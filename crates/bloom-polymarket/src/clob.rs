@@ -7,7 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use url::Url;
 
-use crate::signer::{self, KeystoreSigner};
+use crate::signer::{self, OnboardSigner};
 use crate::types::{Credentials, OrderBook, Side, TokenMarket};
 use crate::{DEFAULT_CLOB_URL, POLYGON, PolymarketError, Result};
 
@@ -132,7 +132,7 @@ impl ClobClient {
     /// the `nonce` used (save it — it's required to re-derive the same creds).
     pub async fn create_credentials(
         &self,
-        signer: &KeystoreSigner,
+        signer: &dyn OnboardSigner,
         nonce: u32,
     ) -> Result<Credentials> {
         self.auth_creds(signer, nonce, reqwest::Method::POST, "/auth/api-key")
@@ -142,7 +142,7 @@ impl ClobClient {
     /// `GET /auth/derive-api-key` with L1 headers — idempotent re-derivation.
     pub async fn derive_credentials(
         &self,
-        signer: &KeystoreSigner,
+        signer: &dyn OnboardSigner,
         nonce: u32,
     ) -> Result<Credentials> {
         self.auth_creds(signer, nonce, reqwest::Method::GET, "/auth/derive-api-key")
@@ -158,7 +158,7 @@ impl ClobClient {
     /// failures propagate instead of being masked behind a second failing call.
     pub async fn mint_or_derive_credentials(
         &self,
-        signer: &KeystoreSigner,
+        signer: &dyn OnboardSigner,
         nonce: u32,
     ) -> Result<Credentials> {
         match self.create_credentials(signer, nonce).await {
@@ -174,7 +174,7 @@ impl ClobClient {
 
     async fn auth_creds(
         &self,
-        signer: &KeystoreSigner,
+        signer: &dyn OnboardSigner,
         nonce: u32,
         method: reqwest::Method,
         path: &str,
@@ -184,7 +184,7 @@ impl ClobClient {
         let url = self.base_url.join(path)?;
         let mut rb = self.http.request(method, url);
         for (name, value) in &headers {
-            rb = rb.header(*name, value);
+            rb = rb.header(name, value);
         }
         let (status, body) = send(rb).await?;
         if !(200..300).contains(&status) {

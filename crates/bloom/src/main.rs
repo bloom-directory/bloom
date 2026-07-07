@@ -3058,7 +3058,7 @@ fn outbox_confirm_unlock_intent(
     Some(intent)
 }
 
-async fn sign_outbox_sealed_approval_if_challenged(
+pub(crate) async fn sign_outbox_sealed_approval_if_challenged(
     d: &Daemon,
     wallet: &str,
     chain: &str,
@@ -3234,7 +3234,7 @@ fn resolve_pending_request_id(home: &Path, id: &str) -> Result<String> {
     Ok(id.to_string())
 }
 
-fn sealed_review_session_id(challenge: &ApprovalChallenge) -> String {
+pub(crate) fn sealed_review_session_id(challenge: &ApprovalChallenge) -> String {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"bloom.review_session.v1");
     hasher.update(challenge.surface.as_bytes());

@@ -17,7 +17,8 @@
 
 use alloy::primitives::{Address, B256, U256};
 use alloy::rpc::types::eth::TransactionRequest;
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
+use bloom_auth_api::PolymarketSealedActionKind;
 use bloom_daemon::Daemon;
 use bloom_polymarket::eip712::{CTF, CTF_EXCHANGE_V2, NEG_RISK_EXCHANGE_V2};
 use bloom_polymarket::order::{self, OrderParams, OrderType};
@@ -28,16 +29,22 @@ use bloom_polymarket::trade;
 use bloom_polymarket::types::Side;
 use bloom_polymarket::{
     BuilderCredentialStore, ClobClient, CredentialStore, DataClient, GammaClient, GeoblockClient,
-    KeystoreSigner, RelayerClient,
+    KeystoreSigner, OnboardSigner, RelayerClient,
 };
 use bloom_proto::HomeWritePermit;
 use bloom_proto::polymarket_policy::{self as pm_policy, PolicySide, PolymarketOrderCtx};
+use bloom_tx::TxEngineError;
+use bloom_vfs::handlers::polymarket as pm_sealed;
 
 fn now_ms() -> u128 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0)
+}
+
+fn now_ms_u64() -> u64 {
+    u64::try_from(now_ms()).unwrap_or(u64::MAX)
 }
 
 /// Keep the value-moving CLI aligned with the VFS staged-request validator:
@@ -559,11 +566,9 @@ async fn execute(
         );
     }
 
-    // Ceremony last.
-    unlock_wallet_with_intent(d, &draft.wallet, passphrase, Some(intent)).await?;
-    let signer = KeystoreSigner::new(d.keystore.signer(&draft.wallet)?);
-    let owner = signer.address();
-
+    // Build the order (salt + timestamp) BEFORE the ceremony so the sealed
+    // approval binds the exact POLY_1271 signing hash being authorized.
+    let owner = info.address;
     let signed = order::build_order(&OrderParams {
         token_id: draft.token_id.parse::<U256>().context("parse token id")?,
         // Maker/funder: the deposit wallet (sigtype 3). The owner EOA key
@@ -588,9 +593,63 @@ async fn execute(
         serde_json::json!({ "draft_id": draft.id, "salt": salt, "signature_type": tf.signature_type }),
     )?;
 
-    let sig = order::sign_order_for_type(&signed, &signer, pm_cfg.chain_id, draft.neg_risk)
+    // Ceremony last.
+    let sig = if info.kind == bloom_keystore::WalletKind::PasskeyGated {
+        // Sealed-approval lane: stage the order action, run the in-band
+        // browser ceremony to mint a grant, then sign through the Bloom
+        // Machine host — raw keystore signer material never touches this
+        // path (mirrors the EVM outbox confirm flow).
+        let now = now_ms_u64();
+        let action = bloom_polymarket::signing::order_action_and_hash(
+            &signed,
+            pm_cfg.chain_id,
+            draft.neg_risk,
+        );
+        let plan = pm_sealed::polymarket_order_plan(
+            draft.side,
+            Some(draft.slug.as_str()),
+            tf.funder,
+            draft.neg_risk,
+            pm_cfg.chain_id,
+            &action.signing_hash,
+        );
+        let sealed = pm_sealed::polymarket_order_sealed_action(
+            &draft.wallet,
+            &action.order_view,
+            &action.signing_hash,
+            pm_cfg.chain_id,
+            draft.neg_risk,
+            plan,
+            now,
+        )?;
+        let action_id = sealed.action_id().to_string();
+        ensure_sealed_polymarket_grant(d, &draft.wallet, sealed, Some(intent)).await?;
+        pm_sealed::host_sign_polymarket_order_hash(
+            d.auth_services
+                .require_petal_host()
+                .context("Sealed Approval petal host is not wired")?
+                .as_ref(),
+            &draft.wallet,
+            &action_id,
+            &signed,
+            &action.signing_hash,
+            pm_cfg.chain_id,
+            draft.neg_risk,
+            now_ms_u64(),
+        )
         .await
-        .context("sign order")?;
+        .context("sign order via Sealed Approval host")?
+    } else {
+        unlock_wallet_with_intent(d, &draft.wallet, passphrase, Some(intent)).await?;
+        let signer = KeystoreSigner::new(d.keystore.signer(&draft.wallet)?);
+        ensure!(
+            signer.address() == owner,
+            "unlocked signer address changed during order preflight"
+        );
+        order::sign_order_for_type(&signed, &signer, pm_cfg.chain_id, draft.neg_risk)
+            .await
+            .context("sign order")?
+    };
 
     // The signature now exists — only now is the order durably "signed".
     draft.status = DraftStatus::Signed;
@@ -1052,6 +1111,109 @@ async fn unlock_wallet_with_intent(
     Ok(())
 }
 
+/// Stage `sealed` and ensure a live Sealed Approval grant exists for it,
+/// running the in-band browser ceremony when none does — the same
+/// stage → challenge → ceremony → grant flow the EVM outbox confirm loop
+/// drives (main.rs `sign_outbox_sealed_approval_if_challenged`). Passkey
+/// wallets only: local password wallets cannot produce sealed approvals and
+/// stay on the passphrase-unlock lane at each call site.
+async fn ensure_sealed_polymarket_grant(
+    d: &Daemon,
+    wallet: &str,
+    sealed: bloom_auth_api::SealedAction,
+    intent: Option<bloom_proto::CeremonyIntent>,
+) -> Result<bloom_auth_api::SealedApprovalGrant> {
+    use base64::Engine as _;
+
+    let now = now_ms_u64();
+    let action_id = sealed.action_id().to_string();
+    let petal_id = sealed.petal_id().to_string();
+    let petal_digest = sealed.petal_digest().to_string();
+    let writer = d
+        .auth_services
+        .require_writer()
+        .context("Sealed Approval auth store writer is not wired")?;
+    writer
+        .stage_action(sealed, now)
+        .await
+        .context("stage Polymarket sealed action")?;
+    if let Some(grant) = d
+        .auth_services
+        .require_grant_store()
+        .context("Sealed Approval grant store is not wired")?
+        .get_active(wallet, &action_id, &petal_id, &petal_digest, now)
+        .await
+        .context("lookup Polymarket grant")?
+    {
+        return Ok(grant);
+    }
+    let mut nonce = [0u8; 32];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut nonce);
+    let nonce_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(nonce);
+    let challenge = writer
+        .issue_challenge(
+            pm_sealed::POLYMARKET_SURFACE,
+            &action_id,
+            &nonce_b64,
+            now.saturating_add(pm_sealed::APPROVAL_TTL_MS),
+            now,
+        )
+        .await
+        .context("issue Polymarket approval challenge")?;
+    let review_session_id = if challenge.assurance == bloom_auth_api::AssuranceLevel::Hardened {
+        let review_session_id = crate::sealed_review_session_id(&challenge);
+        writer
+            .issue_review_session(
+                &review_session_id,
+                &challenge.surface,
+                &challenge.action_id,
+                challenge.expiry_ms,
+                now,
+            )
+            .await
+            .context("issue hardened review session")?;
+        Some(review_session_id)
+    } else {
+        None
+    };
+    let unsigned = bloom_auth_api::UnsignedApproval::for_challenge(
+        &challenge,
+        bloom_auth_api::SignerTransport::BrowserWebauthn,
+        None,
+        review_session_id,
+    );
+    let (grant, _approval) = bloom_daemon::sealed_ceremony::run_sealed_approval_ceremony(
+        &d.keystore,
+        &d.auth_services,
+        unsigned,
+        intent,
+        now,
+        d.signer_cache.as_ref(),
+    )
+    .await
+    .context("run sealed approval browser ceremony")?;
+    Ok(grant)
+}
+
+/// Owner-signing adapter that signs through `PetalHost::sign_hash` under the
+/// live grant for `action_id` (minted by `ensure_sealed_polymarket_grant`).
+fn sealed_polymarket_signer(
+    d: &Daemon,
+    wallet: &str,
+    action_id: String,
+    kind: PolymarketSealedActionKind,
+    owner: Address,
+) -> Result<pm_sealed::SealedOnboardSigner> {
+    let host = d
+        .auth_services
+        .require_petal_host()
+        .context("Sealed Approval petal host is not wired")?
+        .clone();
+    Ok(pm_sealed::SealedOnboardSigner::new(
+        host, wallet, action_id, kind, owner,
+    ))
+}
+
 /// Arguments for `bloom polymarket onboard`.
 pub struct OnboardArgs {
     pub wallet: String,
@@ -1157,8 +1319,30 @@ pub async fn onboard(d: &Daemon, args: OnboardArgs) -> Result<()> {
             "mode": "deposit_wallet",
             "target_pusd": args.target_pusd.is_some(),
         }));
-    unlock_wallet_with_intent(d, &args.wallet, args.passphrase.as_deref(), Some(intent)).await?;
-    let signer = KeystoreSigner::new(d.keystore.signer(&args.wallet)?);
+    let passkey_wallet = info.kind == bloom_keystore::WalletKind::PasskeyGated;
+    // For passkey wallets, skip the standalone unlock ceremony — each run in
+    // the loop below is authorized by an in-band sealed-approval ceremony
+    // that mints an onboarding grant (max 3 signatures) and signs via
+    // `PetalHost::sign_hash`. For local wallets, the passphrase unlock stays
+    // the signing mechanism (they cannot produce sealed approvals).
+    let signer: Box<dyn OnboardSigner> = if passkey_wallet {
+        Box::new(sealed_polymarket_signer(
+            d,
+            &args.wallet,
+            pm_sealed::polymarket_onboard_action_id(&args.wallet),
+            PolymarketSealedActionKind::Onboarding,
+            info.address,
+        )?)
+    } else {
+        unlock_wallet_with_intent(
+            d,
+            &args.wallet,
+            args.passphrase.as_deref(),
+            Some(intent.clone()),
+        )
+        .await?;
+        Box::new(KeystoreSigner::new(d.keystore.signer(&args.wallet)?))
+    };
 
     let (_, chain) = d
         .chains
@@ -1218,8 +1402,19 @@ pub async fn onboard(d: &Daemon, args: OnboardArgs) -> Result<()> {
     // sync lag would otherwise drain the wallet through repeat funding).
     let mut funded_this_run = false;
     loop {
+        // A multi-step onboarding run can outlive one grant's TTL / signature
+        // budget; re-ensure a live grant before each pass (idempotent stage,
+        // ceremony only when no grant is active).
+        if passkey_wallet {
+            let sealed = pm_sealed::polymarket_onboard_sealed_action(
+                &args.wallet,
+                info.address,
+                now_ms_u64(),
+            )?;
+            ensure_sealed_polymarket_grant(d, &args.wallet, sealed, Some(intent.clone())).await?;
+        }
         let st = onboarder
-            .run(&args.wallet, &signer, noop)
+            .run(&args.wallet, signer.as_ref(), noop)
             .await
             .context("onboarding run")?;
         if st.stage != bloom_polymarket::Stage::Fund {
@@ -1932,7 +2127,22 @@ pub async fn fund(d: &Daemon, args: FundArgs) -> Result<()> {
             }
         }
     }
-    unlock_wallet_with_intent(d, &args.wallet, args.passphrase.as_deref(), Some(intent)).await?;
+    let passkey_wallet = info.kind == bloom_keystore::WalletKind::PasskeyGated;
+    // For passkey wallets, skip the standalone unlock ceremony — the in-band
+    // sealed-approval ceremony in the confirm loop below self-unlocks via
+    // WebAuthn (matching the `wallet confirm` path at main.rs:2121). For local
+    // wallets, the passphrase unlock is the mechanism that enables in-policy
+    // auto-broadcast.
+    if !passkey_wallet {
+        unlock_wallet_with_intent(
+            d,
+            &args.wallet,
+            args.passphrase.as_deref(),
+            Some(intent.clone()),
+        )
+        .await?;
+    }
+    let approval_intent = Some(intent);
     let confirm_text = if any_warn {
         info.policy.override_sentinel().to_string()
     } else {
@@ -1952,14 +2162,49 @@ pub async fn fund(d: &Daemon, args: FundArgs) -> Result<()> {
                 &confirm_text,
             )
             .await
-            .with_context(|| format!("confirm staged tx {id}"))
         {
             Ok(s) => s,
+            Err(TxEngineError::BroadcastApprovalRequired(_)) if passkey_wallet => {
+                // In-band sealed-approval ceremony, mirroring `wallet confirm`
+                // (main.rs): the confirm path wrote an approval_challenge.json;
+                // run the browser ceremony to sign it, then retry the confirm.
+                // Without this arm the catch-all below would cancel the staged
+                // tx, forcing a full re-stage and re-ceremony.
+                if crate::sign_outbox_sealed_approval_if_challenged(
+                    d,
+                    &args.wallet,
+                    &chain_name,
+                    id,
+                    approval_intent.clone(),
+                )
+                .await
+                .with_context(|| format!("sign sealed approval for staged tx {id}"))?
+                {
+                    d.tx_engine
+                        .confirm(
+                            home_write_permit(d)?,
+                            &args.wallet,
+                            &chain_name,
+                            id,
+                            &chain,
+                            &info.policy,
+                            &confirm_text,
+                        )
+                        .await
+                        .with_context(|| format!("confirm staged tx {id} after sealed approval"))?
+                } else {
+                    discard(&staged_ids[i..]);
+                    bail!(
+                        "broadcast approval required for staged tx {id} but no \
+                         approval_challenge.json was written"
+                    );
+                }
+            }
             Err(e) => {
                 // Discard this entry if it never broadcast, plus everything
                 // not yet confirmed, so stale pendings can't poison nonces.
                 discard(&staged_ids[i..]);
-                return Err(e);
+                return Err(anyhow::Error::new(e).context(format!("confirm staged tx {id}")));
             }
         };
         let hash: alloy::primitives::B256 = staged
@@ -2136,7 +2381,21 @@ async fn transfer_pusd_to_funding(
             .outbox
             .write_artefact(&entry.dir, "review_intent.json", &bytes);
     }
-    unlock_wallet_with_intent(d, &args.wallet, args.passphrase.as_deref(), Some(intent)).await?;
+    let passkey_wallet = info.kind == bloom_keystore::WalletKind::PasskeyGated;
+    // For passkey wallets, skip the standalone unlock ceremony — the in-band
+    // sealed-approval ceremony in the confirm below self-unlocks via WebAuthn
+    // (matching the fund-swap path above). For local wallets, the passphrase
+    // unlock is the mechanism that enables in-policy auto-broadcast.
+    if !passkey_wallet {
+        unlock_wallet_with_intent(
+            d,
+            &args.wallet,
+            args.passphrase.as_deref(),
+            Some(intent.clone()),
+        )
+        .await?;
+    }
+    let approval_intent = Some(intent);
     let confirm_text = if any_warn {
         info.policy.override_sentinel().to_string()
     } else {
@@ -2154,12 +2413,62 @@ async fn transfer_pusd_to_funding(
             &confirm_text,
         )
         .await
-        .with_context(|| format!("confirm staged tx {}", staged.id))
     {
         Ok(c) => c,
+        Err(TxEngineError::BroadcastApprovalRequired(_)) if passkey_wallet => {
+            // In-band sealed-approval ceremony, mirroring the fund-swap
+            // confirm loop: the confirm path wrote an
+            // approval_challenge.json; run the browser ceremony to sign it,
+            // then retry the confirm. Without this arm the catch-all below
+            // would cancel the staged tx.
+            let signed = match crate::sign_outbox_sealed_approval_if_challenged(
+                d,
+                &args.wallet,
+                chain_name,
+                &staged.id,
+                approval_intent.clone(),
+            )
+            .await
+            .with_context(|| format!("sign sealed approval for staged tx {}", staged.id))
+            {
+                Ok(signed) => signed,
+                Err(e) => {
+                    discard();
+                    return Err(e);
+                }
+            };
+            if !signed {
+                discard();
+                bail!(
+                    "broadcast approval required for staged tx {} but no \
+                     approval_challenge.json was written",
+                    staged.id
+                );
+            }
+            match d
+                .tx_engine
+                .confirm(
+                    home_write_permit(d)?,
+                    &args.wallet,
+                    chain_name,
+                    &staged.id,
+                    chain,
+                    &info.policy,
+                    &confirm_text,
+                )
+                .await
+                .with_context(|| format!("confirm staged tx {} after sealed approval", staged.id))
+            {
+                Ok(c) => c,
+                Err(e) => {
+                    discard();
+                    return Err(e);
+                }
+            }
+        }
         Err(e) => {
             discard();
-            return Err(e);
+            return Err(anyhow::Error::new(e).context(format!("confirm staged tx {}", staged.id)));
         }
     };
     let hash: alloy::primitives::B256 = confirmed
@@ -2367,7 +2676,7 @@ async fn submit_and_confirm_wallet_batch(
     owner: Address,
     deposit_wallet: Address,
     calls: Vec<bloom_polymarket::eip712::Call>,
-    signer: &KeystoreSigner,
+    signer: &dyn OnboardSigner,
     label: &str,
     audit_prefix: &str,
     mut submit_details: serde_json::Value,
@@ -2631,11 +2940,32 @@ pub async fn redeem(
     let review_hash = intent.intent_hash();
     println!("passkey review hash {review_hash}");
 
-    unlock_wallet_with_intent(d, wallet, passphrase, Some(intent)).await?;
-    let signer = KeystoreSigner::new(d.keystore.signer(wallet)?);
-    if signer.address() != info.address {
-        bail!("unlocked signer address changed during redemption preflight");
-    }
+    let signer: Box<dyn OnboardSigner> = if info.kind == bloom_keystore::WalletKind::PasskeyGated {
+        // Sealed-approval lane: one Standard grant covers the single relayer
+        // batch signature; the host signs under it (never the raw keystore).
+        let sealed = pm_sealed::polymarket_redemption_sealed_action(
+            wallet,
+            deposit_wallet,
+            &market.condition_id,
+            market.neg_risk,
+            now_ms_u64(),
+        )?;
+        ensure_sealed_polymarket_grant(d, wallet, sealed, Some(intent)).await?;
+        Box::new(sealed_polymarket_signer(
+            d,
+            wallet,
+            pm_sealed::polymarket_redeem_action_id(wallet, &market.condition_id),
+            PolymarketSealedActionKind::Redemption,
+            info.address,
+        )?)
+    } else {
+        unlock_wallet_with_intent(d, wallet, passphrase, Some(intent)).await?;
+        let signer = KeystoreSigner::new(d.keystore.signer(wallet)?);
+        if signer.address() != info.address {
+            bail!("unlocked signer address changed during redemption preflight");
+        }
+        Box::new(signer)
+    };
 
     let confirmed = submit_and_confirm_wallet_batch(
         &relayer,
@@ -2644,7 +2974,7 @@ pub async fn redeem(
         info.address,
         deposit_wallet,
         vec![call],
-        &signer,
+        signer.as_ref(),
         "redemption",
         "redeem",
         serde_json::json!({
@@ -2785,11 +3115,27 @@ pub async fn withdraw_pusd(
     let review_hash = intent.intent_hash();
     println!("passkey review hash {review_hash}");
 
-    unlock_wallet_with_intent(d, wallet, passphrase, Some(intent)).await?;
-    let signer = KeystoreSigner::new(d.keystore.signer(wallet)?);
-    if signer.address() != owner {
-        bail!("unlocked signer address changed during pUSD withdrawal preflight");
-    }
+    let signer: Box<dyn OnboardSigner> = if info.kind == bloom_keystore::WalletKind::PasskeyGated {
+        // Sealed-approval lane: one Hardened grant covers the single relayer
+        // batch signature; the host signs under it (never the raw keystore).
+        let sealed =
+            pm_sealed::polymarket_withdrawal_sealed_action(wallet, deposit_wallet, now_ms_u64())?;
+        ensure_sealed_polymarket_grant(d, wallet, sealed, Some(intent)).await?;
+        Box::new(sealed_polymarket_signer(
+            d,
+            wallet,
+            pm_sealed::polymarket_withdraw_action_id(wallet),
+            PolymarketSealedActionKind::Withdrawal,
+            owner,
+        )?)
+    } else {
+        unlock_wallet_with_intent(d, wallet, passphrase, Some(intent)).await?;
+        let signer = KeystoreSigner::new(d.keystore.signer(wallet)?);
+        if signer.address() != owner {
+            bail!("unlocked signer address changed during pUSD withdrawal preflight");
+        }
+        Box::new(signer)
+    };
 
     let confirmed = submit_and_confirm_wallet_batch(
         &relayer,
@@ -2798,7 +3144,7 @@ pub async fn withdraw_pusd(
         owner,
         deposit_wallet,
         vec![call],
-        &signer,
+        signer.as_ref(),
         "pUSD withdrawal",
         "withdraw_pusd",
         serde_json::json!({
@@ -2910,11 +3256,27 @@ pub async fn revoke_approvals(
     let review_hash = intent.intent_hash();
     println!("passkey review hash {review_hash}");
 
-    unlock_wallet_with_intent(d, wallet, passphrase, Some(intent)).await?;
-    let signer = KeystoreSigner::new(d.keystore.signer(wallet)?);
-    if signer.address() != info.address {
-        bail!("unlocked signer address changed during revoke preflight");
-    }
+    let signer: Box<dyn OnboardSigner> = if info.kind == bloom_keystore::WalletKind::PasskeyGated {
+        // Sealed-approval lane: one Hardened grant covers the single relayer
+        // batch signature; the host signs under it (never the raw keystore).
+        let sealed =
+            pm_sealed::polymarket_revocation_sealed_action(wallet, deposit_wallet, now_ms_u64())?;
+        ensure_sealed_polymarket_grant(d, wallet, sealed, Some(intent)).await?;
+        Box::new(sealed_polymarket_signer(
+            d,
+            wallet,
+            pm_sealed::polymarket_revoke_action_id(wallet),
+            PolymarketSealedActionKind::Revocation,
+            info.address,
+        )?)
+    } else {
+        unlock_wallet_with_intent(d, wallet, passphrase, Some(intent)).await?;
+        let signer = KeystoreSigner::new(d.keystore.signer(wallet)?);
+        if signer.address() != info.address {
+            bail!("unlocked signer address changed during revoke preflight");
+        }
+        Box::new(signer)
+    };
 
     submit_and_confirm_wallet_batch(
         &relayer,
@@ -2923,7 +3285,7 @@ pub async fn revoke_approvals(
         info.address,
         deposit_wallet,
         calls,
-        &signer,
+        signer.as_ref(),
         "revoke",
         "revoke",
         serde_json::json!({ "deposit_wallet": funder_s }),

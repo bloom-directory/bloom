@@ -115,6 +115,7 @@ pub struct KeystorePetalHost {
     registry: Arc<dyn SigningAttestationSchemaRegistry>,
     audit_log: Arc<AuditLog>,
     signer_cache: Option<Arc<SignerCache>>,
+    policy_evaluator: Option<Arc<dyn bloom_auth_api::PolicyEvaluator>>,
 }
 
 impl KeystorePetalHost {
@@ -130,6 +131,7 @@ impl KeystorePetalHost {
             registry,
             audit_log,
             signer_cache: None,
+            policy_evaluator: None,
         }
     }
 
@@ -138,6 +140,17 @@ impl KeystorePetalHost {
     /// WebAuthn ceremony on every signature within the same grant.
     pub fn with_signer_cache(mut self, cache: Arc<SignerCache>) -> Self {
         self.signer_cache = Some(cache);
+        self
+    }
+
+    /// Wire a policy evaluator that runs after grant validation but before
+    /// signing. The evaluator receives the sealed [`PetalPolicySnapshot`] from
+    /// the grant and the attestation facts as [`PolicyCheckResult`] proxies.
+    pub fn with_policy_evaluator(
+        mut self,
+        evaluator: Arc<dyn bloom_auth_api::PolicyEvaluator>,
+    ) -> Self {
+        self.policy_evaluator = Some(evaluator);
         self
     }
 
@@ -449,6 +462,49 @@ impl PetalHost for KeystorePetalHost {
                         Some(request.action_id.clone()),
                         "attestation policy_snapshot_digest does not match the sealed grant",
                         None,
+                    )
+                    .await;
+            }
+        }
+
+        // Step 6.5: policy evaluation (if a PolicyEvaluator is wired).
+        if let Some(evaluator) = &self.policy_evaluator {
+            let snapshot = PetalPolicySnapshot {
+                policy_version: grant.policy_version,
+                wallet: grant.wallet.clone(),
+                petal_id: grant.petal_id.clone(),
+                petal_digest: grant.petal_digest.clone(),
+                caps: std::collections::BTreeMap::new(),
+                hard_rules: Vec::new(),
+                step_up_rules: Vec::new(),
+                config: std::collections::BTreeMap::new(),
+                budget_state: std::collections::BTreeMap::new(),
+                session_scope: None,
+            };
+            let checks: Vec<bloom_auth_api::PolicyCheckResult> = attestation
+                .facts
+                .iter()
+                .map(|(k, v)| bloom_auth_api::PolicyCheckResult {
+                    rule_id: k.clone(),
+                    rule_class: bloom_auth_api::PolicyCheckClass::Informational,
+                    outcome: "pass".into(),
+                    message: v.to_string(),
+                    step_up_ceiling: None,
+                })
+                .collect();
+            let decision = evaluator.evaluate(&snapshot, &checks, now_ms).await?;
+            if decision.is_denied() {
+                return self
+                    .deny(
+                        "petal.sign.policy_deny",
+                        Some(request.wallet.clone()),
+                        Some(request.action_id.clone()),
+                        "policy evaluation denied",
+                        Some(serde_json::json!({
+                            "petal_id": attestation.petal_id,
+                            "hard_violation": decision.hard_violation,
+                            "exceeded_ceiling": decision.exceeded_ceiling,
+                        })),
                     )
                     .await;
             }

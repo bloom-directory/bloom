@@ -57,6 +57,7 @@ hex.workspace = true
 alloy.workspace = true
 base64.workspace = true
 qrcode.workspace = true
+rand.workspace = true
 rpassword.workspace = true
 
 [dev-dependencies]

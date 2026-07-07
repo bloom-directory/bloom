@@ -385,14 +385,20 @@ impl DefiHandler {
 
     fn list_sessions_for_wallet(&self, wallet: &str) -> Vec<String> {
         let _ = self.load_wallet_sessions(wallet);
-        let mut out: Vec<String> = self
+        let mut entries: Vec<(u128, String)> = self
             .sessions
             .read()
             .values()
             .filter(|s| s.wallet == wallet)
-            .map(|s| s.id.clone())
+            .map(|s| (s.created_ms, s.id.clone()))
             .collect();
-        out.sort();
+        // Sort by created_ms descending (most recent first). Session ids are
+        // not chronologically ordered — the `<NNNN>` prefix is a per-process
+        // counter that resets to 1 on each daemon start (`allocate_id`,
+        // `next_id`), so a lexicographic id sort can surface a stale session
+        // ahead of a newer one.
+        entries.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+        let mut out: Vec<String> = entries.into_iter().map(|(_, id)| id).collect();
         out.dedup();
         out
     }

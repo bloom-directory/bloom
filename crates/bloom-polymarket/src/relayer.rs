@@ -18,7 +18,7 @@ use std::time::Duration;
 use alloy::primitives::{Address, U256};
 
 use crate::eip712::{self, Batch, Call, FACTORY};
-use crate::signer::KeystoreSigner;
+use crate::signer::OnboardSigner;
 use crate::{POLYGON, PolymarketError, Result};
 
 const DEFAULT_RELAYER_URL: &str = "https://relayer-v2.polymarket.com";
@@ -217,7 +217,7 @@ impl RelayerClient {
         calls: Vec<Call>,
         nonce: u64,
         deadline: u64,
-        signer: &KeystoreSigner,
+        signer: &dyn OnboardSigner,
     ) -> Result<RelayerTx> {
         let batch = Batch {
             wallet: deposit_wallet,

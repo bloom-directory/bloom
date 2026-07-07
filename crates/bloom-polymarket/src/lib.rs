@@ -46,6 +46,15 @@ pub mod trade;
 pub mod types;
 pub mod wallet;
 
+/// Pure `(action, hash)` builders and signature encoders for sealed approval.
+/// Inverts the signing surface: this module builds the bytes the user is
+/// asked to approve, and converts host-side raw signatures back into the
+/// wire-format string each call site needs. No keystore access; no I/O.
+///
+/// See `docs/architecture/Sealed Approvals.md` and the WS-H section of
+/// `docs/plans/2026-07-03-sealed-approval-implementation-plan.md`.
+pub mod signing;
+
 pub use builder_creds::{BuilderApiKeyInfo, BuilderCredentialStore, BuilderCredentials};
 pub use clob::ClobClient;
 pub use creds::CredentialStore;
@@ -59,13 +68,23 @@ pub use onboard::{
 };
 pub use order_store::{DraftStatus, OrderDraft, OrderLock, OrderReceipt, OrderStore};
 pub use relayer::{RelayerClient, RelayerTx};
-pub use signer::KeystoreSigner;
+pub use signer::{KeystoreSigner, OnboardSigner};
+pub use signing::{
+    CallView, ClobAuthAction, L1HeaderView, OrderAction, WalletBatchAction, action_id_for,
+    clob_auth_action_and_hash, order_action_and_hash, poly1271_signature_from_raw,
+    signature_string_from_raw, wallet_batch_action_and_hash,
+};
 pub use types::{BookLevel, Credentials, Market, OrderBook, Position, Side, TokenMarket, Trade};
 
 /// Polygon mainnet chain id — where Polymarket settles.
 pub const POLYGON: u64 = 137;
 /// Polygon Amoy testnet chain id (used by the SDK's known-answer vectors).
 pub const AMOY: u64 = 80_002;
+
+/// How many hex chars of the BLAKE3 `action_id` digest we keep. Matches the
+/// `[a-f0-9]{16}` style used elsewhere on the daemon-side action ids.
+/// Used by `signing::action_id_for` to truncate the digest label.
+pub const ACTION_ID_HEX_PREFIX: usize = 16;
 
 /// Default public base URLs for the three Polymarket APIs.
 pub const DEFAULT_GAMMA_URL: &str = "https://gamma-api.polymarket.com";
