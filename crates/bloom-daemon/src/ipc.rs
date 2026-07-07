@@ -720,21 +720,6 @@ fn write_path_uses_wallet_signer(path: &VfsPath) -> bool {
         {
             true
         }
-        // Confirming a paid HTTP request is a first-party Sealed Approval action:
-        // the requests handler stages an approval challenge on the first write and
-        // only signs the x402/Tempo MPP credential under a grant-gated PetalHost
-        // signature. It therefore never consumes a cached signer silently, so the
-        // plain write lane must forward it through to `vfs.write` rather than deny
-        // it here — the old write_unlocked confirm lane is disabled for passkey
-        // wallets, which would otherwise leave mounted confirm with no working path.
-        // Minting a bounded policy session authorizes many future broadcasts; gate
-        // it behind the same human-presence ceremony as a signature so an agent
-        // cannot silently mint a broad batch-signing session.
-        [root, _wallet, ps, leaf]
-            if root == "wallets" && ps == "policy-session" && leaf == "new" =>
-        {
-            true
-        }
         // Hyperliquid owner-signer writes either approve a standing API wallet
         // or sign actions directly with the owner wallet. They require the
         // write_unlocked ceremony; already-approved agent-session actions stay
@@ -765,13 +750,23 @@ fn write_path_uses_wallet_signer(path: &VfsPath) -> bool {
         {
             true
         }
-        // Wallet policy writes (policy.toml) are handled by the VFS wallets
-        // handler as a first-party Sealed Approval action: passkey wallets stage
-        // a challenge and install only under a grant-gated PetalHost signature;
-        // local wallets write immediately (their policy is unsigned). Neither
-        // path silently consumes a cached signer, so the plain write lane must
-        // forward these through to `vfs.write` rather than deny them here — the
-        // old write_unlocked re-sign lane is disabled for passkey wallets.
+        // Everything else reaches the VFS handler through the plain write lane.
+        // In particular these first-party Sealed Approval actions are NOT raw
+        // signer lanes and must forward through to `vfs.write` rather than be
+        // denied here:
+        //   * Wallet policy writes (`policy.toml`): passkey wallets stage a
+        //     challenge and install only under a grant-gated PetalHost signature;
+        //     local wallets write immediately (their policy is unsigned).
+        //   * Policy-session minting (`policy-session/new`): the wallets handler
+        //     stages an approval challenge and mints the bounded session only
+        //     under a grant-gated signature — exactly like `policy.toml`.
+        //   * Paid HTTP confirm (`/requests/<id>/confirm`): the requests handler
+        //     stages an approval challenge on the first write and signs the
+        //     x402/Tempo MPP credential only under a grant-gated PetalHost
+        //     signature.
+        // None of these silently consumes a cached signer, and the old
+        // write_unlocked lane is disabled for passkey wallets — denying them here
+        // would leave mounted confirm/mint with no working path.
         _ => false,
     }
 }
@@ -1539,6 +1534,10 @@ mod tests {
             // policy.toml now reaches the VFS handler, which stages a Sealed
             // Approval for passkey wallets rather than being denied at the lane.
             "/wallets/minnow/policy.toml",
+            // policy-session/new likewise reaches the wallets handler, which
+            // stages a Sealed Approval challenge and mints the bounded session
+            // only under a grant-gated signature (handler-owned, not a raw lane).
+            "/wallets/minnow/policy-session/new",
             "/wallets/minnow/chains/polygon/outbox/new.tx",
             "/wallets/minnow/chains/polygon/outbox/pending/0001/confirm",
             // Paid-request confirm likewise reaches the VFS handler: the first

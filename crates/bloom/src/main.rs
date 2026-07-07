@@ -1169,6 +1169,16 @@ fn is_endpoint_permission_denial(e: &std::io::Error) -> bool {
     e.kind() == std::io::ErrorKind::PermissionDenied || e.raw_os_error() == Some(1)
 }
 
+/// True when a daemon IPC call failed because the VFS *handler* returned
+/// `PermissionDenied` (JSON-RPC code `-32007`) — i.e. a Sealed Approval
+/// challenge was staged — rather than a transport/socket-level denial.
+/// [`try_ipc`] only surfaces this as a propagated `Err`, so it is safe to
+/// distinguish it here by the JSON-RPC error payload.
+fn is_ipc_handler_permission_denied(e: &std::io::Error) -> bool {
+    let s = e.to_string();
+    s.contains("-32007") || s.contains("permission denied")
+}
+
 async fn run(cli: Cli) -> Result<()> {
     let (connect, ipc_socket) = if cli.connect.is_some() {
         (cli.connect, None)
@@ -1551,23 +1561,64 @@ async fn run(cli: Cli) -> Result<()> {
             let wallet = wallet.context(
                 "could not determine paying wallet for this request; pass --wallet or --unlock-wallet",
             )?;
-            let ipc_res = try_ipc(
-                &client,
-                &client_endpoint,
-                "write_unlocked",
-                serde_json::json!({
-                    "path": path,
-                    "bytes_b64": B64.encode(&body),
-                    "wallet": &wallet,
-                }),
-            )
-            .await
-            .with_context(|| format!("ipc request confirm via {}", client_endpoint.display))?;
-            if ipc_res.is_some() {
-                debug!(endpoint = %client_endpoint.display, "cli.request.confirm.via_ipc");
-                return Ok(());
+            // Daemon-backed confirm reaches the VFS handler through a *plain*
+            // `write`, not `write_unlocked`: the requests handler stages a
+            // Sealed Approval challenge and signs the x402/Tempo MPP credential
+            // only under a grant-gated PetalHost signature. `write_unlocked` is
+            // not a passkey signing lane. On a staged-challenge PermissionDenied
+            // we run the request ceremony (writes approval.json to the shared
+            // home) and retry the same plain write so the daemon consumes it.
+            let confirm_params = serde_json::json!({
+                "path": path,
+                "bytes_b64": B64.encode(&body),
+            });
+            match try_ipc(&client, &client_endpoint, "write", confirm_params.clone()).await {
+                Ok(Some(_)) => {
+                    debug!(endpoint = %client_endpoint.display, "cli.request.confirm.via_ipc");
+                    return Ok(());
+                }
+                Ok(None) => {
+                    debug!("cli.request.confirm.via_inproc: no daemon socket present");
+                    // Fall through to the in-process fallback below.
+                }
+                Err(e) if is_ipc_handler_permission_denied(&e) => {
+                    // The daemon staged a Sealed Approval challenge on the first
+                    // plain write. Build a read-only daemon (the serving daemon
+                    // holds the home write lock) to run the request ceremony,
+                    // which writes approval.json onto the shared home, then retry
+                    // the same plain write so the daemon verifies and consumes it.
+                    let ceremony_daemon = Daemon::from_home(home.clone())
+                        .context("build daemon for request confirm ceremony")?;
+                    let approved = sign_request_sealed_approval_if_challenged(
+                        &ceremony_daemon,
+                        &wallet,
+                        &id,
+                        None,
+                    )
+                    .await
+                    .context("request confirm Sealed Approval ceremony")?;
+                    if !approved {
+                        return Err(anyhow::Error::new(e)).context(
+                            "request confirm denied but no approval challenge was staged",
+                        );
+                    }
+                    let retry = try_ipc(&client, &client_endpoint, "write", confirm_params)
+                        .await
+                        .with_context(|| {
+                            format!("ipc request confirm retry via {}", client_endpoint.display)
+                        })?;
+                    if retry.is_some() {
+                        debug!(endpoint = %client_endpoint.display, "cli.request.confirm.via_ipc.after_ceremony");
+                        return Ok(());
+                    }
+                    bail!("request confirm retry did not reach the daemon after Sealed Approval");
+                }
+                Err(e) => {
+                    return Err(anyhow::Error::new(e)).with_context(|| {
+                        format!("ipc request confirm via {}", client_endpoint.display)
+                    });
+                }
             }
-            debug!("cli.request.confirm.via_inproc: no daemon socket present");
             let (_home_permit, d) = build_write_daemon(home)?;
             let info = d.keystore.info(&wallet)?;
             let passkey_wallet = matches!(info.kind, bloom_keystore::WalletKind::PasskeyGated);

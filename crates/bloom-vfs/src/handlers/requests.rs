@@ -786,6 +786,15 @@ impl RequestsHandler {
                     policy_override: Some(&policy),
                     checks_override: Some(checks),
                     sentinel_override: Some(&sentinel),
+                    // Execute from the sealed request/challenge/requirement we
+                    // validated above, not from the mutable pending projection.
+                    sealed_execution: Some(ConfirmExecutionInputs {
+                        request: &request,
+                        challenge: &challenge,
+                        requirement: &requirement,
+                        wallet: &wallet,
+                        dry_run: sealed_inputs.dry_run,
+                    }),
                     ..Default::default()
                 },
             )
@@ -1331,6 +1340,22 @@ struct ConfirmBackendOptions<'a> {
     policy_override: Option<&'a Policy>,
     checks_override: Option<Vec<PolicyCheck>>,
     sentinel_override: Option<&'a str>,
+    /// Sealed execution inputs already validated by the caller. When present,
+    /// `confirm_with_backend` uses these bytes instead of re-reading the
+    /// mutable pending projection (`challenge.json`, `request.toml`), closing
+    /// the TOCTOU between sealed validation and backend execution.
+    sealed_execution: Option<ConfirmExecutionInputs<'a>>,
+}
+
+/// Sealed request/challenge/requirement values threaded into
+/// `confirm_with_backend` so it executes from the sealed action bytes rather
+/// than re-reading the mutable pending projection.
+struct ConfirmExecutionInputs<'a> {
+    request: &'a ParsedRequest,
+    challenge: &'a NormalizedChallenge,
+    requirement: &'a PaymentRequirement,
+    wallet: &'a str,
+    dry_run: bool,
 }
 
 async fn confirm_with_backend(
@@ -1369,14 +1394,45 @@ async fn confirm_with_backend(
             "payment policy warning requires override sentinel '{sentinel}'"
         )));
     }
-    let challenge: NormalizedChallenge = read_json(pending.join("challenge.json"))?;
+    // Prefer the caller's sealed values over the mutable pending projection:
+    // for the MPP path the caller has already validated the sealed action and
+    // its request/challenge/requirement, so re-reading `challenge.json` /
+    // `request.toml` here would reopen a TOCTOU against a tampered projection.
+    let (challenge, request, wallet, requirement, dry_run) = match &options.sealed_execution {
+        Some(sealed) => (
+            sealed.challenge.clone(),
+            sealed.request.clone(),
+            sealed.wallet.to_string(),
+            sealed.requirement.clone(),
+            sealed.dry_run,
+        ),
+        None => {
+            let challenge: NormalizedChallenge = read_json(pending.join("challenge.json"))?;
+            let request_value: serde_json::Value = read_json(pending.join("request.toml"))?;
+            let dry_run = request_value
+                .get("dry_run")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let request = parsed_request_from_dir(&pending)?;
+            let wallet = request_value
+                .get("wallet")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| HandlerError::backend("request artifact missing wallet"))?
+                .to_string();
+            let requirement = PaymentRequirement {
+                scheme: None,
+                network: challenge.network.clone(),
+                asset: challenge.asset.clone(),
+                amount: challenge.amount.clone(),
+                pay_to: None,
+                resource: None,
+                raw: json!({}),
+            };
+            (challenge, request, wallet, requirement, dry_run)
+        }
+    };
     validate_session_state_target(&challenge, id)?;
-    let request_value: serde_json::Value = read_json(pending.join("request.toml"))?;
-    if request_value
-        .get("dry_run")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false)
-    {
+    if dry_run {
         return Err(HandlerError::invalid(
             "dry-run paid requests cannot be confirmed; stage a fresh request with /requests/new",
         ));
@@ -1386,12 +1442,6 @@ async fn confirm_with_backend(
             "this pending request already minted a payment credential; cancel and stage a fresh request instead of re-confirming",
         ));
     }
-    let request = parsed_request_from_dir(&pending)?;
-    let wallet = request_value
-        .get("wallet")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| HandlerError::backend("request artifact missing wallet"))?
-        .to_string();
     let fallback_policy;
     let policy = match options.policy_override {
         Some(policy) => policy,
@@ -1417,15 +1467,6 @@ async fn confirm_with_backend(
         &execution.header_value,
     )
     .await;
-    let requirement = PaymentRequirement {
-        scheme: None,
-        network: challenge.network.clone(),
-        asset: challenge.asset.clone(),
-        amount: challenge.amount.clone(),
-        pay_to: None,
-        resource: None,
-        raw: json!({}),
-    };
     let amount_usd = selected_requirement_amount_usd(&challenge, &requirement);
     let final_state = finalize_paid_retry(
         &requests_root,
@@ -3728,6 +3769,9 @@ mod tests {
         let facts = PaidHttpSigningFacts {
             protocol: "x402".into(),
             request_id: "req-x402".into(),
+            method: "GET".into(),
+            url: "https://merchant.test/pay".into(),
+            host: "merchant.test".into(),
             policy_snapshot_digest: Some(action.petal_policy_digest.clone()),
             ..Default::default()
         };
@@ -3786,6 +3830,10 @@ mod tests {
         };
         let facts = PaidHttpSigningFacts {
             protocol: "x402".into(),
+            request_id: "req-intent".into(),
+            method: "GET".into(),
+            url: "https://merchant.test/pay".into(),
+            host: "merchant.test".into(),
             policy_snapshot_digest: Some(action.petal_policy_digest.clone()),
             ..Default::default()
         };
@@ -3813,6 +3861,9 @@ mod tests {
         let facts = PaidHttpSigningFacts {
             protocol: "x402".into(),
             request_id: "req-facts".into(),
+            method: "GET".into(),
+            url: "https://merchant.test/pay".into(),
+            host: "merchant.test".into(),
             policy_snapshot_digest: Some(action.petal_policy_digest.clone()),
             ..Default::default()
         };
@@ -3891,6 +3942,9 @@ mod tests {
         let facts = PaidHttpSigningFacts {
             protocol: "x402".into(),
             request_id: "req-petal".into(),
+            method: "GET".into(),
+            url: "https://merchant.test/pay".into(),
+            host: "merchant.test".into(),
             policy_snapshot_digest: Some(action.petal_policy_digest.clone()),
             ..Default::default()
         };
@@ -4643,6 +4697,143 @@ inline = '{"prompt":"hi"}'
         assert!(!pending.join("private/credential_minted.json").exists());
     }
 
+    /// Backend double that records the request/challenge/wallet it is prepared
+    /// with, so a test can prove which bytes reached execution.
+    #[derive(Clone, Default)]
+    struct CapturingMppBackend {
+        seen: Arc<std::sync::Mutex<Option<(String, String, String)>>>,
+    }
+
+    #[async_trait]
+    impl PaymentBackend for CapturingMppBackend {
+        fn name(&self) -> &'static str {
+            "capturing_mpp_test_double"
+        }
+
+        async fn prepare(
+            &self,
+            challenge: &NormalizedChallenge,
+            request: &ParsedRequest,
+            wallet: &str,
+            _policy: &Policy,
+            _request_id: &str,
+        ) -> Result<PaymentExecution, String> {
+            *self.seen.lock().unwrap() = Some((
+                challenge.merchant.clone(),
+                request.url.to_string(),
+                wallet.to_string(),
+            ));
+            Ok(PaymentExecution {
+                credential_metadata: json!({
+                    "redacted": true,
+                    "backend": self.name(),
+                    "secret_material_in_vfs": false,
+                    "raw_authorization_stored": false,
+                    "raw_signed_payload_stored": false
+                }),
+                header_name: "Authorization",
+                header_value: "Payment test".into(),
+            })
+        }
+    }
+
+    /// Regression: once the MPP path has validated its sealed action, the
+    /// backend must execute against the sealed request/challenge/requirement,
+    /// not a `challenge.json` / `request.toml` projection an attacker tampered
+    /// with after sealing.
+    #[tokio::test]
+    async fn mpp_confirm_uses_sealed_execution_not_tampered_projection() {
+        let dir = tempfile::tempdir().unwrap();
+        let pending = dir.path().join("requests/pending/req_sealed_exec");
+        fs::create_dir_all(&pending).unwrap();
+        fs::write(pending.join("status"), "pending\n").unwrap();
+
+        // The sealed retry target the caller validated.
+        let (sealed_url, sealed_hits) = mock_server(
+            200,
+            &[("payment-receipt", r#"{"status":"success"}"#)],
+            b"sealed paid response\n",
+        )
+        .await;
+        // A second server that must NEVER be contacted (the tampered target).
+        let (tampered_url, tampered_hits) = mock_server(200, &[], b"tampered response\n").await;
+
+        let sealed_challenge = normalize_challenge(
+            &HeaderMap::new(),
+            br#"{"protocol":"tempo-mpp","type":"Charge","network":"tempo","asset":"pathUSD","amount":"0.10","amountUsd":0.10}"#,
+            &Url::parse(&sealed_url).unwrap(),
+        );
+        let sealed_request = ParsedRequest {
+            method: "GET".into(),
+            url: Url::parse(&sealed_url).unwrap(),
+            wallet: Some("sealed-wallet".into()),
+            max_amount_usd: None,
+            headers: BTreeMap::new(),
+            body: None,
+        };
+        let sealed_requirement = PaymentRequirement {
+            scheme: Some("exact".into()),
+            network: Some("tempo".into()),
+            asset: Some("pathUSD".into()),
+            amount: Some("0.10".into()),
+            pay_to: None,
+            resource: Some(sealed_url.clone()),
+            raw: json!({"scheme": "exact"}),
+        };
+
+        // Tamper the mutable pending projection after sealing: a different
+        // merchant/URL/wallet that would divert the payment if it were read.
+        let tampered_challenge = normalize_challenge(
+            &HeaderMap::new(),
+            br#"{"protocol":"tempo-mpp","type":"Charge","network":"tempo","asset":"pathUSD","amount":"9.99","amountUsd":9.99}"#,
+            &Url::parse(&tampered_url).unwrap(),
+        );
+        write_json(pending.join("challenge.json"), &tampered_challenge).unwrap();
+        write_json(
+            pending.join("request.toml"),
+            &json!({"method":"GET","url":tampered_url,"wallet":"tamper-wallet","headers":{}}),
+        )
+        .unwrap();
+
+        let backend = CapturingMppBackend::default();
+        let result = confirm_with_backend(
+            dir.path(),
+            "req_sealed_exec",
+            b"confirm",
+            &backend,
+            ConfirmBackendOptions {
+                checks_override: Some(vec![]),
+                sealed_execution: Some(ConfirmExecutionInputs {
+                    request: &sealed_request,
+                    challenge: &sealed_challenge,
+                    requirement: &sealed_requirement,
+                    wallet: "sealed-wallet",
+                    dry_run: false,
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.final_state, "sent");
+
+        // The backend saw the sealed request/challenge/wallet, never the
+        // tampered projection.
+        let (merchant, url, wallet) = backend.seen.lock().unwrap().clone().unwrap();
+        let sealed_host = Url::parse(&sealed_url)
+            .unwrap()
+            .host_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(merchant, sealed_host);
+        assert_eq!(url, sealed_url);
+        assert_eq!(wallet, "sealed-wallet");
+
+        // The sealed retry target was contacted; the tampered one was not.
+        assert_eq!(sealed_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(tampered_hits.load(Ordering::SeqCst), 0);
+    }
+
     #[test]
     fn mpp_session_id_must_be_single_safe_segment() {
         let dir = tempfile::tempdir().unwrap();
@@ -4788,6 +4979,7 @@ inline = '{"prompt":"hi"}'
                 policy_override: Some(&policy),
                 checks_override: Some(Vec::new()),
                 sentinel_override: Some("override"),
+                ..Default::default()
             },
         )
         .await
@@ -4946,6 +5138,9 @@ inline = '{"prompt":"hi"}'
             PaidHttpSigningFacts {
                 protocol: "mpp".into(),
                 request_id: "req_mpp_host".into(),
+                method: "GET".into(),
+                url: "https://merchant.test/pay".into(),
+                host: "merchant.test".into(),
                 policy_snapshot_digest: Some(action.petal_policy_digest.clone()),
                 ..Default::default()
             },
@@ -5030,6 +5225,9 @@ inline = '{"prompt":"hi"}'
             PaidHttpSigningFacts {
                 protocol: "mpp".into(),
                 request_id: "req_mpp_wrong_intent".into(),
+                method: "GET".into(),
+                url: "https://merchant.test/pay".into(),
+                host: "merchant.test".into(),
                 policy_snapshot_digest: Some(action.petal_policy_digest.clone()),
                 ..Default::default()
             },

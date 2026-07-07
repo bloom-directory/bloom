@@ -152,15 +152,6 @@ fn mount_write_path_uses_wallet_signer(path: &VfsPath) -> bool {
         {
             true
         }
-        // Confirming a paid HTTP request is a first-party Sealed Approval action:
-        // the requests handler stages an approval challenge on the first write and
-        // only signs under a grant-gated PetalHost signature, so it must reach the
-        // VFS handler rather than be denied at the mount lane (mirrors policy.toml).
-        [root, _wallet, ps, leaf]
-            if root == "wallets" && ps == "policy-session" && leaf == "new" =>
-        {
-            true
-        }
         [root, _network, branch, _wallet, leaf]
             if root == "hyperliquid" && branch == "agent_sessions" && leaf == "new.json" =>
         {
@@ -187,11 +178,12 @@ fn mount_write_path_uses_wallet_signer(path: &VfsPath) -> bool {
         {
             true
         }
-        // policy.toml writes flow through to the VFS wallets handler, which
-        // stages a first-party Sealed Approval for passkey wallets (challenge +
-        // grant-gated install) and writes local policy immediately. They no
-        // longer route through the disabled write_unlocked re-sign lane, so the
-        // mount must forward them to `vfs.write` rather than deny on flush.
+        // policy.toml and policy-session/new writes flow through to the VFS
+        // wallets handler, which stages a first-party Sealed Approval for passkey
+        // wallets (challenge + grant-gated install/mint) and writes local policy
+        // immediately. They no longer route through the disabled write_unlocked
+        // re-sign lane, so the mount must forward them to `vfs.write` rather than
+        // deny on flush.
         _ => false,
     }
 }
@@ -1414,6 +1406,33 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, FsError::PermissionDenied));
+    }
+
+    #[test]
+    fn mount_classifier_forwards_handler_owned_sealed_approval_writes() {
+        // Handler-owned Sealed Approval actions must reach the VFS handler, not
+        // be denied at the mount signer lane. policy-session/new now behaves
+        // like policy.toml: the wallets handler enforces Sealed Approval.
+        for path in [
+            "/wallets/minnow/policy.toml",
+            "/wallets/minnow/policy-session/new",
+            "/requests/pending/req_1/confirm",
+        ] {
+            let p = VfsPath::parse(path).unwrap();
+            assert!(!mount_write_path_uses_wallet_signer(&p), "{path}");
+        }
+        // Truly raw signer lanes remain denied at the mount lane.
+        for path in [
+            "/wallets/minnow/sign/message",
+            "/wallets/minnow/sign/hash",
+            "/wallets/minnow/sign/typed_data",
+            "/wallets/minnow/chains/polygon/outbox/pending/0001/cancel",
+            "/wallets/minnow/chains/polygon/outbox/pending/0001/replace",
+            "/hyperliquid/mainnet/exchange/minnow/order.json",
+        ] {
+            let p = VfsPath::parse(path).unwrap();
+            assert!(mount_write_path_uses_wallet_signer(&p), "{path}");
+        }
     }
 
     #[tokio::test]
