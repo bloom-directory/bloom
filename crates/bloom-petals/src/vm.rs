@@ -222,7 +222,6 @@ fn link_wasi_for_mode(
         crate::meta::PetalMode::Local => {
             preview1::add_to_linker_async(linker, |s: &mut StoreData| &mut s.wasi)?;
         }
-        crate::meta::PetalMode::Chain => {}
     }
     Ok(())
 }
@@ -234,15 +233,6 @@ fn link_imports_for_mode(
     use crate::meta::PetalMode;
     match mode {
         PetalMode::Local => link_local_imports(linker),
-        PetalMode::Chain => {
-            // Chain mode uses its own engine/store type (ChainStoreData) and
-            // is driven via PetalVm::run_chain_call, not via PetalVm::run.
-            // If someone calls PetalVm::run with Chain mode, return an error
-            // rather than silently running with no imports.
-            Err(anyhow::anyhow!(
-                "PetalMode::Chain is not supported via PetalVm::run; use PetalVm::run_chain_call"
-            ))
-        }
     }
 }
 

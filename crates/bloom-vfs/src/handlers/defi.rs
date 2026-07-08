@@ -30,11 +30,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use alloy::primitives::{Address, U256, address};
 use alloy::rpc::types::eth::TransactionRequest;
 use async_trait::async_trait;
-use bloom_chain::{ChainClient, ChainRegistry};
 use bloom_defi::{
     EnsoClient, EnsoError, RouteRequest, RouteResponse, RoutingStrategy, parse_natural_intent,
     resolve_token_symbol,
 };
+use bloom_evm::{ChainClient, ChainRegistry};
 use bloom_keystore::Keystore;
 use bloom_proto::{
     AddressBook, GasStrategy, HomeWritePermit, RawIntent, RawIntentBody, StagedTx,

@@ -6,7 +6,7 @@ license.workspace = true
 
 [dependencies]
 bloom-proto = { workspace = true }
-bloom-chain = { workspace = true }
+bloom-evm = { workspace = true }
 alloy = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -21,6 +21,6 @@ sha3 = { workspace = true }
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
 bloom-proto = { workspace = true }
-bloom-chain = { workspace = true }
+bloom-evm = { workspace = true }
 alloy = { workspace = true }
 hex = { workspace = true }

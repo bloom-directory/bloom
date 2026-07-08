@@ -21,13 +21,11 @@ bytecode-decompile = ["bloom-daemon/bytecode-decompile"]
 bloom-proto.workspace = true
 bloom-auth-api.workspace = true
 bloom-daemon.workspace = true
-bloom-chain-node = { path = "../bloom-chain-node" }
-bloom-chain-types = { path = "../bloom-chain-types" }
 blake3.workspace = true
 wat.workspace = true
 bloom-mount = { workspace = true, optional = true }
 bloom-keystore.workspace = true
-bloom-chain.workspace = true
+bloom-evm.workspace = true
 bloom-defi.workspace = true
 bloom-tx.workspace = true
 url.workspace = true
@@ -36,12 +34,6 @@ bloom-hyperliquid.workspace = true
 bloom-polymarket.workspace = true
 bloom-tools.workspace = true
 bloom-petals.workspace = true
-bloom-ptb-builder.workspace = true
-bloom-petal-fungible.workspace = true
-bloom-petal-manifest.workspace = true
-bloom-script.workspace = true
-bloom-objects.workspace = true
-bloom-value.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 clap_complete.workspace = true
@@ -66,4 +58,3 @@ predicates = "3"
 tempfile.workspace = true
 async-trait.workspace = true
 blake3.workspace = true
-bloom-test-util = { path = "../bloom-test-util" }

@@ -17,7 +17,7 @@ live-providers = []
 
 [dependencies]
 bloom-proto.workspace = true
-bloom-chain.workspace = true
+bloom-evm.workspace = true
 bloom-tools.workspace = true
 alloy.workspace = true
 alloy-dyn-abi.workspace = true

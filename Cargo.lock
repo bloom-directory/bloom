@@ -631,7 +631,7 @@ dependencies = [
  "futures",
  "futures-utils-wasm",
  "lru 0.16.4",
- "parking_lot 0.12.5",
+ "parking_lot",
  "pin-project",
  "reqwest 0.13.4",
  "serde",
@@ -677,7 +677,7 @@ dependencies = [
  "futures",
  "futures-utils-wasm",
  "lru 0.16.4",
- "parking_lot 0.12.5",
+ "parking_lot",
  "pin-project",
  "reqwest 0.13.4",
  "serde",
@@ -701,7 +701,7 @@ dependencies = [
  "auto_impl",
  "bimap",
  "futures",
- "parking_lot 0.12.5",
+ "parking_lot",
  "serde",
  "serde_json",
  "tokio",
@@ -723,7 +723,7 @@ dependencies = [
  "auto_impl",
  "bimap",
  "futures",
- "parking_lot 0.12.5",
+ "parking_lot",
  "serde",
  "serde_json",
  "tokio",
@@ -1213,7 +1213,7 @@ dependencies = [
  "derive_more",
  "futures",
  "futures-utils-wasm",
- "parking_lot 0.12.5",
+ "parking_lot",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -1237,7 +1237,7 @@ dependencies = [
  "futures",
  "futures-utils-wasm",
  "governor",
- "parking_lot 0.12.5",
+ "parking_lot",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -2168,12 +2168,6 @@ dependencies = [
 
 [[package]]
 name = "bitflags"
-version = "1.3.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bef38d45163c2f1dde094a7dfd33ccf595c92905c8f8f4fdc18d06fb1037718a"
-
-[[package]]
-name = "bitflags"
 version = "2.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c4512299f36f043ab09a583e57bceb5a5aab7a73db1805848e8fef3c9e8c78b3"
@@ -2255,26 +2249,17 @@ dependencies = [
  "base64 0.22.1",
  "blake3",
  "bloom-auth-api",
- "bloom-chain",
- "bloom-chain-node",
- "bloom-chain-types",
  "bloom-daemon",
  "bloom-defi",
+ "bloom-evm",
  "bloom-hyperliquid",
  "bloom-keystore",
  "bloom-mount",
- "bloom-objects",
- "bloom-petal-fungible",
- "bloom-petal-manifest",
  "bloom-petals",
  "bloom-polymarket",
  "bloom-proto",
- "bloom-ptb-builder",
- "bloom-script",
- "bloom-test-util",
  "bloom-tools",
  "bloom-tx",
- "bloom-value",
  "bloom-vfs",
  "clap",
  "clap_complete",
@@ -2305,7 +2290,7 @@ dependencies = [
  "blake3",
  "bloom-auth-api",
  "bloom-prices",
- "parking_lot 0.12.5",
+ "parking_lot",
  "rusqlite",
  "serde_json",
  "tempfile",
@@ -2326,115 +2311,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "bloom-chain"
-version = "0.1.0"
-dependencies = [
- "alloy 2.0.5",
- "anyhow",
- "async-trait",
- "bloom-proto",
- "bloom-rpc",
- "hex",
- "parking_lot 0.12.5",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
- "url",
-]
-
-[[package]]
-name = "bloom-chain-abi"
-version = "0.1.0"
-dependencies = [
- "blake3",
-]
-
-[[package]]
-name = "bloom-chain-consensus"
-version = "0.1.0"
-dependencies = [
- "blake3",
- "bloom-chain-types",
- "bloom-script",
- "bloom-test-util",
- "ethereum_ssz",
- "serde",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "bloom-chain-node"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "base64 0.22.1",
- "blake3",
- "bloom-chain-consensus",
- "bloom-chain-state",
- "bloom-chain-types",
- "bloom-keystore",
- "bloom-objects",
- "bloom-petal-fungible",
- "bloom-petal-manifest",
- "bloom-petals",
- "bloom-script",
- "bloom-test-util",
- "bloom-value",
- "clap",
- "hex",
- "parking_lot 0.12.5",
- "rand 0.8.6",
- "rusqlite",
- "serde",
- "serde_json",
- "sled",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "toml 0.8.23",
- "tracing",
- "wasmparser 0.218.1",
- "wat",
- "zbase32",
-]
-
-[[package]]
-name = "bloom-chain-state"
-version = "0.1.0"
-dependencies = [
- "blake3",
- "bloom-chain-types",
- "bloom-objects",
- "ethereum_ssz",
- "hex",
- "proptest",
- "serde",
- "sled",
- "tempfile",
- "thiserror 2.0.18",
-]
-
-[[package]]
-name = "bloom-chain-types"
-version = "0.1.0"
-dependencies = [
- "blake3",
- "ethereum_ssz",
- "ethereum_ssz_derive",
- "hex",
- "proptest",
- "serde",
- "thiserror 2.0.18",
- "zbase32",
-]
-
-[[package]]
 name = "bloom-daemon"
 version = "0.1.0"
 dependencies = [
@@ -2446,33 +2322,27 @@ dependencies = [
  "blake3",
  "bloom-auth",
  "bloom-auth-api",
- "bloom-chain",
- "bloom-chain-node",
- "bloom-chain-types",
  "bloom-defi",
  "bloom-ens",
  "bloom-etherscan",
+ "bloom-evm",
  "bloom-hyperliquid",
  "bloom-keystore",
  "bloom-mempool",
  "bloom-mount",
- "bloom-objects",
  "bloom-paid-http",
  "bloom-petals",
  "bloom-polymarket",
  "bloom-prices",
  "bloom-proto",
- "bloom-ptb-builder",
  "bloom-revert",
- "bloom-script",
- "bloom-test-util",
  "bloom-tools",
  "bloom-tx",
  "bloom-vfs",
  "bloom-watch",
  "futures",
  "hex",
- "parking_lot 0.12.5",
+ "parking_lot",
  "serde",
  "serde_json",
  "tempfile",
@@ -2502,23 +2372,15 @@ dependencies = [
 ]
 
 [[package]]
-name = "bloom-dex-math"
-version = "0.1.0"
-dependencies = [
- "thiserror 2.0.18",
- "uint",
-]
-
-[[package]]
 name = "bloom-ens"
 version = "0.1.0"
 dependencies = [
  "alloy 2.0.5",
  "async-trait",
- "bloom-chain",
+ "bloom-evm",
  "bloom-proto",
  "hex",
- "parking_lot 0.12.5",
+ "parking_lot",
  "serde",
  "serde_json",
  "sha3 0.10.9",
@@ -2535,8 +2397,28 @@ dependencies = [
  "async-trait",
  "bloom-proto",
  "hex",
- "parking_lot 0.12.5",
+ "parking_lot",
  "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "url",
+]
+
+[[package]]
+name = "bloom-evm"
+version = "0.1.0"
+dependencies = [
+ "alloy 2.0.5",
+ "anyhow",
+ "async-trait",
+ "bloom-proto",
+ "bloom-rpc",
+ "hex",
+ "parking_lot",
  "serde",
  "serde_json",
  "tempfile",
@@ -2575,13 +2457,11 @@ dependencies = [
  "blake3",
  "bloom-auth",
  "bloom-auth-api",
- "bloom-chain",
- "bloom-chain-node",
  "bloom-daemon",
+ "bloom-evm",
  "bloom-keystore",
  "bloom-proto",
  "bloom-revert",
- "bloom-test-util",
  "bloom-tx",
  "bloom-vfs",
  "bloom-watch",
@@ -2608,14 +2488,13 @@ dependencies = [
  "blake3",
  "bloom-auth",
  "bloom-auth-api",
- "bloom-chain-types",
  "bloom-proto",
  "chacha20poly1305",
  "ed25519-dalek",
  "hex",
  "ml-dsa",
  "open",
- "parking_lot 0.12.5",
+ "parking_lot",
  "rand 0.8.6",
  "reqwest 0.12.28",
  "serde",
@@ -2639,13 +2518,13 @@ dependencies = [
  "alloy-dyn-abi",
  "anyhow",
  "async-trait",
- "bloom-chain",
+ "bloom-evm",
  "bloom-keystore",
  "bloom-proto",
  "bloom-tools",
  "futures",
  "hex",
- "parking_lot 0.12.5",
+ "parking_lot",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
@@ -2669,21 +2548,11 @@ dependencies = [
  "embednfs",
  "futures",
  "lru 0.12.5",
- "parking_lot 0.12.5",
+ "parking_lot",
  "serde",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
-]
-
-[[package]]
-name = "bloom-objects"
-version = "0.1.0"
-dependencies = [
- "blake3",
- "bloom-chain-types",
- "hex",
- "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -2733,181 +2602,17 @@ dependencies = [
 ]
 
 [[package]]
-name = "bloom-petal-cap"
-version = "0.1.0"
-dependencies = [
- "bloom-objects",
- "bloom-petal-manifest",
- "bloom-resource",
- "bloom-resource-macros",
- "bloom-script",
- "bloom-value",
-]
-
-[[package]]
-name = "bloom-petal-dex-cpmm"
-version = "0.1.0"
-dependencies = [
- "bloom-dex-math",
- "bloom-objects",
- "bloom-resource",
- "bloom-resource-macros",
-]
-
-[[package]]
-name = "bloom-petal-dex-faucet"
-version = "0.1.0"
-dependencies = [
- "bloom-objects",
- "bloom-petal-fungible",
- "bloom-resource",
- "bloom-resource-macros",
-]
-
-[[package]]
-name = "bloom-petal-dex-it"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "base64 0.22.1",
- "blake3",
- "bloom-chain-consensus",
- "bloom-chain-node",
- "bloom-chain-state",
- "bloom-chain-types",
- "bloom-dex-math",
- "bloom-keystore",
- "bloom-objects",
- "bloom-petal-dex-cpmm",
- "bloom-petal-dex-faucet",
- "bloom-petal-dex-pool",
- "bloom-petal-dex-router",
- "bloom-petal-dex-wallet",
- "bloom-petal-fungible",
- "bloom-petal-manifest",
- "bloom-petals",
- "bloom-ptb-builder",
- "bloom-resource",
- "bloom-script",
- "bloom-vfs",
- "hex",
- "serde_json",
- "tokio",
- "tracing-subscriber 0.3.23",
- "wat",
-]
-
-[[package]]
-name = "bloom-petal-dex-pool"
-version = "0.1.0"
-dependencies = [
- "bloom-dex-math",
- "bloom-objects",
- "bloom-petal-fungible",
- "bloom-petal-manifest",
- "bloom-resource",
- "bloom-resource-macros",
- "bloom-value",
-]
-
-[[package]]
-name = "bloom-petal-dex-router"
-version = "0.1.0"
-dependencies = [
- "bloom-dex-math",
- "bloom-objects",
- "bloom-petal-dex-pool",
- "bloom-petal-fungible",
- "bloom-resource",
- "bloom-resource-macros",
-]
-
-[[package]]
-name = "bloom-petal-dex-wallet"
-version = "0.1.0"
-dependencies = [
- "bloom-objects",
- "bloom-resource",
- "bloom-resource-macros",
-]
-
-[[package]]
-name = "bloom-petal-fungible"
-version = "0.1.0"
-dependencies = [
- "bloom-objects",
- "bloom-petal-manifest",
- "bloom-resource",
- "bloom-resource-macros",
- "bloom-value",
-]
-
-[[package]]
-name = "bloom-petal-identity"
-version = "0.1.0"
-dependencies = [
- "blake3",
- "bloom-chain-node",
- "bloom-chain-state",
- "bloom-chain-types",
- "bloom-objects",
- "bloom-petal-fungible",
- "bloom-petal-manifest",
- "bloom-petals",
- "bloom-resource",
- "bloom-resource-macros",
- "bloom-script",
- "wasmparser 0.218.1",
-]
-
-[[package]]
-name = "bloom-petal-it"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "blake3",
- "bloom-chain-node",
- "bloom-chain-state",
- "bloom-chain-types",
- "bloom-objects",
- "bloom-petal-fungible",
- "bloom-petal-manifest",
- "bloom-petals",
- "bloom-resource",
- "bloom-script",
- "tracing-subscriber 0.3.23",
- "wat",
-]
-
-[[package]]
-name = "bloom-petal-manifest"
-version = "0.1.0"
-dependencies = [
- "bloom-chain-types",
- "bloom-objects",
- "bloom-script",
- "bloom-value",
- "wasmparser 0.218.1",
-]
-
-[[package]]
 name = "bloom-petals"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
  "blake3",
- "bloom-chain-state",
- "bloom-chain-types",
- "bloom-objects",
- "bloom-petal-manifest",
  "bloom-proto",
- "bloom-script",
- "bloom-value",
  "bloom-vfs",
  "futures",
  "hex",
- "parking_lot 0.12.5",
+ "parking_lot",
  "serde",
  "serde_json",
  "tempfile",
@@ -2951,7 +2656,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "bloom-proto",
- "parking_lot 0.12.5",
+ "parking_lot",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
@@ -2972,7 +2677,7 @@ dependencies = [
  "fs2",
  "hex",
  "humantime-serde",
- "parking_lot 0.12.5",
+ "parking_lot",
  "serde",
  "serde_json",
  "sha3 0.10.9",
@@ -2983,52 +2688,17 @@ dependencies = [
 ]
 
 [[package]]
-name = "bloom-ptb-builder"
-version = "0.1.0"
-dependencies = [
- "bloom-chain-types",
- "bloom-objects",
- "bloom-petal-fungible",
- "bloom-petal-manifest",
- "bloom-resource",
- "bloom-script",
- "thiserror 2.0.18",
-]
-
-[[package]]
-name = "bloom-resource"
-version = "0.1.0"
-dependencies = [
- "bloom-chain-types",
- "bloom-objects",
- "bloom-value",
- "thiserror 2.0.18",
-]
-
-[[package]]
-name = "bloom-resource-macros"
-version = "0.1.0"
-dependencies = [
- "bloom-objects",
- "bloom-petal-manifest",
- "bloom-resource",
- "proc-macro2",
- "quote",
- "syn 2.0.117",
-]
-
-[[package]]
 name = "bloom-revert"
 version = "0.1.0"
 dependencies = [
  "alloy 2.0.5",
  "alloy-dyn-abi",
  "async-trait",
- "bloom-chain",
  "bloom-etherscan",
+ "bloom-evm",
  "heimdall-decompiler",
  "hex",
- "parking_lot 0.12.5",
+ "parking_lot",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
@@ -3048,7 +2718,7 @@ dependencies = [
  "alloy 2.0.5",
  "async-trait",
  "bloom-proto",
- "parking_lot 0.12.5",
+ "parking_lot",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -3056,37 +2726,6 @@ dependencies = [
  "tower",
  "tracing",
  "url",
-]
-
-[[package]]
-name = "bloom-script"
-version = "0.1.0"
-dependencies = [
- "blake3",
- "bloom-chain-types",
- "bloom-objects",
- "bloom-resource",
- "bloom-value",
- "hex",
- "serde_json",
- "thiserror 2.0.18",
-]
-
-[[package]]
-name = "bloom-test-util"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "blake3",
- "bloom-chain-consensus",
- "bloom-chain-state",
- "bloom-chain-types",
- "bloom-keystore",
- "bloom-vfs",
- "serde_json",
- "tempfile",
- "tokio",
 ]
 
 [[package]]
@@ -3116,14 +2755,14 @@ dependencies = [
  "base64 0.22.1",
  "blake3",
  "bloom-auth-api",
- "bloom-chain",
+ "bloom-evm",
  "bloom-keystore",
  "bloom-mempool",
  "bloom-proto",
  "bloom-rpc",
  "bloom-tools",
  "hex",
- "parking_lot 0.12.5",
+ "parking_lot",
  "rand 0.8.6",
  "serde",
  "serde_json",
@@ -3132,16 +2771,6 @@ dependencies = [
  "tokio",
  "toml 0.8.23",
  "tracing",
-]
-
-[[package]]
-name = "bloom-value"
-version = "0.1.0"
-dependencies = [
- "bloom-objects",
- "hex",
- "serde_json",
- "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -3156,36 +2785,29 @@ dependencies = [
  "blake3",
  "bloom-auth",
  "bloom-auth-api",
- "bloom-chain",
- "bloom-chain-types",
  "bloom-defi",
  "bloom-ens",
  "bloom-etherscan",
+ "bloom-evm",
  "bloom-hyperliquid",
  "bloom-keystore",
  "bloom-mempool",
- "bloom-objects",
  "bloom-paid-http",
  "bloom-paid-mpp",
  "bloom-paid-x402",
- "bloom-petal-fungible",
- "bloom-petal-manifest",
  "bloom-polymarket",
  "bloom-prices",
  "bloom-proto",
- "bloom-ptb-builder",
  "bloom-revert",
  "bloom-rpc",
- "bloom-script",
  "bloom-tools",
  "bloom-tx",
- "bloom-value",
  "bloom-watch",
  "hex",
  "lru 0.12.5",
  "mpp",
  "once_cell",
- "parking_lot 0.12.5",
+ "parking_lot",
  "rand 0.8.6",
  "reqwest 0.12.28",
  "serde",
@@ -3204,10 +2826,10 @@ version = "0.1.0"
 dependencies = [
  "alloy 2.0.5",
  "anyhow",
- "bloom-chain",
+ "bloom-evm",
  "bloom-proto",
  "futures",
- "parking_lot 0.12.5",
+ "parking_lot",
  "serde",
  "serde_json",
  "tempfile",
@@ -3971,16 +3593,6 @@ dependencies = [
 
 [[package]]
 name = "darling"
-version = "0.13.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a01d95850c592940db9b8194bc39f4bc0e89dee5c4265e4b1807c34a9aba453c"
-dependencies = [
- "darling_core 0.13.4",
- "darling_macro 0.13.4",
-]
-
-[[package]]
-name = "darling"
 version = "0.14.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7b750cb3417fd1b327431a470f388520309479ab0bf5e323505daf0290cd3850"
@@ -4007,20 +3619,6 @@ checksum = "25ae13da2f202d56bd7f91c25fba009e7717a1e4a1cc98a76d844b65ae912e9d"
 dependencies = [
  "darling_core 0.23.0",
  "darling_macro 0.23.0",
-]
-
-[[package]]
-name = "darling_core"
-version = "0.13.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "859d65a907b6852c9361e3185c862aae7fafd2887876799fa55f5f99dc40d610"
-dependencies = [
- "fnv",
- "ident_case",
- "proc-macro2",
- "quote",
- "strsim 0.10.0",
- "syn 1.0.109",
 ]
 
 [[package]]
@@ -4067,17 +3665,6 @@ dependencies = [
 
 [[package]]
 name = "darling_macro"
-version = "0.13.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9c972679f83bdf9c42bd905396b6c3588a843a17f0f16dfcfa3e2c5d57441835"
-dependencies = [
- "darling_core 0.13.4",
- "quote",
- "syn 1.0.109",
-]
-
-[[package]]
-name = "darling_macro"
 version = "0.14.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a4aab4dbc9f7611d8b55048a3a16d2d010c2c8334e46304b40ac1cc14bf3b48e"
@@ -4120,7 +3707,7 @@ dependencies = [
  "hashbrown 0.14.5",
  "lock_api",
  "once_cell",
- "parking_lot_core 0.9.12",
+ "parking_lot_core",
 ]
 
 [[package]]
@@ -4632,46 +4219,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ethereum_serde_utils"
-version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3dc1355dbb41fbbd34ec28d4fb2a57d9a70c67ac3c19f6a5ca4d4a176b9e997a"
-dependencies = [
- "alloy-primitives",
- "hex",
- "serde",
- "serde_derive",
- "serde_json",
-]
-
-[[package]]
-name = "ethereum_ssz"
-version = "0.10.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e462875ad8693755ea8913d6e905715c76ea4836e2254e18c9cf0f7a8f8c2a13"
-dependencies = [
- "alloy-primitives",
- "ethereum_serde_utils",
- "itertools 0.14.0",
- "serde",
- "serde_derive",
- "smallvec",
- "typenum",
-]
-
-[[package]]
-name = "ethereum_ssz_derive"
-version = "1.0.0-beta.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8b686a7fe25ffac20ffef791a802bb55d4245c64277884ea6db63e857306a30f"
-dependencies = [
- "darling 0.13.4",
- "proc-macro2",
- "quote",
- "syn 1.0.109",
-]
-
-[[package]]
 name = "eventsource-stream"
 version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4972,15 +4519,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "42012b0f064e01aa58b545fe3727f90f7dd4020f4a3ea735b50344965f5a57e9"
 
 [[package]]
-name = "fxhash"
-version = "0.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c31b6d751ae2c7f11320402d34e41349dd1016f8d5d45e48c4312bc8625af50c"
-dependencies = [
- "byteorder",
-]
-
-[[package]]
 name = "generic-array"
 version = "0.14.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5061,7 +4599,7 @@ dependencies = [
  "futures-util",
  "hashbrown 0.16.1",
  "nonzero_ext",
- "parking_lot 0.12.5",
+ "parking_lot",
  "portable-atomic",
  "quanta",
  "smallvec",
@@ -6509,7 +6047,7 @@ version = "0.10.80"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a45fa2aa886c42762255da344f0a0d313e254066c46aad76f300c3d3da62d967"
 dependencies = [
- "bitflags 2.11.1",
+ "bitflags",
  "cfg-if",
  "foreign-types",
  "libc",
@@ -6595,37 +6133,12 @@ dependencies = [
 
 [[package]]
 name = "parking_lot"
-version = "0.11.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7d17b78036a60663b797adeaee46f5c9dfebb86948d1255007a1d6be0271ff99"
-dependencies = [
- "instant",
- "lock_api",
- "parking_lot_core 0.8.6",
-]
-
-[[package]]
-name = "parking_lot"
 version = "0.12.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "93857453250e3077bd71ff98b6a65ea6621a19bb0f559a85248955ac12c45a1a"
 dependencies = [
  "lock_api",
- "parking_lot_core 0.9.12",
-]
-
-[[package]]
-name = "parking_lot_core"
-version = "0.8.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "60a2cfe6f0ad2bfc16aefa463b497d5c7a5ecd44a23efa72aa342d90177356dc"
-dependencies = [
- "cfg-if",
- "instant",
- "libc",
- "redox_syscall 0.2.16",
- "smallvec",
- "winapi",
+ "parking_lot_core",
 ]
 
 [[package]]
@@ -6636,7 +6149,7 @@ checksum = "2621685985a2ebf1c516881c026032ac7deafcda1a2c9b7850dc81e3dfcb64c1"
 dependencies = [
  "cfg-if",
  "libc",
- "redox_syscall 0.5.18",
+ "redox_syscall",
  "smallvec",
  "windows-link",
 ]
@@ -6959,7 +6472,7 @@ checksum = "4b45fcc2344c680f5025fe57779faef368840d0bd1f42f216291f0dc4ace4744"
 dependencies = [
  "bit-set 0.8.0",
  "bit-vec 0.8.0",
- "bitflags 2.11.1",
+ "bitflags",
  "num-traits",
  "rand 0.9.4",
  "rand_chacha 0.9.0",
@@ -7225,7 +6738,7 @@ version = "11.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "498cd0dc59d73224351ee52a95fee0f1a617a2eae0e7d9d720cc622c73a54186"
 dependencies = [
- "bitflags 2.11.1",
+ "bitflags",
 ]
 
 [[package]]
@@ -7256,20 +6769,11 @@ checksum = "d3edd4d5d42c92f0a659926464d4cce56b562761267ecf0f469d85b7de384175"
 
 [[package]]
 name = "redox_syscall"
-version = "0.2.16"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fb5a58c1855b4b6819d59012155603f0b22ad30cad752600aadfcb695265519a"
-dependencies = [
- "bitflags 1.3.2",
-]
-
-[[package]]
-name = "redox_syscall"
 version = "0.5.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed2bf2547551a7053d6fdfafda3f938979645c44812fbfcda098faae3f1a362d"
 dependencies = [
- "bitflags 2.11.1",
+ "bitflags",
 ]
 
 [[package]]
@@ -7818,7 +7322,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c32490ed687dba31c3c882beb8c20408bdd30ef96690d8f145b0ee9a87040bfe"
 dependencies = [
  "alloy-eip7928 0.3.7",
- "bitflags 2.11.1",
+ "bitflags",
  "revm-bytecode 10.0.0",
  "revm-primitives 23.0.0",
 ]
@@ -7830,7 +7334,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40eff6067185cf80932e06f6a9c8045b012ecb6f99a8d6edc618ec2792373e14"
 dependencies = [
  "alloy-eip7928 0.4.4",
- "bitflags 2.11.1",
+ "bitflags",
  "nonmax",
  "revm-bytecode 11.0.1",
  "revm-primitives 24.0.1",
@@ -7989,7 +7493,7 @@ version = "0.31.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b838eba278d213a8beaf485bd313fd580ca4505a00d5871caeb1457c55322cae"
 dependencies = [
- "bitflags 2.11.1",
+ "bitflags",
  "fallible-iterator",
  "fallible-streaming-iterator",
  "hashlink",
@@ -8062,7 +7566,7 @@ version = "0.38.44"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fdb5bc1ae2baa591800df16c9ca78619bf65c0488b41b96ccec5d11220d8c154"
 dependencies = [
- "bitflags 2.11.1",
+ "bitflags",
  "errno",
  "libc",
  "linux-raw-sys 0.4.15",
@@ -8075,7 +7579,7 @@ version = "1.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6fe4565b9518b83ef4f91bb47ce29620ca828bd32cb7e408f0062e9930ba190"
 dependencies = [
- "bitflags 2.11.1",
+ "bitflags",
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
@@ -8339,7 +7843,7 @@ version = "3.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b7f4bc775c73d9a02cde8bf7b2ec4c9d12743edf609006c7facc23998404cd1d"
 dependencies = [
- "bitflags 2.11.1",
+ "bitflags",
  "core-foundation 0.10.1",
  "core-foundation-sys",
  "libc",
@@ -8539,7 +8043,7 @@ dependencies = [
  "futures-util",
  "log",
  "once_cell",
- "parking_lot 0.12.5",
+ "parking_lot",
  "scc",
  "serial_test_derive",
 ]
@@ -8734,22 +8238,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 
 [[package]]
-name = "sled"
-version = "0.34.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7f96b4737c2ce5987354855aed3797279def4ebf734436c6aa4552cf8e169935"
-dependencies = [
- "crc32fast",
- "crossbeam-epoch",
- "crossbeam-utils",
- "fs2",
- "fxhash",
- "libc",
- "log",
- "parking_lot 0.11.2",
-]
-
-[[package]]
 name = "slice-group-by"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8932,7 +8420,7 @@ version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a13f3d0daba03132c0aa9767f98351b3488edc2c100cda2d2ec2b04f3d8d3c8b"
 dependencies = [
- "bitflags 2.11.1",
+ "bitflags",
  "core-foundation 0.9.4",
  "system-configuration-sys",
 ]
@@ -8953,7 +8441,7 @@ version = "0.27.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cc4592f674ce18521c2a81483873a49596655b179f71c5e05d10c1fe66c78745"
 dependencies = [
- "bitflags 2.11.1",
+ "bitflags",
  "cap-fs-ext",
  "cap-std",
  "fd-lock",
@@ -9214,7 +8702,7 @@ dependencies = [
  "bytes",
  "libc",
  "mio",
- "parking_lot 0.12.5",
+ "parking_lot",
  "pin-project-lite",
  "signal-hook-registry",
  "socket2",
@@ -9438,7 +8926,7 @@ version = "0.6.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4cfcf7e2740e6fc6d4d688b4ef00650406bb94adf4731e43c096c3a19fe40840"
 dependencies = [
- "bitflags 2.11.1",
+ "bitflags",
  "bytes",
  "futures-util",
  "http",
@@ -9902,7 +9390,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "059739c2eac26eea736389a7d6d30b41a8201490bea204d0facde19183359849"
 dependencies = [
  "ahash 0.8.12",
- "bitflags 2.11.1",
+ "bitflags",
  "hashbrown 0.14.5",
  "indexmap 2.14.0",
  "semver 1.0.28",
@@ -9915,7 +9403,7 @@ version = "0.244.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "47b807c72e1bac69382b3a6fb3dbe8ea4c0ed87ff5629b8685ae6b9a611028fe"
 dependencies = [
- "bitflags 2.11.1",
+ "bitflags",
  "hashbrown 0.15.5",
  "indexmap 2.14.0",
  "semver 1.0.28",
@@ -9927,7 +9415,7 @@ version = "0.250.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "071d99cdfb8111603ed05500506c3298a940b58d609dd0259d3981785dd33556"
 dependencies = [
- "bitflags 2.11.1",
+ "bitflags",
  "indexmap 2.14.0",
  "semver 1.0.28",
 ]
@@ -9951,7 +9439,7 @@ checksum = "51e762e163fd305770c6c341df3290f0cabb3c264e7952943018e9a1ced8d917"
 dependencies = [
  "anyhow",
  "async-trait",
- "bitflags 2.11.1",
+ "bitflags",
  "bumpalo",
  "cc",
  "cfg-if",
@@ -10144,7 +9632,7 @@ checksum = "f16c8d87a45168131be6815045e6d46d7f6ddf65897c49444ab210488bce10dc"
 dependencies = [
  "anyhow",
  "async-trait",
- "bitflags 2.11.1",
+ "bitflags",
  "bytes",
  "cap-fs-ext",
  "cap-net-ext",
@@ -10204,7 +9692,7 @@ checksum = "1c598d6b99ea013e35844697fc4670d08339d5cda15588f193c6beedd12f644b"
 dependencies = [
  "futures",
  "js-sys",
- "parking_lot 0.12.5",
+ "parking_lot",
  "pin-utils",
  "slab",
  "wasm-bindgen",
@@ -10370,7 +9858,7 @@ checksum = "b0f25588cf5ea16f56c1af13244486d50c5a2cf67cc0c4e990c665944d741546"
 dependencies = [
  "anyhow",
  "async-trait",
- "bitflags 2.11.1",
+ "bitflags",
  "thiserror 1.0.69",
  "tracing",
  "wasmtime",
@@ -10786,7 +10274,7 @@ version = "0.36.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3f3fd376f71958b862e7afb20cfe5a22830e1963462f3a17f49d82a6c1d1f42d"
 dependencies = [
- "bitflags 2.11.1",
+ "bitflags",
  "windows-sys 0.59.0",
 ]
 
@@ -10877,7 +10365,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9d66ea20e9553b30172b5e831994e35fbde2d165325bec84fc43dbf6f4eb9cb2"
 dependencies = [
  "anyhow",
- "bitflags 2.11.1",
+ "bitflags",
  "indexmap 2.14.0",
  "log",
  "serde",
@@ -11050,12 +10538,6 @@ dependencies = [
  "syn 2.0.117",
  "synstructure",
 ]
-
-[[package]]
-name = "zbase32"
-version = "0.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0f9079049688da5871a7558ddacb7f04958862c703e68258594cb7a862b5e33f"
 
 [[package]]
 name = "zerocopy"

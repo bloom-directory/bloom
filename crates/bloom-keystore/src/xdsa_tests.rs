@@ -76,7 +76,7 @@ mod tests {
         assert_eq!(wallet.name, "alice");
 
         // Sign with loaded key and verify with stored pubkey.
-        let msg = b"hello bloom-chain";
+        let msg = b"hello bloom-evm";
         let sig = wallet.sign(msg);
         pk.verify(msg, &sig)
             .expect("loaded wallet must produce valid sig");

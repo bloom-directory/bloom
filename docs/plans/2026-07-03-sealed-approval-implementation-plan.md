@@ -66,7 +66,7 @@ Missing / violating (the work):
    no wallet DEK (§10).
 10. **`wallet-policy` Petal missing**; policy writes go straight through
     `keystore.write_policy` (`wallets.rs:818`).
-11. **`bloom-chain`/`pipe` signers present** (isolated but not hard-disabled).
+11. **`bloom-evm`/`pipe` signers present** (isolated but not hard-disabled).
 12. **"Layer-B" terminology** survives in comments (`passkey.rs:1712`,
     `bloom-vfs/src/auth.rs`, `wallets.rs`).
 13. **Tests**: spec §12 items 16–18, 20–28 uncovered (subject code absent).
@@ -477,7 +477,7 @@ revoked all deny).
 3. Implement `bloom wallet migrate-local-to-passkey <old> <new>` (may require
    old passphrase locally; creates a passkey wallet; never preserves
    passphrase signing).
-4. `bloom-chain`/`pipe`: hard-disable signing (compile-out feature or
+4. `bloom-evm`/`pipe`: hard-disable signing (compile-out feature or
    startup-fatal guard) per §11.6.
 5. Terminology sweep: purge "Layer-B" comments (`passkey.rs:1712`,
    `bloom-vfs/src/auth.rs`, `wallets.rs`), rename internals to Sealed

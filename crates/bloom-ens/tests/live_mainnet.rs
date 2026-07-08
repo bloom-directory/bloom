@@ -7,8 +7,8 @@
 //! `cargo test -p bloom-ens -- --ignored`.
 
 use alloy::primitives::{Address, address};
-use bloom_chain::ChainClient;
 use bloom_ens::EnsClient;
+use bloom_evm::ChainClient;
 use bloom_proto::ChainSpec;
 
 const VITALIK: Address = address!("d8dA6BF26964aF9D7eED9e03E53415D37aA96045");

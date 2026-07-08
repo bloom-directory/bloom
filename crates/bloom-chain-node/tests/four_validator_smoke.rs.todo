@@ -1,2 +1,0 @@
-// TODO(integration): see chain spec §15 acceptance
-// Full 4-validator smoke test belongs in crates/bloom-it/tests/chain_smoke.rs

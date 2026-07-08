@@ -49,7 +49,7 @@ pub const EIP1967_IMPL_SLOT: B256 = B256::new([
 ]);
 
 /// Storage-read abstraction. Lets [`EtherscanClient::json_abi_for`] follow
-/// EIP-1967 proxies without depending on `bloom-chain` directly.
+/// EIP-1967 proxies without depending on `bloom-evm` directly.
 #[async_trait::async_trait]
 pub trait StorageReader: Send + Sync {
     /// Read 32 bytes from `addr` at `slot` (latest block).

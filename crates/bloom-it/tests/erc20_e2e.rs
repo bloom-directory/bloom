@@ -34,7 +34,7 @@ use bloom_auth_api::{
     SignedApproval, SigningAttestation, SigningAttestationSchemaRegistry,
     petal_identity::{PETAL_ID_EVM_WALLET, PLACEHOLDER_DIGEST_EVM_WALLET},
 };
-use bloom_chain::{ChainClient, IERC20};
+use bloom_evm::{ChainClient, IERC20};
 use bloom_it::mint_evm_test_grant;
 use bloom_proto::{AgentAutonomyMode, ChainSpec, Policy, RawIntent, RawIntentBody};
 use bloom_tx::Outbox;

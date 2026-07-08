@@ -40,9 +40,9 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 
-use bloom_chain::{ChainClient, ChainRegistry};
 use bloom_ens::{EnsClient, EnsError};
 use bloom_etherscan::{AddressHistorySource, ContractMetadataSource, EtherscanClient};
+use bloom_evm::{ChainClient, ChainRegistry};
 use bloom_proto::{Backend, BackendsConfig, checksum_address};
 use bloom_revert::{DecodeContext, DecodedRevert, DecoderChain};
 use parking_lot::Mutex as PlMutex;
@@ -2520,7 +2520,7 @@ mod tests {
     // calls back-to-back, and the test mock answers each method with a
     // single canned response — so we seed `nft_cache` via the test seam
     // for tests that exercise reads beyond detection. Detection itself
-    // is covered by ChainClient unit tests in bloom-chain.
+    // is covered by ChainClient unit tests in bloom-evm.
 
     /// 32-byte big-endian encoding of a uint256 / bool / right-aligned
     /// address, wrapped as a JSON-RPC `result` string.
@@ -2572,7 +2572,7 @@ mod tests {
     /// kind cache pre-seeded.
     async fn nft_handler_with_seed(
         responses: std::collections::HashMap<String, serde_json::Value>,
-        seed: Option<bloom_chain::NftKind>,
+        seed: Option<bloom_evm::NftKind>,
     ) -> ChainsHandler {
         let rpc = spawn_rpc(31338, responses);
         let h = ChainsHandler::new(registry_for_rpc(rpc, 31338));
@@ -2689,7 +2689,7 @@ mod tests {
     async fn nft_collection_kind_returns_erc721_when_seeded() {
         let h = nft_handler_with_seed(
             std::collections::HashMap::new(),
-            Some(bloom_chain::NftKind::Erc721),
+            Some(bloom_evm::NftKind::Erc721),
         )
         .await;
         let p = VfsPath::parse(&format!("/test/contracts/{NFT_CONTRACT}/nft/kind")).unwrap();
@@ -2701,7 +2701,7 @@ mod tests {
     async fn nft_collection_kind_returns_erc1155_when_seeded() {
         let h = nft_handler_with_seed(
             std::collections::HashMap::new(),
-            Some(bloom_chain::NftKind::Erc1155),
+            Some(bloom_evm::NftKind::Erc1155),
         )
         .await;
         let p = VfsPath::parse(&format!("/test/contracts/{NFT_CONTRACT}/nft/kind")).unwrap();
@@ -2725,7 +2725,7 @@ mod tests {
         let owner_addr: alloy::primitives::Address = HOLDER_ADDR.parse().unwrap();
         let mut routes = std::collections::HashMap::new();
         routes.insert("eth_call".into(), enc_address_value(owner_addr));
-        let h = nft_handler_with_seed(routes, Some(bloom_chain::NftKind::Erc721)).await;
+        let h = nft_handler_with_seed(routes, Some(bloom_evm::NftKind::Erc721)).await;
         let p = VfsPath::parse(&format!("/test/contracts/{NFT_CONTRACT}/nft/owner_of/42")).unwrap();
         let bytes = h.read(&p).await.unwrap();
         let s = std::str::from_utf8(&bytes).unwrap().trim();
@@ -2741,7 +2741,7 @@ mod tests {
         // sentinel rather than erroring so directory walks stay clean.
         let h = nft_handler_with_seed(
             std::collections::HashMap::new(),
-            Some(bloom_chain::NftKind::Erc1155),
+            Some(bloom_evm::NftKind::Erc1155),
         )
         .await;
         let p = VfsPath::parse(&format!(
@@ -2756,7 +2756,7 @@ mod tests {
     async fn nft_approved_erc1155_returns_not_applicable() {
         let h = nft_handler_with_seed(
             std::collections::HashMap::new(),
-            Some(bloom_chain::NftKind::Erc1155),
+            Some(bloom_evm::NftKind::Erc1155),
         )
         .await;
         let p = VfsPath::parse(&format!(
@@ -2774,7 +2774,7 @@ mod tests {
             "eth_call".into(),
             enc_string_value("ipfs://QmFoo/{id}.json"),
         );
-        let h = nft_handler_with_seed(routes, Some(bloom_chain::NftKind::Erc1155)).await;
+        let h = nft_handler_with_seed(routes, Some(bloom_evm::NftKind::Erc1155)).await;
         // Token id 1 → 64-char hex, all zeros except trailing 01.
         let p = VfsPath::parse(&format!(
             "/test/addresses/{HOLDER_ADDR}/nfts/{NFT_CONTRACT}/1/uri"
@@ -2793,7 +2793,7 @@ mod tests {
         let data_uri = r#"data:application/json,{"name":"item-1"}"#;
         let mut routes = std::collections::HashMap::new();
         routes.insert("eth_call".into(), enc_string_value(data_uri));
-        let h = nft_handler_with_seed(routes, Some(bloom_chain::NftKind::Erc721)).await;
+        let h = nft_handler_with_seed(routes, Some(bloom_evm::NftKind::Erc721)).await;
         let p = VfsPath::parse(&format!(
             "/test/addresses/{HOLDER_ADDR}/nfts/{NFT_CONTRACT}/1/metadata.json"
         ))
@@ -2812,7 +2812,7 @@ mod tests {
             "eth_call".into(),
             enc_uint256_value(alloy::primitives::U256::from(5u64)),
         );
-        let h = nft_handler_with_seed(routes, Some(bloom_chain::NftKind::Erc1155)).await;
+        let h = nft_handler_with_seed(routes, Some(bloom_evm::NftKind::Erc1155)).await;
         let p = VfsPath::parse(&format!(
             "/test/addresses/{HOLDER_ADDR}/nfts/{NFT_CONTRACT}/9/balance"
         ))
@@ -2826,7 +2826,7 @@ mod tests {
         let owner_addr: alloy::primitives::Address = HOLDER_ADDR.parse().unwrap();
         let mut routes = std::collections::HashMap::new();
         routes.insert("eth_call".into(), enc_address_value(owner_addr));
-        let h = nft_handler_with_seed(routes, Some(bloom_chain::NftKind::Erc721)).await;
+        let h = nft_handler_with_seed(routes, Some(bloom_evm::NftKind::Erc721)).await;
         let p = VfsPath::parse(&format!(
             "/test/addresses/{HOLDER_ADDR}/nfts/{NFT_CONTRACT}/42/is_owner"
         ))
@@ -2859,7 +2859,7 @@ mod tests {
         // decode error.
         let h = nft_handler_with_seed(
             std::collections::HashMap::new(),
-            Some(bloom_chain::NftKind::Unknown),
+            Some(bloom_evm::NftKind::Unknown),
         )
         .await;
         let p = VfsPath::parse(&format!(
@@ -2881,7 +2881,7 @@ mod tests {
         // "unknown\n" so the file is still readable.
         let h = nft_handler_with_seed(
             std::collections::HashMap::new(),
-            Some(bloom_chain::NftKind::Erc721),
+            Some(bloom_evm::NftKind::Erc721),
         )
         .await;
         let p =

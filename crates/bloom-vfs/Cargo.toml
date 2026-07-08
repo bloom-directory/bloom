@@ -9,17 +9,11 @@ description = "Path router and handlers for bloom virtual filesystem"
 bloom-auth-api.workspace = true
 bloom-mempool.workspace = true
 bloom-proto.workspace = true
-bloom-ptb-builder.workspace = true
-bloom-script.workspace = true
-bloom-value.workspace = true
-bloom-objects.workspace = true
-bloom-petal-manifest.workspace = true
-bloom-chain-types.workspace = true
 bloom-keystore.workspace = true
 bloom-paid-http.workspace = true
 bloom-paid-mpp.workspace = true
 bloom-paid-x402.workspace = true
-bloom-chain.workspace = true
+bloom-evm.workspace = true
 bloom-rpc.workspace = true
 bloom-tx.workspace = true
 bloom-tools.workspace = true
@@ -54,6 +48,5 @@ mpp.workspace = true
 
 [dev-dependencies]
 bloom-auth.workspace = true
-bloom-petal-fungible.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["process", "rt-multi-thread", "macros", "time", "io-util"] }

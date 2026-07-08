@@ -23,8 +23,8 @@ In-crate `#[cfg(test)] mod tests { ... }` blocks. Co-located with the code
 they cover. No external services, no filesystem, no network.
 
 - Run: `cargo test -p <crate>` (or `cargo test --lib`)
-- Examples: every protocol crate (`bloom-chain-types`, `bloom-chain-state`,
-  `bloom-chain-abi`, `bloom-petals`, `bloom-chain-consensus`, ...)
+- Examples: every protocol crate (`bloom-evm-types`, `bloom-evm-state`,
+  `bloom-evm-abi`, `bloom-petals`, `bloom-evm-consensus`, ...)
 
 ### integration
 
@@ -33,8 +33,8 @@ against the crate's public API. May spin up in-process state, but no
 subprocesses.
 
 - Run: `cargo test -p <crate> --tests`
-- Examples: `bloom-chain-state/tests/snapshot.rs`,
-  `bloom-chain-consensus/tests/happy_path.rs`,
+- Examples: `bloom-evm-state/tests/snapshot.rs`,
+  `bloom-evm-consensus/tests/happy_path.rs`,
   `bloom-petals/tests/chain_imports.rs`.
 
 ### property
@@ -43,8 +43,8 @@ subprocesses.
 inputs. Live alongside other integration tests but use `proptest!` macros.
 
 - Run: `cargo test -p <crate> --tests`
-- Examples: `bloom-chain-state/tests/trie_props.rs`,
-  `bloom-chain-types/tests/ssz_roundtrip.rs`.
+- Examples: `bloom-evm-state/tests/trie_props.rs`,
+  `bloom-evm-types/tests/ssz_roundtrip.rs`.
 
 ### adversarial
 
@@ -53,9 +53,9 @@ rejected (or accounted for) by the protocol. Test names use the
 `adversarial_*` prefix where practical.
 
 - Run: `cargo test -p <crate> --tests`
-- Examples: `bloom-chain-consensus/tests/locking.rs`,
-  `bloom-chain-node/tests/consensus_auth.rs`,
-  `bloom-chain-node/tests/block_sync_validation.rs`,
+- Examples: `bloom-evm-consensus/tests/locking.rs`,
+  `bloom-evm-node/tests/consensus_auth.rs`,
+  `bloom-evm-node/tests/block_sync_validation.rs`,
   `bloom-petals/tests/chain_hardening.rs`,
   `bloom-petals/tests/chain_revert_fuel.rs`.
 
@@ -72,12 +72,12 @@ Tests that pin the on-wire ABI: each method's `[u8; 4]` selector equals
 
 ### macro-DSL
 
-Tests for the `bloom_chain_abi::contract!` macro itself — selector
+Tests for the `bloom_evm_abi::contract!` macro itself — selector
 derivation, encoder/decoder roundtrips, calldata typing, `Bytes` positioning
 constraints.
 
-- Run: `cargo test -p bloom-chain-abi`
-- Examples: `bloom-chain-abi/tests/contract_macro.rs`.
+- Run: `cargo test -p bloom-evm-abi`
+- Examples: `bloom-evm-abi/tests/contract_macro.rs`.
 
 ### smoke
 
@@ -101,7 +101,7 @@ End-to-end tests that bring up a real 4-validator testnet via
 `docker compose`, exercise it from outside the JVM-of-the-day, and tear it
 down. The CI job runs only if docker is available on the runner.
 
-- Run: `scripts/test-docker-dex.sh`
+- Run: `scripts/removed-docker-dex.sh`
 - Env: `BLOOM_DOCKER_TMPDIR` (workdir for the compose stack — defaults to a
   fresh `mktemp -d`), `BLOOM_RPC_TCP` (`true` to make the CLI use TCP rather
   than UDS — set automatically by the script), `BLOOM_DOCKER_COMPOSE_UP`

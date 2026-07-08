@@ -6,7 +6,7 @@
 
 #![allow(dead_code)]
 
-use bloom_chain_types::{Address, Hash32};
+use bloom_evm_types::{Address, Hash32};
 use bloom_petals::BlockCtx;
 
 pub fn make_address(b: u8) -> Address {

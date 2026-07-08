@@ -8,13 +8,9 @@
 //! optional `bloom` host module (`vfs_read` / `vfs_write`) gated by
 //! per-petal capabilities.
 //!
-//! The `chain_vm` module provides `PetalMode::Chain` for deterministic
-//! smart-contract execution under bloom-chain BFT consensus (chain spec
-//! §7.5–§7.9).
 
 #![forbid(unsafe_code)]
 
-pub mod chain_vm;
 pub mod error;
 pub mod handler;
 pub mod host;
@@ -24,7 +20,6 @@ pub mod runner;
 pub mod store;
 pub mod vm;
 
-pub use chain_vm::{BlockCtx, ChainCallInput, ChainCallOutput, ChainCtx, ChainEntry, LogEntry};
 pub use error::PetalError;
 pub use handler::PetalsHandler;
 pub use host::{HostError, PetalHost};

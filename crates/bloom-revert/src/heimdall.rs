@@ -22,7 +22,7 @@ use alloy::json_abi::JsonAbi;
 use alloy::primitives::{Address, B256, Bytes};
 use alloy_dyn_abi::{DynSolType, Specifier};
 use async_trait::async_trait;
-use bloom_chain::ChainRegistry;
+use bloom_evm::ChainRegistry;
 use sha3::{Digest, Keccak256};
 use tokio::sync::RwLock;
 

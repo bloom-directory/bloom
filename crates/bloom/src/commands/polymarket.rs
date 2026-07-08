@@ -2205,7 +2205,7 @@ async fn transfer_pusd_to_funding(
     d: &Daemon,
     args: &FundArgs,
     chain_name: &str,
-    chain: &bloom_chain::ChainClient,
+    chain: &bloom_evm::ChainClient,
     spec: &bloom_proto::ChainSpec,
     info: &bloom_keystore::WalletInfo,
     owner: alloy::primitives::Address,
@@ -2451,7 +2451,7 @@ async fn transfer_pusd_to_funding(
 /// `fund` reads it from onboarding state, where it was resolved against the
 /// live factory (the local CREATE2 estimate has disagreed with the factory:
 /// funding a wrong address is unrecoverable).
-async fn wait_mined(chain: &bloom_chain::ChainClient, hash: alloy::primitives::B256) -> Result<()> {
+async fn wait_mined(chain: &bloom_evm::ChainClient, hash: alloy::primitives::B256) -> Result<()> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
     loop {
         if let Some(receipt) = chain.receipt(hash).await.context("poll receipt")? {

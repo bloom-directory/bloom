@@ -7,7 +7,7 @@ description = "Subscriptions and live tails for bloom"
 
 [dependencies]
 bloom-proto.workspace = true
-bloom-chain.workspace = true
+bloom-evm.workspace = true
 alloy.workspace = true
 serde.workspace = true
 serde_json.workspace = true

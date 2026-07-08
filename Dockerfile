@@ -51,7 +51,7 @@ COPY --from=planner /recipe.json /recipe.json
 # the resulting layer is reused by every host-target build below.
 RUN cargo chef cook --release --recipe-path /recipe.json \
     -p bloom --bin bloom --all-features \
-    -p bloom-petal-dex-it --tests
+    -p removed-dex-petal-it --tests
 # We deliberately skip a wasm32 `cargo chef cook` step: most workspace deps
 # (tokio, rocksdb, alloy providers, …) don't compile for wasm32 and would
 # fail. The DEX petals have a small, self-contained dep tree that builds
@@ -72,18 +72,18 @@ RUN rustup target add wasm32-unknown-unknown
 RUN rm -f target/release/deps/docker_petal_dex-* \
  && cargo build --release \
     -p bloom --bin bloom --all-features \
-    -p bloom-petal-dex-it --test docker_petal_dex
+    -p removed-dex-petal-it --test docker_petal_dex
 
 # DEX petal wasm artefacts. Build each petal in its own `cargo build`
 # invocation because sibling petals use `features = ["no-entrypoint"]` when
 # imported as rlib dependencies; a single multi-package build would unify those
 # features and can suppress a root petal's exported entrypoints.
-RUN cargo build --release --target wasm32-unknown-unknown -p bloom-petal-dex-pool
-RUN cargo build --release --target wasm32-unknown-unknown -p bloom-petal-dex-wallet
+RUN cargo build --release --target wasm32-unknown-unknown -p removed-dex-petal-pool
+RUN cargo build --release --target wasm32-unknown-unknown -p removed-dex-petal-wallet
 RUN BLOOM_DEX_FAUCET_ADMIN_HEX=6252e10b0fae9107bdf13f3dfe482e81099df4ef93e7373516f94b7fde3da72f \
-    cargo build --release --target wasm32-unknown-unknown -p bloom-petal-dex-faucet
-RUN cargo build --release --target wasm32-unknown-unknown -p bloom-petal-dex-cpmm
-RUN cargo build --release --target wasm32-unknown-unknown -p bloom-petal-dex-router
+    cargo build --release --target wasm32-unknown-unknown -p removed-dex-petal-faucet
+RUN cargo build --release --target wasm32-unknown-unknown -p removed-dex-petal-cpmm
+RUN cargo build --release --target wasm32-unknown-unknown -p removed-dex-petal-router
 RUN cargo build --release --target wasm32-unknown-unknown -p bloom-petal-fungible
 
 # Stage outputs into /out so the runtime COPY is dead-simple.

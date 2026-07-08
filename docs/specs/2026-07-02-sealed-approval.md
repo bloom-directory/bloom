@@ -174,7 +174,7 @@ Petals not to lie about the relationship between the attestation and `hash32`.
    identity, not to exact signing digests for the MVP.
 7. **No PRF output in files.** PRF output, decrypted keys, and signing grants
    are process-local only and must be zeroized or expired.
-8. **Remove out-of-scope signers.** `bloom-chain` and `pipe` signing paths are
+8. **Remove out-of-scope signers.** `bloom-evm` and `pipe` signing paths are
    removed or hard-disabled because they sign outside this model.
 9. **Challenge binds the sealed intent.** The WebAuthn challenge is the domain
    separated hash of the daemon-issued approval payload, including
@@ -1453,9 +1453,9 @@ The ceremony handler returns:
 The daemon verifies the assertion, derives the wrap key, decrypts the wallet
 key, mints a grant, and zeroizes temporary secret material.
 
-### 11.6 Remove `bloom-chain` and `pipe` Signers
+### 11.6 Remove `bloom-evm` and `pipe` Signers
 
-The proposed auth plan excludes `bloom-chain` and `pipe` because they sign
+The proposed auth plan excludes `bloom-evm` and `pipe` because they sign
 outside Sealed Approval. Remove or hard-disable those signing paths before
 calling the implementation complete.
 
@@ -1599,7 +1599,7 @@ The codebase fully implements this spec when:
 8. Implement cross-Bloom autonomy policy and budget ledgers.
 9. Implement EVM owner-signing sessions for bounded agent transfers.
 10. Convert requests, DeFi, Polymarket, and Hyperliquid.
-11. Remove or hard-disable `bloom-chain` and `pipe` signers.
+11. Remove or hard-disable `bloom-evm` and `pipe` signers.
 12. Enforce hard/step-up policy taxonomy across all policy engines.
 13. Update user docs and examples to use Sealed Approval terminology.
 

@@ -19,7 +19,7 @@
 //! See `docs/specs/rpc-robustness.md` §C.2 / §C.6 / §E for design
 //! rationale. The `client: &'a ChainClient` shape in the spec sketch is
 //! realised here as a borrow of the alloy `RootProvider<Ethereum>` to
-//! avoid a circular dep with `bloom-chain` — that crate's
+//! avoid a circular dep with `bloom-evm` — that crate's
 //! `open_session` constructor wraps the borrow.
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -37,7 +37,7 @@ use crate::error::BloomRpcError;
 /// A short-lived handle that pins reads to a specific block hash so
 /// multi-call operations stay self-consistent across a fallback event.
 ///
-/// Construct with `bloom_chain::ChainClient::open_session`. While the
+/// Construct with `bloom_evm::ChainClient::open_session`. While the
 /// session is alive its borrow keeps the underlying provider valid; do
 /// not drop the originating `ChainClient` early. Sessions are cheap to
 /// open (one `eth_getBlockByNumber(latest)` call) so callers can scope
@@ -52,7 +52,7 @@ pub struct Session<'a> {
 }
 
 impl<'a> Session<'a> {
-    /// Internal constructor used by `bloom-chain`'s `open_session`. The
+    /// Internal constructor used by `bloom-evm`'s `open_session`. The
     /// caller is responsible for resolving the (latest_number,
     /// latest_hash) tuple before invoking this — the constructor stays
     /// pure-sync once it has the pinned values.

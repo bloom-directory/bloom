@@ -9,8 +9,6 @@
 #![forbid(unsafe_code)]
 
 mod commands {
-    pub mod chain;
-    pub mod pipe;
     pub mod polymarket;
     pub mod qr;
 }
@@ -38,8 +36,6 @@ use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::{Shell, generate};
 use tracing::{debug, info, trace};
 use tracing_subscriber::EnvFilter;
-
-use commands::chain::ChainCmd;
 
 #[cfg(target_os = "linux")]
 const DEFAULT_MOUNT_PATH: &str = "/bloom";
@@ -236,27 +232,7 @@ enum Cmd {
     Hyperliquid(HyperliquidCmd),
     /// Initialise ~/.bloom with default config + dirs.
     Init,
-    /// Sovereign bloom-chain: init, run-validator, submit, query.
-    #[command(subcommand)]
-    Chain(ChainCmd),
-    /// Lower a pipe expression into a PTB and stream its receipt (spec §3.5).
-    ///
-    /// `EXPR` is a pipe expression — linear `A | B | C` (each command's
-    /// primary output feeds the next) plus named `--a <(<sub-expr>)>`
-    /// DAG inputs. It lowers + validates against the chain via the same
-    /// `PtbSession` the NFS `tx`-session front door uses, so a plan piped
-    /// here commits identically to one staged over the mount.
-    Pipe {
-        /// The pipe expression to lower, e.g.
-        /// `'/bloom/petals/dex/pool/swap amount=100 --in <(/bloom/wallet/coin)>'`.
-        expr: String,
-        /// Signer pubkey (32-byte hex). Repeat for a multi-signer tx.
-        #[arg(long = "signer", value_name = "HEX")]
-        signers: Vec<String>,
-        /// Gas-payer object id (32-byte hex `Coin<LOOM>`).
-        #[arg(long, value_name = "HEX")]
-        gas_payer: String,
-    },
+
     /// Print a shell completion script.
     Completions { shell: Shell },
 }
@@ -2737,24 +2713,7 @@ async fn run(cli: Cli) -> Result<()> {
             let _home_permit = HomeWritePermit::acquire(&home)?;
             run_petals(home, cmd).await
         }
-        Cmd::Chain(cmd) => {
-            let _home_permit = if cmd.requires_home_write_lock() {
-                Some(HomeWritePermit::acquire(&home)?)
-            } else {
-                None
-            };
-            commands::chain::run_chain(&home, cmd).await
-        }
-        Cmd::Pipe {
-            expr,
-            signers,
-            gas_payer,
-        } => {
-            let _home_permit = HomeWritePermit::acquire(&home)?;
-            let rpc_sock = home.root().join("chain").join("rpc.sock");
-            let chain_dir = home.root().join("chain");
-            commands::pipe::run(&rpc_sock, &chain_dir, &expr, &signers, &gas_payer).await
-        }
+
         Cmd::Completions { shell } => {
             generate(shell, &mut Cli::command(), "bloom", &mut std::io::stdout());
             Ok(())

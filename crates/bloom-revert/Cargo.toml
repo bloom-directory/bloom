@@ -27,7 +27,7 @@ thiserror.workspace = true
 tokio = { workspace = true, features = ["sync", "time"] }
 tracing.workspace = true
 
-bloom-chain.workspace = true
+bloom-evm.workspace = true
 bloom-etherscan.workspace = true
 
 # heimdall pinned to rev a981d489 (HEAD of main on 2026-05-09).

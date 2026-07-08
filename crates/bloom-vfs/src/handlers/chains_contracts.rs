@@ -43,8 +43,8 @@ use alloy::primitives::{Address, B256, U256};
 use alloy::rpc::types::eth::{Filter, TransactionRequest};
 use parking_lot::{Mutex, RwLock};
 
-use bloom_chain::ChainClient;
 use bloom_etherscan::{ContractMetadataSource, DataSourceError};
+use bloom_evm::ChainClient;
 use bloom_proto::checksum_address;
 use bloom_tools::abi::{json_to_sol, sol_to_json};
 
@@ -347,7 +347,7 @@ fn parse_block_param(s: Option<&str>) -> Result<Option<u64>, HandlerError> {
     if s.is_empty() || s == "latest" {
         return Ok(None);
     }
-    bloom_chain::parse_block_arg(s)
+    bloom_evm::parse_block_arg(s)
         .map(Some)
         .map_err(|e| HandlerError::invalid(e.to_string()))
 }

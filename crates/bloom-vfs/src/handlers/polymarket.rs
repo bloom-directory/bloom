@@ -17,7 +17,7 @@ use bloom_auth_api::{
     PetalPolicySnapshot, PolymarketSealedActionKind, PolymarketSigningAttestationFacts,
     SealedAction, SignHashRequest, SignedApproval, petal_identity,
 };
-use bloom_chain::ChainClient;
+use bloom_evm::ChainClient;
 use bloom_keystore::{Keystore, KeystoreError};
 use bloom_polymarket::eip712::{PUSD, PUSD_DECIMALS};
 use bloom_polymarket::onboard::OnEvent;

@@ -121,7 +121,7 @@ Or scope to a single crate:
 ```sh
 cargo test -p bloom-vfs              # 219 tests — path router, handlers, caches
 cargo test -p bloom-proto            # 71  tests — config, intent, policy, units
-cargo test -p bloom-chain            # 62  tests — RPC client, blocks, balances
+cargo test -p bloom-evm            # 62  tests — RPC client, blocks, balances
 cargo test -p bloom-tx               # 61  tests — staging, simulation, fee logic
 cargo test -p bloom-mount --features mount  # 43  tests — NFSv4 server (feature-gated)
 cargo test -p bloom-revert           # 27  tests — Error/Panic/custom decoders
@@ -388,7 +388,7 @@ Quick "if I changed X, what should I run?" matrix.
 | `bloom-proto` (config, intents, units) | `cargo test -p bloom-proto` |
 | `bloom-vfs` handlers | `cargo test -p bloom-vfs` then `bash tests/docker/run.sh --mount` |
 | `bloom-rpc` failover/health/WS | `cargo test -p bloom-rpc` then `cargo test -p bloom-it -- --ignored` |
-| `bloom-chain` | `cargo test -p bloom-chain` then `cargo test -p bloom-it --test anvil_e2e -- --ignored` |
+| `bloom-evm` | `cargo test -p bloom-evm` then `cargo test -p bloom-it --test anvil_e2e -- --ignored` |
 | `bloom-tx` staging / nonce / replace | `cargo test -p bloom-tx` then `cargo test -p bloom-it --test anvil_e2e -- --ignored` then `bash tests/docker/run.sh --fork` |
 | `bloom-keystore` | `cargo test -p bloom-keystore` |
 | `bloom-revert` | `cargo test -p bloom-revert` then `cargo test -p bloom-it --test revert_decoding -- --ignored` (and `revert_decoding_fallbacks` with `--features bytecode-decompile` if you touched the heimdall path) |

@@ -212,9 +212,9 @@ jobs:
         with:
           cache-targets: false
       - name: Run hermetic real-wasm invariant ABI gate
-        run: cargo test -p bloom-petal-dex-it --test real_inv_wasm -- --ignored
+        run: cargo test -p removed-dex-petal-it --test real_inv_wasm -- --ignored
       - name: Run real-wasm PTB object-invariant gate
-        run: cargo test -p bloom-petal-dex-it --test real_wasm_pool real_pool_swap_exact_in_executes -- --ignored
+        run: cargo test -p removed-dex-petal-it --test real_wasm_pool real_pool_swap_exact_in_executes -- --ignored
       - name: Run chain-authoritative capability gate
         run: cargo test -p bloom-petal-it --test real_mintcap_revert
       - name: Show sccache stats

@@ -35,7 +35,7 @@ use bloom_auth_api::{
     EvmOwnerSigningSessionUse, ExecutorKind, PetalPolicySnapshot, SIGNING_ATTESTATION_SCHEMA_V1,
     SealedAction, SignHashRequest, SignedApproval, SigningAttestation, petal_identity,
 };
-use bloom_chain::ChainRegistry;
+use bloom_evm::ChainRegistry;
 use bloom_keystore::Keystore;
 use bloom_proto::{
     AddressBook, CapabilityStatus, CapabilityViewEntry, HomeWritePermit, Policy, PolicyEditClass,
@@ -3114,7 +3114,7 @@ mod tests {
                 native_decimals: 18,
                 legacy_tx: false,
             };
-            chains.add(bloom_chain::ChainClient::new(spec).unwrap());
+            chains.add(bloom_evm::ChainClient::new(spec).unwrap());
         }
         let outbox = Outbox::new(&outbox_root).unwrap();
         let tx_engine = TxEngine::new(outbox, 60_000, false);
@@ -3835,7 +3835,7 @@ mod tests {
         };
         f.handler
             .chains
-            .add(bloom_chain::ChainClient::new(spec).unwrap());
+            .add(bloom_evm::ChainClient::new(spec).unwrap());
 
         let new_p = VfsPath::parse("/alice/policy-session/new").unwrap();
         let body =

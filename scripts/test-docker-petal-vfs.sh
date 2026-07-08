@@ -9,4 +9,4 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
 export BLOOM_DOCKER_PETAL_VFS_ONLY=1
-exec "$REPO_ROOT/scripts/test-docker-petal-dex.sh" "$@"
+exec "$REPO_ROOT/scripts/removed-docker-petal-dex.sh" "$@"

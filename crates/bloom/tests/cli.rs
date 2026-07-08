@@ -1251,7 +1251,7 @@ fn install_same_hash_same_mode_different_caps_returns_cap_mismatch() {
 }
 
 // ---------------------------------------------------------------------------
-// `bloom chain init` — review 2026-05-19 #9
+// `bloom walletFS init` — review 2026-05-19 #9
 // ---------------------------------------------------------------------------
 
 /// `chain init` must refuse to overwrite an existing `validator.xdsa` unless

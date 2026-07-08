@@ -233,7 +233,7 @@ against `bloom.foo(...)` must still work in five years. Mitigations:
   the moment you want to pass `alloy::TransactionRequest` you're
   designing a serialization format.
 
-## 7. v1 plan — local vs onchain petals
+## 7. v1 plan — local vs wallet extension petals
 
 ### 7.1 Motivation
 
@@ -359,7 +359,7 @@ scope for v1 of the split itself.
 - Should the `local`/`onchain` distinction be visible in the VFS
   layout? E.g., `public/onchain/<hash>` vs `public/local/<hash>`,
   or just rely on `meta.json.mode` to disambiguate?
-- Do onchain petals need their *own* registry, or share the petname
+- Do wallet extension petals need their *own* registry, or share the petname
   namespace? Cross-mode squatting is a concern.
 - Is there a useful third mode? "Sealed-input local": deterministic
   *given* its stdin, but allowed wall-clock/random for caching /
@@ -371,7 +371,7 @@ scope for v1 of the split itself.
   petals ls` should show mode prominently; `bloom petals run` should
   refuse a local petal in a context that demanded onchain (and vice
   versa).
-- Caching: an onchain petal that calls `chain.read_at(eth, 18m,
+- Caching: an wallet extension petal that calls `chain.read_at(eth, 18m,
   /state/0xabc/balance)` returns the same answer forever. Worth
   building a content-addressed read cache from the start.
 

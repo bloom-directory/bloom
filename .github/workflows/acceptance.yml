@@ -4,15 +4,15 @@ on:
   pull_request:
     paths:
       - .github/workflows/acceptance.yml
-      - scripts/test-docker-petal-dex.sh
+      - scripts/removed-docker-petal-dex.sh
       - scripts/lib.sh
       - docker-compose.yml
       - Dockerfile
       - crates/bloom*/**
       - crates/bloom-mount/**
-      - crates/bloom-chain*/**
+      - crates/bloom-evm*/**
       - crates/bloom-petal*/**
-      - examples/petal-dex/**
+      - removed-dex-example/**
   push:
     branches:
       - master
@@ -46,7 +46,7 @@ jobs:
       - name: Build workspace (release-ish; debug is fine for acceptance)
         run: cargo build --workspace --tests
       - name: Run --ignored acceptance tests
-        run: cargo nextest run --workspace --run-ignored ignored-only --no-fail-fast -E 'not package(bloom-petal-dex-it)'
+        run: cargo nextest run --workspace --run-ignored ignored-only --no-fail-fast -E 'not package(removed-dex-petal-it)'
 
   docker-petal-dex:
     name: docker petal DEX acceptance
@@ -78,7 +78,7 @@ jobs:
         if: steps.docker.outputs.available == 'true'
         env:
           BLOOM_DOCKER_LOG_DIR: ${{ runner.temp }}/bloom-docker-petal-dex-logs
-        run: scripts/test-docker-petal-dex.sh
+        run: scripts/removed-docker-petal-dex.sh
       - name: Upload docker petal DEX diagnostics
         if: always() && steps.docker.outputs.available == 'true'
         uses: actions/upload-artifact@v4

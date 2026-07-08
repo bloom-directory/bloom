@@ -25,8 +25,8 @@ use parking_lot::RwLock;
 use serde_json::json;
 use tracing::debug;
 
-use bloom_chain::{ChainClient, NftKind};
 use bloom_etherscan::{AddressHistorySource, DataSourceError, Sort};
+use bloom_evm::{ChainClient, NftKind};
 use bloom_proto::checksum_address;
 
 use crate::handler::HandlerError;

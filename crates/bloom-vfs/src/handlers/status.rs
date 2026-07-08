@@ -39,7 +39,7 @@ use parking_lot::RwLock;
 use serde::Serialize;
 use tokio::time::timeout;
 
-use bloom_chain::ChainRegistry;
+use bloom_evm::ChainRegistry;
 use bloom_keystore::Keystore;
 use bloom_prices::PricesClient;
 use bloom_proto::{AuditLog, BackendsConfig};
@@ -1201,7 +1201,7 @@ mod tests {
 
     #[tokio::test]
     async fn endpoints_leaf_url_is_redacted() {
-        use bloom_chain::ChainClient;
+        use bloom_evm::ChainClient;
         use bloom_proto::ChainSpec;
         let dir = tempfile::tempdir().unwrap();
         let h = make_handler(dir.path());

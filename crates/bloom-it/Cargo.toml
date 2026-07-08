@@ -17,14 +17,12 @@ bloom-proto.workspace = true
 bloom-auth.workspace = true
 bloom-auth-api.workspace = true
 bloom-keystore.workspace = true
-bloom-chain.workspace = true
-bloom-chain-node = { path = "../bloom-chain-node" }
+bloom-evm.workspace = true
 bloom-watch.workspace = true
 bloom-tx.workspace = true
 bloom-vfs.workspace = true
 bloom-daemon.workspace = true
 bloom-revert.workspace = true
-bloom-test-util = { path = "../bloom-test-util" }
 alloy.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true

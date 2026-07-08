@@ -16,7 +16,7 @@ The contract we ship:
 - **Onchain petals** see a strictly smaller, deterministic host import
   surface. Their output is a pure function of `(petal_hash, stdin)`.
 - **`bloom petals replay`** is the v1-distinguishing piece: a CLI tool
-  that re-runs an onchain petal locally and diffs the output hash
+  that re-runs an wallet extension petal locally and diffs the output hash
   against a recorded one. The replayability contract is *observable*,
   not promised.
 - **Local petals** keep today's surface unchanged. Existing v0 installs
@@ -158,7 +158,7 @@ Paths the chains VFS doesn't expose (e.g. things requiring an
 chains-VFS extension, not a petals one.
 
 **`block` semantics:** `block = 0` is reserved and rejected
-(`ERR_BLOCK_NOT_PINNABLE`) — no "latest" alias inside an onchain petal,
+(`ERR_BLOCK_NOT_PINNABLE`) — no "latest" alias inside an wallet extension petal,
 which would break replay. The caller's stdin can compute a block number
 from "latest" if it wants, but by the time the petal sees it, it's a
 fixed integer.
@@ -290,7 +290,7 @@ The v1-distinguishing piece. Makes the determinism contract
 `bloom petals replay <name-or-hash> --input <file> --expect <output-hash> [--block <n>]`:
 
 1. Resolves petal → install record. Errors if `mode != onchain` (replay
-   only meaningful for onchain petals).
+   only meaningful for wallet extension petals).
 2. Reads input bytes from `<file>` (or stdin if `-`).
 3. Runs the petal under a fresh `PetalVm` instance (the deterministic
    knobs from §4.6 are already on by default — replay does not need a

@@ -344,9 +344,9 @@ mod tests {
     fn install_records_mode() {
         let (_d, store) = store();
         let (_r, m) = store
-            .install(b"abc", Some("a"), &BTreeSet::new(), PetalMode::Chain)
+            .install(b"abc", Some("a"), &BTreeSet::new(), PetalMode::Public)
             .unwrap();
-        assert_eq!(m.mode, PetalMode::Chain);
+        assert_eq!(m.mode, PetalMode::Public);
     }
 
     #[test]
@@ -356,7 +356,7 @@ mod tests {
             .install(b"xyz", None, &BTreeSet::new(), PetalMode::Local)
             .unwrap();
         let err = store
-            .install(b"xyz", None, &BTreeSet::new(), PetalMode::Chain)
+            .install(b"xyz", None, &BTreeSet::new(), PetalMode::Public)
             .unwrap_err();
         assert!(
             matches!(err, PetalError::ModeConflict { existing } if existing == PetalMode::Local),
@@ -409,10 +409,10 @@ mod tests {
             .install(b"local-bytes", None, &BTreeSet::new(), PetalMode::Local)
             .unwrap();
         let (rc, _) = store
-            .install(b"chain-bytes", None, &BTreeSet::new(), PetalMode::Chain)
+            .install(b"chain-bytes", None, &BTreeSet::new(), PetalMode::Public)
             .unwrap();
         let locals = store.list_hashes_by_mode(PetalMode::Local).unwrap();
-        let chain = store.list_hashes_by_mode(PetalMode::Chain).unwrap();
+        let public = store.list_hashes_by_mode(PetalMode::Public).unwrap();
         assert_eq!(locals, vec![rl.hash]);
         assert_eq!(chain, vec![rc.hash]);
     }

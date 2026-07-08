@@ -8,12 +8,6 @@ description = "Content-addressed wasm petals for bloom: store, name registry, VM
 [dependencies]
 bloom-proto.workspace = true
 bloom-vfs.workspace = true
-bloom-chain-types.workspace = true
-bloom-chain-state.workspace = true
-bloom-objects.workspace = true
-bloom-petal-manifest.workspace = true
-bloom-script.workspace = true
-bloom-value.workspace = true
 wasmparser = "0.218"
 async-trait.workspace = true
 anyhow.workspace = true
