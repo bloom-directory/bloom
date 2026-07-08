@@ -5961,7 +5961,17 @@ mod tests {
 
     #[tokio::test]
     async fn agent_session_surface_is_discoverable() {
-        let h = handler();
+        let store = unique_test_dir("bloom-hl-store");
+        let h = handler().with_store_root(store.clone());
+        std::fs::create_dir_all(
+            store
+                .join("agent_sessions")
+                .join("testnet")
+                .join("minnow")
+                .join("session-1"),
+        )
+        .unwrap();
+
         let entries = h
             .list(&VfsPath::parse("/testnet/agent_sessions/minnow").unwrap())
             .await
