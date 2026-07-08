@@ -3088,6 +3088,30 @@ impl HyperliquidHandler {
         })
     }
 
+    fn read_session_approval_challenge(
+        &self,
+        network: &str,
+        wallet: &str,
+        session: &str,
+    ) -> Result<Vec<u8>, HandlerError> {
+        let path = self
+            .session_store_dir(network, wallet, session)?
+            .join(APPROVAL_CHALLENGE_FILE);
+        read_existing_vfs_file(path, APPROVAL_CHALLENGE_FILE)
+    }
+
+    fn session_approval_challenge_exists(
+        &self,
+        network: &str,
+        wallet: &str,
+        session: &str,
+    ) -> Result<bool, HandlerError> {
+        Ok(self
+            .session_store_dir(network, wallet, session)?
+            .join(APPROVAL_CHALLENGE_FILE)
+            .is_file())
+    }
+
     fn read_last_response(&self, network: &str, wallet: &str) -> Result<Vec<u8>, HandlerError> {
         let Some(root) = &self.store_root else {
             return Err(HandlerError::NotFound("last_response.json".into()));
@@ -3106,6 +3130,28 @@ impl HyperliquidHandler {
                 HandlerError::Io(e)
             }
         })
+    }
+
+    fn read_usd_send_approval_challenge(
+        &self,
+        network: &str,
+        wallet: &str,
+    ) -> Result<Vec<u8>, HandlerError> {
+        let path = self
+            .usd_send_auth_dir(network, wallet)?
+            .join(APPROVAL_CHALLENGE_FILE);
+        read_existing_vfs_file(path, APPROVAL_CHALLENGE_FILE)
+    }
+
+    fn usd_send_approval_challenge_exists(
+        &self,
+        network: &str,
+        wallet: &str,
+    ) -> Result<bool, HandlerError> {
+        Ok(self
+            .usd_send_auth_dir(network, wallet)?
+            .join(APPROVAL_CHALLENGE_FILE)
+            .is_file())
     }
 }
 
@@ -3182,7 +3228,10 @@ impl Handler for HyperliquidHandler {
                 let file = &segs[3];
                 if EXCHANGE_WRITE_FILES.contains(&file.as_str()) {
                     Ok(Entry::writable_file(file))
-                } else if EXCHANGE_READ_FILES.contains(&file.as_str()) {
+                } else if EXCHANGE_READ_FILES.contains(&file.as_str())
+                    || (file == APPROVAL_CHALLENGE_FILE
+                        && self.usd_send_approval_challenge_exists(&segs[0], &segs[2])?)
+                {
                     Ok(Entry::file(file))
                 } else {
                     Err(HandlerError::NotFound(path.to_string_path()))
@@ -3211,6 +3260,10 @@ impl Handler for HyperliquidHandler {
                         }
                         _ => Ok(Entry::writable_file(file)),
                     }
+                } else if file == APPROVAL_CHALLENGE_FILE
+                    && self.session_approval_challenge_exists(&segs[0], &segs[2], &segs[3])?
+                {
+                    Ok(Entry::file(file))
                 } else {
                     Err(HandlerError::NotFound(path.to_string_path()))
                 }
@@ -3276,6 +3329,9 @@ impl Handler for HyperliquidHandler {
             4 if segs[1] == "exchange" && segs[3] == "last_response.json" => {
                 self.read_last_response(&segs[0], &segs[2])
             }
+            4 if segs[1] == "exchange" && segs[3] == APPROVAL_CHALLENGE_FILE => {
+                self.read_usd_send_approval_challenge(&segs[0], &segs[2])
+            }
             4 if segs[1] == "agent_sessions" && segs[3] == "new.json" => {
                 Ok(agent_session_new_hint())
             }
@@ -3298,6 +3354,9 @@ impl Handler for HyperliquidHandler {
             }
             5 if segs[1] == "agent_sessions" && segs[4] == "last_response.json" => {
                 self.read_session_last_response(&segs[0], &segs[2], &segs[3])
+            }
+            5 if segs[1] == "agent_sessions" && segs[4] == APPROVAL_CHALLENGE_FILE => {
+                self.read_session_approval_challenge(&segs[0], &segs[2], &segs[3])
             }
             5 if segs[1] == "agent_sessions" && SESSION_FILES.contains(&segs[4].as_str()) => {
                 Ok(agent_session_file_hint(&segs[4]))
@@ -3495,7 +3554,7 @@ impl Handler for HyperliquidHandler {
                 self.list_agent_session_ids(&segs[0], &segs[2])
             }
             4 if NETWORKS.contains(&segs[0].as_str()) && segs[1] == "agent_sessions" => {
-                Ok(SESSION_FILES
+                let mut entries: Vec<_> = SESSION_FILES
                     .iter()
                     .map(|f| match *f {
                         "status.json" | "session.json" | "audit.jsonl" | "last_response.json" => {
@@ -3503,14 +3562,22 @@ impl Handler for HyperliquidHandler {
                         }
                         _ => Entry::writable_file(f),
                     })
-                    .collect())
+                    .collect();
+                if self.session_approval_challenge_exists(&segs[0], &segs[2], &segs[3])? {
+                    entries.push(Entry::file(APPROVAL_CHALLENGE_FILE));
+                }
+                Ok(entries)
             }
             3 if NETWORKS.contains(&segs[0].as_str()) && segs[1] == "exchange" => {
-                Ok(EXCHANGE_WRITE_FILES
+                let mut entries: Vec<_> = EXCHANGE_WRITE_FILES
                     .iter()
                     .map(|f| Entry::writable_file(f))
                     .chain(EXCHANGE_READ_FILES.iter().map(|f| Entry::file(f)))
-                    .collect())
+                    .collect();
+                if self.usd_send_approval_challenge_exists(&segs[0], &segs[2])? {
+                    entries.push(Entry::file(APPROVAL_CHALLENGE_FILE));
+                }
+                Ok(entries)
             }
             _ => Err(HandlerError::NotADir(path.to_string_path())),
         }
@@ -4302,6 +4369,19 @@ fn read_json<T: for<'de> Deserialize<'de>>(path: impl AsRef<Path>) -> Result<T, 
     serde_json::from_slice(&bytes).map_err(err_json)
 }
 
+fn read_existing_vfs_file(
+    path: impl AsRef<Path>,
+    display_name: &'static str,
+) -> Result<Vec<u8>, HandlerError> {
+    std::fs::read(path).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            HandlerError::NotFound(display_name.into())
+        } else {
+            HandlerError::Io(e)
+        }
+    })
+}
+
 fn hyperliquid_usd_send_action_id(network: &str, wallet: &str, pending: &PendingUsdSend) -> String {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"bloom.hyperliquid.usd_send.entry.v1");
@@ -4980,6 +5060,39 @@ mod tests {
         }
     }
 
+    async fn assert_approval_challenge_exposed(
+        h: &HyperliquidHandler,
+        parent_path: &str,
+        expected_action_id: &str,
+    ) {
+        let challenge_path = format!("{parent_path}/{APPROVAL_CHALLENGE_FILE}");
+        let entry = h
+            .lookup(&VfsPath::parse(&challenge_path).expect("valid challenge path"))
+            .await
+            .unwrap();
+        assert_eq!(entry.name, APPROVAL_CHALLENGE_FILE);
+        assert_eq!(entry.mode, 0o444);
+
+        let entries = h
+            .list(&VfsPath::parse(parent_path).expect("valid challenge parent path"))
+            .await
+            .unwrap();
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.name == APPROVAL_CHALLENGE_FILE && entry.mode == 0o444),
+            "missing {APPROVAL_CHALLENGE_FILE} under {parent_path}"
+        );
+
+        let bytes = h
+            .read(&VfsPath::parse(&challenge_path).expect("valid challenge path"))
+            .await
+            .unwrap();
+        let challenge: ApprovalChallenge = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(challenge.action_id, expected_action_id);
+        assert!(challenge.ceremony_url.is_some());
+    }
+
     #[test]
     fn write_file_action_mapping_is_strict() {
         // New update_leverage surface only accepts updateLeverage.
@@ -5514,6 +5627,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn usd_send_approval_challenge_is_exposed_via_vfs() {
+        let h = handler_with_auth_store_and_hyperliquid_policy(
+            "trader",
+            HyperliquidPolicy {
+                transfer_cap_usd: Some(100_000_000),
+                allowed_usd_send_destinations: std::collections::BTreeSet::from([
+                    "0x0000000000000000000000000000000000000001".to_string(),
+                ]),
+                ..Default::default()
+            },
+        )
+        .with_store_root(unique_test_dir("bloom-hl-auth-usd-send-vfs-store"));
+        let req = UsdSendRequest {
+            destination: "0x0000000000000000000000000000000000000001".into(),
+            amount: "1".into(),
+            nonce: None,
+        };
+
+        let err = h
+            .prepare_usd_send_sealed("testnet", "trader", &req, &[])
+            .await
+            .unwrap_err();
+        assert!(matches!(err, HandlerError::PermissionDenied), "{err}");
+
+        let dir = h.usd_send_auth_dir("testnet", "trader").unwrap();
+        let pending: PendingUsdSend = read_json(dir.join(USD_SEND_PENDING_FILE)).unwrap();
+        let action_id = hyperliquid_usd_send_action_id("testnet", "trader", &pending);
+        assert_approval_challenge_exposed(&h, "/testnet/exchange/trader", &action_id).await;
+    }
+
+    #[tokio::test]
     async fn agent_session_subject_commits_exact_approve_agent_message() {
         let policy = HyperliquidPolicy {
             allowed_assets: std::collections::BTreeSet::from(["BTC".to_string()]),
@@ -5593,6 +5737,48 @@ mod tests {
         assert_eq!(action["nonce"], pending.nonce);
         assert_eq!(action["signatureChainId"], pending.signature_chain_id);
         assert_eq!(action["hyperliquidChain"], pending.hyperliquid_chain);
+    }
+
+    #[tokio::test]
+    async fn agent_session_approval_challenge_is_exposed_via_vfs() {
+        let policy = HyperliquidPolicy {
+            allowed_assets: std::collections::BTreeSet::from(["BTC".to_string()]),
+            max_notional_usd: Some(100_000_000),
+            max_position_usd: Some(500_000_000),
+            max_loss_usd: Some(50_000_000),
+            ..Default::default()
+        };
+        let h = handler_with_auth_store_and_hyperliquid_policy("trader", policy.clone())
+            .with_store_root(unique_test_dir("bloom-hl-auth-session-vfs-store"));
+        let req = AgentSessionCreate {
+            id: Some("session-1".into()),
+            agent_name: Some("desk-bot".into()),
+            vault_address: None,
+        };
+
+        let err = h
+            .create_agent_session(
+                h.client("testnet").unwrap(),
+                HyperliquidNetwork::Testnet,
+                "testnet",
+                "trader",
+                req,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, HandlerError::PermissionDenied), "{err}");
+
+        let dir = h
+            .session_store_dir("testnet", "trader", "session-1")
+            .unwrap();
+        let pending: PendingApproveAgent = read_json(dir.join(APPROVE_AGENT_PENDING_FILE)).unwrap();
+        let action_id = hyperliquid_agent_session_action_id(&pending, &policy).unwrap();
+        assert_approval_challenge_exposed(
+            &h,
+            "/testnet/agent_sessions/trader/session-1",
+            &action_id,
+        )
+        .await;
     }
 
     #[tokio::test]
