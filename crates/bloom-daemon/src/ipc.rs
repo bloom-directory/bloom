@@ -1055,39 +1055,11 @@ fn write_unlocked_intent(
             if root == "polymarket" && action == "onboard" && begin == "begin"
     );
     if is_pm_onboard_begin {
-        let mut intent = CeremonyIntent::new(
+        return bloom_polymarket::polymarket_onboard_ceremony_intent(
             wallet,
-            "Approve Polymarket Onboarding",
-            CeremonyIntentKind::WalletUnlock,
+            Some(&path_s),
+            wallet_address.clone(),
         );
-        let mut summary = vec![
-            format!("Run Polymarket onboarding for wallet '{wallet}'."),
-            "May deploy your deposit wallet, mint CLOB credentials, and create a \
-             revocable builder API key (relayer submission auth only — never fund authority)."
-                .to_string(),
-            "Signs one approval batch granting these eight spends from your deposit wallet:"
-                .to_string(),
-        ];
-        summary.extend(
-            bloom_polymarket::wallet::V2_APPROVAL_LABELS
-                .iter()
-                .map(|l| format!("  - {l}")),
-        );
-        intent.summary_lines = summary;
-        intent.risk_lines = vec![
-            "approve(MAX) grants unlimited pUSD spending to the V2 contracts; \
-             revoke later with `bloom polymarket revoke-approvals`."
-                .into(),
-            "The OS passkey prompt will show bloom/localhost, not these details.".into(),
-        ];
-        intent.artifact_paths = vec![path_s.clone()];
-        intent.canonical_subject = json!({
-            "kind": "polymarket_onboard_begin",
-            "wallet": wallet,
-            "path": path_s,
-            "approvals": bloom_polymarket::wallet::V2_APPROVAL_LABELS,
-        });
-        return intent;
     }
 
     let mut intent = CeremonyIntent::new(

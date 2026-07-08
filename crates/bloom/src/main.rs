@@ -407,8 +407,7 @@ enum PolymarketCmd {
         #[arg(long, env = "BLOOM_PASSPHRASE", hide = true)]
         passphrase: Option<String>,
     },
-    /// Sell shares of a position (sell-to-close). Risk-reducing: refused only
-    /// on an affirmative geoblock, not on a geoblock outage. Verifies current
+    /// Sell shares of a position (sell-to-close). Risk-reducing. Verifies current
     /// holdings cover the sale before signing.
     Sell {
         wallet: String,
@@ -432,8 +431,7 @@ enum PolymarketCmd {
         #[arg(long, env = "BLOOM_PASSPHRASE", hide = true)]
         passphrase: Option<String>,
     },
-    /// Cancel a resting Polymarket order. Cancellation is risk-reducing and
-    /// is never blocked by the geoblock gate (a warning is printed instead).
+    /// Cancel a resting Polymarket order. Cancellation is risk-reducing.
     /// Needs no wallet unlock — CLOB credentials are enough.
     Cancel {
         wallet: String,
@@ -1399,6 +1397,107 @@ async fn run(cli: Cli) -> Result<()> {
                     return Ok(());
                 }
 
+                if let Some(onboard_wallet) = polymarket_onboard_begin_write(&p) {
+                    if onboard_wallet != wallet {
+                        bail!(
+                            "--unlock-wallet '{}' does not match Polymarket onboarding path wallet '{}'",
+                            wallet,
+                            onboard_wallet
+                        );
+                    }
+                    let ceremony_daemon =
+                        Daemon::from_home(home.clone()).context("build daemon for onboarding")?;
+                    let info = ceremony_daemon.keystore.info(&wallet)?;
+                    if matches!(info.kind, bloom_keystore::WalletKind::PasskeyGated) {
+                        let params = serde_json::json!({
+                            "path": path,
+                            "bytes_b64": B64.encode(&body),
+                        });
+                        let client = IpcClient::new(&client_endpoint.socket);
+                        match try_ipc(&client, &client_endpoint, "write", params.clone()).await {
+                            Ok(Some(_)) => {
+                                debug!(endpoint = %client_endpoint.display, "cli.vfs.polymarket_onboard.via_ipc");
+                                return Ok(());
+                            }
+                            Ok(None) => {
+                                debug!(
+                                    "cli.vfs.polymarket_onboard.via_inproc: no daemon socket present"
+                                );
+                            }
+                            Err(e) if is_ipc_handler_permission_denied(&e) => {
+                                let intent = polymarket_onboard_ceremony_intent(
+                                    &ceremony_daemon,
+                                    &wallet,
+                                    &p,
+                                )?;
+                                let approved =
+                                    sign_polymarket_onboard_sealed_approval_if_challenged(
+                                        &ceremony_daemon,
+                                        &wallet,
+                                        Some(intent),
+                                    )
+                                    .await
+                                    .context("Polymarket onboarding Sealed Approval ceremony")?;
+                                if !approved {
+                                    return Err(anyhow::Error::new(e)).context(
+                                        "Polymarket onboarding denied but no approval challenge was staged",
+                                    );
+                                }
+                                let retry = try_ipc(&client, &client_endpoint, "write", params)
+                                    .await
+                                    .with_context(|| {
+                                        format!(
+                                            "ipc Polymarket onboarding retry via {}",
+                                            client_endpoint.display
+                                        )
+                                    })?;
+                                if retry.is_some() {
+                                    debug!(endpoint = %client_endpoint.display, "cli.vfs.polymarket_onboard.via_ipc.after_ceremony");
+                                    return Ok(());
+                                }
+                                bail!(
+                                    "Polymarket onboarding retry did not reach the daemon after Sealed Approval"
+                                );
+                            }
+                            Err(e) => {
+                                return Err(anyhow::Error::new(e)).with_context(|| {
+                                    format!(
+                                        "ipc Polymarket onboarding via {}",
+                                        client_endpoint.display
+                                    )
+                                });
+                            }
+                        }
+
+                        let (_home_permit, d) = build_write_daemon(home)?;
+                        match d.vfs.write(&p, &body).await {
+                            Ok(()) => {}
+                            Err(first_err)
+                                if matches!(first_err, HandlerError::PermissionDenied) =>
+                            {
+                                let intent = polymarket_onboard_ceremony_intent(&d, &wallet, &p)?;
+                                if sign_polymarket_onboard_sealed_approval_if_challenged(
+                                    &d,
+                                    &wallet,
+                                    Some(intent),
+                                )
+                                .await?
+                                {
+                                    d.vfs
+                                        .write(&p, &body)
+                                        .await
+                                        .context("Polymarket onboarding after Sealed Approval")?;
+                                } else {
+                                    return Err(first_err).context("Polymarket onboarding");
+                                }
+                            }
+                            Err(e) => return Err(e).context("Polymarket onboarding"),
+                        }
+                        poll_polymarket_onboard_until_stable(&d, &wallet).await?;
+                        return Ok(());
+                    }
+                }
+
                 let client = IpcClient::new(&client_endpoint.socket);
                 let ipc_res = try_ipc(
                     &client,
@@ -1442,30 +1541,7 @@ async fn run(cli: Cli) -> Result<()> {
                     && segs[3] == "begin"
                 {
                     let wallet_name = segs[2].clone();
-                    loop {
-                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                        let status_path = VfsPath::parse(&format!(
-                            "polymarket/onboard/{wallet_name}/status.json"
-                        ))
-                        .context("parse status path")?;
-                        if let Ok(bytes) = d.vfs.read(&status_path).await
-                            && let Ok(st) = serde_json::from_slice::<serde_json::Value>(&bytes)
-                        {
-                            let stage = st["stage"].as_str().unwrap_or("unknown");
-                            info!(stage, "polymarket.onboard.stage");
-                            if matches!(stage, "complete" | "fund") || st["last_error"].is_string()
-                            {
-                                if stage == "fund" {
-                                    let addr = st["deposit_wallet"].as_str().unwrap_or("?");
-                                    println!("fund the EOA: {addr}");
-                                    println!(
-                                        "send POL (gas) and pUSD to this address on Polygon, then re-run"
-                                    );
-                                }
-                                break;
-                            }
-                        }
-                    }
+                    poll_polymarket_onboard_until_stable(&d, &wallet_name).await?;
                 }
                 return Ok(());
             }
@@ -3055,7 +3131,7 @@ fn outbox_confirm_unlock_intent(
     Some(intent)
 }
 
-async fn sign_outbox_sealed_approval_if_challenged(
+pub(crate) async fn sign_outbox_sealed_approval_if_challenged(
     d: &Daemon,
     wallet: &str,
     chain: &str,
@@ -3214,6 +3290,129 @@ async fn sign_request_sealed_approval_if_challenged(
     Ok(true)
 }
 
+fn polymarket_onboard_begin_write(path: &VfsPath) -> Option<String> {
+    let segs = path.segments();
+    if segs.len() == 4 && segs[0] == "polymarket" && segs[1] == "onboard" && segs[3] == "begin" {
+        Some(segs[2].clone())
+    } else {
+        None
+    }
+}
+
+fn polymarket_onboard_ceremony_intent(
+    d: &Daemon,
+    wallet: &str,
+    path: &VfsPath,
+) -> Result<CeremonyIntent> {
+    let info = d.keystore.info(wallet)?;
+    Ok(bloom_polymarket::polymarket_onboard_ceremony_intent(
+        wallet,
+        Some(&path.to_string_path()),
+        Some(bloom_proto::checksum_address(&info.address)),
+    ))
+}
+
+async fn poll_polymarket_onboard_until_stable(d: &Daemon, wallet: &str) -> Result<()> {
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        let status_path = VfsPath::parse(&format!("polymarket/onboard/{wallet}/status.json"))
+            .context("parse status path")?;
+        if let Ok(bytes) = d.vfs.read(&status_path).await
+            && let Ok(st) = serde_json::from_slice::<serde_json::Value>(&bytes)
+        {
+            let stage = st["stage"].as_str().unwrap_or("unknown");
+            info!(stage, "polymarket.onboard.stage");
+            if matches!(stage, "complete" | "fund") || st["last_error"].is_string() {
+                if stage == "fund" {
+                    let addr = st["deposit_wallet"].as_str().unwrap_or("?");
+                    println!("funding address: {addr}");
+                    println!("send pUSD to this address on Polygon, then re-run onboarding");
+                }
+                break;
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn sign_polymarket_onboard_sealed_approval_if_challenged(
+    d: &Daemon,
+    wallet: &str,
+    intent: Option<CeremonyIntent>,
+) -> Result<bool> {
+    let dir = d.home.polymarket_dir().join(wallet);
+    let challenge_path = dir.join("approval_challenge.json");
+    if !challenge_path.exists() {
+        return Ok(false);
+    }
+
+    let challenge: ApprovalChallenge = serde_json::from_slice(
+        &std::fs::read(&challenge_path)
+            .with_context(|| format!("read {}", challenge_path.display()))?,
+    )
+    .with_context(|| format!("parse {}", challenge_path.display()))?;
+    let sealed = d
+        .auth_services
+        .require_store()
+        .context("Sealed Approval auth store is not wired")?
+        .sealed_intent(&challenge.intent_hash)
+        .await
+        .context("read sealed intent for Polymarket onboarding challenge")?;
+    anyhow::ensure!(
+        sealed.envelope.header.wallet == wallet,
+        "approval challenge wallet mismatch: sealed action belongs to '{}'",
+        sealed.envelope.header.wallet
+    );
+    anyhow::ensure!(
+        challenge.action_id
+            == bloom_vfs::handlers::polymarket::polymarket_onboard_action_id(wallet),
+        "approval challenge action mismatch for Polymarket onboarding"
+    );
+
+    let review_session_id = if challenge.assurance == AssuranceLevel::Hardened {
+        let review_session_id = sealed_review_session_id(&challenge);
+        d.auth_services
+            .require_writer()
+            .context("Sealed Approval auth store writer is not wired")?
+            .issue_review_session(
+                &review_session_id,
+                &challenge.surface,
+                &challenge.action_id,
+                challenge.expiry_ms,
+                cli_now_ms(),
+            )
+            .await
+            .context("issue hardened Polymarket onboarding review session")?;
+        Some(review_session_id)
+    } else {
+        None
+    };
+
+    let unsigned = UnsignedApproval::for_challenge(
+        &challenge,
+        SignerTransport::BrowserWebauthn,
+        None,
+        review_session_id,
+    );
+    let (_grant, approval) = bloom_daemon::sealed_ceremony::run_sealed_approval_ceremony(
+        &d.keystore,
+        &d.auth_services,
+        unsigned,
+        intent,
+        cli_now_ms(),
+        d.signer_cache.as_ref(),
+    )
+    .await
+    .context("run Polymarket onboarding sealed approval browser ceremony")?;
+    let approval_path = dir.join("approval.json");
+    std::fs::write(
+        &approval_path,
+        serde_json::to_vec_pretty(&approval).context("encode Polymarket onboarding approval")?,
+    )
+    .with_context(|| format!("write {}", approval_path.display()))?;
+    Ok(true)
+}
+
 fn resolve_pending_request_id(home: &Path, id: &str) -> Result<String> {
     if id != "latest" {
         return Ok(id.to_string());
@@ -3231,7 +3430,7 @@ fn resolve_pending_request_id(home: &Path, id: &str) -> Result<String> {
     Ok(id.to_string())
 }
 
-fn sealed_review_session_id(challenge: &ApprovalChallenge) -> String {
+pub(crate) fn sealed_review_session_id(challenge: &ApprovalChallenge) -> String {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"bloom.review_session.v1");
     hasher.update(challenge.surface.as_bytes());

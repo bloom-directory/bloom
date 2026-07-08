@@ -328,6 +328,27 @@ impl Policy {
             AgentAutonomyMode::Disabled
         }
     }
+
+    /// Load/sign-time consistency check: an `under_policy` autonomy mode
+    /// requires `limits.max_tx_usd` and `limits.max_day_usd` to be set —
+    /// otherwise every broadcast-time authorization fails inside `check_limits`
+    /// (see the `None` arms that return "… is required for under_policy
+    /// autonomy"). Surfacing this at sign time prevents signing a policy that
+    /// would brick every subsequent broadcast.
+    pub fn validate_autonomy_limits(&self) -> Result<(), String> {
+        if matches!(
+            self.effective_agent_autonomy(),
+            AgentAutonomyMode::UnderPolicy
+        ) {
+            if self.limits.max_tx_micro_usd()?.is_none() {
+                return Err("limits.max_tx_usd is required for under_policy autonomy".into());
+            }
+            if self.limits.max_day_micro_usd()?.is_none() {
+                return Err("limits.max_day_usd is required for under_policy autonomy".into());
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

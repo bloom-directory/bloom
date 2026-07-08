@@ -222,8 +222,6 @@ pub struct PolymarketConfig {
 fn default_builder_key_mode() -> String {
     "auto".into()
 }
-// Note: the geoblock endpoint is deliberately NOT configurable — it is a
-// non-bypassable refuse-line (see `bloom_polymarket::geoblock`).
 
 /// Hyperliquid HyperCore API configuration. Every field has a default so a
 /// bare `[hyperliquid]` TOML table uses the official public endpoints.

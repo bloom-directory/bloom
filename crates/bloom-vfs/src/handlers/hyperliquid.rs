@@ -4355,8 +4355,17 @@ fn now_ms_u64() -> u64 {
     bloom_hyperliquid::now_ms()
 }
 
+const AUTH_ENTRY_NOT_CHALLENGEABLE: &str = "entry is not challengeable";
+const STORE_AUTH_ENTRY_NOT_CHALLENGEABLE: &str = "authorization denied: entry is not challengeable";
+
 fn auth_entry_not_challengeable(err: &AuthApiError) -> bool {
-    matches!(err, AuthApiError::Denied(msg) if msg == "entry is not challengeable")
+    matches!(
+        err,
+        AuthApiError::Denied(msg) if msg == AUTH_ENTRY_NOT_CHALLENGEABLE
+    ) || matches!(
+        err,
+        AuthApiError::Store(msg) if msg == STORE_AUTH_ENTRY_NOT_CHALLENGEABLE
+    )
 }
 
 fn write_json(path: impl AsRef<Path>, value: &impl Serialize) -> Result<(), HandlerError> {
@@ -5091,6 +5100,19 @@ mod tests {
         let challenge: ApprovalChallenge = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(challenge.action_id, expected_action_id);
         assert!(challenge.ceremony_url.is_some());
+    }
+
+    #[test]
+    fn auth_entry_not_challengeable_matches_direct_and_store_wrapped_denials() {
+        assert!(auth_entry_not_challengeable(&AuthApiError::Denied(
+            "entry is not challengeable".into()
+        )));
+        assert!(auth_entry_not_challengeable(&AuthApiError::Store(
+            "authorization denied: entry is not challengeable".into()
+        )));
+        assert!(!auth_entry_not_challengeable(&AuthApiError::Store(
+            "authorization denied: approval expired".into()
+        )));
     }
 
     #[test]
