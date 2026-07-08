@@ -28,6 +28,7 @@
 #![forbid(unsafe_code)]
 
 pub mod builder_creds;
+pub mod ceremony;
 pub mod clob;
 pub mod creds;
 pub mod data;
@@ -54,6 +55,7 @@ pub mod wallet;
 pub mod signing;
 
 pub use builder_creds::{BuilderApiKeyInfo, BuilderCredentialStore, BuilderCredentials};
+pub use ceremony::polymarket_onboard_ceremony_intent;
 pub use clob::ClobClient;
 pub use creds::CredentialStore;
 pub use data::DataClient;

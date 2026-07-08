@@ -147,11 +147,6 @@ fn mount_write_path_uses_wallet_signer(path: &VfsPath) -> bool {
         {
             true
         }
-        [root, action, _wallet, begin]
-            if root == "polymarket" && action == "onboard" && begin == "begin" =>
-        {
-            true
-        }
         [root, _network, branch, _wallet, leaf]
             if root == "hyperliquid" && branch == "agent_sessions" && leaf == "new.json" =>
         {
@@ -1417,6 +1412,7 @@ mod tests {
             "/wallets/minnow/policy.toml",
             "/wallets/minnow/policy-session/new",
             "/requests/pending/req_1/confirm",
+            "/polymarket/onboard/test-wallet/begin",
         ] {
             let p = VfsPath::parse(path).unwrap();
             assert!(!mount_write_path_uses_wallet_signer(&p), "{path}");
