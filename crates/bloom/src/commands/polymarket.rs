@@ -10,8 +10,6 @@
 //!   with `--confirm-risk`;
 //! - the per-wallet order lock serializes confirm/post/receipt writes so
 //!   parallel invocations cannot race the daily cap;
-//! - geoblock is fail-closed for risk-adding orders (buy), refused-on-blocked
-//!   but soft on endpoint outage for sell-to-close, and warn-only for cancel;
 //! - ambiguous CLOB errors are never retried — we reconcile against open
 //!   orders and otherwise stop with an `ambiguous` draft status.
 
@@ -28,8 +26,8 @@ use bloom_polymarket::order_store::{
 use bloom_polymarket::trade;
 use bloom_polymarket::types::Side;
 use bloom_polymarket::{
-    BuilderCredentialStore, ClobClient, CredentialStore, DataClient, GammaClient, GeoblockClient,
-    KeystoreSigner, OnboardSigner, RelayerClient,
+    BuilderCredentialStore, ClobClient, CredentialStore, DataClient, GammaClient, KeystoreSigner,
+    OnboardSigner, RelayerClient,
 };
 use bloom_proto::HomeWritePermit;
 use bloom_proto::polymarket_policy::{self as pm_policy, PolicySide, PolymarketOrderCtx};
@@ -73,21 +71,6 @@ fn polymarket_data_client(pm_cfg: &bloom_proto::config::PolymarketConfig) -> Dat
         data = data.with_base_url(url);
     }
     data
-}
-
-fn polymarket_geoblock_client(pm_cfg: &bloom_proto::config::PolymarketConfig) -> GeoblockClient {
-    let Ok(base) = url::Url::parse(&pm_cfg.gamma_url) else {
-        return GeoblockClient::new();
-    };
-    let host = base.host_str().unwrap_or_default();
-    let is_local = matches!(host, "127.0.0.1" | "localhost" | "::1");
-    if !is_local {
-        return GeoblockClient::new();
-    }
-    match base.join("/api/geoblock") {
-        Ok(url) => GeoblockClient::new().with_base_url_for_tests(url.to_string()),
-        Err(_) => GeoblockClient::new(),
-    }
 }
 
 fn now_secs() -> u64 {
@@ -159,31 +142,6 @@ fn evaluate_policy(
     let checks = pm_policy::evaluate_polymarket_order(&info.policy.polymarket, &ctx);
     let deny = bloom_proto::has_deny(&checks);
     Ok((checks, deny))
-}
-
-/// Geoblock gate, differentiated by what the operation does to risk.
-async fn geoblock_gate(pm_cfg: &bloom_proto::config::PolymarketConfig, side: Side) -> Result<()> {
-    match polymarket_geoblock_client(pm_cfg).check().await {
-        Ok(geo) if geo.blocked => {
-            // Affirmative block: no new trades, buy or sell. (Cancel has its
-            // own warn-only path — retracting an offer is not a trade.)
-            bail!("Polymarket is unavailable in your region (geoblock)");
-        }
-        Ok(_) => Ok(()),
-        Err(e) => match side {
-            // Risk-adding: unverifiable means refuse (fail closed).
-            Side::Buy => Err(e).context("geoblock check failed (fail-closed: refusing to trade)"),
-            // Risk-reducing sell-to-close: don't trap existing exposure
-            // behind an endpoint outage; warn and continue.
-            Side::Sell => {
-                eprintln!(
-                    "warning: geoblock endpoint unavailable ({e}); proceeding with \
-                     risk-reducing sell-to-close"
-                );
-                Ok(())
-            }
-        },
-    }
 }
 
 /// The funder/maker context an order is placed under. Loaded from durable
@@ -386,7 +344,7 @@ pub async fn confirm(
     execute(d, &store, draft, confirm_risk, passphrase).await
 }
 
-/// Shared execution path: lock → geoblock → revalidate → policy → plan →
+/// Shared execution path: lock → revalidate → policy → plan →
 /// ceremony → sign → post → receipt.
 async fn execute(
     d: &Daemon,
@@ -402,8 +360,6 @@ async fn execute(
         .context("no [polymarket] block in config.toml")?;
 
     let _lock = store.lock(&draft.wallet)?;
-    geoblock_gate(pm_cfg, draft.side).await?;
-
     // Revalidate everything against the live market; the draft is a snapshot.
     let gamma = polymarket_gamma_client(pm_cfg);
     let clob = polymarket_clob_client(pm_cfg);
@@ -604,6 +560,7 @@ async fn execute(
             &signed,
             pm_cfg.chain_id,
             draft.neg_risk,
+            draft.order_type,
         );
         let plan = pm_sealed::polymarket_order_plan(
             draft.side,
@@ -1239,18 +1196,6 @@ pub async fn onboard(d: &Daemon, args: OnboardArgs) -> Result<()> {
         .polymarket
         .as_ref()
         .context("no [polymarket] block in config.toml")?;
-
-    let geo = GeoblockClient::new()
-        .check()
-        .await
-        .context("geoblock check failed (fail-closed: refusing to onboard)")?;
-    if geo.blocked {
-        bail!(
-            "Polymarket is unavailable in your region (country={}, region={})",
-            geo.country,
-            geo.region
-        );
-    }
 
     if args.target_pusd.is_some() && args.max_spend.is_none() {
         bail!("--max-spend is required with --target-pusd (it bounds the swap's input side)");
@@ -3406,22 +3351,14 @@ pub async fn builder_keys_revoke(d: &Daemon, wallet: &str, key: Option<&str>) ->
     Ok(())
 }
 
-/// `bloom polymarket cancel`: retract a resting order. Risk-reducing — never
-/// blocked by the geoblock gate, and needs no wallet unlock (L2 creds only).
+/// `bloom polymarket cancel`: retract a resting order. Risk-reducing;
+/// needs no wallet unlock (L2 creds only).
 pub async fn cancel(d: &Daemon, wallet: &str, order_id: &str) -> Result<()> {
     let pm_cfg = d
         .config
         .polymarket
         .as_ref()
         .context("no [polymarket] block in config.toml")?;
-
-    match polymarket_geoblock_client(pm_cfg).check().await {
-        Ok(geo) if geo.blocked => {
-            eprintln!("warning: geoblock reports blocked; cancel proceeds (risk-reducing)");
-        }
-        Ok(_) => {}
-        Err(e) => eprintln!("warning: geoblock check unavailable ({e}); cancel proceeds"),
-    }
 
     let info = d.keystore.info(wallet)?;
     let creds = CredentialStore::new(d.home.polymarket_dir())

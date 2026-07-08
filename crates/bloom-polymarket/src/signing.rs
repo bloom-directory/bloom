@@ -96,7 +96,19 @@ pub struct OrderAction {
 /// Build a V2 order action and inner signing hash. The signing hash is the
 /// POLY_1271 typed-data digest (`poly1271_digest`) — what the owner EOA signs.
 /// The wire-format "wrapped" hex is `poly1271_signature_from_raw(order, host_sig, …)`.
-pub fn order_action_and_hash(order: &Order, chain_id: u64, neg_risk: bool) -> OrderAction {
+///
+/// `order_type` is the intended CLOB time-in-force. It is *not* part of the
+/// signed V2 `Order` struct (which carries no `orderType`/`expiration` field),
+/// but it is rendered into the human-approved `order_view` so the sealed
+/// subject shows the true order type instead of a fixed label. `expiration` is
+/// always `"0"`: GTD is refused upstream (no expiration plumbing) and the other
+/// three types never carry an expiration in the signed order.
+pub fn order_action_and_hash(
+    order: &Order,
+    chain_id: u64,
+    neg_risk: bool,
+    order_type: OrderType,
+) -> OrderAction {
     let signing_hash = order::poly1271_digest(order, chain_id, neg_risk);
     let order_view = serde_json::json!({
         "schema": "bloom.polymarket_order_view.v1",
@@ -111,7 +123,7 @@ pub fn order_action_and_hash(order: &Order, chain_id: u64, neg_risk: bool) -> Or
         "timestamp": order.timestamp.to_string(),
         "metadata": format!("{:#x}", order.metadata),
         "builder": format!("{:#x}", order.builder),
-        "orderType": order_type_label(OrderType::GTC),
+        "orderType": order_type_label(order_type),
         "expiration": "0",
         "negRisk": neg_risk,
         "chainId": chain_id,

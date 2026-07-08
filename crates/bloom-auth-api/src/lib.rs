@@ -2068,14 +2068,15 @@ impl PolymarketSealedActionKind {
     }
 }
 
-/// Tagged Polymarket signing-attestation facts. The `kind` field picks which
-/// per-kind `validate_*` rules apply; the rest of the fields are intentionally
-/// a flat map so unspecified fields don't bleed across kinds (parallels
-/// `EVM_TX_SIGN_INTENT`'s strictly-required-field validation).
+/// Tagged Polymarket signing-attestation facts. The `kind` field records which
+/// Polymarket flow the signature is for; the rest of the fields are a flat map
+/// of the shared fields below (parallels `EVM_TX_SIGN_INTENT`'s
+/// strictly-required-field validation).
 ///
-/// All shared fields below are always present for every kind. Per-kind
-/// required keys (e.g. `market_slug` for `Order`, `step_index` for
-/// `Onboarding`) are enforced in `validate_for_kind`.
+/// v1 facts carry only these shared fields — there are no kind-specific keys
+/// yet, so `validate_for_kind` has no per-kind required fields to enforce.
+/// When richer per-kind facts land (e.g. a market identifier for `Order`),
+/// their required-field checks go in `validate_for_kind`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PolymarketSigningAttestationFacts {
     /// Always [`POLYMARKET_SIGNING_ATTESTATION_FACTS_SCHEMA_V1`].
@@ -2135,19 +2136,21 @@ impl PolymarketSigningAttestationFacts {
     }
 
     /// Per-kind required-field enforcement. Called from `validate`.
+    ///
+    /// v1 facts are a flat map of shared fields only (see the struct doc), so
+    /// there are no kind-specific required fields to check yet — every kind is
+    /// fully validated by the shared checks in [`Self::validate`]. This is the
+    /// seam where per-kind required-field checks will go when richer facts land.
     pub fn validate_for_kind(&self) -> Result<(), AuthApiError> {
-        let fact_keys: Vec<String> = {
-            // We re-export a `self`-free helper below to avoid cloning the whole
-            // struct; this scaffold keeps the design symmetric to EVM's
-            // per-fact validation.
-            Vec::new()
-        };
-        let _ = fact_keys;
-        // Per-kind rules are surfaced through `validate_attestation` on the
-        // registry when richer per-kind facts land; for the first wave we
-        // enforce `kind == petal_id`'s intent mapping so a wrong kind/intent
-        // pairing is rejected.
-        Ok(())
+        match self.kind {
+            PolymarketSealedActionKind::Order
+            | PolymarketSealedActionKind::Onboarding
+            | PolymarketSealedActionKind::Redemption
+            | PolymarketSealedActionKind::Withdrawal
+            | PolymarketSealedActionKind::Revocation
+            | PolymarketSealedActionKind::BuilderKey
+            | PolymarketSealedActionKind::Funding => Ok(()),
+        }
     }
 
     pub fn signing_attestation(&self) -> Result<SigningAttestation, AuthApiError> {

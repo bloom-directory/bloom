@@ -14,7 +14,6 @@
 //!   deploy → fund → approve → creds → sync) over the hand-rolled relayer
 //!   client ([`RelayerClient`]), the V2 approval-call builders ([`wallet`]),
 //!   and the 0600 CLOB credential store ([`CredentialStore`]);
-//! - the fail-closed [`GeoblockClient`] refuse-line.
 //!
 //! - **orders** ([`order`]): V2 EIP-712 order building/signing for the
 //!   deposit-wallet path (signatureType 3 / POLY_1271) with integer micro-unit
@@ -34,7 +33,6 @@ pub mod creds;
 pub mod data;
 pub mod eip712;
 pub mod gamma;
-pub mod geoblock;
 pub mod onboard;
 pub mod order;
 pub mod order_store;
@@ -61,7 +59,6 @@ pub use creds::CredentialStore;
 pub use data::DataClient;
 pub use eip712::{deposit_wallet_implementation, derive_deposit_wallet_address};
 pub use gamma::GammaClient;
-pub use geoblock::{GeoblockClient, GeoblockStatus};
 pub use onboard::{
     ChainReader, OnboardEvent, OnboardMode, OnboardState, OnboardStore, Onboarder, Stage,
     validate_wallet_name,

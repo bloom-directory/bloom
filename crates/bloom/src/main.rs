@@ -410,8 +410,7 @@ enum PolymarketCmd {
         #[arg(long, env = "BLOOM_PASSPHRASE", hide = true)]
         passphrase: Option<String>,
     },
-    /// Sell shares of a position (sell-to-close). Risk-reducing: refused only
-    /// on an affirmative geoblock, not on a geoblock outage. Verifies current
+    /// Sell shares of a position (sell-to-close). Risk-reducing. Verifies current
     /// holdings cover the sale before signing.
     Sell {
         wallet: String,
@@ -435,8 +434,7 @@ enum PolymarketCmd {
         #[arg(long, env = "BLOOM_PASSPHRASE", hide = true)]
         passphrase: Option<String>,
     },
-    /// Cancel a resting Polymarket order. Cancellation is risk-reducing and
-    /// is never blocked by the geoblock gate (a warning is printed instead).
+    /// Cancel a resting Polymarket order. Cancellation is risk-reducing.
     /// Needs no wallet unlock — CLOB credentials are enough.
     Cancel {
         wallet: String,

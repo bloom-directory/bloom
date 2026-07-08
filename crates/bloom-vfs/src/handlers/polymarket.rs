@@ -27,8 +27,8 @@ use bloom_polymarket::signing::{action_id_for, poly1271_signature_from_raw};
 use bloom_polymarket::trade;
 use bloom_polymarket::{
     BuilderCredentialStore, ChainReader, ClobClient, CredentialStore, DataClient, GammaClient,
-    GeoblockClient, KeystoreSigner, OnboardEvent, OnboardState, Onboarder, OrderStore,
-    PolymarketError, Side, Stage, validate_wallet_name,
+    KeystoreSigner, OnboardEvent, OnboardState, Onboarder, OrderStore, PolymarketError, Side,
+    Stage, validate_wallet_name,
 };
 use bloom_proto::audit::{AuditLog, AuditRecord};
 use bloom_proto::polymarket_policy::{self as pm_policy, PolicySide, PolymarketOrderCtx};
@@ -148,7 +148,7 @@ Discover resting order ids with `/polymarket/account/<wallet>/orders.json`.
 - Onboarding must complete (`bloom polymarket onboard <wallet>`) before any trade
 - Every value-moving CLI action requires a passkey ceremony or unlocked local wallet
 - Trade draft confirmation uses `bloom vfs write --unlock-wallet <wallet>` so
-  the existing CLI order engine re-checks geoblock, policy, stale draft status,
+  the existing CLI order engine re-checks policy, stale draft status,
   holdings, locks, signing, CLOB post/reconcile, receipts, and audit gates
 - Fund request confirmation uses `bloom vfs write --unlock-wallet <wallet>` so
   the existing CLI funding engine re-reads live balances/routes and applies the
@@ -214,7 +214,7 @@ const CANCEL_HINT: &[u8] = br#"write "confirm" here to cancel this resting CLOB 
 
 Cancellation executes directly in the VFS after compliance checks -- no wallet
 unlock is needed because it uses the wallet's stored CLOB credentials (L2 auth
-only). Geoblock and jurisdiction checks are hard gates for cancel.
+only). Jurisdiction checks are hard gates for cancel.
 
 Equivalent CLI:
 bloom polymarket cancel <wallet> <order-id>
@@ -1098,7 +1098,6 @@ fn read_json<T: for<'de> Deserialize<'de>>(path: impl AsRef<Path>) -> Result<T, 
 /// its constructor and the daemon opts in via [`PolymarketHandler::with_onboarding`].
 pub struct PolymarketOnboarding {
     pub onboarder: Arc<Onboarder>,
-    pub geoblock: Arc<GeoblockClient>,
     pub auth_dir: PathBuf,
     /// Read access to stored CLOB credentials (for the `account/` views).
     pub creds: CredentialStore,
@@ -1525,7 +1524,7 @@ impl PolymarketHandler {
     /// foreground ceremony) only if ALL of the following are true:
     /// - No EVM owner signing is required (L2 CLOB credentials only).
     /// - The operation is risk-reducing (cannot move funds or increase risk).
-    /// - Geoblock and jurisdiction checks pass.
+    /// - Jurisdiction checks pass.
     ///
     /// If any criterion is false, the operation MUST go through the foreground
     /// confirm path (`bloom vfs write --unlock-wallet`). Builder-key revoke is
@@ -1560,20 +1559,6 @@ impl PolymarketHandler {
             ob.creds.load(wallet).map_err(err_be)?.ok_or_else(|| {
                 HandlerError::invalid("wallet not onboarded (no CLOB credentials)")
             })?;
-        match ob.geoblock.check().await {
-            Ok(geo) if geo.blocked => {
-                return Err(HandlerError::invalid(format!(
-                    "Polymarket geoblock denied cancel for wallet '{wallet}' (country={}, region={})",
-                    geo.country, geo.region
-                )));
-            }
-            Ok(_) => {}
-            Err(e) => {
-                return Err(HandlerError::invalid(format!(
-                    "could not verify Polymarket region availability before cancel: {e}"
-                )));
-            }
-        }
         let store = self
             .orders
             .as_deref()
@@ -1953,8 +1938,7 @@ fn render_onboard_plan_md(st: &OnboardState) -> String {
          reader sees `running=false`; rely on `in_flight_deadline_ms` for\n\
          cross-process liveness.\n\
          \n\
-         Preconditions enforced on `begin`: wallet unlocked, region not geoblocked\n\
-         (fail-closed — an unverifiable region refuses too; there is no bypass).\n\
+         Preconditions enforced on `begin`: wallet unlocked\n\
          The owner key never leaves the bloom daemon.\n",
         wallet = st.wallet,
         owner = st.owner,
@@ -2934,12 +2918,18 @@ impl PolymarketHandler {
             ));
         }
         if segs.len() == 4 && segs[0] == "withdraw" && segs[2] == "pusd" && segs[3] == "confirm" {
-            if self.auth_services.is_wired() {
-                return self.execute_withdraw_sealed(&segs[1]).await;
-            }
+            // The wired (serve-socket) withdraw path is intentionally closed: it
+            // does not yet parse the body `amount`, bind it into the sealed
+            // subject/action_id, or read the live pUSD balance, so it cannot
+            // authorize a specific transfer. Until that lands (serve-socket
+            // passkey ceremony, tracked in docs/issues C2) every withdrawal —
+            // password *and* passkey wallets — goes through the foreground CLI
+            // path, which reads the balance, validates the amount, and submits
+            // the correct `pUSD.transfer(owner, amount)`.
             return Err(HandlerError::Unsupported(
                 "pUSD withdrawal confirmation must run through the foreground CLI VFS path so the \
-                 wallet unlock and signer live in the same process: \
+                 wallet unlock and signer live in the same process, and the amount is bound to the \
+                 signed batch: \
                  bloom vfs write /polymarket/withdraw/<wallet>/pusd/confirm \
                  --unlock-wallet <wallet> --data '{\"confirm\":true,\"amount\":\"<amount|all>\"}'"
                     .into(),
@@ -2959,15 +2949,6 @@ impl PolymarketHandler {
         validate_wallet_name(wallet).map_err(err_be)?;
         // Wallet must exist…
         self.wallet_address(wallet)?;
-        // Geoblock refuse-line: blocked or unverifiable → refuse. No bypass.
-        let geo = ob.geoblock.check().await.map_err(err_be)?;
-        if geo.blocked {
-            return Err(HandlerError::invalid(format!(
-                "Polymarket is unavailable in your region (country={}, region={}); \
-                 refusing to onboard",
-                geo.country, geo.region
-            )));
-        }
         if self.auth_services.is_wired() {
             return self.begin_onboard_sealed(ob, wallet).await;
         }
@@ -3280,67 +3261,6 @@ impl PolymarketHandler {
             let _ = audit.append(AuditRecord {
                 ts_ms: 0,
                 kind: "polymarket.revoke.sealed_submitted".into(),
-                wallet: Some(wallet.into()),
-                chain: None,
-                data: serde_json::json!({"tx_id": tx.id, "action_id": action_id}),
-                prev: String::new(),
-                digest: String::new(),
-            });
-        }
-        Ok(())
-    }
-
-    /// Wired-mode withdraw pUSD: stage sealed → grant check → submit
-    /// withdrawal batch via relayer.
-    async fn execute_withdraw_sealed(&self, wallet: &str) -> Result<(), HandlerError> {
-        let ob = self
-            .onboarding
-            .as_ref()
-            .ok_or_else(|| HandlerError::not_found("polymarket onboarding not configured"))?;
-        let info = self
-            .keystore
-            .info(wallet)
-            .map_err(|e| HandlerError::backend(e.to_string()))?;
-        let owner = info.address;
-        let deposit = self.deposit_wallet_of(wallet).await?;
-        let action_id = polymarket_withdraw_action_id(wallet);
-        let sealed = polymarket_withdrawal_sealed_action(wallet, deposit, pm_now_ms_u64())?;
-        self.stage_and_check_sealed(wallet, sealed, &ob.auth_dir)
-            .await?;
-        // Grant exists — submit the withdrawal batch.
-        let host = self.auth_services.require_petal_host()?.clone();
-        let signer = SealedOnboardSigner {
-            host,
-            wallet: wallet.into(),
-            action_id: action_id.clone(),
-            kind: PolymarketSealedActionKind::Withdrawal,
-            owner,
-        };
-        let noop: &OnEvent = &|_| {};
-        let relayer = ob
-            .onboarder
-            .relayer_for(wallet, owner, &signer, noop)
-            .await
-            .map_err(err_be)?;
-        let calls = vec![bloom_polymarket::wallet::approve_amount_call(
-            PUSD,
-            owner,
-            alloy::primitives::U256::MAX,
-        )];
-        let nonce = relayer.wallet_nonce(owner).await.map_err(err_be)?;
-        let deadline = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0)
-            + 3600;
-        let tx = relayer
-            .submit_wallet_batch(owner, deposit, calls, nonce, deadline, &signer)
-            .await
-            .map_err(err_be)?;
-        if let Some(audit) = self.audit.as_ref() {
-            let _ = audit.append(AuditRecord {
-                ts_ms: 0,
-                kind: "polymarket.withdraw.sealed_submitted".into(),
                 wallet: Some(wallet.into()),
                 chain: None,
                 data: serde_json::json!({"tx_id": tx.id, "action_id": action_id}),
@@ -3984,71 +3904,6 @@ mod tests {
         assert!(err.to_string().contains("foreground CLI VFS path"));
     }
 
-    #[tokio::test]
-    async fn cancel_geoblock_blocked_is_hard_denial() {
-        let (addr, _s) = spawn_scripted(vec![(
-            "/api/geoblock",
-            r#"{"blocked":true,"ip":"1.1.1.1","country":"XX","region":"YY"}"#.to_string(),
-        )])
-        .await;
-        let f = onboard_fixture(addr, true).await;
-        f.handler
-            .onboarding
-            .as_ref()
-            .unwrap()
-            .creds
-            .save(
-                "alice",
-                &bloom_polymarket::types::Credentials {
-                    key: "k-1".into(),
-                    secret: "c2VjcmV0LXZhbHVl".into(),
-                    passphrase: "pp-hidden".into(),
-                    nonce: 0,
-                },
-            )
-            .unwrap();
-
-        let err = f
-            .handler
-            .write(&p("/trade/alice/orders/0xORDER/cancel"), b"confirm")
-            .await
-            .unwrap_err();
-        assert!(err.to_string().contains("geoblock denied cancel"), "{err}");
-        assert!(err.to_string().contains("country=XX"), "{err}");
-    }
-
-    #[tokio::test]
-    async fn cancel_geoblock_unavailable_is_hard_denial() {
-        let (addr, _s) = spawn_scripted(vec![]).await;
-        let f = onboard_fixture(addr, true).await;
-        f.handler
-            .onboarding
-            .as_ref()
-            .unwrap()
-            .creds
-            .save(
-                "alice",
-                &bloom_polymarket::types::Credentials {
-                    key: "k-1".into(),
-                    secret: "c2VjcmV0LXZhbHVl".into(),
-                    passphrase: "pp-hidden".into(),
-                    nonce: 0,
-                },
-            )
-            .unwrap();
-
-        let err = f
-            .handler
-            .write(&p("/trade/alice/orders/0xORDER/cancel"), b"confirm")
-            .await
-            .unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("could not verify Polymarket region availability before cancel"),
-            "{err}"
-        );
-    }
-
     #[test]
     fn builder_key_revoke_body_accepts_ack_or_explicit_key() {
         assert_eq!(parse_builder_key_revoke_body(b"confirm").unwrap(), None);
@@ -4153,9 +4008,6 @@ key = "builder-key-2"
         )
         .with_onboarding(PolymarketOnboarding {
             onboarder: Arc::new(onboarder),
-            geoblock: Arc::new(
-                GeoblockClient::new().with_base_url_for_tests(format!("{base}/api/geoblock")),
-            ),
             auth_dir: state_dir.path().to_path_buf(),
             creds: CredentialStore::new(state_dir.path()),
             chain,
@@ -4170,13 +4022,6 @@ key = "builder-key-2"
             state_dir: state_path,
             _dirs: vec![ks_dir, state_dir, audit_dir],
         }
-    }
-
-    fn geo_ok() -> (&'static str, String) {
-        (
-            "/api/geoblock",
-            r#"{"blocked":false,"ip":"1.2.3.4","country":"AR","region":"X"}"#.to_string(),
-        )
     }
 
     fn creds_rule() -> (&'static str, String) {
@@ -4314,7 +4159,7 @@ key = "builder-key-2"
 
     #[tokio::test]
     async fn onboard_shape_when_wired() {
-        let (addr, _s) = spawn_scripted(vec![geo_ok()]).await;
+        let (addr, _s) = spawn_scripted(vec![]).await;
         let f = onboard_fixture(addr, true).await;
 
         let root: Vec<String> = f
@@ -4362,7 +4207,7 @@ key = "builder-key-2"
 
     #[tokio::test]
     async fn begin_preconditions_each_refuse_clearly() {
-        let (addr, _s) = spawn_scripted(vec![geo_ok()]).await;
+        let (addr, _s) = spawn_scripted(vec![]).await;
         let f = onboard_fixture(addr, true).await;
         let err = f
             .handler
@@ -4371,7 +4216,7 @@ key = "builder-key-2"
             .unwrap_err();
         assert!(matches!(err, HandlerError::NotFound(_)), "{err}");
 
-        let (addr, _s) = spawn_scripted(vec![geo_ok()]).await;
+        let (addr, _s) = spawn_scripted(vec![]).await;
         let f = onboard_fixture(addr, false).await;
         let err = f
             .handler
@@ -4379,37 +4224,11 @@ key = "builder-key-2"
             .await
             .unwrap_err();
         assert!(err.to_string().contains("locked"), "{err}");
-
-        let (addr, _s) = spawn_scripted(vec![(
-            "/api/geoblock",
-            r#"{"blocked":true,"ip":"1.1.1.1","country":"XX","region":"YY"}"#.to_string(),
-        )])
-        .await;
-        let f = onboard_fixture(addr, true).await;
-        let err = f
-            .handler
-            .write(&p("/onboard/alice/begin"), b"x")
-            .await
-            .unwrap_err();
-        assert!(err.to_string().contains("country=XX"), "{err}");
-
-        let (addr, _s) = spawn_scripted(vec![]).await; // 404s everything
-        let f = onboard_fixture(addr, true).await;
-        let err = f
-            .handler
-            .write(&p("/onboard/alice/begin"), b"x")
-            .await
-            .unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("could not verify region availability"),
-            "{err}"
-        );
     }
 
     #[tokio::test]
     async fn wired_onboard_denies_and_writes_challenge_without_grant() {
-        let (addr, _s) = spawn_scripted(vec![geo_ok()]).await;
+        let (addr, _s) = spawn_scripted(vec![]).await;
         let f = onboard_fixture(addr, true).await;
         let handler = f.handler.clone().with_auth_services(pm_wired_auth());
 
@@ -4437,7 +4256,6 @@ key = "builder-key-2"
     #[tokio::test]
     async fn begin_runs_to_complete_with_audit_and_no_secret_leak() {
         let (addr, _s) = spawn_scripted(vec![
-            geo_ok(),
             creds_rule(),
             ("/balance-allowance/update", r#"{"ok":true}"#.to_string()),
         ])
@@ -4513,7 +4331,6 @@ key = "builder-key-2"
     #[tokio::test]
     async fn account_views_need_creds_then_serve_sectioned_portfolio() {
         let (addr, _s) = spawn_scripted(vec![
-            geo_ok(),
             (
                 "/balance-allowance",
                 r#"{"balance":"25000000","allowance":"max"}"#.to_string(),
@@ -4671,7 +4488,7 @@ key = "builder-key-2"
 
     #[tokio::test]
     async fn fund_new_refuses_before_deposit_wallet_is_fundable() {
-        let (addr, _s) = spawn_scripted(vec![geo_ok()]).await;
+        let (addr, _s) = spawn_scripted(vec![]).await;
         let f = onboard_fixture(addr, false).await;
         let err = f
             .handler
@@ -4689,7 +4506,7 @@ key = "builder-key-2"
 
     #[tokio::test]
     async fn fund_new_stages_a_request_and_reads_it_back() {
-        let (addr, _s) = spawn_scripted(vec![geo_ok()]).await;
+        let (addr, _s) = spawn_scripted(vec![]).await;
         let f = onboard_fixture(addr, false).await;
         let owner = f.keystore.info("alice").unwrap().address;
         let st: OnboardState = serde_json::from_value(serde_json::json!({
@@ -4905,7 +4722,12 @@ key = "builder-key-2"
             metadata: alloy::primitives::B256::ZERO,
             builder: alloy::primitives::B256::ZERO,
         };
-        let action = bloom_polymarket::signing::order_action_and_hash(&order_shell, 137, true);
+        let action = bloom_polymarket::signing::order_action_and_hash(
+            &order_shell,
+            137,
+            true,
+            bloom_polymarket::order::OrderType::GTC,
+        );
         (draft, action)
     }
 
@@ -4956,7 +4778,6 @@ key = "builder-key-2"
                 )
                 .with_poll_timeout(Duration::from_secs(2)),
             ),
-            geoblock: Arc::new(GeoblockClient::new()),
             auth_dir: auth_dir.path().to_path_buf(),
             creds: CredentialStore::new(auth_dir.path()),
             chain,
@@ -5033,7 +4854,7 @@ key = "builder-key-2"
 
     #[tokio::test]
     async fn sealed_revoke_denies_and_writes_challenge_without_grant() {
-        let (addr, _s) = spawn_scripted(vec![geo_ok()]).await;
+        let (addr, _s) = spawn_scripted(vec![]).await;
         let f = onboard_fixture(addr, true).await;
         let store = bloom_polymarket::OnboardStore::new(&f.state_dir);
         store.save("alice", &fake_onboard_state()).unwrap();
@@ -5059,8 +4880,14 @@ key = "builder-key-2"
     }
 
     #[tokio::test]
-    async fn sealed_withdraw_denies_and_writes_challenge_without_grant() {
-        let (addr, _s) = spawn_scripted(vec![geo_ok()]).await;
+    async fn wired_withdraw_is_gated_to_foreground_cli() {
+        // The wired (serve-socket) withdraw path is intentionally closed until
+        // it binds the body `amount` into the sealed subject and submits a real
+        // `transfer` (tracked in docs/issues C2). Until then, even under wired
+        // auth the confirm returns Unsupported and stages nothing — every
+        // withdrawal goes through the foreground CLI, which reads the balance,
+        // validates the amount, and submits the correct transfer.
+        let (addr, _s) = spawn_scripted(vec![]).await;
         let f = onboard_fixture(addr, true).await;
         let store = bloom_polymarket::OnboardStore::new(&f.state_dir);
         store.save("alice", &fake_onboard_state()).unwrap();
@@ -5071,22 +4898,30 @@ key = "builder-key-2"
             .await
             .unwrap_err();
         assert!(
-            matches!(err, HandlerError::PermissionDenied),
-            "expected PermissionDenied, got: {err}"
+            matches!(err, HandlerError::Unsupported(_)),
+            "expected Unsupported, got: {err}"
+        );
+        assert!(
+            err.to_string().contains("foreground CLI VFS path"),
+            "gated error should point at the CLI, got: {err}"
         );
 
+        // No sealed action is staged for the closed path — no challenge on disk.
         let action_id = polymarket_withdraw_action_id("alice");
         let challenge_path = f
             .state_dir
             .join("alice")
             .join(&action_id)
             .join(APPROVAL_CHALLENGE_FILE);
-        assert!(challenge_path.exists(), "challenge not written");
+        assert!(
+            !challenge_path.exists(),
+            "gated withdraw must not stage a challenge"
+        );
     }
 
     #[tokio::test]
     async fn sealed_redeem_revoke_withdraw_preserve_foreground_when_not_wired() {
-        let (addr, _s) = spawn_scripted(vec![geo_ok()]).await;
+        let (addr, _s) = spawn_scripted(vec![]).await;
         let f = onboard_fixture(addr, true).await;
 
         // Redeem
@@ -5253,7 +5088,12 @@ key = "builder-key-2"
             metadata: alloy::primitives::B256::ZERO,
             builder: alloy::primitives::B256::ZERO,
         };
-        let action = bloom_polymarket::signing::order_action_and_hash(&order_shell, 137, true);
+        let action = bloom_polymarket::signing::order_action_and_hash(
+            &order_shell,
+            137,
+            true,
+            bloom_polymarket::order::OrderType::GTC,
+        );
 
         // Pre-mint a grant so the handler finds one when it checks.
         let now = pm_now_ms_u64();
@@ -5649,7 +5489,12 @@ key = "builder-key-2"
             metadata: alloy::primitives::B256::ZERO,
             builder: alloy::primitives::B256::ZERO,
         };
-        let action = bloom_polymarket::signing::order_action_and_hash(&order_shell, 137, true);
+        let action = bloom_polymarket::signing::order_action_and_hash(
+            &order_shell,
+            137,
+            true,
+            bloom_polymarket::order::OrderType::GTC,
+        );
 
         // Pre-mint a one-signature grant.
         let now = pm_now_ms_u64();
@@ -5817,7 +5662,12 @@ key = "builder-key-2"
             metadata: alloy::primitives::B256::ZERO,
             builder: alloy::primitives::B256::ZERO,
         };
-        let action = bloom_polymarket::signing::order_action_and_hash(&order_shell, 137, true);
+        let action = bloom_polymarket::signing::order_action_and_hash(
+            &order_shell,
+            137,
+            true,
+            bloom_polymarket::order::OrderType::GTC,
+        );
 
         // Should return PermissionDenied (no grant → writes challenge).
         let result = h
