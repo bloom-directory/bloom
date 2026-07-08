@@ -454,6 +454,14 @@ impl PetalHost for KeystorePetalHost {
             }
         }
 
+        // NOTE: a sign-time policy hard-deny hook was intentionally removed
+        // here. The grant carries only `petal_policy_digest` (a hash), not the
+        // full `PetalPolicySnapshot`, so there is no rule set to hand an
+        // evaluator at this point — a hook wired here could only ever see empty
+        // caps/rules and would pass everything, which is worse than no hook.
+        // Re-add it once a snapshot source keyed by wallet/policy_version exists
+        // at sign time (tracked with the C9 policy-pricing work).
+
         // Step 7: ensure the signer is in memory. A per-grant signer cache
         // (set by the daemon after `sealed_approval_ceremony`) lets us reuse
         // the decrypted signer without re-running a WebAuthn ceremony; on a

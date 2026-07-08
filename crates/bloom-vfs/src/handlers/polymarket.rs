@@ -10,10 +10,12 @@ use std::time::Duration;
 use alloy::primitives::{Address, U256};
 use async_trait::async_trait;
 use base64::Engine as _;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::engine::general_purpose::{STANDARD as B64_STANDARD, URL_SAFE_NO_PAD};
 use bloom_auth_api::{
-    AssuranceLevel, CanonicalEnvelope, CanonicalIntentHeader, ExecutorKind, SignedApproval,
-    petal_identity,
+    AssuranceLevel, CanonicalEnvelope, CanonicalIntentHeader, DaemonGrantTerms, ExecutorKind,
+    POLYMARKET_ORDER_SIGN_INTENT, POLYMARKET_SIGNING_ATTESTATION_FACTS_SCHEMA_V1,
+    PetalPolicySnapshot, PolymarketSealedActionKind, PolymarketSigningAttestationFacts,
+    SealedAction, SignHashRequest, SignedApproval, petal_identity,
 };
 use bloom_chain::ChainClient;
 use bloom_keystore::{Keystore, KeystoreError};
@@ -21,11 +23,12 @@ use bloom_polymarket::eip712::{PUSD, PUSD_DECIMALS};
 use bloom_polymarket::onboard::OnEvent;
 use bloom_polymarket::order::{self, OrderType};
 use bloom_polymarket::order_store::{OrderDraft, render_plan_md};
+use bloom_polymarket::signing::{action_id_for, poly1271_signature_from_raw};
 use bloom_polymarket::trade;
 use bloom_polymarket::{
     BuilderCredentialStore, ChainReader, ClobClient, CredentialStore, DataClient, GammaClient,
-    GeoblockClient, KeystoreSigner, OnboardEvent, OnboardState, Onboarder, OrderStore,
-    PolymarketError, Side, Stage, validate_wallet_name,
+    KeystoreSigner, OnboardEvent, OnboardState, Onboarder, OrderStore, PolymarketError, Side,
+    Stage, validate_wallet_name,
 };
 use bloom_proto::audit::{AuditLog, AuditRecord};
 use bloom_proto::polymarket_policy::{self as pm_policy, PolicySide, PolymarketOrderCtx};
@@ -40,7 +43,12 @@ pub const MARKETS_LIST_LIMIT: u32 = 20;
 
 const MARKET_FILES: [&str; 3] = ["market.json", "book.json", "prices.json"];
 const POSITION_FILES: [&str; 3] = ["positions.json", "trades.json", "activity.json"];
-const ONBOARD_RO_FILES: [&str; 3] = ["status.json", "plan.md", "approvals.json"];
+const ONBOARD_RO_FILES: [&str; 4] = [
+    "status.json",
+    "plan.md",
+    "approvals.json",
+    APPROVAL_CHALLENGE_FILE,
+];
 const ACCOUNT_FILES: [&str; 5] = [
     "portfolio.json",
     "orders.json",
@@ -60,7 +68,21 @@ const DRAFT_FILES: [&str; 5] = [
 const ROOT_FILES: [&str; 1] = ["README.md"];
 const APPROVAL_FILE: &str = "approval.json";
 const APPROVAL_CHALLENGE_FILE: &str = "approval_challenge.json";
-const APPROVAL_TTL_MS: u64 = 5 * 60 * 1000;
+/// Approval-challenge TTL shared by the daemon handler and the foreground
+/// CLI (both stage the same sealed actions).
+pub const APPROVAL_TTL_MS: u64 = 5 * 60 * 1000;
+
+/// Canonical subject schema tag for Polymarket V2 order sealed actions.
+const PM_ORDER_SUBJECT_SCHEMA_V1: &str = "bloom.polymarket_order_subject.v1";
+/// `surface` identifier in the canonical intent header for Polymarket
+/// first-party Petal sealed actions.
+pub const POLYMARKET_SURFACE: &str = "polymarket";
+// Per-trade auth directory for `/polymarket/trade/<wallet>/sign-hash/...`.
+
+/// Sidecar file the CLI writes to ask for host-backed signing.
+const PM_ORDER_SIGN_REQUEST_FILE: &str = "sign_request.json";
+/// Sidecar file the VFS writes the host-signed wrapped signature into.
+const PM_ORDER_SIGN_RESULT_FILE: &str = "sign_result.json";
 
 const README: &[u8] = br#"# Polymarket Trading
 
@@ -131,7 +153,7 @@ Discover resting order ids with `/polymarket/account/<wallet>/orders.json`.
 - Onboarding must complete (`bloom polymarket onboard <wallet>`) before any trade
 - Every value-moving CLI action requires a passkey ceremony or unlocked local wallet
 - Trade draft confirmation uses `bloom vfs write --unlock-wallet <wallet>` so
-  the existing CLI order engine re-checks geoblock, policy, stale draft status,
+  the existing CLI order engine re-checks policy, stale draft status,
   holdings, locks, signing, CLOB post/reconcile, receipts, and audit gates
 - Fund request confirmation uses `bloom vfs write --unlock-wallet <wallet>` so
   the existing CLI funding engine re-reads live balances/routes and applies the
@@ -197,7 +219,7 @@ const CANCEL_HINT: &[u8] = br#"write "confirm" here to cancel this resting CLOB 
 
 Cancellation executes directly in the VFS after compliance checks -- no wallet
 unlock is needed because it uses the wallet's stored CLOB credentials (L2 auth
-only). Geoblock and jurisdiction checks are hard gates for cancel.
+only). Jurisdiction checks are hard gates for cancel.
 
 Equivalent CLI:
 bloom polymarket cancel <wallet> <order-id>
@@ -231,11 +253,33 @@ fn polymarket_onboard_auth_dir(root: &Path, wallet: &str) -> Result<PathBuf, Han
     Ok(root.join(wallet))
 }
 
-fn polymarket_onboard_action_id(wallet: &str) -> String {
+pub fn polymarket_onboard_action_id(wallet: &str) -> String {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"bloom.polymarket.onboard.entry.v1");
     hasher.update(wallet.as_bytes());
     format!("pm-onboard-{}", hasher.finalize().to_hex())
+}
+
+pub fn polymarket_revoke_action_id(wallet: &str) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"bloom.polymarket.revoke.v1");
+    hasher.update(wallet.as_bytes());
+    format!("pm-revoke-{}", &hasher.finalize().to_hex()[..32])
+}
+
+pub fn polymarket_withdraw_action_id(wallet: &str) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"bloom.polymarket.withdraw.v1");
+    hasher.update(wallet.as_bytes());
+    format!("pm-withdraw-{}", &hasher.finalize().to_hex()[..32])
+}
+
+pub fn polymarket_redeem_action_id(wallet: &str, condition_id: &str) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"bloom.polymarket.redeem.v1");
+    hasher.update(wallet.as_bytes());
+    hasher.update(condition_id.as_bytes());
+    format!("pm-redeem-{}", &hasher.finalize().to_hex()[..32])
 }
 
 fn polymarket_onboard_envelope(
@@ -283,6 +327,203 @@ fn polymarket_onboard_envelope(
     ))
 }
 
+/// Sealed action for a Polymarket onboarding run: one Hardened grant
+/// (max_signatures=3) covers deploy + V2 approvals + CLOB creds + builder
+/// key. Deterministic `action_id` per wallet, so re-staging is idempotent.
+/// Shared by the daemon handler and the foreground CLI.
+pub fn polymarket_onboard_sealed_action(
+    wallet: &str,
+    owner: Address,
+    now_ms: u64,
+) -> Result<SealedAction, HandlerError> {
+    let envelope = polymarket_onboard_envelope(wallet, &format!("{owner:#x}"))?;
+    let mut extra = std::collections::BTreeMap::new();
+    extra.insert("action_kind".to_string(), serde_json::json!("onboard"));
+    let terms = bloom_auth_api::DaemonGrantTerms {
+        max_ttl_secs: APPROVAL_TTL_MS / 1_000,
+        max_signatures: 3,
+        allowed_sign_intents: vec![bloom_auth_api::POLYMARKET_ONBOARDING_SIGN_INTENT.into()],
+        assurance: AssuranceLevel::Hardened,
+        extra,
+    };
+    let caps = std::collections::BTreeMap::new();
+    let mut config = std::collections::BTreeMap::new();
+    config.insert("chain_id".to_string(), serde_json::json!(137));
+    let snapshot = bloom_auth_api::PetalPolicySnapshot {
+        policy_version: 0,
+        wallet: wallet.to_string(),
+        petal_id: petal_identity::PETAL_ID_POLYMARKET.into(),
+        petal_digest: petal_identity::PLACEHOLDER_DIGEST_POLYMARKET.into(),
+        caps,
+        hard_rules: Vec::new(),
+        step_up_rules: Vec::new(),
+        config,
+        budget_state: std::collections::BTreeMap::new(),
+        session_scope: Some(std::collections::BTreeMap::new()),
+    };
+    SealedAction::new(
+        envelope,
+        "Polymarket onboarding (deploy + V2 approve + CLOB creds + builder key)".into(),
+        Vec::new(),
+        terms,
+        snapshot,
+        now_ms,
+    )
+    .map_err(|e| HandlerError::backend(format!("seal Polymarket onboarding action: {e}")))
+}
+
+/// Sealed action for a one-signature Polymarket relayer operation (redeem,
+/// withdraw, revoke). The per-operation wrappers below fix the subject bytes,
+/// intent, and assurance so the daemon handler and the foreground CLI stage
+/// byte-identical actions for the same operation.
+#[allow(clippy::too_many_arguments)]
+fn polymarket_relayer_sealed_action(
+    wallet: &str,
+    action_id: &str,
+    intent: &str,
+    assurance: AssuranceLevel,
+    subject_label: &str,
+    subject_schema: &str,
+    subject_bytes: Vec<u8>,
+    now_ms: u64,
+) -> Result<SealedAction, HandlerError> {
+    let envelope = CanonicalEnvelope::new(
+        CanonicalIntentHeader {
+            schema: bloom_auth_api::CANONICAL_INTENT_HEADER_SCHEMA_V2.into(),
+            wallet: wallet.to_string(),
+            surface: POLYMARKET_SURFACE.into(),
+            action_id: action_id.into(),
+            petal_id: petal_identity::PETAL_ID_POLYMARKET.into(),
+            petal_digest: petal_identity::PLACEHOLDER_DIGEST_POLYMARKET.into(),
+            petal_version: petal_identity::FIRST_PARTY_PETAL_VERSION_V0.into(),
+            executor_kind: ExecutorKind::FirstParty,
+            network: "polygon".into(),
+            account: wallet.to_string(),
+            action_kind: subject_label.into(),
+            value_movement: true,
+            authority_change: false,
+            expires_ms: 0,
+        },
+        subject_label,
+        subject_schema,
+        subject_bytes,
+    );
+    let mut extra = std::collections::BTreeMap::new();
+    extra.insert("action_kind".to_string(), serde_json::json!(subject_label));
+    let terms = bloom_auth_api::DaemonGrantTerms {
+        max_ttl_secs: APPROVAL_TTL_MS / 1_000,
+        max_signatures: 1,
+        allowed_sign_intents: vec![intent.into()],
+        assurance,
+        extra,
+    };
+    let config = std::collections::BTreeMap::new();
+    let snapshot = bloom_auth_api::PetalPolicySnapshot {
+        policy_version: 0,
+        wallet: wallet.to_string(),
+        petal_id: petal_identity::PETAL_ID_POLYMARKET.into(),
+        petal_digest: petal_identity::PLACEHOLDER_DIGEST_POLYMARKET.into(),
+        caps: std::collections::BTreeMap::new(),
+        hard_rules: Vec::new(),
+        step_up_rules: Vec::new(),
+        config,
+        budget_state: std::collections::BTreeMap::new(),
+        session_scope: Some(std::collections::BTreeMap::new()),
+    };
+    SealedAction::new(
+        envelope,
+        format!("Polymarket {subject_label}"),
+        Vec::new(),
+        terms,
+        snapshot,
+        now_ms,
+    )
+    .map_err(|e| HandlerError::backend(format!("seal Polymarket {subject_label}: {e}")))
+}
+
+/// Sealed action for `revoke-approvals` (zero all V2 allowances + operator
+/// approvals via one relayer batch).
+pub fn polymarket_revocation_sealed_action(
+    wallet: &str,
+    deposit_wallet: Address,
+    now_ms: u64,
+) -> Result<SealedAction, HandlerError> {
+    let subject = serde_json::to_vec(&serde_json::json!({
+        "schema": "bloom.polymarket_revocation_subject.v1",
+        "wallet": wallet,
+        "deposit_wallet": format!("{deposit_wallet:#x}"),
+        "effects": ["zero_all_v2_allowances", "revoke_all_operator_approvals"],
+    }))
+    .map_err(|e| HandlerError::backend(e.to_string()))?;
+    polymarket_relayer_sealed_action(
+        wallet,
+        &polymarket_revoke_action_id(wallet),
+        bloom_auth_api::POLYMARKET_REVOCATION_SIGN_INTENT,
+        AssuranceLevel::Hardened,
+        "revocation",
+        "bloom.polymarket_revocation_subject.v1",
+        subject,
+        now_ms,
+    )
+}
+
+/// Sealed action for `withdraw-pusd` (transfer pUSD from the deposit wallet
+/// back to the owner EOA via one relayer batch).
+pub fn polymarket_withdrawal_sealed_action(
+    wallet: &str,
+    deposit_wallet: Address,
+    now_ms: u64,
+) -> Result<SealedAction, HandlerError> {
+    let subject = serde_json::to_vec(&serde_json::json!({
+        "schema": "bloom.polymarket_withdrawal_subject.v1",
+        "wallet": wallet,
+        "deposit_wallet": format!("{deposit_wallet:#x}"),
+        "token": "pUSD",
+        "effects": ["transfer_pusd_to_owner"],
+    }))
+    .map_err(|e| HandlerError::backend(e.to_string()))?;
+    polymarket_relayer_sealed_action(
+        wallet,
+        &polymarket_withdraw_action_id(wallet),
+        bloom_auth_api::POLYMARKET_WITHDRAWAL_SIGN_INTENT,
+        AssuranceLevel::Hardened,
+        "withdrawal",
+        "bloom.polymarket_withdrawal_subject.v1",
+        subject,
+        now_ms,
+    )
+}
+
+/// Sealed action for `redeem` (burn resolved outcome tokens for pUSD via one
+/// relayer batch).
+pub fn polymarket_redemption_sealed_action(
+    wallet: &str,
+    deposit_wallet: Address,
+    condition_id: &str,
+    neg_risk: bool,
+    now_ms: u64,
+) -> Result<SealedAction, HandlerError> {
+    let subject = serde_json::to_vec(&serde_json::json!({
+        "schema": "bloom.polymarket_redemption_subject.v1",
+        "wallet": wallet,
+        "deposit_wallet": format!("{deposit_wallet:#x}"),
+        "condition_id": condition_id,
+        "neg_risk": neg_risk,
+        "effects": ["redeem_positions"],
+    }))
+    .map_err(|e| HandlerError::backend(e.to_string()))?;
+    polymarket_relayer_sealed_action(
+        wallet,
+        &polymarket_redeem_action_id(wallet, condition_id),
+        bloom_auth_api::POLYMARKET_REDEMPTION_SIGN_INTENT,
+        AssuranceLevel::Standard,
+        "redemption",
+        "bloom.polymarket_redemption_subject.v1",
+        subject,
+        now_ms,
+    )
+}
+
 fn write_json(path: impl AsRef<Path>, value: &impl Serialize) -> Result<(), HandlerError> {
     fs::write(
         path,
@@ -290,6 +531,566 @@ fn write_json(path: impl AsRef<Path>, value: &impl Serialize) -> Result<(), Hand
             .map_err(|e| HandlerError::backend(format!("encode auth json: {e}")))?,
     )?;
     Ok(())
+}
+
+// ── Sealed onboarding signer ──────────────────────────────────────────────
+
+/// Owner-signing adapter that routes EIP-712 hash signatures through the
+/// Bloom Machine's `PetalHost::sign_hash` under a live Sealed Approval grant
+/// for the given action. One onboarding grant (max_signatures=3) covers all
+/// onboarding signature operations: V2 approval batch + CLOB L1 auth +
+/// builder key. Public so the foreground CLI can execute the same sealed
+/// relayer flows in-process.
+pub struct SealedOnboardSigner {
+    host: Arc<dyn bloom_auth_api::PetalHost>,
+    wallet: String,
+    action_id: String,
+    kind: PolymarketSealedActionKind,
+    owner: alloy::primitives::Address,
+}
+
+impl SealedOnboardSigner {
+    pub fn new(
+        host: Arc<dyn bloom_auth_api::PetalHost>,
+        wallet: impl Into<String>,
+        action_id: impl Into<String>,
+        kind: PolymarketSealedActionKind,
+        owner: alloy::primitives::Address,
+    ) -> Self {
+        Self {
+            host,
+            wallet: wallet.into(),
+            action_id: action_id.into(),
+            kind,
+            owner,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl bloom_polymarket::OnboardSigner for SealedOnboardSigner {
+    fn address(&self) -> alloy::primitives::Address {
+        self.owner
+    }
+
+    async fn sign_eip712_hash(
+        &self,
+        hash: &alloy::primitives::B256,
+    ) -> bloom_polymarket::Result<alloy::primitives::Signature> {
+        let facts = PolymarketSigningAttestationFacts {
+            facts_schema: POLYMARKET_SIGNING_ATTESTATION_FACTS_SCHEMA_V1.into(),
+            kind: self.kind,
+            petal_id: petal_identity::PETAL_ID_POLYMARKET.into(),
+            petal_digest: petal_identity::PLACEHOLDER_DIGEST_POLYMARKET.into(),
+            petal_version: petal_identity::FIRST_PARTY_PETAL_VERSION_V0.into(),
+            wallet: self.wallet.clone(),
+            chain_id: bloom_polymarket::POLYGON,
+            action_id: self.action_id.clone(),
+            signing_hash: format!("{hash:#x}"),
+        };
+        let attestation = facts
+            .signing_attestation()
+            .map_err(|e| bloom_polymarket::PolymarketError::signing(e.to_string()))?;
+        let intent = self.kind.intent().to_string();
+        let result = self
+            .host
+            .sign_hash(
+                bloom_auth_api::SignHashRequest {
+                    wallet: self.wallet.clone(),
+                    action_id: self.action_id.clone(),
+                    intent,
+                    hash_hex: format!("{hash:#x}"),
+                },
+                &attestation,
+                pm_now_ms_u64(),
+            )
+            .await
+            .map_err(|e| bloom_polymarket::PolymarketError::signing(e.to_string()))?;
+        let raw = B64_STANDARD
+            .decode(result.signature_b64.as_bytes())
+            .map_err(|e| {
+                bloom_polymarket::PolymarketError::signing(format!("decode host signature: {e}"))
+            })?;
+        let arr: [u8; 65] = raw.as_slice().try_into().map_err(|_| {
+            bloom_polymarket::PolymarketError::signing(format!(
+                "host signature is {} bytes, expected 65",
+                raw.len()
+            ))
+        })?;
+        alloy::primitives::Signature::from_raw(&arr)
+            .map_err(|e| bloom_polymarket::PolymarketError::signing(e.to_string()))
+    }
+
+    async fn clob_auth_headers(
+        &self,
+        chain_id: u64,
+        timestamp: u64,
+        nonce: u32,
+    ) -> bloom_polymarket::Result<Vec<(String, String)>> {
+        let hash = bloom_polymarket::eip712::clob_auth_signing_hash(
+            self.owner, timestamp, nonce, chain_id,
+        );
+        let sig = self.sign_eip712_hash(&hash).await?;
+        Ok(vec![
+            (
+                bloom_polymarket::signer::POLY_ADDRESS.to_string(),
+                format!("{:#x}", self.owner),
+            ),
+            (
+                bloom_polymarket::signer::POLY_NONCE.to_string(),
+                nonce.to_string(),
+            ),
+            (
+                bloom_polymarket::signer::POLY_SIGNATURE.to_string(),
+                sig.to_string(),
+            ),
+            (
+                bloom_polymarket::signer::POLY_TIMESTAMP.to_string(),
+                timestamp.to_string(),
+            ),
+        ])
+    }
+}
+
+// ── Polymarket order sealed approval (WS-H) ─────────────────────────────────
+
+/// Sidecar JSON the CLI writes at `/polymarket/trade/<wallet>/sign_request.json`
+/// to ask the daemon to seal + grant + sign an order via the host.
+///
+/// The VFS handler stages a SealedAction keyed by `signing_hash`, mints a
+/// challenge if no grant exists, or signs (via `host_sign_polymarket_order_hash`)
+/// and writes the wrapped POLY_1271 signature into `sign_result.json` on
+/// success.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PolymarketOrderSignRequest {
+    schema: String,
+    draft_id: String,
+    /// The salt the CLI committed to the draft (so the host signs the same
+    /// bytes the user just approved).
+    salt: String,
+    /// The order_view produced by `bloom_polymarket::signing::order_action_and_hash`.
+    order_view: serde_json::Value,
+    /// `0x` + 64 hex — the inner POLY_1271 hash the host must sign. Sourced
+    /// from `OrderAction.signing_hash` (not embedded inside `order_view`).
+    signing_hash: String,
+    /// Neg-risk flag — required to reproduce the inner POLY_1271 digest.
+    neg_risk: bool,
+    chain_id: u64,
+    side: Side,
+    /// Maker (deposit wallet) — recorded in the attestation for audit.
+    maker: Address,
+    /// Buyer-side human-readable label, optional.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    market_slug: Option<String>,
+}
+
+/// Sidecar JSON written to `/polymarket/trade/<wallet>/sign_result.json`
+/// once the host has signed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PolymarketOrderSignResult {
+    schema: String,
+    draft_id: String,
+    action_id: String,
+    /// 0x + 64 lowercase hex — the inner POLY_1271 hash the host signed.
+    signing_hash: String,
+    /// Wrapped POLY_1271 hex the CLOB expects.
+    wrapped_signature: String,
+    signed_at_ms: u64,
+    /// Grant id consumed by this signature.
+    grant_id: String,
+}
+
+/// Pure canonical-subject bytes for a Polymarket V2 order sealed action.
+/// Carries the full `order_view` so any canonical-subject byte change
+/// invalidates the cached `intent_hash` and the staged action must be re-staged
+/// (per WS-H §5.9: no step substitution after approval).
+fn polymarket_order_subject_bytes(
+    wallet: &str,
+    order_view: &serde_json::Value,
+    chain_id: u64,
+    neg_risk: bool,
+    signing_hash: &alloy::primitives::B256,
+) -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({
+        "schema": PM_ORDER_SUBJECT_SCHEMA_V1,
+        "wallet": wallet,
+        "chain_id": chain_id,
+        "neg_risk": neg_risk,
+        "signing_hash": format!("{signing_hash:#x}"),
+        "order_view": order_view,
+    }))
+    .expect("static polymarket order subject json")
+}
+
+/// Build the canonical intent envelope for a Polymarket order sealed action.
+/// Action id determinism is derived from the inner signing hash (the bytes the
+/// user actually approved), so any change to the order — including the
+/// timestamp-derived salt — invalidates the staged action.
+fn polymarket_order_envelope(
+    wallet: &str,
+    order_view: &serde_json::Value,
+    signing_hash: &alloy::primitives::B256,
+    chain_id: u64,
+    neg_risk: bool,
+) -> Result<CanonicalEnvelope, HandlerError> {
+    let subject =
+        polymarket_order_subject_bytes(wallet, order_view, chain_id, neg_risk, signing_hash);
+    let action_id = action_id_for("polymarket.order.v2", signing_hash);
+    Ok(CanonicalEnvelope::new(
+        CanonicalIntentHeader {
+            schema: bloom_auth_api::CANONICAL_INTENT_HEADER_SCHEMA_V2.into(),
+            wallet: wallet.to_string(),
+            surface: POLYMARKET_SURFACE.into(),
+            action_id,
+            petal_id: petal_identity::PETAL_ID_POLYMARKET.into(),
+            petal_digest: petal_identity::PLACEHOLDER_DIGEST_POLYMARKET.into(),
+            petal_version: petal_identity::FIRST_PARTY_PETAL_VERSION_V0.into(),
+            executor_kind: ExecutorKind::FirstParty,
+            network: if chain_id == bloom_polymarket::POLYGON {
+                "polygon".into()
+            } else if chain_id == bloom_polymarket::AMOY {
+                "amoy".into()
+            } else {
+                "polygon".into()
+            },
+            account: wallet.to_string(),
+            action_kind: "order".into(),
+            value_movement: true,
+            authority_change: false,
+            expires_ms: 0,
+        },
+        "polymarket_order",
+        PM_ORDER_SUBJECT_SCHEMA_V1,
+        subject,
+    ))
+}
+
+/// Human-readable plan text bound into the Polymarket order sealed action.
+/// Shared by the daemon handler and the foreground CLI so both stage the
+/// same action bytes for the same signing hash.
+pub fn polymarket_order_plan(
+    side: Side,
+    market_slug: Option<&str>,
+    maker: Address,
+    neg_risk: bool,
+    chain_id: u64,
+    signing_hash: &alloy::primitives::B256,
+) -> String {
+    format!(
+        "Polymarket V2 order ({:?}, market={}, maker={:#x}, neg_risk={}, chain_id={}, signing_hash={:#x})",
+        side,
+        market_slug.unwrap_or("<unknown>"),
+        maker,
+        neg_risk,
+        chain_id,
+        signing_hash,
+    )
+}
+
+pub fn polymarket_order_sealed_action(
+    wallet: &str,
+    order_view: &serde_json::Value,
+    signing_hash: &alloy::primitives::B256,
+    chain_id: u64,
+    neg_risk: bool,
+    plan: String,
+    now_ms: u64,
+) -> Result<SealedAction, HandlerError> {
+    let envelope = polymarket_order_envelope(wallet, order_view, signing_hash, chain_id, neg_risk)?;
+    let mut extra = std::collections::BTreeMap::new();
+    extra.insert("action_kind".to_string(), serde_json::json!("order"));
+    extra.insert(
+        "signing_hash".to_string(),
+        serde_json::json!(format!("{signing_hash:#x}")),
+    );
+    let terms = DaemonGrantTerms {
+        max_ttl_secs: APPROVAL_TTL_MS / 1_000,
+        max_signatures: 1,
+        allowed_sign_intents: vec![POLYMARKET_ORDER_SIGN_INTENT.into()],
+        assurance: AssuranceLevel::Standard,
+        extra,
+    };
+    let mut caps = std::collections::BTreeMap::new();
+    caps.insert(
+        "signing_hash".to_string(),
+        serde_json::json!(format!("{signing_hash:#x}")),
+    );
+    let mut config = std::collections::BTreeMap::new();
+    config.insert("chain_id".to_string(), serde_json::json!(chain_id));
+    config.insert("neg_risk".to_string(), serde_json::json!(neg_risk));
+    let snapshot = PetalPolicySnapshot {
+        policy_version: 0,
+        wallet: wallet.to_string(),
+        petal_id: petal_identity::PETAL_ID_POLYMARKET.into(),
+        petal_digest: petal_identity::PLACEHOLDER_DIGEST_POLYMARKET.into(),
+        caps,
+        hard_rules: Vec::new(),
+        step_up_rules: Vec::new(),
+        config,
+        budget_state: std::collections::BTreeMap::new(),
+        session_scope: Some(std::collections::BTreeMap::new()),
+    };
+    SealedAction::new(envelope, plan, Vec::new(), terms, snapshot, now_ms)
+        .map_err(|e| HandlerError::backend(format!("seal Polymarket order action: {e}")))
+}
+
+/// Sign a Polymarket V2 order's inner POLY_1271 hash via `PetalHost::sign_hash`
+/// under a live grant for `action_id`, and wrap the raw 65-byte ECDSA into the
+/// ERC-7739 signature hex the CLOB expects. Shared by the daemon handler and
+/// the foreground CLI so both consume grants identically.
+#[allow(clippy::too_many_arguments)]
+pub async fn host_sign_polymarket_order_hash(
+    host: &dyn bloom_auth_api::PetalHost,
+    wallet: &str,
+    action_id: &str,
+    order: &order::Order,
+    signing_hash: &alloy::primitives::B256,
+    chain_id: u64,
+    neg_risk: bool,
+    now_ms: u64,
+) -> Result<String, HandlerError> {
+    let hash_hex = format!("{signing_hash:#x}");
+    let order_facts = PolymarketSigningAttestationFacts {
+        facts_schema: POLYMARKET_SIGNING_ATTESTATION_FACTS_SCHEMA_V1.into(),
+        kind: PolymarketSealedActionKind::Order,
+        petal_id: petal_identity::PETAL_ID_POLYMARKET.into(),
+        petal_digest: petal_identity::PLACEHOLDER_DIGEST_POLYMARKET.into(),
+        petal_version: petal_identity::FIRST_PARTY_PETAL_VERSION_V0.into(),
+        wallet: wallet.to_string(),
+        chain_id,
+        action_id: action_id.to_string(),
+        signing_hash: hash_hex.clone(),
+    };
+    let attestation = order_facts.signing_attestation().map_err(|e| {
+        HandlerError::invalid(format!(
+            "Polymarket Sealed Approval attestation invalid: {e}"
+        ))
+    })?;
+    let sealed_sig = host
+        .sign_hash(
+            SignHashRequest {
+                wallet: wallet.to_string(),
+                action_id: action_id.to_string(),
+                intent: POLYMARKET_ORDER_SIGN_INTENT.into(),
+                hash_hex,
+            },
+            &attestation,
+            now_ms,
+        )
+        .await
+        .map_err(|e| HandlerError::invalid(format!("Polymarket Sealed Approval denied: {e}")))?;
+    let raw = B64_STANDARD
+        .decode(sealed_sig.signature_b64.as_bytes())
+        .map_err(|e| HandlerError::backend(format!("decode host signature: {e}")))?;
+    poly1271_signature_from_raw(order, &raw, chain_id, neg_risk)
+        .map_err(|e| HandlerError::backend(format!("wrap POLY_1271 signature: {e}")))
+}
+
+impl PolymarketHandler {
+    /// Wired-mode order signing flow:
+    ///
+    /// 1. `get_active(wallet, action_id, polymarket, …)` — if a live grant
+    ///    exists, fall through to step 4.
+    /// 2. Look for legacy `approval.json` and try `verify_and_mint_grant`
+    ///    (dev / unmounted flow).
+    /// 3. Else issue an `approval_challenge.json` and return `PermissionDenied`
+    ///    so the user completes the ceremony.
+    /// 4. Use `sign_hash` via `PetalHost` to sign the inner hash.
+    /// 5. Wrap the raw 65-byte ECDSA via `poly1271_signature_from_raw`.
+    ///
+    /// Mirrors `prepare_wallet_policy_sealed` / `execute_wallet_policy_update`
+    /// in `bloom-vfs/src/handlers/wallets.rs:670-825`.
+    #[allow(clippy::too_many_arguments)]
+    async fn prepare_and_sign_order_sealed(
+        &self,
+        wallet: &str,
+        order_view: &serde_json::Value,
+        signing_hash: &alloy::primitives::B256,
+        chain_id: u64,
+        neg_risk: bool,
+        market_slug: Option<String>,
+        maker: Address,
+        side: Side,
+    ) -> Result<PolymarketOrderSignResult, HandlerError> {
+        let now = pm_now_ms_u64();
+        let plan = polymarket_order_plan(
+            side,
+            market_slug.as_deref(),
+            maker,
+            neg_risk,
+            chain_id,
+            signing_hash,
+        );
+        let sealed = polymarket_order_sealed_action(
+            wallet,
+            order_view,
+            signing_hash,
+            chain_id,
+            neg_risk,
+            plan,
+            now,
+        )?;
+        let action_id = sealed.action_id().to_string();
+        let petal_id = sealed.petal_id().to_string();
+        let petal_digest = sealed.petal_digest().to_string();
+        self.auth_services
+            .require_writer()?
+            .stage_action(sealed, now)
+            .await
+            .map_err(|e| HandlerError::backend(format!("stage Polymarket order action: {e}")))?;
+        // Re-fetch the sealed action's grant lookup key after staging so the
+        // petals match what was bound into the SealedAction. Hold the grant
+        // itself: signing below consumes it (max_signatures = 1), so its
+        // `grant_id` must be captured before `sign_hash`, not looked up as
+        // active afterwards.
+        let grant = self
+            .auth_services
+            .require_grant_store()?
+            .get_active(wallet, &action_id, &petal_id, &petal_digest, now)
+            .await
+            .map_err(|e| HandlerError::backend(format!("lookup Polymarket grant: {e}")))?;
+        let grant = match grant {
+            Some(grant) => grant,
+            None => {
+                // Legacy `approval.json` recovery path (matches wallets.rs:712).
+                let auth_root = self
+                    .onboarding
+                    .as_ref()
+                    .map(|ob| ob.auth_dir.clone())
+                    .unwrap_or_else(|| self.keystore.root().join("_polymarket"));
+                let dir = auth_root.join("trade").join(wallet).join(action_id.clone());
+                fs::create_dir_all(&dir)?;
+                let approval_path = dir.join(APPROVAL_FILE);
+                if approval_path.exists() {
+                    let approval: SignedApproval = read_json(&approval_path)?;
+                    self.auth_services
+                        .require_approval_verifier()?
+                        .verify_and_mint_grant(
+                            approval,
+                            self.auth_services.require_grant_store()?.as_ref(),
+                            now,
+                        )
+                        .await
+                        .map_err(|e| {
+                            HandlerError::invalid(format!("Sealed Approval rejected: {e}"))
+                        })?
+                } else {
+                    let challenge = self
+                        .issue_polymarket_order_challenge(&action_id)
+                        .await?
+                        .with_local_ceremony_url();
+                    let challenge_path = approval_path.with_file_name(APPROVAL_CHALLENGE_FILE);
+                    if let Some(parent) = challenge_path.parent() {
+                        fs::create_dir_all(parent)?;
+                    }
+                    write_json(challenge_path, &challenge)?;
+                    return Err(HandlerError::PermissionDenied);
+                }
+            }
+        };
+        // We have a grant now. Sign via the host. We need a minimal `Order`
+        // shell because the POLY_1271 wrap step embeds `contents_hash` (the
+        // inner EIP-712 struct hash) and the APP_DOMAIN_SEPARATOR; the
+        // `order_view` already carries those, but the wrap helper takes
+        // `&Order` — we re-derive the shell here.
+        let order_shell = order_shell_from_view(order_view)?;
+        let hash_hex = format!("{signing_hash:#x}");
+        let wrapped = host_sign_polymarket_order_hash(
+            self.auth_services.require_petal_host()?.as_ref(),
+            wallet,
+            &action_id,
+            &order_shell,
+            signing_hash,
+            chain_id,
+            neg_risk,
+            now,
+        )
+        .await?;
+        Ok(PolymarketOrderSignResult {
+            schema: PM_ORDER_SIGN_RESULT_FILE.into(),
+            draft_id: order_view
+                .get("draft_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            action_id,
+            signing_hash: hash_hex,
+            wrapped_signature: wrapped,
+            signed_at_ms: now,
+            grant_id: grant.grant_id,
+        })
+    }
+
+    async fn issue_polymarket_order_challenge(
+        &self,
+        action_id: &str,
+    ) -> Result<bloom_auth_api::ApprovalChallenge, HandlerError> {
+        use base64::Engine as _;
+        let mut nonce = [0u8; 32];
+        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut nonce);
+        let nonce_b64 = URL_SAFE_NO_PAD.encode(nonce);
+        self.auth_services
+            .require_writer()?
+            .issue_challenge(
+                POLYMARKET_SURFACE,
+                action_id,
+                &nonce_b64,
+                pm_now_ms_u64() + APPROVAL_TTL_MS,
+                pm_now_ms_u64(),
+            )
+            .await
+            .map_err(|e| HandlerError::backend(format!("issue Polymarket order challenge: {e}")))
+    }
+}
+
+/// Build a minimal `Order` shell from a `OrderAction.order_view` JSON.
+/// The POLY_1271 wrap helper needs the `contents_hash` (which it re-derives
+/// from the order struct), the `APP_DOMAIN_SEPARATOR` (which it derives from
+/// `chain_id` + `neg_risk`), and the `ORDER_TYPE_STRING`. So the values we
+/// have to round-trip are the numeric fields the struct hash binds on.
+fn order_shell_from_view(view: &serde_json::Value) -> Result<order::Order, HandlerError> {
+    use std::str::FromStr;
+    let get = |k: &str| -> Result<String, HandlerError> {
+        view.get(k)
+            .and_then(|v| v.as_str().map(str::to_string))
+            .ok_or_else(|| HandlerError::invalid(format!("order_view missing {k}")))
+    };
+    Ok(order::Order {
+        salt: alloy::primitives::U256::from_str(&get("salt")?)
+            .map_err(|e| HandlerError::invalid(format!("parse salt: {e}")))?,
+        maker: get("maker")?
+            .parse::<alloy::primitives::Address>()
+            .map_err(|e| HandlerError::invalid(format!("parse maker: {e}")))?,
+        signer: get("signer")?
+            .parse::<alloy::primitives::Address>()
+            .map_err(|e| HandlerError::invalid(format!("parse signer: {e}")))?,
+        tokenId: alloy::primitives::U256::from_str(&get("tokenId")?)
+            .map_err(|e| HandlerError::invalid(format!("parse tokenId: {e}")))?,
+        makerAmount: alloy::primitives::U256::from_str(&get("makerAmount")?)
+            .map_err(|e| HandlerError::invalid(format!("parse makerAmount: {e}")))?,
+        takerAmount: alloy::primitives::U256::from_str(&get("takerAmount")?)
+            .map_err(|e| HandlerError::invalid(format!("parse takerAmount: {e}")))?,
+        side: {
+            let s = get("side")?;
+            s.parse::<u8>()
+                .map_err(|e| HandlerError::invalid(format!("parse side: {e}")))?
+        },
+        signatureType: get("signatureType")?
+            .parse::<u8>()
+            .map_err(|e| HandlerError::invalid(format!("parse signatureType: {e}")))?,
+        timestamp: alloy::primitives::U256::from_str(&get("timestamp")?)
+            .map_err(|e| HandlerError::invalid(format!("parse timestamp: {e}")))?,
+        metadata: view
+            .get("metadata")
+            .and_then(|v| v.as_str())
+            .and_then(|s| alloy::primitives::B256::from_str(s).ok())
+            .unwrap_or(alloy::primitives::B256::ZERO),
+        builder: view
+            .get("builder")
+            .and_then(|v| v.as_str())
+            .and_then(|s| alloy::primitives::B256::from_str(s).ok())
+            .unwrap_or(alloy::primitives::B256::ZERO),
+    })
 }
 
 fn read_json<T: for<'de> Deserialize<'de>>(path: impl AsRef<Path>) -> Result<T, HandlerError> {
@@ -302,7 +1103,6 @@ fn read_json<T: for<'de> Deserialize<'de>>(path: impl AsRef<Path>) -> Result<T, 
 /// its constructor and the daemon opts in via [`PolymarketHandler::with_onboarding`].
 pub struct PolymarketOnboarding {
     pub onboarder: Arc<Onboarder>,
-    pub geoblock: Arc<GeoblockClient>,
     pub auth_dir: PathBuf,
     /// Read access to stored CLOB credentials (for the `account/` views).
     pub creds: CredentialStore,
@@ -729,7 +1529,7 @@ impl PolymarketHandler {
     /// foreground ceremony) only if ALL of the following are true:
     /// - No EVM owner signing is required (L2 CLOB credentials only).
     /// - The operation is risk-reducing (cannot move funds or increase risk).
-    /// - Geoblock and jurisdiction checks pass.
+    /// - Jurisdiction checks pass.
     ///
     /// If any criterion is false, the operation MUST go through the foreground
     /// confirm path (`bloom vfs write --unlock-wallet`). Builder-key revoke is
@@ -764,20 +1564,6 @@ impl PolymarketHandler {
             ob.creds.load(wallet).map_err(err_be)?.ok_or_else(|| {
                 HandlerError::invalid("wallet not onboarded (no CLOB credentials)")
             })?;
-        match ob.geoblock.check().await {
-            Ok(geo) if geo.blocked => {
-                return Err(HandlerError::invalid(format!(
-                    "Polymarket geoblock denied cancel for wallet '{wallet}' (country={}, region={})",
-                    geo.country, geo.region
-                )));
-            }
-            Ok(_) => {}
-            Err(e) => {
-                return Err(HandlerError::invalid(format!(
-                    "could not verify Polymarket region availability before cancel: {e}"
-                )));
-            }
-        }
         let store = self
             .orders
             .as_deref()
@@ -795,6 +1581,99 @@ impl PolymarketHandler {
                 serde_json::json!({ "order_id": order_id, "response": result }),
             )
             .map_err(err_be)?;
+        Ok(())
+    }
+
+    /// Wired-mode `confirm` dispatch for a draft trade. Reads the
+    /// `sign_request.json` sidecar the CLI committed alongside the
+    /// `build_order` step, stages a SealedAction, mints a challenge if no grant
+    /// exists, otherwise signs via `PetalHost::sign_hash` and writes the
+    /// wrapped POLY_1271 signature to `sign_result.json`.
+    async fn confirm_order_via_sealed(
+        &self,
+        wallet: &str,
+        draft_id: &str,
+        _data: &[u8],
+    ) -> Result<(), HandlerError> {
+        validate_wallet_name(wallet).map_err(err_be)?;
+        let store = self
+            .orders
+            .as_ref()
+            .ok_or_else(|| HandlerError::not_found("polymarket trade/"))?;
+        let draft = store
+            .load_draft(wallet, draft_id)
+            .map_err(err_be)?
+            .ok_or_else(|| {
+                HandlerError::not_found(format!(
+                    "polymarket trade/{wallet}/drafts/{draft_id}/order.json"
+                ))
+            })?;
+        // Sidecar location: <store.dir>/<wallet>/orders/drafts/<draft_id>/sign_request.json.
+        let draft_path = store.draft_path(wallet, draft_id);
+        let trade_dir = match draft_path.parent() {
+            Some(p) => p.to_path_buf(),
+            None => {
+                return Err(HandlerError::not_found(format!(
+                    "polymarket trade/{wallet}/drafts/{draft_id}"
+                )));
+            }
+        };
+        fs::create_dir_all(&trade_dir)?;
+        let req_path = trade_dir.join(PM_ORDER_SIGN_REQUEST_FILE);
+        let req: PolymarketOrderSignRequest = if req_path.exists() {
+            read_json(&req_path)?
+        } else {
+            // CLI didn't drop a sidecar — we accept the request body in this
+            // case so a future sealed-aware CLI doesn't need a sidecar at all.
+            serde_json::from_slice(_data).map_err(|e| {
+                HandlerError::invalid(format!(
+                    "no {PM_ORDER_SIGN_REQUEST_FILE} sidecar and body is not a valid \
+                     PolymarketOrderSignRequest: {e}"
+                ))
+            })?
+        };
+        if req.schema != "bloom.polymarket.order_sign_request.v1" {
+            return Err(HandlerError::invalid(format!(
+                "unsupported sign-request schema {}",
+                req.schema
+            )));
+        }
+        let signing_hash = req
+            .signing_hash
+            .parse::<alloy::primitives::B256>()
+            .map_err(|e| HandlerError::invalid(format!("parse signing_hash: {e}")))?;
+        let result = self
+            .prepare_and_sign_order_sealed(
+                wallet,
+                &req.order_view,
+                &signing_hash,
+                req.chain_id,
+                req.neg_risk,
+                req.market_slug.clone(),
+                req.maker,
+                req.side,
+            )
+            .await?;
+        let result_path = trade_dir.join(PM_ORDER_SIGN_RESULT_FILE);
+        write_json(&result_path, &result)?;
+        // Best-effort: record that the draft was sealed-signed via the host.
+        let _ = std::fs::remove_file(&req_path);
+        if let Some(audit) = self.audit.as_ref() {
+            let _ = audit.append(AuditRecord {
+                ts_ms: 0, // set by append
+                kind: "polymarket.order.sealed_signed".into(),
+                wallet: Some(wallet.to_string()),
+                chain: None,
+                data: serde_json::json!({
+                    "draft_id": draft.id,
+                    "action_id": result.action_id,
+                    "grant_id": result.grant_id,
+                    "signing_hash": result.signing_hash,
+                }),
+                prev: String::new(),
+                digest: String::new(),
+            });
+        }
         Ok(())
     }
 
@@ -1064,8 +1943,7 @@ fn render_onboard_plan_md(st: &OnboardState) -> String {
          reader sees `running=false`; rely on `in_flight_deadline_ms` for\n\
          cross-process liveness.\n\
          \n\
-         Preconditions enforced on `begin`: wallet unlocked, region not geoblocked\n\
-         (fail-closed — an unverifiable region refuses too; there is no bypass).\n\
+         Preconditions enforced on `begin`: wallet unlocked\n\
          The owner key never leaves the bloom daemon.\n",
         wallet = st.wallet,
         owner = st.owner,
@@ -1210,7 +2088,17 @@ impl PolymarketHandler {
                 1 => Ok(Entry::dir("onboard")),
                 2 => Ok(Entry::dir(&segs[1])),
                 3 if segs[2] == "begin" => Ok(Entry::writable_file("begin")),
-                3 if ONBOARD_RO_FILES.contains(&segs[2].as_str()) => Ok(Entry::file(&segs[2])),
+                3 if ONBOARD_RO_FILES.contains(&segs[2].as_str()) => {
+                    if segs[2] == APPROVAL_CHALLENGE_FILE {
+                        let ob = self.onboarding_or_not_found(path)?;
+                        let challenge_path = polymarket_onboard_auth_dir(&ob.auth_dir, &segs[1])?
+                            .join(APPROVAL_CHALLENGE_FILE);
+                        if !challenge_path.exists() {
+                            return Err(HandlerError::not_found(path.to_string_path()));
+                        }
+                    }
+                    Ok(Entry::file(&segs[2]))
+                }
                 _ => Err(HandlerError::not_found(path.to_string_path())),
             },
             "account" if self.onboarding_wired() => match segs.len() {
@@ -1722,6 +2610,14 @@ impl PolymarketHandler {
             }
             "plan.md" => Ok(render_onboard_plan_md(&st).into_bytes()),
             "approvals.json" => pretty(&ob.onboarder.approval_preview(owner)),
+            APPROVAL_CHALLENGE_FILE => {
+                let challenge_path = polymarket_onboard_auth_dir(&ob.auth_dir, wallet)?
+                    .join(APPROVAL_CHALLENGE_FILE);
+                std::fs::read(&challenge_path).map_err(|e| match e.kind() {
+                    std::io::ErrorKind::NotFound => HandlerError::NotAFile(path.to_string_path()),
+                    _ => HandlerError::Io(e),
+                })
+            }
             _ => Err(HandlerError::NotAFile(path.to_string_path())),
         }
     }
@@ -1986,6 +2882,11 @@ impl PolymarketHandler {
             return self.create_trade_draft(&segs[1], _data).await;
         }
         if segs.len() == 5 && segs[0] == "trade" && segs[2] == "drafts" && segs[4] == "confirm" {
+            if self.auth_services.is_wired() {
+                return self
+                    .confirm_order_via_sealed(&segs[1], &segs[3], _data)
+                    .await;
+            }
             return Err(HandlerError::Unsupported(
                 "trade draft confirmation must run through the foreground CLI VFS path so the \
                  wallet unlock and signer live in the same process: \
@@ -2012,6 +2913,9 @@ impl PolymarketHandler {
             return self.execute_builder_key_revoke(&segs[1], _data).await;
         }
         if segs.len() == 4 && segs[0] == "redeem" && segs[3] == "confirm" {
+            if self.auth_services.is_wired() {
+                return self.execute_redeem_sealed(&segs[1], &segs[2]).await;
+            }
             return Err(HandlerError::Unsupported(
                 "redeem confirmation must run through the foreground CLI VFS path so the \
                  wallet unlock and signer live in the same process: \
@@ -2025,6 +2929,9 @@ impl PolymarketHandler {
             && segs[2] == "request"
             && segs[3] == "confirm"
         {
+            if self.auth_services.is_wired() {
+                return self.execute_revoke_sealed(&segs[1]).await;
+            }
             return Err(HandlerError::Unsupported(
                 "revoke-approvals confirmation must run through the foreground CLI VFS path so the \
                  wallet unlock and signer live in the same process: \
@@ -2034,9 +2941,18 @@ impl PolymarketHandler {
             ));
         }
         if segs.len() == 4 && segs[0] == "withdraw" && segs[2] == "pusd" && segs[3] == "confirm" {
+            // The wired (serve-socket) withdraw path is intentionally closed: it
+            // does not yet parse the body `amount`, bind it into the sealed
+            // subject/action_id, or read the live pUSD balance, so it cannot
+            // authorize a specific transfer. Until that lands (serve-socket
+            // passkey ceremony, tracked in docs/issues C2) every withdrawal —
+            // password *and* passkey wallets — goes through the foreground CLI
+            // path, which reads the balance, validates the amount, and submits
+            // the correct `pUSD.transfer(owner, amount)`.
             return Err(HandlerError::Unsupported(
                 "pUSD withdrawal confirmation must run through the foreground CLI VFS path so the \
-                 wallet unlock and signer live in the same process: \
+                 wallet unlock and signer live in the same process, and the amount is bound to the \
+                 signed batch: \
                  bloom vfs write /polymarket/withdraw/<wallet>/pusd/confirm \
                  --unlock-wallet <wallet> --data '{\"confirm\":true,\"amount\":\"<amount|all>\"}'"
                     .into(),
@@ -2056,23 +2972,9 @@ impl PolymarketHandler {
         validate_wallet_name(wallet).map_err(err_be)?;
         // Wallet must exist…
         self.wallet_address(wallet)?;
-        // Geoblock refuse-line: blocked or unverifiable → refuse. No bypass.
-        let geo = ob.geoblock.check().await.map_err(err_be)?;
-        if geo.blocked {
-            return Err(HandlerError::invalid(format!(
-                "Polymarket is unavailable in your region (country={}, region={}); \
-                 refusing to onboard",
-                geo.country, geo.region
-            )));
-        }
         if self.auth_services.is_wired() {
-            return Err(HandlerError::Unsupported(
-                "Polymarket onboarding requires grant-backed Sealed Approval host signing; \
-                 direct owner signing is disabled when auth services are wired"
-                    .into(),
-            ));
+            return self.begin_onboard_sealed(ob, wallet).await;
         }
-        self.prepare_onboard_sealed(ob, wallet).await?;
         // …and be unlocked: signing (approval batch, ClobAuth) needs the key.
         let signer_arc = self.keystore.signer(wallet).map_err(|e| match e {
             KeystoreError::Locked(_) => HandlerError::invalid(format!(
@@ -2120,59 +3022,357 @@ impl PolymarketHandler {
         Ok(())
     }
 
-    async fn prepare_onboard_sealed(
+    /// Wired-mode onboarding: stage a sealed action (deterministic action_id,
+    /// max_signatures=3), check for a live grant, and either spawn the
+    /// onboarder with a [`SealedOnboardSigner`] or issue a challenge +
+    /// return `PermissionDenied`.
+    async fn begin_onboard_sealed(
         &self,
         ob: &PolymarketOnboarding,
         wallet: &str,
     ) -> Result<(), HandlerError> {
-        if !self.auth_services.is_wired() {
-            return Ok(());
-        }
         let info = self
             .keystore
             .info(wallet)
             .map_err(|e| HandlerError::backend(e.to_string()))?;
-        let envelope = polymarket_onboard_envelope(wallet, &format!("{:#x}", info.address))?;
+        let owner = info.address;
+        let action_id = polymarket_onboard_action_id(wallet);
         let now = pm_now_ms_u64();
-        let staged = self
-            .auth_services
+
+        // Stage the sealed action (idempotent — deterministic action_id).
+        let sealed = polymarket_onboard_sealed_action(wallet, owner, now)?;
+        self.auth_services
             .require_writer()?
-            .stage_entry(envelope, AssuranceLevel::Hardened, now)
+            .stage_action(sealed, now)
             .await
             .map_err(|e| {
-                HandlerError::backend(format!("stage Polymarket onboarding auth entry: {e}"))
+                HandlerError::backend(format!("stage Polymarket onboarding action: {e}"))
             })?;
-        let dir = polymarket_onboard_auth_dir(&ob.auth_dir, wallet)?;
-        fs::create_dir_all(&dir)?;
-        let approval_path = dir.join(APPROVAL_FILE);
-        if approval_path.exists() {
-            let approval: SignedApproval = read_json(&approval_path)?;
-            self.auth_services
-                .require_approval_verifier()?
-                .verify_and_consume(approval, pm_now_ms_u64())
-                .await
-                .map_err(|e| HandlerError::invalid(format!("Sealed Approval rejected: {e}")))?;
-            return Ok(());
-        }
-        let mut nonce_bytes = [0u8; 32];
-        rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
-        let server_nonce = URL_SAFE_NO_PAD.encode(nonce_bytes);
-        let challenge = self
-            .auth_services
-            .require_writer()?
-            .issue_challenge(
-                "polymarket",
-                &staged.action_id,
-                &server_nonce,
-                pm_now_ms_u64().saturating_add(APPROVAL_TTL_MS),
-                pm_now_ms_u64(),
+
+        // Check for active grant.
+        let grant_store = self.auth_services.require_grant_store()?;
+        let grant = grant_store
+            .get_active(
+                wallet,
+                &action_id,
+                petal_identity::PETAL_ID_POLYMARKET,
+                petal_identity::PLACEHOLDER_DIGEST_POLYMARKET,
+                now,
             )
             .await
-            .map_err(|e| {
-                HandlerError::backend(format!("issue Polymarket onboarding challenge: {e}"))
-            })?;
-        write_json(dir.join(APPROVAL_CHALLENGE_FILE), &challenge)?;
-        Err(HandlerError::PermissionDenied)
+            .map_err(|e| HandlerError::backend(format!("lookup onboarding grant: {e}")))?;
+
+        if grant.is_none() {
+            // Legacy approval.json recovery path.
+            let dir = polymarket_onboard_auth_dir(&ob.auth_dir, wallet)?;
+            fs::create_dir_all(&dir)?;
+            let approval_path = dir.join(APPROVAL_FILE);
+            if approval_path.exists() {
+                let approval: SignedApproval = read_json(&approval_path)?;
+                self.auth_services
+                    .require_approval_verifier()?
+                    .verify_and_mint_grant(approval, grant_store.as_ref(), now)
+                    .await
+                    .map_err(|e| HandlerError::invalid(format!("Sealed Approval rejected: {e}")))?;
+            } else {
+                let mut nonce_bytes = [0u8; 32];
+                rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
+                let server_nonce = URL_SAFE_NO_PAD.encode(nonce_bytes);
+                let challenge = self
+                    .auth_services
+                    .require_writer()?
+                    .issue_challenge(
+                        POLYMARKET_SURFACE,
+                        &action_id,
+                        &server_nonce,
+                        pm_now_ms_u64().saturating_add(APPROVAL_TTL_MS),
+                        pm_now_ms_u64(),
+                    )
+                    .await
+                    .map_err(|e| {
+                        HandlerError::backend(format!("issue Polymarket onboarding challenge: {e}"))
+                    })?
+                    .with_local_ceremony_url();
+                write_json(dir.join(APPROVAL_CHALLENGE_FILE), &challenge)?;
+                return Err(HandlerError::PermissionDenied);
+            }
+        }
+
+        // Grant exists — spawn the onboarder with a sealed signer.
+        let host = self.auth_services.require_petal_host()?.clone();
+        let signer = SealedOnboardSigner {
+            host,
+            wallet: wallet.to_string(),
+            action_id,
+            kind: PolymarketSealedActionKind::Onboarding,
+            owner,
+        };
+
+        // Single-flight per wallet.
+        if !self.running.lock().unwrap().insert(wallet.to_string()) {
+            return Err(HandlerError::invalid(format!(
+                "onboarding for '{wallet}' is already running; read onboard/{wallet}/status.json"
+            )));
+        }
+        let guard = RunningGuard {
+            set: self.running.clone(),
+            wallet: wallet.to_string(),
+        };
+        let onboarder = ob.onboarder.clone();
+        let audit = self.audit.clone();
+        let wallet_owned = wallet.to_string();
+        tokio::spawn(async move {
+            let _guard = guard;
+            let audit_wallet = wallet_owned.clone();
+            let on_event = move |event: OnboardEvent| {
+                audit_onboard_event(audit.as_deref(), &audit_wallet, &event);
+            };
+            match onboarder
+                .run(&wallet_owned, &signer, &on_event as &OnEvent)
+                .await
+            {
+                Ok(st) => tracing::info!(
+                    wallet = %wallet_owned,
+                    stage = st.stage.as_str(),
+                    "polymarket.onboard.sealed_run_finished"
+                ),
+                Err(e) => tracing::warn!(
+                    wallet = %wallet_owned,
+                    error = %e,
+                    "polymarket.onboard.sealed_run_failed"
+                ),
+            }
+        });
+        Ok(())
+    }
+
+    /// Stage a prebuilt sealed action for a polymarket operation and check
+    /// for a live grant. Returns `Ok(())` if the grant exists (proceed with
+    /// execution). Returns `PermissionDenied` (after writing a challenge) if
+    /// no grant. Used by redeem, withdraw, and revoke.
+    async fn stage_and_check_sealed(
+        &self,
+        wallet: &str,
+        sealed: SealedAction,
+        auth_dir: &Path,
+    ) -> Result<(), HandlerError> {
+        let now = pm_now_ms_u64();
+        let action_id = sealed.action_id().to_string();
+        let subject_label = sealed.envelope.header.action_kind.clone();
+        self.auth_services
+            .require_writer()?
+            .stage_action(sealed, now)
+            .await
+            .map_err(|e| HandlerError::backend(format!("stage Polymarket {subject_label}: {e}")))?;
+        let grant_store = self.auth_services.require_grant_store()?;
+        let grant = grant_store
+            .get_active(
+                wallet,
+                &action_id,
+                petal_identity::PETAL_ID_POLYMARKET,
+                petal_identity::PLACEHOLDER_DIGEST_POLYMARKET,
+                now,
+            )
+            .await
+            .map_err(|e| HandlerError::backend(format!("lookup grant: {e}")))?;
+        if grant.is_none() {
+            let dir = polymarket_onboard_auth_dir(auth_dir, wallet)?;
+            fs::create_dir_all(&dir)?;
+            let approval_path = dir.join(&action_id).join(APPROVAL_FILE);
+            fs::create_dir_all(approval_path.parent().unwrap())?;
+            if approval_path.exists() {
+                let approval: SignedApproval = read_json(&approval_path)?;
+                self.auth_services
+                    .require_approval_verifier()?
+                    .verify_and_mint_grant(approval, grant_store.as_ref(), now)
+                    .await
+                    .map_err(|e| HandlerError::invalid(format!("Sealed Approval rejected: {e}")))?;
+            } else {
+                let mut nonce_bytes = [0u8; 32];
+                rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
+                let server_nonce = URL_SAFE_NO_PAD.encode(nonce_bytes);
+                let challenge = self
+                    .auth_services
+                    .require_writer()?
+                    .issue_challenge(
+                        POLYMARKET_SURFACE,
+                        &action_id,
+                        &server_nonce,
+                        pm_now_ms_u64().saturating_add(APPROVAL_TTL_MS),
+                        pm_now_ms_u64(),
+                    )
+                    .await
+                    .map_err(|e| HandlerError::backend(format!("issue challenge: {e}")))?
+                    .with_local_ceremony_url();
+                let challenge_path = approval_path.with_file_name(APPROVAL_CHALLENGE_FILE);
+                write_json(challenge_path, &challenge)?;
+                return Err(HandlerError::PermissionDenied);
+            }
+        }
+        Ok(())
+    }
+
+    /// Resolve the deposit wallet address for `wallet` from onboarding state.
+    async fn deposit_wallet_of(
+        &self,
+        wallet: &str,
+    ) -> Result<alloy::primitives::Address, HandlerError> {
+        let ob = self
+            .onboarding
+            .as_ref()
+            .ok_or_else(|| HandlerError::not_found("polymarket onboarding not configured"))?;
+        let store = bloom_polymarket::OnboardStore::new(&ob.auth_dir);
+        let st = store
+            .load(wallet)
+            .map_err(err_be)?
+            .ok_or_else(|| HandlerError::invalid("wallet not onboarded"))?;
+        st.deposit_wallet
+            .parse()
+            .map_err(|_| HandlerError::backend("corrupt deposit_wallet"))
+    }
+
+    /// Wired-mode revoke-approvals: stage sealed → grant check → submit
+    /// revocation batch via relayer.
+    async fn execute_revoke_sealed(&self, wallet: &str) -> Result<(), HandlerError> {
+        let ob = self
+            .onboarding
+            .as_ref()
+            .ok_or_else(|| HandlerError::not_found("polymarket onboarding not configured"))?;
+        let info = self
+            .keystore
+            .info(wallet)
+            .map_err(|e| HandlerError::backend(e.to_string()))?;
+        let owner = info.address;
+        let deposit = self.deposit_wallet_of(wallet).await?;
+        let action_id = polymarket_revoke_action_id(wallet);
+        let sealed = polymarket_revocation_sealed_action(wallet, deposit, pm_now_ms_u64())?;
+        self.stage_and_check_sealed(wallet, sealed, &ob.auth_dir)
+            .await?;
+        // Grant exists — submit the revocation batch.
+        let host = self.auth_services.require_petal_host()?.clone();
+        let signer = SealedOnboardSigner {
+            host,
+            wallet: wallet.into(),
+            action_id: action_id.clone(),
+            kind: PolymarketSealedActionKind::Revocation,
+            owner,
+        };
+        let noop: &OnEvent = &|_| {};
+        let relayer = ob
+            .onboarder
+            .relayer_for(wallet, owner, &signer, noop)
+            .await
+            .map_err(err_be)?;
+        let nonce = relayer.wallet_nonce(owner).await.map_err(err_be)?;
+        let deadline = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+            + 3600;
+        let tx = relayer
+            .submit_wallet_batch(
+                owner,
+                deposit,
+                bloom_polymarket::wallet::v2_revoke_calls(),
+                nonce,
+                deadline,
+                &signer,
+            )
+            .await
+            .map_err(err_be)?;
+        if let Some(audit) = self.audit.as_ref() {
+            let _ = audit.append(AuditRecord {
+                ts_ms: 0,
+                kind: "polymarket.revoke.sealed_submitted".into(),
+                wallet: Some(wallet.into()),
+                chain: None,
+                data: serde_json::json!({"tx_id": tx.id, "action_id": action_id}),
+                prev: String::new(),
+                digest: String::new(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Wired-mode redeem: stage sealed → grant check → submit redemption
+    /// batch via relayer.
+    async fn execute_redeem_sealed(&self, wallet: &str, slug: &str) -> Result<(), HandlerError> {
+        let ob = self
+            .onboarding
+            .as_ref()
+            .ok_or_else(|| HandlerError::not_found("polymarket onboarding not configured"))?;
+        let info = self
+            .keystore
+            .info(wallet)
+            .map_err(|e| HandlerError::backend(e.to_string()))?;
+        let owner = info.address;
+        let deposit = self.deposit_wallet_of(wallet).await?;
+        // Resolve the market to get conditionId + negRisk.
+        let market = self.gamma.market_by_slug(slug).await.map_err(err_be)?;
+        let condition_id = if market.condition_id.is_empty() {
+            return Err(HandlerError::invalid("market has no conditionId"));
+        } else {
+            &market.condition_id
+        };
+        let condition_id_b256 = condition_id
+            .parse::<alloy::primitives::B256>()
+            .map_err(|e| HandlerError::invalid(format!("conditionId parse: {e}")))?;
+        let neg_risk = market.neg_risk;
+        let action_id = polymarket_redeem_action_id(wallet, condition_id);
+        let sealed = polymarket_redemption_sealed_action(
+            wallet,
+            deposit,
+            condition_id,
+            neg_risk,
+            pm_now_ms_u64(),
+        )?;
+        self.stage_and_check_sealed(wallet, sealed, &ob.auth_dir)
+            .await?;
+        // Grant exists — submit the redemption batch.
+        let host = self.auth_services.require_petal_host()?.clone();
+        let signer = SealedOnboardSigner {
+            host,
+            wallet: wallet.into(),
+            action_id: action_id.clone(),
+            kind: PolymarketSealedActionKind::Redemption,
+            owner,
+        };
+        let noop: &OnEvent = &|_| {};
+        let relayer = ob
+            .onboarder
+            .relayer_for(wallet, owner, &signer, noop)
+            .await
+            .map_err(err_be)?;
+        let calls = vec![bloom_polymarket::wallet::redeem_positions_call(
+            condition_id_b256,
+            neg_risk,
+        )];
+        let nonce = relayer.wallet_nonce(owner).await.map_err(err_be)?;
+        let deadline = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+            + 3600;
+        let tx = relayer
+            .submit_wallet_batch(owner, deposit, calls, nonce, deadline, &signer)
+            .await
+            .map_err(err_be)?;
+        if let Some(audit) = self.audit.as_ref() {
+            let _ = audit.append(AuditRecord {
+                ts_ms: 0,
+                kind: "polymarket.redeem.sealed_submitted".into(),
+                wallet: Some(wallet.into()),
+                chain: None,
+                data: serde_json::json!({
+                    "tx_id": tx.id,
+                    "action_id": action_id,
+                    "condition_id": condition_id,
+                }),
+                prev: String::new(),
+                digest: String::new(),
+            });
+        }
+        Ok(())
     }
 
     async fn list_inner(&self, path: &VfsPath) -> Result<Vec<Entry>, HandlerError> {
@@ -2228,9 +3428,15 @@ impl PolymarketHandler {
                 self.list_keystore_wallets()
             }
             (Some("onboard"), 2) => {
-                self.onboarding_or_not_found(path)?;
+                let ob = self.onboarding_or_not_found(path)?;
                 let mut entries: Vec<Entry> =
                     ONBOARD_RO_FILES.iter().map(|f| Entry::file(f)).collect();
+                entries.retain(|entry| {
+                    entry.name != APPROVAL_CHALLENGE_FILE
+                        || polymarket_onboard_auth_dir(&ob.auth_dir, &segs[1])
+                            .map(|dir| dir.join(APPROVAL_CHALLENGE_FILE).exists())
+                            .unwrap_or(false)
+                });
                 entries.push(Entry::writable_file("begin"));
                 Ok(entries)
             }
@@ -2342,7 +3548,9 @@ impl PolymarketHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bloom_polymarket::{OnboardStore, RelayerClient};
+    use alloy::signers::SignerSync;
+    use bloom_auth_api::{GrantStore, SigningAttestationSchemaRegistry};
+    use bloom_polymarket::{OnboardSigner, OnboardStore, RelayerClient};
     use std::net::SocketAddr;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
@@ -2439,12 +3647,6 @@ mod tests {
 
     fn clob_unreachable() -> ClobClient {
         ClobClient::default().with_base_url(Url::parse("http://127.0.0.1:1").unwrap())
-    }
-
-    fn wired_auth_services() -> crate::AuthServices {
-        crate::AuthServices::default().with_grant_store(Arc::new(
-            bloom_auth::grant_store::InMemoryGrantStore::default(),
-        ))
     }
 
     fn p(s: &str) -> VfsPath {
@@ -2731,71 +3933,6 @@ mod tests {
         assert!(err.to_string().contains("foreground CLI VFS path"));
     }
 
-    #[tokio::test]
-    async fn cancel_geoblock_blocked_is_hard_denial() {
-        let (addr, _s) = spawn_scripted(vec![(
-            "/api/geoblock",
-            r#"{"blocked":true,"ip":"1.1.1.1","country":"XX","region":"YY"}"#.to_string(),
-        )])
-        .await;
-        let f = onboard_fixture(addr, true).await;
-        f.handler
-            .onboarding
-            .as_ref()
-            .unwrap()
-            .creds
-            .save(
-                "alice",
-                &bloom_polymarket::types::Credentials {
-                    key: "k-1".into(),
-                    secret: "c2VjcmV0LXZhbHVl".into(),
-                    passphrase: "pp-hidden".into(),
-                    nonce: 0,
-                },
-            )
-            .unwrap();
-
-        let err = f
-            .handler
-            .write(&p("/trade/alice/orders/0xORDER/cancel"), b"confirm")
-            .await
-            .unwrap_err();
-        assert!(err.to_string().contains("geoblock denied cancel"), "{err}");
-        assert!(err.to_string().contains("country=XX"), "{err}");
-    }
-
-    #[tokio::test]
-    async fn cancel_geoblock_unavailable_is_hard_denial() {
-        let (addr, _s) = spawn_scripted(vec![]).await;
-        let f = onboard_fixture(addr, true).await;
-        f.handler
-            .onboarding
-            .as_ref()
-            .unwrap()
-            .creds
-            .save(
-                "alice",
-                &bloom_polymarket::types::Credentials {
-                    key: "k-1".into(),
-                    secret: "c2VjcmV0LXZhbHVl".into(),
-                    passphrase: "pp-hidden".into(),
-                    nonce: 0,
-                },
-            )
-            .unwrap();
-
-        let err = f
-            .handler
-            .write(&p("/trade/alice/orders/0xORDER/cancel"), b"confirm")
-            .await
-            .unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("could not verify Polymarket region availability before cancel"),
-            "{err}"
-        );
-    }
-
     #[test]
     fn builder_key_revoke_body_accepts_ack_or_explicit_key() {
         assert_eq!(parse_builder_key_revoke_body(b"confirm").unwrap(), None);
@@ -2900,9 +4037,6 @@ key = "builder-key-2"
         )
         .with_onboarding(PolymarketOnboarding {
             onboarder: Arc::new(onboarder),
-            geoblock: Arc::new(
-                GeoblockClient::new().with_base_url_for_tests(format!("{base}/api/geoblock")),
-            ),
             auth_dir: state_dir.path().to_path_buf(),
             creds: CredentialStore::new(state_dir.path()),
             chain,
@@ -2917,13 +4051,6 @@ key = "builder-key-2"
             state_dir: state_path,
             _dirs: vec![ks_dir, state_dir, audit_dir],
         }
-    }
-
-    fn geo_ok() -> (&'static str, String) {
-        (
-            "/api/geoblock",
-            r#"{"blocked":false,"ip":"1.2.3.4","country":"AR","region":"X"}"#.to_string(),
-        )
     }
 
     fn creds_rule() -> (&'static str, String) {
@@ -3061,7 +4188,7 @@ key = "builder-key-2"
 
     #[tokio::test]
     async fn onboard_shape_when_wired() {
-        let (addr, _s) = spawn_scripted(vec![geo_ok()]).await;
+        let (addr, _s) = spawn_scripted(vec![]).await;
         let f = onboard_fixture(addr, true).await;
 
         let root: Vec<String> = f
@@ -3109,7 +4236,7 @@ key = "builder-key-2"
 
     #[tokio::test]
     async fn begin_preconditions_each_refuse_clearly() {
-        let (addr, _s) = spawn_scripted(vec![geo_ok()]).await;
+        let (addr, _s) = spawn_scripted(vec![]).await;
         let f = onboard_fixture(addr, true).await;
         let err = f
             .handler
@@ -3118,7 +4245,7 @@ key = "builder-key-2"
             .unwrap_err();
         assert!(matches!(err, HandlerError::NotFound(_)), "{err}");
 
-        let (addr, _s) = spawn_scripted(vec![geo_ok()]).await;
+        let (addr, _s) = spawn_scripted(vec![]).await;
         let f = onboard_fixture(addr, false).await;
         let err = f
             .handler
@@ -3126,53 +4253,54 @@ key = "builder-key-2"
             .await
             .unwrap_err();
         assert!(err.to_string().contains("locked"), "{err}");
-
-        let (addr, _s) = spawn_scripted(vec![(
-            "/api/geoblock",
-            r#"{"blocked":true,"ip":"1.1.1.1","country":"XX","region":"YY"}"#.to_string(),
-        )])
-        .await;
-        let f = onboard_fixture(addr, true).await;
-        let err = f
-            .handler
-            .write(&p("/onboard/alice/begin"), b"x")
-            .await
-            .unwrap_err();
-        assert!(err.to_string().contains("country=XX"), "{err}");
-
-        let (addr, _s) = spawn_scripted(vec![]).await; // 404s everything
-        let f = onboard_fixture(addr, true).await;
-        let err = f
-            .handler
-            .write(&p("/onboard/alice/begin"), b"x")
-            .await
-            .unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("could not verify region availability"),
-            "{err}"
-        );
     }
 
     #[tokio::test]
-    async fn wired_auth_disables_direct_onboarding_signing() {
-        let (addr, _s) = spawn_scripted(vec![geo_ok()]).await;
+    async fn wired_onboard_denies_and_writes_challenge_without_grant() {
+        let (addr, _s) = spawn_scripted(vec![]).await;
         let f = onboard_fixture(addr, true).await;
-        let handler = f.handler.clone().with_auth_services(wired_auth_services());
+        let handler = f.handler.clone().with_auth_services(pm_wired_auth());
 
         let err = handler
             .write(&p("/onboard/alice/begin"), b"x")
             .await
             .unwrap_err();
-        assert!(matches!(err, HandlerError::Unsupported(_)), "{err}");
-        assert!(err.to_string().contains("Polymarket onboarding"), "{err}");
-        assert!(err.to_string().contains("Sealed Approval"), "{err}");
+        assert!(
+            matches!(err, HandlerError::PermissionDenied),
+            "expected PermissionDenied, got: {err}"
+        );
+
+        // The challenge file should be under <auth_dir>/<wallet>/.
+        let challenge_path = f.state_dir.join("alice").join(APPROVAL_CHALLENGE_FILE);
+        assert!(
+            challenge_path.exists(),
+            "approval_challenge.json not written"
+        );
+        let challenge: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&challenge_path).unwrap()).unwrap();
+        assert_eq!(challenge["surface"], "polymarket");
+        assert_eq!(challenge["petal_id"], petal_identity::PETAL_ID_POLYMARKET);
+
+        let entries = handler.list(&p("/onboard/alice")).await.unwrap();
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.name == APPROVAL_CHALLENGE_FILE),
+            "approval_challenge.json must be listed after staging"
+        );
+        let projected: serde_json::Value = serde_json::from_slice(
+            &handler
+                .read(&p("/onboard/alice/approval_challenge.json"))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(projected, challenge);
     }
 
     #[tokio::test]
     async fn begin_runs_to_complete_with_audit_and_no_secret_leak() {
         let (addr, _s) = spawn_scripted(vec![
-            geo_ok(),
             creds_rule(),
             ("/balance-allowance/update", r#"{"ok":true}"#.to_string()),
         ])
@@ -3248,7 +4376,6 @@ key = "builder-key-2"
     #[tokio::test]
     async fn account_views_need_creds_then_serve_sectioned_portfolio() {
         let (addr, _s) = spawn_scripted(vec![
-            geo_ok(),
             (
                 "/balance-allowance",
                 r#"{"balance":"25000000","allowance":"max"}"#.to_string(),
@@ -3406,7 +4533,7 @@ key = "builder-key-2"
 
     #[tokio::test]
     async fn fund_new_refuses_before_deposit_wallet_is_fundable() {
-        let (addr, _s) = spawn_scripted(vec![geo_ok()]).await;
+        let (addr, _s) = spawn_scripted(vec![]).await;
         let f = onboard_fixture(addr, false).await;
         let err = f
             .handler
@@ -3424,7 +4551,7 @@ key = "builder-key-2"
 
     #[tokio::test]
     async fn fund_new_stages_a_request_and_reads_it_back() {
-        let (addr, _s) = spawn_scripted(vec![geo_ok()]).await;
+        let (addr, _s) = spawn_scripted(vec![]).await;
         let f = onboard_fixture(addr, false).await;
         let owner = f.keystore.info("alice").unwrap().address;
         let st: OnboardState = serde_json::from_value(serde_json::json!({
@@ -3492,5 +4619,1290 @@ key = "builder-key-2"
             err.to_string().contains("foreground CLI VFS path"),
             "expected foreground CLI guidance, got: {err}"
         );
+    }
+
+    // ── Phase 3b: sealed order confirm integration tests ───────────────
+
+    /// Minimal `AuthStoreWriter` for polymarket sealed-action tests: succeeds
+    /// at `stage_action` and `issue_challenge`, does not actually persist.
+    struct PmTestWriter;
+
+    #[async_trait]
+    impl bloom_auth_api::AuthStoreWriter for PmTestWriter {
+        async fn stage_entry(
+            &self,
+            envelope: CanonicalEnvelope,
+            assurance: AssuranceLevel,
+            now_ms: u64,
+        ) -> Result<bloom_auth_api::AuthEntryRecord, bloom_auth_api::AuthApiError> {
+            let intent_hash = envelope.intent_hash()?;
+            Ok(bloom_auth_api::AuthEntryRecord {
+                surface: envelope.header.surface.clone(),
+                action_id: envelope.header.action_id.clone(),
+                state: bloom_auth_api::AuthEntryState::Staged,
+                intent_hash,
+                assurance,
+                nonce: None,
+                nonce_state: bloom_auth_api::NonceState::Unused,
+                reservation_id: None,
+                updated_ms: now_ms,
+            })
+        }
+
+        async fn stage_action(
+            &self,
+            action: SealedAction,
+            now_ms: u64,
+        ) -> Result<bloom_auth_api::AuthEntryRecord, bloom_auth_api::AuthApiError> {
+            self.stage_entry(action.envelope, action.daemon_terms.assurance, now_ms)
+                .await
+        }
+
+        async fn issue_challenge(
+            &self,
+            surface: &str,
+            action_id: &str,
+            server_nonce: &str,
+            expiry_ms: u64,
+            _now_ms: u64,
+        ) -> Result<bloom_auth_api::ApprovalChallenge, bloom_auth_api::AuthApiError> {
+            Ok(bloom_auth_api::ApprovalChallenge {
+                schema: bloom_auth_api::APPROVAL_CHALLENGE_SCHEMA_V1.to_string(),
+                action_id: action_id.to_string(),
+                wallet: "w".to_string(),
+                surface: surface.to_string(),
+                petal_id: petal_identity::PETAL_ID_POLYMARKET.to_string(),
+                petal_digest: petal_identity::PLACEHOLDER_DIGEST_POLYMARKET.to_string(),
+                intent_hash: "pm-test-intent".to_string(),
+                server_nonce: server_nonce.to_string(),
+                assurance: AssuranceLevel::Standard,
+                daemon_terms_digest: "1".repeat(64),
+                petal_policy_digest: "2".repeat(64),
+                policy_version: 0,
+                expiry_ms,
+                ceremony_url: None,
+            })
+        }
+
+        async fn issue_review_session(
+            &self,
+            _id: &str,
+            _surface: &str,
+            _action_id: &str,
+            _expires_ms: u64,
+            _now_ms: u64,
+        ) -> Result<bloom_auth_api::ReviewSessionRecord, bloom_auth_api::AuthApiError> {
+            Err(bloom_auth_api::AuthApiError::Store("unused".into()))
+        }
+    }
+
+    fn pm_wired_auth() -> crate::AuthServices {
+        crate::AuthServices::default()
+            .with_grant_store(Arc::new(
+                bloom_auth::grant_store::InMemoryGrantStore::default(),
+            ))
+            .with_writer(Arc::new(PmTestWriter))
+    }
+
+    /// Build an order draft + the `OrderAction` (containing `signing_hash`) so
+    /// tests can construct a valid `PolymarketOrderSignRequest` sidecar.
+    fn pm_order_draft_and_action(
+        store: &OrderStore,
+    ) -> (
+        bloom_polymarket::order_store::OrderDraft,
+        bloom_polymarket::signing::OrderAction,
+    ) {
+        use bloom_polymarket::order::{LimitQuote, OrderType};
+        let snap = trade::Snapshot {
+            market: serde_json::from_value(serde_json::json!({
+                "id":"1","slug":"test-market","question":"Will it?","conditionId":"0xcond",
+                "clobTokenIds":"[\"123\",\"456\"]","outcomes":"[\"Yes\",\"No\"]",
+                "enableOrderBook":true,"active":true,"closed":false,"negRisk":true
+            }))
+            .unwrap(),
+            token_id: "123".into(),
+            neg_risk: true,
+            tick_micro: 1_000,
+            min_size_micro: 5_000_000,
+            best_ask_micro: Some(695_000),
+            best_bid_micro: Some(690_000),
+        };
+        let quote = LimitQuote {
+            side: Side::Buy,
+            price_micro: 695_000,
+            size_micro: 14_380_000,
+            maker_micro: 10_000_000,
+            taker_micro: 14_380_000,
+        };
+        let draft = trade::draft_from_quote(
+            "w",
+            "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266".into(),
+            None,
+            0,
+            "test-market",
+            "YES",
+            Side::Buy,
+            OrderType::FAK,
+            700_000,
+            true,
+            1,
+            &snap,
+            &quote,
+        );
+        let draft = store.create_draft(draft).unwrap();
+        // Build a minimal Order directly for order_action_and_hash.
+        let maker = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
+            .parse::<alloy::primitives::Address>()
+            .unwrap();
+        let order_shell = bloom_polymarket::order::Order {
+            salt: alloy::primitives::U256::from(1),
+            maker,
+            signer: maker,
+            tokenId: alloy::primitives::U256::from(123),
+            makerAmount: alloy::primitives::U256::from(10_000_000),
+            takerAmount: alloy::primitives::U256::from(14_380_000),
+            side: 0,
+            signatureType: 0,
+            timestamp: alloy::primitives::U256::from(1),
+            metadata: alloy::primitives::B256::ZERO,
+            builder: alloy::primitives::B256::ZERO,
+        };
+        let action = bloom_polymarket::signing::order_action_and_hash(
+            &order_shell,
+            137,
+            true,
+            bloom_polymarket::order::OrderType::GTC,
+        );
+        (draft, action)
+    }
+
+    #[tokio::test]
+    async fn sealed_order_confirm_preserves_foreground_when_not_wired() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let store = OrderStore::new(store_dir.path());
+        let (draft, _action) = pm_order_draft_and_action(&store);
+
+        let h = handler_with(None, None).with_order_store(OrderStore::new(store_dir.path()));
+
+        let confirm_path = p(&format!("/trade/w/drafts/{}/confirm", draft.id));
+        let err = h.write(&confirm_path, b"confirm").await.unwrap_err();
+        assert!(
+            err.to_string().contains("foreground CLI VFS path"),
+            "expected foreground CLI guidance when not wired, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sealed_order_confirm_denies_and_writes_challenge_without_grant() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let auth_dir = tempfile::tempdir().unwrap();
+        let store = OrderStore::new(store_dir.path());
+        let (draft, action) = pm_order_draft_and_action(&store);
+
+        // Wire a minimal onboarding config so `auth_dir` is known.
+        let ks_dir = tempfile::tempdir().unwrap();
+        let keystore = Keystore::new(ks_dir.path()).unwrap();
+        keystore.create_local("w", "pw").unwrap();
+        let chain: Arc<dyn ChainReader> = Arc::new(ArmedChain);
+        let h = PolymarketHandler::new(
+            GammaClient::new(),
+            DataClient::new(),
+            clob_unreachable(),
+            keystore,
+        )
+        .with_order_store(OrderStore::new(store_dir.path()))
+        .with_onboarding(PolymarketOnboarding {
+            onboarder: Arc::new(
+                Onboarder::new(
+                    chain.clone(),
+                    RelayerClient::new(137).with_base_url("http://127.0.0.1:1"),
+                    clob_unreachable(),
+                    CredentialStore::new(auth_dir.path()),
+                    OnboardStore::new(auth_dir.path()),
+                    137,
+                )
+                .with_poll_timeout(Duration::from_secs(2)),
+            ),
+            auth_dir: auth_dir.path().to_path_buf(),
+            creds: CredentialStore::new(auth_dir.path()),
+            chain,
+        })
+        .with_auth_services(pm_wired_auth());
+
+        // Drop the sign_request.json sidecar next to the draft.
+        let draft_dir = store.draft_path("w", &draft.id);
+        let sidecar = draft_dir.parent().unwrap().join(PM_ORDER_SIGN_REQUEST_FILE);
+        let maker_hex = action.order_view["maker"].as_str().unwrap().to_string();
+        let req = serde_json::json!({
+            "schema": "bloom.polymarket.order_sign_request.v1",
+            "draft_id": draft.id,
+            "salt": "1",
+            "order_view": action.order_view,
+            "signing_hash": format!("{:#x}", action.signing_hash),
+            "neg_risk": action.neg_risk,
+            "chain_id": action.chain_id,
+            "side": Side::Buy,
+            "maker": maker_hex,
+            "market_slug": "test-market",
+        });
+        std::fs::write(&sidecar, serde_json::to_vec(&req).unwrap()).unwrap();
+
+        let confirm_path = p(&format!("/trade/w/drafts/{}/confirm", draft.id));
+        let err = h.write(&confirm_path, b"confirm").await.unwrap_err();
+        assert!(
+            matches!(err, HandlerError::PermissionDenied),
+            "expected PermissionDenied, got: {err}"
+        );
+
+        // The challenge file is written under <auth_dir>/trade/<wallet>/<action_id>/.
+        let action_id =
+            bloom_polymarket::action_id_for("polymarket.order.v2", &action.signing_hash);
+        let challenge_path = auth_dir
+            .path()
+            .join("trade")
+            .join("w")
+            .join(&action_id)
+            .join(APPROVAL_CHALLENGE_FILE);
+        assert!(
+            challenge_path.exists(),
+            "approval_challenge.json not written at {}",
+            challenge_path.display()
+        );
+        let challenge: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&challenge_path).unwrap()).unwrap();
+        assert_eq!(challenge["surface"], "polymarket");
+        assert_eq!(challenge["petal_id"], petal_identity::PETAL_ID_POLYMARKET);
+        assert_eq!(challenge["action_id"], action_id);
+    }
+
+    fn fake_onboard_state() -> bloom_polymarket::OnboardState {
+        bloom_polymarket::OnboardState {
+            wallet: "alice".into(),
+            owner: "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266".into(),
+            deposit_wallet: "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266".into(),
+            deposit_wallet_source: String::new(),
+            deposit_wallet_fundable: true,
+            deposit_wallet_warning: None,
+            chain_id: 137,
+            stage: bloom_polymarket::Stage::Complete,
+            deploy_tx_id: None,
+            approve_tx_id: None,
+            pusd_balance: None,
+            creds_present: true,
+            last_error: None,
+            updated_ms: 0,
+            in_flight_deadline_ms: None,
+            mode: bloom_polymarket::OnboardMode::DepositWallet,
+            relayer_auth: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn sealed_revoke_denies_and_writes_challenge_without_grant() {
+        let (addr, _s) = spawn_scripted(vec![]).await;
+        let f = onboard_fixture(addr, true).await;
+        let store = bloom_polymarket::OnboardStore::new(&f.state_dir);
+        store.save("alice", &fake_onboard_state()).unwrap();
+        let handler = f.handler.clone().with_auth_services(pm_wired_auth());
+
+        let err = handler
+            .write(&p("/revoke-approvals/alice/request/confirm"), b"confirm")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, HandlerError::PermissionDenied),
+            "expected PermissionDenied, got: {err}"
+        );
+
+        // The challenge is written under <auth_dir>/<wallet>/<action_id>/.
+        let action_id = polymarket_revoke_action_id("alice");
+        let challenge_path = f
+            .state_dir
+            .join("alice")
+            .join(&action_id)
+            .join(APPROVAL_CHALLENGE_FILE);
+        assert!(challenge_path.exists(), "challenge not written");
+    }
+
+    #[tokio::test]
+    async fn wired_withdraw_is_gated_to_foreground_cli() {
+        // The wired (serve-socket) withdraw path is intentionally closed until
+        // it binds the body `amount` into the sealed subject and submits a real
+        // `transfer` (tracked in docs/issues C2). Until then, even under wired
+        // auth the confirm returns Unsupported and stages nothing — every
+        // withdrawal goes through the foreground CLI, which reads the balance,
+        // validates the amount, and submits the correct transfer.
+        let (addr, _s) = spawn_scripted(vec![]).await;
+        let f = onboard_fixture(addr, true).await;
+        let store = bloom_polymarket::OnboardStore::new(&f.state_dir);
+        store.save("alice", &fake_onboard_state()).unwrap();
+        let handler = f.handler.clone().with_auth_services(pm_wired_auth());
+
+        let err = handler
+            .write(&p("/withdraw/alice/pusd/confirm"), b"confirm")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, HandlerError::Unsupported(_)),
+            "expected Unsupported, got: {err}"
+        );
+        assert!(
+            err.to_string().contains("foreground CLI VFS path"),
+            "gated error should point at the CLI, got: {err}"
+        );
+
+        // No sealed action is staged for the closed path — no challenge on disk.
+        let action_id = polymarket_withdraw_action_id("alice");
+        let challenge_path = f
+            .state_dir
+            .join("alice")
+            .join(&action_id)
+            .join(APPROVAL_CHALLENGE_FILE);
+        assert!(
+            !challenge_path.exists(),
+            "gated withdraw must not stage a challenge"
+        );
+    }
+
+    #[tokio::test]
+    async fn sealed_redeem_revoke_withdraw_preserve_foreground_when_not_wired() {
+        let (addr, _s) = spawn_scripted(vec![]).await;
+        let f = onboard_fixture(addr, true).await;
+
+        // Redeem
+        let err = f
+            .handler
+            .write(&p("/redeem/alice/test-slug/confirm"), b"confirm")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("foreground CLI VFS path"));
+
+        // Revoke
+        let err = f
+            .handler
+            .write(&p("/revoke-approvals/alice/request/confirm"), b"confirm")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("foreground CLI VFS path"));
+
+        // Withdraw
+        let err = f
+            .handler
+            .write(&p("/withdraw/alice/pusd/confirm"), b"confirm")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("foreground CLI VFS path"));
+    }
+
+    // ── Phase 7c: end-to-end sealed order flow ──────────────────────────
+
+    /// A `PetalHost` that actually signs hashes with a test key and accepts
+    /// any polymarket intent. Consumes one signature off the live grant per
+    /// `sign_hash`, like the production `KeystorePetalHost` — this is what
+    /// invalidates a `max_signatures = 1` grant and would catch a post-sign
+    /// `get_active` lookup regression. Used for end-to-end happy-path tests.
+    struct PmSigningPetalHost {
+        signer: Arc<alloy::signers::local::PrivateKeySigner>,
+        grant_store: Arc<bloom_auth::grant_store::InMemoryGrantStore>,
+    }
+
+    #[async_trait]
+    impl bloom_auth_api::PetalHost for PmSigningPetalHost {
+        async fn seal_context(
+            &self,
+            _petal_id: &str,
+        ) -> Result<bloom_auth_api::SealedPetalContext, bloom_auth_api::AuthApiError> {
+            Err(bloom_auth_api::AuthApiError::Store("unused".into()))
+        }
+
+        async fn sealed_policy_snapshot(
+            &self,
+            _wallet: &str,
+            _petal_id: &str,
+        ) -> Result<bloom_auth_api::PetalPolicySnapshot, bloom_auth_api::AuthApiError> {
+            Err(bloom_auth_api::AuthApiError::Store("unused".into()))
+        }
+
+        async fn sign_hash(
+            &self,
+            request: bloom_auth_api::SignHashRequest,
+            _attestation: &bloom_auth_api::SigningAttestation,
+            now_ms: u64,
+        ) -> Result<bloom_auth_api::SealedSignature, bloom_auth_api::AuthApiError> {
+            use bloom_auth_api::GrantStore as _;
+            let grant = self
+                .grant_store
+                .get_active(
+                    &request.wallet,
+                    &request.action_id,
+                    petal_identity::PETAL_ID_POLYMARKET,
+                    petal_identity::PLACEHOLDER_DIGEST_POLYMARKET,
+                    now_ms,
+                )
+                .await?
+                .ok_or_else(|| {
+                    bloom_auth_api::AuthApiError::Denied("no active grant for sign_hash".into())
+                })?;
+            let hash = hex::decode(request.hash_hex.trim_start_matches("0x"))
+                .map_err(|e| bloom_auth_api::AuthApiError::Denied(format!("hash hex: {e}")))?;
+            let hash = alloy::primitives::B256::from_slice(&hash);
+            let sig = self
+                .signer
+                .sign_hash_sync(&hash)
+                .map_err(|e| bloom_auth_api::AuthApiError::Denied(format!("test sign: {e}")))?;
+            self.grant_store
+                .consume_signature(&grant.grant_id, &request.intent, now_ms)
+                .await?;
+            Ok(bloom_auth_api::SealedSignature {
+                intent_hash: "pm-test-intent".into(),
+                signature_b64: B64_STANDARD.encode(sig.as_bytes()),
+                signed_at_ms: now_ms,
+            })
+        }
+
+        async fn audit(
+            &self,
+            _event: bloom_auth_api::AuditEvent,
+        ) -> Result<(), bloom_auth_api::AuthApiError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn e2e_sealed_order_signs_and_writes_result_with_grant() {
+        use bloom_polymarket::order::{LimitQuote, OrderType};
+        use std::str::FromStr;
+
+        let store_dir = tempfile::tempdir().unwrap();
+        let _auth_dir = tempfile::tempdir().unwrap();
+        let store = OrderStore::new(store_dir.path());
+
+        // Build a draft.
+        let snap = trade::Snapshot {
+            market: serde_json::from_value(serde_json::json!({
+                "id":"1","slug":"test-market","question":"Will it?","conditionId":"0xcond",
+                "clobTokenIds":"[\"123\",\"456\"]","outcomes":"[\"Yes\",\"No\"]",
+                "enableOrderBook":true,"active":true,"closed":false,"negRisk":true
+            }))
+            .unwrap(),
+            token_id: "123".into(),
+            neg_risk: true,
+            tick_micro: 1_000,
+            min_size_micro: 5_000_000,
+            best_ask_micro: Some(695_000),
+            best_bid_micro: Some(690_000),
+        };
+        let quote = LimitQuote {
+            side: Side::Buy,
+            price_micro: 695_000,
+            size_micro: 14_380_000,
+            maker_micro: 10_000_000,
+            taker_micro: 14_380_000,
+        };
+        let draft = trade::draft_from_quote(
+            "w",
+            "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266".into(),
+            None,
+            0,
+            "test-market",
+            "YES",
+            Side::Buy,
+            OrderType::FAK,
+            700_000,
+            true,
+            1,
+            &snap,
+            &quote,
+        );
+        let draft = store.create_draft(draft).unwrap();
+
+        // Build the order action to get the signing hash.
+        let maker =
+            alloy::primitives::Address::from_str("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266")
+                .unwrap();
+        let order_shell = bloom_polymarket::order::Order {
+            salt: alloy::primitives::U256::from(1),
+            maker,
+            signer: maker,
+            tokenId: alloy::primitives::U256::from(123),
+            makerAmount: alloy::primitives::U256::from(10_000_000),
+            takerAmount: alloy::primitives::U256::from(14_380_000),
+            side: 0,
+            signatureType: 0,
+            timestamp: alloy::primitives::U256::from(1),
+            metadata: alloy::primitives::B256::ZERO,
+            builder: alloy::primitives::B256::ZERO,
+        };
+        let action = bloom_polymarket::signing::order_action_and_hash(
+            &order_shell,
+            137,
+            true,
+            bloom_polymarket::order::OrderType::GTC,
+        );
+
+        // Pre-mint a grant so the handler finds one when it checks.
+        let now = pm_now_ms_u64();
+        let grant_store = Arc::new(bloom_auth::grant_store::InMemoryGrantStore::default());
+        let envelope =
+            polymarket_order_envelope("w", &action.order_view, &action.signing_hash, 137, true)
+                .unwrap();
+        let mut extra = std::collections::BTreeMap::new();
+        extra.insert("action_kind".to_string(), serde_json::json!("order"));
+        let terms = bloom_auth_api::DaemonGrantTerms {
+            max_ttl_secs: APPROVAL_TTL_MS / 1_000,
+            max_signatures: 1,
+            allowed_sign_intents: vec![bloom_auth_api::POLYMARKET_ORDER_SIGN_INTENT.into()],
+            assurance: AssuranceLevel::Standard,
+            extra,
+        };
+        let config = std::collections::BTreeMap::new();
+        let snapshot = bloom_auth_api::PetalPolicySnapshot {
+            policy_version: 0,
+            wallet: "w".into(),
+            petal_id: petal_identity::PETAL_ID_POLYMARKET.into(),
+            petal_digest: petal_identity::PLACEHOLDER_DIGEST_POLYMARKET.into(),
+            caps: std::collections::BTreeMap::new(),
+            hard_rules: Vec::new(),
+            step_up_rules: Vec::new(),
+            config,
+            budget_state: std::collections::BTreeMap::new(),
+            session_scope: Some(std::collections::BTreeMap::new()),
+        };
+        let sealed = bloom_auth_api::SealedAction::new(
+            envelope,
+            "test order".into(),
+            Vec::new(),
+            terms,
+            snapshot,
+            now,
+        )
+        .unwrap();
+        grant_store
+            .mint(&sealed, now + APPROVAL_TTL_MS, now)
+            .await
+            .unwrap();
+
+        // Build the handler with all auth services wired.
+        let test_pk = alloy::signers::local::PrivateKeySigner::from_str(
+            "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
+        )
+        .unwrap();
+        let petal_host: Arc<dyn bloom_auth_api::PetalHost> = Arc::new(PmSigningPetalHost {
+            signer: Arc::new(test_pk),
+            grant_store: grant_store.clone(),
+        });
+        let auth = crate::AuthServices::default()
+            .with_grant_store(grant_store)
+            .with_writer(Arc::new(PmTestWriter))
+            .with_petal_host(petal_host);
+
+        let ks_dir = tempfile::tempdir().unwrap();
+        let keystore = Keystore::new(ks_dir.path()).unwrap();
+        keystore.create_local("w", "pw").unwrap();
+        let h = PolymarketHandler::new(
+            GammaClient::new(),
+            DataClient::new(),
+            clob_unreachable(),
+            keystore,
+        )
+        .with_order_store(OrderStore::new(store_dir.path()))
+        .with_auth_services(auth);
+
+        // Write the sign_request.json sidecar.
+        let draft_dir = store.draft_path("w", &draft.id);
+        let sidecar = draft_dir.parent().unwrap().join(PM_ORDER_SIGN_REQUEST_FILE);
+        let maker_hex = action.order_view["maker"].as_str().unwrap().to_string();
+        let req = serde_json::json!({
+            "schema": "bloom.polymarket.order_sign_request.v1",
+            "draft_id": draft.id,
+            "salt": "1",
+            "order_view": action.order_view,
+            "signing_hash": format!("{:#x}", action.signing_hash),
+            "neg_risk": action.neg_risk,
+            "chain_id": action.chain_id,
+            "side": Side::Buy,
+            "maker": maker_hex,
+            "market_slug": "test-market",
+        });
+        std::fs::write(&sidecar, serde_json::to_vec(&req).unwrap()).unwrap();
+
+        // Call confirm — should succeed now (grant exists).
+        let confirm_path = p(&format!("/trade/w/drafts/{}/confirm", draft.id));
+        h.write(&confirm_path, b"confirm").await.unwrap();
+
+        // Verify the result sidecar was written.
+        let result_path = sidecar.with_file_name(PM_ORDER_SIGN_RESULT_FILE);
+        assert!(result_path.exists(), "sign_result.json not written");
+        let result: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&result_path).unwrap()).unwrap();
+        assert!(
+            result["wrapped_signature"]
+                .as_str()
+                .unwrap()
+                .starts_with("0x")
+        );
+        assert!(result["action_id"].as_str().unwrap().starts_with("pm-"));
+        assert!(result["grant_id"].as_str().unwrap().starts_with("grant-"));
+    }
+
+    /// A well-formed order-kind facts map must round-trip through the typed
+    /// struct and pass the production `DefaultAttestationRegistry` validation.
+    /// This guards against schema drift between the handler's facts map and the
+    /// typed struct the host validates against.
+    #[test]
+    fn order_attestation_facts_pass_registry_validation() {
+        let registry = bloom_auth_api::DefaultAttestationRegistry::new();
+        let facts = PolymarketSigningAttestationFacts {
+            facts_schema: POLYMARKET_SIGNING_ATTESTATION_FACTS_SCHEMA_V1.into(),
+            kind: PolymarketSealedActionKind::Order,
+            petal_id: petal_identity::PETAL_ID_POLYMARKET.into(),
+            petal_digest: petal_identity::PLACEHOLDER_DIGEST_POLYMARKET.into(),
+            petal_version: petal_identity::FIRST_PARTY_PETAL_VERSION_V0.into(),
+            wallet: "0x0000000000000000000000000000000000000001".into(),
+            chain_id: bloom_polymarket::POLYGON,
+            action_id: "pm-test-order-action".into(),
+            signing_hash: format!("{:#x}", alloy::primitives::B256::with_last_byte(1)),
+        };
+        let attestation = facts.signing_attestation().expect("order facts valid");
+        registry
+            .validate_attestation(&attestation)
+            .expect("order attestation passes registry validation");
+    }
+
+    /// Same round-trip for an onboarding-kind facts map.
+    #[test]
+    fn onboarding_attestation_facts_pass_registry_validation() {
+        let registry = bloom_auth_api::DefaultAttestationRegistry::new();
+        let facts = PolymarketSigningAttestationFacts {
+            facts_schema: POLYMARKET_SIGNING_ATTESTATION_FACTS_SCHEMA_V1.into(),
+            kind: PolymarketSealedActionKind::Onboarding,
+            petal_id: petal_identity::PETAL_ID_POLYMARKET.into(),
+            petal_digest: petal_identity::PLACEHOLDER_DIGEST_POLYMARKET.into(),
+            petal_version: petal_identity::FIRST_PARTY_PETAL_VERSION_V0.into(),
+            wallet: "0x0000000000000000000000000000000000000002".into(),
+            chain_id: bloom_polymarket::POLYGON,
+            action_id: "pm-test-onboard-action".into(),
+            signing_hash: format!("{:#x}", alloy::primitives::B256::with_last_byte(2)),
+        };
+        let attestation = facts.signing_attestation().expect("onboarding facts valid");
+        registry
+            .validate_attestation(&attestation)
+            .expect("onboarding attestation passes registry validation");
+    }
+
+    /// Regression guard: the OLD hand-built facts map (wrong key `"schema"`
+    /// instead of `"facts_schema"`, missing required fields) must be REJECTED
+    /// by the production registry. This proves the test would have caught the
+    /// original C1 bug.
+    #[test]
+    fn malformed_old_style_facts_fail_registry_validation() {
+        let registry = bloom_auth_api::DefaultAttestationRegistry::new();
+        // Exactly the shape the handler used to build: `"schema"` key, a raw
+        // intent string for `kind`, and several required fields missing.
+        let mut bad_facts = std::collections::BTreeMap::new();
+        bad_facts.insert(
+            "schema".into(),
+            serde_json::json!("bloom.polymarket.signing_facts.v1"),
+        );
+        bad_facts.insert(
+            "kind".into(),
+            serde_json::json!(POLYMARKET_ORDER_SIGN_INTENT),
+        );
+        bad_facts.insert(
+            "wallet".into(),
+            serde_json::json!("0x0000000000000000000000000000000000000003"),
+        );
+        bad_facts.insert(
+            "signing_hash".into(),
+            serde_json::json!(format!("{:#x}", alloy::primitives::B256::with_last_byte(3))),
+        );
+        let attestation = bloom_auth_api::SigningAttestation {
+            schema: bloom_auth_api::SIGNING_ATTESTATION_SCHEMA_V1.into(),
+            petal_id: petal_identity::PETAL_ID_POLYMARKET.into(),
+            petal_digest: petal_identity::PLACEHOLDER_DIGEST_POLYMARKET.into(),
+            intent: POLYMARKET_ORDER_SIGN_INTENT.into(),
+            facts: bad_facts,
+        };
+        let result = registry.validate_attestation(&attestation);
+        assert!(
+            result.is_err(),
+            "old-style malformed facts map must be rejected, but was accepted: {result:?}"
+        );
+    }
+
+    /// `order_shell_from_view` must propagate `metadata`/`builder` from the
+    /// order view JSON instead of zeroing them — both bind into the EIP-712
+    /// `Order` struct hash. A non-zero value must survive the round-trip.
+    #[test]
+    fn order_shell_from_view_preserves_metadata_and_builder() {
+        let meta = alloy::primitives::B256::with_last_byte(0xab);
+        let bldr = alloy::primitives::B256::with_last_byte(0xcd);
+        let view = serde_json::json!({
+            "salt": "1",
+            "maker": "0x0000000000000000000000000000000000000001",
+            "signer": "0x0000000000000000000000000000000000000001",
+            "tokenId": "1",
+            "makerAmount": "1",
+            "takerAmount": "1",
+            "side": "0",
+            "signatureType": "0",
+            "timestamp": "1",
+            "metadata": format!("{meta:#x}"),
+            "builder": format!("{bldr:#x}"),
+        });
+        let shell = order_shell_from_view(&view).expect("view parses");
+        assert_eq!(shell.metadata, meta);
+        assert_eq!(shell.builder, bldr);
+    }
+
+    /// Older order views may omit `metadata`/`builder`; those must fall back to
+    /// zero rather than erroring.
+    #[test]
+    fn order_shell_from_view_defaults_missing_metadata_and_builder_to_zero() {
+        let view = serde_json::json!({
+            "salt": "1",
+            "maker": "0x0000000000000000000000000000000000000001",
+            "signer": "0x0000000000000000000000000000000000000001",
+            "tokenId": "1",
+            "makerAmount": "1",
+            "takerAmount": "1",
+            "side": "0",
+            "signatureType": "0",
+            "timestamp": "1",
+        });
+        let shell = order_shell_from_view(&view).expect("view parses");
+        assert_eq!(shell.metadata, alloy::primitives::B256::ZERO);
+        assert_eq!(shell.builder, alloy::primitives::B256::ZERO);
+    }
+
+    // ── Sealed-action builder parity ───────────────────────────────────
+    //
+    // The `pub` sealed-action builders used by the CLI must produce the same
+    // `action_id` as the corresponding `pub fn polymarket_*_action_id` helper.
+    // If these diverge, the CLI and the daemon handler stage different actions
+    // for the same operation and a grant minted by one will not satisfy the
+    // other.
+
+    #[test]
+    fn onboard_sealed_action_action_id_matches_helper() {
+        let owner: Address = "0x0000000000000000000000000000000000000001"
+            .parse()
+            .unwrap();
+        let sealed = polymarket_onboard_sealed_action("test-wallet", owner, 1_000).unwrap();
+        assert_eq!(
+            sealed.action_id(),
+            &polymarket_onboard_action_id("test-wallet"),
+        );
+    }
+
+    #[test]
+    fn revoke_sealed_action_action_id_matches_helper() {
+        let deposit: Address = "0x0000000000000000000000000000000000000002"
+            .parse()
+            .unwrap();
+        let sealed = polymarket_revocation_sealed_action("test-wallet", deposit, 1_000).unwrap();
+        assert_eq!(
+            sealed.action_id(),
+            &polymarket_revoke_action_id("test-wallet"),
+        );
+    }
+
+    #[test]
+    fn withdraw_sealed_action_action_id_matches_helper() {
+        let deposit: Address = "0x0000000000000000000000000000000000000003"
+            .parse()
+            .unwrap();
+        let sealed = polymarket_withdrawal_sealed_action("test-wallet", deposit, 1_000).unwrap();
+        assert_eq!(
+            sealed.action_id(),
+            &polymarket_withdraw_action_id("test-wallet"),
+        );
+    }
+
+    #[test]
+    fn redeem_sealed_action_action_id_matches_helper() {
+        let deposit: Address = "0x0000000000000000000000000000000000000004"
+            .parse()
+            .unwrap();
+        let condition_id = "0xabc123";
+        let sealed =
+            polymarket_redemption_sealed_action("test-wallet", deposit, condition_id, true, 1_000)
+                .unwrap();
+        assert_eq!(
+            sealed.action_id(),
+            &polymarket_redeem_action_id("test-wallet", condition_id),
+        );
+    }
+
+    #[test]
+    fn order_sealed_action_action_id_matches_action_id_for() {
+        let wallet = "test-wallet";
+        let signing_hash = alloy::primitives::B256::with_last_byte(42);
+        let order_view = serde_json::json!({
+            "salt": "1",
+            "maker": "0x0000000000000000000000000000000000000001",
+            "signer": "0x0000000000000000000000000000000000000001",
+            "tokenId": "1",
+            "makerAmount": "1",
+            "takerAmount": "1",
+            "side": "0",
+            "signatureType": "0",
+            "timestamp": "1",
+        });
+        let sealed = polymarket_order_sealed_action(
+            wallet,
+            &order_view,
+            &signing_hash,
+            137,
+            true,
+            "test plan".into(),
+            1_000,
+        )
+        .unwrap();
+        let expected =
+            bloom_polymarket::signing::action_id_for("polymarket.order.v2", &signing_hash);
+        assert_eq!(sealed.action_id(), &expected);
+    }
+
+    // ── P1 #2: Grant ID captured before consumption ────────────────────
+    //
+    // Regression test: `prepare_and_sign_order_sealed` used to re-fetch the
+    // grant with `get_active` AFTER `sign_hash` consumed it. With
+    // `max_signatures: 1` the grant is no longer active, so the post-sign
+    // lookup always returned `None` → "grant vanished after consumption".
+    // The fix captures the grant before signing; this test verifies the
+    // `grant_id` survives in the result even though the grant is consumed.
+
+    #[tokio::test]
+    async fn prepare_order_sealed_returns_grant_id_after_consume() {
+        use bloom_polymarket::order::{LimitQuote, OrderType};
+        use std::str::FromStr;
+
+        let store_dir = tempfile::tempdir().unwrap();
+        let store = OrderStore::new(store_dir.path());
+
+        let snap = trade::Snapshot {
+            market: serde_json::from_value(serde_json::json!({
+                "id":"1","slug":"test-market","question":"Will it?","conditionId":"0xcond",
+                "clobTokenIds":"[\"123\",\"456\"]","outcomes":"[\"Yes\",\"No\"]",
+                "enableOrderBook":true,"active":true,"closed":false,"negRisk":true
+            }))
+            .unwrap(),
+            token_id: "123".into(),
+            neg_risk: true,
+            tick_micro: 1_000,
+            min_size_micro: 5_000_000,
+            best_ask_micro: Some(695_000),
+            best_bid_micro: Some(690_000),
+        };
+        let quote = LimitQuote {
+            side: Side::Buy,
+            price_micro: 695_000,
+            size_micro: 14_380_000,
+            maker_micro: 10_000_000,
+            taker_micro: 14_380_000,
+        };
+        let _draft = store
+            .create_draft(trade::draft_from_quote(
+                "w",
+                "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266".into(),
+                None,
+                0,
+                "test-market",
+                "YES",
+                Side::Buy,
+                OrderType::FAK,
+                700_000,
+                true,
+                1,
+                &snap,
+                &quote,
+            ))
+            .unwrap();
+
+        let maker = Address::from_str("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266").unwrap();
+        let order_shell = bloom_polymarket::order::Order {
+            salt: alloy::primitives::U256::from(1),
+            maker,
+            signer: maker,
+            tokenId: alloy::primitives::U256::from(123),
+            makerAmount: alloy::primitives::U256::from(10_000_000),
+            takerAmount: alloy::primitives::U256::from(14_380_000),
+            side: 0,
+            signatureType: 0,
+            timestamp: alloy::primitives::U256::from(1),
+            metadata: alloy::primitives::B256::ZERO,
+            builder: alloy::primitives::B256::ZERO,
+        };
+        let action = bloom_polymarket::signing::order_action_and_hash(
+            &order_shell,
+            137,
+            true,
+            bloom_polymarket::order::OrderType::GTC,
+        );
+
+        // Pre-mint a one-signature grant.
+        let now = pm_now_ms_u64();
+        let grant_store = Arc::new(bloom_auth::grant_store::InMemoryGrantStore::default());
+        let plan = polymarket_order_plan(
+            Side::Buy,
+            Some("test-market"),
+            maker,
+            true,
+            137,
+            &action.signing_hash,
+        );
+        let sealed = polymarket_order_sealed_action(
+            "w",
+            &action.order_view,
+            &action.signing_hash,
+            137,
+            true,
+            plan,
+            now,
+        )
+        .unwrap();
+        grant_store
+            .mint(&sealed, now + APPROVAL_TTL_MS, now)
+            .await
+            .unwrap();
+
+        // Wire the handler with the pre-minted grant + signing stub.
+        let test_pk = alloy::signers::local::PrivateKeySigner::from_str(
+            "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
+        )
+        .unwrap();
+        let petal_host: Arc<dyn bloom_auth_api::PetalHost> = Arc::new(PmSigningPetalHost {
+            signer: Arc::new(test_pk),
+            grant_store: grant_store.clone(),
+        });
+        let auth = crate::AuthServices::default()
+            .with_grant_store(grant_store)
+            .with_writer(Arc::new(PmTestWriter))
+            .with_petal_host(petal_host);
+
+        let ks_dir = tempfile::tempdir().unwrap();
+        let keystore = Keystore::new(ks_dir.path()).unwrap();
+        keystore.create_local("w", "pw").unwrap();
+        let h = PolymarketHandler::new(
+            GammaClient::new(),
+            DataClient::new(),
+            clob_unreachable(),
+            keystore.clone(),
+        )
+        .with_order_store(OrderStore::new(store_dir.path()))
+        .with_auth_services(auth);
+
+        // This must succeed and return a non-empty grant_id, even though
+        // sign_hash consumes the one and only signature on the grant.
+        let result = h
+            .prepare_and_sign_order_sealed(
+                "w",
+                &action.order_view,
+                &action.signing_hash,
+                137,
+                true,
+                Some("test-market".into()),
+                maker,
+                Side::Buy,
+            )
+            .await;
+        assert!(
+            result.is_ok(),
+            "prepare_and_sign_order_sealed failed: {:?}",
+            result.err()
+        );
+        let result = result.unwrap();
+        assert!(
+            !result.grant_id.is_empty(),
+            "grant_id must be captured before consumption, got empty string"
+        );
+        assert!(result.grant_id.starts_with("grant-"));
+        assert!(result.wrapped_signature.starts_with("0x"));
+    }
+
+    // ── P1 #3: Challenge carries ceremony_url ──────────────────────────
+    //
+    // The EVM outbox and wallet-policy flows project `.with_local_ceremony_url()`
+    // before writing `approval_challenge.json`. Polymarket challenges must do
+    // the same so the agent/user can click through to the ceremony.
+
+    #[tokio::test]
+    async fn order_challenge_writes_ceremony_url() {
+        use bloom_polymarket::order::{LimitQuote, OrderType};
+
+        let store_dir = tempfile::tempdir().unwrap();
+        let store = OrderStore::new(store_dir.path());
+
+        let snap = trade::Snapshot {
+            market: serde_json::from_value(serde_json::json!({
+                "id":"1","slug":"test-market","question":"Will it?","conditionId":"0xcond",
+                "clobTokenIds":"[\"123\",\"456\"]","outcomes":"[\"Yes\",\"No\"]",
+                "enableOrderBook":true,"active":true,"closed":false,"negRisk":true
+            }))
+            .unwrap(),
+            token_id: "123".into(),
+            neg_risk: true,
+            tick_micro: 1_000,
+            min_size_micro: 5_000_000,
+            best_ask_micro: Some(695_000),
+            best_bid_micro: Some(690_000),
+        };
+        let quote = LimitQuote {
+            side: Side::Buy,
+            price_micro: 695_000,
+            size_micro: 14_380_000,
+            maker_micro: 10_000_000,
+            taker_micro: 14_380_000,
+        };
+        let _draft = store
+            .create_draft(trade::draft_from_quote(
+                "w",
+                "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266".into(),
+                None,
+                0,
+                "test-market",
+                "YES",
+                Side::Buy,
+                OrderType::FAK,
+                700_000,
+                true,
+                1,
+                &snap,
+                &quote,
+            ))
+            .unwrap();
+
+        // No grant pre-minted → handler should issue a challenge.
+        let grant_store = Arc::new(bloom_auth::grant_store::InMemoryGrantStore::default());
+        let auth = crate::AuthServices::default()
+            .with_grant_store(grant_store)
+            .with_writer(Arc::new(PmTestWriter));
+
+        let ks_dir = tempfile::tempdir().unwrap();
+        let keystore = Keystore::new(ks_dir.path()).unwrap();
+        keystore.create_local("w", "pw").unwrap();
+        let h = PolymarketHandler::new(
+            GammaClient::new(),
+            DataClient::new(),
+            clob_unreachable(),
+            keystore.clone(),
+        )
+        .with_order_store(OrderStore::new(store_dir.path()))
+        .with_auth_services(auth);
+
+        let maker: Address = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
+            .parse()
+            .unwrap();
+        let order_shell = bloom_polymarket::order::Order {
+            salt: alloy::primitives::U256::from(1),
+            maker,
+            signer: maker,
+            tokenId: alloy::primitives::U256::from(123),
+            makerAmount: alloy::primitives::U256::from(10_000_000),
+            takerAmount: alloy::primitives::U256::from(14_380_000),
+            side: 0,
+            signatureType: 0,
+            timestamp: alloy::primitives::U256::from(1),
+            metadata: alloy::primitives::B256::ZERO,
+            builder: alloy::primitives::B256::ZERO,
+        };
+        let action = bloom_polymarket::signing::order_action_and_hash(
+            &order_shell,
+            137,
+            true,
+            bloom_polymarket::order::OrderType::GTC,
+        );
+
+        // Should return PermissionDenied (no grant → writes challenge).
+        let result = h
+            .prepare_and_sign_order_sealed(
+                "w",
+                &action.order_view,
+                &action.signing_hash,
+                137,
+                true,
+                Some("test-market".into()),
+                maker,
+                Side::Buy,
+            )
+            .await;
+        assert!(result.is_err(), "expected PermissionDenied, got Ok");
+
+        // The challenge file must have been written with ceremony_url set.
+        let challenge_path = keystore
+            .root()
+            .join("_polymarket")
+            .join("trade")
+            .join("w")
+            .join(bloom_polymarket::signing::action_id_for(
+                "polymarket.order.v2",
+                &action.signing_hash,
+            ))
+            .join(APPROVAL_CHALLENGE_FILE);
+        assert!(
+            challenge_path.exists(),
+            "approval_challenge.json not written at {}",
+            challenge_path.display()
+        );
+        let challenge: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&challenge_path).unwrap()).unwrap();
+        let url = challenge["ceremony_url"].as_str();
+        assert!(
+            url.is_some() && !url.unwrap().is_empty(),
+            "ceremony_url must be projected into approval_challenge.json, got: {challenge}"
+        );
+    }
+
+    // ── P1 #1: SealedOnboardSigner routes through PetalHost ────────────
+    //
+    // The CLI uses `SealedOnboardSigner` for passkey wallets. Every signing
+    // operation must go through `PetalHost::sign_hash` (never the raw
+    // keystore). These tests verify the dispatch using a recording stub.
+
+    /// `PetalHost` stub that records the last `sign_hash` request so tests
+    /// can assert on `wallet`, `action_id`, `intent`, and `hash_hex`.
+    struct RecordingPetalHost {
+        signer: Arc<alloy::signers::local::PrivateKeySigner>,
+        last_request: std::sync::Mutex<Option<bloom_auth_api::SignHashRequest>>,
+    }
+
+    #[async_trait]
+    impl bloom_auth_api::PetalHost for RecordingPetalHost {
+        async fn seal_context(
+            &self,
+            _petal_id: &str,
+        ) -> Result<bloom_auth_api::SealedPetalContext, bloom_auth_api::AuthApiError> {
+            Err(bloom_auth_api::AuthApiError::Store("unused".into()))
+        }
+
+        async fn sealed_policy_snapshot(
+            &self,
+            _wallet: &str,
+            _petal_id: &str,
+        ) -> Result<bloom_auth_api::PetalPolicySnapshot, bloom_auth_api::AuthApiError> {
+            Err(bloom_auth_api::AuthApiError::Store("unused".into()))
+        }
+
+        async fn sign_hash(
+            &self,
+            request: bloom_auth_api::SignHashRequest,
+            _attestation: &bloom_auth_api::SigningAttestation,
+            now_ms: u64,
+        ) -> Result<bloom_auth_api::SealedSignature, bloom_auth_api::AuthApiError> {
+            *self.last_request.lock().unwrap() = Some(request.clone());
+            let hash = hex::decode(request.hash_hex.trim_start_matches("0x"))
+                .map_err(|e| bloom_auth_api::AuthApiError::Denied(format!("hash hex: {e}")))?;
+            let hash = alloy::primitives::B256::from_slice(&hash);
+            let sig = self
+                .signer
+                .sign_hash_sync(&hash)
+                .map_err(|e| bloom_auth_api::AuthApiError::Denied(format!("test sign: {e}")))?;
+            Ok(bloom_auth_api::SealedSignature {
+                intent_hash: "pm-test-intent".into(),
+                signature_b64: B64_STANDARD.encode(sig.as_bytes()),
+                signed_at_ms: now_ms,
+            })
+        }
+
+        async fn audit(
+            &self,
+            _event: bloom_auth_api::AuditEvent,
+        ) -> Result<(), bloom_auth_api::AuthApiError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn sealed_onboard_signer_routes_sign_through_host() {
+        use std::str::FromStr;
+
+        let pk = alloy::signers::local::PrivateKeySigner::from_str(
+            "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
+        )
+        .unwrap();
+        let host = Arc::new(RecordingPetalHost {
+            signer: Arc::new(pk),
+            last_request: std::sync::Mutex::new(None),
+        });
+        let signer = SealedOnboardSigner::new(
+            host.clone(),
+            "test-wallet",
+            "pm-test-action",
+            PolymarketSealedActionKind::Onboarding,
+            "0x0000000000000000000000000000000000000001"
+                .parse()
+                .unwrap(),
+        );
+
+        let hash = alloy::primitives::B256::with_last_byte(0x42);
+        let sig = signer.sign_eip712_hash(&hash).await.unwrap();
+
+        // Host was called exactly once with the right parameters.
+        let req = host.last_request.lock().unwrap().clone().unwrap();
+        assert_eq!(req.wallet, "test-wallet");
+        assert_eq!(req.action_id, "pm-test-action");
+        assert_eq!(
+            req.intent,
+            bloom_auth_api::POLYMARKET_ONBOARDING_SIGN_INTENT
+        );
+        assert_eq!(req.hash_hex, format!("{hash:#x}"));
+
+        // The returned signature is 65 bytes (non-zero, from the host's key).
+        assert_eq!(sig.as_bytes().len(), 65);
+        assert!(sig.as_bytes().iter().any(|&b| b != 0));
+    }
+
+    #[tokio::test]
+    async fn sealed_onboard_signer_kind_intent_mapping_is_correct() {
+        use std::str::FromStr;
+
+        let pk = alloy::signers::local::PrivateKeySigner::from_str(
+            "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
+        )
+        .unwrap();
+
+        let cases = [
+            (
+                PolymarketSealedActionKind::Onboarding,
+                bloom_auth_api::POLYMARKET_ONBOARDING_SIGN_INTENT,
+            ),
+            (
+                PolymarketSealedActionKind::Revocation,
+                bloom_auth_api::POLYMARKET_REVOCATION_SIGN_INTENT,
+            ),
+            (
+                PolymarketSealedActionKind::Withdrawal,
+                bloom_auth_api::POLYMARKET_WITHDRAWAL_SIGN_INTENT,
+            ),
+            (
+                PolymarketSealedActionKind::Redemption,
+                bloom_auth_api::POLYMARKET_REDEMPTION_SIGN_INTENT,
+            ),
+        ];
+
+        let hash = alloy::primitives::B256::with_last_byte(0x01);
+        for (kind, expected_intent) in cases {
+            let host = Arc::new(RecordingPetalHost {
+                signer: Arc::new(pk.clone()),
+                last_request: std::sync::Mutex::new(None),
+            });
+            let signer = SealedOnboardSigner::new(
+                host.clone(),
+                "w",
+                "pm-action",
+                kind,
+                "0x0000000000000000000000000000000000000001"
+                    .parse()
+                    .unwrap(),
+            );
+            signer.sign_eip712_hash(&hash).await.unwrap();
+            let req = host.last_request.lock().unwrap().clone().unwrap();
+            assert_eq!(
+                req.intent, expected_intent,
+                "kind {:?} must map to intent {}",
+                kind, expected_intent,
+            );
+        }
     }
 }

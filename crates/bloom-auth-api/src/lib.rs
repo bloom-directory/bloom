@@ -44,6 +44,32 @@ pub const PAID_HTTP_SIGNING_ATTESTATION_FACTS_SCHEMA_V1: &str = "bloom.paid_http
 pub const PAID_HTTP_X402_SIGN_INTENT: &str = "x402.sign";
 /// Paid-HTTP Tempo MPP signing intent.
 pub const PAID_HTTP_MPP_SIGN_INTENT: &str = "paid-http.mpp.sign";
+
+/// Typed facts schema embedded in [`SigningAttestation::facts`] for any
+/// `(petal_id=polymarket, intent=polymarket.*)` pair. The `kind` field on the
+/// facts map tells the validator which per-kind field set to enforce (order,
+/// onboarding, redemption, withdrawal, revocation, builder_key, funding).
+pub const POLYMARKET_SIGNING_ATTESTATION_FACTS_SCHEMA_V1: &str =
+    "bloom.polymarket.signing_facts.v1";
+/// Polymarket V2 order signing intent (POLY_1271 owner-side wrap).
+pub const POLYMARKET_ORDER_SIGN_INTENT: &str = "polymarket.order.v2";
+/// Polymarket onboarding signing intent (covers V2 approval batch, CLOB creds
+/// mint, builder key create under one hardened grant).
+pub const POLYMARKET_ONBOARDING_SIGN_INTENT: &str = "polymarket.onboarding";
+/// Polymarket redemption signing intent (CTF.redeem batch from deposit wallet).
+pub const POLYMARKET_REDEMPTION_SIGN_INTENT: &str = "polymarket.redemption";
+/// Polymarket withdrawal signing intent (pUSD/USDC transfer from deposit
+/// wallet to owner).
+pub const POLYMARKET_WITHDRAWAL_SIGN_INTENT: &str = "polymarket.withdrawal";
+/// Polymarket builder-key creation / rotation signing intent (used as a
+/// sub-step of onboarding, but reachable on its own).
+pub const POLYMARKET_BUILDER_KEY_SIGN_INTENT: &str = "polymarket.builder_key";
+/// Polymarket V2-spender revoke signing intent (authority-changing: resets
+/// deposit-wallet approvals for every V2 spender to zero).
+pub const POLYMARKET_REVOCATION_SIGN_INTENT: &str = "polymarket.revocation";
+/// Polymarket funding signing intent (EVM tx outbox path; mostly an alias for
+/// the tx-engine Sealed Approval flow used by `bloom polymarket fund`).
+pub const POLYMARKET_FUNDING_SIGN_INTENT: &str = "polymarket.funding";
 /// Schema tag for [`CanonicalEnvelope`].
 ///
 /// v2: the canonical header gained Petal identity (`petal_id`, `petal_digest`,
@@ -1988,6 +2014,205 @@ impl EvmSigningAttestationFacts {
     }
 }
 
+// ── Polymarket first-party Petal attestation (WS-H) ──────────────────────────
+
+/// Discriminator for `(petal_id=polymarket, intent=polymarket.*)` sealed
+/// actions. Each variant binds its own per-kind required fields on
+/// [`PolymarketSigningAttestationFacts`] so the host validates against the
+/// sealed subject, not a fixed superset (parallels [`EvmSealedActionKind`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PolymarketSealedActionKind {
+    /// V2 POLY_1271 deposit-wallet order (signatureType 3).
+    Order,
+    /// Onboarding: covers deploy (no owner sig), V2 approval batch,
+    /// CLOB creds mint, builder-key create under one hardened grant.
+    Onboarding,
+    /// CTF.redeem batch from the deposit wallet.
+    Redemption,
+    /// pUSD/USDC transfer from the deposit wallet to the owner.
+    Withdrawal,
+    /// V2-spender revoke batch (authority change; assurance = hardened).
+    Revocation,
+    /// Builder-key create / rotate (own sealed action when not under onboarding).
+    BuilderKey,
+    /// Funding EVM tx (tx-engine outbox path; mostly an alias for `evm.tx.sign`).
+    Funding,
+}
+
+impl PolymarketSealedActionKind {
+    /// The signing intent string this action kind binds to.
+    pub fn intent(self) -> &'static str {
+        match self {
+            PolymarketSealedActionKind::Order => POLYMARKET_ORDER_SIGN_INTENT,
+            PolymarketSealedActionKind::Onboarding => POLYMARKET_ONBOARDING_SIGN_INTENT,
+            PolymarketSealedActionKind::Redemption => POLYMARKET_REDEMPTION_SIGN_INTENT,
+            PolymarketSealedActionKind::Withdrawal => POLYMARKET_WITHDRAWAL_SIGN_INTENT,
+            PolymarketSealedActionKind::Revocation => POLYMARKET_REVOCATION_SIGN_INTENT,
+            PolymarketSealedActionKind::BuilderKey => POLYMARKET_BUILDER_KEY_SIGN_INTENT,
+            PolymarketSealedActionKind::Funding => POLYMARKET_FUNDING_SIGN_INTENT,
+        }
+    }
+
+    /// Short string label used in canonical-subject serialization.
+    pub fn label(self) -> &'static str {
+        match self {
+            PolymarketSealedActionKind::Order => "order",
+            PolymarketSealedActionKind::Onboarding => "onboarding",
+            PolymarketSealedActionKind::Redemption => "redemption",
+            PolymarketSealedActionKind::Withdrawal => "withdrawal",
+            PolymarketSealedActionKind::Revocation => "revocation",
+            PolymarketSealedActionKind::BuilderKey => "builder_key",
+            PolymarketSealedActionKind::Funding => "funding",
+        }
+    }
+}
+
+/// Tagged Polymarket signing-attestation facts. The `kind` field records which
+/// Polymarket flow the signature is for; the rest of the fields are a flat map
+/// of the shared fields below (parallels `EVM_TX_SIGN_INTENT`'s
+/// strictly-required-field validation).
+///
+/// v1 facts carry only these shared fields — there are no kind-specific keys
+/// yet, so `validate_for_kind` has no per-kind required fields to enforce.
+/// When richer per-kind facts land (e.g. a market identifier for `Order`),
+/// their required-field checks go in `validate_for_kind`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PolymarketSigningAttestationFacts {
+    /// Always [`POLYMARKET_SIGNING_ATTESTATION_FACTS_SCHEMA_V1`].
+    pub facts_schema: String,
+    pub kind: PolymarketSealedActionKind,
+    pub petal_id: String,
+    pub petal_digest: String,
+    pub petal_version: String,
+    pub wallet: String,
+    pub chain_id: u64,
+    pub action_id: String,
+    /// `0x` + 64 lowercase hex chars of the 32-byte signing hash. The host
+    /// matches this against the `action_id`'s canonical sealed subject.
+    pub signing_hash: String,
+}
+
+impl PolymarketSigningAttestationFacts {
+    pub fn to_facts_map(&self) -> Result<BTreeMap<String, serde_json::Value>, AuthApiError> {
+        match serde_json::to_value(self).map_err(AuthApiError::Json)? {
+            serde_json::Value::Object(map) => Ok(map.into_iter().collect()),
+            _ => Err(AuthApiError::InvalidSubject(
+                "Polymarket attestation facts did not serialize as an object".into(),
+            )),
+        }
+    }
+
+    pub fn from_facts_map(
+        facts: &BTreeMap<String, serde_json::Value>,
+    ) -> Result<Self, AuthApiError> {
+        let map: serde_json::Map<String, serde_json::Value> = facts.clone().into_iter().collect();
+        serde_json::from_value(serde_json::Value::Object(map)).map_err(AuthApiError::Json)
+    }
+
+    pub fn validate(&self) -> Result<(), AuthApiError> {
+        if self.facts_schema != POLYMARKET_SIGNING_ATTESTATION_FACTS_SCHEMA_V1 {
+            return Err(AuthApiError::Denied(format!(
+                "unsupported Polymarket attestation facts schema {}",
+                self.facts_schema
+            )));
+        }
+        if self.petal_id != petal_identity::PETAL_ID_POLYMARKET {
+            return Err(AuthApiError::Denied(
+                "Polymarket attestation petal_id must be polymarket".into(),
+            ));
+        }
+        validate_required("petal_digest", &self.petal_digest).map_err(denied_from_invalid)?;
+        validate_required("petal_version", &self.petal_version).map_err(denied_from_invalid)?;
+        validate_required("wallet", &self.wallet).map_err(denied_from_invalid)?;
+        validate_required("action_id", &self.action_id).map_err(denied_from_invalid)?;
+        validate_required_hex32("signing_hash", &self.signing_hash).map_err(denied_from_invalid)?;
+        if self.chain_id == 0 {
+            return Err(AuthApiError::Denied(
+                "Polymarket attestation chain_id is zero".into(),
+            ));
+        }
+        self.validate_for_kind()
+    }
+
+    /// Per-kind required-field enforcement. Called from `validate`.
+    ///
+    /// v1 facts are a flat map of shared fields only (see the struct doc), so
+    /// there are no kind-specific required fields to check yet — every kind is
+    /// fully validated by the shared checks in [`Self::validate`]. This is the
+    /// seam where per-kind required-field checks will go when richer facts land.
+    pub fn validate_for_kind(&self) -> Result<(), AuthApiError> {
+        match self.kind {
+            PolymarketSealedActionKind::Order
+            | PolymarketSealedActionKind::Onboarding
+            | PolymarketSealedActionKind::Redemption
+            | PolymarketSealedActionKind::Withdrawal
+            | PolymarketSealedActionKind::Revocation
+            | PolymarketSealedActionKind::BuilderKey
+            | PolymarketSealedActionKind::Funding => Ok(()),
+        }
+    }
+
+    pub fn signing_attestation(&self) -> Result<SigningAttestation, AuthApiError> {
+        self.validate()?;
+        Ok(SigningAttestation {
+            schema: SIGNING_ATTESTATION_SCHEMA_V1.into(),
+            petal_id: self.petal_id.clone(),
+            petal_digest: self.petal_digest.clone(),
+            intent: self.kind.intent().to_string(),
+            facts: self.to_facts_map()?,
+        })
+    }
+
+    pub fn from_attestation(attestation: &SigningAttestation) -> Result<Self, AuthApiError> {
+        if attestation.schema != SIGNING_ATTESTATION_SCHEMA_V1 {
+            return Err(AuthApiError::Denied(format!(
+                "unsupported attestation schema {}",
+                attestation.schema
+            )));
+        }
+        if attestation.petal_id != petal_identity::PETAL_ID_POLYMARKET {
+            return Err(AuthApiError::Denied(
+                "Polymarket attestation petal_id mismatch".into(),
+            ));
+        }
+        // Intent must be one of the POLYMARKET_*_SIGN_INTENT constants.
+        let kind = match attestation.intent.as_str() {
+            POLYMARKET_ORDER_SIGN_INTENT => PolymarketSealedActionKind::Order,
+            POLYMARKET_ONBOARDING_SIGN_INTENT => PolymarketSealedActionKind::Onboarding,
+            POLYMARKET_REDEMPTION_SIGN_INTENT => PolymarketSealedActionKind::Redemption,
+            POLYMARKET_WITHDRAWAL_SIGN_INTENT => PolymarketSealedActionKind::Withdrawal,
+            POLYMARKET_REVOCATION_SIGN_INTENT => PolymarketSealedActionKind::Revocation,
+            POLYMARKET_BUILDER_KEY_SIGN_INTENT => PolymarketSealedActionKind::BuilderKey,
+            POLYMARKET_FUNDING_SIGN_INTENT => PolymarketSealedActionKind::Funding,
+            other => {
+                return Err(AuthApiError::Denied(format!(
+                    "Polymarket attestation intent mismatch: {other}"
+                )));
+            }
+        };
+        let typed = Self::from_facts_map(&attestation.facts)?;
+        typed.validate()?;
+        if typed.kind != kind {
+            return Err(AuthApiError::Denied(format!(
+                "Polymarket attestation kind mismatch (facts.kind={:?}, intent={})",
+                typed.kind, attestation.intent
+            )));
+        }
+        if typed.petal_id != attestation.petal_id {
+            return Err(AuthApiError::Denied(
+                "Polymarket attestation fact petal_id mismatch".into(),
+            ));
+        }
+        if typed.petal_digest != attestation.petal_digest {
+            return Err(AuthApiError::Denied(
+                "Polymarket attestation fact petal_digest mismatch".into(),
+            ));
+        }
+        Ok(typed)
+    }
+}
+
 impl EvmTokenFact {
     fn validate(&self, chain_id: u64) -> Result<(), AuthApiError> {
         if self.chain_id != chain_id {
@@ -2158,15 +2383,16 @@ impl DefaultAttestationRegistry {
         };
         matches!(
             (petal_id, intent),
-            (PETAL_ID_EVM_WALLET, "evm.tx.sign")
+            (PETAL_ID_EVM_WALLET, EVM_TX_SIGN_INTENT)
                 | (PETAL_ID_PAID_HTTP, "x402.sign")
                 | (PETAL_ID_PAID_HTTP, "paid-http.mpp.sign")
-                | (PETAL_ID_POLYMARKET, "polymarket.order.v2")
-                | (PETAL_ID_POLYMARKET, "polymarket.onboarding")
-                | (PETAL_ID_POLYMARKET, "polymarket.funding")
-                | (PETAL_ID_POLYMARKET, "polymarket.redemption")
-                | (PETAL_ID_POLYMARKET, "polymarket.withdrawal")
-                | (PETAL_ID_POLYMARKET, "polymarket.builder_key")
+                | (PETAL_ID_POLYMARKET, POLYMARKET_ORDER_SIGN_INTENT)
+                | (PETAL_ID_POLYMARKET, POLYMARKET_ONBOARDING_SIGN_INTENT)
+                | (PETAL_ID_POLYMARKET, POLYMARKET_REDEMPTION_SIGN_INTENT)
+                | (PETAL_ID_POLYMARKET, POLYMARKET_WITHDRAWAL_SIGN_INTENT)
+                | (PETAL_ID_POLYMARKET, POLYMARKET_BUILDER_KEY_SIGN_INTENT)
+                | (PETAL_ID_POLYMARKET, POLYMARKET_REVOCATION_SIGN_INTENT)
+                | (PETAL_ID_POLYMARKET, POLYMARKET_FUNDING_SIGN_INTENT)
                 | (PETAL_ID_HYPERLIQUID, "hyperliquid.approve_agent")
                 | (PETAL_ID_HYPERLIQUID, "hyperliquid.usd_send")
                 | (PETAL_ID_HYPERLIQUID, "hyperliquid.order")
@@ -2203,6 +2429,8 @@ impl SigningAttestationSchemaRegistry for DefaultAttestationRegistry {
             && attestation.intent == EVM_TX_SIGN_INTENT
         {
             EvmSigningAttestationFacts::from_attestation(attestation)?;
+        } else if attestation.petal_id == petal_identity::PETAL_ID_POLYMARKET {
+            PolymarketSigningAttestationFacts::from_attestation(attestation)?;
         }
         if attestation.petal_id == petal_identity::PETAL_ID_PAID_HTTP
             && matches!(
@@ -3150,6 +3378,23 @@ fn validate_decimal_string(field: &str, value: &str) -> Result<(), AuthApiError>
     if !value.as_bytes().iter().all(u8::is_ascii_digit) {
         return Err(AuthApiError::InvalidSubject(format!(
             "{field} must be a decimal string"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_required_hex32(field: &str, value: &str) -> Result<(), AuthApiError> {
+    validate_required(field, value)?;
+    let trimmed = value.strip_prefix("0x").unwrap_or(value);
+    if trimmed.len() != 64 {
+        return Err(AuthApiError::InvalidSubject(format!(
+            "{field} must be a 32-byte hex value (got {} chars)",
+            trimmed.len()
+        )));
+    }
+    if !trimmed.as_bytes().iter().all(|b| b.is_ascii_hexdigit()) {
+        return Err(AuthApiError::InvalidSubject(format!(
+            "{field} must be lowercase hex"
         )));
     }
     Ok(())
@@ -4722,6 +4967,30 @@ mod tests {
         .unwrap()
     }
 
+    fn typed_polymarket_attestation_for_registry(
+        intent: &str,
+        kind: PolymarketSealedActionKind,
+    ) -> SigningAttestation {
+        let facts = PolymarketSigningAttestationFacts {
+            facts_schema: POLYMARKET_SIGNING_ATTESTATION_FACTS_SCHEMA_V1.into(),
+            kind,
+            petal_id: PETAL_ID_POLYMARKET.into(),
+            petal_digest: PLACEHOLDER_DIGEST_POLYMARKET.into(),
+            petal_version: FIRST_PARTY_PETAL_VERSION_V0.into(),
+            wallet: "my-wallet".into(),
+            chain_id: 137,
+            action_id: "pm-order-test-1".into(),
+            signing_hash: format!("0x{}", "1".repeat(64)),
+        };
+        SigningAttestation {
+            schema: SIGNING_ATTESTATION_SCHEMA_V1.into(),
+            petal_id: PETAL_ID_POLYMARKET.into(),
+            petal_digest: PLACEHOLDER_DIGEST_POLYMARKET.into(),
+            intent: intent.into(),
+            facts: facts.to_facts_map().expect("test facts"),
+        }
+    }
+
     #[test]
     fn default_registry_accepts_first_party_pairs() {
         let r = DefaultAttestationRegistry::new();
@@ -4735,6 +5004,7 @@ mod tests {
             (PETAL_ID_POLYMARKET, "polymarket.redemption"),
             (PETAL_ID_POLYMARKET, "polymarket.withdrawal"),
             (PETAL_ID_POLYMARKET, "polymarket.builder_key"),
+            (PETAL_ID_POLYMARKET, "polymarket.revocation"),
             (PETAL_ID_HYPERLIQUID, "hyperliquid.approve_agent"),
             (PETAL_ID_HYPERLIQUID, "hyperliquid.usd_send"),
             (PETAL_ID_HYPERLIQUID, "hyperliquid.order"),
@@ -4756,6 +5026,18 @@ mod tests {
                     intent: intent.into(),
                     facts: paid_http_facts_for_intent(intent),
                 }
+            } else if petal_id == PETAL_ID_POLYMARKET {
+                let kind = match intent {
+                    POLYMARKET_ORDER_SIGN_INTENT => PolymarketSealedActionKind::Order,
+                    POLYMARKET_ONBOARDING_SIGN_INTENT => PolymarketSealedActionKind::Onboarding,
+                    POLYMARKET_REDEMPTION_SIGN_INTENT => PolymarketSealedActionKind::Redemption,
+                    POLYMARKET_WITHDRAWAL_SIGN_INTENT => PolymarketSealedActionKind::Withdrawal,
+                    POLYMARKET_REVOCATION_SIGN_INTENT => PolymarketSealedActionKind::Revocation,
+                    POLYMARKET_BUILDER_KEY_SIGN_INTENT => PolymarketSealedActionKind::BuilderKey,
+                    POLYMARKET_FUNDING_SIGN_INTENT => PolymarketSealedActionKind::Funding,
+                    other => panic!("unknown polymarket intent {other}"),
+                };
+                typed_polymarket_attestation_for_registry(intent, kind)
             } else {
                 SigningAttestation {
                     schema: SIGNING_ATTESTATION_SCHEMA_V1.into(),
@@ -4987,6 +5269,127 @@ mod tests {
         let json = serde_json::to_string(&ev_bare).unwrap();
         assert!(!json.contains("wallet"));
         assert!(!json.contains("action_id"));
+    }
+
+    // ── Polymarket WS-H attestation coverage ─────────────────────────────────
+
+    fn typed_polymarket_attestation(kind: PolymarketSealedActionKind) -> SigningAttestation {
+        let facts = PolymarketSigningAttestationFacts {
+            facts_schema: POLYMARKET_SIGNING_ATTESTATION_FACTS_SCHEMA_V1.into(),
+            kind,
+            petal_id: PETAL_ID_POLYMARKET.into(),
+            petal_digest: PLACEHOLDER_DIGEST_POLYMARKET.into(),
+            petal_version: FIRST_PARTY_PETAL_VERSION_V0.into(),
+            wallet: "my-wallet".into(),
+            chain_id: 137,
+            action_id: "pm-action-1".into(),
+            signing_hash: format!("0x{}", "2".repeat(64)),
+        };
+        facts.signing_attestation().expect("test attestation")
+    }
+
+    #[test]
+    fn polymarket_kind_intent_mapping_is_bijective() {
+        for kind in [
+            PolymarketSealedActionKind::Order,
+            PolymarketSealedActionKind::Onboarding,
+            PolymarketSealedActionKind::Redemption,
+            PolymarketSealedActionKind::Withdrawal,
+            PolymarketSealedActionKind::Revocation,
+            PolymarketSealedActionKind::BuilderKey,
+            PolymarketSealedActionKind::Funding,
+        ] {
+            let intent = kind.intent();
+            assert!(intent.starts_with("polymarket."));
+            // The label must not collide with the intent suffix.
+            assert_ne!(kind.label(), "");
+        }
+    }
+
+    #[test]
+    fn polymarket_attestation_rejects_kind_intent_mismatch() {
+        // Order facts under onboarding intent → mismatch.
+        let mut att = typed_polymarket_attestation(PolymarketSealedActionKind::Order);
+        att.intent = POLYMARKET_ONBOARDING_SIGN_INTENT.into();
+        let r = DefaultAttestationRegistry::new();
+        let err = r.validate_attestation(&att).unwrap_err();
+        assert!(
+            err.to_string().contains("kind mismatch")
+                || err.to_string().contains("intent mismatch"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn polymarket_attestation_rejects_bad_signing_hash_hex() {
+        let mut facts = typed_polymarket_attestation(PolymarketSealedActionKind::Order).facts;
+        facts.insert("signing_hash".into(), serde_json::json!("0xnothex"));
+        let att = SigningAttestation {
+            schema: SIGNING_ATTESTATION_SCHEMA_V1.into(),
+            petal_id: PETAL_ID_POLYMARKET.into(),
+            petal_digest: PLACEHOLDER_DIGEST_POLYMARKET.into(),
+            intent: POLYMARKET_ORDER_SIGN_INTENT.into(),
+            facts,
+        };
+        let err = DefaultAttestationRegistry::new()
+            .validate_attestation(&att)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("signing_hash") || err.to_string().contains("hex"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn polymarket_attestation_rejects_chain_id_zero() {
+        let mut facts = typed_polymarket_attestation(PolymarketSealedActionKind::Order).facts;
+        facts.insert("chain_id".into(), serde_json::json!(0));
+        let att = SigningAttestation {
+            schema: SIGNING_ATTESTATION_SCHEMA_V1.into(),
+            petal_id: PETAL_ID_POLYMARKET.into(),
+            petal_digest: PLACEHOLDER_DIGEST_POLYMARKET.into(),
+            intent: POLYMARKET_ORDER_SIGN_INTENT.into(),
+            facts,
+        };
+        let err = DefaultAttestationRegistry::new()
+            .validate_attestation(&att)
+            .unwrap_err();
+        assert!(err.to_string().contains("chain_id"), "{err}");
+    }
+
+    #[test]
+    fn polymarket_attestation_rejects_wrong_petal_id_in_facts() {
+        let mut facts = typed_polymarket_attestation(PolymarketSealedActionKind::Order).facts;
+        facts.insert("petal_id".into(), serde_json::json!("other-petal"));
+        let att = SigningAttestation {
+            schema: SIGNING_ATTESTATION_SCHEMA_V1.into(),
+            petal_id: PETAL_ID_POLYMARKET.into(),
+            petal_digest: PLACEHOLDER_DIGEST_POLYMARKET.into(),
+            intent: POLYMARKET_ORDER_SIGN_INTENT.into(),
+            facts,
+        };
+        let err = DefaultAttestationRegistry::new()
+            .validate_attestation(&att)
+            .unwrap_err();
+        assert!(err.to_string().contains("petal_id"), "{err}");
+    }
+
+    #[test]
+    fn polymarket_attestation_accepts_all_kinds() {
+        let r = DefaultAttestationRegistry::new();
+        for kind in [
+            PolymarketSealedActionKind::Order,
+            PolymarketSealedActionKind::Onboarding,
+            PolymarketSealedActionKind::Redemption,
+            PolymarketSealedActionKind::Withdrawal,
+            PolymarketSealedActionKind::Revocation,
+            PolymarketSealedActionKind::BuilderKey,
+            PolymarketSealedActionKind::Funding,
+        ] {
+            let att = typed_polymarket_attestation(kind);
+            r.validate_attestation(&att)
+                .unwrap_or_else(|e| panic!("{kind:?} must be accepted: {e}"));
+        }
     }
 
     #[test]

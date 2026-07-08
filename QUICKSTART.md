@@ -161,7 +161,8 @@ BLOOM_HOME=/tmp/bloom-demo \
 ```
 
 When `bloom serve` is running, the unlock survives across calls and you
-can write to `…/pending/<id>/confirm` directly:
+can write to `…/pending/<id>/confirm` directly (this applies to passphrase /
+local wallets — the example below uses one):
 
 ```sh
 BLOOM_HOME=/tmp/bloom-demo cargo run -p bloom -- wallet unlock alice \
@@ -169,6 +170,13 @@ BLOOM_HOME=/tmp/bloom-demo cargo run -p bloom -- wallet unlock alice \
 BLOOM_HOME=/tmp/bloom-demo cargo run -p bloom -- vfs write \
   /wallets/alice/chains/anvil/outbox/pending/<id>/confirm --data y
 ```
+
+> **Passkey wallets:** the direct VFS `confirm` write over the serve socket is
+> not available for passkey-gated wallets — the WebAuthn ceremony binds
+> `localhost` and the system browser and is only reachable from the foreground
+> CLI. Stop `bloom serve` (or let the CLI fall back to the in-process path) and
+> run `bloom wallet confirm <wallet> <chain> <id> --text y` to drive the
+> browser ceremony, obtain the Sealed Approval grant, and broadcast in one shot.
 
 The daemon signs, broadcasts, moves the directory to `sent/<id>/`
 (with `tx_hash` inside), and links the tx into

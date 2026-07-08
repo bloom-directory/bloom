@@ -29,7 +29,7 @@ use bloom_hyperliquid::{HyperliquidClient, HyperliquidNetwork};
 use bloom_keystore::{Keystore, KeystoreApprovalSignatureVerifier};
 use bloom_paid_http::PaidHttpChainRpcResolver;
 use bloom_petals::{NameRegistry, PetalRunner, PetalStore, PetalVm, PetalsHandler};
-use bloom_polymarket::{ClobClient, CredentialStore, DataClient, GammaClient, GeoblockClient};
+use bloom_polymarket::{ClobClient, CredentialStore, DataClient, GammaClient};
 use bloom_prices::PricesClient;
 use bloom_proto::{AddressBook, AuditLog, ChainSpec, Config, HomeDir, HomeWritePermit};
 use bloom_revert::{
@@ -786,8 +786,7 @@ impl Daemon {
         // `[chains]` entry matches the Polymarket chain id (Polygon 137), the
         // onboarding state machine and L2 account views. Mount whenever a
         // `[polymarket]` block exists; a bare block uses the public defaults.
-        // Signing never leaves the daemon (Keystore::signer → KeystoreSigner);
-        // the geoblock refuse-line is deliberately not configurable.
+        // Signing never leaves the daemon (Keystore::signer → KeystoreSigner).
         if let Some(pm_cfg) = &config.polymarket {
             let pm_url = |raw: &str| match url::Url::parse(raw) {
                 Ok(u) => Some(u),
@@ -838,22 +837,6 @@ impl Daemon {
                     handler = handler
                         .with_onboarding(PolymarketOnboarding {
                             onboarder: Arc::new(onboarder),
-                            geoblock: Arc::new({
-                                let geo_base = url::Url::parse(&pm_cfg.gamma_url)
-                                    .ok()
-                                    .filter(|u| {
-                                        matches!(
-                                            u.host_str(),
-                                            Some("127.0.0.1" | "localhost" | "::1")
-                                        )
-                                    })
-                                    .and_then(|u| u.join("/api/geoblock").ok());
-                                match geo_base {
-                                    Some(url) => GeoblockClient::new()
-                                        .with_base_url_for_tests(url.to_string()),
-                                    None => GeoblockClient::new(),
-                                }
-                            }),
                             auth_dir: state_dir.clone(),
                             creds: CredentialStore::new(&state_dir),
                             chain,
