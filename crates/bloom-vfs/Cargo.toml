@@ -42,6 +42,7 @@ base64.workspace = true
 blake3.workspace = true
 rand.workspace = true
 mpp.workspace = true
+qrcode.workspace = true
 
 [dev-dependencies]
 bloom-auth.workspace = true

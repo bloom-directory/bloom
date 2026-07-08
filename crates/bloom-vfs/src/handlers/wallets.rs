@@ -8,6 +8,8 @@
 //! - `wallets/`                                                     — list wallets
 //! - `wallets/new`                                                  — write to create wallet (plain name or TOML spec)
 //! - `wallets/<wallet>/address`                                     — checksummed owner/signer address
+//! - `wallets/<wallet>/address.qr.svg`                              — scannable QR image for the owner/signer address
+//! - `wallets/<wallet>/address.qr.png`                              — scannable QR image for the owner/signer address
 //! - `wallets/<wallet>/addresses.json`                              — owner/signer + role addresses (e.g. Polymarket deposit/funder)
 //! - `wallets/<wallet>/public_key`                                  — secp256k1 pubkey hex
 //! - `wallets/<wallet>/kind`                                        — local/watch
@@ -46,6 +48,9 @@ use bloom_tx::{
     outbox::OutboxState,
     tx_engine::{TxEngine, TxEngineError},
 };
+use qrcode::QrCode;
+use qrcode::render::svg;
+use qrcode::types::Color as QrColor;
 
 use crate::auth::AuthServices;
 use crate::handler::{Entry, Handler, HandlerError};
@@ -1005,6 +1010,8 @@ impl WalletsHandler {
     fn wallet_dir_entries(kind: bloom_keystore::WalletKind) -> Vec<Entry> {
         let mut entries = vec![
             Entry::file("address"),
+            Entry::file("address.qr.png"),
+            Entry::file("address.qr.svg"),
             Entry::file("addresses.json"),
             Entry::file("public_key"),
             Entry::file("kind"),
@@ -1041,6 +1048,108 @@ impl WalletsHandler {
 
 fn err_be(e: impl std::fmt::Display) -> HandlerError {
     HandlerError::backend(e.to_string())
+}
+
+fn render_address_qr_svg(address: &str) -> Result<Vec<u8>, HandlerError> {
+    let code = QrCode::new(address.as_bytes())
+        .map_err(|e| HandlerError::backend(format!("qr svg encode: {e}")))?;
+    Ok(code
+        .render::<svg::Color>()
+        .min_dimensions(256, 256)
+        .quiet_zone(true)
+        .build()
+        .into_bytes())
+}
+
+fn render_address_qr_png(address: &str) -> Result<Vec<u8>, HandlerError> {
+    let code = QrCode::new(address.as_bytes())
+        .map_err(|e| HandlerError::backend(format!("qr png encode: {e}")))?;
+    let module_width = code.width();
+    let quiet_modules = 4usize;
+    let total_modules = module_width + quiet_modules * 2;
+    let scale = 256usize.div_ceil(total_modules).max(1);
+    let pixels = total_modules * scale;
+    let row_len = 1 + pixels;
+    let mut raw = Vec::with_capacity(row_len * pixels);
+    for y in 0..pixels {
+        raw.push(0); // PNG filter type 0.
+        let module_y = y / scale;
+        for x in 0..pixels {
+            let module_x = x / scale;
+            let dark = module_x >= quiet_modules
+                && module_x < quiet_modules + module_width
+                && module_y >= quiet_modules
+                && module_y < quiet_modules + module_width
+                && code[(module_x - quiet_modules, module_y - quiet_modules)] == QrColor::Dark;
+            raw.push(if dark { 0 } else { 255 });
+        }
+    }
+
+    let mut png = Vec::new();
+    png.extend_from_slice(b"\x89PNG\r\n\x1a\n");
+
+    let mut ihdr = Vec::with_capacity(13);
+    ihdr.extend_from_slice(&(pixels as u32).to_be_bytes());
+    ihdr.extend_from_slice(&(pixels as u32).to_be_bytes());
+    ihdr.push(8); // bit depth
+    ihdr.push(0); // grayscale
+    ihdr.push(0); // deflate
+    ihdr.push(0); // adaptive filtering
+    ihdr.push(0); // no interlace
+    push_png_chunk(&mut png, b"IHDR", &ihdr);
+
+    let compressed = zlib_store(&raw);
+    push_png_chunk(&mut png, b"IDAT", &compressed);
+    push_png_chunk(&mut png, b"IEND", &[]);
+    Ok(png)
+}
+
+fn push_png_chunk(out: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
+    out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+    out.extend_from_slice(kind);
+    out.extend_from_slice(data);
+    let mut crc_input = Vec::with_capacity(kind.len() + data.len());
+    crc_input.extend_from_slice(kind);
+    crc_input.extend_from_slice(data);
+    out.extend_from_slice(&crc32(&crc_input).to_be_bytes());
+}
+
+fn zlib_store(data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(data.len() + data.len() / 65_535 * 5 + 8);
+    out.extend_from_slice(&[0x78, 0x01]);
+    for (i, chunk) in data.chunks(65_535).enumerate() {
+        let final_block = i == data.len().saturating_sub(1) / 65_535;
+        out.push(if final_block { 0x01 } else { 0x00 });
+        let len = chunk.len() as u16;
+        out.extend_from_slice(&len.to_le_bytes());
+        out.extend_from_slice(&(!len).to_le_bytes());
+        out.extend_from_slice(chunk);
+    }
+    out.extend_from_slice(&adler32(data).to_be_bytes());
+    out
+}
+
+fn crc32(data: &[u8]) -> u32 {
+    let mut crc = 0xffff_ffffu32;
+    for &byte in data {
+        crc ^= u32::from(byte);
+        for _ in 0..8 {
+            let mask = 0u32.wrapping_sub(crc & 1);
+            crc = (crc >> 1) ^ (0xedb8_8320 & mask);
+        }
+    }
+    !crc
+}
+
+fn adler32(data: &[u8]) -> u32 {
+    const MOD: u32 = 65_521;
+    let mut a = 1u32;
+    let mut b = 0u32;
+    for &byte in data {
+        a = (a + u32::from(byte)) % MOD;
+        b = (b + a) % MOD;
+    }
+    (b << 16) | a
 }
 
 fn now_ms() -> u128 {
@@ -1594,7 +1703,8 @@ impl WalletsHandler {
             return Ok(Entry::dir(wallet));
         }
         match segs[1].as_str() {
-            "address" | "addresses.json" | "public_key" | "kind" => Ok(Entry::file(&segs[1])),
+            "address" | "address.qr.png" | "address.qr.svg" | "addresses.json" | "public_key"
+            | "kind" => Ok(Entry::file(&segs[1])),
             "policy.toml" => Ok(Entry::writable_file("policy.toml")),
             "unlock-passkey" if info.kind == bloom_keystore::WalletKind::PasskeyGated => {
                 Ok(Entry::writable_file("unlock-passkey"))
@@ -1674,6 +1784,14 @@ impl WalletsHandler {
         match segs.get(1).map(|s| s.as_str()).unwrap_or("") {
             "address" => {
                 Ok(format!("{}\n", bloom_proto::checksum_address(&info.address)).into_bytes())
+            }
+            "address.qr.svg" => {
+                let address = bloom_proto::checksum_address(&info.address);
+                render_address_qr_svg(&address)
+            }
+            "address.qr.png" => {
+                let address = bloom_proto::checksum_address(&info.address);
+                render_address_qr_png(&address)
             }
             "addresses.json" => self.addresses_json(wallet, &info),
             "public_key" => Ok(format!("0x{}\n", info.pubkey_hex).into_bytes()),
@@ -3408,6 +3526,50 @@ mod tests {
             .map(|e| e.name)
             .collect();
         assert!(names.iter().any(|n| n == "addresses.json"));
+    }
+
+    #[tokio::test]
+    async fn wallet_dir_surfaces_address_qr_images() {
+        let f = make_handler();
+        let dir = VfsPath::parse(&format!("/{}", f.wallet_name)).unwrap();
+        let entries = f.handler.list(&dir).await.unwrap();
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"address.qr.png"));
+        assert!(names.contains(&"address.qr.svg"));
+
+        for leaf in ["address.qr.png", "address.qr.svg"] {
+            let path = VfsPath::parse(&format!("/{}/{leaf}", f.wallet_name)).unwrap();
+            let entry = f.handler.lookup(&path).await.unwrap();
+            assert_eq!(entry.name, leaf);
+            assert!(matches!(entry.kind, crate::handler::EntryKind::File));
+        }
+    }
+
+    #[tokio::test]
+    async fn address_qr_svg_is_scannable_svg_document() {
+        let f = make_handler();
+        let path = VfsPath::parse(&format!("/{}/address.qr.svg", f.wallet_name)).unwrap();
+        let body = f.handler.read(&path).await.unwrap();
+        let svg = String::from_utf8(body).unwrap();
+        assert!(svg.contains("<svg"), "{svg}");
+        assert!(svg.contains("</svg>"), "{svg}");
+        assert!(
+            svg.contains("width=\"") && svg.contains("height=\""),
+            "{svg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn address_qr_png_is_png_document() {
+        let f = make_handler();
+        let path = VfsPath::parse(&format!("/{}/address.qr.png", f.wallet_name)).unwrap();
+        let body = f.handler.read(&path).await.unwrap();
+        assert!(body.starts_with(b"\x89PNG\r\n\x1a\n"));
+        assert!(
+            body.windows(4).any(|w| w == b"IHDR") && body.windows(4).any(|w| w == b"IDAT"),
+            "PNG chunks missing"
+        );
+        assert!(body.len() > 1024, "PNG too small to contain a QR image");
     }
 
     #[tokio::test]
