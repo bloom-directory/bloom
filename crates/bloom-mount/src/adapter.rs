@@ -1412,7 +1412,7 @@ mod tests {
             "/wallets/minnow/policy.toml",
             "/wallets/minnow/policy-session/new",
             "/requests/pending/req_1/confirm",
-            "/polymarket/onboard/minnow/begin",
+            "/polymarket/onboard/test-wallet/begin",
         ] {
             let p = VfsPath::parse(path).unwrap();
             assert!(!mount_write_path_uses_wallet_signer(&p), "{path}");

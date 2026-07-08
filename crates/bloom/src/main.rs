@@ -1428,8 +1428,11 @@ async fn run(cli: Cli) -> Result<()> {
                                 );
                             }
                             Err(e) if is_ipc_handler_permission_denied(&e) => {
-                                let intent =
-                                    polymarket_onboard_ceremony_intent(&ceremony_daemon, &wallet)?;
+                                let intent = polymarket_onboard_ceremony_intent(
+                                    &ceremony_daemon,
+                                    &wallet,
+                                    &p,
+                                )?;
                                 let approved =
                                     sign_polymarket_onboard_sealed_approval_if_challenged(
                                         &ceremony_daemon,
@@ -1475,7 +1478,7 @@ async fn run(cli: Cli) -> Result<()> {
                             Err(first_err)
                                 if matches!(first_err, HandlerError::PermissionDenied) =>
                             {
-                                let intent = polymarket_onboard_ceremony_intent(&d, &wallet)?;
+                                let intent = polymarket_onboard_ceremony_intent(&d, &wallet, &p)?;
                                 if sign_polymarket_onboard_sealed_approval_if_challenged(
                                     &d,
                                     &wallet,
@@ -3299,23 +3302,17 @@ fn polymarket_onboard_begin_write(path: &VfsPath) -> Option<String> {
     }
 }
 
-fn polymarket_onboard_ceremony_intent(d: &Daemon, wallet: &str) -> Result<CeremonyIntent> {
+fn polymarket_onboard_ceremony_intent(
+    d: &Daemon,
+    wallet: &str,
+    path: &VfsPath,
+) -> Result<CeremonyIntent> {
     let info = d.keystore.info(wallet)?;
-    let intent = CeremonyIntent::new(
+    Ok(bloom_polymarket::polymarket_onboard_ceremony_intent(
         wallet,
-        "Approve Polymarket Onboarding Run",
-        CeremonyIntentKind::WalletUnlock,
-    )
-    .with_address(bloom_proto::checksum_address(&info.address))
-    .summary("This approval authorizes a bounded multi-step Polymarket onboarding run.".to_string())
-    .summary("The run may request deposit-wallet deploy, V2 approvals, CLOB credential minting, and buying-power sync.".to_string())
-    .risk("HIGHER RISK: one approval can cover several onboarding signatures.")
-    .subject(serde_json::json!({
-        "action": "polymarket_onboard_run",
-        "owner": bloom_proto::checksum_address(&info.address),
-        "mode": "deposit_wallet",
-    }));
-    Ok(intent)
+        Some(&path.to_string_path()),
+        Some(bloom_proto::checksum_address(&info.address)),
+    ))
 }
 
 async fn poll_polymarket_onboard_until_stable(d: &Daemon, wallet: &str) -> Result<()> {
