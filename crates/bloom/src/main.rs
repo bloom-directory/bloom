@@ -3899,7 +3899,7 @@ async fn handle_hyperliquid(
             };
             print_hl_info(&home, &network, body).await
         }
-        HyperliquidCmd::Session { command } => handle_hl_session(&home, endpoint, command).await,
+        HyperliquidCmd::Session { command } => handle_hl_session(endpoint, command).await,
         HyperliquidCmd::SendAsset {
             wallet,
             destination,
@@ -3918,8 +3918,7 @@ async fn handle_hyperliquid(
                     "warning: --passphrase is ignored for Hyperliquid Sealed Approval; use the browser ceremony"
                 );
             }
-            hl_session_ipc_write_with_sealed_approval(&home, endpoint, &path, body, &wallet)
-                .await?;
+            hl_session_ipc_write_with_sealed_approval(endpoint, &path, body, &wallet).await?;
             let last_response =
                 format!("/hyperliquid/{network}/exchange/{wallet}/last_response.json");
             match hl_session_ipc_read(endpoint, &last_response).await {
@@ -3965,11 +3964,7 @@ async fn handle_hyperliquid(
     }
 }
 
-async fn handle_hl_session(
-    home: &HomeDir,
-    endpoint: &ResolvedEndpoint,
-    cmd: HyperliquidSessionCmd,
-) -> Result<()> {
+async fn handle_hl_session(endpoint: &ResolvedEndpoint, cmd: HyperliquidSessionCmd) -> Result<()> {
     match cmd {
         HyperliquidSessionCmd::Create {
             wallet,
@@ -3991,7 +3986,6 @@ async fn handle_hl_session(
                 );
             }
             hl_session_ipc_write_with_sealed_approval(
-                home,
                 endpoint,
                 &path,
                 serde_json::to_vec(&body)?,
@@ -4155,7 +4149,6 @@ async fn hl_session_ipc_write(
 }
 
 async fn hl_session_ipc_write_with_sealed_approval(
-    home: &HomeDir,
     endpoint: &ResolvedEndpoint,
     path: &str,
     body: Vec<u8>,
@@ -4167,9 +4160,9 @@ async fn hl_session_ipc_write_with_sealed_approval(
             bail!("Hyperliquid Sealed Approval requires a running bloom serve daemon");
         }
         Err(e) if is_ipc_permission_denied(&e) => {
-            let challenge_path = hyperliquid_challenge_path(home, path, &body)
+            let challenge_path = hyperliquid_challenge_vfs_path(path, &body)
                 .with_context(|| format!("locate Hyperliquid approval challenge for {path}"))?;
-            let challenge = read_hyperliquid_approval_challenge(&challenge_path)?;
+            let challenge = read_hyperliquid_approval_challenge(endpoint, &challenge_path).await?;
             ensure_hyperliquid_challenge_matches(&challenge, wallet)?;
             let url = challenge
                 .ceremony_url
@@ -4223,7 +4216,7 @@ fn is_ipc_permission_denied(e: &std::io::Error) -> bool {
             .contains("permission denied")
 }
 
-fn hyperliquid_challenge_path(home: &HomeDir, path: &str, body: &[u8]) -> Result<PathBuf> {
+fn hyperliquid_challenge_vfs_path(path: &str, body: &[u8]) -> Result<String> {
     let vfs_path = VfsPath::parse(path)?;
     let segments = vfs_path.segments();
     if segments.len() == 5
@@ -4231,13 +4224,10 @@ fn hyperliquid_challenge_path(home: &HomeDir, path: &str, body: &[u8]) -> Result
         && segments[2] == "exchange"
         && segments[4] == "send_asset.json"
     {
-        return Ok(home
-            .root()
-            .join("hyperliquid")
-            .join("exchange")
-            .join(&segments[1])
-            .join(&segments[3])
-            .join("approval_challenge.json"));
+        return Ok(format!(
+            "/hyperliquid/{}/exchange/{}/approval_challenge.json",
+            segments[1], segments[3]
+        ));
     }
     if segments.len() == 5
         && segments[0] == "hyperliquid"
@@ -4251,23 +4241,23 @@ fn hyperliquid_challenge_path(home: &HomeDir, path: &str, body: &[u8]) -> Result
             .and_then(|v| v.as_str())
             .filter(|s| !s.is_empty())
             .context("Hyperliquid session create requires an explicit stable id")?;
-        return Ok(home
-            .root()
-            .join("hyperliquid")
-            .join("agent_sessions")
-            .join(&segments[1])
-            .join(&segments[3])
-            .join(id)
-            .join("approval_challenge.json"));
+        return Ok(format!(
+            "/hyperliquid/{}/agent_sessions/{}/{id}/approval_challenge.json",
+            segments[1], segments[3]
+        ));
     }
     bail!("unsupported Hyperliquid Sealed Approval path {path}");
 }
 
-fn read_hyperliquid_approval_challenge(path: &Path) -> Result<ApprovalChallenge> {
-    let bytes = std::fs::read(path)
-        .with_context(|| format!("read Hyperliquid approval challenge {}", path.display()))?;
+async fn read_hyperliquid_approval_challenge(
+    endpoint: &ResolvedEndpoint,
+    path: &str,
+) -> Result<ApprovalChallenge> {
+    let bytes = hl_session_ipc_read(endpoint, path)
+        .await
+        .with_context(|| format!("ipc read Hyperliquid approval challenge {path}"))?;
     serde_json::from_slice(&bytes)
-        .with_context(|| format!("parse Hyperliquid approval challenge {}", path.display()))
+        .with_context(|| format!("parse Hyperliquid approval challenge {path}"))
 }
 
 fn ensure_hyperliquid_challenge_matches(challenge: &ApprovalChallenge, wallet: &str) -> Result<()> {
