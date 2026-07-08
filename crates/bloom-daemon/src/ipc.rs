@@ -720,36 +720,6 @@ fn write_path_uses_wallet_signer(path: &VfsPath) -> bool {
         {
             true
         }
-        // Hyperliquid owner-signer writes either approve a standing API wallet
-        // or sign actions directly with the owner wallet. They require the
-        // write_unlocked ceremony; already-approved agent-session actions stay
-        // available to plain IPC because they use the bounded API wallet.
-        [root, _network, branch, _wallet, leaf]
-            if root == "hyperliquid" && branch == "agent_sessions" && leaf == "new.json" =>
-        {
-            true
-        }
-        [root, _network, branch, _wallet, _session, leaf]
-            if root == "hyperliquid"
-                && branch == "agent_sessions"
-                && matches!(leaf.as_str(), "orphan_cancel_all" | "orphan_close_all") =>
-        {
-            true
-        }
-        [root, _network, branch, _wallet, leaf]
-            if root == "hyperliquid"
-                && branch == "exchange"
-                && matches!(
-                    leaf.as_str(),
-                    "order.json"
-                        | "cancel.json"
-                        | "schedule_cancel.json"
-                        | "update_leverage.json"
-                        | "send_asset.json"
-                ) =>
-        {
-            true
-        }
         // Everything else reaches the VFS handler through the plain write lane.
         // In particular these first-party Sealed Approval actions are NOT raw
         // signer lanes and must forward through to `vfs.write` rather than be
@@ -764,6 +734,10 @@ fn write_path_uses_wallet_signer(path: &VfsPath) -> bool {
         //     stages an approval challenge on the first write and signs the
         //     x402/Tempo MPP credential only under a grant-gated PetalHost
         //     signature.
+        //   * Hyperliquid owner approvals (`agent_sessions/<wallet>/new.json`
+        //     and `exchange/<wallet>/send_asset.json`): the Hyperliquid
+        //     handler stages approval and signs only under a grant-gated
+        //     PetalHost signature.
         // None of these silently consumes a cached signer, and the old
         // write_unlocked lane is disabled for passkey wallets — denying them here
         // would leave mounted confirm/mint with no working path.
@@ -1487,14 +1461,6 @@ mod tests {
             "/wallets/minnow/sign/hash",
             "/wallets/minnow/sign/typed_data",
             "/polymarket/onboard/minnow/begin",
-            "/hyperliquid/mainnet/agent_sessions/minnow/new.json",
-            "/hyperliquid/mainnet/agent_sessions/minnow/session-1/orphan_cancel_all",
-            "/hyperliquid/mainnet/agent_sessions/minnow/session-1/orphan_close_all",
-            "/hyperliquid/mainnet/exchange/minnow/order.json",
-            "/hyperliquid/mainnet/exchange/minnow/cancel.json",
-            "/hyperliquid/mainnet/exchange/minnow/schedule_cancel.json",
-            "/hyperliquid/mainnet/exchange/minnow/update_leverage.json",
-            "/hyperliquid/mainnet/exchange/minnow/send_asset.json",
         ] {
             let p = VfsPath::parse(path).unwrap();
             assert!(write_path_uses_wallet_signer(&p), "{path}");
@@ -1523,6 +1489,14 @@ mod tests {
             "/hyperliquid/mainnet/agent_sessions/minnow/session-1/schedule_cancel.json",
             "/hyperliquid/mainnet/agent_sessions/minnow/session-1/order.json",
             "/hyperliquid/mainnet/agent_sessions/minnow/session-1/cancel_all",
+            "/hyperliquid/mainnet/agent_sessions/minnow/new.json",
+            "/hyperliquid/mainnet/agent_sessions/minnow/session-1/orphan_cancel_all",
+            "/hyperliquid/mainnet/agent_sessions/minnow/session-1/orphan_close_all",
+            "/hyperliquid/mainnet/exchange/minnow/order.json",
+            "/hyperliquid/mainnet/exchange/minnow/cancel.json",
+            "/hyperliquid/mainnet/exchange/minnow/schedule_cancel.json",
+            "/hyperliquid/mainnet/exchange/minnow/update_leverage.json",
+            "/hyperliquid/mainnet/exchange/minnow/send_asset.json",
             "/hyperliquid/mainnet/exchange/minnow/raw_signed.json",
         ] {
             let p = VfsPath::parse(path).unwrap();

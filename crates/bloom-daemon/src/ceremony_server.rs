@@ -318,6 +318,12 @@ async fn complete(
         }
         Err(status) => return err_json(status, "could not resolve approval URL"),
     };
+    if execute && action.surface() == "hyperliquid" {
+        return err_json(
+            StatusCode::BAD_REQUEST,
+            "Hyperliquid approvals support grant mode only; approve the grant, then retry the Bloom VFS write to sign and submit",
+        );
+    }
     let wallet = challenge.wallet.clone();
 
     // Hardened challenges require a daemon-side review session, minted the same

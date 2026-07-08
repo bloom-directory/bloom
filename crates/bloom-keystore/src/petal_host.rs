@@ -31,6 +31,7 @@ use bloom_auth_api::{
     AuditEvent, AuthApiError, DaemonGrantTerms, GrantStore, PetalHost, PetalPolicySnapshot,
     SealedApprovalGrant, SealedPetalContext, SealedSignature, SignHashRequest, SigningAttestation,
     SigningAttestationSchemaRegistry, intent_hash_of, petal_identity::placeholder_digest_for,
+    signing_attestation_facts_digest,
 };
 use bloom_proto::AuditLog;
 use bloom_proto::audit::AuditRecord;
@@ -453,6 +454,22 @@ impl PetalHost for KeystorePetalHost {
                     .await;
             }
         }
+        if let Err(message) =
+            validate_required_grant_terms(&grant.daemon_terms, &request, attestation)
+        {
+            return self
+                .deny(
+                    "petal.sign.deny",
+                    Some(request.wallet.clone()),
+                    Some(request.action_id.clone()),
+                    &message,
+                    Some(serde_json::json!({
+                        "petal_id": attestation.petal_id,
+                        "petal_digest": attestation.petal_digest,
+                    })),
+                )
+                .await;
+        }
 
         // NOTE: a sign-time policy hard-deny hook was intentionally removed
         // here. The grant carries only `petal_policy_digest` (a hash), not the
@@ -659,6 +676,43 @@ fn parse_hash_hex(s: &str) -> Result<B256, String> {
     Ok(B256::from(out))
 }
 
+fn validate_required_grant_terms(
+    terms: &DaemonGrantTerms,
+    request: &SignHashRequest,
+    attestation: &SigningAttestation,
+) -> Result<(), String> {
+    for (key, value) in &terms.extra {
+        match key.as_str() {
+            "required.signing_hash" => {
+                let expected = value.as_str().ok_or_else(|| {
+                    "required.signing_hash grant term must be a string".to_string()
+                })?;
+                if expected != request.hash_hex {
+                    return Err("sign_hash hash does not match required.signing_hash".to_string());
+                }
+            }
+            "required.attestation_facts_digest" => {
+                let expected = value.as_str().ok_or_else(|| {
+                    "required.attestation_facts_digest grant term must be a string".to_string()
+                })?;
+                let actual = signing_attestation_facts_digest(&attestation.facts)
+                    .map_err(|e| format!("digest signing attestation facts: {e}"))?;
+                if expected != actual {
+                    return Err(
+                        "sign_hash attestation facts do not match required.attestation_facts_digest"
+                            .to_string(),
+                    );
+                }
+            }
+            key if key.starts_with("required.") => {
+                return Err(format!("unsupported required grant term '{key}'"));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 fn attestation_fact_str<'a>(attestation: &'a SigningAttestation, key: &str) -> Option<&'a str> {
     attestation.facts.get(key).and_then(|v| v.as_str())
 }
@@ -826,12 +880,40 @@ mod tests {
             issued_ms: u64,
             ttl_secs: u64,
         ) -> SealedApprovalGrant {
+            self.mint_grant_with_extra(
+                wallet,
+                action_id,
+                petal_id,
+                petal_digest,
+                allowed_sign_intents,
+                max_signatures,
+                issued_ms,
+                ttl_secs,
+                BTreeMap::new(),
+            )
+            .await
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        async fn mint_grant_with_extra(
+            &self,
+            wallet: &str,
+            action_id: &str,
+            petal_id: &str,
+            petal_digest: &str,
+            allowed_sign_intents: &[&str],
+            max_signatures: u32,
+            issued_ms: u64,
+            ttl_secs: u64,
+            extra: BTreeMap<String, serde_json::Value>,
+        ) -> SealedApprovalGrant {
             let env = sealed_envelope(wallet, action_id, petal_id, petal_digest);
             let mut terms = DaemonGrantTerms::minimal(AssuranceLevel::Standard);
             terms.allowed_sign_intents =
                 allowed_sign_intents.iter().map(|s| s.to_string()).collect();
             terms.max_signatures = max_signatures;
             terms.max_ttl_secs = ttl_secs;
+            terms.extra = extra;
             let mut snapshot = PetalPolicySnapshot::minimal(&env.header);
             snapshot.policy_version = 0;
             snapshot.caps.clear();
@@ -944,6 +1026,144 @@ mod tests {
         let denies = log.iter().filter(|r| r.kind == "petal.sign.deny").count();
         assert_eq!(oks, 1);
         assert_eq!(denies, 0);
+    }
+
+    #[tokio::test]
+    async fn sign_hash_honors_required_hash_and_facts_digest_terms() {
+        let h = Harness::new("my-wallet");
+        let att = h.attestation(
+            PETAL_ID_EVM_WALLET,
+            PLACEHOLDER_DIGEST_EVM_WALLET,
+            "evm.tx.sign",
+        );
+        let req = h.sign_request("my-wallet", "req_1", "evm.tx.sign");
+        let facts_digest = signing_attestation_facts_digest(&att.facts).unwrap();
+        let grant = h
+            .mint_grant_with_extra(
+                "my-wallet",
+                "req_1",
+                PETAL_ID_EVM_WALLET,
+                PLACEHOLDER_DIGEST_EVM_WALLET,
+                &["evm.tx.sign"],
+                1,
+                1_000,
+                120,
+                BTreeMap::from([
+                    (
+                        "required.signing_hash".into(),
+                        serde_json::json!(req.hash_hex.clone()),
+                    ),
+                    (
+                        "required.attestation_facts_digest".into(),
+                        serde_json::json!(facts_digest),
+                    ),
+                ]),
+            )
+            .await;
+
+        let sig = h.host.sign_hash(req, &att, 1_500).await.unwrap();
+
+        assert_eq!(sig.intent_hash, grant.intent_hash);
+        let active = h
+            .grant_store
+            .get_active(
+                "my-wallet",
+                "req_1",
+                PETAL_ID_EVM_WALLET,
+                PLACEHOLDER_DIGEST_EVM_WALLET,
+                1_500,
+            )
+            .await
+            .unwrap();
+        assert!(active.is_none(), "one-shot grant should be consumed");
+    }
+
+    #[tokio::test]
+    async fn sign_hash_denies_required_hash_mismatch_without_consuming_grant() {
+        let h = Harness::new("my-wallet");
+        h.mint_grant_with_extra(
+            "my-wallet",
+            "req_1",
+            PETAL_ID_EVM_WALLET,
+            PLACEHOLDER_DIGEST_EVM_WALLET,
+            &["evm.tx.sign"],
+            1,
+            1_000,
+            120,
+            BTreeMap::from([(
+                "required.signing_hash".into(),
+                serde_json::json!(format!("0x{}", "2".repeat(64))),
+            )]),
+        )
+        .await;
+        let att = h.attestation(
+            PETAL_ID_EVM_WALLET,
+            PLACEHOLDER_DIGEST_EVM_WALLET,
+            "evm.tx.sign",
+        );
+        let req = h.sign_request("my-wallet", "req_1", "evm.tx.sign");
+
+        let err = h.host.sign_hash(req, &att, 1_500).await.unwrap_err();
+
+        let msg = err.to_string();
+        assert!(msg.contains("required.signing_hash"), "{msg}");
+        let active = h
+            .grant_store
+            .get_active(
+                "my-wallet",
+                "req_1",
+                PETAL_ID_EVM_WALLET,
+                PLACEHOLDER_DIGEST_EVM_WALLET,
+                1_500,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(active.consumed_signature_count, 0);
+    }
+
+    #[tokio::test]
+    async fn sign_hash_denies_required_facts_digest_mismatch_without_consuming_grant() {
+        let h = Harness::new("my-wallet");
+        h.mint_grant_with_extra(
+            "my-wallet",
+            "req_1",
+            PETAL_ID_EVM_WALLET,
+            PLACEHOLDER_DIGEST_EVM_WALLET,
+            &["evm.tx.sign"],
+            1,
+            1_000,
+            120,
+            BTreeMap::from([(
+                "required.attestation_facts_digest".into(),
+                serde_json::json!("0".repeat(64)),
+            )]),
+        )
+        .await;
+        let att = h.attestation(
+            PETAL_ID_EVM_WALLET,
+            PLACEHOLDER_DIGEST_EVM_WALLET,
+            "evm.tx.sign",
+        );
+        let req = h.sign_request("my-wallet", "req_1", "evm.tx.sign");
+
+        let err = h.host.sign_hash(req, &att, 1_500).await.unwrap_err();
+
+        let msg = err.to_string();
+        assert!(msg.contains("required.attestation_facts_digest"), "{msg}");
+        let active = h
+            .grant_store
+            .get_active(
+                "my-wallet",
+                "req_1",
+                PETAL_ID_EVM_WALLET,
+                PLACEHOLDER_DIGEST_EVM_WALLET,
+                1_500,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(active.consumed_signature_count, 0);
     }
 
     // ── denial: no live grant ────────────────────────────────────────────────

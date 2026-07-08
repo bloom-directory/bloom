@@ -235,6 +235,12 @@ pub struct HyperliquidSigner {
 }
 
 impl HyperliquidSigner {
+    /// Construct a signer for Hyperliquid L1 exchange actions.
+    ///
+    /// This type is intended for approved API/agent keys. Owner-signed user
+    /// actions such as `approveAgent` and `usdSend` are deliberately exposed
+    /// only as action/hash builders so callers must route the digest through
+    /// Bloom's Sealed Approval host-signing path.
     pub fn new(signer: Arc<PrivateKeySigner>) -> Self {
         let address = signer.address();
         Self { signer, address }
@@ -264,69 +270,54 @@ impl HyperliquidSigner {
             .map_err(|e| HyperliquidError::signing(e.to_string()))?;
         Ok(SignatureJson::from_signature(&sig))
     }
+}
 
-    /// Sign a Hyperliquid **`usdSend`** (internal USDC transfer) — user-signed
-    /// EIP-712, same `HyperliquidSignTransaction` domain as `approveAgent`
-    /// (chainId = Arbitrum). Owner-only: agent keys cannot authorize transfers.
-    pub async fn sign_usd_send(
-        &self,
-        network: HyperliquidNetwork,
-        destination: Address,
-        amount: &str,
-        nonce: u64,
-    ) -> Result<(Value, SignatureJson)> {
-        let typed = usd_send_typed_data(network, destination, amount, nonce)?;
-        let hash = typed
-            .eip712_signing_hash()
-            .map_err(|e| HyperliquidError::signing(format!("eip712: {e}")))?;
-        let sig = self
-            .signer
-            .sign_hash(&hash)
-            .await
-            .map_err(|e| HyperliquidError::signing(e.to_string()))?;
-        let action = json!({
-            "type": "usdSend",
-            "hyperliquidChain": network.chain_name(),
-            "signatureChainId": format!("0x{:x}", network.signature_chain_id()),
-            "destination": format!("{destination:#x}"),
-            "amount": amount,
-            "time": nonce,
-        });
-        Ok((action, SignatureJson::from_signature(&sig)))
-    }
+pub fn usd_send_action_and_hash(
+    network: HyperliquidNetwork,
+    destination: Address,
+    amount: &str,
+    nonce: u64,
+) -> Result<(Value, B256)> {
+    let typed = usd_send_typed_data(network, destination, amount, nonce)?;
+    let hash = typed
+        .eip712_signing_hash()
+        .map_err(|e| HyperliquidError::signing(format!("eip712: {e}")))?;
+    let action = json!({
+        "type": "usdSend",
+        "hyperliquidChain": network.chain_name(),
+        "signatureChainId": format!("0x{:x}", network.signature_chain_id()),
+        "destination": format!("{destination:#x}"),
+        "amount": amount,
+        "time": nonce,
+    });
+    Ok((action, hash))
+}
 
-    /// Sign a Hyperliquid **`approveAgent`** action — a *user-signed* EIP-712
-    /// action (domain `HyperliquidSignTransaction`), distinct from the L1
-    /// order/cancel scheme in [`Self::sign_l1_action`]. One owner signature
-    /// approves an agent ("API") wallet that can trade but **cannot withdraw**.
-    /// Returns the `action` object to POST and its signature.
-    pub async fn sign_approve_agent(
-        &self,
-        network: HyperliquidNetwork,
-        agent_address: Address,
-        agent_name: Option<&str>,
-        nonce: u64,
-    ) -> Result<(Value, SignatureJson)> {
-        let agent_name = agent_name.unwrap_or("");
-        let typed = approve_agent_typed_data(network, agent_address, agent_name, nonce)?;
-        let hash = typed
-            .eip712_signing_hash()
-            .map_err(|e| HyperliquidError::signing(format!("eip712: {e}")))?;
-        let sig = self
-            .signer
-            .sign_hash(&hash)
-            .await
-            .map_err(|e| HyperliquidError::signing(e.to_string()))?;
-        let action = json!({
-            "type": "approveAgent",
-            "hyperliquidChain": network.chain_name(),
-            "signatureChainId": format!("0x{:x}", network.signature_chain_id()),
-            "agentAddress": format!("{agent_address:#x}"),
-            "agentName": agent_name,
-            "nonce": nonce,
-        });
-        Ok((action, SignatureJson::from_signature(&sig)))
-    }
+pub fn approve_agent_action_and_hash(
+    network: HyperliquidNetwork,
+    agent_address: Address,
+    agent_name: Option<&str>,
+    nonce: u64,
+) -> Result<(Value, B256)> {
+    let agent_name = agent_name.unwrap_or("");
+    let typed = approve_agent_typed_data(network, agent_address, agent_name, nonce)?;
+    let hash = typed
+        .eip712_signing_hash()
+        .map_err(|e| HyperliquidError::signing(format!("eip712: {e}")))?;
+    let action = json!({
+        "type": "approveAgent",
+        "hyperliquidChain": network.chain_name(),
+        "signatureChainId": format!("0x{:x}", network.signature_chain_id()),
+        "agentAddress": format!("{agent_address:#x}"),
+        "agentName": agent_name,
+        "nonce": nonce,
+    });
+    Ok((action, hash))
+}
+
+pub fn signature_json_from_raw(raw: &[u8]) -> Result<SignatureJson> {
+    let sig = Signature::from_raw(raw).map_err(|e| HyperliquidError::signing(e.to_string()))?;
+    Ok(SignatureJson::from_signature(&sig))
 }
 
 /// EIP-712 typed data for a user-signed `approveAgent` action.
@@ -874,20 +865,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn usd_send_signs_user_action_and_recovers_owner() {
+    async fn usd_send_builds_user_action_hash_for_host_signing() {
         let pk = "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
         let owner: PrivateKeySigner = pk.parse().unwrap();
         let owner_addr = owner.address();
-        let signer = HyperliquidSigner::new(Arc::new(owner));
         let dest: Address = "0x000000000000000000000000000000000000dead"
             .parse()
             .unwrap();
         let nonce = 1_700_000_001_000u64;
 
-        let (action, sig) = signer
-            .sign_usd_send(HyperliquidNetwork::Mainnet, dest, "100", nonce)
-            .await
-            .unwrap();
+        let (action, hash) =
+            usd_send_action_and_hash(HyperliquidNetwork::Mainnet, dest, "100", nonce).unwrap();
 
         assert_eq!(action["type"], "usdSend");
         assert_eq!(action["hyperliquidChain"], "Mainnet");
@@ -900,7 +888,8 @@ mod tests {
         assert_eq!(action["time"], nonce);
 
         let typed = usd_send_typed_data(HyperliquidNetwork::Mainnet, dest, "100", nonce).unwrap();
-        let hash = typed.eip712_signing_hash().unwrap();
+        assert_eq!(hash, typed.eip712_signing_hash().unwrap());
+        let sig = SignatureJson::from_signature(&owner.sign_hash(&hash).await.unwrap());
         let recovered = format!("0x{}{}{:02x}", &sig.r[2..], &sig.s[2..], sig.v)
             .parse::<Signature>()
             .unwrap()
@@ -910,21 +899,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn approve_agent_signs_user_action_and_recovers_owner() {
+    async fn approve_agent_builds_user_action_hash_for_host_signing() {
         // Fixed key so the typed-data hash / recovery is deterministic.
         let pk = "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
         let owner: PrivateKeySigner = pk.parse().unwrap();
         let owner_addr = owner.address();
-        let signer = HyperliquidSigner::new(Arc::new(owner));
         let agent: Address = "0x000000000000000000000000000000000000a9e7"
             .parse()
             .unwrap();
         let nonce = 1_700_000_000_000u64;
 
-        let (action, sig) = signer
-            .sign_approve_agent(HyperliquidNetwork::Mainnet, agent, Some("bot"), nonce)
-            .await
-            .unwrap();
+        let (action, hash) =
+            approve_agent_action_and_hash(HyperliquidNetwork::Mainnet, agent, Some("bot"), nonce)
+                .unwrap();
 
         // Mainnet user-signed actions sign on Arbitrum One (0xa4b1) per docs.
         assert_eq!(action["type"], "approveAgent");
@@ -944,7 +931,8 @@ mod tests {
         // (a self-computed pin would just assert our code against itself).
         let typed =
             approve_agent_typed_data(HyperliquidNetwork::Mainnet, agent, "bot", nonce).unwrap();
-        let hash = typed.eip712_signing_hash().unwrap();
+        assert_eq!(hash, typed.eip712_signing_hash().unwrap());
+        let sig = SignatureJson::from_signature(&owner.sign_hash(&hash).await.unwrap());
         let recovered = format!("0x{}{}{:02x}", &sig.r[2..], &sig.s[2..], sig.v)
             .parse::<Signature>()
             .unwrap()

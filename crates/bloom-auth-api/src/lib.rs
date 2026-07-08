@@ -37,6 +37,10 @@ pub const EVM_SEALED_INTENT_SUBJECT_KIND: &str = "evm_wallet_tx";
 pub const EVM_SIGNING_ATTESTATION_FACTS_SCHEMA_V1: &str = "bloom.evm.signing_facts.v1";
 /// EVM wallet signing intent.
 pub const EVM_TX_SIGN_INTENT: &str = "evm.tx.sign";
+/// Hyperliquid owner approval intent for authorizing an API-wallet agent.
+pub const HYPERLIQUID_APPROVE_AGENT_SIGN_INTENT: &str = "hyperliquid.approve_agent";
+/// Hyperliquid owner transfer intent for `usdSend`.
+pub const HYPERLIQUID_USD_SEND_SIGN_INTENT: &str = "hyperliquid.usd_send";
 /// Typed facts schema embedded in [`SigningAttestation::facts`] for the
 /// paid-HTTP (`paid-http`) signing intents (`x402.sign`, `paid-http.mpp.sign`).
 pub const PAID_HTTP_SIGNING_ATTESTATION_FACTS_SCHEMA_V1: &str = "bloom.paid_http.signing_facts.v1";
@@ -91,6 +95,8 @@ pub const APPROVAL_CHALLENGE_DOMAIN: &[u8] = b"bloom.approval.v1";
 pub const DAEMON_TERMS_DIGEST_DOMAIN: &[u8] = b"bloom.daemon_terms.v1";
 /// Domain tag for [`PetalPolicySnapshot::petal_policy_digest`].
 pub const PETAL_POLICY_DIGEST_DOMAIN: &[u8] = b"bloom.petal_policy.v1";
+/// Domain tag for binding structured signing facts into daemon grant terms.
+pub const SIGNING_ATTESTATION_FACTS_DIGEST_DOMAIN: &[u8] = b"bloom.signing_attestation.facts.v1";
 
 /// Hard ceiling on Sealed Approval Grant lifetime (§6.4 recommended default).
 pub const GRANT_MAX_TTL_MS: u64 = 120_000;
@@ -1546,6 +1552,15 @@ impl SigningAttestation {
     }
 }
 
+/// Collision-resistant, domain-tagged digest of a signing attestation facts
+/// map. The map is ordered so serde JSON output is deterministic.
+pub fn signing_attestation_facts_digest(
+    facts: &BTreeMap<String, serde_json::Value>,
+) -> Result<String, AuthApiError> {
+    let bytes = serde_json::to_vec(facts).map_err(AuthApiError::Json)?;
+    Ok(digest_hex(SIGNING_ATTESTATION_FACTS_DIGEST_DOMAIN, &bytes))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EvmSealedActionKind {
@@ -2393,8 +2408,8 @@ impl DefaultAttestationRegistry {
                 | (PETAL_ID_POLYMARKET, POLYMARKET_BUILDER_KEY_SIGN_INTENT)
                 | (PETAL_ID_POLYMARKET, POLYMARKET_REVOCATION_SIGN_INTENT)
                 | (PETAL_ID_POLYMARKET, POLYMARKET_FUNDING_SIGN_INTENT)
-                | (PETAL_ID_HYPERLIQUID, "hyperliquid.approve_agent")
-                | (PETAL_ID_HYPERLIQUID, "hyperliquid.usd_send")
+                | (PETAL_ID_HYPERLIQUID, HYPERLIQUID_APPROVE_AGENT_SIGN_INTENT)
+                | (PETAL_ID_HYPERLIQUID, HYPERLIQUID_USD_SEND_SIGN_INTENT)
                 | (PETAL_ID_HYPERLIQUID, "hyperliquid.order")
                 | (PETAL_ID_HYPERLIQUID, "hyperliquid.cancel")
                 | (PETAL_ID_WALLET_POLICY, "wallet_policy.sign")

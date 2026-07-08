@@ -97,10 +97,14 @@ Per-session:
 
 The intent is:
 
-1. the owner wallet signs `approveAgent` once;
-2. Bloom mints an ephemeral Hyperliquid API wallet;
-3. the daemon keeps only the ephemeral agent key in memory;
-4. session writes use the agent key, but every action still passes the wallet's
+1. Bloom stages a sealed `approveAgent` action for the exact session id and
+   policy snapshot;
+2. the daemon writes `approval_challenge.json` with a stable `ceremony_url`;
+3. the user grants the sealed action in the browser ceremony;
+4. Bloom signs the Hyperliquid owner hash through PetalHost only while that
+   grant is active;
+5. Bloom mints an ephemeral Hyperliquid API wallet;
+6. session writes use the agent key, but every action still passes the wallet's
    verified `[hyperliquid]` policy and the session lifecycle gate.
 
 ## Policy boundary
@@ -142,7 +146,8 @@ creates standing venue authority until it expires or is replaced.
 
 Bloom's model is:
 
-- owner signs `approveAgent`
+- owner `approveAgent` signatures are produced only through Sealed Approval
+  host signing; raw wallet signer fallback is disabled
 - daemon holds the ephemeral API-wallet key only in memory by default
 - session lifecycle enforces TTL and cumulative session state
 - the session monitor can trigger `cancel_all` or `close_all`
@@ -176,8 +181,8 @@ Restart/crash lifecycle:
 - if the daemon restarts, the session becomes orphaned because the ephemeral
   agent key lived in memory
 - orphaned sessions report `tradable: false`
-- recovery is explicit and owner-signed through `orphan_cancel_all` or
-  `orphan_close_all`
+- owner-signed orphan recovery is disabled until it is routed through Sealed
+  Approval host signing
 
 This is a deliberate authority boundary: Bloom does not auto-take owner-key
 cleanup actions on startup.
@@ -202,9 +207,11 @@ Implemented but not fully hardened:
 
 Good review targets for this PR:
 
-- direct writes cannot bypass the `[hyperliquid]` policy gate
+- direct owner signing cannot bypass the Sealed Approval grant and
+  `[hyperliquid]` policy gates
 - session writes pass both policy and lifecycle checks
 - forced cleanup can still flatten after a later policy change
-- orphaned-session cleanup uses the owner key, not the missing agent key
-- `approveAgent` signing matches Hyperliquid's documented EIP-712 shape
+- orphaned-session cleanup cannot use stale direct owner-signing fallbacks
+- `approveAgent` signing matches Hyperliquid's documented EIP-712 shape and is
+  reached only through PetalHost signing
 - operator-facing docs and VFS hints match the real exported paths
