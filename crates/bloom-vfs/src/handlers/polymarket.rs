@@ -43,7 +43,12 @@ pub const MARKETS_LIST_LIMIT: u32 = 20;
 
 const MARKET_FILES: [&str; 3] = ["market.json", "book.json", "prices.json"];
 const POSITION_FILES: [&str; 3] = ["positions.json", "trades.json", "activity.json"];
-const ONBOARD_RO_FILES: [&str; 3] = ["status.json", "plan.md", "approvals.json"];
+const ONBOARD_RO_FILES: [&str; 4] = [
+    "status.json",
+    "plan.md",
+    "approvals.json",
+    APPROVAL_CHALLENGE_FILE,
+];
 const ACCOUNT_FILES: [&str; 5] = [
     "portfolio.json",
     "orders.json",
@@ -2083,7 +2088,17 @@ impl PolymarketHandler {
                 1 => Ok(Entry::dir("onboard")),
                 2 => Ok(Entry::dir(&segs[1])),
                 3 if segs[2] == "begin" => Ok(Entry::writable_file("begin")),
-                3 if ONBOARD_RO_FILES.contains(&segs[2].as_str()) => Ok(Entry::file(&segs[2])),
+                3 if ONBOARD_RO_FILES.contains(&segs[2].as_str()) => {
+                    if segs[2] == APPROVAL_CHALLENGE_FILE {
+                        let ob = self.onboarding_or_not_found(path)?;
+                        let challenge_path = polymarket_onboard_auth_dir(&ob.auth_dir, &segs[1])?
+                            .join(APPROVAL_CHALLENGE_FILE);
+                        if !challenge_path.exists() {
+                            return Err(HandlerError::not_found(path.to_string_path()));
+                        }
+                    }
+                    Ok(Entry::file(&segs[2]))
+                }
                 _ => Err(HandlerError::not_found(path.to_string_path())),
             },
             "account" if self.onboarding_wired() => match segs.len() {
@@ -2595,6 +2610,14 @@ impl PolymarketHandler {
             }
             "plan.md" => Ok(render_onboard_plan_md(&st).into_bytes()),
             "approvals.json" => pretty(&ob.onboarder.approval_preview(owner)),
+            APPROVAL_CHALLENGE_FILE => {
+                let challenge_path = polymarket_onboard_auth_dir(&ob.auth_dir, wallet)?
+                    .join(APPROVAL_CHALLENGE_FILE);
+                std::fs::read(&challenge_path).map_err(|e| match e.kind() {
+                    std::io::ErrorKind::NotFound => HandlerError::NotAFile(path.to_string_path()),
+                    _ => HandlerError::Io(e),
+                })
+            }
             _ => Err(HandlerError::NotAFile(path.to_string_path())),
         }
     }
@@ -3405,9 +3428,15 @@ impl PolymarketHandler {
                 self.list_keystore_wallets()
             }
             (Some("onboard"), 2) => {
-                self.onboarding_or_not_found(path)?;
+                let ob = self.onboarding_or_not_found(path)?;
                 let mut entries: Vec<Entry> =
                     ONBOARD_RO_FILES.iter().map(|f| Entry::file(f)).collect();
+                entries.retain(|entry| {
+                    entry.name != APPROVAL_CHALLENGE_FILE
+                        || polymarket_onboard_auth_dir(&ob.auth_dir, &segs[1])
+                            .map(|dir| dir.join(APPROVAL_CHALLENGE_FILE).exists())
+                            .unwrap_or(false)
+                });
                 entries.push(Entry::writable_file("begin"));
                 Ok(entries)
             }
@@ -4251,6 +4280,22 @@ key = "builder-key-2"
             serde_json::from_slice(&std::fs::read(&challenge_path).unwrap()).unwrap();
         assert_eq!(challenge["surface"], "polymarket");
         assert_eq!(challenge["petal_id"], petal_identity::PETAL_ID_POLYMARKET);
+
+        let entries = handler.list(&p("/onboard/alice")).await.unwrap();
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.name == APPROVAL_CHALLENGE_FILE),
+            "approval_challenge.json must be listed after staging"
+        );
+        let projected: serde_json::Value = serde_json::from_slice(
+            &handler
+                .read(&p("/onboard/alice/approval_challenge.json"))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(projected, challenge);
     }
 
     #[tokio::test]
