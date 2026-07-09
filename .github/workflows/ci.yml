@@ -89,8 +89,11 @@ jobs:
   build_test_archive:
     name: build test archive
     runs-on: ubuntu-latest
+    # No CARGO_BUILD_JOBS cap: public-repo ubuntu-latest is a 4-vCPU runner, so
+    # letting cargo default to nproc uses all cores instead of throttling this
+    # critical-path build to 2. The disk-cleanup step below provides the
+    # headroom the old "2" cap was compensating for.
     env:
-      CARGO_BUILD_JOBS: "2"
       RUSTC_WRAPPER: sccache
       SCCACHE_GHA_ENABLED: "true"
     steps:
