@@ -47,6 +47,10 @@ Read `/hyperliquid/README.md` for Hyperliquid trading (session-first).
 Read `/polymarket/README.md` for prediction-market trading.
 Read `/defi/README.md` for DeFi intents via Enso shortcuts.
 
+## Wallets
+
+When asked for an address for a certain wallet, consider displaying in-line the QR code image for the relevant wallet e.g. `/wallets/<wallet>/address.qr.png`.
+
 ## Mounted Sealed Approval flow
 
 When working through a mounted tree, a confirm write that needs fresh owner
