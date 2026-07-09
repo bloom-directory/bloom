@@ -188,6 +188,8 @@ jobs:
       - uses: actions/checkout@v6
       - name: Install Rust toolchain
         run: rustup show
+      - name: Install wasm target
+        run: rustup target add wasm32-unknown-unknown
       - name: Install cargo-nextest
         uses: taiki-e/install-action@nextest
       - name: Install wasm-tools
