@@ -8,9 +8,9 @@ Workspace: `bloom` (root `/home/joshua/code/bloom`)
 
 These overrides win over any conflicting recommendation later in the document:
 
-1. **New crate `crates/bloom-rpc`** — not a submodule in `bloom-evm`. All paths
-   under `crates/bloom-evm/src/rpc/` in §C.1 and §E read instead as
-   `crates/bloom-rpc/src/`. `bloom-evm` adds `bloom-rpc` as a workspace dep.
+1. **New crate `crates/bloom-rpc`** — not a submodule in `bloom-chain`. All paths
+   under `crates/bloom-chain/src/rpc/` in §C.1 and §E read instead as
+   `crates/bloom-rpc/src/`. `bloom-chain` adds `bloom-rpc` as a workspace dep.
 2. **Tx-staging sessions are always-on.** No `[backends] tx_session` config knob.
    `TxEngine::stage_*` unconditionally opens a session.
 3. **Reorg-dedupe ring buffer in `bloom-watch`** — last 64 blocks of
@@ -43,7 +43,7 @@ becomes a stack: `RpcClient` over `tower::ServiceBuilder` of
 
 ## A. Current state audit
 
-### A.1 `crates/bloom-evm/src/lib.rs`
+### A.1 `crates/bloom-chain/src/lib.rs`
 
 **Construction (line 125–144).** `ChainClient::new(spec: ChainSpec)`:
 
@@ -94,7 +94,7 @@ abstraction must keep `provider()` returning *something* that satisfies
 (`AllEndpointsFailed`) without breaking matchers — every match on the
 type uses `Err(_)` or wildcards.
 
-**No retry/timeout/backoff** lives in `bloom-evm`. The only existing
+**No retry/timeout/backoff** lives in `bloom-chain`. The only existing
 timeout is in `bloom-vfs/src/handlers/status.rs:191` (a `PING_TIMEOUT`
 guard around `client.block_number()` for the status probe). That probe
 caches per-chain in a 5-minute TTL.
@@ -131,7 +131,7 @@ available the executor stays on the wall-clock interval.
 ### A.3 Provider/transport instantiation across the workspace
 
 ```
-crates/bloom-evm/src/lib.rs:138    RootProvider::<Ethereum>::new_http(url)   // sole real instantiation
+crates/bloom-chain/src/lib.rs:138    RootProvider::<Ethereum>::new_http(url)   // sole real instantiation
 ```
 
 `grep` finds no other `ProviderBuilder::new`, `WsConnect`, `new_ws`,
@@ -143,7 +143,7 @@ flows everywhere.
 
 ### A.4 Existing health / timeout / retry handling
 
-- **None inside `bloom-evm`.**
+- **None inside `bloom-chain`.**
 - `bloom-vfs/src/handlers/status.rs` has its own `probe_chain` with a
   `PING_TIMEOUT` and 5-minute cache. This is observation only, not a
   health driver.
@@ -215,7 +215,7 @@ you observe a regression. alloy makes no guarantee here.
 
 ### B.3 Recommendation: extend with a wrapping layer in a new module
 
-**Pick:** Add a new module `crates/bloom-evm/src/rpc/` (no new crate
+**Pick:** Add a new module `crates/bloom-chain/src/rpc/` (no new crate
 yet). Build the alloy layer stack inside `ChainClient::new`. Add a
 **`Session` type** for state-drift control. Defer a separate
 `bloom-rpc` crate until we either (a) want pub use beyond bloom, or
@@ -223,11 +223,11 @@ yet). Build the alloy layer stack inside `ChainClient::new`. Add a
 
 Rationale:
 
-- `bloom-evm` is already the only consumer of `RootProvider`.
-  Extracting now creates a circular concern: `bloom-evm` would
+- `bloom-chain` is already the only consumer of `RootProvider`.
+  Extracting now creates a circular concern: `bloom-chain` would
   re-export the new crate's types verbatim because the call sites
   call `client.balance()`, not `pool.balance()`.
-- Putting the pool inside `bloom-evm` keeps the diff small. The new
+- Putting the pool inside `bloom-chain` keeps the diff small. The new
   module pattern (file per concern: `rpc/transport.rs`,
   `rpc/health.rs`, `rpc/session.rs`) signals "this could be its own
   crate" if usage grows.
@@ -241,7 +241,7 @@ Tradeoffs:
 | Approach                     | Pro | Con |
 |------------------------------|-----|-----|
 | Use alloy `FallbackLayer` directly, no Bloom code | minimum work, ~50 LOC change | no state-drift solution; rate-limit policy stuck on default; no active probes |
-| Wrapping module in `bloom-evm` (recommended) | one place to evolve; reuses alloy primitives where they suffice | mixes "RPC engine" concerns into a crate that also has chain semantics |
+| Wrapping module in `bloom-chain` (recommended) | one place to evolve; reuses alloy primitives where they suffice | mixes "RPC engine" concerns into a crate that also has chain semantics |
 | New `bloom-rpc` crate | clean boundary, reusable | premature; forces every other crate to add a dep just for `Provider` shape |
 
 ---
@@ -251,7 +251,7 @@ Tradeoffs:
 ### C.1 Module / file layout
 
 ```
-crates/bloom-evm/src/
+crates/bloom-chain/src/
 ├── lib.rs                       // ChainClient (slimmed: kept signatures, body delegates to rpc::*)
 └── rpc/
     ├── mod.rs                   // pub use's; the "engine" surface
@@ -691,7 +691,7 @@ change, only the inner transport.
 
 ### D.1 Unit (no network)
 
-Located in `crates/bloom-evm/src/rpc/tests.rs`. Use alloy's
+Located in `crates/bloom-chain/src/rpc/tests.rs`. Use alloy's
 `MockTransport` (the same testing tool `alloy-transport`'s own
 `fallback.rs` uses).
 
@@ -804,12 +804,12 @@ matters where called out; otherwise parallelisable.
 ### WP-2: alloy stack + multi-endpoint failover — DEPENDS ON WP-1
 
 **Touches:**
-- `crates/bloom-evm/src/rpc/mod.rs`, `transport.rs`, `policy.rs`,
+- `crates/bloom-chain/src/rpc/mod.rs`, `transport.rs`, `policy.rs`,
   `endpoint.rs`, `health.rs` (new files; `health.rs` here is a stub —
   full implementation in WP-3).
-- `crates/bloom-evm/src/lib.rs::ChainClient::new`: replace
+- `crates/bloom-chain/src/lib.rs::ChainClient::new`: replace
   `RootProvider::<Ethereum>::new_http(url)` with the layered stack.
-- `crates/bloom-evm/Cargo.toml`: enable `transport-throttle` feature
+- `crates/bloom-chain/Cargo.toml`: enable `transport-throttle` feature
   on `alloy` (workspace `alloy.features`). Confirm `governor` pulls
   cleanly under our toolchain (1.85 stable).
 
@@ -823,10 +823,10 @@ unchanged), `bloom-watch`, `bloom-tx`, `bloom-vfs`.
 ### WP-3: active health + cooldown observability — DEPENDS ON WP-2
 
 **Touches:**
-- `crates/bloom-evm/src/rpc/health.rs`: full `EndpointHealth`,
+- `crates/bloom-chain/src/rpc/health.rs`: full `EndpointHealth`,
   scoring, cooldown state machine, active probe loop spawned in
   `ChainClient::new`.
-- `crates/bloom-evm/src/lib.rs`: add `pub fn endpoints(&self) ->
+- `crates/bloom-chain/src/lib.rs`: add `pub fn endpoints(&self) ->
   Vec<EndpointHealthSnapshot>`.
 - `crates/bloom-vfs/src/handlers/status.rs`: new VFS leaves
   `chains/<n>/endpoints/<idx>/{url,score,cooldown_until,latency_ms,success_rate}`.
@@ -842,7 +842,7 @@ task that doesn't intercept calls.
 ### WP-4: WebSocket subscriptions in `bloom-watch` — INDEPENDENT OF WP-3, NEEDS WP-2
 
 **Touches:**
-- `crates/bloom-evm/src/lib.rs`: add
+- `crates/bloom-chain/src/lib.rs`: add
   `pub fn supports_subscriptions(&self) -> bool`.
 - `crates/bloom-watch/src/executor.rs`: split `start` into
   `start_block_loop`, `start_log_loop`, etc., each one preferring
@@ -864,8 +864,8 @@ sampling code (they keep the poll body but become triggered by
 ### WP-5: `Session` for state-pinned reads — DEPENDS ON WP-2, OPTIONALLY WP-3
 
 **Touches:**
-- `crates/bloom-evm/src/rpc/session.rs`: full `Session` impl.
-- `crates/bloom-evm/src/lib.rs`: `pub async fn open_session(&self)`.
+- `crates/bloom-chain/src/rpc/session.rs`: full `Session` impl.
+- `crates/bloom-chain/src/lib.rs`: `pub async fn open_session(&self)`.
 - `crates/bloom-tx/src/tx_engine.rs::TxEngine::stage_*`: opt-in
   conversion of the multi-call bundle (`nonce + balance + gas_price +
   code + chain_id`) to use a session. Behind a feature flag /
@@ -898,8 +898,8 @@ WP-3, WP-4, WP-5 can run in parallel after WP-2 lands.
 
 ### F.1 Decisions the user owns
 
-1. **New crate or stay in `bloom-evm`?** Recommendation: stay in
-   `bloom-evm` under `rpc/` for the first cut. If the module exceeds
+1. **New crate or stay in `bloom-chain`?** Recommendation: stay in
+   `bloom-chain` under `rpc/` for the first cut. If the module exceeds
    ~1500 LOC or `bloom-defi` / `bloom-ens` start wanting it standalone,
    extract to `bloom-rpc` later. Either path works; downstream code
    doesn't care because everyone goes through `ChainClient`.
@@ -959,7 +959,7 @@ WP-3, WP-4, WP-5 can run in parallel after WP-2 lands.
   `ChainSpec::endpoints()` for forward compatibility, but doing so is
   a separate cleanup that doesn't block functional work. Status
   handler's `redact_url` becomes "redact each endpoint URL" — easy.
-- `crates/bloom-evm/src/lib.rs::tests::missing_endpoints_error`
+- `crates/bloom-chain/src/lib.rs::tests::missing_endpoints_error`
   expects an error when `rpc_urls` is empty. After WP-1, with
   `rpc_endpoints` also empty, the same error fires. Update assertion
   to test both paths.

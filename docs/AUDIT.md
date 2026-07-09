@@ -69,7 +69,7 @@ data or rely on their own internal caches, e.g. the etherscan client).
 | Surface | VFS path(s) | Status | Implementation / Tests |
 |---|---|---|---|
 | Chains: head/safe/finalized, gas, fee history, eth_call, receipts, tx lookups, logs | `chains/<chain>/...` | shipped | `crates/bloom-vfs/src/handlers/chains.rs` + `chains_history.rs` |
-| ERC-20 reads (balance / symbol / decimals) | `chains/<chain>/addresses/<a>/tokens/<token>/{balance,balance.raw,balance.json,symbol,decimals}` | shipped | `chains.rs` + `crates/bloom-evm/src/lib.rs::ChainClient::erc20_*` |
+| ERC-20 reads (balance / symbol / decimals) | `chains/<chain>/addresses/<a>/tokens/<token>/{balance,balance.raw,balance.json,symbol,decimals}` | shipped | `chains.rs` + `crates/bloom-chain/src/lib.rs::ChainClient::erc20_*` |
 | Tx lookups | `chains/<chain>/tx/<hash>/{receipt.json,status,block_number,gas_used,logs.json,full.json}` | shipped | `chains.rs` (eth_getTransactionByHash + receipt) |
 | Etherscan history (txs, internal, ERC-20, ERC-721, source, abi) | `chains/<chain>/addresses/<a>/{txs,internal_txs,erc20_txs,erc721_txs}` and `chains/<chain>/contracts/<a>/{source,abi}` | shipped | `chains_history.rs` + `crates/bloom-etherscan/src/lib.rs` (TTL cache in `cache.rs`) |
 | Wallets: VFS-driven creation (local / import / watch) | `wallets/new` (writable) | shipped | `wallets.rs::write_new_wallet` + `parse_new_wallet_spec` |
@@ -85,7 +85,7 @@ data or rely on their own internal caches, e.g. the etherscan client).
 | Address book (petname round-trip) | `addressbook/{<alias>,new}` | shipped | `crates/bloom-vfs/src/handlers/addressbook.rs` + `crates/bloom-proto/src/address.rs` |
 | Prices (DefiLlama, keyless) | `prices/{spot/<coin>(.usd),change_24h/<coin>}` | shipped | `crates/bloom-vfs/src/handlers/prices.rs` + `crates/bloom-prices/src/lib.rs` |
 | ENS forward resolution surface | `ens/<name>.eth` | shipped | ENS handler (forward resolve via `crates/bloom-ens` against the canonical mainnet registry) |
-| NFTs (`addresses/<a>/nfts/...`, `contracts/<a>/nft/...`) | — | shipped | `crates/bloom-vfs/src/handlers/chains_nfts.rs` + chains.rs routing. Per-holder views (`erc721_txs`, `erc1155_txs`, `owned.json`, per-token `owner/uri/metadata.json/balance/is_owner/approved`) and collection views (`kind`, `name`, `symbol`, `total_supply`, `owner_of/<id>`, `token_uri/<id>`, `is_approved_for_all/<o>/<op>`). ERC-721 vs ERC-1155 auto-detected via ERC-165 (cached). ERC-1155 `{id}` placeholder substitution applied; metadata.json supports `data:`, `ipfs://`, `http(s)://`. ChainClient NFT helpers in `crates/bloom-evm/src/lib.rs`; ERC-1155 transfer history via `crates/bloom-etherscan/src/lib.rs::get_nft1155_tx`. Writes (transfers / per-token approve / set-approval-for-all) flow through the wallet outbox — see the wallets row. |
+| NFTs (`addresses/<a>/nfts/...`, `contracts/<a>/nft/...`) | — | shipped | `crates/bloom-vfs/src/handlers/chains_nfts.rs` + chains.rs routing. Per-holder views (`erc721_txs`, `erc1155_txs`, `owned.json`, per-token `owner/uri/metadata.json/balance/is_owner/approved`) and collection views (`kind`, `name`, `symbol`, `total_supply`, `owner_of/<id>`, `token_uri/<id>`, `is_approved_for_all/<o>/<op>`). ERC-721 vs ERC-1155 auto-detected via ERC-165 (cached). ERC-1155 `{id}` placeholder substitution applied; metadata.json supports `data:`, `ipfs://`, `http(s)://`. ChainClient NFT helpers in `crates/bloom-chain/src/lib.rs`; ERC-1155 transfer history via `crates/bloom-etherscan/src/lib.rs::get_nft1155_tx`. Writes (transfers / per-token approve / set-approval-for-all) flow through the wallet outbox — see the wallets row. |
 | Mempool (`chains/<c>/mempool/...`) | `chains/<c>/mempool/{status.json,live,recent.jsonl,by_address/<a>/...,by_pool/<a>/recent.jsonl,<hash>/{tx,decoded,status}}` | shipped | `crates/bloom-mempool/` + `crates/bloom-vfs/src/handlers/chains_mempool.rs`; per-chain `[mempool.<chain>]` config selects WS provider (`alchemy`, `generic_eth_subscribe`). See "Mempool, private orderflow, gas-bump, MEV warnings" section below for the full per-path map. |
 | Contract methods / events / storage / proxy subtrees | `chains/<c>/contracts/<a>/{methods,events,storage,proxy}/...` | shipped | `crates/bloom-vfs/src/handlers/chains_contracts.rs` — ABI-driven `methods/<m>.{read,tx,sig}` (writable JSON body, eth_call + decode, no broadcast), `events/<e>/{recent,query,live}` (eth_getLogs + alloy log decoding, per-(chain,addr,event) live cursor), `storage/<slot>` and `proxy/{implementation,admin,beacon}` (EIP-1967 + EIP-1822). Methods/events gated behind `contract_metadata = etherscan` (ABI source); storage/proxy stay RPC-only. ABI cache TTL 60s. |
 
@@ -222,7 +222,7 @@ crates/
 ├── bloom                # CLI (clap)
 ├── bloom-daemon         # Daemon orchestration + UDS IPC + ENS adapter + watch start
 ├── bloom-vfs            # Path router + 11 handler modules
-├── bloom-evm          # alloy provider pool, ChainRegistry, ERC-20 reads
+├── bloom-chain          # alloy provider pool, ChainRegistry, ERC-20 reads
 ├── bloom-tx             # Tx engine, intent parser, policy_engine, RecipientResolver, PriceOracle, Outbox (rolling-USD)
 ├── bloom-keystore       # argon2id + chacha20poly1305 encrypted keystore
 ├── bloom-defi           # Enso shortcuts client + natural-language intent parser

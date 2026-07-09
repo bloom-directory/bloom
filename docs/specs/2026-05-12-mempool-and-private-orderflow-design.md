@@ -175,7 +175,7 @@ chains/<chain>/mempool/
 │   ├── pending.jsonl            # txs in mempool from-or-to this address
 │   └── nonces.json              # {"next_unused": N, "observed": [N, N+1, …]}
 ├── by_pool/<pool_addr>/
-│   └── recent.jsonl             # pending swaps touching this removed pool
+│   └── recent.jsonl             # pending swaps touching this DEX pool
 └── <tx_hash>/                   # JIT — appears only if observed
     ├── tx.json
     ├── decoded.json             # ABI-decoded if the contract has a cached ABI; else null
@@ -338,7 +338,7 @@ rejection is one bool flag away if we need it later.
 Pure function. Two cheap checks:
 
 1. **Decoded-swap slippage exposure** — if calldata decodes against
-   a known removed router (Uniswap V2/V3/V4, Aerodrome, Curve in v1),
+   a known DEX router (Uniswap V2/V3/V4, Aerodrome, Curve in v1),
    extract `amountOutMin` and `path`. Fetch current quote via the
    existing `prices` crate or a direct `eth_call` to the router's
    quoter. If `(quoted - amountOutMin) / quoted > policy.mev.max_slippage_bps`,
@@ -524,7 +524,7 @@ clear "not configured" error other absent-backend trees do.
 
 1. **Pure-function unit tests** (in-crate, the bulk of LoC):
    - `heuristic::evaluate` — table-driven over hand-crafted swap
-     calldata fixtures for each supported removed router.
+     calldata fixtures for each supported DEX router.
    - `bump::compute_replacement_fees` — EIP-1559 +12.5 % math and
      rounding edge cases (1 wei, large gas, legacy txs).
    - `PendingTxIndex` — insert/evict/lookup, LRU bound,
@@ -585,7 +585,7 @@ doesn't depend on later phases shipping.
 2. `PendingTxIndex` + `provider_test_suite!()` macro.
 3. `MempoolProvider` trait + `MockMempoolProvider` (fixture-fed).
 4. `PrivateRpcProvider` trait + `MockPrivateRpcProvider`.
-5. `heuristic::evaluate` + removed router fixtures + unit tests.
+5. `heuristic::evaluate` + DEX router fixtures + unit tests.
 6. `bump::compute_replacement_fees` + unit tests.
 
 **Phase 2 — VFS surface**

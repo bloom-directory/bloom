@@ -1,0 +1,41 @@
+[
+  {
+    "id": "mechanistic-1",
+    "hypothesis": "The mechanism that makes NL->predicate secure is a SOUND DETERMINISTIC CHECKER closing the loop on an unreliable generator: single-shot LLM formalization is low-fidelity, but correctness is recoverable from a candidate set whenever a sound deciding gate (symbolic-equivalence selection, an external prover, or replay) selects among candidates — so faithfulness gains come from the soundness of the gate, not the scale of the generator.",
+    "rationale": "'Autoformalization with Large Language Models' reports strong models perfectly formalize only ~25% of statements at pass@1, so most single outputs are wrong-but-valid. 'Autoformalize Mathematical Statements by Symbolic Equivalence and Semantic Consistency' recovers faithful formalizations by scoring candidates with ATP-checked symbolic equivalence + semantic consistency, sharply raising pass@1. 'Agentic Model Checking' formalizes the split as 'agents propose, solvers verify' — the deterministic backend discharges every soundness-relevant decision. This is the same architecture an on-chain deterministic gate would provide.",
+    "supports_if": "Across the corpus, measured faithfulness/accuracy gains track the ADDITION of a sound deciding gate (equivalence/prover/replay over candidates) rather than generator scale; pass@k with a sound selector substantially exceeds pass@1, and removing the gate erases the gain.",
+    "refutes_if": "Accuracy gains track generator scale/prompting rather than gate soundness, OR no sound gate yields the candidate-selection gains (i.e. a cheap non-sound heuristic does just as well), undercutting the claim that the gate's SOUNDNESS is the operative mechanism.",
+    "motivating_papers": [
+      "Autoformalization with Large Language Models",
+      "Autoformalize Mathematical Statements by Symbolic Equivalence and Semantic Consistency",
+      "Agentic Model Checking",
+      "LINC: A Neurosymbolic Approach for Logical Reasoning by Combining Language Models with First-Order Logic Provers"
+    ]
+  },
+  {
+    "id": "mechanistic-2",
+    "hypothesis": "A restricted, total/decidable representation pays off TWICE with one mechanism: by shrinking the space of expressible-but-unintended predicates it lowers intent error, and by guaranteeing terminating deterministic evaluation it supplies exactly the property an on-chain consensus gate requires — so representation restriction is simultaneously a faithfulness lever and the determinism guarantee.",
+    "rationale": "Controlled-NL grammars ('Developing controlled natural language for formal specification patterns using AI assistants') and decidable finite-trace fragments ('First-Order Temporal Logic on Finite Traces: Semantic Properties, Decidable Fragments, and Applications') bound what can be said and guarantee decidable evaluation. Declarative contract DSLs enable automatic inductive-invariant inference ('Safety Verification of Declarative Smart Contracts'), and 'Agentic Model Checking' relies on a restricted DSL that lowers deterministically to assume/assert primitives. The single mechanism is grammar restriction; both benefits fall out of it.",
+    "supports_if": "Restricted/decidable representations show BOTH lower intent-error (fewer expressible-but-wrong predicates, easier human checking) AND total/deterministic bounded evaluation, while more expressive representations lose determinism or decidable equivalence at equal fidelity.",
+    "refutes_if": "Expressive (SMT/full-Turing) representations match restricted ones on intent fidelity at equal determinism and resource bounds — i.e. restriction buys the determinism property but yields no faithfulness advantage, so the 'pays off twice with one mechanism' claim fails.",
+    "motivating_papers": [
+      "Developing controlled natural language for formal specification patterns using AI assistants",
+      "First-Order Temporal Logic on Finite Traces: Semantic Properties, Decidable Fragments, and Applications",
+      "Safety Verification of Declarative Smart Contracts",
+      "Agentic Model Checking"
+    ]
+  },
+  {
+    "id": "mechanistic-3",
+    "hypothesis": "A predicate is a citable SHARED REFERENT only when bidirectionally anchored — deterministically executable on-chain AND back-translatable to the NL fragment — with counterexample witnesses as the binding evidence; round-trip agreement is the mechanism that makes the human claim and the machine predicate the same object.",
+    "rationale": "'nl2spec' maps subformulas back to NL so ambiguity surfaces and is repaired; 'Trustworthy Formal Natural Language Specifications' supplies an auditable formal-English subset with certificates of interpretation; 'Neuroforger: certified violation witnesses for smart contracts verification via LLMs' makes the binding evidence a concrete replayable witness; 'PropertyGPT' validates generated properties against an external oracle; mutation operators ('Mutation Testing for Ethereum Smart Contract') measure whether a predicate is under-constrained. The mechanism: bidirectional anchoring + witnesses turns a predicate into a referent humans, LLMs, and the chain can all point at.",
+    "supports_if": "Predicates that are both on-chain-executable and back-translatable, accompanied by replayable witnesses, are the ones humans/arbiters can adjudicate consistently; round-trip (back-translation) agreement predicts human-judged intent faithfulness.",
+    "refutes_if": "Round-trip / back-translation agreement fails to predict human-judged intent faithfulness (predicates that round-trip cleanly are no more faithful than those that don't), so bidirectional anchoring is not the operative mechanism for shared reference.",
+    "motivating_papers": [
+      "nl2spec: Interactively Translating Unstructured Natural Language to Temporal Logics with Large Language Models",
+      "Trustworthy Formal Natural Language Specifications",
+      "Neuroforger: certified violation witnesses for smart contracts verification via LLMs",
+      "PropertyGPT: LLM-driven Formal Verification of Smart Contracts through Retrieval-Augmented Property Generation"
+    ]
+  }
+]
