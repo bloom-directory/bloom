@@ -1143,7 +1143,7 @@ impl Handler for RequestsHandler {
             [one] if one == "new" || one == "new.dry-run" => Ok(Entry::writable_file(one)),
             [one] if one == "latest" => {
                 let mut entry = Entry::symlink("latest", &self.latest_target());
-                if let Some(modified) = fs_path_modified(&self.latest_path())? {
+                if let Some(modified) = fs_path_modified(self.latest_path())? {
                     entry = entry.with_modified(modified);
                 }
                 Ok(entry)
@@ -1176,7 +1176,7 @@ impl Handler for RequestsHandler {
             [state, _id, name] if matches!(state.as_str(), "pending" | "sent" | "failed") => {
                 if matches!(name.as_str(), "confirm" | "cancel") {
                     let mut entry = Entry::writable_file(name);
-                    if let Some(modified) = fs_path_modified(&self.req_dir(state, _id))? {
+                    if let Some(modified) = fs_path_modified(self.req_dir(state, _id))? {
                         entry = entry.with_modified(modified);
                     }
                     Ok(entry)
