@@ -70,6 +70,18 @@ pub struct StagedTx {
     /// can sum historical sends without re-querying prices.
     #[serde(default)]
     pub usd_value: Option<f64>,
+    /// Outbox id of a tx on the **same chain** that must mine successfully
+    /// before this one may broadcast (e.g. an ERC-20 approve preceding the
+    /// route that spends it). `confirm` refuses to broadcast until the
+    /// dependency is reconciled to `Success`.
+    #[serde(default)]
+    pub depends_on: Option<String>,
+    /// Central action_id allocated via the central outbox projection.
+    /// Set when the tx is staged with a `CentralOutboxProjection` active,
+    /// so that the daemon-wide `/outbox/` VFS surface can correlate this
+    /// EVM entry to its unified action record.
+    #[serde(default)]
+    pub action_id: Option<String>,
 }
 
 /// Lightweight token reference embedded in a `StagedTx` for display.
@@ -132,7 +144,9 @@ impl PlanRender {
         let mut s = String::new();
         s.push_str(&format!("# Staged tx {}\n\n", staged.id));
         s.push_str(&format!("Wallet: {}\n", staged.wallet));
-        s.push_str(&format!("From:   {}\n", staged.from));
+        // `From` is always the wallet's own owner/signer EOA — label it so it
+        // is never read as a deposit/funder or other role address.
+        s.push_str(&format!("From:   {} (owner/signer EOA)\n", staged.from));
         if let Some(tok) = &staged.token {
             // ERC-20 transfer view.
             s.push_str(&format!("To:     {} (token contract)\n", staged.to));
@@ -272,6 +286,8 @@ mod tests {
             token: None,
             nft: None,
             usd_value: None,
+            depends_on: None,
+            action_id: None,
         }
     }
 
@@ -301,7 +317,7 @@ mod tests {
 # Staged tx tx_001
 
 Wallet: alice
-From:   0xfromfromfromfromfromfromfromfromfromfrom
+From:   0xfromfromfromfromfromfromfromfromfromfrom (owner/signer EOA)
 To:     0xtotototototototototototototototototototo
 Chain:  ethereum (id 1)
 Value:  1.5 ETH (1500000000000000000 wei)
@@ -325,16 +341,19 @@ Write `y` to `confirm` to broadcast, `cancel` to discard, `override` to bypass s
             PolicyCheck {
                 rule: "max_value".to_string(),
                 outcome: PolicyOutcome::Pass,
+                class: crate::PolicyRuleClass::Informational,
                 message: "ok".to_string(),
             },
             PolicyCheck {
                 rule: "allowlist".to_string(),
                 outcome: PolicyOutcome::Warn,
+                class: crate::PolicyRuleClass::Soft,
                 message: "recipient not on allowlist".to_string(),
             },
             PolicyCheck {
                 rule: "block_mainnet".to_string(),
                 outcome: PolicyOutcome::Deny,
+                class: crate::PolicyRuleClass::Hard,
                 message: "broadcast denied".to_string(),
             },
         ];

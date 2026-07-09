@@ -2,14 +2,20 @@
 members = [
   "crates/bloom",
   "crates/bloom-daemon",
+  "crates/bloom-auth-api",
+  "crates/bloom-auth",
   "crates/bloom-vfs",
-  "crates/bloom-chain",
+  "crates/bloom-paid-mpp",
+  "crates/bloom-paid-x402",
+  "crates/bloom-paid-http",
+  "crates/bloom-evm",
   "crates/bloom-rpc",
   "crates/bloom-tx",
   "crates/bloom-keystore",
   "crates/bloom-mempool",
   "crates/bloom-defi",
   "crates/bloom-polymarket",
+  "crates/bloom-hyperliquid",
   "crates/bloom-watch",
   "crates/bloom-mount",
   "crates/bloom-proto",
@@ -20,30 +26,6 @@ members = [
   "crates/bloom-revert",
   "crates/bloom-petals",
   "crates/bloom-it",
-  "crates/bloom-chain-types",
-  "crates/bloom-chain-state",
-  "crates/bloom-chain-consensus",
-  "crates/bloom-chain-node",
-  "crates/bloom-chain-abi",
-  "crates/bloom-value",
-  "crates/bloom-objects",
-  "crates/bloom-resource",
-  "crates/bloom-resource-macros",
-  "crates/bloom-petal-manifest",
-  "crates/bloom-script",
-  "crates/bloom-ptb-builder",
-  "crates/bloom-petal-fungible",
-  "crates/bloom-test-util",
-  "crates/bloom-petal-it",
-  "examples/petal-dex/crates/bloom-dex-math",
-  "examples/petal-dex/crates/bloom-petal-dex-cpmm",
-  "examples/petal-dex/crates/bloom-petal-dex-faucet",
-  "examples/petal-dex/crates/bloom-petal-dex-pool",
-  "examples/petal-dex/crates/bloom-petal-dex-router",
-  "examples/petal-dex/crates/bloom-petal-dex-wallet",
-  "examples/petal-dex/tests/bloom-petal-dex-it",
-  "examples/petal-identity",
-  "examples/petal-cap",
 ]
 resolver = "2"
 
@@ -61,7 +43,6 @@ tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "signal"
 tokio-tungstenite = { version = "0.24", default-features = false, features = ["rustls-tls-webpki-roots", "connect"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-serde_with = "3"
 toml = "0.8"
 clap = { version = "4", features = ["derive", "env"] }
 clap_complete = "4"
@@ -70,7 +51,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 async-trait = "0.1"
 parking_lot = "0.12"
 dirs = "5"
-shellexpand = "3"
 hex = "0.4"
 blake3 = "1"
 sha3 = "0.10"
@@ -85,19 +65,16 @@ ml-dsa = { version = "0.1.0", features = ["getrandom", "zeroize"] }
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 rusqlite = { version = "0.31", features = ["bundled"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+mpp = { version = "0.10.4", default-features = false, features = ["client", "tempo", "reqwest-rustls-tls"] }
 url = "2"
-humantime = "2"
 humantime-serde = "1"
 tempfile = "3"
-once_cell = "1"
 futures = "0.3"
 lru = "0.12"
 fs2 = "0.4"
-tar = "0.4"
-wasmtime = { version = "26", default-features = false, features = ["async", "component-model", "cranelift", "runtime", "cache", "parallel-compilation"] }
+wasmtime = { version = "26", default-features = false, features = ["async", "cranelift", "runtime", "cache", "parallel-compilation"] }
 wasmtime-wasi = "26"
 wat = "1"
-wasmparser = "0.218"
 # danger-allow-state-serialisation: webauthn-rs requires this feature to allow
 # the PasskeyRegistration / PasskeyAuthentication state structs to be serialised
 # across await points. Our ceremony server holds state in Arc<Mutex<>> for the
@@ -106,6 +83,12 @@ wasmparser = "0.218"
 webauthn-rs = { version = "0.5.5", features = ["danger-allow-state-serialisation"] }
 open = "5"
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "json"] }
+# QR rendering for deposit addresses. `svg` is a dependency-free string renderer
+# (for `wallet address --qr-out`); we drop the heavy `image`/PNG renderer. The
+# built-in unicode renderer covers the terminal QR.
+qrcode = { version = "0.14", default-features = false, features = ["svg"] }
+# Echo-free passphrase entry for interactive wallet creation.
+rpassword = "7"
 
 # Ethereum stack
 alloy = { version = "2", features = ["full", "signer-local", "rpc-types", "providers", "provider-http", "consensus", "network", "rlp", "json-abi", "k256", "eips", "essentials", "contract", "transport-throttle", "json-rpc"] }
@@ -116,12 +99,16 @@ bloom-mempool  = { path = "crates/bloom-mempool" }
 bloom-proto    = { path = "crates/bloom-proto" }
 bloom-keystore = { path = "crates/bloom-keystore" }
 bloom-rpc      = { path = "crates/bloom-rpc" }
-bloom-chain    = { path = "crates/bloom-chain" }
+bloom-evm      = { path = "crates/bloom-evm" }
 bloom-tx       = { path = "crates/bloom-tx" }
 bloom-vfs      = { path = "crates/bloom-vfs" }
+bloom-paid-mpp = { path = "crates/bloom-paid-mpp" }
+bloom-paid-x402 = { path = "crates/bloom-paid-x402" }
+bloom-paid-http = { path = "crates/bloom-paid-http" }
 bloom-tools    = { path = "crates/bloom-tools" }
 bloom-defi     = { path = "crates/bloom-defi" }
 bloom-polymarket = { path = "crates/bloom-polymarket" }
+bloom-hyperliquid = { path = "crates/bloom-hyperliquid" }
 bloom-watch    = { path = "crates/bloom-watch" }
 bloom-mount    = { path = "crates/bloom-mount" }
 bloom-etherscan = { path = "crates/bloom-etherscan" }
@@ -130,28 +117,9 @@ bloom-prices   = { path = "crates/bloom-prices" }
 bloom-revert   = { path = "crates/bloom-revert" }
 bloom-petals   = { path = "crates/bloom-petals" }
 bloom-daemon   = { path = "crates/bloom-daemon" }
-bloom-chain-types = { path = "crates/bloom-chain-types" }
-bloom-chain-state = { path = "crates/bloom-chain-state" }
-bloom-chain-node = { path = "crates/bloom-chain-node" }
-bloom-chain-abi   = { path = "crates/bloom-chain-abi", default-features = false }
-bloom-value       = { path = "crates/bloom-value" }
-bloom-objects     = { path = "crates/bloom-objects" }
-bloom-resource    = { path = "crates/bloom-resource" }
-bloom-resource-macros = { path = "crates/bloom-resource-macros" }
-bloom-petal-manifest = { path = "crates/bloom-petal-manifest" }
-bloom-script      = { path = "crates/bloom-script" }
-bloom-ptb-builder = { path = "crates/bloom-ptb-builder" }
-bloom-petal-fungible = { path = "crates/bloom-petal-fungible", version = "0.1.0" }
-# ---- example petal DEX crates (not part of the protocol) ----
-bloom-dex-math    = { path = "examples/petal-dex/crates/bloom-dex-math" }
-bloom-petal-dex-cpmm = { path = "examples/petal-dex/crates/bloom-petal-dex-cpmm", version = "0.1.0" }
-bloom-petal-dex-faucet = { path = "examples/petal-dex/crates/bloom-petal-dex-faucet" }
-bloom-petal-dex-pool = { path = "examples/petal-dex/crates/bloom-petal-dex-pool" }
-bloom-petal-dex-router = { path = "examples/petal-dex/crates/bloom-petal-dex-router" }
-bloom-petal-dex-wallet = { path = "examples/petal-dex/crates/bloom-petal-dex-wallet" }
-bloom-petal-identity = { path = "examples/petal-identity" }
+bloom-auth-api = { path = "crates/bloom-auth-api" }
+bloom-auth     = { path = "crates/bloom-auth" }
 # ---- example core petal: generic capability primitives (/bloom/core/cap) ----
-bloom-petal-cap   = { path = "examples/petal-cap", version = "0.1.0" }
 
 [profile.release]
 lto = "thin"

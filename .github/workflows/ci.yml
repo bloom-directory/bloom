@@ -2,9 +2,25 @@ name: CI
 
 on:
   pull_request:
+    paths: &code_paths
+      - ".github/workflows/ci.yml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - "crates/**"
+      - "scripts/**"
+      - "tests/**"
+      - "Dockerfile"
+      - "DEVELOPMENT.md"
   push:
     branches:
       - master
+    paths: *code_paths
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -43,79 +59,203 @@ jobs:
         if: always()
         run: sccache --show-stats
 
-  test:
-    name: test
+  # Doctests can't be captured in a nextest archive, so they compile separately.
+  # An independent job (no `needs`) keeps that compile off the test critical path.
+  doctests:
+    name: doctests
     runs-on: ubuntu-latest
     env:
-      CARGO_BUILD_JOBS: "2"
-      RUSTC_WRAPPER: sccache
-      SCCACHE_GHA_ENABLED: "true"
-    steps:
-      - uses: actions/checkout@v6
-      - name: Install Rust toolchain and WASM target
-        run: |
-          rustup show
-          rustup target add wasm32-unknown-unknown
-      - name: Install cargo-nextest
-        uses: taiki-e/install-action@nextest
-      - name: Free runner disk space
-        run: |
-          df -h
-          sudo rm -rf /opt/hostedtoolcache/CodeQL
-          sudo rm -rf /usr/local/lib/android
-          sudo rm -rf /usr/local/share/boost
-          sudo rm -rf /opt/ghc
-          sudo rm -rf /usr/share/dotnet
-          df -h
-      - name: Install sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
-        with:
-          cache-targets: false
-      - name: Install wasm-tools
-        run: cargo install wasm-tools --version 1.249.0 --locked
-      - name: Run tests
-        run: cargo nextest run --workspace --no-fail-fast -E 'not (binary(chain_testnet_provision) | binary(chain_smoke))'
-      - name: Run doctests
-        run: cargo test --workspace --doc
-      - name: Show sccache stats
-        if: always()
-        run: sccache --show-stats
-
-  chain-subprocess-test:
-    name: chain subprocess test
-    runs-on: ubuntu-latest
-    env:
-      CARGO_BUILD_JOBS: "2"
       RUSTC_WRAPPER: sccache
       SCCACHE_GHA_ENABLED: "true"
     steps:
       - uses: actions/checkout@v6
       - name: Install Rust toolchain
         run: rustup show
-      - name: Free runner disk space
-        run: |
-          df -h
-          sudo rm -rf /opt/hostedtoolcache/CodeQL
-          sudo rm -rf /usr/local/lib/android
-          sudo rm -rf /usr/local/share/boost
-          sudo rm -rf /opt/ghc
-          sudo rm -rf /usr/share/dotnet
-          df -h
       - name: Install sccache
         uses: mozilla-actions/sccache-action@v0.0.9
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
         with:
           cache-targets: false
-      - name: Build bloom CLI for subprocess tests
-        run: cargo build -p bloom --bin bloom
-      - name: Run chain subprocess tests
-        run: cargo test -p bloom-it --test chain_testnet_provision
+      - name: Run doctests
+        run: cargo test --workspace --doc --no-fail-fast
       - name: Show sccache stats
         if: always()
         run: sccache --show-stats
+
+  build_test_archive:
+    name: build test archive
+    runs-on: ubuntu-latest
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install Rust toolchain
+        run: rustup show
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: false
+      - name: Build nextest archive
+        run: cargo nextest archive --workspace --all-targets --archive-file target/nextest-archive.tar.zst
+      - name: Upload nextest archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: nextest-archive
+          path: target/nextest-archive.tar.zst
+          if-no-files-found: error
+          retention-days: 3
+      - name: Show sccache stats
+        if: always()
+        run: sccache --show-stats
+
+  # Pure test-execution lanes below: they only run prebuilt binaries from the
+  # archive, so they carry no sccache/target cache and do no compilation.
+  unit_test:
+    name: unit tests
+    runs-on: ubuntu-latest
+    needs: build_test_archive
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install Rust toolchain
+        run: rustup show
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+      - name: Download nextest archive
+        uses: actions/download-artifact@v4
+        with:
+          name: nextest-archive
+          path: target
+      - name: Run library unit tests from archive
+        run: cargo nextest run --archive-file target/nextest-archive.tar.zst -E 'kind(lib)' --no-fail-fast
+
+  integration_test:
+    name: local integration tests
+    runs-on: ubuntu-latest
+    needs: build_test_archive
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install Rust toolchain
+        run: rustup show
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+      - name: Download nextest archive
+        uses: actions/download-artifact@v4
+        with:
+          name: nextest-archive
+          path: target
+      - name: Run CLI and default local integration tests from archive
+        run: |
+          cargo nextest run --archive-file target/nextest-archive.tar.zst \
+            -E 'package(bloom) and binary(cli)' \
+            --no-fail-fast
+          cargo nextest run --archive-file target/nextest-archive.tar.zst \
+            -E 'package(bloom-it) and (binary(anvil_e2e) or binary(erc20_e2e))' \
+            --no-fail-fast
+      - name: Run ignored local anvil integration tests from archive
+        run: >
+          cargo nextest run --archive-file target/nextest-archive.tar.zst
+          -E 'package(bloom-it) or package(bloom-watch)'
+          --run-ignored ignored-only
+          --no-fail-fast
+
+  e2e_tests:
+    name: external e2e tests
+    runs-on: ubuntu-latest
+    needs: build_test_archive
+    timeout-minutes: 60
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      github.event_name == 'push' ||
+      (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)
+    env:
+      BLOOM_MAINNET_RPC: ${{ secrets.BLOOM_MAINNET_RPC }}
+      BLOOM_ETHERSCAN_KEY: ${{ secrets.BLOOM_ETHERSCAN_KEY }}
+      BLOOM_ENSO_KEY: ${{ secrets.BLOOM_ENSO_KEY }}
+      BLOOM_LIVE_POLYMARKET: ${{ secrets.BLOOM_LIVE_POLYMARKET }}
+      POLYGON_RPC_URL: ${{ secrets.POLYGON_RPC_URL }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install Rust toolchain
+        run: rustup show
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+      - name: Download nextest archive
+        uses: actions/download-artifact@v4
+        with:
+          name: nextest-archive
+          path: target
+      - name: Report external secret availability
+        run: |
+          for name in BLOOM_MAINNET_RPC BLOOM_ETHERSCAN_KEY BLOOM_ENSO_KEY BLOOM_LIVE_POLYMARKET POLYGON_RPC_URL; do
+            if [ -n "${!name:-}" ]; then
+              echo "$name=available"
+            else
+              echo "$name=missing (matching tests should self-skip)"
+            fi
+          done
+      - name: Run live-network Rust e2e tests from archive
+        run: |
+          cargo nextest run --archive-file target/nextest-archive.tar.zst \
+            -E 'package(bloom-ens) and binary(live_mainnet)' \
+            --run-ignored ignored-only \
+            --no-fail-fast
+          cargo nextest run --archive-file target/nextest-archive.tar.zst \
+            -E 'kind(lib) and (package(bloom-defi) or package(bloom-etherscan) or package(bloom-polymarket) or package(bloom-prices))' \
+            --run-ignored ignored-only \
+            --no-fail-fast
+
+  # Heavy docker suites are opt-in via workflow_dispatch only; each mode
+  # self-skips when its required secrets are absent.
+  docker:
+    name: docker (${{ matrix.mode }})
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch'
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [mount, enso, enso-live]
+    env:
+      BLOOM_ENSO_KEY: ${{ secrets.BLOOM_ENSO_KEY }}
+      BLOOM_LIVE_HOME: ${{ secrets.BLOOM_LIVE_HOME }}
+      BLOOM_LIVE_DEST1: ${{ secrets.BLOOM_LIVE_DEST1 }}
+      BLOOM_PASSPHRASE: ${{ secrets.BLOOM_PASSPHRASE }}
+      BLOOM_BASE_RPC_URL: ${{ secrets.BLOOM_BASE_RPC_URL }}
+      BLOOM_SWAP_AMOUNT_ETH: ${{ secrets.BLOOM_SWAP_AMOUNT_ETH }}
+      BLOOM_RUN_LIVE_FUNDS_E2E: ${{ secrets.BLOOM_RUN_LIVE_FUNDS_E2E }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Run docker ${{ matrix.mode }} suite
+        run: |
+          case "${{ matrix.mode }}" in
+            mount)
+              bash tests/docker/run.sh --mount
+              ;;
+            enso)
+              if [ -z "${BLOOM_ENSO_KEY:-}" ]; then
+                echo "BLOOM_ENSO_KEY missing; skipping docker --enso e2e."
+                exit 0
+              fi
+              bash tests/docker/run.sh --enso
+              ;;
+            enso-live)
+              if [ "${BLOOM_RUN_LIVE_FUNDS_E2E:-}" != "1" ]; then
+                echo "BLOOM_RUN_LIVE_FUNDS_E2E is not 1; skipping real-funds e2e."
+                exit 0
+              fi
+              bash tests/docker/run.sh --enso-live
+              ;;
+          esac
 
   locked-build:
     name: locked release build
@@ -135,88 +275,6 @@ jobs:
           cache-targets: false
       - name: Build full-feature binary with locked dependencies
         run: cargo build --release -p bloom --all-features --locked
-      - name: Show sccache stats
-        if: always()
-        run: sccache --show-stats
-
-  docker-petal-vfs:
-    name: docker petal VFS
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    env:
-      RUSTC_WRAPPER: sccache
-      SCCACHE_GHA_ENABLED: "true"
-    steps:
-      - uses: actions/checkout@v6
-      - name: Install Rust toolchain
-        run: |
-          rustup show
-          rustup target add wasm32-unknown-unknown
-      - name: Install sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
-        with:
-          cache-targets: false
-      - name: Install NFS client
-        run: sudo apt-get update && sudo apt-get install -y nfs-common
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-      - name: Build docker image
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: ./Dockerfile
-          load: true
-          tags: bloom-eth:test
-          network: host
-          cache-from: type=gha,scope=bloom-eth
-          cache-to: type=gha,scope=bloom-eth,mode=max
-      - name: Run docker petal VFS acceptance
-        env:
-          BLOOM_DOCKER_IMAGE_PREBUILT: "1"
-          BLOOM_DOCKER_LOG_DIR: ${{ runner.temp }}/bloom-docker-petal-vfs-logs
-        run: scripts/test-docker-petal-vfs.sh
-      - name: Upload docker petal VFS diagnostics
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: docker-petal-vfs-diagnostics
-          path: ${{ runner.temp }}/bloom-docker-petal-vfs-logs
-          if-no-files-found: warn
-      - name: Show sccache stats
-        if: always()
-        run: sccache --show-stats
-
-  # Hermetic real-wasm invariant gates: compile the example petals to
-  # wasm32 and exercise invariant ABI + full PTB object-invariant receipt
-  # propagation in-process (no anvil/network/docker). `#[ignore]`d (heavy)
-  # so these don't run in the host `test` job; gated on PRs here.
-  real-wasm-gates:
-    name: real-wasm invariant gates
-    runs-on: ubuntu-latest
-    env:
-      CARGO_BUILD_JOBS: "2"
-      RUSTC_WRAPPER: sccache
-      SCCACHE_GHA_ENABLED: "true"
-    steps:
-      - uses: actions/checkout@v6
-      - name: Install Rust toolchain and WASM target
-        run: |
-          rustup show
-          rustup target add wasm32-unknown-unknown
-      - name: Install sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
-        with:
-          cache-targets: false
-      - name: Run hermetic real-wasm invariant ABI gate
-        run: cargo test -p bloom-petal-dex-it --test real_inv_wasm -- --ignored
-      - name: Run real-wasm PTB object-invariant gate
-        run: cargo test -p bloom-petal-dex-it --test real_wasm_pool real_pool_swap_exact_in_executes -- --ignored
-      - name: Run chain-authoritative capability gate
-        run: cargo test -p bloom-petal-it --test real_mintcap_revert
       - name: Show sccache stats
         if: always()
         run: sccache --show-stats

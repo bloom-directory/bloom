@@ -111,6 +111,7 @@ pub const DEPOSIT_WALLET_IMPLEMENTATION_AMOY: Address =
 /// pUSD — the V2 CLOB collateral (ERC-20, 6 dp). Replaced USDC.e on 2026-04-28;
 /// this is what the deposit wallet holds and what approvals target.
 pub const PUSD: Address = Address::new(hex_addr(b"C011a7E12a19f7B1f670d46F03B03f3342E82DFB"));
+pub const PUSD_DECIMALS: u8 = 6;
 /// USDC.e — the bridge token only (no longer the CLOB collateral).
 pub const USDC_E: Address = Address::new(hex_addr(b"2791Bca1f2de4661ED88A30C99A7a9449Aa84174"));
 /// Conditional Tokens Framework (ERC-1155).

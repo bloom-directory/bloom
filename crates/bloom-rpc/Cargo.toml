@@ -12,7 +12,6 @@ serde.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
-async-trait.workspace = true
 url.workspace = true
 alloy.workspace = true
 tower = "0.5"

@@ -79,6 +79,35 @@ No `wrap.key`. PRF output is never written to disk.
 
 ---
 
+## Policy signing review
+
+Passkey wallets treat `policy.toml` as a signed authorization boundary. If the
+file changes, Bloom refuses policy-gated actions until the owner runs:
+
+```sh
+bloom wallet sign-policy <wallet>
+```
+
+The command opens a local browser review page before the WebAuthn ceremony. The
+review page is the user-facing source of truth; the native OS/browser passkey
+sheet only confirms user presence for `bloom/localhost`.
+
+For policy signing, the page must show the decision in plain language:
+
+- **Ask me every time** maps to `agent_autonomy = "prompt_all"`.
+- **Let Bloom use these rules** maps to `agent_autonomy = "under_policy"`.
+
+The page may update the in-memory policy draft before signing, validates the
+final TOML, writes it back to `policy.toml` if the user changed the approval
+mode, then signs exactly that final text. Signing a policy does not move funds;
+it changes which future actions Bloom may allow.
+
+Main review copy should avoid internal labels such as `wallet_unlock`,
+`canonical_subject`, `intent_hash`, or `kind`. Those values are audit/debug
+details and belong behind an advanced details disclosure.
+
+---
+
 ## PRF browser support
 
 | Platform | PRF support |

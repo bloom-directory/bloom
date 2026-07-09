@@ -6,7 +6,7 @@
 //!   specs. Each spec is written to `<root>/<wallet>/<id>.toml`.
 //! - [`WatchExecutor`]: a polling executor that runs in a background tokio
 //!   task. On each tick it walks the registry and, for each [`WatchSpec`],
-//!   queries the configured chain via [`bloom_chain::ChainClient`] and
+//!   queries the configured chain via [`bloom_evm::ChainClient`] and
 //!   appends a JSON line to the watch's per-watch live log when state
 //!   changes. When the live file grows past 1 MB, it is rotated into
 //!   `history.jsonl.<n>` and a sentinel is appended to the new live file

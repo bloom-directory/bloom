@@ -3,7 +3,7 @@
 //! The executor runs a single tokio task that wakes up every
 //! `tick_interval` (default 2 s) and walks every spec in the registry.
 //! For each spec it issues the appropriate JSON-RPC call against the
-//! corresponding [`bloom_chain::ChainClient`] and, when the observed
+//! corresponding [`bloom_evm::ChainClient`] and, when the observed
 //! state has changed since the last tick, appends a JSON line to a
 //! per-watch `live` file. Live files are rotated to numbered
 //! `history.jsonl.<n>` segments once they grow past 1 MB, with a
@@ -22,7 +22,7 @@
 //!         └── …
 //! ```
 //!
-//! When the underlying [`bloom_chain::ChainClient`] reports
+//! When the underlying [`bloom_evm::ChainClient`] reports
 //! `supports_subscriptions == true`, the executor also spawns one
 //! supervisor task per `Block` / `Event` spec that drives an
 //! `eth_subscribe` stream over the WS provider. The supervisor emits
@@ -49,7 +49,7 @@ use tokio::task::JoinHandle;
 use tokio::time::interval;
 use tracing::{debug, info, trace, warn};
 
-use bloom_chain::ChainRegistry;
+use bloom_evm::ChainRegistry;
 use bloom_proto::HomeDir;
 
 use crate::{WatchError, WatchKind, WatchRegistry, WatchSpec};

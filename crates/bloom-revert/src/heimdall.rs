@@ -22,7 +22,7 @@ use alloy::json_abi::JsonAbi;
 use alloy::primitives::{Address, B256, Bytes};
 use alloy_dyn_abi::{DynSolType, Specifier};
 use async_trait::async_trait;
-use bloom_chain::ChainRegistry;
+use bloom_evm::ChainRegistry;
 use sha3::{Digest, Keccak256};
 use tokio::sync::RwLock;
 
@@ -141,14 +141,14 @@ impl HeimdallDecompileDecoder {
         if let Some(entry) = self.in_memory.read().await.get(&codehash).cloned() {
             return entry;
         }
-        if let Some(dir) = &self.cache_dir {
-            if let Some(abi) = read_disk_cache(dir, codehash) {
-                self.in_memory
-                    .write()
-                    .await
-                    .insert(codehash, Some(abi.clone()));
-                return Some(abi);
-            }
+        if let Some(dir) = &self.cache_dir
+            && let Some(abi) = read_disk_cache(dir, codehash)
+        {
+            self.in_memory
+                .write()
+                .await
+                .insert(codehash, Some(abi.clone()));
+            return Some(abi);
         }
 
         let abi = match self.run_decompile(code).await {
@@ -159,10 +159,10 @@ impl HeimdallDecompileDecoder {
             }
         };
 
-        if let Some(dir) = &self.cache_dir {
-            if let Err(e) = write_disk_cache(dir, codehash, &abi) {
-                tracing::debug!(error = %e, "heimdall.cache_write_failed");
-            }
+        if let Some(dir) = &self.cache_dir
+            && let Err(e) = write_disk_cache(dir, codehash, &abi)
+        {
+            tracing::debug!(error = %e, "heimdall.cache_write_failed");
         }
         self.in_memory
             .write()

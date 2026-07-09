@@ -31,6 +31,8 @@ elevated privileges. Without a mount, the same paths are available through
 - `wallets/<name>/` — managed wallets, outbox write surface, history,
   allowances, ENS reverse, sign / EIP-712 surfaces.
 - `defi/intents/` — Enso-mediated DeFi intents (write `quote` / `execute`).
+- `hyperliquid/` — HyperCore reads plus signed exchange and agent-session
+  writes; see `docs/hyperliquid-integration.md` for the reviewer-facing map.
 - `polymarket/` — prediction-market reads, onboarding, and trade drafts
   (opt-in + human-gated; drive with `bloom polymarket ...`; see `docs/examples.md`).
 - `watch/` — long-running subscriptions (head, addr, log) executed by the
@@ -58,7 +60,9 @@ Reads are RPC / API queries. Examples:
 ```sh
 cat /bloom/chains/anvil/head/number
 cat /bloom/chains/ethereum/blocks/19000000/full.json
-cat /bloom/wallets/alice/chains/anvil/balance.eth
+cat /bloom/wallets/alice/address                     # the owner/signer EOA
+cat /bloom/wallets/alice/addresses.json              # owner/signer + role addresses (see "Wallet addresses & roles")
+cat /bloom/wallets/alice/chains/anvil/balance        # "1.5 ETH" (display); also balance.raw, balance.json
 cat /bloom/wallets/alice/chains/ethereum/history.json
 cat /bloom/tools/keccak/hello
 cat /bloom/tools/abi/decode/<sig>/<hex>
@@ -88,6 +92,29 @@ cat /bloom/chains/ethereum/tx/$TX/logs.json
 cat /bloom/chains/ethereum/tx/$TX/error.json
 ```
 
+ERC-20 token reads (you supply the token contract address):
+
+```sh
+A=0xd8da...
+# Discovery: ls the dir, then read its self-describing meta-files.
+ls  /bloom/chains/base/addresses/$A/tokens/
+cat /bloom/chains/base/addresses/$A/tokens/README.md   # path grammar + leaf names
+cat /bloom/chains/base/addresses/$A/tokens/known.json  # common + recently-seen tokens
+
+# Per-token reads under <token> (an ERC-20 contract address):
+T=0x833589fcd6edb6e08f4c7c32d4f71b54bda02913   # Base USDC
+cat /bloom/chains/base/addresses/$A/tokens/$T/balance        # "1.5 USDC"
+cat /bloom/chains/base/addresses/$A/tokens/$T/balance.raw    # base units
+cat /bloom/chains/base/addresses/$A/tokens/$T/balance.json   # {symbol,decimals,raw,formatted,...}
+cat /bloom/chains/base/addresses/$A/tokens/$T/symbol
+cat /bloom/chains/base/addresses/$A/tokens/$T/decimals
+```
+
+If `symbol()`/`decimals()` can't be read (revert, non-standard token, or
+RPC outage), `symbol`/`decimals`/`balance` error out instead of returning
+placeholder `?`/`18`; `balance.raw` still works and `balance.json` carries
+`metadata_status: "ok" | "fallback"` (with `null` fields on fallback).
+
 NFT reads (auto-detects ERC-721 vs ERC-1155 via ERC-165):
 
 ```sh
@@ -114,7 +141,74 @@ cat /bloom/chains/ethereum/contracts/<contract>/nft/token_uri/<id>
 cat /bloom/chains/ethereum/contracts/<contract>/nft/is_approved_for_all/<owner>/<operator>
 ```
 
+## Wallet addresses & roles
+
+A wallet has **one owner/signer key** but may be associated with additional
+**role addresses** that it controls but does not equal. Conflating them is a
+real hazard — e.g. reporting a Polymarket deposit wallet's balance as "the
+wallet's balance."
+
+- `wallets/<w>/address` — the **owner/signer EOA**. This is the wallet itself:
+  the key that signs, and the address you fund for gas/native transfers.
+- `wallets/<w>/addresses.json` — the canonical "who is this wallet" answer:
+
+  ```json
+  {
+    "wallet": "alice",
+    "kind": "passkey",
+    "owner":  "0x5c3d…4456",
+    "signer": "0x5c3d…4456",
+    "policy_status": "unsigned",
+    "roles": {
+      "polymarket_deposit_wallet": {
+        "address": "0x3855…0166",
+        "source": "live_factory_resolved",
+        "fundable": true,
+        "note": "Polymarket trade funder/maker — NOT the wallet owner."
+      }
+    }
+  }
+  ```
+
+  `owner` and `signer` are the same EOA. Role addresses (e.g. the Polymarket
+  deposit/funder wallet, derived from the owner) appear under `roles`; sending
+  funds there does not change ownership. `roles` is empty when no role address
+  is known. `policy_status` (`signed`/`unsigned`/`stale`/`not_applicable`)
+  reports whether a passkey wallet's policy is signed — `unsigned`/`stale` block
+  **writes/broadcast**, but never block these read-only leaves.
+
+Read-only leaves (`address`, `addresses.json`, `public_key`, `kind`, balances)
+always work, even when a passkey wallet's `policy.toml` is unsigned or stale.
+The policy signature only gates staging/broadcast/signing.
+
+## Batch signing (policy sessions)
+
+To avoid a passkey prompt per `$1` transaction, mint a **bounded session** with
+one ceremony. It authorizes only the listed transactions, on the listed chains,
+up to a total USD cap, until it expires:
+
+```sh
+echo '{"chains":[42161,8453],"max_usd":10,"ttl_secs":600,"pending_ids":["0001-a","0001-b"]}' \
+  > /bloom/wallets/alice/policy-session/new          # passkey ceremony renders the envelope
+cat /bloom/wallets/alice/policy-session/active.json   # live sessions + remaining budget
+echo y > /bloom/wallets/alice/policy-session/<id>/revoke
+```
+
+Confirms that fall inside the bounds (chain ∈ list, id ∈ list, not expired,
+cumulative USD ≤ cap) broadcast without another prompt; anything outside
+re-prompts. The session lives only in memory and expires independently of the
+unlocked key.
+
 ## Writing (stage-confirm)
+
+On `confirm`, before broadcasting, Bloom:
+- **simulates** the tx (`eth_call`) against current state and refuses to
+  broadcast one that would revert (write `override` instead of `y` to force);
+- enforces **same-chain dependencies**: a tx with a `depends_on` (e.g. a swap
+  that follows its `approve`) is refused until the predecessor has mined
+  **successfully** — "waiting to confirm" while unconfirmed, blocked if it
+  reverted. A background reconciler records each sent tx's mined outcome in a
+  `receipt.json` next to the entry.
 
 Native send (canonical):
 
@@ -176,6 +270,21 @@ echo y > /bloom/defi/intents/alice/<sess>/confirm
 
 ERC-20 token-in routes auto-prepend an `approve(spender, max)` ahead
 of the swap when the current allowance is insufficient.
+
+Deposit to Hyperliquid is a first-class goal:
+
+```sh
+echo 'deposit 5 USDC to hyperliquid' > /bloom/defi/intents/alice/new
+```
+
+It stages a USDC transfer to the Hyperliquid Bridge2 contract on Arbitrum
+(the deposit primitive). Guardrails, before anything is staged:
+- only **native USDC on Arbitrum** is credited — a non-Arbitrum source is
+  rejected with guidance to consolidate to Arbitrum USDC first (sending
+  Base/Polygon USDC straight to the bridge does **not** credit);
+- deposits **below 5 USDC are refused** (the bridge does not credit them and
+  does not auto-return them);
+- cross-chain dust deposits warn when gas likely exceeds value.
 
 Subscribe + read (TOML body, kinds: `block`, `balance`, `gas_price`,
 `event`):

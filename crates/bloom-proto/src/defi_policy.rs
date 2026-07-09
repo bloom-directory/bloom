@@ -104,7 +104,7 @@ pub struct DefiPolicy {
     pub require_calldata_verification: bool,
     /// Hard cap on route input value, micro-USD. `None` ⇒ uncapped (but the
     /// master gate + receiver/router gates still apply).
-    #[serde(default, with = "micro_opt")]
+    #[serde(default, with = "crate::serde_micro")]
     pub max_input_usd: Option<u64>,
     /// Hard cap on native value attached to the route tx, in wei (decimal
     /// string). `None` ⇒ uncapped. Note a native-in route (e.g. POL→pUSD)
@@ -127,53 +127,6 @@ impl Default for DefiPolicy {
             require_calldata_verification: true,
             max_input_usd: None,
             max_native_value_wei: None,
-        }
-    }
-}
-
-/// Serde for `Option<u64>` micro-USD (decimal string ⇒ 6-dp integer). Mirrors
-/// `polymarket_policy::micro_opt`; kept local to avoid widening that module's
-/// visibility.
-mod micro_opt {
-    use serde::de::Error as _;
-    use serde::{Deserialize, Deserializer, Serializer};
-
-    pub fn serialize<S: Serializer>(v: &Option<u64>, s: S) -> Result<S::Ok, S::Error> {
-        match v {
-            None => s.serialize_none(),
-            Some(micro) => s.serialize_some(&crate::units::format_units(
-                alloy::primitives::U256::from(*micro),
-                6,
-            )),
-        }
-    }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<u64>, D::Error> {
-        #[derive(Deserialize)]
-        #[serde(untagged)]
-        enum Raw {
-            S(String),
-            I(i64),
-            F(f64),
-        }
-        let parse = |s: &str| -> Result<u64, String> {
-            let v = crate::units::parse_units(s.trim(), 6)
-                .map_err(|e| format!("bad USD amount '{s}': {e}"))?;
-            u64::try_from(v).map_err(|_| format!("USD amount '{s}' too large"))
-        };
-        match Option::<Raw>::deserialize(d)? {
-            None => Ok(None),
-            Some(Raw::S(s)) => parse(&s).map(Some).map_err(D::Error::custom),
-            Some(Raw::I(i)) => {
-                if i < 0 {
-                    return Err(D::Error::custom("USD amount cannot be negative"));
-                }
-                (i as u64)
-                    .checked_mul(1_000_000)
-                    .map(Some)
-                    .ok_or_else(|| D::Error::custom("USD amount too large"))
-            }
-            Some(Raw::F(f)) => parse(&format!("{f}")).map(Some).map_err(D::Error::custom),
         }
     }
 }
@@ -272,16 +225,10 @@ pub struct DefiRouteCtx {
     pub receiver_verified: bool,
 }
 
-fn check(rule: &str, outcome: PolicyOutcome, message: impl Into<String>) -> PolicyCheck {
-    PolicyCheck {
-        rule: format!("defi.{rule}"),
-        outcome,
-        message: message.into(),
-    }
-}
+use crate::serde_micro::fmt_usd;
 
-fn fmt_usd(micro: u64) -> String {
-    crate::units::format_units(alloy::primitives::U256::from(micro), 6)
+fn check(rule: &str, outcome: PolicyOutcome, message: impl Into<String>) -> PolicyCheck {
+    PolicyCheck::for_venue("defi", rule, outcome, message)
 }
 
 fn receiver_literal(ctx: &DefiRouteCtx) -> String {
@@ -584,19 +531,10 @@ pub fn evaluate_defi_route(policy: &DefiPolicy, ctx: &DefiRouteCtx) -> Vec<Polic
     out
 }
 
-/// Any Deny in the set? Deny-level failures are never CLI-bypassable.
-pub fn has_deny(checks: &[PolicyCheck]) -> bool {
-    checks.iter().any(|c| c.outcome == PolicyOutcome::Deny)
-}
-
-/// Any Warn in the set?
-pub fn has_warn(checks: &[PolicyCheck]) -> bool {
-    checks.iter().any(|c| c.outcome == PolicyOutcome::Warn)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::policy::{has_deny, has_warn};
     use alloy::primitives::U256;
 
     fn enabled_policy() -> DefiPolicy {

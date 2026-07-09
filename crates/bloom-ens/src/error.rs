@@ -7,7 +7,7 @@ pub enum EnsError {
     #[error("ens name not found: {0}")]
     NotFound(String),
     #[error("provider: {0}")]
-    Provider(#[from] bloom_chain::ChainError),
+    Provider(#[from] bloom_evm::ChainError),
     #[error("invalid name: {0}")]
     InvalidName(String),
     #[error("decode: {0}")]

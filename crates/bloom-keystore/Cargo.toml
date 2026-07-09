@@ -6,12 +6,11 @@ license.workspace = true
 description = "Encrypted local keystore for bloom"
 
 [dependencies]
-bloom-chain-types.workspace = true
+bloom-auth-api.workspace = true
 bloom-proto.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-anyhow.workspace = true
 hex.workspace = true
 blake3.workspace = true
 base64.workspace = true
@@ -27,6 +26,7 @@ ml-dsa.workspace = true
 ed25519-dalek.workspace = true
 
 tokio.workspace = true
+async-trait.workspace = true
 webauthn-rs.workspace = true
 open.workspace = true
 axum.workspace = true
@@ -35,3 +35,8 @@ url.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 reqwest.workspace = true
+sha2.workspace = true
+# WS-1: tests construct an `InMemoryGrantStore` directly. The store impl
+# lives in `bloom-auth`; this is a dev-only dep that does not leak into
+# production builds of `bloom-keystore`.
+bloom-auth = { workspace = true }

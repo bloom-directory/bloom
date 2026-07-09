@@ -7,11 +7,12 @@
 //! - `chains/<chain>/head/timestamp`
 //! - `chains/<chain>/head/full.json`
 //! - `chains/<chain>/blocks/<n>/full.json`
-//! - `chains/<chain>/addresses/<addr>/balance` (wei, decimal)
-//! - `chains/<chain>/addresses/<addr>/balance.eth`
+//! - `chains/<chain>/addresses/<addr>/balance` (display, e.g. "1.5 POL")
+//! - `chains/<chain>/addresses/<addr>/balance.raw` (integer base units)
+//! - `chains/<chain>/addresses/<addr>/balance.json` (structured facts)
 //! - `chains/<chain>/addresses/<addr>/nonce`
 //! - `chains/<chain>/addresses/<addr>/code` (hex bytecode)
-//! - `chains/<chain>/addresses/<addr>/tokens/<token>/{balance,balance.raw,balance.formatted,symbol,decimals}`
+//! - `chains/<chain>/addresses/<addr>/tokens/<token>/{balance,balance.raw,balance.json,symbol,decimals}`
 //! - `chains/<chain>/tx/<hash>/{receipt.json,status,block_number,gas_used,logs.json,full.json,error.json}`
 //! - `chains/<chain>/gas/current.json`
 //!
@@ -35,14 +36,14 @@
 //!   address or `not a proxy\n` when the slot is empty.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 
-use bloom_chain::{ChainClient, ChainRegistry};
 use bloom_ens::{EnsClient, EnsError};
 use bloom_etherscan::{AddressHistorySource, ContractMetadataSource, EtherscanClient};
-use bloom_proto::{Backend, BackendsConfig, checksum_address, format_units};
+use bloom_evm::{ChainClient, ChainRegistry};
+use bloom_proto::{Backend, BackendsConfig, checksum_address};
 use bloom_revert::{DecodeContext, DecodedRevert, DecoderChain};
 use parking_lot::Mutex as PlMutex;
 
@@ -84,6 +85,8 @@ pub struct ChainsHandler {
     pending: Arc<PendingBodies>,
     /// Process-wide cache of ERC-165 NFT kind detection.
     nft_cache: Arc<NftKindCache>,
+    /// Longer-lived ERC-20 metadata cache used by display/JSON balance leaves.
+    token_metadata_cache: Arc<PlMutex<std::collections::HashMap<TokenMetadataKey, TokenMetadata>>>,
     /// Tiered revert decoder chain, shared across requests. `None` is a
     /// degenerate config: `error.json` will return an empty marker.
     revert_decoder: Arc<DecoderChain>,
@@ -99,6 +102,19 @@ pub struct ChainsHandler {
         Arc<std::collections::BTreeMap<String, Arc<super::chains_mempool::MempoolHandler>>>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct TokenMetadataKey {
+    chain_id: u64,
+    token: alloy::primitives::Address,
+}
+
+#[derive(Clone, Debug)]
+struct TokenMetadata {
+    decimals: u8,
+    symbol: String,
+    expires_at: Instant,
+}
+
 impl ChainsHandler {
     pub fn new(registry: ChainRegistry) -> Self {
         Self {
@@ -111,6 +127,7 @@ impl ChainsHandler {
             live_state: Arc::new(LiveTailState::new()),
             pending: Arc::new(PendingBodies::new()),
             nft_cache: Arc::new(NftKindCache::new()),
+            token_metadata_cache: Arc::new(PlMutex::new(std::collections::HashMap::new())),
             revert_decoder: Arc::new(DecoderChain::new()),
             revert_cache: Arc::new(PlMutex::new(std::collections::HashMap::new())),
             mempool_handlers: Arc::new(std::collections::BTreeMap::new()),
@@ -177,6 +194,111 @@ impl ChainsHandler {
         self.registry
             .get(name)
             .ok_or_else(|| HandlerError::not_found(format!("chain '{}'", name)))
+    }
+
+    /// Resolve ERC-20 `(decimals, symbol)`. Each element is `None` when
+    /// the on-chain call could not be resolved — a revert, a non-standard
+    /// token, or an RPC failure (the chain client collapses all three
+    /// into `None`). Callers must treat `None` as *unknown*, never as real
+    /// data, so a degraded RPC can't masquerade as `? / 18`. Only
+    /// fully-resolved metadata is cached, so recovery is not blocked by a
+    /// cached fallback for the whole metadata TTL.
+    async fn token_metadata(
+        &self,
+        client: &ChainClient,
+        token: alloy::primitives::Address,
+    ) -> Result<(Option<u8>, Option<String>), HandlerError> {
+        let key = TokenMetadataKey {
+            chain_id: client.spec().chain_id,
+            token,
+        };
+        if let Some(meta) = self.token_metadata_cache.lock().get(&key)
+            && meta.expires_at > Instant::now()
+        {
+            return Ok((Some(meta.decimals), Some(meta.symbol.clone())));
+        }
+
+        let decimals = client.erc20_decimals(token).await.map_err(err_be)?;
+        let symbol = client.erc20_symbol(token).await.map_err(err_be)?;
+
+        if let (Some(dec), Some(sym)) = (decimals, symbol.as_ref()) {
+            self.token_metadata_cache.lock().insert(
+                key,
+                TokenMetadata {
+                    decimals: dec,
+                    symbol: sym.clone(),
+                    expires_at: Instant::now() + super::balances::TOKEN_METADATA_TTL,
+                },
+            );
+        }
+        Ok((decimals, symbol))
+    }
+
+    /// Build the `tokens/known.json` payload: curated majors for this
+    /// chain plus, when an address-history backend is available, tokens
+    /// the holder has recently transferred. `discovery_backend` tells the
+    /// agent whether history-based discovery actually ran.
+    async fn tokens_known_json(
+        &self,
+        client: &ChainClient,
+        chain: &str,
+        holder: alloy::primitives::Address,
+    ) -> Result<Vec<u8>, HandlerError> {
+        use super::well_known_tokens::{self as wkt, DiscoveredEntry, KnownEntry, KnownJson};
+
+        let chain_id = client.spec().chain_id;
+
+        let known: Vec<KnownEntry> = wkt::for_chain(chain_id)
+            .iter()
+            .filter_map(|t| {
+                let addr = t.address.parse::<alloy::primitives::Address>().ok()?;
+                Some(KnownEntry {
+                    address: checksum_address(&addr),
+                    symbol: t.symbol.to_string(),
+                    decimals: t.decimals,
+                    source: "well-known",
+                })
+            })
+            .collect();
+
+        let (discovery_backend, discovered): (&str, Vec<DiscoveredEntry>) =
+            match self.backends.address_history {
+                Backend::Etherscan => match self.address_history.as_ref() {
+                    Some(src) => {
+                        match chains_history::discover_erc20_tokens(src, chain_id, holder).await {
+                            Ok(d) => ("etherscan", d),
+                            // Etherscan configured but history unavailable here.
+                            Err(HandlerError::Unsupported(_)) => ("unsupported", Vec::new()),
+                            // Transient failure: report the backend, empty list.
+                            Err(_) => ("etherscan", Vec::new()),
+                        }
+                    }
+                    None => ("unsupported", Vec::new()),
+                },
+                Backend::Rpc => ("rpc", Vec::new()),
+                Backend::Indexer => ("indexer", Vec::new()),
+            };
+
+        let note = if discovery_backend == "etherscan" {
+            "known = curated majors; discovered = tokens this address recently \
+             transferred. Read tokens/<address>/balance.json for any token."
+        } else {
+            "known = curated majors. History-based discovery is unavailable on \
+             this chain/backend; read tokens/<address>/balance.json for any token \
+             you know."
+        }
+        .to_string();
+
+        let payload = KnownJson {
+            chain: chain.to_string(),
+            discovery_backend: discovery_backend.to_string(),
+            note,
+            known,
+            discovered,
+        };
+        let mut bytes = serde_json::to_vec_pretty(&payload).map_err(err_be)?;
+        bytes.push(b'\n');
+        Ok(bytes)
     }
 
     /// Resolve the contract-metadata source. Returns `NotFound` with an
@@ -439,8 +561,8 @@ fn err_be(e: impl std::fmt::Display) -> HandlerError {
 /// flagged so we only emit them when an etherscan client is configured.
 const ADDRESS_FILES_CORE: &[&str] = &[
     "balance",
-    "balance.eth",
     "balance.raw",
+    "balance.json",
     "nonce",
     "code",
     "is_contract",
@@ -466,10 +588,24 @@ const TX_FILES: &[&str] = &[
 const TOKEN_FILES: &[&str] = &[
     "balance",
     "balance.raw",
-    "balance.formatted",
+    "balance.json",
     "symbol",
     "decimals",
 ];
+
+/// Self-describing meta-files served directly under `addresses/<a>/tokens/`
+/// so an agent that `ls`-es the directory finds the path grammar and a
+/// list of common/discovered tokens, instead of an empty listing.
+const TOKENS_DIR_FILES: &[&str] = &["README.md", "known.json"];
+
+/// Body of `addresses/<a>/tokens/README.md` (vendored, like `DocsHandler`).
+const TOKENS_README: &str = include_str!("../docs/tokens.md");
+
+/// Returned when `symbol()`/`decimals()` can't be resolved. The chain
+/// client collapses revert, non-standard token, and RPC failure into one
+/// `None`, so the message names all three rather than implying real data.
+const ERC20_METADATA_UNAVAILABLE: &str = "erc20 metadata unavailable: symbol()/decimals() reverted, RPC failed, or non-standard \
+     token. Read balance.raw for the integer balance, or balance.json for raw + metadata_status.";
 
 #[async_trait]
 impl Handler for ChainsHandler {
@@ -587,6 +723,9 @@ impl ChainsHandler {
                         Err(HandlerError::not_found(path.to_string_path()))
                     }
                 }
+                5 if segs[3] == "tokens" && TOKENS_DIR_FILES.contains(&segs[4].as_str()) => {
+                    Ok(Entry::file(&segs[4]))
+                }
                 5 if segs[3] == "tokens" => Ok(Entry::dir(&segs[4])),
                 6 if segs[3] == "tokens" => {
                     let f = segs[5].as_str();
@@ -697,18 +836,28 @@ impl ChainsHandler {
                 let addr = parse_addr(&segs[2])?;
                 let spec = client.spec();
                 match segs[3].as_str() {
-                    "balance" | "balance.raw" => {
+                    "balance" => {
                         let bal = client.balance(addr).await.map_err(err_be)?;
-                        Ok(format!("{}\n", bal).into_bytes())
+                        Ok(super::balances::display_line(
+                            bal,
+                            spec.native_decimals,
+                            &spec.native_symbol,
+                        ))
                     }
-                    "balance.eth" => {
+                    "balance.raw" => {
                         let bal = client.balance(addr).await.map_err(err_be)?;
-                        Ok(format!(
-                            "{} {}\n",
-                            format_units(bal, spec.native_decimals),
-                            spec.native_symbol
-                        )
-                        .into_bytes())
+                        Ok(super::balances::raw_line(bal))
+                    }
+                    "balance.json" => {
+                        let bal = client.balance(addr).await.map_err(err_be)?;
+                        Ok(super::balances::balance_json(
+                            chain,
+                            "native",
+                            None,
+                            &spec.native_symbol,
+                            spec.native_decimals,
+                            bal,
+                        ))
                     }
                     "nonce" => {
                         let n = client.nonce(addr).await.map_err(err_be)?;
@@ -750,48 +899,71 @@ impl ChainsHandler {
                     _ => Err(HandlerError::NotAFile(path.to_string_path())),
                 }
             }
+            "addresses" if segs.len() == 5 && segs[3] == "tokens" => {
+                let holder = parse_addr(&segs[2])?;
+                match segs[4].as_str() {
+                    "README.md" => Ok(TOKENS_README.as_bytes().to_vec()),
+                    "known.json" => self.tokens_known_json(&client, chain, holder).await,
+                    _ => Err(HandlerError::NotAFile(path.to_string_path())),
+                }
+            }
             "addresses" if segs.len() == 6 && segs[3] == "tokens" => {
                 let holder = parse_addr(&segs[2])?;
                 let token = parse_addr(&segs[4])?;
                 match segs[5].as_str() {
-                    "balance" | "balance.raw" => {
+                    "balance" => {
                         let bal = client
                             .erc20_balance(token, holder)
                             .await
                             .map_err(err_be)?
                             .ok_or_else(|| HandlerError::backend("erc20 balanceOf reverted"))?;
-                        Ok(format!("{}\n", bal).into_bytes())
+                        // Don't fabricate a display line from `? / 18`: a
+                        // formatted value with the wrong decimals is worse
+                        // than a clear error pointing at balance.raw.
+                        match self.token_metadata(&client, token).await? {
+                            (Some(dec), Some(sym)) => {
+                                Ok(super::balances::display_line(bal, dec, &sym))
+                            }
+                            _ => Err(HandlerError::backend(ERC20_METADATA_UNAVAILABLE)),
+                        }
                     }
-                    "balance.formatted" => {
+                    "balance.raw" => {
                         let bal = client
                             .erc20_balance(token, holder)
                             .await
                             .map_err(err_be)?
                             .ok_or_else(|| HandlerError::backend("erc20 balanceOf reverted"))?;
-                        let dec = client
-                            .erc20_decimals(token)
+                        Ok(super::balances::raw_line(bal))
+                    }
+                    "balance.json" => {
+                        let bal = client
+                            .erc20_balance(token, holder)
                             .await
                             .map_err(err_be)?
-                            .unwrap_or(18);
-                        let sym = client.erc20_symbol(token).await.map_err(err_be)?;
-                        Ok(format!(
-                            "{} {}\n",
-                            format_units(bal, dec),
-                            sym.unwrap_or_else(|| "?".into())
-                        )
-                        .into_bytes())
+                            .ok_or_else(|| HandlerError::backend("erc20 balanceOf reverted"))?;
+                        let (dec, sym) = self.token_metadata(&client, token).await?;
+                        // Carries `metadata_status` + null fields when
+                        // metadata couldn't be resolved, so degraded reads
+                        // are visibly degraded rather than `? / 18`.
+                        Ok(super::balances::token_balance_json(
+                            chain,
+                            &checksum_address(&token),
+                            sym.as_deref(),
+                            dec,
+                            bal,
+                        ))
                     }
                     "symbol" => {
-                        let sym = client.erc20_symbol(token).await.map_err(err_be)?;
-                        Ok(format!("{}\n", sym.unwrap_or_default()).into_bytes())
+                        let (_, sym) = self.token_metadata(&client, token).await?;
+                        let sym =
+                            sym.ok_or_else(|| HandlerError::backend(ERC20_METADATA_UNAVAILABLE))?;
+                        Ok(format!("{sym}\n").into_bytes())
                     }
                     "decimals" => {
-                        let dec = client
-                            .erc20_decimals(token)
-                            .await
-                            .map_err(err_be)?
-                            .unwrap_or(18);
-                        Ok(format!("{}\n", dec).into_bytes())
+                        let (dec, _) = self.token_metadata(&client, token).await?;
+                        let dec =
+                            dec.ok_or_else(|| HandlerError::backend(ERC20_METADATA_UNAVAILABLE))?;
+                        Ok(format!("{dec}\n").into_bytes())
                     }
                     _ => Err(HandlerError::NotAFile(path.to_string_path())),
                 }
@@ -1024,18 +1196,28 @@ impl ChainsHandler {
                 let spec = client.spec().clone();
                 let session = client.open_session_at(block_number).await.map_err(err_be)?;
                 match segs[3].as_str() {
-                    "balance" | "balance.raw" => {
+                    "balance" => {
                         let bal = session.balance(addr).await.map_err(err_be)?;
-                        Ok(format!("{}\n", bal).into_bytes())
+                        Ok(super::balances::display_line(
+                            bal,
+                            spec.native_decimals,
+                            &spec.native_symbol,
+                        ))
                     }
-                    "balance.eth" => {
+                    "balance.raw" => {
                         let bal = session.balance(addr).await.map_err(err_be)?;
-                        Ok(format!(
-                            "{} {}\n",
-                            format_units(bal, spec.native_decimals),
-                            spec.native_symbol
-                        )
-                        .into_bytes())
+                        Ok(super::balances::raw_line(bal))
+                    }
+                    "balance.json" => {
+                        let bal = session.balance(addr).await.map_err(err_be)?;
+                        Ok(super::balances::balance_json(
+                            chain,
+                            "native",
+                            None,
+                            &spec.native_symbol,
+                            spec.native_decimals,
+                            bal,
+                        ))
                     }
                     "nonce" => {
                         let n = session.nonce(addr).await.map_err(err_be)?;
@@ -1123,6 +1305,12 @@ impl ChainsHandler {
                 }
                 Ok(entries)
             }
+            4 if segs[1] == "addresses" && segs[3] == "tokens" => {
+                // /chains/<chain>/addresses/<addr>/tokens — self-describing
+                // meta-files (README + known.json). Tokens themselves are
+                // addressed directly, not enumerated as fake dir entries.
+                Ok(TOKENS_DIR_FILES.iter().map(|n| Entry::file(n)).collect())
+            }
             5 if segs[1] == "addresses" && segs[3] == "tokens" => {
                 // /chains/<chain>/addresses/<addr>/tokens/<token>
                 Ok(TOKEN_FILES.iter().map(|n| Entry::file(n)).collect())
@@ -1191,8 +1379,8 @@ impl ChainsHandler {
             // chain head. Etherscan-backed history is rate-limited so
             // we cache it longer.
             "addresses" => match segs.get(3).map(|s| s.as_str()) {
-                Some("balance" | "balance.eth" | "balance.raw" | "nonce") => {
-                    Some(Duration::from_secs(5))
+                Some("balance" | "balance.raw" | "balance.json" | "nonce") => {
+                    Some(super::balances::LIVE_BALANCE_TTL)
                 }
                 Some("code" | "is_contract") => Some(Duration::from_secs(86_400)),
                 Some("txs" | "internal_txs" | "erc20_txs" | "erc721_txs") => {
@@ -1214,6 +1402,13 @@ impl ChainsHandler {
                     (_, Some("owner" | "balance" | "is_owner" | "approved")) => {
                         Some(Duration::from_secs(5))
                     }
+                    _ => None,
+                },
+                Some("tokens") => match segs.get(5).map(|s| s.as_str()) {
+                    Some("balance" | "balance.raw" | "balance.json") => {
+                        Some(super::balances::LIVE_BALANCE_TTL)
+                    }
+                    Some("symbol" | "decimals") => Some(super::balances::TOKEN_METADATA_TTL),
                     _ => None,
                 },
                 _ => None,
@@ -1626,6 +1821,87 @@ mod tests {
             .collect();
 
         assert_eq!(names, TX_FILES);
+    }
+
+    #[tokio::test]
+    async fn tokens_dir_lists_meta_files() {
+        let h = ChainsHandler::new(anvil_registry());
+        let chain = h.registry.list_names()[0].clone();
+        let p = VfsPath::parse(&format!(
+            "/{chain}/addresses/0x0000000000000000000000000000000000000001/tokens"
+        ))
+        .unwrap();
+
+        let names: Vec<String> = h
+            .list(&p)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert_eq!(names, TOKENS_DIR_FILES);
+    }
+
+    #[tokio::test]
+    async fn tokens_lookup_resolves_meta_and_token_dir() {
+        use crate::handler::EntryKind;
+        let h = ChainsHandler::new(anvil_registry());
+        let chain = h.registry.list_names()[0].clone();
+        let base = format!("/{chain}/addresses/0x0000000000000000000000000000000000000001/tokens");
+
+        // README.md resolves as a file.
+        let readme = h
+            .lookup(&VfsPath::parse(&format!("{base}/README.md")).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(readme.kind, EntryKind::File);
+
+        // A token contract address resolves as a directory.
+        let token = h
+            .lookup(
+                &VfsPath::parse(&format!(
+                    "{base}/0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"
+                ))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(token.kind, EntryKind::Dir);
+    }
+
+    #[tokio::test]
+    async fn tokens_readme_documents_balance_json() {
+        let h = ChainsHandler::new(anvil_registry());
+        let chain = h.registry.list_names()[0].clone();
+        let p = VfsPath::parse(&format!(
+            "/{chain}/addresses/0x0000000000000000000000000000000000000001/tokens/README.md"
+        ))
+        .unwrap();
+
+        let bytes = h.read(&p).await.unwrap();
+        let s = std::str::from_utf8(&bytes).unwrap();
+        assert!(
+            s.contains("balance.json"),
+            "README must document balance.json"
+        );
+    }
+
+    #[tokio::test]
+    async fn tokens_known_json_parses_with_discovery_backend() {
+        // No etherscan source wired → discovery unavailable, but the
+        // payload must still be valid JSON naming the backend state.
+        let h = ChainsHandler::new(anvil_registry());
+        let chain = h.registry.list_names()[0].clone();
+        let p = VfsPath::parse(&format!(
+            "/{chain}/addresses/0x0000000000000000000000000000000000000001/tokens/known.json"
+        ))
+        .unwrap();
+
+        let bytes = h.read(&p).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["discovery_backend"], "unsupported");
+        assert!(v["known"].is_array());
+        assert!(v["discovered"].is_array());
     }
 
     #[tokio::test]
@@ -2310,7 +2586,7 @@ mod tests {
     // calls back-to-back, and the test mock answers each method with a
     // single canned response — so we seed `nft_cache` via the test seam
     // for tests that exercise reads beyond detection. Detection itself
-    // is covered by ChainClient unit tests in bloom-chain.
+    // is covered by ChainClient unit tests in bloom-evm.
 
     /// 32-byte big-endian encoding of a uint256 / bool / right-aligned
     /// address, wrapped as a JSON-RPC `result` string.
@@ -2362,7 +2638,7 @@ mod tests {
     /// kind cache pre-seeded.
     async fn nft_handler_with_seed(
         responses: std::collections::HashMap<String, serde_json::Value>,
-        seed: Option<bloom_chain::NftKind>,
+        seed: Option<bloom_evm::NftKind>,
     ) -> ChainsHandler {
         let rpc = spawn_rpc(31338, responses);
         let h = ChainsHandler::new(registry_for_rpc(rpc, 31338));
@@ -2479,7 +2755,7 @@ mod tests {
     async fn nft_collection_kind_returns_erc721_when_seeded() {
         let h = nft_handler_with_seed(
             std::collections::HashMap::new(),
-            Some(bloom_chain::NftKind::Erc721),
+            Some(bloom_evm::NftKind::Erc721),
         )
         .await;
         let p = VfsPath::parse(&format!("/test/contracts/{NFT_CONTRACT}/nft/kind")).unwrap();
@@ -2491,7 +2767,7 @@ mod tests {
     async fn nft_collection_kind_returns_erc1155_when_seeded() {
         let h = nft_handler_with_seed(
             std::collections::HashMap::new(),
-            Some(bloom_chain::NftKind::Erc1155),
+            Some(bloom_evm::NftKind::Erc1155),
         )
         .await;
         let p = VfsPath::parse(&format!("/test/contracts/{NFT_CONTRACT}/nft/kind")).unwrap();
@@ -2515,7 +2791,7 @@ mod tests {
         let owner_addr: alloy::primitives::Address = HOLDER_ADDR.parse().unwrap();
         let mut routes = std::collections::HashMap::new();
         routes.insert("eth_call".into(), enc_address_value(owner_addr));
-        let h = nft_handler_with_seed(routes, Some(bloom_chain::NftKind::Erc721)).await;
+        let h = nft_handler_with_seed(routes, Some(bloom_evm::NftKind::Erc721)).await;
         let p = VfsPath::parse(&format!("/test/contracts/{NFT_CONTRACT}/nft/owner_of/42")).unwrap();
         let bytes = h.read(&p).await.unwrap();
         let s = std::str::from_utf8(&bytes).unwrap().trim();
@@ -2531,7 +2807,7 @@ mod tests {
         // sentinel rather than erroring so directory walks stay clean.
         let h = nft_handler_with_seed(
             std::collections::HashMap::new(),
-            Some(bloom_chain::NftKind::Erc1155),
+            Some(bloom_evm::NftKind::Erc1155),
         )
         .await;
         let p = VfsPath::parse(&format!(
@@ -2546,7 +2822,7 @@ mod tests {
     async fn nft_approved_erc1155_returns_not_applicable() {
         let h = nft_handler_with_seed(
             std::collections::HashMap::new(),
-            Some(bloom_chain::NftKind::Erc1155),
+            Some(bloom_evm::NftKind::Erc1155),
         )
         .await;
         let p = VfsPath::parse(&format!(
@@ -2564,7 +2840,7 @@ mod tests {
             "eth_call".into(),
             enc_string_value("ipfs://QmFoo/{id}.json"),
         );
-        let h = nft_handler_with_seed(routes, Some(bloom_chain::NftKind::Erc1155)).await;
+        let h = nft_handler_with_seed(routes, Some(bloom_evm::NftKind::Erc1155)).await;
         // Token id 1 → 64-char hex, all zeros except trailing 01.
         let p = VfsPath::parse(&format!(
             "/test/addresses/{HOLDER_ADDR}/nfts/{NFT_CONTRACT}/1/uri"
@@ -2583,7 +2859,7 @@ mod tests {
         let data_uri = r#"data:application/json,{"name":"item-1"}"#;
         let mut routes = std::collections::HashMap::new();
         routes.insert("eth_call".into(), enc_string_value(data_uri));
-        let h = nft_handler_with_seed(routes, Some(bloom_chain::NftKind::Erc721)).await;
+        let h = nft_handler_with_seed(routes, Some(bloom_evm::NftKind::Erc721)).await;
         let p = VfsPath::parse(&format!(
             "/test/addresses/{HOLDER_ADDR}/nfts/{NFT_CONTRACT}/1/metadata.json"
         ))
@@ -2602,7 +2878,7 @@ mod tests {
             "eth_call".into(),
             enc_uint256_value(alloy::primitives::U256::from(5u64)),
         );
-        let h = nft_handler_with_seed(routes, Some(bloom_chain::NftKind::Erc1155)).await;
+        let h = nft_handler_with_seed(routes, Some(bloom_evm::NftKind::Erc1155)).await;
         let p = VfsPath::parse(&format!(
             "/test/addresses/{HOLDER_ADDR}/nfts/{NFT_CONTRACT}/9/balance"
         ))
@@ -2616,7 +2892,7 @@ mod tests {
         let owner_addr: alloy::primitives::Address = HOLDER_ADDR.parse().unwrap();
         let mut routes = std::collections::HashMap::new();
         routes.insert("eth_call".into(), enc_address_value(owner_addr));
-        let h = nft_handler_with_seed(routes, Some(bloom_chain::NftKind::Erc721)).await;
+        let h = nft_handler_with_seed(routes, Some(bloom_evm::NftKind::Erc721)).await;
         let p = VfsPath::parse(&format!(
             "/test/addresses/{HOLDER_ADDR}/nfts/{NFT_CONTRACT}/42/is_owner"
         ))
@@ -2649,7 +2925,7 @@ mod tests {
         // decode error.
         let h = nft_handler_with_seed(
             std::collections::HashMap::new(),
-            Some(bloom_chain::NftKind::Unknown),
+            Some(bloom_evm::NftKind::Unknown),
         )
         .await;
         let p = VfsPath::parse(&format!(
@@ -2671,7 +2947,7 @@ mod tests {
         // "unknown\n" so the file is still readable.
         let h = nft_handler_with_seed(
             std::collections::HashMap::new(),
-            Some(bloom_chain::NftKind::Erc721),
+            Some(bloom_evm::NftKind::Erc721),
         )
         .await;
         let p =
@@ -2729,6 +3005,73 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(h.cache_ttl(&p), Some(Duration::from_secs(3600)));
+    }
+
+    #[tokio::test]
+    async fn balance_cache_ttls_cover_native_and_token_balance_leaves() {
+        let h = ChainsHandler::new(anvil_registry());
+        let chain = h.registry.list_names()[0].clone();
+        for leaf in ["balance", "balance.raw", "balance.json", "nonce"] {
+            let p = VfsPath::parse(&format!("/{chain}/addresses/{HOLDER_ADDR}/{leaf}")).unwrap();
+            assert_eq!(
+                h.cache_ttl(&p),
+                Some(super::super::balances::LIVE_BALANCE_TTL),
+                "native leaf {leaf}"
+            );
+        }
+        for leaf in ["balance", "balance.raw", "balance.json"] {
+            let p = VfsPath::parse(&format!(
+                "/{chain}/addresses/{HOLDER_ADDR}/tokens/{NFT_CONTRACT}/{leaf}"
+            ))
+            .unwrap();
+            assert_eq!(
+                h.cache_ttl(&p),
+                Some(super::super::balances::LIVE_BALANCE_TTL),
+                "token leaf {leaf}"
+            );
+        }
+        for leaf in ["symbol", "decimals"] {
+            let p = VfsPath::parse(&format!(
+                "/{chain}/addresses/{HOLDER_ADDR}/tokens/{NFT_CONTRACT}/{leaf}"
+            ))
+            .unwrap();
+            assert_eq!(
+                h.cache_ttl(&p),
+                Some(super::super::balances::TOKEN_METADATA_TTL),
+                "token metadata leaf {leaf}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn balance_native_display_and_json_are_self_describing() {
+        let mut responses = std::collections::HashMap::new();
+        responses.insert(
+            "eth_getBalance".to_string(),
+            serde_json::Value::String("0xde0b6b3a7640000".into()),
+        );
+        let rpc = spawn_rpc(31338, responses);
+        let h = ChainsHandler::new(registry_for_rpc(rpc, 31338));
+        let balance = h
+            .read(&VfsPath::parse(&format!("/test/addresses/{HOLDER_ADDR}/balance")).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(std::str::from_utf8(&balance).unwrap(), "1 ETH\n");
+
+        let raw = h
+            .read(&VfsPath::parse(&format!("/test/addresses/{HOLDER_ADDR}/balance.raw")).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(std::str::from_utf8(&raw).unwrap(), "1000000000000000000\n");
+
+        let json = h
+            .read(&VfsPath::parse(&format!("/test/addresses/{HOLDER_ADDR}/balance.json")).unwrap())
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&json).unwrap();
+        assert_eq!(json["symbol"], "ETH");
+        assert_eq!(json["raw"], "1000000000000000000");
+        assert_eq!(json["display"], "1 ETH");
     }
 
     // ---- methods/ enumeration + EIP-1967 proxy resolution ----------------

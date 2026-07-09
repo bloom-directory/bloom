@@ -1,13 +1,11 @@
 #!/usr/bin/env bash
 # Acceptance scenario for bloom.
 #
-# Drives the four happy paths from §11.4 of the design doc using only
-# `bloom` CLI calls (which exercise the same code paths as VFS writes).
+# Drives the local acceptance paths using only `bloom` CLI calls (which
+# exercise the same code paths as VFS writes).
 #
 # 1. Native ETH send (Anvil, local-only)
 # 2. ERC-20 transfer (deploys MockERC20, transfers, verifies balance)
-# 3. Uniswap V2 swap (mainnet fork; skipped if BLOOM_MAINNET_RPC unset)
-# 4. Enso intent (mainnet fork + Enso key; skipped if either unset)
 #
 # Requirements: foundry (anvil + cast + forge) on PATH, jq, and the
 # bloom workspace built (`cargo build --release -p bloom`).
@@ -32,6 +30,28 @@ fail() { printf '\033[1;31m[fail]\033[0m %s\n' "$*"; exit 1; }
 ok()   { printf '\033[1;32m[ok]\033[0m %s\n' "$*"; }
 
 bloom() { RUST_LOG=error "$BLOOM_BIN" --home "$HOME_DIR" "$@" 2>/dev/null; }
+
+expect_sealed_challenge() {
+  local staged_id=$1 label=$2 err_file central_id challenge
+  err_file="$HOME_DIR/${label// /_}.confirm.err"
+  if BLOOM_PASSPHRASE=acceptance-pass "$BLOOM_BIN" --home "$HOME_DIR" wallet confirm \
+      alice local "$staged_id" --passphrase acceptance-pass --text y --quiet \
+      >"$HOME_DIR/${label// /_}.confirm.out" 2>"$err_file"; then
+    fail "$label: confirm unexpectedly succeeded without Sealed Approval"
+  fi
+  grep -q "broadcast approval required" "$err_file" \
+    || fail "$label: confirm did not report sealed approval requirement"
+  test -f "$HOME_DIR/outbox/alice/local/pending/$staged_id/approval_challenge.json" \
+    || fail "$label: wallet projection missing approval_challenge.json"
+  central_id=$(jq -r '.action_id' "$HOME_DIR/outbox/alice/local/pending/$staged_id/approval_challenge.json")
+  challenge="$HOME_DIR/central_outbox/pending/$central_id/approval_challenge.json"
+  test -f "$challenge" || fail "$label: central outbox missing approval_challenge.json for $central_id"
+  jq -e '.ceremony_url | strings | (startswith("http://localhost") or startswith("http://127.0.0.1"))' "$challenge" >/dev/null \
+    || fail "$label: central approval_challenge.json missing local ceremony_url"
+  jq -e --arg id "$central_id" '.action_id == $id' "$challenge" >/dev/null \
+    || fail "$label: central challenge action_id mismatch"
+  ok "$label staged $staged_id -> central /outbox/pending/$central_id with ceremony_url"
+}
 
 # Anvil's default mnemonic — first account, 10000 ETH.
 ANVIL_KEY=$ANVIL_KEY_0
@@ -74,27 +94,26 @@ EOF
 
 # 0b. Import the anvil key.
 log "importing anvil key"
-BLOOM_PASSPHRASE="acceptance-pass" bloom wallet import alice "$ANVIL_KEY" --passphrase acceptance-pass >/dev/null
+PASSPHRASE_FILE="$HOME_DIR/acceptance-passphrase"
+printf '%s\n' "acceptance-pass" > "$PASSPHRASE_FILE"
+chmod 600 "$PASSPHRASE_FILE"
+bloom wallet import alice "$ANVIL_KEY" \
+  --local \
+  --allow-passphrase-wallet \
+  --passphrase-file "$PASSPHRASE_FILE" \
+  >/dev/null
 bloom wallet list
 
 # ============================================================== 1. native
-log "scenario 1: native ETH send"
+log "scenario 1: native ETH send sealed-approval gate"
 INTENT='{"to":"'"$DEST_ADDR"'","value":"0.5 ETH","chain":"local"}'
 STAGED=$(BLOOM_PASSPHRASE=acceptance-pass bloom wallet stage alice local --intent "$INTENT")
 log "staged id: $STAGED"
-BEFORE=$(cast balance "$DEST_ADDR" --rpc-url http://127.0.0.1:8545)
-BLOOM_PASSPHRASE=acceptance-pass bloom wallet confirm alice local "$STAGED" --passphrase acceptance-pass --text y
-sleep 1
-AFTER=$(cast balance "$DEST_ADDR" --rpc-url http://127.0.0.1:8545)
-[ "$AFTER" != "$BEFORE" ] || fail "native send: balance unchanged"
-ok "native send delta: $BEFORE -> $AFTER"
+expect_sealed_challenge "$STAGED" "native send"
 
 # ============================================================== 2. ERC-20
 log "scenario 2: ERC-20 transfer"
-# Deploy a minimal ERC-20 with cast (constructor mints to msg.sender).
-TOKEN_BYTECODE='0x608060405234801561001057600080fd5b5060405161083138038061083183398101604081905261002f9161013e565b3360009081526020819052604090208390558060038361004f9190610162565b8210156100a2576100a26040516371fe1ee960e11b8152600401604051809103906000f08015801561008c573d6000803e3d6000fd5b50505b505050610175565b'
-# Using a precompiled minimal ERC20 deployed via solc:
-# For test, use forge to deploy:
+# Deploy a minimal ERC-20 with forge (constructor mints to msg.sender).
 forge --version >/dev/null 2>&1 || { log "forge missing — skipping ERC-20"; SKIP_ERC20=1; }
 
 if [ -z "${SKIP_ERC20:-}" ]; then
@@ -144,28 +163,8 @@ SOL
   ERC20_INTENT='{"chain":"local","token":"'"$TOKEN_ADDR"'","to":"'"$DEST_ADDR"'","value":"100"}'
   STAGED=$(BLOOM_PASSPHRASE=acceptance-pass bloom wallet stage alice local --intent "$ERC20_INTENT")
   log "erc20 staged id: $STAGED"
-  BLOOM_PASSPHRASE=acceptance-pass bloom wallet confirm alice local "$STAGED" --passphrase acceptance-pass --text y
-  sleep 1
-  TOKEN_BAL=$(cast call "$TOKEN_ADDR" "balanceOf(address)(uint256)" "$DEST_ADDR" --rpc-url http://127.0.0.1:8545)
-  [ "$TOKEN_BAL" != "0" ] || fail "erc20: dest balance still zero"
-  ok "erc20 dest balance: $TOKEN_BAL"
+  expect_sealed_challenge "$STAGED" "erc20 transfer"
   rm -rf "$TMPDIR_FORGE"
-fi
-
-# ============================================================== 3. Uniswap V2 (fork)
-if [ -n "${BLOOM_MAINNET_RPC:-}" ]; then
-  log "scenario 3: Uniswap V2 swap (skipping in basic acceptance — see docs)"
-  ok "scenario 3 documented as TODO; requires mainnet fork harness"
-else
-  log "scenario 3: skipped (BLOOM_MAINNET_RPC not set)"
-fi
-
-# ============================================================== 4. Enso (fork)
-if [ -n "${BLOOM_ENSO_KEY:-}" ] && [ -n "${BLOOM_MAINNET_RPC:-}" ]; then
-  log "scenario 4: Enso intent (skipping in basic acceptance)"
-  ok "scenario 4 documented as TODO"
-else
-  log "scenario 4: skipped (BLOOM_ENSO_KEY or BLOOM_MAINNET_RPC not set)"
 fi
 
 ok "acceptance complete"

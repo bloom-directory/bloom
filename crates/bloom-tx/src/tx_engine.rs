@@ -6,16 +6,34 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use alloy::network::EthereumWallet;
-use alloy::network::{NetworkTransactionBuilder, TransactionBuilder};
-use alloy::primitives::{Address, B256, Bytes, U256};
+use alloy::consensus::{SignableTransaction, TxEip1559, TxEnvelope, TxLegacy};
+use alloy::eips::Encodable2718;
+use alloy::eips::eip2930::AccessList;
+use alloy::network::TransactionBuilder;
+use alloy::primitives::{Address, B256, Bytes, Signature, TxKind, U256};
 use alloy::rpc::types::eth::TransactionRequest;
+#[cfg(test)]
 use alloy::signers::local::PrivateKeySigner;
 use alloy::sol;
 use alloy::sol_types::SolCall;
-use bloom_chain::{ChainClient, ChainError, IERC20, NftKind};
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use bloom_auth_api::petal_identity::{
+    FIRST_PARTY_PETAL_VERSION_V0, PETAL_ID_EVM_WALLET, PLACEHOLDER_DIGEST_EVM_WALLET,
+};
+use bloom_auth_api::{
+    ApprovalVerifier, AssuranceLevel, AuthEntryState, AuthStoreWriter, CanonicalEnvelope,
+    DaemonGrantTerms, EVM_ERC20_TRANSFER_METHOD, EVM_OWNER_SESSION_USE_ACTION_KIND,
+    EVM_SEALED_INTENT_SUBJECT_KIND, EVM_SEALED_INTENT_SUBJECT_SCHEMA_V1, EVM_TX_SIGN_INTENT,
+    EvmCallFact, EvmFeeFacts, EvmNonceIntent, EvmOriginalTxFact, EvmOwnerSessionUseFact,
+    EvmOwnerSigningSessionScope, EvmOwnerSigningSessionUse, EvmSealedActionKind,
+    EvmSealedIntentSubject, EvmTokenFact, EvmUnsignedEnvelopeFacts, EvmValueFact, GrantStore,
+    NonceState, PetalHost, PetalPolicySnapshot, SealedAction, SignHashRequest, SignedApproval,
+    SigningAttestation, StandingSessionRecord,
+};
+use bloom_evm::{ChainClient, ChainError, IERC20, NftKind};
 
-// Local NFT-write interfaces. `bloom-chain` declares the read shapes for
+// Local NFT-write interfaces. `bloom-evm` declares the read shapes for
 // ERC-721/1155; we add the write functions here so calldata encoding stays
 // in bloom-tx without expanding the chain crate's read-only surface.
 sol! {
@@ -109,6 +127,18 @@ pub enum TxEngineError {
         "Enso quote is {age}s old (expires ~5 min) — re-run the intent for a fresh route, or write 'override' to broadcast anyway"
     )]
     EnsoQuoteStale { age: u64 },
+    #[error("dependency '{dep_id}' not satisfied: {reason}")]
+    DependencyNotSatisfied { dep_id: String, reason: String },
+    #[error("pre-broadcast simulation reverted: {reason} — write 'override' to broadcast anyway")]
+    SimulationReverted { reason: String },
+    #[error(
+        "nonce gap: tx for {from} uses nonce {staged} but the account's next on-chain nonce is {chain_next} — the node would queue it behind the missing nonce(s) and it could never mine. Broadcast nonce {chain_next} first, or restage with an explicit `nonce` to fill the gap deliberately."
+    )]
+    NonceGap {
+        from: String,
+        staged: u64,
+        chain_next: u64,
+    },
 }
 
 /// In-memory cache for ERC-20 metadata keyed by `(chain_id, address)`.
@@ -121,6 +151,84 @@ type PrivateRpcs = Arc<RwLock<BTreeMap<(u64, String), Arc<dyn bloom_mempool::Pri
 struct SignedRawTx {
     raw: Bytes,
     hash: B256,
+}
+
+enum UnsignedEvmTx {
+    Legacy(TxLegacy),
+    Eip1559(TxEip1559),
+}
+
+struct PreparedEvmTx {
+    unsigned: UnsignedEvmTx,
+    signing_hash: B256,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EvmOutboxActionKind {
+    Confirm,
+    Replace,
+    Cancel,
+}
+
+impl EvmOutboxActionKind {
+    fn action_kind(self) -> &'static str {
+        match self {
+            Self::Confirm => "evm_confirm",
+            Self::Replace => "evm_replace",
+            Self::Cancel => "evm_cancel",
+        }
+    }
+
+    fn sealed_action_kind(self) -> EvmSealedActionKind {
+        match self {
+            Self::Confirm => EvmSealedActionKind::Confirm,
+            Self::Replace => EvmSealedActionKind::Replace,
+            Self::Cancel => EvmSealedActionKind::Cancel,
+        }
+    }
+
+    fn broadcast_kind(self) -> BroadcastAttemptKind {
+        match self {
+            Self::Confirm => BroadcastAttemptKind::Confirm,
+            Self::Replace => BroadcastAttemptKind::Replacement,
+            Self::Cancel => BroadcastAttemptKind::CancelReplacement,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct EvmOwnerSessionExecution {
+    pub tx_hash: B256,
+    pub nonce: u64,
+    pub signing_hash: B256,
+}
+
+#[derive(Debug, Clone)]
+pub struct SealedActionExecution {
+    pub action_id: String,
+    pub petal_id: String,
+    pub petal_digest: String,
+    pub action_kind: String,
+    pub tx_hash: B256,
+    pub nonce: u64,
+    pub signing_hash: B256,
+}
+
+struct EvmCentralResult<'a> {
+    action_id: &'a str,
+    state: OutboxState,
+    outcome: &'a str,
+    tx_hash: B256,
+    nonce: u64,
+    signing_hash: &'a B256,
+    action_kind: &'a str,
+}
+
+struct EvmCentralFailure<'a> {
+    action_id: &'a str,
+    state: OutboxState,
+    outcome: &'a str,
+    reason: &'a str,
 }
 
 struct SubmitResult {
@@ -189,6 +297,10 @@ struct TokenMeta {
 type NonceLocks =
     Arc<parking_lot::Mutex<HashMap<(String, String, Address), Arc<tokio::sync::Mutex<()>>>>>;
 
+const OUTBOX_APPROVAL_FILE: &str = "approval.json";
+const OUTBOX_APPROVAL_CHALLENGE_FILE: &str = "approval_challenge.json";
+const OUTBOX_APPROVAL_TTL_MS: u64 = 5 * 60 * 1000;
+
 /// Stage / confirm the lifecycle.
 #[derive(Clone)]
 pub struct TxEngine {
@@ -216,6 +328,13 @@ pub struct TxEngine {
     /// microseconds only (HashMap lookup/insert); the inner
     /// `tokio::sync::Mutex` is the actual per-sender stage lock.
     nonce_locks: NonceLocks,
+    /// Bounded policy sessions: one ceremony authorizes many in-bounds
+    /// confirms without a fresh per-tx review. See [`crate::session`].
+    session_store: crate::session::SessionStore,
+    approval_verifier: Option<Arc<dyn ApprovalVerifier>>,
+    auth_writer: Option<Arc<dyn AuthStoreWriter>>,
+    grant_store: Option<Arc<dyn GrantStore>>,
+    petal_host: Option<Arc<dyn PetalHost>>,
 }
 
 impl TxEngine {
@@ -230,7 +349,37 @@ impl TxEngine {
             mempool_indexes: Arc::new(RwLock::new(BTreeMap::new())),
             private_rpcs: Arc::new(RwLock::new(BTreeMap::new())),
             nonce_locks: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            session_store: crate::session::SessionStore::new(),
+            approval_verifier: None,
+            auth_writer: None,
+            grant_store: None,
+            petal_host: None,
         }
+    }
+
+    pub fn with_auth_services(
+        mut self,
+        approval_verifier: Arc<dyn ApprovalVerifier>,
+        auth_writer: Arc<dyn AuthStoreWriter>,
+    ) -> Self {
+        self.approval_verifier = Some(approval_verifier);
+        self.auth_writer = Some(auth_writer);
+        self
+    }
+
+    pub fn with_host_signing_services(
+        mut self,
+        grant_store: Arc<dyn GrantStore>,
+        petal_host: Arc<dyn PetalHost>,
+    ) -> Self {
+        self.grant_store = Some(grant_store);
+        self.petal_host = Some(petal_host);
+        self
+    }
+
+    /// Access the bounded policy-session store (mint/revoke/list live here).
+    pub fn session_store(&self) -> &crate::session::SessionStore {
+        &self.session_store
     }
 
     /// Return (or create) the per-(wallet, chain, from) `tokio::sync::Mutex`
@@ -512,19 +661,55 @@ impl TxEngine {
                 to,
                 value,
                 token,
+                amount,
                 data,
             } => {
                 let to_addr = self.resolve_recipient_async(to, address_book).await?;
                 if let Some(v) = Self::resolve_native_value(value, token)? {
+                    if !amount.trim().is_empty() {
+                        return Err(TxEngineError::Amount(
+                            "native sends must use value; amount is only for token sends".into(),
+                        ));
+                    }
                     let data = data.clone().unwrap_or_else(|| "0x".into());
                     Ok((to_addr, v, data, None, None))
                 } else {
+                    if amount.trim().is_empty() {
+                        return Err(TxEngineError::Amount(
+                            "token sends require amount; value is only for native sends".into(),
+                        ));
+                    }
+                    if !value.trim().is_empty() && value.trim() != "0" {
+                        return Err(TxEngineError::Amount(
+                            "token sends must use amount; value is reserved for native sends"
+                                .into(),
+                        ));
+                    }
                     let token_str = token.as_deref().unwrap_or("");
                     let (token_addr, sym_hint) = Self::resolve_token_address(token_str, chain_id)?;
                     let meta = self.token_meta(chain, token_addr, &sym_hint).await?;
                     let parsed =
-                        parse_amount(value).map_err(|e| TxEngineError::Amount(e.to_string()))?;
-                    let amount = parse_units(&parsed.number, meta.decimals)
+                        parse_amount(amount).map_err(|e| TxEngineError::Amount(e.to_string()))?;
+                    // A native metric unit (wei/gwei/eth) on an ERC-20 amount is
+                    // ambiguous — it would be silently rescaled by token
+                    // decimals. Reject it and point at the unambiguous forms.
+                    // A bare integer (explicit_unit == false) is still accepted
+                    // as a human token amount.
+                    if parsed.explicit_unit && parsed.is_native() {
+                        return Err(TxEngineError::Amount(format!(
+                            "'{amount}' uses a native unit ('{}') for an ERC-20 token; write a human \
+                             amount like '10 {}' or raw base units like '10000000 base'",
+                            parsed.unit, meta.symbol
+                        )));
+                    }
+                    // `base` means the number is already in token base units —
+                    // do not rescale by decimals.
+                    let scale = if parsed.unit == "base" {
+                        0
+                    } else {
+                        meta.decimals
+                    };
+                    let amount = parse_units(&parsed.number, scale)
                         .map_err(|e| TxEngineError::Amount(e.to_string()))?;
                     let call = IERC20::transferCall {
                         to: to_addr,
@@ -1004,16 +1189,20 @@ impl TxEngine {
                 } else {
                     bloom_proto::PolicyOutcome::Pass
                 };
-                staged_policy_extras.push(bloom_proto::PolicyCheck {
-                    rule: "nft.approve_all".into(),
-                    outcome,
-                    message: if *approved {
+                staged_policy_extras.push(if *approved {
+                    bloom_proto::PolicyCheck::soft(
+                        "nft.approve_all",
+                        outcome,
                         format!(
                             "operator-wide approval to {op_disp} — review carefully (write override token to confirm)"
-                        )
-                    } else {
-                        format!("revoking operator-wide approval for {op_disp}")
-                    },
+                        ),
+                    )
+                } else {
+                    bloom_proto::PolicyCheck::informational(
+                        "nft.approve_all",
+                        outcome,
+                        format!("revoking operator-wide approval for {op_disp}"),
+                    )
                 });
             }
             RawIntentBody::Enso { .. } => {}
@@ -1024,17 +1213,20 @@ impl TxEngine {
         let needs_usd = policy.caps.per_tx_usd.is_some()
             || policy.caps.require_confirm_above_usd.is_some()
             || policy.caps.per_day_usd.is_some();
-        policy_ctx.usd_value = if needs_usd && value_wei > U256::ZERO {
-            if let Some(oracle) = &self.price_oracle {
+        policy_ctx.usd_value = intent
+            .usd_value_hint
+            .as_deref()
+            .and_then(|s| s.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0);
+        if policy_ctx.usd_value.is_none() && needs_usd && value_wei > U256::ZERO {
+            policy_ctx.usd_value = if let Some(oracle) = &self.price_oracle {
                 oracle
                     .native_usd(&spec.name, value_wei, spec.native_decimals)
                     .await
             } else {
                 None
-            }
-        } else {
-            None
-        };
+            };
+        }
         // Trailing 24h USD spend across all chains for this wallet.
         // Only consulted when the policy actually has a per_day cap;
         // we still set it whenever a USD rule fires so plan.md / audit
@@ -1067,6 +1259,8 @@ impl TxEngine {
             token: token_for_plan,
             nft: nft_for_plan,
             usd_value: policy_ctx.usd_value,
+            depends_on: None,
+            action_id: None,
         };
         staged.policy_checks = policy_engine::evaluate(
             policy,
@@ -1106,10 +1300,8 @@ impl TxEngine {
         chain_name: &str,
         id: &str,
         chain: &ChainClient,
-        signer: &PrivateKeySigner,
         policy: &Policy,
         confirm_text: &str,
-        reviewed_intent_hash: Option<&str>,
     ) -> Result<StagedTx, TxEngineError> {
         self.assert_write_permit(permit)?;
         let entry = self
@@ -1122,7 +1314,7 @@ impl TxEngine {
             .read_broadcast_attempt(&entry, BroadcastAttemptKind::Confirm)?
         {
             return self
-                .reconcile_confirm_attempt(&entry, attempt, chain, policy, reviewed_intent_hash)
+                .reconcile_confirm_attempt(&entry, attempt, chain, policy)
                 .await;
         }
 
@@ -1136,6 +1328,14 @@ impl TxEngine {
                 expired_at: staged.expires_ms,
                 now,
             }));
+        }
+
+        // Same-chain dependency gate: a tx that depends on another (e.g. a
+        // route that spends an approve) must not broadcast until that
+        // predecessor has mined *successfully*. A reverted predecessor still
+        // consumed its nonce, so this is an explicit refuse — never a reshuffle.
+        if let Some(dep_id) = staged.depends_on.clone() {
+            self.ensure_dependency_satisfied(wallet, chain_name, &dep_id)?;
         }
 
         // Policy gate.
@@ -1192,23 +1392,73 @@ impl TxEngine {
             );
             return Err(TxEngineError::BroadcastDisabled(spec.name.clone()));
         }
-        self.ensure_action_authorized(
-            &staged,
-            policy,
-            reviewed_intent_hash,
-            bloom_proto::AuthorizationSurface::Cli,
-        )?;
+        // Pre-broadcast simulation first (no side effects): eth_call against
+        // current state so a tx that would revert is caught here instead of
+        // burning gas. The override sentinel forces it through.
+        if !override_text {
+            self.simulate_or_reject(&staged, chain).await?;
+        }
 
-        let tx_hash = self
-            .submit_with_marker(
+        // Authorization. The policy gates above (hard deny / unoverridden warn)
+        // have already passed, so a bounded policy session may authorize this
+        // confirm without a fresh per-tx review; otherwise fall back to the
+        // standard per-tx authorization. The session debit is atomic; we refund
+        // it if the broadcast then fails.
+        let subject = self.authorization_subject(&staged);
+        let session_debit = self.session_store.authorize_and_debit(
+            wallet,
+            staged.chain_id,
+            &staged.id,
+            subject.total_value_usd_micro,
+            subject.value_moving,
+            now_ms(),
+        );
+        let unsigned = self.build_unsigned_evm_tx(&staged, chain)?;
+        let prepared = PreparedEvmTx {
+            signing_hash: Self::unsigned_signing_hash(&unsigned),
+            unsigned,
+        };
+        let signing_hash = prepared.signing_hash;
+
+        if let Some((ref sid, _)) = session_debit {
+            debug!(id = %staged.id, session = %sid, "tx.authorized_by_session");
+        } else {
+            self.ensure_action_authorized(
                 &entry,
-                BroadcastAttemptKind::Confirm,
                 &staged,
-                chain,
-                signer,
+                EvmOutboxActionKind::Confirm,
+                &signing_hash,
                 policy,
+                bloom_proto::AuthorizationSurface::Cli,
             )
             .await?;
+        }
+
+        let tx_hash = match self
+            .submit_with_marker(
+                &entry,
+                EvmOutboxActionKind::Confirm,
+                &staged,
+                chain,
+                policy,
+                prepared,
+            )
+            .await
+        {
+            Ok(h) => h,
+            Err(e) => {
+                if let Some((sid, amt)) = session_debit {
+                    let attempted = self
+                        .outbox
+                        .read_broadcast_attempt(&entry, BroadcastAttemptKind::Confirm)?
+                        .is_some();
+                    if !attempted {
+                        self.session_store.refund(&sid, amt);
+                    }
+                }
+                return Err(e);
+            }
+        };
         info!(id=%staged.id, hash=%format!("{:#x}", tx_hash), "tx.broadcast");
 
         staged.status = TxStatus::Sent;
@@ -1227,6 +1477,17 @@ impl TxEngine {
             "tx_hash",
             staged.tx_hash.as_ref().unwrap().as_bytes(),
         )?;
+        if let Some(action_id) = staged.action_id.as_deref() {
+            self.write_central_evm_result(EvmCentralResult {
+                action_id,
+                state: OutboxState::Sent,
+                outcome: "sent",
+                tx_hash,
+                nonce: staged.nonce,
+                signing_hash: &signing_hash,
+                action_kind: EvmOutboxActionKind::Confirm.action_kind(),
+            })?;
+        }
 
         Ok(staged)
     }
@@ -1237,14 +1498,13 @@ impl TxEngine {
         attempt: BroadcastAttempt,
         chain: &ChainClient,
         policy: &Policy,
-        reviewed_intent_hash: Option<&str>,
     ) -> Result<StagedTx, TxEngineError> {
         let tx_hash: B256 = attempt
             .tx_hash
             .parse()
             .map_err(|e: alloy::hex::FromHexError| TxEngineError::Address(e.to_string()))?;
         if chain.tx_by_hash(tx_hash).await?.is_some() || chain.receipt(tx_hash).await?.is_some() {
-            return self.finalize_sent(entry, tx_hash);
+            return self.finalize_sent(entry, tx_hash, chain);
         }
 
         let from: Address = attempt
@@ -1323,12 +1583,17 @@ impl TxEngine {
                         reason: "current policy changed to private routing".into(),
                     });
                 }
+                let unsigned = self.build_unsigned_evm_tx(&entry.staged, chain)?;
+                let signing_hash = Self::unsigned_signing_hash(&unsigned);
                 self.ensure_action_authorized(
+                    entry,
                     &entry.staged,
+                    EvmOutboxActionKind::Confirm,
+                    &signing_hash,
                     policy,
-                    reviewed_intent_hash,
                     bloom_proto::AuthorizationSurface::Cli,
-                )?;
+                )
+                .await?;
                 let raw = self.outbox.read_broadcast_raw_tx(
                     entry,
                     BroadcastAttemptKind::Confirm,
@@ -1345,7 +1610,7 @@ impl TxEngine {
                         returned: format!("{:#x}", returned),
                     });
                 }
-                self.finalize_sent(entry, tx_hash)
+                self.finalize_sent(entry, tx_hash, chain)
             }
         }
     }
@@ -1354,6 +1619,7 @@ impl TxEngine {
         &self,
         entry: &crate::outbox::OutboxEntry,
         tx_hash: B256,
+        chain: &ChainClient,
     ) -> Result<StagedTx, TxEngineError> {
         let mut staged = entry.staged.clone();
         staged.status = TxStatus::Sent;
@@ -1371,7 +1637,104 @@ impl TxEngine {
             "tx_hash",
             staged.tx_hash.as_ref().unwrap().as_bytes(),
         )?;
+        if let Some(action_id) = staged.action_id.as_deref() {
+            let signing_hash = self
+                .build_unsigned_evm_tx(&staged, chain)
+                .map(|unsigned| Self::unsigned_signing_hash(&unsigned))?;
+            self.write_central_evm_result(EvmCentralResult {
+                action_id,
+                state: OutboxState::Sent,
+                outcome: "sent",
+                tx_hash,
+                nonce: staged.nonce,
+                signing_hash: &signing_hash,
+                action_kind: EvmOutboxActionKind::Confirm.action_kind(),
+            })?;
+        }
         Ok(staged)
+    }
+
+    fn write_central_evm_result(&self, central: EvmCentralResult<'_>) -> Result<(), TxEngineError> {
+        let result = serde_json::json!({
+            "schema": "bloom.evm_execution_result.v1",
+            "action_id": central.action_id,
+            "state": central.state.dirname(),
+            "outcome": central.outcome,
+            "action_kind": central.action_kind,
+            "tx_hash": format!("{:#x}", central.tx_hash),
+            "nonce": central.nonce,
+            "signing_hash": format!("{:#x}", central.signing_hash),
+            "created_ms": now_ms(),
+        });
+        let mut status = self.central_status_base(central.action_id, central.state)?;
+        let status_obj = status.as_object_mut().expect("central status is object");
+        status_obj.insert("outcome".into(), serde_json::json!(central.outcome));
+        status_obj.insert(
+            "tx_hash".into(),
+            serde_json::json!(format!("{:#x}", central.tx_hash)),
+        );
+        status_obj.insert("action_kind".into(), serde_json::json!(central.action_kind));
+        self.outbox.write_central_action_artifact(
+            central.action_id,
+            central.state,
+            "result.json",
+            &serde_json::to_vec_pretty(&result).unwrap(),
+        )?;
+        self.outbox.write_central_action_artifact(
+            central.action_id,
+            central.state,
+            "status.json",
+            &serde_json::to_vec_pretty(&status).unwrap(),
+        )?;
+        Ok(())
+    }
+
+    fn write_central_evm_failure_result(
+        &self,
+        central: EvmCentralFailure<'_>,
+    ) -> Result<(), TxEngineError> {
+        let result = serde_json::json!({
+            "schema": "bloom.evm_execution_result.v1",
+            "action_id": central.action_id,
+            "state": central.state.dirname(),
+            "outcome": central.outcome,
+            "error": central.reason,
+            "created_ms": now_ms(),
+        });
+        let mut status = self.central_status_base(central.action_id, central.state)?;
+        let status_obj = status.as_object_mut().expect("central status is object");
+        status_obj.insert("outcome".into(), serde_json::json!(central.outcome));
+        status_obj.insert("error".into(), serde_json::json!(central.reason));
+        self.outbox.write_central_action_artifact(
+            central.action_id,
+            central.state,
+            "result.json",
+            &serde_json::to_vec_pretty(&result).unwrap(),
+        )?;
+        self.outbox.write_central_action_artifact(
+            central.action_id,
+            central.state,
+            "status.json",
+            &serde_json::to_vec_pretty(&status).unwrap(),
+        )?;
+        Ok(())
+    }
+
+    fn central_status_base(
+        &self,
+        action_id: &str,
+        state: OutboxState,
+    ) -> Result<serde_json::Value, TxEngineError> {
+        let mut status = self
+            .outbox
+            .read_central_action_artifact(action_id, state, "status.json")?
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+            .filter(|value| value.is_object())
+            .unwrap_or_else(|| serde_json::json!({}));
+        let status_obj = status.as_object_mut().expect("central status is object");
+        status_obj.insert("action_id".into(), serde_json::json!(action_id));
+        status_obj.insert("state".into(), serde_json::json!(state.dirname()));
+        Ok(status)
     }
 
     fn write_reconcile_ambiguous(
@@ -1396,12 +1759,94 @@ impl TxEngine {
         Ok(())
     }
 
-    async fn build_signed_raw_tx(
+    /// Refuse to broadcast a tx whose nonce is ahead of the account's next
+    /// on-chain nonce with nothing filling the gap.
+    ///
+    /// The auto-increment nonce default ([`Outbox::highest_pending_nonce`]) is
+    /// optimistic: a pending entry reserves its slot before it broadcasts, so a
+    /// staged-but-never-broadcast (or later-abandoned) entry can push a
+    /// subsequent tx one nonce past a gap that never fills. The RPC accepts such
+    /// a tx into its *queued* set and returns a hash — it looks broadcast — but
+    /// it can never mine, silently stranding it. This is the broadcast-time
+    /// backstop for that hazard.
+    ///
+    /// The `pending` nonce tag already reflects every tx the node has accepted,
+    /// including our own in-flight ones, so a *strictly greater* staged nonce is
+    /// a genuine gap. Bundles stay safe: a dependent's `depends_on` gate holds it
+    /// until its predecessor mines, by which point the chain nonce has advanced
+    /// to meet it. Callers that intend to queue ahead override the default with
+    /// an explicit intent `nonce`.
+    async fn assert_nonce_not_ahead_of_chain(
+        &self,
+        chain: &ChainClient,
+        from: Address,
+        nonce: u64,
+    ) -> Result<(), TxEngineError> {
+        // Only refuse on *positive* evidence of a gap. A failed nonce read (RPC
+        // down, transient error) is not evidence the tx is ahead of the chain —
+        // fail open and let the actual broadcast surface any real RPC error,
+        // rather than blocking a broadcast on a flaky preflight.
+        let chain_next = match chain.nonce(from).await {
+            Ok(n) => n,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    from = %bloom_proto::checksum_address(&from),
+                    nonce,
+                    "nonce_gap_guard: could not read chain nonce; proceeding with broadcast"
+                );
+                return Ok(());
+            }
+        };
+        if nonce > chain_next {
+            return Err(TxEngineError::NonceGap {
+                from: bloom_proto::checksum_address(&from),
+                staged: nonce,
+                chain_next,
+            });
+        }
+        Ok(())
+    }
+
+    /// Persist a machine-readable advisory beside a pending entry when its
+    /// broadcast was refused by [`Self::assert_nonce_not_ahead_of_chain`], so an
+    /// agent can see the exact gap and how to resolve it without re-deriving it.
+    fn write_nonce_gap_advisory(
+        &self,
+        entry: &crate::outbox::OutboxEntry,
+        staged: u64,
+        chain_next: u64,
+    ) -> Result<(), TxEngineError> {
+        let body = serde_json::json!({
+            "schema": "bloom.nonce_gap.v1",
+            "id": entry.staged.id,
+            "wallet": entry.staged.wallet,
+            "chain": entry.staged.chain,
+            "from": entry.staged.from,
+            "staged_nonce": staged,
+            "chain_next_nonce": chain_next,
+            "advice": format!(
+                "broadcast nonce {chain_next} first, or restage with an explicit `nonce` to fill the gap deliberately"
+            ),
+            "created_ms": now_ms(),
+        });
+        self.outbox.write_artefact(
+            &entry.dir,
+            "nonce_gap.json",
+            &serde_json::to_vec_pretty(&body).unwrap(),
+        )?;
+        Ok(())
+    }
+
+    fn build_unsigned_evm_tx(
         &self,
         staged: &StagedTx,
         chain: &ChainClient,
-        signer: &PrivateKeySigner,
-    ) -> Result<SignedRawTx, TxEngineError> {
+    ) -> Result<UnsignedEvmTx, TxEngineError> {
+        let _from: Address = staged
+            .from
+            .parse()
+            .map_err(|e: alloy::hex::FromHexError| TxEngineError::Address(e.to_string()))?;
         let to_addr: Address = staged
             .to
             .parse()
@@ -1412,22 +1857,21 @@ impl TxEngine {
             .map_err(|_| TxEngineError::Amount("value_wei".into()))?;
         let data = decode_data(&staged.data_hex)?;
 
-        let mut req = TransactionRequest::default()
-            .with_from(signer.address())
-            .with_to(to_addr)
-            .with_value(value)
-            .with_input(data)
-            .with_nonce(staged.nonce)
-            .with_chain_id(staged.chain_id)
-            .with_gas_limit(staged.gas_limit);
-
         if chain.spec().legacy_tx {
             let gp: u128 = staged
                 .gas_price
                 .as_deref()
                 .and_then(|s| s.parse::<u128>().ok())
                 .unwrap_or(1_000_000_000);
-            req = req.with_gas_price(gp);
+            Ok(UnsignedEvmTx::Legacy(TxLegacy {
+                chain_id: Some(staged.chain_id),
+                nonce: staged.nonce,
+                gas_price: gp,
+                gas_limit: staged.gas_limit,
+                to: TxKind::Call(to_addr),
+                value,
+                input: data,
+            }))
         } else {
             let max_fee: u128 = staged
                 .max_fee_per_gas
@@ -1439,21 +1883,84 @@ impl TxEngine {
                 .as_deref()
                 .and_then(|s| s.parse::<u128>().ok())
                 .unwrap_or(1_000_000);
-            req = req
-                .with_max_fee_per_gas(max_fee)
-                .with_max_priority_fee_per_gas(prio);
+            Ok(UnsignedEvmTx::Eip1559(TxEip1559 {
+                chain_id: staged.chain_id,
+                nonce: staged.nonce,
+                gas_limit: staged.gas_limit,
+                max_fee_per_gas: max_fee,
+                max_priority_fee_per_gas: prio,
+                to: TxKind::Call(to_addr),
+                value,
+                access_list: AccessList::default(),
+                input: data,
+            }))
         }
+    }
 
-        let wallet_signer = EthereumWallet::from(signer.clone());
-        let tx_envelope = req
-            .build(&wallet_signer)
-            .await
-            .map_err(|e| TxEngineError::Signer(e.to_string()))?;
+    fn unsigned_signing_hash(unsigned: &UnsignedEvmTx) -> B256 {
+        match unsigned {
+            UnsignedEvmTx::Legacy(tx) => tx.signature_hash(),
+            UnsignedEvmTx::Eip1559(tx) => tx.signature_hash(),
+        }
+    }
+
+    fn assemble_signed_raw_tx(
+        &self,
+        staged: &StagedTx,
+        unsigned: UnsignedEvmTx,
+        signature: Signature,
+    ) -> Result<SignedRawTx, TxEngineError> {
+        let expected_from: Address = staged
+            .from
+            .parse()
+            .map_err(|e: alloy::hex::FromHexError| TxEngineError::Address(e.to_string()))?;
+        let tx_envelope: TxEnvelope = match unsigned {
+            UnsignedEvmTx::Legacy(tx) => {
+                let signed = tx.into_signed(signature);
+                let recovered = signed
+                    .recover_signer()
+                    .map_err(|e| TxEngineError::Signer(format!("recover signer: {e}")))?;
+                if recovered != expected_from {
+                    return Err(TxEngineError::Signer(format!(
+                        "host signature recovered {recovered:#x}, expected {expected_from:#x}"
+                    )));
+                }
+                signed.into()
+            }
+            UnsignedEvmTx::Eip1559(tx) => {
+                let signed = tx.into_signed(signature);
+                let recovered = signed
+                    .recover_signer()
+                    .map_err(|e| TxEngineError::Signer(format!("recover signer: {e}")))?;
+                if recovered != expected_from {
+                    return Err(TxEngineError::Signer(format!(
+                        "host signature recovered {recovered:#x}, expected {expected_from:#x}"
+                    )));
+                }
+                signed.into()
+            }
+        };
         let mut buf = Vec::new();
-        alloy::eips::Encodable2718::encode_2718(&tx_envelope, &mut buf);
+        tx_envelope.encode_2718(&mut buf);
         let raw = Bytes::from(buf);
         let hash = alloy::primitives::keccak256(&raw);
         Ok(SignedRawTx { raw, hash })
+    }
+
+    #[cfg(test)]
+    async fn build_signed_raw_tx(
+        &self,
+        staged: &StagedTx,
+        chain: &ChainClient,
+        signer: &PrivateKeySigner,
+    ) -> Result<SignedRawTx, TxEngineError> {
+        use alloy::signers::SignerSync;
+
+        let unsigned = self.build_unsigned_evm_tx(staged, chain)?;
+        let signature = signer
+            .sign_hash_sync(&Self::unsigned_signing_hash(&unsigned))
+            .map_err(|e| TxEngineError::Signer(e.to_string()))?;
+        self.assemble_signed_raw_tx(staged, unsigned, signature)
     }
 
     async fn submit_signed_raw(
@@ -1497,12 +2004,13 @@ impl TxEngine {
     async fn submit_with_marker(
         &self,
         entry: &crate::outbox::OutboxEntry,
-        kind: BroadcastAttemptKind,
+        action_kind: EvmOutboxActionKind,
         staged: &StagedTx,
         chain: &ChainClient,
-        signer: &PrivateKeySigner,
         policy: &Policy,
+        prepared: PreparedEvmTx,
     ) -> Result<B256, TxEngineError> {
+        let kind = action_kind.broadcast_kind();
         self.ensure_broadcast_allowed(chain.spec())?;
         if policy.private.enabled
             && !matches!(
@@ -1514,7 +2022,31 @@ impl TxEngine {
                 chain.spec().name.clone(),
             ));
         }
-        let signed = self.build_signed_raw_tx(staged, chain, signer).await?;
+        // Refuse to broadcast into a nonce gap (would be queued and never mine).
+        // Do this before signing/marker writes so a refused attempt leaves no
+        // half-broadcast state — just an advisory beside the pending entry.
+        let from: Address = staged
+            .from
+            .parse()
+            .map_err(|e: alloy::hex::FromHexError| TxEngineError::Address(e.to_string()))?;
+        if let Err(e) = self
+            .assert_nonce_not_ahead_of_chain(chain, from, staged.nonce)
+            .await
+        {
+            if let TxEngineError::NonceGap {
+                staged: s,
+                chain_next,
+                ..
+            } = &e
+            {
+                let _ = self.write_nonce_gap_advisory(entry, *s, *chain_next);
+            }
+            return Err(e);
+        }
+        let signature = self
+            .host_sign_evm_hash(staged, action_kind, prepared.signing_hash)
+            .await?;
+        let signed = self.assemble_signed_raw_tx(staged, prepared.unsigned, signature)?;
         self.outbox
             .write_broadcast_raw_tx(entry, kind, &signed.raw)?;
         let attempt = BroadcastAttempt {
@@ -1555,6 +2087,691 @@ impl TxEngine {
         Ok(signed.hash)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub async fn execute_evm_owner_session_use(
+        &self,
+        wallet: &str,
+        session_id: &str,
+        reservation_id: &str,
+        request: &EvmOwnerSigningSessionUse,
+        session: &StandingSessionRecord,
+        chain_name: &str,
+        chain: &ChainClient,
+        from: Address,
+        policy: &Policy,
+    ) -> Result<EvmOwnerSessionExecution, TxEngineError> {
+        self.ensure_broadcast_allowed(chain.spec())?;
+        if chain.spec().chain_id != request.chain_id {
+            return Err(TxEngineError::BroadcastApprovalRequired(format!(
+                "owner-session chain mismatch: request {}, chain {}",
+                request.chain_id,
+                chain.spec().chain_id
+            )));
+        }
+        if request.method != EVM_ERC20_TRANSFER_METHOD {
+            return Err(TxEngineError::BroadcastApprovalRequired(
+                "owner-session use supports only ERC-20 transfer".into(),
+            ));
+        }
+
+        let token_address: Address = request
+            .token_contract
+            .parse()
+            .map_err(|e: alloy::hex::FromHexError| TxEngineError::Address(e.to_string()))?;
+        let recipient: Address = request
+            .recipient
+            .parse()
+            .map_err(|e: alloy::hex::FromHexError| TxEngineError::Address(e.to_string()))?;
+        let amount = U256::from_str_radix(&request.amount_base_units, 10)
+            .map_err(|e| TxEngineError::Amount(format!("owner-session amount: {e}")))?;
+        let call = IERC20::transferCall {
+            to: recipient,
+            amount,
+        };
+        let expected_calldata = format!("0x{}", hex::encode(call.abi_encode()));
+        if !request
+            .calldata_hex
+            .eq_ignore_ascii_case(&expected_calldata)
+        {
+            return Err(TxEngineError::BroadcastApprovalRequired(
+                "owner-session calldata does not match scoped ERC-20 transfer".into(),
+            ));
+        }
+
+        let nonce = match request.nonce {
+            Some(n) => n,
+            None => chain.nonce(from).await?,
+        };
+        let gas_limit = request.gas_limit.unwrap_or(65_000);
+        let max_fee = request
+            .max_fee_per_gas_wei
+            .clone()
+            .unwrap_or_else(|| "2000000000".into());
+        let max_priority = request
+            .max_priority_fee_per_gas_wei
+            .clone()
+            .unwrap_or_else(|| "1000000".into());
+        let id = format!("{session_id}:{reservation_id}");
+        let staged = StagedTx {
+            id,
+            wallet: wallet.to_string(),
+            chain: chain_name.to_string(),
+            chain_id: request.chain_id,
+            from: bloom_proto::checksum_address(&from),
+            to: bloom_proto::checksum_address(&token_address),
+            value_wei: "0".into(),
+            data_hex: expected_calldata,
+            gas_limit,
+            max_fee_per_gas: Some(max_fee),
+            max_priority_fee_per_gas: Some(max_priority),
+            gas_price: None,
+            nonce,
+            policy_checks: Vec::new(),
+            created_ms: now_ms(),
+            expires_ms: u128::from(session.expires_ms),
+            status: TxStatus::Pending,
+            tx_hash: None,
+            token: Some(TokenRef {
+                address: bloom_proto::checksum_address(&token_address),
+                symbol: "ERC20".into(),
+                decimals: 0,
+                recipient: bloom_proto::checksum_address(&recipient),
+                amount: request.amount_base_units.clone(),
+            }),
+            nft: None,
+            usd_value: None,
+            depends_on: None,
+            action_id: Some(session_id.to_string()),
+        };
+        let unsigned = self.build_unsigned_evm_tx(&staged, chain)?;
+        let signing_hash = Self::unsigned_signing_hash(&unsigned);
+        let signature = self
+            .host_sign_evm_owner_session_hash(
+                &staged,
+                session_id,
+                reservation_id,
+                request,
+                session,
+                &signing_hash,
+            )
+            .await?;
+        let signed = self.assemble_signed_raw_tx(&staged, unsigned, signature)?;
+        let submitted = self
+            .submit_signed_raw(&staged, chain, policy, &signed)
+            .await?;
+        if matches!(submitted.transport, BroadcastTransport::PublicRpc)
+            && submitted.returned_hash != Some(signed.hash)
+        {
+            return Err(TxEngineError::BroadcastHashMismatch {
+                expected: format!("{:#x}", signed.hash),
+                returned: submitted
+                    .returned_hash
+                    .map(|h| format!("{:#x}", h))
+                    .unwrap_or_else(|| "<none>".into()),
+            });
+        }
+        Ok(EvmOwnerSessionExecution {
+            tx_hash: signed.hash,
+            nonce,
+            signing_hash,
+        })
+    }
+
+    /// Execute a sealed action through the first-party dispatcher.
+    ///
+    /// Dispatch is Petal-neutral: the selected executor is keyed only by the
+    /// sealed action header's `(petal_id, petal_digest, subject_kind,
+    /// action_kind)`. The current built-in executor is the EVM wallet Petal;
+    /// it reconstructs the transaction solely from sealed subject bytes, signs
+    /// via the wired `PetalHost`, and broadcasts through the existing TxEngine
+    /// transport path.
+    pub async fn execute_sealed_action(
+        &self,
+        sealed: &SealedAction,
+        chain_name: &str,
+        chain: &ChainClient,
+        policy: &Policy,
+    ) -> Result<SealedActionExecution, TxEngineError> {
+        sealed.validate().map_err(|e| {
+            TxEngineError::BroadcastApprovalRequired(format!("invalid sealed action: {e}"))
+        })?;
+        let header = &sealed.envelope.header;
+        match (
+            header.petal_id.as_str(),
+            header.petal_digest.as_str(),
+            sealed.envelope.subject_kind.as_str(),
+            header.action_kind.as_str(),
+        ) {
+            (
+                PETAL_ID_EVM_WALLET,
+                PLACEHOLDER_DIGEST_EVM_WALLET,
+                EVM_SEALED_INTENT_SUBJECT_KIND,
+                "confirm" | "replace" | "cancel" | "owner_session_use",
+            ) => {
+                self.execute_evm_wallet_sealed_subject(sealed, chain_name, chain, policy)
+                    .await
+            }
+            (petal_id, petal_digest, subject_kind, action_kind) => {
+                Err(TxEngineError::BroadcastApprovalRequired(format!(
+                    "no sealed-action executor registered for petal_id={petal_id} petal_digest={petal_digest} subject_kind={subject_kind} action_kind={action_kind}"
+                )))
+            }
+        }
+    }
+
+    /// Locate the per-wallet pending outbox entry whose sealed action id
+    /// matches `action_id`, if any. Used by the daemon Mode 3 ceremony server
+    /// to persist `approval.json` beside the projected challenge.
+    pub fn find_pending_entry_dir_for_action(
+        &self,
+        wallet: &str,
+        chain: &str,
+        action_id: &str,
+    ) -> Option<std::path::PathBuf> {
+        self.find_pending_entry_for_action(wallet, chain, action_id)
+            .map(|entry| entry.dir)
+    }
+
+    fn find_pending_entry_for_action(
+        &self,
+        wallet: &str,
+        chain: &str,
+        action_id: &str,
+    ) -> Option<crate::outbox::OutboxEntry> {
+        let ids = self.outbox.list(wallet, chain, OutboxState::Pending).ok()?;
+        for id in ids {
+            let Ok(entry) = self.outbox.read(wallet, chain, &id) else {
+                continue;
+            };
+            let staged = &entry.staged;
+            let matches = staged.action_id.as_deref() == Some(action_id)
+                || format!("{}:{}", staged.chain_id, staged.id) == action_id;
+            if matches {
+                return Some(entry);
+            }
+        }
+        None
+    }
+
+    fn transition_sealed_wallet_entry_sent(
+        &self,
+        wallet: &str,
+        chain: &str,
+        action_id: &str,
+        tx_hash: B256,
+    ) -> Result<bool, TxEngineError> {
+        let Some(entry) = self.find_pending_entry_for_action(wallet, chain, action_id) else {
+            return Ok(false);
+        };
+        let mut staged = entry.staged.clone();
+        staged.status = TxStatus::Sent;
+        staged.tx_hash = Some(format!("{:#x}", tx_hash));
+        let new_dir = self.outbox.transition(&entry, OutboxState::Sent)?;
+        self.outbox.write_artefact(
+            &new_dir,
+            "intent.json",
+            &serde_json::to_vec_pretty(&staged).unwrap(),
+        )?;
+        self.outbox.write_artefact(
+            &new_dir,
+            "tx_hash",
+            staged.tx_hash.as_ref().unwrap().as_bytes(),
+        )?;
+        Ok(true)
+    }
+
+    pub fn project_sealed_action_execute_failure(
+        &self,
+        sealed: &SealedAction,
+        chain_name: &str,
+        reason: impl AsRef<str>,
+    ) -> Result<(), TxEngineError> {
+        let action_id = sealed.action_id();
+        let wallet = sealed.wallet();
+        let reason = reason.as_ref();
+        let transitioned_wallet = if let Some(entry) =
+            self.find_pending_entry_for_action(wallet, chain_name, action_id)
+        {
+            let mut staged = entry.staged.clone();
+            staged.status = TxStatus::Failed;
+            let new_dir = self.outbox.transition(&entry, OutboxState::Failed)?;
+            self.outbox.write_artefact(
+                &new_dir,
+                "intent.json",
+                &serde_json::to_vec_pretty(&staged).unwrap(),
+            )?;
+            self.outbox.write_artefact(
+                &new_dir,
+                "result.json",
+                &serde_json::to_vec_pretty(&serde_json::json!({
+                    "schema": "bloom.evm_execution_result.v1",
+                    "action_id": action_id,
+                    "state": OutboxState::Failed.dirname(),
+                    "outcome": "failed",
+                    "error": reason,
+                    "created_ms": now_ms(),
+                }))
+                .unwrap(),
+            )?;
+            true
+        } else {
+            false
+        };
+        if !transitioned_wallet {
+            self.outbox.transition_central_action(
+                action_id,
+                OutboxState::Pending,
+                OutboxState::Failed,
+            )?;
+        }
+        self.write_central_evm_failure_result(EvmCentralFailure {
+            action_id,
+            state: OutboxState::Failed,
+            outcome: "failed",
+            reason,
+        })
+    }
+
+    /// Persist `approval.json` for a completed daemon-owned Interaction Mode 3
+    /// ceremony beside the projected challenge — the per-wallet pending dir and
+    /// the central outbox projection, the same places the challenge is written.
+    ///
+    /// This is an audit/projection artifact only; it carries the WebAuthn
+    /// assertion and echoed challenge fields, never PRF output or key material
+    /// (that invariant lives in the [`SignedApproval`] type). The grant is
+    /// minted in daemon memory by the caller, not from this file.
+    pub fn persist_outbox_ceremony_approval(
+        &self,
+        sealed: &SealedAction,
+        approval: &SignedApproval,
+    ) -> Result<(), TxEngineError> {
+        let action_id = sealed.action_id();
+        let wallet = sealed.wallet();
+        // The outbox is keyed by the human chain name ("base"), not the CAIP-2
+        // `network` header ("eip155:8453"). Using the header here silently missed
+        // the per-wallet entry and dropped approval.json.
+        //
+        // This method persists into the EVM outbox and is only meaningful for a
+        // broadcast action. Callers must not invoke it for non-broadcast
+        // first-party actions (wallet-policy updates, policy-session mints),
+        // which have no chain and no outbox entry — a missing chain_name here is
+        // a caller error, not a routine case.
+        let chain_name = sealed.chain_name().ok_or_else(|| {
+            TxEngineError::BroadcastApprovalRequired(
+                "sealed action is missing chain_name in its policy snapshot".into(),
+            )
+        })?;
+        let body = serde_json::to_vec_pretty(approval).map_err(|e| {
+            TxEngineError::BroadcastApprovalRequired(format!("encode approval.json: {e}"))
+        })?;
+        // Per-wallet pending projection. The entry may legitimately be absent
+        // (already transitioned, or the challenge came from another interaction
+        // mode) — but a silent miss is what hid the earlier chain-key bug, so we
+        // warn loudly when nothing was written here.
+        let mut persisted = false;
+        if let Some(dir) = self.find_pending_entry_dir_for_action(wallet, chain_name, action_id) {
+            std::fs::write(dir.join(OUTBOX_APPROVAL_FILE), &body).map_err(|e| {
+                TxEngineError::BroadcastApprovalRequired(format!("write approval.json: {e}"))
+            })?;
+            persisted = true;
+        }
+        // Central outbox projection, keyed by the sealed action id (same place
+        // the challenge is mirrored). No-op when no projection is attached, but
+        // a real write error must not be swallowed — a silent allowlist reject
+        // is exactly what previously kept approval.json out of the central dir.
+        self.outbox.write_central_action_artifact(
+            action_id,
+            OutboxState::Pending,
+            OUTBOX_APPROVAL_FILE,
+            &body,
+        )?;
+        if !persisted {
+            tracing::warn!(
+                wallet,
+                chain = %chain_name,
+                action_id,
+                "ceremony.approval.no_pending_entry: approval.json not written to a per-wallet pending dir"
+            );
+        }
+        Ok(())
+    }
+
+    async fn execute_evm_wallet_sealed_subject(
+        &self,
+        sealed: &SealedAction,
+        chain_name: &str,
+        chain: &ChainClient,
+        policy: &Policy,
+    ) -> Result<SealedActionExecution, TxEngineError> {
+        self.ensure_broadcast_allowed(chain.spec())?;
+        let subject_bytes = base64::engine::general_purpose::STANDARD
+            .decode(sealed.envelope.subject_bytes_b64.as_bytes())
+            .map_err(|e| {
+                TxEngineError::BroadcastApprovalRequired(format!(
+                    "decode sealed subject bytes: {e}"
+                ))
+            })?;
+        let subject: EvmSealedIntentSubject =
+            serde_json::from_slice(&subject_bytes).map_err(|e| {
+                TxEngineError::BroadcastApprovalRequired(format!("decode EVM sealed subject: {e}"))
+            })?;
+        subject.validate_evm().map_err(|e| {
+            TxEngineError::BroadcastApprovalRequired(format!("invalid EVM sealed subject: {e}"))
+        })?;
+        self.ensure_evm_subject_matches_seal(sealed, &subject)?;
+        if chain.spec().chain_id != subject.chain_id {
+            return Err(TxEngineError::BroadcastApprovalRequired(format!(
+                "sealed action chain mismatch: subject {}, chain {}",
+                subject.chain_id,
+                chain.spec().chain_id
+            )));
+        }
+
+        let from: Address = subject
+            .account
+            .parse()
+            .map_err(|e: alloy::hex::FromHexError| TxEngineError::Address(e.to_string()))?;
+        let nonce = match subject.nonce_intent.nonce {
+            Some(nonce) => nonce,
+            None => chain.nonce(from).await?,
+        };
+        let gas_limit = subject
+            .fee_facts
+            .gas_limit
+            .parse::<u64>()
+            .map_err(|e| TxEngineError::Amount(format!("sealed gas_limit: {e}")))?;
+        let staged = StagedTx {
+            id: subject.action_id.clone(),
+            wallet: subject.wallet.clone(),
+            chain: chain_name.to_string(),
+            chain_id: subject.chain_id,
+            from: bloom_proto::checksum_address(&from),
+            to: subject.call.to.clone(),
+            value_wei: subject.value.native_value_wei.clone(),
+            data_hex: subject.call.calldata_hex.clone(),
+            gas_limit,
+            max_fee_per_gas: subject.fee_facts.max_fee_per_gas_wei.clone(),
+            max_priority_fee_per_gas: subject.fee_facts.max_priority_fee_per_gas_wei.clone(),
+            gas_price: subject.fee_facts.gas_price_wei.clone(),
+            nonce,
+            policy_checks: Vec::new(),
+            created_ms: now_ms(),
+            expires_ms: u128::from(sealed.expires_ms),
+            status: TxStatus::Pending,
+            tx_hash: None,
+            token: subject.token.as_ref().map(|token| TokenRef {
+                address: token.token_address.clone(),
+                symbol: token.symbol.clone(),
+                decimals: token.decimals,
+                recipient: subject.call.recipient.clone().unwrap_or_default(),
+                amount: subject
+                    .value
+                    .token_amount_base_units
+                    .clone()
+                    .unwrap_or_else(|| "0".into()),
+            }),
+            nft: None,
+            usd_value: subject
+                .value
+                .valuation_usd_micro
+                .map(|micro| micro as f64 / 1_000_000.0),
+            depends_on: None,
+            action_id: Some(subject.action_id.clone()),
+        };
+        let unsigned = self.build_unsigned_evm_tx(&staged, chain)?;
+        let signing_hash = Self::unsigned_signing_hash(&unsigned);
+        let sealed_hash: B256 = subject
+            .unsigned_envelope
+            .signing_hash
+            .parse()
+            .map_err(|e| TxEngineError::Signer(format!("sealed signing_hash: {e}")))?;
+        if signing_hash != sealed_hash {
+            return Err(TxEngineError::BroadcastApprovalRequired(
+                "sealed subject signing hash does not match reconstructed transaction".into(),
+            ));
+        }
+        let signature = self
+            .host_sign_evm_sealed_subject_hash(&subject, &signing_hash)
+            .await?;
+        let signed = self.assemble_signed_raw_tx(&staged, unsigned, signature)?;
+        // Same broadcast-time nonce-gap guard as the confirm path: never emit a
+        // sealed tx that the node would queue behind a missing nonce.
+        self.assert_nonce_not_ahead_of_chain(chain, from, nonce)
+            .await?;
+        let submitted = self
+            .submit_signed_raw(&staged, chain, policy, &signed)
+            .await?;
+        if matches!(submitted.transport, BroadcastTransport::PublicRpc)
+            && submitted.returned_hash != Some(signed.hash)
+        {
+            return Err(TxEngineError::BroadcastHashMismatch {
+                expected: format!("{:#x}", signed.hash),
+                returned: submitted
+                    .returned_hash
+                    .map(|h| format!("{:#x}", h))
+                    .unwrap_or_else(|| "<none>".into()),
+            });
+        }
+        if !self.transition_sealed_wallet_entry_sent(
+            &subject.wallet,
+            chain_name,
+            &subject.action_id,
+            signed.hash,
+        )? {
+            self.outbox.transition_central_action(
+                &subject.action_id,
+                OutboxState::Pending,
+                OutboxState::Sent,
+            )?;
+        }
+        self.write_central_evm_result(EvmCentralResult {
+            action_id: &subject.action_id,
+            state: OutboxState::Sent,
+            outcome: "sent",
+            tx_hash: signed.hash,
+            nonce,
+            signing_hash: &signing_hash,
+            action_kind: subject.action_kind.as_str(),
+        })?;
+        Ok(SealedActionExecution {
+            action_id: subject.action_id,
+            petal_id: subject.petal_id,
+            petal_digest: subject.petal_digest,
+            action_kind: subject.action_kind.as_str().into(),
+            tx_hash: signed.hash,
+            nonce,
+            signing_hash,
+        })
+    }
+
+    fn ensure_evm_subject_matches_seal(
+        &self,
+        sealed: &SealedAction,
+        subject: &EvmSealedIntentSubject,
+    ) -> Result<(), TxEngineError> {
+        let header = &sealed.envelope.header;
+        let subject_envelope = subject.canonical_envelope(sealed.expires_ms).map_err(|e| {
+            TxEngineError::BroadcastApprovalRequired(format!("rebuild sealed EVM envelope: {e}"))
+        })?;
+        let subject_hash = subject_envelope.intent_hash().map_err(|e| {
+            TxEngineError::BroadcastApprovalRequired(format!("hash sealed EVM envelope: {e}"))
+        })?;
+        let sealed_hash = sealed.intent_hash().map_err(|e| {
+            TxEngineError::BroadcastApprovalRequired(format!("hash sealed action: {e}"))
+        })?;
+        if subject_hash != sealed_hash || subject_envelope != sealed.envelope {
+            return Err(TxEngineError::BroadcastApprovalRequired(
+                "sealed subject bytes do not reproduce the sealed action envelope".into(),
+            ));
+        }
+        let expected = [
+            ("wallet", subject.wallet.as_str(), header.wallet.as_str()),
+            ("surface", subject.surface.as_str(), header.surface.as_str()),
+            (
+                "action_id",
+                subject.action_id.as_str(),
+                header.action_id.as_str(),
+            ),
+            (
+                "petal_id",
+                subject.petal_id.as_str(),
+                header.petal_id.as_str(),
+            ),
+            (
+                "petal_digest",
+                subject.petal_digest.as_str(),
+                header.petal_digest.as_str(),
+            ),
+            (
+                "petal_version",
+                subject.petal_version.as_str(),
+                header.petal_version.as_str(),
+            ),
+            ("account", subject.account.as_str(), header.account.as_str()),
+            (
+                "action_kind",
+                subject.action_kind.as_str(),
+                header.action_kind.as_str(),
+            ),
+        ];
+        for (field, actual, expected) in expected {
+            if actual != expected {
+                return Err(TxEngineError::BroadcastApprovalRequired(format!(
+                    "sealed {field} mismatch: subject={actual} header={expected}"
+                )));
+            }
+        }
+        if sealed.daemon_terms != subject.daemon_terms {
+            return Err(TxEngineError::BroadcastApprovalRequired(
+                "sealed daemon terms do not match EVM subject".into(),
+            ));
+        }
+        if sealed.petal_policy != subject.policy_snapshot {
+            return Err(TxEngineError::BroadcastApprovalRequired(
+                "sealed Petal policy does not match EVM subject".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    async fn host_sign_evm_sealed_subject_hash(
+        &self,
+        subject: &EvmSealedIntentSubject,
+        signing_hash: &B256,
+    ) -> Result<Signature, TxEngineError> {
+        let host = self.petal_host.as_ref().ok_or_else(|| {
+            TxEngineError::BroadcastApprovalRequired(
+                "Sealed Approval Petal host is not wired".into(),
+            )
+        })?;
+        let attestation = subject
+            .signing_attestation_facts()
+            .signing_attestation()
+            .map_err(|e| {
+                TxEngineError::BroadcastApprovalRequired(format!(
+                    "build EVM sealed signing attestation: {e}"
+                ))
+            })?;
+        let sealed = host
+            .sign_hash(
+                SignHashRequest {
+                    wallet: subject.wallet.clone(),
+                    action_id: subject.action_id.clone(),
+                    intent: EVM_TX_SIGN_INTENT.into(),
+                    hash_hex: format!("{signing_hash:#x}"),
+                },
+                &attestation,
+                now_ms() as u64,
+            )
+            .await
+            .map_err(|e| {
+                TxEngineError::BroadcastApprovalRequired(format!("host sign_hash denied: {e}"))
+            })?;
+        let raw = base64::engine::general_purpose::STANDARD
+            .decode(sealed.signature_b64.as_bytes())
+            .map_err(|e| TxEngineError::Signer(format!("decode host signature: {e}")))?;
+        Signature::from_raw(&raw).map_err(|e| TxEngineError::Signer(format!("host signature: {e}")))
+    }
+
+    async fn host_sign_evm_hash(
+        &self,
+        staged: &StagedTx,
+        action_kind: EvmOutboxActionKind,
+        signing_hash: B256,
+    ) -> Result<Signature, TxEngineError> {
+        let host = self.petal_host.as_ref().ok_or_else(|| {
+            TxEngineError::BroadcastApprovalRequired(
+                "Sealed Approval Petal host is not wired".into(),
+            )
+        })?;
+        let action_id = outbox_action_id(staged, action_kind);
+        let hash_hex = format!("{signing_hash:#x}");
+        let attestation = evm_signing_attestation(staged, action_kind, &signing_hash)?;
+        let sealed = host
+            .sign_hash(
+                SignHashRequest {
+                    wallet: staged.wallet.clone(),
+                    action_id,
+                    intent: "evm.tx.sign".into(),
+                    hash_hex,
+                },
+                &attestation,
+                now_ms() as u64,
+            )
+            .await
+            .map_err(|e| {
+                TxEngineError::BroadcastApprovalRequired(format!("host sign_hash denied: {e}"))
+            })?;
+        let raw = base64::engine::general_purpose::STANDARD
+            .decode(sealed.signature_b64.as_bytes())
+            .map_err(|e| TxEngineError::Signer(format!("decode host signature: {e}")))?;
+        Signature::from_raw(&raw).map_err(|e| TxEngineError::Signer(format!("host signature: {e}")))
+    }
+
+    async fn host_sign_evm_owner_session_hash(
+        &self,
+        staged: &StagedTx,
+        session_id: &str,
+        reservation_id: &str,
+        request: &EvmOwnerSigningSessionUse,
+        session: &StandingSessionRecord,
+        signing_hash: &B256,
+    ) -> Result<Signature, TxEngineError> {
+        let host = self.petal_host.as_ref().ok_or_else(|| {
+            TxEngineError::BroadcastApprovalRequired(
+                "Sealed Approval Petal host is not wired".into(),
+            )
+        })?;
+        let hash_hex = format!("{signing_hash:#x}");
+        let attestation = evm_owner_session_signing_attestation(
+            staged,
+            session_id,
+            reservation_id,
+            request,
+            session,
+            signing_hash,
+        )?;
+        let sealed = host
+            .sign_hash(
+                SignHashRequest {
+                    wallet: staged.wallet.clone(),
+                    action_id: session_id.to_string(),
+                    intent: EVM_TX_SIGN_INTENT.into(),
+                    hash_hex,
+                },
+                &attestation,
+                now_ms() as u64,
+            )
+            .await
+            .map_err(|e| {
+                TxEngineError::BroadcastApprovalRequired(format!("host sign_hash denied: {e}"))
+            })?;
+        let raw = base64::engine::general_purpose::STANDARD
+            .decode(sealed.signature_b64.as_bytes())
+            .map_err(|e| TxEngineError::Signer(format!("decode host signature: {e}")))?;
+        Signature::from_raw(&raw).map_err(|e| TxEngineError::Signer(format!("host signature: {e}")))
+    }
+
     fn ensure_broadcast_allowed(&self, spec: &ChainSpec) -> Result<(), TxEngineError> {
         let is_mainnet = bloom_proto::Config::is_mainnet_id(spec.chain_id);
         if (self.block_mainnet_broadcast && is_mainnet) || !spec.allow_broadcast {
@@ -1563,23 +2780,139 @@ impl TxEngine {
         Ok(())
     }
 
-    fn ensure_action_authorized(
+    /// Refuse to broadcast when a same-chain dependency has not mined
+    /// successfully. Both "not yet confirmed" and "reverted/failed" are hard
+    /// refusals: broadcasting a dependent tx before its predecessor confirms
+    /// is precisely the footgun this guards against.
+    fn ensure_dependency_satisfied(
+        &self,
+        wallet: &str,
+        chain: &str,
+        dep_id: &str,
+    ) -> Result<(), TxEngineError> {
+        let reject = |reason: &str| {
+            Err(TxEngineError::DependencyNotSatisfied {
+                dep_id: dep_id.to_string(),
+                reason: reason.to_string(),
+            })
+        };
+        let entry = match self.outbox.read(wallet, chain, dep_id) {
+            Ok(e) => e,
+            Err(OutboxError::NotFound(_)) => return reject("predecessor not found in the outbox"),
+            Err(e) => return Err(e.into()),
+        };
+        match entry.state {
+            crate::outbox::OutboxState::Failed => reject("predecessor failed or was cancelled"),
+            crate::outbox::OutboxState::Pending => {
+                reject("predecessor is still pending (not broadcast)")
+            }
+            crate::outbox::OutboxState::Sent => {
+                match self.outbox.read_receipt(wallet, chain, dep_id)? {
+                    Some(r) if r.is_success() => Ok(()),
+                    Some(r) => {
+                        let detail = r
+                            .revert_reason
+                            .map(|s| format!(": {s}"))
+                            .unwrap_or_default();
+                        Err(TxEngineError::DependencyNotSatisfied {
+                            dep_id: dep_id.to_string(),
+                            reason: format!("predecessor reverted{detail}"),
+                        })
+                    }
+                    None => reject("predecessor broadcast but not yet confirmed"),
+                }
+            }
+        }
+    }
+
+    /// `eth_call` the staged tx against current state; reject on revert. RPC
+    /// failures simulating are non-fatal (don't block broadcast on infra).
+    async fn simulate_or_reject(
         &self,
         staged: &StagedTx,
+        chain: &ChainClient,
+    ) -> Result<(), TxEngineError> {
+        let from: Address = staged
+            .from
+            .parse()
+            .map_err(|_| TxEngineError::Address(staged.from.clone()))?;
+        let to: Address = staged
+            .to
+            .parse()
+            .map_err(|_| TxEngineError::Address(staged.to.clone()))?;
+        let value = U256::from_str_radix(&staged.value_wei, 10).unwrap_or(U256::ZERO);
+        let data = staged.data_hex.parse::<Bytes>().unwrap_or_default();
+        let req = TransactionRequest::default()
+            .from(from)
+            .to(to)
+            .value(value)
+            .input(data.into());
+        match chain.eth_call_capture_revert(req, None).await {
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(returndata)) => Err(TxEngineError::SimulationReverted {
+                reason: crate::reconcile::decode_revert(&returndata),
+            }),
+            Err(e) => {
+                debug!(id = %staged.id, error = %e, "tx.simulate_unavailable");
+                Ok(())
+            }
+        }
+    }
+
+    async fn ensure_action_authorized(
+        &self,
+        entry: &crate::outbox::OutboxEntry,
+        staged: &StagedTx,
+        action_kind: EvmOutboxActionKind,
+        signing_hash: &B256,
         policy: &Policy,
-        reviewed_intent_hash: Option<&str>,
         surface: bloom_proto::AuthorizationSurface,
     ) -> Result<(), TxEngineError> {
-        let reviewed_intent_hash =
-            self.verified_reviewed_intent_hash(staged, reviewed_intent_hash)?;
         let budget = self.budget_snapshot(&staged.wallet)?;
         let subject = self.authorization_subject(staged);
+        let initial = bloom_proto::evaluate_action_authorization(
+            policy,
+            &staged.policy_checks,
+            &subject,
+            Some(&budget),
+            None,
+            surface.clone(),
+        );
+        match initial {
+            bloom_proto::AutonomyDecision::ApprovedAutonomous { .. }
+            | bloom_proto::AutonomyDecision::ApprovedFreshReview { .. }
+            | bloom_proto::AutonomyDecision::NeedsFreshReview { .. } => {}
+            bloom_proto::AutonomyDecision::ApprovedCapability { .. } => {
+                return Err(TxEngineError::BroadcastApprovalRequired(
+                    "scoped run capabilities are not implemented; fresh review required".into(),
+                ));
+            }
+            bloom_proto::AutonomyDecision::Denied { reason } => {
+                return Err(TxEngineError::BroadcastApprovalRequired(reason));
+            }
+        }
+
+        if self.approval_verifier.is_none()
+            || self.auth_writer.is_none()
+            || self.grant_store.is_none()
+            || self.petal_host.is_none()
+        {
+            return Err(TxEngineError::BroadcastApprovalRequired(
+                "outbox confirm requires Sealed Approval; \
+                 auth/grant/host services are not wired (marker fallback removed)"
+                    .into(),
+            ));
+        }
+        let sealed_approval_intent_hash = Some(
+            self.ensure_sealed_outbox_approval(entry, staged, action_kind, signing_hash)
+                .await?,
+        );
         match bloom_proto::evaluate_action_authorization(
             policy,
             &staged.policy_checks,
             &subject,
             Some(&budget),
-            reviewed_intent_hash.as_deref(),
+            sealed_approval_intent_hash.as_deref(),
             surface,
         ) {
             bloom_proto::AutonomyDecision::ApprovedFreshReview { .. }
@@ -1600,61 +2933,158 @@ impl TxEngine {
         }
     }
 
-    fn verified_reviewed_intent_hash(
+    async fn ensure_sealed_outbox_approval(
         &self,
+        entry: &crate::outbox::OutboxEntry,
         staged: &StagedTx,
-        reviewed_intent_hash: Option<&str>,
-    ) -> Result<Option<String>, TxEngineError> {
-        let Some(hash) = reviewed_intent_hash
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        else {
-            return Ok(None);
-        };
-        let entry = self
-            .outbox
-            .read(&staged.wallet, &staged.chain, &staged.id)?;
-        let path = entry.dir.join("review_intent.json");
-        let body = std::fs::read(&path).map_err(|_| {
+        action_kind: EvmOutboxActionKind,
+        signing_hash: &B256,
+    ) -> Result<String, TxEngineError> {
+        let verifier = self.approval_verifier.as_ref().ok_or_else(|| {
+            TxEngineError::BroadcastApprovalRequired("Sealed Approval verifier is not wired".into())
+        })?;
+        let writer = self.auth_writer.as_ref().ok_or_else(|| {
             TxEngineError::BroadcastApprovalRequired(
-                "review hash supplied but no review_intent.json is stored for this outbox entry"
-                    .into(),
+                "Sealed Approval auth store writer is not wired".into(),
             )
         })?;
-        let intent: bloom_proto::CeremonyIntent = serde_json::from_slice(&body).map_err(|e| {
-            TxEngineError::BroadcastApprovalRequired(format!(
-                "stored review_intent.json is invalid: {e}"
-            ))
-        })?;
-        let expected = intent.intent_hash();
-        if hash != expected {
-            return Err(TxEngineError::BroadcastApprovalRequired(
-                "review hash does not match the stored review intent for this outbox entry".into(),
-            ));
-        }
-        let approved_path = entry.dir.join("review_approved.json");
-        let approved_body = std::fs::read(&approved_path).map_err(|_| {
+        let grant_store = self.grant_store.as_ref().ok_or_else(|| {
             TxEngineError::BroadcastApprovalRequired(
-                "review hash supplied but no passkey approval marker is stored for this outbox entry"
-                    .into(),
+                "Sealed Approval grant store is not wired".into(),
             )
         })?;
-        let approved: serde_json::Value = serde_json::from_slice(&approved_body).map_err(|e| {
-            TxEngineError::BroadcastApprovalRequired(format!(
-                "stored review_approved.json is invalid: {e}"
-            ))
-        })?;
-        if approved
-            .get("intent_hash")
-            .and_then(|v| v.as_str())
-            .map(str::trim)
-            != Some(hash)
+        let action_id = outbox_action_id(staged, action_kind);
+        if grant_store
+            .get_active(
+                &staged.wallet,
+                &action_id,
+                PETAL_ID_EVM_WALLET,
+                PLACEHOLDER_DIGEST_EVM_WALLET,
+                now_ms() as u64,
+            )
+            .await
+            .map_err(|e| {
+                TxEngineError::BroadcastApprovalRequired(format!("read active grant: {e}"))
+            })?
+            .is_some()
         {
-            return Err(TxEngineError::BroadcastApprovalRequired(
-                "passkey approval marker does not match the reviewed intent hash".into(),
-            ));
+            return outbox_canonical_envelope(staged, action_kind, signing_hash)?
+                .intent_hash()
+                .map_err(|e| {
+                    TxEngineError::BroadcastApprovalRequired(format!(
+                        "hash sealed outbox action: {e}"
+                    ))
+                });
         }
-        Ok(Some(hash.to_string()))
+
+        let subject = evm_sealed_subject(staged, action_kind, signing_hash)?;
+        let envelope = subject
+            .canonical_envelope(u64::try_from(staged.expires_ms).unwrap_or(u64::MAX))
+            .map_err(|e| {
+                TxEngineError::BroadcastApprovalRequired(format!("build EVM sealed envelope: {e}"))
+            })?;
+        let action = SealedAction::new(
+            envelope,
+            format!(
+                "{} {}:{} nonce {}",
+                action_kind.action_kind(),
+                staged.chain,
+                staged.id,
+                staged.nonce
+            ),
+            Vec::new(),
+            subject.daemon_terms.clone(),
+            subject.policy_snapshot.clone(),
+            now_ms() as u64,
+        )
+        .map_err(|e| {
+            TxEngineError::BroadcastApprovalRequired(format!("seal outbox action failed: {e}"))
+        })?;
+        let intent_hash = action.envelope.intent_hash().map_err(|e| {
+            TxEngineError::BroadcastApprovalRequired(format!("hash sealed outbox action: {e}"))
+        })?;
+        let auth_entry = writer
+            .stage_action(action, now_ms() as u64)
+            .await
+            .map_err(|e| {
+                TxEngineError::BroadcastApprovalRequired(format!(
+                    "stage outbox auth entry failed: {e}"
+                ))
+            })?;
+        if matches!(
+            auth_entry.state,
+            AuthEntryState::Approved | AuthEntryState::Submitting
+        ) && auth_entry.nonce_state == NonceState::Consumed
+        {
+            return Ok(auth_entry.intent_hash);
+        }
+        let approval_path = entry.dir.join(OUTBOX_APPROVAL_FILE);
+        if approval_path.exists() {
+            let approval_body = std::fs::read(&approval_path).map_err(|e| {
+                TxEngineError::BroadcastApprovalRequired(format!("read approval.json: {e}"))
+            })?;
+            let approval: SignedApproval = serde_json::from_slice(&approval_body).map_err(|e| {
+                TxEngineError::BroadcastApprovalRequired(format!(
+                    "stored approval.json is invalid: {e}"
+                ))
+            })?;
+            verifier
+                .verify_and_mint_grant(approval, grant_store.as_ref(), now_ms() as u64)
+                .await
+                .map_err(|e| {
+                    TxEngineError::BroadcastApprovalRequired(format!(
+                        "Sealed Approval rejected: {e}"
+                    ))
+                })?;
+            return Ok(intent_hash);
+        }
+
+        let mut nonce = [0u8; 32];
+        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut nonce);
+        let nonce = URL_SAFE_NO_PAD.encode(nonce);
+        let challenge = writer
+            .issue_challenge(
+                "outbox",
+                &auth_entry.action_id,
+                &nonce,
+                (now_ms() as u64).saturating_add(OUTBOX_APPROVAL_TTL_MS),
+                now_ms() as u64,
+            )
+            .await
+            .map_err(|e| {
+                TxEngineError::BroadcastApprovalRequired(format!(
+                    "issue outbox approval challenge failed: {e}"
+                ))
+            })?
+            .with_local_ceremony_url();
+        let challenge_body = serde_json::to_vec_pretty(&challenge).map_err(|e| {
+            TxEngineError::BroadcastApprovalRequired(format!("encode approval challenge: {e}"))
+        })?;
+        std::fs::write(
+            entry.dir.join(OUTBOX_APPROVAL_CHALLENGE_FILE),
+            &challenge_body,
+        )
+        .map_err(|e| {
+            TxEngineError::BroadcastApprovalRequired(format!("write approval challenge: {e}"))
+        })?;
+        if let Some(central_action_id) = staged.action_id.as_deref() {
+            self.outbox
+                .write_central_pending_artifact(
+                    central_action_id,
+                    OUTBOX_APPROVAL_CHALLENGE_FILE,
+                    &challenge_body,
+                )
+                .map_err(|e| {
+                    TxEngineError::BroadcastApprovalRequired(format!(
+                        "write central approval challenge: {e}"
+                    ))
+                })?;
+        }
+        Err(TxEngineError::BroadcastApprovalRequired(format!(
+            "outbox confirm requires signed Sealed Approval; wrote {} in {}; rerun the foreground confirm/write command with the passkey wallet to sign approval.json. local password wallets can only auto-confirm actions that remain in policy",
+            OUTBOX_APPROVAL_CHALLENGE_FILE,
+            entry.dir.display()
+        )))
     }
 
     fn authorization_subject(&self, staged: &StagedTx) -> bloom_proto::AuthorizationSubject {
@@ -1770,10 +3200,8 @@ impl TxEngine {
         chain_name: &str,
         original_id: &str,
         chain: &ChainClient,
-        signer: &PrivateKeySigner,
         bump_pct: u32,
         policy: &Policy,
-        reviewed_intent_hash: Option<&str>,
     ) -> Result<StagedTx, TxEngineError> {
         self.replace_with_intent(
             permit,
@@ -1781,12 +3209,10 @@ impl TxEngine {
             chain_name,
             original_id,
             chain,
-            signer,
             bump_pct,
             None,
             None,
             policy,
-            reviewed_intent_hash,
         )
         .await
     }
@@ -1806,12 +3232,10 @@ impl TxEngine {
         chain_name: &str,
         original_id: &str,
         chain: &ChainClient,
-        signer: &PrivateKeySigner,
         bump_pct: u32,
         substitute: Option<RawIntent>,
         address_book: Option<&AddressBook>,
         policy: &Policy,
-        reviewed_intent_hash: Option<&str>,
     ) -> Result<StagedTx, TxEngineError> {
         self.assert_write_permit(permit)?;
         let bump = bump_pct.max(10);
@@ -1840,28 +3264,36 @@ impl TxEngine {
             bumped.data_hex = data_hex;
             bumped.token = token;
             bumped.nft = nft;
-            bumped.policy_checks.push(bloom_proto::PolicyCheck {
-                rule: "replacement.substitute".into(),
-                outcome: bloom_proto::PolicyOutcome::Deny,
-                message: "same-nonce replacement with substituted to/value/data is disabled; stage a fresh transaction instead".into(),
-            });
+            bumped.policy_checks.push(bloom_proto::PolicyCheck::hard(
+                "replacement.substitute",
+                bloom_proto::PolicyOutcome::Deny,
+                "same-nonce replacement with substituted to/value/data is disabled; stage a fresh transaction instead",
+            ));
         }
         bump_fees_in_place(&mut bumped, bump);
+        let unsigned = self.build_unsigned_evm_tx(&bumped, chain)?;
+        let prepared = PreparedEvmTx {
+            signing_hash: Self::unsigned_signing_hash(&unsigned),
+            unsigned,
+        };
         self.ensure_action_authorized(
+            &entry,
             &bumped,
+            EvmOutboxActionKind::Replace,
+            &prepared.signing_hash,
             policy,
-            reviewed_intent_hash,
             bloom_proto::AuthorizationSurface::Cli,
-        )?;
+        )
+        .await?;
 
         let tx_hash = self
             .submit_with_marker(
                 &entry,
-                BroadcastAttemptKind::Replacement,
+                EvmOutboxActionKind::Replace,
                 &bumped,
                 chain,
-                signer,
                 policy,
+                prepared,
             )
             .await?;
         bumped.tx_hash = Some(format!("{:#x}", tx_hash));
@@ -1900,10 +3332,8 @@ impl TxEngine {
         chain_name: &str,
         original_id: &str,
         chain: &ChainClient,
-        signer: &PrivateKeySigner,
         bump_pct: u32,
         policy: &Policy,
-        reviewed_intent_hash: Option<&str>,
     ) -> Result<StagedTx, TxEngineError> {
         self.assert_write_permit(permit)?;
         let bump = bump_pct.max(10);
@@ -1913,26 +3343,38 @@ impl TxEngine {
         let mut cancel_tx = original.clone();
         cancel_tx.status = TxStatus::Pending;
         cancel_tx.tx_hash = None;
-        cancel_tx.to = bloom_proto::checksum_address(&signer.address());
+        let from_addr: Address = original
+            .from
+            .parse()
+            .map_err(|e: alloy::hex::FromHexError| TxEngineError::Address(e.to_string()))?;
+        cancel_tx.to = bloom_proto::checksum_address(&from_addr);
         cancel_tx.value_wei = "0".to_string();
         cancel_tx.data_hex = "0x".to_string();
         cancel_tx.token = None;
         bump_fees_in_place(&mut cancel_tx, bump);
+        let unsigned = self.build_unsigned_evm_tx(&cancel_tx, chain)?;
+        let prepared = PreparedEvmTx {
+            signing_hash: Self::unsigned_signing_hash(&unsigned),
+            unsigned,
+        };
         self.ensure_action_authorized(
+            &entry,
             &cancel_tx,
+            EvmOutboxActionKind::Cancel,
+            &prepared.signing_hash,
             policy,
-            reviewed_intent_hash,
             bloom_proto::AuthorizationSurface::Cli,
-        )?;
+        )
+        .await?;
 
         let tx_hash = self
             .submit_with_marker(
                 &entry,
-                BroadcastAttemptKind::CancelReplacement,
+                EvmOutboxActionKind::Cancel,
                 &cancel_tx,
                 chain,
-                signer,
                 policy,
+                prepared,
             )
             .await?;
         cancel_tx.tx_hash = Some(format!("{:#x}", tx_hash));
@@ -2037,6 +3479,397 @@ fn now_ms() -> u128 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis()
+}
+
+fn outbox_action_id(staged: &StagedTx, action_kind: EvmOutboxActionKind) -> String {
+    match action_kind {
+        EvmOutboxActionKind::Confirm => staged
+            .action_id
+            .clone()
+            .unwrap_or_else(|| format!("{}:{}", staged.chain_id, staged.id)),
+        EvmOutboxActionKind::Replace => format!("{}:{}:replace", staged.chain_id, staged.id),
+        EvmOutboxActionKind::Cancel => format!("{}:{}:cancel", staged.chain_id, staged.id),
+    }
+}
+
+fn outbox_canonical_envelope(
+    staged: &StagedTx,
+    action_kind: EvmOutboxActionKind,
+    signing_hash: &B256,
+) -> Result<CanonicalEnvelope, TxEngineError> {
+    evm_sealed_subject(staged, action_kind, signing_hash)?
+        .canonical_envelope(u64::try_from(staged.expires_ms).unwrap_or(u64::MAX))
+        .map_err(|e| {
+            TxEngineError::BroadcastApprovalRequired(format!("build EVM sealed envelope: {e}"))
+        })
+}
+
+fn evm_signing_attestation(
+    staged: &StagedTx,
+    action_kind: EvmOutboxActionKind,
+    signing_hash: &B256,
+) -> Result<SigningAttestation, TxEngineError> {
+    evm_sealed_subject(staged, action_kind, signing_hash)?
+        .signing_attestation_facts()
+        .signing_attestation()
+        .map_err(|e| {
+            TxEngineError::BroadcastApprovalRequired(format!("build EVM signing attestation: {e}"))
+        })
+}
+
+fn evm_owner_session_signing_attestation(
+    staged: &StagedTx,
+    session_id: &str,
+    reservation_id: &str,
+    request: &EvmOwnerSigningSessionUse,
+    session: &StandingSessionRecord,
+    signing_hash: &B256,
+) -> Result<SigningAttestation, TxEngineError> {
+    evm_owner_session_sealed_subject(
+        staged,
+        session_id,
+        reservation_id,
+        request,
+        session,
+        signing_hash,
+    )?
+    .signing_attestation_facts()
+    .signing_attestation()
+    .map_err(|e| {
+        TxEngineError::BroadcastApprovalRequired(format!(
+            "build EVM owner-session signing attestation: {e}"
+        ))
+    })
+}
+
+fn evm_fee_facts(staged: &StagedTx) -> EvmFeeFacts {
+    let (tx_type, gas_price_wei, max_fee_per_gas_wei, max_priority_fee_per_gas_wei) =
+        if let Some(gas_price) = staged.gas_price.clone() {
+            ("legacy", Some(gas_price), None, None)
+        } else {
+            (
+                "eip1559",
+                None,
+                Some(staged.max_fee_per_gas.clone().unwrap_or_else(|| "0".into())),
+                Some(
+                    staged
+                        .max_priority_fee_per_gas
+                        .clone()
+                        .unwrap_or_else(|| "0".into()),
+                ),
+            )
+        };
+    EvmFeeFacts {
+        tx_type: tx_type.into(),
+        gas_limit: staged.gas_limit.to_string(),
+        max_fee_per_gas_wei,
+        max_priority_fee_per_gas_wei,
+        gas_price_wei,
+        max_total_fee_wei: None,
+    }
+}
+
+fn evm_owner_session_sealed_subject(
+    staged: &StagedTx,
+    session_id: &str,
+    reservation_id: &str,
+    request: &EvmOwnerSigningSessionUse,
+    session: &StandingSessionRecord,
+    signing_hash: &B256,
+) -> Result<EvmSealedIntentSubject, TxEngineError> {
+    let scope: EvmOwnerSigningSessionScope = serde_json::from_value(session.scope.clone())
+        .map_err(|e| {
+            TxEngineError::BroadcastApprovalRequired(format!("parse owner-session scope: {e}"))
+        })?;
+    let signing_hash_hex = format!("{signing_hash:#x}");
+    let calldata = decode_data(&staged.data_hex)?;
+    let calldata_hash = format!("0x{}", blake3::hash(&calldata).to_hex());
+    let unsigned_tx_bytes_hash = format!("0x{}", blake3::hash(signing_hash.as_ref()).to_hex());
+    let fee_facts = evm_fee_facts(staged);
+    let token = staged.token.as_ref().map(|t| EvmTokenFact {
+        chain_id: staged.chain_id,
+        token_address: t.address.clone(),
+        symbol: t.symbol.clone(),
+        decimals: t.decimals,
+    });
+    let mut terms = DaemonGrantTerms::minimal(AssuranceLevel::Hardened);
+    terms.allowed_sign_intents = vec![EVM_TX_SIGN_INTENT.into()];
+    terms.max_signatures = scope.max_signature_count;
+    terms.max_ttl_secs = scope.ttl_ms / 1000;
+    terms.extra.insert(
+        "evm.action_kind".into(),
+        serde_json::json!(EVM_OWNER_SESSION_USE_ACTION_KIND),
+    );
+    terms.extra.insert(
+        "evm.signing_hash_source".into(),
+        serde_json::json!("sealed_evm_owner_session_unsigned_tx"),
+    );
+    terms
+        .extra
+        .insert("signer_cache_required".into(), serde_json::json!(true));
+
+    let scope_value = serde_json::to_value(&scope).map_err(|e| {
+        TxEngineError::BroadcastApprovalRequired(format!("serialize owner-session scope: {e}"))
+    })?;
+    let scope_map = scope_value
+        .as_object()
+        .ok_or_else(|| {
+            TxEngineError::BroadcastApprovalRequired(
+                "owner-session scope did not serialize as object".into(),
+            )
+        })?
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let mut caps = BTreeMap::new();
+    caps.insert(
+        "daily_cap_base_units".into(),
+        serde_json::json!(scope.daily_cap_base_units),
+    );
+    caps.insert(
+        "max_signature_count".into(),
+        serde_json::json!(scope.max_signature_count),
+    );
+    let mut config = BTreeMap::new();
+    config.insert("chain_id".into(), serde_json::json!(scope.chain_id));
+    config.insert(
+        "token_contract".into(),
+        serde_json::json!(scope.token_contract),
+    );
+    config.insert("recipient".into(), serde_json::json!(scope.recipient));
+    config.insert("method".into(), serde_json::json!(scope.method));
+    let mut budget_state = BTreeMap::new();
+    budget_state.insert("reservation_id".into(), serde_json::json!(reservation_id));
+    budget_state.insert(
+        "amount_base_units".into(),
+        serde_json::json!(request.amount_base_units),
+    );
+    let policy_snapshot = PetalPolicySnapshot {
+        policy_version: session.frozen_policy_version,
+        wallet: staged.wallet.clone(),
+        petal_id: PETAL_ID_EVM_WALLET.into(),
+        petal_digest: PLACEHOLDER_DIGEST_EVM_WALLET.into(),
+        caps,
+        hard_rules: Vec::new(),
+        step_up_rules: Vec::new(),
+        config,
+        budget_state,
+        session_scope: Some(scope_map),
+    };
+    let policy_snapshot_digest = policy_snapshot.petal_policy_digest().map_err(|e| {
+        TxEngineError::BroadcastApprovalRequired(format!(
+            "digest EVM owner-session policy snapshot: {e}"
+        ))
+    })?;
+    let daemon_terms_digest = terms.daemon_terms_digest().map_err(|e| {
+        TxEngineError::BroadcastApprovalRequired(format!(
+            "digest EVM owner-session daemon terms: {e}"
+        ))
+    })?;
+
+    Ok(EvmSealedIntentSubject {
+        schema: EVM_SEALED_INTENT_SUBJECT_SCHEMA_V1.into(),
+        action_id: session_id.to_string(),
+        wallet: staged.wallet.clone(),
+        surface: "policy-session".into(),
+        petal_id: PETAL_ID_EVM_WALLET.into(),
+        petal_digest: PLACEHOLDER_DIGEST_EVM_WALLET.into(),
+        petal_version: FIRST_PARTY_PETAL_VERSION_V0.into(),
+        action_kind: EvmSealedActionKind::OwnerSessionUse,
+        chain_id: staged.chain_id,
+        account: staged.from.clone(),
+        call: EvmCallFact {
+            to: staged.to.clone(),
+            recipient: Some(scope.recipient.clone()),
+            calldata_hex: staged.data_hex.clone(),
+            calldata_hash,
+            method: EVM_ERC20_TRANSFER_METHOD.into(),
+        },
+        value: EvmValueFact {
+            native_value_wei: "0".into(),
+            token_amount_base_units: Some(request.amount_base_units.clone()),
+            valuation_usd_micro: None,
+        },
+        token,
+        nonce_intent: EvmNonceIntent {
+            mode: "exact".into(),
+            nonce: Some(staged.nonce),
+            original_action_id: None,
+        },
+        fee_facts,
+        replacement_fee_facts: None,
+        unsigned_envelope: EvmUnsignedEnvelopeFacts {
+            envelope_kind: if staged.gas_price.is_some() {
+                "legacy".into()
+            } else {
+                "eip1559".into()
+            },
+            unsigned_tx_bytes_hash,
+            signing_hash: signing_hash_hex,
+        },
+        original_tx: None,
+        owner_session_use: Some(EvmOwnerSessionUseFact {
+            session_id: session_id.to_string(),
+            reservation_id: reservation_id.to_string(),
+            token_address: scope.token_contract,
+            recipient: scope.recipient,
+            daily_cap_base_units: scope.daily_cap_base_units,
+            expires_ms: session.expires_ms,
+            max_signature_count: scope.max_signature_count,
+        }),
+        policy_snapshot_digest,
+        policy_snapshot,
+        daemon_terms: terms,
+        daemon_terms_digest,
+        authority_change: false,
+    })
+}
+
+fn evm_sealed_subject(
+    staged: &StagedTx,
+    action_kind: EvmOutboxActionKind,
+    signing_hash: &B256,
+) -> Result<EvmSealedIntentSubject, TxEngineError> {
+    let signing_hash_hex = format!("{signing_hash:#x}");
+    let calldata = decode_data(&staged.data_hex)?;
+    let calldata_hash = format!("0x{}", blake3::hash(&calldata).to_hex());
+    let unsigned_tx_bytes_hash = format!("0x{}", blake3::hash(signing_hash.as_ref()).to_hex());
+    let fee_facts = evm_fee_facts(staged);
+    let token = staged.token.as_ref().map(|t| EvmTokenFact {
+        chain_id: staged.chain_id,
+        token_address: t.address.clone(),
+        symbol: t.symbol.clone(),
+        decimals: t.decimals,
+    });
+    let recipient = staged
+        .token
+        .as_ref()
+        .map(|t| t.recipient.clone())
+        .or_else(|| (staged.to != "0x").then(|| staged.to.clone()));
+    let token_amount_base_units = staged
+        .token
+        .as_ref()
+        .map(|t| {
+            parse_units(&t.amount, t.decimals)
+                .map(|amount| amount.to_string())
+                .map_err(|e| TxEngineError::Amount(format!("token amount: {e}")))
+        })
+        .transpose()?;
+    let method = if staged.token.is_some() {
+        bloom_auth_api::EVM_ERC20_TRANSFER_METHOD
+    } else {
+        "native_transfer"
+    };
+    let mut terms = DaemonGrantTerms::minimal(AssuranceLevel::Standard);
+    terms.allowed_sign_intents = vec![bloom_auth_api::EVM_TX_SIGN_INTENT.into()];
+    terms.max_signatures = 1;
+    terms.extra.insert(
+        "evm.action_kind".into(),
+        serde_json::json!(action_kind.action_kind()),
+    );
+    terms.extra.insert(
+        "evm.signing_hash_source".into(),
+        serde_json::json!("sealed_evm_unsigned_tx"),
+    );
+
+    let mut policy_snapshot = PetalPolicySnapshot {
+        policy_version: 0,
+        wallet: staged.wallet.clone(),
+        petal_id: PETAL_ID_EVM_WALLET.into(),
+        petal_digest: PLACEHOLDER_DIGEST_EVM_WALLET.into(),
+        caps: BTreeMap::new(),
+        hard_rules: Vec::new(),
+        step_up_rules: Vec::new(),
+        config: BTreeMap::new(),
+        budget_state: BTreeMap::new(),
+        session_scope: None,
+    };
+    policy_snapshot.budget_state.insert(
+        "staged_usd_value".into(),
+        serde_json::json!(staged.usd_value),
+    );
+    policy_snapshot
+        .config
+        .insert("chain_name".into(), serde_json::json!(staged.chain.clone()));
+    policy_snapshot.budget_state.insert(
+        "policy_checks".into(),
+        serde_json::json!(staged.policy_checks),
+    );
+    let policy_snapshot_digest = policy_snapshot.petal_policy_digest().map_err(|e| {
+        TxEngineError::BroadcastApprovalRequired(format!("digest EVM policy snapshot: {e}"))
+    })?;
+    let daemon_terms_digest = terms.daemon_terms_digest().map_err(|e| {
+        TxEngineError::BroadcastApprovalRequired(format!("digest EVM daemon terms: {e}"))
+    })?;
+    let original_tx = if matches!(
+        action_kind,
+        EvmOutboxActionKind::Replace | EvmOutboxActionKind::Cancel
+    ) {
+        staged.tx_hash.as_ref().map(|hash| EvmOriginalTxFact {
+            original_action_id: format!("{}:{}", staged.chain_id, staged.id),
+            original_tx_hash: hash.clone(),
+            original_nonce: Some(staged.nonce),
+        })
+    } else {
+        None
+    };
+
+    Ok(EvmSealedIntentSubject {
+        schema: EVM_SEALED_INTENT_SUBJECT_SCHEMA_V1.into(),
+        action_id: outbox_action_id(staged, action_kind),
+        wallet: staged.wallet.clone(),
+        surface: "outbox".into(),
+        petal_id: PETAL_ID_EVM_WALLET.into(),
+        petal_digest: PLACEHOLDER_DIGEST_EVM_WALLET.into(),
+        petal_version: FIRST_PARTY_PETAL_VERSION_V0.into(),
+        action_kind: action_kind.sealed_action_kind(),
+        chain_id: staged.chain_id,
+        account: staged.from.clone(),
+        call: EvmCallFact {
+            to: staged.to.clone(),
+            recipient,
+            calldata_hex: staged.data_hex.clone(),
+            calldata_hash,
+            method: method.into(),
+        },
+        value: EvmValueFact {
+            native_value_wei: staged.value_wei.clone(),
+            token_amount_base_units,
+            valuation_usd_micro: staged.usd_value.and_then(f64_to_micro_usd),
+        },
+        token,
+        nonce_intent: EvmNonceIntent {
+            mode: "exact".into(),
+            nonce: Some(staged.nonce),
+            original_action_id: matches!(
+                action_kind,
+                EvmOutboxActionKind::Replace | EvmOutboxActionKind::Cancel
+            )
+            .then(|| format!("{}:{}", staged.chain_id, staged.id)),
+        },
+        fee_facts: fee_facts.clone(),
+        replacement_fee_facts: matches!(
+            action_kind,
+            EvmOutboxActionKind::Replace | EvmOutboxActionKind::Cancel
+        )
+        .then_some(fee_facts),
+        unsigned_envelope: EvmUnsignedEnvelopeFacts {
+            envelope_kind: if staged.gas_price.is_some() {
+                "legacy".into()
+            } else {
+                "eip1559".into()
+            },
+            unsigned_tx_bytes_hash,
+            signing_hash: signing_hash_hex,
+        },
+        original_tx,
+        owner_session_use: None,
+        policy_snapshot_digest,
+        policy_snapshot,
+        daemon_terms: terms,
+        daemon_terms_digest,
+        authority_change: false,
+    })
 }
 
 fn f64_to_micro_usd(v: f64) -> Option<i128> {
@@ -2176,17 +4009,14 @@ fn short_addr_label(a: &Address) -> String {
     }
 }
 
-/// Hardcoded list of common ERC-20 addresses. Anvil mainnet forks share
-/// chain id 31337 with vanilla Anvil — the lookup is best-effort and a
+/// Resolve a common ERC-20 symbol to its address via the shared
+/// `bloom_proto::tokens` table (the single source of truth across the send
+/// path, route path, and VFS token surface). Anvil mainnet forks share chain
+/// id 31337 with vanilla Anvil, so they reuse the Ethereum (id 1) majors; a
 /// caller can always pass a 0x address explicitly.
 fn lookup_known_token(chain_id: u64, symbol_upper: &str) -> Option<&'static str> {
-    let hit: Option<&'static str> = match (chain_id, symbol_upper) {
-        (1, "USDC") | (31337, "USDC") => Some("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"),
-        (1, "USDT") | (31337, "USDT") => Some("0xdAC17F958D2ee523a2206206994597C13D831ec7"),
-        (1, "DAI") | (31337, "DAI") => Some("0x6B175474E89094C44Da98b954EedeAC495271d0F"),
-        (1, "WETH") | (31337, "WETH") => Some("0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"),
-        _ => None,
-    };
+    let lookup_chain = if chain_id == 31337 { 1 } else { chain_id };
+    let hit = bloom_proto::tokens::resolve_symbol(lookup_chain, symbol_upper).map(|t| t.address);
     if hit.is_none() {
         debug!(chain_id, symbol = symbol_upper, "tx.known_token_miss");
     }
@@ -2200,7 +4030,397 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+    use bloom_auth_api::{
+        APPROVAL_CHALLENGE_SCHEMA_V1, APPROVAL_SCHEMA_V1, ApprovalChallenge, AuditEvent,
+        AuthApiError, AuthEntryRecord, AuthEntryState, ExecutorKind, NonceState,
+        SealedApprovalGrant, SealedPetalContext, SignerTransport, SigningAttestationSchemaRegistry,
+        WebAuthnAssertionRecord,
+    };
     use bloom_proto::TxStatus;
+
+    const TEST_SIGNER_PK: &str =
+        "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
+    const TEST_SIGNER_ADDRESS: &str = "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266";
+
+    fn test_signer() -> alloy::signers::local::PrivateKeySigner {
+        TEST_SIGNER_PK
+            .parse()
+            .expect("valid deterministic test key")
+    }
+
+    fn fake_grant(
+        wallet: impl Into<String>,
+        action_id: impl Into<String>,
+        petal_id: impl Into<String>,
+        petal_digest: impl Into<String>,
+    ) -> SealedApprovalGrant {
+        let mut terms = DaemonGrantTerms::minimal(AssuranceLevel::Standard);
+        terms.allowed_sign_intents = vec!["evm.tx.sign".into()];
+        terms.max_signatures = 100;
+        SealedApprovalGrant {
+            grant_id: "test-grant".into(),
+            wallet: wallet.into(),
+            action_id: action_id.into(),
+            intent_hash: "test-intent".into(),
+            petal_id: petal_id.into(),
+            petal_digest: petal_digest.into(),
+            petal_version: FIRST_PARTY_PETAL_VERSION_V0.into(),
+            daemon_terms: terms,
+            petal_policy_digest: "0".repeat(64),
+            policy_version: 0,
+            issued_ms: 0,
+            expiry_ms: u64::MAX,
+            max_signatures: 100,
+            consumed_signature_count: 0,
+            revoked: false,
+        }
+    }
+
+    struct TestGrantStore {
+        active: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl GrantStore for TestGrantStore {
+        async fn mint(
+            &self,
+            sealed: &SealedAction,
+            approval_expiry_ms: u64,
+            now_ms: u64,
+        ) -> Result<SealedApprovalGrant, AuthApiError> {
+            SealedApprovalGrant::mint("test-grant", sealed, approval_expiry_ms, now_ms)
+        }
+
+        async fn consume_signature(
+            &self,
+            grant_id: &str,
+            _intent: &str,
+            _now_ms: u64,
+        ) -> Result<SealedApprovalGrant, AuthApiError> {
+            let mut grant = fake_grant(
+                "alice",
+                "test-action",
+                PETAL_ID_EVM_WALLET,
+                PLACEHOLDER_DIGEST_EVM_WALLET,
+            );
+            grant.grant_id = grant_id.to_string();
+            grant.consumed_signature_count = 1;
+            Ok(grant)
+        }
+
+        async fn revoke(&self, _grant_id: &str, _now_ms: u64) -> Result<(), AuthApiError> {
+            Ok(())
+        }
+
+        async fn revoke_all_for_wallet(
+            &self,
+            _wallet: &str,
+            _now_ms: u64,
+        ) -> Result<usize, AuthApiError> {
+            Ok(0)
+        }
+
+        async fn get_active(
+            &self,
+            wallet: &str,
+            action_id: &str,
+            petal_id: &str,
+            petal_digest: &str,
+            _now_ms: u64,
+        ) -> Result<Option<SealedApprovalGrant>, AuthApiError> {
+            Ok(self
+                .active
+                .then(|| fake_grant(wallet, action_id, petal_id, petal_digest)))
+        }
+    }
+
+    struct TestPetalHost;
+
+    #[async_trait::async_trait]
+    impl PetalHost for TestPetalHost {
+        async fn seal_context(&self, petal_id: &str) -> Result<SealedPetalContext, AuthApiError> {
+            Ok(SealedPetalContext {
+                canonical_intent_bytes_hash: "0".repeat(64),
+                intent_hash: "test-intent".into(),
+                daemon_terms_digest: DaemonGrantTerms::minimal(AssuranceLevel::Standard)
+                    .daemon_terms_digest()?,
+                petal_policy_digest: "0".repeat(64),
+                policy_version: 0,
+                petal_id: petal_id.into(),
+            })
+        }
+
+        async fn sealed_policy_snapshot(
+            &self,
+            wallet: &str,
+            petal_id: &str,
+        ) -> Result<PetalPolicySnapshot, AuthApiError> {
+            Ok(PetalPolicySnapshot {
+                policy_version: 0,
+                wallet: wallet.into(),
+                petal_id: petal_id.into(),
+                petal_digest: PLACEHOLDER_DIGEST_EVM_WALLET.into(),
+                caps: BTreeMap::new(),
+                hard_rules: Vec::new(),
+                step_up_rules: Vec::new(),
+                config: BTreeMap::new(),
+                budget_state: BTreeMap::new(),
+                session_scope: None,
+            })
+        }
+
+        async fn sign_hash(
+            &self,
+            request: SignHashRequest,
+            attestation: &SigningAttestation,
+            now_ms: u64,
+        ) -> Result<bloom_auth_api::SealedSignature, AuthApiError> {
+            bloom_auth_api::DefaultAttestationRegistry::new().validate_attestation(attestation)?;
+            if request.intent != "evm.tx.sign" {
+                return Err(AuthApiError::Denied("unexpected test intent".into()));
+            }
+            let hash: B256 = request
+                .hash_hex
+                .parse()
+                .map_err(|e| AuthApiError::Denied(format!("invalid test hash: {e}")))?;
+            use alloy::signers::SignerSync;
+            let sig = test_signer()
+                .sign_hash_sync(&hash)
+                .map_err(|e| AuthApiError::Denied(format!("test sign hash: {e}")))?;
+            Ok(bloom_auth_api::SealedSignature {
+                intent_hash: "test-intent".into(),
+                signature_b64: base64::engine::general_purpose::STANDARD.encode(sig.as_bytes()),
+                signed_at_ms: now_ms,
+            })
+        }
+
+        async fn audit(&self, _event: AuditEvent) -> Result<(), AuthApiError> {
+            Ok(())
+        }
+    }
+
+    fn with_test_host(engine: TxEngine, active: bool) -> TxEngine {
+        engine.with_host_signing_services(
+            Arc::new(TestGrantStore { active }),
+            Arc::new(TestPetalHost),
+        )
+    }
+
+    fn with_test_auth_and_host(engine: TxEngine, active: bool) -> TxEngine {
+        with_test_host(
+            engine.with_auth_services(
+                Arc::new(RejectingTestVerifier),
+                Arc::new(ChallengeOnlyWriter),
+            ),
+            active,
+        )
+    }
+
+    struct RejectingTestVerifier;
+
+    #[async_trait::async_trait]
+    impl ApprovalVerifier for RejectingTestVerifier {
+        async fn verify_and_consume(
+            &self,
+            _approval: SignedApproval,
+            _now_ms: u64,
+        ) -> Result<(), AuthApiError> {
+            Err(AuthApiError::Denied("test verifier rejects".into()))
+        }
+    }
+
+    struct AcceptingTestVerifier;
+
+    #[async_trait::async_trait]
+    impl ApprovalVerifier for AcceptingTestVerifier {
+        async fn verify_and_consume(
+            &self,
+            approval: SignedApproval,
+            _now_ms: u64,
+        ) -> Result<(), AuthApiError> {
+            if approval.surface != "outbox" {
+                return Err(AuthApiError::Denied("wrong surface".into()));
+            }
+            Ok(())
+        }
+
+        async fn verify_and_mint_grant(
+            &self,
+            approval: SignedApproval,
+            _grant_store: &dyn GrantStore,
+            _now_ms: u64,
+        ) -> Result<SealedApprovalGrant, AuthApiError> {
+            if approval.surface != "outbox" {
+                return Err(AuthApiError::Denied("wrong surface".into()));
+            }
+            Ok(fake_grant(
+                approval.wallet,
+                approval.action_id,
+                approval.petal_id,
+                approval.petal_digest,
+            ))
+        }
+    }
+
+    struct ChallengeOnlyWriter;
+
+    #[async_trait::async_trait]
+    impl AuthStoreWriter for ChallengeOnlyWriter {
+        async fn stage_entry(
+            &self,
+            envelope: CanonicalEnvelope,
+            assurance: AssuranceLevel,
+            now_ms: u64,
+        ) -> Result<AuthEntryRecord, AuthApiError> {
+            Ok(AuthEntryRecord {
+                surface: envelope.header.surface.clone(),
+                action_id: envelope.header.action_id.clone(),
+                state: AuthEntryState::Staged,
+                intent_hash: envelope.intent_hash()?,
+                assurance,
+                nonce: None,
+                nonce_state: NonceState::Unused,
+                reservation_id: None,
+                updated_ms: now_ms,
+            })
+        }
+
+        async fn stage_action(
+            &self,
+            action: SealedAction,
+            now_ms: u64,
+        ) -> Result<AuthEntryRecord, AuthApiError> {
+            let assurance = action.daemon_terms.assurance;
+            let envelope = action.envelope;
+            Ok(AuthEntryRecord {
+                surface: envelope.header.surface.clone(),
+                action_id: envelope.header.action_id.clone(),
+                state: AuthEntryState::Staged,
+                intent_hash: envelope.intent_hash()?,
+                assurance,
+                nonce: None,
+                nonce_state: NonceState::Unused,
+                reservation_id: None,
+                updated_ms: now_ms,
+            })
+        }
+
+        async fn issue_challenge(
+            &self,
+            surface: &str,
+            action_id: &str,
+            server_nonce: &str,
+            expiry_ms: u64,
+            _now_ms: u64,
+        ) -> Result<ApprovalChallenge, AuthApiError> {
+            Ok(ApprovalChallenge {
+                schema: APPROVAL_CHALLENGE_SCHEMA_V1.to_string(),
+                action_id: action_id.to_string(),
+                wallet: "alice".to_string(),
+                surface: surface.to_string(),
+                petal_id: PETAL_ID_EVM_WALLET.to_string(),
+                petal_digest: PLACEHOLDER_DIGEST_EVM_WALLET.to_string(),
+                intent_hash: "outbox-intent".to_string(),
+                server_nonce: server_nonce.to_string(),
+                assurance: AssuranceLevel::Standard,
+                daemon_terms_digest: "1".repeat(64),
+                petal_policy_digest: "2".repeat(64),
+                policy_version: 0,
+                expiry_ms,
+                ceremony_url: None,
+            })
+        }
+
+        async fn issue_review_session(
+            &self,
+            review_session_id: &str,
+            surface: &str,
+            action_id: &str,
+            expires_ms: u64,
+            now_ms: u64,
+        ) -> Result<bloom_auth_api::ReviewSessionRecord, AuthApiError> {
+            Ok(bloom_auth_api::ReviewSessionRecord {
+                review_session_id: review_session_id.to_string(),
+                surface: surface.to_string(),
+                action_id: action_id.to_string(),
+                intent_hash: "outbox-intent".to_string(),
+                assurance: AssuranceLevel::Standard,
+                expires_ms,
+                consumed_ms: None,
+                created_ms: now_ms,
+            })
+        }
+    }
+
+    struct PreApprovedWriter;
+
+    #[async_trait::async_trait]
+    impl AuthStoreWriter for PreApprovedWriter {
+        async fn stage_entry(
+            &self,
+            envelope: CanonicalEnvelope,
+            assurance: AssuranceLevel,
+            now_ms: u64,
+        ) -> Result<AuthEntryRecord, AuthApiError> {
+            Ok(AuthEntryRecord {
+                surface: envelope.header.surface.clone(),
+                action_id: envelope.header.action_id.clone(),
+                state: AuthEntryState::Approved,
+                intent_hash: envelope.intent_hash()?,
+                assurance,
+                nonce: Some("already-consumed".into()),
+                nonce_state: NonceState::Consumed,
+                reservation_id: None,
+                updated_ms: now_ms,
+            })
+        }
+
+        async fn stage_action(
+            &self,
+            action: SealedAction,
+            now_ms: u64,
+        ) -> Result<AuthEntryRecord, AuthApiError> {
+            let assurance = action.daemon_terms.assurance;
+            let envelope = action.envelope;
+            Ok(AuthEntryRecord {
+                surface: envelope.header.surface.clone(),
+                action_id: envelope.header.action_id.clone(),
+                state: AuthEntryState::Approved,
+                intent_hash: envelope.intent_hash()?,
+                assurance,
+                nonce: Some("already-consumed".into()),
+                nonce_state: NonceState::Consumed,
+                reservation_id: None,
+                updated_ms: now_ms,
+            })
+        }
+
+        async fn issue_challenge(
+            &self,
+            _surface: &str,
+            _action_id: &str,
+            _server_nonce: &str,
+            _expiry_ms: u64,
+            _now_ms: u64,
+        ) -> Result<ApprovalChallenge, AuthApiError> {
+            Err(AuthApiError::Denied(
+                "pre-approved retry must not issue a new challenge".into(),
+            ))
+        }
+
+        async fn issue_review_session(
+            &self,
+            _review_session_id: &str,
+            _surface: &str,
+            _action_id: &str,
+            _expires_ms: u64,
+            _now_ms: u64,
+        ) -> Result<bloom_auth_api::ReviewSessionRecord, AuthApiError> {
+            Err(AuthApiError::Denied(
+                "pre-approved retry must not issue a review session".into(),
+            ))
+        }
+    }
 
     fn fake_staged_1559(id: &str) -> StagedTx {
         StagedTx {
@@ -2208,7 +4428,7 @@ mod tests {
             wallet: "alice".into(),
             chain: "anvil".into(),
             chain_id: 31337,
-            from: "0x0000000000000000000000000000000000000001".into(),
+            from: TEST_SIGNER_ADDRESS.into(),
             to: "0x0000000000000000000000000000000000000002".into(),
             value_wei: "0".into(),
             data_hex: "0x".into(),
@@ -2225,7 +4445,247 @@ mod tests {
             token: None,
             nft: None,
             usd_value: None,
+            depends_on: None,
+            action_id: None,
         }
+    }
+
+    fn outbox_intent_hash_for(staged: &StagedTx) -> String {
+        outbox_canonical_envelope(staged, EvmOutboxActionKind::Confirm, &test_signing_hash())
+            .unwrap()
+            .intent_hash()
+            .unwrap()
+    }
+
+    fn sealed_action_from_staged(staged: &StagedTx) -> SealedAction {
+        let subject =
+            evm_sealed_subject(staged, EvmOutboxActionKind::Confirm, &test_signing_hash()).unwrap();
+        SealedAction::new(
+            subject
+                .canonical_envelope(u64::try_from(staged.expires_ms).unwrap_or(u64::MAX))
+                .unwrap(),
+            "test plan".into(),
+            Vec::new(),
+            subject.daemon_terms.clone(),
+            subject.policy_snapshot.clone(),
+            1,
+        )
+        .unwrap()
+    }
+
+    fn fake_chain_client(allow_broadcast: bool) -> bloom_evm::ChainClient {
+        let spec = bloom_proto::ChainSpec {
+            name: "anvil".into(),
+            chain_id: 31337,
+            rpc_urls: vec!["http://127.0.0.1:1".into()],
+            rpc_endpoints: Vec::new(),
+            allow_broadcast,
+            etherscan_api_url: None,
+            display_name: None,
+            native_symbol: "ETH".into(),
+            native_decimals: 18,
+            legacy_tx: false,
+        };
+        bloom_evm::ChainClient::new(spec).unwrap()
+    }
+
+    fn test_signing_hash() -> B256 {
+        B256::repeat_byte(0x11)
+    }
+
+    fn assert_outbox_intent_hash_changes<F: FnOnce(&mut StagedTx)>(field: &str, mutate: F) {
+        let base = fake_staged_1559("0001-bind");
+        let base_hash = outbox_intent_hash_for(&base);
+        let mut changed = base;
+        mutate(&mut changed);
+        let changed_hash = outbox_intent_hash_for(&changed);
+        assert_ne!(
+            base_hash, changed_hash,
+            "mutating EVM sealed intent field {field} must change intent hash"
+        );
+    }
+
+    #[test]
+    fn evm_outbox_canonical_envelope_binds_reference_identity() {
+        let mut staged = fake_staged_1559("0001-reference");
+        staged.value_wei = "42".into();
+        staged.data_hex = "0xa9059cbb".into();
+        staged.usd_value = Some(1.25);
+        staged.token = Some(bloom_proto::TokenRef {
+            address: "0x0000000000000000000000000000000000000003".into(),
+            symbol: "USDC".into(),
+            decimals: 6,
+            recipient: "0x0000000000000000000000000000000000000002".into(),
+            amount: "1.25".into(),
+        });
+
+        let envelope =
+            outbox_canonical_envelope(&staged, EvmOutboxActionKind::Confirm, &test_signing_hash())
+                .unwrap();
+        assert_eq!(envelope.header.wallet, "alice");
+        assert_eq!(envelope.header.surface, "outbox");
+        assert_eq!(envelope.header.action_id, "31337:0001-reference");
+        assert_eq!(envelope.header.petal_id, PETAL_ID_EVM_WALLET);
+        assert_eq!(envelope.header.petal_digest, PLACEHOLDER_DIGEST_EVM_WALLET);
+        assert_eq!(envelope.header.petal_version, FIRST_PARTY_PETAL_VERSION_V0);
+        assert_eq!(envelope.header.executor_kind, ExecutorKind::FirstParty);
+        assert_eq!(envelope.header.network, "eip155:31337");
+        assert_eq!(envelope.header.account, TEST_SIGNER_ADDRESS);
+        assert_eq!(envelope.header.action_kind, "confirm");
+        assert!(envelope.header.value_movement);
+        assert!(!envelope.header.authority_change);
+        assert_eq!(
+            envelope.subject_kind,
+            bloom_auth_api::EVM_SEALED_INTENT_SUBJECT_KIND
+        );
+        assert_eq!(
+            envelope.subject_schema,
+            bloom_auth_api::EVM_SEALED_INTENT_SUBJECT_SCHEMA_V1
+        );
+
+        let subject_bytes = base64::engine::general_purpose::STANDARD
+            .decode(&envelope.subject_bytes_b64)
+            .unwrap();
+        let subject: serde_json::Value = serde_json::from_slice(&subject_bytes).unwrap();
+        assert_eq!(
+            subject["schema"],
+            bloom_auth_api::EVM_SEALED_INTENT_SUBJECT_SCHEMA_V1
+        );
+        assert_eq!(subject["action_id"], "31337:0001-reference");
+        assert_eq!(subject["chain_id"], 31337);
+        assert_eq!(subject["call"]["to"], staged.to);
+        assert_eq!(subject["value"]["native_value_wei"], "42");
+        assert_eq!(subject["call"]["calldata_hex"], "0xa9059cbb");
+        assert_eq!(subject["token"]["symbol"], "USDC");
+    }
+
+    #[test]
+    fn evm_outbox_canonical_envelope_binds_critical_fields() {
+        assert_outbox_intent_hash_changes("wallet", |s| s.wallet = "other-wallet".into());
+        assert_outbox_intent_hash_changes("chain", |s| s.chain = "base".into());
+        assert_outbox_intent_hash_changes("chain_id", |s| s.chain_id = 8453);
+        assert_outbox_intent_hash_changes("id", |s| s.id = "0002-bind".into());
+        assert_outbox_intent_hash_changes("from", |s| {
+            s.from = "0x0000000000000000000000000000000000000004".into()
+        });
+        assert_outbox_intent_hash_changes("to", |s| {
+            s.to = "0x0000000000000000000000000000000000000005".into()
+        });
+        assert_outbox_intent_hash_changes("value_wei", |s| s.value_wei = "1".into());
+        assert_outbox_intent_hash_changes("data_hex", |s| s.data_hex = "0x01".into());
+        assert_outbox_intent_hash_changes("gas_limit", |s| s.gas_limit = 50_000);
+        assert_outbox_intent_hash_changes("max_fee_per_gas", |s| {
+            s.max_fee_per_gas = Some("200".into())
+        });
+        assert_outbox_intent_hash_changes("max_priority_fee_per_gas", |s| {
+            s.max_priority_fee_per_gas = Some("20".into())
+        });
+        assert_outbox_intent_hash_changes("nonce", |s| s.nonce = 1);
+        assert_outbox_intent_hash_changes("token", |s| {
+            s.token = Some(bloom_proto::TokenRef {
+                address: "0x0000000000000000000000000000000000000003".into(),
+                symbol: "USDC".into(),
+                decimals: 6,
+                recipient: "0x0000000000000000000000000000000000000002".into(),
+                amount: "0.000001".into(),
+            })
+        });
+        assert_outbox_intent_hash_changes("policy_checks", |s| {
+            s.policy_checks.push(bloom_proto::PolicyCheck::hard(
+                "evm.test",
+                bloom_proto::PolicyOutcome::Deny,
+                "test denial",
+            ))
+        });
+        assert_outbox_intent_hash_changes("expires_ms", |s| s.expires_ms = 123_456);
+    }
+
+    #[test]
+    fn sealed_dispatcher_accepts_exact_evm_subject_bytes() {
+        let (engine, _spec, _dir) = fake_engine(60_000);
+        let mut staged = fake_staged_1559("0001-sealed");
+        staged.action_id = Some("action-0001".into());
+        staged.expires_ms = 10_000;
+        let sealed = sealed_action_from_staged(&staged);
+        let subject_bytes = base64::engine::general_purpose::STANDARD
+            .decode(&sealed.envelope.subject_bytes_b64)
+            .unwrap();
+        let subject: EvmSealedIntentSubject = serde_json::from_slice(&subject_bytes).unwrap();
+
+        engine
+            .ensure_evm_subject_matches_seal(&sealed, &subject)
+            .unwrap();
+    }
+
+    #[test]
+    fn sealed_dispatcher_rejects_tampered_evm_subject_bytes() {
+        let (engine, _spec, _dir) = fake_engine(60_000);
+        let mut staged = fake_staged_1559("0001-sealed");
+        staged.action_id = Some("action-0001".into());
+        staged.expires_ms = 10_000;
+        let sealed = sealed_action_from_staged(&staged);
+        let subject_bytes = base64::engine::general_purpose::STANDARD
+            .decode(&sealed.envelope.subject_bytes_b64)
+            .unwrap();
+        let mut subject: EvmSealedIntentSubject = serde_json::from_slice(&subject_bytes).unwrap();
+        subject.call.to = "0x0000000000000000000000000000000000000005".into();
+
+        let err = engine
+            .ensure_evm_subject_matches_seal(&sealed, &subject)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("sealed subject bytes do not reproduce"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sealed_dispatcher_errors_for_unregistered_fake_petal() {
+        let (engine, _spec, _dir) = fake_engine(60_000);
+        let header = bloom_auth_api::CanonicalIntentHeader {
+            schema: bloom_auth_api::CANONICAL_INTENT_HEADER_SCHEMA_V2.into(),
+            wallet: "alice".into(),
+            surface: "fake".into(),
+            action_id: "fake-action".into(),
+            petal_id: "fake-petal".into(),
+            petal_digest: "fake-digest".into(),
+            petal_version: "v0".into(),
+            executor_kind: ExecutorKind::FirstParty,
+            network: "testnet".into(),
+            account: TEST_SIGNER_ADDRESS.into(),
+            action_kind: "fake_execute".into(),
+            value_movement: false,
+            authority_change: false,
+            expires_ms: 10_000,
+        };
+        let envelope = CanonicalEnvelope::new(
+            header.clone(),
+            "fake_subject",
+            "fake.subject.v1",
+            br#"{\"ok\":true}"#.to_vec(),
+        );
+        let policy = PetalPolicySnapshot::minimal(&header);
+        let sealed = SealedAction::new(
+            envelope,
+            "fake plan".into(),
+            Vec::new(),
+            DaemonGrantTerms::minimal(AssuranceLevel::Standard),
+            policy,
+            1,
+        )
+        .unwrap();
+        let chain = fake_chain_client(true);
+
+        let err = engine
+            .execute_sealed_action(&sealed, "anvil", &chain, &Policy::default())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("no sealed-action executor registered for petal_id=fake-petal"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -2274,6 +4734,24 @@ mod tests {
         assert!(matches!(err, TxEngineError::Token(_)));
     }
 
+    #[test]
+    fn resolve_token_symbol_resolves_on_arbitrum() {
+        // Regression: USDC by symbol must resolve on non-mainnet chains via the
+        // shared bloom_proto::tokens table (previously only chains 1/31337).
+        let (a, sym) = TxEngine::resolve_token_address("USDC", 42161).unwrap();
+        assert_eq!(
+            format!("{a:#x}"),
+            "0xaf88d065e77c8cc2239327c5edb3a432268e5831"
+        );
+        assert_eq!(sym, "USDC");
+    }
+
+    #[test]
+    fn resolve_token_symbol_resolves_on_polygon_and_base() {
+        assert!(TxEngine::resolve_token_address("USDC", 137).is_ok());
+        assert!(TxEngine::resolve_token_address("USDC", 8453).is_ok());
+    }
+
     // -------------------------------------------------------------------
     // Nonce-conflict body tests. These exercise the index lookup +
     // body shape directly; the full stage() path is covered elsewhere
@@ -2307,6 +4785,119 @@ mod tests {
         let outbox = crate::outbox::Outbox::new(dir.path()).unwrap();
         let engine = TxEngine::new(outbox, 60_000, false);
         (engine, dir)
+    }
+
+    /// `persist_outbox_ceremony_approval` is an outbox-only method: it requires
+    /// a broadcast action's `chain_name`. Non-broadcast first-party actions
+    /// (wallet-policy updates, policy-session mints) must not be routed here by
+    /// the ceremony server — this test pins the contract so the caller-side gate
+    /// (which skips this call for non-broadcast actions) stays load-bearing.
+    #[test]
+    fn persist_ceremony_approval_requires_broadcast_chain_name() {
+        let (engine, _dir) = nonce_conflict_engine();
+        let staged = fake_staged_1559("0001-policy-like");
+        let mut action = sealed_action_from_staged(&staged);
+        action.petal_policy.config.remove("chain_name");
+        assert_eq!(action.chain_name(), None, "precondition: no chain_name");
+
+        let approval = SignedApproval {
+            schema: APPROVAL_SCHEMA_V1.into(),
+            action_id: action.action_id().to_string(),
+            wallet: action.wallet().to_string(),
+            surface: "wallet-policy".into(),
+            petal_id: action.petal_id().to_string(),
+            petal_digest: action.petal_digest().to_string(),
+            intent_hash: "policy-intent".into(),
+            server_nonce: "nonce-1".into(),
+            assurance: AssuranceLevel::Standard,
+            daemon_terms_digest: "1".repeat(64),
+            petal_policy_digest: "2".repeat(64),
+            policy_version: 0,
+            expiry_ms: now_ms() as u64 + 60_000,
+            signer_transport: SignerTransport::BrowserWebauthn,
+            credential_id: "cred-1".into(),
+            review_session_id: None,
+            webauthn_assertion: WebAuthnAssertionRecord {
+                credential_id: "cred-1".into(),
+                authenticator_data_b64: "AA".into(),
+                client_data_json_b64: "e30".into(),
+                signature_b64: "AA".into(),
+                user_handle_b64: None,
+            },
+        };
+
+        let err = engine
+            .persist_outbox_ceremony_approval(&action, &approval)
+            .expect_err("outbox persistence must reject a non-broadcast action");
+        assert!(
+            matches!(err, TxEngineError::BroadcastApprovalRequired(_)),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn dependency_gate_blocks_until_predecessor_succeeds() {
+        use crate::outbox::{MinedReceipt, OutboxState, RECEIPT_FILE};
+        let (engine, _dir) = nonce_conflict_engine();
+
+        // No predecessor in the outbox → refused.
+        assert!(matches!(
+            engine.ensure_dependency_satisfied("alice", "anvil", "approve"),
+            Err(TxEngineError::DependencyNotSatisfied { .. })
+        ));
+
+        // Predecessor staged but still pending → refused.
+        let mut dep = fake_staged_1559("approve");
+        dep.tx_hash = Some(format!("{:#x}", B256::repeat_byte(9)));
+        engine.outbox.write_pending(&dep, "# plan").unwrap();
+        assert!(matches!(
+            engine.ensure_dependency_satisfied("alice", "anvil", "approve"),
+            Err(TxEngineError::DependencyNotSatisfied { .. })
+        ));
+
+        // Broadcast (sent) but no receipt yet → refused (waiting to confirm).
+        let entry = engine.outbox.read("alice", "anvil", "approve").unwrap();
+        engine.outbox.transition(&entry, OutboxState::Sent).unwrap();
+        assert!(matches!(
+            engine.ensure_dependency_satisfied("alice", "anvil", "approve"),
+            Err(TxEngineError::DependencyNotSatisfied { .. })
+        ));
+
+        // Reverted receipt → refused, with the reason surfaced.
+        let se = &engine.outbox.walk_all_sent().unwrap()[0];
+        let reverted = MinedReceipt {
+            outcome: "reverted".into(),
+            tx_hash: dep.tx_hash.clone().unwrap(),
+            block_number: Some(1),
+            revert_reason: Some("ERC20: insufficient allowance".into()),
+        };
+        engine
+            .outbox
+            .write_sent_sibling(se, RECEIPT_FILE, &serde_json::to_vec(&reverted).unwrap())
+            .unwrap();
+        match engine.ensure_dependency_satisfied("alice", "anvil", "approve") {
+            Err(TxEngineError::DependencyNotSatisfied { reason, .. }) => {
+                assert!(reason.contains("reverted"))
+            }
+            other => panic!("expected reverted refusal, got {other:?}"),
+        }
+
+        // Success receipt → allowed.
+        let success = MinedReceipt {
+            outcome: "success".into(),
+            tx_hash: dep.tx_hash.clone().unwrap(),
+            block_number: Some(1),
+            revert_reason: None,
+        };
+        engine
+            .outbox
+            .write_sent_sibling(se, RECEIPT_FILE, &serde_json::to_vec(&success).unwrap())
+            .unwrap();
+        assert!(
+            engine
+                .ensure_dependency_satisfied("alice", "anvil", "approve")
+                .is_ok()
+        );
     }
 
     #[test]
@@ -2400,7 +4991,7 @@ mod tests {
             native_decimals: 18,
             legacy_tx: false,
         };
-        let chain = bloom_chain::ChainClient::new(spec).unwrap();
+        let chain = bloom_evm::ChainClient::new(spec).unwrap();
         let policy = bloom_proto::Policy::default();
         let report = evaluate_mev_risk(&chain, &cd, U256::ZERO, &policy);
         assert_eq!(report.risk, bloom_mempool::MevRisk::High);
@@ -2449,8 +5040,7 @@ mod tests {
     async fn confirm_rejects_id_already_in_sent() {
         let (engine, spec, dir) = fake_engine(60_000);
         let permit = permit_for(&dir);
-        let chain = bloom_chain::ChainClient::new(spec.clone()).unwrap();
-        let signer = alloy::signers::local::PrivateKeySigner::random();
+        let chain = bloom_evm::ChainClient::new(spec.clone()).unwrap();
         let policy = bloom_proto::Policy::default();
 
         // Stage manually (write_pending) so we don't need a live RPC.
@@ -2466,17 +5056,7 @@ mod tests {
             .unwrap();
 
         let r = engine
-            .confirm(
-                &permit,
-                "alice",
-                "anvil",
-                "0001-test",
-                &chain,
-                &signer,
-                &policy,
-                "y",
-                None,
-            )
+            .confirm(&permit, "alice", "anvil", "0001-test", &chain, &policy, "y")
             .await;
         match r {
             Err(TxEngineError::Outbox(OutboxError::StateMismatch { actual, .. })) => {
@@ -2493,8 +5073,7 @@ mod tests {
     async fn confirm_rejects_expired_stage() {
         let (engine, spec, dir) = fake_engine(60_000);
         let permit = permit_for(&dir);
-        let chain = bloom_chain::ChainClient::new(spec.clone()).unwrap();
-        let signer = alloy::signers::local::PrivateKeySigner::random();
+        let chain = bloom_evm::ChainClient::new(spec.clone()).unwrap();
         let policy = bloom_proto::Policy::default();
 
         let mut staged = fake_staged_1559("0001-test");
@@ -2503,17 +5082,7 @@ mod tests {
         engine.outbox.write_pending(&staged, "p").unwrap();
 
         let r = engine
-            .confirm(
-                &permit,
-                "alice",
-                "anvil",
-                "0001-test",
-                &chain,
-                &signer,
-                &policy,
-                "y",
-                None,
-            )
+            .confirm(&permit, "alice", "anvil", "0001-test", &chain, &policy, "y")
             .await;
         match r {
             Err(TxEngineError::Outbox(OutboxError::StagedExpired { id, .. })) => {
@@ -2526,9 +5095,9 @@ mod tests {
     #[tokio::test]
     async fn confirm_writes_broadcast_attempt_before_public_submit_error() {
         let (engine, spec, dir) = fake_engine(60_000);
+        let engine = with_test_auth_and_host(engine, true);
         let permit = permit_for(&dir);
-        let chain = bloom_chain::ChainClient::new(spec.clone()).unwrap();
-        let signer = alloy::signers::local::PrivateKeySigner::random();
+        let chain = bloom_evm::ChainClient::new(spec.clone()).unwrap();
         let policy = bloom_proto::Policy::default();
 
         let mut staged = fake_staged_1559("0001-attempt");
@@ -2542,10 +5111,8 @@ mod tests {
                 "anvil",
                 "0001-attempt",
                 &chain,
-                &signer,
                 &policy,
                 "y",
-                None,
             )
             .await;
         assert!(r.is_err(), "unreachable public RPC should fail");
@@ -2568,11 +5135,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn confirm_keeps_session_debit_after_broadcast_attempt_error() {
+        let (engine, spec, dir) = fake_engine(60_000);
+        let engine = with_test_auth_and_host(engine, true);
+        let permit = permit_for(&dir);
+        let chain = bloom_evm::ChainClient::new(spec.clone()).unwrap();
+        let policy = bloom_proto::Policy::default();
+
+        let mut staged = fake_staged_1559("0001-session-attempt");
+        staged.expires_ms = now_ms() + 60_000;
+        staged.usd_value = Some(2.0);
+        engine.outbox.write_pending(&staged, "p").unwrap();
+        engine.session_store.mint(crate::session::ActiveSession {
+            id: "session-attempt".into(),
+            wallet: "alice".into(),
+            chains: std::collections::BTreeSet::from([31337]),
+            expires_ms: now_ms() + 60_000,
+            max_micro_usd: 5_000_000,
+            spent_micro_usd: 0,
+            allowed_pending_ids: std::collections::BTreeSet::from([crate::session::pending_key(
+                31337,
+                "0001-session-attempt",
+            )]),
+        });
+
+        let r = engine
+            .confirm(
+                &permit,
+                "alice",
+                "anvil",
+                "0001-session-attempt",
+                &chain,
+                &policy,
+                "y",
+            )
+            .await;
+        assert!(r.is_err(), "unreachable public RPC should fail");
+        let session = engine
+            .session_store
+            .active(now_ms())
+            .into_iter()
+            .find(|s| s.id == "session-attempt")
+            .expect("session remains active");
+        assert_eq!(session.spent_micro_usd, 2_000_000);
+    }
+
+    #[tokio::test]
     async fn replace_and_cancel_by_replacement_write_broadcast_attempts_before_submit_error() {
         let (engine, spec, dir) = fake_engine(60_000);
+        let engine = with_test_auth_and_host(engine, true);
         let permit = permit_for(&dir);
-        let chain = bloom_chain::ChainClient::new(spec.clone()).unwrap();
-        let signer = alloy::signers::local::PrivateKeySigner::random();
+        let chain = bloom_evm::ChainClient::new(spec.clone()).unwrap();
         let policy = bloom_proto::Policy::default();
 
         let mut staged = fake_staged_1559("0001-replace");
@@ -2585,10 +5198,8 @@ mod tests {
                 "anvil",
                 "0001-replace",
                 &chain,
-                &signer,
                 10,
                 &policy,
-                None,
             )
             .await;
         assert!(r.is_err(), "unreachable public RPC should fail");
@@ -2621,10 +5232,8 @@ mod tests {
                 "anvil",
                 "0002-cancel",
                 &chain,
-                &signer,
                 10,
                 &policy,
-                None,
             )
             .await;
         assert!(r.is_err(), "unreachable public RPC should fail");
@@ -2651,10 +5260,10 @@ mod tests {
     #[tokio::test]
     async fn replace_and_cancel_by_replacement_respect_broadcast_gate() {
         let (engine, mut spec, dir) = fake_engine(60_000);
+        let engine = with_test_auth_and_host(engine, true);
         spec.allow_broadcast = false;
         let permit = permit_for(&dir);
-        let chain = bloom_chain::ChainClient::new(spec.clone()).unwrap();
-        let signer = alloy::signers::local::PrivateKeySigner::random();
+        let chain = bloom_evm::ChainClient::new(spec.clone()).unwrap();
         let policy = bloom_proto::Policy::default();
 
         let mut staged = fake_staged_1559("0001-replace-gated");
@@ -2667,10 +5276,8 @@ mod tests {
                 "anvil",
                 "0001-replace-gated",
                 &chain,
-                &signer,
                 10,
                 &policy,
-                None,
             )
             .await;
         assert!(matches!(r, Err(TxEngineError::BroadcastDisabled(_))));
@@ -2703,10 +5310,8 @@ mod tests {
                 "anvil",
                 "0002-cancel-gated",
                 &chain,
-                &signer,
                 10,
                 &policy,
-                None,
             )
             .await;
         assert!(matches!(r, Err(TxEngineError::BroadcastDisabled(_))));
@@ -2880,7 +5485,7 @@ mod tests {
         // actually dial the RPC URL in `spec`, which is why this test
         // can run with a stub spec and no live node.
         let (engine, spec, _dir) = fake_engine(60_000);
-        let chain = bloom_chain::ChainClient::new(spec.clone()).unwrap();
+        let chain = bloom_evm::ChainClient::new(spec.clone()).unwrap();
         let addr = Address::ZERO;
         assert_eq!(
             engine
@@ -2913,7 +5518,7 @@ mod tests {
     async fn resolve_intent_body_nft_transfer_hinted_erc721() {
         use bloom_proto::intent::RawIntentBody;
         let (engine, spec, _dir) = fake_engine(60_000);
-        let chain = bloom_chain::ChainClient::new(spec.clone()).unwrap();
+        let chain = bloom_evm::ChainClient::new(spec.clone()).unwrap();
         let from = "0x000000000000000000000000000000000000aaaa"
             .parse::<Address>()
             .unwrap();
@@ -2953,7 +5558,7 @@ mod tests {
     async fn resolve_intent_body_nft_transfer_hinted_erc1155_defaults_amount_to_one() {
         use bloom_proto::intent::RawIntentBody;
         let (engine, spec, _dir) = fake_engine(60_000);
-        let chain = bloom_chain::ChainClient::new(spec.clone()).unwrap();
+        let chain = bloom_evm::ChainClient::new(spec.clone()).unwrap();
         let from = "0x000000000000000000000000000000000000aaaa"
             .parse::<Address>()
             .unwrap();
@@ -2991,7 +5596,7 @@ mod tests {
         // happy path via the calldata-encoding tests above. Here we
         // assert that an Unknown contract is rejected as expected.
         let (engine, spec, _dir) = fake_engine(60_000);
-        let chain = bloom_chain::ChainClient::new(spec.clone()).unwrap();
+        let chain = bloom_evm::ChainClient::new(spec.clone()).unwrap();
         let from = "0x000000000000000000000000000000000000aaaa"
             .parse::<Address>()
             .unwrap();
@@ -3018,7 +5623,7 @@ mod tests {
     async fn resolve_intent_body_rejects_unknown_standard_hint() {
         use bloom_proto::intent::RawIntentBody;
         let (engine, spec, _dir) = fake_engine(60_000);
-        let chain = bloom_chain::ChainClient::new(spec.clone()).unwrap();
+        let chain = bloom_evm::ChainClient::new(spec.clone()).unwrap();
         let from = Address::ZERO;
         let body = RawIntentBody::NftTransfer {
             contract: "0x0000000000000000000000000000000000001155".into(),
@@ -3043,9 +5648,9 @@ mod tests {
         use bloom_proto::policy::{PolicyAutomation, PolicyCaps, PolicyCheck, PolicyOutcome};
 
         let (engine, spec, dir) = fake_engine(60_000);
+        let engine = with_test_auth_and_host(engine, true);
         let permit = permit_for(&dir);
-        let chain = bloom_chain::ChainClient::new(spec.clone()).unwrap();
-        let signer = alloy::signers::local::PrivateKeySigner::random();
+        let chain = bloom_evm::ChainClient::new(spec.clone()).unwrap();
 
         // Soft-warn on tx, with a non-default override token.
         let policy = bloom_proto::Policy {
@@ -3060,26 +5665,16 @@ mod tests {
         let mut staged = fake_staged_1559("0001-test");
         staged.expires_ms = now_ms() + 60_000;
         // Inject a Warn check directly so the override gate fires.
-        staged.policy_checks = vec![PolicyCheck {
-            rule: "test.warn".into(),
-            outcome: PolicyOutcome::Warn,
-            message: "soft cap".into(),
-        }];
+        staged.policy_checks = vec![PolicyCheck::soft(
+            "test.warn",
+            PolicyOutcome::Warn,
+            "soft cap",
+        )];
         engine.outbox.write_pending(&staged, "p").unwrap();
 
         // "y" must be rejected — needs the policy's override token.
         let r = engine
-            .confirm(
-                &permit,
-                "alice",
-                "anvil",
-                "0001-test",
-                &chain,
-                &signer,
-                &policy,
-                "y",
-                None,
-            )
+            .confirm(&permit, "alice", "anvil", "0001-test", &chain, &policy, "y")
             .await;
         assert!(matches!(r, Err(TxEngineError::PolicyDenied)));
 
@@ -3092,10 +5687,8 @@ mod tests {
                 "anvil",
                 "0001-test",
                 &chain,
-                &signer,
                 &policy,
                 "override",
-                None,
             )
             .await;
         assert!(matches!(r, Err(TxEngineError::PolicyDenied)));
@@ -3111,10 +5704,8 @@ mod tests {
                 "anvil",
                 "0001-test",
                 &chain,
-                &signer,
                 &policy,
                 "yolo",
-                None,
             )
             .await;
         match r {
@@ -3132,31 +5723,20 @@ mod tests {
 
         let (engine, spec, dir) = fake_engine(60_000);
         let permit = permit_for(&dir);
-        let chain = bloom_chain::ChainClient::new(spec.clone()).unwrap();
-        let signer = alloy::signers::local::PrivateKeySigner::random();
+        let chain = bloom_evm::ChainClient::new(spec.clone()).unwrap();
         let policy = bloom_proto::Policy::default();
 
         let mut staged = fake_staged_1559("0001-test");
         staged.expires_ms = now_ms() + 60_000;
-        staged.policy_checks = vec![PolicyCheck {
-            rule: "caps.max_value_eth".into(),
-            outcome: PolicyOutcome::Deny,
-            message: "value exceeds max".into(),
-        }];
+        staged.policy_checks = vec![PolicyCheck::hard(
+            "caps.max_value_eth",
+            PolicyOutcome::Deny,
+            "value exceeds max",
+        )];
         engine.outbox.write_pending(&staged, "p").unwrap();
 
         let r = engine
-            .confirm(
-                &permit,
-                "alice",
-                "anvil",
-                "0001-test",
-                &chain,
-                &signer,
-                &policy,
-                "y",
-                None,
-            )
+            .confirm(&permit, "alice", "anvil", "0001-test", &chain, &policy, "y")
             .await;
         assert!(
             matches!(r, Err(TxEngineError::PolicyDenied)),
@@ -3181,33 +5761,23 @@ mod tests {
         use bloom_proto::policy::{PolicyCheck, PolicyOutcome};
 
         let (engine, spec, dir) = fake_engine(60_000);
+        let engine = with_test_auth_and_host(engine, true);
         let permit = permit_for(&dir);
-        let chain = bloom_chain::ChainClient::new(spec.clone()).unwrap();
-        let signer = alloy::signers::local::PrivateKeySigner::random();
+        let chain = bloom_evm::ChainClient::new(spec.clone()).unwrap();
         let policy = bloom_proto::Policy::default(); // override_sentinel() == "override"
 
         let mut staged = fake_staged_1559("0001-test");
         staged.expires_ms = now_ms() + 60_000;
-        staged.policy_checks = vec![PolicyCheck {
-            rule: "caps.warn_value_eth".into(),
-            outcome: PolicyOutcome::Warn,
-            message: "soft cap exceeded".into(),
-        }];
+        staged.policy_checks = vec![PolicyCheck::soft(
+            "caps.warn_value_eth",
+            PolicyOutcome::Warn,
+            "soft cap exceeded",
+        )];
         engine.outbox.write_pending(&staged, "p").unwrap();
 
         // Wrong text — must be rejected.
         let r = engine
-            .confirm(
-                &permit,
-                "alice",
-                "anvil",
-                "0001-test",
-                &chain,
-                &signer,
-                &policy,
-                "y",
-                None,
-            )
+            .confirm(&permit, "alice", "anvil", "0001-test", &chain, &policy, "y")
             .await;
         assert!(
             matches!(r, Err(TxEngineError::PolicyDenied)),
@@ -3232,10 +5802,8 @@ mod tests {
                 "anvil",
                 "0001-test",
                 &chain,
-                &signer,
                 &policy,
                 "override",
-                None,
             )
             .await;
         match r {
@@ -3249,8 +5817,7 @@ mod tests {
     async fn broadcast_approval_required_blocks_confirm_before_rpc() {
         let (engine, spec, dir) = fake_engine(60_000);
         let permit = permit_for(&dir);
-        let chain = bloom_chain::ChainClient::new(spec.clone()).unwrap();
-        let signer = alloy::signers::local::PrivateKeySigner::random();
+        let chain = bloom_evm::ChainClient::new(spec.clone()).unwrap();
         let mut policy = bloom_proto::Policy::default();
         policy.approval.require_broadcast_approval = true;
 
@@ -3260,6 +5827,8 @@ mod tests {
         staged.expires_ms = now_ms() + 60_000;
         engine.outbox.write_pending(&staged, "p").unwrap();
 
+        // Without auth services wired, confirm must fail closed instead of
+        // accepting forgeable marker files (M1: marker fallback removed).
         let r = engine
             .confirm(
                 &permit,
@@ -3267,17 +5836,16 @@ mod tests {
                 "anvil",
                 "0001-approval",
                 &chain,
-                &signer,
                 &policy,
                 "y",
-                None,
             )
             .await;
         assert!(
-            matches!(r, Err(TxEngineError::BroadcastApprovalRequired(_))),
-            "expected approval refusal, got {r:?}"
+            matches!(r, Err(TxEngineError::BroadcastApprovalRequired(ref e)) if e.contains("not wired")),
+            "expected fail-closed when unwired, got {r:?}"
         );
 
+        // Supplying a review hash no longer helps without wired auth services.
         let r = engine
             .confirm(
                 &permit,
@@ -3285,40 +5853,43 @@ mod tests {
                 "anvil",
                 "0001-approval",
                 &chain,
-                &signer,
                 &policy,
                 "y",
-                Some("reviewed"),
             )
             .await;
         assert!(
-            matches!(r, Err(TxEngineError::BroadcastApprovalRequired(ref e)) if e.contains("review_intent")),
-            "expected missing review artifact refusal, got {r:?}"
+            matches!(r, Err(TxEngineError::BroadcastApprovalRequired(ref e)) if e.contains("not wired")),
+            "expected fail-closed when unwired even with review hash, got {r:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn wired_auth_outbox_confirm_ignores_legacy_marker_and_issues_challenge() {
+        let (engine, spec, dir) = fake_engine(60_000);
+        let engine = engine.with_auth_services(
+            Arc::new(RejectingTestVerifier),
+            Arc::new(ChallengeOnlyWriter),
+        );
+        let engine = with_test_host(engine, false);
+        let permit = permit_for(&dir);
+        let chain = bloom_evm::ChainClient::new(spec.clone()).unwrap();
+        let mut policy = bloom_proto::Policy::default();
+        policy.approval.require_broadcast_approval = true;
+
+        let mut staged = fake_staged_1559("0001-sealed-approval");
+        staged.value_wei = "1".into();
+        staged.usd_value = Some(0.01);
+        staged.expires_ms = now_ms() + 60_000;
+        engine.outbox.write_pending(&staged, "p").unwrap();
 
         let entry = engine
             .outbox
-            .read("alice", "anvil", "0001-approval")
+            .read("alice", "anvil", "0001-sealed-approval")
             .unwrap();
-        let intent = bloom_proto::CeremonyIntent::new(
-            "alice",
-            "Approve anvil Transaction",
-            bloom_proto::CeremonyIntentKind::EvmTransaction,
-        )
-        .subject(serde_json::json!({
-            "kind": "outbox_confirm",
-            "wallet": "alice",
-            "chain": "anvil",
-            "outbox_id": "0001-approval",
-        }));
-        let review_hash = intent.intent_hash();
+        let legacy_hash = "legacy-reviewed-hash";
         engine
             .outbox
-            .write_artefact(
-                &entry.dir,
-                "review_intent.json",
-                &serde_json::to_vec_pretty(&intent).unwrap(),
-            )
+            .write_artefact(&entry.dir, "review_intent.json", br#"{"schema":"legacy"}"#)
             .unwrap();
         engine
             .outbox
@@ -3327,7 +5898,7 @@ mod tests {
                 "review_approved.json",
                 &serde_json::to_vec_pretty(&serde_json::json!({
                     "schema": "bloom.review_approved.v1",
-                    "intent_hash": review_hash,
+                    "intent_hash": legacy_hash,
                 }))
                 .unwrap(),
             )
@@ -3338,17 +5909,146 @@ mod tests {
                 &permit,
                 "alice",
                 "anvil",
-                "0001-approval",
+                "0001-sealed-approval",
                 &chain,
-                &signer,
                 &policy,
                 "y",
-                Some(&review_hash),
+            )
+            .await;
+        assert!(
+            matches!(r, Err(TxEngineError::BroadcastApprovalRequired(ref e)) if e.contains("Sealed Approval")),
+            "expected Sealed Approval challenge refusal, got {r:?}"
+        );
+        let challenge: ApprovalChallenge = serde_json::from_slice(
+            &std::fs::read(entry.dir.join(OUTBOX_APPROVAL_CHALLENGE_FILE)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(challenge.surface, "outbox");
+        assert_eq!(
+            challenge.action_id,
+            outbox_action_id(&staged, EvmOutboxActionKind::Confirm)
+        );
+        assert_eq!(challenge.intent_hash, "outbox-intent");
+    }
+
+    #[tokio::test]
+    async fn wired_auth_outbox_confirm_accepts_approval_without_legacy_marker() {
+        let (engine, spec, dir) = fake_engine(60_000);
+        let engine = engine.with_auth_services(
+            Arc::new(AcceptingTestVerifier),
+            Arc::new(ChallengeOnlyWriter),
+        );
+        let engine = with_test_host(engine, false);
+        let permit = permit_for(&dir);
+        let chain = bloom_evm::ChainClient::new(spec.clone()).unwrap();
+        let mut policy = bloom_proto::Policy::default();
+        policy.approval.require_broadcast_approval = true;
+
+        let mut staged = fake_staged_1559("0001-sealed-approval-ok");
+        staged.value_wei = "1".into();
+        staged.usd_value = Some(0.01);
+        staged.expires_ms = now_ms() + 60_000;
+        engine.outbox.write_pending(&staged, "p").unwrap();
+        let entry = engine
+            .outbox
+            .read("alice", "anvil", "0001-sealed-approval-ok")
+            .unwrap();
+        engine
+            .outbox
+            .write_artefact(
+                &entry.dir,
+                OUTBOX_APPROVAL_FILE,
+                &serde_json::to_vec_pretty(&SignedApproval {
+                    schema: APPROVAL_SCHEMA_V1.into(),
+                    action_id: outbox_action_id(&staged, EvmOutboxActionKind::Confirm),
+                    wallet: "alice".into(),
+                    surface: "outbox".into(),
+                    petal_id: PETAL_ID_EVM_WALLET.into(),
+                    petal_digest: PLACEHOLDER_DIGEST_EVM_WALLET.into(),
+                    intent_hash: "outbox-intent".into(),
+                    server_nonce: "nonce-1".into(),
+                    assurance: AssuranceLevel::Standard,
+                    daemon_terms_digest: "1".repeat(64),
+                    petal_policy_digest: "2".repeat(64),
+                    policy_version: 0,
+                    expiry_ms: now_ms() as u64 + 60_000,
+                    signer_transport: SignerTransport::BrowserWebauthn,
+                    credential_id: "cred-1".into(),
+                    review_session_id: None,
+                    webauthn_assertion: WebAuthnAssertionRecord {
+                        credential_id: "cred-1".into(),
+                        authenticator_data_b64: "AA".into(),
+                        client_data_json_b64: "e30".into(),
+                        signature_b64: "AA".into(),
+                        user_handle_b64: None,
+                    },
+                })
+                .unwrap(),
+            )
+            .unwrap();
+
+        let r = engine
+            .confirm(
+                &permit,
+                "alice",
+                "anvil",
+                "0001-sealed-approval-ok",
+                &chain,
+                &policy,
+                "y",
             )
             .await;
         match r {
-            Err(TxEngineError::BroadcastApprovalRequired(_)) => {
-                panic!("review hash should satisfy approval gate")
+            Err(TxEngineError::BroadcastApprovalRequired(e)) => {
+                panic!("signed approval should satisfy approval gate: {e}")
+            }
+            Ok(_) => panic!("unexpected broadcast success on unreachable RPC"),
+            Err(_) => {}
+        }
+        let entry = engine
+            .outbox
+            .read("alice", "anvil", "0001-sealed-approval-ok")
+            .unwrap();
+        assert!(
+            engine
+                .outbox
+                .read_broadcast_attempt(&entry, BroadcastAttemptKind::Confirm)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn wired_auth_outbox_confirm_retries_consumed_approval_for_same_intent() {
+        let (engine, spec, dir) = fake_engine(60_000);
+        let engine =
+            engine.with_auth_services(Arc::new(RejectingTestVerifier), Arc::new(PreApprovedWriter));
+        let engine = with_test_host(engine, false);
+        let permit = permit_for(&dir);
+        let chain = bloom_evm::ChainClient::new(spec.clone()).unwrap();
+        let mut policy = bloom_proto::Policy::default();
+        policy.approval.require_broadcast_approval = true;
+
+        let mut staged = fake_staged_1559("0001-sealed-approval-retry");
+        staged.value_wei = "1".into();
+        staged.usd_value = Some(0.01);
+        staged.expires_ms = now_ms() + 60_000;
+        engine.outbox.write_pending(&staged, "p").unwrap();
+
+        let r = engine
+            .confirm(
+                &permit,
+                "alice",
+                "anvil",
+                "0001-sealed-approval-retry",
+                &chain,
+                &policy,
+                "y",
+            )
+            .await;
+        match r {
+            Err(TxEngineError::BroadcastApprovalRequired(e)) => {
+                panic!("consumed approval for same intent should satisfy retry gate: {e}")
             }
             Ok(_) => panic!("unexpected broadcast success on unreachable RPC"),
             Err(_) => {}
@@ -3358,9 +6058,9 @@ mod tests {
     #[tokio::test]
     async fn under_policy_autonomy_requires_usd_and_limits() {
         let (engine, spec, dir) = fake_engine(60_000);
+        let engine = with_test_auth_and_host(engine, true);
         let permit = permit_for(&dir);
-        let chain = bloom_chain::ChainClient::new(spec.clone()).unwrap();
-        let signer = alloy::signers::local::PrivateKeySigner::random();
+        let chain = bloom_evm::ChainClient::new(spec.clone()).unwrap();
         let mut policy = bloom_proto::Policy::default();
         policy.approval.agent_autonomy = Some(bloom_proto::AgentAutonomyMode::UnderPolicy);
         policy.limits.max_tx_usd = Some("3".into());
@@ -3378,10 +6078,8 @@ mod tests {
                 "anvil",
                 "0001-no-usd",
                 &chain,
-                &signer,
                 &policy,
                 "y",
-                None,
             )
             .await;
         assert!(
@@ -3402,10 +6100,8 @@ mod tests {
                 "anvil",
                 "0002-priced",
                 &chain,
-                &signer,
                 &policy,
                 "y",
-                None,
             )
             .await;
         match r {
@@ -3523,8 +6219,8 @@ mod tests {
         let (engine, mut spec, _dir) = fake_engine(60_000);
         spec.name = "sepolia".into();
         spec.chain_id = bloom_mempool::SEPOLIA_CHAIN_ID;
-        let chain = bloom_chain::ChainClient::new(spec.clone()).unwrap();
-        let signer = alloy::signers::local::PrivateKeySigner::random();
+        let chain = bloom_evm::ChainClient::new(spec.clone()).unwrap();
+        let signer = test_signer();
         let mut policy = bloom_proto::Policy::default();
         policy.private.enabled = true;
         policy.private.provider = "flashbots".into();
@@ -3556,8 +6252,8 @@ mod tests {
     #[tokio::test]
     async fn broadcast_rejects_private_on_non_mainnet() {
         let (engine, spec, _dir) = fake_engine(60_000);
-        let chain = bloom_chain::ChainClient::new(spec.clone()).unwrap();
-        let signer = alloy::signers::local::PrivateKeySigner::random();
+        let chain = bloom_evm::ChainClient::new(spec.clone()).unwrap();
+        let signer = test_signer();
         let mut policy = bloom_proto::Policy::default();
         policy.private.enabled = true;
         policy.private.provider = "mev_blocker".into();
@@ -3609,5 +6305,34 @@ mod tests {
     fn enso_quote_age_none_for_missing_timestamp() {
         let hex = enso_hex(r#"{"Source":"Enso","Route":"0x1234"}"#);
         assert_eq!(enso_quote_age_secs(&hex, 1700000000), None);
+    }
+
+    #[test]
+    fn f64_to_micro_usd_normal() {
+        assert_eq!(f64_to_micro_usd(0.0), Some(0));
+        assert_eq!(f64_to_micro_usd(1.0), Some(1_000_000));
+        assert_eq!(f64_to_micro_usd(1.5), Some(1_500_000));
+    }
+
+    #[test]
+    fn f64_to_micro_usd_rejects_nan() {
+        assert_eq!(f64_to_micro_usd(f64::NAN), None);
+    }
+
+    #[test]
+    fn f64_to_micro_usd_rejects_infinity() {
+        assert_eq!(f64_to_micro_usd(f64::INFINITY), None);
+        assert_eq!(f64_to_micro_usd(f64::NEG_INFINITY), None);
+    }
+
+    #[test]
+    fn f64_to_micro_usd_rejects_negative() {
+        assert_eq!(f64_to_micro_usd(-1.0), None);
+        assert_eq!(f64_to_micro_usd(-0.001), None);
+    }
+
+    #[test]
+    fn f64_to_micro_usd_rejects_overflow() {
+        assert_eq!(f64_to_micro_usd(f64::MAX), None);
     }
 }

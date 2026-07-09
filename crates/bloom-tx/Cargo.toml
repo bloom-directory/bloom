@@ -6,10 +6,10 @@ license.workspace = true
 description = "Tx engine, intent parser, policy for bloom"
 
 [dependencies]
+bloom-auth-api.workspace = true
 bloom-proto.workspace = true
-bloom-chain.workspace = true
+bloom-evm.workspace = true
 bloom-rpc.workspace = true
-bloom-keystore.workspace = true
 bloom-mempool.workspace = true
 bloom-tools.workspace = true
 blake3.workspace = true
@@ -24,6 +24,8 @@ tracing.workspace = true
 alloy.workspace = true
 parking_lot.workspace = true
 async-trait.workspace = true
+base64.workspace = true
+rand.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

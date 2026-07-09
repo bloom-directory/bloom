@@ -5,7 +5,10 @@
 
 #![forbid(unsafe_code)]
 
+pub mod ceremony_server;
 pub mod ipc;
+pub mod sealed_ceremony;
+pub mod sign_hash;
 
 mod ens_resolver;
 mod price_oracle;
@@ -15,38 +18,38 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use alloy::primitives::B256;
 use alloy::signers::SignerSync;
-use async_trait::async_trait;
-use bloom_chain::{ChainClient, ChainRegistry};
-use bloom_chain_node::rpc::{RpcChainAdapter, RpcClient};
-use bloom_chain_types::ssz::Encode;
-use bloom_chain_types::tx::{Tx, TxKind};
-use bloom_chain_types::types::{Address as ChainAddress, PubKeyBytes, SigBytes};
+use bloom_auth::{AuthStore, StoreApprovalVerifier};
+use bloom_evm::{ChainClient, ChainRegistry};
+
 use bloom_defi::EnsoClient;
 use bloom_ens::EnsClient;
 use bloom_etherscan::EtherscanClient;
-use bloom_keystore::Keystore;
+use bloom_hyperliquid::{HyperliquidClient, HyperliquidNetwork};
+use bloom_keystore::{Keystore, KeystoreApprovalSignatureVerifier};
+use bloom_paid_http::PaidHttpChainRpcResolver;
 use bloom_petals::{
     HostError, HostVfsEntry, HttpRequest, HttpResponse, LateVfsHost, NameRegistry, NetPolicy,
     PetalHost, PetalRouter, PetalRunner, PetalStore, PetalVm, SignRequest,
 };
-use bloom_polymarket::{ClobClient, CredentialStore, DataClient, GammaClient, GeoblockClient};
+use bloom_polymarket::{ClobClient, CredentialStore, DataClient, GammaClient};
 use bloom_prices::PricesClient;
-use bloom_proto::{AddressBook, AuditLog, AuditRecord, Config, HomeDir, HomeWritePermit};
+use bloom_proto::audit::AuditRecord;
+use bloom_proto::{AddressBook, AuditLog, ChainSpec, Config, HomeDir, HomeWritePermit};
 use bloom_revert::{
     AbiSource, BuiltinDecoder, DecoderChain, EtherscanAbiDecoder, EtherscanAbiSource,
     OpenchainDecoder, boxed,
 };
-use bloom_script::{ChainStateIface, PqSignature, PtbTx};
-use bloom_tx::outbox::Outbox;
+use bloom_tx::outbox::{CentralActionIdentity, CentralOutboxProjection, Outbox};
 use bloom_tx::tx_engine::TxEngine;
+use bloom_vfs::handlers::outbox::StagedPetalIdentity;
 use bloom_vfs::handlers::polymarket::{ChainClientReader, PolymarketOnboarding, build_onboarder};
 use bloom_vfs::handlers::status::{MempoolBackendStatus, PrivateRpcBackendStatus};
 use bloom_vfs::handlers::{
-    AddressBookHandler, ChainsHandler, DefiHandler, DocsHandler, EnsHandler, PolymarketHandler,
-    PricesHandler, SimulateHandler, StatusHandler, ToolsHandler, WalletsHandler, WatchHandler,
+    AddressBookHandler, CentralOutbox, ChainsHandler, DefiHandler, DocsHandler, EnsHandler,
+    HyperliquidHandler, OutboxHandler, PolymarketHandler, PricesHandler, RequestsHandler,
+    SimulateHandler, StatusHandler, ToolsHandler, WalletsHandler, WatchHandler,
 };
-use bloom_vfs::tx_handler::PtbSubmitter;
-use bloom_vfs::{HandlerError, PathCache, Vfs};
+use bloom_vfs::{AuthServices, PathCache, Vfs};
 use bloom_watch::{WatchExecutor, WatchRegistry};
 use futures::StreamExt;
 use thiserror::Error;
@@ -54,7 +57,94 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
+use std::sync::Mutex;
+
 const PETAL_HTTP_MAX_REDIRECTS: usize = 5;
+
+/// Concrete adapter that bridges [`CentralOutbox`] (filesystem) and
+/// [`AuthStore`] (action_id_map) to satisfy [`CentralOutboxProjection`]
+/// for the EVM tx-engine outbox.
+struct EvmOutboxProjection {
+    central: CentralOutbox,
+    auth: Mutex<AuthStore>,
+}
+
+impl EvmOutboxProjection {
+    fn new(central: CentralOutbox, auth: AuthStore) -> Self {
+        Self {
+            central,
+            auth: Mutex::new(auth),
+        }
+    }
+}
+
+impl CentralOutboxProjection for EvmOutboxProjection {
+    fn allocate_action_id(
+        &self,
+        surface: &str,
+        venue_local_id: &str,
+        wallet: &str,
+        staged_at_ms: u64,
+    ) -> Result<String, String> {
+        let mut auth = self.auth.lock().map_err(|e| e.to_string())?;
+        auth.allocate_action_id(surface, venue_local_id, wallet, staged_at_ms)
+            .map_err(|e| e.to_string())
+    }
+
+    fn stage_action(
+        &self,
+        action_id: &str,
+        intent_json: &[u8],
+        plan_md: &str,
+        policy_check_json: &[u8],
+        identity: CentralActionIdentity<'_>,
+    ) -> Result<(), String> {
+        let intent_hash = bloom_auth_api::intent_hash_of(intent_json);
+        self.central
+            .stage_with_identity(
+                action_id,
+                intent_json,
+                &intent_hash,
+                plan_md,
+                policy_check_json,
+                &StagedPetalIdentity {
+                    petal_id: identity.petal_id.to_string(),
+                    petal_digest: identity.petal_digest.to_string(),
+                    petal_version: identity.petal_version.to_string(),
+                },
+            )
+            .map_err(|e| e.to_string())
+    }
+
+    fn transition_action(&self, action_id: &str, from: &str, to: &str) -> Result<(), String> {
+        self.central
+            .transition(action_id, from, to)
+            .map_err(|e| e.to_string())
+    }
+
+    fn write_action_file(
+        &self,
+        action_id: &str,
+        state: &str,
+        file: &str,
+        data: &[u8],
+    ) -> Result<(), String> {
+        self.central
+            .write_action_file(action_id, state, file, data)
+            .map_err(|e| e.to_string())
+    }
+
+    fn read_action_file(
+        &self,
+        action_id: &str,
+        state: &str,
+        file: &str,
+    ) -> Result<Vec<u8>, String> {
+        self.central
+            .read_action_file(action_id, state, file)
+            .map_err(|e| e.to_string())
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum DaemonError {
@@ -65,7 +155,7 @@ pub enum DaemonError {
     #[error("keystore: {0}")]
     Keystore(String),
     #[error("chain: {0}")]
-    Chain(#[from] bloom_chain::ChainError),
+    Chain(#[from] bloom_evm::ChainError),
     #[error("outbox: {0}")]
     Outbox(String),
     #[error("audit: {0}")]
@@ -137,7 +227,7 @@ impl DaemonPetalHost {
     fn audit_sign_hash(&self, req: &SignRequest, outcome: &str, error: Option<&str>) {
         let mut data = serde_json::json!({
             "purpose": req.purpose.as_str(),
-            "hash32_sha256": bloom_tools::sha256_hex(&req.hash32),
+            "hash32": hex::encode(req.hash32),
             "outcome": outcome,
         });
         if let Some(error) = error {
@@ -157,7 +247,7 @@ impl DaemonPetalHost {
     }
 }
 
-#[async_trait]
+#[async_trait::async_trait]
 impl PetalHost for DaemonPetalHost {
     async fn vfs_lookup(&self, path: &str) -> Result<HostVfsEntry, HostError> {
         self.vfs.vfs_lookup(path).await
@@ -356,7 +446,7 @@ impl PetalHost for DaemonPetalHost {
             self.audit_sign_hash(&req, "error", Some(&err.to_string()));
             err
         })?;
-        tracing::info!(
+        info!(
             target: "bloom_daemon::petal_host",
             wallet = %req.wallet,
             purpose = %req.purpose,
@@ -449,6 +539,8 @@ pub struct Daemon {
     pub home_write_permit: Option<Arc<HomeWritePermit>>,
     pub address_book: Arc<AddressBook>,
     pub audit: Arc<AuditLog>,
+    pub auth_services: AuthServices,
+    pub signer_cache: Arc<bloom_keystore::petal_host::SignerCache>,
     pub vfs: Vfs,
     pub petals: PetalRunner,
     pub watch_registry: Arc<WatchRegistry>,
@@ -504,6 +596,8 @@ impl Daemon {
         for c in clients {
             chains.add(c);
         }
+        let paid_http_rpc_resolver: Arc<dyn PaidHttpChainRpcResolver> =
+            Arc::new(ConfigPaidHttpRpcResolver::from_config(&config));
 
         // Build per-chain mempool indexes + handlers from [mempool.<chain>]
         // config. Each entry creates an LRU index, a VFS handler, and
@@ -607,8 +701,18 @@ impl Daemon {
         let keystore =
             Keystore::new(home.keystore_dir()).map_err(|e| DaemonError::Keystore(e.to_string()))?;
 
-        let outbox =
-            Outbox::new(home.outbox_dir()).map_err(|e| DaemonError::Outbox(e.to_string()))?;
+        // Open auth store early so we can also wire the EVM → central
+        // outbox projection.  Two connections to the same SQLite file:
+        // one for the verifier (owned), one for the projection (behind
+        // a Mutex).
+        let auth_db_path = home.root().join("auth").join("auth.sqlite");
+        let projection_auth = AuthStore::open(&auth_db_path)
+            .map_err(|e| DaemonError::Audit(format!("auth store (projection): {e}")))?;
+        let central = CentralOutbox::new(home.root().join("central_outbox"));
+        let projection: Arc<dyn CentralOutboxProjection> =
+            Arc::new(EvmOutboxProjection::new(central, projection_auth));
+        let outbox = Outbox::new_with_projection(home.outbox_dir(), projection)
+            .map_err(|e| DaemonError::Outbox(e.to_string()))?;
         let mut tx_engine = TxEngine::new(
             outbox,
             config.stage_ttl.as_millis(),
@@ -642,6 +746,44 @@ impl Daemon {
         let audit =
             AuditLog::open(home.audit_path()).map_err(|e| DaemonError::Audit(e.to_string()))?;
         let audit_arc = Arc::new(audit.clone());
+        let auth_store = AuthStore::open(&auth_db_path)
+            .map_err(|e| DaemonError::Audit(format!("auth store: {e}")))?;
+        let auth_verifier = Arc::new(StoreApprovalVerifier::new(
+            auth_store,
+            KeystoreApprovalSignatureVerifier::new(keystore.clone()),
+        ));
+        tx_engine = tx_engine.with_auth_services(auth_verifier.clone(), auth_verifier.clone());
+        let auth_services = AuthServices::new(
+            Some(auth_verifier.clone()),
+            Some(auth_verifier.clone()),
+            Some(auth_verifier),
+        );
+        // WS-1 wiring: in-memory grant store + first-party attestation
+        // registry + keystore-backed PetalHost. All three live behind the
+        // existing `AuthServices` so VFS handlers and the new `sign_hash`
+        // IPC method can call them without going through the old
+        // verifier/nfc paths. The concrete store / registry / host impls
+        // can be swapped (test doubles, post-MVP venues) by replacing
+        // the `Arc<dyn ...>` references.
+        let grant_store: Arc<dyn bloom_auth_api::GrantStore> =
+            Arc::new(bloom_auth::grant_store::InMemoryGrantStore::default());
+        let attestation_registry: Arc<dyn bloom_auth_api::SigningAttestationSchemaRegistry> =
+            Arc::new(bloom_auth_api::DefaultAttestationRegistry::new());
+        let signer_cache = Arc::new(bloom_keystore::petal_host::SignerCache::new());
+        let petal_host: Arc<dyn bloom_auth_api::PetalHost> = Arc::new(
+            bloom_keystore::petal_host::KeystorePetalHost::new(
+                Arc::new(keystore.clone()),
+                grant_store.clone(),
+                attestation_registry.clone(),
+                audit_arc.clone(),
+            )
+            .with_signer_cache(signer_cache.clone()),
+        );
+        tx_engine = tx_engine.with_host_signing_services(grant_store.clone(), petal_host.clone());
+        let auth_services = auth_services
+            .with_grant_store(grant_store)
+            .with_attestation_registry(attestation_registry)
+            .with_petal_host(petal_host);
         let path_cache = Arc::new(PathCache::new());
 
         let watch_registry = Arc::new(
@@ -803,9 +945,8 @@ impl Daemon {
 
         // Build the petals runtime: content-addressed store under
         // `~/.bloom/petals/store`, name registry under
-        // `~/.bloom/petals/registry`, and a wasmtime engine. Local app
-        // packages mount under `apps/`; raw single-WASM local petals are not
-        // exposed.
+        // `~/.bloom/petals/registry`, and a wasmtime engine. V2 app
+        // packages are exposed under `apps/`.
         let petals_root = home.root().join("petals");
         let petal_store = PetalStore::open(petals_root.join("store"))
             .map_err(|e| DaemonError::Audit(format!("petals store: {e}")))?;
@@ -826,7 +967,7 @@ impl Daemon {
         let mut vfs_builder = Vfs::builder()
             .mount(
                 "apps",
-                Arc::new(PetalRouter::new(petals.clone(), petal_app_host.clone())) as _,
+                Arc::new(PetalRouter::new(petals.clone(), petal_app_host)) as _,
             )
             .mount(
                 "chains",
@@ -838,7 +979,44 @@ impl Daemon {
                         .with_mempool_handlers(mempool_handlers.clone())
                         .with_revert_decoder(decoder_chain.clone()),
                 ) as _,
-            )
+            );
+
+        let hyperliquid_handler: Option<Arc<HyperliquidHandler>> = if let Some(hl_cfg) =
+            &config.hyperliquid
+        {
+            let hl_url = |raw: &str| match url::Url::parse(raw) {
+                Ok(u) => Some(u),
+                Err(e) => {
+                    warn!(url = %raw, error = %e, "daemon.hyperliquid_url_invalid_using_default");
+                    None
+                }
+            };
+            let mut mainnet = HyperliquidClient::new(HyperliquidNetwork::Mainnet);
+            if let Some(u) = hl_url(&hl_cfg.mainnet_url) {
+                mainnet = mainnet.with_base_url(u);
+            }
+            let mut testnet = HyperliquidClient::new(HyperliquidNetwork::Testnet);
+            if let Some(u) = hl_url(&hl_cfg.testnet_url) {
+                testnet = testnet.with_base_url(u);
+            }
+            debug!("daemon.hyperliquid_mounted");
+            let handler = Arc::new(
+                HyperliquidHandler::new(mainnet, testnet, keystore.clone())
+                    .with_auth_services(auth_services.clone())
+                    .with_store_root(home.root().join("hyperliquid")),
+            );
+            handler.clone().start_monitoring();
+            Some(handler)
+        } else {
+            debug!("daemon.hyperliquid_skipped: no [hyperliquid] config");
+            None
+        };
+
+        if let Some(ref hl) = hyperliquid_handler {
+            vfs_builder = vfs_builder.mount("hyperliquid", hl.clone() as _);
+        }
+
+        vfs_builder = vfs_builder
             .mount(
                 "wallets",
                 Arc::new(
@@ -848,11 +1026,26 @@ impl Daemon {
                         tx_engine.clone(),
                         address_book.clone(),
                     )
+                    .with_auth_services(auth_services.clone())
                     .with_home_write_permit_opt(home_write_permit.clone())
-                    .with_mempool_indexes(mempool_indexes.clone()),
+                    .with_mempool_indexes(mempool_indexes.clone())
+                    .with_polymarket_root(home.polymarket_dir())
+                    .with_hyperliquid_handler(hyperliquid_handler.clone()),
                 ) as _,
             )
             .mount("tools", Arc::new(ToolsHandler::new()) as _)
+            .mount(
+                "requests",
+                Arc::new(
+                    RequestsHandler::new(
+                        home.root().to_path_buf(),
+                        keystore.clone(),
+                        config.default_wallet.clone(),
+                    )
+                    .with_auth_services(auth_services.clone())
+                    .with_paid_http_rpc_resolver(paid_http_rpc_resolver.clone()),
+                ) as _,
+            )
             .mount("status", status_handler.clone() as _)
             .mount("docs", Arc::new(DocsHandler::new()) as _)
             .mount(
@@ -873,31 +1066,18 @@ impl Daemon {
             .mount("ens", Arc::new(EnsHandler::new(ens_client.clone())) as _)
             .mount("prices", Arc::new(PricesHandler::new(prices)) as _)
             .mount(
+                "outbox",
+                Arc::new(OutboxHandler::new(CentralOutbox::new(
+                    home.root().join("central_outbox"),
+                ))) as _,
+            )
+            .mount(
                 "addressbook",
                 Arc::new(
                     AddressBookHandler::open(&address_book_path)
                         .map_err(|e| DaemonError::Audit(e.to_string()))?,
                 ) as _,
             );
-
-        if let Some(chain_state) = tx_chain_state_adapter(&home) {
-            let rpc_sock = home.root().join("chain").join("rpc.sock");
-            let rpc_client = match std::env::var("BLOOM_RPC_TCP") {
-                Ok(addr) if !addr.is_empty() => RpcClient::tcp(addr),
-                _ => RpcClient::new(&rpc_sock),
-            };
-            let submitter = Arc::new(RpcPtbSubmitter::new(home.clone(), rpc_client));
-            vfs_builder = vfs_builder.mount(
-                "petals",
-                Arc::new(bloom_vfs::PetalsEndpointHandler::new(chain_state.clone())) as _,
-            );
-            vfs_builder = vfs_builder.mount(
-                "tx",
-                Arc::new(bloom_vfs::TxHandler::new(chain_state).with_submitter(submitter)) as _,
-            );
-        } else {
-            debug!("daemon.tx_skipped: no ChainStateIface adapter available");
-        }
 
         // DeFi: Enso's public REST works without an API key for chains
         // they support keyless (currently quote+route on Base mainnet).
@@ -918,6 +1098,18 @@ impl Daemon {
                 warn!("enso api_key empty; mounting defi/ for keyless access (rate-limited)");
             }
             debug!("daemon.defi_mounted");
+            // Hyperliquid deposit goal: bridge address + deposit chain, from
+            // `[hyperliquid]` config when present, else the mainnet defaults.
+            let (hl_bridge, hl_deposit_chain_id) = {
+                let cfg = config.hyperliquid.clone().unwrap_or_default();
+                let bridge = cfg.bridge_address.parse().unwrap_or_else(|_| {
+                    warn!(addr = %cfg.bridge_address, "daemon.hyperliquid_bridge_invalid_using_default");
+                    bloom_proto::hyperliquid::MAINNET_BRIDGE
+                        .parse()
+                        .expect("valid bridge const")
+                });
+                (bridge, cfg.deposit_chain_id)
+            };
             vfs_builder = vfs_builder.mount(
                 "defi",
                 Arc::new(
@@ -928,11 +1120,13 @@ impl Daemon {
                         tx_engine.clone(),
                         address_book_arc.clone(),
                     )
+                    .with_auth_services(auth_services.clone())
                     .with_home_write_permit_opt(home_write_permit.clone())
                     .with_default_chain(config.default_chain.clone())
                     .with_store_root(home.root().join("defi"))
                     .with_polymarket_root(home.polymarket_dir())
-                    .with_revert_decoder(decoder_chain.clone()),
+                    .with_revert_decoder(decoder_chain.clone())
+                    .with_hyperliquid(hl_bridge, hl_deposit_chain_id),
                 ) as _,
             );
         } else {
@@ -943,8 +1137,7 @@ impl Daemon {
         // `[chains]` entry matches the Polymarket chain id (Polygon 137), the
         // onboarding state machine and L2 account views. Mount whenever a
         // `[polymarket]` block exists; a bare block uses the public defaults.
-        // Signing never leaves the daemon (Keystore::signer → KeystoreSigner);
-        // the geoblock refuse-line is deliberately not configurable.
+        // Signing never leaves the daemon (Keystore::signer → KeystoreSigner).
         if let Some(pm_cfg) = &config.polymarket {
             let pm_url = |raw: &str| match url::Url::parse(raw) {
                 Ok(u) => Some(u),
@@ -967,8 +1160,12 @@ impl Daemon {
             }
 
             let mut handler = PolymarketHandler::new(gamma, data, clob.clone(), keystore.clone())
+                .with_auth_services(auth_services.clone())
                 .with_order_store(bloom_polymarket::OrderStore::new(home.polymarket_dir()))
-                .with_fund_store(home.polymarket_dir());
+                .with_fund_store(home.polymarket_dir())
+                .with_builder_key_store(bloom_polymarket::BuilderCredentialStore::new(
+                    home.polymarket_dir(),
+                ));
             // Resolve the settlement chain by id — onboarding needs RPC reads
             // (code/balances/allowances) for its idempotency probes.
             let polygon = chains
@@ -991,7 +1188,7 @@ impl Daemon {
                     handler = handler
                         .with_onboarding(PolymarketOnboarding {
                             onboarder: Arc::new(onboarder),
-                            geoblock: Arc::new(GeoblockClient::new()),
+                            auth_dir: state_dir.clone(),
                             creds: CredentialStore::new(&state_dir),
                             chain,
                         })
@@ -1008,6 +1205,149 @@ impl Daemon {
         } else {
             debug!("daemon.polymarket_skipped: no [polymarket] config");
         }
+
+        // /next.md — brutally-scoped next-action aggregator for agents.
+        // Answers: what wallets need attention, what confirms are pending,
+        // what capabilities are active/expired/orphaned, what risk data is stale.
+        let next_keystore = keystore.clone();
+        let next_tx_engine = tx_engine.clone();
+        let next_hl = hyperliquid_handler.clone();
+        let next_renderer: Arc<dyn Fn() -> Vec<u8> + Send + Sync> = Arc::new(move || {
+            let mut md = String::from("# Next Actions\n\n");
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0);
+
+            // 1. Unsigned-policy passkey wallets
+            let mut unsigned = Vec::new();
+            if let Ok(infos) = next_keystore.list() {
+                for info in &infos {
+                    let status = next_keystore
+                        .policy_status(&info.name)
+                        .unwrap_or(bloom_keystore::PolicyStatus::NotApplicable);
+                    if status == bloom_keystore::PolicyStatus::Unsigned
+                        || status == bloom_keystore::PolicyStatus::Stale
+                    {
+                        unsigned.push(format!(
+                            "- `{}`: policy is **{:?}** — run `bloom wallet sign-policy {}` to enable agent trading",
+                            info.name, status, info.name
+                        ));
+                    }
+                }
+            }
+            if !unsigned.is_empty() {
+                md.push_str("## Unsigned Policies\n\n");
+                for u in &unsigned {
+                    md.push_str(u);
+                    md.push('\n');
+                }
+                md.push('\n');
+            }
+
+            // 2. Pending outbox confirms
+            let mut pending_confirms = Vec::new();
+            if let Ok(infos) = next_keystore.list() {
+                for info in &infos {
+                    let sessions = next_tx_engine.session_store().active(now_ms);
+                    let has_session = sessions.iter().any(|s| s.wallet == info.name);
+                    if has_session {
+                        for s in &sessions {
+                            if s.wallet != info.name {
+                                continue;
+                            }
+                            if s.expires_ms > now_ms {
+                                pending_confirms.push(format!(
+                                    "- `{}`: {} pending tx ids, session `{}` active (expires in {}s)",
+                                    info.name,
+                                    s.allowed_pending_ids.len(),
+                                    s.id,
+                                    ((s.expires_ms - now_ms) / 1000)
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+            if !pending_confirms.is_empty() {
+                md.push_str("## Pending Outbox Confirms\n\n");
+                for p in &pending_confirms {
+                    md.push_str(p);
+                    md.push('\n');
+                }
+                md.push('\n');
+            }
+
+            // 3. Capability status (HL sessions)
+            if let Some(ref hl) = next_hl {
+                let mut expired = Vec::new();
+                let mut orphaned = Vec::new();
+                let mut stale = Vec::new();
+                if let Ok(infos) = next_keystore.list() {
+                    for info in &infos {
+                        let views = hl.capability_views_for(&info.name);
+                        for v in &views {
+                            match v.status {
+                                bloom_proto::CapabilityStatus::Expired => {
+                                    expired.push(format!(
+                                        "- `{}` session `{}`: **expired** — no new orders accepted",
+                                        info.name, v.id
+                                    ));
+                                }
+                                bloom_proto::CapabilityStatus::Orphaned => {
+                                    orphaned.push(format!(
+                                        "- `{}` session `{}`: **orphaned** — daemon lost the agent key after restart. Owner must recover via `orphan_cancel_all` or `orphan_close_all` at `{}`",
+                                        info.name, v.id, v.revoke_path
+                                    ));
+                                }
+                                bloom_proto::CapabilityStatus::Active => {
+                                    if let Some(secs) = v.expires_in_secs
+                                        && secs < 300
+                                    {
+                                        stale.push(format!(
+                                            "- `{}` session `{}`: expiring in {}s",
+                                            info.name, v.id, secs
+                                        ));
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+                if !expired.is_empty() {
+                    md.push_str("## Expired Sessions\n\n");
+                    for e in &expired {
+                        md.push_str(e);
+                        md.push('\n');
+                    }
+                    md.push('\n');
+                }
+                if !orphaned.is_empty() {
+                    md.push_str("## Orphaned Sessions (Needs Owner)\n\n");
+                    for o in &orphaned {
+                        md.push_str(o);
+                        md.push('\n');
+                    }
+                    md.push('\n');
+                }
+                if !stale.is_empty() {
+                    md.push_str("## Expiring Soon\n\n");
+                    for s in &stale {
+                        md.push_str(s);
+                        md.push('\n');
+                    }
+                    md.push('\n');
+                }
+            }
+
+            if unsigned.is_empty() && pending_confirms.is_empty() && next_hl.is_none() {
+                md.push_str("No wallets with pending actions.\n\n");
+                md.push_str("All policies are signed, no outbox confirms await review, and no Hyperliquid sessions are active.\n");
+            }
+            md.into_bytes()
+        });
+        vfs_builder = vfs_builder.with_root_dynamic("next.md", next_renderer);
 
         let vfs = vfs_builder
             .with_audit(audit_arc.clone())
@@ -1083,6 +1423,19 @@ impl Daemon {
             debug!("daemon.bump_scanner_spawned");
         }
 
+        // Spawn the receipt reconciler: every ~15s it walks sent/ entries and
+        // records each broadcast tx's mined outcome (success/reverted) as a
+        // `receipt.json` sibling. The same-chain dependency gate and the bump
+        // scanner read it. Runs regardless of mempool config.
+        if tokio::runtime::Handle::try_current().is_ok() {
+            let reconciler = Arc::new(bloom_tx::reconcile::Reconciler::new(
+                tx_engine.outbox.clone(),
+                chains.clone(),
+            ));
+            bump_shutdown.push(reconciler.spawn());
+            debug!("daemon.reconciler_spawned");
+        }
+
         // Spawn the backends probe task. Every 60s it:
         //   * refreshes `status/backends/mempool` from the live handler state
         //   * calls `health()` on each registered private RPC and writes the
@@ -1156,7 +1509,10 @@ impl Daemon {
             debug!("daemon.backends_probe_spawned");
         }
 
-        info!(
+        // `debug!`, not `info!`: the CLI builds a daemon in-process for
+        // every `vfs cat`/`ls`, so at default verbosity this line would
+        // print before each value and clutter agent/visual output.
+        debug!(
             home = %home.root().display(),
             chains = ?config.chains.keys().collect::<Vec<_>>(),
             etherscan = etherscan_arc.is_some(),
@@ -1176,6 +1532,8 @@ impl Daemon {
             home_write_permit,
             address_book: address_book_arc,
             audit: audit_arc,
+            auth_services,
+            signer_cache,
             vfs,
             petals,
             watch_registry,
@@ -1332,6 +1690,41 @@ impl bloom_tx::bump_scanner::BasefeeProvider for ChainBasefeeProvider {
     }
 }
 
+#[derive(Debug, Clone)]
+struct ConfigPaidHttpRpcResolver {
+    by_chain_id: std::collections::BTreeMap<u64, Vec<String>>,
+}
+
+impl ConfigPaidHttpRpcResolver {
+    fn from_config(config: &Config) -> Self {
+        let by_chain_id = config
+            .chains
+            .values()
+            .filter_map(|spec| {
+                let urls = http_rpc_urls(spec);
+                (!urls.is_empty()).then_some((spec.chain_id, urls))
+            })
+            .collect();
+        Self { by_chain_id }
+    }
+}
+
+impl PaidHttpChainRpcResolver for ConfigPaidHttpRpcResolver {
+    fn http_rpc_urls_for_chain_id(&self, chain_id: u64) -> Vec<String> {
+        self.by_chain_id.get(&chain_id).cloned().unwrap_or_default()
+    }
+}
+
+fn http_rpc_urls(spec: &ChainSpec) -> Vec<String> {
+    let mut endpoints = spec.endpoints();
+    endpoints.sort_by_key(|endpoint| std::cmp::Reverse(endpoint.weight));
+    endpoints
+        .into_iter()
+        .map(|endpoint| endpoint.url)
+        .filter(|url| url.starts_with("http://") || url.starts_with("https://"))
+        .collect()
+}
+
 fn pick_ens_client(chains: &ChainRegistry) -> Option<EnsClient> {
     for name in chains.list_names() {
         let Some(c) = chains.get(&name) else {
@@ -1345,186 +1738,6 @@ fn pick_ens_client(chains: &ChainRegistry) -> Option<EnsClient> {
     }
     debug!("ens.picker.no_match: no chain with id 1/5/11155111/17000 configured");
     None
-}
-
-#[derive(Clone)]
-struct RpcPtbSubmitter {
-    home: HomeDir,
-    client: RpcClient,
-}
-
-impl RpcPtbSubmitter {
-    fn new(home: HomeDir, client: RpcClient) -> Self {
-        Self { home, client }
-    }
-
-    fn chain_dir(&self) -> std::path::PathBuf {
-        self.home.root().join("chain")
-    }
-
-    fn load_validator_key(
-        &self,
-    ) -> Result<
-        (
-            bloom_keystore::xdsa::XdsaSecretKey,
-            bloom_keystore::xdsa::XdsaPublicKey,
-            ChainAddress,
-        ),
-        HandlerError,
-    > {
-        let key_path = self.chain_dir().join("keystore").join("validator.xdsa");
-        let key_bytes = std::fs::read(&key_path)
-            .map_err(|e| HandlerError::backend(format!("read {}: {e}", key_path.display())))?;
-        let sk = bloom_keystore::xdsa::XdsaSecretKey::from_bytes(&key_bytes)
-            .map_err(|e| HandlerError::backend(format!("decode validator key: {e}")))?;
-        let pk = sk.public_key();
-        let sender = ChainAddress::from_pubkey_bytes(&pk.0);
-        Ok((sk, pk, sender))
-    }
-
-    fn load_chain_id(&self) -> Result<String, HandlerError> {
-        let path = self.chain_dir().join("genesis.toml");
-        let text = std::fs::read_to_string(&path)
-            .map_err(|e| HandlerError::backend(format!("read {}: {e}", path.display())))?;
-        let parsed: bloom_chain_node::genesis::GenesisFile = toml::from_str(&text)
-            .map_err(|e| HandlerError::backend(format!("parse {}: {e}", path.display())))?;
-        Ok(parsed.chain_id)
-    }
-
-    async fn fetch_nonce(&self, sender: ChainAddress) -> Result<u64, HandlerError> {
-        let value = self
-            .client
-            .call(
-                "chain_query_account",
-                serde_json::json!({ "address": hex::encode(sender.0) }),
-            )
-            .await
-            .map_err(err_he)?;
-        Ok(value.get("nonce").and_then(|v| v.as_u64()).unwrap_or(0))
-    }
-
-    async fn poll_receipt(
-        &self,
-        tx_hash: bloom_chain_types::types::Hash32,
-    ) -> Result<serde_json::Value, HandlerError> {
-        let deadline = std::time::Instant::now() + Duration::from_secs(30);
-        loop {
-            let value = self
-                .client
-                .call(
-                    "chain_query_tx",
-                    serde_json::json!({ "tx_hash": hex::encode(tx_hash.0) }),
-                )
-                .await
-                .map_err(err_he)?;
-            if !value.is_null() {
-                return Ok(value);
-            }
-            if std::time::Instant::now() >= deadline {
-                return Err(HandlerError::backend(format!(
-                    "timed out waiting for tx {}",
-                    hex::encode(tx_hash.0)
-                )));
-            }
-            tokio::time::sleep(Duration::from_millis(150)).await;
-        }
-    }
-
-    fn build_outer_tx(
-        &self,
-        sk: &bloom_keystore::xdsa::XdsaSecretKey,
-        pk: &bloom_keystore::xdsa::XdsaPublicKey,
-        sender: ChainAddress,
-        chain_id: String,
-        nonce: u64,
-        ptb_bytes: Vec<u8>,
-    ) -> Tx {
-        let mut tx = Tx {
-            chain_id,
-            sender,
-            nonce,
-            max_fuel: 10_000_000,
-            fee_per_unit: 1,
-            kind: TxKind::SubmitPtb { ptb_bytes },
-            pubkey: PubKeyBytes(pk.to_bytes()),
-            sig: SigBytes(vec![]),
-        };
-        let digest = tx.signing_digest();
-        let sig = sk.sign(&digest.0);
-        tx.sig = SigBytes(sig.to_bytes());
-        tx
-    }
-}
-
-#[async_trait::async_trait]
-impl PtbSubmitter for RpcPtbSubmitter {
-    async fn select_gas_payer(
-        &self,
-        signers: &[[u8; 32]],
-    ) -> Result<bloom_objects::ObjectId, HandlerError> {
-        let signer = signers
-            .first()
-            .ok_or_else(|| HandlerError::invalid("no signers set"))?;
-        bloom_chain_node::gas_select::select_loom_gas_payer_rpc(&self.client, *signer, 1_000_000)
-            .await
-            .map_err(|e| HandlerError::invalid(e.to_string()))
-    }
-
-    async fn submit_ptb(
-        &self,
-        _session_id: bloom_ptb_builder::session::SessionId,
-        mut tx: PtbTx,
-        _status: bloom_ptb_builder::SessionStatus,
-    ) -> Result<Vec<serde_json::Value>, HandlerError> {
-        let (sk, pk, sender) = self.load_validator_key()?;
-        if tx.signers != vec![sender.0] {
-            return Err(HandlerError::invalid(
-                "tx commit can sign exactly one signer: the validator key's xDSA address",
-            ));
-        }
-        let ptb_digest = tx.signing_digest();
-        tx.signatures = vec![PqSignature(sk.sign(&ptb_digest).to_bytes())];
-        let ptb_bytes = bloom_script::encode_ptb(&tx)
-            .map_err(|e| HandlerError::backend(format!("encode signed PTB: {e}")))?;
-
-        let chain_id = self.load_chain_id()?;
-        let nonce = self.fetch_nonce(sender).await? + 1;
-        let outer = self.build_outer_tx(&sk, &pk, sender, chain_id, nonce, ptb_bytes);
-        let outer_hash = outer.tx_hash();
-        self.client
-            .call(
-                "chain_submit_tx",
-                serde_json::json!({ "tx_hex": hex::encode(outer.as_ssz_bytes()) }),
-            )
-            .await
-            .map_err(err_he)?;
-        let receipt = self.poll_receipt(outer_hash).await?;
-        Ok(vec![
-            serde_json::json!({
-                "kind": "submit",
-                "tx_hash": format!("0x{}", hex::encode(outer_hash.0)),
-            }),
-            serde_json::json!({
-                "kind": "receipt",
-                "tx_hash": format!("0x{}", hex::encode(outer_hash.0)),
-                "receipt": receipt,
-            }),
-        ])
-    }
-}
-
-fn err_he(e: impl std::fmt::Display) -> HandlerError {
-    HandlerError::backend(e.to_string())
-}
-
-/// Integration seam for the tx-session VFS front door.
-///
-/// `bloom_vfs::TxHandler` needs the petal/PTB read model exposed as
-/// `ChainStateIface`. The authoritative sovereign-chain `State` lives in the
-/// validator, so the daemon mounts `tx/` through the chain JSON-RPC read model.
-fn tx_chain_state_adapter(home: &HomeDir) -> Option<Arc<dyn ChainStateIface + Send + Sync>> {
-    let rpc_sock = home.root().join("chain").join("rpc.sock");
-    Some(Arc::new(RpcChainAdapter::from_env_or_socket(&rpc_sock)))
 }
 
 #[cfg(test)]
@@ -1548,167 +1761,6 @@ mod tests {
         assert!(d.vfs.handler("addressbook").is_some());
         assert!(d.vfs.handler("ens").is_some());
         assert!(d.vfs.handler("apps").is_some());
-    }
-
-    #[test]
-    fn tx_front_door_mounts_chain_rpc_adapter() {
-        let dir = tempfile::tempdir().unwrap();
-        let home = HomeDir::at(dir.path());
-        let d = Daemon::from_home(home).unwrap();
-        assert!(tx_chain_state_adapter(&d.home).is_some());
-        assert!(d.vfs.handler("tx").is_some());
-    }
-
-    #[tokio::test]
-    async fn daemon_petal_host_signs_hash_with_unlocked_keystore_wallet() {
-        let dir = tempfile::tempdir().unwrap();
-        let keystore = Keystore::new(dir.path().join("keystore")).unwrap();
-        let audit = Arc::new(AuditLog::open(dir.path().join("audit.jsonl")).unwrap());
-        keystore.create_local("alice", "passphrase").unwrap();
-        let host = DaemonPetalHost::new(
-            Arc::new(LateVfsHost::new()),
-            keystore.clone(),
-            audit.clone(),
-        );
-
-        let locked = host
-            .sign_hash(SignRequest {
-                wallet: "alice".into(),
-                hash32: [1u8; 32],
-                purpose: "test".into(),
-            })
-            .await
-            .unwrap_err();
-        assert!(matches!(locked, HostError::Denied(_)));
-
-        keystore.unlock("alice", "passphrase").unwrap();
-        let sig = host
-            .sign_hash(SignRequest {
-                wallet: "alice".into(),
-                hash32: [1u8; 32],
-                purpose: "test".into(),
-            })
-            .await
-            .unwrap();
-        assert_eq!(sig.len(), 65);
-
-        let records = audit.tail(10).unwrap();
-        assert_eq!(records.len(), 2);
-        assert_eq!(records[0].kind, "petal.sign_hash");
-        assert_eq!(records[0].wallet.as_deref(), Some("alice"));
-        assert_eq!(records[0].data["outcome"], "denied");
-        assert_eq!(records[1].kind, "petal.sign_hash");
-        assert_eq!(records[1].wallet.as_deref(), Some("alice"));
-        assert_eq!(records[1].data["outcome"], "ok");
-    }
-
-    #[test]
-    fn petal_http_redirect_targets_are_resolved_against_current_url() {
-        assert_eq!(
-            resolve_redirect_target("https://api.example.com/a/b?x=1", "../next").unwrap(),
-            "https://api.example.com/next"
-        );
-        assert_eq!(
-            resolve_redirect_target(
-                "https://api.example.com/a/b",
-                "https://cdn.example.com/final"
-            )
-            .unwrap(),
-            "https://cdn.example.com/final"
-        );
-        assert!(resolve_redirect_target("https://api.example.com/a/b", "http://[bad").is_err());
-    }
-
-    #[test]
-    fn petal_http_redirect_targets_are_revalidated_by_policy() {
-        let policy = NetPolicy::from_v2_manifest_toml(
-            br#"
-schema = "bloom.petal.local-app.v2"
-name = "redirector"
-
-[caps]
-allowed = ["bloom:http"]
-
-[[net.allow]]
-host = "api.example.com"
-methods = ["GET"]
-paths = ["/start", "/next"]
-"#,
-        )
-        .unwrap();
-
-        let allowed = resolve_redirect_target("https://api.example.com/start", "/next").unwrap();
-        assert!(policy.check("GET", &allowed).is_ok());
-
-        let denied =
-            resolve_redirect_target("https://api.example.com/start", "https://evil.example/next")
-                .unwrap();
-        assert!(matches!(
-            policy.check("GET", &denied),
-            Err(HostError::Denied(_))
-        ));
-    }
-
-    #[test]
-    fn petal_http_redirect_method_preserves_or_converts_by_status() {
-        assert_eq!(redirect_method("POST", 301), "GET");
-        assert_eq!(redirect_method("POST", 302), "GET");
-        assert_eq!(redirect_method("POST", 307), "POST");
-        assert_eq!(redirect_method("patch", 308), "PATCH");
-        assert_eq!(redirect_method("POST", 303), "GET");
-        assert_eq!(redirect_method("HEAD", 303), "HEAD");
-    }
-
-    #[test]
-    fn petal_http_cross_origin_redirect_strips_headers_and_blocks_body_replay() {
-        let mut headers = vec![
-            ("Authorization".into(), "Bearer secret".into()),
-            ("X-CLOB-Api-Key".into(), "secret".into()),
-        ];
-        let mut body = b"secret-body".to_vec();
-        let err = prepare_redirect_request(
-            "https://api.example.com/start",
-            "https://cdn.example.com/final",
-            "POST",
-            &mut headers,
-            &mut body,
-        )
-        .unwrap_err();
-        assert!(matches!(err, HostError::Denied(_)));
-        assert!(headers.is_empty());
-        assert_eq!(body, b"secret-body");
-
-        let mut headers = vec![("Authorization".into(), "Bearer secret".into())];
-        let mut body = b"secret-body".to_vec();
-        prepare_redirect_request(
-            "https://api.example.com/start",
-            "https://cdn.example.com/final",
-            "GET",
-            &mut headers,
-            &mut body,
-        )
-        .unwrap();
-        assert!(headers.is_empty());
-        assert!(body.is_empty());
-    }
-
-    #[test]
-    fn petal_http_same_origin_redirect_preserves_headers_but_clears_get_body() {
-        let mut headers = vec![("Authorization".into(), "Bearer secret".into())];
-        let mut body = b"secret-body".to_vec();
-        prepare_redirect_request(
-            "https://api.example.com/start",
-            "https://api.example.com/final",
-            "GET",
-            &mut headers,
-            &mut body,
-        )
-        .unwrap();
-        assert_eq!(
-            headers,
-            vec![("Authorization".into(), "Bearer secret".into())]
-        );
-        assert!(body.is_empty());
     }
 
     /// A pre-existing watch spec on disk should be loaded into the
@@ -1898,6 +1950,8 @@ ws_url = "wss://example.invalid"
             token: None,
             nft: None,
             usd_value: None,
+            depends_on: None,
+            action_id: None,
         };
         d.tx_engine.outbox.write_pending(&staged, "p").unwrap();
         let n = d.tx_engine.outbox.sweep_expired(2).unwrap();

@@ -14,7 +14,6 @@
 //!   deploy → fund → approve → creds → sync) over the hand-rolled relayer
 //!   client ([`RelayerClient`]), the V2 approval-call builders ([`wallet`]),
 //!   and the 0600 CLOB credential store ([`CredentialStore`]);
-//! - the fail-closed [`GeoblockClient`] refuse-line.
 //!
 //! - **orders** ([`order`]): V2 EIP-712 order building/signing for the
 //!   deposit-wallet path (signatureType 3 / POLY_1271) with integer micro-unit
@@ -29,21 +28,15 @@
 #![forbid(unsafe_code)]
 
 pub mod builder_creds;
-#[cfg(feature = "native-client")]
+pub mod ceremony;
 pub mod clob;
 pub mod creds;
-#[cfg(feature = "native-client")]
 pub mod data;
 pub mod eip712;
-#[cfg(feature = "native-client")]
 pub mod gamma;
-#[cfg(feature = "native-client")]
-pub mod geoblock;
-#[cfg(feature = "native-client")]
 pub mod onboard;
 pub mod order;
 pub mod order_store;
-#[cfg(feature = "native-client")]
 pub mod relayer;
 pub mod signer;
 #[cfg(test)]
@@ -52,25 +45,33 @@ pub mod trade;
 pub mod types;
 pub mod wallet;
 
+/// Pure `(action, hash)` builders and signature encoders for sealed approval.
+/// Inverts the signing surface: this module builds the bytes the user is
+/// asked to approve, and converts host-side raw signatures back into the
+/// wire-format string each call site needs. No keystore access; no I/O.
+///
+/// See `docs/architecture/Sealed Approvals.md` and the WS-H section of
+/// `docs/plans/2026-07-03-sealed-approval-implementation-plan.md`.
+pub mod signing;
+
 pub use builder_creds::{BuilderApiKeyInfo, BuilderCredentialStore, BuilderCredentials};
-#[cfg(feature = "native-client")]
+pub use ceremony::polymarket_onboard_ceremony_intent;
 pub use clob::ClobClient;
 pub use creds::CredentialStore;
-#[cfg(feature = "native-client")]
 pub use data::DataClient;
 pub use eip712::{deposit_wallet_implementation, derive_deposit_wallet_address};
-#[cfg(feature = "native-client")]
 pub use gamma::GammaClient;
-#[cfg(feature = "native-client")]
-pub use geoblock::{GeoblockClient, GeoblockStatus};
-#[cfg(feature = "native-client")]
 pub use onboard::{
     ChainReader, OnboardEvent, OnboardMode, OnboardState, OnboardStore, Onboarder, Stage,
 };
 pub use order_store::{DraftStatus, OrderDraft, OrderLock, OrderReceipt, OrderStore};
-#[cfg(feature = "native-client")]
 pub use relayer::{RelayerClient, RelayerTx};
-pub use signer::KeystoreSigner;
+pub use signer::{KeystoreSigner, OnboardSigner};
+pub use signing::{
+    CallView, ClobAuthAction, L1HeaderView, OrderAction, WalletBatchAction, action_id_for,
+    clob_auth_action_and_hash, order_action_and_hash, poly1271_signature_from_raw,
+    signature_string_from_raw, wallet_batch_action_and_hash,
+};
 pub use types::{BookLevel, Credentials, Market, OrderBook, Position, Side, TokenMarket, Trade};
 pub use wallet_name::validate_wallet_name;
 
@@ -97,6 +98,11 @@ pub const POLYGON: u64 = 137;
 /// Polygon Amoy testnet chain id (used by the SDK's known-answer vectors).
 pub const AMOY: u64 = 80_002;
 
+/// How many hex chars of the BLAKE3 `action_id` digest we keep. Matches the
+/// `[a-f0-9]{16}` style used elsewhere on the daemon-side action ids.
+/// Used by `signing::action_id_for` to truncate the digest label.
+pub const ACTION_ID_HEX_PREFIX: usize = 16;
+
 /// Default public base URLs for the three Polymarket APIs.
 pub const DEFAULT_GAMMA_URL: &str = "https://gamma-api.polymarket.com";
 pub const DEFAULT_DATA_URL: &str = "https://data-api.polymarket.com";
@@ -105,7 +111,6 @@ pub const DEFAULT_CLOB_URL: &str = "https://clob.polymarket.com";
 /// Errors surfaced by the Polymarket clients.
 #[derive(Debug, thiserror::Error)]
 pub enum PolymarketError {
-    #[cfg(feature = "native-client")]
     #[error("http: {0}")]
     Http(#[from] reqwest::Error),
     #[error("url: {0}")]

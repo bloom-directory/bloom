@@ -36,7 +36,7 @@ use alloy::primitives::{Address, B256, Bytes, U256};
 use alloy::rpc::types::eth::TransactionRequest;
 use alloy::rpc::types::eth::state::{AccountOverride, StateOverride};
 use async_trait::async_trait;
-use bloom_chain::ChainRegistry;
+use bloom_evm::ChainRegistry;
 use bloom_proto::{AddressBook, RawIntent, RawIntentBody, checksum_address, parse_eth};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
@@ -236,9 +236,30 @@ fn build_tx_request(
             to,
             value,
             token,
+            amount,
             data,
         } => {
             let to_addr = resolve_addr(to, addr_book)?;
+            if token.is_some() {
+                if amount.trim().is_empty() {
+                    return Err(HandlerError::invalid(
+                        "token sends require amount; value is only for native sends",
+                    ));
+                }
+                if !value.trim().is_empty() && value.trim() != "0" {
+                    return Err(HandlerError::invalid(
+                        "token sends must use amount; value is reserved for native sends",
+                    ));
+                }
+                return Err(HandlerError::Unsupported(
+                    "ERC-20 token simulation requires a contract-call intent".into(),
+                ));
+            }
+            if !amount.trim().is_empty() {
+                return Err(HandlerError::invalid(
+                    "native sends must use value; amount is only for token sends",
+                ));
+            }
             let v = resolve_value(value, token)?;
             let d = data.clone().unwrap_or_else(|| "0x".into());
             (to_addr, v, d)
@@ -274,7 +295,7 @@ fn build_tx_request(
             amount,
         } => {
             use alloy::sol_types::SolCall;
-            use bloom_chain::IERC20;
+            use bloom_evm::IERC20;
             let token_addr = resolve_addr(token, addr_book)?;
             let spender_addr = resolve_addr(spender, addr_book)?;
             let amount_u = if amount.trim().is_empty() || amount.eq_ignore_ascii_case("max") {
@@ -364,15 +385,25 @@ fn render_sim_plan(session: &SimSession) -> String {
         ));
         match &intent.body {
             RawIntentBody::Send {
-                to, value, token, ..
+                to,
+                value,
+                token,
+                amount,
+                ..
             } => {
                 s.push_str("Kind:  send\n");
                 s.push_str(&format!("To:    {}\n", to));
-                s.push_str(&format!(
-                    "Value: {} {}\n",
-                    if value.is_empty() { "0" } else { value },
-                    token.as_deref().unwrap_or("(native)")
-                ));
+                if let Some(token) = token {
+                    s.push_str(&format!("Amount: {} {}\n", amount, token));
+                    if !value.trim().is_empty() && value.trim() != "0" {
+                        s.push_str(&format!("Native value: {}\n", value));
+                    }
+                } else {
+                    s.push_str(&format!(
+                        "Value: {}\n",
+                        if value.is_empty() { "0" } else { value }
+                    ));
+                }
             }
             RawIntentBody::Raw { to, value, data } => {
                 s.push_str("Kind:  raw\n");
@@ -471,7 +502,7 @@ fn render_sim_plan(session: &SimSession) -> String {
 impl SimulateHandler {
     /// Resolve a chain client for an intent, falling back to the only
     /// registered chain if exactly one is registered.
-    fn pick_client(&self, intent: &RawIntent) -> Result<bloom_chain::ChainClient, HandlerError> {
+    fn pick_client(&self, intent: &RawIntent) -> Result<bloom_evm::ChainClient, HandlerError> {
         let preferred = pick_chain(intent);
         if let Some(c) = self.chains.get(&preferred) {
             return Ok(c);
@@ -835,7 +866,7 @@ mod tests {
     use tokio::process::{Child, Command};
     use tokio::time::timeout;
 
-    use bloom_chain::{ChainClient, ChainRegistry};
+    use bloom_evm::{ChainClient, ChainRegistry};
     use bloom_proto::ChainSpec;
 
     const ANVIL_BIN_DEFAULT: &str = "/Users/joshua/.foundry/bin/anvil";

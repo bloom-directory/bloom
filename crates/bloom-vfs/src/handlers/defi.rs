@@ -30,11 +30,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use alloy::primitives::{Address, U256, address};
 use alloy::rpc::types::eth::TransactionRequest;
 use async_trait::async_trait;
-use bloom_chain::{ChainClient, ChainRegistry};
 use bloom_defi::{
     EnsoClient, EnsoError, RouteRequest, RouteResponse, RoutingStrategy, parse_natural_intent,
     resolve_token_symbol,
 };
+use bloom_evm::{ChainClient, ChainRegistry};
 use bloom_keystore::Keystore;
 use bloom_proto::{
     AddressBook, GasStrategy, HomeWritePermit, RawIntent, RawIntentBody, StagedTx,
@@ -48,6 +48,42 @@ use serde::{Deserialize, Serialize};
 /// Enso's native-token sentinel; matches `bloom_defi::NATIVE_TOKEN`.
 /// When `token_in == NATIVE_TOKEN_ADDR`, no ERC-20 approval is needed.
 const NATIVE_TOKEN_ADDR: Address = address!("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee");
+
+const ROOT_FILES: [&str; 1] = ["README.md"];
+
+const README: &[u8] = br#"# DeFi Intents (Enso Shortcuts)
+
+## Quick Start for Agents
+
+### 1. Create an intent
+```json
+ write: /defi/intents/<wallet>/new
+ example: {"intent":"swap 100 usdc to eth","chain":"ethereum"}
+ or just NL text: swap 100 usdc to eth
+```
+
+### 2. Inspect the plan
+```json
+ read: /defi/intents/<wallet>/<session>/plan.md
+ read: /defi/intents/<wallet>/<session>/route.json
+ read: /defi/intents/<wallet>/<session>/tx.json
+ read: /defi/intents/<wallet>/<session>/simulation.json
+```
+
+### 3. Confirm (two confirms required)
+```json
+ write: /defi/intents/<wallet>/<session>/confirm    # Stage into outbox
+ write: /wallets/<wallet>/chains/<chain>/outbox/pending/<id>/confirm  # Broadcast
+```
+
+## Safety Model
+
+- Route discovery uses the Enso Shortcuts API (requires BLOOM_ENSO_KEY)
+- Simulation is re-run on each read; reverts are decoded
+- Auto-approve handles ERC-20 allowances when needed
+- Broadcast requires the standard outbox confirm (owner gate)
+- Settlement verification for cross-chain routes: read settlement.json and wait_settlement
+"#;
 
 use crate::handler::{Entry, Handler, HandlerError};
 use crate::path::VfsPath;
@@ -170,6 +206,12 @@ pub struct DefiHandler {
     /// Enables `polymarket_deposit_wallet` receiver classification from
     /// durable onboarding state. `None` ⇒ that class is unavailable.
     polymarket_root: Option<PathBuf>,
+    /// Hyperliquid Bridge2 address (deposit receiver) and the chain whose
+    /// native USDC it credits. Defaults to the mainnet bridge / Arbitrum;
+    /// the daemon may override from `[hyperliquid]` config.
+    hl_bridge: Address,
+    hl_deposit_chain_id: u64,
+    auth_services: crate::AuthServices,
 }
 
 impl DefiHandler {
@@ -193,7 +235,25 @@ impl DefiHandler {
             next_id: Arc::new(RwLock::new(1)),
             revert_decoder: Arc::new(DecoderChain::new()),
             polymarket_root: None,
+            hl_bridge: bloom_proto::hyperliquid::MAINNET_BRIDGE
+                .parse()
+                .expect("valid hyperliquid bridge const"),
+            hl_deposit_chain_id: bloom_proto::hyperliquid::DEPOSIT_CHAIN_ID,
+            auth_services: crate::AuthServices::default(),
         }
+    }
+
+    pub fn with_auth_services(mut self, auth_services: crate::AuthServices) -> Self {
+        self.auth_services = auth_services;
+        self
+    }
+
+    /// Override the Hyperliquid bridge address + deposit chain (from
+    /// `[hyperliquid]` config). Defaults to the mainnet bridge / Arbitrum.
+    pub fn with_hyperliquid(mut self, bridge: Address, deposit_chain_id: u64) -> Self {
+        self.hl_bridge = bridge;
+        self.hl_deposit_chain_id = deposit_chain_id;
+        self
     }
 
     pub fn with_home_write_permit(mut self, permit: Arc<HomeWritePermit>) -> Self {
@@ -325,14 +385,20 @@ impl DefiHandler {
 
     fn list_sessions_for_wallet(&self, wallet: &str) -> Vec<String> {
         let _ = self.load_wallet_sessions(wallet);
-        let mut out: Vec<String> = self
+        let mut entries: Vec<(u128, String)> = self
             .sessions
             .read()
             .values()
             .filter(|s| s.wallet == wallet)
-            .map(|s| s.id.clone())
+            .map(|s| (s.created_ms, s.id.clone()))
             .collect();
-        out.sort();
+        // Sort by created_ms descending (most recent first). Session ids are
+        // not chronologically ordered — the `<NNNN>` prefix is a per-process
+        // counter that resets to 1 on each daemon start (`allocate_id`,
+        // `next_id`), so a lexicographic id sort can surface a stale session
+        // ahead of a newer one.
+        entries.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+        let mut out: Vec<String> = entries.into_iter().map(|(_, id)| id).collect();
         out.dedup();
         out
     }
@@ -573,6 +639,102 @@ impl DefiHandler {
         }
     }
 
+    /// Stage a Hyperliquid deposit: a direct USDC transfer to the Bridge2
+    /// contract on Arbitrum. This is the deposit *primitive* — the bridge
+    /// credits native Arbitrum USDC sent to it. The guardrails (Arbitrum-only,
+    /// 5 USDC minimum, dust warning) live in [`bloom_proto::hyperliquid`].
+    async fn stage_hyperliquid_deposit(
+        &self,
+        wallet: &str,
+        amount: &str,
+        token_in: &str,
+        body: &NewIntentBody,
+    ) -> Result<(), HandlerError> {
+        use bloom_proto::hyperliquid::{DepositCheck, check_deposit};
+
+        let info = self
+            .keystore
+            .info(wallet)
+            .map_err(|e| HandlerError::backend(e.to_string()))?;
+        let chain_name = body
+            .chain
+            .clone()
+            .unwrap_or_else(|| self.default_chain.clone());
+        let chain = self.chain_client(&chain_name)?;
+        let chain_id = chain
+            .chain_id()
+            .await
+            .map_err(|e| HandlerError::backend(e.to_string()))?;
+
+        // v1 supports depositing USDC you already hold on Arbitrum. Other
+        // sources must consolidate to Arbitrum USDC first (the bridge only
+        // credits native Arbitrum USDC — sending Base/Polygon USDC straight to
+        // the bridge does not credit).
+        if !token_in.eq_ignore_ascii_case("USDC") {
+            return Err(HandlerError::invalid(
+                "Hyperliquid deposit currently supports USDC input; swap to USDC first, then deposit.",
+            ));
+        }
+        if chain_id != self.hl_deposit_chain_id {
+            return Err(HandlerError::invalid(format!(
+                "Hyperliquid credits only native USDC on chain {} (Arbitrum); you are on chain \
+                 {chain_id}. Bridge/consolidate to Arbitrum USDC first, then deposit.",
+                self.hl_deposit_chain_id
+            )));
+        }
+        let amount_units = bloom_proto::parse_units(amount, 6)
+            .map_err(|e| HandlerError::invalid(format!("amount: {e}")))?;
+        let amount_6dp =
+            u128::try_from(amount_units).map_err(|_| HandlerError::invalid("amount too large"))?;
+        match check_deposit(chain_id, true, amount_6dp, true) {
+            DepositCheck::Reject(msg) => return Err(HandlerError::invalid(msg)),
+            DepositCheck::Ok { warning } => {
+                if let Some(w) = warning {
+                    tracing::warn!(wallet, warning = %w, "hyperliquid.deposit.warning");
+                }
+            }
+        }
+
+        // The deposit is a plain USDC transfer to the bridge. Symbol + decimals
+        // resolve via the shared token table (#5); the user confirms it through
+        // the normal outbox flow.
+        let bridge = bloom_proto::checksum_address(&self.hl_bridge);
+        let intent = RawIntent {
+            body: RawIntentBody::Send {
+                to: bridge.clone(),
+                value: String::new(),
+                token: Some("USDC".to_string()),
+                amount: amount.to_string(),
+                data: None,
+            },
+            chain: Some(chain_name.clone()),
+            gas: GasStrategy::Auto,
+            nonce: None,
+            gas_limit_hint: None,
+            usd_value_hint: None,
+        };
+        let staged = self
+            .tx_engine
+            .stage(
+                self.write_permit()?,
+                wallet,
+                info.address,
+                intent,
+                &chain,
+                &info.policy,
+                Some(&self.address_book),
+            )
+            .await
+            .map_err(|e| HandlerError::backend(e.to_string()))?;
+        tracing::info!(
+            wallet,
+            outbox_id = %staged.id,
+            bridge = %bridge,
+            "hyperliquid.deposit.staged"
+        );
+        Ok(())
+    }
+
     async fn create_session(
         &self,
         wallet: &str,
@@ -651,9 +813,11 @@ impl DefiHandler {
                     gas: GasStrategy::Auto,
                     nonce: None,
                     gas_limit_hint: None,
+                    usd_value_hint: None,
                 });
             }
         }
+        let route_usd_value_hint = route_usd_value_hint(&req, &route);
         intents.push(RawIntent {
             body: RawIntentBody::Raw {
                 to: checksum_address(&route.tx.to),
@@ -664,6 +828,7 @@ impl DefiHandler {
             gas: GasStrategy::Auto,
             nonce: None,
             gas_limit_hint: route.gas.as_deref().and_then(|g| g.parse().ok()),
+            usd_value_hint: route_usd_value_hint,
         });
 
         // Evaluate `[defi]` route policy for display + review (the hard gate
@@ -890,6 +1055,15 @@ impl DefiHandler {
                 )
                 .await
                 .map_err(|e| HandlerError::backend(e.to_string()))?;
+            // Sequential same-chain intents must broadcast in order (e.g.
+            // approve → route). Record the dependency so `confirm` refuses the
+            // dependent until its predecessor mines successfully.
+            if let Some(prev) = staged_list.last() {
+                self.tx_engine
+                    .outbox
+                    .set_pending_depends_on(wallet, &sess.chain, &staged.id, &prev.id)
+                    .map_err(|e| HandlerError::backend(e.to_string()))?;
+            }
             if let Some(state) = sess.intent_states.get_mut(idx) {
                 state.status = DefiIntentStatus::Staged;
                 state.outbox_id = Some(staged.id.clone());
@@ -1121,6 +1295,9 @@ impl DefiHandler {
         if segs.is_empty() {
             return Ok(Entry::dir(""));
         }
+        if segs.len() == 1 && ROOT_FILES.contains(&segs[0].as_str()) {
+            return Ok(Entry::file(&segs[0]));
+        }
         match segs[0].as_str() {
             "intents" => match segs.len() {
                 1 => Ok(Entry::dir("intents")),
@@ -1151,6 +1328,9 @@ impl DefiHandler {
 
     async fn read_inner(&self, path: &VfsPath) -> Result<Vec<u8>, HandlerError> {
         let segs = path.segments();
+        if segs.len() == 1 && ROOT_FILES.contains(&segs[0].as_str()) {
+            return Ok(README.to_vec());
+        }
         if segs.len() != 4 || segs[0] != "intents" {
             return Err(HandlerError::NotAFile(path.to_string_path()));
         }
@@ -1209,6 +1389,14 @@ impl DefiHandler {
                 let body = std::str::from_utf8(data)
                     .map_err(|_| HandlerError::invalid("non-utf8 intent body"))?;
                 let parsed = Self::parse_new_body(body)?;
+                // First-class "deposit to Hyperliquid" goal: stage a validated
+                // USDC transfer to the bridge instead of an Enso route.
+                if let Some((amount, token_in)) = parse_hyperliquid_deposit(&parsed.intent) {
+                    self.stage_hyperliquid_deposit(&segs[1], &amount, &token_in, &parsed)
+                        .await?;
+                    tracing::info!(wallet = %segs[1], "defi.hyperliquid_deposit.staged");
+                    return Ok(());
+                }
                 let sess = self.create_session(&segs[1], parsed).await?;
                 tracing::info!(wallet = %sess.wallet, session = %sess.id, "defi.session.created");
                 Ok(())
@@ -1237,7 +1425,7 @@ impl DefiHandler {
     async fn list_inner(&self, path: &VfsPath) -> Result<Vec<Entry>, HandlerError> {
         let segs = path.segments();
         match segs.len() {
-            0 => Ok(vec![Entry::dir("intents")]),
+            0 => Ok(vec![Entry::file("README.md"), Entry::dir("intents")]),
             1 if segs[0] == "intents" => Ok(self
                 .list_session_wallets()
                 .into_iter()
@@ -1299,19 +1487,71 @@ fn map_enso_err(e: EnsoError) -> HandlerError {
     }
 }
 
+/// Recognize a Hyperliquid deposit goal: `deposit <amount> [token] to
+/// hyperliquid`. Returns `(amount, token_in)` with `token_in` defaulting to
+/// USDC. `None` when the intent is not a Hyperliquid deposit.
+fn parse_hyperliquid_deposit(intent: &str) -> Option<(String, String)> {
+    let toks: Vec<&str> = intent.split_whitespace().collect();
+    let n = toks.len();
+    // deposit <amount> [token] to hyperliquid  → at least 4 tokens.
+    if n < 4 || !toks[0].eq_ignore_ascii_case("deposit") {
+        return None;
+    }
+    if !toks[n - 1].eq_ignore_ascii_case("hyperliquid") || !toks[n - 2].eq_ignore_ascii_case("to") {
+        return None;
+    }
+    let amount = toks[1];
+    if !amount
+        .chars()
+        .next()
+        .map(|c| c.is_ascii_digit())
+        .unwrap_or(false)
+    {
+        return None;
+    }
+    // Optional token sits between the amount and the `to` connective.
+    let token = if n - 2 > 2 {
+        toks[2].to_string()
+    } else {
+        "USDC".to_string()
+    };
+    Some((amount.to_string(), token))
+}
+
 fn decimals_for_symbol(chain_id: u64, sym: &str) -> u8 {
     let upper = sym.to_ascii_uppercase();
+    // Native coins (and their wrapped majors) are 18 decimals everywhere.
     if matches!(
         upper.as_str(),
         "ETH" | "ETHER" | "WETH" | "MATIC" | "BNB" | "AVAX"
     ) {
         return 18;
     }
-    match (chain_id, upper.as_str()) {
-        (_, "USDC" | "USDT") => 6,
-        (1, "DAI") => 18,
-        (1, "WBTC") => 8,
-        _ => 18,
+    // Everything else from the shared token table; default to 18 only when
+    // the symbol isn't a known major on this chain.
+    bloom_proto::tokens::resolve_symbol(chain_id, &upper)
+        .map(|t| t.decimals)
+        .unwrap_or(18)
+}
+
+fn route_usd_value_hint(req: &RouteRequest, route: &RouteResponse) -> Option<String> {
+    let out_chain = req.destination_chain_id.unwrap_or(req.chain_id);
+    let token = bloom_proto::tokens::for_chain(out_chain).iter().find(|t| {
+        t.address
+            .eq_ignore_ascii_case(&format!("0x{:x}", req.token_out))
+            && matches!(t.symbol, "USDC" | "USDT" | "DAI")
+    })?;
+    let raw = route.amount_out.parse::<U256>().ok()?;
+    let human = format_units(raw, token.decimals);
+    if human
+        .parse::<f64>()
+        .ok()
+        .filter(|v| v.is_finite())
+        .is_some()
+    {
+        Some(human)
+    } else {
+        None
     }
 }
 
@@ -1384,7 +1624,7 @@ fn render_plan_md(
         s.push('\n');
     }
     s.push_str(&format!(
-        "From:      {}\n",
+        "From (owner/signer EOA): {}\n",
         checksum_address(&req.from_address)
     ));
     // High-risk fields up top: receiver + classification, router, protocols.
@@ -1633,6 +1873,7 @@ mod tests {
             gas: GasStrategy::Auto,
             nonce: None,
             gas_limit_hint: None,
+            usd_value_hint: None,
         }];
         let now = now_ms();
         DefiSession {
@@ -1661,6 +1902,27 @@ mod tests {
             policy_checks: serde_json::Value::Null,
             receiver_class: None,
         }
+    }
+
+    #[test]
+    fn parse_hyperliquid_deposit_goal() {
+        // With and without an explicit token; token defaults to USDC.
+        assert_eq!(
+            parse_hyperliquid_deposit("deposit 5 USDC to hyperliquid"),
+            Some(("5".to_string(), "USDC".to_string()))
+        );
+        assert_eq!(
+            parse_hyperliquid_deposit("deposit 5 to hyperliquid"),
+            Some(("5".to_string(), "USDC".to_string()))
+        );
+        assert_eq!(
+            parse_hyperliquid_deposit("deposit 12.5 USDC to Hyperliquid"),
+            Some(("12.5".to_string(), "USDC".to_string()))
+        );
+        // Not a deposit goal.
+        assert!(parse_hyperliquid_deposit("swap 1 ETH to USDC").is_none());
+        assert!(parse_hyperliquid_deposit("deposit USDC to hyperliquid").is_none());
+        assert!(parse_hyperliquid_deposit("deposit 5 USDC to polygon").is_none());
     }
 
     #[test]
@@ -1740,6 +2002,69 @@ mod tests {
     }
 
     #[test]
+    fn route_usd_value_hint_uses_stablecoin_output() {
+        let usdc = resolve_token_symbol(8453, "USDC").unwrap();
+        let req = RouteRequest {
+            from_address: Address::ZERO,
+            chain_id: 137,
+            destination_chain_id: Some(8453),
+            token_in: NATIVE_TOKEN_ADDR,
+            token_out: usdc,
+            amount_in: U256::from(94_000_000_000_000_000_000u128),
+            slippage_bps: 100,
+            routing_strategy: Some(RoutingStrategy::Router),
+            receiver: Some(Address::ZERO),
+        };
+        let route = RouteResponse {
+            tx: bloom_defi::RouteTx {
+                from: Address::ZERO,
+                to: Address::ZERO,
+                data: Default::default(),
+                value: req.amount_in,
+            },
+            amount_out: "7619717".into(),
+            gas: None,
+            route: serde_json::Value::Null,
+            price_impact: None,
+            destination_chain_id: Some(8453),
+        };
+        assert_eq!(
+            route_usd_value_hint(&req, &route).as_deref(),
+            Some("7.619717")
+        );
+    }
+
+    #[test]
+    fn route_usd_value_hint_ignores_non_stable_output() {
+        let weth = resolve_token_symbol(8453, "WETH").unwrap();
+        let req = RouteRequest {
+            from_address: Address::ZERO,
+            chain_id: 137,
+            destination_chain_id: Some(8453),
+            token_in: NATIVE_TOKEN_ADDR,
+            token_out: weth,
+            amount_in: U256::from(1u64),
+            slippage_bps: 50,
+            routing_strategy: Some(RoutingStrategy::Router),
+            receiver: None,
+        };
+        let route = RouteResponse {
+            tx: bloom_defi::RouteTx {
+                from: Address::ZERO,
+                to: Address::ZERO,
+                data: Default::default(),
+                value: U256::ZERO,
+            },
+            amount_out: "1".into(),
+            gas: None,
+            route: serde_json::Value::Null,
+            price_impact: None,
+            destination_chain_id: Some(8453),
+        };
+        assert!(route_usd_value_hint(&req, &route).is_none());
+    }
+
+    #[test]
     fn render_plan_md_includes_key_fields() {
         let req = RouteRequest {
             from_address: Address::ZERO,
@@ -1775,6 +2100,7 @@ mod tests {
             gas: GasStrategy::Auto,
             nonce: None,
             gas_limit_hint: None,
+            usd_value_hint: None,
         }];
         let ctx = test_route_ctx(&req, &route);
         let checks = bloom_proto::evaluate_defi_route(&bloom_proto::DefiPolicy::default(), &ctx);
@@ -1842,6 +2168,7 @@ mod tests {
                 gas: GasStrategy::Auto,
                 nonce: None,
                 gas_limit_hint: None,
+                usd_value_hint: None,
             },
             RawIntent {
                 body: RawIntentBody::Raw {
@@ -1853,6 +2180,7 @@ mod tests {
                 gas: GasStrategy::Auto,
                 nonce: None,
                 gas_limit_hint: None,
+                usd_value_hint: None,
             },
         ];
         let ctx = test_route_ctx(&req, &route);

@@ -119,6 +119,75 @@ impl CeremonyIntent {
     }
 }
 
+/// Build the human-review intent for minting a bounded policy session. The
+/// `canonical_subject` (which alone determines [`CeremonyIntent::intent_hash`])
+/// binds the wallet, the VFS path, and the exact descriptor bytes — so the
+/// reviewed-intent hash is reproducible by anyone holding the same descriptor.
+///
+/// Both the IPC ceremony lane (which renders and approves this) and the VFS mint
+/// handler (which verifies an approval marker before minting) call this, so the
+/// hash they compare is guaranteed identical.
+pub fn policy_session_mint_intent(wallet: &str, path: &str, descriptor: &[u8]) -> CeremonyIntent {
+    let descriptor_blake3 = blake3::hash(descriptor).to_hex().to_string();
+    let parsed: serde_json::Value =
+        serde_json::from_slice(descriptor).unwrap_or(serde_json::Value::Null);
+    // pending_ids are {chain_id, id} pairs; render chain-qualified ids so the
+    // human approves exact (chain, id) pairs, and derive the chain list.
+    let pairs: Vec<(u64, String)> = parsed
+        .get("pending_ids")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|p| {
+                    Some((
+                        p.get("chain_id")?.as_u64()?,
+                        p.get("id")?.as_str()?.to_string(),
+                    ))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let chains = {
+        let mut cs: Vec<String> = pairs.iter().map(|(c, _)| c.to_string()).collect();
+        cs.sort();
+        cs.dedup();
+        cs.join(", ")
+    };
+    let ids: Vec<String> = pairs.iter().map(|(c, i)| format!("{c}:{i}")).collect();
+    let mut intent = CeremonyIntent::new(
+        wallet,
+        "Approve Batch-Signing Session",
+        CeremonyIntentKind::RunCapability,
+    );
+    intent.summary_lines = vec![
+        format!("Mint a batch-signing session for wallet '{wallet}'."),
+        "After approval, the listed transactions can broadcast WITHOUT another passkey prompt — within these bounds:".into(),
+        format!("Chains: {chains}"),
+        format!(
+            "Max total spend: {} USD",
+            parsed.get("max_usd").map(|v| v.to_string()).unwrap_or_else(|| "?".into())
+        ),
+        format!(
+            "Expires in: {} seconds",
+            parsed.get("ttl_secs").map(|v| v.to_string()).unwrap_or_else(|| "?".into())
+        ),
+        format!("Authorizes exactly {} transaction id(s): {}", ids.len(), ids.join(", ")),
+    ];
+    intent.risk_lines = vec![
+        "These transactions will broadcast without a further prompt once approved.".into(),
+        "Only the listed ids, chains, and total USD are authorized; nothing else.".into(),
+        "Revoke early by writing to policy-session/<id>/revoke.".into(),
+    ];
+    intent.artifact_paths = vec![path.to_string()];
+    intent.canonical_subject = serde_json::json!({
+        "kind": "vfs_policy_session_mint",
+        "wallet": wallet,
+        "path": path,
+        "descriptor_blake3": descriptor_blake3,
+    });
+    intent
+}
+
 fn now_ms_u64() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

@@ -13,6 +13,8 @@
       --line:#d8dee8;
       --soft:#eef2f7;
       --accent:#0f766e;
+      --accent-dark:#0b5d57;
+      --accent-soft:#e6f6f2;
       --accent-2:#0b5fff;
       --danger:#b42318;
       --warn-bg:#fff7df;
@@ -23,8 +25,8 @@
     }
     *{box-sizing:border-box}
     body{margin:0;background:var(--bg);color:var(--text);font-family:var(--sans)}
-    main{max-width:1040px;margin:0 auto;padding:32px 20px 44px}
-    header{display:flex;gap:18px;align-items:flex-start;justify-content:space-between;margin-bottom:18px}
+    main{max-width:1040px;margin:0 auto;padding:32px 20px 120px}
+    header{display:none}
     h1{font-size:24px;line-height:1.2;margin:0 0 8px;font-weight:720;letter-spacing:0}
     p{color:var(--muted);margin:0;font-size:14px;line-height:1.5}
     a{color:var(--accent-2);text-decoration:none}
@@ -33,6 +35,18 @@
     .panel{background:var(--panel);border:1px solid var(--line);border-radius:8px;box-shadow:0 1px 2px rgba(16,24,40,.04)}
     .panel h2{font-size:13px;text-transform:uppercase;letter-spacing:.04em;color:var(--muted);margin:0;padding:14px 16px;border-bottom:1px solid var(--line)}
     .panel-body{padding:16px}
+    .hero{padding:22px;border:1px solid #c9d7ef;background:#fff}
+    .hero-title{font-size:30px;line-height:1.12;margin:0 0 8px;font-weight:760}
+    .hero-copy{font-size:16px;line-height:1.55;color:#344054;max-width:760px}
+    .hero-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px;margin-top:16px}
+    .hero-stat{border:1px solid var(--line);border-radius:8px;background:#fff;padding:12px}
+    .hero-stat strong{display:block;font-size:12px;text-transform:uppercase;letter-spacing:.05em;color:var(--muted);margin-bottom:6px}
+    .hero-stat span{display:block;font-size:15px;line-height:1.35;color:var(--text);overflow-wrap:anywhere}
+    .hero-stat span.unlimited-warn{color:#d32f2f;font-weight:700}
+    .hero-note{display:grid;grid-template-columns:minmax(0,1fr);gap:10px;margin-top:14px}
+    .hero-box{border:1px solid #d7e3f4;border-radius:8px;background:#fff;padding:13px}
+    .hero-box strong{display:block;font-size:13px;margin-bottom:6px}
+    .hero-box p{font-size:13px;color:#475467}
     .kv{display:grid;grid-template-columns:88px minmax(0,1fr);gap:8px 12px;font-size:14px}
     .label{color:var(--muted)}
     .value{min-width:0;overflow-wrap:anywhere}
@@ -48,40 +62,56 @@
     .policy-line:nth-child(even) .code{background:#111a24}
     .policy-line a{color:#7dd3fc}
     .choice{display:grid;grid-template-columns:1fr 1fr;gap:12px}
-    .choice-card{border:1px solid var(--line);border-radius:8px;background:#fbfcfe;padding:13px;text-align:left;color:var(--text);cursor:pointer}
+    .choice-card{position:relative;border:1px solid var(--line);border-radius:8px;background:#fbfcfe;padding:14px 14px 14px 16px;text-align:left;color:var(--text);cursor:pointer;transition:background .12s ease,border-color .12s ease,box-shadow .12s ease,transform .12s ease}
     .choice-card h3{font-size:14px;margin:0 0 7px;color:var(--text)}
     .choice-card p{font-size:13px;margin:0;color:var(--muted)}
     .choice-card.primary{border-color:var(--line);background:#fbfcfe}
-    .choice-card.selected{border-color:#0f766e;box-shadow:0 0 0 2px rgba(15,118,110,.14)}
+    .choice-card.selected{border-color:var(--accent);background:var(--accent-soft);box-shadow:0 0 0 3px rgba(15,118,110,.18)}
+    .choice-card.selected:before{content:"";position:absolute;left:-1px;top:-1px;bottom:-1px;width:5px;background:var(--accent);border-radius:8px 0 0 8px}
+    .choice-card.saving{border-color:#0b5fff;background:#eef5ff;box-shadow:0 0 0 3px rgba(11,95,255,.14)}
     .choice-card:focus{outline:2px solid #0b5fff;outline-offset:2px}
-    .choice-card .picked{display:none;margin-top:10px;font-size:12px;font-weight:700;color:#0f766e}
+    .choice-card .picked{display:none;margin-top:10px;font-size:12px;font-weight:800;color:var(--accent-dark)}
     .choice-card.selected .picked{display:block}
+    .review-banner{display:grid;gap:6px;border:1px solid #b7e4c4;background:#effaf3;color:#14532d;border-radius:8px;padding:12px 14px;margin-bottom:14px}
+    .review-banner.warn{border-color:#f0d28a;background:#fff7df;color:#7a4d00}
+    .review-banner strong{font-size:14px}
+    .review-banner span{font-size:13px;line-height:1.45}
     .simple-policy{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;margin:14px 0}
     .simple-card{border:1px solid var(--line);border-radius:8px;background:#fbfcfe;padding:12px}
     .simple-card strong{display:block;font-size:13px;margin-bottom:4px;color:var(--text)}
     .simple-card span{display:block;font-size:13px;line-height:1.4;color:var(--muted);overflow-wrap:anywhere}
+    .simple-card span.unlimited-warn{color:#d32f2f;font-weight:700}
     details{border:1px solid var(--line);border-radius:8px;background:#fbfcfe}
     summary{cursor:pointer;padding:12px 14px;color:var(--muted);font-size:13px}
     pre{margin:0;padding:0 14px 14px;white-space:pre-wrap;word-break:break-word;font-family:var(--mono);font-size:12px;color:#344054}
-    .actions{display:flex;gap:10px;align-items:center;margin-top:16px}
+    .actions{position:fixed;left:0;right:0;bottom:0;z-index:5;display:flex;gap:10px;align-items:center;justify-content:center;margin:0;padding:12px 16px;background:rgba(246,247,249,.94);border-top:1px solid var(--line);backdrop-filter:blur(10px)}
     button{font:600 14px var(--sans);padding:10px 14px;border:1px solid #172033;background:#172033;color:white;border-radius:6px;cursor:pointer}
     button.secondary{background:white;color:#172033;border-color:var(--line)}
     button.choice-card{border:1px solid var(--line);background:#fbfcfe;color:var(--text);padding:13px}
     button.choice-card.primary{border-color:var(--line);background:#fbfcfe}
     button.choice-card.selected{border-color:#0f766e;background:#e6f6f2;box-shadow:0 0 0 3px rgba(15,118,110,.2)}
     button:disabled{opacity:.55;cursor:not-allowed}
-    #status{margin-top:14px;padding:12px 14px;border-radius:8px;line-height:1.45;font-size:14px;border:1px solid #f0d28a;background:var(--warn-bg);color:#7a4d00}
+    #status{position:fixed;left:50%;bottom:58px;transform:translateX(-50%);z-index:6;width:min(720px,calc(100% - 24px));padding:12px 14px;border-radius:8px;line-height:1.45;font-size:14px;border:1px solid #f0d28a;background:var(--warn-bg);color:#7a4d00;box-shadow:0 10px 28px rgba(16,24,40,.12)}
     #status.ok{background:var(--ok-bg);border-color:#b7e4c4;color:#14532d}
     #status.err{background:var(--err-bg);border-color:#f5b5ae;color:#7a1f16}
     .hidden{display:none}
     .address{font-family:var(--mono);font-size:13px}
+    #technicalWrap summary{font-weight:700;color:#344054}
     @media(max-width:850px){
-      main{padding:22px 12px 34px}
+      main{padding:22px 12px 128px}
       header{display:block}
       .grid{grid-template-columns:1fr}
+      .hero-grid{grid-template-columns:1fr 1fr}
+      .hero-note{grid-template-columns:1fr}
       .kv{grid-template-columns:74px minmax(0,1fr)}
       .choice{grid-template-columns:1fr}
       .simple-policy{grid-template-columns:1fr}
+    }
+    @media(max-width:560px){
+      .hero-grid{grid-template-columns:1fr}
+      .hero-title{font-size:24px}
+      .actions{align-items:stretch}
+      .actions button{flex:1}
     }
   </style>
 </head>
@@ -91,22 +121,40 @@
     <div>
       <h1 id="title">Review passkey action</h1>
       <p>
-        Review the exact Bloom action before the OS/browser passkey prompt opens.
+        Review the authority you are granting before the OS/browser passkey prompt opens.
         The passkey prompt proves user presence for bloom/localhost; it does not
-        display these details itself.
+        show venue, risk, or size details itself.
       </p>
     </div>
   </header>
 
+  <section id="heroWrap" class="panel hero hidden" style="margin-bottom:16px">
+    <div>
+      <h2 id="heroTitle" class="hero-title">Review authorization</h2>
+      <p id="heroCopy" class="hero-copy"></p>
+    </div>
+    <div id="heroGrid" class="hero-grid"></div>
+    <div class="hero-note">
+      <div class="hero-box">
+        <strong>What you are authorizing</strong>
+        <p id="heroWhat"></p>
+      </div>
+      <div class="hero-box">
+        <strong>What the next prompt will show</strong>
+        <p id="heroPrompt"></p>
+      </div>
+    </div>
+  </section>
+
   <div class="grid">
-    <section class="panel">
+    <section id="actionWrap" class="panel">
       <h2>Action</h2>
       <div class="panel-body">
         <ul id="summary" class="clean"></ul>
       </div>
     </section>
 
-    <aside class="panel">
+    <aside id="identityWrap" class="panel">
       <h2>Identity</h2>
       <div class="panel-body kv">
         <div class="label">Wallet</div><div id="wallet" class="value">loading...</div>
@@ -117,32 +165,43 @@
     </aside>
   </div>
 
+  <section id="technicalWrap" style="margin-top:16px">
+    <details>
+      <summary>Advanced details</summary>
+      <div class="panel-body kv">
+        <div class="label">Wallet</div><div id="advancedWallet" class="value">-</div>
+        <div class="label">Address</div><div id="advancedAddress" class="value address">-</div>
+        <div class="label">Type</div><div id="advancedKind" class="value kind">-</div>
+        <div class="label">Review ID</div><div id="advancedHash" class="value hash">-</div>
+      </div>
+    </details>
+  </section>
+
   <section id="policyWrap" class="panel hidden" style="margin-top:16px">
     <h2 id="policyTitle">Policy</h2>
     <div class="panel-body">
       <div id="policyDecision" class="hidden" style="margin-bottom:14px">
-        <p style="margin-bottom:12px">
-          This policy decides how much autonomy Bloom has. You can require a
-          fresh passkey approval for every money-moving action, or let Bloom
-          act by itself only when an action fits these rules.
-        </p>
+        <div class="review-banner">
+          <strong>Choose how Bloom should ask you later.</strong>
+          <span>You can make Bloom ask every time, or let it act only when the action fits these rules.</span>
+        </div>
         <div class="choice">
           <button class="choice-card" type="button" data-autonomy-mode="prompt_all">
-            <h3>Manual approval for every action</h3>
-            <p>Bloom still uses this policy as guardrails, but it must ask you
-              before every money-moving action.</p>
+            <h3>Ask me every time</h3>
+            <p>Bloom must stop and ask before money moves.</p>
             <span class="picked">Selected</span>
           </button>
           <button class="choice-card primary" type="button" data-autonomy-mode="under_policy">
-            <h3>Agent-guided by signed policy</h3>
-            <p>Approve this policy as the boundary. Bloom may proceed
-              autonomously for matching actions, and must refuse anything
-              outside the allowed chains, receivers, routers, caps, and risk
-              settings.</p>
+            <h3>Let Bloom use these rules</h3>
+            <p>Bloom can act later only if the action passes every rule below.</p>
             <span class="picked">Selected</span>
           </button>
         </div>
         <p id="policyPlainEnglish" style="margin-top:12px"></p>
+      </div>
+      <div id="policyEditNotice" class="review-banner warn hidden">
+        <strong>This screen signs the policy exactly as shown.</strong>
+        <span>To change approval mode, close this tab, edit the wallet policy, and start signing again.</span>
       </div>
       <div id="policySimple" class="simple-policy"></div>
       <details id="rawPolicyDetails">
@@ -182,6 +241,8 @@
 <script>
 var TK=new URLSearchParams(location.search).get('t')||'';
 var CURRENT_INTENT=null;
+var EDITABLE_POLICY=false;
+var PASSKEY_FLOW_ACTIVE=false;
 function dec(s){
   s=s.replace(/-/g,'+').replace(/_/g,'/');
   while(s.length%4)s+='=';
@@ -308,26 +369,142 @@ function simpleCard(parent,title,text){
       const h=document.createElement('strong');
   h.textContent=title;
   const body=document.createElement('span');
+  if(String(text).indexOf('UNLIMITED')>=0) body.className='unlimited-warn';
   appendLinkedText(body,text);
   card.appendChild(h);
   card.appendChild(body);
   parent.appendChild(card);
+}
+function heroStat(parent,title,text){
+  const card=document.createElement('div');
+  card.className='hero-stat';
+  const h=document.createElement('strong');
+  h.textContent=title;
+  const body=document.createElement('span');
+  if(String(text).indexOf('UNLIMITED')>=0) body.className='unlimited-warn';
+  appendLinkedText(body,text);
+  card.appendChild(h);
+  card.appendChild(body);
+  parent.appendChild(card);
+}
+function summaryLineValue(lines,prefix){
+  for(const line of (lines||[])){
+    if(String(line).startsWith(prefix)) return String(line).slice(prefix.length).trim();
+  }
+  return '';
 }
 function setPolicyModePresentation(mode){
   const title=document.getElementById('policyTitle');
   const details=document.getElementById('rawPolicyDetails');
   const plain=document.getElementById('policyPlainEnglish');
   if(mode==='under_policy'){
-    title.textContent='Agent Rules';
+    title.textContent='Rules Bloom Must Follow';
     details.open=false;
     details.querySelector('summary').textContent='Advanced: exact policy.toml';
-    plain.textContent='Bloom may act without asking only when an action fits these rules.';
+    plain.textContent='Selected: Bloom can act later, but only if every rule below says yes.';
   }else{
-    title.textContent='Safety Limits';
+    title.textContent='Rules Bloom Must Follow';
     details.open=false;
     details.querySelector('summary').textContent='Advanced: exact safety limits';
-    plain.textContent='Bloom will ask before every money-moving action. These limits can still block actions that are outside your guardrails.';
+    plain.textContent='Selected: Bloom must ask before money moves. These rules can still block unsafe actions.';
   }
+}
+function isHyperliquidIntent(i){
+  const subj=i&&i.canonical_subject?i.canonical_subject:{};
+  return subj.kind==='hyperliquid_agent_session_grant' || subj.kind==='hyperliquid_vfs_write';
+}
+function buttonLabelForIntent(i){
+  if(isHyperliquidIntent(i)){
+    const summary=i&&i.summary_lines?i.summary_lines:[];
+    if((i.canonical_subject||{}).kind==='hyperliquid_agent_session_grant'){
+      const markets=lineValue((i.policy_lines||[]).join('\n'),'allowed_assets')||'Trading';
+      return 'Authorize '+markets+' Trading Session';
+    }
+    const file=(i.canonical_subject||{}).file||summaryLineValue(summary,'Action file:');
+    if(file==='order.json') return 'Authorize Hyperliquid Order';
+    if(file==='cancel.json') return 'Authorize Hyperliquid Cancel';
+    if(file==='schedule_cancel.json') return 'Authorize Dead-Man Switch';
+    if(file==='update_leverage.json') return 'Authorize Leverage Update';
+    return 'Authorize Hyperliquid Action';
+  }
+  if(isPolicyIntent(i)) return 'Approve Policy';
+  return 'Approve and Continue';
+}
+function sessionDurationText(raw){
+  const secs=parseInt(String(raw||''),10);
+  if(!isFinite(secs)||secs<=0) return 'Not stated';
+  if(secs%3600===0) return (secs/3600)+' hour'+(secs===3600?'':'s');
+  if(secs%60===0) return (secs/60)+' minute'+(secs===60?'':'s');
+  return secs+' seconds';
+}
+function renderHyperliquidReview(text,subject){
+  const parent=document.getElementById('policySimple');
+  parent.textContent='';
+  const network=subject&&subject.network?subject.network:'mainnet';
+  simpleCard(parent,'Allowed','Bloom can trade on Hyperliquid '+network+' only inside these limits.');
+  simpleCard(parent,'Duration',sessionDurationText(lineValue(text,'max_session_secs')));
+  simpleCard(parent,'Markets',lineValue(text,'allowed_assets')||'Not stated');
+  simpleCard(parent,'Order types',lineValue(text,'allowed_order_types')||'Not stated');
+  simpleCard(parent,'Max position',lineValue(text,'max_position_usd')||'Not stated');
+  simpleCard(parent,'Max order size',lineValue(text,'max_notional_usd')||'Not stated');
+  simpleCard(parent,'Max loss',lineValue(text,'max_loss_usd')||'Not stated');
+  simpleCard(parent,'Max leverage',lineValue(text,'max_leverage')||'Not stated');
+  simpleCard(parent,'Cannot do','Withdrawals and third-party transfers are blocked.');
+}
+function renderHero(i){
+  const wrap=document.getElementById('heroWrap');
+  const title=document.getElementById('heroTitle');
+  const copy=document.getElementById('heroCopy');
+  const what=document.getElementById('heroWhat');
+  const prompt=document.getElementById('heroPrompt');
+  const grid=document.getElementById('heroGrid');
+  grid.textContent='';
+  wrap.classList.remove('hidden');
+  if(isHyperliquidIntent(i)){
+    const text=(i.policy_lines||[]).join('\n');
+    const isSession=(i.canonical_subject||{}).kind==='hyperliquid_agent_session_grant';
+    title.textContent=isSession?'Let Bloom trade on Hyperliquid?':'Approve this Hyperliquid action?';
+    copy.textContent=isSession
+      ?'Bloom can place trades only within the limits shown below. It cannot withdraw your funds.'
+      :'Bloom will sign one Hyperliquid action after this review.';
+    heroStat(grid,'Wallet',i.wallet||'Unknown');
+    heroStat(grid,'Markets',lineValue(text,'allowed_assets')||'Not stated');
+    heroStat(grid,'Duration',sessionDurationText(lineValue(text,'max_session_secs')));
+    heroStat(grid,'Max Order',lineValue(text,'max_notional_usd')||'Not stated');
+    heroStat(grid,'Max Position',lineValue(text,'max_position_usd')||'Not stated');
+    heroStat(grid,'Max Loss',lineValue(text,'max_loss_usd')||'Not stated');
+    what.textContent=isSession
+      ?'Bloom creates a trade-only Hyperliquid key. That key can trade within these limits until it expires or you stop it.'
+      :'Bloom will submit exactly one Hyperliquid action. This does not grant an open-ended trading session.';
+    prompt.textContent='Your device will ask you to confirm. The important details are the limits on this page.';
+    return;
+  }
+  if(isPolicyIntent(i)){
+    title.textContent='Set wallet safety rules';
+    copy.textContent='Choose how much Bloom can do later. Signing this does not move money right now.';
+    heroStat(grid,'Wallet',i.wallet||'Unknown');
+    heroStat(grid,'Money moves now','No');
+    heroStat(grid,'Can change later','Yes');
+    what.textContent='You are approving the rules Bloom will use later when deciding what is allowed.';
+    prompt.textContent='Your device will ask you to confirm this page. The rules below are what matter.';
+    return;
+  }
+  if(i.kind==='wallet_unlock'){
+    title.textContent='Use this wallet now?';
+    copy.textContent='Bloom will unlock this wallet for the command you just started. This does not approve a trade or transfer by itself.';
+    heroStat(grid,'Wallet',i.wallet||'Unknown');
+    heroStat(grid,'Money moves now','No');
+    heroStat(grid,'Use','This command only');
+    what.textContent='Bloom can use the wallet key in this foreground command after you confirm.';
+    prompt.textContent='Your device will ask you to confirm you are present.';
+    return;
+  }
+  title.textContent=i.title||'Approve this action?';
+  copy.textContent='Review what Bloom will do before continuing.';
+  heroStat(grid,'Wallet',i.wallet||'Unknown');
+  heroStat(grid,'Money moves now','Review below');
+  what.textContent='Bloom will proceed only with the action shown on this page.';
+  prompt.textContent='Your device will ask you to confirm you are present.';
 }
 function renderSimplePolicy(text){
   const parent=document.getElementById('policySimple');
@@ -343,17 +520,17 @@ function renderSimplePolicy(text){
   const routers=arrayValues(defi,'allowed_routers');
   const calldata=boolValue(defi,'require_calldata_verification');
   let modeText='Bloom must ask before moving money.';
-  if(mode==='prompt_all') modeText='Bloom must ask you before every money-moving action. The policy still blocks actions outside these guardrails.';
-  if(mode==='under_policy') modeText='Bloom may act by itself only when the action fits these guardrails.';
-  simpleCard(parent,mode==='under_policy'?'Autonomy':'Approval',modeText);
+  if(mode==='prompt_all') modeText='Bloom must ask before money moves.';
+  if(mode==='under_policy') modeText='Bloom can act later only when every rule says yes.';
+  simpleCard(parent,'Choice',modeText);
   if(mode==='prompt_all'){
-    simpleCard(parent,'Hard stops','Bloom can still refuse actions outside these safety limits, even if you later approve.');
+    simpleCard(parent,'Hard stops','Bloom refuses actions outside these limits.');
     simpleCard(parent,'Allowed receivers',shortAddressList(receivers));
     simpleCard(parent,'Safety check',calldata===false?'Calldata verification is off for matching DeFi routes.':'Calldata verification is on. Bloom refuses routes it cannot verify.');
     simpleCard(parent,'Native coin cap','Refuse native coin value above '+(lineValue(caps,'max_value_eth')||'no cap')+'.');
     return;
   }
-  simpleCard(parent,'DeFi swaps',boolValue(defi,'enabled')===false?'Swaps are off.':'Swaps may start on '+(sources.join(', ')||'no chain listed')+' and end on '+(dests.join(', ')||'no chain listed')+'.');
+  simpleCard(parent,'Swaps',boolValue(defi,'enabled')===false?'Swaps are off.':'Allowed from '+(sources.join(', ')||'no chain listed')+' to '+(dests.join(', ')||'no chain listed')+'.');
   simpleCard(parent,'Allowed receivers',shortAddressList(receivers));
   simpleCard(parent,'Allowed routers',shortAddressList(routers));
   simpleCard(parent,'Safety check',calldata===false?'Calldata verification is off. Bloom must rely on the quoted route staying inside the policy.':'Calldata verification is on. Bloom refuses routes it cannot verify.');
@@ -362,7 +539,15 @@ function renderSimplePolicy(text){
 }
 function setSelectedAutonomy(mode){
   document.querySelectorAll('[data-autonomy-mode]').forEach(function(btn){
-    btn.classList.toggle('selected',btn.getAttribute('data-autonomy-mode')===mode);
+    const selected=btn.getAttribute('data-autonomy-mode')===mode;
+    btn.classList.toggle('selected',selected);
+    btn.setAttribute('aria-pressed',selected?'true':'false');
+  });
+}
+function setSavingAutonomy(mode,on){
+  document.querySelectorAll('[data-autonomy-mode]').forEach(function(btn){
+    btn.classList.toggle('saving',on&&btn.getAttribute('data-autonomy-mode')===mode);
+    btn.disabled=!!on;
   });
 }
 function classifyWebauthnError(e){
@@ -388,24 +573,39 @@ async function loadIntent(){
   const data=await(await fetch('/intent.json')).json();
   const i=data.intent||{};
   CURRENT_INTENT=i;
+  EDITABLE_POLICY=!!data.editable_policy;
   document.getElementById('title').textContent=i.title||'Review passkey action';
   document.getElementById('wallet').textContent=i.wallet||'unknown';
   setLinked('address',i.wallet_address||'-');
   document.getElementById('kind').textContent=i.kind||'unknown';
   document.getElementById('hash').textContent=data.intent_hash||'-';
+  document.getElementById('advancedWallet').textContent=i.wallet||'unknown';
+  setLinked('advancedAddress',i.wallet_address||'-');
+  document.getElementById('advancedKind').textContent=i.kind||'unknown';
+  document.getElementById('advancedHash').textContent=data.intent_hash||'-';
+  renderHero(i);
+  document.getElementById('identityWrap').classList.add('hidden');
+  document.getElementById('actionWrap').classList.toggle(
+    'hidden',
+    isPolicyIntent(i)||i.kind==='wallet_unlock'
+  );
   const summary=document.getElementById('summary');
   summary.textContent='';
   if(isPolicyIntent(i)){
-    li(summary,'You are reviewing wallet rules for '+(i.wallet||'this wallet')+'.');
-    li(summary,'This does not move money or place a trade.');
-    li(summary,'After approval, Bloom uses these rules to decide what is allowed.');
+    li(summary,'You are setting rules for '+(i.wallet||'this wallet')+'.');
+    li(summary,'No money moves when you sign these rules.');
   }else{
     (i.summary_lines&&i.summary_lines.length?i.summary_lines:['No action summary was provided.']).forEach(x=>li(summary,x));
   }
   if(i.policy_lines&&i.policy_lines.length){
     document.getElementById('policyWrap').classList.remove('hidden');
     if(isPolicyIntent(i)){
-      document.getElementById('policyDecision').classList.remove('hidden');
+      document.getElementById('policyDecision').classList.toggle('hidden',!EDITABLE_POLICY);
+      document.getElementById('policyEditNotice').classList.toggle('hidden',EDITABLE_POLICY);
+    }else if(isHyperliquidIntent(i)){
+      document.getElementById('policyTitle').textContent='Trading Bounds';
+      document.getElementById('rawPolicyDetails').open=false;
+      document.getElementById('rawPolicyDetails').querySelector('summary').textContent='Technical details';
     }else{
       document.getElementById('policyTitle').textContent='Transaction Details';
       document.getElementById('rawPolicyDetails').open=true;
@@ -414,11 +614,15 @@ async function loadIntent(){
     const policy=document.getElementById('policy');
     policy.textContent='';
     i.policy_lines.forEach((x,idx)=>policyLine(policy,x,idx+1));
-    renderSimplePolicy(i.policy_lines.join('\n'));
-    setSelectedAutonomy(getAutonomyMode(i.policy_lines.join('\n')));
+    if(isHyperliquidIntent(i)){
+      renderHyperliquidReview(i.policy_lines.join('\n'),i.canonical_subject||{});
+    }else{
+      renderSimplePolicy(i.policy_lines.join('\n'));
+      setSelectedAutonomy(getAutonomyMode(i.policy_lines.join('\n')));
+    }
   }
   if(i.risk_lines&&i.risk_lines.length){
-    document.getElementById('riskWrap').classList.remove('hidden');
+    document.getElementById('riskWrap').classList.toggle('hidden',i.kind==='wallet_unlock');
     const risk=document.getElementById('risk');
     risk.textContent='';
     i.risk_lines.forEach(x=>li(risk,x));
@@ -433,20 +637,32 @@ async function loadIntent(){
     document.getElementById('subjectWrap').classList.remove('hidden');
     document.getElementById('subject').textContent=JSON.stringify(i.canonical_subject,null,2);
   }
-  st.textContent='Compare the intent hash with the terminal, then approve to open the passkey prompt.';
-  document.getElementById('approve').disabled=false;
+  const approve=document.getElementById('approve');
+  approve.textContent=buttonLabelForIntent(i);
+  if(isHyperliquidIntent(i)){
+    st.textContent='Review the trading bounds above. The next OS prompt only confirms bloom/localhost.';
+  }else if(isPolicyIntent(i)){
+    st.textContent=EDITABLE_POLICY
+      ?'Choose the approval mode, review the plain-language summary, then sign.'
+      :'Review the plain-language summary. This page signs the policy exactly as shown.';
+  }else{
+    st.textContent='Review the authorization above, then continue to the passkey prompt.';
+  }
+  approve.disabled=false;
 }
 async function run(){
   const st=document.getElementById('status');
   const approve=document.getElementById('approve');
+  const normalLabel=buttonLabelForIntent(CURRENT_INTENT||{});
   approve.disabled=true;
   approve.textContent='Waiting...';
   if(!navigator.credentials||!navigator.credentials.get){
     st.className='err';
     st.textContent='WebAuthn is not available in this browser. Try Chrome or Safari on this device.';
-    approve.textContent='Approve and Continue';
+    approve.textContent=normalLabel;
     return;
   }
+  PASSKEY_FLOW_ACTIVE=true;
   try{
     await fetch('/reviewed',{method:'POST',headers:{'x-bloom-token':TK}});
     const opts=await(await fetch('/challenge')).json();
@@ -510,8 +726,10 @@ async function run(){
       approve.textContent='Retry Passkey';
       st.textContent+=' The action has not been signed. Check the review hash and retry from this page.';
     }else{
-      approve.textContent='Approve and Continue';
+      approve.textContent=normalLabel;
     }
+  }finally{
+    PASSKEY_FLOW_ACTIVE=false;
   }
 }
 document.getElementById('approve').addEventListener('click',function(){
@@ -524,13 +742,22 @@ document.getElementById('reject').addEventListener('click',function(){
 });
 document.querySelectorAll('[data-autonomy-mode]').forEach(function(btn){
   btn.addEventListener('click',async function(){
+    if(!EDITABLE_POLICY){
+      const st=document.getElementById('status');
+      st.className='err';
+      st.textContent='This policy review is not editable. Close this tab, edit policy.toml, then run sign-policy again.';
+      return;
+    }
     const mode=btn.getAttribute('data-autonomy-mode');
     const st=document.getElementById('status');
     const previous=getAutonomyMode(currentPolicyText());
     setSelectedAutonomy(mode);
+    setSavingAutonomy(mode,true);
     document.getElementById('approve').disabled=true;
-    st.className='';
-    st.textContent='Updating policy choice...';
+    st.className='ok';
+    st.textContent=mode==='prompt_all'
+      ?'Selected: Bloom must ask before every money-moving action. Saving choice...'
+      :'Selected: Bloom may act only inside these signed rules. Saving choice...';
     try{
       const r=await fetch('/policy-autonomy',{method:'POST',headers:{'Content-Type':'application/json','x-bloom-token':TK},body:JSON.stringify({mode:mode})});
       if(!r.ok){
@@ -539,22 +766,28 @@ document.querySelectorAll('[data-autonomy-mode]').forEach(function(btn){
           const body=await r.json();
           if(body&&body.error) err=body.error;
         }catch(_e){}
+        setSavingAutonomy(mode,false);
         setSelectedAutonomy(previous);
+        document.getElementById('approve').disabled=false;
         st.className='err';
         st.textContent=err;
         return;
       }
       await loadIntent();
+      setSavingAutonomy(mode,false);
       st.className='ok';
-      st.textContent='Updated. Review the simple summary and hash, then approve or reject.';
+      st.textContent='Saved. Review the summary, then approve or reject.';
     }catch(e){
+      setSavingAutonomy(mode,false);
       setSelectedAutonomy(previous);
+      document.getElementById('approve').disabled=false;
       st.className='err';
       st.textContent='Could not update policy choice: '+(e&&e.message?e.message:e);
     }
   });
 });
 window.addEventListener('unhandledrejection',function(e){
+  if(!PASSKEY_FLOW_ACTIVE) return;
   const st=document.getElementById('status');
   st.className='err';
   st.textContent='Error: '+classifyWebauthnError(e.reason||e);

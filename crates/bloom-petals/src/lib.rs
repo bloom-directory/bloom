@@ -4,15 +4,10 @@
 //! `~/.bloom/petals`. Local plugin packages are v2 apps mounted through
 //! the `apps/` VFS router. Raw single-WASM local petal installation and
 //! execution is intentionally unsupported.
-//!
-//! The `chain_vm` module provides `PetalMode::Chain` for deterministic
-//! smart-contract execution under bloom-chain BFT consensus (chain spec
-//! §7.5–§7.9).
 
 #![forbid(unsafe_code)]
 
 pub mod abi;
-pub mod chain_vm;
 pub mod error;
 pub mod host;
 pub mod meta;
@@ -32,7 +27,6 @@ pub use abi::{
     encode_dispatch_request, encode_dispatch_response, encode_http_request, encode_http_response,
     encode_sign_request, encode_string_list,
 };
-pub use chain_vm::{BlockCtx, ChainCallInput, ChainCallOutput, ChainCtx, ChainEntry, LogEntry};
 pub use error::PetalError;
 pub use host::{DenyHost, HostError, HostVfsEntry, HostVfsEntryKind, PetalHost};
 pub use meta::{Capability, PetalMeta, PetalMode};

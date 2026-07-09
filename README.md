@@ -1,5 +1,7 @@
 <p align="center">
-  <img src="docs/assets/bloom-wordmark.png" alt="Bloom" width="420">
+  <a href="https://bloom.directory">
+    <img src="docs/assets/bloom-wordmark.png" alt="Bloom">
+  </a>
 </p>
 
 <p align="center">
@@ -32,13 +34,13 @@ network broadcasts are blocked, but reads, simulations, local devnet flows,
 and any explicitly enabled broadcast paths should still be treated as
 high-risk until the code has been independently audited.
 
-The shortest onboarding path is:
+The shortest agent setup path is:
 
 > Tell your agent: **"Read https://bloom.directory/SKILL.md and set up Bloom."**
 
-After that, your agent should know to mount Bloom, inspect the Bloom
-directory, explain what it can do, and use Bloom instead of writing
-custom Web3 SDK code.
+After that, your agent should know to create or inspect a wallet, show the
+deposit address, mount Bloom, inspect the Bloom directory, explain what it can
+do, and use Bloom instead of writing custom Web3 SDK code.
 
 ## What Bloom enables
 
@@ -50,6 +52,9 @@ Bloom gives an agent a safe wallet workspace:
   the filesystem;
 - stage native ETH, ERC-20, NFT, contract-call, signing, and DeFi
   intents by writing plain-language or structured files;
+- stage free or paid HTTP requests through `/requests`, including HTTP
+  402 payment flows that are reviewed before x402 or Tempo MPP credentials
+  are signed;
 - inspect a generated `plan.md` before anything is signed;
 - confirm a staged transaction only after user approval;
 - enforce policy: spend caps, allow/deny lists, contract-call gates,
@@ -88,6 +93,18 @@ If you cannot mount on the current machine, use the developer fallback:
 cargo run -p bloom -- vfs ls /
 cargo run -p bloom -- vfs cat /docs/README.md
 cargo run -p bloom -- vfs cat /chains/ethereum/head/number
+```
+
+Bloom can also stage HTTP requests. Free responses are stored directly; paid
+HTTP 402 responses produce a plan and require confirmation before any payment
+credential is signed:
+
+```sh
+cargo run -p bloom -- vfs write /requests/new \
+  --data 'GET https://api.example.com/data wallet=research max_amount_usd=0.05'
+cargo run -p bloom -- vfs cat /requests/latest/plan.md
+cargo run -p bloom -- vfs write /requests/latest/confirm --data confirm
+cargo run -p bloom -- vfs cat /requests/latest/response/body
 ```
 
 For the full wallet walkthrough, read
@@ -135,6 +152,13 @@ A fresh Bloom VFS root exposes these default entries:
 - `petals/` — installed petal packages and petal-backed surfaces.
 - `public/` — public chain/petal-facing read surfaces.
 - `tx/` — transaction-oriented helper surface.
+- `requests/` — free and paid HTTP requests. Paid HTTP 402 challenges are
+  staged under `pending/`, exposed as `plan.md`, and only signed after a
+  confirm write.
+- `polymarket/` — Polymarket market/account reads, onboarding, trade draft
+  review, and pUSD funding request staging. Funding requests can be executed
+  through foreground `bloom vfs write --unlock-wallet`; trade drafts can be
+  posted the same way at `/polymarket/trade/<wallet>/drafts/<id>/confirm`.
 - `status/` — daemon health, chain probes, audit head/count, cache
   counts, policy flags, wallet/outbox counts, and backend declarations.
 - `docs/` — in-tree help, vendored from `crates/bloom-vfs/src/docs/`.
@@ -146,7 +170,9 @@ the wallet outbox.
 
 See [QUICKSTART.md](./QUICKSTART.md) for an Anvil-backed walkthrough
 and [docs/AUDIT.md](./docs/AUDIT.md) for the per-surface implementation
-map and live-network verification log.
+map and live-network verification log. See
+[docs/parity/VFS_CLI_PARITY_LEDGER.md](./docs/parity/VFS_CLI_PARITY_LEDGER.md)
+for the current VFS/CLI workflow parity matrix.
 
 ## Architecture
 
@@ -157,7 +183,7 @@ Bloom is a Rust Cargo workspace. The main user-facing/runtime crates are:
 | `bloom` | CLI binary; thin client plus in-process daemon driver. |
 | `bloom-daemon` | Wires home dir, config, chains, keystore, VFS, IPC, ENS, watches, and optional feature adapters. |
 | `bloom-vfs` | Path router, handler trait, per-path caching, and vendored docs. |
-| `bloom-chain` / `bloom-rpc` | RPC pools, per-chain engines, chain reads, and provider health. |
+| `bloom-evm` / `bloom-rpc` | RPC pools, per-chain engines, chain reads, and provider health. |
 | `bloom-tx` | Tx staging, simulation, signing, broadcast, nonce management, and policy enforcement. |
 | `bloom-keystore` | Encrypted local key storage and signer integration. |
 | `bloom-mempool` | Optional pending-transaction indexing for configured WebSocket providers. |
@@ -191,6 +217,11 @@ and example crates used by the broader Bloom runtime and examples.
 - **Policy enforcement before signing.** Per-wallet `policy.toml`
   enforces caps, recipient allow/deny lists, contract-call gates,
   private orderflow settings, and automation thresholds.
+- **Passkey policy review is plain-language first.** `bloom wallet
+  sign-policy <wallet>` opens a local review page where the user chooses
+  whether Bloom must ask before every money-moving action or may act later
+  only when the action passes the signed policy. Technical hashes and raw
+  policy TOML stay behind advanced details.
 - **Private orderflow is opt-in and fail-closed.** On unsupported
   chains, private broadcast returns an error instead of silently falling
   back to public RPC.
@@ -212,7 +243,7 @@ and example crates used by the broader Bloom runtime and examples.
   feeds are wired at daemon startup. The generic `eth_subscribe` path
   exists in `bloom-mempool` but is not enabled by default until tx-body
   enrichment is complete.
-- **Watch executor is poll-based.** `bloom-chain` is HTTP-first, so the
+- **Watch executor is poll-based.** `bloom-evm` is HTTP-first, so the
   executor polls on an interval rather than using a WebSocket fast path.
 - **NFT support has sharp edges.** Reads cover holder and collection
   views; writes flow through wallet outbox intents. ERC-1155 per-token

@@ -31,7 +31,9 @@ do not).
 13. [Addressbook](#13-addressbook)
 14. [Status, audit, RPC endpoints](#14-status-audit-rpc-endpoints)
 15. [Docs (vendored)](#15-docs-vendored)
-16. [Address reference](#16-address-reference)
+16. [Hyperliquid trading](#16-hyperliquid-trading)
+17. [Polymarket trading](#17-polymarket-trading)
+18. [Address reference](#18-address-reference)
 
 ---
 
@@ -126,8 +128,9 @@ cat /bloom/chains/ethereum/head/full.json | jq '.header.baseFeePerGas'
 
 ```sh
 # vitalik.eth
-cat /bloom/chains/ethereum/addresses/0xd8dA6BF26964aF9D7eeD9e03E53415D37aA96045/balance       # wei (decimal)
-cat /bloom/chains/ethereum/addresses/0xd8dA6BF26964aF9D7eeD9e03E53415D37aA96045/balance.eth   # "1.234 ETH"
+cat /bloom/chains/ethereum/addresses/0xd8dA6BF26964aF9D7eeD9e03E53415D37aA96045/balance       # "1.234 ETH" (display, with symbol)
+cat /bloom/chains/ethereum/addresses/0xd8dA6BF26964aF9D7eeD9e03E53415D37aA96045/balance.raw   # wei (integer base units)
+cat /bloom/chains/ethereum/addresses/0xd8dA6BF26964aF9D7eeD9e03E53415D37aA96045/balance.json  # { symbol, decimals, raw, formatted, display }
 cat /bloom/chains/ethereum/addresses/0xd8dA6BF26964aF9D7eeD9e03E53415D37aA96045/nonce
 cat /bloom/chains/ethereum/addresses/0xd8dA6BF26964aF9D7eeD9e03E53415D37aA96045/code          # 0x for EOA
 cat /bloom/chains/ethereum/addresses/0xd8dA6BF26964aF9D7eeD9e03E53415D37aA96045/is_contract   # true / false
@@ -148,13 +151,13 @@ Allowances are not exposed here — read them via the token contract's
 
 ```sh
 ls /bloom/chains/ethereum/addresses/0xd8dA6BF26964aF9D7eeD9e03E53415D37aA96045/tokens/0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48/
-# → balance, balance.raw, balance.formatted, symbol, decimals
+# → balance, balance.raw, balance.json, symbol, decimals
 
-cat /bloom/chains/ethereum/addresses/0xd8dA6BF26964aF9D7eeD9e03E53415D37aA96045/tokens/0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48/balance.formatted   # "1234.56 USDC"
+cat /bloom/chains/ethereum/addresses/0xd8dA6BF26964aF9D7eeD9e03E53415D37aA96045/tokens/0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48/balance   # "1234.56 USDC" (display, with symbol)
 cat /bloom/chains/ethereum/addresses/0xd8dA6BF26964aF9D7eeD9e03E53415D37aA96045/tokens/0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2/symbol            # → WETH
 
 # Same shape on Base (USDC on Base):
-cat /bloom/chains/base/addresses/0xd8dA6BF26964aF9D7eeD9e03E53415D37aA96045/tokens/0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913/balance.formatted
+cat /bloom/chains/base/addresses/0xd8dA6BF26964aF9D7eeD9e03E53415D37aA96045/tokens/0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913/balance
 ```
 
 ### Transactions and receipts
@@ -620,9 +623,9 @@ cat /bloom/wallets/alice/kind             # local | watch
 cat /bloom/wallets/alice/policy.toml      # current policy
 
 # Per-chain native balance + nonce.
-cat /bloom/wallets/alice/chains/base/balance       # raw wei
-cat /bloom/wallets/alice/chains/base/balance.eth   # human "0.123 ETH"
-cat /bloom/wallets/alice/chains/base/balance.raw
+cat /bloom/wallets/alice/chains/base/balance       # human "0.123 ETH" (display, with symbol)
+cat /bloom/wallets/alice/chains/base/balance.raw   # raw wei (integer base units)
+cat /bloom/wallets/alice/chains/base/balance.json  # { symbol, decimals, raw, formatted, display }
 cat /bloom/wallets/alice/chains/base/nonce
 ```
 
@@ -631,7 +634,7 @@ reader at `chains/<c>/addresses/<addr>/tokens/<token>/...`:
 
 ```sh
 ALICE=$(cat /bloom/wallets/alice/address)
-cat /bloom/chains/base/addresses/$ALICE/tokens/0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913/balance.formatted
+cat /bloom/chains/base/addresses/$ALICE/tokens/0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913/balance
 ```
 
 ### Signing
@@ -720,13 +723,13 @@ cat <<'EOF' > /bloom/wallets/alice/chains/anvil/outbox/new.tx
 }
 EOF
 
-# ERC-20 transfer (token + value with a unit triggers ERC-20 encoding).
+# ERC-20 transfer (token + amount triggers ERC-20 encoding).
 # Below: send 10 USDC on Base to a test recipient.
 cat <<'EOF' > /bloom/wallets/alice/chains/base/outbox/new.tx
 {
   "kind": "send",
   "to": "0x70997970C51812dc3A010C7d01b50e0d17dc79C8",
-  "value": "10",
+  "amount": "10",
   "token": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
   "chain": "base"
 }
@@ -1499,7 +1502,155 @@ just by `cat`ing them again.
 
 ---
 
-## 16. Address reference
+## 16. Hyperliquid trading
+
+Hyperliquid perp and spot trading surface. Mounted when the `[hyperliquid]`
+block is present in `config.toml`. Reads are always safe; writes require either
+an agent session (RECOMMENDED) or an unlocked wallet for direct exchange
+writes (ADVANCED). Read `/hyperliquid/README.md` for the full safety
+model and agent guidance.
+
+### Discovery
+
+```sh
+ls /bloom/hyperliquid/mainnet/
+# mids.json  perp_meta.json  spot_meta.json  books/  candles/
+# exchange/  agent_sessions/  users/  README.md  ASSET_IDS.md
+cat /bloom/hyperliquid/mainnet/README.md
+```
+
+### Market data (reads, no wallet)
+
+```sh
+# All prices
+cat /bloom/hyperliquid/mainnet/mids.json | jq '.[0:3]'
+
+# Order book
+cat /bloom/hyperliquid/mainnet/books/BTC.json
+
+# Perp metadata
+cat /bloom/hyperliquid/mainnet/perp_meta.json
+
+# Candles (coin, interval in ["15m","1h","4h","1d"])
+cat /bloom/hyperliquid/mainnet/candles/ETH.json
+# {"interval":"1h","candles":[{"t":...,"o":"...","h":"...","l":"...","c":"..."}]}
+
+# User account state
+cat /bloom/hyperliquid/mainnet/users/0xYourAddress/clearinghouse.json
+cat /bloom/hyperliquid/mainnet/users/0xYourAddress/open_orders.json
+cat /bloom/hyperliquid/mainnet/users/0xYourAddress/fills.json
+```
+
+### Automated trading via agent session (RECOMMENDED)
+
+One `approveAgent` ceremony creates an ephemeral trading key. The agent
+trades inside policy bounds without further prompts. Sessions auto-expire
+and auto-flatten on risk breach.
+
+```sh
+# 1) Owner unlocks (one time)
+bloom wallet unlock <wallet>
+
+# 2) Create the session (one approveAgent signature)
+echo '{}' > /bloom/hyperliquid/mainnet/agent_sessions/<wallet>/new.json
+# 3) Trade through the session
+echo '{"asset":"ETH","is_buy":true,"order_type":"Limit",
+  "price":"3000","sz":"0.01","reduce_only":false}' \
+  > /bloom/hyperliquid/mainnet/agent_sessions/<wallet>/<session>/order.json
+
+# 4) Inspect session status
+cat /bloom/hyperliquid/mainnet/agent_sessions/<wallet>/<session>/status.json
+
+# 5) Stop the session early
+echo stop > /bloom/hyperliquid/mainnet/agent_sessions/<wallet>/<session>/stop
+```
+
+### Direct exchange writes (ADVANCED)
+
+Owner-signed one-off actions. Requires the wallet to stay unlocked.
+
+```sh
+echo '{"asset":"ETH","is_buy":true,"order_type":"Limit",
+  "price":"3000","sz":"0.01","reduce_only":false}' \
+  > /bloom/hyperliquid/mainnet/exchange/<wallet>/order.json
+
+echo '{"asset":"ETH","is_cross":false,"leverage":5}' \
+  > /bloom/hyperliquid/mainnet/exchange/<wallet>/update_leverage.json
+```
+
+---
+
+## 17. Polymarket trading
+
+Prediction-market trading via the `bloom polymarket ...` CLI plus the
+`/polymarket/` VFS surface. VFS can stage trade drafts and pUSD funding
+requests; funding requests can be confirmed with foreground
+`bloom vfs write --unlock-wallet`. Trade drafts can be posted through the same
+foreground VFS pattern, which dispatches to the same execution path as
+`bloom polymarket confirm`. Read `/polymarket/README.md` for the full safety
+model.
+
+### Quick path
+
+```sh
+# 1) Onboard (one-time, human-present)
+bloom polymarket onboard <wallet>
+
+# 2) Fund (send pUSD to the deposit wallet)
+bloom polymarket fund <wallet> --target-pusd 10 --max-spend 100
+
+# Or stage/review a funding request through VFS, then execute the same request
+# through the foreground CLI VFS path.
+bloom vfs write /polymarket/fund/<wallet>/new \
+  --data '{"target_pusd":"10","max_spend":"100","from_token":"native","slippage_bps":50}'
+cat /bloom/polymarket/fund/<wallet>/<fund-id>/plan.md
+bloom vfs write /polymarket/fund/<wallet>/<fund-id>/confirm \
+  --unlock-wallet <wallet> \
+  --data confirm
+
+# 3) Stage a draft in the VFS
+echo '{"slug":"will-canada-win-2026-world-cup-755",
+  "outcome":"yes","amount":"1","max_price":"0.01"}' \
+  > /bloom/polymarket/trade/<wallet>/new
+
+cat /bloom/polymarket/trade/<wallet>/drafts/<id>/plan.md
+
+# 4) Confirm (requires unlock or passkey ceremony per trade)
+bloom vfs write /polymarket/trade/<wallet>/drafts/<id>/confirm \
+  --unlock-wallet <wallet> \
+  --data confirm
+
+# Equivalent dedicated CLI command:
+bloom polymarket confirm <wallet> <id>
+
+# 5) Cancel a resting order — risk-reducing, runs directly in the VFS (no unlock)
+bloom vfs write /polymarket/trade/<wallet>/orders/<order-id> \
+  --data confirm
+# Equivalent: bloom polymarket cancel <wallet> <order-id>
+
+# 6) Exit actions after resolution (owner-signed → foreground CLI VFS path)
+bloom polymarket redeem <wallet> <slug> --dry-run        # print the plan first
+bloom vfs write /polymarket/redeem/<wallet>/<slug>/confirm \
+  --unlock-wallet <wallet> --data confirm
+# Equivalent: bloom polymarket redeem <wallet> <slug>
+
+bloom vfs write /polymarket/withdraw/<wallet>/pusd/confirm \
+  --unlock-wallet <wallet> \
+  --data '{"confirm":true,"amount":"all"}'
+# Equivalent: bloom polymarket withdraw-pusd <wallet> all
+
+bloom vfs write /polymarket/revoke-approvals/<wallet>/request/confirm \
+  --unlock-wallet <wallet> --data confirm
+# Equivalent: bloom polymarket revoke-approvals <wallet>
+```
+
+A Polymarket capability primitive (scoped approve, TTL, caps,
+bounded window without per-trade ceremony) is in active development — see
+`docs/plans/2026-06-20-agent-obvious-capability-model.md`.
+
+---
+
+## 18. Address reference
 
 All addresses below are real and live as of this writing. They appear
 in examples throughout the document; substitute your own as needed.

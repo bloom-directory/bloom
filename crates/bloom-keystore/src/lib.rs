@@ -28,7 +28,10 @@
 
 #![forbid(unsafe_code)]
 
+pub mod ephemeral;
 pub(crate) mod passkey;
+pub use passkey::{SealedCeremonyChallenge, client_data_challenge_b64};
+pub mod petal_host;
 pub mod xdsa;
 #[cfg(test)]
 mod xdsa_tests;
@@ -48,6 +51,9 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use zeroize::{Zeroize, Zeroizing};
 
+use bloom_auth_api::{
+    ApprovalSignatureVerifier, AuthApiError, UnsignedApproval, WebAuthnAssertionRecord,
+};
 use bloom_proto::{Policy, checksum_address};
 
 // ── errors ────────────────────────────────────────────────────────────────────
@@ -86,7 +92,7 @@ pub enum KeystoreError {
 
 /// Signing algorithm for a wallet.
 ///
-/// New wallets default to `Xdsa` (bloom-chain native).  Existing wallets
+/// New wallets default to `Xdsa` (bloom-evm native).  Existing wallets
 /// without an `algorithm` field in their envelope default to `Secp256k1`
 /// for backward compatibility.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -95,7 +101,7 @@ pub enum Algorithm {
     /// secp256k1 / ECDSA — Ethereum-interop wallets.
     #[default]
     Secp256k1,
-    /// Composite ML-DSA-65 + Ed25519 — bloom-chain native wallets.
+    /// Composite ML-DSA-65 + Ed25519 — bloom-evm native wallets.
     Xdsa,
 }
 
@@ -110,22 +116,21 @@ impl std::fmt::Display for Algorithm {
 
 /// An on-disk address that distinguishes the two key types.
 ///
-/// Ethereum wallets carry a 20-byte `Address`; bloom-chain xDSA wallets
-/// carry a 32-byte BLAKE3 digest derived from the composite public key per
-/// chain spec §4.3.
+/// Ethereum wallets carry a 20-byte `Address`; bloom-evm xDSA wallets
+/// carry a 32-byte BLAKE3 digest derived from the composite public key.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WalletAddress {
     /// 20-byte Ethereum-style address (secp256k1 wallets).
     Ethereum(Address),
-    /// 32-byte bloom-chain address (xDSA wallets).
-    BloomChain([u8; 32]),
+    /// 32-byte bloom-evm address (xDSA wallets).
+    BloomEvm([u8; 32]),
 }
 
 impl std::fmt::Display for WalletAddress {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             WalletAddress::Ethereum(a) => write!(f, "{}", checksum_address(a)),
-            WalletAddress::BloomChain(b) => write!(f, "{}", hex::encode(b)),
+            WalletAddress::BloomEvm(b) => write!(f, "{}", hex::encode(b)),
         }
     }
 }
@@ -168,7 +173,7 @@ fn is_secp256k1(a: &Algorithm) -> bool {
     *a == Algorithm::Secp256k1
 }
 
-/// Argon2id parameters for xDSA keystore (spec §4 / chain spec §13).
+/// Argon2id parameters for xDSA keystore.
 const XDSA_ARGON2_M_COST: u32 = 65536; // 64 MiB
 const XDSA_ARGON2_T_COST: u32 = 3;
 const XDSA_ARGON2_P_COST: u32 = 4;
@@ -272,11 +277,11 @@ impl XdsaWallet {
         self.secret.sign(msg)
     }
 
-    /// The wallet's 32-byte bloom-chain address bytes.
+    /// The wallet's 32-byte bloom-evm address bytes.
     pub fn address_bytes(&self) -> [u8; 32] {
         match &self.address {
-            WalletAddress::BloomChain(b) => *b,
-            _ => unreachable!("xDSA wallet always has a BloomChain address"),
+            WalletAddress::BloomEvm(b) => *b,
+            _ => unreachable!("xDSA wallet always has a bloom-evm address"),
         }
     }
 }
@@ -328,7 +333,7 @@ pub fn create_xdsa_wallet(
             .as_bytes(),
     )?;
 
-    Ok((WalletAddress::BloomChain(addr_bytes), pk))
+    Ok((WalletAddress::BloomEvm(addr_bytes), pk))
 }
 
 /// Load and decrypt an xDSA wallet from disk.
@@ -357,7 +362,7 @@ pub fn load_xdsa_wallet(
 
     Ok(XdsaWallet {
         name: name.into(),
-        address: WalletAddress::BloomChain(addr_bytes),
+        address: WalletAddress::BloomEvm(addr_bytes),
         public_key: pk,
         secret: sk,
     })
@@ -385,6 +390,22 @@ impl std::fmt::Display for WalletKind {
             WalletKind::PasskeyGated => f.write_str("passkey"),
         }
     }
+}
+
+/// Signature state of a wallet's `policy.toml`, for display surfaces.
+/// Unlike [`Keystore::info`], reading this never fails on an unsigned or
+/// stale policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PolicyStatus {
+    /// PasskeyGated wallet with a policy whose signature matches.
+    Signed,
+    /// PasskeyGated wallet has policy content but no `policy.toml.sig`.
+    Unsigned,
+    /// PasskeyGated wallet's signature does not match the current policy.
+    Stale,
+    /// Wallet kind does not require a signed policy, or has no policy.
+    NotApplicable,
 }
 
 // ── public types ──────────────────────────────────────────────────────────────
@@ -502,7 +523,10 @@ impl Keystore {
             })?;
             if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
                 if let Some(name) = entry.file_name().to_str() {
-                    match self.info(name) {
+                    // Listings use the unverified read so a passkey wallet with
+                    // an unsigned/stale policy stays visible — hiding it is what
+                    // led an agent to mistake a deposit wallet for the owner.
+                    match self.info_unverified(name) {
                         Ok(info) => out.push(info),
                         Err(e) => {
                             tracing::debug!(
@@ -554,7 +578,11 @@ impl Keystore {
         Ok((content, kind))
     }
 
-    pub fn info(&self, name: &str) -> Result<WalletInfo, KeystoreError> {
+    /// Wallet identity + parsed policy **without** verifying the passkey
+    /// policy signature. Read-only surfaces (address, balances, listings) use
+    /// this so an unsigned/stale `policy.toml` never blocks a read — the
+    /// signature is a write-time authorization control, enforced by [`info`].
+    pub fn info_unverified(&self, name: &str) -> Result<WalletInfo, KeystoreError> {
         Self::validate_name(name)?;
         let dir = self.wallet_path(name);
         if !dir.exists() {
@@ -577,7 +605,6 @@ impl Keystore {
             other => return Err(KeystoreError::Malformed(format!("kind: {other}"))),
         };
 
-        // Read policy content as string so we can verify the sig before parsing.
         let policy_content = if policy_path.exists() {
             fs::read_to_string(&policy_path).map_err(|source| KeystoreError::Io {
                 path: policy_path.clone(),
@@ -586,19 +613,6 @@ impl Keystore {
         } else {
             String::new()
         };
-
-        // Phase 2: verify policy.toml.sig for PasskeyGated wallets.
-        if kind == WalletKind::PasskeyGated && !policy_content.is_empty() {
-            let sig_path = dir.join("policy.toml.sig");
-            if sig_path.exists() {
-                passkey::verify_policy_sig(name, &policy_content, &address, &sig_path)?;
-            } else {
-                return Err(KeystoreError::Policy(
-                    "passkey wallet policy.toml is missing policy.toml.sig".into(),
-                ));
-            }
-        }
-
         let policy = if policy_content.is_empty() {
             Policy::default()
         } else {
@@ -614,6 +628,69 @@ impl Keystore {
             policy,
             recovery_key: None,
         })
+    }
+
+    /// Wallet identity + parsed policy, **verifying** the passkey policy
+    /// signature. Write/sign/broadcast paths use this: a `PasskeyGated` wallet
+    /// whose `policy.toml` is unsigned or modified-since-signed is rejected,
+    /// so a tampered policy cannot authorize a mutation.
+    pub fn info(&self, name: &str) -> Result<WalletInfo, KeystoreError> {
+        let info = self.info_unverified(name)?;
+        // Phase 2: verify policy.toml.sig for PasskeyGated wallets.
+        if info.kind == WalletKind::PasskeyGated {
+            let dir = self.wallet_path(name);
+            let policy_path = dir.join("policy.toml");
+            let policy_content = if policy_path.exists() {
+                fs::read_to_string(&policy_path).map_err(|source| KeystoreError::Io {
+                    path: policy_path.clone(),
+                    source,
+                })?
+            } else {
+                String::new()
+            };
+            if !policy_content.is_empty() {
+                let sig_path = dir.join("policy.toml.sig");
+                if sig_path.exists() {
+                    passkey::verify_policy_sig(name, &policy_content, &info.address, &sig_path)?;
+                } else {
+                    return Err(KeystoreError::Policy(
+                        "passkey wallet policy.toml is missing policy.toml.sig".into(),
+                    ));
+                }
+            }
+        }
+        Ok(info)
+    }
+
+    /// Signature state of a wallet's `policy.toml`, for *display*. Never errors
+    /// on an unsigned/stale policy (unlike [`info`]); local/watch wallets and
+    /// passkey wallets with no policy report [`PolicyStatus::NotApplicable`].
+    pub fn policy_status(&self, name: &str) -> Result<PolicyStatus, KeystoreError> {
+        let info = self.info_unverified(name)?;
+        if info.kind != WalletKind::PasskeyGated {
+            return Ok(PolicyStatus::NotApplicable);
+        }
+        let dir = self.wallet_path(name);
+        let policy_path = dir.join("policy.toml");
+        let policy_content = if policy_path.exists() {
+            fs::read_to_string(&policy_path).map_err(|source| KeystoreError::Io {
+                path: policy_path.clone(),
+                source,
+            })?
+        } else {
+            String::new()
+        };
+        if policy_content.is_empty() {
+            return Ok(PolicyStatus::NotApplicable);
+        }
+        let sig_path = dir.join("policy.toml.sig");
+        if !sig_path.exists() {
+            return Ok(PolicyStatus::Unsigned);
+        }
+        match passkey::verify_policy_sig(name, &policy_content, &info.address, &sig_path) {
+            Ok(()) => Ok(PolicyStatus::Signed),
+            Err(_) => Ok(PolicyStatus::Stale),
+        }
     }
 
     // ── create / import ───────────────────────────────────────────────────────
@@ -755,7 +832,7 @@ impl Keystore {
         // For passkey wallets check the signer is available BEFORE writing
         // anything, so disk stays consistent if the wallet is locked.
         if kind_str == "passkey" {
-            let _ = self.signer(name)?;
+            let _ = self.cached_signer(name)?;
         }
 
         write_atomic(&dir.join("policy.toml"), toml_bytes)?;
@@ -778,6 +855,17 @@ impl Keystore {
     }
 
     pub fn signer(&self, name: &str) -> Result<Arc<PrivateKeySigner>, KeystoreError> {
+        let info = self.info_unverified(name)?;
+        if info.kind == WalletKind::PasskeyGated {
+            return Err(KeystoreError::Signer(
+                "passkey wallet signing requires a Sealed Approval grant via PetalHost::sign_hash"
+                    .into(),
+            ));
+        }
+        self.cached_signer(name)
+    }
+
+    pub(crate) fn cached_signer(&self, name: &str) -> Result<Arc<PrivateKeySigner>, KeystoreError> {
         match self.inner.unlocked.read().get(name).cloned() {
             Some(s) => Ok(s),
             None => {
@@ -855,6 +943,36 @@ impl Keystore {
             policy: default_policy,
             recovery_key: None,
         })
+    }
+}
+
+#[derive(Clone)]
+pub struct KeystoreApprovalSignatureVerifier {
+    keystore: Keystore,
+}
+
+impl KeystoreApprovalSignatureVerifier {
+    pub fn new(keystore: Keystore) -> Self {
+        Self { keystore }
+    }
+}
+
+#[async_trait::async_trait]
+impl ApprovalSignatureVerifier for KeystoreApprovalSignatureVerifier {
+    async fn verify_signature(
+        &self,
+        unsigned: &UnsignedApproval,
+        webauthn_assertion: &WebAuthnAssertionRecord,
+        _now_ms: u64,
+    ) -> Result<(), AuthApiError> {
+        match self
+            .keystore
+            .verify_approval_signature_with_passkey(unsigned, webauthn_assertion)
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err(e) => Err(AuthApiError::Denied(e.to_string())),
+        }
     }
 }
 
@@ -1029,6 +1147,30 @@ mod tests {
         assert_eq!(s.address(), info.address);
         ks.lock("alice");
         assert!(!ks.is_unlocked("alice"));
+    }
+
+    #[test]
+    fn public_signer_rejects_passkey_wallet_even_when_cached() {
+        let (dir, ks) = temp_store();
+        let (_wallet_dir, _) = setup_passkey_dir(dir.path(), "pk-cached");
+        ks.inner
+            .unlocked
+            .write()
+            .insert("pk-cached".into(), Arc::new(PrivateKeySigner::random()));
+
+        let err = ks.signer("pk-cached").unwrap_err();
+        assert!(
+            matches!(err, KeystoreError::Signer(_)),
+            "expected passkey signer migration error, got: {err}"
+        );
+        assert!(
+            err.to_string().contains("PetalHost::sign_hash"),
+            "error should point to grant-backed host signing: {err}"
+        );
+        assert!(
+            ks.cached_signer("pk-cached").is_ok(),
+            "internal sealed/passkey paths can still use the cached signer"
+        );
     }
 
     #[test]
@@ -1284,6 +1426,75 @@ mod tests {
         assert!(
             err.to_string().contains("policy.toml.sig"),
             "error should mention missing signature: {err}"
+        );
+    }
+
+    /// Read-only path: an unsigned passkey policy blocks `info()` but
+    /// `info_unverified()` still returns identity, and the wallet reports
+    /// `Unsigned` rather than vanishing.
+    #[test]
+    fn passkey_info_unverified_tolerates_unsigned_policy() {
+        let (dir, ks) = temp_store();
+        let (wallet_dir, addr) = setup_passkey_dir(dir.path(), "readable-unsigned");
+        let policy_toml = toml::to_string_pretty(&bloom_proto::Policy::default()).unwrap();
+        write_atomic(&wallet_dir.join("policy.toml"), policy_toml.as_bytes()).unwrap();
+
+        assert!(
+            ks.info("readable-unsigned").is_err(),
+            "verified info must reject"
+        );
+        let info = ks
+            .info_unverified("readable-unsigned")
+            .expect("unverified read must succeed");
+        assert_eq!(info.address, addr);
+        assert_eq!(
+            ks.policy_status("readable-unsigned").unwrap(),
+            PolicyStatus::Unsigned
+        );
+    }
+
+    /// A passkey wallet with an unsigned/stale policy must remain visible in
+    /// `list()` — hiding it is what led an agent to mistake a deposit wallet
+    /// for the owner.
+    #[test]
+    fn list_includes_unsigned_passkey_wallet() {
+        let (dir, ks) = temp_store();
+        let (wallet_dir, _addr) = setup_passkey_dir(dir.path(), "listed-unsigned");
+        let policy_toml = toml::to_string_pretty(&bloom_proto::Policy::default()).unwrap();
+        write_atomic(&wallet_dir.join("policy.toml"), policy_toml.as_bytes()).unwrap();
+
+        let names: Vec<String> = ks.list().unwrap().into_iter().map(|i| i.name).collect();
+        assert!(
+            names.iter().any(|n| n == "listed-unsigned"),
+            "unsigned passkey wallet must still be listed, got: {names:?}"
+        );
+    }
+
+    /// `policy_status` distinguishes a signed policy, a tampered (stale) one,
+    /// and a non-passkey wallet.
+    #[test]
+    fn policy_status_reports_signed_stale_and_not_applicable() {
+        let (dir, ks) = temp_store();
+
+        // Signed: unlock + sign produces a matching signature.
+        make_unlocked_passkey_wallet(&ks, dir.path(), "signed-w");
+        ks.sign_policy("signed-w").unwrap();
+        assert_eq!(ks.policy_status("signed-w").unwrap(), PolicyStatus::Signed);
+
+        // Stale: transplant a signature from a different key.
+        let (victim_dir, _addr) = setup_passkey_dir(dir.path(), "stale-w");
+        let policy_toml = toml::to_string_pretty(&bloom_proto::Policy::default()).unwrap();
+        write_atomic(&victim_dir.join("policy.toml"), policy_toml.as_bytes()).unwrap();
+        let other_sig =
+            std::fs::read_to_string(dir.path().join("signed-w").join("policy.toml.sig")).unwrap();
+        std::fs::write(victim_dir.join("policy.toml.sig"), other_sig).unwrap();
+        assert_eq!(ks.policy_status("stale-w").unwrap(), PolicyStatus::Stale);
+
+        // Not applicable: a local wallet never requires a signed policy.
+        ks.create_local("local-w", "p").unwrap();
+        assert_eq!(
+            ks.policy_status("local-w").unwrap(),
+            PolicyStatus::NotApplicable
         );
     }
 

@@ -16,8 +16,10 @@ and `bloom vfs write` commands against paths without the mount prefix.
 # 1. Start anvil
 anvil --port 8545
 
-# 2. In another terminal, create a wallet
-bloom wallet new alice --passphrase 'devonly'
+# 2. In another terminal, create a wallet (passkey is the default; for a
+#    passphrase wallet in dev, use --local --allow-passphrase-wallet
+#    --passphrase-file <path>)
+bloom wallet new alice
 
 # 3. Inspect chain
 cat /bloom/chains/anvil/head/number

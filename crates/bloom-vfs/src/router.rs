@@ -40,7 +40,10 @@ pub struct Vfs {
     handlers: Arc<BTreeMap<String, Arc<dyn Handler>>>,
     audit: Option<Arc<AuditLog>>,
     cache: Option<Arc<PathCache>>,
+    root_dynamic: Arc<BTreeMap<String, Arc<RootContentRenderer>>>,
 }
+
+type RootContentRenderer = dyn Fn() -> Vec<u8> + Send + Sync;
 
 impl Default for Vfs {
     fn default() -> Self {
@@ -54,6 +57,7 @@ impl Vfs {
             handlers: Arc::new(BTreeMap::new()),
             audit: None,
             cache: None,
+            root_dynamic: Arc::new(BTreeMap::new()),
         }
     }
 
@@ -165,6 +169,26 @@ fn root_agent_guidance_entry(path: &VfsPath) -> Option<&'static str> {
     }
 }
 
+fn root_dynamic_entry<'a>(
+    path: &VfsPath,
+    map: &'a BTreeMap<String, Arc<RootContentRenderer>>,
+) -> Option<&'a str> {
+    match path.segments() {
+        [name] => map.get_key_value(name).map(|(k, _)| k.as_str()),
+        _ => None,
+    }
+}
+
+fn root_dynamic_renderer<'a>(
+    path: &VfsPath,
+    map: &'a BTreeMap<String, Arc<RootContentRenderer>>,
+) -> Option<&'a Arc<RootContentRenderer>> {
+    match path.segments() {
+        [name] => map.get(name),
+        _ => None,
+    }
+}
+
 #[async_trait]
 impl Handler for Vfs {
     async fn lookup(&self, path: &VfsPath) -> Result<Entry, HandlerError> {
@@ -175,6 +199,9 @@ impl Handler for Vfs {
             let mut entry = Entry::file(name);
             entry.size = AGENT_GUIDANCE.len() as u64;
             return Ok(entry);
+        }
+        if let Some(name) = root_dynamic_entry(path, &self.root_dynamic) {
+            return Ok(Entry::file(name));
         }
         let head = path.first().unwrap();
         let h = self
@@ -191,6 +218,9 @@ impl Handler for Vfs {
     async fn read(&self, path: &VfsPath) -> Result<Vec<u8>, HandlerError> {
         if root_agent_guidance_entry(path).is_some() {
             return Ok(AGENT_GUIDANCE.to_vec());
+        }
+        if let Some(renderer) = root_dynamic_renderer(path, &self.root_dynamic) {
+            return Ok(renderer());
         }
         let head = path
             .first()
@@ -258,6 +288,9 @@ impl Handler for Vfs {
             for name in self.handlers.keys() {
                 out.push(Entry::dir(name));
             }
+            for name in self.root_dynamic.keys() {
+                out.push(Entry::file(name));
+            }
             return Ok(out);
         }
         let head = path.first().unwrap();
@@ -276,6 +309,7 @@ pub struct VfsBuilder {
     handlers: BTreeMap<String, Arc<dyn Handler>>,
     audit: Option<Arc<AuditLog>>,
     cache: Option<Arc<PathCache>>,
+    root_dynamic: BTreeMap<String, Arc<RootContentRenderer>>,
 }
 
 impl VfsBuilder {
@@ -299,11 +333,17 @@ impl VfsBuilder {
         self
     }
 
+    pub fn with_root_dynamic(mut self, name: &str, renderer: Arc<RootContentRenderer>) -> Self {
+        self.root_dynamic.insert(name.into(), renderer);
+        self
+    }
+
     pub fn build(self) -> Vfs {
         Vfs {
             handlers: Arc::new(self.handlers),
             audit: self.audit,
             cache: self.cache,
+            root_dynamic: Arc::new(self.root_dynamic),
         }
     }
 }

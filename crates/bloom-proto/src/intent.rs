@@ -46,6 +46,8 @@ pub enum RawIntentBody {
         #[serde(default)]
         token: Option<String>,
         #[serde(default)]
+        amount: String,
+        #[serde(default)]
         data: Option<String>,
     },
     /// Contract method call.
@@ -129,6 +131,11 @@ pub struct RawIntent {
     /// the fallback when `eth_estimateGas` fails at stage time.
     #[serde(default)]
     pub gas_limit_hint: Option<u64>,
+    /// USD value hint supplied by a higher-level intent planner. This is
+    /// intentionally advisory metadata for wallet policy checks; the concrete
+    /// transaction is still fully represented by `body`.
+    #[serde(default)]
+    pub usd_value_hint: Option<String>,
 }
 
 /// A normalised concrete tx-intent (post-resolution): addresses parsed,

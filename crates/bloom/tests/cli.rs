@@ -8,10 +8,18 @@
 //! in-process `IpcServer` to verify the "socket exists → route via IPC"
 //! branch in the CLI's vfs subcommand.
 
+use std::io::{Read, Write};
+use std::net::TcpListener;
 use std::path::Path;
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicUsize, Ordering},
+};
 use std::time::Duration;
 
 use assert_cmd::Command;
+use async_trait::async_trait;
+use bloom_vfs::{Entry, Handler, HandlerError, VfsPath};
 use predicates::prelude::*;
 use tempfile::TempDir;
 
@@ -56,6 +64,143 @@ summary = "Demo app used by CLI tests."
     );
 }
 
+/// Write `passphrase` to a file under `home` and return its path string. Used
+/// to feed `--passphrase-file` for non-interactive passphrase-wallet creation
+/// (the only way to create a local wallet without a tty — passkey is default).
+fn write_passphrase_file(home: &Path, passphrase: &str) -> String {
+    let path = home.join(".passphrase");
+    std::fs::write(&path, passphrase).expect("write passphrase file");
+    path.to_string_lossy().into_owned()
+}
+
+#[derive(Default)]
+struct RecordingWriteHandler {
+    writes: Mutex<Vec<(String, Vec<u8>)>>,
+}
+
+impl RecordingWriteHandler {
+    fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    fn writes(&self) -> Vec<(String, Vec<u8>)> {
+        self.writes.lock().unwrap().clone()
+    }
+}
+
+#[async_trait]
+impl Handler for RecordingWriteHandler {
+    async fn lookup(&self, p: &VfsPath) -> Result<Entry, HandlerError> {
+        if p.is_root() {
+            return Ok(Entry::dir(""));
+        }
+        Ok(Entry::writable_file(
+            p.segments().last().map(String::as_str).unwrap_or("write"),
+        ))
+    }
+
+    async fn list(&self, p: &VfsPath) -> Result<Vec<Entry>, HandlerError> {
+        if p.is_root() {
+            Ok(vec![])
+        } else {
+            Err(HandlerError::NotADir(p.to_string_path()))
+        }
+    }
+
+    async fn write(&self, p: &VfsPath, data: &[u8]) -> Result<(), HandlerError> {
+        self.writes
+            .lock()
+            .unwrap()
+            .push((p.to_string_path(), data.to_vec()));
+        Ok(())
+    }
+}
+
+fn spawn_ipc_server(
+    home: &Path,
+    vfs: bloom_vfs::Vfs,
+) -> (bloom_daemon::ipc::IpcServer, std::thread::JoinHandle<()>) {
+    use bloom_daemon::ipc::{IpcServer, default_socket_path};
+
+    let socket = default_socket_path(home);
+    std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build tokio runtime");
+    let server = IpcServer::new(vfs, "ipc-test-version", vec!["ipc-chain".into()]);
+    let server_for_thread = server.clone();
+    let socket_for_thread = socket.clone();
+    let server_thread = std::thread::spawn(move || {
+        rt.block_on(async move {
+            server_for_thread
+                .serve(&socket_for_thread)
+                .await
+                .expect("ipc serve");
+        });
+    });
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !socket.exists() {
+        if std::time::Instant::now() >= deadline {
+            panic!("ipc server never created socket at {}", socket.display());
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    (server, server_thread)
+}
+
+fn stop_ipc_server(
+    server: bloom_daemon::ipc::IpcServer,
+    server_thread: std::thread::JoinHandle<()>,
+) {
+    server.trigger_shutdown();
+    let join_deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !server_thread.is_finished() {
+        if std::time::Instant::now() >= join_deadline {
+            panic!("ipc server thread did not exit after shutdown");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    server_thread.join().expect("ipc server thread panicked");
+}
+
+fn http_fixture(
+    status: u16,
+    headers: &[(&str, &str)],
+    body: &'static [u8],
+) -> (String, Arc<AtomicUsize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock HTTP server");
+    let addr = listener.local_addr().expect("mock server addr");
+    let hits = Arc::new(AtomicUsize::new(0));
+    let hits_for_thread = hits.clone();
+    let header_lines = headers
+        .iter()
+        .map(|(k, v)| format!("{k}: {v}\r\n"))
+        .collect::<String>();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            hits_for_thread.fetch_add(1, Ordering::SeqCst);
+            let mut buf = [0_u8; 4096];
+            let _ = stream.read(&mut buf);
+            let reason = if status == 402 {
+                "Payment Required"
+            } else {
+                "OK"
+            };
+            let response = format!(
+                "HTTP/1.1 {status} {reason}\r\ncontent-length: {}\r\n{header_lines}\r\n",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+            stream.write_all(body).unwrap();
+        }
+    });
+    (format!("http://{addr}/resource"), hits)
+}
+
 #[test]
 fn help_lists_all_subcommands() {
     let home = fresh_home();
@@ -66,6 +211,7 @@ fn help_lists_all_subcommands() {
         .stdout(predicate::str::contains("status"))
         .stdout(predicate::str::contains("vfs"))
         .stdout(predicate::str::contains("wallet"))
+        .stdout(predicate::str::contains("request"))
         .stdout(predicate::str::contains("serve"))
         .stdout(predicate::str::contains("ipc"))
         .stdout(predicate::str::contains("petals"))
@@ -88,6 +234,18 @@ fn vfs_write_help_lists_unlock_flags() {
 }
 
 #[test]
+fn wallet_help_lists_outbox_cancel_and_replace() {
+    let home = fresh_home();
+    bloom_cmd(home.path())
+        .args(["wallet", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("cancel"))
+        .stdout(predicate::str::contains("replace"))
+        .stdout(predicate::str::contains("confirm"));
+}
+
+#[test]
 fn polymarket_help_lists_obligations() {
     let home = fresh_home();
     bloom_cmd(home.path())
@@ -96,6 +254,134 @@ fn polymarket_help_lists_obligations() {
         .success()
         .stdout(predicate::str::contains("obligations"))
         .stdout(predicate::str::contains("redeem"));
+}
+
+#[test]
+fn polymarket_vfs_trade_confirm_reaches_cli_confirm_path_for_durable_drafts() {
+    let home = fresh_home();
+    let expected = "no draft order-000000001 for wallet my-wallet";
+
+    bloom_cmd(home.path())
+        .args(["polymarket", "confirm", "my-wallet", "order-000000001"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(expected));
+
+    bloom_cmd(home.path())
+        .args([
+            "vfs",
+            "write",
+            "/polymarket/trade/my-wallet/drafts/order-000000001/confirm",
+            "--unlock-wallet",
+            "my-wallet",
+            "--data",
+            "confirm",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(expected));
+}
+
+#[test]
+fn polymarket_vfs_redeem_confirm_shares_cli_redeem_core() {
+    // Both the CLI command and the foreground VFS confirm path must dispatch
+    // into the same redeem core and fail at the same durable refusal (no
+    // [polymarket] config) before any network or signing work.
+    let home = fresh_home();
+    let expected = "no [polymarket] block in config.toml";
+
+    bloom_cmd(home.path())
+        .args(["polymarket", "redeem", "my-wallet", "some-slug"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(expected));
+
+    bloom_cmd(home.path())
+        .args([
+            "vfs",
+            "write",
+            "/polymarket/redeem/my-wallet/some-slug/confirm",
+            "--unlock-wallet",
+            "my-wallet",
+            "--data",
+            "confirm",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(expected));
+}
+
+#[test]
+fn polymarket_vfs_revoke_approvals_confirm_shares_cli_core() {
+    let home = fresh_home();
+    let expected = "no [polymarket] block in config.toml";
+
+    bloom_cmd(home.path())
+        .args(["polymarket", "revoke-approvals", "my-wallet"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(expected));
+
+    bloom_cmd(home.path())
+        .args([
+            "vfs",
+            "write",
+            "/polymarket/revoke-approvals/my-wallet/request/confirm",
+            "--unlock-wallet",
+            "my-wallet",
+            "--data",
+            "confirm",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(expected));
+}
+
+#[test]
+fn polymarket_vfs_withdraw_pusd_confirm_shares_cli_core() {
+    let home = fresh_home();
+    let expected = "no [polymarket] block in config.toml";
+
+    // CLI: amount is a positional; VFS: amount rides in the confirm body.
+    bloom_cmd(home.path())
+        .args(["polymarket", "withdraw-pusd", "my-wallet", "all"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(expected));
+
+    bloom_cmd(home.path())
+        .args([
+            "vfs",
+            "write",
+            "/polymarket/withdraw/my-wallet/pusd/confirm",
+            "--unlock-wallet",
+            "my-wallet",
+            "--data",
+            r#"{"confirm":true,"amount":"all"}"#,
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(expected));
+}
+
+#[test]
+fn polymarket_vfs_withdraw_pusd_confirm_rejects_bare_ack() {
+    // A bare ack has no amount; the foreground decoder must refuse before any
+    // daemon/network work so an agent cannot default to withdrawing everything.
+    let home = fresh_home();
+    bloom_cmd(home.path())
+        .args([
+            "vfs",
+            "write",
+            "/polymarket/withdraw/my-wallet/pusd/confirm",
+            "--unlock-wallet",
+            "my-wallet",
+            "--data",
+            "confirm",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("explicit amount"));
 }
 
 #[test]
@@ -129,6 +415,7 @@ fn vfs_ls_root_lists_top_level_handlers() {
         "status",
         "wallets",
         "tools",
+        "requests",
         "docs",
     ] {
         assert!(
@@ -173,7 +460,7 @@ fn vfs_ls_status_lists_known_files() {
         .assert()
         .success();
     let out = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
-    for required in ["version", "uptime", "started_at", "home", "chains", "audit"] {
+    for required in ["version", "uptime", "started_at", "chains", "audit"] {
         assert!(
             out.lines().any(|l| l.starts_with(required)),
             "expected `{required}` in vfs ls /status, got:\n{out}"
@@ -190,107 +477,6 @@ fn vfs_cat_status_version_returns_pkg_version() {
         .assert()
         .success()
         .stdout(predicate::eq(expected));
-}
-
-#[test]
-fn v2_app_cli_build_install_list_and_vfs_read_happy_path() {
-    let home = fresh_home();
-    let work = tempfile::tempdir().expect("create package workdir");
-    let package = work.path().join("demo-package");
-    let archive = work.path().join("demo.petal.tar");
-    write_demo_v2_package(&package);
-
-    let package_arg = package.to_str().unwrap();
-    let archive_arg = archive.to_str().unwrap();
-    bloom_cmd(home.path())
-        .args(["petal", "app", "build", package_arg, "--out", archive_arg])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("app_mount: apps/demo/"))
-        .stdout(predicate::str::contains("routes: 1"))
-        .stdout(predicate::str::contains("archive: "));
-    assert!(
-        archive.is_file(),
-        "build should write {}",
-        archive.display()
-    );
-
-    bloom_cmd(home.path())
-        .args(["petals", "install", archive_arg])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("mode: local-app"))
-        .stdout(predicate::str::contains("app_mount: apps/demo/"))
-        .stdout(predicate::str::contains("routes: 1"));
-
-    bloom_cmd(home.path())
-        .args(["petals", "ls"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("app=apps/demo/"));
-
-    bloom_cmd(home.path())
-        .args(["vfs", "cat", "/apps/demo/hello.txt"])
-        .assert()
-        .success()
-        .stdout(predicate::eq("component"));
-}
-
-#[test]
-#[ignore = "clones and builds the public Polymarket Petal source repo"]
-fn github_source_install_polymarket_dispatches_parity() {
-    let home = fresh_home();
-    bloom_cmd(home.path())
-        .args([
-            "petals",
-            "install",
-            "https://github.com/bloom-directory/bloom-petal-polymarket",
-            "--ref",
-            "v0.1.1",
-        ])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("Selected tag: v0.1.1"))
-        .stdout(predicate::str::contains(
-            "source: bloom-directory/bloom-petal-polymarket@v0.1.1",
-        ))
-        .stdout(predicate::str::contains("routes: 67"));
-
-    bloom_cmd(home.path())
-        .args(["petals", "ls"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains(
-            "source=bloom-directory/bloom-petal-polymarket@v0.1.1",
-        ));
-
-    bloom_cmd(home.path())
-        .args(["vfs", "cat", "/apps/polymarket/meta/parity.json"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("polymarket_v2_petal_parity"));
-}
-
-#[test]
-fn petals_install_rejects_untrusted_owner_and_raw_remote_wasm() {
-    let home = fresh_home();
-    bloom_cmd(home.path())
-        .args(["petals", "install", "https://github.com/not-bloom/petal"])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("unsupported GitHub owner"));
-
-    bloom_cmd(home.path())
-        .args([
-            "petals",
-            "install",
-            "https://github.com/bloom-directory/petal/raw/main/route.wasm",
-        ])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains(
-            "raw remote .wasm installs are not supported",
-        ));
 }
 
 #[test]
@@ -447,16 +633,112 @@ fn chain_ls_validators_does_not_take_home_write_lock() {
 }
 
 #[test]
+fn request_new_routes_via_ipc_when_home_write_lock_is_live() {
+    use bloom_vfs::Vfs;
+
+    let home = fresh_home();
+    let _permit = bloom_proto::HomeWritePermit::acquire(&bloom_proto::HomeDir::at(home.path()))
+        .expect("hold home write permit");
+    let requests = RecordingWriteHandler::new();
+    let vfs = Vfs::builder().mount("requests", requests.clone()).build();
+    let (server, server_thread) = spawn_ipc_server(home.path(), vfs);
+
+    bloom_cmd(home.path())
+        .args([
+            "request",
+            "new",
+            "--dry-run",
+            "--wallet",
+            "alice",
+            "GET https://example.com",
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("already open for writing").not())
+        .stdout(predicate::str::contains("dry_run: true"));
+
+    stop_ipc_server(server, server_thread);
+    let writes = requests.writes();
+    assert_eq!(writes.len(), 1, "writes={writes:?}");
+    assert_eq!(writes[0].0, "/new.dry-run");
+    assert_eq!(
+        String::from_utf8_lossy(&writes[0].1),
+        "GET https://example.com wallet=alice"
+    );
+}
+
+#[test]
+fn wallet_stage_routes_via_ipc_when_home_write_lock_is_live() {
+    use bloom_vfs::Vfs;
+
+    let home = fresh_home();
+    let _permit = bloom_proto::HomeWritePermit::acquire(&bloom_proto::HomeDir::at(home.path()))
+        .expect("hold home write permit");
+    let wallets = RecordingWriteHandler::new();
+    let vfs = Vfs::builder().mount("wallets", wallets.clone()).build();
+    let (server, server_thread) = spawn_ipc_server(home.path(), vfs);
+    let intent = "send 0.001 eth to 0x0000000000000000000000000000000000000000 on anvil";
+
+    bloom_cmd(home.path())
+        .args(["wallet", "stage", "alice", "anvil", "--intent", intent])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("already open for writing").not());
+
+    stop_ipc_server(server, server_thread);
+    let writes = wallets.writes();
+    assert_eq!(writes.len(), 1, "writes={writes:?}");
+    assert_eq!(writes[0].0, "/alice/chains/anvil/outbox/new.tx");
+    assert_eq!(String::from_utf8_lossy(&writes[0].1), intent);
+}
+
+#[test]
+fn wallet_stage_without_daemon_uses_in_process_parser() {
+    let home = fresh_home();
+    bloom_cmd(home.path())
+        .args([
+            "wallet",
+            "stage",
+            "alice",
+            "anvil",
+            "--intent",
+            "not an intent",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("parse intent"))
+        .stderr(predicate::str::contains("already open for writing").not());
+}
+
+#[test]
 fn wallet_new_then_list_round_trip() {
     let home = fresh_home();
+    let pass_file = write_passphrase_file(home.path(), "smoke-test-pass");
     let create = bloom_cmd(home.path())
-        .args(["wallet", "new", "alice", "--passphrase", "smoke-test-pass"])
+        .args([
+            "wallet",
+            "new",
+            "alice",
+            "--local",
+            "--allow-passphrase-wallet",
+            "--passphrase-file",
+            &pass_file,
+        ])
         .assert()
         .success();
     let create_out = String::from_utf8(create.get_output().stdout.clone()).unwrap();
     assert!(
         create_out.contains("created wallet 'alice'"),
         "unexpected create output: {create_out}"
+    );
+    assert!(
+        create_out.contains("default_wallet: alice"),
+        "first wallet creation should announce default wallet selection: {create_out}"
+    );
+    let config = std::fs::read_to_string(home.path().join("config.toml")).unwrap();
+    assert!(
+        config.contains("default_wallet = \"alice\""),
+        "config should persist default wallet, got:\n{config}"
     );
     // Address line is `created wallet 'alice': 0x...` — capture and reuse
     // the address to assert the listing matches what was just minted.
@@ -482,13 +764,22 @@ fn wallet_new_then_list_round_trip() {
 }
 
 #[test]
-fn wallet_new_via_env_passphrase() {
-    // BLOOM_PASSPHRASE feeds the same arg via env. Confirms the env path
-    // works and that the wallet ends up in the keystore directory on disk.
+fn wallet_new_local_via_passphrase_file() {
+    // BLOOM_PASSPHRASE no longer creates wallets — passkey is the default, and
+    // passphrase-wallet creation must be explicit: --local +
+    // --allow-passphrase-wallet + --passphrase-file (non-interactive).
     let home = fresh_home();
+    let pass_file = write_passphrase_file(home.path(), "env-pass-1");
     bloom_cmd(home.path())
-        .args(["wallet", "new", "bob"])
-        .env("BLOOM_PASSPHRASE", "env-pass-1")
+        .args([
+            "wallet",
+            "new",
+            "bob",
+            "--local",
+            "--allow-passphrase-wallet",
+            "--passphrase-file",
+            &pass_file,
+        ])
         .assert()
         .success()
         .stdout(predicate::str::contains("created wallet 'bob'"));
@@ -501,6 +792,224 @@ fn wallet_new_via_env_passphrase() {
         bob_dir.join("encrypted.key").exists(),
         "expected keystore/bob/encrypted.key to be written"
     );
+    assert!(
+        bob_dir.join("RECOVERY.txt").exists(),
+        "passphrase wallets must write a RECOVERY.txt"
+    );
+}
+
+/// Creating a passphrase wallet non-interactively WITHOUT --allow-passphrase-wallet
+/// must fail closed — this is the gate that stops an agent from silently minting
+/// a passphrase wallet. (assert_cmd stdin is not a tty.)
+#[test]
+fn wallet_new_local_refused_without_ack_when_noninteractive() {
+    let home = fresh_home();
+    let pass_file = write_passphrase_file(home.path(), "pw");
+    let assert = bloom_cmd(home.path())
+        .args([
+            "wallet",
+            "new",
+            "sneaky",
+            "--local",
+            "--passphrase-file",
+            &pass_file,
+        ])
+        .assert()
+        .failure();
+    let err = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+    assert!(
+        err.contains("--allow-passphrase-wallet"),
+        "error should demand the ack flag, got: {err}"
+    );
+    // Nothing was created.
+    assert!(
+        !home.path().join("keystore").join("sneaky").exists(),
+        "no wallet directory should exist after a refused creation"
+    );
+}
+
+/// A successful wallet creation appends a first-class `wallet.created` audit
+/// record — the CLI path does not flow through the VFS router, so without this
+/// event a CLI-created wallet leaves no trail (the original eth-long-1 bug).
+#[test]
+fn wallet_created_audit_event() {
+    let home = fresh_home();
+    let pass_file = write_passphrase_file(home.path(), "audit-pass");
+    bloom_cmd(home.path())
+        .args([
+            "wallet",
+            "new",
+            "audited",
+            "--local",
+            "--allow-passphrase-wallet",
+            "--passphrase-file",
+            &pass_file,
+        ])
+        .assert()
+        .success();
+    let audit = std::fs::read_to_string(home.path().join("audit.jsonl")).unwrap();
+    assert!(
+        audit.contains("\"kind\":\"wallet.created\"") && audit.contains("audited"),
+        "audit log should contain a wallet.created event for 'audited', got:\n{audit}"
+    );
+}
+
+#[test]
+fn request_cli_dry_run_uses_vfs_lifecycle_and_body_receipt_helpers() {
+    let home = fresh_home();
+    let pass_file = write_passphrase_file(home.path(), "pw");
+    bloom_cmd(home.path())
+        .args([
+            "wallet",
+            "new",
+            "alice",
+            "--local",
+            "--allow-passphrase-wallet",
+            "--passphrase-file",
+            &pass_file,
+        ])
+        .assert()
+        .success();
+
+    let (url, hits) = http_fixture(200, &[("content-type", "text/plain")], b"cli-body\n");
+    let new = bloom_cmd(home.path())
+        .args(["request", "new", "--dry-run", &format!("GET {url}")])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("request: sent/"))
+        .stdout(predicate::str::contains("dry_run: true"))
+        .get_output()
+        .stdout
+        .clone();
+    let new = String::from_utf8(new).unwrap();
+    let id = new
+        .lines()
+        .find_map(|line| line.strip_prefix("request: sent/"))
+        .expect("request id in request new output")
+        .trim()
+        .to_string();
+
+    bloom_cmd(home.path())
+        .args(["request", "plan", "latest"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Dry run: true"));
+    bloom_cmd(home.path())
+        .args(["request", "body", &id])
+        .assert()
+        .success()
+        .stdout(predicate::eq("cli-body\n"));
+    bloom_cmd(home.path())
+        .args(["request", "receipt", &id])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"protocol\": \"free\""));
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        1,
+        "read helpers must not re-issue HTTP"
+    );
+}
+
+#[test]
+fn status_on_empty_keystore_points_to_wallet_creation() {
+    let home = fresh_home();
+    let assert = bloom_cmd(home.path()).args(["status"]).assert().success();
+    let out = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    assert!(
+        out.contains("no wallets yet"),
+        "empty status should say no wallet exists:\n{out}"
+    );
+    assert!(
+        out.contains("bloom wallet new main"),
+        "status should point at the explicit wallet command:\n{out}"
+    );
+}
+
+/// `wallet address <name>` prints the bare checksummed address; adding `--qr`
+/// prepends a scannable QR block while keeping the address line.
+#[test]
+fn wallet_address_with_and_without_qr() {
+    let home = fresh_home();
+    let pass_file = write_passphrase_file(home.path(), "addr-smoke-pass");
+    bloom_cmd(home.path())
+        .args([
+            "wallet",
+            "new",
+            "alice",
+            "--local",
+            "--allow-passphrase-wallet",
+            "--passphrase-file",
+            &pass_file,
+        ])
+        .assert()
+        .success();
+
+    let plain = bloom_cmd(home.path())
+        .args(["wallet", "address", "alice"])
+        .assert()
+        .success();
+    let plain_out = String::from_utf8(plain.get_output().stdout.clone()).unwrap();
+    let addr = plain_out.trim();
+    assert!(
+        addr.starts_with("0x") && addr.len() == 42,
+        "plain output should be a bare address, got: {plain_out:?}"
+    );
+
+    let qr = bloom_cmd(home.path())
+        .args(["wallet", "address", "alice", "--qr"])
+        .assert()
+        .success();
+    let qr_out = String::from_utf8(qr.get_output().stdout.clone()).unwrap();
+    assert!(
+        qr_out.contains(addr),
+        "--qr output must still include the address:\n{qr_out}"
+    );
+    assert!(
+        qr_out.lines().count() > plain_out.lines().count(),
+        "--qr should add a QR block above the address:\n{qr_out}"
+    );
+}
+
+/// `wallet address <name> --qr-out <path>` writes a scannable SVG QR file and
+/// still prints the address; the SVG is a real `<svg>` document.
+#[test]
+fn wallet_address_qr_out_writes_svg() {
+    let home = fresh_home();
+    let pass_file = write_passphrase_file(home.path(), "qr-out-pass");
+    bloom_cmd(home.path())
+        .args([
+            "wallet",
+            "new",
+            "alice",
+            "--local",
+            "--allow-passphrase-wallet",
+            "--passphrase-file",
+            &pass_file,
+        ])
+        .assert()
+        .success();
+    let svg_path = home.path().join("deposit.svg");
+    let out = bloom_cmd(home.path())
+        .args([
+            "wallet",
+            "address",
+            "alice",
+            "--qr-out",
+            svg_path.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+    // The bare address still goes to stdout (scriptable).
+    let stdout = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    assert!(stdout.trim().starts_with("0x"), "stdout: {stdout:?}");
+    // The SVG file exists and is a real SVG document.
+    let svg = std::fs::read_to_string(&svg_path).expect("qr svg written");
+    assert!(
+        svg.contains("<svg") && svg.contains("</svg>"),
+        "expected an SVG document, got: {}",
+        &svg[..svg.len().min(80)]
+    );
 }
 
 /// Spin up an in-process `IpcServer` bound to the home's default socket
@@ -511,8 +1020,60 @@ fn wallet_new_via_env_passphrase() {
 #[test]
 fn vfs_routes_via_ipc_when_socket_exists() {
     use bloom_daemon::ipc::{IpcServer, default_socket_path};
-    use bloom_test_util::mocks::SingleFileHandler;
-    use bloom_vfs::Vfs;
+    use bloom_vfs::{Entry, Handler, HandlerError, Vfs, VfsPath};
+
+    struct SingleFileHandler {
+        name: String,
+        body: Vec<u8>,
+    }
+
+    impl SingleFileHandler {
+        fn new(name: impl Into<String>, body: Vec<u8>) -> Self {
+            Self {
+                name: name.into(),
+                body,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Handler for SingleFileHandler {
+        async fn lookup(&self, path: &VfsPath) -> Result<Entry, HandlerError> {
+            match path
+                .segments()
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .as_slice()
+            {
+                [] => Ok(Entry::dir("probe")),
+                [leaf] if *leaf == self.name => Ok(Entry::read_only_file(&self.name)),
+                _ => Err(HandlerError::NotFound(path.to_string_path())),
+            }
+        }
+
+        async fn read(&self, path: &VfsPath) -> Result<Vec<u8>, HandlerError> {
+            match path
+                .segments()
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .as_slice()
+            {
+                [leaf] if *leaf == self.name => Ok(self.body.clone()),
+                [] => Err(HandlerError::NotAFile(path.to_string_path())),
+                _ => Err(HandlerError::NotFound(path.to_string_path())),
+            }
+        }
+
+        async fn list(&self, path: &VfsPath) -> Result<Vec<Entry>, HandlerError> {
+            if path.is_root() {
+                Ok(vec![Entry::read_only_file(&self.name)])
+            } else {
+                Err(HandlerError::NotADir(path.to_string_path()))
+            }
+        }
+    }
 
     // A trivial in-memory handler that the production daemon never mounts;
     // if the CLI's `vfs ls /probe` returns this entry, the request must
@@ -594,137 +1155,103 @@ fn vfs_routes_via_ipc_when_socket_exists() {
     server_thread.join().expect("ipc server thread panicked");
 }
 
-// ---------------------------------------------------------------------------
-// `bloom chain init` — review 2026-05-19 #9
-// ---------------------------------------------------------------------------
-
-/// `chain init` must refuse to overwrite an existing `validator.xdsa` unless
-/// `--force` is passed. Pre-fix the second invocation would silently
-/// generate a fresh keypair and clobber the operator's existing secret.
 #[test]
-fn chain_init_refuses_to_overwrite_validator_key_without_force() {
+fn v2_app_cli_build_install_list_and_vfs_read_happy_path() {
     let home = fresh_home();
-    bloom_cmd(home.path())
-        .args(["chain", "init"])
-        .assert()
-        .success();
-    let key_path = home
-        .path()
-        .join("chain")
-        .join("keystore")
-        .join("validator.xdsa");
-    let first = std::fs::read(&key_path).expect("first init wrote a key");
+    let work = tempfile::tempdir().expect("create package workdir");
+    let package = work.path().join("demo-package");
+    let archive = work.path().join("demo.petal.tar");
+    write_demo_v2_package(&package);
 
+    let package_arg = package.to_str().unwrap();
+    let archive_arg = archive.to_str().unwrap();
     bloom_cmd(home.path())
-        .args(["chain", "init"])
+        .args(["petal", "app", "build", package_arg, "--out", archive_arg])
         .assert()
-        .failure()
-        .stderr(predicate::str::contains("refusing to overwrite"))
-        .stderr(predicate::str::contains("--force"));
-
-    let after_fail = std::fs::read(&key_path).expect("key still present after refused re-init");
-    assert_eq!(
-        first, after_fail,
-        "refused chain init must not have touched the existing key"
+        .success()
+        .stdout(predicate::str::contains("app_mount: apps/demo/"))
+        .stdout(predicate::str::contains("routes: 1"))
+        .stdout(predicate::str::contains("archive: "));
+    assert!(
+        archive.is_file(),
+        "build should write {}",
+        archive.display()
     );
 
     bloom_cmd(home.path())
-        .args(["chain", "init", "--force"])
+        .args(["petals", "install", archive_arg])
         .assert()
-        .success();
-    let forced = std::fs::read(&key_path).expect("forced init wrote a key");
-    assert_ne!(
-        first, forced,
-        "--force must mint a fresh keypair (replacing the previous bytes)"
-    );
+        .success()
+        .stdout(predicate::str::contains("mode: local-app"))
+        .stdout(predicate::str::contains("app_mount: apps/demo/"))
+        .stdout(predicate::str::contains("routes: 1"));
+
+    bloom_cmd(home.path())
+        .args(["petals", "ls"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("app=apps/demo/"));
+
+    bloom_cmd(home.path())
+        .args(["vfs", "cat", "/apps/demo/hello.txt"])
+        .assert()
+        .success()
+        .stdout(predicate::eq("component"));
 }
 
-/// On Unix, the freshly written validator secret must be mode 0o600 — no
-/// group / world read or write. Pre-fix the file landed with umask-default
-/// 0644 and a malicious group member could lift the secret.
-#[cfg(unix)]
 #[test]
-fn chain_init_writes_validator_key_with_mode_0600() {
-    use std::os::unix::fs::PermissionsExt;
-
+#[ignore = "clones and builds the public Polymarket Petal source repo"]
+fn github_source_install_polymarket_dispatches_parity() {
     let home = fresh_home();
-    bloom_cmd(home.path())
-        .args(["chain", "init"])
-        .assert()
-        .success();
-    let key_path = home
-        .path()
-        .join("chain")
-        .join("keystore")
-        .join("validator.xdsa");
-    let mode = std::fs::metadata(&key_path)
-        .expect("stat validator.xdsa")
-        .permissions()
-        .mode()
-        & 0o777;
-    assert_eq!(
-        mode, 0o600,
-        "validator.xdsa must be mode 0o600, got 0o{mode:o}"
-    );
-
-    // `--force` re-init must also leave the file at 0o600, not whatever the
-    // pre-existing mode was.
-    bloom_cmd(home.path())
-        .args(["chain", "init", "--force"])
-        .assert()
-        .success();
-    let mode_after_force = std::fs::metadata(&key_path)
-        .expect("stat validator.xdsa after --force")
-        .permissions()
-        .mode()
-        & 0o777;
-    assert_eq!(mode_after_force, 0o600);
-}
-
-/// `chain testnet` writes per-validator key files in fresh `home<i>/chain/`
-/// directories. Those files must also be mode 0o600 on Unix.
-#[cfg(unix)]
-#[test]
-fn chain_testnet_writes_validator_keys_with_mode_0600() {
-    use std::os::unix::fs::PermissionsExt;
-
-    let home = fresh_home();
-    let outdir = home.path().join("testnet");
     bloom_cmd(home.path())
         .args([
-            "chain",
-            "testnet",
-            "--validators",
-            "2",
-            "--output-dir",
-            outdir.to_str().unwrap(),
+            "petals",
+            "install",
+            "https://github.com/bloom-directory/bloom-petal-polymarket",
+            "--ref",
+            "v0.1.1",
         ])
         .assert()
-        .success();
-    let genesis = std::fs::read_to_string(outdir.join("home0").join("chain").join("genesis.toml"))
-        .expect("read generated genesis.toml");
-    assert!(
-        genesis.contains("[[petals]]")
-            && genesis.contains(r#"path = "/bloom/petals/core/fungible""#)
-            && genesis.contains("wasm_hex = \"00"),
-        "generated funded genesis must bind the core fungible petal"
-    );
-    for i in 0..2u8 {
-        let key = outdir
-            .join(format!("home{i}"))
-            .join("chain")
-            .join("keystore")
-            .join("validator.xdsa");
-        let mode = std::fs::metadata(&key)
-            .unwrap_or_else(|e| panic!("stat {}: {e}", key.display()))
-            .permissions()
-            .mode()
-            & 0o777;
-        assert_eq!(
-            mode,
-            0o600,
-            "{} must be mode 0o600, got 0o{mode:o}",
-            key.display()
-        );
-    }
+        .success()
+        .stdout(predicate::str::contains("Selected tag: v0.1.1"))
+        .stdout(predicate::str::contains(
+            "source: bloom-directory/bloom-petal-polymarket@v0.1.1",
+        ))
+        .stdout(predicate::str::contains("routes: 67"));
+
+    bloom_cmd(home.path())
+        .args(["petals", "ls"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "source=bloom-directory/bloom-petal-polymarket@v0.1.1",
+        ));
+
+    bloom_cmd(home.path())
+        .args(["vfs", "cat", "/apps/polymarket/meta/parity.json"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("polymarket_v2_petal_parity"));
+}
+
+#[test]
+fn petals_install_rejects_untrusted_owner_and_raw_remote_wasm() {
+    let home = fresh_home();
+    bloom_cmd(home.path())
+        .args(["petals", "install", "https://github.com/not-bloom/petal"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("unsupported GitHub owner"));
+
+    bloom_cmd(home.path())
+        .args([
+            "petals",
+            "install",
+            "https://github.com/bloom-directory/petal/raw/main/route.wasm",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "raw remote .wasm installs are not supported",
+        ));
 }

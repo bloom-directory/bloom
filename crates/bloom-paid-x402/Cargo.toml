@@ -1,0 +1,19 @@
+[package]
+name = "bloom-paid-x402"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "x402 adapter for Bloom paid HTTP requests"
+
+[dependencies]
+bloom-paid-http.workspace = true
+base64.workspace = true
+serde_json.workspace = true
+alloy.workspace = true
+async-trait.workspace = true
+x402-chain-eip155 = { version = "2.0.0", features = ["client", "telemetry"] }
+x402-types = "2.0.0"
+
+[dev-dependencies]
+reqwest.workspace = true
+url.workspace = true

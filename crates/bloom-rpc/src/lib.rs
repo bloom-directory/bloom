@@ -1,8 +1,8 @@
-//! Layered RPC engine for `bloom-chain`.
+//! Layered RPC engine for `bloom-evm`.
 //!
 //! This crate owns the alloy transport stack (retry → optional
 //! throttle → HTTP) under a `FallbackLayer` for multi-endpoint
-//! failover. The public surface is intentionally narrow — `bloom-chain`
+//! failover. The public surface is intentionally narrow — `bloom-evm`
 //! constructs an `RpcEngine` once per `ChainSpec` and exposes the
 //! resulting `RootProvider` to the rest of the workspace through
 //! `ChainClient::provider()`. Direct use of this crate from

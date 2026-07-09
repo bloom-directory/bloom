@@ -28,6 +28,9 @@ pub struct Config {
     /// Address the NFS server listens on. Loopback only by default.
     #[serde(default = "default_nfs_listen")]
     pub nfs_listen_addr: String,
+    /// Default wallet used when a request/command omits an explicit wallet.
+    #[serde(default)]
+    pub default_wallet: Option<String>,
     /// Default chain to use when an intent omits `chain`.
     #[serde(default = "default_chain_name")]
     pub default_chain: String,
@@ -45,6 +48,10 @@ pub struct Config {
     /// `polymarket/` VFS subtree in (like `[enso]` opts in `defi/`).
     #[serde(default)]
     pub polymarket: Option<PolymarketConfig>,
+    /// Hyperliquid HyperCore read/write surface. Presence of `[hyperliquid]`
+    /// opts the `hyperliquid/` VFS subtree in.
+    #[serde(default)]
+    pub hyperliquid: Option<HyperliquidConfig>,
     #[serde(default)]
     pub mempool: BTreeMap<String, MempoolChainConfig>,
     #[serde(default)]
@@ -215,8 +222,34 @@ pub struct PolymarketConfig {
 fn default_builder_key_mode() -> String {
     "auto".into()
 }
-// Note: the geoblock endpoint is deliberately NOT configurable — it is a
-// non-bypassable refuse-line (see `bloom_polymarket::geoblock`).
+
+/// Hyperliquid HyperCore API configuration. Every field has a default so a
+/// bare `[hyperliquid]` TOML table uses the official public endpoints.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HyperliquidConfig {
+    #[serde(default = "default_hyperliquid_mainnet_url")]
+    pub mainnet_url: String,
+    #[serde(default = "default_hyperliquid_testnet_url")]
+    pub testnet_url: String,
+    /// Bridge2 contract that credits deposits (native USDC on Arbitrum).
+    /// Defaults to the mainnet bridge; not a magic literal in the route code.
+    #[serde(default = "default_hyperliquid_bridge")]
+    pub bridge_address: String,
+    /// Chain whose native USDC the bridge credits (Arbitrum One).
+    #[serde(default = "default_hyperliquid_deposit_chain_id")]
+    pub deposit_chain_id: u64,
+}
+
+impl Default for HyperliquidConfig {
+    fn default() -> Self {
+        Self {
+            mainnet_url: default_hyperliquid_mainnet_url(),
+            testnet_url: default_hyperliquid_testnet_url(),
+            bridge_address: default_hyperliquid_bridge(),
+            deposit_chain_id: default_hyperliquid_deposit_chain_id(),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct MempoolChainConfig {
@@ -265,6 +298,18 @@ fn default_clob_url() -> String {
 }
 fn default_relayer_url() -> String {
     "https://relayer-v2.polymarket.com".to_string()
+}
+fn default_hyperliquid_mainnet_url() -> String {
+    "https://api.hyperliquid.xyz".to_string()
+}
+fn default_hyperliquid_testnet_url() -> String {
+    "https://api.hyperliquid-testnet.xyz".to_string()
+}
+fn default_hyperliquid_bridge() -> String {
+    crate::hyperliquid::MAINNET_BRIDGE.to_string()
+}
+fn default_hyperliquid_deposit_chain_id() -> u64 {
+    crate::hyperliquid::DEPOSIT_CHAIN_ID
 }
 fn default_polymarket_chain_id() -> u64 {
     137
@@ -330,6 +375,13 @@ fn default_chains() -> BTreeMap<String, ChainSpec> {
             8453,
             &["https://mainnet.base.org", "https://base.llamarpc.com"],
             "Base Mainnet",
+            "ETH",
+        ),
+        evm_chain(
+            "tempo",
+            4217,
+            &["https://rpc.tempo.xyz"],
+            "Tempo Mainnet",
             "ETH",
         ),
         evm_chain(
@@ -428,12 +480,14 @@ impl Config {
         Config {
             mount_path: default_mount_path(),
             nfs_listen_addr: default_nfs_listen(),
+            default_wallet: None,
             default_chain: default_chain_name(),
             stage_ttl: default_stage_ttl(),
             chains,
             etherscan: None,
             enso: None,
             polymarket: None,
+            hyperliquid: None,
             mempool: BTreeMap::new(),
             private_rpc: BTreeMap::new(),
             block_mainnet_broadcast: true,
@@ -478,6 +532,16 @@ impl Config {
                 "default_chain={} not in chains",
                 self.default_chain
             )));
+        }
+        if self
+            .default_wallet
+            .as_deref()
+            .map(|w| w.trim().is_empty())
+            .unwrap_or(false)
+        {
+            return Err(ConfigError::Invalid(
+                "default_wallet must not be empty".into(),
+            ));
         }
         for (k, c) in &self.chains {
             if k != &c.name {
@@ -534,18 +598,23 @@ mod tests {
     fn local_default_shape() {
         let cfg = Config::local_default();
         assert_eq!(cfg.default_chain, "ethereum");
+        assert!(cfg.default_wallet.is_none());
         assert_eq!(cfg.mount_path, "/bloom");
         assert_eq!(cfg.nfs_listen_addr, "127.0.0.1:12049");
         assert!(cfg.block_mainnet_broadcast);
         assert!(cfg.etherscan.is_none());
         assert!(cfg.enso.is_none());
-        assert_eq!(cfg.chains.len(), 11);
+        assert!(cfg.hyperliquid.is_none());
+        assert_eq!(cfg.chains.len(), 12);
         let ethereum = cfg.chains.get("ethereum").expect("ethereum entry");
         assert_eq!(ethereum.chain_id, 1);
         assert!(!ethereum.allow_broadcast);
         assert!(!ethereum.rpc_urls.is_empty());
         let base = cfg.chains.get("base").expect("base entry");
         assert_eq!(base.chain_id, 8453);
+        let tempo = cfg.chains.get("tempo").expect("tempo entry");
+        assert_eq!(tempo.chain_id, 4217);
+        assert_eq!(tempo.rpc_urls, vec!["https://rpc.tempo.xyz"]);
         let hyperliquid = cfg.chains.get("hyperliquid").expect("hyperliquid entry");
         assert_eq!(hyperliquid.chain_id, 999);
         let anvil = cfg.chains.get("anvil").expect("anvil entry");
@@ -598,6 +667,18 @@ mod tests {
                 .unwrap();
         assert_eq!(pm.relayer_api_key.as_deref(), Some("k-123"));
         assert_eq!(pm.relayer_api_key_address.as_deref(), Some("0xabc"));
+    }
+
+    #[test]
+    fn bare_hyperliquid_block_parses_to_public_defaults() {
+        let hl: HyperliquidConfig = toml::from_str("").unwrap();
+        assert_eq!(hl.mainnet_url, "https://api.hyperliquid.xyz");
+        assert_eq!(hl.testnet_url, "https://api.hyperliquid-testnet.xyz");
+
+        let hl: HyperliquidConfig =
+            toml::from_str("mainnet_url = \"http://localhost:3001\"\n").unwrap();
+        assert_eq!(hl.mainnet_url, "http://localhost:3001");
+        assert_eq!(hl.testnet_url, "https://api.hyperliquid-testnet.xyz");
     }
 
     #[test]
@@ -667,6 +748,46 @@ mod tests {
             ConfigError::Invalid(m) => assert!(m.contains("default_chain=ghost"), "msg: {m}"),
             other => panic!("expected Invalid, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn default_wallet_round_trips_and_empty_is_rejected() {
+        let mut cfg = Config::local_default();
+        cfg.default_wallet = Some("alice".to_string());
+        let s = toml::to_string_pretty(&cfg).unwrap();
+        assert!(s.contains("default_wallet = \"alice\""));
+        let back: Config = toml::from_str(&s).unwrap();
+        assert_eq!(back.default_wallet.as_deref(), Some("alice"));
+
+        cfg.default_wallet = Some("   ".to_string());
+        let err = cfg.validate().unwrap_err();
+        match err {
+            ConfigError::Invalid(m) => assert!(m.contains("default_wallet"), "msg: {m}"),
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn older_config_without_default_wallet_parses() {
+        let cfg: Config = toml::from_str(
+            r#"
+mount_path = "/bloom"
+nfs_listen_addr = "127.0.0.1:12049"
+default_chain = "anvil"
+stage_ttl = "30m"
+block_mainnet_broadcast = true
+
+[chains.anvil]
+name = "anvil"
+chain_id = 31337
+rpc_urls = ["http://127.0.0.1:8545"]
+native_symbol = "ETH"
+allow_broadcast = true
+"#,
+        )
+        .unwrap();
+        assert!(cfg.default_wallet.is_none());
+        cfg.validate().unwrap();
     }
 
     #[test]

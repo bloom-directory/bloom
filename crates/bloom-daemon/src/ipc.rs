@@ -27,10 +27,11 @@ use std::sync::Arc;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
+use bloom_keystore::petal_host::SignerCache;
 use bloom_keystore::{Keystore, WalletKind};
 use bloom_petals::{PetalError, PetalRunner};
 use bloom_proto::{CeremonyIntent, CeremonyIntentKind};
-use bloom_vfs::{Entry, EntryKind, Handler, HandlerError, Vfs, VfsPath};
+use bloom_vfs::{AuthServices, Entry, EntryKind, Handler, HandlerError, Vfs, VfsPath};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
@@ -121,7 +122,21 @@ pub struct IpcServer {
     pub chains: Vec<String>,
     keystore: Option<Keystore>,
     petals: Option<PetalRunner>,
+    auth_services: AuthServices,
+    signer_cache: Option<Arc<SignerCache>>,
     shutdown: Arc<Notify>,
+}
+
+const PASSKEY_WRITE_UNLOCKED_DISABLED: &str = "write_unlocked is disabled for passkey wallets; \
+stage a Sealed Approval action and sign through PetalHost::sign_hash";
+
+fn reject_passkey_write_unlocked(kind: WalletKind) -> Result<(), HandlerError> {
+    if kind == WalletKind::PasskeyGated {
+        return Err(HandlerError::Unsupported(
+            PASSKEY_WRITE_UNLOCKED_DISABLED.into(),
+        ));
+    }
+    Ok(())
 }
 
 impl IpcServer {
@@ -132,6 +147,8 @@ impl IpcServer {
             chains,
             keystore: None,
             petals: None,
+            auth_services: AuthServices::default(),
+            signer_cache: None,
             shutdown: Arc::new(Notify::new()),
         }
     }
@@ -148,6 +165,16 @@ impl IpcServer {
     /// `-32601 method not found`.
     pub fn with_petals(mut self, runner: PetalRunner) -> Self {
         self.petals = Some(runner);
+        self
+    }
+
+    pub fn with_auth_services(mut self, auth_services: AuthServices) -> Self {
+        self.auth_services = auth_services;
+        self
+    }
+
+    pub fn with_signer_cache(mut self, signer_cache: Arc<SignerCache>) -> Self {
+        self.signer_cache = Some(signer_cache);
         self
     }
 
@@ -281,6 +308,10 @@ impl IpcServer {
                 Ok(()) => Response::ok(id, Value::Null),
                 Err(e) => map_handler_err(id, e),
             },
+            "sign_hash" => match self.do_sign_hash(&req.params).await {
+                Ok(v) => Response::ok(id, v),
+                Err(e) => map_handler_err(id, e),
+            },
             "wallet.sign_policy" => match self.do_wallet_sign_policy(&req.params).await {
                 Ok(()) => Response::ok(id, Value::Null),
                 Err(e) => map_handler_err(id, e),
@@ -289,7 +320,23 @@ impl IpcServer {
                 Ok(v) => Response::ok(id, v),
                 Err(e) => map_handler_err(id, e),
             },
+            "petals.install" => match self.do_petals_install(&req.params).await {
+                Ok(v) => Response::ok(id, v),
+                Err(e) => map_petal_err(id, e),
+            },
+            "petals.run" => match self.do_petals_run(&req.params).await {
+                Ok(v) => Response::ok(id, v),
+                Err(e) => map_petal_err(id, e),
+            },
             "petals.list" => match self.do_petals_list().await {
+                Ok(v) => Response::ok(id, v),
+                Err(e) => map_petal_err(id, e),
+            },
+            "petals.resolve" => match self.do_petals_resolve(&req.params).await {
+                Ok(v) => Response::ok(id, v),
+                Err(e) => map_petal_err(id, e),
+            },
+            "petals.name" => match self.do_petals_name(&req.params).await {
                 Ok(v) => Response::ok(id, v),
                 Err(e) => map_petal_err(id, e),
             },
@@ -327,7 +374,7 @@ impl IpcServer {
 
     async fn do_write_unlocked(&self, params: &Value) -> Result<(), HandlerError> {
         let path = parse_path(params)?;
-        let mut bytes = parse_write_bytes(params)?;
+        let bytes = parse_write_bytes(params)?;
         let wallet = params
             .get("wallet")
             .and_then(|v| v.as_str())
@@ -342,60 +389,56 @@ impl IpcServer {
             .map_err(|e: bloom_keystore::KeystoreError| HandlerError::backend(e.to_string()))?;
         match info.kind {
             WalletKind::PasskeyGated => {
-                // A daemon may have a signer cached from a previous ceremony.
-                // `write_unlocked` is the explicit "fresh user present" lane
-                // for VFS writes that sign or broadcast, so force the browser
-                // review instead of reusing that cached signer.
-                keystore.lock(wallet);
-                let intent = write_unlocked_intent(
-                    wallet,
-                    &path,
-                    &bytes,
-                    Some(bloom_proto::checksum_address(&info.address)),
-                    keystore.root().parent().map(|home| home.join("outbox")),
-                );
-                let reviewed_intent_hash = intent.intent_hash();
-                if let Some(home) = keystore.root().parent() {
-                    persist_outbox_review_intent(wallet, &path, &home.join("outbox"), &intent)
-                        .map_err(|e| HandlerError::backend(e.to_string()))?;
-                }
-                let editable_policy = if is_wallet_policy_write(wallet, &path) {
-                    Some(String::from_utf8_lossy(&bytes).to_string())
-                } else {
-                    None
-                };
-                let edited_policy = keystore
-                    .unlock_passkey_with_intent_and_policy_edit(
-                        wallet,
-                        Some(intent),
-                        editable_policy,
-                    )
-                    .await
-                    .map_err(|e: bloom_keystore::KeystoreError| {
-                        HandlerError::backend(e.to_string())
-                    })?;
-                if let Some(policy) = edited_policy {
-                    bytes = policy.into_bytes();
-                } else if is_outbox_confirm_write(wallet, &path) {
-                    if let Some(home) = keystore.root().parent() {
-                        persist_outbox_review_approved(
-                            wallet,
-                            &path,
-                            &home.join("outbox"),
-                            &reviewed_intent_hash,
-                        )
-                        .map_err(|e| HandlerError::backend(e.to_string()))?;
-                    }
-                    bytes.extend_from_slice(
-                        format!("\nreview_hash={reviewed_intent_hash}").as_bytes(),
-                    );
+                reject_passkey_write_unlocked(info.kind)?;
+            }
+            _ => {
+                keystore.unlock(wallet, passphrase.unwrap_or("")).map_err(
+                    |e: bloom_keystore::KeystoreError| HandlerError::backend(e.to_string()),
+                )?;
+                if self.auth_services.is_wired()
+                    && let Some((challenge_path, _approval_path)) =
+                        sealed_approval_paths(keystore, wallet, &path, &bytes)
+                    && challenge_path.exists()
+                {
+                    return Err(HandlerError::Unsupported(
+                        "fresh Sealed Approval requires a passkey wallet; local password wallets can only auto-confirm actions that remain in policy".into(),
+                    ));
                 }
             }
-            _ => keystore
-                .unlock(wallet, passphrase.unwrap_or(""))
-                .map_err(|e: bloom_keystore::KeystoreError| HandlerError::backend(e.to_string()))?,
         }
-        self.vfs.write(&path, &bytes).await
+        // For a policy-session mint, require wired Sealed Approval. The old
+        // forgeable marker fallback is removed; fail closed when unwired.
+        if is_policy_session_new(wallet, &path) && !self.auth_services.is_wired() {
+            return Err(HandlerError::Unsupported(
+                "policy-session mint requires Sealed Approval; \
+                 auth services are not wired (marker fallback removed)"
+                    .into(),
+            ));
+        }
+        // Paid request confirms can sign x402 or Tempo MPP credentials. The old
+        // forgeable marker fallback is removed; fail closed when unwired.
+        if let Some(home) = keystore.root().parent()
+            && let Some(_id) = request_confirm_id(home, &path)
+            && !self.auth_services.is_wired()
+        {
+            return Err(HandlerError::Unsupported(
+                "request confirm requires Sealed Approval; \
+                 auth services are not wired (marker fallback removed)"
+                    .into(),
+            ));
+        }
+        match self.vfs.write(&path, &bytes).await {
+            Ok(()) => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// WS-1 IPC delegate for `sign_hash`. Thin wrapper that hands off
+    /// to [`crate::sign_hash::handle_sign_hash`] after looking up the
+    /// wired [`AuthServices`]. All validation, grant gating, audit
+    /// emission, and error mapping happens in that module.
+    async fn do_sign_hash(&self, params: &Value) -> Result<Value, HandlerError> {
+        crate::sign_hash::handle_sign_hash(&self.auth_services, params).await
     }
 
     async fn do_wallet_sign_policy(&self, params: &Value) -> Result<(), HandlerError> {
@@ -420,7 +463,7 @@ impl IpcServer {
             let policy_digest = blake3::hash(policy_toml.as_bytes()).to_hex().to_string();
             let mut intent =
                 CeremonyIntent::new(wallet, "Sign Wallet Policy", CeremonyIntentKind::SignPolicy);
-            intent.wallet_address = address;
+            intent.wallet_address = address.clone();
             intent.summary_lines = vec![
                 format!("Review rules for wallet '{wallet}'."),
                 "This does not move money or place a trade.".into(),
@@ -439,15 +482,49 @@ impl IpcServer {
                 "policy_path": policy_path,
                 "policy_blake3": policy_digest,
             });
-            if let Ok(bytes) = serde_json::to_vec_pretty(&intent) {
+            keystore.lock(wallet);
+            let reviewed_policy = keystore
+                .unlock_passkey_with_intent_and_policy_edit(
+                    wallet,
+                    Some(intent),
+                    Some(policy_toml.clone()),
+                )
+                .await
+                .map_err(|e: bloom_keystore::KeystoreError| HandlerError::backend(e.to_string()))?;
+            let final_policy = reviewed_policy.unwrap_or(policy_toml);
+            toml::from_str::<bloom_proto::Policy>(&final_policy)
+                .map_err(|e| HandlerError::backend(format!("reviewed policy.toml: {e}")))?;
+            if final_policy != std::fs::read_to_string(&policy_path).unwrap_or_default() {
+                std::fs::write(&policy_path, final_policy.as_bytes())
+                    .map_err(|e| HandlerError::backend(format!("write policy.toml: {e}")))?;
+            }
+            let final_digest = blake3::hash(final_policy.as_bytes()).to_hex().to_string();
+            let mut reviewed_intent =
+                CeremonyIntent::new(wallet, "Sign Wallet Policy", CeremonyIntentKind::SignPolicy);
+            reviewed_intent.wallet_address = address;
+            reviewed_intent.summary_lines = vec![
+                format!("Review rules for wallet '{wallet}'."),
+                "This does not move money or place a trade.".into(),
+                "After approval, Bloom uses these rules to decide what is allowed.".into(),
+                format!("Policy digest: {final_digest}"),
+            ];
+            reviewed_intent.policy_lines = final_policy.lines().map(str::to_string).collect();
+            reviewed_intent.risk_lines = vec![
+                "Approving these rules can change what Bloom allows later.".into(),
+                "The OS passkey prompt only proves your presence; review the details on this page."
+                    .into(),
+            ];
+            reviewed_intent.artifact_paths = vec![policy_path.display().to_string()];
+            reviewed_intent.canonical_subject = serde_json::json!({
+                "kind": "sign_policy",
+                "wallet": wallet,
+                "policy_path": policy_path,
+                "policy_blake3": final_digest,
+            });
+            if let Ok(bytes) = serde_json::to_vec_pretty(&reviewed_intent) {
                 let review_path = wallet_dir.join("policy.review.json");
                 let _ = std::fs::write(&review_path, bytes);
             }
-            keystore.lock(wallet);
-            keystore
-                .unlock_passkey_with_intent(wallet, Some(intent))
-                .await
-                .map_err(|e: bloom_keystore::KeystoreError| HandlerError::backend(e.to_string()))?;
         }
         keystore
             .sign_policy(wallet)
@@ -467,27 +544,78 @@ impl IpcServer {
             .ok_or_else(|| PetalError::vm("petals not enabled on this daemon"))
     }
 
+    /// `params`: `{ bytes_b64? | text?, name?, caps?: ["vfs.read","vfs.write"] }`.
+    /// Either `bytes_b64` (raw wasm or WAT) or `text` (WAT only) must be set.
+    async fn do_petals_install(&self, _params: &Value) -> Result<Value, PetalError> {
+        Err(PetalError::vm(
+            "raw petal IPC install is unsupported; use `bloom petals install <package-dir|.petal.tar|github-url>`",
+        ))
+    }
+
+    /// `params`: `{ name_or_hash, stdin_b64?, input?, cap_mask?: ["vfs.read",...] }`.
+    /// `cap_mask` narrows the petal's declared caps; absent ⇒ use them as-is.
+    async fn do_petals_run(&self, _params: &Value) -> Result<Value, PetalError> {
+        Err(PetalError::vm(
+            "raw petal IPC run is unsupported; v2 app routes are dispatched through /apps",
+        ))
+    }
+
     async fn do_petals_list(&self) -> Result<Value, PetalError> {
         let runner = self.petals()?;
-        let package_hashes = runner.store().list_package_hashes()?;
-        let mut out = Vec::with_capacity(package_hashes.len());
-        for hash in package_hashes {
+        let names = runner.registry().snapshot();
+        // Build a hash → first-matching-name reverse map so each entry
+        // can carry its registered name (or null).
+        let mut name_for_hash: std::collections::BTreeMap<String, String> = Default::default();
+        for (name, hash) in &names {
+            name_for_hash.entry(hash.clone()).or_insert(name.clone());
+        }
+        let hashes = runner.store().list_hashes()?;
+        let mut out = Vec::with_capacity(hashes.len());
+        for hash in hashes {
             let meta = runner.store().load_meta(&hash)?;
-            let app_mount = meta
-                .local_app
-                .as_ref()
-                .map(|app| format!("apps/{}/", app.name));
             out.push(json!({
                 "hash": meta.hash,
                 "size": meta.size,
+                "name": name_for_hash.get(&meta.hash).cloned(),
                 "caps": meta.caps.iter().map(|c| c.as_str()).collect::<Vec<_>>(),
                 "installed_at_ms": meta.installed_at_ms,
                 "mode": meta.mode_str(),
-                "app_mount": app_mount,
-                "local_app": meta.local_app,
             }));
         }
         Ok(Value::Array(out))
+    }
+
+    async fn do_petals_resolve(&self, params: &Value) -> Result<Value, PetalError> {
+        let runner = self.petals()?;
+        let target = params
+            .get("name_or_hash")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| PetalError::vm("missing 'name_or_hash'"))?;
+        let hash = runner.resolve(target)?;
+        Ok(json!({ "hash": hash }))
+    }
+
+    /// `params`: `{ name, hash? }`. Omitted/empty `hash` unsets the name.
+    async fn do_petals_name(&self, params: &Value) -> Result<Value, PetalError> {
+        let runner = self.petals()?;
+        let name = params
+            .get("name")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| PetalError::vm("missing 'name'"))?;
+        let hash = params
+            .get("hash")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty());
+        match hash {
+            Some(h) => {
+                runner.registry().set(name, h)?;
+                Ok(json!({ "name": name, "hash": h }))
+            }
+            None => {
+                let removed = runner.registry().unset(name)?;
+                Ok(json!({ "name": name, "removed": removed }))
+            }
+        }
     }
 
     async fn do_petals_uninstall(&self, params: &Value) -> Result<Value, PetalError> {
@@ -534,8 +662,53 @@ fn write_path_uses_wallet_signer(path: &VfsPath) -> bool {
         {
             true
         }
+        // Everything else reaches the VFS handler through the plain write lane.
+        // In particular these first-party Sealed Approval actions are NOT raw
+        // signer lanes and must forward through to `vfs.write` rather than be
+        // denied here:
+        //   * Wallet policy writes (`policy.toml`): passkey wallets stage a
+        //     challenge and install only under a grant-gated PetalHost signature;
+        //     local wallets write immediately (their policy is unsigned).
+        //   * Policy-session minting (`policy-session/new`): the wallets handler
+        //     stages an approval challenge and mints the bounded session only
+        //     under a grant-gated signature — exactly like `policy.toml`.
+        //   * Paid HTTP confirm (`/requests/<id>/confirm`): the requests handler
+        //     stages an approval challenge on the first write and signs the
+        //     x402/Tempo MPP credential only under a grant-gated PetalHost
+        //     signature.
+        //   * Hyperliquid owner approvals (`agent_sessions/<wallet>/new.json`
+        //     and `exchange/<wallet>/send_asset.json`): the Hyperliquid
+        //     handler stages approval and signs only under a grant-gated
+        //     PetalHost signature.
+        // None of these silently consumes a cached signer, and the old
+        // write_unlocked lane is disabled for passkey wallets — denying them here
+        // would leave mounted confirm/mint with no working path.
         _ => false,
     }
+}
+
+fn request_confirm_id(home: &Path, path: &VfsPath) -> Option<String> {
+    match path.segments() {
+        [root, reference, action] if root == "requests" && action == "confirm" => {
+            if reference == "latest" {
+                latest_pending_request_id(home)
+            } else {
+                Some(reference.to_string())
+            }
+        }
+        [root, state, id, action]
+            if root == "requests" && state == "pending" && action == "confirm" =>
+        {
+            Some(id.to_string())
+        }
+        _ => None,
+    }
+}
+
+fn latest_pending_request_id(home: &Path) -> Option<String> {
+    let latest = std::fs::read_to_string(home.join("requests").join("latest")).ok()?;
+    let (state, id) = latest.trim().split_once('/')?;
+    (state == "pending").then(|| id.to_string())
 }
 
 fn is_wallet_policy_write(wallet: &str, path: &VfsPath) -> bool {
@@ -545,17 +718,102 @@ fn is_wallet_policy_write(wallet: &str, path: &VfsPath) -> bool {
     )
 }
 
-fn is_outbox_confirm_write(wallet: &str, path: &VfsPath) -> bool {
+fn is_policy_session_new(wallet: &str, path: &VfsPath) -> bool {
     matches!(
         path.segments(),
-        [root, w, chains, _chain, outbox, pending, _id, confirm]
-            if root == "wallets"
-                && w == wallet
-                && chains == "chains"
-                && outbox == "outbox"
-                && pending == "pending"
-                && confirm == "confirm"
+        [root, w, ps, leaf]
+            if root == "wallets" && w == wallet && ps == "policy-session" && leaf == "new"
     )
+}
+
+fn sealed_approval_paths(
+    keystore: &Keystore,
+    wallet: &str,
+    path: &VfsPath,
+    bytes: &[u8],
+) -> Option<(PathBuf, PathBuf)> {
+    let home = keystore.root().parent()?;
+    if let Some(id) = request_confirm_id(home, path) {
+        let dir = home.join("requests").join("pending").join(id);
+        return Some((
+            dir.join("approval_challenge.json"),
+            dir.join("approval.json"),
+        ));
+    }
+    if let Some(dir) = outbox_confirm_dir(wallet, path, &home.join("outbox")) {
+        return Some((
+            dir.join("approval_challenge.json"),
+            dir.join("approval.json"),
+        ));
+    }
+    if is_policy_session_new(wallet, path) {
+        let action_id = policy_session_action_id(wallet, bytes);
+        let dir = keystore
+            .root()
+            .join(wallet)
+            .join("policy-session")
+            .join(action_id);
+        return Some((
+            dir.join("approval_challenge.json"),
+            dir.join("approval.json"),
+        ));
+    }
+    if is_wallet_policy_write(wallet, path) {
+        let old_policy = keystore.raw_policy(wallet).ok()?.0;
+        let action_id = wallet_policy_action_id(wallet, old_policy.as_bytes(), bytes);
+        let dir = keystore
+            .root()
+            .join(wallet)
+            .join("policy-updates")
+            .join(action_id);
+        return Some((
+            dir.join("approval_challenge.json"),
+            dir.join("approval.json"),
+        ));
+    }
+    if let Some(dir) = polymarket_onboard_dir(home, wallet, path) {
+        return Some((
+            dir.join("approval_challenge.json"),
+            dir.join("approval.json"),
+        ));
+    }
+    if let Some(dir) = hyperliquid_usd_send_dir(home, wallet, path) {
+        return Some((
+            dir.join("approval_challenge.json"),
+            dir.join("approval.json"),
+        ));
+    }
+    if let Some(dir) = hyperliquid_agent_session_dir(home, wallet, path, bytes) {
+        return Some((
+            dir.join("approval_challenge.json"),
+            dir.join("approval.json"),
+        ));
+    }
+    None
+}
+
+fn policy_session_action_id(wallet: &str, data: &[u8]) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"bloom.policy_session.entry.v1");
+    hasher.update(wallet.as_bytes());
+    hasher.update(&[0]);
+    hasher.update(data);
+    format!("ps-{}", hasher.finalize().to_hex())
+}
+
+fn wallet_policy_hash_hex(policy: &[u8]) -> String {
+    blake3::hash(policy).to_hex().to_string()
+}
+
+fn wallet_policy_action_id(wallet: &str, old_policy: &[u8], proposed_policy: &[u8]) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"bloom.wallet_policy.update.v1");
+    hasher.update(wallet.as_bytes());
+    hasher.update(&[0]);
+    hasher.update(wallet_policy_hash_hex(old_policy).as_bytes());
+    hasher.update(&[0]);
+    hasher.update(wallet_policy_hash_hex(proposed_policy).as_bytes());
+    format!("policy-update-{}", hasher.finalize().to_hex())
 }
 
 fn outbox_confirm_dir(wallet: &str, path: &VfsPath, outbox_root: &Path) -> Option<PathBuf> {
@@ -581,46 +839,81 @@ fn outbox_confirm_dir(wallet: &str, path: &VfsPath, outbox_root: &Path) -> Optio
     }
 }
 
-fn persist_outbox_review_intent(
+fn polymarket_onboard_dir(home: &Path, wallet: &str, path: &VfsPath) -> Option<PathBuf> {
+    let [root, action, w, leaf] = path.segments() else {
+        return None;
+    };
+    if root == "polymarket" && action == "onboard" && w == wallet && leaf == "begin" {
+        Some(
+            home.join("polymarket")
+                .join(safe_sealed_approval_segment(wallet)?),
+        )
+    } else {
+        None
+    }
+}
+
+fn hyperliquid_usd_send_dir(home: &Path, wallet: &str, path: &VfsPath) -> Option<PathBuf> {
+    let [root, network, branch, w, leaf] = path.segments() else {
+        return None;
+    };
+    if root == "hyperliquid" && branch == "exchange" && w == wallet && leaf == "send_asset.json" {
+        Some(
+            home.join("hyperliquid")
+                .join("exchange")
+                .join(safe_sealed_approval_segment(network)?)
+                .join(safe_sealed_approval_segment(wallet)?),
+        )
+    } else {
+        None
+    }
+}
+
+fn hyperliquid_agent_session_dir(
+    home: &Path,
     wallet: &str,
     path: &VfsPath,
-    outbox_root: &Path,
-    intent: &CeremonyIntent,
-) -> std::io::Result<()> {
-    let Some(dir) = outbox_confirm_dir(wallet, path, outbox_root) else {
-        return Ok(());
+    bytes: &[u8],
+) -> Option<PathBuf> {
+    let [root, network, branch, w, leaf] = path.segments() else {
+        return None;
     };
-    std::fs::write(
-        dir.join("review_intent.json"),
-        serde_json::to_vec_pretty(intent).map_err(|e| std::io::Error::other(e.to_string()))?,
+    if !(root == "hyperliquid" && branch == "agent_sessions" && w == wallet && leaf == "new.json") {
+        return None;
+    }
+    let body: Value = serde_json::from_slice(bytes).ok()?;
+    let session_id = body.get("id")?.as_str()?;
+    Some(
+        home.join("hyperliquid")
+            .join("agent_sessions")
+            .join(safe_sealed_approval_segment(network)?)
+            .join(safe_sealed_approval_segment(wallet)?)
+            .join(safe_sealed_approval_segment(session_id)?),
     )
 }
 
-fn persist_outbox_review_approved(
-    wallet: &str,
-    path: &VfsPath,
-    outbox_root: &Path,
-    intent_hash: &str,
-) -> std::io::Result<()> {
-    let Some(dir) = outbox_confirm_dir(wallet, path, outbox_root) else {
-        return Ok(());
-    };
-    let approved = serde_json::json!({
-        "schema": "bloom.review_approved.v1",
-        "intent_hash": intent_hash,
-    });
-    std::fs::write(
-        dir.join("review_approved.json"),
-        serde_json::to_vec_pretty(&approved).map_err(|e| std::io::Error::other(e.to_string()))?,
-    )
+fn safe_sealed_approval_segment(raw: &str) -> Option<String> {
+    if raw.is_empty()
+        || raw == "."
+        || raw == ".."
+        || raw.len() > 128
+        || !raw
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+    {
+        return None;
+    }
+    Some(raw.to_string())
 }
 
+#[cfg(test)]
 fn write_unlocked_intent(
     wallet: &str,
     path: &VfsPath,
     body: &[u8],
     wallet_address: Option<String>,
     outbox_root: Option<PathBuf>,
+    wallet_policy_toml: Option<&str>,
 ) -> CeremonyIntent {
     let path_s = path.to_string_path();
     let segs = path.segments();
@@ -658,12 +951,37 @@ fn write_unlocked_intent(
         return intent;
     }
 
+    // Minting a bounded policy session: render the full envelope (chains, USD
+    // cap, TTL, and the exact pending-tx ids) so the human approves a concrete,
+    // finite authorization rather than an open-ended one.
+    let is_policy_session_new = matches!(
+        segs,
+        [root, w, ps, leaf]
+            if root == "wallets" && w == wallet && ps == "policy-session" && leaf == "new"
+    );
+    if is_policy_session_new {
+        let mut intent = bloom_proto::policy_session_mint_intent(wallet, &path_s, body);
+        intent.wallet_address = wallet_address;
+        return intent;
+    }
+
     if let Some(intent) = outbox_confirm_unlock_intent(
         wallet,
         &path_s,
         segs,
         wallet_address.clone(),
         outbox_root.as_deref(),
+    ) {
+        return intent;
+    }
+
+    if let Some(intent) = bloom_proto::hyperliquid_write_unlock_intent(
+        wallet,
+        &path_s,
+        segs,
+        body,
+        wallet_address.clone(),
+        wallet_policy_toml,
     ) {
         return intent;
     }
@@ -679,39 +997,11 @@ fn write_unlocked_intent(
             if root == "polymarket" && action == "onboard" && begin == "begin"
     );
     if is_pm_onboard_begin {
-        let mut intent = CeremonyIntent::new(
+        return bloom_polymarket::polymarket_onboard_ceremony_intent(
             wallet,
-            "Approve Polymarket Onboarding",
-            CeremonyIntentKind::WalletUnlock,
+            Some(&path_s),
+            wallet_address.clone(),
         );
-        let mut summary = vec![
-            format!("Run Polymarket onboarding for wallet '{wallet}'."),
-            "May deploy your deposit wallet, mint CLOB credentials, and create a \
-             revocable builder API key (relayer submission auth only — never fund authority)."
-                .to_string(),
-            "Signs one approval batch granting these eight spends from your deposit wallet:"
-                .to_string(),
-        ];
-        summary.extend(
-            bloom_polymarket::wallet::V2_APPROVAL_LABELS
-                .iter()
-                .map(|l| format!("  - {l}")),
-        );
-        intent.summary_lines = summary;
-        intent.risk_lines = vec![
-            "approve(MAX) grants unlimited pUSD spending to the V2 contracts; \
-             revoke later with `bloom polymarket revoke-approvals`."
-                .into(),
-            "The OS passkey prompt will show bloom/localhost, not these details.".into(),
-        ];
-        intent.artifact_paths = vec![path_s.clone()];
-        intent.canonical_subject = json!({
-            "kind": "polymarket_onboard_begin",
-            "wallet": wallet,
-            "path": path_s,
-            "approvals": bloom_polymarket::wallet::V2_APPROVAL_LABELS,
-        });
-        return intent;
     }
 
     let mut intent = CeremonyIntent::new(
@@ -736,6 +1026,7 @@ fn write_unlocked_intent(
     intent
 }
 
+#[cfg(test)]
 fn outbox_confirm_unlock_intent(
     wallet: &str,
     path_s: &str,
@@ -763,7 +1054,7 @@ fn outbox_confirm_unlock_intent(
         .join("plan.md");
     let plan = std::fs::read_to_string(&plan_path).ok()?;
     let plan_hash = blake3::hash(plan.as_bytes()).to_hex().to_string();
-    let defi_review = find_defi_review_for_outbox(outbox_root?, wallet, id);
+    let defi_review = find_defi_review_for_outbox(outbox_root?, wallet, chain, id);
     let mut intent = CeremonyIntent::new(
         wallet,
         format!("Approve {} Transaction", chain),
@@ -835,6 +1126,7 @@ fn outbox_confirm_unlock_intent(
 }
 
 #[derive(Debug, Clone)]
+#[cfg(test)]
 struct DefiReview {
     id: String,
     plan_md: String,
@@ -843,9 +1135,11 @@ struct DefiReview {
     risk_lines: Vec<String>,
 }
 
+#[cfg(test)]
 fn find_defi_review_for_outbox(
     outbox_root: &Path,
     wallet: &str,
+    chain: &str,
     outbox_id: &str,
 ) -> Option<DefiReview> {
     let home = if outbox_root.file_name().is_some_and(|name| name == "outbox") {
@@ -855,17 +1149,29 @@ fn find_defi_review_for_outbox(
     };
     let sessions = home.join("defi").join(wallet).join("sessions");
     for entry in std::fs::read_dir(sessions).ok()? {
-        let path = entry.ok()?.path();
+        // Skip an unreadable/corrupt sibling rather than aborting the whole scan
+        // (which would silently drop a valid same-chain review later in the dir).
+        let Ok(entry) = entry else { continue };
+        let path = entry.path();
         if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
             continue;
         }
-        let raw = std::fs::read_to_string(&path).ok()?;
-        let value: Value = serde_json::from_str(&raw).ok()?;
+        let Ok(raw) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<Value>(&raw) else {
+            continue;
+        };
+        // Outbox ids are scoped per chain (`.../wallet/<chain>/pending/<id>`),
+        // so the same id can exist on two chains. Bind the review to the chain
+        // being confirmed, or a session for a *different* chain (e.g. a Polygon
+        // route) could shadow this confirm's copy with the wrong chain.
+        let chain_matches = value.get("chain").and_then(|v| v.as_str()) == Some(chain);
         let staged = value
             .get("staged_ids")
             .and_then(|v| v.as_array())
             .is_some_and(|ids| ids.iter().any(|id| id.as_str() == Some(outbox_id)));
-        if !staged {
+        if !chain_matches || !staged {
             continue;
         }
         let id = value
@@ -1054,8 +1360,60 @@ impl IpcClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bloom_test_util::mocks::SingleFileHandler;
     use std::sync::Arc;
+
+    struct SingleFileHandler {
+        name: String,
+        body: Vec<u8>,
+    }
+
+    impl SingleFileHandler {
+        fn new(name: impl Into<String>, body: Vec<u8>) -> Self {
+            Self {
+                name: name.into(),
+                body,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Handler for SingleFileHandler {
+        async fn lookup(&self, path: &VfsPath) -> Result<Entry, HandlerError> {
+            match path
+                .segments()
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .as_slice()
+            {
+                [] => Ok(Entry::dir("stub")),
+                [leaf] if *leaf == self.name => Ok(Entry::read_only_file(&self.name)),
+                _ => Err(HandlerError::NotFound(path.to_string_path())),
+            }
+        }
+
+        async fn read(&self, path: &VfsPath) -> Result<Vec<u8>, HandlerError> {
+            match path
+                .segments()
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .as_slice()
+            {
+                [leaf] if *leaf == self.name => Ok(self.body.clone()),
+                [] => Err(HandlerError::NotAFile(path.to_string_path())),
+                _ => Err(HandlerError::NotFound(path.to_string_path())),
+            }
+        }
+
+        async fn list(&self, path: &VfsPath) -> Result<Vec<Entry>, HandlerError> {
+            if path.is_root() {
+                Ok(vec![Entry::read_only_file(&self.name)])
+            } else {
+                Err(HandlerError::NotADir(path.to_string_path()))
+            }
+        }
+    }
 
     fn vfs() -> Vfs {
         Vfs::builder()
@@ -1081,8 +1439,35 @@ mod tests {
         for path in [
             "/defi/intents/minnow/0001/confirm",
             "/polymarket/trade/minnow/new",
+            // policy.toml now reaches the VFS handler, which stages a Sealed
+            // Approval for passkey wallets rather than being denied at the lane.
+            "/wallets/minnow/policy.toml",
+            // policy-session/new likewise reaches the wallets handler, which
+            // stages a Sealed Approval challenge and mints the bounded session
+            // only under a grant-gated signature (handler-owned, not a raw lane).
+            "/wallets/minnow/policy-session/new",
             "/wallets/minnow/chains/polygon/outbox/new.tx",
             "/wallets/minnow/chains/polygon/outbox/pending/0001/confirm",
+            // Paid-request confirm likewise reaches the VFS handler: the first
+            // write stages a Sealed Approval challenge and signing only happens
+            // under a grant-gated PetalHost signature.
+            "/requests/latest/confirm",
+            "/requests/req_123/confirm",
+            "/requests/pending/req_123/confirm",
+            "/requests/new",
+            "/requests/pending/req_123/cancel",
+            "/hyperliquid/mainnet/agent_sessions/minnow/session-1/schedule_cancel.json",
+            "/hyperliquid/mainnet/agent_sessions/minnow/session-1/order.json",
+            "/hyperliquid/mainnet/agent_sessions/minnow/session-1/cancel_all",
+            "/hyperliquid/mainnet/agent_sessions/minnow/new.json",
+            "/hyperliquid/mainnet/agent_sessions/minnow/session-1/orphan_cancel_all",
+            "/hyperliquid/mainnet/agent_sessions/minnow/session-1/orphan_close_all",
+            "/hyperliquid/mainnet/exchange/minnow/order.json",
+            "/hyperliquid/mainnet/exchange/minnow/cancel.json",
+            "/hyperliquid/mainnet/exchange/minnow/schedule_cancel.json",
+            "/hyperliquid/mainnet/exchange/minnow/update_leverage.json",
+            "/hyperliquid/mainnet/exchange/minnow/send_asset.json",
+            "/hyperliquid/mainnet/exchange/minnow/raw_signed.json",
         ] {
             let p = VfsPath::parse(path).unwrap();
             assert!(!write_path_uses_wallet_signer(&p), "{path}");
@@ -1098,9 +1483,25 @@ mod tests {
     }
 
     #[test]
+    fn passkey_write_unlocked_is_hard_disabled() {
+        let err = reject_passkey_write_unlocked(WalletKind::PasskeyGated).unwrap_err();
+        let HandlerError::Unsupported(msg) = err else {
+            panic!("expected unsupported error");
+        };
+        assert!(msg.contains("write_unlocked is disabled"), "{msg}");
+        assert!(msg.contains("Sealed Approval"), "{msg}");
+        assert!(msg.contains("PetalHost::sign_hash"), "{msg}");
+    }
+
+    #[test]
+    fn local_write_unlocked_lane_is_retained() {
+        reject_passkey_write_unlocked(WalletKind::Local).unwrap();
+    }
+
+    #[test]
     fn onboard_begin_unlock_intent_lists_grants_not_just_the_path() {
         let p = VfsPath::parse("/polymarket/onboard/minnow/begin").unwrap();
-        let intent = write_unlocked_intent("minnow", &p, b"y", None, None);
+        let intent = write_unlocked_intent("minnow", &p, b"y", None, None, None);
         // The reviewer must see the concrete onboarding effects, not a bare path.
         let text = intent.summary_lines.join("\n");
         assert!(text.contains("approve(MAX) -> CTF Exchange V2"), "{text}");
@@ -1117,6 +1518,7 @@ mod tests {
             b"hello",
             None,
             None,
+            None,
         );
         assert_eq!(g.canonical_subject["kind"], "vfs_write_unlocked");
         assert!(g.intent_hash() != intent.intent_hash());
@@ -1126,13 +1528,52 @@ mod tests {
     fn policy_write_unlock_intent_shows_policy_body() {
         let p = VfsPath::parse("/wallets/minnow/policy.toml").unwrap();
         let body = b"[defi]\nrequire_calldata_verification = false\n";
-        let intent = write_unlocked_intent("minnow", &p, body, Some("0xabc".into()), None);
+        let intent = write_unlocked_intent("minnow", &p, body, Some("0xabc".into()), None, None);
         assert_eq!(intent.kind, CeremonyIntentKind::SignPolicy);
         assert_eq!(intent.canonical_subject["kind"], "vfs_policy_write");
         assert_eq!(intent.wallet_address.as_deref(), Some("0xabc"));
         let policy = intent.policy_lines.join("\n");
         assert!(policy.contains("require_calldata_verification = false"));
         assert!(intent.summary_lines.join("\n").contains("Review rules"));
+    }
+
+    #[test]
+    fn hyperliquid_agent_session_intent_shows_authority_and_bounds() {
+        let p = VfsPath::parse("/hyperliquid/mainnet/agent_sessions/minnow/new.json").unwrap();
+        let body = br#"{"id":"btc-hour-1","agent_name":"bloom-btc-hour"}"#;
+        let policy = r#"
+[hyperliquid]
+allowed_assets = ["BTC"]
+allowed_order_types = ["limit"]
+max_notional_usd = "12"
+max_position_usd = "12"
+max_loss_usd = "5"
+max_leverage = 3
+max_session_secs = 1800
+allow_reduce_only = true
+allow_trigger_orders = false
+allow_twap = false
+allow_builder_fees = false
+allow_vault_or_subaccount = false
+"#;
+        let intent =
+            write_unlocked_intent("minnow", &p, body, Some("0xabc".into()), None, Some(policy));
+        let summary = intent.summary_lines.join("\n");
+        let review = intent.policy_lines.join("\n");
+        assert_eq!(intent.title, "Authorize Hyperliquid Trading Session");
+        assert_eq!(
+            intent.canonical_subject["kind"],
+            "hyperliquid_agent_session_grant"
+        );
+        assert!(summary.contains("trade-only API wallet"));
+        assert!(summary.contains("Session id: btc-hour-1"));
+        assert!(summary.contains("Agent name: bloom-btc-hour"));
+        assert!(summary.contains("without more passkey prompts"));
+        assert!(review.contains("session_key = \"trade-only API wallet\""));
+        assert!(review.contains("allowed_assets = \"BTC\""));
+        assert!(review.contains("max_notional_usd = \"$12"));
+        assert!(review.contains("max_session_secs = \"1800\""));
+        assert!(review.contains("withdrawals = \"not allowed\""));
     }
 
     #[test]
@@ -1158,6 +1599,7 @@ mod tests {
             b"y",
             Some("0xabc".into()),
             Some(tmp.path().to_path_buf()),
+            None,
         );
         assert_eq!(intent.title, "Approve base Transaction");
         assert_eq!(intent.kind, CeremonyIntentKind::EvmTransaction);
@@ -1192,6 +1634,7 @@ mod tests {
             sessions.join("0001-route.json"),
             serde_json::to_vec_pretty(&json!({
                 "id": "0001-route",
+                "chain": "base",
                 "staged_ids": ["0001-test"],
                 "plan_md": "# DeFi intent\n\nIntent:    swap 5 USDC to MATIC\nChain:     base (id 8453)\nDest chain:polygon (id 137)\nReceiver:  0xabc\nToken in:  USDC amount=5000000 (raw)\nToken out: MATIC amountOut≈1\nSlippage:  50 bps\nRouter:    0xrouter\nProtocols: stargate -> 1inch\nTx value:  1 wei\n",
                 "policy_checks": [
@@ -1207,8 +1650,14 @@ mod tests {
         .unwrap();
         let p =
             VfsPath::parse("/wallets/minnow/chains/base/outbox/pending/0001-test/confirm").unwrap();
-        let intent =
-            write_unlocked_intent("minnow", &p, b"y", Some("0xabc".into()), Some(outbox_root));
+        let intent = write_unlocked_intent(
+            "minnow",
+            &p,
+            b"y",
+            Some("0xabc".into()),
+            Some(outbox_root),
+            None,
+        );
         let summary = intent.summary_lines.join("\n");
         assert!(summary.contains("DeFi route intent 0001-route"));
         assert!(summary.contains("Intent:    swap 5 USDC to MATIC"));
@@ -1222,6 +1671,56 @@ mod tests {
                 .contains("# Staged tx 0001-test")
         );
         assert_eq!(intent.canonical_subject["defi_session_id"], "0001-route");
+    }
+
+    #[test]
+    fn outbox_confirm_ignores_defi_review_for_a_different_chain() {
+        // Regression: outbox ids are per-chain, so a same-id session on another
+        // chain must NOT shadow this confirm's copy (the stale "Polygon" bleed).
+        let tmp = tempfile::tempdir().unwrap();
+        let outbox_root = tmp.path().join("outbox");
+        let dir = outbox_root
+            .join("minnow")
+            .join("base")
+            .join("pending")
+            .join("0001-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("plan.md"),
+            "# Staged tx 0001-test\n\nWallet: minnow\nFrom:   0xabc\nTo:     0xdef\nChain:  base (id 8453)\nValue:  0.1 ETH\nNonce:  7\nGas:    limit=1\nData:   4 bytes\n",
+        )
+        .unwrap();
+        // A *Polygon* session that happens to reference the same outbox id.
+        let sessions = tmp.path().join("defi").join("minnow").join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::write(
+            sessions.join("0001-route.json"),
+            serde_json::to_vec_pretty(&json!({
+                "id": "0001-route",
+                "chain": "polygon",
+                "staged_ids": ["0001-test"],
+                "plan_md": "# DeFi intent\n\nIntent:    swap 1 USDC to MATIC\nChain:     polygon (id 137)\n",
+                "policy_checks": []
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let p =
+            VfsPath::parse("/wallets/minnow/chains/base/outbox/pending/0001-test/confirm").unwrap();
+        let intent = write_unlocked_intent(
+            "minnow",
+            &p,
+            b"y",
+            Some("0xabc".into()),
+            Some(outbox_root),
+            None,
+        );
+        let summary = intent.summary_lines.join("\n");
+        // The Base confirm shows Base, never the Polygon session's copy.
+        assert!(summary.contains("Chain:  base (id 8453)"));
+        assert!(!summary.contains("DeFi route intent"));
+        assert!(!summary.to_lowercase().contains("polygon"));
+        assert!(intent.canonical_subject["defi_session_id"].is_null());
     }
 
     #[tokio::test]

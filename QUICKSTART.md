@@ -11,6 +11,21 @@ If you are delegating setup to an agent, the fastest path is:
 Read https://bloom.directory/SKILL.md and set up Bloom.
 ```
 
+## Agent-first shape
+
+Bloom's primary surface is the VFS. Use `init` to create the home directory,
+`wallet` commands for explicit key management, and `vfs cat|ls|write` for the
+same paths an agent sees through the mount. There is no separate top-level
+onboarding dashboard; first-run setup is just the same primitives in sequence:
+create a wallet, show its deposit QR, then inspect balances and staged actions
+through the VFS.
+
+Fund the deposit address, then review every staged plan before signing. Caps
+and allow/deny live in each wallet's `policy.toml`; value-moving actions still
+go through the stage → review → confirm outbox flow. Polymarket trading
+additionally requires `bloom polymarket onboard <wallet>` (see `AGENTS.md`).
+Re-display a deposit address any time with `bloom wallet address <name> --qr`.
+
 ## Prerequisites
 
 - Rust toolchain — pinned via `rust-toolchain.toml` (installed
@@ -47,28 +62,31 @@ ignore them and create our own wallet.
 
 ## 3. Create a wallet
 
-The keystore encrypts the key with `BLOOM_PASSPHRASE` (argon2id +
-chacha20poly1305). For a demo, any passphrase works.
-
-The CLI shortcut and the VFS write are equivalent — wallets are
-first-class VFS citizens:
+The default wallet kind is **passkey** (WebAuthn) — a browser ceremony runs
+and no passphrase is needed. For a quick local demo you can instead create a
+**passphrase** wallet with `--local` (non-interactive creation also needs
+`--allow-passphrase-wallet` and `--passphrase-file`):
 
 ```sh
-# CLI shortcut
-BLOOM_HOME=/tmp/bloom-demo BLOOM_PASSPHRASE=devonly \
-  cargo run -p bloom -- wallet new alice --passphrase devonly
+# Passkey wallet (default) — opens a browser WebAuthn ceremony:
+BLOOM_HOME=/tmp/bloom-demo cargo run -p bloom -- wallet new alice
+
+# Passphrase wallet for dev/CI (writes a RECOVERY.txt next to the key):
+echo devonly > /tmp/pw.txt
+BLOOM_HOME=/tmp/bloom-demo cargo run -p bloom -- wallet new alice \
+  --local --allow-passphrase-wallet --passphrase-file /tmp/pw.txt
 
 # Equivalent VFS write (what an agent would do over the mount).
-# Plain text body = create a local wallet with that name.
-BLOOM_HOME=/tmp/bloom-demo BLOOM_PASSPHRASE=devonly \
-  cargo run -p bloom -- vfs write /wallets/new --data 'alice'
+# Plain text body = create a passkey wallet with that name.
+BLOOM_HOME=/tmp/bloom-demo cargo run -p bloom -- vfs write /wallets/new --data 'alice'
 
-# Full TOML form for import / watch:
+# Full TOML form for import / watch / passphrase:
 #   name = "alice"
-#   kind = "import"        # or "local" (default) | "watch"
-#   private_key = "0x..."  # required for import
-#   address = "0x..."      # required for watch
-#   passphrase = "..."     # optional; falls back to BLOOM_PASSPHRASE
+#   kind = "local"        # or "passkey" (default) | "import" | "watch"
+#   private_key = "0x..." # required for import
+#   address = "0x..."     # required for watch
+#   passphrase = "..."    # required for local/import
+#   allow_passphrase_wallet = true  # required for local/import
 ```
 
 You'll get back something like `created wallet 'alice': 0x...`. List
@@ -143,7 +161,8 @@ BLOOM_HOME=/tmp/bloom-demo \
 ```
 
 When `bloom serve` is running, the unlock survives across calls and you
-can write to `…/pending/<id>/confirm` directly:
+can write to `…/pending/<id>/confirm` directly (this applies to passphrase /
+local wallets — the example below uses one):
 
 ```sh
 BLOOM_HOME=/tmp/bloom-demo cargo run -p bloom -- wallet unlock alice \
@@ -151,6 +170,13 @@ BLOOM_HOME=/tmp/bloom-demo cargo run -p bloom -- wallet unlock alice \
 BLOOM_HOME=/tmp/bloom-demo cargo run -p bloom -- vfs write \
   /wallets/alice/chains/anvil/outbox/pending/<id>/confirm --data y
 ```
+
+> **Passkey wallets:** the direct VFS `confirm` write over the serve socket is
+> not available for passkey-gated wallets — the WebAuthn ceremony binds
+> `localhost` and the system browser and is only reachable from the foreground
+> CLI. Stop `bloom serve` (or let the CLI fall back to the in-process path) and
+> run `bloom wallet confirm <wallet> <chain> <id> --text y` to drive the
+> browser ceremony, obtain the Sealed Approval grant, and broadcast in one shot.
 
 The daemon signs, broadcasts, moves the directory to `sent/<id>/`
 (with `tx_hash` inside), and links the tx into
@@ -179,7 +205,7 @@ it expire after the configured TTL) cancels the stage.
   and contract `source` / `abi`. Requires an `[etherscan]` block in
   `config.toml`.
 - **ERC-20 reads** — `chains/<c>/addresses/<a>/tokens/<token>/{balance,
-  balance.raw,balance.formatted,symbol,decimals}` (live `eth_call`).
+  balance.raw,balance.json,symbol,decimals}` (live `eth_call`).
 - **ENS** — recipient names like `vitalik.eth` resolve in tx intents
   via the canonical mainnet registry; forward resolution is also
   exposed at `ens/<name>.eth`.
@@ -191,6 +217,28 @@ it expire after the configured TTL) cancels the stage.
   needed; default slippage is 50 bps.
 - **Prices** — keyless DefiLlama at `prices/spot/<coin>(.usd)` and
   `prices/change_24h/<coin>`.
+- **Hyperliquid** — perp and spot market data, order books, candles,
+  account state at `/hyperliquid/<network>/...`. Agent sessions
+  (one-time approveAgent, then bounded trading) at
+  `/hyperliquid/<network>/agent_sessions/<wallet>/...`. One-off
+  owner-signed writes at `/hyperliquid/<network>/exchange/<wallet>/...`
+  labeled ADVANCED. Read `/hyperliquid/README.md`.
+- **Polymarket** — prediction-market trading via CLI (`bloom polymarket
+  ...`). VFS staging at `/polymarket/...`; pUSD funding requests can be
+  confirmed with `bloom vfs write /polymarket/fund/<wallet>/<id>/confirm
+  --unlock-wallet <wallet> --data confirm`, and trade drafts can be posted with
+  `bloom vfs write /polymarket/trade/<wallet>/drafts/<id>/confirm
+  --unlock-wallet <wallet> --data confirm`. Exit actions also have VFS parity:
+  cancel runs directly at `/polymarket/trade/<wallet>/orders/<order-id>/cancel`
+  (no unlock — risk-reducing, CLOB creds only), while redeem, revoke-approvals,
+  and pUSD withdraw are owner-signed and confirm through the foreground path
+  (`/polymarket/redeem/<wallet>/<slug>/confirm`,
+  `/polymarket/revoke-approvals/<wallet>/request/confirm`,
+  `/polymarket/withdraw/<wallet>/pusd/confirm` with
+  `--data '{"confirm":true,"amount":"..."}'`). A capability primitive (scoped
+  approve, TTL, caps) is in active development — see
+  `docs/plans/2026-06-20-agent-obvious-capability-model.md`.
+  Read `/polymarket/README.md`.
 - **Zero-config chain reads** — Ethereum, Base, Arbitrum, Optimism,
   Polygon, BNB Smart Chain, Avalanche, Gnosis, Linea, HyperEVM, and
   Anvil are present after `bloom init`; live-network broadcasts remain
@@ -221,9 +269,11 @@ home. Exit the subshell to tear everything down.
 
 ## End-to-end acceptance
 
-`scripts/acceptance.sh` boots Anvil, imports the funded test key, and
-drives a native ETH send and an ERC-20 transfer through the
-stage-confirm-broadcast loop on a local devnet. Optional Uniswap V2 /
+`scripts/acceptance.sh` boots Anvil, imports the funded test key, stages a
+native ETH send and an ERC-20 transfer, and verifies the mounted Sealed
+Approval gate: initial confirm is denied, `approval_challenge.json` is
+written in both the wallet projection and central `/outbox/pending/<action_id>`
+store, and the challenge includes a local `ceremony_url`. Optional Uniswap V2 /
 Enso scenarios on a mainnet fork run when `BLOOM_MAINNET_RPC` is set.
 
 `tests/docker/run.sh` is the dockerized harness with six modes:

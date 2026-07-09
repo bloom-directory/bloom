@@ -26,7 +26,7 @@
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
-use bloom_chain::ChainClient;
+use bloom_evm::ChainClient;
 use bloom_it::spawn_anvil;
 use bloom_proto::ChainSpec;
 

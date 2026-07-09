@@ -52,15 +52,16 @@ cat /bloom/chains/ethereum/head/full.json | jq '.header.baseFeePerGas'
 
 ## Addresses (core, RPC-only)
 
-`addresses/<addr>/` lists `balance`, `balance.eth`, `balance.raw`,
+`addresses/<addr>/` lists `balance`, `balance.raw`, `balance.json`,
 `nonce`, `code`, `is_contract`, plus `tokens/` and `nfts/` subdirs. ENS
 reverse and the Etherscan history files only appear when the matching
 backend is wired (see further below).
 
 ```sh
 # vitalik.eth
-cat /bloom/chains/ethereum/addresses/0xd8dA6BF26964aF9D7eeD9e03E53415D37aA96045/balance       # wei (decimal)
-cat /bloom/chains/ethereum/addresses/0xd8dA6BF26964aF9D7eeD9e03E53415D37aA96045/balance.eth   # "1.234567 ETH"
+cat /bloom/chains/ethereum/addresses/0xd8dA6BF26964aF9D7eeD9e03E53415D37aA96045/balance       # "1.234567 ETH" (display, with symbol)
+cat /bloom/chains/ethereum/addresses/0xd8dA6BF26964aF9D7eeD9e03E53415D37aA96045/balance.raw   # wei (integer base units)
+cat /bloom/chains/ethereum/addresses/0xd8dA6BF26964aF9D7eeD9e03E53415D37aA96045/balance.json  # { symbol, decimals, raw, formatted, display }
 cat /bloom/chains/ethereum/addresses/0xd8dA6BF26964aF9D7eeD9e03E53415D37aA96045/nonce
 cat /bloom/chains/ethereum/addresses/0xd8dA6BF26964aF9D7eeD9e03E53415D37aA96045/code          # 0x for EOA
 cat /bloom/chains/ethereum/addresses/0xd8dA6BF26964aF9D7eeD9e03E53415D37aA96045/is_contract   # true / false
@@ -87,14 +88,14 @@ allowance is **not** exposed at this address-scoped path; use
 
 ```sh
 ls /bloom/chains/ethereum/addresses/0xd8dA6BF26964aF9D7eeD9e03E53415D37aA96045/tokens/0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48/
-# → balance, balance.raw, balance.formatted, symbol, decimals
+# → balance, balance.raw, balance.json, symbol, decimals
 
-cat /bloom/chains/ethereum/addresses/0xd8dA6BF26964aF9D7eeD9e03E53415D37aA96045/tokens/0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48/balance.formatted   # "1234.56 USDC"
+cat /bloom/chains/ethereum/addresses/0xd8dA6BF26964aF9D7eeD9e03E53415D37aA96045/tokens/0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48/balance   # "1234.56 USDC" (display, with symbol)
 cat /bloom/chains/ethereum/addresses/0xd8dA6BF26964aF9D7eeD9e03E53415D37aA96045/tokens/0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2/symbol            # → WETH
 cat /bloom/chains/ethereum/addresses/0xd8dA6BF26964aF9D7eeD9e03E53415D37aA96045/tokens/0x6B175474E89094C44Da98b954EedeAC495271d0f/decimals          # → 18
 
 # Same shape on Base (USDC on Base):
-cat /bloom/chains/base/addresses/0xd8dA6BF26964aF9D7eeD9e03E53415D37aA96045/tokens/0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913/balance.formatted
+cat /bloom/chains/base/addresses/0xd8dA6BF26964aF9D7eeD9e03E53415D37aA96045/tokens/0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913/balance
 
 # Allowance: read it via the token's allowance() method.
 echo '{"args":["0xd8dA6BF26964aF9D7eeD9e03E53415D37aA96045","0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D"]}' \

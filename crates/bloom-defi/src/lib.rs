@@ -796,22 +796,9 @@ pub fn resolve_token_symbol(chain_id: u64, sym: &str) -> Option<Address> {
     if matches!(upper.as_str(), "ETH" | "ETHER" | "MATIC" | "BNB" | "AVAX") {
         return NATIVE_TOKEN.parse().ok();
     }
-    let resolved = match (chain_id, upper.as_str()) {
-        (1, "USDC") => "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48".parse().ok(),
-        (1, "USDT") => "0xdAC17F958D2ee523a2206206994597C13D831ec7".parse().ok(),
-        (1, "DAI") => "0x6B175474E89094C44Da98b954EedeAC495271d0F".parse().ok(),
-        (1, "WETH") => "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2".parse().ok(),
-        (1, "WBTC") => "0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599".parse().ok(),
-        (10, "USDC") => "0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85".parse().ok(),
-        (137, "USDC") => "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359".parse().ok(),
-        (137, "USDT") => "0xc2132D05D31c914a87C6611C10748AEb04B58e8F".parse().ok(),
-        (137, "WETH") => "0x7ceB23fD6bC0adD59E62ac25578270cFf1b9f619".parse().ok(),
-        (42161, "USDC") => "0xaf88d065e77c8cC2239327C5EDb3A432268e5831".parse().ok(),
-        (42161, "USDT") => "0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9".parse().ok(),
-        (42161, "WETH") => "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1".parse().ok(),
-        (8453, "USDC") => "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913".parse().ok(),
-        _ => None,
-    };
+    // Symbol majors come from the shared `bloom_proto::tokens` table.
+    let resolved =
+        bloom_proto::tokens::resolve_symbol(chain_id, &upper).and_then(|t| t.address.parse().ok());
     if resolved.is_none() {
         tracing::debug!(chain_id, symbol = %upper, "enso.token.unknown_symbol");
     }

@@ -31,7 +31,7 @@ use alloy::sol_types::SolStruct;
 use serde::{Deserialize, Serialize};
 
 use crate::eip712::{CTF_EXCHANGE_V2, NEG_RISK_EXCHANGE_V2};
-use crate::signer::KeystoreSigner;
+use crate::signer::{KeystoreSigner, OnboardSigner};
 use crate::types::Side;
 use crate::{PolymarketError, Result};
 
@@ -417,6 +417,20 @@ pub fn build_order(p: &OrderParams) -> Order {
 /// EIP-712 signing hash for `order` against the V2 exchange domain.
 pub fn signing_hash(order: &Order, chain_id: u64, neg_risk: bool) -> B256 {
     order.eip712_signing_hash(&ctf_exchange_domain(chain_id, neg_risk))
+}
+
+/// EIP-712 struct-only hash of `order` (the inner typed-data contents hash,
+/// used by the POLY_1271 wrapped encoding). Exposed so the pure builder in
+/// `crate::signing` can wrap a host-supplied raw signature without touching
+/// the keystore.
+pub fn signing_hash_contents(order: &Order) -> B256 {
+    order.eip712_hash_struct()
+}
+
+/// Verbatim `Order` EIP-712 type string used for the ERC-7739 wrap. Public for
+/// the same reason as [`signing_hash_contents`].
+pub fn order_type_string() -> &'static str {
+    ORDER_TYPE_STRING
 }
 
 // ── POLY_1271 (deposit wallet, signatureType 3) ──────────────────────────────
