@@ -52,7 +52,9 @@ fn host_from_handler(e: HandlerError) -> HostError {
     match e {
         HandlerError::NotFound(s) => HostError::NotFound(s),
         HandlerError::NotADir(s) | HandlerError::NotAFile(s) => HostError::Invalid(s),
-        HandlerError::PermissionDenied => HostError::Denied("vfs".into()),
+        HandlerError::PermissionDenied | HandlerError::OperationNotPermitted => {
+            HostError::Denied("vfs".into())
+        }
         HandlerError::Invalid(s) => HostError::Invalid(s),
         HandlerError::Unsupported(s) => HostError::Backend(format!("unsupported: {s}")),
         HandlerError::Backend(s) => HostError::Backend(s),

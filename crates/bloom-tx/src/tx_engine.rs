@@ -1293,6 +1293,110 @@ impl TxEngine {
     /// rebroadcast (fix #2). Refuses any pending entry whose `expires_ms`
     /// has passed (fix #3) — the caller should sweep expired and re-stage.
     #[allow(clippy::too_many_arguments)]
+    pub async fn prepare_confirm_write_open(
+        &self,
+        permit: &HomeWritePermit,
+        wallet: &str,
+        chain_name: &str,
+        id: &str,
+        chain: &ChainClient,
+        policy: &Policy,
+        override_warnings: bool,
+    ) -> Result<(), TxEngineError> {
+        self.assert_write_permit(permit)?;
+        let entry = self
+            .outbox
+            .read_in_state(wallet, chain_name, id, OutboxState::Pending)?;
+        let mut staged = entry.staged.clone();
+
+        if self
+            .outbox
+            .read_broadcast_attempt(&entry, BroadcastAttemptKind::Confirm)?
+            .is_some()
+        {
+            return Ok(());
+        }
+
+        let now = now_ms();
+        if staged.expires_ms != 0 && now >= staged.expires_ms {
+            return Err(TxEngineError::Outbox(OutboxError::StagedExpired {
+                id: staged.id.clone(),
+                expired_at: staged.expires_ms,
+                now,
+            }));
+        }
+
+        if let Some(dep_id) = staged.depends_on.clone() {
+            self.ensure_dependency_satisfied(wallet, chain_name, &dep_id)?;
+        }
+
+        let hard = policy_engine::has_hard_violation(&staged.policy_checks);
+        if hard {
+            staged.status = TxStatus::Failed;
+            self.outbox
+                .transition(&entry, crate::outbox::OutboxState::Failed)?;
+            debug!(
+                id = %staged.id,
+                wallet,
+                chain = %chain_name,
+                reason = "hard",
+                "tx.policy_denied"
+            );
+            return Err(TxEngineError::PolicyDenied);
+        }
+        let warn = policy_engine::has_warning(&staged.policy_checks);
+        if warn && !override_warnings {
+            debug!(
+                id = %staged.id,
+                wallet,
+                chain = %chain_name,
+                reason = "warn_no_override",
+                "tx.policy_denied"
+            );
+            return Err(TxEngineError::PolicyDenied);
+        }
+
+        const ENSO_QUOTE_MAX_AGE_SECS: u64 = 300;
+        let now_secs = (now_ms() / 1000) as u64;
+        if let Some(age) = enso_quote_age_secs(&staged.data_hex, now_secs)
+            && age > ENSO_QUOTE_MAX_AGE_SECS
+            && !override_warnings
+        {
+            return Err(TxEngineError::EnsoQuoteStale { age });
+        }
+
+        let spec = chain.spec();
+        let is_mainnet = bloom_proto::Config::is_mainnet_id(spec.chain_id);
+        if (self.block_mainnet_broadcast && is_mainnet) || !spec.allow_broadcast {
+            debug!(
+                id = %staged.id,
+                wallet,
+                chain = %spec.name,
+                is_mainnet,
+                allow_broadcast = spec.allow_broadcast,
+                block_mainnet = self.block_mainnet_broadcast,
+                "tx.broadcast_disabled"
+            );
+            return Err(TxEngineError::BroadcastDisabled(spec.name.clone()));
+        }
+        if !override_warnings {
+            self.simulate_or_reject(&staged, chain).await?;
+        }
+
+        let unsigned = self.build_unsigned_evm_tx(&staged, chain)?;
+        let signing_hash = Self::unsigned_signing_hash(&unsigned);
+        self.ensure_action_authorized(
+            &entry,
+            &staged,
+            EvmOutboxActionKind::Confirm,
+            &signing_hash,
+            policy,
+            bloom_proto::AuthorizationSurface::Cli,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub async fn confirm(
         &self,
         permit: &HomeWritePermit,

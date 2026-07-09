@@ -24,8 +24,9 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use embednfs::{
     AccessMask, Attrs, CloseSupport, CommitSupport, CreateKind, CreateRequest, CreateResult,
-    DirEntry, DirPage, FileSystem, FsError, FsResult, FsStats, ObjectType, ReadResult,
-    RequestContext, SetAttrs, Symlinks, Timestamp, WriteResult, WriteStability,
+    DirEntry, DirPage, FileSystem, FsError, FsResult, FsStats, ObjectType, OpenRequest,
+    OpenSupport, ReadResult, RequestContext, SetAttrs, Symlinks, Timestamp, WriteResult,
+    WriteStability,
 };
 use futures::FutureExt;
 use futures::future::{BoxFuture, Shared};
@@ -188,7 +189,8 @@ fn map_err(e: HandlerError) -> FsError {
         HandlerError::NotFound(_) => FsError::NotFound,
         HandlerError::NotADir(_) => FsError::NotDirectory,
         HandlerError::NotAFile(_) => FsError::IsDirectory,
-        HandlerError::PermissionDenied => FsError::PermissionDenied,
+        HandlerError::PermissionDenied => FsError::AccessDenied,
+        HandlerError::OperationNotPermitted => FsError::PermissionDenied,
         HandlerError::Invalid(_) => FsError::InvalidInput,
         HandlerError::Unsupported(_) => FsError::Unsupported,
         HandlerError::Backend(_) => FsError::Io,
@@ -1193,8 +1195,40 @@ impl FileSystem for BloomFs {
         Some(self)
     }
 
+    fn open_support(&self) -> Option<&dyn OpenSupport<BloomHandle>> {
+        Some(self)
+    }
+
     fn symlinks(&self) -> Option<&dyn Symlinks<BloomHandle>> {
         Some(self)
+    }
+}
+
+#[async_trait]
+impl OpenSupport<BloomHandle> for BloomFs {
+    async fn open(
+        &self,
+        _ctx: &RequestContext,
+        handle: &BloomHandle,
+        request: OpenRequest,
+    ) -> FsResult<()> {
+        if !request.write {
+            return Ok(());
+        }
+        let path = match handle {
+            BloomHandle::Root => return Err(FsError::IsDirectory),
+            BloomHandle::Path { kind, path } => {
+                if *kind != HandleKind::File {
+                    return Err(FsError::IsDirectory);
+                }
+                path.clone()
+            }
+        };
+        self.vfs.prepare_write_open(&path).await.map_err(map_err)?;
+        if mount_write_path_uses_wallet_signer(&path) {
+            return Err(FsError::PermissionDenied);
+        }
+        Ok(())
     }
 }
 
@@ -1356,6 +1390,16 @@ mod tests {
             }
         }
 
+        async fn prepare_write_open(&self, p: &VfsPath) -> Result<(), HandlerError> {
+            match p.first() {
+                Some("challenge") => {
+                    self.staged.lock().push(Vec::new());
+                    Err(HandlerError::PermissionDenied)
+                }
+                _ => Ok(()),
+            }
+        }
+
         async fn list(&self, p: &VfsPath) -> Result<Vec<Entry>, HandlerError> {
             if p.is_root() {
                 Ok(vec![Entry::writable_file("challenge")])
@@ -1446,6 +1490,36 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, FsError::PermissionDenied));
+    }
+
+    #[tokio::test]
+    async fn write_open_stages_challenge_and_denies_before_write() {
+        let handler = ChallengeStagingHandler::new();
+        let vfs = Vfs::builder().mount("stage", handler.clone()).build();
+        let fs = BloomFs::new(vfs);
+        let ctx = fake_ctx();
+        let dir = fs.lookup(&ctx, &BloomHandle::Root, "stage").await.unwrap();
+        let challenge = fs.lookup(&ctx, &dir, "challenge").await.unwrap();
+
+        let opener = fs.open_support().expect("open support enabled");
+        let err = opener
+            .open(
+                &ctx,
+                &challenge,
+                OpenRequest {
+                    read: false,
+                    write: true,
+                },
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(err, FsError::AccessDenied);
+        assert_eq!(
+            handler.staged_count(),
+            1,
+            "open should stage the approval challenge exactly once"
+        );
     }
 
     #[tokio::test]
@@ -1568,7 +1642,7 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert_eq!(err, FsError::PermissionDenied);
+        assert_eq!(err, FsError::AccessDenied);
         assert_eq!(
             handler.staged_count(),
             1,
@@ -1613,7 +1687,7 @@ mod tests {
 
         let cs = fs.commit_support().expect("commit support enabled");
         let err = cs.commit(&ctx, &challenge, 0, 7).await.unwrap_err();
-        assert_eq!(err, FsError::PermissionDenied);
+        assert_eq!(err, FsError::AccessDenied);
         assert_eq!(handler.staged_count(), 1);
     }
 
@@ -1641,7 +1715,7 @@ mod tests {
 
         let closer = fs.close_support().expect("close support enabled");
         let err = closer.close(&ctx, &challenge).await.unwrap_err();
-        assert_eq!(err, FsError::PermissionDenied);
+        assert_eq!(err, FsError::AccessDenied);
         assert_eq!(
             handler.staged_count(),
             1,
