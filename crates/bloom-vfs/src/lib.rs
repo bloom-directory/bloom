@@ -28,7 +28,10 @@ pub mod router;
 
 pub use auth::AuthServices;
 pub use cache::PathCache;
-pub use handler::{Entry, EntryKind, Handler, HandlerError};
+pub use handler::{
+    Entry, EntryKind, Handler, HandlerError, entry_for_fs_path, entry_from_fs_dir_entry,
+    entry_from_fs_metadata, fs_path_modified,
+};
 pub use paginate::{PAGE_SIZE, Projection, page_indices, page_name, page_slice, parse_page_name};
 pub use path::{PercentDecodeError, VfsPath, percent_decode_segment};
 pub use router::Vfs;

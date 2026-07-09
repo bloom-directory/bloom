@@ -97,6 +97,14 @@ impl SimulateHandler {
         let n = self.next_id.fetch_add(1, Ordering::SeqCst);
         format!("sim-{:04}", n)
     }
+
+    fn session_entry(&self, id: &str, entry: Entry) -> Result<Entry, HandlerError> {
+        let g = self.sessions.read();
+        let s = g
+            .get(id)
+            .ok_or_else(|| HandlerError::not_found(id.to_string()))?;
+        Ok(entry.with_modified_ms(s.created_ms))
+    }
 }
 
 /// JSON envelope accepted by `simulate/new`. Either an inline `intent` or a
@@ -765,8 +773,8 @@ impl SimulateHandler {
                 "last" => Ok(Entry::file("last")),
                 id => {
                     let g = self.sessions.read();
-                    if g.contains_key(id) {
-                        Ok(Entry::dir(id))
+                    if let Some(s) = g.get(id) {
+                        Ok(Entry::dir(id).with_modified_ms(s.created_ms))
                     } else {
                         Err(HandlerError::not_found(path.to_string_path()))
                     }
@@ -780,9 +788,11 @@ impl SimulateHandler {
                 }
                 drop(g);
                 match segs[1].as_str() {
-                    "state-override.json" => Ok(Entry::writable_file("state-override.json")),
+                    "state-override.json" => {
+                        self.session_entry(id, Entry::writable_file("state-override.json"))
+                    }
                     "intent.json" | "simulation.json" | "plan.md" | "trace.json" => {
-                        Ok(Entry::file(&segs[1]))
+                        self.session_entry(id, Entry::file(&segs[1]))
                     }
                     _ => Err(HandlerError::not_found(path.to_string_path())),
                 }
@@ -837,7 +847,9 @@ impl SimulateHandler {
                 let mut ids: Vec<&String> = g.keys().collect();
                 ids.sort();
                 for id in ids {
-                    out.push(Entry::dir(id));
+                    if let Some(s) = g.get(id) {
+                        out.push(Entry::dir(id).with_modified_ms(s.created_ms));
+                    }
                 }
                 Ok(out)
             }
@@ -846,7 +858,10 @@ impl SimulateHandler {
                 let s = g
                     .get(&segs[0])
                     .ok_or_else(|| HandlerError::not_found(path.to_string_path()))?;
-                Ok(Self::session_dir_entries(s))
+                Ok(Self::session_dir_entries(s)
+                    .into_iter()
+                    .map(|entry| entry.with_modified_ms(s.created_ms))
+                    .collect())
             }
             _ => Err(HandlerError::NotADir(path.to_string_path())),
         }
@@ -989,6 +1004,41 @@ mod tests {
         let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
         assert!(names.contains(&"new"));
         assert!(names.contains(&"last"));
+    }
+
+    #[tokio::test]
+    async fn session_entries_surface_created_time() {
+        let r = ChainRegistry::new();
+        let h = SimulateHandler::new(r, Arc::new(AddressBook::default()));
+        let created_ms = 1_700_000_000_000;
+        h.sessions.write().insert(
+            "sim-fixed".into(),
+            SimSession {
+                id: "sim-fixed".into(),
+                intent: None,
+                from: None,
+                state_override: None,
+                result: None,
+                plan_md: None,
+                trace_json: None,
+                created_ms,
+            },
+        );
+
+        let dir = h
+            .lookup(&VfsPath::parse("sim-fixed").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            dir.modified,
+            Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_millis(created_ms as u64))
+        );
+
+        let plan = h
+            .lookup(&VfsPath::parse("sim-fixed/plan.md").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(plan.modified, dir.modified);
     }
 
     #[tokio::test]

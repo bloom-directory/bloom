@@ -23,7 +23,7 @@ use async_trait::async_trait;
 use bloom_proto::HomeDir;
 use bloom_watch::{WatchExecutor, WatchKind, WatchRegistry, WatchSpec};
 
-use crate::handler::{Entry, Handler, HandlerError};
+use crate::handler::{Entry, Handler, HandlerError, fs_path_modified};
 use crate::path::VfsPath;
 
 #[derive(Clone)]
@@ -82,6 +82,27 @@ impl WatchHandler {
         out.sort();
         out
     }
+
+    fn spec_entry(spec: &WatchSpec, entry: Entry) -> Entry {
+        entry.with_modified_ms(spec.created_ms)
+    }
+
+    fn watch_file_entry(
+        &self,
+        spec: &WatchSpec,
+        name: &str,
+        entry: Entry,
+    ) -> Result<Entry, HandlerError> {
+        let path = if name == "live" {
+            WatchExecutor::live_path_for_spec(&self.home, spec)
+        } else {
+            self.watch_dir(spec).join(name)
+        };
+        Ok(match fs_path_modified(path)? {
+            Some(modified) => entry.with_modified(modified),
+            None => Self::spec_entry(spec, entry),
+        })
+    }
 }
 
 #[async_trait]
@@ -132,17 +153,19 @@ impl WatchHandler {
             1 => match segs[0].as_str() {
                 "new" => Ok(Entry::writable_file("new")),
                 id => {
-                    let _ = self.resolve_id(id)?;
-                    Ok(Entry::dir(id))
+                    let spec = self.resolve_id(id)?;
+                    Ok(Self::spec_entry(&spec, Entry::dir(id)))
                 }
             },
             2 => {
-                let _ = self.resolve_id(&segs[0])?;
+                let spec = self.resolve_id(&segs[0])?;
                 match segs[1].as_str() {
-                    "spec.toml" => Ok(Entry::file("spec.toml")),
-                    "live" => Ok(Entry::file("live")),
-                    "delete" => Ok(Entry::writable_file("delete")),
-                    n if Self::is_history_segment(n) => Ok(Entry::file(n)),
+                    "spec.toml" => Ok(Self::spec_entry(&spec, Entry::file("spec.toml"))),
+                    "live" => self.watch_file_entry(&spec, "live", Entry::file("live")),
+                    "delete" => Ok(Self::spec_entry(&spec, Entry::writable_file("delete"))),
+                    n if Self::is_history_segment(n) => {
+                        self.watch_file_entry(&spec, n, Entry::file(n))
+                    }
                     _ => Err(HandlerError::not_found(path.to_string_path())),
                 }
             }
@@ -235,19 +258,19 @@ impl WatchHandler {
             0 => {
                 let mut out = vec![Entry::writable_file("new")];
                 for s in self.registry.list_all() {
-                    out.push(Entry::dir(&s.id));
+                    out.push(Self::spec_entry(&s, Entry::dir(&s.id)));
                 }
                 Ok(out)
             }
             1 => {
                 let spec = self.resolve_id(&segs[0])?;
                 let mut out = vec![
-                    Entry::file("spec.toml"),
-                    Entry::file("live"),
-                    Entry::writable_file("delete"),
+                    Self::spec_entry(&spec, Entry::file("spec.toml")),
+                    self.watch_file_entry(&spec, "live", Entry::file("live"))?,
+                    Self::spec_entry(&spec, Entry::writable_file("delete")),
                 ];
                 for n in self.list_history_segments(&spec) {
-                    out.push(Entry::file(&n));
+                    out.push(self.watch_file_entry(&spec, &n, Entry::file(&n))?);
                 }
                 Ok(out)
             }
@@ -405,6 +428,43 @@ threshold_gwei = 25.0
         assert!(names.contains(&"new"));
         // Some allocated id w-NNNN should appear.
         assert!(names.iter().any(|n| n.starts_with("w-")));
+    }
+
+    #[tokio::test]
+    async fn entries_surface_spec_and_artifact_modified_times() {
+        let (h, _t) = build_handler();
+        let toml = r#"
+kind = "block"
+wallet = "alice"
+chain = "anvil"
+"#;
+        h.write(&VfsPath::parse("new").unwrap(), toml.as_bytes())
+            .await
+            .unwrap();
+        let spec = h.registry.list_all().into_iter().next().unwrap();
+        let expected = std::time::SystemTime::UNIX_EPOCH
+            + std::time::Duration::from_millis(spec.created_ms as u64);
+
+        let dir_entry = h.lookup(&VfsPath::parse(&spec.id).unwrap()).await.unwrap();
+        assert_eq!(dir_entry.modified, Some(expected));
+
+        let spec_entry = h
+            .lookup(&VfsPath::parse(&format!("{}/spec.toml", spec.id)).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(spec_entry.modified, Some(expected));
+
+        let live_path = WatchExecutor::live_path_for_spec(&h.home, &spec);
+        if let Some(parent) = live_path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(&live_path, b"{}\n").unwrap();
+        let live_modified = std::fs::metadata(&live_path).unwrap().modified().unwrap();
+        let live_entry = h
+            .lookup(&VfsPath::parse(&format!("{}/live", spec.id)).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(live_entry.modified, Some(live_modified));
     }
 
     #[tokio::test]

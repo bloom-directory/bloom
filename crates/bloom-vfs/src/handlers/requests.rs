@@ -38,7 +38,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use url::Url;
 
 use crate::auth::AuthServices;
-use crate::handler::{Entry, Handler, HandlerError};
+use crate::handler::{
+    Entry, EntryKind, Handler, HandlerError, entry_for_fs_path, entry_from_fs_dir_entry,
+    fs_path_modified,
+};
 use crate::path::VfsPath;
 
 const APPROVAL_FILE: &str = "approval.json";
@@ -1138,12 +1141,22 @@ impl Handler for RequestsHandler {
         match segs {
             [] => Ok(Entry::dir("requests")),
             [one] if one == "new" || one == "new.dry-run" => Ok(Entry::writable_file(one)),
-            [one] if one == "latest" => Ok(Entry::symlink("latest", &self.latest_target())),
+            [one] if one == "latest" => {
+                let mut entry = Entry::symlink("latest", &self.latest_target());
+                if let Some(modified) = fs_path_modified(self.latest_path())? {
+                    entry = entry.with_modified(modified);
+                }
+                Ok(entry)
+            }
             [one] if matches!(one.as_str(), "pending" | "sent" | "failed" | "sessions") => {
-                Ok(Entry::dir(one))
+                entry_for_fs_path(self.requests_root().join(one), one, EntryKind::Dir)
             }
             [state, id] if matches!(state.as_str(), "pending" | "sent" | "failed" | "sessions") => {
-                Ok(Entry::dir(id))
+                entry_for_fs_path(
+                    self.requests_root().join(state).join(id),
+                    id,
+                    EntryKind::Dir,
+                )
             }
             [state, _id, name]
                 if matches!(state.as_str(), "pending" | "sent" | "failed")
@@ -1154,34 +1167,49 @@ impl Handler for RequestsHandler {
                 // generic file arm reports it as a 0-byte file, so a mounted
                 // client caches it as a file and descending into it fails with
                 // ENOTDIR.
-                Ok(Entry::dir("response"))
+                entry_for_fs_path(
+                    self.req_dir(state, _id).join("response"),
+                    "response",
+                    EntryKind::Dir,
+                )
             }
             [state, _id, name] if matches!(state.as_str(), "pending" | "sent" | "failed") => {
                 if matches!(name.as_str(), "confirm" | "cancel") {
-                    Ok(Entry::writable_file(name))
+                    let mut entry = Entry::writable_file(name);
+                    if let Some(modified) = fs_path_modified(self.req_dir(state, _id))? {
+                        entry = entry.with_modified(modified);
+                    }
+                    Ok(entry)
                 } else {
-                    Ok(Entry::file(name))
+                    entry_for_fs_path(self.req_dir(state, _id).join(name), name, EntryKind::File)
                 }
             }
             [state, id, name] if state == "sessions" => {
                 let file = self.requests_root().join("sessions").join(id).join(name);
                 if matches!(name.as_str(), "topup" | "close") {
                     if file.exists() {
-                        Ok(Entry::writable_file(name))
+                        entry_for_fs_path(file, name, EntryKind::File).map(|mut entry| {
+                            entry.mode = 0o644;
+                            entry
+                        })
                     } else {
                         Err(HandlerError::NotFound(format!(
                             "/requests/sessions/{id}/{name}: control unavailable until a fresh Tempo MPP session challenge is staged"
                         )))
                     }
                 } else {
-                    Ok(Entry::file(name))
+                    entry_for_fs_path(file, name, EntryKind::File)
                 }
             }
-            [state, _id, response, name]
+            [state, id, response, name]
                 if matches!(state.as_str(), "pending" | "sent" | "failed")
                     && response == "response" =>
             {
-                Ok(Entry::file(name))
+                entry_for_fs_path(
+                    self.req_dir(state, id).join("response").join(name),
+                    name,
+                    EntryKind::File,
+                )
             }
             _ => Err(HandlerError::NotFound(path.to_string_path())),
         }
@@ -1195,11 +1223,26 @@ impl Handler for RequestsHandler {
             [] => Ok(vec![
                 Entry::writable_file("new"),
                 Entry::writable_file("new.dry-run"),
-                Entry::symlink("latest", &self.latest_target()),
-                Entry::dir("pending"),
-                Entry::dir("sent"),
-                Entry::dir("failed"),
-                Entry::dir("sessions"),
+                entry_with_optional_fs_modified(
+                    self.latest_path(),
+                    Entry::symlink("latest", &self.latest_target()),
+                )?,
+                entry_with_optional_fs_modified(
+                    self.requests_root().join("pending"),
+                    Entry::dir("pending"),
+                )?,
+                entry_with_optional_fs_modified(
+                    self.requests_root().join("sent"),
+                    Entry::dir("sent"),
+                )?,
+                entry_with_optional_fs_modified(
+                    self.requests_root().join("failed"),
+                    Entry::dir("failed"),
+                )?,
+                entry_with_optional_fs_modified(
+                    self.requests_root().join("sessions"),
+                    Entry::dir("sessions"),
+                )?,
             ]),
             [state] if matches!(state.as_str(), "pending" | "sent" | "failed" | "sessions") => {
                 list_dirs(self.requests_root().join(state))
@@ -2089,7 +2132,8 @@ fn list_dirs(path: PathBuf) -> Result<Vec<Entry>, HandlerError> {
         for e in fs::read_dir(path)? {
             let e = e?;
             if e.file_type()?.is_dir() {
-                out.push(Entry::dir(&e.file_name().to_string_lossy()));
+                let name = e.file_name().to_string_lossy().to_string();
+                out.push(entry_from_fs_dir_entry(&e, &name, EntryKind::Dir)?);
             }
         }
     }
@@ -2106,15 +2150,27 @@ fn list_entries(path: PathBuf) -> Result<Vec<Entry>, HandlerError> {
         }
         let ty = e.file_type()?;
         out.push(if ty.is_dir() {
-            Entry::dir(&name)
+            entry_from_fs_dir_entry(&e, &name, EntryKind::Dir)?
         } else if matches!(name.as_str(), "confirm" | "cancel" | "topup" | "close") {
-            Entry::writable_file(&name)
+            let mut entry = entry_from_fs_dir_entry(&e, &name, EntryKind::File)?;
+            entry.mode = 0o644;
+            entry
         } else {
-            Entry::file(&name)
+            entry_from_fs_dir_entry(&e, &name, EntryKind::File)?
         });
     }
     out.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(out)
+}
+
+fn entry_with_optional_fs_modified(
+    path: impl AsRef<Path>,
+    entry: Entry,
+) -> Result<Entry, HandlerError> {
+    let Some(modified) = fs_path_modified(path.as_ref())? else {
+        return Ok(entry);
+    };
+    Ok(entry.with_modified(modified))
 }
 fn new_request_id() -> String {
     static REQUEST_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -2728,6 +2784,40 @@ mod tests {
             ),
             _tmp: tmp,
         }
+    }
+
+    #[tokio::test]
+    async fn pending_request_entries_surface_artifact_modified_times() {
+        let f = fixture(Some("alice"));
+        let req = parse_request("GET https://merchant.test/pay wallet=alice").unwrap();
+        let dir = f.handler.req_dir("pending", "req_time");
+        write_request_artifacts(&dir, &req, "alice", "pending", false).unwrap();
+
+        let dir_modified = fs::metadata(&dir).unwrap().modified().unwrap();
+        let request_toml = dir.join("request.toml");
+        let file_metadata = fs::metadata(&request_toml).unwrap();
+        let file_modified = file_metadata.modified().unwrap();
+
+        let pending_entries = f
+            .handler
+            .list(&VfsPath::parse("/pending").unwrap())
+            .await
+            .unwrap();
+        let req_entry = pending_entries
+            .iter()
+            .find(|entry| entry.name == "req_time")
+            .expect("pending request entry is listed");
+        assert_eq!(req_entry.kind, EntryKind::Dir);
+        assert_eq!(req_entry.modified, Some(dir_modified));
+
+        let request_entry = f
+            .handler
+            .lookup(&VfsPath::parse("/pending/req_time/request.toml").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(request_entry.kind, EntryKind::File);
+        assert_eq!(request_entry.size, file_metadata.len());
+        assert_eq!(request_entry.modified, Some(file_modified));
     }
 
     #[test]

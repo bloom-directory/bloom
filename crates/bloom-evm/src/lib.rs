@@ -331,8 +331,27 @@ impl ChainClient {
         Ok(self.primary.get_transaction_by_hash(hash).await?)
     }
 
+    pub async fn raw_tx_by_hash(
+        &self,
+        hash: B256,
+    ) -> Result<Option<serde_json::Value>, ChainError> {
+        Ok(self
+            .primary
+            .client()
+            .request("eth_getTransactionByHash", (format!("{hash:#x}"),))
+            .await?)
+    }
+
     pub async fn receipt(&self, hash: B256) -> Result<Option<TransactionReceipt>, ChainError> {
         Ok(self.primary.get_transaction_receipt(hash).await?)
+    }
+
+    pub async fn raw_receipt(&self, hash: B256) -> Result<Option<serde_json::Value>, ChainError> {
+        Ok(self
+            .primary
+            .client()
+            .request("eth_getTransactionReceipt", (format!("{hash:#x}"),))
+            .await?)
     }
 
     /// Re-execute a *reverted* transaction via `eth_call` at the block it

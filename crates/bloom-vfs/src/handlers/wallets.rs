@@ -2061,15 +2061,17 @@ impl WalletsHandler {
                 // Confirm the entry actually lives in the requested state
                 // (fix #8): a stale path like `outbox/sent/<pending-id>`
                 // should NotFound, not silently succeed.
-                self.tx_engine
+                let entry = self
+                    .tx_engine
                     .outbox
                     .read_in_state(wallet, chain, id, st)
                     .map_err(err_be)?;
-                Ok(Entry::dir(id))
+                Ok(Entry::dir(id).with_modified_ms(entry.staged.created_ms))
             }
             [state, id, fname] => {
                 let st = parse_state_seg(state)?;
-                self.tx_engine
+                let entry = self
+                    .tx_engine
                     .outbox
                     .read_in_state(wallet, chain, id, st)
                     .map_err(err_be)?;
@@ -2082,9 +2084,9 @@ impl WalletsHandler {
                         "confirm" | "confirm.override" | "replace" | "cancel"
                     )
                 {
-                    Ok(Entry::writable_file(fname))
+                    Ok(Entry::writable_file(fname).with_modified_ms(entry.staged.created_ms))
                 } else {
-                    Ok(Entry::file(fname))
+                    Ok(Entry::file(fname).with_modified_ms(entry.staged.created_ms))
                 }
             }
             _ => Err(HandlerError::not_found(rest.join("/"))),
@@ -2340,7 +2342,18 @@ impl WalletsHandler {
                     .outbox
                     .list(wallet, chain, st)
                     .map_err(err_be)?;
-                Ok(ids.into_iter().map(|n| Entry::dir(&n)).collect())
+                let entries = ids
+                    .into_iter()
+                    .filter_map(|id| {
+                        let entry = self
+                            .tx_engine
+                            .outbox
+                            .read_in_state(wallet, chain, &id, st)
+                            .ok()?;
+                        Some(Entry::dir(&id).with_modified_ms(entry.staged.created_ms))
+                    })
+                    .collect();
+                Ok(entries)
             }
             [s, state, id] if s == "outbox" => {
                 let st = parse_state_seg(state)?;
@@ -2365,12 +2378,17 @@ impl WalletsHandler {
                                         "confirm" | "confirm.override" | "replace" | "cancel"
                                     )
                                 {
-                                    out.push(Entry::writable_file(n));
+                                    out.push(
+                                        Entry::writable_file(n)
+                                            .with_modified_ms(entry.staged.created_ms),
+                                    );
                                 } else {
-                                    out.push(Entry::file(n));
+                                    out.push(
+                                        Entry::file(n).with_modified_ms(entry.staged.created_ms),
+                                    );
                                 }
                             } else {
-                                out.push(Entry::dir(n));
+                                out.push(Entry::dir(n).with_modified_ms(entry.staged.created_ms));
                             }
                         }
                     }
@@ -2381,7 +2399,10 @@ impl WalletsHandler {
                 if entry.state == OutboxState::Pending {
                     for ctrl in ["confirm", "confirm.override", "replace", "cancel"] {
                         if !out.iter().any(|e| e.name == ctrl) {
-                            out.push(Entry::writable_file(ctrl));
+                            out.push(
+                                Entry::writable_file(ctrl)
+                                    .with_modified_ms(entry.staged.created_ms),
+                            );
                         }
                     }
                 }

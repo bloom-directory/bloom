@@ -1,6 +1,8 @@
 //! The Handler trait — every top-level subtree implements it.
 
-use std::time::Duration;
+use std::fs;
+use std::path::Path;
+use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
 use thiserror::Error;
@@ -25,6 +27,9 @@ pub struct Entry {
     pub mode: u32,
     /// For symlinks, the target.
     pub link_target: Option<String>,
+    /// Optional artifact modification time. Mount adapters surface this as
+    /// mtime/ctime/atime when a handler knows the backing artifact time.
+    pub modified: Option<SystemTime>,
 }
 
 impl Entry {
@@ -35,6 +40,7 @@ impl Entry {
             size: 0,
             mode: 0o755,
             link_target: None,
+            modified: None,
         }
     }
     /// Build a read-only file entry (mode 0o444). This is the right
@@ -57,6 +63,7 @@ impl Entry {
             size: 0,
             mode: 0o444,
             link_target: None,
+            modified: None,
         }
     }
     /// Build a writable file entry (mode 0o644). Use for the small set
@@ -68,6 +75,7 @@ impl Entry {
             size: 0,
             mode: 0o644,
             link_target: None,
+            modified: None,
         }
     }
     /// Build an executable read-only file entry (mode 0o555). This is used
@@ -80,6 +88,7 @@ impl Entry {
             size: 0,
             mode: 0o555,
             link_target: None,
+            modified: None,
         }
     }
     pub fn symlink(name: &str, target: &str) -> Self {
@@ -89,7 +98,65 @@ impl Entry {
             size: 0,
             mode: 0o777,
             link_target: Some(target.into()),
+            modified: None,
         }
+    }
+
+    pub fn with_modified(mut self, modified: SystemTime) -> Self {
+        self.modified = Some(modified);
+        self
+    }
+
+    pub fn with_modified_ms(self, modified_ms: u128) -> Self {
+        if modified_ms > u64::MAX as u128 {
+            return self;
+        }
+        self.with_modified(SystemTime::UNIX_EPOCH + Duration::from_millis(modified_ms as u64))
+    }
+
+    pub fn with_fs_metadata(mut self, metadata: &fs::Metadata) -> Self {
+        if self.kind == EntryKind::File {
+            self.size = metadata.len();
+        }
+        if let Ok(modified) = metadata.modified() {
+            self.modified = Some(modified);
+        }
+        self
+    }
+}
+
+pub fn entry_from_fs_metadata(name: &str, kind: EntryKind, metadata: &fs::Metadata) -> Entry {
+    match kind {
+        EntryKind::Dir => Entry::dir(name),
+        EntryKind::File => Entry::file(name),
+        EntryKind::Symlink => Entry::symlink(name, ""),
+    }
+    .with_fs_metadata(metadata)
+}
+
+pub fn entry_for_fs_path(
+    path: impl AsRef<Path>,
+    name: &str,
+    kind: EntryKind,
+) -> Result<Entry, HandlerError> {
+    let metadata = fs::metadata(path)?;
+    Ok(entry_from_fs_metadata(name, kind, &metadata))
+}
+
+pub fn entry_from_fs_dir_entry(
+    dir_entry: &fs::DirEntry,
+    name: &str,
+    kind: EntryKind,
+) -> Result<Entry, HandlerError> {
+    let metadata = dir_entry.metadata()?;
+    Ok(entry_from_fs_metadata(name, kind, &metadata))
+}
+
+pub fn fs_path_modified(path: impl AsRef<Path>) -> Result<Option<SystemTime>, HandlerError> {
+    match fs::metadata(path) {
+        Ok(metadata) => Ok(metadata.modified().ok()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err.into()),
     }
 }
 
@@ -207,6 +274,7 @@ mod tests {
         assert_eq!(e.size, 0);
         assert_eq!(e.mode, 0o755);
         assert!(e.link_target.is_none());
+        assert!(e.modified.is_none());
     }
 
     #[test]
@@ -218,6 +286,7 @@ mod tests {
         assert_eq!(a.mode, b.mode);
         assert_eq!(a.size, b.size);
         assert_eq!(a.link_target, b.link_target);
+        assert_eq!(a.modified, b.modified);
     }
 
     #[test]
@@ -228,6 +297,7 @@ mod tests {
         assert_eq!(e.size, 0);
         assert_eq!(e.mode, 0o444);
         assert!(e.link_target.is_none());
+        assert!(e.modified.is_none());
     }
 
     #[test]
@@ -238,6 +308,7 @@ mod tests {
         assert_eq!(e.size, 0);
         assert_eq!(e.mode, 0o644);
         assert!(e.link_target.is_none());
+        assert!(e.modified.is_none());
     }
 
     #[test]
@@ -248,6 +319,7 @@ mod tests {
         assert_eq!(e.size, 0);
         assert_eq!(e.mode, 0o555);
         assert!(e.link_target.is_none());
+        assert!(e.modified.is_none());
     }
 
     #[test]
@@ -258,6 +330,36 @@ mod tests {
         assert_eq!(e.size, 0);
         assert_eq!(e.mode, 0o777);
         assert_eq!(e.link_target.as_deref(), Some("../ethereum"));
+        assert!(e.modified.is_none());
+    }
+
+    #[test]
+    fn with_modified_records_artifact_time() {
+        let modified = SystemTime::UNIX_EPOCH + Duration::from_secs(123);
+        let e = Entry::file("artifact.json").with_modified(modified);
+        assert_eq!(e.modified, Some(modified));
+    }
+
+    #[test]
+    fn with_modified_ms_records_epoch_milliseconds() {
+        let e = Entry::dir("req").with_modified_ms(1_700_000_000_123);
+        assert_eq!(
+            e.modified,
+            Some(SystemTime::UNIX_EPOCH + Duration::from_millis(1_700_000_000_123))
+        );
+    }
+
+    #[test]
+    fn with_fs_metadata_records_file_size_and_modified_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("artifact.json");
+        std::fs::write(&path, b"hello").unwrap();
+        let metadata = std::fs::metadata(&path).unwrap();
+
+        let entry = Entry::file("artifact.json").with_fs_metadata(&metadata);
+
+        assert_eq!(entry.size, 5);
+        assert_eq!(entry.modified, metadata.modified().ok());
     }
 
     #[test]

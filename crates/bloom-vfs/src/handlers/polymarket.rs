@@ -22,7 +22,7 @@ use bloom_keystore::{Keystore, KeystoreError};
 use bloom_polymarket::eip712::{PUSD, PUSD_DECIMALS};
 use bloom_polymarket::onboard::OnEvent;
 use bloom_polymarket::order::{self, OrderType};
-use bloom_polymarket::order_store::{OrderDraft, render_plan_md};
+use bloom_polymarket::order_store::{OrderDraft, OrderReceipt, render_plan_md};
 use bloom_polymarket::signing::{action_id_for, poly1271_signature_from_raw};
 use bloom_polymarket::trade;
 use bloom_polymarket::{
@@ -1813,6 +1813,28 @@ fn pretty(v: &impl serde::Serialize) -> Result<Vec<u8>, HandlerError> {
     serde_json::to_vec_pretty(v).map_err(|e| HandlerError::backend(e.to_string()))
 }
 
+fn load_required_draft(
+    store: &OrderStore,
+    wallet: &str,
+    id: &str,
+) -> Result<OrderDraft, HandlerError> {
+    store
+        .load_draft(wallet, id)
+        .map_err(err_be)?
+        .ok_or_else(|| HandlerError::not_found(format!("polymarket draft {wallet}/{id}")))
+}
+
+fn load_required_receipt(
+    store: &OrderStore,
+    wallet: &str,
+    id: &str,
+) -> Result<OrderReceipt, HandlerError> {
+    store
+        .load_receipt(wallet, id)
+        .map_err(err_be)?
+        .ok_or_else(|| HandlerError::not_found(format!("polymarket receipt {wallet}/{id}")))
+}
+
 /// Removes `wallet` from the running set when the spawned run ends, however
 /// it ends (success, error, or panic unwind).
 struct RunningGuard {
@@ -2120,9 +2142,13 @@ impl PolymarketHandler {
                 1 => Ok(Entry::dir("fund")),
                 2 => Ok(Entry::dir(&segs[1])),
                 3 if segs[2] == "new" => Ok(Entry::writable_file("new")),
-                3 => Ok(Entry::dir(&segs[2])),
-                4 if FUND_FILES.contains(&segs[3].as_str()) => Ok(Entry::file(&segs[3])),
-                4 if segs[3] == "confirm" => Ok(Entry::writable_file("confirm")),
+                3 => self.fund_session_dir_entry(path, &segs[1], &segs[2]),
+                4 if FUND_FILES.contains(&segs[3].as_str()) => {
+                    self.fund_session_file_entry(path, &segs[1], &segs[2], &segs[3])
+                }
+                4 if segs[3] == "confirm" => {
+                    self.fund_session_file_entry(path, &segs[1], &segs[2], "confirm")
+                }
                 _ => Err(HandlerError::not_found(path.to_string_path())),
             },
             "trade" if self.orders.is_some() => match segs.len() {
@@ -2130,15 +2156,25 @@ impl PolymarketHandler {
                 2 => Ok(Entry::dir(&segs[1])),
                 3 if segs[2] == "new" => Ok(Entry::writable_file("new")),
                 3 if segs[2] == "drafts" || segs[2] == "receipts" => Ok(Entry::dir(&segs[2])),
-                4 if segs[2] == "drafts" || segs[2] == "receipts" => Ok(Entry::dir(&segs[3])),
+                4 if segs[2] == "drafts" => {
+                    let store = self.orders_or_not_found(path)?;
+                    self.draft_dir_entry(store, &segs[1], &segs[3])
+                }
+                4 if segs[2] == "receipts" => {
+                    let store = self.orders_or_not_found(path)?;
+                    self.receipt_dir_entry(store, &segs[1], &segs[3])
+                }
                 5 if segs[2] == "drafts" && segs[4] == "confirm" => {
-                    Ok(Entry::writable_file("confirm"))
+                    let store = self.orders_or_not_found(path)?;
+                    self.draft_file_entry(store, &segs[1], &segs[3], "confirm")
                 }
                 5 if segs[2] == "drafts" && DRAFT_FILES.contains(&segs[4].as_str()) => {
-                    Ok(Entry::file(&segs[4]))
+                    let store = self.orders_or_not_found(path)?;
+                    self.draft_file_entry(store, &segs[1], &segs[3], &segs[4])
                 }
                 5 if segs[2] == "receipts" && segs[4] == "receipt.json" => {
-                    Ok(Entry::file(&segs[4]))
+                    let store = self.orders_or_not_found(path)?;
+                    self.receipt_file_entry(store, &segs[1], &segs[3], &segs[4])
                 }
                 3 if segs[2] == "orders" => Ok(Entry::dir("orders")),
                 4 if segs[2] == "orders" => Ok(Entry::dir(&segs[3])),
@@ -2406,6 +2442,79 @@ impl PolymarketHandler {
         }
         ids.sort();
         Ok(ids)
+    }
+
+    fn fund_session_dir_entry(
+        &self,
+        path: &VfsPath,
+        wallet: &str,
+        id: &str,
+    ) -> Result<Entry, HandlerError> {
+        let sess = self.load_fund_session(path, wallet, id)?;
+        Ok(Entry::dir(id).with_modified_ms(sess.created_ms))
+    }
+
+    fn fund_session_file_entry(
+        &self,
+        path: &VfsPath,
+        wallet: &str,
+        id: &str,
+        file: &str,
+    ) -> Result<Entry, HandlerError> {
+        let sess = self.load_fund_session(path, wallet, id)?;
+        let entry = if file == "confirm" {
+            Entry::writable_file(file)
+        } else {
+            Entry::file(file)
+        };
+        Ok(entry.with_modified_ms(sess.updated_ms))
+    }
+
+    fn draft_dir_entry(
+        &self,
+        store: &OrderStore,
+        wallet: &str,
+        id: &str,
+    ) -> Result<Entry, HandlerError> {
+        let draft = load_required_draft(store, wallet, id)?;
+        Ok(Entry::dir(id).with_modified_ms(draft.created_ms))
+    }
+
+    fn draft_file_entry(
+        &self,
+        store: &OrderStore,
+        wallet: &str,
+        id: &str,
+        file: &str,
+    ) -> Result<Entry, HandlerError> {
+        let draft = load_required_draft(store, wallet, id)?;
+        let entry = if file == "confirm" {
+            Entry::writable_file(file)
+        } else {
+            Entry::file(file)
+        };
+        Ok(entry.with_modified_ms(draft.updated_ms))
+    }
+
+    fn receipt_dir_entry(
+        &self,
+        store: &OrderStore,
+        wallet: &str,
+        id: &str,
+    ) -> Result<Entry, HandlerError> {
+        let receipt = load_required_receipt(store, wallet, id)?;
+        Ok(Entry::dir(id).with_modified_ms(receipt.posted_ms))
+    }
+
+    fn receipt_file_entry(
+        &self,
+        store: &OrderStore,
+        wallet: &str,
+        id: &str,
+        file: &str,
+    ) -> Result<Entry, HandlerError> {
+        let receipt = load_required_receipt(store, wallet, id)?;
+        Ok(Entry::file(file).with_modified_ms(receipt.posted_ms))
     }
 
     fn read_fund(
@@ -3466,14 +3575,20 @@ impl PolymarketHandler {
                 entries.extend(
                     self.list_fund_sessions(path, &segs[1])?
                         .iter()
-                        .map(|id| Entry::dir(id)),
+                        .filter_map(|id| self.fund_session_dir_entry(path, &segs[1], id).ok()),
                 );
                 Ok(entries)
             }
             (Some("fund"), 3) if segs[2] != "new" => {
                 self.fund_root_or_not_found(path)?;
-                let mut entries: Vec<Entry> = FUND_FILES.iter().map(|f| Entry::file(f)).collect();
-                entries.push(Entry::writable_file("confirm"));
+                let mut entries: Vec<Entry> = FUND_FILES
+                    .iter()
+                    .filter_map(|f| {
+                        self.fund_session_file_entry(path, &segs[1], &segs[2], f)
+                            .ok()
+                    })
+                    .collect();
+                entries.push(self.fund_session_file_entry(path, &segs[1], &segs[2], "confirm")?);
                 Ok(entries)
             }
             (Some("trade"), 1) => {
@@ -3492,22 +3607,40 @@ impl PolymarketHandler {
             (Some("trade"), 3) if segs[2] == "drafts" => {
                 let store = self.orders_or_not_found(path)?;
                 let ids = store.list_drafts(&segs[1]).map_err(err_be)?;
-                Ok(ids.iter().map(|id| Entry::dir(id)).collect())
+                Ok(ids
+                    .iter()
+                    .filter_map(|id| self.draft_dir_entry(store, &segs[1], id).ok())
+                    .collect())
             }
             (Some("trade"), 3) if segs[2] == "receipts" => {
                 let store = self.orders_or_not_found(path)?;
                 let ids = store.list_receipts(&segs[1]).map_err(err_be)?;
-                Ok(ids.iter().map(|id| Entry::dir(id)).collect())
+                Ok(ids
+                    .iter()
+                    .filter_map(|id| self.receipt_dir_entry(store, &segs[1], id).ok())
+                    .collect())
             }
             // Resting CLOB order-ids come from the live book/account views, not
             // the local store, so the orders dir is not enumerable by id here.
             (Some("trade"), 3) if segs[2] == "orders" => Ok(Vec::new()),
             (Some("trade"), 4) if segs[2] == "drafts" => {
-                let mut entries: Vec<Entry> = DRAFT_FILES.iter().map(|f| Entry::file(f)).collect();
-                entries.push(Entry::writable_file("confirm"));
+                let store = self.orders_or_not_found(path)?;
+                let mut entries: Vec<Entry> = DRAFT_FILES
+                    .iter()
+                    .filter_map(|f| self.draft_file_entry(store, &segs[1], &segs[3], f).ok())
+                    .collect();
+                entries.push(self.draft_file_entry(store, &segs[1], &segs[3], "confirm")?);
                 Ok(entries)
             }
-            (Some("trade"), 4) if segs[2] == "receipts" => Ok(vec![Entry::file("receipt.json")]),
+            (Some("trade"), 4) if segs[2] == "receipts" => {
+                let store = self.orders_or_not_found(path)?;
+                Ok(vec![self.receipt_file_entry(
+                    store,
+                    &segs[1],
+                    &segs[3],
+                    "receipt.json",
+                )?])
+            }
             (Some("trade"), 4) if segs[2] == "orders" => Ok(vec![Entry::writable_file("cancel")]),
             // redeem/<wallet>/ — slugs are arbitrary (discovered via markets/),
             // so the wallet dir is not enumerable; the confirm leaf is reachable

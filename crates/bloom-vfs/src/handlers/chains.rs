@@ -36,7 +36,7 @@
 //!   address or `not a proxy\n` when the slot is empty.
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use async_trait::async_trait;
 
@@ -677,29 +677,142 @@ impl Handler for ChainsHandler {
 }
 
 impl ChainsHandler {
+    fn entry_with_unix_timestamp(entry: Entry, timestamp_secs: u64) -> Entry {
+        entry.with_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(timestamp_secs))
+    }
+
+    fn json_hex_u64(value: &serde_json::Value, key: &str) -> Option<u64> {
+        let raw = value.get(key)?.as_str()?;
+        u64::from_str_radix(raw.strip_prefix("0x").unwrap_or(raw), 16).ok()
+    }
+
+    fn json_status(value: &serde_json::Value) -> Option<bool> {
+        let raw = value.get("status")?.as_str()?;
+        match raw {
+            "0x1" | "1" => Some(true),
+            "0x0" | "0" => Some(false),
+            _ => None,
+        }
+    }
+
+    async fn tx_json(
+        client: &ChainClient,
+        hash: alloy::primitives::B256,
+    ) -> Result<serde_json::Value, HandlerError> {
+        match client.tx_by_hash(hash).await {
+            Ok(Some(tx)) => serde_json::to_value(tx).map_err(err_be),
+            Ok(None) => Err(HandlerError::not_found(format!("tx {hash:#x}"))),
+            Err(typed_err) => client
+                .raw_tx_by_hash(hash)
+                .await
+                .map_err(err_be)?
+                .ok_or_else(|| HandlerError::not_found(format!("tx {hash:#x}")))
+                .inspect_err(|_| {
+                    tracing::debug!(hash = %format!("{hash:#x}"), error = %typed_err, "chains.tx.raw_fallback_miss");
+                }),
+        }
+    }
+
+    async fn receipt_json(
+        client: &ChainClient,
+        hash: alloy::primitives::B256,
+    ) -> Result<serde_json::Value, HandlerError> {
+        match client.receipt(hash).await {
+            Ok(Some(receipt)) => serde_json::to_value(receipt).map_err(err_be),
+            Ok(None) => Err(HandlerError::not_found(format!("receipt {hash:#x}"))),
+            Err(typed_err) => client
+                .raw_receipt(hash)
+                .await
+                .map_err(err_be)?
+                .ok_or_else(|| HandlerError::not_found(format!("receipt {hash:#x}")))
+                .inspect_err(|_| {
+                    tracing::debug!(hash = %format!("{hash:#x}"), error = %typed_err, "chains.receipt.raw_fallback_miss");
+                }),
+        }
+    }
+
+    async fn tx_block_number(client: &ChainClient, hash: alloy::primitives::B256) -> Option<u64> {
+        match client.receipt(hash).await {
+            Ok(Some(receipt)) => receipt.block_number,
+            _ => {
+                let raw = client.raw_receipt(hash).await.ok()??;
+                Self::json_hex_u64(&raw, "blockNumber")
+            }
+        }
+    }
+
+    async fn entry_with_block_timestamp(
+        &self,
+        client: &ChainClient,
+        entry: Entry,
+        block_number: u64,
+    ) -> Entry {
+        match client.block_by_number(block_number).await {
+            Ok(Some(block)) => Self::entry_with_unix_timestamp(entry, block.header.timestamp),
+            _ => entry,
+        }
+    }
+
+    async fn entry_with_head_timestamp(&self, client: &ChainClient, entry: Entry) -> Entry {
+        match client.block_latest().await {
+            Ok(Some(block)) => Self::entry_with_unix_timestamp(entry, block.header.timestamp),
+            _ => entry,
+        }
+    }
+
+    async fn entry_with_tx_block_timestamp(
+        &self,
+        client: &ChainClient,
+        entry: Entry,
+        tx_hash: &str,
+    ) -> Entry {
+        let Ok(hash) = tx_hash.parse::<alloy::primitives::B256>() else {
+            return entry;
+        };
+        let Some(block_number) = Self::tx_block_number(client, hash).await else {
+            return entry;
+        };
+        self.entry_with_block_timestamp(client, entry, block_number)
+            .await
+    }
+
     async fn lookup_inner(&self, path: &VfsPath) -> Result<Entry, HandlerError> {
         let segs = path.segments();
         if segs.is_empty() {
             return Ok(Entry::dir(""));
         }
         let chain = &segs[0];
-        let _client = self.client(chain)?;
+        let client = self.client(chain)?;
         if segs.len() == 1 {
             return Ok(Entry::dir(chain));
         }
         match segs[1].as_str() {
             "chain_id" if segs.len() == 2 => Ok(Entry::file("chain_id")),
             "head" => match segs.get(2).map(|s| s.as_str()) {
-                None => Ok(Entry::dir("head")),
-                Some("number") | Some("hash") | Some("timestamp") | Some("full.json") => {
-                    Ok(Entry::file(segs.last().unwrap()))
-                }
+                None => Ok(self
+                    .entry_with_head_timestamp(&client, Entry::dir("head"))
+                    .await),
+                Some("number") | Some("hash") | Some("timestamp") | Some("full.json") => Ok(self
+                    .entry_with_head_timestamp(&client, Entry::file(segs.last().unwrap()))
+                    .await),
                 _ => Err(HandlerError::not_found(path.to_string_path())),
             },
             "blocks" => match segs.len() {
                 2 => Ok(Entry::dir("blocks")),
-                3 => Ok(Entry::dir(&segs[2])),
-                4 if segs[3] == "full.json" => Ok(Entry::file("full.json")),
+                3 => {
+                    let entry = Entry::dir(&segs[2]);
+                    Ok(match segs[2].parse::<u64>() {
+                        Ok(n) => self.entry_with_block_timestamp(&client, entry, n).await,
+                        Err(_) => entry,
+                    })
+                }
+                4 if segs[3] == "full.json" => {
+                    let entry = Entry::file("full.json");
+                    Ok(match segs[2].parse::<u64>() {
+                        Ok(n) => self.entry_with_block_timestamp(&client, entry, n).await,
+                        Err(_) => entry,
+                    })
+                }
                 _ => Err(HandlerError::not_found(path.to_string_path())),
             },
             "addresses" => match segs.len() {
@@ -770,11 +883,15 @@ impl ChainsHandler {
             },
             "tx" => match segs.len() {
                 2 => Ok(Entry::dir("tx")),
-                3 => Ok(Entry::dir(&segs[2])),
+                3 => Ok(self
+                    .entry_with_tx_block_timestamp(&client, Entry::dir(&segs[2]), &segs[2])
+                    .await),
                 4 => {
                     let f = segs[3].as_str();
                     if TX_FILES.contains(&f) {
-                        Ok(Entry::file(f))
+                        Ok(self
+                            .entry_with_tx_block_timestamp(&client, Entry::file(f), &segs[2])
+                            .await)
                     } else {
                         Err(HandlerError::not_found(path.to_string_path()))
                     }
@@ -1050,55 +1167,53 @@ impl ChainsHandler {
                     .map_err(|e| HandlerError::invalid(format!("tx hash: {e}")))?;
                 match segs[3].as_str() {
                     "full.json" => {
-                        let tx = client
-                            .tx_by_hash(hash)
-                            .await
-                            .map_err(err_be)?
-                            .ok_or_else(|| HandlerError::not_found(format!("tx {hash:#x}")))?;
+                        let tx = Self::tx_json(&client, hash).await?;
                         Ok(serde_json::to_vec_pretty(&tx).map_err(err_be)?)
                     }
                     "receipt.json" => {
-                        let r =
-                            client.receipt(hash).await.map_err(err_be)?.ok_or_else(|| {
-                                HandlerError::not_found(format!("receipt {hash:#x}"))
-                            })?;
+                        let r = Self::receipt_json(&client, hash).await?;
                         Ok(serde_json::to_vec_pretty(&r).map_err(err_be)?)
                     }
                     "status" => {
-                        let r =
-                            client.receipt(hash).await.map_err(err_be)?.ok_or_else(|| {
-                                HandlerError::not_found(format!("receipt {hash:#x}"))
-                            })?;
-                        let s = if r.status() { "success" } else { "reverted" };
+                        let r = Self::receipt_json(&client, hash).await?;
+                        let status = Self::json_status(&r).ok_or_else(|| {
+                            HandlerError::backend(format!(
+                                "receipt {hash:#x} missing decodable status"
+                            ))
+                        })?;
+                        let s = if status { "success" } else { "reverted" };
                         Ok(format!("{}\n", s).into_bytes())
                     }
                     "block_number" => {
-                        let r =
-                            client.receipt(hash).await.map_err(err_be)?.ok_or_else(|| {
-                                HandlerError::not_found(format!("receipt {hash:#x}"))
-                            })?;
-                        Ok(format!("{}\n", r.block_number.unwrap_or(0)).into_bytes())
+                        let r = Self::receipt_json(&client, hash).await?;
+                        let block_number = Self::json_hex_u64(&r, "blockNumber").unwrap_or(0);
+                        Ok(format!("{}\n", block_number).into_bytes())
                     }
                     "gas_used" => {
-                        let r =
-                            client.receipt(hash).await.map_err(err_be)?.ok_or_else(|| {
-                                HandlerError::not_found(format!("receipt {hash:#x}"))
-                            })?;
-                        Ok(format!("{}\n", r.gas_used).into_bytes())
+                        let r = Self::receipt_json(&client, hash).await?;
+                        let gas_used = Self::json_hex_u64(&r, "gasUsed").ok_or_else(|| {
+                            HandlerError::backend(format!(
+                                "receipt {hash:#x} missing decodable gasUsed"
+                            ))
+                        })?;
+                        Ok(format!("{}\n", gas_used).into_bytes())
                     }
                     "logs.json" => {
-                        let r =
-                            client.receipt(hash).await.map_err(err_be)?.ok_or_else(|| {
-                                HandlerError::not_found(format!("receipt {hash:#x}"))
-                            })?;
-                        Ok(serde_json::to_vec_pretty(&r.inner.logs()).map_err(err_be)?)
+                        let r = Self::receipt_json(&client, hash).await?;
+                        let logs = r
+                            .get("logs")
+                            .cloned()
+                            .unwrap_or_else(|| serde_json::json!([]));
+                        Ok(serde_json::to_vec_pretty(&logs).map_err(err_be)?)
                     }
                     "error.json" => {
-                        let r =
-                            client.receipt(hash).await.map_err(err_be)?.ok_or_else(|| {
-                                HandlerError::not_found(format!("receipt {hash:#x}"))
-                            })?;
-                        if r.status() {
+                        let receipt_json = Self::receipt_json(&client, hash).await?;
+                        let status = Self::json_status(&receipt_json).ok_or_else(|| {
+                            HandlerError::backend(format!(
+                                "receipt {hash:#x} missing decodable status"
+                            ))
+                        })?;
+                        if status {
                             // Successful tx → emit an explicit "no error"
                             // marker rather than a NotFound. Lets callers
                             // `cat` the file unconditionally without
@@ -1107,6 +1222,10 @@ impl ChainsHandler {
                             // for every getattr on a successful tx.
                             return Ok(b"null\n".to_vec());
                         }
+                        let r =
+                            client.receipt(hash).await.map_err(err_be)?.ok_or_else(|| {
+                                HandlerError::not_found(format!("receipt {hash:#x}"))
+                            })?;
                         if let Some(cached) = self
                             .revert_cache
                             .lock()
@@ -1256,7 +1375,7 @@ impl ChainsHandler {
                 .collect());
         }
         let chain = &segs[0];
-        let _client = self.client(chain)?;
+        let client = self.client(chain)?;
         match segs.len() {
             1 => {
                 let mut entries = vec![
@@ -1276,15 +1395,36 @@ impl ChainsHandler {
                 }
                 Ok(entries)
             }
-            2 if segs[1] == "head" => Ok(vec![
-                Entry::file("number"),
-                Entry::file("hash"),
-                Entry::file("timestamp"),
-                Entry::file("full.json"),
-            ]),
+            2 if segs[1] == "head" => {
+                let entries = vec![
+                    Entry::file("number"),
+                    Entry::file("hash"),
+                    Entry::file("timestamp"),
+                    Entry::file("full.json"),
+                ];
+                match client.block_latest().await {
+                    Ok(Some(block)) => Ok(entries
+                        .into_iter()
+                        .map(|entry| Self::entry_with_unix_timestamp(entry, block.header.timestamp))
+                        .collect()),
+                    _ => Ok(entries),
+                }
+            }
             3 if segs[1] == "blocks" => {
                 // /chains/<chain>/blocks/<number>
-                Ok(BLOCK_FILES.iter().map(|n| Entry::file(n)).collect())
+                let entries: Vec<Entry> = BLOCK_FILES.iter().map(|n| Entry::file(n)).collect();
+                Ok(match segs[2].parse::<u64>() {
+                    Ok(n) => match client.block_by_number(n).await {
+                        Ok(Some(block)) => entries
+                            .into_iter()
+                            .map(|entry| {
+                                Self::entry_with_unix_timestamp(entry, block.header.timestamp)
+                            })
+                            .collect(),
+                        _ => entries,
+                    },
+                    Err(_) => entries,
+                })
             }
             2 if segs[1] == "gas" => Ok(vec![Entry::file("current.json")]),
             3 if segs[1] == "addresses" => {
@@ -1331,7 +1471,20 @@ impl ChainsHandler {
             }
             3 if segs[1] == "tx" => {
                 // /chains/<chain>/tx/<hash>
-                Ok(TX_FILES.iter().map(|n| Entry::file(n)).collect())
+                let entries: Vec<Entry> = TX_FILES.iter().map(|n| Entry::file(n)).collect();
+                let Ok(hash) = segs[2].parse::<alloy::primitives::B256>() else {
+                    return Ok(entries);
+                };
+                let Some(block_number) = Self::tx_block_number(&client, hash).await else {
+                    return Ok(entries);
+                };
+                match client.block_by_number(block_number).await {
+                    Ok(Some(block)) => Ok(entries
+                        .into_iter()
+                        .map(|entry| Self::entry_with_unix_timestamp(entry, block.header.timestamp))
+                        .collect()),
+                    _ => Ok(entries),
+                }
             }
             n if n >= 3 && segs[1] == "contracts" => {
                 let client = self.client(chain)?;
@@ -1803,6 +1956,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn head_entries_surface_head_block_timestamp() {
+        let timestamp = 1_700_000_100;
+        let mut routes = std::collections::HashMap::new();
+        routes.insert("eth_getBlockByNumber".to_string(), rpc_block(42, timestamp));
+        let rpc = spawn_rpc(31_338, routes);
+        let h = ChainsHandler::new(registry_for_rpc(rpc, 31_338));
+
+        let entries = h
+            .list(&VfsPath::parse("/test/head").unwrap())
+            .await
+            .unwrap();
+
+        let expected =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(timestamp);
+        assert!(entries.iter().all(|entry| entry.modified == Some(expected)));
+    }
+
+    #[tokio::test]
+    async fn block_entries_surface_block_timestamp() {
+        let timestamp = 1_700_000_200;
+        let mut routes = std::collections::HashMap::new();
+        routes.insert("eth_getBlockByNumber".to_string(), rpc_block(7, timestamp));
+        let rpc = spawn_rpc(31_339, routes);
+        let h = ChainsHandler::new(registry_for_rpc(rpc, 31_339));
+
+        let dir = h
+            .lookup(&VfsPath::parse("/test/blocks/7").unwrap())
+            .await
+            .unwrap();
+        let leaf = h
+            .lookup(&VfsPath::parse("/test/blocks/7/full.json").unwrap())
+            .await
+            .unwrap();
+
+        let expected =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(timestamp);
+        assert_eq!(dir.modified, Some(expected));
+        assert_eq!(leaf.modified, Some(expected));
+    }
+
+    #[tokio::test]
     async fn tx_hash_dir_lists_documented_leaves() {
         let h = ChainsHandler::new(anvil_registry());
         let chain_name = h.registry.list_names()[0].clone();
@@ -1821,6 +2015,105 @@ mod tests {
             .collect();
 
         assert_eq!(names, TX_FILES);
+    }
+
+    #[tokio::test]
+    async fn confirmed_tx_entries_surface_containing_block_timestamp() {
+        let timestamp = 1_700_000_300;
+        let hash = format!("0x{}", "22".repeat(32));
+        let mut routes = std::collections::HashMap::new();
+        routes.insert(
+            "eth_getTransactionReceipt".to_string(),
+            rpc_receipt(&hash, 9),
+        );
+        routes.insert("eth_getBlockByNumber".to_string(), rpc_block(9, timestamp));
+        let rpc = spawn_rpc(31_340, routes);
+        let h = ChainsHandler::new(registry_for_rpc(rpc, 31_340));
+
+        let entries = h
+            .list(&VfsPath::parse(&format!("/test/tx/{hash}")).unwrap())
+            .await
+            .unwrap();
+        let leaf = h
+            .lookup(&VfsPath::parse(&format!("/test/tx/{hash}/receipt.json")).unwrap())
+            .await
+            .unwrap();
+
+        let expected =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(timestamp);
+        assert!(entries.iter().all(|entry| entry.modified == Some(expected)));
+        assert_eq!(leaf.modified, Some(expected));
+    }
+
+    #[tokio::test]
+    async fn unknown_typed_tx_receipt_falls_back_to_raw_json() {
+        let timestamp = 1_700_000_400;
+        let hash = format!("0x{}", "33".repeat(32));
+        let mut routes = std::collections::HashMap::new();
+        routes.insert(
+            "eth_getTransactionByHash".to_string(),
+            rpc_unknown_typed_tx(&hash, 11),
+        );
+        routes.insert(
+            "eth_getTransactionReceipt".to_string(),
+            rpc_unknown_typed_receipt(&hash, 11),
+        );
+        routes.insert("eth_getBlockByNumber".to_string(), rpc_block(11, timestamp));
+        let rpc = spawn_rpc(31_341, routes);
+        let h = ChainsHandler::new(registry_for_rpc(rpc, 31_341));
+
+        let full = h
+            .read(&VfsPath::parse(&format!("/test/tx/{hash}/full.json")).unwrap())
+            .await
+            .unwrap();
+        let full: serde_json::Value = serde_json::from_slice(&full).unwrap();
+        assert_eq!(full["type"], "0x7e");
+
+        let receipt = h
+            .read(&VfsPath::parse(&format!("/test/tx/{hash}/receipt.json")).unwrap())
+            .await
+            .unwrap();
+        let receipt: serde_json::Value = serde_json::from_slice(&receipt).unwrap();
+        assert_eq!(receipt["type"], "0x7e");
+
+        let status = h
+            .read(&VfsPath::parse(&format!("/test/tx/{hash}/status")).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(std::str::from_utf8(&status).unwrap(), "success\n");
+
+        let block_number = h
+            .read(&VfsPath::parse(&format!("/test/tx/{hash}/block_number")).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(std::str::from_utf8(&block_number).unwrap(), "11\n");
+
+        let gas_used = h
+            .read(&VfsPath::parse(&format!("/test/tx/{hash}/gas_used")).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(std::str::from_utf8(&gas_used).unwrap(), "21000\n");
+
+        let logs = h
+            .read(&VfsPath::parse(&format!("/test/tx/{hash}/logs.json")).unwrap())
+            .await
+            .unwrap();
+        let logs: serde_json::Value = serde_json::from_slice(&logs).unwrap();
+        assert_eq!(logs, serde_json::json!([]));
+
+        let error = h
+            .read(&VfsPath::parse(&format!("/test/tx/{hash}/error.json")).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(std::str::from_utf8(&error).unwrap(), "null\n");
+
+        let entry = h
+            .lookup(&VfsPath::parse(&format!("/test/tx/{hash}/receipt.json")).unwrap())
+            .await
+            .unwrap();
+        let expected =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(timestamp);
+        assert_eq!(entry.modified, Some(expected));
     }
 
     #[tokio::test]
@@ -2214,6 +2507,78 @@ mod tests {
         let reg = ChainRegistry::default();
         reg.add(client);
         reg
+    }
+
+    fn rpc_block(number: u64, timestamp: u64) -> serde_json::Value {
+        let zero32 = format!("0x{}", "00".repeat(32));
+        let zero8 = "0x0000000000000000".to_string();
+        let zero_addr = format!("0x{}", "00".repeat(20));
+        let zero_bloom = format!("0x{}", "00".repeat(256));
+        serde_json::json!({
+            "number": format!("0x{number:x}"),
+            "hash": format!("0x{}", "11".repeat(32)),
+            "parentHash": zero32,
+            "sha3Uncles": zero32,
+            "logsBloom": zero_bloom,
+            "transactionsRoot": zero32,
+            "stateRoot": zero32,
+            "receiptsRoot": zero32,
+            "miner": zero_addr,
+            "difficulty": "0x0",
+            "totalDifficulty": "0x0",
+            "extraData": "0x",
+            "size": "0x0",
+            "gasLimit": "0x0",
+            "gasUsed": "0x0",
+            "timestamp": format!("0x{timestamp:x}"),
+            "uncles": [],
+            "transactions": [],
+            "mixHash": format!("0x{}", "00".repeat(32)),
+            "nonce": zero8,
+            "baseFeePerGas": "0x0"
+        })
+    }
+
+    fn rpc_receipt(hash: &str, block_number: u64) -> serde_json::Value {
+        serde_json::json!({
+            "transactionHash": hash,
+            "transactionIndex": "0x0",
+            "blockHash": format!("0x{}", "11".repeat(32)),
+            "blockNumber": format!("0x{block_number:x}"),
+            "from": "0x0000000000000000000000000000000000000001",
+            "to": "0x0000000000000000000000000000000000000002",
+            "cumulativeGasUsed": "0x5208",
+            "gasUsed": "0x5208",
+            "contractAddress": null,
+            "logs": [],
+            "logsBloom": format!("0x{}", "00".repeat(256)),
+            "status": "0x1",
+            "effectiveGasPrice": "0x1",
+            "type": "0x2"
+        })
+    }
+
+    fn rpc_unknown_typed_tx(hash: &str, block_number: u64) -> serde_json::Value {
+        serde_json::json!({
+            "hash": hash,
+            "blockHash": format!("0x{}", "11".repeat(32)),
+            "blockNumber": format!("0x{block_number:x}"),
+            "transactionIndex": "0x0",
+            "from": "0x0000000000000000000000000000000000000001",
+            "to": "0x0000000000000000000000000000000000000002",
+            "gas": "0x5208",
+            "gasPrice": "0x1",
+            "input": "0x",
+            "nonce": "0x0",
+            "value": "0x0",
+            "type": "0x7e"
+        })
+    }
+
+    fn rpc_unknown_typed_receipt(hash: &str, block_number: u64) -> serde_json::Value {
+        let mut receipt = rpc_receipt(hash, block_number);
+        receipt["type"] = serde_json::json!("0x7e");
+        receipt
     }
 
     /// Minimal ERC-20 ABI: `balanceOf`, `transfer`, `Transfer` event.
