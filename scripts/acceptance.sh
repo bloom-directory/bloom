@@ -1,13 +1,11 @@
 #!/usr/bin/env bash
 # Acceptance scenario for bloom.
 #
-# Drives the four happy paths from §11.4 of the design doc using only
-# `bloom` CLI calls (which exercise the same code paths as VFS writes).
+# Drives the local acceptance paths using only `bloom` CLI calls (which
+# exercise the same code paths as VFS writes).
 #
 # 1. Native ETH send (Anvil, local-only)
 # 2. ERC-20 transfer (deploys MockERC20, transfers, verifies balance)
-# 3. Uniswap V2 swap (mainnet fork; skipped if BLOOM_MAINNET_RPC unset)
-# 4. Enso intent (mainnet fork + Enso key; skipped if either unset)
 #
 # Requirements: foundry (anvil + cast + forge) on PATH, jq, and the
 # bloom workspace built (`cargo build --release -p bloom`).
@@ -115,10 +113,7 @@ expect_sealed_challenge "$STAGED" "native send"
 
 # ============================================================== 2. ERC-20
 log "scenario 2: ERC-20 transfer"
-# Deploy a minimal ERC-20 with cast (constructor mints to msg.sender).
-TOKEN_BYTECODE='0x608060405234801561001057600080fd5b5060405161083138038061083183398101604081905261002f9161013e565b3360009081526020819052604090208390558060038361004f9190610162565b8210156100a2576100a26040516371fe1ee960e11b8152600401604051809103906000f08015801561008c573d6000803e3d6000fd5b50505b505050610175565b'
-# Using a precompiled minimal ERC20 deployed via solc:
-# For test, use forge to deploy:
+# Deploy a minimal ERC-20 with forge (constructor mints to msg.sender).
 forge --version >/dev/null 2>&1 || { log "forge missing — skipping ERC-20"; SKIP_ERC20=1; }
 
 if [ -z "${SKIP_ERC20:-}" ]; then
@@ -170,22 +165,6 @@ SOL
   log "erc20 staged id: $STAGED"
   expect_sealed_challenge "$STAGED" "erc20 transfer"
   rm -rf "$TMPDIR_FORGE"
-fi
-
-# ============================================================== 3. Uniswap V2 (fork)
-if [ -n "${BLOOM_MAINNET_RPC:-}" ]; then
-  log "scenario 3: Uniswap V2 swap (skipping in basic acceptance — see docs)"
-  ok "scenario 3 documented as TODO; requires mainnet fork harness"
-else
-  log "scenario 3: skipped (BLOOM_MAINNET_RPC not set)"
-fi
-
-# ============================================================== 4. Enso (fork)
-if [ -n "${BLOOM_ENSO_KEY:-}" ] && [ -n "${BLOOM_MAINNET_RPC:-}" ]; then
-  log "scenario 4: Enso intent (skipping in basic acceptance)"
-  ok "scenario 4 documented as TODO"
-else
-  log "scenario 4: skipped (BLOOM_ENSO_KEY or BLOOM_MAINNET_RPC not set)"
 fi
 
 ok "acceptance complete"
