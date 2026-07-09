@@ -59,11 +59,8 @@ jobs:
         if: always()
         run: sccache --show-stats
 
-  # Doctests can't be captured in a nextest archive, so they need their own
-  # compile. Run them as an independent job (no `needs`) so that compile happens
-  # concurrently with build_test_archive/clippy instead of being appended to the
-  # unit-test lane, where it sat on the critical path and re-built the workspace
-  # from a cold target dir.
+  # Doctests can't be captured in a nextest archive, so they compile separately.
+  # An independent job (no `needs`) keeps that compile off the test critical path.
   doctests:
     name: doctests
     runs-on: ubuntu-latest
@@ -89,10 +86,6 @@ jobs:
   build_test_archive:
     name: build test archive
     runs-on: ubuntu-latest
-    # No CARGO_BUILD_JOBS cap: public-repo ubuntu-latest is a 4-vCPU runner, so
-    # letting cargo default to nproc uses all cores instead of throttling this
-    # critical-path build to 2. The disk-cleanup step below provides the
-    # headroom the old "2" cap was compensating for.
     env:
       RUSTC_WRAPPER: sccache
       SCCACHE_GHA_ENABLED: "true"
@@ -231,8 +224,8 @@ jobs:
             --run-ignored ignored-only \
             --no-fail-fast
 
-  # Heavy docker suites are opt-in via workflow_dispatch only. Consolidated into
-  # one matrix job; each mode self-skips when its required secrets are absent.
+  # Heavy docker suites are opt-in via workflow_dispatch only; each mode
+  # self-skips when its required secrets are absent.
   docker:
     name: docker (${{ matrix.mode }})
     runs-on: ubuntu-latest
