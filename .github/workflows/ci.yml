@@ -95,15 +95,6 @@ jobs:
         run: rustup show
       - name: Install cargo-nextest
         uses: taiki-e/install-action@nextest
-      - name: Free runner disk space
-        run: |
-          df -h
-          sudo rm -rf /opt/hostedtoolcache/CodeQL
-          sudo rm -rf /usr/local/lib/android
-          sudo rm -rf /usr/local/share/boost
-          sudo rm -rf /opt/ghc
-          sudo rm -rf /usr/share/dotnet
-          df -h
       - name: Install sccache
         uses: mozilla-actions/sccache-action@v0.0.9
       - name: Cache cargo
