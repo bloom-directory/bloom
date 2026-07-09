@@ -52,6 +52,7 @@ members = [
   "examples/petal-identity",
   "examples/petal-cap",
 ]
+exclude = ["vendor/embednfs"]
 resolver = "2"
 
 [workspace.package]

@@ -4559,7 +4559,6 @@ checksum = "edd0f118536f44f5ccd48bcb8b111bdc3de888b58c74639dfb034a357d0f206d"
 [[package]]
 name = "embednfs"
 version = "0.4.1"
-source = "git+https://github.com/bloom-directory/embednfs.git?rev=a9c835304edc5e338e082b0ac3a499aefdfd68e7#a9c835304edc5e338e082b0ac3a499aefdfd68e7"
 dependencies = [
  "async-trait",
  "bytes",
@@ -4573,7 +4572,6 @@ dependencies = [
 [[package]]
 name = "embednfs-proto"
 version = "0.4.1"
-source = "git+https://github.com/bloom-directory/embednfs.git?rev=a9c835304edc5e338e082b0ac3a499aefdfd68e7#a9c835304edc5e338e082b0ac3a499aefdfd68e7"
 dependencies = [
  "bytes",
  "num-derive",

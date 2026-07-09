@@ -23,9 +23,9 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 use async_trait::async_trait;
 use bytes::Bytes;
 use embednfs::{
-    AccessMask, Attrs, CommitSupport, CreateKind, CreateRequest, CreateResult, DirEntry, DirPage,
-    FileSystem, FsError, FsResult, FsStats, ObjectType, ReadResult, RequestContext, SetAttrs,
-    Symlinks, Timestamp, WriteResult, WriteStability,
+    AccessMask, Attrs, CloseSupport, CommitSupport, CreateKind, CreateRequest, CreateResult,
+    DirEntry, DirPage, FileSystem, FsError, FsResult, FsStats, ObjectType, ReadResult,
+    RequestContext, SetAttrs, Symlinks, Timestamp, WriteResult, WriteStability,
 };
 use futures::FutureExt;
 use futures::future::{BoxFuture, Shared};
@@ -1187,6 +1187,14 @@ impl FileSystem for BloomFs {
         Some(self)
     }
 
+    fn close_support(&self) -> Option<&dyn CloseSupport<BloomHandle>> {
+        // Some clients delay writeback error reporting until file close
+        // rather than issuing an explicit COMMIT. Route CLOSE through
+        // the same whole-file flush path so PermissionDenied from the
+        // VFS reaches shell redirects and simple agent file writes.
+        Some(self)
+    }
+
     fn symlinks(&self) -> Option<&dyn Symlinks<BloomHandle>> {
         Some(self)
     }
@@ -1233,6 +1241,17 @@ impl CommitSupport<BloomHandle> for BloomFs {
         // incomplete (a missing prefix), we leave it in place — the
         // client will either resend the missing chunk or the idle
         // timer will reap it on the next read.
+        let path = match handle {
+            BloomHandle::Root => return Err(FsError::IsDirectory),
+            BloomHandle::Path { path, .. } => path.clone(),
+        };
+        self.flush_path(&path).await
+    }
+}
+
+#[async_trait]
+impl CloseSupport<BloomHandle> for BloomFs {
+    async fn close(&self, _ctx: &RequestContext, handle: &BloomHandle) -> FsResult<()> {
         let path = match handle {
             BloomHandle::Root => return Err(FsError::IsDirectory),
             BloomHandle::Path { path, .. } => path.clone(),
@@ -1598,6 +1617,38 @@ mod tests {
         let err = cs.commit(&ctx, &challenge, 0, 7).await.unwrap_err();
         assert_eq!(err, FsError::PermissionDenied);
         assert_eq!(handler.staged_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn unstable_write_denies_on_close() {
+        let handler = ChallengeStagingHandler::new();
+        let vfs = Vfs::builder().mount("stage", handler.clone()).build();
+        let fs = BloomFs::new(vfs);
+        let ctx = fake_ctx();
+        let dir = fs.lookup(&ctx, &BloomHandle::Root, "stage").await.unwrap();
+        let challenge = fs.lookup(&ctx, &dir, "challenge").await.unwrap();
+
+        let result = fs
+            .write(
+                &ctx,
+                &challenge,
+                0,
+                Bytes::from_static(b"{\"action\":\"usdSend\"}"),
+                WriteStability::Unstable,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.stability, WriteStability::Unstable);
+        assert_eq!(handler.staged_count(), 0);
+
+        let closer = fs.close_support().expect("close support enabled");
+        let err = closer.close(&ctx, &challenge).await.unwrap_err();
+        assert_eq!(err, FsError::PermissionDenied);
+        assert_eq!(
+            handler.staged_count(),
+            1,
+            "close should flush the buffered body exactly once"
+        );
     }
 
     /// Bug #4 acceptance: a 16 KiB write delivered as four 4 KiB

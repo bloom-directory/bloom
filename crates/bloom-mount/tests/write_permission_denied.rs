@@ -115,7 +115,10 @@ async fn mounted_printf_surfaces_permission_denied() {
     {
         Some(output) => output,
         None => {
-            eprintln!("skipping real mount permission-denied test: shell redirect timed out");
+            eprintln!(
+                "skipping real mount permission-denied test: shell redirect timed out; staged_count={}",
+                handler.staged_count()
+            );
             let _ = mount.unmount().await;
             let _ = std::fs::remove_dir(&mount_dir);
             return;

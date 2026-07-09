@@ -157,7 +157,7 @@ pub fn detect_mount_command() -> &'static str {
 /// the platform mount command, targeting the embedded NFSv4.1 server at
 /// `server`.
 ///
-/// The shared options are `vers=4.1,proto=tcp`, explicit `port` so we
+/// The shared options are `vers=4.1,proto=tcp`, `sync`, explicit `port` so we
 /// can target the auto-assigned ephemeral port, generous `rsize`/`wsize`
 /// so most JSON/TOML payloads fit in a single op (the adapter buffers
 /// multi-block writes anyway but a single op stays simpler for the
@@ -195,18 +195,18 @@ pub fn build_mount_args(cfg: &MountConfig, server: SocketAddr) -> Vec<String> {
 
 #[cfg(target_os = "linux")]
 fn build_mount_opts(port: u16) -> String {
-    format!("actimeo=0,vers=4.1,proto=tcp,port={port},rsize=65536,wsize=65536,timeo=10")
+    format!("actimeo=0,vers=4.1,proto=tcp,sync,port={port},rsize=65536,wsize=65536,timeo=10")
 }
 
 #[cfg(target_os = "macos")]
 fn build_mount_opts(port: u16) -> String {
-    format!("actimeo=0,vers=4.1,proto=tcp,port={port},rsize=65536,wsize=65536,timeo=10")
+    format!("actimeo=0,vers=4.1,proto=tcp,sync,port={port},rsize=65536,wsize=65536,timeo=10")
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn build_mount_opts(port: u16) -> String {
     format!(
-        "actimeo=0,vers=4.1,proto=tcp,nolocks,mountport={port},port={port},rsize=65536,wsize=65536,timeo=10"
+        "actimeo=0,vers=4.1,proto=tcp,sync,nolocks,mountport={port},port={port},rsize=65536,wsize=65536,timeo=10"
     )
 }
 
@@ -237,6 +237,7 @@ mod tests {
         let args = build_mount_args(&cfg, server);
         let joined = args.join(" ");
         assert!(joined.contains("vers=4.1"), "missing vers=4.1 in {joined}");
+        assert!(joined.contains("sync"), "missing sync in {joined}");
         assert!(
             joined.contains("port=54321"),
             "missing port=54321 in {joined}"

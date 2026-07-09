@@ -1,0 +1,27 @@
+[package]
+name = "embednfs"
+version = "0.4.1"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Embeddable NFSv4.1 server library"
+readme = "../../README.md"
+exclude = ["CLAUDE.md"]
+
+[lints]
+workspace = true
+
+[dependencies]
+async-trait = "0.1.89"
+bytes = "1.11.1"
+dashmap = "6.1.0"
+embednfs-proto = { path = "../embednfs-proto", version = "0.4.1" }
+thiserror = "2.0.18"
+tokio = { version = "1.50.0", features = ["full"] }
+tracing = "0.1.44"
+
+[dev-dependencies]
+nfs-rs = { git = "https://github.com/NetAppLabs/nfs-rs.git", rev = "483ef9f072e20cc84a5c40d8f3484d7f816c2a79" }

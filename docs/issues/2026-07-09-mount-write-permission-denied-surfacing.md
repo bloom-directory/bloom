@@ -59,8 +59,20 @@ filesystem.
 4. Protocol bound discovered during implementation: for `Unstable` NFS writes,
    Bloom cannot safely prove that an offset-0 contiguous prefix is the final
    file. The safe implementation therefore preserves data correctness and
-   surfaces `PermissionDenied` on sync-stable `WRITE`, `COMMIT`, or read; a
-   future full solution needs an expected-size/preflight signal.
+   surfaces `PermissionDenied` on sync-stable `WRITE`, explicit `COMMIT`,
+   NFS `CLOSE`, or read. The close path is the important fix for ordinary
+   shell redirects and agent open/write/close flows.
+
+## 2.1 Resolution implemented in PR #92
+
+The fix adds a small `CloseSupport` extension to the vendored `embednfs`
+server API and calls it from the NFS `CLOSE` operation before open-state
+teardown. `BloomFs` implements that hook by routing close through the same
+whole-file `flush_path` used by `COMMIT` and read repair. As a result,
+buffered `Unstable` writes are still not flushed early based on unsafe
+EOF guesses, but a normal mounted open/write/close sequence now returns
+`FsError::PermissionDenied` from close when the VFS handler stages a challenge
+and denies the write.
 
 ## 3. Current behavior
 
