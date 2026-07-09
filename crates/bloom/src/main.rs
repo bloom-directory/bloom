@@ -2123,23 +2123,61 @@ async fn run(cli: Cli) -> Result<()> {
             let path = format!("/wallets/{wallet}/chains/{chain}/outbox/pending/{id}/confirm");
             let body = text.into_bytes();
             let client = IpcClient::new(&client_endpoint.socket);
-            let ipc_res = try_ipc(
-                &client,
-                &client_endpoint,
-                "write_unlocked",
-                serde_json::json!({
-                    "path": path,
-                    "bytes_b64": B64.encode(&body),
-                    "wallet": &wallet,
-                }),
-            )
-            .await
-            .with_context(|| format!("ipc wallet confirm via {}", client_endpoint.display))?;
-            if ipc_res.is_some() {
-                debug!(endpoint = %client_endpoint.display, "cli.wallet.confirm.via_ipc");
-                return Ok(());
+            // Daemon-backed confirm must use the plain VFS write lane. The
+            // wallets handler/tx engine stages Sealed Approval challenges and
+            // later consumes approval.json; `write_unlocked` is intentionally
+            // not a passkey signing lane.
+            let confirm_params = serde_json::json!({
+                "path": path,
+                "bytes_b64": B64.encode(&body),
+            });
+            match try_ipc(&client, &client_endpoint, "write", confirm_params.clone()).await {
+                Ok(Some(_)) => {
+                    debug!(endpoint = %client_endpoint.display, "cli.wallet.confirm.via_ipc");
+                    return Ok(());
+                }
+                Ok(None) => {
+                    debug!("cli.wallet.confirm.via_inproc: no daemon socket present");
+                    // Fall through to the in-process fallback below.
+                }
+                Err(e) if is_ipc_handler_permission_denied(&e) => {
+                    // The serving daemon staged approval_challenge.json on the
+                    // first plain write. Build a read-only daemon in this
+                    // process to run the foreground ceremony against the shared
+                    // home, write approval.json, then retry the same write so
+                    // the serving daemon verifies and broadcasts.
+                    let ceremony_daemon = Daemon::from_home(home.clone())
+                        .context("build daemon for wallet confirm ceremony")?;
+                    let approved = sign_outbox_sealed_approval_if_challenged(
+                        &ceremony_daemon,
+                        &wallet,
+                        &chain,
+                        &id,
+                        None,
+                    )
+                    .await
+                    .context("wallet confirm Sealed Approval ceremony")?;
+                    if !approved {
+                        return Err(anyhow::Error::new(e))
+                            .context("wallet confirm denied but no approval challenge was staged");
+                    }
+                    let retry = try_ipc(&client, &client_endpoint, "write", confirm_params)
+                        .await
+                        .with_context(|| {
+                            format!("ipc wallet confirm retry via {}", client_endpoint.display)
+                        })?;
+                    if retry.is_some() {
+                        debug!(endpoint = %client_endpoint.display, "cli.wallet.confirm.via_ipc.after_ceremony");
+                        return Ok(());
+                    }
+                    bail!("wallet confirm retry did not reach the daemon after Sealed Approval");
+                }
+                Err(e) => {
+                    return Err(anyhow::Error::new(e)).with_context(|| {
+                        format!("ipc wallet confirm via {}", client_endpoint.display)
+                    });
+                }
             }
-            debug!("cli.wallet.confirm.via_inproc: no daemon socket present");
             let text = String::from_utf8(body).expect("wallet confirm text originated as UTF-8");
             let (home_permit, d) = build_write_daemon(home)?;
             let info = d.keystore.info(&wallet)?;

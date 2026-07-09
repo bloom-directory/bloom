@@ -1129,6 +1129,39 @@ fn vfs_routes_via_ipc_when_socket_exists() {
     server_thread.join().expect("ipc server thread panicked");
 }
 
+#[test]
+fn wallet_confirm_uses_plain_ipc_write_when_socket_exists() {
+    let home = fresh_home();
+    let handler = RecordingWriteHandler::new();
+    let vfs = bloom_vfs::Vfs::builder()
+        .mount("wallets", handler.clone())
+        .build();
+    let (server, server_thread) = spawn_ipc_server(home.path(), vfs);
+
+    bloom_cmd(home.path())
+        .args([
+            "wallet",
+            "confirm",
+            "alice",
+            "base",
+            "0001-deadbeef",
+            "--text",
+            "y",
+        ])
+        .assert()
+        .success();
+
+    stop_ipc_server(server, server_thread);
+
+    let writes = handler.writes();
+    assert_eq!(writes.len(), 1, "expected one VFS write, got {writes:?}");
+    assert_eq!(
+        writes[0].0,
+        "/alice/chains/base/outbox/pending/0001-deadbeef/confirm"
+    );
+    assert_eq!(writes[0].1, b"y");
+}
+
 /// End-to-end petals smoke test: install a WAT module from a file,
 /// confirm `petals ls` shows it under both its hash and its petname, then
 /// `petals run` it and check that WASI stdout reaches the parent process.
