@@ -34,10 +34,10 @@ bytes = { version = "1", optional = true }
 lru = { workspace = true, optional = true }
 futures = { workspace = true, optional = true }
 
-# Embedded NFSv4.1 server. Vendored from the previously pinned revision with
-# a small CloseSupport hook so buffered write errors can surface from NFS CLOSE.
-# Marked optional so non-mount builds don't compile it.
-embednfs = { path = "../../vendor/embednfs/crates/embednfs", optional = true }
+# Embedded NFSv4.1 server. Pinned to the bloom-directory fork revision that
+# exposes CloseSupport so buffered write errors can surface from NFS CLOSE.
+# Marked optional so non-mount builds don't fetch the git source.
+embednfs = { git = "https://github.com/bloom-directory/embednfs.git", rev = "f73510247ad057a0b57ff7a83cc1f9f3a3fa55f1", optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }

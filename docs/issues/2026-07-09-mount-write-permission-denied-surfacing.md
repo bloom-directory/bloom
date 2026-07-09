@@ -65,14 +65,13 @@ filesystem.
 
 ## 2.1 Resolution implemented in PR #92
 
-The fix adds a small `CloseSupport` extension to the vendored `embednfs`
-server API and calls it from the NFS `CLOSE` operation before open-state
-teardown. `BloomFs` implements that hook by routing close through the same
-whole-file `flush_path` used by `COMMIT` and read repair. As a result,
-buffered `Unstable` writes are still not flushed early based on unsafe
-EOF guesses, but a normal mounted open/write/close sequence now returns
-`FsError::PermissionDenied` from close when the VFS handler stages a challenge
-and denies the write.
+The fix adds a small `CloseSupport` extension to the `bloom-directory/embednfs`
+fork and calls it from the NFS `CLOSE` operation before open-state teardown.
+`BloomFs` implements that hook by routing close through the same whole-file
+`flush_path` used by `COMMIT` and read repair. As a result, buffered
+`Unstable` writes are still not flushed early based on unsafe EOF guesses, but
+a normal mounted open/write/close sequence now returns `FsError::PermissionDenied`
+from close when the VFS handler stages a challenge and denies the write.
 
 ## 3. Current behavior
 
