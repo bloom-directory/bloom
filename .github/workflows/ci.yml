@@ -190,6 +190,8 @@ jobs:
         run: rustup show
       - name: Install cargo-nextest
         uses: taiki-e/install-action@nextest
+      - name: Install wasm-tools
+        uses: bytecodealliance/actions/wasm-tools/setup@v1
       - name: Download nextest archive
         uses: actions/download-artifact@v4
         with:
