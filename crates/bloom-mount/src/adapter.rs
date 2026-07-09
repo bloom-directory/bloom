@@ -196,17 +196,23 @@ fn map_err(e: HandlerError) -> FsError {
     }
 }
 
-/// Build a `Timestamp` for "now" (epoch fallback). The VFS doesn't
-/// expose mtime per entry today; using the epoch is honest — it tells
-/// the kernel "I have no idea, please don't trust this for caching".
+/// Build a stable fallback timestamp. The VFS doesn't expose mtime per
+/// entry today; change attributes carry cache invalidation instead.
 fn epoch_ts() -> Timestamp {
-    let dur = std::time::SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
     Timestamp {
-        seconds: dur.as_secs() as i64,
-        nanos: dur.subsec_nanos(),
+        seconds: 0,
+        nanos: 0,
     }
+}
+
+fn stable_attrs(object_type: ObjectType, fileid: u64) -> Attrs {
+    let mut attrs = Attrs::new(object_type, fileid);
+    let ts = epoch_ts();
+    attrs.atime = ts;
+    attrs.mtime = ts;
+    attrs.ctime = ts;
+    attrs.birthtime = ts;
+    attrs
 }
 
 /// Build attrs for an Entry returned by `list` / `lookup`.
@@ -234,14 +240,10 @@ fn entry_to_attrs(path: &VfsPath, e: &Entry, size: u64) -> Attrs {
     } else {
         size
     };
-    let mut a = Attrs::new(ot, fileid_for(path));
+    let mut a = stable_attrs(ot, fileid_for(path));
     a.size = size;
     a.space_used = size;
     a.mode = e.mode;
-    let ts = epoch_ts();
-    a.mtime = ts;
-    a.atime = ts;
-    a.ctime = ts;
     if matches!(e.kind, EntryKind::File | EntryKind::Symlink) {
         a.change = file_change_now();
     }
@@ -712,12 +714,8 @@ impl FileSystem for BloomFs {
     async fn getattr(&self, _ctx: &RequestContext, handle: &BloomHandle) -> FsResult<Attrs> {
         match handle {
             BloomHandle::Root => {
-                let mut a = Attrs::new(ObjectType::Directory, fileid_for(&VfsPath::root()));
+                let mut a = stable_attrs(ObjectType::Directory, fileid_for(&VfsPath::root()));
                 a.mode = 0o755;
-                let ts = epoch_ts();
-                a.mtime = ts;
-                a.atime = ts;
-                a.ctime = ts;
                 a.change = self.dir_change(&VfsPath::root()).await;
                 Ok(a)
             }

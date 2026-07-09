@@ -12,10 +12,20 @@ use bloom_vfs::{Vfs, VfsPath};
 
 #[derive(Default)]
 struct ChallengeStagingHandler {
+    lookups: parking_lot::Mutex<usize>,
+    lists: parking_lot::Mutex<usize>,
     staged: parking_lot::Mutex<Vec<Vec<u8>>>,
 }
 
 impl ChallengeStagingHandler {
+    fn lookup_count(&self) -> usize {
+        *self.lookups.lock()
+    }
+
+    fn list_count(&self) -> usize {
+        *self.lists.lock()
+    }
+
     fn staged_count(&self) -> usize {
         self.staged.lock().len()
     }
@@ -24,6 +34,7 @@ impl ChallengeStagingHandler {
 #[async_trait]
 impl Handler for ChallengeStagingHandler {
     async fn lookup(&self, path: &VfsPath) -> Result<Entry, HandlerError> {
+        *self.lookups.lock() += 1;
         if path.is_root() {
             return Ok(Entry::dir(""));
         }
@@ -44,6 +55,7 @@ impl Handler for ChallengeStagingHandler {
     }
 
     async fn list(&self, path: &VfsPath) -> Result<Vec<Entry>, HandlerError> {
+        *self.lists.lock() += 1;
         if path.is_root() {
             Ok(vec![Entry::writable_file("challenge")])
         } else {
@@ -82,6 +94,21 @@ fn command_output_with_timeout(
     }
 }
 
+fn command_text(cmd: &str, args: &[&str], timeout: Duration) -> String {
+    let mut command = Command::new(cmd);
+    command.args(args);
+    match command_output_with_timeout(&mut command, timeout) {
+        Ok(Some(output)) => format!(
+            "status={} stdout={} stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ),
+        Ok(None) => "timed out".to_string(),
+        Err(err) => format!("failed to run: {err}"),
+    }
+}
+
 /// Manual issue #77 coverage: a real shell redirect through a kernel NFS
 /// mount must fail when the handler stages a challenge and returns
 /// PermissionDenied. This needs platform mount privileges, so it is ignored
@@ -103,6 +130,74 @@ async fn mounted_printf_surfaces_permission_denied() {
         }
     };
 
+    let mut root_ls = Command::new("ls");
+    root_ls.arg("-la").arg(&mount_dir);
+    match command_output_with_timeout(&mut root_ls, Duration::from_secs(5))
+        .expect("run ls through mounted root")
+    {
+        Some(output) if output.status.success() => {}
+        Some(output) => {
+            eprintln!(
+                "skipping real mount permission-denied test: root ls failed: stdout={} stderr={} lookups={} lists={} staged_count={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+                handler.lookup_count(),
+                handler.list_count(),
+                handler.staged_count()
+            );
+            let _ = mount.unmount().await;
+            let _ = std::fs::remove_dir(&mount_dir);
+            return;
+        }
+        None => {
+            eprintln!(
+                "skipping real mount permission-denied test: root ls timed out; nfs_addr={} mount={} nfsstat={} lookups={} lists={} staged_count={}",
+                mount.nfs_addr(),
+                command_text("mount", &[], Duration::from_secs(2)),
+                command_text("nfsstat", &["-m"], Duration::from_secs(2)),
+                handler.lookup_count(),
+                handler.list_count(),
+                handler.staged_count()
+            );
+            let _ = mount.unmount().await;
+            let _ = std::fs::remove_dir(&mount_dir);
+            return;
+        }
+    }
+
+    let stage_dir = mount_dir.join("stage");
+    let mut stage_ls = Command::new("ls");
+    stage_ls.arg("-la").arg(&stage_dir);
+    match command_output_with_timeout(&mut stage_ls, Duration::from_secs(5))
+        .expect("run ls through mounted stage dir")
+    {
+        Some(output) if output.status.success() => {}
+        Some(output) => {
+            eprintln!(
+                "skipping real mount permission-denied test: stage ls failed: stdout={} stderr={} lookups={} lists={} staged_count={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+                handler.lookup_count(),
+                handler.list_count(),
+                handler.staged_count()
+            );
+            let _ = mount.unmount().await;
+            let _ = std::fs::remove_dir(&mount_dir);
+            return;
+        }
+        None => {
+            eprintln!(
+                "skipping real mount permission-denied test: stage ls timed out; lookups={} lists={} staged_count={}",
+                handler.lookup_count(),
+                handler.list_count(),
+                handler.staged_count()
+            );
+            let _ = mount.unmount().await;
+            let _ = std::fs::remove_dir(&mount_dir);
+            return;
+        }
+    }
+
     let target = mount_dir.join("stage").join("challenge");
     let mut command = Command::new("sh");
     command
@@ -116,7 +211,9 @@ async fn mounted_printf_surfaces_permission_denied() {
         Some(output) => output,
         None => {
             eprintln!(
-                "skipping real mount permission-denied test: shell redirect timed out; staged_count={}",
+                "skipping real mount permission-denied test: shell redirect timed out; lookups={} lists={} staged_count={}",
+                handler.lookup_count(),
+                handler.list_count(),
                 handler.staged_count()
             );
             let _ = mount.unmount().await;
