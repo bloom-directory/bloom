@@ -2,7 +2,7 @@ name: CI
 
 on:
   pull_request:
-    paths:
+    paths: &code_paths
       - ".github/workflows/ci.yml"
       - "Cargo.toml"
       - "Cargo.lock"
@@ -15,16 +15,7 @@ on:
   push:
     branches:
       - master
-    paths:
-      - ".github/workflows/ci.yml"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - "rust-toolchain.toml"
-      - "crates/**"
-      - "scripts/**"
-      - "tests/**"
-      - "Dockerfile"
-      - "DEVELOPMENT.md"
+    paths: *code_paths
   workflow_dispatch:
 
 concurrency:
@@ -64,6 +55,33 @@ jobs:
           cache-targets: false
       - name: Run clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Show sccache stats
+        if: always()
+        run: sccache --show-stats
+
+  # Doctests can't be captured in a nextest archive, so they need their own
+  # compile. Run them as an independent job (no `needs`) so that compile happens
+  # concurrently with build_test_archive/clippy instead of being appended to the
+  # unit-test lane, where it sat on the critical path and re-built the workspace
+  # from a cold target dir.
+  doctests:
+    name: doctests
+    runs-on: ubuntu-latest
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install Rust toolchain
+        run: rustup show
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: false
+      - name: Run doctests
+        run: cargo test --workspace --doc --no-fail-fast
       - name: Show sccache stats
         if: always()
         run: sccache --show-stats
@@ -109,25 +127,18 @@ jobs:
         if: always()
         run: sccache --show-stats
 
+  # Pure test-execution lanes below: they only run prebuilt binaries from the
+  # archive, so they carry no sccache/target cache and do no compilation.
   unit_test:
     name: unit tests
     runs-on: ubuntu-latest
     needs: build_test_archive
-    env:
-      RUSTC_WRAPPER: sccache
-      SCCACHE_GHA_ENABLED: "true"
     steps:
       - uses: actions/checkout@v6
       - name: Install Rust toolchain
         run: rustup show
       - name: Install cargo-nextest
         uses: taiki-e/install-action@nextest
-      - name: Install sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
-        with:
-          cache-targets: false
       - name: Download nextest archive
         uses: actions/download-artifact@v4
         with:
@@ -135,11 +146,6 @@ jobs:
           path: target
       - name: Run library unit tests from archive
         run: cargo nextest run --archive-file target/nextest-archive.tar.zst -E 'kind(lib)' --no-fail-fast
-      - name: Run doctests
-        run: cargo test --workspace --doc --no-fail-fast
-      - name: Show sccache stats
-        if: always()
-        run: sccache --show-stats
 
   integration_test:
     name: local integration tests
@@ -222,35 +228,16 @@ jobs:
             --run-ignored ignored-only \
             --no-fail-fast
 
-  docker_integration_smoke:
-    name: docker integration smoke
+  # Heavy docker suites are opt-in via workflow_dispatch only. Consolidated into
+  # one matrix job; each mode self-skips when its required secrets are absent.
+  docker:
+    name: docker (${{ matrix.mode }})
     runs-on: ubuntu-latest
     if: github.event_name == 'workflow_dispatch'
-    steps:
-      - uses: actions/checkout@v6
-      - name: Run local docker mount smoke
-        run: bash tests/docker/run.sh --mount
-
-  docker_e2e_external:
-    name: docker external e2e
-    runs-on: ubuntu-latest
-    if: github.event_name == 'workflow_dispatch'
-    env:
-      BLOOM_ENSO_KEY: ${{ secrets.BLOOM_ENSO_KEY }}
-    steps:
-      - uses: actions/checkout@v6
-      - name: Run Enso/anvil docker e2e
-        run: |
-          if [ -z "${BLOOM_ENSO_KEY:-}" ]; then
-            echo "BLOOM_ENSO_KEY missing; skipping docker --enso e2e."
-            exit 0
-          fi
-          bash tests/docker/run.sh --enso
-
-  docker_live_funds_e2e:
-    name: docker live-funds e2e
-    runs-on: ubuntu-latest
-    if: github.event_name == 'workflow_dispatch'
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [mount, enso, enso-live]
     env:
       BLOOM_ENSO_KEY: ${{ secrets.BLOOM_ENSO_KEY }}
       BLOOM_LIVE_HOME: ${{ secrets.BLOOM_LIVE_HOME }}
@@ -261,13 +248,27 @@ jobs:
       BLOOM_RUN_LIVE_FUNDS_E2E: ${{ secrets.BLOOM_RUN_LIVE_FUNDS_E2E }}
     steps:
       - uses: actions/checkout@v6
-      - name: Run live-funds docker e2e
+      - name: Run docker ${{ matrix.mode }} suite
         run: |
-          if [ "${BLOOM_RUN_LIVE_FUNDS_E2E:-}" != "1" ]; then
-            echo "BLOOM_RUN_LIVE_FUNDS_E2E is not 1; skipping real-funds e2e."
-            exit 0
-          fi
-          bash tests/docker/run.sh --enso-live
+          case "${{ matrix.mode }}" in
+            mount)
+              bash tests/docker/run.sh --mount
+              ;;
+            enso)
+              if [ -z "${BLOOM_ENSO_KEY:-}" ]; then
+                echo "BLOOM_ENSO_KEY missing; skipping docker --enso e2e."
+                exit 0
+              fi
+              bash tests/docker/run.sh --enso
+              ;;
+            enso-live)
+              if [ "${BLOOM_RUN_LIVE_FUNDS_E2E:-}" != "1" ]; then
+                echo "BLOOM_RUN_LIVE_FUNDS_E2E is not 1; skipping real-funds e2e."
+                exit 0
+              fi
+              bash tests/docker/run.sh --enso-live
+              ;;
+          esac
 
   locked-build:
     name: locked release build
