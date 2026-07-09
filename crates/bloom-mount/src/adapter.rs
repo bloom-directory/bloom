@@ -18,7 +18,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
-use std::time::{Duration, Instant, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -197,13 +197,9 @@ fn map_err(e: HandlerError) -> FsError {
     }
 }
 
-/// Build a `Timestamp` for "now" (epoch fallback). The VFS doesn't
-/// expose mtime per entry today; using the epoch is honest — it tells
-/// the kernel "I have no idea, please don't trust this for caching".
-fn epoch_ts() -> Timestamp {
-    let dur = std::time::SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
+/// Build a `Timestamp` from a system time, falling back to the Unix epoch.
+fn system_time_to_ts(time: SystemTime) -> Timestamp {
+    let dur = time.duration_since(UNIX_EPOCH).unwrap_or_default();
     Timestamp {
         seconds: dur.as_secs() as i64,
         nanos: dur.subsec_nanos(),
@@ -239,7 +235,7 @@ fn entry_to_attrs(path: &VfsPath, e: &Entry, size: u64) -> Attrs {
     a.size = size;
     a.space_used = size;
     a.mode = e.mode;
-    let ts = epoch_ts();
+    let ts = system_time_to_ts(e.modified.unwrap_or_else(SystemTime::now));
     a.mtime = ts;
     a.atime = ts;
     a.ctime = ts;
@@ -710,7 +706,7 @@ impl FileSystem for BloomFs {
             BloomHandle::Root => {
                 let mut a = Attrs::new(ObjectType::Directory, fileid_for(&VfsPath::root()));
                 a.mode = 0o755;
-                let ts = epoch_ts();
+                let ts = system_time_to_ts(SystemTime::now());
                 a.mtime = ts;
                 a.atime = ts;
                 a.ctime = ts;
@@ -1723,6 +1719,19 @@ mod tests {
         let run = fs.lookup(&ctx, &dir, "run").await.unwrap();
         let attrs = fs.getattr(&ctx, &run).await.unwrap();
         assert_eq!(attrs.mode & 0o777, 0o555);
+    }
+
+    #[test]
+    fn entry_to_attrs_uses_entry_modified_time() {
+        let modified = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let entry = Entry::file("artifact.json").with_modified(modified);
+        let path = VfsPath::parse("/requests/pending/req_1/artifact.json").unwrap();
+
+        let attrs = entry_to_attrs(&path, &entry, 0);
+
+        assert_eq!(attrs.mtime.seconds, 1_700_000_000);
+        assert_eq!(attrs.ctime.seconds, 1_700_000_000);
+        assert_eq!(attrs.atime.seconds, 1_700_000_000);
     }
 
     /// Bug #5: ACCESS strips MODIFY/EXTEND/DELETE for a read-only path

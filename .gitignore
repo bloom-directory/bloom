@@ -3,6 +3,8 @@
 
 target/
 target-docker/
+cache/
+out/
 
 # Dependencies that are explicitly vendored for offline builds.
 # .vendor/ stores a snapshot of crates.io deps; re-generate via:

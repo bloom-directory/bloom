@@ -2902,6 +2902,39 @@ impl HyperliquidHandler {
         Ok(Some(value))
     }
 
+    fn session_created_ms(
+        &self,
+        network: &str,
+        wallet: &str,
+        session: &str,
+    ) -> Result<Option<u128>, HandlerError> {
+        if let Some(active) = self.active_session_if_present(network, wallet, session) {
+            return Ok(Some(active.lock().session.created_ms));
+        }
+        let value = match self.persisted_session_status_value(network, wallet, session) {
+            Ok(Some(value)) => value,
+            Ok(None) | Err(HandlerError::NotFound(_)) => return Ok(None),
+            Err(err) => return Err(err),
+        };
+        Ok(value
+            .get("created_ms")
+            .and_then(Value::as_u64)
+            .map(u128::from))
+    }
+
+    fn agent_session_entry(
+        &self,
+        network: &str,
+        wallet: &str,
+        session: &str,
+        entry: Entry,
+    ) -> Result<Entry, HandlerError> {
+        Ok(match self.session_created_ms(network, wallet, session)? {
+            Some(created_ms) => entry.with_modified_ms(created_ms),
+            None => entry,
+        })
+    }
+
     async fn try_recover_persisted_session(
         &self,
         client: &HyperliquidClient,
@@ -3039,11 +3072,14 @@ impl HyperliquidHandler {
                 names.insert(session.to_string());
             }
         }
-        Ok(SESSION_ROOT_FILES
+        let mut entries: Vec<Entry> = SESSION_ROOT_FILES
             .iter()
             .map(|f| Entry::writable_file(f))
-            .chain(names.into_iter().map(|name| Entry::dir(&name)))
-            .collect())
+            .collect();
+        for name in names {
+            entries.push(self.agent_session_entry(network, wallet, &name, Entry::dir(&name))?);
+        }
+        Ok(entries)
     }
 
     fn read_session_audit(
@@ -3248,7 +3284,7 @@ impl Handler for HyperliquidHandler {
                 if SESSION_ROOT_FILES.contains(&file.as_str()) {
                     Ok(Entry::writable_file(file))
                 } else {
-                    Ok(Entry::dir(file))
+                    self.agent_session_entry(&segs[0], &segs[2], file, Entry::dir(file))
                 }
             }
             5 if NETWORKS.contains(&segs[0].as_str()) && segs[1] == "agent_sessions" => {
@@ -3256,9 +3292,19 @@ impl Handler for HyperliquidHandler {
                 if SESSION_FILES.contains(&file.as_str()) {
                     match file.as_str() {
                         "status.json" | "session.json" | "audit.jsonl" | "last_response.json" => {
-                            Ok(Entry::file(file))
+                            self.agent_session_entry(
+                                &segs[0],
+                                &segs[2],
+                                &segs[3],
+                                Entry::file(file),
+                            )
                         }
-                        _ => Ok(Entry::writable_file(file)),
+                        _ => self.agent_session_entry(
+                            &segs[0],
+                            &segs[2],
+                            &segs[3],
+                            Entry::writable_file(file),
+                        ),
                     }
                 } else if file == APPROVAL_CHALLENGE_FILE
                     && self.session_approval_challenge_exists(&segs[0], &segs[2], &segs[3])?
@@ -3554,15 +3600,16 @@ impl Handler for HyperliquidHandler {
                 self.list_agent_session_ids(&segs[0], &segs[2])
             }
             4 if NETWORKS.contains(&segs[0].as_str()) && segs[1] == "agent_sessions" => {
-                let mut entries: Vec<_> = SESSION_FILES
-                    .iter()
-                    .map(|f| match *f {
+                let mut entries = Vec::new();
+                for f in SESSION_FILES {
+                    let entry = match f {
                         "status.json" | "session.json" | "audit.jsonl" | "last_response.json" => {
                             Entry::file(f)
                         }
                         _ => Entry::writable_file(f),
-                    })
-                    .collect();
+                    };
+                    entries.push(self.agent_session_entry(&segs[0], &segs[2], &segs[3], entry)?);
+                }
                 if self.session_approval_challenge_exists(&segs[0], &segs[2], &segs[3])? {
                     entries.push(Entry::file(APPROVAL_CHALLENGE_FILE));
                 }
@@ -5029,6 +5076,7 @@ mod tests {
     use bloom_auth_api::{ApprovalVerifier, AuthStoreView, AuthStoreWriter};
     use bloom_hyperliquid::{MAINNET_API_URL, TESTNET_API_URL};
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::SystemTime;
 
     static NEXT_TEST_DIR: AtomicU64 = AtomicU64::new(0);
 
@@ -6020,12 +6068,12 @@ mod tests {
         let session_dir = store
             .join("agent_sessions")
             .join("mainnet")
-            .join("minnow")
+            .join("test-wallet")
             .join("session-1");
         std::fs::create_dir_all(&session_dir).unwrap();
         std::fs::write(
             session_dir.join("session.json"),
-            br#"{"id":"session-1","wallet":"minnow","orphaned":false,"tradable":true}"#,
+            br#"{"id":"session-1","wallet":"test-wallet","created_ms":1700000000000,"orphaned":false,"tradable":true}"#,
         )
         .unwrap();
 
@@ -6033,18 +6081,25 @@ mod tests {
             .list(&VfsPath::parse("/mainnet/agent_sessions").unwrap())
             .await
             .unwrap();
-        assert!(wallets.iter().any(|entry| entry.name == "minnow"));
+        assert!(wallets.iter().any(|entry| entry.name == "test-wallet"));
 
         let sessions = h
-            .list(&VfsPath::parse("/mainnet/agent_sessions/minnow").unwrap())
+            .list(&VfsPath::parse("/mainnet/agent_sessions/test-wallet").unwrap())
             .await
             .unwrap();
         assert!(sessions.iter().any(|entry| entry.name == "new.json"));
-        assert!(sessions.iter().any(|entry| entry.name == "session-1"));
+        let session_entry = sessions
+            .iter()
+            .find(|entry| entry.name == "session-1")
+            .expect("persisted session is listed");
+        assert_eq!(
+            session_entry.modified,
+            Some(SystemTime::UNIX_EPOCH + Duration::from_millis(1_700_000_000_000))
+        );
 
         let status = h
             .read(
-                &VfsPath::parse("/mainnet/agent_sessions/minnow/session-1/status.json")
+                &VfsPath::parse("/mainnet/agent_sessions/test-wallet/session-1/status.json")
                     .expect("valid status path"),
             )
             .await

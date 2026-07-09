@@ -1305,16 +1305,16 @@ impl DefiHandler {
                 3 if segs[2] == "new" => Ok(Entry::writable_file("new")),
                 3 => {
                     // /<wallet>/<session>
-                    let _ = self.get_session(&segs[1], &segs[2])?;
-                    Ok(Entry::dir(&segs[2]))
+                    let sess = self.get_session(&segs[1], &segs[2])?;
+                    Ok(Entry::dir(&segs[2]).with_modified_ms(sess.created_ms))
                 }
                 4 => {
-                    let _ = self.get_session(&segs[1], &segs[2])?;
+                    let sess = self.get_session(&segs[1], &segs[2])?;
                     if is_session_file(&segs[3]) {
                         if segs[3] == "confirm" {
-                            Ok(Entry::writable_file(&segs[3]))
+                            Ok(Entry::writable_file(&segs[3]).with_modified_ms(sess.updated_ms))
                         } else {
-                            Ok(Entry::file(&segs[3]))
+                            Ok(Entry::file(&segs[3]).with_modified_ms(sess.updated_ms))
                         }
                     } else {
                         Err(HandlerError::not_found(path.to_string_path()))
@@ -1437,23 +1437,24 @@ impl DefiHandler {
                 // we show only `new`).
                 let mut out = vec![Entry::writable_file("new")];
                 for id in self.list_sessions_for_wallet(&segs[1]) {
-                    out.push(Entry::dir(&id));
+                    let sess = self.get_session(&segs[1], &id)?;
+                    out.push(Entry::dir(&id).with_modified_ms(sess.created_ms));
                 }
                 Ok(out)
             }
             3 if segs[0] == "intents" => {
-                let _ = self.get_session(&segs[1], &segs[2])?;
+                let sess = self.get_session(&segs[1], &segs[2])?;
                 Ok(vec![
-                    Entry::file("intent.txt"),
-                    Entry::file("route.json"),
-                    Entry::file("plan.md"),
-                    Entry::file("policy_check.json"),
-                    Entry::file("tx.json"),
-                    Entry::file("simulation.json"),
-                    Entry::file("settlement.json"),
-                    Entry::file("wait_settlement"),
-                    Entry::file("destination_chain.txt"),
-                    Entry::writable_file("confirm"),
+                    Entry::file("intent.txt").with_modified_ms(sess.updated_ms),
+                    Entry::file("route.json").with_modified_ms(sess.updated_ms),
+                    Entry::file("plan.md").with_modified_ms(sess.updated_ms),
+                    Entry::file("policy_check.json").with_modified_ms(sess.updated_ms),
+                    Entry::file("tx.json").with_modified_ms(sess.updated_ms),
+                    Entry::file("simulation.json").with_modified_ms(sess.updated_ms),
+                    Entry::file("settlement.json").with_modified_ms(sess.updated_ms),
+                    Entry::file("wait_settlement").with_modified_ms(sess.updated_ms),
+                    Entry::file("destination_chain.txt").with_modified_ms(sess.updated_ms),
+                    Entry::writable_file("confirm").with_modified_ms(sess.updated_ms),
                 ])
             }
             _ => Err(HandlerError::NotADir(path.to_string_path())),
@@ -2256,6 +2257,34 @@ mod tests {
             Some(137)
         );
         assert_eq!(loaded.intent_states.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn session_entries_surface_session_timestamps() {
+        let td = tempfile::tempdir().unwrap();
+        let h = test_handler(td.path());
+        let mut sess = fake_session("alice", "s1");
+        sess.created_ms = 1_700_000_000_000;
+        sess.updated_ms = 1_700_000_123_000;
+        h.put_session(sess).unwrap();
+
+        let dir = h
+            .lookup(&VfsPath::parse("/intents/alice/s1").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            dir.modified,
+            Some(SystemTime::UNIX_EPOCH + Duration::from_millis(1_700_000_000_000))
+        );
+
+        let plan = h
+            .lookup(&VfsPath::parse("/intents/alice/s1/plan.md").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            plan.modified,
+            Some(SystemTime::UNIX_EPOCH + Duration::from_millis(1_700_000_123_000))
+        );
     }
 
     #[test]

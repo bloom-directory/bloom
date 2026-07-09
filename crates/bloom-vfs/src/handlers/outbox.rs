@@ -16,7 +16,9 @@ use std::path::PathBuf;
 use async_trait::async_trait;
 use bloom_auth_api::petal_identity::label_petal_digest;
 
-use crate::handler::{Entry, Handler, HandlerError};
+use crate::handler::{
+    Entry, EntryKind, Handler, HandlerError, entry_for_fs_path, entry_from_fs_dir_entry,
+};
 use crate::path::VfsPath;
 
 const STATES: &[&str] = &["pending", "sent", "failed"];
@@ -312,6 +314,21 @@ impl OutboxHandler {
             .latest_pending_action_id()?
             .map(|id| format!("pending/{id}")))
     }
+
+    fn file_entry_for_path(
+        &self,
+        path: impl AsRef<std::path::Path>,
+        name: &str,
+        writable: bool,
+    ) -> Result<Entry, HandlerError> {
+        let metadata = std::fs::metadata(path)?;
+        let entry = if writable {
+            Entry::writable_file(name)
+        } else {
+            Entry::file(name)
+        };
+        Ok(entry.with_fs_metadata(&metadata))
+    }
 }
 
 fn validate_action_id(id: &str) -> Result<(), HandlerError> {
@@ -355,11 +372,7 @@ impl Handler for OutboxHandler {
                 if !fpath.exists() {
                     return Err(HandlerError::NotFound(format!("/outbox/latest/{file}")));
                 }
-                if *file == "approval.json" {
-                    Ok(Entry::writable_file(file))
-                } else {
-                    Ok(Entry::file(file))
-                }
+                self.file_entry_for_path(fpath, file, *file == "approval.json")
             }
             [state, action_id] if STATES.contains(state) => {
                 validate_action_id(action_id)?;
@@ -369,7 +382,7 @@ impl Handler for OutboxHandler {
                         "/outbox/{state}/{action_id}"
                     )));
                 }
-                Ok(Entry::dir(action_id))
+                entry_for_fs_path(dir, action_id, EntryKind::Dir)
             }
             [state, action_id, file] if STATES.contains(state) => {
                 validate_action_id(action_id)?;
@@ -384,11 +397,11 @@ impl Handler for OutboxHandler {
                         "/outbox/{state}/{action_id}/{file}"
                     )));
                 }
-                if *file == "approval.json" && *state == "pending" {
-                    Ok(Entry::writable_file(file))
-                } else {
-                    Ok(Entry::file(file))
-                }
+                self.file_entry_for_path(
+                    fpath,
+                    file,
+                    *file == "approval.json" && *state == "pending",
+                )
             }
             _ => Err(HandlerError::NotFound(path.to_string_path())),
         }
@@ -490,7 +503,10 @@ impl Handler for OutboxHandler {
                 let mut entries: Vec<Entry> = std::fs::read_dir(&dir)
                     .map_err(|e| HandlerError::backend(e.to_string()))?
                     .filter_map(|e| e.ok())
-                    .map(|e| Entry::dir(e.file_name().to_string_lossy().as_ref()))
+                    .filter_map(|e| {
+                        let name = e.file_name().to_string_lossy().to_string();
+                        entry_from_fs_dir_entry(&e, &name, EntryKind::Dir).ok()
+                    })
                     .collect();
                 entries.sort_by(|a, b| a.name.cmp(&b.name));
                 Ok(entries)
@@ -508,14 +524,21 @@ impl Handler for OutboxHandler {
                     .filter_map(|e| e.ok())
                     .map(|e| {
                         let name = e.file_name().to_string_lossy().to_string();
+                        let metadata = e.metadata().ok();
                         if e.file_type().map(|t| t.is_file()).unwrap_or(false) {
-                            if state == &"pending" && name == "approval.json" {
+                            let entry = if state == &"pending" && name == "approval.json" {
                                 Entry::writable_file(&name)
                             } else {
                                 Entry::file(&name)
-                            }
+                            };
+                            metadata
+                                .as_ref()
+                                .map_or(entry.clone(), |m| entry.with_fs_metadata(m))
                         } else {
-                            Entry::dir(&name)
+                            let entry = Entry::dir(&name);
+                            metadata
+                                .as_ref()
+                                .map_or(entry.clone(), |m| entry.with_fs_metadata(m))
                         }
                     })
                     .collect();
@@ -566,6 +589,39 @@ mod tests {
         let p = VfsPath::parse("pending/act-001/intent_hash").unwrap();
         let data = h.read(&p).await.unwrap();
         assert!(String::from_utf8_lossy(&data).contains("abc123"));
+    }
+
+    #[tokio::test]
+    async fn entries_surface_action_artifact_modified_times() {
+        let h = handler();
+        h.outbox
+            .stage("act-time", b"{}", "hash", "plan", b"[]")
+            .unwrap();
+        let action_dir = h.outbox.action_dir("pending", "act-time");
+        let dir_modified = std::fs::metadata(&action_dir).unwrap().modified().unwrap();
+        let intent_path = action_dir.join("intent.json");
+        let intent_modified = std::fs::metadata(&intent_path).unwrap().modified().unwrap();
+
+        let action_entry = h
+            .lookup(&VfsPath::parse("pending/act-time").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(action_entry.modified, Some(dir_modified));
+
+        let file_entry = h
+            .lookup(&VfsPath::parse("pending/act-time/intent.json").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(file_entry.modified, Some(intent_modified));
+
+        let listed_action = h
+            .list(&VfsPath::parse("pending").unwrap())
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.name == "act-time")
+            .expect("action listed");
+        assert_eq!(listed_action.modified, Some(dir_modified));
     }
 
     #[tokio::test]
