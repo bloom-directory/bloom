@@ -43,6 +43,7 @@ use wasmtime_wasi::preview1::{self, WasiP1Ctx};
 
 use crate::abi::{
     ChainRequest, ChainResponse, DispatchOp, DispatchRequest, DispatchResponse, SignRequest,
+    V2SignContext,
 };
 use crate::error::PetalError;
 use crate::host::{HostError, HostVfsEntry, HostVfsEntryKind, PetalHost};
@@ -66,6 +67,7 @@ pub struct StoreData {
     caps: BTreeSet<Capability>,
     petal_hash: String,
     net_policy: NetPolicy,
+    sign_context: Option<V2SignContext>,
     sign_intents: Option<BTreeSet<String>>,
     store_namespaces: Option<StoreNamespacePolicy>,
     http_response_cap: usize,
@@ -217,6 +219,7 @@ impl PetalVm {
                 caps,
                 petal_hash: petal_hash.to_string(),
                 net_policy: opts.net_policy.clone().unwrap_or_else(NetPolicy::deny_all),
+                sign_context: None,
                 sign_intents: opts.sign_intents.clone(),
                 store_namespaces: opts.store_namespaces.clone(),
                 http_response_cap: opts.http_response_cap,
@@ -278,6 +281,22 @@ impl PetalVm {
                 caps,
                 petal_hash: petal_hash.to_string(),
                 net_policy: opts.net_policy.clone().unwrap_or_else(NetPolicy::deny_all),
+                sign_context: Some(V2SignContext {
+                    app_root: app_root.to_string(),
+                    package_hash: petal_hash.to_string(),
+                    route_id: request
+                        .ctx
+                        .iter()
+                        .find_map(|(name, value)| (name == "bloom.route_id").then(|| value.clone()))
+                        .unwrap_or_default(),
+                    op: route_component_export_name(request.op).to_string(),
+                    path: request.path.clone(),
+                    params: route_params.clone(),
+                    actor: request
+                        .ctx
+                        .iter()
+                        .find_map(|(name, value)| (name == "actor").then(|| value.clone())),
+                }),
                 sign_intents: opts.sign_intents.clone(),
                 store_namespaces: opts.store_namespaces.clone(),
                 http_response_cap: opts.http_response_cap,
@@ -349,6 +368,7 @@ impl PetalVm {
                 caps,
                 petal_hash: petal_hash.to_string(),
                 net_policy: opts.net_policy.clone().unwrap_or_else(NetPolicy::deny_all),
+                sign_context: None,
                 sign_intents: opts.sign_intents.clone(),
                 store_namespaces: opts.store_namespaces.clone(),
                 http_response_cap: opts.http_response_cap,
@@ -1208,6 +1228,7 @@ async fn component_sign_hash(
             wallet,
             hash32,
             purpose: intent,
+            context: store.data().sign_context.clone(),
         })
         .await
     {
@@ -2824,6 +2845,7 @@ paths = ["/status"]
                 caps,
                 petal_hash: VALID_HASH.into(),
                 net_policy,
+                sign_context: None,
                 sign_intents: None,
                 store_namespaces: None,
                 http_response_cap: DEFAULT_HTTP_RESPONSE_CAP,

@@ -29,6 +29,18 @@ pub struct SignRequest {
     pub wallet: String,
     pub hash32: [u8; 32],
     pub purpose: String,
+    pub context: Option<V2SignContext>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct V2SignContext {
+    pub app_root: String,
+    pub package_hash: String,
+    pub route_id: String,
+    pub op: String,
+    pub path: String,
+    pub params: Vec<(String, String)>,
+    pub actor: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -250,6 +262,7 @@ pub fn decode_sign_request(bytes: &[u8]) -> Result<SignRequest, HostError> {
         wallet,
         hash32,
         purpose,
+        context: None,
     })
 }
 

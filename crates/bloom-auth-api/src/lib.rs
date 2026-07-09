@@ -28,6 +28,11 @@ pub const APPROVAL_CHALLENGE_SCHEMA_V1: &str = "bloom.approval_challenge.v1";
 pub const SEALED_ACTION_SCHEMA_V1: &str = "bloom.sealed_action.v1";
 /// Schema tag for [`SigningAttestation`] envelopes.
 pub const SIGNING_ATTESTATION_SCHEMA_V1: &str = "bloom.signing_attestation.v1";
+/// Typed facts schema embedded in [`SigningAttestation::facts`] for v2 local
+/// app package signing.
+pub const LOCAL_APP_SIGNING_ATTESTATION_FACTS_SCHEMA_V1: &str = "bloom.local_app.signing_facts.v1";
+/// Petal id prefix for dynamically loaded v2 local apps.
+pub const LOCAL_APP_PETAL_ID_PREFIX: &str = "local-app:";
 /// Canonical subject schema for EVM wallet sealed actions.
 pub const EVM_SEALED_INTENT_SUBJECT_SCHEMA_V1: &str = "bloom.evm.sealed_intent.v1";
 /// Canonical subject kind for EVM wallet sealed actions.
@@ -1552,6 +1557,163 @@ impl SigningAttestation {
     }
 }
 
+/// Facts attested by the daemon-owned v2 local-app signing bridge.
+///
+/// A component receives only `(wallet, hash32, intent)` through the WIT
+/// interface. The runner supplies the remaining provenance from the resolved
+/// package and route, so an app cannot select another app identity or route
+/// when requesting a signature.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocalAppSigningAttestationFacts {
+    pub facts_schema: String,
+    pub action_id: String,
+    pub wallet: String,
+    pub surface: String,
+    pub petal_id: String,
+    pub petal_digest: String,
+    pub petal_version: String,
+    pub app_root: String,
+    pub package_hash: String,
+    pub route_id: String,
+    pub op: String,
+    pub path: String,
+    #[serde(default)]
+    pub params: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor: Option<String>,
+    pub intent: String,
+    pub signing_hash: String,
+    pub policy_snapshot_digest: String,
+}
+
+/// Whether `petal_id` names a dynamically loaded v2 local application.
+pub fn is_local_app_petal_id(petal_id: &str) -> bool {
+    petal_id
+        .strip_prefix(LOCAL_APP_PETAL_ID_PREFIX)
+        .is_some_and(|app_root| !app_root.trim().is_empty())
+}
+
+impl LocalAppSigningAttestationFacts {
+    pub fn to_facts_map(&self) -> Result<BTreeMap<String, serde_json::Value>, AuthApiError> {
+        match serde_json::to_value(self).map_err(AuthApiError::Json)? {
+            serde_json::Value::Object(map) => Ok(map.into_iter().collect()),
+            _ => Err(AuthApiError::InvalidSubject(
+                "local-app attestation facts did not serialize as an object".into(),
+            )),
+        }
+    }
+
+    pub fn from_facts_map(
+        facts: &BTreeMap<String, serde_json::Value>,
+    ) -> Result<Self, AuthApiError> {
+        let map: serde_json::Map<String, serde_json::Value> = facts.clone().into_iter().collect();
+        serde_json::from_value(serde_json::Value::Object(map)).map_err(AuthApiError::Json)
+    }
+
+    pub fn signing_attestation(&self) -> Result<SigningAttestation, AuthApiError> {
+        self.validate()?;
+        Ok(SigningAttestation {
+            schema: SIGNING_ATTESTATION_SCHEMA_V1.into(),
+            petal_id: self.petal_id.clone(),
+            petal_digest: self.petal_digest.clone(),
+            intent: self.intent.clone(),
+            facts: self.to_facts_map()?,
+        })
+    }
+
+    pub fn from_attestation(attestation: &SigningAttestation) -> Result<Self, AuthApiError> {
+        if attestation.schema != SIGNING_ATTESTATION_SCHEMA_V1 {
+            return Err(AuthApiError::Denied(format!(
+                "unsupported attestation schema {}",
+                attestation.schema
+            )));
+        }
+        if !is_local_app_petal_id(&attestation.petal_id) {
+            return Err(AuthApiError::Denied(
+                "local-app attestation petal_id mismatch".into(),
+            ));
+        }
+        let typed = Self::from_facts_map(&attestation.facts)?;
+        typed.validate()?;
+        if typed.petal_id != attestation.petal_id
+            || typed.petal_digest != attestation.petal_digest
+            || typed.intent != attestation.intent
+        {
+            return Err(AuthApiError::Denied(
+                "local-app attestation envelope does not match typed facts".into(),
+            ));
+        }
+        Ok(typed)
+    }
+
+    pub fn validate(&self) -> Result<(), AuthApiError> {
+        if self.facts_schema != LOCAL_APP_SIGNING_ATTESTATION_FACTS_SCHEMA_V1 {
+            return Err(AuthApiError::Denied(format!(
+                "unsupported local-app attestation facts schema {}",
+                self.facts_schema
+            )));
+        }
+        for (name, value) in [
+            ("action_id", &self.action_id),
+            ("wallet", &self.wallet),
+            ("petal_id", &self.petal_id),
+            ("petal_digest", &self.petal_digest),
+            ("petal_version", &self.petal_version),
+            ("app_root", &self.app_root),
+            ("package_hash", &self.package_hash),
+            ("route_id", &self.route_id),
+            ("op", &self.op),
+            ("intent", &self.intent),
+            ("signing_hash", &self.signing_hash),
+            ("policy_snapshot_digest", &self.policy_snapshot_digest),
+        ] {
+            validate_required(name, value).map_err(denied_from_invalid)?;
+        }
+        if self.surface != "apps" {
+            return Err(AuthApiError::Denied(
+                "local-app attestation surface must be apps".into(),
+            ));
+        }
+        if !is_local_app_petal_id(&self.petal_id) {
+            return Err(AuthApiError::Denied(
+                "local-app attestation petal_id must use local-app: prefix".into(),
+            ));
+        }
+        if self.petal_id != format!("{LOCAL_APP_PETAL_ID_PREFIX}{}", self.app_root)
+            || self.petal_digest != self.package_hash
+        {
+            return Err(AuthApiError::Denied(
+                "local-app attestation identity does not match package provenance".into(),
+            ));
+        }
+        if self.package_hash.len() != 64
+            || !self
+                .package_hash
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(AuthApiError::Denied(
+                "local-app attestation package_hash must be a lowercase BLAKE3 digest".into(),
+            ));
+        }
+        if !matches!(self.op.as_str(), "lookup" | "list" | "read" | "write") {
+            return Err(AuthApiError::Denied(
+                "local-app attestation operation is unsupported".into(),
+            ));
+        }
+        let hash = self
+            .signing_hash
+            .strip_prefix("0x")
+            .unwrap_or(&self.signing_hash);
+        if hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(AuthApiError::Denied(
+                "local-app attestation signing_hash must be a 32-byte hex value".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Collision-resistant, domain-tagged digest of a signing attestation facts
 /// map. The map is ordered so serde JSON output is deterministic.
 pub fn signing_attestation_facts_digest(
@@ -2423,7 +2585,7 @@ impl SigningAttestationSchemaRegistry for DefaultAttestationRegistry {
         if schema != SIGNING_ATTESTATION_SCHEMA_V1 {
             return false;
         }
-        Self::allowed_pair(petal_id, intent)
+        is_local_app_petal_id(petal_id) || Self::allowed_pair(petal_id, intent)
     }
 
     fn validate_attestation(&self, attestation: &SigningAttestation) -> Result<(), AuthApiError> {
@@ -2434,13 +2596,17 @@ impl SigningAttestationSchemaRegistry for DefaultAttestationRegistry {
                 attestation.schema
             )));
         }
-        if !Self::allowed_pair(&attestation.petal_id, &attestation.intent) {
+        if !is_local_app_petal_id(&attestation.petal_id)
+            && !Self::allowed_pair(&attestation.petal_id, &attestation.intent)
+        {
             return Err(AuthApiError::Denied(format!(
                 "unsupported attestation schema for ({}, {})",
                 attestation.petal_id, attestation.intent
             )));
         }
-        if attestation.petal_id == petal_identity::PETAL_ID_EVM_WALLET
+        if is_local_app_petal_id(&attestation.petal_id) {
+            LocalAppSigningAttestationFacts::from_attestation(attestation)?;
+        } else if attestation.petal_id == petal_identity::PETAL_ID_EVM_WALLET
             && attestation.intent == EVM_TX_SIGN_INTENT
         {
             EvmSigningAttestationFacts::from_attestation(attestation)?;
@@ -4785,6 +4951,38 @@ mod tests {
         DefaultAttestationRegistry::new()
             .validate_attestation(&attestation)
             .unwrap();
+    }
+
+    #[test]
+    fn local_app_attestation_is_bound_to_package_and_route_provenance() {
+        let facts = LocalAppSigningAttestationFacts {
+            facts_schema: LOCAL_APP_SIGNING_ATTESTATION_FACTS_SCHEMA_V1.into(),
+            action_id: "appsign-test".into(),
+            wallet: "alice".into(),
+            surface: "apps".into(),
+            petal_id: "local-app:portfolio".into(),
+            petal_digest: "a".repeat(64),
+            petal_version: "v2-package".into(),
+            app_root: "portfolio".into(),
+            package_hash: "a".repeat(64),
+            route_id: "r000001".into(),
+            op: "read".into(),
+            path: "/positions".into(),
+            params: BTreeMap::from([("account".into(), "main".into())]),
+            actor: Some("agent-1".into()),
+            intent: "portfolio.position.sign".into(),
+            signing_hash: format!("0x{}", "b".repeat(64)),
+            policy_snapshot_digest: "c".repeat(64),
+        };
+        let attestation = facts.signing_attestation().unwrap();
+        DefaultAttestationRegistry::new()
+            .validate_attestation(&attestation)
+            .unwrap();
+
+        let mut mismatched = facts;
+        mismatched.package_hash = "e".repeat(64);
+        let err = mismatched.validate().unwrap_err();
+        assert!(err.to_string().contains("package provenance"), "{err}");
     }
 
     #[test]

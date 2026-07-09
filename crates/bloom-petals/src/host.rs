@@ -169,6 +169,7 @@ mod tests {
                 wallet: "0x0".into(),
                 hash32: [0u8; 32],
                 purpose: "test".into(),
+                context: None,
             })
             .await,
             Err(HostError::Denied(_))

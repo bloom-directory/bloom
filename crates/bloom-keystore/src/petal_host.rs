@@ -392,7 +392,9 @@ impl PetalHost for KeystorePetalHost {
                 )
                 .await;
         }
-        if attestation.petal_id == bloom_auth_api::petal_identity::PETAL_ID_PAID_HTTP {
+        if attestation.petal_id == bloom_auth_api::petal_identity::PETAL_ID_PAID_HTTP
+            || bloom_auth_api::is_local_app_petal_id(&attestation.petal_id)
+        {
             if attestation.intent != request.intent {
                 return self
                     .deny(
