@@ -2265,6 +2265,7 @@ dependencies = [
  "clap_complete",
  "dirs 5.0.1",
  "hex",
+ "humantime",
  "predicates",
  "qrcode",
  "rand 0.8.6",
