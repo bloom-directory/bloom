@@ -149,9 +149,7 @@ A fresh Bloom VFS root exposes these default entries:
 - `prices/{spot,change_24h}/<coin>` — DefiLlama keyless price oracle.
 - `addressbook/<alias>` — local petname directory.
 - `ens/<name>.eth` — ENS forward resolution as a read surface.
-- `petals/` — installed petal packages and petal-backed surfaces.
-- `public/` — public chain/petal-facing read surfaces.
-- `tx/` — transaction-oriented helper surface.
+- `apps/<name>/` — installed local petal app surfaces.
 - `requests/` — free and paid HTTP requests. Paid HTTP 402 challenges are
   staged under `pending/`, exposed as `plan.md`, and only signed after a
   confirm write.

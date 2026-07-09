@@ -16,7 +16,7 @@ use wasm_compose::{
 };
 use wasmparser::{
     CanonicalFunction, ComponentAlias, ComponentDefinedType, ComponentExternalKind,
-    ComponentFuncResult, ComponentFuncType, ComponentOuterAliasKind, ComponentType,
+    ComponentFuncType, ComponentOuterAliasKind, ComponentType,
     ComponentTypeRef as WasmComponentTypeRef, ComponentValType, InstanceTypeDeclaration, Parser,
     Payload, PrimitiveValType as ComponentPrimitiveValType, TypeBounds as WasmComponentTypeBounds,
     Validator,
@@ -1799,7 +1799,7 @@ fn validate_route_wasm_inner(
                 for import in reader {
                     let import =
                         import.map_err(|e| PetalError::InvalidWasm(format!("{path}: {e}")))?;
-                    let name = import.name.0;
+                    let name = import.name.name;
                     let kind = import.ty.kind();
                     if kind == ComponentExternalKind::Type {
                         let route_type = match import.ty {
@@ -1942,7 +1942,7 @@ fn validate_route_wasm_inner(
                 for export in reader {
                     let export =
                         export.map_err(|e| PetalError::InvalidWasm(format!("{path}: {e}")))?;
-                    let name = export.name.0;
+                    let name = export.name.name;
                     if component_route_export(name).is_some()
                         && export.kind != ComponentExternalKind::Func
                     {
@@ -2193,7 +2193,7 @@ fn validate_component_route_func_sig(
         _ => return Ok(()),
     }
 
-    let Some((_, result_ty)) = single_component_result(&ty.results) else {
+    let Some(result_ty) = single_component_result(&ty.result) else {
         return Err(PetalError::InvalidWasm(format!(
             "{path}: component route export {export:?} must return a single result"
         )));
@@ -2223,12 +2223,8 @@ enum RouteOkType {
     Unit,
 }
 
-fn single_component_result<'a>(
-    result: &'a ComponentFuncResult<'a>,
-) -> Option<(Option<&'a str>, &'a ComponentValType)> {
-    let mut iter = result.iter();
-    let first = iter.next()?;
-    iter.next().is_none().then_some(first)
+fn single_component_result(result: &Option<ComponentValType>) -> Option<&ComponentValType> {
+    result.as_ref()
 }
 
 fn is_route_result(
@@ -2330,7 +2326,7 @@ fn is_route_types_instance<'a>(type_index: u32, types: &[ComponentTypeEntry<'a>]
                 local_types.push(ComponentTypeEntry::Type(ty.clone()));
             }
             InstanceTypeDeclaration::Export { name, ty } => {
-                let Some(route_type) = component_route_type_import(name.0) else {
+                let Some(route_type) = component_route_type_import(name.name) else {
                     return false;
                 };
                 let WasmComponentTypeRef::Type(WasmComponentTypeBounds::Eq(index)) = *ty else {
@@ -2416,11 +2412,11 @@ fn is_host_interface_instance<'a>(
             }
             InstanceTypeDeclaration::Export { name, ty } => match *ty {
                 WasmComponentTypeRef::Type(WasmComponentTypeBounds::Eq(index)) => {
-                    let Some(expected) = host_type_export(interface, name.0) else {
+                    let Some(expected) = host_type_export(interface, name.name) else {
                         return false;
                     };
                     if !host_type_export_matches(expected, index, &local_types)
-                        || !exported_types.insert(name.0)
+                        || !exported_types.insert(name.name)
                     {
                         return false;
                     }
@@ -2430,11 +2426,11 @@ fn is_host_interface_instance<'a>(
                     local_types.push(entry);
                 }
                 WasmComponentTypeRef::Func(func_type_index) => {
-                    let Some(expected) = host_func_export(interface, name.0) else {
+                    let Some(expected) = host_func_export(interface, name.name) else {
                         return false;
                     };
                     if !host_func_export_matches(expected, func_type_index, &local_types)
-                        || !exported_funcs.insert(name.0)
+                        || !exported_funcs.insert(name.name)
                     {
                         return false;
                     }
@@ -2544,14 +2540,14 @@ fn host_func_export_matches(
     match expected {
         HostFuncExport::HttpFetch => {
             params_match(params, types, &[("req", is_http_request)])
-                && result_matches(&ty.results, types, HostOkType::HttpResponse)
+                && result_matches(&ty.result, types, HostOkType::HttpResponse)
         }
         HostFuncExport::StoreGet => {
             params_match(
                 params,
                 types,
                 &[("namespace", is_string_type), ("key", is_string_type)],
-            ) && result_matches(&ty.results, types, HostOkType::OptionalBytes)
+            ) && result_matches(&ty.result, types, HostOkType::OptionalBytes)
         }
         HostFuncExport::StorePut => {
             params_match(
@@ -2563,7 +2559,7 @@ fn host_func_export_matches(
                     ("value", is_byte_list),
                     ("secret", is_bool_type),
                 ],
-            ) && result_matches(&ty.results, types, HostOkType::Unit)
+            ) && result_matches(&ty.result, types, HostOkType::Unit)
         }
         HostFuncExport::StorePutNew => {
             params_match(
@@ -2575,21 +2571,21 @@ fn host_func_export_matches(
                     ("value", is_byte_list),
                     ("secret", is_bool_type),
                 ],
-            ) && result_matches(&ty.results, types, HostOkType::Unit)
+            ) && result_matches(&ty.result, types, HostOkType::Unit)
         }
         HostFuncExport::StoreList => {
             params_match(
                 params,
                 types,
                 &[("namespace", is_string_type), ("prefix", is_string_type)],
-            ) && result_matches(&ty.results, types, HostOkType::StringList)
+            ) && result_matches(&ty.result, types, HostOkType::StringList)
         }
         HostFuncExport::StoreDelete => {
             params_match(
                 params,
                 types,
                 &[("namespace", is_string_type), ("key", is_string_type)],
-            ) && result_matches(&ty.results, types, HostOkType::Unit)
+            ) && result_matches(&ty.result, types, HostOkType::Unit)
         }
         HostFuncExport::StoreDeleteIfValue => {
             params_match(
@@ -2600,7 +2596,7 @@ fn host_func_export_matches(
                     ("key", is_string_type),
                     ("expected", is_byte_list),
                 ],
-            ) && result_matches(&ty.results, types, HostOkType::Unit)
+            ) && result_matches(&ty.result, types, HostOkType::Unit)
         }
         HostFuncExport::SignHash => {
             params_match(
@@ -2611,37 +2607,37 @@ fn host_func_export_matches(
                     ("hash32", is_byte_list),
                     ("intent", is_string_type),
                 ],
-            ) && result_matches(&ty.results, types, HostOkType::Bytes)
+            ) && result_matches(&ty.result, types, HostOkType::Bytes)
         }
         HostFuncExport::ChainCall => {
             params_match(params, types, &[("req", is_chain_request)])
-                && result_matches(&ty.results, types, HostOkType::ChainResponse)
+                && result_matches(&ty.result, types, HostOkType::ChainResponse)
         }
         HostFuncExport::VfsLookup => {
             params_match(params, types, &[("path", is_string_type)])
-                && result_matches(&ty.results, types, HostOkType::VfsEntry)
+                && result_matches(&ty.result, types, HostOkType::VfsEntry)
         }
         HostFuncExport::VfsList => {
             params_match(params, types, &[("path", is_string_type)])
-                && result_matches(&ty.results, types, HostOkType::VfsEntryList)
+                && result_matches(&ty.result, types, HostOkType::VfsEntryList)
         }
         HostFuncExport::VfsRead => {
             params_match(params, types, &[("path", is_string_type)])
-                && result_matches(&ty.results, types, HostOkType::Bytes)
+                && result_matches(&ty.result, types, HostOkType::Bytes)
         }
         HostFuncExport::VfsWrite => {
             params_match(
                 params,
                 types,
                 &[("path", is_string_type), ("body", is_byte_list)],
-            ) && result_matches(&ty.results, types, HostOkType::Unit)
+            ) && result_matches(&ty.result, types, HostOkType::Unit)
         }
         HostFuncExport::EnvNowMs => {
-            params.is_empty() && result_matches(&ty.results, types, HostOkType::U64)
+            params.is_empty() && result_matches(&ty.result, types, HostOkType::U64)
         }
         HostFuncExport::EnvRandomBytes => {
             params_match(params, types, &[("len", is_u32_type)])
-                && result_matches(&ty.results, types, HostOkType::Bytes)
+                && result_matches(&ty.result, types, HostOkType::Bytes)
         }
     }
 }
@@ -2676,11 +2672,11 @@ enum HostOkType {
 }
 
 fn result_matches(
-    result: &ComponentFuncResult<'_>,
+    result: &Option<ComponentValType>,
     types: &[ComponentTypeEntry<'_>],
     ok: HostOkType,
 ) -> bool {
-    let Some((_, result_ty)) = single_component_result(result) else {
+    let Some(result_ty) = single_component_result(result) else {
         return false;
     };
     with_defined_type(result_ty, types, 0, |defined, types, depth| {
@@ -4561,42 +4557,47 @@ name = "echo"
 
     fn route_component_with_func_import(import: &str) -> Vec<u8> {
         let mut builder = ComponentBuilder::default();
-        let (func_type, mut ty) = builder.type_function();
-        ty.params(std::iter::empty::<(&str, PrimitiveValType)>())
-            .results(std::iter::empty::<(&str, PrimitiveValType)>());
+        let (func_type, mut ty) = builder.type_function(None);
+        ty.params(std::iter::empty::<(&str, PrimitiveValType)>());
+        ty.result(None);
         builder.import(import, ComponentTypeRef::Func(func_type));
         builder.finish()
     }
 
     fn route_component_with_nested_route_exports() -> Vec<u8> {
         let mut builder = ComponentBuilder::default();
-        builder.component(route_component_builder(&["metadata", "read"], &[]));
+        builder.component(None, route_component_builder(&["metadata", "read"], &[]));
         builder.finish()
     }
 
     fn route_component_builder(exports: &[&str], imports: &[&str]) -> ComponentBuilder {
         let mut builder = ComponentBuilder::default();
-        let (func_type, mut ty) = builder.type_function();
-        ty.params(std::iter::empty::<(&str, PrimitiveValType)>())
-            .results(std::iter::empty::<(&str, PrimitiveValType)>());
+        let (func_type, mut ty) = builder.type_function(None);
+        ty.params(std::iter::empty::<(&str, PrimitiveValType)>());
+        ty.result(None);
 
-        let instance_type = builder.type_instance(&InstanceType::new());
+        let instance_type = builder.type_instance(None, &InstanceType::new());
         for import in imports {
-            builder.import(import, ComponentTypeRef::Instance(instance_type));
+            builder.import(*import, ComponentTypeRef::Instance(instance_type));
         }
 
         let module = route_component_core_module(exports);
-        let module = builder.core_module(&module);
-        let instance = builder.core_instantiate(module, std::iter::empty::<(&str, _)>());
+        let module = builder.core_module(None, &module);
+        let instance = builder.core_instantiate(None, module, std::iter::empty::<(&str, _)>());
         for export in exports {
             let core_func = builder.core_alias_export(
+                None,
                 instance,
                 &format!("__bloom_route_{export}"),
                 ExportKind::Func,
             );
-            let func =
-                builder.lift_func(core_func, func_type, std::iter::empty::<CanonicalOption>());
-            builder.export(export, ComponentExportKind::Func, func, None);
+            let func = builder.lift_func(
+                None,
+                core_func,
+                func_type,
+                std::iter::empty::<CanonicalOption>(),
+            );
+            builder.export(*export, ComponentExportKind::Func, func, None);
         }
         builder
     }

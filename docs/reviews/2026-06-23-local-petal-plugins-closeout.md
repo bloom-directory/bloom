@@ -1,15 +1,15 @@
-# 2026-06-23 - Local Petal Plugins v1 Closeout
+# 2026-06-23 - Local Petal Plugins Closeout
 
 ## Scope
 
 This closeout covers branch `feat/local-petal-plugins` against
 `docs/superpowers/specs/2026-06-22-local-petal-plugins-design.md`.
 
-The shipped slice is off-chain only: local, content-addressed WASM petals with
-embedded local manifests, default-deny host capabilities, private per-petal
-storage, daemon-mediated HTTP/signing, VFS dispatch through `apps/<mount>`, CLI
-and IPC install/list surfaces, SDK exports, example local petals, and the
-Polymarket local petal.
+The surviving post-merge slice is off-chain only: local, content-addressed v2 app
+packages with `petal.toml`, default-deny host capabilities, private per-petal
+storage, daemon-mediated HTTP, VFS dispatch through `apps/<mount>`, and CLI/IPC
+install/list surfaces. Signing imports are intentionally disabled in the daemon
+until they are wired through Sealed Approval grants.
 
 No consensus, chain VM, staking, scoring, zk, or on-chain petal path was part of
 this scope.
@@ -18,12 +18,11 @@ this scope.
 
 | Milestone | Status | Primary Evidence |
 | --- | --- | --- |
-| Manifest schema, embed, extract, validate | Complete | `bloom-petal-manifest` local schema, custom-section extraction, install validation, manifest tests |
-| Runtime capabilities | Complete | `bloom-petals` local host imports for `vfs_*`, `http_fetch`, `sign_hash`, and `store_*`; daemon redirect revalidation; private store tests |
+| Package schema and validation | Complete | `bloom-petals` v2 `petal.toml` package validation, deterministic `.petal.tar`, route-index, and package install tests |
+| Runtime capabilities | Complete | `bloom-petals` local host imports for VFS, HTTP, and private store; daemon redirect revalidation; signing fail-closed until Sealed Approval wiring exists |
 | Handler dispatch, router, CLI/IPC, consent | Complete | `PetalVm::dispatch`, `PetalRouter`, `apps/` mount, local install/list IPC, CLI install/list/read smoke |
-| SDK | Complete | `bloom-petal-sdk`, `bloom-petal-sdk-macros`, `#[bloom_petal_sdk::petal]`, export contract smoke |
-| Misc tool petals | Complete | `misc-tools` and `portfolio` compiled WASM router smokes |
-| Polymarket port | Complete for v1 graduation | compiled Polymarket router smoke covers market/search/positions/account/onboarding/funding/buy/sell/reconcile/cancel/redaction paths |
+| GitHub source install | Complete | Trusted `bloom-directory/*` source clone/build/install path with remote-source parity coverage |
+| Polymarket app path | Complete for this branch | Polymarket route package/source install and onboarding status routing through `/apps/polymarket/...` |
 
 ## Review Findings
 
@@ -49,22 +48,13 @@ Passed on the final branch audit:
 
 - `cargo fmt --check`
 - `git diff --check`
-- `cargo test -p bloom-petal-manifest`
-- `cargo test -p bloom-petal-sdk`
 - `cargo test -p bloom-petals`
 - `cargo test -p bloom-daemon`
-- `cargo test -p bloom local_petal_install_prints_consent_and_serves_under_apps`
-- `cargo test -p bloom-local-petal-misc-tools --test router_smoke`
-- `cargo test -p bloom-local-petal-portfolio --test router_smoke`
-- `cargo test -p bloom-local-petal-polymarket --lib`
-- `cargo check -p bloom-local-petal-polymarket --target wasm32-wasip1`
-- `cargo check -p bloom-local-petal-misc-tools --target wasm32-wasip1`
-- `cargo check -p bloom-local-petal-portfolio --target wasm32-wasip1`
-- `cargo test -p bloom-local-petal-polymarket --test router_smoke`
+- `cargo test -p bloom --test cli v2_app_cli_build_install_list_and_vfs_read_happy_path`
+- `cargo test -p bloom --test cli petals_install_rejects_untrusted_owner_and_raw_remote_wasm`
 - `cargo check -p bloom`
 - `cargo test -p bloom`
 - `cargo test -p bloom-polymarket`
-- `cargo check -p bloom-polymarket --target wasm32-wasip1 --no-default-features`
 
 ## Secret and On-Chain Audit
 

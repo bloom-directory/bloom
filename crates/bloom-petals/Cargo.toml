@@ -9,7 +9,7 @@ description = "Content-addressed wasm petals for bloom: store, name registry, VM
 bloom-proto.workspace = true
 bloom-vfs.workspace = true
 url.workspace = true
-wasmparser = "0.218"
+wasmparser = "0.252"
 wasm-compose = "0.252"
 async-trait.workspace = true
 anyhow.workspace = true
@@ -31,4 +31,4 @@ tempfile.workspace = true
 
 [dev-dependencies]
 futures.workspace = true
-wasm-encoder = "0.218"
+wasm-encoder = "0.252"

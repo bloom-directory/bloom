@@ -1,6 +1,8 @@
 # Local Petal Plugins (v1) — Design
 
-Status: draft (design approved; not yet implemented)
+Status: historical draft, superseded by
+`2026-06-23-local-petal-plugins-v2-revised.md` and
+`docs/guides/local-petal-apps-v2.md`
 Date: 2026-06-22
 Scope: an initial, piecemeal slice of the off-chain petal vision — **local, WASM-compiled,
 content-addressed petals that act as plugins to the main Bloom application** by owning a VFS
@@ -42,8 +44,9 @@ Designed-for but **not built** in this slice:
 - RPC-provider / typed-tooling kind.
 - Cross-petal `petal.call`.
 - Wildcard-host network rules (exact host only in v1).
-- Anything on-chain (scoring, staking, LOOM, zkVM, consensus, the chain `petals/` endpoint
-  handler, chain-mode VM).
+- Anything on-chain (scoring, staking, LOOM, zkVM, consensus, chain petal
+  endpoints, or chain-mode VM). Those components were removed from the current
+  branch and are not part of local app petals.
 - The canonical-codec envelope — v1 uses a simple length-prefixed binary framing for the
   request/response envelope; the schema-driven codec
   (`2026-06-01-canonical-codec-and-type-system-design.md`) can be adopted later without an ABI
@@ -88,15 +91,14 @@ Every interface here is chosen so the deferred work drops in without a format or
 
 ### New / changed crates
 
-- **`bloom-petal-sdk`** (new, wasm-side). The author-facing Rust library, analogous to the
-  existing chain-side `bloom-resource`. Wraps the raw `extern "C"` host imports in ergonomic
+- **`bloom-petal-sdk`** (proposed, wasm-side). The author-facing Rust library. Wraps the raw `extern "C"` host imports in ergonomic
   Rust (`vfs::read`, `http::fetch`, `sign::hash`, `store::get/put/...`) and provides a
   `#[petal]` entry macro that generates `petal_alloc` + `petal_dispatch` and dispatches into the
   author's `lookup`/`list`/`read`/`write` functions. Authors write a normal crate and build with
   `cargo build --target wasm32-wasip1`.
-- **`bloom-petal-manifest`** (extend existing). Add a v1 **local handler** manifest schema
-  variant alongside the existing on-chain schema, embedded as the `bloom_petal_manifest` wasm
-  custom section (reuse existing extraction machinery).
+- **`bloom-petals` v2 package validation** (implemented later). The current branch uses
+  `petal.toml` plus route component validation inside `bloom-petals`; the deleted
+  `bloom-petal-manifest` crate and on-chain manifest schema are not restored.
 - **`bloom-petals`** (extend existing).
   - `PetalVm`: add the **handler execution path** — instantiate, call `petal_dispatch` with a
     request envelope, read the response — alongside the existing `_start` command path.

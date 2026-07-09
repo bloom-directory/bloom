@@ -12,8 +12,9 @@ RUST_LOG=warn cargo test --workspace
 RUST_LOG=warn cargo test --workspace -- --ignored
 ```
 
-CI runs the first command on every PR (`.github/workflows/ci.yml`) and both on
-`push` to `master` (`.github/workflows/acceptance.yml`).
+CI runs workspace tests through the split jobs in `.github/workflows/ci.yml`.
+Ignored live-network and docker suites are run only by the CI lanes that opt in
+with `--run-ignored`.
 
 ## Categories
 

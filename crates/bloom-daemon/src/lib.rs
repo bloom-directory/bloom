@@ -16,8 +16,6 @@ mod price_oracle;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use alloy::primitives::B256;
-use alloy::signers::SignerSync;
 use bloom_auth::{AuthStore, StoreApprovalVerifier};
 use bloom_evm::{ChainClient, ChainRegistry};
 
@@ -168,24 +166,18 @@ pub enum DaemonError {
 
 struct DaemonPetalHost {
     vfs: Arc<LateVfsHost>,
-    keystore: Keystore,
     http: reqwest::Client,
     audit: Arc<AuditLog>,
 }
 
 impl DaemonPetalHost {
-    fn new(vfs: Arc<LateVfsHost>, keystore: Keystore, audit: Arc<AuditLog>) -> Self {
+    fn new(vfs: Arc<LateVfsHost>, audit: Arc<AuditLog>) -> Self {
         let http = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .timeout(Duration::from_secs(20))
             .build()
             .expect("daemon petal http client must build");
-        Self {
-            vfs,
-            keystore,
-            http,
-            audit,
-        }
+        Self { vfs, http, audit }
     }
 
     fn audit_http_fetch(
@@ -435,25 +427,12 @@ impl PetalHost for DaemonPetalHost {
     }
 
     async fn sign_hash(&self, req: SignRequest) -> Result<Vec<u8>, HostError> {
-        let signer = self
-            .keystore
-            .signer(&req.wallet)
-            .map_err(host_error_from_keystore)
-            .inspect_err(|e| self.audit_sign_hash(&req, "denied", Some(&e.to_string())))?;
-        let hash = B256::from(req.hash32);
-        let sig = signer.sign_hash_sync(&hash).map_err(|e| {
-            let err = HostError::Backend(format!("sign_hash: {e}"));
-            self.audit_sign_hash(&req, "error", Some(&err.to_string()));
-            err
-        })?;
-        info!(
-            target: "bloom_daemon::petal_host",
-            wallet = %req.wallet,
-            purpose = %req.purpose,
-            "petal.sign_hash"
+        let err = HostError::Denied(
+            "v2 petal sign_hash requires Sealed Approval grant wiring; direct daemon signing is disabled"
+                .into(),
         );
-        self.audit_sign_hash(&req, "ok", None);
-        Ok(sig.as_bytes().to_vec())
+        self.audit_sign_hash(&req, "denied", Some(&err.to_string()));
+        Err(err)
     }
 }
 
@@ -513,17 +492,6 @@ fn audit_http_target(raw: &str) -> serde_json::Value {
             "path": url.path(),
         }),
         Err(_) => serde_json::json!({ "invalid": true }),
-    }
-}
-
-fn host_error_from_keystore(err: bloom_keystore::KeystoreError) -> HostError {
-    match err {
-        bloom_keystore::KeystoreError::NotFound(wallet) => HostError::NotFound(wallet),
-        bloom_keystore::KeystoreError::InvalidName(wallet) => HostError::Invalid(wallet),
-        bloom_keystore::KeystoreError::Locked(wallet) => {
-            HostError::Denied(format!("wallet '{wallet}' is locked"))
-        }
-        other => HostError::Backend(other.to_string()),
     }
 }
 
@@ -959,7 +927,6 @@ impl Daemon {
         let petal_vfs_host = Arc::new(LateVfsHost::new());
         let petal_app_host = Arc::new(DaemonPetalHost::new(
             petal_vfs_host.clone(),
-            keystore.clone(),
             audit_arc.clone(),
         ));
         debug!(root = %petals_root.display(), "daemon.petals_initialised");
@@ -1761,6 +1728,25 @@ mod tests {
         assert!(d.vfs.handler("addressbook").is_some());
         assert!(d.vfs.handler("ens").is_some());
         assert!(d.vfs.handler("apps").is_some());
+    }
+
+    #[tokio::test]
+    async fn daemon_petal_host_sign_hash_fails_closed_until_sealed_grants_are_wired() {
+        let dir = tempfile::tempdir().unwrap();
+        let audit = Arc::new(AuditLog::open(dir.path().join("audit.jsonl")).unwrap());
+        let host = DaemonPetalHost::new(Arc::new(LateVfsHost::new()), audit);
+        let err = host
+            .sign_hash(SignRequest {
+                wallet: "alice".into(),
+                hash32: [7; 32],
+                purpose: "test.intent".into(),
+            })
+            .await
+            .unwrap_err();
+        let HostError::Denied(msg) = err else {
+            panic!("expected denied error");
+        };
+        assert!(msg.contains("Sealed Approval grant wiring"), "{msg}");
     }
 
     /// A pre-existing watch spec on disk should be loaded into the

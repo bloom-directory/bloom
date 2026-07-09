@@ -569,10 +569,14 @@ impl IpcServer {
         for (name, hash) in &names {
             name_for_hash.entry(hash.clone()).or_insert(name.clone());
         }
-        let hashes = runner.store().list_hashes()?;
+        let hashes = runner.store().list_package_hashes()?;
         let mut out = Vec::with_capacity(hashes.len());
         for hash in hashes {
             let meta = runner.store().load_meta(&hash)?;
+            let app_mount = meta
+                .local_app
+                .as_ref()
+                .map(|app| format!("apps/{}/", app.name));
             out.push(json!({
                 "hash": meta.hash,
                 "size": meta.size,
@@ -580,6 +584,9 @@ impl IpcServer {
                 "caps": meta.caps.iter().map(|c| c.as_str()).collect::<Vec<_>>(),
                 "installed_at_ms": meta.installed_at_ms,
                 "mode": meta.mode_str(),
+                "app_mount": app_mount,
+                "local_app": meta.local_app,
+                "source": meta.source,
             }));
         }
         Ok(Value::Array(out))
@@ -656,12 +663,6 @@ fn write_path_uses_wallet_signer(path: &VfsPath) -> bool {
         {
             true
         }
-        // polymarket/onboard/<wallet>/begin signs CLOB auth and relayer/deposit-wallet operations.
-        [root, action, _wallet, begin]
-            if root == "polymarket" && action == "onboard" && begin == "begin" =>
-        {
-            true
-        }
         // Everything else reaches the VFS handler through the plain write lane.
         // In particular these first-party Sealed Approval actions are NOT raw
         // signer lanes and must forward through to `vfs.write` rather than be
@@ -676,6 +677,10 @@ fn write_path_uses_wallet_signer(path: &VfsPath) -> bool {
         //     stages an approval challenge on the first write and signs the
         //     x402/Tempo MPP credential only under a grant-gated PetalHost
         //     signature.
+        //   * Polymarket onboarding (`/polymarket/onboard/<wallet>/begin`):
+        //     the handler stages approval and signs CLOB auth plus relayer/
+        //     deposit-wallet operations only under grant-gated PetalHost
+        //     signatures.
         //   * Hyperliquid owner approvals (`agent_sessions/<wallet>/new.json`
         //     and `exchange/<wallet>/send_asset.json`): the Hyperliquid
         //     handler stages approval and signs only under a grant-gated
@@ -1424,13 +1429,35 @@ mod tests {
             .build()
     }
 
+    fn write_demo_v2_package(root: &Path) {
+        let write = |rel: &str, body: &[u8]| {
+            let path = root.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, body).unwrap();
+        };
+        write(
+            "petal.toml",
+            br#"schema = "bloom.petal.local-app.v2"
+name = "demo"
+
+[consent]
+summary = "Demo app used by IPC tests."
+"#,
+        );
+        write("README.md", b"# demo\n");
+        write("AGENTS.md", b"# demo agents\n");
+        write(
+            "app/demo/hello.txt.wasm",
+            include_bytes!("../../bloom-petals/tests/fixtures/route_component_no_imports.wasm"),
+        );
+    }
+
     #[test]
     fn plain_ipc_write_rejects_signer_consuming_paths() {
         for path in [
             "/wallets/minnow/sign/message",
             "/wallets/minnow/sign/hash",
             "/wallets/minnow/sign/typed_data",
-            "/polymarket/onboard/minnow/begin",
         ] {
             let p = VfsPath::parse(path).unwrap();
             assert!(write_path_uses_wallet_signer(&p), "{path}");
@@ -1456,6 +1483,7 @@ mod tests {
             "/requests/pending/req_123/confirm",
             "/requests/new",
             "/requests/pending/req_123/cancel",
+            "/polymarket/onboard/minnow/begin",
             "/hyperliquid/mainnet/agent_sessions/minnow/session-1/schedule_cancel.json",
             "/hyperliquid/mainnet/agent_sessions/minnow/session-1/order.json",
             "/hyperliquid/mainnet/agent_sessions/minnow/session-1/cancel_all",
@@ -1496,6 +1524,29 @@ mod tests {
     #[test]
     fn local_write_unlocked_lane_is_retained() {
         reject_passkey_write_unlocked(WalletKind::Local).unwrap();
+    }
+
+    #[tokio::test]
+    async fn petals_list_reports_v2_app_packages() {
+        let dir = tempfile::tempdir().unwrap();
+        let package = dir.path().join("demo-package");
+        write_demo_v2_package(&package);
+
+        let store = bloom_petals::PetalStore::open(dir.path().join("store")).unwrap();
+        let registry =
+            Arc::new(bloom_petals::NameRegistry::open(dir.path().join("registry")).unwrap());
+        let vm = bloom_petals::PetalVm::new().unwrap();
+        let runner = PetalRunner::new(store.clone(), registry, vm);
+        let (installed, _, _) = store.install_app_package_dir(&package).unwrap();
+
+        let server = IpcServer::new(vfs(), "0", vec![]).with_petals(runner);
+        let listed = server.do_petals_list().await.unwrap();
+        let entries = listed.as_array().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["hash"], installed.hash);
+        assert_eq!(entries[0]["mode"], "local");
+        assert_eq!(entries[0]["app_mount"], "apps/demo/");
+        assert_eq!(entries[0]["local_app"]["name"], "demo");
     }
 
     #[test]
