@@ -27,6 +27,10 @@ on:
       - "DEVELOPMENT.md"
   workflow_dispatch:
 
+concurrency:
+  group: ci-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
@@ -109,12 +113,21 @@ jobs:
     name: unit tests
     runs-on: ubuntu-latest
     needs: build_test_archive
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
     steps:
       - uses: actions/checkout@v6
       - name: Install Rust toolchain
         run: rustup show
       - name: Install cargo-nextest
         uses: taiki-e/install-action@nextest
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: false
       - name: Download nextest archive
         uses: actions/download-artifact@v4
         with:
@@ -124,11 +137,15 @@ jobs:
         run: cargo nextest run --archive-file target/nextest-archive.tar.zst -E 'kind(lib)' --no-fail-fast
       - name: Run doctests
         run: cargo test --workspace --doc --no-fail-fast
+      - name: Show sccache stats
+        if: always()
+        run: sccache --show-stats
 
   integration_test:
     name: local integration tests
     runs-on: ubuntu-latest
     needs: build_test_archive
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v6
       - name: Install Rust toolchain
@@ -163,6 +180,7 @@ jobs:
     name: external e2e tests
     runs-on: ubuntu-latest
     needs: build_test_archive
+    timeout-minutes: 60
     if: >
       github.event_name == 'workflow_dispatch' ||
       github.event_name == 'push' ||
@@ -207,7 +225,6 @@ jobs:
   docker_integration_smoke:
     name: docker integration smoke
     runs-on: ubuntu-latest
-    needs: build_test_archive
     if: github.event_name == 'workflow_dispatch'
     steps:
       - uses: actions/checkout@v6
@@ -217,7 +234,6 @@ jobs:
   docker_e2e_external:
     name: docker external e2e
     runs-on: ubuntu-latest
-    needs: build_test_archive
     if: github.event_name == 'workflow_dispatch'
     env:
       BLOOM_ENSO_KEY: ${{ secrets.BLOOM_ENSO_KEY }}
@@ -234,7 +250,6 @@ jobs:
   docker_live_funds_e2e:
     name: docker live-funds e2e
     runs-on: ubuntu-latest
-    needs: build_test_archive
     if: github.event_name == 'workflow_dispatch'
     env:
       BLOOM_ENSO_KEY: ${{ secrets.BLOOM_ENSO_KEY }}
