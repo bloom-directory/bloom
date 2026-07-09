@@ -60,7 +60,7 @@ mod tests {
 
         // Create wallet on disk.
         let (addr, pk) = create_xdsa_wallet(root, "alice", "hunter2").unwrap();
-        assert!(matches!(addr, WalletAddress::BloomChain(_)));
+        assert!(matches!(addr, WalletAddress::BloomEvm(_)));
         assert_eq!(pk.0.len(), XDSA_PK_LEN);
 
         // Verify on-disk files exist.

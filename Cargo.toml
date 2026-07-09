@@ -26,7 +26,6 @@ members = [
   "crates/bloom-revert",
   "crates/bloom-petals",
   "crates/bloom-it",
-  # ---- example apps (not part of the protocol) ----
 ]
 resolver = "2"
 
@@ -125,7 +124,6 @@ bloom-petals   = { path = "crates/bloom-petals" }
 bloom-daemon   = { path = "crates/bloom-daemon" }
 bloom-auth-api = { path = "crates/bloom-auth-api" }
 bloom-auth     = { path = "crates/bloom-auth" }
-# ---- example petal DEX crates (not part of the protocol) ----
 # ---- example core petal: generic capability primitives (/bloom/core/cap) ----
 
 [profile.release]
