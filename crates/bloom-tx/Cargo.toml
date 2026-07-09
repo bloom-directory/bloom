@@ -10,7 +10,6 @@ bloom-auth-api.workspace = true
 bloom-proto.workspace = true
 bloom-evm.workspace = true
 bloom-rpc.workspace = true
-bloom-keystore.workspace = true
 bloom-mempool.workspace = true
 bloom-tools.workspace = true
 blake3.workspace = true

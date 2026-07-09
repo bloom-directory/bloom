@@ -29,7 +29,6 @@ bloom-evm.workspace = true
 bloom-mempool.workspace = true
 bloom-tx.workspace = true
 bloom-vfs.workspace = true
-bloom-tools.workspace = true
 bloom-defi.workspace = true
 bloom-polymarket.workspace = true
 bloom-hyperliquid.workspace = true
@@ -55,8 +54,6 @@ axum.workspace = true
 url.workspace = true
 base64.workspace = true
 blake3.workspace = true
-hex.workspace = true
-futures.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

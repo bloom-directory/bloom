@@ -2258,12 +2258,10 @@ dependencies = [
  "bloom-petals",
  "bloom-polymarket",
  "bloom-proto",
- "bloom-tools",
  "bloom-tx",
  "bloom-vfs",
  "clap",
  "clap_complete",
- "dirs 5.0.1",
  "hex",
  "predicates",
  "qrcode",
@@ -2271,14 +2269,12 @@ dependencies = [
  "rpassword",
  "serde",
  "serde_json",
- "shellexpand 3.1.2",
  "tempfile",
  "tokio",
  "toml 0.8.23",
  "tracing",
  "tracing-subscriber 0.3.23",
  "url",
- "wat",
 ]
 
 [[package]]
@@ -2336,12 +2332,9 @@ dependencies = [
  "bloom-prices",
  "bloom-proto",
  "bloom-revert",
- "bloom-tools",
  "bloom-tx",
  "bloom-vfs",
  "bloom-watch",
- "futures",
- "hex",
  "parking_lot",
  "serde",
  "serde_json",
@@ -2359,7 +2352,6 @@ name = "bloom-defi"
 version = "0.1.0"
 dependencies = [
  "alloy 2.0.5",
- "anyhow",
  "bloom-proto",
  "hex",
  "reqwest 0.12.28",
@@ -2376,13 +2368,10 @@ name = "bloom-ens"
 version = "0.1.0"
 dependencies = [
  "alloy 2.0.5",
- "async-trait",
  "bloom-evm",
  "bloom-proto",
  "hex",
  "parking_lot",
- "serde",
- "serde_json",
  "sha3 0.10.9",
  "thiserror 2.0.18",
  "tokio",
@@ -2397,7 +2386,6 @@ dependencies = [
  "async-trait",
  "bloom-proto",
  "hex",
- "parking_lot",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
@@ -2413,13 +2401,10 @@ name = "bloom-evm"
 version = "0.1.0"
 dependencies = [
  "alloy 2.0.5",
- "anyhow",
- "async-trait",
  "bloom-proto",
  "bloom-rpc",
  "hex",
  "parking_lot",
- "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.18",
@@ -2434,7 +2419,6 @@ version = "0.1.0"
 dependencies = [
  "alloy 2.0.5",
  "alloy-dyn-abi",
- "async-trait",
  "hex",
  "reqwest 0.12.28",
  "rmp-serde",
@@ -2454,12 +2438,10 @@ dependencies = [
  "anyhow",
  "async-trait",
  "base64 0.22.1",
- "blake3",
  "bloom-auth",
  "bloom-auth-api",
  "bloom-daemon",
  "bloom-evm",
- "bloom-keystore",
  "bloom-proto",
  "bloom-revert",
  "bloom-tx",
@@ -2471,7 +2453,6 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
- "toml 0.8.23",
  "tracing-subscriber 0.3.23",
 ]
 
@@ -2480,7 +2461,6 @@ name = "bloom-keystore"
 version = "0.1.0"
 dependencies = [
  "alloy 2.0.5",
- "anyhow",
  "argon2",
  "async-trait",
  "axum",
@@ -2515,13 +2495,9 @@ name = "bloom-mempool"
 version = "0.1.0"
 dependencies = [
  "alloy 2.0.5",
- "alloy-dyn-abi",
  "anyhow",
  "async-trait",
- "bloom-evm",
  "bloom-keystore",
- "bloom-proto",
- "bloom-tools",
  "futures",
  "hex",
  "parking_lot",
@@ -2540,16 +2516,13 @@ dependencies = [
 name = "bloom-mount"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "async-trait",
- "bloom-proto",
  "bloom-vfs",
  "bytes",
  "embednfs",
  "futures",
  "lru 0.12.5",
  "parking_lot",
- "serde",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -2608,7 +2581,6 @@ dependencies = [
  "anyhow",
  "async-trait",
  "blake3",
- "bloom-proto",
  "bloom-vfs",
  "futures",
  "hex",
@@ -2620,7 +2592,6 @@ dependencies = [
  "tokio",
  "toml 0.8.23",
  "tracing",
- "wasmparser 0.218.1",
  "wasmtime",
  "wasmtime-wasi",
  "wat",
@@ -2631,7 +2602,6 @@ name = "bloom-polymarket"
 version = "0.1.0"
 dependencies = [
  "alloy 2.0.5",
- "anyhow",
  "async-trait",
  "base64 0.22.1",
  "blake3",
@@ -2646,7 +2616,6 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
- "tracing",
  "url",
 ]
 
@@ -2654,8 +2623,6 @@ dependencies = [
 name = "bloom-prices"
 version = "0.1.0"
 dependencies = [
- "async-trait",
- "bloom-proto",
  "parking_lot",
  "reqwest 0.12.28",
  "serde",
@@ -2670,7 +2637,6 @@ name = "bloom-proto"
 version = "0.1.0"
 dependencies = [
  "alloy 2.0.5",
- "anyhow",
  "blake3",
  "bloom-auth-api",
  "dirs 5.0.1",
@@ -2680,7 +2646,6 @@ dependencies = [
  "parking_lot",
  "serde",
  "serde_json",
- "sha3 0.10.9",
  "tempfile",
  "thiserror 2.0.18",
  "toml 0.8.23",
@@ -2698,13 +2663,11 @@ dependencies = [
  "bloom-evm",
  "heimdall-decompiler",
  "hex",
- "parking_lot",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
  "sha3 0.10.9",
  "tempfile",
- "thiserror 2.0.18",
  "tokio",
  "tracing",
  "tracing-subscriber 0.3.23",
@@ -2716,7 +2679,6 @@ name = "bloom-rpc"
 version = "0.1.0"
 dependencies = [
  "alloy 2.0.5",
- "async-trait",
  "bloom-proto",
  "parking_lot",
  "serde",
@@ -2734,14 +2696,11 @@ version = "0.1.0"
 dependencies = [
  "alloy 2.0.5",
  "alloy-dyn-abi",
- "anyhow",
  "base64 0.22.1",
  "blake3",
  "hex",
- "serde",
  "serde_json",
  "sha2 0.10.9",
- "sha3 0.10.9",
  "thiserror 2.0.18",
 ]
 
@@ -2756,7 +2715,6 @@ dependencies = [
  "blake3",
  "bloom-auth-api",
  "bloom-evm",
- "bloom-keystore",
  "bloom-mempool",
  "bloom-proto",
  "bloom-rpc",
@@ -2778,8 +2736,6 @@ name = "bloom-vfs"
 version = "0.1.0"
 dependencies = [
  "alloy 2.0.5",
- "alloy-dyn-abi",
- "anyhow",
  "async-trait",
  "base64 0.22.1",
  "blake3",
@@ -2806,7 +2762,6 @@ dependencies = [
  "hex",
  "lru 0.12.5",
  "mpp",
- "once_cell",
  "parking_lot",
  "rand 0.8.6",
  "reqwest 0.12.28",
@@ -3953,22 +3908,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "dirs"
-version = "6.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c3e8aa94d75141228480295a7d0e7feb620b1a5ad9f12bc40be62411e38cce4e"
-dependencies = [
- "dirs-sys 0.5.0",
-]
-
-[[package]]
 name = "dirs-sys"
 version = "0.3.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1b1d1d91c932ef41c0f2663aa8b0ca0342d444d842c06914aa0a7e352d0bada6"
 dependencies = [
  "libc",
- "redox_users 0.4.6",
+ "redox_users",
  "winapi",
 ]
 
@@ -3980,20 +3926,8 @@ checksum = "520f05a5cbd335fae5a99ff7a6ab8627577660ee5cfd6a94a6a929b52ff0321c"
 dependencies = [
  "libc",
  "option-ext",
- "redox_users 0.4.6",
+ "redox_users",
  "windows-sys 0.48.0",
-]
-
-[[package]]
-name = "dirs-sys"
-version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e01a3366d27ee9890022452ee61b2b63a67e6f13f58900b651ff5665f0bb1fab"
-dependencies = [
- "libc",
- "option-ext",
- "redox_users 0.5.2",
- "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4003,7 +3937,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4ebda144c4fe02d1f7ea1a7d9641b6fc6b580adcfa024ae48797ecdeb6825b4d"
 dependencies = [
  "libc",
- "redox_users 0.4.6",
+ "redox_users",
  "winapi",
 ]
 
@@ -6788,17 +6722,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "redox_users"
-version = "0.5.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a4e608c6638b9c18977b00b475ac1f28d14e84b27d8d42f70e0bf1e3dec127ac"
-dependencies = [
- "getrandom 0.2.17",
- "libredox",
- "thiserror 2.0.18",
-]
-
-[[package]]
 name = "ref-cast"
 version = "1.0.25"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8162,15 +8085,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7ccc8076840c4da029af4f87e4e8daeb0fca6b87bbb02e10cb60b791450e11e4"
 dependencies = [
  "dirs 4.0.0",
-]
-
-[[package]]
-name = "shellexpand"
-version = "3.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "32824fab5e16e6c4d86dc1ba84489390419a39f97699852b66480bb87d297ed8"
-dependencies = [
- "dirs 6.0.0",
 ]
 
 [[package]]
@@ -9875,7 +9789,7 @@ dependencies = [
  "heck",
  "proc-macro2",
  "quote",
- "shellexpand 2.1.2",
+ "shellexpand",
  "syn 2.0.117",
  "witx",
 ]

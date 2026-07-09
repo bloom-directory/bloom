@@ -16,11 +16,7 @@ flashbots = ["dep:reqwest"]
 live-providers = []
 
 [dependencies]
-bloom-proto.workspace = true
-bloom-evm.workspace = true
-bloom-tools.workspace = true
 alloy.workspace = true
-alloy-dyn-abi.workspace = true
 async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true

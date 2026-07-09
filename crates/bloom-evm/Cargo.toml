@@ -8,13 +8,10 @@ description = "EVM RPC pool and wallet client for bloom"
 [dependencies]
 bloom-proto.workspace = true
 bloom-rpc.workspace = true
-serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-anyhow.workspace = true
 hex.workspace = true
 tokio.workspace = true
-async-trait.workspace = true
 tracing.workspace = true
 alloy.workspace = true
 parking_lot.workspace = true

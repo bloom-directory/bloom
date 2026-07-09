@@ -6,9 +6,7 @@ license.workspace = true
 description = "Content-addressed wasm petals for bloom: store, name registry, VM, VFS handler"
 
 [dependencies]
-bloom-proto.workspace = true
 bloom-vfs.workspace = true
-wasmparser = "0.218"
 async-trait.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true

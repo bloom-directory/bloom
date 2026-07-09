@@ -18,12 +18,10 @@ alloy.workspace = true
 alloy-dyn-abi.workspace = true
 async-trait.workspace = true
 hex.workspace = true
-parking_lot.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha3.workspace = true
-thiserror.workspace = true
 tokio = { workspace = true, features = ["sync", "time"] }
 tracing.workspace = true
 

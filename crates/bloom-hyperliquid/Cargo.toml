@@ -8,7 +8,6 @@ description = "Hyperliquid HyperCore client and signer for bloom"
 [dependencies]
 alloy.workspace = true
 alloy-dyn-abi.workspace = true
-async-trait.workspace = true
 hex.workspace = true
 reqwest.workspace = true
 rmp-serde = "1"

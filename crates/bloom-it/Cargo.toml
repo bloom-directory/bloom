@@ -16,7 +16,6 @@ bytecode-decompile = ["bloom-revert/bytecode-decompile"]
 bloom-proto.workspace = true
 bloom-auth.workspace = true
 bloom-auth-api.workspace = true
-bloom-keystore.workspace = true
 bloom-evm.workspace = true
 bloom-watch.workspace = true
 bloom-tx.workspace = true
@@ -30,9 +29,7 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros", "process", 
 serde_json.workspace = true
 hex.workspace = true
 tempfile.workspace = true
-toml.workspace = true
 tracing-subscriber.workspace = true
 reqwest.workspace = true
 futures.workspace = true
-blake3.workspace = true
 base64.workspace = true
