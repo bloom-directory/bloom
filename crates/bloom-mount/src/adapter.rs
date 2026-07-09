@@ -58,13 +58,12 @@ pub(crate) const RENDER_CACHE_CAPACITY: usize = 1024;
 /// rather than hanging past the kernel's retry threshold.
 pub(crate) const RENDER_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Time without further writes after which a buffer is auto-flushed.
+/// Time without further writes after which a buffer may be reaped.
 /// Picked to match the typical NFSv4 client behaviour: kernels with
 /// `wsize=4096` issue a burst of WRITEs followed by a COMMIT once the
 /// userspace `close(2)` returns. The COMMIT path is the primary flush
-/// trigger; this idle timer is the safety net for clients that skip
-/// COMMIT or for `O_DIRECT`-style writes that arrive with `FileSync`
-/// stability and never see a follow-up COMMIT.
+/// trigger for UNSTABLE writes; this idle window is only used to
+/// discard stale incomplete buffers on a later read of the same path.
 pub(crate) const WRITE_IDLE_FLUSH: Duration = Duration::from_secs(5);
 
 /// Opaque handle exported over NFS.
@@ -294,9 +293,9 @@ struct WriteBuffer {
     /// Adjacent and overlapping ranges are merged on insert so the
     /// "is contiguous prefix" check is a single map lookup.
     filled: BTreeMap<usize, usize>,
-    /// Timestamp of the most recent write. Idle-flush compares against
-    /// this so a one-shot O_DIRECT write that finishes without COMMIT
-    /// still lands eventually.
+    /// Timestamp of the most recent write. Stale-buffer cleanup compares
+    /// against this so an abandoned partial write can be reaped on a later
+    /// read of the same path.
     last_write: Instant,
     /// Total bytes the client has handed us across all WRITEs (count
     /// of bytes received, not max-offset). Tracked for the FBIG cap so
@@ -371,6 +370,14 @@ impl WriteBuffer {
             Some((&start, &end)) => start == 0 && end == self.bytes.len(),
             None => false,
         }
+    }
+
+    fn should_flush_after_write(&self, requested: WriteStability) -> bool {
+        self.is_complete()
+            && matches!(
+                requested,
+                WriteStability::DataSync | WriteStability::FileSync
+            )
     }
 }
 
@@ -471,10 +478,8 @@ type RenderFuture = Shared<BoxFuture<'static, Result<Bytes, String>>>;
 /// 1. An NFS COMMIT against the handle (the primary trigger — the
 ///    Linux client issues COMMIT after the userspace `close(2)` /
 ///    `fsync(2)` for unstable writes).
-/// 2. An idle timer ([`WRITE_IDLE_FLUSH`]) since the last WRITE on
-///    that handle, as a safety net for clients that skip COMMIT or
-///    for `WriteStability::FileSync` writes that arrive without a
-///    follow-up COMMIT.
+/// 2. The WRITE call itself when the request is synchronous and the
+///    buffer is contiguous.
 /// 3. A `read` against the same handle — we flush first, then read,
 ///    so the user observes their own writes.
 ///
@@ -581,10 +586,9 @@ impl BloomFs {
     }
 
     /// Flush any buffered writes for `path` through to the VFS. No-op
-    /// if the buffer is empty or non-contiguous (the latter only
-    /// happens if a client never sends the missing prefix; the idle
-    /// timer would normally drop such buffers, but flush_path is
-    /// defensive about it).
+    /// if the buffer is empty or non-contiguous; incomplete buffers can
+    /// only be completed by a follow-up WRITE or discarded by
+    /// `drop_stale_buffer` on a later read of the same path.
     async fn flush_path(&self, path: &VfsPath) -> FsResult<()> {
         if let Some(bytes) = self.take_complete_buffer(path) {
             if mount_write_path_uses_wallet_signer(path) {
@@ -1035,15 +1039,17 @@ impl FileSystem for BloomFs {
         // advertise UNSTABLE for every reply.
         //
         // Strategy:
-        // - DATA_SYNC / FILE_SYNC requested: flush eagerly when the
-        //   buffer is contiguous and report back the requested level so
-        //   the kernel doesn't need to follow up with a COMMIT.
+        // - Flush eagerly only when the request is sync-stable and the
+        //   buffer is contiguous. NFS WRITE does not carry an EOF/final
+        //   chunk marker, so any UNSTABLE offset-0 prefix that may grow
+        //   must wait for COMMIT even if it could also be a whole
+        //   single-RPC write.
         // - DATA_SYNC / FILE_SYNC requested but buffer is incomplete
         //   (mid-stream chunk): reject explicitly. Returning a weaker
         //   stability than requested violates embednfs' contract and
         //   surfaces as SERVERFAULT/EREMOTEIO.
-        // - UNSTABLE requested: buffer and reply UNSTABLE; the kernel
-        //   sends a COMMIT after CLOSE that triggers `flush_path`.
+        // - UNSTABLE requested: buffer and reply UNSTABLE; a later
+        //   COMMIT or read will trigger `flush_path`.
         let (complete_payload, accepted) = {
             let mut map = self.write_buffers.lock();
             let buf = map.entry(path.clone()).or_insert_with(WriteBuffer::new);
@@ -1055,11 +1061,7 @@ impl FileSystem for BloomFs {
                 return Err(FsError::FileTooLarge);
             }
             buf.apply(offset, &data)?;
-            let needs_eager_flush = matches!(
-                requested,
-                WriteStability::DataSync | WriteStability::FileSync
-            ) && buf.is_complete();
-            let payload = if needs_eager_flush {
+            let payload = if buf.should_flush_after_write(requested) {
                 Some(map.remove(&path).expect("just observed").bytes)
             } else {
                 None
@@ -1111,8 +1113,10 @@ impl FileSystem for BloomFs {
     ) -> FsResult<CreateResult<BloomHandle>> {
         // VFS doesn't expose a create-empty op; for files we issue a
         // zero-byte write (writable handlers are expected to materialise
-        // an entry). Directory creation is not supported in v1 — the
-        // VFS structure is fixed.
+        // an entry). For content-sensitive handlers, a successful
+        // zero-byte create is not a guarantee that the subsequent
+        // content write will succeed. Directory creation is not
+        // supported in v1 — the VFS structure is fixed.
         if matches!(req.kind, CreateKind::Directory) {
             return Err(FsError::Unsupported);
         }
@@ -1293,6 +1297,54 @@ mod tests {
 
         fn last_write(&self) -> Option<Vec<u8>> {
             self.writes.lock().last().cloned()
+        }
+    }
+
+    /// Models a handler that stages a side effect, such as writing an
+    /// approval_challenge.json, before denying the attempted write.
+    #[derive(Default)]
+    struct ChallengeStagingHandler {
+        staged: parking_lot::Mutex<Vec<Vec<u8>>>,
+    }
+
+    impl ChallengeStagingHandler {
+        fn new() -> Arc<Self> {
+            Arc::new(Self::default())
+        }
+
+        fn staged_count(&self) -> usize {
+            self.staged.lock().len()
+        }
+    }
+
+    #[async_trait]
+    impl Handler for ChallengeStagingHandler {
+        async fn lookup(&self, p: &VfsPath) -> Result<Entry, HandlerError> {
+            if p.is_root() {
+                return Ok(Entry::dir(""));
+            }
+            match p.first() {
+                Some("challenge") => Ok(Entry::writable_file("challenge")),
+                _ => Err(HandlerError::NotFound(p.to_string_path())),
+            }
+        }
+
+        async fn write(&self, p: &VfsPath, data: &[u8]) -> Result<(), HandlerError> {
+            match p.first() {
+                Some("challenge") => {
+                    self.staged.lock().push(data.to_vec());
+                    Err(HandlerError::PermissionDenied)
+                }
+                _ => Err(HandlerError::PermissionDenied),
+            }
+        }
+
+        async fn list(&self, p: &VfsPath) -> Result<Vec<Entry>, HandlerError> {
+            if p.is_root() {
+                Ok(vec![Entry::writable_file("challenge")])
+            } else {
+                Err(HandlerError::NotADir(p.to_string_path()))
+            }
         }
     }
 
@@ -1479,6 +1531,75 @@ mod tests {
         assert!(page.eof);
     }
 
+    #[tokio::test]
+    async fn file_sync_write_surfaces_permission_denied_immediately() {
+        let handler = ChallengeStagingHandler::new();
+        let vfs = Vfs::builder().mount("stage", handler.clone()).build();
+        let fs = BloomFs::new(vfs);
+        let ctx = fake_ctx();
+        let dir = fs.lookup(&ctx, &BloomHandle::Root, "stage").await.unwrap();
+        let challenge = fs.lookup(&ctx, &dir, "challenge").await.unwrap();
+
+        let err = fs
+            .write(
+                &ctx,
+                &challenge,
+                0,
+                Bytes::from_static(b"{\"action\":\"usdSend\"}"),
+                WriteStability::FileSync,
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(err, FsError::PermissionDenied);
+        assert_eq!(
+            handler.staged_count(),
+            1,
+            "challenge staging side effect should still happen exactly once"
+        );
+    }
+
+    #[tokio::test]
+    async fn multi_chunk_unstable_write_denies_on_commit() {
+        let handler = ChallengeStagingHandler::new();
+        let vfs = Vfs::builder().mount("stage", handler.clone()).build();
+        let fs = BloomFs::new(vfs);
+        let ctx = fake_ctx();
+        let dir = fs.lookup(&ctx, &BloomHandle::Root, "stage").await.unwrap();
+        let challenge = fs.lookup(&ctx, &dir, "challenge").await.unwrap();
+
+        let result = fs
+            .write(
+                &ctx,
+                &challenge,
+                5,
+                Bytes::from_static(b"1}"),
+                WriteStability::Unstable,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.stability, WriteStability::Unstable);
+        assert_eq!(handler.staged_count(), 0);
+
+        let result = fs
+            .write(
+                &ctx,
+                &challenge,
+                0,
+                Bytes::from_static(b"{\"a\":"),
+                WriteStability::Unstable,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.stability, WriteStability::Unstable);
+        assert_eq!(handler.staged_count(), 0);
+
+        let cs = fs.commit_support().expect("commit support enabled");
+        let err = cs.commit(&ctx, &challenge, 0, 7).await.unwrap_err();
+        assert_eq!(err, FsError::PermissionDenied);
+        assert_eq!(handler.staged_count(), 1);
+    }
+
     /// Bug #4 acceptance: a 16 KiB write delivered as four 4 KiB
     /// chunks at offsets 0/4096/8192/12288 followed by a COMMIT must
     /// land as a single `vfs.write` carrying the joined payload.
@@ -1515,7 +1636,8 @@ mod tests {
             assert_eq!(result.written, 4096);
             assert_eq!(result.stability, WriteStability::Unstable);
         }
-        // No flush yet — UNSTABLE writes wait for COMMIT.
+        // No flush yet: without an EOF marker, each sequential complete
+        // prefix could still be the first part of a larger file.
         assert_eq!(recorder.write_count(), 0);
 
         // COMMIT: the kernel issues this on close/fsync and it must
@@ -1528,8 +1650,44 @@ mod tests {
         assert_eq!(recorder.last_write().unwrap(), payload);
     }
 
+    /// Regression: a complete offset-zero prefix is not necessarily a
+    /// complete file. Sequential clients can split at sizes other than
+    /// 4 KiB, so the adapter must not eagerly flush the first 8 KiB
+    /// prefix and lose the tail.
+    #[tokio::test]
+    async fn sequential_non_4k_chunks_wait_for_commit() {
+        let recorder = RecordingHandler::new();
+        let vfs = Vfs::builder().mount("box", recorder.clone()).build();
+        let fs = BloomFs::new(vfs);
+        let ctx = fake_ctx();
+        let dir = fs.lookup(&ctx, &BloomHandle::Root, "box").await.unwrap();
+        let inbox = fs.lookup(&ctx, &dir, "inbox").await.unwrap();
+
+        let payload = vec![7u8; 16 * 1024];
+        let chunks: Vec<&[u8]> = payload.chunks(8192).collect();
+        for (i, chunk) in chunks.iter().enumerate() {
+            fs.write(
+                &ctx,
+                &inbox,
+                (i as u64) * 8192,
+                Bytes::copy_from_slice(chunk),
+                WriteStability::Unstable,
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(recorder.write_count(), 0);
+
+        let cs = fs.commit_support().expect("commit support enabled");
+        cs.commit(&ctx, &inbox, 0, payload.len() as u32)
+            .await
+            .unwrap();
+        assert_eq!(recorder.write_count(), 1);
+        assert_eq!(recorder.last_write().unwrap(), payload);
+    }
+
     /// Bug #4 acceptance: out-of-order chunks plus a final prefix
-    /// chunk + COMMIT still produce a single coalesced write.
+    /// chunk still produce a single coalesced write on COMMIT.
     #[tokio::test]
     async fn buffered_chunks_tolerate_out_of_order() {
         let recorder = RecordingHandler::new();
@@ -1557,6 +1715,66 @@ mod tests {
                 .await
                 .unwrap();
         }
+        assert_eq!(recorder.write_count(), 0);
+
+        let cs = fs.commit_support().unwrap();
+        cs.commit(&ctx, &inbox, 0, payload.len() as u32)
+            .await
+            .unwrap();
+        assert_eq!(recorder.write_count(), 1);
+        assert_eq!(recorder.last_write().unwrap(), payload);
+    }
+
+    /// Regression: out-of-order chunks can become temporarily contiguous
+    /// before the tail arrives. That prefix is not a final-file signal,
+    /// so UNSTABLE writes must still wait for COMMIT.
+    #[tokio::test]
+    async fn out_of_order_prefix_completion_waits_for_commit_until_tail_arrives() {
+        let recorder = RecordingHandler::new();
+        let vfs = Vfs::builder().mount("box", recorder.clone()).build();
+        let fs = BloomFs::new(vfs);
+        let ctx = fake_ctx();
+        let dir = fs.lookup(&ctx, &BloomHandle::Root, "box").await.unwrap();
+        let inbox = fs.lookup(&ctx, &dir, "inbox").await.unwrap();
+
+        let mut payload = vec![0u8; 12288];
+        for (i, b) in payload.iter_mut().enumerate() {
+            *b = (i & 0xff) as u8;
+        }
+
+        fs.write(
+            &ctx,
+            &inbox,
+            4096,
+            Bytes::copy_from_slice(&payload[4096..8192]),
+            WriteStability::Unstable,
+        )
+        .await
+        .unwrap();
+        fs.write(
+            &ctx,
+            &inbox,
+            0,
+            Bytes::copy_from_slice(&payload[0..4096]),
+            WriteStability::Unstable,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            recorder.write_count(),
+            0,
+            "contiguous prefix must not flush before the tail arrives"
+        );
+
+        fs.write(
+            &ctx,
+            &inbox,
+            8192,
+            Bytes::copy_from_slice(&payload[8192..12288]),
+            WriteStability::Unstable,
+        )
+        .await
+        .unwrap();
         assert_eq!(recorder.write_count(), 0);
 
         let cs = fs.commit_support().unwrap();
