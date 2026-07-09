@@ -253,6 +253,22 @@ fn polymarket_onboard_auth_dir(root: &Path, wallet: &str) -> Result<PathBuf, Han
     Ok(root.join(wallet))
 }
 
+fn polymarket_onboard_approval_paths(
+    root: &Path,
+    wallet: &str,
+) -> Result<(PathBuf, PathBuf), HandlerError> {
+    let dir = polymarket_onboard_auth_dir(root, wallet)?;
+    Ok((dir.join(APPROVAL_FILE), dir.join(APPROVAL_CHALLENGE_FILE)))
+}
+
+fn polymarket_onboard_challenge_actionable(
+    root: &Path,
+    wallet: &str,
+) -> Result<bool, HandlerError> {
+    let (approval_path, challenge_path) = polymarket_onboard_approval_paths(root, wallet)?;
+    Ok(challenge_path.exists() && !approval_path.exists())
+}
+
 pub fn polymarket_onboard_action_id(wallet: &str) -> String {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"bloom.polymarket.onboard.entry.v1");
@@ -2091,9 +2107,7 @@ impl PolymarketHandler {
                 3 if ONBOARD_RO_FILES.contains(&segs[2].as_str()) => {
                     if segs[2] == APPROVAL_CHALLENGE_FILE {
                         let ob = self.onboarding_or_not_found(path)?;
-                        let challenge_path = polymarket_onboard_auth_dir(&ob.auth_dir, &segs[1])?
-                            .join(APPROVAL_CHALLENGE_FILE);
-                        if !challenge_path.exists() {
+                        if !polymarket_onboard_challenge_actionable(&ob.auth_dir, &segs[1])? {
                             return Err(HandlerError::not_found(path.to_string_path()));
                         }
                     }
@@ -2611,8 +2625,10 @@ impl PolymarketHandler {
             "plan.md" => Ok(render_onboard_plan_md(&st).into_bytes()),
             "approvals.json" => pretty(&ob.onboarder.approval_preview(owner)),
             APPROVAL_CHALLENGE_FILE => {
-                let challenge_path = polymarket_onboard_auth_dir(&ob.auth_dir, wallet)?
-                    .join(APPROVAL_CHALLENGE_FILE);
+                if !polymarket_onboard_challenge_actionable(&ob.auth_dir, wallet)? {
+                    return Err(HandlerError::not_found(path.to_string_path()));
+                }
+                let (_, challenge_path) = polymarket_onboard_approval_paths(&ob.auth_dir, wallet)?;
                 std::fs::read(&challenge_path).map_err(|e| match e.kind() {
                     std::io::ErrorKind::NotFound => HandlerError::NotAFile(path.to_string_path()),
                     _ => HandlerError::Io(e),
@@ -3433,8 +3449,7 @@ impl PolymarketHandler {
                     ONBOARD_RO_FILES.iter().map(|f| Entry::file(f)).collect();
                 entries.retain(|entry| {
                     entry.name != APPROVAL_CHALLENGE_FILE
-                        || polymarket_onboard_auth_dir(&ob.auth_dir, &segs[1])
-                            .map(|dir| dir.join(APPROVAL_CHALLENGE_FILE).exists())
+                        || polymarket_onboard_challenge_actionable(&ob.auth_dir, &segs[1])
                             .unwrap_or(false)
                 });
                 entries.push(Entry::writable_file("begin"));
@@ -4296,6 +4311,51 @@ key = "builder-key-2"
         )
         .unwrap();
         assert_eq!(projected, challenge);
+    }
+
+    #[tokio::test]
+    async fn wired_onboard_hides_challenge_after_approval_is_written() {
+        let (addr, _s) = spawn_scripted(vec![]).await;
+        let f = onboard_fixture(addr, true).await;
+        let handler = f.handler.clone().with_auth_services(pm_wired_auth());
+
+        let err = handler
+            .write(&p("/onboard/alice/begin"), b"x")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, HandlerError::PermissionDenied),
+            "expected PermissionDenied, got: {err}"
+        );
+
+        let approval_path = f.state_dir.join("alice").join(APPROVAL_FILE);
+        std::fs::write(&approval_path, b"{}").unwrap();
+
+        let entries = handler.list(&p("/onboard/alice")).await.unwrap();
+        assert!(
+            entries
+                .iter()
+                .all(|entry| entry.name != APPROVAL_CHALLENGE_FILE),
+            "approval_challenge.json must be hidden after approval.json is present"
+        );
+
+        let lookup_err = handler
+            .lookup(&p("/onboard/alice/approval_challenge.json"))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(lookup_err, HandlerError::NotFound(_)),
+            "expected NotFound, got: {lookup_err}"
+        );
+
+        let read_err = handler
+            .read(&p("/onboard/alice/approval_challenge.json"))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(read_err, HandlerError::NotFound(_)),
+            "expected NotFound, got: {read_err}"
+        );
     }
 
     #[tokio::test]
