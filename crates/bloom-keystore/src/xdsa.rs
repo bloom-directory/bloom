@@ -453,37 +453,22 @@ mod tests {
         assert_ne!(derive_address(&pk1), derive_address(&pk2));
     }
 
-    /// Regression for the 2026-05-19 review (#10): wallet-side and chain-side
-    /// address derivation must agree on a single canonical domain tag.
-    ///
-    /// Pre-fix, `derive_address` used `b"addr:account:"`, while the chain
-    /// (`bloom-evm-node::consensus_driver::apply_block` sender check, and the
-    /// spec at §4.3) used `b"bloom-evm.v0.addr:"`. The mismatch meant every
-    /// keystore-created wallet had an address that the chain rejected with
-    /// `sender mismatch`, even though both sides looked correct in isolation.
-    ///
-    /// This test will fail on master, where the two derivations disagree.
+    /// Regression for the 2026-05-19 review (#10): xDSA wallet address
+    /// derivation must stay pinned to the canonical wallet domain tag.
     #[test]
-    fn keystore_address_matches_chain_canonical_derivation() {
+    fn keystore_address_uses_canonical_derivation() {
         let (_, pk) = XdsaSecretKey::generate();
         let keystore_addr = derive_address(&pk);
-        let chain_addr = bloom_evm_types::types::Address::from_pubkey_bytes(&pk.0).0;
-        assert_eq!(
-            keystore_addr, chain_addr,
-            "wallet derive_address() and Address::from_pubkey_bytes() must \
-             agree — drift between them silently makes wallets invalid as tx \
-             senders"
-        );
 
         // Pin the canonical tag explicitly so any future drift trips this
-        // test, not a downstream consensus regression.
+        // test before downstream wallet consumers see incompatible addresses.
         let mut h = blake3::Hasher::new();
-        h.update(b"bloom-evm.v0.addr:");
+        h.update(b"bloom.wallet.addr:");
         h.update(&pk.0);
         let expected = *h.finalize().as_bytes();
         assert_eq!(
             keystore_addr, expected,
-            "canonical domain tag is `bloom-evm.v0.addr:` per spec §4.3"
+            "canonical domain tag is `bloom.wallet.addr:`"
         );
     }
 

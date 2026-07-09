@@ -82,6 +82,7 @@ impl PetalMeta {
 /// Validate that a (mode, caps) pair is allowed at install time.
 ///
 /// - `Local` may declare `{vfs.read, vfs.write}`.
+///
 /// Returns `Err` on the first offending capability; the remaining caps
 /// are not inspected.
 pub fn validate_mode_caps(

@@ -1442,8 +1442,60 @@ impl IpcClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bloom_test_util::mocks::SingleFileHandler;
     use std::sync::Arc;
+
+    struct SingleFileHandler {
+        name: String,
+        body: Vec<u8>,
+    }
+
+    impl SingleFileHandler {
+        fn new(name: impl Into<String>, body: Vec<u8>) -> Self {
+            Self {
+                name: name.into(),
+                body,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Handler for SingleFileHandler {
+        async fn lookup(&self, path: &VfsPath) -> Result<Entry, HandlerError> {
+            match path
+                .segments()
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .as_slice()
+            {
+                [] => Ok(Entry::dir("stub")),
+                [leaf] if *leaf == self.name => Ok(Entry::read_only_file(&self.name)),
+                _ => Err(HandlerError::NotFound(path.to_string_path())),
+            }
+        }
+
+        async fn read(&self, path: &VfsPath) -> Result<Vec<u8>, HandlerError> {
+            match path
+                .segments()
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .as_slice()
+            {
+                [leaf] if *leaf == self.name => Ok(self.body.clone()),
+                [] => Err(HandlerError::NotAFile(path.to_string_path())),
+                _ => Err(HandlerError::NotFound(path.to_string_path())),
+            }
+        }
+
+        async fn list(&self, path: &VfsPath) -> Result<Vec<Entry>, HandlerError> {
+            if path.is_root() {
+                Ok(vec![Entry::read_only_file(&self.name)])
+            } else {
+                Err(HandlerError::NotADir(path.to_string_path()))
+            }
+        }
+    }
 
     fn vfs() -> Vfs {
         Vfs::builder()
