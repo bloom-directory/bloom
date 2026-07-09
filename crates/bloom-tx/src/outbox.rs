@@ -8,9 +8,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use bloom_auth_api::petal_identity::{
-    FIRST_PARTY_PETAL_VERSION_V0, PETAL_ID_EVM_WALLET, PLACEHOLDER_DIGEST_EVM_WALLET,
-};
 use bloom_proto::{StagedTx, TxStatus};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
@@ -414,6 +411,8 @@ impl Outbox {
     /// `intent.json`.
     pub fn write_pending(&self, staged: &StagedTx, plan_md: &str) -> Result<PathBuf, OutboxError> {
         let mut staged = staged.clone();
+        let execution_origin = staged.resolved_execution_origin();
+        execution_origin.validate().map_err(OutboxError::Other)?;
 
         // Project to central outbox if a projection is wired.
         if let Some(proj) = &self.inner.projection {
@@ -430,9 +429,9 @@ impl Outbox {
                 plan_md,
                 &policy_check_json,
                 CentralActionIdentity {
-                    petal_id: PETAL_ID_EVM_WALLET,
-                    petal_digest: PLACEHOLDER_DIGEST_EVM_WALLET,
-                    petal_version: FIRST_PARTY_PETAL_VERSION_V0,
+                    petal_id: &execution_origin.petal_id,
+                    petal_digest: &execution_origin.petal_digest,
+                    petal_version: &execution_origin.petal_version,
                 },
             )
             .map_err(OutboxError::Other)?;
@@ -1147,6 +1146,7 @@ mod tests {
             usd_value: None,
             depends_on: None,
             action_id: None,
+            execution_origin: None,
         }
     }
 
@@ -1672,10 +1672,12 @@ mod tests {
         assert_eq!(mock.allocated.lock().unwrap().len(), 1);
         let staged_actions = mock.staged.lock().unwrap();
         assert_eq!(staged_actions.len(), 1);
+        let origin = staged.resolved_execution_origin();
         assert_eq!(
             staged_actions[0],
             format!(
-                "act-0000:{PETAL_ID_EVM_WALLET}:{PLACEHOLDER_DIGEST_EVM_WALLET}:{FIRST_PARTY_PETAL_VERSION_V0}"
+                "act-0000:{}:{}:{}",
+                origin.petal_id, origin.petal_digest, origin.petal_version
             )
         );
         drop(staged_actions);
@@ -1689,6 +1691,29 @@ mod tests {
         assert_eq!(ts[0].0, "act-0000");
         assert_eq!(ts[0].1, "pending");
         assert_eq!(ts[0].2, "sent");
+    }
+
+    #[test]
+    fn projection_uses_persisted_local_app_execution_origin() {
+        let dir = tempfile::tempdir().unwrap();
+        let mock = Arc::new(MockProjection::new());
+        let ob = Outbox::new_with_projection(dir.path(), mock.clone()).unwrap();
+        let mut staged = fake_staged("0001-local-app");
+        staged.execution_origin = Some(bloom_proto::plan::ExecutionOrigin {
+            petal_id: "local-app:polymarket".into(),
+            petal_digest: "a".repeat(64),
+            petal_version: "v2-package".into(),
+        });
+
+        ob.write_pending(&staged, "# plan").unwrap();
+
+        assert_eq!(
+            mock.staged.lock().unwrap().as_slice(),
+            [format!(
+                "act-0000:local-app:polymarket:{}:v2-package",
+                "a".repeat(64)
+            )]
+        );
     }
 
     #[test]

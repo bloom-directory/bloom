@@ -42,7 +42,8 @@ use wasmtime_wasi::pipe::{MemoryInputPipe, MemoryOutputPipe};
 use wasmtime_wasi::preview1::{self, WasiP1Ctx};
 
 use crate::abi::{
-    ChainRequest, ChainResponse, DispatchOp, DispatchRequest, DispatchResponse, SignRequest,
+    ChainRequest, ChainResponse, DispatchOp, DispatchRequest, DispatchResponse,
+    EvmOutboxInspection, EvmOutboxOutcome, EvmTransactionRequest, SignOutcome, SignRequest,
     V2SignContext,
 };
 use crate::error::PetalError;
@@ -786,6 +787,24 @@ fn link_component_host_imports(linker: &mut ComponentLinker<StoreData>) -> anyho
         })?;
     }
     {
+        let mut sign = linker.instance("bloom:sign/signing@0.2.0")?;
+        sign.func_new_async("sign-hash", |store, params, results| {
+            Box::new(async move { component_sign_hash_v2(store, params, results).await })
+        })?;
+    }
+    {
+        let mut tx = linker.instance("bloom:tx/outbox@0.1.0")?;
+        tx.func_new_async("stage", |store, params, results| {
+            Box::new(async move { component_evm_tx_stage(store, params, results).await })
+        })?;
+        tx.func_new_async("confirm", |store, params, results| {
+            Box::new(async move { component_evm_tx_confirm(store, params, results).await })
+        })?;
+        tx.func_new_async("inspect", |store, params, results| {
+            Box::new(async move { component_evm_tx_inspect(store, params, results).await })
+        })?;
+    }
+    {
         let mut vfs = linker.instance("bloom:vfs/readwrite@0.1.0")?;
         vfs.func_new_async("lookup", |store, params, results| {
             Box::new(async move { component_vfs_lookup(store, params, results).await })
@@ -1171,67 +1190,12 @@ async fn component_sign_hash(
     params: &[ComponentVal],
     results: &mut [ComponentVal],
 ) -> anyhow::Result<()> {
-    if !store.data().caps.contains(&Capability::Sign) {
-        log_denied(store.data(), "component_sign_hash");
-        return set_component_result(
-            results,
-            component_host_err(HostError::Denied("sign".into())),
-        );
-    }
-    let [wallet, hash, intent] = params else {
-        return set_component_result(
-            results,
-            component_host_err(HostError::Invalid(
-                "invalid bloom:sign.sign-hash params".into(),
-            )),
-        );
+    let req = match component_sign_request(store.data(), params) {
+        Ok(req) => req,
+        Err(err) => return set_component_result(results, component_host_err(err)),
     };
-    let wallet = match component_string(wallet, "wallet") {
-        Ok(wallet) => wallet,
-        Err(e) => return set_component_result(results, component_host_err(e)),
-    };
-    let hash = match component_byte_list(hash, "hash32") {
-        Ok(hash) => hash,
-        Err(e) => return set_component_result(results, component_host_err(e)),
-    };
-    if hash.len() != 32 {
-        return set_component_result(
-            results,
-            component_host_err(HostError::Invalid(
-                "sign-hash requires a 32-byte hash".into(),
-            )),
-        );
-    }
-    let mut hash32 = [0u8; 32];
-    hash32.copy_from_slice(&hash);
-    let intent = match component_string(intent, "intent") {
-        Ok(intent) => intent,
-        Err(e) => return set_component_result(results, component_host_err(e)),
-    };
-    if !sign_intent_allowed(store.data(), &intent) {
-        tracing::info!(
-            target: "bloom_petals::vm",
-            petal = %store.data().petal_hash,
-            intent = %intent,
-            "component sign_hash denied by sign intent policy"
-        );
-        return set_component_result(
-            results,
-            component_host_err(HostError::Denied(format!(
-                "sign intent {intent:?} is not allowed"
-            ))),
-        );
-    }
     let host = store.data().host.clone();
-    match host
-        .sign_hash(SignRequest {
-            wallet,
-            hash32,
-            purpose: intent,
-            context: store.data().sign_context.clone(),
-        })
-        .await
-    {
+    match host.sign_hash(req).await {
         Ok(sig) if sig.len() == 65 => {
             set_component_result(results, component_ok(Some(component_bytes(sig))))
         }
@@ -1243,6 +1207,306 @@ async fn component_sign_hash(
         ),
         Err(e) => set_component_result(results, component_host_err(e)),
     }
+}
+
+async fn component_sign_hash_v2(
+    store: StoreContextMut<'_, StoreData>,
+    params: &[ComponentVal],
+    results: &mut [ComponentVal],
+) -> anyhow::Result<()> {
+    let req = match component_sign_request(store.data(), params) {
+        Ok(req) => req,
+        Err(err) => return set_component_result(results, component_host_err(err)),
+    };
+    let host = store.data().host.clone();
+    match host.sign_hash_outcome(req).await {
+        Ok(SignOutcome::Signature(signature)) if signature.len() == 65 => {
+            set_component_result(results, component_sign_v2_signature(signature))
+        }
+        Ok(SignOutcome::Signature(_)) => set_component_result(
+            results,
+            component_host_err(HostError::Backend(
+                "sign_hash returned non-65-byte signature".into(),
+            )),
+        ),
+        Ok(SignOutcome::ApprovalRequired(approval)) => set_component_result(
+            results,
+            component_sign_v2_approval_required(
+                approval.action_id,
+                approval.ceremony_url,
+                approval.expires_ms,
+            ),
+        ),
+        Err(err) => set_component_result(results, component_host_err(err)),
+    }
+}
+
+fn component_sign_request(
+    data: &StoreData,
+    params: &[ComponentVal],
+) -> Result<SignRequest, HostError> {
+    if !data.caps.contains(&Capability::Sign) {
+        log_denied(data, "component_sign_hash");
+        return Err(HostError::Denied("sign".into()));
+    }
+    let [wallet, hash, intent] = params else {
+        return Err(HostError::Invalid(
+            "invalid bloom:sign.sign-hash params".into(),
+        ));
+    };
+    let wallet = component_string(wallet, "wallet")?;
+    let hash = component_byte_list(hash, "hash32")?;
+    if hash.len() != 32 {
+        return Err(HostError::Invalid(
+            "sign-hash requires a 32-byte hash".into(),
+        ));
+    }
+    let mut hash32 = [0u8; 32];
+    hash32.copy_from_slice(&hash);
+    let purpose = component_string(intent, "intent")?;
+    if !sign_intent_allowed(data, &purpose) {
+        tracing::info!(
+            target: "bloom_petals::vm",
+            petal = %data.petal_hash,
+            intent = %purpose,
+            "component sign_hash denied by sign intent policy"
+        );
+        return Err(HostError::Denied(format!(
+            "sign intent {purpose:?} is not allowed"
+        )));
+    }
+    Ok(SignRequest {
+        wallet,
+        hash32,
+        purpose,
+        context: data.sign_context.clone(),
+    })
+}
+
+fn component_sign_v2_signature(signature: Vec<u8>) -> ComponentVal {
+    ComponentVal::Result(Ok(Some(Box::new(ComponentVal::Variant(
+        "signature".into(),
+        Some(Box::new(component_bytes(signature))),
+    )))))
+}
+
+fn component_sign_v2_approval_required(
+    action_id: String,
+    ceremony_url: String,
+    expires_ms: u64,
+) -> ComponentVal {
+    ComponentVal::Result(Ok(Some(Box::new(ComponentVal::Variant(
+        "approval-required".into(),
+        Some(Box::new(ComponentVal::Record(vec![
+            ("action-id".into(), ComponentVal::String(action_id)),
+            ("ceremony-url".into(), ComponentVal::String(ceremony_url)),
+            ("expires-ms".into(), ComponentVal::U64(expires_ms)),
+        ]))),
+    )))))
+}
+
+async fn component_evm_tx_stage(
+    store: StoreContextMut<'_, StoreData>,
+    params: &[ComponentVal],
+    results: &mut [ComponentVal],
+) -> anyhow::Result<()> {
+    if !store.data().caps.contains(&Capability::TxOutbox) {
+        log_denied(store.data(), "component_evm_tx_stage");
+        return set_component_result(
+            results,
+            component_host_err(HostError::Denied("tx.outbox".into())),
+        );
+    }
+    let [ComponentVal::Record(fields)] = params else {
+        return set_component_result(
+            results,
+            component_host_err(HostError::Invalid(
+                "invalid bloom:tx.outbox stage params".into(),
+            )),
+        );
+    };
+    let request = match component_evm_transaction_request(fields, store.data().sign_context.clone())
+    {
+        Ok(request) => request,
+        Err(err) => return set_component_result(results, component_host_err(err)),
+    };
+    let host = store.data().host.clone();
+    match host.evm_tx_stage(request).await {
+        Ok(outcome) => set_component_result(results, component_evm_outbox_outcome(outcome)),
+        Err(err) => set_component_result(results, component_host_err(err)),
+    }
+}
+
+async fn component_evm_tx_confirm(
+    store: StoreContextMut<'_, StoreData>,
+    params: &[ComponentVal],
+    results: &mut [ComponentVal],
+) -> anyhow::Result<()> {
+    if !store.data().caps.contains(&Capability::TxOutbox) {
+        log_denied(store.data(), "component_evm_tx_confirm");
+        return set_component_result(
+            results,
+            component_host_err(HostError::Denied("tx.outbox".into())),
+        );
+    }
+    let [wallet, chain, outbox_id, acknowledge_warnings] = params else {
+        return set_component_result(
+            results,
+            component_host_err(HostError::Invalid(
+                "invalid bloom:tx.outbox confirm params".into(),
+            )),
+        );
+    };
+    let wallet = match component_string(wallet, "wallet") {
+        Ok(value) => value,
+        Err(err) => return set_component_result(results, component_host_err(err)),
+    };
+    let chain = match component_string(chain, "chain") {
+        Ok(value) => value,
+        Err(err) => return set_component_result(results, component_host_err(err)),
+    };
+    let outbox_id = match component_string(outbox_id, "outbox-id") {
+        Ok(value) => value,
+        Err(err) => return set_component_result(results, component_host_err(err)),
+    };
+    let ComponentVal::Bool(acknowledge_warnings) = acknowledge_warnings else {
+        return set_component_result(
+            results,
+            component_host_err(HostError::Invalid(
+                "acknowledge-warnings must be a bool".into(),
+            )),
+        );
+    };
+    let host = store.data().host.clone();
+    match host
+        .evm_tx_confirm(
+            wallet,
+            chain,
+            outbox_id,
+            *acknowledge_warnings,
+            store.data().sign_context.clone(),
+        )
+        .await
+    {
+        Ok(outcome) => set_component_result(results, component_evm_outbox_outcome(outcome)),
+        Err(err) => set_component_result(results, component_host_err(err)),
+    }
+}
+
+async fn component_evm_tx_inspect(
+    store: StoreContextMut<'_, StoreData>,
+    params: &[ComponentVal],
+    results: &mut [ComponentVal],
+) -> anyhow::Result<()> {
+    if !store.data().caps.contains(&Capability::TxOutbox) {
+        log_denied(store.data(), "component_evm_tx_inspect");
+        return set_component_result(
+            results,
+            component_host_err(HostError::Denied("tx.outbox".into())),
+        );
+    }
+    let [wallet, chain, outbox_id] = params else {
+        return set_component_result(
+            results,
+            component_host_err(HostError::Invalid(
+                "invalid bloom:tx.outbox inspect params".into(),
+            )),
+        );
+    };
+    let wallet = match component_string(wallet, "wallet") {
+        Ok(value) => value,
+        Err(err) => return set_component_result(results, component_host_err(err)),
+    };
+    let chain = match component_string(chain, "chain") {
+        Ok(value) => value,
+        Err(err) => return set_component_result(results, component_host_err(err)),
+    };
+    let outbox_id = match component_string(outbox_id, "outbox-id") {
+        Ok(value) => value,
+        Err(err) => return set_component_result(results, component_host_err(err)),
+    };
+    let host = store.data().host.clone();
+    match host
+        .evm_tx_inspect(wallet, chain, outbox_id, store.data().sign_context.clone())
+        .await
+    {
+        Ok(inspection) => {
+            set_component_result(results, component_evm_outbox_inspection(inspection))
+        }
+        Err(err) => set_component_result(results, component_host_err(err)),
+    }
+}
+
+fn component_evm_transaction_request(
+    fields: &[(String, ComponentVal)],
+    context: Option<V2SignContext>,
+) -> Result<EvmTransactionRequest, HostError> {
+    let string = |name| {
+        component_string_field(fields, name).map_err(|err| HostError::Invalid(err.to_string()))
+    };
+    let optional_u64 = |name| {
+        component_optional_u64_field(fields, name)
+            .map_err(|err| HostError::Invalid(err.to_string()))
+    };
+    let optional_string = |name| {
+        component_optional_string_field(fields, name)
+            .map_err(|err| HostError::Invalid(err.to_string()))
+    };
+    Ok(EvmTransactionRequest {
+        wallet: string("wallet")?,
+        chain: string("chain")?,
+        to: string("to")?,
+        value_wei: string("value-wei")?,
+        data_hex: string("data-hex")?,
+        nonce: optional_u64("nonce")?,
+        max_fee_per_gas: optional_string("max-fee-per-gas")?,
+        max_priority_fee_per_gas: optional_string("max-priority-fee-per-gas")?,
+        context,
+    })
+}
+
+fn component_evm_outbox_outcome(outcome: EvmOutboxOutcome) -> ComponentVal {
+    let approval = outcome.approval_required.map(|approval| {
+        Box::new(ComponentVal::Record(vec![
+            ("action-id".into(), ComponentVal::String(approval.action_id)),
+            (
+                "ceremony-url".into(),
+                ComponentVal::String(approval.ceremony_url),
+            ),
+            ("expires-ms".into(), ComponentVal::U64(approval.expires_ms)),
+        ]))
+    });
+    component_ok(Some(ComponentVal::Record(vec![
+        ("outbox-id".into(), ComponentVal::String(outcome.outbox_id)),
+        ("plan-md".into(), ComponentVal::String(outcome.plan_md)),
+        ("approval".into(), ComponentVal::Option(approval)),
+    ])))
+}
+
+fn component_evm_outbox_inspection(inspection: EvmOutboxInspection) -> ComponentVal {
+    component_ok(Some(ComponentVal::Record(vec![
+        (
+            "outbox-id".into(),
+            ComponentVal::String(inspection.outbox_id),
+        ),
+        ("state".into(), ComponentVal::String(inspection.state)),
+        (
+            "tx-hash".into(),
+            ComponentVal::Option(
+                inspection
+                    .tx_hash
+                    .map(|value| Box::new(ComponentVal::String(value))),
+            ),
+        ),
+        (
+            "receipt-json".into(),
+            ComponentVal::Option(
+                inspection
+                    .receipt_json
+                    .map(|value| Box::new(ComponentVal::String(value))),
+            ),
+        ),
+    ])))
 }
 
 async fn component_chain_call(
@@ -1258,7 +1522,9 @@ async fn component_chain_call(
         );
     }
     let req = match params {
-        [ComponentVal::Record(fields)] => component_chain_request(fields),
+        [ComponentVal::Record(fields)] => {
+            component_chain_request(fields, store.data().sign_context.clone())
+        }
         _ => Err(HostError::Invalid(
             "invalid bloom:chain.read call params".into(),
         )),
@@ -1577,11 +1843,15 @@ fn component_http_response(resp: crate::abi::HttpResponse) -> ComponentVal {
     ])
 }
 
-fn component_chain_request(fields: &[(String, ComponentVal)]) -> Result<ChainRequest, HostError> {
+fn component_chain_request(
+    fields: &[(String, ComponentVal)],
+    context: Option<V2SignContext>,
+) -> Result<ChainRequest, HostError> {
     Ok(ChainRequest {
         chain: component_record_string(fields, "chain")?,
         method: component_record_string(fields, "method")?,
         params_json: component_record_string(fields, "params-json")?,
+        context,
     })
 }
 
@@ -2105,6 +2375,9 @@ mod tests {
         )
     "#;
 
+    type TxConfirmCall = (String, String, String, bool, Option<V2SignContext>);
+    type TxInspectCall = (String, String, String, Option<V2SignContext>);
+
     #[derive(Default)]
     struct MockHost {
         store: Mutex<HashMap<String, Vec<u8>>>,
@@ -2112,6 +2385,11 @@ mod tests {
         vfs_reads: Mutex<Vec<String>>,
         http_calls: Mutex<Vec<HttpRequest>>,
         sign_calls: Mutex<Vec<SignRequest>>,
+        sign_outcome: Mutex<Option<SignOutcome>>,
+        tx_stage_calls: Mutex<Vec<EvmTransactionRequest>>,
+        tx_confirm_calls: Mutex<Vec<TxConfirmCall>>,
+        tx_inspect_calls: Mutex<Vec<TxInspectCall>>,
+        tx_outcome: Mutex<Option<EvmOutboxOutcome>>,
         chain_calls: Mutex<Vec<ChainRequest>>,
     }
 
@@ -2181,6 +2459,67 @@ mod tests {
         async fn sign_hash(&self, req: SignRequest) -> Result<Vec<u8>, HostError> {
             self.sign_calls.lock().push(req);
             Ok(vec![7u8; 65])
+        }
+
+        async fn sign_hash_outcome(&self, req: SignRequest) -> Result<SignOutcome, HostError> {
+            self.sign_calls.lock().push(req);
+            Ok(self
+                .sign_outcome
+                .lock()
+                .clone()
+                .unwrap_or_else(|| SignOutcome::Signature(vec![7u8; 65])))
+        }
+
+        async fn evm_tx_stage(
+            &self,
+            req: EvmTransactionRequest,
+        ) -> Result<EvmOutboxOutcome, HostError> {
+            self.tx_stage_calls.lock().push(req);
+            Ok(self.tx_outcome.lock().clone().unwrap_or(EvmOutboxOutcome {
+                outbox_id: "outbox-1".into(),
+                plan_md: "# transaction\n".into(),
+                approval_required: None,
+            }))
+        }
+
+        async fn evm_tx_confirm(
+            &self,
+            wallet: String,
+            chain: String,
+            outbox_id: String,
+            acknowledge_warnings: bool,
+            context: Option<V2SignContext>,
+        ) -> Result<EvmOutboxOutcome, HostError> {
+            self.tx_confirm_calls.lock().push((
+                wallet,
+                chain,
+                outbox_id,
+                acknowledge_warnings,
+                context,
+            ));
+            Ok(self.tx_outcome.lock().clone().unwrap_or(EvmOutboxOutcome {
+                outbox_id: "outbox-1".into(),
+                plan_md: "# transaction\n".into(),
+                approval_required: None,
+            }))
+        }
+
+        async fn evm_tx_inspect(
+            &self,
+            wallet: String,
+            chain: String,
+            outbox_id: String,
+            context: Option<V2SignContext>,
+        ) -> Result<EvmOutboxInspection, HostError> {
+            self.tx_inspect_calls
+                .lock()
+                .push((wallet, chain, outbox_id.clone(), context));
+            Ok(EvmOutboxInspection {
+                outbox_id,
+                state: "sent".into(),
+                tx_hash: Some(format!("0x{}", "ab".repeat(32))),
+                receipt_json: Some(r#"{"outcome":"success"}"#.into()),
+            })
         }
 
         async fn chain_read(&self, req: ChainRequest) -> Result<ChainResponse, HostError> {
@@ -2599,6 +2938,16 @@ mod tests {
         let mut caps = BTreeSet::new();
         caps.insert(Capability::Chain);
         let mut store = component_test_store(caps, None, host.clone());
+        let context = V2SignContext {
+            app_root: "reader".into(),
+            package_hash: "a".repeat(64),
+            route_id: "r000001".into(),
+            op: "read".into(),
+            path: "/balance.json".into(),
+            params: vec![],
+            actor: None,
+        };
+        store.data_mut().sign_context = Some(context.clone());
         let mut allowed = vec![ComponentVal::Bool(false)];
         component_chain_call(store.as_context_mut(), &[req], &mut allowed)
             .await
@@ -2610,6 +2959,7 @@ mod tests {
         assert_eq!(calls[0].chain, "polygon");
         assert_eq!(calls[0].method, "eth_call");
         assert_eq!(calls[0].params_json, r#"{"to":"0x1"}"#);
+        assert_eq!(calls[0].context, Some(context));
     }
 
     #[tokio::test]
@@ -2746,6 +3096,216 @@ paths = ["/status"]
             host.store.lock().get("wallets/bob.txt").cloned().unwrap(),
             b"bob"
         );
+    }
+
+    #[tokio::test]
+    async fn component_sign_v2_returns_machine_readable_approval_required() {
+        let host = Arc::new(MockHost::default());
+        *host.sign_outcome.lock() = Some(SignOutcome::ApprovalRequired(
+            crate::abi::ApprovalRequired {
+                action_id: "action-123".into(),
+                ceremony_url: "bloom://ceremony/action-123".into(),
+                expires_ms: 123_456,
+            },
+        ));
+        let mut caps = BTreeSet::new();
+        caps.insert(Capability::Sign);
+        let mut store = component_test_store(caps, None, host.clone());
+        let mut result = vec![ComponentVal::Bool(false)];
+
+        component_sign_hash_v2(
+            store.as_context_mut(),
+            &[
+                ComponentVal::String("alice".into()),
+                component_bytes(vec![3u8; 32]),
+                ComponentVal::String("orders.place".into()),
+            ],
+            &mut result,
+        )
+        .await
+        .unwrap();
+
+        let ComponentVal::Result(Ok(Some(value))) = &result[0] else {
+            panic!(
+                "expected successful structured sign result: {:?}",
+                result[0]
+            );
+        };
+        let ComponentVal::Variant(name, Some(record)) = value.as_ref() else {
+            panic!("expected approval-required variant: {value:?}");
+        };
+        assert_eq!(name, "approval-required");
+        let ComponentVal::Record(fields) = record.as_ref() else {
+            panic!("expected approval-required record: {record:?}");
+        };
+        assert_eq!(
+            fields,
+            &vec![
+                (
+                    "action-id".into(),
+                    ComponentVal::String("action-123".into())
+                ),
+                (
+                    "ceremony-url".into(),
+                    ComponentVal::String("bloom://ceremony/action-123".into()),
+                ),
+                ("expires-ms".into(), ComponentVal::U64(123_456)),
+            ]
+        );
+        assert_eq!(host.sign_calls.lock().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn component_sign_v2_preserves_signature_and_policy_checks() {
+        let host = Arc::new(MockHost::default());
+        let mut caps = BTreeSet::new();
+        caps.insert(Capability::Sign);
+        let mut store = component_test_store(caps, None, host.clone());
+        let params = [
+            ComponentVal::String("alice".into()),
+            component_bytes(vec![3u8; 32]),
+            ComponentVal::String("orders.place".into()),
+        ];
+        let mut result = vec![ComponentVal::Bool(false)];
+        component_sign_hash_v2(store.as_context_mut(), &params, &mut result)
+            .await
+            .unwrap();
+        let ComponentVal::Result(Ok(Some(value))) = &result[0] else {
+            panic!(
+                "expected successful structured sign result: {:?}",
+                result[0]
+            );
+        };
+        let ComponentVal::Variant(name, Some(signature)) = value.as_ref() else {
+            panic!("expected signature variant: {value:?}");
+        };
+        assert_eq!(name, "signature");
+        assert_eq!(
+            component_byte_list(signature, "signature").unwrap(),
+            vec![7u8; 65]
+        );
+
+        store.data_mut().sign_intents = Some(BTreeSet::from(["orders.cancel".to_string()]));
+        let mut denied = vec![ComponentVal::Bool(false)];
+        component_sign_hash_v2(store.as_context_mut(), &params, &mut denied)
+            .await
+            .unwrap();
+        assert_component_err_contains(&denied[0], "not allowed");
+        assert_eq!(host.sign_calls.lock().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn component_evm_outbox_is_capability_gated_and_preserves_trusted_context() {
+        let host = Arc::new(MockHost::default());
+        let transaction = ComponentVal::Record(vec![
+            ("wallet".into(), ComponentVal::String("alice".into())),
+            ("chain".into(), ComponentVal::String("polygon".into())),
+            (
+                "to".into(),
+                ComponentVal::String("0x0000000000000000000000000000000000000001".into()),
+            ),
+            ("value-wei".into(), ComponentVal::String("1".into())),
+            ("data-hex".into(), ComponentVal::String("0x".into())),
+            ("nonce".into(), ComponentVal::Option(None)),
+            ("max-fee-per-gas".into(), ComponentVal::Option(None)),
+            (
+                "max-priority-fee-per-gas".into(),
+                ComponentVal::Option(None),
+            ),
+        ]);
+        let mut denied_store = component_test_store(BTreeSet::new(), None, host.clone());
+        let mut denied = vec![ComponentVal::Bool(false)];
+        component_evm_tx_stage(
+            denied_store.as_context_mut(),
+            std::slice::from_ref(&transaction),
+            &mut denied,
+        )
+        .await
+        .unwrap();
+        assert_component_err_contains(&denied[0], "tx.outbox");
+        assert!(host.tx_stage_calls.lock().is_empty());
+
+        let context = V2SignContext {
+            app_root: "polymarket".into(),
+            package_hash: "a".repeat(64),
+            route_id: "r000001".into(),
+            op: "write".into(),
+            path: "/fund/alice/one/confirm".into(),
+            params: vec![("id".into(), "one".into())],
+            actor: Some("agent-1".into()),
+        };
+        *host.tx_outcome.lock() = Some(EvmOutboxOutcome {
+            outbox_id: "outbox-1".into(),
+            plan_md: "# transaction\n".into(),
+            approval_required: Some(crate::abi::ApprovalRequired {
+                action_id: "action-1".into(),
+                ceremony_url: "bloom://ceremony/action-1".into(),
+                expires_ms: 500,
+            }),
+        });
+        let mut caps = BTreeSet::new();
+        caps.insert(Capability::TxOutbox);
+        let mut store = component_test_store(caps, None, host.clone());
+        store.data_mut().sign_context = Some(context.clone());
+        let mut staged = vec![ComponentVal::Bool(false)];
+        component_evm_tx_stage(store.as_context_mut(), &[transaction], &mut staged)
+            .await
+            .unwrap();
+        let ComponentVal::Result(Ok(Some(value))) = &staged[0] else {
+            panic!("expected staged transaction: {:?}", staged[0]);
+        };
+        let ComponentVal::Record(fields) = value.as_ref() else {
+            panic!("expected staged record: {value:?}");
+        };
+        assert_eq!(
+            component_string(component_field(fields, "outbox-id").unwrap(), "outbox-id").unwrap(),
+            "outbox-1"
+        );
+        let ComponentVal::Option(Some(approval)) = component_field(fields, "approval").unwrap()
+        else {
+            panic!("expected structured approval: {fields:?}");
+        };
+        let ComponentVal::Record(approval_fields) = approval.as_ref() else {
+            panic!("expected approval record: {approval:?}");
+        };
+        assert_eq!(
+            component_string(
+                component_field(approval_fields, "action-id").unwrap(),
+                "action-id"
+            )
+            .unwrap(),
+            "action-1"
+        );
+        {
+            let calls = host.tx_stage_calls.lock();
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0].context, Some(context.clone()));
+            assert_eq!(calls[0].value_wei, "1");
+        }
+
+        let mut inspected = vec![ComponentVal::Bool(false)];
+        component_evm_tx_inspect(
+            store.as_context_mut(),
+            &[
+                ComponentVal::String("alice".into()),
+                ComponentVal::String("polygon".into()),
+                ComponentVal::String("outbox-1".into()),
+            ],
+            &mut inspected,
+        )
+        .await
+        .unwrap();
+        let ComponentVal::Result(Ok(Some(inspection))) = &inspected[0] else {
+            panic!("expected inspection: {:?}", inspected[0]);
+        };
+        let ComponentVal::Record(inspection) = inspection.as_ref() else {
+            panic!("expected inspection record");
+        };
+        assert_eq!(
+            component_string(component_field(inspection, "state").unwrap(), "state").unwrap(),
+            "sent"
+        );
+        assert_eq!(host.tx_inspect_calls.lock()[0].3, Some(context));
     }
 
     #[tokio::test]

@@ -1886,9 +1886,11 @@ impl EvmSealedIntentSubject {
         validate_required("wallet", &self.wallet)?;
         validate_required("surface", &self.surface)?;
         validate_required("account", &self.account)?;
-        if self.petal_id != petal_identity::PETAL_ID_EVM_WALLET {
+        if self.petal_id != petal_identity::PETAL_ID_EVM_WALLET
+            && !is_local_app_petal_id(&self.petal_id)
+        {
             return Err(AuthApiError::InvalidSubject(
-                "EVM sealed intent petal_id must be evm-wallet".into(),
+                "EVM sealed intent petal_id must be evm-wallet or a local app".into(),
             ));
         }
         if self.petal_digest.trim().is_empty() || self.petal_version.trim().is_empty() {
@@ -2101,9 +2103,11 @@ impl EvmSigningAttestationFacts {
                 "EVM attestation intent mismatch".into(),
             ));
         }
-        if attestation.petal_id != petal_identity::PETAL_ID_EVM_WALLET {
+        if attestation.petal_id != petal_identity::PETAL_ID_EVM_WALLET
+            && !is_local_app_petal_id(&attestation.petal_id)
+        {
             return Err(AuthApiError::Denied(
-                "EVM attestation petal_id mismatch".into(),
+                "EVM attestation petal_id must be evm-wallet or a local app".into(),
             ));
         }
         let typed = Self::from_facts_map(&attestation.facts)?;
@@ -2134,9 +2138,11 @@ impl EvmSigningAttestationFacts {
         validate_required("account", &self.account).map_err(denied_from_invalid)?;
         validate_required("to", &self.to).map_err(denied_from_invalid)?;
         validate_required("method", &self.method).map_err(denied_from_invalid)?;
-        if self.petal_id != petal_identity::PETAL_ID_EVM_WALLET {
+        if self.petal_id != petal_identity::PETAL_ID_EVM_WALLET
+            && !is_local_app_petal_id(&self.petal_id)
+        {
             return Err(AuthApiError::Denied(
-                "EVM attestation petal_id must be evm-wallet".into(),
+                "EVM attestation petal_id must be evm-wallet or a local app".into(),
             ));
         }
         validate_required("petal_digest", &self.petal_digest).map_err(denied_from_invalid)?;
@@ -2604,12 +2610,13 @@ impl SigningAttestationSchemaRegistry for DefaultAttestationRegistry {
                 attestation.petal_id, attestation.intent
             )));
         }
-        if is_local_app_petal_id(&attestation.petal_id) {
-            LocalAppSigningAttestationFacts::from_attestation(attestation)?;
-        } else if attestation.petal_id == petal_identity::PETAL_ID_EVM_WALLET
-            && attestation.intent == EVM_TX_SIGN_INTENT
+        if attestation.intent == EVM_TX_SIGN_INTENT
+            && (attestation.petal_id == petal_identity::PETAL_ID_EVM_WALLET
+                || is_local_app_petal_id(&attestation.petal_id))
         {
             EvmSigningAttestationFacts::from_attestation(attestation)?;
+        } else if is_local_app_petal_id(&attestation.petal_id) {
+            LocalAppSigningAttestationFacts::from_attestation(attestation)?;
         } else if attestation.petal_id == petal_identity::PETAL_ID_POLYMARKET {
             PolymarketSigningAttestationFacts::from_attestation(attestation)?;
         }
@@ -4937,6 +4944,27 @@ mod tests {
         subject.daemon_terms_digest = subject.daemon_terms.daemon_terms_digest().unwrap();
         let err = subject.validate_evm().unwrap_err();
         assert!(err.to_string().contains("one-shot"), "{err}");
+    }
+
+    #[test]
+    fn evm_typed_subject_and_attestation_allow_local_app_provenance() {
+        let mut subject = evm_typed_subject();
+        subject.petal_id = "local-app:polymarket".into();
+        subject.petal_digest = "a".repeat(64);
+        subject.petal_version = "v2-package".into();
+        subject.policy_snapshot.petal_id = subject.petal_id.clone();
+        subject.policy_snapshot.petal_digest = subject.petal_digest.clone();
+        subject.policy_snapshot_digest = subject.policy_snapshot.petal_policy_digest().unwrap();
+
+        subject.validate_evm().unwrap();
+        let attestation = subject
+            .signing_attestation_facts()
+            .signing_attestation()
+            .unwrap();
+        EvmSigningAttestationFacts::from_attestation(&attestation).unwrap();
+        DefaultAttestationRegistry::new()
+            .validate_attestation(&attestation)
+            .unwrap();
     }
 
     #[test]

@@ -8,7 +8,10 @@
 
 use async_trait::async_trait;
 
-use crate::abi::{ChainRequest, ChainResponse, HttpRequest, HttpResponse, SignRequest};
+use crate::abi::{
+    ChainRequest, ChainResponse, EvmOutboxInspection, EvmOutboxOutcome, EvmTransactionRequest,
+    HttpRequest, HttpResponse, SignOutcome, SignRequest, V2SignContext,
+};
 use crate::policy::NetPolicy;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -81,6 +84,46 @@ pub trait PetalHost: Send + Sync {
     /// Default-deny; keys never cross into the petal.
     async fn sign_hash(&self, _req: SignRequest) -> Result<Vec<u8>, HostError> {
         Err(HostError::Denied("sign_hash".into()))
+    }
+
+    /// Structured component signing result for `bloom:sign/signing@0.2.0`.
+    /// Hosts that have not opted into staged approval retain the v0.1 behavior.
+    async fn sign_hash_outcome(&self, req: SignRequest) -> Result<SignOutcome, HostError> {
+        self.sign_hash(req).await.map(SignOutcome::Signature)
+    }
+
+    /// Stage a generic EVM transaction in the daemon outbox. Hosts default to
+    /// deny so a package cannot gain transaction authority merely by importing
+    /// the WIT interface.
+    async fn evm_tx_stage(
+        &self,
+        _req: EvmTransactionRequest,
+    ) -> Result<EvmOutboxOutcome, HostError> {
+        Err(HostError::Denied("evm_tx_stage".into()))
+    }
+
+    /// Confirm a previously staged generic EVM transaction. Transaction bytes
+    /// are always read from the persisted outbox entry, not component input.
+    async fn evm_tx_confirm(
+        &self,
+        _wallet: String,
+        _chain: String,
+        _outbox_id: String,
+        _acknowledge_warnings: bool,
+        _context: Option<V2SignContext>,
+    ) -> Result<EvmOutboxOutcome, HostError> {
+        Err(HostError::Denied("evm_tx_confirm".into()))
+    }
+
+    /// Inspect an outbox entry owned by the trusted route package.
+    async fn evm_tx_inspect(
+        &self,
+        _wallet: String,
+        _chain: String,
+        _outbox_id: String,
+        _context: Option<V2SignContext>,
+    ) -> Result<EvmOutboxInspection, HostError> {
+        Err(HostError::Denied("evm_tx_inspect".into()))
     }
 
     /// Perform a daemon-mediated chain read. Default-deny; production hosts
@@ -179,6 +222,7 @@ mod tests {
                 chain: "polygon".into(),
                 method: "eth_call".into(),
                 params_json: "{}".into(),
+                context: None,
             })
             .await,
             Err(HostError::Denied(_))

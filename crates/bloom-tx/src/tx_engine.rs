@@ -56,6 +56,7 @@ sol! {
         ) external;
     }
 }
+use bloom_proto::plan::ExecutionOrigin;
 use bloom_proto::{
     AddressBook, ChainSpec, HomeWritePermit, NftAction, NftRef, Policy, RawIntent, RawIntentBody,
     StagedTx, TokenRef, TxStatus, parse_amount, parse_eth, parse_units,
@@ -93,6 +94,8 @@ pub enum TxEngineError {
     Address(String),
     #[error("amount: {0}")]
     Amount(String),
+    #[error("invalid EIP-1559 fee override: {0}")]
+    InvalidFeeOverride(String),
     #[error("policy denied")]
     PolicyDenied,
     #[error("broadcast disabled for chain '{0}' (set allow_broadcast=true)")]
@@ -156,6 +159,57 @@ struct SignedRawTx {
 enum UnsignedEvmTx {
     Legacy(TxLegacy),
     Eip1559(TxEip1559),
+}
+
+/// A complete, validated EIP-1559 fee override pair.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Eip1559FeeOverrides {
+    max_fee_per_gas: u128,
+    max_priority_fee_per_gas: u128,
+}
+
+impl Eip1559FeeOverrides {
+    pub fn from_decimal_pair(
+        max_fee_per_gas: Option<&str>,
+        max_priority_fee_per_gas: Option<&str>,
+        legacy_chain: bool,
+    ) -> Result<Option<Self>, TxEngineError> {
+        let (Some(max_fee), Some(priority_fee)) = (max_fee_per_gas, max_priority_fee_per_gas)
+        else {
+            if max_fee_per_gas.is_some() || max_priority_fee_per_gas.is_some() {
+                return Err(TxEngineError::InvalidFeeOverride(
+                    "max fee and max priority fee must be supplied together".into(),
+                ));
+            }
+            return Ok(None);
+        };
+        if legacy_chain {
+            return Err(TxEngineError::InvalidFeeOverride(
+                "EIP-1559 overrides are not valid for a legacy transaction chain".into(),
+            ));
+        }
+        let parse = |field: &str, value: &str| {
+            if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+                return Err(TxEngineError::InvalidFeeOverride(format!(
+                    "{field} must be an unsigned decimal integer"
+                )));
+            }
+            value
+                .parse::<u128>()
+                .map_err(|_| TxEngineError::InvalidFeeOverride(format!("{field} exceeds u128")))
+        };
+        let max_fee_per_gas = parse("max-fee-per-gas", max_fee)?;
+        let max_priority_fee_per_gas = parse("max-priority-fee-per-gas", priority_fee)?;
+        if max_priority_fee_per_gas > max_fee_per_gas {
+            return Err(TxEngineError::InvalidFeeOverride(
+                "max priority fee exceeds max fee".into(),
+            ));
+        }
+        Ok(Some(Self {
+            max_fee_per_gas,
+            max_priority_fee_per_gas,
+        }))
+    }
 }
 
 struct PreparedEvmTx {
@@ -955,8 +1009,75 @@ impl TxEngine {
         policy: &Policy,
         address_book: Option<&AddressBook>,
     ) -> Result<StagedTx, TxEngineError> {
+        self.stage_with_execution_origin(
+            permit,
+            wallet,
+            from,
+            intent,
+            chain,
+            policy,
+            address_book,
+            None,
+        )
+        .await
+    }
+
+    /// Stage an EVM transaction with trusted Petal provenance supplied by the
+    /// caller that owns the execution surface. Native wallet staging passes no
+    /// origin and therefore retains the default `evm-wallet` identity.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn stage_with_execution_origin(
+        &self,
+        permit: &HomeWritePermit,
+        wallet: &str,
+        from: Address,
+        intent: RawIntent,
+        chain: &ChainClient,
+        policy: &Policy,
+        address_book: Option<&AddressBook>,
+        execution_origin: Option<ExecutionOrigin>,
+    ) -> Result<StagedTx, TxEngineError> {
+        self.stage_with_execution_origin_and_fee_overrides(
+            permit,
+            wallet,
+            from,
+            intent,
+            chain,
+            policy,
+            address_book,
+            execution_origin,
+            None,
+        )
+        .await
+    }
+
+    /// Stage with trusted provenance and an optional complete EIP-1559 fee
+    /// pair. The override is used for estimation, review, sealing, and signing.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn stage_with_execution_origin_and_fee_overrides(
+        &self,
+        permit: &HomeWritePermit,
+        wallet: &str,
+        from: Address,
+        intent: RawIntent,
+        chain: &ChainClient,
+        policy: &Policy,
+        address_book: Option<&AddressBook>,
+        execution_origin: Option<ExecutionOrigin>,
+        fee_overrides: Option<Eip1559FeeOverrides>,
+    ) -> Result<StagedTx, TxEngineError> {
+        if let Some(origin) = &execution_origin {
+            origin
+                .validate()
+                .map_err(TxEngineError::BroadcastApprovalRequired)?;
+        }
         self.assert_write_permit(permit)?;
         let spec: &ChainSpec = chain.spec();
+        if spec.legacy_tx && fee_overrides.is_some() {
+            return Err(TxEngineError::InvalidFeeOverride(
+                "EIP-1559 overrides are not valid for a legacy transaction chain".into(),
+            ));
+        }
         let chain_id = chain.chain_id().await?;
 
         // (to, value_wei, data_hex, optional token / nft metadata for plan)
@@ -1053,8 +1174,10 @@ impl TxEngine {
                 1_000_000_000
             }
         };
-        let max_fee = gas_price.saturating_mul(2);
-        let prio = (gas_price / 10).max(1);
+        let (max_fee, prio) = fee_overrides.map_or_else(
+            || (gas_price.saturating_mul(2), (gas_price / 10).max(1)),
+            |fees| (fees.max_fee_per_gas, fees.max_priority_fee_per_gas),
+        );
 
         let mut req = TransactionRequest::default()
             .with_from(from)
@@ -1261,6 +1384,7 @@ impl TxEngine {
             usd_value: policy_ctx.usd_value,
             depends_on: None,
             action_id: None,
+            execution_origin,
         };
         staged.policy_checks = policy_engine::evaluate(
             policy,
@@ -2182,6 +2306,7 @@ impl TxEngine {
             usd_value: None,
             depends_on: None,
             action_id: Some(session_id.to_string()),
+            execution_origin: None,
         };
         let unsigned = self.build_unsigned_evm_tx(&staged, chain)?;
         let signing_hash = Self::unsigned_signing_hash(&unsigned);
@@ -2237,25 +2362,20 @@ impl TxEngine {
         })?;
         let header = &sealed.envelope.header;
         match (
-            header.petal_id.as_str(),
-            header.petal_digest.as_str(),
             sealed.envelope.subject_kind.as_str(),
             header.action_kind.as_str(),
         ) {
             (
-                PETAL_ID_EVM_WALLET,
-                PLACEHOLDER_DIGEST_EVM_WALLET,
                 EVM_SEALED_INTENT_SUBJECT_KIND,
                 "confirm" | "replace" | "cancel" | "owner_session_use",
             ) => {
                 self.execute_evm_wallet_sealed_subject(sealed, chain_name, chain, policy)
                     .await
             }
-            (petal_id, petal_digest, subject_kind, action_kind) => {
-                Err(TxEngineError::BroadcastApprovalRequired(format!(
-                    "no sealed-action executor registered for petal_id={petal_id} petal_digest={petal_digest} subject_kind={subject_kind} action_kind={action_kind}"
-                )))
-            }
+            (subject_kind, action_kind) => Err(TxEngineError::BroadcastApprovalRequired(format!(
+                "no sealed-action executor registered for petal_id={} petal_digest={} subject_kind={subject_kind} action_kind={action_kind}",
+                header.petal_id, header.petal_digest,
+            ))),
         }
     }
 
@@ -2285,7 +2405,13 @@ impl TxEngine {
             };
             let staged = &entry.staged;
             let matches = staged.action_id.as_deref() == Some(action_id)
-                || format!("{}:{}", staged.chain_id, staged.id) == action_id;
+                || [
+                    EvmOutboxActionKind::Confirm,
+                    EvmOutboxActionKind::Replace,
+                    EvmOutboxActionKind::Cancel,
+                ]
+                .into_iter()
+                .any(|kind| outbox_action_id(staged, kind) == action_id);
             if matches {
                 return Some(entry);
             }
@@ -2459,6 +2585,9 @@ impl TxEngine {
             TxEngineError::BroadcastApprovalRequired(format!("invalid EVM sealed subject: {e}"))
         })?;
         self.ensure_evm_subject_matches_seal(sealed, &subject)?;
+        if subject.surface == "outbox" {
+            self.ensure_evm_subject_matches_persisted_origin(chain_name, &subject)?;
+        }
         if chain.spec().chain_id != subject.chain_id {
             return Err(TxEngineError::BroadcastApprovalRequired(format!(
                 "sealed action chain mismatch: subject {}, chain {}",
@@ -2517,6 +2646,11 @@ impl TxEngine {
                 .map(|micro| micro as f64 / 1_000_000.0),
             depends_on: None,
             action_id: Some(subject.action_id.clone()),
+            execution_origin: Some(ExecutionOrigin {
+                petal_id: subject.petal_id.clone(),
+                petal_digest: subject.petal_digest.clone(),
+                petal_version: subject.petal_version.clone(),
+            }),
         };
         let unsigned = self.build_unsigned_evm_tx(&staged, chain)?;
         let signing_hash = Self::unsigned_signing_hash(&unsigned);
@@ -2650,6 +2784,49 @@ impl TxEngine {
             return Err(TxEngineError::BroadcastApprovalRequired(
                 "sealed Petal policy does not match EVM subject".into(),
             ));
+        }
+        Ok(())
+    }
+
+    fn ensure_evm_subject_matches_persisted_origin(
+        &self,
+        chain_name: &str,
+        subject: &EvmSealedIntentSubject,
+    ) -> Result<(), TxEngineError> {
+        let entry = self
+            .find_pending_entry_for_action(&subject.wallet, chain_name, &subject.action_id)
+            .ok_or_else(|| {
+                TxEngineError::BroadcastApprovalRequired(
+                    "sealed EVM action has no pending staged transaction with persisted execution origin"
+                        .into(),
+                )
+            })?;
+        let origin = entry.staged.resolved_execution_origin();
+        origin
+            .validate()
+            .map_err(TxEngineError::BroadcastApprovalRequired)?;
+        for (field, expected, actual) in [
+            (
+                "petal_id",
+                origin.petal_id.as_str(),
+                subject.petal_id.as_str(),
+            ),
+            (
+                "petal_digest",
+                origin.petal_digest.as_str(),
+                subject.petal_digest.as_str(),
+            ),
+            (
+                "petal_version",
+                origin.petal_version.as_str(),
+                subject.petal_version.as_str(),
+            ),
+        ] {
+            if expected != actual {
+                return Err(TxEngineError::BroadcastApprovalRequired(format!(
+                    "sealed EVM {field} does not match persisted execution origin: sealed={actual} persisted={expected}"
+                )));
+            }
         }
         Ok(())
     }
@@ -2954,12 +3131,16 @@ impl TxEngine {
             )
         })?;
         let action_id = outbox_action_id(staged, action_kind);
+        let execution_origin = staged.resolved_execution_origin();
+        execution_origin
+            .validate()
+            .map_err(TxEngineError::BroadcastApprovalRequired)?;
         if grant_store
             .get_active(
                 &staged.wallet,
                 &action_id,
-                PETAL_ID_EVM_WALLET,
-                PLACEHOLDER_DIGEST_EVM_WALLET,
+                &execution_origin.petal_id,
+                &execution_origin.petal_digest,
                 now_ms() as u64,
             )
             .await
@@ -3771,12 +3952,16 @@ fn evm_sealed_subject(
         "evm.signing_hash_source".into(),
         serde_json::json!("sealed_evm_unsigned_tx"),
     );
+    let execution_origin = staged.resolved_execution_origin();
+    execution_origin
+        .validate()
+        .map_err(TxEngineError::BroadcastApprovalRequired)?;
 
     let mut policy_snapshot = PetalPolicySnapshot {
         policy_version: 0,
         wallet: staged.wallet.clone(),
-        petal_id: PETAL_ID_EVM_WALLET.into(),
-        petal_digest: PLACEHOLDER_DIGEST_EVM_WALLET.into(),
+        petal_id: execution_origin.petal_id.clone(),
+        petal_digest: execution_origin.petal_digest.clone(),
         caps: BTreeMap::new(),
         hard_rules: Vec::new(),
         step_up_rules: Vec::new(),
@@ -3819,9 +4004,9 @@ fn evm_sealed_subject(
         action_id: outbox_action_id(staged, action_kind),
         wallet: staged.wallet.clone(),
         surface: "outbox".into(),
-        petal_id: PETAL_ID_EVM_WALLET.into(),
-        petal_digest: PLACEHOLDER_DIGEST_EVM_WALLET.into(),
-        petal_version: FIRST_PARTY_PETAL_VERSION_V0.into(),
+        petal_id: execution_origin.petal_id,
+        petal_digest: execution_origin.petal_digest,
+        petal_version: execution_origin.petal_version,
         action_kind: action_kind.sealed_action_kind(),
         chain_id: staged.chain_id,
         account: staged.from.clone(),
@@ -4447,6 +4632,7 @@ mod tests {
             usd_value: None,
             depends_on: None,
             action_id: None,
+            execution_origin: None,
         }
     }
 
@@ -4638,6 +4824,40 @@ mod tests {
             err.contains("sealed subject bytes do not reproduce"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn local_app_execution_origin_binds_evm_sealed_subject_and_executor_match() {
+        let (engine, _spec, _dir) = fake_engine(60_000);
+        let mut staged = fake_staged_1559("0001-local-origin");
+        staged.action_id = Some("local-origin-action".into());
+        staged.execution_origin = Some(ExecutionOrigin {
+            petal_id: "local-app:polymarket".into(),
+            petal_digest: "a".repeat(64),
+            petal_version: "v2-package".into(),
+        });
+        engine.outbox.write_pending(&staged, "# plan").unwrap();
+
+        let subject =
+            evm_sealed_subject(&staged, EvmOutboxActionKind::Confirm, &test_signing_hash())
+                .unwrap();
+        assert_eq!(subject.petal_id, "local-app:polymarket");
+        assert_eq!(subject.petal_digest, "a".repeat(64));
+        assert_eq!(subject.petal_version, "v2-package");
+        assert_eq!(subject.policy_snapshot.petal_id, subject.petal_id);
+        assert_eq!(subject.policy_snapshot.petal_digest, subject.petal_digest);
+
+        engine
+            .ensure_evm_subject_matches_persisted_origin("anvil", &subject)
+            .unwrap();
+
+        let mut mismatched = subject;
+        mismatched.petal_digest = "b".repeat(64);
+        let err = engine
+            .ensure_evm_subject_matches_persisted_origin("anvil", &mismatched)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("petal_digest does not match persisted execution origin"));
     }
 
     #[tokio::test]
@@ -6334,5 +6554,31 @@ mod tests {
     #[test]
     fn f64_to_micro_usd_rejects_overflow() {
         assert_eq!(f64_to_micro_usd(f64::MAX), None);
+    }
+
+    #[test]
+    fn eip1559_fee_overrides_require_a_complete_decimal_ordered_pair() {
+        assert_eq!(
+            Eip1559FeeOverrides::from_decimal_pair(Some("100"), Some("10"), false).unwrap(),
+            Some(Eip1559FeeOverrides {
+                max_fee_per_gas: 100,
+                max_priority_fee_per_gas: 10,
+            })
+        );
+        assert!(
+            Eip1559FeeOverrides::from_decimal_pair(None, None, false)
+                .unwrap()
+                .is_none()
+        );
+
+        for result in [
+            Eip1559FeeOverrides::from_decimal_pair(Some("100"), None, false),
+            Eip1559FeeOverrides::from_decimal_pair(None, Some("10"), false),
+            Eip1559FeeOverrides::from_decimal_pair(Some("1e2"), Some("10"), false),
+            Eip1559FeeOverrides::from_decimal_pair(Some("100"), Some("101"), false),
+            Eip1559FeeOverrides::from_decimal_pair(Some("100"), Some("10"), true),
+        ] {
+            assert!(matches!(result, Err(TxEngineError::InvalidFeeOverride(_))));
+        }
     }
 }

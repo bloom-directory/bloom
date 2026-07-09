@@ -519,6 +519,7 @@ fn v2_capability(cap: &str) -> Option<Capability> {
         "bloom:store" => Some(Capability::Store),
         "bloom:sign" => Some(Capability::Sign),
         "bloom:chain" => Some(Capability::Chain),
+        "bloom:tx.outbox" => Some(Capability::TxOutbox),
         "bloom:vfs.read" => Some(Capability::VfsRead),
         "bloom:vfs.write" => Some(Capability::VfsWrite),
         _ => Capability::parse(cap),
@@ -836,6 +837,7 @@ name = "echo"
     #[test]
     fn v2_capability_maps_chain_to_local_host_capability() {
         assert_eq!(v2_capability("bloom:chain"), Some(Capability::Chain));
+        assert_eq!(v2_capability("bloom:tx.outbox"), Some(Capability::TxOutbox));
     }
 
     #[test]

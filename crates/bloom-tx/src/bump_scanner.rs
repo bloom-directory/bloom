@@ -272,6 +272,7 @@ mod tests {
             usd_value: None,
             depends_on: None,
             action_id: None,
+            execution_origin: None,
         }
     }
 

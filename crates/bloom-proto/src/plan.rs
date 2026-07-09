@@ -3,6 +3,10 @@
 
 use serde::{Deserialize, Serialize};
 
+use bloom_auth_api::petal_identity::{
+    FIRST_PARTY_PETAL_VERSION_V0, PETAL_ID_EVM_WALLET, PLACEHOLDER_DIGEST_EVM_WALLET,
+};
+
 use crate::policy::PolicyCheck;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -27,6 +31,42 @@ impl std::fmt::Display for TxStatus {
             TxStatus::Cancelled => "cancelled",
         };
         f.write_str(s)
+    }
+}
+
+/// Trusted application identity that originated an EVM execution request.
+///
+/// Older staged transactions omit this field and resolve to the native EVM
+/// wallet identity through [`Default`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExecutionOrigin {
+    pub petal_id: String,
+    pub petal_digest: String,
+    pub petal_version: String,
+}
+
+impl Default for ExecutionOrigin {
+    fn default() -> Self {
+        Self {
+            petal_id: PETAL_ID_EVM_WALLET.into(),
+            petal_digest: PLACEHOLDER_DIGEST_EVM_WALLET.into(),
+            petal_version: FIRST_PARTY_PETAL_VERSION_V0.into(),
+        }
+    }
+}
+
+impl ExecutionOrigin {
+    pub fn validate(&self) -> Result<(), String> {
+        for (field, value) in [
+            ("petal_id", self.petal_id.as_str()),
+            ("petal_digest", self.petal_digest.as_str()),
+            ("petal_version", self.petal_version.as_str()),
+        ] {
+            if value.trim().is_empty() {
+                return Err(format!("execution origin {field} is empty"));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -82,6 +122,18 @@ pub struct StagedTx {
     /// EVM entry to its unified action record.
     #[serde(default)]
     pub action_id: Option<String>,
+    /// Optional trusted Petal provenance for EVM execution. Missing origins in
+    /// historical `intent.json` entries resolve to the native EVM wallet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_origin: Option<ExecutionOrigin>,
+}
+
+impl StagedTx {
+    /// Resolve the persisted execution origin, preserving native behavior for
+    /// entries serialized before execution provenance existed.
+    pub fn resolved_execution_origin(&self) -> ExecutionOrigin {
+        self.execution_origin.clone().unwrap_or_default()
+    }
 }
 
 /// Lightweight token reference embedded in a `StagedTx` for display.
@@ -288,6 +340,7 @@ mod tests {
             usd_value: None,
             depends_on: None,
             action_id: None,
+            execution_origin: None,
         }
     }
 
@@ -462,6 +515,11 @@ Write `y` to `confirm` to broadcast, `cancel` to discard, `override` to bypass s
         assert!(staged.token.is_none());
         assert!(staged.tx_hash.is_none());
         assert!(staged.usd_value.is_none());
+        assert!(staged.execution_origin.is_none());
+        assert_eq!(
+            staged.resolved_execution_origin(),
+            ExecutionOrigin::default()
+        );
 
         // Round-trip back.
         let s = serde_json::to_string(&staged).unwrap();

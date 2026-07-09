@@ -2096,19 +2096,17 @@ fn component_route_type_import(name: &str) -> Option<&'static str> {
 
 fn component_import_caps(name: &str) -> Option<&'static [&'static str]> {
     let (package, interface, version) = component_import_package_interface(name)?;
-    if version != "0.1.0" {
-        return None;
-    }
     match (package, interface) {
-        ("bloom:route", "types") => Some(&[]),
-        ("bloom:http", "fetch") => Some(&["bloom:http"]),
-        ("bloom:store", "kv") => Some(&["bloom:store"]),
-        ("bloom:sign", "signing") => Some(&["bloom:sign"]),
-        // Fail closed until the production daemon host mediates chain reads.
-        // The VM can link this interface for future/runtime tests, but v2
-        // install validation must not accept apps that will deny at runtime.
-        ("bloom:vfs", "readwrite") => Some(&["bloom:vfs.read", "bloom:vfs.write"]),
-        ("bloom:env", "runtime") => Some(&[]),
+        ("bloom:route", "types") if version == "0.1.0" => Some(&[]),
+        ("bloom:http", "fetch") if version == "0.1.0" => Some(&["bloom:http"]),
+        ("bloom:store", "kv") if version == "0.1.0" => Some(&["bloom:store"]),
+        ("bloom:sign", "signing") if matches!(version, "0.1.0" | "0.2.0") => Some(&["bloom:sign"]),
+        ("bloom:tx", "outbox") if version == "0.1.0" => Some(&["bloom:tx.outbox"]),
+        ("bloom:chain", "read") if version == "0.1.0" => Some(&["bloom:chain"]),
+        ("bloom:vfs", "readwrite") if version == "0.1.0" => {
+            Some(&["bloom:vfs.read", "bloom:vfs.write"])
+        }
+        ("bloom:env", "runtime") if version == "0.1.0" => Some(&[]),
         _ => None,
     }
 }
@@ -2118,6 +2116,8 @@ enum ComponentHostInterface {
     HttpFetch,
     StoreKv,
     SignSigning,
+    SignSigningV2,
+    TxOutbox,
     ChainRead,
     VfsReadwrite,
     EnvRuntime,
@@ -2125,16 +2125,21 @@ enum ComponentHostInterface {
 
 fn component_host_interface(name: &str) -> Option<ComponentHostInterface> {
     let (package, interface, version) = component_import_package_interface(name)?;
-    if version != "0.1.0" {
-        return None;
-    }
     match (package, interface) {
-        ("bloom:http", "fetch") => Some(ComponentHostInterface::HttpFetch),
-        ("bloom:store", "kv") => Some(ComponentHostInterface::StoreKv),
-        ("bloom:sign", "signing") => Some(ComponentHostInterface::SignSigning),
-        ("bloom:chain", "read") => Some(ComponentHostInterface::ChainRead),
-        ("bloom:vfs", "readwrite") => Some(ComponentHostInterface::VfsReadwrite),
-        ("bloom:env", "runtime") => Some(ComponentHostInterface::EnvRuntime),
+        ("bloom:http", "fetch") if version == "0.1.0" => Some(ComponentHostInterface::HttpFetch),
+        ("bloom:store", "kv") if version == "0.1.0" => Some(ComponentHostInterface::StoreKv),
+        ("bloom:sign", "signing") if version == "0.1.0" => {
+            Some(ComponentHostInterface::SignSigning)
+        }
+        ("bloom:sign", "signing") if version == "0.2.0" => {
+            Some(ComponentHostInterface::SignSigningV2)
+        }
+        ("bloom:tx", "outbox") if version == "0.1.0" => Some(ComponentHostInterface::TxOutbox),
+        ("bloom:chain", "read") if version == "0.1.0" => Some(ComponentHostInterface::ChainRead),
+        ("bloom:vfs", "readwrite") if version == "0.1.0" => {
+            Some(ComponentHostInterface::VfsReadwrite)
+        }
+        ("bloom:env", "runtime") if version == "0.1.0" => Some(ComponentHostInterface::EnvRuntime),
         _ => None,
     }
 }
@@ -2369,6 +2374,12 @@ enum HostTypeExport {
     ChainResponse,
     VfsEntryKind,
     VfsEntry,
+    EvmTransaction,
+    OutboxApprovalRequired,
+    StagedTransaction,
+    OutboxInspection,
+    SignApprovalRequired,
+    SignResultV2,
 }
 
 #[derive(Clone, Copy)]
@@ -2381,6 +2392,10 @@ enum HostFuncExport {
     StoreDelete,
     StoreDeleteIfValue,
     SignHash,
+    SignHashV2,
+    EvmTxStage,
+    EvmTxConfirm,
+    EvmTxInspect,
     ChainCall,
     VfsLookup,
     VfsList,
@@ -2459,6 +2474,22 @@ fn host_type_export(interface: ComponentHostInterface, name: &str) -> Option<Hos
         (ComponentHostInterface::ChainRead, "response") => Some(HostTypeExport::ChainResponse),
         (ComponentHostInterface::VfsReadwrite, "entry-kind") => Some(HostTypeExport::VfsEntryKind),
         (ComponentHostInterface::VfsReadwrite, "entry") => Some(HostTypeExport::VfsEntry),
+        (ComponentHostInterface::TxOutbox, "evm-transaction") => {
+            Some(HostTypeExport::EvmTransaction)
+        }
+        (ComponentHostInterface::TxOutbox, "approval-required") => {
+            Some(HostTypeExport::OutboxApprovalRequired)
+        }
+        (ComponentHostInterface::TxOutbox, "staged-transaction") => {
+            Some(HostTypeExport::StagedTransaction)
+        }
+        (ComponentHostInterface::TxOutbox, "inspection") => Some(HostTypeExport::OutboxInspection),
+        (ComponentHostInterface::SignSigningV2, "approval-required") => {
+            Some(HostTypeExport::SignApprovalRequired)
+        }
+        (ComponentHostInterface::SignSigningV2, "sign-result") => {
+            Some(HostTypeExport::SignResultV2)
+        }
         _ => None,
     }
 }
@@ -2475,6 +2506,10 @@ fn host_func_export(interface: ComponentHostInterface, name: &str) -> Option<Hos
             Some(HostFuncExport::StoreDeleteIfValue)
         }
         (ComponentHostInterface::SignSigning, "sign-hash") => Some(HostFuncExport::SignHash),
+        (ComponentHostInterface::SignSigningV2, "sign-hash") => Some(HostFuncExport::SignHashV2),
+        (ComponentHostInterface::TxOutbox, "stage") => Some(HostFuncExport::EvmTxStage),
+        (ComponentHostInterface::TxOutbox, "confirm") => Some(HostFuncExport::EvmTxConfirm),
+        (ComponentHostInterface::TxOutbox, "inspect") => Some(HostFuncExport::EvmTxInspect),
         (ComponentHostInterface::ChainRead, "call") => Some(HostFuncExport::ChainCall),
         (ComponentHostInterface::VfsReadwrite, "lookup") => Some(HostFuncExport::VfsLookup),
         (ComponentHostInterface::VfsReadwrite, "list") => Some(HostFuncExport::VfsList),
@@ -2495,6 +2530,13 @@ fn required_host_type_exports(interface: ComponentHostInterface) -> &'static [&'
         ComponentHostInterface::VfsReadwrite => &["entry-kind", "entry"],
         ComponentHostInterface::EnvRuntime => &[],
         ComponentHostInterface::StoreKv | ComponentHostInterface::SignSigning => &[],
+        ComponentHostInterface::SignSigningV2 => &["approval-required", "sign-result"],
+        ComponentHostInterface::TxOutbox => &[
+            "evm-transaction",
+            "approval-required",
+            "staged-transaction",
+            "inspection",
+        ],
     }
 }
 
@@ -2505,6 +2547,8 @@ fn required_host_func_exports(interface: ComponentHostInterface) -> &'static [&'
             &["get", "put", "put-new", "list", "delete", "delete-if-value"]
         }
         ComponentHostInterface::SignSigning => &["sign-hash"],
+        ComponentHostInterface::SignSigningV2 => &["sign-hash"],
+        ComponentHostInterface::TxOutbox => &["stage", "confirm", "inspect"],
         ComponentHostInterface::ChainRead => &["call"],
         ComponentHostInterface::VfsReadwrite => &["lookup", "list", "read", "write"],
         ComponentHostInterface::EnvRuntime => &["now-ms", "random-bytes"],
@@ -2524,6 +2568,12 @@ fn host_type_export_matches(
         HostTypeExport::ChainResponse => is_chain_response(&ty, types, 0),
         HostTypeExport::VfsEntryKind => is_entry_kind(&ty, types, 0),
         HostTypeExport::VfsEntry => is_route_entry(&ty, types, 0),
+        HostTypeExport::EvmTransaction => is_evm_transaction(&ty, types, 0),
+        HostTypeExport::OutboxApprovalRequired => is_outbox_approval_required(&ty, types, 0),
+        HostTypeExport::StagedTransaction => is_staged_transaction(&ty, types, 0),
+        HostTypeExport::OutboxInspection => is_outbox_inspection(&ty, types, 0),
+        HostTypeExport::SignApprovalRequired => is_approval_required(&ty, types, 0),
+        HostTypeExport::SignResultV2 => is_sign_result_v2(&ty, types, 0),
     }
 }
 
@@ -2609,6 +2659,44 @@ fn host_func_export_matches(
                 ],
             ) && result_matches(&ty.result, types, HostOkType::Bytes)
         }
+        HostFuncExport::SignHashV2 => {
+            params_match(
+                params,
+                types,
+                &[
+                    ("wallet", is_string_type),
+                    ("hash32", is_byte_list),
+                    ("intent", is_string_type),
+                ],
+            ) && result_matches(&ty.result, types, HostOkType::SignResultV2)
+        }
+        HostFuncExport::EvmTxStage => {
+            params_match(params, types, &[("tx", is_evm_transaction)])
+                && result_matches(&ty.result, types, HostOkType::StagedTransaction)
+        }
+        HostFuncExport::EvmTxConfirm => {
+            params_match(
+                params,
+                types,
+                &[
+                    ("wallet", is_string_type),
+                    ("chain", is_string_type),
+                    ("outbox-id", is_string_type),
+                    ("acknowledge-warnings", is_bool_type),
+                ],
+            ) && result_matches(&ty.result, types, HostOkType::StagedTransaction)
+        }
+        HostFuncExport::EvmTxInspect => {
+            params_match(
+                params,
+                types,
+                &[
+                    ("wallet", is_string_type),
+                    ("chain", is_string_type),
+                    ("outbox-id", is_string_type),
+                ],
+            ) && result_matches(&ty.result, types, HostOkType::OutboxInspection)
+        }
         HostFuncExport::ChainCall => {
             params_match(params, types, &[("req", is_chain_request)])
                 && result_matches(&ty.result, types, HostOkType::ChainResponse)
@@ -2669,6 +2757,9 @@ enum HostOkType {
     VfsEntry,
     VfsEntryList,
     U64,
+    SignResultV2,
+    StagedTransaction,
+    OutboxInspection,
 }
 
 fn result_matches(
@@ -2693,9 +2784,131 @@ fn result_matches(
             (HostOkType::VfsEntry, Some(ty)) => is_route_entry(ty, types, depth),
             (HostOkType::VfsEntryList, Some(ty)) => is_list_of(ty, types, is_route_entry, depth),
             (HostOkType::U64, Some(ty)) => is_u64(ty, types, depth),
+            (HostOkType::SignResultV2, Some(ty)) => is_sign_result_v2(ty, types, depth),
+            (HostOkType::StagedTransaction, Some(ty)) => is_staged_transaction(ty, types, depth),
+            (HostOkType::OutboxInspection, Some(ty)) => is_outbox_inspection(ty, types, depth),
             _ => false,
         };
         ok_matches && err.is_some_and(|ty| is_string(&ty))
+    })
+}
+
+fn is_sign_result_v2(
+    ty: &ComponentValType,
+    types: &[ComponentTypeEntry<'_>],
+    depth: usize,
+) -> bool {
+    with_defined_type(ty, types, depth, |defined, types, depth| {
+        let ComponentDefinedType::Variant(cases) = defined else {
+            return false;
+        };
+        cases.as_ref().len() == 2
+            && cases[0].name == "signature"
+            && cases[0]
+                .ty
+                .as_ref()
+                .is_some_and(|ty| is_byte_list(ty, types, depth))
+            && cases[1].name == "approval-required"
+            && cases[1]
+                .ty
+                .as_ref()
+                .is_some_and(|ty| is_approval_required(ty, types, depth))
+    })
+}
+
+fn is_approval_required(
+    ty: &ComponentValType,
+    types: &[ComponentTypeEntry<'_>],
+    depth: usize,
+) -> bool {
+    with_defined_type(ty, types, depth, |defined, types, depth| {
+        let ComponentDefinedType::Record(fields) = defined else {
+            return false;
+        };
+        fields.as_ref().len() == 3
+            && fields[0].0 == "action-id"
+            && is_string(&fields[0].1)
+            && fields[1].0 == "ceremony-url"
+            && is_string(&fields[1].1)
+            && fields[2].0 == "expires-ms"
+            && is_u64(&fields[2].1, types, depth)
+    })
+}
+
+fn is_evm_transaction(
+    ty: &ComponentValType,
+    types: &[ComponentTypeEntry<'_>],
+    depth: usize,
+) -> bool {
+    with_defined_type(ty, types, depth, |defined, types, depth| {
+        let ComponentDefinedType::Record(fields) = defined else {
+            return false;
+        };
+        fields.as_ref().len() == 8
+            && fields[0].0 == "wallet"
+            && is_string(&fields[0].1)
+            && fields[1].0 == "chain"
+            && is_string(&fields[1].1)
+            && fields[2].0 == "to"
+            && is_string(&fields[2].1)
+            && fields[3].0 == "value-wei"
+            && is_string(&fields[3].1)
+            && fields[4].0 == "data-hex"
+            && is_string(&fields[4].1)
+            && fields[5].0 == "nonce"
+            && is_option_of(&fields[5].1, types, is_u64, depth)
+            && fields[6].0 == "max-fee-per-gas"
+            && is_option_of(&fields[6].1, types, is_string_type, depth)
+            && fields[7].0 == "max-priority-fee-per-gas"
+            && is_option_of(&fields[7].1, types, is_string_type, depth)
+    })
+}
+
+fn is_outbox_approval_required(
+    ty: &ComponentValType,
+    types: &[ComponentTypeEntry<'_>],
+    depth: usize,
+) -> bool {
+    is_approval_required(ty, types, depth)
+}
+
+fn is_staged_transaction(
+    ty: &ComponentValType,
+    types: &[ComponentTypeEntry<'_>],
+    depth: usize,
+) -> bool {
+    with_defined_type(ty, types, depth, |defined, types, depth| {
+        let ComponentDefinedType::Record(fields) = defined else {
+            return false;
+        };
+        fields.as_ref().len() == 3
+            && fields[0].0 == "outbox-id"
+            && is_string(&fields[0].1)
+            && fields[1].0 == "plan-md"
+            && is_string(&fields[1].1)
+            && fields[2].0 == "approval"
+            && is_option_of(&fields[2].1, types, is_outbox_approval_required, depth)
+    })
+}
+
+fn is_outbox_inspection(
+    ty: &ComponentValType,
+    types: &[ComponentTypeEntry<'_>],
+    depth: usize,
+) -> bool {
+    with_defined_type(ty, types, depth, |defined, types, depth| {
+        let ComponentDefinedType::Record(fields) = defined else {
+            return false;
+        };
+        fields.as_ref().len() == 4
+            && fields[0].0 == "outbox-id"
+            && is_string(&fields[0].1)
+            && fields[1].0 == "state"
+            && is_string(&fields[1].1)
+            && fields[2].0 == "tx-hash"
+            && is_option_of(&fields[2].1, types, is_string_type, depth)
+            && fields[3].0 == "receipt-json"
+            && is_option_of(&fields[3].1, types, is_string_type, depth)
     })
 }
 
@@ -4283,21 +4496,12 @@ allowed = ["bloom:http"]
     }
 
     #[test]
-    fn v2_component_chain_imports_fail_closed_until_host_exists() {
-        let tmp = tempfile::tempdir().unwrap();
-        write_v2_package_with_manifest_and_route(
-            tmp.path(),
-            br#"schema = "bloom.petal.local-app.v2"
-name = "echo"
-[caps]
-allowed = ["bloom:chain"]
-"#,
-            &route_component(&["metadata", "read"], &["bloom:chain/read@0.1.0"]),
+    fn v2_component_chain_import_requires_declared_chain_capability() {
+        assert_eq!(
+            component_import_caps("bloom:chain/read@0.1.0"),
+            Some(&["bloom:chain" as &str][..])
         );
-
-        let err = PreparedAppPackage::from_dir(tmp.path()).unwrap_err();
-        assert!(err.to_string().contains("unsupported host item"));
-        assert!(err.to_string().contains("bloom:chain/read@0.1.0"));
+        assert_eq!(component_import_caps("bloom:chain/read@0.2.0"), None);
     }
 
     #[test]
@@ -4315,6 +4519,52 @@ allowed = ["bloom:http"]
 
         let err = PreparedAppPackage::from_dir(tmp.path()).unwrap_err();
         assert!(err.to_string().contains("unsupported host item"));
+    }
+
+    #[test]
+    fn v2_component_signing_v2_is_allowed_but_other_versions_fail_closed() {
+        assert_eq!(
+            component_import_caps("bloom:sign/signing@0.2.0"),
+            Some(&["bloom:sign"][..])
+        );
+        assert!(matches!(
+            component_host_interface("bloom:sign/signing@0.2.0"),
+            Some(ComponentHostInterface::SignSigningV2)
+        ));
+        assert!(component_import_caps("bloom:sign/signing@0.3.0").is_none());
+        assert!(component_host_interface("bloom:sign/signing@0.3.0").is_none());
+    }
+
+    #[test]
+    fn v2_component_signing_v2_requires_its_exported_nominal_types() {
+        let interface = ComponentHostInterface::SignSigningV2;
+        assert!(matches!(
+            host_type_export(interface, "approval-required"),
+            Some(HostTypeExport::SignApprovalRequired)
+        ));
+        assert!(matches!(
+            host_type_export(interface, "sign-result"),
+            Some(HostTypeExport::SignResultV2)
+        ));
+        assert_eq!(
+            required_host_type_exports(interface),
+            ["approval-required", "sign-result"]
+        );
+    }
+
+    #[test]
+    fn v2_component_outbox_requires_inspection_type_and_function() {
+        let interface = ComponentHostInterface::TxOutbox;
+        assert!(matches!(
+            host_type_export(interface, "inspection"),
+            Some(HostTypeExport::OutboxInspection)
+        ));
+        assert!(matches!(
+            host_func_export(interface, "inspect"),
+            Some(HostFuncExport::EvmTxInspect)
+        ));
+        assert!(required_host_type_exports(interface).contains(&"inspection"));
+        assert!(required_host_func_exports(interface).contains(&"inspect"));
     }
 
     #[test]

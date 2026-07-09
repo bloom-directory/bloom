@@ -21,8 +21,9 @@ pub mod v2;
 pub mod vm;
 
 pub use abi::{
-    DispatchEntry, DispatchEntryKind, DispatchOp, DispatchRequest, DispatchResponse, HttpRequest,
-    HttpResponse, SignRequest, decode_dispatch_request, decode_dispatch_response,
+    ApprovalRequired, DispatchEntry, DispatchEntryKind, DispatchOp, DispatchRequest,
+    DispatchResponse, EvmOutboxInspection, EvmOutboxOutcome, EvmTransactionRequest, HttpRequest,
+    HttpResponse, SignOutcome, SignRequest, decode_dispatch_request, decode_dispatch_response,
     decode_http_request, decode_http_response, decode_sign_request, decode_string_list,
     encode_dispatch_request, encode_dispatch_response, encode_http_request, encode_http_response,
     encode_sign_request, encode_string_list,

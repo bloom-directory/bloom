@@ -16,6 +16,9 @@ mod price_oracle;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use alloy::network::TransactionBuilder;
+use alloy::primitives::{Address, Bytes, U256};
+use alloy::rpc::types::eth::TransactionRequest;
 use base64::Engine as _;
 use bloom_auth::{AuthStore, StoreApprovalVerifier};
 use bloom_auth_api::{
@@ -33,21 +36,27 @@ use bloom_etherscan::EtherscanClient;
 use bloom_hyperliquid::{HyperliquidClient, HyperliquidNetwork};
 use bloom_keystore::{Keystore, KeystoreApprovalSignatureVerifier};
 use bloom_paid_http::PaidHttpChainRpcResolver;
-use bloom_petals::abi::V2SignContext;
+use bloom_petals::abi::{
+    ApprovalRequired, ChainRequest, ChainResponse, EvmOutboxInspection, EvmOutboxOutcome,
+    EvmTransactionRequest, V2SignContext,
+};
 use bloom_petals::{
     HostError, HostVfsEntry, HttpRequest, HttpResponse, LateVfsHost, NameRegistry, NetPolicy,
-    PetalHost, PetalRouter, PetalRunner, PetalStore, PetalVm, SignRequest,
+    PetalHost, PetalRouter, PetalRunner, PetalStore, PetalVm, SignOutcome, SignRequest,
 };
 use bloom_polymarket::{ClobClient, CredentialStore, DataClient, GammaClient};
 use bloom_prices::PricesClient;
 use bloom_proto::audit::AuditRecord;
-use bloom_proto::{AddressBook, AuditLog, ChainSpec, Config, HomeDir, HomeWritePermit};
+use bloom_proto::{
+    AddressBook, AuditLog, ChainSpec, Config, GasStrategy, HomeDir, HomeWritePermit, RawIntent,
+    RawIntentBody,
+};
 use bloom_revert::{
     AbiSource, BuiltinDecoder, DecoderChain, EtherscanAbiDecoder, EtherscanAbiSource,
     OpenchainDecoder, boxed,
 };
-use bloom_tx::outbox::{CentralActionIdentity, CentralOutboxProjection, Outbox};
-use bloom_tx::tx_engine::TxEngine;
+use bloom_tx::outbox::{CentralActionIdentity, CentralOutboxProjection, Outbox, OutboxState};
+use bloom_tx::tx_engine::{Eip1559FeeOverrides, TxEngine};
 use bloom_vfs::handlers::outbox::StagedPetalIdentity;
 use bloom_vfs::handlers::polymarket::{ChainClientReader, PolymarketOnboarding, build_onboarder};
 use bloom_vfs::handlers::status::{MempoolBackendStatus, PrivateRpcBackendStatus};
@@ -183,6 +192,17 @@ struct DaemonPetalHost {
     http: reqwest::Client,
     audit: Arc<AuditLog>,
     auth_services: AuthServices,
+    tx_outbox: Option<PetalTxOutbox>,
+    tx_stage_lock: tokio::sync::Mutex<()>,
+}
+
+#[derive(Clone)]
+struct PetalTxOutbox {
+    tx_engine: TxEngine,
+    chains: ChainRegistry,
+    keystore: Keystore,
+    address_book: Arc<AddressBook>,
+    write_permit: Option<Arc<HomeWritePermit>>,
 }
 
 impl DaemonPetalHost {
@@ -197,7 +217,41 @@ impl DaemonPetalHost {
             http,
             audit,
             auth_services,
+            tx_outbox: None,
+            tx_stage_lock: tokio::sync::Mutex::new(()),
         }
+    }
+
+    fn with_tx_outbox(mut self, tx_outbox: PetalTxOutbox) -> Self {
+        self.tx_outbox = Some(tx_outbox);
+        self
+    }
+
+    fn local_app_execution_origin(
+        context: &V2SignContext,
+    ) -> Result<bloom_proto::plan::ExecutionOrigin, HostError> {
+        if context.app_root.trim().is_empty()
+            || context.route_id.trim().is_empty()
+            || context.path.trim().is_empty()
+            || !bloom_petals::store::is_valid_hex_hash(&context.package_hash)
+            || !matches!(context.op.as_str(), "lookup" | "list" | "read" | "write")
+        {
+            return Err(HostError::Invalid(
+                "trusted v2 route context is incomplete or has an invalid package hash".into(),
+            ));
+        }
+        let route_binding = blake3::hash(
+            format!("{}\0{}\0{}", context.route_id, context.op, context.path).as_bytes(),
+        );
+        Ok(bloom_proto::plan::ExecutionOrigin {
+            petal_id: format!(
+                "{LOCAL_APP_PETAL_ID_PREFIX}{}:route:{}",
+                context.app_root,
+                route_binding.to_hex()
+            ),
+            petal_digest: context.package_hash.clone(),
+            petal_version: "v2-package".into(),
+        })
     }
 
     fn local_app_action(
@@ -622,6 +676,16 @@ impl PetalHost for DaemonPetalHost {
     }
 
     async fn sign_hash(&self, req: SignRequest) -> Result<Vec<u8>, HostError> {
+        match self.sign_hash_outcome(req).await? {
+            SignOutcome::Signature(signature) => Ok(signature),
+            SignOutcome::ApprovalRequired(approval) => Err(HostError::Denied(format!(
+                "Sealed Approval required for v2 petal sign_hash; action_id={}; ceremony_url={}",
+                approval.action_id, approval.ceremony_url
+            ))),
+        }
+    }
+
+    async fn sign_hash_outcome(&self, req: SignRequest) -> Result<SignOutcome, HostError> {
         let Some(context) = req.context.as_ref() else {
             let err = HostError::Denied(
                 "v2 petal sign_hash requires trusted v2 route context and a Sealed Approval grant"
@@ -678,13 +742,16 @@ impl PetalHost for DaemonPetalHost {
                     HostError::Backend(format!("issue local-app approval challenge: {e}"))
                 })?
                 .with_local_ceremony_url();
-            let ceremony_url = challenge.ceremony_url.as_deref().unwrap_or("unavailable");
-            let err = HostError::Denied(format!(
-                "Sealed Approval required for v2 petal sign_hash; action_id={}; ceremony_url={ceremony_url}",
-                action.action_id(),
-            ));
-            self.audit_sign_hash(&req, "approval_required", Some(&err.to_string()));
-            return Err(err);
+            let ceremony_url = challenge
+                .ceremony_url
+                .unwrap_or_else(|| "unavailable".into());
+            let approval = SignOutcome::ApprovalRequired(ApprovalRequired {
+                action_id: action.action_id().to_string(),
+                ceremony_url,
+                expires_ms: action.expires_ms,
+            });
+            self.audit_sign_hash(&req, "approval_required", None);
+            return Ok(approval);
         }
 
         let signature = self
@@ -713,8 +780,456 @@ impl PetalHost for DaemonPetalHost {
             return Err(err);
         }
         self.audit_sign_hash(&req, "ok", None);
-        Ok(signature)
+        Ok(SignOutcome::Signature(signature))
     }
+
+    async fn evm_tx_stage(
+        &self,
+        req: EvmTransactionRequest,
+    ) -> Result<EvmOutboxOutcome, HostError> {
+        let context = req.context.as_ref().ok_or_else(|| {
+            HostError::Denied("v2 petal EVM outbox requires trusted v2 route context".into())
+        })?;
+        let origin = Self::local_app_execution_origin(context)?;
+        let service = self
+            .tx_outbox
+            .as_ref()
+            .ok_or_else(|| HostError::Denied("EVM outbox is unavailable".into()))?;
+        let permit = service
+            .write_permit
+            .as_deref()
+            .ok_or_else(|| HostError::Denied("EVM outbox requires daemon write permit".into()))?;
+        if req.value_wei.is_empty() || !req.value_wei.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err(HostError::Invalid(
+                "value-wei must be an unsigned decimal integer".into(),
+            ));
+        }
+        if !req.data_hex.starts_with("0x")
+            || !req.data_hex.len().is_multiple_of(2)
+            || req.data_hex != req.data_hex.to_ascii_lowercase()
+            || hex::decode(&req.data_hex[2..]).is_err()
+        {
+            return Err(HostError::Invalid(
+                "data-hex must be canonical 0x-prefixed hex".into(),
+            ));
+        }
+        let wallet = service
+            .keystore
+            .info(&req.wallet)
+            .map_err(|e| HostError::Invalid(format!("wallet: {e}")))?;
+        let chain = service
+            .chains
+            .get(&req.chain)
+            .ok_or_else(|| HostError::NotFound(format!("chain {}", req.chain)))?;
+        let fee_overrides = Eip1559FeeOverrides::from_decimal_pair(
+            req.max_fee_per_gas.as_deref(),
+            req.max_priority_fee_per_gas.as_deref(),
+            chain.spec().legacy_tx,
+        )
+        .map_err(|error| HostError::Invalid(error.to_string()))?;
+        let requested_to = req
+            .to
+            .parse::<Address>()
+            .map_err(|error| HostError::Invalid(format!("to address: {error}")))?;
+        let requested_value = req
+            .value_wei
+            .parse::<U256>()
+            .map_err(|error| HostError::Invalid(format!("value-wei: {error}")))?;
+        // Keep pending-action reuse and staging atomic within the daemon. Without
+        // this guard, concurrent retries can both miss the pending scan.
+        let _stage_guard = self.tx_stage_lock.lock().await;
+        for pending_id in service
+            .tx_engine
+            .outbox
+            .list(&req.wallet, &req.chain, OutboxState::Pending)
+            .map_err(|error| HostError::Backend(format!("list pending EVM outbox: {error}")))?
+        {
+            let entry = service
+                .tx_engine
+                .outbox
+                .read_in_state(&req.wallet, &req.chain, &pending_id, OutboxState::Pending)
+                .map_err(|error| HostError::Backend(format!("read pending EVM outbox: {error}")))?;
+            if petal_pending_request_matches(
+                &entry.staged,
+                &req,
+                &origin,
+                requested_to,
+                requested_value,
+            ) {
+                return petal_outbox_outcome(
+                    &service.tx_engine,
+                    &req.wallet,
+                    &req.chain,
+                    &pending_id,
+                    None,
+                );
+            }
+        }
+        let staged = service
+            .tx_engine
+            .stage_with_execution_origin_and_fee_overrides(
+                permit,
+                &req.wallet,
+                wallet.address,
+                RawIntent {
+                    body: RawIntentBody::Raw {
+                        to: req.to,
+                        value: format!("{} wei", req.value_wei),
+                        data: req.data_hex,
+                    },
+                    chain: Some(req.chain.clone()),
+                    gas: GasStrategy::Auto,
+                    nonce: req.nonce,
+                    gas_limit_hint: None,
+                    usd_value_hint: None,
+                },
+                &chain,
+                &wallet.policy,
+                Some(service.address_book.as_ref()),
+                Some(origin),
+                fee_overrides,
+            )
+            .await
+            .map_err(|e| HostError::Backend(format!("stage EVM outbox: {e}")))?;
+        petal_outbox_outcome(
+            &service.tx_engine,
+            &req.wallet,
+            &req.chain,
+            &staged.id,
+            None,
+        )
+    }
+
+    async fn evm_tx_confirm(
+        &self,
+        wallet: String,
+        chain_name: String,
+        outbox_id: String,
+        acknowledge_warnings: bool,
+        context: Option<V2SignContext>,
+    ) -> Result<EvmOutboxOutcome, HostError> {
+        let context = context.as_ref().ok_or_else(|| {
+            HostError::Denied("v2 petal EVM outbox requires trusted v2 route context".into())
+        })?;
+        let origin = Self::local_app_execution_origin(context)?;
+        let service = self
+            .tx_outbox
+            .as_ref()
+            .ok_or_else(|| HostError::Denied("EVM outbox is unavailable".into()))?;
+        let permit = service
+            .write_permit
+            .as_deref()
+            .ok_or_else(|| HostError::Denied("EVM outbox requires daemon write permit".into()))?;
+        let entry = service
+            .tx_engine
+            .outbox
+            .read(&wallet, &chain_name, &outbox_id)
+            .map_err(|e| HostError::NotFound(format!("outbox {outbox_id}: {e}")))?;
+        if entry.staged.resolved_execution_origin() != origin {
+            return Err(HostError::Denied(
+                "outbox entry was not staged by this trusted local app".into(),
+            ));
+        }
+        let wallet_info = service
+            .keystore
+            .info(&wallet)
+            .map_err(|e| HostError::Invalid(format!("wallet: {e}")))?;
+        let chain = service
+            .chains
+            .get(&chain_name)
+            .ok_or_else(|| HostError::NotFound(format!("chain {chain_name}")))?;
+        match service
+            .tx_engine
+            .confirm(
+                permit,
+                &wallet,
+                &chain_name,
+                &outbox_id,
+                &chain,
+                &wallet_info.policy,
+                if acknowledge_warnings {
+                    wallet_info.policy.override_sentinel()
+                } else {
+                    "y"
+                },
+            )
+            .await
+        {
+            Ok(_) => {
+                petal_outbox_outcome(&service.tx_engine, &wallet, &chain_name, &outbox_id, None)
+            }
+            Err(error) if error.to_string().contains("Sealed Approval") => petal_outbox_outcome(
+                &service.tx_engine,
+                &wallet,
+                &chain_name,
+                &outbox_id,
+                Some(error.to_string()),
+            ),
+            Err(error) => Err(HostError::Backend(format!("confirm EVM outbox: {error}"))),
+        }
+    }
+
+    async fn evm_tx_inspect(
+        &self,
+        wallet: String,
+        chain_name: String,
+        outbox_id: String,
+        context: Option<V2SignContext>,
+    ) -> Result<EvmOutboxInspection, HostError> {
+        let context = context.as_ref().ok_or_else(|| {
+            HostError::Denied("v2 petal EVM outbox requires trusted v2 route context".into())
+        })?;
+        let origin = Self::local_app_execution_origin(context)?;
+        let service = self
+            .tx_outbox
+            .as_ref()
+            .ok_or_else(|| HostError::Denied("EVM outbox is unavailable".into()))?;
+        let entry = service
+            .tx_engine
+            .outbox
+            .read(&wallet, &chain_name, &outbox_id)
+            .map_err(|e| HostError::NotFound(format!("outbox {outbox_id}: {e}")))?;
+        if entry.staged.resolved_execution_origin() != origin {
+            return Err(HostError::Denied(
+                "outbox entry was not staged by this trusted local app".into(),
+            ));
+        }
+        let receipt = service
+            .tx_engine
+            .outbox
+            .read_receipt(&wallet, &chain_name, &outbox_id)
+            .map_err(|e| HostError::Backend(format!("read EVM outbox receipt: {e}")))?;
+        let state = receipt
+            .as_ref()
+            .map(|receipt| receipt.outcome.clone())
+            .unwrap_or_else(|| entry.staged.status.to_string());
+        let receipt_json = receipt
+            .map(|receipt| serde_json::to_string(&receipt))
+            .transpose()
+            .map_err(|e| HostError::Backend(format!("encode EVM outbox receipt: {e}")))?;
+        Ok(EvmOutboxInspection {
+            outbox_id,
+            state,
+            tx_hash: entry.staged.tx_hash,
+            receipt_json,
+        })
+    }
+
+    async fn chain_read(&self, req: ChainRequest) -> Result<ChainResponse, HostError> {
+        let context = req.context.as_ref().ok_or_else(|| {
+            HostError::Denied("v2 petal chain read requires trusted v2 route context".into())
+        })?;
+        Self::local_app_execution_origin(context)?;
+        let service = self
+            .tx_outbox
+            .as_ref()
+            .ok_or_else(|| HostError::Denied("chain reads are unavailable".into()))?;
+        let chain = service
+            .chains
+            .get(&req.chain)
+            .ok_or_else(|| HostError::NotFound(format!("chain {}", req.chain)))?;
+        let result_json = daemon_petal_chain_read(&chain, &req.method, &req.params_json).await?;
+        Ok(ChainResponse { result_json })
+    }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PetalEthCall {
+    to: String,
+    #[serde(default)]
+    from: Option<String>,
+    #[serde(default)]
+    value: Option<String>,
+    #[serde(default)]
+    data: Option<String>,
+    #[serde(default)]
+    input: Option<String>,
+}
+
+async fn daemon_petal_chain_read(
+    chain: &ChainClient,
+    method: &str,
+    params_json: &str,
+) -> Result<String, HostError> {
+    let params: Vec<serde_json::Value> = serde_json::from_str(params_json)
+        .map_err(|e| HostError::Invalid(format!("chain params-json must be an array: {e}")))?;
+    let result = match method {
+        "eth_chainId" if params.is_empty() => format!(
+            "0x{:x}",
+            chain
+                .chain_id()
+                .await
+                .map_err(|e| HostError::Backend(format!("chain id: {e}")))?
+        ),
+        "eth_getBalance" if matches!(params.len(), 1 | 2) => {
+            require_latest_block_param(&params, 1)?;
+            let address = parse_petal_address(&params[0], "eth_getBalance address")?;
+            let balance = chain
+                .balance(address)
+                .await
+                .map_err(|e| HostError::Backend(format!("native balance: {e}")))?;
+            format!("{balance:#x}")
+        }
+        "eth_call" if matches!(params.len(), 1 | 2) => {
+            require_latest_block_param(&params, 1)?;
+            let call: PetalEthCall = serde_json::from_value(params[0].clone())
+                .map_err(|e| HostError::Invalid(format!("invalid eth_call request: {e}")))?;
+            if call.data.is_some() && call.input.is_some() {
+                return Err(HostError::Invalid(
+                    "eth_call must not supply both data and input".into(),
+                ));
+            }
+            let to = call
+                .to
+                .parse::<Address>()
+                .map_err(|e| HostError::Invalid(format!("eth_call to address: {e}")))?;
+            let mut tx = TransactionRequest::default().with_to(to);
+            if let Some(from) = call.from {
+                tx = tx.with_from(
+                    from.parse::<Address>()
+                        .map_err(|e| HostError::Invalid(format!("eth_call from address: {e}")))?,
+                );
+            }
+            if let Some(value) = call.value {
+                tx = tx.with_value(parse_petal_hex_quantity(&value, "eth_call value")?);
+            }
+            let input = call.data.or(call.input).unwrap_or_else(|| "0x".into());
+            tx = tx.with_input(Bytes::from(parse_petal_hex_bytes(&input, "eth_call data")?));
+            let bytes = chain
+                .eth_call_at_block(tx, Some("latest"))
+                .await
+                .map_err(|e| HostError::Backend(format!("eth_call: {e}")))?;
+            format!("0x{}", hex::encode(bytes))
+        }
+        "eth_chainId" | "eth_getBalance" | "eth_call" => {
+            return Err(HostError::Invalid(format!(
+                "invalid {method} parameters; only latest-block reads are allowed"
+            )));
+        }
+        _ => {
+            return Err(HostError::Denied(format!(
+                "chain method {method} is not in the read-only allowlist"
+            )));
+        }
+    };
+    serde_json::to_string(&result)
+        .map_err(|e| HostError::Backend(format!("encode chain response: {e}")))
+}
+
+fn require_latest_block_param(params: &[serde_json::Value], index: usize) -> Result<(), HostError> {
+    if let Some(block) = params.get(index)
+        && block.as_str() != Some("latest")
+    {
+        return Err(HostError::Denied(
+            "only latest-block chain reads are allowed".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn parse_petal_address(value: &serde_json::Value, field: &str) -> Result<Address, HostError> {
+    value
+        .as_str()
+        .ok_or_else(|| HostError::Invalid(format!("{field} must be a string")))?
+        .parse::<Address>()
+        .map_err(|e| HostError::Invalid(format!("{field}: {e}")))
+}
+
+fn parse_petal_hex_quantity(value: &str, field: &str) -> Result<U256, HostError> {
+    if !value.starts_with("0x") || value.len() < 3 {
+        return Err(HostError::Invalid(format!(
+            "{field} must be a 0x-prefixed hex quantity"
+        )));
+    }
+    value
+        .parse::<U256>()
+        .map_err(|e| HostError::Invalid(format!("{field}: {e}")))
+}
+
+fn parse_petal_hex_bytes(value: &str, field: &str) -> Result<Vec<u8>, HostError> {
+    let Some(value) = value.strip_prefix("0x") else {
+        return Err(HostError::Invalid(format!(
+            "{field} must be canonical 0x-prefixed hex"
+        )));
+    };
+    if !value.len().is_multiple_of(2) {
+        return Err(HostError::Invalid(format!(
+            "{field} must have an even number of hex digits"
+        )));
+    }
+    hex::decode(value).map_err(|e| HostError::Invalid(format!("{field}: {e}")))
+}
+
+fn petal_pending_request_matches(
+    staged: &bloom_proto::StagedTx,
+    request: &EvmTransactionRequest,
+    origin: &bloom_proto::plan::ExecutionOrigin,
+    requested_to: Address,
+    requested_value: U256,
+) -> bool {
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or(u128::MAX);
+    staged.expires_ms > now_ms
+        && staged.resolved_execution_origin() == *origin
+        && staged.to.parse::<Address>().ok() == Some(requested_to)
+        && staged.value_wei.parse::<U256>().ok() == Some(requested_value)
+        && staged.data_hex == request.data_hex
+        && request.nonce.is_none_or(|nonce| staged.nonce == nonce)
+        && request
+            .max_fee_per_gas
+            .as_ref()
+            .is_none_or(|fee| decimal_strings_equal(staged.max_fee_per_gas.as_deref(), fee))
+        && request.max_priority_fee_per_gas.as_ref().is_none_or(|fee| {
+            decimal_strings_equal(staged.max_priority_fee_per_gas.as_deref(), fee)
+        })
+}
+
+fn decimal_strings_equal(stored: Option<&str>, requested: &str) -> bool {
+    match (
+        stored.and_then(|value| value.parse::<U256>().ok()),
+        requested.parse::<U256>().ok(),
+    ) {
+        (Some(stored), Some(requested)) => stored == requested,
+        _ => false,
+    }
+}
+
+fn petal_outbox_outcome(
+    tx_engine: &TxEngine,
+    wallet: &str,
+    chain: &str,
+    outbox_id: &str,
+    approval_error: Option<String>,
+) -> Result<EvmOutboxOutcome, HostError> {
+    let entry = tx_engine
+        .outbox
+        .read(wallet, chain, outbox_id)
+        .map_err(|e| HostError::Backend(format!("read staged EVM outbox: {e}")))?;
+    let plan_md = std::fs::read_to_string(entry.dir.join("plan.md"))
+        .map_err(|e| HostError::Backend(format!("read staged EVM plan: {e}")))?;
+    let approval_required = approval_error
+        .map(|_| {
+            let bytes = std::fs::read(entry.dir.join("approval_challenge.json"))
+                .map_err(|e| HostError::Backend(format!("read EVM approval challenge: {e}")))?;
+            let challenge: bloom_auth_api::ApprovalChallenge = serde_json::from_slice(&bytes)
+                .map_err(|e| HostError::Backend(format!("decode EVM approval challenge: {e}")))?;
+            Ok(ApprovalRequired {
+                action_id: challenge.action_id,
+                ceremony_url: challenge
+                    .ceremony_url
+                    .unwrap_or_else(|| "unavailable".into()),
+                expires_ms: challenge.expiry_ms,
+            })
+        })
+        .transpose()?;
+    Ok(EvmOutboxOutcome {
+        outbox_id: outbox_id.into(),
+        plan_md,
+        approval_required,
+    })
 }
 
 fn resolve_redirect_target(current_url: &str, location: &str) -> Result<String, HostError> {
@@ -1206,11 +1721,20 @@ impl Daemon {
         let petal_vm = PetalVm::new().map_err(|e| DaemonError::Audit(format!("petals vm: {e}")))?;
         let petals = PetalRunner::new(petal_store.clone(), petal_registry.clone(), petal_vm);
         let petal_vfs_host = Arc::new(LateVfsHost::new());
-        let petal_app_host = Arc::new(DaemonPetalHost::new(
-            petal_vfs_host.clone(),
-            audit_arc.clone(),
-            auth_services.clone(),
-        ));
+        let petal_app_host = Arc::new(
+            DaemonPetalHost::new(
+                petal_vfs_host.clone(),
+                audit_arc.clone(),
+                auth_services.clone(),
+            )
+            .with_tx_outbox(PetalTxOutbox {
+                tx_engine: tx_engine.clone(),
+                chains: chains.clone(),
+                keystore: keystore.clone(),
+                address_book: address_book_arc.clone(),
+                write_permit: home_write_permit.clone(),
+            }),
+        );
         debug!(root = %petals_root.display(), "daemon.petals_initialised");
 
         let mut vfs_builder = Vfs::builder()
@@ -2085,6 +2609,262 @@ mod tests {
         );
     }
 
+    #[test]
+    fn daemon_petal_host_derives_evm_origin_only_from_trusted_route_context() {
+        let context = V2SignContext {
+            app_root: "polymarket".into(),
+            package_hash: "a".repeat(64),
+            route_id: "r000001".into(),
+            op: "write".into(),
+            path: "/fund/alice/one/confirm".into(),
+            params: vec![("id".into(), "one".into())],
+            actor: Some("agent-1".into()),
+        };
+        let origin = DaemonPetalHost::local_app_execution_origin(&context).unwrap();
+        assert!(origin.petal_id.starts_with("local-app:polymarket:route:"));
+        assert_eq!(origin.petal_digest, "a".repeat(64));
+        assert_eq!(origin.petal_version, "v2-package");
+
+        for mutate in ["route", "operation", "path"] {
+            let mut changed = context.clone();
+            match mutate {
+                "route" => changed.route_id = "r000002".into(),
+                "operation" => changed.op = "read".into(),
+                "path" => changed.path = "/fund/alice/two/confirm".into(),
+                _ => unreachable!(),
+            }
+            assert_ne!(
+                DaemonPetalHost::local_app_execution_origin(&changed).unwrap(),
+                origin,
+                "{mutate} must change EVM execution origin"
+            );
+        }
+
+        let mut invalid = context;
+        invalid.package_hash = "not-a-digest".into();
+        assert!(DaemonPetalHost::local_app_execution_origin(&invalid).is_err());
+    }
+
+    fn test_petal_host(daemon: &Daemon) -> DaemonPetalHost {
+        DaemonPetalHost::new(
+            Arc::new(LateVfsHost::new()),
+            daemon.audit.clone(),
+            daemon.auth_services.clone(),
+        )
+        .with_tx_outbox(PetalTxOutbox {
+            tx_engine: daemon.tx_engine.clone(),
+            chains: daemon.chains.clone(),
+            keystore: daemon.keystore.clone(),
+            address_book: daemon.address_book.clone(),
+            write_permit: daemon.home_write_permit.clone(),
+        })
+    }
+
+    #[tokio::test]
+    async fn daemon_petal_chain_read_requires_context_and_rejects_unsafe_rpc_shapes() {
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = Daemon::from_home(HomeDir::at(dir.path())).unwrap();
+        let host = test_petal_host(&daemon);
+        let context = V2SignContext {
+            app_root: "reader".into(),
+            package_hash: "a".repeat(64),
+            route_id: "r000001".into(),
+            op: "read".into(),
+            path: "/balance.json".into(),
+            params: vec![],
+            actor: None,
+        };
+        let chain_name = daemon.chains.list_names().into_iter().next().unwrap();
+
+        let missing_context = host
+            .chain_read(ChainRequest {
+                chain: chain_name.clone(),
+                method: "eth_chainId".into(),
+                params_json: "[]".into(),
+                context: None,
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(missing_context, HostError::Denied(_)));
+
+        for (method, params) in [
+            ("eth_sendRawTransaction", "[]"),
+            ("eth_chainId", "[1]"),
+            (
+                "eth_getBalance",
+                r#"["0x0000000000000000000000000000000000000001","pending"]"#,
+            ),
+            (
+                "eth_call",
+                r#"[{"to":"0x0000000000000000000000000000000000000001","stateOverride":{}},"latest"]"#,
+            ),
+        ] {
+            let error = host
+                .chain_read(ChainRequest {
+                    chain: chain_name.clone(),
+                    method: method.into(),
+                    params_json: params.into(),
+                    context: Some(context.clone()),
+                })
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, HostError::Denied(_) | HostError::Invalid(_)),
+                "unexpected {method} result: {error}"
+            );
+        }
+
+        assert!(parse_petal_hex_bytes("0x70a08231", "data").is_ok());
+        assert!(parse_petal_hex_bytes("70a08231", "data").is_err());
+        assert!(parse_petal_hex_quantity("0x0", "value").is_ok());
+        assert!(parse_petal_hex_quantity("0", "value").is_err());
+    }
+
+    #[tokio::test]
+    async fn daemon_petal_outbox_inspection_is_read_only_and_origin_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = Daemon::from_home(HomeDir::at(dir.path())).unwrap();
+        let host = test_petal_host(&daemon);
+        let context = V2SignContext {
+            app_root: "funding".into(),
+            package_hash: "b".repeat(64),
+            route_id: "r000002".into(),
+            op: "read".into(),
+            path: "/fund/alice/one/status.json".into(),
+            params: vec![],
+            actor: Some("agent-1".into()),
+        };
+        let tx_hash = format!("0x{}", "ab".repeat(32));
+        let staged = bloom_proto::StagedTx {
+            id: "petal-inspect".into(),
+            wallet: "alice".into(),
+            chain: "anvil".into(),
+            chain_id: 31337,
+            from: "0x0000000000000000000000000000000000000001".into(),
+            to: "0x0000000000000000000000000000000000000002".into(),
+            value_wei: "0".into(),
+            data_hex: "0x".into(),
+            gas_limit: 21_000,
+            max_fee_per_gas: Some("100".into()),
+            max_priority_fee_per_gas: Some("10".into()),
+            gas_price: None,
+            nonce: 0,
+            policy_checks: vec![],
+            created_ms: 1,
+            expires_ms: u128::MAX,
+            status: bloom_proto::TxStatus::Pending,
+            tx_hash: Some(tx_hash.clone()),
+            token: None,
+            nft: None,
+            usd_value: None,
+            depends_on: None,
+            action_id: None,
+            execution_origin: Some(DaemonPetalHost::local_app_execution_origin(&context).unwrap()),
+        };
+        let request = EvmTransactionRequest {
+            wallet: "alice".into(),
+            chain: "anvil".into(),
+            to: staged.to.clone(),
+            value_wei: staged.value_wei.clone(),
+            data_hex: staged.data_hex.clone(),
+            nonce: None,
+            max_fee_per_gas: None,
+            max_priority_fee_per_gas: None,
+            context: Some(context.clone()),
+        };
+        let origin = staged.resolved_execution_origin();
+        assert!(petal_pending_request_matches(
+            &staged,
+            &request,
+            &origin,
+            staged.to.parse().unwrap(),
+            staged.value_wei.parse().unwrap(),
+        ));
+        let mut equivalent_fee_request = request.clone();
+        equivalent_fee_request.max_fee_per_gas = Some("00100".into());
+        equivalent_fee_request.max_priority_fee_per_gas = Some("00010".into());
+        assert!(petal_pending_request_matches(
+            &staged,
+            &equivalent_fee_request,
+            &origin,
+            staged.to.parse().unwrap(),
+            staged.value_wei.parse().unwrap(),
+        ));
+        let mut changed_request = request;
+        changed_request.data_hex = "0x00".into();
+        assert!(!petal_pending_request_matches(
+            &staged,
+            &changed_request,
+            &origin,
+            staged.to.parse().unwrap(),
+            staged.value_wei.parse().unwrap(),
+        ));
+        let entry_dir = daemon
+            .tx_engine
+            .outbox
+            .write_pending(&staged, "# plan")
+            .unwrap();
+        let receipt = bloom_tx::outbox::MinedReceipt {
+            outcome: "success".into(),
+            tx_hash: tx_hash.clone(),
+            block_number: Some(42),
+            revert_reason: None,
+        };
+        daemon
+            .tx_engine
+            .outbox
+            .write_artefact(
+                &entry_dir,
+                bloom_tx::outbox::RECEIPT_FILE,
+                &serde_json::to_vec(&receipt).unwrap(),
+            )
+            .unwrap();
+
+        let inspection = host
+            .evm_tx_inspect(
+                "alice".into(),
+                "anvil".into(),
+                staged.id.clone(),
+                Some(context.clone()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(inspection.state, "success");
+        assert_eq!(inspection.tx_hash.as_deref(), Some(tx_hash.as_str()));
+        assert!(
+            inspection
+                .receipt_json
+                .unwrap()
+                .contains("\"block_number\":42")
+        );
+
+        let mut other_route = context.clone();
+        other_route.path = "/fund/alice/two/confirm".into();
+        let denied = host
+            .evm_tx_inspect(
+                "alice".into(),
+                "anvil".into(),
+                staged.id.clone(),
+                Some(other_route),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(denied, HostError::Denied(_)));
+
+        let mut other_context = context;
+        other_context.package_hash = "c".repeat(64);
+        let denied = host
+            .evm_tx_inspect(
+                "alice".into(),
+                "anvil".into(),
+                staged.id,
+                Some(other_context),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(denied, HostError::Denied(_)));
+    }
+
     /// A pre-existing watch spec on disk should be loaded into the
     /// registry and the executor should start polling it on boot. We
     /// register an event-style spec (which keys off block number) and
@@ -2274,6 +3054,7 @@ ws_url = "wss://example.invalid"
             usd_value: None,
             depends_on: None,
             action_id: None,
+            execution_origin: None,
         };
         d.tx_engine.outbox.write_pending(&staged, "p").unwrap();
         let n = d.tx_engine.outbox.sweep_expired(2).unwrap();

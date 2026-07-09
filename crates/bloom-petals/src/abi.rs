@@ -32,6 +32,58 @@ pub struct SignRequest {
     pub context: Option<V2SignContext>,
 }
 
+/// Result of a structured v2 component signing request.
+///
+/// Unlike the legacy `sign_hash` error-only protocol, this makes a pending
+/// Sealed Approval ceremony machine-readable so a component can persist it
+/// and retry the exact prepared request after approval.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApprovalRequired {
+    pub action_id: String,
+    pub ceremony_url: String,
+    pub expires_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SignOutcome {
+    Signature(Vec<u8>),
+    ApprovalRequired(ApprovalRequired),
+}
+
+/// A generic EVM transaction prepared by a v2 route. Route provenance is
+/// injected by the runner and never supplied by the component.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EvmTransactionRequest {
+    pub wallet: String,
+    pub chain: String,
+    pub to: String,
+    pub value_wei: String,
+    pub data_hex: String,
+    pub nonce: Option<u64>,
+    pub max_fee_per_gas: Option<String>,
+    pub max_priority_fee_per_gas: Option<String>,
+    pub context: Option<V2SignContext>,
+}
+
+/// Generic staged-EVM transaction state returned through
+/// `bloom:tx/outbox@0.1.0`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EvmOutboxOutcome {
+    pub outbox_id: String,
+    pub plan_md: String,
+    pub approval_required: Option<ApprovalRequired>,
+}
+
+/// Read-only projection of a generic EVM outbox entry. `receipt_json` is the
+/// persisted generic mined receipt, not a venue-specific receipt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EvmOutboxInspection {
+    pub outbox_id: String,
+    pub state: String,
+    pub tx_hash: Option<String>,
+    pub receipt_json: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct V2SignContext {
     pub app_root: String,
@@ -48,6 +100,8 @@ pub struct ChainRequest {
     pub chain: String,
     pub method: String,
     pub params_json: String,
+    /// Trusted route provenance injected by the runner, never the component.
+    pub context: Option<V2SignContext>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

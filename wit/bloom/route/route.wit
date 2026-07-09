@@ -51,7 +51,8 @@ world route-file {
 
   import bloom:http/fetch@0.1.0;
   import bloom:store/kv@0.1.0;
-  import bloom:sign/signing@0.1.0;
+  import bloom:sign/signing@0.2.0;
+  import bloom:tx/outbox@0.1.0;
   import bloom:chain/read@0.1.0;
   import bloom:vfs/readwrite@0.1.0;
   import bloom:env/runtime@0.1.0;

@@ -26,6 +26,9 @@ pub enum Capability {
     /// May perform mediated chain reads.
     #[serde(rename = "chain")]
     Chain,
+    /// May stage and confirm generic EVM outbox entries.
+    #[serde(rename = "tx.outbox")]
+    TxOutbox,
 }
 
 impl Capability {
@@ -37,6 +40,7 @@ impl Capability {
             Capability::Sign => "sign",
             Capability::Store => "store",
             Capability::Chain => "chain",
+            Capability::TxOutbox => "tx.outbox",
         }
     }
 
@@ -48,6 +52,7 @@ impl Capability {
             "sign" => Some(Capability::Sign),
             "store" => Some(Capability::Store),
             "chain" => Some(Capability::Chain),
+            "tx.outbox" => Some(Capability::TxOutbox),
             _ => None,
         }
     }
@@ -144,6 +149,7 @@ pub fn validate_mode_caps(
                     | Capability::Sign
                     | Capability::Store
                     | Capability::Chain
+                    | Capability::TxOutbox
             )
         );
         if !ok {
@@ -168,12 +174,14 @@ mod tests {
         assert_eq!(Capability::Sign.as_str(), "sign");
         assert_eq!(Capability::Store.as_str(), "store");
         assert_eq!(Capability::Chain.as_str(), "chain");
+        assert_eq!(Capability::TxOutbox.as_str(), "tx.outbox");
         assert_eq!(Capability::parse("vfs.read"), Some(Capability::VfsRead));
         assert_eq!(Capability::parse("vfs.write"), Some(Capability::VfsWrite));
         assert_eq!(Capability::parse("net.fetch"), Some(Capability::NetFetch));
         assert_eq!(Capability::parse("sign"), Some(Capability::Sign));
         assert_eq!(Capability::parse("store"), Some(Capability::Store));
         assert_eq!(Capability::parse("chain"), Some(Capability::Chain));
+        assert_eq!(Capability::parse("tx.outbox"), Some(Capability::TxOutbox));
         assert_eq!(Capability::parse("nope"), None);
     }
 
@@ -256,6 +264,13 @@ mod tests {
         assert!(
             validate_mode_caps(PetalMode::Local, &chain).is_ok(),
             "Local + {{chain}} should be ok"
+        );
+
+        let mut tx_outbox = BTreeSet::new();
+        tx_outbox.insert(Capability::TxOutbox);
+        assert!(
+            validate_mode_caps(PetalMode::Local, &tx_outbox).is_ok(),
+            "Local + {{tx.outbox}} should be ok"
         );
     }
 }
