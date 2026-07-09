@@ -2,9 +2,30 @@ name: CI
 
 on:
   pull_request:
+    paths:
+      - ".github/workflows/ci.yml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - "crates/**"
+      - "scripts/**"
+      - "tests/**"
+      - "Dockerfile"
+      - "DEVELOPMENT.md"
   push:
     branches:
       - master
+    paths:
+      - ".github/workflows/ci.yml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - "crates/**"
+      - "scripts/**"
+      - "tests/**"
+      - "Dockerfile"
+      - "DEVELOPMENT.md"
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -43,8 +64,8 @@ jobs:
         if: always()
         run: sccache --show-stats
 
-  test:
-    name: test
+  build_test_archive:
+    name: build test archive
     runs-on: ubuntu-latest
     env:
       CARGO_BUILD_JOBS: "2"
@@ -56,10 +77,6 @@ jobs:
         run: rustup show
       - name: Install cargo-nextest
         uses: taiki-e/install-action@nextest
-      - name: Install Foundry
-        uses: foundry-rs/foundry-toolchain@v1
-        with:
-          version: stable
       - name: Free runner disk space
         run: |
           df -h
@@ -75,13 +92,167 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           cache-targets: false
-      - name: Run tests
-        run: cargo nextest run --workspace --no-fail-fast
-      - name: Run doctests
-        run: cargo test --workspace --doc
+      - name: Build nextest archive
+        run: cargo nextest archive --workspace --all-targets --archive-file target/nextest-archive.tar.zst
+      - name: Upload nextest archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: nextest-archive
+          path: target/nextest-archive.tar.zst
+          if-no-files-found: error
+          retention-days: 3
       - name: Show sccache stats
         if: always()
         run: sccache --show-stats
+
+  unit_test:
+    name: unit tests
+    runs-on: ubuntu-latest
+    needs: build_test_archive
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install Rust toolchain
+        run: rustup show
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+      - name: Download nextest archive
+        uses: actions/download-artifact@v4
+        with:
+          name: nextest-archive
+          path: target
+      - name: Run library unit tests from archive
+        run: cargo nextest run --archive-file target/nextest-archive.tar.zst -E 'kind(lib)' --no-fail-fast
+      - name: Run doctests
+        run: cargo test --workspace --doc --no-fail-fast
+
+  integration_test:
+    name: local integration tests
+    runs-on: ubuntu-latest
+    needs: build_test_archive
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install Rust toolchain
+        run: rustup show
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+      - name: Download nextest archive
+        uses: actions/download-artifact@v4
+        with:
+          name: nextest-archive
+          path: target
+      - name: Run CLI and default local integration tests from archive
+        run: |
+          cargo nextest run --archive-file target/nextest-archive.tar.zst \
+            -E 'package(bloom) and binary(cli)' \
+            --no-fail-fast
+          cargo nextest run --archive-file target/nextest-archive.tar.zst \
+            -E 'package(bloom-it) and (binary(anvil_e2e) or binary(erc20_e2e))' \
+            --no-fail-fast
+      - name: Run ignored local anvil integration tests from archive
+        run: >
+          cargo nextest run --archive-file target/nextest-archive.tar.zst
+          -E 'package(bloom-it) or package(bloom-watch)'
+          --run-ignored ignored-only
+          --no-fail-fast
+
+  e2e_tests:
+    name: external e2e tests
+    runs-on: ubuntu-latest
+    needs: build_test_archive
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      github.event_name == 'push' ||
+      (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)
+    env:
+      BLOOM_MAINNET_RPC: ${{ secrets.BLOOM_MAINNET_RPC }}
+      BLOOM_ETHERSCAN_KEY: ${{ secrets.BLOOM_ETHERSCAN_KEY }}
+      BLOOM_ENSO_KEY: ${{ secrets.BLOOM_ENSO_KEY }}
+      BLOOM_LIVE_POLYMARKET: ${{ secrets.BLOOM_LIVE_POLYMARKET }}
+      POLYGON_RPC_URL: ${{ secrets.POLYGON_RPC_URL }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install Rust toolchain
+        run: rustup show
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+      - name: Download nextest archive
+        uses: actions/download-artifact@v4
+        with:
+          name: nextest-archive
+          path: target
+      - name: Report external secret availability
+        run: |
+          for name in BLOOM_MAINNET_RPC BLOOM_ETHERSCAN_KEY BLOOM_ENSO_KEY BLOOM_LIVE_POLYMARKET POLYGON_RPC_URL; do
+            if [ -n "${!name:-}" ]; then
+              echo "$name=available"
+            else
+              echo "$name=missing (matching tests should self-skip)"
+            fi
+          done
+      - name: Run live-network Rust e2e tests from archive
+        run: |
+          cargo nextest run --archive-file target/nextest-archive.tar.zst \
+            -E 'package(bloom-ens) and binary(live_mainnet)' \
+            --run-ignored ignored-only \
+            --no-fail-fast
+          cargo nextest run --archive-file target/nextest-archive.tar.zst \
+            -E 'kind(lib) and (package(bloom-defi) or package(bloom-etherscan) or package(bloom-polymarket) or package(bloom-prices))' \
+            --run-ignored ignored-only \
+            --no-fail-fast
+
+  docker_integration_smoke:
+    name: docker integration smoke
+    runs-on: ubuntu-latest
+    needs: build_test_archive
+    if: github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@v6
+      - name: Run local docker mount smoke
+        run: bash tests/docker/run.sh --mount
+
+  docker_e2e_external:
+    name: docker external e2e
+    runs-on: ubuntu-latest
+    needs: build_test_archive
+    if: github.event_name == 'workflow_dispatch'
+    env:
+      BLOOM_ENSO_KEY: ${{ secrets.BLOOM_ENSO_KEY }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Run Enso/anvil docker e2e
+        run: |
+          if [ -z "${BLOOM_ENSO_KEY:-}" ]; then
+            echo "BLOOM_ENSO_KEY missing; skipping docker --enso e2e."
+            exit 0
+          fi
+          bash tests/docker/run.sh --enso
+
+  docker_live_funds_e2e:
+    name: docker live-funds e2e
+    runs-on: ubuntu-latest
+    needs: build_test_archive
+    if: github.event_name == 'workflow_dispatch'
+    env:
+      BLOOM_ENSO_KEY: ${{ secrets.BLOOM_ENSO_KEY }}
+      BLOOM_LIVE_HOME: ${{ secrets.BLOOM_LIVE_HOME }}
+      BLOOM_LIVE_DEST1: ${{ secrets.BLOOM_LIVE_DEST1 }}
+      BLOOM_PASSPHRASE: ${{ secrets.BLOOM_PASSPHRASE }}
+      BLOOM_BASE_RPC_URL: ${{ secrets.BLOOM_BASE_RPC_URL }}
+      BLOOM_SWAP_AMOUNT_ETH: ${{ secrets.BLOOM_SWAP_AMOUNT_ETH }}
+      BLOOM_RUN_LIVE_FUNDS_E2E: ${{ secrets.BLOOM_RUN_LIVE_FUNDS_E2E }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Run live-funds docker e2e
+        run: |
+          if [ "${BLOOM_RUN_LIVE_FUNDS_E2E:-}" != "1" ]; then
+            echo "BLOOM_RUN_LIVE_FUNDS_E2E is not 1; skipping real-funds e2e."
+            exit 0
+          fi
+          bash tests/docker/run.sh --enso-live
 
   locked-build:
     name: locked release build

@@ -107,6 +107,21 @@ before invoking the docker drivers.
 
 ## Test suites
 
+CI separates the suites by dependency boundary in `.github/workflows/ci.yml`:
+
+- `build_test_archive` compiles all Rust test targets once with
+  `cargo nextest archive` and uploads `target/nextest-archive.tar.zst`.
+- `unit_test` downloads that archive and runs only workspace library tests via
+  nextest, plus doctests with `cargo test --workspace --doc`. It does not
+  install Foundry, Docker, or any external-service credentials.
+- `integration_test` downloads the same archive, installs Foundry, and runs
+  local-only subprocess/anvil tests on the GitHub runner.
+- `e2e_tests` is the live-network lane for ignored external-service tests. It
+  is isolated from fork PRs and reports which optional secrets are present
+  before tests self-skip or run.
+- Docker mount/Enso/live-funds e2e jobs are manual-only (`workflow_dispatch`),
+  with the real-funds path guarded by `BLOOM_RUN_LIVE_FUNDS_E2E=1`.
+
 ### Rust unit tests
 
 Standard `#[cfg(test)] mod tests` blocks, ~572 across the workspace. None
