@@ -3,6 +3,7 @@
 use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -93,6 +94,150 @@ impl Handler for ChallengeStagingHandler {
                 Ok(br#"{"schema":"test.approval_challenge","status":"pending"}"#.to_vec())
             }
             _ => Err(HandlerError::NotAFile(path.to_string_path())),
+        }
+    }
+}
+
+const HL_TEST_SESSION: &str = "mount-session-1";
+
+#[derive(Default)]
+struct HyperliquidMountWorkflowHandler {
+    approved: AtomicBool,
+    challenge_staged: AtomicBool,
+    writes: parking_lot::Mutex<Vec<(String, Vec<u8>)>>,
+}
+
+impl HyperliquidMountWorkflowHandler {
+    fn approve(&self) {
+        self.approved.store(true, Ordering::SeqCst);
+    }
+
+    fn writes_for(&self, leaf: &str) -> Vec<Vec<u8>> {
+        self.writes
+            .lock()
+            .iter()
+            .filter(|(path, _)| path.ends_with(leaf))
+            .map(|(_, body)| body.clone())
+            .collect()
+    }
+}
+
+#[async_trait]
+impl Handler for HyperliquidMountWorkflowHandler {
+    async fn lookup(&self, path: &VfsPath) -> Result<Entry, HandlerError> {
+        let rendered = path.to_string_path();
+        match rendered.as_str() {
+            "/" => Ok(Entry::dir("")),
+            "/mainnet" => Ok(Entry::dir("mainnet")),
+            "/mainnet/agent_sessions" => Ok(Entry::dir("agent_sessions")),
+            "/mainnet/agent_sessions/minnow" => Ok(Entry::dir("minnow")),
+            "/mainnet/agent_sessions/minnow/new.json" => Ok(Entry::writable_file("new.json")),
+            "/mainnet/agent_sessions/minnow/mount-session-1" => Ok(Entry::dir(HL_TEST_SESSION)),
+            "/mainnet/agent_sessions/minnow/mount-session-1/approval_challenge.json"
+                if self.challenge_staged.load(Ordering::SeqCst) =>
+            {
+                Ok(Entry::file("approval_challenge.json"))
+            }
+            "/mainnet/agent_sessions/minnow/mount-session-1/status.json" => {
+                Ok(Entry::file("status.json"))
+            }
+            "/mainnet/agent_sessions/minnow/mount-session-1/order.json" => {
+                Ok(Entry::writable_file("order.json"))
+            }
+            "/mainnet/agent_sessions/minnow/mount-session-1/cancel.json" => {
+                Ok(Entry::writable_file("cancel.json"))
+            }
+            "/mainnet/agent_sessions/minnow/mount-session-1/stop" => {
+                Ok(Entry::writable_file("stop"))
+            }
+            _ => Err(HandlerError::NotFound(path.to_string_path())),
+        }
+    }
+
+    async fn read(&self, path: &VfsPath) -> Result<Vec<u8>, HandlerError> {
+        let rendered = path.to_string_path();
+        match rendered.as_str() {
+            "/mainnet/agent_sessions/minnow/mount-session-1/approval_challenge.json"
+                if self.challenge_staged.load(Ordering::SeqCst) =>
+            {
+                Ok(br#"{"schema":"test.hyperliquid.approval","status":"pending"}"#.to_vec())
+            }
+            "/mainnet/agent_sessions/minnow/mount-session-1/status.json" => {
+                let status = if self.approved.load(Ordering::SeqCst) {
+                    "active"
+                } else {
+                    "pending"
+                };
+                Ok(format!(r#"{{"status":"{status}"}}"#).into_bytes())
+            }
+            "/mainnet/agent_sessions/minnow/new.json" => {
+                Ok(br#"{"hint":"write a session request"}"#.to_vec())
+            }
+            "/mainnet/agent_sessions/minnow/mount-session-1/order.json" => {
+                Ok(br#"{"hint":"write order.json"}"#.to_vec())
+            }
+            "/mainnet/agent_sessions/minnow/mount-session-1/cancel.json" => {
+                Ok(br#"{"hint":"write cancel.json"}"#.to_vec())
+            }
+            "/mainnet/agent_sessions/minnow/mount-session-1/stop" => {
+                Ok(br#"{"hint":"write stop"}"#.to_vec())
+            }
+            _ => Err(HandlerError::NotAFile(path.to_string_path())),
+        }
+    }
+
+    async fn write(&self, path: &VfsPath, data: &[u8]) -> Result<(), HandlerError> {
+        self.writes
+            .lock()
+            .push((path.to_string_path(), data.to_vec()));
+        let rendered = path.to_string_path();
+        match rendered.as_str() {
+            "/mainnet/agent_sessions/minnow/new.json" => {
+                if !String::from_utf8_lossy(data).contains(HL_TEST_SESSION) {
+                    return Err(HandlerError::invalid("missing session id"));
+                }
+                if !self.approved.load(Ordering::SeqCst) {
+                    self.challenge_staged.store(true, Ordering::SeqCst);
+                    return Err(HandlerError::PermissionDenied);
+                }
+                Ok(())
+            }
+            "/mainnet/agent_sessions/minnow/mount-session-1/order.json"
+            | "/mainnet/agent_sessions/minnow/mount-session-1/cancel.json"
+            | "/mainnet/agent_sessions/minnow/mount-session-1/stop" => {
+                if self.approved.load(Ordering::SeqCst) {
+                    Ok(())
+                } else {
+                    Err(HandlerError::PermissionDenied)
+                }
+            }
+            _ => Err(HandlerError::PermissionDenied),
+        }
+    }
+
+    async fn list(&self, path: &VfsPath) -> Result<Vec<Entry>, HandlerError> {
+        let rendered = path.to_string_path();
+        match rendered.as_str() {
+            "/" => Ok(vec![Entry::dir("mainnet")]),
+            "/mainnet" => Ok(vec![Entry::dir("agent_sessions")]),
+            "/mainnet/agent_sessions" => Ok(vec![Entry::dir("minnow")]),
+            "/mainnet/agent_sessions/minnow" => Ok(vec![
+                Entry::writable_file("new.json"),
+                Entry::dir(HL_TEST_SESSION),
+            ]),
+            "/mainnet/agent_sessions/minnow/mount-session-1" => {
+                let mut entries = vec![
+                    Entry::file("status.json"),
+                    Entry::writable_file("order.json"),
+                    Entry::writable_file("cancel.json"),
+                    Entry::writable_file("stop"),
+                ];
+                if self.challenge_staged.load(Ordering::SeqCst) {
+                    entries.push(Entry::file("approval_challenge.json"));
+                }
+                Ok(entries)
+            }
+            _ => Err(HandlerError::NotADir(path.to_string_path())),
         }
     }
 }
@@ -388,5 +533,137 @@ async fn mounted_printf_surfaces_permission_denied() {
         handler.staged_payloads(),
         vec![Vec::<u8>::new()],
         "open-time denial must happen before the shell writes the payload"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires the host to allow a real localhost NFS mount"]
+async fn mounted_hyperliquid_session_flow_reaches_handler() {
+    let mount_dir = unique_mount_dir();
+    std::fs::create_dir_all(&mount_dir).expect("create Hyperliquid mount test directory");
+    let handler = Arc::new(HyperliquidMountWorkflowHandler::default());
+    let vfs = Vfs::builder().mount("hyperliquid", handler.clone()).build();
+    let mount = match serve_test_mount(vfs, &mount_dir).await {
+        Ok(mount) => mount,
+        Err(err) => {
+            let _ = std::fs::remove_dir(&mount_dir);
+            if require_real_mount_test() {
+                panic!("real mounted Hyperliquid workflow failed to mount: {err}");
+            }
+            eprintln!("skipping real mounted Hyperliquid workflow: {err}");
+            return;
+        }
+    };
+
+    let wallet_root = mount_dir.join("hyperliquid/mainnet/agent_sessions/minnow");
+    let new_path = wallet_root.join("new.json");
+    let session_root = wallet_root.join(HL_TEST_SESSION);
+    let payload = format!(r#"{{"id":"{HL_TEST_SESSION}","agent_name":"mounted-test"}}"#);
+    let write_redirect = |path: &std::path::Path, body: &str| {
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg("printf '%s\\n' \"$2\" > \"$1\"")
+            .arg("sh")
+            .arg(path)
+            .arg(body);
+        command
+    };
+
+    let first =
+        command_output_with_timeout(write_redirect(&new_path, &payload), Duration::from_secs(10))
+            .await
+            .expect("attempt mounted Hyperliquid session creation")
+            .expect("mounted Hyperliquid session creation timed out");
+
+    let mut cat_challenge = Command::new("cat");
+    cat_challenge.arg(session_root.join("approval_challenge.json"));
+    let challenge = command_output_with_timeout(cat_challenge, Duration::from_secs(10))
+        .await
+        .expect("read mounted Hyperliquid approval challenge")
+        .expect("mounted Hyperliquid approval challenge read timed out");
+
+    handler.approve();
+    let approved =
+        command_output_with_timeout(write_redirect(&new_path, &payload), Duration::from_secs(10))
+            .await
+            .expect("retry mounted Hyperliquid session creation")
+            .expect("approved mounted Hyperliquid session creation timed out");
+
+    let order_body = r#"{"action":{"type":"order"}}"#;
+    let order = command_output_with_timeout(
+        write_redirect(&session_root.join("order.json"), order_body),
+        Duration::from_secs(10),
+    )
+    .await
+    .expect("submit mounted Hyperliquid order")
+    .expect("mounted Hyperliquid order timed out");
+
+    let cancel_body = r#"{"action":{"type":"cancel"}}"#;
+    let cancel = command_output_with_timeout(
+        write_redirect(&session_root.join("cancel.json"), cancel_body),
+        Duration::from_secs(10),
+    )
+    .await
+    .expect("submit mounted Hyperliquid cancel")
+    .expect("mounted Hyperliquid cancel timed out");
+
+    let mut cat_status = Command::new("cat");
+    cat_status.arg(session_root.join("status.json"));
+    let status = command_output_with_timeout(cat_status, Duration::from_secs(10))
+        .await
+        .expect("read mounted Hyperliquid session status")
+        .expect("mounted Hyperliquid session status read timed out");
+
+    if let Err(err) = mount.unmount().await {
+        eprintln!("real mounted Hyperliquid cleanup: unmount failed: {err}");
+    }
+    let _ = std::fs::remove_dir(&mount_dir);
+
+    // macOS may still report success for a deferred NFS WRITE error. The
+    // important mount-only contract is that the payload reached the handler
+    // and the resulting challenge is immediately discoverable/readable.
+    assert!(
+        first.status.success(),
+        "atomic command transport must defer handler denial instead of returning a macOS NFS write error: stderr={}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    assert!(challenge.status.success());
+    assert!(String::from_utf8_lossy(&challenge.stdout).contains("test.hyperliquid.approval"));
+    assert!(
+        approved.status.success(),
+        "approved session creation failed: stderr={}",
+        String::from_utf8_lossy(&approved.stderr)
+    );
+    assert!(
+        order.status.success(),
+        "mounted order failed: stderr={}",
+        String::from_utf8_lossy(&order.stderr)
+    );
+    assert!(
+        cancel.status.success(),
+        "mounted cancel failed: stderr={}",
+        String::from_utf8_lossy(&cancel.stderr)
+    );
+    assert!(status.status.success());
+    assert!(String::from_utf8_lossy(&status.stdout).contains(r#""status":"active""#));
+    let new_writes = handler.writes_for("new.json");
+    assert!(
+        new_writes.len() >= 2,
+        "initial and approved retries must both reach the handler"
+    );
+    assert!(
+        new_writes
+            .iter()
+            .all(|body| body == &format!("{payload}\n").into_bytes()),
+        "NFS retransmissions must preserve the exact session request: {new_writes:?}"
+    );
+    assert_eq!(
+        handler.writes_for("order.json"),
+        vec![format!("{order_body}\n").into_bytes()]
+    );
+    assert_eq!(
+        handler.writes_for("cancel.json"),
+        vec![format!("{cancel_body}\n").into_bytes()]
     );
 }

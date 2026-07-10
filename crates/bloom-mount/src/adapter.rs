@@ -147,11 +147,6 @@ fn mount_write_path_uses_wallet_signer(path: &VfsPath) -> bool {
         {
             true
         }
-        [root, _network, branch, _wallet, leaf]
-            if root == "hyperliquid" && branch == "agent_sessions" && leaf == "new.json" =>
-        {
-            true
-        }
         [root, _network, branch, _wallet, _session, leaf]
             if root == "hyperliquid"
                 && branch == "agent_sessions"
@@ -179,6 +174,44 @@ fn mount_write_path_uses_wallet_signer(path: &VfsPath) -> bool {
         // immediately. They no longer route through the disabled write_unlocked
         // re-sign lane, so the mount must forward them to `vfs.write` rather than
         // deny on flush.
+        _ => false,
+    }
+}
+
+/// Command sinks whose supported payloads are deliberately small and are
+/// expected to be submitted by a single userspace write (shell redirect,
+/// `tee`, or equivalent). macOS' NFS client does not reliably send COMMIT or
+/// propagate CLOSE errors for these synthetic files, so leaving an UNSTABLE
+/// write buffered can make a successful command disappear entirely.
+///
+/// Keep this list narrow. Ordinary files still need whole-file buffering
+/// because a first contiguous WRITE is not proof that more chunks will not
+/// follow. Hyperliquid agent-session commands are JSON/control messages well
+/// below the mount's 64 KiB `wsize`; applying their offset-zero WRITE inline is
+/// what makes the documented mount-only workflow usable on macOS.
+fn mount_write_path_is_atomic_command(path: &VfsPath) -> bool {
+    let segs = path.segments();
+    match segs {
+        [root, _network, branch, _wallet, leaf]
+            if root == "hyperliquid" && branch == "agent_sessions" && leaf == "new.json" =>
+        {
+            true
+        }
+        [root, _network, branch, _wallet, _session, leaf]
+            if root == "hyperliquid"
+                && branch == "agent_sessions"
+                && matches!(
+                    leaf.as_str(),
+                    "order.json"
+                        | "cancel.json"
+                        | "schedule_cancel.json"
+                        | "stop"
+                        | "cancel_all"
+                        | "close_all"
+                ) =>
+        {
+            true
+        }
         _ => false,
     }
 }
@@ -1039,11 +1072,11 @@ impl FileSystem for BloomFs {
         // advertise UNSTABLE for every reply.
         //
         // Strategy:
-        // - Flush eagerly only when the request is sync-stable and the
-        //   buffer is contiguous. NFS WRITE does not carry an EOF/final
-        //   chunk marker, so any UNSTABLE offset-0 prefix that may grow
-        //   must wait for COMMIT even if it could also be a whole
-        //   single-RPC write.
+        // - Flush eagerly when the request is sync-stable and the buffer is
+        //   contiguous, or for a narrowly-classified atomic command sink at
+        //   offset zero. NFS WRITE does not otherwise carry an EOF/final chunk
+        //   marker, so an ordinary UNSTABLE offset-0 prefix that may grow must
+        //   wait for COMMIT even if it could also be a whole single-RPC write.
         // - DATA_SYNC / FILE_SYNC requested but buffer is incomplete
         //   (mid-stream chunk): reject explicitly. Returning a weaker
         //   stability than requested violates embednfs' contract and
@@ -1061,7 +1094,9 @@ impl FileSystem for BloomFs {
                 return Err(FsError::FileTooLarge);
             }
             buf.apply(offset, &data)?;
-            let payload = if buf.should_flush_after_write(requested) {
+            let payload = if buf.should_flush_after_write(requested)
+                || (offset == 0 && mount_write_path_is_atomic_command(&path) && buf.is_complete())
+            {
                 Some(map.remove(&path).expect("just observed").bytes)
             } else {
                 None
@@ -1093,9 +1128,28 @@ impl FileSystem for BloomFs {
             if mount_write_path_uses_wallet_signer(&path) {
                 return Err(FsError::PermissionDenied);
             }
-            self.vfs.write(&path, &payload).await.map_err(map_err)?;
-            // Persisted new bytes — invalidate any stale rendered view.
-            self.render_cache.invalidate(&path);
+            match self.vfs.write(&path, &payload).await {
+                Ok(()) => {
+                    // Persisted new bytes — invalidate any stale rendered view.
+                    self.render_cache.invalidate(&path);
+                }
+                Err(error) if mount_write_path_is_atomic_command(&path) => {
+                    // macOS can panic in nfs_vinvalbuf2 when a userspace server
+                    // rejects an UNSTABLE WRITE after the kernel has installed
+                    // dirty UBC pages. These command sinks expose their outcome
+                    // through challenge/status/audit/last-response files, so
+                    // acknowledge the transport write after the handler has
+                    // recorded that outcome instead of feeding a deferred NFS
+                    // error back into the kernel's page invalidation path.
+                    warn!(
+                        path = %path.to_string_path(),
+                        error = %error,
+                        "mount.adapter.atomic_command_outcome_deferred"
+                    );
+                    self.render_cache.invalidate(&path);
+                }
+                Err(error) => return Err(map_err(error)),
+            }
         }
 
         Ok(WriteResult {
@@ -1368,6 +1422,25 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct AtomicDenyHandler {
+        writes: parking_lot::Mutex<Vec<Vec<u8>>>,
+    }
+
+    #[async_trait]
+    impl Handler for AtomicDenyHandler {
+        async fn lookup(&self, p: &VfsPath) -> Result<Entry, HandlerError> {
+            Ok(Entry::writable_file(
+                p.segments().last().map(String::as_str).unwrap_or("command"),
+            ))
+        }
+
+        async fn write(&self, _p: &VfsPath, data: &[u8]) -> Result<(), HandlerError> {
+            self.writes.lock().push(data.to_vec());
+            Err(HandlerError::PermissionDenied)
+        }
+    }
+
     #[async_trait]
     impl Handler for ChallengeStagingHandler {
         async fn lookup(&self, p: &VfsPath) -> Result<Entry, HandlerError> {
@@ -1432,7 +1505,7 @@ mod tests {
         }
         async fn write(&self, p: &VfsPath, data: &[u8]) -> Result<(), HandlerError> {
             match p.first() {
-                Some("inbox") => {
+                Some("inbox" | "mainnet") => {
                     self.writes.lock().push(data.to_vec());
                     Ok(())
                 }
@@ -1556,6 +1629,7 @@ mod tests {
             "/wallets/minnow/policy-session/new",
             "/requests/pending/req_1/confirm",
             "/polymarket/onboard/test-wallet/begin",
+            "/hyperliquid/mainnet/agent_sessions/minnow/new.json",
         ] {
             let p = VfsPath::parse(path).unwrap();
             assert!(!mount_write_path_uses_wallet_signer(&p), "{path}");
@@ -1572,6 +1646,78 @@ mod tests {
             let p = VfsPath::parse(path).unwrap();
             assert!(mount_write_path_uses_wallet_signer(&p), "{path}");
         }
+    }
+
+    #[test]
+    fn mount_classifier_flushes_hyperliquid_session_commands_inline() {
+        for path in [
+            "/hyperliquid/mainnet/agent_sessions/minnow/new.json",
+            "/hyperliquid/mainnet/agent_sessions/minnow/session-1/order.json",
+            "/hyperliquid/mainnet/agent_sessions/minnow/session-1/cancel.json",
+            "/hyperliquid/mainnet/agent_sessions/minnow/session-1/schedule_cancel.json",
+            "/hyperliquid/mainnet/agent_sessions/minnow/session-1/stop",
+            "/hyperliquid/mainnet/agent_sessions/minnow/session-1/cancel_all",
+            "/hyperliquid/mainnet/agent_sessions/minnow/session-1/close_all",
+        ] {
+            let p = VfsPath::parse(path).unwrap();
+            assert!(mount_write_path_is_atomic_command(&p), "{path}");
+        }
+
+        for path in [
+            "/hyperliquid/mainnet/mids.json",
+            "/hyperliquid/mainnet/exchange/minnow/order.json",
+            "/hyperliquid/mainnet/agent_sessions/minnow/session-1/status.json",
+            "/wallets/minnow/policy.toml",
+        ] {
+            let p = VfsPath::parse(path).unwrap();
+            assert!(!mount_write_path_is_atomic_command(&p), "{path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn unstable_hyperliquid_session_command_flushes_inline() {
+        let recorder = RecordingHandler::new();
+        let vfs = Vfs::builder()
+            .mount("hyperliquid", recorder.clone())
+            .build();
+        let fs = BloomFs::new(vfs);
+        let ctx = fake_ctx();
+        let handle = BloomHandle::Path {
+            kind: HandleKind::File,
+            path: VfsPath::parse("/hyperliquid/mainnet/agent_sessions/minnow/session-1/order.json")
+                .unwrap(),
+        };
+        let body = Bytes::from_static(br#"{"action":{"type":"order"}}"#);
+
+        let result = fs
+            .write(&ctx, &handle, 0, body.clone(), WriteStability::Unstable)
+            .await
+            .unwrap();
+
+        assert_eq!(result.written, body.len() as u32);
+        assert_eq!(recorder.write_count(), 1);
+        assert_eq!(recorder.last_write(), Some(body.to_vec()));
+    }
+
+    #[tokio::test]
+    async fn unstable_hyperliquid_command_defers_handler_error_to_status_files() {
+        let handler = Arc::new(AtomicDenyHandler::default());
+        let vfs = Vfs::builder().mount("hyperliquid", handler.clone()).build();
+        let fs = BloomFs::new(vfs);
+        let ctx = fake_ctx();
+        let handle = BloomHandle::Path {
+            kind: HandleKind::File,
+            path: VfsPath::parse("/hyperliquid/mainnet/agent_sessions/minnow/new.json").unwrap(),
+        };
+        let body = Bytes::from_static(br#"{"id":"session-1"}"#);
+
+        let result = fs
+            .write(&ctx, &handle, 0, body.clone(), WriteStability::Unstable)
+            .await
+            .expect("atomic command transport acknowledges deferred handler outcome");
+
+        assert_eq!(result.written, body.len() as u32);
+        assert_eq!(*handler.writes.lock(), vec![body.to_vec()]);
     }
 
     #[tokio::test]
