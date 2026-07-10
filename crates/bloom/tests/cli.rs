@@ -1201,7 +1201,8 @@ fn v2_app_cli_build_install_list_and_vfs_read_happy_path() {
 
 #[test]
 #[ignore = "clones and builds the public Polymarket Petal source repo"]
-fn github_source_install_polymarket_dispatches_parity() {
+fn github_source_install_polymarket_dispatches_route_contract() {
+    let petal_ref = "825a9f72b871c3da7a6ec38f57e78615f9c42052";
     let home = fresh_home();
     bloom_cmd(home.path())
         .args([
@@ -1209,29 +1210,33 @@ fn github_source_install_polymarket_dispatches_parity() {
             "install",
             "https://github.com/bloom-directory/bloom-petal-polymarket",
             "--ref",
-            "v0.1.1",
+            petal_ref,
         ])
         .assert()
         .success()
-        .stdout(predicate::str::contains("Selected tag: v0.1.1"))
-        .stdout(predicate::str::contains(
-            "source: bloom-directory/bloom-petal-polymarket@v0.1.1",
-        ))
-        .stdout(predicate::str::contains("routes: 67"));
+        .stdout(predicate::str::contains(format!(
+            "source: bloom-directory/bloom-petal-polymarket@{petal_ref}"
+        )))
+        .stdout(predicate::str::contains(format!(
+            "resolved_commit: {petal_ref}"
+        )))
+        .stdout(predicate::str::contains("routes: 93"));
 
     bloom_cmd(home.path())
         .args(["petals", "ls"])
         .assert()
         .success()
-        .stdout(predicate::str::contains(
-            "source=bloom-directory/bloom-petal-polymarket@v0.1.1",
-        ));
+        .stdout(predicate::str::contains(format!(
+            "source=bloom-directory/bloom-petal-polymarket@{petal_ref}"
+        )));
 
     bloom_cmd(home.path())
-        .args(["vfs", "cat", "/apps/polymarket/meta/parity.json"])
+        .args(["vfs", "cat", "/apps/polymarket/meta/route-contract.json"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("polymarket_v2_petal_parity"));
+        .stdout(predicate::str::contains(
+            "bloom.polymarket.petal-route-contract.v1",
+        ));
 }
 
 #[test]

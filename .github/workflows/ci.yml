@@ -219,7 +219,7 @@ jobs:
             --run-ignored ignored-only \
             --no-fail-fast
           cargo nextest run --archive-file target/nextest-archive.tar.zst \
-            -E 'package(bloom) and test(github_source_install_polymarket_dispatches_parity)' \
+            -E 'package(bloom) and test(github_source_install_polymarket_dispatches_route_contract)' \
             --run-ignored ignored-only \
             --no-fail-fast
 
