@@ -469,7 +469,8 @@ fn default_chains() -> BTreeMap<String, ChainSpec> {
 }
 
 impl Config {
-    /// A safe agentic-wallet default: ten read-ready public EVM networks plus Anvil.
+    /// A safe agentic-wallet default: read-ready public EVM networks, Anvil,
+    /// and the Hyperliquid HyperCore VFS using its official public endpoints.
     ///
     /// Live networks default to read-only (`allow_broadcast = false`) and the
     /// global mainnet broadcast kill-switch stays enabled. Users can inspect
@@ -487,7 +488,7 @@ impl Config {
             etherscan: None,
             enso: None,
             polymarket: None,
-            hyperliquid: None,
+            hyperliquid: Some(HyperliquidConfig::default()),
             mempool: BTreeMap::new(),
             private_rpc: BTreeMap::new(),
             block_mainnet_broadcast: true,
@@ -604,7 +605,15 @@ mod tests {
         assert!(cfg.block_mainnet_broadcast);
         assert!(cfg.etherscan.is_none());
         assert!(cfg.enso.is_none());
-        assert!(cfg.hyperliquid.is_none());
+        let hyperliquid = cfg
+            .hyperliquid
+            .as_ref()
+            .expect("Hyperliquid is enabled by default");
+        assert_eq!(hyperliquid.mainnet_url, "https://api.hyperliquid.xyz");
+        assert_eq!(
+            hyperliquid.testnet_url,
+            "https://api.hyperliquid-testnet.xyz"
+        );
         assert_eq!(cfg.chains.len(), 12);
         let ethereum = cfg.chains.get("ethereum").expect("ethereum entry");
         assert_eq!(ethereum.chain_id, 1);

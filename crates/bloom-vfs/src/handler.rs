@@ -103,6 +103,8 @@ pub enum HandlerError {
     NotAFile(String),
     #[error("permission denied")]
     PermissionDenied,
+    #[error("operation not permitted")]
+    OperationNotPermitted,
     #[error("invalid input: {0}")]
     Invalid(String),
     #[error("unsupported: {0}")]
@@ -155,6 +157,17 @@ pub trait Handler: Send + Sync {
     async fn write(&self, path: &VfsPath, _data: &[u8]) -> Result<(), HandlerError> {
         let _ = path;
         Err(HandlerError::PermissionDenied)
+    }
+
+    /// Prepare for a write-open before any bytes are accepted by the mount.
+    ///
+    /// Handlers that need user-visible failures for shell redirects should
+    /// perform path-derived authorization here and return `PermissionDenied`
+    /// after staging any challenge artifacts. The default allows the open and
+    /// leaves enforcement to `write`.
+    async fn prepare_write_open(&self, path: &VfsPath) -> Result<(), HandlerError> {
+        let _ = path;
+        Ok(())
     }
 
     /// List directory children. Default: NotADir.

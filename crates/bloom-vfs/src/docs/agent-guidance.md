@@ -65,8 +65,9 @@ Expected mounted flow for value-moving outbox actions:
 ls /bloom/outbox/pending
 cat /bloom/outbox/pending/<action_id>/plan.md
 
-# 2. Confirm through the Petal projection. This should fail with permission denied
-#    after the daemon writes approval_challenge.json.
+# 2. Confirm through the Petal projection. If fresh approval is needed, opening
+#    the write should fail with permission denied after the daemon writes
+#    approval_challenge.json.
 printf 'confirm\n' > /bloom/wallets/<wallet>/chains/<chain>/outbox/pending/<id>/confirm
 
 # 3. Read the challenge from the same central action directory.
@@ -82,6 +83,11 @@ The ceremony page offers two modes:
 - **grant**: mints only an in-memory daemon grant. Retry the same mounted
   confirm write to execute from the sealed bytes.
 - **grant + execute**: mints the grant and executes immediately in the daemon.
+
+If the pending transaction has soft policy warnings and you intend to bypass
+them, use the sibling write sink `confirm.override`. Mounted override intent
+lives in the path so Bloom can make the approval decision before accepting
+payload bytes.
 
 After execution, inspect `/outbox/sent/<action_id>/` or
 `/outbox/failed/<action_id>/` for `status.json`, `result.json`, and audit/result

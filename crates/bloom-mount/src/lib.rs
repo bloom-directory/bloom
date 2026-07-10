@@ -15,9 +15,9 @@
 //! [`build_mount_args`]) so the daemon and CLI compile uniformly. The
 //! stub [`mount`] entry returns [`MountError::NotEnabled`].
 //!
-//! With `--features mount`, the additional entry point [`serve_nfs`]
-//! starts the server, issues the platform mount, and hands back a
-//! [`NfsMountHandle`] whose `Drop` runs `umount`.
+//! With `--features mount`, the additional entry points [`serve_nfs`]
+//! and [`serve_nfs_with`] start the server, issue the platform mount,
+//! and hand back a [`NfsMountHandle`] whose `Drop` runs `umount`.
 
 #![forbid(unsafe_code)]
 
@@ -32,7 +32,7 @@ pub mod adapter;
 mod server;
 
 #[cfg(feature = "mount")]
-pub use server::{NfsMountHandle, serve_nfs};
+pub use server::{NfsMountHandle, serve_nfs, serve_nfs_with};
 
 /// Configuration for mounting a bloom VFS over NFS.
 #[derive(Debug, Clone)]

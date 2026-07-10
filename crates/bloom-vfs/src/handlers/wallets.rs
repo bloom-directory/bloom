@@ -1050,6 +1050,20 @@ fn err_be(e: impl std::fmt::Display) -> HandlerError {
     HandlerError::backend(e.to_string())
 }
 
+fn tx_open_err(e: TxEngineError) -> HandlerError {
+    match e {
+        TxEngineError::BroadcastApprovalRequired(_) => HandlerError::PermissionDenied,
+        TxEngineError::PolicyDenied | TxEngineError::BroadcastDisabled(_) => {
+            HandlerError::OperationNotPermitted
+        }
+        TxEngineError::EnsoQuoteStale { .. }
+        | TxEngineError::DependencyNotSatisfied { .. }
+        | TxEngineError::SimulationReverted { .. }
+        | TxEngineError::NonceGap { .. } => HandlerError::invalid(e.to_string()),
+        other => err_be(other),
+    }
+}
+
 fn render_address_qr_svg(address: &str) -> Result<Vec<u8>, HandlerError> {
     let code = QrCode::new(address.as_bytes())
         .map_err(|e| HandlerError::backend(format!("qr svg encode: {e}")))?;
@@ -1632,6 +1646,45 @@ impl Handler for WalletsHandler {
         r
     }
 
+    async fn prepare_write_open(&self, path: &VfsPath) -> Result<(), HandlerError> {
+        let segs = path.segments();
+        let r = match segs {
+            [wallet, chains, chain, outbox, pending, id, fname]
+                if chains == "chains"
+                    && outbox == "outbox"
+                    && pending == "pending"
+                    && fname == "confirm.override" =>
+            {
+                let info = self.keystore.info(wallet).map_err(err_be)?;
+                let client = self
+                    .chains
+                    .get(chain)
+                    .ok_or_else(|| HandlerError::not_found(format!("chain '{}'", chain)))?;
+                self.tx_engine
+                    .prepare_confirm_write_open(
+                        self.write_permit()?,
+                        wallet,
+                        chain,
+                        id,
+                        &client,
+                        &info.policy,
+                        true,
+                    )
+                    .await
+                    .map_err(tx_open_err)
+            }
+            _ => Ok(()),
+        };
+        if let Err(e) = &r {
+            tracing::debug!(
+                path = %path.to_string_path(),
+                error = %e,
+                "wallets.prepare_write_open_err"
+            );
+        }
+        r
+    }
+
     async fn list(&self, path: &VfsPath) -> Result<Vec<Entry>, HandlerError> {
         let r = self.list_inner(path).await;
         if let Err(e) = &r {
@@ -1675,12 +1728,15 @@ impl Handler for WalletsHandler {
         {
             return true;
         }
-        // wallets/<w>/chains/<c>/outbox/pending/<id>/{confirm,replace,cancel}
+        // wallets/<w>/chains/<c>/outbox/pending/<id>/{confirm,confirm.override,replace,cancel}
         if segs.len() == 7
             && segs[1] == "chains"
             && segs[3] == "outbox"
             && segs[4] == "pending"
-            && matches!(segs[6].as_str(), "confirm" | "replace" | "cancel")
+            && matches!(
+                segs[6].as_str(),
+                "confirm" | "confirm.override" | "replace" | "cancel"
+            )
         {
             return true;
         }
@@ -2013,7 +2069,10 @@ impl WalletsHandler {
                 // (`confirm`, `replace`, `cancel`) even when those files
                 // don't yet exist on disk — they are virtual write sinks.
                 if st == OutboxState::Pending
-                    && (fname == "confirm" || fname == "replace" || fname == "cancel")
+                    && matches!(
+                        fname.as_str(),
+                        "confirm" | "confirm.override" | "replace" | "cancel"
+                    )
                 {
                     Ok(Entry::writable_file(fname))
                 } else {
@@ -2290,11 +2349,13 @@ impl WalletsHandler {
                     for r in rd.flatten() {
                         if let Some(n) = r.file_name().to_str() {
                             if r.file_type().map(|t| t.is_file()).unwrap_or(false) {
-                                // Pending entries' control files (confirm /
-                                // replace / cancel) are writable; everything
-                                // else is read-only metadata.
+                                // Pending entries' control files are writable;
+                                // everything else is read-only metadata.
                                 if entry.state == OutboxState::Pending
-                                    && (n == "confirm" || n == "replace" || n == "cancel")
+                                    && matches!(
+                                        n,
+                                        "confirm" | "confirm.override" | "replace" | "cancel"
+                                    )
                                 {
                                     out.push(Entry::writable_file(n));
                                 } else {
@@ -2310,7 +2371,7 @@ impl WalletsHandler {
                 // they've been written, so agents can `echo y > confirm`
                 // (and similarly for replace / cancel — fix #10).
                 if entry.state == OutboxState::Pending {
-                    for ctrl in ["confirm", "replace", "cancel"] {
+                    for ctrl in ["confirm", "confirm.override", "replace", "cancel"] {
                         if !out.iter().any(|e| e.name == ctrl) {
                             out.push(Entry::writable_file(ctrl));
                         }
@@ -2357,7 +2418,9 @@ impl WalletsHandler {
                 Ok(())
             }
             // outbox/pending/<id>/confirm — broadcast
-            [state, id, fname] if state == "pending" && fname == "confirm" => {
+            [state, id, fname]
+                if state == "pending" && (fname == "confirm" || fname == "confirm.override") =>
+            {
                 // Fix #9: confirm must have non-empty content. Quietly
                 // accepting an empty body (the old behaviour) made every
                 // empty `> confirm` a footgun that broadcast a tx.
@@ -2377,7 +2440,11 @@ impl WalletsHandler {
                         .map_err(err_be)?;
                     return Ok(());
                 }
-                let confirm_text = first_confirm_line(confirm_text);
+                let confirm_text = if fname == "confirm.override" {
+                    info.policy.override_sentinel()
+                } else {
+                    first_confirm_line(confirm_text)
+                };
                 let _staged = self
                     .tx_engine
                     .confirm(
@@ -4138,6 +4205,21 @@ mod tests {
         assert_eq!(entry.state, OutboxState::Failed);
         assert!(!entry.dir.join("broadcast_attempted.json").exists());
         assert!(!entry.dir.join("raw_tx").exists());
+    }
+
+    #[tokio::test]
+    async fn normal_confirm_open_preserves_body_control_semantics() {
+        let f = make_handler_with_chain(true);
+        let p = VfsPath::parse(&format!(
+            "/{}/chains/anvil/outbox/pending/not-yet-staged/confirm",
+            f.wallet_name
+        ))
+        .unwrap();
+
+        // OPEN cannot know whether the later body is `cancel`, a legacy
+        // override sentinel, or an ordinary confirmation. It must therefore
+        // allow the write through to write_inner, which owns those semantics.
+        f.handler.prepare_write_open(&p).await.unwrap();
     }
 
     #[test]

@@ -1275,6 +1275,31 @@ impl Handler for RequestsHandler {
         }
     }
 
+    async fn prepare_write_open(&self, path: &VfsPath) -> Result<(), HandlerError> {
+        validate_vfs_segments(path)?;
+        match path.segments() {
+            [reference, action] if action == "confirm" => {
+                let (state, id) = self.resolve_ref(reference)?;
+                if state != "pending" {
+                    return Err(HandlerError::OperationNotPermitted);
+                }
+                let pending = self.req_dir("pending", &id);
+                if !pending.exists() {
+                    return Err(HandlerError::NotFound(format!("/requests/pending/{id}")));
+                }
+                self.ensure_sealed_confirm_approval(&pending, &id).await
+            }
+            [state, id, action] if state == "pending" && action == "confirm" => {
+                let pending = self.req_dir("pending", id);
+                if !pending.exists() {
+                    return Err(HandlerError::NotFound(format!("/requests/pending/{id}")));
+                }
+                self.ensure_sealed_confirm_approval(&pending, id).await
+            }
+            _ => Ok(()),
+        }
+    }
+
     async fn write(&self, path: &VfsPath, data: &[u8]) -> Result<(), HandlerError> {
         validate_vfs_segments(path)?;
         let segs = path.segments();

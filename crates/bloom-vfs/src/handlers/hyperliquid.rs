@@ -66,11 +66,13 @@ const EXCHANGE_WRITE_FILES: [&str; 6] = [
     "send_asset.json",
 ];
 const EXCHANGE_READ_FILES: [&str; 1] = ["last_response.json"];
-const SESSION_ROOT_FILES: [&str; 1] = ["new.json"];
-const SESSION_FILES: [&str; 12] = [
+const LAST_ERROR_FILE: &str = "last_error.json";
+const SESSION_ROOT_FILES: [&str; 2] = ["new.json", LAST_ERROR_FILE];
+const SESSION_FILES: [&str; 13] = [
     "status.json",
     "session.json",
     "last_response.json",
+    LAST_ERROR_FILE,
     "order.json",
     "cancel.json",
     "schedule_cancel.json",
@@ -188,7 +190,10 @@ Signed writes:
 
 Agent sessions:
 - /hyperliquid/<network>/agent_sessions/<wallet>/new.json
+- /hyperliquid/<network>/agent_sessions/<wallet>/last_error.json
 - /hyperliquid/<network>/agent_sessions/<wallet>/<session>/status.json
+- /hyperliquid/<network>/agent_sessions/<wallet>/<session>/last_response.json
+- /hyperliquid/<network>/agent_sessions/<wallet>/<session>/last_error.json
 - /hyperliquid/<network>/agent_sessions/<wallet>/<session>/order.json
 - /hyperliquid/<network>/agent_sessions/<wallet>/<session>/cancel.json
 - /hyperliquid/<network>/agent_sessions/<wallet>/<session>/schedule_cancel.json
@@ -201,6 +206,12 @@ Agent sessions:
 Writes submit immediately after Sealed Approval or with an explicitly supplied
 `raw_signed.json` signature. For sub-accounts or vaults, include vaultAddress;
 Hyperliquid applies the action to that account.
+
+An NFS write reports that the command was accepted by the mount, not that every
+downstream action completed successfully. Read `status.json`,
+`last_response.json`, and `last_error.json` for the durable outcome. Session
+creation errors that occur before an id is available are written to the
+wallet-level `last_error.json`.
 
 Safety model:
 - Read-only paths never need wallet unlock.
@@ -2604,6 +2615,62 @@ impl HyperliquidHandler {
             .join(safe_segment(session)?))
     }
 
+    fn agent_session_wallet_store_dir(
+        &self,
+        network: &str,
+        wallet: &str,
+    ) -> Result<PathBuf, HandlerError> {
+        let Some(root) = &self.store_root else {
+            return Err(HandlerError::NotFound("agent session store".into()));
+        };
+        Ok(root
+            .join("agent_sessions")
+            .join(safe_segment(network)?)
+            .join(safe_segment(wallet)?))
+    }
+
+    fn persist_command_error(
+        &self,
+        dir: PathBuf,
+        file: &str,
+        error: &HandlerError,
+        body_len: usize,
+    ) {
+        let result = (|| -> Result<(), HandlerError> {
+            std::fs::create_dir_all(&dir)?;
+            std::fs::write(
+                dir.join(LAST_ERROR_FILE),
+                pretty_json(&json!({
+                    "status": "error",
+                    "submitted_file": file,
+                    "updated_ms": bloom_hyperliquid::now_ms(),
+                    "error": error.to_string(),
+                    "body_bytes": body_len,
+                })),
+            )?;
+            Ok(())
+        })();
+        if let Err(persist_error) = result {
+            tracing::warn!(
+                path = %dir.display(),
+                error = %persist_error,
+                "hyperliquid.command_error_persist_failed"
+            );
+        }
+    }
+
+    fn clear_command_error(&self, dir: PathBuf) {
+        match std::fs::remove_file(dir.join(LAST_ERROR_FILE)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => tracing::warn!(
+                path = %dir.display(),
+                error = %error,
+                "hyperliquid.command_error_clear_failed"
+            ),
+        }
+    }
+
     fn agent_key_kek_path(&self) -> Result<PathBuf, HandlerError> {
         let Some(root) = &self.store_root else {
             return Err(HandlerError::NotFound("agent key store".into()));
@@ -3041,7 +3108,10 @@ impl HyperliquidHandler {
         }
         Ok(SESSION_ROOT_FILES
             .iter()
-            .map(|f| Entry::writable_file(f))
+            .map(|f| match *f {
+                "new.json" => Entry::writable_file(f),
+                _ => Entry::file(f),
+            })
             .chain(names.into_iter().map(|name| Entry::dir(&name)))
             .collect())
     }
@@ -3086,6 +3156,29 @@ impl HyperliquidHandler {
                 HandlerError::Io(e)
             }
         })
+    }
+
+    fn read_agent_session_wallet_error(
+        &self,
+        network: &str,
+        wallet: &str,
+    ) -> Result<Vec<u8>, HandlerError> {
+        let path = self
+            .agent_session_wallet_store_dir(network, wallet)?
+            .join(LAST_ERROR_FILE);
+        read_existing_vfs_file(path, LAST_ERROR_FILE)
+    }
+
+    fn read_session_error(
+        &self,
+        network: &str,
+        wallet: &str,
+        session: &str,
+    ) -> Result<Vec<u8>, HandlerError> {
+        let path = self
+            .session_store_dir(network, wallet, session)?
+            .join(LAST_ERROR_FILE);
+        read_existing_vfs_file(path, LAST_ERROR_FILE)
     }
 
     fn read_session_approval_challenge(
@@ -3245,19 +3338,18 @@ impl Handler for HyperliquidHandler {
             }
             4 if NETWORKS.contains(&segs[0].as_str()) && segs[1] == "agent_sessions" => {
                 let file = &segs[3];
-                if SESSION_ROOT_FILES.contains(&file.as_str()) {
-                    Ok(Entry::writable_file(file))
-                } else {
-                    Ok(Entry::dir(file))
+                match file.as_str() {
+                    "new.json" => Ok(Entry::writable_file(file)),
+                    LAST_ERROR_FILE => Ok(Entry::file(file)),
+                    _ => Ok(Entry::dir(file)),
                 }
             }
             5 if NETWORKS.contains(&segs[0].as_str()) && segs[1] == "agent_sessions" => {
                 let file = &segs[4];
                 if SESSION_FILES.contains(&file.as_str()) {
                     match file.as_str() {
-                        "status.json" | "session.json" | "audit.jsonl" | "last_response.json" => {
-                            Ok(Entry::file(file))
-                        }
+                        "status.json" | "session.json" | "audit.jsonl" | "last_response.json"
+                        | LAST_ERROR_FILE => Ok(Entry::file(file)),
                         _ => Ok(Entry::writable_file(file)),
                     }
                 } else if file == APPROVAL_CHALLENGE_FILE
@@ -3335,6 +3427,9 @@ impl Handler for HyperliquidHandler {
             4 if segs[1] == "agent_sessions" && segs[3] == "new.json" => {
                 Ok(agent_session_new_hint())
             }
+            4 if segs[1] == "agent_sessions" && segs[3] == LAST_ERROR_FILE => {
+                self.read_agent_session_wallet_error(&segs[0], &segs[2])
+            }
             5 if segs[1] == "agent_sessions" && segs[4] == "status.json" => {
                 let client = self.client(&segs[0])?;
                 let value = self
@@ -3355,6 +3450,9 @@ impl Handler for HyperliquidHandler {
             5 if segs[1] == "agent_sessions" && segs[4] == "last_response.json" => {
                 self.read_session_last_response(&segs[0], &segs[2], &segs[3])
             }
+            5 if segs[1] == "agent_sessions" && segs[4] == LAST_ERROR_FILE => {
+                self.read_session_error(&segs[0], &segs[2], &segs[3])
+            }
             5 if segs[1] == "agent_sessions" && segs[4] == APPROVAL_CHALLENGE_FILE => {
                 self.read_session_approval_challenge(&segs[0], &segs[2], &segs[3])
             }
@@ -3372,11 +3470,38 @@ impl Handler for HyperliquidHandler {
             let wallet = &segs[2];
             let network = Self::network(network_raw)?;
             let client = self.client(network_raw)?;
-            let req: AgentSessionCreate = serde_json::from_slice(data)
-                .map_err(|e| HandlerError::invalid(format!("request json: {e}")))?;
-            return self
+            let wallet_dir = self.agent_session_wallet_store_dir(network_raw, wallet)?;
+            let req: AgentSessionCreate = match serde_json::from_slice(data) {
+                Ok(req) => req,
+                Err(parse_error) => {
+                    let error = HandlerError::invalid(format!("request json: {parse_error}"));
+                    self.persist_command_error(wallet_dir, "new.json", &error, data.len());
+                    return Err(error);
+                }
+            };
+            let session_id = req.id.clone();
+            let result = self
                 .create_agent_session(client, network, network_raw, wallet, req)
                 .await;
+            match &result {
+                Ok(()) => {
+                    self.clear_command_error(wallet_dir);
+                    if let Some(id) = session_id.as_deref()
+                        && let Ok(dir) = self.session_store_dir(network_raw, wallet, id)
+                    {
+                        self.clear_command_error(dir);
+                    }
+                }
+                Err(error) => {
+                    self.persist_command_error(wallet_dir, "new.json", error, data.len());
+                    if let Some(id) = session_id.as_deref()
+                        && let Ok(dir) = self.session_store_dir(network_raw, wallet, id)
+                    {
+                        self.persist_command_error(dir, "new.json", error, data.len());
+                    }
+                }
+            }
+            return result;
         }
         if segs.len() == 5 && segs[1] == "agent_sessions" {
             let network_raw = &segs[0];
@@ -3385,62 +3510,84 @@ impl Handler for HyperliquidHandler {
             let file = &segs[4];
             let network = Self::network(network_raw)?;
             let client = self.client(network_raw)?;
-            return match file.as_str() {
-                "order.json" | "cancel.json" | "schedule_cancel.json" => {
-                    let req: SignSubmit = serde_json::from_slice(data)
-                        .map_err(|e| HandlerError::invalid(format!("request json: {e}")))?;
-                    self.submit_session_action(
-                        client,
-                        network,
-                        SessionActionTarget {
-                            network: network_raw,
-                            wallet,
-                            id,
-                            file,
-                        },
-                        req,
-                    )
-                    .await
-                }
-                "stop" => self.stop_session(network_raw, wallet, id).await,
-                "cancel_all" => {
-                    let response = self
-                        .cancel_all_session_orders(client, network, network_raw, wallet, id, false)
-                        .await?;
-                    self.persist_response(
-                        network_raw,
-                        wallet,
-                        "agent_session_cancel_all",
-                        &response,
-                    )
-                }
-                "close_all" => {
-                    let response = self
-                        .close_all_session_positions(
+            let result = async {
+                match file.as_str() {
+                    "order.json" | "cancel.json" | "schedule_cancel.json" => {
+                        let req: SignSubmit = serde_json::from_slice(data)
+                            .map_err(|e| HandlerError::invalid(format!("request json: {e}")))?;
+                        self.submit_session_action(
                             client,
                             network,
+                            SessionActionTarget {
+                                network: network_raw,
+                                wallet,
+                                id,
+                                file,
+                            },
+                            req,
+                        )
+                        .await
+                    }
+                    "stop" => self.stop_session(network_raw, wallet, id).await,
+                    "cancel_all" => {
+                        let response = self
+                            .cancel_all_session_orders(
+                                client,
+                                network,
+                                network_raw,
+                                wallet,
+                                id,
+                                false,
+                            )
+                            .await?;
+                        self.persist_response(
                             network_raw,
                             wallet,
-                            id,
-                            false,
+                            "agent_session_cancel_all",
+                            &response,
                         )
-                        .await?;
-                    self.persist_response(network_raw, wallet, "agent_session_close_all", &response)
+                    }
+                    "close_all" => {
+                        let response = self
+                            .close_all_session_positions(
+                                client,
+                                network,
+                                network_raw,
+                                wallet,
+                                id,
+                                false,
+                            )
+                            .await?;
+                        self.persist_response(
+                            network_raw,
+                            wallet,
+                            "agent_session_close_all",
+                            &response,
+                        )
+                    }
+                    "orphan_cancel_all" => {
+                        let response = self
+                            .orphan_cancel_all(client, network, network_raw, wallet, id)
+                            .await?;
+                        self.persist_response(network_raw, wallet, "orphan_cancel_all", &response)
+                    }
+                    "orphan_close_all" => {
+                        let response = self
+                            .orphan_close_all(client, network, network_raw, wallet, id)
+                            .await?;
+                        self.persist_response(network_raw, wallet, "orphan_close_all", &response)
+                    }
+                    _ => Err(HandlerError::PermissionDenied),
                 }
-                "orphan_cancel_all" => {
-                    let response = self
-                        .orphan_cancel_all(client, network, network_raw, wallet, id)
-                        .await?;
-                    self.persist_response(network_raw, wallet, "orphan_cancel_all", &response)
+            }
+            .await;
+            if let Ok(dir) = self.session_store_dir(network_raw, wallet, id) {
+                match &result {
+                    Ok(()) => self.clear_command_error(dir),
+                    Err(error) => self.persist_command_error(dir, file, error, data.len()),
                 }
-                "orphan_close_all" => {
-                    let response = self
-                        .orphan_close_all(client, network, network_raw, wallet, id)
-                        .await?;
-                    self.persist_response(network_raw, wallet, "orphan_close_all", &response)
-                }
-                _ => Err(HandlerError::PermissionDenied),
-            };
+            }
+            return result;
         }
         if segs.len() != 4 || segs[1] != "exchange" {
             return Err(HandlerError::PermissionDenied);
@@ -3557,9 +3704,8 @@ impl Handler for HyperliquidHandler {
                 let mut entries: Vec<_> = SESSION_FILES
                     .iter()
                     .map(|f| match *f {
-                        "status.json" | "session.json" | "audit.jsonl" | "last_response.json" => {
-                            Entry::file(f)
-                        }
+                        "status.json" | "session.json" | "audit.jsonl" | "last_response.json"
+                        | LAST_ERROR_FILE => Entry::file(f),
                         _ => Entry::writable_file(f),
                     })
                     .collect();
@@ -5269,6 +5415,50 @@ mod tests {
             .write_policy(wallet, toml::to_string_pretty(&policy).unwrap().as_bytes())
             .unwrap();
         h
+    }
+
+    #[tokio::test]
+    async fn malformed_mounted_commands_persist_readable_error_artifacts() {
+        let store = unique_test_dir("bloom-hl-command-errors");
+        let h = handler().with_store_root(store);
+
+        let new_path = VfsPath::parse("/mainnet/agent_sessions/minnow/new.json").unwrap();
+        let err = h.write(&new_path, b"{not-json").await.unwrap_err();
+        assert!(matches!(err, HandlerError::Invalid(_)));
+        let root_error = h
+            .read(&VfsPath::parse("/mainnet/agent_sessions/minnow/last_error.json").unwrap())
+            .await
+            .unwrap();
+        let root_error: Value = serde_json::from_slice(&root_error).unwrap();
+        assert_eq!(root_error["status"], "error");
+        assert_eq!(root_error["submitted_file"], "new.json");
+        assert!(
+            root_error["error"]
+                .as_str()
+                .unwrap()
+                .contains("request json")
+        );
+
+        let order_path =
+            VfsPath::parse("/mainnet/agent_sessions/minnow/session-1/order.json").unwrap();
+        let err = h.write(&order_path, b"{also-not-json").await.unwrap_err();
+        assert!(matches!(err, HandlerError::Invalid(_)));
+        let session_error = h
+            .read(
+                &VfsPath::parse("/mainnet/agent_sessions/minnow/session-1/last_error.json")
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let session_error: Value = serde_json::from_slice(&session_error).unwrap();
+        assert_eq!(session_error["status"], "error");
+        assert_eq!(session_error["submitted_file"], "order.json");
+        assert!(
+            session_error["error"]
+                .as_str()
+                .unwrap()
+                .contains("request json")
+        );
     }
 
     #[test]

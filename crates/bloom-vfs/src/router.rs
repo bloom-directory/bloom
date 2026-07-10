@@ -277,6 +277,16 @@ impl Handler for Vfs {
         Ok(())
     }
 
+    async fn prepare_write_open(&self, path: &VfsPath) -> Result<(), HandlerError> {
+        let head = path.first().ok_or(HandlerError::PermissionDenied)?;
+        let h = self
+            .handlers
+            .get(head)
+            .ok_or_else(|| HandlerError::NotFound(path.to_string_path()))?;
+        let rest = path.shift();
+        h.prepare_write_open(&rest).await
+    }
+
     async fn list(&self, path: &VfsPath) -> Result<Vec<Entry>, HandlerError> {
         if path.is_root() {
             let mut out = Vec::new();
