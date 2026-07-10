@@ -67,6 +67,7 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 mpp = { version = "0.10.4", default-features = false, features = ["client", "tempo", "reqwest-rustls-tls"] }
 url = "2"
+humantime = "2"
 humantime-serde = "1"
 tempfile = "3"
 futures = "0.3"
@@ -93,6 +94,8 @@ rpassword = "7"
 # Ethereum stack
 alloy = { version = "2", features = ["full", "signer-local", "rpc-types", "providers", "provider-http", "consensus", "network", "rlp", "json-abi", "k256", "eips", "essentials", "contract", "transport-throttle", "json-rpc"] }
 alloy-dyn-abi = { version = "1.5", features = ["eip712"] }
+# OP Stack typed RPC (Base, Optimism deposit/system transactions & receipts).
+op-alloy = { version = "2", features = ["rpc-types", "consensus", "serde", "network"] }
 
 # Internal crates
 bloom-mempool  = { path = "crates/bloom-mempool" }

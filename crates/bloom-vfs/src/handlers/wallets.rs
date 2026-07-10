@@ -2344,13 +2344,16 @@ impl WalletsHandler {
                     .map_err(err_be)?;
                 let entries = ids
                     .into_iter()
-                    .filter_map(|id| {
-                        let entry = self
-                            .tx_engine
-                            .outbox
-                            .read_in_state(wallet, chain, &id, st)
-                            .ok()?;
-                        Some(Entry::dir(&id).with_modified_ms(entry.staged.created_ms))
+                    .map(|id| {
+                        match self.tx_engine.outbox.read_in_state(wallet, chain, &id, st) {
+                            Ok(entry) => {
+                                Entry::dir(&id).with_modified_ms(entry.staged.created_ms)
+                            }
+                            Err(e) => {
+                                tracing::warn!(id = %id, error = %e, "wallets.outbox.metadata_fallback");
+                                Entry::dir(&id)
+                            }
+                        }
                     })
                     .collect();
                 Ok(entries)
@@ -3325,6 +3328,7 @@ mod tests {
                 native_symbol: "ETH".into(),
                 native_decimals: 18,
                 legacy_tx: false,
+                op_stack: false,
             };
             chains.add(bloom_evm::ChainClient::new(spec).unwrap());
         }
@@ -4089,6 +4093,7 @@ mod tests {
             native_symbol: "ETH".into(),
             native_decimals: 18,
             legacy_tx: false,
+            op_stack: false,
         };
         f.handler
             .chains

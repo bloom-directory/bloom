@@ -131,6 +131,9 @@ pub struct RpcEngine {
     chain_name: String,
     endpoints: Vec<EndpointSpec>,
     provider: Arc<RootProvider<Ethereum>>,
+    /// Kept so callers can build a provider with a different network
+    /// type (e.g. `RootProvider<Optimism>`) over the same transport.
+    client: RpcClient,
     supports_subscriptions: bool,
     health: HealthRegistry,
     /// Send `true` here to cancel the probe loop on drop. Wrapped in
@@ -244,7 +247,7 @@ impl RpcEngine {
         // outer layer, so default to false (the most conservative
         // choice for retry/timeout heuristics).
         let client: RpcClient = RpcClient::new(service, false);
-        let provider: RootProvider<Ethereum> = RootProvider::<Ethereum>::new(client);
+        let provider: RootProvider<Ethereum> = RootProvider::<Ethereum>::new(client.clone());
 
         let health = HealthRegistry::new(tracked_urls);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -268,6 +271,7 @@ impl RpcEngine {
             chain_name: spec.name.clone(),
             endpoints,
             provider: Arc::new(provider),
+            client,
             supports_subscriptions,
             health,
             shutdown_tx: Some(shutdown_tx),
@@ -281,6 +285,13 @@ impl RpcEngine {
     /// engine.
     pub fn provider(&self) -> Arc<RootProvider<Ethereum>> {
         self.provider.clone()
+    }
+
+    /// Clone of the underlying `RpcClient`, so callers can build a
+    /// provider with a different network type (e.g.
+    /// `RootProvider<Optimism>`) over the same transport stack.
+    pub fn raw_client(&self) -> RpcClient {
+        self.client.clone()
     }
 
     /// True if any configured endpoint declared a ws/wss URL and was

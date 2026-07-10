@@ -4945,6 +4945,7 @@ mod tests {
             native_symbol: "ETH".into(),
             native_decimals: 18,
             legacy_tx: false,
+            op_stack: false,
         };
         bloom_evm::ChainClient::new(spec).unwrap()
     }
@@ -5501,6 +5502,7 @@ mod tests {
             native_symbol: "ETH".into(),
             native_decimals: 18,
             legacy_tx: false,
+            op_stack: false,
         };
         let chain = bloom_evm::ChainClient::new(spec).unwrap();
         let policy = bloom_proto::Policy::default();
@@ -5536,6 +5538,7 @@ mod tests {
             native_symbol: "ETH".into(),
             native_decimals: 18,
             legacy_tx: false,
+            op_stack: false,
         };
         (engine, spec, dir)
     }

@@ -15,7 +15,7 @@ use std::sync::{
     Arc, Mutex,
     atomic::{AtomicUsize, Ordering},
 };
-use std::time::Duration;
+use std::time::{Duration, UNIX_EPOCH};
 
 use assert_cmd::Command;
 use async_trait::async_trait;
@@ -113,6 +113,30 @@ impl Handler for RecordingWriteHandler {
             .unwrap()
             .push((p.to_string_path(), data.to_vec()));
         Ok(())
+    }
+}
+
+struct FixedStatHandler;
+
+#[async_trait]
+impl Handler for FixedStatHandler {
+    async fn lookup(&self, p: &VfsPath) -> Result<Entry, HandlerError> {
+        if p.is_root() {
+            return Ok(Entry::dir(""));
+        }
+        let mut entry = Entry::read_only_file("meta");
+        entry.size = 42;
+        Ok(entry.with_modified(UNIX_EPOCH + Duration::from_millis(1_700_000_000_123)))
+    }
+
+    async fn list(&self, p: &VfsPath) -> Result<Vec<Entry>, HandlerError> {
+        if p.is_root() {
+            Ok(vec![Entry::read_only_file("meta").with_modified(
+                UNIX_EPOCH + Duration::from_millis(1_700_000_000_123),
+            )])
+        } else {
+            Err(HandlerError::NotADir(p.to_string_path()))
+        }
     }
 }
 
@@ -480,6 +504,52 @@ fn vfs_cat_status_version_returns_pkg_version() {
         .assert()
         .success()
         .stdout(predicate::eq(expected));
+}
+
+#[test]
+fn vfs_stat_reports_metadata_without_mount() {
+    let home = fresh_home();
+    let out = bloom_cmd(home.path())
+        .args(["vfs", "stat", "/status/version"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    assert!(stdout.contains("path: /status/version"), "{stdout}");
+    assert!(stdout.contains("name: version"), "{stdout}");
+    assert!(stdout.contains("kind: file"), "{stdout}");
+    assert!(stdout.contains("mode: 0444"), "{stdout}");
+    assert!(stdout.contains("size: 0"), "{stdout}");
+    assert!(stdout.contains("modified_ms: "), "{stdout}");
+    assert!(stdout.contains("modified: "), "{stdout}");
+    assert!(
+        stdout.contains("modified_source: synthetic_now"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn vfs_stat_via_ipc_preserves_entry_modified_ms() {
+    let home = fresh_home();
+    let vfs = bloom_vfs::Vfs::builder()
+        .mount("fixed", Arc::new(FixedStatHandler))
+        .build();
+    let (server, server_thread) = spawn_ipc_server(home.path(), vfs);
+
+    let out = bloom_cmd(home.path())
+        .args(["vfs", "stat", "/fixed/meta"])
+        .assert()
+        .success();
+
+    stop_ipc_server(server, server_thread);
+
+    let stdout = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    assert!(stdout.contains("path: /fixed/meta"), "{stdout}");
+    assert!(stdout.contains("name: meta"), "{stdout}");
+    assert!(stdout.contains("kind: file"), "{stdout}");
+    assert!(stdout.contains("mode: 0444"), "{stdout}");
+    assert!(stdout.contains("size: 42"), "{stdout}");
+    assert!(stdout.contains("modified_ms: 1700000000123"), "{stdout}");
+    assert!(stdout.contains("modified_source: artifact"), "{stdout}");
 }
 
 #[test]

@@ -1149,9 +1149,11 @@ impl Handler for RequestsHandler {
                 Ok(entry)
             }
             [one] if matches!(one.as_str(), "pending" | "sent" | "failed" | "sessions") => {
+                self.ensure_layout()?;
                 entry_for_fs_path(self.requests_root().join(one), one, EntryKind::Dir)
             }
             [state, id] if matches!(state.as_str(), "pending" | "sent" | "failed" | "sessions") => {
+                self.ensure_layout()?;
                 entry_for_fs_path(
                     self.requests_root().join(state).join(id),
                     id,

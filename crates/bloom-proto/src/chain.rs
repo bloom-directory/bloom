@@ -111,6 +111,12 @@ pub struct ChainSpec {
     /// `max_priority_fee_per_gas`. Defaults to false (EIP-1559).
     #[serde(default)]
     pub legacy_tx: bool,
+    /// When true, this chain is part of the OP Stack (Base, Optimism,
+    /// …) and produces deposit/system transactions (type `0x7e`) and
+    /// receipts with L1-fee fields. The EVM client uses `op-alloy`
+    /// typed decoders so these are parsed correctly.
+    #[serde(default)]
+    pub op_stack: bool,
 }
 
 fn default_native() -> String {
@@ -134,6 +140,7 @@ impl ChainSpec {
             native_symbol: "ETH".to_string(),
             native_decimals: 18,
             legacy_tx: false,
+            op_stack: false,
         }
     }
 
@@ -142,6 +149,29 @@ impl ChainSpec {
     }
     pub fn r#ref(&self) -> ChainRef {
         ChainRef::new(&self.name)
+    }
+
+    /// Builder helper: marks this chain as an OP Stack chain.
+    pub fn with_op_stack(mut self) -> Self {
+        self.op_stack = true;
+        self
+    }
+
+    /// Known OP-stack chain IDs (Optimism, Base, and their testnets).
+    pub fn is_known_op_stack_chain_id(chain_id: u64) -> bool {
+        matches!(chain_id, 10 | 8453 | 11155420 | 84532)
+    }
+
+    /// Infer `op_stack` from the chain ID when the field was absent in
+    /// an older config file. Only upgrades falseâtrue for well-known
+    /// OP-stack chain IDs; never downgrades.
+    pub fn infer_op_stack(&mut self) -> bool {
+        if !self.op_stack && Self::is_known_op_stack_chain_id(self.chain_id) {
+            self.op_stack = true;
+            true
+        } else {
+            false
+        }
     }
 
     /// Single source of truth for the RPC layer.
@@ -216,6 +246,7 @@ mod tests {
         assert_eq!(c.native_symbol, "ETH");
         assert_eq!(c.native_decimals, 18);
         assert!(!c.legacy_tx);
+        assert!(!c.op_stack);
         assert!(c.etherscan_api_url.is_none());
     }
 
@@ -240,6 +271,7 @@ mod tests {
             native_symbol: "ETH".to_string(),
             native_decimals: 18,
             legacy_tx: false,
+            op_stack: false,
         };
         let s = serde_json::to_string(&original).unwrap();
         let back: ChainSpec = serde_json::from_str(&s).unwrap();
@@ -262,6 +294,7 @@ mod tests {
             native_symbol: "ETH".into(),
             native_decimals: 18,
             legacy_tx: false,
+            op_stack: false,
         };
         let eps = spec.endpoints();
         assert_eq!(eps.len(), 3);
@@ -309,6 +342,7 @@ mod tests {
             native_symbol: "ETH".into(),
             native_decimals: 18,
             legacy_tx: false,
+            op_stack: false,
         };
         assert_eq!(spec.endpoints(), rich);
     }

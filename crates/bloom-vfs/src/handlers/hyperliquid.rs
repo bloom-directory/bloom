@@ -3147,7 +3147,13 @@ impl HyperliquidHandler {
             })
             .collect();
         for name in names {
-            entries.push(self.agent_session_entry(network, wallet, &name, Entry::dir(&name))?);
+            entries.push(
+                self.agent_session_entry(network, wallet, &name, Entry::dir(&name))
+                    .unwrap_or_else(|e| {
+                        tracing::warn!(session = %name, error = %e, "hyperliquid.session.metadata_fallback");
+                        Entry::dir(&name)
+                    }),
+            );
         }
         Ok(entries)
     }
@@ -3385,14 +3391,12 @@ impl Handler for HyperliquidHandler {
                 if SESSION_FILES.contains(&file.as_str()) {
                     match file.as_str() {
                         "status.json" | "session.json" | "audit.jsonl" | "last_response.json"
-                        | LAST_ERROR_FILE => {
-                            self.agent_session_entry(
-                                &segs[0],
-                                &segs[2],
-                                &segs[3],
-                                Entry::file(file),
-                            )
-                        }
+                        | LAST_ERROR_FILE => self.agent_session_entry(
+                            &segs[0],
+                            &segs[2],
+                            &segs[3],
+                            Entry::file(file),
+                        ),
                         _ => self.agent_session_entry(
                             &segs[0],
                             &segs[2],

@@ -375,6 +375,7 @@ fn evm_chain(
         native_symbol: native_symbol.to_string(),
         native_decimals: 18,
         legacy_tx: false,
+        op_stack: false,
     }
 }
 
@@ -397,7 +398,8 @@ fn default_chains() -> BTreeMap<String, ChainSpec> {
             &["https://mainnet.base.org", "https://base.llamarpc.com"],
             "Base Mainnet",
             "ETH",
-        ),
+        )
+        .with_op_stack(),
         evm_chain(
             "tempo",
             4217,
@@ -424,7 +426,8 @@ fn default_chains() -> BTreeMap<String, ChainSpec> {
             ],
             "OP Mainnet",
             "ETH",
-        ),
+        )
+        .with_op_stack(),
         evm_chain(
             "polygon",
             137,
@@ -520,7 +523,8 @@ impl Config {
 
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
         let s = std::fs::read_to_string(path)?;
-        let cfg: Self = toml::from_str(&s)?;
+        let mut cfg: Self = toml::from_str(&s)?;
+        cfg.migrate();
         cfg.validate()?;
         Ok(cfg)
     }
@@ -541,6 +545,16 @@ impl Config {
             let cfg = Self::local_default();
             cfg.save(path)?;
             Ok(cfg)
+        }
+    }
+
+    /// Apply post-load migrations for backwards compatibility.
+    ///
+    /// Currently infers `op_stack` for well-known OP-stack chain IDs
+    /// (Optimism=10, Base=8453, â¦) that predate the `op_stack` field.
+    fn migrate(&mut self) {
+        for spec in self.chains.values_mut() {
+            spec.infer_op_stack();
         }
     }
 
@@ -1030,6 +1044,7 @@ allow_broadcast = true
             native_symbol: "ETH".into(),
             native_decimals: 18,
             legacy_tx: false,
+            op_stack: false,
         };
         assert!(!cfg.broadcast_permitted(&mainnet));
     }
@@ -1049,6 +1064,7 @@ allow_broadcast = true
             native_symbol: "ETH".into(),
             native_decimals: 18,
             legacy_tx: false,
+            op_stack: false,
         };
         assert!(cfg.broadcast_permitted(&mainnet));
     }
@@ -1233,5 +1249,43 @@ ws_url = "wss://example"
         let cfg: Config = toml::from_str(toml_src).unwrap();
         let m = cfg.mempool.get("ethereum").unwrap();
         assert_eq!(m.max_index_size, 50_000);
+    }
+
+    #[test]
+    fn load_migrates_op_stack_for_known_chain_ids() {
+        let toml_src = r#"
+default_chain = "base"
+
+[chains.base]
+name = "base"
+chain_id = 8453
+rpc_urls = ["https://mainnet.base.org"]
+
+[chains.ethereum]
+name = "ethereum"
+chain_id = 1
+rpc_urls = ["https://ethereum-rpc.publicnode.com"]
+
+[chains.optimism]
+name = "optimism"
+chain_id = 10
+rpc_urls = ["https://mainnet.optimism.io"]
+"#;
+        let td = tempdir().unwrap();
+        let path = td.path().join("config.toml");
+        std::fs::write(&path, toml_src).unwrap();
+        let cfg = Config::load(&path).unwrap();
+        assert!(
+            cfg.chains["base"].op_stack,
+            "base should be op_stack after migration"
+        );
+        assert!(
+            cfg.chains["optimism"].op_stack,
+            "optimism should be op_stack after migration"
+        );
+        assert!(
+            !cfg.chains["ethereum"].op_stack,
+            "ethereum should not be op_stack"
+        );
     }
 }

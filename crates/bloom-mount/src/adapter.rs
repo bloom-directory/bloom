@@ -302,7 +302,7 @@ fn entry_to_attrs(path: &VfsPath, e: &Entry, size: u64) -> Attrs {
     a.size = size;
     a.space_used = size;
     a.mode = e.mode;
-    let ts = system_time_to_ts(e.modified.unwrap_or_else(SystemTime::now));
+    let ts = e.modified.map(system_time_to_ts).unwrap_or_else(epoch_ts);
     a.mtime = ts;
     a.atime = ts;
     a.ctime = ts;

@@ -3575,7 +3575,13 @@ impl PolymarketHandler {
                 entries.extend(
                     self.list_fund_sessions(path, &segs[1])?
                         .iter()
-                        .filter_map(|id| self.fund_session_dir_entry(path, &segs[1], id).ok()),
+                        .map(|id| {
+                            self.fund_session_dir_entry(path, &segs[1], id)
+                                .unwrap_or_else(|e| {
+                                    tracing::warn!(id = %id, error = %e, "polymarket.fund_session.metadata_fallback");
+                                    Entry::dir(id)
+                                })
+                        }),
                 );
                 Ok(entries)
             }
@@ -3583,12 +3589,21 @@ impl PolymarketHandler {
                 self.fund_root_or_not_found(path)?;
                 let mut entries: Vec<Entry> = FUND_FILES
                     .iter()
-                    .filter_map(|f| {
+                    .map(|f| {
                         self.fund_session_file_entry(path, &segs[1], &segs[2], f)
-                            .ok()
+                            .unwrap_or_else(|e| {
+                                tracing::warn!(file = *f, error = %e, "polymarket.fund_file.metadata_fallback");
+                                if *f == "confirm" { Entry::writable_file(f) } else { Entry::file(f) }
+                            })
                     })
                     .collect();
-                entries.push(self.fund_session_file_entry(path, &segs[1], &segs[2], "confirm")?);
+                entries.push(
+                    self.fund_session_file_entry(path, &segs[1], &segs[2], "confirm")
+                        .unwrap_or_else(|e| {
+                            tracing::warn!(error = %e, "polymarket.fund_confirm.metadata_fallback");
+                            Entry::writable_file("confirm")
+                        }),
+                );
                 Ok(entries)
             }
             (Some("trade"), 1) => {
@@ -3609,7 +3624,13 @@ impl PolymarketHandler {
                 let ids = store.list_drafts(&segs[1]).map_err(err_be)?;
                 Ok(ids
                     .iter()
-                    .filter_map(|id| self.draft_dir_entry(store, &segs[1], id).ok())
+                    .map(|id| {
+                        self.draft_dir_entry(store, &segs[1], id)
+                            .unwrap_or_else(|e| {
+                                tracing::warn!(id = %id, error = %e, "polymarket.draft.metadata_fallback");
+                                Entry::dir(id)
+                            })
+                    })
                     .collect())
             }
             (Some("trade"), 3) if segs[2] == "receipts" => {
@@ -3617,7 +3638,13 @@ impl PolymarketHandler {
                 let ids = store.list_receipts(&segs[1]).map_err(err_be)?;
                 Ok(ids
                     .iter()
-                    .filter_map(|id| self.receipt_dir_entry(store, &segs[1], id).ok())
+                    .map(|id| {
+                        self.receipt_dir_entry(store, &segs[1], id)
+                            .unwrap_or_else(|e| {
+                                tracing::warn!(id = %id, error = %e, "polymarket.receipt.metadata_fallback");
+                                Entry::dir(id)
+                            })
+                    })
                     .collect())
             }
             // Resting CLOB order-ids come from the live book/account views, not
@@ -3627,9 +3654,21 @@ impl PolymarketHandler {
                 let store = self.orders_or_not_found(path)?;
                 let mut entries: Vec<Entry> = DRAFT_FILES
                     .iter()
-                    .filter_map(|f| self.draft_file_entry(store, &segs[1], &segs[3], f).ok())
+                    .map(|f| {
+                        self.draft_file_entry(store, &segs[1], &segs[3], f)
+                            .unwrap_or_else(|e| {
+                                tracing::warn!(file = *f, error = %e, "polymarket.draft_file.metadata_fallback");
+                                Entry::file(f)
+                            })
+                    })
                     .collect();
-                entries.push(self.draft_file_entry(store, &segs[1], &segs[3], "confirm")?);
+                entries.push(
+                    self.draft_file_entry(store, &segs[1], &segs[3], "confirm")
+                        .unwrap_or_else(|e| {
+                            tracing::warn!(error = %e, "polymarket.draft_confirm.metadata_fallback");
+                            Entry::writable_file("confirm")
+                        }),
+                );
                 Ok(entries)
             }
             (Some("trade"), 4) if segs[2] == "receipts" => {

@@ -31,7 +31,7 @@ use bloom_proto::{AuditRecord, CeremonyIntent, CeremonyIntentKind, HomeDir, Home
 use bloom_tx::TxEngineError;
 use bloom_vfs::{
     VfsPath,
-    handler::{Handler, HandlerError},
+    handler::{Entry, EntryKind, Handler, HandlerError},
 };
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::{Shell, generate};
@@ -257,6 +257,8 @@ enum VfsCmd {
         #[arg(default_value = "/")]
         path: String,
     },
+    /// `stat /bloom/<path>` — inspect VFS metadata without a kernel mount.
+    Stat { path: String },
     /// Write data to a writable VFS path. Reads from stdin if `--data` is omitted.
     Write {
         path: String,
@@ -1160,6 +1162,90 @@ fn is_ipc_handler_permission_denied(e: &std::io::Error) -> bool {
     s.contains("-32007") || s.contains("permission denied")
 }
 
+fn system_time_to_unix_ms(time: SystemTime) -> u128 {
+    time.duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+}
+
+fn unix_ms_to_system_time(ms: u128) -> SystemTime {
+    let ms = ms.min(u64::MAX as u128) as u64;
+    UNIX_EPOCH + std::time::Duration::from_millis(ms)
+}
+
+fn entry_kind_label(kind: EntryKind) -> &'static str {
+    match kind {
+        EntryKind::Dir => "dir",
+        EntryKind::File => "file",
+        EntryKind::Symlink => "symlink",
+    }
+}
+
+fn print_vfs_stat(
+    path: &str,
+    name: &str,
+    kind: &str,
+    mode: u32,
+    size: u64,
+    link_target: Option<&str>,
+    modified: Option<SystemTime>,
+) {
+    let (modified, modified_source) = match modified {
+        Some(t) => (t, "artifact"),
+        None => (SystemTime::now(), "synthetic_now"),
+    };
+    let modified_ms = system_time_to_unix_ms(modified);
+    println!("path: {path}");
+    println!("name: {name}");
+    println!("kind: {kind}");
+    println!("mode: {:04o}", mode & 0o7777);
+    println!("size: {size}");
+    println!("modified_ms: {modified_ms}");
+    println!("modified: {}", humantime::format_rfc3339(modified));
+    println!("modified_source: {modified_source}");
+    if let Some(target) = link_target {
+        println!("link_target: {target}");
+    }
+}
+
+fn print_vfs_stat_entry(path: &str, entry: &Entry) {
+    print_vfs_stat(
+        path,
+        &entry.name,
+        entry_kind_label(entry.kind),
+        entry.mode,
+        entry.size,
+        entry.link_target.as_deref(),
+        entry.modified,
+    )
+}
+
+fn print_vfs_stat_json(path: &str, entry: &serde_json::Value) -> Result<()> {
+    let name = entry
+        .get("name")
+        .and_then(|v| v.as_str())
+        .context("ipc lookup: missing name")?;
+    let kind = entry
+        .get("kind")
+        .and_then(|v| v.as_str())
+        .context("ipc lookup: missing kind")?;
+    let mode = entry
+        .get("mode")
+        .and_then(|v| v.as_u64())
+        .context("ipc lookup: missing mode")? as u32;
+    let size = entry
+        .get("size")
+        .and_then(|v| v.as_u64())
+        .context("ipc lookup: missing size")?;
+    let link_target = entry.get("link_target").and_then(|v| v.as_str());
+    let modified = entry
+        .get("modified_ms")
+        .and_then(|v| v.as_u64())
+        .map(|ms| unix_ms_to_system_time(ms as u128));
+    print_vfs_stat(path, name, kind, mode, size, link_target, modified);
+    Ok(())
+}
+
 async fn run(cli: Cli) -> Result<()> {
     let (connect, ipc_socket) = if cli.connect.is_some() {
         (cli.connect, None)
@@ -1299,6 +1385,28 @@ async fn run(cli: Cli) -> Result<()> {
                 for e in entries {
                     println!("{}\t{:?}", e.name, e.kind);
                 }
+            }
+            Ok(())
+        }
+        Cmd::Vfs(VfsCmd::Stat { path }) => {
+            let p = VfsPath::parse(&path).context("parse path")?;
+            let client = IpcClient::new(&client_endpoint.socket);
+            let ipc_res = try_ipc(
+                &client,
+                &client_endpoint,
+                "lookup",
+                serde_json::json!({ "path": path }),
+            )
+            .await
+            .with_context(|| format!("ipc lookup via {}", client_endpoint.display))?;
+            if let Some(res) = ipc_res {
+                debug!(endpoint = %client_endpoint.display, "cli.vfs.stat.via_ipc");
+                print_vfs_stat_json(&path, &res)?;
+            } else {
+                debug!("cli.vfs.stat.via_inproc: no daemon socket present");
+                let d = Daemon::from_home(home).context("build daemon")?;
+                let entry = d.vfs.lookup(&p).await.context("vfs lookup")?;
+                print_vfs_stat_entry(&path, &entry);
             }
             Ok(())
         }

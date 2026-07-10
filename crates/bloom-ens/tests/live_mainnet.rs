@@ -25,6 +25,7 @@ fn mainnet_spec(url: String) -> ChainSpec {
         native_symbol: "ETH".to_string(),
         native_decimals: 18,
         legacy_tx: false,
+        op_stack: false,
     }
 }
 

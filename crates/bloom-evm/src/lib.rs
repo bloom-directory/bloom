@@ -8,8 +8,9 @@
 
 use std::sync::Arc;
 
+use alloy::consensus::Transaction as TxTrait;
 use alloy::eips::BlockNumberOrTag;
-use alloy::network::{Ethereum, TransactionBuilder};
+use alloy::network::{Ethereum, ReceiptResponse, TransactionBuilder};
 use alloy::primitives::{Address, B256, BlockHash, Bytes, U256};
 use alloy::providers::{Provider, RootProvider};
 use alloy::rpc::types::eth::state::StateOverride;
@@ -18,6 +19,7 @@ use alloy::rpc::types::eth::{
 };
 use alloy::sol;
 use alloy::transports::TransportError;
+use op_alloy::network::Optimism;
 use parking_lot::RwLock;
 use thiserror::Error;
 use tracing::{debug, warn};
@@ -145,6 +147,11 @@ fn map_rpc_error(e: bloom_rpc::BloomRpcError) -> ChainError {
 pub struct ChainClient {
     spec: Arc<ChainSpec>,
     primary: Arc<RootProvider<Ethereum>>,
+    /// When `op_stack` is set, a `RootProvider<Optimism>` sharing the
+    /// same transport as `primary`. Its `get_transaction_by_hash` /
+    /// `get_transaction_receipt` natively decode deposit/system txs
+    /// (type `0x7e`) and L1-fee receipt fields.
+    op_primary: Option<Arc<RootProvider<Optimism>>>,
     engine: Arc<bloom_rpc::RpcEngine>,
     /// Cached chain id once the provider has reported it.
     cached_chain_id: Arc<RwLock<Option<u64>>>,
@@ -162,9 +169,15 @@ impl ChainClient {
     pub fn new(spec: ChainSpec) -> Result<Self, ChainError> {
         let engine = bloom_rpc::RpcEngine::build(&spec).map_err(map_rpc_error)?;
         let provider = engine.provider();
+        let op_primary = if spec.op_stack {
+            Some(Arc::new(RootProvider::<Optimism>::new(engine.raw_client())))
+        } else {
+            None
+        };
         Ok(Self {
             spec: Arc::new(spec),
             primary: provider,
+            op_primary,
             engine: Arc::new(engine),
             cached_chain_id: Arc::new(RwLock::new(None)),
         })
@@ -175,6 +188,10 @@ impl ChainClient {
     }
     pub fn id(&self) -> ChainId {
         ChainId(self.spec.chain_id)
+    }
+    /// True when this chain uses the OP Stack (Base, Optimism, …).
+    pub fn is_op_stack(&self) -> bool {
+        self.spec.op_stack
     }
     pub fn provider(&self) -> Arc<RootProvider<Ethereum>> {
         self.primary.clone()
@@ -331,27 +348,64 @@ impl ChainClient {
         Ok(self.primary.get_transaction_by_hash(hash).await?)
     }
 
-    pub async fn raw_tx_by_hash(
-        &self,
-        hash: B256,
-    ) -> Result<Option<serde_json::Value>, ChainError> {
-        Ok(self
-            .primary
-            .client()
-            .request("eth_getTransactionByHash", (format!("{hash:#x}"),))
-            .await?)
+    /// Fetch a transaction as typed JSON. On OP-stack chains the
+    /// `RootProvider<Optimism>` natively decodes deposit/system
+    /// transactions (type `0x7e`); on L1 chains the standard alloy
+    /// `Transaction` decoder is used.
+    pub async fn tx_json(&self, hash: B256) -> Result<Option<serde_json::Value>, ChainError> {
+        if let Some(op) = &self.op_primary {
+            match op.get_transaction_by_hash(hash).await? {
+                Some(tx) => serde_json::to_value(&tx)
+                    .map_err(|e| ChainError::Decode(format!("tx {hash:#x}: {e}")))
+                    .map(Some),
+                None => Ok(None),
+            }
+        } else {
+            match self.tx_by_hash(hash).await? {
+                Some(tx) => serde_json::to_value(&tx)
+                    .map_err(|e| ChainError::Decode(format!("tx {hash:#x}: {e}")))
+                    .map(Some),
+                None => Ok(None),
+            }
+        }
     }
 
     pub async fn receipt(&self, hash: B256) -> Result<Option<TransactionReceipt>, ChainError> {
         Ok(self.primary.get_transaction_receipt(hash).await?)
     }
 
-    pub async fn raw_receipt(&self, hash: B256) -> Result<Option<serde_json::Value>, ChainError> {
-        Ok(self
-            .primary
-            .client()
-            .request("eth_getTransactionReceipt", (format!("{hash:#x}"),))
-            .await?)
+    /// Fetch a receipt as typed JSON. On OP-stack chains the
+    /// `RootProvider<Optimism>` natively decodes L1-fee fields and
+    /// deposit-tx metadata.
+    pub async fn receipt_json(&self, hash: B256) -> Result<Option<serde_json::Value>, ChainError> {
+        if let Some(op) = &self.op_primary {
+            match op.get_transaction_receipt(hash).await? {
+                Some(r) => serde_json::to_value(&r)
+                    .map_err(|e| ChainError::Decode(format!("receipt {hash:#x}: {e}")))
+                    .map(Some),
+                None => Ok(None),
+            }
+        } else {
+            match self.receipt(hash).await? {
+                Some(r) => serde_json::to_value(&r)
+                    .map_err(|e| ChainError::Decode(format!("receipt {hash:#x}: {e}")))
+                    .map(Some),
+                None => Ok(None),
+            }
+        }
+    }
+
+    /// Extract the block number from a transaction receipt using the
+    /// typed decoder appropriate for the chain family.
+    pub async fn receipt_block_number(&self, hash: B256) -> Result<Option<u64>, ChainError> {
+        if let Some(op) = &self.op_primary {
+            Ok(op
+                .get_transaction_receipt(hash)
+                .await?
+                .and_then(|r| r.block_number()))
+        } else {
+            Ok(self.receipt(hash).await?.and_then(|r| r.block_number))
+        }
     }
 
     /// Re-execute a *reverted* transaction via `eth_call` at the block it
@@ -362,33 +416,93 @@ impl ChainClient {
     /// * `Ok(Some(bytes))` — the replayed call reverted and we extracted
     ///   the encoded returndata from the JSON-RPC error.
     pub async fn trace_revert(&self, hash: B256) -> Result<Option<Bytes>, ChainError> {
-        let receipt = match self.primary.get_transaction_receipt(hash).await? {
-            Some(r) => r,
-            None => {
-                debug!(%hash, "trace_revert.no_receipt");
+        let block_number;
+        let req;
+
+        if let Some(op) = &self.op_primary {
+            // OP-stack path: the Optimism provider decodes deposit/system
+            // txs and L1-fee receipts natively.
+            let receipt = match op.get_transaction_receipt(hash).await? {
+                Some(r) => r,
+                None => {
+                    debug!(%hash, "trace_revert.no_receipt");
+                    return Ok(None);
+                }
+            };
+            if receipt.status() {
+                debug!(%hash, "trace_revert.tx_succeeded");
                 return Ok(None);
             }
-        };
-        if receipt.status() {
-            debug!(%hash, "trace_revert.tx_succeeded");
-            return Ok(None);
+            block_number = match receipt.block_number() {
+                Some(n) => n,
+                None => {
+                    debug!(%hash, "trace_revert.no_block_number");
+                    return Ok(None);
+                }
+            };
+            let from = receipt.from();
+            let tx = match op.get_transaction_by_hash(hash).await? {
+                Some(t) => t,
+                None => {
+                    debug!(%hash, "trace_revert.no_tx");
+                    return Ok(None);
+                }
+            };
+            // Build TransactionRequest from typed fields, preserving
+            // all execution-relevant fields (gas price, access list, etc.)
+            // so the replay matches the original execution exactly.
+            let mut builder = TransactionRequest::default()
+                .with_from(from)
+                .with_input(tx.input().clone())
+                .with_gas_limit(tx.gas_limit())
+                .with_value(tx.value())
+                .with_max_fee_per_gas(tx.max_fee_per_gas());
+            if let Some(gas_price) = tx.gas_price() {
+                builder = builder.with_gas_price(gas_price);
+            }
+            if let Some(prio_fee) = tx.max_priority_fee_per_gas() {
+                builder = builder.with_max_priority_fee_per_gas(prio_fee);
+            }
+            if let Some(chain_id) = tx.chain_id() {
+                builder = builder.with_chain_id(chain_id);
+            }
+            if let Some(to) = tx.to() {
+                builder = builder.with_to(to);
+            }
+            if let Some(access_list) = tx.access_list() {
+                builder = builder.with_access_list(access_list.clone());
+            }
+            req = builder;
+        } else {
+            // L1 path: standard typed decode handles all known tx types.
+            let receipt = match self.primary.get_transaction_receipt(hash).await? {
+                Some(r) => r,
+                None => {
+                    debug!(%hash, "trace_revert.no_receipt");
+                    return Ok(None);
+                }
+            };
+            if receipt.status() {
+                debug!(%hash, "trace_revert.tx_succeeded");
+                return Ok(None);
+            }
+            block_number = match receipt.block_number {
+                Some(n) => n,
+                None => {
+                    debug!(%hash, "trace_revert.no_block_number");
+                    return Ok(None);
+                }
+            };
+            let tx = match self.primary.get_transaction_by_hash(hash).await? {
+                Some(t) => t,
+                None => {
+                    debug!(%hash, "trace_revert.no_tx");
+                    return Ok(None);
+                }
+            };
+            req = tx.into_request().with_from(receipt.from);
         }
-        let block_number = match receipt.block_number {
-            Some(n) => n,
-            None => {
-                debug!(%hash, "trace_revert.no_block_number");
-                return Ok(None);
-            }
-        };
-        let tx = match self.primary.get_transaction_by_hash(hash).await? {
-            Some(t) => t,
-            None => {
-                debug!(%hash, "trace_revert.no_tx");
-                return Ok(None);
-            }
-        };
-        let from = receipt.from;
-        let req: TransactionRequest = tx.into_request().with_from(from);
+
         let call = self
             .primary
             .call(req)

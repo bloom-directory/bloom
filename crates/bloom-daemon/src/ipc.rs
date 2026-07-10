@@ -24,6 +24,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::UNIX_EPOCH;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
@@ -1257,12 +1258,19 @@ fn entry_to_json(e: &Entry) -> Value {
         EntryKind::File => "file",
         EntryKind::Symlink => "symlink",
     };
+    let modified_ms = e.modified.map(|modified| {
+        modified
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+    });
     json!({
         "name": e.name,
         "kind": kind,
         "size": e.size,
         "mode": e.mode,
         "link_target": e.link_target,
+        "modified_ms": modified_ms,
     })
 }
 
