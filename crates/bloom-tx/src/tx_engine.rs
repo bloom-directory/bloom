@@ -1217,6 +1217,28 @@ impl TxEngine {
         } else {
             (Some(max_fee.to_string()), Some(prio.to_string()), None)
         };
+        let funding_check = match session.balance(from).await {
+            Ok(available) => insufficient_native_funds_check(
+                &bloom_proto::checksum_address(&from),
+                spec.display_name.as_deref().unwrap_or(&spec.name),
+                &spec.native_symbol,
+                spec.native_decimals,
+                available,
+                value_wei,
+                gas_limit,
+                if spec.legacy_tx { gas_price } else { max_fee },
+            ),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    wallet,
+                    chain = %spec.name,
+                    account = %bloom_proto::checksum_address(&from),
+                    "tx.native_funding_check_unavailable"
+                );
+                None
+            }
+        };
 
         // For policy evaluation, decide what addresses are involved:
         //   - native send: contract=None,    token=None,         recipient=to
@@ -1234,6 +1256,9 @@ impl TxEngine {
         // (e.g. operator-wide approvals) — appended after the rules engine
         // has produced its own checks so they all show up in plan.md.
         let mut staged_policy_extras: Vec<bloom_proto::PolicyCheck> = Vec::new();
+        if let Some(check) = funding_check {
+            staged_policy_extras.push(check);
+        }
         match &intent.body {
             RawIntentBody::Send { .. } => {
                 if let Some(t) = &token_for_plan {
@@ -4069,6 +4094,39 @@ fn f64_to_micro_usd(v: f64) -> Option<i128> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn insufficient_native_funds_check(
+    account: &str,
+    chain: &str,
+    native_symbol: &str,
+    native_decimals: u8,
+    available: U256,
+    value: U256,
+    gas_limit: u64,
+    fee_cap_per_gas: u128,
+) -> Option<bloom_proto::PolicyCheck> {
+    let gas_budget = U256::from(gas_limit).saturating_mul(U256::from(fee_cap_per_gas));
+    let required = value.saturating_add(gas_budget);
+    if available >= required {
+        return None;
+    }
+
+    let available_display = bloom_proto::format_units(available, native_decimals);
+    let required_display = bloom_proto::format_units(required, native_decimals);
+    let value_display = bloom_proto::format_units(value, native_decimals);
+    let gas_display = bloom_proto::format_units(gas_budget, native_decimals);
+    Some(bloom_proto::PolicyCheck::hard(
+        "balance.native_funds",
+        bloom_proto::PolicyOutcome::Deny,
+        format!(
+            "account {account} has {available_display} {native_symbol} on {chain}; \
+             requires up to {required_display} {native_symbol} \
+             ({value_display} value + {gas_display} gas at the staged fee cap). \
+             Fund the account and restage this transaction before approving."
+        ),
+    ))
+}
+
 /// Approve amount: accepts `"max"` (alias for 2^256 - 1) or a decimal
 /// integer string. Empty falls through to max so the common case
 /// (`{"kind":"approve","token":"…","spender":"…"}`) doesn't require a
@@ -6554,6 +6612,60 @@ mod tests {
     #[test]
     fn f64_to_micro_usd_rejects_overflow() {
         assert_eq!(f64_to_micro_usd(f64::MAX), None);
+    }
+
+    #[test]
+    fn insufficient_native_funds_check_is_hard_and_actionable_in_plan() {
+        let account = "0x0000000000000000000000000000000000000001";
+        let check = insufficient_native_funds_check(
+            account,
+            "Base",
+            "ETH",
+            18,
+            U256::ZERO,
+            U256::from(1_000_000_000_000_000_000u128),
+            21_000,
+            100_000_000_000,
+        )
+        .expect("zero balance cannot cover value and gas");
+
+        assert_eq!(check.rule, "balance.native_funds");
+        assert!(check.is_hard_violation());
+        assert!(
+            check
+                .message
+                .contains(&format!("account {account} has 0 ETH on Base"))
+        );
+        assert!(check.message.contains("requires up to 1.0021 ETH"));
+        assert!(check.message.contains("1 value + 0.0021 gas"));
+        assert!(check.message.contains("Fund the account and restage"));
+
+        let mut staged = fake_staged_1559("0001-insufficient-funds");
+        staged.policy_checks.push(check);
+        let plan = bloom_proto::PlanRender::render(&staged, "ETH", 18);
+        assert!(plan.contains("[Deny] balance.native_funds:"));
+        assert!(plan.contains("Fund the account and restage"));
+    }
+
+    #[test]
+    fn native_funding_check_accepts_exact_required_balance() {
+        let gas_budget = U256::from(21_000u64) * U256::from(100_000_000_000u128);
+        let value = U256::from(1_000_000_000_000_000_000u128);
+
+        assert!(
+            insufficient_native_funds_check(
+                "0x0000000000000000000000000000000000000001",
+                "Base",
+                "ETH",
+                18,
+                value + gas_budget,
+                value,
+                21_000,
+                100_000_000_000,
+            )
+            .is_none(),
+            "an account with exactly value plus the staged gas cap is funded"
+        );
     }
 
     #[test]
