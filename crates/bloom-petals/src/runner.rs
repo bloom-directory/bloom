@@ -470,8 +470,7 @@ fn match_index_for_op<'a>(
         DispatchOp::Lookup => index
             .match_route(path)
             .or_else(|| match_special_route(index, path, "$lookup")),
-        DispatchOp::List => match_special_route(index, path, "$list"),
-        DispatchOp::Read | DispatchOp::Write => index.match_route(path),
+        DispatchOp::List | DispatchOp::Read | DispatchOp::Write => index.match_route(path),
     }
 }
 

@@ -149,7 +149,7 @@ polymarket.petal/
     polymarket/
       $index.wasm
       markets/
-        $list.wasm
+        $index.wasm
         [slug]/
           market.json.wasm
           book.json.wasm
@@ -182,7 +182,7 @@ polymarket.petal/
         [wallet]/
           new.wasm
           drafts/
-            $list.wasm
+            $index.wasm
             [id]/
               plan.md.wasm
               order.json.wasm
@@ -190,7 +190,7 @@ polymarket.petal/
               quote.json.wasm
               review_intent.json.wasm
           receipts/
-            $list.wasm
+            $index.wasm
             [id]/
               receipt.json.wasm
 ```
@@ -300,8 +300,7 @@ For `/apps/polymarket/trade/alice/drafts/abc/plan.md`, params are:
 
 ### Special route modules
 
-- `$index.wasm` describes or handles the directory itself.
-- `$list.wasm` dynamically lists directory children.
+- `$index.wasm` handles directory lookup, listing, and reads.
 - `$lookup.wasm` optionally resolves existence/type for dynamic paths where static inference is insufficient.
 
 ### File modules

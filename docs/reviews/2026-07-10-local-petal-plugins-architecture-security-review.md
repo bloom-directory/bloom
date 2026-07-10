@@ -220,9 +220,8 @@ Some qualifications:
 Route files determine the VFS API:
 
 - `hello.txt.wasm` becomes `hello.txt`
-- `$index.wasm` maps to the containing directory
+- `$index.wasm` owns lookup, listing, and reads for the containing directory
 - `$lookup.wasm` becomes an explicit lookup handler
-- `$list.wasm` becomes an explicit list handler
 - `[wallet].json.wasm` creates a dynamic parameter with a suffix
 - nested directories become nested VFS routes
 

@@ -596,7 +596,7 @@ fn install_metadata_for_route(
         &route.route_id,
         route_kind,
         &component_metadata,
-        &validation.required_caps,
+        None,
         allowed_caps,
         allowed_sign_intents,
     )?;
@@ -605,7 +605,19 @@ fn install_metadata_for_route(
     metadata.side_effecting_read = component_metadata.side_effecting_read;
     metadata.write_async = component_metadata.write_async;
     metadata.executable = component_metadata.executable;
-    metadata.required_caps = component_metadata.required_caps;
+    metadata.required_caps = component_metadata
+        .required_caps
+        .into_iter()
+        .filter(|cap| validation.required_caps.contains(cap))
+        .collect();
+    if component_metadata.sign_intent.is_some()
+        && !metadata.required_caps.iter().any(|cap| cap == "bloom:sign")
+    {
+        return Err(PetalError::InvalidWasm(format!(
+            "v2 route {} metadata sign_intent is not backed by a signing import",
+            route.route_id
+        )));
+    }
     metadata.sign_intent = component_metadata.sign_intent;
     Ok(metadata)
 }
@@ -625,7 +637,7 @@ pub fn narrow_runtime_route_metadata(
         &route.route_id,
         route.kind,
         metadata,
-        &install.required_caps,
+        Some(&install.required_caps),
         &install_caps,
         allowed_sign_intents,
     )?;
@@ -726,7 +738,7 @@ fn validate_component_metadata_policy(
     route_id: &str,
     route_kind: RouteEntryKind,
     metadata: &ComponentRouteMetadata,
-    import_required_caps: &[String],
+    required_cap_ceiling: Option<&[String]>,
     allowed_caps: &BTreeSet<String>,
     allowed_sign_intents: &BTreeSet<String>,
 ) -> Result<(), PetalError> {
@@ -751,16 +763,19 @@ fn validate_component_metadata_policy(
             "v2 route {route_id} metadata mode must be a unix permission mode"
         )));
     }
-    let import_caps = import_required_caps.iter().collect::<BTreeSet<_>>();
+    let cap_ceiling = required_cap_ceiling.map(|caps| caps.iter().collect::<BTreeSet<_>>());
     for cap in &metadata.required_caps {
         if !allowed_caps.contains(cap) {
             return Err(PetalError::InvalidWasm(format!(
                 "v2 route {route_id} metadata requires missing petal.toml cap {cap}"
             )));
         }
-        if !import_caps.contains(cap) {
+        if cap_ceiling
+            .as_ref()
+            .is_some_and(|ceiling| !ceiling.contains(cap))
+        {
             return Err(PetalError::InvalidWasm(format!(
-                "v2 route {route_id} metadata required cap {cap} was not declared by route imports"
+                "v2 route {route_id} metadata required cap {cap} widens its capability ceiling"
             )));
         }
     }
@@ -1221,8 +1236,10 @@ fn remove_generated_artifacts(root: &Path) -> Result<(), PetalError> {
 
 fn route_kind_and_ops(source_path: &str) -> (RouteEntryKind, Vec<RouteOp>) {
     match source_path.rsplit('/').next().unwrap_or_default() {
-        "$index.wasm" => (RouteEntryKind::Dir, vec![RouteOp::Lookup, RouteOp::Read]),
-        "$list.wasm" => (RouteEntryKind::Dir, vec![RouteOp::List]),
+        "$index.wasm" => (
+            RouteEntryKind::Dir,
+            vec![RouteOp::Lookup, RouteOp::List, RouteOp::Read],
+        ),
         "$lookup.wasm" => (RouteEntryKind::File, vec![RouteOp::Lookup]),
         _ => (RouteEntryKind::File, vec![RouteOp::Lookup, RouteOp::Read]),
     }
@@ -1685,10 +1702,13 @@ fn route_pattern_from_rel(rel: &str) -> Result<String, PetalError> {
             segments.pop();
             Ok(segments.join("/"))
         }
-        "$list" | "$lookup" => {
+        "$lookup" => {
             *last = last_without_wasm;
             Ok(segments.join("/"))
         }
+        other if other.starts_with('$') => Err(PetalError::InvalidWasm(format!(
+            "unsupported reserved route file {other}.wasm"
+        ))),
         other => {
             *last = other;
             Ok(segments.join("/"))
@@ -2065,8 +2085,7 @@ fn component_route_export_type(
 
 fn required_component_handler_exports(path: &str) -> &'static [&'static str] {
     match path.rsplit('/').next().unwrap_or_default() {
-        "$index.wasm" => &["lookup", "read"],
-        "$list.wasm" => &["list"],
+        "$index.wasm" => &["lookup", "list", "read"],
         "$lookup.wasm" => &["lookup"],
         _ => &["lookup", "read"],
     }
@@ -2458,12 +2477,7 @@ fn is_host_interface_instance<'a>(
         }
     }
 
-    required_host_type_exports(interface)
-        .iter()
-        .all(|name| exported_types.contains(name))
-        && required_host_func_exports(interface)
-            .iter()
-            .all(|name| exported_funcs.contains(name))
+    !exported_types.is_empty() || !exported_funcs.is_empty()
 }
 
 fn host_type_export(interface: ComponentHostInterface, name: &str) -> Option<HostTypeExport> {
@@ -2520,38 +2534,6 @@ fn host_func_export(interface: ComponentHostInterface, name: &str) -> Option<Hos
             Some(HostFuncExport::EnvRandomBytes)
         }
         _ => None,
-    }
-}
-
-fn required_host_type_exports(interface: ComponentHostInterface) -> &'static [&'static str] {
-    match interface {
-        ComponentHostInterface::HttpFetch => &["request", "response"],
-        ComponentHostInterface::ChainRead => &["request", "response"],
-        ComponentHostInterface::VfsReadwrite => &["entry-kind", "entry"],
-        ComponentHostInterface::EnvRuntime => &[],
-        ComponentHostInterface::StoreKv | ComponentHostInterface::SignSigning => &[],
-        ComponentHostInterface::SignSigningV2 => &["approval-required", "sign-result"],
-        ComponentHostInterface::TxOutbox => &[
-            "evm-transaction",
-            "approval-required",
-            "staged-transaction",
-            "inspection",
-        ],
-    }
-}
-
-fn required_host_func_exports(interface: ComponentHostInterface) -> &'static [&'static str] {
-    match interface {
-        ComponentHostInterface::HttpFetch => &["fetch"],
-        ComponentHostInterface::StoreKv => {
-            &["get", "put", "put-new", "list", "delete", "delete-if-value"]
-        }
-        ComponentHostInterface::SignSigning => &["sign-hash"],
-        ComponentHostInterface::SignSigningV2 => &["sign-hash"],
-        ComponentHostInterface::TxOutbox => &["stage", "confirm", "inspect"],
-        ComponentHostInterface::ChainRead => &["call"],
-        ComponentHostInterface::VfsReadwrite => &["lookup", "list", "read", "write"],
-        ComponentHostInterface::EnvRuntime => &["now-ms", "random-bytes"],
     }
 }
 
@@ -3370,7 +3352,12 @@ fn route_pattern(app_root: &Path, wasm_path: &Path) -> Result<String, PetalError
         "$index" => {
             parts.pop();
         }
-        "$list" | "$lookup" => {}
+        "$lookup" => {}
+        other if other.starts_with('$') => {
+            return Err(PetalError::InvalidWasm(format!(
+                "unsupported reserved route file {other}.wasm"
+            )));
+        }
         _ => {}
     }
     Ok(parts.join("/"))
@@ -4201,7 +4188,7 @@ imports = ["components/helper.wasm"]
     }
 
     #[test]
-    fn v2_special_route_files_normalize_patterns() {
+    fn v2_index_and_lookup_route_files_normalize_patterns() {
         let tmp = tempfile::tempdir().unwrap();
         write_v2_package_with_manifest_and_route(
             tmp.path(),
@@ -4217,11 +4204,6 @@ name = "echo"
         .unwrap();
         write_package_file(
             tmp.path(),
-            "app/echo/items/$list.wasm",
-            route_component_no_imports(),
-        );
-        write_package_file(
-            tmp.path(),
             "app/echo/items/[id]/$lookup.wasm",
             route_component_no_imports(),
         );
@@ -4232,7 +4214,21 @@ name = "echo"
             .iter()
             .map(|route| route.pattern.as_str())
             .collect::<Vec<_>>();
-        assert_eq!(patterns, vec!["", "items/$list", "items/[id]/$lookup"]);
+        assert_eq!(patterns, vec!["", "items/[id]/$lookup"]);
+    }
+
+    #[test]
+    fn v2_unknown_reserved_route_files_are_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_v2_package(tmp.path());
+        write_package_file(
+            tmp.path(),
+            "app/echo/items/$reserved.wasm",
+            route_component_no_imports(),
+        );
+
+        let err = PetalAppPackage::scan_dir(tmp.path()).unwrap_err();
+        assert!(err.to_string().contains("unsupported reserved route file"));
     }
 
     #[test]
@@ -4436,7 +4432,7 @@ name = "echo"
     }
 
     #[test]
-    fn v2_component_routes_require_handler_for_route_kind() {
+    fn v2_component_index_routes_require_list_handler() {
         let tmp = tempfile::tempdir().unwrap();
         write_package_file(
             tmp.path(),
@@ -4449,8 +4445,8 @@ name = "echo"
         write_package_file(tmp.path(), "AGENTS.md", b"# echo agents");
         write_package_file(
             tmp.path(),
-            "app/echo/$list.wasm",
-            &route_component(&["metadata", "read"], &[]),
+            "app/echo/$index.wasm",
+            &route_component(&["metadata", "lookup", "read"], &[]),
         );
 
         let err = PreparedAppPackage::from_dir(tmp.path()).unwrap_err();
@@ -4536,7 +4532,7 @@ allowed = ["bloom:http"]
     }
 
     #[test]
-    fn v2_component_signing_v2_requires_its_exported_nominal_types() {
+    fn v2_component_signing_v2_recognizes_its_exported_nominal_types() {
         let interface = ComponentHostInterface::SignSigningV2;
         assert!(matches!(
             host_type_export(interface, "approval-required"),
@@ -4546,14 +4542,10 @@ allowed = ["bloom:http"]
             host_type_export(interface, "sign-result"),
             Some(HostTypeExport::SignResultV2)
         ));
-        assert_eq!(
-            required_host_type_exports(interface),
-            ["approval-required", "sign-result"]
-        );
     }
 
     #[test]
-    fn v2_component_outbox_requires_inspection_type_and_function() {
+    fn v2_component_outbox_recognizes_inspection_type_and_function() {
         let interface = ComponentHostInterface::TxOutbox;
         assert!(matches!(
             host_type_export(interface, "inspection"),
@@ -4563,8 +4555,6 @@ allowed = ["bloom:http"]
             host_func_export(interface, "inspect"),
             Some(HostFuncExport::EvmTxInspect)
         ));
-        assert!(required_host_type_exports(interface).contains(&"inspection"));
-        assert!(required_host_func_exports(interface).contains(&"inspect"));
     }
 
     #[test]
@@ -4602,6 +4592,53 @@ allowed = ["bloom:http"]
             err.to_string()
                 .contains("invalid Bloom WIT interface shape")
         );
+    }
+
+    #[test]
+    fn v2_component_imports_accept_narrowed_bloom_interfaces() {
+        assert!(host_import_instance_matches(
+            ComponentHostInterface::EnvRuntime,
+            r#"
+(component
+  (type (instance
+    (type (list u8))
+    (type (result 0 (error string)))
+    (type (func (param "len" u32) (result 1)))
+    (export "random-bytes" (func (type 2)))
+  ))
+  (import "bloom:env/runtime@0.1.0" (instance (type 0)))
+)
+"#,
+        ));
+        assert!(host_import_instance_matches(
+            ComponentHostInterface::StoreKv,
+            r#"
+(component
+  (type (instance
+    (type (list u8))
+    (type (option 0))
+    (type (result 1 (error string)))
+    (type (func (param "namespace" string) (param "key" string) (result 2)))
+    (export "get" (func (type 3)))
+  ))
+  (import "bloom:store/kv@0.1.0" (instance (type 0)))
+)
+"#,
+        ));
+        assert!(host_import_instance_matches(
+            ComponentHostInterface::VfsReadwrite,
+            r#"
+(component
+  (type (instance
+    (type (list u8))
+    (type (result 0 (error string)))
+    (type (func (param "path" string) (result 1)))
+    (export "read" (func (type 2)))
+  ))
+  (import "bloom:vfs/readwrite@0.1.0" (instance (type 0)))
+)
+"#,
+        ));
     }
 
     #[test]
@@ -4818,6 +4855,34 @@ name = "echo"
         let mut builder = ComponentBuilder::default();
         builder.component(None, route_component_builder(&["metadata", "read"], &[]));
         builder.finish()
+    }
+
+    fn host_import_instance_matches(interface: ComponentHostInterface, source: &str) -> bool {
+        let wasm = wat::parse_str(source).unwrap();
+        let mut component_types = Vec::new();
+        for payload in Parser::new(0).parse_all(&wasm) {
+            match payload.unwrap() {
+                Payload::ComponentTypeSection(reader) => {
+                    for ty in reader {
+                        component_types.push(ComponentTypeEntry::Type(ty.unwrap()));
+                    }
+                }
+                Payload::ComponentImportSection(reader) => {
+                    for import in reader {
+                        let import = import.unwrap();
+                        if let WasmComponentTypeRef::Instance(type_index) = import.ty {
+                            return is_host_interface_instance(
+                                interface,
+                                type_index,
+                                &component_types,
+                            );
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        false
     }
 
     fn route_component_builder(exports: &[&str], imports: &[&str]) -> ComponentBuilder {
