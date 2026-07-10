@@ -1385,6 +1385,23 @@ mod tests {
         assert!(d.vfs.handler("addressbook").is_some());
         assert!(d.vfs.handler("ens").is_some());
         assert!(d.vfs.handler("public").is_some());
+        assert!(
+            d.vfs.handler("hyperliquid").is_some(),
+            "fresh homes should mount Hyperliquid with public defaults"
+        );
+    }
+
+    #[test]
+    fn config_without_hyperliquid_keeps_surface_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = HomeDir::at(dir.path());
+        home.ensure().unwrap();
+        let mut config = Config::local_default();
+        config.hyperliquid = None;
+        config.save(&home.config_path()).unwrap();
+
+        let daemon = Daemon::from_home(home).unwrap();
+        assert!(daemon.vfs.handler("hyperliquid").is_none());
     }
 
     /// A pre-existing watch spec on disk should be loaded into the
