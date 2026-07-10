@@ -4,7 +4,7 @@ use alloy::transports::TransportError;
 use thiserror::Error;
 
 /// Top-level error variant returned by `bloom-rpc` constructors and the
-/// (still-stub) session API. Callers in `bloom-chain` translate this into
+/// (still-stub) session API. Callers in `bloom-evm` translate this into
 /// their own `ChainError` so we don't leak this enum across crate
 /// boundaries unnecessarily.
 #[derive(Debug, Error)]

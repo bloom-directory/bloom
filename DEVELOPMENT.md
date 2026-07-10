@@ -32,7 +32,7 @@ and [QUICKSTART.md](./QUICKSTART.md); this file covers the dev loop.
 
 ## Building
 
-The workspace contains 17 crates (`Cargo.toml` `[workspace]`). Default builds
+The workspace contains 26 crates (`Cargo.toml` `[workspace]`). Default builds
 exclude the optional NFS mount adapter; opt in with the `mount` feature when
 you need it.
 
@@ -107,6 +107,21 @@ before invoking the docker drivers.
 
 ## Test suites
 
+CI separates the suites by dependency boundary in `.github/workflows/ci.yml`:
+
+- `build_test_archive` compiles all Rust test targets once with
+  `cargo nextest archive` and uploads `target/nextest-archive.tar.zst`.
+- `unit_test` downloads that archive and runs only workspace library tests via
+  nextest, plus doctests with `cargo test --workspace --doc`. It does not
+  install Foundry, Docker, or any external-service credentials.
+- `integration_test` downloads the same archive, installs Foundry, and runs
+  local-only subprocess/anvil tests on the GitHub runner.
+- `e2e_tests` is the live-network lane for ignored external-service tests. It
+  is isolated from fork PRs and reports which optional secrets are present
+  before tests self-skip or run.
+- Docker mount/Enso/live-funds e2e jobs are manual-only (`workflow_dispatch`),
+  with the real-funds path guarded by `BLOOM_RUN_LIVE_FUNDS_E2E=1`.
+
 ### Rust unit tests
 
 Standard `#[cfg(test)] mod tests` blocks, ~572 across the workspace. None
@@ -121,7 +136,7 @@ Or scope to a single crate:
 ```sh
 cargo test -p bloom-vfs              # 219 tests — path router, handlers, caches
 cargo test -p bloom-proto            # 71  tests — config, intent, policy, units
-cargo test -p bloom-chain            # 62  tests — RPC client, blocks, balances
+cargo test -p bloom-evm            # 62  tests — RPC client, blocks, balances
 cargo test -p bloom-tx               # 61  tests — staging, simulation, fee logic
 cargo test -p bloom-mount --features mount  # 43  tests — NFSv4 server (feature-gated)
 cargo test -p bloom-revert           # 27  tests — Error/Panic/custom decoders
@@ -138,9 +153,10 @@ cargo test -p bloom-keystore         # 5   tests — argon2id + chacha20poly1305
 
 ### Rust integration tests
 
-Ten `tests/*.rs` files. All but `crates/bloom/tests/cli.rs` are gated with
-`#[ignore]` because they spawn an anvil or hit the network — pass `-- --ignored`
-to opt in.
+Integration tests live under crate-local `tests/*.rs` files. The CLI smoke
+tests and the primary `bloom-it` anvil flows run by default; heavier anvil,
+fallback, watch, and live-network coverage is gated with `#[ignore]` — pass
+`-- --ignored` to opt in where appropriate.
 
 ```sh
 # Always-on: CLI smoke tests (no anvil, no network)
@@ -225,8 +241,8 @@ In-container drivers and their helpers all live in `tests/docker/`:
   `ca-certificates`, `procps`, `curl`, `jq`. Pins rustfmt + clippy to dodge
   transient registry hiccups.
 - `docker-compose.yml` — anvil-fork sidecar (Base mainnet at chain_id 8453,
-  port 8545, healthcheck via `cast chain-id`); two driver profiles (`enso`,
-  `fork`) sharing the sidecar.
+  port 8545, healthcheck via `cast chain-id`); driver profiles (`enso`,
+  `fork`, `mempool`) sharing the sidecar.
 - `lib.sh` — bash helpers (`prepare_home_dir`, `build_mount_demo`,
   `start_mount_demo`, `wait_for_mount`, `wait_tx_success`,
   `top_up_anvil_balance`, etc.) plus the deterministic Anvil fixtures.
@@ -249,8 +265,8 @@ Common gotchas (more in each script's header comment):
 
 ### Acceptance script (`scripts/acceptance.sh`)
 
-Host-side end-to-end suite that doesn't need Docker. Drives the four happy
-paths from §11.4 of the design doc using `bloom` CLI calls (which exercise the
+Host-side end-to-end suite that doesn't need Docker. Drives the local native
+ETH and ERC-20 acceptance paths using `bloom` CLI calls (which exercise the
 same code as VFS writes).
 
 ```sh
@@ -264,9 +280,7 @@ Prereqs: `anvil`, `cast`, `forge`, `jq`, and a built `target/release/bloom`
 | # | Scenario | Skipped when |
 |---|----------|--------------|
 | 1 | Native ETH send staged on local Anvil; initial confirm must deny and write central `approval_challenge.json` with `ceremony_url` | (always runs) |
-| 2 | ERC-20 transfer staged with deployed `MockERC20`; initial confirm must deny and write central `approval_challenge.json` with `ceremony_url` | (always runs) |
-| 3 | Uniswap V2 swap on a mainnet fork | `BLOOM_MAINNET_RPC` unset |
-| 4 | Enso intent on a mainnet fork | `BLOOM_MAINNET_RPC` or `BLOOM_ENSO_KEY` unset |
+| 2 | ERC-20 transfer staged with deployed `MockERC20`; initial confirm must deny and write central `approval_challenge.json` with `ceremony_url` | `forge` missing |
 
 Anvil and the temp home dir are torn down on exit via `trap`.
 
@@ -388,7 +402,7 @@ Quick "if I changed X, what should I run?" matrix.
 | `bloom-proto` (config, intents, units) | `cargo test -p bloom-proto` |
 | `bloom-vfs` handlers | `cargo test -p bloom-vfs` then `bash tests/docker/run.sh --mount` |
 | `bloom-rpc` failover/health/WS | `cargo test -p bloom-rpc` then `cargo test -p bloom-it -- --ignored` |
-| `bloom-chain` | `cargo test -p bloom-chain` then `cargo test -p bloom-it --test anvil_e2e -- --ignored` |
+| `bloom-evm` | `cargo test -p bloom-evm` then `cargo test -p bloom-it --test anvil_e2e -- --ignored` |
 | `bloom-tx` staging / nonce / replace | `cargo test -p bloom-tx` then `cargo test -p bloom-it --test anvil_e2e -- --ignored` then `bash tests/docker/run.sh --fork` |
 | `bloom-keystore` | `cargo test -p bloom-keystore` |
 | `bloom-revert` | `cargo test -p bloom-revert` then `cargo test -p bloom-it --test revert_decoding -- --ignored` (and `revert_decoding_fallbacks` with `--features bytecode-decompile` if you touched the heimdall path) |

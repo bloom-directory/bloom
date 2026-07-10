@@ -183,7 +183,7 @@ Bloom is a Rust Cargo workspace. The main user-facing/runtime crates are:
 | `bloom` | CLI binary; thin client plus in-process daemon driver. |
 | `bloom-daemon` | Wires home dir, config, chains, keystore, VFS, IPC, ENS, watches, and optional feature adapters. |
 | `bloom-vfs` | Path router, handler trait, per-path caching, and vendored docs. |
-| `bloom-chain` / `bloom-rpc` | RPC pools, per-chain engines, chain reads, and provider health. |
+| `bloom-evm` / `bloom-rpc` | RPC pools, per-chain engines, chain reads, and provider health. |
 | `bloom-tx` | Tx staging, simulation, signing, broadcast, nonce management, and policy enforcement. |
 | `bloom-keystore` | Encrypted local key storage and signer integration. |
 | `bloom-mempool` | Optional pending-transaction indexing for configured WebSocket providers. |
@@ -243,7 +243,7 @@ and example crates used by the broader Bloom runtime and examples.
   feeds are wired at daemon startup. The generic `eth_subscribe` path
   exists in `bloom-mempool` but is not enabled by default until tx-body
   enrichment is complete.
-- **Watch executor is poll-based.** `bloom-chain` is HTTP-first, so the
+- **Watch executor is poll-based.** `bloom-evm` is HTTP-first, so the
   executor polls on an interval rather than using a WebSocket fast path.
 - **NFT support has sharp edges.** Reads cover holder and collection
   views; writes flow through wallet outbox intents. ERC-1155 per-token

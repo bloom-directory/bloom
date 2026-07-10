@@ -10,7 +10,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use bloom_chain::ChainRegistry;
+use bloom_evm::ChainRegistry;
 use tokio::sync::oneshot;
 
 use crate::outbox::{MinedReceipt, Outbox, RECEIPT_FILE};

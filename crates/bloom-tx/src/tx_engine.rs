@@ -31,9 +31,9 @@ use bloom_auth_api::{
     NonceState, PetalHost, PetalPolicySnapshot, SealedAction, SignHashRequest, SignedApproval,
     SigningAttestation, StandingSessionRecord,
 };
-use bloom_chain::{ChainClient, ChainError, IERC20, NftKind};
+use bloom_evm::{ChainClient, ChainError, IERC20, NftKind};
 
-// Local NFT-write interfaces. `bloom-chain` declares the read shapes for
+// Local NFT-write interfaces. `bloom-evm` declares the read shapes for
 // ERC-721/1155; we add the write functions here so calldata encoding stays
 // in bloom-tx without expanding the chain crate's read-only surface.
 sol! {
@@ -4577,7 +4577,7 @@ mod tests {
         .unwrap()
     }
 
-    fn fake_chain_client(allow_broadcast: bool) -> bloom_chain::ChainClient {
+    fn fake_chain_client(allow_broadcast: bool) -> bloom_evm::ChainClient {
         let spec = bloom_proto::ChainSpec {
             name: "anvil".into(),
             chain_id: 31337,
@@ -4590,7 +4590,7 @@ mod tests {
             native_decimals: 18,
             legacy_tx: false,
         };
-        bloom_chain::ChainClient::new(spec).unwrap()
+        bloom_evm::ChainClient::new(spec).unwrap()
     }
 
     fn test_signing_hash() -> B256 {
@@ -5095,7 +5095,7 @@ mod tests {
             native_decimals: 18,
             legacy_tx: false,
         };
-        let chain = bloom_chain::ChainClient::new(spec).unwrap();
+        let chain = bloom_evm::ChainClient::new(spec).unwrap();
         let policy = bloom_proto::Policy::default();
         let report = evaluate_mev_risk(&chain, &cd, U256::ZERO, &policy);
         assert_eq!(report.risk, bloom_mempool::MevRisk::High);
@@ -5144,7 +5144,7 @@ mod tests {
     async fn confirm_rejects_id_already_in_sent() {
         let (engine, spec, dir) = fake_engine(60_000);
         let permit = permit_for(&dir);
-        let chain = bloom_chain::ChainClient::new(spec.clone()).unwrap();
+        let chain = bloom_evm::ChainClient::new(spec.clone()).unwrap();
         let policy = bloom_proto::Policy::default();
 
         // Stage manually (write_pending) so we don't need a live RPC.
@@ -5177,7 +5177,7 @@ mod tests {
     async fn confirm_rejects_expired_stage() {
         let (engine, spec, dir) = fake_engine(60_000);
         let permit = permit_for(&dir);
-        let chain = bloom_chain::ChainClient::new(spec.clone()).unwrap();
+        let chain = bloom_evm::ChainClient::new(spec.clone()).unwrap();
         let policy = bloom_proto::Policy::default();
 
         let mut staged = fake_staged_1559("0001-test");
@@ -5201,7 +5201,7 @@ mod tests {
         let (engine, spec, dir) = fake_engine(60_000);
         let engine = with_test_auth_and_host(engine, true);
         let permit = permit_for(&dir);
-        let chain = bloom_chain::ChainClient::new(spec.clone()).unwrap();
+        let chain = bloom_evm::ChainClient::new(spec.clone()).unwrap();
         let policy = bloom_proto::Policy::default();
 
         let mut staged = fake_staged_1559("0001-attempt");
@@ -5243,7 +5243,7 @@ mod tests {
         let (engine, spec, dir) = fake_engine(60_000);
         let engine = with_test_auth_and_host(engine, true);
         let permit = permit_for(&dir);
-        let chain = bloom_chain::ChainClient::new(spec.clone()).unwrap();
+        let chain = bloom_evm::ChainClient::new(spec.clone()).unwrap();
         let policy = bloom_proto::Policy::default();
 
         let mut staged = fake_staged_1559("0001-session-attempt");
@@ -5289,7 +5289,7 @@ mod tests {
         let (engine, spec, dir) = fake_engine(60_000);
         let engine = with_test_auth_and_host(engine, true);
         let permit = permit_for(&dir);
-        let chain = bloom_chain::ChainClient::new(spec.clone()).unwrap();
+        let chain = bloom_evm::ChainClient::new(spec.clone()).unwrap();
         let policy = bloom_proto::Policy::default();
 
         let mut staged = fake_staged_1559("0001-replace");
@@ -5367,7 +5367,7 @@ mod tests {
         let engine = with_test_auth_and_host(engine, true);
         spec.allow_broadcast = false;
         let permit = permit_for(&dir);
-        let chain = bloom_chain::ChainClient::new(spec.clone()).unwrap();
+        let chain = bloom_evm::ChainClient::new(spec.clone()).unwrap();
         let policy = bloom_proto::Policy::default();
 
         let mut staged = fake_staged_1559("0001-replace-gated");
@@ -5589,7 +5589,7 @@ mod tests {
         // actually dial the RPC URL in `spec`, which is why this test
         // can run with a stub spec and no live node.
         let (engine, spec, _dir) = fake_engine(60_000);
-        let chain = bloom_chain::ChainClient::new(spec.clone()).unwrap();
+        let chain = bloom_evm::ChainClient::new(spec.clone()).unwrap();
         let addr = Address::ZERO;
         assert_eq!(
             engine
@@ -5622,7 +5622,7 @@ mod tests {
     async fn resolve_intent_body_nft_transfer_hinted_erc721() {
         use bloom_proto::intent::RawIntentBody;
         let (engine, spec, _dir) = fake_engine(60_000);
-        let chain = bloom_chain::ChainClient::new(spec.clone()).unwrap();
+        let chain = bloom_evm::ChainClient::new(spec.clone()).unwrap();
         let from = "0x000000000000000000000000000000000000aaaa"
             .parse::<Address>()
             .unwrap();
@@ -5662,7 +5662,7 @@ mod tests {
     async fn resolve_intent_body_nft_transfer_hinted_erc1155_defaults_amount_to_one() {
         use bloom_proto::intent::RawIntentBody;
         let (engine, spec, _dir) = fake_engine(60_000);
-        let chain = bloom_chain::ChainClient::new(spec.clone()).unwrap();
+        let chain = bloom_evm::ChainClient::new(spec.clone()).unwrap();
         let from = "0x000000000000000000000000000000000000aaaa"
             .parse::<Address>()
             .unwrap();
@@ -5700,7 +5700,7 @@ mod tests {
         // happy path via the calldata-encoding tests above. Here we
         // assert that an Unknown contract is rejected as expected.
         let (engine, spec, _dir) = fake_engine(60_000);
-        let chain = bloom_chain::ChainClient::new(spec.clone()).unwrap();
+        let chain = bloom_evm::ChainClient::new(spec.clone()).unwrap();
         let from = "0x000000000000000000000000000000000000aaaa"
             .parse::<Address>()
             .unwrap();
@@ -5727,7 +5727,7 @@ mod tests {
     async fn resolve_intent_body_rejects_unknown_standard_hint() {
         use bloom_proto::intent::RawIntentBody;
         let (engine, spec, _dir) = fake_engine(60_000);
-        let chain = bloom_chain::ChainClient::new(spec.clone()).unwrap();
+        let chain = bloom_evm::ChainClient::new(spec.clone()).unwrap();
         let from = Address::ZERO;
         let body = RawIntentBody::NftTransfer {
             contract: "0x0000000000000000000000000000000000001155".into(),
@@ -5754,7 +5754,7 @@ mod tests {
         let (engine, spec, dir) = fake_engine(60_000);
         let engine = with_test_auth_and_host(engine, true);
         let permit = permit_for(&dir);
-        let chain = bloom_chain::ChainClient::new(spec.clone()).unwrap();
+        let chain = bloom_evm::ChainClient::new(spec.clone()).unwrap();
 
         // Soft-warn on tx, with a non-default override token.
         let policy = bloom_proto::Policy {
@@ -5827,7 +5827,7 @@ mod tests {
 
         let (engine, spec, dir) = fake_engine(60_000);
         let permit = permit_for(&dir);
-        let chain = bloom_chain::ChainClient::new(spec.clone()).unwrap();
+        let chain = bloom_evm::ChainClient::new(spec.clone()).unwrap();
         let policy = bloom_proto::Policy::default();
 
         let mut staged = fake_staged_1559("0001-test");
@@ -5867,7 +5867,7 @@ mod tests {
         let (engine, spec, dir) = fake_engine(60_000);
         let engine = with_test_auth_and_host(engine, true);
         let permit = permit_for(&dir);
-        let chain = bloom_chain::ChainClient::new(spec.clone()).unwrap();
+        let chain = bloom_evm::ChainClient::new(spec.clone()).unwrap();
         let policy = bloom_proto::Policy::default(); // override_sentinel() == "override"
 
         let mut staged = fake_staged_1559("0001-test");
@@ -5921,7 +5921,7 @@ mod tests {
     async fn broadcast_approval_required_blocks_confirm_before_rpc() {
         let (engine, spec, dir) = fake_engine(60_000);
         let permit = permit_for(&dir);
-        let chain = bloom_chain::ChainClient::new(spec.clone()).unwrap();
+        let chain = bloom_evm::ChainClient::new(spec.clone()).unwrap();
         let mut policy = bloom_proto::Policy::default();
         policy.approval.require_broadcast_approval = true;
 
@@ -5976,7 +5976,7 @@ mod tests {
         );
         let engine = with_test_host(engine, false);
         let permit = permit_for(&dir);
-        let chain = bloom_chain::ChainClient::new(spec.clone()).unwrap();
+        let chain = bloom_evm::ChainClient::new(spec.clone()).unwrap();
         let mut policy = bloom_proto::Policy::default();
         policy.approval.require_broadcast_approval = true;
 
@@ -6044,7 +6044,7 @@ mod tests {
         );
         let engine = with_test_host(engine, false);
         let permit = permit_for(&dir);
-        let chain = bloom_chain::ChainClient::new(spec.clone()).unwrap();
+        let chain = bloom_evm::ChainClient::new(spec.clone()).unwrap();
         let mut policy = bloom_proto::Policy::default();
         policy.approval.require_broadcast_approval = true;
 
@@ -6129,7 +6129,7 @@ mod tests {
             engine.with_auth_services(Arc::new(RejectingTestVerifier), Arc::new(PreApprovedWriter));
         let engine = with_test_host(engine, false);
         let permit = permit_for(&dir);
-        let chain = bloom_chain::ChainClient::new(spec.clone()).unwrap();
+        let chain = bloom_evm::ChainClient::new(spec.clone()).unwrap();
         let mut policy = bloom_proto::Policy::default();
         policy.approval.require_broadcast_approval = true;
 
@@ -6164,7 +6164,7 @@ mod tests {
         let (engine, spec, dir) = fake_engine(60_000);
         let engine = with_test_auth_and_host(engine, true);
         let permit = permit_for(&dir);
-        let chain = bloom_chain::ChainClient::new(spec.clone()).unwrap();
+        let chain = bloom_evm::ChainClient::new(spec.clone()).unwrap();
         let mut policy = bloom_proto::Policy::default();
         policy.approval.agent_autonomy = Some(bloom_proto::AgentAutonomyMode::UnderPolicy);
         policy.limits.max_tx_usd = Some("3".into());
@@ -6323,7 +6323,7 @@ mod tests {
         let (engine, mut spec, _dir) = fake_engine(60_000);
         spec.name = "sepolia".into();
         spec.chain_id = bloom_mempool::SEPOLIA_CHAIN_ID;
-        let chain = bloom_chain::ChainClient::new(spec.clone()).unwrap();
+        let chain = bloom_evm::ChainClient::new(spec.clone()).unwrap();
         let signer = test_signer();
         let mut policy = bloom_proto::Policy::default();
         policy.private.enabled = true;
@@ -6356,7 +6356,7 @@ mod tests {
     #[tokio::test]
     async fn broadcast_rejects_private_on_non_mainnet() {
         let (engine, spec, _dir) = fake_engine(60_000);
-        let chain = bloom_chain::ChainClient::new(spec.clone()).unwrap();
+        let chain = bloom_evm::ChainClient::new(spec.clone()).unwrap();
         let signer = test_signer();
         let mut policy = bloom_proto::Policy::default();
         policy.private.enabled = true;

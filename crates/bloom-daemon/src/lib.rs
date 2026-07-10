@@ -17,11 +17,8 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bloom_auth::{AuthStore, StoreApprovalVerifier};
-use bloom_chain::{ChainClient, ChainRegistry};
-use bloom_chain_node::rpc::{RpcChainAdapter, RpcClient};
-use bloom_chain_types::ssz::Encode;
-use bloom_chain_types::tx::{Tx, TxKind};
-use bloom_chain_types::types::{Address as ChainAddress, PubKeyBytes, SigBytes};
+use bloom_evm::{ChainClient, ChainRegistry};
+
 use bloom_defi::EnsoClient;
 use bloom_ens::EnsClient;
 use bloom_etherscan::EtherscanClient;
@@ -36,7 +33,6 @@ use bloom_revert::{
     AbiSource, BuiltinDecoder, DecoderChain, EtherscanAbiDecoder, EtherscanAbiSource,
     OpenchainDecoder, boxed,
 };
-use bloom_script::{ChainStateIface, PqSignature, PtbTx};
 use bloom_tx::outbox::{CentralActionIdentity, CentralOutboxProjection, Outbox};
 use bloom_tx::tx_engine::TxEngine;
 use bloom_vfs::handlers::outbox::StagedPetalIdentity;
@@ -47,8 +43,7 @@ use bloom_vfs::handlers::{
     HyperliquidHandler, OutboxHandler, PolymarketHandler, PricesHandler, RequestsHandler,
     SimulateHandler, StatusHandler, ToolsHandler, WalletsHandler, WatchHandler,
 };
-use bloom_vfs::tx_handler::PtbSubmitter;
-use bloom_vfs::{AuthServices, HandlerError, PathCache, Vfs};
+use bloom_vfs::{AuthServices, PathCache, Vfs};
 use bloom_watch::{WatchExecutor, WatchRegistry};
 use thiserror::Error;
 use tokio::sync::watch;
@@ -151,7 +146,7 @@ pub enum DaemonError {
     #[error("keystore: {0}")]
     Keystore(String),
     #[error("chain: {0}")]
-    Chain(#[from] bloom_chain::ChainError),
+    Chain(#[from] bloom_evm::ChainError),
     #[error("outbox: {0}")]
     Outbox(String),
     #[error("audit: {0}")]
@@ -708,25 +703,6 @@ impl Daemon {
                         .map_err(|e| DaemonError::Audit(e.to_string()))?,
                 ) as _,
             );
-
-        if let Some(chain_state) = tx_chain_state_adapter(&home) {
-            let rpc_sock = home.root().join("chain").join("rpc.sock");
-            let rpc_client = match std::env::var("BLOOM_RPC_TCP") {
-                Ok(addr) if !addr.is_empty() => RpcClient::tcp(addr),
-                _ => RpcClient::new(&rpc_sock),
-            };
-            let submitter = Arc::new(RpcPtbSubmitter::new(home.clone(), rpc_client));
-            vfs_builder = vfs_builder.mount(
-                "petals",
-                Arc::new(bloom_vfs::PetalsEndpointHandler::new(chain_state.clone())) as _,
-            );
-            vfs_builder = vfs_builder.mount(
-                "tx",
-                Arc::new(bloom_vfs::TxHandler::new(chain_state).with_submitter(submitter)) as _,
-            );
-        } else {
-            debug!("daemon.tx_skipped: no ChainStateIface adapter available");
-        }
 
         // DeFi: Enso's public REST works without an API key for chains
         // they support keyless (currently quote+route on Base mainnet).
@@ -1388,186 +1364,6 @@ fn pick_ens_client(chains: &ChainRegistry) -> Option<EnsClient> {
     None
 }
 
-#[derive(Clone)]
-struct RpcPtbSubmitter {
-    home: HomeDir,
-    client: RpcClient,
-}
-
-impl RpcPtbSubmitter {
-    fn new(home: HomeDir, client: RpcClient) -> Self {
-        Self { home, client }
-    }
-
-    fn chain_dir(&self) -> std::path::PathBuf {
-        self.home.root().join("chain")
-    }
-
-    fn load_validator_key(
-        &self,
-    ) -> Result<
-        (
-            bloom_keystore::xdsa::XdsaSecretKey,
-            bloom_keystore::xdsa::XdsaPublicKey,
-            ChainAddress,
-        ),
-        HandlerError,
-    > {
-        let key_path = self.chain_dir().join("keystore").join("validator.xdsa");
-        let key_bytes = std::fs::read(&key_path)
-            .map_err(|e| HandlerError::backend(format!("read {}: {e}", key_path.display())))?;
-        let sk = bloom_keystore::xdsa::XdsaSecretKey::from_bytes(&key_bytes)
-            .map_err(|e| HandlerError::backend(format!("decode validator key: {e}")))?;
-        let pk = sk.public_key();
-        let sender = ChainAddress::from_pubkey_bytes(&pk.0);
-        Ok((sk, pk, sender))
-    }
-
-    fn load_chain_id(&self) -> Result<String, HandlerError> {
-        let path = self.chain_dir().join("genesis.toml");
-        let text = std::fs::read_to_string(&path)
-            .map_err(|e| HandlerError::backend(format!("read {}: {e}", path.display())))?;
-        let parsed: bloom_chain_node::genesis::GenesisFile = toml::from_str(&text)
-            .map_err(|e| HandlerError::backend(format!("parse {}: {e}", path.display())))?;
-        Ok(parsed.chain_id)
-    }
-
-    async fn fetch_nonce(&self, sender: ChainAddress) -> Result<u64, HandlerError> {
-        let value = self
-            .client
-            .call(
-                "chain_query_account",
-                serde_json::json!({ "address": hex::encode(sender.0) }),
-            )
-            .await
-            .map_err(err_he)?;
-        Ok(value.get("nonce").and_then(|v| v.as_u64()).unwrap_or(0))
-    }
-
-    async fn poll_receipt(
-        &self,
-        tx_hash: bloom_chain_types::types::Hash32,
-    ) -> Result<serde_json::Value, HandlerError> {
-        let deadline = std::time::Instant::now() + Duration::from_secs(30);
-        loop {
-            let value = self
-                .client
-                .call(
-                    "chain_query_tx",
-                    serde_json::json!({ "tx_hash": hex::encode(tx_hash.0) }),
-                )
-                .await
-                .map_err(err_he)?;
-            if !value.is_null() {
-                return Ok(value);
-            }
-            if std::time::Instant::now() >= deadline {
-                return Err(HandlerError::backend(format!(
-                    "timed out waiting for tx {}",
-                    hex::encode(tx_hash.0)
-                )));
-            }
-            tokio::time::sleep(Duration::from_millis(150)).await;
-        }
-    }
-
-    fn build_outer_tx(
-        &self,
-        sk: &bloom_keystore::xdsa::XdsaSecretKey,
-        pk: &bloom_keystore::xdsa::XdsaPublicKey,
-        sender: ChainAddress,
-        chain_id: String,
-        nonce: u64,
-        ptb_bytes: Vec<u8>,
-    ) -> Tx {
-        let mut tx = Tx {
-            chain_id,
-            sender,
-            nonce,
-            max_fuel: 10_000_000,
-            fee_per_unit: 1,
-            kind: TxKind::SubmitPtb { ptb_bytes },
-            pubkey: PubKeyBytes(pk.to_bytes()),
-            sig: SigBytes(vec![]),
-        };
-        let digest = tx.signing_digest();
-        let sig = sk.sign(&digest.0);
-        tx.sig = SigBytes(sig.to_bytes());
-        tx
-    }
-}
-
-#[async_trait::async_trait]
-impl PtbSubmitter for RpcPtbSubmitter {
-    async fn select_gas_payer(
-        &self,
-        signers: &[[u8; 32]],
-    ) -> Result<bloom_objects::ObjectId, HandlerError> {
-        let signer = signers
-            .first()
-            .ok_or_else(|| HandlerError::invalid("no signers set"))?;
-        bloom_chain_node::gas_select::select_loom_gas_payer_rpc(&self.client, *signer, 1_000_000)
-            .await
-            .map_err(|e| HandlerError::invalid(e.to_string()))
-    }
-
-    async fn submit_ptb(
-        &self,
-        _session_id: bloom_ptb_builder::session::SessionId,
-        mut tx: PtbTx,
-        _status: bloom_ptb_builder::SessionStatus,
-    ) -> Result<Vec<serde_json::Value>, HandlerError> {
-        let (sk, pk, sender) = self.load_validator_key()?;
-        if tx.signers != vec![sender.0] {
-            return Err(HandlerError::invalid(
-                "tx commit can sign exactly one signer: the validator key's xDSA address",
-            ));
-        }
-        let ptb_digest = tx.signing_digest();
-        tx.signatures = vec![PqSignature(sk.sign(&ptb_digest).to_bytes())];
-        let ptb_bytes = bloom_script::encode_ptb(&tx)
-            .map_err(|e| HandlerError::backend(format!("encode signed PTB: {e}")))?;
-
-        let chain_id = self.load_chain_id()?;
-        let nonce = self.fetch_nonce(sender).await? + 1;
-        let outer = self.build_outer_tx(&sk, &pk, sender, chain_id, nonce, ptb_bytes);
-        let outer_hash = outer.tx_hash();
-        self.client
-            .call(
-                "chain_submit_tx",
-                serde_json::json!({ "tx_hex": hex::encode(outer.as_ssz_bytes()) }),
-            )
-            .await
-            .map_err(err_he)?;
-        let receipt = self.poll_receipt(outer_hash).await?;
-        Ok(vec![
-            serde_json::json!({
-                "kind": "submit",
-                "tx_hash": format!("0x{}", hex::encode(outer_hash.0)),
-            }),
-            serde_json::json!({
-                "kind": "receipt",
-                "tx_hash": format!("0x{}", hex::encode(outer_hash.0)),
-                "receipt": receipt,
-            }),
-        ])
-    }
-}
-
-fn err_he(e: impl std::fmt::Display) -> HandlerError {
-    HandlerError::backend(e.to_string())
-}
-
-/// Integration seam for the tx-session VFS front door.
-///
-/// `bloom_vfs::TxHandler` needs the petal/PTB read model exposed as
-/// `ChainStateIface`. The authoritative sovereign-chain `State` lives in the
-/// validator, so the daemon mounts `tx/` through the chain JSON-RPC read model.
-fn tx_chain_state_adapter(home: &HomeDir) -> Option<Arc<dyn ChainStateIface + Send + Sync>> {
-    let rpc_sock = home.root().join("chain").join("rpc.sock");
-    Some(Arc::new(RpcChainAdapter::from_env_or_socket(&rpc_sock)))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1589,16 +1385,6 @@ mod tests {
         assert!(d.vfs.handler("addressbook").is_some());
         assert!(d.vfs.handler("ens").is_some());
         assert!(d.vfs.handler("public").is_some());
-        assert!(d.vfs.handler("petals").is_some());
-    }
-
-    #[test]
-    fn tx_front_door_mounts_chain_rpc_adapter() {
-        let dir = tempfile::tempdir().unwrap();
-        let home = HomeDir::at(dir.path());
-        let d = Daemon::from_home(home).unwrap();
-        assert!(tx_chain_state_adapter(&d.home).is_some());
-        assert!(d.vfs.handler("tx").is_some());
     }
 
     /// A pre-existing watch spec on disk should be loaded into the

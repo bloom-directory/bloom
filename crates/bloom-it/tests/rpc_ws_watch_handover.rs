@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 
 use alloy::providers::Provider;
 use anyhow::{Context, Result, anyhow};
-use bloom_chain::{ChainClient, ChainRegistry};
+use bloom_evm::{ChainClient, ChainRegistry};
 use bloom_it::spawn_anvil;
 use bloom_proto::{ChainSpec, EndpointSpec, HomeDir};
 use bloom_watch::executor::WatchExecutor;

@@ -434,7 +434,7 @@ fn vfs_ls_status_lists_known_files() {
         .assert()
         .success();
     let out = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
-    for required in ["version", "uptime", "started_at", "home", "chains", "audit"] {
+    for required in ["version", "uptime", "started_at", "chains", "audit"] {
         assert!(
             out.lines().any(|l| l.starts_with(required)),
             "expected `{required}` in vfs ls /status, got:\n{out}"
@@ -994,8 +994,60 @@ fn wallet_address_qr_out_writes_svg() {
 #[test]
 fn vfs_routes_via_ipc_when_socket_exists() {
     use bloom_daemon::ipc::{IpcServer, default_socket_path};
-    use bloom_test_util::mocks::SingleFileHandler;
-    use bloom_vfs::Vfs;
+    use bloom_vfs::{Entry, Handler, HandlerError, Vfs, VfsPath};
+
+    struct SingleFileHandler {
+        name: String,
+        body: Vec<u8>,
+    }
+
+    impl SingleFileHandler {
+        fn new(name: impl Into<String>, body: Vec<u8>) -> Self {
+            Self {
+                name: name.into(),
+                body,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Handler for SingleFileHandler {
+        async fn lookup(&self, path: &VfsPath) -> Result<Entry, HandlerError> {
+            match path
+                .segments()
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .as_slice()
+            {
+                [] => Ok(Entry::dir("probe")),
+                [leaf] if *leaf == self.name => Ok(Entry::read_only_file(&self.name)),
+                _ => Err(HandlerError::NotFound(path.to_string_path())),
+            }
+        }
+
+        async fn read(&self, path: &VfsPath) -> Result<Vec<u8>, HandlerError> {
+            match path
+                .segments()
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .as_slice()
+            {
+                [leaf] if *leaf == self.name => Ok(self.body.clone()),
+                [] => Err(HandlerError::NotAFile(path.to_string_path())),
+                _ => Err(HandlerError::NotFound(path.to_string_path())),
+            }
+        }
+
+        async fn list(&self, path: &VfsPath) -> Result<Vec<Entry>, HandlerError> {
+            if path.is_root() {
+                Ok(vec![Entry::read_only_file(&self.name)])
+            } else {
+                Err(HandlerError::NotADir(path.to_string_path()))
+            }
+        }
+    }
 
     // A trivial in-memory handler that the production daemon never mounts;
     // if the CLI's `vfs ls /probe` returns this entry, the request must
@@ -1248,139 +1300,4 @@ fn install_same_hash_same_mode_different_caps_returns_cap_mismatch() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("cap mismatch"));
-}
-
-// ---------------------------------------------------------------------------
-// `bloom chain init` — review 2026-05-19 #9
-// ---------------------------------------------------------------------------
-
-/// `chain init` must refuse to overwrite an existing `validator.xdsa` unless
-/// `--force` is passed. Pre-fix the second invocation would silently
-/// generate a fresh keypair and clobber the operator's existing secret.
-#[test]
-fn chain_init_refuses_to_overwrite_validator_key_without_force() {
-    let home = fresh_home();
-    bloom_cmd(home.path())
-        .args(["chain", "init"])
-        .assert()
-        .success();
-    let key_path = home
-        .path()
-        .join("chain")
-        .join("keystore")
-        .join("validator.xdsa");
-    let first = std::fs::read(&key_path).expect("first init wrote a key");
-
-    bloom_cmd(home.path())
-        .args(["chain", "init"])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("refusing to overwrite"))
-        .stderr(predicate::str::contains("--force"));
-
-    let after_fail = std::fs::read(&key_path).expect("key still present after refused re-init");
-    assert_eq!(
-        first, after_fail,
-        "refused chain init must not have touched the existing key"
-    );
-
-    bloom_cmd(home.path())
-        .args(["chain", "init", "--force"])
-        .assert()
-        .success();
-    let forced = std::fs::read(&key_path).expect("forced init wrote a key");
-    assert_ne!(
-        first, forced,
-        "--force must mint a fresh keypair (replacing the previous bytes)"
-    );
-}
-
-/// On Unix, the freshly written validator secret must be mode 0o600 — no
-/// group / world read or write. Pre-fix the file landed with umask-default
-/// 0644 and a malicious group member could lift the secret.
-#[cfg(unix)]
-#[test]
-fn chain_init_writes_validator_key_with_mode_0600() {
-    use std::os::unix::fs::PermissionsExt;
-
-    let home = fresh_home();
-    bloom_cmd(home.path())
-        .args(["chain", "init"])
-        .assert()
-        .success();
-    let key_path = home
-        .path()
-        .join("chain")
-        .join("keystore")
-        .join("validator.xdsa");
-    let mode = std::fs::metadata(&key_path)
-        .expect("stat validator.xdsa")
-        .permissions()
-        .mode()
-        & 0o777;
-    assert_eq!(
-        mode, 0o600,
-        "validator.xdsa must be mode 0o600, got 0o{mode:o}"
-    );
-
-    // `--force` re-init must also leave the file at 0o600, not whatever the
-    // pre-existing mode was.
-    bloom_cmd(home.path())
-        .args(["chain", "init", "--force"])
-        .assert()
-        .success();
-    let mode_after_force = std::fs::metadata(&key_path)
-        .expect("stat validator.xdsa after --force")
-        .permissions()
-        .mode()
-        & 0o777;
-    assert_eq!(mode_after_force, 0o600);
-}
-
-/// `chain testnet` writes per-validator key files in fresh `home<i>/chain/`
-/// directories. Those files must also be mode 0o600 on Unix.
-#[cfg(unix)]
-#[test]
-fn chain_testnet_writes_validator_keys_with_mode_0600() {
-    use std::os::unix::fs::PermissionsExt;
-
-    let home = fresh_home();
-    let outdir = home.path().join("testnet");
-    bloom_cmd(home.path())
-        .args([
-            "chain",
-            "testnet",
-            "--validators",
-            "2",
-            "--output-dir",
-            outdir.to_str().unwrap(),
-        ])
-        .assert()
-        .success();
-    let genesis = std::fs::read_to_string(outdir.join("home0").join("chain").join("genesis.toml"))
-        .expect("read generated genesis.toml");
-    assert!(
-        genesis.contains("[[petals]]")
-            && genesis.contains(r#"path = "/bloom/petals/core/fungible""#)
-            && genesis.contains("wasm_hex = \"00"),
-        "generated funded genesis must bind the core fungible petal"
-    );
-    for i in 0..2u8 {
-        let key = outdir
-            .join(format!("home{i}"))
-            .join("chain")
-            .join("keystore")
-            .join("validator.xdsa");
-        let mode = std::fs::metadata(&key)
-            .unwrap_or_else(|e| panic!("stat {}: {e}", key.display()))
-            .permissions()
-            .mode()
-            & 0o777;
-        assert_eq!(
-            mode,
-            0o600,
-            "{} must be mode 0o600, got 0o{mode:o}",
-            key.display()
-        );
-    }
 }

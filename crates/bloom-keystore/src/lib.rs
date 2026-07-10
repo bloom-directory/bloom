@@ -92,7 +92,7 @@ pub enum KeystoreError {
 
 /// Signing algorithm for a wallet.
 ///
-/// New wallets default to `Xdsa` (bloom-chain native).  Existing wallets
+/// New wallets default to `Xdsa` (bloom-evm native).  Existing wallets
 /// without an `algorithm` field in their envelope default to `Secp256k1`
 /// for backward compatibility.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -101,7 +101,7 @@ pub enum Algorithm {
     /// secp256k1 / ECDSA — Ethereum-interop wallets.
     #[default]
     Secp256k1,
-    /// Composite ML-DSA-65 + Ed25519 — bloom-chain native wallets.
+    /// Composite ML-DSA-65 + Ed25519 — bloom-evm native wallets.
     Xdsa,
 }
 
@@ -116,22 +116,21 @@ impl std::fmt::Display for Algorithm {
 
 /// An on-disk address that distinguishes the two key types.
 ///
-/// Ethereum wallets carry a 20-byte `Address`; bloom-chain xDSA wallets
-/// carry a 32-byte BLAKE3 digest derived from the composite public key per
-/// chain spec §4.3.
+/// Ethereum wallets carry a 20-byte `Address`; bloom-evm xDSA wallets
+/// carry a 32-byte BLAKE3 digest derived from the composite public key.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WalletAddress {
     /// 20-byte Ethereum-style address (secp256k1 wallets).
     Ethereum(Address),
-    /// 32-byte bloom-chain address (xDSA wallets).
-    BloomChain([u8; 32]),
+    /// 32-byte bloom-evm address (xDSA wallets).
+    BloomEvm([u8; 32]),
 }
 
 impl std::fmt::Display for WalletAddress {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             WalletAddress::Ethereum(a) => write!(f, "{}", checksum_address(a)),
-            WalletAddress::BloomChain(b) => write!(f, "{}", hex::encode(b)),
+            WalletAddress::BloomEvm(b) => write!(f, "{}", hex::encode(b)),
         }
     }
 }
@@ -174,7 +173,7 @@ fn is_secp256k1(a: &Algorithm) -> bool {
     *a == Algorithm::Secp256k1
 }
 
-/// Argon2id parameters for xDSA keystore (spec §4 / chain spec §13).
+/// Argon2id parameters for xDSA keystore.
 const XDSA_ARGON2_M_COST: u32 = 65536; // 64 MiB
 const XDSA_ARGON2_T_COST: u32 = 3;
 const XDSA_ARGON2_P_COST: u32 = 4;
@@ -278,11 +277,11 @@ impl XdsaWallet {
         self.secret.sign(msg)
     }
 
-    /// The wallet's 32-byte bloom-chain address bytes.
+    /// The wallet's 32-byte bloom-evm address bytes.
     pub fn address_bytes(&self) -> [u8; 32] {
         match &self.address {
-            WalletAddress::BloomChain(b) => *b,
-            _ => unreachable!("xDSA wallet always has a BloomChain address"),
+            WalletAddress::BloomEvm(b) => *b,
+            _ => unreachable!("xDSA wallet always has a bloom-evm address"),
         }
     }
 }
@@ -334,7 +333,7 @@ pub fn create_xdsa_wallet(
             .as_bytes(),
     )?;
 
-    Ok((WalletAddress::BloomChain(addr_bytes), pk))
+    Ok((WalletAddress::BloomEvm(addr_bytes), pk))
 }
 
 /// Load and decrypt an xDSA wallet from disk.
@@ -363,7 +362,7 @@ pub fn load_xdsa_wallet(
 
     Ok(XdsaWallet {
         name: name.into(),
-        address: WalletAddress::BloomChain(addr_bytes),
+        address: WalletAddress::BloomEvm(addr_bytes),
         public_key: pk,
         secret: sk,
     })

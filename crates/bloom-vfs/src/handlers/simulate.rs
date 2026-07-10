@@ -36,7 +36,7 @@ use alloy::primitives::{Address, B256, Bytes, U256};
 use alloy::rpc::types::eth::TransactionRequest;
 use alloy::rpc::types::eth::state::{AccountOverride, StateOverride};
 use async_trait::async_trait;
-use bloom_chain::ChainRegistry;
+use bloom_evm::ChainRegistry;
 use bloom_proto::{AddressBook, RawIntent, RawIntentBody, checksum_address, parse_eth};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
@@ -295,7 +295,7 @@ fn build_tx_request(
             amount,
         } => {
             use alloy::sol_types::SolCall;
-            use bloom_chain::IERC20;
+            use bloom_evm::IERC20;
             let token_addr = resolve_addr(token, addr_book)?;
             let spender_addr = resolve_addr(spender, addr_book)?;
             let amount_u = if amount.trim().is_empty() || amount.eq_ignore_ascii_case("max") {
@@ -502,7 +502,7 @@ fn render_sim_plan(session: &SimSession) -> String {
 impl SimulateHandler {
     /// Resolve a chain client for an intent, falling back to the only
     /// registered chain if exactly one is registered.
-    fn pick_client(&self, intent: &RawIntent) -> Result<bloom_chain::ChainClient, HandlerError> {
+    fn pick_client(&self, intent: &RawIntent) -> Result<bloom_evm::ChainClient, HandlerError> {
         let preferred = pick_chain(intent);
         if let Some(c) = self.chains.get(&preferred) {
             return Ok(c);
@@ -866,7 +866,7 @@ mod tests {
     use tokio::process::{Child, Command};
     use tokio::time::timeout;
 
-    use bloom_chain::{ChainClient, ChainRegistry};
+    use bloom_evm::{ChainClient, ChainRegistry};
     use bloom_proto::ChainSpec;
 
     const ANVIL_BIN_DEFAULT: &str = "/Users/joshua/.foundry/bin/anvil";

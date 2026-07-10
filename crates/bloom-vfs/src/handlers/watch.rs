@@ -352,7 +352,7 @@ impl NewSpec {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bloom_chain::ChainRegistry;
+    use bloom_evm::ChainRegistry;
     use tempfile::tempdir;
 
     fn build_handler() -> (WatchHandler, tempfile::TempDir) {

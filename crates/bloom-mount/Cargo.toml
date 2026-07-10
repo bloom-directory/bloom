@@ -18,14 +18,11 @@ mount = ["dep:embednfs", "dep:bloom-vfs", "dep:bytes", "dep:lru", "dep:futures"]
 nfs = ["mount"]
 
 [dependencies]
-bloom-proto.workspace = true
 # bloom-vfs is only needed when the `mount` feature is on — that is
 # where the NFS-to-VFS adapter lives. Default builds keep it out so the
 # stub surface compiles on platforms that can't link an NFS server.
 bloom-vfs = { workspace = true, optional = true }
-serde.workspace = true
 thiserror.workspace = true
-anyhow.workspace = true
 tokio.workspace = true
 async-trait.workspace = true
 tracing.workspace = true

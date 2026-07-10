@@ -16,7 +16,6 @@ url = { workspace = true }
 tracing = { workspace = true }
 hex = { workspace = true }
 async-trait = { workspace = true }
-parking_lot = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }

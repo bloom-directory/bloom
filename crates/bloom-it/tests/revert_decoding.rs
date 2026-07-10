@@ -22,7 +22,7 @@ use std::time::Duration;
 
 use alloy::primitives::{Address, B256};
 use anyhow::{Context, Result, anyhow};
-use bloom_chain::ChainClient;
+use bloom_evm::ChainClient;
 use bloom_it::{FUNDER_PRIV_KEY, cast_send, spawn_anvil};
 use bloom_proto::ChainSpec;
 use bloom_revert::{
@@ -133,7 +133,7 @@ async fn anvil_decodes_three_revert_kinds() -> Result<()> {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-                tracing_subscriber::EnvFilter::new("warn,bloom_revert=info,bloom_chain=info")
+                tracing_subscriber::EnvFilter::new("warn,bloom_revert=info,bloom_evm=info")
             }),
         )
         .with_test_writer()

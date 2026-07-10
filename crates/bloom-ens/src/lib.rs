@@ -1,6 +1,6 @@
 //! ENS resolution against an Ethereum-compatible chain.
 //!
-//! The [`EnsClient`] uses a [`bloom_chain::ChainClient`] for transport and
+//! The [`EnsClient`] uses a [`bloom_evm::ChainClient`] for transport and
 //! talks to the standard ENS registry + a per-name resolver to perform:
 //!
 //! * forward resolution: `name -> address`
@@ -28,7 +28,7 @@ use alloy::sol;
 use parking_lot::RwLock;
 use tracing::debug;
 
-use bloom_chain::ChainClient;
+use bloom_evm::ChainClient;
 
 pub use error::{EnsError, Result};
 pub use namehash::{keccak256, namehash};

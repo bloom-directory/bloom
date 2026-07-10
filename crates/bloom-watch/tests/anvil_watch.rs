@@ -18,7 +18,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
-use bloom_chain::{ChainClient, ChainRegistry};
+use bloom_evm::{ChainClient, ChainRegistry};
 use bloom_proto::{ChainSpec, HomeDir};
 use bloom_watch::{WatchExecutor, WatchKind, WatchRegistry, WatchSpec};
 use tokio::io::{AsyncBufReadExt, BufReader};
