@@ -1653,7 +1653,7 @@ impl Handler for WalletsHandler {
                 if chains == "chains"
                     && outbox == "outbox"
                     && pending == "pending"
-                    && (fname == "confirm" || fname == "confirm.override") =>
+                    && fname == "confirm.override" =>
             {
                 let info = self.keystore.info(wallet).map_err(err_be)?;
                 let client = self
@@ -1668,7 +1668,7 @@ impl Handler for WalletsHandler {
                         id,
                         &client,
                         &info.policy,
-                        fname == "confirm.override",
+                        true,
                     )
                     .await
                     .map_err(tx_open_err)
@@ -4204,6 +4204,21 @@ mod tests {
         assert_eq!(entry.state, OutboxState::Failed);
         assert!(!entry.dir.join("broadcast_attempted.json").exists());
         assert!(!entry.dir.join("raw_tx").exists());
+    }
+
+    #[tokio::test]
+    async fn normal_confirm_open_preserves_body_control_semantics() {
+        let f = make_handler_with_chain(true);
+        let p = VfsPath::parse(&format!(
+            "/{}/chains/anvil/outbox/pending/not-yet-staged/confirm",
+            f.wallet_name
+        ))
+        .unwrap();
+
+        // OPEN cannot know whether the later body is `cancel`, a legacy
+        // override sentinel, or an ordinary confirmation. It must therefore
+        // allow the write through to write_inner, which owns those semantics.
+        f.handler.prepare_write_open(&p).await.unwrap();
     }
 
     #[test]

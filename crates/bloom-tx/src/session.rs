@@ -92,6 +92,36 @@ impl SessionStore {
             .collect()
     }
 
+    /// Return whether a live session currently covers a confirm without
+    /// consuming any budget. OPEN-time authorization uses this read-only probe;
+    /// the real confirm performs the atomic debit immediately before signing.
+    pub fn covers(
+        &self,
+        wallet: &str,
+        chain_id: u64,
+        pending_id: &str,
+        tx_micro_usd: Option<i128>,
+        value_moving: bool,
+        now_ms: u128,
+    ) -> bool {
+        let key = pending_key(chain_id, pending_id);
+        self.inner.read().values().any(|session| {
+            if session.wallet != wallet
+                || session.expires_ms <= now_ms
+                || !session.chains.contains(&chain_id)
+                || !session.allowed_pending_ids.contains(&key)
+            {
+                return false;
+            }
+            match tx_micro_usd {
+                Some(value) => {
+                    session.spent_micro_usd.saturating_add(value) <= session.max_micro_usd
+                }
+                None => !value_moving,
+            }
+        })
+    }
+
     /// Atomically authorize a confirm against a covering session and debit its
     /// budget. Returns `Some((session_id, debited_micro_usd))` when covered
     /// (the caller refunds on a subsequent submit failure), else `None`.
@@ -193,6 +223,21 @@ mod tests {
                 .authorize_and_debit("alice", 8453, "0001-a", Some(1), true, 1)
                 .is_some()
         );
+    }
+
+    #[test]
+    fn covers_is_read_only_and_matches_authorize_bounds() {
+        let store = SessionStore::new();
+        store.mint(session("s1", 10_000_000, &["0001-a"]));
+
+        assert!(store.covers("alice", 42161, "0001-a", Some(4_000_000), true, 1));
+        assert!(store.covers("alice", 42161, "0001-a", Some(4_000_000), true, 1));
+
+        let debit = store
+            .authorize_and_debit("alice", 42161, "0001-a", Some(7_000_000), true, 1)
+            .expect("coverage probes must not consume budget");
+        assert_eq!(debit.1, 7_000_000);
+        assert!(!store.covers("alice", 42161, "0001-a", Some(4_000_000), true, 1));
     }
 
     #[test]

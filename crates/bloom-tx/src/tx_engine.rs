@@ -1383,6 +1383,18 @@ impl TxEngine {
             self.simulate_or_reject(&staged, chain).await?;
         }
 
+        let subject = self.authorization_subject(&staged);
+        if self.session_store.covers(
+            wallet,
+            staged.chain_id,
+            &staged.id,
+            subject.total_value_usd_micro,
+            subject.value_moving,
+            now_ms(),
+        ) {
+            return Ok(());
+        }
+
         let unsigned = self.build_unsigned_evm_tx(&staged, chain)?;
         let signing_hash = Self::unsigned_signing_hash(&unsigned);
         self.ensure_action_authorized(
