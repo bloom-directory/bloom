@@ -131,6 +131,14 @@ Target creation flow:
 11. Present recovery material or recovery instructions in a foreground ceremony;
     never hide a recovery secret in logs or background output.
 
+The initial policy is a product default, distinct from the backward-compatible
+serde `Policy::default()`. New wallets enable the generic DeFi route surface
+only for owner-EOA receivers on supported chains and pinned provider routers;
+unknown receivers, routers, protocols, and chains fail closed. Agent autonomy
+remains disabled, so these defaults do not authorize unattended signing or
+broadcast. Existing policy files that omit `[defi]` continue to deserialize
+with DeFi disabled and do not gain authority during an upgrade.
+
 The wallet-creation registration ceremony is distinct from Sealed Approval for
 later actions. Registration establishes wallet authority; Sealed Approval spends
 or changes that authority for a specific sealed action.

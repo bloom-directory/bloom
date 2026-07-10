@@ -194,9 +194,22 @@ pub struct EtherscanConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EnsoConfig {
+    /// Enso production API credential. Fresh configs leave this empty so the
+    /// daemon can read `BLOOM_ENSO_KEY` / `ENSO_API_KEY` without requiring a
+    /// config edit.
+    #[serde(default)]
     pub api_key: String,
     #[serde(default = "default_enso_url")]
     pub api_url: String,
+}
+
+impl Default for EnsoConfig {
+    fn default() -> Self {
+        Self {
+            api_key: String::new(),
+            api_url: default_enso_url(),
+        }
+    }
 }
 
 /// Hyperliquid HyperCore API configuration. Every field has a default so a
@@ -261,7 +274,7 @@ fn default_etherscan_url() -> String {
     "https://api.etherscan.io/v2/api".to_string()
 }
 fn default_enso_url() -> String {
-    "https://api.enso.finance".to_string()
+    "https://api.enso.build".to_string()
 }
 fn default_hyperliquid_mainnet_url() -> String {
     "https://api.hyperliquid.xyz".to_string()
@@ -446,7 +459,7 @@ impl Config {
             stage_ttl: default_stage_ttl(),
             chains,
             etherscan: None,
-            enso: None,
+            enso: Some(EnsoConfig::default()),
             petals: PetalsConfig::default(),
             hyperliquid: Some(HyperliquidConfig::default()),
             mempool: BTreeMap::new(),
@@ -663,7 +676,9 @@ mod tests {
         assert_eq!(cfg.mount_path, "/bloom");
         assert_eq!(cfg.nfs_listen_addr, "127.0.0.1:12049");
         assert!(cfg.etherscan.is_none());
-        assert!(cfg.enso.is_none());
+        let enso = cfg.enso.as_ref().expect("DeFi is enabled by default");
+        assert!(enso.api_key.is_empty());
+        assert_eq!(enso.api_url, "https://api.enso.build");
         assert_eq!(cfg.petals.preinstalled, ["polymarket"]);
         let hyperliquid = cfg
             .hyperliquid
@@ -1124,7 +1139,11 @@ api_key = "ENKEY"
         assert_eq!(es.api_url, "https://api.etherscan.io/v2/api");
         let en = cfg.enso.expect("enso parsed");
         assert_eq!(en.api_key, "ENKEY");
-        assert_eq!(en.api_url, "https://api.enso.finance");
+        assert_eq!(en.api_url, "https://api.enso.build");
+
+        let en: EnsoConfig = toml::from_str("").unwrap();
+        assert!(en.api_key.is_empty());
+        assert_eq!(en.api_url, "https://api.enso.build");
     }
 
     #[test]

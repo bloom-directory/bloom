@@ -266,7 +266,8 @@ echo cancel  > /bloom/wallets/alice/chains/ethereum/outbox/pending/<id>/cancel
 ```
 
 DeFi intent (Enso shortcuts) — natural language is the canonical input;
-JSON works too. If `defi/` is present, use it directly:
+JSON works too. Fresh homes expose `/defi` by default; set `BLOOM_ENSO_KEY`
+or `ENSO_API_KEY` for Enso's production API without editing `config.toml`:
 
 ```sh
 echo 'swap 0.1 eth to USDC on base' \

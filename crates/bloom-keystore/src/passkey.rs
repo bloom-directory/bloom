@@ -1444,7 +1444,7 @@ fn unique_rebind_backup_dir(root: &std::path::Path, name: &str) -> std::path::Pa
 /// Default policy TOML for a fresh passkey registration, served to the
 /// registration page before any attempt exists.
 pub fn default_passkey_policy_toml() -> Result<String, KeystoreError> {
-    let mut default_policy = Policy::default();
+    let mut default_policy = Policy::fresh_wallet_default();
     default_policy.approval.agent_autonomy = Some(bloom_proto::AgentAutonomyMode::Disabled);
     toml::to_string_pretty(&default_policy).map_err(|e| KeystoreError::Policy(e.to_string()))
 }

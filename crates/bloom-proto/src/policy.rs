@@ -55,8 +55,9 @@ pub struct Policy {
     /// wallet policy can disable it or apply exposure limits.
     #[serde(default)]
     pub polymarket: crate::polymarket_policy::PolymarketPolicy,
-    /// Generic DeFi route policy (`[defi]`). Defaults to disabled — the
-    /// open-ended `defi/intents` route surface refuses until opted in.
+    /// Generic DeFi route policy (`[defi]`). Missing sections deserialize as
+    /// disabled for backward compatibility; newly-created wallets receive the
+    /// narrower review-gated defaults from [`Policy::fresh_wallet_default`].
     #[serde(default)]
     pub defi: crate::defi_policy::DefiPolicy,
     /// Paid HTTP request policy (`[payments]`). Defaults to disabled — paid
@@ -1051,6 +1052,18 @@ pub fn has_soft_violation(checks: &[PolicyCheck]) -> bool {
 }
 
 impl Policy {
+    /// Policy written for a newly-created wallet.
+    ///
+    /// Keep [`Default`] backward-compatible and fail-closed for policy files
+    /// created before newer surfaces existed; fresh product defaults can opt a
+    /// new wallet into narrowly bounded, review-gated capabilities here.
+    pub fn fresh_wallet_default() -> Self {
+        Self {
+            defi: crate::defi_policy::DefiPolicy::fresh_wallet_default(),
+            ..Self::default()
+        }
+    }
+
     /// Default permissive policy. Useful in tests / on dev chains.
     pub fn permissive() -> Self {
         Policy::default()
@@ -1068,6 +1081,19 @@ impl Policy {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fresh_wallet_default_enables_review_gated_defi_without_changing_legacy_default() {
+        let legacy = Policy::default();
+        assert!(!legacy.defi.enabled);
+
+        let fresh = Policy::fresh_wallet_default();
+        assert!(fresh.defi.enabled);
+        assert_eq!(
+            fresh.effective_agent_autonomy(),
+            AgentAutonomyMode::Disabled
+        );
+    }
 
     #[test]
     fn most_restrictive_picks_smaller_cap() {

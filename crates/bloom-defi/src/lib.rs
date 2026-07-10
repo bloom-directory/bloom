@@ -1,7 +1,7 @@
 //! Enso DeFi intent client.
 //!
 //! Real client against the Enso Shortcuts API
-//! (<https://api.enso.finance>). Handles single-step routes (swaps,
+//! (<https://api.enso.build>). Handles single-step routes (swaps,
 //! deposits, etc.) and multi-step bundles. Read/quote-oriented; no
 //! broadcasting concerns live here — the resulting tx is staged through
 //! the wallet outbox by the caller.
@@ -21,7 +21,7 @@ use alloy::sol_types::{SolCall, SolValue};
 use serde::{Deserialize, Serialize};
 use url::Url;
 
-const DEFAULT_BASE_URL: &str = "https://api.enso.finance";
+const DEFAULT_BASE_URL: &str = "https://api.enso.build";
 
 /// Sentinel address Enso uses for the chain's native token (ETH, MATIC, …).
 pub const NATIVE_TOKEN: &str = "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
@@ -353,20 +353,27 @@ impl EnsoClient {
         }
     }
 
+    /// Construct from an optional configured key, falling back to the standard
+    /// environment variables when a fresh config intentionally leaves the key
+    /// empty. `BLOOM_ENSO_KEY` wins over Enso's generic `ENSO_API_KEY`.
+    pub fn new_with_env_fallback(api_key: impl Into<String>) -> Self {
+        let key = resolve_api_key(
+            api_key.into(),
+            std::env::var("BLOOM_ENSO_KEY").ok(),
+            std::env::var("ENSO_API_KEY").ok(),
+        );
+        Self::new(key)
+    }
+
     /// Try to construct from `BLOOM_ENSO_KEY` (preferred) or `ENSO_API_KEY`.
     pub fn from_env() -> Result<Self, EnsoError> {
-        let key = match std::env::var("BLOOM_ENSO_KEY")
-            .ok()
-            .or_else(|| std::env::var("ENSO_API_KEY").ok())
-        {
-            Some(k) => k,
-            None => {
-                tracing::debug!("enso.from_env.missing_key");
-                return Err(EnsoError::MissingKey);
-            }
-        };
+        let key = resolve_api_key(
+            String::new(),
+            std::env::var("BLOOM_ENSO_KEY").ok(),
+            std::env::var("ENSO_API_KEY").ok(),
+        );
         if key.is_empty() {
-            tracing::debug!("enso.from_env.empty_key");
+            tracing::debug!("enso.from_env.missing_key");
             return Err(EnsoError::MissingKey);
         }
         Ok(Self::new(key))
@@ -385,6 +392,15 @@ impl EnsoClient {
         &self.api_key
     }
 
+    /// Fail before doing any route preparation that could touch a chain RPC.
+    pub fn ensure_configured(&self) -> Result<(), EnsoError> {
+        if self.api_key.trim().is_empty() {
+            Err(EnsoError::MissingKey)
+        } else {
+            Ok(())
+        }
+    }
+
     fn auth(&self, rb: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         if self.api_key.is_empty() {
             tracing::trace!("enso.auth.unconfigured");
@@ -399,6 +415,7 @@ impl EnsoClient {
     /// Enso's REST surface uses **GET** with query params for `route`
     /// (despite being mutating in spirit); we follow that.
     pub async fn route(&self, req: RouteRequest) -> Result<RouteResponse, EnsoError> {
+        self.ensure_configured()?;
         let url = self.base_url.join("/api/v1/shortcuts/route")?;
         tracing::trace!(
             chain_id = req.chain_id,
@@ -446,6 +463,7 @@ impl EnsoClient {
 
     /// `POST /api/v1/shortcuts/bundle` — multi-step.
     pub async fn bundle(&self, req: BundleRequest) -> Result<BundleResponse, EnsoError> {
+        self.ensure_configured()?;
         let url = self.base_url.join("/api/v1/shortcuts/bundle")?;
         tracing::trace!(
             chain_id = req.chain_id,
@@ -491,6 +509,7 @@ impl EnsoClient {
     /// `GET /api/v1/shortcuts/quote` — non-committal price preview.
     /// Returns `amountOut` without producing tx calldata.
     pub async fn quote(&self, req: RouteRequest) -> Result<QuoteResponse, EnsoError> {
+        self.ensure_configured()?;
         let url = self.base_url.join("/api/v1/shortcuts/quote")?;
         tracing::trace!(
             chain_id = req.chain_id,
@@ -528,6 +547,18 @@ impl EnsoClient {
         );
         Ok(v)
     }
+}
+
+fn resolve_api_key(
+    configured: String,
+    bloom_env: Option<String>,
+    enso_env: Option<String>,
+) -> String {
+    [Some(configured), bloom_env, enso_env]
+        .into_iter()
+        .flatten()
+        .find(|key| !key.trim().is_empty())
+        .unwrap_or_default()
 }
 
 // --- Enso Quoter: simulate + validate ------------------------------------
@@ -972,8 +1003,49 @@ mod tests {
     #[test]
     fn client_uses_default_base_url() {
         let c = EnsoClient::new("k");
-        assert_eq!(c.base_url().as_str(), "https://api.enso.finance/");
+        assert_eq!(c.base_url().as_str(), "https://api.enso.build/");
         assert_eq!(c.api_key(), "k");
+    }
+
+    #[test]
+    fn api_key_resolution_prefers_config_then_bloom_then_enso() {
+        assert_eq!(
+            resolve_api_key(
+                "configured".into(),
+                Some("bloom".into()),
+                Some("enso".into())
+            ),
+            "configured"
+        );
+        assert_eq!(
+            resolve_api_key(String::new(), Some("bloom".into()), Some("enso".into())),
+            "bloom"
+        );
+        assert_eq!(
+            resolve_api_key(String::new(), Some(" ".into()), Some("enso".into())),
+            "enso"
+        );
+        assert!(resolve_api_key(String::new(), None, None).is_empty());
+    }
+
+    #[tokio::test]
+    async fn route_without_api_key_fails_before_network() {
+        let client = EnsoClient::new("");
+        let request = RouteRequest {
+            from_address: Address::ZERO,
+            chain_id: 1,
+            destination_chain_id: None,
+            token_in: NATIVE_TOKEN.parse().unwrap(),
+            token_out: Address::ZERO,
+            amount_in: U256::from(1u64),
+            slippage_bps: 50,
+            routing_strategy: Some(RoutingStrategy::Router),
+            receiver: None,
+        };
+        assert!(matches!(
+            client.route(request).await,
+            Err(EnsoError::MissingKey)
+        ));
     }
 
     #[tokio::test]

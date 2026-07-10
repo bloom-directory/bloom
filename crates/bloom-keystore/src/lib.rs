@@ -337,7 +337,7 @@ pub fn create_xdsa_wallet(
     write_atomic(&dir.join("pubkey"), pk_hex.as_bytes())?;
     write_atomic(&dir.join("kind"), b"local")?;
     write_atomic(&dir.join("algorithm"), b"xdsa")?;
-    let default_policy = Policy::default();
+    let default_policy = Policy::fresh_wallet_default();
     write_atomic(
         &dir.join("policy.toml"),
         toml::to_string_pretty(&default_policy)
@@ -946,7 +946,7 @@ impl Keystore {
         write_atomic(&dir.join("address"), checksum_address(&address).as_bytes())?;
         write_atomic(&dir.join("pubkey"), pub_hex.as_bytes())?;
         write_atomic(&dir.join("kind"), b"local")?;
-        let default_policy = Policy::default();
+        let default_policy = Policy::fresh_wallet_default();
         write_atomic(
             &dir.join("policy.toml"),
             toml::to_string_pretty(&default_policy)
@@ -1164,6 +1164,23 @@ mod tests {
         assert_eq!(s.address(), info.address);
         ks.lock("alice");
         assert!(!ks.is_unlocked("alice"));
+    }
+
+    #[test]
+    fn new_wallet_uses_review_gated_defi_defaults() {
+        let (_dir, ks) = temp_store();
+        let info = ks.create_local("my-wallet", "test-passphrase").unwrap();
+        assert!(info.policy.defi.enabled);
+        assert!(
+            info.policy
+                .defi
+                .allowed_receivers
+                .contains("class:wallet_eoa")
+        );
+        assert_eq!(
+            info.policy.effective_agent_autonomy(),
+            bloom_proto::AgentAutonomyMode::Disabled
+        );
     }
 
     #[test]

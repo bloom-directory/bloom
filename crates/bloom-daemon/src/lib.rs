@@ -2392,12 +2392,13 @@ impl Daemon {
                 ) as _,
             );
 
-        // DeFi: Enso's public REST works without an API key for chains
-        // they support keyless (currently quote+route on Base mainnet).
-        // Mount whenever an `[enso]` block exists in config; an empty
-        // api_key just means unauthenticated calls (rate-limited).
+        // DeFi: fresh configs mount the surface by default. Enso production
+        // routing requires a credential; an empty config key falls back to
+        // BLOOM_ENSO_KEY / ENSO_API_KEY and otherwise produces an actionable
+        // error only when a route is requested. Older/custom configs can still
+        // omit `[enso]` to disable the surface entirely.
         if let Some(enso_cfg) = &config.enso {
-            let mut enso = EnsoClient::new(&enso_cfg.api_key);
+            let mut enso = EnsoClient::new_with_env_fallback(&enso_cfg.api_key);
             match url::Url::parse(&enso_cfg.api_url) {
                 Ok(url) => {
                     debug!(api_url = %url, "daemon.enso_configured");
@@ -2407,8 +2408,10 @@ impl Daemon {
                     warn!(api_url = %enso_cfg.api_url, error = %e, "daemon.enso_url_invalid_using_default");
                 }
             }
-            if enso_cfg.api_key.is_empty() {
-                warn!("enso api_key empty; mounting defi/ for keyless access (rate-limited)");
+            if enso.api_key().is_empty() {
+                warn!(
+                    "Enso API key unavailable; defi/ is mounted for discovery but route requests require BLOOM_ENSO_KEY or ENSO_API_KEY"
+                );
             }
             debug!("daemon.defi_mounted");
             // Hyperliquid deposit goal: bridge address + deposit chain, from
@@ -3053,6 +3056,10 @@ mod tests {
         assert!(d.vfs.handler("ens").is_some());
         assert!(d.vfs.handler("petals").is_some());
         assert!(
+            d.vfs.handler("defi").is_some(),
+            "fresh homes should mount DeFi with Enso defaults"
+        );
+        assert!(
             d.vfs.handler("hyperliquid").is_some(),
             "fresh homes should mount Hyperliquid with public defaults"
         );
@@ -3632,6 +3639,19 @@ mod tests {
 
         let daemon = Daemon::from_home(home).unwrap();
         assert!(daemon.vfs.handler("hyperliquid").is_none());
+    }
+
+    #[test]
+    fn config_without_enso_keeps_surface_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = HomeDir::at(dir.path());
+        home.ensure().unwrap();
+        let mut config = Config::local_default();
+        config.enso = None;
+        config.save(&home.config_path()).unwrap();
+
+        let daemon = Daemon::from_home(home).unwrap();
+        assert!(daemon.vfs.handler("defi").is_none());
     }
 
     /// A pre-existing watch spec on disk should be loaded into the

@@ -43,7 +43,9 @@ fn default_true() -> bool {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DefiPolicy {
     /// Master gate. Defaults to **false**: the generic DeFi route surface
-    /// refuses all value-moving routes until the owner opts in.
+    /// refuses all value-moving routes until the owner opts in. Fresh wallets
+    /// use [`DefiPolicy::fresh_wallet_default`], which permits only reviewed
+    /// routes returning to the owner EOA.
     #[serde(default)]
     pub enabled: bool,
     /// Source chains a route may originate on. Empty ⇒ none allowed.
@@ -123,6 +125,64 @@ impl Default for DefiPolicy {
             denied_protocols: BTreeSet::new(),
             allow_unknown_protocols: false,
             require_calldata_verification: true,
+            max_input_usd: None,
+            max_native_value_wei: None,
+        }
+    }
+}
+
+impl DefiPolicy {
+    /// Policy installed for newly-created wallets.
+    ///
+    /// Existing policies that omit `[defi]` continue to deserialize through
+    /// [`Default`] as disabled, so upgrading Bloom never expands an existing
+    /// wallet's authority. Fresh wallets permit only routes returning to the
+    /// owner EOA on Bloom's default Enso-supported chains, through the Enso V2
+    /// routers documented at <https://docs.enso.build/pages/build/reference/deployments>.
+    ///
+    /// Router addresses are intentionally pinned as a fail-closed allowlist:
+    /// Enso recommends using `tx.to` because deployments can change, and a new
+    /// address must therefore be reviewed here before fresh wallets accept it.
+    /// Calldata verification remains warning-only for this route class because
+    /// the generic handler cannot yet prove Enso's minimum-output floor. This
+    /// does not grant autonomous signing: the default wallet approval mode is
+    /// disabled, so outbox broadcast still requires fresh Sealed Approval.
+    pub fn fresh_wallet_default() -> Self {
+        const COMMON_ROUTER: &str = "0xf75584ef6673ad213a685a1b58cc0330b8ea22cf";
+        const LINEA_ROUTER: &str = "0xa146d46823f3f594b785200102be5385cafce9b5";
+        let routers = [
+            ("ethereum", COMMON_ROUTER),
+            ("optimism", COMMON_ROUTER),
+            ("bsc", COMMON_ROUTER),
+            ("gnosis", COMMON_ROUTER),
+            ("polygon", COMMON_ROUTER),
+            ("hyperliquid", COMMON_ROUTER),
+            ("base", COMMON_ROUTER),
+            ("arbitrum", COMMON_ROUTER),
+            ("avalanche", COMMON_ROUTER),
+            ("linea", LINEA_ROUTER),
+        ];
+        let allowed_chains = routers
+            .iter()
+            .map(|(chain, _)| (*chain).to_string())
+            .collect();
+
+        Self {
+            enabled: true,
+            allowed_source_chains: allowed_chains,
+            allowed_destination_chains: routers
+                .iter()
+                .map(|(chain, _)| (*chain).to_string())
+                .collect(),
+            allowed_receivers: ["class:wallet_eoa".to_string()].into_iter().collect(),
+            denied_receivers: BTreeSet::new(),
+            allowed_routers: routers
+                .into_iter()
+                .map(|(chain, router)| format!("{chain}:{router}"))
+                .collect(),
+            denied_protocols: BTreeSet::new(),
+            allow_unknown_protocols: false,
+            require_calldata_verification: false,
             max_input_usd: None,
             max_native_value_wei: None,
         }
@@ -576,6 +636,52 @@ mod tests {
             checks
                 .iter()
                 .any(|c| c.rule == "defi.enabled" && c.outcome == PolicyOutcome::Deny)
+        );
+    }
+
+    #[test]
+    fn fresh_wallet_default_allows_reviewed_swap_to_owner_on_documented_router() {
+        let policy = DefiPolicy::fresh_wallet_default();
+        let mut ctx = clean_ctx();
+        ctx.source_chain = "ethereum".into();
+        ctx.destination_chain = "ethereum".into();
+        ctx.receiver_class = ReceiverClass::WalletEoa;
+        ctx.router = "0xf75584ef6673ad213a685a1b58cc0330b8ea22cf".into();
+        ctx.min_out_enforced = false;
+        ctx.receiver_verified = false;
+
+        let checks = evaluate_defi_route(&policy, &ctx);
+        assert!(
+            !has_deny(&checks),
+            "fresh reviewed route denied: {checks:?}"
+        );
+        assert!(has_warn(&checks), "unverified calldata must remain visible");
+        assert!(!policy.require_calldata_verification);
+        assert!(policy.allowed_receivers.contains("class:wallet_eoa"));
+    }
+
+    #[test]
+    fn fresh_wallet_default_fails_closed_on_router_or_receiver_change() {
+        let policy = DefiPolicy::fresh_wallet_default();
+        let mut ctx = clean_ctx();
+        ctx.source_chain = "base".into();
+        ctx.destination_chain = "base".into();
+        ctx.receiver_class = ReceiverClass::WalletEoa;
+        ctx.router = "0x0000000000000000000000000000000000000001".into();
+        assert!(has_deny(&evaluate_defi_route(&policy, &ctx)));
+
+        ctx.router = "0xf75584ef6673ad213a685a1b58cc0330b8ea22cf".into();
+        ctx.receiver_class = ReceiverClass::Unknown;
+        assert!(has_deny(&evaluate_defi_route(&policy, &ctx)));
+    }
+
+    #[test]
+    fn fresh_wallet_default_pins_linea_router_deployment() {
+        let policy = DefiPolicy::fresh_wallet_default();
+        assert!(
+            policy
+                .allowed_routers
+                .contains("linea:0xa146d46823f3f594b785200102be5385cafce9b5")
         );
     }
 

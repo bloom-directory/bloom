@@ -79,7 +79,8 @@ const README: &[u8] = br#"# DeFi Intents (Enso Shortcuts)
 
 ## Safety Model
 
-- Route discovery uses the Enso Shortcuts API (requires BLOOM_ENSO_KEY)
+- Fresh homes mount this surface by default
+- Route discovery uses the Enso Shortcuts API (set BLOOM_ENSO_KEY or ENSO_API_KEY)
 - Simulation is re-run on each read; reverts are decoded
 - Auto-approve handles ERC-20 allowances when needed
 - Broadcast requires the standard outbox confirm (owner gate)
@@ -861,6 +862,10 @@ impl DefiHandler {
             .keystore
             .info(wallet)
             .map_err(|e| HandlerError::backend(e.to_string()))?;
+        // Credential preflight must precede chain-id, token-decimal, balance,
+        // and allowance RPC reads so an unconfigured fresh home fails locally
+        // with the setup instruction instead of an unrelated RPC error.
+        self.enso.ensure_configured().map_err(map_enso_err)?;
         let chain_name = body
             .chain
             .clone()
@@ -1667,7 +1672,19 @@ fn is_session_file(s: &str) -> bool {
 fn map_enso_err(e: EnsoError) -> HandlerError {
     match e {
         EnsoError::Disabled | EnsoError::MissingKey => {
-            HandlerError::Unsupported("Enso is disabled (no API key)".into())
+            HandlerError::Unsupported(
+                "DeFi routing requires an Enso API key; set BLOOM_ENSO_KEY or ENSO_API_KEY (no config.toml edit required)"
+                    .into(),
+            )
+        }
+        EnsoError::Api {
+            status: 401 | 403,
+            ..
+        } => {
+            HandlerError::Unsupported(
+                "Enso rejected the configured API key; update BLOOM_ENSO_KEY or ENSO_API_KEY"
+                    .into(),
+            )
         }
         EnsoError::InvalidIntent(s) => HandlerError::invalid(s),
         other => HandlerError::backend(other.to_string()),
@@ -2323,12 +2340,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn confirm_refuses_on_default_deny_policy() {
-        // A wallet with default policy ([defi] disabled) must refuse to stage
-        // a route at confirm — before any TxEngine::stage.
+    async fn confirm_refuses_on_legacy_default_deny_policy() {
+        // Existing policy files that predate fresh-wallet DeFi defaults still
+        // deserialize with [defi] disabled and must refuse before staging.
         let td = tempfile::tempdir().unwrap();
         let h = test_handler(td.path());
         h.keystore.create_local("alice", "pw").unwrap();
+        let legacy = toml::to_string_pretty(&bloom_proto::Policy::default()).unwrap();
+        h.keystore.write_policy("alice", legacy.as_bytes()).unwrap();
         let mut sess = fake_session("alice", "s1");
         sess.chain = "ethereum".into();
         sess.destination_chain = None;
@@ -2339,6 +2358,33 @@ mod tests {
             msg.contains("defi.enabled") || msg.to_lowercase().contains("disabled"),
             "default-deny must cite the defi gate, got: {msg}"
         );
+    }
+
+    #[tokio::test]
+    async fn create_session_without_enso_key_fails_before_chain_rpc() {
+        let td = tempfile::tempdir().unwrap();
+        let h = test_handler(td.path());
+        h.keystore
+            .create_local("my-wallet", "test-passphrase")
+            .unwrap();
+
+        let err = h
+            .create_session(
+                "my-wallet",
+                NewIntentBody {
+                    kind: None,
+                    intent: "swap 1 usdc to eth".into(),
+                    chain: Some("ethereum".into()),
+                    destination_chain: None,
+                    receiver: None,
+                    slippage_bps: None,
+                },
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, HandlerError::Unsupported(_)));
+        assert!(err.to_string().contains("BLOOM_ENSO_KEY"));
     }
 
     #[test]
