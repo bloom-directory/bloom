@@ -915,6 +915,7 @@ impl DefiHandler {
                 "Enso route transaction input does not match the requested token and amount",
             ));
         }
+        validate_route_sender(&req, &route)?;
 
         // Build the swap (Raw) intent and, when the source token is an
         // ERC-20 with insufficient allowance to the router, a preceding
@@ -1682,13 +1683,24 @@ fn map_enso_err(e: EnsoError) -> HandlerError {
             ..
         } => {
             HandlerError::Unsupported(
-                "Enso rejected the configured API key; update BLOOM_ENSO_KEY or ENSO_API_KEY"
+                "Enso rejected the configured API key; if [enso].api_key is set in config.toml, update or remove it and restart Bloom; otherwise update BLOOM_ENSO_KEY or ENSO_API_KEY and restart Bloom"
                     .into(),
             )
         }
         EnsoError::InvalidIntent(s) => HandlerError::invalid(s),
         other => HandlerError::backend(other.to_string()),
     }
+}
+
+fn validate_route_sender(req: &RouteRequest, route: &RouteResponse) -> Result<(), HandlerError> {
+    if route.tx.from != req.from_address {
+        return Err(HandlerError::invalid(format!(
+            "Enso route sender {} does not match requested wallet {}; refusing response",
+            checksum_address(&route.tx.from),
+            checksum_address(&req.from_address),
+        )));
+    }
+    Ok(())
 }
 
 /// Recognize a Hyperliquid deposit goal: `deposit <amount> [token] to
@@ -2199,6 +2211,57 @@ mod tests {
         let defaulted =
             DefiHandler::compose_route_request(8453, Some(137), from, &nat, 6, None).unwrap();
         assert_eq!(defaulted.receiver, Some(from));
+    }
+
+    #[test]
+    fn route_sender_must_match_requested_wallet() {
+        let expected: Address = "0x0000000000000000000000000000000000000001"
+            .parse()
+            .unwrap();
+        let unexpected: Address = "0x0000000000000000000000000000000000000002"
+            .parse()
+            .unwrap();
+        let req = RouteRequest {
+            from_address: expected,
+            chain_id: 1,
+            destination_chain_id: None,
+            token_in: NATIVE_TOKEN_ADDR,
+            token_out: Address::ZERO,
+            amount_in: U256::from(1u64),
+            slippage_bps: 50,
+            routing_strategy: Some(RoutingStrategy::Router),
+            receiver: Some(expected),
+        };
+        let mut route = RouteResponse {
+            tx: bloom_defi::RouteTx {
+                from: expected,
+                to: Address::ZERO,
+                data: Default::default(),
+                value: U256::from(1u64),
+            },
+            amount_out: "1".into(),
+            gas: None,
+            route: serde_json::Value::Null,
+            price_impact: None,
+            destination_chain_id: None,
+        };
+
+        validate_route_sender(&req, &route).unwrap();
+        route.tx.from = unexpected;
+        let err = validate_route_sender(&req, &route).unwrap_err();
+        assert!(err.to_string().contains("does not match requested wallet"));
+    }
+
+    #[test]
+    fn rejected_key_error_explains_config_precedence() {
+        let err = map_enso_err(EnsoError::Api {
+            status: 401,
+            body: "unauthorized".into(),
+        });
+        let message = err.to_string();
+        assert!(message.contains("[enso].api_key"));
+        assert!(message.contains("update or remove"));
+        assert!(message.contains("restart Bloom"));
     }
 
     #[test]
