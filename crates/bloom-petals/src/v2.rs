@@ -571,7 +571,14 @@ fn install_metadata_for_route(
     allowed_sign_intents: &BTreeSet<String>,
 ) -> Result<InstallRouteMetadata, PetalError> {
     let mut metadata = InstallRouteMetadata {
-        mode: if validation.abi == RouteAbi::ComponentBloomRoute010 && validation.has_write_export {
+        // Conservative ceiling for routes whose metadata cannot be
+        // evaluated at install time (parameterized routes): it must be
+        // kind-compatible so runtime metadata can narrow it — a directory
+        // needs traversal bits a file ceiling would strip.
+        mode: if route_kind == RouteEntryKind::Dir {
+            0o777
+        } else if validation.abi == RouteAbi::ComponentBloomRoute010 && validation.has_write_export
+        {
             0o666
         } else {
             0o444
@@ -660,7 +667,12 @@ pub fn narrow_runtime_route_metadata(
         )));
     }
     match (install.cache_ttl_ms, metadata.cache_ttl_ms) {
-        (None, Some(_)) => {
+        // Parameterized routes never evaluate component metadata at
+        // install time, so their install-time `None` means "unevaluated"
+        // rather than "not cacheable" and is not a TTL ceiling. Caching
+        // still stays off for them: the router only caches through the
+        // install metadata, which keeps `side_effecting_read = true`.
+        (None, Some(_)) if route.params.is_empty() => {
             return Err(PetalError::InvalidWasm(format!(
                 "v2 route {} runtime metadata widens cacheability",
                 route.route_id
@@ -1859,6 +1871,7 @@ fn validate_route_wasm_inner(
                         )));
                     };
                     let host_interface = component_host_interface(name);
+                    let mut caps = caps.to_vec();
                     let route_types_instance = if caps.is_empty()
                         && name == "bloom:route/types@0.1.0"
                     {
@@ -1881,7 +1894,12 @@ fn validate_route_wasm_inner(
                                     interface,
                                     type_index,
                                     &component_types,
-                                ) => {}
+                                ) =>
+                            {
+                                if matches!(interface, ComponentHostInterface::VfsReadwrite) {
+                                    caps = vfs_readwrite_import_caps(type_index, &component_types);
+                                }
+                            }
                             (Some(_), _) => {
                                 return Err(PetalError::InvalidWasm(format!(
                                     "{path}: component route import {name:?} has invalid Bloom WIT interface shape"
@@ -1891,7 +1909,7 @@ fn validate_route_wasm_inner(
                         }
                         false
                     };
-                    for cap in caps {
+                    for cap in &caps {
                         if *cap == "bloom:sign" && allowed_sign_intents.is_empty() {
                             return Err(PetalError::InvalidWasm(format!(
                                 "{path}: component route import {name:?} requires [sign].allowed_intents"
@@ -2478,6 +2496,44 @@ fn is_host_interface_instance<'a>(
     }
 
     !exported_types.is_empty() || !exported_funcs.is_empty()
+}
+
+/// Capabilities actually reachable through a `bloom:vfs/readwrite@0.1.0`
+/// import: a component that only imports the read-side functions must not
+/// be granted (or forced to declare) `bloom:vfs.write`, and vice versa.
+/// The instance shape has already been validated by
+/// [`is_host_interface_instance`]; unknown shapes fall back to the full
+/// capability set so this can only ever narrow.
+fn vfs_readwrite_import_caps(
+    type_index: u32,
+    types: &[ComponentTypeEntry<'_>],
+) -> Vec<&'static str> {
+    let Some(ComponentTypeEntry::Type(ComponentType::Instance(declarations))) =
+        types.get(type_index as usize)
+    else {
+        return vec!["bloom:vfs.read", "bloom:vfs.write"];
+    };
+    let mut caps = Vec::new();
+    for declaration in declarations.as_ref() {
+        let InstanceTypeDeclaration::Export {
+            name,
+            ty: WasmComponentTypeRef::Func(_),
+        } = declaration
+        else {
+            continue;
+        };
+        let cap = match host_func_export(ComponentHostInterface::VfsReadwrite, name.name) {
+            Some(HostFuncExport::VfsLookup | HostFuncExport::VfsList | HostFuncExport::VfsRead) => {
+                "bloom:vfs.read"
+            }
+            Some(HostFuncExport::VfsWrite) => "bloom:vfs.write",
+            _ => continue,
+        };
+        if !caps.contains(&cap) {
+            caps.push(cap);
+        }
+    }
+    caps
 }
 
 fn host_type_export(interface: ComponentHostInterface, name: &str) -> Option<HostTypeExport> {
@@ -3491,6 +3547,255 @@ fn dynamic_segment(segment: &str) -> Result<Option<(&str, &str)>, PetalError> {
 }
 
 #[cfg(test)]
+pub(crate) mod route_fixtures {
+    //! Hand-written `bloom:route@0.1.0` component fixtures with working
+    //! canonical-ABI handlers, used to exercise parameterized-route
+    //! installation and runtime metadata narrowing end-to-end.
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum FixtureVfsImport {
+        None,
+        ReadOnly,
+        ReadWrite,
+    }
+
+    const STRINGS_BASE: u32 = 512;
+    const META_RESULT: u32 = 1024;
+    const LOOKUP_RESULT: u32 = 1152;
+    const LIST_RESULT: u32 = 1280;
+    const READ_RESULT: u32 = 1344;
+    const WRITE_RESULT: u32 = 1408;
+    const EMPTY_LIST_PTR: u32 = 2048;
+    const ENTRY_NAME: &str = "alice";
+    pub(crate) const LOOKUP_ENTRY_SIZE: u64 = 7;
+
+    /// Builds a directory (`$index`) route component whose `metadata`
+    /// export reports `kind = dir`, `mode = 0o755`,
+    /// `cache-ttl-ms = some(30000)` and `required-caps = metadata_caps`,
+    /// and whose `lookup` export returns a dir entry named "alice" with
+    /// mode `0o755` and size [`LOOKUP_ENTRY_SIZE`].
+    pub(crate) fn dynamic_dir_route_component(
+        import_store: bool,
+        vfs: FixtureVfsImport,
+        metadata_caps: &[&str],
+        package_import: Option<&str>,
+    ) -> Vec<u8> {
+        // String table for the metadata cap names and the lookup entry name.
+        let mut strings = Vec::new();
+        let mut cap_locs = Vec::new();
+        for cap in metadata_caps {
+            cap_locs.push((STRINGS_BASE + strings.len() as u32, cap.len() as u32));
+            strings.extend_from_slice(cap.as_bytes());
+        }
+        let name_ptr = STRINGS_BASE + strings.len() as u32;
+        strings.extend_from_slice(ENTRY_NAME.as_bytes());
+        let caps_array = (STRINGS_BASE + strings.len() as u32 + 3) & !3;
+        let mut caps_array_bytes = Vec::new();
+        for (ptr, len) in &cap_locs {
+            caps_array_bytes.extend_from_slice(&ptr.to_le_bytes());
+            caps_array_bytes.extend_from_slice(&len.to_le_bytes());
+        }
+
+        // Canonical-ABI encoding of result<route-meta, route-error>.
+        let mut meta = vec![0u8; 88];
+        meta[8] = 0; // kind: dir
+        meta[12..16].copy_from_slice(&0o755u32.to_le_bytes());
+        meta[16] = 1; // cache-ttl-ms: some
+        meta[24..32].copy_from_slice(&30_000u64.to_le_bytes());
+        meta[60..64].copy_from_slice(&caps_array.to_le_bytes());
+        meta[64..68].copy_from_slice(&(metadata_caps.len() as u32).to_le_bytes());
+
+        // Canonical-ABI encoding of result<entry, route-error>.
+        let mut lookup = vec![0u8; 56];
+        lookup[8..12].copy_from_slice(&name_ptr.to_le_bytes());
+        lookup[12..16].copy_from_slice(&(ENTRY_NAME.len() as u32).to_le_bytes());
+        lookup[16] = 0; // kind: dir
+        lookup[20..24].copy_from_slice(&0o755u32.to_le_bytes());
+        lookup[24] = 1; // size: some
+        lookup[32..40].copy_from_slice(&LOOKUP_ENTRY_SIZE.to_le_bytes());
+
+        // result<list<entry>, route-error> and result<list<u8>, route-error>
+        // with empty ok lists, and result<_, route-error> ok.
+        let mut empty_list = vec![0u8; 16];
+        empty_list[4..8].copy_from_slice(&EMPTY_LIST_PTR.to_le_bytes());
+        let write = vec![0u8; 16];
+
+        let store_import = if import_store {
+            r#"
+  (type $store-ty (instance
+    (type (list u8))
+    (type (option 0))
+    (type (result 1 (error string)))
+    (type (func (param "namespace" string) (param "key" string) (result 2)))
+    (export "get" (func (type 3)))
+  ))
+  (import "bloom:store/kv@0.1.0" (instance (type $store-ty)))
+"#
+        } else {
+            ""
+        };
+        let vfs_import = match vfs {
+            FixtureVfsImport::None => "",
+            FixtureVfsImport::ReadOnly => {
+                r#"
+  (type $vfs-ty (instance
+    (type (list u8))
+    (type (result 0 (error string)))
+    (type (func (param "path" string) (result 1)))
+    (export "read" (func (type 2)))
+  ))
+  (import "bloom:vfs/readwrite@0.1.0" (instance (type $vfs-ty)))
+"#
+            }
+            FixtureVfsImport::ReadWrite => {
+                r#"
+  (type $vfs-ty (instance
+    (type (list u8))
+    (type (result 0 (error string)))
+    (type (func (param "path" string) (result 1)))
+    (export "read" (func (type 2)))
+    (type (result (error string)))
+    (type (func (param "path" string) (param "body" 0) (result 3)))
+    (export "write" (func (type 4)))
+  ))
+  (import "bloom:vfs/readwrite@0.1.0" (instance (type $vfs-ty)))
+"#
+            }
+        };
+        let package_import = package_import
+            .map(|name| format!("  (import {name:?} (instance))\n"))
+            .unwrap_or_default();
+
+        let wat = format!(
+            r#"(component
+{store_import}{vfs_import}
+  (type $route-types-ty (instance
+    (type (tuple string string))
+    (type (list 0))
+    (type (option string))
+    (type (record (field "app-root" string) (field "package-hash" string) (field "path" string) (field "params" 1) (field "actor" 2)))
+    (export "ctx" (type (eq 3)))
+    (type (enum "dir" "file" "symlink"))
+    (export "entry-kind" (type (eq 5)))
+    (type (option u64))
+    (type (record (field "name" string) (field "kind" 6) (field "mode" u32) (field "size" 7) (field "link-target" 2)))
+    (export "entry" (type (eq 8)))
+    (type (variant (case "not-found" string) (case "not-a-dir" string) (case "denied" string) (case "invalid" string) (case "backend" string) (case "unsupported" string)))
+    (export "route-error" (type (eq 10)))
+    (type (list string))
+    (type (record (field "kind" 6) (field "mode" u32) (field "cache-ttl-ms" 7) (field "side-effecting-read" bool) (field "write-async" bool) (field "description" 2) (field "consent-summary" 2) (field "required-caps" 12) (field "sign-intent" 2) (field "executable" bool)))
+    (export "route-meta" (type (eq 13)))
+  ))
+  (import "bloom:route/types@0.1.0" (instance $route-types (type $route-types-ty)))
+{package_import}  (alias export $route-types "ctx" (type $ctx))
+  (import "ctx" (type $ctx-import (eq $ctx)))
+  (alias export $route-types "entry" (type $entry))
+  (import "entry" (type $entry-import (eq $entry)))
+  (alias export $route-types "route-error" (type $route-error))
+  (import "route-error" (type $route-error-import (eq $route-error)))
+  (alias export $route-types "route-meta" (type $route-meta))
+  (import "route-meta" (type $route-meta-import (eq $route-meta)))
+  (core module $main
+    (memory (;0;) 1)
+    (global $heap (mut i32) (i32.const 4096))
+    (func $realloc (param i32 i32 i32 i32) (result i32)
+      (local $ptr i32)
+      global.get $heap
+      local.get 2
+      i32.add
+      i32.const 1
+      i32.sub
+      local.get 2
+      i32.const 1
+      i32.sub
+      i32.const -1
+      i32.xor
+      i32.and
+      local.set $ptr
+      local.get $ptr
+      local.get 3
+      i32.add
+      global.set $heap
+      local.get $ptr
+    )
+    (func $metadata (param i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32) (result i32)
+      i32.const {META_RESULT})
+    (func $lookup (param i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32) (result i32)
+      i32.const {LOOKUP_RESULT})
+    (func $list (param i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32) (result i32)
+      i32.const {LIST_RESULT})
+    (func $read (param i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32) (result i32)
+      i32.const {READ_RESULT})
+    (func $write (param i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32) (result i32)
+      i32.const {WRITE_RESULT})
+    (export "memory" (memory 0))
+    (export "cabi_realloc" (func $realloc))
+    (export "metadata" (func $metadata))
+    (export "lookup" (func $lookup))
+    (export "list" (func $list))
+    (export "read" (func $read))
+    (export "write" (func $write))
+    {strings_data}
+    {caps_array_data}
+    {meta_data}
+    {lookup_data}
+    {list_data}
+    {read_data}
+    {write_data}
+  )
+  (core instance $main-instance (instantiate $main))
+  (alias core export $main-instance "memory" (core memory $mem))
+  (alias core export $main-instance "cabi_realloc" (core func $realloc))
+  (alias core export $main-instance "metadata" (core func $core-metadata))
+  (alias core export $main-instance "lookup" (core func $core-lookup))
+  (alias core export $main-instance "list" (core func $core-list))
+  (alias core export $main-instance "read" (core func $core-read))
+  (alias core export $main-instance "write" (core func $core-write))
+  (type $meta-result (result $route-meta-import (error $route-error-import)))
+  (type $meta-fn (func (param "ctx" $ctx-import) (result $meta-result)))
+  (func $metadata (type $meta-fn) (canon lift (core func $core-metadata) (memory $mem) (realloc $realloc) string-encoding=utf8))
+  (export "metadata" (func $metadata))
+  (type $lookup-result (result $entry-import (error $route-error-import)))
+  (type $lookup-fn (func (param "ctx" $ctx-import) (result $lookup-result)))
+  (func $lookup (type $lookup-fn) (canon lift (core func $core-lookup) (memory $mem) (realloc $realloc) string-encoding=utf8))
+  (export "lookup" (func $lookup))
+  (type $entry-list (list $entry-import))
+  (type $list-result (result $entry-list (error $route-error-import)))
+  (type $list-fn (func (param "ctx" $ctx-import) (result $list-result)))
+  (func $list (type $list-fn) (canon lift (core func $core-list) (memory $mem) (realloc $realloc) string-encoding=utf8))
+  (export "list" (func $list))
+  (type $bytes (list u8))
+  (type $read-result (result $bytes (error $route-error-import)))
+  (type $read-fn (func (param "ctx" $ctx-import) (result $read-result)))
+  (func $read (type $read-fn) (canon lift (core func $core-read) (memory $mem) (realloc $realloc) string-encoding=utf8))
+  (export "read" (func $read))
+  (type $write-result (result (error $route-error-import)))
+  (type $write-fn (func (param "ctx" $ctx-import) (param "body" $bytes) (result $write-result)))
+  (func $write (type $write-fn) (canon lift (core func $core-write) (memory $mem) (realloc $realloc) string-encoding=utf8))
+  (export "write" (func $write))
+)
+"#,
+            strings_data = data_segment(STRINGS_BASE, &strings),
+            caps_array_data = data_segment(caps_array, &caps_array_bytes),
+            meta_data = data_segment(META_RESULT, &meta),
+            lookup_data = data_segment(LOOKUP_RESULT, &lookup),
+            list_data = data_segment(LIST_RESULT, &empty_list),
+            read_data = data_segment(READ_RESULT, &empty_list),
+            write_data = data_segment(WRITE_RESULT, &write),
+        );
+        wat::parse_str(&wat).unwrap()
+    }
+
+    fn data_segment(addr: u32, bytes: &[u8]) -> String {
+        let escaped = bytes
+            .iter()
+            .map(|byte| format!("\\{byte:02x}"))
+            .collect::<String>();
+        format!("(data (i32.const {addr}) \"{escaped}\")")
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
 
@@ -4460,6 +4765,229 @@ name = "echo"
 
         let err = PreparedAppPackage::from_dir(tmp.path()).unwrap_err();
         assert!(err.to_string().contains("\"lookup\" export"));
+    }
+
+    fn route_for_pattern<'a>(index: &'a RouteIndex, pattern: &str) -> &'a RouteIndexRecord {
+        index
+            .routes
+            .iter()
+            .find(|route| route.pattern == pattern)
+            .unwrap_or_else(|| panic!("no route with pattern {pattern:?}"))
+    }
+
+    fn write_dynamic_dir_package(root: &Path, manifest: &[u8], route: &[u8]) {
+        write_package_file(root, "petal.toml", manifest);
+        write_package_file(root, "README.md", b"# example");
+        write_package_file(root, "AGENTS.md", b"# example agents");
+        write_package_file(root, "app/example/[wallet]/$index.wasm", route);
+    }
+
+    const DYNAMIC_DIR_MANIFEST: &[u8] = br#"schema = "bloom.petal.local-app.v2"
+name = "example"
+
+[caps]
+allowed = ["bloom:store", "bloom:vfs.read"]
+
+[store]
+namespaces = ["wallets"]
+"#;
+
+    #[test]
+    fn v2_parameterized_dir_route_records_imported_caps_ceiling() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_dynamic_dir_package(
+            tmp.path(),
+            DYNAMIC_DIR_MANIFEST,
+            &route_fixtures::dynamic_dir_route_component(
+                true,
+                route_fixtures::FixtureVfsImport::ReadOnly,
+                &["bloom:store", "bloom:vfs.read"],
+                None,
+            ),
+        );
+
+        let package = PreparedAppPackage::from_dir(tmp.path()).unwrap();
+        let route = route_for_pattern(&package.route_index, "[wallet]");
+
+        assert_eq!(route.kind, RouteEntryKind::Dir);
+        assert_eq!(
+            route.install_metadata.required_caps,
+            vec!["bloom:store".to_string(), "bloom:vfs.read".to_string()]
+        );
+        assert_eq!(route.install_metadata.mode, 0o777);
+    }
+
+    #[test]
+    fn v2_vfs_import_caps_follow_imported_functions() {
+        // A read+write vfs import must keep requiring bloom:vfs.write ...
+        let tmp = tempfile::tempdir().unwrap();
+        write_dynamic_dir_package(
+            tmp.path(),
+            DYNAMIC_DIR_MANIFEST,
+            &route_fixtures::dynamic_dir_route_component(
+                true,
+                route_fixtures::FixtureVfsImport::ReadWrite,
+                &["bloom:store", "bloom:vfs.read"],
+                None,
+            ),
+        );
+        let err = PreparedAppPackage::from_dir(tmp.path()).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("requires missing petal.toml cap bloom:vfs.write"),
+            "{err}"
+        );
+
+        // ... and records both vfs caps when the manifest allows them.
+        let allowed = tempfile::tempdir().unwrap();
+        write_dynamic_dir_package(
+            allowed.path(),
+            br#"schema = "bloom.petal.local-app.v2"
+name = "example"
+
+[caps]
+allowed = ["bloom:store", "bloom:vfs.read", "bloom:vfs.write"]
+
+[store]
+namespaces = ["wallets"]
+"#,
+            &route_fixtures::dynamic_dir_route_component(
+                true,
+                route_fixtures::FixtureVfsImport::ReadWrite,
+                &["bloom:store", "bloom:vfs.read"],
+                None,
+            ),
+        );
+        let package = PreparedAppPackage::from_dir(allowed.path()).unwrap();
+        assert_eq!(
+            route_for_pattern(&package.route_index, "[wallet]")
+                .install_metadata
+                .required_caps,
+            vec![
+                "bloom:store".to_string(),
+                "bloom:vfs.read".to_string(),
+                "bloom:vfs.write".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn v2_parameterized_route_imports_still_require_manifest_caps() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_dynamic_dir_package(
+            tmp.path(),
+            br#"schema = "bloom.petal.local-app.v2"
+name = "example"
+
+[caps]
+allowed = ["bloom:store"]
+
+[store]
+namespaces = ["wallets"]
+"#,
+            &route_fixtures::dynamic_dir_route_component(
+                true,
+                route_fixtures::FixtureVfsImport::ReadOnly,
+                &["bloom:store", "bloom:vfs.read"],
+                None,
+            ),
+        );
+
+        let err = PreparedAppPackage::from_dir(tmp.path()).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("requires missing petal.toml cap bloom:vfs.read"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn v2_composed_parameterized_route_records_imported_caps_ceiling() {
+        let tmp = tempfile::tempdir().unwrap();
+        let route = route_fixtures::dynamic_dir_route_component(
+            true,
+            route_fixtures::FixtureVfsImport::ReadOnly,
+            &["bloom:store", "bloom:vfs.read"],
+            Some("bloom:example/helper@0.1.0"),
+        );
+        write_dynamic_dir_package(tmp.path(), DYNAMIC_DIR_MANIFEST, &route);
+        write_package_file(
+            tmp.path(),
+            "app/example/[wallet]/$index.route.toml",
+            br#"abi = "component"
+component = "modules/index.wasm"
+imports = ["components/helper.wasm"]
+"#,
+        );
+        write_package_file(tmp.path(), "modules/index.wasm", &route);
+        write_package_file(
+            tmp.path(),
+            "components/helper.wasm",
+            &wat::parse_str(
+                r#"
+(component
+  (instance)
+  (export "bloom:example/helper@0.1.0" (instance 0))
+)
+"#,
+            )
+            .unwrap(),
+        );
+
+        let package = PreparedAppPackage::from_dir(tmp.path()).unwrap();
+        let route = route_for_pattern(&package.route_index, "[wallet]");
+        assert_eq!(route.kind, RouteEntryKind::Dir);
+        assert_eq!(
+            route.install_metadata.required_caps,
+            vec!["bloom:store".to_string(), "bloom:vfs.read".to_string()]
+        );
+    }
+
+    #[test]
+    fn v2_runtime_metadata_cache_ttl_is_unrestricted_only_for_parameterized_routes() {
+        let record = |params: Vec<String>| RouteIndexRecord {
+            route_id: "r000001".into(),
+            pattern: "[name].txt".into(),
+            source_path: "app/echo/[name].txt.wasm".into(),
+            artifact_path: "artifacts/routes/r000001.wasm".into(),
+            artifact_hash: "00".repeat(32),
+            abi: RouteAbi::ComponentBloomRoute010,
+            kind: RouteEntryKind::File,
+            ops: vec![RouteOp::Lookup, RouteOp::Read],
+            params,
+            specificity: [1, 0, 1],
+            install_metadata: InstallRouteMetadata {
+                mode: 0o444,
+                cache_ttl_ms: None,
+                side_effecting_read: true,
+                write_async: false,
+                executable: false,
+                required_caps: Vec::new(),
+                sign_intent: None,
+            },
+        };
+        let metadata = ComponentRouteMetadata {
+            kind: ComponentRouteEntryKind::File,
+            mode: 0o444,
+            cache_ttl_ms: Some(1000),
+            side_effecting_read: false,
+            write_async: false,
+            executable: false,
+            required_caps: Vec::new(),
+            sign_intent: None,
+        };
+
+        let narrowed = narrow_runtime_route_metadata(
+            &record(vec!["name".into()]),
+            &metadata,
+            &BTreeSet::new(),
+        )
+        .unwrap();
+        assert_eq!(narrowed.cache_ttl_ms, Some(1000));
+
+        let err = narrow_runtime_route_metadata(&record(Vec::new()), &metadata, &BTreeSet::new())
+            .unwrap_err();
+        assert!(err.to_string().contains("widens cacheability"), "{err}");
     }
 
     #[test]

@@ -788,6 +788,60 @@ name = "echo"
     }
 
     #[tokio::test]
+    async fn dynamic_route_metadata_cannot_require_unimported_cap() {
+        let (dir, r) = runner();
+        let package = dir.path().join("unimported-cap-app");
+        write_package_file(
+            &package,
+            "petal.toml",
+            br#"schema = "bloom.petal.local-app.v2"
+name = "example"
+
+[caps]
+allowed = ["bloom:store", "bloom:vfs.read"]
+
+[store]
+namespaces = ["wallets"]
+"#,
+        );
+        write_package_file(&package, "README.md", b"# example");
+        write_package_file(&package, "AGENTS.md", b"# example agents");
+        // The component's runtime metadata claims bloom:vfs.read, but the
+        // artifact never imports the vfs interface, so the install-time
+        // capability ceiling is bloom:store only.
+        write_package_file(
+            &package,
+            "app/example/[wallet]/$index.wasm",
+            &crate::v2::route_fixtures::dynamic_dir_route_component(
+                true,
+                crate::v2::route_fixtures::FixtureVfsImport::None,
+                &["bloom:store", "bloom:vfs.read"],
+                None,
+            ),
+        );
+        let (_, _, index) = r.store().install_app_package_dir(&package).unwrap();
+        assert_eq!(
+            index.routes[0].install_metadata.required_caps,
+            vec!["bloom:store".to_string()]
+        );
+
+        let err = r
+            .local_app_route_runtime_metadata(
+                "example",
+                DispatchOp::Lookup,
+                "alice",
+                RunOptions::default(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("requires missing petal.toml cap bloom:vfs.read"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
     async fn dynamic_component_runtime_metadata_can_deny_write() {
         let (dir, r) = runner();
         let package = dir.path().join("dynamic-component-write-app");

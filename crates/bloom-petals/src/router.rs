@@ -431,6 +431,57 @@ name = "demo"
         );
     }
 
+    fn write_dynamic_dir_package(root: &std::path::Path) {
+        write_package_file(
+            root,
+            "petal.toml",
+            br#"schema = "bloom.petal.local-app.v2"
+name = "example"
+
+[caps]
+allowed = ["bloom:store", "bloom:vfs.read"]
+
+[store]
+namespaces = ["wallets"]
+"#,
+        );
+        write_package_file(root, "README.md", b"# example");
+        write_package_file(root, "AGENTS.md", b"# example agents");
+        write_package_file(
+            root,
+            "app/example/[wallet]/$index.wasm",
+            &crate::v2::route_fixtures::dynamic_dir_route_component(
+                true,
+                crate::v2::route_fixtures::FixtureVfsImport::ReadOnly,
+                &["bloom:store", "bloom:vfs.read"],
+                None,
+            ),
+        );
+    }
+
+    #[tokio::test]
+    async fn parameterized_dir_route_lookup_uses_component_runtime_metadata() {
+        let (dir, runner) = runner();
+        let package = dir.path().join("example-app");
+        write_dynamic_dir_package(&package);
+        runner.store().install_app_package_dir(&package).unwrap();
+
+        let router = PetalRouter::new(runner, Arc::new(DenyHost));
+        let vfs = Vfs::builder().mount("apps", Arc::new(router)).build();
+
+        let entry = vfs
+            .lookup(&VfsPath::parse("/apps/example/alice").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(entry.name, "alice");
+        assert_eq!(entry.kind, bloom_vfs::EntryKind::Dir);
+        assert_eq!(entry.mode, 0o755);
+        // The size comes from the component's lookup handler, proving the
+        // dynamic route dispatched instead of falling back to a static
+        // route-index directory entry.
+        assert_eq!(entry.size, crate::v2::route_fixtures::LOOKUP_ENTRY_SIZE);
+    }
+
     #[tokio::test]
     async fn mounted_apps_vfs_dispatches_installed_v2_routes() {
         let (dir, runner) = runner();
