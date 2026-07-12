@@ -541,6 +541,18 @@ pub fn is_valid_hex_hash(s: &str) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
+/// Length of the hash prefix `petal ls` prints, and the minimum
+/// prefix length accepted when resolving an uninstall target.
+pub const HASH_PREFIX_LEN: usize = 12;
+
+/// True when `s` is shaped like a partial content hash: lowercase
+/// hex, at least [`HASH_PREFIX_LEN`] and fewer than 64 chars.
+pub fn is_hex_hash_prefix(s: &str) -> bool {
+    (HASH_PREFIX_LEN..64).contains(&s.len())
+        && s.bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
 fn validate_hash_arg(hash: &str) -> Result<(), PetalError> {
     if is_valid_hex_hash(hash) {
         Ok(())

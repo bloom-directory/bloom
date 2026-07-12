@@ -295,8 +295,10 @@ enum PetalsCmd {
     Ls,
     /// Remove an installed petal (and any petname pointing at it).
     Uninstall {
-        /// 64-char hex content hash of the petal to remove.
-        hash: String,
+        /// Content hash of the petal to remove: full 64-char hex, a
+        /// unique prefix of at least 12 chars (as printed by `ls`),
+        /// an app name, or a petname.
+        target: String,
     },
 }
 
@@ -2920,7 +2922,7 @@ async fn run_petals(home: HomeDir, cmd: PetalsCmd) -> Result<()> {
                 });
                 println!(
                     "{}  {:<7}  {:>7}  caps=[]  name=-{}{}",
-                    &meta.hash[..12],
+                    &meta.hash[..bloom_petals::store::HASH_PREFIX_LEN],
                     "app",
                     meta.size,
                     app,
@@ -2929,12 +2931,12 @@ async fn run_petals(home: HomeDir, cmd: PetalsCmd) -> Result<()> {
             }
             Ok(())
         }
-        PetalsCmd::Uninstall { hash } => {
-            let removed = d.petals.uninstall(&hash).context("uninstall petal")?;
+        PetalsCmd::Uninstall { target } => {
+            let removed = d.petals.uninstall(&target).context("uninstall petal")?;
             if removed {
-                println!("removed {hash}");
+                println!("removed {target}");
             } else {
-                println!("not installed: {hash}");
+                println!("not installed: {target}");
             }
             Ok(())
         }

@@ -199,20 +199,52 @@ impl PetalRunner {
         &self.registry
     }
 
-    /// Remove an installed petal and any petname pointing at it.
-    /// Returns true if anything was removed.
-    pub fn uninstall(&self, hash: &str) -> Result<bool, PetalError> {
+    /// Remove an installed petal and any petname pointing at it. The
+    /// target may be a full content hash, a unique hash prefix of at
+    /// least [`crate::store::HASH_PREFIX_LEN`] chars (the length
+    /// `petal ls` prints), a local app name, or a petname. Returns
+    /// true if anything was removed.
+    pub fn uninstall(&self, target: &str) -> Result<bool, PetalError> {
+        let Some(hash) = self.resolve_uninstall_hash(target)? else {
+            return Ok(false);
+        };
         let to_unset: Vec<String> = self
             .registry
             .snapshot()
             .into_iter()
             .filter_map(|(n, h)| if h == hash { Some(n) } else { None })
             .collect();
-        let removed = self.store.uninstall(hash)?;
+        let removed = self.store.uninstall(&hash)?;
         for n in to_unset {
             self.registry.unset(&n)?;
         }
         Ok(removed)
+    }
+
+    /// Resolve an uninstall target to a full content hash. Hashes win
+    /// (as in [`Self::resolve`]): a full 64-char hash is used as-is,
+    /// then a hash prefix is tried against every installed hash, then
+    /// a local app name, then a petname. Returns `None` when nothing
+    /// matches.
+    fn resolve_uninstall_hash(&self, target: &str) -> Result<Option<String>, PetalError> {
+        if crate::store::is_valid_hex_hash(target) {
+            return Ok(Some(target.to_string()));
+        }
+        if crate::store::is_hex_hash_prefix(target) {
+            let mut hashes: BTreeSet<String> = self.store.list_hashes()?.into_iter().collect();
+            hashes.extend(self.store.list_package_hashes()?);
+            if let Some(hash) = resolve_hash_prefix(target, hashes)? {
+                return Ok(Some(hash));
+            }
+        }
+        if let Some(hash) = self
+            .local_app_mounts()?
+            .into_iter()
+            .find_map(|(name, hash)| (name == target).then_some(hash))
+        {
+            return Ok(Some(hash));
+        }
+        Ok(self.registry.lookup(target))
     }
 
     /// Resolve a `name_or_hash` to a content hash. Hashes win — if a
@@ -440,6 +472,28 @@ impl PetalRunner {
     }
 }
 
+/// Match `prefix` against installed hashes: `None` when nothing
+/// matches, the full hash when exactly one does, and an error when
+/// the prefix is ambiguous.
+fn resolve_hash_prefix(
+    prefix: &str,
+    hashes: impl IntoIterator<Item = String>,
+) -> Result<Option<String>, PetalError> {
+    let mut matched: Option<String> = None;
+    for hash in hashes {
+        if !hash.starts_with(prefix) {
+            continue;
+        }
+        if matched.is_some() {
+            return Err(PetalError::InvalidHash(format!(
+                "{prefix} is ambiguous: matches multiple installed petals"
+            )));
+        }
+        matched = Some(hash);
+    }
+    Ok(matched)
+}
+
 fn route_op(op: DispatchOp) -> RouteOp {
     match op {
         DispatchOp::Lookup => RouteOp::Lookup,
@@ -648,6 +702,76 @@ mod tests {
         let reg = Arc::new(NameRegistry::open(dir.path().join("reg")).unwrap());
         let vm = PetalVm::new().unwrap();
         (dir, PetalRunner::new(store, reg, vm))
+    }
+
+    fn install_echo_app(dir: &TempDir, r: &PetalRunner) -> String {
+        let package = dir.path().join("echo-app");
+        write_package_file(
+            &package,
+            "petal.toml",
+            br#"schema = "bloom.petal.local-app.v2"
+name = "echo"
+"#,
+        );
+        write_package_file(&package, "README.md", b"# echo");
+        write_package_file(&package, "AGENTS.md", b"# echo agents");
+        write_package_file(
+            &package,
+            "app/echo/message.txt.wasm",
+            include_bytes!("../tests/fixtures/route_component_no_imports.wasm"),
+        );
+        let (result, _, _) = r.store().install_app_package_dir(&package).unwrap();
+        result.hash
+    }
+
+    #[test]
+    fn uninstall_accepts_ls_hash_prefix() {
+        let (dir, r) = runner();
+        let hash = install_echo_app(&dir, &r);
+        assert!(r.uninstall(&hash[..crate::store::HASH_PREFIX_LEN]).unwrap());
+        assert!(!r.store().contains_package(&hash));
+    }
+
+    #[test]
+    fn uninstall_accepts_local_app_name() {
+        let (dir, r) = runner();
+        let hash = install_echo_app(&dir, &r);
+        assert!(r.uninstall("echo").unwrap());
+        assert!(!r.store().contains_package(&hash));
+    }
+
+    #[test]
+    fn uninstall_accepts_petname_and_unsets_it() {
+        let (dir, r) = runner();
+        let hash = install_echo_app(&dir, &r);
+        r.registry().set("mypetal", &hash).unwrap();
+        assert!(r.uninstall("mypetal").unwrap());
+        assert!(!r.store().contains_package(&hash));
+        assert!(r.registry().lookup("mypetal").is_none());
+    }
+
+    #[test]
+    fn uninstall_unknown_target_returns_false() {
+        let (_dir, r) = runner();
+        assert!(!r.uninstall("nope").unwrap());
+        // Hash-prefix shaped, but nothing installed matches it.
+        assert!(!r.uninstall("0123456789ab").unwrap());
+    }
+
+    #[test]
+    fn resolve_hash_prefix_requires_unique_match() {
+        let a = format!("{}{}", "ab".repeat(6), "0".repeat(52));
+        let b = format!("{}{}", "ab".repeat(6), "1".repeat(52));
+        let c = "c".repeat(64);
+        assert!(matches!(
+            resolve_hash_prefix(&"ab".repeat(6), [a.clone(), b, c.clone()]),
+            Err(PetalError::InvalidHash(_))
+        ));
+        assert_eq!(
+            resolve_hash_prefix(&a[..13], [a.clone(), c.clone()]).unwrap(),
+            Some(a)
+        );
+        assert_eq!(resolve_hash_prefix("dddddddddddd", [c]).unwrap(), None);
     }
 
     struct StaticHandler;
