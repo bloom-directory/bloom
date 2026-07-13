@@ -33,10 +33,7 @@ use lru::LruCache;
 use parking_lot::Mutex;
 use tracing::{debug, trace, warn};
 
-use bloom_vfs::{
-    Entry, EntryKind, Handler, HandlerError, Vfs, VfsPath, is_agent_guidance_path,
-    mounted_agent_guidance, percent_decode_segment,
-};
+use bloom_vfs::{Entry, EntryKind, Handler, HandlerError, Vfs, VfsPath, percent_decode_segment};
 
 /// Maximum bytes we'll buffer for a single open file before forcing a
 /// flush (or rejecting further writes with FBIG). 8 MiB matches the
@@ -693,9 +690,6 @@ impl BloomFs {
     /// an existing render future for the same path if one is already
     /// running.
     async fn render_with_dedup(&self, path: &VfsPath) -> Result<Bytes, FsError> {
-        if is_agent_guidance_path(path) {
-            return Ok(Bytes::from_static(mounted_agent_guidance()));
-        }
         let fut: RenderFuture = {
             let mut map = self.in_flight.lock();
             if let Some(existing) = map.get(path) {
@@ -1008,9 +1002,7 @@ impl FileSystem for BloomFs {
         // rendered body. Reading from that cache guarantees the size
         // we returned in GETATTR matches what READ delivers, so `eof`
         // is correct and tooling never sees NUL padding past EOF.
-        let data: Bytes = if is_agent_guidance_path(&path) {
-            Bytes::from_static(mounted_agent_guidance())
-        } else if let Some(cached) = self.render_cache.get(&path) {
+        let data: Bytes = if let Some(cached) = self.render_cache.get(&path) {
             match cached {
                 MountRenderResult::Bytes(b) => b,
                 MountRenderResult::Error => return Err(FsError::Io),
@@ -1340,7 +1332,6 @@ mod tests {
     use std::sync::Arc;
 
     use bloom_vfs::handler::{Entry, Handler, HandlerError};
-    use bloom_vfs::handlers::DocsHandler;
 
     struct StaticHandler;
 
@@ -1530,42 +1521,6 @@ mod tests {
         let ctx = fake_ctx();
         let attrs = fs.getattr(&ctx, &BloomHandle::Root).await.unwrap();
         assert_eq!(attrs.object_type, ObjectType::Directory);
-    }
-
-    #[tokio::test]
-    async fn mounted_root_agent_guidance_uses_filesystem_commands() {
-        let vfs = Vfs::builder()
-            .mount("docs", Arc::new(DocsHandler::new()))
-            .build();
-        let fs = BloomFs::new(vfs);
-        let ctx = fake_ctx();
-        let agents = fs
-            .lookup(&ctx, &BloomHandle::Root, "AGENTS.md")
-            .await
-            .unwrap();
-        let read = fs.read(&ctx, &agents, 0, u32::MAX).await.unwrap();
-        let text = std::str::from_utf8(&read.data).unwrap();
-
-        assert!(text.contains("cat docs/README.md"), "{text}");
-        assert!(text.contains("cat requests/latest/plan.md"), "{text}");
-        assert!(!text.contains("bloom vfs"), "{text}");
-        assert!(!text.contains("/bloom/"), "{text}");
-    }
-
-    #[tokio::test]
-    async fn mounted_docs_agent_guidance_uses_mounted_variant() {
-        let vfs = Vfs::builder()
-            .mount("docs", Arc::new(DocsHandler::new()))
-            .build();
-        let fs = BloomFs::new(vfs);
-        let ctx = fake_ctx();
-        let docs = fs.lookup(&ctx, &BloomHandle::Root, "docs").await.unwrap();
-        let guidance = fs.lookup(&ctx, &docs, "agent-guidance.md").await.unwrap();
-        let read = fs.read(&ctx, &guidance, 0, u32::MAX).await.unwrap();
-        let text = std::str::from_utf8(&read.data).unwrap();
-
-        assert!(text.contains("cat docs/README.md"), "{text}");
-        assert!(!text.contains("bloom vfs"), "{text}");
     }
 
     #[tokio::test]
