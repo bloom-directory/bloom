@@ -419,10 +419,13 @@ fn vfs_cat_root_agent_guidance_returns_identical_content() {
 
     assert_eq!(agents, claude);
     let text = String::from_utf8(agents).expect("guidance is utf-8");
-    assert!(text.contains("/docs"), "guidance should call out /docs");
     assert!(
-        text.contains("bloom vfs"),
-        "guidance should mention the bloom vfs CLI"
+        text.contains("cat docs/README.md"),
+        "guidance should use mounted filesystem examples"
+    );
+    assert!(
+        !text.contains("bloom vfs"),
+        "guidance should not mention the bloom vfs CLI"
     );
 }
 
