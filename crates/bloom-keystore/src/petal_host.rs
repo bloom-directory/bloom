@@ -29,9 +29,9 @@ use base64::Engine as _;
 
 use bloom_auth_api::{
     AuditEvent, AuthApiError, DaemonGrantTerms, GrantStore, PetalHost, PetalPolicySnapshot,
-    SealedApprovalGrant, SealedPetalContext, SealedSignature, SignHashRequest, SigningAttestation,
-    SigningAttestationSchemaRegistry, intent_hash_of, petal_identity::placeholder_digest_for,
-    signing_attestation_facts_digest,
+    SealedApprovalGrant, SealedPetalContext, SealedSignBatchEntry, SealedSignature,
+    SignHashRequest, SigningAttestation, SigningAttestationSchemaRegistry, intent_hash_of,
+    petal_identity::placeholder_digest_for, signing_attestation_facts_digest,
 };
 use bloom_proto::AuditLog;
 use bloom_proto::audit::AuditRecord;
@@ -577,6 +577,65 @@ impl PetalHost for KeystorePetalHost {
         })
     }
 
+    async fn sign_hash_batch(
+        &self,
+        requests: Vec<SignHashRequest>,
+        attestations: &[SigningAttestation],
+        now_ms: u64,
+    ) -> Result<Vec<SealedSignature>, AuthApiError> {
+        if requests.is_empty() || requests.len() != attestations.len() {
+            return Err(AuthApiError::Denied(
+                "signing batch must contain matching non-empty requests and attestations".into(),
+            ));
+        }
+        let first = &requests[0];
+        if requests
+            .iter()
+            .any(|request| request.wallet != first.wallet || request.action_id != first.action_id)
+        {
+            return Err(AuthApiError::Denied(
+                "every signing batch entry must share one wallet and action_id".into(),
+            ));
+        }
+        let first_attestation = &attestations[0];
+        let grant = self
+            .grant_store
+            .get_active(
+                &first.wallet,
+                &first.action_id,
+                &first_attestation.petal_id,
+                &first_attestation.petal_digest,
+                now_ms,
+            )
+            .await?
+            .ok_or_else(|| AuthApiError::Denied("no live grant for signing batch".into()))?;
+        let sealed_entries: Vec<SealedSignBatchEntry> = serde_json::from_value(
+            grant
+                .daemon_terms
+                .extra
+                .get("required.signing_requests")
+                .cloned()
+                .ok_or_else(|| {
+                    AuthApiError::Denied("batch grant is missing required.signing_requests".into())
+                })?,
+        )
+        .map_err(|e| AuthApiError::Denied(format!("invalid sealed signing batch: {e}")))?;
+        let actual_entries = sealed_batch_entries(&requests, attestations)?;
+        if sealed_entries != actual_entries || grant.max_signatures as usize != requests.len() {
+            return Err(AuthApiError::Denied(
+                "signing batch does not exactly match the sealed ordered request set".into(),
+            ));
+        }
+
+        // Validate the full set above before signing. Individual calls retain
+        // the normal hash-specific attestation, grant, TTL, and count checks.
+        let mut signatures = Vec::with_capacity(requests.len());
+        for (request, attestation) in requests.into_iter().zip(attestations) {
+            signatures.push(self.sign_hash(request, attestation, now_ms).await?);
+        }
+        Ok(signatures)
+    }
+
     async fn audit(&self, event: AuditEvent) -> Result<(), AuthApiError> {
         let _ = self
             .audit_log
@@ -706,6 +765,21 @@ fn validate_required_grant_terms(
                     );
                 }
             }
+            "required.signing_requests" => {
+                let entries: Vec<SealedSignBatchEntry> = serde_json::from_value(value.clone())
+                    .map_err(|e| format!("required.signing_requests is invalid: {e}"))?;
+                let actual_digest = signing_attestation_facts_digest(&attestation.facts)
+                    .map_err(|e| format!("digest signing attestation facts: {e}"))?;
+                let matched = entries.iter().any(|entry| {
+                    entry.wallet == request.wallet
+                        && entry.intent == request.intent
+                        && entry.hash_hex == request.hash_hex
+                        && entry.attestation_facts_digest == actual_digest
+                });
+                if !matched {
+                    return Err("sign_hash request is not in required.signing_requests".to_string());
+                }
+            }
             key if key.starts_with("required.") => {
                 return Err(format!("unsupported required grant term '{key}'"));
             }
@@ -713,6 +787,24 @@ fn validate_required_grant_terms(
         }
     }
     Ok(())
+}
+
+fn sealed_batch_entries(
+    requests: &[SignHashRequest],
+    attestations: &[SigningAttestation],
+) -> Result<Vec<SealedSignBatchEntry>, AuthApiError> {
+    requests
+        .iter()
+        .zip(attestations)
+        .map(|(request, attestation)| {
+            Ok(SealedSignBatchEntry {
+                wallet: request.wallet.clone(),
+                intent: request.intent.clone(),
+                hash_hex: request.hash_hex.clone(),
+                attestation_facts_digest: signing_attestation_facts_digest(&attestation.facts)?,
+            })
+        })
+        .collect()
 }
 
 fn attestation_fact_str<'a>(attestation: &'a SigningAttestation, key: &str) -> Option<&'a str> {
@@ -1078,6 +1170,37 @@ mod tests {
             .await
             .unwrap();
         assert!(active.is_none(), "one-shot grant should be consumed");
+    }
+
+    #[test]
+    fn required_signing_requests_bind_each_hash_and_attestation() {
+        let h = Harness::new("my-wallet");
+        let attestation = h.attestation(
+            PETAL_ID_EVM_WALLET,
+            PLACEHOLDER_DIGEST_EVM_WALLET,
+            "evm.tx.sign",
+        );
+        let request = h.sign_request("my-wallet", "req_1", "evm.tx.sign");
+        let entry = SealedSignBatchEntry {
+            wallet: request.wallet.clone(),
+            intent: request.intent.clone(),
+            hash_hex: request.hash_hex.clone(),
+            attestation_facts_digest: signing_attestation_facts_digest(&attestation.facts).unwrap(),
+        };
+        let mut terms = DaemonGrantTerms::minimal(AssuranceLevel::Hardened);
+        terms.extra.insert(
+            "required.signing_requests".into(),
+            serde_json::to_value([entry]).unwrap(),
+        );
+        assert!(validate_required_grant_terms(&terms, &request, &attestation).is_ok());
+
+        let mut changed = request;
+        changed.hash_hex = format!("0x{}", "2".repeat(64));
+        assert!(
+            validate_required_grant_terms(&terms, &changed, &attestation)
+                .unwrap_err()
+                .contains("not in required.signing_requests")
+        );
     }
 
     #[tokio::test]

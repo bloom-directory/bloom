@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use bloom_proto::config::PetalAppRuntimeConfig;
 use bloom_vfs::handler::{Entry, EntryKind, Handler, HandlerError};
 use bloom_vfs::path::VfsPath;
 
@@ -22,11 +23,41 @@ use crate::vm::{COMPONENT_NOT_A_DIR_CODE, COMPONENT_UNSUPPORTED_CODE, RunOptions
 pub struct PetalRouter {
     runner: PetalRunner,
     host: Arc<dyn PetalHost>,
+    runtime_apps: BTreeMap<String, PetalAppRuntimeConfig>,
 }
 
 impl PetalRouter {
     pub fn new(runner: PetalRunner, host: Arc<dyn PetalHost>) -> Self {
-        Self { runner, host }
+        Self {
+            runner,
+            host,
+            runtime_apps: BTreeMap::new(),
+        }
+    }
+
+    pub fn with_runtime_apps(
+        mut self,
+        runtime_apps: BTreeMap<String, PetalAppRuntimeConfig>,
+    ) -> Self {
+        self.runtime_apps = runtime_apps;
+        self
+    }
+
+    fn run_options(&self, mount: &str) -> RunOptions {
+        let Some(app) = self.runtime_apps.get(mount) else {
+            return RunOptions::default();
+        };
+        let mut runtime_settings = app.values.clone();
+        runtime_settings.extend(
+            app.endpoints
+                .iter()
+                .map(|(key, value)| (format!("endpoint.{key}"), value.clone())),
+        );
+        RunOptions {
+            runtime_settings,
+            endpoint_bindings: app.endpoints.clone(),
+            ..RunOptions::default()
+        }
     }
 
     fn mount_path(path: &VfsPath) -> Result<(&str, String), HandlerError> {
@@ -60,7 +91,7 @@ impl PetalRouter {
                 },
                 self.host.clone(),
                 None,
-                RunOptions::default(),
+                self.run_options(mount),
             )
             .await
             .map_err(map_petal_err)?;
@@ -143,7 +174,7 @@ impl Handler for PetalRouter {
                 mount,
                 DispatchOp::Write,
                 &rest,
-                RunOptions::default(),
+                self.run_options(mount),
             )
             .await
             .map_err(map_petal_err)?;
@@ -157,9 +188,10 @@ impl Handler for PetalRouter {
                 body: data.to_vec(),
                 ctx: Vec::new(),
             };
+            let opts = self.run_options(&mount);
             tokio::spawn(async move {
                 let result = runner
-                    .dispatch_app_route(&mount, request, host, None, RunOptions::default())
+                    .dispatch_app_route(&mount, request, host, None, opts)
                     .await;
                 if let Err(e) = result {
                     tracing::warn!(
@@ -250,10 +282,10 @@ impl Handler for PetalRouter {
         {
             return self
                 .runner
-                .local_app_route(mount, DispatchOp::Read, &rest)
+                .local_app_route_effective_metadata(mount, DispatchOp::Read, &rest)
                 .ok()
-                .filter(|matched| !matched.route.install_metadata.side_effecting_read)
-                .and_then(|matched| matched.route.install_metadata.cache_ttl_ms)
+                .filter(|(_, metadata)| !metadata.side_effecting_read)
+                .and_then(|(_, metadata)| metadata.cache_ttl_ms)
                 .map(Duration::from_millis);
         }
         None
@@ -265,9 +297,9 @@ impl Handler for PetalRouter {
         {
             return self
                 .runner
-                .local_app_route(mount, DispatchOp::Read, &rest)
+                .local_app_route_effective_metadata(mount, DispatchOp::Read, &rest)
                 .ok()
-                .map(|matched| matched.route.install_metadata.side_effecting_read)
+                .map(|(_, metadata)| metadata.side_effecting_read)
                 .unwrap_or(false);
         }
         false
@@ -431,7 +463,7 @@ name = "demo"
         );
     }
 
-    fn write_dynamic_dir_package(root: &std::path::Path) {
+    fn write_dynamic_dir_package(root: &std::path::Path, side_effecting_read: bool) {
         write_package_file(
             root,
             "petal.toml",
@@ -447,27 +479,38 @@ namespaces = ["wallets"]
         );
         write_package_file(root, "README.md", b"# example");
         write_package_file(root, "AGENTS.md", b"# example agents");
-        write_package_file(
-            root,
-            "app/example/[wallet]/$index.wasm",
-            &crate::v2::route_fixtures::dynamic_dir_route_component(
+        let route = if side_effecting_read {
+            crate::v2::route_fixtures::dynamic_side_effecting_dir_route_component(
                 true,
                 crate::v2::route_fixtures::FixtureVfsImport::ReadOnly,
                 &["bloom:store", "bloom:vfs.read"],
                 None,
-            ),
-        );
+            )
+        } else {
+            crate::v2::route_fixtures::dynamic_dir_route_component(
+                true,
+                crate::v2::route_fixtures::FixtureVfsImport::ReadOnly,
+                &["bloom:store", "bloom:vfs.read"],
+                None,
+            )
+        };
+        write_package_file(root, "app/example/[wallet]/$index.wasm", &route);
     }
 
     #[tokio::test]
     async fn parameterized_dir_route_lookup_uses_component_runtime_metadata() {
         let (dir, runner) = runner();
         let package = dir.path().join("example-app");
-        write_dynamic_dir_package(&package);
+        write_dynamic_dir_package(&package, false);
         runner.store().install_app_package_dir(&package).unwrap();
 
         let router = PetalRouter::new(runner, Arc::new(DenyHost));
-        let vfs = Vfs::builder().mount("apps", Arc::new(router)).build();
+        let route_path = VfsPath::parse("/example/alice").unwrap();
+        assert!(router.is_read_side_effecting(&route_path));
+        assert_eq!(router.cache_ttl(&route_path), None);
+        let vfs = Vfs::builder()
+            .mount("apps", Arc::new(router.clone()))
+            .build();
 
         let entry = vfs
             .lookup(&VfsPath::parse("/apps/example/alice").unwrap())
@@ -480,6 +523,30 @@ namespaces = ["wallets"]
         // dynamic route dispatched instead of falling back to a static
         // route-index directory entry.
         assert_eq!(entry.size, crate::v2::route_fixtures::LOOKUP_ENTRY_SIZE);
+        assert!(!router.is_read_side_effecting(&route_path));
+        assert_eq!(router.cache_ttl(&route_path), Some(Duration::from_secs(30)));
+    }
+
+    #[tokio::test]
+    async fn parameterized_side_effecting_route_remains_fail_closed_after_lookup() {
+        let (dir, runner) = runner();
+        let package = dir.path().join("example-app");
+        write_dynamic_dir_package(&package, true);
+        runner.store().install_app_package_dir(&package).unwrap();
+
+        let router = PetalRouter::new(runner, Arc::new(DenyHost));
+        let route_path = VfsPath::parse("/example/alice").unwrap();
+        assert!(router.is_read_side_effecting(&route_path));
+        let vfs = Vfs::builder()
+            .mount("apps", Arc::new(router.clone()))
+            .build();
+
+        vfs.lookup(&VfsPath::parse("/apps/example/alice").unwrap())
+            .await
+            .unwrap();
+
+        assert!(router.is_read_side_effecting(&route_path));
+        assert_eq!(router.cache_ttl(&route_path), None);
     }
 
     #[tokio::test]

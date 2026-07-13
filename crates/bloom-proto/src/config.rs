@@ -48,6 +48,12 @@ pub struct Config {
     /// `polymarket/` VFS subtree in (like `[enso]` opts in `defi/`).
     #[serde(default)]
     pub polymarket: Option<PolymarketConfig>,
+    /// Trusted, daemon-owned runtime settings for installed v2 Petal apps.
+    /// Endpoint overrides are matched to named manifest bindings and may only
+    /// replace the HTTPS authority; the signed method/path policy remains the
+    /// upper bound.
+    #[serde(default)]
+    pub petals: PetalsConfig,
     /// Hyperliquid HyperCore read/write surface. Presence of `[hyperliquid]`
     /// opts the `hyperliquid/` VFS subtree in.
     #[serde(default)]
@@ -66,6 +72,20 @@ pub struct Config {
     /// metadata + history, RPC for everything else.
     #[serde(default)]
     pub backends: BackendsConfig,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PetalsConfig {
+    #[serde(default)]
+    pub apps: BTreeMap<String, PetalAppRuntimeConfig>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PetalAppRuntimeConfig {
+    #[serde(default)]
+    pub endpoints: BTreeMap<String, String>,
+    #[serde(default)]
+    pub values: BTreeMap<String, String>,
 }
 
 /// Where a given feature sources its data.
@@ -488,6 +508,7 @@ impl Config {
             etherscan: None,
             enso: None,
             polymarket: None,
+            petals: PetalsConfig::default(),
             hyperliquid: Some(HyperliquidConfig::default()),
             mempool: BTreeMap::new(),
             private_rpc: BTreeMap::new(),
@@ -558,6 +579,42 @@ impl Config {
                 )));
             }
         }
+        for (app_name, app) in &self.petals.apps {
+            validate_petal_runtime_name("app", app_name)?;
+            for (binding, origin) in &app.endpoints {
+                validate_petal_runtime_name("endpoint binding", binding)?;
+                validate_petal_endpoint_origin(origin)?;
+            }
+            for key in app.values.keys() {
+                validate_petal_runtime_name("runtime value", key)?;
+            }
+            match (app.values.get("chain"), app.values.get("chain_id")) {
+                (Some(chain), Some(chain_id)) => {
+                    let parsed = chain_id.parse::<u64>().map_err(|_| {
+                        ConfigError::Invalid(format!(
+                            "petals.apps.{app_name}.values.chain_id must be a u64"
+                        ))
+                    })?;
+                    let spec = self.chains.get(chain).ok_or_else(|| {
+                        ConfigError::Invalid(format!(
+                            "petals.apps.{app_name}.values.chain={chain:?} is not configured"
+                        ))
+                    })?;
+                    if spec.chain_id != parsed {
+                        return Err(ConfigError::Invalid(format!(
+                            "petals.apps.{app_name} chain {chain:?} has id {}, not {parsed}",
+                            spec.chain_id
+                        )));
+                    }
+                }
+                (None, None) => {}
+                _ => {
+                    return Err(ConfigError::Invalid(format!(
+                        "petals.apps.{app_name} must set values.chain and values.chain_id together"
+                    )));
+                }
+            }
+        }
         Ok(())
     }
 
@@ -580,6 +637,39 @@ impl Config {
         }
         c.allow_broadcast
     }
+}
+
+fn validate_petal_runtime_name(kind: &str, name: &str) -> Result<(), ConfigError> {
+    if name.is_empty()
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Err(ConfigError::Invalid(format!(
+            "petal {kind} {name:?} must contain only ASCII letters, digits, '-' or '_'"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_petal_endpoint_origin(origin: &str) -> Result<(), ConfigError> {
+    let url = url::Url::parse(origin).map_err(|err| {
+        ConfigError::Invalid(format!("invalid petal endpoint origin {origin:?}: {err}"))
+    })?;
+    if url.scheme() != "https"
+        || url.username() != ""
+        || url.password().is_some()
+        || url.port().is_some_and(|port| port != 443)
+        || url.path() != "/"
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || url.host_str().is_none()
+    {
+        return Err(ConfigError::Invalid(format!(
+            "petal endpoint {origin:?} must be an HTTPS origin using the default port"
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -640,6 +730,31 @@ mod tests {
     #[test]
     fn local_default_validates() {
         Config::local_default().validate().unwrap();
+    }
+
+    #[test]
+    fn petal_runtime_endpoints_and_chain_are_operator_validated() {
+        let mut cfg = Config::local_default();
+        cfg.petals.apps.insert(
+            "polymarket".into(),
+            PetalAppRuntimeConfig {
+                endpoints: BTreeMap::from([(
+                    "clob".into(),
+                    "https://clob.internal.example".into(),
+                )]),
+                values: BTreeMap::from([
+                    ("chain".into(), "polygon".into()),
+                    ("chain_id".into(), "137".into()),
+                ]),
+            },
+        );
+        cfg.validate().unwrap();
+
+        cfg.petals.apps["polymarket"].endpoints.insert(
+            "clob".into(),
+            "https://clob.internal.example/credential-sink".into(),
+        );
+        assert!(cfg.validate().is_err());
     }
 
     #[test]

@@ -30,7 +30,7 @@
 //! Both calls fail with [`HostError::Denied`] (`-2`) unless the petal's
 //! metadata declared the corresponding capability.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -43,8 +43,8 @@ use wasmtime_wasi::preview1::{self, WasiP1Ctx};
 
 use crate::abi::{
     ChainRequest, ChainResponse, DispatchOp, DispatchRequest, DispatchResponse,
-    EvmOutboxInspection, EvmOutboxOutcome, EvmTransactionRequest, SignOutcome, SignRequest,
-    V2SignContext,
+    EvmOutboxInspection, EvmOutboxOutcome, EvmTransactionRequest, SignBatchOutcome,
+    SignBatchRequest, SignOutcome, SignRequest, V2SignContext,
 };
 use crate::error::PetalError;
 use crate::host::{HostError, HostVfsEntry, HostVfsEntryKind, PetalHost};
@@ -56,6 +56,7 @@ const DEFAULT_FUEL: u64 = 100_000_000;
 const DEFAULT_MEMORY_PAGES: u32 = 256; // 16 MiB (64 KiB pages).
 const STDOUT_CAP: usize = 1 << 20; // 1 MiB.
 const DEFAULT_HTTP_RESPONSE_CAP: usize = 8 * 1024 * 1024;
+const MAX_SIGN_BATCH_REQUESTS: usize = 16;
 const DEFAULT_RANDOM_BYTES_CAP: u32 = 1024 * 1024;
 pub(crate) const COMPONENT_NOT_A_DIR_CODE: i32 = -101;
 pub(crate) const COMPONENT_UNSUPPORTED_CODE: i32 = -102;
@@ -74,6 +75,7 @@ pub struct StoreData {
     http_response_cap: usize,
     private_store: Option<PrivateStore>,
     deterministic_env: bool,
+    runtime_settings: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -113,6 +115,10 @@ pub struct RunOptions {
     pub private_store_root: Option<PathBuf>,
     /// Force mediated env helpers to deterministic values for install-time checks.
     pub deterministic_env: bool,
+    /// Daemon-owned settings exposed read-only through `bloom:env`.
+    pub runtime_settings: BTreeMap<String, String>,
+    /// Daemon-owned HTTPS origins for manifest-declared endpoint bindings.
+    pub endpoint_bindings: BTreeMap<String, String>,
 }
 
 impl Default for RunOptions {
@@ -126,6 +132,8 @@ impl Default for RunOptions {
             http_response_cap: DEFAULT_HTTP_RESPONSE_CAP,
             private_store_root: None,
             deterministic_env: false,
+            runtime_settings: BTreeMap::new(),
+            endpoint_bindings: BTreeMap::new(),
         }
     }
 }
@@ -225,6 +233,7 @@ impl PetalVm {
                 store_namespaces: opts.store_namespaces.clone(),
                 http_response_cap: opts.http_response_cap,
                 deterministic_env: opts.deterministic_env,
+                runtime_settings: opts.runtime_settings.clone(),
                 private_store: match opts.private_store_root.clone() {
                     Some(root) => Some(
                         PrivateStore::open(root)
@@ -302,6 +311,7 @@ impl PetalVm {
                 store_namespaces: opts.store_namespaces.clone(),
                 http_response_cap: opts.http_response_cap,
                 deterministic_env: opts.deterministic_env,
+                runtime_settings: opts.runtime_settings.clone(),
                 private_store: match opts.private_store_root.clone() {
                     Some(root) => Some(
                         PrivateStore::open(root)
@@ -374,6 +384,7 @@ impl PetalVm {
                 store_namespaces: opts.store_namespaces.clone(),
                 http_response_cap: opts.http_response_cap,
                 deterministic_env: opts.deterministic_env,
+                runtime_settings: opts.runtime_settings.clone(),
                 private_store: match opts.private_store_root.clone() {
                     Some(root) => Some(
                         PrivateStore::open(root)
@@ -791,6 +802,9 @@ fn link_component_host_imports(linker: &mut ComponentLinker<StoreData>) -> anyho
         sign.func_new_async("sign-hash", |store, params, results| {
             Box::new(async move { component_sign_hash_v2(store, params, results).await })
         })?;
+        sign.func_new_async("sign-hashes", |store, params, results| {
+            Box::new(async move { component_sign_hashes_v2(store, params, results).await })
+        })?;
     }
     {
         let mut tx = linker.instance("bloom:tx/outbox@0.1.0")?;
@@ -832,6 +846,9 @@ fn link_component_host_imports(linker: &mut ComponentLinker<StoreData>) -> anyho
         })?;
         env.func_new_async("random-bytes", |store, params, results| {
             Box::new(async move { component_env_random_bytes(store, params, results).await })
+        })?;
+        env.func_new_async("setting", |store, params, results| {
+            Box::new(async move { component_env_setting(store, params, results).await })
         })?;
     }
     Ok(())
@@ -1239,6 +1256,107 @@ async fn component_sign_hash_v2(
         ),
         Err(err) => set_component_result(results, component_host_err(err)),
     }
+}
+
+async fn component_sign_hashes_v2(
+    store: StoreContextMut<'_, StoreData>,
+    params: &[ComponentVal],
+    results: &mut [ComponentVal],
+) -> anyhow::Result<()> {
+    let req = match component_sign_batch_request(store.data(), params) {
+        Ok(req) => req,
+        Err(err) => return set_component_result(results, component_host_err(err)),
+    };
+    let host = store.data().host.clone();
+    match host.sign_hashes_outcome(req).await {
+        Ok(SignBatchOutcome::Signatures(signatures))
+            if signatures.iter().all(|signature| signature.len() == 65) =>
+        {
+            set_component_result(
+                results,
+                ComponentVal::Result(Ok(Some(Box::new(ComponentVal::Variant(
+                    "signatures".into(),
+                    Some(Box::new(ComponentVal::List(
+                        signatures.into_iter().map(component_bytes).collect(),
+                    ))),
+                ))))),
+            )
+        }
+        Ok(SignBatchOutcome::Signatures(_)) => set_component_result(
+            results,
+            component_host_err(HostError::Backend(
+                "sign_hashes returned a non-65-byte signature".into(),
+            )),
+        ),
+        Ok(SignBatchOutcome::ApprovalRequired(approval)) => set_component_result(
+            results,
+            component_sign_v2_approval_required(
+                approval.action_id,
+                approval.ceremony_url,
+                approval.expires_ms,
+            ),
+        ),
+        Err(err) => set_component_result(results, component_host_err(err)),
+    }
+}
+
+fn component_sign_batch_request(
+    data: &StoreData,
+    params: &[ComponentVal],
+) -> Result<SignBatchRequest, HostError> {
+    if !data.caps.contains(&Capability::Sign) {
+        log_denied(data, "component_sign_hashes");
+        return Err(HostError::Denied("sign".into()));
+    }
+    let [ComponentVal::List(values)] = params else {
+        return Err(HostError::Invalid(
+            "invalid bloom:sign.sign-hashes params".into(),
+        ));
+    };
+    if values.is_empty() || values.len() > MAX_SIGN_BATCH_REQUESTS {
+        return Err(HostError::Invalid(format!(
+            "sign-hashes requires 1..={MAX_SIGN_BATCH_REQUESTS} requests"
+        )));
+    }
+    let mut requests = Vec::with_capacity(values.len());
+    for value in values {
+        let ComponentVal::Record(fields) = value else {
+            return Err(HostError::Invalid(
+                "sign-hashes request must be a record".into(),
+            ));
+        };
+        let wallet = component_string(
+            component_field(fields, "wallet").map_err(|e| HostError::Invalid(e.to_string()))?,
+            "wallet",
+        )?;
+        let hash = component_byte_list(
+            component_field(fields, "hash32").map_err(|e| HostError::Invalid(e.to_string()))?,
+            "hash32",
+        )?;
+        if hash.len() != 32 {
+            return Err(HostError::Invalid(
+                "sign-hashes requires 32-byte hashes".into(),
+            ));
+        }
+        let purpose = component_string(
+            component_field(fields, "intent").map_err(|e| HostError::Invalid(e.to_string()))?,
+            "intent",
+        )?;
+        if !sign_intent_allowed(data, &purpose) {
+            return Err(HostError::Denied(format!(
+                "sign intent {purpose:?} is not allowed"
+            )));
+        }
+        let mut hash32 = [0u8; 32];
+        hash32.copy_from_slice(&hash);
+        requests.push(SignRequest {
+            wallet,
+            hash32,
+            purpose,
+            context: data.sign_context.clone(),
+        });
+    }
+    Ok(SignBatchRequest { requests })
 }
 
 fn component_sign_request(
@@ -1696,6 +1814,32 @@ async fn component_env_random_bytes(
             .map_err(|e| anyhow::anyhow!("random-bytes unavailable: {e}"))?;
     }
     set_component_result(results, component_ok(Some(component_bytes(bytes))))
+}
+
+async fn component_env_setting(
+    store: StoreContextMut<'_, StoreData>,
+    params: &[ComponentVal],
+    results: &mut [ComponentVal],
+) -> anyhow::Result<()> {
+    let [key] = params else {
+        return set_component_result(
+            results,
+            component_host_err(HostError::Invalid(
+                "invalid bloom:env.setting params".into(),
+            )),
+        );
+    };
+    let key = match component_string(key, "key") {
+        Ok(key) => key,
+        Err(err) => return set_component_result(results, component_host_err(err)),
+    };
+    let value = store.data().runtime_settings.get(&key).cloned();
+    set_component_result(
+        results,
+        component_ok(Some(ComponentVal::Option(
+            value.map(|value| Box::new(ComponentVal::String(value.into()))),
+        ))),
+    )
 }
 
 fn set_component_result(results: &mut [ComponentVal], val: ComponentVal) -> anyhow::Result<()> {
@@ -3410,6 +3554,7 @@ paths = ["/status"]
                 store_namespaces: None,
                 http_response_cap: DEFAULT_HTTP_RESPONSE_CAP,
                 deterministic_env: false,
+                runtime_settings: BTreeMap::new(),
                 private_store,
             },
         )

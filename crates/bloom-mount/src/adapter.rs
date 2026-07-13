@@ -8,17 +8,18 @@
 //! ## Path semantics
 //!
 //! - `BloomHandle::Root` corresponds to `/` and is always a directory.
-//! - `BloomHandle::Path { kind, path }` carries the parsed
-//!   [`VfsPath`] plus a cached [`EntryKind`]. The kind is filled in on
-//!   `lookup` so subsequent `getattr` calls don't have to ask the VFS
-//!   again. Stale-cache risk is acceptable here because the VFS surface
-//!   is functionally immutable from the kernel's perspective during a
-//!   single mount session — directories don't morph into files.
+//! - `BloomHandle::Path { entry, path }` carries the parsed [`VfsPath`]
+//!   plus the [`Entry`] metadata returned by lookup or readdir. This keeps
+//!   subsequent metadata calls from re-running a dynamic Petal route.
+//!   Stale-cache risk is acceptable because the VFS namespace is
+//!   functionally immutable during a single mount session.
 
 use std::collections::{BTreeMap, HashMap};
+use std::hash::{Hash, Hasher};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
-use std::time::{Duration, Instant, UNIX_EPOCH};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -31,6 +32,7 @@ use futures::FutureExt;
 use futures::future::{BoxFuture, Shared};
 use lru::LruCache;
 use parking_lot::Mutex;
+use tokio::time::Instant;
 use tracing::{debug, trace, warn};
 
 use bloom_vfs::{Entry, EntryKind, Handler, HandlerError, Vfs, VfsPath, percent_decode_segment};
@@ -58,6 +60,13 @@ pub(crate) const RENDER_CACHE_CAPACITY: usize = 1024;
 /// rather than hanging past the kernel's retry threshold.
 pub(crate) const RENDER_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Directory snapshots bridge the GETATTR used to compute NFS's cookie
+/// verifier with every READDIR page in the same enumeration.
+pub(crate) const DIRECTORY_CACHE_CAPACITY: usize = 1024;
+pub(crate) const DIRECTORY_CACHE_IDLE_TTL: Duration = Duration::from_secs(2);
+pub(crate) const DIRECTORY_CACHE_MAX_AGE: Duration = Duration::from_secs(30);
+pub(crate) const DIRECTORY_LIST_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Time without further writes after which a buffer may be reaped.
 /// Picked to match the typical NFSv4 client behaviour: kernels with
 /// `wsize=4096` issue a burst of WRITEs followed by a COMMIT once the
@@ -72,34 +81,37 @@ pub(crate) const WRITE_IDLE_FLUSH: Duration = Duration::from_secs(5);
 /// caches handles and we want a `getattr` after a `lookup` to keep
 /// returning the same object. Handles are equal iff their stringified
 /// path is equal (root compares equal to root).
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone)]
 pub enum BloomHandle {
     Root,
     Path {
-        /// Cached kind from the last `lookup`. May lag reality but the
-        /// VFS surface is largely static — directories don't become
-        /// files mid-session.
-        kind: HandleKind,
+        /// Metadata already returned while resolving this handle. Keeping it
+        /// on the handle avoids a second VFS lookup for GETATTR/ACCESS.
+        entry: Entry,
         path: VfsPath,
     },
 }
 
-/// Kind cached on a handle so `getattr` doesn't have to re-query the
-/// VFS for object type. Only file/dir/symlink — NFS doesn't carry our
-/// finer-grained metadata.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum HandleKind {
-    Dir,
-    File,
-    Symlink,
+impl PartialEq for BloomHandle {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Root, Self::Root) => true,
+            (Self::Path { path: left, .. }, Self::Path { path: right, .. }) => left == right,
+            _ => false,
+        }
+    }
 }
 
-impl From<EntryKind> for HandleKind {
-    fn from(k: EntryKind) -> Self {
-        match k {
-            EntryKind::Dir => HandleKind::Dir,
-            EntryKind::File => HandleKind::File,
-            EntryKind::Symlink => HandleKind::Symlink,
+impl Eq for BloomHandle {}
+
+impl Hash for BloomHandle {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        match self {
+            Self::Root => 0_u8.hash(state),
+            Self::Path { path, .. } => {
+                1_u8.hash(state);
+                path.hash(state);
+            }
         }
     }
 }
@@ -438,7 +450,7 @@ struct MountRenderEntry {
 #[derive(Clone)]
 enum MountRenderResult {
     Bytes(Bytes),
-    Error,
+    Error(FsError),
 }
 
 impl MountRenderCache {
@@ -470,9 +482,9 @@ impl MountRenderCache {
         self.inner.lock().put(path.clone(), entry);
     }
 
-    fn put_error(&self, path: &VfsPath, ttl: Duration) {
+    fn put_error(&self, path: &VfsPath, error: FsError, ttl: Duration) {
         let entry = MountRenderEntry {
-            result: MountRenderResult::Error,
+            result: MountRenderResult::Error(error),
             expires_at: Instant::now() + ttl,
         };
         self.inner.lock().put(path.clone(), entry);
@@ -491,10 +503,162 @@ impl MountRenderCache {
 /// cold expensive leaf (e.g. `chains/<c>/tx/<h>/error.json`) cannot
 /// stampede when NFS clients retry slow ops.
 ///
-/// The future resolves to either `Ok(Bytes)` or a string-encoded error
-/// — we cannot share `HandlerError` directly because it is not `Clone`
-/// and `Shared` requires the inner output to be `Clone`.
-type RenderFuture = Shared<BoxFuture<'static, Result<Bytes, String>>>;
+/// `FsError` is cloneable, so native and Petal `HandlerError` values can be
+/// mapped through Bloom's existing NFS semantics before the future is shared.
+type RenderFuture = Shared<BoxFuture<'static, Result<Bytes, FsError>>>;
+
+/// One stable, ordered directory view used by GETATTR and every READDIR page.
+struct DirectorySnapshot {
+    entries: Arc<[Entry]>,
+    change: u64,
+    created_at: Instant,
+}
+
+struct MountDirectoryEntry {
+    entries: Option<Arc<[Entry]>>,
+    change: u64,
+    created_at: Instant,
+    last_used_at: Instant,
+}
+
+/// Short-lived mount cache for NFS directory enumeration. This is separate
+/// from the VFS read cache: list pagination and cookie verifiers have their own
+/// coherence requirements, and handlers should not need NFS-specific caches.
+struct MountDirectoryCache {
+    inner: Mutex<LruCache<VfsPath, MountDirectoryEntry>>,
+    generation: AtomicU64,
+}
+
+impl MountDirectoryCache {
+    fn new(capacity: usize) -> Self {
+        let cap = NonZeroUsize::new(capacity.max(1)).expect("capacity > 0");
+        Self {
+            inner: Mutex::new(LruCache::new(cap)),
+            generation: AtomicU64::new(1),
+        }
+    }
+
+    fn entry_expired(entry: &MountDirectoryEntry, now: Instant) -> bool {
+        now.duration_since(entry.last_used_at) > DIRECTORY_CACHE_IDLE_TTL
+            || now.duration_since(entry.created_at) > DIRECTORY_CACHE_MAX_AGE
+    }
+
+    fn get(&self, path: &VfsPath) -> Option<Arc<DirectorySnapshot>> {
+        let now = Instant::now();
+        let mut cache = self.inner.lock();
+        let expired = cache
+            .peek(path)
+            .map(|entry| Self::entry_expired(entry, now));
+        match expired {
+            Some(true) => {
+                cache.pop(path);
+                trace!(path = %path, "mount.directory_cache.expired");
+                None
+            }
+            Some(false) => {
+                let entry = cache.get_mut(path).expect("entry observed above");
+                entry.last_used_at = now;
+                let Some(entries) = &entry.entries else {
+                    trace!(path = %path, change = entry.change, "mount.directory_cache.metadata_hit");
+                    return None;
+                };
+                trace!(path = %path, change = entry.change, "mount.directory_cache.hit");
+                Some(Arc::new(DirectorySnapshot {
+                    entries: entries.clone(),
+                    change: entry.change,
+                    created_at: entry.created_at,
+                }))
+            }
+            None => {
+                trace!(path = %path, "mount.directory_cache.miss");
+                None
+            }
+        }
+    }
+
+    /// Return a child's known change without loading or extending its idle
+    /// lifetime. READDIRPLUS must never recursively evaluate child listings.
+    fn cached_change(&self, path: &VfsPath) -> Option<u64> {
+        let now = Instant::now();
+        let mut cache = self.inner.lock();
+        let expired = cache
+            .peek(path)
+            .map(|entry| Self::entry_expired(entry, now));
+        if expired == Some(true) {
+            cache.pop(path);
+            return None;
+        }
+        cache.peek(path).map(|entry| entry.change)
+    }
+
+    /// Allocate or reuse the change token which NFS uses as its cookie
+    /// verifier. This metadata-only operation deliberately does not call
+    /// `Vfs::list`; the first READDIR fills entries under the same token.
+    fn metadata(&self, path: &VfsPath) -> (u64, Instant) {
+        let now = Instant::now();
+        let mut cache = self.inner.lock();
+        let expired = cache
+            .peek(path)
+            .map(|entry| Self::entry_expired(entry, now));
+        if expired == Some(true) {
+            cache.pop(path);
+        }
+        if let Some(entry) = cache.get_mut(path) {
+            entry.last_used_at = now;
+            return (entry.change, entry.created_at);
+        }
+        let change = file_change_now();
+        cache.put(
+            path.clone(),
+            MountDirectoryEntry {
+                entries: None,
+                change,
+                created_at: now,
+                last_used_at: now,
+            },
+        );
+        trace!(path = %path, change, "mount.directory_cache.metadata_inserted");
+        (change, now)
+    }
+
+    fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
+    fn put_if_generation(&self, path: VfsPath, snapshot: Arc<DirectorySnapshot>, generation: u64) {
+        let mut cache = self.inner.lock();
+        if self.generation() != generation {
+            trace!(path = %path, "mount.directory_cache.insert_skipped_after_invalidation");
+            return;
+        }
+        let entries = snapshot.entries.len();
+        let change = snapshot.change;
+        cache.put(
+            path.clone(),
+            MountDirectoryEntry {
+                entries: Some(snapshot.entries.clone()),
+                change: snapshot.change,
+                created_at: snapshot.created_at,
+                last_used_at: Instant::now(),
+            },
+        );
+        trace!(path = %path, entries, change, "mount.directory_cache.inserted");
+    }
+
+    fn invalidate(&self, path: &VfsPath) {
+        self.generation.fetch_add(1, Ordering::AcqRel);
+        if self.inner.lock().pop(path).is_some() {
+            trace!(path = %path, "mount.directory_cache.invalidated");
+        }
+    }
+}
+
+type DirectoryFuture = Shared<BoxFuture<'static, Result<Arc<DirectorySnapshot>, FsError>>>;
+
+struct InFlightDirectory {
+    generation: u64,
+    future: DirectoryFuture,
+}
 
 /// Adapter that holds a clone of the [`Vfs`] facade and serves it as
 /// an [`embednfs::FileSystem`].
@@ -545,6 +709,10 @@ pub struct BloomFs {
     /// entry is removed once the future resolves — subsequent
     /// requests after the cache TTL re-render normally.
     in_flight: Arc<Mutex<HashMap<VfsPath, RenderFuture>>>,
+    /// Stable snapshots shared by directory GETATTR and paginated READDIR.
+    directory_cache: Arc<MountDirectoryCache>,
+    /// Cold list operations coalesce independently from file renders.
+    directory_in_flight: Arc<Mutex<HashMap<VfsPath, InFlightDirectory>>>,
 }
 
 impl BloomFs {
@@ -554,6 +722,8 @@ impl BloomFs {
             write_buffers: Arc::new(Mutex::new(HashMap::new())),
             render_cache: Arc::new(MountRenderCache::new(RENDER_CACHE_CAPACITY)),
             in_flight: Arc::new(Mutex::new(HashMap::new())),
+            directory_cache: Arc::new(MountDirectoryCache::new(DIRECTORY_CACHE_CAPACITY)),
+            directory_in_flight: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -565,46 +735,94 @@ impl BloomFs {
         }
     }
 
-    /// Compute a content-derived change id for `dir_path`. The default
-    /// `Attrs::new` change is a function of fileid (path), so it stays
-    /// constant for a given directory across its lifetime — and Linux's
-    /// NFS client uses the change attribute to validate its dir cache:
-    /// "change unchanged ⇒ my cached listing is still good." That makes
-    /// state mutated outside the NFS write path (e.g. the daemon
-    /// dropping a new entry into `outbox/pending/`) invisible to clients
-    /// that already saw the directory empty. Hashing the current listing
-    /// makes change move whenever entries are added, removed, or
-    /// renamed, which forces the kernel to re-issue READDIR. The cost is
-    /// one extra `vfs.list` per `getattr` on a directory; bloom's
-    /// directories are small so this is fine.
-    async fn dir_change(&self, dir_path: &VfsPath) -> u64 {
-        let entries = match self.vfs.list(dir_path).await {
-            Ok(es) => es,
-            Err(e) => {
-                debug!(path = %dir_path.to_string_path(), error = %e, "mount.adapter.dir_change.list_failed_using_empty");
-                Vec::new()
+    async fn directory_snapshot(&self, dir_path: &VfsPath) -> FsResult<Arc<DirectorySnapshot>> {
+        if let Some(snapshot) = self.directory_cache.get(dir_path) {
+            return Ok(snapshot);
+        }
+
+        let future = {
+            let mut in_flight = self.directory_in_flight.lock();
+            if let Some(existing) = in_flight.get(dir_path) {
+                trace!(path = %dir_path, "mount.directory_list.coalesced");
+                existing.future.clone()
+            } else if let Some(snapshot) = self.directory_cache.get(dir_path) {
+                // A load may have completed between the first cache probe and
+                // acquiring the in-flight lock.
+                return Ok(snapshot);
+            } else {
+                let generation = self.directory_cache.generation();
+                let (change, created_at) = self.directory_cache.metadata(dir_path);
+                let vfs = self.vfs.clone();
+                let path = dir_path.clone();
+                let cleanup_path = path.clone();
+                let cache = self.directory_cache.clone();
+                let in_flight_map = self.directory_in_flight.clone();
+                let future = async move {
+                    let result =
+                        tokio::time::timeout(DIRECTORY_LIST_TIMEOUT, vfs.list(&path)).await;
+                    let result = match result {
+                        Ok(Ok(entries)) => {
+                            let snapshot = Arc::new(DirectorySnapshot {
+                                change,
+                                entries: Arc::from(entries),
+                                created_at,
+                            });
+                            cache.put_if_generation(path.clone(), snapshot.clone(), generation);
+                            Ok(snapshot)
+                        }
+                        Ok(Err(error)) => Err(map_err(error)),
+                        Err(_) => {
+                            warn!(path = %path, "mount.directory_list.timed_out");
+                            Err(FsError::Io)
+                        }
+                    };
+                    let mut in_flight = in_flight_map.lock();
+                    if in_flight
+                        .get(&cleanup_path)
+                        .is_some_and(|entry| entry.generation == generation)
+                    {
+                        in_flight.remove(&cleanup_path);
+                    }
+                    result
+                }
+                .boxed()
+                .shared();
+                in_flight.insert(
+                    dir_path.clone(),
+                    InFlightDirectory {
+                        generation,
+                        future: future.clone(),
+                    },
+                );
+                future
             }
         };
-        let mut h: u64 = 0xcbf29ce484222325;
-        // Mix a salt derived from the path so two empty directories at
-        // different paths don't collide on `change=fnv_empty`.
-        for &b in dir_path.to_string_path().as_bytes() {
-            h ^= b as u64;
-            h = h.wrapping_mul(0x100000001b3);
+        future.await
+    }
+
+    async fn dir_change(&self, dir_path: &VfsPath) -> FsResult<u64> {
+        Ok(self.directory_cache.metadata(dir_path).0)
+    }
+
+    fn parent_path(path: &VfsPath) -> Option<VfsPath> {
+        if path.is_root() {
+            return None;
         }
-        h ^= 0xff;
-        h = h.wrapping_mul(0x100000001b3);
-        for e in &entries {
-            for &b in e.name.as_bytes() {
-                h ^= b as u64;
-                h = h.wrapping_mul(0x100000001b3);
-            }
-            h ^= 0x00;
-            h = h.wrapping_mul(0x100000001b3);
+        let mut parent = VfsPath::root();
+        for segment in &path.segments()[..path.segments().len() - 1] {
+            parent = parent.join(segment);
         }
-        // 0 is a poor change id (some clients treat it specially); also
-        // keep us above the Attrs::new default of fileid.max(1).
-        h.max(2)
+        Some(parent)
+    }
+
+    fn invalidate_after_write(&self, path: &VfsPath) {
+        self.render_cache.invalidate(path);
+        self.directory_cache.invalidate(path);
+        self.directory_in_flight.lock().remove(path);
+        if let Some(parent) = Self::parent_path(path) {
+            self.directory_cache.invalidate(&parent);
+            self.directory_in_flight.lock().remove(&parent);
+        }
     }
 
     /// Take a buffer's contents out, leaving the slot empty. Returns
@@ -633,7 +851,7 @@ impl BloomFs {
             trace!(path = %path.to_string_path(), bytes = bytes.len(), "mount.adapter.flush");
             self.vfs.write(path, &bytes).await.map_err(map_err)?;
             // The rendered view is now stale; drop it so the next read re-renders.
-            self.render_cache.invalidate(path);
+            self.invalidate_after_write(path);
         } else {
             trace!(path = %path.to_string_path(), "mount.adapter.flush.nothing_to_flush");
         }
@@ -703,11 +921,8 @@ impl BloomFs {
                     let result = tokio::time::timeout(RENDER_TIMEOUT, vfs.read(&path_owned)).await;
                     let bytes = match result {
                         Ok(Ok(b)) => Ok(Bytes::from(b)),
-                        Ok(Err(e)) => Err(format!("vfs.read: {e}")),
-                        Err(_) => Err(format!(
-                            "render timed out after {}s",
-                            RENDER_TIMEOUT.as_secs()
-                        )),
+                        Ok(Err(e)) => Err(map_err(e)),
+                        Err(_) => Err(FsError::Io),
                     };
                     // Remove ourselves from the in-flight map so the
                     // next request after this resolves can start a
@@ -725,9 +940,9 @@ impl BloomFs {
         };
         match fut.await {
             Ok(b) => Ok(b),
-            Err(s) => {
-                debug!(path = %path.to_string_path(), error = %s, "mount.adapter.render_failed");
-                Err(FsError::Io)
+            Err(error) => {
+                debug!(path = %path.to_string_path(), ?error, "mount.adapter.render_failed");
+                Err(error)
             }
         }
     }
@@ -750,18 +965,10 @@ impl FileSystem for BloomFs {
             BloomHandle::Root => {
                 let mut a = stable_attrs(ObjectType::Directory, fileid_for(&VfsPath::root()));
                 a.mode = 0o755;
-                a.change = self.dir_change(&VfsPath::root()).await;
+                a.change = self.dir_change(&VfsPath::root()).await?;
                 Ok(a)
             }
-            BloomHandle::Path { kind, path } => {
-                // Re-fetch the entry so size/mode reflect current
-                // state. `lookup` returns the entry under the same
-                // path semantics handlers use.
-                let e = self.vfs.lookup(path).await.map_err(map_err)?;
-                // If the kind has somehow drifted, prefer the live
-                // value over the cached one.
-                let _ = kind;
-
+            BloomHandle::Path { entry: e, path } => {
                 // For renderable read-only files, materialise the body
                 // so we can return an accurate `st_size`. The bytes
                 // are stashed in the mount-side cache so the imminent
@@ -770,31 +977,34 @@ impl FileSystem for BloomFs {
                 // with `size = 0` and never trigger a render here —
                 // critical to avoid a `stat` triggering a sign or
                 // broadcast.
-                let size = if self.should_render_for_attrs(path, &e) {
+                let size = if self.should_render_for_attrs(path, e) {
                     match self.render_cache.get(path) {
                         Some(MountRenderResult::Bytes(bytes)) => bytes.len() as u64,
-                        Some(MountRenderResult::Error) => 0,
+                        Some(MountRenderResult::Error(FsError::IsDirectory)) => e.size,
+                        Some(MountRenderResult::Error(error)) => return Err(error),
                         None => match self.render_with_dedup(path).await {
                             Ok(bytes) => {
                                 let len = bytes.len() as u64;
                                 self.render_cache.put(path, bytes, RENDER_CACHE_TTL);
                                 len
                             }
-                            Err(_) => {
-                                // Render failed (timeout, backend error,
-                                // write-only sink that errors on read).
-                                // Falling through with `size = 0` keeps
-                                // metadata-only inspection (`stat`,
-                                // `ls -l`) working, but remember the
-                                // negative render so a follow-up READ can
-                                // surface EIO instead of looking like a
-                                // legitimate empty file.
-                                self.render_cache.put_error(path, RENDER_CACHE_TTL);
-                                warn!(
-                                    path = %path.to_string_path(),
-                                    "mount.adapter.getattr.render_failed_falling_back_to_size_0"
+                            Err(FsError::IsDirectory) => {
+                                // Lookup already proved this is a file. Bloom's
+                                // existing NotAFile -> IsDirectory mapping
+                                // therefore identifies a deliberate unreadable
+                                // command sink rather than a failed data read.
+                                self.render_cache.put_error(
+                                    path,
+                                    FsError::IsDirectory,
+                                    RENDER_CACHE_TTL,
                                 );
-                                0
+                                debug!(path = %path, "mount.adapter.getattr.unreadable_file_sink");
+                                e.size
+                            }
+                            Err(error) => {
+                                self.render_cache.put_error(path, error, RENDER_CACHE_TTL);
+                                warn!(path = %path, ?error, "mount.adapter.getattr.render_failed");
+                                return Err(error);
                             }
                         },
                     }
@@ -802,9 +1012,9 @@ impl FileSystem for BloomFs {
                     0
                 };
 
-                let mut attrs = entry_to_attrs(path, &e, size);
+                let mut attrs = entry_to_attrs(path, e, size);
                 if e.kind == EntryKind::Dir {
-                    attrs.change = self.dir_change(path).await;
+                    attrs.change = self.dir_change(path).await?;
                 }
                 Ok(attrs)
             }
@@ -828,16 +1038,7 @@ impl FileSystem for BloomFs {
         // write-time.
         let mode = match handle {
             BloomHandle::Root => 0o755,
-            BloomHandle::Path { path, .. } => match self.vfs.lookup(path).await {
-                Ok(e) => e.mode,
-                // If the entry has gone missing between lookup and
-                // access, fall through with a permissive mode and let
-                // the next op surface the real error.
-                Err(e) => {
-                    debug!(path = %path.to_string_path(), error = %e, "mount.adapter.access.lookup_failed_using_0644");
-                    0o644
-                }
-            },
+            BloomHandle::Path { entry, .. } => entry.mode,
         };
         let mut granted = requested;
         // Owner-write bit absent => mask off MODIFY/EXTEND/DELETE.
@@ -871,7 +1072,7 @@ impl FileSystem for BloomFs {
         let child = parent_path.join(&decoded);
         let e = self.vfs.lookup(&child).await.map_err(map_err)?;
         Ok(BloomHandle::Path {
-            kind: HandleKind::from(e.kind),
+            entry: e,
             path: child,
         })
     }
@@ -890,8 +1091,12 @@ impl FileSystem for BloomFs {
                 } else {
                     let parent_str = format!("/{}", segs[..segs.len() - 1].join("/"));
                     let parent = VfsPath::parse(&parent_str).map_err(|_| FsError::InvalidInput)?;
+                    let name = parent
+                        .segments()
+                        .last()
+                        .expect("non-root parent has a final segment");
                     Ok(Some(BloomHandle::Path {
-                        kind: HandleKind::Dir,
+                        entry: Entry::dir(name),
                         path: parent,
                     }))
                 }
@@ -908,7 +1113,8 @@ impl FileSystem for BloomFs {
         with_attrs: bool,
     ) -> FsResult<DirPage<BloomHandle>> {
         let dir_path = Self::path_of(dir);
-        let entries = self.vfs.list(&dir_path).await.map_err(map_err)?;
+        let snapshot = self.directory_snapshot(&dir_path).await?;
+        let entries = &snapshot.entries;
 
         // Pagination: cookie 0 means "from the start". We hand out
         // dense cookies starting at 3 because 0/1/2 are reserved by
@@ -925,10 +1131,10 @@ impl FileSystem for BloomFs {
         };
         let total = entries.len();
         let mut out = Vec::new();
-        for (idx, e) in entries.into_iter().skip(start).take(limit).enumerate() {
+        for (idx, e) in entries.iter().skip(start).take(limit).enumerate() {
             let child_path = dir_path.join(&e.name);
             let handle = BloomHandle::Path {
-                kind: HandleKind::from(e.kind),
+                entry: e.clone(),
                 path: child_path.clone(),
             };
             let attrs = if with_attrs {
@@ -948,28 +1154,26 @@ impl FileSystem for BloomFs {
                 let size = if e.kind == EntryKind::File {
                     match self.render_cache.get(&child_path) {
                         Some(MountRenderResult::Bytes(b)) => b.len() as u64,
-                        Some(MountRenderResult::Error) | None => e.size,
+                        Some(MountRenderResult::Error(_)) | None => e.size,
                     }
                 } else {
                     e.size
                 };
-                let mut a = entry_to_attrs(&child_path, &e, size);
+                let mut a = entry_to_attrs(&child_path, e, size);
                 if e.kind == EntryKind::Dir {
-                    // See `dir_change`: for child directories returned
-                    // inline with READDIR's attr_request, the kernel
-                    // uses `change` to validate any cached listing of
-                    // that subdirectory. Without this, a `find` walk
-                    // populates the cache with stale `change=fileid`
-                    // and never refreshes when the daemon mutates the
-                    // subdirectory out-of-band.
-                    a.change = self.dir_change(&child_path).await;
+                    // Never run a child list merely to build parent
+                    // READDIRPLUS attrs. Reuse a known change when available;
+                    // the child's own GETATTR loads it when traversed.
+                    if let Some(change) = self.directory_cache.cached_change(&child_path) {
+                        a.change = change;
+                    }
                 }
                 Some(a)
             } else {
                 None
             };
             out.push(DirEntry {
-                name: e.name,
+                name: e.name.clone(),
                 handle,
                 cookie: (start + idx + 3) as u64,
                 attrs,
@@ -1005,7 +1209,7 @@ impl FileSystem for BloomFs {
         let data: Bytes = if let Some(cached) = self.render_cache.get(&path) {
             match cached {
                 MountRenderResult::Bytes(b) => b,
-                MountRenderResult::Error => return Err(FsError::Io),
+                MountRenderResult::Error(error) => return Err(error),
             }
         } else {
             // Cache miss — go straight to the VFS. This covers reads
@@ -1130,7 +1334,7 @@ impl FileSystem for BloomFs {
             match self.vfs.write(&path, &payload).await {
                 Ok(()) => {
                     // Persisted new bytes — invalidate any stale rendered view.
-                    self.render_cache.invalidate(&path);
+                    self.invalidate_after_write(&path);
                 }
                 Err(error) if mount_write_path_is_atomic_command(&path) => {
                     // macOS can panic in nfs_vinvalbuf2 when a userspace server
@@ -1145,7 +1349,7 @@ impl FileSystem for BloomFs {
                         error = %error,
                         "mount.adapter.atomic_command_outcome_deferred"
                     );
-                    self.render_cache.invalidate(&path);
+                    self.invalidate_after_write(&path);
                 }
                 Err(error) => return Err(map_err(error)),
             }
@@ -1188,7 +1392,7 @@ impl FileSystem for BloomFs {
             return Err(FsError::PermissionDenied);
         }
         self.vfs.write(&child, &[]).await.map_err(map_err)?;
-        self.render_cache.invalidate(&child);
+        self.invalidate_after_write(&child);
         let e = self.vfs.lookup(&child).await.map_err(map_err)?;
         // CREATE returns initial attrs; the file has just been written
         // empty (or with a zero-byte body). Report `e.size` so a
@@ -1196,7 +1400,7 @@ impl FileSystem for BloomFs {
         // client; otherwise 0 is honest.
         let attrs = entry_to_attrs(&child, &e, e.size);
         let handle = BloomHandle::Path {
-            kind: HandleKind::from(e.kind),
+            entry: e,
             path: child,
         };
         Ok(CreateResult { handle, attrs })
@@ -1262,8 +1466,8 @@ impl OpenSupport<BloomHandle> for BloomFs {
         }
         let path = match handle {
             BloomHandle::Root => return Err(FsError::IsDirectory),
-            BloomHandle::Path { kind, path } => {
-                if *kind != HandleKind::File {
+            BloomHandle::Path { entry, path } => {
+                if entry.kind != EntryKind::File {
                     return Err(FsError::IsDirectory);
                 }
                 path.clone()
@@ -1528,7 +1732,7 @@ mod tests {
         let fs = BloomFs::new(Vfs::builder().build());
         let ctx = fake_ctx();
         let handle = BloomHandle::Path {
-            kind: HandleKind::File,
+            entry: Entry::file("order.json"),
             path: VfsPath::parse("/hyperliquid/mainnet/exchange/minnow/order.json").unwrap(),
         };
 
@@ -1580,7 +1784,7 @@ mod tests {
         let fs = BloomFs::new(Vfs::builder().build());
         let ctx = fake_ctx();
         let parent = BloomHandle::Path {
-            kind: HandleKind::Dir,
+            entry: Entry::dir("minnow"),
             path: VfsPath::parse("/hyperliquid/mainnet/exchange/minnow").unwrap(),
         };
 
@@ -1663,7 +1867,7 @@ mod tests {
         let fs = BloomFs::new(vfs);
         let ctx = fake_ctx();
         let handle = BloomHandle::Path {
-            kind: HandleKind::File,
+            entry: Entry::file("order.json"),
             path: VfsPath::parse("/hyperliquid/mainnet/agent_sessions/minnow/session-1/order.json")
                 .unwrap(),
         };
@@ -1686,7 +1890,7 @@ mod tests {
         let fs = BloomFs::new(vfs);
         let ctx = fake_ctx();
         let handle = BloomHandle::Path {
-            kind: HandleKind::File,
+            entry: Entry::file("new.json"),
             path: VfsPath::parse("/hyperliquid/mainnet/agent_sessions/minnow/new.json").unwrap(),
         };
         let body = Bytes::from_static(br#"{"id":"session-1"}"#);
@@ -2240,6 +2444,321 @@ mod tests {
         }
     }
 
+    struct CountingDirectoryHandler {
+        root_lists: parking_lot::Mutex<u32>,
+        child_lists: parking_lot::Mutex<u32>,
+        child_lookups: parking_lot::Mutex<u32>,
+        child_directories: bool,
+    }
+
+    impl CountingDirectoryHandler {
+        fn new(child_directories: bool) -> Arc<Self> {
+            Arc::new(Self {
+                root_lists: parking_lot::Mutex::new(0),
+                child_lists: parking_lot::Mutex::new(0),
+                child_lookups: parking_lot::Mutex::new(0),
+                child_directories,
+            })
+        }
+
+        fn root_list_count(&self) -> u32 {
+            *self.root_lists.lock()
+        }
+
+        fn child_list_count(&self) -> u32 {
+            *self.child_lists.lock()
+        }
+
+        fn child_lookup_count(&self) -> u32 {
+            *self.child_lookups.lock()
+        }
+
+        fn entries(&self) -> Vec<Entry> {
+            (0..7)
+                .map(|index| {
+                    let name = format!("entry-{index}");
+                    if self.child_directories {
+                        Entry::dir(&name)
+                    } else {
+                        Entry::file(&name)
+                    }
+                })
+                .collect()
+        }
+    }
+
+    #[async_trait]
+    impl Handler for CountingDirectoryHandler {
+        async fn lookup(&self, p: &VfsPath) -> Result<Entry, HandlerError> {
+            match p.segments() {
+                [] => Ok(Entry::dir("")),
+                [name] if name.starts_with("entry-") => {
+                    *self.child_lookups.lock() += 1;
+                    if self.child_directories {
+                        Ok(Entry::dir(name))
+                    } else {
+                        Ok(Entry::file(name))
+                    }
+                }
+                _ => Err(HandlerError::NotFound(p.to_string_path())),
+            }
+        }
+
+        async fn read(&self, _p: &VfsPath) -> Result<Vec<u8>, HandlerError> {
+            Ok(Vec::new())
+        }
+
+        async fn list(&self, p: &VfsPath) -> Result<Vec<Entry>, HandlerError> {
+            if p.is_root() {
+                *self.root_lists.lock() += 1;
+                Ok(self.entries())
+            } else if self.child_directories {
+                *self.child_lists.lock() += 1;
+                Ok(Vec::new())
+            } else {
+                Err(HandlerError::NotADir(p.to_string_path()))
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn paginated_readdir_reuses_getattr_directory_snapshot() {
+        let handler = CountingDirectoryHandler::new(false);
+        let vfs = Vfs::builder().mount("box", handler.clone()).build();
+        let fs = BloomFs::new(vfs);
+        let ctx = fake_ctx();
+        let directory = fs.lookup(&ctx, &BloomHandle::Root, "box").await.unwrap();
+        let expected_change = fs.getattr(&ctx, &directory).await.unwrap().change;
+
+        let mut cookie = 0;
+        let mut names = Vec::new();
+        loop {
+            assert_eq!(
+                fs.getattr(&ctx, &directory).await.unwrap().change,
+                expected_change
+            );
+            let page = fs
+                .readdir(&ctx, &directory, cookie, 2, false)
+                .await
+                .unwrap();
+            if let Some(last) = page.entries.last() {
+                cookie = last.cookie;
+            }
+            names.extend(page.entries.into_iter().map(|entry| entry.name));
+            if page.eof {
+                break;
+            }
+        }
+
+        assert_eq!(
+            names,
+            (0..7)
+                .map(|index| format!("entry-{index}"))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(handler.root_list_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn handle_metadata_calls_do_not_repeat_vfs_lookup() {
+        let handler = CountingDirectoryHandler::new(true);
+        let vfs = Vfs::builder().mount("box", handler.clone()).build();
+        let fs = BloomFs::new(vfs);
+        let ctx = fake_ctx();
+        let directory = fs.lookup(&ctx, &BloomHandle::Root, "box").await.unwrap();
+        let child = fs.lookup(&ctx, &directory, "entry-0").await.unwrap();
+
+        for _ in 0..4 {
+            fs.getattr(&ctx, &child).await.unwrap();
+            fs.access(&ctx, &child, AccessMask::READ).await.unwrap();
+        }
+
+        assert_eq!(handler.child_lookup_count(), 1);
+        assert_eq!(handler.child_list_count(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_directory_readdirs_coalesce_to_one_list() {
+        let handler = CountingDirectoryHandler::new(false);
+        let vfs = Vfs::builder().mount("box", handler.clone()).build();
+        let fs = Arc::new(BloomFs::new(vfs));
+        let directory = fs
+            .lookup(&fake_ctx(), &BloomHandle::Root, "box")
+            .await
+            .unwrap();
+
+        let mut tasks = Vec::new();
+        for _ in 0..16 {
+            let fs = fs.clone();
+            let directory = directory.clone();
+            tasks.push(tokio::spawn(async move {
+                fs.readdir(&fake_ctx(), &directory, 0, u32::MAX, false)
+                    .await
+            }));
+        }
+        for task in tasks {
+            task.await.unwrap().unwrap();
+        }
+        assert_eq!(handler.root_list_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn readdirplus_does_not_list_child_directories() {
+        let handler = CountingDirectoryHandler::new(true);
+        let vfs = Vfs::builder().mount("box", handler.clone()).build();
+        let fs = BloomFs::new(vfs);
+        let ctx = fake_ctx();
+        let directory = fs.lookup(&ctx, &BloomHandle::Root, "box").await.unwrap();
+
+        fs.getattr(&ctx, &directory).await.unwrap();
+        let page = fs
+            .readdir(&ctx, &directory, 0, u32::MAX, true)
+            .await
+            .unwrap();
+
+        // Model macOS issuing an explicit GETATTR for every returned child.
+        for entry in &page.entries {
+            fs.getattr(&ctx, &entry.handle).await.unwrap();
+            fs.access(&ctx, &entry.handle, AccessMask::READ)
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(page.entries.len(), 7);
+        assert_eq!(handler.root_list_count(), 1);
+        assert_eq!(handler.child_list_count(), 0);
+        assert_eq!(handler.child_lookup_count(), 0);
+    }
+
+    struct FailingDirectoryHandler;
+
+    #[async_trait]
+    impl Handler for FailingDirectoryHandler {
+        async fn lookup(&self, p: &VfsPath) -> Result<Entry, HandlerError> {
+            if p.is_root() {
+                Ok(Entry::dir(""))
+            } else {
+                Err(HandlerError::NotFound(p.to_string_path()))
+            }
+        }
+
+        async fn list(&self, _p: &VfsPath) -> Result<Vec<Entry>, HandlerError> {
+            Err(HandlerError::Backend("directory backend offline".into()))
+        }
+    }
+
+    #[tokio::test]
+    async fn directory_readdir_propagates_list_error_instead_of_returning_empty() {
+        let vfs = Vfs::builder()
+            .mount("box", Arc::new(FailingDirectoryHandler))
+            .build();
+        let fs = BloomFs::new(vfs);
+        let ctx = fake_ctx();
+        let directory = fs.lookup(&ctx, &BloomHandle::Root, "box").await.unwrap();
+        // Metadata is cheap and does not evaluate the directory. The actual
+        // enumeration is the operation which must surface the backend error.
+        fs.getattr(&ctx, &directory).await.unwrap();
+        let error = fs
+            .readdir(&ctx, &directory, 0, u32::MAX, false)
+            .await
+            .unwrap_err();
+        assert_eq!(error, FsError::Io);
+    }
+
+    #[derive(Default)]
+    struct ListingWriteHandler {
+        entries: parking_lot::Mutex<Vec<String>>,
+        lists: parking_lot::Mutex<u32>,
+    }
+
+    impl ListingWriteHandler {
+        fn new() -> Arc<Self> {
+            Arc::new(Self::default())
+        }
+
+        fn list_count(&self) -> u32 {
+            *self.lists.lock()
+        }
+    }
+
+    #[async_trait]
+    impl Handler for ListingWriteHandler {
+        async fn lookup(&self, p: &VfsPath) -> Result<Entry, HandlerError> {
+            match p.segments() {
+                [] => Ok(Entry::dir("")),
+                [name] if name == "add" => Ok(Entry::writable_file("add")),
+                [name] if self.entries.lock().iter().any(|entry| entry == name) => {
+                    Ok(Entry::file(name))
+                }
+                _ => Err(HandlerError::NotFound(p.to_string_path())),
+            }
+        }
+
+        async fn read(&self, p: &VfsPath) -> Result<Vec<u8>, HandlerError> {
+            if matches!(p.segments(), [name] if name == "add") {
+                Ok(Vec::new())
+            } else {
+                Ok(b"created\n".to_vec())
+            }
+        }
+
+        async fn write(&self, p: &VfsPath, data: &[u8]) -> Result<(), HandlerError> {
+            if !matches!(p.segments(), [name] if name == "add") {
+                return Err(HandlerError::PermissionDenied);
+            }
+            let name = std::str::from_utf8(data)
+                .map_err(|error| HandlerError::Invalid(error.to_string()))?
+                .trim()
+                .to_string();
+            self.entries.lock().push(name);
+            Ok(())
+        }
+
+        async fn list(&self, p: &VfsPath) -> Result<Vec<Entry>, HandlerError> {
+            if !p.is_root() {
+                return Err(HandlerError::NotADir(p.to_string_path()));
+            }
+            *self.lists.lock() += 1;
+            let mut entries = vec![Entry::writable_file("add")];
+            entries.extend(self.entries.lock().iter().map(|name| Entry::file(name)));
+            Ok(entries)
+        }
+    }
+
+    #[tokio::test]
+    async fn successful_write_invalidates_parent_directory_snapshot() {
+        let handler = ListingWriteHandler::new();
+        let vfs = Vfs::builder().mount("box", handler.clone()).build();
+        let fs = BloomFs::new(vfs);
+        let ctx = fake_ctx();
+        let directory = fs.lookup(&ctx, &BloomHandle::Root, "box").await.unwrap();
+        let add = fs.lookup(&ctx, &directory, "add").await.unwrap();
+
+        let before = fs
+            .readdir(&ctx, &directory, 0, u32::MAX, false)
+            .await
+            .unwrap();
+        assert_eq!(handler.list_count(), 1);
+        assert_eq!(before.entries.len(), 1);
+
+        fs.write(
+            &ctx,
+            &add,
+            0,
+            Bytes::from_static(b"created"),
+            WriteStability::FileSync,
+        )
+        .await
+        .unwrap();
+
+        let after = fs
+            .readdir(&ctx, &directory, 0, u32::MAX, false)
+            .await
+            .unwrap();
+        assert_eq!(handler.list_count(), 2);
+        assert!(after.entries.iter().any(|entry| entry.name == "created"));
+    }
+
     /// Regression for the Enso/Aave integration test bug: when the
     /// daemon writes a new pending stage out-of-band (i.e. not via the
     /// NFS write path), `getattr` on the parent directory must report a
@@ -2247,7 +2766,7 @@ mod tests {
     /// the next READDIR sees the new entry. Before this fix `change`
     /// was a function of fileid (path), so it never moved and clients
     /// who saw the directory empty kept seeing it empty forever.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn dir_change_moves_when_listing_grows() {
         let h = MutableDirHandler::new();
         let vfs = Vfs::builder().mount("box", h.clone()).build();
@@ -2257,6 +2776,7 @@ mod tests {
         let pending = fs.lookup(&ctx, &box_dir, "pending").await.unwrap();
         let before = fs.getattr(&ctx, &pending).await.unwrap().change;
         h.push("0001-21699");
+        tokio::time::advance(DIRECTORY_CACHE_IDLE_TTL + Duration::from_millis(1)).await;
         let after = fs.getattr(&ctx, &pending).await.unwrap().change;
         assert_ne!(
             before, after,
@@ -2406,6 +2926,95 @@ mod tests {
         );
     }
 
+    #[derive(Clone, Copy)]
+    enum TestReadResult {
+        Backend,
+        NotFound,
+        Empty,
+    }
+
+    struct ClassifiedReadHandler {
+        result: TestReadResult,
+        reads: parking_lot::Mutex<u32>,
+    }
+
+    impl ClassifiedReadHandler {
+        fn new(result: TestReadResult) -> Arc<Self> {
+            Arc::new(Self {
+                result,
+                reads: parking_lot::Mutex::new(0),
+            })
+        }
+
+        fn read_count(&self) -> u32 {
+            *self.reads.lock()
+        }
+    }
+
+    #[async_trait]
+    impl Handler for ClassifiedReadHandler {
+        async fn lookup(&self, p: &VfsPath) -> Result<Entry, HandlerError> {
+            match p.segments() {
+                [] => Ok(Entry::dir("")),
+                [name] if name == "value" => Ok(Entry::file("value")),
+                _ => Err(HandlerError::NotFound(p.to_string_path())),
+            }
+        }
+
+        async fn read(&self, _p: &VfsPath) -> Result<Vec<u8>, HandlerError> {
+            *self.reads.lock() += 1;
+            match self.result {
+                TestReadResult::Backend => Err(HandlerError::Backend("offline".into())),
+                TestReadResult::NotFound => Err(HandlerError::NotFound("missing".into())),
+                TestReadResult::Empty => Ok(Vec::new()),
+            }
+        }
+
+        async fn list(&self, p: &VfsPath) -> Result<Vec<Entry>, HandlerError> {
+            if p.is_root() {
+                Ok(vec![Entry::file("value")])
+            } else {
+                Err(HandlerError::NotADir(p.to_string_path()))
+            }
+        }
+    }
+
+    async fn classified_read_handle(handler: Arc<ClassifiedReadHandler>) -> (BloomFs, BloomHandle) {
+        let vfs = Vfs::builder().mount("box", handler).build();
+        let fs = BloomFs::new(vfs);
+        let ctx = fake_ctx();
+        let dir = fs.lookup(&ctx, &BloomHandle::Root, "box").await.unwrap();
+        let value = fs.lookup(&ctx, &dir, "value").await.unwrap();
+        (fs, value)
+    }
+
+    #[tokio::test]
+    async fn getattr_backend_render_error_returns_io_without_followup_read() {
+        let handler = ClassifiedReadHandler::new(TestReadResult::Backend);
+        let (fs, value) = classified_read_handle(handler.clone()).await;
+        let error = fs.getattr(&fake_ctx(), &value).await.unwrap_err();
+        assert_eq!(error, FsError::Io);
+        assert_eq!(handler.read_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn getattr_not_found_render_error_preserves_not_found() {
+        let handler = ClassifiedReadHandler::new(TestReadResult::NotFound);
+        let (fs, value) = classified_read_handle(handler.clone()).await;
+        let error = fs.getattr(&fake_ctx(), &value).await.unwrap_err();
+        assert_eq!(error, FsError::NotFound);
+        assert_eq!(handler.read_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn getattr_successful_empty_render_is_a_real_empty_file() {
+        let handler = ClassifiedReadHandler::new(TestReadResult::Empty);
+        let (fs, value) = classified_read_handle(handler.clone()).await;
+        let attrs = fs.getattr(&fake_ctx(), &value).await.unwrap();
+        assert_eq!(attrs.size, 0);
+        assert_eq!(handler.read_count(), 1);
+    }
+
     /// Handler exposing a writable file whose `read` errors out — the
     /// "write-only sink" pattern (outbox controls, watch/new). GETATTR
     /// must succeed with `size = 0`, *not* surface the read error.
@@ -2449,7 +3058,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn getattr_render_failure_makes_followup_read_fail() {
+    async fn write_only_sink_followup_read_preserves_not_a_file_mapping() {
         let vfs = Vfs::builder()
             .mount("box", Arc::new(WriteOnlySinkHandler))
             .build();
@@ -2461,7 +3070,7 @@ mod tests {
         let attrs = fs.getattr(&ctx, &confirm).await.unwrap();
         assert_eq!(attrs.size, 0);
         let err = fs.read(&ctx, &confirm, 0, 1024).await.unwrap_err();
-        assert_eq!(err, FsError::Io);
+        assert_eq!(err, FsError::IsDirectory);
     }
 
     /// Handler that exposes a read-only file whose `read` actually
@@ -2656,13 +3265,11 @@ mod tests {
         }
     }
 
-    /// Bug #1 acceptance: a render that never resolves must not turn
-    /// GETATTR into an EIO. After the timeout fires, the adapter falls
-    /// through with `size = 0` so `stat`/`ls -l` keep working when a
-    /// backend wedges. Uses tokio's `pause`/`advance` to drive the
-    /// timer instantly so the test doesn't actually wait 30 seconds.
+    /// A render that never resolves fails GETATTR with EIO. Reporting a
+    /// successful zero-byte file would let clients skip READ and hide the
+    /// timeout entirely.
     #[tokio::test(start_paused = true)]
-    async fn render_timeout_falls_back_to_size_0() {
+    async fn render_timeout_fails_getattr_with_eio() {
         let vfs = Vfs::builder()
             .mount("box", Arc::new(NeverResolvesHandler))
             .build();
@@ -2684,8 +3291,8 @@ mod tests {
         // Yield once so the spawned getattr enters the render future.
         tokio::task::yield_now().await;
         tokio::time::advance(RENDER_TIMEOUT + Duration::from_secs(1)).await;
-        let attrs = getattr.await.unwrap().unwrap();
-        assert_eq!(attrs.size, 0);
+        let error = getattr.await.unwrap().unwrap_err();
+        assert_eq!(error, FsError::Io);
     }
 
     /// Bug #2 acceptance: kernel-supplied path components arrive as

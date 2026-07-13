@@ -2777,6 +2777,16 @@ pub struct SignHashRequest {
     pub hash_hex: String,
 }
 
+/// One entry in a daemon-sealed ordered signing batch. The optional facts
+/// digest binds the hash-specific attestation used for this exact entry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SealedSignBatchEntry {
+    pub wallet: String,
+    pub intent: String,
+    pub hash_hex: String,
+    pub attestation_facts_digest: String,
+}
+
 /// Sealed signature returned by [`PetalHost::sign_hash`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SealedSignature {
@@ -2829,6 +2839,23 @@ pub trait PetalHost: Send + Sync {
         attestation: &SigningAttestation,
         now_ms: u64,
     ) -> Result<SealedSignature, AuthApiError>;
+
+    /// Sign a daemon-sealed ordered batch. The default is deliberately
+    /// fail-closed; hosts opting in must validate every entry before exposing
+    /// any signature to the caller. Signature production is not transactional:
+    /// an unexpected signer or audit failure may consume a prefix internally,
+    /// but that prefix is never returned and the caller must obtain a fresh
+    /// approval rather than append or resume the sealed request set.
+    async fn sign_hash_batch(
+        &self,
+        _requests: Vec<SignHashRequest>,
+        _attestations: &[SigningAttestation],
+        _now_ms: u64,
+    ) -> Result<Vec<SealedSignature>, AuthApiError> {
+        Err(AuthApiError::Denied(
+            "batch signing is not supported by this host".into(),
+        ))
+    }
 
     /// Append a structured audit event to the host audit log.
     async fn audit(&self, event: AuditEvent) -> Result<(), AuthApiError>;

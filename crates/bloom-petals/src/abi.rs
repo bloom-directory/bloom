@@ -32,6 +32,11 @@ pub struct SignRequest {
     pub context: Option<V2SignContext>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignBatchRequest {
+    pub requests: Vec<SignRequest>,
+}
+
 /// Result of a structured v2 component signing request.
 ///
 /// Unlike the legacy `sign_hash` error-only protocol, this makes a pending
@@ -47,6 +52,12 @@ pub struct ApprovalRequired {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SignOutcome {
     Signature(Vec<u8>),
+    ApprovalRequired(ApprovalRequired),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SignBatchOutcome {
+    Signatures(Vec<Vec<u8>>),
     ApprovalRequired(ApprovalRequired),
 }
 

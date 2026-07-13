@@ -18,6 +18,7 @@ tracing.workspace = true
 parking_lot.workspace = true
 alloy.workspace = true
 dirs.workspace = true
+url.workspace = true
 fs2.workspace = true
 
 [dev-dependencies]

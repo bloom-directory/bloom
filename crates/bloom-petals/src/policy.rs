@@ -1,6 +1,6 @@
 //! Runtime network policy for v2 local app petals.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::Deserialize;
 
@@ -28,18 +28,56 @@ impl NetPolicy {
             .map(|net| {
                 net.allow
                     .into_iter()
-                    .map(|rule| NetRule {
-                        host: rule.host.to_ascii_lowercase(),
-                        methods: rule
-                            .methods
-                            .into_iter()
-                            .map(|method| method.to_ascii_uppercase())
-                            .collect(),
-                        paths: rule.paths.unwrap_or_default(),
+                    .map(|rule| {
+                        if let Some(binding) = rule.binding.as_deref() {
+                            validate_binding_name(binding)?;
+                        }
+                        Ok(NetRule {
+                            binding: rule.binding,
+                            host: rule.host.to_ascii_lowercase(),
+                            methods: rule
+                                .methods
+                                .into_iter()
+                                .map(|method| method.to_ascii_uppercase())
+                                .collect(),
+                            paths: rule.paths.unwrap_or_default(),
+                        })
                     })
-                    .collect()
+                    .collect::<Result<Vec<_>, PetalError>>()
             })
+            .transpose()?
             .unwrap_or_default();
+        Ok(Self { rules })
+    }
+
+    /// Resolve daemon-owned named endpoint bindings without widening the
+    /// signed method/path ceiling. Overrides are HTTPS origins only.
+    pub fn with_endpoint_bindings(
+        &self,
+        bindings: &BTreeMap<String, String>,
+    ) -> Result<Self, PetalError> {
+        for binding in bindings.keys() {
+            validate_binding_name(binding)?;
+            if !self
+                .rules
+                .iter()
+                .any(|rule| rule.binding.as_deref() == Some(binding.as_str()))
+            {
+                return Err(PetalError::InvalidWasm(format!(
+                    "endpoint override {binding:?} is not declared by the petal manifest"
+                )));
+            }
+        }
+        let mut rules = self.rules.clone();
+        for rule in &mut rules {
+            let Some(binding) = rule.binding.as_ref() else {
+                continue;
+            };
+            let Some(origin) = bindings.get(binding) else {
+                continue;
+            };
+            rule.host = endpoint_origin_host(origin)?;
+        }
         Ok(Self { rules })
     }
 
@@ -64,6 +102,7 @@ impl NetPolicy {
                     continue;
                 }
                 rules.push(NetRule {
+                    binding: declared.binding.clone(),
                     host: declared.host.clone(),
                     methods,
                     paths,
@@ -183,6 +222,7 @@ impl StoreNamespacePolicy {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct NetRule {
+    binding: Option<String>,
     host: String,
     methods: BTreeSet<String>,
     /// Empty means any path.
@@ -202,10 +242,45 @@ struct V2NetPolicy {
 
 #[derive(Debug, Deserialize)]
 struct V2NetRule {
+    #[serde(default)]
+    binding: Option<String>,
     host: String,
     #[serde(default)]
     methods: Vec<String>,
     paths: Option<Vec<String>>,
+}
+
+fn endpoint_origin_host(origin: &str) -> Result<String, PetalError> {
+    let url = url::Url::parse(origin)
+        .map_err(|err| PetalError::InvalidWasm(format!("endpoint binding URL: {err}")))?;
+    if url.scheme() != "https"
+        || url.username() != ""
+        || url.password().is_some()
+        || url.port().is_some_and(|port| port != 443)
+        || url.path() != "/"
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(PetalError::InvalidWasm(
+            "endpoint binding must be an HTTPS origin using the default port".into(),
+        ));
+    }
+    url.host_str()
+        .map(str::to_ascii_lowercase)
+        .ok_or_else(|| PetalError::InvalidWasm("endpoint binding URL is missing a host".into()))
+}
+
+fn validate_binding_name(binding: &str) -> Result<(), PetalError> {
+    if binding.is_empty()
+        || !binding
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Err(PetalError::InvalidWasm(format!(
+            "endpoint binding {binding:?} must contain only ASCII letters, digits, '-' or '_'"
+        )));
+    }
+    Ok(())
 }
 
 impl NetRule {
@@ -347,6 +422,7 @@ paths = ["/markets*", "/auth/*", "/wallets/*/orders"]
         let declared = NetPolicy::from_v2_manifest_toml(manifest_toml()).expect("valid manifest");
         let mask = NetPolicy {
             rules: vec![NetRule {
+                binding: None,
                 host: "api.example.com".into(),
                 methods: BTreeSet::from(["GET".to_string()]),
                 paths: vec!["/markets*".into()],
@@ -366,6 +442,57 @@ paths = ["/markets*", "/auth/*", "/wallets/*/orders"]
         assert!(
             narrowed
                 .check("GET", "https://api.example.com/auth/key")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn named_endpoint_binding_replaces_only_the_exact_host() {
+        let declared = NetPolicy::from_v2_manifest_toml(
+            br#"
+[[net.allow]]
+binding = "clob"
+host = "clob.polymarket.com"
+methods = ["post"]
+paths = ["/order"]
+"#,
+        )
+        .unwrap();
+        let bound = declared
+            .with_endpoint_bindings(&BTreeMap::from([(
+                "clob".into(),
+                "https://clob.internal.example".into(),
+            )]))
+            .unwrap();
+        assert!(
+            bound
+                .check("POST", "https://clob.internal.example/order")
+                .is_ok()
+        );
+        assert!(
+            bound
+                .check("POST", "https://clob.polymarket.com/order")
+                .is_err()
+        );
+        assert!(
+            bound
+                .check("POST", "https://clob.internal.example/anything")
+                .is_err()
+        );
+        assert!(
+            declared
+                .with_endpoint_bindings(&BTreeMap::from([(
+                    "clob".into(),
+                    "https://clob.internal.example/prefix".into(),
+                )]))
+                .is_err()
+        );
+        assert!(
+            declared
+                .with_endpoint_bindings(&BTreeMap::from([(
+                    "undeclared".into(),
+                    "https://other.example".into(),
+                )]))
                 .is_err()
         );
     }

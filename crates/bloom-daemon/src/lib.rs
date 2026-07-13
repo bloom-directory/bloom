@@ -25,8 +25,8 @@ use bloom_auth_api::{
     AssuranceLevel, CANONICAL_INTENT_HEADER_SCHEMA_V2, CanonicalEnvelope, CanonicalIntentHeader,
     DaemonGrantTerms, ExecutorKind, LOCAL_APP_PETAL_ID_PREFIX,
     LOCAL_APP_SIGNING_ATTESTATION_FACTS_SCHEMA_V1, LocalAppSigningAttestationFacts,
-    PetalPolicySnapshot, PolicyCheckClass, PolicyCheckResult, SealedAction, SignHashRequest,
-    signing_attestation_facts_digest,
+    PetalPolicySnapshot, PolicyCheckClass, PolicyCheckResult, SealedAction, SealedSignBatchEntry,
+    SignHashRequest, signing_attestation_facts_digest,
 };
 use bloom_evm::{ChainClient, ChainRegistry};
 
@@ -42,7 +42,8 @@ use bloom_petals::abi::{
 };
 use bloom_petals::{
     HostError, HostVfsEntry, HttpRequest, HttpResponse, LateVfsHost, NameRegistry, NetPolicy,
-    PetalHost, PetalRouter, PetalRunner, PetalStore, PetalVm, SignOutcome, SignRequest,
+    PetalHost, PetalRouter, PetalRunner, PetalStore, PetalVm, SignBatchOutcome, SignBatchRequest,
+    SignOutcome, SignRequest,
 };
 use bloom_polymarket::{ClobClient, CredentialStore, DataClient, GammaClient};
 use bloom_prices::PricesClient;
@@ -81,6 +82,8 @@ const LOCAL_APP_ACTION_TTL_MS: u64 = 120_000;
 const LOCAL_APP_SIGNING_SUBJECT_KIND: &str = "local_app_sign_hash";
 const LOCAL_APP_SIGNING_SUBJECT_SCHEMA_V1: &str = "bloom.local_app.sign_hash_subject.v1";
 const LOCAL_APP_SIGNING_ACTION_DOMAIN: &[u8] = b"bloom.local_app.sign_hash.action.v1";
+const LOCAL_APP_SIGNING_BATCH_ACTION_DOMAIN: &[u8] = b"bloom.local_app.sign_hash_batch.action.v1";
+const MAX_LOCAL_APP_SIGN_BATCH: usize = 16;
 
 /// Concrete adapter that bridges [`CentralOutbox`] (filesystem) and
 /// [`AuthStore`] (action_id_map) to satisfy [`CentralOutboxProjection`]
@@ -194,6 +197,7 @@ struct DaemonPetalHost {
     auth_services: AuthServices,
     tx_outbox: Option<PetalTxOutbox>,
     tx_stage_lock: tokio::sync::Mutex<()>,
+    sign_batch_lock: tokio::sync::Mutex<()>,
 }
 
 #[derive(Clone)]
@@ -219,6 +223,7 @@ impl DaemonPetalHost {
             auth_services,
             tx_outbox: None,
             tx_stage_lock: tokio::sync::Mutex::new(()),
+            sign_batch_lock: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -427,6 +432,183 @@ impl DaemonPetalHost {
         )
         .map_err(|e| HostError::Backend(format!("seal local-app signing action: {e}")))?;
         Ok((action, attestation))
+    }
+
+    fn local_app_batch_action(
+        &self,
+        requests: &[SignRequest],
+        now_ms: u64,
+    ) -> Result<(SealedAction, Vec<bloom_auth_api::SigningAttestation>), HostError> {
+        if requests.is_empty() || requests.len() > MAX_LOCAL_APP_SIGN_BATCH {
+            return Err(HostError::Invalid(format!(
+                "local-app signing batch requires 1..={MAX_LOCAL_APP_SIGN_BATCH} requests"
+            )));
+        }
+        let first_context = requests[0].context.as_ref().ok_or_else(|| {
+            HostError::Denied("signing batch requires trusted v2 route context".into())
+        })?;
+        let first_wallet = requests[0].wallet.as_str();
+        let mut individual = Vec::with_capacity(requests.len());
+        let mut seen = std::collections::BTreeSet::new();
+        for request in requests {
+            if request.wallet != first_wallet || request.context.as_ref() != Some(first_context) {
+                return Err(HostError::Invalid(
+                    "signing batch entries must share one wallet and trusted route context".into(),
+                ));
+            }
+            let tuple = (
+                request.wallet.clone(),
+                request.hash32,
+                request.purpose.clone(),
+            );
+            if !seen.insert(tuple) {
+                return Err(HostError::Invalid(
+                    "signing batch contains a duplicate wallet/hash/intent entry".into(),
+                ));
+            }
+            individual.push(self.local_app_action(request, first_context, now_ms)?);
+        }
+
+        let expires_ms = individual[0].0.expires_ms;
+        let request_fingerprint: Vec<_> = requests
+            .iter()
+            .map(|request| {
+                serde_json::json!({
+                    "wallet": request.wallet,
+                    "hash_hex": format!("0x{}", hex::encode(request.hash32)),
+                    "intent": request.purpose,
+                })
+            })
+            .collect();
+        let fingerprint = serde_json::to_vec(&serde_json::json!({
+            "requests": request_fingerprint,
+            "app_root": first_context.app_root,
+            "package_hash": first_context.package_hash,
+            "route_id": first_context.route_id,
+            "op": first_context.op,
+            "path": first_context.path,
+            "params": first_context.params,
+            "actor": first_context.actor,
+            "expires_ms": expires_ms,
+        }))
+        .map_err(|e| HostError::Backend(format!("encode local-app batch fingerprint: {e}")))?;
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(LOCAL_APP_SIGNING_BATCH_ACTION_DOMAIN);
+        hasher.update(&fingerprint);
+        let action_id = format!("appsign-batch-{}", hasher.finalize().to_hex());
+
+        let mut attestations = Vec::with_capacity(individual.len());
+        let mut entries = Vec::with_capacity(individual.len());
+        for ((_, attestation), request) in individual.into_iter().zip(requests) {
+            let mut facts = LocalAppSigningAttestationFacts::from_attestation(&attestation)
+                .map_err(|e| HostError::Backend(format!("decode local-app attestation: {e}")))?;
+            facts.action_id = action_id.clone();
+            let attestation = facts
+                .signing_attestation()
+                .map_err(|e| HostError::Backend(format!("build batch attestation: {e}")))?;
+            entries.push(SealedSignBatchEntry {
+                wallet: request.wallet.clone(),
+                intent: request.purpose.clone(),
+                hash_hex: format!("0x{}", hex::encode(request.hash32)),
+                attestation_facts_digest: signing_attestation_facts_digest(&attestation.facts)
+                    .map_err(|e| HostError::Backend(format!("digest batch attestation: {e}")))?,
+            });
+            attestations.push(attestation);
+        }
+
+        let petal_id = format!("{LOCAL_APP_PETAL_ID_PREFIX}{}", first_context.app_root);
+        let header = CanonicalIntentHeader {
+            schema: CANONICAL_INTENT_HEADER_SCHEMA_V2.into(),
+            wallet: first_wallet.into(),
+            surface: "apps".into(),
+            action_id: action_id.clone(),
+            petal_id,
+            petal_digest: first_context.package_hash.clone(),
+            petal_version: "v2-package".into(),
+            executor_kind: ExecutorKind::Wasm,
+            network: "local".into(),
+            account: first_wallet.into(),
+            action_kind: "local_app.sign_hash_batch".into(),
+            value_movement: true,
+            authority_change: true,
+            expires_ms,
+        };
+        let mut terms = DaemonGrantTerms::minimal(AssuranceLevel::Hardened);
+        terms.max_ttl_secs = LOCAL_APP_ACTION_TTL_MS / 1_000;
+        terms.max_signatures = u32::try_from(entries.len())
+            .map_err(|_| HostError::Invalid("signing batch is too large".into()))?;
+        terms.allowed_sign_intents = requests
+            .iter()
+            .map(|request| request.purpose.clone())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        terms.extra.insert(
+            "required.signing_requests".into(),
+            serde_json::to_value(&entries)
+                .map_err(|e| HostError::Backend(format!("encode sealed signing batch: {e}")))?,
+        );
+        let mut snapshot = PetalPolicySnapshot::minimal(&header);
+        snapshot.config.insert(
+            "app_root".into(),
+            serde_json::Value::String(first_context.app_root.clone()),
+        );
+        snapshot.config.insert(
+            "package_hash".into(),
+            serde_json::Value::String(first_context.package_hash.clone()),
+        );
+        snapshot.config.insert(
+            "route_id".into(),
+            serde_json::Value::String(first_context.route_id.clone()),
+        );
+        let subject = serde_json::to_vec(&serde_json::json!({
+            "action_id": action_id,
+            "requests": entries,
+        }))
+        .map_err(|e| HostError::Backend(format!("encode local-app batch subject: {e}")))?;
+        let plan_entries = requests
+            .iter()
+            .enumerate()
+            .map(|(index, request)| {
+                format!(
+                    "{}. intent `{}`; hash `0x{}`",
+                    index + 1,
+                    request.purpose,
+                    hex::encode(request.hash32)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let action = SealedAction::new(
+            CanonicalEnvelope::new(
+                header,
+                "local_app_sign_hash_batch",
+                "bloom.local_app.sign_hash_batch_subject.v1",
+                subject,
+            ),
+            format!(
+                "# Approve local app signature batch\n\nApp: `{}`\nPackage: `{}`\nRoute: `{}` {} `{}`\nWallet: `{}`\n\n{}\n",
+                first_context.app_root,
+                first_context.package_hash,
+                first_context.route_id,
+                first_context.op,
+                first_context.path,
+                first_wallet,
+                plan_entries,
+            ),
+            vec![PolicyCheckResult {
+                rule_id: "local_app.route_provenance".into(),
+                rule_class: PolicyCheckClass::Informational,
+                outcome: "pass".into(),
+                message: "ordered signature batch is bound to the resolved local app package and route".into(),
+                step_up_ceiling: None,
+            }],
+            terms,
+            snapshot,
+            now_ms,
+        )
+        .map_err(|e| HostError::Backend(format!("seal local-app signing batch: {e}")))?;
+        Ok((action, attestations))
     }
 
     fn audit_http_fetch(
@@ -781,6 +963,94 @@ impl PetalHost for DaemonPetalHost {
         }
         self.audit_sign_hash(&req, "ok", None);
         Ok(SignOutcome::Signature(signature))
+    }
+
+    async fn sign_hashes_outcome(
+        &self,
+        req: SignBatchRequest,
+    ) -> Result<SignBatchOutcome, HostError> {
+        let _guard = self.sign_batch_lock.lock().await;
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_millis() as u64)
+            .unwrap_or(0);
+        let (action, attestations) = self.local_app_batch_action(&req.requests, now_ms)?;
+        let active_grant = self
+            .auth_services
+            .require_grant_store()
+            .map_err(|e| HostError::Backend(e.to_string()))?
+            .get_active(
+                action.wallet(),
+                action.action_id(),
+                action.petal_id(),
+                action.petal_digest(),
+                now_ms,
+            )
+            .await
+            .map_err(|e| HostError::Backend(format!("lookup local-app batch grant: {e}")))?;
+        if active_grant.is_none() {
+            let writer = self
+                .auth_services
+                .require_writer()
+                .map_err(|e| HostError::Backend(e.to_string()))?;
+            writer
+                .stage_action(action.clone(), now_ms)
+                .await
+                .map_err(|e| HostError::Backend(format!("stage local-app signing batch: {e}")))?;
+            let mut nonce = [0u8; 32];
+            rand::rngs::OsRng.fill_bytes(&mut nonce);
+            let challenge = writer
+                .issue_challenge(
+                    action.surface(),
+                    action.action_id(),
+                    &base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(nonce),
+                    action.expires_ms,
+                    now_ms,
+                )
+                .await
+                .map_err(|e| HostError::Backend(format!("issue batch challenge: {e}")))?
+                .with_local_ceremony_url();
+            return Ok(SignBatchOutcome::ApprovalRequired(ApprovalRequired {
+                action_id: action.action_id().into(),
+                ceremony_url: challenge
+                    .ceremony_url
+                    .unwrap_or_else(|| "unavailable".into()),
+                expires_ms: action.expires_ms,
+            }));
+        }
+
+        let requests = req
+            .requests
+            .iter()
+            .map(|request| SignHashRequest {
+                wallet: request.wallet.clone(),
+                action_id: action.action_id().into(),
+                intent: request.purpose.clone(),
+                hash_hex: format!("0x{}", hex::encode(request.hash32)),
+            })
+            .collect();
+        let sealed = self
+            .auth_services
+            .require_petal_host()
+            .map_err(|e| HostError::Backend(e.to_string()))?
+            .sign_hash_batch(requests, &attestations, now_ms)
+            .await
+            .map_err(|e| {
+                HostError::Denied(format!("local-app sealed batch signing denied: {e}"))
+            })?;
+        let mut signatures = Vec::with_capacity(sealed.len());
+        for signature in sealed {
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(signature.signature_b64)
+                .map_err(|e| HostError::Backend(format!("decode batch signature: {e}")))?;
+            if bytes.len() != 65 {
+                return Err(HostError::Backend(
+                    "local-app batch signer returned a non-65-byte signature".into(),
+                ));
+            }
+            signatures.push(bytes);
+        }
+        Ok(SignBatchOutcome::Signatures(signatures))
     }
 
     async fn evm_tx_stage(
@@ -1740,7 +2010,10 @@ impl Daemon {
         let mut vfs_builder = Vfs::builder()
             .mount(
                 "apps",
-                Arc::new(PetalRouter::new(petals.clone(), petal_app_host)) as _,
+                Arc::new(
+                    PetalRouter::new(petals.clone(), petal_app_host)
+                        .with_runtime_apps(config.petals.apps.clone()),
+                ) as _,
             )
             .mount(
                 "chains",
@@ -2610,6 +2883,60 @@ mod tests {
                 .get("signing_hash")
                 .and_then(|value| value.as_str()),
             Some(expected_hash.as_str())
+        );
+    }
+
+    #[test]
+    fn daemon_petal_host_seals_exact_ordered_hardened_signing_batch() {
+        let dir = tempfile::tempdir().unwrap();
+        let audit = Arc::new(AuditLog::open(dir.path().join("audit.jsonl")).unwrap());
+        let host =
+            DaemonPetalHost::new(Arc::new(LateVfsHost::new()), audit, AuthServices::default());
+        let context = V2SignContext {
+            app_root: "polymarket".into(),
+            package_hash: "b".repeat(64),
+            route_id: "r-onboard".into(),
+            op: "write".into(),
+            path: "/onboard/alice/begin".into(),
+            params: vec![("wallet".into(), "alice".into())],
+            actor: None,
+        };
+        let requests = vec![
+            SignRequest {
+                wallet: "alice".into(),
+                hash32: [1; 32],
+                purpose: "polymarket.onboard".into(),
+                context: Some(context.clone()),
+            },
+            SignRequest {
+                wallet: "alice".into(),
+                hash32: [2; 32],
+                purpose: "polymarket.relayer_batch".into(),
+                context: Some(context),
+            },
+        ];
+        let (action, attestations) = host.local_app_batch_action(&requests, 1).unwrap();
+        assert_eq!(action.daemon_terms.assurance, AssuranceLevel::Hardened);
+        assert_eq!(action.daemon_terms.max_signatures, 2);
+        assert_eq!(attestations.len(), 2);
+        let entries: Vec<SealedSignBatchEntry> =
+            serde_json::from_value(action.daemon_terms.extra["required.signing_requests"].clone())
+                .unwrap();
+        assert_eq!(entries[0].hash_hex, format!("0x{}", hex::encode([1; 32])));
+        assert_eq!(entries[1].hash_hex, format!("0x{}", hex::encode([2; 32])));
+        assert!(
+            entries
+                .iter()
+                .all(|entry| !entry.attestation_facts_digest.is_empty())
+        );
+
+        let mut reversed = requests.clone();
+        reversed.reverse();
+        let (reversed_action, _) = host.local_app_batch_action(&reversed, 1).unwrap();
+        assert_ne!(action.action_id(), reversed_action.action_id());
+        assert!(
+            host.local_app_batch_action(&[requests[0].clone(), requests[0].clone()], 1)
+                .is_err()
         );
     }
 

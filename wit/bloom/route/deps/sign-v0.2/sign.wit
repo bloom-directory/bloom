@@ -12,6 +12,20 @@ interface signing {
     approval-required(approval-required),
   }
 
+  record sign-request {
+    wallet: string,
+    hash32: list<u8>,
+    intent: string,
+  }
+
+  variant sign-batch-result {
+    signatures(list<list<u8>>),
+    approval-required(approval-required),
+  }
+
   sign-hash: func(wallet: string, hash32: list<u8>, intent: string)
     -> result<sign-result, string>;
+
+  sign-hashes: func(requests: list<sign-request>)
+    -> result<sign-batch-result, string>;
 }

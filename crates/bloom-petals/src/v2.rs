@@ -2417,6 +2417,8 @@ enum HostTypeExport {
     OutboxInspection,
     SignApprovalRequired,
     SignResultV2,
+    SignRequestV2,
+    SignBatchResultV2,
 }
 
 #[derive(Clone, Copy)]
@@ -2430,6 +2432,7 @@ enum HostFuncExport {
     StoreDeleteIfValue,
     SignHash,
     SignHashV2,
+    SignHashesV2,
     EvmTxStage,
     EvmTxConfirm,
     EvmTxInspect,
@@ -2440,6 +2443,7 @@ enum HostFuncExport {
     VfsWrite,
     EnvNowMs,
     EnvRandomBytes,
+    EnvSetting,
 }
 
 fn is_host_interface_instance<'a>(
@@ -2560,6 +2564,12 @@ fn host_type_export(interface: ComponentHostInterface, name: &str) -> Option<Hos
         (ComponentHostInterface::SignSigningV2, "sign-result") => {
             Some(HostTypeExport::SignResultV2)
         }
+        (ComponentHostInterface::SignSigningV2, "sign-request") => {
+            Some(HostTypeExport::SignRequestV2)
+        }
+        (ComponentHostInterface::SignSigningV2, "sign-batch-result") => {
+            Some(HostTypeExport::SignBatchResultV2)
+        }
         _ => None,
     }
 }
@@ -2577,6 +2587,9 @@ fn host_func_export(interface: ComponentHostInterface, name: &str) -> Option<Hos
         }
         (ComponentHostInterface::SignSigning, "sign-hash") => Some(HostFuncExport::SignHash),
         (ComponentHostInterface::SignSigningV2, "sign-hash") => Some(HostFuncExport::SignHashV2),
+        (ComponentHostInterface::SignSigningV2, "sign-hashes") => {
+            Some(HostFuncExport::SignHashesV2)
+        }
         (ComponentHostInterface::TxOutbox, "stage") => Some(HostFuncExport::EvmTxStage),
         (ComponentHostInterface::TxOutbox, "confirm") => Some(HostFuncExport::EvmTxConfirm),
         (ComponentHostInterface::TxOutbox, "inspect") => Some(HostFuncExport::EvmTxInspect),
@@ -2589,6 +2602,7 @@ fn host_func_export(interface: ComponentHostInterface, name: &str) -> Option<Hos
         (ComponentHostInterface::EnvRuntime, "random-bytes") => {
             Some(HostFuncExport::EnvRandomBytes)
         }
+        (ComponentHostInterface::EnvRuntime, "setting") => Some(HostFuncExport::EnvSetting),
         _ => None,
     }
 }
@@ -2612,6 +2626,8 @@ fn host_type_export_matches(
         HostTypeExport::OutboxInspection => is_outbox_inspection(&ty, types, 0),
         HostTypeExport::SignApprovalRequired => is_approval_required(&ty, types, 0),
         HostTypeExport::SignResultV2 => is_sign_result_v2(&ty, types, 0),
+        HostTypeExport::SignRequestV2 => is_sign_request_v2(&ty, types, 0),
+        HostTypeExport::SignBatchResultV2 => is_sign_batch_result_v2(&ty, types, 0),
     }
 }
 
@@ -2708,6 +2724,15 @@ fn host_func_export_matches(
                 ],
             ) && result_matches(&ty.result, types, HostOkType::SignResultV2)
         }
+        HostFuncExport::SignHashesV2 => {
+            params_match(
+                params,
+                types,
+                &[("requests", |ty, types, depth| {
+                    is_list_of(ty, types, is_sign_request_v2, depth)
+                })],
+            ) && result_matches(&ty.result, types, HostOkType::SignBatchResultV2)
+        }
         HostFuncExport::EvmTxStage => {
             params_match(params, types, &[("tx", is_evm_transaction)])
                 && result_matches(&ty.result, types, HostOkType::StagedTransaction)
@@ -2765,6 +2790,10 @@ fn host_func_export_matches(
             params_match(params, types, &[("len", is_u32_type)])
                 && result_matches(&ty.result, types, HostOkType::Bytes)
         }
+        HostFuncExport::EnvSetting => {
+            params_match(params, types, &[("key", is_string_type)])
+                && result_matches(&ty.result, types, HostOkType::OptionalString)
+        }
     }
 }
 
@@ -2789,6 +2818,7 @@ enum HostOkType {
     Unit,
     Bytes,
     OptionalBytes,
+    OptionalString,
     StringList,
     HttpResponse,
     ChainResponse,
@@ -2796,6 +2826,7 @@ enum HostOkType {
     VfsEntryList,
     U64,
     SignResultV2,
+    SignBatchResultV2,
     StagedTransaction,
     OutboxInspection,
 }
@@ -2816,6 +2847,9 @@ fn result_matches(
             (HostOkType::Unit, None) => true,
             (HostOkType::Bytes, Some(ty)) => is_byte_list(ty, types, depth),
             (HostOkType::OptionalBytes, Some(ty)) => is_option_of(ty, types, is_byte_list, depth),
+            (HostOkType::OptionalString, Some(ty)) => {
+                is_option_of(ty, types, is_string_type, depth)
+            }
             (HostOkType::StringList, Some(ty)) => is_list_of(ty, types, is_string_type, depth),
             (HostOkType::HttpResponse, Some(ty)) => is_http_response(ty, types, depth),
             (HostOkType::ChainResponse, Some(ty)) => is_chain_response(ty, types, depth),
@@ -2823,6 +2857,7 @@ fn result_matches(
             (HostOkType::VfsEntryList, Some(ty)) => is_list_of(ty, types, is_route_entry, depth),
             (HostOkType::U64, Some(ty)) => is_u64(ty, types, depth),
             (HostOkType::SignResultV2, Some(ty)) => is_sign_result_v2(ty, types, depth),
+            (HostOkType::SignBatchResultV2, Some(ty)) => is_sign_batch_result_v2(ty, types, depth),
             (HostOkType::StagedTransaction, Some(ty)) => is_staged_transaction(ty, types, depth),
             (HostOkType::OutboxInspection, Some(ty)) => is_outbox_inspection(ty, types, depth),
             _ => false,
@@ -2846,6 +2881,52 @@ fn is_sign_result_v2(
                 .ty
                 .as_ref()
                 .is_some_and(|ty| is_byte_list(ty, types, depth))
+            && cases[1].name == "approval-required"
+            && cases[1]
+                .ty
+                .as_ref()
+                .is_some_and(|ty| is_approval_required(ty, types, depth))
+    })
+}
+
+fn is_sign_request_v2(
+    ty: &ComponentValType,
+    types: &[ComponentTypeEntry<'_>],
+    depth: usize,
+) -> bool {
+    with_defined_type(ty, types, depth, |defined, types, depth| {
+        let ComponentDefinedType::Record(fields) = defined else {
+            return false;
+        };
+        fields.as_ref().len() == 3
+            && fields[0].0 == "wallet"
+            && is_string(&fields[0].1)
+            && fields[1].0 == "hash32"
+            && is_byte_list(&fields[1].1, types, depth)
+            && fields[2].0 == "intent"
+            && is_string(&fields[2].1)
+    })
+}
+
+fn is_sign_batch_result_v2(
+    ty: &ComponentValType,
+    types: &[ComponentTypeEntry<'_>],
+    depth: usize,
+) -> bool {
+    with_defined_type(ty, types, depth, |defined, types, depth| {
+        let ComponentDefinedType::Variant(cases) = defined else {
+            return false;
+        };
+        cases.as_ref().len() == 2
+            && cases[0].name == "signatures"
+            && cases[0].ty.as_ref().is_some_and(|ty| {
+                is_list_of(
+                    ty,
+                    types,
+                    |ty, types, depth| is_byte_list(ty, types, depth),
+                    depth,
+                )
+            })
             && cases[1].name == "approval-required"
             && cases[1]
                 .ty
@@ -3580,6 +3661,25 @@ pub(crate) mod route_fixtures {
         metadata_caps: &[&str],
         package_import: Option<&str>,
     ) -> Vec<u8> {
+        build_dynamic_dir_route_component(import_store, vfs, metadata_caps, package_import, false)
+    }
+
+    pub(crate) fn dynamic_side_effecting_dir_route_component(
+        import_store: bool,
+        vfs: FixtureVfsImport,
+        metadata_caps: &[&str],
+        package_import: Option<&str>,
+    ) -> Vec<u8> {
+        build_dynamic_dir_route_component(import_store, vfs, metadata_caps, package_import, true)
+    }
+
+    fn build_dynamic_dir_route_component(
+        import_store: bool,
+        vfs: FixtureVfsImport,
+        metadata_caps: &[&str],
+        package_import: Option<&str>,
+        side_effecting_read: bool,
+    ) -> Vec<u8> {
         // String table for the metadata cap names and the lookup entry name.
         let mut strings = Vec::new();
         let mut cap_locs = Vec::new();
@@ -3602,6 +3702,7 @@ pub(crate) mod route_fixtures {
         meta[12..16].copy_from_slice(&0o755u32.to_le_bytes());
         meta[16] = 1; // cache-ttl-ms: some
         meta[24..32].copy_from_slice(&30_000u64.to_le_bytes());
+        meta[32] = u8::from(side_effecting_read);
         meta[60..64].copy_from_slice(&caps_array.to_le_bytes());
         meta[64..68].copy_from_slice(&(metadata_caps.len() as u32).to_le_bytes());
 

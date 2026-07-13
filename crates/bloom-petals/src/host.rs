@@ -10,7 +10,8 @@ use async_trait::async_trait;
 
 use crate::abi::{
     ChainRequest, ChainResponse, EvmOutboxInspection, EvmOutboxOutcome, EvmTransactionRequest,
-    HttpRequest, HttpResponse, SignOutcome, SignRequest, V2SignContext,
+    HttpRequest, HttpResponse, SignBatchOutcome, SignBatchRequest, SignOutcome, SignRequest,
+    V2SignContext,
 };
 use crate::policy::NetPolicy;
 
@@ -90,6 +91,15 @@ pub trait PetalHost: Send + Sync {
     /// Hosts that have not opted into staged approval retain the v0.1 behavior.
     async fn sign_hash_outcome(&self, req: SignRequest) -> Result<SignOutcome, HostError> {
         self.sign_hash(req).await.map(SignOutcome::Signature)
+    }
+
+    /// Sign an exact ordered set of hashes under one staged approval. Hosts
+    /// must not return a partial signature vector.
+    async fn sign_hashes_outcome(
+        &self,
+        _req: SignBatchRequest,
+    ) -> Result<SignBatchOutcome, HostError> {
+        Err(HostError::Denied("sign_hashes".into()))
     }
 
     /// Stage a generic EVM transaction in the daemon outbox. Hosts default to

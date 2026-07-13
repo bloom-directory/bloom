@@ -5,13 +5,15 @@
 //! host imports we install on the runner's VM.
 
 use std::collections::BTreeSet;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use bloom_vfs::handler::HandlerError;
 use bloom_vfs::path::VfsPath;
 use bloom_vfs::{Handler, Vfs};
-use parking_lot::RwLock;
+use lru::LruCache;
+use parking_lot::{Mutex, RwLock};
 
 use crate::error::PetalError;
 use crate::host::{DenyHost, HostError, HostVfsEntry, HostVfsEntryKind, PetalHost};
@@ -26,6 +28,18 @@ use crate::v2::{
 };
 use crate::vm::{DispatchOutput, PetalVm, RunOptions};
 use crate::{DispatchOp, DispatchRequest};
+
+/// Runtime route metadata is deterministic for an immutable package and a
+/// fully-bound route path. Keep a bounded cache so synchronous VFS metadata
+/// hooks can use the validated, narrowed result after an async route lookup.
+const RUNTIME_METADATA_CACHE_CAPACITY: usize = 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct RuntimeMetadataCacheKey {
+    package_hash: String,
+    route_id: String,
+    path: String,
+}
 
 /// Wraps an `Arc<Vfs>` so a petal's `bloom.vfs_read`/`vfs_write` calls
 /// land on the live VFS (and therefore on the same daemon state the
@@ -173,6 +187,7 @@ pub struct PetalRunner {
     store: PetalStore,
     registry: Arc<NameRegistry>,
     vm: PetalVm,
+    runtime_metadata: Arc<Mutex<LruCache<RuntimeMetadataCacheKey, InstallRouteMetadata>>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -188,7 +203,45 @@ impl PetalRunner {
             store,
             registry,
             vm,
+            runtime_metadata: Arc::new(Mutex::new(LruCache::new(
+                NonZeroUsize::new(RUNTIME_METADATA_CACHE_CAPACITY)
+                    .expect("runtime metadata cache capacity is non-zero"),
+            ))),
         }
+    }
+
+    fn runtime_metadata_key(matched: &LocalAppRouteMatch, path: &str) -> RuntimeMetadataCacheKey {
+        RuntimeMetadataCacheKey {
+            package_hash: matched.hash.clone(),
+            route_id: matched.route.route_id.clone(),
+            path: path.to_string(),
+        }
+    }
+
+    /// Return the best synchronously available metadata for a route.
+    ///
+    /// Parameterized routes start with a conservative install-time ceiling.
+    /// Once an async lookup or dispatch has evaluated their component
+    /// metadata, this returns that validated narrowing. Cache misses remain
+    /// fail-closed by returning the install-time metadata.
+    pub fn local_app_route_effective_metadata(
+        &self,
+        mount: &str,
+        op: DispatchOp,
+        path: &str,
+    ) -> Result<(LocalAppRouteMatch, InstallRouteMetadata), PetalError> {
+        let matched = self.local_app_route(mount, op, path)?;
+        if matched.params.is_empty() {
+            return Ok((matched.clone(), matched.route.install_metadata.clone()));
+        }
+        let key = Self::runtime_metadata_key(&matched, path);
+        let metadata = self
+            .runtime_metadata
+            .lock()
+            .get(&key)
+            .cloned()
+            .unwrap_or_else(|| matched.route.install_metadata.clone());
+        Ok((matched, metadata))
     }
 
     pub fn store(&self) -> &PetalStore {
@@ -396,7 +449,9 @@ impl PetalRunner {
         if opts.private_store_root.is_none() {
             opts.private_store_root = Some(self.store.private_data_root());
         }
-        let declared = self.v2_net_policy(&matched.hash)?;
+        let declared = self
+            .v2_net_policy(&matched.hash)?
+            .with_endpoint_bindings(&opts.endpoint_bindings)?;
         opts.net_policy = Some(match opts.net_policy {
             Some(mask) => declared.intersect(&mask),
             None => declared,
@@ -437,6 +492,10 @@ impl PetalRunner {
         if matched.route.abi != RouteAbi::ComponentBloomRoute010 || matched.params.is_empty() {
             return Ok(matched.route.install_metadata.clone());
         }
+        let key = Self::runtime_metadata_key(matched, path);
+        if let Some(metadata) = self.runtime_metadata.lock().get(&key).cloned() {
+            return Ok(metadata);
+        }
         let metadata = self
             .vm
             .component_route_metadata(
@@ -450,7 +509,10 @@ impl PetalRunner {
                 opts.clone(),
             )
             .await?;
-        narrow_runtime_route_metadata(&matched.route, &metadata, declared_sign_intents)
+        let metadata =
+            narrow_runtime_route_metadata(&matched.route, &metadata, declared_sign_intents)?;
+        self.runtime_metadata.lock().put(key, metadata.clone());
+        Ok(metadata)
     }
 
     fn v2_net_policy(&self, hash: &str) -> Result<NetPolicy, PetalError> {
