@@ -19,6 +19,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use alloy::network::TransactionBuilder;
 use alloy::primitives::{Address, Bytes, U256};
 use alloy::rpc::types::eth::TransactionRequest;
+use alloy::signers::SignerSync;
+use alloy::signers::local::PrivateKeySigner;
 use base64::Engine as _;
 use bloom_auth::{AuthStore, StoreApprovalVerifier};
 use bloom_auth_api::{
@@ -79,6 +81,7 @@ use std::sync::Mutex;
 
 const PETAL_HTTP_MAX_REDIRECTS: usize = 5;
 const LOCAL_APP_ACTION_TTL_MS: u64 = 120_000;
+const LOCAL_APP_ACTION_RETRY_BUCKET_MS: u64 = 60_000;
 const LOCAL_APP_SIGNING_SUBJECT_KIND: &str = "local_app_sign_hash";
 const LOCAL_APP_SIGNING_SUBJECT_SCHEMA_V1: &str = "bloom.local_app.sign_hash_subject.v1";
 const LOCAL_APP_SIGNING_ACTION_DOMAIN: &[u8] = b"bloom.local_app.sign_hash.action.v1";
@@ -198,6 +201,7 @@ struct DaemonPetalHost {
     tx_outbox: Option<PetalTxOutbox>,
     tx_stage_lock: tokio::sync::Mutex<()>,
     sign_batch_lock: tokio::sync::Mutex<()>,
+    unsafe_debug_signer: Option<(String, Arc<PrivateKeySigner>)>,
 }
 
 #[derive(Clone)]
@@ -224,12 +228,25 @@ impl DaemonPetalHost {
             tx_outbox: None,
             tx_stage_lock: tokio::sync::Mutex::new(()),
             sign_batch_lock: tokio::sync::Mutex::new(()),
+            unsafe_debug_signer: None,
         }
     }
 
     fn with_tx_outbox(mut self, tx_outbox: PetalTxOutbox) -> Self {
         self.tx_outbox = Some(tx_outbox);
         self
+    }
+
+    fn with_unsafe_debug_signer(mut self, wallet: String, signer: Arc<PrivateKeySigner>) -> Self {
+        self.unsafe_debug_signer = Some((wallet, signer));
+        self
+    }
+
+    fn unsafe_debug_signer(&self, wallet: &str) -> Option<&Arc<PrivateKeySigner>> {
+        self.unsafe_debug_signer
+            .as_ref()
+            .filter(|(configured, _)| configured == wallet)
+            .map(|(_, signer)| signer)
     }
 
     fn local_app_execution_origin(
@@ -284,12 +301,16 @@ impl DaemonPetalHost {
             }
         }
 
-        // Bucket the expiry so the same request retries reuse one action and
-        // challenge, while the action still has a strict two-minute upper bound.
-        let expires_ms = now_ms
-            .checked_div(LOCAL_APP_ACTION_TTL_MS)
-            .and_then(|bucket| bucket.checked_add(1))
-            .and_then(|bucket| bucket.checked_mul(LOCAL_APP_ACTION_TTL_MS))
+        // Keep retries stable within a short bucket, but always leave enough
+        // time to complete the ceremony. Bucketing directly by the TTL can
+        // create an action milliseconds before the bucket boundary and trap
+        // the route behind an effectively expired challenge.
+        let bucket_start_ms = now_ms
+            .checked_div(LOCAL_APP_ACTION_RETRY_BUCKET_MS)
+            .and_then(|bucket| bucket.checked_mul(LOCAL_APP_ACTION_RETRY_BUCKET_MS))
+            .ok_or_else(|| HostError::Backend("local-app action bucket overflow".into()))?;
+        let expires_ms = bucket_start_ms
+            .checked_add(LOCAL_APP_ACTION_TTL_MS)
             .ok_or_else(|| HostError::Backend("local-app action expiry overflow".into()))?;
         let hash_hex = format!("0x{}", hex::encode(req.hash32));
         let fingerprint = serde_json::to_vec(&serde_json::json!({
@@ -878,6 +899,20 @@ impl PetalHost for DaemonPetalHost {
                 return Err(err);
             }
         };
+        if let Some(signer) = self.unsafe_debug_signer(&req.wallet) {
+            tracing::warn!(
+                wallet = %req.wallet,
+                action_id = %action.action_id(),
+                "petal.unsafe_debug_signing_bypass"
+            );
+            let signature = signer
+                .sign_hash_sync(&alloy::primitives::B256::from(req.hash32))
+                .map_err(|e| HostError::Backend(format!("debug sign hash: {e}")))?
+                .as_bytes()
+                .to_vec();
+            self.audit_sign_hash(&req, "unsafe_debug_ok", None);
+            return Ok(SignOutcome::Signature(signature));
+        }
         let active_grant = self
             .auth_services
             .require_grant_store()
@@ -966,6 +1001,25 @@ impl PetalHost for DaemonPetalHost {
             .map(|duration| duration.as_millis() as u64)
             .unwrap_or(0);
         let (action, attestations) = self.local_app_batch_action(&req.requests, now_ms)?;
+        if let Some(signer) = self.unsafe_debug_signer(action.wallet()) {
+            tracing::warn!(
+                wallet = %action.wallet(),
+                action_id = %action.action_id(),
+                count = req.requests.len(),
+                "petal.unsafe_debug_batch_signing_bypass"
+            );
+            let mut signatures = Vec::with_capacity(req.requests.len());
+            for request in &req.requests {
+                signatures.push(
+                    signer
+                        .sign_hash_sync(&alloy::primitives::B256::from(request.hash32))
+                        .map_err(|e| HostError::Backend(format!("debug batch sign hash: {e}")))?
+                        .as_bytes()
+                        .to_vec(),
+                );
+            }
+            return Ok(SignBatchOutcome::Signatures(signatures));
+        }
         let active_grant = self
             .auth_services
             .require_grant_store()
@@ -1332,6 +1386,15 @@ async fn daemon_petal_chain_read(
                 .map_err(|e| HostError::Backend(format!("native balance: {e}")))?;
             format!("{balance:#x}")
         }
+        "eth_getCode" if matches!(params.len(), 1 | 2) => {
+            require_latest_block_param(&params, 1)?;
+            let address = parse_petal_address(&params[0], "eth_getCode address")?;
+            let code = chain
+                .code(address)
+                .await
+                .map_err(|e| HostError::Backend(format!("contract code: {e}")))?;
+            format!("0x{}", hex::encode(code))
+        }
         "eth_call" if matches!(params.len(), 1 | 2) => {
             require_latest_block_param(&params, 1)?;
             let call: PetalEthCall = serde_json::from_value(params[0].clone())
@@ -1363,7 +1426,7 @@ async fn daemon_petal_chain_read(
                 .map_err(|e| HostError::Backend(format!("eth_call: {e}")))?;
             format!("0x{}", hex::encode(bytes))
         }
-        "eth_chainId" | "eth_getBalance" | "eth_call" => {
+        "eth_chainId" | "eth_getBalance" | "eth_getCode" | "eth_call" => {
             return Err(HostError::Invalid(format!(
                 "invalid {method} parameters; only latest-block reads are allowed"
             )));
@@ -1727,6 +1790,55 @@ impl Daemon {
         let keystore =
             Keystore::new(home.keystore_dir()).map_err(|e| DaemonError::Keystore(e.to_string()))?;
 
+        let unsafe_debug_signer = match (
+            std::env::var("BLOOM_UNSAFE_DEBUG_SIGNER_WALLET").ok(),
+            std::env::var("BLOOM_UNSAFE_DEBUG_PRIVATE_KEY_FILE").ok(),
+        ) {
+            (Some(wallet), Some(path)) => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt as _;
+                    let mode = std::fs::metadata(&path)?.permissions().mode() & 0o777;
+                    if mode != 0o600 {
+                        return Err(DaemonError::Keystore(format!(
+                            "unsafe debug private-key file must have mode 0600, got {mode:04o}"
+                        )));
+                    }
+                }
+                let key = std::fs::read_to_string(&path)?;
+                let signer: PrivateKeySigner = key.trim().parse().map_err(|e| {
+                    DaemonError::Keystore(format!("parse unsafe debug private key: {e}"))
+                })?;
+                let expected = keystore
+                    .info(&wallet)
+                    .map_err(|e| DaemonError::Keystore(e.to_string()))?
+                    .address;
+                if signer.address() != expected {
+                    return Err(DaemonError::Keystore(format!(
+                        "unsafe debug signer address {} does not match wallet {wallet} ({expected})",
+                        signer.address()
+                    )));
+                }
+                let signer = Arc::new(signer);
+                keystore
+                    .install_unsafe_debug_signer(&wallet, signer.clone())
+                    .map_err(|e| DaemonError::Keystore(e.to_string()))?;
+                warn!(
+                    wallet = %wallet,
+                    address = %expected,
+                    "UNSAFE DEBUG SIGNER ENABLED: interactive approval ceremonies are bypassed"
+                );
+                Some((wallet, signer))
+            }
+            (None, None) => None,
+            _ => {
+                return Err(DaemonError::Keystore(
+                    "BLOOM_UNSAFE_DEBUG_SIGNER_WALLET and BLOOM_UNSAFE_DEBUG_PRIVATE_KEY_FILE must be set together"
+                        .into(),
+                ));
+            }
+        };
+
         // Open auth store early so we can also wire the EVM → central
         // outbox projection.  Two connections to the same SQLite file:
         // one for the verifier (owned), one for the projection (behind
@@ -1744,6 +1856,9 @@ impl Daemon {
             config.stage_ttl.as_millis(),
             config.block_mainnet_broadcast,
         );
+        if let Some((wallet, signer)) = &unsafe_debug_signer {
+            tx_engine = tx_engine.with_unsafe_debug_signer(wallet.clone(), signer.clone());
+        }
 
         // Wire ENS resolver into TxEngine when a mainnet-style chain is
         // configured. We pick the first chain with id 1 / 11155111 / 5 /
@@ -1984,20 +2099,23 @@ impl Daemon {
         let petals = PetalRunner::new(petal_store.clone(), petal_registry.clone(), petal_vm);
         let petal_async_writes = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let petal_vfs_host = Arc::new(LateVfsHost::new());
-        let petal_app_host = Arc::new(
-            DaemonPetalHost::new(
-                petal_vfs_host.clone(),
-                audit_arc.clone(),
-                auth_services.clone(),
-            )
-            .with_tx_outbox(PetalTxOutbox {
-                tx_engine: tx_engine.clone(),
-                chains: chains.clone(),
-                keystore: keystore.clone(),
-                address_book: address_book_arc.clone(),
-                write_permit: home_write_permit.clone(),
-            }),
-        );
+        let mut petal_app_host = DaemonPetalHost::new(
+            petal_vfs_host.clone(),
+            audit_arc.clone(),
+            auth_services.clone(),
+        )
+        .with_tx_outbox(PetalTxOutbox {
+            tx_engine: tx_engine.clone(),
+            chains: chains.clone(),
+            keystore: keystore.clone(),
+            address_book: address_book_arc.clone(),
+            write_permit: home_write_permit.clone(),
+        });
+        if let Some((wallet, signer)) = &unsafe_debug_signer {
+            petal_app_host =
+                petal_app_host.with_unsafe_debug_signer(wallet.clone(), signer.clone());
+        }
+        let petal_app_host = Arc::new(petal_app_host);
         debug!(root = %petals_root.display(), "daemon.petals_initialised");
 
         let mut vfs_builder = Vfs::builder()
@@ -2896,6 +3014,45 @@ mod tests {
     }
 
     #[test]
+    fn local_app_signing_ceremony_never_starts_near_expiry() {
+        let dir = tempfile::tempdir().unwrap();
+        let audit = Arc::new(AuditLog::open(dir.path().join("audit.jsonl")).unwrap());
+        let host =
+            DaemonPetalHost::new(Arc::new(LateVfsHost::new()), audit, AuthServices::default());
+        let req = SignRequest {
+            wallet: "alice".into(),
+            hash32: [7; 32],
+            purpose: "example.batch_sign".into(),
+            context: Some(V2SignContext {
+                app_root: "example".into(),
+                package_hash: "a".repeat(64),
+                route_id: "r-sign".into(),
+                op: "write".into(),
+                path: "/sign/alice/begin".into(),
+                params: vec![("wallet".into(), "alice".into())],
+                actor: None,
+            }),
+        };
+
+        let (start, _) = host
+            .local_app_action(&req, req.context.as_ref().unwrap(), 1)
+            .unwrap();
+        let (end_of_bucket, _) = host
+            .local_app_action(&req, req.context.as_ref().unwrap(), 59_999)
+            .unwrap();
+        assert_eq!(start.action_id(), end_of_bucket.action_id());
+        assert_eq!(end_of_bucket.expires_ms, 120_000);
+        assert!(end_of_bucket.expires_ms - 59_999 >= LOCAL_APP_ACTION_RETRY_BUCKET_MS);
+
+        let (next_bucket, _) = host
+            .local_app_action(&req, req.context.as_ref().unwrap(), 60_000)
+            .unwrap();
+        assert_ne!(start.action_id(), next_bucket.action_id());
+        assert_eq!(next_bucket.expires_ms, 180_000);
+        assert_eq!(next_bucket.expires_ms - 60_000, LOCAL_APP_ACTION_TTL_MS);
+    }
+
+    #[test]
     fn daemon_petal_host_seals_exact_ordered_hardened_signing_batch() {
         let dir = tempfile::tempdir().unwrap();
         let audit = Arc::new(AuditLog::open(dir.path().join("audit.jsonl")).unwrap());
@@ -3039,6 +3196,10 @@ mod tests {
             ("eth_chainId", "[1]"),
             (
                 "eth_getBalance",
+                r#"["0x0000000000000000000000000000000000000001","pending"]"#,
+            ),
+            (
+                "eth_getCode",
                 r#"["0x0000000000000000000000000000000000000001","pending"]"#,
             ),
             (

@@ -679,6 +679,12 @@ impl WalletsHandler {
         if old_policy_toml.as_bytes() == data {
             return Ok(());
         }
+        let unsafe_debug_wallet = std::env::var("BLOOM_UNSAFE_DEBUG_SIGNER_WALLET").ok();
+        if unsafe_debug_wallet.as_deref() == Some(wallet) && self.keystore.is_unlocked(wallet) {
+            tracing::warn!(wallet, "wallet.unsafe_debug_policy_approval_bypass");
+            self.keystore.write_policy(wallet, data).map_err(err_be)?;
+            return Ok(());
+        }
         let old_policy: Policy = toml::from_str(&old_policy_toml)
             .map_err(|e| HandlerError::backend(format!("existing policy TOML is invalid: {e}")))?;
         let now = now_ms_u64();

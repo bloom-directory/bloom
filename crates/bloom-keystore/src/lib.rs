@@ -854,6 +854,26 @@ impl Keystore {
         self.inner.unlocked.read().contains_key(name)
     }
 
+    /// Install a recovered signer into the in-memory cache for an explicit
+    /// local debug session. The signer must control the wallet's persisted
+    /// address. Nothing is written to disk.
+    pub fn install_unsafe_debug_signer(
+        &self,
+        name: &str,
+        signer: Arc<PrivateKeySigner>,
+    ) -> Result<(), KeystoreError> {
+        let expected = self.info_unverified(name)?.address;
+        if signer.address() != expected {
+            return Err(KeystoreError::Signer(format!(
+                "debug signer address {} does not match wallet address {expected}",
+                signer.address()
+            )));
+        }
+        self.inner.unlocked.write().insert(name.to_string(), signer);
+        tracing::warn!(wallet = name, "keystore.unsafe_debug_signer_installed");
+        Ok(())
+    }
+
     pub fn signer(&self, name: &str) -> Result<Arc<PrivateKeySigner>, KeystoreError> {
         let info = self.info_unverified(name)?;
         if info.kind == WalletKind::PasskeyGated {

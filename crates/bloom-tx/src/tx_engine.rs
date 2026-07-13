@@ -12,7 +12,7 @@ use alloy::eips::eip2930::AccessList;
 use alloy::network::TransactionBuilder;
 use alloy::primitives::{Address, B256, Bytes, Signature, TxKind, U256};
 use alloy::rpc::types::eth::TransactionRequest;
-#[cfg(test)]
+use alloy::signers::SignerSync;
 use alloy::signers::local::PrivateKeySigner;
 use alloy::sol;
 use alloy::sol_types::SolCall;
@@ -389,6 +389,7 @@ pub struct TxEngine {
     auth_writer: Option<Arc<dyn AuthStoreWriter>>,
     grant_store: Option<Arc<dyn GrantStore>>,
     petal_host: Option<Arc<dyn PetalHost>>,
+    unsafe_debug_signer: Option<(String, Arc<PrivateKeySigner>)>,
 }
 
 impl TxEngine {
@@ -408,6 +409,7 @@ impl TxEngine {
             auth_writer: None,
             grant_store: None,
             petal_host: None,
+            unsafe_debug_signer: None,
         }
     }
 
@@ -429,6 +431,25 @@ impl TxEngine {
         self.grant_store = Some(grant_store);
         self.petal_host = Some(petal_host);
         self
+    }
+
+    /// Install an explicit local-only debug signer for one wallet. Policy
+    /// evaluation and transaction simulation still run; only the interactive
+    /// Sealed Approval ceremony is bypassed. Never enable this in production.
+    pub fn with_unsafe_debug_signer(
+        mut self,
+        wallet: impl Into<String>,
+        signer: Arc<PrivateKeySigner>,
+    ) -> Self {
+        self.unsafe_debug_signer = Some((wallet.into(), signer));
+        self
+    }
+
+    fn unsafe_debug_signer(&self, wallet: &str) -> Option<&Arc<PrivateKeySigner>> {
+        self.unsafe_debug_signer
+            .as_ref()
+            .filter(|(configured, _)| configured == wallet)
+            .map(|(_, signer)| signer)
     }
 
     /// Access the bounded policy-session store (mint/revoke/list live here).
@@ -2977,6 +2998,11 @@ impl TxEngine {
         subject: &EvmSealedIntentSubject,
         signing_hash: &B256,
     ) -> Result<Signature, TxEngineError> {
+        if let Some(signer) = self.unsafe_debug_signer(&subject.wallet) {
+            return signer
+                .sign_hash_sync(signing_hash)
+                .map_err(|e| TxEngineError::Signer(format!("debug sign hash: {e}")));
+        }
         let host = self.petal_host.as_ref().ok_or_else(|| {
             TxEngineError::BroadcastApprovalRequired(
                 "Sealed Approval Petal host is not wired".into(),
@@ -3017,6 +3043,11 @@ impl TxEngine {
         action_kind: EvmOutboxActionKind,
         signing_hash: B256,
     ) -> Result<Signature, TxEngineError> {
+        if let Some(signer) = self.unsafe_debug_signer(&staged.wallet) {
+            return signer
+                .sign_hash_sync(&signing_hash)
+                .map_err(|e| TxEngineError::Signer(format!("debug sign hash: {e}")));
+        }
         let host = self.petal_host.as_ref().ok_or_else(|| {
             TxEngineError::BroadcastApprovalRequired(
                 "Sealed Approval Petal host is not wired".into(),
@@ -3055,6 +3086,11 @@ impl TxEngine {
         session: &StandingSessionRecord,
         signing_hash: &B256,
     ) -> Result<Signature, TxEngineError> {
+        if let Some(signer) = self.unsafe_debug_signer(&staged.wallet) {
+            return signer
+                .sign_hash_sync(signing_hash)
+                .map_err(|e| TxEngineError::Signer(format!("debug sign hash: {e}")));
+        }
         let host = self.petal_host.as_ref().ok_or_else(|| {
             TxEngineError::BroadcastApprovalRequired(
                 "Sealed Approval Petal host is not wired".into(),
@@ -3210,6 +3246,15 @@ impl TxEngine {
             }
         }
 
+        if self.unsafe_debug_signer(&staged.wallet).is_some() {
+            tracing::warn!(
+                wallet = %staged.wallet,
+                action = action_kind.action_kind(),
+                "tx.unsafe_debug_approval_bypass"
+            );
+            return Ok(());
+        }
+
         if self.approval_verifier.is_none()
             || self.auth_writer.is_none()
             || self.grant_store.is_none()
@@ -3350,15 +3395,31 @@ impl TxEngine {
                     "stored approval.json is invalid: {e}"
                 ))
             })?;
-            verifier
+            let verification = verifier
                 .verify_and_mint_grant(approval, grant_store.as_ref(), now_ms() as u64)
-                .await
-                .map_err(|e| {
-                    TxEngineError::BroadcastApprovalRequired(format!(
+                .await;
+            match verification {
+                Ok(_) => return Ok(intent_hash),
+                Err(bloom_auth_api::AuthApiError::Denied(reason))
+                    if reason == "approval expired" =>
+                {
+                    // A completed browser ceremony can expire before the caller
+                    // retries confirm. Do not pin the outbox entry to that stale
+                    // approval forever: discard only the expired response and
+                    // fall through to issue a fresh challenge for the exact same
+                    // sealed action. Other verification failures remain fatal.
+                    std::fs::remove_file(&approval_path).map_err(|e| {
+                        TxEngineError::BroadcastApprovalRequired(format!(
+                            "remove expired approval.json: {e}"
+                        ))
+                    })?;
+                }
+                Err(e) => {
+                    return Err(TxEngineError::BroadcastApprovalRequired(format!(
                         "Sealed Approval rejected: {e}"
-                    ))
-                })?;
-            return Ok(intent_hash);
+                    )));
+                }
+            }
         }
 
         let mut nonce = [0u8; 32];
