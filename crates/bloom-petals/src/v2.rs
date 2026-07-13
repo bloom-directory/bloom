@@ -3594,11 +3594,29 @@ fn file_route_shadows_descendant(
         return Ok(false);
     }
     for (candidate, descendant) in candidate_segments.into_iter().zip(descendant_segments) {
-        if !segments_overlap(candidate, descendant)? {
+        if !segment_covers(candidate, descendant)? {
             return Ok(false);
         }
     }
     Ok(true)
+}
+
+/// Returns whether every path segment matched by `descendant` is also matched
+/// by `candidate`. Shadowing needs containment, not mere overlap: a reserved
+/// static route such as `new` overlaps `[id]`, but only for one value and must
+/// not make all `[id]/...` descendants invalid.
+fn segment_covers(candidate: &str, descendant: &str) -> Result<bool, PetalError> {
+    match (dynamic_segment(candidate)?, dynamic_segment(descendant)?) {
+        (None, None) => Ok(candidate == descendant),
+        (Some((_param, suffix)), None) => Ok(descendant
+            .strip_suffix(suffix)
+            .is_some_and(|bound| !bound.is_empty())),
+        (None, Some(_)) => Ok(false),
+        (
+            Some((_candidate_param, candidate_suffix)),
+            Some((_descendant_param, descendant_suffix)),
+        ) => Ok(descendant_suffix.ends_with(candidate_suffix)),
+    }
 }
 
 fn normalize_request_path(path: &str) -> Option<&str> {
@@ -4063,6 +4081,37 @@ name = "echo"
         std::fs::remove_file(tmp.path().join("app/echo/foo.wasm")).unwrap();
         write_package_file(tmp.path(), "app/echo/foo/$index.wasm", b"\0asm");
         PetalAppPackage::scan_dir(tmp.path()).unwrap();
+    }
+
+    #[test]
+    fn v2_scanner_allows_reserved_static_route_beside_dynamic_descendants() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_package_file(tmp.path(), "petal.toml", br#"name = "echo""#);
+        write_package_file(tmp.path(), "README.md", b"# echo");
+        write_package_file(tmp.path(), "AGENTS.md", b"# echo agents");
+        write_package_file(tmp.path(), "app/echo/fund/[wallet]/new.wasm", b"\0asm");
+        write_package_file(
+            tmp.path(),
+            "app/echo/fund/[wallet]/[id]/approval.json.wasm",
+            b"\0asm",
+        );
+
+        let package = PetalAppPackage::scan_dir(tmp.path()).unwrap();
+        let new_fund = package.match_route("fund/alice/new").unwrap();
+        assert_eq!(new_fund.route.pattern, "fund/[wallet]/new");
+        assert_eq!(new_fund.params, vec![("wallet".into(), "alice".into())]);
+
+        let approval = package
+            .match_route("fund/alice/position-1/approval.json")
+            .unwrap();
+        assert_eq!(approval.route.pattern, "fund/[wallet]/[id]/approval.json");
+        assert_eq!(
+            approval.params,
+            vec![
+                ("wallet".into(), "alice".into()),
+                ("id".into(), "position-1".into()),
+            ]
+        );
     }
 
     #[test]
