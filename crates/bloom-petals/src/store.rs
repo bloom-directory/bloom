@@ -214,7 +214,7 @@ impl PetalStore {
             Err(e) => return Err(e),
         };
 
-        self.reject_duplicate_app_name(&hash, &package.name)?;
+        let replaced_hashes = self.app_hashes_with_name(&hash, &package.name)?;
 
         if !already_present {
             let tmp = self.package_tmp_path(&hash);
@@ -264,6 +264,10 @@ impl PetalStore {
         meta.source = source;
         self.write_meta(&meta)?;
 
+        for replaced_hash in replaced_hashes {
+            self.uninstall(&replaced_hash)?;
+        }
+
         Ok((
             InstallResult {
                 hash,
@@ -275,19 +279,18 @@ impl PetalStore {
         ))
     }
 
-    fn reject_duplicate_app_name(&self, hash: &str, name: &str) -> Result<(), PetalError> {
+    fn app_hashes_with_name(&self, hash: &str, name: &str) -> Result<Vec<String>, PetalError> {
+        let mut matches = Vec::new();
         for existing_hash in self.list_package_hashes()? {
             if existing_hash == hash {
                 continue;
             }
             let meta = self.load_meta(&existing_hash)?;
             if meta.local_app.as_ref().is_some_and(|app| app.name == name) {
-                return Err(PetalError::InvalidWasm(format!(
-                    "v2 app root {name:?} is already installed by package {existing_hash}"
-                )));
+                matches.push(existing_hash);
             }
         }
-        Ok(())
+        Ok(matches)
     }
 
     fn verify_existing_app_package(&self, package: &PreparedAppPackage) -> Result<(), PetalError> {
@@ -889,7 +892,7 @@ name = "echo"
     }
 
     #[test]
-    fn install_app_package_rejects_duplicate_app_name() {
+    fn install_app_package_replaces_same_app_name() {
         let (d, store) = store();
         let first = d.path().join("pkg-a");
         write_file(
@@ -902,7 +905,8 @@ name = "echo"
         write_file(&first, "README.md", b"# echo");
         write_file(&first, "AGENTS.md", b"# echo agents");
         write_file(&first, "app/echo/one.txt.wasm", route_component_wasm());
-        store.install_app_package_dir(&first).unwrap();
+        let (first_install, _, _) = store.install_app_package_dir(&first).unwrap();
+        let first_hash = first_install.hash;
 
         let second = d.path().join("pkg-b");
         write_file(
@@ -916,8 +920,12 @@ name = "echo"
         write_file(&second, "AGENTS.md", b"# echo agents");
         write_file(&second, "app/echo/two.txt.wasm", route_component_wasm());
 
-        let err = store.install_app_package_dir(&second).unwrap_err();
-        assert!(err.to_string().contains("already installed"));
+        let (replacement, meta, index) = store.install_app_package_dir(&second).unwrap();
+        assert_ne!(replacement.hash, first_hash);
+        assert_eq!(meta.local_app.as_ref().unwrap().name, "echo");
+        assert_eq!(index.routes[0].pattern, "two.txt");
+        assert!(!store.contains_package(&first_hash));
+        assert!(store.contains_package(&replacement.hash));
     }
 
     #[test]

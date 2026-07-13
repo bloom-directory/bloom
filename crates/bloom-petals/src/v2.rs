@@ -406,6 +406,7 @@ impl PreparedAppPackage {
         validate_sign_policy(&allowed_caps, &allowed_sign_intents)?;
         let store_policy = store_policy_from_manifest(&manifest);
         validate_store_policy(&allowed_caps, &store_policy)?;
+        validate_net_policy(&allowed_caps, &manifest.net)?;
         let route_files = route_records_from_files(&files, &app_root)?;
         if route_files.is_empty() {
             return Err(PetalError::InvalidWasm(format!(
@@ -463,7 +464,7 @@ impl PreparedAppPackage {
                     )));
                 }
                 let artifact_validation = validate_composed_route_artifact_wasm(
-                    &artifact_path,
+                    &source_path,
                     &artifact_bytes,
                     &allowed_caps,
                     &allowed_sign_intents,
@@ -1014,7 +1015,15 @@ fn route_artifact_bytes_from_files(
         }
         expected
     } else {
-        file_bytes(files, source_path)?.to_vec()
+        let source = file_bytes(files, source_path)?;
+        if let Some(artifact) = generated_artifact
+            && artifact != source
+        {
+            return Err(PetalError::InvalidWasm(format!(
+                "v2 package artifact {route_id} does not match its route source"
+            )));
+        }
+        source.to_vec()
     };
     Ok(generated_artifact
         .map(|artifact| artifact.to_vec())
@@ -3386,6 +3395,30 @@ fn validate_store_policy(
     Ok(())
 }
 
+fn validate_net_policy(
+    allowed_caps: &BTreeSet<String>,
+    policy: &NetPolicyToml,
+) -> Result<(), PetalError> {
+    if allowed_caps.contains("bloom:http") && policy.allow.is_empty() {
+        return Err(PetalError::InvalidWasm(
+            "v2 package cap bloom:http requires at least one [[net.allow]] rule".into(),
+        ));
+    }
+    for rule in &policy.allow {
+        if rule.host.trim().is_empty() || rule.methods.is_empty() {
+            return Err(PetalError::InvalidWasm(
+                "v2 [[net.allow]] rules require a host and at least one method".into(),
+            ));
+        }
+        if rule.methods.iter().any(|method| method.trim().is_empty()) {
+            return Err(PetalError::InvalidWasm(
+                "v2 [[net.allow]] methods must be non-empty".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn validate_store_namespace(namespace: &str) -> Result<(), PetalError> {
     if namespace.is_empty() || namespace.len() > 128 {
         return Err(PetalError::InvalidWasm(
@@ -3532,9 +3565,40 @@ fn validate_route_conflicts(routes: &[RouteRecord]) -> Result<(), PetalError> {
                     a.pattern, b.pattern
                 )));
             }
+            if file_route_shadows_descendant(a, b)? || file_route_shadows_descendant(b, a)? {
+                return Err(PetalError::InvalidWasm(format!(
+                    "file route shadows descendant v2 route: {:?} and {:?}",
+                    a.pattern, b.pattern
+                )));
+            }
         }
     }
     Ok(())
+}
+
+fn file_route_shadows_descendant(
+    candidate: &RouteRecord,
+    descendant: &RouteRecord,
+) -> Result<bool, PetalError> {
+    if candidate
+        .source_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        == Some("$index.wasm")
+    {
+        return Ok(false);
+    }
+    let candidate_segments = candidate.pattern.split('/').collect::<Vec<_>>();
+    let descendant_segments = descendant.pattern.split('/').collect::<Vec<_>>();
+    if candidate_segments.len() >= descendant_segments.len() {
+        return Ok(false);
+    }
+    for (candidate, descendant) in candidate_segments.into_iter().zip(descendant_segments) {
+        if !segments_overlap(candidate, descendant)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn normalize_request_path(path: &str) -> Option<&str> {
@@ -3657,7 +3721,14 @@ pub(crate) mod route_fixtures {
         metadata_caps: &[&str],
         package_import: Option<&str>,
     ) -> Vec<u8> {
-        build_dynamic_dir_route_component(import_store, vfs, metadata_caps, package_import, false)
+        build_dynamic_dir_route_component(
+            import_store,
+            vfs,
+            metadata_caps,
+            package_import,
+            false,
+            true,
+        )
     }
 
     pub(crate) fn dynamic_side_effecting_dir_route_component(
@@ -3666,7 +3737,18 @@ pub(crate) mod route_fixtures {
         metadata_caps: &[&str],
         package_import: Option<&str>,
     ) -> Vec<u8> {
-        build_dynamic_dir_route_component(import_store, vfs, metadata_caps, package_import, true)
+        build_dynamic_dir_route_component(
+            import_store,
+            vfs,
+            metadata_caps,
+            package_import,
+            true,
+            true,
+        )
+    }
+
+    pub(crate) fn dynamic_dir_route_component_without_list() -> Vec<u8> {
+        build_dynamic_dir_route_component(false, FixtureVfsImport::None, &[], None, false, false)
     }
 
     fn build_dynamic_dir_route_component(
@@ -3675,6 +3757,7 @@ pub(crate) mod route_fixtures {
         metadata_caps: &[&str],
         package_import: Option<&str>,
         side_effecting_read: bool,
+        include_list: bool,
     ) -> Vec<u8> {
         // String table for the metadata cap names and the lookup entry name.
         let mut strings = Vec::new();
@@ -3762,6 +3845,31 @@ pub(crate) mod route_fixtures {
         let package_import = package_import
             .map(|name| format!("  (import {name:?} (instance))\n"))
             .unwrap_or_default();
+        let core_list_func = if include_list {
+            r#"(func $list (param i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32) (result i32)
+      i32.const 1280)"#
+        } else {
+            ""
+        };
+        let core_list_export = if include_list {
+            r#"(export "list" (func $list))"#
+        } else {
+            ""
+        };
+        let core_list_alias = if include_list {
+            r#"(alias core export $main-instance "list" (core func $core-list))"#
+        } else {
+            ""
+        };
+        let component_list_export = if include_list {
+            r#"(type $entry-list (list $entry-import))
+  (type $list-result (result $entry-list (error $route-error-import)))
+  (type $list-fn (func (param "ctx" $ctx-import) (result $list-result)))
+  (func $list (type $list-fn) (canon lift (core func $core-list) (memory $mem) (realloc $realloc) string-encoding=utf8))
+  (export "list" (func $list))"#
+        } else {
+            ""
+        };
 
         let wat = format!(
             r#"(component
@@ -3819,8 +3927,7 @@ pub(crate) mod route_fixtures {
       i32.const {META_RESULT})
     (func $lookup (param i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32) (result i32)
       i32.const {LOOKUP_RESULT})
-    (func $list (param i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32) (result i32)
-      i32.const {LIST_RESULT})
+    {core_list_func}
     (func $read (param i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32) (result i32)
       i32.const {READ_RESULT})
     (func $write (param i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32) (result i32)
@@ -3829,7 +3936,7 @@ pub(crate) mod route_fixtures {
     (export "cabi_realloc" (func $realloc))
     (export "metadata" (func $metadata))
     (export "lookup" (func $lookup))
-    (export "list" (func $list))
+    {core_list_export}
     (export "read" (func $read))
     (export "write" (func $write))
     {strings_data}
@@ -3845,7 +3952,7 @@ pub(crate) mod route_fixtures {
   (alias core export $main-instance "cabi_realloc" (core func $realloc))
   (alias core export $main-instance "metadata" (core func $core-metadata))
   (alias core export $main-instance "lookup" (core func $core-lookup))
-  (alias core export $main-instance "list" (core func $core-list))
+  {core_list_alias}
   (alias core export $main-instance "read" (core func $core-read))
   (alias core export $main-instance "write" (core func $core-write))
   (type $meta-result (result $route-meta-import (error $route-error-import)))
@@ -3856,11 +3963,7 @@ pub(crate) mod route_fixtures {
   (type $lookup-fn (func (param "ctx" $ctx-import) (result $lookup-result)))
   (func $lookup (type $lookup-fn) (canon lift (core func $core-lookup) (memory $mem) (realloc $realloc) string-encoding=utf8))
   (export "lookup" (func $lookup))
-  (type $entry-list (list $entry-import))
-  (type $list-result (result $entry-list (error $route-error-import)))
-  (type $list-fn (func (param "ctx" $ctx-import) (result $list-result)))
-  (func $list (type $list-fn) (canon lift (core func $core-list) (memory $mem) (realloc $realloc) string-encoding=utf8))
-  (export "list" (func $list))
+  {component_list_export}
   (type $bytes (list u8))
   (type $read-result (result $bytes (error $route-error-import)))
   (type $read-fn (func (param "ctx" $ctx-import) (result $read-result)))
@@ -3943,6 +4046,23 @@ name = "echo"
 
         let err = PetalAppPackage::scan_dir(tmp.path()).unwrap_err();
         assert!(err.to_string().contains("conflicting v2 routes"));
+    }
+
+    #[test]
+    fn v2_scanner_rejects_file_routes_that_shadow_descendants() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_package_file(tmp.path(), "petal.toml", br#"name = "echo""#);
+        write_package_file(tmp.path(), "README.md", b"# echo");
+        write_package_file(tmp.path(), "AGENTS.md", b"# echo agents");
+        write_package_file(tmp.path(), "app/echo/foo.wasm", b"\0asm");
+        write_package_file(tmp.path(), "app/echo/foo/bar.wasm", b"\0asm");
+
+        let err = PetalAppPackage::scan_dir(tmp.path()).unwrap_err();
+        assert!(err.to_string().contains("file route shadows descendant"));
+
+        std::fs::remove_file(tmp.path().join("app/echo/foo.wasm")).unwrap();
+        write_package_file(tmp.path(), "app/echo/foo/$index.wasm", b"\0asm");
+        PetalAppPackage::scan_dir(tmp.path()).unwrap();
     }
 
     #[test]
@@ -4336,6 +4456,63 @@ component = "modules/message.wasm"
         assert!(
             err.to_string()
                 .contains("does not match route sidecar composition")
+        );
+    }
+
+    #[test]
+    fn v2_route_without_sidecar_rejects_stale_generated_artifact() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_v2_package(tmp.path());
+        write_package_file(
+            tmp.path(),
+            "artifacts/routes/r000001.wasm",
+            route_component_metadata(),
+        );
+
+        let err = PreparedAppPackage::from_dir(tmp.path()).unwrap_err();
+        assert!(err.to_string().contains("does not match its route source"));
+    }
+
+    #[test]
+    fn v2_sidecar_artifact_is_validated_as_an_index_route() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_package_file(
+            tmp.path(),
+            "petal.toml",
+            br#"schema = "bloom.petal.local-app.v2"
+name = "echo"
+"#,
+        );
+        write_package_file(tmp.path(), "README.md", b"# echo");
+        write_package_file(tmp.path(), "AGENTS.md", b"# echo agents");
+        write_package_file(
+            tmp.path(),
+            "app/echo/$index.wasm",
+            &route_fixtures::dynamic_dir_route_component(
+                false,
+                route_fixtures::FixtureVfsImport::None,
+                &[],
+                None,
+            ),
+        );
+        write_package_file(
+            tmp.path(),
+            "app/echo/$index.route.toml",
+            br#"abi = "component"
+component = "modules/index.wasm"
+"#,
+        );
+        write_package_file(
+            tmp.path(),
+            "modules/index.wasm",
+            &route_fixtures::dynamic_dir_route_component_without_list(),
+        );
+
+        let err = PreparedAppPackage::from_dir(tmp.path()).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("missing bloom:route@0.1.0 \"list\" export"),
+            "{err}"
         );
     }
 
@@ -5106,6 +5283,10 @@ imports = ["components/helper.wasm"]
 name = "echo"
 [caps]
 allowed = ["bloom:http"]
+
+[[net.allow]]
+host = "api.example.com"
+methods = ["get"]
 "#,
             wasm,
         );
@@ -5114,6 +5295,41 @@ allowed = ["bloom:http"]
             package.route_index.routes[0].install_metadata.required_caps,
             vec!["bloom:http".to_string()]
         );
+    }
+
+    #[test]
+    fn v2_http_cap_requires_a_usable_network_allow_rule() {
+        let missing = tempfile::tempdir().unwrap();
+        write_v2_package_with_manifest_and_route(
+            missing.path(),
+            br#"schema = "bloom.petal.local-app.v2"
+name = "echo"
+[caps]
+allowed = ["bloom:http"]
+"#,
+            route_component_http(),
+        );
+        let err = PreparedAppPackage::from_dir(missing.path()).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("requires at least one [[net.allow]]")
+        );
+
+        let empty_methods = tempfile::tempdir().unwrap();
+        write_v2_package_with_manifest_and_route(
+            empty_methods.path(),
+            br#"schema = "bloom.petal.local-app.v2"
+name = "echo"
+[caps]
+allowed = ["bloom:http"]
+
+[[net.allow]]
+host = "api.example.com"
+"#,
+            route_component_http(),
+        );
+        let err = PreparedAppPackage::from_dir(empty_methods.path()).unwrap_err();
+        assert!(err.to_string().contains("host and at least one method"));
     }
 
     #[test]
@@ -5134,6 +5350,10 @@ allowed = ["bloom:http"]
 name = "echo"
 [caps]
 allowed = ["bloom:http"]
+
+[[net.allow]]
+host = "api.example.com"
+methods = ["get"]
 "#,
             &route_component(&["metadata", "read"], &["bloom:http/fetch@999.0.0"]),
         );
@@ -5191,6 +5411,10 @@ allowed = ["bloom:http"]
 name = "echo"
 [caps]
 allowed = ["bloom:http"]
+
+[[net.allow]]
+host = "api.example.com"
+methods = ["get"]
 "#,
             &route_component_with_func_import("bloom:http/fetch@0.1.0"),
         );
@@ -5208,6 +5432,10 @@ allowed = ["bloom:http"]
 name = "echo"
 [caps]
 allowed = ["bloom:http"]
+
+[[net.allow]]
+host = "api.example.com"
+methods = ["get"]
 "#,
             &route_component(&["metadata", "read"], &["bloom:http/fetch@0.1.0"]),
         );

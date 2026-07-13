@@ -237,7 +237,6 @@ impl DaemonPetalHost {
     ) -> Result<bloom_proto::plan::ExecutionOrigin, HostError> {
         if context.app_root.trim().is_empty()
             || context.route_id.trim().is_empty()
-            || context.path.trim().is_empty()
             || !bloom_petals::store::is_valid_hex_hash(&context.package_hash)
             || !matches!(context.op.as_str(), "lookup" | "list" | "read" | "write")
         {
@@ -245,15 +244,8 @@ impl DaemonPetalHost {
                 "trusted v2 route context is incomplete or has an invalid package hash".into(),
             ));
         }
-        let route_binding = blake3::hash(
-            format!("{}\0{}\0{}", context.route_id, context.op, context.path).as_bytes(),
-        );
         Ok(bloom_proto::plan::ExecutionOrigin {
-            petal_id: format!(
-                "{LOCAL_APP_PETAL_ID_PREFIX}{}:route:{}",
-                context.app_root,
-                route_binding.to_hex()
-            ),
+            petal_id: format!("{LOCAL_APP_PETAL_ID_PREFIX}{}", context.app_root),
             petal_digest: context.package_hash.clone(),
             petal_version: "v2-package".into(),
         })
@@ -272,7 +264,6 @@ impl DaemonPetalHost {
         }
         if context.app_root.trim().is_empty()
             || context.route_id.trim().is_empty()
-            || context.path.trim().is_empty()
             || !bloom_petals::store::is_valid_hex_hash(&context.package_hash)
         {
             return Err(HostError::Invalid(
@@ -1577,6 +1568,7 @@ pub struct Daemon {
     pub signer_cache: Arc<bloom_keystore::petal_host::SignerCache>,
     pub vfs: Vfs,
     pub petals: PetalRunner,
+    petal_async_writes: Arc<std::sync::atomic::AtomicBool>,
     pub watch_registry: Arc<WatchRegistry>,
     pub watch_executor: Arc<WatchExecutor>,
     /// Shutdown handles for spawned mempool subscription tasks. Dropping
@@ -1990,6 +1982,7 @@ impl Daemon {
         );
         let petal_vm = PetalVm::new().map_err(|e| DaemonError::Audit(format!("petals vm: {e}")))?;
         let petals = PetalRunner::new(petal_store.clone(), petal_registry.clone(), petal_vm);
+        let petal_async_writes = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let petal_vfs_host = Arc::new(LateVfsHost::new());
         let petal_app_host = Arc::new(
             DaemonPetalHost::new(
@@ -2012,6 +2005,7 @@ impl Daemon {
                 "apps",
                 Arc::new(
                     PetalRouter::new(petals.clone(), petal_app_host)
+                        .with_async_write_switch(petal_async_writes.clone())
                         .with_runtime_apps(config.petals.apps.clone()),
                 ) as _,
             )
@@ -2582,6 +2576,7 @@ impl Daemon {
             signer_cache,
             vfs,
             petals,
+            petal_async_writes,
             watch_registry,
             watch_executor,
             mempool_shutdown: Arc::new(parking_lot::Mutex::new(mempool_shutdown)),
@@ -2598,6 +2593,13 @@ impl Daemon {
         if let Err(e) = self.watch_executor.start() {
             warn!(error = %e, "watch.executor.start_failed");
         }
+    }
+
+    /// Enable detached Petal writes for a long-running daemon. One-shot
+    /// in-process callers leave this disabled so writes finish before exit.
+    pub fn enable_petal_async_writes(&self) {
+        self.petal_async_writes
+            .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Stop background workers cleanly. Signals all spawned mempool
@@ -2862,7 +2864,10 @@ mod tests {
         assert_eq!(action.petal_id(), "local-app:portfolio");
         assert_eq!(action.petal_digest(), "a".repeat(64));
         assert_eq!(action.daemon_terms.max_signatures, 1);
-        assert_eq!(action.daemon_terms.allowed_sign_intents, vec![req.purpose]);
+        assert_eq!(
+            action.daemon_terms.allowed_sign_intents,
+            vec![req.purpose.clone()]
+        );
         assert!(
             action
                 .daemon_terms
@@ -2884,6 +2889,10 @@ mod tests {
                 .and_then(|value| value.as_str()),
             Some(expected_hash.as_str())
         );
+
+        let mut root_context = req.context.clone().unwrap();
+        root_context.path.clear();
+        host.local_app_action(&req, &root_context, 1).unwrap();
     }
 
     #[test]
@@ -2952,7 +2961,7 @@ mod tests {
             actor: Some("agent-1".into()),
         };
         let origin = DaemonPetalHost::local_app_execution_origin(&context).unwrap();
-        assert!(origin.petal_id.starts_with("local-app:polymarket:route:"));
+        assert_eq!(origin.petal_id, "local-app:polymarket");
         assert_eq!(origin.petal_digest, "a".repeat(64));
         assert_eq!(origin.petal_version, "v2-package");
 
@@ -2964,12 +2973,19 @@ mod tests {
                 "path" => changed.path = "/fund/alice/two/confirm".into(),
                 _ => unreachable!(),
             }
-            assert_ne!(
+            assert_eq!(
                 DaemonPetalHost::local_app_execution_origin(&changed).unwrap(),
                 origin,
-                "{mutate} must change EVM execution origin"
+                "{mutate} must remain within the package-scoped EVM execution origin"
             );
         }
+
+        let mut root = context.clone();
+        root.path.clear();
+        assert_eq!(
+            DaemonPetalHost::local_app_execution_origin(&root).unwrap(),
+            origin
+        );
 
         let mut invalid = context;
         invalid.package_hash = "not-a-digest".into();
@@ -3171,12 +3187,23 @@ mod tests {
 
         let mut other_route = context.clone();
         other_route.path = "/fund/alice/two/confirm".into();
+        host.evm_tx_inspect(
+            "alice".into(),
+            "anvil".into(),
+            staged.id.clone(),
+            Some(other_route),
+        )
+        .await
+        .unwrap();
+
+        let mut other_app = context.clone();
+        other_app.app_root = "other".into();
         let denied = host
             .evm_tx_inspect(
                 "alice".into(),
                 "anvil".into(),
                 staged.id.clone(),
-                Some(other_route),
+                Some(other_app),
             )
             .await
             .unwrap_err();

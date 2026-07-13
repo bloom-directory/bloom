@@ -2505,6 +2505,7 @@ async fn run(cli: Cli) -> Result<()> {
         Cmd::Serve { endpoint, mount } => {
             eprintln!("{ALPHA_DISCLOSURE}");
             let (_home_permit, d) = build_write_daemon(home)?;
+            d.enable_petal_async_writes();
             // Spawn the outbox expiry sweeper for the lifetime of the
             // serve command (fix #3). The handle is dropped (and the task
             // signalled to stop) right before the function returns.

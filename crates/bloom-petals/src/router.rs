@@ -6,6 +6,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -24,6 +25,7 @@ pub struct PetalRouter {
     runner: PetalRunner,
     host: Arc<dyn PetalHost>,
     runtime_apps: BTreeMap<String, PetalAppRuntimeConfig>,
+    async_writes: Arc<AtomicBool>,
 }
 
 impl PetalRouter {
@@ -32,7 +34,13 @@ impl PetalRouter {
             runner,
             host,
             runtime_apps: BTreeMap::new(),
+            async_writes: Arc::new(AtomicBool::new(true)),
         }
+    }
+
+    pub fn with_async_write_switch(mut self, enabled: Arc<AtomicBool>) -> Self {
+        self.async_writes = enabled;
+        self
     }
 
     pub fn with_runtime_apps(
@@ -70,6 +78,10 @@ impl PetalRouter {
 
     fn is_v2_app(&self, mount: &str) -> bool {
         self.runner.resolve_app_mount(mount).is_ok()
+    }
+
+    fn async_writes_enabled(&self) -> bool {
+        self.async_writes.load(Ordering::Relaxed)
     }
 
     async fn dispatch_v2(
@@ -178,7 +190,7 @@ impl Handler for PetalRouter {
             )
             .await
             .map_err(map_petal_err)?;
-        if runtime_metadata.write_async {
+        if runtime_metadata.write_async && self.async_writes_enabled() {
             let runner = self.runner.clone();
             let host = self.host.clone();
             let mount = mount.to_string();
@@ -573,5 +585,16 @@ namespaces = ["wallets"]
             .await
             .unwrap();
         assert_eq!(bytes, b"component");
+    }
+
+    #[test]
+    fn async_write_switch_can_keep_one_shot_dispatch_in_process() {
+        let (_dir, runner) = runner();
+        let enabled = Arc::new(AtomicBool::new(false));
+        let router =
+            PetalRouter::new(runner, Arc::new(DenyHost)).with_async_write_switch(enabled.clone());
+        assert!(!router.async_writes_enabled());
+        enabled.store(true, Ordering::Relaxed);
+        assert!(router.async_writes_enabled());
     }
 }
