@@ -23,7 +23,22 @@ use crate::handler::{Entry, EntryKind, Handler, HandlerError};
 use crate::path::VfsPath;
 
 const AGENT_GUIDANCE: &[u8] = include_bytes!("docs/agent-guidance.md");
+const MOUNTED_AGENT_GUIDANCE: &[u8] = include_bytes!("docs/agent-guidance-mounted.md");
 const AGENT_GUIDANCE_FILES: [&str; 2] = ["AGENTS.md", "CLAUDE.md"];
+
+/// Rendered root/docs guidance for callers that know they are serving the VFS as
+/// a mounted filesystem. Mounted agent docs should teach ordinary relative file
+/// operations, not fallback `bloom vfs` CLI commands.
+pub fn mounted_agent_guidance() -> &'static [u8] {
+    MOUNTED_AGENT_GUIDANCE
+}
+
+/// Paths whose contents are agent-facing operating guidance and should be
+/// rewritten by mount transports to the mounted variant.
+pub fn is_agent_guidance_path(path: &VfsPath) -> bool {
+    root_agent_guidance_entry(path).is_some()
+        || matches!(path.segments(), [head, file] if head == "docs" && file == "agent-guidance.md")
+}
 
 /// Audit `kind` discriminants. Keep these in sync with `docs/AUDIT.md`.
 const AUDIT_KIND_WRITE: &str = "vfs.write";

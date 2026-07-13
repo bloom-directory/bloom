@@ -31,4 +31,4 @@ pub use cache::PathCache;
 pub use handler::{Entry, EntryKind, Handler, HandlerError};
 pub use paginate::{PAGE_SIZE, Projection, page_indices, page_name, page_slice, parse_page_name};
 pub use path::{PercentDecodeError, VfsPath, percent_decode_segment};
-pub use router::Vfs;
+pub use router::{Vfs, is_agent_guidance_path, mounted_agent_guidance};
