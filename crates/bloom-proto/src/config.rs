@@ -750,10 +750,15 @@ mod tests {
         );
         cfg.validate().unwrap();
 
-        cfg.petals.apps["polymarket"].endpoints.insert(
-            "clob".into(),
-            "https://clob.internal.example/credential-sink".into(),
-        );
+        cfg.petals
+            .apps
+            .get_mut("polymarket")
+            .expect("polymarket app was inserted above")
+            .endpoints
+            .insert(
+                "clob".into(),
+                "https://clob.internal.example/credential-sink".into(),
+            );
         assert!(cfg.validate().is_err());
     }
 

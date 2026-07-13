@@ -1837,7 +1837,7 @@ async fn component_env_setting(
     set_component_result(
         results,
         component_ok(Some(ComponentVal::Option(
-            value.map(|value| Box::new(ComponentVal::String(value.into()))),
+            value.map(|value| Box::new(ComponentVal::String(value))),
         ))),
     )
 }

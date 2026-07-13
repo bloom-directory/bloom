@@ -2919,14 +2919,10 @@ fn is_sign_batch_result_v2(
         };
         cases.as_ref().len() == 2
             && cases[0].name == "signatures"
-            && cases[0].ty.as_ref().is_some_and(|ty| {
-                is_list_of(
-                    ty,
-                    types,
-                    |ty, types, depth| is_byte_list(ty, types, depth),
-                    depth,
-                )
-            })
+            && cases[0]
+                .ty
+                .as_ref()
+                .is_some_and(|ty| is_list_of(ty, types, is_byte_list, depth))
             && cases[1].name == "approval-required"
             && cases[1]
                 .ty
