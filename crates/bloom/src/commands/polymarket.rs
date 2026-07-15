@@ -18,7 +18,7 @@ use alloy::rpc::types::eth::TransactionRequest;
 use anyhow::{Context, Result, bail, ensure};
 use bloom_auth_api::PolymarketSealedActionKind;
 use bloom_daemon::Daemon;
-use bloom_polymarket::eip712::{CTF, CTF_EXCHANGE_V2, NEG_RISK_EXCHANGE_V2};
+use bloom_polymarket::eip712::{CTF, CTF_EXCHANGE, NEG_RISK_EXCHANGE};
 use bloom_polymarket::order::{self, OrderParams, OrderType};
 use bloom_polymarket::order_store::{
     DraftStatus, OrderDraft, OrderReceipt, OrderStore, render_plan_md,
@@ -146,7 +146,7 @@ fn evaluate_policy(
 
 /// The funder/maker context an order is placed under. Loaded from durable
 /// onboarding state — orders are refused outright when the account is not in
-/// a tradeable mode (the V2 CLOB rejects EOA makers at POST time).
+/// a tradeable mode (the CLOB rejects EOA makers at POST time).
 struct TradeFunder {
     /// Deposit wallet address (maker + struct signer for sigtype 3).
     funder: alloy::primitives::Address,
@@ -209,7 +209,7 @@ pub async fn place(d: &Daemon, args: PlaceArgs) -> Result<()> {
         .context("no [polymarket] block in config.toml")?;
     if pm_cfg.legacy_eoa_mode {
         bail!(
-            "[polymarket].legacy_eoa_mode is no longer supported for V2 trading. \
+            "[polymarket].legacy_eoa_mode is no longer supported for trading. \
              Remove that setting and re-run `bloom polymarket onboard {}` to use \
              deposit-wallet mode.",
             args.wallet
@@ -930,9 +930,9 @@ async fn verify_sell_preflight(
     verify_holdings(d, chain_id, &deposit_wallet, token_id, size_micro).await?;
 
     let operator = if neg_risk {
-        NEG_RISK_EXCHANGE_V2
+        NEG_RISK_EXCHANGE
     } else {
-        CTF_EXCHANGE_V2
+        CTF_EXCHANGE
     };
     let chain = d
         .chains
@@ -1202,7 +1202,7 @@ pub async fn onboard(d: &Daemon, args: OnboardArgs) -> Result<()> {
     }
     if pm_cfg.legacy_eoa_mode {
         bail!(
-            "[polymarket].legacy_eoa_mode is no longer supported for V2 trading. \
+            "[polymarket].legacy_eoa_mode is no longer supported for trading. \
              Remove that setting and re-run `bloom polymarket onboard {}` to use \
              deposit-wallet mode.",
             args.wallet
@@ -1213,7 +1213,7 @@ pub async fn onboard(d: &Daemon, args: OnboardArgs) -> Result<()> {
 
     // Disclose what onboarding will authorize BEFORE the ceremony.
     println!("onboarding '{}' (owner {})", args.wallet, info.address);
-    println!("mode: deposit wallet (signatureType 3) — the V2 trading path");
+    println!("mode: deposit wallet (signatureType 3) — the trading path");
     if pm_cfg.relayer_api_key.is_none() && pm_cfg.builder_key_mode == "auto" {
         println!(
             "relayer auth: bloom will create a Polymarket builder API key from this \
@@ -1225,7 +1225,7 @@ pub async fn onboard(d: &Daemon, args: OnboardArgs) -> Result<()> {
         );
     }
     println!(
-        "approvals: the V2 exchange approvals are granted from the deposit wallet \
+        "approvals: the exchange approvals are granted from the deposit wallet \
          (one\nsigned relayer batch) unless on-chain reads show them already in place."
     );
 
@@ -1250,7 +1250,7 @@ pub async fn onboard(d: &Daemon, args: OnboardArgs) -> Result<()> {
     .risk("HIGHER RISK: one approval, several signatures across the run.");
     intent = intent
         .summary("  • deploy your deposit wallet (gasless relayer)".to_string())
-        .summary("  • grant the 8 V2 exchange approvals from the deposit wallet".to_string());
+        .summary("  • grant the 8 exchange approvals from the deposit wallet".to_string());
     if args.target_pusd.is_some() {
         intent = intent
             .summary("  • fund pUSD up to the requested target (separate review)".to_string());
@@ -3118,7 +3118,7 @@ pub async fn withdraw_pusd(
 
 /// `bloom polymarket revoke-approvals`: withdraw the spending authority the
 /// onboarding approval batch granted — pUSD `approve(0)` + CTF
-/// `setApprovalForAll(false)` to the four V2 contracts, via one gasless relayer
+/// `setApprovalForAll(false)` to the four contracts, via one gasless relayer
 /// batch from the deposit wallet. The inverse of onboarding's approve stage.
 pub async fn revoke_approvals(
     d: &Daemon,
@@ -3153,14 +3153,14 @@ pub async fn revoke_approvals(
         .context("corrupt deposit_wallet in onboarding state")?;
     let funder_s = bloom_proto::checksum_address(&deposit_wallet);
 
-    // The four V2 spenders/operators, in the v2_approval_calls order.
+    // The four spenders/operators, in the approval_calls order.
     let spenders = [
-        CTF_EXCHANGE_V2,
-        NEG_RISK_EXCHANGE_V2,
+        CTF_EXCHANGE,
+        NEG_RISK_EXCHANGE,
         CTF_COLLATERAL_ADAPTER,
         NEG_RISK_CTF_COLLATERAL_ADAPTER,
     ];
-    let calls = bloom_polymarket::wallet::v2_revoke_calls();
+    let calls = bloom_polymarket::wallet::revoke_calls();
 
     let relayer = relayer_for_polymarket(d, wallet, pm_cfg)?;
     let order_store = OrderStore::new(d.home.polymarket_dir());
@@ -3171,9 +3171,7 @@ pub async fn revoke_approvals(
     println!("owner: {}", bloom_proto::checksum_address(&info.address));
     println!("deposit wallet: {funder_s}");
     println!("revoking (gasless relayer batch from the deposit wallet):");
-    println!(
-        "  pUSD approve(0)               -> CTF Exchange V2, Neg-Risk Exchange V2, + 2 adapters"
-    );
+    println!("  pUSD approve(0)               -> CTF Exchange, Neg-Risk Exchange, + 2 adapters");
     println!("  CTF  setApprovalForAll(false) -> the same four contracts");
     println!(
         "signing exactly the deposit-wallet batch above (passkey ceremony follows if locked)."
@@ -3190,7 +3188,7 @@ pub async fn revoke_approvals(
     )
     .with_address(bloom_proto::checksum_address(&info.address))
     .summary(format!("Deposit wallet: {funder_s}"))
-    .summary("pUSD approve(0) to the 2 V2 exchanges + 2 collateral adapters".to_string())
+    .summary("pUSD approve(0) to the 2 exchanges + 2 collateral adapters".to_string())
     .summary("CTF setApprovalForAll(false) to the same four contracts".to_string())
     .risk("After this, trading needs re-onboarding to restore approvals.")
     .subject(serde_json::json!({
@@ -3270,7 +3268,7 @@ pub async fn revoke_approvals(
     }
     println!(
         "revoked: deposit wallet {funder_s} has zero pUSD allowance and no CTF operator \
-         approval for the four V2 contracts. Re-run `bloom polymarket onboard {wallet}` to \
+         approval for the four contracts. Re-run `bloom polymarket onboard {wallet}` to \
          trade again."
     );
     Ok(())

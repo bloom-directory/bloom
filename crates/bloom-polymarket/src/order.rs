@@ -1,12 +1,12 @@
-//! Polymarket V2 order building, signing, and wire encoding (EOA path,
+//! Polymarket order building, signing, and wire encoding (EOA path,
 //! signatureType 0).
 //!
 //! Every byte-exact convention here is copied from the official
-//! `Polymarket/rs-clob-client-v2` SDK (`src/clob/order_builder.rs`,
+//! `the Polymarket Rust SDK SDK (`src/clob/order_builder.rs`,
 //! `src/clob/types/mod.rs`, `src/clob/client.rs`), which is the reference for
 //! what the live CLOB accepts:
 //!
-//! - The signed struct is the **V2** `Order` (no `taker`/`expiration`/`nonce`/
+//! - The signed struct is the `Order` (no `taker`/`expiration`/`nonce`/
 //!   `feeRateBps`; adds `timestamp` in **milliseconds**, `metadata`, `builder`).
 //!   The Solidity type name must be exactly `Order` — it is hashed into the
 //!   on-chain EIP-712 typehash.
@@ -30,7 +30,7 @@ use alloy::primitives::{Address, B256, U256};
 use alloy::sol_types::SolStruct;
 use serde::{Deserialize, Serialize};
 
-use crate::eip712::{CTF_EXCHANGE_V2, NEG_RISK_EXCHANGE_V2};
+use crate::eip712::{CTF_EXCHANGE, NEG_RISK_EXCHANGE};
 use crate::signer::{KeystoreSigner, OnboardSigner};
 use crate::types::Side;
 use crate::{PolymarketError, Result};
@@ -39,7 +39,7 @@ use crate::{PolymarketError, Result};
 // clashing with anything else; the typehash depends on that exact name.
 mod sol_defs {
     alloy::sol! {
-        /// Polymarket CTF Exchange **V2** order struct.
+        /// Polymarket CTF Exchange order struct.
         #[derive(Debug, PartialEq)]
         struct Order {
             uint256 salt;
@@ -111,7 +111,7 @@ impl std::str::FromStr for OrderType {
     }
 }
 
-/// EIP-712 domain for the V2 exchanges. Name and version are identical for the
+/// EIP-712 domain for the exchanges. Name and version are identical for the
 /// normal and neg-risk exchanges; only the verifying contract differs.
 pub fn ctf_exchange_domain(chain_id: u64, neg_risk: bool) -> Eip712Domain {
     Eip712Domain {
@@ -119,9 +119,9 @@ pub fn ctf_exchange_domain(chain_id: u64, neg_risk: bool) -> Eip712Domain {
         version: Some(Cow::Borrowed("2")),
         chain_id: Some(U256::from(chain_id)),
         verifying_contract: Some(if neg_risk {
-            NEG_RISK_EXCHANGE_V2
+            NEG_RISK_EXCHANGE
         } else {
-            CTF_EXCHANGE_V2
+            CTF_EXCHANGE
         }),
         ..Eip712Domain::default()
     }
@@ -243,7 +243,7 @@ fn validate_price(price_micro: u64, tick_micro: u64) -> Result<()> {
 
 // ── order quantities ──────────────────────────────────────────────────────────
 
-/// Integer quantities for one V2 limit order. All micro-units (6 dp).
+/// Integer quantities for one limit order. All micro-units (6 dp).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LimitQuote {
     pub side: Side,
@@ -368,11 +368,11 @@ impl LimitQuote {
 
 // ── building and signing ─────────────────────────────────────────────────────
 
-/// Signature type the CLOB accepts for V2 deposit-wallet orders: POLY_1271
+/// Signature type the CLOB accepts for deposit-wallet orders: POLY_1271
 /// (signatureType 3, the only path Bloom trades).
 pub const SIG_TYPE_POLY_1271: u8 = 3;
 
-/// Everything needed to build a signable V2 order.
+/// Everything needed to build a signable order.
 ///
 /// For signatureType 3 (POLY_1271): `maker` = the **deposit wallet** — both
 /// the struct's `maker` and `signer` fields carry it; the owner EOA only
@@ -392,7 +392,7 @@ pub struct OrderParams {
     pub signature_type: u8,
 }
 
-/// Build a V2 order: random JS-safe salt, millisecond timestamp.
+/// Build an order: random JS-safe salt, millisecond timestamp.
 pub fn build_order(p: &OrderParams) -> Order {
     let salt = rand::random::<u64>() & JS_SAFE_INTEGER_MAX;
     let timestamp_ms = std::time::SystemTime::now()
@@ -414,7 +414,7 @@ pub fn build_order(p: &OrderParams) -> Order {
     }
 }
 
-/// EIP-712 signing hash for `order` against the V2 exchange domain.
+/// EIP-712 signing hash for `order` against the exchange domain.
 pub fn signing_hash(order: &Order, chain_id: u64, neg_risk: bool) -> B256 {
     order.eip712_signing_hash(&ctf_exchange_domain(chain_id, neg_risk))
 }
@@ -436,7 +436,7 @@ pub fn order_type_string() -> &'static str {
 // ── POLY_1271 (deposit wallet, signatureType 3) ──────────────────────────────
 
 /// ERC-7739 `TypedDataSign` type string, verbatim from the official SDK
-/// (`rs-clob-client-v2 src/clob/client.rs`). The nested `Order` text must be
+/// (the Polymarket Rust SDK src/clob/client.rs`). The nested `Order` text must be
 /// byte-identical to our struct's root type — asserted in tests.
 const SOLADY_TYPE_STRING: &str = concat!(
     "TypedDataSign(Order contents,string name,string version,uint256 chainId,",
@@ -455,7 +455,7 @@ const DEPOSIT_WALLET_VERSION: &str = "1";
 
 /// The ERC-7739 digest the owner EOA signs for a deposit-wallet order:
 /// `keccak(0x1901 ‖ APP_DOMAIN_SEPARATOR ‖ TypedDataSign struct hash)` where
-/// the app domain is the CTF Exchange V2 domain and the nested fields carry
+/// the app domain is the CTF Exchange domain and the nested fields carry
 /// the DepositWallet domain with `verifyingContract = order.signer` (the
 /// deposit wallet) and zero salt. Verbatim port of the SDK's
 /// `sign_poly1271_order`.
@@ -781,17 +781,17 @@ mod tests {
         assert_eq!(d.version.as_deref(), Some("2"));
     }
 
-    /// Known-answer test for V2 order signing.
+    /// Known-answer test for order signing.
     ///
     /// Provenance: struct layout, domain (name "Polymarket CTF Exchange",
     /// version "2"), and exchange addresses are verbatim from the official
-    /// `Polymarket/rs-clob-client-v2` SDK source. The expected hashes and
+    /// `the Polymarket Rust SDK SDK source. The expected hashes and
     /// signatures were generated with an independent EIP-712 implementation
     /// (python `eth_account` 0.13.7) over the same typed data, using anvil
     /// account 0 — the key the SDK's own auth vectors use. ECDSA here is
     /// RFC 6979 deterministic, so signature bytes must match exactly.
     #[tokio::test]
-    async fn known_answer_v2_order_signing() {
+    async fn known_answer_order_signing() {
         use alloy::primitives::{b256, keccak256};
         use alloy::signers::local::PrivateKeySigner;
         use std::str::FromStr;
@@ -804,7 +804,7 @@ mod tests {
         assert_eq!(
             Order::eip712_root_type().to_string(),
             TYPE_PREIMAGE,
-            "sol! struct drifted from the official V2 Order type"
+            "sol! struct drifted from the official Order type"
         );
         assert_eq!(
             keccak256(TYPE_PREIMAGE.as_bytes()),
@@ -834,7 +834,7 @@ mod tests {
             builder: B256::ZERO,
         };
 
-        // Normal CTF Exchange V2 domain.
+        // Normal CTF Exchange domain.
         let hash = signing_hash(&order, crate::POLYGON, false);
         assert_eq!(
             hash,
@@ -871,7 +871,7 @@ mod tests {
     ///
     /// Provenance: TypedDataSign/Order type strings, DepositWallet domain
     /// fields, and the wrapped-signature layout are verbatim from
-    /// `rs-clob-client-v2 src/clob/client.rs::sign_poly1271_order`. Expected
+    /// the Polymarket Rust SDK src/clob/client.rs::sign_poly1271_order`. Expected
     /// digests and full wrapped signatures were generated with an independent
     /// implementation (python eth_account/eth_abi/eth_utils), anvil key 0 as
     /// the owner, deposit wallet = the eip712 derivation regression vector.

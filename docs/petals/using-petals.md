@@ -1,7 +1,7 @@
 # Using Petals
 
 This guide is for people and agents operating a Bloom installation. A Petal
-adds an application tree at `/apps/<name>/`; interact with that tree in the
+adds an application tree at `/petals/<name>/`; interact with that tree in the
 mounted filesystem or through the equivalent `bloom vfs` commands.
 
 ## Install
@@ -56,19 +56,19 @@ bloom petals ls
 
 The output includes a short content hash and the app mount. If the Bloom daemon
 is mounted at `/Volumes/bloom`, for example, a Petal named `polymarket` appears
-at `/Volumes/bloom/apps/polymarket/`:
+at `/Volumes/bloom/petals/polymarket/`:
 
 ```sh
-ls /Volumes/bloom/apps/polymarket
-cat /Volumes/bloom/apps/polymarket/status.json
+ls /Volumes/bloom/petals/polymarket
+cat /Volumes/bloom/petals/polymarket/status.json
 ```
 
 When a filesystem mount is unavailable, use the VFS fallback:
 
 ```sh
-bloom vfs ls /apps/polymarket
-bloom vfs cat /apps/polymarket/status.json
-bloom vfs write /apps/polymarket/PATH --data 'DOCUMENTED_BODY'
+bloom vfs ls /petals/polymarket
+bloom vfs cat /petals/polymarket/status.json
+bloom vfs write /petals/polymarket/PATH --data 'DOCUMENTED_BODY'
 ```
 
 The exact paths, accepted write bodies, and staged-confirm workflows belong to
@@ -114,7 +114,7 @@ available to the other routes in the same package. A daemon restart deliberately
 forgets in-memory approval grants and may require the user to approve again.
 
 Petals with `bloom:vfs.read` or `bloom:vfs.write` currently receive broad VFS
-authority rather than manifest-declared path prefixes. The `/apps` subtree is
+authority rather than manifest-declared path prefixes. The `/petals` subtree is
 blocked from Petal VFS host access to prevent recursive Petal calls. Install a
 Petal only when its declared capability set is appropriate for the package.
 

@@ -367,7 +367,7 @@ async fn mint_owner_session_test_grant(
 ) -> Result<()> {
     let expires_ms = now_ms.saturating_add(120_000);
     let header = CanonicalIntentHeader {
-        schema: bloom_auth_api::CANONICAL_INTENT_HEADER_SCHEMA_V2.into(),
+        schema: bloom_auth_api::CANONICAL_INTENT_HEADER_SCHEMA_V1.into(),
         wallet: wallet.into(),
         surface: "policy-session".into(),
         action_id: session_id.into(),

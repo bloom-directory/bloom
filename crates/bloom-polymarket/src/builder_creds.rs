@@ -196,8 +196,8 @@ mod tests {
             serde_json::from_str(r#"{"apiKey":"u-1","secret":"s","passphrase":"p"}"#).unwrap();
         assert_eq!(v.key, "u-1");
         // and the stored form round-trips through the rename
-        let v2: BuilderCredentials =
+        let second: BuilderCredentials =
             serde_json::from_slice(&serde_json::to_vec(&v).unwrap()).unwrap();
-        assert_eq!(v2.key, "u-1");
+        assert_eq!(second.key, "u-1");
     }
 }

@@ -1338,7 +1338,7 @@ fn wallet_policy_canonical_envelope(
     .map_err(|e| HandlerError::backend(e.to_string()))?;
     Ok(CanonicalEnvelope::new(
         CanonicalIntentHeader {
-            schema: bloom_auth_api::CANONICAL_INTENT_HEADER_SCHEMA_V2.into(),
+            schema: bloom_auth_api::CANONICAL_INTENT_HEADER_SCHEMA_V1.into(),
             wallet: wallet.to_string(),
             surface: WALLET_POLICY_SURFACE.into(),
             action_id: action_id.to_string(),
@@ -1540,7 +1540,7 @@ fn evm_owner_session_canonical_envelope(
     .map_err(|e| HandlerError::backend(e.to_string()))?;
     Ok(CanonicalEnvelope::new(
         CanonicalIntentHeader {
-            schema: bloom_auth_api::CANONICAL_INTENT_HEADER_SCHEMA_V2.into(),
+            schema: bloom_auth_api::CANONICAL_INTENT_HEADER_SCHEMA_V1.into(),
             wallet: wallet.to_string(),
             surface: "policy-session".into(),
             action_id: action_id.to_string(),
@@ -1579,7 +1579,7 @@ fn policy_session_canonical_envelope(
     .map_err(|e| HandlerError::backend(e.to_string()))?;
     Ok(CanonicalEnvelope::new(
         CanonicalIntentHeader {
-            schema: bloom_auth_api::CANONICAL_INTENT_HEADER_SCHEMA_V2.into(),
+            schema: bloom_auth_api::CANONICAL_INTENT_HEADER_SCHEMA_V1.into(),
             wallet: wallet.to_string(),
             surface: "policy-session".into(),
             action_id: action_id.to_string(),
@@ -3756,9 +3756,9 @@ mod tests {
         // Revoke clears it.
         let revoke_p = VfsPath::parse(&format!("/alice/policy-session/{id}/revoke")).unwrap();
         f.handler.write(&revoke_p, b"y").await.unwrap();
-        let v2: serde_json::Value =
+        let second_response: serde_json::Value =
             serde_json::from_slice(&f.handler.read(&active_p).await.unwrap()).unwrap();
-        assert!(v2["sessions"].as_array().unwrap().is_empty());
+        assert!(second_response["sessions"].as_array().unwrap().is_empty());
 
         // A degenerate descriptor (no chains/ids) is rejected.
         let bad = br#"{"chains":[],"max_usd":10,"ttl_secs":600,"pending_ids":[]}"#;

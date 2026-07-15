@@ -29,19 +29,19 @@ use serde::{Deserialize, Serialize};
 use crate::clob::ClobClient;
 use crate::creds::CredentialStore;
 use crate::eip712::{
-    CTF, CTF_COLLATERAL_ADAPTER, CTF_EXCHANGE_V2, NEG_RISK_CTF_COLLATERAL_ADAPTER,
-    NEG_RISK_EXCHANGE_V2, PUSD, derive_deposit_wallet_address,
+    CTF, CTF_COLLATERAL_ADAPTER, CTF_EXCHANGE, NEG_RISK_CTF_COLLATERAL_ADAPTER, NEG_RISK_EXCHANGE,
+    PUSD, derive_deposit_wallet_address,
 };
 use crate::relayer::RelayerClient;
 use crate::signer::OnboardSigner;
-use crate::wallet::v2_approval_calls;
+use crate::wallet::approval_calls;
 use crate::{PolymarketError, Result};
 
-/// The four V2 spenders/operators the approval batch grants (order matters —
-/// it mirrors `v2_approval_calls`).
-const V2_SPENDERS: [Address; 4] = [
-    CTF_EXCHANGE_V2,
-    NEG_RISK_EXCHANGE_V2,
+/// The four spenders/operators the approval batch grants (order matters —
+/// it mirrors `approval_calls`).
+const SPENDERS: [Address; 4] = [
+    CTF_EXCHANGE,
+    NEG_RISK_EXCHANGE,
     CTF_COLLATERAL_ADAPTER,
     NEG_RISK_CTF_COLLATERAL_ADAPTER,
 ];
@@ -555,9 +555,9 @@ impl Onboarder {
     /// `approvals.json`. Pure; no network, no signature.
     pub fn approval_preview(&self, owner: Address) -> serde_json::Value {
         let deposit = derive_deposit_wallet_address(&owner, self.chain_id);
-        let calls: Vec<serde_json::Value> = v2_approval_calls()
+        let calls: Vec<serde_json::Value> = approval_calls()
             .iter()
-            .zip(crate::wallet::V2_APPROVAL_LABELS)
+            .zip(crate::wallet::APPROVAL_LABELS)
             .map(|(c, label)| {
                 serde_json::json!({
                     "label": label,
@@ -722,7 +722,7 @@ impl Onboarder {
             on_event(OnboardEvent::StageDone(Stage::Fund));
         }
 
-        // ── approve: grant the V2 exchanges/adapters spending rights *from the
+        // ── approve: grant the exchanges/adapters spending rights *from the
         // deposit wallet* via one gasless relayer batch (an EOA approve() does
         // nothing for it).
         if !self.approvals_in_place(deposit).await? {
@@ -731,7 +731,7 @@ impl Onboarder {
             let nonce = relayer.wallet_nonce(owner).await?;
             let deadline = now_secs() + BATCH_DEADLINE_SECS;
             let tx = match relayer
-                .submit_wallet_batch(owner, deposit, v2_approval_calls(), nonce, deadline, signer)
+                .submit_wallet_batch(owner, deposit, approval_calls(), nonce, deadline, signer)
                 .await
             {
                 Ok(tx) => tx,
@@ -744,7 +744,7 @@ impl Onboarder {
                             .submit_wallet_batch(
                                 owner,
                                 deposit,
-                                v2_approval_calls(),
+                                approval_calls(),
                                 nonce,
                                 deadline,
                                 signer,
@@ -813,15 +813,15 @@ impl Onboarder {
         Ok(())
     }
 
-    /// Whether all eight V2 grants are live on-chain.
+    /// Whether all eight onboarding grants are live on-chain.
     async fn approvals_in_place(&self, deposit: Address) -> Result<bool> {
         let floor = allowance_floor();
-        for spender in V2_SPENDERS {
+        for spender in SPENDERS {
             if self.chain.erc20_allowance(PUSD, deposit, spender).await? < floor {
                 return Ok(false);
             }
         }
-        for operator in V2_SPENDERS {
+        for operator in SPENDERS {
             if !self
                 .chain
                 .is_approved_for_all(CTF, deposit, operator)
@@ -879,7 +879,7 @@ mod tests {
             self.balances.lock().unwrap().insert((token, holder), v);
         }
         fn approve_all(&self, deposit: Address) {
-            for s in V2_SPENDERS {
+            for s in SPENDERS {
                 self.allowances
                     .lock()
                     .unwrap()
@@ -1282,7 +1282,7 @@ mod tests {
         let v = onboarder.approval_preview(owner);
         let calls = v["calls"].as_array().unwrap();
         assert_eq!(calls.len(), 8);
-        let expected = v2_approval_calls();
+        let expected = approval_calls();
         for (rendered, call) in calls.iter().zip(&expected) {
             assert_eq!(
                 rendered["target"].as_str().unwrap().to_lowercase(),

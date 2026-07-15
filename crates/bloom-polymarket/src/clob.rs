@@ -46,7 +46,7 @@ impl ClobClient {
     // ── public market data ──────────────────────────────────────────────────
 
     /// `GET /version` — which order version the CLOB accepts (1 or 2). Bloom
-    /// only builds V2 orders; callers must refuse to trade on version != 2.
+    /// only builds orders; callers must refuse to trade on version != 2.
     pub async fn server_version(&self) -> Result<u32> {
         let url = self.base_url.join("/version")?;
         let v: serde_json::Value = self.get_public(url).await?;

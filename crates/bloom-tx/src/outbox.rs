@@ -1694,15 +1694,15 @@ mod tests {
     }
 
     #[test]
-    fn projection_uses_persisted_local_app_execution_origin() {
+    fn projection_uses_persisted_petal_execution_origin() {
         let dir = tempfile::tempdir().unwrap();
         let mock = Arc::new(MockProjection::new());
         let ob = Outbox::new_with_projection(dir.path(), mock.clone()).unwrap();
-        let mut staged = fake_staged("0001-local-app");
+        let mut staged = fake_staged("0001-petal");
         staged.execution_origin = Some(bloom_proto::plan::ExecutionOrigin {
-            petal_id: "local-app:polymarket".into(),
+            petal_id: "petal:polymarket".into(),
             petal_digest: "a".repeat(64),
-            petal_version: "v2-package".into(),
+            petal_version: "v1-package".into(),
         });
 
         ob.write_pending(&staged, "# plan").unwrap();
@@ -1710,7 +1710,7 @@ mod tests {
         assert_eq!(
             mock.staged.lock().unwrap().as_slice(),
             [format!(
-                "act-0000:local-app:polymarket:{}:v2-package",
+                "act-0000:petal:polymarket:{}:v1-package",
                 "a".repeat(64)
             )]
         );

@@ -546,7 +546,7 @@ pub fn render_plan_md(d: &OrderDraft) -> String {
         if d.signature_type == 3 {
             " — deposit wallet; owner EOA signs the wrapped POLY_1271 authorization"
         } else {
-            " — legacy EOA (the V2 CLOB rejects EOA makers at POST)"
+            " — legacy EOA (the CLOB rejects EOA makers at POST)"
         },
     ));
     s.push_str(&format!("Market:    {} ({})\n", d.question, d.slug));

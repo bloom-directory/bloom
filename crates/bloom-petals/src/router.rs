@@ -1,8 +1,8 @@
-//! VFS router for v2 local petal app packages.
+//! VFS router for installed Petal packages.
 //!
-//! The daemon mounts this handler at `apps/`. The first path segment selects
-//! an installed v2 app package; the remaining path is passed to the matched
-//! app route artifact.
+//! The daemon mounts this handler at `petals/`. The first path segment selects
+//! an installed Petal package; the remaining path is passed to the matched
+//! Petal route artifact.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -10,7 +10,7 @@ use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use bloom_proto::config::PetalAppRuntimeConfig;
+use bloom_proto::config::PetalRuntimeConfig;
 use bloom_vfs::handler::{Entry, EntryKind, Handler, HandlerError};
 use bloom_vfs::path::VfsPath;
 
@@ -24,7 +24,7 @@ use crate::vm::{COMPONENT_NOT_A_DIR_CODE, COMPONENT_UNSUPPORTED_CODE, RunOptions
 pub struct PetalRouter {
     runner: PetalRunner,
     host: Arc<dyn PetalHost>,
-    runtime_apps: BTreeMap<String, PetalAppRuntimeConfig>,
+    runtime_petals: BTreeMap<String, PetalRuntimeConfig>,
 }
 
 impl PetalRouter {
@@ -32,7 +32,7 @@ impl PetalRouter {
         Self {
             runner,
             host,
-            runtime_apps: BTreeMap::new(),
+            runtime_petals: BTreeMap::new(),
         }
     }
 
@@ -42,11 +42,11 @@ impl PetalRouter {
         self
     }
 
-    pub fn with_runtime_apps(
+    pub fn with_runtime_petals(
         mut self,
-        runtime_apps: BTreeMap<String, PetalAppRuntimeConfig>,
+        runtime_petals: BTreeMap<String, PetalRuntimeConfig>,
     ) -> Result<Self, PetalError> {
-        for (mount, app) in &runtime_apps {
+        for (mount, app) in &runtime_petals {
             if app.endpoints.is_empty() {
                 continue;
             }
@@ -58,12 +58,12 @@ impl PetalRouter {
                 Err(err) => return Err(err),
             }
         }
-        self.runtime_apps = runtime_apps;
+        self.runtime_petals = runtime_petals;
         Ok(self)
     }
 
     fn run_options(&self, mount: &str) -> RunOptions {
-        let Some(app) = self.runtime_apps.get(mount) else {
+        let Some(app) = self.runtime_petals.get(mount) else {
             return RunOptions::default();
         };
         let mut runtime_settings = app.values.clone();
@@ -87,11 +87,11 @@ impl PetalRouter {
         Ok((mount, rest))
     }
 
-    fn is_v2_app(&self, mount: &str) -> bool {
-        self.runner.resolve_app_mount(mount).is_ok()
+    fn is_petal(&self, mount: &str) -> bool {
+        self.runner.resolve_petal_mount(mount).is_ok()
     }
 
-    async fn dispatch_v2(
+    async fn dispatch_petal(
         &self,
         mount: &str,
         op: DispatchOp,
@@ -100,7 +100,7 @@ impl PetalRouter {
     ) -> Result<DispatchResponse, HandlerError> {
         let out = self
             .runner
-            .dispatch_app_route(
+            .dispatch_petal_route(
                 mount,
                 DispatchRequest {
                     op,
@@ -124,18 +124,18 @@ impl Handler for PetalRouter {
         match path.segments() {
             [] => Ok(Entry::dir("")),
             [mount] => {
-                if !self.is_v2_app(mount) {
+                if !self.is_petal(mount) {
                     return Err(HandlerError::NotFound(path.to_string_path()));
                 }
                 Ok(Entry::dir(mount))
             }
             _ => {
                 let (mount, rest) = Self::mount_path(path)?;
-                if !self.is_v2_app(mount) {
+                if !self.is_petal(mount) {
                     return Err(HandlerError::NotFound(path.to_string_path()));
                 }
                 match self
-                    .dispatch_v2(mount, DispatchOp::Lookup, rest.clone(), Vec::new())
+                    .dispatch_petal(mount, DispatchOp::Lookup, rest.clone(), Vec::new())
                     .await
                 {
                     Ok(DispatchResponse::Lookup(entry)) => entry_to_vfs(entry),
@@ -146,7 +146,7 @@ impl Handler for PetalRouter {
                     Err(HandlerError::NotFound(_))
                         if self
                             .runner
-                            .local_app_has_descendant(mount, &rest)
+                            .petal_has_descendant(mount, &rest)
                             .map_err(map_petal_err)? =>
                     {
                         let name = path
@@ -164,11 +164,11 @@ impl Handler for PetalRouter {
 
     async fn read(&self, path: &VfsPath) -> Result<Vec<u8>, HandlerError> {
         let (mount, rest) = Self::mount_path(path)?;
-        if !self.is_v2_app(mount) {
+        if !self.is_petal(mount) {
             return Err(HandlerError::NotFound(path.to_string_path()));
         }
         match self
-            .dispatch_v2(mount, DispatchOp::Read, rest, Vec::new())
+            .dispatch_petal(mount, DispatchOp::Read, rest, Vec::new())
             .await?
         {
             DispatchResponse::Read(bytes) => Ok(bytes),
@@ -184,11 +184,11 @@ impl Handler for PetalRouter {
         if rest.is_empty() {
             return Err(HandlerError::PermissionDenied);
         }
-        if !self.is_v2_app(mount) {
+        if !self.is_petal(mount) {
             return Err(HandlerError::NotFound(path.to_string_path()));
         }
         match self
-            .dispatch_v2(mount, DispatchOp::Write, rest, data.to_vec())
+            .dispatch_petal(mount, DispatchOp::Write, rest, data.to_vec())
             .await?
         {
             DispatchResponse::Write => Ok(()),
@@ -203,14 +203,14 @@ impl Handler for PetalRouter {
         match path.segments() {
             [] => {
                 let mut mounts = BTreeMap::new();
-                for (mount, _hash) in self.runner.local_app_mounts().map_err(map_petal_err)? {
+                for (mount, _hash) in self.runner.local_petal_mounts().map_err(map_petal_err)? {
                     mounts.insert(mount, ());
                 }
                 Ok(mounts.into_keys().map(|mount| Entry::dir(&mount)).collect())
             }
-            [mount] if self.is_v2_app(mount) => {
+            [mount] if self.is_petal(mount) => {
                 match self
-                    .dispatch_v2(mount, DispatchOp::List, String::new(), Vec::new())
+                    .dispatch_petal(mount, DispatchOp::List, String::new(), Vec::new())
                     .await
                 {
                     Ok(DispatchResponse::List(entries)) => {
@@ -222,7 +222,7 @@ impl Handler for PetalRouter {
                     Ok(other) => Err(unexpected_response("list", other)),
                     Err(HandlerError::NotFound(_)) => self
                         .runner
-                        .local_app_static_list(mount, "")
+                        .petal_static_list(mount, "")
                         .map_err(map_petal_err)?
                         .into_iter()
                         .map(entry_to_vfs)
@@ -233,9 +233,9 @@ impl Handler for PetalRouter {
             [mount] => Err(HandlerError::NotFound(mount.to_string())),
             _ => {
                 let (mount, rest) = Self::mount_path(path)?;
-                if self.is_v2_app(mount) {
+                if self.is_petal(mount) {
                     return match self
-                        .dispatch_v2(mount, DispatchOp::List, rest.clone(), Vec::new())
+                        .dispatch_petal(mount, DispatchOp::List, rest.clone(), Vec::new())
                         .await
                     {
                         Ok(DispatchResponse::List(entries)) => {
@@ -247,7 +247,7 @@ impl Handler for PetalRouter {
                         Ok(other) => Err(unexpected_response("list", other)),
                         Err(HandlerError::NotFound(_)) => self
                             .runner
-                            .local_app_static_list(mount, &rest)
+                            .petal_static_list(mount, &rest)
                             .map_err(map_petal_err)?
                             .into_iter()
                             .map(entry_to_vfs)
@@ -262,11 +262,11 @@ impl Handler for PetalRouter {
 
     fn cache_ttl(&self, path: &VfsPath) -> Option<Duration> {
         if let Ok((mount, rest)) = Self::mount_path(path)
-            && self.is_v2_app(mount)
+            && self.is_petal(mount)
         {
             return self
                 .runner
-                .local_app_route_effective_metadata(mount, DispatchOp::Read, &rest)
+                .petal_route_effective_metadata(mount, DispatchOp::Read, &rest)
                 .ok()
                 .filter(|(_, metadata)| !metadata.side_effecting_read)
                 .and_then(|(_, metadata)| metadata.cache_ttl_ms)
@@ -277,11 +277,11 @@ impl Handler for PetalRouter {
 
     fn is_read_side_effecting(&self, path: &VfsPath) -> bool {
         if let Ok((mount, rest)) = Self::mount_path(path)
-            && self.is_v2_app(mount)
+            && self.is_petal(mount)
         {
             return self
                 .runner
-                .local_app_route_effective_metadata(mount, DispatchOp::Read, &rest)
+                .petal_route_effective_metadata(mount, DispatchOp::Read, &rest)
                 .ok()
                 .map(|(_, metadata)| metadata.side_effecting_read)
                 .unwrap_or(false);
@@ -434,7 +434,7 @@ mod tests {
         write_package_file(
             root,
             "petal.toml",
-            br#"schema = "bloom.petal.local-app.v2"
+            br#"schema = "bloom.petal.package.v1"
 name = "demo"
 "#,
         );
@@ -442,7 +442,7 @@ name = "demo"
         write_package_file(root, "AGENTS.md", b"# demo agents");
         write_package_file(
             root,
-            "app/demo/hello.txt.wasm",
+            "petal/demo/hello.txt.wasm",
             include_bytes!("../tests/fixtures/route_component_no_imports.wasm"),
         );
     }
@@ -451,7 +451,7 @@ name = "demo"
         write_package_file(
             root,
             "petal.toml",
-            br#"schema = "bloom.petal.local-app.v2"
+            br#"schema = "bloom.petal.package.v1"
 name = "example"
 
 [caps]
@@ -464,28 +464,28 @@ namespaces = ["wallets"]
         write_package_file(root, "README.md", b"# example");
         write_package_file(root, "AGENTS.md", b"# example agents");
         let route = if side_effecting_read {
-            crate::v2::route_fixtures::dynamic_side_effecting_dir_route_component(
+            crate::package::route_fixtures::dynamic_side_effecting_dir_route_component(
                 true,
-                crate::v2::route_fixtures::FixtureVfsImport::ReadOnly,
+                crate::package::route_fixtures::FixtureVfsImport::ReadOnly,
                 &["bloom:store", "bloom:vfs.read"],
                 None,
             )
         } else {
-            crate::v2::route_fixtures::dynamic_dir_route_component(
+            crate::package::route_fixtures::dynamic_dir_route_component(
                 true,
-                crate::v2::route_fixtures::FixtureVfsImport::ReadOnly,
+                crate::package::route_fixtures::FixtureVfsImport::ReadOnly,
                 &["bloom:store", "bloom:vfs.read"],
                 None,
             )
         };
-        write_package_file(root, "app/example/[wallet]/$index.wasm", &route);
+        write_package_file(root, "petal/example/[wallet]/$index.wasm", &route);
     }
 
     fn write_async_failing_package(root: &std::path::Path) {
         write_package_file(
             root,
             "petal.toml",
-            br#"schema = "bloom.petal.local-app.v2"
+            br#"schema = "bloom.petal.package.v1"
 name = "example"
 "#,
         );
@@ -493,8 +493,8 @@ name = "example"
         write_package_file(root, "AGENTS.md", b"# example agents");
         write_package_file(
             root,
-            "app/example/[wallet].txt.wasm",
-            &crate::v2::route_fixtures::async_failing_write_route_component(),
+            "petal/example/[wallet].txt.wasm",
+            &crate::package::route_fixtures::async_failing_write_route_component(),
         );
     }
 
@@ -503,18 +503,18 @@ name = "example"
         let (dir, runner) = runner();
         let package = dir.path().join("example-app");
         write_dynamic_dir_package(&package, false);
-        runner.store().install_app_package_dir(&package).unwrap();
+        runner.store().install_petal_package_dir(&package).unwrap();
 
         let router = PetalRouter::new(runner, Arc::new(DenyHost));
         let route_path = VfsPath::parse("/example/alice").unwrap();
         assert!(router.is_read_side_effecting(&route_path));
         assert_eq!(router.cache_ttl(&route_path), None);
         let vfs = Vfs::builder()
-            .mount("apps", Arc::new(router.clone()))
+            .mount("petals", Arc::new(router.clone()))
             .build();
 
         let entry = vfs
-            .lookup(&VfsPath::parse("/apps/example/alice").unwrap())
+            .lookup(&VfsPath::parse("/petals/example/alice").unwrap())
             .await
             .unwrap();
         assert_eq!(entry.name, "alice");
@@ -523,7 +523,10 @@ name = "example"
         // The size comes from the component's lookup handler, proving the
         // dynamic route dispatched instead of falling back to a static
         // route-index directory entry.
-        assert_eq!(entry.size, crate::v2::route_fixtures::LOOKUP_ENTRY_SIZE);
+        assert_eq!(
+            entry.size,
+            crate::package::route_fixtures::LOOKUP_ENTRY_SIZE
+        );
         assert!(!router.is_read_side_effecting(&route_path));
         assert_eq!(router.cache_ttl(&route_path), Some(Duration::from_secs(30)));
     }
@@ -533,16 +536,16 @@ name = "example"
         let (dir, runner) = runner();
         let package = dir.path().join("example-app");
         write_dynamic_dir_package(&package, true);
-        runner.store().install_app_package_dir(&package).unwrap();
+        runner.store().install_petal_package_dir(&package).unwrap();
 
         let router = PetalRouter::new(runner, Arc::new(DenyHost));
         let route_path = VfsPath::parse("/example/alice").unwrap();
         assert!(router.is_read_side_effecting(&route_path));
         let vfs = Vfs::builder()
-            .mount("apps", Arc::new(router.clone()))
+            .mount("petals", Arc::new(router.clone()))
             .build();
 
-        vfs.lookup(&VfsPath::parse("/apps/example/alice").unwrap())
+        vfs.lookup(&VfsPath::parse("/petals/example/alice").unwrap())
             .await
             .unwrap();
 
@@ -551,26 +554,26 @@ name = "example"
     }
 
     #[tokio::test]
-    async fn mounted_apps_vfs_dispatches_installed_v2_routes() {
+    async fn mounted_petals_vfs_dispatches_installed_petal_routes() {
         let (dir, runner) = runner();
         let package = dir.path().join("demo-app");
         write_demo_package(&package);
-        runner.store().install_app_package_dir(&package).unwrap();
+        runner.store().install_petal_package_dir(&package).unwrap();
 
         let router = PetalRouter::new(runner, Arc::new(DenyHost));
-        let vfs = Vfs::builder().mount("apps", Arc::new(router)).build();
+        let vfs = Vfs::builder().mount("petals", Arc::new(router)).build();
 
-        let apps = vfs.list(&VfsPath::parse("/apps").unwrap()).await.unwrap();
+        let apps = vfs.list(&VfsPath::parse("/petals").unwrap()).await.unwrap();
         assert!(apps.iter().any(|entry| entry.name == "demo"));
 
         let app_entries = vfs
-            .list(&VfsPath::parse("/apps/demo").unwrap())
+            .list(&VfsPath::parse("/petals/demo").unwrap())
             .await
             .unwrap();
         assert!(app_entries.iter().any(|entry| entry.name == "hello.txt"));
 
         let bytes = vfs
-            .read(&VfsPath::parse("/apps/demo/hello.txt").unwrap())
+            .read(&VfsPath::parse("/petals/demo/hello.txt").unwrap())
             .await
             .unwrap();
         assert_eq!(bytes, b"component");
@@ -581,11 +584,11 @@ name = "example"
         let (dir, runner) = runner();
         let package = dir.path().join("demo-app");
         write_demo_package(&package);
-        runner.store().install_app_package_dir(&package).unwrap();
+        runner.store().install_petal_package_dir(&package).unwrap();
 
-        let runtime_apps = BTreeMap::from([(
+        let runtime_petals = BTreeMap::from([(
             "demo".to_string(),
-            PetalAppRuntimeConfig {
+            PetalRuntimeConfig {
                 endpoints: BTreeMap::from([(
                     "clob".to_string(),
                     "https://clob.internal.example".to_string(),
@@ -593,7 +596,8 @@ name = "example"
                 values: BTreeMap::new(),
             },
         )]);
-        let err = match PetalRouter::new(runner, Arc::new(DenyHost)).with_runtime_apps(runtime_apps)
+        let err = match PetalRouter::new(runner, Arc::new(DenyHost))
+            .with_runtime_petals(runtime_petals)
         {
             Ok(_) => panic!("undeclared endpoint override unexpectedly accepted"),
             Err(err) => err,
@@ -610,17 +614,17 @@ name = "example"
         let (dir, runner) = runner();
         let package = dir.path().join("example-app");
         write_async_failing_package(&package);
-        runner.store().install_app_package_dir(&package).unwrap();
+        runner.store().install_petal_package_dir(&package).unwrap();
 
         // A true switch used to detach this write and return Ok immediately.
         // The compatibility method is now deliberately a no-op.
         let router = PetalRouter::new(runner, Arc::new(DenyHost))
             .with_async_write_switch(Arc::new(AtomicBool::new(true)));
-        let vfs = Vfs::builder().mount("apps", Arc::new(router)).build();
+        let vfs = Vfs::builder().mount("petals", Arc::new(router)).build();
 
         let error = vfs
             .write(
-                &VfsPath::parse("/apps/example/alice.txt").unwrap(),
+                &VfsPath::parse("/petals/example/alice.txt").unwrap(),
                 b"payload",
             )
             .await

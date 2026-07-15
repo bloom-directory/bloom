@@ -1,4 +1,4 @@
-//! Polymarket v2 client for bloom (hand-roll path).
+//! Polymarket client for bloom (hand-roll path).
 //!
 //! Pure library crate — no VFS coupling, no `bloom-keystore` dependency. It
 //! provides:
@@ -12,17 +12,17 @@
 //! - the deterministic deposit-wallet address derivation ([`eip712`]);
 //! - **onboarding**: the idempotent, resumable state machine ([`Onboarder`]:
 //!   deploy → fund → approve → creds → sync) over the hand-rolled relayer
-//!   client ([`RelayerClient`]), the V2 approval-call builders ([`wallet`]),
+//!   client ([`RelayerClient`]), the onboarding approval-call builders ([`wallet`]),
 //!   and the 0600 CLOB credential store ([`CredentialStore`]);
 //!
-//! - **orders** ([`order`]): V2 EIP-712 order building/signing for the
+//! - **orders** ([`order`]): EIP-712 order building/signing for the
 //!   deposit-wallet path (signatureType 3 / POLY_1271) with integer micro-unit
 //!   amount math, verified by known-answer tests against independent EIP-712
 //!   implementations and official SDK source shapes.
 //!
 //! The private key never leaves the supplied signer; no code path serializes
 //! it. The reference for every byte-exact signing detail is the official
-//! `Polymarket/rs-clob-client-v2` SDK (we hand-roll to avoid pulling its
+//! official Polymarket Rust SDK (we hand-roll to avoid pulling its
 //! `alloy 1.6` major alongside bloom's `alloy 2`).
 
 #![forbid(unsafe_code)]

@@ -18,14 +18,14 @@ use parking_lot::{Mutex, RwLock};
 use crate::error::PetalError;
 use crate::host::{DenyHost, HostError, HostVfsEntry, HostVfsEntryKind, PetalHost};
 use crate::meta::Capability;
+use crate::package::{
+    InstallRouteMetadata, RouteAbi, RouteEntryKind, RouteIndex, RouteIndexRecord, RouteOp,
+    narrow_runtime_route_metadata, sign_intents_from_manifest_toml,
+    store_policy_from_manifest_toml,
+};
 use crate::policy::NetPolicy;
 use crate::registry::NameRegistry;
 use crate::store::PetalStore;
-use crate::v2::{
-    InstallRouteMetadata, RouteAbi, RouteEntryKind, RouteIndex, RouteIndexRecord, RouteOp,
-    narrow_runtime_route_metadata, sign_intents_from_v2_manifest_toml,
-    store_policy_from_v2_manifest_toml,
-};
 use crate::vm::{DispatchOutput, PetalVm, RunOptions};
 use crate::{DispatchOp, DispatchRequest};
 
@@ -93,7 +93,7 @@ impl PetalHost for VfsHost {
 }
 
 fn deny_apps_subtree(path: &VfsPath) -> Result<(), HostError> {
-    if path.first() == Some("apps") {
+    if path.first() == Some("petals") {
         return Err(HostError::Denied(
             "petals may not call other apps through vfs imports".into(),
         ));
@@ -103,7 +103,7 @@ fn deny_apps_subtree(path: &VfsPath) -> Result<(), HostError> {
 
 /// A VFS host whose router is set after the daemon finishes building the VFS.
 ///
-/// `apps/` needs a [`PetalHost`] while the VFS builder is still being wired,
+/// `petals/` needs a [`PetalHost`] while the VFS builder is still being wired,
 /// but the host itself should point at the final router. This tiny indirection
 /// avoids disabling `vfs.read`/`vfs.write` for app petals.
 #[derive(Default)]
@@ -191,7 +191,7 @@ pub struct PetalRunner {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LocalAppRouteMatch {
+pub struct PetalRouteMatch {
     pub hash: String,
     pub route: RouteIndexRecord,
     pub params: Vec<(String, String)>,
@@ -210,7 +210,7 @@ impl PetalRunner {
         }
     }
 
-    fn runtime_metadata_key(matched: &LocalAppRouteMatch, path: &str) -> RuntimeMetadataCacheKey {
+    fn runtime_metadata_key(matched: &PetalRouteMatch, path: &str) -> RuntimeMetadataCacheKey {
         RuntimeMetadataCacheKey {
             package_hash: matched.hash.clone(),
             route_id: matched.route.route_id.clone(),
@@ -224,13 +224,13 @@ impl PetalRunner {
     /// Once an async lookup or dispatch has evaluated their component
     /// metadata, this returns that validated narrowing. Cache misses remain
     /// fail-closed by returning the install-time metadata.
-    pub fn local_app_route_effective_metadata(
+    pub fn petal_route_effective_metadata(
         &self,
         mount: &str,
         op: DispatchOp,
         path: &str,
-    ) -> Result<(LocalAppRouteMatch, InstallRouteMetadata), PetalError> {
-        let matched = self.local_app_route(mount, op, path)?;
+    ) -> Result<(PetalRouteMatch, InstallRouteMetadata), PetalError> {
+        let matched = self.petal_route(mount, op, path)?;
         if matched.params.is_empty() {
             return Ok((matched.clone(), matched.route.install_metadata.clone()));
         }
@@ -255,7 +255,7 @@ impl PetalRunner {
     /// Remove an installed petal and any petname pointing at it. The
     /// target may be a full content hash, a unique hash prefix of at
     /// least [`crate::store::HASH_PREFIX_LEN`] chars (the length
-    /// `petal ls` prints), a local app name, or a petname. Returns
+    /// `petal ls` prints), a Petal name, or a petname. Returns
     /// true if anything was removed.
     pub fn uninstall(&self, target: &str) -> Result<bool, PetalError> {
         let Some(hash) = self.resolve_uninstall_hash(target)? else {
@@ -277,7 +277,7 @@ impl PetalRunner {
     /// Resolve an uninstall target to a full content hash. Hashes win
     /// (as in [`Self::resolve`]): a full 64-char hash is used as-is,
     /// then a hash prefix is tried against every installed hash, then
-    /// a local app name, then a petname. Returns `None` when nothing
+    /// a Petal name, then a petname. Returns `None` when nothing
     /// matches.
     fn resolve_uninstall_hash(&self, target: &str) -> Result<Option<String>, PetalError> {
         if crate::store::is_valid_hex_hash(target) {
@@ -291,7 +291,7 @@ impl PetalRunner {
             }
         }
         if let Some(hash) = self
-            .local_app_mounts()?
+            .local_petal_mounts()?
             .into_iter()
             .find_map(|(name, hash)| (name == target).then_some(hash))
         {
@@ -312,14 +312,14 @@ impl PetalRunner {
             .ok_or_else(|| PetalError::NotFound(name_or_hash.to_string()))
     }
 
-    pub fn local_app_mounts(&self) -> Result<Vec<(String, String)>, PetalError> {
-        self.store.list_app_owners()
+    pub fn local_petal_mounts(&self) -> Result<Vec<(String, String)>, PetalError> {
+        self.store.list_petal_owners()
     }
 
-    pub fn resolve_app_mount(&self, mount: &str) -> Result<String, PetalError> {
+    pub fn resolve_petal_mount(&self, mount: &str) -> Result<String, PetalError> {
         self.store
-            .resolve_app_owner(mount)?
-            .ok_or_else(|| PetalError::NotFound(format!("apps/{mount}")))
+            .resolve_petal_owner(mount)?
+            .ok_or_else(|| PetalError::NotFound(format!("petals/{mount}")))
     }
 
     /// Validate operator-configured endpoint origins against the bindings
@@ -330,25 +330,25 @@ impl PetalRunner {
         mount: &str,
         bindings: &BTreeMap<String, String>,
     ) -> Result<(), PetalError> {
-        let hash = self.resolve_app_mount(mount)?;
-        self.v2_net_policy(&hash)?
+        let hash = self.resolve_petal_mount(mount)?;
+        self.petal_net_policy(&hash)?
             .with_endpoint_bindings(bindings)?;
         Ok(())
     }
 
-    pub fn load_app_route_index(&self, mount: &str) -> Result<RouteIndex, PetalError> {
-        let hash = self.resolve_app_mount(mount)?;
+    pub fn load_petal_route_index(&self, mount: &str) -> Result<RouteIndex, PetalError> {
+        let hash = self.resolve_petal_mount(mount)?;
         self.store.load_route_index(&hash)
     }
 
-    pub fn local_app_route(
+    pub fn petal_route(
         &self,
         mount: &str,
         op: DispatchOp,
         path: &str,
-    ) -> Result<LocalAppRouteMatch, PetalError> {
+    ) -> Result<PetalRouteMatch, PetalError> {
         validate_runtime_route_path(path)?;
-        let hash = self.resolve_app_mount(mount)?;
+        let hash = self.resolve_petal_mount(mount)?;
         let index = self.store.load_route_index(&hash)?;
         let Some(matched) = match_index_for_op(&index, op, path) else {
             return Err(PetalError::NotFound(app_path(mount, path)));
@@ -356,56 +356,63 @@ impl PetalRunner {
         let required_op = route_op(op);
         if !matched.route.ops.contains(&required_op) {
             return Err(PetalError::ModeUnsupported(format!(
-                "v2 route {} does not support {required_op:?}",
+                "Petal route {} does not support {required_op:?}",
                 matched.route.route_id
             )));
         }
-        Ok(LocalAppRouteMatch {
+        Ok(PetalRouteMatch {
             hash,
             route: matched.route.clone(),
             params: matched.params,
         })
     }
 
-    pub async fn local_app_route_runtime_metadata(
+    pub async fn petal_route_runtime_metadata(
         &self,
         mount: &str,
         op: DispatchOp,
         path: &str,
         opts: RunOptions,
-    ) -> Result<(LocalAppRouteMatch, InstallRouteMetadata), PetalError> {
-        let matched = self.local_app_route(mount, op, path)?;
+    ) -> Result<(PetalRouteMatch, InstallRouteMetadata), PetalError> {
+        let matched = self.petal_route(mount, op, path)?;
         let wasm = self
             .store
             .read_route_artifact(&matched.hash, &matched.route.route_id)?;
-        let declared_sign_intents = self.v2_sign_intents(&matched.hash)?;
+        let declared_sign_intents = self.petal_sign_intents(&matched.hash)?;
         let metadata = self
-            .runtime_app_route_metadata(&matched, mount, path, &wasm, &declared_sign_intents, &opts)
+            .runtime_petal_route_metadata(
+                &matched,
+                mount,
+                path,
+                &wasm,
+                &declared_sign_intents,
+                &opts,
+            )
             .await?;
         enforce_runtime_route_op(op, &matched, &metadata)?;
         Ok((matched, metadata))
     }
 
-    pub fn local_app_has_descendant(&self, mount: &str, path: &str) -> Result<bool, PetalError> {
+    pub fn petal_has_descendant(&self, mount: &str, path: &str) -> Result<bool, PetalError> {
         validate_runtime_route_path(path)?;
-        let index = self.load_app_route_index(mount)?;
+        let index = self.load_petal_route_index(mount)?;
         Ok(index
             .routes
             .iter()
             .any(|route| route_has_descendant(&route.pattern, path)))
     }
 
-    pub fn local_app_static_list(
+    pub fn petal_static_list(
         &self,
         mount: &str,
         path: &str,
     ) -> Result<Vec<crate::DispatchEntry>, PetalError> {
         validate_runtime_route_path(path)?;
-        let index = self.load_app_route_index(mount)?;
+        let index = self.load_petal_route_index(mount)?;
         Ok(static_list_entries(&index, path))
     }
 
-    pub async fn dispatch_app_route(
+    pub async fn dispatch_petal_route(
         &self,
         mount: &str,
         mut request: DispatchRequest,
@@ -413,7 +420,7 @@ impl PetalRunner {
         cap_mask: Option<BTreeSet<Capability>>,
         opts: RunOptions,
     ) -> Result<DispatchOutput, PetalError> {
-        let matched = self.local_app_route(mount, request.op, &request.path)?;
+        let matched = self.petal_route(mount, request.op, &request.path)?;
         let route_params = matched.params.clone();
         request.ctx.extend(route_params.clone());
         request
@@ -423,9 +430,9 @@ impl PetalRunner {
         let wasm = self
             .store
             .read_route_artifact(&matched.hash, &matched.route.route_id)?;
-        let declared_sign_intents = self.v2_sign_intents(&matched.hash)?;
+        let declared_sign_intents = self.petal_sign_intents(&matched.hash)?;
         let runtime_metadata = self
-            .runtime_app_route_metadata(
+            .runtime_petal_route_metadata(
                 &matched,
                 mount,
                 &request.path,
@@ -439,9 +446,9 @@ impl PetalRunner {
             .required_caps
             .iter()
             .map(|cap| {
-                v2_capability(cap).ok_or_else(|| {
+                petal_capability(cap).ok_or_else(|| {
                     PetalError::InvalidWasm(format!(
-                        "v2 route {} has unknown required cap {cap:?}",
+                        "Petal route {} has unknown required cap {cap:?}",
                         matched.route.route_id
                     ))
                 })
@@ -455,7 +462,7 @@ impl PetalRunner {
             opts.private_store_root = Some(self.store.private_data_root());
         }
         let declared = self
-            .v2_net_policy(&matched.hash)?
+            .petal_net_policy(&matched.hash)?
             .with_endpoint_bindings(&opts.endpoint_bindings)?;
         opts.net_policy = Some(match opts.net_policy {
             Some(mask) => declared.intersect(&mask),
@@ -466,7 +473,7 @@ impl PetalRunner {
             runtime_metadata.sign_intent.as_deref(),
             opts.sign_intents,
         ));
-        let declared_store_policy = self.v2_store_policy(&matched.hash)?;
+        let declared_store_policy = self.petal_store_policy(&matched.hash)?;
         opts.store_namespaces = Some(match opts.store_namespaces {
             Some(mask) => declared_store_policy.intersect(&mask),
             None => declared_store_policy,
@@ -485,9 +492,9 @@ impl PetalRunner {
             .await
     }
 
-    async fn runtime_app_route_metadata(
+    async fn runtime_petal_route_metadata(
         &self,
-        matched: &LocalAppRouteMatch,
+        matched: &PetalRouteMatch,
         mount: &str,
         path: &str,
         wasm: &[u8],
@@ -520,22 +527,22 @@ impl PetalRunner {
         Ok(metadata)
     }
 
-    fn v2_net_policy(&self, hash: &str) -> Result<NetPolicy, PetalError> {
+    fn petal_net_policy(&self, hash: &str) -> Result<NetPolicy, PetalError> {
         let manifest = std::fs::read(self.store.package_path(hash)?.join("source/petal.toml"))?;
-        NetPolicy::from_v2_manifest_toml(&manifest)
+        NetPolicy::from_manifest_toml(&manifest)
     }
 
-    fn v2_sign_intents(&self, hash: &str) -> Result<BTreeSet<String>, PetalError> {
+    fn petal_sign_intents(&self, hash: &str) -> Result<BTreeSet<String>, PetalError> {
         let manifest = std::fs::read(self.store.package_path(hash)?.join("source/petal.toml"))?;
-        sign_intents_from_v2_manifest_toml(&manifest)
+        sign_intents_from_manifest_toml(&manifest)
     }
 
-    fn v2_store_policy(
+    fn petal_store_policy(
         &self,
         hash: &str,
     ) -> Result<crate::policy::StoreNamespacePolicy, PetalError> {
         let manifest = std::fs::read(self.store.package_path(hash)?.join("source/petal.toml"))?;
-        store_policy_from_v2_manifest_toml(&manifest)
+        store_policy_from_manifest_toml(&manifest)
     }
 }
 
@@ -572,12 +579,12 @@ fn route_op(op: DispatchOp) -> RouteOp {
 
 fn enforce_runtime_route_op(
     op: DispatchOp,
-    matched: &LocalAppRouteMatch,
+    matched: &PetalRouteMatch,
     metadata: &InstallRouteMetadata,
 ) -> Result<(), PetalError> {
     if op == DispatchOp::Write && metadata.mode & 0o222 == 0 {
         return Err(PetalError::ModeUnsupported(format!(
-            "v2 route {} is not writable at runtime",
+            "Petal route {} is not writable at runtime",
             matched.route.route_id
         )));
     }
@@ -588,7 +595,7 @@ fn match_index_for_op<'a>(
     index: &'a RouteIndex,
     op: DispatchOp,
     path: &str,
-) -> Option<crate::v2::RouteIndexMatch<'a>> {
+) -> Option<crate::package::RouteIndexMatch<'a>> {
     match op {
         DispatchOp::Lookup => index
             .match_route(path)
@@ -601,7 +608,7 @@ fn match_special_route<'a>(
     index: &'a RouteIndex,
     path: &str,
     special: &str,
-) -> Option<crate::v2::RouteIndexMatch<'a>> {
+) -> Option<crate::package::RouteIndexMatch<'a>> {
     let candidate = special_route_path(path, special);
     let matched = index.match_route(&candidate)?;
     if route_segments(&matched.route.pattern).last().copied() == Some(special) {
@@ -621,7 +628,7 @@ fn validate_runtime_route_path(path: &str) -> Result<(), PetalError> {
             }))
     {
         return Err(PetalError::InvalidWasm(format!(
-            "invalid v2 runtime route path {path:?}"
+            "invalid Petal runtime route path {path:?}"
         )));
     }
     Ok(())
@@ -635,7 +642,7 @@ fn special_route_path(path: &str, special: &str) -> String {
     }
 }
 
-fn v2_capability(cap: &str) -> Option<Capability> {
+fn petal_capability(cap: &str) -> Option<Capability> {
     match cap {
         "bloom:http" => Some(Capability::NetFetch),
         "bloom:store" => Some(Capability::Store),
@@ -668,9 +675,9 @@ fn route_sign_intents(
 
 fn app_path(mount: &str, path: &str) -> String {
     if path.is_empty() {
-        format!("apps/{mount}")
+        format!("petals/{mount}")
     } else {
-        format!("apps/{mount}/{path}")
+        format!("petals/{mount}/{path}")
     }
 }
 
@@ -776,7 +783,7 @@ mod tests {
         write_package_file(
             &package,
             "petal.toml",
-            br#"schema = "bloom.petal.local-app.v2"
+            br#"schema = "bloom.petal.package.v1"
 name = "echo"
 "#,
         );
@@ -784,10 +791,10 @@ name = "echo"
         write_package_file(&package, "AGENTS.md", b"# echo agents");
         write_package_file(
             &package,
-            "app/echo/message.txt.wasm",
+            "petal/echo/message.txt.wasm",
             include_bytes!("../tests/fixtures/route_component_no_imports.wasm"),
         );
-        let (result, _, _) = r.store().install_app_package_dir(&package).unwrap();
+        let (result, _, _) = r.store().install_petal_package_dir(&package).unwrap();
         result.hash
     }
 
@@ -800,7 +807,7 @@ name = "echo"
     }
 
     #[test]
-    fn uninstall_accepts_local_app_name() {
+    fn uninstall_accepts_petal_name() {
         let (dir, r) = runner();
         let hash = install_echo_app(&dir, &r);
         assert!(r.uninstall("echo").unwrap());
@@ -863,21 +870,21 @@ name = "echo"
     }
 
     #[tokio::test]
-    async fn vfs_host_denies_apps_subtree_to_prevent_petal_recursion() {
+    async fn vfs_host_denies_petals_subtree_to_prevent_petal_recursion() {
         let vfs = Vfs::builder()
-            .mount("apps", Arc::new(StaticHandler) as _)
+            .mount("petals", Arc::new(StaticHandler) as _)
             .build();
         let host = VfsHost::new(Arc::new(vfs));
         assert!(matches!(
-            host.vfs_read("apps/demo/file").await,
+            host.vfs_read("petals/demo/file").await,
             Err(HostError::Denied(_))
         ));
         assert!(matches!(
-            host.vfs_write("apps/demo/file", b"x").await,
+            host.vfs_write("petals/demo/file", b"x").await,
             Err(HostError::Denied(_))
         ));
         assert!(matches!(
-            host.vfs_list("apps/demo").await,
+            host.vfs_list("petals/demo").await,
             Err(HostError::Denied(_))
         ));
         assert!(matches!(
@@ -887,13 +894,13 @@ name = "echo"
     }
 
     #[tokio::test]
-    async fn component_app_routes_use_component_runner() {
+    async fn component_petal_routes_use_component_runner() {
         let (dir, r) = runner();
         let package = dir.path().join("component-app");
         write_package_file(
             &package,
             "petal.toml",
-            br#"schema = "bloom.petal.local-app.v2"
+            br#"schema = "bloom.petal.package.v1"
 name = "echo"
 "#,
         );
@@ -901,13 +908,13 @@ name = "echo"
         write_package_file(&package, "AGENTS.md", b"# echo agents");
         write_package_file(
             &package,
-            "app/echo/message.txt.wasm",
+            "petal/echo/message.txt.wasm",
             include_bytes!("../tests/fixtures/route_component_no_imports.wasm"),
         );
-        r.store().install_app_package_dir(&package).unwrap();
+        r.store().install_petal_package_dir(&package).unwrap();
 
         let out = r
-            .dispatch_app_route(
+            .dispatch_petal_route(
                 "echo",
                 DispatchRequest {
                     op: DispatchOp::Read,
@@ -925,13 +932,13 @@ name = "echo"
     }
 
     #[tokio::test]
-    async fn dynamic_component_app_routes_evaluate_runtime_metadata() {
+    async fn dynamic_component_petal_routes_evaluate_runtime_metadata() {
         let (dir, r) = runner();
         let package = dir.path().join("dynamic-component-app");
         write_package_file(
             &package,
             "petal.toml",
-            br#"schema = "bloom.petal.local-app.v2"
+            br#"schema = "bloom.petal.package.v1"
 name = "echo"
 "#,
         );
@@ -939,17 +946,17 @@ name = "echo"
         write_package_file(&package, "AGENTS.md", b"# echo agents");
         write_package_file(
             &package,
-            "app/echo/[name].txt.wasm",
+            "petal/echo/[name].txt.wasm",
             include_bytes!("../tests/fixtures/route_component_no_imports.wasm"),
         );
-        let (_, _, index) = r.store().install_app_package_dir(&package).unwrap();
+        let (_, _, index) = r.store().install_petal_package_dir(&package).unwrap();
         let route = &index.routes[0];
         assert_eq!(route.install_metadata.mode, 0o666);
         assert!(route.install_metadata.side_effecting_read);
         assert!(route.install_metadata.write_async);
 
         let (_, runtime_metadata) = r
-            .local_app_route_runtime_metadata(
+            .petal_route_runtime_metadata(
                 "echo",
                 DispatchOp::Read,
                 "alice.txt",
@@ -961,7 +968,7 @@ name = "echo"
         assert!(!runtime_metadata.write_async);
 
         let out = r
-            .dispatch_app_route(
+            .dispatch_petal_route(
                 "echo",
                 DispatchRequest {
                     op: DispatchOp::Read,
@@ -985,7 +992,7 @@ name = "echo"
         write_package_file(
             &package,
             "petal.toml",
-            br#"schema = "bloom.petal.local-app.v2"
+            br#"schema = "bloom.petal.package.v1"
 name = "example"
 
 [caps]
@@ -1002,22 +1009,22 @@ namespaces = ["wallets"]
         // capability ceiling is bloom:store only.
         write_package_file(
             &package,
-            "app/example/[wallet]/$index.wasm",
-            &crate::v2::route_fixtures::dynamic_dir_route_component(
+            "petal/example/[wallet]/$index.wasm",
+            &crate::package::route_fixtures::dynamic_dir_route_component(
                 true,
-                crate::v2::route_fixtures::FixtureVfsImport::None,
+                crate::package::route_fixtures::FixtureVfsImport::None,
                 &["bloom:store", "bloom:vfs.read"],
                 None,
             ),
         );
-        let (_, _, index) = r.store().install_app_package_dir(&package).unwrap();
+        let (_, _, index) = r.store().install_petal_package_dir(&package).unwrap();
         assert_eq!(
             index.routes[0].install_metadata.required_caps,
             vec!["bloom:store".to_string()]
         );
 
         let err = r
-            .local_app_route_runtime_metadata(
+            .petal_route_runtime_metadata(
                 "example",
                 DispatchOp::Lookup,
                 "alice",
@@ -1039,7 +1046,7 @@ namespaces = ["wallets"]
         write_package_file(
             &package,
             "petal.toml",
-            br#"schema = "bloom.petal.local-app.v2"
+            br#"schema = "bloom.petal.package.v1"
 name = "echo"
 "#,
         );
@@ -1047,17 +1054,17 @@ name = "echo"
         write_package_file(&package, "AGENTS.md", b"# echo agents");
         write_package_file(
             &package,
-            "app/echo/[name].txt.wasm",
+            "petal/echo/[name].txt.wasm",
             include_bytes!("../tests/fixtures/route_component_no_imports.wasm"),
         );
-        let (_, _, index) = r.store().install_app_package_dir(&package).unwrap();
+        let (_, _, index) = r.store().install_petal_package_dir(&package).unwrap();
         let route = &index.routes[0];
         assert!(route.ops.contains(&RouteOp::Write));
         assert_eq!(route.install_metadata.mode, 0o666);
         assert!(route.install_metadata.write_async);
 
         let err = r
-            .dispatch_app_route(
+            .dispatch_petal_route(
                 "echo",
                 DispatchRequest {
                     op: DispatchOp::Write,
@@ -1081,13 +1088,16 @@ name = "echo"
     }
 
     #[test]
-    fn v2_capability_maps_chain_to_local_host_capability() {
-        assert_eq!(v2_capability("bloom:chain"), Some(Capability::Chain));
-        assert_eq!(v2_capability("bloom:tx.outbox"), Some(Capability::TxOutbox));
+    fn petal_capability_maps_chain_to_local_host_capability() {
+        assert_eq!(petal_capability("bloom:chain"), Some(Capability::Chain));
+        assert_eq!(
+            petal_capability("bloom:tx.outbox"),
+            Some(Capability::TxOutbox)
+        );
     }
 
     #[test]
-    fn v2_route_sign_intent_narrows_manifest_and_runtime_masks() {
+    fn petal_route_sign_intent_narrows_manifest_and_runtime_masks() {
         let declared = BTreeSet::from(["safe.intent".to_string(), "wide.intent".to_string()]);
         assert_eq!(
             route_sign_intents(declared.clone(), Some("safe.intent"), None),

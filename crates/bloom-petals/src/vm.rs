@@ -43,8 +43,8 @@ use wasmtime_wasi::preview1::{self, WasiP1Ctx};
 
 use crate::abi::{
     ChainRequest, ChainResponse, DispatchOp, DispatchRequest, DispatchResponse,
-    EvmOutboxInspection, EvmOutboxOutcome, EvmTransactionRequest, SignBatchOutcome,
-    SignBatchRequest, SignOutcome, SignRequest, V2SignContext,
+    EvmOutboxInspection, EvmOutboxOutcome, EvmTransactionRequest, PetalRouteContext,
+    SignBatchOutcome, SignBatchRequest, SignOutcome, SignRequest,
 };
 use crate::error::PetalError;
 use crate::host::{HostError, HostVfsEntry, HostVfsEntryKind, PetalHost};
@@ -69,7 +69,7 @@ pub struct StoreData {
     caps: BTreeSet<Capability>,
     petal_hash: String,
     net_policy: NetPolicy,
-    sign_context: Option<V2SignContext>,
+    sign_context: Option<PetalRouteContext>,
     sign_intents: Option<BTreeSet<String>>,
     store_namespaces: Option<StoreNamespacePolicy>,
     http_response_cap: usize,
@@ -107,10 +107,10 @@ pub struct RunOptions {
     /// narrow it. Direct VM callers that omit it get deny-all.
     pub net_policy: Option<NetPolicy>,
     /// Optional signing intent allow-list. `None` preserves legacy/direct VM
-    /// behavior; v2 package dispatch sets this from `[sign].allowed_intents`.
+    /// behavior; Petal package dispatch sets this from `[sign].allowed_intents`.
     pub sign_intents: Option<BTreeSet<String>>,
     /// Optional private-store namespace policy. `None` preserves legacy/direct
-    /// VM behavior; v2 package dispatch sets this from `[store]`.
+    /// VM behavior; Petal package dispatch sets this from `[store]`.
     pub store_namespaces: Option<StoreNamespacePolicy>,
     pub http_response_cap: usize,
     pub private_store_root: Option<PathBuf>,
@@ -274,7 +274,7 @@ impl PetalVm {
         caps: BTreeSet<Capability>,
         host: Arc<dyn PetalHost>,
         petal_hash: &str,
-        app_root: &str,
+        petal_root: &str,
         route_params: Vec<(String, String)>,
         opts: RunOptions,
     ) -> Result<DispatchOutput, PetalError> {
@@ -289,8 +289,8 @@ impl PetalVm {
                 caps,
                 petal_hash: petal_hash.to_string(),
                 net_policy: opts.net_policy.clone().unwrap_or_else(NetPolicy::deny_all),
-                sign_context: Some(V2SignContext {
-                    app_root: app_root.to_string(),
+                sign_context: Some(PetalRouteContext {
+                    petal_root: petal_root.to_string(),
                     package_hash: petal_hash.to_string(),
                     route_id: request
                         .ctx
@@ -339,7 +339,7 @@ impl PetalVm {
         let func = instance.get_func(&mut store, export).ok_or_else(|| {
             PetalError::InvalidWasm(format!("component route missing {export:?} export"))
         })?;
-        let params = route_component_params(&request, app_root, petal_hash, route_params);
+        let params = route_component_params(&request, petal_root, petal_hash, route_params);
         let mut results = vec![ComponentVal::Bool(false)];
         func.call_async(&mut store, &params, &mut results)
             .await
@@ -362,7 +362,7 @@ impl PetalVm {
         caps: BTreeSet<Capability>,
         host: Arc<dyn PetalHost>,
         petal_hash: &str,
-        app_root: &str,
+        petal_root: &str,
         path: &str,
         route_params: Vec<(String, String)>,
         opts: RunOptions,
@@ -418,7 +418,7 @@ impl PetalVm {
             body: Vec::new(),
             ctx: Vec::new(),
         };
-        let params = route_component_params(&request, app_root, petal_hash, route_params);
+        let params = route_component_params(&request, petal_root, petal_hash, route_params);
         let mut results = vec![ComponentVal::Bool(false)];
         func.call_async(&mut store, &params, &mut results)
             .await
@@ -441,7 +441,7 @@ fn route_component_export_name(op: DispatchOp) -> &'static str {
 
 fn route_component_params(
     request: &DispatchRequest,
-    app_root: &str,
+    petal_root: &str,
     petal_hash: &str,
     route_params: Vec<(String, String)>,
 ) -> Vec<ComponentVal> {
@@ -461,8 +461,8 @@ fn route_component_params(
         .collect::<Vec<_>>();
     params.push(ComponentVal::Record(vec![
         (
-            "app-root".into(),
-            ComponentVal::String(app_root.to_string()),
+            "petal-root".into(),
+            ComponentVal::String(petal_root.to_string()),
         ),
         (
             "package-hash".into(),
@@ -796,14 +796,8 @@ fn link_component_host_imports(linker: &mut ComponentLinker<StoreData>) -> anyho
         sign.func_new_async("sign-hash", |store, params, results| {
             Box::new(async move { component_sign_hash(store, params, results).await })
         })?;
-    }
-    {
-        let mut sign = linker.instance("bloom:sign/signing@0.2.0")?;
-        sign.func_new_async("sign-hash", |store, params, results| {
-            Box::new(async move { component_sign_hash_v2(store, params, results).await })
-        })?;
         sign.func_new_async("sign-hashes", |store, params, results| {
-            Box::new(async move { component_sign_hashes_v2(store, params, results).await })
+            Box::new(async move { component_sign_hashes(store, params, results).await })
         })?;
     }
     {
@@ -1212,33 +1206,9 @@ async fn component_sign_hash(
         Err(err) => return set_component_result(results, component_host_err(err)),
     };
     let host = store.data().host.clone();
-    match host.sign_hash(req).await {
-        Ok(sig) if sig.len() == 65 => {
-            set_component_result(results, component_ok(Some(component_bytes(sig))))
-        }
-        Ok(_) => set_component_result(
-            results,
-            component_host_err(HostError::Backend(
-                "sign_hash returned non-65-byte signature".into(),
-            )),
-        ),
-        Err(e) => set_component_result(results, component_host_err(e)),
-    }
-}
-
-async fn component_sign_hash_v2(
-    store: StoreContextMut<'_, StoreData>,
-    params: &[ComponentVal],
-    results: &mut [ComponentVal],
-) -> anyhow::Result<()> {
-    let req = match component_sign_request(store.data(), params) {
-        Ok(req) => req,
-        Err(err) => return set_component_result(results, component_host_err(err)),
-    };
-    let host = store.data().host.clone();
     match host.sign_hash_outcome(req).await {
         Ok(SignOutcome::Signature(signature)) if signature.len() == 65 => {
-            set_component_result(results, component_sign_v2_signature(signature))
+            set_component_result(results, component_sign_signature(signature))
         }
         Ok(SignOutcome::Signature(_)) => set_component_result(
             results,
@@ -1248,7 +1218,7 @@ async fn component_sign_hash_v2(
         ),
         Ok(SignOutcome::ApprovalRequired(approval)) => set_component_result(
             results,
-            component_sign_v2_approval_required(
+            component_sign_approval_required(
                 approval.action_id,
                 approval.ceremony_url,
                 approval.expires_ms,
@@ -1258,7 +1228,7 @@ async fn component_sign_hash_v2(
     }
 }
 
-async fn component_sign_hashes_v2(
+async fn component_sign_hashes(
     store: StoreContextMut<'_, StoreData>,
     params: &[ComponentVal],
     results: &mut [ComponentVal],
@@ -1301,7 +1271,7 @@ async fn component_sign_hashes_v2(
         ),
         Ok(SignBatchOutcome::ApprovalRequired(approval)) => set_component_result(
             results,
-            component_sign_v2_approval_required(
+            component_sign_approval_required(
                 approval.action_id,
                 approval.ceremony_url,
                 approval.expires_ms,
@@ -1412,14 +1382,14 @@ fn component_sign_request(
     })
 }
 
-fn component_sign_v2_signature(signature: Vec<u8>) -> ComponentVal {
+fn component_sign_signature(signature: Vec<u8>) -> ComponentVal {
     ComponentVal::Result(Ok(Some(Box::new(ComponentVal::Variant(
         "signature".into(),
         Some(Box::new(component_bytes(signature))),
     )))))
 }
 
-fn component_sign_v2_approval_required(
+fn component_sign_approval_required(
     action_id: String,
     ceremony_url: String,
     expires_ms: u64,
@@ -1568,7 +1538,7 @@ async fn component_evm_tx_inspect(
 
 fn component_evm_transaction_request(
     fields: &[(String, ComponentVal)],
-    context: Option<V2SignContext>,
+    context: Option<PetalRouteContext>,
 ) -> Result<EvmTransactionRequest, HostError> {
     let string = |name| {
         component_string_field(fields, name).map_err(|err| HostError::Invalid(err.to_string()))
@@ -2000,7 +1970,7 @@ fn component_http_response(resp: crate::abi::HttpResponse) -> ComponentVal {
 
 fn component_chain_request(
     fields: &[(String, ComponentVal)],
-    context: Option<V2SignContext>,
+    context: Option<PetalRouteContext>,
 ) -> Result<ChainRequest, HostError> {
     Ok(ChainRequest {
         chain: component_record_string(fields, "chain")?,
@@ -2553,8 +2523,8 @@ mod tests {
         )
     "#;
 
-    type TxConfirmCall = (String, String, String, bool, Option<V2SignContext>);
-    type TxInspectCall = (String, String, String, Option<V2SignContext>);
+    type TxConfirmCall = (String, String, String, bool, Option<PetalRouteContext>);
+    type TxInspectCall = (String, String, String, Option<PetalRouteContext>);
 
     #[derive(Default)]
     struct MockHost {
@@ -2680,7 +2650,7 @@ mod tests {
             chain: String,
             outbox_id: String,
             acknowledge_warnings: bool,
-            context: Option<V2SignContext>,
+            context: Option<PetalRouteContext>,
         ) -> Result<EvmOutboxOutcome, HostError> {
             self.tx_confirm_calls.lock().push((
                 wallet,
@@ -2701,7 +2671,7 @@ mod tests {
             wallet: String,
             chain: String,
             outbox_id: String,
-            context: Option<V2SignContext>,
+            context: Option<PetalRouteContext>,
         ) -> Result<EvmOutboxInspection, HostError> {
             self.tx_inspect_calls
                 .lock()
@@ -3130,8 +3100,8 @@ mod tests {
         let mut caps = BTreeSet::new();
         caps.insert(Capability::Chain);
         let mut store = component_test_store(caps, None, host.clone());
-        let context = V2SignContext {
-            app_root: "reader".into(),
+        let context = PetalRouteContext {
+            petal_root: "reader".into(),
             package_hash: "a".repeat(64),
             route_id: "r000001".into(),
             op: "read".into(),
@@ -3176,7 +3146,7 @@ mod tests {
         caps.insert(Capability::Sign);
         caps.insert(Capability::VfsRead);
         caps.insert(Capability::VfsWrite);
-        let policy = NetPolicy::from_v2_manifest_toml(
+        let policy = NetPolicy::from_manifest_toml(
             br#"
 name = "echo"
 [caps]
@@ -3222,7 +3192,7 @@ paths = ["/status"]
         )
         .await
         .unwrap();
-        assert_component_ok_bytes(&sign[0], &[7u8; 65]);
+        assert_component_ok_signature(&sign[0], &[7u8; 65]);
         assert_eq!(host.sign_calls.lock().len(), 1);
 
         store.data_mut().sign_intents = Some(BTreeSet::from(["test.allowed".to_string()]));
@@ -3295,7 +3265,7 @@ paths = ["/status"]
     }
 
     #[tokio::test]
-    async fn component_sign_v2_returns_machine_readable_approval_required() {
+    async fn component_sign_returns_machine_readable_approval_required() {
         let host = Arc::new(MockHost::default());
         *host.sign_outcome.lock() = Some(SignOutcome::ApprovalRequired(
             crate::abi::ApprovalRequired {
@@ -3309,7 +3279,7 @@ paths = ["/status"]
         let mut store = component_test_store(caps, None, host.clone());
         let mut result = vec![ComponentVal::Bool(false)];
 
-        component_sign_hash_v2(
+        component_sign_hash(
             store.as_context_mut(),
             &[
                 ComponentVal::String("alice".into()),
@@ -3352,7 +3322,7 @@ paths = ["/status"]
     }
 
     #[tokio::test]
-    async fn component_sign_v2_preserves_signature_and_policy_checks() {
+    async fn component_sign_preserves_signature_and_policy_checks() {
         let host = Arc::new(MockHost::default());
         let mut caps = BTreeSet::new();
         caps.insert(Capability::Sign);
@@ -3363,7 +3333,7 @@ paths = ["/status"]
             ComponentVal::String("orders.place".into()),
         ];
         let mut result = vec![ComponentVal::Bool(false)];
-        component_sign_hash_v2(store.as_context_mut(), &params, &mut result)
+        component_sign_hash(store.as_context_mut(), &params, &mut result)
             .await
             .unwrap();
         let ComponentVal::Result(Ok(Some(value))) = &result[0] else {
@@ -3383,7 +3353,7 @@ paths = ["/status"]
 
         store.data_mut().sign_intents = Some(BTreeSet::from(["orders.cancel".to_string()]));
         let mut denied = vec![ComponentVal::Bool(false)];
-        component_sign_hash_v2(store.as_context_mut(), &params, &mut denied)
+        component_sign_hash(store.as_context_mut(), &params, &mut denied)
             .await
             .unwrap();
         assert_component_err_contains(&denied[0], "not allowed");
@@ -3413,7 +3383,7 @@ paths = ["/status"]
             vec![2u8; 65],
         ]));
         let mut exact = vec![ComponentVal::Bool(false)];
-        component_sign_hashes_v2(store.as_context_mut(), &params, &mut exact)
+        component_sign_hashes(store.as_context_mut(), &params, &mut exact)
             .await
             .unwrap();
         let ComponentVal::Result(Ok(Some(value))) = &exact[0] else {
@@ -3445,7 +3415,7 @@ paths = ["/status"]
         ] {
             *host.sign_batch_outcome.lock() = Some(SignBatchOutcome::Signatures(signatures));
             let mut result = vec![ComponentVal::Bool(false)];
-            component_sign_hashes_v2(store.as_context_mut(), &params, &mut result)
+            component_sign_hashes(store.as_context_mut(), &params, &mut result)
                 .await
                 .unwrap();
             assert_component_err_contains(&result[0], expected_error);
@@ -3488,8 +3458,8 @@ paths = ["/status"]
         assert_component_err_contains(&denied[0], "tx.outbox");
         assert!(host.tx_stage_calls.lock().is_empty());
 
-        let context = V2SignContext {
-            app_root: "polymarket".into(),
+        let context = PetalRouteContext {
+            petal_root: "polymarket".into(),
             package_hash: "a".repeat(64),
             route_id: "r000001".into(),
             op: "write".into(),
@@ -3577,7 +3547,7 @@ paths = ["/status"]
             "../tests/fixtures/route_component_http_calls_fetch.wat"
         ))
         .unwrap();
-        let policy = NetPolicy::from_v2_manifest_toml(
+        let policy = NetPolicy::from_manifest_toml(
             br#"
 name = "echo"
 [caps]
@@ -3608,7 +3578,7 @@ paths = ["/status"]
                 caps,
                 host.clone(),
                 VALID_HASH,
-                "apps/echo",
+                "petals/echo",
                 Vec::new(),
                 RunOptions {
                     net_policy: Some(policy.clone()),
@@ -3636,7 +3606,7 @@ paths = ["/status"]
                 BTreeSet::new(),
                 denied_host.clone(),
                 VALID_HASH,
-                "apps/echo",
+                "petals/echo",
                 Vec::new(),
                 RunOptions {
                     net_policy: Some(policy),
@@ -3730,6 +3700,27 @@ paths = ["/status"]
         };
         let ComponentVal::List(items) = payload.as_ref() else {
             panic!("expected byte list payload, got {payload:?}");
+        };
+        let bytes = items
+            .iter()
+            .map(|item| match item {
+                ComponentVal::U8(byte) => *byte,
+                other => panic!("expected u8 item, got {other:?}"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(bytes, expected);
+    }
+
+    fn assert_component_ok_signature(value: &ComponentVal, expected: &[u8]) {
+        let ComponentVal::Result(Ok(Some(payload))) = value else {
+            panic!("expected component ok result, got {value:?}");
+        };
+        let ComponentVal::Variant(kind, Some(signature)) = payload.as_ref() else {
+            panic!("expected signature result, got {payload:?}");
+        };
+        assert_eq!(kind, "signature");
+        let ComponentVal::List(items) = signature.as_ref() else {
+            panic!("expected signature bytes, got {signature:?}");
         };
         let bytes = items
             .iter()

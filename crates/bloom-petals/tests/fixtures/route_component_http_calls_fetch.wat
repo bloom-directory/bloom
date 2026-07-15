@@ -19,7 +19,7 @@
       (type (;0;) (tuple string string))
       (type (;1;) (list 0))
       (type (;2;) (option string))
-      (type (;3;) (record (field "app-root" string) (field "package-hash" string) (field "path" string) (field "params" 1) (field "actor" 2)))
+      (type (;3;) (record (field "petal-root" string) (field "package-hash" string) (field "path" string) (field "params" 1) (field "actor" 2)))
       (export (;4;) "ctx" (type (eq 3)))
       (type (;5;) (enum "dir" "file" "symlink"))
       (export (;6;) "entry-kind" (type (eq 5)))
@@ -98,8 +98,20 @@
     )
     (func (;10;) (type 2) (param i32))
     (func (;11;) (type 4) (param i32 i32 i32 i32) (result i32)
+      (local $ptr i32)
       global.get $heap
-      global.get $heap
+      local.get 2
+      i32.add
+      i32.const 1
+      i32.sub
+      local.get 2
+      i32.const 1
+      i32.sub
+      i32.const -1
+      i32.xor
+      i32.and
+      local.tee $ptr
+      local.get $ptr
       local.get 3
       i32.add
       global.set $heap

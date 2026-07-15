@@ -4,7 +4,9 @@ use std::process::Command;
 use anyhow::{Context, Result, anyhow, bail};
 use bloom_daemon::Daemon;
 use bloom_petals::meta::PetalSourceProvenance;
-use bloom_petals::v2::{AppConsentSummary, PreparedAppPackage, RouteIndex, app_consent_summary};
+use bloom_petals::package::{
+    PetalConsentSummary, PreparedPetalPackage, RouteIndex, petal_consent_summary,
+};
 use bloom_proto::HomeDir;
 use serde::Deserialize;
 use url::Url;
@@ -24,7 +26,7 @@ pub(crate) struct GitHubInstallOutput {
     pub result: bloom_petals::store::InstallResult,
     pub meta: bloom_petals::meta::PetalMeta,
     pub index: RouteIndex,
-    pub consent: AppConsentSummary,
+    pub consent: PetalConsentSummary,
     pub provenance: PetalSourceProvenance,
 }
 
@@ -62,7 +64,7 @@ struct SemverTag {
 pub(crate) fn parse_github_install_url(input: &str) -> Result<Option<GitHubRepo>> {
     if is_raw_remote_wasm(input) {
         bail!(
-            "raw remote .wasm installs are not supported; install a trusted v2 source repository"
+            "raw remote .wasm installs are not supported; install a trusted Petal source repository"
         );
     }
 
@@ -120,10 +122,10 @@ pub(crate) fn install_github_source(
     println!("Building source package...");
     run_source_build(tmp.path())?;
 
-    println!("Validating v2 Petal package...");
+    println!("Validating Petal package...");
     let package =
-        PreparedAppPackage::from_dir(tmp.path()).context("validate generated v2 package")?;
-    let consent = app_consent_summary(&package).context("build app consent summary")?;
+        PreparedPetalPackage::from_dir(tmp.path()).context("validate generated Petal package")?;
+    let consent = petal_consent_summary(&package).context("build app consent summary")?;
     let provenance = PetalSourceProvenance {
         source_kind: "github".to_string(),
         url: repo.canonical_url.clone(),
@@ -137,8 +139,8 @@ pub(crate) fn install_github_source(
     let (result, meta, index) = daemon
         .petals
         .store()
-        .install_prepared_app_package_with_source(package, Some(provenance.clone()))
-        .context("install generated v2 package")?;
+        .install_prepared_petal_package_with_source(package, Some(provenance.clone()))
+        .context("install generated Petal package")?;
 
     Ok(GitHubInstallOutput {
         result,
@@ -321,8 +323,8 @@ fn checkout_source(cache: &Path, root: &Path, commit: &str) -> Result<()> {
 
 fn validate_source_manifest(root: &Path, repo: &GitHubRepo) -> Result<()> {
     let manifest = read_source_manifest(root)?;
-    if manifest.schema.as_deref() != Some("bloom.petal.local-app.v2") {
-        bail!("GitHub Petal source must declare schema = \"bloom.petal.local-app.v2\"");
+    if manifest.schema.as_deref() != Some("bloom.petal.package.v1") {
+        bail!("GitHub Petal source must declare schema = \"bloom.petal.package.v1\"");
     }
     let source = manifest
         .source
@@ -497,11 +499,11 @@ mod tests {
 
     #[test]
     fn resolves_latest_semver_tag_by_default() {
-        let fixture = git_fixture(&["v0.1.0", "v0.2.0"]).unwrap();
+        let fixture = git_fixture(&["v0.1.0", "v0.1.1"]).unwrap();
         let repo = test_repo();
         let resolved = resolve_ref(fixture.bare.path(), &repo, None).unwrap();
-        assert_eq!(resolved.requested_ref, "v0.2.0");
-        assert_eq!(resolved.selected_tag.as_deref(), Some("v0.2.0"));
+        assert_eq!(resolved.requested_ref, "v0.1.1");
+        assert_eq!(resolved.selected_tag.as_deref(), Some("v0.1.1"));
         assert_eq!(resolved.commit, fixture.commits[1]);
     }
 
@@ -613,7 +615,7 @@ mod tests {
     fn source_install_from_local_bare_repo_uses_latest_tag_records_provenance_and_dispatches() {
         let fixture = source_repo_fixture(SourceRepoOptions {
             repo: "bloom-petal-test-latest",
-            tags: vec!["v0.1.0", "v0.2.0"],
+            tags: vec!["v0.1.0", "v0.1.1"],
             include_manifest: true,
             build_script: BuildScript::Success,
         })
@@ -625,10 +627,10 @@ mod tests {
 
         let installed = install_github_source(&home_dir, &daemon, &repo, None).unwrap();
 
-        assert_eq!(installed.provenance.selected_tag.as_deref(), Some("v0.2.0"));
-        assert_eq!(installed.provenance.requested_ref, "v0.2.0");
+        assert_eq!(installed.provenance.selected_tag.as_deref(), Some("v0.1.1"));
+        assert_eq!(installed.provenance.requested_ref, "v0.1.1");
         assert_eq!(installed.provenance.resolved_commit, fixture.commits[1]);
-        assert_eq!(installed.index.app_root, "demo");
+        assert_eq!(installed.index.petal_root, "demo");
         assert_eq!(installed.index.routes.len(), 1);
         let loaded = daemon
             .petals
@@ -642,7 +644,7 @@ mod tests {
             .block_on(
                 daemon
                     .vfs
-                    .read(&VfsPath::parse("/apps/demo/hello.txt").unwrap()),
+                    .read(&VfsPath::parse("/petals/demo/hello.txt").unwrap()),
             )
             .unwrap();
         assert_eq!(body, b"component");
@@ -652,7 +654,7 @@ mod tests {
     fn source_install_honors_explicit_tag_and_sha_refs() {
         let fixture = source_repo_fixture(SourceRepoOptions {
             repo: "bloom-petal-test-ref",
-            tags: vec!["v0.1.0", "v0.2.0"],
+            tags: vec!["v0.1.0", "v0.1.1"],
             include_manifest: true,
             build_script: BuildScript::Success,
         })
@@ -861,7 +863,7 @@ mod tests {
             }
         }
 
-        std::fs::write(work.path().join("README.md"), b"# demo v2\n")?;
+        std::fs::write(work.path().join("README.md"), b"# demo Petal\n")?;
         test_git(Some(work.path()), &["commit", "-am", "two"])?;
         let second = test_git_stdout(Some(work.path()), &["rev-parse", "HEAD"])?;
         for tag in &options.tags {
@@ -893,7 +895,7 @@ mod tests {
         readme_suffix: &str,
     ) -> Result<()> {
         if include_manifest {
-            let manifest = r#"schema = "bloom.petal.local-app.v2"
+            let manifest = r#"schema = "bloom.petal.package.v1"
 name = "demo"
 
 [source]
@@ -902,7 +904,7 @@ repository = "bloom-directory/REPO_NAME"
 
 [build]
 command = "scripts/build.sh"
-outputs = ["app/demo"]
+outputs = ["petal/demo"]
 
 [consent]
 summary = "Demo app used by source install tests."
@@ -923,7 +925,7 @@ summary = "Demo app used by source install tests."
         std::fs::create_dir_all(work.path().join("scripts"))?;
         let script = match build_script {
             BuildScript::Success => {
-                "#!/usr/bin/env bash\nset -euo pipefail\nmkdir -p app/demo\ncp components/route.wasm app/demo/hello.txt.wasm\n"
+                "#!/usr/bin/env bash\nset -euo pipefail\nmkdir -p petal/demo\ncp components/route.wasm petal/demo/hello.txt.wasm\n"
             }
             BuildScript::Failure => "#!/usr/bin/env bash\nset -euo pipefail\nexit 42\n",
         };

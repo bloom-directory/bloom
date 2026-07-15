@@ -222,13 +222,13 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(v1.a, 9);
-        let v2: Demo = cache
+        let reloaded: Demo = cache
             .get_or_fetch(1, "kind", "k", None, || async {
                 panic!("should not call fetch on hit")
             })
             .await
             .unwrap();
-        assert_eq!(v2, v1);
+        assert_eq!(reloaded, v1);
     }
 
     #[test]

@@ -2246,7 +2246,7 @@ fn paid_http_canonical_envelope(
     .map_err(|e| HandlerError::backend(e.to_string()))?;
     Ok(CanonicalEnvelope::new(
         CanonicalIntentHeader {
-            schema: bloom_auth_api::CANONICAL_INTENT_HEADER_SCHEMA_V2.into(),
+            schema: bloom_auth_api::CANONICAL_INTENT_HEADER_SCHEMA_V1.into(),
             wallet: input.wallet.to_string(),
             surface: "requests".into(),
             action_id: action_id.to_string(),
@@ -2530,7 +2530,7 @@ mod tests {
             self.calls.fetch_add(1, Ordering::SeqCst);
             let envelope = CanonicalEnvelope::new(
                 CanonicalIntentHeader {
-                    schema: bloom_auth_api::CANONICAL_INTENT_HEADER_SCHEMA_V2.into(),
+                    schema: bloom_auth_api::CANONICAL_INTENT_HEADER_SCHEMA_V1.into(),
                     wallet: approval.wallet.clone(),
                     surface: approval.surface.clone(),
                     action_id: approval.action_id.clone(),
@@ -3704,7 +3704,7 @@ mod tests {
         issued_ms: u64,
     ) -> SealedAction {
         let header = CanonicalIntentHeader {
-            schema: bloom_auth_api::CANONICAL_INTENT_HEADER_SCHEMA_V2.into(),
+            schema: bloom_auth_api::CANONICAL_INTENT_HEADER_SCHEMA_V1.into(),
             wallet: wallet.into(),
             surface: "requests".into(),
             action_id: action_id.into(),

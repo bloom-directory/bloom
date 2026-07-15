@@ -564,14 +564,14 @@ mod tests {
     };
     use bloom_auth_api::{
         APPROVAL_CHALLENGE_SCHEMA_V1, ApprovalVerifier, AuthStoreView, AuthStoreWriter,
-        CANONICAL_INTENT_HEADER_SCHEMA_V2, CanonicalEnvelope, CanonicalIntentHeader,
+        CANONICAL_INTENT_HEADER_SCHEMA_V1, CanonicalEnvelope, CanonicalIntentHeader,
         DaemonGrantTerms, ExecutorKind, PetalPolicySnapshot,
     };
     use bloom_vfs::AuthServices;
 
     fn sealed_action(action_id: &str, plan: &str, expires_ms: u64) -> SealedAction {
         let header = CanonicalIntentHeader {
-            schema: CANONICAL_INTENT_HEADER_SCHEMA_V2.into(),
+            schema: CANONICAL_INTENT_HEADER_SCHEMA_V1.into(),
             wallet: "my-wallet".into(),
             surface: "outbox".into(),
             action_id: action_id.into(),

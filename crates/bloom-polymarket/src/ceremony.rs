@@ -1,7 +1,7 @@
 use bloom_proto::{CeremonyIntent, CeremonyIntentKind};
 use serde_json::json;
 
-use crate::wallet::V2_APPROVAL_LABELS;
+use crate::wallet::APPROVAL_LABELS;
 
 /// Build the human-review payload for a Polymarket onboarding run.
 ///
@@ -26,10 +26,10 @@ pub fn polymarket_onboard_ceremony_intent(
         "Signs one approval batch granting these eight spends from your deposit wallet:"
             .to_string(),
     ];
-    summary.extend(V2_APPROVAL_LABELS.iter().map(|l| format!("  - {l}")));
+    summary.extend(APPROVAL_LABELS.iter().map(|l| format!("  - {l}")));
     intent.summary_lines = summary;
     intent.risk_lines = vec![
-        "approve(MAX) grants unlimited pUSD spending to the V2 contracts; \
+        "approve(MAX) grants unlimited pUSD spending to the contracts; \
          revoke later with `bloom polymarket revoke-approvals`."
             .into(),
         "The OS passkey prompt will show bloom/localhost, not these details.".into(),
@@ -41,7 +41,7 @@ pub fn polymarket_onboard_ceremony_intent(
         "kind": "polymarket_onboard_begin",
         "wallet": wallet,
         "path": path,
-        "approvals": V2_APPROVAL_LABELS,
+        "approvals": APPROVAL_LABELS,
     });
     intent
 }
@@ -59,7 +59,7 @@ mod tests {
         );
 
         let summary = intent.summary_lines.join("\n");
-        for label in V2_APPROVAL_LABELS {
+        for label in APPROVAL_LABELS {
             assert!(summary.contains(label), "missing approval label {label}");
         }
 

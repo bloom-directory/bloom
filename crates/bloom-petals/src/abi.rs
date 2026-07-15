@@ -29,7 +29,7 @@ pub struct SignRequest {
     pub wallet: String,
     pub hash32: [u8; 32],
     pub purpose: String,
-    pub context: Option<V2SignContext>,
+    pub context: Option<PetalRouteContext>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37,7 +37,7 @@ pub struct SignBatchRequest {
     pub requests: Vec<SignRequest>,
 }
 
-/// Result of a structured v2 component signing request.
+/// Result of a structured component signing request.
 ///
 /// Unlike the legacy `sign_hash` error-only protocol, this makes a pending
 /// Sealed Approval ceremony machine-readable so a component can persist it
@@ -61,7 +61,7 @@ pub enum SignBatchOutcome {
     ApprovalRequired(ApprovalRequired),
 }
 
-/// A generic EVM transaction prepared by a v2 route. Route provenance is
+/// A generic EVM transaction prepared by a Petal route. Route provenance is
 /// injected by the runner and never supplied by the component.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EvmTransactionRequest {
@@ -73,7 +73,7 @@ pub struct EvmTransactionRequest {
     pub nonce: Option<u64>,
     pub max_fee_per_gas: Option<String>,
     pub max_priority_fee_per_gas: Option<String>,
-    pub context: Option<V2SignContext>,
+    pub context: Option<PetalRouteContext>,
 }
 
 /// Generic staged-EVM transaction state returned through
@@ -96,8 +96,8 @@ pub struct EvmOutboxInspection {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct V2SignContext {
-    pub app_root: String,
+pub struct PetalRouteContext {
+    pub petal_root: String,
     pub package_hash: String,
     pub route_id: String,
     pub op: String,
@@ -112,7 +112,7 @@ pub struct ChainRequest {
     pub method: String,
     pub params_json: String,
     /// Trusted route provenance injected by the runner, never the component.
-    pub context: Option<V2SignContext>,
+    pub context: Option<PetalRouteContext>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

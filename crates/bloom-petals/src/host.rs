@@ -10,8 +10,8 @@ use async_trait::async_trait;
 
 use crate::abi::{
     ChainRequest, ChainResponse, EvmOutboxInspection, EvmOutboxOutcome, EvmTransactionRequest,
-    HttpRequest, HttpResponse, SignBatchOutcome, SignBatchRequest, SignOutcome, SignRequest,
-    V2SignContext,
+    HttpRequest, HttpResponse, PetalRouteContext, SignBatchOutcome, SignBatchRequest, SignOutcome,
+    SignRequest,
 };
 use crate::policy::NetPolicy;
 
@@ -87,7 +87,7 @@ pub trait PetalHost: Send + Sync {
         Err(HostError::Denied("sign_hash".into()))
     }
 
-    /// Structured component signing result for `bloom:sign/signing@0.2.0`.
+    /// Structured component signing result for `bloom:sign/signing@0.1.0`.
     /// Hosts that have not opted into staged approval retain the v0.1 behavior.
     async fn sign_hash_outcome(&self, req: SignRequest) -> Result<SignOutcome, HostError> {
         self.sign_hash(req).await.map(SignOutcome::Signature)
@@ -120,7 +120,7 @@ pub trait PetalHost: Send + Sync {
         _chain: String,
         _outbox_id: String,
         _acknowledge_warnings: bool,
-        _context: Option<V2SignContext>,
+        _context: Option<PetalRouteContext>,
     ) -> Result<EvmOutboxOutcome, HostError> {
         Err(HostError::Denied("evm_tx_confirm".into()))
     }
@@ -131,7 +131,7 @@ pub trait PetalHost: Send + Sync {
         _wallet: String,
         _chain: String,
         _outbox_id: String,
-        _context: Option<V2SignContext>,
+        _context: Option<PetalRouteContext>,
     ) -> Result<EvmOutboxInspection, HostError> {
         Err(HostError::Denied("evm_tx_inspect".into()))
     }

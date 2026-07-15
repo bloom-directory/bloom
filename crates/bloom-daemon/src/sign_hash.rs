@@ -290,7 +290,7 @@ mod tests {
         ttl_secs: u64,
     ) -> bloom_auth_api::SealedApprovalGrant {
         let header = CanonicalIntentHeader {
-            schema: bloom_auth_api::CANONICAL_INTENT_HEADER_SCHEMA_V2.into(),
+            schema: bloom_auth_api::CANONICAL_INTENT_HEADER_SCHEMA_V1.into(),
             wallet: "my-wallet".into(),
             surface: "outbox".into(),
             action_id: action_id.into(),

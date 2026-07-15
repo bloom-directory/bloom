@@ -44,11 +44,11 @@ fn write_file(root: &Path, rel: &str, body: &[u8]) {
     std::fs::write(path, body).expect("write fixture file");
 }
 
-fn write_demo_v2_package(root: &Path) {
+fn write_demo_petal_package(root: &Path) {
     write_file(
         root,
         "petal.toml",
-        br#"schema = "bloom.petal.local-app.v2"
+        br#"schema = "bloom.petal.package.v1"
 name = "demo"
 
 [consent]
@@ -59,7 +59,7 @@ summary = "Demo app used by CLI tests."
     write_file(root, "AGENTS.md", b"# demo agents\n");
     write_file(
         root,
-        "app/demo/hello.txt.wasm",
+        "petal/demo/hello.txt.wasm",
         include_bytes!("../../bloom-petals/tests/fixtures/route_component_no_imports.wasm"),
     );
 }
@@ -1189,20 +1189,20 @@ fn wallet_confirm_uses_plain_ipc_write_when_socket_exists() {
 }
 
 #[test]
-fn v2_app_cli_build_install_list_and_vfs_read_happy_path() {
+fn petal_cli_build_install_list_and_vfs_read_happy_path() {
     let home = fresh_home();
     let work = tempfile::tempdir().expect("create package workdir");
     let package = work.path().join("demo-package");
     let archive = work.path().join("demo.petal.tar");
-    write_demo_v2_package(&package);
+    write_demo_petal_package(&package);
 
     let package_arg = package.to_str().unwrap();
     let archive_arg = archive.to_str().unwrap();
     bloom_cmd(home.path())
-        .args(["petal", "app", "build", package_arg, "--out", archive_arg])
+        .args(["petals", "build", package_arg, "--out", archive_arg])
         .assert()
         .success()
-        .stdout(predicate::str::contains("app_mount: apps/demo/"))
+        .stdout(predicate::str::contains("petal_mount: petals/demo/"))
         .stdout(predicate::str::contains("routes: 1"))
         .stdout(predicate::str::contains("archive: "));
     assert!(
@@ -1215,18 +1215,18 @@ fn v2_app_cli_build_install_list_and_vfs_read_happy_path() {
         .args(["petals", "install", archive_arg])
         .assert()
         .success()
-        .stdout(predicate::str::contains("mode: local-app"))
-        .stdout(predicate::str::contains("app_mount: apps/demo/"))
+        .stdout(predicate::str::contains("mode: petal"))
+        .stdout(predicate::str::contains("petal_mount: petals/demo/"))
         .stdout(predicate::str::contains("routes: 1"));
 
     bloom_cmd(home.path())
         .args(["petals", "ls"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("app=apps/demo/"));
+        .stdout(predicate::str::contains("app=petals/demo/"));
 
     bloom_cmd(home.path())
-        .args(["vfs", "cat", "/apps/demo/hello.txt"])
+        .args(["vfs", "cat", "/petals/demo/hello.txt"])
         .assert()
         .success()
         .stdout(predicate::eq("component"));
@@ -1264,7 +1264,7 @@ fn github_source_install_polymarket_dispatches_route_contract() {
         )));
 
     bloom_cmd(home.path())
-        .args(["vfs", "cat", "/apps/polymarket/meta/route-contract.json"])
+        .args(["vfs", "cat", "/petals/polymarket/meta/route-contract.json"])
         .assert()
         .success()
         .stdout(predicate::str::contains(

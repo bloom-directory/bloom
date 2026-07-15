@@ -9,7 +9,7 @@
 //!   to mint/derive CLOB API credentials.
 //! - **L2** (`l2_headers` / [`l2_message`] / [`l2_hmac`]): HMAC-SHA256 over
 //!   `{timestamp}{METHOD}{path}{body}` with the API `secret` — no private key
-//!   involved. Byte-exact reference: `rs-clob-client-v2` `src/auth.rs`.
+//!   involved. Byte-exact reference: the Polymarket Rust SDK `src/auth.rs`.
 
 use std::sync::Arc;
 
@@ -173,7 +173,7 @@ mod tests {
         KeystoreSigner::new(Arc::new(pk))
     }
 
-    /// Reproduces `rs-clob-client-v2` `l1_headers_should_succeed` byte-for-byte.
+    /// Reproduces the Polymarket Rust SDK `l1_headers_should_succeed` byte-for-byte.
     #[tokio::test]
     async fn l1_headers_match_sdk_vector() {
         let signer = test_signer();
@@ -205,7 +205,7 @@ mod tests {
         assert_eq!(get(POLY_TIMESTAMP), Some("10000000"));
     }
 
-    /// Reproduces `rs-clob-client-v2` `l2_headers_should_succeed`: GET `/`, ts 1.
+    /// Reproduces the Polymarket Rust SDK `l2_headers_should_succeed`: GET `/`, ts 1.
     #[test]
     fn l2_headers_match_sdk_vector() {
         let address = Address::from_str("0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266").unwrap();

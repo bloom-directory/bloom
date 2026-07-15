@@ -5074,23 +5074,23 @@ mod tests {
     }
 
     #[test]
-    fn local_app_execution_origin_binds_evm_sealed_subject_and_executor_match() {
+    fn petal_execution_origin_binds_evm_sealed_subject_and_executor_match() {
         let (engine, _spec, _dir) = fake_engine(60_000);
         let mut staged = fake_staged_1559("0001-local-origin");
         staged.action_id = Some("local-origin-action".into());
         staged.execution_origin = Some(ExecutionOrigin {
-            petal_id: "local-app:polymarket".into(),
+            petal_id: "petal:polymarket".into(),
             petal_digest: "a".repeat(64),
-            petal_version: "v2-package".into(),
+            petal_version: "v1-package".into(),
         });
         engine.outbox.write_pending(&staged, "# plan").unwrap();
 
         let subject =
             evm_sealed_subject(&staged, EvmOutboxActionKind::Confirm, &test_signing_hash())
                 .unwrap();
-        assert_eq!(subject.petal_id, "local-app:polymarket");
+        assert_eq!(subject.petal_id, "petal:polymarket");
         assert_eq!(subject.petal_digest, "a".repeat(64));
-        assert_eq!(subject.petal_version, "v2-package");
+        assert_eq!(subject.petal_version, "v1-package");
         assert_eq!(subject.policy_snapshot.petal_id, subject.petal_id);
         assert_eq!(subject.policy_snapshot.petal_digest, subject.petal_digest);
 
@@ -5111,7 +5111,7 @@ mod tests {
     async fn sealed_dispatcher_errors_for_unregistered_fake_petal() {
         let (engine, _spec, _dir) = fake_engine(60_000);
         let header = bloom_auth_api::CanonicalIntentHeader {
-            schema: bloom_auth_api::CANONICAL_INTENT_HEADER_SCHEMA_V2.into(),
+            schema: bloom_auth_api::CANONICAL_INTENT_HEADER_SCHEMA_V1.into(),
             wallet: "alice".into(),
             surface: "fake".into(),
             action_id: "fake-action".into(),

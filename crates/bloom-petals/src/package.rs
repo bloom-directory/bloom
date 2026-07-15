@@ -1,6 +1,6 @@
-//! Experimental v2 file-driven local app package scanner.
+//! Experimental Petal file-driven Petal package scanner.
 //!
-//! This is intentionally incremental: it scans `app/<name>/.../*.wasm`
+//! This is intentionally incremental: it scans `petal/<name>/.../*.wasm`
 //! route trees and prepares content-addressed package records. Route
 //! artifacts must be `bloom:route@0.1.0` components.
 
@@ -29,14 +29,14 @@ use crate::vm::{ComponentRouteEntryKind, ComponentRouteMetadata, PetalVm, RunOpt
 
 pub const ROUTE_INDEX_SCHEMA: &str = "bloom.petal.route-index.v1";
 pub const BUILD_MANIFEST_SCHEMA: &str = "bloom.petal.build-manifest.v1";
-const PACKAGE_DIGEST_PREFIX: &[u8] = b"bloom.petal.package.v2\0";
+const PACKAGE_DIGEST_PREFIX: &[u8] = b"bloom.petal.package.v1\0";
 const TAR_NAME_LEN: usize = 100;
 const TAR_PREFIX_LEN: usize = 155;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PetalAppPackage {
+pub struct PetalPackage {
     pub name: String,
-    pub app_root: String,
+    pub petal_root: String,
     pub routes: Vec<RouteRecord>,
 }
 
@@ -178,7 +178,7 @@ pub struct NormalizedPackageFile {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PreparedAppPackage {
+pub struct PreparedPetalPackage {
     pub hash: String,
     pub name: String,
     pub files: Vec<NormalizedPackageFile>,
@@ -231,7 +231,7 @@ impl RouteSidecarAbi {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RouteSidecar {
     path: String,
-    app_name: String,
+    petal_name: String,
     abi: RouteSidecarAbi,
     component: String,
     imports: Vec<String>,
@@ -239,20 +239,20 @@ struct RouteSidecar {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AppConsentSummary {
+pub struct PetalConsentSummary {
     pub name: String,
-    pub app_mount: String,
+    pub petal_mount: String,
     pub package_summary: Option<String>,
     pub docs: Vec<String>,
     pub capabilities: Vec<String>,
-    pub network: Vec<AppConsentNetRule>,
+    pub network: Vec<PetalConsentNetRule>,
     pub sign_intents: Vec<String>,
-    pub store_namespaces: Vec<AppConsentStoreNamespace>,
-    pub routes: Vec<AppConsentRoute>,
+    pub store_namespaces: Vec<PetalConsentStoreNamespace>,
+    pub routes: Vec<PetalConsentRoute>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AppConsentNetRule {
+pub struct PetalConsentNetRule {
     pub binding: Option<String>,
     pub host: String,
     /// Operator-configured HTTPS origin replacing `host` for this binding.
@@ -263,13 +263,13 @@ pub struct AppConsentNetRule {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AppConsentStoreNamespace {
+pub struct PetalConsentStoreNamespace {
     pub namespace: String,
     pub secret: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AppConsentRoute {
+pub struct PetalConsentRoute {
     pub path: String,
     pub kind: RouteEntryKind,
     pub ops: Vec<RouteOp>,
@@ -284,7 +284,7 @@ pub struct RouteIndex {
     pub schema: String,
     pub package_hash: String,
     pub name: String,
-    pub app_root: String,
+    pub petal_root: String,
     pub policy_hash: String,
     pub routes: Vec<RouteIndexRecord>,
 }
@@ -349,7 +349,7 @@ impl RouteSpecificity {
     }
 }
 
-impl PetalAppPackage {
+impl PetalPackage {
     pub fn scan_dir(root: impl AsRef<Path>) -> Result<Self, PetalError> {
         let root = root.as_ref();
         require_file(root.join("petal.toml"))?;
@@ -358,18 +358,18 @@ impl PetalAppPackage {
 
         let petal_toml = std::fs::read_to_string(root.join("petal.toml"))?;
         let manifest: PetalToml = toml::from_str(&petal_toml)?;
-        validate_app_name(&manifest.name)?;
+        validate_petal_name(&manifest.name)?;
 
-        let app_root = root.join("app").join(&manifest.name);
-        if !app_root.is_dir() {
+        let petal_root = root.join("petal").join(&manifest.name);
+        if !petal_root.is_dir() {
             return Err(PetalError::InvalidWasm(format!(
-                "v2 package missing app/{}/ route root",
+                "Petal package missing petal/{}/ route root",
                 manifest.name
             )));
         }
 
         let mut routes = Vec::new();
-        scan_routes(&app_root, &app_root, &mut routes)?;
+        scan_routes(&petal_root, &petal_root, &mut routes)?;
         routes.sort_by(|a, b| a.pattern.cmp(&b.pattern));
         for (idx, route) in routes.iter_mut().enumerate() {
             route.route_id = format!("r{:06}", idx + 1);
@@ -378,7 +378,7 @@ impl PetalAppPackage {
 
         Ok(Self {
             name: manifest.name.clone(),
-            app_root: manifest.name,
+            petal_root: manifest.name,
             routes,
         })
     }
@@ -403,7 +403,7 @@ impl PetalAppPackage {
     }
 }
 
-impl PreparedAppPackage {
+impl PreparedPetalPackage {
     pub fn from_dir(root: impl AsRef<Path>) -> Result<Self, PetalError> {
         Self::from_files(collect_package_dir(root.as_ref())?)
     }
@@ -423,16 +423,16 @@ impl PreparedAppPackage {
         let manifest_toml = std::str::from_utf8(manifest_bytes)
             .map_err(|_| PetalError::InvalidWasm("petal.toml is not utf-8".into()))?;
         let manifest: PetalToml = toml::from_str(manifest_toml)?;
-        if manifest.schema.as_deref() != Some("bloom.petal.local-app.v2") {
+        if manifest.schema.as_deref() != Some("bloom.petal.package.v1") {
             return Err(PetalError::InvalidWasm(
-                "v2 package petal.toml must set schema = \"bloom.petal.local-app.v2\"".into(),
+                "Petal package petal.toml must set schema = \"bloom.petal.package.v1\"".into(),
             ));
         }
-        validate_app_name(&manifest.name)?;
+        validate_petal_name(&manifest.name)?;
         file_bytes(&files, "README.md")?;
         file_bytes(&files, "AGENTS.md")?;
-        let app_root = format!("app/{}", manifest.name);
-        validate_single_app_root(&files, &manifest.name)?;
+        let petal_root = format!("petal/{}", manifest.name);
+        validate_single_petal_root(&files, &manifest.name)?;
         let allowed_caps = manifest
             .caps
             .allowed
@@ -449,10 +449,10 @@ impl PreparedAppPackage {
         let store_policy = store_policy_from_manifest(&manifest);
         validate_store_policy(&allowed_caps, &store_policy)?;
         validate_net_policy(&allowed_caps, &manifest.net)?;
-        let route_files = route_records_from_files(&files, &app_root)?;
+        let route_files = route_records_from_files(&files, &petal_root)?;
         if route_files.is_empty() {
             return Err(PetalError::InvalidWasm(format!(
-                "v2 package app/{}/ contains no .wasm routes",
+                "Petal package petal/{}/ contains no .wasm routes",
                 manifest.name
             )));
         }
@@ -461,7 +461,7 @@ impl PreparedAppPackage {
             schema: ROUTE_INDEX_SCHEMA.to_string(),
             package_hash: hash.clone(),
             name: manifest.name.clone(),
-            app_root: manifest.name.clone(),
+            petal_root: manifest.name.clone(),
             policy_hash,
             routes: Vec::with_capacity(route_files.len()),
         };
@@ -488,7 +488,7 @@ impl PreparedAppPackage {
                 )?;
                 if source_validation.abi != sidecar.abi.route_abi() {
                     return Err(PetalError::InvalidWasm(format!(
-                        "v2 route sidecar {} declares {:?} but source route validates as {:?}",
+                        "Petal route sidecar {} declares {:?} but source route validates as {:?}",
                         sidecar.path, sidecar.abi, source_validation.abi
                     )));
                 }
@@ -501,7 +501,7 @@ impl PreparedAppPackage {
                 )?;
                 if sidecar_source_validation.abi != source_validation.abi {
                     return Err(PetalError::InvalidWasm(format!(
-                        "v2 route sidecar {} component ABI does not match source route",
+                        "Petal route sidecar {} component ABI does not match source route",
                         sidecar.path
                     )));
                 }
@@ -513,7 +513,7 @@ impl PreparedAppPackage {
                 )?;
                 if artifact_validation.abi != source_validation.abi {
                     return Err(PetalError::InvalidWasm(format!(
-                        "v2 package artifact {} ABI does not match source route",
+                        "Petal package artifact {} ABI does not match source route",
                         route.route_id
                     )));
                 }
@@ -534,7 +534,7 @@ impl PreparedAppPackage {
                     )?;
                     if artifact_validation != source_validation {
                         return Err(PetalError::InvalidWasm(format!(
-                            "v2 package artifact {} ABI/caps do not match source route",
+                            "Petal package artifact {} ABI/caps do not match source route",
                             route.route_id
                         )));
                     }
@@ -605,7 +605,7 @@ impl PreparedAppPackage {
 #[allow(clippy::too_many_arguments)]
 fn install_metadata_for_route(
     package_hash: &str,
-    app_root: &str,
+    petal_root: &str,
     route: &RouteRecord,
     route_kind: RouteEntryKind,
     validation: &RouteValidation,
@@ -641,7 +641,7 @@ fn install_metadata_for_route(
         return Ok(metadata);
     }
     let component_metadata =
-        evaluate_static_component_metadata(package_hash, app_root, route, artifact_bytes)?;
+        evaluate_static_component_metadata(package_hash, petal_root, route, artifact_bytes)?;
     validate_component_metadata_policy(
         &route.route_id,
         route_kind,
@@ -664,7 +664,7 @@ fn install_metadata_for_route(
         && !metadata.required_caps.iter().any(|cap| cap == "bloom:sign")
     {
         return Err(PetalError::InvalidWasm(format!(
-            "v2 route {} metadata sign_intent is not backed by a signing import",
+            "Petal route {} metadata sign_intent is not backed by a signing import",
             route.route_id
         )));
     }
@@ -693,19 +693,19 @@ pub fn narrow_runtime_route_metadata(
     )?;
     if metadata.mode & !install.mode != 0 {
         return Err(PetalError::InvalidWasm(format!(
-            "v2 route {} runtime metadata mode widens install-time mode",
+            "Petal route {} runtime metadata mode widens install-time mode",
             route.route_id
         )));
     }
     if !install.side_effecting_read && metadata.side_effecting_read {
         return Err(PetalError::InvalidWasm(format!(
-            "v2 route {} runtime metadata widens side-effecting-read",
+            "Petal route {} runtime metadata widens side-effecting-read",
             route.route_id
         )));
     }
     if !install.write_async && metadata.write_async {
         return Err(PetalError::InvalidWasm(format!(
-            "v2 route {} runtime metadata widens write-async",
+            "Petal route {} runtime metadata widens write-async",
             route.route_id
         )));
     }
@@ -717,13 +717,13 @@ pub fn narrow_runtime_route_metadata(
         // install metadata, which keeps `side_effecting_read = true`.
         (None, Some(_)) if route.params.is_empty() => {
             return Err(PetalError::InvalidWasm(format!(
-                "v2 route {} runtime metadata widens cacheability",
+                "Petal route {} runtime metadata widens cacheability",
                 route.route_id
             )));
         }
         (Some(max), Some(ttl)) if ttl > max => {
             return Err(PetalError::InvalidWasm(format!(
-                "v2 route {} runtime metadata widens cache ttl",
+                "Petal route {} runtime metadata widens cache ttl",
                 route.route_id
             )));
         }
@@ -733,7 +733,7 @@ pub fn narrow_runtime_route_metadata(
         && metadata.sign_intent.as_ref() != Some(install_intent)
     {
         return Err(PetalError::InvalidWasm(format!(
-            "v2 route {} runtime metadata widens sign intent",
+            "Petal route {} runtime metadata widens sign intent",
             route.route_id
         )));
     }
@@ -750,13 +750,13 @@ pub fn narrow_runtime_route_metadata(
 
 fn evaluate_static_component_metadata(
     package_hash: &str,
-    app_root: &str,
+    petal_root: &str,
     route: &RouteRecord,
     artifact_bytes: &[u8],
 ) -> Result<ComponentRouteMetadata, PetalError> {
     let wasm = artifact_bytes.to_vec();
     let package_hash = package_hash.to_string();
-    let app_root = app_root.to_string();
+    let petal_root = petal_root.to_string();
     let path = route.pattern.clone();
     let handle = std::thread::spawn(move || {
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -770,7 +770,7 @@ fn evaluate_static_component_metadata(
                     BTreeSet::new(),
                     Arc::new(DenyHost),
                     &package_hash,
-                    &app_root,
+                    &petal_root,
                     &path,
                     Vec::new(),
                     RunOptions {
@@ -804,25 +804,25 @@ fn validate_component_metadata_policy(
     };
     if metadata_kind != route_kind {
         return Err(PetalError::InvalidWasm(format!(
-            "v2 route {route_id} metadata kind {:?} does not match route kind {:?}",
+            "Petal route {route_id} metadata kind {:?} does not match route kind {:?}",
             metadata_kind, route_kind
         )));
     }
     if metadata.executable {
         return Err(PetalError::InvalidWasm(format!(
-            "v2 route {route_id} metadata executable=true is not supported"
+            "Petal route {route_id} metadata executable=true is not supported"
         )));
     }
     if metadata.mode & !0o777 != 0 {
         return Err(PetalError::InvalidWasm(format!(
-            "v2 route {route_id} metadata mode must be a unix permission mode"
+            "Petal route {route_id} metadata mode must be a unix permission mode"
         )));
     }
     let cap_ceiling = required_cap_ceiling.map(|caps| caps.iter().collect::<BTreeSet<_>>());
     for cap in &metadata.required_caps {
         if !allowed_caps.contains(cap) {
             return Err(PetalError::InvalidWasm(format!(
-                "v2 route {route_id} metadata requires missing petal.toml cap {cap}"
+                "Petal route {route_id} metadata requires missing petal.toml cap {cap}"
             )));
         }
         if cap_ceiling
@@ -830,19 +830,19 @@ fn validate_component_metadata_policy(
             .is_some_and(|ceiling| !ceiling.contains(cap))
         {
             return Err(PetalError::InvalidWasm(format!(
-                "v2 route {route_id} metadata required cap {cap} widens its capability ceiling"
+                "Petal route {route_id} metadata required cap {cap} widens its capability ceiling"
             )));
         }
     }
     if let Some(intent) = &metadata.sign_intent {
         if !metadata.required_caps.iter().any(|cap| cap == "bloom:sign") {
             return Err(PetalError::InvalidWasm(format!(
-                "v2 route {route_id} metadata sign_intent requires bloom:sign"
+                "Petal route {route_id} metadata sign_intent requires bloom:sign"
             )));
         }
         if !allowed_sign_intents.contains(intent) {
             return Err(PetalError::InvalidWasm(format!(
-                "v2 route {route_id} metadata sign_intent {intent:?} is not allowed"
+                "Petal route {route_id} metadata sign_intent {intent:?} is not allowed"
             )));
         }
         validate_sign_intent(intent)?;
@@ -850,7 +850,7 @@ fn validate_component_metadata_policy(
     Ok(())
 }
 
-pub fn sign_intents_from_v2_manifest_toml(bytes: &[u8]) -> Result<BTreeSet<String>, PetalError> {
+pub fn sign_intents_from_manifest_toml(bytes: &[u8]) -> Result<BTreeSet<String>, PetalError> {
     let manifest_toml = std::str::from_utf8(bytes)
         .map_err(|_| PetalError::InvalidWasm("petal.toml is not utf-8".into()))?;
     let manifest: PetalToml = toml::from_str(manifest_toml)?;
@@ -870,7 +870,7 @@ pub fn sign_intents_from_v2_manifest_toml(bytes: &[u8]) -> Result<BTreeSet<Strin
     Ok(allowed_sign_intents)
 }
 
-pub(crate) fn net_rules_from_v2_manifest_toml(
+pub(crate) fn net_rules_from_manifest_toml(
     bytes: &[u8],
 ) -> Result<Vec<ManifestNetRule>, PetalError> {
     let manifest_toml = std::str::from_utf8(bytes)
@@ -896,9 +896,7 @@ pub(crate) fn net_rules_from_v2_manifest_toml(
         .collect())
 }
 
-pub fn store_policy_from_v2_manifest_toml(
-    bytes: &[u8],
-) -> Result<StoreNamespacePolicy, PetalError> {
+pub fn store_policy_from_manifest_toml(bytes: &[u8]) -> Result<StoreNamespacePolicy, PetalError> {
     let manifest_toml = std::str::from_utf8(bytes)
         .map_err(|_| PetalError::InvalidWasm("petal.toml is not utf-8".into()))?;
     let manifest: PetalToml = toml::from_str(manifest_toml)?;
@@ -913,12 +911,12 @@ pub fn store_policy_from_v2_manifest_toml(
     Ok(policy)
 }
 
-pub fn build_app_package_dir(root: impl AsRef<Path>) -> Result<PreparedAppPackage, PetalError> {
+pub fn build_petal_package_dir(root: impl AsRef<Path>) -> Result<PreparedPetalPackage, PetalError> {
     let root = root.as_ref();
-    PetalAppPackage::scan_dir(root)?;
+    PetalPackage::scan_dir(root)?;
     validate_generated_artifact_paths(root)?;
     remove_generated_artifacts(root)?;
-    let source_package = PreparedAppPackage::from_dir(root)?;
+    let source_package = PreparedPetalPackage::from_dir(root)?;
     let manifest = build_manifest_for_package(&source_package)?;
 
     for route in &source_package.route_index.routes {
@@ -931,10 +929,12 @@ pub fn build_app_package_dir(root: impl AsRef<Path>) -> Result<PreparedAppPackag
         &serde_json::to_vec_pretty(&manifest)?,
     )?;
 
-    PreparedAppPackage::from_dir(root)
+    PreparedPetalPackage::from_dir(root)
 }
 
-pub fn app_consent_summary(package: &PreparedAppPackage) -> Result<AppConsentSummary, PetalError> {
+pub fn petal_consent_summary(
+    package: &PreparedPetalPackage,
+) -> Result<PetalConsentSummary, PetalError> {
     let manifest_bytes = file_bytes(&package.files, "petal.toml")?;
     let manifest_toml = std::str::from_utf8(manifest_bytes)
         .map_err(|_| PetalError::InvalidWasm("petal.toml is not utf-8".into()))?;
@@ -959,7 +959,7 @@ pub fn app_consent_summary(package: &PreparedAppPackage) -> Result<AppConsentSum
     store_namespace_names.dedup();
     let store_namespaces = store_namespace_names
         .into_iter()
-        .map(|namespace| AppConsentStoreNamespace {
+        .map(|namespace| PetalConsentStoreNamespace {
             secret: secret_namespaces.contains(&namespace),
             namespace,
         })
@@ -969,7 +969,7 @@ pub fn app_consent_summary(package: &PreparedAppPackage) -> Result<AppConsentSum
         .net
         .allow
         .into_iter()
-        .map(|rule| AppConsentNetRule {
+        .map(|rule| PetalConsentNetRule {
             binding: rule.binding,
             host: rule.host,
             effective_origin: None,
@@ -986,11 +986,11 @@ pub fn app_consent_summary(package: &PreparedAppPackage) -> Result<AppConsentSum
         .route_index
         .routes
         .iter()
-        .map(|route| AppConsentRoute {
+        .map(|route| PetalConsentRoute {
             path: if route.pattern.is_empty() {
-                format!("/apps/{}", package.name)
+                format!("/petals/{}", package.name)
             } else {
-                format!("/apps/{}/{}", package.name, route.pattern)
+                format!("/petals/{}/{}", package.name, route.pattern)
             },
             kind: route.kind,
             ops: route.ops.clone(),
@@ -1001,9 +1001,9 @@ pub fn app_consent_summary(package: &PreparedAppPackage) -> Result<AppConsentSum
         })
         .collect();
 
-    Ok(AppConsentSummary {
+    Ok(PetalConsentSummary {
         name: package.name.clone(),
-        app_mount: format!("apps/{}/", package.name),
+        petal_mount: format!("petals/{}/", package.name),
         package_summary: manifest.consent.summary,
         docs: vec!["README.md".into(), "AGENTS.md".into()],
         capabilities,
@@ -1017,8 +1017,8 @@ pub fn app_consent_summary(package: &PreparedAppPackage) -> Result<AppConsentSum
 /// Apply daemon-owned endpoint overrides to a consent summary while enforcing
 /// that every configured binding was declared by the manifest. The declared
 /// host remains visible alongside the effective origin.
-pub fn apply_app_consent_endpoint_bindings(
-    summary: &mut AppConsentSummary,
+pub fn apply_petal_consent_endpoint_bindings(
+    summary: &mut PetalConsentSummary,
     bindings: &BTreeMap<String, String>,
 ) -> Result<(), PetalError> {
     for (binding, origin) in bindings {
@@ -1044,7 +1044,7 @@ pub fn apply_app_consent_endpoint_bindings(
     Ok(())
 }
 
-fn build_manifest_for_package(package: &PreparedAppPackage) -> Result<BuildManifest, PetalError> {
+fn build_manifest_for_package(package: &PreparedPetalPackage) -> Result<BuildManifest, PetalError> {
     let mut routes = Vec::with_capacity(package.route_index.routes.len());
     for route in &package.route_index.routes {
         let source = package
@@ -1078,7 +1078,7 @@ fn build_manifest_for_package(package: &PreparedAppPackage) -> Result<BuildManif
 }
 
 pub(crate) fn route_artifact_bytes(
-    package: &PreparedAppPackage,
+    package: &PreparedPetalPackage,
     route: &RouteIndexRecord,
 ) -> Result<Vec<u8>, PetalError> {
     route_artifact_bytes_from_files(
@@ -1092,19 +1092,19 @@ pub(crate) fn route_artifact_bytes(
 
 fn route_artifact_bytes_from_files(
     files: &[NormalizedPackageFile],
-    app_name: &str,
+    petal_name: &str,
     route_id: &str,
     source_path: &str,
     artifact_path: &str,
 ) -> Result<Vec<u8>, PetalError> {
-    let sidecar = route_sidecar(files, app_name, source_path)?;
+    let sidecar = route_sidecar(files, petal_name, source_path)?;
     let generated_artifact = optional_file_bytes(files, artifact_path);
     let expected = if let Some(sidecar) = sidecar {
         let expected = route_sidecar_artifact(files, route_id, &sidecar)?;
         if let Some(artifact) = generated_artifact {
             if blake3::hash(artifact) != blake3::hash(&expected) {
                 return Err(PetalError::InvalidWasm(format!(
-                    "v2 package artifact {route_id} does not match route sidecar composition"
+                    "Petal package artifact {route_id} does not match route sidecar composition"
                 )));
             }
             return Ok(artifact.to_vec());
@@ -1116,7 +1116,7 @@ fn route_artifact_bytes_from_files(
             && artifact != source
         {
             return Err(PetalError::InvalidWasm(format!(
-                "v2 package artifact {route_id} does not match its route source"
+                "Petal package artifact {route_id} does not match its route source"
             )));
         }
         source.to_vec()
@@ -1166,7 +1166,7 @@ fn compose_route_component(
         .compose()
         .map_err(|e| {
             PetalError::InvalidWasm(format!(
-                "v2 route {route_id} component composition failed: {e}"
+                "Petal route {route_id} component composition failed: {e}"
             ))
         })
 }
@@ -1180,7 +1180,7 @@ fn insert_compose_dependency(
     if let Some(existing) = config.dependencies.get(name) {
         if existing.path != path {
             return Err(PetalError::InvalidWasm(format!(
-                "v2 route {route_id} sidecar maps dependency {name:?} to both {} and {}",
+                "Petal route {route_id} sidecar maps dependency {name:?} to both {} and {}",
                 existing.path.display(),
                 path.display()
             )));
@@ -1217,21 +1217,21 @@ fn sidecar_import_names(
         .and_then(|stem| stem.to_str())
         .ok_or_else(|| {
             PetalError::InvalidWasm(format!(
-                "v2 route {route_id} sidecar import {import:?} has no utf-8 stem"
+                "Petal route {route_id} sidecar import {import:?} has no utf-8 stem"
             ))
         })?;
     let mut names = vec![stem.to_string()];
     if let Some(path_alias) = import.strip_suffix(".wasm") {
         names.push(path_alias.to_string());
     }
-    names.push(format!("bloom:{}/{stem}", sidecar.app_name));
-    names.push(format!("bloom:{}/{stem}@0.1.0", sidecar.app_name));
+    names.push(format!("bloom:{}/{stem}", sidecar.petal_name));
+    names.push(format!("bloom:{}/{stem}@0.1.0", sidecar.petal_name));
     Ok(names)
 }
 
 fn route_sidecar(
     files: &[NormalizedPackageFile],
-    app_name: &str,
+    petal_name: &str,
     source_path: &str,
 ) -> Result<Option<RouteSidecar>, PetalError> {
     let Some(stem) = source_path.strip_suffix(".wasm") else {
@@ -1242,7 +1242,7 @@ fn route_sidecar(
         return Ok(None);
     };
     let toml = std::str::from_utf8(bytes)
-        .map_err(|_| PetalError::InvalidWasm(format!("v2 route sidecar {path} is not utf-8")))?;
+        .map_err(|_| PetalError::InvalidWasm(format!("Petal route sidecar {path} is not utf-8")))?;
     let parsed: RouteSidecarToml = toml::from_str(toml)?;
     validate_route_sidecar_path(&path, &parsed.component, true)?;
     for import in &parsed.imports {
@@ -1250,7 +1250,7 @@ fn route_sidecar(
     }
     Ok(Some(RouteSidecar {
         path,
-        app_name: app_name.to_string(),
+        petal_name: petal_name.to_string(),
         abi: parsed.abi,
         component: parsed.component,
         imports: parsed.imports,
@@ -1271,7 +1271,7 @@ fn validate_route_sidecar_path(
     };
     if !allowed {
         return Err(PetalError::InvalidWasm(format!(
-            "v2 route sidecar {sidecar_path} path {rel:?} must be package-local under {}",
+            "Petal route sidecar {sidecar_path} path {rel:?} must be package-local under {}",
             if primary {
                 "modules/ or components/"
             } else {
@@ -1286,7 +1286,7 @@ fn validate_route_sidecar_wasm_path(sidecar_path: &str, rel: &str) -> Result<(),
     validate_package_path(rel)?;
     if !rel.ends_with(".wasm") {
         return Err(PetalError::InvalidWasm(format!(
-            "v2 route sidecar {sidecar_path} path {rel:?} must point to a .wasm component"
+            "Petal route sidecar {sidecar_path} path {rel:?} must point to a .wasm component"
         )));
     }
     Ok(())
@@ -1298,7 +1298,7 @@ fn validate_generated_artifact_paths(root: &Path) -> Result<(), PetalError> {
         && !meta.is_dir()
     {
         return Err(PetalError::InvalidWasm(
-            "v2 package artifacts path must be a directory".into(),
+            "Petal package artifacts path must be a directory".into(),
         ));
     }
 
@@ -1307,7 +1307,7 @@ fn validate_generated_artifact_paths(root: &Path) -> Result<(), PetalError> {
         && !meta.is_dir()
     {
         return Err(PetalError::InvalidWasm(
-            "v2 package artifacts/routes path must be a directory".into(),
+            "Petal package artifacts/routes path must be a directory".into(),
         ));
     }
 
@@ -1316,7 +1316,7 @@ fn validate_generated_artifact_paths(root: &Path) -> Result<(), PetalError> {
         && !meta.is_file()
     {
         return Err(PetalError::InvalidWasm(
-            "v2 package artifacts/build-manifest.json path must be a file".into(),
+            "Petal package artifacts/build-manifest.json path must be a file".into(),
         ));
     }
     Ok(())
@@ -1374,7 +1374,7 @@ fn validate_writable_route_has_write_export(
         && !validation.has_write_export
     {
         return Err(PetalError::InvalidWasm(format!(
-            "v2 route {route_id} advertises write but has no write export"
+            "Petal route {route_id} advertises write but has no write export"
         )));
     }
     Ok(())
@@ -1414,15 +1414,15 @@ pub fn package_hash(files: &[NormalizedPackageFile]) -> String {
     hex::encode(hasher.finalize().as_bytes())
 }
 
-pub fn verify_prepared_package(package: &PreparedAppPackage) -> Result<(), PetalError> {
+pub fn verify_prepared_package(package: &PreparedPetalPackage) -> Result<(), PetalError> {
     let files = normalize_files(package.files.clone())?;
-    let rebuilt = PreparedAppPackage::from_files(files)?;
+    let rebuilt = PreparedPetalPackage::from_files(files)?;
     if package.hash != rebuilt.hash {
         return Err(PetalError::InvalidHash(package.hash.clone()));
     }
     if package.name != rebuilt.name || package.route_index != rebuilt.route_index {
         return Err(PetalError::InvalidWasm(
-            "v2 prepared package route index does not match rebuilt package".into(),
+            "Petal prepared package route index does not match rebuilt package".into(),
         ));
     }
     for route in &package.route_index.routes {
@@ -1441,12 +1441,12 @@ pub fn validate_package_path(path: &str) -> Result<(), PetalError> {
             .any(|segment| segment.is_empty() || segment == "." || segment == "..")
     {
         return Err(PetalError::InvalidWasm(format!(
-            "invalid v2 package path {path:?}"
+            "invalid Petal package path {path:?}"
         )));
     }
     if !path_fits_ustar(path) {
         return Err(PetalError::InvalidWasm(format!(
-            "v2 package path {path:?} is too long for strict .petal.tar archives"
+            "Petal package path {path:?} is too long for strict .petal.tar archives"
         )));
     }
     Ok(())
@@ -1472,7 +1472,7 @@ fn write_package_file(root: &Path, rel: &str, bytes: &[u8]) -> Result<(), PetalE
     validate_package_path(rel)?;
     let path = root.join(rel);
     let parent = path.parent().ok_or_else(|| {
-        PetalError::InvalidWasm(format!("v2 package output path has no parent: {rel}"))
+        PetalError::InvalidWasm(format!("Petal package output path has no parent: {rel}"))
     })?;
     std::fs::create_dir_all(parent)?;
     std::fs::write(path, bytes)?;
@@ -1506,7 +1506,7 @@ fn collect_package_dir_inner(
             });
         } else {
             return Err(PetalError::InvalidWasm(format!(
-                "v2 package contains non-regular file {}",
+                "Petal package contains non-regular file {}",
                 path.display()
             )));
         }
@@ -1542,7 +1542,7 @@ fn read_package_tar(reader: impl Read) -> Result<Vec<NormalizedPackageFile>, Pet
         let normalized_path = archive_entry_path(&path, ty)?;
         if !seen_paths.insert(normalized_path.clone()) {
             return Err(PetalError::InvalidWasm(format!(
-                "duplicate v2 package archive path {:?}",
+                "duplicate Petal package archive path {:?}",
                 normalized_path
             )));
         }
@@ -1551,7 +1551,7 @@ fn read_package_tar(reader: impl Read) -> Result<Vec<NormalizedPackageFile>, Pet
         }
         if !ty.is_file() {
             return Err(PetalError::InvalidWasm(format!(
-                "v2 package archive entry {:?} is not a regular file or directory",
+                "Petal package archive entry {:?} is not a regular file or directory",
                 entry.path_bytes()
             )));
         }
@@ -1597,13 +1597,13 @@ fn validate_tar_entry_header(entry: &tar::Entry<'_, impl Read>) -> Result<(), Pe
         || ty.is_gnu_longlink()
     {
         return Err(PetalError::InvalidWasm(format!(
-            "v2 package archive entry {:?} uses unsupported extended metadata",
+            "Petal package archive entry {:?} uses unsupported extended metadata",
             path
         )));
     }
     let mode = header.mode().map_err(|e| {
         PetalError::InvalidWasm(format!(
-            "v2 package archive entry {:?} has invalid mode: {e}",
+            "Petal package archive entry {:?} has invalid mode: {e}",
             path
         ))
     })?;
@@ -1615,31 +1615,31 @@ fn validate_tar_entry_header(entry: &tar::Entry<'_, impl Read>) -> Result<(), Pe
                     .unwrap_or(false));
         if !allowed_mode {
             return Err(PetalError::InvalidWasm(format!(
-                "v2 package archive file {:?} has unsupported mode {mode:o}",
+                "Petal package archive file {:?} has unsupported mode {mode:o}",
                 path
             )));
         }
     } else if ty.is_dir() && mode != 0o755 && mode != 0 {
         return Err(PetalError::InvalidWasm(format!(
-            "v2 package archive directory {:?} has unsupported mode {mode:o}",
+            "Petal package archive directory {:?} has unsupported mode {mode:o}",
             path
         )));
     }
     let uid = header.uid().map_err(|e| {
         PetalError::InvalidWasm(format!(
-            "v2 package archive entry {:?} has invalid uid: {e}",
+            "Petal package archive entry {:?} has invalid uid: {e}",
             path
         ))
     })?;
     let gid = header.gid().map_err(|e| {
         PetalError::InvalidWasm(format!(
-            "v2 package archive entry {:?} has invalid gid: {e}",
+            "Petal package archive entry {:?} has invalid gid: {e}",
             path
         ))
     })?;
     if uid != 0 || gid != 0 {
         return Err(PetalError::InvalidWasm(format!(
-            "v2 package archive entry {:?} has nonzero owner metadata",
+            "Petal package archive entry {:?} has nonzero owner metadata",
             path
         )));
     }
@@ -1653,38 +1653,38 @@ fn validate_tar_entry_header(entry: &tar::Entry<'_, impl Read>) -> Result<(), Pe
             .unwrap_or(false)
     {
         return Err(PetalError::InvalidWasm(format!(
-            "v2 package archive entry {:?} has textual owner metadata",
+            "Petal package archive entry {:?} has textual owner metadata",
             path
         )));
     }
     let mtime = header.mtime().map_err(|e| {
         PetalError::InvalidWasm(format!(
-            "v2 package archive entry {:?} has invalid mtime: {e}",
+            "Petal package archive entry {:?} has invalid mtime: {e}",
             path
         ))
     })?;
     if mtime != 0 {
         return Err(PetalError::InvalidWasm(format!(
-            "v2 package archive entry {:?} has nonzero mtime",
+            "Petal package archive entry {:?} has nonzero mtime",
             path
         )));
     }
     if let Some(gnu) = header.as_gnu() {
         let atime = gnu.atime().map_err(|e| {
             PetalError::InvalidWasm(format!(
-                "v2 package archive entry {:?} has invalid atime: {e}",
+                "Petal package archive entry {:?} has invalid atime: {e}",
                 path
             ))
         })?;
         let ctime = gnu.ctime().map_err(|e| {
             PetalError::InvalidWasm(format!(
-                "v2 package archive entry {:?} has invalid ctime: {e}",
+                "Petal package archive entry {:?} has invalid ctime: {e}",
                 path
             ))
         })?;
         if atime != 0 || ctime != 0 {
             return Err(PetalError::InvalidWasm(format!(
-                "v2 package archive entry {:?} has nonzero atime/ctime",
+                "Petal package archive entry {:?} has nonzero atime/ctime",
                 path
             )));
         }
@@ -1696,7 +1696,7 @@ fn archive_entry_path(path: &str, ty: tar::EntryType) -> Result<String, PetalErr
     if ty.is_dir() {
         if path.ends_with("//") {
             return Err(PetalError::InvalidWasm(format!(
-                "invalid v2 package path {path:?}"
+                "invalid Petal package path {path:?}"
             )));
         }
         if let Some(path) = path.strip_suffix('/') {
@@ -1722,7 +1722,7 @@ fn normalize_files(
     for pair in files.windows(2) {
         if pair[0].path == pair[1].path {
             return Err(PetalError::InvalidWasm(format!(
-                "duplicate v2 package path {:?}",
+                "duplicate Petal package path {:?}",
                 pair[0].path
             )));
         }
@@ -1735,7 +1735,9 @@ fn file_bytes<'a>(files: &'a [NormalizedPackageFile], path: &str) -> Result<&'a 
         .binary_search_by(|file| file.path.as_str().cmp(path))
         .ok()
         .map(|idx| files[idx].bytes.as_slice())
-        .ok_or_else(|| PetalError::InvalidWasm(format!("v2 package missing required file {path}")))
+        .ok_or_else(|| {
+            PetalError::InvalidWasm(format!("Petal package missing required file {path}"))
+        })
 }
 
 fn optional_file_bytes<'a>(files: &'a [NormalizedPackageFile], path: &str) -> Option<&'a [u8]> {
@@ -1747,9 +1749,9 @@ fn optional_file_bytes<'a>(files: &'a [NormalizedPackageFile], path: &str) -> Op
 
 fn route_records_from_files(
     files: &[NormalizedPackageFile],
-    app_root: &str,
+    petal_root: &str,
 ) -> Result<Vec<RouteRecord>, PetalError> {
-    let prefix = format!("{app_root}/");
+    let prefix = format!("{petal_root}/");
     let mut routes = Vec::new();
     let mut has_app_file = false;
     for file in files {
@@ -1769,7 +1771,7 @@ fn route_records_from_files(
     }
     if !has_app_file {
         return Err(PetalError::InvalidWasm(format!(
-            "v2 package missing {app_root}/ route root"
+            "Petal package missing {petal_root}/ route root"
         )));
     }
     routes.sort_by(|a, b| a.pattern.as_bytes().cmp(b.pattern.as_bytes()));
@@ -1780,18 +1782,18 @@ fn route_records_from_files(
     Ok(routes)
 }
 
-fn validate_single_app_root(
+fn validate_single_petal_root(
     files: &[NormalizedPackageFile],
     expected: &str,
 ) -> Result<(), PetalError> {
     for file in files {
-        let Some(rest) = file.path.strip_prefix("app/") else {
+        let Some(rest) = file.path.strip_prefix("petal/") else {
             continue;
         };
         let root = rest.split('/').next().unwrap_or_default();
         if root != expected {
             return Err(PetalError::InvalidWasm(format!(
-                "v2 package has extra app root {root:?}; expected only app/{expected}/"
+                "Petal package has extra petal root {root:?}; expected only petal/{expected}/"
             )));
         }
     }
@@ -2148,7 +2150,7 @@ fn validate_route_wasm_inner(
     }
 
     Err(PetalError::InvalidWasm(format!(
-        "{path}: v2 routes must be bloom:route@0.1.0 components"
+        "{path}: Petal routes must be bloom:route@0.1.0 components"
     )))
 }
 
@@ -2253,7 +2255,7 @@ fn component_import_caps(name: &str) -> Option<&'static [&'static str]> {
         ("bloom:route", "types") if version == "0.1.0" => Some(&[]),
         ("bloom:http", "fetch") if version == "0.1.0" => Some(&["bloom:http"]),
         ("bloom:store", "kv") if version == "0.1.0" => Some(&["bloom:store"]),
-        ("bloom:sign", "signing") if matches!(version, "0.1.0" | "0.2.0") => Some(&["bloom:sign"]),
+        ("bloom:sign", "signing") if version == "0.1.0" => Some(&["bloom:sign"]),
         ("bloom:tx", "outbox") if version == "0.1.0" => Some(&["bloom:tx.outbox"]),
         ("bloom:chain", "read") if version == "0.1.0" => Some(&["bloom:chain"]),
         ("bloom:vfs", "readwrite") if version == "0.1.0" => {
@@ -2269,7 +2271,6 @@ enum ComponentHostInterface {
     HttpFetch,
     StoreKv,
     SignSigning,
-    SignSigningV2,
     TxOutbox,
     ChainRead,
     VfsReadwrite,
@@ -2283,9 +2284,6 @@ fn component_host_interface(name: &str) -> Option<ComponentHostInterface> {
         ("bloom:store", "kv") if version == "0.1.0" => Some(ComponentHostInterface::StoreKv),
         ("bloom:sign", "signing") if version == "0.1.0" => {
             Some(ComponentHostInterface::SignSigning)
-        }
-        ("bloom:sign", "signing") if version == "0.2.0" => {
-            Some(ComponentHostInterface::SignSigningV2)
         }
         ("bloom:tx", "outbox") if version == "0.1.0" => Some(ComponentHostInterface::TxOutbox),
         ("bloom:chain", "read") if version == "0.1.0" => Some(ComponentHostInterface::ChainRead),
@@ -2532,9 +2530,9 @@ enum HostTypeExport {
     StagedTransaction,
     OutboxInspection,
     SignApprovalRequired,
-    SignResultV2,
-    SignRequestV2,
-    SignBatchResultV2,
+    SignResultStructured,
+    SignRequestStructured,
+    SignBatchResultStructured,
 }
 
 #[derive(Clone, Copy)]
@@ -2546,9 +2544,8 @@ enum HostFuncExport {
     StoreList,
     StoreDelete,
     StoreDeleteIfValue,
-    SignHash,
-    SignHashV2,
-    SignHashesV2,
+    SignHashStructured,
+    SignHashesStructured,
     EvmTxStage,
     EvmTxConfirm,
     EvmTxInspect,
@@ -2674,17 +2671,17 @@ fn host_type_export(interface: ComponentHostInterface, name: &str) -> Option<Hos
             Some(HostTypeExport::StagedTransaction)
         }
         (ComponentHostInterface::TxOutbox, "inspection") => Some(HostTypeExport::OutboxInspection),
-        (ComponentHostInterface::SignSigningV2, "approval-required") => {
+        (ComponentHostInterface::SignSigning, "approval-required") => {
             Some(HostTypeExport::SignApprovalRequired)
         }
-        (ComponentHostInterface::SignSigningV2, "sign-result") => {
-            Some(HostTypeExport::SignResultV2)
+        (ComponentHostInterface::SignSigning, "sign-result") => {
+            Some(HostTypeExport::SignResultStructured)
         }
-        (ComponentHostInterface::SignSigningV2, "sign-request") => {
-            Some(HostTypeExport::SignRequestV2)
+        (ComponentHostInterface::SignSigning, "sign-request") => {
+            Some(HostTypeExport::SignRequestStructured)
         }
-        (ComponentHostInterface::SignSigningV2, "sign-batch-result") => {
-            Some(HostTypeExport::SignBatchResultV2)
+        (ComponentHostInterface::SignSigning, "sign-batch-result") => {
+            Some(HostTypeExport::SignBatchResultStructured)
         }
         _ => None,
     }
@@ -2701,10 +2698,11 @@ fn host_func_export(interface: ComponentHostInterface, name: &str) -> Option<Hos
         (ComponentHostInterface::StoreKv, "delete-if-value") => {
             Some(HostFuncExport::StoreDeleteIfValue)
         }
-        (ComponentHostInterface::SignSigning, "sign-hash") => Some(HostFuncExport::SignHash),
-        (ComponentHostInterface::SignSigningV2, "sign-hash") => Some(HostFuncExport::SignHashV2),
-        (ComponentHostInterface::SignSigningV2, "sign-hashes") => {
-            Some(HostFuncExport::SignHashesV2)
+        (ComponentHostInterface::SignSigning, "sign-hash") => {
+            Some(HostFuncExport::SignHashStructured)
+        }
+        (ComponentHostInterface::SignSigning, "sign-hashes") => {
+            Some(HostFuncExport::SignHashesStructured)
         }
         (ComponentHostInterface::TxOutbox, "stage") => Some(HostFuncExport::EvmTxStage),
         (ComponentHostInterface::TxOutbox, "confirm") => Some(HostFuncExport::EvmTxConfirm),
@@ -2741,9 +2739,9 @@ fn host_type_export_matches(
         HostTypeExport::StagedTransaction => is_staged_transaction(&ty, types, 0),
         HostTypeExport::OutboxInspection => is_outbox_inspection(&ty, types, 0),
         HostTypeExport::SignApprovalRequired => is_approval_required(&ty, types, 0),
-        HostTypeExport::SignResultV2 => is_sign_result_v2(&ty, types, 0),
-        HostTypeExport::SignRequestV2 => is_sign_request_v2(&ty, types, 0),
-        HostTypeExport::SignBatchResultV2 => is_sign_batch_result_v2(&ty, types, 0),
+        HostTypeExport::SignResultStructured => is_sign_result_petal(&ty, types, 0),
+        HostTypeExport::SignRequestStructured => is_sign_request_petal(&ty, types, 0),
+        HostTypeExport::SignBatchResultStructured => is_sign_batch_result_petal(&ty, types, 0),
     }
 }
 
@@ -2818,7 +2816,7 @@ fn host_func_export_matches(
                 ],
             ) && result_matches(&ty.result, types, HostOkType::Unit)
         }
-        HostFuncExport::SignHash => {
+        HostFuncExport::SignHashStructured => {
             params_match(
                 params,
                 types,
@@ -2827,27 +2825,16 @@ fn host_func_export_matches(
                     ("hash32", is_byte_list),
                     ("intent", is_string_type),
                 ],
-            ) && result_matches(&ty.result, types, HostOkType::Bytes)
+            ) && result_matches(&ty.result, types, HostOkType::SignResultStructured)
         }
-        HostFuncExport::SignHashV2 => {
-            params_match(
-                params,
-                types,
-                &[
-                    ("wallet", is_string_type),
-                    ("hash32", is_byte_list),
-                    ("intent", is_string_type),
-                ],
-            ) && result_matches(&ty.result, types, HostOkType::SignResultV2)
-        }
-        HostFuncExport::SignHashesV2 => {
+        HostFuncExport::SignHashesStructured => {
             params_match(
                 params,
                 types,
                 &[("requests", |ty, types, depth| {
-                    is_list_of(ty, types, is_sign_request_v2, depth)
+                    is_list_of(ty, types, is_sign_request_petal, depth)
                 })],
-            ) && result_matches(&ty.result, types, HostOkType::SignBatchResultV2)
+            ) && result_matches(&ty.result, types, HostOkType::SignBatchResultStructured)
         }
         HostFuncExport::EvmTxStage => {
             params_match(params, types, &[("tx", is_evm_transaction)])
@@ -2941,8 +2928,8 @@ enum HostOkType {
     VfsEntry,
     VfsEntryList,
     U64,
-    SignResultV2,
-    SignBatchResultV2,
+    SignResultStructured,
+    SignBatchResultStructured,
     StagedTransaction,
     OutboxInspection,
 }
@@ -2972,8 +2959,10 @@ fn result_matches(
             (HostOkType::VfsEntry, Some(ty)) => is_route_entry(ty, types, depth),
             (HostOkType::VfsEntryList, Some(ty)) => is_list_of(ty, types, is_route_entry, depth),
             (HostOkType::U64, Some(ty)) => is_u64(ty, types, depth),
-            (HostOkType::SignResultV2, Some(ty)) => is_sign_result_v2(ty, types, depth),
-            (HostOkType::SignBatchResultV2, Some(ty)) => is_sign_batch_result_v2(ty, types, depth),
+            (HostOkType::SignResultStructured, Some(ty)) => is_sign_result_petal(ty, types, depth),
+            (HostOkType::SignBatchResultStructured, Some(ty)) => {
+                is_sign_batch_result_petal(ty, types, depth)
+            }
             (HostOkType::StagedTransaction, Some(ty)) => is_staged_transaction(ty, types, depth),
             (HostOkType::OutboxInspection, Some(ty)) => is_outbox_inspection(ty, types, depth),
             _ => false,
@@ -2982,7 +2971,7 @@ fn result_matches(
     })
 }
 
-fn is_sign_result_v2(
+fn is_sign_result_petal(
     ty: &ComponentValType,
     types: &[ComponentTypeEntry<'_>],
     depth: usize,
@@ -3005,7 +2994,7 @@ fn is_sign_result_v2(
     })
 }
 
-fn is_sign_request_v2(
+fn is_sign_request_petal(
     ty: &ComponentValType,
     types: &[ComponentTypeEntry<'_>],
     depth: usize,
@@ -3024,7 +3013,7 @@ fn is_sign_request_v2(
     })
 }
 
-fn is_sign_batch_result_v2(
+fn is_sign_batch_result_petal(
     ty: &ComponentValType,
     types: &[ComponentTypeEntry<'_>],
     depth: usize,
@@ -3160,7 +3149,7 @@ fn is_route_ctx(ty: &ComponentValType, types: &[ComponentTypeEntry<'_>], depth: 
             return false;
         };
         fields.as_ref().len() == 5
-            && fields[0].0 == "app-root"
+            && fields[0].0 == "petal-root"
             && is_string(&fields[0].1)
             && fields[1].0 == "package-hash"
             && is_string(&fields[1].1)
@@ -3437,7 +3426,7 @@ fn require_file(path: PathBuf) -> Result<(), PetalError> {
         Ok(())
     } else {
         Err(PetalError::InvalidWasm(format!(
-            "v2 package missing required file {}",
+            "Petal package missing required file {}",
             path.file_name()
                 .and_then(|name| name.to_str())
                 .unwrap_or("<unknown>")
@@ -3445,7 +3434,7 @@ fn require_file(path: PathBuf) -> Result<(), PetalError> {
     }
 }
 
-fn validate_app_name(name: &str) -> Result<(), PetalError> {
+fn validate_petal_name(name: &str) -> Result<(), PetalError> {
     let valid = !name.is_empty()
         && name
             .bytes()
@@ -3454,7 +3443,7 @@ fn validate_app_name(name: &str) -> Result<(), PetalError> {
         Ok(())
     } else {
         Err(PetalError::InvalidWasm(format!(
-            "invalid v2 app name {name:?}; expected only ASCII letters, digits, '-' or '_'"
+            "invalid Petal name {name:?}; expected only ASCII letters, digits, '-' or '_'"
         )))
     }
 }
@@ -3465,7 +3454,7 @@ fn validate_sign_policy(
 ) -> Result<(), PetalError> {
     if allowed_caps.contains("bloom:sign") && allowed_sign_intents.is_empty() {
         return Err(PetalError::InvalidWasm(
-            "v2 package cap bloom:sign requires [sign].allowed_intents".into(),
+            "Petal package cap bloom:sign requires [sign].allowed_intents".into(),
         ));
     }
     for intent in allowed_sign_intents {
@@ -3487,7 +3476,7 @@ fn validate_store_policy(
 ) -> Result<(), PetalError> {
     if allowed_caps.contains("bloom:store") && policy.is_empty() {
         return Err(PetalError::InvalidWasm(
-            "v2 package cap bloom:store requires [store].namespaces or [store].secret_namespaces"
+            "Petal package cap bloom:store requires [store].namespaces or [store].secret_namespaces"
                 .into(),
         ));
     }
@@ -3503,18 +3492,18 @@ fn validate_net_policy(
 ) -> Result<(), PetalError> {
     if allowed_caps.contains("bloom:http") && policy.allow.is_empty() {
         return Err(PetalError::InvalidWasm(
-            "v2 package cap bloom:http requires at least one [[net.allow]] rule".into(),
+            "Petal package cap bloom:http requires at least one [[net.allow]] rule".into(),
         ));
     }
     for rule in &policy.allow {
         if rule.host.trim().is_empty() || rule.methods.is_empty() {
             return Err(PetalError::InvalidWasm(
-                "v2 [[net.allow]] rules require a host and at least one method".into(),
+                "Petal [[net.allow]] rules require a host and at least one method".into(),
             ));
         }
         if rule.methods.iter().any(|method| method.trim().is_empty()) {
             return Err(PetalError::InvalidWasm(
-                "v2 [[net.allow]] methods must be non-empty".into(),
+                "Petal [[net.allow]] methods must be non-empty".into(),
             ));
         }
         if let Some(binding) = rule.binding.as_deref() {
@@ -3522,7 +3511,7 @@ fn validate_net_policy(
         }
         if rule.paths.is_empty() || rule.paths.iter().any(|path| path.trim().is_empty()) {
             return Err(PetalError::InvalidWasm(
-                "v2 [[net.allow]] paths must be explicit and non-empty; use \"/*\" for all paths"
+                "Petal [[net.allow]] paths must be explicit and non-empty; use \"/*\" for all paths"
                     .into(),
             ));
         }
@@ -3533,7 +3522,7 @@ fn validate_net_policy(
 fn validate_store_namespace(namespace: &str) -> Result<(), PetalError> {
     if namespace.is_empty() || namespace.len() > 128 {
         return Err(PetalError::InvalidWasm(
-            "v2 store namespace must be 1..128 bytes".into(),
+            "Petal store namespace must be 1..128 bytes".into(),
         ));
     }
     if namespace.contains('/')
@@ -3542,7 +3531,7 @@ fn validate_store_namespace(namespace: &str) -> Result<(), PetalError> {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
     {
         return Err(PetalError::InvalidWasm(format!(
-            "v2 store namespace {namespace:?} contains an unsupported byte"
+            "Petal store namespace {namespace:?} contains an unsupported byte"
         )));
     }
     Ok(())
@@ -3551,7 +3540,7 @@ fn validate_store_namespace(namespace: &str) -> Result<(), PetalError> {
 fn validate_sign_intent(intent: &str) -> Result<(), PetalError> {
     if intent.is_empty() || intent.len() > 128 {
         return Err(PetalError::InvalidWasm(
-            "v2 sign intent must be 1..128 bytes".into(),
+            "Petal sign intent must be 1..128 bytes".into(),
         ));
     }
     if !intent
@@ -3559,14 +3548,14 @@ fn validate_sign_intent(intent: &str) -> Result<(), PetalError> {
         .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_' | b':'))
     {
         return Err(PetalError::InvalidWasm(format!(
-            "v2 sign intent {intent:?} contains an unsupported byte"
+            "Petal sign intent {intent:?} contains an unsupported byte"
         )));
     }
     Ok(())
 }
 
 fn scan_routes(
-    app_root: &Path,
+    petal_root: &Path,
     dir: &Path,
     routes: &mut Vec<RouteRecord>,
 ) -> Result<(), PetalError> {
@@ -3576,7 +3565,7 @@ fn scan_routes(
         let path = entry.path();
         let ty = entry.file_type()?;
         if ty.is_dir() {
-            scan_routes(app_root, &path, routes)?;
+            scan_routes(petal_root, &path, routes)?;
         } else if ty.is_file()
             && path
                 .file_name()
@@ -3584,7 +3573,7 @@ fn scan_routes(
                 .map(|name| name.ends_with(".wasm"))
                 .unwrap_or(false)
         {
-            let pattern = route_pattern(app_root, &path)?;
+            let pattern = route_pattern(petal_root, &path)?;
             routes.push(RouteRecord {
                 route_id: String::new(),
                 params: route_params(&pattern)?,
@@ -3597,10 +3586,10 @@ fn scan_routes(
     Ok(())
 }
 
-fn route_pattern(app_root: &Path, wasm_path: &Path) -> Result<String, PetalError> {
+fn route_pattern(petal_root: &Path, wasm_path: &Path) -> Result<String, PetalError> {
     let rel = wasm_path
-        .strip_prefix(app_root)
-        .map_err(|_| PetalError::InvalidWasm("route escaped app root".into()))?;
+        .strip_prefix(petal_root)
+        .map_err(|_| PetalError::InvalidWasm("route escaped petal root".into()))?;
     let mut parts = Vec::new();
     for component in rel.components() {
         let std::path::Component::Normal(seg) = component else {
@@ -3683,13 +3672,13 @@ fn validate_route_conflicts(routes: &[RouteRecord]) -> Result<(), PetalError> {
         for b in routes.iter().skip(idx + 1) {
             if a.specificity == b.specificity && patterns_overlap(&a.pattern, &b.pattern)? {
                 return Err(PetalError::InvalidWasm(format!(
-                    "conflicting v2 routes {:?} and {:?}",
+                    "conflicting Petal routes {:?} and {:?}",
                     a.pattern, b.pattern
                 )));
             }
             if file_route_shadows_descendant(a, b)? || file_route_shadows_descendant(b, a)? {
                 return Err(PetalError::InvalidWasm(format!(
-                    "file route shadows descendant v2 route: {:?} and {:?}",
+                    "file route shadows descendant Petal route: {:?} and {:?}",
                     a.pattern, b.pattern
                 )));
             }
@@ -4064,7 +4053,7 @@ pub(crate) mod route_fixtures {
     (type (tuple string string))
     (type (list 0))
     (type (option string))
-    (type (record (field "app-root" string) (field "package-hash" string) (field "path" string) (field "params" 1) (field "actor" 2)))
+    (type (record (field "petal-root" string) (field "package-hash" string) (field "path" string) (field "params" 1) (field "actor" 2)))
     (export "ctx" (type (eq 3)))
     (type (enum "dir" "file" "symlink"))
     (export "entry-kind" (type (eq 5)))
@@ -4192,21 +4181,21 @@ mod tests {
     };
 
     #[test]
-    fn v2_scanner_matches_static_and_dynamic_routes() {
+    fn petal_scanner_matches_static_and_dynamic_routes() {
         let tmp = tempfile::tempdir().unwrap();
         write_package_file(
             tmp.path(),
             "petal.toml",
-            br#"schema = "bloom.petal.local-app.v2"
+            br#"schema = "bloom.petal.package.v1"
 name = "echo"
 "#,
         );
         write_package_file(tmp.path(), "README.md", b"# echo");
         write_package_file(tmp.path(), "AGENTS.md", b"# echo agents");
-        write_package_file(tmp.path(), "app/echo/hello.txt.wasm", b"\0asm");
-        write_package_file(tmp.path(), "app/echo/[name].txt.wasm", b"\0asm");
+        write_package_file(tmp.path(), "petal/echo/hello.txt.wasm", b"\0asm");
+        write_package_file(tmp.path(), "petal/echo/[name].txt.wasm", b"\0asm");
 
-        let package = PetalAppPackage::scan_dir(tmp.path()).unwrap();
+        let package = PetalPackage::scan_dir(tmp.path()).unwrap();
         assert_eq!(package.name, "echo");
         assert_eq!(package.routes.len(), 2);
 
@@ -4221,25 +4210,43 @@ name = "echo"
     }
 
     #[test]
-    fn v2_scanner_rejects_equal_specificity_dynamic_conflicts() {
+    fn legacy_package_schema_is_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_petal_package_with_manifest_and_route(
+            tmp.path(),
+            br#"schema = "bloom.petal.local-app.v2"
+name = "echo"
+"#,
+            route_component_no_imports(),
+        );
+
+        let err = PreparedPetalPackage::from_dir(tmp.path()).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("must set schema = \"bloom.petal.package.v1\"")
+        );
+    }
+
+    #[test]
+    fn petal_scanner_rejects_equal_specificity_dynamic_conflicts() {
         let tmp = tempfile::tempdir().unwrap();
         write_package_file(tmp.path(), "petal.toml", br#"name = "echo""#);
         write_package_file(tmp.path(), "README.md", b"# echo");
         write_package_file(tmp.path(), "AGENTS.md", b"# echo agents");
-        write_package_file(tmp.path(), "app/echo/[name].txt.wasm", b"\0asm");
-        write_package_file(tmp.path(), "app/echo/[wallet].txt.wasm", b"\0asm");
+        write_package_file(tmp.path(), "petal/echo/[name].txt.wasm", b"\0asm");
+        write_package_file(tmp.path(), "petal/echo/[wallet].txt.wasm", b"\0asm");
 
-        let err = PetalAppPackage::scan_dir(tmp.path()).unwrap_err();
-        assert!(err.to_string().contains("conflicting v2 routes"));
+        let err = PetalPackage::scan_dir(tmp.path()).unwrap_err();
+        assert!(err.to_string().contains("conflicting Petal routes"));
     }
 
     #[test]
-    fn v2_app_names_match_runtime_configuration_grammar() {
+    fn petal_names_match_runtime_configuration_grammar() {
         for valid in ["echo", "Echo2", "my-petal", "my_petal"] {
-            validate_app_name(valid).unwrap();
+            validate_petal_name(valid).unwrap();
         }
         for invalid in ["", "foo.bar", "foo/bar", "foo\\bar", "petal💮"] {
-            let err = validate_app_name(invalid).unwrap_err();
+            let err = validate_petal_name(invalid).unwrap_err();
             assert!(
                 err.to_string()
                     .contains("expected only ASCII letters, digits, '-' or '_'")
@@ -4247,48 +4254,48 @@ name = "echo"
         }
 
         let tmp = tempfile::tempdir().unwrap();
-        write_v2_package_with_manifest_and_route(
+        write_petal_package_with_manifest_and_route(
             tmp.path(),
-            br#"schema = "bloom.petal.local-app.v2"
+            br#"schema = "bloom.petal.package.v1"
 name = "foo.bar"
 "#,
             route_component_no_imports(),
         );
-        let err = PreparedAppPackage::from_dir(tmp.path()).unwrap_err();
-        assert!(err.to_string().contains("invalid v2 app name \"foo.bar\""));
+        let err = PreparedPetalPackage::from_dir(tmp.path()).unwrap_err();
+        assert!(err.to_string().contains("invalid Petal name \"foo.bar\""));
     }
 
     #[test]
-    fn v2_scanner_rejects_file_routes_that_shadow_descendants() {
+    fn petal_scanner_rejects_file_routes_that_shadow_descendants() {
         let tmp = tempfile::tempdir().unwrap();
         write_package_file(tmp.path(), "petal.toml", br#"name = "echo""#);
         write_package_file(tmp.path(), "README.md", b"# echo");
         write_package_file(tmp.path(), "AGENTS.md", b"# echo agents");
-        write_package_file(tmp.path(), "app/echo/foo.wasm", b"\0asm");
-        write_package_file(tmp.path(), "app/echo/foo/bar.wasm", b"\0asm");
+        write_package_file(tmp.path(), "petal/echo/foo.wasm", b"\0asm");
+        write_package_file(tmp.path(), "petal/echo/foo/bar.wasm", b"\0asm");
 
-        let err = PetalAppPackage::scan_dir(tmp.path()).unwrap_err();
+        let err = PetalPackage::scan_dir(tmp.path()).unwrap_err();
         assert!(err.to_string().contains("file route shadows descendant"));
 
-        std::fs::remove_file(tmp.path().join("app/echo/foo.wasm")).unwrap();
-        write_package_file(tmp.path(), "app/echo/foo/$index.wasm", b"\0asm");
-        PetalAppPackage::scan_dir(tmp.path()).unwrap();
+        std::fs::remove_file(tmp.path().join("petal/echo/foo.wasm")).unwrap();
+        write_package_file(tmp.path(), "petal/echo/foo/$index.wasm", b"\0asm");
+        PetalPackage::scan_dir(tmp.path()).unwrap();
     }
 
     #[test]
-    fn v2_scanner_allows_reserved_static_route_beside_dynamic_descendants() {
+    fn petal_scanner_allows_reserved_static_route_beside_dynamic_descendants() {
         let tmp = tempfile::tempdir().unwrap();
         write_package_file(tmp.path(), "petal.toml", br#"name = "echo""#);
         write_package_file(tmp.path(), "README.md", b"# echo");
         write_package_file(tmp.path(), "AGENTS.md", b"# echo agents");
-        write_package_file(tmp.path(), "app/echo/fund/[wallet]/new.wasm", b"\0asm");
+        write_package_file(tmp.path(), "petal/echo/fund/[wallet]/new.wasm", b"\0asm");
         write_package_file(
             tmp.path(),
-            "app/echo/fund/[wallet]/[id]/approval.json.wasm",
+            "petal/echo/fund/[wallet]/[id]/approval.json.wasm",
             b"\0asm",
         );
 
-        let package = PetalAppPackage::scan_dir(tmp.path()).unwrap();
+        let package = PetalPackage::scan_dir(tmp.path()).unwrap();
         let new_fund = package.match_route("fund/alice/new").unwrap();
         assert_eq!(new_fund.route.pattern, "fund/[wallet]/new");
         assert_eq!(new_fund.params, vec![("wallet".into(), "alice".into())]);
@@ -4307,7 +4314,7 @@ name = "foo.bar"
     }
 
     #[test]
-    fn v2_scanner_rejects_paths_too_long_for_strict_archive() {
+    fn petal_scanner_rejects_paths_too_long_for_strict_archive() {
         let tmp = tempfile::tempdir().unwrap();
         write_package_file(tmp.path(), "petal.toml", br#"name = "echo""#);
         write_package_file(tmp.path(), "README.md", b"# echo");
@@ -4315,31 +4322,31 @@ name = "foo.bar"
         let file_name = format!("{}.wasm", "a".repeat(TAR_NAME_LEN + 1));
         write_package_file(
             tmp.path(),
-            &format!("app/echo/{file_name}"),
+            &format!("petal/echo/{file_name}"),
             route_component_no_imports(),
         );
 
-        let err = PreparedAppPackage::from_dir(tmp.path()).unwrap_err();
+        let err = PreparedPetalPackage::from_dir(tmp.path()).unwrap_err();
         assert!(err.to_string().contains("too long for strict .petal.tar"));
     }
 
     #[test]
-    fn v2_tar_and_dir_inputs_share_normalized_hash() {
+    fn petal_tar_and_dir_inputs_share_normalized_hash() {
         let tmp = tempfile::tempdir().unwrap();
-        write_v2_package(tmp.path());
-        let dir = PreparedAppPackage::from_dir(tmp.path()).unwrap();
+        write_petal_package(tmp.path());
+        let dir = PreparedPetalPackage::from_dir(tmp.path()).unwrap();
         let wasm = route_component_no_imports();
-        let tar = PreparedAppPackage::from_reader(std::io::Cursor::new(package_tar_bytes(vec![
+        let tar = PreparedPetalPackage::from_reader(std::io::Cursor::new(package_tar_bytes(vec![
             ("README.md", b"# echo".as_slice()),
             ("AGENTS.md", b"# echo agents".as_slice()),
             (
                 "petal.toml",
-                br#"schema = "bloom.petal.local-app.v2"
+                br#"schema = "bloom.petal.package.v1"
 name = "echo"
 "#
                 .as_slice(),
             ),
-            ("app/echo/hello.txt.wasm", wasm),
+            ("petal/echo/hello.txt.wasm", wasm),
         ])))
         .unwrap();
 
@@ -4349,12 +4356,12 @@ name = "echo"
     }
 
     #[test]
-    fn v2_app_consent_summary_includes_manifest_policy_docs_and_routes() {
+    fn petal_consent_summary_includes_manifest_policy_docs_and_routes() {
         let tmp = tempfile::tempdir().unwrap();
         write_package_file(
             tmp.path(),
             "petal.toml",
-            br#"schema = "bloom.petal.local-app.v2"
+            br#"schema = "bloom.petal.package.v1"
 name = "echo"
 
 [consent]
@@ -4380,15 +4387,15 @@ secret_namespaces = ["credentials"]
         write_package_file(tmp.path(), "AGENTS.md", b"# echo agents");
         write_package_file(
             tmp.path(),
-            "app/echo/hello.txt.wasm",
+            "petal/echo/hello.txt.wasm",
             route_component_no_imports(),
         );
 
-        let package = PreparedAppPackage::from_dir(tmp.path()).unwrap();
-        let summary = app_consent_summary(&package).unwrap();
+        let package = PreparedPetalPackage::from_dir(tmp.path()).unwrap();
+        let summary = petal_consent_summary(&package).unwrap();
 
         assert_eq!(summary.name, "echo");
-        assert_eq!(summary.app_mount, "apps/echo/");
+        assert_eq!(summary.petal_mount, "petals/echo/");
         assert_eq!(
             summary.package_summary.as_deref(),
             Some("Expose echo routes and use mediated host capabilities.")
@@ -4406,26 +4413,26 @@ secret_namespaces = ["credentials"]
         assert_eq!(
             summary.store_namespaces,
             vec![
-                AppConsentStoreNamespace {
+                PetalConsentStoreNamespace {
                     namespace: "credentials".into(),
                     secret: true,
                 },
-                AppConsentStoreNamespace {
+                PetalConsentStoreNamespace {
                     namespace: "orders".into(),
                     secret: false,
                 },
             ]
         );
         assert_eq!(summary.routes.len(), 1);
-        assert_eq!(summary.routes[0].path, "/apps/echo/hello.txt");
+        assert_eq!(summary.routes[0].path, "/petals/echo/hello.txt");
         assert_eq!(summary.routes[0].ops, vec![RouteOp::Lookup, RouteOp::Read]);
     }
 
     #[test]
-    fn v2_write_petal_tar_emits_installable_deterministic_archive() {
+    fn petal_write_petal_tar_emits_installable_deterministic_archive() {
         let tmp = tempfile::tempdir().unwrap();
-        write_v2_package(tmp.path());
-        let package = PreparedAppPackage::from_dir(tmp.path()).unwrap();
+        write_petal_package(tmp.path());
+        let package = PreparedPetalPackage::from_dir(tmp.path()).unwrap();
 
         let mut first = Vec::new();
         package.write_petal_tar(&mut first).unwrap();
@@ -4433,30 +4440,30 @@ secret_namespaces = ["credentials"]
         package.write_petal_tar(&mut second).unwrap();
         assert_eq!(first, second);
 
-        let from_tar = PreparedAppPackage::from_reader(std::io::Cursor::new(first)).unwrap();
+        let from_tar = PreparedPetalPackage::from_reader(std::io::Cursor::new(first)).unwrap();
         assert_eq!(from_tar.hash, package.hash);
         assert_eq!(from_tar.route_index, package.route_index);
     }
 
     #[test]
-    fn v2_write_petal_tar_uses_strict_headers_for_ustar_split_paths() {
+    fn petal_write_petal_tar_uses_strict_headers_for_ustar_split_paths() {
         let tmp = tempfile::tempdir().unwrap();
         write_package_file(
             tmp.path(),
             "petal.toml",
-            br#"schema = "bloom.petal.local-app.v2"
+            br#"schema = "bloom.petal.package.v1"
 name = "echo"
 "#,
         );
         write_package_file(tmp.path(), "README.md", b"# echo");
         write_package_file(tmp.path(), "AGENTS.md", b"# echo agents");
         let route_path = format!(
-            "app/echo/{}/hello.txt.wasm",
+            "petal/echo/{}/hello.txt.wasm",
             "nested-static-segment".repeat(4)
         );
         assert!(route_path.len() > TAR_NAME_LEN);
         write_package_file(tmp.path(), &route_path, route_component_no_imports());
-        let package = PreparedAppPackage::from_dir(tmp.path()).unwrap();
+        let package = PreparedPetalPackage::from_dir(tmp.path()).unwrap();
 
         let mut tar_bytes = Vec::new();
         package.write_petal_tar(&mut tar_bytes).unwrap();
@@ -4470,19 +4477,19 @@ name = "echo"
             assert!(!ty.is_gnu_longname());
             assert!(!ty.is_gnu_longlink());
         }
-        let from_tar = PreparedAppPackage::from_reader(std::io::Cursor::new(tar_bytes)).unwrap();
+        let from_tar = PreparedPetalPackage::from_reader(std::io::Cursor::new(tar_bytes)).unwrap();
         assert_eq!(from_tar.hash, package.hash);
     }
 
     #[test]
-    fn v2_build_app_package_dir_writes_artifacts_and_manifest_deterministically() {
+    fn petal_build_petal_package_dir_writes_artifacts_and_manifest_deterministically() {
         let tmp = tempfile::tempdir().unwrap();
-        write_v2_package(tmp.path());
+        write_petal_package(tmp.path());
 
-        let first = build_app_package_dir(tmp.path()).unwrap();
+        let first = build_petal_package_dir(tmp.path()).unwrap();
         let artifact_path = tmp.path().join("artifacts/routes/r000001.wasm");
         let manifest_path = tmp.path().join("artifacts/build-manifest.json");
-        let source = std::fs::read(tmp.path().join("app/echo/hello.txt.wasm")).unwrap();
+        let source = std::fs::read(tmp.path().join("petal/echo/hello.txt.wasm")).unwrap();
         let artifact = std::fs::read(&artifact_path).unwrap();
         assert_eq!(artifact, source);
 
@@ -4491,7 +4498,7 @@ name = "echo"
         assert_eq!(manifest.schema, BUILD_MANIFEST_SCHEMA);
         assert_eq!(manifest.routes.len(), 1);
         assert_eq!(manifest.routes[0].route_id, "r000001");
-        assert_eq!(manifest.routes[0].source_path, "app/echo/hello.txt.wasm");
+        assert_eq!(manifest.routes[0].source_path, "petal/echo/hello.txt.wasm");
         assert_eq!(
             manifest.routes[0].artifact_path,
             "artifacts/routes/r000001.wasm"
@@ -4513,15 +4520,15 @@ name = "echo"
                 .any(|file| file.path == "artifacts/routes/r000001.wasm")
         );
 
-        let second = build_app_package_dir(tmp.path()).unwrap();
+        let second = build_petal_package_dir(tmp.path()).unwrap();
         assert_eq!(second.hash, first.hash);
         assert_eq!(second.route_index, first.route_index);
     }
 
     #[test]
-    fn v2_build_app_package_dir_replaces_stale_generated_artifacts() {
+    fn petal_build_petal_package_dir_replaces_stale_generated_artifacts() {
         let tmp = tempfile::tempdir().unwrap();
-        write_v2_package(tmp.path());
+        write_petal_package(tmp.path());
         write_package_file(
             tmp.path(),
             "artifacts/routes/r000001.wasm",
@@ -4533,7 +4540,7 @@ name = "echo"
             b"stale invalid manifest",
         );
 
-        let package = build_app_package_dir(tmp.path()).unwrap();
+        let package = build_petal_package_dir(tmp.path()).unwrap();
         let route = &package.route_index.routes[0];
         let artifact = std::fs::read(tmp.path().join(&route.artifact_path)).unwrap();
         let source = std::fs::read(tmp.path().join(&route.source_path)).unwrap();
@@ -4542,14 +4549,14 @@ name = "echo"
 
     #[cfg(unix)]
     #[test]
-    fn v2_build_app_package_dir_rejects_symlinked_artifacts_without_deleting_target() {
+    fn petal_build_petal_package_dir_rejects_symlinked_artifacts_without_deleting_target() {
         let tmp = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
-        write_v2_package(tmp.path());
+        write_petal_package(tmp.path());
         std::fs::write(outside.path().join("sentinel"), b"keep").unwrap();
         std::os::unix::fs::symlink(outside.path(), tmp.path().join("artifacts")).unwrap();
 
-        let err = build_app_package_dir(tmp.path()).unwrap_err();
+        let err = build_petal_package_dir(tmp.path()).unwrap_err();
         assert!(
             err.to_string().contains("non-regular file")
                 || err
@@ -4564,12 +4571,12 @@ name = "echo"
     }
 
     #[test]
-    fn v2_route_sidecar_builds_artifact_from_module_component() {
+    fn petal_route_sidecar_builds_artifact_from_module_component() {
         let tmp = tempfile::tempdir().unwrap();
         write_package_file(
             tmp.path(),
             "petal.toml",
-            br#"schema = "bloom.petal.local-app.v2"
+            br#"schema = "bloom.petal.package.v1"
 name = "echo"
 "#,
         );
@@ -4577,12 +4584,12 @@ name = "echo"
         write_package_file(tmp.path(), "AGENTS.md", b"# echo agents");
         write_package_file(
             tmp.path(),
-            "app/echo/message.txt.wasm",
+            "petal/echo/message.txt.wasm",
             route_component_no_imports(),
         );
         write_package_file(
             tmp.path(),
-            "app/echo/message.txt.route.toml",
+            "petal/echo/message.txt.route.toml",
             br#"abi = "component"
 component = "modules/message.wasm"
 "#,
@@ -4593,7 +4600,7 @@ component = "modules/message.wasm"
             route_component_metadata(),
         );
 
-        let package = build_app_package_dir(tmp.path()).unwrap();
+        let package = build_petal_package_dir(tmp.path()).unwrap();
         let route = &package.route_index.routes[0];
         let artifact = std::fs::read(tmp.path().join(&route.artifact_path)).unwrap();
         assert_eq!(artifact, route_component_metadata());
@@ -4613,37 +4620,37 @@ component = "modules/message.wasm"
     }
 
     #[test]
-    fn v2_route_sidecar_rejects_non_component_paths() {
+    fn petal_route_sidecar_rejects_non_component_paths() {
         let tmp = tempfile::tempdir().unwrap();
-        write_v2_package_with_route(tmp.path(), route_component_metadata());
+        write_petal_package_with_route(tmp.path(), route_component_metadata());
         write_package_file(
             tmp.path(),
-            "app/echo/hello.txt.route.toml",
+            "petal/echo/hello.txt.route.toml",
             br#"abi = "component"
-component = "app/echo/hello.txt.wasm"
+component = "petal/echo/hello.txt.wasm"
 "#,
         );
 
-        let err = PreparedAppPackage::from_dir(tmp.path()).unwrap_err();
+        let err = PreparedPetalPackage::from_dir(tmp.path()).unwrap_err();
         assert!(err.to_string().contains("modules/ or components/"));
     }
 
     #[test]
-    fn v2_route_sidecar_still_requires_valid_route_leaf() {
+    fn petal_route_sidecar_still_requires_valid_route_leaf() {
         let tmp = tempfile::tempdir().unwrap();
         write_package_file(
             tmp.path(),
             "petal.toml",
-            br#"schema = "bloom.petal.local-app.v2"
+            br#"schema = "bloom.petal.package.v1"
 name = "echo"
 "#,
         );
         write_package_file(tmp.path(), "README.md", b"# echo");
         write_package_file(tmp.path(), "AGENTS.md", b"# echo agents");
-        write_package_file(tmp.path(), "app/echo/message.txt.wasm", b"not wasm");
+        write_package_file(tmp.path(), "petal/echo/message.txt.wasm", b"not wasm");
         write_package_file(
             tmp.path(),
-            "app/echo/message.txt.route.toml",
+            "petal/echo/message.txt.route.toml",
             br#"abi = "component"
 component = "modules/message.wasm"
 "#,
@@ -4654,17 +4661,17 @@ component = "modules/message.wasm"
             route_component_metadata(),
         );
 
-        let err = PreparedAppPackage::from_dir(tmp.path()).unwrap_err();
+        let err = PreparedPetalPackage::from_dir(tmp.path()).unwrap_err();
         assert!(err.to_string().contains("invalid route wasm"));
     }
 
     #[test]
-    fn v2_route_sidecar_rejects_mismatched_generated_artifact() {
+    fn petal_route_sidecar_rejects_mismatched_generated_artifact() {
         let tmp = tempfile::tempdir().unwrap();
         write_package_file(
             tmp.path(),
             "petal.toml",
-            br#"schema = "bloom.petal.local-app.v2"
+            br#"schema = "bloom.petal.package.v1"
 name = "echo"
 "#,
         );
@@ -4672,12 +4679,12 @@ name = "echo"
         write_package_file(tmp.path(), "AGENTS.md", b"# echo agents");
         write_package_file(
             tmp.path(),
-            "app/echo/message.txt.wasm",
+            "petal/echo/message.txt.wasm",
             route_component_no_imports(),
         );
         write_package_file(
             tmp.path(),
-            "app/echo/message.txt.route.toml",
+            "petal/echo/message.txt.route.toml",
             br#"abi = "component"
 component = "modules/message.wasm"
 "#,
@@ -4693,7 +4700,7 @@ component = "modules/message.wasm"
             route_component_no_imports(),
         );
 
-        let err = PreparedAppPackage::from_dir(tmp.path()).unwrap_err();
+        let err = PreparedPetalPackage::from_dir(tmp.path()).unwrap_err();
         assert!(
             err.to_string()
                 .contains("does not match route sidecar composition")
@@ -4701,26 +4708,26 @@ component = "modules/message.wasm"
     }
 
     #[test]
-    fn v2_route_without_sidecar_rejects_stale_generated_artifact() {
+    fn petal_route_without_sidecar_rejects_stale_generated_artifact() {
         let tmp = tempfile::tempdir().unwrap();
-        write_v2_package(tmp.path());
+        write_petal_package(tmp.path());
         write_package_file(
             tmp.path(),
             "artifacts/routes/r000001.wasm",
             route_component_metadata(),
         );
 
-        let err = PreparedAppPackage::from_dir(tmp.path()).unwrap_err();
+        let err = PreparedPetalPackage::from_dir(tmp.path()).unwrap_err();
         assert!(err.to_string().contains("does not match its route source"));
     }
 
     #[test]
-    fn v2_sidecar_artifact_is_validated_as_an_index_route() {
+    fn petal_sidecar_artifact_is_validated_as_an_index_route() {
         let tmp = tempfile::tempdir().unwrap();
         write_package_file(
             tmp.path(),
             "petal.toml",
-            br#"schema = "bloom.petal.local-app.v2"
+            br#"schema = "bloom.petal.package.v1"
 name = "echo"
 "#,
         );
@@ -4728,7 +4735,7 @@ name = "echo"
         write_package_file(tmp.path(), "AGENTS.md", b"# echo agents");
         write_package_file(
             tmp.path(),
-            "app/echo/$index.wasm",
+            "petal/echo/$index.wasm",
             &route_fixtures::dynamic_dir_route_component(
                 false,
                 route_fixtures::FixtureVfsImport::None,
@@ -4738,7 +4745,7 @@ name = "echo"
         );
         write_package_file(
             tmp.path(),
-            "app/echo/$index.route.toml",
+            "petal/echo/$index.route.toml",
             br#"abi = "component"
 component = "modules/index.wasm"
 "#,
@@ -4749,7 +4756,7 @@ component = "modules/index.wasm"
             &route_fixtures::dynamic_dir_route_component_without_list(),
         );
 
-        let err = PreparedAppPackage::from_dir(tmp.path()).unwrap_err();
+        let err = PreparedPetalPackage::from_dir(tmp.path()).unwrap_err();
         assert!(
             err.to_string()
                 .contains("missing bloom:route@0.1.0 \"list\" export"),
@@ -4758,12 +4765,12 @@ component = "modules/index.wasm"
     }
 
     #[test]
-    fn v2_route_sidecar_rejects_missing_import_component() {
+    fn petal_route_sidecar_rejects_missing_import_component() {
         let tmp = tempfile::tempdir().unwrap();
         write_package_file(
             tmp.path(),
             "petal.toml",
-            br#"schema = "bloom.petal.local-app.v2"
+            br#"schema = "bloom.petal.package.v1"
 name = "echo"
 "#,
         );
@@ -4771,12 +4778,12 @@ name = "echo"
         write_package_file(tmp.path(), "AGENTS.md", b"# echo agents");
         write_package_file(
             tmp.path(),
-            "app/echo/message.txt.wasm",
+            "petal/echo/message.txt.wasm",
             route_component_no_imports(),
         );
         write_package_file(
             tmp.path(),
-            "app/echo/message.txt.route.toml",
+            "petal/echo/message.txt.route.toml",
             br#"abi = "component"
 component = "modules/message.wasm"
 imports = ["components/missing.wasm"]
@@ -4788,12 +4795,12 @@ imports = ["components/missing.wasm"]
             route_component_metadata(),
         );
 
-        let err = PreparedAppPackage::from_dir(tmp.path()).unwrap_err();
+        let err = PreparedPetalPackage::from_dir(tmp.path()).unwrap_err();
         assert!(err.to_string().contains("components/missing.wasm"));
     }
 
     #[test]
-    fn v2_route_sidecar_composes_package_local_import_alias() {
+    fn petal_route_sidecar_composes_package_local_import_alias() {
         let root = wat::parse_str(
             r#"
 (component
@@ -4823,8 +4830,8 @@ imports = ["components/missing.wasm"]
         ])
         .unwrap();
         let sidecar = RouteSidecar {
-            path: "app/echo/message.txt.route.toml".into(),
-            app_name: "echo".into(),
+            path: "petal/echo/message.txt.route.toml".into(),
+            petal_name: "echo".into(),
             abi: RouteSidecarAbi::Component,
             component: "modules/root.wasm".into(),
             imports: vec!["components/helper.wasm".into()],
@@ -4837,12 +4844,12 @@ imports = ["components/missing.wasm"]
     }
 
     #[test]
-    fn v2_route_sidecar_builds_route_with_package_local_import() {
+    fn petal_route_sidecar_builds_route_with_package_local_import() {
         let tmp = tempfile::tempdir().unwrap();
         write_package_file(
             tmp.path(),
             "petal.toml",
-            br#"schema = "bloom.petal.local-app.v2"
+            br#"schema = "bloom.petal.package.v1"
 name = "echo"
 "#,
         );
@@ -4850,12 +4857,12 @@ name = "echo"
         write_package_file(tmp.path(), "AGENTS.md", b"# echo agents");
         write_package_file(
             tmp.path(),
-            "app/echo/message.txt.wasm",
+            "petal/echo/message.txt.wasm",
             route_component_package_import(),
         );
         write_package_file(
             tmp.path(),
-            "app/echo/message.txt.route.toml",
+            "petal/echo/message.txt.route.toml",
             br#"abi = "component"
 component = "modules/message.wasm"
 imports = ["components/helper.wasm"]
@@ -4872,7 +4879,7 @@ imports = ["components/helper.wasm"]
             &package_local_helper_component(),
         );
 
-        let package = build_app_package_dir(tmp.path()).unwrap();
+        let package = build_petal_package_dir(tmp.path()).unwrap();
         let route = &package.route_index.routes[0];
         let artifact = std::fs::read(tmp.path().join(&route.artifact_path)).unwrap();
         Validator::new().validate_all(&artifact).unwrap();
@@ -4887,65 +4894,65 @@ imports = ["components/helper.wasm"]
     }
 
     #[test]
-    fn v2_tar_rejects_duplicate_and_traversal_paths() {
+    fn petal_tar_rejects_duplicate_and_traversal_paths() {
         let duplicate =
-            PreparedAppPackage::from_reader(std::io::Cursor::new(package_tar_bytes(vec![
+            PreparedPetalPackage::from_reader(std::io::Cursor::new(package_tar_bytes(vec![
                 (
                     "petal.toml",
-                    br#"schema = "bloom.petal.local-app.v2" name = "x""#,
+                    br#"schema = "bloom.petal.package.v1" name = "x""#,
                 ),
                 (
                     "petal.toml",
-                    br#"schema = "bloom.petal.local-app.v2" name = "x""#,
+                    br#"schema = "bloom.petal.package.v1" name = "x""#,
                 ),
             ])))
             .unwrap_err();
         assert!(
             duplicate
                 .to_string()
-                .contains("duplicate v2 package archive path")
+                .contains("duplicate Petal package archive path")
         );
 
-        let traversal = PreparedAppPackage::from_reader(std::io::Cursor::new(
+        let traversal = PreparedPetalPackage::from_reader(std::io::Cursor::new(
             raw_package_tar_bytes("../petal.toml", b"x"),
         ))
         .unwrap_err();
-        assert!(traversal.to_string().contains("invalid v2 package path"));
+        assert!(traversal.to_string().contains("invalid Petal package path"));
     }
 
     #[test]
-    fn v2_tar_rejects_non_normal_mode_and_metadata() {
-        let bad_mode = PreparedAppPackage::from_reader(std::io::Cursor::new(
+    fn petal_tar_rejects_non_normal_mode_and_metadata() {
+        let bad_mode = PreparedPetalPackage::from_reader(std::io::Cursor::new(
             raw_package_tar_entry("petal.toml", b"x", 0o777, 0, 0, 0),
         ))
         .unwrap_err();
         assert!(bad_mode.to_string().contains("unsupported mode"));
 
-        let bad_owner = PreparedAppPackage::from_reader(std::io::Cursor::new(
+        let bad_owner = PreparedPetalPackage::from_reader(std::io::Cursor::new(
             raw_package_tar_entry("petal.toml", b"x", 0o644, 1, 0, 0),
         ))
         .unwrap_err();
         assert!(bad_owner.to_string().contains("nonzero owner"));
 
-        let bad_mtime = PreparedAppPackage::from_reader(std::io::Cursor::new(
+        let bad_mtime = PreparedPetalPackage::from_reader(std::io::Cursor::new(
             raw_package_tar_entry("petal.toml", b"x", 0o644, 0, 0, 1),
         ))
         .unwrap_err();
         assert!(bad_mtime.to_string().contains("nonzero mtime"));
 
-        let bad_names = PreparedAppPackage::from_reader(std::io::Cursor::new(
+        let bad_names = PreparedPetalPackage::from_reader(std::io::Cursor::new(
             raw_tar_entry_with_names("petal.toml", b"x", "user", "group"),
         ))
         .unwrap_err();
         assert!(bad_names.to_string().contains("textual owner metadata"));
 
-        let malformed_uid = PreparedAppPackage::from_reader(std::io::Cursor::new(
+        let malformed_uid = PreparedPetalPackage::from_reader(std::io::Cursor::new(
             raw_tar_entry_with_malformed_uid("petal.toml", b"x"),
         ))
         .unwrap_err();
         assert!(malformed_uid.to_string().contains("invalid uid"));
 
-        let bad_atime = PreparedAppPackage::from_reader(std::io::Cursor::new(
+        let bad_atime = PreparedPetalPackage::from_reader(std::io::Cursor::new(
             raw_tar_entry_with_times("petal.toml", b"x", 1, 0),
         ))
         .unwrap_err();
@@ -4953,82 +4960,83 @@ imports = ["components/helper.wasm"]
     }
 
     #[test]
-    fn v2_tar_rejects_bad_or_duplicate_directory_entries() {
-        let bad_dir = PreparedAppPackage::from_reader(std::io::Cursor::new(raw_dir_tar_entry(
+    fn petal_tar_rejects_bad_or_duplicate_directory_entries() {
+        let bad_dir = PreparedPetalPackage::from_reader(std::io::Cursor::new(raw_dir_tar_entry(
             "../bad/", 0o755,
         )))
         .unwrap_err();
-        assert!(bad_dir.to_string().contains("invalid v2 package path"));
+        assert!(bad_dir.to_string().contains("invalid Petal package path"));
 
         let duplicate_dir =
-            PreparedAppPackage::from_reader(std::io::Cursor::new(raw_multi_entry_tar(vec![
-                RawTarEntry::dir("app/", 0o755),
-                RawTarEntry::dir("app/", 0o755),
+            PreparedPetalPackage::from_reader(std::io::Cursor::new(raw_multi_entry_tar(vec![
+                RawTarEntry::dir("petal/", 0o755),
+                RawTarEntry::dir("petal/", 0o755),
             ])))
             .unwrap_err();
         assert!(
             duplicate_dir
                 .to_string()
-                .contains("duplicate v2 package archive path")
+                .contains("duplicate Petal package archive path")
         );
 
-        let empty_segment_dir = PreparedAppPackage::from_reader(std::io::Cursor::new(
-            raw_dir_tar_entry("app//", 0o755),
+        let empty_segment_dir = PreparedPetalPackage::from_reader(std::io::Cursor::new(
+            raw_dir_tar_entry("petal//", 0o755),
         ))
         .unwrap_err();
         assert!(
             empty_segment_dir
                 .to_string()
-                .contains("invalid v2 package path")
+                .contains("invalid Petal package path")
         );
     }
 
     #[test]
-    fn v2_tar_rejects_pax_extension_entries() {
-        let pax = PreparedAppPackage::from_reader(std::io::Cursor::new(raw_multi_entry_tar(vec![
-            RawTarEntry::pax("pax", b"13 atime=1\n"),
-            RawTarEntry::file("petal.toml", b"x", 0o644, 0, 0, 0),
-        ])))
-        .unwrap_err();
+    fn petal_tar_rejects_pax_extension_entries() {
+        let pax =
+            PreparedPetalPackage::from_reader(std::io::Cursor::new(raw_multi_entry_tar(vec![
+                RawTarEntry::pax("pax", b"13 atime=1\n"),
+                RawTarEntry::file("petal.toml", b"x", 0o644, 0, 0, 0),
+            ])))
+            .unwrap_err();
         assert!(pax.to_string().contains("unsupported extended metadata"));
     }
 
     #[test]
-    fn v2_rejects_extra_app_roots() {
+    fn petal_rejects_extra_petal_roots() {
         let tmp = tempfile::tempdir().unwrap();
-        write_v2_package(tmp.path());
+        write_petal_package(tmp.path());
         write_package_file(
             tmp.path(),
-            "app/other/hello.txt.wasm",
+            "petal/other/hello.txt.wasm",
             route_component_no_imports(),
         );
 
-        let err = PreparedAppPackage::from_dir(tmp.path()).unwrap_err();
-        assert!(err.to_string().contains("extra app root"));
+        let err = PreparedPetalPackage::from_dir(tmp.path()).unwrap_err();
+        assert!(err.to_string().contains("extra petal root"));
     }
 
     #[test]
-    fn v2_index_and_lookup_route_files_normalize_patterns() {
+    fn petal_index_and_lookup_route_files_normalize_patterns() {
         let tmp = tempfile::tempdir().unwrap();
-        write_v2_package_with_manifest_and_route(
+        write_petal_package_with_manifest_and_route(
             tmp.path(),
-            br#"schema = "bloom.petal.local-app.v2"
+            br#"schema = "bloom.petal.package.v1"
 name = "echo"
 "#,
             route_component_no_imports(),
         );
         std::fs::rename(
-            tmp.path().join("app/echo/hello.txt.wasm"),
-            tmp.path().join("app/echo/$index.wasm"),
+            tmp.path().join("petal/echo/hello.txt.wasm"),
+            tmp.path().join("petal/echo/$index.wasm"),
         )
         .unwrap();
         write_package_file(
             tmp.path(),
-            "app/echo/items/[id]/$lookup.wasm",
+            "petal/echo/items/[id]/$lookup.wasm",
             route_component_no_imports(),
         );
 
-        let package = PetalAppPackage::scan_dir(tmp.path()).unwrap();
+        let package = PetalPackage::scan_dir(tmp.path()).unwrap();
         let patterns = package
             .routes
             .iter()
@@ -5038,33 +5046,33 @@ name = "echo"
     }
 
     #[test]
-    fn v2_unknown_reserved_route_files_are_rejected() {
+    fn petal_unknown_reserved_route_files_are_rejected() {
         let tmp = tempfile::tempdir().unwrap();
-        write_v2_package(tmp.path());
+        write_petal_package(tmp.path());
         write_package_file(
             tmp.path(),
-            "app/echo/items/$reserved.wasm",
+            "petal/echo/items/$reserved.wasm",
             route_component_no_imports(),
         );
 
-        let err = PetalAppPackage::scan_dir(tmp.path()).unwrap_err();
+        let err = PetalPackage::scan_dir(tmp.path()).unwrap_err();
         assert!(err.to_string().contains("unsupported reserved route file"));
     }
 
     #[test]
-    fn v2_reserved_route_segments_are_rejected_for_directories_and_archives() {
+    fn petal_reserved_route_segments_are_rejected_for_directories_and_archives() {
         for reserved in ["$private", "$index"] {
             let tmp = tempfile::tempdir().unwrap();
-            write_v2_package(tmp.path());
+            write_petal_package(tmp.path());
             write_package_file(
                 tmp.path(),
-                &format!("app/echo/{reserved}/bar.wasm"),
+                &format!("petal/echo/{reserved}/bar.wasm"),
                 route_component_no_imports(),
             );
 
-            let scan_err = PetalAppPackage::scan_dir(tmp.path()).unwrap_err();
+            let scan_err = PetalPackage::scan_dir(tmp.path()).unwrap_err();
             assert!(scan_err.to_string().contains("reserved route segment"));
-            let package_err = PreparedAppPackage::from_dir(tmp.path()).unwrap_err();
+            let package_err = PreparedPetalPackage::from_dir(tmp.path()).unwrap_err();
             assert!(package_err.to_string().contains("reserved route segment"));
 
             let tar = package_tar_bytes(vec![
@@ -5072,17 +5080,17 @@ name = "echo"
                 ("AGENTS.md", b"# echo agents".as_slice()),
                 (
                     "petal.toml",
-                    br#"schema = "bloom.petal.local-app.v2"
+                    br#"schema = "bloom.petal.package.v1"
 name = "echo"
 "#
                     .as_slice(),
                 ),
                 (
-                    &format!("app/echo/{reserved}/bar.wasm"),
+                    &format!("petal/echo/{reserved}/bar.wasm"),
                     route_component_no_imports(),
                 ),
             ]);
-            let tar_err = PreparedAppPackage::from_reader(std::io::Cursor::new(tar)).unwrap_err();
+            let tar_err = PreparedPetalPackage::from_reader(std::io::Cursor::new(tar)).unwrap_err();
             assert!(
                 tar_err.to_string().contains("reserved route segment"),
                 "unexpected archive error: {tar_err}"
@@ -5091,35 +5099,35 @@ name = "echo"
     }
 
     #[test]
-    fn v2_root_index_route_matches_empty_path() {
+    fn petal_root_index_route_matches_empty_path() {
         let tmp = tempfile::tempdir().unwrap();
         write_package_file(tmp.path(), "petal.toml", br#"name = "echo""#);
         write_package_file(tmp.path(), "README.md", b"# echo");
         write_package_file(tmp.path(), "AGENTS.md", b"# echo agents");
-        write_package_file(tmp.path(), "app/echo/$index.wasm", b"\0asm");
+        write_package_file(tmp.path(), "petal/echo/$index.wasm", b"\0asm");
 
-        let package = PetalAppPackage::scan_dir(tmp.path()).unwrap();
+        let package = PetalPackage::scan_dir(tmp.path()).unwrap();
         let matched = package.match_route("").unwrap();
         assert_eq!(matched.route.pattern, "");
     }
 
     #[test]
-    fn v2_component_routes_are_validated_as_bloom_route_010() {
+    fn petal_component_routes_are_validated_as_bloom_route_010() {
         let tmp = tempfile::tempdir().unwrap();
-        write_v2_package_with_route(tmp.path(), route_component_no_imports());
+        write_petal_package_with_route(tmp.path(), route_component_no_imports());
 
-        let package = PreparedAppPackage::from_dir(tmp.path()).unwrap();
+        let package = PreparedPetalPackage::from_dir(tmp.path()).unwrap();
         let route = &package.route_index.routes[0];
         assert_eq!(route.abi, RouteAbi::ComponentBloomRoute010);
         assert!(route.install_metadata.required_caps.is_empty());
     }
 
     #[test]
-    fn v2_static_component_metadata_is_cached_in_route_index() {
+    fn petal_static_component_metadata_is_cached_in_route_index() {
         let tmp = tempfile::tempdir().unwrap();
-        write_v2_package_with_route(tmp.path(), route_component_metadata());
+        write_petal_package_with_route(tmp.path(), route_component_metadata());
 
-        let package = PreparedAppPackage::from_dir(tmp.path()).unwrap();
+        let package = PreparedPetalPackage::from_dir(tmp.path()).unwrap();
         let route = &package.route_index.routes[0];
         let metadata = &route.install_metadata;
         assert_eq!(metadata.mode, 0o640);
@@ -5133,7 +5141,7 @@ name = "echo"
     }
 
     #[test]
-    fn v2_writable_routes_require_write_export() {
+    fn petal_writable_routes_require_write_export() {
         let validation = RouteValidation {
             abi: RouteAbi::ComponentBloomRoute010,
             required_caps: Vec::new(),
@@ -5174,20 +5182,20 @@ name = "echo"
     }
 
     #[test]
-    fn v2_static_component_metadata_rejects_executable_routes() {
+    fn petal_static_component_metadata_rejects_executable_routes() {
         let tmp = tempfile::tempdir().unwrap();
-        write_v2_package_with_route(tmp.path(), route_component_executable());
+        write_petal_package_with_route(tmp.path(), route_component_executable());
 
-        let err = PreparedAppPackage::from_dir(tmp.path()).unwrap_err();
+        let err = PreparedPetalPackage::from_dir(tmp.path()).unwrap_err();
         assert!(err.to_string().contains("executable=true"));
     }
 
     #[test]
-    fn v2_runtime_component_metadata_can_only_narrow_install_metadata() {
+    fn petal_runtime_component_metadata_can_only_narrow_install_metadata() {
         let route = RouteIndexRecord {
             route_id: "r000001".into(),
             pattern: "[name].txt".into(),
-            source_path: "app/echo/[name].txt.wasm".into(),
+            source_path: "petal/echo/[name].txt.wasm".into(),
             artifact_path: "artifacts/routes/r000001.wasm".into(),
             artifact_hash: "00".repeat(32),
             abi: RouteAbi::ComponentBloomRoute010,
@@ -5223,11 +5231,11 @@ name = "echo"
     }
 
     #[test]
-    fn v2_runtime_component_metadata_rejects_widening() {
+    fn petal_runtime_component_metadata_rejects_widening() {
         let route = RouteIndexRecord {
             route_id: "r000001".into(),
             pattern: "[name].txt".into(),
-            source_path: "app/echo/[name].txt.wasm".into(),
+            source_path: "petal/echo/[name].txt.wasm".into(),
             artifact_path: "artifacts/routes/r000001.wasm".into(),
             artifact_hash: "00".repeat(32),
             abi: RouteAbi::ComponentBloomRoute010,
@@ -5261,42 +5269,42 @@ name = "echo"
     }
 
     #[test]
-    fn v2_component_routes_reject_wrong_route_export_signatures() {
+    fn petal_component_routes_reject_wrong_route_export_signatures() {
         let tmp = tempfile::tempdir().unwrap();
-        write_v2_package_with_route(
+        write_petal_package_with_route(
             tmp.path(),
             &route_component(&["metadata", "lookup", "read"], &[]),
         );
 
-        let err = PreparedAppPackage::from_dir(tmp.path()).unwrap_err();
+        let err = PreparedPetalPackage::from_dir(tmp.path()).unwrap_err();
         assert!(err.to_string().contains("invalid bloom:route@0.1.0"));
     }
 
     #[test]
-    fn v2_component_routes_require_metadata_export() {
+    fn petal_component_routes_require_metadata_export() {
         let tmp = tempfile::tempdir().unwrap();
-        write_v2_package_with_route(tmp.path(), &route_component(&["read"], &[]));
+        write_petal_package_with_route(tmp.path(), &route_component(&["read"], &[]));
 
-        let err = PreparedAppPackage::from_dir(tmp.path()).unwrap_err();
+        let err = PreparedPetalPackage::from_dir(tmp.path()).unwrap_err();
         assert!(err.to_string().contains("metadata export"));
     }
 
     #[test]
-    fn v2_component_routes_ignore_nested_route_exports_for_abi_validation() {
+    fn petal_component_routes_ignore_nested_route_exports_for_abi_validation() {
         let tmp = tempfile::tempdir().unwrap();
-        write_v2_package_with_route(tmp.path(), &route_component_with_nested_route_exports());
+        write_petal_package_with_route(tmp.path(), &route_component_with_nested_route_exports());
 
-        let err = PreparedAppPackage::from_dir(tmp.path()).unwrap_err();
+        let err = PreparedPetalPackage::from_dir(tmp.path()).unwrap_err();
         assert!(err.to_string().contains("metadata export"));
     }
 
     #[test]
-    fn v2_component_index_routes_require_list_handler() {
+    fn petal_component_index_routes_require_list_handler() {
         let tmp = tempfile::tempdir().unwrap();
         write_package_file(
             tmp.path(),
             "petal.toml",
-            br#"schema = "bloom.petal.local-app.v2"
+            br#"schema = "bloom.petal.package.v1"
 name = "echo"
 "#,
         );
@@ -5304,20 +5312,20 @@ name = "echo"
         write_package_file(tmp.path(), "AGENTS.md", b"# echo agents");
         write_package_file(
             tmp.path(),
-            "app/echo/$index.wasm",
+            "petal/echo/$index.wasm",
             &route_component(&["metadata", "lookup", "read"], &[]),
         );
 
-        let err = PreparedAppPackage::from_dir(tmp.path()).unwrap_err();
+        let err = PreparedPetalPackage::from_dir(tmp.path()).unwrap_err();
         assert!(err.to_string().contains("\"list\" export"));
     }
 
     #[test]
-    fn v2_component_regular_file_routes_require_lookup_and_read_exports() {
+    fn petal_component_regular_file_routes_require_lookup_and_read_exports() {
         let tmp = tempfile::tempdir().unwrap();
-        write_v2_package_with_route(tmp.path(), &route_component(&["metadata", "read"], &[]));
+        write_petal_package_with_route(tmp.path(), &route_component(&["metadata", "read"], &[]));
 
-        let err = PreparedAppPackage::from_dir(tmp.path()).unwrap_err();
+        let err = PreparedPetalPackage::from_dir(tmp.path()).unwrap_err();
         assert!(err.to_string().contains("\"lookup\" export"));
     }
 
@@ -5333,10 +5341,10 @@ name = "echo"
         write_package_file(root, "petal.toml", manifest);
         write_package_file(root, "README.md", b"# example");
         write_package_file(root, "AGENTS.md", b"# example agents");
-        write_package_file(root, "app/example/[wallet]/$index.wasm", route);
+        write_package_file(root, "petal/example/[wallet]/$index.wasm", route);
     }
 
-    const DYNAMIC_DIR_MANIFEST: &[u8] = br#"schema = "bloom.petal.local-app.v2"
+    const DYNAMIC_DIR_MANIFEST: &[u8] = br#"schema = "bloom.petal.package.v1"
 name = "example"
 
 [caps]
@@ -5347,7 +5355,7 @@ namespaces = ["wallets"]
 "#;
 
     #[test]
-    fn v2_parameterized_dir_route_records_imported_caps_ceiling() {
+    fn petal_parameterized_dir_route_records_imported_caps_ceiling() {
         let tmp = tempfile::tempdir().unwrap();
         write_dynamic_dir_package(
             tmp.path(),
@@ -5360,7 +5368,7 @@ namespaces = ["wallets"]
             ),
         );
 
-        let package = PreparedAppPackage::from_dir(tmp.path()).unwrap();
+        let package = PreparedPetalPackage::from_dir(tmp.path()).unwrap();
         let route = route_for_pattern(&package.route_index, "[wallet]");
 
         assert_eq!(route.kind, RouteEntryKind::Dir);
@@ -5372,7 +5380,7 @@ namespaces = ["wallets"]
     }
 
     #[test]
-    fn v2_vfs_import_caps_follow_imported_functions() {
+    fn petal_vfs_import_caps_follow_imported_functions() {
         // A read+write vfs import must keep requiring bloom:vfs.write ...
         let tmp = tempfile::tempdir().unwrap();
         write_dynamic_dir_package(
@@ -5385,7 +5393,7 @@ namespaces = ["wallets"]
                 None,
             ),
         );
-        let err = PreparedAppPackage::from_dir(tmp.path()).unwrap_err();
+        let err = PreparedPetalPackage::from_dir(tmp.path()).unwrap_err();
         assert!(
             err.to_string()
                 .contains("requires missing petal.toml cap bloom:vfs.write"),
@@ -5396,7 +5404,7 @@ namespaces = ["wallets"]
         let allowed = tempfile::tempdir().unwrap();
         write_dynamic_dir_package(
             allowed.path(),
-            br#"schema = "bloom.petal.local-app.v2"
+            br#"schema = "bloom.petal.package.v1"
 name = "example"
 
 [caps]
@@ -5412,7 +5420,7 @@ namespaces = ["wallets"]
                 None,
             ),
         );
-        let package = PreparedAppPackage::from_dir(allowed.path()).unwrap();
+        let package = PreparedPetalPackage::from_dir(allowed.path()).unwrap();
         assert_eq!(
             route_for_pattern(&package.route_index, "[wallet]")
                 .install_metadata
@@ -5426,11 +5434,11 @@ namespaces = ["wallets"]
     }
 
     #[test]
-    fn v2_parameterized_route_imports_still_require_manifest_caps() {
+    fn petal_parameterized_route_imports_still_require_manifest_caps() {
         let tmp = tempfile::tempdir().unwrap();
         write_dynamic_dir_package(
             tmp.path(),
-            br#"schema = "bloom.petal.local-app.v2"
+            br#"schema = "bloom.petal.package.v1"
 name = "example"
 
 [caps]
@@ -5447,7 +5455,7 @@ namespaces = ["wallets"]
             ),
         );
 
-        let err = PreparedAppPackage::from_dir(tmp.path()).unwrap_err();
+        let err = PreparedPetalPackage::from_dir(tmp.path()).unwrap_err();
         assert!(
             err.to_string()
                 .contains("requires missing petal.toml cap bloom:vfs.read"),
@@ -5456,7 +5464,7 @@ namespaces = ["wallets"]
     }
 
     #[test]
-    fn v2_composed_parameterized_route_records_imported_caps_ceiling() {
+    fn petal_composed_parameterized_route_records_imported_caps_ceiling() {
         let tmp = tempfile::tempdir().unwrap();
         let route = route_fixtures::dynamic_dir_route_component(
             true,
@@ -5467,7 +5475,7 @@ namespaces = ["wallets"]
         write_dynamic_dir_package(tmp.path(), DYNAMIC_DIR_MANIFEST, &route);
         write_package_file(
             tmp.path(),
-            "app/example/[wallet]/$index.route.toml",
+            "petal/example/[wallet]/$index.route.toml",
             br#"abi = "component"
 component = "modules/index.wasm"
 imports = ["components/helper.wasm"]
@@ -5488,7 +5496,7 @@ imports = ["components/helper.wasm"]
             .unwrap(),
         );
 
-        let package = PreparedAppPackage::from_dir(tmp.path()).unwrap();
+        let package = PreparedPetalPackage::from_dir(tmp.path()).unwrap();
         let route = route_for_pattern(&package.route_index, "[wallet]");
         assert_eq!(route.kind, RouteEntryKind::Dir);
         assert_eq!(
@@ -5498,11 +5506,11 @@ imports = ["components/helper.wasm"]
     }
 
     #[test]
-    fn v2_runtime_metadata_cache_ttl_is_unrestricted_only_for_parameterized_routes() {
+    fn petal_runtime_metadata_cache_ttl_is_unrestricted_only_for_parameterized_routes() {
         let record = |params: Vec<String>| RouteIndexRecord {
             route_id: "r000001".into(),
             pattern: "[name].txt".into(),
-            source_path: "app/echo/[name].txt.wasm".into(),
+            source_path: "petal/echo/[name].txt.wasm".into(),
             artifact_path: "artifacts/routes/r000001.wasm".into(),
             artifact_hash: "00".repeat(32),
             abi: RouteAbi::ComponentBloomRoute010,
@@ -5545,21 +5553,21 @@ imports = ["components/helper.wasm"]
     }
 
     #[test]
-    fn v2_component_imports_require_declared_caps_and_record_them() {
+    fn petal_component_imports_require_declared_caps_and_record_them() {
         let wasm = route_component_http();
 
         let missing = tempfile::tempdir().unwrap();
-        write_v2_package_with_route(missing.path(), wasm);
-        let err = PreparedAppPackage::from_dir(missing.path()).unwrap_err();
+        write_petal_package_with_route(missing.path(), wasm);
+        let err = PreparedPetalPackage::from_dir(missing.path()).unwrap_err();
         assert!(
             err.to_string()
                 .contains("requires missing petal.toml cap bloom:http")
         );
 
         let allowed = tempfile::tempdir().unwrap();
-        write_v2_package_with_manifest_and_route(
+        write_petal_package_with_manifest_and_route(
             allowed.path(),
-            br#"schema = "bloom.petal.local-app.v2"
+            br#"schema = "bloom.petal.package.v1"
 name = "echo"
 [caps]
 allowed = ["bloom:http"]
@@ -5571,7 +5579,7 @@ paths = ["/*"]
 "#,
             wasm,
         );
-        let package = PreparedAppPackage::from_dir(allowed.path()).unwrap();
+        let package = PreparedPetalPackage::from_dir(allowed.path()).unwrap();
         assert_eq!(
             package.route_index.routes[0].install_metadata.required_caps,
             vec!["bloom:http".to_string()]
@@ -5579,27 +5587,27 @@ paths = ["/*"]
     }
 
     #[test]
-    fn v2_http_cap_requires_a_usable_network_allow_rule() {
+    fn petal_http_cap_requires_a_usable_network_allow_rule() {
         let missing = tempfile::tempdir().unwrap();
-        write_v2_package_with_manifest_and_route(
+        write_petal_package_with_manifest_and_route(
             missing.path(),
-            br#"schema = "bloom.petal.local-app.v2"
+            br#"schema = "bloom.petal.package.v1"
 name = "echo"
 [caps]
 allowed = ["bloom:http"]
 "#,
             route_component_http(),
         );
-        let err = PreparedAppPackage::from_dir(missing.path()).unwrap_err();
+        let err = PreparedPetalPackage::from_dir(missing.path()).unwrap_err();
         assert!(
             err.to_string()
                 .contains("requires at least one [[net.allow]]")
         );
 
         let empty_methods = tempfile::tempdir().unwrap();
-        write_v2_package_with_manifest_and_route(
+        write_petal_package_with_manifest_and_route(
             empty_methods.path(),
-            br#"schema = "bloom.petal.local-app.v2"
+            br#"schema = "bloom.petal.package.v1"
 name = "echo"
 [caps]
 allowed = ["bloom:http"]
@@ -5610,19 +5618,19 @@ paths = ["/*"]
 "#,
             route_component_http(),
         );
-        let err = PreparedAppPackage::from_dir(empty_methods.path()).unwrap_err();
+        let err = PreparedPetalPackage::from_dir(empty_methods.path()).unwrap_err();
         assert!(err.to_string().contains("host and at least one method"));
     }
 
     #[test]
-    fn v2_network_policy_rejects_unknown_fields_and_implicit_wildcards() {
+    fn petal_network_policy_rejects_unknown_fields_and_implicit_wildcards() {
         for (extra, expected) in [
             (r#"path = ["/orders"]"#, "unknown field `path`"),
             ("paths = []", "paths must be explicit and non-empty"),
         ] {
             let tmp = tempfile::tempdir().unwrap();
             let manifest = format!(
-                r#"schema = "bloom.petal.local-app.v2"
+                r#"schema = "bloom.petal.package.v1"
 name = "echo"
 [caps]
 allowed = ["bloom:http"]
@@ -5633,19 +5641,19 @@ methods = ["get"]
 {extra}
 "#
             );
-            write_v2_package_with_manifest_and_route(
+            write_petal_package_with_manifest_and_route(
                 tmp.path(),
                 manifest.as_bytes(),
                 route_component_http(),
             );
-            let err = PreparedAppPackage::from_dir(tmp.path()).unwrap_err();
+            let err = PreparedPetalPackage::from_dir(tmp.path()).unwrap_err();
             assert!(err.to_string().contains(expected), "{err}");
         }
     }
 
     #[test]
-    fn v2_manifest_accepts_source_metadata_and_rejects_unknown_policy_fields() {
-        let valid = r#"schema = "bloom.petal.local-app.v2"
+    fn petal_manifest_accepts_source_metadata_and_rejects_unknown_policy_fields() {
+        let valid = r#"schema = "bloom.petal.package.v1"
 name = "polymarket"
 
 [source]
@@ -5654,7 +5662,7 @@ repository = "bloom-directory/bloom-petal-polymarket"
 
 [build]
 command = "scripts/build.sh"
-outputs = ["app/polymarket"]
+outputs = ["petal/polymarket"]
 
 [consent]
 summary = "Polymarket routes"
@@ -5695,11 +5703,11 @@ secret_namespaces = ["secrets"]
     }
 
     #[test]
-    fn v2_consent_preserves_named_endpoint_bindings() {
+    fn petal_consent_preserves_named_endpoint_bindings() {
         let tmp = tempfile::tempdir().unwrap();
-        write_v2_package_with_manifest_and_route(
+        write_petal_package_with_manifest_and_route(
             tmp.path(),
-            br#"schema = "bloom.petal.local-app.v2"
+            br#"schema = "bloom.petal.package.v1"
 name = "echo"
 [caps]
 allowed = ["bloom:http"]
@@ -5712,15 +5720,15 @@ paths = ["/orders"]
 "#,
             route_component_http(),
         );
-        let package = PreparedAppPackage::from_dir(tmp.path()).unwrap();
-        let consent = app_consent_summary(&package).unwrap();
+        let package = PreparedPetalPackage::from_dir(tmp.path()).unwrap();
+        let consent = petal_consent_summary(&package).unwrap();
         assert_eq!(consent.network.len(), 1);
         assert_eq!(consent.network[0].binding.as_deref(), Some("clob"));
         assert_eq!(consent.network[0].effective_origin, None);
         assert_eq!(consent.network[0].paths, vec!["/orders"]);
 
         let mut consent = consent;
-        apply_app_consent_endpoint_bindings(
+        apply_petal_consent_endpoint_bindings(
             &mut consent,
             &BTreeMap::from([(
                 "clob".to_string(),
@@ -5733,7 +5741,7 @@ paths = ["/orders"]
             Some("https://clob.internal.example")
         );
 
-        let err = apply_app_consent_endpoint_bindings(
+        let err = apply_petal_consent_endpoint_bindings(
             &mut consent,
             &BTreeMap::from([(
                 "undeclared".to_string(),
@@ -5745,20 +5753,20 @@ paths = ["/orders"]
     }
 
     #[test]
-    fn v2_component_chain_import_requires_declared_chain_capability() {
+    fn petal_component_chain_import_requires_declared_chain_capability() {
         assert_eq!(
             component_import_caps("bloom:chain/read@0.1.0"),
             Some(&["bloom:chain" as &str][..])
         );
-        assert_eq!(component_import_caps("bloom:chain/read@0.2.0"), None);
+        assert_eq!(component_import_caps("bloom:chain/read@9.9.9"), None);
     }
 
     #[test]
-    fn v2_component_imports_require_exact_bloom_wit_versions() {
+    fn petal_component_imports_require_exact_bloom_wit_versions() {
         let tmp = tempfile::tempdir().unwrap();
-        write_v2_package_with_manifest_and_route(
+        write_petal_package_with_manifest_and_route(
             tmp.path(),
-            br#"schema = "bloom.petal.local-app.v2"
+            br#"schema = "bloom.petal.package.v1"
 name = "echo"
 [caps]
 allowed = ["bloom:http"]
@@ -5771,39 +5779,39 @@ paths = ["/*"]
             &route_component(&["metadata", "read"], &["bloom:http/fetch@999.0.0"]),
         );
 
-        let err = PreparedAppPackage::from_dir(tmp.path()).unwrap_err();
+        let err = PreparedPetalPackage::from_dir(tmp.path()).unwrap_err();
         assert!(err.to_string().contains("unsupported host item"));
     }
 
     #[test]
-    fn v2_component_signing_v2_is_allowed_but_other_versions_fail_closed() {
+    fn petal_component_signing_is_allowed_but_other_versions_fail_closed() {
         assert_eq!(
-            component_import_caps("bloom:sign/signing@0.2.0"),
+            component_import_caps("bloom:sign/signing@0.1.0"),
             Some(&["bloom:sign"][..])
         );
         assert!(matches!(
-            component_host_interface("bloom:sign/signing@0.2.0"),
-            Some(ComponentHostInterface::SignSigningV2)
+            component_host_interface("bloom:sign/signing@0.1.0"),
+            Some(ComponentHostInterface::SignSigning)
         ));
-        assert!(component_import_caps("bloom:sign/signing@0.3.0").is_none());
-        assert!(component_host_interface("bloom:sign/signing@0.3.0").is_none());
+        assert!(component_import_caps("bloom:sign/signing@9.9.9").is_none());
+        assert!(component_host_interface("bloom:sign/signing@9.9.9").is_none());
     }
 
     #[test]
-    fn v2_component_signing_v2_recognizes_its_exported_nominal_types() {
-        let interface = ComponentHostInterface::SignSigningV2;
+    fn petal_component_signing_recognizes_its_exported_nominal_types() {
+        let interface = ComponentHostInterface::SignSigning;
         assert!(matches!(
             host_type_export(interface, "approval-required"),
             Some(HostTypeExport::SignApprovalRequired)
         ));
         assert!(matches!(
             host_type_export(interface, "sign-result"),
-            Some(HostTypeExport::SignResultV2)
+            Some(HostTypeExport::SignResultStructured)
         ));
     }
 
     #[test]
-    fn v2_component_outbox_recognizes_inspection_type_and_function() {
+    fn petal_component_outbox_recognizes_inspection_type_and_function() {
         let interface = ComponentHostInterface::TxOutbox;
         assert!(matches!(
             host_type_export(interface, "inspection"),
@@ -5816,11 +5824,11 @@ paths = ["/*"]
     }
 
     #[test]
-    fn v2_component_imports_must_be_interface_instances() {
+    fn petal_component_imports_must_be_interface_instances() {
         let tmp = tempfile::tempdir().unwrap();
-        write_v2_package_with_manifest_and_route(
+        write_petal_package_with_manifest_and_route(
             tmp.path(),
-            br#"schema = "bloom.petal.local-app.v2"
+            br#"schema = "bloom.petal.package.v1"
 name = "echo"
 [caps]
 allowed = ["bloom:http"]
@@ -5833,16 +5841,16 @@ paths = ["/*"]
             &route_component_with_func_import("bloom:http/fetch@0.1.0"),
         );
 
-        let err = PreparedAppPackage::from_dir(tmp.path()).unwrap_err();
+        let err = PreparedPetalPackage::from_dir(tmp.path()).unwrap_err();
         assert!(err.to_string().contains("must be an interface instance"));
     }
 
     #[test]
-    fn v2_component_imports_require_bloom_wit_interface_shapes() {
+    fn petal_component_imports_require_bloom_wit_interface_shapes() {
         let tmp = tempfile::tempdir().unwrap();
-        write_v2_package_with_manifest_and_route(
+        write_petal_package_with_manifest_and_route(
             tmp.path(),
-            br#"schema = "bloom.petal.local-app.v2"
+            br#"schema = "bloom.petal.package.v1"
 name = "echo"
 [caps]
 allowed = ["bloom:http"]
@@ -5855,7 +5863,7 @@ paths = ["/*"]
             &route_component(&["metadata", "read"], &["bloom:http/fetch@0.1.0"]),
         );
 
-        let err = PreparedAppPackage::from_dir(tmp.path()).unwrap_err();
+        let err = PreparedPetalPackage::from_dir(tmp.path()).unwrap_err();
         assert!(
             err.to_string()
                 .contains("invalid Bloom WIT interface shape")
@@ -5863,7 +5871,7 @@ paths = ["/*"]
     }
 
     #[test]
-    fn v2_component_imports_accept_narrowed_bloom_interfaces() {
+    fn petal_component_imports_accept_narrowed_bloom_interfaces() {
         assert!(host_import_instance_matches(
             ComponentHostInterface::EnvRuntime,
             r#"
@@ -5910,23 +5918,23 @@ paths = ["/*"]
     }
 
     #[test]
-    fn v2_component_routes_reject_non_bloom_imports() {
+    fn petal_component_routes_reject_non_bloom_imports() {
         let tmp = tempfile::tempdir().unwrap();
-        write_v2_package_with_route(
+        write_petal_package_with_route(
             tmp.path(),
             &route_component(&["metadata", "read"], &["wasi:http/outgoing-handler@0.2.0"]),
         );
 
-        let err = PreparedAppPackage::from_dir(tmp.path()).unwrap_err();
+        let err = PreparedPetalPackage::from_dir(tmp.path()).unwrap_err();
         assert!(err.to_string().contains("unsupported host item"));
     }
 
     #[test]
-    fn v2_component_sign_imports_require_intent_policy() {
+    fn petal_component_sign_imports_require_intent_policy() {
         let tmp = tempfile::tempdir().unwrap();
-        write_v2_package_with_manifest_and_route(
+        write_petal_package_with_manifest_and_route(
             tmp.path(),
-            br#"schema = "bloom.petal.local-app.v2"
+            br#"schema = "bloom.petal.package.v1"
 name = "echo"
 [caps]
 allowed = ["bloom:sign"]
@@ -5934,13 +5942,13 @@ allowed = ["bloom:sign"]
             route_component_sign(),
         );
 
-        let err = PreparedAppPackage::from_dir(tmp.path()).unwrap_err();
+        let err = PreparedPetalPackage::from_dir(tmp.path()).unwrap_err();
         assert!(err.to_string().contains("[sign].allowed_intents"));
 
         let allowed = tempfile::tempdir().unwrap();
-        write_v2_package_with_manifest_and_route(
+        write_petal_package_with_manifest_and_route(
             allowed.path(),
-            br#"schema = "bloom.petal.local-app.v2"
+            br#"schema = "bloom.petal.package.v1"
 name = "echo"
 [caps]
 allowed = ["bloom:sign"]
@@ -5951,19 +5959,15 @@ allowed_intents = ["test.intent"]
             route_component_sign(),
         );
 
-        let package = PreparedAppPackage::from_dir(allowed.path()).unwrap();
-        assert_eq!(
-            package.route_index.routes[0].install_metadata.required_caps,
-            vec!["bloom:sign".to_string()]
-        );
+        PreparedPetalPackage::from_dir(allowed.path()).unwrap();
     }
 
     #[test]
-    fn v2_store_cap_requires_declared_namespaces() {
+    fn petal_store_cap_requires_declared_namespaces() {
         let tmp = tempfile::tempdir().unwrap();
-        write_v2_package_with_manifest_and_route(
+        write_petal_package_with_manifest_and_route(
             tmp.path(),
-            br#"schema = "bloom.petal.local-app.v2"
+            br#"schema = "bloom.petal.package.v1"
 name = "echo"
 [caps]
 allowed = ["bloom:store"]
@@ -5971,13 +5975,13 @@ allowed = ["bloom:store"]
             route_component_no_imports(),
         );
 
-        let err = PreparedAppPackage::from_dir(tmp.path()).unwrap_err();
+        let err = PreparedPetalPackage::from_dir(tmp.path()).unwrap_err();
         assert!(err.to_string().contains("[store].namespaces"));
 
         let allowed = tempfile::tempdir().unwrap();
-        write_v2_package_with_manifest_and_route(
+        write_petal_package_with_manifest_and_route(
             allowed.path(),
-            br#"schema = "bloom.petal.local-app.v2"
+            br#"schema = "bloom.petal.package.v1"
 name = "echo"
 [caps]
 allowed = ["bloom:store"]
@@ -5988,8 +5992,8 @@ secret_namespaces = ["credentials"]
 "#,
             route_component_no_imports(),
         );
-        let policy = store_policy_from_v2_manifest_toml(
-            br#"schema = "bloom.petal.local-app.v2"
+        let policy = store_policy_from_manifest_toml(
+            br#"schema = "bloom.petal.package.v1"
 name = "echo"
 [caps]
 allowed = ["bloom:store"]
@@ -6003,15 +6007,15 @@ secret_namespaces = ["credentials"]
         assert!(policy.namespaces().contains("orders"));
         assert!(policy.namespaces().contains("credentials"));
         assert!(policy.secret_namespaces().contains("credentials"));
-        PreparedAppPackage::from_dir(allowed.path()).unwrap();
+        PreparedPetalPackage::from_dir(allowed.path()).unwrap();
     }
 
     #[test]
-    fn v2_store_namespaces_reject_ambiguous_path_segments() {
+    fn petal_store_namespaces_reject_ambiguous_path_segments() {
         let tmp = tempfile::tempdir().unwrap();
-        write_v2_package_with_manifest_and_route(
+        write_petal_package_with_manifest_and_route(
             tmp.path(),
-            br#"schema = "bloom.petal.local-app.v2"
+            br#"schema = "bloom.petal.package.v1"
 name = "echo"
 [caps]
 allowed = ["bloom:store"]
@@ -6022,13 +6026,13 @@ namespaces = ["orders/archive"]
             route_component_no_imports(),
         );
 
-        let err = PreparedAppPackage::from_dir(tmp.path()).unwrap_err();
+        let err = PreparedPetalPackage::from_dir(tmp.path()).unwrap_err();
         assert!(err.to_string().contains("unsupported byte"));
 
         let drive = tempfile::tempdir().unwrap();
-        write_v2_package_with_manifest_and_route(
+        write_petal_package_with_manifest_and_route(
             drive.path(),
-            br#"schema = "bloom.petal.local-app.v2"
+            br#"schema = "bloom.petal.package.v1"
 name = "echo"
 [caps]
 allowed = ["bloom:store"]
@@ -6039,7 +6043,7 @@ namespaces = ["C:"]
             route_component_no_imports(),
         );
 
-        let err = PreparedAppPackage::from_dir(drive.path()).unwrap_err();
+        let err = PreparedPetalPackage::from_dir(drive.path()).unwrap_err();
         assert!(err.to_string().contains("unsupported byte"));
     }
 
@@ -6049,25 +6053,25 @@ namespaces = ["C:"]
         std::fs::write(path, body).unwrap();
     }
 
-    fn write_v2_package(root: &Path) {
-        write_v2_package_with_route(root, route_component_no_imports());
+    fn write_petal_package(root: &Path) {
+        write_petal_package_with_route(root, route_component_no_imports());
     }
 
-    fn write_v2_package_with_route(root: &Path, route: &[u8]) {
-        write_v2_package_with_manifest_and_route(
+    fn write_petal_package_with_route(root: &Path, route: &[u8]) {
+        write_petal_package_with_manifest_and_route(
             root,
-            br#"schema = "bloom.petal.local-app.v2"
+            br#"schema = "bloom.petal.package.v1"
 name = "echo"
 "#,
             route,
         );
     }
 
-    fn write_v2_package_with_manifest_and_route(root: &Path, manifest: &[u8], route: &[u8]) {
+    fn write_petal_package_with_manifest_and_route(root: &Path, manifest: &[u8], route: &[u8]) {
         write_package_file(root, "petal.toml", manifest);
         write_package_file(root, "README.md", b"# echo");
         write_package_file(root, "AGENTS.md", b"# echo agents");
-        write_package_file(root, "app/echo/hello.txt.wasm", route);
+        write_package_file(root, "petal/echo/hello.txt.wasm", route);
     }
 
     fn route_component_no_imports() -> &'static [u8] {

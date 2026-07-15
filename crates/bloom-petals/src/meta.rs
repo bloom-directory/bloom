@@ -93,15 +93,15 @@ pub struct PetalMeta {
     #[serde(default)]
     pub mode: PetalMode,
     #[serde(default)]
-    pub local_app: Option<LocalAppMeta>,
+    pub petal: Option<PetalPackageMeta>,
     #[serde(default)]
     pub source: Option<PetalSourceProvenance>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LocalAppMeta {
+pub struct PetalPackageMeta {
     pub name: String,
-    pub app_root: String,
+    pub petal_root: String,
     pub route_index_schema: String,
 }
 
@@ -196,7 +196,7 @@ mod tests {
             name: Some("hello".into()),
             caps,
             mode: PetalMode::default(),
-            local_app: None,
+            petal: None,
             source: None,
         };
         let s = serde_json::to_string(&m).unwrap();

@@ -26,11 +26,11 @@ use alloy::signers::local::PrivateKeySigner;
 use base64::Engine as _;
 use bloom_auth::{AuthStore, StoreApprovalVerifier};
 use bloom_auth_api::{
-    AssuranceLevel, CANONICAL_INTENT_HEADER_SCHEMA_V2, CanonicalEnvelope, CanonicalIntentHeader,
-    DaemonGrantTerms, ExecutorKind, LOCAL_APP_PETAL_ID_PREFIX,
-    LOCAL_APP_SIGNING_ATTESTATION_FACTS_SCHEMA_V1, LocalAppSigningAttestationFacts,
-    PetalPolicySnapshot, PolicyCheckClass, PolicyCheckResult, SealedAction, SealedSignBatchEntry,
-    SignHashRequest, signing_attestation_facts_digest,
+    AssuranceLevel, CANONICAL_INTENT_HEADER_SCHEMA_V1, CanonicalEnvelope, CanonicalIntentHeader,
+    DaemonGrantTerms, ExecutorKind, PETAL_PETAL_ID_PREFIX,
+    PETAL_SIGNING_ATTESTATION_FACTS_SCHEMA_V1, PetalPolicySnapshot, PetalSigningAttestationFacts,
+    PolicyCheckClass, PolicyCheckResult, SealedAction, SealedSignBatchEntry, SignHashRequest,
+    signing_attestation_facts_digest,
 };
 use bloom_evm::{ChainClient, ChainRegistry};
 
@@ -42,7 +42,7 @@ use bloom_keystore::{Keystore, KeystoreApprovalSignatureVerifier};
 use bloom_paid_http::PaidHttpChainRpcResolver;
 use bloom_petals::abi::{
     ApprovalRequired, ChainRequest, ChainResponse, EvmOutboxInspection, EvmOutboxOutcome,
-    EvmTransactionRequest, V2SignContext,
+    EvmTransactionRequest, PetalRouteContext,
 };
 use bloom_petals::{
     HostError, HostVfsEntry, HttpRequest, HttpResponse, LateVfsHost, NameRegistry, NetPolicy,
@@ -82,26 +82,26 @@ use tracing::{debug, info, warn};
 use std::sync::Mutex;
 
 const PETAL_HTTP_MAX_REDIRECTS: usize = 5;
-const LOCAL_APP_ACTION_TTL_MS: u64 = 120_000;
-const MAX_ACTIVE_LOCAL_APP_ACTION_IDENTITIES: usize = 4_096;
-const LOCAL_APP_SIGNING_SUBJECT_KIND: &str = "local_app_sign_hash";
-const LOCAL_APP_SIGNING_SUBJECT_SCHEMA_V1: &str = "bloom.local_app.sign_hash_subject.v1";
-const LOCAL_APP_SIGNING_ACTION_DOMAIN: &[u8] = b"bloom.local_app.sign_hash.action.v1";
-const LOCAL_APP_SIGNING_BATCH_ACTION_DOMAIN: &[u8] = b"bloom.local_app.sign_hash_batch.action.v1";
-const MAX_LOCAL_APP_SIGN_BATCH: usize = 16;
+const PETAL_ACTION_TTL_MS: u64 = 120_000;
+const MAX_ACTIVE_PETAL_ACTION_IDENTITIES: usize = 4_096;
+const PETAL_SIGNING_SUBJECT_KIND: &str = "petal_sign_hash";
+const PETAL_SIGNING_SUBJECT_SCHEMA_V1: &str = "bloom.petal.sign_hash_subject.v1";
+const PETAL_SIGNING_ACTION_DOMAIN: &[u8] = b"bloom.petal.sign_hash.action.v1";
+const PETAL_SIGNING_BATCH_ACTION_DOMAIN: &[u8] = b"bloom.petal.sign_hash_batch.action.v1";
+const MAX_PETAL_SIGN_BATCH: usize = 16;
 
 #[derive(Clone)]
-struct LocalAppActionIdentity {
+struct PetalActionIdentity {
     action_id: String,
     expires_ms: u64,
 }
 
 #[derive(Default)]
-struct LocalAppActionIdentityCache {
-    entries: std::collections::HashMap<[u8; 32], LocalAppActionIdentity>,
+struct PetalActionIdentityCache {
+    entries: std::collections::HashMap<[u8; 32], PetalActionIdentity>,
 }
 
-impl LocalAppActionIdentityCache {
+impl PetalActionIdentityCache {
     /// Keep one request identity for the challenge's complete live interval.
     /// Expiry remains part of the action id, so the same scoped request gets a
     /// fresh identity in its next lifecycle and cannot revive an old grant.
@@ -112,7 +112,7 @@ impl LocalAppActionIdentityCache {
         action_id_prefix: &str,
         fingerprint: &[u8],
         now_ms: u64,
-    ) -> Result<LocalAppActionIdentity, HostError> {
+    ) -> Result<PetalActionIdentity, HostError> {
         self.entries
             .retain(|_, identity| identity.expires_ms > now_ms);
 
@@ -123,20 +123,20 @@ impl LocalAppActionIdentityCache {
         if let Some(identity) = self.entries.get(&request_key) {
             return Ok(identity.clone());
         }
-        if self.entries.len() >= MAX_ACTIVE_LOCAL_APP_ACTION_IDENTITIES {
+        if self.entries.len() >= MAX_ACTIVE_PETAL_ACTION_IDENTITIES {
             return Err(HostError::Backend(
-                "too many active local-app signing approval identities".into(),
+                "too many active petal signing approval identities".into(),
             ));
         }
 
         let expires_ms = now_ms
-            .checked_add(LOCAL_APP_ACTION_TTL_MS)
-            .ok_or_else(|| HostError::Backend("local-app action expiry overflow".into()))?;
+            .checked_add(PETAL_ACTION_TTL_MS)
+            .ok_or_else(|| HostError::Backend("petal action expiry overflow".into()))?;
         let mut action_hasher = blake3::Hasher::new();
         action_hasher.update(domain);
         action_hasher.update(fingerprint);
         action_hasher.update(&expires_ms.to_be_bytes());
-        let identity = LocalAppActionIdentity {
+        let identity = PetalActionIdentity {
             action_id: format!("{action_id_prefix}{}", action_hasher.finalize().to_hex()),
             expires_ms,
         };
@@ -258,7 +258,7 @@ struct DaemonPetalHost {
     tx_outbox: Option<PetalTxOutbox>,
     tx_stage_lock: tokio::sync::Mutex<()>,
     sign_batch_lock: tokio::sync::Mutex<()>,
-    local_app_action_identities: Mutex<LocalAppActionIdentityCache>,
+    petal_action_identities: Mutex<PetalActionIdentityCache>,
     #[cfg(feature = "unsafe-debug-signer")]
     unsafe_debug_signer: Option<(String, Arc<PrivateKeySigner>)>,
 }
@@ -287,7 +287,7 @@ impl DaemonPetalHost {
             tx_outbox: None,
             tx_stage_lock: tokio::sync::Mutex::new(()),
             sign_batch_lock: tokio::sync::Mutex::new(()),
-            local_app_action_identities: Mutex::new(LocalAppActionIdentityCache::default()),
+            petal_action_identities: Mutex::new(PetalActionIdentityCache::default()),
             #[cfg(feature = "unsafe-debug-signer")]
             unsafe_debug_signer: None,
         }
@@ -312,82 +312,82 @@ impl DaemonPetalHost {
             .map(|(_, signer)| signer)
     }
 
-    fn local_app_execution_origin(
-        context: &V2SignContext,
+    fn petal_execution_origin(
+        context: &PetalRouteContext,
     ) -> Result<bloom_proto::plan::ExecutionOrigin, HostError> {
-        if context.app_root.trim().is_empty()
+        if context.petal_root.trim().is_empty()
             || context.route_id.trim().is_empty()
             || !bloom_petals::store::is_valid_hex_hash(&context.package_hash)
             || !matches!(context.op.as_str(), "lookup" | "list" | "read" | "write")
         {
             return Err(HostError::Invalid(
-                "trusted v2 route context is incomplete or has an invalid package hash".into(),
+                "trusted Petal route context is incomplete or has an invalid package hash".into(),
             ));
         }
         Ok(bloom_proto::plan::ExecutionOrigin {
-            petal_id: format!("{LOCAL_APP_PETAL_ID_PREFIX}{}", context.app_root),
+            petal_id: format!("{PETAL_PETAL_ID_PREFIX}{}", context.petal_root),
             petal_digest: context.package_hash.clone(),
-            petal_version: "v2-package".into(),
+            petal_version: "v1-package".into(),
         })
     }
 
-    fn validate_local_app_signing_scope(
+    fn validate_petal_signing_scope(
         req: &SignRequest,
-        context: &V2SignContext,
+        context: &PetalRouteContext,
     ) -> Result<std::collections::BTreeMap<String, String>, HostError> {
         if req.wallet.trim().is_empty() || req.purpose.trim().is_empty() {
             return Err(HostError::Invalid(
                 "sign-hash wallet and intent must be non-empty".into(),
             ));
         }
-        if context.app_root.trim().is_empty()
+        if context.petal_root.trim().is_empty()
             || context.route_id.trim().is_empty()
             || !bloom_petals::store::is_valid_hex_hash(&context.package_hash)
         {
             return Err(HostError::Invalid(
-                "trusted v2 route context is incomplete or has an invalid package hash".into(),
+                "trusted Petal route context is incomplete or has an invalid package hash".into(),
             ));
         }
         if !matches!(context.op.as_str(), "lookup" | "list" | "read" | "write") {
             return Err(HostError::Invalid(
-                "trusted v2 route context has an invalid operation".into(),
+                "trusted Petal route context has an invalid operation".into(),
             ));
         }
         let mut params = std::collections::BTreeMap::new();
         for (key, value) in &context.params {
             if params.insert(key.clone(), value.clone()).is_some() {
                 return Err(HostError::Invalid(
-                    "trusted v2 route context has duplicate parameter names".into(),
+                    "trusted Petal route context has duplicate parameter names".into(),
                 ));
             }
         }
         Ok(params)
     }
 
-    fn local_app_action(
+    fn petal_action(
         &self,
         req: &SignRequest,
-        context: &V2SignContext,
+        context: &PetalRouteContext,
         now_ms: u64,
     ) -> Result<(SealedAction, bloom_auth_api::SigningAttestation), HostError> {
-        self.local_app_action_with_identity(req, context, now_ms, None)
+        self.petal_action_with_identity(req, context, now_ms, None)
     }
 
-    fn local_app_action_with_identity(
+    fn petal_action_with_identity(
         &self,
         req: &SignRequest,
-        context: &V2SignContext,
+        context: &PetalRouteContext,
         now_ms: u64,
-        identity: Option<&LocalAppActionIdentity>,
+        identity: Option<&PetalActionIdentity>,
     ) -> Result<(SealedAction, bloom_auth_api::SigningAttestation), HostError> {
-        let params = Self::validate_local_app_signing_scope(req, context)?;
+        let params = Self::validate_petal_signing_scope(req, context)?;
 
         let hash_hex = format!("0x{}", hex::encode(req.hash32));
         let fingerprint = serde_json::to_vec(&serde_json::json!({
             "wallet": req.wallet,
             "hash_hex": hash_hex,
             "intent": req.purpose,
-            "app_root": context.app_root,
+            "petal_root": context.petal_root,
             "package_hash": context.package_hash,
             "route_id": context.route_id,
             "op": context.op,
@@ -395,15 +395,15 @@ impl DaemonPetalHost {
             "params": params,
             "actor": context.actor,
         }))
-        .map_err(|e| HostError::Backend(format!("encode local-app action fingerprint: {e}")))?;
+        .map_err(|e| HostError::Backend(format!("encode petal action fingerprint: {e}")))?;
         let identity = match identity {
             Some(identity) => identity.clone(),
             None => self
-                .local_app_action_identities
+                .petal_action_identities
                 .lock()
-                .map_err(|e| HostError::Backend(format!("lock local-app action identities: {e}")))?
+                .map_err(|e| HostError::Backend(format!("lock petal action identities: {e}")))?
                 .resolve(
-                    LOCAL_APP_SIGNING_ACTION_DOMAIN,
+                    PETAL_SIGNING_ACTION_DOMAIN,
                     "appsign-",
                     &fingerprint,
                     now_ms,
@@ -411,25 +411,25 @@ impl DaemonPetalHost {
         };
         let action_id = identity.action_id;
         let expires_ms = identity.expires_ms;
-        let petal_id = format!("{LOCAL_APP_PETAL_ID_PREFIX}{}", context.app_root);
+        let petal_id = format!("{PETAL_PETAL_ID_PREFIX}{}", context.petal_root);
         let header = CanonicalIntentHeader {
-            schema: CANONICAL_INTENT_HEADER_SCHEMA_V2.into(),
+            schema: CANONICAL_INTENT_HEADER_SCHEMA_V1.into(),
             wallet: req.wallet.clone(),
-            surface: "apps".into(),
+            surface: "petals".into(),
             action_id: action_id.clone(),
             petal_id: petal_id.clone(),
             petal_digest: context.package_hash.clone(),
-            petal_version: "v2-package".into(),
+            petal_version: "v1-package".into(),
             executor_kind: ExecutorKind::Wasm,
             network: "local".into(),
             account: req.wallet.clone(),
-            action_kind: "local_app.sign_hash".into(),
+            action_kind: "petal.sign_hash".into(),
             value_movement: true,
             authority_change: true,
             expires_ms,
         };
         let mut terms = DaemonGrantTerms::minimal(AssuranceLevel::Standard);
-        terms.max_ttl_secs = LOCAL_APP_ACTION_TTL_MS / 1_000;
+        terms.max_ttl_secs = PETAL_ACTION_TTL_MS / 1_000;
         terms.max_signatures = 1;
         terms.allowed_sign_intents = vec![req.purpose.clone()];
         terms.extra.insert(
@@ -439,8 +439,8 @@ impl DaemonPetalHost {
 
         let mut snapshot = PetalPolicySnapshot::minimal(&header);
         snapshot.config.insert(
-            "app_root".into(),
-            serde_json::Value::String(context.app_root.clone()),
+            "petal_root".into(),
+            serde_json::Value::String(context.petal_root.clone()),
         );
         snapshot.config.insert(
             "package_hash".into(),
@@ -452,16 +452,16 @@ impl DaemonPetalHost {
         );
         let policy_snapshot_digest = snapshot
             .petal_policy_digest()
-            .map_err(|e| HostError::Backend(format!("digest local-app policy snapshot: {e}")))?;
-        let facts = LocalAppSigningAttestationFacts {
-            facts_schema: LOCAL_APP_SIGNING_ATTESTATION_FACTS_SCHEMA_V1.into(),
+            .map_err(|e| HostError::Backend(format!("digest petal policy snapshot: {e}")))?;
+        let facts = PetalSigningAttestationFacts {
+            facts_schema: PETAL_SIGNING_ATTESTATION_FACTS_SCHEMA_V1.into(),
             action_id,
             wallet: req.wallet.clone(),
-            surface: "apps".into(),
+            surface: "petals".into(),
             petal_id,
             petal_digest: context.package_hash.clone(),
-            petal_version: "v2-package".into(),
-            app_root: context.app_root.clone(),
+            petal_version: "v1-package".into(),
+            petal_root: context.petal_root.clone(),
             package_hash: context.package_hash.clone(),
             route_id: context.route_id.clone(),
             op: context.op.clone(),
@@ -474,27 +474,27 @@ impl DaemonPetalHost {
         };
         let facts_map = facts
             .to_facts_map()
-            .map_err(|e| HostError::Backend(format!("encode local-app signing facts: {e}")))?;
+            .map_err(|e| HostError::Backend(format!("encode petal signing facts: {e}")))?;
         let facts_digest = signing_attestation_facts_digest(&facts_map)
-            .map_err(|e| HostError::Backend(format!("digest local-app signing facts: {e}")))?;
+            .map_err(|e| HostError::Backend(format!("digest petal signing facts: {e}")))?;
         terms.extra.insert(
             "required.attestation_facts_digest".into(),
             serde_json::Value::String(facts_digest),
         );
         let attestation = facts
             .signing_attestation()
-            .map_err(|e| HostError::Backend(format!("build local-app signing attestation: {e}")))?;
+            .map_err(|e| HostError::Backend(format!("build petal signing attestation: {e}")))?;
         let subject = serde_json::to_vec(&facts)
-            .map_err(|e| HostError::Backend(format!("encode local-app signing subject: {e}")))?;
+            .map_err(|e| HostError::Backend(format!("encode petal signing subject: {e}")))?;
         let envelope = CanonicalEnvelope::new(
             header,
-            LOCAL_APP_SIGNING_SUBJECT_KIND,
-            LOCAL_APP_SIGNING_SUBJECT_SCHEMA_V1,
+            PETAL_SIGNING_SUBJECT_KIND,
+            PETAL_SIGNING_SUBJECT_SCHEMA_V1,
             subject,
         );
         let plan = format!(
-            "# Approve local app signature\n\nApp: `{}`\nPackage: `{}`\nRoute: `{}` {} `{}`\nWallet: `{}`\nIntent: `{}`\nHash: `{}`\n",
-            context.app_root,
+            "# Approve Petal signature\n\nPetal: `{}`\nPackage: `{}`\nRoute: `{}` {} `{}`\nWallet: `{}`\nIntent: `{}`\nHash: `{}`\n",
+            context.petal_root,
             context.package_hash,
             context.route_id,
             context.op,
@@ -511,10 +511,10 @@ impl DaemonPetalHost {
             envelope,
             plan,
             vec![PolicyCheckResult {
-                rule_id: "local_app.route_provenance".into(),
+                rule_id: "petal.route_provenance".into(),
                 rule_class: PolicyCheckClass::Informational,
                 outcome: "pass".into(),
-                message: "signature request is bound to the resolved local app package and route"
+                message: "signature request is bound to the resolved Petal package and route"
                     .into(),
                 step_up_ceiling: None,
             }],
@@ -522,22 +522,22 @@ impl DaemonPetalHost {
             snapshot,
             now_ms,
         )
-        .map_err(|e| HostError::Backend(format!("seal local-app signing action: {e}")))?;
+        .map_err(|e| HostError::Backend(format!("seal petal signing action: {e}")))?;
         Ok((action, attestation))
     }
 
-    fn local_app_batch_action(
+    fn petal_batch_action(
         &self,
         requests: &[SignRequest],
         now_ms: u64,
     ) -> Result<(SealedAction, Vec<bloom_auth_api::SigningAttestation>), HostError> {
-        if requests.is_empty() || requests.len() > MAX_LOCAL_APP_SIGN_BATCH {
+        if requests.is_empty() || requests.len() > MAX_PETAL_SIGN_BATCH {
             return Err(HostError::Invalid(format!(
-                "local-app signing batch requires 1..={MAX_LOCAL_APP_SIGN_BATCH} requests"
+                "petal signing batch requires 1..={MAX_PETAL_SIGN_BATCH} requests"
             )));
         }
         let first_context = requests[0].context.as_ref().ok_or_else(|| {
-            HostError::Denied("signing batch requires trusted v2 route context".into())
+            HostError::Denied("signing batch requires trusted Petal route context".into())
         })?;
         let first_wallet = requests[0].wallet.as_str();
         let mut seen = std::collections::BTreeSet::new();
@@ -557,10 +557,10 @@ impl DaemonPetalHost {
                     "signing batch contains a duplicate wallet/hash/intent entry".into(),
                 ));
             }
-            Self::validate_local_app_signing_scope(request, first_context)?;
+            Self::validate_petal_signing_scope(request, first_context)?;
         }
 
-        let params = Self::validate_local_app_signing_scope(&requests[0], first_context)?;
+        let params = Self::validate_petal_signing_scope(&requests[0], first_context)?;
         let request_fingerprint: Vec<_> = requests
             .iter()
             .map(|request| {
@@ -573,7 +573,7 @@ impl DaemonPetalHost {
             .collect();
         let fingerprint = serde_json::to_vec(&serde_json::json!({
             "requests": request_fingerprint,
-            "app_root": first_context.app_root,
+            "petal_root": first_context.petal_root,
             "package_hash": first_context.package_hash,
             "route_id": first_context.route_id,
             "op": first_context.op,
@@ -581,13 +581,13 @@ impl DaemonPetalHost {
             "params": params,
             "actor": first_context.actor,
         }))
-        .map_err(|e| HostError::Backend(format!("encode local-app batch fingerprint: {e}")))?;
+        .map_err(|e| HostError::Backend(format!("encode petal batch fingerprint: {e}")))?;
         let identity = self
-            .local_app_action_identities
+            .petal_action_identities
             .lock()
-            .map_err(|e| HostError::Backend(format!("lock local-app action identities: {e}")))?
+            .map_err(|e| HostError::Backend(format!("lock petal action identities: {e}")))?
             .resolve(
-                LOCAL_APP_SIGNING_BATCH_ACTION_DOMAIN,
+                PETAL_SIGNING_BATCH_ACTION_DOMAIN,
                 "appsign-batch-",
                 &fingerprint,
                 now_ms,
@@ -597,7 +597,7 @@ impl DaemonPetalHost {
 
         let mut individual = Vec::with_capacity(requests.len());
         for request in requests {
-            individual.push(self.local_app_action_with_identity(
+            individual.push(self.petal_action_with_identity(
                 request,
                 first_context,
                 now_ms,
@@ -608,8 +608,8 @@ impl DaemonPetalHost {
         let mut attestations = Vec::with_capacity(individual.len());
         let mut entries = Vec::with_capacity(individual.len());
         for ((_, attestation), request) in individual.into_iter().zip(requests) {
-            let mut facts = LocalAppSigningAttestationFacts::from_attestation(&attestation)
-                .map_err(|e| HostError::Backend(format!("decode local-app attestation: {e}")))?;
+            let mut facts = PetalSigningAttestationFacts::from_attestation(&attestation)
+                .map_err(|e| HostError::Backend(format!("decode petal attestation: {e}")))?;
             facts.action_id = action_id.clone();
             let attestation = facts
                 .signing_attestation()
@@ -624,25 +624,25 @@ impl DaemonPetalHost {
             attestations.push(attestation);
         }
 
-        let petal_id = format!("{LOCAL_APP_PETAL_ID_PREFIX}{}", first_context.app_root);
+        let petal_id = format!("{PETAL_PETAL_ID_PREFIX}{}", first_context.petal_root);
         let header = CanonicalIntentHeader {
-            schema: CANONICAL_INTENT_HEADER_SCHEMA_V2.into(),
+            schema: CANONICAL_INTENT_HEADER_SCHEMA_V1.into(),
             wallet: first_wallet.into(),
-            surface: "apps".into(),
+            surface: "petals".into(),
             action_id: action_id.clone(),
             petal_id,
             petal_digest: first_context.package_hash.clone(),
-            petal_version: "v2-package".into(),
+            petal_version: "v1-package".into(),
             executor_kind: ExecutorKind::Wasm,
             network: "local".into(),
             account: first_wallet.into(),
-            action_kind: "local_app.sign_hash_batch".into(),
+            action_kind: "petal.sign_hash_batch".into(),
             value_movement: true,
             authority_change: true,
             expires_ms,
         };
         let mut terms = DaemonGrantTerms::minimal(AssuranceLevel::Hardened);
-        terms.max_ttl_secs = LOCAL_APP_ACTION_TTL_MS / 1_000;
+        terms.max_ttl_secs = PETAL_ACTION_TTL_MS / 1_000;
         terms.max_signatures = u32::try_from(entries.len())
             .map_err(|_| HostError::Invalid("signing batch is too large".into()))?;
         terms.allowed_sign_intents = requests
@@ -658,8 +658,8 @@ impl DaemonPetalHost {
         );
         let mut snapshot = PetalPolicySnapshot::minimal(&header);
         snapshot.config.insert(
-            "app_root".into(),
-            serde_json::Value::String(first_context.app_root.clone()),
+            "petal_root".into(),
+            serde_json::Value::String(first_context.petal_root.clone()),
         );
         snapshot.config.insert(
             "package_hash".into(),
@@ -673,7 +673,7 @@ impl DaemonPetalHost {
             "action_id": action_id,
             "requests": entries,
         }))
-        .map_err(|e| HostError::Backend(format!("encode local-app batch subject: {e}")))?;
+        .map_err(|e| HostError::Backend(format!("encode petal batch subject: {e}")))?;
         let plan_entries = requests
             .iter()
             .enumerate()
@@ -690,13 +690,13 @@ impl DaemonPetalHost {
         let action = SealedAction::new(
             CanonicalEnvelope::new(
                 header,
-                "local_app_sign_hash_batch",
-                "bloom.local_app.sign_hash_batch_subject.v1",
+                "petal_sign_hash_batch",
+                "bloom.petal.sign_hash_batch_subject.v1",
                 subject,
             ),
             format!(
-                "# Approve local app signature batch\n\nApp: `{}`\nPackage: `{}`\nRoute: `{}` {} `{}`\nWallet: `{}`\n\n{}\n",
-                first_context.app_root,
+                "# Approve Petal signature batch\n\nPetal: `{}`\nPackage: `{}`\nRoute: `{}` {} `{}`\nWallet: `{}`\n\n{}\n",
+                first_context.petal_root,
                 first_context.package_hash,
                 first_context.route_id,
                 first_context.op,
@@ -705,17 +705,17 @@ impl DaemonPetalHost {
                 plan_entries,
             ),
             vec![PolicyCheckResult {
-                rule_id: "local_app.route_provenance".into(),
+                rule_id: "petal.route_provenance".into(),
                 rule_class: PolicyCheckClass::Informational,
                 outcome: "pass".into(),
-                message: "ordered signature batch is bound to the resolved local app package and route".into(),
+                message: "ordered signature batch is bound to the resolved Petal package and route".into(),
                 step_up_ceiling: None,
             }],
             terms,
             snapshot,
             now_ms,
         )
-        .map_err(|e| HostError::Backend(format!("seal local-app signing batch: {e}")))?;
+        .map_err(|e| HostError::Backend(format!("seal petal signing batch: {e}")))?;
         Ok((action, attestations))
     }
 
@@ -969,7 +969,7 @@ impl PetalHost for DaemonPetalHost {
         match self.sign_hash_outcome(req).await? {
             SignOutcome::Signature(signature) => Ok(signature),
             SignOutcome::ApprovalRequired(approval) => Err(HostError::Denied(format!(
-                "Sealed Approval required for v2 petal sign_hash; action_id={}; ceremony_url={}",
+                "Sealed Approval required for Petal sign_hash; action_id={}; ceremony_url={}",
                 approval.action_id, approval.ceremony_url
             ))),
         }
@@ -978,7 +978,7 @@ impl PetalHost for DaemonPetalHost {
     async fn sign_hash_outcome(&self, req: SignRequest) -> Result<SignOutcome, HostError> {
         let Some(context) = req.context.as_ref() else {
             let err = HostError::Denied(
-                "v2 petal sign_hash requires trusted v2 route context and a Sealed Approval grant"
+                "Petal sign_hash requires trusted Petal route context and a Sealed Approval grant"
                     .into(),
             );
             self.audit_sign_hash(&req, "denied", Some(&err.to_string()));
@@ -988,7 +988,7 @@ impl PetalHost for DaemonPetalHost {
             .duration_since(UNIX_EPOCH)
             .map(|duration| duration.as_millis() as u64)
             .unwrap_or(0);
-        let (action, attestation) = match self.local_app_action(&req, context, now_ms) {
+        let (action, attestation) = match self.petal_action(&req, context, now_ms) {
             Ok(value) => value,
             Err(err) => {
                 self.audit_sign_hash(&req, "denied", Some(&err.to_string()));
@@ -1022,7 +1022,7 @@ impl PetalHost for DaemonPetalHost {
                 now_ms,
             )
             .await
-            .map_err(|e| HostError::Backend(format!("lookup local-app sealed grant: {e}")))?;
+            .map_err(|e| HostError::Backend(format!("lookup petal sealed grant: {e}")))?;
         if active_grant.is_none() {
             let writer = self
                 .auth_services
@@ -1031,7 +1031,7 @@ impl PetalHost for DaemonPetalHost {
             writer
                 .stage_action(action.clone(), now_ms)
                 .await
-                .map_err(|e| HostError::Backend(format!("stage local-app sealed action: {e}")))?;
+                .map_err(|e| HostError::Backend(format!("stage petal sealed action: {e}")))?;
             let mut nonce = [0u8; 32];
             rand::rngs::OsRng.fill_bytes(&mut nonce);
             let challenge = writer
@@ -1043,9 +1043,7 @@ impl PetalHost for DaemonPetalHost {
                     now_ms,
                 )
                 .await
-                .map_err(|e| {
-                    HostError::Backend(format!("issue local-app approval challenge: {e}"))
-                })?
+                .map_err(|e| HostError::Backend(format!("issue petal approval challenge: {e}")))?
                 .with_local_ceremony_url();
             let ceremony_url = challenge
                 .ceremony_url
@@ -1074,13 +1072,12 @@ impl PetalHost for DaemonPetalHost {
                 now_ms,
             )
             .await
-            .map_err(|e| HostError::Denied(format!("local-app sealed signing denied: {e}")))?;
+            .map_err(|e| HostError::Denied(format!("petal sealed signing denied: {e}")))?;
         let signature = base64::engine::general_purpose::STANDARD
             .decode(signature.signature_b64)
-            .map_err(|e| HostError::Backend(format!("decode local-app signature: {e}")))?;
+            .map_err(|e| HostError::Backend(format!("decode petal signature: {e}")))?;
         if signature.len() != 65 {
-            let err =
-                HostError::Backend("local-app signer returned a non-65-byte signature".into());
+            let err = HostError::Backend("petal signer returned a non-65-byte signature".into());
             self.audit_sign_hash(&req, "error", Some(&err.to_string()));
             return Err(err);
         }
@@ -1097,7 +1094,7 @@ impl PetalHost for DaemonPetalHost {
             .duration_since(UNIX_EPOCH)
             .map(|duration| duration.as_millis() as u64)
             .unwrap_or(0);
-        let (action, attestations) = self.local_app_batch_action(&req.requests, now_ms)?;
+        let (action, attestations) = self.petal_batch_action(&req.requests, now_ms)?;
         #[cfg(feature = "unsafe-debug-signer")]
         if let Some(signer) = self.unsafe_debug_signer(action.wallet()) {
             tracing::warn!(
@@ -1130,7 +1127,7 @@ impl PetalHost for DaemonPetalHost {
                 now_ms,
             )
             .await
-            .map_err(|e| HostError::Backend(format!("lookup local-app batch grant: {e}")))?;
+            .map_err(|e| HostError::Backend(format!("lookup petal batch grant: {e}")))?;
         if active_grant.is_none() {
             let writer = self
                 .auth_services
@@ -1139,7 +1136,7 @@ impl PetalHost for DaemonPetalHost {
             writer
                 .stage_action(action.clone(), now_ms)
                 .await
-                .map_err(|e| HostError::Backend(format!("stage local-app signing batch: {e}")))?;
+                .map_err(|e| HostError::Backend(format!("stage petal signing batch: {e}")))?;
             let mut nonce = [0u8; 32];
             rand::rngs::OsRng.fill_bytes(&mut nonce);
             let challenge = writer
@@ -1178,9 +1175,7 @@ impl PetalHost for DaemonPetalHost {
             .map_err(|e| HostError::Backend(e.to_string()))?
             .sign_hash_batch(requests, &attestations, now_ms)
             .await
-            .map_err(|e| {
-                HostError::Denied(format!("local-app sealed batch signing denied: {e}"))
-            })?;
+            .map_err(|e| HostError::Denied(format!("petal sealed batch signing denied: {e}")))?;
         let mut signatures = Vec::with_capacity(sealed.len());
         for signature in sealed {
             let bytes = base64::engine::general_purpose::STANDARD
@@ -1188,7 +1183,7 @@ impl PetalHost for DaemonPetalHost {
                 .map_err(|e| HostError::Backend(format!("decode batch signature: {e}")))?;
             if bytes.len() != 65 {
                 return Err(HostError::Backend(
-                    "local-app batch signer returned a non-65-byte signature".into(),
+                    "petal batch signer returned a non-65-byte signature".into(),
                 ));
             }
             signatures.push(bytes);
@@ -1201,9 +1196,9 @@ impl PetalHost for DaemonPetalHost {
         req: EvmTransactionRequest,
     ) -> Result<EvmOutboxOutcome, HostError> {
         let context = req.context.as_ref().ok_or_else(|| {
-            HostError::Denied("v2 petal EVM outbox requires trusted v2 route context".into())
+            HostError::Denied("Petal EVM outbox requires trusted Petal route context".into())
         })?;
-        let origin = Self::local_app_execution_origin(context)?;
+        let origin = Self::petal_execution_origin(context)?;
         let service = self
             .tx_outbox
             .as_ref()
@@ -1319,12 +1314,12 @@ impl PetalHost for DaemonPetalHost {
         chain_name: String,
         outbox_id: String,
         acknowledge_warnings: bool,
-        context: Option<V2SignContext>,
+        context: Option<PetalRouteContext>,
     ) -> Result<EvmOutboxOutcome, HostError> {
         let context = context.as_ref().ok_or_else(|| {
-            HostError::Denied("v2 petal EVM outbox requires trusted v2 route context".into())
+            HostError::Denied("Petal EVM outbox requires trusted Petal route context".into())
         })?;
-        let origin = Self::local_app_execution_origin(context)?;
+        let origin = Self::petal_execution_origin(context)?;
         let service = self
             .tx_outbox
             .as_ref()
@@ -1340,7 +1335,7 @@ impl PetalHost for DaemonPetalHost {
             .map_err(|e| HostError::NotFound(format!("outbox {outbox_id}: {e}")))?;
         if entry.staged.resolved_execution_origin() != origin {
             return Err(HostError::Denied(
-                "outbox entry was not staged by this trusted local app".into(),
+                "outbox entry was not staged by this trusted Petal".into(),
             ));
         }
         let wallet_info = service
@@ -1387,12 +1382,12 @@ impl PetalHost for DaemonPetalHost {
         wallet: String,
         chain_name: String,
         outbox_id: String,
-        context: Option<V2SignContext>,
+        context: Option<PetalRouteContext>,
     ) -> Result<EvmOutboxInspection, HostError> {
         let context = context.as_ref().ok_or_else(|| {
-            HostError::Denied("v2 petal EVM outbox requires trusted v2 route context".into())
+            HostError::Denied("Petal EVM outbox requires trusted Petal route context".into())
         })?;
-        let origin = Self::local_app_execution_origin(context)?;
+        let origin = Self::petal_execution_origin(context)?;
         let service = self
             .tx_outbox
             .as_ref()
@@ -1404,7 +1399,7 @@ impl PetalHost for DaemonPetalHost {
             .map_err(|e| HostError::NotFound(format!("outbox {outbox_id}: {e}")))?;
         if entry.staged.resolved_execution_origin() != origin {
             return Err(HostError::Denied(
-                "outbox entry was not staged by this trusted local app".into(),
+                "outbox entry was not staged by this trusted Petal".into(),
             ));
         }
         let receipt = service
@@ -1430,9 +1425,9 @@ impl PetalHost for DaemonPetalHost {
 
     async fn chain_read(&self, req: ChainRequest) -> Result<ChainResponse, HostError> {
         let context = req.context.as_ref().ok_or_else(|| {
-            HostError::Denied("v2 petal chain read requires trusted v2 route context".into())
+            HostError::Denied("Petal chain read requires trusted Petal route context".into())
         })?;
-        Self::local_app_execution_origin(context)?;
+        Self::petal_execution_origin(context)?;
         let service = self
             .tx_outbox
             .as_ref()
@@ -2175,8 +2170,8 @@ impl Daemon {
 
         // Build the petals runtime: content-addressed store under
         // `~/.bloom/petals/store`, name registry under
-        // `~/.bloom/petals/registry`, and a wasmtime engine. V2 app
-        // packages are exposed under `apps/`.
+        // `~/.bloom/petals/registry`, and a wasmtime engine. Petal
+        // packages are exposed under `petals/`.
         let petals_root = home.root().join("petals");
         let petal_store = PetalStore::open(petals_root.join("store"))
             .map_err(|e| DaemonError::Audit(format!("petals store: {e}")))?;
@@ -2211,10 +2206,10 @@ impl Daemon {
 
         let mut vfs_builder = Vfs::builder()
             .mount(
-                "apps",
+                "petals",
                 Arc::new(
                     PetalRouter::new(petals.clone(), petal_app_host)
-                        .with_runtime_apps(config.petals.apps.clone())
+                        .with_runtime_petals(config.petals.runtime.clone())
                         .map_err(|e| {
                             DaemonError::Audit(format!("petals runtime configuration: {e}"))
                         })?,
@@ -3033,7 +3028,7 @@ mod tests {
         assert!(d.vfs.handler("prices").is_some());
         assert!(d.vfs.handler("addressbook").is_some());
         assert!(d.vfs.handler("ens").is_some());
-        assert!(d.vfs.handler("apps").is_some());
+        assert!(d.vfs.handler("petals").is_some());
         assert!(
             d.vfs.handler("hyperliquid").is_some(),
             "fresh homes should mount Hyperliquid with public defaults"
@@ -3041,7 +3036,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn daemon_petal_host_sign_hash_rejects_calls_without_trusted_v2_context() {
+    async fn daemon_petal_host_sign_hash_rejects_calls_without_trusted_petal_context() {
         let dir = tempfile::tempdir().unwrap();
         let audit = Arc::new(AuditLog::open(dir.path().join("audit.jsonl")).unwrap());
         let host =
@@ -3058,11 +3053,11 @@ mod tests {
         let HostError::Denied(msg) = err else {
             panic!("expected denied error");
         };
-        assert!(msg.contains("trusted v2 route context"), "{msg}");
+        assert!(msg.contains("trusted Petal route context"), "{msg}");
     }
 
     #[test]
-    fn daemon_petal_host_seals_v2_signing_action_from_trusted_route_context() {
+    fn daemon_petal_host_seals_petal_signing_action_from_trusted_route_context() {
         let dir = tempfile::tempdir().unwrap();
         let audit = Arc::new(AuditLog::open(dir.path().join("audit.jsonl")).unwrap());
         let host =
@@ -3071,8 +3066,8 @@ mod tests {
             wallet: "alice".into(),
             hash32: [7; 32],
             purpose: "portfolio.position.sign".into(),
-            context: Some(V2SignContext {
-                app_root: "portfolio".into(),
+            context: Some(PetalRouteContext {
+                petal_root: "portfolio".into(),
                 package_hash: "a".repeat(64),
                 route_id: "r000001".into(),
                 op: "read".into(),
@@ -3082,11 +3077,11 @@ mod tests {
             }),
         };
         let (action, attestation) = host
-            .local_app_action(&req, req.context.as_ref().unwrap(), 1)
+            .petal_action(&req, req.context.as_ref().unwrap(), 1)
             .unwrap();
 
-        assert_eq!(action.surface(), "apps");
-        assert_eq!(action.petal_id(), "local-app:portfolio");
+        assert_eq!(action.surface(), "petals");
+        assert_eq!(action.petal_id(), "petal:portfolio");
         assert_eq!(action.petal_digest(), "a".repeat(64));
         assert_eq!(action.daemon_terms.max_signatures, 1);
         assert_eq!(
@@ -3117,11 +3112,11 @@ mod tests {
 
         let mut root_context = req.context.clone().unwrap();
         root_context.path.clear();
-        host.local_app_action(&req, &root_context, 1).unwrap();
+        host.petal_action(&req, &root_context, 1).unwrap();
     }
 
     #[test]
-    fn local_app_signing_identity_is_stable_until_expiry() {
+    fn petal_signing_identity_is_stable_until_expiry() {
         let dir = tempfile::tempdir().unwrap();
         let audit = Arc::new(AuditLog::open(dir.path().join("audit.jsonl")).unwrap());
         let host =
@@ -3130,8 +3125,8 @@ mod tests {
             wallet: "alice".into(),
             hash32: [7; 32],
             purpose: "example.batch_sign".into(),
-            context: Some(V2SignContext {
-                app_root: "example".into(),
+            context: Some(PetalRouteContext {
+                petal_root: "example".into(),
                 package_hash: "a".repeat(64),
                 route_id: "r-sign".into(),
                 op: "write".into(),
@@ -3142,34 +3137,34 @@ mod tests {
         };
 
         let (start, _) = host
-            .local_app_action(&req, req.context.as_ref().unwrap(), 1)
+            .petal_action(&req, req.context.as_ref().unwrap(), 1)
             .unwrap();
         let (end_of_bucket, _) = host
-            .local_app_action(&req, req.context.as_ref().unwrap(), 59_999)
+            .petal_action(&req, req.context.as_ref().unwrap(), 59_999)
             .unwrap();
         assert_eq!(start.action_id(), end_of_bucket.action_id());
         assert_eq!(end_of_bucket.expires_ms, 120_001);
 
         let (next_bucket, _) = host
-            .local_app_action(&req, req.context.as_ref().unwrap(), 60_000)
+            .petal_action(&req, req.context.as_ref().unwrap(), 60_000)
             .unwrap();
         assert_eq!(start.action_id(), next_bucket.action_id());
         assert_eq!(next_bucket.expires_ms, start.expires_ms);
 
         let (last_live_retry, _) = host
-            .local_app_action(&req, req.context.as_ref().unwrap(), 120_000)
+            .petal_action(&req, req.context.as_ref().unwrap(), 120_000)
             .unwrap();
         assert_eq!(start.action_id(), last_live_retry.action_id());
 
         let (after_expiry, _) = host
-            .local_app_action(&req, req.context.as_ref().unwrap(), 120_001)
+            .petal_action(&req, req.context.as_ref().unwrap(), 120_001)
             .unwrap();
         assert_ne!(start.action_id(), after_expiry.action_id());
         assert_eq!(after_expiry.expires_ms, 240_001);
     }
 
     #[test]
-    fn local_app_signing_identity_binds_the_complete_request_scope() {
+    fn petal_signing_identity_binds_the_complete_request_scope() {
         let dir = tempfile::tempdir().unwrap();
         let audit = Arc::new(AuditLog::open(dir.path().join("audit.jsonl")).unwrap());
         let host =
@@ -3178,8 +3173,8 @@ mod tests {
             wallet: "alice".into(),
             hash32: [7; 32],
             purpose: "example.sign".into(),
-            context: Some(V2SignContext {
-                app_root: "example".into(),
+            context: Some(PetalRouteContext {
+                petal_root: "example".into(),
                 package_hash: "a".repeat(64),
                 route_id: "r-sign".into(),
                 op: "write".into(),
@@ -3189,20 +3184,20 @@ mod tests {
             }),
         };
         let (original, _) = host
-            .local_app_action(&req, req.context.as_ref().unwrap(), 1)
+            .petal_action(&req, req.context.as_ref().unwrap(), 1)
             .unwrap();
 
         let mut changed_hash = req.clone();
         changed_hash.hash32 = [8; 32];
         let (changed_hash, _) = host
-            .local_app_action(&changed_hash, changed_hash.context.as_ref().unwrap(), 1)
+            .petal_action(&changed_hash, changed_hash.context.as_ref().unwrap(), 1)
             .unwrap();
         assert_ne!(original.action_id(), changed_hash.action_id());
 
         let mut changed_context = req.clone();
         changed_context.context.as_mut().unwrap().actor = Some("agent-2".into());
         let (changed_context, _) = host
-            .local_app_action(
+            .petal_action(
                 &changed_context,
                 changed_context.context.as_ref().unwrap(),
                 1,
@@ -3217,8 +3212,8 @@ mod tests {
         let audit = Arc::new(AuditLog::open(dir.path().join("audit.jsonl")).unwrap());
         let host =
             DaemonPetalHost::new(Arc::new(LateVfsHost::new()), audit, AuthServices::default());
-        let context = V2SignContext {
-            app_root: "polymarket".into(),
+        let context = PetalRouteContext {
+            petal_root: "polymarket".into(),
             package_hash: "b".repeat(64),
             route_id: "r-onboard".into(),
             op: "write".into(),
@@ -3240,7 +3235,7 @@ mod tests {
                 context: Some(context),
             },
         ];
-        let (action, attestations) = host.local_app_batch_action(&requests, 1).unwrap();
+        let (action, attestations) = host.petal_batch_action(&requests, 1).unwrap();
         assert_eq!(action.daemon_terms.assurance, AssuranceLevel::Hardened);
         assert_eq!(action.daemon_terms.max_signatures, 2);
         assert_eq!(attestations.len(), 2);
@@ -3255,21 +3250,21 @@ mod tests {
                 .all(|entry| !entry.attestation_facts_digest.is_empty())
         );
 
-        let (across_retry_boundary, _) = host.local_app_batch_action(&requests, 60_000).unwrap();
+        let (across_retry_boundary, _) = host.petal_batch_action(&requests, 60_000).unwrap();
         assert_eq!(action.action_id(), across_retry_boundary.action_id());
         assert_eq!(action.expires_ms, across_retry_boundary.expires_ms);
 
         let (after_expiry, _) = host
-            .local_app_batch_action(&requests, action.expires_ms)
+            .petal_batch_action(&requests, action.expires_ms)
             .unwrap();
         assert_ne!(action.action_id(), after_expiry.action_id());
 
         let mut reversed = requests.clone();
         reversed.reverse();
-        let (reversed_action, _) = host.local_app_batch_action(&reversed, 1).unwrap();
+        let (reversed_action, _) = host.petal_batch_action(&reversed, 1).unwrap();
         assert_ne!(action.action_id(), reversed_action.action_id());
         assert!(
-            host.local_app_batch_action(&[requests[0].clone(), requests[0].clone()], 1)
+            host.petal_batch_action(&[requests[0].clone(), requests[0].clone()], 1)
                 .is_err()
         );
     }
@@ -3280,8 +3275,8 @@ mod tests {
         let audit = Arc::new(AuditLog::open(dir.path().join("audit.jsonl")).unwrap());
         let host =
             DaemonPetalHost::new(Arc::new(LateVfsHost::new()), audit, AuthServices::default());
-        let context = V2SignContext {
-            app_root: "example".into(),
+        let context = PetalRouteContext {
+            petal_root: "example".into(),
             package_hash: "b".repeat(64),
             route_id: "r-sign".into(),
             op: "write".into(),
@@ -3290,7 +3285,7 @@ mod tests {
             actor: None,
         };
 
-        for index in 0..MAX_ACTIVE_LOCAL_APP_ACTION_IDENTITIES {
+        for index in 0..MAX_ACTIVE_PETAL_ACTION_IDENTITIES {
             let mut hash32 = [0; 32];
             hash32[..8].copy_from_slice(&(index as u64).to_be_bytes());
             let invalid = SignRequest {
@@ -3299,14 +3294,10 @@ mod tests {
                 purpose: String::new(),
                 context: Some(context.clone()),
             };
-            assert!(host.local_app_batch_action(&[invalid], 1).is_err());
+            assert!(host.petal_batch_action(&[invalid], 1).is_err());
         }
         assert_eq!(
-            host.local_app_action_identities
-                .lock()
-                .unwrap()
-                .entries
-                .len(),
+            host.petal_action_identities.lock().unwrap().entries.len(),
             0
         );
 
@@ -3316,21 +3307,17 @@ mod tests {
             purpose: "example.sign".into(),
             context: Some(context),
         };
-        host.local_app_batch_action(&[valid], 1).unwrap();
+        host.petal_batch_action(&[valid], 1).unwrap();
         assert_eq!(
-            host.local_app_action_identities
-                .lock()
-                .unwrap()
-                .entries
-                .len(),
+            host.petal_action_identities.lock().unwrap().entries.len(),
             1
         );
     }
 
     #[test]
     fn daemon_petal_host_derives_evm_origin_only_from_trusted_route_context() {
-        let context = V2SignContext {
-            app_root: "polymarket".into(),
+        let context = PetalRouteContext {
+            petal_root: "polymarket".into(),
             package_hash: "a".repeat(64),
             route_id: "r000001".into(),
             op: "write".into(),
@@ -3338,10 +3325,10 @@ mod tests {
             params: vec![("id".into(), "one".into())],
             actor: Some("agent-1".into()),
         };
-        let origin = DaemonPetalHost::local_app_execution_origin(&context).unwrap();
-        assert_eq!(origin.petal_id, "local-app:polymarket");
+        let origin = DaemonPetalHost::petal_execution_origin(&context).unwrap();
+        assert_eq!(origin.petal_id, "petal:polymarket");
         assert_eq!(origin.petal_digest, "a".repeat(64));
-        assert_eq!(origin.petal_version, "v2-package");
+        assert_eq!(origin.petal_version, "v1-package");
 
         for mutate in ["route", "operation", "path"] {
             let mut changed = context.clone();
@@ -3352,7 +3339,7 @@ mod tests {
                 _ => unreachable!(),
             }
             assert_eq!(
-                DaemonPetalHost::local_app_execution_origin(&changed).unwrap(),
+                DaemonPetalHost::petal_execution_origin(&changed).unwrap(),
                 origin,
                 "{mutate} must remain within the package-scoped EVM execution origin"
             );
@@ -3361,13 +3348,13 @@ mod tests {
         let mut root = context.clone();
         root.path.clear();
         assert_eq!(
-            DaemonPetalHost::local_app_execution_origin(&root).unwrap(),
+            DaemonPetalHost::petal_execution_origin(&root).unwrap(),
             origin
         );
 
         let mut invalid = context;
         invalid.package_hash = "not-a-digest".into();
-        assert!(DaemonPetalHost::local_app_execution_origin(&invalid).is_err());
+        assert!(DaemonPetalHost::petal_execution_origin(&invalid).is_err());
     }
 
     fn test_petal_host(daemon: &Daemon) -> DaemonPetalHost {
@@ -3390,8 +3377,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let daemon = Daemon::from_home(HomeDir::at(dir.path())).unwrap();
         let host = test_petal_host(&daemon);
-        let context = V2SignContext {
-            app_root: "reader".into(),
+        let context = PetalRouteContext {
+            petal_root: "reader".into(),
             package_hash: "a".repeat(64),
             route_id: "r000001".into(),
             op: "read".into(),
@@ -3454,8 +3441,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let daemon = Daemon::from_home(HomeDir::at(dir.path())).unwrap();
         let host = test_petal_host(&daemon);
-        let context = V2SignContext {
-            app_root: "funding".into(),
+        let context = PetalRouteContext {
+            petal_root: "funding".into(),
             package_hash: "b".repeat(64),
             route_id: "r000002".into(),
             op: "read".into(),
@@ -3488,7 +3475,7 @@ mod tests {
             usd_value: None,
             depends_on: None,
             action_id: None,
-            execution_origin: Some(DaemonPetalHost::local_app_execution_origin(&context).unwrap()),
+            execution_origin: Some(DaemonPetalHost::petal_execution_origin(&context).unwrap()),
         };
         let request = EvmTransactionRequest {
             wallet: "alice".into(),
@@ -3579,7 +3566,7 @@ mod tests {
         .unwrap();
 
         let mut other_app = context.clone();
-        other_app.app_root = "other".into();
+        other_app.petal_root = "other".into();
         let denied = host
             .evm_tx_inspect(
                 "alice".into(),

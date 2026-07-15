@@ -44,11 +44,11 @@ pub struct Config {
     pub etherscan: Option<EtherscanConfig>,
     #[serde(default)]
     pub enso: Option<EnsoConfig>,
-    /// Polymarket v2 read surface. Presence of `[polymarket]` opts the
+    /// Polymarket read surface. Presence of `[polymarket]` opts the
     /// `polymarket/` VFS subtree in (like `[enso]` opts in `defi/`).
     #[serde(default)]
     pub polymarket: Option<PolymarketConfig>,
-    /// Trusted, daemon-owned runtime settings for installed v2 Petal apps.
+    /// Trusted, daemon-owned runtime settings for installed Petals.
     /// Endpoint overrides are matched to named manifest bindings and may only
     /// replace the HTTPS authority; the signed method/path policy remains the
     /// upper bound.
@@ -75,13 +75,14 @@ pub struct Config {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PetalsConfig {
     #[serde(default)]
-    pub apps: BTreeMap<String, PetalAppRuntimeConfig>,
+    pub runtime: BTreeMap<String, PetalRuntimeConfig>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct PetalAppRuntimeConfig {
+pub struct PetalRuntimeConfig {
     #[serde(default)]
     pub endpoints: BTreeMap<String, String>,
     #[serde(default)]
@@ -92,7 +93,7 @@ pub struct PetalAppRuntimeConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Backend {
-    /// Etherscan v2 multichain API. Requires an `[etherscan]` block.
+    /// Etherscan multichain API. Requires an `[etherscan]` block.
     Etherscan,
     /// Raw JSON-RPC against the configured chain endpoints.
     Rpc,
@@ -176,7 +177,7 @@ impl BackendsConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EtherscanConfig {
-    /// Etherscan v2 multi-chain API key.
+    /// Etherscan multi-chain API key.
     pub api_key: String,
     #[serde(default = "default_etherscan_url")]
     pub api_url: String,
@@ -189,7 +190,7 @@ pub struct EnsoConfig {
     pub api_url: String,
 }
 
-/// Polymarket v2 client configuration. Every field has a default so a bare
+/// Polymarket client configuration. Every field has a default so a bare
 /// `[polymarket]` TOML table parses to the public-endpoint defaults on Polygon.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PolymarketConfig {
@@ -232,7 +233,7 @@ pub struct PolymarketConfig {
     #[serde(default = "default_builder_key_mode")]
     pub builder_key_mode: String,
     /// Explicit opt-in to the legacy EOA onboarding mode (signatureType 0).
-    /// The V2 CLOB rejects EOA makers at order placement ("maker address not
+    /// The CLOB rejects EOA makers at order placement ("maker address not
     /// allowed"), so this mode cannot trade — it exists for read/creds-only
     /// setups and backward compatibility.
     #[serde(default)]
@@ -579,7 +580,7 @@ impl Config {
                 )));
             }
         }
-        for (app_name, app) in &self.petals.apps {
+        for (app_name, app) in &self.petals.runtime {
             validate_petal_runtime_name("app", app_name)?;
             for (binding, origin) in &app.endpoints {
                 validate_petal_runtime_name("endpoint binding", binding)?;
@@ -592,17 +593,17 @@ impl Config {
                 (Some(chain), Some(chain_id)) => {
                     let parsed = chain_id.parse::<u64>().map_err(|_| {
                         ConfigError::Invalid(format!(
-                            "petals.apps.{app_name}.values.chain_id must be a u64"
+                            "petals.runtime.{app_name}.values.chain_id must be a u64"
                         ))
                     })?;
                     let spec = self.chains.get(chain).ok_or_else(|| {
                         ConfigError::Invalid(format!(
-                            "petals.apps.{app_name}.values.chain={chain:?} is not configured"
+                            "petals.runtime.{app_name}.values.chain={chain:?} is not configured"
                         ))
                     })?;
                     if spec.chain_id != parsed {
                         return Err(ConfigError::Invalid(format!(
-                            "petals.apps.{app_name} chain {chain:?} has id {}, not {parsed}",
+                            "petals.runtime.{app_name} chain {chain:?} has id {}, not {parsed}",
                             spec.chain_id
                         )));
                     }
@@ -610,7 +611,7 @@ impl Config {
                 (None, None) => {}
                 _ => {
                     return Err(ConfigError::Invalid(format!(
-                        "petals.apps.{app_name} must set values.chain and values.chain_id together"
+                        "petals.runtime.{app_name} must set values.chain and values.chain_id together"
                     )));
                 }
             }
@@ -735,9 +736,9 @@ mod tests {
     #[test]
     fn petal_runtime_endpoints_and_chain_are_operator_validated() {
         let mut cfg = Config::local_default();
-        cfg.petals.apps.insert(
+        cfg.petals.runtime.insert(
             "polymarket".into(),
-            PetalAppRuntimeConfig {
+            PetalRuntimeConfig {
                 endpoints: BTreeMap::from([(
                     "clob".into(),
                     "https://clob.internal.example".into(),
@@ -751,7 +752,7 @@ mod tests {
         cfg.validate().unwrap();
 
         cfg.petals
-            .apps
+            .runtime
             .get_mut("polymarket")
             .expect("polymarket app was inserted above")
             .endpoints
@@ -774,6 +775,17 @@ mod tests {
                     .contains("must contain only ASCII letters, digits, '-' or '_'")
             );
         }
+    }
+
+    #[test]
+    fn legacy_petals_apps_config_is_rejected() {
+        let err = toml::from_str::<PetalsConfig>(
+            r#"
+[apps.demo]
+"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("unknown field `apps`"), "{err}");
     }
 
     #[test]

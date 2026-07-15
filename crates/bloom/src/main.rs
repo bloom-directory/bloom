@@ -280,7 +280,7 @@ enum VfsCmd {
 
 #[derive(Subcommand, Debug)]
 enum PetalsCmd {
-    /// Install a v2 package directory, `.petal.tar`, or trusted GitHub source repository.
+    /// Install a Petal package directory, `.petal.tar`, or trusted GitHub source repository.
     Install {
         /// Path to a package directory, `.petal.tar`, or trusted GitHub source repository URL.
         path: String,
@@ -288,29 +288,22 @@ enum PetalsCmd {
         #[arg(long = "ref", value_name = "TAG_OR_SHA")]
         ref_: Option<String>,
     },
-    /// Author and validate v2 local app packages.
-    #[command(subcommand)]
-    App(PetalAppCmd),
+    /// Validate a Petal package directory and optionally emit a deterministic `.petal.tar`.
+    Build {
+        /// Package directory containing petal.toml, README.md, AGENTS.md, and petal/<name>/.
+        package_dir: String,
+        /// Write a deterministic `.petal.tar` archive.
+        #[arg(long, value_name = "ARCHIVE")]
+        out: Option<String>,
+    },
     /// List installed petals.
     Ls,
     /// Remove an installed petal (and any petname pointing at it).
     Uninstall {
         /// Content hash of the petal to remove: full 64-char hex, a
         /// unique prefix of at least 12 chars (as printed by `ls`),
-        /// an app name, or a petname.
+        /// a Petal name, or a petname.
         target: String,
-    },
-}
-
-#[derive(Subcommand, Debug)]
-enum PetalAppCmd {
-    /// Validate a v2 package directory and optionally emit a deterministic `.petal.tar`.
-    Build {
-        /// Package directory containing petal.toml, README.md, AGENTS.md, and app/<name>/.
-        package_dir: String,
-        /// Write a deterministic `.petal.tar` archive.
-        #[arg(long, value_name = "ARCHIVE")]
-        out: Option<String>,
     },
 }
 
@@ -428,7 +421,7 @@ enum PolymarketCmd {
         #[arg(long, env = "BLOOM_PASSPHRASE", hide = true)]
         passphrase: Option<String>,
     },
-    /// Revoke the pUSD/CTF spending approvals onboarding granted to the four V2
+    /// Revoke the pUSD/CTF spending approvals onboarding granted to the four
     /// contracts (the inverse of onboarding's approve stage). Withdraws the
     /// trading contracts' authority over the deposit wallet's collateral and
     /// positions; trading needs re-onboarding afterward.
@@ -2794,19 +2787,19 @@ async fn run(cli: Cli) -> Result<()> {
 
 async fn run_petals(home: HomeDir, cmd: PetalsCmd) -> Result<()> {
     let cmd = match cmd {
-        PetalsCmd::App(PetalAppCmd::Build { package_dir, out }) => {
+        PetalsCmd::Build { package_dir, out } => {
             if let Some(out) = out.as_deref() {
                 reject_archive_output_inside_package(&package_dir, out)?;
             }
-            let package = bloom_petals::v2::build_app_package_dir(&package_dir)
-                .with_context(|| format!("build app package {package_dir}"))?;
-            let consent = bloom_petals::v2::app_consent_summary(&package)
-                .context("build app consent summary")?;
+            let package = bloom_petals::package::build_petal_package_dir(&package_dir)
+                .with_context(|| format!("build Petal package {package_dir}"))?;
+            let consent = bloom_petals::package::petal_consent_summary(&package)
+                .context("build Petal consent summary")?;
             println!("hash: {}", package.hash);
-            println!("app_mount: apps/{}/", package.name);
+            println!("petal_mount: petals/{}/", package.name);
             println!("routes: {}", package.route_index.routes.len());
             println!("artifacts: {package_dir}/artifacts");
-            print_v2_app_consent(&consent);
+            print_petal_consent(&consent);
             if let Some(out) = out {
                 let file =
                     std::fs::File::create(&out).with_context(|| format!("create archive {out}"))?;
@@ -2826,16 +2819,16 @@ async fn run_petals(home: HomeDir, cmd: PetalsCmd) -> Result<()> {
             if let Some(repo) = github_source::parse_github_install_url(&path)? {
                 let mut installed =
                     github_source::install_github_source(&home, &d, &repo, ref_.as_deref())?;
-                apply_configured_app_endpoints(&d, &mut installed.consent)?;
+                apply_configured_petal_endpoints(&d, &mut installed.consent)?;
                 println!();
                 println!("hash: {}", installed.result.hash);
-                println!("mode: local-app");
+                println!("mode: petal");
                 println!("size: {} bytes", installed.result.size);
                 if installed.result.already_present {
                     println!("note: already installed");
                 }
-                if let Some(app) = &installed.meta.local_app {
-                    println!("app_mount: apps/{}/", app.name);
+                if let Some(app) = &installed.meta.petal {
+                    println!("petal_mount: petals/{}/", app.name);
                 }
                 println!("routes: {}", installed.index.routes.len());
                 println!(
@@ -2849,7 +2842,7 @@ async fn run_petals(home: HomeDir, cmd: PetalsCmd) -> Result<()> {
                         .unwrap_or(&installed.provenance.requested_ref)
                 );
                 println!("resolved_commit: {}", installed.provenance.resolved_commit);
-                print_v2_app_consent(&installed.consent);
+                print_petal_consent(&installed.consent);
                 return Ok(());
             }
 
@@ -2857,53 +2850,55 @@ async fn run_petals(home: HomeDir, cmd: PetalsCmd) -> Result<()> {
                 bail!("--ref is only supported for trusted GitHub source installs");
             }
             let path_meta = std::fs::metadata(&path).with_context(|| format!("stat {path}"))?;
-            let is_app_dir = path_meta.is_dir();
-            if !is_app_dir && !path.ends_with(".petal.tar") {
+            let is_petal_dir = path_meta.is_dir();
+            if !is_petal_dir && !path.ends_with(".petal.tar") {
                 bail!(
-                    "petals install only accepts v2 package directories, .petal.tar archives, or trusted GitHub source repositories"
+                    "petals install only accepts Petal package directories, .petal.tar archives, or trusted GitHub source repositories"
                 );
             }
-            let consent_package = if is_app_dir {
-                bloom_petals::v2::PreparedAppPackage::from_dir(&path)
-                    .with_context(|| format!("read app package dir {path}"))?
+            let consent_package = if is_petal_dir {
+                bloom_petals::package::PreparedPetalPackage::from_dir(&path)
+                    .with_context(|| format!("read Petal package dir {path}"))?
             } else {
-                bloom_petals::v2::PreparedAppPackage::from_petal_tar(&path)
-                    .with_context(|| format!("read app package archive {path}"))?
+                bloom_petals::package::PreparedPetalPackage::from_petal_tar(&path)
+                    .with_context(|| format!("read Petal package archive {path}"))?
             };
-            let mut consent = bloom_petals::v2::app_consent_summary(&consent_package)
+            let mut consent = bloom_petals::package::petal_consent_summary(&consent_package)
                 .context("build app consent summary")?;
-            apply_configured_app_endpoints(&d, &mut consent)?;
-            let (result, meta, index) = if is_app_dir {
+            apply_configured_petal_endpoints(&d, &mut consent)?;
+            let (result, meta, index) = if is_petal_dir {
                 d.petals
                     .store()
-                    .install_app_package_dir(&path)
-                    .with_context(|| format!("install app package dir {path}"))?
+                    .install_petal_package_dir(&path)
+                    .with_context(|| format!("install Petal package dir {path}"))?
             } else {
                 d.petals
                     .store()
-                    .install_app_package_tar(&path)
-                    .with_context(|| format!("install app package archive {path}"))?
+                    .install_petal_package_tar(&path)
+                    .with_context(|| format!("install Petal package archive {path}"))?
             };
             println!("hash: {}", result.hash);
-            println!("mode: local-app");
+            println!("mode: petal");
             println!("size: {} bytes", result.size);
             if result.already_present {
                 println!("note: already installed");
             }
-            if let Some(app) = &meta.local_app {
-                println!("app_mount: apps/{}/", app.name);
+            if let Some(app) = &meta.petal {
+                println!("petal_mount: petals/{}/", app.name);
             }
             println!("routes: {}", index.routes.len());
-            print_v2_app_consent(&consent);
+            print_petal_consent(&consent);
             Ok(())
         }
-        PetalsCmd::App(_) => unreachable!("petal app commands are handled before daemon startup"),
+        PetalsCmd::Build { .. } => {
+            unreachable!("Petal build commands are handled before daemon startup")
+        }
         PetalsCmd::Ls => {
             let package_hashes = d
                 .petals
                 .store()
                 .list_package_hashes()
-                .context("list app packages")?;
+                .context("list Petal packages")?;
             if package_hashes.is_empty() {
                 println!("(no petals installed)");
                 return Ok(());
@@ -2911,9 +2906,9 @@ async fn run_petals(home: HomeDir, cmd: PetalsCmd) -> Result<()> {
             for h in package_hashes {
                 let meta = d.petals.store().load_meta(&h).context("load meta")?;
                 let app = meta
-                    .local_app
+                    .petal
                     .as_ref()
-                    .map(|app| format!("  app=apps/{}/", app.name))
+                    .map(|app| format!("  app=petals/{}/", app.name))
                     .unwrap_or_default();
                 let source = meta.source.as_ref().map_or_else(String::new, |source| {
                     let selected = source
@@ -2945,7 +2940,7 @@ async fn run_petals(home: HomeDir, cmd: PetalsCmd) -> Result<()> {
     }
 }
 
-fn print_v2_app_consent(summary: &bloom_petals::v2::AppConsentSummary) {
+fn print_petal_consent(summary: &bloom_petals::package::PetalConsentSummary) {
     println!("consent:");
     if let Some(package_summary) = &summary.package_summary {
         println!("  summary: {package_summary}");
@@ -2957,7 +2952,7 @@ fn print_v2_app_consent(summary: &bloom_petals::v2::AppConsentSummary) {
     if !summary.network.is_empty() {
         println!("  network:");
         for rule in &summary.network {
-            println!("{}", format_v2_app_consent_net_rule(rule));
+            println!("{}", format_petal_consent_net_rule(rule));
         }
     }
     if !summary.sign_intents.is_empty() {
@@ -3009,23 +3004,23 @@ fn print_v2_app_consent(summary: &bloom_petals::v2::AppConsentSummary) {
     }
 }
 
-fn apply_configured_app_endpoints(
+fn apply_configured_petal_endpoints(
     daemon: &Daemon,
-    summary: &mut bloom_petals::v2::AppConsentSummary,
+    summary: &mut bloom_petals::package::PetalConsentSummary,
 ) -> Result<()> {
     let bindings = daemon
         .config
         .petals
-        .apps
+        .runtime
         .get(&summary.name)
         .map(|app| &app.endpoints)
         .cloned()
         .unwrap_or_default();
-    bloom_petals::v2::apply_app_consent_endpoint_bindings(summary, &bindings)
+    bloom_petals::package::apply_petal_consent_endpoint_bindings(summary, &bindings)
         .context("apply configured Petal endpoint bindings")
 }
 
-fn format_v2_app_consent_net_rule(rule: &bloom_petals::v2::AppConsentNetRule) -> String {
+fn format_petal_consent_net_rule(rule: &bloom_petals::package::PetalConsentNetRule) -> String {
     let binding = rule
         .binding
         .as_deref()
@@ -3407,7 +3402,7 @@ fn polymarket_onboard_begin_write(path: &VfsPath) -> Option<String> {
     if segs.len() == 4 && segs[0] == "polymarket" && segs[1] == "onboard" && segs[3] == "begin" {
         Some(segs[2].clone())
     } else if segs.len() == 5
-        && segs[0] == "apps"
+        && segs[0] == "petals"
         && segs[1] == "polymarket"
         && segs[2] == "onboard"
         && segs[4] == "begin"
@@ -3423,12 +3418,12 @@ fn polymarket_onboard_status_path(path: &VfsPath) -> Option<String> {
     if segs.len() == 4 && segs[0] == "polymarket" && segs[1] == "onboard" && segs[3] == "begin" {
         Some(format!("polymarket/onboard/{}/status.json", segs[2]))
     } else if segs.len() == 5
-        && segs[0] == "apps"
+        && segs[0] == "petals"
         && segs[1] == "polymarket"
         && segs[2] == "onboard"
         && segs[4] == "begin"
     {
-        Some(format!("apps/polymarket/onboard/{}/status.json", segs[3]))
+        Some(format!("petals/polymarket/onboard/{}/status.json", segs[3]))
     } else {
         None
     }
@@ -4840,7 +4835,7 @@ async fn unmount_bloom(handle: Option<()>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        format_v2_app_consent_net_rule, polymarket_fund_confirm_write,
+        format_petal_consent_net_rule, polymarket_fund_confirm_write,
         polymarket_redeem_confirm_write, polymarket_revoke_approvals_confirm_write,
         polymarket_trade_confirm_write, polymarket_withdraw_pusd_confirm_write,
         request_body_with_wallet,
@@ -4849,7 +4844,7 @@ mod tests {
 
     #[test]
     fn petal_consent_network_line_includes_named_binding() {
-        let line = format_v2_app_consent_net_rule(&bloom_petals::v2::AppConsentNetRule {
+        let line = format_petal_consent_net_rule(&bloom_petals::package::PetalConsentNetRule {
             binding: Some("clob".into()),
             host: "clob.polymarket.com".into(),
             effective_origin: Some("https://clob.internal.example".into()),

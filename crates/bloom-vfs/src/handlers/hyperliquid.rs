@@ -4570,7 +4570,7 @@ fn hyperliquid_usd_send_envelope(
     .map_err(err_json)?;
     Ok(CanonicalEnvelope::new(
         CanonicalIntentHeader {
-            schema: bloom_auth_api::CANONICAL_INTENT_HEADER_SCHEMA_V2.into(),
+            schema: bloom_auth_api::CANONICAL_INTENT_HEADER_SCHEMA_V1.into(),
             wallet: wallet.to_string(),
             surface: "hyperliquid".into(),
             action_id: hyperliquid_usd_send_action_id(network, wallet, pending),
@@ -4846,7 +4846,7 @@ fn hyperliquid_agent_session_envelope(
     let subject = serde_json::to_vec(&subject).map_err(err_json)?;
     Ok(CanonicalEnvelope::new(
         CanonicalIntentHeader {
-            schema: bloom_auth_api::CANONICAL_INTENT_HEADER_SCHEMA_V2.into(),
+            schema: bloom_auth_api::CANONICAL_INTENT_HEADER_SCHEMA_V1.into(),
             wallet: pending.wallet.clone(),
             surface: "hyperliquid".into(),
             action_id: hyperliquid_agent_session_action_id(pending, policy)?,

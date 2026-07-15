@@ -556,7 +556,7 @@ impl IpcServer {
     /// `cap_mask` narrows the petal's declared caps; absent ⇒ use them as-is.
     async fn do_petals_run(&self, _params: &Value) -> Result<Value, PetalError> {
         Err(PetalError::vm(
-            "raw petal IPC run is unsupported; v2 app routes are dispatched through /apps",
+            "raw petal IPC run is unsupported; Petal routes are dispatched through /petals",
         ))
     }
 
@@ -573,10 +573,10 @@ impl IpcServer {
         let mut out = Vec::with_capacity(hashes.len());
         for hash in hashes {
             let meta = runner.store().load_meta(&hash)?;
-            let app_mount = meta
-                .local_app
+            let petal_mount = meta
+                .petal
                 .as_ref()
-                .map(|app| format!("apps/{}/", app.name));
+                .map(|app| format!("petals/{}/", app.name));
             out.push(json!({
                 "hash": meta.hash,
                 "size": meta.size,
@@ -584,8 +584,8 @@ impl IpcServer {
                 "caps": meta.caps.iter().map(|c| c.as_str()).collect::<Vec<_>>(),
                 "installed_at_ms": meta.installed_at_ms,
                 "mode": meta.mode_str(),
-                "app_mount": app_mount,
-                "local_app": meta.local_app,
+                "petal_mount": petal_mount,
+                "petal": meta.petal,
                 "source": meta.source,
             }));
         }
@@ -1430,7 +1430,7 @@ mod tests {
             .build()
     }
 
-    fn write_demo_v2_package(root: &Path) {
+    fn write_demo_petal_package(root: &Path) {
         let write = |rel: &str, body: &[u8]| {
             let path = root.join(rel);
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -1438,7 +1438,7 @@ mod tests {
         };
         write(
             "petal.toml",
-            br#"schema = "bloom.petal.local-app.v2"
+            br#"schema = "bloom.petal.package.v1"
 name = "demo"
 
 [consent]
@@ -1448,7 +1448,7 @@ summary = "Demo app used by IPC tests."
         write("README.md", b"# demo\n");
         write("AGENTS.md", b"# demo agents\n");
         write(
-            "app/demo/hello.txt.wasm",
+            "petal/demo/hello.txt.wasm",
             include_bytes!("../../bloom-petals/tests/fixtures/route_component_no_imports.wasm"),
         );
     }
@@ -1528,17 +1528,17 @@ summary = "Demo app used by IPC tests."
     }
 
     #[tokio::test]
-    async fn petals_list_reports_v2_app_packages() {
+    async fn petals_list_reports_petal_packages() {
         let dir = tempfile::tempdir().unwrap();
         let package = dir.path().join("demo-package");
-        write_demo_v2_package(&package);
+        write_demo_petal_package(&package);
 
         let store = bloom_petals::PetalStore::open(dir.path().join("store")).unwrap();
         let registry =
             Arc::new(bloom_petals::NameRegistry::open(dir.path().join("registry")).unwrap());
         let vm = bloom_petals::PetalVm::new().unwrap();
         let runner = PetalRunner::new(store.clone(), registry, vm);
-        let (installed, _, _) = store.install_app_package_dir(&package).unwrap();
+        let (installed, _, _) = store.install_petal_package_dir(&package).unwrap();
 
         let server = IpcServer::new(vfs(), "0", vec![]).with_petals(runner);
         let listed = server.do_petals_list().await.unwrap();
@@ -1546,8 +1546,8 @@ summary = "Demo app used by IPC tests."
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0]["hash"], installed.hash);
         assert_eq!(entries[0]["mode"], "local");
-        assert_eq!(entries[0]["app_mount"], "apps/demo/");
-        assert_eq!(entries[0]["local_app"]["name"], "demo");
+        assert_eq!(entries[0]["petal_mount"], "petals/demo/");
+        assert_eq!(entries[0]["petal"]["name"], "demo");
     }
 
     #[test]
@@ -1556,7 +1556,7 @@ summary = "Demo app used by IPC tests."
         let intent = write_unlocked_intent("minnow", &p, b"y", None, None, None);
         // The reviewer must see the concrete onboarding effects, not a bare path.
         let text = intent.summary_lines.join("\n");
-        assert!(text.contains("approve(MAX) -> CTF Exchange V2"), "{text}");
+        assert!(text.contains("approve(MAX) -> CTF Exchange"), "{text}");
         assert!(text.contains("setApprovalForAll(true)"), "{text}");
         assert!(text.contains("builder API key"), "{text}");
         assert_eq!(

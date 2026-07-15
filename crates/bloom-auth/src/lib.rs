@@ -2751,7 +2751,7 @@ mod tests {
     use super::*;
     use base64::Engine as _;
     use bloom_auth_api::{
-        CANONICAL_INTENT_HEADER_SCHEMA_V2, CanonicalEnvelope, CanonicalIntentHeader, EvmFeePolicy,
+        CANONICAL_INTENT_HEADER_SCHEMA_V1, CanonicalEnvelope, CanonicalIntentHeader, EvmFeePolicy,
         ExecutorKind, SignerTransport,
         petal_identity::{
             FIRST_PARTY_PETAL_VERSION_V0, PETAL_ID_EVM_WALLET, PETAL_ID_PAID_HTTP,
@@ -3439,7 +3439,7 @@ mod tests {
     fn envelope_for(surface: &str, action_id: &str) -> CanonicalEnvelope {
         CanonicalEnvelope::new(
             CanonicalIntentHeader {
-                schema: CANONICAL_INTENT_HEADER_SCHEMA_V2.into(),
+                schema: CANONICAL_INTENT_HEADER_SCHEMA_V1.into(),
                 wallet: "my-wallet".into(),
                 surface: surface.into(),
                 action_id: action_id.into(),

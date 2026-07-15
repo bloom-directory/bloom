@@ -1,9 +1,9 @@
-//! Deposit-wallet on-chain call builders — the V2 approval set.
+//! Deposit-wallet on-chain call builders — the onboarding approval set.
 //!
 //! These produce the [`Call`]s bundled into a relayer `WALLET` batch to grant
 //! the trading contracts spending rights *from the deposit wallet* (an EOA
 //! `approve()` does nothing for it). Spender membership is byte-exact with
-//! `rs-builder-relayer-client/src/operations/approve.rs` V2 set — getting a
+//! `rs-builder-relayer-client/src/operations/approve.rs` approval set — getting a
 //! spender wrong is a fund-loss vector, so it is asserted in tests.
 
 use alloy::primitives::{Address, B256, U256};
@@ -11,8 +11,8 @@ use alloy::sol;
 use alloy::sol_types::SolCall;
 
 use crate::eip712::{
-    CTF, CTF_COLLATERAL_ADAPTER, CTF_EXCHANGE_V2, Call, NEG_RISK_CTF_COLLATERAL_ADAPTER,
-    NEG_RISK_EXCHANGE_V2, PUSD,
+    CTF, CTF_COLLATERAL_ADAPTER, CTF_EXCHANGE, Call, NEG_RISK_CTF_COLLATERAL_ADAPTER,
+    NEG_RISK_EXCHANGE, PUSD,
 };
 
 sol! {
@@ -63,49 +63,49 @@ pub fn set_approval_for_all_call(token: Address, operator: Address) -> Call {
     set_approval_for_all_value_call(token, operator, true)
 }
 
-/// Human-readable labels for the eight [`v2_approval_calls`], in order. Single
+/// Human-readable labels for the eight [`approval_calls`], in order. Single
 /// source of truth for the onboarding approval preview and the passkey review
 /// page so the displayed grants never drift from what is signed.
-pub const V2_APPROVAL_LABELS: [&str; 8] = [
-    "pUSD approve(MAX) -> CTF Exchange V2",
-    "pUSD approve(MAX) -> Neg-Risk CTF Exchange V2",
+pub const APPROVAL_LABELS: [&str; 8] = [
+    "pUSD approve(MAX) -> CTF Exchange",
+    "pUSD approve(MAX) -> Neg-Risk CTF Exchange",
     "pUSD approve(MAX) -> CTF Collateral Adapter",
     "pUSD approve(MAX) -> Neg-Risk CTF Collateral Adapter",
-    "CTF setApprovalForAll(true) -> CTF Exchange V2",
-    "CTF setApprovalForAll(true) -> Neg-Risk CTF Exchange V2",
+    "CTF setApprovalForAll(true) -> CTF Exchange",
+    "CTF setApprovalForAll(true) -> Neg-Risk CTF Exchange",
     "CTF setApprovalForAll(true) -> CTF Collateral Adapter",
     "CTF setApprovalForAll(true) -> Neg-Risk CTF Collateral Adapter",
 ];
 
-/// The full V2 deposit-wallet approval batch (Polygon mainnet): pUSD `approve`
-/// for the two V2 exchanges + the two collateral adapters, and CTF (ERC-1155)
+/// The full deposit-wallet approval batch (Polygon mainnet): pUSD `approve`
+/// for the two exchanges + the two collateral adapters, and CTF (ERC-1155)
 /// `setApprovalForAll` for the same four. Eight calls, submitted together.
-pub fn v2_approval_calls() -> Vec<Call> {
+pub fn approval_calls() -> Vec<Call> {
     vec![
-        approve_call(PUSD, CTF_EXCHANGE_V2),
-        approve_call(PUSD, NEG_RISK_EXCHANGE_V2),
+        approve_call(PUSD, CTF_EXCHANGE),
+        approve_call(PUSD, NEG_RISK_EXCHANGE),
         approve_call(PUSD, CTF_COLLATERAL_ADAPTER),
         approve_call(PUSD, NEG_RISK_CTF_COLLATERAL_ADAPTER),
-        set_approval_for_all_call(CTF, CTF_EXCHANGE_V2),
-        set_approval_for_all_call(CTF, NEG_RISK_EXCHANGE_V2),
+        set_approval_for_all_call(CTF, CTF_EXCHANGE),
+        set_approval_for_all_call(CTF, NEG_RISK_EXCHANGE),
         set_approval_for_all_call(CTF, CTF_COLLATERAL_ADAPTER),
         set_approval_for_all_call(CTF, NEG_RISK_CTF_COLLATERAL_ADAPTER),
     ]
 }
 
-/// The inverse of [`v2_approval_calls`]: revoke every grant onboarding made —
+/// The inverse of [`approval_calls`]: revoke every grant onboarding made —
 /// pUSD `approve(0)` for the four spenders + CTF `setApprovalForAll(false)` for
 /// the same four, in the same order. Submitted as a relayer `WALLET` batch from
 /// the deposit wallet so a user can withdraw the trading contracts' spending
 /// authority over their collateral and positions.
-pub fn v2_revoke_calls() -> Vec<Call> {
+pub fn revoke_calls() -> Vec<Call> {
     vec![
-        approve_amount_call(PUSD, CTF_EXCHANGE_V2, U256::ZERO),
-        approve_amount_call(PUSD, NEG_RISK_EXCHANGE_V2, U256::ZERO),
+        approve_amount_call(PUSD, CTF_EXCHANGE, U256::ZERO),
+        approve_amount_call(PUSD, NEG_RISK_EXCHANGE, U256::ZERO),
         approve_amount_call(PUSD, CTF_COLLATERAL_ADAPTER, U256::ZERO),
         approve_amount_call(PUSD, NEG_RISK_CTF_COLLATERAL_ADAPTER, U256::ZERO),
-        set_approval_for_all_value_call(CTF, CTF_EXCHANGE_V2, false),
-        set_approval_for_all_value_call(CTF, NEG_RISK_EXCHANGE_V2, false),
+        set_approval_for_all_value_call(CTF, CTF_EXCHANGE, false),
+        set_approval_for_all_value_call(CTF, NEG_RISK_EXCHANGE, false),
         set_approval_for_all_value_call(CTF, CTF_COLLATERAL_ADAPTER, false),
         set_approval_for_all_value_call(CTF, NEG_RISK_CTF_COLLATERAL_ADAPTER, false),
     ]
@@ -113,7 +113,7 @@ pub fn v2_revoke_calls() -> Vec<Call> {
 
 /// Redeem a resolved binary condition through the pUSD collateral adapter.
 ///
-/// The V2 adapters expose the same call shape as the underlying CTF
+/// The collateral adapters expose the same call shape as the underlying CTF
 /// `redeemPositions`: pUSD collateral, zero parent collection, condition id,
 /// and index sets `[1, 2]`. The losing side burns for zero; the winning side
 /// pays one pUSD per share. The target is selected by market class.
@@ -145,14 +145,14 @@ mod tests {
     const REDEEM_POSITIONS_SELECTOR: [u8; 4] = [0x01, 0xb7, 0x03, 0x7c];
 
     #[test]
-    fn v2_set_has_exact_targets_spenders_and_selectors() {
-        let calls = v2_approval_calls();
+    fn approval_set_has_exact_targets_spenders_and_selectors() {
+        let calls = approval_calls();
         assert_eq!(calls.len(), 8);
 
-        // First 4: pUSD approve(spender, MAX) to the V2 exchanges + adapters.
+        // First 4: pUSD approve(spender, MAX) to the exchanges + adapters.
         let approve_spenders = [
-            CTF_EXCHANGE_V2,
-            NEG_RISK_EXCHANGE_V2,
+            CTF_EXCHANGE,
+            NEG_RISK_EXCHANGE,
             CTF_COLLATERAL_ADAPTER,
             NEG_RISK_CTF_COLLATERAL_ADAPTER,
         ];
@@ -181,12 +181,12 @@ mod tests {
     }
 
     #[test]
-    fn v2_revoke_set_zeroes_the_same_spenders_and_operators() {
-        let calls = v2_revoke_calls();
+    fn revoke_set_zeroes_the_same_spenders_and_operators() {
+        let calls = revoke_calls();
         assert_eq!(calls.len(), 8);
         let spenders = [
-            CTF_EXCHANGE_V2,
-            NEG_RISK_EXCHANGE_V2,
+            CTF_EXCHANGE,
+            NEG_RISK_EXCHANGE,
             CTF_COLLATERAL_ADAPTER,
             NEG_RISK_CTF_COLLATERAL_ADAPTER,
         ];
@@ -214,8 +214,8 @@ mod tests {
             assert_eq!(decoded.operator, *operator);
             assert!(!decoded.approved, "revoke must set approved = false");
         }
-        // Mirrors v2_approval_calls target/spender ordering exactly.
-        let approvals = v2_approval_calls();
+        // Mirrors approval_calls target/spender ordering exactly.
+        let approvals = approval_calls();
         for (rev, app) in calls.iter().zip(&approvals) {
             assert_eq!(rev.target, app.target);
         }

@@ -2,7 +2,7 @@ package bloom:route@0.1.0;
 
 interface types {
   record ctx {
-    app-root: string,
+    petal-root: string,
     package-hash: string,
     path: string,
     params: list<tuple<string, string>>,
@@ -51,7 +51,7 @@ world route-file {
 
   import bloom:http/fetch@0.1.0;
   import bloom:store/kv@0.1.0;
-  import bloom:sign/signing@0.2.0;
+  import bloom:sign/signing@0.1.0;
   import bloom:tx/outbox@0.1.0;
   import bloom:chain/read@0.1.0;
   import bloom:vfs/readwrite@0.1.0;

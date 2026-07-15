@@ -1,8 +1,8 @@
 //! Content-addressed wasm petals for bloom.
 //!
 //! Petals are content-addressed wasm artifacts with metadata under
-//! `~/.bloom/petals`. Local plugin packages are v2 apps mounted through
-//! the `apps/` VFS router. Raw single-WASM local petal installation and
+//! `~/.bloom/petals`. Local plugin packages are Petals mounted through
+//! the `petals/` VFS router. Raw single-WASM local petal installation and
 //! execution is intentionally unsupported.
 
 #![forbid(unsafe_code)]
@@ -11,13 +11,13 @@ pub mod abi;
 pub mod error;
 pub mod host;
 pub mod meta;
+pub mod package;
 pub mod policy;
 pub mod private_store;
 pub mod registry;
 pub mod router;
 pub mod runner;
 pub mod store;
-pub mod v2;
 pub mod vm;
 
 pub use abi::{
@@ -31,11 +31,11 @@ pub use abi::{
 pub use error::PetalError;
 pub use host::{DenyHost, HostError, HostVfsEntry, HostVfsEntryKind, PetalHost};
 pub use meta::{Capability, PetalMeta, PetalMode};
+pub use package::{PetalPackage, RouteMatch, RouteRecord, RouteSpecificity};
 pub use policy::NetPolicy;
 pub use private_store::PrivateStore;
 pub use registry::{NameRegistry, validate_name};
 pub use router::PetalRouter;
 pub use runner::{LateVfsHost, PetalRunner, VfsHost};
 pub use store::{InstallResult, PetalStore};
-pub use v2::{PetalAppPackage, RouteMatch, RouteRecord, RouteSpecificity};
 pub use vm::{PetalVm, RunOptions, RunOutput};

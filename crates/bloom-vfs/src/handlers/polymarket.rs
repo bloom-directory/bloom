@@ -72,7 +72,7 @@ const APPROVAL_CHALLENGE_FILE: &str = "approval_challenge.json";
 /// CLI (both stage the same sealed actions).
 pub const APPROVAL_TTL_MS: u64 = 5 * 60 * 1000;
 
-/// Canonical subject schema tag for Polymarket V2 order sealed actions.
+/// Canonical subject schema tag for Polymarket order sealed actions.
 const PM_ORDER_SUBJECT_SCHEMA_V1: &str = "bloom.polymarket_order_subject.v1";
 /// `surface` identifier in the canonical intent header for Polymarket
 /// first-party Petal sealed actions.
@@ -290,10 +290,10 @@ fn polymarket_onboard_envelope(
         "schema": "bloom.polymarket_onboard_subject.v1",
         "wallet": wallet,
         "owner_address": owner_address,
-        "approvals": bloom_polymarket::wallet::V2_APPROVAL_LABELS,
+        "approvals": bloom_polymarket::wallet::APPROVAL_LABELS,
         "effects": [
             "deploy_deposit_wallet_if_needed",
-            "approve_v2_spenders",
+            "approve_spenders",
             "mint_clob_credentials",
             "create_builder_key_if_configured",
             "sync_buying_power"
@@ -302,7 +302,7 @@ fn polymarket_onboard_envelope(
     .map_err(|e| HandlerError::backend(format!("encode Polymarket onboarding intent: {e}")))?;
     Ok(CanonicalEnvelope::new(
         CanonicalIntentHeader {
-            schema: bloom_auth_api::CANONICAL_INTENT_HEADER_SCHEMA_V2.into(),
+            schema: bloom_auth_api::CANONICAL_INTENT_HEADER_SCHEMA_V1.into(),
             wallet: wallet.to_string(),
             surface: "polymarket".into(),
             action_id: polymarket_onboard_action_id(wallet),
@@ -328,7 +328,7 @@ fn polymarket_onboard_envelope(
 }
 
 /// Sealed action for a Polymarket onboarding run: one Hardened grant
-/// (max_signatures=3) covers deploy + V2 approvals + CLOB creds + builder
+/// (max_signatures=3) covers deploy + onboarding approvals + CLOB creds + builder
 /// key. Deterministic `action_id` per wallet, so re-staging is idempotent.
 /// Shared by the daemon handler and the foreground CLI.
 pub fn polymarket_onboard_sealed_action(
@@ -363,7 +363,7 @@ pub fn polymarket_onboard_sealed_action(
     };
     SealedAction::new(
         envelope,
-        "Polymarket onboarding (deploy + V2 approve + CLOB creds + builder key)".into(),
+        "Polymarket onboarding (deploy + approvals + CLOB creds + builder key)".into(),
         Vec::new(),
         terms,
         snapshot,
@@ -389,7 +389,7 @@ fn polymarket_relayer_sealed_action(
 ) -> Result<SealedAction, HandlerError> {
     let envelope = CanonicalEnvelope::new(
         CanonicalIntentHeader {
-            schema: bloom_auth_api::CANONICAL_INTENT_HEADER_SCHEMA_V2.into(),
+            schema: bloom_auth_api::CANONICAL_INTENT_HEADER_SCHEMA_V1.into(),
             wallet: wallet.to_string(),
             surface: POLYMARKET_SURFACE.into(),
             action_id: action_id.into(),
@@ -441,7 +441,7 @@ fn polymarket_relayer_sealed_action(
     .map_err(|e| HandlerError::backend(format!("seal Polymarket {subject_label}: {e}")))
 }
 
-/// Sealed action for `revoke-approvals` (zero all V2 allowances + operator
+/// Sealed action for `revoke-approvals` (zero all allowances + operator
 /// approvals via one relayer batch).
 pub fn polymarket_revocation_sealed_action(
     wallet: &str,
@@ -452,7 +452,7 @@ pub fn polymarket_revocation_sealed_action(
         "schema": "bloom.polymarket_revocation_subject.v1",
         "wallet": wallet,
         "deposit_wallet": format!("{deposit_wallet:#x}"),
-        "effects": ["zero_all_v2_allowances", "revoke_all_operator_approvals"],
+        "effects": ["zero_all_allowances", "revoke_all_operator_approvals"],
     }))
     .map_err(|e| HandlerError::backend(e.to_string()))?;
     polymarket_relayer_sealed_action(
@@ -538,7 +538,7 @@ fn write_json(path: impl AsRef<Path>, value: &impl Serialize) -> Result<(), Hand
 /// Owner-signing adapter that routes EIP-712 hash signatures through the
 /// Bloom Machine's `PetalHost::sign_hash` under a live Sealed Approval grant
 /// for the given action. One onboarding grant (max_signatures=3) covers all
-/// onboarding signature operations: V2 approval batch + CLOB L1 auth +
+/// onboarding signature operations: onboarding approval batch + CLOB L1 auth +
 /// builder key. Public so the foreground CLI can execute the same sealed
 /// relayer flows in-process.
 pub struct SealedOnboardSigner {
@@ -700,7 +700,7 @@ struct PolymarketOrderSignResult {
     grant_id: String,
 }
 
-/// Pure canonical-subject bytes for a Polymarket V2 order sealed action.
+/// Pure canonical-subject bytes for a Polymarket order sealed action.
 /// Carries the full `order_view` so any canonical-subject byte change
 /// invalidates the cached `intent_hash` and the staged action must be re-staged
 /// (per WS-H §5.9: no step substitution after approval).
@@ -735,10 +735,10 @@ fn polymarket_order_envelope(
 ) -> Result<CanonicalEnvelope, HandlerError> {
     let subject =
         polymarket_order_subject_bytes(wallet, order_view, chain_id, neg_risk, signing_hash);
-    let action_id = action_id_for("polymarket.order.v2", signing_hash);
+    let action_id = action_id_for("polymarket.order.v1", signing_hash);
     Ok(CanonicalEnvelope::new(
         CanonicalIntentHeader {
-            schema: bloom_auth_api::CANONICAL_INTENT_HEADER_SCHEMA_V2.into(),
+            schema: bloom_auth_api::CANONICAL_INTENT_HEADER_SCHEMA_V1.into(),
             wallet: wallet.to_string(),
             surface: POLYMARKET_SURFACE.into(),
             action_id,
@@ -777,7 +777,7 @@ pub fn polymarket_order_plan(
     signing_hash: &alloy::primitives::B256,
 ) -> String {
     format!(
-        "Polymarket V2 order ({:?}, market={}, maker={:#x}, neg_risk={}, chain_id={}, signing_hash={:#x})",
+        "Polymarket order ({:?}, market={}, maker={:#x}, neg_risk={}, chain_id={}, signing_hash={:#x})",
         side,
         market_slug.unwrap_or("<unknown>"),
         maker,
@@ -834,7 +834,7 @@ pub fn polymarket_order_sealed_action(
         .map_err(|e| HandlerError::backend(format!("seal Polymarket order action: {e}")))
 }
 
-/// Sign a Polymarket V2 order's inner POLY_1271 hash via `PetalHost::sign_hash`
+/// Sign a Polymarket order's inner POLY_1271 hash via `PetalHost::sign_hash`
 /// under a live grant for `action_id`, and wrap the raw 65-byte ECDSA into the
 /// ERC-7739 signature hex the CLOB expects. Shared by the daemon handler and
 /// the foreground CLI so both consume grants identically.
@@ -1312,7 +1312,7 @@ impl ChainReader for ChainClientReader {
 }
 
 /// Build the onboarder for a `[polymarket]` config + resolved chain client.
-/// Bloom uses the deposit-wallet path (signatureType 3) for V2 trading.
+/// Bloom uses the deposit-wallet path (signatureType 3) for trading.
 pub fn build_onboarder(
     pm_cfg: &bloom_proto::config::PolymarketConfig,
     chain_client: ChainClient,
@@ -1913,7 +1913,7 @@ fn render_onboard_plan_md(st: &OnboardState) -> String {
            {fund_note} Then write `begin` again.\n\
            (Advanced: the `defi/intents/{wallet}/new` VFS flow also works, but its\n\
            sessions are in-memory — it requires a persistent `bloom serve` daemon.)\n\
-         - [{m_approve}] **approve** — one EIP-712-signed relayer batch granting the V2 exchanges/adapters\n\
+         - [{m_approve}] **approve** — one EIP-712-signed relayer batch granting the exchanges/adapters\n\
            spending rights *from the deposit wallet* (see `approvals.json` for the exact calldata)\n\
          - [{m_creds}] **creds** — sign the L1 `ClobAuth` attestation to mint CLOB API credentials\n\
            (stored mode 0600 under the bloom home; never exposed through the VFS)\n\
@@ -2582,7 +2582,7 @@ impl PolymarketHandler {
                     serde_json::to_value(&st).map_err(|e| HandlerError::backend(e.to_string()))?;
                 v["running"] = serde_json::json!(self.running.lock().unwrap().contains(wallet));
                 v["poll_timeout_secs"] = serde_json::json!(ob.onboarder.poll_timeout_secs());
-                // The V2 CLOB rejects EOA makers: a Complete EOA run is NOT
+                // The CLOB rejects EOA makers: a Complete EOA run is NOT
                 // tradeable, and status must never imply otherwise.
                 v["tradeable"] = serde_json::json!(st.tradeable());
                 if st.stage == Stage::Fund {
@@ -3273,7 +3273,7 @@ impl PolymarketHandler {
             .submit_wallet_batch(
                 owner,
                 deposit,
-                bloom_polymarket::wallet::v2_revoke_calls(),
+                bloom_polymarket::wallet::revoke_calls(),
                 nonce,
                 deadline,
                 &signer,
@@ -4856,7 +4856,7 @@ key = "builder-key-2"
 
         // The challenge file is written under <auth_dir>/trade/<wallet>/<action_id>/.
         let action_id =
-            bloom_polymarket::action_id_for("polymarket.order.v2", &action.signing_hash);
+            bloom_polymarket::action_id_for("polymarket.order.v1", &action.signing_hash);
         let challenge_path = auth_dir
             .path()
             .join("trade")
@@ -5460,7 +5460,7 @@ key = "builder-key-2"
         )
         .unwrap();
         let expected =
-            bloom_polymarket::signing::action_id_for("polymarket.order.v2", &signing_hash);
+            bloom_polymarket::signing::action_id_for("polymarket.order.v1", &signing_hash);
         assert_eq!(sealed.action_id(), &expected);
     }
 
@@ -5736,7 +5736,7 @@ key = "builder-key-2"
             .join("trade")
             .join("w")
             .join(bloom_polymarket::signing::action_id_for(
-                "polymarket.order.v2",
+                "polymarket.order.v1",
                 &action.signing_hash,
             ))
             .join(APPROVAL_CHALLENGE_FILE);

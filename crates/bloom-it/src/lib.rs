@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use bloom_auth_api::{
-    AssuranceLevel, CANONICAL_INTENT_HEADER_SCHEMA_V2, CanonicalEnvelope, CanonicalIntentHeader,
+    AssuranceLevel, CANONICAL_INTENT_HEADER_SCHEMA_V1, CanonicalEnvelope, CanonicalIntentHeader,
     DaemonGrantTerms, EVM_SEALED_INTENT_SUBJECT_KIND, EVM_SEALED_INTENT_SUBJECT_SCHEMA_V1,
     EVM_TX_SIGN_INTENT, ExecutorKind, GrantStore, PetalPolicySnapshot, SealedAction,
     SealedApprovalGrant,
@@ -164,7 +164,7 @@ pub async fn mint_evm_test_grant(
 ) -> Result<SealedApprovalGrant> {
     let expires_ms = now_ms.saturating_add(120_000);
     let header = CanonicalIntentHeader {
-        schema: CANONICAL_INTENT_HEADER_SCHEMA_V2.into(),
+        schema: CANONICAL_INTENT_HEADER_SCHEMA_V1.into(),
         wallet: wallet.into(),
         surface: "outbox".into(),
         action_id: action_id.into(),

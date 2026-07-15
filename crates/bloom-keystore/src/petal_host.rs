@@ -217,7 +217,7 @@ impl PetalHost for KeystorePetalHost {
             })?
             .to_string();
         let mut snapshot = PetalPolicySnapshot::minimal(&bloom_auth_api::CanonicalIntentHeader {
-            schema: bloom_auth_api::CANONICAL_INTENT_HEADER_SCHEMA_V2.into(),
+            schema: bloom_auth_api::CANONICAL_INTENT_HEADER_SCHEMA_V1.into(),
             wallet: info.name.clone(),
             surface: "host".into(),
             action_id: String::new(),
@@ -393,7 +393,7 @@ impl PetalHost for KeystorePetalHost {
                 .await;
         }
         if attestation.petal_id == bloom_auth_api::petal_identity::PETAL_ID_PAID_HTTP
-            || bloom_auth_api::is_local_app_petal_id(&attestation.petal_id)
+            || bloom_auth_api::is_petal_petal_id(&attestation.petal_id)
         {
             if attestation.intent != request.intent {
                 return self
@@ -1043,7 +1043,7 @@ mod tests {
     ) -> CanonicalEnvelope {
         CanonicalEnvelope::new(
             CanonicalIntentHeader {
-                schema: bloom_auth_api::CANONICAL_INTENT_HEADER_SCHEMA_V2.into(),
+                schema: bloom_auth_api::CANONICAL_INTENT_HEADER_SCHEMA_V1.into(),
                 wallet: wallet.into(),
                 surface: "outbox".into(),
                 action_id: action_id.into(),

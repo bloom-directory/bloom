@@ -1,9 +1,9 @@
-//! EIP-712 typed data (CLOB auth + relayer batch) and the V2 contract addresses.
+//! EIP-712 typed data (CLOB auth + relayer batch) and the contract addresses.
 //!
-//! All EIP-712 machinery is sourced from the **`alloy` v2 umbrella** modules
+//! All EIP-712 machinery is sourced from the **`alloy` umbrella** modules
 //! (`alloy::sol`, `alloy::sol_types::SolStruct`, `alloy::dyn_abi::Eip712Domain`)
 //! — never the standalone `alloy-dyn-abi 1.5` dep — so there is exactly one
-//! `Eip712Domain` type in play. Byte-exact reference: `rs-clob-client-v2`
+//! `Eip712Domain` type in play. Byte-exact reference: the Polymarket Rust SDK
 //! `src/auth.rs` (`ClobAuth`) and the Polymarket deposit-wallet docs.
 
 use std::borrow::Cow;
@@ -89,7 +89,7 @@ pub fn batch_signing_hash(batch: &Batch, chain_id: u64, deposit_wallet: Address)
     batch.eip712_signing_hash(&deposit_wallet_domain(chain_id, deposit_wallet))
 }
 
-// ── Deposit-wallet factory + V2 contract addresses (Polygon mainnet, 137) ────
+// ── Deposit-wallet factory + contract addresses (Polygon mainnet, 137) ────
 //
 // The deposit-wallet **address** is resolved at runtime from the live factory
 // (`ChainReader::predict_deposit_wallet`, two eth_calls) and persisted into
@@ -108,7 +108,7 @@ pub const DEPOSIT_WALLET_IMPLEMENTATION: Address =
 pub const DEPOSIT_WALLET_IMPLEMENTATION_AMOY: Address =
     Address::new(hex_addr(b"50a88fE9a441cB4c9c2aD6A2207CE2795C7D7Fbd"));
 
-/// pUSD — the V2 CLOB collateral (ERC-20, 6 dp). Replaced USDC.e on 2026-04-28;
+/// pUSD — the CLOB collateral (ERC-20, 6 dp). Replaced USDC.e on 2026-04-28;
 /// this is what the deposit wallet holds and what approvals target.
 pub const PUSD: Address = Address::new(hex_addr(b"C011a7E12a19f7B1f670d46F03B03f3342E82DFB"));
 pub const PUSD_DECIMALS: u8 = 6;
@@ -116,19 +116,19 @@ pub const PUSD_DECIMALS: u8 = 6;
 pub const USDC_E: Address = Address::new(hex_addr(b"2791Bca1f2de4661ED88A30C99A7a9449Aa84174"));
 /// Conditional Tokens Framework (ERC-1155).
 pub const CTF: Address = Address::new(hex_addr(b"4D97DCd97eC945f40cF65F87097ACe5EA0476045"));
-/// CTF Exchange V2 (pUSD-collateralized, EIP-1271). POLY_1271 verifying contract.
-pub const CTF_EXCHANGE_V2: Address =
+/// CTF Exchange (pUSD-collateralized, EIP-1271). POLY_1271 verifying contract.
+pub const CTF_EXCHANGE: Address =
     Address::new(hex_addr(b"E111180000d2663C0091e4f400237545B87B996B"));
-/// Neg-Risk CTF Exchange V2.
-pub const NEG_RISK_EXCHANGE_V2: Address =
+/// Neg-Risk CTF Exchange.
+pub const NEG_RISK_EXCHANGE: Address =
     Address::new(hex_addr(b"e2222d279d744050d28e00520010520000310F59"));
 /// Neg-Risk Adapter.
 pub const NEG_RISK_ADAPTER: Address =
     Address::new(hex_addr(b"d91E80cF2E7be2e162c6513ceD06f1dD0dA35296"));
-/// CtfCollateralAdapter (V2 pUSD split/merge/redeem).
+/// CtfCollateralAdapter (pUSD split/merge/redeem).
 pub const CTF_COLLATERAL_ADAPTER: Address =
     Address::new(hex_addr(b"AdA100Db00Ca00073811820692005400218FcE1f"));
-/// NegRiskCtfCollateralAdapter (V2 pUSD-aware, neg-risk).
+/// NegRiskCtfCollateralAdapter (pUSD-aware, neg-risk).
 pub const NEG_RISK_CTF_COLLATERAL_ADAPTER: Address =
     Address::new(hex_addr(b"adA2005600Dec949baf300f4C6120000bDB6eAab"));
 
@@ -249,14 +249,14 @@ mod tests {
             Address::from_str("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174").unwrap()
         );
         assert_eq!(
-            CTF_EXCHANGE_V2,
+            CTF_EXCHANGE,
             Address::from_str("0xE111180000d2663C0091e4f400237545B87B996B").unwrap()
         );
     }
 
     /// Lock the `Batch` EIP-712 signing hash for a fixed batch **with a nested
     /// `Call[]`** — the exact payload that authorizes fund moves. Confirms
-    /// alloy v2's `sol!` recursive-array encoding is stable.
+    /// alloy's `sol!` recursive-array encoding is stable.
     #[test]
     fn batch_signing_hash_is_stable_with_nested_calls() {
         let deposit_wallet =
@@ -281,7 +281,7 @@ mod tests {
         assert_ne!(h, B256::ZERO);
     }
 
-    /// Salt for the vitalik.eth owner — the exact value the V2 deposit-wallet
+    /// Salt for the vitalik.eth owner — the exact value the deposit-wallet
     /// discovery probe printed for this public test owner.
     #[test]
     fn deposit_wallet_salt_matches_probe_vector() {

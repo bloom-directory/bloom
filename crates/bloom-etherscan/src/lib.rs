@@ -1,6 +1,6 @@
-//! Etherscan v2 multichain client.
+//! Etherscan multichain client.
 //!
-//! Talks to the unified Etherscan v2 endpoint
+//! Talks to the unified Etherscan endpoint
 //! (`https://api.etherscan.io/v2/api`). Every request carries a `chainid`
 //! query parameter so a single API key works across all supported chains.
 //!
@@ -56,7 +56,7 @@ pub trait StorageReader: Send + Sync {
     async fn read_slot(&self, addr: Address, slot: B256) -> Result<B256, EtherscanError>;
 }
 
-/// Default base URL for Etherscan v2 multichain API.
+/// Default base URL for Etherscan multichain API.
 pub const DEFAULT_BASE_URL: &str = "https://api.etherscan.io/v2/api";
 
 /// Default rate limit (free tier: 5 req/sec).
@@ -343,7 +343,7 @@ impl EtherscanConfig {
     }
 }
 
-/// Etherscan v2 multichain client.
+/// Etherscan multichain client.
 ///
 /// Cheap to clone; the inner state is shared via `Arc`.
 #[derive(Clone)]
@@ -1309,7 +1309,7 @@ mod tests {
 
     // ---- Live integration (gated) -----------------------------------------
 
-    /// Live test against the real Etherscan v2 API. Needs
+    /// Live test against the real Etherscan API. Needs
     /// `BLOOM_ETHERSCAN_KEY` in env. Skipped by default; run with
     /// `cargo test -p bloom-etherscan -- --ignored`.
     #[tokio::test]

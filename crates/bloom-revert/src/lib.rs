@@ -143,7 +143,7 @@ pub struct DecodeContext {
     /// per-contract error catalog. May be `None` for contract-creation
     /// reverts; ABI decoders should return `None` in that case.
     pub to: Option<Address>,
-    /// Chain id for ABI-source lookups (Etherscan v2 multichain, etc.).
+    /// Chain id for ABI-source lookups (Etherscan multichain, etc.).
     pub chain_id: u64,
 }
 

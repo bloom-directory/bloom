@@ -267,7 +267,7 @@ mod tests {
     fn envelope_for(surface: &str, action_id: &str) -> CanonicalEnvelope {
         CanonicalEnvelope::new(
             CanonicalIntentHeader {
-                schema: bloom_auth_api::CANONICAL_INTENT_HEADER_SCHEMA_V2.into(),
+                schema: bloom_auth_api::CANONICAL_INTENT_HEADER_SCHEMA_V1.into(),
                 wallet: "my-wallet".into(),
                 surface: surface.into(),
                 action_id: action_id.into(),
@@ -369,7 +369,7 @@ mod tests {
         let action = sealed_action(2);
         let grant = store.mint(&action, 1_000_000, 200).await.unwrap();
         let err = store
-            .consume_signature(&grant.grant_id, "polymarket.order.v2", 300)
+            .consume_signature(&grant.grant_id, "polymarket.order.v1", 300)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("not allowed"), "{err}");
@@ -435,7 +435,7 @@ mod tests {
         // header to keep tuple keys distinct).
         let other_env = CanonicalEnvelope::new(
             CanonicalIntentHeader {
-                schema: bloom_auth_api::CANONICAL_INTENT_HEADER_SCHEMA_V2.into(),
+                schema: bloom_auth_api::CANONICAL_INTENT_HEADER_SCHEMA_V1.into(),
                 wallet: "other-wallet".into(),
                 surface: "requests".into(),
                 action_id: "req_other".into(),

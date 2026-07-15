@@ -13,7 +13,7 @@ my-petal/
   petal.toml
   README.md
   AGENTS.md
-  app/
+  petal/
     example/
       $index.wasm
       status.json.wasm
@@ -23,16 +23,16 @@ my-petal/
 operating contract for users and agents: document paths, input bodies,
 side effects, approval steps, idempotency, and how to recognize completion.
 
-The `name` in `petal.toml` must equal the sole directory under `app/`. It may
+The `name` in `petal.toml` must equal the sole directory under `petal/`. It may
 contain ASCII letters, digits, `-`, and `_`; it may not contain dots or Unicode.
-Bloom mounts `app/example/` at `/apps/example/`.
+Bloom mounts `petal/example/` at `/petals/example/`.
 
 ## Manifest
 
 A representative manifest is:
 
 ```toml
-schema = "bloom.petal.local-app.v2"
+schema = "bloom.petal.package.v1"
 name = "example"
 
 [consent]
@@ -61,7 +61,7 @@ Supported component imports map to manifest capabilities as follows:
 |---|---|
 | `bloom:http/fetch@0.1.0` | `bloom:http` plus `[[net.allow]]` |
 | `bloom:store/kv@0.1.0` | `bloom:store` plus `[store]` namespaces |
-| `bloom:sign/signing@0.1.0` or `@0.2.0` | `bloom:sign` plus `[sign].allowed_intents` |
+| `bloom:sign/signing@0.1.0` | `bloom:sign` plus `[sign].allowed_intents` |
 | `bloom:tx/outbox@0.1.0` | `bloom:tx.outbox` |
 | `bloom:chain/read@0.1.0` | `bloom:chain` |
 | `bloom:vfs/readwrite@0.1.0` | `bloom:vfs.read` and/or `bloom:vfs.write`, according to used exports |
@@ -82,7 +82,7 @@ Every route artifact is a WebAssembly component implementing
 
 The route tree is the public VFS declaration:
 
-- `status.json.wasm` creates the file `/apps/example/status.json`;
+- `status.json.wasm` creates the file `/petals/example/status.json`;
 - `$index.wasm` handles the containing directory;
 - `$lookup.wasm` refines lookup for dynamic entries;
 - `[wallet]/balance.json.wasm` binds a dynamic `wallet` parameter; and
@@ -111,7 +111,7 @@ components, but design and test every write against synchronous execution.
 For composition, a route may have a sibling `.route.toml` sidecar which points
 to a primary component under `modules/` or `components/` and dependencies under
 `components/`. See the
-[file-driven package design](../superpowers/specs/2026-06-23-local-petal-plugins-v2-revised.md)
+[file-driven package design](../superpowers/specs/2026-06-23-petals-v1.md)
 for route precedence, sidecar composition, metadata narrowing, and archive
 normalization rules.
 
@@ -120,13 +120,13 @@ normalization rules.
 Validate the directory and generate route artifacts:
 
 ```sh
-bloom petal app build path/to/my-petal
+bloom petals build path/to/my-petal
 ```
 
 Emit a deterministic uncompressed package archive at the same time:
 
 ```sh
-bloom petal app build path/to/my-petal --out my-petal.petal.tar
+bloom petals build path/to/my-petal --out my-petal.petal.tar
 ```
 
 The build regenerates `artifacts/routes/` and

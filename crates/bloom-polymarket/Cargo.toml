@@ -3,7 +3,7 @@ name = "bloom-polymarket"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Polymarket v2 client (Gamma/Data/CLOB reads + L1/L2 auth signing) for bloom"
+description = "Polymarket client (Gamma/Data/CLOB reads + L1/L2 auth signing) for bloom"
 
 [features]
 default = ["native-client"]

@@ -79,7 +79,7 @@ pub fn clob_auth_action_and_hash(
     }
 }
 
-/// View of one V2 (`POLY_1271`) order action: the order view the host should
+/// View of one `POLY_1271` order action: the order view the host should
 /// render in the plan, plus the inner 32-byte signing hash. The outer ERC-7739
 /// wrapped hex is built by `poly1271_signature_from_raw` after the host returns
 /// a 65-byte signature.
@@ -93,12 +93,12 @@ pub struct OrderAction {
     pub signing_hash: B256,
 }
 
-/// Build a V2 order action and inner signing hash. The signing hash is the
+/// Build a order action and inner signing hash. The signing hash is the
 /// POLY_1271 typed-data digest (`poly1271_digest`) — what the owner EOA signs.
 /// The wire-format "wrapped" hex is `poly1271_signature_from_raw(order, host_sig, …)`.
 ///
 /// `order_type` is the intended CLOB time-in-force. It is *not* part of the
-/// signed V2 `Order` struct (which carries no `orderType`/`expiration` field),
+/// signed `Order` struct (which carries no `orderType`/`expiration` field),
 /// but it is rendered into the human-approved `order_view` so the sealed
 /// subject shows the true order type instead of a fixed label. `expiration` is
 /// always `"0"`: GTD is refused upstream (no expiration plumbing) and the other
@@ -381,7 +381,7 @@ mod tests {
     #[test]
     fn action_id_differs_per_action_kind() {
         let h = B256::ZERO;
-        let a = action_id_for("polymarket.order.v2", &h);
+        let a = action_id_for("polymarket.order.v1", &h);
         let b = action_id_for("polymarket.onboarding", &h);
         assert_ne!(a, b);
     }

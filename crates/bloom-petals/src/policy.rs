@@ -1,4 +1,4 @@
-//! Runtime network policy for v2 local app petals.
+//! Runtime network policy for Petals.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -17,8 +17,8 @@ impl NetPolicy {
         Self { rules: Vec::new() }
     }
 
-    pub fn from_v2_manifest_toml(bytes: &[u8]) -> Result<Self, PetalError> {
-        let rules = crate::v2::net_rules_from_v2_manifest_toml(bytes)?
+    pub fn from_manifest_toml(bytes: &[u8]) -> Result<Self, PetalError> {
+        let rules = crate::package::net_rules_from_manifest_toml(bytes)?
             .into_iter()
             .map(|rule| NetRule {
                 binding: rule.binding,
@@ -127,7 +127,7 @@ impl NetPolicy {
 /// Effective private-store namespace policy for a single petal invocation.
 ///
 /// `None` at the VM `RunOptions` level preserves legacy/direct VM behavior.
-/// When present for v2 apps, a route may only touch declared namespaces and
+/// When present for Petals, a route may only touch declared namespaces and
 /// secret writes must match the namespace's declared visibility.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct StoreNamespacePolicy {
@@ -317,7 +317,7 @@ mod tests {
 
     fn manifest_toml() -> &'static [u8] {
         br#"
-schema = "bloom.petal.local-app.v2"
+schema = "bloom.petal.package.v1"
 name = "netty"
 
 [caps]
@@ -332,7 +332,7 @@ paths = ["/markets*", "/auth/*", "/wallets/*/orders"]
 
     #[test]
     fn policy_enforces_https_host_method_and_path() {
-        let policy = NetPolicy::from_v2_manifest_toml(manifest_toml()).expect("valid manifest");
+        let policy = NetPolicy::from_manifest_toml(manifest_toml()).expect("valid manifest");
         assert!(
             policy
                 .check("GET", "https://api.example.com/markets")
@@ -382,7 +382,7 @@ paths = ["/markets*", "/auth/*", "/wallets/*/orders"]
 
     #[test]
     fn runtime_mask_only_narrows() {
-        let declared = NetPolicy::from_v2_manifest_toml(manifest_toml()).expect("valid manifest");
+        let declared = NetPolicy::from_manifest_toml(manifest_toml()).expect("valid manifest");
         let mask = NetPolicy {
             rules: vec![NetRule {
                 binding: None,
@@ -411,7 +411,7 @@ paths = ["/markets*", "/auth/*", "/wallets/*/orders"]
 
     #[test]
     fn named_endpoint_binding_replaces_only_the_exact_host() {
-        let declared = NetPolicy::from_v2_manifest_toml(
+        let declared = NetPolicy::from_manifest_toml(
             br#"
 name = "netty"
 [caps]
@@ -491,10 +491,10 @@ paths = ["/order"]
     }
 
     #[test]
-    fn v2_manifest_policy_enforces_https_host_method_and_path() {
-        let policy = NetPolicy::from_v2_manifest_toml(
+    fn petal_manifest_policy_enforces_https_host_method_and_path() {
+        let policy = NetPolicy::from_manifest_toml(
             br#"
-schema = "bloom.petal.local-app.v2"
+schema = "bloom.petal.package.v1"
 name = "echo"
 
 [[net.allow]]
