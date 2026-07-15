@@ -1712,6 +1712,12 @@ pub struct Daemon {
     pub petals: PetalRunner,
     pub watch_registry: Arc<WatchRegistry>,
     pub watch_executor: Arc<WatchExecutor>,
+    /// Background update checker for newer GitHub releases. Holds a
+    /// 5-minute-refresh task whose shutdown is signalled via
+    /// `update_shutdown` below. Always `Some` after `from_home` —
+    /// network failure at startup leaves the checker constructed
+    /// but with a `status: "error"` snapshot.
+    pub update_checker: Arc<bloom_update::UpdateChecker>,
     /// Shutdown handles for spawned mempool subscription tasks. Dropping
     /// these signals each task to exit at its next iteration.
     pub mempool_shutdown: Arc<parking_lot::Mutex<Vec<tokio::sync::oneshot::Sender<()>>>>,
@@ -1719,6 +1725,10 @@ pub struct Daemon {
     /// Sent on shutdown; safe even when no scanner / probe was spawned.
     pub bump_shutdown: Arc<parking_lot::Mutex<Vec<tokio::sync::oneshot::Sender<()>>>>,
     pub probe_shutdown: Arc<parking_lot::Mutex<Vec<tokio::sync::oneshot::Sender<()>>>>,
+    /// Shutdown handle for the update-checker background refresher.
+    /// `Daemon::shutdown` drains this alongside the other
+    /// background-task shutdown channels.
+    pub update_shutdown: Arc<parking_lot::Mutex<Vec<tokio::sync::oneshot::Sender<()>>>>,
 }
 
 impl Daemon {
@@ -2143,6 +2153,16 @@ impl Daemon {
             );
         }
 
+        // Construct the background update-checker here (before
+        // StatusHandler) so the handler can wire its snapshot
+        // producer. The actual background refresh task is spawned
+        // further down alongside the other long-lived tasks.
+        let update_checker: Arc<bloom_update::UpdateChecker> = Arc::new(
+            bloom_update::UpdateChecker::new(env!("CARGO_PKG_VERSION"), home.cache_dir())
+                .map_err(|e| DaemonError::Audit(format!("update checker init: {e}")))?,
+        );
+        let update_checker_for_vfs = update_checker.clone();
+
         let status_handler = Arc::new(
             StatusHandler::with_backends(
                 chains.clone(),
@@ -2161,7 +2181,46 @@ impl Daemon {
                 SystemTime::now(),
                 env!("CARGO_PKG_VERSION"),
             )
-            .with_mempool_statuses(initial_mempool_statuses),
+            .with_mempool_statuses(initial_mempool_statuses)
+            .with_update_snapshot_fn(Arc::new(move || {
+                // Always produce a snapshot. The VFS renders the
+                // fields that depend on a successful refresh
+                // (latest, available, behind_by, release_url,
+                // checked_at) as empty / "unknown" / 0 when the
+                // in-memory snapshot is in the `Unknown` state
+                // (e.g. fresh daemon, no cache file yet). The
+                // `installed` field is always populated because it
+                // is baked into the binary at compile time.
+                let s = update_checker_for_vfs.snapshot();
+                let available = match s.available() {
+                    bloom_update::UpdateAvailable::OutOfDate => {
+                        bloom_vfs::handlers::status::UpdateAvailable::OutOfDate
+                    }
+                    bloom_update::UpdateAvailable::UpToDate => {
+                        bloom_vfs::handlers::status::UpdateAvailable::UpToDate
+                    }
+                    bloom_update::UpdateAvailable::Unknown => {
+                        bloom_vfs::handlers::status::UpdateAvailable::Unknown
+                    }
+                };
+                let behind_by = s.behind_by();
+                let bloom_update::UpdateSnapshot {
+                    installed,
+                    latest,
+                    release_url,
+                    checked_at,
+                    status: _,
+                    error_reason: _,
+                } = s;
+                Some(bloom_vfs::handlers::status::UpdateSnapshot {
+                    installed,
+                    latest,
+                    available,
+                    behind_by,
+                    checked_at,
+                    release_url,
+                })
+            })),
         );
 
         // Build the petals runtime: content-addressed store under
@@ -2751,6 +2810,21 @@ impl Daemon {
             debug!("daemon.backends_probe_spawned");
         }
 
+        // Spawn the background update-checker task. Every 5 minutes it
+        // refreshes the snapshot from the GitHub releases/latest endpoint
+        // and writes the result to the on-disk cache. Gated on a tokio
+        // runtime being available (some tests construct the daemon in
+        // a sync context; they can read the cache directly via
+        // `UpdateChecker::quick_check_cached`). The `update_checker`
+        // Arc was constructed above (before StatusHandler) so the VFS
+        // can already see the seed snapshot from the on-disk cache.
+        let mut update_shutdown: Vec<tokio::sync::oneshot::Sender<()>> = Vec::new();
+        if tokio::runtime::Handle::try_current().is_ok() {
+            let tx = Arc::clone(&update_checker).spawn_background();
+            update_shutdown.push(tx);
+            debug!("daemon.update_checker_spawned");
+        }
+
         // `debug!`, not `info!`: the CLI builds a daemon in-process for
         // every `vfs cat`/`ls`, so at default verbosity this line would
         // print before each value and clutter agent/visual output.
@@ -2780,9 +2854,11 @@ impl Daemon {
             petals,
             watch_registry,
             watch_executor,
+            update_checker,
             mempool_shutdown: Arc::new(parking_lot::Mutex::new(mempool_shutdown)),
             bump_shutdown: Arc::new(parking_lot::Mutex::new(bump_shutdown)),
             probe_shutdown: Arc::new(parking_lot::Mutex::new(probe_shutdown)),
+            update_shutdown: Arc::new(parking_lot::Mutex::new(update_shutdown)),
         })
     }
 
@@ -2797,9 +2873,9 @@ impl Daemon {
     }
 
     /// Stop background workers cleanly. Signals all spawned mempool
-    /// subscription tasks, the bump scanner, and the backends probe,
-    /// then shuts down the watch executor's polling task. Safe to call
-    /// multiple times.
+    /// subscription tasks, the bump scanner, the backends probe, and
+    /// the update-checker refresher, then shuts down the watch
+    /// executor's polling task. Safe to call multiple times.
     pub async fn shutdown(&self) {
         for s in self.mempool_shutdown.lock().drain(..) {
             let _ = s.send(());
@@ -2808,6 +2884,9 @@ impl Daemon {
             let _ = s.send(());
         }
         for s in self.probe_shutdown.lock().drain(..) {
+            let _ = s.send(());
+        }
+        for s in self.update_shutdown.lock().drain(..) {
             let _ = s.send(());
         }
         self.watch_executor.stop().await;

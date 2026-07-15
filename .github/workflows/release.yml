@@ -1,20 +1,130 @@
 name: Release
 
+# Tag-driven release workflow. Mirrors the structure of vibefi/client's
+# release.yml but adapted to this repo: no cargo-packager, four native
+# runners (no --target cross-compile), per-binary verify step, and a
+# committed workspace version bump (no --config magic, no cargo-edit).
+#
+# Flow:
+#   1. `prepare` resolves and validates the tag (vX.Y.Z).
+#   2. `bump` checks out the tag, edits [workspace.package] version, runs
+#      `cargo update --workspace` (which only touches the 26 workspace
+#      member version fields — no transitive dep churn), commits the
+#      change to a `release/vX.Y.Z` branch, and reports that commit's
+#      SHA so the publish step points at the *built* commit, not the
+#      original tag commit.
+#   3. `build` checks out `release/vX.Y.Z` and runs `cargo build --locked`
+#      on each of the four native runners. A verify step asserts that
+#      `bloom --version` matches the tag.
+#   4. `publish` downloads the four tarballs, generates SHA256SUMS, and
+#      `gh release create vX.Y.Z --latest` — pointing at the bump
+#      branch HEAD (not the original tag commit).
+#
+# The floating `latest` git tag is intentionally NOT touched here. It
+# continues to track master and powers the
+#   https://github.com/<owner>/<repo>/releases/latest/download/<file>
+# redirect, independent of the release object the API endpoint returns.
+
 on:
   push:
-    branches:
-      - master
+    tags:
+      - 'v*.*.*'
   workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to release (e.g. v0.1.1). Tag must already exist on origin.'
+        required: true
+        type: string
 
 permissions:
   contents: write
+
+concurrency:
+  group: release-${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref_name }}
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  prepare:
+    name: Resolve Release Metadata
+    runs-on: ubuntu-latest
+    outputs:
+      release_tag: ${{ steps.meta.outputs.release_tag }}
+      release_version: ${{ steps.meta.outputs.release_version }}
+      release_ref: ${{ steps.meta.outputs.release_ref }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - id: meta
+        run: |
+          set -euo pipefail
+          TAG="${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref_name }}"
+          if [[ ! "$TAG" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+            echo "::error::release tag must match vX.Y.Z, got: $TAG"
+            exit 1
+          fi
+          git fetch --tags --force
+          if ! git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+            echo "::error::tag does not exist in repository: $TAG"
+            exit 1
+          fi
+          VERSION="${TAG#v}"
+          REF="refs/tags/$TAG"
+          {
+            echo "release_tag=$TAG"
+            echo "release_version=$VERSION"
+            echo "release_ref=$REF"
+          } >> "$GITHUB_OUTPUT"
+          echo "Resolved release metadata:"
+          echo "  tag: $TAG"
+          echo "  version: $VERSION"
+          echo "  ref: $REF"
+
+  bump:
+    name: Bump Workspace Version
+    runs-on: ubuntu-latest
+    needs: prepare
+    outputs:
+      release_branch_sha: ${{ steps.commit.outputs.release_branch_sha }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.prepare.outputs.release_ref }}
+          fetch-depth: 0
+      - name: Bump version and regenerate lockfile
+        env:
+          VERSION: ${{ needs.prepare.outputs.release_version }}
+        run: |
+          set -euo pipefail
+          # Only the [workspace.package] version line at the start of a
+          # line matches — every member crate uses `version.workspace = true`,
+          # so they pick up the workspace version at compile time.
+          sed -i -E 's/^version = "[0-9]+\.[0-9]+\.[0-9]+"/version = "'"$VERSION"'"/' Cargo.toml
+          cargo update --workspace
+          # Sanity: the diff should be exactly Cargo.toml + Cargo.lock.
+          # Anything else means cargo touched a transitive dep — investigate.
+          git diff --stat
+      - id: commit
+        env:
+          VERSION: ${{ needs.prepare.outputs.release_version }}
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Cargo.toml Cargo.lock
+          git commit -m "release: v$VERSION"
+          # The release/* branch is workflow-owned; --force is safe.
+          git push --force origin "HEAD:refs/heads/release/v$VERSION"
+          SHA="$(git rev-parse HEAD)"
+          echo "release_branch_sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "Bumped branch release/v$VERSION at $SHA"
+
   build:
     name: build ${{ matrix.asset_name }}
+    needs: [prepare, bump]
     strategy:
       fail-fast: false
       matrix:
@@ -22,52 +132,64 @@ jobs:
           - asset_name: bloom-linux-x86_64.tar.gz
             os: ubuntu-latest
             binary: bloom
-            archive: tar.gz
           - asset_name: bloom-linux-aarch64.tar.gz
             os: ubuntu-24.04-arm
             binary: bloom
-            archive: tar.gz
           - asset_name: bloom-macos-x86_64.tar.gz
             os: macos-26-intel
             binary: bloom
-            archive: tar.gz
           - asset_name: bloom-macos-aarch64.tar.gz
             os: macos-26
             binary: bloom
-            archive: tar.gz
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v6
+        with:
+          ref: release/v${{ needs.prepare.outputs.release_version }}
+          fetch-depth: 0
 
       - name: Install Rust toolchain
         run: rustup show
 
-      - name: Build full-feature binary
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: false
+
+      - name: Build release binary (locked)
         run: cargo build --release -p bloom --all-features --locked
 
+      - name: Verify binary version matches tag
+        env:
+          VERSION: ${{ needs.prepare.outputs.release_version }}
+        run: |
+          set -euo pipefail
+          ACTUAL="$(./target/release/${{ matrix.binary }} --version | awk '{print $2}')"
+          if [[ "$ACTUAL" != "$VERSION" ]]; then
+            echo "::error::binary version '$ACTUAL' does not match tag '$VERSION'"
+            exit 1
+          fi
+          echo "Verified: ${{ matrix.binary }} --version = $ACTUAL"
+
       - name: Stage package
-        shell: bash
         run: |
           set -euo pipefail
           mkdir -p package dist
           cp "target/release/${{ matrix.binary }}" package/
           cp README.md LICENSE package/
+          tar -czf "dist/${{ matrix.asset_name }}" -C package .
 
-      - name: Create tarball
-        if: matrix.archive == 'tar.gz'
-        shell: bash
-        run: tar -czf "dist/${{ matrix.asset_name }}" -C package .
-
-      - name: Upload build artifact
+      - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.asset_name }}
           path: dist/${{ matrix.asset_name }}
           if-no-files-found: error
+          retention-days: 7
 
   publish:
-    name: publish latest release
-    needs: build
+    name: Publish GitHub Release
+    needs: [prepare, bump, build]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -81,42 +203,56 @@ jobs:
           merge-multiple: true
 
       - name: Generate checksums
-        run: |
-          cd dist
-          sha256sum bloom-* > SHA256SUMS
+        working-directory: dist
+        run: sha256sum bloom-* > SHA256SUMS
 
-      - name: Move latest tag
-        run: |
-          git tag --force latest "$GITHUB_SHA"
-          git push --force origin refs/tags/latest
-
-      - name: Publish latest release
+      - name: Create or update GitHub release
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.prepare.outputs.release_tag }}
+          VERSION: ${{ needs.prepare.outputs.release_version }}
+          SHA: ${{ needs.bump.outputs.release_branch_sha }}
         run: |
-          notes_file="$(mktemp)"
-          cat > "$notes_file" <<EOF
-          Automated full-feature build for ${GITHUB_SHA}.
+          set -euo pipefail
+          NOTES="$(mktemp)"
+          cat > "$NOTES" <<EOF
+          ## bloom v$VERSION
 
-          Stable download URLs use the \`latest\` tag, for example:
+          Automated release for tag \`$TAG\`.
 
+          ### Downloads
+
+          Stable per-version URLs — pick the one for your platform:
           \`\`\`
-          https://github.com/${GITHUB_REPOSITORY}/releases/download/latest/bloom-linux-x86_64.tar.gz
+          https://github.com/${{ github.repository }}/releases/download/$TAG/bloom-linux-x86_64.tar.gz
+          https://github.com/${{ github.repository }}/releases/download/$TAG/bloom-linux-aarch64.tar.gz
+          https://github.com/${{ github.repository }}/releases/download/$TAG/bloom-macos-x86_64.tar.gz
+          https://github.com/${{ github.repository }}/releases/download/$TAG/bloom-macos-aarch64.tar.gz
           \`\`\`
+
+          Latest-alias URL (always resolves to the highest semver tag):
+          \`\`\`
+          https://github.com/${{ github.repository }}/releases/latest/download/bloom-linux-x86_64.tar.gz
+          \`\`\`
+
+          Verify your download with \`SHA256SUMS\`.
           EOF
 
-          if gh release view latest >/dev/null 2>&1; then
-            gh release edit latest \
-              --target "$GITHUB_SHA" \
-              --title "Latest master build" \
-              --notes-file "$notes_file" \
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            # Retry path: release already exists. Update metadata and
+            # re-upload assets (clobbering any previous ones).
+            gh release edit "$TAG" \
+              --target "$SHA" \
+              --title "bloom v$VERSION" \
+              --notes-file "$NOTES" \
               --latest
+            gh release upload "$TAG" dist/* --clobber
           else
-            gh release create latest \
-              --target "$GITHUB_SHA" \
-              --title "Latest master build" \
-              --notes-file "$notes_file" \
-              --latest
+            # First-time create.
+            gh release create "$TAG" \
+              --target "$SHA" \
+              --title "bloom v$VERSION" \
+              --notes-file "$NOTES" \
+              --latest \
+              dist/*
           fi
-
-          gh release upload latest dist/* --clobber

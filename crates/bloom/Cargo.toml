@@ -33,6 +33,7 @@ bloom-defi.workspace = true
 bloom-tx.workspace = true
 url.workspace = true
 bloom-vfs.workspace = true
+bloom-update.workspace = true
 bloom-hyperliquid.workspace = true
 bloom-polymarket.workspace = true
 bloom-petals.workspace = true

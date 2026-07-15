@@ -26,6 +26,7 @@ members = [
   "crates/bloom-revert",
   "crates/bloom-petals",
   "crates/bloom-it",
+  "crates/bloom-update",
 ]
 resolver = "2"
 
@@ -123,6 +124,7 @@ bloom-petal-contract = { git = "https://github.com/bloom-directory/petal", rev =
 bloom-daemon   = { path = "crates/bloom-daemon" }
 bloom-auth-api = { path = "crates/bloom-auth-api" }
 bloom-auth     = { path = "crates/bloom-auth" }
+bloom-update   = { path = "crates/bloom-update" }
 # ---- example core petal: generic capability primitives (/bloom/core/cap) ----
 
 [profile.release]
