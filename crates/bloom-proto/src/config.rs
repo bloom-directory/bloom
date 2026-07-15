@@ -763,6 +763,20 @@ mod tests {
     }
 
     #[test]
+    fn petal_runtime_names_use_the_package_name_grammar() {
+        for valid in ["echo", "Echo2", "my-petal", "my_petal"] {
+            validate_petal_runtime_name("app", valid).unwrap();
+        }
+        for invalid in ["", "foo.bar", "foo/bar", "foo\\bar", "petal💮"] {
+            let err = validate_petal_runtime_name("app", invalid).unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("must contain only ASCII letters, digits, '-' or '_'")
+            );
+        }
+    }
+
+    #[test]
     fn toml_round_trip_default() {
         let cfg = Config::local_default();
         let s = toml::to_string_pretty(&cfg).unwrap();

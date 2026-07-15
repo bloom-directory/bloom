@@ -4,7 +4,7 @@
 //! surrounding [`bloom_vfs::Vfs`] — petals reach VFS paths via the
 //! host imports we install on the runner's VM.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
@@ -313,22 +313,27 @@ impl PetalRunner {
     }
 
     pub fn local_app_mounts(&self) -> Result<Vec<(String, String)>, PetalError> {
-        let mut out = Vec::new();
-        for hash in self.store.list_package_hashes()? {
-            let meta = self.store.load_meta(&hash)?;
-            if let Some(app) = meta.local_app {
-                out.push((app.name, hash));
-            }
-        }
-        out.sort_by(|a, b| a.0.cmp(&b.0));
-        Ok(out)
+        self.store.list_app_owners()
     }
 
     pub fn resolve_app_mount(&self, mount: &str) -> Result<String, PetalError> {
-        self.local_app_mounts()?
-            .into_iter()
-            .find_map(|(candidate, hash)| (candidate == mount).then_some(hash))
+        self.store
+            .resolve_app_owner(mount)?
             .ok_or_else(|| PetalError::NotFound(format!("apps/{mount}")))
+    }
+
+    /// Validate operator-configured endpoint origins against the bindings
+    /// declared by an installed app. This is used while constructing the
+    /// router so configuration errors fail daemon startup, before dispatch.
+    pub fn validate_app_endpoint_bindings(
+        &self,
+        mount: &str,
+        bindings: &BTreeMap<String, String>,
+    ) -> Result<(), PetalError> {
+        let hash = self.resolve_app_mount(mount)?;
+        self.v2_net_policy(&hash)?
+            .with_endpoint_bindings(bindings)?;
+        Ok(())
     }
 
     pub fn load_app_route_index(&self, mount: &str) -> Result<RouteIndex, PetalError> {

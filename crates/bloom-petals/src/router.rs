@@ -6,7 +6,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -25,7 +25,6 @@ pub struct PetalRouter {
     runner: PetalRunner,
     host: Arc<dyn PetalHost>,
     runtime_apps: BTreeMap<String, PetalAppRuntimeConfig>,
-    async_writes: Arc<AtomicBool>,
 }
 
 impl PetalRouter {
@@ -34,21 +33,33 @@ impl PetalRouter {
             runner,
             host,
             runtime_apps: BTreeMap::new(),
-            async_writes: Arc::new(AtomicBool::new(true)),
         }
     }
 
-    pub fn with_async_write_switch(mut self, enabled: Arc<AtomicBool>) -> Self {
-        self.async_writes = enabled;
+    /// Retained temporarily for daemon API compatibility. Petal writes are
+    /// synchronous in this iteration so VFS callers receive execution errors.
+    pub fn with_async_write_switch(self, _enabled: Arc<AtomicBool>) -> Self {
         self
     }
 
     pub fn with_runtime_apps(
         mut self,
         runtime_apps: BTreeMap<String, PetalAppRuntimeConfig>,
-    ) -> Self {
+    ) -> Result<Self, PetalError> {
+        for (mount, app) in &runtime_apps {
+            if app.endpoints.is_empty() {
+                continue;
+            }
+            match self
+                .runner
+                .validate_app_endpoint_bindings(mount, &app.endpoints)
+            {
+                Ok(()) | Err(PetalError::NotFound(_)) => {}
+                Err(err) => return Err(err),
+            }
+        }
         self.runtime_apps = runtime_apps;
-        self
+        Ok(self)
     }
 
     fn run_options(&self, mount: &str) -> RunOptions {
@@ -78,10 +89,6 @@ impl PetalRouter {
 
     fn is_v2_app(&self, mount: &str) -> bool {
         self.runner.resolve_app_mount(mount).is_ok()
-    }
-
-    fn async_writes_enabled(&self) -> bool {
-        self.async_writes.load(Ordering::Relaxed)
     }
 
     async fn dispatch_v2(
@@ -179,41 +186,6 @@ impl Handler for PetalRouter {
         }
         if !self.is_v2_app(mount) {
             return Err(HandlerError::NotFound(path.to_string_path()));
-        }
-        let (_, runtime_metadata) = self
-            .runner
-            .local_app_route_runtime_metadata(
-                mount,
-                DispatchOp::Write,
-                &rest,
-                self.run_options(mount),
-            )
-            .await
-            .map_err(map_petal_err)?;
-        if runtime_metadata.write_async && self.async_writes_enabled() {
-            let runner = self.runner.clone();
-            let host = self.host.clone();
-            let mount = mount.to_string();
-            let request = DispatchRequest {
-                op: DispatchOp::Write,
-                path: rest,
-                body: data.to_vec(),
-                ctx: Vec::new(),
-            };
-            let opts = self.run_options(&mount);
-            tokio::spawn(async move {
-                let result = runner
-                    .dispatch_app_route(&mount, request, host, None, opts)
-                    .await;
-                if let Err(e) = result {
-                    tracing::warn!(
-                        mount = %mount,
-                        error = %e,
-                        "async v2 petal write failed"
-                    );
-                }
-            });
-            return Ok(());
         }
         match self
             .dispatch_v2(mount, DispatchOp::Write, rest, data.to_vec())
@@ -509,6 +481,23 @@ namespaces = ["wallets"]
         write_package_file(root, "app/example/[wallet]/$index.wasm", &route);
     }
 
+    fn write_async_failing_package(root: &std::path::Path) {
+        write_package_file(
+            root,
+            "petal.toml",
+            br#"schema = "bloom.petal.local-app.v2"
+name = "example"
+"#,
+        );
+        write_package_file(root, "README.md", b"# example");
+        write_package_file(root, "AGENTS.md", b"# example agents");
+        write_package_file(
+            root,
+            "app/example/[wallet].txt.wasm",
+            &crate::v2::route_fixtures::async_failing_write_route_component(),
+        );
+    }
+
     #[tokio::test]
     async fn parameterized_dir_route_lookup_uses_component_runtime_metadata() {
         let (dir, runner) = runner();
@@ -588,13 +577,57 @@ namespaces = ["wallets"]
     }
 
     #[test]
-    fn async_write_switch_can_keep_one_shot_dispatch_in_process() {
-        let (_dir, runner) = runner();
-        let enabled = Arc::new(AtomicBool::new(false));
-        let router =
-            PetalRouter::new(runner, Arc::new(DenyHost)).with_async_write_switch(enabled.clone());
-        assert!(!router.async_writes_enabled());
-        enabled.store(true, Ordering::Relaxed);
-        assert!(router.async_writes_enabled());
+    fn router_rejects_undeclared_endpoint_override_before_dispatch() {
+        let (dir, runner) = runner();
+        let package = dir.path().join("demo-app");
+        write_demo_package(&package);
+        runner.store().install_app_package_dir(&package).unwrap();
+
+        let runtime_apps = BTreeMap::from([(
+            "demo".to_string(),
+            PetalAppRuntimeConfig {
+                endpoints: BTreeMap::from([(
+                    "clob".to_string(),
+                    "https://clob.internal.example".to_string(),
+                )]),
+                values: BTreeMap::new(),
+            },
+        )]);
+        let err = match PetalRouter::new(runner, Arc::new(DenyHost)).with_runtime_apps(runtime_apps)
+        {
+            Ok(_) => panic!("undeclared endpoint override unexpectedly accepted"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string()
+                .contains("endpoint override \"clob\" is not declared"),
+            "unexpected router construction error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_async_route_errors_are_returned_to_the_vfs_caller() {
+        let (dir, runner) = runner();
+        let package = dir.path().join("example-app");
+        write_async_failing_package(&package);
+        runner.store().install_app_package_dir(&package).unwrap();
+
+        // A true switch used to detach this write and return Ok immediately.
+        // The compatibility method is now deliberately a no-op.
+        let router = PetalRouter::new(runner, Arc::new(DenyHost))
+            .with_async_write_switch(Arc::new(AtomicBool::new(true)));
+        let vfs = Vfs::builder().mount("apps", Arc::new(router)).build();
+
+        let error = vfs
+            .write(
+                &VfsPath::parse("/apps/example/alice.txt").unwrap(),
+                b"payload",
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("component route write"),
+            "unexpected write error: {error}"
+        );
     }
 }

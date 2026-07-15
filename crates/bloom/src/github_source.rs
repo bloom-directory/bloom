@@ -275,11 +275,17 @@ fn resolve_ref(
 }
 
 fn resolve_explicit_ref(cache: &Path, requested_ref: &str) -> Result<String> {
-    for candidate in [
-        requested_ref.to_string(),
+    let mut candidates = Vec::with_capacity(4);
+    if is_full_commit_id(requested_ref) {
+        candidates.push(requested_ref.to_string());
+    }
+    candidates.extend([
         format!("refs/tags/{requested_ref}"),
         format!("refs/remotes/origin/{requested_ref}"),
-    ] {
+        requested_ref.to_string(),
+    ]);
+
+    for candidate in candidates {
         let rev = format!("{candidate}^{{commit}}");
         if let Ok(commit) = git_stdout(Some(cache), &["rev-parse", "--verify", "--quiet", &rev]) {
             let commit = commit.trim().to_string();
@@ -289,6 +295,10 @@ fn resolve_explicit_ref(cache: &Path, requested_ref: &str) -> Result<String> {
         }
     }
     bail!("ref not found")
+}
+
+fn is_full_commit_id(value: &str) -> bool {
+    matches!(value.len(), 40 | 64) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn explicit_tag_commit(cache: &Path, requested_ref: &str) -> Result<String> {
@@ -511,6 +521,81 @@ mod tests {
         let sha = resolve_ref(fixture.bare.path(), &repo, Some(&fixture.commits[0])).unwrap();
         assert_eq!(sha.selected_tag, None);
         assert_eq!(sha.commit, fixture.commits[0]);
+    }
+
+    #[test]
+    fn resolves_explicit_branch_from_freshly_fetched_origin_ref() {
+        let work = tempfile::tempdir().unwrap();
+        let remote = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        test_git(Some(work.path()), &["init", "-b", "main"]).unwrap();
+        test_git(
+            Some(work.path()),
+            &["config", "user.email", "test@example.com"],
+        )
+        .unwrap();
+        test_git(Some(work.path()), &["config", "user.name", "Test User"]).unwrap();
+        test_git(Some(remote.path()), &["init", "--bare"]).unwrap();
+        let remote_path = remote.path().to_string_lossy().to_string();
+        test_git(
+            Some(work.path()),
+            &["remote", "add", "origin", &remote_path],
+        )
+        .unwrap();
+
+        std::fs::write(work.path().join("file.txt"), "one").unwrap();
+        test_git(Some(work.path()), &["add", "file.txt"]).unwrap();
+        test_git(Some(work.path()), &["commit", "-m", "one"]).unwrap();
+        let first = test_git_stdout(Some(work.path()), &["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_string();
+        test_git(Some(work.path()), &["push", "origin", "main"]).unwrap();
+
+        let repo = source_test_repo(remote.path(), "bloom-petal-test-advancing");
+        let home_dir = HomeDir::at(home.path());
+        let cache = fetch_repo_cache(&home_dir, &repo).unwrap();
+        assert_eq!(
+            test_git_stdout(Some(&cache), &["rev-parse", "refs/heads/main"])
+                .unwrap()
+                .trim(),
+            first
+        );
+
+        std::fs::write(work.path().join("file.txt"), "two").unwrap();
+        test_git(Some(work.path()), &["commit", "-am", "two"]).unwrap();
+        let second = test_git_stdout(Some(work.path()), &["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_string();
+        test_git(Some(work.path()), &["push", "origin", "main"]).unwrap();
+
+        let cache = fetch_repo_cache(&home_dir, &repo).unwrap();
+        assert_eq!(
+            test_git_stdout(Some(&cache), &["rev-parse", "refs/heads/main"])
+                .unwrap()
+                .trim(),
+            first,
+            "the bare clone's local branch demonstrates the stale-cache condition"
+        );
+        assert_eq!(
+            test_git_stdout(Some(&cache), &["rev-parse", "refs/remotes/origin/main"])
+                .unwrap()
+                .trim(),
+            second
+        );
+
+        let resolved = resolve_ref(&cache, &repo, Some("main")).unwrap();
+        assert_eq!(resolved.commit, second);
+    }
+
+    #[test]
+    fn explicit_unknown_ref_does_not_match_a_similarly_named_ref() {
+        let fixture = git_fixture(&["v0.1.0"]).unwrap();
+        let error = resolve_ref(fixture.bare.path(), &test_repo(), Some("mai"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("ref \"mai\" was not found"));
     }
 
     #[test]

@@ -5,6 +5,10 @@ edition.workspace = true
 license.workspace = true
 description = "Tx engine, intent parser, policy for bloom"
 
+[features]
+default = []
+unsafe-debug-signer = []
+
 [dependencies]
 bloom-auth-api.workspace = true
 bloom-proto.workspace = true

@@ -5,6 +5,10 @@ edition.workspace = true
 license.workspace = true
 description = "Path router and handlers for bloom virtual filesystem"
 
+[features]
+default = []
+unsafe-debug-signer = ["bloom-keystore/unsafe-debug-signer"]
+
 [dependencies]
 bloom-auth-api.workspace = true
 bloom-mempool.workspace = true

@@ -65,6 +65,9 @@ pub(crate) const RENDER_TIMEOUT: Duration = Duration::from_secs(30);
 pub(crate) const DIRECTORY_CACHE_CAPACITY: usize = 1024;
 pub(crate) const DIRECTORY_CACHE_IDLE_TTL: Duration = Duration::from_secs(2);
 pub(crate) const DIRECTORY_CACHE_MAX_AGE: Duration = Duration::from_secs(30);
+/// Directory GETATTR revalidates a cached listing at this cadence so daemon,
+/// CLI, or another mount's mutations advance NFS's change token promptly.
+pub(crate) const DIRECTORY_CACHE_REVALIDATE_INTERVAL: Duration = Duration::from_millis(500);
 pub(crate) const DIRECTORY_LIST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Time without further writes after which a buffer may be reaped.
@@ -511,7 +514,6 @@ type RenderFuture = Shared<BoxFuture<'static, Result<Bytes, FsError>>>;
 struct DirectorySnapshot {
     entries: Arc<[Entry]>,
     change: u64,
-    created_at: Instant,
 }
 
 struct MountDirectoryEntry {
@@ -519,6 +521,7 @@ struct MountDirectoryEntry {
     change: u64,
     created_at: Instant,
     last_used_at: Instant,
+    last_validated_at: Instant,
 }
 
 /// Short-lived mount cache for NFS directory enumeration. This is separate
@@ -566,7 +569,6 @@ impl MountDirectoryCache {
                 Some(Arc::new(DirectorySnapshot {
                     entries: entries.clone(),
                     change: entry.change,
-                    created_at: entry.created_at,
                 }))
             }
             None => {
@@ -615,6 +617,7 @@ impl MountDirectoryCache {
                 change,
                 created_at: now,
                 last_used_at: now,
+                last_validated_at: now,
             },
         );
         trace!(path = %path, change, "mount.directory_cache.metadata_inserted");
@@ -625,24 +628,69 @@ impl MountDirectoryCache {
         self.generation.load(Ordering::Acquire)
     }
 
-    fn put_if_generation(&self, path: VfsPath, snapshot: Arc<DirectorySnapshot>, generation: u64) {
+    fn needs_revalidation(&self, path: &VfsPath) -> bool {
+        let now = Instant::now();
+        let mut cache = self.inner.lock();
+        let expired = cache
+            .peek(path)
+            .map(|entry| Self::entry_expired(entry, now));
+        if expired == Some(true) {
+            cache.pop(path);
+            return true;
+        }
+        cache.peek(path).is_none_or(|entry| {
+            now.duration_since(entry.last_validated_at) >= DIRECTORY_CACHE_REVALIDATE_INTERVAL
+        })
+    }
+
+    fn put_listing_if_generation(
+        &self,
+        path: VfsPath,
+        entries: Arc<[Entry]>,
+        generation: u64,
+    ) -> Arc<DirectorySnapshot> {
+        let now = Instant::now();
         let mut cache = self.inner.lock();
         if self.generation() != generation {
             trace!(path = %path, "mount.directory_cache.insert_skipped_after_invalidation");
-            return;
+            return Arc::new(DirectorySnapshot {
+                entries,
+                change: file_change_now(),
+            });
         }
-        let entries = snapshot.entries.len();
-        let change = snapshot.change;
+
+        let existing = cache.peek(&path);
+        let unchanged = existing
+            .and_then(|entry| entry.entries.as_deref())
+            .is_some_and(|current| directory_entries_equal(current, &entries));
+        // A metadata-only entry has not exposed a listing yet, so the first
+        // READDIR must fill it under the same verifier allocated by GETATTR.
+        let preserve_change = existing.is_some_and(|entry| entry.entries.is_none()) || unchanged;
+        let change = existing
+            .filter(|_| preserve_change)
+            .map(|entry| entry.change)
+            .unwrap_or_else(file_change_now);
+        let created_at = existing
+            .filter(|_| preserve_change)
+            .map(|entry| entry.created_at)
+            .unwrap_or(now);
+        let snapshot = Arc::new(DirectorySnapshot {
+            entries: entries.clone(),
+            change,
+        });
+        let entry_count = entries.len();
         cache.put(
             path.clone(),
             MountDirectoryEntry {
-                entries: Some(snapshot.entries.clone()),
-                change: snapshot.change,
-                created_at: snapshot.created_at,
-                last_used_at: Instant::now(),
+                entries: Some(entries),
+                change,
+                created_at,
+                last_used_at: now,
+                last_validated_at: now,
             },
         );
-        trace!(path = %path, entries, change, "mount.directory_cache.inserted");
+        trace!(path = %path, entries = entry_count, change, "mount.directory_cache.inserted");
+        snapshot
     }
 
     fn invalidate(&self, path: &VfsPath) {
@@ -651,6 +699,17 @@ impl MountDirectoryCache {
             trace!(path = %path, "mount.directory_cache.invalidated");
         }
     }
+}
+
+fn directory_entries_equal(left: &[Entry], right: &[Entry]) -> bool {
+    left.len() == right.len()
+        && left.iter().zip(right).all(|(left, right)| {
+            left.name == right.name
+                && left.kind == right.kind
+                && left.size == right.size
+                && left.mode == right.mode
+                && left.link_target == right.link_target
+        })
 }
 
 type DirectoryFuture = Shared<BoxFuture<'static, Result<Arc<DirectorySnapshot>, FsError>>>;
@@ -735,8 +794,14 @@ impl BloomFs {
         }
     }
 
-    async fn directory_snapshot(&self, dir_path: &VfsPath) -> FsResult<Arc<DirectorySnapshot>> {
-        if let Some(snapshot) = self.directory_cache.get(dir_path) {
+    async fn load_directory_snapshot(
+        &self,
+        dir_path: &VfsPath,
+        revalidate: bool,
+    ) -> FsResult<Arc<DirectorySnapshot>> {
+        if let Some(snapshot) = self.directory_cache.get(dir_path)
+            && (!revalidate || !self.directory_cache.needs_revalidation(dir_path))
+        {
             return Ok(snapshot);
         }
 
@@ -745,13 +810,15 @@ impl BloomFs {
             if let Some(existing) = in_flight.get(dir_path) {
                 trace!(path = %dir_path, "mount.directory_list.coalesced");
                 existing.future.clone()
-            } else if let Some(snapshot) = self.directory_cache.get(dir_path) {
+            } else if let Some(snapshot) = self.directory_cache.get(dir_path)
+                && (!revalidate || !self.directory_cache.needs_revalidation(dir_path))
+            {
                 // A load may have completed between the first cache probe and
                 // acquiring the in-flight lock.
                 return Ok(snapshot);
             } else {
                 let generation = self.directory_cache.generation();
-                let (change, created_at) = self.directory_cache.metadata(dir_path);
+                self.directory_cache.metadata(dir_path);
                 let vfs = self.vfs.clone();
                 let path = dir_path.clone();
                 let cleanup_path = path.clone();
@@ -761,15 +828,11 @@ impl BloomFs {
                     let result =
                         tokio::time::timeout(DIRECTORY_LIST_TIMEOUT, vfs.list(&path)).await;
                     let result = match result {
-                        Ok(Ok(entries)) => {
-                            let snapshot = Arc::new(DirectorySnapshot {
-                                change,
-                                entries: Arc::from(entries),
-                                created_at,
-                            });
-                            cache.put_if_generation(path.clone(), snapshot.clone(), generation);
-                            Ok(snapshot)
-                        }
+                        Ok(Ok(entries)) => Ok(cache.put_listing_if_generation(
+                            path.clone(),
+                            Arc::from(entries),
+                            generation,
+                        )),
                         Ok(Err(error)) => Err(map_err(error)),
                         Err(_) => {
                             warn!(path = %path, "mount.directory_list.timed_out");
@@ -800,8 +863,17 @@ impl BloomFs {
         future.await
     }
 
+    async fn directory_snapshot(&self, dir_path: &VfsPath) -> FsResult<Arc<DirectorySnapshot>> {
+        self.load_directory_snapshot(dir_path, false).await
+    }
+
     async fn dir_change(&self, dir_path: &VfsPath) -> FsResult<u64> {
-        Ok(self.directory_cache.metadata(dir_path).0)
+        let metadata = self.directory_cache.metadata(dir_path);
+        if !self.directory_cache.needs_revalidation(dir_path) {
+            return Ok(metadata.0);
+        }
+
+        Ok(self.load_directory_snapshot(dir_path, true).await?.change)
     }
 
     fn parent_path(path: &VfsPath) -> Option<VfsPath> {
@@ -2487,6 +2559,46 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct BlockingRevalidationHandler {
+        lists: std::sync::atomic::AtomicU32,
+        revalidation_started: tokio::sync::Notify,
+        release_revalidation: tokio::sync::Notify,
+    }
+
+    impl BlockingRevalidationHandler {
+        fn new() -> Arc<Self> {
+            Arc::new(Self::default())
+        }
+
+        fn list_count(&self) -> u32 {
+            self.lists.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl Handler for BlockingRevalidationHandler {
+        async fn lookup(&self, p: &VfsPath) -> Result<Entry, HandlerError> {
+            if p.is_root() {
+                Ok(Entry::dir(""))
+            } else {
+                Err(HandlerError::NotFound(p.to_string_path()))
+            }
+        }
+
+        async fn list(&self, p: &VfsPath) -> Result<Vec<Entry>, HandlerError> {
+            if !p.is_root() {
+                return Err(HandlerError::NotADir(p.to_string_path()));
+            }
+            let prior = self.lists.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if prior > 0 {
+                self.revalidation_started.notify_one();
+                self.release_revalidation.notified().await;
+            }
+            Ok(vec![Entry::file("entry")])
+        }
+    }
+
     #[async_trait]
     impl Handler for CountingDirectoryHandler {
         async fn lookup(&self, p: &VfsPath) -> Result<Entry, HandlerError> {
@@ -2600,6 +2712,39 @@ mod tests {
             task.await.unwrap().unwrap();
         }
         assert_eq!(handler.root_list_count(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn concurrent_directory_revalidations_coalesce_to_one_list() {
+        let handler = BlockingRevalidationHandler::new();
+        let vfs = Vfs::builder().mount("box", handler.clone()).build();
+        let fs = Arc::new(BloomFs::new(vfs));
+        let directory = fs
+            .lookup(&fake_ctx(), &BloomHandle::Root, "box")
+            .await
+            .unwrap();
+        fs.readdir(&fake_ctx(), &directory, 0, u32::MAX, false)
+            .await
+            .unwrap();
+        assert_eq!(handler.list_count(), 1);
+
+        tokio::time::advance(DIRECTORY_CACHE_REVALIDATE_INTERVAL + Duration::from_millis(1)).await;
+        let revalidation_started = handler.revalidation_started.notified();
+        let tasks = (0..16)
+            .map(|_| {
+                let fs = fs.clone();
+                let directory = directory.clone();
+                tokio::spawn(async move { fs.getattr(&fake_ctx(), &directory).await })
+            })
+            .collect::<Vec<_>>();
+
+        revalidation_started.await;
+        tokio::task::yield_now().await;
+        handler.release_revalidation.notify_one();
+        for task in tasks {
+            task.await.unwrap().unwrap();
+        }
+        assert_eq!(handler.list_count(), 2);
     }
 
     #[tokio::test]
@@ -2774,9 +2919,14 @@ mod tests {
         let ctx = fake_ctx();
         let box_dir = fs.lookup(&ctx, &BloomHandle::Root, "box").await.unwrap();
         let pending = fs.lookup(&ctx, &box_dir, "pending").await.unwrap();
+        fs.readdir(&ctx, &pending, 0, u32::MAX, false)
+            .await
+            .unwrap();
         let before = fs.getattr(&ctx, &pending).await.unwrap().change;
         h.push("0001-21699");
-        tokio::time::advance(DIRECTORY_CACHE_IDLE_TTL + Duration::from_millis(1)).await;
+        // Stay well inside the idle/max-age window: metadata revalidation,
+        // rather than cache expiry, must discover the out-of-band mutation.
+        tokio::time::advance(DIRECTORY_CACHE_REVALIDATE_INTERVAL + Duration::from_millis(1)).await;
         let after = fs.getattr(&ctx, &pending).await.unwrap().change;
         assert_ne!(
             before, after,

@@ -857,6 +857,7 @@ impl Keystore {
     /// Install a recovered signer into the in-memory cache for an explicit
     /// local debug session. The signer must control the wallet's persisted
     /// address. Nothing is written to disk.
+    #[cfg(feature = "unsafe-debug-signer")]
     pub fn install_unsafe_debug_signer(
         &self,
         name: &str,

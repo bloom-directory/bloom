@@ -5,6 +5,8 @@
 //! ```text
 //! <base>/objects/<hash>      — raw wasm bytes
 //! <base>/meta/<hash>.json    — PetalMeta (size, installed_at, name, caps)
+//! <base>/packages/<hash>/    — prepared local app package
+//! <base>/owners/<name>.json  — authoritative local app package hash
 //! ```
 //!
 //! Hash is hex-encoded BLAKE3 of the wasm bytes. Writes are atomic
@@ -27,6 +29,7 @@ use crate::v2::{
 const OBJECTS: &str = "objects";
 const META: &str = "meta";
 const PACKAGES: &str = "packages";
+const OWNERS: &str = "owners";
 const SOURCE: &str = "source";
 const ARTIFACTS_ROUTES: &str = "artifacts/routes";
 const ROUTE_INDEX: &str = "route-index.json";
@@ -47,6 +50,13 @@ pub struct InstallResult {
     pub already_present: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AppOwner {
+    name: String,
+    hash: String,
+}
+
 impl PetalStore {
     /// Open (or create) a store rooted at `base`. Creates the
     /// `objects/` and `meta/` subdirectories if missing.
@@ -55,7 +65,10 @@ impl PetalStore {
         std::fs::create_dir_all(base.join(OBJECTS))?;
         std::fs::create_dir_all(base.join(META))?;
         std::fs::create_dir_all(base.join(PACKAGES))?;
-        Ok(Self { base })
+        std::fs::create_dir_all(base.join(OWNERS))?;
+        let store = Self { base };
+        store.reconcile_app_owners()?;
+        Ok(store)
     }
 
     pub fn base(&self) -> &Path {
@@ -91,6 +104,10 @@ impl PetalStore {
 
     fn package_tmp_path(&self, hash: &str) -> PathBuf {
         self.base.join(PACKAGES).join(format!(".{hash}.tmp"))
+    }
+
+    fn owner_path(&self, name: &str) -> PathBuf {
+        self.base.join(OWNERS).join(format!("{name}.json"))
     }
 
     fn route_index_path_unchecked(&self, hash: &str) -> PathBuf {
@@ -214,8 +231,6 @@ impl PetalStore {
             Err(e) => return Err(e),
         };
 
-        let replaced_hashes = self.app_hashes_with_name(&hash, &package.name)?;
-
         if !already_present {
             let tmp = self.package_tmp_path(&hash);
             match std::fs::remove_dir_all(&tmp) {
@@ -264,9 +279,15 @@ impl PetalStore {
         meta.source = source;
         self.write_meta(&meta)?;
 
-        for replaced_hash in replaced_hashes {
-            self.uninstall(&replaced_hash)?;
-        }
+        // This atomic rename is the installation commit point. Before it,
+        // readers continue to resolve the previous package; after it, they
+        // resolve only this fully prepared and verified package.
+        self.write_app_owner(&package.name, &hash)?;
+
+        // Keep prior package data until the next store open. A request that
+        // resolved the old owner immediately before the commit can therefore
+        // still finish safely. Reconciliation later removes the unreachable
+        // content-addressed package.
 
         Ok((
             InstallResult {
@@ -277,20 +298,6 @@ impl PetalStore {
             meta,
             package.route_index,
         ))
-    }
-
-    fn app_hashes_with_name(&self, hash: &str, name: &str) -> Result<Vec<String>, PetalError> {
-        let mut matches = Vec::new();
-        for existing_hash in self.list_package_hashes()? {
-            if existing_hash == hash {
-                continue;
-            }
-            let meta = self.load_meta(&existing_hash)?;
-            if meta.local_app.as_ref().is_some_and(|app| app.name == name) {
-                matches.push(existing_hash);
-            }
-        }
-        Ok(matches)
     }
 
     fn verify_existing_app_package(&self, package: &PreparedAppPackage) -> Result<(), PetalError> {
@@ -413,11 +420,163 @@ impl PetalStore {
         Ok(out.into_iter().collect())
     }
 
+    /// List authoritative installed app-package hashes. Unreachable package
+    /// data awaiting startup reconciliation is intentionally omitted.
     pub fn list_package_hashes(&self) -> Result<Vec<String>, PetalError> {
+        Ok(self
+            .list_app_owners()?
+            .into_iter()
+            .map(|(_, hash)| hash)
+            .collect())
+    }
+
+    fn list_physical_package_hashes(&self) -> Result<Vec<String>, PetalError> {
         let mut out = BTreeSet::new();
         collect_meta_hashes(self.base.join(META), &mut out)?;
         out.retain(|hash| self.package_path_unchecked(hash).exists());
         Ok(out.into_iter().collect())
+    }
+
+    /// List the single authoritative package owner for each installed app.
+    pub fn list_app_owners(&self) -> Result<Vec<(String, String)>, PetalError> {
+        let mut owners = Vec::new();
+        for entry in std::fs::read_dir(self.base.join(OWNERS))? {
+            let entry = entry?;
+            if !entry.file_type()?.is_file() {
+                continue;
+            }
+            let Some(file_name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            if file_name.starts_with('.') || !file_name.ends_with(".json") {
+                continue;
+            }
+            let owner: AppOwner = serde_json::from_slice(&std::fs::read(entry.path())?)?;
+            validate_owner(&owner)?;
+            if file_name.strip_suffix(".json") != Some(owner.name.as_str()) {
+                return Err(PetalError::InvalidWasm(format!(
+                    "app owner record name does not match file {file_name:?}"
+                )));
+            }
+            if !self.package_path_unchecked(&owner.hash).is_dir() {
+                return Err(PetalError::NotFound(owner.hash));
+            }
+            owners.push((owner.name, owner.hash));
+        }
+        owners.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(owners)
+    }
+
+    pub fn resolve_app_owner(&self, name: &str) -> Result<Option<String>, PetalError> {
+        validate_owner_name(name)?;
+        let bytes = match std::fs::read(self.owner_path(name)) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(PetalError::Io(e)),
+        };
+        let owner: AppOwner = serde_json::from_slice(&bytes)?;
+        validate_owner(&owner)?;
+        if owner.name != name {
+            return Err(PetalError::InvalidWasm(format!(
+                "app owner record name mismatch: expected {name:?}, found {:?}",
+                owner.name
+            )));
+        }
+        if !self.package_path_unchecked(&owner.hash).is_dir() {
+            return Err(PetalError::NotFound(owner.hash));
+        }
+        Ok(Some(owner.hash))
+    }
+
+    fn write_app_owner(&self, name: &str, hash: &str) -> Result<(), PetalError> {
+        validate_owner_name(name)?;
+        validate_hash_arg(hash)?;
+        let owner = AppOwner {
+            name: name.to_string(),
+            hash: hash.to_string(),
+        };
+        atomic_write(&self.owner_path(name), &serde_json::to_vec_pretty(&owner)?)?;
+        Ok(())
+    }
+
+    fn remove_app_owner_for_hash(&self, hash: &str) -> Result<(), PetalError> {
+        for (name, owner_hash) in self.list_app_owners()? {
+            if owner_hash != hash {
+                continue;
+            }
+            match std::fs::remove_file(self.owner_path(&name)) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(PetalError::Io(e)),
+            }
+        }
+        Ok(())
+    }
+
+    /// Recover interrupted installs. Existing valid owner records always win:
+    /// an owner swap is the commit point. Stores created before owner records
+    /// existed are migrated by selecting the newest package for each app.
+    fn reconcile_app_owners(&self) -> Result<(), PetalError> {
+        for entry in std::fs::read_dir(self.base.join(OWNERS))? {
+            let entry = entry?;
+            if entry.file_name().to_string_lossy().starts_with('.') {
+                match std::fs::remove_file(entry.path()) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(PetalError::Io(e)),
+                }
+            }
+        }
+
+        let mut packages = Vec::new();
+        for hash in self.list_physical_package_hashes()? {
+            let meta = self.load_meta(&hash)?;
+            if let Some(app) = meta.local_app {
+                packages.push((app.name, hash, meta.installed_at_ms));
+            }
+        }
+        packages.sort_by(|a, b| {
+            (a.0.as_str(), a.2, a.1.as_str()).cmp(&(b.0.as_str(), b.2, b.1.as_str()))
+        });
+
+        let mut names = packages
+            .iter()
+            .map(|(name, _, _)| name.clone())
+            .collect::<BTreeSet<_>>();
+        for entry in std::fs::read_dir(self.base.join(OWNERS))? {
+            let entry = entry?;
+            let file_name = entry.file_name();
+            let Some(name) = file_name
+                .to_str()
+                .and_then(|name| name.strip_suffix(".json"))
+            else {
+                continue;
+            };
+            if validate_owner_name(name).is_ok() {
+                names.insert(name.to_string());
+            }
+        }
+        for name in names {
+            let candidates = packages
+                .iter()
+                .filter(|(candidate, _, _)| candidate == &name)
+                .collect::<Vec<_>>();
+            let current = self.resolve_app_owner(&name).ok().flatten();
+            let owner = current
+                .filter(|hash| candidates.iter().any(|(_, candidate, _)| candidate == hash))
+                .or_else(|| candidates.last().map(|(_, hash, _)| hash.clone()));
+            let Some(owner) = owner else {
+                let _ = std::fs::remove_file(self.owner_path(&name));
+                continue;
+            };
+            self.write_app_owner(&name, &owner)?;
+            for (_, hash, _) in candidates {
+                if hash != &owner {
+                    let _ = self.remove_package_data(hash);
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Remove an installed petal's object and metadata. Returns `true`
@@ -430,6 +589,11 @@ impl PetalStore {
     /// unlinks can leave the store with only one of the two files.
     pub fn uninstall(&self, hash: &str) -> Result<bool, PetalError> {
         validate_hash_arg(hash)?;
+        self.remove_app_owner_for_hash(hash)?;
+        self.remove_package_data(hash)
+    }
+
+    fn remove_package_data(&self, hash: &str) -> Result<bool, PetalError> {
         let obj_path = self.object_path(hash);
         let meta_path = self.meta_path(hash);
         let package_path = self.package_path_unchecked(hash);
@@ -576,6 +740,25 @@ fn validate_route_id_arg(route_id: &str) -> Result<(), PetalError> {
             "invalid route id {route_id:?}"
         )))
     }
+}
+
+fn validate_owner_name(name: &str) -> Result<(), PetalError> {
+    let valid = !name.is_empty()
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'));
+    if valid {
+        Ok(())
+    } else {
+        Err(PetalError::InvalidWasm(format!(
+            "invalid app owner name {name:?}"
+        )))
+    }
+}
+
+fn validate_owner(owner: &AppOwner) -> Result<(), PetalError> {
+    validate_owner_name(&owner.name)?;
+    validate_hash_arg(&owner.hash)
 }
 
 #[cfg(test)]
@@ -924,8 +1107,101 @@ name = "echo"
         assert_ne!(replacement.hash, first_hash);
         assert_eq!(meta.local_app.as_ref().unwrap().name, "echo");
         assert_eq!(index.routes[0].pattern, "two.txt");
-        assert!(!store.contains_package(&first_hash));
+        assert!(store.contains_package(&first_hash));
         assert!(store.contains_package(&replacement.hash));
+        assert_eq!(
+            store.list_app_owners().unwrap(),
+            vec![("echo".to_string(), replacement.hash)]
+        );
+
+        let reopened = PetalStore::open(d.path()).unwrap();
+        assert!(!reopened.contains_package(&first_hash));
+    }
+
+    #[test]
+    fn prepared_replacement_is_invisible_until_owner_commit() {
+        let (d, store) = store();
+        let first_hash = install_test_app(&d, &store, "first", "one.txt");
+
+        let staged_root = TempDir::new().unwrap();
+        let staged_store = PetalStore::open(staged_root.path().join("store")).unwrap();
+        let staged_hash = install_test_app(&staged_root, &staged_store, "second", "two.txt");
+        copy_dir(
+            &staged_store.package_path(&staged_hash).unwrap(),
+            &store.package_path(&staged_hash).unwrap(),
+        );
+        std::fs::copy(
+            staged_store.meta_path(&staged_hash),
+            store.meta_path(&staged_hash),
+        )
+        .unwrap();
+
+        assert!(store.contains_package(&staged_hash));
+        assert_eq!(
+            store.resolve_app_owner("echo").unwrap(),
+            Some(first_hash.clone())
+        );
+        assert_eq!(
+            store.list_package_hashes().unwrap(),
+            vec![first_hash.clone()]
+        );
+
+        // Reopening treats the uncommitted package as garbage and preserves
+        // the old authoritative owner.
+        let reopened = PetalStore::open(d.path()).unwrap();
+        assert_eq!(
+            reopened.resolve_app_owner("echo").unwrap(),
+            Some(first_hash)
+        );
+        assert!(!reopened.contains_package(&staged_hash));
+    }
+
+    #[test]
+    fn committed_replacement_survives_interrupted_cleanup() {
+        let (d, store) = store();
+        let first_hash = install_test_app(&d, &store, "first", "one.txt");
+
+        let staged_root = TempDir::new().unwrap();
+        let staged_store = PetalStore::open(staged_root.path().join("store")).unwrap();
+        let staged_hash = install_test_app(&staged_root, &staged_store, "second", "two.txt");
+        copy_dir(
+            &staged_store.package_path(&staged_hash).unwrap(),
+            &store.package_path(&staged_hash).unwrap(),
+        );
+        std::fs::copy(
+            staged_store.meta_path(&staged_hash),
+            store.meta_path(&staged_hash),
+        )
+        .unwrap();
+
+        // Simulate interruption after the atomic owner rename and before old
+        // package cleanup.
+        store.write_app_owner("echo", &staged_hash).unwrap();
+        assert!(store.contains_package(&first_hash));
+        assert_eq!(
+            store.list_package_hashes().unwrap(),
+            vec![staged_hash.clone()]
+        );
+
+        let reopened = PetalStore::open(d.path()).unwrap();
+        assert_eq!(
+            reopened.resolve_app_owner("echo").unwrap(),
+            Some(staged_hash)
+        );
+        assert!(!reopened.contains_package(&first_hash));
+    }
+
+    #[test]
+    fn reopening_migrates_legacy_package_and_removes_stale_owner_temp() {
+        let (d, store) = store();
+        let hash = install_test_app(&d, &store, "legacy", "one.txt");
+        std::fs::remove_file(store.owner_path("echo")).unwrap();
+        let stale = d.path().join(OWNERS).join(".echo.json.tmp");
+        std::fs::write(&stale, b"partial").unwrap();
+
+        let reopened = PetalStore::open(d.path()).unwrap();
+        assert_eq!(reopened.resolve_app_owner("echo").unwrap(), Some(hash));
+        assert!(!stale.exists());
     }
 
     #[test]
@@ -1018,6 +1294,43 @@ name = "echo"
         let path = root.join(rel);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, body).unwrap();
+    }
+
+    fn install_test_app(
+        temp: &TempDir,
+        store: &PetalStore,
+        package_dir: &str,
+        route: &str,
+    ) -> String {
+        let package = temp.path().join(package_dir);
+        write_file(
+            &package,
+            "petal.toml",
+            br#"schema = "bloom.petal.local-app.v2"
+name = "echo"
+"#,
+        );
+        write_file(&package, "README.md", b"# echo");
+        write_file(&package, "AGENTS.md", b"# echo agents");
+        write_file(
+            &package,
+            &format!("app/echo/{route}.wasm"),
+            route_component_wasm(),
+        );
+        store.install_app_package_dir(package).unwrap().0.hash
+    }
+
+    fn copy_dir(source: &Path, target: &Path) {
+        std::fs::create_dir_all(target).unwrap();
+        for entry in std::fs::read_dir(source).unwrap() {
+            let entry = entry.unwrap();
+            let destination = target.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                copy_dir(&entry.path(), &destination);
+            } else {
+                std::fs::copy(entry.path(), destination).unwrap();
+            }
+        }
     }
 
     fn route_component_wasm() -> &'static [u8] {

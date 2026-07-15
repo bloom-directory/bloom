@@ -679,8 +679,10 @@ impl WalletsHandler {
         if old_policy_toml.as_bytes() == data {
             return Ok(());
         }
-        let unsafe_debug_wallet = std::env::var("BLOOM_UNSAFE_DEBUG_SIGNER_WALLET").ok();
-        if unsafe_debug_wallet.as_deref() == Some(wallet) && self.keystore.is_unlocked(wallet) {
+        #[cfg(feature = "unsafe-debug-signer")]
+        if std::env::var("BLOOM_UNSAFE_DEBUG_SIGNER_WALLET").as_deref() == Ok(wallet)
+            && self.keystore.is_unlocked(wallet)
+        {
             tracing::warn!(wallet, "wallet.unsafe_debug_policy_approval_bypass");
             self.keystore.write_policy(wallet, data).map_err(err_be)?;
             return Ok(());
@@ -1058,7 +1060,7 @@ fn err_be(e: impl std::fmt::Display) -> HandlerError {
 
 fn tx_open_err(e: TxEngineError) -> HandlerError {
     match e {
-        TxEngineError::BroadcastApprovalRequired(_) => HandlerError::PermissionDenied,
+        TxEngineError::ApprovalRequired(_) => HandlerError::PermissionDenied,
         TxEngineError::PolicyDenied | TxEngineError::BroadcastDisabled(_) => {
             HandlerError::OperationNotPermitted
         }
@@ -2467,9 +2469,7 @@ impl WalletsHandler {
                         TxEngineError::EnsoQuoteStale { .. } => {
                             HandlerError::invalid(e.to_string())
                         }
-                        TxEngineError::BroadcastApprovalRequired(_) => {
-                            HandlerError::PermissionDenied
-                        }
+                        TxEngineError::ApprovalRequired(_) => HandlerError::PermissionDenied,
                         other => err_be(other),
                     })?;
                 Ok(())

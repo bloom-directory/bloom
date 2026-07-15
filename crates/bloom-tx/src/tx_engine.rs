@@ -12,7 +12,9 @@ use alloy::eips::eip2930::AccessList;
 use alloy::network::TransactionBuilder;
 use alloy::primitives::{Address, B256, Bytes, Signature, TxKind, U256};
 use alloy::rpc::types::eth::TransactionRequest;
+#[cfg(feature = "unsafe-debug-signer")]
 use alloy::signers::SignerSync;
+#[cfg(any(test, feature = "unsafe-debug-signer"))]
 use alloy::signers::local::PrivateKeySigner;
 use alloy::sol;
 use alloy::sol_types::SolCall;
@@ -80,6 +82,24 @@ pub trait RecipientResolver: Send + Sync {
     async fn resolve_name(&self, name: &str) -> Result<Address, String>;
 }
 
+/// A recoverable request for the caller to complete a Sealed Approval ceremony.
+///
+/// This is deliberately structured: callers must route on this type, never on
+/// the human-readable error text.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ApprovalRequirement {
+    pub action_id: String,
+    pub ceremony_url: String,
+    pub expires_ms: u64,
+    pub reason: String,
+}
+
+impl std::fmt::Display for ApprovalRequirement {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "for action '{}': {}", self.action_id, self.reason)
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum TxEngineError {
     #[error("parse: {0}")]
@@ -100,8 +120,18 @@ pub enum TxEngineError {
     PolicyDenied,
     #[error("broadcast disabled for chain '{0}' (set allow_broadcast=true)")]
     BroadcastDisabled(String),
-    #[error("broadcast approval required: {0}")]
-    BroadcastApprovalRequired(String),
+    #[error("broadcast approval required {0}")]
+    ApprovalRequired(ApprovalRequirement),
+    #[error("approval service unavailable: {0}")]
+    ApprovalServiceUnavailable(String),
+    #[error("approval state error: {0}")]
+    ApprovalState(String),
+    #[error("approval construction error: {0}")]
+    ApprovalConstruction(String),
+    #[error("approval backend error: {0}")]
+    ApprovalBackend(String),
+    #[error("approval denied: {0}")]
+    ApprovalDenied(String),
     #[error("not yet implemented: {0}")]
     Unimplemented(String),
     #[error("signer: {0}")]
@@ -389,6 +419,7 @@ pub struct TxEngine {
     auth_writer: Option<Arc<dyn AuthStoreWriter>>,
     grant_store: Option<Arc<dyn GrantStore>>,
     petal_host: Option<Arc<dyn PetalHost>>,
+    #[cfg(feature = "unsafe-debug-signer")]
     unsafe_debug_signer: Option<(String, Arc<PrivateKeySigner>)>,
 }
 
@@ -409,6 +440,7 @@ impl TxEngine {
             auth_writer: None,
             grant_store: None,
             petal_host: None,
+            #[cfg(feature = "unsafe-debug-signer")]
             unsafe_debug_signer: None,
         }
     }
@@ -436,6 +468,7 @@ impl TxEngine {
     /// Install an explicit local-only debug signer for one wallet. Policy
     /// evaluation and transaction simulation still run; only the interactive
     /// Sealed Approval ceremony is bypassed. Never enable this in production.
+    #[cfg(feature = "unsafe-debug-signer")]
     pub fn with_unsafe_debug_signer(
         mut self,
         wallet: impl Into<String>,
@@ -445,6 +478,7 @@ impl TxEngine {
         self
     }
 
+    #[cfg(feature = "unsafe-debug-signer")]
     fn unsafe_debug_signer(&self, wallet: &str) -> Option<&Arc<PrivateKeySigner>> {
         self.unsafe_debug_signer
             .as_ref()
@@ -1090,7 +1124,7 @@ impl TxEngine {
         if let Some(origin) = &execution_origin {
             origin
                 .validate()
-                .map_err(TxEngineError::BroadcastApprovalRequired)?;
+                .map_err(TxEngineError::ApprovalConstruction)?;
         }
         self.assert_write_permit(permit)?;
         let spec: &ChainSpec = chain.spec();
@@ -2388,14 +2422,14 @@ impl TxEngine {
     ) -> Result<EvmOwnerSessionExecution, TxEngineError> {
         self.ensure_broadcast_allowed(chain.spec())?;
         if chain.spec().chain_id != request.chain_id {
-            return Err(TxEngineError::BroadcastApprovalRequired(format!(
+            return Err(TxEngineError::ApprovalDenied(format!(
                 "owner-session chain mismatch: request {}, chain {}",
                 request.chain_id,
                 chain.spec().chain_id
             )));
         }
         if request.method != EVM_ERC20_TRANSFER_METHOD {
-            return Err(TxEngineError::BroadcastApprovalRequired(
+            return Err(TxEngineError::ApprovalDenied(
                 "owner-session use supports only ERC-20 transfer".into(),
             ));
         }
@@ -2419,7 +2453,7 @@ impl TxEngine {
             .calldata_hex
             .eq_ignore_ascii_case(&expected_calldata)
         {
-            return Err(TxEngineError::BroadcastApprovalRequired(
+            return Err(TxEngineError::ApprovalDenied(
                 "owner-session calldata does not match scoped ERC-20 transfer".into(),
             ));
         }
@@ -2519,9 +2553,9 @@ impl TxEngine {
         chain: &ChainClient,
         policy: &Policy,
     ) -> Result<SealedActionExecution, TxEngineError> {
-        sealed.validate().map_err(|e| {
-            TxEngineError::BroadcastApprovalRequired(format!("invalid sealed action: {e}"))
-        })?;
+        sealed
+            .validate()
+            .map_err(|e| TxEngineError::ApprovalState(format!("invalid sealed action: {e}")))?;
         let header = &sealed.envelope.header;
         match (
             sealed.envelope.subject_kind.as_str(),
@@ -2534,7 +2568,7 @@ impl TxEngine {
                 self.execute_evm_wallet_sealed_subject(sealed, chain_name, chain, policy)
                     .await
             }
-            (subject_kind, action_kind) => Err(TxEngineError::BroadcastApprovalRequired(format!(
+            (subject_kind, action_kind) => Err(TxEngineError::ApprovalState(format!(
                 "no sealed-action executor registered for petal_id={} petal_digest={} subject_kind={subject_kind} action_kind={action_kind}",
                 header.petal_id, header.petal_digest,
             ))),
@@ -2685,22 +2719,20 @@ impl TxEngine {
         // which have no chain and no outbox entry — a missing chain_name here is
         // a caller error, not a routine case.
         let chain_name = sealed.chain_name().ok_or_else(|| {
-            TxEngineError::BroadcastApprovalRequired(
+            TxEngineError::ApprovalState(
                 "sealed action is missing chain_name in its policy snapshot".into(),
             )
         })?;
-        let body = serde_json::to_vec_pretty(approval).map_err(|e| {
-            TxEngineError::BroadcastApprovalRequired(format!("encode approval.json: {e}"))
-        })?;
+        let body = serde_json::to_vec_pretty(approval)
+            .map_err(|e| TxEngineError::ApprovalState(format!("encode approval.json: {e}")))?;
         // Per-wallet pending projection. The entry may legitimately be absent
         // (already transitioned, or the challenge came from another interaction
         // mode) — but a silent miss is what hid the earlier chain-key bug, so we
         // warn loudly when nothing was written here.
         let mut persisted = false;
         if let Some(dir) = self.find_pending_entry_dir_for_action(wallet, chain_name, action_id) {
-            std::fs::write(dir.join(OUTBOX_APPROVAL_FILE), &body).map_err(|e| {
-                TxEngineError::BroadcastApprovalRequired(format!("write approval.json: {e}"))
-            })?;
+            std::fs::write(dir.join(OUTBOX_APPROVAL_FILE), &body)
+                .map_err(|e| TxEngineError::ApprovalBackend(format!("write approval.json: {e}")))?;
             persisted = true;
         }
         // Central outbox projection, keyed by the sealed action id (same place
@@ -2735,23 +2767,19 @@ impl TxEngine {
         let subject_bytes = base64::engine::general_purpose::STANDARD
             .decode(sealed.envelope.subject_bytes_b64.as_bytes())
             .map_err(|e| {
-                TxEngineError::BroadcastApprovalRequired(format!(
-                    "decode sealed subject bytes: {e}"
-                ))
+                TxEngineError::ApprovalState(format!("decode sealed subject bytes: {e}"))
             })?;
-        let subject: EvmSealedIntentSubject =
-            serde_json::from_slice(&subject_bytes).map_err(|e| {
-                TxEngineError::BroadcastApprovalRequired(format!("decode EVM sealed subject: {e}"))
-            })?;
+        let subject: EvmSealedIntentSubject = serde_json::from_slice(&subject_bytes)
+            .map_err(|e| TxEngineError::ApprovalState(format!("decode EVM sealed subject: {e}")))?;
         subject.validate_evm().map_err(|e| {
-            TxEngineError::BroadcastApprovalRequired(format!("invalid EVM sealed subject: {e}"))
+            TxEngineError::ApprovalState(format!("invalid EVM sealed subject: {e}"))
         })?;
         self.ensure_evm_subject_matches_seal(sealed, &subject)?;
         if subject.surface == "outbox" {
             self.ensure_evm_subject_matches_persisted_origin(chain_name, &subject)?;
         }
         if chain.spec().chain_id != subject.chain_id {
-            return Err(TxEngineError::BroadcastApprovalRequired(format!(
+            return Err(TxEngineError::ApprovalState(format!(
                 "sealed action chain mismatch: subject {}, chain {}",
                 subject.chain_id,
                 chain.spec().chain_id
@@ -2822,7 +2850,7 @@ impl TxEngine {
             .parse()
             .map_err(|e| TxEngineError::Signer(format!("sealed signing_hash: {e}")))?;
         if signing_hash != sealed_hash {
-            return Err(TxEngineError::BroadcastApprovalRequired(
+            return Err(TxEngineError::ApprovalState(
                 "sealed subject signing hash does not match reconstructed transaction".into(),
             ));
         }
@@ -2887,16 +2915,16 @@ impl TxEngine {
     ) -> Result<(), TxEngineError> {
         let header = &sealed.envelope.header;
         let subject_envelope = subject.canonical_envelope(sealed.expires_ms).map_err(|e| {
-            TxEngineError::BroadcastApprovalRequired(format!("rebuild sealed EVM envelope: {e}"))
+            TxEngineError::ApprovalConstruction(format!("rebuild sealed EVM envelope: {e}"))
         })?;
         let subject_hash = subject_envelope.intent_hash().map_err(|e| {
-            TxEngineError::BroadcastApprovalRequired(format!("hash sealed EVM envelope: {e}"))
+            TxEngineError::ApprovalConstruction(format!("hash sealed EVM envelope: {e}"))
         })?;
-        let sealed_hash = sealed.intent_hash().map_err(|e| {
-            TxEngineError::BroadcastApprovalRequired(format!("hash sealed action: {e}"))
-        })?;
+        let sealed_hash = sealed
+            .intent_hash()
+            .map_err(|e| TxEngineError::ApprovalConstruction(format!("hash sealed action: {e}")))?;
         if subject_hash != sealed_hash || subject_envelope != sealed.envelope {
-            return Err(TxEngineError::BroadcastApprovalRequired(
+            return Err(TxEngineError::ApprovalState(
                 "sealed subject bytes do not reproduce the sealed action envelope".into(),
             ));
         }
@@ -2932,18 +2960,18 @@ impl TxEngine {
         ];
         for (field, actual, expected) in expected {
             if actual != expected {
-                return Err(TxEngineError::BroadcastApprovalRequired(format!(
+                return Err(TxEngineError::ApprovalState(format!(
                     "sealed {field} mismatch: subject={actual} header={expected}"
                 )));
             }
         }
         if sealed.daemon_terms != subject.daemon_terms {
-            return Err(TxEngineError::BroadcastApprovalRequired(
+            return Err(TxEngineError::ApprovalState(
                 "sealed daemon terms do not match EVM subject".into(),
             ));
         }
         if sealed.petal_policy != subject.policy_snapshot {
-            return Err(TxEngineError::BroadcastApprovalRequired(
+            return Err(TxEngineError::ApprovalState(
                 "sealed Petal policy does not match EVM subject".into(),
             ));
         }
@@ -2958,15 +2986,13 @@ impl TxEngine {
         let entry = self
             .find_pending_entry_for_action(&subject.wallet, chain_name, &subject.action_id)
             .ok_or_else(|| {
-                TxEngineError::BroadcastApprovalRequired(
+                TxEngineError::ApprovalState(
                     "sealed EVM action has no pending staged transaction with persisted execution origin"
                         .into(),
                 )
             })?;
         let origin = entry.staged.resolved_execution_origin();
-        origin
-            .validate()
-            .map_err(TxEngineError::BroadcastApprovalRequired)?;
+        origin.validate().map_err(TxEngineError::ApprovalState)?;
         for (field, expected, actual) in [
             (
                 "petal_id",
@@ -2985,7 +3011,7 @@ impl TxEngine {
             ),
         ] {
             if expected != actual {
-                return Err(TxEngineError::BroadcastApprovalRequired(format!(
+                return Err(TxEngineError::ApprovalState(format!(
                     "sealed EVM {field} does not match persisted execution origin: sealed={actual} persisted={expected}"
                 )));
             }
@@ -2998,13 +3024,14 @@ impl TxEngine {
         subject: &EvmSealedIntentSubject,
         signing_hash: &B256,
     ) -> Result<Signature, TxEngineError> {
+        #[cfg(feature = "unsafe-debug-signer")]
         if let Some(signer) = self.unsafe_debug_signer(&subject.wallet) {
             return signer
                 .sign_hash_sync(signing_hash)
                 .map_err(|e| TxEngineError::Signer(format!("debug sign hash: {e}")));
         }
         let host = self.petal_host.as_ref().ok_or_else(|| {
-            TxEngineError::BroadcastApprovalRequired(
+            TxEngineError::ApprovalServiceUnavailable(
                 "Sealed Approval Petal host is not wired".into(),
             )
         })?;
@@ -3012,7 +3039,7 @@ impl TxEngine {
             .signing_attestation_facts()
             .signing_attestation()
             .map_err(|e| {
-                TxEngineError::BroadcastApprovalRequired(format!(
+                TxEngineError::ApprovalConstruction(format!(
                     "build EVM sealed signing attestation: {e}"
                 ))
             })?;
@@ -3028,9 +3055,7 @@ impl TxEngine {
                 now_ms() as u64,
             )
             .await
-            .map_err(|e| {
-                TxEngineError::BroadcastApprovalRequired(format!("host sign_hash denied: {e}"))
-            })?;
+            .map_err(|e| TxEngineError::ApprovalBackend(format!("host sign_hash denied: {e}")))?;
         let raw = base64::engine::general_purpose::STANDARD
             .decode(sealed.signature_b64.as_bytes())
             .map_err(|e| TxEngineError::Signer(format!("decode host signature: {e}")))?;
@@ -3043,13 +3068,14 @@ impl TxEngine {
         action_kind: EvmOutboxActionKind,
         signing_hash: B256,
     ) -> Result<Signature, TxEngineError> {
+        #[cfg(feature = "unsafe-debug-signer")]
         if let Some(signer) = self.unsafe_debug_signer(&staged.wallet) {
             return signer
                 .sign_hash_sync(&signing_hash)
                 .map_err(|e| TxEngineError::Signer(format!("debug sign hash: {e}")));
         }
         let host = self.petal_host.as_ref().ok_or_else(|| {
-            TxEngineError::BroadcastApprovalRequired(
+            TxEngineError::ApprovalServiceUnavailable(
                 "Sealed Approval Petal host is not wired".into(),
             )
         })?;
@@ -3068,9 +3094,7 @@ impl TxEngine {
                 now_ms() as u64,
             )
             .await
-            .map_err(|e| {
-                TxEngineError::BroadcastApprovalRequired(format!("host sign_hash denied: {e}"))
-            })?;
+            .map_err(|e| TxEngineError::ApprovalBackend(format!("host sign_hash denied: {e}")))?;
         let raw = base64::engine::general_purpose::STANDARD
             .decode(sealed.signature_b64.as_bytes())
             .map_err(|e| TxEngineError::Signer(format!("decode host signature: {e}")))?;
@@ -3086,13 +3110,14 @@ impl TxEngine {
         session: &StandingSessionRecord,
         signing_hash: &B256,
     ) -> Result<Signature, TxEngineError> {
+        #[cfg(feature = "unsafe-debug-signer")]
         if let Some(signer) = self.unsafe_debug_signer(&staged.wallet) {
             return signer
                 .sign_hash_sync(signing_hash)
                 .map_err(|e| TxEngineError::Signer(format!("debug sign hash: {e}")));
         }
         let host = self.petal_host.as_ref().ok_or_else(|| {
-            TxEngineError::BroadcastApprovalRequired(
+            TxEngineError::ApprovalServiceUnavailable(
                 "Sealed Approval Petal host is not wired".into(),
             )
         })?;
@@ -3117,9 +3142,7 @@ impl TxEngine {
                 now_ms() as u64,
             )
             .await
-            .map_err(|e| {
-                TxEngineError::BroadcastApprovalRequired(format!("host sign_hash denied: {e}"))
-            })?;
+            .map_err(|e| TxEngineError::ApprovalBackend(format!("host sign_hash denied: {e}")))?;
         let raw = base64::engine::general_purpose::STANDARD
             .decode(sealed.signature_b64.as_bytes())
             .map_err(|e| TxEngineError::Signer(format!("decode host signature: {e}")))?;
@@ -3237,15 +3260,16 @@ impl TxEngine {
             | bloom_proto::AutonomyDecision::ApprovedFreshReview { .. }
             | bloom_proto::AutonomyDecision::NeedsFreshReview { .. } => {}
             bloom_proto::AutonomyDecision::ApprovedCapability { .. } => {
-                return Err(TxEngineError::BroadcastApprovalRequired(
+                return Err(TxEngineError::ApprovalDenied(
                     "scoped run capabilities are not implemented; fresh review required".into(),
                 ));
             }
             bloom_proto::AutonomyDecision::Denied { reason } => {
-                return Err(TxEngineError::BroadcastApprovalRequired(reason));
+                return Err(TxEngineError::ApprovalDenied(reason));
             }
         }
 
+        #[cfg(feature = "unsafe-debug-signer")]
         if self.unsafe_debug_signer(&staged.wallet).is_some() {
             tracing::warn!(
                 wallet = %staged.wallet,
@@ -3260,7 +3284,7 @@ impl TxEngine {
             || self.grant_store.is_none()
             || self.petal_host.is_none()
         {
-            return Err(TxEngineError::BroadcastApprovalRequired(
+            return Err(TxEngineError::ApprovalServiceUnavailable(
                 "outbox confirm requires Sealed Approval; \
                  auth/grant/host services are not wired (marker fallback removed)"
                     .into(),
@@ -3285,13 +3309,13 @@ impl TxEngine {
             // broadcast-authorization gap if a producer is ever added without
             // re-reviewing this path. Fail closed until the system actually lands.
             bloom_proto::AutonomyDecision::ApprovedCapability { .. } => {
-                Err(TxEngineError::BroadcastApprovalRequired(
+                Err(TxEngineError::ApprovalDenied(
                     "scoped run capabilities are not implemented; fresh review required".into(),
                 ))
             }
             bloom_proto::AutonomyDecision::NeedsFreshReview { reason }
             | bloom_proto::AutonomyDecision::Denied { reason } => {
-                Err(TxEngineError::BroadcastApprovalRequired(reason))
+                Err(TxEngineError::ApprovalDenied(reason))
             }
         }
     }
@@ -3304,15 +3328,17 @@ impl TxEngine {
         signing_hash: &B256,
     ) -> Result<String, TxEngineError> {
         let verifier = self.approval_verifier.as_ref().ok_or_else(|| {
-            TxEngineError::BroadcastApprovalRequired("Sealed Approval verifier is not wired".into())
+            TxEngineError::ApprovalServiceUnavailable(
+                "Sealed Approval verifier is not wired".into(),
+            )
         })?;
         let writer = self.auth_writer.as_ref().ok_or_else(|| {
-            TxEngineError::BroadcastApprovalRequired(
+            TxEngineError::ApprovalServiceUnavailable(
                 "Sealed Approval auth store writer is not wired".into(),
             )
         })?;
         let grant_store = self.grant_store.as_ref().ok_or_else(|| {
-            TxEngineError::BroadcastApprovalRequired(
+            TxEngineError::ApprovalServiceUnavailable(
                 "Sealed Approval grant store is not wired".into(),
             )
         })?;
@@ -3320,7 +3346,7 @@ impl TxEngine {
         let execution_origin = staged.resolved_execution_origin();
         execution_origin
             .validate()
-            .map_err(TxEngineError::BroadcastApprovalRequired)?;
+            .map_err(TxEngineError::ApprovalState)?;
         if grant_store
             .get_active(
                 &staged.wallet,
@@ -3330,17 +3356,13 @@ impl TxEngine {
                 now_ms() as u64,
             )
             .await
-            .map_err(|e| {
-                TxEngineError::BroadcastApprovalRequired(format!("read active grant: {e}"))
-            })?
+            .map_err(|e| TxEngineError::ApprovalBackend(format!("read active grant: {e}")))?
             .is_some()
         {
             return outbox_canonical_envelope(staged, action_kind, signing_hash)?
                 .intent_hash()
                 .map_err(|e| {
-                    TxEngineError::BroadcastApprovalRequired(format!(
-                        "hash sealed outbox action: {e}"
-                    ))
+                    TxEngineError::ApprovalConstruction(format!("hash sealed outbox action: {e}"))
                 });
         }
 
@@ -3348,7 +3370,7 @@ impl TxEngine {
         let envelope = subject
             .canonical_envelope(u64::try_from(staged.expires_ms).unwrap_or(u64::MAX))
             .map_err(|e| {
-                TxEngineError::BroadcastApprovalRequired(format!("build EVM sealed envelope: {e}"))
+                TxEngineError::ApprovalConstruction(format!("build EVM sealed envelope: {e}"))
             })?;
         let action = SealedAction::new(
             envelope,
@@ -3365,18 +3387,16 @@ impl TxEngine {
             now_ms() as u64,
         )
         .map_err(|e| {
-            TxEngineError::BroadcastApprovalRequired(format!("seal outbox action failed: {e}"))
+            TxEngineError::ApprovalConstruction(format!("seal outbox action failed: {e}"))
         })?;
         let intent_hash = action.envelope.intent_hash().map_err(|e| {
-            TxEngineError::BroadcastApprovalRequired(format!("hash sealed outbox action: {e}"))
+            TxEngineError::ApprovalConstruction(format!("hash sealed outbox action: {e}"))
         })?;
         let auth_entry = writer
             .stage_action(action, now_ms() as u64)
             .await
             .map_err(|e| {
-                TxEngineError::BroadcastApprovalRequired(format!(
-                    "stage outbox auth entry failed: {e}"
-                ))
+                TxEngineError::ApprovalBackend(format!("stage outbox auth entry failed: {e}"))
             })?;
         if matches!(
             auth_entry.state,
@@ -3387,13 +3407,10 @@ impl TxEngine {
         }
         let approval_path = entry.dir.join(OUTBOX_APPROVAL_FILE);
         if approval_path.exists() {
-            let approval_body = std::fs::read(&approval_path).map_err(|e| {
-                TxEngineError::BroadcastApprovalRequired(format!("read approval.json: {e}"))
-            })?;
+            let approval_body = std::fs::read(&approval_path)
+                .map_err(|e| TxEngineError::ApprovalState(format!("read approval.json: {e}")))?;
             let approval: SignedApproval = serde_json::from_slice(&approval_body).map_err(|e| {
-                TxEngineError::BroadcastApprovalRequired(format!(
-                    "stored approval.json is invalid: {e}"
-                ))
+                TxEngineError::ApprovalState(format!("stored approval.json is invalid: {e}"))
             })?;
             let verification = verifier
                 .verify_and_mint_grant(approval, grant_store.as_ref(), now_ms() as u64)
@@ -3409,13 +3426,11 @@ impl TxEngine {
                     // fall through to issue a fresh challenge for the exact same
                     // sealed action. Other verification failures remain fatal.
                     std::fs::remove_file(&approval_path).map_err(|e| {
-                        TxEngineError::BroadcastApprovalRequired(format!(
-                            "remove expired approval.json: {e}"
-                        ))
+                        TxEngineError::ApprovalBackend(format!("remove expired approval.json: {e}"))
                     })?;
                 }
                 Err(e) => {
-                    return Err(TxEngineError::BroadcastApprovalRequired(format!(
+                    return Err(TxEngineError::ApprovalDenied(format!(
                         "Sealed Approval rejected: {e}"
                     )));
                 }
@@ -3435,21 +3450,19 @@ impl TxEngine {
             )
             .await
             .map_err(|e| {
-                TxEngineError::BroadcastApprovalRequired(format!(
+                TxEngineError::ApprovalBackend(format!(
                     "issue outbox approval challenge failed: {e}"
                 ))
             })?
             .with_local_ceremony_url();
         let challenge_body = serde_json::to_vec_pretty(&challenge).map_err(|e| {
-            TxEngineError::BroadcastApprovalRequired(format!("encode approval challenge: {e}"))
+            TxEngineError::ApprovalConstruction(format!("encode approval challenge: {e}"))
         })?;
         std::fs::write(
             entry.dir.join(OUTBOX_APPROVAL_CHALLENGE_FILE),
             &challenge_body,
         )
-        .map_err(|e| {
-            TxEngineError::BroadcastApprovalRequired(format!("write approval challenge: {e}"))
-        })?;
+        .map_err(|e| TxEngineError::ApprovalBackend(format!("write approval challenge: {e}")))?;
         if let Some(central_action_id) = staged.action_id.as_deref() {
             self.outbox
                 .write_central_pending_artifact(
@@ -3458,16 +3471,21 @@ impl TxEngine {
                     &challenge_body,
                 )
                 .map_err(|e| {
-                    TxEngineError::BroadcastApprovalRequired(format!(
-                        "write central approval challenge: {e}"
-                    ))
+                    TxEngineError::ApprovalBackend(format!("write central approval challenge: {e}"))
                 })?;
         }
-        Err(TxEngineError::BroadcastApprovalRequired(format!(
-            "outbox confirm requires signed Sealed Approval; wrote {} in {}; rerun the foreground confirm/write command with the passkey wallet to sign approval.json. local password wallets can only auto-confirm actions that remain in policy",
-            OUTBOX_APPROVAL_CHALLENGE_FILE,
-            entry.dir.display()
-        )))
+        Err(TxEngineError::ApprovalRequired(ApprovalRequirement {
+            action_id: challenge.action_id,
+            ceremony_url: challenge
+                .ceremony_url
+                .unwrap_or_else(|| "unavailable".into()),
+            expires_ms: challenge.expiry_ms,
+            reason: format!(
+                "outbox confirm requires signed Sealed Approval; wrote {} in {}; rerun the foreground confirm/write command with the passkey wallet to sign approval.json. local password wallets can only auto-confirm actions that remain in policy",
+                OUTBOX_APPROVAL_CHALLENGE_FILE,
+                entry.dir.display()
+            ),
+        }))
     }
 
     fn authorization_subject(&self, staged: &StagedTx) -> bloom_proto::AuthorizationSubject {
@@ -3882,9 +3900,7 @@ fn outbox_canonical_envelope(
 ) -> Result<CanonicalEnvelope, TxEngineError> {
     evm_sealed_subject(staged, action_kind, signing_hash)?
         .canonical_envelope(u64::try_from(staged.expires_ms).unwrap_or(u64::MAX))
-        .map_err(|e| {
-            TxEngineError::BroadcastApprovalRequired(format!("build EVM sealed envelope: {e}"))
-        })
+        .map_err(|e| TxEngineError::ApprovalConstruction(format!("build EVM sealed envelope: {e}")))
 }
 
 fn evm_signing_attestation(
@@ -3896,7 +3912,7 @@ fn evm_signing_attestation(
         .signing_attestation_facts()
         .signing_attestation()
         .map_err(|e| {
-            TxEngineError::BroadcastApprovalRequired(format!("build EVM signing attestation: {e}"))
+            TxEngineError::ApprovalConstruction(format!("build EVM signing attestation: {e}"))
         })
 }
 
@@ -3919,7 +3935,7 @@ fn evm_owner_session_signing_attestation(
     .signing_attestation_facts()
     .signing_attestation()
     .map_err(|e| {
-        TxEngineError::BroadcastApprovalRequired(format!(
+        TxEngineError::ApprovalConstruction(format!(
             "build EVM owner-session signing attestation: {e}"
         ))
     })
@@ -3961,9 +3977,7 @@ fn evm_owner_session_sealed_subject(
     signing_hash: &B256,
 ) -> Result<EvmSealedIntentSubject, TxEngineError> {
     let scope: EvmOwnerSigningSessionScope = serde_json::from_value(session.scope.clone())
-        .map_err(|e| {
-            TxEngineError::BroadcastApprovalRequired(format!("parse owner-session scope: {e}"))
-        })?;
+        .map_err(|e| TxEngineError::ApprovalState(format!("parse owner-session scope: {e}")))?;
     let signing_hash_hex = format!("{signing_hash:#x}");
     let calldata = decode_data(&staged.data_hex)?;
     let calldata_hash = format!("0x{}", blake3::hash(&calldata).to_hex());
@@ -3992,12 +4006,12 @@ fn evm_owner_session_sealed_subject(
         .insert("signer_cache_required".into(), serde_json::json!(true));
 
     let scope_value = serde_json::to_value(&scope).map_err(|e| {
-        TxEngineError::BroadcastApprovalRequired(format!("serialize owner-session scope: {e}"))
+        TxEngineError::ApprovalConstruction(format!("serialize owner-session scope: {e}"))
     })?;
     let scope_map = scope_value
         .as_object()
         .ok_or_else(|| {
-            TxEngineError::BroadcastApprovalRequired(
+            TxEngineError::ApprovalConstruction(
                 "owner-session scope did not serialize as object".into(),
             )
         })?
@@ -4040,14 +4054,12 @@ fn evm_owner_session_sealed_subject(
         session_scope: Some(scope_map),
     };
     let policy_snapshot_digest = policy_snapshot.petal_policy_digest().map_err(|e| {
-        TxEngineError::BroadcastApprovalRequired(format!(
+        TxEngineError::ApprovalConstruction(format!(
             "digest EVM owner-session policy snapshot: {e}"
         ))
     })?;
     let daemon_terms_digest = terms.daemon_terms_digest().map_err(|e| {
-        TxEngineError::BroadcastApprovalRequired(format!(
-            "digest EVM owner-session daemon terms: {e}"
-        ))
+        TxEngineError::ApprovalConstruction(format!("digest EVM owner-session daemon terms: {e}"))
     })?;
 
     Ok(EvmSealedIntentSubject {
@@ -4157,7 +4169,7 @@ fn evm_sealed_subject(
     let execution_origin = staged.resolved_execution_origin();
     execution_origin
         .validate()
-        .map_err(TxEngineError::BroadcastApprovalRequired)?;
+        .map_err(TxEngineError::ApprovalState)?;
 
     let mut policy_snapshot = PetalPolicySnapshot {
         policy_version: 0,
@@ -4183,10 +4195,10 @@ fn evm_sealed_subject(
         serde_json::json!(staged.policy_checks),
     );
     let policy_snapshot_digest = policy_snapshot.petal_policy_digest().map_err(|e| {
-        TxEngineError::BroadcastApprovalRequired(format!("digest EVM policy snapshot: {e}"))
+        TxEngineError::ApprovalConstruction(format!("digest EVM policy snapshot: {e}"))
     })?;
     let daemon_terms_digest = terms.daemon_terms_digest().map_err(|e| {
-        TxEngineError::BroadcastApprovalRequired(format!("digest EVM daemon terms: {e}"))
+        TxEngineError::ApprovalConstruction(format!("digest EVM daemon terms: {e}"))
     })?;
     let original_tx = if matches!(
         action_kind,
@@ -5242,6 +5254,23 @@ mod tests {
         (engine, dir)
     }
 
+    #[cfg(feature = "unsafe-debug-signer")]
+    #[test]
+    fn unsafe_debug_signer_is_available_only_for_configured_wallet() {
+        let (engine, _dir) = nonce_conflict_engine();
+        let signer = Arc::new(test_signer());
+        let expected_address = signer.address();
+        let engine = engine.with_unsafe_debug_signer("dev-wallet", signer);
+
+        assert_eq!(
+            engine
+                .unsafe_debug_signer("dev-wallet")
+                .map(|signer| signer.address()),
+            Some(expected_address)
+        );
+        assert!(engine.unsafe_debug_signer("other-wallet").is_none());
+    }
+
     /// `persist_outbox_ceremony_approval` is an outbox-only method: it requires
     /// a broadcast action's `chain_name`. Non-broadcast first-party actions
     /// (wallet-policy updates, policy-session mints) must not be routed here by
@@ -5285,7 +5314,7 @@ mod tests {
             .persist_outbox_ceremony_approval(&action, &approval)
             .expect_err("outbox persistence must reject a non-broadcast action");
         assert!(
-            matches!(err, TxEngineError::BroadcastApprovalRequired(_)),
+            matches!(err, TxEngineError::ApprovalState(_)),
             "unexpected error: {err}"
         );
     }
@@ -6296,7 +6325,7 @@ mod tests {
             )
             .await;
         assert!(
-            matches!(r, Err(TxEngineError::BroadcastApprovalRequired(ref e)) if e.contains("not wired")),
+            matches!(r, Err(TxEngineError::ApprovalServiceUnavailable(ref e)) if e.contains("not wired")),
             "expected fail-closed when unwired, got {r:?}"
         );
 
@@ -6313,7 +6342,7 @@ mod tests {
             )
             .await;
         assert!(
-            matches!(r, Err(TxEngineError::BroadcastApprovalRequired(ref e)) if e.contains("not wired")),
+            matches!(r, Err(TxEngineError::ApprovalServiceUnavailable(ref e)) if e.contains("not wired")),
             "expected fail-closed when unwired even with review hash, got {r:?}"
         );
     }
@@ -6370,10 +6399,10 @@ mod tests {
                 "y",
             )
             .await;
-        assert!(
-            matches!(r, Err(TxEngineError::BroadcastApprovalRequired(ref e)) if e.contains("Sealed Approval")),
-            "expected Sealed Approval challenge refusal, got {r:?}"
-        );
+        let requirement = match &r {
+            Err(TxEngineError::ApprovalRequired(requirement)) => requirement,
+            other => panic!("expected typed Sealed Approval requirement, got {other:?}"),
+        };
         let challenge: ApprovalChallenge = serde_json::from_slice(
             &std::fs::read(entry.dir.join(OUTBOX_APPROVAL_CHALLENGE_FILE)).unwrap(),
         )
@@ -6384,6 +6413,12 @@ mod tests {
             outbox_action_id(&staged, EvmOutboxActionKind::Confirm)
         );
         assert_eq!(challenge.intent_hash, "outbox-intent");
+        assert_eq!(requirement.action_id, challenge.action_id);
+        assert_eq!(requirement.expires_ms, challenge.expiry_ms);
+        assert_eq!(
+            requirement.ceremony_url,
+            challenge.ceremony_url.as_deref().unwrap()
+        );
     }
 
     #[tokio::test]
@@ -6454,7 +6489,7 @@ mod tests {
             )
             .await;
         match r {
-            Err(TxEngineError::BroadcastApprovalRequired(e)) => {
+            Err(TxEngineError::ApprovalRequired(e)) => {
                 panic!("signed approval should satisfy approval gate: {e}")
             }
             Ok(_) => panic!("unexpected broadcast success on unreachable RPC"),
@@ -6470,6 +6505,46 @@ mod tests {
                 .read_broadcast_attempt(&entry, BroadcastAttemptKind::Confirm)
                 .unwrap()
                 .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_stored_approval_is_state_error_not_ceremony() {
+        let (engine, spec, dir) = fake_engine(60_000);
+        let engine = engine.with_auth_services(
+            Arc::new(RejectingTestVerifier),
+            Arc::new(ChallengeOnlyWriter),
+        );
+        let engine = with_test_host(engine, false);
+        let permit = permit_for(&dir);
+        let chain = bloom_evm::ChainClient::new(spec).unwrap();
+        let mut policy = bloom_proto::Policy::default();
+        policy.approval.require_broadcast_approval = true;
+        let mut staged = fake_staged_1559("0001-malformed-approval");
+        staged.value_wei = "1".into();
+        staged.usd_value = Some(0.01);
+        staged.expires_ms = now_ms() + 60_000;
+        engine.outbox.write_pending(&staged, "p").unwrap();
+        let entry = engine
+            .outbox
+            .read("alice", "anvil", "0001-malformed-approval")
+            .unwrap();
+        std::fs::write(entry.dir.join(OUTBOX_APPROVAL_FILE), b"not-json").unwrap();
+
+        let result = engine
+            .confirm(
+                &permit,
+                "alice",
+                "anvil",
+                "0001-malformed-approval",
+                &chain,
+                &policy,
+                "y",
+            )
+            .await;
+        assert!(
+            matches!(result, Err(TxEngineError::ApprovalState(ref message)) if message.contains("stored approval.json is invalid")),
+            "malformed approval must not initiate a ceremony: {result:?}"
         );
     }
 
@@ -6502,7 +6577,7 @@ mod tests {
             )
             .await;
         match r {
-            Err(TxEngineError::BroadcastApprovalRequired(e)) => {
+            Err(TxEngineError::ApprovalRequired(e)) => {
                 panic!("consumed approval for same intent should satisfy retry gate: {e}")
             }
             Ok(_) => panic!("unexpected broadcast success on unreachable RPC"),
@@ -6538,7 +6613,7 @@ mod tests {
             )
             .await;
         assert!(
-            matches!(r, Err(TxEngineError::BroadcastApprovalRequired(ref e)) if e.contains("USD valuation")),
+            matches!(r, Err(TxEngineError::ApprovalDenied(ref e)) if e.contains("USD valuation")),
             "expected unknown USD refusal, got {r:?}"
         );
 
@@ -6560,7 +6635,7 @@ mod tests {
             )
             .await;
         match r {
-            Err(TxEngineError::BroadcastApprovalRequired(e)) => {
+            Err(TxEngineError::ApprovalRequired(e)) => {
                 panic!("under-policy tx should pass approval gate, got {e}")
             }
             Ok(_) => panic!("unexpected broadcast success on unreachable RPC"),

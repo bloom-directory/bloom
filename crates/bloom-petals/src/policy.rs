@@ -2,8 +2,6 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use serde::Deserialize;
-
 use crate::error::PetalError;
 use crate::host::HostError;
 
@@ -20,33 +18,19 @@ impl NetPolicy {
     }
 
     pub fn from_v2_manifest_toml(bytes: &[u8]) -> Result<Self, PetalError> {
-        let manifest_toml = std::str::from_utf8(bytes)
-            .map_err(|_| PetalError::InvalidWasm("petal.toml is not utf-8".into()))?;
-        let manifest: V2PolicyManifest = toml::from_str(manifest_toml)?;
-        let rules = manifest
-            .net
-            .map(|net| {
-                net.allow
+        let rules = crate::v2::net_rules_from_v2_manifest_toml(bytes)?
+            .into_iter()
+            .map(|rule| NetRule {
+                binding: rule.binding,
+                host: rule.host.to_ascii_lowercase(),
+                methods: rule
+                    .methods
                     .into_iter()
-                    .map(|rule| {
-                        if let Some(binding) = rule.binding.as_deref() {
-                            validate_binding_name(binding)?;
-                        }
-                        Ok(NetRule {
-                            binding: rule.binding,
-                            host: rule.host.to_ascii_lowercase(),
-                            methods: rule
-                                .methods
-                                .into_iter()
-                                .map(|method| method.to_ascii_uppercase())
-                                .collect(),
-                            paths: rule.paths.unwrap_or_default(),
-                        })
-                    })
-                    .collect::<Result<Vec<_>, PetalError>>()
+                    .map(|method| method.to_ascii_uppercase())
+                    .collect(),
+                paths: rule.paths,
             })
-            .transpose()?
-            .unwrap_or_default();
+            .collect();
         Ok(Self { rules })
     }
 
@@ -229,28 +213,7 @@ struct NetRule {
     paths: Vec<String>,
 }
 
-#[derive(Debug, Deserialize)]
-struct V2PolicyManifest {
-    net: Option<V2NetPolicy>,
-}
-
-#[derive(Debug, Deserialize)]
-struct V2NetPolicy {
-    #[serde(default)]
-    allow: Vec<V2NetRule>,
-}
-
-#[derive(Debug, Deserialize)]
-struct V2NetRule {
-    #[serde(default)]
-    binding: Option<String>,
-    host: String,
-    #[serde(default)]
-    methods: Vec<String>,
-    paths: Option<Vec<String>>,
-}
-
-fn endpoint_origin_host(origin: &str) -> Result<String, PetalError> {
+pub(crate) fn endpoint_origin_host(origin: &str) -> Result<String, PetalError> {
     let url = url::Url::parse(origin)
         .map_err(|err| PetalError::InvalidWasm(format!("endpoint binding URL: {err}")))?;
     if url.scheme() != "https"
@@ -270,7 +233,7 @@ fn endpoint_origin_host(origin: &str) -> Result<String, PetalError> {
         .ok_or_else(|| PetalError::InvalidWasm("endpoint binding URL is missing a host".into()))
 }
 
-fn validate_binding_name(binding: &str) -> Result<(), PetalError> {
+pub(crate) fn validate_binding_name(binding: &str) -> Result<(), PetalError> {
     if binding.is_empty()
         || !binding
             .bytes()
@@ -450,6 +413,10 @@ paths = ["/markets*", "/auth/*", "/wallets/*/orders"]
     fn named_endpoint_binding_replaces_only_the_exact_host() {
         let declared = NetPolicy::from_v2_manifest_toml(
             br#"
+name = "netty"
+[caps]
+allowed = ["bloom:http"]
+
 [[net.allow]]
 binding = "clob"
 host = "clob.polymarket.com"

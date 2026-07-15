@@ -18,6 +18,13 @@ mount = ["bloom-mount/mount"]
 # decompile fallback to the revert-decoder chain. Heavy build (heimdall
 # pulls a lot of git deps) so opt-in only.
 bytecode-decompile = ["bloom-revert/bytecode-decompile"]
+# Development-only escape hatch for local testing. This compiles private-key
+# loading and approval-bypass paths into the daemon and must remain opt-in.
+unsafe-debug-signer = [
+    "bloom-keystore/unsafe-debug-signer",
+    "bloom-tx/unsafe-debug-signer",
+    "bloom-vfs/unsafe-debug-signer",
+]
 
 [dependencies]
 bloom-auth-api.workspace = true

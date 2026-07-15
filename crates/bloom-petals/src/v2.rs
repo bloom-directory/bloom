@@ -4,7 +4,7 @@
 //! route trees and prepares content-addressed package records. Route
 //! artifacts must be `bloom:route@0.1.0` components.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -69,6 +69,7 @@ pub struct RouteIndexMatch<'a> {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PetalToml {
     #[serde(default)]
     schema: Option<String>,
@@ -83,47 +84,84 @@ struct PetalToml {
     sign: SignPolicy,
     #[serde(default)]
     store: StorePolicyToml,
+    #[serde(default, rename = "source")]
+    _source: Option<SourcePolicyToml>,
+    #[serde(default, rename = "build")]
+    _build: Option<BuildPolicyToml>,
 }
 
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ConsentPolicy {
     #[serde(default)]
     summary: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PetalCaps {
     #[serde(default)]
     allowed: Vec<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct NetPolicyToml {
     #[serde(default)]
     allow: Vec<NetAllowToml>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct NetAllowToml {
+    #[serde(default)]
+    binding: Option<String>,
     host: String,
     #[serde(default)]
     methods: Vec<String>,
-    #[serde(default)]
     paths: Vec<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SignPolicy {
     #[serde(default)]
     allowed_intents: Vec<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct StorePolicyToml {
     #[serde(default)]
     namespaces: Vec<String>,
     #[serde(default)]
     secret_namespaces: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SourcePolicyToml {
+    #[serde(rename = "kind")]
+    _kind: String,
+    #[serde(rename = "repository")]
+    _repository: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BuildPolicyToml {
+    #[serde(rename = "command")]
+    _command: String,
+    #[serde(default, rename = "outputs")]
+    _outputs: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ManifestNetRule {
+    pub binding: Option<String>,
+    pub host: String,
+    pub methods: Vec<String>,
+    pub paths: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -215,7 +253,11 @@ pub struct AppConsentSummary {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppConsentNetRule {
+    pub binding: Option<String>,
     pub host: String,
+    /// Operator-configured HTTPS origin replacing `host` for this binding.
+    /// `None` means the declared host remains effective.
+    pub effective_origin: Option<String>,
     pub methods: Vec<String>,
     pub paths: Vec<String>,
 }
@@ -828,6 +870,32 @@ pub fn sign_intents_from_v2_manifest_toml(bytes: &[u8]) -> Result<BTreeSet<Strin
     Ok(allowed_sign_intents)
 }
 
+pub(crate) fn net_rules_from_v2_manifest_toml(
+    bytes: &[u8],
+) -> Result<Vec<ManifestNetRule>, PetalError> {
+    let manifest_toml = std::str::from_utf8(bytes)
+        .map_err(|_| PetalError::InvalidWasm("petal.toml is not utf-8".into()))?;
+    let manifest: PetalToml = toml::from_str(manifest_toml)?;
+    let allowed_caps = manifest
+        .caps
+        .allowed
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    validate_net_policy(&allowed_caps, &manifest.net)?;
+    Ok(manifest
+        .net
+        .allow
+        .into_iter()
+        .map(|rule| ManifestNetRule {
+            binding: rule.binding,
+            host: rule.host,
+            methods: rule.methods,
+            paths: rule.paths,
+        })
+        .collect())
+}
+
 pub fn store_policy_from_v2_manifest_toml(
     bytes: &[u8],
 ) -> Result<StoreNamespacePolicy, PetalError> {
@@ -902,17 +970,15 @@ pub fn app_consent_summary(package: &PreparedAppPackage) -> Result<AppConsentSum
         .allow
         .into_iter()
         .map(|rule| AppConsentNetRule {
+            binding: rule.binding,
             host: rule.host,
+            effective_origin: None,
             methods: rule
                 .methods
                 .into_iter()
                 .map(|method| method.to_ascii_uppercase())
                 .collect(),
-            paths: if rule.paths.is_empty() {
-                vec!["/*".to_string()]
-            } else {
-                rule.paths
-            },
+            paths: rule.paths,
         })
         .collect();
 
@@ -946,6 +1012,36 @@ pub fn app_consent_summary(package: &PreparedAppPackage) -> Result<AppConsentSum
         store_namespaces,
         routes,
     })
+}
+
+/// Apply daemon-owned endpoint overrides to a consent summary while enforcing
+/// that every configured binding was declared by the manifest. The declared
+/// host remains visible alongside the effective origin.
+pub fn apply_app_consent_endpoint_bindings(
+    summary: &mut AppConsentSummary,
+    bindings: &BTreeMap<String, String>,
+) -> Result<(), PetalError> {
+    for (binding, origin) in bindings {
+        crate::policy::validate_binding_name(binding)?;
+        crate::policy::endpoint_origin_host(origin)?;
+        if !summary
+            .network
+            .iter()
+            .any(|rule| rule.binding.as_deref() == Some(binding.as_str()))
+        {
+            return Err(PetalError::InvalidWasm(format!(
+                "endpoint override {binding:?} is not declared by the petal manifest"
+            )));
+        }
+    }
+    for rule in &mut summary.network {
+        rule.effective_origin = rule
+            .binding
+            .as_ref()
+            .and_then(|binding| bindings.get(binding))
+            .cloned();
+    }
+    Ok(())
 }
 
 fn build_manifest_for_package(package: &PreparedAppPackage) -> Result<BuildManifest, PetalError> {
@@ -1712,9 +1808,20 @@ fn route_pattern_from_rel(rel: &str) -> Result<String, PetalError> {
             )));
         }
     }
-    let Some(last) = segments.last_mut() else {
+    if segments.is_empty() {
         return Err(PetalError::InvalidWasm("empty route path".into()));
-    };
+    }
+    if let Some(reserved) = segments[..segments.len() - 1]
+        .iter()
+        .find(|segment| segment.starts_with('$'))
+    {
+        return Err(PetalError::InvalidWasm(format!(
+            "reserved route segment {reserved:?} is only allowed as a recognized route leaf"
+        )));
+    }
+    let last = segments
+        .last_mut()
+        .expect("route path was checked as non-empty");
     let Some(last_without_wasm) = last.strip_suffix(".wasm") else {
         return Err(PetalError::InvalidWasm("route leaf is not .wasm".into()));
     };
@@ -3340,19 +3447,14 @@ fn require_file(path: PathBuf) -> Result<(), PetalError> {
 
 fn validate_app_name(name: &str) -> Result<(), PetalError> {
     let valid = !name.is_empty()
-        && name != "."
-        && name != ".."
-        && !name.contains('/')
-        && !name.contains('\\')
-        && !name.bytes().any(|b| b == 0)
         && name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'));
     if valid {
         Ok(())
     } else {
         Err(PetalError::InvalidWasm(format!(
-            "invalid v2 app name {name:?}"
+            "invalid v2 app name {name:?}; expected only ASCII letters, digits, '-' or '_'"
         )))
     }
 }
@@ -3413,6 +3515,15 @@ fn validate_net_policy(
         if rule.methods.iter().any(|method| method.trim().is_empty()) {
             return Err(PetalError::InvalidWasm(
                 "v2 [[net.allow]] methods must be non-empty".into(),
+            ));
+        }
+        if let Some(binding) = rule.binding.as_deref() {
+            crate::policy::validate_binding_name(binding)?;
+        }
+        if rule.paths.is_empty() || rule.paths.iter().any(|path| path.trim().is_empty()) {
+            return Err(PetalError::InvalidWasm(
+                "v2 [[net.allow]] paths must be explicit and non-empty; use \"/*\" for all paths"
+                    .into(),
             ));
         }
     }
@@ -3507,9 +3618,20 @@ fn route_pattern(app_root: &Path, wasm_path: &Path) -> Result<String, PetalError
         }
         parts.push(seg.to_string());
     }
-    let Some(last) = parts.last_mut() else {
+    if parts.is_empty() {
         return Err(PetalError::InvalidWasm("empty route path".into()));
-    };
+    }
+    if let Some(reserved) = parts[..parts.len() - 1]
+        .iter()
+        .find(|segment| segment.starts_with('$'))
+    {
+        return Err(PetalError::InvalidWasm(format!(
+            "reserved route segment {reserved:?} is only allowed as a recognized route leaf"
+        )));
+    }
+    let last = parts
+        .last_mut()
+        .expect("route path was checked as non-empty");
     *last = last
         .strip_suffix(".wasm")
         .ok_or_else(|| PetalError::InvalidWasm("route leaf is not .wasm".into()))?
@@ -3746,6 +3868,9 @@ pub(crate) mod route_fixtures {
             package_import,
             false,
             true,
+            false,
+            false,
+            false,
         )
     }
 
@@ -3762,13 +3887,44 @@ pub(crate) mod route_fixtures {
             package_import,
             true,
             true,
+            false,
+            false,
+            false,
         )
     }
 
     pub(crate) fn dynamic_dir_route_component_without_list() -> Vec<u8> {
-        build_dynamic_dir_route_component(false, FixtureVfsImport::None, &[], None, false, false)
+        build_dynamic_dir_route_component(
+            false,
+            FixtureVfsImport::None,
+            &[],
+            None,
+            false,
+            false,
+            false,
+            false,
+            false,
+        )
     }
 
+    /// Builds a writable route which advertises asynchronous writes but
+    /// traps from its write handler. This exercises error propagation at the
+    /// VFS/router boundary without depending on a host capability failure.
+    pub(crate) fn async_failing_write_route_component() -> Vec<u8> {
+        build_dynamic_dir_route_component(
+            false,
+            FixtureVfsImport::None,
+            &[],
+            None,
+            false,
+            true,
+            true,
+            true,
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn build_dynamic_dir_route_component(
         import_store: bool,
         vfs: FixtureVfsImport,
@@ -3776,6 +3932,9 @@ pub(crate) mod route_fixtures {
         package_import: Option<&str>,
         side_effecting_read: bool,
         include_list: bool,
+        write_async: bool,
+        trap_write: bool,
+        file_route: bool,
     ) -> Vec<u8> {
         // String table for the metadata cap names and the lookup entry name.
         let mut strings = Vec::new();
@@ -3795,11 +3954,13 @@ pub(crate) mod route_fixtures {
 
         // Canonical-ABI encoding of result<route-meta, route-error>.
         let mut meta = vec![0u8; 88];
-        meta[8] = 0; // kind: dir
-        meta[12..16].copy_from_slice(&0o755u32.to_le_bytes());
+        meta[8] = u8::from(file_route); // kind: dir (0) or file (1)
+        let mode: u32 = if file_route { 0o666 } else { 0o755 };
+        meta[12..16].copy_from_slice(&mode.to_le_bytes());
         meta[16] = 1; // cache-ttl-ms: some
         meta[24..32].copy_from_slice(&30_000u64.to_le_bytes());
         meta[32] = u8::from(side_effecting_read);
+        meta[33] = u8::from(write_async);
         meta[60..64].copy_from_slice(&caps_array.to_le_bytes());
         meta[64..68].copy_from_slice(&(metadata_caps.len() as u32).to_le_bytes());
 
@@ -3807,8 +3968,8 @@ pub(crate) mod route_fixtures {
         let mut lookup = vec![0u8; 56];
         lookup[8..12].copy_from_slice(&name_ptr.to_le_bytes());
         lookup[12..16].copy_from_slice(&(ENTRY_NAME.len() as u32).to_le_bytes());
-        lookup[16] = 0; // kind: dir
-        lookup[20..24].copy_from_slice(&0o755u32.to_le_bytes());
+        lookup[16] = u8::from(file_route); // kind: dir (0) or file (1)
+        lookup[20..24].copy_from_slice(&mode.to_le_bytes());
         lookup[24] = 1; // size: some
         lookup[32..40].copy_from_slice(&LOOKUP_ENTRY_SIZE.to_le_bytes());
 
@@ -3879,6 +4040,13 @@ pub(crate) mod route_fixtures {
         } else {
             ""
         };
+        let core_write_func = if trap_write {
+            r#"(func $write (param i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32) (result i32)
+      unreachable)"#
+        } else {
+            r#"(func $write (param i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32) (result i32)
+      i32.const 1408)"#
+        };
         let component_list_export = if include_list {
             r#"(type $entry-list (list $entry-import))
   (type $list-result (result $entry-list (error $route-error-import)))
@@ -3948,8 +4116,7 @@ pub(crate) mod route_fixtures {
     {core_list_func}
     (func $read (param i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32) (result i32)
       i32.const {READ_RESULT})
-    (func $write (param i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32) (result i32)
-      i32.const {WRITE_RESULT})
+    {core_write_func}
     (export "memory" (memory 0))
     (export "cabi_realloc" (func $realloc))
     (export "metadata" (func $metadata))
@@ -4064,6 +4231,31 @@ name = "echo"
 
         let err = PetalAppPackage::scan_dir(tmp.path()).unwrap_err();
         assert!(err.to_string().contains("conflicting v2 routes"));
+    }
+
+    #[test]
+    fn v2_app_names_match_runtime_configuration_grammar() {
+        for valid in ["echo", "Echo2", "my-petal", "my_petal"] {
+            validate_app_name(valid).unwrap();
+        }
+        for invalid in ["", "foo.bar", "foo/bar", "foo\\bar", "petal💮"] {
+            let err = validate_app_name(invalid).unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("expected only ASCII letters, digits, '-' or '_'")
+            );
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        write_v2_package_with_manifest_and_route(
+            tmp.path(),
+            br#"schema = "bloom.petal.local-app.v2"
+name = "foo.bar"
+"#,
+            route_component_no_imports(),
+        );
+        let err = PreparedAppPackage::from_dir(tmp.path()).unwrap_err();
+        assert!(err.to_string().contains("invalid v2 app name \"foo.bar\""));
     }
 
     #[test]
@@ -4860,6 +5052,45 @@ name = "echo"
     }
 
     #[test]
+    fn v2_reserved_route_segments_are_rejected_for_directories_and_archives() {
+        for reserved in ["$private", "$index"] {
+            let tmp = tempfile::tempdir().unwrap();
+            write_v2_package(tmp.path());
+            write_package_file(
+                tmp.path(),
+                &format!("app/echo/{reserved}/bar.wasm"),
+                route_component_no_imports(),
+            );
+
+            let scan_err = PetalAppPackage::scan_dir(tmp.path()).unwrap_err();
+            assert!(scan_err.to_string().contains("reserved route segment"));
+            let package_err = PreparedAppPackage::from_dir(tmp.path()).unwrap_err();
+            assert!(package_err.to_string().contains("reserved route segment"));
+
+            let tar = package_tar_bytes(vec![
+                ("README.md", b"# echo".as_slice()),
+                ("AGENTS.md", b"# echo agents".as_slice()),
+                (
+                    "petal.toml",
+                    br#"schema = "bloom.petal.local-app.v2"
+name = "echo"
+"#
+                    .as_slice(),
+                ),
+                (
+                    &format!("app/echo/{reserved}/bar.wasm"),
+                    route_component_no_imports(),
+                ),
+            ]);
+            let tar_err = PreparedAppPackage::from_reader(std::io::Cursor::new(tar)).unwrap_err();
+            assert!(
+                tar_err.to_string().contains("reserved route segment"),
+                "unexpected archive error: {tar_err}"
+            );
+        }
+    }
+
+    #[test]
     fn v2_root_index_route_matches_empty_path() {
         let tmp = tempfile::tempdir().unwrap();
         write_package_file(tmp.path(), "petal.toml", br#"name = "echo""#);
@@ -5336,6 +5567,7 @@ allowed = ["bloom:http"]
 [[net.allow]]
 host = "api.example.com"
 methods = ["get"]
+paths = ["/*"]
 "#,
             wasm,
         );
@@ -5374,11 +5606,142 @@ allowed = ["bloom:http"]
 
 [[net.allow]]
 host = "api.example.com"
+paths = ["/*"]
 "#,
             route_component_http(),
         );
         let err = PreparedAppPackage::from_dir(empty_methods.path()).unwrap_err();
         assert!(err.to_string().contains("host and at least one method"));
+    }
+
+    #[test]
+    fn v2_network_policy_rejects_unknown_fields_and_implicit_wildcards() {
+        for (extra, expected) in [
+            (r#"path = ["/orders"]"#, "unknown field `path`"),
+            ("paths = []", "paths must be explicit and non-empty"),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let manifest = format!(
+                r#"schema = "bloom.petal.local-app.v2"
+name = "echo"
+[caps]
+allowed = ["bloom:http"]
+
+[[net.allow]]
+host = "api.example.com"
+methods = ["get"]
+{extra}
+"#
+            );
+            write_v2_package_with_manifest_and_route(
+                tmp.path(),
+                manifest.as_bytes(),
+                route_component_http(),
+            );
+            let err = PreparedAppPackage::from_dir(tmp.path()).unwrap_err();
+            assert!(err.to_string().contains(expected), "{err}");
+        }
+    }
+
+    #[test]
+    fn v2_manifest_accepts_source_metadata_and_rejects_unknown_policy_fields() {
+        let valid = r#"schema = "bloom.petal.local-app.v2"
+name = "polymarket"
+
+[source]
+kind = "github"
+repository = "bloom-directory/bloom-petal-polymarket"
+
+[build]
+command = "scripts/build.sh"
+outputs = ["app/polymarket"]
+
+[consent]
+summary = "Polymarket routes"
+
+[caps]
+allowed = ["bloom:http", "bloom:sign", "bloom:store"]
+
+[[net.allow]]
+binding = "clob"
+host = "clob.polymarket.com"
+methods = ["get"]
+paths = ["/orders"]
+
+[sign]
+allowed_intents = ["polymarket.order"]
+
+[store]
+namespaces = ["state"]
+secret_namespaces = ["secrets"]
+"#;
+        toml::from_str::<PetalToml>(valid).expect("valid GitHub source manifest");
+
+        for (section, field) in [
+            ("consent", "summry"),
+            ("caps", "allowd"),
+            ("sign", "allowed_intent"),
+            ("store", "namespace"),
+            ("source", "repo"),
+            ("build", "output"),
+        ] {
+            let manifest = format!("name = \"echo\"\n[{section}]\n{field} = []\n");
+            let err = toml::from_str::<PetalToml>(&manifest).unwrap_err();
+            assert!(
+                err.to_string().contains("unknown field"),
+                "{section}.{field} should fail closed: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn v2_consent_preserves_named_endpoint_bindings() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_v2_package_with_manifest_and_route(
+            tmp.path(),
+            br#"schema = "bloom.petal.local-app.v2"
+name = "echo"
+[caps]
+allowed = ["bloom:http"]
+
+[[net.allow]]
+binding = "clob"
+host = "clob.example.com"
+methods = ["post"]
+paths = ["/orders"]
+"#,
+            route_component_http(),
+        );
+        let package = PreparedAppPackage::from_dir(tmp.path()).unwrap();
+        let consent = app_consent_summary(&package).unwrap();
+        assert_eq!(consent.network.len(), 1);
+        assert_eq!(consent.network[0].binding.as_deref(), Some("clob"));
+        assert_eq!(consent.network[0].effective_origin, None);
+        assert_eq!(consent.network[0].paths, vec!["/orders"]);
+
+        let mut consent = consent;
+        apply_app_consent_endpoint_bindings(
+            &mut consent,
+            &BTreeMap::from([(
+                "clob".to_string(),
+                "https://clob.internal.example".to_string(),
+            )]),
+        )
+        .unwrap();
+        assert_eq!(
+            consent.network[0].effective_origin.as_deref(),
+            Some("https://clob.internal.example")
+        );
+
+        let err = apply_app_consent_endpoint_bindings(
+            &mut consent,
+            &BTreeMap::from([(
+                "undeclared".to_string(),
+                "https://other.example".to_string(),
+            )]),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("is not declared"));
     }
 
     #[test]
@@ -5403,6 +5766,7 @@ allowed = ["bloom:http"]
 [[net.allow]]
 host = "api.example.com"
 methods = ["get"]
+paths = ["/*"]
 "#,
             &route_component(&["metadata", "read"], &["bloom:http/fetch@999.0.0"]),
         );
@@ -5464,6 +5828,7 @@ allowed = ["bloom:http"]
 [[net.allow]]
 host = "api.example.com"
 methods = ["get"]
+paths = ["/*"]
 "#,
             &route_component_with_func_import("bloom:http/fetch@0.1.0"),
         );
@@ -5485,6 +5850,7 @@ allowed = ["bloom:http"]
 [[net.allow]]
 host = "api.example.com"
 methods = ["get"]
+paths = ["/*"]
 "#,
             &route_component(&["metadata", "read"], &["bloom:http/fetch@0.1.0"]),
         );

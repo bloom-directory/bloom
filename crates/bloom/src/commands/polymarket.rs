@@ -2109,7 +2109,7 @@ pub async fn fund(d: &Daemon, args: FundArgs) -> Result<()> {
             .await
         {
             Ok(s) => s,
-            Err(TxEngineError::BroadcastApprovalRequired(_)) if passkey_wallet => {
+            Err(TxEngineError::ApprovalRequired(_)) if passkey_wallet => {
                 // In-band sealed-approval ceremony, mirroring `wallet confirm`
                 // (main.rs): the confirm path wrote an approval_challenge.json;
                 // run the browser ceremony to sign it, then retry the confirm.
@@ -2360,7 +2360,7 @@ async fn transfer_pusd_to_funding(
         .await
     {
         Ok(c) => c,
-        Err(TxEngineError::BroadcastApprovalRequired(_)) if passkey_wallet => {
+        Err(TxEngineError::ApprovalRequired(_)) if passkey_wallet => {
             // In-band sealed-approval ceremony, mirroring the fund-swap
             // confirm loop: the confirm path wrote an
             // approval_challenge.json; run the browser ceremony to sign it,

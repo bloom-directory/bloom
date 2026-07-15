@@ -2269,7 +2269,7 @@ async fn run(cli: Cli) -> Result<()> {
             };
             let staged = match confirm_once().await {
                 Ok(staged) => staged,
-                Err(TxEngineError::BroadcastApprovalRequired(reason)) if passkey_wallet => {
+                Err(TxEngineError::ApprovalRequired(requirement)) if passkey_wallet => {
                     if sign_outbox_sealed_approval_if_challenged(
                         &d,
                         &wallet,
@@ -2281,7 +2281,7 @@ async fn run(cli: Cli) -> Result<()> {
                     {
                         confirm_once().await?
                     } else {
-                        return Err(TxEngineError::BroadcastApprovalRequired(reason).into());
+                        return Err(TxEngineError::ApprovalRequired(requirement).into());
                     }
                 }
                 Err(e) => return Err(e.into()),
@@ -2470,7 +2470,7 @@ async fn run(cli: Cli) -> Result<()> {
                 };
                 let staged = match confirm_once().await {
                     Ok(staged) => staged,
-                    Err(TxEngineError::BroadcastApprovalRequired(reason)) if passkey_wallet => {
+                    Err(TxEngineError::ApprovalRequired(requirement)) if passkey_wallet => {
                         if sign_outbox_sealed_approval_if_challenged(
                             &d,
                             &wallet,
@@ -2485,7 +2485,7 @@ async fn run(cli: Cli) -> Result<()> {
                                 .await
                                 .with_context(|| format!("confirm {chain}:{id}"))?
                         } else {
-                            return Err(TxEngineError::BroadcastApprovalRequired(reason).into());
+                            return Err(TxEngineError::ApprovalRequired(requirement).into());
                         }
                     }
                     Err(e) => {
@@ -2505,7 +2505,6 @@ async fn run(cli: Cli) -> Result<()> {
         Cmd::Serve { endpoint, mount } => {
             eprintln!("{ALPHA_DISCLOSURE}");
             let (_home_permit, d) = build_write_daemon(home)?;
-            d.enable_petal_async_writes();
             // Spawn the outbox expiry sweeper for the lifetime of the
             // serve command (fix #3). The handle is dropped (and the task
             // signalled to stop) right before the function returns.
@@ -2825,8 +2824,9 @@ async fn run_petals(home: HomeDir, cmd: PetalsCmd) -> Result<()> {
     match cmd {
         PetalsCmd::Install { path, ref_ } => {
             if let Some(repo) = github_source::parse_github_install_url(&path)? {
-                let installed =
+                let mut installed =
                     github_source::install_github_source(&home, &d, &repo, ref_.as_deref())?;
+                apply_configured_app_endpoints(&d, &mut installed.consent)?;
                 println!();
                 println!("hash: {}", installed.result.hash);
                 println!("mode: local-app");
@@ -2870,8 +2870,9 @@ async fn run_petals(home: HomeDir, cmd: PetalsCmd) -> Result<()> {
                 bloom_petals::v2::PreparedAppPackage::from_petal_tar(&path)
                     .with_context(|| format!("read app package archive {path}"))?
             };
-            let consent = bloom_petals::v2::app_consent_summary(&consent_package)
+            let mut consent = bloom_petals::v2::app_consent_summary(&consent_package)
                 .context("build app consent summary")?;
+            apply_configured_app_endpoints(&d, &mut consent)?;
             let (result, meta, index) = if is_app_dir {
                 d.petals
                     .store()
@@ -2956,12 +2957,7 @@ fn print_v2_app_consent(summary: &bloom_petals::v2::AppConsentSummary) {
     if !summary.network.is_empty() {
         println!("  network:");
         for rule in &summary.network {
-            println!(
-                "    - host={} methods=[{}] paths=[{}]",
-                rule.host,
-                rule.methods.join(","),
-                rule.paths.join(",")
-            );
+            println!("{}", format_v2_app_consent_net_rule(rule));
         }
     }
     if !summary.sign_intents.is_empty() {
@@ -3011,6 +3007,43 @@ fn print_v2_app_consent(summary: &bloom_petals::v2::AppConsentSummary) {
             }
         }
     }
+}
+
+fn apply_configured_app_endpoints(
+    daemon: &Daemon,
+    summary: &mut bloom_petals::v2::AppConsentSummary,
+) -> Result<()> {
+    let bindings = daemon
+        .config
+        .petals
+        .apps
+        .get(&summary.name)
+        .map(|app| &app.endpoints)
+        .cloned()
+        .unwrap_or_default();
+    bloom_petals::v2::apply_app_consent_endpoint_bindings(summary, &bindings)
+        .context("apply configured Petal endpoint bindings")
+}
+
+fn format_v2_app_consent_net_rule(rule: &bloom_petals::v2::AppConsentNetRule) -> String {
+    let binding = rule
+        .binding
+        .as_deref()
+        .map(|binding| format!(" binding={binding}"))
+        .unwrap_or_default();
+    let effective = rule
+        .effective_origin
+        .as_deref()
+        .map(|origin| format!(" effective_origin={origin}"))
+        .unwrap_or_default();
+    format!(
+        "    - declared_host={}{}{} methods=[{}] paths=[{}]",
+        rule.host,
+        binding,
+        effective,
+        rule.methods.join(","),
+        rule.paths.join(",")
+    )
 }
 
 #[cfg(feature = "mount")]
@@ -4807,11 +4840,27 @@ async fn unmount_bloom(handle: Option<()>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        polymarket_fund_confirm_write, polymarket_redeem_confirm_write,
-        polymarket_revoke_approvals_confirm_write, polymarket_trade_confirm_write,
-        polymarket_withdraw_pusd_confirm_write, request_body_with_wallet,
+        format_v2_app_consent_net_rule, polymarket_fund_confirm_write,
+        polymarket_redeem_confirm_write, polymarket_revoke_approvals_confirm_write,
+        polymarket_trade_confirm_write, polymarket_withdraw_pusd_confirm_write,
+        request_body_with_wallet,
     };
     use bloom_vfs::VfsPath;
+
+    #[test]
+    fn petal_consent_network_line_includes_named_binding() {
+        let line = format_v2_app_consent_net_rule(&bloom_petals::v2::AppConsentNetRule {
+            binding: Some("clob".into()),
+            host: "clob.polymarket.com".into(),
+            effective_origin: Some("https://clob.internal.example".into()),
+            methods: vec!["POST".into()],
+            paths: vec!["/order".into()],
+        });
+        assert_eq!(
+            line,
+            "    - declared_host=clob.polymarket.com binding=clob effective_origin=https://clob.internal.example methods=[POST] paths=[/order]"
+        );
+    }
 
     #[test]
     fn request_wallet_injection_preserves_http_message_body() {

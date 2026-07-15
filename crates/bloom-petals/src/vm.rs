@@ -76,6 +76,7 @@ pub struct StoreData {
     private_store: Option<PrivateStore>,
     deterministic_env: bool,
     runtime_settings: BTreeMap<String, String>,
+    limiter: MemLimiter,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -234,6 +235,7 @@ impl PetalVm {
                 http_response_cap: opts.http_response_cap,
                 deterministic_env: opts.deterministic_env,
                 runtime_settings: opts.runtime_settings.clone(),
+                limiter: MemLimiter::new(opts.memory_pages),
                 private_store: match opts.private_store_root.clone() {
                     Some(root) => Some(
                         PrivateStore::open(root)
@@ -246,11 +248,7 @@ impl PetalVm {
         store
             .set_fuel(opts.fuel)
             .map_err(|e| PetalError::vm(e.to_string()))?;
-        store.limiter(move |_| {
-            // Box-leak a per-store limiter. Simpler than threading a
-            // separate field on StoreData; we only need the page cap.
-            Box::leak(Box::new(MemLimiter::new(opts.memory_pages)))
-        });
+        store.limiter(|data| &mut data.limiter);
 
         let mut linker = Linker::<StoreData>::new(&self.engine);
         link_wasi_for_mode(&mut linker, mode).map_err(|e| PetalError::vm(e.to_string()))?;
@@ -312,6 +310,7 @@ impl PetalVm {
                 http_response_cap: opts.http_response_cap,
                 deterministic_env: opts.deterministic_env,
                 runtime_settings: opts.runtime_settings.clone(),
+                limiter: MemLimiter::new(opts.memory_pages),
                 private_store: match opts.private_store_root.clone() {
                     Some(root) => Some(
                         PrivateStore::open(root)
@@ -324,7 +323,7 @@ impl PetalVm {
         store
             .set_fuel(opts.fuel)
             .map_err(|e| PetalError::vm(e.to_string()))?;
-        store.limiter(move |_| Box::leak(Box::new(MemLimiter::new(opts.memory_pages))));
+        store.limiter(|data| &mut data.limiter);
 
         let mut linker = ComponentLinker::<StoreData>::new(&self.engine);
         linker
@@ -385,6 +384,7 @@ impl PetalVm {
                 http_response_cap: opts.http_response_cap,
                 deterministic_env: opts.deterministic_env,
                 runtime_settings: opts.runtime_settings.clone(),
+                limiter: MemLimiter::new(opts.memory_pages),
                 private_store: match opts.private_store_root.clone() {
                     Some(root) => Some(
                         PrivateStore::open(root)
@@ -397,7 +397,7 @@ impl PetalVm {
         store
             .set_fuel(opts.fuel)
             .map_err(|e| PetalError::vm(e.to_string()))?;
-        store.limiter(move |_| Box::leak(Box::new(MemLimiter::new(opts.memory_pages))));
+        store.limiter(|data| &mut data.limiter);
 
         let mut linker = ComponentLinker::<StoreData>::new(&self.engine);
         linker
@@ -1267,10 +1267,12 @@ async fn component_sign_hashes_v2(
         Ok(req) => req,
         Err(err) => return set_component_result(results, component_host_err(err)),
     };
+    let expected_signatures = req.requests.len();
     let host = store.data().host.clone();
     match host.sign_hashes_outcome(req).await {
         Ok(SignBatchOutcome::Signatures(signatures))
-            if signatures.iter().all(|signature| signature.len() == 65) =>
+            if signatures.len() == expected_signatures
+                && signatures.iter().all(|signature| signature.len() == 65) =>
         {
             set_component_result(
                 results,
@@ -1280,6 +1282,15 @@ async fn component_sign_hashes_v2(
                         signatures.into_iter().map(component_bytes).collect(),
                     ))),
                 ))))),
+            )
+        }
+        Ok(SignBatchOutcome::Signatures(signatures)) if signatures.len() != expected_signatures => {
+            set_component_result(
+                results,
+                component_host_err(HostError::Backend(format!(
+                    "sign_hashes returned {} signatures for {expected_signatures} requests",
+                    signatures.len()
+                ))),
             )
         }
         Ok(SignBatchOutcome::Signatures(_)) => set_component_result(
@@ -2343,6 +2354,17 @@ struct MemLimiter {
     max_pages: usize,
 }
 
+#[cfg(test)]
+static DROPPED_MEM_LIMITERS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+impl Drop for MemLimiter {
+    fn drop(&mut self) {
+        DROPPED_MEM_LIMITERS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 impl MemLimiter {
     fn new(pages: u32) -> Self {
         Self {
@@ -2438,6 +2460,18 @@ mod tests {
         assert!(out.fuel_consumed > 0);
     }
 
+    #[test]
+    fn store_data_owns_and_drops_its_memory_limiter() {
+        let before = DROPPED_MEM_LIMITERS.load(std::sync::atomic::Ordering::SeqCst);
+        let store = component_test_store(BTreeSet::new(), None, Arc::new(DenyHost));
+        drop(store);
+        let after = DROPPED_MEM_LIMITERS.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            after > before,
+            "dropping a Wasmtime store must drop its owned memory limiter"
+        );
+    }
+
     /// Petal that writes to stdout via `fd_write`. We do this by
     /// composing a tiny WASI command that writes a fixed buffer.
     const HELLO_WASI: &str = r#"
@@ -2530,6 +2564,8 @@ mod tests {
         http_calls: Mutex<Vec<HttpRequest>>,
         sign_calls: Mutex<Vec<SignRequest>>,
         sign_outcome: Mutex<Option<SignOutcome>>,
+        sign_batch_calls: Mutex<Vec<SignBatchRequest>>,
+        sign_batch_outcome: Mutex<Option<SignBatchOutcome>>,
         tx_stage_calls: Mutex<Vec<EvmTransactionRequest>>,
         tx_confirm_calls: Mutex<Vec<TxConfirmCall>>,
         tx_inspect_calls: Mutex<Vec<TxInspectCall>>,
@@ -2612,6 +2648,18 @@ mod tests {
                 .lock()
                 .clone()
                 .unwrap_or_else(|| SignOutcome::Signature(vec![7u8; 65])))
+        }
+
+        async fn sign_hashes_outcome(
+            &self,
+            req: SignBatchRequest,
+        ) -> Result<SignBatchOutcome, HostError> {
+            self.sign_batch_calls.lock().push(req);
+            Ok(self
+                .sign_batch_outcome
+                .lock()
+                .clone()
+                .unwrap_or_else(|| SignBatchOutcome::Signatures(vec![vec![7u8; 65]])))
         }
 
         async fn evm_tx_stage(
@@ -3130,6 +3178,10 @@ mod tests {
         caps.insert(Capability::VfsWrite);
         let policy = NetPolicy::from_v2_manifest_toml(
             br#"
+name = "echo"
+[caps]
+allowed = ["bloom:http"]
+
 [[net.allow]]
 host = "api.example.com"
 methods = ["GET"]
@@ -3339,6 +3391,73 @@ paths = ["/status"]
     }
 
     #[tokio::test]
+    async fn component_sign_batch_requires_exactly_one_valid_signature_per_request() {
+        let host = Arc::new(MockHost::default());
+        let mut caps = BTreeSet::new();
+        caps.insert(Capability::Sign);
+        let mut store = component_test_store(caps, None, host.clone());
+        let request = |wallet: &str, byte: u8| {
+            ComponentVal::Record(vec![
+                ("wallet".into(), ComponentVal::String(wallet.into())),
+                ("hash32".into(), component_bytes(vec![byte; 32])),
+                ("intent".into(), ComponentVal::String("orders.place".into())),
+            ])
+        };
+        let params = [ComponentVal::List(vec![
+            request("alice", 1),
+            request("bob", 2),
+        ])];
+
+        *host.sign_batch_outcome.lock() = Some(SignBatchOutcome::Signatures(vec![
+            vec![1u8; 65],
+            vec![2u8; 65],
+        ]));
+        let mut exact = vec![ComponentVal::Bool(false)];
+        component_sign_hashes_v2(store.as_context_mut(), &params, &mut exact)
+            .await
+            .unwrap();
+        let ComponentVal::Result(Ok(Some(value))) = &exact[0] else {
+            panic!("expected successful batch result: {:?}", exact[0]);
+        };
+        let ComponentVal::Variant(name, Some(signatures)) = value.as_ref() else {
+            panic!("expected signatures variant: {value:?}");
+        };
+        assert_eq!(name, "signatures");
+        let ComponentVal::List(signatures) = signatures.as_ref() else {
+            panic!("expected signature list: {signatures:?}");
+        };
+        assert_eq!(
+            signatures
+                .iter()
+                .map(|signature| component_byte_list(signature, "signature").unwrap()[0])
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+
+        for (signatures, expected_error) in [
+            (vec![], "returned 0 signatures for 2 requests"),
+            (vec![vec![1u8; 65]], "returned 1 signatures for 2 requests"),
+            (
+                vec![vec![1u8; 65], vec![2u8; 65], vec![3u8; 65]],
+                "returned 3 signatures for 2 requests",
+            ),
+            (vec![vec![1u8; 65], vec![2u8; 64]], "non-65-byte signature"),
+        ] {
+            *host.sign_batch_outcome.lock() = Some(SignBatchOutcome::Signatures(signatures));
+            let mut result = vec![ComponentVal::Bool(false)];
+            component_sign_hashes_v2(store.as_context_mut(), &params, &mut result)
+                .await
+                .unwrap();
+            assert_component_err_contains(&result[0], expected_error);
+        }
+
+        let calls = host.sign_batch_calls.lock();
+        assert_eq!(calls.len(), 5);
+        assert_eq!(calls[0].requests[0].wallet, "alice");
+        assert_eq!(calls[0].requests[1].wallet, "bob");
+    }
+
+    #[tokio::test]
     async fn component_evm_outbox_is_capability_gated_and_preserves_trusted_context() {
         let host = Arc::new(MockHost::default());
         let transaction = ComponentVal::Record(vec![
@@ -3460,6 +3579,10 @@ paths = ["/status"]
         .unwrap();
         let policy = NetPolicy::from_v2_manifest_toml(
             br#"
+name = "echo"
+[caps]
+allowed = ["bloom:http"]
+
 [[net.allow]]
 host = "api.example.com"
 methods = ["GET"]
@@ -3555,6 +3678,7 @@ paths = ["/status"]
                 http_response_cap: DEFAULT_HTTP_RESPONSE_CAP,
                 deterministic_env: false,
                 runtime_settings: BTreeMap::new(),
+                limiter: MemLimiter::new(DEFAULT_MEMORY_PAGES),
                 private_store,
             },
         )
