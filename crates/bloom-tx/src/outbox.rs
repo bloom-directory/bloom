@@ -1080,12 +1080,11 @@ fn parse_sent_entry(
             max_fee_per_gas,
             max_priority_fee_per_gas,
         }
-    } else if let Some(gp) = staged.gas_price.as_deref() {
+    } else {
+        let gp = staged.gas_price.as_deref()?;
         bloom_mempool::TxFees::Legacy {
             gas_price: gp.parse::<u128>().ok()?,
         }
-    } else {
-        return None;
     };
     // intent.json is written once at entry creation and never modified;
     // its mtime is therefore a stable proxy for when the tx was sent.
