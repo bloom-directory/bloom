@@ -569,6 +569,96 @@ fn vfs_default_missing_socket_falls_back_in_process() {
 }
 
 #[test]
+fn vfs_ls_status_includes_update_subtree() {
+    let home = fresh_home();
+    let out = bloom_cmd(home.path())
+        .args(["vfs", "ls", "/status"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    assert!(
+        stdout.contains("update"),
+        "expected `update` in ls /status, got:\n{stdout}"
+    );
+}
+
+#[test]
+fn vfs_cat_status_update_installed_matches_pkg_version() {
+    let home = fresh_home();
+    let expected = format!("{}\n", env!("CARGO_PKG_VERSION"));
+    bloom_cmd(home.path())
+        .args(["vfs", "cat", "/status/update/installed"])
+        .assert()
+        .success()
+        .stdout(predicate::eq(expected));
+}
+
+#[test]
+fn vfs_cat_status_update_when_no_cache_reports_unknown() {
+    let home = fresh_home();
+    bloom_cmd(home.path())
+        .args(["vfs", "cat", "/status/update/available"])
+        .assert()
+        .success()
+        .stdout(predicate::eq("unknown\n"));
+    bloom_cmd(home.path())
+        .args(["vfs", "cat", "/status/update/latest"])
+        .assert()
+        .success()
+        .stdout(predicate::eq("\n"));
+    bloom_cmd(home.path())
+        .args(["vfs", "cat", "/status/update/behind_by"])
+        .assert()
+        .success()
+        .stdout(predicate::eq("0\n"));
+}
+
+#[test]
+fn vfs_cat_status_update_with_seed_cache_reports_behind() {
+    let home = fresh_home();
+    let cache_dir = home.path().join("cache");
+    std::fs::create_dir_all(&cache_dir).unwrap();
+    let cache = serde_json::json!({
+        "version": 1,
+        "installed": "0.1.0",
+        "latest": "0.2.0",
+        "release_url": "https://github.com/bloom-directory/bloom/releases/tag/v0.2.0",
+        "checked_at": null,
+        "status": "ok"
+    });
+    std::fs::write(
+        cache_dir.join("update_cache.json"),
+        serde_json::to_vec_pretty(&cache).unwrap(),
+    )
+    .unwrap();
+    bloom_cmd(home.path())
+        .args(["vfs", "cat", "/status/update/latest"])
+        .assert()
+        .success()
+        .stdout(predicate::eq("0.2.0\n"));
+    bloom_cmd(home.path())
+        .args(["vfs", "cat", "/status/update/available"])
+        .assert()
+        .success()
+        .stdout(predicate::eq(if env!("CARGO_PKG_VERSION") == "0.1.0" {
+            "out_of_date\n"
+        } else {
+            "up_to_date\n"
+        }));
+}
+
+#[test]
+fn bloom_update_status_prints_cached_snapshot() {
+    let home = fresh_home();
+    bloom_cmd(home.path())
+        .args(["update", "status"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"installed\""))
+        .stdout(predicate::str::contains("\"status\""));
+}
+
+#[test]
 fn vfs_explicit_missing_endpoint_fails_closed() {
     let home = fresh_home();
     let socket = home.path().join("run").join("missing.sock");

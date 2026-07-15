@@ -231,6 +231,10 @@ enum Cmd {
     /// Hyperliquid HyperCore reads and tightly scoped test actions.
     #[command(subcommand)]
     Hyperliquid(HyperliquidCmd),
+    /// Check for newer bloom releases on GitHub and inspect the
+    /// current update-checker state.
+    #[command(subcommand)]
+    Update(UpdateCmd),
     /// Initialise ~/.bloom with default config + dirs.
     Init,
 
@@ -535,6 +539,16 @@ enum RequestCmd {
     Body { id: String },
     /// Print receipt JSON for an id or `latest`.
     Receipt { id: String },
+}
+
+/// Subcommands for `bloom update`.
+#[derive(Subcommand, Debug)]
+enum UpdateCmd {
+    /// Force a refresh against GitHub and print the result as JSON.
+    /// Exits 0 if up to date, 1 if behind, 2 if unknown/error.
+    Check,
+    /// Print the cached snapshot without making a network call.
+    Status,
 }
 
 #[derive(Subcommand, Debug)]
@@ -1326,6 +1340,23 @@ async fn run(cli: Cli) -> Result<()> {
             } else {
                 println!("deposit: bloom wallet address <wallet> --qr");
                 println!("agent workflow: browse the mounted VFS or use bloom vfs cat/ls/write");
+            }
+            if let Some(snap) = d.update_checker.quick_check_cached() {
+                let latest = snap.latest.as_deref().unwrap_or("?");
+                let available = match snap.available() {
+                    bloom_update::UpdateAvailable::OutOfDate => "out_of_date",
+                    bloom_update::UpdateAvailable::UpToDate => "up_to_date",
+                    bloom_update::UpdateAvailable::Unknown => "unknown",
+                };
+                println!("latest_release: {}", latest);
+                println!("update_available: {}", available);
+                if matches!(snap.available(), bloom_update::UpdateAvailable::OutOfDate) {
+                    eprintln!(
+                        "hint: bloom v{} is available (you have v{}); see /status/update",
+                        latest,
+                        env!("CARGO_PKG_VERSION")
+                    );
+                }
             }
             Ok(())
         }
@@ -2863,6 +2894,7 @@ async fn run(cli: Cli) -> Result<()> {
             }
         }
         Cmd::Hyperliquid(cmd) => handle_hyperliquid(home, &client_endpoint, cmd).await,
+        Cmd::Update(cmd) => handle_update(&home, cmd).await,
         Cmd::Petals(cmd) => {
             let _home_permit = HomeWritePermit::acquire(&home)?;
             run_petals(home, cmd).await
@@ -4408,6 +4440,34 @@ async fn handle_hyperliquid(
                 },
             )
             .await
+        }
+    }
+}
+
+async fn handle_update(home: &HomeDir, cmd: UpdateCmd) -> Result<()> {
+    match cmd {
+        UpdateCmd::Status => {
+            let installed = env!("CARGO_PKG_VERSION");
+            let snap = bloom_update::read_cache_only(installed, &home.cache_dir());
+            let json = serde_json::to_string_pretty(&snap).context("serialise update snapshot")?;
+            println!("{json}");
+            Ok(())
+        }
+        UpdateCmd::Check => {
+            let d = Daemon::from_home(home.clone()).context("build daemon")?;
+            let snap = d.update_checker.refresh().await;
+            let json = serde_json::to_string_pretty(&snap).context("serialise update snapshot")?;
+            println!("{json}");
+            let code = match snap.available() {
+                bloom_update::UpdateAvailable::OutOfDate => 1,
+                bloom_update::UpdateAvailable::UpToDate => 0,
+                bloom_update::UpdateAvailable::Unknown => 2,
+            };
+            d.shutdown().await;
+            if code != 0 {
+                std::process::exit(code);
+            }
+            Ok(())
         }
     }
 }

@@ -2269,6 +2269,7 @@ dependencies = [
  "bloom-polymarket",
  "bloom-proto",
  "bloom-tx",
+ "bloom-update",
  "bloom-vfs",
  "clap",
  "clap_complete",
@@ -2344,6 +2345,7 @@ dependencies = [
  "bloom-proto",
  "bloom-revert",
  "bloom-tx",
+ "bloom-update",
  "bloom-vfs",
  "bloom-watch",
  "futures",
@@ -2762,6 +2764,20 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "toml 0.8.23",
+ "tracing",
+]
+
+[[package]]
+name = "bloom-update"
+version = "0.1.0"
+dependencies = [
+ "parking_lot",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
  "tracing",
 ]
 
