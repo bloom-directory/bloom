@@ -9,7 +9,6 @@ use crate::path::VfsPath;
 pub struct DocsHandler {
     readme: String,
     examples: String,
-    agent_guidance: String,
 }
 
 impl Default for DocsHandler {
@@ -17,7 +16,6 @@ impl Default for DocsHandler {
         Self {
             readme: include_str!("../docs/README.md").to_string(),
             examples: include_str!("../docs/examples.md").to_string(),
-            agent_guidance: include_str!("../docs/agent-guidance.md").to_string(),
         }
     }
 }
@@ -61,7 +59,6 @@ impl DocsHandler {
             [] => Ok(Entry::dir("")),
             [s] if s == "README.md" => Ok(Entry::file("README.md")),
             [s] if s == "examples.md" => Ok(Entry::file("examples.md")),
-            [s] if s == "agent-guidance.md" => Ok(Entry::file("agent-guidance.md")),
             _ => Err(HandlerError::not_found(path.to_string_path())),
         }
     }
@@ -70,18 +67,13 @@ impl DocsHandler {
         match path.segments() {
             [s] if s == "README.md" => Ok(self.readme.as_bytes().to_vec()),
             [s] if s == "examples.md" => Ok(self.examples.as_bytes().to_vec()),
-            [s] if s == "agent-guidance.md" => Ok(self.agent_guidance.as_bytes().to_vec()),
             _ => Err(HandlerError::NotAFile(path.to_string_path())),
         }
     }
 
     async fn list_inner(&self, path: &VfsPath) -> Result<Vec<Entry>, HandlerError> {
         if path.is_root() {
-            Ok(vec![
-                Entry::file("README.md"),
-                Entry::file("examples.md"),
-                Entry::file("agent-guidance.md"),
-            ])
+            Ok(vec![Entry::file("README.md"), Entry::file("examples.md")])
         } else {
             Err(HandlerError::NotADir(path.to_string_path()))
         }
@@ -94,13 +86,11 @@ mod tests {
     use crate::handler::EntryKind;
 
     #[tokio::test]
-    async fn root_lists_readme_and_examples() {
+    async fn root_lists_only_readme_and_examples() {
         let h = DocsHandler::new();
         let entries = h.list(&VfsPath::root()).await.unwrap();
         let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
-        assert!(names.contains(&"README.md"), "names={names:?}");
-        assert!(names.contains(&"examples.md"), "names={names:?}");
-        assert!(names.contains(&"agent-guidance.md"), "names={names:?}");
+        assert_eq!(names, ["README.md", "examples.md"]);
         for e in &entries {
             assert_eq!(e.kind, EntryKind::File);
             // Entry::file => read-only mode.
@@ -129,12 +119,27 @@ mod tests {
     #[tokio::test]
     async fn lookup_known_files_are_files() {
         let h = DocsHandler::new();
-        for name in ["README.md", "examples.md", "agent-guidance.md"] {
+        for name in ["README.md", "examples.md"] {
             let p = VfsPath::parse(&format!("/{name}")).unwrap();
             let e = h.lookup(&p).await.unwrap();
             assert_eq!(e.kind, EntryKind::File);
             assert_eq!(e.name, name);
         }
+    }
+
+    #[tokio::test]
+    async fn agent_guidance_is_not_exposed_under_docs() {
+        let h = DocsHandler::new();
+        let path = VfsPath::parse("/agent-guidance.md").unwrap();
+
+        assert!(matches!(
+            h.lookup(&path).await,
+            Err(HandlerError::NotFound(_))
+        ));
+        assert!(matches!(
+            h.read(&path).await,
+            Err(HandlerError::NotAFile(_))
+        ));
     }
 
     #[tokio::test]

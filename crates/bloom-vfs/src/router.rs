@@ -22,6 +22,7 @@ use crate::cache::PathCache;
 use crate::handler::{Entry, EntryKind, Handler, HandlerError};
 use crate::path::VfsPath;
 
+// This source document is exposed only through the two mount-root aliases below.
 const AGENT_GUIDANCE: &[u8] = include_bytes!("docs/agent-guidance.md");
 const AGENT_GUIDANCE_FILES: [&str; 2] = ["AGENTS.md", "CLAUDE.md"];
 

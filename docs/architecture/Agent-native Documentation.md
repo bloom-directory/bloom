@@ -25,8 +25,8 @@ How it works today:
   listings include both filenames, lookups return a read-only file entry
   (mode `0o444`), and reads return the embedded bytes verbatim. Writes are
   not routable to these paths.
-- The same content is also readable at `/docs/agent-guidance.md` through the
-  docs handler, alongside `/docs/README.md` and `/docs/examples.md`.
+- The source filename is not exposed through `/docs`; the guidance is only
+  readable through the root `AGENTS.md` and `CLAUDE.md` aliases.
 
 Because the content is compiled into the Bloom Machine, the documentation an agent
 reads is always the documentation of the exact binary serving the mount.

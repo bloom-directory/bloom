@@ -134,12 +134,24 @@ VFS policy write) with the signed-policy error; the mounted flow does not repair
 it. Recovering an externally-broken policy needs the admin helper
 `bloom wallet sign-policy <wallet>`, not this edit surface.
 
-## Paid HTTP
+## Paid HTTP (x402 and MPP)
 
 Paid HTTP requests live under `requests`. Agents should stage the request,
 read `plan.md`, and confirm only when the quoted cost, network, asset, and
-merchant match the task. Bloom handles x402 and Tempo MPP internally; agents
-should not look for separate `/x402` or `/mpp` paths.
+merchant match the task. Bloom handles both x402 and MPP internally.
+
+### Selecting the payment protocol
+
+Bloom handles credentials and settlement internally, but the merchant may use
+request headers to select its payment rail.
+
+For a merchant supporting both x402 and MPP:
+
+- No negotiation header may default to x402.
+- To request MPP, include the negotiation header
+  `authorization: Payment` in the staged request.
+
+### Approval
 
 If paid confirmation needs passkey approval, the first confirm write may return
 permission denied after writing
@@ -163,7 +175,7 @@ the sealed subject, or `private/request_body` no longer matches the sealed body
 hash, confirmation fails before signing or minting credentials. Live policy may
 narrow or deny, but it cannot widen the already sealed payment terms.
 
-Example paid search:
+### Examples
 
 ```sh
 cat > requests/new <<'REQUEST'
@@ -192,6 +204,17 @@ content-type: application/json
 
 {"user":"0x..."}
 REQUEST
+
+# MPP forced based on presence of `authorization: Payment` header
+cat > requests/new <<'REQUEST'
+POST https://api.nansen.ai/api/v1/smart-money/netflow wallet=<wallet>max_amount_usd=0.10
+content-type: application/json
+accept: application/json
+authorization: Payment
+
+{"chains":["ethereum"],"filters":{"token_sectors":["DeFi"],"include_stablecoins":false},"pagination":{"page":1,"per_page":10},"order_by":[{"field":"net_flow_7d_usd","direction":"ASC"}]}
+REQUEST
+
 
 # Polymarket ghost-fill risk.
 cat > requests/new <<'REQUEST'
