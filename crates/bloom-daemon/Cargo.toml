@@ -9,10 +9,10 @@ description = "Daemon library wiring VFS + chain + tx + mount for bloom"
 doctest = false
 
 [features]
-default = []
+default = ["mount"]
 # Forward to bloom-mount/mount: enables `Daemon::mount(path)` and pulls
-# in the embednfs server. Off by default so the default daemon build
-# stays portable (no embednfs git dep, no kernel NFS tooling).
+# in the embednfs server. Portable builds can opt out with
+# `--no-default-features`.
 mount = ["bloom-mount/mount"]
 # Forward to bloom-revert/bytecode-decompile: appends the heimdall-rs
 # decompile fallback to the revert-decoder chain. Heavy build (heimdall

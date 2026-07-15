@@ -72,7 +72,7 @@ running Anvil node.
 Mount Bloom first, then interact with it like a directory:
 
 ```sh
-cargo build -p bloom --all-features
+cargo build -p bloom
 cargo run -p bloom -- init
 mkdir -p "$HOME/bloom"
 cargo run -p bloom -- serve --mount "$HOME/bloom"
@@ -121,11 +121,14 @@ cargo test -p bloom --no-default-features
 cargo test --workspace --lib
 ```
 
-Build the mount-capable CLI with:
+Mount support is included in the default CLI build:
 
 ```sh
-cargo build -p bloom --all-features
+cargo build -p bloom
 ```
+
+Portable builds can omit the NFS mount adapter with
+`cargo build -p bloom --no-default-features`.
 
 ## Filesystem layout
 

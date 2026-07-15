@@ -10,8 +10,9 @@ name = "bloom"
 path = "src/main.rs"
 
 [features]
-default = []
-# Enable the embedded NFS mount adapter through the daemon crate.
+default = ["mount"]
+# Enable the embedded NFS mount adapter through the daemon crate. This remains
+# a named feature so portable builds can opt out with `--no-default-features`.
 mount = ["bloom-daemon/mount", "dep:bloom-mount"]
 # Pass-through for the heimdall-rs decompile decoder. Build with
 # `cargo build --features bytecode-decompile` to enable.
