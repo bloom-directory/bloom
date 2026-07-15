@@ -7,23 +7,20 @@ name: Release
 #
 # Flow:
 #   1. `prepare` resolves and validates the tag (vX.Y.Z).
-#   2. `bump` checks out the tag, edits [workspace.package] version, runs
-#      `cargo update --workspace` (which only touches the 26 workspace
-#      member version fields — no transitive dep churn), commits the
-#      change to a `release/vX.Y.Z` branch, and reports that commit's
-#      SHA so the publish step points at the *built* commit, not the
-#      original tag commit.
-#   3. `build` checks out `release/vX.Y.Z` and runs `cargo build --locked`
+#   2. `prepare_release` either validates that an existing tag already
+#      points at a version-bumped commit, or (for workflow_dispatch)
+#      creates the bump commit and tag together. It also mirrors the
+#      immutable release SHA to `release/vX.Y.Z` for maintainers.
+#   3. `build` checks out that exact SHA and runs `cargo build --locked`
 #      on each of the four native runners. A verify step asserts that
 #      `bloom --version` matches the tag.
-#   4. `publish` downloads the four tarballs, generates SHA256SUMS, and
-#      `gh release create vX.Y.Z --latest` — pointing at the bump
-#      branch HEAD (not the original tag commit).
+#   4. `publish` verifies the tag still resolves to the built SHA,
+#      downloads the four tarballs, generates SHA256SUMS, and creates
+#      or updates the GitHub release for that existing tag.
 #
-# The floating `latest` git tag is intentionally NOT touched here. It
-# continues to track master and powers the
-#   https://github.com/<owner>/<repo>/releases/latest/download/<file>
-# redirect, independent of the release object the API endpoint returns.
+# The floating `latest` git tag is intentionally NOT touched here.
+# GitHub's `/releases/latest/download/<file>` route follows whichever
+# release is marked latest; it does not require a git tag named `latest`.
 
 on:
   push:
@@ -32,7 +29,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Tag to release (e.g. v0.1.1). Tag must already exist on origin.'
+        description: 'Tag to create or retry (e.g. v0.1.1).'
         required: true
         type: string
 
@@ -54,6 +51,7 @@ jobs:
       release_tag: ${{ steps.meta.outputs.release_tag }}
       release_version: ${{ steps.meta.outputs.release_version }}
       release_ref: ${{ steps.meta.outputs.release_ref }}
+      tag_exists: ${{ steps.meta.outputs.tag_exists }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -67,24 +65,31 @@ jobs:
             exit 1
           fi
           git fetch --tags --force
-          if ! git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
-            echo "::error::tag does not exist in repository: $TAG"
+          if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+            TAG_EXISTS=true
+            REF="refs/tags/$TAG"
+          elif [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            TAG_EXISTS=false
+            REF="refs/heads/${{ github.event.repository.default_branch }}"
+          else
+            echo "::error::pushed tag does not exist in repository: $TAG"
             exit 1
           fi
           VERSION="${TAG#v}"
-          REF="refs/tags/$TAG"
           {
             echo "release_tag=$TAG"
             echo "release_version=$VERSION"
             echo "release_ref=$REF"
+            echo "tag_exists=$TAG_EXISTS"
           } >> "$GITHUB_OUTPUT"
           echo "Resolved release metadata:"
           echo "  tag: $TAG"
           echo "  version: $VERSION"
           echo "  ref: $REF"
+          echo "  tag exists: $TAG_EXISTS"
 
-  bump:
-    name: Bump Workspace Version
+  prepare_release:
+    name: Prepare Release Commit
     runs-on: ubuntu-latest
     needs: prepare
     outputs:
@@ -94,37 +99,69 @@ jobs:
         with:
           ref: ${{ needs.prepare.outputs.release_ref }}
           fetch-depth: 0
-      - name: Bump version and regenerate lockfile
+      - name: Validate or bump workspace version
         env:
+          TAG_EXISTS: ${{ needs.prepare.outputs.tag_exists }}
           VERSION: ${{ needs.prepare.outputs.release_version }}
         run: |
           set -euo pipefail
-          # Only the [workspace.package] version line at the start of a
-          # line matches — every member crate uses `version.workspace = true`,
-          # so they pick up the workspace version at compile time.
-          sed -i -E 's/^version = "[0-9]+\.[0-9]+\.[0-9]+"/version = "'"$VERSION"'"/' Cargo.toml
-          cargo update --workspace
-          # Sanity: the diff should be exactly Cargo.toml + Cargo.lock.
-          # Anything else means cargo touched a transitive dep — investigate.
-          git diff --stat
+          CURRENT_VERSION="$(sed -n -E 's/^version = "([0-9]+\.[0-9]+\.[0-9]+)"/\1/p' Cargo.toml | head -n 1)"
+          if [[ "$TAG_EXISTS" == "true" ]]; then
+            # Tags are immutable release inputs. A tag-push release must
+            # already point at a commit whose workspace version matches it.
+            if [[ "$CURRENT_VERSION" != "$VERSION" ]]; then
+              echo "::error::tag v$VERSION points at workspace version $CURRENT_VERSION; bump and commit before tagging"
+              exit 1
+            fi
+          else
+            # A manual CI-only release starts from the default branch and
+            # creates the version commit before creating the tag.
+            sed -i -E 's/^version = "[0-9]+\.[0-9]+\.[0-9]+"/version = "'"$VERSION"'"/' Cargo.toml
+            cargo update --workspace
+            # Sanity: the diff should be exactly Cargo.toml + Cargo.lock.
+            # Anything else means cargo touched a transitive dep — investigate.
+            git diff --stat
+          fi
       - id: commit
         env:
+          TAG: ${{ needs.prepare.outputs.release_tag }}
+          TAG_EXISTS: ${{ needs.prepare.outputs.tag_exists }}
           VERSION: ${{ needs.prepare.outputs.release_version }}
         run: |
           set -euo pipefail
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add Cargo.toml Cargo.lock
-          git commit -m "release: v$VERSION"
+          if git diff --cached --quiet; then
+            echo "Workspace is already at v$VERSION; using the tagged commit."
+          else
+            git commit -m "release: v$VERSION"
+          fi
+          SHA="$(git rev-parse HEAD)"
+
+          if [[ "$TAG_EXISTS" == "true" ]]; then
+            TAG_SHA="$(git rev-parse "$TAG^{commit}")"
+            if [[ "$TAG_SHA" != "$SHA" ]]; then
+              echo "::error::tag $TAG resolves to $TAG_SHA, but release commit is $SHA"
+              exit 1
+            fi
+          else
+            git tag "$TAG" "$SHA"
+          fi
+
           # The release/* branch is workflow-owned; --force is safe.
           git push --force origin "HEAD:refs/heads/release/v$VERSION"
-          SHA="$(git rev-parse HEAD)"
+          if [[ "$TAG_EXISTS" == "false" ]]; then
+            # A normal (non-force) push fails safely if another actor
+            # created the tag after the prepare job checked for it.
+            git push origin "refs/tags/$TAG"
+          fi
           echo "release_branch_sha=$SHA" >> "$GITHUB_OUTPUT"
-          echo "Bumped branch release/v$VERSION at $SHA"
+          echo "Prepared $TAG and release/v$VERSION at $SHA"
 
   build:
     name: build ${{ matrix.asset_name }}
-    needs: [prepare, bump]
+    needs: [prepare, prepare_release]
     strategy:
       fail-fast: false
       matrix:
@@ -145,7 +182,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: release/v${{ needs.prepare.outputs.release_version }}
+          ref: ${{ needs.prepare_release.outputs.release_branch_sha }}
           fetch-depth: 0
 
       - name: Install Rust toolchain
@@ -189,7 +226,7 @@ jobs:
 
   publish:
     name: Publish GitHub Release
-    needs: [prepare, bump, build]
+    needs: [prepare, prepare_release, build]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -211,9 +248,15 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ needs.prepare.outputs.release_tag }}
           VERSION: ${{ needs.prepare.outputs.release_version }}
-          SHA: ${{ needs.bump.outputs.release_branch_sha }}
+          SHA: ${{ needs.prepare_release.outputs.release_branch_sha }}
         run: |
           set -euo pipefail
+          git fetch --tags --force
+          TAG_SHA="$(git rev-parse "$TAG^{commit}")"
+          if [[ "$TAG_SHA" != "$SHA" ]]; then
+            echo "::error::refusing to publish: tag $TAG resolves to $TAG_SHA, built SHA is $SHA"
+            exit 1
+          fi
           NOTES="$(mktemp)"
           cat > "$NOTES" <<EOF
           ## bloom v$VERSION
@@ -230,7 +273,7 @@ jobs:
           https://github.com/${{ github.repository }}/releases/download/$TAG/bloom-macos-aarch64.tar.gz
           \`\`\`
 
-          Latest-alias URL (always resolves to the highest semver tag):
+          Latest-alias URL (resolves to the release marked latest):
           \`\`\`
           https://github.com/${{ github.repository }}/releases/latest/download/bloom-linux-x86_64.tar.gz
           \`\`\`
@@ -242,7 +285,6 @@ jobs:
             # Retry path: release already exists. Update metadata and
             # re-upload assets (clobbering any previous ones).
             gh release edit "$TAG" \
-              --target "$SHA" \
               --title "bloom v$VERSION" \
               --notes-file "$NOTES" \
               --latest
@@ -250,7 +292,7 @@ jobs:
           else
             # First-time create.
             gh release create "$TAG" \
-              --target "$SHA" \
+              --verify-tag \
               --title "bloom v$VERSION" \
               --notes-file "$NOTES" \
               --latest \

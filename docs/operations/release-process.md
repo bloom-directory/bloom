@@ -2,31 +2,33 @@
 
 ## Overview
 
-Releases are tag-driven. A `vX.Y.Z` push to a release branch triggers
-the `release.yml` workflow, which:
+Releases can start from a `vX.Y.Z` tag push or from a manual workflow
+dispatch. The `release.yml` workflow:
 
 1. Validates the tag shape.
-2. Checks out the tag, bumps the workspace version to `X.Y.Z` in
-   `Cargo.toml` and `Cargo.lock`, commits the change to a
-   `release/vX.Y.Z` branch, and pushes that branch.
-3. Builds the `bloom` binary on four runners (Linux x86_64 + aarch64,
-   macOS x86_64 + aarch64) from the release branch with `--locked`.
+2. If the tag already exists, verifies that its commit already has
+   workspace version `X.Y.Z`. If a manual run names a new tag, bumps
+   `Cargo.toml` and `Cargo.lock`, commits the change, and creates the
+   tag at that commit.
+3. Mirrors the tagged commit to `release/vX.Y.Z`, then builds the exact
+   commit SHA on four runners (Linux x86_64 + aarch64, macOS x86_64 +
+   aarch64) with `--locked`.
 4. Verifies the resulting binary's `bloom --version` matches the tag.
-5. Creates a GitHub release `vX.Y.Z` with the four tarballs and a
-   `SHA256SUMS` file. Sets `--latest` so the GitHub UI badge follows
-   the highest semver tag.
+5. Verifies the tag still resolves to the built SHA, then creates a
+   GitHub release `vX.Y.Z` with the four tarballs and a `SHA256SUMS`
+   file. Sets `--latest` so GitHub's latest-release links follow it.
 
 The floating `latest` git tag is intentionally NOT created by the
 workflow. It is owned by the old (now-retired) branch-driven
 `release.yml`. The legacy `Latest master build` release and the
-`latest` tag are removed in the cutover step below. **Until that
-cutover, `/releases/latest/download/...` continues to work because
-the legacy tag still exists and powers the download redirect.**
+`latest` tag are removed in the cleanup step below. GitHub's
+`/releases/latest/download/...` route follows the release marked
+latest; it does not require a git tag literally named `latest`.
 
-## Local release (recommended for the first cutover)
+## Local release (recommended for the first versioned release)
 
-The first `vX.Y.Z` release after this workflow lands is the cutover.
-Run it locally so you can verify the build before pushing the tag:
+Run the first `vX.Y.Z` release locally so you can verify the build
+before pushing the tag:
 
 ```bash
 # 1. Decide on the version. For a first release from the existing
@@ -51,65 +53,64 @@ git diff --stat
 cargo build --release -p bloom --all-features --locked
 ./target/release/bloom --version    # must print "bloom $VERSION"
 
-# 5. Commit + tag + push.
+# 5. Commit, tag that exact commit, and push.
 git add Cargo.toml Cargo.lock
 git commit -m "release: v$VERSION"
 git tag "v$VERSION"
 git push origin master
-git push --tags
-
-# 6. Trigger the workflow. The `bump` job will see that the version
-#    bump is already in master and is a no-op; the `build` matrix
-#    will checkout `release/vX.Y.Z` (created by the bump job, or
-#    left over from a previous run). If the bump job creates a new
-#    release branch, the build will use that.
-gh workflow run release.yml --ref master
+git push origin "v$VERSION"
 ```
 
-The `publish` job will create the `v$VERSION` GitHub release with
-`--latest` set, upload the four tarballs, and generate `SHA256SUMS`.
+The tag push starts the workflow automatically. Because the tag
+already points at the version-bumped commit, the prepare job makes no
+new commit. The build jobs use that exact SHA, and the publish job
+creates the `v$VERSION` release with the four tarballs and
+`SHA256SUMS`.
 
 ## CI-only release (subsequent versions)
 
-After the first cutover, the workflow can run end-to-end on its own:
-
-1. Bump the version locally and commit (or let the workflow do it via
-   the `bump` job, which edits `Cargo.toml` and pushes a
-   `release/vX.Y.Z` branch).
-2. Push the `vX.Y.Z` tag to the `master` branch.
-3. The `prepare` job validates the tag, the `bump` job updates
-   `Cargo.toml` + `Cargo.lock` and pushes the release branch, the
-   `build` matrix builds the four binaries, the `publish` job creates
-   the release.
-
-## Cutover (one-time, manual)
-
-The legacy `Latest master build` release and the `latest` git tag
-must be deleted so that `/releases/latest` (the API endpoint the
-UpdateChecker hits) starts returning the highest `vX.Y.Z` release
-instead of the floating one. After the first `vX.Y.Z` ships:
+The workflow can also create the release commit and tag itself:
 
 ```bash
-# 1. Delete the legacy release. This removes the API-side "latest"
-#    so the next API call returns the highest vX.Y.Z.
+VERSION="0.1.2"
+gh workflow run release.yml --ref master -f tag="v$VERSION"
+```
+
+For a new tag, the workflow starts from the repository's default
+branch, creates `release: v$VERSION`, tags that new commit, and pushes
+`release/v$VERSION`. The build and source archives therefore resolve
+to the same commit. The release commit remains on the release branch;
+use the local path above when the version bump should also live on
+`master`.
+
+If the requested tag already exists, a manual run is treated as a
+retry. Its commit must already contain the matching workspace version;
+the workflow never moves an existing release tag.
+
+## Legacy cleanup (one-time, manual)
+
+After the first `vX.Y.Z` release is published and marked latest,
+GitHub's `/releases/latest` API and download routes point to it. The
+legacy `Latest master build` release and floating `latest` git tag can
+then be deleted as cleanup:
+
+```bash
+# 1. Delete the legacy release whose tag is literally "latest".
 gh release delete latest --yes
 
-# 2. Delete the floating git tag. This is purely a download-side
-#    cleanup — after this, /releases/latest/download/... will start
-#    returning a 404 until you add a new git tag named "latest" (we
-#    don't plan to; users should use the versioned URL).
+# 2. Delete its floating git tag.
 git push origin :refs/tags/latest
 ```
 
-**The cutover is irreversible from the UI side** (GitHub doesn't let
-you restore a deleted release's UI badge). After this, the only
-"latest" pointer is whichever `vX.Y.Z` release has `--latest` set,
-which the workflow does by default.
+The stable `/releases/latest/download/...` URLs continue to work: they
+follow the `vX.Y.Z` release marked latest, independently of the deleted
+floating tag.
 
 ## Verifying the UpdateChecker
 
-After the cutover, the daemon's `/status/update` subtree should be
-meaningful. Verify from any machine running the binary:
+After the first versioned release, the daemon's `/status/update`
+subtree should be meaningful. Verify from any machine running the
+binary:
 
 ```bash
 # First-run: no cache file → available=unknown, latest=empty.
@@ -123,10 +124,11 @@ bloom vfs cat /status/update/latest        # → e.g. "0.1.1\n"
 bloom vfs cat /status/update/available     # → out_of_date | up_to_date
 ```
 
-If `bloom update check` exits with `error: http 404`, the API is
-returning 404 because (a) no `vX.Y.Z` release exists yet, or (b) the
-release was created without `--latest`. Fix (a) by tagging a version;
-fix (b) by running `gh release edit vX.Y.Z --latest`.
+Before the first versioned release, GitHub may return the legacy tag
+`latest`. That is a successful HTTP response but not semver, so
+`bloom update check` reports `available: unknown` and exits 2 rather
+than claiming the binary is up to date. An HTTP 404 means no eligible
+published release exists yet.
 
 ## What is intentionally NOT in the workflow
 
@@ -134,8 +136,9 @@ fix (b) by running `gh release edit vX.Y.Z --latest`.
   doesn't need a fresh toolchain.
 - **`--config 'package.version="X.Y.Z"'`**: doesn't exist in Cargo.
   Verified against the Cargo configuration reference.
-- **A floating `latest` git tag**: removed in the cutover. The
-  versioned URL is the canonical source.
+- **A floating `latest` git tag**: removed during legacy cleanup. The
+  versioned URL is canonical, while GitHub's latest-release URL remains
+  a stable convenience alias.
 - **Cross-compiled builds**: each runner builds natively (`cargo
   build --release` without `--target`), matching the previous
   workflow. Cross-compilation is a separate effort.

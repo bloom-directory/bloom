@@ -155,7 +155,13 @@ impl UpdateSnapshot {
         let Some(latest) = self.latest.as_deref() else {
             return UpdateAvailable::Unknown;
         };
-        match crate::semver::compare_semver(&self.installed, latest) {
+        let (Some(installed), Some(latest)) = (
+            crate::semver::parse_semver(&self.installed),
+            crate::semver::parse_semver(latest),
+        ) else {
+            return UpdateAvailable::Unknown;
+        };
+        match installed.cmp(&latest) {
             std::cmp::Ordering::Less => UpdateAvailable::OutOfDate,
             _ => UpdateAvailable::UpToDate,
         }
@@ -214,6 +220,25 @@ mod tests {
         );
         assert_eq!(s.available(), UpdateAvailable::UpToDate);
         assert_eq!(s.behind_by(), Some(0));
+    }
+
+    #[test]
+    fn unknown_when_either_version_is_not_semver() {
+        let invalid_latest = UpdateSnapshot::ok(
+            "0.1.0".into(),
+            Some("latest".into()),
+            Some("https://example/latest".into()),
+        );
+        assert_eq!(invalid_latest.available(), UpdateAvailable::Unknown);
+        assert_eq!(invalid_latest.behind_by(), None);
+
+        let invalid_installed = UpdateSnapshot::ok(
+            "development".into(),
+            Some("v0.2.0".into()),
+            Some("https://example/v0.2.0".into()),
+        );
+        assert_eq!(invalid_installed.available(), UpdateAvailable::Unknown);
+        assert_eq!(invalid_installed.behind_by(), None);
     }
 
     #[test]

@@ -26,6 +26,11 @@ use crate::snapshot::{UpdateSnapshot, UpdateStatus};
 const RELEASES_LATEST_URL: &str =
     "https://api.github.com/repos/bloom-directory/bloom/releases/latest";
 
+/// GitHub rejects API requests without a valid User-Agent. Keep the
+/// product name stable and include the running workspace version so
+/// requests are identifiable when debugging API traffic.
+const USER_AGENT_PREFIX: &str = "bloom";
+
 /// How long to wait for the GitHub response.
 const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -59,6 +64,10 @@ struct Inner {
     snapshot: RwLock<UpdateSnapshot>,
     /// `reqwest::Client` with a 10s timeout. Reused across refreshes.
     http: reqwest::Client,
+    /// Release endpoint. Fixed in production and replaceable in unit
+    /// tests so the real request headers and response handling are
+    /// exercised without contacting GitHub.
+    releases_url: String,
     /// Cache file directory. `home.cache_dir()` for production;
     /// tempdir for tests.
     cache_dir: PathBuf,
@@ -75,7 +84,18 @@ impl UpdateChecker {
     ) -> Result<Self, UpdateError> {
         let installed = installed.into();
         let cache_dir = cache_dir.into();
-        let http = reqwest::Client::builder().timeout(HTTP_TIMEOUT).build()?;
+        Self::with_releases_url(installed, cache_dir, RELEASES_LATEST_URL.to_string())
+    }
+
+    fn with_releases_url(
+        installed: String,
+        cache_dir: PathBuf,
+        releases_url: String,
+    ) -> Result<Self, UpdateError> {
+        let http = reqwest::Client::builder()
+            .timeout(HTTP_TIMEOUT)
+            .user_agent(format!("{USER_AGENT_PREFIX}/{installed}"))
+            .build()?;
         // Seed from disk cache if present; otherwise leave as Unknown
         // until the first network refresh completes.
         let initial =
@@ -92,6 +112,7 @@ impl UpdateChecker {
             inner: Arc::new(Inner {
                 snapshot: RwLock::new(initial),
                 http,
+                releases_url,
                 cache_dir,
             }),
         })
@@ -191,7 +212,7 @@ impl UpdateChecker {
         let resp = self
             .inner
             .http
-            .get(RELEASES_LATEST_URL)
+            .get(&self.inner.releases_url)
             .header("Accept", "application/vnd.github+json")
             .send()
             .await
@@ -225,7 +246,12 @@ impl UpdateChecker {
 /// `UpdateChecker`. Useful for the CLI hint path where the daemon
 /// isn't running and we just want whatever's on disk.
 pub fn read_cache_only(installed: &str, cache_dir: &Path) -> UpdateSnapshot {
-    cache::read(cache_dir).unwrap_or_else(|| UpdateSnapshot::unknown(installed.to_string()))
+    let cached =
+        cache::read(cache_dir).unwrap_or_else(|| UpdateSnapshot::unknown(installed.to_string()));
+    UpdateSnapshot {
+        installed: installed.to_string(),
+        ..cached
+    }
 }
 
 #[cfg(test)]
@@ -233,55 +259,53 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
     use std::net::TcpListener;
-    use std::sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    };
+    use std::sync::mpsc;
 
-    /// Minimal HTTP fixture: returns a canned status + body for
-    /// every request. Copied from `crates/bloom/tests/cli.rs` rather
-    /// than depending on a test-only helper crate.
+    /// Minimal one-shot HTTP fixture. It returns a canned response and
+    /// sends the raw request headers back to the test for assertions.
     fn http_fixture(
         status: u16,
         headers: &[(&str, &str)],
         body: &'static [u8],
-    ) -> (String, Arc<AtomicUsize>) {
+    ) -> (String, mpsc::Receiver<String>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock HTTP server");
         let addr = listener.local_addr().expect("mock server addr");
-        let hits = Arc::new(AtomicUsize::new(0));
-        let hits_for_thread = hits.clone();
+        let (request_tx, request_rx) = mpsc::channel();
         let header_lines = headers
             .iter()
             .map(|(k, v)| format!("{k}: {v}\r\n"))
             .collect::<String>();
         std::thread::spawn(move || {
-            for stream in listener.incoming() {
-                let Ok(mut stream) = stream else { break };
-                hits_for_thread.fetch_add(1, Ordering::SeqCst);
-                let mut buf = [0_u8; 4096];
-                let _ = stream.read(&mut buf);
-                let reason = if status == 404 { "Not Found" } else { "OK" };
-                let response = format!(
-                    "HTTP/1.1 {status} {reason}\r\ncontent-length: {}\r\n{header_lines}\r\n",
-                    body.len()
-                );
-                stream.write_all(response.as_bytes()).unwrap();
-                stream.write_all(body).unwrap();
+            let (mut stream, _) = listener.accept().expect("accept mock HTTP request");
+            let mut request = Vec::new();
+            let mut buf = [0_u8; 1024];
+            loop {
+                let read = stream.read(&mut buf).expect("read mock HTTP request");
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buf[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
             }
+            request_tx
+                .send(String::from_utf8_lossy(&request).into_owned())
+                .expect("return captured request");
+            let reason = if status == 404 { "Not Found" } else { "OK" };
+            let response = format!(
+                "HTTP/1.1 {status} {reason}\r\ncontent-length: {}\r\n{header_lines}connection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+            stream.write_all(body).unwrap();
         });
-        (format!("http://{addr}/resource"), hits)
+        (format!("http://{addr}/resource"), request_rx)
     }
 
     fn make_checker(dir: &Path, url: &str) -> UpdateChecker {
-        let checker = UpdateChecker::new("0.1.0", dir.to_path_buf()).expect("build checker");
-        // Replace the hard-coded GitHub URL with our fixture. We do
-        // this by re-pointing the underlying client through a
-        // redirect, but that's not supported by reqwest's high-level
-        // builder. Instead, we accept that the live GitHub URL won't
-        // resolve in tests; we test the failure path and the
-        // cache-loaded path directly.
-        let _ = url;
-        checker
+        UpdateChecker::with_releases_url("0.1.0".to_string(), dir.to_path_buf(), url.to_string())
+            .expect("build checker")
     }
 
     #[test]
@@ -333,6 +357,19 @@ mod tests {
     }
 
     #[test]
+    fn cache_only_read_overrides_cached_installed() {
+        let dir = tempfile::tempdir().unwrap();
+        let cached = UpdateSnapshot::ok("0.1.0".into(), Some("0.3.0".into()), None);
+        cache::write(dir.path(), &cached).unwrap();
+
+        let snap = read_cache_only("0.2.0", dir.path());
+
+        assert_eq!(snap.installed, "0.2.0");
+        assert_eq!(snap.latest.as_deref(), Some("0.3.0"));
+        assert_eq!(snap.available(), crate::UpdateAvailable::OutOfDate);
+    }
+
+    #[test]
     fn quick_check_cached_respects_freshness() {
         let dir = tempfile::tempdir().unwrap();
         // Fresh snapshot: quick_check returns Some.
@@ -351,48 +388,52 @@ mod tests {
             error_reason: None,
         };
         cache::write(dir.path(), &stale).unwrap();
-        // Bypass the construction-time cache load (which preserves
-        // `installed` but doesn't reset `checked_at` for our stale
-        // case here). Use the read-only path directly.
+        // The read-only helper updates the running version without
+        // changing the cache timestamp.
         let snap = read_cache_only("0.1.0", dir.path());
-        // The cache is exactly the stale snapshot.
         assert_eq!(snap.checked_at, Some(std::time::UNIX_EPOCH));
-        // But the checker, when constructed, would have re-stamped
-        // checked_at. So we test the helper directly.
-        assert!(crate::cache::read(dir.path()).unwrap().checked_at == Some(std::time::UNIX_EPOCH));
     }
 
-    #[test]
-    fn http_fixture_smoke() {
-        // Sanity check that the canned-HTTP fixture actually
-        // serves a body. We don't exercise the full refresh path
-        // because it would require either a network mock for the
-        // reqwest builder or a public-test endpoint. The fixture
-        // is well-tested by the existing CLI tests; this is a
-        // regression guard for the helper's shape.
-        let (_url, _hits) = http_fixture(
+    #[tokio::test]
+    async fn refresh_sends_user_agent_and_parses_release() {
+        let (url, request_rx) = http_fixture(
             200,
             &[("content-type", "application/json")],
             br#"{"tag_name":"v9.9.9","html_url":"https://example/v9.9.9"}"#,
         );
-        // Just confirm we got a URL.
-        assert!(_url.starts_with("http://"));
+        let dir = tempfile::tempdir().unwrap();
+        let checker = make_checker(dir.path(), &url);
+
+        let snap = checker.refresh().await;
+
+        assert_eq!(snap.latest.as_deref(), Some("v9.9.9"));
+        assert_eq!(snap.status_kind(), UpdateStatus::Ok);
+        let request = request_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("captured request")
+            .to_ascii_lowercase();
+        assert!(
+            request.contains("\r\nuser-agent: bloom/0.1.0\r\n"),
+            "request did not contain Bloom User-Agent:\n{request}"
+        );
     }
 
-    #[test]
-    fn fetch_handles_404_gracefully() {
-        // We can't easily swap the GitHub URL inside the production
-        // builder, so this test documents the intent: a 404 should
-        // produce an Error status, not panic. The production
-        // `fetch` is called from `refresh`, which preserves the
-        // previous snapshot on error.
+    #[tokio::test]
+    async fn fetch_handles_404_gracefully() {
+        let (url, _request_rx) = http_fixture(
+            404,
+            &[("content-type", "application/json")],
+            br#"{"message":"Not Found"}"#,
+        );
         let dir = tempfile::tempdir().unwrap();
         let cached = UpdateSnapshot::ok("0.1.0".into(), Some("0.1.5".into()), None);
         cache::write(dir.path(), &cached).unwrap();
-        let checker = make_checker(dir.path(), "http://invalid.example/");
-        let snap = checker.snapshot();
-        // Latest is preserved from cache.
+        let checker = make_checker(dir.path(), &url);
+
+        let snap = checker.refresh().await;
+
         assert_eq!(snap.latest.as_deref(), Some("0.1.5"));
-        assert_eq!(snap.status_kind(), UpdateStatus::Ok);
+        assert_eq!(snap.status_kind(), UpdateStatus::Error);
+        assert_eq!(snap.error_reason.as_deref(), Some("http 404 Not Found"));
     }
 }

@@ -88,18 +88,20 @@ pub fn write(cache_dir: &Path, snapshot: &UpdateSnapshot) -> std::io::Result<()>
 /// which is good enough to show in the VFS without claiming an exact
 /// "you are N releases behind" count.
 pub fn behind_by(snapshot: &UpdateSnapshot) -> Option<u64> {
-    let latest = snapshot.latest.as_deref()?;
-    match crate::semver::compare_semver(&snapshot.installed, latest) {
-        std::cmp::Ordering::Less => behind_count(&snapshot.installed, latest),
+    use crate::semver::parse_semver;
+
+    let installed = parse_semver(&snapshot.installed)?;
+    let latest = parse_semver(snapshot.latest.as_deref()?)?;
+    match installed.cmp(&latest) {
+        std::cmp::Ordering::Less => Some(behind_count(installed, latest)),
         _ => Some(0),
     }
 }
 
-fn behind_count(installed: &str, latest: &str) -> Option<u64> {
-    use crate::semver::parse_semver;
-    let (ai, bi, ci) = parse_semver(installed)?;
-    let (al, bl, cl) = parse_semver(latest)?;
-    Some(al.saturating_sub(ai) * 10_000 + bl.saturating_sub(bi) * 100 + cl.saturating_sub(ci))
+fn behind_count(installed: (u64, u64, u64), latest: (u64, u64, u64)) -> u64 {
+    let (ai, bi, ci) = installed;
+    let (al, bl, cl) = latest;
+    al.saturating_sub(ai) * 10_000 + bl.saturating_sub(bi) * 100 + cl.saturating_sub(ci)
 }
 
 #[cfg(test)]
@@ -189,5 +191,16 @@ mod tests {
         s.installed = "1.9.0".into();
         s.latest = Some("1.10.0".into());
         assert_eq!(behind_by(&s), Some(100));
+    }
+
+    #[test]
+    fn behind_by_is_unknown_for_non_semver() {
+        let mut s = snap();
+        s.latest = Some("latest".into());
+        assert_eq!(behind_by(&s), None);
+
+        s.latest = Some("0.2.0".into());
+        s.installed = "development".into();
+        assert_eq!(behind_by(&s), None);
     }
 }

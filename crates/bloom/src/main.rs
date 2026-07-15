@@ -4454,8 +4454,13 @@ async fn handle_update(home: &HomeDir, cmd: UpdateCmd) -> Result<()> {
             Ok(())
         }
         UpdateCmd::Check => {
-            let d = Daemon::from_home(home.clone()).context("build daemon")?;
-            let snap = d.update_checker.refresh().await;
+            // An explicit check needs only a checker. Constructing a full
+            // daemon would also spawn its immediate background refresh,
+            // issuing two concurrent GitHub requests for one CLI command.
+            let checker =
+                bloom_update::UpdateChecker::new(env!("CARGO_PKG_VERSION"), home.cache_dir())
+                    .context("build update checker")?;
+            let snap = checker.refresh().await;
             let json = serde_json::to_string_pretty(&snap).context("serialise update snapshot")?;
             println!("{json}");
             let code = match snap.available() {
@@ -4463,7 +4468,6 @@ async fn handle_update(home: &HomeDir, cmd: UpdateCmd) -> Result<()> {
                 bloom_update::UpdateAvailable::UpToDate => 0,
                 bloom_update::UpdateAvailable::Unknown => 2,
             };
-            d.shutdown().await;
             if code != 0 {
                 std::process::exit(code);
             }
