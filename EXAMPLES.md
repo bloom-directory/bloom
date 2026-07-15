@@ -1359,19 +1359,39 @@ echo "delete" > /bloom/addressbook/vitalik
 
 The `status/` tree is the daemon's introspection layer: uptime and
 version, per-chain RPC reachability, the audit-log digest, cache and
-outbox counts, the active backend mapping, and a per-endpoint health
-snapshot for every configured RPC URL.
+outbox counts, the active backend mapping, a per-endpoint health
+snapshot for every configured RPC URL, and (when the daemon has
+network access) the current release-checker state.
 
 ### Daemon
 
 ```sh
-ls /bloom/status/                                      # daemon.json, version, uptime, started_at, home, chains/, audit/, cache/, policies/, wallets/, outbox/, backends/
+ls /bloom/status/                                      # daemon.json, version, uptime, started_at, home, chains/, audit/, cache/, policies/, wallets/, outbox/, backends/, update/
 cat /bloom/status/version                              # daemon version, e.g. 0.0.0
 cat /bloom/status/uptime                               # "Ns" under a minute, "HH:MM:SS" otherwise
 cat /bloom/status/started_at                           # RFC3339 UTC
 cat /bloom/status/home                                 # absolute home dir, e.g. /home/you/.bloom
 cat /bloom/status/daemon.json                          # JSON: {version, started_unix_ms, started_at, uptime_secs, home, chains}
 ```
+
+### Update checker
+
+```sh
+ls /bloom/status/update/                               # installed, latest, available, behind_by, checked_at, release_url, summary.json
+cat /bloom/status/update/installed                      # this binary's compiled-in version
+cat /bloom/status/update/latest                         # latest known GitHub release tag (e.g. "0.2.0"), empty if unknown
+cat /bloom/status/update/available                     # "out_of_date" | "up_to_date" | "unknown"
+cat /bloom/status/update/behind_by                     # weighted version distance (major*10000 + minor*100 + patch), 0 if up to date or unknown
+cat /bloom/status/update/checked_at                     # RFC3339 of the last successful refresh
+cat /bloom/status/update/release_url                    # HTML URL of the latest release, empty if unknown
+cat /bloom/status/update/summary.json                   # all of the above, JSON
+```
+
+The daemon refreshes this state every 5 minutes. Use
+`bloom update check` to force a refresh, or `bloom update status` to
+print the cached snapshot to stdout. The CLI also prints a one-line
+hint to stderr from `bloom status` when the cached snapshot says
+you're behind.
 
 ### Chains
 
