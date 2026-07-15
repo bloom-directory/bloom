@@ -2822,6 +2822,31 @@ mod tests {
         assert_eq!(request_entry.modified, Some(file_modified));
     }
 
+    /// Missing request paths must be NotFound (ENOENT on a mount), not
+    /// Io (EIO): the fs-metadata lookups added for timestamps would
+    /// otherwise leak `HandlerError::Io` for nonexistent ids.
+    #[tokio::test]
+    async fn lookup_missing_request_paths_return_not_found() {
+        let f = fixture(Some("alice"));
+        for path in [
+            "/pending/req_missing",
+            "/pending/req_missing/request.toml",
+            "/pending/req_missing/response",
+            "/pending/req_missing/response/body",
+            "/sessions/sess_missing/summary.json",
+        ] {
+            let err = f
+                .handler
+                .lookup(&VfsPath::parse(path).unwrap())
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, HandlerError::NotFound(_)),
+                "{path}: expected NotFound, got: {err:?}"
+            );
+        }
+    }
+
     #[test]
     fn paid_http_canonical_envelope_commits_to_selected_plan() {
         let request = parse_request("GET https://merchant.test/pay wallet=alice").unwrap();

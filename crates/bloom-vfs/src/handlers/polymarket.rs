@@ -3673,12 +3673,13 @@ impl PolymarketHandler {
             }
             (Some("trade"), 4) if segs[2] == "receipts" => {
                 let store = self.orders_or_not_found(path)?;
-                Ok(vec![self.receipt_file_entry(
-                    store,
-                    &segs[1],
-                    &segs[3],
-                    "receipt.json",
-                )?])
+                Ok(vec![
+                    self.receipt_file_entry(store, &segs[1], &segs[3], "receipt.json")
+                        .unwrap_or_else(|e| {
+                            tracing::warn!(error = %e, "polymarket.receipt_file.metadata_fallback");
+                            Entry::file("receipt.json")
+                        }),
+                ])
             }
             (Some("trade"), 4) if segs[2] == "orders" => Ok(vec![Entry::writable_file("cancel")]),
             // redeem/<wallet>/ — slugs are arbitrary (discovered via markets/),

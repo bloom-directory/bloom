@@ -785,6 +785,12 @@ pub struct BloomFs {
     directory_cache: Arc<MountDirectoryCache>,
     /// Cold list operations coalesce independently from file renders.
     directory_in_flight: Arc<Mutex<HashMap<VfsPath, InFlightDirectory>>>,
+    /// Wall-clock time this adapter was built; the root directory's
+    /// mtime. Stable across getattrs — a per-stat `SystemTime::now()`
+    /// would make the root look freshly modified to every freshness
+    /// check (`rsync`, `find -newer`) — but saner-looking than the
+    /// epoch fallback used for entries with no known artifact time.
+    mounted_at: SystemTime,
 }
 
 impl BloomFs {
@@ -796,6 +802,7 @@ impl BloomFs {
             in_flight: Arc::new(Mutex::new(HashMap::new())),
             directory_cache: Arc::new(MountDirectoryCache::new(DIRECTORY_CACHE_CAPACITY)),
             directory_in_flight: Arc::new(Mutex::new(HashMap::new())),
+            mounted_at: SystemTime::now(),
         }
     }
 
@@ -1050,7 +1057,7 @@ impl FileSystem for BloomFs {
             BloomHandle::Root => {
                 let mut a = stable_attrs(ObjectType::Directory, fileid_for(&VfsPath::root()));
                 a.mode = 0o755;
-                let ts = system_time_to_ts(SystemTime::now());
+                let ts = system_time_to_ts(self.mounted_at);
                 a.mtime = ts;
                 a.atime = ts;
                 a.ctime = ts;

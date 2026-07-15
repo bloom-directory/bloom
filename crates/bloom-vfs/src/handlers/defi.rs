@@ -1437,8 +1437,16 @@ impl DefiHandler {
                 // we show only `new`).
                 let mut out = vec![Entry::writable_file("new")];
                 for id in self.list_sessions_for_wallet(&segs[1]) {
-                    let sess = self.get_session(&segs[1], &id)?;
-                    out.push(Entry::dir(&id).with_modified_ms(sess.created_ms));
+                    // Metadata is best-effort: one unreadable session must
+                    // not fail the whole listing.
+                    let entry = match self.get_session(&segs[1], &id) {
+                        Ok(sess) => Entry::dir(&id).with_modified_ms(sess.created_ms),
+                        Err(e) => {
+                            tracing::warn!(id = %id, error = %e, "defi.session.metadata_fallback");
+                            Entry::dir(&id)
+                        }
+                    };
+                    out.push(entry);
                 }
                 Ok(out)
             }

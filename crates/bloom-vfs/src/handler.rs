@@ -139,7 +139,15 @@ pub fn entry_for_fs_path(
     name: &str,
     kind: EntryKind,
 ) -> Result<Entry, HandlerError> {
-    let metadata = fs::metadata(path)?;
+    // A missing backing artifact must surface as NotFound (ENOENT on
+    // mounts), not Io (EIO): clients treat EIO as a server fault.
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Err(HandlerError::NotFound(name.to_string()));
+        }
+        Err(err) => return Err(err.into()),
+    };
     Ok(entry_from_fs_metadata(name, kind, &metadata))
 }
 
@@ -360,6 +368,17 @@ mod tests {
 
         assert_eq!(entry.size, 5);
         assert_eq!(entry.modified, metadata.modified().ok());
+    }
+
+    #[test]
+    fn entry_for_fs_path_maps_missing_path_to_not_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let err =
+            entry_for_fs_path(dir.path().join("missing"), "missing", EntryKind::File).unwrap_err();
+        assert!(
+            matches!(err, HandlerError::NotFound(_)),
+            "missing artifact must be NotFound (ENOENT), got: {err:?}"
+        );
     }
 
     #[test]

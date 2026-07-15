@@ -137,6 +137,40 @@ fn map_rpc_error(e: bloom_rpc::BloomRpcError) -> ChainError {
     }
 }
 
+/// Build the `eth_call` request that replays a mined transaction,
+/// preserving all execution-relevant fields (fees, access list, etc.)
+/// so the replay matches the original execution.
+///
+/// Fee fields are mutually exclusive: legacy transactions report their
+/// gas price through both `gas_price()` and `max_fee_per_gas()`, and
+/// geth-family nodes reject calls carrying both `gasPrice` and
+/// EIP-1559 fee fields.
+fn revert_replay_request<T: TxTrait>(from: Address, tx: &T) -> TransactionRequest {
+    let mut builder = TransactionRequest::default()
+        .with_from(from)
+        .with_input(tx.input().clone())
+        .with_gas_limit(tx.gas_limit())
+        .with_value(tx.value());
+    if let Some(gas_price) = tx.gas_price() {
+        builder = builder.with_gas_price(gas_price);
+    } else {
+        builder = builder.with_max_fee_per_gas(tx.max_fee_per_gas());
+        if let Some(prio_fee) = tx.max_priority_fee_per_gas() {
+            builder = builder.with_max_priority_fee_per_gas(prio_fee);
+        }
+    }
+    if let Some(chain_id) = tx.chain_id() {
+        builder = builder.with_chain_id(chain_id);
+    }
+    if let Some(to) = tx.to() {
+        builder = builder.with_to(to);
+    }
+    if let Some(access_list) = tx.access_list() {
+        builder = builder.with_access_list(access_list.clone());
+    }
+    builder
+}
+
 /// One alloy provider backed by the layered `bloom-rpc` engine.
 ///
 /// The provider is a `RootProvider<Ethereum>` whose transport is the
@@ -448,31 +482,7 @@ impl ChainClient {
                     return Ok(None);
                 }
             };
-            // Build TransactionRequest from typed fields, preserving
-            // all execution-relevant fields (gas price, access list, etc.)
-            // so the replay matches the original execution exactly.
-            let mut builder = TransactionRequest::default()
-                .with_from(from)
-                .with_input(tx.input().clone())
-                .with_gas_limit(tx.gas_limit())
-                .with_value(tx.value())
-                .with_max_fee_per_gas(tx.max_fee_per_gas());
-            if let Some(gas_price) = tx.gas_price() {
-                builder = builder.with_gas_price(gas_price);
-            }
-            if let Some(prio_fee) = tx.max_priority_fee_per_gas() {
-                builder = builder.with_max_priority_fee_per_gas(prio_fee);
-            }
-            if let Some(chain_id) = tx.chain_id() {
-                builder = builder.with_chain_id(chain_id);
-            }
-            if let Some(to) = tx.to() {
-                builder = builder.with_to(to);
-            }
-            if let Some(access_list) = tx.access_list() {
-                builder = builder.with_access_list(access_list.clone());
-            }
-            req = builder;
+            req = revert_replay_request(from, &tx);
         } else {
             // L1 path: standard typed decode handles all known tx types.
             let receipt = match self.primary.get_transaction_receipt(hash).await? {
@@ -1016,6 +1026,33 @@ pub fn parse_block_arg(s: &str) -> Result<u64, ChainError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Legacy txs report their gas price through both `gas_price()` and
+    /// `max_fee_per_gas()`; the replay request must carry exactly one
+    /// fee style or geth-family nodes reject the `eth_call`.
+    #[test]
+    fn revert_replay_request_sets_one_fee_style() {
+        let legacy = alloy::consensus::TxLegacy {
+            gas_price: 7,
+            gas_limit: 21_000,
+            ..Default::default()
+        };
+        let req = revert_replay_request(Address::ZERO, &legacy);
+        assert_eq!(req.gas_price, Some(7));
+        assert_eq!(req.max_fee_per_gas, None);
+        assert_eq!(req.max_priority_fee_per_gas, None);
+
+        let eip1559 = alloy::consensus::TxEip1559 {
+            max_fee_per_gas: 9,
+            max_priority_fee_per_gas: 2,
+            gas_limit: 21_000,
+            ..Default::default()
+        };
+        let req = revert_replay_request(Address::ZERO, &eip1559);
+        assert_eq!(req.gas_price, None);
+        assert_eq!(req.max_fee_per_gas, Some(9));
+        assert_eq!(req.max_priority_fee_per_gas, Some(2));
+    }
 
     #[test]
     fn registry_add_get() {

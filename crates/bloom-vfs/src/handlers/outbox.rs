@@ -321,13 +321,11 @@ impl OutboxHandler {
         name: &str,
         writable: bool,
     ) -> Result<Entry, HandlerError> {
-        let metadata = std::fs::metadata(path)?;
-        let entry = if writable {
-            Entry::writable_file(name)
-        } else {
-            Entry::file(name)
-        };
-        Ok(entry.with_fs_metadata(&metadata))
+        let mut entry = entry_for_fs_path(path, name, EntryKind::File)?;
+        if writable {
+            entry.mode = 0o644;
+        }
+        Ok(entry)
     }
 }
 

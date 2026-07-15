@@ -3755,12 +3755,20 @@ impl Handler for HyperliquidHandler {
             4 if NETWORKS.contains(&segs[0].as_str()) && segs[1] == "agent_sessions" => {
                 let mut entries = Vec::new();
                 for f in SESSION_FILES {
-                    let entry = match f {
+                    let base = || match f {
                         "status.json" | "session.json" | "audit.jsonl" | "last_response.json"
                         | LAST_ERROR_FILE => Entry::file(f),
                         _ => Entry::writable_file(f),
                     };
-                    entries.push(self.agent_session_entry(&segs[0], &segs[2], &segs[3], entry)?);
+                    // Metadata is best-effort: a corrupt session must not
+                    // hide its own audit/status files from listing.
+                    let entry = self
+                        .agent_session_entry(&segs[0], &segs[2], &segs[3], base())
+                        .unwrap_or_else(|e| {
+                            tracing::warn!(session = %segs[3], error = %e, "hyperliquid.session.metadata_fallback");
+                            base()
+                        });
+                    entries.push(entry);
                 }
                 if self.session_approval_challenge_exists(&segs[0], &segs[2], &segs[3])? {
                     entries.push(Entry::file(APPROVAL_CHALLENGE_FILE));

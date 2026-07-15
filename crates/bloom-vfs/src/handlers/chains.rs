@@ -100,6 +100,11 @@ pub struct ChainsHandler {
     /// configured. Keys are chain names (e.g., "ethereum").
     mempool_handlers:
         Arc<std::collections::BTreeMap<String, Arc<super::chains_mempool::MempoolHandler>>>,
+    /// Block timestamps backing directory-listing metadata, so kernel
+    /// readdir/getattr bursts don't fan out into repeated RPC fetches.
+    /// Head timestamps expire on a short TTL (heads advance);
+    /// mined-block timestamps are immutable, so only map size is bounded.
+    block_ts_cache: Arc<PlMutex<BlockTsCache>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -113,6 +118,22 @@ struct TokenMetadata {
     decimals: u8,
     symbol: String,
     expires_at: Instant,
+}
+
+/// TTL for cached head-block timestamps in directory listings. Short
+/// enough that `ls` metadata tracks the chain head, long enough that a
+/// burst of readdir/getattr traffic collapses into one RPC fetch.
+const HEAD_TS_TTL: Duration = Duration::from_secs(5);
+
+/// Cap on cached per-number block timestamps. Entries are immutable so
+/// eviction is purely a memory bound; the map is cleared wholesale when
+/// full (a rebuild costs one RPC per listed block directory).
+const BLOCK_TS_CACHE_CAP: usize = 4096;
+
+#[derive(Default)]
+struct BlockTsCache {
+    head: std::collections::HashMap<String, (Instant, u64)>,
+    by_number: std::collections::HashMap<(String, u64), u64>,
 }
 
 impl ChainsHandler {
@@ -131,6 +152,7 @@ impl ChainsHandler {
             revert_decoder: Arc::new(DecoderChain::new()),
             revert_cache: Arc::new(PlMutex::new(std::collections::HashMap::new())),
             mempool_handlers: Arc::new(std::collections::BTreeMap::new()),
+            block_ts_cache: Arc::new(PlMutex::new(BlockTsCache::default())),
         }
     }
 
@@ -679,6 +701,50 @@ impl Handler for ChainsHandler {
 impl ChainsHandler {
     fn entry_with_unix_timestamp(entry: Entry, timestamp_secs: u64) -> Entry {
         entry.with_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(timestamp_secs))
+    }
+
+    /// Head-block timestamp for `chain`, cached for [`HEAD_TS_TTL`].
+    /// Returns `None` on RPC failure — listings must not fail (or slow
+    /// down under readdir bursts) because a metadata fetch did.
+    async fn head_timestamp_cached(&self, chain: &str, client: &ChainClient) -> Option<u64> {
+        if let Some((fetched_at, ts)) = self.block_ts_cache.lock().head.get(chain)
+            && fetched_at.elapsed() < HEAD_TS_TTL
+        {
+            return Some(*ts);
+        }
+        let ts = match client.block_latest().await {
+            Ok(Some(block)) => block.header.timestamp,
+            _ => return None,
+        };
+        self.block_ts_cache
+            .lock()
+            .head
+            .insert(chain.to_string(), (Instant::now(), ts));
+        Some(ts)
+    }
+
+    /// Timestamp of mined block `number` on `chain`. Cached without a
+    /// TTL: block timestamps are immutable once mined.
+    async fn block_timestamp_cached(
+        &self,
+        chain: &str,
+        number: u64,
+        client: &ChainClient,
+    ) -> Option<u64> {
+        let key = (chain.to_string(), number);
+        if let Some(ts) = self.block_ts_cache.lock().by_number.get(&key) {
+            return Some(*ts);
+        }
+        let ts = match client.block_by_number(number).await {
+            Ok(Some(block)) => block.header.timestamp,
+            _ => return None,
+        };
+        let mut cache = self.block_ts_cache.lock();
+        if cache.by_number.len() >= BLOCK_TS_CACHE_CAP {
+            cache.by_number.clear();
+        }
+        cache.by_number.insert(key, ts);
+        Some(ts)
     }
 
     fn json_hex_u64(value: &serde_json::Value, key: &str) -> Option<u64> {
@@ -1329,26 +1395,24 @@ impl ChainsHandler {
                     Entry::file("timestamp"),
                     Entry::file("full.json"),
                 ];
-                match client.block_latest().await {
-                    Ok(Some(block)) => Ok(entries
+                match self.head_timestamp_cached(chain, &client).await {
+                    Some(ts) => Ok(entries
                         .into_iter()
-                        .map(|entry| Self::entry_with_unix_timestamp(entry, block.header.timestamp))
+                        .map(|entry| Self::entry_with_unix_timestamp(entry, ts))
                         .collect()),
-                    _ => Ok(entries),
+                    None => Ok(entries),
                 }
             }
             3 if segs[1] == "blocks" => {
                 // /chains/<chain>/blocks/<number>
                 let entries: Vec<Entry> = BLOCK_FILES.iter().map(|n| Entry::file(n)).collect();
                 Ok(match segs[2].parse::<u64>() {
-                    Ok(n) => match client.block_by_number(n).await {
-                        Ok(Some(block)) => entries
+                    Ok(n) => match self.block_timestamp_cached(chain, n, &client).await {
+                        Some(ts) => entries
                             .into_iter()
-                            .map(|entry| {
-                                Self::entry_with_unix_timestamp(entry, block.header.timestamp)
-                            })
+                            .map(|entry| Self::entry_with_unix_timestamp(entry, ts))
                             .collect(),
-                        _ => entries,
+                        None => entries,
                     },
                     Err(_) => entries,
                 })
@@ -1908,6 +1972,39 @@ mod tests {
             leaf.modified.is_none(),
             "lookup must not RPC-fetch timestamps"
         );
+    }
+
+    #[tokio::test]
+    async fn listing_timestamps_come_from_cache_not_rpc() {
+        // No eth_getBlockByNumber route is registered: a listing that
+        // still surfaces a timestamp can only have read the cache.
+        let rpc = spawn_rpc(31_342, std::collections::HashMap::new());
+        let h = ChainsHandler::new(registry_for_rpc(rpc, 31_342));
+        {
+            let mut cache = h.block_ts_cache.lock();
+            cache.by_number.insert(("test".into(), 7), 1_700_000_500);
+            cache
+                .head
+                .insert("test".into(), (Instant::now(), 1_700_000_600));
+        }
+
+        let expected_block =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_500);
+        let blocks = h
+            .list(&VfsPath::parse("/test/blocks/7").unwrap())
+            .await
+            .unwrap();
+        assert!(!blocks.is_empty());
+        assert!(blocks.iter().all(|e| e.modified == Some(expected_block)));
+
+        let expected_head =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_600);
+        let head = h
+            .list(&VfsPath::parse("/test/head").unwrap())
+            .await
+            .unwrap();
+        assert!(!head.is_empty());
+        assert!(head.iter().all(|e| e.modified == Some(expected_head)));
     }
 
     #[tokio::test]
