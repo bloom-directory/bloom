@@ -149,7 +149,7 @@ A fresh Bloom VFS root exposes these default entries:
 - `prices/{spot,change_24h}/<coin>` — DefiLlama keyless price oracle.
 - `addressbook/<alias>` — local petname directory.
 - `ens/<name>.eth` — ENS forward resolution as a read surface.
-- `apps/<name>/` — installed local petal app surfaces.
+- `petals/<name>/` — installed local petal app surfaces.
 - `requests/` — free and paid HTTP requests. Paid HTTP 402 challenges are
   staged under `pending/`, exposed as `plan.md`, and only signed after a
   confirm write.
@@ -189,7 +189,7 @@ Bloom is a Rust Cargo workspace. The main user-facing/runtime crates are:
 | `bloom-watch` | Subscription registry and polling executor. |
 | `bloom-mount` | NFSv4 mount adapter behind the `mount` feature. |
 | `bloom-tools` | Pure crypto/encoding helpers. |
-| `bloom-etherscan` | Etherscan v2 multichain client and on-disk TTL cache. |
+| `bloom-etherscan` | Etherscan multichain client and on-disk TTL cache. |
 | `bloom-ens` | ENS namehash plus forward/reverse/text/contenthash resolution. |
 | `bloom-prices` | DefiLlama keyless price oracle. |
 | `bloom-proto` | Shared config, audit, address book, intent, policy, plan, path, and unit types. |
@@ -234,7 +234,7 @@ and example crates used by the broader Bloom runtime and examples.
   `allow_broadcast = true`. Forgetting the second is the most common
   cause of "stage works, confirm 403s".
 - **Embedded indexer deferred.** Address activity, ERC-20 / ERC-721
-  history, and contract source / ABI are served via Etherscan v2; no
+  history, and contract source / ABI are served via Etherscan; no
   local block-by-block index yet. The selected backend is visible under
   `status/backends/`.
 - **Mempool support is provider-gated.** Alchemy pending-transaction

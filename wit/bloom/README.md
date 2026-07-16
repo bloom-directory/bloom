@@ -1,6 +1,6 @@
 # Bloom WIT contracts
 
-The `route` package is the v2 local app route ABI. Its `deps/` directory checks
+The `route` package is the Petal route ABI. Its `deps/` directory checks
 in the Bloom-owned host capability packages that route components may import.
 
 Validate the contracts with:

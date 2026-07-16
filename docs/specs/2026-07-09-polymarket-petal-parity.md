@@ -7,7 +7,7 @@ enforcement from scope.
 
 ## Objective
 
-Bring the `polymarket` v2 local Petal to functional parity with the native
+Bring the `polymarket` Petal to functional parity with the native
 Polymarket surface without adding Polymarket-specific daemon IPC. The Petal
 owns protocol semantics and user-facing routes. The daemon supplies only
 generic authority, chain-read, and transaction-execution primitives.
@@ -36,12 +36,11 @@ other venue-specific daemon command.
 
 ### Structured signing result
 
-Version `bloom:sign/signing` to `0.2.0` without changing the existing `0.1.0`
-interface. The new interface returns structured approval state rather than an
-error string containing a ceremony URL.
+Define the initial `bloom:sign/signing@0.1.0` interface with a structured
+approval result rather than an error string containing a ceremony URL.
 
 ```wit
-package bloom:sign@0.2.0;
+package bloom:sign@0.1.0;
 
 interface signing {
   record approval-required {
@@ -60,7 +59,7 @@ interface signing {
 }
 ```
 
-The daemon must derive action identity from trusted v2 route provenance and
+The daemon must derive action identity from trusted Petal route provenance and
 the exact hash. It must not accept app-selected Petal identity, route identity,
 or action ID.
 

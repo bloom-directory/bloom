@@ -163,7 +163,7 @@ steps open a passkey ceremony — run them in the foreground with a human presen
 or use a local wallet with `BLOOM_PASSPHRASE` set for headless runs:
 
 ```sh
-# Onboard: deploy the deposit wallet, approve the V2 contracts, mint CLOB creds,
+# Onboard: deploy the deposit wallet, approve the contracts, mint CLOB creds,
 # sync buying power. Optionally fund inline with --target-pusd/--max-spend.
 bloom polymarket onboard alice --target-pusd 5 --max-spend 8
 
@@ -182,7 +182,7 @@ bloom polymarket cancel alice <order-id>
 bloom polymarket obligations alice            # read-only: open positions + next exit
 bloom polymarket redeem alice <market-slug>   # after resolution (redeemable positions)
 bloom polymarket withdraw-pusd alice all      # deposit wallet → owner EOA
-bloom polymarket revoke-approvals alice       # withdraw the V2 spending approvals
+bloom polymarket revoke-approvals alice       # withdraw the spending approvals
 ```
 
 Caveats: only true binary YES/NO markets trade; geoblock is fail-closed (refuses

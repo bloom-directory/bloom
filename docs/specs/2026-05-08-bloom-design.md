@@ -581,7 +581,7 @@ Negative caching for not-found / not-a-contract.
 
 ### 5.2 Etherscan
 
-- Etherscan v2 multi-chain API (single key, many chains) preferred.
+- Etherscan multi-chain API (single key, many chains) preferred.
 - Used for: verified source, ABI, activity (tx history), token
   metadata, internal txs.
 - Sourcify fallback for source where Etherscan doesn't have it.

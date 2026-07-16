@@ -123,7 +123,7 @@ Verified end-to-end via `tests/docker/run.sh --mempool`.
 
 | Requirement | Status | Artifact |
 |---|---|---|
-| Etherscan v2 multichain client + on-disk cache | shipped | `crates/bloom-etherscan/src/{lib.rs,cache.rs}` |
+| Etherscan multichain client + on-disk cache | shipped | `crates/bloom-etherscan/src/{lib.rs,cache.rs}` |
 | Embedded indexer | deferred | Activity / history served via Etherscan; no local block index. The Etherscan↔RPC boundary is now explicit per-feature via `[backends]` in `Config` (`crates/bloom-proto/src/config.rs::BackendsConfig`); selecting `indexer` returns a clear "not yet implemented" error. Live config readable at `status/backends/<feature>` and `status/backends/summary.json`. |
 | Per-feature backend declaration (etherscan / rpc / indexer) | shipped | `crates/bloom-proto/src/config.rs::BackendsConfig`; gating in `crates/bloom-vfs/src/handlers/chains.rs::ChainsHandler::require_etherscan_backend`; surface in `crates/bloom-vfs/src/handlers/status.rs` (`status/backends/...`). |
 | ENS forward + reverse resolution | shipped | `crates/bloom-ens/src/lib.rs::EnsClient::{resolve,reverse,text,content_hash}` |
@@ -178,7 +178,7 @@ Verified end-to-end via `tests/docker/run.sh --mempool`.
 | Base mainnet RPC | `https://mainnet.base.org` (chain_id 8453) | `vfs cat /chains/base/head/number` |
 | Ethereum mainnet RPC | `https://ethereum-rpc.publicnode.com` | `vfs cat /chains/ethereum/head/number` |
 | DefiLlama keyless price oracle | `coins.llama.fi` | `vfs cat /prices/spot/eth.usd` |
-| Etherscan v2 multichain (txlist) | `api.etherscan.io/v2` chainid=1 | `vfs cat /chains/ethereum/addresses/0xd8dA…6045/txs` |
+| Etherscan multichain (txlist) | `api.etherscan.io/v2` chainid=1 | `vfs cat /chains/ethereum/addresses/0xd8dA…6045/txs` |
 | ENS canonical-registry forward resolution | mainnet via tx-engine resolver | staged `send 0.0001 eth to vitalik.eth on ethereum` → `plan.md` shows `To: 0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045` |
 | VFS-based wallet creation (round-trip) | local | `vfs write /wallets/new --data 'bob'` → `vfs cat /wallets/bob/address` |
 | Native ETH send (live) | Base, chain_id 8453 | `0xd4a496fb…3c40` — 0.001 ETH dest1→dest2 |
@@ -200,8 +200,8 @@ Verified end-to-end via `tests/docker/run.sh --mempool`.
    re-scan for sandwich victims. Stage-time analysis flags risky
    intents at `pending/<id>/mev_risk.json`. See
    `docs/specs/2026-05-12-mempool-and-private-orderflow-design.md`.
-3. **Embedded block indexer** — activity / history rely on Etherscan
-   v2; without an `[etherscan]` config block, those paths return
+3. **Embedded block indexer** — activity / history rely on Etherscan;
+   without an `[etherscan]` config block, those paths return
    `NotFound`.
 4. **Mainnet-fork acceptance scenarios.** `acceptance.sh` skips
    scenarios 3 + 4 unless `BLOOM_MAINNET_RPC` is set.
@@ -228,7 +228,7 @@ crates/
 ├── bloom-defi           # Enso shortcuts client + natural-language intent parser
 ├── bloom-watch          # Subscription registry + executor task + event log rotation
 ├── bloom-tools          # Pure crypto/abi/encoding utilities
-├── bloom-etherscan      # Etherscan v2 client + TTL cache
+├── bloom-etherscan      # Etherscan client + TTL cache
 ├── bloom-ens            # ENS namehash + forward / reverse / text / contenthash
 ├── bloom-prices         # DefiLlama keyless price oracle
 ├── bloom-mount          # NFSv4 adapter (feature `mount`)

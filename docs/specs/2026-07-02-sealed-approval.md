@@ -954,7 +954,7 @@ Field meanings:
 - `max_ttl_secs`: maximum grant lifetime the daemon may mint for this action.
 - `max_signatures`: maximum wallet signatures allowed across the action.
 - `allowed_sign_intents`: exact `intent` strings the Petal may pass to
-  `sign-hash`, such as `polymarket.order.v2`,
+  `sign-hash`, such as `polymarket.order.v1`,
   `hyperliquid.approve_agent`, or `wallet_policy.sign`.
 - `assurance`: required approval strength copied into the challenge.
 - `extra`: daemon-owned extension map for Petal-specific host terms that are

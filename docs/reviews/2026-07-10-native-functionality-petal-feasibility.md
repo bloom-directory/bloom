@@ -2,7 +2,7 @@
 
 **Date:** 10 July 2026  
 **Status:** Code-backed architecture assessment  
-**Scope:** Native Bloom VFS surfaces and supporting crates compared with the current local Petal v2 ABI.
+**Scope:** Native Bloom VFS surfaces and supporting crates compared with the current local Petals v1 ABI.
 
 ## Executive conclusion
 
@@ -48,7 +48,7 @@ A Petal can technically wrap most existing native surfaces through `bloom:vfs/re
 | Signing | Sign one 32-byte hash for a declared intent, with structured approval-required result |
 | Transactions | Stage, confirm, and inspect one ordinary EVM transaction |
 | Chain | `eth_chainId`, latest `eth_getBalance`, and latest `eth_call` |
-| VFS | Broad lookup/list/read/write of native VFS, except `/apps` |
+| VFS | Broad lookup/list/read/write of native VFS, except `/petals` |
 | Environment | Time and bounded random bytes |
 
 ## Summary matrix

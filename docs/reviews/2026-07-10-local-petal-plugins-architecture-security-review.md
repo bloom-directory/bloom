@@ -22,7 +22,7 @@ to:
 ```text
 versioned multi-route app package
   -> validated, composed, content-addressed install
-  -> mounted at apps/<app>/
+  -> mounted at petals/<app>/
   -> invoked through ordinary VFS operations
   -> Wasm Component Model route ABI
   -> capability-mediated daemon services
@@ -58,10 +58,10 @@ package normalization + strict validation
         +-- metadata + source provenance
         |
         v
-daemon mounts PetalRouter at /apps
+daemon mounts PetalRouter at /petals
         |
         v
-/apps/<app>/<route>
+/petals/<app>/<route>
         |
         +-- match route and parameters
         +-- evaluate/narrow dynamic metadata
@@ -98,21 +98,21 @@ That product surface is gone:
 - CLI `Run` and `Name` subcommands were removed.
 - Raw `.wasm` and `.wat` installation is no longer accepted.
 - IPC method names still exist for compatibility, but raw install and run now return explicit unsupported errors.
-- Listing now enumerates installed v2 packages and reports their `apps/<name>/` mount.
+- Listing now enumerates installed Petal packages and reports their `petals/<name>/` mount.
 - The CLI accepts package directories, `.petal.tar` files, or trusted GitHub source repositories.
 
 Some lower-level v1 primitives remain public: `PetalStore::install`, `PetalVm::run`, the registry, and core-Wasm machinery. They are no longer wired into the supported daemon/CLI execution path. This is therefore a breaking product/API migration even though some library compatibility remains.
 
 ## 2. Petals are now content-addressed app packages
 
-The new unit is a `bloom.petal.local-app.v2` package represented by `PreparedAppPackage`.
+The new unit is a `bloom.petal.package.v1` package represented by `PreparedAppPackage`.
 
 A valid package requires:
 
 - `petal.toml`
 - `README.md`
 - `AGENTS.md`
-- exactly one `app/<name>/` route tree
+- exactly one `petal/<name>/` route tree
 - one or more `.wasm` route components
 
 The manifest can declare:
@@ -235,7 +235,7 @@ Matching uses a specificity tuple based on:
 
 Overlapping dynamic routes of equal specificity are rejected at install time, preventing order-dependent ambiguity.
 
-The new `PetalRouter` is mounted at `/apps` by the daemon. It:
+The new `PetalRouter` is mounted at `/petals` by the daemon. It:
 
 - lists installed applications
 - resolves the first segment as an app mount
@@ -396,7 +396,7 @@ Residual local-filesystem risks include symlink following inside a pre-compromis
 
 Components can read, list, lookup, or write the live Bloom VFS when granted VFS capability.
 
-The entire `/apps` subtree is denied to component VFS calls, preventing recursion and cross-app invocation.
+The entire `/petals` subtree is denied to component VFS calls, preventing recursion and cross-app invocation.
 
 Otherwise, access is broad: there is no manifest path-prefix allowlist. A VFS-capable component can reach wallet, chain, request, status, and other mounted surfaces, subject to downstream handlers' own authorization rules.
 
@@ -419,7 +419,7 @@ Signing v0.2 returns either:
 - a signature
 - structured `approval-required` information containing action ID, ceremony URL, and expiry
 
-The daemon rejects signing without trusted v2 route context.
+The daemon rejects signing without trusted Petal route context.
 
 It constructs a short-lived Sealed Action bound to:
 
@@ -503,7 +503,7 @@ It:
 - checks out a detached commit
 - validates source provenance in `petal.toml`
 - runs the declared build command
-- validates the generated v2 package
+- validates the generated Petal package
 - records owner, repo, requested ref, selected tag, resolved commit, and package hash
 
 This is useful supply-chain provenance, but it is also the branch's largest security regression.
@@ -583,7 +583,7 @@ Several adjacent changes support the new architecture:
 - Polymarket wallet names are standardized to 1-64 characters of `[A-Za-z0-9_-]`, eliminating dots and tightening path safety.
 - POLY_1271 wrapping was separated from raw signing so a Wasm app can request a digest signature from the host and perform deterministic wrapping without key access.
 - Polymarket onboarding is now allowed through the ordinary grant-gated write path instead of being treated as a raw cached-signer lane.
-- CLI onboarding detection recognizes both native `/polymarket/...` and `/apps/polymarket/...` paths.
+- CLI onboarding detection recognizes both native `/polymarket/...` and `/petals/polymarket/...` paths.
 - Chain method-body paths gain an optional `@<nonce>` scope to avoid collisions between concurrently staged method bodies.
 - Credential permission handling is made portable with Unix-only permission calls.
 - CI installs the Wasm target and `wasm-tools` needed for package/component tests.
@@ -624,7 +624,7 @@ The new runtime security architecture is materially stronger:
 - redirect and response-size hardening
 - raw IPC execution removed
 
-The attack surface is nevertheless much larger because Petals can now perform useful application work through `/apps`: network calls, persistence, VFS interaction, signing requests, and policy-constrained transaction execution.
+The attack surface is nevertheless much larger because Petals can now perform useful application work through `/petals`: network calls, persistence, VFS interaction, signing requests, and policy-constrained transaction execution.
 
 The main residual concerns, in priority order, are:
 

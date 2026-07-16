@@ -1,4 +1,4 @@
-# Polymarket v2 Integration
+# Polymarket Integration
 
 **Status (2026-06-13): implemented; live entry and exit completed.** Bloom's
 tradeable path is deposit-wallet mode: it creates/loads CLOB creds, creates a
@@ -16,7 +16,7 @@ instruction to trade.
 
 **Trading facts enforced by KATs in `crates/bloom-polymarket/src/order.rs`:**
 
-- CLOB signs the V2 order struct:
+- CLOB signs the order struct:
   `Order(salt,maker,signer,tokenId,makerAmount,takerAmount,side,signatureType,timestamp,metadata,builder)`.
 - EIP-712 domain is `"Polymarket CTF Exchange"`, version `"2"` for normal and
   neg-risk exchanges; only verifying contract differs.
@@ -125,7 +125,7 @@ The owner EOA signs:
 
 1. CLOB L1 auth for API creds.
 2. Relayer `Batch` EIP-712 for deposit-wallet calls.
-3. CLOB V2 orders with `signatureType = 3`, POLY_1271 / ERC-7739 wrapped.
+3. CLOB orders with `signatureType = 3`, POLY_1271 / ERC-7739 wrapped.
 
 ## Onboarding State
 

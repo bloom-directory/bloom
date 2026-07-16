@@ -2,12 +2,12 @@
 
 **Status:** Initial detailed specification  
 **Date:** 10 July 2026  
-**Depends on:** Local Petal Plugins v2, Sealed Approval, Polymarket Petal Parity  
+**Depends on:** Local Petal Plugins v1, Sealed Approval, Polymarket Petal Parity
 **Scope:** Extend the generic Petal platform so venue and protocol integrations can move out of native Bloom without moving Bloom's security kernel into untrusted Wasm.
 
 ## 0. Summary
 
-Bloom's current Petal v2 platform is sufficient for request-driven applications that need static-host HTTPS, per-package KV, simple chain calls, one-hash signing, and ordinary EVM transactions.
+Bloom's current Petals v1 platform is sufficient for request-driven applications that need static-host HTTPS, per-package KV, simple chain calls, one-hash signing, and ordinary EVM transactions.
 
 It is not sufficient for full replacement of native Hyperliquid, paid HTTP, DeFi, watch, simulation, chain explorer, or system-provider functionality.
 
@@ -97,7 +97,7 @@ Production remote installation does not run repository build commands on the use
 - Bloom verifies the publisher key, release manifest, archive hash, normalized package hash, and source provenance before activation.
 - GitHub organization membership alone is not a publisher signature.
 - Reproducible rebuild verification happens in CI or another explicitly configured builder and is evidence attached to the release; it is not ambient code execution during install.
-- `bloom petals app build` remains a local developer command. It creates an artifact but does not activate it.
+- `bloom petals build` remains a local developer command. It creates an artifact but does not activate it.
 - Any compatibility path that executes a remote source build is development-only, disabled by default, and requires an explicit unsafe flag plus pre-build consent.
 
 This removes the current highest-risk install behavior instead of relying on a cross-platform sandbox that is not yet designed.
@@ -189,10 +189,10 @@ No additional privileged capability SHOULD ship before Phase 0 is complete.
 | Item | Decision/default | Primary code ownership | Acceptance criteria |
 | --- | --- | --- | --- |
 | Remote source execution | Production remote installs are prebuilt-artifact-only per D3. Legacy source execution is disabled unless an unsafe development flag is present. | `crates/bloom/src/github_source.rs`, `crates/bloom/src/main.rs` | Installing a GitHub URL never invokes `Command` in the default build; tests use a canary executable and verify it is not run. |
-| Two-stage consent | Acquisition/build ceiling before optional local build; final activation consent after composition and ABI validation. No package is mounted before activation confirmation. | `crates/bloom/src/main.rs`, `crates/bloom/src/github_source.rs`, `crates/bloom-petals/src/v2.rs`, `crates/bloom-petals/src/store.rs` | Declining either stage leaves package store, activation records, mounts, jobs, and secrets unchanged. Final consent reflects actual composed imports. |
-| Route consent metadata | Parse and preserve `description` and `consent-summary`, tag both as app-provided, and include them in activation output. | `wit/bloom/route/route.wit`, `crates/bloom-petals/src/vm.rs`, `crates/bloom-petals/src/v2.rs` | Component metadata round-trips into route index/consent; control and bidi characters are rejected or escaped. |
+| Two-stage consent | Acquisition/build ceiling before optional local build; final activation consent after composition and ABI validation. No package is mounted before activation confirmation. | `crates/bloom/src/main.rs`, `crates/bloom/src/github_source.rs`, `crates/bloom-petals/src/package.rs`, `crates/bloom-petals/src/store.rs` | Declining either stage leaves package store, activation records, mounts, jobs, and secrets unchanged. Final consent reflects actual composed imports. |
+| Route consent metadata | Parse and preserve `description` and `consent-summary`, tag both as app-provided, and include them in activation output. | `wit/bloom/route/route.wit`, `crates/bloom-petals/src/vm.rs`, `crates/bloom-petals/src/package.rs` | Component metadata round-trips into route index/consent; control and bidi characters are rejected or escaped. |
 | Installed integrity | Verify route-index/package binding and artifact hash before first dispatch; cache successful verification by immutable file identity and invalidate on metadata change. | `crates/bloom-petals/src/store.rs`, `crates/bloom-petals/src/runner.rs` | Modifying source, route index, or artifact after install prevents dispatch under the old package identity. |
-| Ingestion limits | Apply the concrete defaults in Section 21 before `read_to_end`, component parsing, or composition. | `crates/bloom-petals/src/v2.rs`, `crates/bloom-petals/src/store.rs` | Oversized directory and tar inputs fail before unbounded allocation; boundary tests cover every limit. |
+| Ingestion limits | Apply the concrete defaults in Section 21 before `read_to_end`, component parsing, or composition. | `crates/bloom-petals/src/package.rs`, `crates/bloom-petals/src/store.rs` | Oversized directory and tar inputs fail before unbounded allocation; boundary tests cover every limit. |
 | Component deadline | Wasmtime epoch interruption; default route deadline 10 seconds, metadata deadline 2 seconds, configurable downward per runtime and upward only by daemon config. Expiry returns typed `timeout`, traps the instance, and records fuel/elapsed time. | `crates/bloom-petals/src/vm.rs`, `crates/bloom-petals/src/runner.rs` | A spinning component and a component blocked in a cancellable host call terminate within deadline plus 250 ms scheduling tolerance. |
 | Filesystem hardening | Petal data directories mode `0700`; no-follow/beneath-root traversal; randomized create-new temporary files; equivalent owner ACL on supported non-Unix platforms. | `crates/bloom-petals/src/private_store.rs`, `crates/bloom-petals/src/store.rs` | Pre-planted symlinks and temp-name collisions cannot redirect or weaken private/secret writes. |
 | Single metadata snapshot | Evaluate dynamic metadata exactly once and pass the immutable result into async/sync dispatch. | `crates/bloom-petals/src/router.rs`, `crates/bloom-petals/src/runner.rs` | A nondeterministic metadata component cannot cause routing and execution to observe different mode/async/capability values. |
@@ -214,7 +214,7 @@ acquire and authenticate artifact
   -> enable mount, jobs, secrets, and providers
 ```
 
-Package bytes MAY be placed in a quarantine/cache before activation, but they MUST NOT appear in `local_app_mounts`, receive stable app storage, start jobs, or use secret handles until the activation transaction commits.
+Package bytes MAY be placed in a quarantine/cache before activation, but they MUST NOT appear in `petal_mounts`, receive stable app storage, start jobs, or use secret handles until the activation transaction commits.
 
 ## 6. Capability taxonomy
 
@@ -302,7 +302,7 @@ Rules:
 
 ### 7.1 Motivation
 
-`bloom:sign@0.2.0` accepts `(wallet, hash32, intent)`. This is sufficient cryptographically but insufficient for:
+`bloom:sign@0.1.0` accepts `(wallet, hash32, intent)`. This is sufficient cryptographically but insufficient for:
 
 - one approval covering multiple stable hashes
 - binding amount, asset, payee, venue, or order facts
@@ -497,7 +497,7 @@ This avoids pretending a generic schema string is a security boundary.
 
 ### 7.8 Compatibility
 
-`bloom:sign@0.1.0` and `0.2.0` remain supported. `bloom:auth/actions@0.1.0` is additive. Applications requiring multi-hash or semantic actions use the new interface.
+`bloom:sign@0.1.0` remains supported. `bloom:auth/actions@0.1.0` is additive. Applications requiring semantic actions use the new interface.
 
 ## 8. Secret and delegated-key vault
 
@@ -611,7 +611,7 @@ Migration rules:
 Stable app storage does not reuse the current file-per-key `PrivateStore`. Add `AppStore`, backed by one owner-only SQLite database per app instance:
 
 ```text
-~/.bloom/petals/apps/<app-instance-id>/data.sqlite
+~/.bloom/petals/petals/<app-instance-id>/data.sqlite
 ```
 
 Minimum schema:
@@ -1000,7 +1000,7 @@ Rules:
 2. `.`/`..`, alternate separators, NULs, symlink escapes, and ambiguous encodings are rejected before policy evaluation.
 3. Read and write are independent imports and independent consent items.
 4. Runtime masks intersect manifest prefixes and can only narrow them.
-5. `/apps` remains denied; typed cross-app calls require the separate dependency model.
+5. `/petals` remains denied; typed cross-app calls require the separate dependency model.
 6. Keystore-private files, approval/grant internals, raw audit storage, Petal data roots, and daemon control files are permanently non-addressable through Petal VFS.
 7. A root prefix or wildcard spanning multiple mounts is Class R3 and requires explicit high-risk consent. It is not eligible for unattended installation policy.
 8. Typed host interfaces take precedence. New first-party Petals MUST NOT request VFS access for facts available through wallet, chain, address-book, outbox, or system interfaces.
@@ -1008,10 +1008,10 @@ Rules:
 
 Implementation ownership:
 
-- manifest/schema and consent: `crates/bloom-petals/src/v2.rs`
+- manifest/schema and consent: `crates/bloom-petals/src/package.rs`
 - policy parsing/intersection: `crates/bloom-petals/src/policy.rs`
 - VM enforcement: `crates/bloom-petals/src/vm.rs`
-- final path enforcement and `/apps` denial: `crates/bloom-petals/src/runner.rs`
+- final path enforcement and `/petals` denial: `crates/bloom-petals/src/runner.rs`
 
 Acceptance requires tests proving that allowed siblings, dynamic path segments, symlinks, and prefix-confusion strings cannot cross a declared boundary.
 
@@ -1073,7 +1073,7 @@ Keystore, approval verification, audit, and transaction signing are permanently 
 
 ## 18. Inter-app dependencies
 
-The current `/apps` VFS denial prevents recursion and confused-deputy behavior. Preserve that default.
+The current `/petals` VFS denial prevents recursion and confused-deputy behavior. Preserve that default.
 
 If typed cross-Petal calls are introduced, they require:
 
@@ -1460,7 +1460,7 @@ Initial file-level ownership map:
 
 | Primitive | Primary files/crates |
 | --- | --- |
-| Activation records/stable identity | `crates/bloom-petals/src/meta.rs`, `store.rs`, `v2.rs`, new `activation.rs`; CLI flows in `crates/bloom/src/main.rs` and `github_source.rs`; daemon mount discovery in `crates/bloom-daemon/src/lib.rs` |
+| Activation records/stable identity | `crates/bloom-petals/src/meta.rs`, `store.rs`, `package.rs`, new `activation.rs`; CLI flows in `crates/bloom/src/main.rs` and `github_source.rs`; daemon mount discovery in `crates/bloom-daemon/src/lib.rs` |
 | Prepared actions | WIT under `wit/bloom/`; types/validation in `bloom-auth-api`; SQLite state in `bloom-auth`; host orchestration in `bloom-daemon`; VM adapter in `bloom-petals/src/vm.rs` |
 | Secret injection/delegated keys | new vault implementation adjacent to `bloom-keystore`; policy and WIT adapters in `bloom-petals`; HTTP injection in `bloom-daemon`; provisioning CLI in `bloom/src/main.rs` |
 | Transaction workflows | `bloom-proto/src/plan.rs`; `bloom-tx/src/outbox.rs` and `tx_engine.rs`; daemon Petal host; `bloom-petals/src/abi.rs` and `vm.rs`; new WIT under `wit/bloom/route/deps/tx/` |

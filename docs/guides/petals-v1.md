@@ -1,16 +1,16 @@
-# Local Petal Apps v2
+# Petals v1
 
-v2 local apps are content-addressed packages whose `app/<name>/` tree defines
-the `/apps/<name>/` VFS surface.
+Petals are content-addressed packages whose `petal/<name>/` tree defines
+the `/petals/<name>/` VFS surface.
 
 Required files:
 
 - `petal.toml`
 - `README.md`
 - `AGENTS.md`
-- at least one `app/<name>/**/*.wasm` route
+- at least one `petal/<name>/**/*.wasm` route
 
-v2 apps run only `bloom:route@0.1.0` component routes. Component route imports
+Petals run only `bloom:route@0.1.0` component routes. Component route imports
 are validated against Bloom-owned WIT at build/install time; direct component
 exports are invoked by the component runner. Each normal file route must export
 the full `route-file` world: `metadata`, `lookup`, `list`, `read`, and `write`.
@@ -32,7 +32,7 @@ composition support.
 Useful commands:
 
 ```sh
-bloom petal app build path/to/package --out app.petal.tar
+bloom petals build path/to/package --out app.petal.tar
 bloom petals install path/to/package
 bloom petals install app.petal.tar
 bloom petals install https://github.com/bloom-directory/bloom-petal-polymarket
@@ -40,14 +40,14 @@ bloom petals install https://github.com/bloom-directory/bloom-petal-polymarket -
 bloom petals ls
 ```
 
-`bloom petal app build` validates the package, writes generated route artifacts
+`bloom petals build` validates the package, writes generated route artifacts
 under `artifacts/`, and emits a deterministic `.petal.tar` when `--out` is set.
 
 `bloom petals install <trusted-github-url>` accepts source repositories under
 `bloom-directory`. By default it installs the latest SemVer-like tag; pass
 `--ref <tag-or-sha>` to pin a tag, branch, or commit explicitly. GitHub source
 repos must declare `[build] command = "..."` in `petal.toml`; Bloom runs that
-trusted command locally, validates the generated v2 package through the same
+trusted command locally, validates the generated Petal package through the same
 package pipeline as local directories and `.petal.tar` archives, then records
 the source URL, selected tag/ref, resolved commit, and package hash in install
 metadata. Raw remote `.wasm` URLs and unsupported GitHub owners are rejected.

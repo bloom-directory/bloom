@@ -5,9 +5,9 @@
 This closeout covers branch `feat/local-petal-plugins` against
 `docs/superpowers/specs/2026-06-22-local-petal-plugins-design.md`.
 
-The surviving post-merge slice is off-chain only: local, content-addressed v2 app
+The surviving post-merge slice is off-chain only: local, content-addressed Petal
 packages with `petal.toml`, default-deny host capabilities, private per-petal
-storage, daemon-mediated HTTP, VFS dispatch through `apps/<mount>`, and CLI/IPC
+storage, daemon-mediated HTTP, VFS dispatch through `petals/<mount>`, and CLI/IPC
 install/list surfaces. Signing imports are intentionally disabled in the daemon
 until they are wired through Sealed Approval grants.
 
@@ -18,11 +18,11 @@ this scope.
 
 | Milestone | Status | Primary Evidence |
 | --- | --- | --- |
-| Package schema and validation | Complete | `bloom-petals` v2 `petal.toml` package validation, deterministic `.petal.tar`, route-index, and package install tests |
+| Package schema and validation | Complete | `bloom-petals` `petal.toml` package validation, deterministic `.petal.tar`, route-index, and package install tests |
 | Runtime capabilities | Complete | `bloom-petals` local host imports for VFS, HTTP, and private store; daemon redirect revalidation; signing fail-closed until Sealed Approval wiring exists |
-| Handler dispatch, router, CLI/IPC, consent | Complete | `PetalVm::dispatch`, `PetalRouter`, `apps/` mount, local install/list IPC, CLI install/list/read smoke |
+| Handler dispatch, router, CLI/IPC, consent | Complete | `PetalVm::dispatch`, `PetalRouter`, `petals/` mount, local install/list IPC, CLI install/list/read smoke |
 | GitHub source install | Complete | Trusted `bloom-directory/*` source clone/build/install path with remote-source parity coverage |
-| Polymarket app path | Complete for this branch | Polymarket route package/source install and onboarding status routing through `/apps/polymarket/...` |
+| Polymarket app path | Complete for this branch | Polymarket route package/source install and onboarding status routing through `/petals/polymarket/...` |
 
 ## Review Findings
 

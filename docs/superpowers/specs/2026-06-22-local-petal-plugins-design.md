@@ -1,8 +1,8 @@
 # Local Petal Plugins (v1) — Design
 
 Status: historical draft, superseded by
-`2026-06-23-local-petal-plugins-v2-revised.md` and
-`docs/guides/local-petal-apps-v2.md`
+`2026-06-23-petals-v1.md` and
+`docs/guides/petals-v1.md`
 Date: 2026-06-22
 Scope: an initial, piecemeal slice of the off-chain petal vision — **local, WASM-compiled,
 content-addressed petals that act as plugins to the main Bloom application** by owning a VFS
@@ -72,7 +72,7 @@ Every interface here is chosen so the deferred work drops in without a format or
                          ┌──────────────────────────────────────────┐
    NFS / VFS op          │ Bloom daemon                               │
    (lookup/list/read/    │                                            │
-    write on apps/…)     │   Vfs router ── mount "apps/" ──▶ PetalRouter
+    write on petals/…)     │   Vfs router ── mount "petals/" ──▶ PetalRouter
         ───────────────▶ │                                       │     │
                          │                                       ▼     │
                          │                          resolve mount → petal hash
@@ -96,7 +96,7 @@ Every interface here is chosen so the deferred work drops in without a format or
   `#[petal]` entry macro that generates `petal_alloc` + `petal_dispatch` and dispatches into the
   author's `lookup`/`list`/`read`/`write` functions. Authors write a normal crate and build with
   `cargo build --target wasm32-wasip1`.
-- **`bloom-petals` v2 package validation** (implemented later). The current branch uses
+- **`bloom-petals` Petal package validation** (implemented later). The current branch uses
   `petal.toml` plus route component validation inside `bloom-petals`; the deleted
   `bloom-petal-manifest` crate and on-chain manifest schema are not restored.
 - **`bloom-petals`** (extend existing).
@@ -105,7 +105,7 @@ Every interface here is chosen so the deferred work drops in without a format or
   - Add the new host imports (`http_fetch`, `sign_hash`, `store_*`) to local-mode linking.
   - Add per-petal private storage backing (`~/.bloom/petals/data/<hash>/`).
   - Extend `PetalMeta` with the parsed manifest, the new caps, and the network policy.
-- **`PetalRouter`** (new `Handler`, in `bloom-vfs` or `bloom-daemon`). Mounted at `apps/`.
+- **`PetalRouter`** (new `Handler`, in `bloom-vfs` or `bloom-daemon`). Mounted at `petals/`.
   Resolves the first path segment to an installed handler-petal (by declared `mount`), then
   routes the VFS op into that petal via `PetalVm`. Enforces namespace isolation (a petal only
   ever sees paths relative to its own mount).
@@ -118,27 +118,27 @@ Every interface here is chosen so the deferred work drops in without a format or
   plain file. At install, Bloom extracts + validates it and records the parsed form in
   `PetalMeta`. *(Rejected alternative: a loose sidecar TOML at install time — simpler, but the
   manifest would not be covered by the content hash, undercutting content-addressing.)*
-- **(b) Mount root is `apps/`.** A fresh top-level namespace (`petals/` is the on-chain endpoint
+- **(b) Mount root is `petals/`.** A fresh top-level namespace (`petals/` is the on-chain endpoint
   handler; `public/` is the artifact/names store). Each handler-petal declares a relative
-  `mount` (e.g. `polymarket`) and serves the tree under `apps/<mount>/…`. Namespacing under one
+  `mount` (e.g. `polymarket`) and serves the tree under `petals/<mount>/…`. Namespacing under one
   root means a petal cannot shadow native mounts (`wallets/`, `chains/`, …). The Polymarket petal
-  lands at `apps/polymarket/`, coexisting with the native `polymarket/` handler until it is ready
+  lands at `petals/polymarket/`, coexisting with the native `polymarket/` handler until it is ready
   to graduate.
 
 ---
 
 ## 2. Manifest (`petal.toml`)
 
-Superseded by the v2 local app package `petal.toml`; manifests are packaged
+Superseded by the Petal package `petal.toml`; manifests are packaged
 alongside route artifacts instead of embedded in a single wasm.
 
 ```toml
-schema = "bloom.petal.local-app.v2"
+schema = "bloom.petal.package.v1"
 name   = "polymarket"
 
 [provides]
 kind  = "vfs"            # v1: only "vfs". Future: "stream", "rpc".
-mount = "polymarket"      # served under apps/polymarket/
+mount = "polymarket"      # served under petals/polymarket/
 
 # Capabilities — default-deny. Declared here, narrowable at run time, never widened.
 caps = ["vfs.read", "vfs.write", "net.fetch", "sign", "store"]
@@ -308,10 +308,10 @@ Inherit v0 local-mode limits: 100M fuel, 16 MiB / 256-page memory, single-thread
 
 ## 5. Routing & mount (`PetalRouter`)
 
-A single `Handler` mounted at `apps/`.
+A single `Handler` mounted at `petals/`.
 
-- `apps/` `list` → the set of installed handler-petals (by `mount` name).
-- `apps/<mount>/…` → resolve `<mount>` to an installed petal hash; strip the `apps/<mount>`
+- `petals/` `list` → the set of installed handler-petals (by `mount` name).
+- `petals/<mount>/…` → resolve `<mount>` to an installed petal hash; strip the `petals/<mount>`
   prefix; pass the remainder as the request `path` into `petal_dispatch`.
 - **Namespace isolation**: the petal only ever receives paths relative to its own mount and can
   only act on the outside world through its granted host imports — it cannot escape its subtree
@@ -321,7 +321,7 @@ A single `Handler` mounted at `apps/`.
 CLI/IPC: extend the existing surfaces rather than inventing new ones — `bloom petals install`
 learns to extract/validate the embedded manifest and print the install-time consent summary;
 `petals.install` / `petals.list` carry the parsed manifest. Mounting a handler-petal makes it
-visible under `apps/` automatically; no separate "run" step is needed for the VFS path.
+visible under `petals/` automatically; no separate "run" step is needed for the VFS path.
 
 ### Install-time consent
 
@@ -329,8 +329,8 @@ visible under `apps/` automatically; no separate "run" step is needed for the VF
 trusting the petal, e.g.:
 
 ```
-petal: polymarket  (hash 9f86…)  mount: apps/polymarket/
-  may read/write:  apps/polymarket/**
+petal: polymarket  (hash 9f86…)  mount: petals/polymarket/
+  may read/write:  petals/polymarket/**
   may fetch:       GET  gamma-api.polymarket.com/markets*, /events*
                    GET  data-api.polymarket.com/*
                    GET,POST clob.polymarket.com/book, /order, /auth/*
@@ -349,7 +349,7 @@ petal: polymarket  (hash 9f86…)  mount: apps/polymarket/
    - signing → `sign_hash`
    - `std::fs` persistence (creds/order/onboard) → `store_*`
 
-   Mounts at `apps/polymarket/`. Exercises every v1 capability, the async-write onboarding flow,
+   Mounts at `petals/polymarket/`. Exercises every v1 capability, the async-write onboarding flow,
    and secret storage.
 2. **Misc tools** proving the low end of the surface:
    - `gas-now` — no caps; input→output tool endpoint returning a gas recommendation.
@@ -365,7 +365,7 @@ petal: polymarket  (hash 9f86…)  mount: apps/polymarket/
   bits.
 - **Host-import integration** (`PetalVm` handler path with a mock `PetalHost`): cap default-deny;
   `--cap`/`--net` narrowing; async-write spawn-and-return; error-code mapping including overflow.
-- **Router**: `lookup`/`list`/`read`/`write` dispatch through `apps/<mount>/…`; namespace
+- **Router**: `lookup`/`list`/`read`/`write` dispatch through `petals/<mount>/…`; namespace
   isolation (a petal cannot escape its mount or collide with native mounts).
 - **End-to-end**: `gas-now`/`portfolio` run through the router with golden outputs; Polymarket
   against recorded HTTP fixtures. The existing `BLOOM_LIVE_POLYMARKET` live tests stay opt-in.
@@ -377,6 +377,6 @@ petal: polymarket  (hash 9f86…)  mount: apps/polymarket/
 - Exact byte layout of the request/response envelope and the `store_*` / `http_fetch` import
   signatures (ptr/len marshalling, header encoding).
 - Whether `PetalRouter` lives in `bloom-vfs` or `bloom-daemon`.
-- Migration/coexistence detail for `apps/polymarket/` vs the native `polymarket/` handler during
+- Migration/coexistence detail for `petals/polymarket/` vs the native `polymarket/` handler during
   the port (parity checklist before graduation).
 - `#[petal]` macro surface in `bloom-petal-sdk`.

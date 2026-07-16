@@ -89,7 +89,7 @@ Every `BLOOM_*` variable used by the binary, scripts, or test harness:
 |----------|---------|-------|
 | `BLOOM_HOME` | binary, all scripts | Override home dir. Default `~/.bloom`. |
 | `BLOOM_PASSPHRASE` | binary, scripts | Argon2id-derived KEK for the keystore. |
-| `BLOOM_ETHERSCAN_KEY` | bloom-etherscan, live tests | Etherscan v2 API key. |
+| `BLOOM_ETHERSCAN_KEY` | bloom-etherscan, live tests | Etherscan API key. |
 | `BLOOM_ENSO_KEY` | bloom-defi, docker `--enso*` | Enso Shortcuts key. |
 | `BLOOM_MAINNET_RPC` | bloom-ens live test, acceptance.sh §3/§4 | Optional; scenarios skip cleanly when unset. |
 | `BLOOM_LIVE_HOME` | docker `--enso-live` | Path to a real keystore (mounted **read-only** into container). |

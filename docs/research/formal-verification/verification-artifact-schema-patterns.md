@@ -401,7 +401,7 @@ TCT's versioning is entirely code-hash-driven:
 - There is no concept of "theorem versioning" — theorems are stateless, single-use
   objects attached to transactions. They are not persisted as curatable artifacts.
 - **Bloom extension:** Bloom would benefit from persisting theorems as versioned objects
-  that can be superseded. A theorem proven for petal v1 might be *updated* for v2 rather
+  that can be superseded. A theorem proven for Petals v1 might be *updated* for a later schema rather
   than discarded — the update itself is a curation action.
 
 ### (d) Challenge and invalidation
