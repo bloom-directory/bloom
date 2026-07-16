@@ -17,8 +17,8 @@ mod github_source;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
-use std::sync::atomic::AtomicI32;
 use std::sync::Arc;
+use std::sync::atomic::AtomicI32;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 static UPDATE_EXIT_CODE: AtomicI32 = AtomicI32::new(0);
