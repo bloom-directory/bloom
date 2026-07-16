@@ -54,7 +54,7 @@ impl std::str::FromStr for UpdateStatus {
 /// What an agent or user should do based on the snapshot. This is
 /// derived from the snapshot (not stored) so the VFS can render it
 /// without doing semver math at read time.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UpdateAvailable {
     /// `latest > installed` (semver compare succeeded and shows a

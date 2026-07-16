@@ -2191,18 +2191,13 @@ impl Daemon {
                 // (e.g. fresh daemon, no cache file yet). The
                 // `installed` field is always populated because it
                 // is baked into the binary at compile time.
+                //
+                // `bloom_vfs::handlers::status::UpdateAvailable` is a
+                // re-export of `bloom_update::UpdateAvailable`, so the
+                // `available()` verdict passes through without a
+                // three-arm match.
                 let s = update_checker_for_vfs.snapshot();
-                let available = match s.available() {
-                    bloom_update::UpdateAvailable::OutOfDate => {
-                        bloom_vfs::handlers::status::UpdateAvailable::OutOfDate
-                    }
-                    bloom_update::UpdateAvailable::UpToDate => {
-                        bloom_vfs::handlers::status::UpdateAvailable::UpToDate
-                    }
-                    bloom_update::UpdateAvailable::Unknown => {
-                        bloom_vfs::handlers::status::UpdateAvailable::Unknown
-                    }
-                };
+                let available = s.available();
                 let behind_by = s.behind_by();
                 let bloom_update::UpdateSnapshot {
                     installed,

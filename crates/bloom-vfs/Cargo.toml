@@ -29,6 +29,7 @@ bloom-prices.workspace = true
 bloom-etherscan.workspace = true
 bloom-ens.workspace = true
 bloom-revert.workspace = true
+bloom-update.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 toml.workspace = true

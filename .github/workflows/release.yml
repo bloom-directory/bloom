@@ -149,6 +149,11 @@ jobs:
             git tag "$TAG" "$SHA"
           fi
 
+          # Write the SHA output *before* the tag push so a failed
+          # tag push (e.g. another actor created it concurrently)
+          # doesn't strip downstream jobs of the release commit SHA.
+          echo "release_branch_sha=$SHA" >> "$GITHUB_OUTPUT"
+
           # The release/* branch is workflow-owned; --force is safe.
           git push --force origin "HEAD:refs/heads/release/v$VERSION"
           if [[ "$TAG_EXISTS" == "false" ]]; then
@@ -156,7 +161,6 @@ jobs:
             # created the tag after the prepare job checked for it.
             git push origin "refs/tags/$TAG"
           fi
-          echo "release_branch_sha=$SHA" >> "$GITHUB_OUTPUT"
           echo "Prepared $TAG and release/v$VERSION at $SHA"
 
   build:
@@ -290,9 +294,13 @@ jobs:
               --latest
             gh release upload "$TAG" dist/* --clobber
           else
-            # First-time create.
+            # First-time create. We do NOT pass `--verify-tag` because
+            # the CI-only path creates a *lightweight* tag above
+            # (`git tag "$TAG" "$SHA"` without -a/-s), and `gh
+            # release create --verify-tag` runs `git tag --verify`
+            # which requires an annotated/signed tag. The earlier
+            # TAG_SHA check already guards against tag/SHA drift.
             gh release create "$TAG" \
-              --verify-tag \
               --title "bloom v$VERSION" \
               --notes-file "$NOTES" \
               --latest \

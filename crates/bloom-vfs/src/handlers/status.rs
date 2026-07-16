@@ -93,17 +93,11 @@ pub struct UpdateSnapshot {
 }
 
 /// Verdicts the VFS can render for the `update/available` leaf and
-/// the `summary.json.available` field.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum UpdateAvailable {
-    /// `latest > installed`.
-    OutOfDate,
-    /// `latest <= installed`.
-    UpToDate,
-    /// No information (never refreshed, GitHub errored, etc.).
-    Unknown,
-}
+/// the `summary.json.available` field. Re-exported from
+/// `bloom-update` so the VFS handler and the upstream checker share
+/// a single source of truth — adding a new verdict in one place
+/// would silently desync the JSON payload otherwise.
+pub use bloom_update::UpdateAvailable;
 
 #[derive(Clone)]
 pub struct StatusHandler {
