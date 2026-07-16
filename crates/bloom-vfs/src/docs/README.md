@@ -315,8 +315,8 @@ echo '0x000000000000000000000000000000000000beef' \
 cat /bloom/addressbook/alice
 ```
 
-Per-chain `allow_broadcast` defaults to `true`, but mainnet broadcasts remain
-**blocked by default**. Configure via `~/.bloom/config.toml`;
-`block_mainnet_broadcast = false` is required to allow live broadcasts.
+Per-chain `allow_broadcast` defaults to `true` and
+`block_mainnet_broadcast` defaults to `false`. Configure either gate via
+`~/.bloom/config.toml`; signing, policy, and confirmation checks still apply.
 
 See `examples.md` for end-to-end demos.

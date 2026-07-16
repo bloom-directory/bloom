@@ -341,7 +341,7 @@ fn default_polymarket_chain_id() -> u64 {
     137
 }
 fn default_mainnet_block() -> bool {
-    true
+    false
 }
 fn default_max_index_size() -> usize {
     50_000
@@ -501,9 +501,9 @@ impl Config {
     /// An agentic-wallet default: read-ready public EVM networks, Anvil,
     /// and the Hyperliquid HyperCore VFS using its official public endpoints.
     ///
-    /// Per-chain broadcast is enabled by default. The global mainnet broadcast
-    /// kill-switch stays enabled, so live mainnet sends still require a separate
-    /// deliberate opt-in.
+    /// Per-chain broadcast is enabled by default and the global mainnet
+    /// kill-switch defaults off. Signing, policy, confirmation, and Sealed
+    /// Approval gates still apply to value-moving actions.
     pub fn local_default() -> Self {
         let chains = default_chains();
         Config {
@@ -521,7 +521,7 @@ impl Config {
             hyperliquid: Some(HyperliquidConfig::default()),
             mempool: BTreeMap::new(),
             private_rpc: BTreeMap::new(),
-            block_mainnet_broadcast: true,
+            block_mainnet_broadcast: false,
             backends: BackendsConfig::default(),
         }
     }
@@ -563,7 +563,9 @@ impl Config {
     /// Apply post-load migrations for backwards compatibility.
     ///
     /// Infers `op_stack` for well-known OP-stack chain IDs that predate the
-    /// field, and applies versioned config migrations once.
+    /// field. Version 0 configs cannot distinguish the old generated broadcast
+    /// gates from explicit operator choices, so both new defaults are applied
+    /// once; later per-chain opt-outs and global kill-switch opt-ins are durable.
     fn migrate(&mut self) -> bool {
         let mut changed = false;
         for spec in self.chains.values_mut() {
@@ -575,6 +577,7 @@ impl Config {
             for chain in self.chains.values_mut() {
                 chain.allow_broadcast = true;
             }
+            self.block_mainnet_broadcast = false;
             self.config_version = CURRENT_CONFIG_VERSION;
             changed = true;
         }
@@ -731,7 +734,7 @@ mod tests {
         assert!(cfg.default_wallet.is_none());
         assert_eq!(cfg.mount_path, "/bloom");
         assert_eq!(cfg.nfs_listen_addr, "127.0.0.1:12049");
-        assert!(cfg.block_mainnet_broadcast);
+        assert!(!cfg.block_mainnet_broadcast);
         assert!(cfg.etherscan.is_none());
         assert!(cfg.enso.is_none());
         let hyperliquid = cfg
@@ -824,6 +827,12 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("unknown field `apps`"), "{err}");
+    }
+
+    #[test]
+    fn missing_mainnet_killswitch_defaults_false() {
+        let cfg: Config = toml::from_str("").unwrap();
+        assert!(!cfg.block_mainnet_broadcast);
     }
 
     #[test]
@@ -929,6 +938,7 @@ mod tests {
             &path,
             r#"
 default_chain = "anvil"
+block_mainnet_broadcast = true
 
 [chains.anvil]
 name = "anvil"
@@ -942,14 +952,18 @@ allow_broadcast = false
         let mut cfg = Config::load_or_init(&path).unwrap();
         assert_eq!(cfg.config_version, CURRENT_CONFIG_VERSION);
         assert!(cfg.chains["anvil"].allow_broadcast);
+        assert!(!cfg.block_mainnet_broadcast);
         let saved = std::fs::read_to_string(&path).unwrap();
         assert!(saved.contains("config_version = 1"));
         assert!(saved.contains("allow_broadcast = true"));
+        assert!(saved.contains("block_mainnet_broadcast = false"));
 
         cfg.chains.get_mut("anvil").unwrap().allow_broadcast = false;
+        cfg.block_mainnet_broadcast = true;
         cfg.save(&path).unwrap();
         let reloaded = Config::load_or_init(&path).unwrap();
         assert!(!reloaded.chains["anvil"].allow_broadcast);
+        assert!(reloaded.block_mainnet_broadcast);
     }
 
     #[test]
@@ -1087,7 +1101,8 @@ allow_broadcast = true
 
     #[test]
     fn broadcast_permitted_blocked_on_mainnet_when_killswitch_on() {
-        let cfg = Config::local_default(); // block_mainnet_broadcast = true
+        let mut cfg = Config::local_default();
+        cfg.block_mainnet_broadcast = true;
         let mainnet = ChainSpec {
             name: "ethereum".to_string(),
             chain_id: 1,

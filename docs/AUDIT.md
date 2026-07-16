@@ -148,8 +148,8 @@ Verified end-to-end via `tests/docker/run.sh --mempool`.
 
 | Requirement | Status | Artifact |
 |---|---|---|
-| `block_mainnet_broadcast` default-on | shipped | `Config::default()` (config.rs:100) sets it `true`; mainnet chain-id list checked at broadcast time. |
-| Per-chain `allow_broadcast` opt-in | shipped | `ChainSpec.allow_broadcast`; daemon refuses to send when false. |
+| `block_mainnet_broadcast` global kill-switch | shipped | `Config::default()` sets it `false`; setting it `true` blocks recognized mainnet chain ids at broadcast time. |
+| Per-chain `allow_broadcast` gate | shipped | Defaults to `true`; the daemon refuses to send when explicitly set to false. |
 | Encrypted keystore (argon2id + chacha20poly1305) | shipped | `crates/bloom-keystore`. |
 | Hash-chained audit log | shipped | `crates/bloom-proto/src/audit.rs::AuditLog`; wired into the VFS router. |
 | Stage-confirm only write mode for txs | shipped | `tx_engine.rs::confirm` requires non-empty body. |

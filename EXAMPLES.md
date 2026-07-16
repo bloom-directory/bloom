@@ -52,10 +52,10 @@ bloom mount /bloom
 # and likewise for `ls`, `echo > path`, and `tail -f`.
 ```
 
-Mainnet broadcasts are gated by two flags in `~/.bloom/config.toml`
-— top-level `block_mainnet_broadcast = false` (the kill-switch) AND
-the chain entry's `allow_broadcast = true`. Both default off; staging
-and reads work regardless.
+Mainnet broadcasts pass two config gates in `~/.bloom/config.toml`:
+top-level `block_mainnet_broadcast = false` and the chain entry's
+`allow_broadcast = true`. Both values are the defaults. Set the global
+flag to `true` or a chain flag to `false` to disable broadcast routing.
 
 ## 2. Conventions
 
@@ -838,14 +838,14 @@ echo y > /bloom/wallets/alice/chains/anvil/outbox/pending/$ID/cancel
 
 ### Mainnet broadcast
 
-The same paths work for `chain = "ethereum"`, but the daemon refuses
-to broadcast unless both knobs are flipped:
+The same paths work for `chain = "ethereum"`. Broadcast routing is enabled
+when both gates have their default values:
 
 - top-level `block_mainnet_broadcast = false`
 - per-chain `allow_broadcast = true`
 
-Stage + review still work read-only with the defaults; only the
-`confirm` write fails.
+Signing, policy, review, and confirmation checks still apply. Set either
+gate to its blocking value to make `confirm` fail before broadcast.
 
 ---
 

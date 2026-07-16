@@ -38,7 +38,7 @@ An agent using Bloom can:
 - enforce wallet policy: spend caps, allow/deny lists, contract-call gates, private orderflow preferences, and audit logging;
 - use ten major read-ready EVM networks immediately after `bloom init`: Ethereum, Base, Arbitrum, Optimism, Polygon, BNB Smart Chain, Avalanche, Gnosis, Linea, and HyperEVM, plus local Anvil.
 
-Mainnet and L2 broadcasts are disabled by default. Bloom is useful immediately for reads, simulation, planning, and local devnet sends; live broadcasts require explicit config changes.
+Mainnet and L2 broadcast routing is enabled by default. Live sends still require the applicable signing, policy, confirmation, and Sealed Approval gates.
 
 ## First five minutes
 

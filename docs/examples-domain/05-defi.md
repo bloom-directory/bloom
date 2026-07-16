@@ -2,7 +2,7 @@
 
 The `defi/intents/<wallet>/` surface is an "intent compiler" that turns a natural-language or JSON DeFi request into one or more concrete `RawIntent`s using the Enso Shortcuts API, and then forwards them — on confirm — into the same wallet outbox the rest of bloom uses. The full lifecycle is: write an intent under `defi/intents/<wallet>/new` to open a session; review the routed plan, full Enso response, prepared `RawIntent`s, and an `eth_call` simulation under `defi/intents/<wallet>/<id>/`; write to that session's `confirm` to stage the resulting tx (or `[approve, swap]` pair) into `wallets/<wallet>/chains/<chain>/outbox/pending/<tx-id>/`; then write to the outbox's own `confirm` to actually broadcast. There are always two confirms — one to commit the route into the outbox, one to actually broadcast each pending tx — and the second confirm is where ordering, gas, and policy checks live. Sessions are file-backed under `~/.bloom/defi/<wallet>/sessions/`, so they survive one-shot CLI invocations and daemon restarts; the outbox entry is still the durable artefact for the staged transaction.
 
-All paths below are rooted at `/bloom/`. Mainnet broadcast is gated by `block_mainnet_broadcast=false` and per-chain `allow_broadcast=true` in daemon config; the `ethereum` examples below are written as if those are off (demonstration; broadcast disabled by default), and the `base` examples assume per-chain broadcast was opted in.
+All paths below are rooted at `/bloom/`. Mainnet broadcast routing defaults on with `block_mainnet_broadcast=false` and per-chain `allow_broadcast=true` in daemon config. The `ethereum` examples below can therefore broadcast when their signing, policy, review, and confirmation gates pass.
 
 ## Session layout
 
@@ -145,7 +145,7 @@ echo y > /bloom/wallets/alice/chains/ethereum/outbox/pending/0002-.../confirm
 ls /bloom/wallets/alice/chains/ethereum/outbox/sent/
 ```
 
-Note: this is the `ethereum` flow, gated as "demonstration; broadcast disabled by default" until both `block_mainnet_broadcast=false` (daemon-wide) and `allow_broadcast=true` (per-chain) are set in config. The first nine steps work locally regardless; only step 11 actually hits the network.
+Note: this is a live `ethereum` flow. Both broadcast config gates allow it by default; the first nine steps are local, and step 11 can hit the network after the applicable signing, policy, review, and confirmation gates pass.
 
 ## JSON-explicit equivalent
 
@@ -205,7 +205,7 @@ echo y > /bloom/wallets/alice/chains/ethereum/outbox/pending/<approve-id>/confir
 echo y > /bloom/wallets/alice/chains/ethereum/outbox/pending/<swap-id>/confirm
 ```
 
-(demonstration; broadcast disabled by default)
+(live-mainnet example; the final confirmation can broadcast)
 
 ### 2. ETH -> USDC on Ethereum (native in, no approve)
 
@@ -229,7 +229,7 @@ echo y > /bloom/defi/intents/alice/<id>/confirm
 echo y > /bloom/wallets/alice/chains/ethereum/outbox/pending/<swap-id>/confirm
 ```
 
-(demonstration; broadcast disabled by default)
+(live-mainnet example; the final confirmation can broadcast)
 
 ### 3. USDC -> DAI on Base (different chain, auto-approve)
 

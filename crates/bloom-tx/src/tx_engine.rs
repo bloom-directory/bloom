@@ -1724,7 +1724,7 @@ impl TxEngine {
             return Err(TxEngineError::EnsoQuoteStale { age });
         }
 
-        // Broadcast gate: never broadcast to mainnet by default.
+        // Broadcast gates: honor the global kill-switch and per-chain setting.
         let spec = chain.spec();
         let is_mainnet = bloom_proto::Config::is_mainnet_id(spec.chain_id);
         if (self.block_mainnet_broadcast && is_mainnet) || !spec.allow_broadcast {
