@@ -17,8 +17,11 @@ mod github_source;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
+use std::sync::atomic::AtomicI32;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+static UPDATE_EXIT_CODE: AtomicI32 = AtomicI32::new(0);
 
 use anyhow::{Context, Result, bail};
 use base64::Engine as _;
@@ -1058,7 +1061,13 @@ async fn main() -> ExitCode {
         .try_init();
 
     match run(cli).await {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(()) => {
+            let code = UPDATE_EXIT_CODE.load(std::sync::atomic::Ordering::SeqCst);
+            if code != 0 {
+                std::process::exit(code);
+            }
+            ExitCode::SUCCESS
+        }
         Err(e) => {
             eprintln!("error: {:#}", e);
             ExitCode::FAILURE
@@ -4469,7 +4478,7 @@ async fn handle_update(home: &HomeDir, cmd: UpdateCmd) -> Result<()> {
                 bloom_update::UpdateAvailable::Unknown => 2,
             };
             if code != 0 {
-                std::process::exit(code);
+                UPDATE_EXIT_CODE.store(code, std::sync::atomic::Ordering::SeqCst);
             }
             Ok(())
         }
