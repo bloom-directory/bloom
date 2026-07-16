@@ -117,18 +117,10 @@ For local development, use the package-manager-native checks:
 
 ```sh
 cargo fmt
-cargo test -p bloom --no-default-features
+cargo test -p bloom
 cargo test --workspace --lib
-```
-
-Mount support is included in the default CLI build:
-
-```sh
 cargo build -p bloom
 ```
-
-Portable builds can omit the NFS mount adapter with
-`cargo build -p bloom --no-default-features`.
 
 ## Filesystem layout
 
@@ -192,7 +184,7 @@ Bloom is a Rust Cargo workspace. The main user-facing/runtime crates are:
 | `bloom-mempool` | Optional pending-transaction indexing for configured WebSocket providers. |
 | `bloom-defi` | Enso Shortcuts client and natural-language DeFi intent support. |
 | `bloom-watch` | Subscription registry and polling executor. |
-| `bloom-mount` | NFSv4 mount adapter behind the `mount` feature. |
+| `bloom-mount` | NFSv4 adapter that mounts Bloom's VFS as an ordinary filesystem. |
 | `bloom-tools` | Pure crypto/encoding helpers. |
 | `bloom-etherscan` | Etherscan v2 multichain client and on-disk TTL cache. |
 | `bloom-ens` | ENS namehash plus forward/reverse/text/contenthash resolution. |
