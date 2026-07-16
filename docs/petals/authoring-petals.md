@@ -76,7 +76,7 @@ select one of them.
 
 Every route artifact is a WebAssembly component implementing
 `bloom:route@0.1.0`; raw core Wasm is rejected. The complete contract is in
-[`route.wit`](../../wit/bloom/route/route.wit). The route world exports
+The canonical [`route.wit`](https://github.com/bloom-directory/petal/blob/main/wit/route/route.wit). The route world exports
 `metadata`, `lookup`, `list`, `read`, and `write`; return
 `route-error.unsupported` for operations the route does not implement.
 

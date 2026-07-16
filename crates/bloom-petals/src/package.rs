@@ -27,11 +27,16 @@ use crate::host::DenyHost;
 use crate::policy::StoreNamespacePolicy;
 use crate::vm::{ComponentRouteEntryKind, ComponentRouteMetadata, PetalVm, RunOptions};
 
-pub const ROUTE_INDEX_SCHEMA: &str = "bloom.petal.route-index.v1";
-pub const BUILD_MANIFEST_SCHEMA: &str = "bloom.petal.build-manifest.v1";
-const PACKAGE_DIGEST_PREFIX: &[u8] = b"bloom.petal.package.v1\0";
+pub use bloom_petal_contract::{BUILD_MANIFEST_SCHEMA, ROUTE_INDEX_SCHEMA, ROUTE_PACKAGE};
+use bloom_petal_contract::{
+    HostInterface as ContractHostInterface, PACKAGE_DIGEST_PREFIX, PACKAGE_SCHEMA,
+};
 const TAR_NAME_LEN: usize = 100;
 const TAR_PREFIX_LEN: usize = 155;
+
+pub fn contract_wit_digest() -> String {
+    bloom_petal_contract::wit_digest()
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PetalPackage {
@@ -423,10 +428,10 @@ impl PreparedPetalPackage {
         let manifest_toml = std::str::from_utf8(manifest_bytes)
             .map_err(|_| PetalError::InvalidWasm("petal.toml is not utf-8".into()))?;
         let manifest: PetalToml = toml::from_str(manifest_toml)?;
-        if manifest.schema.as_deref() != Some("bloom.petal.package.v1") {
-            return Err(PetalError::InvalidWasm(
-                "Petal package petal.toml must set schema = \"bloom.petal.package.v1\"".into(),
-            ));
+        if manifest.schema.as_deref() != Some(PACKAGE_SCHEMA) {
+            return Err(PetalError::InvalidWasm(format!(
+                "Petal package petal.toml must set schema = {PACKAGE_SCHEMA:?}"
+            )));
         }
         validate_petal_name(&manifest.name)?;
         file_bytes(&files, "README.md")?;
@@ -2250,20 +2255,7 @@ fn component_route_type_import(name: &str) -> Option<&'static str> {
 }
 
 fn component_import_caps(name: &str) -> Option<&'static [&'static str]> {
-    let (package, interface, version) = component_import_package_interface(name)?;
-    match (package, interface) {
-        ("bloom:route", "types") if version == "0.1.0" => Some(&[]),
-        ("bloom:http", "fetch") if version == "0.1.0" => Some(&["bloom:http"]),
-        ("bloom:store", "kv") if version == "0.1.0" => Some(&["bloom:store"]),
-        ("bloom:sign", "signing") if version == "0.1.0" => Some(&["bloom:sign"]),
-        ("bloom:tx", "outbox") if version == "0.1.0" => Some(&["bloom:tx.outbox"]),
-        ("bloom:chain", "read") if version == "0.1.0" => Some(&["bloom:chain"]),
-        ("bloom:vfs", "readwrite") if version == "0.1.0" => {
-            Some(&["bloom:vfs.read", "bloom:vfs.write"])
-        }
-        ("bloom:env", "runtime") if version == "0.1.0" => Some(&[]),
-        _ => None,
-    }
+    bloom_petal_contract::capabilities_for_import(name)
 }
 
 #[derive(Clone, Copy)]
@@ -2278,32 +2270,16 @@ enum ComponentHostInterface {
 }
 
 fn component_host_interface(name: &str) -> Option<ComponentHostInterface> {
-    let (package, interface, version) = component_import_package_interface(name)?;
-    match (package, interface) {
-        ("bloom:http", "fetch") if version == "0.1.0" => Some(ComponentHostInterface::HttpFetch),
-        ("bloom:store", "kv") if version == "0.1.0" => Some(ComponentHostInterface::StoreKv),
-        ("bloom:sign", "signing") if version == "0.1.0" => {
-            Some(ComponentHostInterface::SignSigning)
-        }
-        ("bloom:tx", "outbox") if version == "0.1.0" => Some(ComponentHostInterface::TxOutbox),
-        ("bloom:chain", "read") if version == "0.1.0" => Some(ComponentHostInterface::ChainRead),
-        ("bloom:vfs", "readwrite") if version == "0.1.0" => {
-            Some(ComponentHostInterface::VfsReadwrite)
-        }
-        ("bloom:env", "runtime") if version == "0.1.0" => Some(ComponentHostInterface::EnvRuntime),
-        _ => None,
+    match bloom_petal_contract::host_interface(name)? {
+        ContractHostInterface::HttpFetch => Some(ComponentHostInterface::HttpFetch),
+        ContractHostInterface::StoreKv => Some(ComponentHostInterface::StoreKv),
+        ContractHostInterface::SignSigning => Some(ComponentHostInterface::SignSigning),
+        ContractHostInterface::TxOutbox => Some(ComponentHostInterface::TxOutbox),
+        ContractHostInterface::ChainRead => Some(ComponentHostInterface::ChainRead),
+        ContractHostInterface::VfsReadwrite => Some(ComponentHostInterface::VfsReadwrite),
+        ContractHostInterface::EnvRuntime => Some(ComponentHostInterface::EnvRuntime),
+        ContractHostInterface::RouteTypes => None,
     }
-}
-
-fn component_import_package_interface(name: &str) -> Option<(&str, &str, &str)> {
-    let (_, rest) = name.split_once(':')?;
-    let (package_rest, interface) = rest.split_once('/')?;
-    let (interface, version) = interface.split_once('@')?;
-    Some((
-        &name[..("bloom:".len() + package_rest.len())],
-        interface,
-        version,
-    ))
 }
 
 fn component_func_type<'a>(

@@ -172,7 +172,7 @@ This provides modularity without allowing arbitrary runtime imports.
 
 ## 3. The new Petal interface is a Wasm Component Model ABI
 
-The canonical interface is `bloom:route@0.1.0`, defined in `wit/bloom/route/route.wit`.
+The canonical interface is `bloom:route@0.1.0`, defined in [`bloom-directory/petal`](https://github.com/bloom-directory/petal/blob/main/wit/route/route.wit).
 
 A route component exports:
 

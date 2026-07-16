@@ -18,7 +18,7 @@ Start with the guide for your role:
 These guides are the concise operational entry point. The following documents
 remain authoritative for lower-level detail:
 
-- [Bloom route and host WIT](../../wit/bloom/README.md)
+- [Canonical Bloom route and host WIT](https://github.com/bloom-directory/petal/tree/main/wit/route)
 - [File-driven package design](../superpowers/specs/2026-06-23-petals-v1.md)
 - [External repositories and GitHub source installs](../superpowers/specs/2026-06-24-external-petal-repos-and-github-source-installs.md)
 - [Petal platform/native parity](../specs/2026-07-10-petal-platform-native-parity.md)

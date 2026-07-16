@@ -2796,6 +2796,11 @@ async fn run_petals(home: HomeDir, cmd: PetalsCmd) -> Result<()> {
             let consent = bloom_petals::package::petal_consent_summary(&package)
                 .context("build Petal consent summary")?;
             println!("hash: {}", package.hash);
+            println!("contract: {}", bloom_petals::package::ROUTE_PACKAGE);
+            println!(
+                "wit_digest: {}",
+                bloom_petals::package::contract_wit_digest()
+            );
             println!("petal_mount: petals/{}/", package.name);
             println!("routes: {}", package.route_index.routes.len());
             println!("artifacts: {package_dir}/artifacts");

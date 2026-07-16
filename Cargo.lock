@@ -2585,12 +2585,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "bloom-petal-contract"
+version = "0.1.0"
+source = "git+https://github.com/bloom-directory/petal?rev=4c043f0900106b5cca58ef8f2db266648357afd4#4c043f0900106b5cca58ef8f2db266648357afd4"
+dependencies = [
+ "sha2 0.10.9",
+]
+
+[[package]]
 name = "bloom-petals"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
  "blake3",
+ "bloom-petal-contract",
  "bloom-proto",
  "bloom-vfs",
  "futures",

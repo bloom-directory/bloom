@@ -6,6 +6,7 @@ license.workspace = true
 description = "Content-addressed wasm petals for bloom: store, name registry, VM, VFS handler"
 
 [dependencies]
+bloom-petal-contract.workspace = true
 bloom-proto.workspace = true
 bloom-vfs.workspace = true
 url.workspace = true
