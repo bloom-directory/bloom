@@ -498,7 +498,7 @@ impl PreparedPetalPackage {
                     )));
                 }
                 let sidecar_source_validation = validate_route_wasm_with_package_imports(
-                    &sidecar.component,
+                    &source_path,
                     file_bytes(&files, &sidecar.component)?,
                     &allowed_caps,
                     &allowed_sign_intents,
@@ -3477,6 +3477,12 @@ fn validate_net_policy(
                 "Petal [[net.allow]] rules require a host and at least one method".into(),
             ));
         }
+        if rule.host.trim() != rule.host || url::Host::parse(&rule.host).is_err() {
+            return Err(PetalError::InvalidWasm(format!(
+                "Petal [[net.allow]] host {:?} must be a bare DNS name or IP address without a scheme, path, or port",
+                rule.host
+            )));
+        }
         if rule.methods.iter().any(|method| method.trim().is_empty()) {
             return Err(PetalError::InvalidWasm(
                 "Petal [[net.allow]] methods must be non-empty".into(),
@@ -3869,6 +3875,20 @@ pub(crate) mod route_fixtures {
             false,
             false,
             false,
+        )
+    }
+
+    pub(crate) fn dynamic_file_lookup_route_component() -> Vec<u8> {
+        build_dynamic_dir_route_component(
+            false,
+            FixtureVfsImport::None,
+            &[],
+            None,
+            false,
+            false,
+            false,
+            false,
+            true,
         )
     }
 
@@ -4405,6 +4425,44 @@ secret_namespaces = ["credentials"]
     }
 
     #[test]
+    fn petal_manifest_rejects_network_hosts_with_scheme_or_port() {
+        for host in ["https://api.example.com", "api.example.com:443"] {
+            let tmp = tempfile::tempdir().unwrap();
+            write_package_file(
+                tmp.path(),
+                "petal.toml",
+                format!(
+                    r#"schema = "bloom.petal.package.v1"
+name = "echo"
+
+[caps]
+allowed = ["bloom:http"]
+
+[[net.allow]]
+host = {host:?}
+methods = ["get"]
+paths = ["/*"]
+"#
+                )
+                .as_bytes(),
+            );
+            write_package_file(tmp.path(), "README.md", b"# echo");
+            write_package_file(tmp.path(), "AGENTS.md", b"# echo agents");
+            write_package_file(
+                tmp.path(),
+                "petal/echo/hello.txt.wasm",
+                route_component_http(),
+            );
+
+            let err = PreparedPetalPackage::from_dir(tmp.path()).unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("must be a bare DNS name or IP address")
+            );
+        }
+    }
+
+    #[test]
     fn petal_write_petal_tar_emits_installable_deterministic_archive() {
         let tmp = tempfile::tempdir().unwrap();
         write_petal_package(tmp.path());
@@ -4593,6 +4651,34 @@ component = "modules/message.wasm"
             manifest.routes[0].source_hash,
             manifest.routes[0].artifact_hash
         );
+    }
+
+    #[test]
+    fn petal_lookup_sidecar_component_is_validated_as_lookup_route() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_package_file(
+            tmp.path(),
+            "petal.toml",
+            br#"schema = "bloom.petal.package.v1"
+name = "echo"
+"#,
+        );
+        write_package_file(tmp.path(), "README.md", b"# echo");
+        write_package_file(tmp.path(), "AGENTS.md", b"# echo agents");
+        let lookup_only = route_fixtures::dynamic_file_lookup_route_component();
+        write_package_file(tmp.path(), "petal/echo/$lookup.wasm", &lookup_only);
+        write_package_file(
+            tmp.path(),
+            "petal/echo/$lookup.route.toml",
+            br#"abi = "component"
+component = "components/lookup.wasm"
+"#,
+        );
+        write_package_file(tmp.path(), "components/lookup.wasm", &lookup_only);
+
+        let package = build_petal_package_dir(tmp.path()).unwrap();
+        assert!(package.route_index.routes[0].ops.contains(&RouteOp::Lookup));
+        assert!(!package.route_index.routes[0].ops.contains(&RouteOp::Read));
     }
 
     #[test]

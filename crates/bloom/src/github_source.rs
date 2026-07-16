@@ -125,7 +125,17 @@ pub(crate) fn install_github_source(
     println!("Validating Petal package...");
     let package =
         PreparedPetalPackage::from_dir(tmp.path()).context("validate generated Petal package")?;
-    let consent = petal_consent_summary(&package).context("build app consent summary")?;
+    let mut consent = petal_consent_summary(&package).context("build app consent summary")?;
+    let bindings = daemon
+        .config
+        .petals
+        .runtime
+        .get(&consent.name)
+        .map(|app| &app.endpoints)
+        .cloned()
+        .unwrap_or_default();
+    bloom_petals::package::apply_petal_consent_endpoint_bindings(&mut consent, &bindings)
+        .context("apply configured Petal endpoint bindings")?;
     let provenance = PetalSourceProvenance {
         source_kind: "github".to_string(),
         url: repo.canonical_url.clone(),
@@ -681,6 +691,47 @@ mod tests {
         assert_eq!(sha_install.provenance.selected_tag, None);
         assert_eq!(sha_install.provenance.requested_ref, fixture.commits[0]);
         assert_eq!(sha_install.provenance.resolved_commit, fixture.commits[0]);
+    }
+
+    #[test]
+    fn source_install_rejects_invalid_endpoint_binding_before_installing_package() {
+        let fixture = source_repo_fixture(SourceRepoOptions {
+            repo: "bloom-petal-test-endpoint",
+            tags: vec!["v0.1.0"],
+            include_manifest: true,
+            build_script: BuildScript::Success,
+        })
+        .unwrap();
+        let repo = source_test_repo(fixture.bare.path(), "bloom-petal-test-endpoint");
+        let home = tempfile::tempdir().unwrap();
+        let home_dir = HomeDir::at(home.path());
+        home_dir.ensure().unwrap();
+        let mut config = bloom_proto::Config::local_default();
+        config.petals.runtime.insert(
+            "demo".into(),
+            bloom_proto::config::PetalRuntimeConfig {
+                endpoints: std::collections::BTreeMap::from([(
+                    "undeclared".into(),
+                    "https://example.com".into(),
+                )]),
+                values: Default::default(),
+            },
+        );
+        config.save(&home_dir.config_path()).unwrap();
+        let daemon = Daemon::from_home(home_dir.clone()).unwrap();
+
+        let err = install_github_source(&home_dir, &daemon, &repo, None).unwrap_err();
+        let err = format!("{err:#}");
+
+        assert!(err.contains("endpoint override \"undeclared\" is not declared"));
+        assert!(
+            daemon
+                .petals
+                .store()
+                .list_package_hashes()
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

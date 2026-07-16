@@ -1623,6 +1623,35 @@ impl TxEngine {
         policy: &Policy,
         confirm_text: &str,
     ) -> Result<StagedTx, TxEngineError> {
+        let override_warnings = confirm_text
+            .trim()
+            .eq_ignore_ascii_case(policy.override_sentinel());
+        self.confirm_with_warning_override(
+            permit,
+            wallet,
+            chain_name,
+            id,
+            chain,
+            policy,
+            override_warnings,
+        )
+        .await
+    }
+
+    /// Confirm a staged transaction with an explicit warning-override decision.
+    /// This avoids converting trusted boolean decisions into user-configurable
+    /// sentinel text at internal call sites.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn confirm_with_warning_override(
+        &self,
+        permit: &HomeWritePermit,
+        wallet: &str,
+        chain_name: &str,
+        id: &str,
+        chain: &ChainClient,
+        policy: &Policy,
+        override_warnings: bool,
+    ) -> Result<StagedTx, TxEngineError> {
         self.assert_write_permit(permit)?;
         let entry = self
             .outbox
@@ -1674,9 +1703,7 @@ impl TxEngine {
             return Err(TxEngineError::PolicyDenied);
         }
         let warn = policy_engine::has_warning(&staged.policy_checks);
-        let sentinel = policy.override_sentinel();
-        let override_text = confirm_text.trim().eq_ignore_ascii_case(sentinel);
-        if warn && !override_text {
+        if warn && !override_warnings {
             debug!(
                 id = %staged.id,
                 wallet,
@@ -1692,7 +1719,7 @@ impl TxEngine {
         let now_secs = (now_ms() / 1000) as u64;
         if let Some(age) = enso_quote_age_secs(&staged.data_hex, now_secs)
             && age > ENSO_QUOTE_MAX_AGE_SECS
-            && !override_text
+            && !override_warnings
         {
             return Err(TxEngineError::EnsoQuoteStale { age });
         }
@@ -1715,7 +1742,7 @@ impl TxEngine {
         // Pre-broadcast simulation first (no side effects): eth_call against
         // current state so a tx that would revert is caught here instead of
         // burning gas. The override sentinel forces it through.
-        if !override_text {
+        if !override_warnings {
             self.simulate_or_reject(&staged, chain).await?;
         }
 
@@ -6248,7 +6275,8 @@ mod tests {
         let engine = with_test_auth_and_host(engine, true);
         let permit = permit_for(&dir);
         let chain = bloom_evm::ChainClient::new(spec.clone()).unwrap();
-        let policy = bloom_proto::Policy::default(); // override_sentinel() == "override"
+        let mut policy = bloom_proto::Policy::default();
+        policy.automation.override_token = Some("y".into());
 
         let mut staged = fake_staged_1559("0001-test");
         staged.expires_ms = now_ms() + 60_000;
@@ -6259,9 +6287,18 @@ mod tests {
         )];
         engine.outbox.write_pending(&staged, "p").unwrap();
 
-        // Wrong text — must be rejected.
+        // An explicit false decision must be rejected even when the policy's
+        // configured text sentinel is the historically common value "y".
         let r = engine
-            .confirm(&permit, "alice", "anvil", "0001-test", &chain, &policy, "y")
+            .confirm_with_warning_override(
+                &permit,
+                "alice",
+                "anvil",
+                "0001-test",
+                &chain,
+                &policy,
+                false,
+            )
             .await;
         assert!(
             matches!(r, Err(TxEngineError::PolicyDenied)),
@@ -6280,15 +6317,7 @@ mod tests {
         // on the unreachable RPC. Any error other than PolicyDenied means
         // the policy gate was successfully passed.
         let r = engine
-            .confirm(
-                &permit,
-                "alice",
-                "anvil",
-                "0001-test",
-                &chain,
-                &policy,
-                "override",
-            )
+            .confirm(&permit, "alice", "anvil", "0001-test", &chain, &policy, "y")
             .await;
         match r {
             Err(TxEngineError::PolicyDenied) => panic!("override sentinel did not bypass warn"),

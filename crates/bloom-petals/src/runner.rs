@@ -304,8 +304,13 @@ impl PetalRunner {
     /// caller passes a 64-char hex that happens to be a name, the
     /// hash interpretation is used.
     pub fn resolve(&self, name_or_hash: &str) -> Result<String, PetalError> {
-        if crate::store::is_valid_hex_hash(name_or_hash) && self.store.contains(name_or_hash) {
+        if crate::store::is_valid_hex_hash(name_or_hash)
+            && (self.store.contains(name_or_hash) || self.store.contains_package(name_or_hash))
+        {
             return Ok(name_or_hash.to_string());
+        }
+        if let Some(hash) = self.store.resolve_petal_owner(name_or_hash)? {
+            return Ok(hash);
         }
         self.registry
             .lookup(name_or_hash)
@@ -812,6 +817,15 @@ name = "echo"
         let hash = install_echo_app(&dir, &r);
         assert!(r.uninstall("echo").unwrap());
         assert!(!r.store().contains_package(&hash));
+    }
+
+    #[test]
+    fn resolve_accepts_installed_package_hash_and_petal_mount() {
+        let (dir, r) = runner();
+        let hash = install_echo_app(&dir, &r);
+
+        assert_eq!(r.resolve(&hash).unwrap(), hash);
+        assert_eq!(r.resolve("echo").unwrap(), hash);
     }
 
     #[test]

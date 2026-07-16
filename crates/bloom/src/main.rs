@@ -2822,9 +2822,8 @@ async fn run_petals(home: HomeDir, cmd: PetalsCmd) -> Result<()> {
     match cmd {
         PetalsCmd::Install { path, ref_ } => {
             if let Some(repo) = github_source::parse_github_install_url(&path)? {
-                let mut installed =
+                let installed =
                     github_source::install_github_source(&home, &d, &repo, ref_.as_deref())?;
-                apply_configured_petal_endpoints(&d, &mut installed.consent)?;
                 println!();
                 println!("hash: {}", installed.result.hash);
                 println!("mode: petal");

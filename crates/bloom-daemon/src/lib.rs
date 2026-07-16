@@ -1348,18 +1348,14 @@ impl PetalHost for DaemonPetalHost {
             .ok_or_else(|| HostError::NotFound(format!("chain {chain_name}")))?;
         match service
             .tx_engine
-            .confirm(
+            .confirm_with_warning_override(
                 permit,
                 &wallet,
                 &chain_name,
                 &outbox_id,
                 &chain,
                 &wallet_info.policy,
-                if acknowledge_warnings {
-                    wallet_info.policy.override_sentinel()
-                } else {
-                    "y"
-                },
+                acknowledge_warnings,
             )
             .await
         {
