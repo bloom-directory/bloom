@@ -140,7 +140,7 @@ If you want to refresh what the daemon ships with after a workspace update, just
 
 ## Update checker
 
-`status/update/` is the daemon's self-update view. The daemon refreshes it every 5 minutes by GETting `https://api.github.com/repos/bloom-directory/bloom/releases/latest` and caching the response at `~/.bloom/update_cache.json`. No auth (60 req/h/IP cap; the cache + 5-min interval make that plenty for one user).
+`status/update/` is the daemon's self-update view. A long-lived `bloom serve` daemon refreshes it every 5 minutes by GETting `https://api.github.com/repos/bloom-directory/bloom/releases/latest` and caching the response at `~/.bloom/cache/update_cache.json`. Short-lived in-process CLI commands only read that cache; they do not contact GitHub. No auth (60 req/h/IP cap; the single 5-minute refresher stays well within that limit).
 
 ```sh
 ls /bloom/status/update/                               # installed, latest, available, behind_by, checked_at, release_url, summary.json

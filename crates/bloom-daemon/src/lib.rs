@@ -1712,11 +1712,9 @@ pub struct Daemon {
     pub petals: PetalRunner,
     pub watch_registry: Arc<WatchRegistry>,
     pub watch_executor: Arc<WatchExecutor>,
-    /// Background update checker for newer GitHub releases. Holds a
-    /// 5-minute-refresh task whose shutdown is signalled via
-    /// `update_shutdown` below. Always `Some` after `from_home` —
-    /// network failure at startup leaves the checker constructed
-    /// but with a `status: "error"` snapshot.
+    /// Update checker for newer GitHub releases. Construction loads its
+    /// cached snapshot without making a network request; the 5-minute
+    /// refresher starts only with [`Self::spawn_background_tasks`].
     pub update_checker: Arc<bloom_update::UpdateChecker>,
     /// Shutdown handles for spawned mempool subscription tasks. Dropping
     /// these signals each task to exit at its next iteration.
@@ -2153,10 +2151,10 @@ impl Daemon {
             );
         }
 
-        // Construct the background update-checker here (before
-        // StatusHandler) so the handler can wire its snapshot
-        // producer. The actual background refresh task is spawned
-        // further down alongside the other long-lived tasks.
+        // Construct the update checker here (before StatusHandler) so
+        // the handler can wire its snapshot producer. Construction only
+        // loads the on-disk cache; the network refresher is started by
+        // `spawn_background_tasks` for long-lived daemon processes.
         let update_checker: Arc<bloom_update::UpdateChecker> = Arc::new(
             bloom_update::UpdateChecker::new(env!("CARGO_PKG_VERSION"), home.cache_dir())
                 .map_err(|e| DaemonError::Audit(format!("update checker init: {e}")))?,
@@ -2805,21 +2803,6 @@ impl Daemon {
             debug!("daemon.backends_probe_spawned");
         }
 
-        // Spawn the background update-checker task. Every 5 minutes it
-        // refreshes the snapshot from the GitHub releases/latest endpoint
-        // and writes the result to the on-disk cache. Gated on a tokio
-        // runtime being available (some tests construct the daemon in
-        // a sync context; they can read the cache directly via
-        // `UpdateChecker::quick_check_cached`). The `update_checker`
-        // Arc was constructed above (before StatusHandler) so the VFS
-        // can already see the seed snapshot from the on-disk cache.
-        let mut update_shutdown: Vec<tokio::sync::oneshot::Sender<()>> = Vec::new();
-        if tokio::runtime::Handle::try_current().is_ok() {
-            let tx = Arc::clone(&update_checker).spawn_background();
-            update_shutdown.push(tx);
-            debug!("daemon.update_checker_spawned");
-        }
-
         // `debug!`, not `info!`: the CLI builds a daemon in-process for
         // every `vfs cat`/`ls`, so at default verbosity this line would
         // print before each value and clutter agent/visual output.
@@ -2853,7 +2836,7 @@ impl Daemon {
             mempool_shutdown: Arc::new(parking_lot::Mutex::new(mempool_shutdown)),
             bump_shutdown: Arc::new(parking_lot::Mutex::new(bump_shutdown)),
             probe_shutdown: Arc::new(parking_lot::Mutex::new(probe_shutdown)),
-            update_shutdown: Arc::new(parking_lot::Mutex::new(update_shutdown)),
+            update_shutdown: Arc::new(parking_lot::Mutex::new(Vec::new())),
         })
     }
 
@@ -2893,16 +2876,28 @@ impl Daemon {
         Self::from_home(home)
     }
 
-    /// Spawn long-lived background tasks: currently the outbox expiry
-    /// sweeper that runs every 60s and moves any pending entry past its
-    /// `expires_ms` into `failed/` (fix #3). Caller keeps the returned
-    /// [`BackgroundTasks`] alive; dropping it triggers graceful shutdown.
+    /// Spawn long-lived background tasks: the update checker and the
+    /// outbox expiry sweeper that runs every 60s and moves any pending
+    /// entry past its `expires_ms` into `failed/` (fix #3). Caller keeps
+    /// the returned [`BackgroundTasks`] alive; dropping it triggers
+    /// graceful shutdown of the sweeper.
     ///
-    /// Safe to call multiple times — each call spawns a fresh task and
-    /// returns its own handle. Short-lived CLI commands generally don't
-    /// need this; it's primarily for `bloom serve` and the in-process
+    /// Safe to call multiple times — each call spawns a fresh sweeper and
+    /// returns its own handle, while the update refresher starts at most
+    /// once per daemon. Short-lived CLI commands generally don't need
+    /// these tasks; this is primarily for `bloom serve` and the in-process
     /// daemon used by integration tests.
     pub fn spawn_background_tasks(&self) -> BackgroundTasks {
+        // Only long-lived daemons poll GitHub. Most CLI commands construct
+        // an in-process Daemon, so starting this in `from_home` would turn
+        // every `vfs cat`/`ls` invocation into an immediate API request.
+        let mut update_shutdown = self.update_shutdown.lock();
+        if update_shutdown.is_empty() {
+            update_shutdown.push(Arc::clone(&self.update_checker).spawn_background());
+            debug!("daemon.update_checker_spawned");
+        }
+        drop(update_shutdown);
+
         let outbox = self.tx_engine.outbox.clone();
         let (tx, mut rx) = watch::channel(false);
         let interval = Duration::from_secs(60);
@@ -3827,6 +3822,17 @@ ws_url = "wss://example.invalid"
             .expect("shutdown timed out");
     }
 
+    #[tokio::test]
+    async fn daemon_construction_does_not_start_update_refresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = Daemon::from_home(HomeDir::at(dir.path())).unwrap();
+
+        assert!(
+            daemon.update_shutdown.lock().is_empty(),
+            "short-lived daemon construction must not start the GitHub update refresher"
+        );
+    }
+
     /// Fix #3: the spawned sweeper drops expired pending entries into
     /// `failed/` on its own. We don't wait for the natural 60s tick;
     /// instead the test calls `outbox.sweep_expired` itself to keep
@@ -3838,6 +3844,11 @@ ws_url = "wss://example.invalid"
         let home = HomeDir::at(dir.path());
         let d = Daemon::from_home(home).unwrap();
         let tasks = d.spawn_background_tasks();
+        assert_eq!(
+            d.update_shutdown.lock().len(),
+            1,
+            "long-lived background tasks should start one update refresher"
+        );
         // Seed an already-expired pending entry; the foreground call
         // exercises the same code the spawned task runs.
         let staged = bloom_proto::StagedTx {

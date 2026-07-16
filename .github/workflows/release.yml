@@ -289,18 +289,19 @@ jobs:
             # Retry path: release already exists. Update metadata and
             # re-upload assets (clobbering any previous ones).
             gh release edit "$TAG" \
+              --verify-tag \
               --title "bloom v$VERSION" \
               --notes-file "$NOTES" \
               --latest
             gh release upload "$TAG" dist/* --clobber
           else
-            # First-time create. We do NOT pass `--verify-tag` because
-            # the CI-only path creates a *lightweight* tag above
-            # (`git tag "$TAG" "$SHA"` without -a/-s), and `gh
-            # release create --verify-tag` runs `git tag --verify`
-            # which requires an annotated/signed tag. The earlier
-            # TAG_SHA check already guards against tag/SHA drift.
+            # First-time create. `--verify-tag` checks that the tag
+            # already exists in the remote repository; lightweight tags
+            # are supported. Together with the TAG_SHA comparison above,
+            # this prevents `gh` from creating a missing tag from the
+            # default branch after the build has completed.
             gh release create "$TAG" \
+              --verify-tag \
               --title "bloom v$VERSION" \
               --notes-file "$NOTES" \
               --latest \

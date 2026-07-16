@@ -37,27 +37,45 @@ before pushing the tag:
 #    (signals "now we have update checks + the workflow"). Pick
 #    deliberately and document the choice in the PR description.
 VERSION="0.1.1"
+BRANCH="release-prep/v$VERSION"
+git switch master
+git pull --ff-only origin master
+git switch -c "$BRANCH"
 
 # 2. Bump the workspace version. `sed` is enough — every member
 #    crate uses `version.workspace = true` and picks up the new
 #    number at compile time. `cargo update --workspace` regens the
-#    lockfile (only touches the 26 workspace member version fields,
-#    no transitive dep churn — verified empirically).
+#    lockfile. Review the diff to ensure it only changes workspace
+#    package versions and does not introduce transitive dep churn.
 sed -i -E "s/^version = \"[0-9]+\\.[0-9]+\\.[0-9]+\"/version = \"$VERSION\"/" Cargo.toml
 cargo update --workspace
 
-# 3. Sanity: diff is exactly Cargo.toml + Cargo.lock, ~52 lines.
+# 3. Sanity: the diff is exactly Cargo.toml + Cargo.lock.
 git diff --stat
 
 # 4. Build and verify the binary.
 cargo build --release -p bloom --all-features --locked
 ./target/release/bloom --version    # must print "bloom $VERSION"
 
-# 5. Commit, tag that exact commit, and push.
+# 5. Commit the bump on a release-prep branch and open a PR. Do not
+#    push directly to master; the default branch requires its status
+#    checks to pass through a PR.
 git add Cargo.toml Cargo.lock
 git commit -m "release: v$VERSION"
+git push -u origin "$BRANCH"
+gh pr create --base master --head "$BRANCH" \
+  --title "release: v$VERSION" \
+  --body "Bump the workspace version for v$VERSION."
+
+# 6. After that PR passes checks and is merged, update local master.
+#    Rebuild so the tag is attached to the exact commit you tested
+#    even if another PR merged in the meantime.
+git switch master
+git pull --ff-only origin master
+test "$(sed -n -E 's/^version = "([0-9]+\.[0-9]+\.[0-9]+)"/\1/p' Cargo.toml | head -n 1)" = "$VERSION"
+cargo build --release -p bloom --all-features --locked
+./target/release/bloom --version    # must print "bloom $VERSION"
 git tag "v$VERSION"
-git push origin master
 git push origin "v$VERSION"
 ```
 

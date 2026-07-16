@@ -1,6 +1,6 @@
 //! On-disk JSON cache for the latest known release.
 //!
-//! One pretty-printed JSON file at `~/.bloom/update_cache.json`,
+//! One pretty-printed JSON file at `~/.bloom/cache/update_cache.json`,
 //! rewritten on every successful refresh via temp-file + atomic
 //! rename. No fsync: this is a UX nicety, not a security boundary;
 //! losing the cache just means the next VFS read reports

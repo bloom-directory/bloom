@@ -1064,7 +1064,7 @@ async fn main() -> ExitCode {
         Ok(()) => {
             let code = UPDATE_EXIT_CODE.load(std::sync::atomic::Ordering::SeqCst);
             if code != 0 {
-                std::process::exit(code);
+                return ExitCode::from(code as u8);
             }
             ExitCode::SUCCESS
         }
@@ -4463,9 +4463,8 @@ async fn handle_update(home: &HomeDir, cmd: UpdateCmd) -> Result<()> {
             Ok(())
         }
         UpdateCmd::Check => {
-            // An explicit check needs only a checker. Constructing a full
-            // daemon would also spawn its immediate background refresh,
-            // issuing two concurrent GitHub requests for one CLI command.
+            // An explicit check needs only a checker; avoid constructing
+            // the full daemon and its unrelated VFS/transaction services.
             let checker =
                 bloom_update::UpdateChecker::new(env!("CARGO_PKG_VERSION"), home.cache_dir())
                     .context("build update checker")?;
