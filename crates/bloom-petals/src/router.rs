@@ -315,6 +315,7 @@ fn entry_to_vfs(entry: DispatchEntry) -> Result<Entry, HandlerError> {
             entry.mode
         },
         link_target: entry.link_target,
+        modified: None,
     })
 }
 

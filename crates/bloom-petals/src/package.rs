@@ -1932,10 +1932,8 @@ fn validate_route_wasm_inner(
         let payload = payload.map_err(|e| PetalError::InvalidWasm(format!("{path}: {e}")))?;
         let current_depth = parse_depth;
         match payload {
-            Payload::Version { encoding, .. } => {
-                if current_depth == 0 {
-                    saw_component |= matches!(encoding, wasmparser::Encoding::Component);
-                }
+            Payload::Version { encoding, .. } if current_depth == 0 => {
+                saw_component |= matches!(encoding, wasmparser::Encoding::Component);
             }
             Payload::ComponentTypeSection(reader) => {
                 if current_depth != 0 {
