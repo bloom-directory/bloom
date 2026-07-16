@@ -1235,7 +1235,7 @@ fn petal_cli_build_install_list_and_vfs_read_happy_path() {
 #[test]
 #[ignore = "clones and builds the public Polymarket Petal source repo"]
 fn github_source_install_polymarket_dispatches_route_contract() {
-    let petal_ref = "825a9f72b871c3da7a6ec38f57e78615f9c42052";
+    let petal_ref = "f2d7adbd64f76fccf515e7f39f46af048047a4e3";
     let home = fresh_home();
     bloom_cmd(home.path())
         .args([
@@ -1253,7 +1253,7 @@ fn github_source_install_polymarket_dispatches_route_contract() {
         .stdout(predicate::str::contains(format!(
             "resolved_commit: {petal_ref}"
         )))
-        .stdout(predicate::str::contains("routes: 93"));
+        .stdout(predicate::str::contains("routes: 94"));
 
     bloom_cmd(home.path())
         .args(["petals", "ls"])
