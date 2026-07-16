@@ -771,6 +771,7 @@ fn sealed_approval_paths(
             .root()
             .join(wallet)
             .join("policy-updates")
+            .join("pending")
             .join(action_id);
         return Some((
             dir.join("approval_challenge.json"),

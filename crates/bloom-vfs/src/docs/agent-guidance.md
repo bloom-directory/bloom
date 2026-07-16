@@ -101,10 +101,10 @@ cat wallets/<wallet>/policy.toml
 #    permission denied after the daemon stages a Sealed Approval challenge.
 printf '%s' "$edited_policy" > wallets/<wallet>/policy.toml
 
-# 3. Discover and read the challenge through the mount.
-ls wallets/<wallet>/policy-updates
-cat wallets/<wallet>/policy-updates/<action_id>/status.json
-cat wallets/<wallet>/policy-updates/<action_id>/approval_challenge.json
+# 3. Discover and read the challenge through the mount (no BLOOM_HOME access).
+ls wallets/<wallet>/policy-updates/pending
+cat wallets/<wallet>/policy-updates/latest/status.json
+cat wallets/<wallet>/policy-updates/latest/approval_challenge.json
 
 # 4. Open or forward ceremony_url, approve, then retry the identical write.
 printf '%s' "$edited_policy" > wallets/<wallet>/policy.toml

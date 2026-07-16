@@ -63,6 +63,12 @@ const WALLET_POLICY_SURFACE: &str = "wallet-policy";
 const WALLET_POLICY_ACTION_KIND: &str = "policy_update";
 const WALLET_POLICY_SUBJECT_SCHEMA: &str = "bloom.wallet_policy_update_subject.v1";
 const WALLET_POLICY_SIGN_INTENT: &str = "wallet_policy.sign";
+/// Lifecycle states for a staged wallet-policy update, mirroring the
+/// `/outbox/{pending,sent,failed}` stage/confirm structure. A policy update is
+/// `pending` while it carries an unconsumed challenge, `confirmed` once the
+/// approved policy is installed, or `failed` if the staged baseline changed
+/// before the approved retry landed.
+const POLICY_UPDATE_STATES: &[&str] = &["pending", "confirmed", "failed"];
 
 #[derive(Clone)]
 pub struct WalletsHandler {
@@ -716,11 +722,7 @@ impl WalletsHandler {
             .is_none()
         {
             let approval_path = self
-                .keystore
-                .root()
-                .join(wallet)
-                .join("policy-updates")
-                .join(&action_id)
+                .policy_update_action_dir(wallet, "pending", &action_id)
                 .join(APPROVAL_FILE);
             if approval_path.exists() {
                 let approval: SignedApproval = read_json(&approval_path)?;
@@ -782,6 +784,7 @@ impl WalletsHandler {
     ) -> Result<(), HandlerError> {
         let current = std::fs::read(self.keystore.root().join(wallet).join("policy.toml"))?;
         if current != old_policy_toml.as_bytes() {
+            let _ = self.policy_update_transition(wallet, action_id, "pending", "failed");
             return Err(HandlerError::invalid(
                 "wallet policy changed after approval; restage the policy update",
             ));
@@ -839,22 +842,68 @@ impl WalletsHandler {
             sig_json.to_string().as_bytes(),
         )?;
         write_atomic_file(&wallet_dir.join("policy.toml"), proposed_policy)?;
+        let _ = self.policy_update_transition(wallet, action_id, "pending", "confirmed");
         Ok(())
     }
 
     /// On-disk root for staged wallet-policy update artifacts (challenges and,
-    /// once approved, the signed approval). These are *views* of a pending
-    /// Sealed Approval — the canonical proposed policy lives in the sealed
-    /// action subject, never in these side files.
+    /// once approved, the signed approval). These are *views* of a Sealed
+    /// Approval — the canonical proposed policy lives in the sealed action
+    /// subject, never in these side files. The root holds one subdirectory per
+    /// lifecycle state (`pending`, `confirmed`, `failed`), matching the
+    /// `/outbox/{pending,sent,failed}` stage/confirm structure.
     fn policy_updates_dir(&self, wallet: &str) -> std::path::PathBuf {
         self.keystore.root().join(wallet).join("policy-updates")
     }
 
-    /// Sorted list of staged policy-update action ids that have on-disk
-    /// artifacts, for the `policy-updates/` VFS listing.
-    fn policy_update_action_ids(&self, wallet: &str) -> Vec<String> {
+    fn policy_update_state_dir(&self, wallet: &str, state: &str) -> std::path::PathBuf {
+        self.policy_updates_dir(wallet).join(state)
+    }
+
+    fn policy_update_action_dir(
+        &self,
+        wallet: &str,
+        state: &str,
+        action_id: &str,
+    ) -> std::path::PathBuf {
+        self.policy_update_state_dir(wallet, state).join(action_id)
+    }
+
+    /// Atomically move an action between lifecycle states (e.g. `pending` →
+    /// `confirmed` once the approved policy is installed). Best-effort: a
+    /// failure is logged but never overrides an already-decided install/error
+    /// outcome, because the policy bytes on disk are the source of truth.
+    fn policy_update_transition(
+        &self,
+        wallet: &str,
+        action_id: &str,
+        from: &str,
+        to: &str,
+    ) -> std::io::Result<()> {
+        let from_dir = self.policy_update_action_dir(wallet, from, action_id);
+        let to_dir = self.policy_update_action_dir(wallet, to, action_id);
+        if !from_dir.exists() {
+            return Ok(());
+        }
+        std::fs::create_dir_all(self.policy_update_state_dir(wallet, to))?;
+        std::fs::rename(&from_dir, &to_dir).map_err(|e| {
+            tracing::warn!(
+                wallet = wallet,
+                action_id = action_id,
+                from = from,
+                to = to,
+                error = %e,
+                "policy_update.transition_failed"
+            );
+            e
+        })
+    }
+
+    /// Sorted list of action ids currently in a given lifecycle state.
+    fn policy_update_action_ids(&self, wallet: &str, state: &str) -> Vec<String> {
         let mut ids = Vec::new();
-        if let Ok(rd) = std::fs::read_dir(self.policy_updates_dir(wallet)) {
+        let dir = self.policy_update_state_dir(wallet, state);
+        if let Ok(rd) = std::fs::read_dir(&dir) {
             for ent in rd.flatten() {
                 if ent.file_type().map(|t| t.is_dir()).unwrap_or(false)
                     && let Some(name) = ent.file_name().to_str()
@@ -867,6 +916,35 @@ impl WalletsHandler {
         ids
     }
 
+    /// The most recently staged pending action id, keyed off the challenge
+    /// file's mtime so later artefact writes (e.g. an approval landing) do not
+    /// reshuffle the ordering. Mirrors `OutboxHandler::latest_pending_action_id`.
+    fn policy_update_latest_pending_id(&self, wallet: &str) -> Option<String> {
+        let pending = self.policy_update_state_dir(wallet, "pending");
+        let rd = std::fs::read_dir(&pending).ok()?;
+        let mut entries: Vec<_> = rd
+            .filter_map(|e| e.ok())
+            .filter_map(|e| {
+                let challenge = e.path().join(APPROVAL_CHALLENGE_FILE);
+                std::fs::metadata(&challenge)
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .map(|mtime| (mtime, e.file_name()))
+            })
+            .collect();
+        // Newest mtime first; lexicographic action id ascending as a stable
+        // tie-breaker (same convention as the outbox latest ordering).
+        entries.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+        entries
+            .first()
+            .map(|(_, name)| name.to_string_lossy().into_owned())
+    }
+
+    fn policy_update_latest_target(&self, wallet: &str) -> Option<String> {
+        self.policy_update_latest_pending_id(wallet)
+            .map(|id| format!("pending/{id}"))
+    }
+
     /// Raw approval challenge JSON for a staged policy update, surfaced through
     /// the mount so an agent can discover the ceremony (including `ceremony_url`)
     /// without reading `BLOOM_HOME`. Contains only bounded challenge metadata —
@@ -874,34 +952,36 @@ impl WalletsHandler {
     fn read_policy_update_challenge(
         &self,
         wallet: &str,
+        state: &str,
         action_id: &str,
     ) -> Result<Vec<u8>, HandlerError> {
         let path = self
-            .policy_updates_dir(wallet)
-            .join(action_id)
+            .policy_update_action_dir(wallet, state, action_id)
             .join(APPROVAL_CHALLENGE_FILE);
         if !path.exists() {
             return Err(HandlerError::not_found(format!(
-                "policy-updates/{action_id}/{APPROVAL_CHALLENGE_FILE}"
+                "policy-updates/{state}/{action_id}/{APPROVAL_CHALLENGE_FILE}"
             )));
         }
         Ok(std::fs::read(&path)?)
     }
 
-    /// Human/agent-facing status view for a staged policy update. Derives its
-    /// `status` from which artifacts exist on disk (a challenge alone means the
-    /// ceremony is still pending; an approval means the one-shot grant can be
-    /// minted by re-writing the same proposed policy). Exposes `ceremony_url`
-    /// and the exact retry path; never exposes the signed approval itself.
+    /// Human/agent-facing status view for a policy update. The lifecycle folder
+    /// (`pending`/`confirmed`/`failed`) is authoritative; within `pending` the
+    /// presence of `approval.json` distinguishes `approved` (grant can be minted
+    /// by re-writing the same proposed policy) from `challenged` (ceremony still
+    /// required). Exposes `ceremony_url` and the exact retry path; never exposes
+    /// the signed approval itself.
     fn policy_update_status_json(
         &self,
         wallet: &str,
+        state: &str,
         action_id: &str,
     ) -> Result<Vec<u8>, HandlerError> {
-        let action_dir = self.policy_updates_dir(wallet).join(action_id);
+        let action_dir = self.policy_update_action_dir(wallet, state, action_id);
         if !action_dir.is_dir() {
             return Err(HandlerError::not_found(format!(
-                "policy-updates/{action_id}"
+                "policy-updates/{state}/{action_id}"
             )));
         }
         let challenge_path = action_dir.join(APPROVAL_CHALLENGE_FILE);
@@ -910,22 +990,40 @@ impl WalletsHandler {
         } else {
             None
         };
-        let approved = action_dir.join(APPROVAL_FILE).exists();
-        let status = if approved { "approved" } else { "challenged" };
-        let next_step = if approved {
-            "re-write the same proposed policy to /wallets/<wallet>/policy.toml to install"
-        } else {
-            "open ceremony_url, approve, then re-write the same proposed policy.toml"
+        let (status, next_step) = match state {
+            "confirmed" => (
+                "confirmed",
+                "policy installed; this entry is kept for audit history",
+            ),
+            "failed" => (
+                "failed",
+                "staged baseline changed before the approved retry; restage the policy update",
+            ),
+            _ => {
+                let approved = action_dir.join(APPROVAL_FILE).exists();
+                if approved {
+                    (
+                        "approved",
+                        "re-write the same proposed policy to /wallets/<wallet>/policy.toml to install",
+                    )
+                } else {
+                    (
+                        "challenged",
+                        "open ceremony_url, approve, then re-write the same proposed policy.toml",
+                    )
+                }
+            }
         };
         let body = serde_json::json!({
             "schema": "bloom.wallet_policy_update_view.v1",
             "wallet": wallet,
             "action_id": action_id,
             "surface": WALLET_POLICY_SURFACE,
+            "state": state,
             "status": status,
             "write_path": format!("/wallets/{wallet}/policy.toml"),
             "installation_target": format!("/wallets/{wallet}/policy.toml"),
-            "challenge_path": format!("/wallets/{wallet}/policy-updates/{action_id}/{APPROVAL_CHALLENGE_FILE}"),
+            "challenge_path": format!("/wallets/{wallet}/policy-updates/{state}/{action_id}/{APPROVAL_CHALLENGE_FILE}"),
             "assurance": challenge.as_ref().map(|c| c.assurance),
             "ceremony_url": challenge.as_ref().and_then(|c| c.ceremony_url.clone()),
             "expiry_ms": challenge.as_ref().map(|c| c.expiry_ms),
@@ -1056,6 +1154,22 @@ impl WalletsHandler {
 
 fn err_be(e: impl std::fmt::Display) -> HandlerError {
     HandlerError::backend(e.to_string())
+}
+
+/// Reject a policy-update action id that could escape its state directory
+/// (path traversal, the `latest` sentinel, or NUL). Real ids are
+/// `policy-update-<blake3-hex>`, so this is defense-in-depth.
+fn validate_policy_action_id(id: &str) -> Result<(), HandlerError> {
+    if id.is_empty()
+        || id == "latest"
+        || id.contains('/')
+        || id.contains('\\')
+        || id.contains('\0')
+        || id.contains("..")
+    {
+        return Err(HandlerError::invalid(format!("invalid action id: {id}")));
+    }
+    Ok(())
 }
 
 fn tx_open_err(e: TxEngineError) -> HandlerError {
@@ -1801,23 +1915,61 @@ impl WalletsHandler {
             },
             "policy-updates" => match segs.len() {
                 2 => Ok(Entry::dir("policy-updates")),
-                3 if self.policy_updates_dir(wallet).join(&segs[2]).is_dir() => {
-                    Ok(Entry::dir(&segs[2]))
+                3 if POLICY_UPDATE_STATES.contains(&segs[2].as_str()) => Ok(Entry::dir(&segs[2])),
+                3 if segs[2] == "latest" => {
+                    let target = self
+                        .policy_update_latest_target(wallet)
+                        .ok_or_else(|| HandlerError::not_found("policy-updates/latest"))?;
+                    Ok(Entry::symlink("latest", &target))
                 }
-                4 if segs[3] == "status.json" => {
-                    let action_dir = self.policy_updates_dir(wallet).join(&segs[2]);
-                    if action_dir.is_dir() {
+                4 if segs[2] == "latest"
+                    && matches!(segs[3].as_str(), "status.json" | APPROVAL_CHALLENGE_FILE) =>
+                {
+                    let action_id = self
+                        .policy_update_latest_pending_id(wallet)
+                        .ok_or_else(|| HandlerError::not_found("policy-updates/latest"))?;
+                    let dir = self.policy_update_action_dir(wallet, "pending", &action_id);
+                    // status.json is derived from the action dir, not persisted;
+                    // the challenge is a real file.
+                    let present = if segs[3] == "status.json" {
+                        dir.is_dir()
+                    } else {
+                        dir.join(&segs[3]).is_file()
+                    };
+                    if present {
+                        Ok(Entry::file(&segs[3]))
+                    } else {
+                        Err(HandlerError::not_found(path.to_string_path()))
+                    }
+                }
+                4 if POLICY_UPDATE_STATES.contains(&segs[2].as_str()) => {
+                    validate_policy_action_id(&segs[3])?;
+                    let dir = self.policy_update_action_dir(wallet, &segs[2], &segs[3]);
+                    if dir.is_dir() {
+                        Ok(Entry::dir(&segs[3]))
+                    } else {
+                        Err(HandlerError::not_found(path.to_string_path()))
+                    }
+                }
+                5 if POLICY_UPDATE_STATES.contains(&segs[2].as_str())
+                    && segs[4] == "status.json" =>
+                {
+                    validate_policy_action_id(&segs[3])?;
+                    let dir = self.policy_update_action_dir(wallet, &segs[2], &segs[3]);
+                    if dir.is_dir() {
                         Ok(Entry::file("status.json"))
                     } else {
                         Err(HandlerError::not_found(path.to_string_path()))
                     }
                 }
-                4 if segs[3] == APPROVAL_CHALLENGE_FILE => {
-                    let challenge_path = self
-                        .policy_updates_dir(wallet)
-                        .join(&segs[2])
+                5 if POLICY_UPDATE_STATES.contains(&segs[2].as_str())
+                    && segs[4] == APPROVAL_CHALLENGE_FILE =>
+                {
+                    validate_policy_action_id(&segs[3])?;
+                    let fpath = self
+                        .policy_update_action_dir(wallet, &segs[2], &segs[3])
                         .join(APPROVAL_CHALLENGE_FILE);
-                    if challenge_path.is_file() {
+                    if fpath.is_file() {
                         Ok(Entry::file(APPROVAL_CHALLENGE_FILE))
                     } else {
                         Err(HandlerError::not_found(path.to_string_path()))
@@ -1875,11 +2027,31 @@ impl WalletsHandler {
             "policy-session" if segs.len() == 3 && segs[2] == "active.json" => {
                 self.policy_session_active_json(wallet).await
             }
-            "policy-updates" if segs.len() == 4 && segs[3] == "approval_challenge.json" => {
-                self.read_policy_update_challenge(wallet, &segs[2])
+            "policy-updates" if segs.len() == 4 && segs[2] == "latest" => {
+                let action_id = self
+                    .policy_update_latest_pending_id(wallet)
+                    .ok_or_else(|| HandlerError::not_found("policy-updates/latest"))?;
+                match segs[3].as_str() {
+                    "approval_challenge.json" => {
+                        self.read_policy_update_challenge(wallet, "pending", &action_id)
+                    }
+                    "status.json" => self.policy_update_status_json(wallet, "pending", &action_id),
+                    _ => Err(HandlerError::NotAFile(path.to_string_path())),
+                }
             }
-            "policy-updates" if segs.len() == 4 && segs[3] == "status.json" => {
-                self.policy_update_status_json(wallet, &segs[2])
+            "policy-updates"
+                if segs.len() == 5
+                    && POLICY_UPDATE_STATES.contains(&segs[2].as_str())
+                    && segs[4] == "approval_challenge.json" =>
+            {
+                self.read_policy_update_challenge(wallet, &segs[2], &segs[3])
+            }
+            "policy-updates"
+                if segs.len() == 5
+                    && POLICY_UPDATE_STATES.contains(&segs[2].as_str())
+                    && segs[4] == "status.json" =>
+            {
+                self.policy_update_status_json(wallet, &segs[2], &segs[3])
             }
             "capabilities" if segs.len() == 3 && segs[2] == "active.json" => {
                 self.capabilities_active_json(wallet)
@@ -1996,13 +2168,27 @@ impl WalletsHandler {
                 .collect()),
             2 if segs[1] == "sign" => Ok(Self::sign_dir_entries()),
             2 if segs[1] == "policy-session" => Ok(Self::policy_session_dir_entries()),
-            2 if segs[1] == "policy-updates" => Ok(self
-                .policy_update_action_ids(wallet)
-                .iter()
-                .map(|id| Entry::dir(id))
-                .collect()),
-            3 if segs[1] == "policy-updates" => {
-                let dir = self.policy_updates_dir(wallet).join(&segs[2]);
+            2 if segs[1] == "policy-updates" => {
+                let mut entries: Vec<Entry> =
+                    POLICY_UPDATE_STATES.iter().map(|s| Entry::dir(s)).collect();
+                if let Some(target) = self.policy_update_latest_target(wallet) {
+                    entries.push(Entry::symlink("latest", &target));
+                }
+                Ok(entries)
+            }
+            3 if segs[1] == "policy-updates"
+                && POLICY_UPDATE_STATES.contains(&segs[2].as_str()) =>
+            {
+                Ok(self
+                    .policy_update_action_ids(wallet, &segs[2])
+                    .iter()
+                    .map(|id| Entry::dir(id))
+                    .collect())
+            }
+            4 if segs[1] == "policy-updates"
+                && POLICY_UPDATE_STATES.contains(&segs[2].as_str()) =>
+            {
+                let dir = self.policy_update_action_dir(wallet, &segs[2], &segs[3]);
                 if !dir.is_dir() {
                     return Err(HandlerError::not_found(path.to_string_path()));
                 }
@@ -4605,6 +4791,7 @@ mod tests {
             .root()
             .join("alice")
             .join("policy-updates")
+            .join("pending")
             .join(&action_id);
         let challenge: ApprovalChallenge = read_json(dir.join(APPROVAL_CHALLENGE_FILE)).unwrap();
         assert_eq!(challenge.surface, WALLET_POLICY_SURFACE);
@@ -4623,6 +4810,135 @@ mod tests {
             std::fs::read_to_string(f.handler.keystore.root().join("alice/policy.toml")).unwrap();
         assert_eq!(on_disk, proposed);
         f.handler.keystore.info("alice").unwrap();
+    }
+
+    /// After a successful approved install, the action moves from `pending/` to
+    /// `confirmed/`: its `status.json` reports `confirmed`, the `pending/`
+    /// directory is empty, and no `latest` symlink is advertised.
+    #[tokio::test]
+    async fn wallet_policy_update_transitions_to_confirmed_after_install() {
+        let mut f = make_handler();
+        let services = wallet_policy_auth_services(&f);
+        convert_wallet_to_passkey(&f, "alice");
+        f.handler = f.handler.with_auth_services(services);
+        let (old_policy, _) = f.handler.keystore.raw_policy("alice").unwrap();
+        let mut proposed: Policy = toml::from_str(&old_policy).unwrap();
+        proposed.denylists.recipients.insert("0xbeef".into());
+        let proposed = toml::to_string_pretty(&proposed).unwrap();
+        let action_id =
+            wallet_policy_action_id("alice", old_policy.as_bytes(), proposed.as_bytes());
+        let p = VfsPath::parse("/alice/policy.toml").unwrap();
+
+        // Stage + approve.
+        assert!(matches!(
+            f.handler.write(&p, proposed.as_bytes()).await.unwrap_err(),
+            HandlerError::PermissionDenied
+        ));
+        let dir = f
+            .handler
+            .keystore
+            .root()
+            .join("alice")
+            .join("policy-updates")
+            .join("pending")
+            .join(&action_id);
+        let challenge: ApprovalChallenge = read_json(dir.join(APPROVAL_CHALLENGE_FILE)).unwrap();
+        write_json(
+            dir.join(APPROVAL_FILE),
+            &signed_wallet_policy_approval(&challenge),
+        )
+        .unwrap();
+
+        // Install.
+        f.handler.write(&p, proposed.as_bytes()).await.unwrap();
+
+        // The action is now under confirmed/, not pending/.
+        let confirmed_status = f
+            .handler
+            .read(
+                &VfsPath::parse(&format!(
+                    "/alice/policy-updates/confirmed/{action_id}/status.json"
+                ))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status: serde_json::Value = serde_json::from_slice(&confirmed_status).unwrap();
+        assert_eq!(status["state"], "confirmed");
+        assert_eq!(status["status"], "confirmed");
+
+        let pending = f
+            .handler
+            .list(&VfsPath::parse("/alice/policy-updates/pending").unwrap())
+            .await
+            .unwrap();
+        assert!(pending.is_empty(), "pending should be empty after install");
+
+        // No latest symlink once nothing is pending.
+        let root = f
+            .handler
+            .list(&VfsPath::parse("/alice/policy-updates").unwrap())
+            .await
+            .unwrap();
+        assert!(
+            root.iter().all(|e| e.name != "latest"),
+            "no latest symlink expected once pending drains: {root:?}"
+        );
+    }
+
+    /// The `latest` symlink tracks the most recently staged pending action and
+    /// resolves its challenge/status views, matching the outbox convention.
+    #[tokio::test]
+    async fn wallet_policy_update_latest_symlink_tracks_most_recent_pending() {
+        let mut f = make_handler();
+        let services = wallet_policy_auth_services(&f);
+        convert_wallet_to_passkey(&f, "alice");
+        f.handler = f.handler.with_auth_services(services);
+        let (old_policy, _) = f.handler.keystore.raw_policy("alice").unwrap();
+
+        let mut first: Policy = toml::from_str(&old_policy).unwrap();
+        first.denylists.recipients.insert("0xaaaa".into());
+        let first = toml::to_string_pretty(&first).unwrap();
+
+        let mut second: Policy = toml::from_str(&old_policy).unwrap();
+        second.denylists.recipients.insert("0xbbbb".into());
+        let second = toml::to_string_pretty(&second).unwrap();
+        let second_id = wallet_policy_action_id("alice", old_policy.as_bytes(), second.as_bytes());
+
+        let p = VfsPath::parse("/alice/policy.toml").unwrap();
+        assert!(matches!(
+            f.handler.write(&p, first.as_bytes()).await.unwrap_err(),
+            HandlerError::PermissionDenied
+        ));
+        std::thread::sleep(std::time::Duration::from_millis(15));
+        assert!(matches!(
+            f.handler.write(&p, second.as_bytes()).await.unwrap_err(),
+            HandlerError::PermissionDenied
+        ));
+
+        // latest points at the more recently staged action.
+        let entry = f
+            .handler
+            .lookup(&VfsPath::parse("/alice/policy-updates/latest").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(entry.name, "latest");
+        let expected_target = format!("pending/{second_id}");
+        assert_eq!(
+            entry.link_target.as_deref(),
+            Some(expected_target.as_str()),
+            "latest must track the most recently staged pending action"
+        );
+
+        // latest/status.json resolves to the newest action's view.
+        let status_bytes = f
+            .handler
+            .read(&VfsPath::parse("/alice/policy-updates/latest/status.json").unwrap())
+            .await
+            .unwrap();
+        let status: serde_json::Value = serde_json::from_slice(&status_bytes).unwrap();
+        assert_eq!(status["action_id"], second_id);
+        assert_eq!(status["state"], "pending");
     }
 
     #[tokio::test]
@@ -4654,6 +4970,7 @@ mod tests {
             .root()
             .join("alice")
             .join("policy-updates")
+            .join("pending")
             .join(&action_id);
         let challenge: ApprovalChallenge = read_json(dir.join(APPROVAL_CHALLENGE_FILE)).unwrap();
         write_json(
@@ -4782,21 +5099,34 @@ mod tests {
             HandlerError::PermissionDenied
         ));
 
-        // policy-updates/ lists the staged action.
+        // policy-updates/ lists the lifecycle state dirs plus a latest symlink.
         let listed = f
             .handler
             .list(&VfsPath::parse("/alice/policy-updates").unwrap())
             .await
             .unwrap();
+        let names: Vec<&str> = listed.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"pending"), "missing pending dir: {names:?}");
+        assert!(
+            names.contains(&"latest"),
+            "missing latest symlink: {names:?}"
+        );
+
+        // policy-updates/pending/ lists the staged action.
+        let listed = f
+            .handler
+            .list(&VfsPath::parse("/alice/policy-updates/pending").unwrap())
+            .await
+            .unwrap();
         assert!(
             listed.iter().any(|e| e.name == action_id),
-            "policy-updates listing missing action id: {listed:?}"
+            "policy-updates/pending listing missing action id: {listed:?}"
         );
 
         // The action dir advertises its readable artifacts.
         let artifacts = f
             .handler
-            .list(&VfsPath::parse(&format!("/alice/policy-updates/{action_id}")).unwrap())
+            .list(&VfsPath::parse(&format!("/alice/policy-updates/pending/{action_id}")).unwrap())
             .await
             .unwrap();
         let names: Vec<&str> = artifacts.iter().map(|e| e.name.as_str()).collect();
@@ -4807,7 +5137,8 @@ mod tests {
             let entry = f
                 .handler
                 .lookup(
-                    &VfsPath::parse(&format!("/alice/policy-updates/{action_id}/{leaf}")).unwrap(),
+                    &VfsPath::parse(&format!("/alice/policy-updates/pending/{action_id}/{leaf}"))
+                        .unwrap(),
                 )
                 .await
                 .unwrap();
@@ -4819,7 +5150,7 @@ mod tests {
             .handler
             .read(
                 &VfsPath::parse(&format!(
-                    "/alice/policy-updates/{action_id}/approval_challenge.json"
+                    "/alice/policy-updates/pending/{action_id}/approval_challenge.json"
                 ))
                 .unwrap(),
             )
@@ -4836,7 +5167,10 @@ mod tests {
         let status_bytes = f
             .handler
             .read(
-                &VfsPath::parse(&format!("/alice/policy-updates/{action_id}/status.json")).unwrap(),
+                &VfsPath::parse(&format!(
+                    "/alice/policy-updates/pending/{action_id}/status.json"
+                ))
+                .unwrap(),
             )
             .await
             .unwrap();
@@ -4853,6 +5187,7 @@ mod tests {
                 .root()
                 .join("alice")
                 .join("policy-updates")
+                .join("pending")
                 .join(&action_id)
                 .join(APPROVAL_FILE),
             &signed_wallet_policy_approval(&challenge),
@@ -4862,7 +5197,7 @@ mod tests {
             .handler
             .read(
                 &VfsPath::parse(&format!(
-                    "/alice/policy-updates/{action_id}/{APPROVAL_FILE}"
+                    "/alice/policy-updates/pending/{action_id}/{APPROVAL_FILE}"
                 ))
                 .unwrap(),
             )
@@ -4886,7 +5221,8 @@ mod tests {
         let f = make_handler();
 
         for leaf in ["status.json", APPROVAL_CHALLENGE_FILE] {
-            let path = VfsPath::parse(&format!("/alice/policy-updates/missing/{leaf}")).unwrap();
+            let path =
+                VfsPath::parse(&format!("/alice/policy-updates/pending/missing/{leaf}")).unwrap();
             let result = f.handler.lookup(&path).await;
             assert!(
                 matches!(result, Err(HandlerError::NotFound(_))),
@@ -4905,6 +5241,7 @@ mod tests {
                 .root()
                 .join("alice")
                 .join("policy-updates")
+                .join("pending")
                 .join(action_id),
         )
         .unwrap();
@@ -4912,7 +5249,10 @@ mod tests {
         let status = f
             .handler
             .lookup(
-                &VfsPath::parse(&format!("/alice/policy-updates/{action_id}/status.json")).unwrap(),
+                &VfsPath::parse(&format!(
+                    "/alice/policy-updates/pending/{action_id}/status.json"
+                ))
+                .unwrap(),
             )
             .await
             .unwrap();
@@ -4922,7 +5262,7 @@ mod tests {
             .handler
             .lookup(
                 &VfsPath::parse(&format!(
-                    "/alice/policy-updates/{action_id}/{APPROVAL_CHALLENGE_FILE}"
+                    "/alice/policy-updates/pending/{action_id}/{APPROVAL_CHALLENGE_FILE}"
                 ))
                 .unwrap(),
             )
@@ -4962,6 +5302,7 @@ mod tests {
             .root()
             .join("alice")
             .join("policy-updates")
+            .join("pending")
             .join(&action_id);
         let challenge: ApprovalChallenge = read_json(dir.join(APPROVAL_CHALLENGE_FILE)).unwrap();
         write_json(

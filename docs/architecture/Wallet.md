@@ -212,8 +212,9 @@ Flow:
 3. With no live grant, the first write issues an `approval_challenge.json` (with
    a projected `ceremony_url`) and returns permission denied.
 4. The challenge and a `status.json` view are reachable through the mount at
-   `/wallets/<wallet>/policy-updates/<action_id>/`, so the agent never needs
-   `BLOOM_HOME` access. These are read-only views: bounded challenge metadata and
+   `/wallets/<wallet>/policy-updates/pending/<action_id>/` (or via the
+   `policy-updates/latest` symlink), so the agent never needs `BLOOM_HOME`
+   access. These are read-only views: bounded challenge metadata and
    `ceremony_url` only — never the signed approval, grant, or key/PRF material.
 5. Approval mints a one-shot grant. The grant is keyed to the sealed action id,
    which is bound to `blake3(proposed_policy)`, so only the exact approved
