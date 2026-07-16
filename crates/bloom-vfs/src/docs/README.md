@@ -78,7 +78,8 @@ enumerate. Address known block numbers directly; each block directory exposes
 `full.json`.
 
 Transaction-by-hash reads expose a small directory of receipt and transaction
-views:
+views. The hash directory resolves only when the configured RPC returns a
+transaction; malformed or unknown hashes surface as `NotFound`:
 
 ```sh
 TX=0x...

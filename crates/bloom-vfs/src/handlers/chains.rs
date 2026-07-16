@@ -59,6 +59,9 @@ use super::chains_nfts::{
     PER_TOKEN_LEAVES,
 };
 
+type TxCache =
+    std::collections::HashMap<(String, alloy::primitives::B256), (Instant, serde_json::Value)>;
+
 #[derive(Clone)]
 pub struct ChainsHandler {
     pub registry: ChainRegistry,
@@ -95,6 +98,10 @@ pub struct ChainsHandler {
     /// daemon process is the natural lifetime bound.
     revert_cache:
         Arc<PlMutex<std::collections::HashMap<(String, alloy::primitives::B256), DecodedRevert>>>,
+    /// Positive transaction lookups used to validate `tx/<hash>/` directories.
+    /// A short TTL collapses the lookup + readdir + getattr burst produced by
+    /// mounted filesystem clients without hiding a reorg indefinitely.
+    tx_cache: Arc<PlMutex<TxCache>>,
     /// Per-chain mempool handlers. Empty by default; populated by the
     /// daemon via [`with_mempool_handlers`] when mempool providers are
     /// configured. Keys are chain names (e.g., "ethereum").
@@ -130,6 +137,9 @@ const HEAD_TS_TTL: Duration = Duration::from_secs(5);
 /// full (a rebuild costs one RPC per listed block directory).
 const BLOCK_TS_CACHE_CAP: usize = 4096;
 
+const TX_CACHE_TTL: Duration = Duration::from_secs(60);
+const TX_CACHE_CAP: usize = 4096;
+
 #[derive(Default)]
 struct BlockTsCache {
     head: std::collections::HashMap<String, (Instant, u64)>,
@@ -151,6 +161,7 @@ impl ChainsHandler {
             token_metadata_cache: Arc::new(PlMutex::new(std::collections::HashMap::new())),
             revert_decoder: Arc::new(DecoderChain::new()),
             revert_cache: Arc::new(PlMutex::new(std::collections::HashMap::new())),
+            tx_cache: Arc::new(PlMutex::new(std::collections::HashMap::new())),
             mempool_handlers: Arc::new(std::collections::BTreeMap::new()),
             block_ts_cache: Arc::new(PlMutex::new(BlockTsCache::default())),
         }
@@ -766,15 +777,36 @@ impl ChainsHandler {
         None
     }
 
+    fn parse_tx_hash(path: &VfsPath, raw: &str) -> Result<alloy::primitives::B256, HandlerError> {
+        raw.parse::<alloy::primitives::B256>()
+            .map_err(|_| HandlerError::not_found(path.to_string_path()))
+    }
+
     async fn tx_json(
+        &self,
         client: &ChainClient,
+        chain: &str,
         hash: alloy::primitives::B256,
     ) -> Result<serde_json::Value, HandlerError> {
-        client
+        let key = (chain.to_string(), hash);
+        if let Some((cached_at, value)) = self.tx_cache.lock().get(&key)
+            && cached_at.elapsed() < TX_CACHE_TTL
+        {
+            return Ok(value.clone());
+        }
+
+        let value = client
             .tx_json(hash)
             .await
             .map_err(err_be)?
-            .ok_or_else(|| HandlerError::not_found(format!("tx {hash:#x}")))
+            .ok_or_else(|| HandlerError::not_found(format!("tx {hash:#x}")))?;
+
+        let mut cache = self.tx_cache.lock();
+        if cache.len() >= TX_CACHE_CAP {
+            cache.clear();
+        }
+        cache.insert(key, (Instant::now(), value.clone()));
+        Ok(value)
     }
 
     async fn receipt_json(
@@ -794,7 +826,7 @@ impl ChainsHandler {
             return Ok(Entry::dir(""));
         }
         let chain = &segs[0];
-        let _client = self.client(chain)?;
+        let client = self.client(chain)?;
         if segs.len() == 1 {
             return Ok(Entry::dir(chain));
         }
@@ -881,10 +913,16 @@ impl ChainsHandler {
             },
             "tx" => match segs.len() {
                 2 => Ok(Entry::dir("tx")),
-                3 => Ok(Entry::dir(&segs[2])),
+                3 => {
+                    let hash = Self::parse_tx_hash(path, &segs[2])?;
+                    self.tx_json(&client, chain, hash).await?;
+                    Ok(Entry::dir(&segs[2]))
+                }
                 4 => {
                     let f = segs[3].as_str();
                     if TX_FILES.contains(&f) {
+                        let hash = Self::parse_tx_hash(path, &segs[2])?;
+                        self.tx_json(&client, chain, hash).await?;
                         Ok(Entry::file(f))
                     } else {
                         Err(HandlerError::not_found(path.to_string_path()))
@@ -1161,7 +1199,7 @@ impl ChainsHandler {
                     .map_err(|e| HandlerError::invalid(format!("tx hash: {e}")))?;
                 match segs[3].as_str() {
                     "full.json" => {
-                        let tx = Self::tx_json(&client, hash).await?;
+                        let tx = self.tx_json(&client, chain, hash).await?;
                         Ok(serde_json::to_vec_pretty(&tx).map_err(err_be)?)
                     }
                     "receipt.json" => {
@@ -1460,7 +1498,11 @@ impl ChainsHandler {
                 // /chains/<chain>/addresses/<addr>/nfts/<contract>/<token_id>
                 Ok(PER_TOKEN_LEAVES.iter().map(|n| Entry::file(n)).collect())
             }
-            3 if segs[1] == "tx" => Ok(TX_FILES.iter().map(|n| Entry::file(n)).collect()),
+            3 if segs[1] == "tx" => {
+                let hash = Self::parse_tx_hash(path, &segs[2])?;
+                self.tx_json(&client, chain, hash).await?;
+                Ok(TX_FILES.iter().map(|n| Entry::file(n)).collect())
+            }
             n if n >= 3 && segs[1] == "contracts" => {
                 let client = self.client(chain)?;
                 self.list_contracts(segs, &client).await
@@ -2009,13 +2051,15 @@ mod tests {
 
     #[tokio::test]
     async fn tx_hash_dir_lists_documented_leaves() {
-        let h = ChainsHandler::new(anvil_registry());
-        let chain_name = h.registry.list_names()[0].clone();
-        let p = VfsPath::parse(&format!(
-            "/{chain}/tx/0x0000000000000000000000000000000000000000000000000000000000000000",
-            chain = chain_name
-        ))
-        .unwrap();
+        let hash = format!("0x{}", "11".repeat(32));
+        let mut routes = std::collections::HashMap::new();
+        routes.insert(
+            "eth_getTransactionByHash".to_string(),
+            rpc_tx(&hash, 7, 31_343),
+        );
+        let rpc = spawn_rpc(31_343, routes);
+        let h = ChainsHandler::new(registry_for_rpc(rpc, 31_343));
+        let p = VfsPath::parse(&format!("/test/tx/{hash}")).unwrap();
 
         let names: Vec<String> = h
             .list(&p)
@@ -2029,30 +2073,71 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn confirmed_tx_entries_surface_containing_block_timestamp() {
-        // Lookup/list must not RPC-fetch timestamps for every path component.
-        // The entries are still returned with correct names and kinds.
+    async fn missing_tx_hash_dir_is_not_found() {
+        let rpc = spawn_rpc(31_344, std::collections::HashMap::new());
+        let h = ChainsHandler::new(registry_for_rpc(rpc, 31_344));
+        let hash = format!("0x{}", "ff".repeat(32));
+        let path = VfsPath::parse(&format!("/test/tx/{hash}")).unwrap();
+
+        assert!(matches!(
+            h.lookup(&path).await,
+            Err(HandlerError::NotFound(_))
+        ));
+        assert!(matches!(
+            h.list(&path).await,
+            Err(HandlerError::NotFound(_))
+        ));
+
+        let leaf = VfsPath::parse(&format!("/test/tx/{hash}/status")).unwrap();
+        assert!(matches!(
+            h.lookup(&leaf).await,
+            Err(HandlerError::NotFound(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn invalid_tx_hash_dir_is_not_found() {
         let h = ChainsHandler::new(anvil_registry());
-        let chain = h.registry.list_names()[0].clone();
+        let path = VfsPath::parse("/anvil/tx/not-a-transaction-hash").unwrap();
+
+        assert!(matches!(
+            h.lookup(&path).await,
+            Err(HandlerError::NotFound(_))
+        ));
+        assert!(matches!(
+            h.list(&path).await,
+            Err(HandlerError::NotFound(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn confirmed_tx_entries_surface_containing_block_timestamp() {
         let hash = format!("0x{}", "22".repeat(32));
+        let mut routes = std::collections::HashMap::new();
+        routes.insert(
+            "eth_getTransactionByHash".to_string(),
+            rpc_tx(&hash, 8, 31_345),
+        );
+        let rpc = spawn_rpc(31_345, routes);
+        let h = ChainsHandler::new(registry_for_rpc(rpc, 31_345));
 
         let entries = h
-            .list(&VfsPath::parse(&format!("/{chain}/tx/{hash}")).unwrap())
+            .list(&VfsPath::parse(&format!("/test/tx/{hash}")).unwrap())
             .await
             .unwrap();
         let leaf = h
-            .lookup(&VfsPath::parse(&format!("/{chain}/tx/{hash}/receipt.json")).unwrap())
+            .lookup(&VfsPath::parse(&format!("/test/tx/{hash}/receipt.json")).unwrap())
             .await
             .unwrap();
 
         assert!(!entries.is_empty());
         assert!(
             entries.iter().all(|e| e.modified.is_none()),
-            "list must not RPC-fetch timestamps"
+            "list must not fabricate timestamps"
         );
         assert!(
             leaf.modified.is_none(),
-            "lookup must not RPC-fetch timestamps"
+            "lookup must not fabricate timestamps"
         );
     }
 
@@ -2578,6 +2663,28 @@ mod tests {
             "status": "0x1",
             "effectiveGasPrice": "0x1",
             "type": "0x2"
+        })
+    }
+
+    fn rpc_tx(hash: &str, block_number: u64, chain_id: u64) -> serde_json::Value {
+        let v = chain_id * 2 + 35;
+        serde_json::json!({
+            "hash": hash,
+            "blockHash": format!("0x{}", "11".repeat(32)),
+            "blockNumber": format!("0x{block_number:x}"),
+            "transactionIndex": "0x0",
+            "from": "0x0000000000000000000000000000000000000001",
+            "to": "0x0000000000000000000000000000000000000002",
+            "gas": "0x5208",
+            "gasPrice": "0x1",
+            "input": "0x",
+            "nonce": "0x0",
+            "value": "0x0",
+            "type": "0x0",
+            "chainId": format!("0x{chain_id:x}"),
+            "r": "0x1",
+            "s": "0x1",
+            "v": format!("0x{v:x}")
         })
     }
 
