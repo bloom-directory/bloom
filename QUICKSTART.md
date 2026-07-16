@@ -43,11 +43,11 @@ BLOOM_HOME=/tmp/bloom-demo cargo run -p bloom -- init
 ```
 
 This prints the home dir, config path, and configured chains. The
-default config registers ten read-ready public EVM chains (Ethereum,
-Base, Arbitrum, Optimism, Polygon, BNB Smart Chain, Avalanche, Gnosis,
-Linea, HyperEVM) plus `anvil` at `http://127.0.0.1:8545`. Live-network
-broadcasts are blocked by default (`block_mainnet_broadcast = true` and
-per-chain `allow_broadcast = false`).
+default config registers eleven read-ready public EVM chains (Ethereum,
+Base, Tempo, Arbitrum, Optimism, Polygon, BNB Smart Chain, Avalanche,
+Gnosis, Linea, HyperEVM) plus `anvil` at `http://127.0.0.1:8545`. Per-chain
+`allow_broadcast` defaults to `true`; live-mainnet broadcasts remain blocked by
+the separate `block_mainnet_broadcast = true` kill-switch.
 
 ## 2. Start a local devnet
 

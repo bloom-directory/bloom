@@ -60,12 +60,12 @@ Bloom gives an agent a safe wallet workspace:
 - enforce policy: spend caps, allow/deny lists, contract-call gates,
   private orderflow settings, and hash-chained audit logging.
 
-Bloom ships read-ready RPC defaults for ten major EVM networks —
-Ethereum, Base, Arbitrum, Optimism, Polygon, BNB Smart Chain,
-Avalanche, Gnosis, Linea, and HyperEVM — plus local Anvil. Mainnet/L2
-broadcasts are disabled by default. Public reads, simulations, and
-planning work without adding API keys; local devnet sends require a
-running Anvil node.
+Bloom ships read-ready RPC defaults for major EVM networks — Ethereum,
+Base, Tempo, Arbitrum, Optimism, Polygon, BNB Smart Chain, Avalanche,
+Gnosis, Linea, and HyperEVM — plus local Anvil. Per-chain broadcasting is
+enabled by default, while the separate mainnet kill-switch remains on.
+Public reads, simulations, and planning work without adding API keys;
+local devnet sends require a running Anvil node.
 
 ## Try it
 
@@ -199,9 +199,9 @@ and example crates used by the broader Bloom runtime and examples.
 
 ## Security defaults
 
-- **Mainnet broadcasts disabled by default.** Set
-  `block_mainnet_broadcast = false` plus a per-chain `allow_broadcast =
-  true` in `~/.bloom/config.toml` to opt a chain into broadcasting.
+- **Mainnet broadcasts blocked by default.** Per-chain `allow_broadcast`
+  defaults to `true`; set `block_mainnet_broadcast = false` in
+  `~/.bloom/config.toml` only when you deliberately want live broadcasts.
 - **Private keys are never readable through the FS.** The keystore
   lives outside the mount; only `address` and `public_key` are
   exposed.

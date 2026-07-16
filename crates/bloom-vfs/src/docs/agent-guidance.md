@@ -31,6 +31,9 @@ bloom gatekeeps every value-moving action through capabilities:
   reside in daemon RAM for a bounded window and auto-lock on expiry.
   Hyperliquid already uses an ephemeral agent key that does not need the
   owner key after session creation.
+- **Broadcast config has two gates.** Per-chain `allow_broadcast` defaults to
+  `true`, while the global mainnet kill-switch remains enabled. Never disable
+  the kill-switch or broadcast a value-moving action without owner approval.
 
 To see what a wallet can do without a human, check its per-chain state and
 outbox, or its Hyperliquid sessions under `hyperliquid/<net>/agent_sessions/`.

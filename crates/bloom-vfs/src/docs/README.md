@@ -315,8 +315,8 @@ echo '0x000000000000000000000000000000000000beef' \
 cat /bloom/addressbook/alice
 ```
 
-Mainnet broadcasts are **disabled by default**. Configure via
-`~/.bloom/config.toml` (`block_mainnet_broadcast = false` is required
-to allow live broadcasts).
+Per-chain `allow_broadcast` defaults to `true`, but mainnet broadcasts remain
+**blocked by default**. Configure via `~/.bloom/config.toml`;
+`block_mainnet_broadcast = false` is required to allow live broadcasts.
 
 See `examples.md` for end-to-end demos.

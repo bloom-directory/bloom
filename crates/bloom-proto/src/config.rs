@@ -8,6 +8,8 @@ use thiserror::Error;
 
 use crate::chain::ChainSpec;
 
+const CURRENT_CONFIG_VERSION: u32 = 1;
+
 #[derive(Debug, Error)]
 pub enum ConfigError {
     #[error("io error: {0}")]
@@ -22,6 +24,9 @@ pub enum ConfigError {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
+    /// Version of Bloom's automatic config migrations.
+    #[serde(default)]
+    pub config_version: u32,
     /// Default mount path (informational; the kernel mount is opt-in).
     #[serde(default = "default_mount_path")]
     pub mount_path: String,
@@ -369,7 +374,7 @@ fn evm_chain(
         chain_id,
         rpc_urls: rpc_urls.iter().map(|u| (*u).to_string()).collect(),
         rpc_endpoints: Vec::new(),
-        allow_broadcast: false,
+        allow_broadcast: true,
         etherscan_api_url: None,
         display_name: Some(display_name.to_string()),
         native_symbol: native_symbol.to_string(),
@@ -493,16 +498,16 @@ fn default_chains() -> BTreeMap<String, ChainSpec> {
 }
 
 impl Config {
-    /// A safe agentic-wallet default: read-ready public EVM networks, Anvil,
+    /// An agentic-wallet default: read-ready public EVM networks, Anvil,
     /// and the Hyperliquid HyperCore VFS using its official public endpoints.
     ///
-    /// Live networks default to read-only (`allow_broadcast = false`) and the
-    /// global mainnet broadcast kill-switch stays enabled. Users can inspect
-    /// balances, contracts, ENS, prices, and stage plans immediately with zero
-    /// config, then opt into live broadcasts deliberately.
+    /// Per-chain broadcast is enabled by default. The global mainnet broadcast
+    /// kill-switch stays enabled, so live mainnet sends still require a separate
+    /// deliberate opt-in.
     pub fn local_default() -> Self {
         let chains = default_chains();
         Config {
+            config_version: CURRENT_CONFIG_VERSION,
             mount_path: default_mount_path(),
             nfs_listen_addr: default_nfs_listen(),
             default_wallet: None,
@@ -540,7 +545,14 @@ impl Config {
 
     pub fn load_or_init(path: &Path) -> Result<Self, ConfigError> {
         if path.exists() {
-            Self::load(path)
+            let s = std::fs::read_to_string(path)?;
+            let mut cfg: Self = toml::from_str(&s)?;
+            let changed = cfg.migrate();
+            cfg.validate()?;
+            if changed {
+                cfg.save(path)?;
+            }
+            Ok(cfg)
         } else {
             let cfg = Self::local_default();
             cfg.save(path)?;
@@ -550,12 +562,23 @@ impl Config {
 
     /// Apply post-load migrations for backwards compatibility.
     ///
-    /// Currently infers `op_stack` for well-known OP-stack chain IDs
-    /// (Optimism=10, Base=8453, â¦) that predate the `op_stack` field.
-    fn migrate(&mut self) {
+    /// Infers `op_stack` for well-known OP-stack chain IDs that predate the
+    /// field, and applies versioned config migrations once.
+    fn migrate(&mut self) -> bool {
+        let mut changed = false;
         for spec in self.chains.values_mut() {
+            let was_op_stack = spec.op_stack;
             spec.infer_op_stack();
+            changed |= spec.op_stack != was_op_stack;
         }
+        if self.config_version < CURRENT_CONFIG_VERSION {
+            for chain in self.chains.values_mut() {
+                chain.allow_broadcast = true;
+            }
+            self.config_version = CURRENT_CONFIG_VERSION;
+            changed = true;
+        }
+        changed
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
@@ -703,6 +726,7 @@ mod tests {
     #[test]
     fn local_default_shape() {
         let cfg = Config::local_default();
+        assert_eq!(cfg.config_version, CURRENT_CONFIG_VERSION);
         assert_eq!(cfg.default_chain, "ethereum");
         assert!(cfg.default_wallet.is_none());
         assert_eq!(cfg.mount_path, "/bloom");
@@ -722,7 +746,7 @@ mod tests {
         assert_eq!(cfg.chains.len(), 12);
         let ethereum = cfg.chains.get("ethereum").expect("ethereum entry");
         assert_eq!(ethereum.chain_id, 1);
-        assert!(!ethereum.allow_broadcast);
+        assert!(ethereum.allow_broadcast);
         assert!(!ethereum.rpc_urls.is_empty());
         let base = cfg.chains.get("base").expect("base entry");
         assert_eq!(base.chain_id, 8453);
@@ -895,6 +919,37 @@ mod tests {
         // Second call should load, not overwrite — round-trip equivalent.
         let cfg2 = Config::load_or_init(&path).unwrap();
         assert_configs_equivalent(&cfg, &cfg2);
+    }
+
+    #[test]
+    fn load_or_init_migrates_existing_broadcast_defaults_once() {
+        let td = tempdir().unwrap();
+        let path = td.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+default_chain = "anvil"
+
+[chains.anvil]
+name = "anvil"
+chain_id = 31337
+rpc_urls = ["http://127.0.0.1:8545"]
+allow_broadcast = false
+"#,
+        )
+        .unwrap();
+
+        let mut cfg = Config::load_or_init(&path).unwrap();
+        assert_eq!(cfg.config_version, CURRENT_CONFIG_VERSION);
+        assert!(cfg.chains["anvil"].allow_broadcast);
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(saved.contains("config_version = 1"));
+        assert!(saved.contains("allow_broadcast = true"));
+
+        cfg.chains.get_mut("anvil").unwrap().allow_broadcast = false;
+        cfg.save(&path).unwrap();
+        let reloaded = Config::load_or_init(&path).unwrap();
+        assert!(!reloaded.chains["anvil"].allow_broadcast);
     }
 
     #[test]

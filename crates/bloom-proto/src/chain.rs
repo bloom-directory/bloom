@@ -89,10 +89,9 @@ pub struct ChainSpec {
     /// New: rich endpoint schema. Wins over `rpc_urls` when non-empty.
     #[serde(default)]
     pub rpc_endpoints: Vec<EndpointSpec>,
-    /// Whether broadcasts are allowed on this chain. **False by default
-    /// on mainnet/L2** to enforce the "never broadcast to mainnet
-    /// without explicit operator config" rule.
-    #[serde(default)]
+    /// Whether broadcasts are allowed on this chain. Defaults to true; the
+    /// separate global mainnet kill-switch remains the final safety gate.
+    #[serde(default = "default_allow_broadcast")]
     pub allow_broadcast: bool,
     /// Etherscan-compatible API base URL (optional).
     #[serde(default)]
@@ -121,6 +120,9 @@ pub struct ChainSpec {
 
 fn default_native() -> String {
     "ETH".to_string()
+}
+fn default_allow_broadcast() -> bool {
+    true
 }
 fn default_native_decimals() -> u8 {
     18
@@ -259,6 +261,19 @@ mod tests {
     }
 
     #[test]
+    fn missing_allow_broadcast_defaults_true() {
+        let spec: ChainSpec = toml::from_str(
+            r#"
+name = "base"
+chain_id = 8453
+rpc_urls = ["https://mainnet.base.org"]
+"#,
+        )
+        .unwrap();
+        assert!(spec.allow_broadcast);
+    }
+
+    #[test]
     fn chain_spec_json_round_trip() {
         let original = ChainSpec {
             name: "ethereum".to_string(),
@@ -394,7 +409,7 @@ mod tests {
         assert_eq!(c.name, "minimal");
         assert_eq!(c.chain_id, 42);
         // serde defaults should fill in everything else
-        assert!(!c.allow_broadcast);
+        assert!(c.allow_broadcast);
         assert_eq!(c.native_symbol, "ETH");
         assert_eq!(c.native_decimals, 18);
         assert!(!c.legacy_tx);
