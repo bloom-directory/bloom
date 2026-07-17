@@ -8,8 +8,6 @@ use thiserror::Error;
 
 use crate::chain::ChainSpec;
 
-const CURRENT_CONFIG_VERSION: u32 = 1;
-
 #[derive(Debug, Error)]
 pub enum ConfigError {
     #[error("io error: {0}")]
@@ -24,9 +22,6 @@ pub enum ConfigError {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
-    /// Version of Bloom's automatic config migrations.
-    #[serde(default)]
-    pub config_version: u32,
     /// Default mount path (informational; the kernel mount is opt-in).
     #[serde(default = "default_mount_path")]
     pub mount_path: String,
@@ -507,7 +502,6 @@ impl Config {
     pub fn local_default() -> Self {
         let chains = default_chains();
         Config {
-            config_version: CURRENT_CONFIG_VERSION,
             mount_path: default_mount_path(),
             nfs_listen_addr: default_nfs_listen(),
             default_wallet: None,
@@ -545,14 +539,7 @@ impl Config {
 
     pub fn load_or_init(path: &Path) -> Result<Self, ConfigError> {
         if path.exists() {
-            let s = std::fs::read_to_string(path)?;
-            let mut cfg: Self = toml::from_str(&s)?;
-            let changed = cfg.migrate();
-            cfg.validate()?;
-            if changed {
-                cfg.save(path)?;
-            }
-            Ok(cfg)
+            Self::load(path)
         } else {
             let cfg = Self::local_default();
             cfg.save(path)?;
@@ -562,26 +549,12 @@ impl Config {
 
     /// Apply post-load migrations for backwards compatibility.
     ///
-    /// Infers `op_stack` for well-known OP-stack chain IDs that predate the
-    /// field. Version 0 configs cannot distinguish the old generated broadcast
-    /// gates from explicit operator choices, so both new defaults are applied
-    /// once; later per-chain opt-outs and global kill-switch opt-ins are durable.
-    fn migrate(&mut self) -> bool {
-        let mut changed = false;
+    /// Currently infers `op_stack` for well-known OP-stack chain IDs
+    /// (Optimism=10, Base=8453, …) that predate the `op_stack` field.
+    fn migrate(&mut self) {
         for spec in self.chains.values_mut() {
-            let was_op_stack = spec.op_stack;
             spec.infer_op_stack();
-            changed |= spec.op_stack != was_op_stack;
         }
-        if self.config_version < CURRENT_CONFIG_VERSION {
-            for chain in self.chains.values_mut() {
-                chain.allow_broadcast = true;
-            }
-            self.block_mainnet_broadcast = false;
-            self.config_version = CURRENT_CONFIG_VERSION;
-            changed = true;
-        }
-        changed
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
@@ -729,7 +702,6 @@ mod tests {
     #[test]
     fn local_default_shape() {
         let cfg = Config::local_default();
-        assert_eq!(cfg.config_version, CURRENT_CONFIG_VERSION);
         assert_eq!(cfg.default_chain, "ethereum");
         assert!(cfg.default_wallet.is_none());
         assert_eq!(cfg.mount_path, "/bloom");
@@ -931,12 +903,10 @@ mod tests {
     }
 
     #[test]
-    fn load_or_init_migrates_existing_broadcast_defaults_once() {
+    fn load_or_init_preserves_existing_broadcast_settings() {
         let td = tempdir().unwrap();
         let path = td.path().join("config.toml");
-        std::fs::write(
-            &path,
-            r#"
+        let existing = r#"
 default_chain = "anvil"
 block_mainnet_broadcast = true
 
@@ -945,25 +915,13 @@ name = "anvil"
 chain_id = 31337
 rpc_urls = ["http://127.0.0.1:8545"]
 allow_broadcast = false
-"#,
-        )
-        .unwrap();
+"#;
+        std::fs::write(&path, existing).unwrap();
 
-        let mut cfg = Config::load_or_init(&path).unwrap();
-        assert_eq!(cfg.config_version, CURRENT_CONFIG_VERSION);
-        assert!(cfg.chains["anvil"].allow_broadcast);
-        assert!(!cfg.block_mainnet_broadcast);
-        let saved = std::fs::read_to_string(&path).unwrap();
-        assert!(saved.contains("config_version = 1"));
-        assert!(saved.contains("allow_broadcast = true"));
-        assert!(saved.contains("block_mainnet_broadcast = false"));
-
-        cfg.chains.get_mut("anvil").unwrap().allow_broadcast = false;
-        cfg.block_mainnet_broadcast = true;
-        cfg.save(&path).unwrap();
-        let reloaded = Config::load_or_init(&path).unwrap();
-        assert!(!reloaded.chains["anvil"].allow_broadcast);
-        assert!(reloaded.block_mainnet_broadcast);
+        let cfg = Config::load_or_init(&path).unwrap();
+        assert!(!cfg.chains["anvil"].allow_broadcast);
+        assert!(cfg.block_mainnet_broadcast);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), existing);
     }
 
     #[test]
