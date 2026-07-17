@@ -30,7 +30,8 @@ Receive should contain only destinations that an external sender can use.
   chain's native asset and tokens, but Bloom must not imply that every possible token is
   discoverable or supported by the portfolio view.
 - **Venue deposit wallet:** a user-specific address with explicit provenance and asset
-  rules. Bloom currently has this for a verified Polymarket deposit wallet on Polygon.
+  rules. The preinstalled Polymarket Petal can expose this for a verified deposit wallet
+  on Polygon.
 - **Funding workflow:** an action that must originate from the Bloom wallet. This is not
   a receive destination.
 
@@ -129,8 +130,8 @@ the first read-only view.
 
 ### Polymarket
 
-Only show the current direct Polygon deposit wallet as `ready` when persisted onboarding
-state says the live factory address was resolved and `fundable=true`. A local CREATE2
+Only show the current direct Polygon deposit wallet as `ready` when versioned Petal
+status says the live factory address was resolved and `fundable=true`. A local CREATE2
 estimate must remain `blocked`, with no prominent QR or copy affordance. Include Polygon
 chain ID, the accepted pUSD contract identity, wallet role, state provenance, and
 `updated_ms`.
@@ -153,13 +154,13 @@ the shared bridge address.
 
 ## What exists and what is missing
 
-Bloom already has most V0 inputs:
+Bloom core and the installed Polymarket Petal together have most V0 inputs:
 
 - [`wallets.rs`](../../crates/bloom-vfs/src/handlers/wallets.rs) exposes the checksummed
   owner address, raw-address QR images, wallet kind, configured chains, and
   `addresses.json`.
-- `addresses.json` includes a persisted Polymarket role address with `source` and
-  `fundable`.
+- The Polymarket Petal persists the venue deposit-wallet address and its source/funding
+  state; core `addresses.json` intentionally exposes only core-owned owner/signer roles.
 - [`ChainSpec`](../../crates/bloom-proto/src/chain.rs) supplies chain name, display name,
   chain ID, native symbol, and decimals.
 - [`hyperliquid.rs`](../../crates/bloom-proto/src/hyperliquid.rs) and the DeFi handler
@@ -167,8 +168,8 @@ Bloom already has most V0 inputs:
 
 The gaps are small:
 
-- `addresses.json` does not chain-qualify the owner or Polymarket role and omits the
-  venue's accepted asset identity.
+- `addresses.json` does not chain-qualify the owner, and no versioned provider contract
+  yet projects the Petal-owned venue role and accepted asset into a core snapshot.
 - The current QR payload contains no network or asset context.
 - There is no route-level `ready/blocked` contract or one shared snapshot for JSON,
   Markdown, and HTML.
@@ -178,12 +179,14 @@ The gaps are small:
 ## Suggested implementation sequence
 
 1. Add a versioned `ReceiveSnapshot` and pure JSON/Markdown/HTML renderers to the wallet
-   handler. V0 uses only local keystore, chain config, and persisted onboarding state.
-2. Generate one owner route per configured chain and one Polymarket route only when
-   persisted state exists. Represent invalid or unverified venue state as blocked, not
-   absent or usable.
-3. Extend role metadata with CAIP identifiers, chain ID, accepted asset, provenance,
-   verification time, and route status. Keep the old address and raw QR paths compatible.
+   handler. V0 uses local keystore and chain config plus versioned data from the
+   installed Polymarket Petal.
+2. Generate one owner route per configured chain and one Polymarket route only when the
+   Petal reports verified, fundable state. Represent invalid or unverified venue state
+   as blocked, not absent or usable.
+3. Define provider metadata with CAIP identifiers, chain ID, accepted asset, provenance,
+   verification time, and route status. Keep the old owner-address and raw QR paths
+   compatible.
 4. Add optional chain-specific native-payment QR payloads; never generate token-payment
    requests without an exact token contract and amount.
 5. Test two chains sharing one owner address, obvious testnet labeling, watch wallets,

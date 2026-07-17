@@ -411,9 +411,10 @@ portable backups. Service API credentials remain in Service access, not key expo
 1. Add versioned `PermissionsSnapshot`/entry/recovery models and one short-lived snapshot
    service. Project existing capability, durable auth-session, policy, wallet-kind, and
    sanitized passkey metadata into it.
-2. Add direct high-value adapters: Bloom-known EVM approvals, Permit2, EIP-7702 account
-   code, Polymarket onboarding approvals/credentials/controllers, and Hyperliquid remote
-   agents/builders/multisig. Report partial coverage from day one.
+2. Add direct high-value adapters for Bloom-known EVM approvals, Permit2, EIP-7702
+   account code, and Hyperliquid remote agents/builders/multisig, plus a versioned Petal
+   provider for Polymarket onboarding approvals/credentials/controllers. Report partial
+   coverage from day one.
 3. Render JSON, Markdown, and HTML plus per-entry and recovery detail. Project findings
    into Next Moves and security changes into Activity.
 4. Add durable background approval-log discovery with explicit chain/range checkpoints

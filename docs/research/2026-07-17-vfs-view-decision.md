@@ -28,8 +28,9 @@ recovery path.
   enumeration. Portfolio coverage must therefore be explicitly partial unless a
   configured indexer proves more ([ERC-20](https://eips.ethereum.org/EIPS/eip-20)).
 - Polymarket's current-position response includes current value, PnL, redeemability,
-  slug, and end date. The current Rust type omits several of these, so a typed adapter
-  change is required before redemption or deadline signals are trustworthy
+  slug, and end date. The external Polymarket Petal's DTO currently omits several of
+  those fields; they must survive the Petal and a versioned provider boundary before
+  portfolio, redemption, or deadline signals are trustworthy
   ([current positions API](https://docs.polymarket.com/api-reference/core/get-current-positions-for-a-user)).
 - Hyperliquid API-wallet queries and permissions belong to the master/subaccount, not
   the agent address; remote authorization and Bloom's local executor state must remain

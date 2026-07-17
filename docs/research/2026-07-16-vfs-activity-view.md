@@ -152,15 +152,17 @@ PnL; show only venue-provided realized PnL with provenance.
 | EVM RPC | Broadcast and basic mined receipt reconciliation | Persist block hash, block time, gas, logs, replacement relation, and finality/reorg state |
 | EVM address history | Normal, internal, ERC-20, ERC-721, and ERC-1155 paginated feeds | Query the source directly, merge overlapping feeds by hash, and state recent-only coverage |
 | Hyperliquid | Recent fills, open orders, clearinghouse and spot state | Add by-time fills, historical orders, funding, and non-funding ledger updates |
-| Polymarket | Public activity/trades and local order drafts/receipts | Add authenticated CLOB trades to link order IDs, partial fills, and settlement exactly |
+| Polymarket | The preinstalled Petal exposes public activity/trades and local order drafts/receipts | Define a versioned activity-provider boundary and link authenticated CLOB trades to order IDs, partial fills, and settlement exactly |
 | Audit log | Hash-chained implementation records | Keep as provenance only; its free-form reads/signatures/paths are not a product timeline |
 
 Relevant code is in
 [`outbox.rs`](../../crates/bloom-vfs/src/handlers/outbox.rs),
 [`chains_history.rs`](../../crates/bloom-vfs/src/handlers/chains_history.rs),
 [`hyperliquid.rs`](../../crates/bloom-vfs/src/handlers/hyperliquid.rs),
-[`polymarket.rs`](../../crates/bloom-vfs/src/handlers/polymarket.rs), and
 [`audit.rs`](../../crates/bloom-proto/src/audit.rs).
+Polymarket now lives in the external preinstalled Petal described by the
+[native-removal specification](../specs/2026-07-20-preinstalled-polymarket-petal.md),
+so core aggregation needs an explicit provider boundary rather than a native handler.
 
 The upstream semantics support this split:
 
@@ -241,7 +243,7 @@ Suggested sequence:
 2. Project all sealed actions and venue outcomes consistently; add `workflow_id` and
    enrich EVM receipts with canonical block, fee, effect, finality, and replacement data.
 3. Add typed adapters for outboxes, `AddressHistorySource`, Hyperliquid history/ledger,
-   and Polymarket authenticated trades plus public activity. Query independent sources
+   and a versioned Polymarket Petal activity provider. Query independent sources
    concurrently with bounded timeouts.
 4. Normalize, group only by exact identifiers, retain evidence/conflicts, and report
    honest recent-only coverage.

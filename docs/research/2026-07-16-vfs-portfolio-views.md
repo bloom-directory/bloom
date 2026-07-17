@@ -68,18 +68,19 @@ Use chain-qualified account and asset identifiers rather than symbols as identit
 | EVM | Native/token balance readers, configured-chain registry, curated and history-discovered token lists | Aggregate them and report that token discovery is partial |
 | Prices | `PricesClient::current_many` with timestamp and confidence | Apply it once to normalized items |
 | Hyperliquid | Raw clearinghouse, spot-state, and order data | Normalize equity, spot balances, leverage, entry/liquidation price, notional, and PnL |
-| Polymarket | Public positions plus account cash/balance data | Preserve current value, PnL, redeemability, and market deadline in the typed model |
+| Polymarket | The preinstalled Petal exposes positions and buying power, but its `Position` DTO omits current value, PnL, slug, and end date | Preserve those fields in the Petal and expose them through a versioned portfolio-provider boundary without double-counting cash or cost basis |
 | VFS | Byte reads and filename-based discovery | No MIME/presentation metadata; keep Markdown as the fallback |
 | Cache | Per-path byte cache | Add one shared snapshot cache so JSON/Markdown/HTML agree |
-| Petals | Generic VFS routes and manifests | No semantic portfolio-provider contract; not required for V0 |
+| Petals | Generic VFS routes and manifests plus the preinstalled Polymarket Petal | No semantic portfolio-provider contract; one is required before core can aggregate Petal data without crawling arbitrary paths |
 
 Relevant implementation points are
 [`balances.rs`](../../crates/bloom-vfs/src/handlers/balances.rs),
 [`chains.rs`](../../crates/bloom-vfs/src/handlers/chains.rs),
 [`wallets.rs`](../../crates/bloom-vfs/src/handlers/wallets.rs),
 [`hyperliquid.rs`](../../crates/bloom-vfs/src/handlers/hyperliquid.rs),
-[`polymarket.rs`](../../crates/bloom-vfs/src/handlers/polymarket.rs), and
 [`bloom-prices`](../../crates/bloom-prices/src/lib.rs).
+Polymarket now lives in the external preinstalled Petal described by the
+[native-removal specification](../specs/2026-07-20-preinstalled-polymarket-petal.md).
 
 ## Correctness rules
 
@@ -113,9 +114,10 @@ Relevant implementation points are
   chain limits. Alchemy's
   [Portfolio API](https://www.alchemy.com/docs/reference/portfolio-apis) is one viable
   opt-in provider, not a V0 dependency.
-- **Generic Petal portfolio interface: later.** Introduce a normalized provider
-  contract after a second external portfolio source proves the abstraction. Do not
-  crawl arbitrary Petal trees looking for balances.
+- **Generic multi-Petal portfolio interface: later.** V0 can define a narrow,
+  versioned Polymarket provider boundary; generalize it after a second external
+  portfolio source proves the abstraction. Do not crawl arbitrary Petal trees looking
+  for balances.
 - **MCP Apps/A2UI component protocol: later.** These can enable interactive host-native
   UI, but host support is not universal. Plain HTML plus Markdown solves the immediate
   problem without defining a new component system
@@ -126,8 +128,8 @@ Relevant implementation points are
 
 1. Add a versioned `PortfolioSnapshot` model and a shared, short-lived
    `PortfolioSnapshotService` injected into the wallets handler.
-2. Add direct adapters for configured EVM chains, Hyperliquid, and Polymarket. Run
-   them concurrently with timeouts and per-source errors.
+2. Add direct adapters for configured EVM chains and Hyperliquid plus the versioned
+   Polymarket Petal provider. Run them concurrently with timeouts and per-source errors.
 3. Normalize and deduplicate items, batch prices, then calculate the conservative
    priced summary.
 4. Add JSON, Markdown, and HTML renderers and expose the three synthetic VFS files.

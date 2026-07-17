@@ -158,13 +158,14 @@ The supporting state also needs small typed accessors:
 - [`RootContentRenderer`](../../crates/bloom-vfs/src/router.rs) is synchronous,
   infallible, and outside the path cache. Portfolio-derived signals need an async,
   fallible root renderer or a dedicated handler backed by the shared snapshot cache.
-- Polymarket's [`Position`](../../crates/bloom-polymarket/src/types.rs) drops `slug`,
-  `currentValue`, PnL, and `endDate`, although the upstream response supplies them. The
-  redeem signal needs at least `slug`, `conditionId`, `redeemable`, and current value
+- The external Polymarket Petal's `Position` DTO currently drops `slug`,
+  `currentValue`, PnL, and `endDate`. Preserve them in the Petal and expose them through
+  a versioned provider boundary before deriving signals. The redeem signal needs at
+  least `slug`, `conditionId`, `redeemable`, and current value
   ([Polymarket positions API](https://docs.polymarket.com/api-reference/core/get-current-positions-for-a-user)).
-- The Polymarket rules should consume the typed `OnboardState` and its terminal
-  `Complete` stage; existing rendered account status has inconsistent tradeable-stage
-  logic.
+- The Polymarket rules should consume versioned Petal account-status and obligations
+  data rather than Bloom's removed native `OnboardState`; the provider contract must
+  define the terminal tradeable state consistently.
 - Hyperliquid's capability roll-up lacks the exposure, stale-age, and cleanup-error data
   needed to decide whether a session state is actually actionable.
 - `bump.tx` and `cancel.tx` are advisory today, not directly stageable. Surface them as
