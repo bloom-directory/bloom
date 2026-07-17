@@ -1,0 +1,132 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Bloom VFS view concepts</title>
+  <link rel="stylesheet" href="bloom.css">
+</head>
+<body>
+  <div class="demo-bar">Concept templates · static example data · no live wallet connected</div>
+  <header class="site-header">
+    <a class="brand" href="index.html" aria-label="Bloom view concepts home">
+      <img src="../../assets/bloom-wordmark.png" alt="Bloom">
+    </a>
+    <nav class="showcase-nav" aria-label="View concepts">
+      <a href="portfolio.html">Portfolio</a>
+      <a href="next-moves.html">Next moves</a>
+      <a href="receive.html">Receive</a>
+      <a href="send.html">Send</a>
+      <a href="activity.html">Activity</a>
+      <a href="permissions.html">Permissions</a>
+    </nav>
+  </header>
+
+  <main class="page">
+    <div class="context-row">
+      <div class="vfs-path"><code>issue://114/view-templates</code></div>
+      <div class="snapshot">Research showcase · 17 July 2026</div>
+    </div>
+
+    <section class="index-hero">
+      <div>
+        <p class="eyebrow">A view layer for wallet facts</p>
+        <h1>Useful at a glance.<br>Exact on demand.</h1>
+        <p>Six Bloom-owned templates turn typed VFS snapshots into calm, readable wallet views—for people and the agents helping them.</p>
+        <div class="intro-facts" aria-label="Template principles">
+          <span class="pill">One canonical snapshot</span>
+          <span class="pill">Read-only HTML</span>
+          <span class="pill">Honest coverage</span>
+        </div>
+      </div>
+      <div class="petal-orbit" aria-hidden="true">
+        <span class="slash-core"></span>
+        <span class="orbit-dot one">Portfolio</span>
+        <span class="orbit-dot two">Next</span>
+        <span class="orbit-dot three">Receive</span>
+        <span class="orbit-dot four">Send</span>
+        <span class="orbit-dot five">Activity</span>
+        <span class="orbit-dot six">Security</span>
+      </div>
+    </section>
+
+    <section class="section" aria-labelledby="views-heading">
+      <div class="section-head">
+        <h2 id="views-heading">The six core views</h2>
+        <p>Open any template to explore the example</p>
+      </div>
+      <div class="view-grid">
+        <a class="view-card card" href="portfolio.html">
+          <span class="view-number">01 / HOLDINGS</span>
+          <h2>Portfolio</h2>
+          <p>Balances, venue equity, leveraged positions, and prediction-market bets—valued without double counting.</p>
+          <span class="action-label">Open portfolio</span>
+        </a>
+        <a class="view-card card" href="next-moves.html">
+          <span class="view-number">02 / PRIORITIES</span>
+          <h2>Next moves</h2>
+          <p>A small deterministic inbox for approvals, risks, blocked workflows, and concrete follow-ups available now.</p>
+          <span class="action-label">Open next moves</span>
+        </a>
+        <a class="view-card card" href="receive.html">
+          <span class="view-number">03 / DESTINATIONS</span>
+          <h2>Receive</h2>
+          <p>Verified, chain-qualified receive routes that make network, asset, purpose, and provenance impossible to miss.</p>
+          <span class="action-label">Open receive</span>
+        </a>
+        <a class="view-card card" href="send.html">
+          <span class="view-number">04 / REVIEW</span>
+          <h2>Send</h2>
+          <p>An exact staged-transaction review with ENS resolution, simulation, policy checks, and trusted contact context.</p>
+          <span class="action-label">Open send</span>
+        </a>
+        <a class="view-card card" href="activity.html">
+          <span class="view-number">05 / OUTCOMES</span>
+          <h2>Activity</h2>
+          <p>A semantic wallet timeline: one user action per card, with lifecycle, net effects, finality, and evidence.</p>
+          <span class="action-label">Open activity</span>
+        </a>
+        <a class="view-card card" href="permissions.html">
+          <span class="view-number">06 / AUTHORITY</span>
+          <h2>Permissions &amp; security</h2>
+          <p>Who can act, what they can do, what Bloom can still exercise, and how key custody and recovery are configured.</p>
+          <span class="action-label">Open permissions</span>
+        </a>
+      </div>
+    </section>
+
+    <section class="section" aria-labelledby="contract-heading">
+      <div class="section-head">
+        <h2 id="contract-heading">One rendering contract</h2>
+        <p>Same facts, three useful surfaces</p>
+      </div>
+      <div class="grid-3">
+        <article class="card card-pad">
+          <span class="label">For agents</span>
+          <h3>Typed JSON</h3>
+          <p class="muted">Canonical facts, decimal strings, stable identifiers, evidence paths, and explicit source coverage.</p>
+          <span class="path-box">/wallets/alice/&lt;view&gt;.json</span>
+        </article>
+        <article class="card card-pad">
+          <span class="label">For every chat</span>
+          <h3>Readable Markdown</h3>
+          <p class="muted">The dependable fallback for Codex, Claude, OpenCode, terminals, and clients without rich rendering.</p>
+          <span class="path-box">/wallets/alice/&lt;view&gt;.md</span>
+        </article>
+        <article class="card card-pad">
+          <span class="label">For people</span>
+          <h3>Beautiful HTML</h3>
+          <p class="muted">Semantic, responsive, script-free, escaped, and generated from exactly the same cached snapshot.</p>
+          <span class="path-box">/wallets/alice/&lt;view&gt;.html</span>
+        </article>
+      </div>
+    </section>
+  </main>
+
+  <footer class="page-footer">
+    <span><strong>Bloom VFS view concepts</strong> · research for issue 114</span>
+    <span>Example values only · no live actions</span>
+  </footer>
+</body>
+</html>

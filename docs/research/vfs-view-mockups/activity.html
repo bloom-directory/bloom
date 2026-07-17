@@ -1,0 +1,156 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Activity · Bloom</title>
+  <link rel="stylesheet" href="bloom.css">
+</head>
+<body>
+  <div class="demo-bar">Concept template · static example data · no live wallet connected</div>
+  <header class="site-header">
+    <a class="brand" href="index.html" aria-label="Bloom view concepts home">
+      <img src="../../assets/bloom-wordmark.png" alt="Bloom">
+    </a>
+    <nav class="showcase-nav" aria-label="View concepts">
+      <a href="portfolio.html">Portfolio</a>
+      <a href="next-moves.html">Next moves</a>
+      <a href="receive.html">Receive</a>
+      <a href="send.html">Send</a>
+      <a href="activity.html" aria-current="page">Activity</a>
+      <a href="permissions.html">Permissions</a>
+    </nav>
+  </header>
+
+  <main class="page narrow">
+    <div class="context-row">
+      <div class="vfs-path"><code>/wallets/alice/activity.html</code></div>
+      <div class="snapshot">Snapshot T72B · 10:42:16 ART</div>
+    </div>
+
+    <section class="activity-intro">
+      <p class="eyebrow">Wallet outcomes</p>
+      <h1>Activity</h1>
+      <p class="intro-copy">Actions and effects, not raw transaction noise. Related steps stay together from staging through final settlement.</p>
+      <div class="intro-facts">
+        <span class="status bloom">1 in progress</span>
+        <span class="status warn">Recent coverage partial</span>
+        <span class="pill">America/Argentina/Cordoba</span>
+      </div>
+    </section>
+
+    <section aria-labelledby="progress-heading">
+      <div class="section-head"><h2 id="progress-heading">In progress</h2><p>Outstanding work stays pinned</p></div>
+      <article class="card progress-card">
+        <div class="progress-top">
+          <div><span class="label">Swap · Base</span><h2>Swap 100 USDC → ETH</h2><p>Prepared at 10:36 · minimum received 0.0281 ETH</p></div>
+          <span class="status bloom">Awaiting approval</span>
+        </div>
+        <div class="progress-track" aria-label="Prepared, simulated, and policy checked; approval and broadcast remain">
+          <span class="done"></span><span class="done"></span><span class="done"></span><span></span>
+        </div>
+        <details>
+          <summary>Lifecycle and review path</summary>
+          <div class="detail-body">
+            <p>Prepared → simulated → policy passed → <strong>awaiting passkey</strong> → broadcast → settlement.</p>
+            <span class="path-box">/wallets/alice/chains/base/outbox/pending/swap_7KM4/review.html</span>
+          </div>
+        </details>
+      </article>
+    </section>
+
+    <section class="day-group" aria-labelledby="today-heading">
+      <h2 class="day-label" id="today-heading">Today · 17 July</h2>
+      <div class="timeline">
+        <article class="card timeline-item">
+          <span class="activity-symbol sent" aria-hidden="true">↑</span>
+          <div class="activity-copy">
+            <div class="move-head"><h3>Sent 25 USDC to maya.eth</h3><span class="status good">Finalized</span></div>
+            <p>Base · Bloom-originated transfer · saved ENS resolution</p>
+            <div class="signed-effects"><span class="signed-effect">−25.00 USDC</span><span class="signed-effect">fee −0.000029 ETH</span></div>
+            <details>
+              <summary>Exact destination and evidence</summary>
+              <div class="detail-body">
+                <p><strong>Recipient:</strong> <code>0x52908400098527886E0F7030069857D2E4169EE7</code></p>
+                <p><strong>Transaction:</strong> <code>0x87d2f34b3c91572ce54306269329e19051c9ed8be6bbdcb22362d8cc36ef91af</code></p>
+                <p>Receipt independently checked through finalized block 33,803,112.</p>
+              </div>
+            </details>
+          </div>
+          <time class="timeline-time" datetime="2026-07-17T09:58:12-03:00">09:58</time>
+        </article>
+
+        <article class="card timeline-item">
+          <span class="activity-symbol market" aria-hidden="true">Y</span>
+          <div class="activity-copy">
+            <div class="move-head"><h3>Bought 40 YES on “Fed cuts by September?”</h3><span class="status good">Filled</span></div>
+            <p>Polymarket · one order · two partial fills grouped</p>
+            <div class="signed-effects"><span class="signed-effect">−32.64 USDC</span><span class="signed-effect">+40 YES</span></div>
+            <details>
+              <summary>Order, fills, and provenance</summary>
+              <div class="detail-body"><p>Average price 81.6¢ · order <code>0xe2c7…91d4</code> · fills <code>trade_72A</code> and <code>trade_72B</code>. Outcome and amounts are provider-reported; local receipt links both fills to the order.</p></div>
+            </details>
+          </div>
+          <time class="timeline-time" datetime="2026-07-17T09:12:44-03:00">09:12</time>
+        </article>
+
+        <article class="card timeline-item">
+          <span class="activity-symbol trade" aria-hidden="true">↗</span>
+          <div class="activity-copy">
+            <div class="move-head"><h3>Increased BTC perpetual long</h3><span class="status good">Filled</span></div>
+            <p>Hyperliquid · buy 0.10 BTC at $63,201 · maker fill</p>
+            <div class="signed-effects"><span class="signed-effect">position +0.10 BTC</span><span class="signed-effect">fee −$1.26</span></div>
+            <details>
+              <summary>Order evidence</summary>
+              <div class="detail-body"><p>Order ID <code>88421093117</code> · trade ID <code>771209442108</code> · account state and fill reported by Hyperliquid at 08:46:08 ART.</p></div>
+            </details>
+          </div>
+          <time class="timeline-time" datetime="2026-07-17T08:46:08-03:00">08:46</time>
+        </article>
+
+        <article class="card timeline-item">
+          <span class="activity-symbol" aria-hidden="true">+4</span>
+          <div class="activity-copy">
+            <div class="move-head"><h3>Unverified incoming assets hidden</h3><span class="status info">Collapsed</span></div>
+            <p>Four unsolicited token transfers on Base · no contact or recipient suggestions created</p>
+            <details>
+              <summary>Why Bloom collapsed these</summary>
+              <div class="detail-body">Incoming history is attacker-controlled. The assets and exact source evidence remain in JSON, but names, links, and remote images are not promoted into this timeline.</div>
+            </details>
+          </div>
+          <time class="timeline-time" datetime="2026-07-17T07:31:55-03:00">07:31</time>
+        </article>
+      </div>
+    </section>
+
+    <section class="day-group" aria-labelledby="yesterday-heading">
+      <h2 class="day-label" id="yesterday-heading">Yesterday · 16 July</h2>
+      <div class="timeline">
+        <article class="card timeline-item">
+          <span class="activity-symbol security" aria-hidden="true">✓</span>
+          <div class="activity-copy">
+            <div class="move-head"><h3>Revoked USDC spending approval</h3><span class="status good">Finalized</span></div>
+            <p>Polygon · Polymarket Exchange · authority change</p>
+            <div class="signed-effects"><span class="signed-effect">allowance unlimited → 0</span><span class="signed-effect">fee −0.0031 POL</span></div>
+            <details>
+              <summary>Contract and transaction</summary>
+              <div class="detail-body"><p><strong>Spender:</strong> <code>0x4bFb41d5B3570DeFd03C39a9A4D8dE6BD8B8982E</code></p><p><strong>Transaction:</strong> <code>0x1ef05940f12c9dbd13cc5c91d86f0f669b80eaefed640b18710c1ecbd20a072e</code></p></div>
+            </details>
+          </div>
+          <time class="timeline-time" datetime="2026-07-16T18:22:19-03:00">18:22</time>
+        </article>
+      </div>
+    </section>
+
+    <section class="section" aria-label="Coverage statement">
+      <div class="notice"><strong>Recent-only coverage.</strong> Bloom checked its local outboxes, Base and Ethereum address history, Hyperliquid's recent fills, and Polymarket activity. Ethereum history is provider-limited before 1 July; this is not presented as complete lifetime history.</div>
+    </section>
+  </main>
+
+  <footer class="page-footer">
+    <span><strong>Bloom activity concept</strong> · generated from bloom.activity.v1</span>
+    <span>One lifecycle per action · exact evidence one disclosure away</span>
+  </footer>
+</body>
+</html>

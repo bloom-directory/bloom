@@ -1,0 +1,200 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Alice's portfolio · Bloom</title>
+  <link rel="stylesheet" href="bloom.css">
+</head>
+<body>
+  <div class="demo-bar">Concept template · static example data · no live wallet connected</div>
+  <header class="site-header">
+    <a class="brand" href="index.html" aria-label="Bloom view concepts home">
+      <img src="../../assets/bloom-wordmark.png" alt="Bloom">
+    </a>
+    <nav class="showcase-nav" aria-label="View concepts">
+      <a href="portfolio.html" aria-current="page">Portfolio</a>
+      <a href="next-moves.html">Next moves</a>
+      <a href="receive.html">Receive</a>
+      <a href="send.html">Send</a>
+      <a href="activity.html">Activity</a>
+      <a href="permissions.html">Permissions</a>
+    </nav>
+  </header>
+
+  <main class="page">
+    <div class="context-row">
+      <div class="vfs-path"><code>/wallets/alice/portfolio.html</code></div>
+      <div class="snapshot">Snapshot 7KM4 · 10:42:16 ART</div>
+    </div>
+
+    <section class="page-intro">
+      <div>
+        <p class="eyebrow">Wallet overview</p>
+        <h1>Alice's portfolio</h1>
+      </div>
+      <div>
+        <p class="intro-copy">Balances and positions across Alice's configured accounts, priced conservatively from one shared snapshot.</p>
+        <div class="intro-facts">
+          <span class="status warn">Coverage partial</span>
+          <span class="pill">2 unpriced items</span>
+          <span class="pill">Updated just now</span>
+        </div>
+      </div>
+    </section>
+
+    <section class="portfolio-hero" aria-label="Portfolio summary">
+      <div>
+        <span class="label">Priced net value</span>
+        <div class="portfolio-value money"><sup>USD</sup>$42,736.82</div>
+        <span class="muted">19 priced items · 3 sources responded</span>
+      </div>
+      <div>
+        <span class="label">Where value lives</span>
+        <div class="allocation-bar" aria-label="43.2% wallet assets, 49% Hyperliquid, 7.8% Polymarket">
+          <span></span><span></span><span></span>
+        </div>
+        <div class="allocation-legend">
+          <div><strong>Wallet</strong><small>43.2% · $18,452</small></div>
+          <div><strong>Hyperliquid</strong><small>49.0% · $20,934</small></div>
+          <div><strong>Polymarket</strong><small>7.8% · $3,350</small></div>
+        </div>
+      </div>
+    </section>
+
+    <section class="section" aria-labelledby="accounts-heading">
+      <div class="section-head">
+        <h2 id="accounts-heading">Accounts &amp; venues</h2>
+        <p>Position exposure is not added to net value</p>
+      </div>
+      <div class="grid-2">
+        <article class="card account-card">
+          <div class="account-card-head">
+            <div class="account-title">
+              <span class="avatar" aria-hidden="true">a</span>
+              <div>
+                <h3>Alice's wallet</h3>
+                <span class="muted">Base + Ethereum</span>
+              </div>
+            </div>
+            <span class="status good">Fresh</span>
+          </div>
+          <div class="account-total money">$18,452.42</div>
+          <div class="asset-list">
+            <div class="asset-row">
+              <div class="asset-name">
+                <span class="asset-mark eth">Ξ</span>
+                <div><strong>Ethereum</strong><small>4.1823 ETH</small></div>
+              </div>
+              <div class="asset-value"><strong class="money">$14,594.22</strong><small>$3,489.52</small></div>
+            </div>
+            <div class="asset-row">
+              <div class="asset-name">
+                <span class="asset-mark usdc">$</span>
+                <div><strong>USD Coin</strong><small>3,858.20 USDC</small></div>
+              </div>
+              <div class="asset-value"><strong class="money">$3,858.20</strong><small>$1.00</small></div>
+            </div>
+          </div>
+          <details>
+            <summary>Chains and discovery coverage</summary>
+            <div class="detail-body">
+              <p><strong>Base:</strong> native balance and 7 discovered tokens at block 33,804,221.</p>
+              <p><strong>Ethereum:</strong> native balance and 12 discovered tokens at block 22,914,870. Token discovery is partial.</p>
+            </div>
+          </details>
+        </article>
+
+        <article class="card account-card">
+          <div class="account-card-head">
+            <div class="account-title">
+              <span class="asset-mark hype">HL</span>
+              <div>
+                <h3>Hyperliquid</h3>
+                <span class="muted">Cross-margin account</span>
+              </div>
+            </div>
+            <span class="status good">Connected</span>
+          </div>
+          <div class="account-total money">$20,934.40</div>
+          <div class="position-card">
+            <div class="position-line">
+              <div><h4>BTC perpetual</h4><p>Long 0.31 BTC · 3× leverage</p></div>
+              <span class="status good">+$511.50 P&amp;L</span>
+            </div>
+            <dl class="detail-list">
+              <div><dt>Entry</dt><dd class="money">$61,820</dd></div>
+              <div><dt>Mark</dt><dd class="money">$63,470</dd></div>
+              <div><dt>Exposure</dt><dd class="money">$19,675.70</dd></div>
+              <div><dt>Liquidation</dt><dd class="money">$47,908</dd></div>
+            </dl>
+            <div class="risk-meter" style="--meter: 38%" role="img" aria-label="Margin usage 38%, below warning threshold"></div>
+            <span class="muted">Margin usage 38% · warning begins at 65%</span>
+          </div>
+          <details>
+            <summary>How this value is counted</summary>
+            <div class="detail-body">Account equity is counted once. The $19,675.70 position exposure describes risk and is not added again as wealth.</div>
+          </details>
+        </article>
+      </div>
+    </section>
+
+    <section class="section" aria-labelledby="markets-heading">
+      <div class="section-head">
+        <h2 id="markets-heading">Prediction positions</h2>
+        <p>$2,144.80 positions · $1,205.20 available cash</p>
+      </div>
+      <div class="grid-2">
+        <article class="card market-card">
+          <div class="market-head">
+            <span class="status info">Open · Yes</span>
+            <span class="muted">Ends 18 Sep</span>
+          </div>
+          <h3>Will the Fed cut rates by September?</h3>
+          <div class="market-outcome">
+            <div><span class="label">Current value</span><br><strong class="money">$1,958.40</strong></div>
+            <div class="asset-value"><strong class="positive">+$278.40</strong><small>unrealized P&amp;L</small></div>
+          </div>
+          <details>
+            <summary>Position details</summary>
+            <div class="detail-body">2,400 YES shares · average cost 70¢ · current price 81.6¢ · provider-reported by Polymarket.</div>
+          </details>
+        </article>
+        <article class="card market-card">
+          <div class="market-head">
+            <span class="status good">Resolved · Redeemable</span>
+            <span class="muted">Ended 16 Jul</span>
+          </div>
+          <h3>Was ETH above $3,000 at Friday close?</h3>
+          <div class="market-outcome">
+            <div><span class="label">Redeemable value</span><br><strong class="money">$186.40</strong></div>
+            <div class="asset-value"><strong class="positive">+$52.40</strong><small>position P&amp;L</small></div>
+          </div>
+          <details>
+            <summary>Position details</summary>
+            <div class="detail-body">186.40 winning YES shares · outcome explicitly marked redeemable · follow-up appears in Next moves.</div>
+          </details>
+        </article>
+      </div>
+    </section>
+
+    <section class="section" aria-labelledby="coverage-heading">
+      <div class="section-head">
+        <h2 id="coverage-heading">Coverage</h2>
+        <p>Why this is “priced net value,” not “total value”</p>
+      </div>
+      <div class="grid-3">
+        <article class="card card-pad"><span class="status good">EVM checked</span><h3>19 known tokens</h3><p class="muted">Curated tokens plus those found in available address history. Unknown tokens may exist.</p></article>
+        <article class="card card-pad"><span class="status good">Venues checked</span><h3>2 of 2 connected</h3><p class="muted">Hyperliquid and Polymarket both responded within the snapshot window.</p></article>
+        <article class="card card-pad"><span class="status warn">2 unpriced</span><h3>Not in the headline</h3><p class="muted">Small MYST and LP-OLD balances are preserved in JSON but excluded from USD value.</p></article>
+      </div>
+    </section>
+  </main>
+
+  <footer class="page-footer">
+    <span><strong>Bloom portfolio concept</strong> · generated from bloom.portfolio.v1</span>
+    <span>Values are illustrative · coverage is deliberately explicit</span>
+  </footer>
+</body>
+</html>

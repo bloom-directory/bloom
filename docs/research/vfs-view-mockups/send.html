@@ -1,0 +1,147 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Review send · Bloom</title>
+  <link rel="stylesheet" href="bloom.css">
+</head>
+<body>
+  <div class="demo-bar">Concept template · static example data · no transaction can be submitted here</div>
+  <header class="site-header">
+    <a class="brand" href="index.html" aria-label="Bloom view concepts home">
+      <img src="../../assets/bloom-wordmark.png" alt="Bloom">
+    </a>
+    <nav class="showcase-nav" aria-label="View concepts">
+      <a href="portfolio.html">Portfolio</a>
+      <a href="next-moves.html">Next moves</a>
+      <a href="receive.html">Receive</a>
+      <a href="send.html" aria-current="page">Send</a>
+      <a href="activity.html">Activity</a>
+      <a href="permissions.html">Permissions</a>
+    </nav>
+  </header>
+
+  <main class="page">
+    <div class="context-row">
+      <div class="vfs-path"><code>/wallets/alice/chains/base/outbox/pending/send_4P9K/review.html</code></div>
+      <div class="snapshot">Sealed review · expires in 8 minutes</div>
+    </div>
+
+    <section class="page-intro">
+      <div>
+        <p class="eyebrow">Exact transaction review</p>
+        <h1>Send with context</h1>
+      </div>
+      <div>
+        <p class="intro-copy">Recipient resolution, decoded effects, simulation, and policy facts are sealed to the exact unsigned transaction before approval.</p>
+        <div class="intro-facts">
+          <span class="status good">Simulation passed</span>
+          <span class="status bloom">Passkey required</span>
+          <span class="pill">Base</span>
+        </div>
+      </div>
+    </section>
+
+    <div class="send-layout">
+      <article class="card review-sheet" aria-labelledby="review-heading">
+        <div class="review-banner"><span>✓ Simulation completed at Base block 33,804,221</span><span>20 sec ago</span></div>
+        <div class="review-body">
+          <div class="recipient-lockup">
+            <span class="avatar" aria-hidden="true">m</span>
+            <div>
+              <span class="label">Recipient · not yet saved</span>
+              <h2 id="review-heading">maya.eth</h2>
+              <p>Base address record resolved 20 seconds ago</p>
+            </div>
+          </div>
+
+          <div class="address-block">
+            <code>0x52908400098527886E0F7030069857D2E4169EE7</code>
+            <div class="address-caption">Full resolved address · destination classified as an externally owned account</div>
+          </div>
+
+          <div class="send-amount">
+            <span class="label">Maya receives</span>
+            <strong class="money">100.00 USDC</strong>
+            <span>≈ $100.00 · on Base</span>
+          </div>
+
+          <div class="effect-list" aria-label="Simulated transaction effects">
+            <div class="effect-row"><span>Alice sends</span><strong>−100.00 USDC</strong></div>
+            <div class="effect-row"><span>Maya receives</span><strong>+100.00 USDC</strong></div>
+            <div class="effect-row"><span>Estimated network fee</span><strong>0.000031 ETH · $0.11</strong></div>
+            <div class="effect-row"><span>Alice after send</span><strong>3,758.20 USDC · 0.192 ETH</strong></div>
+            <div class="effect-row"><span>New approvals or authority</span><strong>None</strong></div>
+          </div>
+
+          <details>
+            <summary>Exact transaction and interpretation evidence</summary>
+            <div class="detail-body">
+              <dl class="detail-list">
+                <div><dt>Chain</dt><dd>eip155:8453</dd></div>
+                <div><dt>Nonce</dt><dd>185</dd></div>
+                <div><dt>Method</dt><dd>USDC transfer(address,uint256)</dd></div>
+                <div><dt>Trust</dt><dd>Host-decoded + simulated</dd></div>
+              </dl>
+              <p class="path-box">Signing hash 0x1a65c74dd88c72a5f08d5bea3c6eb0ce47183a4cf39fe442a76c10be159b7842</p>
+            </div>
+          </details>
+
+          <div class="approval-boundary">
+            <h3>This page cannot send funds</h3>
+            <p>Bloom will request a passkey only for this sealed transaction. Any recipient, amount, fee, calldata, or descriptor change creates a new signing hash and a new review.</p>
+            <span class="path-box">/wallets/alice/chains/base/outbox/pending/send_4P9K/confirm</span>
+          </div>
+        </div>
+      </article>
+
+      <aside class="side-stack" aria-label="Send context">
+        <section class="card side-card contact-suggestion">
+          <span class="status bloom">Suggested contact</span>
+          <h2>Save Maya as a contact?</h2>
+          <p class="muted">Alice has already sent successfully to this exact Base address twice. Incoming history was not used.</p>
+          <div class="contact-history">
+            <div class="history-row"><span>3 Jul · finalized</span><strong>40 USDC</strong></div>
+            <div class="history-row"><span>8 Jun · finalized</span><strong>25 USDC</strong></div>
+          </div>
+          <span class="action-label">Prepare “Save as contact”</span>
+          <details>
+            <summary>Evidence hashes</summary>
+            <div class="detail-body"><code>0x87d2…91af</code><br><code>0x14cb…072e</code><br><br>Both full hashes remain available in the typed suggestion entry.</div>
+          </details>
+        </section>
+
+        <section class="card side-card">
+          <span class="label">Approval journey</span>
+          <h2>What happens next</h2>
+          <div class="stepper">
+            <div class="step done" data-step="1"><strong>Prepared</strong><small>Exact unsigned transaction</small></div>
+            <div class="step done" data-step="2"><strong>Simulated</strong><small>Effects and fee checked</small></div>
+            <div class="step done" data-step="3"><strong>Policy checked</strong><small>$140 of $250 daily cap</small></div>
+            <div class="step current" data-step="4"><strong>Passkey approval</strong><small>User confirms sealed review</small></div>
+            <div class="step" data-step="5"><strong>Broadcast</strong><small>Only after valid approval</small></div>
+          </div>
+        </section>
+
+        <section class="card side-card">
+          <span class="label">AddressBook</span>
+          <h2>Recent trusted recipients</h2>
+          <div class="contact-history">
+            <div class="history-row"><span>Payroll vault · Base</span><strong>0x8A7E…33C1</strong></div>
+            <div class="history-row"><span>Leo · Ethereum</span><strong>leo.eth</strong></div>
+            <div class="history-row"><span>Treasury · Base</span><strong>0xB492…0D17</strong></div>
+          </div>
+          <div class="notice"><strong>Names never replace addresses.</strong> The full chain-qualified destination stays in every review.</div>
+        </section>
+      </aside>
+    </div>
+  </main>
+
+  <footer class="page-footer">
+    <span><strong>Bloom send concept</strong> · exact staged transaction review</span>
+    <span>Read-only HTML · signing remains behind Sealed Approval</span>
+  </footer>
+</body>
+</html>

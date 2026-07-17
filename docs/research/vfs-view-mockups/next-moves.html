@@ -1,0 +1,157 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Next moves · Bloom</title>
+  <link rel="stylesheet" href="bloom.css">
+</head>
+<body>
+  <div class="demo-bar">Concept template · static example data · no live wallet connected</div>
+  <header class="site-header">
+    <a class="brand" href="index.html" aria-label="Bloom view concepts home">
+      <img src="../../assets/bloom-wordmark.png" alt="Bloom">
+    </a>
+    <nav class="showcase-nav" aria-label="View concepts">
+      <a href="portfolio.html">Portfolio</a>
+      <a href="next-moves.html" aria-current="page">Next moves</a>
+      <a href="receive.html">Receive</a>
+      <a href="send.html">Send</a>
+      <a href="activity.html">Activity</a>
+      <a href="permissions.html">Permissions</a>
+    </nav>
+  </header>
+
+  <main class="page">
+    <div class="context-row">
+      <div class="vfs-path"><code>/wallets/alice/next.html</code></div>
+      <div class="snapshot">Snapshot A91F · checked 24 seconds ago</div>
+    </div>
+
+    <section class="page-intro">
+      <div>
+        <p class="eyebrow">Priority inbox</p>
+        <h1>Next moves</h1>
+      </div>
+      <div>
+        <p class="intro-copy">Deterministic wallet conditions that deserve attention or have a supported follow-up—without inventing investment advice.</p>
+        <div class="intro-facts">
+          <span class="status warn">3 need attention</span>
+          <span class="status good">1 available now</span>
+          <span class="pill">Coverage complete</span>
+        </div>
+      </div>
+    </section>
+
+    <div class="inbox-summary">
+      <strong>Four open signals</strong>
+      <span class="muted">Ordered by consequence, deadline, then stable ID</span>
+    </div>
+
+    <section class="lane" aria-labelledby="attention-heading">
+      <div class="lane-heading"><span class="lane-count">3</span><h2 id="attention-heading">Needs attention</h2></div>
+      <div class="move-list">
+        <article class="card move-card">
+          <div class="move-rank">01</div>
+          <div class="move-copy">
+            <div class="move-head"><h3>Swap is waiting for approval</h3><span class="status bloom">Approval required</span></div>
+            <p>Swap 100 USDC for at least 0.0281 ETH on Base. The sealed review expires at 10:58.</p>
+            <div class="move-meta">
+              <span class="pill">Base</span>
+              <span class="pill">Prepared 6m ago</span>
+              <span class="pill">Policy pass</span>
+            </div>
+            <details>
+              <summary>Evidence and supported next step</summary>
+              <div class="detail-body">
+                <p>Bloom found a canonical staged action that still awaits its matching passkey approval.</p>
+                <span class="path-box">/wallets/alice/chains/base/outbox/pending/swap_7KM4/review.html</span>
+              </div>
+            </details>
+          </div>
+          <div class="move-side"><strong>16 min</strong><small>until review expires</small></div>
+        </article>
+
+        <article class="card move-card">
+          <div class="move-rank">02</div>
+          <div class="move-copy">
+            <div class="move-head"><h3>Margin crossed your warning band</h3><span class="status warn">Risk changed</span></div>
+            <p>Hyperliquid cross-margin usage is 68%, above Alice's 65% warning threshold. Current venue data is fresh.</p>
+            <div class="choice-row" aria-label="Possible responses">
+              <span class="choice">Review exposure</span>
+              <span class="choice">Add collateral</span>
+              <span class="choice">Reduce exposure</span>
+              <span class="choice">Leave unchanged</span>
+            </div>
+            <details>
+              <summary>Evidence and supported next steps</summary>
+              <div class="detail-body">
+                <p>Account equity $20,934.40 · BTC-PERP long 0.31 BTC · reported liquidation price $47,908. Bloom does not prescribe a trade.</p>
+                <span class="path-box">/wallets/alice/hyperliquid/portfolio.json</span>
+              </div>
+            </details>
+          </div>
+          <div class="move-side"><strong>68%</strong><small>margin usage</small></div>
+        </article>
+
+        <article class="card move-card">
+          <div class="move-rank">03</div>
+          <div class="move-copy">
+            <div class="move-head"><h3>Transaction is still pending</h3><span class="status warn">Soon</span></div>
+            <p>A Base transfer has been unmined for 8 minutes. Current replacement-fee advice is available for review.</p>
+            <div class="move-meta">
+              <span class="pill">Base</span>
+              <span class="pill">Nonce 184</span>
+              <span class="pill">Original fee 0.000021 ETH</span>
+            </div>
+            <details>
+              <summary>Evidence and supported next step</summary>
+              <div class="detail-body">
+                <p>The scanner refreshed its advice 18 seconds ago. The replacement remains advisory until prepared through the normal intent and approval flow.</p>
+                <span class="path-box">/wallets/alice/chains/base/outbox/sent/tx_184/bump_advice.json</span>
+              </div>
+            </details>
+          </div>
+          <div class="move-side"><strong>8 min</strong><small>pending</small></div>
+        </article>
+      </div>
+    </section>
+
+    <section class="lane available" aria-labelledby="available-heading">
+      <div class="lane-heading"><span class="lane-count">1</span><h2 id="available-heading">Available now</h2></div>
+      <div class="move-list">
+        <article class="card move-card">
+          <div class="move-rank">01</div>
+          <div class="move-copy">
+            <div class="move-head"><h3>Redeem a resolved position</h3><span class="status good">Verified redeemable</span></div>
+            <p>“Was ETH above $3,000 at Friday close?” resolved YES. Polymarket reports 186.40 winning shares ready to redeem.</p>
+            <div class="move-meta">
+              <span class="pill">Polymarket</span>
+              <span class="pill">Resolved 16 Jul</span>
+              <span class="pill">Approval still required</span>
+            </div>
+            <details>
+              <summary>Evidence and supported next step</summary>
+              <div class="detail-body">
+                <p>The market's typed position state is explicitly <code>redeemable=true</code>. Opening the path prepares a new action; it does not redeem from this page.</p>
+                <span class="path-box">/wallets/alice/polymarket/positions/eth-friday/redeem.md</span>
+              </div>
+            </details>
+          </div>
+          <div class="move-side"><strong>$186.40</strong><small>estimated value</small></div>
+        </article>
+      </div>
+    </section>
+
+    <section class="section" aria-label="Safety boundary">
+      <div class="notice"><strong>Discovery, not authorization.</strong> These items point to evidence or a supported preparation path. Any value-moving action is still staged, simulated, policy-checked, and approved through Bloom's existing signing ceremony. Generic airdrops and trade ideas are intentionally absent.</div>
+    </section>
+  </main>
+
+  <footer class="page-footer">
+    <span><strong>Bloom next-moves concept</strong> · generated from bloom.next_moves.v1</span>
+    <span>Facts first · no invented recommendations</span>
+  </footer>
+</body>
+</html>

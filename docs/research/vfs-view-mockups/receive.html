@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Receive · Bloom</title>
+  <link rel="stylesheet" href="bloom.css">
+</head>
+<body>
+  <div class="demo-bar">Concept template · static example data · do not send to these addresses</div>
+  <header class="site-header">
+    <a class="brand" href="index.html" aria-label="Bloom view concepts home">
+      <img src="../../assets/bloom-wordmark.png" alt="Bloom">
+    </a>
+    <nav class="showcase-nav" aria-label="View concepts">
+      <a href="portfolio.html">Portfolio</a>
+      <a href="next-moves.html">Next moves</a>
+      <a href="receive.html" aria-current="page">Receive</a>
+      <a href="send.html">Send</a>
+      <a href="activity.html">Activity</a>
+      <a href="permissions.html">Permissions</a>
+    </nav>
+  </header>
+
+  <main class="page">
+    <div class="context-row">
+      <div class="vfs-path"><code>/wallets/alice/receive.html</code></div>
+      <div class="snapshot">Snapshot R4E2 · routes verified 1 minute ago</div>
+    </div>
+
+    <section class="page-intro">
+      <div>
+        <p class="eyebrow">Verified destinations</p>
+        <h1>Receive</h1>
+      </div>
+      <div>
+        <p class="intro-copy">Choose the network and purpose first. Bloom shows a QR only when the destination, chain, and asset constraints are known.</p>
+        <div class="intro-facts">
+          <span class="status good">3 routes ready</span>
+          <span class="pill">Mainnets only</span>
+          <span class="pill">1 funding workflow</span>
+        </div>
+      </div>
+    </section>
+
+    <section class="card route-focus" aria-labelledby="base-route-heading">
+      <div>
+        <div class="route-kicker">
+          <span class="asset-mark" aria-hidden="true">B</span>
+          <div><span class="label">Wallet account · chain ID 8453</span><h2 id="base-route-heading">Receive on Base</h2></div>
+        </div>
+        <span class="status good">Ready · owner account verified</span>
+        <div class="address-block">
+          <code>0x71C7656EC7ab88b098defB751B7401B5f6d8976F</code>
+          <div class="address-caption">Full EIP-55 checksum address · Alice's owner account on Base</div>
+        </div>
+        <dl class="detail-list">
+          <div><dt>Network</dt><dd>Base mainnet (8453)</dd></div>
+          <div><dt>Purpose</dt><dd>Wallet deposit</dd></div>
+          <div><dt>Accepted</dt><dd>ETH + Base tokens</dd></div>
+          <div><dt>Minimum</dt><dd>None set by Bloom</dd></div>
+        </dl>
+        <div class="notice" style="margin-top: 24px"><strong>Check before sending.</strong> Assets sent on another network may not appear here. Token discovery in Portfolio can still be partial.</div>
+      </div>
+      <figure class="qr-shell">
+        <svg viewBox="0 0 210 210" role="img" aria-label="Illustrative QR placeholder for the Base receive route">
+          <rect width="210" height="210" rx="8" fill="#fffdf8"/>
+          <g fill="currentColor">
+            <path d="M14 14h56v56H14zm8 8v40h40V22zm8 8h24v24H30zM140 14h56v56h-56zm8 8v40h40V22zm8 8h24v24h-24zM14 140h56v56H14zm8 8v40h40v-40zm8 8h24v24H30z" fill-rule="evenodd"/>
+            <path d="M84 14h14v14H84zm28 0h14v14h-14zM84 42h28v14H84zm28 14h14v28h-14zM84 70h14v28H84zm14 28h28v14H98zm42-14h14v28h-14zm28 0h28v14h-28zm-28 28h42v14h-42zM14 84h14v28H14zm28 0h28v14H42zm-14 28h56v14H28zm56 14h14v28H84zm28-14h14v42h-14zm28 28h14v14h-14zm28-14h28v14h-28zm-14 28h42v14h-42zm-56 14h28v14H98zm-14 14h14v14H84zm42 0h14v14h-14zm28 0h42v14h-42z"/>
+          </g>
+          <path d="M92 119l26-31" stroke="#a8324c" stroke-width="8" stroke-linecap="round"/>
+        </svg>
+        <figcaption class="qr-label"><span>Illustrative QR</span><span>Demo only</span></figcaption>
+      </figure>
+    </section>
+
+    <section class="section" aria-labelledby="routes-heading">
+      <div class="section-head">
+        <h2 id="routes-heading">Other receive routes</h2>
+        <p>Same bytes can mean different routes</p>
+      </div>
+      <div class="grid-3">
+        <article class="card route-card">
+          <div class="route-head"><div><span class="label">Wallet account</span><h3>Ethereum</h3></div><span class="status good">Ready</span></div>
+          <p class="route-purpose">Receive assets directly into Alice's owner account on Ethereum mainnet.</p>
+          <div class="address-block"><code>0x71C7656EC7ab88b098defB751B7401B5f6d8976F</code></div>
+          <div class="asset-chips"><span class="asset-chip">ETH</span><span class="asset-chip">ERC-20 tokens</span><span class="asset-chip">Chain 1</span></div>
+          <details><summary>Verification</summary><div class="detail-body">Source: Bloom owner signer plus configured Ethereum chain. Checked at block 22,914,870.</div></details>
+        </article>
+
+        <article class="card route-card">
+          <div class="route-head"><div><span class="label">Venue deposit wallet</span><h3>Polymarket</h3></div><span class="status good">Fundable</span></div>
+          <p class="route-purpose">Receive native USDC on Polygon into Alice's verified Polymarket deposit wallet.</p>
+          <div class="address-block"><code>0x27b1fdb04752bbc536007a920d24acb045561c26</code></div>
+          <div class="asset-chips"><span class="asset-chip">USDC only</span><span class="asset-chip">Polygon</span><span class="asset-chip">Chain 137</span></div>
+          <details><summary>Verification</summary><div class="detail-body">User-specific deposit wallet resolved from the live factory and verified <code>fundable=true</code> 1 minute ago.</div></details>
+        </article>
+
+        <article class="card route-card">
+          <div class="route-head"><div><span class="label">Funding workflow</span><h3>Hyperliquid</h3></div><span class="status info">Use Bloom flow</span></div>
+          <p class="route-purpose">Hyperliquid credits the account that sends to its shared bridge. That bridge is not Alice's receive address.</p>
+          <div class="notice"><strong>No address shown.</strong> Prepare funding from Alice's Bloom wallet so the correct account receives credit.</div>
+          <div class="asset-chips"><span class="asset-chip">Native USDC</span><span class="asset-chip">Arbitrum</span><span class="asset-chip">Approval required</span></div>
+          <details><summary>Supported path</summary><div class="detail-body"><span class="path-box">/wallets/alice/hyperliquid/deposit.md</span></div></details>
+        </article>
+      </div>
+    </section>
+
+    <section class="section" aria-labelledby="route-rules-heading">
+      <div class="section-head"><h2 id="route-rules-heading">What makes a route safe to show</h2><p>Destination + network + purpose + constraints</p></div>
+      <div class="grid-3">
+        <article class="card card-pad"><span class="label">01 · Identity</span><h3>Chain-qualified</h3><p class="muted">The network name and numeric chain ID sit beside the full checksummed address.</p></article>
+        <article class="card card-pad"><span class="label">02 · Constraints</span><h3>Asset-specific</h3><p class="muted">Venue routes state accepted assets, minimums, readiness, and any expiry.</p></article>
+        <article class="card card-pad"><span class="label">03 · Provenance</span><h3>Recently verified</h3><p class="muted">Derived or fetched addresses show their source and verification time instead of implying certainty.</p></article>
+      </div>
+    </section>
+  </main>
+
+  <footer class="page-footer">
+    <span><strong>Bloom receive concept</strong> · generated from bloom.receive.v1</span>
+    <span>Example addresses · do not send funds</span>
+  </footer>
+</body>
+</html>

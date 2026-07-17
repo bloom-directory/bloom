@@ -1,0 +1,205 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Permissions &amp; security · Bloom</title>
+  <link rel="stylesheet" href="bloom.css">
+</head>
+<body>
+  <div class="demo-bar">Concept template · static example data · no live wallet connected</div>
+  <header class="site-header">
+    <a class="brand" href="index.html" aria-label="Bloom view concepts home">
+      <img src="../../assets/bloom-wordmark.png" alt="Bloom">
+    </a>
+    <nav class="showcase-nav" aria-label="View concepts">
+      <a href="portfolio.html">Portfolio</a>
+      <a href="next-moves.html">Next moves</a>
+      <a href="receive.html">Receive</a>
+      <a href="send.html">Send</a>
+      <a href="activity.html">Activity</a>
+      <a href="permissions.html" aria-current="page">Permissions</a>
+    </nav>
+  </header>
+
+  <main class="page">
+    <div class="context-row">
+      <div class="vfs-path"><code>/wallets/alice/permissions.html</code></div>
+      <div class="snapshot">Snapshot S90C · checked 2 minutes ago</div>
+    </div>
+
+    <section class="page-intro">
+      <div>
+        <p class="eyebrow">Standing authority &amp; custody</p>
+        <h1>Permissions &amp; security</h1>
+      </div>
+      <div>
+        <p class="intro-copy">Who can act for Alice, what they can do, whether Bloom can still exercise that authority, and how recovery is configured.</p>
+        <div class="intro-facts">
+          <span class="status warn">2 need attention</span>
+          <span class="pill">7 standing permissions</span>
+          <span class="status warn">Coverage partial</span>
+        </div>
+      </div>
+    </section>
+
+    <section class="security-summary" aria-label="Permission summary">
+      <div class="security-stat"><strong>2</strong><span>Need attention</span></div>
+      <div class="security-stat"><strong>7</strong><span>Standing permissions</span></div>
+      <div class="security-stat"><strong>Partial</strong><span>Discovery coverage</span></div>
+    </section>
+
+    <section class="section" aria-labelledby="attention-heading">
+      <div class="section-head"><h2 id="attention-heading">Needs attention</h2><p>Deterministic findings, not a security score</p></div>
+      <div class="attention-grid">
+        <article class="card attention-card">
+          <span class="status warn">Remote authority remains</span>
+          <h3>Hyperliquid agent “bloom-session”</h3>
+          <p>Bloom stopped the local session yesterday, but Hyperliquid still reports the API wallet as authorized for Alice's master account.</p>
+          <dl class="detail-list">
+            <div><dt>Venue state</dt><dd>Active</dd></div>
+            <div><dt>Bloom executor</dt><dd>Stopped</dd></div>
+          </dl>
+          <details><summary>Review evidence and next step</summary><div class="detail-body"><p>Local cleanup is not remote revocation. Bloom must use a venue-side replacement or expiry workflow and verify the resulting state.</p><span class="path-box">/wallets/alice/permissions/entries/perm_hl_7KM4.json</span></div></details>
+        </article>
+        <article class="card attention-card">
+          <span class="status bad">Unrecognized delegate</span>
+          <h3>Base account delegates execution</h3>
+          <p>A live EIP-7702 designator points to a delegate Bloom cannot label from trusted sources. The authority is active at the checked block.</p>
+          <dl class="detail-list">
+            <div><dt>Authorization</dt><dd>Active</dd></div>
+            <div><dt>Identity</dt><dd>Unknown</dd></div>
+          </dl>
+          <details><summary>Exact delegate and evidence</summary><div class="detail-body"><p><code>0x2D7A3c58F7eF0D9A08c8b4efC52A12c69b455C12</code></p><p>Observed in Alice's Base account code at block 33,804,190. Unknown means unverified—not automatically malicious or safe.</p></div></details>
+        </article>
+      </div>
+    </section>
+
+    <section class="section" aria-labelledby="control-heading">
+      <div class="section-head"><h2 id="control-heading">Account control</h2><p>Explicit account graph, never inferred from history</p></div>
+      <div class="card permission-list">
+        <div class="authority-row">
+          <div class="authority-name"><span class="asset-mark">A</span><div><strong>Alice owner key</strong><small>0x71C7…976F · verified locally</small></div></div>
+          <div class="authority-scope">Controls the EVM owner account on configured chains.<br><small>Signing requires a matching passkey-protected Bloom policy.</small></div>
+          <div class="dual-state"><span class="status good">Available</span><small>Owner signer</small></div>
+        </div>
+        <div class="authority-row">
+          <div class="authority-name"><span class="asset-mark poly">P</span><div><strong>Polymarket wallet</strong><small>Polygon deposit role</small></div></div>
+          <div class="authority-scope">Controlled by Alice's owner account.<br><small>Factory relationship verified 2 minutes ago.</small></div>
+          <div class="dual-state"><span class="status good">Controlled by owner</span><small>On-chain relationship</small></div>
+        </div>
+        <div class="authority-row">
+          <div class="authority-name"><span class="asset-mark">77</span><div><strong>Base delegate</strong><small>EIP-7702 · label unknown</small></div></div>
+          <div class="authority-scope">May execute calls through Alice's Base account.<br><small>No trusted application identity matched the delegate address.</small></div>
+          <div class="dual-state"><span class="status bad">Active · unknown</span><small>Executor unknown</small></div>
+        </div>
+      </div>
+    </section>
+
+    <section class="section" aria-labelledby="access-heading">
+      <div class="section-head"><h2 id="access-heading">Spending &amp; trading access</h2><p>Authorization and Bloom executor shown separately</p></div>
+      <div class="card permission-list">
+        <div class="authority-row">
+          <div class="authority-name"><span class="asset-mark poly">PM</span><div><strong>Polymarket Exchange</strong><small>Polygon · contract verified</small></div></div>
+          <div class="authority-scope">Can spend pUSD from the deposit wallet.<br><small>Allowance: unlimited · no expiry</small></div>
+          <div class="dual-state"><span class="status warn">Active</span><small>Executor available · revoke supported</small></div>
+        </div>
+        <div class="authority-row">
+          <div class="authority-name"><span class="asset-mark usdc">$</span><div><strong>Permit2 allowance</strong><small>Base · Swap Router</small></div></div>
+          <div class="authority-scope">Can spend up to 500 USDC for swaps.<br><small>372 USDC remaining · expires 31 Aug 2026</small></div>
+          <div class="dual-state"><span class="status good">Active · bounded</span><small>Executor available</small></div>
+        </div>
+        <div class="authority-row">
+          <div class="authority-name"><span class="asset-mark hype">HL</span><div><strong>bloom-session</strong><small>Hyperliquid API wallet</small></div></div>
+          <div class="authority-scope">Can place and cancel orders for the master account.<br><small>No withdrawal authority · venue authorization has no local executor</small></div>
+          <div class="dual-state"><span class="status warn">Active remotely</span><small>Bloom executor stopped</small></div>
+        </div>
+        <div class="authority-row">
+          <div class="authority-name"><span class="asset-mark">B</span><div><strong>Base swap session</strong><small>Bloom standing capability</small></div></div>
+          <div class="authority-scope">May prepare Base swaps within signed policy.<br><small>$250/day cap · USDC and ETH only · expires tomorrow</small></div>
+          <div class="dual-state"><span class="status good">Active · bounded</span><small>Executor available</small></div>
+        </div>
+        <div class="authority-row">
+          <div class="authority-name"><span class="asset-mark">NFT</span><div><strong>OpenSea conduit</strong><small>Ethereum · operator approval</small></div></div>
+          <div class="authority-scope">Can transfer NFTs from collection “Bloom Studies.”<br><small>All tokens in this collection · no expiry</small></div>
+          <div class="dual-state"><span class="status warn">Active</span><small>External operator</small></div>
+        </div>
+      </div>
+    </section>
+
+    <section class="section" aria-labelledby="service-heading">
+      <div class="section-head"><h2 id="service-heading">Service access</h2><p>Cannot independently sign value movement</p></div>
+      <div class="card permission-list">
+        <div class="authority-row">
+          <div class="authority-name"><span class="asset-mark">WC</span><div><strong>Portfolio companion</strong><small>Wallet-scoped service token</small></div></div>
+          <div class="authority-scope">Can read balances and query order status.<br><small>Cannot stage, sign, submit, or cancel transactions</small></div>
+          <div class="dual-state"><span class="status info">Read only</span><small>Credential available · rotates 24 Jul</small></div>
+        </div>
+      </div>
+    </section>
+
+    <section class="section" aria-labelledby="safeguards-heading">
+      <div class="section-head"><h2 id="safeguards-heading">Safeguards</h2><p>Facts and limits, not an “all clear” badge</p></div>
+      <div class="guardrail-grid">
+        <article class="card guardrail"><span class="status good">Enabled</span><strong>Passkey protected</strong><p>Two registered passkeys can authorize sealed policy and transaction reviews.</p></article>
+        <article class="card guardrail"><span class="status good">Current</span><strong>Signed policy</strong><p>Digest matches the active local policy. Last changed 11 July.</p></article>
+        <article class="card guardrail"><span class="status info">Bounded</span><strong>$250 daily cap</strong><p>$40 used today. Higher value requires a fresh explicit policy approval.</p></article>
+        <article class="card guardrail"><span class="status bloom">Review mode</span><strong>No autonomous send</strong><p>Value movement always requires a matching sealed user approval.</p></article>
+      </div>
+    </section>
+
+    <section class="section" aria-labelledby="recovery-heading">
+      <div class="section-head"><h2 id="recovery-heading">Recovery &amp; key custody</h2><p>No secrets are ever serialized into this view</p></div>
+      <div class="recovery-grid">
+        <article class="card recovery-card">
+          <span class="status good">Recovery configured</span>
+          <h3>Two passkeys + verified encrypted backup</h3>
+          <p>A platform passkey and hardware passkey are registered. The encrypted owner-key backup was restored in memory and matched Alice's expected address on 12 July.</p>
+          <dl class="detail-list">
+            <div><dt>Backup fingerprint</dt><dd><code>age1:7d9f…e42c</code></dd></div>
+            <div><dt>Last verified</dt><dd>12 Jul · 16:08 ART</dd></div>
+            <div><dt>Storage</dt><dd>User-managed file</dd></div>
+            <div><dt>Freshness</dt><dd>5 days</dd></div>
+          </dl>
+          <details><summary>What “verified” does and does not mean</summary><div class="detail-body">Bloom proved that decrypting this ciphertext produced Alice's expected wallet address at that time. It does not prove the file still exists, that the passphrase is remembered, or that another copy is safe.</div></details>
+        </article>
+        <article class="card recovery-card">
+          <span class="label">Trusted ceremonies</span>
+          <h3>Manage recovery</h3>
+          <p>Every operation opens a fresh, local, passkey-protected ceremony with the wallet name, full address, and consequence shown first.</p>
+          <div class="ceremony-list">
+            <div class="ceremony"><div><strong>Add a passkey</strong><small>Recommended for redundancy</small></div><span class="action-label">Prepare</span></div>
+            <div class="ceremony"><div><strong>Create encrypted backup</strong><small>Verify before replacing the old copy</small></div><span class="action-label">Prepare</span></div>
+            <div class="ceremony"><div><strong>Reveal raw owner key</strong><small>Advanced · highest-risk export</small></div><span class="status bad">Guarded</span></div>
+          </div>
+          <div class="notice" style="margin-top: 16px"><strong>Raw reveal is exceptional.</strong> It requires fresh passkey authorization, hides from logs and VFS output, auto-clears the display, and never changes Alice's EOA address or rotates its key.</div>
+        </article>
+      </div>
+    </section>
+
+    <section class="section" aria-labelledby="changes-heading">
+      <div class="section-head"><h2 id="changes-heading">Recent security changes</h2><p>Linked outcomes live in Activity</p></div>
+      <div class="grid-2">
+        <article class="card card-pad"><span class="status good">Finalized · yesterday</span><h3>USDC approval revoked</h3><p class="muted">Polymarket Exchange allowance changed from unlimited to zero on Polygon.</p><span class="action-label">View activity evidence</span></article>
+        <article class="card card-pad"><span class="status info">Verified · 12 Jul</span><h3>Encrypted backup checked</h3><p class="muted">In-memory restore matched Alice's expected owner address; only verification metadata remains.</p><span class="action-label">View recovery detail</span></article>
+      </div>
+    </section>
+
+    <section class="section" aria-labelledby="coverage-heading">
+      <div class="section-head"><h2 id="coverage-heading">Coverage &amp; blind spots</h2><p>“No permission found” is meaningful only within checked sources</p></div>
+      <div class="coverage-grid">
+        <article class="card coverage-card"><span class="status good">Checked</span><strong>Base + Polygon</strong><span>Allowances, operators, account code, and configured contracts checked at anchored blocks.</span></article>
+        <article class="card coverage-card"><span class="status good">Checked</span><strong>Hyperliquid + Bloom</strong><span>Venue agents, local capabilities, signed policy, and executor state checked 2 minutes ago.</span></article>
+        <article class="card coverage-card"><span class="status warn">Partial</span><strong>Ethereum NFT history</strong><span>Provider range begins 1 July. Older unknown operator approvals may not have been discovered.</span></article>
+      </div>
+      <div class="notice" style="margin-top: 14px"><strong>Honest result:</strong> seven active permissions found in checked sources. Bloom does not claim this wallet is “secure,” and it does not treat missing provider data as absence of authority.</div>
+    </section>
+  </main>
+
+  <footer class="page-footer">
+    <span><strong>Bloom permissions concept</strong> · generated from bloom.permissions.v1</span>
+    <span>Standing authority + custody · never a generic score</span>
+  </footer>
+</body>
+</html>
