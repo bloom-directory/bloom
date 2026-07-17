@@ -84,85 +84,135 @@ const PM_ORDER_SIGN_REQUEST_FILE: &str = "sign_request.json";
 /// Sidecar file the VFS writes the host-signed wrapped signature into.
 const PM_ORDER_SIGN_RESULT_FILE: &str = "sign_result.json";
 
-const README: &[u8] = br#"# Polymarket Trading
+const README: &[u8] = br#"# Polymarket VFS
 
-## Quick Start for Agents
+All paths below are relative to this `polymarket/` directory. Directory
+listings are authoritative: paths whose backing services are unavailable are
+omitted.
 
-### 1. Read market data (no wallet needed)
+## Market and account reads
+
+| Path | Contents |
+| --- | --- |
+| `markets/` | Up to 20 active markets, ordered by volume. |
+| `markets/<slug>/market.json` | Market metadata and outcomes. |
+| `markets/<slug>/book.json` | Current YES-token order book. |
+| `markets/<slug>/prices.json` | Midpoint, spread, and best buy price. |
+| `search/<query>` | Market search results; encode spaces as `+`. |
+| `positions/<wallet>/positions.json` | Current positions for a wallet name or address. |
+| `positions/<wallet>/trades.json` | Trade history. |
+| `positions/<wallet>/activity.json` | Account activity. |
+| `account/<wallet>/portfolio.json` | Portfolio summary. |
+| `account/<wallet>/orders.json` | Live resting orders and their ids. |
+| `account/<wallet>/status.json` | Onboarding, balances, approvals, and trading readiness. |
+| `account/<wallet>/buying_power.json` | Spendable pUSD and funding readiness. |
+| `account/<wallet>/funding_options.json` | Supported funding routes and limits. |
+
+## Onboarding
+
+`onboard/<wallet>/` contains:
+
+- `status.json` - current stage, liveness, and next required action.
+- `plan.md` - the exact deployment, approval, and credential plan.
+- `approvals.json` - token and exchange approvals that onboarding may grant.
+- `begin` - writable sink that starts or resumes onboarding; the body is ignored.
+- `approval_challenge.json` - appears when owner approval is required. Give its
+  `ceremony_url` to the owner, then retry the same write to `begin` after
+  approval.
+
+Onboarding is complete when `status.json` reports the synchronized stage and
+`account/<wallet>/status.json` reports `tradeable: true`.
+
+## Funding
+
+Create a reviewable pUSD funding request by writing JSON to
+`fund/<wallet>/new`:
+
 ```json
- /polymarket/markets/        # List active markets
- /polymarket/markets/<slug>/         # Market detail (title, outcomes, prices)
- /polymarket/positions/<wallet>/     # Current positions
- /polymarket/account/<wallet>/status.json  # Onboarding state
+{"target_pusd":"10","max_spend":"100","from_token":"native","slippage_bps":50}
 ```
 
-### 2. Trading (per-trade owner ceremony)
-Every value-moving action re-crosses the owner gate today:
+`target_pusd` and `max_spend` must be positive. `from_token` may be `native`,
+`POL`, `MATIC`, or an ERC-20 address. `slippage_bps` defaults to 50 and cannot
+exceed 1000.
+
+Each created request appears as `fund/<wallet>/<id>/`:
+
+- `request.json` - immutable requested amounts and route constraints.
+- `plan.md` - human-readable funding plan.
+- `status.json` - `draft` or the latest execution state.
+- `confirm` - writable confirmation sink. The mounted handler currently stages
+  funding requests but does not execute this sink; a rejected write leaves the
+  request in `draft` state.
+
+## Trading
+
+Create a reviewable order draft by writing JSON to `trade/<wallet>/new`:
+
 ```json
- bloom polymarket order <wallet> ...
- bloom polymarket sell <wallet> ...
- bloom polymarket confirm <wallet> <id>
- bloom vfs write /polymarket/trade/<wallet>/drafts/<id>/confirm --unlock-wallet <wallet> --data confirm
+{"slug":"will-example-happen","outcome":"yes","amount":"1","max_price":"0.60"}
 ```
 
-A Polymarket capability primitive (scoped approve, TTL, caps, bounded window
-with no per-trade ceremony) is in active development. See
-`docs/plans/2026-06-20-agent-obvious-capability-model.md` for status.
+Fields:
 
-### 3. VFS staging and foreground confirmation
-Drafts can be created in the VFS and confirmed through the foreground CLI VFS
-write path, which unlocks the wallet in the same process that signs:
-```json
- write: /polymarket/trade/<wallet>/new     # Create a reviewable draft
- read:  /polymarket/trade/<wallet>/drafts/<id>/plan.md
- write: /polymarket/trade/<wallet>/drafts/<id>/confirm   # use bloom vfs write --unlock-wallet <wallet>
-```
+- `slug`, `outcome`, and `amount` are required.
+- `side` is `buy` by default; `sell` uses `amount` as share count.
+- `max_price` bounds a buy; `min_price` bounds a sell.
+- `limit_price` creates an explicit resting limit order.
+- `order_type` may be `FAK`, `FOK`, or `GTC`.
 
-Funding requests can be staged and then executed through the foreground CLI VFS
-write path, which unlocks the wallet in the same process that signs:
-```json
- write: /polymarket/fund/<wallet>/new
- write: /polymarket/fund/<wallet>/<id>/confirm   # use bloom vfs write --unlock-wallet <wallet>
-```
+Drafts appear under `trade/<wallet>/drafts/<id>/`:
 
-### 4. Risk-reducing and exit actions (foreground confirmation)
-Redeem, revoke-approvals, and pUSD withdraw are owner-signed, so the mounted
-handler advertises the path and refuses direct execution; confirm through the
-foreground CLI VFS write path so the signer ceremony stays in-process:
-```json
- write: /polymarket/redeem/<wallet>/<slug>/confirm                  --unlock-wallet <wallet> --data confirm
- write: /polymarket/revoke-approvals/<wallet>/request/confirm       --unlock-wallet <wallet> --data confirm
- write: /polymarket/withdraw/<wallet>/pusd/confirm                  --unlock-wallet <wallet> --data '{"confirm":true,"amount":"<amount|all>"}'
-```
-Each dispatches to the same core as the matching CLI command (`bloom polymarket
-redeem|revoke-approvals|withdraw-pusd`). Print the plan first with the CLI
-`--dry-run` flag. pUSD withdraw requires an explicit `amount` in the body (the
-path carries no amount slot); a bare `confirm` is rejected.
+- `plan.md` - review summary and confirmation requirements.
+- `order.json` - canonical draft.
+- `policy_check.json` - wallet-policy decisions.
+- `quote.json` - size, price bounds, book snapshot, and tick data.
+- `review_intent.json` - intent committed for review.
+- `confirm` - writable Sealed Approval sink. It consumes the prepared order
+  sign request, stages the action in the central `../outbox/`, and either completes
+  signing or returns an approval challenge. A plain confirmation body is not
+  sufficient when no prepared sign request exists.
 
-Cancel uses stored CLOB credentials (no owner signing), so it executes directly
-in the VFS only after compliance checks pass:
-```json
- write: /polymarket/trade/<wallet>/orders/<order-id>/cancel          --data confirm
-```
-Discover resting order ids with `/polymarket/account/<wallet>/orders.json`.
+Completed orders create `trade/<wallet>/receipts/<id>/receipt.json`.
 
-## Safety Model
+Resting order ids come from `account/<wallet>/orders.json`. Cancel an order by
+writing `confirm`, `y`, or `yes` to
+`trade/<wallet>/orders/<order-id>/cancel`. Cancellation uses stored CLOB
+credentials and executes after compliance checks; it does not request an owner
+wallet signature.
 
-- Reads are always safe (no signing needed)
-- Policy checks (slug allow/deny, max order, max daily) run per action
-- Onboarding must complete (`bloom polymarket onboard <wallet>`) before any trade
-- Every value-moving CLI action requires a passkey ceremony or unlocked local wallet
-- Trade draft confirmation uses `bloom vfs write --unlock-wallet <wallet>` so
-  the existing CLI order engine re-checks policy, stale draft status,
-  holdings, locks, signing, CLOB post/reconcile, receipts, and audit gates
-- Fund request confirmation uses `bloom vfs write --unlock-wallet <wallet>` so
-  the existing CLI funding engine re-reads live balances/routes and applies the
-  standard tx-engine policy, plan, review, signing, broadcast, and audit gates
-- Redeem, revoke-approvals, and pUSD withdraw confirmation use
-  `bloom vfs write --unlock-wallet <wallet>` so the existing CLI cores re-check
-  onboarding state, redeemable status / pUSD balance, the passkey ceremony, the
-  gasless relayer batch, and (for revoke) post-confirm on-chain allowance
-  verification -- the mounted handler only advertises and refuses
+## Exit and authority sinks
+
+- `redeem/<wallet>/<slug>/confirm` - redeem a resolved market position. With
+  Sealed Approval wired, a denied first write stages an approval challenge;
+  retry the same write after approval.
+- `revoke-approvals/<wallet>/request/confirm` - revoke Polymarket token and
+  exchange approvals. It follows the same challenge-and-retry flow.
+- `withdraw/<wallet>/pusd/confirm` - advertised pUSD withdrawal sink. The
+  mounted handler currently refuses execution because an amount-specific
+  signed action is not available through this sink; a write must not be treated
+  as a completed withdrawal.
+
+For approval-gated actions, inspect `../outbox/pending/<action-id>/` in the Bloom
+VFS. Its `plan.md`, `policy_check.json`, `approval_challenge.json`, and
+`status.json` provide the review, owner ceremony, and action state. After the
+owner completes `ceremony_url`, retry the original Polymarket sink. Final state
+is recorded under `../outbox/sent/` or `../outbox/failed/`.
+
+## Builder keys
+
+- `builder-keys/<wallet>/keys.json` lists builder API keys and whether Bloom
+  stores each key; secrets are never exposed.
+- `builder-keys/<wallet>/revoke` revokes the stored key when written with
+  `confirm`, `y`, or `yes`. To select a key, write
+  `{"confirm":true,"key":"<builder-key-id>"}`.
+
+## Safety
+
+Trading is enabled by default, but every order still passes market invariants,
+wallet policy checks, price and exposure checks, review, signing, venue
+compliance, receipt recording, and audit gates. Always inspect the draft or
+central outbox artifacts before retrying an approval-gated sink.
 "#;
 
 const BEGIN_HINT: &[u8] = b"write anything here to (re)run onboarding; run in the foreground for passkey wallets; rests at 'fund' for pUSD; progress + liveness: status.json\n";
@@ -4245,6 +4295,34 @@ key = "builder-key-2"
             .map(|e| e.name)
             .collect();
         assert_eq!(names, vec!["README.md", "markets", "positions", "search"]);
+    }
+
+    #[tokio::test]
+    async fn readme_documents_the_live_vfs_without_cli_commands() {
+        let h = handler_with(None, None);
+        let text = String::from_utf8(h.read(&p("/README.md")).await.unwrap()).unwrap();
+        let lower = text.to_ascii_lowercase();
+        for forbidden in ["bloom polymarket", "bloom vfs", "--unlock-wallet", "cli"] {
+            assert!(!lower.contains(forbidden), "README contains {forbidden:?}");
+        }
+        for required in [
+            "markets/<slug>/market.json",
+            "positions/<wallet>/positions.json",
+            "onboard/<wallet>/",
+            "account/<wallet>/status.json",
+            "fund/<wallet>/new",
+            "trade/<wallet>/new",
+            "trade/<wallet>/drafts/<id>/",
+            "trade/<wallet>/receipts/<id>/receipt.json",
+            "trade/<wallet>/orders/<order-id>/cancel",
+            "redeem/<wallet>/<slug>/confirm",
+            "revoke-approvals/<wallet>/request/confirm",
+            "withdraw/<wallet>/pusd/confirm",
+            "builder-keys/<wallet>/keys.json",
+            "../outbox/pending/<action-id>/",
+        ] {
+            assert!(text.contains(required), "README missing {required:?}");
+        }
     }
 
     #[tokio::test]

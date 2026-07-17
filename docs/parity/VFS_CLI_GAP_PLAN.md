@@ -221,7 +221,7 @@ Tests added:
 - CLI subprocess parity smoke tests proving `bloom polymarket
   redeem|revoke-approvals|withdraw-pusd` and the matching
   `bloom vfs write .../confirm --unlock-wallet` paths share the same durable
-  refusal (no `[polymarket]` config) before any network/signing work; plus a
+  refusal (missing wallet) before any network/signing work; plus a
   test that withdraw confirm rejects a bare ack.
 
 Docs updated:

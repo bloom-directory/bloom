@@ -2373,8 +2373,8 @@ impl Daemon {
 
         // Polymarket: public read surface (Gamma/Data/CLOB) plus, when a
         // `[chains]` entry matches the Polymarket chain id (Polygon 137), the
-        // onboarding state machine and L2 account views. Mount whenever a
-        // `[polymarket]` block exists; a bare block uses the public defaults.
+        // onboarding state machine and L2 account views. Polymarket is enabled
+        // by default with public endpoints; a config block can override them.
         // Signing never leaves the daemon (Keystore::signer → KeystoreSigner).
         if let Some(pm_cfg) = &config.polymarket {
             let pm_url = |raw: &str| match url::Url::parse(raw) {
@@ -2441,7 +2441,7 @@ impl Daemon {
             debug!(chain_id = pm_cfg.chain_id, "daemon.polymarket_mounted");
             vfs_builder = vfs_builder.mount("polymarket", Arc::new(handler) as _);
         } else {
-            debug!("daemon.polymarket_skipped: no [polymarket] config");
+            debug!("daemon.polymarket_skipped: disabled programmatically");
         }
 
         // /next.md — brutally-scoped next-action aggregator for agents.

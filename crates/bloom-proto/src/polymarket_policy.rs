@@ -10,7 +10,8 @@
 //! are micro-probabilities on the same scale (`"0.75"` → `750_000`).
 //!
 //! Semantics:
-//! - `enabled = false` (the default) refuses all order placement. Fail closed.
+//! - `enabled = true` by default. Setting it to `false` refuses all order
+//!   placement.
 //! - **Deny-level outcomes cannot be bypassed from the command line.** They
 //!   change only by editing the wallet's policy file — a separate, auditable
 //!   capability boundary. Only `require_flag_above_usd` produces a `Warn`,
@@ -40,9 +41,8 @@ fn default_true() -> bool {
 /// `[polymarket]` section of a wallet's policy file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PolymarketPolicy {
-    /// Master gate. Defaults to **false**: a wallet cannot place Polymarket
-    /// orders until its owner opts in via the policy file.
-    #[serde(default)]
+    /// Master gate. Defaults to **true**; wallet policy can disable trading.
+    #[serde(default = "default_true")]
     pub enabled: bool,
     /// Hard cap per order, micro-USD (TOML: decimal string, e.g. `"10"`).
     #[serde(default, with = "crate::serde_micro")]
@@ -72,7 +72,7 @@ pub struct PolymarketPolicy {
 impl Default for PolymarketPolicy {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             max_order_usd: None,
             max_daily_usd: None,
             require_flag_above_usd: None,
@@ -358,13 +358,13 @@ mod tests {
     }
 
     #[test]
-    fn disabled_by_default_denies() {
+    fn enabled_by_default_allows_open_order() {
         let checks = evaluate_polymarket_order(&PolymarketPolicy::default(), &open_ctx());
-        assert!(has_deny(&checks));
+        assert!(!has_deny(&checks));
         assert!(
             checks
                 .iter()
-                .any(|c| c.rule == "polymarket.enabled" && c.outcome == PolicyOutcome::Deny)
+                .any(|c| c.rule == "polymarket.enabled" && c.outcome == PolicyOutcome::Pass)
         );
     }
 
@@ -505,7 +505,10 @@ mod tests {
         ctx.side = PolicySide::Sell;
         assert!(!has_deny(&evaluate_polymarket_order(&p, &ctx)));
         // enabled gate still applies to sells
-        let disabled = PolymarketPolicy::default();
+        let disabled = PolymarketPolicy {
+            enabled: false,
+            ..Default::default()
+        };
         assert!(has_deny(&evaluate_polymarket_order(&disabled, &ctx)));
     }
 
@@ -535,7 +538,7 @@ denied_slugs = ["bad-market"]
     #[test]
     fn default_section_parses_from_policy_toml() {
         let p: crate::policy::Policy = toml::from_str("[caps]\nmax_value_eth = 0.1\n").unwrap();
-        assert!(!p.polymarket.enabled, "polymarket must default to disabled");
+        assert!(p.polymarket.enabled, "Polymarket must default to enabled");
         assert!(p.polymarket.allow_neg_risk);
     }
 }

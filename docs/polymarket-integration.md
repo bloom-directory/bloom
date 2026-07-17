@@ -36,8 +36,8 @@ instruction to trade.
 - Prefer self-contained blocking commands for agent flows:
   `onboard`, `fund`, `order --dry-run`, `confirm`, `sell`, `cancel`,
   `obligations`, `redeem`, `withdraw-pusd`, and `revoke-approvals`.
-- Wallet policy must opt in before any order with `[polymarket] enabled = true`
-  plus caps/allowlists as needed.
+- Wallet policy enables trading by default. Set `[polymarket] enabled = false`
+  to disable it, or add caps and allow/deny lists to constrain it.
 - Funding requests staged under `polymarket/fund/<wallet>/new` can be executed
   with `bloom vfs write /polymarket/fund/<wallet>/<id>/confirm --unlock-wallet
   <wallet> --data confirm`; this dispatches to the same funding engine as

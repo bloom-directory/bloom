@@ -44,9 +44,9 @@ pub struct Config {
     pub etherscan: Option<EtherscanConfig>,
     #[serde(default)]
     pub enso: Option<EnsoConfig>,
-    /// Polymarket read surface. Presence of `[polymarket]` opts the
-    /// `polymarket/` VFS subtree in (like `[enso]` opts in `defi/`).
-    #[serde(default)]
+    /// Polymarket read and trading surface. Enabled with public Polygon
+    /// endpoints by default; a `[polymarket]` table can override them.
+    #[serde(default = "default_polymarket_config")]
     pub polymarket: Option<PolymarketConfig>,
     /// Trusted, daemon-owned runtime settings for installed Petals.
     /// Endpoint overrides are matched to named manifest bindings and may only
@@ -234,6 +234,27 @@ pub struct PolymarketConfig {
     /// setups and backward compatibility.
     #[serde(default)]
     pub legacy_eoa_mode: bool,
+}
+
+impl Default for PolymarketConfig {
+    fn default() -> Self {
+        Self {
+            gamma_url: default_gamma_url(),
+            data_url: default_data_url(),
+            clob_url: default_clob_url(),
+            relayer_url: default_relayer_url(),
+            chain_id: default_polymarket_chain_id(),
+            builder_code: None,
+            relayer_api_key: None,
+            relayer_api_key_address: None,
+            builder_key_mode: default_builder_key_mode(),
+            legacy_eoa_mode: false,
+        }
+    }
+}
+
+fn default_polymarket_config() -> Option<PolymarketConfig> {
+    Some(PolymarketConfig::default())
 }
 
 fn default_builder_key_mode() -> String {
@@ -503,7 +524,7 @@ impl Config {
             chains,
             etherscan: None,
             enso: None,
-            polymarket: None,
+            polymarket: default_polymarket_config(),
             petals: PetalsConfig::default(),
             hyperliquid: Some(HyperliquidConfig::default()),
             mempool: BTreeMap::new(),
@@ -689,6 +710,11 @@ mod tests {
         assert_eq!(cfg.nfs_listen_addr, "127.0.0.1:12049");
         assert!(cfg.etherscan.is_none());
         assert!(cfg.enso.is_none());
+        let polymarket = cfg
+            .polymarket
+            .as_ref()
+            .expect("Polymarket is enabled by default");
+        assert_eq!(polymarket.chain_id, 137);
         let hyperliquid = cfg
             .hyperliquid
             .as_ref()
@@ -815,6 +841,16 @@ mod tests {
                 .unwrap();
         assert_eq!(pm.relayer_api_key.as_deref(), Some("k-123"));
         assert_eq!(pm.relayer_api_key_address.as_deref(), Some("0xabc"));
+    }
+
+    #[test]
+    fn missing_polymarket_block_enables_public_defaults() {
+        let cfg: Config = toml::from_str("").unwrap();
+        let pm = cfg
+            .polymarket
+            .expect("Polymarket should be enabled when the block is omitted");
+        assert_eq!(pm.chain_id, 137);
+        assert_eq!(pm.gamma_url, "https://gamma-api.polymarket.com");
     }
 
     #[test]

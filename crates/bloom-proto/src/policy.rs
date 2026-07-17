@@ -51,8 +51,8 @@ pub struct Policy {
     /// and daemon surfaces alike.
     #[serde(default)]
     pub limits: LimitsPolicy,
-    /// Polymarket order policy (`[polymarket]`). Defaults to disabled —
-    /// trading requires an explicit opt-in in the policy file.
+    /// Polymarket order policy (`[polymarket]`). Trading is enabled by default;
+    /// wallet policy can disable it or apply exposure limits.
     #[serde(default)]
     pub polymarket: crate::polymarket_policy::PolymarketPolicy,
     /// Generic DeFi route policy (`[defi]`). Defaults to disabled — the
