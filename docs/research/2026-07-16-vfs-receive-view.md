@@ -34,13 +34,16 @@ Receive should contain only destinations that an external sender can use.
 - **Funding workflow:** an action that must originate from the Bloom wallet. This is not
   a receive destination.
 
-Hyperliquid belongs to the third category. Its Arbitrum bridge credits the account that
-*sent* native USDC to the shared bridge contract; handing that bridge address to another
-sender would credit the other sender, not the intended Bloom wallet
+Hyperliquid belongs to the third category for V0. A direct Bridge2 deposit credits the
+account that *sent* native USDC to the shared bridge contract; handing that bridge
+address to another sender would credit the other sender, not the intended Bloom wallet
 ([Hyperliquid Bridge2](https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/bridge2)).
-The Receive page should therefore say “fund through Bloom's Hyperliquid deposit flow,”
-not display the bridge as the wallet's deposit address. That workflow belongs in the
-Send/action surface.
+Bridge2 also exposes a permit-based deposit-on-behalf flow, but Bloom does not currently
+implement that flow. Until it does, the Receive page must say “fund through Bloom's
+Hyperliquid deposit flow,” not display the bridge as a generic wallet destination. A
+future permit route would need to bind the sender, credited account, native Arbitrum
+USDC asset, five-USDC minimum, and permit expiry in one review; it must not look like a
+copyable bridge QR. The current workflow belongs in the Send/action surface.
 
 ## V0 route model
 
@@ -141,9 +144,12 @@ useful extension, not a V0 dependency.
 
 ### Hyperliquid
 
-Do not expose Bridge2 as a receive route. Put a non-receive notice in the overview with
-the existing staged funding entry point. The current implementation already enforces
-native Arbitrum USDC, a 5 USDC minimum, and confirmation through the normal outbox.
+Do not expose Bridge2 as a generic receive route. Put a non-receive notice in the
+overview with the existing staged funding entry point. The current implementation
+enforces native Arbitrum USDC, a 5 USDC minimum, and confirmation through the normal
+outbox. Treat a future permit-based deposit-on-behalf implementation as a distinct,
+sender-bound route with its own typed snapshot and expiry—not as a reason to publish
+the shared bridge address.
 
 ## What exists and what is missing
 
@@ -181,8 +187,9 @@ The gaps are small:
 4. Add optional chain-specific native-payment QR payloads; never generate token-payment
    requests without an exact token contract and amount.
 5. Test two chains sharing one owner address, obvious testnet labeling, watch wallets,
-   a blocked Polymarket estimate, a verified Polymarket destination, Hyperliquid never
-   appearing as a receive address, and identical snapshot IDs across formats.
+   a blocked Polymarket estimate, a verified Polymarket destination, Hyperliquid's
+   shared bridge never appearing as a generic receive address, and identical snapshot
+   IDs across formats.
 
 V0 is ready when a user cannot mistake an owner address for a venue deposit wallet,
 cannot mistake one EVM network for another, and never sees an unverified or sender-bound

@@ -100,10 +100,10 @@
 
         <article class="card route-card">
           <div class="route-head"><div><span class="label">Funding workflow</span><h3>Hyperliquid</h3></div><span class="status info">Use Bloom flow</span></div>
-          <p class="route-purpose">Hyperliquid credits the account that sends to its shared bridge. That bridge is not Alice's receive address.</p>
+          <p class="route-purpose">Direct deposits credit the account that sends to the shared bridge. Bloom's current flow sends from Alice; the bridge is not her generic receive address.</p>
           <div class="notice"><strong>No address shown.</strong> Prepare funding from Alice's Bloom wallet so the correct account receives credit.</div>
-          <div class="asset-chips"><span class="asset-chip">Native USDC</span><span class="asset-chip">Arbitrum</span><span class="asset-chip">Approval required</span></div>
-          <details><summary>Supported path</summary><div class="detail-body"><span class="path-box">/wallets/alice/hyperliquid/deposit.md</span></div></details>
+          <div class="asset-chips"><span class="asset-chip">Native USDC</span><span class="asset-chip">Arbitrum</span><span class="asset-chip">Min 5 USDC</span><span class="asset-chip">Approval required</span></div>
+          <details><summary>Supported path and future extension</summary><div class="detail-body"><p><span class="path-box">/wallets/alice/hyperliquid/deposit.md</span></p><p>Bridge2 also supports permit-based deposits on behalf of another account, but Bloom does not expose that sender-bound flow yet.</p></div></details>
         </article>
       </div>
     </section>
