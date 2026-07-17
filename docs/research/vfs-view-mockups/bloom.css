@@ -22,10 +22,10 @@
   --violet-soft: #e8dfec;
   --danger: #8b2d2d;
   --danger-soft: #f2dddd;
-  --shadow: 0 24px 70px rgba(50, 39, 25, 0.09);
-  --shadow-small: 0 10px 30px rgba(50, 39, 25, 0.07);
-  --radius: 24px;
-  --radius-small: 15px;
+  --shadow: 0 24px 70px rgba(50, 39, 25, 0.07);
+  --shadow-small: 0 4px 18px rgba(50, 39, 25, 0.035);
+  --radius: 18px;
+  --radius-small: 12px;
   --sans: Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
   --serif: Iowan Old Style, Baskerville, "Times New Roman", serif;
   --mono: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
@@ -280,7 +280,7 @@ h1,
   padding: 7px 10px;
   border: 1px solid var(--line);
   color: var(--ink-soft);
-  background: rgba(255, 253, 248, 0.55);
+  background: rgba(255, 253, 248, 0.3);
 }
 
 .status {
@@ -297,33 +297,38 @@ h1,
 
 .status.good {
   color: var(--moss);
-  background: var(--moss-soft);
+  border: 1px solid #b5d0c2;
+  background: rgba(220, 235, 227, 0.48);
 }
 
 .status.warn {
   color: var(--amber);
-  background: var(--amber-soft);
+  border: 1px solid #dfc89d;
+  background: rgba(243, 229, 201, 0.48);
 }
 
 .status.bad {
   color: var(--danger);
-  background: var(--danger-soft);
+  border: 1px solid #dfb8b8;
+  background: rgba(242, 221, 221, 0.48);
 }
 
 .status.info {
   color: var(--blue);
-  background: var(--blue-soft);
+  border: 1px solid #b9d0da;
+  background: rgba(220, 232, 237, 0.48);
 }
 
 .status.bloom {
   color: var(--bloom-dark);
-  background: var(--bloom-soft);
+  border: 1px solid #dcb2bd;
+  background: rgba(241, 220, 225, 0.48);
 }
 
 .card {
   border: 1px solid var(--line);
   border-radius: var(--radius);
-  background: rgba(251, 248, 241, 0.92);
+  background: rgba(251, 248, 241, 0.72);
   box-shadow: var(--shadow-small);
 }
 
@@ -673,9 +678,9 @@ a:hover .action-label::after {
 .view-card:hover,
 .view-card:focus-visible {
   border-color: var(--line-strong);
-  box-shadow: var(--shadow);
+  box-shadow: 0 7px 18px rgba(50, 39, 25, 0.06);
   outline: none;
-  transform: translateY(-3px);
+  transform: translateY(-1px);
 }
 
 .view-card::after {
@@ -687,7 +692,7 @@ a:hover .action-label::after {
   border: 1px solid var(--line);
   border-radius: 50%;
   content: "";
-  box-shadow: 0 0 0 24px rgba(213, 205, 191, 0.18);
+  box-shadow: 0 0 0 24px rgba(213, 205, 191, 0.12);
 }
 
 .view-number {
