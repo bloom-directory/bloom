@@ -26,15 +26,8 @@ bloom gatekeeps every value-moving action through capabilities:
 - **Automated action uses a capability.** Create a bounded session/capability
   first — the human approves the bounds once, then the agent operates inside
   them without re-prompting until expiry, breach, or revocation.
-- **The owner key is never handed off.** For capabilities that depend on owner
-  signing (EVM, Polymarket — the target model, not yet shipped), the key will
-  reside in daemon RAM for a bounded window and auto-lock on expiry.
-  Hyperliquid already uses an ephemeral agent key that does not need the
-  owner key after session creation.
-- **Broadcast config has two gates.** Per-chain `allow_broadcast` defaults to
-  `true` and the global `block_mainnet_broadcast` kill-switch defaults to
-  `false`. Never broadcast a value-moving action without owner approval.
-
+- **The owner key is never exposed through the VFS.** Use the mounted challenge,
+  capability, and session paths; never ask for or handle private key material.
 To see what a wallet can do without a human, check its per-chain state and
 outbox, or its Hyperliquid sessions under `hyperliquid/<net>/agent_sessions/`.
 A read-only `wallets/<wallet>/capabilities/` roll-up and a VFS-root `next.md`
@@ -108,7 +101,7 @@ cat wallets/<wallet>/policy.toml
 #    permission denied after the daemon stages a Sealed Approval challenge.
 printf '%s' "$edited_policy" > wallets/<wallet>/policy.toml
 
-# 3. Discover and read the challenge through the mount (no BLOOM_HOME access).
+# 3. Discover and read the challenge through the mount.
 ls wallets/<wallet>/policy-updates
 cat wallets/<wallet>/policy-updates/<action_id>/status.json
 cat wallets/<wallet>/policy-updates/<action_id>/approval_challenge.json
@@ -129,13 +122,6 @@ a new policy that lacks its matching signature.
 `status.json` and `approval_challenge.json` are read-only views: they carry
 bounded challenge metadata and `ceremony_url` only, never the signed approval or
 any key/PRF/grant material.
-
-Direct edits to `BLOOM_HOME/keystore/<wallet>/policy.toml` are **unsupported**
-for this flow. If a policy is mutated out of band and its `policy.toml.sig` goes
-stale, the passkey wallet fails closed on every signed path (including the first
-VFS policy write) with the signed-policy error; the mounted flow does not repair
-it. Recovering an externally-broken policy needs the admin helper
-`bloom wallet sign-policy <wallet>`, not this edit surface.
 
 ## Paid HTTP (x402 and MPP)
 
@@ -160,8 +146,7 @@ If paid confirmation needs passkey approval, the first confirm write may return
 permission denied after writing
 `requests/pending/<id>/approval_challenge.json`. Read that file, check
 `action_id`, `expiry_ms`, merchant/payment details in `plan.md`, then open or
-forward `ceremony_url`. The foreground `bloom request confirm` command follows
-the same Sealed Approval ceremony and retry path.
+forward `ceremony_url`, then retry the same VFS write.
 
 The ceremony mints a short-lived in-memory grant for the sealed request. x402
 and MPP then ask Bloom's host signer to sign the exact payment digest under that
@@ -254,26 +239,20 @@ Hyperliquid trading uses Sealed Approval for owner authority:
 - **Owner actions:** `hyperliquid/<network>/exchange/<wallet>/send_asset.json`
   follows the same challenge/grant/retry flow and requires `transfer_cap_usd`.
   Generic owner-signed order/cancel/update-leverage writes are disabled; use
-  agent sessions, or `raw_signed.json` for payloads signed outside Bloom.
+  agent sessions.
 
 ## Polymarket
 
-Prediction-market trading lives under `polymarket` and is driven by the
-`bloom polymarket ...` commands. It is **opt-in and human-gated**: a wallet
-trades only after `[polymarket] enabled = true` is set in its `policy.toml`, and
-today every value-moving action opens a fresh passkey review ceremony. A
-Polymarket capability primitive (scoped approve, TTL, caps) is in active
-development; until it lands, treat Polymarket value-moving actions as
-human-gated.
-
-Start at `docs/examples.md` (the Polymarket section) and read
-`docs/polymarket-integration.md` in the repo for the full spec. Funds move only
-through the CLI; the VFS surface stages and reviews, it never signs.
+Prediction-market trading lives under `polymarket` and is human-gated. Read
+`polymarket/README.md`, inspect the mounted market and account paths, and use
+the advertised write surfaces. When a write produces
+`approval_challenge.json`, verify its action and expiry, forward its
+`ceremony_url` to the owner, and retry the same VFS write after approval.
 
 ## Passkey policy mode
 
-For passkey wallets, policy edits must be re-signed with
-`bloom wallet sign-policy <wallet>`. The browser page lets the human choose:
+For passkey wallets, policy writes through `wallets/<wallet>/policy.toml` may
+produce a mounted approval challenge. The review page lets the human choose:
 
 - `Ask me every time`: money-moving actions need a fresh passkey review.
 - `Let Bloom use these rules`: agents may proceed only when every signed policy

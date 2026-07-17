@@ -1930,11 +1930,7 @@ impl Daemon {
             Arc::new(EvmOutboxProjection::new(central, projection_auth));
         let outbox = Outbox::new_with_projection(home.outbox_dir(), projection)
             .map_err(|e| DaemonError::Outbox(e.to_string()))?;
-        let mut tx_engine = TxEngine::new(
-            outbox,
-            config.stage_ttl.as_millis(),
-            config.block_mainnet_broadcast,
-        );
+        let mut tx_engine = TxEngine::new(outbox, config.stage_ttl.as_millis());
         #[cfg(feature = "unsafe-debug-signer")]
         if let Some((wallet, signer)) = &unsafe_debug_signer {
             tx_engine = tx_engine.with_unsafe_debug_signer(wallet.clone(), signer.clone());
@@ -2761,7 +2757,6 @@ impl Daemon {
             enso = config.enso.is_some(),
             ens_resolver = ens_client.is_some(),
             heimdall = cfg!(feature = "bytecode-decompile"),
-            block_mainnet_broadcast = config.block_mainnet_broadcast,
             "daemon.built"
         );
 

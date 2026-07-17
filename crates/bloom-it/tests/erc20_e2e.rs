@@ -422,7 +422,7 @@ async fn erc20_stage_fails_when_decimals_unreadable() -> Result<()> {
     let tmp = tempfile::tempdir()?;
     let permit = bloom_proto::HomeWritePermit::acquire(&bloom_proto::HomeDir::at(tmp.path()))?;
     let outbox = Outbox::new(tmp.path().join("outbox")).map_err(|e| anyhow!("outbox: {e}"))?;
-    let engine = TxEngine::new(outbox, 60_000, false);
+    let engine = TxEngine::new(outbox, 60_000);
 
     let from = ANVIL_ADDR0.parse().unwrap();
     let intent = RawIntent {
@@ -475,7 +475,7 @@ async fn replace_keeps_nonce_and_bumps_fees() -> Result<()> {
     let permit = bloom_proto::HomeWritePermit::acquire(&bloom_proto::HomeDir::at(tmp.path()))?;
     let outbox = Outbox::new(tmp.path().join("outbox")).map_err(|e| anyhow!("outbox: {e}"))?;
     let grant_store: Arc<dyn GrantStore> = Arc::new(InMemoryGrantStore::default());
-    let engine = TxEngine::new(outbox, 60_000, false)
+    let engine = TxEngine::new(outbox, 60_000)
         .with_auth_services(
             Arc::new(DenyingApprovalVerifier),
             Arc::new(UnusedAuthWriter),
@@ -594,7 +594,6 @@ async fn owner_session_executes_erc20_until_daily_cap_then_denies() -> Result<()
     let engine = TxEngine::new(
         Outbox::new(tempfile::tempdir()?.path().join("outbox"))?,
         60_000,
-        false,
     )
     .with_host_signing_services(
         grant_store.clone(),

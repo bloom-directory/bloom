@@ -200,8 +200,8 @@ and example crates used by the broader Bloom runtime and examples.
 ## Security defaults
 
 - **Broadcast routing enabled by default.** Per-chain `allow_broadcast`
-  defaults to `true` and `block_mainnet_broadcast` defaults to `false`.
-  Signing, policy, confirmation, and Sealed Approval gates still apply.
+  defaults to `true`. Signing, policy, confirmation, and Sealed Approval
+  gates still apply.
 - **Private keys are never readable through the FS.** The keystore
   lives outside the mount; only `address` and `public_key` are
   exposed.
@@ -229,9 +229,8 @@ and example crates used by the broader Bloom runtime and examples.
 - **Single-user daemon.** No daemon-level auth or multi-tenant
   isolation; the mount inherits the OS user's permissions on
   `~/.bloom`.
-- **Broadcast config is not an approval boundary.** Use
-  `block_mainnet_broadcast = true` as a global emergency stop or set a
-  chain's `allow_broadcast = false` to disable that chain. Value-moving
+- **Broadcast config is not an approval boundary.** Set a chain's
+  `allow_broadcast = false` to disable broadcast on that chain. Value-moving
   actions still pass Bloom's signing, policy, and confirmation controls.
 - **Embedded indexer deferred.** Address activity, ERC-20 / ERC-721
   history, and contract source / ABI are served via Etherscan; no

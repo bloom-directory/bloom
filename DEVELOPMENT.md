@@ -344,7 +344,6 @@ bloom vfs cat /status/chains/base/connected              # true / false (750ms R
 bloom vfs cat /status/chains/base/block_number           # head height (or backend error)
 bloom vfs ls  /status/chains/base/endpoints              # health snapshots, 0-indexed
 bloom vfs cat /status/chains/base/endpoints/0/success_rate
-bloom vfs cat /status/policies/block_mainnet_broadcast   # safety flag
 bloom vfs cat /status/outbox/pending_count               # pending tx count
 bloom vfs cat /status/backends/summary.json              # which data source each surface uses
 ```

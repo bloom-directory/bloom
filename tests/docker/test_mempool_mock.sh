@@ -36,7 +36,7 @@ RPC_URL="$BASE_FORK_INTERNAL_URL"
 prepare_home_dir "$HOME_DIR"
 
 # Write base config (chains.base section) then append the mempool section.
-write_base_config "$HOME_DIR" "$RPC_URL" "Base (forked)" false
+write_base_config "$HOME_DIR" "$RPC_URL" "Base (forked)"
 
 log "appending mempool config (provider=alchemy ws=$MEMPOOL_MOCK_WS_URL)"
 cat >> "$HOME_DIR/config.toml" <<EOF

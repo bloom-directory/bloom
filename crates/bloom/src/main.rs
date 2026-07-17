@@ -1294,10 +1294,6 @@ async fn run(cli: Cli) -> Result<()> {
                 "default_wallet: {}",
                 d.config.default_wallet.as_deref().unwrap_or("<none>")
             );
-            println!(
-                "block_mainnet_broadcast: {}",
-                d.config.block_mainnet_broadcast
-            );
             if d.config.hyperliquid.is_some() {
                 println!("hyperliquid_vfs: enabled (/hyperliquid)");
                 // Which wallets have an actual trading boundary in force.

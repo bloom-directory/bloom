@@ -2,9 +2,7 @@
 
 Cheatsheet for the three write-heavy surfaces of the `/bloom/` VFS.
 Every command below is a plain `cat`, `ls`, `echo > path`, or `tail -f`
-against the mounted filesystem. Mainnet broadcast routing defaults on:
-`block_mainnet_broadcast = false` and per-chain
-`allow_broadcast = true`. The runnable flows here use `anvil` or `base`.
+against the mounted filesystem. The runnable flows here use `anvil` or `base`.
 
 ## 1. Wallets
 
@@ -345,9 +343,8 @@ echo y > /bloom/wallets/alice/chains/anvil/outbox/pending/$ID/cancel
 
 ### Mainnet broadcast
 
-The same paths work for `chain = "ethereum"`; both broadcast gates default to
-allowing the route. Signing, policy, review, and confirmation checks still
-apply. Set top-level `block_mainnet_broadcast = true` or the chain entry's
+The same paths work for `chain = "ethereum"`. Signing, policy, review, and
+confirmation checks still apply. Set the chain entry's
 `allow_broadcast = false` to make `confirm` fail before broadcast.
 
 ## 3. Simulate

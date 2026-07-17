@@ -2,7 +2,7 @@
 
 The `status/` tree is the daemon's introspection layer: uptime and version, per-chain RPC reachability, the audit-log digest, cache and outbox counts, the active backend mapping, and a per-endpoint health snapshot for every configured RPC URL. The `docs/` tree is the daemon's vendored help (the same markdown checked into `crates/bloom-vfs/src/docs/`). The per-endpoint leaves under `status/chains/<chain>/endpoints/<idx>/` are the RPC-robustness fleet view added in WP-3 (commit `9f5eab6`): one directory per configured endpoint, populated by a 15 s active probe loop with EWMA latency, success-rate sampling, and a cooldown state machine. All examples below assume the VFS is mounted at `/bloom/`.
 
-A point of caution on naming: leaves are exactly what the source advertises. There is no `status/chains/<chain>.json`, no `status/chains/summary.json`, no `outbox/list.json`, no `wallets/list.json`, no `cache/count`, and no `audit/tail.jsonl`. Per-wallet policy lives at `/bloom/wallets/<wallet>/policy.toml` (handled by the wallets handler, not status); the only policy leaf under `status/` is the global `block_mainnet_broadcast` flag. Use the listings below as the authoritative shape.
+A point of caution on naming: leaves are exactly what the source advertises. There is no `status/chains/<chain>.json`, no `status/chains/summary.json`, no `outbox/list.json`, no `wallets/list.json`, no `cache/count`, and no `audit/tail.jsonl`. Per-wallet policy lives at `/bloom/wallets/<wallet>/policy.toml` (handled by the wallets handler, not status). Use the listings below as the authoritative shape.
 
 ## Daemon
 
@@ -103,9 +103,6 @@ cat /bloom/status/wallets/count                        # number of registered wa
 
 ls /bloom/status/outbox/                               # pending_count
 cat /bloom/status/outbox/pending_count                 # total pending tx ids across all wallets and chains
-
-ls /bloom/status/policies/                             # block_mainnet_broadcast
-cat /bloom/status/policies/block_mainnet_broadcast     # "true" / "false" — global mainnet broadcast lock
 ```
 
 Per-wallet policy is **not** under `status/`; it lives at `/bloom/wallets/<wallet>/policy.toml` (read+write, handled by the wallets handler).

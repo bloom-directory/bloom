@@ -1,28 +1,13 @@
 # Examples
 
-These examples assume the VFS is mounted. Start a mount-enabled daemon first:
-
-```sh
-bloom serve --mount              # /bloom on Linux, /Volumes/bloom on macOS
-bloom serve --mount /tmp/bloom   # explicit mount path
-```
-
-If the tree is not mounted, use the equivalent `bloom vfs cat`, `bloom vfs ls`,
-and `bloom vfs write` commands against paths without the mount prefix.
+These examples use paths under the Bloom VFS root.
 
 ## Local Anvil round-trip
 
 ```sh
-# 1. Start anvil
-anvil --port 8545
-
-# 2. In another terminal, create a wallet (passkey is the default; for a
-#    passphrase wallet in dev, use --local --allow-passphrase-wallet
-#    --passphrase-file <path>)
-bloom wallet new alice
-
-# 3. Inspect chain
+# 1. Inspect the mounted chain and wallet.
 cat /bloom/chains/anvil/head/number
+cat /bloom/wallets/alice/address
 cat /bloom/chains/anvil/chain_id
 
 # 4. Stage a send
@@ -131,62 +116,16 @@ echo y > /bloom/wallets/alice/chains/ethereum/outbox/pending/0001-*/confirm
 
 ## Polymarket (prediction markets)
 
-Trading is **opt-in, human-gated, and binary-markets-only**. Read
-`docs/polymarket-integration.md` for the full spec; this is the happy path.
-
-Prerequisites:
-
-```toml
-# ~/.bloom/config.toml — the block must be present; fields default
-# (chain_id = 137, builder_key_mode = "auto").
-[polymarket]
-
-# A Polygon chain entry to settle + broadcast funding on (same shape as other
-# chains); broadcast must be enabled for the funding tx.
-[chains.polygon]
-chain_id = 137
-allow_broadcast = true
-```
-
-```toml
-# ~/.bloom/keystore/<wallet>/policy.toml — trading is refused until this opts in.
-[polymarket]
-enabled = true
-max_order_usd = "5"     # per-order cap (decimal string)
-max_daily_usd = "20"    # trailing-24h posted cap
-max_price = "0.90"      # per-share price ceiling
-# allowed_slugs / denied_slugs / allowed_condition_ids / denied_condition_ids
-```
-
-Happy path (self-contained commands; no `bloom serve` needed). Value-moving
-steps open a passkey ceremony — run them in the foreground with a human present,
-or use a local wallet with `BLOOM_PASSPHRASE` set for headless runs:
+The mounted Polymarket surface is human-gated. Start with its own live
+instructions and discover the paths that are present:
 
 ```sh
-# Onboard: deploy the deposit wallet, approve the contracts, mint CLOB creds,
-# sync buying power. Optionally fund inline with --target-pusd/--max-spend.
-bloom polymarket onboard alice --target-pusd 5 --max-spend 8
-
-# Or fund separately (target-denominated swap, bounded by --max-spend), or
-# execute a request staged via the VFS at polymarket/fund/<wallet>/new:
-bloom polymarket fund alice --target-pusd 5 --max-spend 8
-bloom polymarket fund alice --request <request-id>
-
-# Draft an order (dry-run shows the reviewable plan; nothing signs), then confirm:
-bloom polymarket order alice <market-slug> yes 3 --max-price 0.70 --dry-run
-bloom polymarket confirm alice <draft-id>
-
-# Exit + housekeeping:
-bloom polymarket sell alice <market-slug> yes <shares> --min-price 0.50
-bloom polymarket cancel alice <order-id>
-bloom polymarket obligations alice            # read-only: open positions + next exit
-bloom polymarket redeem alice <market-slug>   # after resolution (redeemable positions)
-bloom polymarket withdraw-pusd alice all      # deposit wallet → owner EOA
-bloom polymarket revoke-approvals alice       # withdraw the spending approvals
+cat /bloom/polymarket/README.md
+ls /bloom/polymarket/
+ls /bloom/polymarket/markets/
+ls /bloom/polymarket/account/alice/
 ```
 
-Caveats: only true binary YES/NO markets trade; geoblock is fail-closed (refuses
-in restricted regions); orders use the gasless deposit wallet (signatureType 3);
-keep deposit-wallet balances small — this is a hot wallet, and the terminal/browser
-review hash is a local consistency check, not a hardware trusted display. Drafts
-and receipts are readable at `polymarket/trade/<wallet>/{drafts,receipts}/...`.
+Use only the read and write paths advertised by those listings. For any write
+that creates `approval_challenge.json`, verify the action and expiry, forward
+its `ceremony_url` to the owner, and retry the same VFS write after approval.

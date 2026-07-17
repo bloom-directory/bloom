@@ -418,8 +418,7 @@ fn status_prints_version_and_chain_summary() {
         // Version line uses the package version; just assert the prefix.
         .stdout(predicate::str::contains("version: "))
         .stdout(predicate::str::contains("home: "))
-        .stdout(predicate::str::contains("chains: "))
-        .stdout(predicate::str::contains("block_mainnet_broadcast: "));
+        .stdout(predicate::str::contains("chains: "));
 }
 
 #[test]

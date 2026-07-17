@@ -3333,7 +3333,7 @@ mod tests {
             chains.add(bloom_evm::ChainClient::new(spec).unwrap());
         }
         let outbox = Outbox::new(&outbox_root).unwrap();
-        let tx_engine = TxEngine::new(outbox, 60_000, false);
+        let tx_engine = TxEngine::new(outbox, 60_000);
         let address_book = AddressBook::default();
         let home = bloom_proto::HomeDir::at(tmp.path().join("home"));
         let permit = Arc::new(HomeWritePermit::acquire(&home).unwrap());

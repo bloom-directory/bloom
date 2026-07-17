@@ -78,7 +78,6 @@ bloom init >/dev/null
 # Patch config.toml — replace mainnet entry with anvil-local.
 cat > "$HOME_DIR/config.toml" <<EOF
 stage_ttl = "10m"
-block_mainnet_broadcast = false
 default_chain = "local"
 
 [chains.local]

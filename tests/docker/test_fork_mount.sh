@@ -41,7 +41,7 @@ WALLET_PASSPHRASE="${BLOOM_TEST_WALLET_PASSPHRASE:-}"
 RPC_URL="$BASE_FORK_INTERNAL_URL"
 
 prepare_home_dir "$HOME_DIR"
-write_base_config "$HOME_DIR" "$RPC_URL" "Base (forked)" false
+write_base_config "$HOME_DIR" "$RPC_URL" "Base (forked)"
 build_mount_demo
 
 # ---------- top up the test wallet on the fork ----------

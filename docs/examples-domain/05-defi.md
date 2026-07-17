@@ -2,7 +2,7 @@
 
 The `defi/intents/<wallet>/` surface is an "intent compiler" that turns a natural-language or JSON DeFi request into one or more concrete `RawIntent`s using the Enso Shortcuts API, and then forwards them — on confirm — into the same wallet outbox the rest of bloom uses. The full lifecycle is: write an intent under `defi/intents/<wallet>/new` to open a session; review the routed plan, full Enso response, prepared `RawIntent`s, and an `eth_call` simulation under `defi/intents/<wallet>/<id>/`; write to that session's `confirm` to stage the resulting tx (or `[approve, swap]` pair) into `wallets/<wallet>/chains/<chain>/outbox/pending/<tx-id>/`; then write to the outbox's own `confirm` to actually broadcast. There are always two confirms — one to commit the route into the outbox, one to actually broadcast each pending tx — and the second confirm is where ordering, gas, and policy checks live. Sessions are file-backed under `~/.bloom/defi/<wallet>/sessions/`, so they survive one-shot CLI invocations and daemon restarts; the outbox entry is still the durable artefact for the staged transaction.
 
-All paths below are rooted at `/bloom/`. Mainnet broadcast routing defaults on with `block_mainnet_broadcast=false` and per-chain `allow_broadcast=true` in daemon config. The `ethereum` examples below can therefore broadcast when their signing, policy, review, and confirmation gates pass.
+All paths below are rooted at `/bloom/`. The `ethereum` examples below can broadcast when their signing, policy, review, and confirmation gates pass.
 
 ## Session layout
 

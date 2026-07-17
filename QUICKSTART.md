@@ -46,9 +46,8 @@ This prints the home dir, config path, and configured chains. The
 default config registers eleven read-ready public EVM chains (Ethereum,
 Base, Tempo, Arbitrum, Optimism, Polygon, BNB Smart Chain, Avalanche,
 Gnosis, Linea, HyperEVM) plus `anvil` at `http://127.0.0.1:8545`. Per-chain
-`allow_broadcast` defaults to `true` and the separate
-`block_mainnet_broadcast` kill-switch defaults to `false`. Value-moving actions
-still require the applicable signing, policy, and confirmation gates.
+`allow_broadcast` defaults to `true`. Value-moving actions still require the
+applicable signing, policy, and confirmation gates.
 
 ## 2. Start a local devnet
 

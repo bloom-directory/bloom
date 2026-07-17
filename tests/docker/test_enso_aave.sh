@@ -74,7 +74,6 @@ case "$MODE" in
             || fail "BASE_FORK_INTERNAL_URL not set"
         RPC_URL="$BASE_FORK_INTERNAL_URL"
         CHAIN_DISPLAY="Base (forked)"
-        BLOCK_MAINNET_BROADCAST=false
         ;;
     live)
         DEST1="${BLOOM_LIVE_DEST1:-}"
@@ -90,10 +89,6 @@ case "$MODE" in
             || fail "BLOOM_BASE_RPC_URL not set"
         RPC_URL="$BLOOM_BASE_RPC_URL"
         CHAIN_DISPLAY="Base (mainnet)"
-        # block_mainnet_broadcast guards against unexpected broadcasts
-        # to a chain id that matches a known mainnet. Live mode wants
-        # to broadcast to Base mainnet, so we leave the guard off.
-        BLOCK_MAINNET_BROADCAST=false
         warn "LIVE MODE: broadcasting to Base mainnet from $DEST1"
         warn "           swap = $SWAP_AMOUNT_ETH ETH (real funds)"
         ;;
@@ -105,7 +100,7 @@ esac
 prepare_home_dir "$HOME_DIR"
 [[ "$MODE" == "live" ]] && prepare_live_home "$HOME_DIR" "$WALLET"
 
-write_base_config "$HOME_DIR" "$RPC_URL" "$CHAIN_DISPLAY" "$BLOCK_MAINNET_BROADCAST" "$BLOOM_ENSO_KEY"
+write_base_config "$HOME_DIR" "$RPC_URL" "$CHAIN_DISPLAY" "$BLOOM_ENSO_KEY"
 build_mount_demo
 
 # ---------- top up the test wallet on the fork ----------

@@ -4,24 +4,7 @@ Bloom is an agentic Ethereum wallet exposed as a virtual filesystem.
 Agents can inspect chains with reads, stage wallet actions with writes,
 and review generated plans before any transaction is signed.
 
-If you are setting Bloom up for a user, start from
-`https://bloom.directory/SKILL.md`; it is the canonical agent setup
-prompt.
-
-## Running
-
-Use `bloom serve` for a long-running daemon with JSON-RPC IPC only. To expose
-the same VFS through the kernel NFS client, use a binary built with the `mount`
-feature and pass `--mount`:
-
-```sh
-bloom serve --mount              # /bloom on Linux, /Volumes/bloom on macOS
-bloom serve --mount /tmp/bloom   # explicit mount path
-```
-
-The mount point must already exist and the platform mount command may require
-elevated privileges. Without a mount, the same paths are available through
-`bloom vfs ls`, `bloom vfs cat`, and `bloom vfs write`.
+All paths below are relative to the Bloom VFS root.
 
 ## Top-level layout
 
@@ -32,11 +15,10 @@ elevated privileges. Without a mount, the same paths are available through
   allowances, ENS reverse, sign / EIP-712 surfaces.
 - `defi/intents/` — Enso-mediated DeFi intents (write `quote` / `execute`).
 - `hyperliquid/` — HyperCore reads plus signed exchange and agent-session
-  writes; see `docs/hyperliquid-integration.md` for the reviewer-facing map.
+  writes; read `hyperliquid/README.md` for the mounted workflow.
 - `polymarket/` — prediction-market reads, onboarding, and trade drafts
-  (opt-in + human-gated; drive with `bloom polymarket ...`; see `docs/examples.md`).
-- `watch/` — long-running subscriptions (head, addr, log) executed by the
-  daemon and persisted to JSONL.
+  (opt-in + human-gated; read `polymarket/README.md`).
+- `watch/` — long-running subscriptions (head, addr, log) with JSONL history.
 - `simulate/` — out-of-band tx simulation with state overrides
   (`eth_call` / `debug_traceCall`).
 - `tools/` — pure helpers: `keccak`, `selector`, `address/checksum`,
@@ -257,8 +239,7 @@ echo cancel  > /bloom/wallets/alice/chains/ethereum/outbox/pending/<id>/cancel
 ```
 
 DeFi intent (Enso shortcuts) — natural language is the canonical input;
-JSON works too. Requires an `[enso]` block in `~/.bloom/config.toml`
-with an API key (`BLOOM_ENSO_KEY`):
+JSON works too. If `defi/` is present, use it directly:
 
 ```sh
 echo 'swap 0.1 eth to USDC on base' \
@@ -314,9 +295,5 @@ echo '0x000000000000000000000000000000000000beef' \
   > /bloom/addressbook/alice
 cat /bloom/addressbook/alice
 ```
-
-Per-chain `allow_broadcast` defaults to `true` and
-`block_mainnet_broadcast` defaults to `false`. Configure either gate via
-`~/.bloom/config.toml`; signing, policy, and confirmation checks still apply.
 
 See `examples.md` for end-to-end demos.

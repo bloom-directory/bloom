@@ -1789,7 +1789,7 @@ mod tests {
     fn test_handler(root: &std::path::Path) -> DefiHandler {
         let keystore = Keystore::new(root.join("keystore")).unwrap();
         let outbox = Outbox::new(root.join("outbox")).unwrap();
-        let tx_engine = TxEngine::new(outbox, 60_000, false);
+        let tx_engine = TxEngine::new(outbox, 60_000);
         DefiHandler::new(
             EnsoClient::new(""),
             ChainRegistry::default(),

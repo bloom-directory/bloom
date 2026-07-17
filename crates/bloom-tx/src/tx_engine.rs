@@ -391,8 +391,6 @@ pub struct TxEngine {
     pub outbox: Outbox,
     /// Default stage TTL in ms.
     pub stage_ttl_ms: u128,
-    /// Mainnet broadcast kill-switch.
-    pub block_mainnet_broadcast: bool,
     token_cache: TokenCache,
     resolver: Option<Arc<dyn RecipientResolver>>,
     price_oracle: Option<crate::oracle::DynPriceOracle>,
@@ -424,11 +422,10 @@ pub struct TxEngine {
 }
 
 impl TxEngine {
-    pub fn new(outbox: Outbox, stage_ttl_ms: u128, block_mainnet_broadcast: bool) -> Self {
+    pub fn new(outbox: Outbox, stage_ttl_ms: u128) -> Self {
         Self {
             outbox,
             stage_ttl_ms,
-            block_mainnet_broadcast,
             token_cache: Arc::new(RwLock::new(HashMap::new())),
             resolver: None,
             price_oracle: None,
@@ -1570,15 +1567,12 @@ impl TxEngine {
         }
 
         let spec = chain.spec();
-        let is_mainnet = bloom_proto::Config::is_mainnet_id(spec.chain_id);
-        if (self.block_mainnet_broadcast && is_mainnet) || !spec.allow_broadcast {
+        if !spec.allow_broadcast {
             debug!(
                 id = %staged.id,
                 wallet,
                 chain = %spec.name,
-                is_mainnet,
                 allow_broadcast = spec.allow_broadcast,
-                block_mainnet = self.block_mainnet_broadcast,
                 "tx.broadcast_disabled"
             );
             return Err(TxEngineError::BroadcastDisabled(spec.name.clone()));
@@ -1724,17 +1718,14 @@ impl TxEngine {
             return Err(TxEngineError::EnsoQuoteStale { age });
         }
 
-        // Broadcast gates: honor the global kill-switch and per-chain setting.
+        // Broadcast gate: honor the per-chain setting.
         let spec = chain.spec();
-        let is_mainnet = bloom_proto::Config::is_mainnet_id(spec.chain_id);
-        if (self.block_mainnet_broadcast && is_mainnet) || !spec.allow_broadcast {
+        if !spec.allow_broadcast {
             debug!(
                 id = %staged.id,
                 wallet,
                 chain = %spec.name,
-                is_mainnet,
                 allow_broadcast = spec.allow_broadcast,
-                block_mainnet = self.block_mainnet_broadcast,
                 "tx.broadcast_disabled"
             );
             return Err(TxEngineError::BroadcastDisabled(spec.name.clone()));
@@ -1916,8 +1907,7 @@ impl TxEngine {
             }
             BroadcastTransport::PublicRpc => {
                 let spec = chain.spec();
-                let is_mainnet = bloom_proto::Config::is_mainnet_id(spec.chain_id);
-                if (self.block_mainnet_broadcast && is_mainnet) || !spec.allow_broadcast {
+                if !spec.allow_broadcast {
                     return Err(TxEngineError::BroadcastDisabled(spec.name.clone()));
                 }
                 if policy.private.enabled {
@@ -3177,8 +3167,7 @@ impl TxEngine {
     }
 
     fn ensure_broadcast_allowed(&self, spec: &ChainSpec) -> Result<(), TxEngineError> {
-        let is_mainnet = bloom_proto::Config::is_mainnet_id(spec.chain_id);
-        if (self.block_mainnet_broadcast && is_mainnet) || !spec.allow_broadcast {
+        if !spec.allow_broadcast {
             return Err(TxEngineError::BroadcastDisabled(spec.name.clone()));
         }
         Ok(())
@@ -5278,7 +5267,7 @@ mod tests {
     fn nonce_conflict_engine() -> (TxEngine, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let outbox = crate::outbox::Outbox::new(dir.path()).unwrap();
-        let engine = TxEngine::new(outbox, 60_000, false);
+        let engine = TxEngine::new(outbox, 60_000);
         (engine, dir)
     }
 
@@ -5524,7 +5513,7 @@ mod tests {
     fn fake_engine(stage_ttl_ms: u128) -> (TxEngine, bloom_proto::ChainSpec, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let outbox = crate::outbox::Outbox::new(dir.path().join("outbox")).unwrap();
-        let engine = TxEngine::new(outbox, stage_ttl_ms, false);
+        let engine = TxEngine::new(outbox, stage_ttl_ms);
         let spec = bloom_proto::ChainSpec {
             name: "anvil".into(),
             chain_id: 31337,

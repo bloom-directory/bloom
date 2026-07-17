@@ -68,12 +68,10 @@ fi
 mkdir -p "$PLAY_HOME"
 "$BLOOM_BIN" --home "$PLAY_HOME" init >/dev/null 2>&1 || true
 
-# Overwrite config.toml with the playground topology. We disable
-# block_mainnet_broadcast at the top level so the operator decides per
-# chain via allow_broadcast — anvil broadcasts, base does not.
+# Overwrite config.toml with the playground topology. Per-chain
+# allow_broadcast enables anvil broadcasts and disables base broadcasts.
 cat > "$PLAY_HOME/config.toml" <<'EOF'
 stage_ttl = "30m"
-block_mainnet_broadcast = false
 default_chain = "anvil"
 
 [chains.anvil]

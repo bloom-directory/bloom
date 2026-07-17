@@ -80,7 +80,7 @@ data or rely on their own internal caches, e.g. the etherscan client).
 | Watch (subscriptions, executor task, events tail) | `watch/{new,<id>/{spec.toml,live,history.jsonl[.n],delete}}` | shipped | `crates/bloom-vfs/src/handlers/watch.rs` + `crates/bloom-watch/src/{lib.rs,executor.rs}`; executor started by `Daemon::from_home` |
 | Simulate (eth_call + state override + best-effort trace) | `simulate/{new,last,<id>/{intent.json,state-override.json,simulation.json,plan.md,trace.json}}` | shipped | `crates/bloom-vfs/src/handlers/simulate.rs` |
 | Tools (keccak, selector, address checksum, sha256, blake3, hex, base64, units, ABI encode/decode, RLP, EIP-712 hash) | `tools/{keccak,selector,address/checksum,sha256,blake3,hex,base64,unit/{parse,format},abi,rlp,eip712}/...` | shipped | `crates/bloom-vfs/src/handlers/tools.rs` + `crates/bloom-tools/src/lib.rs` (units helpers come from `crates/bloom-proto/src/units.rs`). |
-| Status / diagnostics | `status/{version,uptime,started_at,home,daemon.json,chains/<c>/{connected,block_number,rpc_url},audit/{head,count,last},cache/{etherscan,prices}_entries,policies/block_mainnet_broadcast,wallets/count,outbox/pending_count}` | shipped | `crates/bloom-vfs/src/handlers/status.rs` |
+| Status / diagnostics | `status/{version,uptime,started_at,home,daemon.json,chains/<c>/{connected,block_number,rpc_url},audit/{head,count,last},cache/{etherscan,prices}_entries,wallets/count,outbox/pending_count}` | shipped | `crates/bloom-vfs/src/handlers/status.rs` |
 | Docs (embedded examples for each surface) | `docs/...` | shipped | `crates/bloom-vfs/src/handlers/docs.rs` + `crates/bloom-vfs/src/docs/` |
 | Address book (petname round-trip) | `addressbook/{<alias>,new}` | shipped | `crates/bloom-vfs/src/handlers/addressbook.rs` + `crates/bloom-proto/src/address.rs` |
 | Prices (DefiLlama, keyless) | `prices/{spot/<coin>(.usd),change_24h/<coin>}` | shipped | `crates/bloom-vfs/src/handlers/prices.rs` + `crates/bloom-prices/src/lib.rs` |
@@ -148,7 +148,6 @@ Verified end-to-end via `tests/docker/run.sh --mempool`.
 
 | Requirement | Status | Artifact |
 |---|---|---|
-| `block_mainnet_broadcast` global kill-switch | shipped | `Config::default()` sets it `false`; setting it `true` blocks recognized mainnet chain ids at broadcast time. |
 | Per-chain `allow_broadcast` gate | shipped | Defaults to `true`; the daemon refuses to send when explicitly set to false. |
 | Encrypted keystore (argon2id + chacha20poly1305) | shipped | `crates/bloom-keystore`. |
 | Hash-chained audit log | shipped | `crates/bloom-proto/src/audit.rs::AuditLog`; wired into the VFS router. |

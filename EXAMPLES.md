@@ -52,10 +52,9 @@ bloom mount /bloom
 # and likewise for `ls`, `echo > path`, and `tail -f`.
 ```
 
-Mainnet broadcasts pass two config gates in `~/.bloom/config.toml`:
-top-level `block_mainnet_broadcast = false` and the chain entry's
-`allow_broadcast = true`. Both values are the defaults. Set the global
-flag to `true` or a chain flag to `false` to disable broadcast routing.
+Broadcast routing is controlled per chain by `allow_broadcast` in
+`~/.bloom/config.toml`. It defaults to `true`; set it to `false` on any chain
+where broadcasting should be disabled.
 
 ## 2. Conventions
 
@@ -700,9 +699,8 @@ Permit2 typed data has the same shape — swap `domain.name` to
 
 The outbox is scoped per `wallet/chain`. Every staged tx gets a
 `<seq>-<hash>` directory id under `pending/`, `sent/`, or `failed/`.
-Demo against `anvil` or `base`; mainnet is always shown as a path —
-the kill-switch (`block_mainnet_broadcast` + per-chain
-`allow_broadcast`) gates the actual `confirm` write.
+Demo against `anvil` or `base`; each chain's `allow_broadcast` setting gates
+the actual `confirm` write.
 
 ### Stage an intent
 
@@ -838,14 +836,9 @@ echo y > /bloom/wallets/alice/chains/anvil/outbox/pending/$ID/cancel
 
 ### Mainnet broadcast
 
-The same paths work for `chain = "ethereum"`. Broadcast routing is enabled
-when both gates have their default values:
-
-- top-level `block_mainnet_broadcast = false`
-- per-chain `allow_broadcast = true`
-
-Signing, policy, review, and confirmation checks still apply. Set either
-gate to its blocking value to make `confirm` fail before broadcast.
+The same paths work for `chain = "ethereum"`. Signing, policy, review, and
+confirmation checks still apply. Set that chain's `allow_broadcast = false`
+to make `confirm` fail before broadcast.
 
 ---
 
@@ -1458,9 +1451,6 @@ cat /bloom/status/wallets/count
 
 ls /bloom/status/outbox/                               # pending_count
 cat /bloom/status/outbox/pending_count
-
-ls /bloom/status/policies/                             # block_mainnet_broadcast
-cat /bloom/status/policies/block_mainnet_broadcast     # "true" / "false"
 ```
 
 Per-wallet policy is **not** under `status/`; it lives at

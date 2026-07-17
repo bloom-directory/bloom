@@ -19,7 +19,6 @@
 //! - `status/audit/count`                        — total entries (decimal)
 //! - `status/cache/etherscan_entries`            — count of cached etherscan files
 //! - `status/cache/prices_entries`               — count of cached price responses
-//! - `status/policies/block_mainnet_broadcast`   — `true`/`false`
 //! - `status/wallets/count`                      — number of wallets
 //! - `status/outbox/pending_count`               — total pending tx ids
 //! - `status/backends/<feature>`                 — declared backend per feature
@@ -493,7 +492,6 @@ impl StatusHandler {
             [s] if s == "chains"
                 || s == "audit"
                 || s == "cache"
-                || s == "policies"
                 || s == "wallets"
                 || s == "outbox"
                 || s == "backends"
@@ -567,9 +565,6 @@ impl StatusHandler {
                 if a == "cache"
                     && matches!(leaf.as_str(), "etherscan_entries" | "prices_entries") =>
             {
-                Ok(Entry::file(leaf))
-            }
-            [a, leaf] if a == "policies" && leaf == "block_mainnet_broadcast" => {
                 Ok(Entry::file(leaf))
             }
             [a, leaf] if a == "wallets" && leaf == "count" => Ok(Entry::file(leaf)),
@@ -691,9 +686,6 @@ impl StatusHandler {
             [a, leaf] if a == "cache" && leaf == "prices_entries" => {
                 Ok(format!("{}\n", self.prices_entries()).into_bytes())
             }
-            [a, leaf] if a == "policies" && leaf == "block_mainnet_broadcast" => {
-                Ok(format!("{}\n", self.tx_engine.block_mainnet_broadcast).into_bytes())
-            }
             [a, leaf] if a == "wallets" && leaf == "count" => {
                 Ok(format!("{}\n", self.wallet_count()).into_bytes())
             }
@@ -762,7 +754,6 @@ impl StatusHandler {
                 Entry::dir("chains"),
                 Entry::dir("audit"),
                 Entry::dir("cache"),
-                Entry::dir("policies"),
                 Entry::dir("wallets"),
                 Entry::dir("outbox"),
                 Entry::dir("backends"),
@@ -820,7 +811,6 @@ impl StatusHandler {
                 Entry::file("etherscan_entries"),
                 Entry::file("prices_entries"),
             ]),
-            [a] if a == "policies" => Ok(vec![Entry::file("block_mainnet_broadcast")]),
             [a] if a == "wallets" => Ok(vec![Entry::file("count")]),
             [a] if a == "outbox" => Ok(vec![Entry::file("pending_count")]),
             [a] if a == "backends" => {
@@ -867,7 +857,6 @@ impl StatusHandler {
             // Daemon-static fields.
             Some("version" | "started_at") => Some(Duration::from_secs(86_400)),
             Some("uptime" | "daemon.json") => Some(Duration::from_secs(2)),
-            Some("policies") => Some(Duration::from_secs(60)),
             // `backends/*` is mostly static config (per-feature backend
             // declaration + `summary.json`), but `backends/mempool` and
             // `backends/private_rpc` are live JSON snapshots updated at
@@ -941,7 +930,7 @@ mod tests {
         let chains = ChainRegistry::default();
         let keystore = Keystore::new(home.join("keystore")).unwrap();
         let outbox = Outbox::new(home.join("outbox")).unwrap();
-        let tx_engine = TxEngine::new(outbox, 60_000, true);
+        let tx_engine = TxEngine::new(outbox, 60_000);
         let audit = Arc::new(AuditLog::open(home.join("audit.jsonl")).unwrap());
         StatusHandler::new(
             chains,
@@ -1035,7 +1024,6 @@ mod tests {
             "chains",
             "audit",
             "cache",
-            "policies",
             "wallets",
             "outbox",
             "backends",

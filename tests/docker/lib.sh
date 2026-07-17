@@ -60,13 +60,12 @@ prepare_live_home() {
 }
 
 write_base_config() {
-    local home_dir=$1 rpc_url=$2 display_name=$3 block_mainnet_broadcast=${4:-false}
-    local enso_key=${5:-}
+    local home_dir=$1 rpc_url=$2 display_name=$3
+    local enso_key=${4:-}
 
     log "writing config.toml (rpc: $rpc_url)"
     cat > "$home_dir/config.toml" <<EOF
 stage_ttl = "30m"
-block_mainnet_broadcast = $block_mainnet_broadcast
 default_chain = "base"
 
 [chains.base]
