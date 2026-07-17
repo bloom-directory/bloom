@@ -89,8 +89,8 @@ pub struct ChainSpec {
     /// New: rich endpoint schema. Wins over `rpc_urls` when non-empty.
     #[serde(default)]
     pub rpc_endpoints: Vec<EndpointSpec>,
-    /// Whether broadcasts are allowed on this chain. Defaults to true; the
-    /// separate global mainnet kill-switch remains the final safety gate.
+    /// Whether broadcasts are allowed on this chain. Defaults to true; set to false
+    /// to disable broadcasting for this chain.
     #[serde(default = "default_allow_broadcast")]
     pub allow_broadcast: bool,
     /// Etherscan-compatible API base URL (optional).
