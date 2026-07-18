@@ -51,6 +51,7 @@ use bloom_tx::{
 use qrcode::QrCode;
 use qrcode::render::svg;
 use qrcode::types::Color as QrColor;
+use serde::Deserialize;
 
 use crate::auth::AuthServices;
 use crate::handler::{Entry, Handler, HandlerError};
@@ -673,6 +674,7 @@ impl WalletsHandler {
         path: &str,
         data: &[u8],
     ) -> Result<(), HandlerError> {
+        self.migrate_legacy_policy_updates(wallet);
         let proposed_policy_toml = std::str::from_utf8(data)
             .map_err(|e| HandlerError::invalid(format!("policy must be UTF-8: {e}")))?;
         let proposed_policy: Policy = toml::from_str(proposed_policy_toml)
@@ -842,6 +844,8 @@ impl WalletsHandler {
             sig_json.to_string().as_bytes(),
         )?;
         write_atomic_file(&wallet_dir.join("policy.toml"), proposed_policy)?;
+        self.fail_superseded_pending_policy_updates(wallet, action_id, proposed_policy)
+            .await;
         let _ = self.policy_update_transition(wallet, action_id, "pending", "confirmed");
         Ok(())
     }
@@ -869,6 +873,47 @@ impl WalletsHandler {
         self.policy_update_state_dir(wallet, state).join(action_id)
     }
 
+    /// Move pre-lifecycle policy-update directories into `pending/` on first
+    /// access. Older releases stored `<action_id>/` directly below
+    /// `policy-updates/`; preserving those directories is necessary for an
+    /// approved retry to find its existing challenge and approval.
+    fn migrate_legacy_policy_updates(&self, wallet: &str) {
+        let root = self.policy_updates_dir(wallet);
+        let Ok(entries) = std::fs::read_dir(&root) else {
+            return;
+        };
+        let pending = self.policy_update_state_dir(wallet, "pending");
+        for entry in entries.flatten() {
+            if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                continue;
+            }
+            let name = entry.file_name();
+            let Some(action_id) = name.to_str() else {
+                continue;
+            };
+            if POLICY_UPDATE_STATES.contains(&action_id)
+                || !action_id.starts_with("policy-update-")
+                || validate_policy_action_id(action_id).is_err()
+            {
+                continue;
+            }
+            let target = pending.join(action_id);
+            if target.exists() {
+                continue;
+            }
+            let result = std::fs::create_dir_all(&pending)
+                .and_then(|()| std::fs::rename(entry.path(), &target));
+            if let Err(error) = result {
+                tracing::warn!(
+                    wallet,
+                    action_id,
+                    error = %error,
+                    "policy_update.legacy_migration_failed"
+                );
+            }
+        }
+    }
+
     /// Atomically move an action between lifecycle states (e.g. `pending` →
     /// `confirmed` once the approved policy is installed). Best-effort: a
     /// failure is logged but never overrides an already-decided install/error
@@ -885,7 +930,17 @@ impl WalletsHandler {
         if !from_dir.exists() {
             return Ok(());
         }
-        std::fs::create_dir_all(self.policy_update_state_dir(wallet, to))?;
+        if let Err(error) = std::fs::create_dir_all(self.policy_update_state_dir(wallet, to)) {
+            tracing::warn!(
+                wallet = wallet,
+                action_id = action_id,
+                from = from,
+                to = to,
+                error = %error,
+                "policy_update.transition_directory_failed"
+            );
+            return Err(error);
+        }
         std::fs::rename(&from_dir, &to_dir).map_err(|e| {
             tracing::warn!(
                 wallet = wallet,
@@ -955,6 +1010,7 @@ impl WalletsHandler {
         state: &str,
         action_id: &str,
     ) -> Result<Vec<u8>, HandlerError> {
+        validate_policy_action_id(action_id)?;
         let path = self
             .policy_update_action_dir(wallet, state, action_id)
             .join(APPROVAL_CHALLENGE_FILE);
@@ -978,6 +1034,7 @@ impl WalletsHandler {
         state: &str,
         action_id: &str,
     ) -> Result<Vec<u8>, HandlerError> {
+        validate_policy_action_id(action_id)?;
         let action_dir = self.policy_update_action_dir(wallet, state, action_id);
         if !action_dir.is_dir() {
             return Err(HandlerError::not_found(format!(
@@ -1032,6 +1089,58 @@ impl WalletsHandler {
         let mut out = serde_json::to_vec_pretty(&body).map_err(err_be)?;
         out.push(b'\n');
         Ok(out)
+    }
+
+    /// Mark older pending actions for the same proposed policy as failed after
+    /// a newer baseline has been approved and installed. Their sealed subjects
+    /// are the authority for the proposed-policy hash; the VFS challenge is
+    /// only used to locate that sealed record.
+    async fn fail_superseded_pending_policy_updates(
+        &self,
+        wallet: &str,
+        current_action_id: &str,
+        proposed_policy: &[u8],
+    ) {
+        let Some(store) = self.auth_services.store() else {
+            return;
+        };
+        let proposed_hash = wallet_policy_hash_hex(proposed_policy);
+        for action_id in self.policy_update_action_ids(wallet, "pending") {
+            if action_id == current_action_id {
+                continue;
+            }
+            let dir = self.policy_update_action_dir(wallet, "pending", &action_id);
+            let Ok(challenge) = read_json::<ApprovalChallenge>(dir.join(APPROVAL_CHALLENGE_FILE))
+            else {
+                continue;
+            };
+            if challenge.wallet != wallet || challenge.action_id != action_id {
+                continue;
+            }
+            let Ok(sealed) = store.sealed_intent(&challenge.intent_hash).await else {
+                continue;
+            };
+            let Some(action) = sealed.action else {
+                continue;
+            };
+            if action.action_id() != action_id
+                || action.wallet() != wallet
+                || action.surface() != WALLET_POLICY_SURFACE
+                || action.envelope.subject_schema != WALLET_POLICY_SUBJECT_SCHEMA
+            {
+                continue;
+            }
+            let Ok(subject_bytes) = B64_STANDARD.decode(&action.envelope.subject_bytes_b64) else {
+                continue;
+            };
+            let Ok(subject) = serde_json::from_slice::<WalletPolicySealedSubject>(&subject_bytes)
+            else {
+                continue;
+            };
+            if subject.proposed_policy_blake3 == proposed_hash {
+                let _ = self.policy_update_transition(wallet, &action_id, "pending", "failed");
+            }
+        }
     }
 
     async fn require_sealed_evm_owner_session_approval(
@@ -1425,6 +1534,11 @@ fn wallet_policy_assurance(before: &Policy, after: &Policy) -> AssuranceLevel {
     } else {
         AssuranceLevel::Standard
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct WalletPolicySealedSubject {
+    proposed_policy_blake3: String,
 }
 
 fn wallet_policy_canonical_envelope(
@@ -1877,6 +1991,7 @@ impl WalletsHandler {
         }
         let wallet = &segs[0];
         let info = self.keystore.info_unverified(wallet).map_err(err_be)?;
+        self.migrate_legacy_policy_updates(wallet);
         if segs.len() == 1 {
             return Ok(Entry::dir(wallet));
         }
@@ -1997,6 +2112,7 @@ impl WalletsHandler {
         }
         let wallet = &segs[0];
         let info = self.keystore.info_unverified(wallet).map_err(err_be)?;
+        self.migrate_legacy_policy_updates(wallet);
         match segs.get(1).map(|s| s.as_str()).unwrap_or("") {
             "address" => {
                 Ok(format!("{}\n", bloom_proto::checksum_address(&info.address)).into_bytes())
@@ -2044,6 +2160,7 @@ impl WalletsHandler {
                     && POLICY_UPDATE_STATES.contains(&segs[2].as_str())
                     && segs[4] == "approval_challenge.json" =>
             {
+                validate_policy_action_id(&segs[3])?;
                 self.read_policy_update_challenge(wallet, &segs[2], &segs[3])
             }
             "policy-updates"
@@ -2051,6 +2168,7 @@ impl WalletsHandler {
                     && POLICY_UPDATE_STATES.contains(&segs[2].as_str())
                     && segs[4] == "status.json" =>
             {
+                validate_policy_action_id(&segs[3])?;
                 self.policy_update_status_json(wallet, &segs[2], &segs[3])
             }
             "capabilities" if segs.len() == 3 && segs[2] == "active.json" => {
@@ -2158,6 +2276,7 @@ impl WalletsHandler {
         }
         let wallet = &segs[0];
         let info = self.keystore.info_unverified(wallet).map_err(err_be)?;
+        self.migrate_legacy_policy_updates(wallet);
         match segs.len() {
             1 => Ok(Self::wallet_dir_entries(info.kind)),
             2 if segs[1] == "chains" => Ok(self
@@ -2188,6 +2307,7 @@ impl WalletsHandler {
             4 if segs[1] == "policy-updates"
                 && POLICY_UPDATE_STATES.contains(&segs[2].as_str()) =>
             {
+                validate_policy_action_id(&segs[3])?;
                 let dir = self.policy_update_action_dir(wallet, &segs[2], &segs[3]);
                 if !dir.is_dir() {
                     return Err(HandlerError::not_found(path.to_string_path()));
@@ -2957,8 +3077,9 @@ mod tests {
     use bloom_auth_api::{
         APPROVAL_CHALLENGE_SCHEMA_V1, APPROVAL_SCHEMA_V1, ApprovalVerifier, AuthApiError,
         AuthEntryRecord, AuthEntryState, AuthStoreView, AuthStoreWriter, DaemonGrantTerms,
-        GrantStore, NonceState, PetalHost, SealedAction, SealedApprovalGrant, SealedPetalContext,
-        SealedSignature, SignerTransport, StandingSessionRecord, WebAuthnAssertionRecord,
+        GrantStore, NonceState, PetalHost, SealedAction, SealedApprovalGrant, SealedIntentRecord,
+        SealedPetalContext, SealedSignature, SignerTransport, StandingSessionRecord,
+        WebAuthnAssertionRecord,
     };
     use bloom_proto::AddressBook;
     use bloom_tx::outbox::Outbox;
@@ -2978,6 +3099,10 @@ mod tests {
 
     struct SigningPetalHost {
         signer: Arc<alloy::signers::local::PrivateKeySigner>,
+    }
+
+    struct StaticPolicyStore {
+        record: SealedIntentRecord,
     }
 
     struct UnusedGrantStore;
@@ -3122,6 +3247,22 @@ mod tests {
     }
 
     struct RejectingVerifier;
+
+    #[async_trait]
+    impl AuthStoreView for StaticPolicyStore {
+        async fn sealed_intent(
+            &self,
+            intent_hash: &str,
+        ) -> Result<bloom_auth_api::SealedIntentRecord, AuthApiError> {
+            if self.record.intent_hash == intent_hash {
+                Ok(self.record.clone())
+            } else {
+                Err(AuthApiError::NotFound(format!(
+                    "sealed intent {intent_hash}"
+                )))
+            }
+        }
+    }
 
     #[async_trait]
     impl ApprovalVerifier for RejectingVerifier {
@@ -4698,6 +4839,25 @@ mod tests {
         }
     }
 
+    fn wallet_policy_challenge_for_action(action: &SealedAction) -> ApprovalChallenge {
+        ApprovalChallenge {
+            schema: APPROVAL_CHALLENGE_SCHEMA_V1.into(),
+            action_id: action.action_id().into(),
+            wallet: action.wallet().into(),
+            surface: action.surface().into(),
+            petal_id: action.petal_id().into(),
+            petal_digest: action.petal_digest().into(),
+            intent_hash: action.intent_hash().unwrap(),
+            server_nonce: "test-nonce".into(),
+            assurance: action.daemon_terms.assurance,
+            daemon_terms_digest: action.daemon_terms_digest().unwrap(),
+            petal_policy_digest: action.petal_policy_digest.clone(),
+            policy_version: action.policy_version,
+            expiry_ms: action.expires_ms,
+            ceremony_url: None,
+        }
+    }
+
     /// Passkey wallet: dir lists `unlock-passkey`, lookup gives writable file,
     /// and `kind` reads "passkey".
     #[tokio::test]
@@ -4939,6 +5099,96 @@ mod tests {
         let status: serde_json::Value = serde_json::from_slice(&status_bytes).unwrap();
         assert_eq!(status["action_id"], second_id);
         assert_eq!(status["state"], "pending");
+    }
+
+    #[tokio::test]
+    async fn wallet_policy_update_migrates_legacy_flat_action_directory() {
+        let f = make_handler();
+        let action_id = "policy-update-legacy";
+        let legacy = f
+            .handler
+            .keystore
+            .root()
+            .join("alice")
+            .join("policy-updates")
+            .join(action_id);
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(legacy.join(APPROVAL_CHALLENGE_FILE), b"{}\n").unwrap();
+
+        let pending = f
+            .handler
+            .list(&VfsPath::parse("/alice/policy-updates/pending").unwrap())
+            .await
+            .unwrap();
+        assert!(pending.iter().any(|entry| entry.name == action_id));
+        assert!(!legacy.exists());
+        assert!(
+            legacy
+                .parent()
+                .unwrap()
+                .join("pending")
+                .join(action_id)
+                .exists()
+        );
+    }
+
+    #[tokio::test]
+    async fn wallet_policy_update_fails_superseded_pending_action_from_sealed_subject() {
+        let mut f = make_handler();
+        let (old_policy, _) = f.handler.keystore.raw_policy("alice").unwrap();
+        let mut proposed: Policy = toml::from_str(&old_policy).unwrap();
+        proposed.denylists.recipients.insert("0xbeef".into());
+        let proposed = toml::to_string_pretty(&proposed).unwrap();
+        let before: Policy = toml::from_str(&old_policy).unwrap();
+        let after: Policy = toml::from_str(&proposed).unwrap();
+        let action = wallet_policy_sealed_action(
+            "alice",
+            "/alice/policy.toml",
+            old_policy.as_bytes(),
+            proposed.as_bytes(),
+            &before,
+            &after,
+            now_ms_u64(),
+        )
+        .unwrap();
+        let challenge = wallet_policy_challenge_for_action(&action);
+        let pending = f
+            .handler
+            .keystore
+            .root()
+            .join("alice")
+            .join("policy-updates")
+            .join("pending")
+            .join(action.action_id());
+        std::fs::create_dir_all(&pending).unwrap();
+        write_json(pending.join(APPROVAL_CHALLENGE_FILE), &challenge).unwrap();
+
+        let store = Arc::new(StaticPolicyStore {
+            record: SealedIntentRecord {
+                intent_hash: challenge.intent_hash.clone(),
+                envelope: action.envelope.clone(),
+                sealed_at_ms: action.created_ms,
+                action: Some(action.clone()),
+            },
+        });
+        f.handler.auth_services = AuthServices::default().with_store(store);
+        f.handler
+            .fail_superseded_pending_policy_updates(
+                "alice",
+                "policy-update-current",
+                proposed.as_bytes(),
+            )
+            .await;
+
+        assert!(!pending.exists());
+        assert!(
+            f.handler
+                .keystore
+                .root()
+                .join("alice/policy-updates/failed")
+                .join(action.action_id())
+                .exists()
+        );
     }
 
     #[tokio::test]

@@ -767,12 +767,16 @@ fn sealed_approval_paths(
     if is_wallet_policy_write(wallet, path) {
         let old_policy = keystore.raw_policy(wallet).ok()?.0;
         let action_id = wallet_policy_action_id(wallet, old_policy.as_bytes(), bytes);
-        let dir = keystore
-            .root()
-            .join(wallet)
-            .join("policy-updates")
-            .join("pending")
-            .join(action_id);
+        let updates = keystore.root().join(wallet).join("policy-updates");
+        let pending_dir = updates.join("pending").join(&action_id);
+        // Releases before the lifecycle layout stored the action directly
+        // below policy-updates/. Keep the local-wallet guard pointed at that
+        // challenge until the VFS handler migrates it into pending/.
+        let dir = if pending_dir.exists() {
+            pending_dir
+        } else {
+            updates.join(action_id)
+        };
         return Some((
             dir.join("approval_challenge.json"),
             dir.join("approval.json"),
