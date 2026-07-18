@@ -141,8 +141,8 @@ impl UpdateChecker {
 
     /// Force a refresh: GET the GitHub endpoint, parse the response,
     /// write the cache file, and update the in-memory snapshot. On
-    /// any error the existing in-memory snapshot is left untouched
-    /// (so a transient blip doesn't downgrade a known-good state).
+    /// error, only the in-memory status is marked as errored; the last
+    /// successful cache entry remains available across restarts.
     pub async fn refresh(&self) -> UpdateSnapshot {
         let new_snapshot = match self.fetch().await {
             Ok(snap) => snap,
@@ -153,9 +153,7 @@ impl UpdateChecker {
                 let mut current = self.snapshot();
                 current.status = UpdateStatus::Error.as_str().to_string();
                 current.error_reason = Some(reason);
-                current.checked_at = Some(std::time::SystemTime::now());
                 *self.inner.snapshot.write() = current.clone();
-                let _ = cache::write(&self.inner.cache_dir, &current);
                 return current;
             }
         };
@@ -435,5 +433,15 @@ mod tests {
         assert_eq!(snap.latest.as_deref(), Some("0.1.5"));
         assert_eq!(snap.status_kind(), UpdateStatus::Error);
         assert_eq!(snap.error_reason.as_deref(), Some("http 404 Not Found"));
+
+        // A failed refresh is transient and must not replace the last
+        // successful cache entry or its successful-refresh timestamp.
+        let cached_after_failure = cache::read(dir.path()).expect("successful cache retained");
+        assert_eq!(cached_after_failure.status_kind(), UpdateStatus::Ok);
+        assert_eq!(cached_after_failure.latest.as_deref(), Some("0.1.5"));
+        assert_eq!(
+            cached_after_failure.checked_at, cached.checked_at,
+            "failed refresh must not rewrite checked_at"
+        );
     }
 }
