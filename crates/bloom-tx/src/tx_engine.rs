@@ -377,13 +377,18 @@ struct TokenMeta {
     decimals: u8,
 }
 
-fn classify_action_kind(body: &RawIntentBody, has_token: bool) -> TxActionKind {
+fn classify_action_kind(
+    body: &RawIntentBody,
+    has_token: bool,
+    destination_is_contract: bool,
+) -> TxActionKind {
     match body {
         RawIntentBody::Send { .. } if has_token => TxActionKind::Erc20Transfer,
         RawIntentBody::Send { data, .. }
-            if data.as_deref().map_or(true, |value| {
-                value.trim().is_empty() || value.trim() == "0x"
-            }) =>
+            if !destination_is_contract
+                && data
+                    .as_deref()
+                    .is_none_or(|value| value.trim().is_empty() || value.trim() == "0x") =>
         {
             TxActionKind::NativeTransfer
         }
@@ -1396,7 +1401,25 @@ impl TxEngine {
         if let Some(check) = funding_check {
             staged_policy_extras.push(check);
         }
-        let action_kind = classify_action_kind(&intent.body, token_for_plan.is_some());
+        let native_destination_is_contract = match &intent.body {
+            RawIntentBody::Send { .. } if token_for_plan.is_none() => {
+                // An unavailable code lookup is treated conservatively: a
+                // native send must not become an autonomous transfer merely
+                // because the RPC could not prove the destination is an EOA.
+                !data_bytes.is_empty()
+                    || session
+                        .code(to)
+                        .await
+                        .map(|code| !code.is_empty())
+                        .unwrap_or(true)
+            }
+            _ => false,
+        };
+        let action_kind = classify_action_kind(
+            &intent.body,
+            token_for_plan.is_some(),
+            native_destination_is_contract,
+        );
         match &intent.body {
             RawIntentBody::Send { .. } => {
                 if let Some(t) = &token_for_plan {
@@ -1411,13 +1434,7 @@ impl TxEngine {
                     policy_ctx.recipient = Some(to);
                     // Native send: if data is non-empty or the destination
                     // has bytecode, treat as contract call.
-                    let data_nonempty = !data_bytes.is_empty();
-                    let to_has_code = session
-                        .code(to)
-                        .await
-                        .map(|c| !c.is_empty())
-                        .unwrap_or(false);
-                    policy_ctx.destination_is_contract = data_nonempty || to_has_code;
+                    policy_ctx.destination_is_contract = native_destination_is_contract;
                     if policy_ctx.destination_is_contract {
                         policy_ctx.contract = Some(to);
                     }
@@ -3864,7 +3881,10 @@ impl TxEngine {
             bumped.data_hex = data_hex;
             bumped.token = token;
             bumped.nft = nft;
-            bumped.action_kind = classify_action_kind(&intent.body, bumped.token.is_some());
+            // Substituted replacements are hard-denied below; classify a
+            // non-token send conservatively because this path does not stage
+            // a fresh destination-code fact.
+            bumped.action_kind = classify_action_kind(&intent.body, bumped.token.is_some(), true);
             // A substituted body is currently hard-denied below. Do not
             // leave the original quote attached to the replacement facts.
             bumped.usd_value = None;
@@ -4951,6 +4971,25 @@ mod tests {
             gas_limit_hint: None,
             usd_value_hint: usd_hint.map(str::to_string),
         }
+    }
+
+    #[test]
+    fn native_send_to_contract_is_not_typed_as_transfer() {
+        let body = RawIntentBody::Send {
+            to: "0x2222222222222222222222222222222222222222".into(),
+            value: "1 eth".into(),
+            token: None,
+            amount: String::new(),
+            data: None,
+        };
+        assert_eq!(
+            classify_action_kind(&body, false, true),
+            TxActionKind::ContractCall
+        );
+        assert_eq!(
+            classify_action_kind(&body, false, false),
+            TxActionKind::NativeTransfer
+        );
     }
 
     #[tokio::test]

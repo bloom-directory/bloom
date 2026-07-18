@@ -662,10 +662,15 @@ impl DefiHandler {
         &self,
         source_chain: &str,
         req: &RouteRequest,
+        route: &RouteResponse,
     ) -> Option<ValuationQuote> {
         let Some(oracle) = &self.price_oracle else {
             return None;
         };
+        if !route.input_matches_request(req) {
+            tracing::warn!(chain = source_chain, "defi.route_input_calldata_mismatch");
+            return None;
+        }
         let (asset_id, amount_base_units) = Self::route_input_valuation_target(source_chain, req);
         let now = now_ms() as u64;
         match oracle.quote_usd(&asset_id, &amount_base_units, now).await {
@@ -846,6 +851,11 @@ impl DefiHandler {
         }
 
         let route = self.enso.route(req.clone()).await.map_err(map_enso_err)?;
+        if !route.input_matches_request(&req) {
+            return Err(HandlerError::invalid(
+                "Enso route transaction input does not match the requested token and amount",
+            ));
+        }
 
         // Build the swap (Raw) intent and, when the source token is an
         // ERC-20 with insufficient allowance to the router, a preceding
@@ -897,7 +907,7 @@ impl DefiHandler {
             .destination_chain
             .clone()
             .unwrap_or_else(|| chain_name.clone());
-        let input_valuation = self.route_input_valuation(&chain_name, &req).await;
+        let input_valuation = self.route_input_valuation(&chain_name, &req, &route).await;
         let route_ctx = self.build_route_ctx(
             wallet,
             &chain_name,
@@ -1060,11 +1070,16 @@ impl DefiHandler {
         // `bloom polymarket fund` command stages through its own validated
         // path and is not affected by `[defi] enabled`.
         if let (Some(req), Some(route)) = (sess.route_request.as_ref(), sess.route.as_ref()) {
+            if !route.input_matches_request(req) {
+                return Err(HandlerError::invalid(
+                    "stored Enso route transaction input does not match the requested token and amount",
+                ));
+            }
             let dest = sess
                 .destination_chain
                 .clone()
                 .unwrap_or_else(|| sess.chain.clone());
-            let input_valuation = self.route_input_valuation(&sess.chain, req).await;
+            let input_valuation = self.route_input_valuation(&sess.chain, req, route).await;
             let ctx = self.build_route_ctx(
                 wallet,
                 &sess.chain,
@@ -1925,29 +1940,27 @@ mod tests {
 
     fn fake_session(wallet: &str, id: &str) -> DefiSession {
         let req = RouteRequest {
-            from_address: Address::ZERO,
-            chain_id: 1,
+            from_address: "0x1111111111111111111111111111111111111111"
+                .parse()
+                .unwrap(),
+            chain_id: 137,
             destination_chain_id: Some(137),
-            token_in: Address::ZERO,
-            token_out: Address::ZERO,
-            amount_in: U256::from(1u64),
+            token_in: "0x3c499c542cef5e3811e1192ce70d8cc03d5c3359"
+                .parse()
+                .unwrap(),
+            token_out: "0xc011a7e12a19f7b1f670d46f03b03f3342e82dfb"
+                .parse()
+                .unwrap(),
+            amount_in: U256::from(5_000_000u64),
             slippage_bps: 50,
             routing_strategy: Some(RoutingStrategy::Router),
             receiver: Some(Address::ZERO),
         };
-        let route = RouteResponse {
-            tx: bloom_defi::RouteTx {
-                from: Address::ZERO,
-                to: Address::ZERO,
-                data: Default::default(),
-                value: U256::ZERO,
-            },
-            amount_out: "1".into(),
-            gas: None,
-            route: serde_json::Value::Null,
-            price_impact: None,
-            destination_chain_id: Some(137),
-        };
+        let mut route: RouteResponse = serde_json::from_str(include_str!(
+            "../../../bloom-defi/tests/fixtures/route_same_chain_receiver_placeholder.json"
+        ))
+        .unwrap();
+        route.destination_chain_id = Some(137);
         let intents = vec![RawIntent {
             body: RawIntentBody::Raw {
                 to: checksum_address(&Address::ZERO),
