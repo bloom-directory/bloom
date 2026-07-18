@@ -31,7 +31,7 @@ use bloom_auth_api::{
     EvmOwnerSigningSessionScope, EvmOwnerSigningSessionUse, EvmSealedActionKind,
     EvmSealedIntentSubject, EvmTokenFact, EvmUnsignedEnvelopeFacts, EvmValueFact, GrantStore,
     NonceState, PetalHost, PetalPolicySnapshot, SealedAction, SignHashRequest, SignedApproval,
-    SigningAttestation, StandingSessionRecord,
+    SigningAttestation, StandingSessionRecord, ValuationPolicy,
 };
 use bloom_evm::{ChainClient, ChainError, IERC20, NftKind};
 
@@ -61,7 +61,7 @@ sol! {
 use bloom_proto::plan::ExecutionOrigin;
 use bloom_proto::{
     AddressBook, ChainSpec, HomeWritePermit, NftAction, NftRef, Policy, RawIntent, RawIntentBody,
-    StagedTx, TokenRef, TxStatus, parse_amount, parse_eth, parse_units,
+    StagedTx, TokenRef, TxActionKind, TxStatus, format_units, parse_amount, parse_eth, parse_units,
 };
 use parking_lot::RwLock;
 use thiserror::Error;
@@ -132,6 +132,8 @@ pub enum TxEngineError {
     ApprovalBackend(String),
     #[error("approval denied: {0}")]
     ApprovalDenied(String),
+    #[error("valuation unavailable: {0}")]
+    ValuationUnavailable(String),
     #[error("not yet implemented: {0}")]
     Unimplemented(String),
     #[error("signer: {0}")]
@@ -373,6 +375,27 @@ struct TokenMeta {
     address: Address,
     symbol: String,
     decimals: u8,
+}
+
+fn classify_action_kind(body: &RawIntentBody, has_token: bool) -> TxActionKind {
+    match body {
+        RawIntentBody::Send { .. } if has_token => TxActionKind::Erc20Transfer,
+        RawIntentBody::Send { data, .. }
+            if data.as_deref().map_or(true, |value| {
+                value.trim().is_empty() || value.trim() == "0x"
+            }) =>
+        {
+            TxActionKind::NativeTransfer
+        }
+        RawIntentBody::Send { .. } => TxActionKind::ContractCall,
+        RawIntentBody::Approve { .. }
+        | RawIntentBody::NftApprove { .. }
+        | RawIntentBody::NftApproveAll { .. } => TxActionKind::Approval,
+        RawIntentBody::NftTransfer { .. } => TxActionKind::NftTransfer,
+        RawIntentBody::Call { .. } | RawIntentBody::Raw { .. } | RawIntentBody::Enso { .. } => {
+            TxActionKind::ContractCall
+        }
+    }
 }
 
 /// Per-(wallet, chain, from) stage-serialisation lock map.
@@ -828,6 +851,7 @@ impl TxEngine {
                         decimals: meta.decimals,
                         recipient: bloom_proto::checksum_address(&to_addr),
                         amount: parsed.number.clone(),
+                        amount_base_units: Some(amount.to_string()),
                     };
                     Ok((token_addr, U256::ZERO, calldata, Some(token_ref), None))
                 }
@@ -1118,6 +1142,67 @@ impl TxEngine {
         execution_origin: Option<ExecutionOrigin>,
         fee_overrides: Option<Eip1559FeeOverrides>,
     ) -> Result<StagedTx, TxEngineError> {
+        self.stage_with_execution_origin_and_fee_overrides_and_valuation_target(
+            permit,
+            wallet,
+            from,
+            intent,
+            chain,
+            policy,
+            address_book,
+            execution_origin,
+            fee_overrides,
+            None,
+        )
+        .await
+    }
+
+    /// Stage a trusted route transaction with an exact oracle binding. The
+    /// caller supplies the encoded input asset and base-unit amount; the
+    /// engine obtains the quote itself so a caller cannot provide a forged USD
+    /// value or bind a quote to different facts.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn stage_with_oracle_valuation_target(
+        &self,
+        permit: &HomeWritePermit,
+        wallet: &str,
+        from: Address,
+        intent: RawIntent,
+        chain: &ChainClient,
+        policy: &Policy,
+        address_book: Option<&AddressBook>,
+        asset_id: String,
+        amount_base_units: String,
+    ) -> Result<StagedTx, TxEngineError> {
+        self.stage_with_execution_origin_and_fee_overrides_and_valuation_target(
+            permit,
+            wallet,
+            from,
+            intent,
+            chain,
+            policy,
+            address_book,
+            None,
+            None,
+            Some((asset_id, amount_base_units)),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn stage_with_execution_origin_and_fee_overrides_and_valuation_target(
+        &self,
+        permit: &HomeWritePermit,
+        wallet: &str,
+        from: Address,
+        intent: RawIntent,
+        chain: &ChainClient,
+        policy: &Policy,
+        address_book: Option<&AddressBook>,
+        execution_origin: Option<ExecutionOrigin>,
+        fee_overrides: Option<Eip1559FeeOverrides>,
+        trusted_valuation_target: Option<(String, String)>,
+    ) -> Result<StagedTx, TxEngineError> {
         if let Some(origin) = &execution_origin {
             origin
                 .validate()
@@ -1311,6 +1396,7 @@ impl TxEngine {
         if let Some(check) = funding_check {
             staged_policy_extras.push(check);
         }
+        let action_kind = classify_action_kind(&intent.body, token_for_plan.is_some());
         match &intent.body {
             RawIntentBody::Send { .. } => {
                 if let Some(t) = &token_for_plan {
@@ -1407,26 +1493,84 @@ impl TxEngine {
             }
             RawIntentBody::Enso { .. } => {}
         }
-        // Only call the oracle when the active policy actually evaluates
-        // a dollar-denominated rule — otherwise we'd add HTTP latency to
-        // every stage for nothing.
-        let needs_usd = policy.caps.per_tx_usd.is_some()
+        // USD valuation is authoritative only when produced by the oracle.
+        // Caller-supplied hints are deliberately ignored: they are not bound
+        // to the encoded asset, amount, or calldata and must never satisfy an
+        // autonomous policy budget.
+        let needs_usd = trusted_valuation_target.is_some()
+            || policy.caps.per_tx_usd.is_some()
             || policy.caps.require_confirm_above_usd.is_some()
-            || policy.caps.per_day_usd.is_some();
-        policy_ctx.usd_value = intent
-            .usd_value_hint
-            .as_deref()
-            .and_then(|s| s.parse::<f64>().ok())
-            .filter(|v| v.is_finite() && *v >= 0.0);
-        if policy_ctx.usd_value.is_none() && needs_usd && value_wei > U256::ZERO {
-            policy_ctx.usd_value = if let Some(oracle) = &self.price_oracle {
-                oracle
-                    .native_usd(&spec.name, value_wei, spec.native_decimals)
+            || policy.caps.per_day_usd.is_some()
+            || matches!(
+                policy.effective_agent_autonomy(),
+                bloom_proto::AgentAutonomyMode::UnderPolicy
+            );
+        let has_trusted_valuation_target = trusted_valuation_target.is_some();
+        let valuation_target = trusted_valuation_target.or_else(|| match action_kind {
+            TxActionKind::NativeTransfer if value_wei > U256::ZERO => {
+                Some((format!("native:{}", spec.name), value_wei.to_string()))
+            }
+            TxActionKind::Erc20Transfer => token_for_plan.as_ref().and_then(|token| {
+                token
+                    .amount_base_units
+                    .clone()
+                    .map(|amount| (format!("{}:{}", spec.name, token.address), amount))
+            }),
+            _ => None,
+        });
+        let valuation = if needs_usd {
+            if let Some((asset_id, amount_base_units)) = valuation_target.as_ref()
+                && let Some(oracle) = &self.price_oracle
+            {
+                match oracle
+                    .quote_usd(asset_id, amount_base_units, now_ms as u64)
                     .await
+                {
+                    Ok(quote)
+                        if quote.asset_id == *asset_id
+                            && quote.amount_base_units == *amount_base_units
+                            && quote.usd_micro >= 0
+                            && quote
+                                .validate_for_authorization(
+                                    &ValuationPolicy::default(),
+                                    now_ms as u64,
+                                )
+                                .is_ok() =>
+                    {
+                        Some(quote)
+                    }
+                    Ok(_) => {
+                        tracing::warn!(
+                            wallet,
+                            chain = %spec.name,
+                            "tx.valuation_oracle_returned_unbound_quote"
+                        );
+                        None
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            wallet,
+                            chain = %spec.name,
+                            error = %error,
+                            "tx.valuation_lookup_failed"
+                        );
+                        None
+                    }
+                }
             } else {
                 None
-            };
+            }
+        } else {
+            None
+        };
+        if has_trusted_valuation_target && valuation.is_none() {
+            return Err(TxEngineError::ValuationUnavailable(
+                "trusted valuation target could not be quoted or validated".into(),
+            ));
         }
+        policy_ctx.usd_value = valuation
+            .as_ref()
+            .map(|quote| quote.usd_micro as f64 / 1_000_000.0);
         // Trailing 24h USD spend across all chains for this wallet.
         // Only consulted when the policy actually has a per_day cap;
         // we still set it whenever a USD rule fires so plan.md / audit
@@ -1455,10 +1599,12 @@ impl TxEngine {
             created_ms: now_ms,
             expires_ms: now_ms + self.stage_ttl_ms,
             status: TxStatus::Pending,
+            action_kind,
             tx_hash: None,
             token: token_for_plan,
             nft: nft_for_plan,
             usd_value: policy_ctx.usd_value,
+            valuation,
             depends_on: None,
             action_id: None,
             execution_origin,
@@ -1587,7 +1733,7 @@ impl TxEngine {
             staged.chain_id,
             &staged.id,
             subject.total_value_usd_micro,
-            subject.value_moving,
+            subject.value_moving && subject.calldata_verified && !subject.authority_change,
             now_ms(),
         ) {
             return Ok(());
@@ -1748,7 +1894,7 @@ impl TxEngine {
             staged.chain_id,
             &staged.id,
             subject.total_value_usd_micro,
-            subject.value_moving,
+            subject.value_moving && subject.calldata_verified && !subject.authority_change,
             now_ms(),
         );
         let unsigned = self.build_unsigned_evm_tx(&staged, chain)?;
@@ -2507,6 +2653,7 @@ impl TxEngine {
             created_ms: now_ms(),
             expires_ms: u128::from(session.expires_ms),
             status: TxStatus::Pending,
+            action_kind: TxActionKind::Erc20Transfer,
             tx_hash: None,
             token: Some(TokenRef {
                 address: bloom_proto::checksum_address(&token_address),
@@ -2514,9 +2661,11 @@ impl TxEngine {
                 decimals: 0,
                 recipient: bloom_proto::checksum_address(&recipient),
                 amount: request.amount_base_units.clone(),
+                amount_base_units: Some(request.amount_base_units.clone()),
             }),
             nft: None,
             usd_value: None,
+            valuation: None,
             depends_on: None,
             action_id: Some(session_id.to_string()),
             execution_origin: None,
@@ -2834,6 +2983,15 @@ impl TxEngine {
             created_ms: now_ms(),
             expires_ms: u128::from(sealed.expires_ms),
             status: TxStatus::Pending,
+            action_kind: if subject.token.is_some() {
+                TxActionKind::Erc20Transfer
+            } else if subject.authority_change {
+                TxActionKind::Approval
+            } else if subject.call.method == "native_transfer" {
+                TxActionKind::NativeTransfer
+            } else {
+                TxActionKind::ContractCall
+            },
             tx_hash: None,
             token: subject.token.as_ref().map(|token| TokenRef {
                 address: token.token_address.clone(),
@@ -2844,13 +3002,20 @@ impl TxEngine {
                     .value
                     .token_amount_base_units
                     .clone()
+                    .and_then(|amount| {
+                        parse_units(&amount, token.decimals)
+                            .ok()
+                            .map(|value| format_units(value, token.decimals))
+                    })
                     .unwrap_or_else(|| "0".into()),
+                amount_base_units: subject.value.token_amount_base_units.clone(),
             }),
             nft: None,
             usd_value: subject
                 .value
                 .valuation_usd_micro
                 .map(|micro| micro as f64 / 1_000_000.0),
+            valuation: subject.value.valuation.clone(),
             depends_on: None,
             action_id: Some(subject.action_id.clone()),
             execution_origin: Some(ExecutionOrigin {
@@ -3511,10 +3676,29 @@ impl TxEngine {
             .trim_start_matches("0x")
             .bytes()
             .any(|b| b != b'0');
-        let value_moving = value_wei > U256::ZERO
-            || staged.token.is_some()
-            || staged.nft.is_some()
-            || data_nonempty;
+        let value_moving = match staged.action_kind {
+            bloom_proto::TxActionKind::NativeTransfer => value_wei > U256::ZERO,
+            bloom_proto::TxActionKind::Erc20Transfer => true,
+            bloom_proto::TxActionKind::Unknown
+            | bloom_proto::TxActionKind::ContractCall
+            | bloom_proto::TxActionKind::Approval
+            | bloom_proto::TxActionKind::NftTransfer => {
+                value_wei > U256::ZERO
+                    || staged.token.is_some()
+                    || staged.nft.is_some()
+                    || data_nonempty
+            }
+        };
+        let calldata_verified = matches!(
+            staged.action_kind,
+            bloom_proto::TxActionKind::NativeTransfer | bloom_proto::TxActionKind::Erc20Transfer
+        );
+        let authority_change = matches!(staged.action_kind, bloom_proto::TxActionKind::Approval);
+        let total_value_usd_micro = staged
+            .valuation
+            .as_ref()
+            .filter(|quote| quote.is_fresh_at(now_ms() as u64))
+            .map(|quote| quote.usd_micro);
         bloom_proto::AuthorizationSubject {
             kind: "evm_tx".into(),
             wallet: staged.wallet.clone(),
@@ -3529,13 +3713,12 @@ impl TxEngine {
                 staged.nonce,
                 staged.id
             ),
-            total_value_usd_micro: staged.usd_value.and_then(f64_to_micro_usd),
+            total_value_usd_micro,
             value_moving,
-            // A staged EVM transaction is byte-immutable: the evaluator is
-            // authorizing the exact to/value/data/nonce persisted in outbox.
-            // DeFi route receiver/min-output verification remains represented
-            // by policy checks attached during staging.
-            calldata_verified: true,
+            // Only the typed native/ERC-20 transfer paths have verified asset
+            // and amount facts. Generic calldata remains review-only.
+            calldata_verified,
+            authority_change,
         }
     }
 
@@ -3681,6 +3864,11 @@ impl TxEngine {
             bumped.data_hex = data_hex;
             bumped.token = token;
             bumped.nft = nft;
+            bumped.action_kind = classify_action_kind(&intent.body, bumped.token.is_some());
+            // A substituted body is currently hard-denied below. Do not
+            // leave the original quote attached to the replacement facts.
+            bumped.usd_value = None;
+            bumped.valuation = None;
             bumped.policy_checks.push(bloom_proto::PolicyCheck::hard(
                 "replacement.substitute",
                 bloom_proto::PolicyOutcome::Deny,
@@ -4100,6 +4288,7 @@ fn evm_owner_session_sealed_subject(
             native_value_wei: "0".into(),
             token_amount_base_units: Some(request.amount_base_units.clone()),
             valuation_usd_micro: None,
+            valuation: None,
         },
         token,
         nonce_intent: EvmNonceIntent {
@@ -4152,24 +4341,44 @@ fn evm_sealed_subject(
         symbol: t.symbol.clone(),
         decimals: t.decimals,
     });
-    let recipient = staged
-        .token
-        .as_ref()
-        .map(|t| t.recipient.clone())
-        .or_else(|| (staged.to != "0x").then(|| staged.to.clone()));
-    let token_amount_base_units = staged
-        .token
-        .as_ref()
-        .map(|t| {
-            parse_units(&t.amount, t.decimals)
-                .map(|amount| amount.to_string())
-                .map_err(|e| TxEngineError::Amount(format!("token amount: {e}")))
-        })
-        .transpose()?;
-    let method = if staged.token.is_some() {
-        bloom_auth_api::EVM_ERC20_TRANSFER_METHOD
+    let approval = matches!(staged.action_kind, TxActionKind::Approval);
+    // Approval facts are deliberately kept separate from transfer metadata:
+    // `to` is the token contract, `recipient` is the spender, and the token
+    // amount field binds the exact allowance (including uint256 max).
+    let recipient = if approval {
+        decode_approve_spender(&calldata).map(|spender| bloom_proto::checksum_address(&spender))
     } else {
-        "native_transfer"
+        staged
+            .token
+            .as_ref()
+            .map(|t| t.recipient.clone())
+            .or_else(|| (staged.to != "0x").then(|| staged.to.clone()))
+    };
+    let token_amount_base_units = if approval {
+        decode_approve_amount(&calldata).map(|amount| amount.to_string())
+    } else {
+        staged
+            .token
+            .as_ref()
+            .map(|t| {
+                t.amount_base_units
+                    .as_deref()
+                    .map_or_else(
+                        || parse_units(&t.amount, t.decimals),
+                        |amount| parse_units(amount, 0),
+                    )
+                    .map(|amount| amount.to_string())
+                    .map_err(|e| TxEngineError::Amount(format!("token amount: {e}")))
+            })
+            .transpose()?
+    };
+    let method = match staged.action_kind {
+        TxActionKind::NativeTransfer => "native_transfer",
+        TxActionKind::Erc20Transfer => bloom_auth_api::EVM_ERC20_TRANSFER_METHOD,
+        TxActionKind::Approval => "approval",
+        TxActionKind::NftTransfer => "nft_transfer",
+        TxActionKind::ContractCall => "contract_call",
+        TxActionKind::Unknown => "unknown",
     };
     let mut terms = DaemonGrantTerms::minimal(AssuranceLevel::Standard);
     terms.allowed_sign_intents = vec![bloom_auth_api::EVM_TX_SIGN_INTENT.into()];
@@ -4250,7 +4459,8 @@ fn evm_sealed_subject(
         value: EvmValueFact {
             native_value_wei: staged.value_wei.clone(),
             token_amount_base_units,
-            valuation_usd_micro: staged.usd_value.and_then(f64_to_micro_usd),
+            valuation_usd_micro: staged.valuation.as_ref().map(|quote| quote.usd_micro),
+            valuation: staged.valuation.clone(),
         },
         token,
         nonce_intent: EvmNonceIntent {
@@ -4283,7 +4493,7 @@ fn evm_sealed_subject(
         policy_snapshot,
         daemon_terms: terms,
         daemon_terms_digest,
-        authority_change: false,
+        authority_change: matches!(staged.action_kind, TxActionKind::Approval),
     })
 }
 
@@ -4360,6 +4570,15 @@ fn decode_approve_spender(data: &[u8]) -> Option<Address> {
             None
         }
     }
+}
+
+/// Pull the exact allowance out of an `approve(address,uint256)` calldata
+/// blob. Failure is intentionally represented as `None`; the sealed subject
+/// then remains review-only without inventing an approval amount.
+fn decode_approve_amount(data: &[u8]) -> Option<U256> {
+    IERC20::approveCall::abi_decode(data)
+        .ok()
+        .map(|call| call.amount)
 }
 
 /// Pull the recipient out of an NFT transfer calldata blob. Tries the
@@ -4494,6 +4713,582 @@ mod tests {
         TEST_SIGNER_PK
             .parse()
             .expect("valid deterministic test key")
+    }
+
+    #[derive(Clone)]
+    struct RecordingOracle {
+        calls: Arc<parking_lot::Mutex<Vec<(String, String)>>>,
+        usd_micro: i128,
+        age_ms: u64,
+        max_age_ms: u64,
+    }
+
+    #[async_trait::async_trait]
+    impl bloom_auth_api::PriceOracle for RecordingOracle {
+        async fn quote_usd(
+            &self,
+            asset_id: &str,
+            amount_base_units: &str,
+            now_ms: u64,
+        ) -> Result<bloom_auth_api::ValuationQuote, bloom_auth_api::AuthApiError> {
+            self.calls
+                .lock()
+                .push((asset_id.to_string(), amount_base_units.to_string()));
+            let fetched_at_ms = now_ms.saturating_sub(self.age_ms).max(1);
+            Ok(bloom_auth_api::ValuationQuote {
+                asset_id: asset_id.to_string(),
+                amount_base_units: amount_base_units.to_string(),
+                usd_micro: self.usd_micro,
+                source: "test-oracle".into(),
+                quote_timestamp_ms: fetched_at_ms,
+                fetched_at_ms,
+                max_age_ms: self.max_age_ms,
+                confidence_ppm: None,
+                stablecoin_assumption: false,
+            })
+        }
+    }
+
+    /// A small JSON-RPC fixture for stage() tests. Keeping this local to the
+    /// tx crate makes the valuation tests independent of a running node and
+    /// exercises the complete chain/session/nonce/gas/balance path.
+    async fn spawn_stage_rpc(include_code: bool) -> String {
+        use std::net::SocketAddr;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr: SocketAddr = listener.local_addr().unwrap();
+        let responses = Arc::new(parking_lot::Mutex::new(stage_rpc_responses(include_code)));
+        tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = match listener.accept().await {
+                    Ok(pair) => pair,
+                    Err(_) => break,
+                };
+                let responses = responses.clone();
+                tokio::spawn(async move {
+                    let mut bytes = Vec::with_capacity(16 * 1024);
+                    let mut chunk = [0u8; 4096];
+                    let body = loop {
+                        let read = match socket.read(&mut chunk).await {
+                            Ok(0) => return,
+                            Ok(read) => read,
+                            Err(_) => return,
+                        };
+                        bytes.extend_from_slice(&chunk[..read]);
+                        let Some(header_end) = bytes.windows(4).position(|w| w == b"\r\n\r\n")
+                        else {
+                            continue;
+                        };
+                        let headers = String::from_utf8_lossy(&bytes[..header_end]);
+                        let content_length = headers
+                            .lines()
+                            .find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                name.trim()
+                                    .eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse::<usize>().ok())
+                                    .flatten()
+                            })
+                            .unwrap_or(0);
+                        let body_start = header_end + 4;
+                        while bytes.len() < body_start + content_length {
+                            let read = match socket.read(&mut chunk).await {
+                                Ok(0) => return,
+                                Ok(read) => read,
+                                Err(_) => return,
+                            };
+                            bytes.extend_from_slice(&chunk[..read]);
+                        }
+                        break String::from_utf8_lossy(
+                            &bytes[body_start..body_start + content_length],
+                        )
+                        .to_string();
+                    };
+
+                    let request: serde_json::Value =
+                        serde_json::from_str(&body).unwrap_or(serde_json::Value::Null);
+                    let id = request.get("id").cloned().unwrap_or(serde_json::json!(1));
+                    let method = request
+                        .get("method")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("")
+                        .to_string();
+                    let result = responses.lock().get_mut(&method).and_then(|queue| {
+                        if queue.is_empty() {
+                            None
+                        } else {
+                            Some(queue.remove(0))
+                        }
+                    });
+                    let response_body = match result {
+                        Some(result) => format!(
+                            "{{\"jsonrpc\":\"2.0\",\"id\":{},\"result\":{}}}",
+                            serde_json::to_string(&id).unwrap(),
+                            result
+                        ),
+                        None => format!(
+                            "{{\"jsonrpc\":\"2.0\",\"id\":{},\"error\":{{\"code\":-32601,\"message\":\"unmocked method: {}\"}}}}",
+                            serde_json::to_string(&id).unwrap(),
+                            method
+                        ),
+                    };
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        response_body.len(),
+                        response_body
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    fn stage_rpc_responses(include_code: bool) -> HashMap<String, Vec<String>> {
+        let zero32 = format!("0x{}", "00".repeat(32));
+        let zero8 = "0x0000000000000000";
+        let zero_addr = format!("0x{}", "00".repeat(20));
+        let zero_bloom = format!("0x{}", "00".repeat(256));
+        let block = serde_json::json!({
+            "number": "0x64",
+            "hash": format!("0x{}", "11".repeat(32)),
+            "parentHash": zero32,
+            "sha3Uncles": zero32,
+            "logsBloom": zero_bloom,
+            "transactionsRoot": zero32,
+            "stateRoot": zero32,
+            "receiptsRoot": zero32,
+            "miner": zero_addr,
+            "difficulty": "0x0",
+            "totalDifficulty": "0x0",
+            "extraData": "0x",
+            "size": "0x0",
+            "gasLimit": "0x0",
+            "gasUsed": "0x0",
+            "timestamp": "0x0",
+            "uncles": [],
+            "transactions": [],
+            "mixHash": zero32,
+            "nonce": zero8,
+            "baseFeePerGas": "0x0"
+        })
+        .to_string();
+        let mut responses = HashMap::from([
+            ("eth_chainId".into(), vec!["\"0x7a69\"".into()]),
+            ("eth_getBlockByNumber".into(), vec![block]),
+            ("eth_getTransactionCount".into(), vec!["\"0x0\"".into()]),
+            ("eth_gasPrice".into(), vec!["\"0x3b9aca00\"".into()]),
+            ("eth_estimateGas".into(), vec!["\"0x5208\"".into()]),
+            (
+                "eth_getBalance".into(),
+                vec!["\"0x3635c9adc5dea00000\"".into()],
+            ),
+        ]);
+        if include_code {
+            responses.insert("eth_getCode".into(), vec!["\"0x\"".into()]);
+        }
+        responses
+    }
+
+    fn stage_chain(url: &str) -> ChainClient {
+        let spec = ChainSpec {
+            name: "anvil".into(),
+            chain_id: 31337,
+            rpc_urls: vec![url.into()],
+            rpc_endpoints: Vec::new(),
+            allow_broadcast: true,
+            etherscan_api_url: None,
+            display_name: None,
+            native_symbol: "ETH".into(),
+            native_decimals: 18,
+            legacy_tx: false,
+            op_stack: false,
+        };
+        ChainClient::new(spec).unwrap()
+    }
+
+    fn stage_fixture(
+        url: &str,
+        oracle: RecordingOracle,
+    ) -> (TxEngine, tempfile::TempDir, HomeWritePermit, ChainClient) {
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = crate::outbox::Outbox::new(dir.path().join("outbox")).unwrap();
+        let engine = TxEngine::new(outbox, 60_000, false).with_price_oracle(Arc::new(oracle));
+        let permit = permit_for(&dir);
+        let chain = stage_chain(url);
+        (engine, dir, permit, chain)
+    }
+
+    fn policy_with_usd_cap() -> Policy {
+        let mut policy = Policy::default();
+        policy.caps.per_tx_usd = Some(10_000.0);
+        policy
+    }
+
+    fn under_policy_with_usd_limits() -> Policy {
+        let mut policy = policy_with_usd_cap();
+        policy.approval.agent_autonomy = Some(bloom_proto::AgentAutonomyMode::UnderPolicy);
+        policy.limits.max_tx_usd = Some("100".into());
+        policy.limits.max_day_usd = Some("100".into());
+        policy
+    }
+
+    fn native_intent(value: &str, usd_hint: Option<&str>) -> RawIntent {
+        RawIntent {
+            body: RawIntentBody::Send {
+                to: "0x2222222222222222222222222222222222222222".into(),
+                value: value.into(),
+                token: None,
+                amount: String::new(),
+                data: None,
+            },
+            chain: Some("anvil".into()),
+            gas: bloom_proto::intent::GasStrategy::Auto,
+            nonce: None,
+            gas_limit_hint: None,
+            usd_value_hint: usd_hint.map(str::to_string),
+        }
+    }
+
+    #[tokio::test]
+    async fn stage_native_transfer_uses_bound_oracle_value_not_hint() {
+        let url = spawn_stage_rpc(true).await;
+        let oracle = RecordingOracle {
+            calls: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            usd_micro: 42_000_000,
+            age_ms: 0,
+            max_age_ms: 60_000,
+        };
+        let calls = oracle.calls.clone();
+        let (engine, _dir, permit, chain) = stage_fixture(&url, oracle);
+        let staged = engine
+            .stage(
+                &permit,
+                "alice",
+                "0x1111111111111111111111111111111111111111"
+                    .parse()
+                    .unwrap(),
+                native_intent("1 eth", Some("999999")),
+                &chain,
+                &policy_with_usd_cap(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(staged.action_kind, TxActionKind::NativeTransfer);
+        assert_eq!(staged.value_wei, "1000000000000000000");
+        assert_eq!(staged.usd_value, Some(42.0));
+        let quote = staged.valuation.as_ref().unwrap();
+        assert_eq!(quote.asset_id, "native:anvil");
+        assert_eq!(quote.amount_base_units, "1000000000000000000");
+        assert_eq!(quote.usd_micro, 42_000_000);
+        assert_eq!(
+            calls.lock().as_slice(),
+            &[("native:anvil".into(), "1000000000000000000".into())]
+        );
+    }
+
+    #[tokio::test]
+    async fn stage_erc20_transfer_uses_exact_base_units_for_oracle() {
+        let url = spawn_stage_rpc(false).await;
+        let oracle = RecordingOracle {
+            calls: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            usd_micro: 1_250_000,
+            age_ms: 0,
+            max_age_ms: 60_000,
+        };
+        let calls = oracle.calls.clone();
+        let (engine, _dir, permit, chain) = stage_fixture(&url, oracle);
+        let token_addr: Address = "0x1111111111111111111111111111111111111111"
+            .parse()
+            .unwrap();
+        engine.token_cache.write().insert(
+            (31337, token_addr),
+            TokenMeta {
+                address: token_addr,
+                symbol: "USDC".into(),
+                decimals: 6,
+            },
+        );
+        let intent = RawIntent {
+            body: RawIntentBody::Send {
+                to: "0x2222222222222222222222222222222222222222".into(),
+                value: String::new(),
+                token: Some(token_addr.to_string()),
+                amount: "1.25 usdc".into(),
+                data: None,
+            },
+            chain: Some("anvil".into()),
+            gas: bloom_proto::intent::GasStrategy::Auto,
+            nonce: None,
+            gas_limit_hint: None,
+            usd_value_hint: None,
+        };
+        let staged = engine
+            .stage(
+                &permit,
+                "alice",
+                "0x3333333333333333333333333333333333333333"
+                    .parse()
+                    .unwrap(),
+                intent,
+                &chain,
+                &policy_with_usd_cap(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(staged.action_kind, TxActionKind::Erc20Transfer);
+        let token = staged.token.as_ref().unwrap();
+        assert_eq!(token.amount, "1.25");
+        assert_eq!(token.amount_base_units.as_deref(), Some("1250000"));
+        let quote = staged.valuation.as_ref().unwrap();
+        assert_eq!(quote.asset_id, format!("anvil:{}", token.address));
+        assert_eq!(quote.amount_base_units, "1250000");
+        let subject = engine.authorization_subject(&staged);
+        assert!(subject.calldata_verified);
+        assert_eq!(subject.total_value_usd_micro, Some(1_250_000));
+        assert_eq!(calls.lock().len(), 1);
+        assert_eq!(calls.lock()[0].1, "1250000");
+    }
+
+    #[tokio::test]
+    async fn fresh_native_valuation_can_satisfy_under_policy_authorization() {
+        let url = spawn_stage_rpc(true).await;
+        let oracle = RecordingOracle {
+            calls: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            usd_micro: 42_000_000,
+            age_ms: 0,
+            max_age_ms: 60_000,
+        };
+        let (engine, _dir, permit, chain) = stage_fixture(&url, oracle);
+        let policy = under_policy_with_usd_limits();
+        let staged = engine
+            .stage(
+                &permit,
+                "alice",
+                "0x1111111111111111111111111111111111111111"
+                    .parse()
+                    .unwrap(),
+                native_intent("1 eth", None),
+                &chain,
+                &policy,
+                None,
+            )
+            .await
+            .unwrap();
+        let subject = engine.authorization_subject(&staged);
+        let decision = bloom_proto::evaluate_action_authorization(
+            &policy,
+            &staged.policy_checks,
+            &subject,
+            Some(&bloom_proto::BudgetSnapshot {
+                spent_day_micro_usd: 0,
+                spent_week_micro_usd: 0,
+                spent_month_micro_usd: 0,
+            }),
+            None,
+            bloom_proto::AuthorizationSurface::Cli,
+        );
+        assert!(matches!(
+            decision,
+            bloom_proto::AutonomyDecision::ApprovedAutonomous {
+                debit_micro_usd: 42_000_000,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn stage_discards_stale_oracle_quote() {
+        let url = spawn_stage_rpc(true).await;
+        let oracle = RecordingOracle {
+            calls: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            usd_micro: 42_000_000,
+            age_ms: 10_000,
+            max_age_ms: 100,
+        };
+        let (engine, _dir, permit, chain) = stage_fixture(&url, oracle);
+        let staged = engine
+            .stage(
+                &permit,
+                "alice",
+                "0x1111111111111111111111111111111111111111"
+                    .parse()
+                    .unwrap(),
+                native_intent("1 eth", None),
+                &chain,
+                &policy_with_usd_cap(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(staged.valuation.is_none());
+        assert!(staged.usd_value.is_none());
+        let policy = under_policy_with_usd_limits();
+        let subject = engine.authorization_subject(&staged);
+        let decision = bloom_proto::evaluate_action_authorization(
+            &policy,
+            &staged.policy_checks,
+            &subject,
+            Some(&bloom_proto::BudgetSnapshot {
+                spent_day_micro_usd: 0,
+                spent_week_micro_usd: 0,
+                spent_month_micro_usd: 0,
+            }),
+            None,
+            bloom_proto::AuthorizationSurface::Cli,
+        );
+        assert!(!matches!(
+            decision,
+            bloom_proto::AutonomyDecision::ApprovedAutonomous { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn stage_does_not_value_generic_calldata() {
+        let url = spawn_stage_rpc(false).await;
+        let oracle = RecordingOracle {
+            calls: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            usd_micro: 42_000_000,
+            age_ms: 0,
+            max_age_ms: 60_000,
+        };
+        let calls = oracle.calls.clone();
+        let (engine, _dir, permit, chain) = stage_fixture(&url, oracle);
+        let intent = RawIntent {
+            body: RawIntentBody::Raw {
+                to: "0x2222222222222222222222222222222222222222".into(),
+                value: String::new(),
+                data: "0x12345678".into(),
+            },
+            chain: Some("anvil".into()),
+            gas: bloom_proto::intent::GasStrategy::Auto,
+            nonce: None,
+            gas_limit_hint: None,
+            usd_value_hint: Some("999999".into()),
+        };
+        let staged = engine
+            .stage(
+                &permit,
+                "alice",
+                "0x1111111111111111111111111111111111111111"
+                    .parse()
+                    .unwrap(),
+                intent,
+                &chain,
+                &policy_with_usd_cap(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(staged.action_kind, TxActionKind::ContractCall);
+        assert!(staged.valuation.is_none());
+        assert!(calls.lock().is_empty());
+        assert!(!engine.authorization_subject(&staged).calldata_verified);
+    }
+
+    #[tokio::test]
+    async fn stage_enso_route_values_exact_input_without_trusting_hint() {
+        let url = spawn_stage_rpc(false).await;
+        let oracle = RecordingOracle {
+            calls: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            usd_micro: 7_500_000,
+            age_ms: 0,
+            max_age_ms: 60_000,
+        };
+        let calls = oracle.calls.clone();
+        let (engine, _dir, permit, chain) = stage_fixture(&url, oracle);
+        let intent = RawIntent {
+            body: RawIntentBody::Raw {
+                to: "0x2222222222222222222222222222222222222222".into(),
+                value: "0".into(),
+                data: "0x12345678".into(),
+            },
+            chain: Some("anvil".into()),
+            gas: bloom_proto::intent::GasStrategy::Auto,
+            nonce: None,
+            gas_limit_hint: None,
+            usd_value_hint: Some("999999".into()),
+        };
+        let staged = engine
+            .stage_with_oracle_valuation_target(
+                &permit,
+                "alice",
+                "0x1111111111111111111111111111111111111111"
+                    .parse()
+                    .unwrap(),
+                intent,
+                &chain,
+                &policy_with_usd_cap(),
+                None,
+                "anvil:0x1111111111111111111111111111111111111111".into(),
+                "1250000".into(),
+            )
+            .await
+            .unwrap();
+
+        let quote = staged.valuation.as_ref().unwrap();
+        assert_eq!(
+            quote.asset_id,
+            "anvil:0x1111111111111111111111111111111111111111"
+        );
+        assert_eq!(quote.amount_base_units, "1250000");
+        assert_eq!(quote.usd_micro, 7_500_000);
+        assert!(!engine.authorization_subject(&staged).calldata_verified);
+        assert_eq!(
+            calls.lock().as_slice(),
+            &[(
+                "anvil:0x1111111111111111111111111111111111111111".into(),
+                "1250000".into(),
+            )]
+        );
+    }
+
+    #[test]
+    fn approval_sealed_subject_binds_token_spender_and_allowance() {
+        let (engine, _spec, _dir) = fake_engine(60_000);
+        let token: Address = "0x1111111111111111111111111111111111111111"
+            .parse()
+            .unwrap();
+        let spender: Address = "0x2222222222222222222222222222222222222222"
+            .parse()
+            .unwrap();
+        let amount = U256::from(123_456u64);
+        let mut staged = fake_staged_1559("approval-facts");
+        staged.to = bloom_proto::checksum_address(&token);
+        staged.data_hex = format!(
+            "0x{}",
+            hex::encode(IERC20::approveCall { spender, amount }.abi_encode())
+        );
+        staged.action_kind = TxActionKind::Approval;
+
+        let subject =
+            evm_sealed_subject(&staged, EvmOutboxActionKind::Confirm, &test_signing_hash())
+                .unwrap();
+        assert_eq!(subject.call.method, "approval");
+        assert_eq!(subject.call.to, bloom_proto::checksum_address(&token));
+        assert_eq!(
+            subject.call.recipient.as_deref(),
+            Some(bloom_proto::checksum_address(&spender).as_str())
+        );
+        assert_eq!(
+            subject.value.token_amount_base_units.as_deref(),
+            Some("123456")
+        );
+        assert!(subject.authority_change);
+
+        let auth = engine.authorization_subject(&staged);
+        assert!(auth.authority_change);
+        assert!(!auth.calldata_verified);
+        assert!(auth.total_value_usd_micro.is_none());
     }
 
     fn fake_grant(
@@ -4889,10 +5684,12 @@ mod tests {
             created_ms: 0,
             expires_ms: 0,
             status: TxStatus::Pending,
+            action_kind: TxActionKind::Unknown,
             tx_hash: None,
             token: None,
             nft: None,
             usd_value: None,
+            valuation: None,
             depends_on: None,
             action_id: None,
             execution_origin: None,
@@ -4961,12 +5758,14 @@ mod tests {
         staged.value_wei = "42".into();
         staged.data_hex = "0xa9059cbb".into();
         staged.usd_value = Some(1.25);
+        staged.action_kind = TxActionKind::Erc20Transfer;
         staged.token = Some(bloom_proto::TokenRef {
             address: "0x0000000000000000000000000000000000000003".into(),
             symbol: "USDC".into(),
             decimals: 6,
             recipient: "0x0000000000000000000000000000000000000002".into(),
             amount: "1.25".into(),
+            amount_base_units: Some("1250000".into()),
         });
 
         let envelope =
@@ -5005,7 +5804,9 @@ mod tests {
         assert_eq!(subject["chain_id"], 31337);
         assert_eq!(subject["call"]["to"], staged.to);
         assert_eq!(subject["value"]["native_value_wei"], "42");
+        assert_eq!(subject["value"]["token_amount_base_units"], "1250000");
         assert_eq!(subject["call"]["calldata_hex"], "0xa9059cbb");
+        assert_eq!(subject["call"]["method"], "erc20_transfer");
         assert_eq!(subject["token"]["symbol"], "USDC");
     }
 
@@ -5038,6 +5839,7 @@ mod tests {
                 decimals: 6,
                 recipient: "0x0000000000000000000000000000000000000002".into(),
                 amount: "0.000001".into(),
+                amount_base_units: Some("1".into()),
             })
         });
         assert_outbox_intent_hash_changes("policy_checks", |s| {
@@ -5646,8 +6448,21 @@ mod tests {
         let policy = bloom_proto::Policy::default();
 
         let mut staged = fake_staged_1559("0001-session-attempt");
+        staged.value_wei = "1".into();
         staged.expires_ms = now_ms() + 60_000;
         staged.usd_value = Some(2.0);
+        staged.action_kind = TxActionKind::NativeTransfer;
+        staged.valuation = Some(bloom_auth_api::ValuationQuote {
+            asset_id: "native:anvil".into(),
+            amount_base_units: "1".into(),
+            usd_micro: 2_000_000,
+            source: "test".into(),
+            quote_timestamp_ms: now_ms() as u64,
+            fetched_at_ms: now_ms() as u64,
+            max_age_ms: 60_000,
+            confidence_ppm: None,
+            stablecoin_assumption: false,
+        });
         engine.outbox.write_pending(&staged, "p").unwrap();
         engine.session_store.mint(crate::session::ActiveSession {
             id: "session-attempt".into(),
@@ -6619,6 +7434,7 @@ mod tests {
 
         let mut no_usd = fake_staged_1559("0001-no-usd");
         no_usd.value_wei = "1".into();
+        no_usd.action_kind = TxActionKind::NativeTransfer;
         no_usd.expires_ms = now_ms() + 60_000;
         engine.outbox.write_pending(&no_usd, "p").unwrap();
 
@@ -6641,6 +7457,18 @@ mod tests {
         let mut priced = fake_staged_1559("0002-priced");
         priced.value_wei = "1".into();
         priced.usd_value = Some(2.0);
+        priced.action_kind = TxActionKind::NativeTransfer;
+        priced.valuation = Some(bloom_auth_api::ValuationQuote {
+            asset_id: "native:anvil".into(),
+            amount_base_units: "1".into(),
+            usd_micro: 2_000_000,
+            source: "test".into(),
+            quote_timestamp_ms: now_ms() as u64,
+            fetched_at_ms: now_ms() as u64,
+            max_age_ms: 60_000,
+            confidence_ppm: None,
+            stablecoin_assumption: false,
+        });
         priced.expires_ms = now_ms() + 60_000;
         engine.outbox.write_pending(&priced, "p").unwrap();
 
@@ -6863,6 +7691,51 @@ mod tests {
         assert_eq!(f64_to_micro_usd(0.0), Some(0));
         assert_eq!(f64_to_micro_usd(1.0), Some(1_000_000));
         assert_eq!(f64_to_micro_usd(1.5), Some(1_500_000));
+    }
+
+    #[test]
+    fn authorization_subject_requires_verified_typed_transfer_kind() {
+        let (engine, _spec, _dir) = fake_engine(60_000);
+        let mut native = fake_staged_1559("typed-native");
+        native.value_wei = "1".into();
+        native.action_kind = TxActionKind::NativeTransfer;
+        native.valuation = Some(bloom_auth_api::ValuationQuote {
+            asset_id: "native:anvil".into(),
+            amount_base_units: "1".into(),
+            usd_micro: 1_000_000,
+            source: "test".into(),
+            quote_timestamp_ms: now_ms() as u64,
+            fetched_at_ms: now_ms() as u64,
+            max_age_ms: 60_000,
+            confidence_ppm: None,
+            stablecoin_assumption: false,
+        });
+        let subject = engine.authorization_subject(&native);
+        assert!(subject.value_moving);
+        assert!(subject.calldata_verified);
+        assert_eq!(subject.total_value_usd_micro, Some(1_000_000));
+
+        let mut raw = native;
+        raw.action_kind = TxActionKind::ContractCall;
+        raw.data_hex = "0xdeadbeef".into();
+        let subject = engine.authorization_subject(&raw);
+        assert!(subject.value_moving);
+        assert!(!subject.calldata_verified);
+        assert_eq!(subject.total_value_usd_micro, Some(1_000_000));
+    }
+
+    #[test]
+    fn legacy_usd_value_is_not_resealed_as_authoritative_valuation() {
+        let mut staged = fake_staged_1559("legacy-usd");
+        staged.action_kind = TxActionKind::NativeTransfer;
+        staged.value_wei = "1".into();
+        staged.usd_value = Some(999_999.0);
+
+        let subject =
+            evm_sealed_subject(&staged, EvmOutboxActionKind::Confirm, &test_signing_hash())
+                .unwrap();
+        assert_eq!(subject.value.valuation_usd_micro, None);
+        assert_eq!(subject.value.valuation, None);
     }
 
     #[test]

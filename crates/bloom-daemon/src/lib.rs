@@ -60,6 +60,7 @@ use bloom_revert::{
     AbiSource, BuiltinDecoder, DecoderChain, EtherscanAbiDecoder, EtherscanAbiSource,
     OpenchainDecoder, boxed,
 };
+use bloom_tx::DynPriceOracle;
 use bloom_tx::outbox::{CentralActionIdentity, CentralOutboxProjection, Outbox, OutboxState};
 use bloom_tx::tx_engine::{Eip1559FeeOverrides, TxEngine};
 use bloom_vfs::handlers::outbox::StagedPetalIdentity;
@@ -2035,8 +2036,9 @@ impl Daemon {
         // Wire the prices client into the policy USD-cap path. The trait
         // lives in bloom-tx; the adapter is in this crate so bloom-tx
         // doesn't pull reqwest+rustls.
-        tx_engine =
-            tx_engine.with_price_oracle(Arc::new(price_oracle::PricesOracle::new(prices.clone())));
+        let price_oracle: DynPriceOracle =
+            Arc::new(price_oracle::PricesOracle::new(prices.clone()));
+        tx_engine = tx_engine.with_price_oracle(price_oracle.clone());
 
         // Wire mempool indexes into TxEngine (drives nonce-conflict
         // checks + cancel.tx targeting). Done before private-RPC
@@ -2359,6 +2361,7 @@ impl Daemon {
                         address_book_arc.clone(),
                     )
                     .with_auth_services(auth_services.clone())
+                    .with_price_oracle(price_oracle.clone())
                     .with_home_write_permit_opt(home_write_permit.clone())
                     .with_default_chain(config.default_chain.clone())
                     .with_store_root(home.root().join("defi"))
@@ -3478,10 +3481,12 @@ mod tests {
             created_ms: 1,
             expires_ms: u128::MAX,
             status: bloom_proto::TxStatus::Pending,
+            action_kind: bloom_proto::TxActionKind::Unknown,
             tx_hash: Some(tx_hash.clone()),
             token: None,
             nft: None,
             usd_value: None,
+            valuation: None,
             depends_on: None,
             action_id: None,
             execution_origin: Some(DaemonPetalHost::petal_execution_origin(&context).unwrap()),
@@ -3797,10 +3802,12 @@ ws_url = "wss://example.invalid"
             created_ms: 0,
             expires_ms: 1,
             status: bloom_proto::TxStatus::Pending,
+            action_kind: bloom_proto::TxActionKind::Unknown,
             tx_hash: None,
             token: None,
             nft: None,
             usd_value: None,
+            valuation: None,
             depends_on: None,
             action_id: None,
             execution_origin: None,

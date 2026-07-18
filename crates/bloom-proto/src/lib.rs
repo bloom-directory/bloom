@@ -50,7 +50,7 @@ pub use hyperliquid_session::{BreachAction, HyperliquidSession, SessionStatus};
 pub use intent::{
     EnsoIntent, GasStrategy, RawIntent, RawIntentBody, ShellIntent, TxIntent, ValueOrToken,
 };
-pub use plan::{NftAction, NftRef, PlanRender, StagedTx, TokenRef, TxStatus};
+pub use plan::{NftAction, NftRef, PlanRender, StagedTx, TokenRef, TxActionKind, TxStatus};
 pub use policy::{
     AgentAutonomyMode, ApprovalPolicy, ApprovalStepUpPolicy, AuthorizationSubject,
     AuthorizationSurface, AutonomyDecision, BudgetSnapshot, LimitsPolicy, Policy, PolicyCheck,

@@ -513,6 +513,9 @@ pub struct AuthorizationSubject {
     pub total_value_usd_micro: Option<i128>,
     pub value_moving: bool,
     pub calldata_verified: bool,
+    /// Allowance or other authority changes require a fresh review and are
+    /// never covered by a standing spend session.
+    pub authority_change: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -731,6 +734,12 @@ pub fn evaluate_action_authorization(
     {
         return AutonomyDecision::ApprovedFreshReview {
             review_hash: hash.to_string(),
+        };
+    }
+
+    if subject.authority_change {
+        return AutonomyDecision::NeedsFreshReview {
+            reason: "authority-changing action requires fresh review".into(),
         };
     }
 
@@ -1219,6 +1228,7 @@ uv_above_usd = "1.0000001"
             value_moving: true,
             total_value_usd_micro: Some(1_000_000),
             calldata_verified: true,
+            authority_change: false,
         };
         let budget = BudgetSnapshot {
             spent_day_micro_usd: 0,
@@ -1287,6 +1297,7 @@ uv_above_usd = "1.0000001"
             total_value_usd_micro: value,
             value_moving: true,
             calldata_verified: true,
+            authority_change: false,
         }
     }
 
@@ -1393,6 +1404,28 @@ uv_above_usd = "1.0000001"
             ),
             AutonomyDecision::Denied { reason }
                 if reason.contains("calldata/order facts")
+        ));
+    }
+
+    #[test]
+    fn authority_changes_always_require_fresh_review() {
+        let mut p = Policy::default();
+        p.approval.agent_autonomy = Some(AgentAutonomyMode::UnderPolicy);
+        let subject = AuthorizationSubject {
+            authority_change: true,
+            ..auth_subject(Some(1_000_000))
+        };
+        assert!(matches!(
+            evaluate_action_authorization(
+                &p,
+                &[],
+                &subject,
+                Some(&budget()),
+                None,
+                AuthorizationSurface::Vfs,
+            ),
+            AutonomyDecision::NeedsFreshReview { reason }
+                if reason.contains("authority-changing")
         ));
     }
 

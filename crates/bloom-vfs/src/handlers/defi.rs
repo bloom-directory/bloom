@@ -30,6 +30,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use alloy::primitives::{Address, U256, address};
 use alloy::rpc::types::eth::TransactionRequest;
 use async_trait::async_trait;
+use bloom_auth_api::{ValuationPolicy, ValuationQuote};
 use bloom_defi::{
     EnsoClient, EnsoError, RouteRequest, RouteResponse, RoutingStrategy, parse_natural_intent,
     resolve_token_symbol,
@@ -41,7 +42,7 @@ use bloom_proto::{
     checksum_address, format_units,
 };
 use bloom_revert::{DecodeContext, DecoderChain};
-use bloom_tx::tx_engine::TxEngine;
+use bloom_tx::{DynPriceOracle, tx_engine::TxEngine};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 
@@ -191,6 +192,7 @@ pub struct DefiHandler {
     chains: ChainRegistry,
     keystore: Keystore,
     tx_engine: TxEngine,
+    price_oracle: Option<DynPriceOracle>,
     address_book: Arc<AddressBook>,
     home_write_permit: Option<Arc<HomeWritePermit>>,
     sessions: Arc<RwLock<HashMap<String, DefiSession>>>,
@@ -227,6 +229,7 @@ impl DefiHandler {
             chains,
             keystore,
             tx_engine,
+            price_oracle: None,
             address_book,
             home_write_permit: None,
             sessions: Arc::new(RwLock::new(HashMap::new())),
@@ -245,6 +248,14 @@ impl DefiHandler {
 
     pub fn with_auth_services(mut self, auth_services: crate::AuthServices) -> Self {
         self.auth_services = auth_services;
+        self
+    }
+
+    /// Wire the same daemon-owned oracle used by `TxEngine`. Enso routes use
+    /// it only for the exact input token and amount supplied by the route
+    /// request; output-token heuristics are never used for authorization.
+    pub fn with_price_oracle(mut self, oracle: DynPriceOracle) -> Self {
+        self.price_oracle = Some(oracle);
         self
     }
 
@@ -615,6 +626,7 @@ impl DefiHandler {
         destination_chain: &str,
         req: &RouteRequest,
         route: &RouteResponse,
+        input_valuation: Option<&ValuationQuote>,
     ) -> bloom_proto::DefiRouteCtx {
         let receiver = req.receiver.unwrap_or(req.from_address);
         let cross_chain = source_chain != destination_chain;
@@ -630,12 +642,58 @@ impl DefiHandler {
             router: format!("0x{:x}", route.tx.to),
             protocols,
             protocols_unknown,
-            // No USD price oracle wired here; leave input value unknown so a
-            // configured max_input_usd fails closed rather than passing blind.
-            input_microusd: None,
+            input_microusd: input_valuation.and_then(|quote| u64::try_from(quote.usd_micro).ok()),
             native_value_wei: route.tx.value,
             min_out_enforced: false,
             receiver_verified: false,
+        }
+    }
+
+    fn route_input_valuation_target(source_chain: &str, req: &RouteRequest) -> (String, String) {
+        let asset_id = if req.token_in == NATIVE_TOKEN_ADDR {
+            format!("native:{source_chain}")
+        } else {
+            format!("{}:{}", source_chain, checksum_address(&req.token_in))
+        };
+        (asset_id, req.amount_in.to_string())
+    }
+
+    async fn route_input_valuation(
+        &self,
+        source_chain: &str,
+        req: &RouteRequest,
+    ) -> Option<ValuationQuote> {
+        let Some(oracle) = &self.price_oracle else {
+            return None;
+        };
+        let (asset_id, amount_base_units) = Self::route_input_valuation_target(source_chain, req);
+        let now = now_ms() as u64;
+        match oracle.quote_usd(&asset_id, &amount_base_units, now).await {
+            Ok(quote)
+                if quote.asset_id == asset_id
+                    && quote.amount_base_units == amount_base_units
+                    && quote.usd_micro >= 0
+                    && quote
+                        .validate_for_authorization(&ValuationPolicy::default(), now)
+                        .is_ok() =>
+            {
+                Some(quote)
+            }
+            Ok(_) => {
+                tracing::warn!(
+                    chain = source_chain,
+                    "defi.route_input_valuation_unbound_quote"
+                );
+                None
+            }
+            Err(error) => {
+                tracing::warn!(
+                    chain = source_chain,
+                    error = %error,
+                    "defi.route_input_valuation_failed"
+                );
+                None
+            }
         }
     }
 
@@ -817,7 +875,6 @@ impl DefiHandler {
                 });
             }
         }
-        let route_usd_value_hint = route_usd_value_hint(&req, &route);
         intents.push(RawIntent {
             body: RawIntentBody::Raw {
                 to: checksum_address(&route.tx.to),
@@ -828,7 +885,10 @@ impl DefiHandler {
             gas: GasStrategy::Auto,
             nonce: None,
             gas_limit_hint: route.gas.as_deref().and_then(|g| g.parse().ok()),
-            usd_value_hint: route_usd_value_hint,
+            // The route's exact input valuation is obtained from the oracle
+            // when this intent is staged; caller-provided USD hints are never
+            // trusted.
+            usd_value_hint: None,
         });
 
         // Evaluate `[defi]` route policy for display + review (the hard gate
@@ -837,7 +897,15 @@ impl DefiHandler {
             .destination_chain
             .clone()
             .unwrap_or_else(|| chain_name.clone());
-        let route_ctx = self.build_route_ctx(wallet, &chain_name, &dest_chain_name, &req, &route);
+        let input_valuation = self.route_input_valuation(&chain_name, &req).await;
+        let route_ctx = self.build_route_ctx(
+            wallet,
+            &chain_name,
+            &dest_chain_name,
+            &req,
+            &route,
+            input_valuation.as_ref(),
+        );
         let receiver_class = route_ctx.receiver_class.as_str().to_string();
         let policy_checks = bloom_proto::evaluate_defi_route(&info.policy.defi, &route_ctx);
         let policy_checks_json =
@@ -996,7 +1064,15 @@ impl DefiHandler {
                 .destination_chain
                 .clone()
                 .unwrap_or_else(|| sess.chain.clone());
-            let ctx = self.build_route_ctx(wallet, &sess.chain, &dest, req, route);
+            let input_valuation = self.route_input_valuation(&sess.chain, req).await;
+            let ctx = self.build_route_ctx(
+                wallet,
+                &sess.chain,
+                &dest,
+                req,
+                route,
+                input_valuation.as_ref(),
+            );
             let checks = bloom_proto::evaluate_defi_route(&info.policy.defi, &ctx);
             sess.policy_checks = serde_json::to_value(&checks).unwrap_or(serde_json::Value::Null);
             self.put_session(sess.clone())?;
@@ -1042,19 +1118,40 @@ impl DefiHandler {
                     }
                 }
             }
-            let staged = self
-                .tx_engine
-                .stage(
-                    self.write_permit()?,
-                    wallet,
-                    info.address,
-                    intent,
-                    &chain,
-                    &info.policy,
-                    Some(&self.address_book),
-                )
-                .await
-                .map_err(|e| HandlerError::backend(e.to_string()))?;
+            let staged = if idx + 1 == sess.intents.len() {
+                let req = sess.route_request.as_ref().ok_or_else(|| {
+                    HandlerError::backend("session has no route request; refusing to stage")
+                })?;
+                let (asset_id, amount_base_units) =
+                    Self::route_input_valuation_target(&sess.chain, req);
+                self.tx_engine
+                    .stage_with_oracle_valuation_target(
+                        self.write_permit()?,
+                        wallet,
+                        info.address,
+                        intent,
+                        &chain,
+                        &info.policy,
+                        Some(&self.address_book),
+                        asset_id,
+                        amount_base_units,
+                    )
+                    .await
+                    .map_err(|e| HandlerError::backend(e.to_string()))?
+            } else {
+                self.tx_engine
+                    .stage(
+                        self.write_permit()?,
+                        wallet,
+                        info.address,
+                        intent,
+                        &chain,
+                        &info.policy,
+                        Some(&self.address_book),
+                    )
+                    .await
+                    .map_err(|e| HandlerError::backend(e.to_string()))?
+            };
             // Sequential same-chain intents must broadcast in order (e.g.
             // approve → route). Record the dependency so `confirm` refuses the
             // dependent until its predecessor mines successfully.
@@ -1543,27 +1640,6 @@ fn decimals_for_symbol(chain_id: u64, sym: &str) -> u8 {
         .unwrap_or(18)
 }
 
-fn route_usd_value_hint(req: &RouteRequest, route: &RouteResponse) -> Option<String> {
-    let out_chain = req.destination_chain_id.unwrap_or(req.chain_id);
-    let token = bloom_proto::tokens::for_chain(out_chain).iter().find(|t| {
-        t.address
-            .eq_ignore_ascii_case(&format!("0x{:x}", req.token_out))
-            && matches!(t.symbol, "USDC" | "USDT" | "DAI")
-    })?;
-    let raw = route.amount_out.parse::<U256>().ok()?;
-    let human = format_units(raw, token.decimals);
-    if human
-        .parse::<f64>()
-        .ok()
-        .filter(|v| v.is_finite())
-        .is_some()
-    {
-        Some(human)
-    } else {
-        None
-    }
-}
-
 #[derive(Debug, Clone)]
 struct RouteTokenDisplay {
     token_in: TokenDisplay,
@@ -2008,69 +2084,6 @@ mod tests {
         let defaulted =
             DefiHandler::compose_route_request(8453, Some(137), from, &nat, 6, None).unwrap();
         assert_eq!(defaulted.receiver, Some(from));
-    }
-
-    #[test]
-    fn route_usd_value_hint_uses_stablecoin_output() {
-        let usdc = resolve_token_symbol(8453, "USDC").unwrap();
-        let req = RouteRequest {
-            from_address: Address::ZERO,
-            chain_id: 137,
-            destination_chain_id: Some(8453),
-            token_in: NATIVE_TOKEN_ADDR,
-            token_out: usdc,
-            amount_in: U256::from(94_000_000_000_000_000_000u128),
-            slippage_bps: 100,
-            routing_strategy: Some(RoutingStrategy::Router),
-            receiver: Some(Address::ZERO),
-        };
-        let route = RouteResponse {
-            tx: bloom_defi::RouteTx {
-                from: Address::ZERO,
-                to: Address::ZERO,
-                data: Default::default(),
-                value: req.amount_in,
-            },
-            amount_out: "7619717".into(),
-            gas: None,
-            route: serde_json::Value::Null,
-            price_impact: None,
-            destination_chain_id: Some(8453),
-        };
-        assert_eq!(
-            route_usd_value_hint(&req, &route).as_deref(),
-            Some("7.619717")
-        );
-    }
-
-    #[test]
-    fn route_usd_value_hint_ignores_non_stable_output() {
-        let weth = resolve_token_symbol(8453, "WETH").unwrap();
-        let req = RouteRequest {
-            from_address: Address::ZERO,
-            chain_id: 137,
-            destination_chain_id: Some(8453),
-            token_in: NATIVE_TOKEN_ADDR,
-            token_out: weth,
-            amount_in: U256::from(1u64),
-            slippage_bps: 50,
-            routing_strategy: Some(RoutingStrategy::Router),
-            receiver: None,
-        };
-        let route = RouteResponse {
-            tx: bloom_defi::RouteTx {
-                from: Address::ZERO,
-                to: Address::ZERO,
-                data: Default::default(),
-                value: U256::ZERO,
-            },
-            amount_out: "1".into(),
-            gas: None,
-            route: serde_json::Value::Null,
-            price_impact: None,
-            destination_chain_id: Some(8453),
-        };
-        assert!(route_usd_value_hint(&req, &route).is_none());
     }
 
     #[test]

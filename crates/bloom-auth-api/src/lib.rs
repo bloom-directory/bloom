@@ -1762,6 +1762,9 @@ pub struct EvmValueFact {
     /// time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub valuation_usd_micro: Option<i128>,
+    /// Structured quote bound to the sealed action when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valuation: Option<ValuationQuote>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -4820,6 +4823,7 @@ mod tests {
                 native_value_wei: "0".into(),
                 token_amount_base_units: Some("1000000".into()),
                 valuation_usd_micro: Some(1_000_000),
+                valuation: None,
             },
             token: Some(EvmTokenFact {
                 chain_id: 8453,
@@ -5189,6 +5193,7 @@ mod tests {
                 native_value_wei: "0".into(),
                 token_amount_base_units: Some("1000000".into()),
                 valuation_usd_micro: Some(1_000_000),
+                valuation: None,
             },
             token: Some(EvmTokenFact {
                 chain_id: 31337,

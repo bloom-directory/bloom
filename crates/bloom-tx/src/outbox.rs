@@ -1004,7 +1004,7 @@ impl Outbox {
         Ok(count)
     }
 
-    /// Sum the `usd_value` of every staged tx for `wallet` whose
+    /// Sum the structured valuation of every staged tx for `wallet` whose
     /// `created_ms >= since_ms`, across all chains and all states.
     ///
     /// Used by the policy engine to enforce `caps.per_day_usd`. We
@@ -1013,9 +1013,9 @@ impl Outbox {
     /// against the rolling cap, otherwise stacking many pending
     /// stages becomes a trivial bypass.
     ///
-    /// Entries without a `usd_value` (oracle wasn't available when
-    /// they were staged) contribute zero — the rule then degrades
-    /// to "best-effort sum of priced sends".
+    /// Legacy entries that only contain the old floating-point `usd_value`
+    /// field contribute zero because that field was not bound to an asset or
+    /// amount and may have originated from an untrusted hint.
     pub fn sum_usd_since(&self, wallet: &str, since_ms: u128) -> Result<f64, OutboxError> {
         Self::validate_segment(wallet).map_err(|_| OutboxError::InvalidWallet(wallet.into()))?;
         let wallet_dir = self.inner.root.join(wallet);
@@ -1041,9 +1041,10 @@ impl Outbox {
                     }
                     let staged: StagedTx = serde_json::from_slice(&fs::read(&intent_path)?)?;
                     if staged.created_ms >= since_ms
-                        && let Some(u) = staged.usd_value
+                        && let Some(quote) = staged.valuation
+                        && quote.usd_micro >= 0
                     {
-                        total += u;
+                        total += quote.usd_micro as f64 / 1_000_000.0;
                     }
                 }
             }
@@ -1139,10 +1140,12 @@ mod tests {
             created_ms: 0,
             expires_ms: 0,
             status: TxStatus::Pending,
+            action_kind: bloom_proto::TxActionKind::Unknown,
             tx_hash: None,
             token: None,
             nft: None,
             usd_value: None,
+            valuation: None,
             depends_on: None,
             action_id: None,
             execution_origin: None,
@@ -1453,7 +1456,7 @@ mod tests {
     }
 
     /// `sum_usd_since` ignores entries older than the cutoff and entries
-    /// without a usd_value, and aggregates across chains and states.
+    /// without a structured valuation, and aggregates across chains/states.
     #[test]
     fn sum_usd_since_aggregates_across_chains_and_states() {
         let dir = tempfile::tempdir().unwrap();
@@ -1462,7 +1465,18 @@ mod tests {
         // Recent: anvil + base, both sent. Stale: too old. Unpriced: no contribution.
         let mut a = fake_staged("a");
         a.created_ms = 2_000;
-        a.usd_value = Some(100.0);
+        a.usd_value = Some(999.0); // legacy value must not be trusted
+        a.valuation = Some(bloom_auth_api::ValuationQuote {
+            asset_id: "native:anvil".into(),
+            amount_base_units: "1".into(),
+            usd_micro: 100_000_000,
+            source: "test".into(),
+            quote_timestamp_ms: 2_000,
+            fetched_at_ms: 2_000,
+            max_age_ms: 60_000,
+            confidence_ppm: None,
+            stablecoin_assumption: false,
+        });
         ob.write_pending(&a, "p").unwrap();
         ob.transition(&ob.read("alice", "anvil", "a").unwrap(), OutboxState::Sent)
             .unwrap();
@@ -1470,7 +1484,18 @@ mod tests {
         let mut b = fake_staged("b");
         b.chain = "base".into();
         b.created_ms = 2_500;
-        b.usd_value = Some(50.0);
+        b.usd_value = Some(999.0); // legacy value must not be trusted
+        b.valuation = Some(bloom_auth_api::ValuationQuote {
+            asset_id: "native:base".into(),
+            amount_base_units: "1".into(),
+            usd_micro: 50_000_000,
+            source: "test".into(),
+            quote_timestamp_ms: 2_500,
+            fetched_at_ms: 2_500,
+            max_age_ms: 60_000,
+            confidence_ppm: None,
+            stablecoin_assumption: false,
+        });
         ob.write_pending(&b, "p").unwrap();
 
         let mut c = fake_staged("c");
@@ -1480,7 +1505,7 @@ mod tests {
 
         let mut d = fake_staged("d");
         d.created_ms = 3_000;
-        d.usd_value = None; // unpriced
+        d.usd_value = Some(999.0); // legacy-only value is unpriced
         ob.write_pending(&d, "p").unwrap();
 
         let total = ob.sum_usd_since("alice", 1_000).unwrap();

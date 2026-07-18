@@ -3384,10 +3384,12 @@ mod tests {
             // Far in the future so expiry never trips during tests.
             expires_ms: u128::MAX,
             status: bloom_proto::TxStatus::Pending,
+            action_kind: bloom_proto::TxActionKind::Unknown,
             tx_hash: None,
             token: None,
             nft: None,
             usd_value: None,
+            valuation: None,
             depends_on: None,
             action_id: None,
             execution_origin: None,
