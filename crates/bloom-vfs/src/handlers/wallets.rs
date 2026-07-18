@@ -674,7 +674,6 @@ impl WalletsHandler {
         path: &str,
         data: &[u8],
     ) -> Result<(), HandlerError> {
-        self.migrate_legacy_policy_updates(wallet);
         let proposed_policy_toml = std::str::from_utf8(data)
             .map_err(|e| HandlerError::invalid(format!("policy must be UTF-8: {e}")))?;
         let proposed_policy: Policy = toml::from_str(proposed_policy_toml)
@@ -871,47 +870,6 @@ impl WalletsHandler {
         action_id: &str,
     ) -> std::path::PathBuf {
         self.policy_update_state_dir(wallet, state).join(action_id)
-    }
-
-    /// Move pre-lifecycle policy-update directories into `pending/` on first
-    /// access. Older releases stored `<action_id>/` directly below
-    /// `policy-updates/`; preserving those directories is necessary for an
-    /// approved retry to find its existing challenge and approval.
-    fn migrate_legacy_policy_updates(&self, wallet: &str) {
-        let root = self.policy_updates_dir(wallet);
-        let Ok(entries) = std::fs::read_dir(&root) else {
-            return;
-        };
-        let pending = self.policy_update_state_dir(wallet, "pending");
-        for entry in entries.flatten() {
-            if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                continue;
-            }
-            let name = entry.file_name();
-            let Some(action_id) = name.to_str() else {
-                continue;
-            };
-            if POLICY_UPDATE_STATES.contains(&action_id)
-                || !action_id.starts_with("policy-update-")
-                || validate_policy_action_id(action_id).is_err()
-            {
-                continue;
-            }
-            let target = pending.join(action_id);
-            if target.exists() {
-                continue;
-            }
-            let result = std::fs::create_dir_all(&pending)
-                .and_then(|()| std::fs::rename(entry.path(), &target));
-            if let Err(error) = result {
-                tracing::warn!(
-                    wallet,
-                    action_id,
-                    error = %error,
-                    "policy_update.legacy_migration_failed"
-                );
-            }
-        }
     }
 
     /// Atomically move an action between lifecycle states (e.g. `pending` →
@@ -1991,7 +1949,6 @@ impl WalletsHandler {
         }
         let wallet = &segs[0];
         let info = self.keystore.info_unverified(wallet).map_err(err_be)?;
-        self.migrate_legacy_policy_updates(wallet);
         if segs.len() == 1 {
             return Ok(Entry::dir(wallet));
         }
@@ -2112,7 +2069,6 @@ impl WalletsHandler {
         }
         let wallet = &segs[0];
         let info = self.keystore.info_unverified(wallet).map_err(err_be)?;
-        self.migrate_legacy_policy_updates(wallet);
         match segs.get(1).map(|s| s.as_str()).unwrap_or("") {
             "address" => {
                 Ok(format!("{}\n", bloom_proto::checksum_address(&info.address)).into_bytes())
@@ -2276,7 +2232,6 @@ impl WalletsHandler {
         }
         let wallet = &segs[0];
         let info = self.keystore.info_unverified(wallet).map_err(err_be)?;
-        self.migrate_legacy_policy_updates(wallet);
         match segs.len() {
             1 => Ok(Self::wallet_dir_entries(info.kind)),
             2 if segs[1] == "chains" => Ok(self
@@ -5099,37 +5054,6 @@ mod tests {
         let status: serde_json::Value = serde_json::from_slice(&status_bytes).unwrap();
         assert_eq!(status["action_id"], second_id);
         assert_eq!(status["state"], "pending");
-    }
-
-    #[tokio::test]
-    async fn wallet_policy_update_migrates_legacy_flat_action_directory() {
-        let f = make_handler();
-        let action_id = "policy-update-legacy";
-        let legacy = f
-            .handler
-            .keystore
-            .root()
-            .join("alice")
-            .join("policy-updates")
-            .join(action_id);
-        std::fs::create_dir_all(&legacy).unwrap();
-        std::fs::write(legacy.join(APPROVAL_CHALLENGE_FILE), b"{}\n").unwrap();
-
-        let pending = f
-            .handler
-            .list(&VfsPath::parse("/alice/policy-updates/pending").unwrap())
-            .await
-            .unwrap();
-        assert!(pending.iter().any(|entry| entry.name == action_id));
-        assert!(!legacy.exists());
-        assert!(
-            legacy
-                .parent()
-                .unwrap()
-                .join("pending")
-                .join(action_id)
-                .exists()
-        );
     }
 
     #[tokio::test]
