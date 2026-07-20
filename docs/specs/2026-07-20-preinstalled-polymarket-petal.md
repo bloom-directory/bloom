@@ -145,7 +145,9 @@ After provisioning is implemented and tested:
   `/petals/polymarket/README.md`.
 
 The recently added native `[polymarket] enabled = false` opt-out is superseded
-by `petals.preinstalled = []`.
+by `petals.preinstalled = []`. Loading an existing config must preserve that
+legacy explicit opt-out when `petals.preinstalled` has not yet been set; an
+explicit new pre-installed list takes precedence.
 
 ## User-visible behavior
 

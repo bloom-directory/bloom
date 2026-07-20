@@ -457,8 +457,9 @@ impl Config {
 
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
         let s = std::fs::read_to_string(path)?;
+        let document: toml::Value = toml::from_str(&s)?;
         let mut cfg: Self = toml::from_str(&s)?;
-        cfg.migrate();
+        cfg.migrate(&document);
         cfg.validate()?;
         Ok(cfg)
     }
@@ -486,9 +487,26 @@ impl Config {
     ///
     /// Currently infers `op_stack` for well-known OP-stack chain IDs
     /// (Optimism=10, Base=8453, …) that predate the `op_stack` field.
-    fn migrate(&mut self) {
+    fn migrate(&mut self, document: &toml::Value) {
         for spec in self.chains.values_mut() {
             spec.infer_op_stack();
+        }
+
+        // Bloom versions immediately before native Polymarket removal used
+        // `[polymarket] enabled = false` as the persistent opt-out. Preserve
+        // that explicit choice unless the operator has already configured the
+        // replacement `petals.preinstalled` list.
+        let legacy_polymarket_disabled = document
+            .get("polymarket")
+            .and_then(|value| value.get("enabled"))
+            .and_then(toml::Value::as_bool)
+            == Some(false);
+        let preinstalled_is_explicit = document
+            .get("petals")
+            .and_then(|value| value.get("preinstalled"))
+            .is_some();
+        if legacy_polymarket_disabled && !preinstalled_is_explicit {
+            self.petals.preinstalled.retain(|name| name != "polymarket");
         }
     }
 
@@ -850,6 +868,25 @@ allow_broadcast = false
         let cfg = Config::load_or_init(&path).unwrap();
         assert!(!cfg.chains["anvil"].allow_broadcast);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), existing);
+    }
+
+    #[test]
+    fn load_preserves_legacy_polymarket_opt_out_until_new_setting_is_explicit() {
+        let td = tempdir().unwrap();
+        let path = td.path().join("config.toml");
+        let default = toml::to_string_pretty(&Config::local_default()).unwrap();
+        let legacy = default
+            .replace("preinstalled = [\"polymarket\"]\n", "")
+            .replace("preinstalled = [\n    \"polymarket\",\n]\n", "");
+        assert!(!legacy.contains("preinstalled"));
+        std::fs::write(&path, format!("{legacy}\n[polymarket]\nenabled = false\n")).unwrap();
+
+        let migrated = Config::load(&path).unwrap();
+        assert!(migrated.petals.preinstalled.is_empty());
+
+        std::fs::write(&path, format!("{default}\n[polymarket]\nenabled = false\n")).unwrap();
+        let explicitly_enabled = Config::load(&path).unwrap();
+        assert_eq!(explicitly_enabled.petals.preinstalled, vec!["polymarket"]);
     }
 
     #[test]
