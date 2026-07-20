@@ -1197,22 +1197,19 @@ fn github_source_install_polymarket_dispatches_route_contract() {
     let petal_ref = "1ffb267a1e1d4acd137c184806c20cc98d20a3f4";
     let home = fresh_home();
     bloom_cmd(home.path())
-        .args([
-            "petals",
-            "install",
-            "https://github.com/bloom-directory/bloom-petal-polymarket",
-            "--ref",
-            petal_ref,
-        ])
+        .arg("init")
         .assert()
         .success()
+        .stdout(predicate::str::contains(
+            "preinstalled_petal: installing polymarket",
+        ))
         .stdout(predicate::str::contains(format!(
-            "source: bloom-directory/bloom-petal-polymarket@{petal_ref}"
+            "Resolved commit: {petal_ref}"
         )))
-        .stdout(predicate::str::contains(format!(
-            "resolved_commit: {petal_ref}"
-        )))
-        .stdout(predicate::str::contains("routes: 95"));
+        .stdout(predicate::str::contains("\"routes\": 95"))
+        .stdout(predicate::str::contains(
+            "preinstalled_petals: [\"polymarket\"]",
+        ));
 
     bloom_cmd(home.path())
         .args(["petals", "ls"])
