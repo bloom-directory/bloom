@@ -127,8 +127,13 @@ impl PriceOracle for PricesOracle {
             self.client.current(coin).await.map_err(|error| {
                 AuthApiError::Denied(format!("price oracle unavailable: {error}"))
             })?;
+        // Native asset ids are EVM native assets, whose base unit is always
+        // 18 decimals. DefiLlama may omit decimals for native quotes, but an
+        // omitted token-contract decimal is still unresolvable and must fail
+        // closed.
         let decimals = quote
             .decimals
+            .or_else(|| asset_id.strip_prefix("native:").map(|_| 18u8))
             .ok_or_else(|| AuthApiError::Denied("price quote decimals missing".into()))?;
         if quote.timestamp == 0 {
             return Err(AuthApiError::Denied("price quote timestamp missing".into()));
@@ -161,6 +166,27 @@ impl PriceOracle for PricesOracle {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn one_shot_price_server(body: &'static str) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let mut request = [0u8; 1024];
+            let _ = stream.read(&mut request).await;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+            let _ = stream.shutdown().await;
+        });
+        format!("http://{addr}")
+    }
 
     #[test]
     fn asset_ids_distinguish_native_and_erc20() {
@@ -206,5 +232,21 @@ mod tests {
             CoinId::Native(s) => assert_eq!(s, "polygon"),
             _ => panic!("expected Native"),
         }
+    }
+
+    #[tokio::test]
+    async fn native_quote_defaults_to_evm_decimals_when_provider_omits_them() {
+        let body = r#"{"coins":{"coingecko:ethereum":{"price":3500.5,"timestamp":1700000000}}}"#;
+        let url = one_shot_price_server(body).await;
+        let oracle = PricesOracle::new(PricesClient::with_base_url(url));
+
+        let quote = oracle
+            .quote_usd("native:anvil", "1000000000000000000", 1_700_000_000_000)
+            .await
+            .unwrap();
+
+        assert_eq!(quote.asset_id, "native:anvil");
+        assert_eq!(quote.amount_base_units, "1000000000000000000");
+        assert_eq!(quote.usd_micro, 3_500_500_000);
     }
 }
