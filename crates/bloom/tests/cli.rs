@@ -640,11 +640,15 @@ fn vfs_cat_status_update_with_seed_cache_reports_behind() {
         .args(["vfs", "cat", "/status/update/available"])
         .assert()
         .success()
-        .stdout(predicate::eq(if env!("CARGO_PKG_VERSION") == "0.1.0" {
-            "out_of_date\n"
-        } else {
-            "up_to_date\n"
-        }));
+        .stdout(predicate::eq(
+            if bloom_update::compare_semver(env!("CARGO_PKG_VERSION"), "0.2.0")
+                == std::cmp::Ordering::Less
+            {
+                "out_of_date\n"
+            } else {
+                "up_to_date\n"
+            },
+        ));
 }
 
 #[test]

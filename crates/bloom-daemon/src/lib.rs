@@ -2892,9 +2892,14 @@ impl Daemon {
         // an in-process Daemon, so starting this in `from_home` would turn
         // every `vfs cat`/`ls` invocation into an immediate API request.
         let mut update_shutdown = self.update_shutdown.lock();
-        if update_shutdown.is_empty() {
+        if update_shutdown.is_empty() && !bloom_update::automatic_checks_disabled() {
             update_shutdown.push(Arc::clone(&self.update_checker).spawn_background());
             debug!("daemon.update_checker_spawned");
+        } else if update_shutdown.is_empty() {
+            debug!(
+                env = bloom_update::DISABLE_AUTO_CHECK_ENV,
+                "daemon.update_checker_disabled"
+            );
         }
         drop(update_shutdown);
 

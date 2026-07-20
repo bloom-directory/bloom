@@ -2,15 +2,14 @@
 
 ## Overview
 
-Releases can start from a `vX.Y.Z` tag push or from a manual workflow
-dispatch. The `release.yml` workflow:
+Releases start from a reviewed version-bump PR followed by a `vX.Y.Z` tag
+push. The optional `propose-release.yml` workflow prepares the PR; it never
+writes to the default branch, creates a stable tag, or publishes a release.
+The `release.yml` workflow:
 
 1. Validates the tag shape.
-2. If the tag already exists, verifies that its commit already has
-   workspace version `X.Y.Z`. If a manual run names a new tag, bumps
-   `Cargo.toml` and `Cargo.lock`, commits the change, and creates the
-   tag at that commit.
-3. Mirrors the tagged commit to `release/vX.Y.Z`, then builds the exact
+2. Verifies that the tagged commit already has workspace version `X.Y.Z`.
+3. Builds the exact
    commit SHA on four runners (Linux x86_64 + aarch64, macOS x86_64 +
    aarch64) with `--locked`.
 4. Verifies the resulting binary's `bloom --version` matches the tag.
@@ -25,7 +24,38 @@ workflow. It is owned by the old (now-retired) branch-driven
 `/releases/latest/download/...` route follows the release marked
 latest; it does not require a git tag literally named `latest`.
 
-## Local release (recommended for the first versioned release)
+## CI-proposed release
+
+Configure a `RELEASE_PR_TOKEN` repository secret backed by a GitHub App token
+or fine-grained token with Contents read/write and Pull requests read/write.
+The token is needed because a PR created with `GITHUB_TOKEN` does not receive
+the normal pull-request workflow events.
+
+Run **Actions → Propose Release → Run workflow**, enter the next version
+without the `v` prefix, and review the generated PR. The workflow updates only
+`Cargo.toml` and the workspace metadata in `Cargo.lock`, and refuses to
+upgrade unrelated external dependencies. After the PR is merged, push a tag
+from the merge commit:
+
+```bash
+VERSION="0.1.1"
+git switch master
+git pull --ff-only origin master
+test "$(sed -n -E 's/^version = "([0-9]+\.[0-9]+\.[0-9]+)"/\1/p' Cargo.toml | head -n 1)" = "$VERSION"
+git tag "v$VERSION"
+git push origin "v$VERSION"
+```
+
+The tag push starts the release workflow. It verifies that the tag and
+workspace version agree, builds that immutable commit, and publishes the
+release only after all build jobs pass.
+
+Repository rules should require review before merging the proposal PR and
+limit creation or update of `v*` tags to release maintainers. The release
+workflow's write token is used only by the publish job for GitHub release
+metadata and assets.
+
+## Local release
 
 Run the first `vX.Y.Z` release locally so you can verify the build
 before pushing the tag:
@@ -44,14 +74,14 @@ git switch -c "$BRANCH"
 
 # 2. Bump the workspace version. `sed` is enough — every member
 #    crate uses `version.workspace = true` and picks up the new
-#    number at compile time. `cargo update --workspace` regens the
-#    lockfile. Review the diff to ensure it only changes workspace
-#    package versions and does not introduce transitive dep churn.
+#    number at compile time. `cargo check --workspace` refreshes only
+#    the lockfile metadata required by the version change; it does not
+#    proactively upgrade compatible transitive dependencies.
 sed -i -E "s/^version = \"[0-9]+\\.[0-9]+\\.[0-9]+\"/version = \"$VERSION\"/" Cargo.toml
-cargo update --workspace
+cargo check --workspace
 
 # 3. Sanity: the diff is exactly Cargo.toml + Cargo.lock.
-git diff --stat
+git diff -- Cargo.toml Cargo.lock
 
 # 4. Build and verify the binary.
 cargo build --release -p bloom --all-features --locked
@@ -79,31 +109,11 @@ git tag "v$VERSION"
 git push origin "v$VERSION"
 ```
 
-The tag push starts the workflow automatically. Because the tag
-already points at the version-bumped commit, the prepare job makes no
-new commit. The build jobs use that exact SHA, and the publish job
-creates the `v$VERSION` release with the four tarballs and
-`SHA256SUMS`.
-
-## CI-only release (subsequent versions)
-
-The workflow can also create the release commit and tag itself:
-
-```bash
-VERSION="0.1.2"
-gh workflow run release.yml --ref master -f tag="v$VERSION"
-```
-
-For a new tag, the workflow starts from the repository's default
-branch, creates `release: v$VERSION`, tags that new commit, and pushes
-`release/v$VERSION`. The build and source archives therefore resolve
-to the same commit. The release commit remains on the release branch;
-use the local path above when the version bump should also live on
-`master`.
-
-If the requested tag already exists, a manual run is treated as a
-retry. Its commit must already contain the matching workspace version;
-the workflow never moves an existing release tag.
+The tag push starts the workflow automatically. Because the tag already
+points at the reviewed version-bumped commit, the build jobs use that exact
+SHA and the publish job creates the `v$VERSION` release with the four
+tarballs and `SHA256SUMS`. A manual `release.yml` run is available only to
+retry an existing tag and never creates commits or tags.
 
 ## Legacy cleanup (one-time, manual)
 
@@ -147,6 +157,9 @@ Before the first versioned release, GitHub may return the legacy tag
 `bloom update check` reports `available: unknown` and exits 2 rather
 than claiming the binary is up to date. An HTTP 404 means no eligible
 published release exists yet.
+
+To disable automatic daemon polling on a host while retaining explicit
+checks, set `BLOOM_DISABLE_UPDATE_CHECK=1` in the service environment.
 
 ## What is intentionally NOT in the workflow
 

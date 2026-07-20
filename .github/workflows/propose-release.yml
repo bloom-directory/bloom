@@ -1,0 +1,152 @@
+name: Propose Release
+
+# This workflow prepares a reviewed version-bump PR. It never writes to the
+# default branch, creates a stable tag, or publishes a GitHub release.
+#
+# RELEASE_PR_TOKEN must be a repository secret backed by a GitHub App token or
+# fine-grained token with Contents: read/write and Pull requests: read/write.
+# A token other than GITHUB_TOKEN is required so the generated PR receives the
+# normal pull_request CI checks.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Next stable version without the v prefix (e.g. 0.1.1).'
+        required: true
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: release-proposal-${{ inputs.version }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  propose:
+    name: Open reviewed release PR
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    env:
+      GH_TOKEN: ${{ secrets.RELEASE_PR_TOKEN }}
+      VERSION: ${{ inputs.version }}
+      BASE: ${{ github.event.repository.default_branch }}
+    steps:
+      - name: Require release PR token
+        run: |
+          set -euo pipefail
+          if [[ -z "${GH_TOKEN:-}" ]]; then
+            echo "::error::configure the RELEASE_PR_TOKEN repository secret before running this workflow"
+            exit 1
+          fi
+
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
+          token: ${{ secrets.RELEASE_PR_TOKEN }}
+
+      - name: Prepare and open release PR
+        run: |
+          set -euo pipefail
+
+          if [[ ! "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "::error::version must match X.Y.Z without a leading v: $VERSION"
+            exit 1
+          fi
+
+          current_version() {
+            sed -n -E 's/^version = "([0-9]+\.[0-9]+\.[0-9]+)"/\1/p' Cargo.toml | head -n 1
+          }
+          version_gt() {
+            local left right lpart rpart
+            IFS=. read -r -a left <<< "$1"
+            IFS=. read -r -a right <<< "$2"
+            for i in 0 1 2; do
+              lpart=$((10#${left[$i]}))
+              rpart=$((10#${right[$i]}))
+              if (( lpart > rpart )); then return 0; fi
+              if (( lpart < rpart )); then return 1; fi
+            done
+            return 1
+          }
+
+          CURRENT_VERSION="$(current_version)"
+          if [[ -z "$CURRENT_VERSION" ]]; then
+            echo "::error::could not read the workspace version from Cargo.toml"
+            exit 1
+          fi
+          if ! version_gt "$VERSION" "$CURRENT_VERSION"; then
+            echo "::error::proposed version $VERSION must be newer than $CURRENT_VERSION"
+            exit 1
+          fi
+
+          BRANCH="release-proposal/v$VERSION"
+          if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
+            echo "::error::branch $BRANCH already exists; review or close the existing proposal before retrying"
+            exit 1
+          fi
+          EXISTING_PR="$(gh pr list --state all --head "$BRANCH" --json number,url --jq '.[].url')"
+          if [[ -n "$EXISTING_PR" ]]; then
+            echo "::error::a release proposal already exists: $EXISTING_PR"
+            exit 1
+          fi
+
+          LOCK_BEFORE="$(mktemp)"
+          LOCK_AFTER="$(mktemp)"
+          cargo metadata --locked --format-version 1 \
+            | jq -S '[.packages[] | select(.source != null) | {name, version, source, checksum}]' \
+            > "$LOCK_BEFORE"
+
+          sed -i -E 's/^version = "[0-9]+\.[0-9]+\.[0-9]+"/version = "'"$VERSION"'"/' Cargo.toml
+          cargo check --workspace
+
+          cargo metadata --locked --format-version 1 \
+            | jq -S '[.packages[] | select(.source != null) | {name, version, source, checksum}]' \
+            > "$LOCK_AFTER"
+          if ! cmp -s "$LOCK_BEFORE" "$LOCK_AFTER"; then
+            echo "::error::version bump changed resolved external dependency tuples"
+            diff -u "$LOCK_BEFORE" "$LOCK_AFTER" || true
+            exit 1
+          fi
+
+          CHANGED_FILES="$(git diff --name-only)"
+          if [[ "$(printf '%s\n' "$CHANGED_FILES" | grep -Ev '^(Cargo\.toml|Cargo\.lock)$' || true)" != "" ]]; then
+            echo "::error::release proposal changed files outside Cargo.toml and Cargo.lock"
+            printf '%s\n' "$CHANGED_FILES"
+            exit 1
+          fi
+
+          git diff --check
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Cargo.toml Cargo.lock
+          git commit -m "release: v$VERSION"
+          git push --set-upstream origin "HEAD:refs/heads/$BRANCH"
+
+          NOTES="$(mktemp)"
+          cat > "$NOTES" <<EOF
+          ## Proposed release: v$VERSION
+
+          This PR was generated by CI from the current `$BASE` branch.
+
+          Please review the version, changelog, and normal CI checks before merging.
+          After merge, push the matching tag:
+
+          ```sh
+          git tag v$VERSION <merge-commit>
+          git push origin v$VERSION
+          ```
+
+          The release workflow will build and publish only that reviewed tag.
+          EOF
+          gh pr create \
+            --base "$BASE" \
+            --head "$BRANCH" \
+            --title "release: v$VERSION" \
+            --body-file "$NOTES"

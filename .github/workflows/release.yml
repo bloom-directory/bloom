@@ -3,14 +3,12 @@ name: Release
 # Tag-driven release workflow. Mirrors the structure of vibefi/client's
 # release.yml but adapted to this repo: no cargo-packager, four native
 # runners (no --target cross-compile), per-binary verify step, and a
-# committed workspace version bump (no --config magic, no cargo-edit).
+# reviewed workspace version bump (no --config magic, no cargo-edit).
 #
 # Flow:
-#   1. `prepare` resolves and validates the tag (vX.Y.Z).
-#   2. `prepare_release` either validates that an existing tag already
-#      points at a version-bumped commit, or (for workflow_dispatch)
-#      creates the bump commit and tag together. It also mirrors the
-#      immutable release SHA to `release/vX.Y.Z` for maintainers.
+#   1. A reviewed version-bump PR is merged, then a maintainer pushes its
+#      matching `vX.Y.Z` tag. `propose-release.yml` can open that PR.
+#   2. `prepare` resolves and validates the existing tag (vX.Y.Z).
 #   3. `build` checks out that exact SHA and runs `cargo build --locked`
 #      on each of the four native runners. A verify step asserts that
 #      `bloom --version` matches the tag.
@@ -33,8 +31,9 @@ on:
         required: true
         type: string
 
-permissions:
-  contents: write
+# Jobs opt into the minimum permissions they need below. In particular,
+# build runners never receive a write-capable token.
+permissions: {}
 
 concurrency:
   group: release-${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref_name }}
@@ -47,127 +46,57 @@ jobs:
   prepare:
     name: Resolve Release Metadata
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     outputs:
       release_tag: ${{ steps.meta.outputs.release_tag }}
       release_version: ${{ steps.meta.outputs.release_version }}
-      release_ref: ${{ steps.meta.outputs.release_ref }}
-      tag_exists: ${{ steps.meta.outputs.tag_exists }}
+      release_sha: ${{ steps.meta.outputs.release_sha }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           fetch-depth: 0
+          persist-credentials: false
       - id: meta
         env:
           RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref_name }}
         run: |
           set -euo pipefail
           TAG="$RELEASE_TAG"
-          if [[ ! "$TAG" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+          if [[ ! "$TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
             echo "::error::release tag must match vX.Y.Z, got: $TAG"
             exit 1
           fi
           git fetch --tags --force
-          if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
-            TAG_EXISTS=true
-            REF="refs/tags/$TAG"
-          elif [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
-            TAG_EXISTS=false
-            REF="refs/heads/${{ github.event.repository.default_branch }}"
-          else
+          if ! git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
             echo "::error::pushed tag does not exist in repository: $TAG"
             exit 1
           fi
+          REF="refs/tags/$TAG"
+          RELEASE_SHA="$(git rev-parse "$REF^{commit}")"
           VERSION="${TAG#v}"
+          CURRENT_VERSION="$(git show "$RELEASE_SHA:Cargo.toml" | sed -n -E 's/^version = "([0-9]+\.[0-9]+\.[0-9]+)"/\1/p' | head -n 1)"
+          if [[ "$CURRENT_VERSION" != "$VERSION" ]]; then
+            echo "::error::tag $TAG points at workspace version $CURRENT_VERSION; merge the reviewed version bump before tagging"
+            exit 1
+          fi
           {
             echo "release_tag=$TAG"
             echo "release_version=$VERSION"
-            echo "release_ref=$REF"
-            echo "tag_exists=$TAG_EXISTS"
+            echo "release_sha=$RELEASE_SHA"
           } >> "$GITHUB_OUTPUT"
           echo "Resolved release metadata:"
           echo "  tag: $TAG"
           echo "  version: $VERSION"
           echo "  ref: $REF"
-          echo "  tag exists: $TAG_EXISTS"
-
-  prepare_release:
-    name: Prepare Release Commit
-    runs-on: ubuntu-latest
-    needs: prepare
-    outputs:
-      release_branch_sha: ${{ steps.commit.outputs.release_branch_sha }}
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          ref: ${{ needs.prepare.outputs.release_ref }}
-          fetch-depth: 0
-      - name: Validate or bump workspace version
-        env:
-          TAG_EXISTS: ${{ needs.prepare.outputs.tag_exists }}
-          VERSION: ${{ needs.prepare.outputs.release_version }}
-        run: |
-          set -euo pipefail
-          CURRENT_VERSION="$(sed -n -E 's/^version = "([0-9]+\.[0-9]+\.[0-9]+)"/\1/p' Cargo.toml | head -n 1)"
-          if [[ "$TAG_EXISTS" == "true" ]]; then
-            # Tags are immutable release inputs. A tag-push release must
-            # already point at a commit whose workspace version matches it.
-            if [[ "$CURRENT_VERSION" != "$VERSION" ]]; then
-              echo "::error::tag v$VERSION points at workspace version $CURRENT_VERSION; bump and commit before tagging"
-              exit 1
-            fi
-          else
-            # A manual CI-only release starts from the default branch and
-            # creates the version commit before creating the tag.
-            sed -i -E 's/^version = "[0-9]+\.[0-9]+\.[0-9]+"/version = "'"$VERSION"'"/' Cargo.toml
-            cargo update --workspace
-            # Sanity: the diff should be exactly Cargo.toml + Cargo.lock.
-            # Anything else means cargo touched a transitive dep — investigate.
-            git diff --stat
-          fi
-      - id: commit
-        env:
-          TAG: ${{ needs.prepare.outputs.release_tag }}
-          TAG_EXISTS: ${{ needs.prepare.outputs.tag_exists }}
-          VERSION: ${{ needs.prepare.outputs.release_version }}
-        run: |
-          set -euo pipefail
-          git config user.name  "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add Cargo.toml Cargo.lock
-          if git diff --cached --quiet; then
-            echo "Workspace is already at v$VERSION; using the tagged commit."
-          else
-            git commit -m "release: v$VERSION"
-          fi
-          SHA="$(git rev-parse HEAD)"
-
-          if [[ "$TAG_EXISTS" == "true" ]]; then
-            TAG_SHA="$(git rev-parse "$TAG^{commit}")"
-            if [[ "$TAG_SHA" != "$SHA" ]]; then
-              echo "::error::tag $TAG resolves to $TAG_SHA, but release commit is $SHA"
-              exit 1
-            fi
-          else
-            git tag "$TAG" "$SHA"
-          fi
-
-          # Write the SHA output *before* the tag push so a failed
-          # tag push (e.g. another actor created it concurrently)
-          # doesn't strip downstream jobs of the release commit SHA.
-          echo "release_branch_sha=$SHA" >> "$GITHUB_OUTPUT"
-
-          # The release/* branch is workflow-owned; --force is safe.
-          git push --force origin "HEAD:refs/heads/release/v$VERSION"
-          if [[ "$TAG_EXISTS" == "false" ]]; then
-            # A normal (non-force) push fails safely if another actor
-            # created the tag after the prepare job checked for it.
-            git push origin "refs/tags/$TAG"
-          fi
-          echo "Prepared $TAG and release/v$VERSION at $SHA"
+          echo "  sha: $RELEASE_SHA"
+          echo "  workspace version: $CURRENT_VERSION"
 
   build:
     name: build ${{ matrix.asset_name }}
-    needs: [prepare, prepare_release]
+    needs: prepare
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -186,16 +115,17 @@ jobs:
             binary: bloom
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
-          ref: ${{ needs.prepare_release.outputs.release_branch_sha }}
+          ref: ${{ needs.prepare.outputs.release_sha }}
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Install Rust toolchain
         run: rustup show
 
       - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           cache-targets: false
 
@@ -223,7 +153,7 @@ jobs:
           tar -czf "dist/${{ matrix.asset_name }}" -C package .
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: ${{ matrix.asset_name }}
           path: dist/${{ matrix.asset_name }}
@@ -232,15 +162,18 @@ jobs:
 
   publish:
     name: Publish GitHub Release
-    needs: [prepare, prepare_release, build]
+    needs: [prepare, build]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Download build artifacts
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
           path: dist
           merge-multiple: true
@@ -254,7 +187,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ needs.prepare.outputs.release_tag }}
           VERSION: ${{ needs.prepare.outputs.release_version }}
-          SHA: ${{ needs.prepare_release.outputs.release_branch_sha }}
+          SHA: ${{ needs.prepare.outputs.release_sha }}
         run: |
           set -euo pipefail
           git fetch --tags --force
@@ -287,14 +220,39 @@ jobs:
           Verify your download with \`SHA256SUMS\`.
           EOF
 
+          CURRENT_LATEST="$(gh api "repos/${{ github.repository }}/releases/latest" --jq '.tag_name' 2>/dev/null || true)"
+          version_at_least() {
+            local left right lpart rpart
+            IFS=. read -r -a left <<< "${1#v}"
+            IFS=. read -r -a right <<< "${2#v}"
+            for i in 0 1 2; do
+              lpart=$((10#${left[$i]}))
+              rpart=$((10#${right[$i]}))
+              if (( lpart > rpart )); then return 0; fi
+              if (( lpart < rpart )); then return 1; fi
+            done
+            return 0
+          }
+          MARK_LATEST=false
+          if [[ -z "$CURRENT_LATEST" || "$CURRENT_LATEST" == "latest" ]]; then
+            MARK_LATEST=true
+          elif [[ "$CURRENT_LATEST" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+            && version_at_least "$TAG" "$CURRENT_LATEST"; then
+            MARK_LATEST=true
+          fi
+          echo "Current latest release: ${CURRENT_LATEST:-none}"
+          echo "Marking $TAG latest: $MARK_LATEST"
+
           if gh release view "$TAG" >/dev/null 2>&1; then
-            # Retry path: release already exists. Update metadata and
-            # re-upload assets (clobbering any previous ones).
-            gh release edit "$TAG" \
-              --verify-tag \
-              --title "bloom v$VERSION" \
-              --notes-file "$NOTES" \
-              --latest
+            # Retry path: release already exists. Use the REST API because
+            # `gh release edit` can mark a release latest but cannot explicitly
+            # demote one that was previously marked latest.
+            RELEASE_ID="$(gh api "repos/${{ github.repository }}/releases/tags/$TAG" --jq '.id')"
+            gh api --method PATCH \
+              "repos/${{ github.repository }}/releases/$RELEASE_ID" \
+              -f name="bloom v$VERSION" \
+              -f body="$(<"$NOTES")" \
+              -f make_latest="$MARK_LATEST"
             gh release upload "$TAG" dist/* --clobber
           else
             # First-time create. `--verify-tag` checks that the tag
@@ -306,6 +264,6 @@ jobs:
               --verify-tag \
               --title "bloom v$VERSION" \
               --notes-file "$NOTES" \
-              --latest \
+              --latest="$MARK_LATEST" \
               dist/*
           fi

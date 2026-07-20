@@ -1352,6 +1352,7 @@ async fn run(cli: Cli) -> Result<()> {
             }
             if let Some(snap) = d.update_checker.quick_check_cached() {
                 let latest = snap.latest.as_deref().unwrap_or("?");
+                let latest_display = latest.strip_prefix('v').unwrap_or(latest);
                 let available = match snap.available() {
                     bloom_update::UpdateAvailable::OutOfDate => "out_of_date",
                     bloom_update::UpdateAvailable::UpToDate => "up_to_date",
@@ -1362,7 +1363,7 @@ async fn run(cli: Cli) -> Result<()> {
                 if matches!(snap.available(), bloom_update::UpdateAvailable::OutOfDate) {
                     eprintln!(
                         "hint: bloom v{} is available (you have v{}); see /status/update",
-                        latest,
+                        latest_display,
                         env!("CARGO_PKG_VERSION")
                     );
                 }

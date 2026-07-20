@@ -6,8 +6,8 @@
 //! - [`UpdateChecker`]: a clone-cheap, Arc-shareable object that holds
 //!   the snapshot, owns the `reqwest::Client`, and can spawn a
 //!   background tokio task that refreshes every 5 minutes.
-//! - [`parse_semver`] / [`compare_semver`]: tiny semver helpers that
-//!   avoid pulling in the `semver` crate.
+//! - [`parse_semver`] / [`compare_semver`]: SemVer parsing and precedence
+//!   helpers backed by the standard `semver` crate.
 //!
 //! The crate is intentionally network- and cache-only; it knows nothing
 //! about the daemon, the VFS, or the CLI. Wiring it into the rest of
@@ -21,7 +21,8 @@ pub mod checker;
 pub mod semver;
 pub mod snapshot;
 
-pub use checker::UpdateChecker;
-pub use checker::read_cache_only;
+pub use checker::{
+    DISABLE_AUTO_CHECK_ENV, UpdateChecker, automatic_checks_disabled, read_cache_only,
+};
 pub use semver::{compare_semver, parse_semver};
 pub use snapshot::{UpdateAvailable, UpdateSnapshot, UpdateStatus};

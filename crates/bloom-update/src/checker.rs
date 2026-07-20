@@ -27,9 +27,26 @@ const RELEASES_LATEST_URL: &str =
     "https://api.github.com/repos/bloom-directory/bloom/releases/latest";
 
 /// GitHub rejects API requests without a valid User-Agent. Keep the
-/// product name stable and include the running workspace version so
-/// requests are identifiable when debugging API traffic.
+/// product name stable without disclosing the installed version.
 const USER_AGENT_PREFIX: &str = "bloom";
+
+/// Environment switch for operators who do not want automatic network
+/// requests from a long-lived daemon. Explicit `bloom update check` remains
+/// available because it constructs and refreshes a checker directly.
+pub const DISABLE_AUTO_CHECK_ENV: &str = "BLOOM_DISABLE_UPDATE_CHECK";
+
+pub fn automatic_checks_disabled() -> bool {
+    std::env::var(DISABLE_AUTO_CHECK_ENV)
+        .map(|value| is_truthy(&value))
+        .unwrap_or(false)
+}
+
+fn is_truthy(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
 
 /// How long to wait for the GitHub response.
 const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
@@ -94,7 +111,7 @@ impl UpdateChecker {
     ) -> Result<Self, UpdateError> {
         let http = reqwest::Client::builder()
             .timeout(HTTP_TIMEOUT)
-            .user_agent(format!("{USER_AGENT_PREFIX}/{installed}"))
+            .user_agent(USER_AGENT_PREFIX)
             .build()?;
         // Seed from disk cache if present; otherwise leave as Unknown
         // until the first network refresh completes.
@@ -307,6 +324,16 @@ mod tests {
     }
 
     #[test]
+    fn disable_auto_check_accepts_common_truthy_values() {
+        for value in ["1", "true", "TRUE", "yes", "on", " on "] {
+            assert!(is_truthy(value), "expected {value:?} to disable checks");
+        }
+        for value in ["", "0", "false", "no", "off"] {
+            assert!(!is_truthy(value), "expected {value:?} to enable checks");
+        }
+    }
+
+    #[test]
     fn fresh_checker_is_unknown_until_refresh() {
         let dir = tempfile::tempdir().unwrap();
         let checker = UpdateChecker::new("0.1.0", dir.path()).unwrap();
@@ -411,7 +438,7 @@ mod tests {
             .expect("captured request")
             .to_ascii_lowercase();
         assert!(
-            request.contains("\r\nuser-agent: bloom/0.1.0\r\n"),
+            request.contains("\r\nuser-agent: bloom\r\n"),
             "request did not contain Bloom User-Agent:\n{request}"
         );
     }

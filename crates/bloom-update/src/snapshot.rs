@@ -161,7 +161,7 @@ impl UpdateSnapshot {
         ) else {
             return UpdateAvailable::Unknown;
         };
-        match installed.cmp(&latest) {
+        match installed.cmp_precedence(&latest) {
             std::cmp::Ordering::Less => UpdateAvailable::OutOfDate,
             _ => UpdateAvailable::UpToDate,
         }

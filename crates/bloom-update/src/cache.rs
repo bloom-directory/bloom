@@ -89,11 +89,21 @@ pub fn write(cache_dir: &Path, snapshot: &UpdateSnapshot) -> std::io::Result<()>
 /// "you are N releases behind" count.
 pub fn behind_by(snapshot: &UpdateSnapshot) -> Option<u64> {
     use crate::semver::parse_semver;
+    use crate::snapshot::UpdateStatus;
 
+    if snapshot.status_kind() != UpdateStatus::Ok {
+        return None;
+    }
     let installed = parse_semver(&snapshot.installed)?;
     let latest = parse_semver(snapshot.latest.as_deref()?)?;
-    match installed.cmp(&latest) {
-        std::cmp::Ordering::Less => Some(behind_count(installed, latest)),
+    match installed.cmp_precedence(&latest) {
+        std::cmp::Ordering::Less => {
+            let distance = behind_count(
+                (installed.major, installed.minor, installed.patch),
+                (latest.major, latest.minor, latest.patch),
+            );
+            Some(distance.max(1))
+        }
         _ => Some(0),
     }
 }
@@ -107,7 +117,7 @@ fn behind_count(installed: (u64, u64, u64), latest: (u64, u64, u64)) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::snapshot::UpdateStatus;
+    use crate::snapshot::{UpdateAvailable, UpdateStatus};
 
     fn snap() -> UpdateSnapshot {
         UpdateSnapshot::ok(
@@ -194,6 +204,15 @@ mod tests {
     }
 
     #[test]
+    fn behind_by_counts_prerelease_to_stable_as_one() {
+        let mut s = snap();
+        s.installed = "0.2.0-rc.1".into();
+        s.latest = Some("0.2.0".into());
+        assert_eq!(s.available(), UpdateAvailable::OutOfDate);
+        assert_eq!(behind_by(&s), Some(1));
+    }
+
+    #[test]
     fn behind_by_is_unknown_for_non_semver() {
         let mut s = snap();
         s.latest = Some("latest".into());
@@ -201,6 +220,14 @@ mod tests {
 
         s.latest = Some("0.2.0".into());
         s.installed = "development".into();
+        assert_eq!(behind_by(&s), None);
+    }
+
+    #[test]
+    fn behind_by_is_unknown_after_failed_refresh() {
+        let mut s = snap();
+        s.status = UpdateStatus::Error.as_str().to_string();
+        assert_eq!(s.available(), UpdateAvailable::Unknown);
         assert_eq!(behind_by(&s), None);
     }
 }

@@ -862,23 +862,20 @@ impl StatusHandler {
                     }),
                     "behind_by" => Ok(format!("{}\n", snap.behind_by.unwrap_or(0)).into_bytes()),
                     "checked_at" => {
-                        let secs = snap
-                            .checked_at
-                            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                            .map(|d| d.as_secs())
-                            .unwrap_or(0);
-                        let (y, mo, d, h, mi, se) = unix_to_civil(secs);
-                        Ok(format!(
-                            "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z\n",
-                            y, mo, d, h, mi, se
-                        )
-                        .into_bytes())
+                        Ok(format!("{}\n", format_update_checked_at(snap.checked_at)).into_bytes())
                     }
                     "release_url" => {
                         Ok(format!("{}\n", snap.release_url.as_deref().unwrap_or("")).into_bytes())
                     }
-                    "summary.json" => serde_json::to_vec_pretty(&snap)
-                        .map_err(|e| HandlerError::backend(e.to_string())),
+                    "summary.json" => serde_json::to_vec_pretty(&serde_json::json!({
+                        "installed": snap.installed,
+                        "latest": snap.latest.as_deref().unwrap_or(""),
+                        "available": update_available_label(snap.available),
+                        "behind_by": snap.behind_by.unwrap_or(0),
+                        "checked_at": format_update_checked_at(snap.checked_at),
+                        "release_url": snap.release_url.as_deref().unwrap_or(""),
+                    }))
+                    .map_err(|e| HandlerError::backend(e.to_string())),
                     _ => Err(HandlerError::NotAFile(path.to_string_path())),
                 }
             }
@@ -1095,6 +1092,25 @@ fn unix_to_civil(secs: u64) -> (i64, u32, u32, u32, u32, u32) {
     let mo = if mp < 10 { mp + 3 } else { mp - 9 } as u32; // [1, 12]
     let y = if mo <= 2 { y + 1 } else { y };
     (y, mo, d, h, m, s)
+}
+
+fn format_update_checked_at(time: Option<SystemTime>) -> String {
+    let Some(secs) = time
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+    else {
+        return String::new();
+    };
+    let (y, mo, d, h, mi, se) = unix_to_civil(secs);
+    format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", y, mo, d, h, mi, se)
+}
+
+fn update_available_label(available: UpdateAvailable) -> &'static str {
+    match available {
+        UpdateAvailable::OutOfDate => "out_of_date",
+        UpdateAvailable::UpToDate => "up_to_date",
+        UpdateAvailable::Unknown => "unknown",
+    }
 }
 
 #[cfg(test)]
@@ -1314,7 +1330,11 @@ mod tests {
         assert_eq!(v["latest"], serde_json::json!("0.2.0"));
         assert_eq!(v["available"], serde_json::json!("out_of_date"));
         assert_eq!(v["behind_by"], serde_json::json!(100));
-        assert!(v.get("release_url").is_some());
+        assert_eq!(v["checked_at"], serde_json::json!("1970-01-01T00:00:00Z"));
+        assert_eq!(
+            v["release_url"],
+            serde_json::json!("https://github.com/bloom-directory/bloom/releases/tag/v0.2.0")
+        );
     }
 
     #[tokio::test]
@@ -1349,6 +1369,23 @@ mod tests {
             b"0\n",
             "unknown behind_by should be 0, not 404"
         );
+        assert_eq!(
+            h.read(&VfsPath::parse("update/checked_at").unwrap())
+                .await
+                .unwrap(),
+            b"\n",
+            "unknown checked_at should be an empty line, not the Unix epoch"
+        );
+        let body = h
+            .read(&VfsPath::parse("update/summary.json").unwrap())
+            .await
+            .unwrap();
+        let summary: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(summary["latest"], serde_json::json!(""));
+        assert_eq!(summary["available"], serde_json::json!("unknown"));
+        assert_eq!(summary["behind_by"], serde_json::json!(0));
+        assert_eq!(summary["checked_at"], serde_json::json!(""));
+        assert_eq!(summary["release_url"], serde_json::json!(""));
     }
 
     #[tokio::test]
