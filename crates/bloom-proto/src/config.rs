@@ -70,11 +70,28 @@ pub struct Config {
     pub backends: BackendsConfig,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PetalsConfig {
+    /// Built-in Petals provisioned by explicit lifecycle commands such as
+    /// `bloom init`. An explicit empty list is a persistent opt-out.
+    #[serde(default = "default_preinstalled_petals")]
+    pub preinstalled: Vec<String>,
     #[serde(default)]
     pub runtime: BTreeMap<String, PetalRuntimeConfig>,
+}
+
+impl Default for PetalsConfig {
+    fn default() -> Self {
+        Self {
+            preinstalled: default_preinstalled_petals(),
+            runtime: BTreeMap::new(),
+        }
+    }
+}
+
+fn default_preinstalled_petals() -> Vec<String> {
+    vec!["polymarket".to_string()]
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -651,6 +668,20 @@ impl Config {
                 }
             }
         }
+        let mut seen_preinstalled = std::collections::BTreeSet::new();
+        for name in &self.petals.preinstalled {
+            validate_petal_runtime_name("preinstalled entry", name)?;
+            if !matches!(name.as_str(), "polymarket") {
+                return Err(ConfigError::Invalid(format!(
+                    "unknown preinstalled Petal {name:?}"
+                )));
+            }
+            if !seen_preinstalled.insert(name) {
+                return Err(ConfigError::Invalid(format!(
+                    "duplicate preinstalled Petal {name:?}"
+                )));
+            }
+        }
         Ok(())
     }
 
@@ -719,6 +750,7 @@ mod tests {
         assert_eq!(cfg.nfs_listen_addr, "127.0.0.1:12049");
         assert!(cfg.etherscan.is_none());
         assert!(cfg.enso.is_none());
+        assert_eq!(cfg.petals.preinstalled, ["polymarket"]);
         let polymarket = cfg
             .polymarket
             .as_ref()
@@ -803,6 +835,32 @@ mod tests {
                     .contains("must contain only ASCII letters, digits, '-' or '_'")
             );
         }
+    }
+
+    #[test]
+    fn preinstalled_petals_support_persistent_opt_out_and_validate_catalog_names() {
+        let mut cfg = Config::local_default();
+        cfg.petals.preinstalled.clear();
+        assert!(cfg.petals.preinstalled.is_empty());
+        cfg.validate().unwrap();
+
+        let serialized = toml::to_string_pretty(&cfg).unwrap();
+        let reloaded: Config = toml::from_str(&serialized).unwrap();
+        assert!(reloaded.petals.preinstalled.is_empty());
+
+        cfg.petals.preinstalled = vec!["unknown".into()];
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("unknown preinstalled Petal \"unknown\""),
+            "{err}"
+        );
+
+        cfg.petals.preinstalled = vec!["polymarket".into(), "polymarket".into()];
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("duplicate preinstalled Petal \"polymarket\""),
+            "{err}"
+        );
     }
 
     #[test]

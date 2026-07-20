@@ -1274,9 +1274,12 @@ async fn run(cli: Cli) -> Result<()> {
         Cmd::Init => {
             eprintln!("{ALPHA_DISCLOSURE}");
             let d = Daemon::from_home(home.clone()).context("init daemon")?;
+            let preinstalled = github_source::ensure_preinstalled_petals(&home, &d)
+                .context("provision configured pre-installed Petals")?;
             println!("home: {}", d.home.root().display());
             println!("config: {}", d.home.config_path().display());
             println!("chains: {:?}", d.chains.list_names());
+            println!("preinstalled_petals: {preinstalled:?}");
             println!("next: bloom wallet new main");
             println!("then: bloom wallet address main --qr");
             println!("mount: mkdir -p ~/bloom && bloom serve --mount ~/bloom");
@@ -2601,7 +2604,9 @@ async fn run(cli: Cli) -> Result<()> {
         }
         Cmd::Serve { endpoint, mount } => {
             eprintln!("{ALPHA_DISCLOSURE}");
-            let (_home_permit, d) = build_write_daemon(home)?;
+            let (_home_permit, d) = build_write_daemon(home.clone())?;
+            github_source::ensure_preinstalled_petals(&home, &d)
+                .context("provision configured pre-installed Petals before serving")?;
             // Spawn the outbox expiry sweeper for the lifetime of the
             // serve command (fix #3). The handle is dropped (and the task
             // signalled to stop) right before the function returns.

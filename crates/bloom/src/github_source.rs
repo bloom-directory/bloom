@@ -12,6 +12,25 @@ use serde::Deserialize;
 use url::Url;
 
 const TRUSTED_GITHUB_OWNER: &str = "bloom-directory";
+const POLYMARKET_PARITY_COMMIT: &str = "1ffb267a1e1d4acd137c184806c20cc98d20a3f4";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PreinstalledPetal {
+    pub name: &'static str,
+    pub repository: &'static str,
+    pub commit: &'static str,
+    pub expected_hash: Option<&'static str>,
+}
+
+const PREINSTALLED_POLYMARKET: PreinstalledPetal = PreinstalledPetal {
+    name: "polymarket",
+    repository: "https://github.com/bloom-directory/bloom-petal-polymarket",
+    commit: POLYMARKET_PARITY_COMMIT,
+    // Source builds are verified by immutable commit and recorded package
+    // provenance. Add a package hash when release builds are reproducible
+    // across every supported host toolchain.
+    expected_hash: None,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct GitHubRepo {
@@ -107,9 +126,29 @@ pub(crate) fn install_github_source(
     repo: &GitHubRepo,
     requested_ref: Option<&str>,
 ) -> Result<GitHubInstallOutput> {
+    install_github_source_with_expectation(home, daemon, repo, requested_ref, None)
+}
+
+fn install_github_source_with_expectation(
+    home: &HomeDir,
+    daemon: &Daemon,
+    repo: &GitHubRepo,
+    requested_ref: Option<&str>,
+    expected: Option<&PreinstalledPetal>,
+) -> Result<GitHubInstallOutput> {
     println!("Resolving {}", repo.canonical_url);
     let cache = fetch_repo_cache(home, repo)?;
     let resolved = resolve_ref(&cache, repo, requested_ref)?;
+    if let Some(expected) = expected
+        && resolved.commit != expected.commit
+    {
+        bail!(
+            "pre-installed Petal {} resolved commit {} does not match pinned commit {}",
+            expected.name,
+            resolved.commit,
+            expected.commit
+        );
+    }
     if let Some(tag) = &resolved.selected_tag {
         println!("Selected tag: {tag}");
     }
@@ -125,6 +164,25 @@ pub(crate) fn install_github_source(
     println!("Validating Petal package...");
     let package =
         PreparedPetalPackage::from_dir(tmp.path()).context("validate generated Petal package")?;
+    if let Some(expected) = expected {
+        if package.name != expected.name {
+            bail!(
+                "pre-installed Petal {} built unexpected package name {:?}",
+                expected.name,
+                package.name
+            );
+        }
+        if let Some(expected_hash) = expected.expected_hash
+            && package.hash != expected_hash
+        {
+            bail!(
+                "pre-installed Petal {} package hash {} does not match expected hash {}",
+                expected.name,
+                package.hash,
+                expected_hash
+            );
+        }
+    }
     let mut consent = petal_consent_summary(&package).context("build app consent summary")?;
     let bindings = daemon
         .config
@@ -159,6 +217,130 @@ pub(crate) fn install_github_source(
         consent,
         provenance,
     })
+}
+
+pub(crate) fn ensure_preinstalled_petals(home: &HomeDir, daemon: &Daemon) -> Result<Vec<String>> {
+    let owners = daemon
+        .petals
+        .store()
+        .list_petal_owners()
+        .context("list installed Petal owners before provisioning")?;
+    let owners = owners
+        .into_iter()
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let mut ready = Vec::new();
+
+    for name in &daemon.config.petals.preinstalled {
+        let entry = preinstalled_petal(name)
+            .ok_or_else(|| anyhow!("unknown pre-installed Petal {name:?}"))?;
+        if let Some(hash) = owners.get(name) {
+            let meta = daemon.petals.store().load_meta(hash).with_context(|| {
+                format!("load installed metadata for pre-installed Petal {name}")
+            })?;
+            validate_existing_preinstalled(entry, &meta)?;
+            println!(
+                "preinstalled_petal: {name} (already installed at {})",
+                &hash[..hash.len().min(bloom_petals::store::HASH_PREFIX_LEN)]
+            );
+            ready.push(name.clone());
+            continue;
+        }
+
+        println!(
+            "preinstalled_petal: installing {} from {}@{}",
+            entry.name, entry.repository, entry.commit
+        );
+        let repo = parse_github_install_url(entry.repository)?
+            .ok_or_else(|| anyhow!("built-in Petal repository is not a GitHub source URL"))?;
+        let installed = install_github_source_with_expectation(
+            home,
+            daemon,
+            &repo,
+            Some(entry.commit),
+            Some(entry),
+        )
+        .with_context(|| {
+            format!(
+                "provision pre-installed Petal {} from {}@{}; fix the cause and retry `bloom init`, or persistently opt out with `[petals] preinstalled = []`",
+                entry.name, entry.repository, entry.commit
+            )
+        })?;
+        validate_existing_preinstalled(entry, &installed.meta)?;
+        println!(
+            "preinstalled_petal: {} ready at petals/{}/",
+            entry.name, entry.name
+        );
+        ready.push(name.clone());
+    }
+
+    Ok(ready)
+}
+
+fn preinstalled_petal(name: &str) -> Option<&'static PreinstalledPetal> {
+    match name {
+        "polymarket" => Some(&PREINSTALLED_POLYMARKET),
+        _ => None,
+    }
+}
+
+fn validate_existing_preinstalled(
+    expected: &PreinstalledPetal,
+    meta: &bloom_petals::meta::PetalMeta,
+) -> Result<()> {
+    let package = meta
+        .petal
+        .as_ref()
+        .ok_or_else(|| anyhow!("installed owner {} is not a Petal package", expected.name))?;
+    if package.name != expected.name {
+        bail!(
+            "installed owner {} reports unexpected package name {:?}",
+            expected.name,
+            package.name
+        );
+    }
+    let source = meta.source.as_ref().ok_or_else(|| {
+        anyhow!(
+            "pre-installed Petal {} is already owned by an installation without source provenance; uninstall it or set `[petals] preinstalled = []`",
+            expected.name
+        )
+    })?;
+    let expected_repo = expected
+        .repository
+        .strip_prefix("https://github.com/")
+        .unwrap_or(expected.repository);
+    let actual_repo = format!("{}/{}", source.owner, source.repo);
+    if source.source_kind != "github"
+        || actual_repo != expected_repo
+        || source.resolved_commit != expected.commit
+    {
+        bail!(
+            "pre-installed Petal {} is already owned by {}@{} instead of {}@{}; Bloom will not overwrite it automatically",
+            expected.name,
+            actual_repo,
+            source.resolved_commit,
+            expected_repo,
+            expected.commit
+        );
+    }
+    if source.package_hash != meta.hash {
+        bail!(
+            "pre-installed Petal {} source provenance hash {} does not match installed hash {}",
+            expected.name,
+            source.package_hash,
+            meta.hash
+        );
+    }
+    if let Some(expected_hash) = expected.expected_hash
+        && meta.hash != expected_hash
+    {
+        bail!(
+            "pre-installed Petal {} hash {} does not match expected hash {}",
+            expected.name,
+            meta.hash,
+            expected_hash
+        );
+    }
+    Ok(())
 }
 
 fn is_raw_remote_wasm(input: &str) -> bool {
@@ -461,6 +643,7 @@ fn git_output(cwd: Option<&Path>, args: &[&str]) -> Result<std::process::Output>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bloom_petals::meta::{PetalMeta, PetalMode, PetalPackageMeta, PetalSourceProvenance};
     use bloom_proto::HomeDir;
     use bloom_vfs::VfsPath;
     use bloom_vfs::handler::Handler;
@@ -505,6 +688,88 @@ mod tests {
     fn selects_latest_semver_like_tag() {
         let latest = latest_semver_tag(["v0.1.0", "v0.10.0", "junk", "0.2.1"].into_iter()).unwrap();
         assert_eq!(latest.tag, "v0.10.0");
+    }
+
+    #[test]
+    fn built_in_polymarket_entry_is_immutable_and_catalogued() {
+        let entry = preinstalled_petal("polymarket").unwrap();
+        assert_eq!(entry.name, "polymarket");
+        assert_eq!(entry.commit.len(), 40);
+        assert!(entry.commit.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert!(entry.repository.ends_with("/bloom-petal-polymarket"));
+        assert!(preinstalled_petal("unknown").is_none());
+    }
+
+    #[test]
+    fn existing_preinstalled_package_must_match_source_commit_and_hash() {
+        let entry = preinstalled_petal("polymarket").unwrap();
+        let hash = "a".repeat(64);
+        let mut meta = PetalMeta {
+            hash: hash.clone(),
+            size: 1,
+            installed_at_ms: 1,
+            name: Some("polymarket".into()),
+            caps: Default::default(),
+            mode: PetalMode::Local,
+            petal: Some(PetalPackageMeta {
+                name: "polymarket".into(),
+                petal_root: "polymarket".into(),
+                route_index_schema: "test".into(),
+            }),
+            source: Some(PetalSourceProvenance {
+                source_kind: "github".into(),
+                url: entry.repository.into(),
+                owner: "bloom-directory".into(),
+                repo: "bloom-petal-polymarket".into(),
+                requested_ref: entry.commit.into(),
+                resolved_commit: entry.commit.into(),
+                selected_tag: None,
+                package_hash: hash,
+            }),
+        };
+        validate_existing_preinstalled(entry, &meta).unwrap();
+
+        meta.source.as_mut().unwrap().resolved_commit = "b".repeat(40);
+        let err = validate_existing_preinstalled(entry, &meta)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("will not overwrite it automatically"), "{err}");
+
+        meta.source.as_mut().unwrap().resolved_commit = entry.commit.into();
+        meta.source.as_mut().unwrap().package_hash = "c".repeat(64);
+        let err = validate_existing_preinstalled(entry, &meta)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("provenance hash"), "{err}");
+    }
+
+    #[test]
+    fn explicit_empty_preinstalled_list_is_network_free_and_idempotent() {
+        let home = tempfile::tempdir().unwrap();
+        let home_dir = HomeDir::at(home.path());
+        let mut config = bloom_proto::Config::local_default();
+        config.petals.preinstalled.clear();
+        config.save(&home_dir.config_path()).unwrap();
+        let daemon = Daemon::from_home(home_dir.clone()).unwrap();
+
+        assert!(
+            ensure_preinstalled_petals(&home_dir, &daemon)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            ensure_preinstalled_petals(&home_dir, &daemon)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            daemon
+                .petals
+                .store()
+                .list_petal_owners()
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
