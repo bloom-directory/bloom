@@ -1212,7 +1212,7 @@ fn github_source_install_polymarket_dispatches_route_contract() {
         .stdout(predicate::str::contains(format!(
             "resolved_commit: {petal_ref}"
         )))
-        .stdout(predicate::str::contains("routes: 94"));
+        .stdout(predicate::str::contains("routes: 95"));
 
     bloom_cmd(home.path())
         .args(["petals", "ls"])
