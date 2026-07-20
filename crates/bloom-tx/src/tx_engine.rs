@@ -4936,7 +4936,7 @@ mod tests {
     ) -> (TxEngine, tempfile::TempDir, HomeWritePermit, ChainClient) {
         let dir = tempfile::tempdir().unwrap();
         let outbox = crate::outbox::Outbox::new(dir.path().join("outbox")).unwrap();
-        let engine = TxEngine::new(outbox, 60_000, false).with_price_oracle(Arc::new(oracle));
+        let engine = TxEngine::new(outbox, 60_000).with_price_oracle(Arc::new(oracle));
         let permit = permit_for(&dir);
         let chain = stage_chain(url);
         (engine, dir, permit, chain)
