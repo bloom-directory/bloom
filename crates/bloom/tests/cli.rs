@@ -1212,6 +1212,17 @@ fn github_source_install_polymarket_dispatches_route_contract() {
         ));
 
     bloom_cmd(home.path())
+        .arg("init")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "preinstalled_petal: polymarket (already installed at ",
+        ))
+        .stdout(predicate::str::contains(
+            "preinstalled_petals: [\"polymarket\"]",
+        ));
+
+    bloom_cmd(home.path())
         .args(["petals", "ls"])
         .assert()
         .success()
