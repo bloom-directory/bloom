@@ -2255,6 +2255,7 @@ impl PriceOracle for BloomPricesOracle {
         &self,
         asset_id: &str,
         amount_base_units: &str,
+        native_decimals: Option<u8>,
         now_ms: u64,
     ) -> Result<ValuationQuote, AuthApiError> {
         let coin = parse_coin_id(asset_id)?;
@@ -2263,9 +2264,15 @@ impl PriceOracle for BloomPricesOracle {
             .current(coin)
             .await
             .map_err(|err| AuthApiError::Denied(format!("price oracle unavailable: {err}")))?;
-        let decimals = quote
-            .decimals
-            .ok_or_else(|| AuthApiError::Denied("price quote decimals missing".into()))?;
+        let decimals = if asset_id.starts_with("native:") {
+            native_decimals
+                .or(quote.decimals)
+                .ok_or_else(|| AuthApiError::Denied("price quote decimals missing".into()))?
+        } else {
+            quote
+                .decimals
+                .ok_or_else(|| AuthApiError::Denied("price quote decimals missing".into()))?
+        };
         if quote.timestamp == 0 {
             return Err(AuthApiError::Denied("price quote timestamp missing".into()));
         }

@@ -93,6 +93,8 @@ pub enum OutboxError {
     InvalidWallet(String),
     #[error("invalid chain '{0}'")]
     InvalidChain(String),
+    #[error("structured valuation unavailable for staged tx '{0}'")]
+    UnknownValuation(String),
     #[error("{0}")]
     Other(String),
 }
@@ -1014,8 +1016,9 @@ impl Outbox {
     /// stages becomes a trivial bypass.
     ///
     /// Legacy entries that only contain the old floating-point `usd_value`
-    /// field contribute zero because that field was not bound to an asset or
-    /// amount and may have originated from an untrusted hint.
+    /// field make the rolling ledger unavailable because that field was not
+    /// bound to an asset or amount and may have originated from an untrusted
+    /// hint. This fails closed for policies that require a trustworthy cap.
     pub fn sum_usd_since(&self, wallet: &str, since_ms: u128) -> Result<f64, OutboxError> {
         Self::validate_segment(wallet).map_err(|_| OutboxError::InvalidWallet(wallet.into()))?;
         let wallet_dir = self.inner.root.join(wallet);
@@ -1040,10 +1043,18 @@ impl Outbox {
                         continue;
                     }
                     let staged: StagedTx = serde_json::from_slice(&fs::read(&intent_path)?)?;
-                    if staged.created_ms >= since_ms
-                        && let Some(quote) = staged.valuation
-                        && quote.usd_micro >= 0
-                    {
+                    if staged.created_ms < since_ms {
+                        continue;
+                    }
+                    let Some(quote) = staged.valuation else {
+                        if staged.usd_value.is_some() {
+                            return Err(OutboxError::UnknownValuation(
+                                ent.path().display().to_string(),
+                            ));
+                        }
+                        continue;
+                    };
+                    if quote.usd_micro >= 0 {
                         total += quote.usd_micro as f64 / 1_000_000.0;
                     }
                 }
@@ -1455,8 +1466,8 @@ mod tests {
         assert!(matches!(r, Err(OutboxError::NotFound(_))));
     }
 
-    /// `sum_usd_since` ignores entries older than the cutoff and entries
-    /// without a structured valuation, and aggregates across chains/states.
+    /// `sum_usd_since` ignores entries older than the cutoff and unpriced
+    /// entries without a legacy USD hint, and aggregates across chains/states.
     #[test]
     fn sum_usd_since_aggregates_across_chains_and_states() {
         let dir = tempfile::tempdir().unwrap();
@@ -1508,8 +1519,8 @@ mod tests {
         d.usd_value = Some(999.0); // legacy-only value is unpriced
         ob.write_pending(&d, "p").unwrap();
 
-        let total = ob.sum_usd_since("alice", 1_000).unwrap();
-        assert!((total - 150.0).abs() < 1e-6, "got {total}");
+        let result = ob.sum_usd_since("alice", 1_000);
+        assert!(matches!(result, Err(OutboxError::UnknownValuation(_))));
     }
 
     #[test]

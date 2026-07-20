@@ -673,7 +673,17 @@ impl DefiHandler {
         }
         let (asset_id, amount_base_units) = Self::route_input_valuation_target(source_chain, req);
         let now = now_ms() as u64;
-        match oracle.quote_usd(&asset_id, &amount_base_units, now).await {
+        let native_decimals = (req.token_in == NATIVE_TOKEN_ADDR)
+            .then(|| {
+                self.chains
+                    .get(source_chain)
+                    .map(|chain| chain.spec().native_decimals)
+            })
+            .flatten();
+        match oracle
+            .quote_usd(&asset_id, &amount_base_units, native_decimals, now)
+            .await
+        {
             Ok(quote)
                 if quote.asset_id == asset_id
                     && quote.amount_base_units == amount_base_units

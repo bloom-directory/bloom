@@ -1540,7 +1540,14 @@ impl TxEngine {
                 && let Some(oracle) = &self.price_oracle
             {
                 match oracle
-                    .quote_usd(asset_id, amount_base_units, now_ms as u64)
+                    .quote_usd(
+                        asset_id,
+                        amount_base_units,
+                        asset_id
+                            .strip_prefix("native:")
+                            .map(|_| spec.native_decimals),
+                        now_ms as u64,
+                    )
                     .await
                 {
                     Ok(quote)
@@ -4749,6 +4756,7 @@ mod tests {
             &self,
             asset_id: &str,
             amount_base_units: &str,
+            _native_decimals: Option<u8>,
             now_ms: u64,
         ) -> Result<bloom_auth_api::ValuationQuote, bloom_auth_api::AuthApiError> {
             self.calls

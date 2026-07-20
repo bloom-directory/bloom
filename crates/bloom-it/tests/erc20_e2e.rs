@@ -83,6 +83,7 @@ impl PriceOracle for TestPriceOracle {
         &self,
         asset_id: &str,
         amount_base_units: &str,
+        _native_decimals: Option<u8>,
         now_ms: u64,
     ) -> std::result::Result<ValuationQuote, AuthApiError> {
         Ok(ValuationQuote {

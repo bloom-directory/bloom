@@ -120,6 +120,7 @@ impl PriceOracle for PricesOracle {
         &self,
         asset_id: &str,
         amount_base_units: &str,
+        native_decimals: Option<u8>,
         now_ms: u64,
     ) -> Result<ValuationQuote, AuthApiError> {
         let coin = Self::coin_for_asset(asset_id)?;
@@ -127,14 +128,20 @@ impl PriceOracle for PricesOracle {
             self.client.current(coin).await.map_err(|error| {
                 AuthApiError::Denied(format!("price oracle unavailable: {error}"))
             })?;
-        // Native asset ids are EVM native assets, whose base unit is always
-        // 18 decimals. DefiLlama may omit decimals for native quotes, but an
-        // omitted token-contract decimal is still unresolvable and must fail
-        // closed.
+        // Native asset decimals are chain-configured and must take precedence
+        // over the provider metadata. DefiLlama may omit native decimals, but
+        // an omitted token-contract decimal is still unresolvable and must
+        // fail closed.
         let decimals = quote
             .decimals
+            .or_else(|| asset_id.strip_prefix("native:").and(native_decimals))
             .or_else(|| asset_id.strip_prefix("native:").map(|_| 18u8))
             .ok_or_else(|| AuthApiError::Denied("price quote decimals missing".into()))?;
+        let decimals = if asset_id.starts_with("native:") {
+            native_decimals.unwrap_or(decimals)
+        } else {
+            decimals
+        };
         if quote.timestamp == 0 {
             return Err(AuthApiError::Denied("price quote timestamp missing".into()));
         }
@@ -241,12 +248,31 @@ mod tests {
         let oracle = PricesOracle::new(PricesClient::with_base_url(url));
 
         let quote = oracle
-            .quote_usd("native:anvil", "1000000000000000000", 1_700_000_000_000)
+            .quote_usd(
+                "native:anvil",
+                "1000000000000000000",
+                None,
+                1_700_000_000_000,
+            )
             .await
             .unwrap();
 
         assert_eq!(quote.asset_id, "native:anvil");
         assert_eq!(quote.amount_base_units, "1000000000000000000");
+        assert_eq!(quote.usd_micro, 3_500_500_000);
+    }
+
+    #[tokio::test]
+    async fn native_quote_uses_configured_decimals_over_provider_metadata() {
+        let body = r#"{"coins":{"coingecko:ethereum":{"price":3500.5,"timestamp":1700000000,"decimals":18}}}"#;
+        let url = one_shot_price_server(body).await;
+        let oracle = PricesOracle::new(PricesClient::with_base_url(url));
+
+        let quote = oracle
+            .quote_usd("native:anvil", "1000000000", Some(9), 1_700_000_000_000)
+            .await
+            .unwrap();
+
         assert_eq!(quote.usd_micro, 3_500_500_000);
     }
 }

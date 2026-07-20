@@ -3256,6 +3256,7 @@ pub trait PriceOracle: Send + Sync {
         &self,
         asset_id: &str,
         amount_base_units: &str,
+        native_decimals: Option<u8>,
         now_ms: u64,
     ) -> Result<ValuationQuote, AuthApiError>;
 }
