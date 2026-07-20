@@ -14,8 +14,8 @@ fn default_true() -> bool {
 /// `[polymarket]` section of a wallet's policy file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PolymarketPolicy {
-    /// Master gate. Defaults to **false**: the wallet owner must opt in.
-    #[serde(default)]
+    /// Master gate. Defaults to **true**; wallet policy can disable trading.
+    #[serde(default = "default_true")]
     pub enabled: bool,
     /// Hard cap per order, micro-USD (TOML: decimal string, e.g. `"10"`).
     #[serde(default, with = "crate::serde_micro")]
@@ -45,7 +45,7 @@ pub struct PolymarketPolicy {
 impl Default for PolymarketPolicy {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             max_order_usd: None,
             max_daily_usd: None,
             require_flag_above_usd: None,
@@ -64,9 +64,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn defaults_are_fail_closed() {
+    fn default_preserves_enabled_policy_compatibility() {
         let policy = PolymarketPolicy::default();
-        assert!(!policy.enabled);
+        assert!(policy.enabled);
         assert!(policy.max_order_usd.is_none());
         assert!(policy.max_daily_usd.is_none());
     }

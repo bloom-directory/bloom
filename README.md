@@ -162,9 +162,9 @@ the wallet outbox.
 
 See [QUICKSTART.md](./QUICKSTART.md) for an Anvil-backed walkthrough
 and [docs/AUDIT.md](./docs/AUDIT.md) for the per-surface implementation
-map and live-network verification log. See
-[docs/parity/VFS_CLI_PARITY_LEDGER.md](./docs/parity/VFS_CLI_PARITY_LEDGER.md)
-for the current VFS/CLI workflow parity matrix.
+map and live-network verification log. The
+[VFS/CLI parity ledger](./docs/parity/VFS_CLI_PARITY_LEDGER.md) is retained as
+a dated historical snapshot, not as current product documentation.
 
 ## Architecture
 

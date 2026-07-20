@@ -1,7 +1,7 @@
 # Pre-installed Petals and Native Polymarket Removal
 
-**Status:** Implementation specification  
-**Date:** 2026-07-20  
+**Status:** Implementation specification
+**Date:** 2026-07-20
 **Primary PR:** bloom-directory/bloom#107
 
 ## Summary
