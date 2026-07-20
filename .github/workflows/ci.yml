@@ -182,8 +182,6 @@ jobs:
       BLOOM_MAINNET_RPC: ${{ secrets.BLOOM_MAINNET_RPC }}
       BLOOM_ETHERSCAN_KEY: ${{ secrets.BLOOM_ETHERSCAN_KEY }}
       BLOOM_ENSO_KEY: ${{ secrets.BLOOM_ENSO_KEY }}
-      BLOOM_LIVE_POLYMARKET: ${{ secrets.BLOOM_LIVE_POLYMARKET }}
-      POLYGON_RPC_URL: ${{ secrets.POLYGON_RPC_URL }}
     steps:
       - uses: actions/checkout@v6
       - name: Install Rust toolchain
@@ -201,7 +199,7 @@ jobs:
           path: target
       - name: Report external secret availability
         run: |
-          for name in BLOOM_MAINNET_RPC BLOOM_ETHERSCAN_KEY BLOOM_ENSO_KEY BLOOM_LIVE_POLYMARKET POLYGON_RPC_URL; do
+          for name in BLOOM_MAINNET_RPC BLOOM_ETHERSCAN_KEY BLOOM_ENSO_KEY; do
             if [ -n "${!name:-}" ]; then
               echo "$name=available"
             else
@@ -215,7 +213,7 @@ jobs:
             --run-ignored ignored-only \
             --no-fail-fast
           cargo nextest run --archive-file target/nextest-archive.tar.zst \
-            -E 'kind(lib) and (package(bloom-defi) or package(bloom-etherscan) or package(bloom-polymarket) or package(bloom-prices))' \
+            -E 'kind(lib) and (package(bloom-defi) or package(bloom-etherscan) or package(bloom-prices))' \
             --run-ignored ignored-only \
             --no-fail-fast
           cargo nextest run --archive-file target/nextest-archive.tar.zst \

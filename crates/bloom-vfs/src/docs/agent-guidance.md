@@ -26,17 +26,22 @@ bloom gatekeeps every value-moving action through capabilities:
 - **Automated action uses a capability.** Create a bounded session/capability
   first — the human approves the bounds once, then the agent operates inside
   them without re-prompting until expiry, breach, or revocation.
-- **The owner key is never exposed through the VFS.** Use the mounted challenge,
-  capability, and session paths; never ask for or handle private key material.
+- **The owner key is never handed off.** For capabilities that depend on owner
+  signing (EVM and installed Petals), the key will
+  reside in daemon RAM for a bounded window and auto-lock on expiry.
+  Hyperliquid already uses an ephemeral agent key that does not need the
+  owner key after session creation.
+
 To see what a wallet can do without a human, check its per-chain state and
 outbox, or its Hyperliquid sessions under `hyperliquid/<net>/agent_sessions/`.
 A read-only `wallets/<wallet>/capabilities/` roll-up and a VFS-root `next.md`
 aggregator expose the current capability and next-action view when the daemon
 has the relevant handlers mounted.
 
-Read `hyperliquid/README.md` for Hyperliquid trading (session-first).
-Read `polymarket/README.md` for prediction-market trading.
-Read `defi/README.md` for DeFi intents via Enso shortcuts.
+Read `/hyperliquid/README.md` for Hyperliquid trading (session-first).
+If the external Polymarket Petal is installed, read
+`/petals/polymarket/README.md` before using its prediction-market routes.
+Read `/defi/README.md` for DeFi intents via Enso shortcuts.
 
 ## Wallets
 
@@ -241,13 +246,13 @@ Hyperliquid trading uses Sealed Approval for owner authority:
   Generic owner-signed order/cancel/update-leverage writes are disabled; use
   agent sessions.
 
-## Polymarket
+## Polymarket Petal
 
-Prediction-market trading lives under `polymarket` and is human-gated. Read
-`polymarket/README.md`, inspect the mounted market and account paths, and use
-the advertised write surfaces. When a write produces
-`approval_challenge.json`, verify its action and expiry, forward its
-`ceremony_url` to the owner, and retry the same VFS write after approval.
+Polymarket is not built into Bloom. `bloom init` provisions the pinned default
+`bloom-directory/bloom-petal-polymarket` package at `/petals/polymarket/`.
+Read that installed Petal's `README.md` and route documentation for its current
+onboarding, policy, approval, and trading workflow. Do not use the removed
+`/polymarket` paths or `bloom polymarket` commands.
 
 ## Passkey policy mode
 

@@ -10,12 +10,6 @@ pub enum CeremonyIntentKind {
     WalletUnlock,
     SignPolicy,
     EvmTransaction,
-    PolymarketOrder,
-    PolymarketCancel,
-    PolymarketSell,
-    PolymarketFund,
-    PolymarketRedeem,
-    PolymarketRevokeApprovals,
     RunCapability,
     Other,
 }

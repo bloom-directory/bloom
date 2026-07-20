@@ -49,7 +49,6 @@ use bloom_petals::{
     PetalHost, PetalRouter, PetalRunner, PetalStore, PetalVm, SignBatchOutcome, SignBatchRequest,
     SignOutcome, SignRequest,
 };
-use bloom_polymarket::{ClobClient, CredentialStore, DataClient, GammaClient};
 use bloom_prices::PricesClient;
 use bloom_proto::audit::AuditRecord;
 use bloom_proto::{
@@ -63,12 +62,11 @@ use bloom_revert::{
 use bloom_tx::outbox::{CentralActionIdentity, CentralOutboxProjection, Outbox, OutboxState};
 use bloom_tx::tx_engine::{Eip1559FeeOverrides, TxEngine};
 use bloom_vfs::handlers::outbox::StagedPetalIdentity;
-use bloom_vfs::handlers::polymarket::{ChainClientReader, PolymarketOnboarding, build_onboarder};
 use bloom_vfs::handlers::status::{MempoolBackendStatus, PrivateRpcBackendStatus};
 use bloom_vfs::handlers::{
     AddressBookHandler, CentralOutbox, ChainsHandler, DefiHandler, DocsHandler, EnsHandler,
-    HyperliquidHandler, OutboxHandler, PolymarketHandler, PricesHandler, RequestsHandler,
-    SimulateHandler, StatusHandler, ToolsHandler, WalletsHandler, WatchHandler,
+    HyperliquidHandler, OutboxHandler, PricesHandler, RequestsHandler, SimulateHandler,
+    StatusHandler, ToolsHandler, WalletsHandler, WatchHandler,
 };
 use bloom_vfs::{AuthServices, PathCache, Vfs};
 use bloom_watch::{WatchExecutor, WatchRegistry};
@@ -2267,7 +2265,6 @@ impl Daemon {
                     .with_auth_services(auth_services.clone())
                     .with_home_write_permit_opt(home_write_permit.clone())
                     .with_mempool_indexes(mempool_indexes.clone())
-                    .with_polymarket_root(home.polymarket_dir())
                     .with_hyperliquid_handler(hyperliquid_handler.clone()),
                 ) as _,
             )
@@ -2362,87 +2359,12 @@ impl Daemon {
                     .with_home_write_permit_opt(home_write_permit.clone())
                     .with_default_chain(config.default_chain.clone())
                     .with_store_root(home.root().join("defi"))
-                    .with_polymarket_root(home.polymarket_dir())
                     .with_revert_decoder(decoder_chain.clone())
                     .with_hyperliquid(hl_bridge, hl_deposit_chain_id),
                 ) as _,
             );
         } else {
             debug!("daemon.defi_skipped: no [enso] config");
-        }
-
-        // Polymarket: public read surface (Gamma/Data/CLOB) plus, when a
-        // `[chains]` entry matches the Polymarket chain id (Polygon 137), the
-        // onboarding state machine and L2 account views. Polymarket is enabled
-        // by default with public endpoints; `[polymarket] enabled = false`
-        // provides a persistent opt-out and other fields override the defaults.
-        // Signing never leaves the daemon (Keystore::signer → KeystoreSigner).
-        if let Some(pm_cfg) = config.polymarket.as_ref().filter(|cfg| cfg.enabled) {
-            let pm_url = |raw: &str| match url::Url::parse(raw) {
-                Ok(u) => Some(u),
-                Err(e) => {
-                    warn!(url = %raw, error = %e, "daemon.polymarket_url_invalid_using_default");
-                    None
-                }
-            };
-            let mut gamma = GammaClient::new();
-            if let Some(u) = pm_url(&pm_cfg.gamma_url) {
-                gamma = gamma.with_base_url(u);
-            }
-            let mut data = DataClient::new();
-            if let Some(u) = pm_url(&pm_cfg.data_url) {
-                data = data.with_base_url(u);
-            }
-            let mut clob = ClobClient::new(pm_cfg.chain_id);
-            if let Some(u) = pm_url(&pm_cfg.clob_url) {
-                clob = clob.with_base_url(u);
-            }
-
-            let mut handler = PolymarketHandler::new(gamma, data, clob.clone(), keystore.clone())
-                .with_auth_services(auth_services.clone())
-                .with_order_store(bloom_polymarket::OrderStore::new(home.polymarket_dir()))
-                .with_fund_store(home.polymarket_dir())
-                .with_builder_key_store(bloom_polymarket::BuilderCredentialStore::new(
-                    home.polymarket_dir(),
-                ));
-            // Resolve the settlement chain by id — onboarding needs RPC reads
-            // (code/balances/allowances) for its idempotency probes.
-            let polygon = chains
-                .list_names()
-                .into_iter()
-                .filter_map(|n| chains.get(&n))
-                .find(|c| c.spec().chain_id == pm_cfg.chain_id);
-            match polygon {
-                Some(chain_client) => {
-                    let state_dir = home.polymarket_dir();
-                    let chain: Arc<dyn bloom_polymarket::ChainReader> =
-                        Arc::new(ChainClientReader(chain_client.clone()));
-                    // Factory selects the path (relayer_api_key present ⇒
-                    // deposit-wallet, else EOA) and applies the configured URLs.
-                    let onboarder = build_onboarder(pm_cfg, chain_client, &state_dir);
-                    debug!(
-                        chain_id = pm_cfg.chain_id,
-                        "daemon.polymarket_onboarding_wired"
-                    );
-                    handler = handler
-                        .with_onboarding(PolymarketOnboarding {
-                            onboarder: Arc::new(onboarder),
-                            auth_dir: state_dir.clone(),
-                            creds: CredentialStore::new(&state_dir),
-                            chain,
-                        })
-                        .with_audit(audit_arc.clone());
-                }
-                None => warn!(
-                    chain_id = pm_cfg.chain_id,
-                    "polymarket onboarding disabled: no [chains.*] entry with this chain_id; \
-                     mounting the read surface only"
-                ),
-            }
-            debug!(chain_id = pm_cfg.chain_id, "daemon.polymarket_mounted");
-            vfs_builder = vfs_builder.mount("polymarket", Arc::new(handler) as _);
-        } else {
-            debug!("daemon.polymarket_skipped: disabled by config");
         }
 
         // /next.md — brutally-scoped next-action aggregator for agents.
@@ -3026,22 +2948,9 @@ mod tests {
             "fresh homes should mount Hyperliquid with public defaults"
         );
         assert!(
-            d.vfs.handler("polymarket").is_some(),
-            "fresh homes should mount Polymarket with public defaults"
+            d.vfs.handler("polymarket").is_none(),
+            "native Polymarket must not be mounted; use petals/polymarket"
         );
-    }
-
-    #[test]
-    fn explicit_polymarket_opt_out_skips_vfs_mount() {
-        let dir = tempfile::tempdir().unwrap();
-        let home = HomeDir::at(dir.path());
-        let mut config = Config::local_default();
-        config.polymarket.as_mut().unwrap().enabled = false;
-        config.save(&home.config_path()).unwrap();
-
-        let d = Daemon::from_home(home).unwrap();
-        assert!(!d.config.polymarket.as_ref().unwrap().enabled);
-        assert!(d.vfs.handler("polymarket").is_none());
     }
 
     #[tokio::test]

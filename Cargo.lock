@@ -2266,7 +2266,6 @@ dependencies = [
  "bloom-keystore",
  "bloom-mount",
  "bloom-petals",
- "bloom-polymarket",
  "bloom-proto",
  "bloom-tx",
  "bloom-vfs",
@@ -2339,7 +2338,6 @@ dependencies = [
  "bloom-mount",
  "bloom-paid-http",
  "bloom-petals",
- "bloom-polymarket",
  "bloom-prices",
  "bloom-proto",
  "bloom-revert",
@@ -2631,28 +2629,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "bloom-polymarket"
-version = "0.1.0"
-dependencies = [
- "alloy 2.0.5",
- "async-trait",
- "base64 0.22.1",
- "blake3",
- "bloom-proto",
- "hex",
- "hmac 0.12.1",
- "rand 0.8.6",
- "reqwest 0.12.28",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "url",
-]
-
-[[package]]
 name = "bloom-prices"
 version = "0.1.0"
 dependencies = [
@@ -2785,7 +2761,6 @@ dependencies = [
  "bloom-paid-http",
  "bloom-paid-mpp",
  "bloom-paid-x402",
- "bloom-polymarket",
  "bloom-prices",
  "bloom-proto",
  "bloom-revert",

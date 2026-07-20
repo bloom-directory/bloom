@@ -114,18 +114,16 @@ cat /bloom/wallets/alice/chains/ethereum/outbox/pending/0001-*/plan.md
 echo y > /bloom/wallets/alice/chains/ethereum/outbox/pending/0001-*/confirm
 ```
 
-## Polymarket (prediction markets)
+## Polymarket (external Petal)
 
-The mounted Polymarket surface is human-gated. Start with its own live
-instructions and discover the paths that are present:
+Bloom does not ship a native Polymarket CLI or root-level VFS subtree.
+`bloom init` provisions the pinned default package; follow the documentation
+served by that exact package version:
 
 ```sh
-cat /bloom/polymarket/README.md
-ls /bloom/polymarket/
-ls /bloom/polymarket/markets/
-ls /bloom/polymarket/account/alice/
+bloom init
+bloom vfs cat /petals/polymarket/README.md
 ```
 
-Use only the read and write paths advertised by those listings. For any write
-that creates `approval_challenge.json`, verify the action and expiry, forward
-its `ceremony_url` to the owner, and retry the same VFS write after approval.
+The installed Petal owns its routes and venue-specific state. Bloom supplies the
+generic HTTP, chain-read, storage, outbox, signing, and approval host contracts.

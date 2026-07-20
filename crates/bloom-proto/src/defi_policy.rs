@@ -5,8 +5,8 @@
 //! not *route shape*: which chains, which receiver, which router/protocols,
 //! and how much output is actually guaranteed. This section adds those gates.
 //!
-//! Design follows [`crate::polymarket_policy`]: default-deny master gate,
-//! deny-beats-allow, empty-allowlist semantics, integer micro-USD money (no
+//! The design uses a default-deny master gate, deny-beats-allow and
+//! empty-allowlist semantics, with integer micro-USD money (no
 //! `f64` in decisions), and `PolicyCheck` output so plans render uniformly.
 //!
 //! Three findings from the red-team are baked in:
@@ -21,8 +21,8 @@
 //!   un-decoded calldata.
 //! - **B3 (classification, not literals).** Receiver allowlist entries may be
 //!   raw `chain:token:address` literals OR classification tokens
-//!   (`class:<receiver_class>`), so a resolver (durable onboarding state,
-//!   addressbook) is the single source of truth and a hand-typed address can't
+//!   (`class:<receiver_class>`), so a resolver (wallet state or addressbook)
+//!   is the single source of truth and a hand-typed address can't
 //!   silently disagree with what bloom resolved.
 //! - **S1 (no unit-unverified money knobs).** There is deliberately no
 //!   `max_price_impact_*` / `max_route_fee_*` field: Enso's `priceImpact` unit
@@ -43,9 +43,7 @@ fn default_true() -> bool {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DefiPolicy {
     /// Master gate. Defaults to **false**: the generic DeFi route surface
-    /// refuses all value-moving routes until the owner opts in. (Note: the
-    /// purpose-built `bloom polymarket fund` command has its own validations
-    /// and is not gated by this flag — see the command docs.)
+    /// refuses all value-moving routes until the owner opts in.
     #[serde(default)]
     pub enabled: bool,
     /// Source chains a route may originate on. Empty ⇒ none allowed.
@@ -57,7 +55,7 @@ pub struct DefiPolicy {
     /// Receiver allowlist. Entries are either:
     /// - a literal `"<chain>:<token>:<address>"` (all lower-case), or
     /// - a classification token `"class:<receiver_class>"`
-    ///   (e.g. `"class:polymarket_deposit_wallet"`, `"class:wallet_eoa"`).
+    ///   (e.g. `"class:wallet_eoa"`, `"class:addressbook_alias"`).
     ///
     /// Empty ⇒ unknown receivers refuse. Deny always wins.
     #[serde(default)]
@@ -166,9 +164,6 @@ mod wei_opt {
 pub enum ReceiverClass {
     /// The wallet's own owner EOA.
     WalletEoa,
-    /// This wallet's Polymarket deposit wallet (resolved from onboarding
-    /// state / the live factory — not a hardcoded address).
-    PolymarketDepositWallet,
     /// A named entry in the wallet's address book.
     AddressbookAlias,
     /// A well-known system/contract address.
@@ -181,7 +176,6 @@ impl ReceiverClass {
     pub fn as_str(self) -> &'static str {
         match self {
             ReceiverClass::WalletEoa => "wallet_eoa",
-            ReceiverClass::PolymarketDepositWallet => "polymarket_deposit_wallet",
             ReceiverClass::AddressbookAlias => "addressbook_alias",
             ReceiverClass::KnownSystemAddress => "known_system_address",
             ReceiverClass::Unknown => "unknown",
@@ -542,9 +536,7 @@ mod tests {
             enabled: true,
             allowed_source_chains: ["polygon".into()].into_iter().collect(),
             allowed_destination_chains: BTreeSet::new(),
-            allowed_receivers: ["class:polymarket_deposit_wallet".into()]
-                .into_iter()
-                .collect(),
+            allowed_receivers: ["class:wallet_eoa".into()].into_iter().collect(),
             denied_receivers: BTreeSet::new(),
             allowed_routers: ["polygon:0xf75584ef6673ad213a685a1b58cc0330b8ea22cf".into()]
                 .into_iter()
@@ -565,7 +557,7 @@ mod tests {
             cross_chain: false,
             receiver: "0x1000000000000000000000000000000000000001".into(),
             token_out: "0xc011a7e12a19f7b1f670d46f03b03f3342e82dfb".into(),
-            receiver_class: ReceiverClass::PolymarketDepositWallet,
+            receiver_class: ReceiverClass::WalletEoa,
             router: "0xf75584ef6673ad213a685a1b58cc0330b8ea22cf".into(),
             protocols: vec!["enso".into()],
             protocols_unknown: false,
@@ -663,9 +655,7 @@ mod tests {
     #[test]
     fn deny_receiver_wins_over_allow() {
         let mut p = enabled_policy();
-        p.denied_receivers = ["class:polymarket_deposit_wallet".into()]
-            .into_iter()
-            .collect();
+        p.denied_receivers = ["class:wallet_eoa".into()].into_iter().collect();
         assert!(has_deny(&evaluate_defi_route(&p, &clean_ctx())));
     }
 
@@ -751,7 +741,7 @@ mod tests {
 enabled = true
 allowed_source_chains = ["polygon", "base"]
 allowed_destination_chains = ["polygon"]
-allowed_receivers = ["class:polymarket_deposit_wallet"]
+allowed_receivers = ["class:wallet_eoa"]
 allowed_routers = ["polygon:0xabc"]
 denied_protocols = ["sketchybridge"]
 max_input_usd = "25"
@@ -764,9 +754,6 @@ max_native_value_wei = "75000000000000000000"
             p.max_native_value_wei,
             Some(U256::from(75u64) * U256::from(10u64).pow(U256::from(18u64)))
         );
-        assert!(
-            p.allowed_receivers
-                .contains("class:polymarket_deposit_wallet")
-        );
+        assert!(p.allowed_receivers.contains("class:wallet_eoa"));
     }
 }

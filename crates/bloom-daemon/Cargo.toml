@@ -37,7 +37,6 @@ bloom-mempool.workspace = true
 bloom-tx.workspace = true
 bloom-vfs.workspace = true
 bloom-defi.workspace = true
-bloom-polymarket.workspace = true
 bloom-hyperliquid.workspace = true
 bloom-watch.workspace = true
 bloom-mount.workspace = true

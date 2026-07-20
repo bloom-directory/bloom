@@ -122,7 +122,7 @@ pub struct DefiSession {
     #[serde(default)]
     pub policy_checks: serde_json::Value,
     /// Receiver classification recorded for review (`wallet_eoa`,
-    /// `polymarket_deposit_wallet`, `addressbook_alias`, `unknown`, …).
+    /// `wallet_eoa`, `addressbook_alias`, `unknown`, …).
     #[serde(default)]
     pub receiver_class: Option<String>,
 }
@@ -202,10 +202,6 @@ pub struct DefiHandler {
     /// to simulation/confirm failures. Defaults to an empty chain so the
     /// handler still works in tests; the daemon wires a real chain in.
     revert_decoder: Arc<DecoderChain>,
-    /// Polymarket state root (`~/.bloom/polymarket`), wired by the daemon.
-    /// Enables `polymarket_deposit_wallet` receiver classification from
-    /// durable onboarding state. `None` ⇒ that class is unavailable.
-    polymarket_root: Option<PathBuf>,
     /// Hyperliquid Bridge2 address (deposit receiver) and the chain whose
     /// native USDC it credits. Defaults to the mainnet bridge / Arbitrum;
     /// the daemon may override from `[hyperliquid]` config.
@@ -234,7 +230,6 @@ impl DefiHandler {
             default_chain: "ethereum".into(),
             next_id: Arc::new(RwLock::new(1)),
             revert_decoder: Arc::new(DecoderChain::new()),
-            polymarket_root: None,
             hl_bridge: bloom_proto::hyperliquid::MAINNET_BRIDGE
                 .parse()
                 .expect("valid hyperliquid bridge const"),
@@ -263,14 +258,6 @@ impl DefiHandler {
 
     pub fn with_home_write_permit_opt(mut self, permit: Option<Arc<HomeWritePermit>>) -> Self {
         self.home_write_permit = permit;
-        self
-    }
-
-    /// Wire the Polymarket state root so cross-chain/funding routes can be
-    /// classified as `polymarket_deposit_wallet` from durable onboarding
-    /// state (not a hardcoded or locally-derived address).
-    pub fn with_polymarket_root(mut self, root: impl Into<PathBuf>) -> Self {
-        self.polymarket_root = Some(root.into());
         self
     }
 
@@ -579,24 +566,13 @@ impl DefiHandler {
     }
 
     /// Classify a route receiver from durable state — never guessed from the
-    /// route. Order: owner EOA → polymarket deposit wallet → addressbook
-    /// alias → unknown.
+    /// route. Order: owner EOA → addressbook alias → unknown.
     fn classify_receiver(&self, wallet: &str, receiver: Address) -> bloom_proto::ReceiverClass {
         use bloom_proto::ReceiverClass;
         if let Ok(info) = self.keystore.info(wallet)
             && info.address == receiver
         {
             return ReceiverClass::WalletEoa;
-        }
-        if let Some(root) = &self.polymarket_root
-            && let Ok(Some(st)) = bloom_polymarket::OnboardStore::new(root).load(wallet)
-            && st
-                .deposit_wallet
-                .parse::<Address>()
-                .map(|dw| dw == receiver)
-                .unwrap_or(false)
-        {
-            return ReceiverClass::PolymarketDepositWallet;
         }
         if self.address_book.alias_for(&receiver).is_some() {
             return ReceiverClass::AddressbookAlias;
@@ -988,9 +964,7 @@ impl DefiHandler {
 
         // ── route policy gate (B1/B2): re-evaluate from CURRENT policy, not
         // the session snapshot, and refuse on any Deny BEFORE staging. This
-        // gate is on the generic defi/intents surface only; the purpose-built
-        // `bloom polymarket fund` command stages through its own validated
-        // path and is not affected by `[defi] enabled`.
+        // gate is on the generic defi/intents surface.
         if let (Some(req), Some(route)) = (sess.route_request.as_ref(), sess.route.as_ref()) {
             let dest = sess
                 .destination_chain

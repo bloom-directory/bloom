@@ -239,7 +239,29 @@ fn help_lists_all_subcommands() {
         .stdout(predicate::str::contains("serve"))
         .stdout(predicate::str::contains("ipc"))
         .stdout(predicate::str::contains("petals"))
-        .stdout(predicate::str::contains("init"));
+        .stdout(predicate::str::contains("init"))
+        .stdout(predicate::str::contains("polymarket").not());
+}
+
+#[test]
+fn init_respects_persistent_preinstalled_petal_opt_out_without_network() {
+    let home = fresh_home();
+    let home_dir = bloom_proto::HomeDir::at(home.path());
+    let mut config = bloom_proto::Config::local_default();
+    config.petals.preinstalled.clear();
+    config.save(&home_dir.config_path()).unwrap();
+
+    bloom_cmd(home.path())
+        .arg("init")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("preinstalled_petals: []"));
+
+    bloom_cmd(home.path())
+        .args(["petals", "ls"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("(no petals installed)"));
 }
 
 #[test]
@@ -267,145 +289,6 @@ fn wallet_help_lists_outbox_cancel_and_replace() {
         .stdout(predicate::str::contains("cancel"))
         .stdout(predicate::str::contains("replace"))
         .stdout(predicate::str::contains("confirm"));
-}
-
-#[test]
-fn polymarket_help_lists_obligations() {
-    let home = fresh_home();
-    bloom_cmd(home.path())
-        .args(["polymarket", "--help"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("obligations"))
-        .stdout(predicate::str::contains("redeem"));
-}
-
-#[test]
-fn polymarket_vfs_trade_confirm_reaches_cli_confirm_path_for_durable_drafts() {
-    let home = fresh_home();
-    let expected = "no draft order-000000001 for wallet my-wallet";
-
-    bloom_cmd(home.path())
-        .args(["polymarket", "confirm", "my-wallet", "order-000000001"])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains(expected));
-
-    bloom_cmd(home.path())
-        .args([
-            "vfs",
-            "write",
-            "/polymarket/trade/my-wallet/drafts/order-000000001/confirm",
-            "--unlock-wallet",
-            "my-wallet",
-            "--data",
-            "confirm",
-        ])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains(expected));
-}
-
-#[test]
-fn polymarket_vfs_redeem_confirm_shares_cli_redeem_core() {
-    // Both the CLI command and the foreground VFS confirm path must dispatch
-    // into the same redeem core and fail at the same durable refusal (missing
-    // wallet) before any network or signing work.
-    let home = fresh_home();
-    let expected = "wallet 'my-wallet' not found";
-
-    bloom_cmd(home.path())
-        .args(["polymarket", "redeem", "my-wallet", "some-slug"])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains(expected));
-
-    bloom_cmd(home.path())
-        .args([
-            "vfs",
-            "write",
-            "/polymarket/redeem/my-wallet/some-slug/confirm",
-            "--unlock-wallet",
-            "my-wallet",
-            "--data",
-            "confirm",
-        ])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains(expected));
-}
-
-#[test]
-fn polymarket_vfs_revoke_approvals_confirm_shares_cli_core() {
-    let home = fresh_home();
-    let expected = "wallet 'my-wallet' not found";
-
-    bloom_cmd(home.path())
-        .args(["polymarket", "revoke-approvals", "my-wallet"])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains(expected));
-
-    bloom_cmd(home.path())
-        .args([
-            "vfs",
-            "write",
-            "/polymarket/revoke-approvals/my-wallet/request/confirm",
-            "--unlock-wallet",
-            "my-wallet",
-            "--data",
-            "confirm",
-        ])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains(expected));
-}
-
-#[test]
-fn polymarket_vfs_withdraw_pusd_confirm_shares_cli_core() {
-    let home = fresh_home();
-    let expected = "wallet 'my-wallet' not found";
-
-    // CLI: amount is a positional; VFS: amount rides in the confirm body.
-    bloom_cmd(home.path())
-        .args(["polymarket", "withdraw-pusd", "my-wallet", "all"])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains(expected));
-
-    bloom_cmd(home.path())
-        .args([
-            "vfs",
-            "write",
-            "/polymarket/withdraw/my-wallet/pusd/confirm",
-            "--unlock-wallet",
-            "my-wallet",
-            "--data",
-            r#"{"confirm":true,"amount":"all"}"#,
-        ])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains(expected));
-}
-
-#[test]
-fn polymarket_vfs_withdraw_pusd_confirm_rejects_bare_ack() {
-    // A bare ack has no amount; the foreground decoder must refuse before any
-    // daemon/network work so an agent cannot default to withdrawing everything.
-    let home = fresh_home();
-    bloom_cmd(home.path())
-        .args([
-            "vfs",
-            "write",
-            "/polymarket/withdraw/my-wallet/pusd/confirm",
-            "--unlock-wallet",
-            "my-wallet",
-            "--data",
-            "confirm",
-        ])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("explicit amount"));
 }
 
 #[test]
@@ -446,6 +329,10 @@ fn vfs_ls_root_lists_top_level_handlers() {
             "expected `{required}` in vfs ls /, got:\n{out}"
         );
     }
+    assert!(
+        !out.lines().any(|line| line.starts_with("polymarket\t")),
+        "native polymarket handler must not be mounted:\n{out}"
+    );
 }
 
 #[test]
@@ -1307,7 +1194,7 @@ fn petal_cli_build_install_list_and_vfs_read_happy_path() {
 #[test]
 #[ignore = "clones and builds the public Polymarket Petal source repo"]
 fn github_source_install_polymarket_dispatches_route_contract() {
-    let petal_ref = "f2d7adbd64f76fccf515e7f39f46af048047a4e3";
+    let petal_ref = "1ffb267a1e1d4acd137c184806c20cc98d20a3f4";
     let home = fresh_home();
     bloom_cmd(home.path())
         .args([

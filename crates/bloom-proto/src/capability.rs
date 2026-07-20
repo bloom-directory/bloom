@@ -1,6 +1,6 @@
 //! Capability model: the unified read-only shape for bounded trading
-//! authority across all venues (Hyperliquid agent sessions, EVM
-//! policy-sessions, future Polymarket capabilities).
+//! authority across built-in venues (Hyperliquid agent sessions and EVM
+//! policy-sessions).
 //!
 //! [`CapabilityViewEntry`] is the serialisable snapshot each venue handler
 //! projects into, rendered at `/wallets/<w>/capabilities/active.json`.
@@ -19,8 +19,6 @@ pub enum Venue {
     EvmOutbox,
     /// Hyperliquid perp/spot trading via agent sessions.
     Hyperliquid,
-    /// Polymarket prediction-market orders.
-    Polymarket,
     /// DeFi intent routes via Enso shortcuts.
     Defi,
 }
@@ -39,11 +37,11 @@ pub enum SigningModel {
     HoldsDelegatedKey,
     /// The capability authorises actions but every action is still signed by
     /// the owner key (which must be resident in daemon RAM for the window).
-    /// This is the EVM `policy-session` and planned Polymarket model.
+    /// This is the EVM `policy-session` model.
     AuthorizesOwnerSigning,
     /// The capability is a service credential only (HMAC / API key). It never
     /// moves funds — the owner must still sign value-moving operations
-    /// separately (e.g. Polymarket builder API keys, Enso API keys).
+    /// separately (e.g. Enso API keys).
     ServiceAuthOnly,
 }
 

@@ -58,9 +58,7 @@ pub use policy::{
     StepUpRuleCeilingValidation, classify_policy_edit, evaluate_action_authorization, has_deny,
     has_soft_violation, has_warn, validate_step_up_rule_ceilings,
 };
-pub use polymarket_policy::{
-    PolicySide, PolymarketOrderCtx, PolymarketPolicy, evaluate_polymarket_order,
-};
+pub use polymarket_policy::PolymarketPolicy;
 pub use units::{ParsedAmount, format_units, parse_amount, parse_eth, parse_units};
 
 /// Re-exports of alloy types we use across the workspace.

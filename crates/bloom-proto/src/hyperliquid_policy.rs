@@ -6,13 +6,13 @@
 //! them: without it, any action signs the moment the wallet is unlocked.
 //!
 //! The evaluator is **pure over a pre-fetched context snapshot**
-//! ([`HyperliquidActionCtx`]), exactly like [`crate::polymarket_policy`]:
+//! ([`HyperliquidActionCtx`]):
 //! request-derivable caps (asset, order type, leverage, notional) are checked
 //! from the action itself, while position/loss/cumulative-notional caps require
 //! the caller (daemon) to populate live clearinghouse state. When a stateful cap
 //! is configured but its snapshot is unavailable (`snapshot_readable = false`),
 //! the action is **denied** — fail closed, mirroring
-//! `PolymarketOrderCtx.receipt_store_readable`.
+//! other venue policy contexts.
 //!
 //! Money is integer **micro-USD** (6 dp) end to end; no floats touch decisions.
 //! Unknown / not-yet-supported action kinds **default-deny**, so new actions

@@ -46,7 +46,7 @@ from the release it ships with.
 - the mounted Sealed Approval lifecycle for the EVM slice: permission-denied
   confirm writes, `approval_challenge.json`, `ceremony_url`, grant / grant +
   execute, and retrying after a grant-only approval;
-- Hyperliquid session-first trading and Polymarket opt-in gating;
+- Hyperliquid session-first trading and discovery of installed Petal docs;
 - passkey policy signing and `under_policy` semantics.
 
 As additional Petals adopt the mounted Sealed Approval flow described in
@@ -59,12 +59,12 @@ hint file and no per-directory README duplication of global contracts.
 
 ## Per-Petal READMEs
 
-Petal handlers embed their own read-only, Petal-local documentation the same
-way (compile-time constants served as `README.md` inside the Petal's
-subtree): `/hyperliquid/README.md` (plus `asset_ids.md`),
-`/polymarket/README.md`, `/defi/README.md`, ENS, and the per-address
-`tokens/README.md` under chain handlers. Per-request `plan.md` files under
-`/requests` are per-instance previews rather than static docs.
+Built-in handlers embed read-only, handler-local documentation, while external
+Petals package their own `README.md` and route documentation under
+`/petals/<name>/`. For example, Hyperliquid exposes `/hyperliquid/README.md`, and
+the default installed Polymarket Petal exposes `/petals/polymarket/README.md`. Per-request
+`plan.md` files under `/requests` are per-instance previews rather than static
+docs.
 
 The division of labor:
 
@@ -72,6 +72,11 @@ The division of labor:
   the action lifecycle, approvals, and where things live;
 - a Petal README documents only Petal-local paths and semantics, and links
   back to the shared contracts rather than restating them.
+
+Venue integrations that graduate to external Petals must not retain a native
+CLI, root-level VFS subtree, daemon mount, or daemon-owned venue state. The
+installed package documentation becomes authoritative, while Bloom retains
+only generic host capabilities and any wallet-policy schema the Petal consumes.
 
 ## Keeping It Honest
 

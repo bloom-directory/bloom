@@ -678,10 +678,6 @@ fn write_path_uses_wallet_signer(path: &VfsPath) -> bool {
         //     stages an approval challenge on the first write and signs the
         //     x402/Tempo MPP credential only under a grant-gated PetalHost
         //     signature.
-        //   * Polymarket onboarding (`/polymarket/onboard/<wallet>/begin`):
-        //     the handler stages approval and signs CLOB auth plus relayer/
-        //     deposit-wallet operations only under grant-gated PetalHost
-        //     signatures.
         //   * Hyperliquid owner approvals (`agent_sessions/<wallet>/new.json`
         //     and `exchange/<wallet>/send_asset.json`): the Hyperliquid
         //     handler stages approval and signs only under a grant-gated
@@ -777,12 +773,6 @@ fn sealed_approval_paths(
             dir.join("approval.json"),
         ));
     }
-    if let Some(dir) = polymarket_onboard_dir(home, wallet, path) {
-        return Some((
-            dir.join("approval_challenge.json"),
-            dir.join("approval.json"),
-        ));
-    }
     if let Some(dir) = hyperliquid_usd_send_dir(home, wallet, path) {
         return Some((
             dir.join("approval_challenge.json"),
@@ -839,20 +829,6 @@ fn outbox_confirm_dir(wallet: &str, path: &VfsPath, outbox_root: &Path) -> Optio
                 .join(chain)
                 .join("pending")
                 .join(id),
-        )
-    } else {
-        None
-    }
-}
-
-fn polymarket_onboard_dir(home: &Path, wallet: &str, path: &VfsPath) -> Option<PathBuf> {
-    let [root, action, w, leaf] = path.segments() else {
-        return None;
-    };
-    if root == "polymarket" && action == "onboard" && w == wallet && leaf == "begin" {
-        Some(
-            home.join("polymarket")
-                .join(safe_sealed_approval_segment(wallet)?),
         )
     } else {
         None
@@ -990,24 +966,6 @@ fn write_unlocked_intent(
         wallet_policy_toml,
     ) {
         return intent;
-    }
-
-    // Polymarket onboarding `begin` is far more than a generic write: it can
-    // deploy the deposit wallet, sign an eight-grant approval batch, mint CLOB
-    // credentials, and auto-create a (revocable, submission-only) builder API
-    // key. Show the reviewer exactly that, with one source of truth for the
-    // grant list, instead of a bare path.
-    let is_pm_onboard_begin = matches!(
-        segs,
-        [root, action, _w, begin]
-            if root == "polymarket" && action == "onboard" && begin == "begin"
-    );
-    if is_pm_onboard_begin {
-        return bloom_polymarket::polymarket_onboard_ceremony_intent(
-            wallet,
-            Some(&path_s),
-            wallet_address.clone(),
-        );
     }
 
     let mut intent = CeremonyIntent::new(
@@ -1474,7 +1432,6 @@ summary = "Demo app used by IPC tests."
 
         for path in [
             "/defi/intents/minnow/0001/confirm",
-            "/polymarket/trade/minnow/new",
             // policy.toml now reaches the VFS handler, which stages a Sealed
             // Approval for passkey wallets rather than being denied at the lane.
             "/wallets/minnow/policy.toml",
@@ -1492,7 +1449,6 @@ summary = "Demo app used by IPC tests."
             "/requests/pending/req_123/confirm",
             "/requests/new",
             "/requests/pending/req_123/cancel",
-            "/polymarket/onboard/minnow/begin",
             "/hyperliquid/mainnet/agent_sessions/minnow/session-1/schedule_cancel.json",
             "/hyperliquid/mainnet/agent_sessions/minnow/session-1/order.json",
             "/hyperliquid/mainnet/agent_sessions/minnow/session-1/cancel_all",
@@ -1556,32 +1512,6 @@ summary = "Demo app used by IPC tests."
         assert_eq!(entries[0]["mode"], "local");
         assert_eq!(entries[0]["petal_mount"], "petals/demo/");
         assert_eq!(entries[0]["petal"]["name"], "demo");
-    }
-
-    #[test]
-    fn onboard_begin_unlock_intent_lists_grants_not_just_the_path() {
-        let p = VfsPath::parse("/polymarket/onboard/minnow/begin").unwrap();
-        let intent = write_unlocked_intent("minnow", &p, b"y", None, None, None);
-        // The reviewer must see the concrete onboarding effects, not a bare path.
-        let text = intent.summary_lines.join("\n");
-        assert!(text.contains("approve(MAX) -> CTF Exchange"), "{text}");
-        assert!(text.contains("setApprovalForAll(true)"), "{text}");
-        assert!(text.contains("builder API key"), "{text}");
-        assert_eq!(
-            intent.canonical_subject["kind"], "polymarket_onboard_begin",
-            "onboarding has a distinct hashed subject from a generic write"
-        );
-        // A generic write keeps the old, minimal intent.
-        let g = write_unlocked_intent(
-            "minnow",
-            &VfsPath::parse("/wallets/minnow/sign/message").unwrap(),
-            b"hello",
-            None,
-            None,
-            None,
-        );
-        assert_eq!(g.canonical_subject["kind"], "vfs_write_unlocked");
-        assert!(g.intent_hash() != intent.intent_hash());
     }
 
     #[test]

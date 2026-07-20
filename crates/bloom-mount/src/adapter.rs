@@ -1908,7 +1908,6 @@ mod tests {
             "/wallets/minnow/policy.toml",
             "/wallets/minnow/policy-session/new",
             "/requests/pending/req_1/confirm",
-            "/polymarket/onboard/test-wallet/begin",
             "/hyperliquid/mainnet/agent_sessions/minnow/new.json",
         ] {
             let p = VfsPath::parse(path).unwrap();

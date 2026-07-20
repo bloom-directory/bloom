@@ -10,7 +10,7 @@
 //! - `wallets/<wallet>/address`                                     — checksummed owner/signer address
 //! - `wallets/<wallet>/address.qr.svg`                              — scannable QR image for the owner/signer address
 //! - `wallets/<wallet>/address.qr.png`                              — scannable QR image for the owner/signer address
-//! - `wallets/<wallet>/addresses.json`                              — owner/signer + role addresses (e.g. Polymarket deposit/funder)
+//! - `wallets/<wallet>/addresses.json`                              — owner/signer + role addresses
 //! - `wallets/<wallet>/public_key`                                  — secp256k1 pubkey hex
 //! - `wallets/<wallet>/kind`                                        — local/watch
 //! - `wallets/<wallet>/policy.toml`                                 — read+write policy
@@ -73,9 +73,6 @@ pub struct WalletsHandler {
     pub home_write_permit: Option<Arc<HomeWritePermit>>,
     pub mempool_indexes:
         Arc<std::collections::BTreeMap<String, Arc<bloom_mempool::PendingTxIndex>>>,
-    /// Read-only Polymarket onboarding state, used to surface a wallet's
-    /// deposit/funder address alongside its owner EOA in `addresses.json`.
-    pub polymarket_onboard: Option<bloom_polymarket::OnboardStore>,
     /// Optional Hyperliquid handler for capability roll-up aggregation.
     pub hyperliquid_handler: Option<Arc<crate::handlers::hyperliquid::HyperliquidHandler>>,
     /// Optional Layer-B auth services. Migrated signer paths must use this
@@ -97,7 +94,6 @@ impl WalletsHandler {
             address_book: Arc::new(address_book),
             home_write_permit: None,
             mempool_indexes: Arc::new(std::collections::BTreeMap::new()),
-            polymarket_onboard: None,
             hyperliquid_handler: None,
             auth_services: AuthServices::default(),
         }
@@ -105,14 +101,6 @@ impl WalletsHandler {
 
     pub fn with_auth_services(mut self, auth_services: AuthServices) -> Self {
         self.auth_services = auth_services;
-        self
-    }
-
-    /// Attach the Polymarket state root so `addresses.json` can surface the
-    /// wallet's deposit/funder address. Read-only: loads persisted
-    /// `account.json`, never resolves the live factory.
-    pub fn with_polymarket_root(mut self, root: impl Into<std::path::PathBuf>) -> Self {
-        self.polymarket_onboard = Some(bloom_polymarket::OnboardStore::new(root));
         self
     }
 
@@ -143,9 +131,8 @@ impl WalletsHandler {
     }
 
     /// Role-labeled address view for a wallet. The keystore `address` is both
-    /// the `owner` and the `signer` (the owner key signs); any derived role
-    /// address (e.g. the Polymarket deposit/funder wallet) is listed under
-    /// `roles` with its provenance, sourced from persisted onboarding state.
+    /// the `owner` and the `signer` (the owner key signs). Venue-specific
+    /// role addresses are exposed by their installed Petals.
     fn addresses_json(
         &self,
         wallet: &str,
@@ -167,21 +154,7 @@ impl WalletsHandler {
         let unlocked = self.keystore.is_unlocked(wallet);
         let owner = bloom_proto::checksum_address(&info.address);
 
-        let mut roles = serde_json::Map::new();
-        if let Some(store) = &self.polymarket_onboard
-            && let Ok(Some(st)) = store.load(wallet)
-        {
-            roles.insert(
-                "polymarket_deposit_wallet".to_string(),
-                serde_json::json!({
-                    "address": st.deposit_wallet,
-                    "source": st.deposit_wallet_source,
-                    "fundable": st.deposit_wallet_fundable,
-                    "note": "Polymarket trade funder/maker — NOT the wallet owner. \
-                             Funds sent here are controlled via the owner key.",
-                }),
-            );
-        }
+        let roles = serde_json::Map::new();
 
         let body = serde_json::json!({
             "wallet": wallet,
@@ -322,7 +295,6 @@ impl WalletsHandler {
                     match c.venue {
                         Venue::Hyperliquid => "Hyperliquid",
                         Venue::EvmOutbox => "EVM outbox",
-                        Venue::Polymarket => "Polymarket",
                         Venue::Defi => "DeFi",
                     }
                 ));
@@ -3669,44 +3641,6 @@ mod tests {
             "PNG chunks missing"
         );
         assert!(body.len() > 1024, "PNG too small to contain a QR image");
-    }
-
-    #[tokio::test]
-    async fn addresses_json_surfaces_polymarket_deposit_wallet() {
-        let f = make_handler();
-        let pm_root = f._tmp.path().join("polymarket");
-        let owner = f.wallet_addr;
-        let deposit = "0x3855000000000000000000000000000000000166";
-        let st: bloom_polymarket::OnboardState = serde_json::from_value(serde_json::json!({
-            "wallet": "alice",
-            "owner": bloom_proto::checksum_address(&owner),
-            "deposit_wallet": deposit,
-            "deposit_wallet_source": "live_factory_resolved",
-            "deposit_wallet_fundable": true,
-            "chain_id": 137,
-            "stage": "complete",
-            "deploy_tx_id": null,
-            "approve_tx_id": null,
-            "pusd_balance": null,
-            "creds_present": true,
-            "last_error": null,
-            "updated_ms": 0,
-        }))
-        .unwrap();
-        bloom_polymarket::OnboardStore::new(&pm_root)
-            .save("alice", &st)
-            .unwrap();
-
-        let handler = f.handler.clone().with_polymarket_root(&pm_root);
-        let p = VfsPath::parse("/alice/addresses.json").unwrap();
-        let v: serde_json::Value =
-            serde_json::from_slice(&handler.read(&p).await.unwrap()).unwrap();
-        let role = &v["roles"]["polymarket_deposit_wallet"];
-        assert_eq!(role["address"], deposit);
-        assert_eq!(role["source"], "live_factory_resolved");
-        assert_eq!(role["fundable"], true);
-        // Owner must NOT equal the deposit wallet — the bug we are guarding.
-        assert_ne!(v["owner"], role["address"]);
     }
 
     #[tokio::test]
