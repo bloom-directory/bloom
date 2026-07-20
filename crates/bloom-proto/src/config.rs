@@ -190,6 +190,10 @@ pub struct EnsoConfig {
 /// `[polymarket]` TOML table parses to the public-endpoint defaults on Polygon.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PolymarketConfig {
+    /// Mount the Polymarket VFS integration. Defaults to true; set false for a
+    /// serialization-safe opt-out.
+    #[serde(default = "default_polymarket_enabled")]
+    pub enabled: bool,
     #[serde(default = "default_gamma_url")]
     pub gamma_url: String,
     #[serde(default = "default_data_url")]
@@ -239,6 +243,7 @@ pub struct PolymarketConfig {
 impl Default for PolymarketConfig {
     fn default() -> Self {
         Self {
+            enabled: default_polymarket_enabled(),
             gamma_url: default_gamma_url(),
             data_url: default_data_url(),
             clob_url: default_clob_url(),
@@ -255,6 +260,10 @@ impl Default for PolymarketConfig {
 
 fn default_polymarket_config() -> Option<PolymarketConfig> {
     Some(PolymarketConfig::default())
+}
+
+fn default_polymarket_enabled() -> bool {
+    true
 }
 
 fn default_builder_key_mode() -> String {
@@ -818,6 +827,7 @@ mod tests {
     #[test]
     fn bare_polymarket_block_parses_to_public_defaults() {
         let pm: PolymarketConfig = toml::from_str("").unwrap();
+        assert!(pm.enabled);
         assert_eq!(pm.gamma_url, "https://gamma-api.polymarket.com");
         assert_eq!(pm.data_url, "https://data-api.polymarket.com");
         assert_eq!(pm.clob_url, "https://clob.polymarket.com");
@@ -849,8 +859,20 @@ mod tests {
         let pm = cfg
             .polymarket
             .expect("Polymarket should be enabled when the block is omitted");
+        assert!(pm.enabled);
         assert_eq!(pm.chain_id, 137);
         assert_eq!(pm.gamma_url, "https://gamma-api.polymarket.com");
+    }
+
+    #[test]
+    fn polymarket_disabled_setting_survives_toml_round_trip() {
+        let cfg: Config = toml::from_str("[polymarket]\nenabled = false\n").unwrap();
+        assert!(!cfg.polymarket.as_ref().unwrap().enabled);
+
+        let serialized = toml::to_string_pretty(&cfg).unwrap();
+        assert!(serialized.contains("enabled = false"));
+        let reloaded: Config = toml::from_str(&serialized).unwrap();
+        assert!(!reloaded.polymarket.unwrap().enabled);
     }
 
     #[test]

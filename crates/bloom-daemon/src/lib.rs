@@ -2374,9 +2374,10 @@ impl Daemon {
         // Polymarket: public read surface (Gamma/Data/CLOB) plus, when a
         // `[chains]` entry matches the Polymarket chain id (Polygon 137), the
         // onboarding state machine and L2 account views. Polymarket is enabled
-        // by default with public endpoints; a config block can override them.
+        // by default with public endpoints; `[polymarket] enabled = false`
+        // provides a persistent opt-out and other fields override the defaults.
         // Signing never leaves the daemon (Keystore::signer → KeystoreSigner).
-        if let Some(pm_cfg) = &config.polymarket {
+        if let Some(pm_cfg) = config.polymarket.as_ref().filter(|cfg| cfg.enabled) {
             let pm_url = |raw: &str| match url::Url::parse(raw) {
                 Ok(u) => Some(u),
                 Err(e) => {
@@ -2441,7 +2442,7 @@ impl Daemon {
             debug!(chain_id = pm_cfg.chain_id, "daemon.polymarket_mounted");
             vfs_builder = vfs_builder.mount("polymarket", Arc::new(handler) as _);
         } else {
-            debug!("daemon.polymarket_skipped: disabled programmatically");
+            debug!("daemon.polymarket_skipped: disabled by config");
         }
 
         // /next.md — brutally-scoped next-action aggregator for agents.
@@ -3024,6 +3025,23 @@ mod tests {
             d.vfs.handler("hyperliquid").is_some(),
             "fresh homes should mount Hyperliquid with public defaults"
         );
+        assert!(
+            d.vfs.handler("polymarket").is_some(),
+            "fresh homes should mount Polymarket with public defaults"
+        );
+    }
+
+    #[test]
+    fn explicit_polymarket_opt_out_skips_vfs_mount() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = HomeDir::at(dir.path());
+        let mut config = Config::local_default();
+        config.polymarket.as_mut().unwrap().enabled = false;
+        config.save(&home.config_path()).unwrap();
+
+        let d = Daemon::from_home(home).unwrap();
+        assert!(!d.config.polymarket.as_ref().unwrap().enabled);
+        assert!(d.vfs.handler("polymarket").is_none());
     }
 
     #[tokio::test]
