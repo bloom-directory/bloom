@@ -674,6 +674,7 @@ impl WalletsHandler {
         path: &str,
         data: &[u8],
     ) -> Result<(), HandlerError> {
+        self.migrate_legacy_policy_updates(wallet);
         let proposed_policy_toml = std::str::from_utf8(data)
             .map_err(|e| HandlerError::invalid(format!("policy must be UTF-8: {e}")))?;
         let proposed_policy: Policy = toml::from_str(proposed_policy_toml)
@@ -785,6 +786,8 @@ impl WalletsHandler {
     ) -> Result<(), HandlerError> {
         let current = std::fs::read(self.keystore.root().join(wallet).join("policy.toml"))?;
         if current != old_policy_toml.as_bytes() {
+            self.fail_superseded_pending_policy_updates(wallet, action_id, proposed_policy)
+                .await;
             let _ = self.policy_update_transition(wallet, action_id, "pending", "failed");
             return Err(HandlerError::invalid(
                 "wallet policy changed after approval; restage the policy update",
@@ -870,6 +873,47 @@ impl WalletsHandler {
         action_id: &str,
     ) -> std::path::PathBuf {
         self.policy_update_state_dir(wallet, state).join(action_id)
+    }
+
+    /// Move pre-lifecycle policy-update directories into `pending/` on first
+    /// access. Older releases stored `<action_id>/` directly below
+    /// `policy-updates/`; preserving those directories is necessary for an
+    /// approved retry to find its existing challenge and approval.
+    fn migrate_legacy_policy_updates(&self, wallet: &str) {
+        let root = self.policy_updates_dir(wallet);
+        let Ok(entries) = std::fs::read_dir(&root) else {
+            return;
+        };
+        let pending = self.policy_update_state_dir(wallet, "pending");
+        for entry in entries.flatten() {
+            if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                continue;
+            }
+            let name = entry.file_name();
+            let Some(action_id) = name.to_str() else {
+                continue;
+            };
+            if POLICY_UPDATE_STATES.contains(&action_id)
+                || !action_id.starts_with("policy-update-")
+                || validate_policy_action_id(action_id).is_err()
+            {
+                continue;
+            }
+            let target = pending.join(action_id);
+            if target.exists() {
+                continue;
+            }
+            let result = std::fs::create_dir_all(&pending)
+                .and_then(|()| std::fs::rename(entry.path(), &target));
+            if let Err(error) = result {
+                tracing::warn!(
+                    wallet,
+                    action_id,
+                    error = %error,
+                    "policy_update.legacy_migration_failed"
+                );
+            }
+        }
     }
 
     /// Atomically move an action between lifecycle states (e.g. `pending` →
@@ -1949,6 +1993,7 @@ impl WalletsHandler {
         }
         let wallet = &segs[0];
         let info = self.keystore.info_unverified(wallet).map_err(err_be)?;
+        self.migrate_legacy_policy_updates(wallet);
         if segs.len() == 1 {
             return Ok(Entry::dir(wallet));
         }
@@ -2069,6 +2114,7 @@ impl WalletsHandler {
         }
         let wallet = &segs[0];
         let info = self.keystore.info_unverified(wallet).map_err(err_be)?;
+        self.migrate_legacy_policy_updates(wallet);
         match segs.get(1).map(|s| s.as_str()).unwrap_or("") {
             "address" => {
                 Ok(format!("{}\n", bloom_proto::checksum_address(&info.address)).into_bytes())
@@ -2232,6 +2278,7 @@ impl WalletsHandler {
         }
         let wallet = &segs[0];
         let info = self.keystore.info_unverified(wallet).map_err(err_be)?;
+        self.migrate_legacy_policy_updates(wallet);
         match segs.len() {
             1 => Ok(Self::wallet_dir_entries(info.kind)),
             2 if segs[1] == "chains" => Ok(self
@@ -5057,6 +5104,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn wallet_policy_update_migrates_legacy_flat_action_directory() {
+        let f = make_handler();
+        let action_id = "policy-update-legacy";
+        let legacy = f
+            .handler
+            .keystore
+            .root()
+            .join("alice")
+            .join("policy-updates")
+            .join(action_id);
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(legacy.join(APPROVAL_CHALLENGE_FILE), b"{}\n").unwrap();
+
+        let pending = f
+            .handler
+            .list(&VfsPath::parse("/alice/policy-updates/pending").unwrap())
+            .await
+            .unwrap();
+        assert!(pending.iter().any(|entry| entry.name == action_id));
+        assert!(!legacy.exists());
+        assert!(
+            legacy
+                .parent()
+                .unwrap()
+                .join("pending")
+                .join(action_id)
+                .exists()
+        );
+    }
+
+    #[tokio::test]
     async fn wallet_policy_update_fails_superseded_pending_action_from_sealed_subject() {
         let mut f = make_handler();
         let (old_policy, _) = f.handler.keystore.raw_policy("alice").unwrap();
@@ -5485,6 +5563,33 @@ mod tests {
         )
         .unwrap();
 
+        // The fixture writer does not persist sealed actions, so provide the
+        // original sealed subject explicitly for the supersession lookup.
+        let before: Policy = toml::from_str(&old_policy).unwrap();
+        let after: Policy = toml::from_str(&proposed).unwrap();
+        let original_action = wallet_policy_sealed_action(
+            "alice",
+            "/alice/policy.toml",
+            old_policy.as_bytes(),
+            proposed.as_bytes(),
+            &before,
+            &after,
+            now_ms_u64(),
+        )
+        .unwrap();
+        f.handler.auth_services =
+            f.handler
+                .auth_services
+                .clone()
+                .with_store(Arc::new(StaticPolicyStore {
+                    record: SealedIntentRecord {
+                        intent_hash: challenge.intent_hash.clone(),
+                        envelope: original_action.envelope.clone(),
+                        sealed_at_ms: original_action.created_ms,
+                        action: Some(original_action),
+                    },
+                }));
+
         // Out-of-band but still validly-signed change to the current policy.
         let mut baseline_shift: Policy = toml::from_str(&old_policy).unwrap();
         baseline_shift.denylists.recipients.insert("0x9999".into());
@@ -5499,11 +5604,41 @@ mod tests {
             f.handler.write(&p, proposed.as_bytes()).await.unwrap_err(),
             HandlerError::PermissionDenied
         ));
+        let rebased_action_id =
+            wallet_policy_action_id("alice", baseline_shift.as_bytes(), proposed.as_bytes());
+        let rebased_dir = f
+            .handler
+            .keystore
+            .root()
+            .join("alice")
+            .join("policy-updates")
+            .join("pending")
+            .join(&rebased_action_id);
+        let rebased_challenge: ApprovalChallenge =
+            read_json(rebased_dir.join(APPROVAL_CHALLENGE_FILE)).unwrap();
+        write_json(
+            rebased_dir.join(APPROVAL_FILE),
+            &signed_wallet_policy_approval(&rebased_challenge),
+        )
+        .unwrap();
+
+        // The re-baselined action can now install, and the original A→B
+        // action must be retired so latest cannot surface its stale challenge.
+        f.handler.write(&p, proposed.as_bytes()).await.unwrap();
         let on_disk =
             std::fs::read_to_string(f.handler.keystore.root().join("alice/policy.toml")).unwrap();
         assert_eq!(
-            on_disk, baseline_shift,
-            "proposed policy must not be installed"
+            on_disk, proposed,
+            "the approved re-baselined policy should be installed"
+        );
+        assert!(
+            f.handler
+                .keystore
+                .root()
+                .join("alice/policy-updates/failed")
+                .join(&action_id)
+                .exists(),
+            "the original pending action should be marked failed"
         );
     }
 
