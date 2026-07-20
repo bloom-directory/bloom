@@ -92,9 +92,28 @@ jobs:
           echo "  sha: $RELEASE_SHA"
           echo "  workspace version: $CURRENT_VERSION"
 
+  test:
+    name: test tagged release
+    needs: prepare
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ needs.prepare.outputs.release_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        run: rustup show
+
+      - name: Run workspace tests (locked)
+        run: cargo test --workspace --locked
+
   build:
     name: build ${{ matrix.asset_name }}
-    needs: prepare
+    needs: [prepare, test]
     permissions:
       contents: read
     strategy:
@@ -162,7 +181,7 @@ jobs:
 
   publish:
     name: Publish GitHub Release
-    needs: [prepare, build]
+    needs: [prepare, test, build]
     runs-on: ubuntu-latest
     permissions:
       contents: write
