@@ -2714,6 +2714,13 @@ impl WalletsHandler {
         // daemon's loopback ceremony listener — see
         // docs/plans/2026-07-21-async-vfs-passkey-registration.md.
         if spec.kind == "passkey" {
+            // Unlike local/import/watch (which validate the name inside the
+            // keystore methods they call), staging goes straight to the
+            // registration coordinator, which later joins the name into a
+            // filesystem path. Validate here with the same rule the keystore
+            // itself uses, so a name like "../../escape" is rejected before
+            // it ever reaches that join.
+            bloom_keystore::Keystore::validate_name(&spec.name).map_err(err_be)?;
             self.write_permit()?;
             let status = self
                 .auth_services
@@ -3707,6 +3714,25 @@ mod tests {
         f.handler.write(&p, b"erin").await.unwrap();
         let second = f.handler.read(&status_path).await.unwrap();
         assert_eq!(first, second, "repeated live write rotated the session/URL");
+    }
+
+    #[tokio::test]
+    async fn passkey_new_wallet_rejects_path_traversal_names() {
+        let f = make_handler_with_registration(true);
+        let p = VfsPath::parse("/new").unwrap();
+        for name in ["../../escape", "a/b", "..", "/etc/passwd"] {
+            let body = format!("name = \"{name}\"\nkind = \"passkey\"\n");
+            let err = f.handler.write(&p, body.as_bytes()).await.unwrap_err();
+            assert!(
+                matches!(err, HandlerError::Backend(_)),
+                "expected Backend (invalid name), got {err:?} for {name:?}"
+            );
+        }
+        // The coordinator never staged a session for any rejected name —
+        // if it had, this would list it (see registrations_listing_enumerates_known_wallets).
+        let list_path = VfsPath::parse("/registrations").unwrap();
+        let entries = f.handler.list(&list_path).await.unwrap();
+        assert!(entries.is_empty(), "entries={entries:?}");
     }
 
     #[tokio::test]

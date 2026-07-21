@@ -503,7 +503,14 @@ impl Keystore {
         self.inner.root.join(name)
     }
 
-    fn validate_name(name: &str) -> Result<(), KeystoreError> {
+    /// Validate a wallet name: non-empty, at most 64 bytes, and restricted to
+    /// `[A-Za-z0-9_-]` — no path separators, `..`, or other characters that
+    /// could escape the keystore root once the name is joined into a
+    /// filesystem path. `pub` so callers that stage a wallet without going
+    /// through a `Keystore` method first (e.g. the daemon's asynchronous
+    /// passkey registration coordinator) can apply the identical rule before
+    /// the name ever reaches a `Path::join`.
+    pub fn validate_name(name: &str) -> Result<(), KeystoreError> {
         if name.is_empty() || name.len() > 64 {
             return Err(KeystoreError::InvalidName(name.into()));
         }

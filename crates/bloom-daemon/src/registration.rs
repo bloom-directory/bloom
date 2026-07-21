@@ -190,6 +190,13 @@ impl WalletRegistrationCoordinator for RegistrationCoordinator {
         wallet: &str,
         now_ms: u64,
     ) -> Result<WalletRegistrationStatus, AuthApiError> {
+        // Defense in depth: `wallet` is joined into a filesystem path below
+        // and, on a successful ceremony, again in `recovery_ack`'s
+        // `finalize_passkey_wallet` rename target. Reject anything that
+        // could escape `keystore_root` even if a future caller stages
+        // sessions without going through `WalletsHandler`'s own check.
+        Keystore::validate_name(wallet).map_err(|e| AuthApiError::Denied(e.to_string()))?;
+
         let base = self.base_url()?;
 
         if self.keystore_root.join(wallet).exists() {
@@ -750,6 +757,28 @@ mod tests {
 
         let err = coordinator.stage("alice", 1_000).await.unwrap_err();
         assert!(err.to_string().contains("already exists"));
+    }
+
+    /// Defense in depth alongside `WalletsHandler`'s own name validation:
+    /// even a caller that reaches the coordinator directly cannot stage a
+    /// name that would later escape `keystore_root` when joined into a path
+    /// (used by both the initial existence check and, on completion,
+    /// `recovery_ack`'s rename target).
+    #[tokio::test]
+    async fn stage_rejects_path_traversal_names() {
+        let (coordinator, _tmp) = coordinator();
+        coordinator.mark_listener_bound("http://localhost:18734");
+        for name in ["../../escape", "a/b", "..", "/etc/passwd", ""] {
+            let err = coordinator
+                .stage(name, 1_000)
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("invalid wallet name") || err.contains("InvalidName"),
+                "name={name:?} err={err}"
+            );
+        }
     }
 
     #[tokio::test]

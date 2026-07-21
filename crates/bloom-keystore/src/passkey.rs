@@ -1563,8 +1563,6 @@ pub struct FinalizedPasskeyWallet {
 }
 
 /// Atomically commit a prepared wallet to `final_dir` (`<root>/<name>`).
-/// Consumes `prepared` so its temp-dir cleanup `Drop` never fires after a
-/// successful finalize.
 pub fn finalize_passkey_wallet(
     prepared: PreparedPasskeyWallet,
     final_dir: &Path,
@@ -1578,9 +1576,11 @@ pub fn finalize_passkey_wallet(
         pubkey_hex: prepared.pubkey_hex.clone(),
         policy: prepared.policy.clone(),
     };
-    // The temp dir was just renamed away; forget `prepared` so its `Drop`
-    // does not try to remove a path that no longer exists at `tmp_dir`.
-    std::mem::forget(prepared);
+    // Let `prepared` drop normally rather than `mem::forget`-ing it: its
+    // `Drop` only tries to remove `tmp_dir` (already renamed away, so this
+    // is a harmless no-op via the ignored `Result`), and letting it run is
+    // exactly what zeroizes `recovery_key`. Forgetting the whole struct
+    // would skip that zeroization and leak the recovery key in memory.
     Ok(out)
 }
 
