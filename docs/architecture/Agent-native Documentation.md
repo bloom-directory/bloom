@@ -62,9 +62,17 @@ hint file and no per-directory README duplication of global contracts.
 Built-in handlers embed read-only, handler-local documentation, while external
 Petals expose package-defined route documentation under `/petals/<name>/`.
 For example, Hyperliquid exposes `/hyperliquid/README.md`, and the default
-installed Polymarket Petal exposes
+installed Polymarket Petal exposes `/petals/polymarket/README.md`,
+`/petals/polymarket/AGENTS.md`, and
 `/petals/polymarket/meta/route-contract.json`. Per-request `plan.md` files under
 `/requests` are per-instance previews rather than static docs.
+
+An installed Petal's `README.md` and `AGENTS.md` come directly from its
+validated, content-addressed package. The Bloom Petal router serves those two
+files read-only at the Petal mount root instead of dispatching them through
+Petal-supplied WASM. This keeps operator and agent guidance available before an
+agent invokes any Petal route and prevents a dynamic route from shadowing the
+packaged documentation.
 
 The division of labor:
 
@@ -85,9 +93,10 @@ Two mechanisms keep the served documentation truthful:
 **Tests pin the surface.** The router tests assert that the root lists both
 `AGENTS.md` and `CLAUDE.md` as read-only files, that the served bytes are
 byte-identical to the vendored source file, and that the content passes
-sanity checks. Petal handlers carry similar tests for their READMEs (for
-example, that the Hyperliquid README documents safe reads and API-wallet
-risk).
+sanity checks. Petal router tests assert that package `README.md` and
+`AGENTS.md` files are listed, readable, and immutable. Built-in handlers carry
+similar tests for their READMEs (for example, that the Hyperliquid README
+documents safe reads and API-wallet risk).
 
 **The PR checklist enforces updates.** The repository's pull request
 template includes a mandatory "Agent Documentation updated" item, enforced

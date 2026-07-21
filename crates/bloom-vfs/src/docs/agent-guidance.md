@@ -39,9 +39,10 @@ aggregator expose the current capability and next-action view when the daemon
 has the relevant handlers mounted.
 
 Read `/hyperliquid/README.md` for Hyperliquid trading (session-first).
-If the external Polymarket Petal is installed, inspect
-`/petals/polymarket/meta/route-contract.json` and list its route tree before
-using its prediction-market routes.
+If the external Polymarket Petal is installed, start with
+`cat petals/polymarket/README.md`, read `petals/polymarket/AGENTS.md`, then
+inspect `petals/polymarket/meta/route-contract.json` and list its route tree
+before using its prediction-market routes.
 Read `/defi/README.md` for DeFi intents via Enso shortcuts.
 
 ## Wallets
@@ -251,9 +252,12 @@ Hyperliquid trading uses Sealed Approval for owner authority:
 
 Polymarket is not built into Bloom. `bloom init` provisions the pinned default
 `bloom-directory/bloom-petal-polymarket` package at `/petals/polymarket/`.
-Read that installed Petal's `README.md` and route documentation for its current
-onboarding, policy, approval, and trading workflow. Do not use the removed
-`/polymarket` paths or `bloom polymarket` commands.
+Start with `cat petals/polymarket/README.md`; also read
+`petals/polymarket/AGENTS.md` and inspect
+`petals/polymarket/meta/route-contract.json` for the current onboarding, policy,
+approval, and trading workflow. The README and AGENTS files are immutable
+documents from the installed package. Do not use the removed `/polymarket`
+paths or `bloom polymarket` commands.
 
 ## Passkey policy mode
 
