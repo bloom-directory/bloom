@@ -99,7 +99,13 @@
     .pending{display:block!important;border-color:var(--rule)!important;background:var(--paper);color:var(--ink-2)}
     .ok{display:block!important;border-color:rgba(53,95,71,.25)!important;background:var(--success-bg);color:var(--success)}
     .err{display:block!important;border-color:rgba(122,34,48,.2)!important;background:var(--error-bg);color:var(--error)}
-    @media(max-width:820px){
+    /* .layout's desktop grid needs minmax(280px,.72fr) + minmax(480px,1fr) =
+       760px of content width, plus its own gap (up to 8vw) and .page's own
+       padding (up to 2*4vw) — solving 820px (or any narrower breakpoint)
+       against those minimums leaves a dead zone (~821-905px) where the grid
+       can't shrink to fit and .page's overflow-x:hidden clips the right
+       column instead of wrapping. 940px keeps a safety margin above that. */
+    @media(max-width:940px){
       .page{padding-top:24px}
       .layout{grid-template-columns:1fr;gap:34px;margin-top:30px}
       .intro{position:static;padding-top:0}
@@ -124,6 +130,7 @@
     @media(prefers-reduced-motion:reduce){*{scroll-behavior:auto!important;transition:none!important}}
     .state-panel{display:none;padding:26px 30px 30px}
     .state-panel.active{display:block}
+    #wallet-form,.state-panel{transition:opacity .2s ease}
     .state-panel h2{margin:0 0 12px;font-family:var(--serif);font-size:26px;font-weight:400}
     .state-panel p{margin:0 0 12px;color:var(--ink-2);font-size:14px;line-height:1.55}
     .state-panel ul{margin:0 0 14px;padding-left:20px;color:var(--ink-2);font-size:14px;line-height:1.6}
@@ -175,7 +182,7 @@
         </div>
       </section>
 
-      <form class="panel" id="wallet-form">
+      <form class="panel active" id="wallet-form">
         <div class="panel-header">
           <p class="panel-kicker">Wallet policy</p>
           <h2 class="panel-title">Choose your guardrails</h2>
@@ -243,48 +250,40 @@
       </form>
 
       <div class="panel state-panel" id="panel-unsupported">
-        <div class="state-panel active">
-          <h2>Unsupported passkey method</h2>
-          <p>This passkey method does not support a cryptographic feature required by this application.</p>
-          <p>Please try again and choose a different passkey method, such as:</p>
-          <ul>
-            <li>Your browser or device passkey</li>
-            <li>iCloud Keychain or Google Password Manager</li>
-            <li>A compatible hardware security key</li>
-          </ul>
-          <p>If Bitwarden appears, select <strong><em>Use browser, device, or hardware key</em></strong> instead.</p>
-          <button id="retry-btn" type="button" class="secondary-btn">Try a different passkey method</button>
-        </div>
+        <h2>Unsupported passkey method</h2>
+        <p>This passkey method does not support a cryptographic feature required by this application.</p>
+        <p>Please try again and choose a different passkey method, such as:</p>
+        <ul>
+          <li>Your browser or device passkey</li>
+          <li>iCloud Keychain or Google Password Manager</li>
+          <li>A compatible hardware security key</li>
+        </ul>
+        <p>If Bitwarden appears, select <strong><em>Use browser, device, or hardware key</em></strong> instead.</p>
+        <button id="retry-btn" type="button" class="secondary-btn">Try a different passkey method</button>
       </div>
 
       <div class="panel state-panel" id="panel-recovery">
-        <div class="state-panel active">
-          <h2>Save your recovery key</h2>
-          <p>This is the only time your recovery key will be shown. Store it like a seed phrase — anyone with this key can control the wallet.</p>
-          <code class="recovery-key" id="recovery-key-text"></code>
-          <div class="warn-box">Reloading or closing this page after this point loses this key forever. If you lose it before acknowledging, the wallet is not created and you must start over.</div>
-          <div class="ack-row">
-            <input type="checkbox" id="ack-checkbox">
-            <label for="ack-checkbox">I have saved this recovery key somewhere safe.</label>
-          </div>
-          <button id="ack-btn" type="button" disabled>Continue</button>
+        <h2>Save your recovery key</h2>
+        <p>This is the only time your recovery key will be shown. Store it like a seed phrase — anyone with this key can control the wallet.</p>
+        <code class="recovery-key" id="recovery-key-text"></code>
+        <div class="warn-box">Reloading or closing this page after this point loses this key forever. If you lose it before acknowledging, the wallet is not created and you must start over.</div>
+        <div class="ack-row">
+          <input type="checkbox" id="ack-checkbox">
+          <label for="ack-checkbox">I have saved this recovery key somewhere safe.</label>
         </div>
+        <button id="ack-btn" type="button" disabled>Continue</button>
       </div>
 
       <div class="panel state-panel" id="panel-done">
-        <div class="state-panel active">
-          <h2>Wallet created</h2>
-          <p>Your passkey wallet is ready.</p>
-          <code class="address-box" id="done-address"></code>
-          <p>You can close this tab.</p>
-        </div>
+        <h2>Wallet created</h2>
+        <p>Your passkey wallet is ready.</p>
+        <code class="address-box" id="done-address"></code>
+        <p>You can close this tab.</p>
       </div>
 
       <div class="panel state-panel" id="panel-terminal">
-        <div class="state-panel active">
-          <h2 id="terminal-title">Registration unavailable</h2>
-          <p id="terminal-message"></p>
-        </div>
+        <h2 id="terminal-title">Registration unavailable</h2>
+        <p id="terminal-message"></p>
       </div>
     </div>
   </main>
@@ -348,13 +347,52 @@ function populateForm(toml){
   var priv=match('enabled'); if(priv) document.getElementById('private_enabled').checked=(priv==='true');
 }
 
+var PANEL_IDS=['wallet-form','panel-unsupported','panel-recovery','panel-done','panel-terminal'];
+var PANEL_FADE_MS=200;
+
+function currentPanel(){
+  for(var i=0;i<PANEL_IDS.length;i++){
+    var el=document.getElementById(PANEL_IDS[i]);
+    if(el && el.classList.contains('active')) return el;
+  }
+  return null;
+}
+
+// Swaps the visible panel in place (all panels share one box position in the
+// layout grid) instead of stacking a newly-shown panel below the old one.
+// When a panel is already showing, the old content fades out first, then the
+// new panel fades in — so e.g. "Choose your guardrails" visibly turns into
+// "Save your recovery key" in the same spot rather than appearing below it.
 function showPanel(id){
-  ['wallet-form','panel-unsupported','panel-recovery','panel-done','panel-terminal'].forEach(function(pid){
-    var el=document.getElementById(pid);
-    if(!el) return;
-    if(pid===id) el.classList.add('active'); else el.classList.remove('active');
-    if(pid!=='wallet-form') el.style.display=(pid===id)?'':'none';
-  });
+  var next=document.getElementById(id);
+  if(!next) return;
+  var current=currentPanel();
+  if(current===next) return;
+
+  function activate(){
+    PANEL_IDS.forEach(function(pid){
+      var el=document.getElementById(pid);
+      if(!el) return;
+      if(pid===id){
+        el.classList.add('active');
+        el.style.display='';
+        el.style.opacity='0';
+        void el.offsetWidth; // force reflow so the fade-in actually transitions
+        el.style.opacity='';
+      }else{
+        el.classList.remove('active');
+        el.style.display='none';
+        el.style.opacity='';
+      }
+    });
+  }
+
+  if(!current){
+    activate();
+    return;
+  }
+  current.style.opacity='0';
+  window.setTimeout(activate,PANEL_FADE_MS);
 }
 
 function showTerminal(title,message){
