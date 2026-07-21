@@ -1,79 +1,242 @@
-<!DOCTYPE html>
-<html>
+<!doctype html>
+<html lang="en">
 <head>
   <meta charset="utf-8">
-  <title>bloom — Register Passkey</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#f4efe6">
+  <title>/bloom — Create your wallet</title>
+  <link rel="icon" type="image/svg+xml" href="/favicon-light.svg" data-favicon-link>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&amp;family=Inter+Tight:wght@300;400;500;600&amp;family=JetBrains+Mono:wght@300;400;500&amp;display=swap" rel="stylesheet">
   <style>
-    body{font-family:monospace;max-width:620px;margin:60px auto;padding:0 20px}
-    h1{font-size:1.1em;margin-bottom:0.2em}
-    .wallet{color:#888;font-size:0.9em;margin:0 0 1.4em}
-    .section{margin-bottom:1.2em}
-    .section-label{font-size:0.75em;text-transform:uppercase;letter-spacing:0.08em;color:#888;margin:0 0 0.5em}
-    .field{display:flex;align-items:baseline;gap:0.6em;margin-bottom:0.4em}
-    .field label{font-size:0.85em;color:#444;min-width:220px}
-    .field input[type=number]{font-family:monospace;font-size:0.85em;width:90px;padding:0.2em 0.4em;border:1px solid #ccc;border-radius:3px}
-    .field input[type=checkbox]{width:14px;height:14px;cursor:pointer}
-    .field .unit{font-size:0.8em;color:#888}
-    .field .opt{font-size:0.75em;color:#aaa;margin-left:0.2em}
-    button{font-family:monospace;font-size:0.95em;padding:0.55em 1.2em;background:#1a1a2e;color:#fff;border:none;border-radius:4px;cursor:pointer;margin-top:0.6em}
-    button:disabled{opacity:0.45;cursor:default}
-    .hint{color:#888;font-size:0.8em;margin-top:0.4em}
-    #status{margin-top:1em;padding:0.8em 1em;border-radius:4px;line-height:1.5;display:none}
-    .ok{background:#d4edda;color:#155724;display:block!important}
-    .err{background:#f8d7da;color:#721c24;display:block!important}
-    hr{border:none;border-top:1px solid #e8e8e8;margin:1.2em 0}
+    :root{
+      --paper:#f4efe6;
+      --paper-2:#ece4d6;
+      --surface:#faf7f1;
+      --ink:#15130f;
+      --ink-2:#342d24;
+      --graphite:#706757;
+      --muted:#9a907f;
+      --rule:#d5c9b6;
+      --rule-2:#c4b59d;
+      --leaf:#526f51;
+      --leaf-2:#2f4f3b;
+      --accent:#8a2a3a;
+      --accent-deep:#5e1a26;
+      --success:#355f47;
+      --success-bg:#e2eadf;
+      --error:#7a2230;
+      --error-bg:#f2dfe0;
+      --serif:"Instrument Serif","Iowan Old Style","Palatino Linotype",Georgia,serif;
+      --sans:"Inter Tight",Inter,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+      --mono:"JetBrains Mono","SFMono-Regular",Consolas,"Liberation Mono",monospace;
+    }
+    *{box-sizing:border-box}
+    html{min-height:100%;background:var(--paper);color:var(--ink);-webkit-text-size-adjust:100%}
+    body{min-height:100vh;min-height:100svh;margin:0;font-family:var(--sans);font-size:16px;line-height:1.5;-webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility;overflow-x:hidden}
+    body::before{content:"";position:fixed;inset:0;pointer-events:none;background:linear-gradient(115deg,rgba(255,255,255,.62),transparent 35%),linear-gradient(180deg,rgba(82,111,81,.08),transparent 48%),linear-gradient(0deg,rgba(138,42,58,.055),transparent 38%)}
+    body::after{content:"";position:fixed;width:440px;height:440px;right:-180px;top:-190px;border:1px solid rgba(138,42,58,.13);border-radius:50%;box-shadow:0 0 0 72px rgba(138,42,58,.025),0 0 0 144px rgba(82,111,81,.02);pointer-events:none}
+    button,input{font:inherit}
+    button,input,label{touch-action:manipulation}
+    button:focus-visible,input:focus-visible{outline:3px solid rgba(138,42,58,.2);outline-offset:2px}
+    .page{position:relative;z-index:1;width:min(1180px,100%);min-height:100vh;min-height:100svh;margin:0 auto;padding:28px clamp(20px,4vw,56px) clamp(32px,5vw,64px)}
+    .brand-lockup{display:inline-flex;min-width:0;align-items:center;gap:10px;color:var(--ink);font-family:var(--mono);font-size:12px;line-height:1.15;letter-spacing:0;text-decoration:none;text-transform:uppercase}
+    .brand-mark{width:30px;height:30px;flex:0 0 auto}
+    .brand-lockup strong{color:var(--accent-deep);font-weight:600}
+    .layout{display:grid;grid-template-columns:minmax(280px,.72fr) minmax(480px,1fr);gap:clamp(48px,8vw,108px);align-items:start;margin-top:32px}
+    .intro{position:sticky;top:28px;padding-top:12px}
+    .eyebrow{margin:0 0 17px;color:var(--accent);font-family:var(--mono);font-size:11px;font-weight:500;letter-spacing:.06em;text-transform:uppercase}
+    h1{width:100%;max-width:none;margin:0;font-family:var(--serif);font-size:clamp(52px,6.1vw,76px);font-style:italic;font-weight:400;line-height:.94;letter-spacing:-.025em;text-wrap:balance}
+    .lede{max-width:28rem;margin:24px 0 0;color:var(--ink-2);font-size:18px;line-height:1.48}
+    .wallet{display:inline-flex;max-width:100%;align-items:center;gap:9px;margin:28px 0 0;padding:8px 12px;border:1px solid var(--rule);border-radius:999px;background:rgba(250,247,241,.64);color:var(--ink-2);font-family:var(--mono);font-size:11px;overflow-wrap:anywhere}
+    .wallet::before{content:"";width:7px;height:7px;flex:0 0 auto;border-radius:50%;background:var(--leaf);box-shadow:0 0 0 4px rgba(82,111,81,.12)}
+    .trust-list{display:grid;gap:15px;margin:40px 0 0;padding:25px 0 0;border-top:1px solid var(--rule)}
+    .trust-item{display:grid;grid-template-columns:26px 1fr;gap:11px;align-items:start;color:var(--graphite);font-size:13px;line-height:1.45}
+    .trust-item svg{width:20px;height:20px;margin-top:1px;color:var(--leaf)}
+    .trust-item strong{display:block;margin-bottom:2px;color:var(--ink-2);font-size:14px;font-weight:600}
+    .panel{overflow:hidden;border:1px solid var(--rule-2);border-radius:18px;background:rgba(250,247,241,.91);box-shadow:0 24px 70px rgba(52,45,36,.09),0 2px 8px rgba(52,45,36,.04);backdrop-filter:blur(12px)}
+    .panel-header{padding:27px 30px 23px;border-bottom:1px solid var(--rule);background:rgba(236,228,214,.38)}
+    .panel-kicker{margin:0 0 6px;color:var(--graphite);font-family:var(--mono);font-size:10px;letter-spacing:.08em;text-transform:uppercase}
+    .panel-title{margin:0;font-family:var(--serif);font-size:30px;font-weight:400;line-height:1.15}
+    .panel-copy{margin:7px 0 0;color:var(--graphite);font-size:13px}
+    .section{padding:26px 30px;border-bottom:1px solid var(--rule)}
+    .section-heading{display:flex;align-items:center;gap:10px;margin:0 0 18px}
+    .section-icon{display:grid;width:30px;height:30px;place-items:center;border:1px solid var(--rule);border-radius:50%;color:var(--accent);background:var(--paper)}
+    .section-icon svg{width:15px;height:15px}
+    .section-label{margin:0;color:var(--ink);font-family:var(--mono);font-size:11px;font-weight:500;letter-spacing:.05em;text-transform:uppercase}
+    .section-note{margin:-10px 0 19px 40px;color:var(--muted);font-size:12px}
+    .field-list{display:grid;gap:12px}
+    .field{display:grid;grid-template-columns:minmax(0,1fr) minmax(128px,158px);gap:18px;align-items:center}
+    .field-copy{min-width:0}
+    .field label{display:block;color:var(--ink-2);font-size:14px;font-weight:500;cursor:pointer}
+    .field-description{display:block;margin-top:2px;color:var(--muted);font-size:12px;font-weight:400;line-height:1.35}
+    .input-wrap{position:relative}
+    .field input[type=number]{width:100%;height:43px;padding:9px 47px 9px 12px;border:1px solid var(--rule-2);border-radius:8px;background:var(--surface);color:var(--ink);font-family:var(--mono);font-size:13px;transition:border-color 160ms ease,box-shadow 160ms ease,background 160ms ease}
+    .field input[type=number]:hover{border-color:var(--graphite)}
+    .field input[type=number]:focus{border-color:var(--accent);background:#fff;box-shadow:0 0 0 3px rgba(138,42,58,.08);outline:none}
+    .field input[type=number]::placeholder{color:var(--muted)}
+    .unit{position:absolute;right:12px;top:50%;transform:translateY(-50%);color:var(--graphite);font-family:var(--mono);font-size:10px;pointer-events:none}
+    .toggle-field{grid-template-columns:minmax(0,1fr) auto;min-height:45px}
+    .field .toggle{position:relative;display:inline-grid;width:46px;height:28px;place-items:center;cursor:pointer}
+    .toggle input{position:absolute;inset:0;z-index:2;width:100%;height:100%;margin:0;opacity:0;cursor:pointer}
+    .toggle-track{position:absolute;inset:0;overflow:hidden;border:1px solid var(--rule-2);border-radius:999px;background:var(--paper-2);pointer-events:none;transition:background 160ms ease,border-color 160ms ease}
+    .toggle-track::after{content:"";position:absolute;width:18px;height:18px;left:4px;top:4px;border-radius:50%;background:var(--surface);box-shadow:0 1px 4px rgba(52,45,36,.3);transition:transform 180ms ease}
+    .toggle input:checked + .toggle-track{border-color:var(--leaf-2);background:var(--leaf-2)}
+    .toggle input:checked + .toggle-track::after{transform:translateX(20px)}
+    .toggle input:focus-visible + .toggle-track{outline:3px solid rgba(138,42,58,.2);outline-offset:2px}
+    .actions{padding:27px 30px 30px;background:rgba(236,228,214,.22)}
+    button{display:flex;width:100%;min-height:50px;align-items:center;justify-content:center;gap:9px;padding:13px 18px;border:0;border-radius:9px;background:var(--accent);color:var(--paper);font-family:var(--mono);font-size:12px;font-weight:500;letter-spacing:.01em;cursor:pointer;box-shadow:0 8px 20px rgba(94,26,38,.17);transition:transform 160ms ease,background 160ms ease,box-shadow 160ms ease,opacity 160ms ease}
+    button svg{width:17px;height:17px}
+    button:hover:not(:disabled){transform:translateY(-1px);background:var(--accent-deep);box-shadow:0 11px 24px rgba(94,26,38,.22)}
+    button:active:not(:disabled){transform:translateY(0)}
+    button:disabled{opacity:.48;cursor:wait;box-shadow:none}
+    .hint{display:flex;align-items:flex-start;justify-content:center;gap:7px;margin:12px 8px 0;color:var(--graphite);font-size:11px;line-height:1.45;text-align:center}
+    .hint svg{width:14px;height:14px;flex:0 0 auto;margin-top:1px;color:var(--leaf)}
+    #status{display:none;margin:14px 0 0;padding:13px 15px;border:1px solid transparent;border-radius:8px;font-size:12px;line-height:1.5;overflow-wrap:anywhere}
+    .pending{display:block!important;border-color:var(--rule)!important;background:var(--paper);color:var(--ink-2)}
+    .ok{display:block!important;border-color:rgba(53,95,71,.25)!important;background:var(--success-bg);color:var(--success)}
+    .err{display:block!important;border-color:rgba(122,34,48,.2)!important;background:var(--error-bg);color:var(--error)}
+    @media(max-width:820px){
+      .page{padding-top:24px}
+      .layout{grid-template-columns:1fr;gap:34px;margin-top:30px}
+      .intro{position:static;padding-top:0}
+      h1{font-size:clamp(48px,11vw,68px)}
+      .lede{font-size:17px}
+      .trust-list{grid-template-columns:repeat(2,minmax(0,1fr));margin-top:30px}
+    }
+    @media(max-width:560px){
+      .page{padding:19px 14px 28px}
+      .layout{margin-top:28px;gap:28px}
+      h1{font-size:46px}
+      .lede{margin-top:18px;font-size:16px}
+      .wallet{margin-top:22px}
+      .trust-list{grid-template-columns:1fr;gap:12px;padding-top:20px}
+      .panel{border-radius:14px}
+      .panel-header,.section,.actions{padding-left:20px;padding-right:20px}
+      .field{grid-template-columns:1fr;gap:8px}
+      .toggle-field{grid-template-columns:minmax(0,1fr) auto;gap:16px}
+      .field input[type=number]{height:46px}
+      .section-note{margin-left:0}
+    }
+    @media(prefers-reduced-motion:reduce){*{scroll-behavior:auto!important;transition:none!important}}
   </style>
 </head>
 <body>
-  <h1>bloom — Register Passkey</h1>
-  <p class="wallet" id="wallet-name">Loading…</p>
+  <main class="page">
+    <header>
+      <div class="brand-lockup" aria-label="Bloom walletFS">
+        <svg class="brand-mark" viewBox="0 0 1024 1024" aria-hidden="true">
+          <g stroke-linejoin="round" stroke-linecap="round">
+            <path d="M24.58 0C96.09 141.31 209.14 141.31 282.62 0" fill="none" stroke="#7a2230" stroke-width="30" transform="translate(512 512) rotate(-72.5) scale(1.24)"/>
+            <path d="M24.58 0C96.09 141.31 209.14 141.31 282.62 0C209.14-141.31 96.09-141.31 24.58 0Z" fill="#9d2d3f" transform="translate(512 512) rotate(-12.5) scale(1.24)"/>
+            <path d="M24.58 0C96.09 141.31 209.14 141.31 282.62 0C209.14-141.31 96.09-141.31 24.58 0Z" fill="none" stroke="#7a2230" stroke-width="30" transform="translate(512 512) rotate(47.5) scale(1.24)"/>
+            <path d="M24.58 0C96.09 141.31 209.14 141.31 282.62 0C209.14-141.31 96.09-141.31 24.58 0Z" fill="#9d2d3f" transform="translate(512 512) rotate(107.5) scale(1.24)"/>
+            <path d="M24.58 0C96.09 141.31 209.14 141.31 282.62 0C209.14-141.31 96.09-141.31 24.58 0Z" fill="none" stroke="#7a2230" stroke-width="30" transform="translate(512 512) rotate(167.5) scale(1.24)"/>
+            <path d="M24.58 0C96.09 141.31 209.14 141.31 282.62 0C209.14-141.31 96.09-141.31 24.58 0Z" fill="#9d2d3f" transform="translate(512 512) rotate(227.5) scale(1.24)"/>
+            <path d="M282.62 0C209.14-141.31 96.09-141.31 24.58 0" fill="none" stroke="#7a2230" stroke-width="30" transform="translate(512 512) rotate(-72.5) scale(1.24)"/>
+          </g>
+        </svg>
+        <span><strong>/bloom</strong> walletFS</span>
+      </div>
+    </header>
 
-  <div class="section">
-    <p class="section-label">Spend limits</p>
-    <div class="field">
-      <label>Hard cap per tx</label>
-      <input type="number" id="max_value_eth" min="0" step="0.01" placeholder="none">
-      <span class="unit">ETH</span><span class="opt">(optional)</span>
-    </div>
-    <div class="field">
-      <label>Require override above</label>
-      <input type="number" id="require_override_above_eth" min="0" step="0.01" placeholder="none">
-      <span class="unit">ETH</span><span class="opt">(optional)</span>
-    </div>
-    <div class="field">
-      <label>Require confirm above</label>
-      <input type="number" id="require_confirm_above_usd" min="0" step="1" placeholder="none">
-      <span class="unit">USD</span><span class="opt">(optional)</span>
-    </div>
-  </div>
+    <div class="layout">
+      <section class="intro" aria-labelledby="page-title">
+        <p class="eyebrow">Secure wallet setup</p>
+        <h1 id="page-title">Create your wallet.</h1>
+        <p class="lede">Set the boundaries Bloom will enforce, then protect the wallet with a passkey stored by your device.</p>
+        <p class="wallet" id="wallet-name" aria-live="polite">Loading wallet…</p>
 
-  <div class="section">
-    <p class="section-label">Swap protection</p>
-    <div class="field">
-      <label>Max slippage</label>
-      <input type="number" id="max_slippage_pct" min="0.01" max="50" step="0.01" value="1">
-      <span class="unit">%</span>
-    </div>
-    <div class="field">
-      <label>Fail on high-risk routes</label>
-      <input type="checkbox" id="fail_on_high_risk">
-    </div>
-  </div>
+        <div class="trust-list" aria-label="Security details">
+          <div class="trust-item">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><rect x="4" y="10" width="16" height="10" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3M12 14v2"/></svg>
+            <div><strong>Keys stay isolated</strong>Your private key is encrypted and never exposed to agents.</div>
+          </div>
+          <div class="trust-item">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="M12 3 20 7v5c0 4.6-3.1 7.5-8 9-4.9-1.5-8-4.4-8-9V7l8-4Z"/><path d="m8.5 12 2.2 2.2 4.8-5"/></svg>
+            <div><strong>Policy before signing</strong>Every action is checked against the limits you choose.</div>
+          </div>
+        </div>
+      </section>
 
-  <div class="section">
-    <p class="section-label">Privacy</p>
-    <div class="field">
-      <label>Route via MEV Blocker</label>
-      <input type="checkbox" id="private_enabled">
-    </div>
-  </div>
+      <form class="panel" id="wallet-form" onsubmit="return false">
+        <div class="panel-header">
+          <p class="panel-kicker">Wallet policy</p>
+          <h2 class="panel-title">Choose your guardrails</h2>
+          <p class="panel-copy">Leave an optional limit blank if you do not want to set one yet.</p>
+        </div>
 
-  <hr>
-  <button id="btn" disabled>Save policy &amp; register passkey</button>
-  <p class="hint">Your authenticator (Touch ID, security key, etc.) will be prompted after clicking.</p>
-  <div id="status"></div>
+        <section class="section" aria-labelledby="spend-heading">
+          <div class="section-heading">
+            <span class="section-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="M4 7.5h14a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H4V7.5Z"/><path d="M4 7.5V6a2 2 0 0 1 2-2h10M15 13.5h5"/></svg></span>
+            <h3 class="section-label" id="spend-heading">Spend limits</h3>
+          </div>
+          <p class="section-note">Set limits for native-coin transactions and approval prompts.</p>
+          <div class="field-list">
+            <div class="field">
+              <div class="field-copy"><label for="max_value_eth">Maximum per transaction<span class="field-description">Refuse transactions above this amount</span></label></div>
+              <div class="input-wrap"><input type="number" id="max_value_eth" min="0" step="0.01" placeholder="No limit" inputmode="decimal"><span class="unit">ETH</span></div>
+            </div>
+            <div class="field">
+              <div class="field-copy"><label for="require_override_above_eth">Extra review above<span class="field-description">Require an explicit policy override</span></label></div>
+              <div class="input-wrap"><input type="number" id="require_override_above_eth" min="0" step="0.01" placeholder="No limit" inputmode="decimal"><span class="unit">ETH</span></div>
+            </div>
+            <div class="field">
+              <div class="field-copy"><label for="require_confirm_above_usd">Confirmation above<span class="field-description">Ask for confirmation at this USD value</span></label></div>
+              <div class="input-wrap"><input type="number" id="require_confirm_above_usd" min="0" step="1" placeholder="No limit" inputmode="decimal"><span class="unit">USD</span></div>
+            </div>
+          </div>
+        </section>
+
+        <section class="section" aria-labelledby="swap-heading">
+          <div class="section-heading">
+            <span class="section-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="m7 7 3-3 3 3M10 4v12a4 4 0 0 0 4 4h3M17 17l3 3-3 3"/></svg></span>
+            <h3 class="section-label" id="swap-heading">Swap protection</h3>
+          </div>
+          <div class="field-list">
+            <div class="field">
+              <div class="field-copy"><label for="max_slippage_pct">Maximum slippage<span class="field-description">Limit acceptable price movement</span></label></div>
+              <div class="input-wrap"><input type="number" id="max_slippage_pct" min="0.01" max="50" step="0.01" value="1" inputmode="decimal"><span class="unit">%</span></div>
+            </div>
+            <div class="field toggle-field">
+              <div class="field-copy"><label for="fail_on_high_risk">Block high-risk routes<span class="field-description">Reject routes flagged as unsafe</span></label></div>
+              <label class="toggle" aria-label="Block high-risk routes"><input type="checkbox" id="fail_on_high_risk"><span class="toggle-track" aria-hidden="true"></span></label>
+            </div>
+          </div>
+        </section>
+
+        <section class="section" aria-labelledby="privacy-heading">
+          <div class="section-heading">
+            <span class="section-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="M3 12s3.3-6 9-6 9 6 9 6-3.3 6-9 6-9-6-9-6Z"/><circle cx="12" cy="12" r="2.5"/><path d="m4 20 16-16"/></svg></span>
+            <h3 class="section-label" id="privacy-heading">Transaction privacy</h3>
+          </div>
+          <div class="field toggle-field">
+            <div class="field-copy"><label for="private_enabled">Use MEV Blocker<span class="field-description">Route eligible transactions through a private endpoint</span></label></div>
+            <label class="toggle" aria-label="Use MEV Blocker"><input type="checkbox" id="private_enabled"><span class="toggle-track" aria-hidden="true"></span></label>
+          </div>
+        </section>
+
+        <div class="actions">
+          <button id="btn" type="submit" disabled>
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><circle cx="8" cy="15" r="4"/><path d="m11 12 8-8M15 8l3 3M17 6l2 2"/></svg>
+            Save policy &amp; create passkey
+          </button>
+          <p class="hint"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="M12 3 20 7v5c0 4.6-3.1 7.5-8 9-4.9-1.5-8-4.4-8-9V7l8-4Z"/></svg>Your device will ask for Touch ID, Windows Hello, or a security key.</p>
+          <div id="status" role="status" aria-live="polite"></div>
+        </div>
+      </form>
+    </div>
+  </main>
 
 <script>
+var FAVICON_LINK=document.querySelector('link[data-favicon-link]');
+var COLOR_SCHEME_MEDIA=window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)');
+function syncFavicon(){
+  if(FAVICON_LINK) FAVICON_LINK.href=COLOR_SCHEME_MEDIA&&COLOR_SCHEME_MEDIA.matches?'/favicon-dark.svg':'/favicon-light.svg';
+}
+syncFavicon();
+if(COLOR_SCHEME_MEDIA) COLOR_SCHEME_MEDIA.addEventListener('change',syncFavicon);
 var TK=new URLSearchParams(location.search).get('t')||'';
 var PASSKEY_FLOW_ACTIVE=false;
 function dec(s){
@@ -118,7 +281,7 @@ function populateForm(toml){
 }
 async function init(){
   var name=await(await fetch('/name')).text();
-  document.getElementById('wallet-name').textContent='wallet: '+name;
+  document.getElementById('wallet-name').textContent='Wallet · '+name;
   var toml=await(await fetch('/policy')).text();
   populateForm(toml);
   document.getElementById('btn').disabled=false;
@@ -128,7 +291,7 @@ async function register(){
   var st=document.getElementById('status');
   btn.disabled=true;
   st.style.display='block';
-  st.className='';
+  st.className='pending';
   if(!navigator.credentials||!navigator.credentials.create){
     st.className='err';
     st.textContent='WebAuthn is not available in this browser. Try Chrome or Safari on this device.';

@@ -55,13 +55,6 @@ const AUTH_TIMEOUT_SECS: u64 = 120;
 /// form and optionally edit fields before clicking — allow 5 minutes.
 const REG_TIMEOUT_SECS: u64 = 300;
 
-/// Port for the recovery-key display page (must differ from CEREMONY_PORT
-/// so it can run immediately after the ceremony without a bind conflict).
-const RECOVERY_PORT: u16 = 18735;
-
-/// Timeout for the recovery-key display page.
-const RECOVERY_TIMEOUT_SECS: u64 = 300;
-
 /// WebAuthn Relying Party ID for all bloom passkey credentials.
 pub(crate) const RP_ID: &str = "localhost";
 
@@ -681,44 +674,28 @@ async fn require_localhost_origin(
     next.run(req).await
 }
 
-/// Same as `require_localhost_origin` but for the recovery-key page, which
-/// runs on `RECOVERY_PORT` (18735), not `CEREMONY_PORT` (18734).
-async fn require_recovery_origin(
-    req: axum::extract::Request,
-    next: axum::middleware::Next,
-) -> axum::response::Response {
-    use axum::response::IntoResponse as _;
-    if !origin_ok(&req, RECOVERY_PORT) {
-        return axum::http::StatusCode::FORBIDDEN.into_response();
-    }
-    next.run(req).await
-}
-
 /// Generate an unguessable 256-bit capability token (base64url, no pad). It is
 /// embedded in the URL bloom opens and required on every state-changing request
-/// (and the recovery `/data` read), binding the loopback server to the browser
-/// page bloom launched.
+/// to bind the loopback server to the browser page bloom launched.
 fn gen_token() -> String {
     let mut t = [0u8; 32];
     rand::thread_rng().fill_bytes(&mut t);
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(t)
 }
 
-/// Capability-token gate. POSTs (and the recovery-page `GET /data`) must carry
-/// an `x-bloom-token` header equal to the per-server token embedded in the URL
-/// bloom opened. The `Origin` header is trivially spoofable by a local
-/// non-browser process and the challenge is readable via `GET /challenge`, so
-/// the origin check alone does not stop a local process from POSTing a forged
-/// PRF output or scraping the recovery key. The token — never sent to the
-/// network, only present in the URL bloom launched — closes that gap.
+/// Capability-token gate. POSTs must carry an `x-bloom-token` header equal to
+/// the per-server token embedded in the URL bloom opened. The `Origin` header
+/// is trivially spoofable by a local non-browser process and the challenge is
+/// readable via `GET /challenge`, so the origin check alone does not stop a
+/// local process from POSTing a forged PRF output. The token — never sent to
+/// the network, only present in the URL bloom launched — closes that gap.
 async fn require_token(
     axum::extract::State(token): axum::extract::State<String>,
     req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
     use axum::response::IntoResponse as _;
-    let sensitive = req.method() == axum::http::Method::POST
-        || (req.method() == axum::http::Method::GET && req.uri().path() == "/data");
+    let sensitive = req.method() == axum::http::Method::POST;
     if sensitive {
         let ok = req
             .headers()
@@ -736,6 +713,8 @@ fn build_reg_app(state: RegState) -> Router {
     let token = state.token.clone();
     Router::new()
         .route("/", get(reg_index))
+        .route("/favicon-light.svg", get(reg_favicon_light))
+        .route("/favicon-dark.svg", get(reg_favicon_dark))
         .route("/challenge", get(reg_challenge))
         .route("/name", get(reg_name))
         .route("/policy", get(reg_policy))
@@ -750,6 +729,32 @@ fn build_reg_app(state: RegState) -> Router {
 
 async fn reg_index() -> Html<&'static str> {
     Html(REGISTER_HTML)
+}
+
+async fn reg_favicon_light() -> impl axum::response::IntoResponse {
+    (
+        [
+            (
+                axum::http::header::CONTENT_TYPE,
+                "image/svg+xml; charset=utf-8",
+            ),
+            (axum::http::header::CACHE_CONTROL, "public, max-age=86400"),
+        ],
+        FAVICON_LIGHT,
+    )
+}
+
+async fn reg_favicon_dark() -> impl axum::response::IntoResponse {
+    (
+        [
+            (
+                axum::http::header::CONTENT_TYPE,
+                "image/svg+xml; charset=utf-8",
+            ),
+            (axum::http::header::CACHE_CONTROL, "public, max-age=86400"),
+        ],
+        FAVICON_DARK,
+    )
 }
 
 async fn reg_challenge(
@@ -1152,106 +1157,11 @@ async fn auth_post(
 
 const REGISTER_HTML: &str = include_str!("passkey_register.html");
 
+const FAVICON_LIGHT: &str = include_str!("passkey_favicon_light.svg");
+
+const FAVICON_DARK: &str = include_str!("passkey_favicon_dark.svg");
+
 const AUTH_HTML: &str = include_str!("passkey_auth.html");
-
-// ── recovery key display ──────────────────────────────────────────────────────
-
-/// Open a browser page that shows the recovery key for a newly created or
-/// rebound passkey wallet. Blocks until the user confirms they have stored
-/// it (POST /done) or the timeout elapses. The caller must already have
-/// printed the key to stderr as a fallback — this is the visual display.
-pub(crate) async fn display_recovery_key(
-    wallet_name: &str,
-    recovery_key_hex: &str,
-) -> Result<(), String> {
-    let state = RecoveryState {
-        wallet_name: wallet_name.to_string(),
-        recovery_key_hex: recovery_key_hex.to_string(),
-        token: gen_token(),
-        done: Arc::new(tokio::sync::Notify::new()),
-        shutdown: Arc::new(tokio::sync::Notify::new()),
-    };
-
-    let app = build_recovery_app(state.clone());
-    let listener = bind_local(RECOVERY_PORT, "recovery key page")?;
-    let shutdown = state.shutdown.clone();
-    let server = tokio::spawn(async move {
-        let _ = axum::serve(listener, app)
-            .with_graceful_shutdown(async move { shutdown.notified().await })
-            .await;
-    });
-
-    let url = format!("http://localhost:{RECOVERY_PORT}/?t={}", state.token);
-    eprintln!("[bloom] Recovery key page: {url}");
-    if let Err(e) = launch_browser(&url) {
-        state.shutdown.notify_one();
-        let _ = server.await;
-        return Err(e);
-    }
-
-    let timed_out = tokio::time::timeout(
-        std::time::Duration::from_secs(RECOVERY_TIMEOUT_SECS),
-        state.done.notified(),
-    )
-    .await
-    .is_err();
-
-    state.shutdown.notify_one();
-    let _ = server.await;
-
-    if timed_out {
-        eprintln!("[bloom] Recovery key page timed out after {RECOVERY_TIMEOUT_SECS}s");
-        Err(format!(
-            "recovery key page timed out after {RECOVERY_TIMEOUT_SECS}s"
-        ))
-    } else {
-        Ok(())
-    }
-}
-
-#[derive(Clone)]
-struct RecoveryState {
-    wallet_name: String,
-    recovery_key_hex: String,
-    /// Per-server capability token embedded in the launched URL; required on
-    /// `GET /data` and `POST /done` by `require_token`.
-    token: String,
-    done: Arc<tokio::sync::Notify>,
-    shutdown: Arc<tokio::sync::Notify>,
-}
-
-fn build_recovery_app(state: RecoveryState) -> Router {
-    let token = state.token.clone();
-    Router::new()
-        .route("/", get(recovery_index))
-        .route("/data", get(recovery_data))
-        .route("/done", post(recovery_done))
-        .layer(axum::middleware::from_fn(require_recovery_origin))
-        .layer(axum::middleware::from_fn_with_state(token, require_token))
-        .with_state(state)
-}
-
-async fn recovery_index() -> Html<&'static str> {
-    Html(RECOVERY_HTML)
-}
-
-async fn recovery_data(State(state): State<RecoveryState>) -> Json<serde_json::Value> {
-    Json(serde_json::json!({
-        "wallet": state.wallet_name,
-        "recovery_key": format!("0x{}", state.recovery_key_hex),
-        "recovery_command": format!(
-            "bloom wallet import {} 0x{}",
-            state.wallet_name, state.recovery_key_hex
-        ),
-    }))
-}
-
-async fn recovery_done(State(state): State<RecoveryState>) -> axum::http::StatusCode {
-    state.done.notify_one();
-    axum::http::StatusCode::OK
-}
-
-const RECOVERY_HTML: &str = include_str!("passkey_recovery.html");
 
 // ── keystore integration ──────────────────────────────────────────────────────
 //
@@ -1275,18 +1185,6 @@ const PASSKEY_ENCRYPTED_VERSION: u8 = 1;
 const PASSKEY_AAD: &[u8] = b"bloom-keystore-passkey";
 
 // ── passkey crypto helpers ────────────────────────────────────────────────────
-
-/// Show the recovery key in a browser page; if that fails, return it so
-/// `main.rs` can display a terminal prompt instead. Either way the key is
-/// shown exactly once and never written to disk.
-async fn recovery_key_field(name: &str, signer: &PrivateKeySigner) -> Option<Zeroizing<String>> {
-    let hex_key = Zeroizing::new(hex::encode(signer.to_bytes()));
-    if display_recovery_key(name, &hex_key).await.is_ok() {
-        None
-    } else {
-        Some(hex_key)
-    }
-}
 
 /// Encrypt a 32-byte private key using a wrap key derived from `prf_output`.
 /// `wrap_key = blake3::derive_key("bloom passkey wrap key", prf_output)`.
@@ -1625,9 +1523,9 @@ impl super::Keystore {
         let final_policy = toml::from_str::<Policy>(&final_policy_toml)
             .map_err(|e| KeystoreError::Policy(format!("final policy parse: {e}")))?;
 
-        // Show the recovery key in a browser page; fall back to returning it
-        // for terminal display if the browser cannot be launched.
-        let recovery_key = recovery_key_field(name, signer).await;
+        // Return the recovery key for the existing one-time terminal prompt.
+        // It is never written to disk.
+        let recovery_key = Some(Zeroizing::new(hex::encode(signer.to_bytes())));
 
         // Cache the signer so the wallet is ready to use immediately after creation.
         self.inner
@@ -2219,8 +2117,8 @@ impl super::Keystore {
         }
         std::mem::forget(tmp_guard);
 
-        // Step 7: Show recovery key in browser; fall back to terminal if needed.
-        let recovery_key = recovery_key_field(name, &signer).await;
+        // Step 7: Return the recovery key for the one-time terminal prompt.
+        let recovery_key = Some(Zeroizing::new(hex::encode(signer.to_bytes())));
 
         // Re-insert (same signer; new credential is now on disk).
         self.inner.unlocked.write().insert(name.to_string(), signer);
