@@ -6,12 +6,12 @@
   <meta name="theme-color" content="#f4efe6">
   <meta name="referrer" content="no-referrer">
   <title>/bloom — Create your wallet</title>
-  <link rel="icon" type="image/svg+xml" href="/favicon-light.svg" data-favicon-link>
+  <link rel="icon" type="image/svg+xml" href="/wallet-registration-assets/favicon-light.svg" data-favicon-link>
   <style>
-    @font-face{font-family:"Instrument Serif";font-style:normal;font-weight:400;font-display:swap;src:url("/fonts/instrument-serif-normal-latin.woff2") format("woff2")}
-    @font-face{font-family:"Instrument Serif";font-style:italic;font-weight:400;font-display:swap;src:url("/fonts/instrument-serif-italic-latin.woff2") format("woff2")}
-    @font-face{font-family:"Inter Tight";font-style:normal;font-weight:300 600;font-display:swap;src:url("/fonts/inter-tight-latin.woff2") format("woff2")}
-    @font-face{font-family:"JetBrains Mono";font-style:normal;font-weight:300 500;font-display:swap;src:url("/fonts/jetbrains-mono-latin.woff2") format("woff2")}
+    @font-face{font-family:"Instrument Serif";font-style:normal;font-weight:400;font-display:swap;src:url("/wallet-registration-assets/fonts/instrument-serif-normal-latin.woff2") format("woff2")}
+    @font-face{font-family:"Instrument Serif";font-style:italic;font-weight:400;font-display:swap;src:url("/wallet-registration-assets/fonts/instrument-serif-italic-latin.woff2") format("woff2")}
+    @font-face{font-family:"Inter Tight";font-style:normal;font-weight:300 600;font-display:swap;src:url("/wallet-registration-assets/fonts/inter-tight-latin.woff2") format("woff2")}
+    @font-face{font-family:"JetBrains Mono";font-style:normal;font-weight:300 500;font-display:swap;src:url("/wallet-registration-assets/fonts/jetbrains-mono-latin.woff2") format("woff2")}
     :root{
       --paper:#f4efe6;
       --paper-2:#ece4d6;
@@ -122,6 +122,19 @@
       .section-note{margin-left:0}
     }
     @media(prefers-reduced-motion:reduce){*{scroll-behavior:auto!important;transition:none!important}}
+    .state-panel{display:none;padding:26px 30px 30px}
+    .state-panel.active{display:block}
+    .state-panel h2{margin:0 0 12px;font-family:var(--serif);font-size:26px;font-weight:400}
+    .state-panel p{margin:0 0 12px;color:var(--ink-2);font-size:14px;line-height:1.55}
+    .state-panel ul{margin:0 0 14px;padding-left:20px;color:var(--ink-2);font-size:14px;line-height:1.6}
+    .recovery-key{display:block;margin:10px 0 16px;padding:14px;border:1px solid var(--rule-2);border-radius:8px;background:var(--surface);color:var(--ink);font-family:var(--mono);font-size:13px;word-break:break-all;user-select:all}
+    .warn-box{margin:0 0 16px;padding:12px 14px;border:1px solid rgba(122,34,48,.25);border-radius:8px;background:var(--error-bg);color:var(--error);font-size:13px;line-height:1.5}
+    .ack-row{display:flex;align-items:flex-start;gap:9px;margin:0 0 18px}
+    .ack-row input{margin-top:3px}
+    .ack-row label{font-size:13px;color:var(--ink-2);line-height:1.5}
+    .secondary-btn{background:var(--paper-2);color:var(--ink-2);box-shadow:none}
+    .secondary-btn:hover:not(:disabled){background:var(--rule);color:var(--ink)}
+    .address-box{display:block;margin:10px 0 16px;padding:14px;border:1px solid rgba(53,95,71,.25);border-radius:8px;background:var(--success-bg);color:var(--success);font-family:var(--mono);font-size:13px;word-break:break-all}
   </style>
 </head>
 <body>
@@ -228,6 +241,51 @@
           <div id="status" role="status" aria-live="polite"></div>
         </div>
       </form>
+
+      <div class="panel state-panel" id="panel-unsupported">
+        <div class="state-panel active">
+          <h2>Unsupported passkey method</h2>
+          <p>This passkey method does not support a cryptographic feature required by this application.</p>
+          <p>Please try again and choose a different passkey method, such as:</p>
+          <ul>
+            <li>Your browser or device passkey</li>
+            <li>iCloud Keychain or Google Password Manager</li>
+            <li>A compatible hardware security key</li>
+          </ul>
+          <p>If Bitwarden appears, select <strong><em>Use browser, device, or hardware key</em></strong> instead.</p>
+          <button id="retry-btn" type="button" class="secondary-btn">Try a different passkey method</button>
+        </div>
+      </div>
+
+      <div class="panel state-panel" id="panel-recovery">
+        <div class="state-panel active">
+          <h2>Save your recovery key</h2>
+          <p>This is the only time your recovery key will be shown. Store it like a seed phrase — anyone with this key can control the wallet.</p>
+          <code class="recovery-key" id="recovery-key-text"></code>
+          <div class="warn-box">Reloading or closing this page after this point loses this key forever. If you lose it before acknowledging, the wallet is not created and you must start over.</div>
+          <div class="ack-row">
+            <input type="checkbox" id="ack-checkbox">
+            <label for="ack-checkbox">I have saved this recovery key somewhere safe.</label>
+          </div>
+          <button id="ack-btn" type="button" disabled>Continue</button>
+        </div>
+      </div>
+
+      <div class="panel state-panel" id="panel-done">
+        <div class="state-panel active">
+          <h2>Wallet created</h2>
+          <p>Your passkey wallet is ready.</p>
+          <code class="address-box" id="done-address"></code>
+          <p>You can close this tab.</p>
+        </div>
+      </div>
+
+      <div class="panel state-panel" id="panel-terminal">
+        <div class="state-panel active">
+          <h2 id="terminal-title">Registration unavailable</h2>
+          <p id="terminal-message"></p>
+        </div>
+      </div>
     </div>
   </main>
 
@@ -235,12 +293,20 @@
 var FAVICON_LINK=document.querySelector('link[data-favicon-link]');
 var COLOR_SCHEME_MEDIA=window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)');
 function syncFavicon(){
-  if(FAVICON_LINK) FAVICON_LINK.href=COLOR_SCHEME_MEDIA&&COLOR_SCHEME_MEDIA.matches?'/favicon-dark.svg':'/favicon-light.svg';
+  if(FAVICON_LINK) FAVICON_LINK.href=COLOR_SCHEME_MEDIA&&COLOR_SCHEME_MEDIA.matches?'/wallet-registration-assets/favicon-dark.svg':'/wallet-registration-assets/favicon-light.svg';
 }
 syncFavicon();
 if(COLOR_SCHEME_MEDIA) COLOR_SCHEME_MEDIA.addEventListener('change',syncFavicon);
-var TK=new URLSearchParams(location.search).get('t')||'';
+
+// BASE is this ceremony's own URL, e.g. "/wallet-registration/<token>" — the
+// token is never read from a query param; it is the routing capability
+// embedded in the page's own path, matching every fetch below.
+var BASE=location.pathname.replace(/\/$/,'');
 var PASSKEY_FLOW_ACTIVE=false;
+// Recovery key and completion receipt live only in this page's memory —
+// never localStorage/sessionStorage, never sent anywhere but /recovery-ack.
+var PENDING_RECEIPT=null;
+
 function dec(s){
   s=s.replace(/-/g,'+').replace(/_/g,'/');
   while(s.length%4)s+='=';
@@ -281,13 +347,86 @@ function populateForm(toml){
   var fhr=match('fail_on_high_risk'); if(fhr) document.getElementById('fail_on_high_risk').checked=(fhr==='true');
   var priv=match('enabled'); if(priv) document.getElementById('private_enabled').checked=(priv==='true');
 }
+
+function showPanel(id){
+  ['wallet-form','panel-unsupported','panel-recovery','panel-done','panel-terminal'].forEach(function(pid){
+    var el=document.getElementById(pid);
+    if(!el) return;
+    if(pid===id) el.classList.add('active'); else el.classList.remove('active');
+    if(pid!=='wallet-form') el.style.display=(pid===id)?'':'none';
+  });
+}
+
+function showTerminal(title,message){
+  document.getElementById('terminal-title').textContent=title;
+  document.getElementById('terminal-message').textContent=message;
+  showPanel('panel-terminal');
+}
+
+async function jsonOrThrow(resp){
+  var body=null;
+  try{body=await resp.json();}catch(e){}
+  if(!resp.ok){
+    var msg=(body&&body.error)?body.error:('request failed (HTTP '+resp.status+')');
+    throw new Error(msg);
+  }
+  return body;
+}
+
 async function init(){
-  var name=await(await fetch('/name')).text();
-  document.getElementById('wallet-name').textContent='Wallet · '+name;
-  var toml=await(await fetch('/policy')).text();
-  populateForm(toml);
+  var session=await jsonOrThrow(await fetch(BASE+'/session.json'));
+  document.getElementById('wallet-name').textContent='Wallet · '+session.wallet;
+  if(session.state==='awaiting_recovery_ack'){
+    showTerminal(
+      'Recovery acknowledgment pending',
+      'A passkey was already created for this wallet in another tab or window. If that tab is still open, finish there. If you lost it, cancel this registration and start over.'
+    );
+    return;
+  }
+  populateForm(session.default_policy_toml||'');
   document.getElementById('btn').disabled=false;
 }
+
+/// Show the exact approved unsupported-PRF copy and let the user retry with
+/// a fresh attempt. Never calls /complete, never POSTs the credential.
+function showUnsupported(){
+  showPanel('panel-unsupported');
+}
+
+async function createAttempt(){
+  var toml=buildToml();
+  return jsonOrThrow(await fetch(BASE+'/attempts',{method:'POST',headers:{'Content-Type':'text/plain'},body:toml}));
+}
+
+function decodeCreationOptions(optsJson){
+  var opts=JSON.parse(JSON.stringify(optsJson));
+  opts.publicKey.challenge=dec(opts.publicKey.challenge);
+  opts.publicKey.user.id=dec(opts.publicKey.user.id);
+  if(opts.publicKey.excludeCredentials)
+    opts.publicKey.excludeCredentials=opts.publicKey.excludeCredentials.map(function(c){return{...c,id:dec(c.id)};});
+  var prfSaltBytes=null;
+  if(opts.publicKey.extensions&&opts.publicKey.extensions.prf&&opts.publicKey.extensions.prf.eval&&opts.publicKey.extensions.prf.eval.first){
+    prfSaltBytes=dec(opts.publicKey.extensions.prf.eval.first);
+    opts.publicKey.extensions.prf.eval.first=prfSaltBytes;
+  }
+  return {opts:opts,prfSaltBytes:prfSaltBytes};
+}
+
+function credentialJson(cred){
+  return {id:cred.id,rawId:enc(cred.rawId),type:cred.type,response:{
+    attestationObject:enc(cred.response.attestationObject),
+    clientDataJSON:enc(cred.response.clientDataJSON)
+  }};
+}
+function assertionJson(cred){
+  return {id:cred.id,rawId:enc(cred.rawId),type:cred.type,response:{
+    authenticatorData:enc(cred.response.authenticatorData),
+    clientDataJSON:enc(cred.response.clientDataJSON),
+    signature:enc(cred.response.signature),
+    userHandle:cred.response.userHandle?enc(cred.response.userHandle):null
+  }};
+}
+
 async function register(){
   var btn=document.getElementById('btn');
   var st=document.getElementById('status');
@@ -297,84 +436,78 @@ async function register(){
   if(!navigator.credentials||!navigator.credentials.create){
     st.className='err';
     st.textContent='WebAuthn is not available in this browser. Try Chrome or Safari on this device.';
-    return;
-  }
-  var toml=buildToml();
-  var upd=await fetch('/policy/update',{method:'POST',headers:{'Content-Type':'text/plain','x-bloom-token':TK},body:toml});
-  if(!upd.ok){
-    st.className='err';
-    st.textContent='Policy validation failed (invalid TOML). Please check your inputs.';
     btn.disabled=false;
     return;
   }
-  st.textContent='Waiting for passkey interaction (Touch ID / security key)…';
   PASSKEY_FLOW_ACTIVE=true;
   try{
-    var opts=await(await fetch('/challenge')).json();
-    opts.publicKey.challenge=dec(opts.publicKey.challenge);
-    opts.publicKey.user.id=dec(opts.publicKey.user.id);
-    if(opts.publicKey.excludeCredentials)
-      opts.publicKey.excludeCredentials=opts.publicKey.excludeCredentials.map(function(c){return{...c,id:dec(c.id)};});
-    // Decode the PRF salt from base64url to ArrayBuffer for the WebAuthn API.
-    var prfSaltBytes=null;
-    if(opts.publicKey.extensions&&opts.publicKey.extensions.prf&&opts.publicKey.extensions.prf.eval&&opts.publicKey.extensions.prf.eval.first){
-      prfSaltBytes=dec(opts.publicKey.extensions.prf.eval.first);
-      opts.publicKey.extensions.prf.eval.first=prfSaltBytes;
-    }
-    var cred=await navigator.credentials.create(opts);
+    st.textContent='Creating a fresh registration attempt…';
+    var attempt=await createAttempt();
+    var decoded=decodeCreationOptions(attempt.creation_options_json);
+
+    st.textContent='Waiting for passkey interaction (Touch ID / security key)…';
+    var cred=await navigator.credentials.create(decoded.opts);
     var ext=cred.getClientExtensionResults();
     var prfFirst=ext&&ext.prf&&ext.prf.results&&ext.prf.results.first;
 
-    if(prfFirst){
-      // PRF output returned during create — most common path (macOS Touch ID + Chrome).
-      await fetch('/prf-output',{method:'POST',headers:{'Content-Type':'application/json','x-bloom-token':TK},body:JSON.stringify({prf_output_b64:enc(prfFirst),client_data_json_b64:enc(cred.response.clientDataJSON)})});
-    }else if(ext&&ext.prf&&ext.prf.enabled){
-      // PRF is supported but output only available during get(), not create().
-      // Run a secondary authentication to extract PRF output.
+    var outcome;
+    if(prfFirst && prfFirst.byteLength===32){
+      // PRF output returned during create() — verify+consume in one atomic
+      // /complete request, never uploaded separately.
+      outcome=await jsonOrThrow(await fetch(
+        BASE+'/attempts/'+attempt.attempt_id+'/complete',
+        {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
+          kind:'registration',
+          credential:credentialJson(cred),
+          prf_output_b64:enc(prfFirst)
+        })}
+      ));
+    }else if(ext&&ext.prf&&ext.prf.enabled===true){
+      // PRF is supported but output only available during get() — the
+      // server verifies+consumes the registration credential first, then
+      // issues a fallback authentication challenge for it.
       st.textContent='Almost done — please authenticate once more to complete PRF setup…';
-      var challengeData=await(await fetch('/auth-challenge')).json();
-      var fallbackChallenge=dec(challengeData.challenge);
-      var credId=new Uint8Array(cred.rawId);
-      var authOpts={
-        publicKey:{
-          challenge:fallbackChallenge,
-          timeout:60000,
-          allowCredentials:[{id:credId,type:'public-key'}],
-          extensions:{prf:{eval:{first:prfSaltBytes}}}
-        }
-      };
-      var authCred=await navigator.credentials.get(authOpts);
-      var authExt=authCred.getClientExtensionResults();
-      var authPrfFirst=authExt&&authExt.prf&&authExt.prf.results&&authExt.prf.results.first;
-      if(!authPrfFirst){
-        st.className='err';
-        st.textContent='PRF output not available from your authenticator. Supported: Touch ID (macOS/iOS), YubiKey 5+, Windows Hello (Chrome 147+), security keys with hmac-secret. On Linux: Chromium has no built-in passkey manager — install Google Chrome instead.';
-        btn.disabled=false;
+      var fbOpts=await jsonOrThrow(await fetch(
+        BASE+'/attempts/'+attempt.attempt_id+'/fallback-options',
+        {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(credentialJson(cred))}
+      ));
+      var fb=fbOpts.request_options_json;
+      fb.publicKey.challenge=dec(fb.publicKey.challenge);
+      if(fb.publicKey.allowCredentials) fb.publicKey.allowCredentials=fb.publicKey.allowCredentials.map(function(c){return{...c,id:dec(c.id)};});
+      if(fb.publicKey.extensions&&fb.publicKey.extensions.prf&&fb.publicKey.extensions.prf.eval&&fb.publicKey.extensions.prf.eval.first){
+        fb.publicKey.extensions.prf.eval.first=decoded.prfSaltBytes;
+      }
+      var fbCred=await navigator.credentials.get(fb);
+      var fbExt=fbCred.getClientExtensionResults();
+      var fbPrfFirst=fbExt&&fbExt.prf&&fbExt.prf.results&&fbExt.prf.results.first;
+      if(!fbPrfFirst || fbPrfFirst.byteLength!==32){
+        showUnsupported();
         return;
       }
-      await fetch('/prf-output',{method:'POST',headers:{'Content-Type':'application/json','x-bloom-token':TK},body:JSON.stringify({prf_output_b64:enc(authPrfFirst),client_data_json_b64:enc(authCred.response.clientDataJSON)})});
+      outcome=await jsonOrThrow(await fetch(
+        BASE+'/attempts/'+attempt.attempt_id+'/complete',
+        {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
+          kind:'fallback',
+          credential:assertionJson(fbCred),
+          prf_output_b64:enc(fbPrfFirst)
+        })}
+      ));
     }else{
-      // PRF not supported at all by this authenticator.
-      st.className='err';
-      st.textContent='Your authenticator does not support the PRF extension required by bloom passkey wallets. Supported: Touch ID (macOS/iOS), YubiKey 5+, Windows Hello (Chrome 147+), security keys with hmac-secret. On Linux: Chromium has no built-in passkey manager — install Google Chrome instead.';
-      btn.disabled=false;
+      // PRF absent or explicitly unsupported: do not call /complete, do not
+      // POST the credential anywhere, do not create any wallet files.
+      showUnsupported();
       return;
     }
 
-    await fetch('/register',{method:'POST',headers:{'Content-Type':'application/json','x-bloom-token':TK},body:JSON.stringify({
-      id:cred.id,rawId:enc(cred.rawId),type:cred.type,
-      response:{
-        attestationObject:enc(cred.response.attestationObject),
-        clientDataJSON:enc(cred.response.clientDataJSON)
-      }
-    })});
-    st.className='ok';
-    st.textContent='✓ Passkey registered. You can close this tab.';
-    btn.style.display='none';
+    // Recovery key + receipt: page memory only, shown once.
+    PENDING_RECEIPT=outcome.receipt;
+    document.getElementById('recovery-key-text').textContent='0x'+outcome.recovery_key;
+    document.getElementById('done-address').textContent=outcome.address;
+    showPanel('panel-recovery');
   }catch(e){
     btn.disabled=false;
     st.className='err';
-    var m=e.message||'';
+    var m=e.message||String(e);
     if(m.indexOf('connection')!==-1||m.indexOf('Receiving end')!==-1||m.indexOf('extension')!==-1){
       st.innerHTML='A browser extension (e.g. Bitwarden) is interfering with passkey creation.<br><br>Fix: in the extension settings, disable passkey management for this browser. <b>Do not use incognito on Linux</b> — passkeys are not saved to the OS keychain from incognito mode. Alternatively, install Google Chrome and disable Bitwarden passkeys there.<br><br>Error: '+m;
     }else{
@@ -384,6 +517,7 @@ async function register(){
     PASSKEY_FLOW_ACTIVE=false;
   }
 }
+
 document.getElementById('wallet-form').addEventListener('submit',function(e){
   e.preventDefault();
   if(document.getElementById('btn').disabled) return;
@@ -395,6 +529,33 @@ document.getElementById('wallet-form').addEventListener('submit',function(e){
     document.getElementById('btn').disabled=false;
   });
 });
+
+document.getElementById('retry-btn').addEventListener('click',function(){
+  showPanel('wallet-form');
+  document.getElementById('btn').disabled=false;
+  document.getElementById('status').style.display='none';
+});
+
+document.getElementById('ack-checkbox').addEventListener('change',function(){
+  document.getElementById('ack-btn').disabled=!this.checked;
+});
+
+document.getElementById('ack-btn').addEventListener('click',function(){
+  var btn=this;
+  btn.disabled=true;
+  var attemptId='ack'; // path segment is unused server-side; token+receipt authorize this call
+  fetch(BASE+'/attempts/'+attemptId+'/recovery-ack',{
+    method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({receipt:PENDING_RECEIPT})
+  }).then(jsonOrThrow).then(function(){
+    PENDING_RECEIPT=null;
+    showPanel('panel-done');
+  }).catch(function(e){
+    btn.disabled=false;
+    showTerminal('Could not finish registration',e.message||String(e));
+  });
+});
+
 window.addEventListener('unhandledrejection',function(e){
   if(!PASSKEY_FLOW_ACTIVE) return;
   var st=document.getElementById('status');
@@ -403,8 +564,9 @@ window.addEventListener('unhandledrejection',function(e){
   st.textContent='Error: '+msg+' (during passkey registration)';
   e.preventDefault();
 });
+
 init().catch(function(e){
-  document.getElementById('btn').disabled=false;
+  showTerminal('This registration is unavailable',e.message||String(e));
 });
 </script>
 </body>

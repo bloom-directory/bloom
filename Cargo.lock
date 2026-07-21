@@ -2315,6 +2315,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.18",
+ "zeroize",
 ]
 
 [[package]]
@@ -2360,6 +2361,8 @@ dependencies = [
  "tracing",
  "tracing-subscriber 0.3.23",
  "url",
+ "webauthn-rs",
+ "zeroize",
 ]
 
 [[package]]

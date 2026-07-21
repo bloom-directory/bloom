@@ -41,6 +41,8 @@ use tokio::task::JoinHandle;
 
 use crate::Daemon;
 
+mod wallet_registration;
+
 const CEREMONY_HTML: &str = include_str!("sealed_ceremony.html");
 
 fn now_ms() -> u64 {
@@ -105,6 +107,13 @@ pub async fn spawn(daemon: &Daemon) -> std::io::Result<CeremonyServer> {
     let addr = format!("127.0.0.1:{LOCAL_CEREMONY_PORT}");
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     tracing::info!(addr = %addr, "ceremony.server.listening");
+    // Arm the wallet-registration coordinator now that this process owns
+    // the one loopback ceremony listener — `stage()` fails closed until
+    // this is called, which is the fix for the historical port-18734
+    // double-bind: no VFS/IPC registration path can reach a second bind.
+    if let Some(coordinator) = daemon.auth_services.registration_coordinator() {
+        coordinator.mark_listener_bound(&format!("http://localhost:{LOCAL_CEREMONY_PORT}"));
+    }
     let shutdown_signal = shutdown.clone();
     let handle = tokio::spawn(async move {
         let _ = axum::serve(listener, app)
@@ -123,6 +132,7 @@ fn router(state: CeremonyState) -> Router {
         .route("/ceremony/{token}/plan.json", get(plan_json))
         .route("/ceremony/{token}/challenge", get(challenge_json))
         .route("/ceremony/{token}/complete", post(complete))
+        .merge(wallet_registration::router())
         .layer(axum::middleware::from_fn(require_local_origin))
         .with_state(state)
 }

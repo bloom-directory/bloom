@@ -7,6 +7,7 @@
 
 pub mod ceremony_server;
 pub mod ipc;
+pub mod registration;
 pub mod sealed_ceremony;
 pub mod sign_hash;
 
@@ -1973,7 +1974,7 @@ impl Daemon {
         let auth_services = AuthServices::new(
             Some(auth_verifier.clone()),
             Some(auth_verifier.clone()),
-            Some(auth_verifier),
+            Some(auth_verifier.clone()),
         );
         // WS-1 wiring: in-memory grant store + first-party attestation
         // registry + keystore-backed PetalHost. All three live behind the
@@ -1997,10 +1998,33 @@ impl Daemon {
             .with_signer_cache(signer_cache.clone()),
         );
         tx_engine = tx_engine.with_host_signing_services(grant_store.clone(), petal_host.clone());
+
+        // Wallet registration coordinator: always constructed (so every
+        // VFS/IPC caller sees the same instance), but stays unarmed until
+        // `ceremony_server::spawn` marks the shared loopback listener bound.
+        // Restart reconciliation runs here unconditionally — a harmless
+        // no-op if there is nothing unfinished, and correct regardless of
+        // whether this process ends up being `bloom serve` or a one-shot
+        // CLI command.
+        let registration_coordinator: Arc<dyn bloom_auth_api::WalletRegistrationCoordinator> =
+            Arc::new(registration::RegistrationCoordinator::new(
+                keystore.clone(),
+                auth_verifier.clone(),
+                auth_verifier.clone(),
+                home.keystore_dir(),
+            ));
+        if let Err(e) = auth_verifier.mark_unfinished_wallet_registrations_failed_sync(
+            "daemon restarted before this registration finished",
+            registration::now_ms(),
+        ) {
+            warn!(err = %e, "daemon.wallet_registration_restart_reconciliation_failed");
+        }
+
         let auth_services = auth_services
             .with_grant_store(grant_store)
             .with_attestation_registry(attestation_registry)
-            .with_petal_host(petal_host);
+            .with_petal_host(petal_host)
+            .with_registration_coordinator(registration_coordinator);
         let path_cache = Arc::new(PathCache::new());
 
         let watch_registry = Arc::new(
@@ -2826,6 +2850,7 @@ impl Daemon {
     /// daemon used by integration tests.
     pub fn spawn_background_tasks(&self) -> BackgroundTasks {
         let outbox = self.tx_engine.outbox.clone();
+        let registration_coordinator = self.auth_services.registration_coordinator().cloned();
         let (tx, mut rx) = watch::channel(false);
         let interval = Duration::from_secs(60);
         let handle = tokio::spawn(async move {
@@ -2845,6 +2870,11 @@ impl Daemon {
                             Ok(0) => tracing::trace!("outbox.sweep_expired.empty"),
                             Ok(n) => info!(swept = n, "outbox.sweep_expired"),
                             Err(e) => warn!(error = %e, "outbox.sweep_expired_failed"),
+                        }
+                        if let Some(coordinator) = &registration_coordinator
+                            && let Err(e) = coordinator.sweep_expired(now_ms as u64).await
+                        {
+                            warn!(error = %e, "wallet_registration.sweep_expired_failed");
                         }
                     }
                     _ = rx.changed() => {

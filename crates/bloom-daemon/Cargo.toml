@@ -65,6 +65,8 @@ rand.workspace = true
 futures.workspace = true
 hex.workspace = true
 reqwest = { workspace = true, features = ["stream"] }
+webauthn-rs.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

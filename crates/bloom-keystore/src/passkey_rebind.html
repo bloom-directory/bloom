@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>bloom — Re-bind passkey</title>
+  <style>
+    body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;max-width:32rem;margin:4rem auto;padding:0 1.5rem;color:#15130f}
+    button{width:100%;padding:0.9rem;font-size:1rem;border:0;border-radius:8px;background:#8a2a3a;color:#fff;cursor:pointer}
+    button:disabled{opacity:0.5;cursor:wait}
+    #status{margin-top:1rem;font-size:0.9rem;white-space:pre-wrap}
+    .err{color:#7a2230}
+    .ok{color:#355f47}
+  </style>
+</head>
+<body>
+  <h1>Re-bind passkey</h1>
+  <p>Create a new passkey for this wallet. Your device will prompt for Touch ID, Windows Hello, or a security key.</p>
+  <button id="btn">Create new passkey</button>
+  <div id="status"></div>
+<script>
+var TK = new URLSearchParams(location.search).get('t') || '';
+function dec(s){s=s.replace(/-/g,'+').replace(/_/g,'/');while(s.length%4)s+='=';return Uint8Array.from(atob(s),c=>c.charCodeAt(0));}
+function enc(b){return btoa(String.fromCharCode(...new Uint8Array(b))).replace(/\+/g,'-').replace(/\//g,'_').replace(/=/g,'');}
+function credJson(cred){
+  return {id:cred.id,rawId:enc(cred.rawId),type:cred.type,response:{
+    attestationObject:enc(cred.response.attestationObject),
+    clientDataJSON:enc(cred.response.clientDataJSON)
+  }};
+}
+function assertionJson(cred){
+  return {id:cred.id,rawId:enc(cred.rawId),type:cred.type,response:{
+    authenticatorData:enc(cred.response.authenticatorData),
+    clientDataJSON:enc(cred.response.clientDataJSON),
+    signature:enc(cred.response.signature),
+    userHandle:cred.response.userHandle?enc(cred.response.userHandle):null
+  }};
+}
+async function post(path, body){
+  return fetch(path, {method:'POST', headers:{'Content-Type':'application/json','x-bloom-token':TK}, body:JSON.stringify(body)});
+}
+async function run(){
+  var btn = document.getElementById('btn');
+  var st = document.getElementById('status');
+  btn.disabled = true;
+  st.className = '';
+  st.textContent = 'Waiting for passkey interaction…';
+  try{
+    var opts = await (await fetch('/challenge')).json();
+    opts.publicKey.challenge = dec(opts.publicKey.challenge);
+    opts.publicKey.user.id = dec(opts.publicKey.user.id);
+    var prfSaltBytes = null;
+    if (opts.publicKey.extensions && opts.publicKey.extensions.prf && opts.publicKey.extensions.prf.eval && opts.publicKey.extensions.prf.eval.first) {
+      prfSaltBytes = dec(opts.publicKey.extensions.prf.eval.first);
+      opts.publicKey.extensions.prf.eval.first = prfSaltBytes;
+    }
+    var cred = await navigator.credentials.create(opts);
+    var ext = cred.getClientExtensionResults();
+    var prfFirst = ext && ext.prf && ext.prf.results && ext.prf.results.first;
+    var resp;
+    if (prfFirst) {
+      resp = await post('/complete', {kind:'registration', credential:credJson(cred), prf_output_b64:enc(prfFirst)});
+    } else if (ext && ext.prf && ext.prf.enabled) {
+      st.textContent = 'Almost done — please authenticate once more…';
+      var fbOpts = await (await post('/fallback-options', {credential:credJson(cred)})).json();
+      fbOpts.publicKey.challenge = dec(fbOpts.publicKey.challenge);
+      if (fbOpts.publicKey.allowCredentials) fbOpts.publicKey.allowCredentials = fbOpts.publicKey.allowCredentials.map(function(c){return {...c, id: dec(c.id)};});
+      if (fbOpts.publicKey.extensions && fbOpts.publicKey.extensions.prf && fbOpts.publicKey.extensions.prf.eval && fbOpts.publicKey.extensions.prf.eval.first) {
+        fbOpts.publicKey.extensions.prf.eval.first = prfSaltBytes;
+      }
+      var fbCred = await navigator.credentials.get(fbOpts);
+      var fbExt = fbCred.getClientExtensionResults();
+      var fbPrf = fbExt && fbExt.prf && fbExt.prf.results && fbExt.prf.results.first;
+      if (!fbPrf) {
+        st.className = 'err';
+        st.textContent = 'PRF output not available from your authenticator.';
+        btn.disabled = false;
+        return;
+      }
+      resp = await post('/complete', {kind:'fallback', credential:assertionJson(fbCred), prf_output_b64:enc(fbPrf)});
+    } else {
+      st.className = 'err';
+      st.textContent = 'Your authenticator does not support the PRF extension required by bloom passkey wallets.';
+      btn.disabled = false;
+      return;
+    }
+    if (resp.ok) {
+      st.className = 'ok';
+      st.textContent = 'Passkey re-bound. You can close this tab.';
+      btn.style.display = 'none';
+    } else {
+      st.className = 'err';
+      st.textContent = 'Error completing the ceremony (HTTP ' + resp.status + ').';
+      btn.disabled = false;
+    }
+  } catch (e) {
+    st.className = 'err';
+    st.textContent = 'Error: ' + (e.message || e);
+    btn.disabled = false;
+  }
+}
+document.getElementById('btn').addEventListener('click', function(){ run(); });
+</script>
+</body>
+</html>
