@@ -67,12 +67,12 @@
     .section-icon{display:grid;width:30px;height:30px;place-items:center;border:1px solid var(--rule);border-radius:50%;color:var(--accent);background:var(--paper)}
     .section-icon svg{width:15px;height:15px}
     .section-label{margin:0;color:var(--ink);font-family:var(--mono);font-size:11px;font-weight:500;letter-spacing:.05em;text-transform:uppercase}
-    .section-note{margin:-10px 0 19px 40px;color:var(--muted);font-size:12px}
+    .section-note{margin:-10px 0 19px 40px;color:var(--graphite);font-size:12px}
     .field-list{display:grid;gap:12px}
     .field{display:grid;grid-template-columns:minmax(0,1fr) minmax(128px,158px);gap:18px;align-items:center}
     .field-copy{min-width:0}
     .field label{display:block;color:var(--ink-2);font-size:14px;font-weight:500;cursor:pointer}
-    .field-description{display:block;margin-top:2px;color:var(--muted);font-size:12px;font-weight:400;line-height:1.35}
+    .field-description{display:block;margin-top:2px;color:var(--graphite);font-size:12px;font-weight:400;line-height:1.35}
     .input-wrap{position:relative}
     .field input[type=number]{width:100%;height:43px;padding:9px 47px 9px 12px;border:1px solid var(--rule-2);border-radius:8px;background:var(--surface);color:var(--ink);font-family:var(--mono);font-size:13px;transition:border-color 160ms ease,box-shadow 160ms ease,background 160ms ease}
     .field input[type=number]:hover{border-color:var(--graphite)}
@@ -203,7 +203,7 @@
             </div>
             <div class="field toggle-field">
               <div class="field-copy"><label for="fail_on_high_risk">Block high-risk routes<span class="field-description">Reject routes flagged as unsafe</span></label></div>
-              <label class="toggle" aria-label="Block high-risk routes"><input type="checkbox" id="fail_on_high_risk"><span class="toggle-track" aria-hidden="true"></span></label>
+              <label class="toggle"><input type="checkbox" id="fail_on_high_risk"><span class="toggle-track" aria-hidden="true"></span></label>
             </div>
           </div>
         </section>
@@ -215,7 +215,7 @@
           </div>
           <div class="field toggle-field">
             <div class="field-copy"><label for="private_enabled">Use MEV Blocker<span class="field-description">Route eligible transactions through a private endpoint</span></label></div>
-            <label class="toggle" aria-label="Use MEV Blocker"><input type="checkbox" id="private_enabled"><span class="toggle-track" aria-hidden="true"></span></label>
+            <label class="toggle"><input type="checkbox" id="private_enabled"><span class="toggle-track" aria-hidden="true"></span></label>
           </div>
         </section>
 

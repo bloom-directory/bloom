@@ -751,7 +751,7 @@ async fn reg_favicon_light() -> impl axum::response::IntoResponse {
                 axum::http::header::CONTENT_TYPE,
                 "image/svg+xml; charset=utf-8",
             ),
-            (axum::http::header::CACHE_CONTROL, "public, max-age=86400"),
+            (axum::http::header::CACHE_CONTROL, "no-cache"),
         ],
         FAVICON_LIGHT,
     )
@@ -764,7 +764,7 @@ async fn reg_favicon_dark() -> impl axum::response::IntoResponse {
                 axum::http::header::CONTENT_TYPE,
                 "image/svg+xml; charset=utf-8",
             ),
-            (axum::http::header::CACHE_CONTROL, "public, max-age=86400"),
+            (axum::http::header::CACHE_CONTROL, "no-cache"),
         ],
         FAVICON_DARK,
     )
@@ -774,7 +774,7 @@ fn font_response(font: &'static [u8]) -> impl axum::response::IntoResponse {
     (
         [
             (axum::http::header::CONTENT_TYPE, "font/woff2"),
-            (axum::http::header::CACHE_CONTROL, "public, max-age=86400"),
+            (axum::http::header::CACHE_CONTROL, "no-cache"),
         ],
         font,
     )
