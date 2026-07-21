@@ -119,14 +119,23 @@ Provisioning must:
 3. Do nothing when the expected Petal is already installed.
 4. Refuse to silently overwrite a differently sourced or differently versioned
    Petal with the same mount name; report the mismatch and remediation.
-5. Install a missing entry through the existing trusted GitHub source
-   installation path using the immutable ref.
+5. Prefer a checksum-verified Petal archive built from the catalog's immutable
+   ref and attached to the matching Bloom release. Fall back to the existing
+   trusted GitHub source installation path for development builds and releases
+   that predate the archive.
 6. Verify the installed Petal name, source provenance, resolved commit, and any
    configured expected hash before reporting success.
 7. Be safe to rerun after success or a partial acquisition/build failure.
 
 Normal daemon construction, status commands, VFS reads, and tests that create a
 temporary `HomeDir` must not unexpectedly access the network.
+
+The release workflow builds the Polymarket archive once from the pinned commit,
+publishes it alongside the Bloom binaries, and includes it in `SHA256SUMS`.
+Installing a released Bloom binary therefore does not require a local Rust
+toolchain. A downloaded archive must fail closed if its filename-bound checksum,
+package structure, Petal name, endpoint bindings, or recorded source provenance
+does not match the catalog entry.
 
 ## Native Polymarket removal
 
@@ -162,6 +171,17 @@ bloom vfs cat /petals/polymarket/meta/route-contract.json
 The list and route-contract read must show the installed external Petal without
 a separate manual installation command.
 
+The package's immutable operator and agent documents are also exposed directly
+through the Petal mount:
+
+```sh
+bloom vfs cat /petals/polymarket/README.md
+bloom vfs cat /petals/polymarket/AGENTS.md
+```
+
+These files come from the installed content-addressed package and are read-only;
+they do not dispatch through Petal-supplied WASM routes.
+
 For an opted-out home:
 
 ```toml
@@ -189,6 +209,11 @@ Add deterministic tests covering:
 - an existing matching installation is retained;
 - a conflicting existing owner/version is not overwritten;
 - source/ref/name/hash verification rejects mismatches;
+- release checksum verification is bound to the expected archive name and
+  rejects missing or tampered entries;
+- a valid prebuilt archive installs without invoking a source build;
+- package `README.md` and `AGENTS.md` are readable and immutable at the Petal
+  mount root;
 - failed installation is retryable and leaves no authoritative partial owner;
 - initialization reports the pre-installed Petal;
 - the Polymarket route contract is dispatchable after installation;

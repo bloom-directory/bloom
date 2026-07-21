@@ -34,6 +34,8 @@ use crate::{DispatchOp, DispatchRequest};
 /// hooks can use the validated, narrowed result after an async route lookup.
 const RUNTIME_METADATA_CACHE_CAPACITY: usize = 1024;
 
+pub(crate) const PETAL_DOCUMENT_NAMES: [&str; 2] = ["README.md", "AGENTS.md"];
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct RuntimeMetadataCacheKey {
     package_hash: String,
@@ -415,6 +417,21 @@ impl PetalRunner {
         validate_runtime_route_path(path)?;
         let index = self.load_petal_route_index(mount)?;
         Ok(static_list_entries(&index, path))
+    }
+
+    pub fn petal_document(&self, mount: &str, name: &str) -> Result<Vec<u8>, PetalError> {
+        if !PETAL_DOCUMENT_NAMES.contains(&name) {
+            return Err(PetalError::NotFound(app_path(mount, name)));
+        }
+        let hash = self.resolve_petal_mount(mount)?;
+        let path = self.store.package_path(&hash)?.join("source").join(name);
+        match std::fs::read(path) {
+            Ok(bytes) => Ok(bytes),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                Err(PetalError::NotFound(app_path(mount, name)))
+            }
+            Err(err) => Err(PetalError::Io(err)),
+        }
     }
 
     pub async fn dispatch_petal_route(

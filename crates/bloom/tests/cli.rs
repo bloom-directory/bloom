@@ -1300,6 +1300,12 @@ fn petal_cli_build_install_list_and_vfs_read_happy_path() {
         .assert()
         .success()
         .stdout(predicate::eq("component"));
+
+    bloom_cmd(home.path())
+        .args(["vfs", "cat", "/petals/demo/README.md"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("# demo"));
 }
 
 #[test]
@@ -1348,6 +1354,12 @@ fn github_source_install_polymarket_dispatches_route_contract() {
         .stdout(predicate::str::contains(
             "bloom.polymarket.petal-route-contract.v1",
         ));
+
+    bloom_cmd(home.path())
+        .args(["vfs", "cat", "/petals/polymarket/README.md"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("# Polymarket Petal"));
 }
 
 #[test]

@@ -8,17 +8,22 @@ use bloom_petals::package::{
     PetalConsentSummary, PreparedPetalPackage, RouteIndex, petal_consent_summary,
 };
 use bloom_proto::HomeDir;
+use flate2::read::GzDecoder;
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use url::Url;
 
 const TRUSTED_GITHUB_OWNER: &str = "bloom-directory";
 const POLYMARKET_PARITY_COMMIT: &str = "1ffb267a1e1d4acd137c184806c20cc98d20a3f4";
+const BLOOM_RELEASE_DOWNLOAD_BASE: &str =
+    "https://github.com/bloom-directory/bloom/releases/latest/download";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PreinstalledPetal {
     pub name: &'static str,
     pub repository: &'static str,
     pub commit: &'static str,
+    pub archive: &'static str,
     pub expected_hash: Option<&'static str>,
 }
 
@@ -26,6 +31,7 @@ const PREINSTALLED_POLYMARKET: PreinstalledPetal = PreinstalledPetal {
     name: "polymarket",
     repository: "https://github.com/bloom-directory/bloom-petal-polymarket",
     commit: POLYMARKET_PARITY_COMMIT,
+    archive: "polymarket-1ffb267a1e1d4acd137c184806c20cc98d20a3f4.petal.tar.gz",
     // Source builds are verified by immutable commit and recorded package
     // provenance. Add a package hash when release builds are reproducible
     // across every supported host toolchain.
@@ -250,6 +256,18 @@ pub(crate) fn ensure_preinstalled_petals(home: &HomeDir, daemon: &Daemon) -> Res
             "preinstalled_petal: installing {} from {}@{}",
             entry.name, entry.repository, entry.commit
         );
+        if let Some(installed) = install_prebuilt_release_petal(daemon, entry)? {
+            validate_existing_preinstalled(entry, &installed.meta)?;
+            println!(
+                "preinstalled_petal: {} ready at petals/{}/",
+                entry.name, entry.name
+            );
+            ready.push(name.clone());
+            continue;
+        }
+        println!(
+            "preinstalled_petal: prebuilt archive unavailable; falling back to a local source build"
+        );
         let repo = parse_github_install_url(entry.repository)?
             .ok_or_else(|| anyhow!("built-in Petal repository is not a GitHub source URL"))?;
         let installed = install_github_source_with_expectation(
@@ -274,6 +292,138 @@ pub(crate) fn ensure_preinstalled_petals(home: &HomeDir, daemon: &Daemon) -> Res
     }
 
     Ok(ready)
+}
+
+fn install_prebuilt_release_petal(
+    daemon: &Daemon,
+    entry: &PreinstalledPetal,
+) -> Result<Option<GitHubInstallOutput>> {
+    let url = format!("{BLOOM_RELEASE_DOWNLOAD_BASE}/{}", entry.archive);
+    let archive = tempfile::NamedTempFile::new().context("create pre-installed Petal download")?;
+    let Some(status) = curl_download(&url, archive.path())? else {
+        return Ok(None);
+    };
+    if !status.success() {
+        return Ok(None);
+    }
+
+    let checksums = tempfile::NamedTempFile::new().context("create release checksum download")?;
+    let checksum_url = format!("{BLOOM_RELEASE_DOWNLOAD_BASE}/SHA256SUMS");
+    let status = curl_download(&checksum_url, checksums.path())?
+        .ok_or_else(|| anyhow!("curl is required to verify the pre-installed Petal archive"))?;
+    if !status.success() {
+        bail!("download Bloom release checksums for pre-installed Petal archive");
+    }
+    verify_release_checksum(archive.path(), entry.archive, checksums.path())?;
+    install_prebuilt_petal_archive(daemon, entry, archive.path()).map(Some)
+}
+
+fn curl_download(url: &str, output: &Path) -> Result<Option<std::process::ExitStatus>> {
+    match Command::new("curl")
+        .args(["--fail", "--silent", "--show-error", "--location"])
+        .arg(url)
+        .arg("--output")
+        .arg(output)
+        .status()
+    {
+        Ok(status) => Ok(Some(status)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).context("launch curl for pre-installed Petal archive"),
+    }
+}
+
+fn verify_release_checksum(archive: &Path, name: &str, checksums: &Path) -> Result<()> {
+    let body = std::fs::read_to_string(checksums)
+        .with_context(|| format!("read Bloom release checksums from {}", checksums.display()))?;
+    let expected = body
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let digest = fields.next()?;
+            let file = fields.next()?.trim_start_matches('*');
+            (file == name).then_some(digest)
+        })
+        .next()
+        .ok_or_else(|| anyhow!("Bloom release checksums do not contain {name}"))?;
+    if expected.len() != 64 || !expected.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!("Bloom release checksum for {name} is malformed");
+    }
+
+    let mut file = std::fs::File::open(archive)
+        .with_context(|| format!("open downloaded Petal archive {}", archive.display()))?;
+    let mut hasher = Sha256::new();
+    std::io::copy(&mut file, &mut hasher).context("hash downloaded Petal archive")?;
+    let actual = hex::encode(hasher.finalize());
+    if !actual.eq_ignore_ascii_case(expected) {
+        bail!("Bloom release checksum verification failed for {name}");
+    }
+    Ok(())
+}
+
+fn install_prebuilt_petal_archive(
+    daemon: &Daemon,
+    entry: &PreinstalledPetal,
+    archive: &Path,
+) -> Result<GitHubInstallOutput> {
+    let file = std::fs::File::open(archive)
+        .with_context(|| format!("open pre-installed Petal archive {}", archive.display()))?;
+    let package = PreparedPetalPackage::from_reader(GzDecoder::new(file))
+        .context("validate pre-installed Petal release archive")?;
+    if package.name != entry.name {
+        bail!(
+            "pre-installed Petal {} archive contains unexpected package {:?}",
+            entry.name,
+            package.name
+        );
+    }
+    if let Some(expected_hash) = entry.expected_hash
+        && package.hash != expected_hash
+    {
+        bail!(
+            "pre-installed Petal {} package hash {} does not match expected hash {}",
+            entry.name,
+            package.hash,
+            expected_hash
+        );
+    }
+
+    let mut consent = petal_consent_summary(&package).context("build Petal consent summary")?;
+    let bindings = daemon
+        .config
+        .petals
+        .runtime
+        .get(&consent.name)
+        .map(|app| &app.endpoints)
+        .cloned()
+        .unwrap_or_default();
+    bloom_petals::package::apply_petal_consent_endpoint_bindings(&mut consent, &bindings)
+        .context("apply configured Petal endpoint bindings")?;
+
+    let repo = parse_github_install_url(entry.repository)?
+        .ok_or_else(|| anyhow!("built-in Petal repository is not a GitHub source URL"))?;
+    let provenance = PetalSourceProvenance {
+        source_kind: "github".to_string(),
+        url: repo.canonical_url,
+        owner: repo.owner,
+        repo: repo.repo,
+        requested_ref: entry.commit.to_string(),
+        resolved_commit: entry.commit.to_string(),
+        selected_tag: None,
+        package_hash: package.hash.clone(),
+    };
+    let (result, meta, index) = daemon
+        .petals
+        .store()
+        .install_prepared_petal_package_with_source(package, Some(provenance.clone()))
+        .context("install pre-built Petal package")?;
+
+    Ok(GitHubInstallOutput {
+        result,
+        meta,
+        index,
+        consent,
+        provenance,
+    })
 }
 
 fn preinstalled_petal(name: &str) -> Option<&'static PreinstalledPetal> {
@@ -697,6 +847,12 @@ mod tests {
         assert_eq!(entry.commit.len(), 40);
         assert!(entry.commit.bytes().all(|byte| byte.is_ascii_hexdigit()));
         assert!(entry.repository.ends_with("/bloom-petal-polymarket"));
+        assert!(entry.archive.starts_with("polymarket-"));
+        assert!(entry.archive.ends_with(".petal.tar.gz"));
+        assert_eq!(
+            entry.archive,
+            format!("polymarket-{}.petal.tar.gz", entry.commit)
+        );
         assert!(preinstalled_petal("unknown").is_none());
     }
 
@@ -770,6 +926,78 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn prebuilt_archive_installs_without_running_source_build() {
+        let source = tempfile::tempdir().unwrap();
+        write_source_repo(
+            &source,
+            "bloom-petal-test-prebuilt",
+            true,
+            &BuildScript::Success,
+            "prebuilt",
+        )
+        .unwrap();
+        run_source_build(source.path()).unwrap();
+        let package = PreparedPetalPackage::from_dir(source.path()).unwrap();
+        let archive = tempfile::NamedTempFile::new().unwrap();
+        {
+            let mut encoder = flate2::write::GzEncoder::new(
+                archive.reopen().unwrap(),
+                flate2::Compression::best(),
+            );
+            package.write_petal_tar(&mut encoder).unwrap();
+            encoder.finish().unwrap();
+        }
+
+        let home = tempfile::tempdir().unwrap();
+        let daemon = Daemon::from_home(HomeDir::at(home.path())).unwrap();
+        let entry = PreinstalledPetal {
+            name: "demo",
+            repository: "https://github.com/bloom-directory/bloom-petal-test-prebuilt",
+            commit: "1111111111111111111111111111111111111111",
+            archive: "unused.petal.tar.gz",
+            expected_hash: None,
+        };
+        let installed = install_prebuilt_petal_archive(&daemon, &entry, archive.path()).unwrap();
+        assert_eq!(installed.meta.hash, package.hash);
+        assert_eq!(installed.provenance.source_kind, "github");
+        assert_eq!(installed.provenance.resolved_commit, entry.commit);
+        assert_eq!(
+            daemon.petals.store().list_petal_owners().unwrap(),
+            vec![("demo".to_string(), package.hash)]
+        );
+    }
+
+    #[test]
+    fn release_checksum_verification_is_name_bound_and_fail_closed() {
+        let archive = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(archive.path(), b"petal archive").unwrap();
+        let digest = hex::encode(Sha256::digest(b"petal archive"));
+        let checksums = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            checksums.path(),
+            format!(
+                "{digest}  expected.petal.tar.gz\n{}  other\n",
+                "0".repeat(64)
+            ),
+        )
+        .unwrap();
+
+        verify_release_checksum(archive.path(), "expected.petal.tar.gz", checksums.path()).unwrap();
+        let missing =
+            verify_release_checksum(archive.path(), "missing.petal.tar.gz", checksums.path())
+                .unwrap_err()
+                .to_string();
+        assert!(missing.contains("do not contain"), "{missing}");
+
+        std::fs::write(archive.path(), b"tampered").unwrap();
+        let mismatch =
+            verify_release_checksum(archive.path(), "expected.petal.tar.gz", checksums.path())
+                .unwrap_err()
+                .to_string();
+        assert!(mismatch.contains("verification failed"), "{mismatch}");
     }
 
     #[test]
