@@ -566,6 +566,23 @@ fn serve_refuses_when_home_write_lock_is_live() {
 }
 
 #[test]
+fn init_refuses_when_home_write_lock_is_live() {
+    let home = fresh_home();
+    let _permit = bloom_proto::HomeWritePermit::acquire(&bloom_proto::HomeDir::at(home.path()))
+        .expect("hold home write permit");
+    let lock = home.path().join("run").join(".daemon.lock");
+
+    bloom_cmd(home.path())
+        .arg("init")
+        .assert()
+        .failure()
+        .stderr(
+            predicate::str::contains("already open for writing")
+                .and(predicate::str::contains(lock.display().to_string())),
+        );
+}
+
+#[test]
 fn chain_health_does_not_take_home_write_lock() {
     let home = fresh_home();
     let _permit = bloom_proto::HomeWritePermit::acquire(&bloom_proto::HomeDir::at(home.path()))

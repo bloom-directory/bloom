@@ -44,7 +44,7 @@ Reads are RPC / API queries. Examples:
 cat /bloom/chains/anvil/head/number
 cat /bloom/chains/ethereum/blocks/19000000/full.json
 cat /bloom/wallets/alice/address                     # the owner/signer EOA
-cat /bloom/wallets/alice/addresses.json              # owner/signer + role addresses (see "Wallet addresses & roles")
+cat /bloom/wallets/alice/addresses.json              # owner/signer addresses (see "Wallet addresses & roles")
 cat /bloom/wallets/alice/chains/anvil/balance        # "1.5 ETH" (display); also balance.raw, balance.json
 cat /bloom/wallets/alice/chains/ethereum/history.json
 cat /bloom/tools/keccak/hello
@@ -127,10 +127,10 @@ cat /bloom/chains/ethereum/contracts/<contract>/nft/is_approved_for_all/<owner>/
 
 ## Wallet addresses & roles
 
-A wallet has **one owner/signer key** but may be associated with additional
-**role addresses** that it controls but does not equal. Conflating them is a
-real hazard — e.g. reporting a Polymarket deposit wallet's balance as "the
-wallet's balance."
+A wallet has **one owner/signer key**. Petals may associate it with additional
+venue-specific addresses that it controls but does not equal. Conflating them
+is a real hazard — e.g. reporting a Polymarket deposit wallet's balance as
+"the wallet's balance."
 
 - `wallets/<w>/address` — the **owner/signer EOA**. This is the wallet itself:
   the key that signs, and the address you fund for gas/native transfers.
@@ -143,22 +143,21 @@ wallet's balance."
     "owner":  "0x5c3d…4456",
     "signer": "0x5c3d…4456",
     "policy_status": "unsigned",
-    "roles": {
-      "polymarket_deposit_wallet": {
-        "address": "0x3855…0166",
-        "source": "live_factory_resolved",
-        "fundable": true,
-        "note": "Polymarket trade funder/maker — NOT the wallet owner."
-      }
-    }
+    "roles": {}
   }
   ```
 
-  `owner` and `signer` are the same EOA. Role addresses (e.g. the Polymarket
-  deposit/funder wallet, derived from the owner) appear under `roles`; sending
-  funds there does not change ownership. `roles` is empty when no role address
-  is known. `policy_status` (`signed`/`unsigned`/`stale`/`not_applicable`)
-  reports whether a passkey wallet's policy is signed — `unsigned`/`stale` block
+  `owner` and `signer` are the same EOA. `roles` is currently empty; Petals do
+  not augment this Bloom-owned response. Query a Petal's own account route for
+  venue-specific addresses. For example, after Polymarket onboarding:
+
+  ```sh
+  cat /bloom/petals/polymarket/account/alice/status.json
+  # Read `deposit_wallet` from the response; it is not the owner EOA.
+  ```
+
+  `policy_status` (`signed`/`unsigned`/`stale`/`not_applicable`) reports whether
+  a passkey wallet's policy is signed — `unsigned`/`stale` block
   **writes/broadcast**, but never block these read-only leaves.
 
 Read-only leaves (`address`, `addresses.json`, `public_key`, `kind`, balances)

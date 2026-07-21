@@ -1092,7 +1092,7 @@ async fn run(cli: Cli) -> Result<()> {
     match cli.cmd {
         Cmd::Init => {
             eprintln!("{ALPHA_DISCLOSURE}");
-            let d = Daemon::from_home(home.clone()).context("init daemon")?;
+            let (_home_permit, d) = build_write_daemon(home.clone()).context("init daemon")?;
             let preinstalled = github_source::ensure_preinstalled_petals(&home, &d)
                 .context("provision configured pre-installed Petals")?;
             println!("home: {}", d.home.root().display());
