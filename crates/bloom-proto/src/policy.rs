@@ -767,17 +767,17 @@ pub fn evaluate_action_authorization(
                 };
             }
             if !subject.calldata_verified {
-                return AutonomyDecision::Denied {
+                return AutonomyDecision::NeedsFreshReview {
                     reason: "calldata/order facts are not verified".into(),
                 };
             }
             let Some(value) = subject.total_value_usd_micro else {
-                return AutonomyDecision::Denied {
+                return AutonomyDecision::NeedsFreshReview {
                     reason: "USD valuation unavailable".into(),
                 };
             };
             let Some(snapshot) = budget else {
-                return AutonomyDecision::Denied {
+                return AutonomyDecision::NeedsFreshReview {
                     reason: "budget ledger unavailable".into(),
                 };
             };
@@ -1326,7 +1326,7 @@ uv_above_usd = "1.0000001"
     }
 
     #[test]
-    fn under_policy_denies_unknown_usd() {
+    fn under_policy_requires_review_for_unknown_usd() {
         let mut p = Policy::default();
         p.approval.agent_autonomy = Some(AgentAutonomyMode::UnderPolicy);
         p.limits.max_tx_usd = Some("3".into());
@@ -1340,7 +1340,7 @@ uv_above_usd = "1.0000001"
                 None,
                 AuthorizationSurface::Vfs,
             ),
-            AutonomyDecision::Denied { reason } if reason.contains("USD valuation")
+            AutonomyDecision::NeedsFreshReview { reason } if reason.contains("USD valuation")
         ));
     }
 
@@ -1388,7 +1388,7 @@ uv_above_usd = "1.0000001"
     }
 
     #[test]
-    fn under_policy_denies_unverified_calldata() {
+    fn under_policy_requires_review_for_unverified_calldata() {
         let mut p = Policy::default();
         p.approval.agent_autonomy = Some(AgentAutonomyMode::UnderPolicy);
         p.limits.max_tx_usd = Some("3".into());
@@ -1402,7 +1402,7 @@ uv_above_usd = "1.0000001"
                 &p, &[], &subject, Some(&budget()), None,
                 AuthorizationSurface::Vfs,
             ),
-            AutonomyDecision::Denied { reason }
+            AutonomyDecision::NeedsFreshReview { reason }
                 if reason.contains("calldata/order facts")
         ));
     }
@@ -1430,7 +1430,7 @@ uv_above_usd = "1.0000001"
     }
 
     #[test]
-    fn under_policy_denies_missing_budget() {
+    fn under_policy_requires_review_for_missing_budget() {
         let mut p = Policy::default();
         p.approval.agent_autonomy = Some(AgentAutonomyMode::UnderPolicy);
         p.limits.max_tx_usd = Some("3".into());
@@ -1440,7 +1440,7 @@ uv_above_usd = "1.0000001"
                 &p, &[], &auth_subject(Some(1_000_000)), None, None,
                 AuthorizationSurface::Vfs,
             ),
-            AutonomyDecision::Denied { reason }
+            AutonomyDecision::NeedsFreshReview { reason }
                 if reason.contains("budget ledger")
         ));
     }

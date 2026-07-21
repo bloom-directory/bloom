@@ -42,7 +42,7 @@ use bloom_proto::{
     checksum_address, format_units,
 };
 use bloom_revert::{DecodeContext, DecoderChain};
-use bloom_tx::{DynPriceOracle, tx_engine::TxEngine};
+use bloom_tx::{BoundValuationTarget, DynPriceOracle, tx_engine::TxEngine};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 
@@ -658,6 +658,74 @@ impl DefiHandler {
         (asset_id, req.amount_in.to_string())
     }
 
+    async fn route_input_decimals(
+        &self,
+        source_chain: &str,
+        req: &RouteRequest,
+    ) -> Result<u8, HandlerError> {
+        let chain = self.chain_client(source_chain)?;
+        if req.token_in == NATIVE_TOKEN_ADDR {
+            return Ok(chain.spec().native_decimals);
+        }
+        chain
+            .erc20_decimals(req.token_in)
+            .await
+            .map_err(|error| HandlerError::backend(error.to_string()))?
+            .ok_or_else(|| {
+                HandlerError::backend(format!(
+                    "could not read decimals for route input {}",
+                    checksum_address(&req.token_in)
+                ))
+            })
+    }
+
+    fn route_raw_intent(source_chain: &str, route: &RouteResponse) -> RawIntent {
+        RawIntent {
+            body: RawIntentBody::Raw {
+                to: checksum_address(&route.tx.to),
+                value: route.tx.value.to_string(),
+                data: format!("0x{}", hex::encode(route.tx.data.as_ref())),
+            },
+            chain: Some(source_chain.to_string()),
+            gas: GasStrategy::Auto,
+            nonce: None,
+            gas_limit_hint: route.gas.as_deref().and_then(|gas| gas.parse().ok()),
+            usd_value_hint: None,
+        }
+    }
+
+    fn session_intents_match_route(
+        sess: &DefiSession,
+        req: &RouteRequest,
+        route: &RouteResponse,
+    ) -> bool {
+        let Some(last) = sess.intents.last() else {
+            return false;
+        };
+        if last != &Self::route_raw_intent(&sess.chain, route) {
+            return false;
+        }
+        match sess.intents.as_slice() {
+            [_route] => true,
+            [approval, _route] if req.token_in != NATIVE_TOKEN_ADDR => {
+                approval
+                    == &RawIntent {
+                        body: RawIntentBody::Approve {
+                            token: checksum_address(&req.token_in),
+                            spender: checksum_address(&route.tx.to),
+                            amount: "max".into(),
+                        },
+                        chain: Some(sess.chain.clone()),
+                        gas: GasStrategy::Auto,
+                        nonce: None,
+                        gas_limit_hint: None,
+                        usd_value_hint: None,
+                    }
+            }
+            _ => false,
+        }
+    }
+
     async fn route_input_valuation(
         &self,
         source_chain: &str,
@@ -673,21 +741,21 @@ impl DefiHandler {
         }
         let (asset_id, amount_base_units) = Self::route_input_valuation_target(source_chain, req);
         let now = now_ms() as u64;
-        let native_decimals = (req.token_in == NATIVE_TOKEN_ADDR)
-            .then(|| {
-                self.chains
-                    .get(source_chain)
-                    .map(|chain| chain.spec().native_decimals)
-            })
-            .flatten();
+        let asset_decimals = match self.route_input_decimals(source_chain, req).await {
+            Ok(decimals) => decimals,
+            Err(error) => {
+                tracing::warn!(chain = source_chain, %error, "defi.route_input_decimals_failed");
+                return None;
+            }
+        };
         match oracle
-            .quote_usd(&asset_id, &amount_base_units, native_decimals, now)
+            .quote_usd(&asset_id, &amount_base_units, asset_decimals, now)
             .await
         {
             Ok(quote)
                 if quote.asset_id == asset_id
                     && quote.amount_base_units == amount_base_units
-                    && quote.usd_micro >= 0
+                    && (quote.usd_micro > 0 || req.amount_in.is_zero())
                     && quote
                         .validate_for_authorization(&ValuationPolicy::default(), now)
                         .is_ok() =>
@@ -895,21 +963,7 @@ impl DefiHandler {
                 });
             }
         }
-        intents.push(RawIntent {
-            body: RawIntentBody::Raw {
-                to: checksum_address(&route.tx.to),
-                value: route.tx.value.to_string(),
-                data: format!("0x{}", hex::encode(route.tx.data.as_ref())),
-            },
-            chain: Some(chain_name.clone()),
-            gas: GasStrategy::Auto,
-            nonce: None,
-            gas_limit_hint: route.gas.as_deref().and_then(|g| g.parse().ok()),
-            // The route's exact input valuation is obtained from the oracle
-            // when this intent is staged; caller-provided USD hints are never
-            // trusted.
-            usd_value_hint: None,
-        });
+        intents.push(Self::route_raw_intent(&chain_name, &route));
 
         // Evaluate `[defi]` route policy for display + review (the hard gate
         // is at confirm, re-evaluated from current policy before staging).
@@ -1080,11 +1134,6 @@ impl DefiHandler {
         // `bloom polymarket fund` command stages through its own validated
         // path and is not affected by `[defi] enabled`.
         if let (Some(req), Some(route)) = (sess.route_request.as_ref(), sess.route.as_ref()) {
-            if !route.input_matches_request(req) {
-                return Err(HandlerError::invalid(
-                    "stored Enso route transaction input does not match the requested token and amount",
-                ));
-            }
             let dest = sess
                 .destination_chain
                 .clone()
@@ -1110,6 +1159,29 @@ impl DefiHandler {
                      bypassable; edit the wallet's [defi] policy to change it",
                     d.rule, d.message
                 )));
+            }
+            if !route.input_matches_request(req) {
+                return Err(HandlerError::invalid(
+                    "stored Enso route transaction input does not match the requested token and amount",
+                ));
+            }
+            if req.from_address != info.address
+                || route.tx.from != info.address
+                || !Self::session_intents_match_route(&sess, req, route)
+            {
+                return Err(HandlerError::invalid(
+                    "stored Enso session does not match the wallet, chain, and executable route transaction",
+                ));
+            }
+            let source_chain_id = self
+                .chain_client(&sess.chain)?
+                .chain_id()
+                .await
+                .map_err(|error| HandlerError::backend(error.to_string()))?;
+            if req.chain_id != source_chain_id {
+                return Err(HandlerError::invalid(
+                    "stored Enso session does not match the executable source chain",
+                ));
             }
         } else {
             return Err(HandlerError::backend(
@@ -1149,6 +1221,10 @@ impl DefiHandler {
                 })?;
                 let (asset_id, amount_base_units) =
                     Self::route_input_valuation_target(&sess.chain, req);
+                let asset_decimals = self.route_input_decimals(&sess.chain, req).await?;
+                let route = sess.route.as_ref().ok_or_else(|| {
+                    HandlerError::backend("session has no route; refusing to stage")
+                })?;
                 self.tx_engine
                     .stage_with_oracle_valuation_target(
                         self.write_permit()?,
@@ -1158,8 +1234,14 @@ impl DefiHandler {
                         &chain,
                         &info.policy,
                         Some(&self.address_book),
-                        asset_id,
-                        amount_base_units,
+                        BoundValuationTarget {
+                            asset_id,
+                            amount_base_units,
+                            asset_decimals,
+                            expected_to: route.tx.to,
+                            expected_value_wei: route.tx.value,
+                            expected_calldata: route.tx.data.clone(),
+                        },
                     )
                     .await
                     .map_err(|e| HandlerError::backend(e.to_string()))?
@@ -2010,6 +2092,25 @@ mod tests {
             policy_checks: serde_json::Value::Null,
             receiver_class: None,
         }
+    }
+
+    #[test]
+    fn confirm_binding_rejects_route_intent_substitution() {
+        let mut sess = fake_session("alice", "route-binding");
+        let req = sess.route_request.clone().unwrap();
+        let route = sess.route.clone().unwrap();
+        sess.intents = vec![DefiHandler::route_raw_intent(&sess.chain, &route)];
+        assert!(DefiHandler::session_intents_match_route(
+            &sess, &req, &route
+        ));
+
+        let RawIntentBody::Raw { data, .. } = &mut sess.intents[0].body else {
+            panic!("expected raw route intent");
+        };
+        data.push_str("00");
+        assert!(!DefiHandler::session_intents_match_route(
+            &sess, &req, &route
+        ));
     }
 
     #[test]

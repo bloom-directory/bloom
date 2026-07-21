@@ -1019,7 +1019,12 @@ impl Outbox {
     /// field make the rolling ledger unavailable because that field was not
     /// bound to an asset or amount and may have originated from an untrusted
     /// hint. This fails closed for policies that require a trustworthy cap.
-    pub fn sum_usd_since(&self, wallet: &str, since_ms: u128) -> Result<f64, OutboxError> {
+    pub fn sum_usd_since(
+        &self,
+        wallet: &str,
+        since_ms: u128,
+        exclude_action: Option<(&str, &str)>,
+    ) -> Result<f64, OutboxError> {
         Self::validate_segment(wallet).map_err(|_| OutboxError::InvalidWallet(wallet.into()))?;
         let wallet_dir = self.inner.root.join(wallet);
         if !wallet_dir.exists() {
@@ -1032,6 +1037,9 @@ impl Outbox {
                 continue;
             }
             for state in [OutboxState::Pending, OutboxState::Sent, OutboxState::Failed] {
+                if state == OutboxState::Failed {
+                    continue;
+                }
                 let state_dir = c.path().join(state.dirname());
                 if !state_dir.exists() {
                     continue;
@@ -1044,6 +1052,15 @@ impl Outbox {
                     }
                     let staged: StagedTx = serde_json::from_slice(&fs::read(&intent_path)?)?;
                     if staged.created_ms < since_ms {
+                        continue;
+                    }
+                    if exclude_action
+                        .is_some_and(|(chain, id)| staged.chain == chain && staged.id == id)
+                        || matches!(
+                            staged.status,
+                            TxStatus::Reverted | TxStatus::Failed | TxStatus::Cancelled
+                        )
+                    {
                         continue;
                     }
                     let Some(quote) = staged.valuation else {
@@ -1519,7 +1536,7 @@ mod tests {
         d.usd_value = Some(999.0); // legacy-only value is unpriced
         ob.write_pending(&d, "p").unwrap();
 
-        let result = ob.sum_usd_since("alice", 1_000);
+        let result = ob.sum_usd_since("alice", 1_000, None);
         assert!(matches!(result, Err(OutboxError::UnknownValuation(_))));
     }
 
@@ -1527,8 +1544,46 @@ mod tests {
     fn sum_usd_since_unknown_wallet_returns_zero() {
         let dir = tempfile::tempdir().unwrap();
         let ob = Outbox::new(dir.path()).unwrap();
-        let total = ob.sum_usd_since("alice", 0).unwrap();
+        let total = ob.sum_usd_since("alice", 0, None).unwrap();
         assert_eq!(total, 0.0);
+    }
+
+    #[test]
+    fn sum_usd_since_excludes_current_action_and_failed_legacy_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let ob = Outbox::new(dir.path()).unwrap();
+        let quote = |usd_micro| bloom_auth_api::ValuationQuote {
+            asset_id: "native:anvil".into(),
+            amount_base_units: "1".into(),
+            usd_micro,
+            source: "test".into(),
+            quote_timestamp_ms: 2_000,
+            fetched_at_ms: 2_000,
+            max_age_ms: 60_000,
+            confidence_ppm: None,
+            stablecoin_assumption: false,
+        };
+
+        let mut current = fake_staged("current");
+        current.created_ms = 2_000;
+        current.valuation = Some(quote(6_000_000));
+        ob.write_pending(&current, "p").unwrap();
+
+        let mut other = fake_staged("other");
+        other.created_ms = 2_000;
+        other.valuation = Some(quote(5_000_000));
+        ob.write_pending(&other, "p").unwrap();
+
+        let mut failed_legacy = fake_staged("failed-legacy");
+        failed_legacy.created_ms = 2_000;
+        failed_legacy.usd_value = Some(999.0);
+        ob.write_pending(&failed_legacy, "p").unwrap();
+        ob.cancel("alice", "anvil", "failed-legacy").unwrap();
+
+        let total = ob
+            .sum_usd_since("alice", 1_000, Some(("anvil", "current")))
+            .unwrap();
+        assert_eq!(total, 5.0);
     }
 
     #[test]

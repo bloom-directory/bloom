@@ -3149,6 +3149,13 @@ impl SessionDenialReason {
 pub struct ValuationPolicy {
     pub volatile_max_age_ms: u64,
     pub stablecoin_max_age_ms: u64,
+    /// Maximum acceptable age of the upstream market observation. This is
+    /// deliberately separate from the local cache/fetch age.
+    #[serde(default = "default_observation_max_age_ms")]
+    pub observation_max_age_ms: u64,
+    /// Small allowance for provider/local clock skew.
+    #[serde(default = "default_future_tolerance_ms")]
+    pub future_tolerance_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub min_confidence_ppm: Option<u32>,
     #[serde(default)]
@@ -3160,10 +3167,20 @@ impl Default for ValuationPolicy {
         Self {
             volatile_max_age_ms: 30_000,
             stablecoin_max_age_ms: 120_000,
+            observation_max_age_ms: default_observation_max_age_ms(),
+            future_tolerance_ms: default_future_tolerance_ms(),
             min_confidence_ppm: None,
             stablecoin_asset_allowlist: Vec::new(),
         }
     }
+}
+
+const fn default_observation_max_age_ms() -> u64 {
+    5 * 60 * 1_000
+}
+
+const fn default_future_tolerance_ms() -> u64 {
+    60 * 1_000
 }
 
 impl ValuationPolicy {
@@ -3217,6 +3234,18 @@ impl ValuationQuote {
                 "valuation fetched timestamp is missing".into(),
             ));
         }
+        if self.quote_timestamp_ms > now_ms.saturating_add(policy.future_tolerance_ms) {
+            return Err(AuthApiError::Denied(
+                "valuation quote timestamp is in the future".into(),
+            ));
+        }
+        let observation_age_ms = now_ms.saturating_sub(self.quote_timestamp_ms);
+        if observation_age_ms > policy.observation_max_age_ms {
+            return Err(AuthApiError::Denied(format!(
+                "valuation market observation is stale: age_ms={observation_age_ms} max_age_ms={}",
+                policy.observation_max_age_ms
+            )));
+        }
         let max_age_ms = policy.max_age_for(self);
         if now_ms.saturating_sub(self.fetched_at_ms) > max_age_ms {
             return Err(AuthApiError::Denied(format!(
@@ -3256,7 +3285,7 @@ pub trait PriceOracle: Send + Sync {
         &self,
         asset_id: &str,
         amount_base_units: &str,
-        native_decimals: Option<u8>,
+        asset_decimals: u8,
         now_ms: u64,
     ) -> Result<ValuationQuote, AuthApiError>;
 }
@@ -5147,6 +5176,33 @@ mod tests {
             .validate_for_authorization(&policy, 20_000)
             .unwrap_err();
         assert!(err.to_string().contains("missing"), "{err}");
+    }
+
+    #[test]
+    fn valuation_validation_checks_market_observation_age_and_future_skew() {
+        let policy = ValuationPolicy::default();
+        let now = 1_000_000;
+
+        let mut old = valuation_quote();
+        old.fetched_at_ms = now;
+        old.quote_timestamp_ms = now - policy.observation_max_age_ms - 1;
+        let err = old.validate_for_authorization(&policy, now).unwrap_err();
+        assert!(err.to_string().contains("market observation is stale"));
+
+        let mut future = valuation_quote();
+        future.fetched_at_ms = now;
+        future.quote_timestamp_ms = now + policy.future_tolerance_ms + 1;
+        let err = future.validate_for_authorization(&policy, now).unwrap_err();
+        assert!(err.to_string().contains("in the future"));
+
+        let mut normal_provider_lag = valuation_quote();
+        normal_provider_lag.fetched_at_ms = now;
+        normal_provider_lag.quote_timestamp_ms = now - 45_000;
+        assert!(
+            normal_provider_lag
+                .validate_for_authorization(&policy, now)
+                .is_ok()
+        );
     }
 
     #[test]

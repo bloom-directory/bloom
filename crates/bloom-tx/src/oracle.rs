@@ -30,17 +30,13 @@ mod tests {
             &self,
             asset_id: &str,
             amount_base_units: &str,
-            native_decimals: Option<u8>,
+            asset_decimals: u8,
             now_ms: u64,
         ) -> Result<ValuationQuote, AuthApiError> {
             let amount = amount_base_units
                 .parse::<f64>()
                 .map_err(|e| AuthApiError::Denied(e.to_string()))?;
-            let decimals = if asset_id.starts_with("native:") {
-                native_decimals.unwrap_or(18)
-            } else {
-                0
-            };
+            let decimals = asset_decimals;
             Ok(ValuationQuote {
                 asset_id: asset_id.into(),
                 amount_base_units: amount_base_units.into(),
@@ -65,7 +61,7 @@ mod tests {
         };
         // 1 ETH at $2500 = $2500.
         let quote = o
-            .quote_usd("native:ethereum", "1000000000000000000", Some(18), 1_000)
+            .quote_usd("native:ethereum", "1000000000000000000", 18, 1_000)
             .await
             .unwrap();
         assert_eq!(quote.usd_micro, 2_500_000_000);

@@ -3776,7 +3776,18 @@ mod tests {
             f.handler
                 .tx_engine
                 .session_store()
-                .authorize_and_debit("alice", 42161, "0001-a", Some(1_000_000), true, now_ms())
+                .authorize_and_debit(
+                    "alice",
+                    42161,
+                    "0001-a",
+                    Some(1_000_000),
+                    bloom_tx::session::SessionActionFacts {
+                        value_moving: true,
+                        calldata_verified: true,
+                        authority_change: false,
+                    },
+                    now_ms(),
+                )
                 .is_some()
         );
 

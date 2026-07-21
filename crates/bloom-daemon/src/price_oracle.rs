@@ -57,12 +57,12 @@ impl PricesOracle {
         decimals: u8,
         price_usd: f64,
     ) -> Result<i128, AuthApiError> {
-        if !price_usd.is_finite() || price_usd < 0.0 {
+        if !price_usd.is_finite() || price_usd <= 0.0 {
             return Err(AuthApiError::Denied("price quote is invalid".into()));
         }
         let amount = U256::from_str_radix(amount_base_units, 10)
             .map_err(|_| AuthApiError::Denied("amount_base_units is invalid".into()))?;
-        if amount.is_zero() || price_usd == 0.0 {
+        if amount.is_zero() {
             return Ok(0);
         }
         // PriceQuote currently exposes f64, so use its exact binary rational
@@ -87,20 +87,16 @@ impl PricesOracle {
                 .checked_shl(binary_exponent as usize)
                 .ok_or_else(|| AuthApiError::Denied("computed USD value is invalid".into()))?;
         } else {
-            // For a non-overflowing numerator, a sufficiently large
-            // denominator cannot produce even one micro-USD. If the shift
-            // itself does not fit, returning zero is conservative.
+            // A denominator this large means the exact value is below one
+            // micro-dollar. Round conservatively upward rather than to zero.
             denominator = match denominator.checked_shl((-binary_exponent) as usize) {
                 Some(value) => value,
-                None => return Ok(0),
+                None => return Ok(1),
             };
         }
         let quotient = numerator / denominator;
         let remainder = numerator % denominator;
-        let half = denominator / U256::from(2u8);
-        let rounds_up =
-            remainder > half || (remainder == half && denominator % U256::from(2u8) == U256::ZERO);
-        let rounded = if rounds_up {
+        let rounded = if remainder > U256::ZERO {
             quotient
                 .checked_add(U256::from(1u8))
                 .ok_or_else(|| AuthApiError::Denied("computed USD value is invalid".into()))?
@@ -120,7 +116,7 @@ impl PriceOracle for PricesOracle {
         &self,
         asset_id: &str,
         amount_base_units: &str,
-        native_decimals: Option<u8>,
+        asset_decimals: u8,
         now_ms: u64,
     ) -> Result<ValuationQuote, AuthApiError> {
         let coin = Self::coin_for_asset(asset_id)?;
@@ -128,20 +124,13 @@ impl PriceOracle for PricesOracle {
             self.client.current(coin).await.map_err(|error| {
                 AuthApiError::Denied(format!("price oracle unavailable: {error}"))
             })?;
-        // Native asset decimals are chain-configured and must take precedence
-        // over the provider metadata. DefiLlama may omit native decimals, but
-        // an omitted token-contract decimal is still unresolvable and must
-        // fail closed.
-        let decimals = quote
-            .decimals
-            .or_else(|| asset_id.strip_prefix("native:").and(native_decimals))
-            .or_else(|| asset_id.strip_prefix("native:").map(|_| 18u8))
-            .ok_or_else(|| AuthApiError::Denied("price quote decimals missing".into()))?;
-        let decimals = if asset_id.starts_with("native:") {
-            native_decimals.unwrap_or(decimals)
-        } else {
-            decimals
-        };
+        if let Some(provider_decimals) = quote.decimals
+            && provider_decimals != asset_decimals
+        {
+            return Err(AuthApiError::Denied(format!(
+                "price quote decimals mismatch: provider={provider_decimals} trusted={asset_decimals}"
+            )));
+        }
         if quote.timestamp == 0 {
             return Err(AuthApiError::Denied("price quote timestamp missing".into()));
         }
@@ -159,7 +148,7 @@ impl PriceOracle for PricesOracle {
         Ok(ValuationQuote {
             asset_id: asset_id.into(),
             amount_base_units: amount_base_units.into(),
-            usd_micro: Self::amount_to_usd_micro(amount_base_units, decimals, quote.price)?,
+            usd_micro: Self::amount_to_usd_micro(amount_base_units, asset_decimals, quote.price)?,
             source: self.source.clone(),
             quote_timestamp_ms: quote.timestamp.saturating_mul(1_000),
             fetched_at_ms: now_ms,
@@ -223,10 +212,19 @@ mod tests {
     }
 
     #[test]
-    fn token_amount_rejects_non_finite_or_negative_prices() {
+    fn token_amount_rejects_nonpositive_or_non_finite_prices() {
         assert!(PricesOracle::amount_to_usd_micro("1", 0, f64::NAN).is_err());
         assert!(PricesOracle::amount_to_usd_micro("1", 0, f64::INFINITY).is_err());
         assert!(PricesOracle::amount_to_usd_micro("1", 0, -1.0).is_err());
+        assert!(PricesOracle::amount_to_usd_micro("1", 0, 0.0).is_err());
+    }
+
+    #[test]
+    fn positive_dust_rounds_up_to_one_micro_usd() {
+        assert_eq!(
+            PricesOracle::amount_to_usd_micro("1", 18, 0.000_001).unwrap(),
+            1
+        );
     }
 
     #[test]
@@ -242,18 +240,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn native_quote_defaults_to_evm_decimals_when_provider_omits_them() {
+    async fn native_quote_uses_trusted_decimals_when_provider_omits_them() {
         let body = r#"{"coins":{"coingecko:ethereum":{"price":3500.5,"timestamp":1700000000}}}"#;
         let url = one_shot_price_server(body).await;
         let oracle = PricesOracle::new(PricesClient::with_base_url(url));
 
         let quote = oracle
-            .quote_usd(
-                "native:anvil",
-                "1000000000000000000",
-                None,
-                1_700_000_000_000,
-            )
+            .quote_usd("native:anvil", "1000000000000000000", 18, 1_700_000_000_000)
             .await
             .unwrap();
 
@@ -264,15 +257,33 @@ mod tests {
 
     #[tokio::test]
     async fn native_quote_uses_configured_decimals_over_provider_metadata() {
-        let body = r#"{"coins":{"coingecko:ethereum":{"price":3500.5,"timestamp":1700000000,"decimals":18}}}"#;
+        let body = r#"{"coins":{"coingecko:ethereum":{"price":3500.5,"timestamp":1700000000}}}"#;
         let url = one_shot_price_server(body).await;
         let oracle = PricesOracle::new(PricesClient::with_base_url(url));
 
         let quote = oracle
-            .quote_usd("native:anvil", "1000000000", Some(9), 1_700_000_000_000)
+            .quote_usd("native:anvil", "1000000000", 9, 1_700_000_000_000)
             .await
             .unwrap();
 
         assert_eq!(quote.usd_micro, 3_500_500_000);
+    }
+
+    #[tokio::test]
+    async fn token_quote_rejects_provider_decimal_mismatch() {
+        let body = r#"{"coins":{"ethereum:0x0000000000000000000000000000000000000001":{"price":1.0,"timestamp":1700000000,"decimals":18}}}"#;
+        let url = one_shot_price_server(body).await;
+        let oracle = PricesOracle::new(PricesClient::with_base_url(url));
+
+        let error = oracle
+            .quote_usd(
+                "ethereum:0x0000000000000000000000000000000000000001",
+                "1000000",
+                6,
+                1_700_000_000_000,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("decimals mismatch"));
     }
 }

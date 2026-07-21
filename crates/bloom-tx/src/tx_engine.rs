@@ -377,6 +377,25 @@ struct TokenMeta {
     decimals: u8,
 }
 
+/// Oracle input facts supplied by a trusted route handler, bound to the exact
+/// executable transaction that the engine resolves and stages.
+#[derive(Debug, Clone)]
+pub struct BoundValuationTarget {
+    pub asset_id: String,
+    pub amount_base_units: String,
+    pub asset_decimals: u8,
+    pub expected_to: Address,
+    pub expected_value_wei: U256,
+    pub expected_calldata: Bytes,
+}
+
+#[derive(Debug, Clone)]
+struct ValuationTarget {
+    asset_id: String,
+    amount_base_units: String,
+    asset_decimals: u8,
+}
+
 fn classify_action_kind(
     body: &RawIntentBody,
     has_token: bool,
@@ -1163,9 +1182,9 @@ impl TxEngine {
     }
 
     /// Stage a trusted route transaction with an exact oracle binding. The
-    /// caller supplies the encoded input asset and base-unit amount; the
-    /// engine obtains the quote itself so a caller cannot provide a forged USD
-    /// value or bind a quote to different facts.
+    /// caller supplies the encoded input asset and base-unit amount together
+    /// with the expected executable transaction; the engine rejects any
+    /// mismatch before obtaining or attaching a quote.
     #[allow(clippy::too_many_arguments)]
     pub async fn stage_with_oracle_valuation_target(
         &self,
@@ -1176,8 +1195,7 @@ impl TxEngine {
         chain: &ChainClient,
         policy: &Policy,
         address_book: Option<&AddressBook>,
-        asset_id: String,
-        amount_base_units: String,
+        valuation_target: BoundValuationTarget,
     ) -> Result<StagedTx, TxEngineError> {
         self.stage_with_execution_origin_and_fee_overrides_and_valuation_target(
             permit,
@@ -1189,7 +1207,7 @@ impl TxEngine {
             address_book,
             None,
             None,
-            Some((asset_id, amount_base_units)),
+            Some(valuation_target),
         )
         .await
     }
@@ -1206,7 +1224,7 @@ impl TxEngine {
         address_book: Option<&AddressBook>,
         execution_origin: Option<ExecutionOrigin>,
         fee_overrides: Option<Eip1559FeeOverrides>,
-        trusted_valuation_target: Option<(String, String)>,
+        trusted_valuation_target: Option<BoundValuationTarget>,
     ) -> Result<StagedTx, TxEngineError> {
         if let Some(origin) = &execution_origin {
             origin
@@ -1235,6 +1253,15 @@ impl TxEngine {
 
         // Build a request to estimate gas; choose 1559 vs legacy fields.
         let data_bytes = decode_data(&data_hex)?;
+        if let Some(target) = &trusted_valuation_target
+            && (target.expected_to != to
+                || target.expected_value_wei != value_wei
+                || target.expected_calldata.as_ref() != data_bytes.as_ref())
+        {
+            return Err(TxEngineError::ValuationUnavailable(
+                "trusted valuation target does not match the executable transaction".into(),
+            ));
+        }
 
         // Stage-time MEV/sandwich heuristic. Computed up-front so that
         // when `policy.mev.fail_on_high_risk` is set we can deny before
@@ -1514,46 +1541,59 @@ impl TxEngine {
         // Caller-supplied hints are deliberately ignored: they are not bound
         // to the encoded asset, amount, or calldata and must never satisfy an
         // autonomous policy budget.
-        let needs_usd = trusted_valuation_target.is_some()
-            || policy.caps.per_tx_usd.is_some()
+        let needs_usd = policy.caps.per_tx_usd.is_some()
             || policy.caps.require_confirm_above_usd.is_some()
             || policy.caps.per_day_usd.is_some()
             || matches!(
                 policy.effective_agent_autonomy(),
                 bloom_proto::AgentAutonomyMode::UnderPolicy
             );
-        let has_trusted_valuation_target = trusted_valuation_target.is_some();
-        let valuation_target = trusted_valuation_target.or_else(|| match action_kind {
-            TxActionKind::NativeTransfer if value_wei > U256::ZERO => {
-                Some((format!("native:{}", spec.name), value_wei.to_string()))
-            }
-            TxActionKind::Erc20Transfer => token_for_plan.as_ref().and_then(|token| {
-                token
-                    .amount_base_units
-                    .clone()
-                    .map(|amount| (format!("{}:{}", spec.name, token.address), amount))
-            }),
-            _ => None,
-        });
-        let valuation = if needs_usd {
-            if let Some((asset_id, amount_base_units)) = valuation_target.as_ref()
+        let valuation_target = trusted_valuation_target
+            .as_ref()
+            .map(|target| ValuationTarget {
+                asset_id: target.asset_id.clone(),
+                amount_base_units: target.amount_base_units.clone(),
+                asset_decimals: target.asset_decimals,
+            })
+            .or_else(|| match action_kind {
+                TxActionKind::NativeTransfer if value_wei > U256::ZERO => Some(ValuationTarget {
+                    asset_id: format!("native:{}", spec.name),
+                    amount_base_units: value_wei.to_string(),
+                    asset_decimals: spec.native_decimals,
+                }),
+                TxActionKind::Erc20Transfer => token_for_plan.as_ref().and_then(|token| {
+                    token
+                        .amount_base_units
+                        .clone()
+                        .map(|amount| ValuationTarget {
+                            asset_id: format!("{}:{}", spec.name, token.address),
+                            amount_base_units: amount,
+                            asset_decimals: token.decimals,
+                        })
+                }),
+                _ => None,
+            });
+        let valuation = if needs_usd || trusted_valuation_target.is_some() {
+            if let Some(target) = valuation_target.as_ref()
                 && let Some(oracle) = &self.price_oracle
             {
                 match oracle
                     .quote_usd(
-                        asset_id,
-                        amount_base_units,
-                        asset_id
-                            .strip_prefix("native:")
-                            .map(|_| spec.native_decimals),
+                        &target.asset_id,
+                        &target.amount_base_units,
+                        target.asset_decimals,
                         now_ms as u64,
                     )
                     .await
                 {
                     Ok(quote)
-                        if quote.asset_id == *asset_id
-                            && quote.amount_base_units == *amount_base_units
-                            && quote.usd_micro >= 0
+                        if quote.asset_id == target.asset_id
+                            && quote.amount_base_units == target.amount_base_units
+                            && (quote.usd_micro > 0
+                                || target
+                                    .amount_base_units
+                                    .parse::<U256>()
+                                    .is_ok_and(|v| v.is_zero()))
                             && quote
                                 .validate_for_authorization(
                                     &ValuationPolicy::default(),
@@ -1587,11 +1627,6 @@ impl TxEngine {
         } else {
             None
         };
-        if has_trusted_valuation_target && valuation.is_none() {
-            return Err(TxEngineError::ValuationUnavailable(
-                "trusted valuation target could not be quoted or validated".into(),
-            ));
-        }
         policy_ctx.usd_value = valuation
             .as_ref()
             .map(|quote| quote.usd_micro as f64 / 1_000_000.0);
@@ -1602,7 +1637,7 @@ impl TxEngine {
         if needs_usd {
             const DAY_MS: u128 = 24 * 60 * 60 * 1000;
             let since = now_ms.saturating_sub(DAY_MS);
-            policy_ctx.usd_spent_last_24h = self.outbox.sum_usd_since(wallet, since).ok();
+            policy_ctx.usd_spent_last_24h = self.outbox.sum_usd_since(wallet, since, None).ok();
         }
 
         let mut staged = StagedTx {
@@ -1757,7 +1792,11 @@ impl TxEngine {
             staged.chain_id,
             &staged.id,
             subject.total_value_usd_micro,
-            subject.value_moving && subject.calldata_verified && !subject.authority_change,
+            crate::session::SessionActionFacts {
+                value_moving: subject.value_moving,
+                calldata_verified: subject.calldata_verified,
+                authority_change: subject.authority_change,
+            },
             now_ms(),
         ) {
             return Ok(());
@@ -1918,7 +1957,11 @@ impl TxEngine {
             staged.chain_id,
             &staged.id,
             subject.total_value_usd_micro,
-            subject.value_moving && subject.calldata_verified && !subject.authority_change,
+            crate::session::SessionActionFacts {
+                value_moving: subject.value_moving,
+                calldata_verified: subject.calldata_verified,
+                authority_change: subject.authority_change,
+            },
             now_ms(),
         );
         let unsigned = self.build_unsigned_evm_tx(&staged, chain)?;
@@ -3450,13 +3493,24 @@ impl TxEngine {
         policy: &Policy,
         surface: bloom_proto::AuthorizationSurface,
     ) -> Result<(), TxEngineError> {
-        let budget = self.budget_snapshot(&staged.wallet)?;
         let subject = self.authorization_subject(staged);
+        let budget = match self.budget_snapshot(staged) {
+            Ok(snapshot) => Some(snapshot),
+            Err(error) => {
+                tracing::warn!(
+                    wallet = %staged.wallet,
+                    id = %staged.id,
+                    %error,
+                    "tx.budget_ledger_unavailable_requires_review"
+                );
+                None
+            }
+        };
         let initial = bloom_proto::evaluate_action_authorization(
             policy,
             &staged.policy_checks,
             &subject,
-            Some(&budget),
+            budget.as_ref(),
             None,
             surface.clone(),
         );
@@ -3503,7 +3557,7 @@ impl TxEngine {
             policy,
             &staged.policy_checks,
             &subject,
-            Some(&budget),
+            budget.as_ref(),
             sealed_approval_intent_hash.as_deref(),
             surface,
         ) {
@@ -3721,7 +3775,11 @@ impl TxEngine {
         let total_value_usd_micro = staged
             .valuation
             .as_ref()
-            .filter(|quote| quote.is_fresh_at(now_ms() as u64))
+            .filter(|quote| {
+                quote
+                    .validate_for_authorization(&ValuationPolicy::default(), now_ms() as u64)
+                    .is_ok()
+            })
             .map(|quote| quote.usd_micro);
         bloom_proto::AuthorizationSubject {
             kind: "evm_tx".into(),
@@ -3746,20 +3804,29 @@ impl TxEngine {
         }
     }
 
-    fn budget_snapshot(&self, wallet: &str) -> Result<bloom_proto::BudgetSnapshot, TxEngineError> {
+    fn budget_snapshot(
+        &self,
+        staged: &StagedTx,
+    ) -> Result<bloom_proto::BudgetSnapshot, TxEngineError> {
         const DAY_MS: u128 = 24 * 60 * 60 * 1000;
         const WEEK_MS: u128 = 7 * DAY_MS;
         const MONTH_MS: u128 = 30 * DAY_MS;
         let now = now_ms();
-        let day = self
-            .outbox
-            .sum_usd_since(wallet, now.saturating_sub(DAY_MS))?;
-        let week = self
-            .outbox
-            .sum_usd_since(wallet, now.saturating_sub(WEEK_MS))?;
-        let month = self
-            .outbox
-            .sum_usd_since(wallet, now.saturating_sub(MONTH_MS))?;
+        let day = self.outbox.sum_usd_since(
+            &staged.wallet,
+            now.saturating_sub(DAY_MS),
+            Some((&staged.chain, &staged.id)),
+        )?;
+        let week = self.outbox.sum_usd_since(
+            &staged.wallet,
+            now.saturating_sub(WEEK_MS),
+            Some((&staged.chain, &staged.id)),
+        )?;
+        let month = self.outbox.sum_usd_since(
+            &staged.wallet,
+            now.saturating_sub(MONTH_MS),
+            Some((&staged.chain, &staged.id)),
+        )?;
         Ok(bloom_proto::BudgetSnapshot {
             spent_day_micro_usd: f64_to_micro_usd(day).unwrap_or(i128::MAX),
             spent_week_micro_usd: f64_to_micro_usd(week).unwrap_or(i128::MAX),
@@ -3972,17 +4039,7 @@ impl TxEngine {
         let entry = self.read_replaceable_entry(wallet, chain_name, original_id)?;
         let original = &entry.staged;
 
-        let mut cancel_tx = original.clone();
-        cancel_tx.status = TxStatus::Pending;
-        cancel_tx.tx_hash = None;
-        let from_addr: Address = original
-            .from
-            .parse()
-            .map_err(|e: alloy::hex::FromHexError| TxEngineError::Address(e.to_string()))?;
-        cancel_tx.to = bloom_proto::checksum_address(&from_addr);
-        cancel_tx.value_wei = "0".to_string();
-        cancel_tx.data_hex = "0x".to_string();
-        cancel_tx.token = None;
+        let mut cancel_tx = cancellation_candidate(original)?;
         bump_fees_in_place(&mut cancel_tx, bump);
         let unsigned = self.build_unsigned_evm_tx(&cancel_tx, chain)?;
         let prepared = PreparedEvmTx {
@@ -4041,6 +4098,27 @@ impl TxEngine {
         );
         Ok(cancel_tx)
     }
+}
+
+fn cancellation_candidate(original: &StagedTx) -> Result<StagedTx, TxEngineError> {
+    let from_addr: Address = original
+        .from
+        .parse()
+        .map_err(|e: alloy::hex::FromHexError| TxEngineError::Address(e.to_string()))?;
+    let mut cancel = original.clone();
+    cancel.status = TxStatus::Pending;
+    cancel.tx_hash = None;
+    cancel.to = bloom_proto::checksum_address(&from_addr);
+    cancel.value_wei = "0".into();
+    cancel.data_hex = "0x".into();
+    cancel.gas_limit = 21_000;
+    cancel.action_kind = TxActionKind::NativeTransfer;
+    cancel.token = None;
+    cancel.nft = None;
+    cancel.usd_value = None;
+    cancel.valuation = None;
+    cancel.policy_checks.clear();
+    Ok(cancel)
 }
 
 /// Bump fee fields by `pct%` (rounded up by ≥ 1 wei). Whichever set is
@@ -4399,13 +4477,17 @@ fn evm_sealed_subject(
             })
             .transpose()?
     };
-    let method = match staged.action_kind {
-        TxActionKind::NativeTransfer => "native_transfer",
-        TxActionKind::Erc20Transfer => bloom_auth_api::EVM_ERC20_TRANSFER_METHOD,
-        TxActionKind::Approval => "approval",
-        TxActionKind::NftTransfer => "nft_transfer",
-        TxActionKind::ContractCall => "contract_call",
-        TxActionKind::Unknown => "unknown",
+    let method = if matches!(action_kind, EvmOutboxActionKind::Cancel) {
+        "cancel"
+    } else {
+        match staged.action_kind {
+            TxActionKind::NativeTransfer => "native_transfer",
+            TxActionKind::Erc20Transfer => bloom_auth_api::EVM_ERC20_TRANSFER_METHOD,
+            TxActionKind::Approval => "approval",
+            TxActionKind::NftTransfer => "nft_transfer",
+            TxActionKind::ContractCall => "contract_call",
+            TxActionKind::Unknown => "unknown",
+        }
     };
     let mut terms = DaemonGrantTerms::minimal(AssuranceLevel::Standard);
     terms.allowed_sign_intents = vec![bloom_auth_api::EVM_TX_SIGN_INTENT.into()];
@@ -4756,7 +4838,7 @@ mod tests {
             &self,
             asset_id: &str,
             amount_base_units: &str,
-            _native_decimals: Option<u8>,
+            _asset_decimals: u8,
             now_ms: u64,
         ) -> Result<bloom_auth_api::ValuationQuote, bloom_auth_api::AuthApiError> {
             self.calls
@@ -5272,12 +5354,20 @@ mod tests {
                 "0x1111111111111111111111111111111111111111"
                     .parse()
                     .unwrap(),
-                intent,
+                intent.clone(),
                 &chain,
                 &policy_with_usd_cap(),
                 None,
-                "anvil:0x1111111111111111111111111111111111111111".into(),
-                "1250000".into(),
+                BoundValuationTarget {
+                    asset_id: "anvil:0x1111111111111111111111111111111111111111".into(),
+                    amount_base_units: "1250000".into(),
+                    asset_decimals: 6,
+                    expected_to: "0x2222222222222222222222222222222222222222"
+                        .parse()
+                        .unwrap(),
+                    expected_value_wei: U256::ZERO,
+                    expected_calldata: Bytes::from(hex::decode("12345678").unwrap()),
+                },
             )
             .await
             .unwrap();
@@ -5297,6 +5387,32 @@ mod tests {
                 "1250000".into(),
             )]
         );
+
+        let error = engine
+            .stage_with_oracle_valuation_target(
+                &permit,
+                "alice",
+                "0x1111111111111111111111111111111111111111"
+                    .parse()
+                    .unwrap(),
+                intent,
+                &chain,
+                &policy_with_usd_cap(),
+                None,
+                BoundValuationTarget {
+                    asset_id: "anvil:0x1111111111111111111111111111111111111111".into(),
+                    amount_base_units: "1250000".into(),
+                    asset_decimals: 6,
+                    expected_to: "0x2222222222222222222222222222222222222222"
+                        .parse()
+                        .unwrap(),
+                    expected_value_wei: U256::ZERO,
+                    expected_calldata: Bytes::from(hex::decode("deadbeef").unwrap()),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("does not match"));
     }
 
     #[test]
@@ -6041,6 +6157,46 @@ mod tests {
         bump_fees_in_place(&mut s, 12);
         // 1000 + 1000*12/100 = 1120.
         assert_eq!(s.gas_price.as_deref(), Some("1120"));
+    }
+
+    #[test]
+    fn cancellation_candidate_clears_original_value_and_authority_facts() {
+        let mut original = fake_staged_1559("cancel-facts");
+        original.action_kind = TxActionKind::Approval;
+        original.value_wei = "123".into();
+        original.data_hex = "0xdeadbeef".into();
+        original.token = Some(TokenRef {
+            address: "0x2222222222222222222222222222222222222222".into(),
+            symbol: "TOK".into(),
+            decimals: 6,
+            recipient: "0x3333333333333333333333333333333333333333".into(),
+            amount: "1".into(),
+            amount_base_units: Some("1000000".into()),
+        });
+        original.usd_value = Some(10.0);
+        original.valuation = Some(bloom_auth_api::ValuationQuote {
+            asset_id: "anvil:0x2222222222222222222222222222222222222222".into(),
+            amount_base_units: "1000000".into(),
+            usd_micro: 10_000_000,
+            source: "test".into(),
+            quote_timestamp_ms: 1,
+            fetched_at_ms: 1,
+            max_age_ms: 30_000,
+            confidence_ppm: None,
+            stablecoin_assumption: false,
+        });
+
+        let cancel = cancellation_candidate(&original).unwrap();
+        assert!(cancel.to.eq_ignore_ascii_case(&original.from));
+        assert_eq!(cancel.value_wei, "0");
+        assert_eq!(cancel.data_hex, "0x");
+        assert_eq!(cancel.gas_limit, 21_000);
+        assert_eq!(cancel.action_kind, TxActionKind::NativeTransfer);
+        assert!(cancel.token.is_none());
+        assert!(cancel.nft.is_none());
+        assert!(cancel.usd_value.is_none());
+        assert!(cancel.valuation.is_none());
+        assert!(cancel.policy_checks.is_empty());
     }
 
     #[test]
@@ -7497,8 +7653,8 @@ mod tests {
             )
             .await;
         assert!(
-            matches!(r, Err(TxEngineError::ApprovalDenied(ref e)) if e.contains("USD valuation")),
-            "expected unknown USD refusal, got {r:?}"
+            !matches!(r, Err(TxEngineError::ApprovalDenied(ref e)) if e.contains("USD valuation")),
+            "missing valuation must fall back to fresh review, got {r:?}"
         );
 
         let mut priced = fake_staged_1559("0002-priced");
@@ -7537,6 +7693,46 @@ mod tests {
             Ok(_) => panic!("unexpected broadcast success on unreachable RPC"),
             Err(_) => {}
         }
+    }
+
+    #[test]
+    fn budget_snapshot_does_not_double_count_current_pending_action() {
+        let (engine, _spec, _dir) = fake_engine(60_000);
+        let mut staged = fake_staged_1559("current-budget");
+        staged.created_ms = now_ms();
+        staged.action_kind = TxActionKind::NativeTransfer;
+        staged.value_wei = "1".into();
+        staged.valuation = Some(bloom_auth_api::ValuationQuote {
+            asset_id: "native:anvil".into(),
+            amount_base_units: "1".into(),
+            usd_micro: 6_000_000,
+            source: "test".into(),
+            quote_timestamp_ms: now_ms() as u64,
+            fetched_at_ms: now_ms() as u64,
+            max_age_ms: 30_000,
+            confidence_ppm: None,
+            stablecoin_assumption: false,
+        });
+        engine.outbox.write_pending(&staged, "p").unwrap();
+
+        let budget = engine.budget_snapshot(&staged).unwrap();
+        assert_eq!(budget.spent_day_micro_usd, 0);
+
+        let mut policy = Policy::default();
+        policy.approval.agent_autonomy = Some(bloom_proto::AgentAutonomyMode::UnderPolicy);
+        policy.limits.max_tx_usd = Some("10".into());
+        policy.limits.max_day_usd = Some("10".into());
+        assert!(matches!(
+            bloom_proto::evaluate_action_authorization(
+                &policy,
+                &[],
+                &engine.authorization_subject(&staged),
+                Some(&budget),
+                None,
+                bloom_proto::AuthorizationSurface::Cli,
+            ),
+            bloom_proto::AutonomyDecision::ApprovedAutonomous { .. }
+        ));
     }
 
     /// `submit_via_private` looks up the registered provider by
