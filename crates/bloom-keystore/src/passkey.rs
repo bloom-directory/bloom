@@ -1030,6 +1030,10 @@ fn decode_prf_output_b64(s: &str) -> Result<[u8; 32], String> {
     Ok(arr)
 }
 
+/// Outcome of a foreground registration/rebind ceremony: the verified
+/// credential plus its adjacent PRF output, or an error message.
+type RebindOutcome = Result<(Passkey, [u8; 32]), String>;
+
 #[derive(Clone)]
 struct RebindState {
     token: String,
@@ -1037,7 +1041,7 @@ struct RebindState {
     challenge: [u8; 32],
     reg_state: PasskeyRegistration,
     fallback: Arc<Mutex<Option<(Passkey, PasskeyAuthentication)>>>,
-    tx: Arc<Mutex<Option<tokio::sync::oneshot::Sender<Result<(Passkey, [u8; 32]), String>>>>>,
+    tx: Arc<Mutex<Option<tokio::sync::oneshot::Sender<RebindOutcome>>>>,
     shutdown: Arc<tokio::sync::Notify>,
     creation_options_json: serde_json::Value,
 }
@@ -1137,13 +1141,13 @@ async fn rebind_complete(
 pub async fn foreground_registration_ceremony(
     wallet_name: &str,
     prf_salt: &[u8; 32],
-) -> Result<(Passkey, [u8; 32]), String> {
+) -> RebindOutcome {
     let mut challenge = [0u8; 32];
     rand::thread_rng().fill_bytes(&mut challenge);
     let (creation_options_json, reg_state) =
         start_registration_challenge(wallet_name, prf_salt, &challenge)?;
 
-    let (tx, rx) = tokio::sync::oneshot::channel::<Result<(Passkey, [u8; 32]), String>>();
+    let (tx, rx) = tokio::sync::oneshot::channel::<RebindOutcome>();
     let token = gen_token();
     let state = RebindState {
         token: token.clone(),
