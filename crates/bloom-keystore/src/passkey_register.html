@@ -162,7 +162,7 @@
         </div>
       </section>
 
-      <form class="panel" id="wallet-form" onsubmit="return false">
+      <form class="panel" id="wallet-form">
         <div class="panel-header">
           <p class="panel-kicker">Wallet policy</p>
           <h2 class="panel-title">Choose your guardrails</h2>
@@ -384,7 +384,9 @@ async function register(){
     PASSKEY_FLOW_ACTIVE=false;
   }
 }
-document.getElementById('btn').addEventListener('click',function(){
+document.getElementById('wallet-form').addEventListener('submit',function(e){
+  e.preventDefault();
+  if(document.getElementById('btn').disabled) return;
   register().catch(function(e){
     PASSKEY_FLOW_ACTIVE=false;
     var st=document.getElementById('status');
