@@ -99,7 +99,7 @@ contains:
 
 The initial `polymarket` entry points to
 `bloom-directory/bloom-petal-polymarket` at the parity-capable merge commit
-`1ffb267a1e1d4acd137c184806c20cc98d20a3f4` and its repository-owned `v0.1.3`
+`e2e898b69046c9f5d905dd2cd66b3a57ef195542` and its repository-owned `v0.1.3`
 release. A newer immutable release may replace that pin only through a reviewed
 catalog update that names its exact source commit and artifact.
 

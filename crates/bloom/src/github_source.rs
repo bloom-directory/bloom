@@ -33,9 +33,7 @@ const PREINSTALLED_POLYMARKET: PreinstalledPetal = PreinstalledPetal {
     commit: POLYMARKET_PARITY_COMMIT,
     release_tag: "v0.1.3",
     archive: "polymarket-v0.1.3.petal.tar.gz",
-    // The release provenance manifest binds the archive to the package hash
-    // produced once by the Petal repository's pinned release workflow.
-    expected_hash: None,
+    expected_hash: Some("02d6d18d773147013c3b1e7129c4694d2db3c93f1e885e755bdb4aa390bf6a5c"),
 };
 
 const PREINSTALLED_NEAR_INTENTS: PreinstalledPetal = PreinstalledPetal {
@@ -44,7 +42,7 @@ const PREINSTALLED_NEAR_INTENTS: PreinstalledPetal = PreinstalledPetal {
     commit: NEAR_INTENTS_INITIAL_RELEASE_COMMIT,
     release_tag: "v0.1.0",
     archive: "near-intents-v0.1.0.petal.tar.gz",
-    expected_hash: None,
+    expected_hash: Some("c78316d538e8364e837ed488fa74f04429d2477a617c36e7a6dc0c0fc68edee0"),
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -942,7 +940,7 @@ mod tests {
     #[test]
     fn existing_preinstalled_package_must_match_source_commit_and_hash() {
         let entry = preinstalled_petal("polymarket").unwrap();
-        let hash = "a".repeat(64);
+        let hash = entry.expected_hash.unwrap().to_string();
         let mut meta = PetalMeta {
             hash: hash.clone(),
             size: 1,
@@ -1113,7 +1111,7 @@ mod tests {
             release_tag: entry.release_tag.into(),
             archive: entry.archive.into(),
             archive_sha256: "a".repeat(64),
-            package_hash: "b".repeat(64),
+            package_hash: entry.expected_hash.unwrap().into(),
             tooling_repository: "bloom-directory/petal".into(),
             tooling_commit: "c".repeat(40),
         };
@@ -1126,6 +1124,13 @@ mod tests {
         assert!(mismatch.contains("pinned catalog entry"), "{mismatch}");
 
         manifest.source_commit = entry.commit.into();
+        manifest.package_hash = "b".repeat(64);
+        let hash_mismatch = validate_release_manifest(entry, &repo, &manifest)
+            .unwrap_err()
+            .to_string();
+        assert!(hash_mismatch.contains("package hash"), "{hash_mismatch}");
+
+        manifest.package_hash = entry.expected_hash.unwrap().into();
         manifest.tooling_repository = "untrusted/petal".into();
         let untrusted = validate_release_manifest(entry, &repo, &manifest)
             .unwrap_err()

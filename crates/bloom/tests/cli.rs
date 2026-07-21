@@ -1311,7 +1311,7 @@ fn petal_cli_build_install_list_and_vfs_read_happy_path() {
 #[test]
 #[ignore = "clones and builds the public Polymarket Petal source repo"]
 fn github_source_install_polymarket_dispatches_route_contract() {
-    let petal_ref = "1ffb267a1e1d4acd137c184806c20cc98d20a3f4";
+    let petal_ref = "e2e898b69046c9f5d905dd2cd66b3a57ef195542";
     let home = fresh_home();
     let home_dir = bloom_proto::HomeDir::at(home.path());
     let mut config = bloom_proto::Config::local_default();
