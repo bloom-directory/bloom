@@ -39,8 +39,9 @@ aggregator expose the current capability and next-action view when the daemon
 has the relevant handlers mounted.
 
 Read `/hyperliquid/README.md` for Hyperliquid trading (session-first).
-If the external Polymarket Petal is installed, read
-`/petals/polymarket/README.md` before using its prediction-market routes.
+If the external Polymarket Petal is installed, inspect
+`/petals/polymarket/meta/route-contract.json` and list its route tree before
+using its prediction-market routes.
 Read `/defi/README.md` for DeFi intents via Enso shortcuts.
 
 ## Wallets

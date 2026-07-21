@@ -1578,11 +1578,11 @@ is available at `/petals/polymarket/`:
 
 ```sh
 bloom init
-bloom vfs cat /petals/polymarket/README.md
+bloom vfs cat /petals/polymarket/meta/route-contract.json
 ```
 
-The installed README and route documentation describe the supported workflow for
-that exact Petal version.
+The installed route contract describes the supported workflow for that exact
+Petal version.
 
 ---
 

@@ -117,12 +117,12 @@ echo y > /bloom/wallets/alice/chains/ethereum/outbox/pending/0001-*/confirm
 ## Polymarket (external Petal)
 
 Bloom does not ship a native Polymarket CLI or root-level VFS subtree.
-`bloom init` provisions the pinned default package; follow the documentation
+`bloom init` provisions the pinned default package; inspect the route contract
 served by that exact package version:
 
 ```sh
 bloom init
-bloom vfs cat /petals/polymarket/README.md
+bloom vfs cat /petals/polymarket/meta/route-contract.json
 ```
 
 The installed Petal owns its routes and venue-specific state. Bloom supplies the

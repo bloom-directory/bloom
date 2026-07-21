@@ -57,14 +57,14 @@ forwarding or opening `ceremony_url`, the grant / grant + execute choice, and
 retrying the confirm write after a grant-only approval. There is no per-action
 hint file and no per-directory README duplication of global contracts.
 
-## Per-Petal READMEs
+## Per-surface documentation
 
 Built-in handlers embed read-only, handler-local documentation, while external
-Petals package their own `README.md` and route documentation under
-`/petals/<name>/`. For example, Hyperliquid exposes `/hyperliquid/README.md`, and
-the default installed Polymarket Petal exposes `/petals/polymarket/README.md`. Per-request
-`plan.md` files under `/requests` are per-instance previews rather than static
-docs.
+Petals expose package-defined route documentation under `/petals/<name>/`.
+For example, Hyperliquid exposes `/hyperliquid/README.md`, and the default
+installed Polymarket Petal exposes
+`/petals/polymarket/meta/route-contract.json`. Per-request `plan.md` files under
+`/requests` are per-instance previews rather than static docs.
 
 The division of labor:
 

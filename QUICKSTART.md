@@ -223,8 +223,9 @@ it expire after the configured TTL) cancels the stage.
   owner-signed writes at `/hyperliquid/<network>/exchange/<wallet>/...`
   labeled ADVANCED. Read `/hyperliquid/README.md`.
 - **Polymarket** — `bloom init` provisions the pinned default
-  `bloom-petal-polymarket` package. It appears at `/petals/polymarket/`; read the
-  installed `README.md` for the workflow supported by that package version.
+  `bloom-petal-polymarket` package. It appears at `/petals/polymarket/`; inspect
+  `meta/route-contract.json` and list the route tree for the exact installed
+  workflow.
 - **Zero-config chain reads** — Ethereum, Base, Arbitrum, Optimism,
   Polygon, BNB Smart Chain, Avalanche, Gnosis, Linea, HyperEVM, and
   Anvil are present after `bloom init`; live-network broadcasts remain

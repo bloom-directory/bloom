@@ -141,8 +141,8 @@ After provisioning is implemented and tested:
 - retain generic Petal HTTP, chain-read, storage, signing, transaction outbox,
   and Sealed Approval paths;
 - retain the wallet Polymarket policy schema used by the external Petal;
-- direct documentation and agent guidance to
-  `/petals/polymarket/README.md`.
+- direct documentation and agent guidance to the installed route tree and
+  `/petals/polymarket/meta/route-contract.json`.
 
 The recently added native `[polymarket] enabled = false` opt-out is superseded
 by `petals.preinstalled = []`. Loading an existing config must preserve that
@@ -156,11 +156,11 @@ For a fresh default home:
 ```sh
 bloom init
 bloom petals ls
-bloom vfs cat /petals/polymarket/README.md
+bloom vfs cat /petals/polymarket/meta/route-contract.json
 ```
 
-The list and README read must show the installed external Petal without a
-separate manual installation command.
+The list and route-contract read must show the installed external Petal without
+a separate manual installation command.
 
 For an opted-out home:
 

@@ -15,7 +15,7 @@ All paths below are relative to the Bloom VFS root.
   allowances, ENS reverse, sign / EIP-712 surfaces.
 - `defi/intents/` — Enso-mediated DeFi intents (write `quote` / `execute`).
 - `hyperliquid/` — HyperCore reads plus signed exchange and agent-session
-  writes; see `docs/hyperliquid-integration.md` for the reviewer-facing map.
+  writes; read `hyperliquid/README.md` for the mounted workflow documentation.
 - `petals/<name>/` — installed external Petal surfaces. Polymarket is provided
   by the default pre-installed package at `petals/polymarket/`, not built in.
 - `watch/` — long-running subscriptions (head, addr, log) executed by the
