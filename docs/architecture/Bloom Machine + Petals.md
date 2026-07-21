@@ -24,6 +24,27 @@ to approve.
 | Enforcement | the acting Petal | interpreting what is being signed and enforcing its own domain limits; producing an attestation | trusted — not structurally enforced |
 | Verification | verifier Petals (future) | independently checking or simulating another Petal's payload before it is signed | pluggable — unimplemented today |
 
+## Build and Release Ownership
+
+The Bloom Machine consumes and validates Petal packages; it does not build
+default Petals as part of its own release or on an operator's machine.
+
+Release responsibilities are split deliberately:
+
+- `bloom-directory/petal` owns the canonical package builder and reusable
+  release workflow;
+- each Petal repository owns its source build, release tag, installable archive,
+  checksum file, and provenance manifest;
+- Bloom owns the reviewed built-in catalog and installs configured defaults
+  from exact repository release pins during `bloom init`;
+- normal daemon construction and startup remain network-free.
+
+The catalog binds a default Petal to its repository, release tag, source commit,
+archive name, and expected identity. Installation verifies the repository-owned
+`SHA256SUMS` and `petal-release.json`, then validates the package itself before
+recording source provenance. Bloom never follows a floating `latest` Petal
+release and never falls back to compiling default Petal source locally.
+
 ## The Grant Envelope
 
 A Sealed Approval grant authorizes a single Petal to use bounded signing

@@ -93,13 +93,20 @@ contains:
 - stable catalog name;
 - trusted GitHub repository URL;
 - immutable Git commit;
+- immutable release tag and archive filename;
 - expected Petal mount/name;
 - expected package hash when a stable reproducible hash is available.
 
 The initial `polymarket` entry points to
 `bloom-directory/bloom-petal-polymarket` at the parity-capable merge commit
-`1ffb267a1e1d4acd137c184806c20cc98d20a3f4`. A newer immutable release tag
-may replace the raw commit only if it contains the same parity work.
+`1ffb267a1e1d4acd137c184806c20cc98d20a3f4` and its repository-owned `v0.1.3`
+release. A newer immutable release may replace that pin only through a reviewed
+catalog update that names its exact source commit and artifact.
+
+The catalog also contains the NEAR Intents Petal at
+`bloom-directory/bloom-petal-near` release `v0.1.0`. It is available for an
+explicit `petals.preinstalled = ["near-intents"]` configuration but is not part
+of the default set.
 
 The catalog is deliberately not arbitrary user-controlled source execution.
 Manual `bloom petals install` remains the interface for other trusted sources.
@@ -119,23 +126,27 @@ Provisioning must:
 3. Do nothing when the expected Petal is already installed.
 4. Refuse to silently overwrite a differently sourced or differently versioned
    Petal with the same mount name; report the mismatch and remediation.
-5. Prefer a checksum-verified Petal archive built from the catalog's immutable
-   ref and attached to the matching Bloom release. Fall back to the existing
-   trusted GitHub source installation path for development builds and releases
-   that predate the archive.
-6. Verify the installed Petal name, source provenance, resolved commit, and any
-   configured expected hash before reporting success.
-7. Be safe to rerun after success or a partial acquisition/build failure.
+5. Download the checksum and provenance-verified archive from the Petal
+   repository's exact catalogued release. Bloom must not build a default Petal
+   from source during setup.
+6. Verify the release tag, archive checksum, Petal name, source repository and
+   commit, Petal tooling commit, package hash, endpoint bindings, and installed
+   provenance before reporting success.
+7. Be safe to rerun after success or a partial acquisition failure.
 
 Normal daemon construction, status commands, VFS reads, and tests that create a
 temporary `HomeDir` must not unexpectedly access the network.
 
-The release workflow builds the Polymarket archive once from the pinned commit,
-publishes it alongside the Bloom binaries, and includes it in `SHA256SUMS`.
-Installing a released Bloom binary therefore does not require a local Rust
-toolchain. A downloaded archive must fail closed if its filename-bound checksum,
-package structure, Petal name, endpoint bindings, or recorded source provenance
-does not match the catalog entry.
+The `bloom-directory/petal` repository owns the canonical packaging command and
+reusable release workflow. Each Petal repository invokes that workflow from a
+thin, immutable-pin workflow and publishes its own archive, `SHA256SUMS`, and
+`petal-release.json`. Bloom's release workflow builds only Bloom binaries.
+
+Installing Bloom therefore does not require a local Rust toolchain. A
+downloaded Petal archive must fail closed if its filename-bound checksum,
+release manifest, package structure, Petal name, endpoint bindings, source
+commit, tooling provenance, or recorded package provenance does not match the
+catalog entry.
 
 ## Native Polymarket removal
 
@@ -208,9 +219,11 @@ Add deterministic tests covering:
 - explicit opt-out performs no installation;
 - an existing matching installation is retained;
 - a conflicting existing owner/version is not overwritten;
-- source/ref/name/hash verification rejects mismatches;
+- repository/release/ref/name/hash verification rejects mismatches;
 - release checksum verification is bound to the expected archive name and
   rejects missing or tampered entries;
+- release manifest verification rejects the wrong repository, source commit,
+  tag, archive, package hash, or tooling provenance;
 - a valid prebuilt archive installs without invoking a source build;
 - package `README.md` and `AGENTS.md` are readable and immutable at the Petal
   mount root;

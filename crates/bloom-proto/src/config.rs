@@ -585,7 +585,7 @@ impl Config {
         let mut seen_preinstalled = std::collections::BTreeSet::new();
         for name in &self.petals.preinstalled {
             validate_petal_runtime_name("preinstalled entry", name)?;
-            if !matches!(name.as_str(), "polymarket") {
+            if !matches!(name.as_str(), "polymarket" | "near-intents") {
                 return Err(ConfigError::Invalid(format!(
                     "unknown preinstalled Petal {name:?}"
                 )));
@@ -756,6 +756,9 @@ mod tests {
         let serialized = toml::to_string_pretty(&cfg).unwrap();
         let reloaded: Config = toml::from_str(&serialized).unwrap();
         assert!(reloaded.petals.preinstalled.is_empty());
+
+        cfg.petals.preinstalled = vec!["near-intents".into()];
+        cfg.validate().unwrap();
 
         cfg.petals.preinstalled = vec!["unknown".into()];
         let err = cfg.validate().unwrap_err().to_string();
