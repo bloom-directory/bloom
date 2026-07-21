@@ -8,14 +8,17 @@ writes to the default branch, creates a stable tag, or publishes a release.
 The `release.yml` workflow:
 
 1. Validates the tag shape.
-2. Verifies that the tagged commit already has workspace version `X.Y.Z`.
+2. Verifies that the tagged commit is reachable from the default branch and
+   already has workspace version `X.Y.Z`.
 3. Builds the exact
    commit SHA on four runners (Linux x86_64 + aarch64, macOS x86_64 +
    aarch64) with `--locked`.
 4. Verifies the resulting binary's `bloom --version` matches the tag.
 5. Verifies the tag still resolves to the built SHA, then creates a
    GitHub release `vX.Y.Z` with the four tarballs and a `SHA256SUMS`
-   file. Sets `--latest` so GitHub's latest-release links follow it.
+   file. It advances GitHub's latest-release alias only when this version is
+   at least as new as the current latest release; failures resolving that
+   release abort publication rather than treating the result as empty.
 
 The floating `latest` git tag is intentionally NOT created by the
 workflow. It is owned by the old (now-retired) branch-driven
@@ -46,9 +49,10 @@ git tag "v$VERSION"
 git push origin "v$VERSION"
 ```
 
-The tag push starts the release workflow. It verifies that the tag and
-workspace version agree, builds that immutable commit, and publishes the
-release only after all build jobs pass.
+The tag push starts the release workflow. It verifies that the tag points to a
+commit reachable from the default branch, that the tag and workspace version
+agree, builds that immutable commit, and publishes the release only after all
+build jobs pass.
 
 Repository rules should require review before merging the proposal PR and
 limit creation or update of `v*` tags to release maintainers. The release
