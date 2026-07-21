@@ -14,10 +14,8 @@ use sha2::{Digest, Sha256};
 use url::Url;
 
 const TRUSTED_GITHUB_OWNER: &str = "bloom-directory";
-// Update these source commits to the tagged merge commits after the owning
-// release-workflow PRs land. PR #122 remains draft until those tags exist.
-const POLYMARKET_PARITY_COMMIT: &str = "1ffb267a1e1d4acd137c184806c20cc98d20a3f4";
-const NEAR_INTENTS_INITIAL_RELEASE_COMMIT: &str = "5329b15b9728f4a0c5f5a30767a3eeb76c2e38d0";
+const POLYMARKET_PARITY_COMMIT: &str = "e2e898b69046c9f5d905dd2cd66b3a57ef195542";
+const NEAR_INTENTS_INITIAL_RELEASE_COMMIT: &str = "320b2b466bc0eb087a5cae3e658a5797198ce8ba";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PreinstalledPetal {
