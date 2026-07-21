@@ -715,6 +715,19 @@ fn build_reg_app(state: RegState) -> Router {
         .route("/", get(reg_index))
         .route("/favicon-light.svg", get(reg_favicon_light))
         .route("/favicon-dark.svg", get(reg_favicon_dark))
+        .route(
+            "/fonts/instrument-serif-normal-latin.woff2",
+            get(reg_font_instrument_normal),
+        )
+        .route(
+            "/fonts/instrument-serif-italic-latin.woff2",
+            get(reg_font_instrument_italic),
+        )
+        .route("/fonts/inter-tight-latin.woff2", get(reg_font_inter_tight))
+        .route(
+            "/fonts/jetbrains-mono-latin.woff2",
+            get(reg_font_jetbrains_mono),
+        )
         .route("/challenge", get(reg_challenge))
         .route("/name", get(reg_name))
         .route("/policy", get(reg_policy))
@@ -755,6 +768,32 @@ async fn reg_favicon_dark() -> impl axum::response::IntoResponse {
         ],
         FAVICON_DARK,
     )
+}
+
+fn font_response(font: &'static [u8]) -> impl axum::response::IntoResponse {
+    (
+        [
+            (axum::http::header::CONTENT_TYPE, "font/woff2"),
+            (axum::http::header::CACHE_CONTROL, "public, max-age=86400"),
+        ],
+        font,
+    )
+}
+
+async fn reg_font_instrument_normal() -> impl axum::response::IntoResponse {
+    font_response(FONT_INSTRUMENT_NORMAL)
+}
+
+async fn reg_font_instrument_italic() -> impl axum::response::IntoResponse {
+    font_response(FONT_INSTRUMENT_ITALIC)
+}
+
+async fn reg_font_inter_tight() -> impl axum::response::IntoResponse {
+    font_response(FONT_INTER_TIGHT)
+}
+
+async fn reg_font_jetbrains_mono() -> impl axum::response::IntoResponse {
+    font_response(FONT_JETBRAINS_MONO)
 }
 
 async fn reg_challenge(
@@ -1160,6 +1199,16 @@ const REGISTER_HTML: &str = include_str!("passkey_register.html");
 const FAVICON_LIGHT: &str = include_str!("passkey_favicon_light.svg");
 
 const FAVICON_DARK: &str = include_str!("passkey_favicon_dark.svg");
+
+const FONT_INSTRUMENT_NORMAL: &[u8] =
+    include_bytes!("passkey_fonts/instrument-serif-normal-latin.woff2");
+
+const FONT_INSTRUMENT_ITALIC: &[u8] =
+    include_bytes!("passkey_fonts/instrument-serif-italic-latin.woff2");
+
+const FONT_INTER_TIGHT: &[u8] = include_bytes!("passkey_fonts/inter-tight-latin.woff2");
+
+const FONT_JETBRAINS_MONO: &[u8] = include_bytes!("passkey_fonts/jetbrains-mono-latin.woff2");
 
 const AUTH_HTML: &str = include_str!("passkey_auth.html");
 
