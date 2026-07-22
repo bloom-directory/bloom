@@ -6,17 +6,21 @@ two disagree, the contract wins — it is what runs in CI.
 
 ## TL;DR — the contract
 
-A release is published when, and only when, a `vX.Y.Z` tag is pushed to the
-repository. That tag push triggers the `Release` workflow
-(`.github/workflows/release.yml:23`), which then runs `prepare`, `test`,
-`build` (4 native binaries), and `publish`.
+A `vX.Y.Z` tag push starts the initial `Release` workflow run. An existing tag
+can also be retried with the workflow's manual `workflow_dispatch` trigger by
+entering the tag name in the Actions UI (`.github/workflows/release.yml:23-32`).
+Both triggers run the complete `prepare`, `test`, `build` (4 native binaries),
+and `publish` pipeline.
 
-The `prepare` job enforces exactly two hard gates
-(`.github/workflows/release.yml:80-92`):
+The `prepare` job enforces these hard gates
+(`.github/workflows/release.yml:65-92`):
 
-1. The tagged commit is reachable from `master` (i.e. it is an ancestor of
+1. The tag name strictly matches `vX.Y.Z`, with numeric SemVer components.
+2. The tag already exists in the repository and resolves to a commit. Manual
+   dispatch does not create a missing tag.
+3. The tagged commit is reachable from `master` (i.e. it is an ancestor of
    `origin/master`).
-2. The workspace `version` in `Cargo.toml` at that commit equals the tag
+4. The workspace `version` in `Cargo.toml` at that commit equals the tag
    (`X.Y.Z`).
 
 **Nothing else is checked by the publish workflow.** In particular, `release.yml`
@@ -56,10 +60,12 @@ git tag v0.1.1 <merge-sha>               # pin the exact SHA, do not tag a movin
 git push origin v0.1.1                   # this triggers the Release workflow
 ```
 
-Prefer tagging an explicit `<merge-sha>` over `origin/master`. If you tag
-`origin/master` and another commit lands between your `fetch` and your `git tag`,
-you will tag the wrong commit and `prepare` will reject it (the `Cargo.toml`
-version at that SHA will not match the tag).
+Prefer tagging an explicit `<merge-sha>` over `origin/master`. The
+remote-tracking ref does not move between `git fetch` and `git tag`, but a fetch
+can advance it past the release PR if other changes have already landed. Pinning
+the reviewed merge SHA avoids accidentally tagging a later commit. (`prepare`
+may not catch that mistake if the later commit retains the same workspace
+version.)
 
 ## Alternative: the Propose Release workflow
 
@@ -97,8 +103,11 @@ The publish workflow will not catch it.
 
 - **Tests run only after the tag is public.** The `test` job
   (`.github/workflows/release.yml:105`) runs on the tagged commit. If it fails,
-  a public `vX.Y.Z` tag already exists with no (or partial) release, and the tag
-  must be deleted/moved. To de-risk, let CI pass on the bump PR before tagging.
+  a public `vX.Y.Z` tag already exists with no (or partial) release. For a
+  transient failure, rerun the failed Actions jobs or manually dispatch the
+  `Release` workflow for the same tag. Do not delete or move a public release
+  tag. If the failure requires a code change, merge the fix and cut a new
+  version. To de-risk, let CI pass on the bump PR before tagging.
 - **`Cargo.toml` has two `version = "0.x.y"` lines.** Only the one under
   `[workspace.package]` is the release version (line 33). The other is a
   dependency pin and must not be changed.
