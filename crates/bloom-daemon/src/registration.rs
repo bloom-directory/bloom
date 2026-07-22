@@ -42,6 +42,12 @@ use zeroize::Zeroize;
 /// Initial session TTL (spec: "Use a five-minute initial TTL unless product
 /// requirements select another value").
 const SESSION_TTL_MS: u64 = 5 * 60 * 1000;
+/// Deadline for acknowledging recovery, counted from the moment `/complete`
+/// installs a winner — deliberately separate from (and later than)
+/// `SESSION_TTL_MS`, which bounds the WebAuthn ceremony itself. A completion
+/// that lands close to the original session deadline must not leave the
+/// human only seconds to read and save the recovery key.
+const RECOVERY_ACK_TTL_MS: u64 = 5 * 60 * 1000;
 /// Bound on attempts per session (spec: "Bound attempts per session (for
 /// example, five)").
 const MAX_ATTEMPTS: usize = 5;
@@ -86,6 +92,36 @@ struct SecretAttempt {
 struct WinnerState {
     prepared: PreparedPasskeyWallet,
     receipt: String,
+    /// Identifies the exact `/complete` request that won, so an identical
+    /// retry (e.g. after a dropped response) can be answered with the same
+    /// outcome instead of erroring — the recovery key/receipt only ever
+    /// existed in that one lost response.
+    attempt_id: String,
+    request_digest: [u8; 32],
+    recovery_ack_expires_at_ms: u64,
+}
+
+/// Digest identifying a `/complete` request's content, for detecting an
+/// exact client retry. Not a security boundary (the attempt/credential are
+/// already consumed by this point) — only used to decide whether a second
+/// `/complete` call is the same request replayed, not a genuinely new one.
+fn complete_body_digest(attempt_id: &str, body: &WalletRegistrationCompleteBody) -> [u8; 32] {
+    let (kind, credential, prf_output_b64) = match body {
+        WalletRegistrationCompleteBody::Registration {
+            credential,
+            prf_output_b64,
+        } => ("registration", credential, prf_output_b64),
+        WalletRegistrationCompleteBody::Fallback {
+            credential,
+            prf_output_b64,
+        } => ("fallback", credential, prf_output_b64),
+    };
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(attempt_id.as_bytes());
+    hasher.update(kind.as_bytes());
+    hasher.update(&serde_json::to_vec(credential).unwrap_or_default());
+    hasher.update(prf_output_b64.as_bytes());
+    *hasher.finalize().as_bytes()
 }
 
 struct SecretSession {
@@ -494,7 +530,22 @@ impl WalletRegistrationCoordinator for RegistrationCoordinator {
                 .ok_or_else(|| {
                     AuthApiError::NotFound("unknown or expired registration session".into())
                 })?;
-            if session.winner.is_some() {
+            if let Some(winner) = &session.winner {
+                // Idempotent replay: the recovery key/receipt only ever
+                // existed in the one HTTP response for the request that
+                // won. If the browser lost that response (network drop)
+                // and retries the exact same request, hand back the same
+                // outcome instead of erroring into a state the user cannot
+                // recover from.
+                if winner.attempt_id == attempt_id
+                    && winner.request_digest == complete_body_digest(attempt_id, &body)
+                {
+                    return Ok(WalletRegistrationCompleteOutcome {
+                        address: bloom_proto::checksum_address(&winner.prepared.address),
+                        recovery_key: winner.prepared.recovery_key.clone(),
+                        receipt: winner.receipt.clone().into(),
+                    });
+                }
                 return Err(AuthApiError::Denied(
                     "registration already completed".into(),
                 ));
@@ -561,6 +612,7 @@ impl WalletRegistrationCoordinator for RegistrationCoordinator {
             // this session now observes `used`/`winner` and loses.
             attempt.used = true;
             let policy_toml = attempt.policy_toml.clone();
+            let request_digest = complete_body_digest(attempt_id, &body);
 
             let temp_id = format!("{token}-{attempt_id}");
             let prepared = match prepare_passkey_wallet(
@@ -583,6 +635,9 @@ impl WalletRegistrationCoordinator for RegistrationCoordinator {
             session.winner = Some(WinnerState {
                 prepared,
                 receipt: receipt.clone(),
+                attempt_id: attempt_id.to_string(),
+                request_digest,
+                recovery_ack_expires_at_ms: now_ms + RECOVERY_ACK_TTL_MS,
             });
 
             (wallet, address, recovery_key, receipt)
@@ -617,20 +672,48 @@ impl WalletRegistrationCoordinator for RegistrationCoordinator {
             let session = state.sessions.get_mut(token).ok_or_else(|| {
                 AuthApiError::NotFound("unknown or expired registration session".into())
             })?;
-            let winner = session.winner.take().ok_or_else(|| {
+            // Peek rather than `take()` first: every rejection below must
+            // leave a valid pending winner exactly as it was, and checking
+            // before removing means there is nothing to "put back" on any
+            // failure path.
+            let winner = session.winner.as_ref().ok_or_else(|| {
                 AuthApiError::Denied("no completed registration attempt for this session".into())
             })?;
+            if now_ms > winner.recovery_ack_expires_at_ms {
+                // Same deadline `sweep_expired` uses for a winner-holding
+                // session — don't let this race sweep's 60s cadence: a
+                // request past the deadline is denied here regardless of
+                // whether the sweeper has already run.
+                return Err(AuthApiError::Denied(
+                    "recovery acknowledgment window has expired".into(),
+                ));
+            }
             if winner.receipt != receipt {
-                // Wrong receipt: put the winner back rather than destroying
-                // a valid pending registration over one bad ack attempt.
-                session.winner = Some(winner);
                 return Err(AuthApiError::Denied(
                     "invalid recovery acknowledgment receipt".into(),
                 ));
             }
+            let winner = session.winner.take().expect("checked Some above");
             let wallet = session.wallet.clone();
             let final_dir = self.keystore_root.join(&wallet);
-            let finalize_result = finalize_passkey_wallet(winner.prepared, &final_dir);
+            let finalize_result = match finalize_passkey_wallet(winner.prepared, &final_dir) {
+                Ok(finalized) => Ok(finalized),
+                Err((prepared, e)) => {
+                    // Preserve the prepared wallet on a failed rename
+                    // (disk full, cross-device, permissions) rather than
+                    // losing the only copy of the recovery key over a
+                    // transient error — a retried acknowledgment with the
+                    // same receipt can still succeed.
+                    session.winner = Some(WinnerState {
+                        prepared: *prepared,
+                        receipt: winner.receipt,
+                        attempt_id: winner.attempt_id,
+                        request_digest: winner.request_digest,
+                        recovery_ack_expires_at_ms: winner.recovery_ack_expires_at_ms,
+                    });
+                    Err(e)
+                }
+            };
             (wallet, finalize_result)
         };
 
@@ -663,15 +746,32 @@ impl WalletRegistrationCoordinator for RegistrationCoordinator {
     async fn cancel_by_token(&self, token: &str, now_ms: u64) -> Result<(), AuthApiError> {
         let wallet = {
             let mut state = self.state.lock();
-            state.sessions.remove(token).map(|session| {
-                state.by_wallet.remove(&session.wallet);
-                session.wallet
-            })
-        };
-        let Some(wallet) = wallet else {
-            return Err(AuthApiError::NotFound(
-                "unknown or already-terminal registration session".into(),
-            ));
+            // A session with an installed winner has already produced a
+            // real WebAuthn credential and a recovery key the browser may
+            // already hold — "cancelling" it here would silently destroy
+            // that prepared wallet (via `PreparedPasskeyWallet::Drop`)
+            // while `/complete` might still be finishing its own response,
+            // or after the browser has already shown the recovery key.
+            // There is nothing left to cancel at that point: the caller
+            // must acknowledge recovery or let it expire.
+            match state.sessions.get(token) {
+                None => {
+                    return Err(AuthApiError::NotFound(
+                        "unknown or already-terminal registration session".into(),
+                    ));
+                }
+                Some(session) if session.winner.is_some() => {
+                    return Err(AuthApiError::Denied(
+                        "registration already completed — acknowledge recovery or let it \
+                         expire; it can no longer be cancelled"
+                            .into(),
+                    ));
+                }
+                Some(_) => {}
+            }
+            let session = state.sessions.remove(token).expect("checked Some above");
+            state.by_wallet.remove(&session.wallet);
+            session.wallet
         };
         let mut status = self
             .store
@@ -692,7 +792,22 @@ impl WalletRegistrationCoordinator for RegistrationCoordinator {
             let expired_tokens: Vec<String> = state
                 .sessions
                 .iter()
-                .filter(|(_, s)| s.expires_at_ms <= now_ms)
+                .filter(|(_, s)| {
+                    // A session with an installed winner is judged against
+                    // its own, later recovery-ack deadline instead of the
+                    // original WebAuthn-ceremony deadline — otherwise a
+                    // completion that lands close to `expires_at_ms` could
+                    // be swept away (destroying the prepared wallet) before
+                    // the human has any real chance to acknowledge it. Must
+                    // stay consistent with `recovery_ack`'s own deadline
+                    // check.
+                    let deadline = s
+                        .winner
+                        .as_ref()
+                        .map(|w| w.recovery_ack_expires_at_ms)
+                        .unwrap_or(s.expires_at_ms);
+                    deadline <= now_ms
+                })
                 .map(|(t, _)| t.clone())
                 .collect();
             expired_tokens
@@ -911,6 +1026,87 @@ mod tests {
         // half-completed state, and the attempt can still be retried.
         let after = coordinator.status("alice").await.unwrap().unwrap();
         assert_eq!(after.state, WalletRegistrationState::AwaitingUser);
+    }
+
+    /// `cancel_by_token` must still work exactly as before when no winner
+    /// has been installed — the new "reject once completed" guard must not
+    /// affect the ordinary cancellation path.
+    #[tokio::test]
+    async fn cancel_by_token_still_works_before_any_completion() {
+        let (coordinator, _tmp) = coordinator();
+        coordinator.mark_listener_bound("http://localhost:18734");
+        let status = coordinator.stage("alice", 1_000).await.unwrap();
+        let token = status
+            .ceremony_url
+            .unwrap()
+            .rsplit('/')
+            .next()
+            .unwrap()
+            .to_string();
+
+        coordinator.cancel_by_token(&token, 2_000).await.unwrap();
+        let after = coordinator.status("alice").await.unwrap().unwrap();
+        assert_eq!(after.state, WalletRegistrationState::Cancelled);
+    }
+
+    /// `complete_body_digest` is the sole mechanism `complete()` uses to
+    /// decide whether a second call for an already-won session is the exact
+    /// same request replayed (answer with the cached outcome) or a
+    /// genuinely different one (deny). It must be sensitive to every field
+    /// that distinguishes one `/complete` request from another.
+    #[test]
+    fn complete_body_digest_is_stable_and_sensitive_to_every_field() {
+        let cred_a = serde_json::json!({"id": "a"});
+        let cred_b = serde_json::json!({"id": "b"});
+        let reg_a = WalletRegistrationCompleteBody::Registration {
+            credential: cred_a.clone(),
+            prf_output_b64: "AAAA".into(),
+        };
+        let reg_a_again = WalletRegistrationCompleteBody::Registration {
+            credential: cred_a.clone(),
+            prf_output_b64: "AAAA".into(),
+        };
+        assert_eq!(
+            complete_body_digest("att-1", &reg_a),
+            complete_body_digest("att-1", &reg_a_again),
+            "identical requests must digest identically"
+        );
+
+        let reg_b = WalletRegistrationCompleteBody::Registration {
+            credential: cred_b,
+            prf_output_b64: "AAAA".into(),
+        };
+        assert_ne!(
+            complete_body_digest("att-1", &reg_a),
+            complete_body_digest("att-1", &reg_b),
+            "different credential must change the digest"
+        );
+
+        let reg_diff_prf = WalletRegistrationCompleteBody::Registration {
+            credential: cred_a.clone(),
+            prf_output_b64: "BBBB".into(),
+        };
+        assert_ne!(
+            complete_body_digest("att-1", &reg_a),
+            complete_body_digest("att-1", &reg_diff_prf),
+            "different prf_output_b64 must change the digest"
+        );
+
+        assert_ne!(
+            complete_body_digest("att-1", &reg_a),
+            complete_body_digest("att-2", &reg_a),
+            "different attempt_id must change the digest"
+        );
+
+        let fallback_a = WalletRegistrationCompleteBody::Fallback {
+            credential: cred_a,
+            prf_output_b64: "AAAA".into(),
+        };
+        assert_ne!(
+            complete_body_digest("att-1", &reg_a),
+            complete_body_digest("att-1", &fallback_a),
+            "Registration vs Fallback with identical fields must still differ"
+        );
     }
 
     #[tokio::test]

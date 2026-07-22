@@ -1563,14 +1563,29 @@ pub struct FinalizedPasskeyWallet {
 }
 
 /// Atomically commit a prepared wallet to `final_dir` (`<root>/<name>`).
+///
+/// On a failed rename, `prepared` is handed back rather than dropped: its
+/// `Drop` unconditionally `remove_dir_all`s the temp directory, which is
+/// exactly right when the rename succeeded (the directory has already moved
+/// away) but would otherwise destroy the still-valid, not-yet-installed
+/// wallet — including the only copy of the recovery key — on nothing more
+/// than a transient rename failure (disk full, cross-device, permissions).
+/// Callers that have somewhere durable to put `prepared` back (a coordinator
+/// session awaiting recovery acknowledgment) should do so and let the
+/// caller retry finalization later.
 pub fn finalize_passkey_wallet(
     prepared: PreparedPasskeyWallet,
     final_dir: &Path,
-) -> Result<FinalizedPasskeyWallet, KeystoreError> {
-    std::fs::rename(&prepared.tmp_dir, final_dir).map_err(|source| KeystoreError::Io {
-        path: final_dir.to_path_buf(),
-        source,
-    })?;
+) -> Result<FinalizedPasskeyWallet, (Box<PreparedPasskeyWallet>, KeystoreError)> {
+    if let Err(source) = std::fs::rename(&prepared.tmp_dir, final_dir) {
+        return Err((
+            Box::new(prepared),
+            KeystoreError::Io {
+                path: final_dir.to_path_buf(),
+                source,
+            },
+        ));
+    }
     let out = FinalizedPasskeyWallet {
         address: prepared.address,
         pubkey_hex: prepared.pubkey_hex.clone(),
@@ -2339,6 +2354,76 @@ mod registration_primitive_tests {
         });
         let credential: RegisterPublicKeyCredential = serde_json::from_value(garbage).unwrap();
         assert!(finish_registration(&credential, &reg_state).is_err());
+    }
+}
+
+#[cfg(test)]
+mod finalize_tests {
+    use super::*;
+
+    fn make_prepared(tmp_dir: PathBuf) -> PreparedPasskeyWallet {
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        std::fs::write(tmp_dir.join("marker"), b"still here").unwrap();
+        PreparedPasskeyWallet {
+            tmp_dir,
+            address: Address::ZERO,
+            pubkey_hex: "deadbeef".into(),
+            policy: Policy::default(),
+            recovery_key: Zeroizing::new("recovery-key-plaintext".into()),
+        }
+    }
+
+    #[test]
+    fn finalize_moves_tmp_dir_to_final_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let prepared = make_prepared(tmp.path().join("staged"));
+        let final_dir = tmp.path().join("final");
+
+        // `FinalizedPasskeyWallet`/`PreparedPasskeyWallet` intentionally
+        // don't derive `Debug` (they carry key material), so match instead
+        // of `.unwrap()`/`.unwrap_err()`.
+        let finalized = match finalize_passkey_wallet(prepared, &final_dir) {
+            Ok(f) => f,
+            Err(_) => panic!("expected finalize to succeed"),
+        };
+
+        assert!(final_dir.join("marker").exists());
+        assert_eq!(finalized.pubkey_hex, "deadbeef");
+    }
+
+    /// The bug this guards: `finalize_passkey_wallet` used to take
+    /// `PreparedPasskeyWallet` by value and drop it internally on any error
+    /// path, and `Drop` unconditionally `remove_dir_all`s the temp dir —
+    /// destroying a still-valid, not-yet-installed wallet (including the
+    /// only copy of the recovery key) on nothing more than a transient
+    /// rename failure. It must now hand `prepared` back intact so a caller
+    /// can retry.
+    #[test]
+    fn finalize_hands_prepared_back_intact_on_rename_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let staged_dir = tmp.path().join("staged");
+        let prepared = make_prepared(staged_dir.clone());
+        // `final_dir`'s parent doesn't exist, so `std::fs::rename` fails.
+        let final_dir = tmp.path().join("no-such-parent").join("final");
+
+        let returned = match finalize_passkey_wallet(prepared, &final_dir) {
+            Ok(_) => panic!("expected finalize to fail: parent dir does not exist"),
+            Err((prepared, _e)) => prepared,
+        };
+
+        assert!(
+            staged_dir.join("marker").exists(),
+            "a failed rename must not have deleted the still-valid prepared wallet"
+        );
+        assert_eq!(returned.recovery_key.as_str(), "recovery-key-plaintext");
+
+        // The caller can still choose to discard it — dropping the
+        // returned value cleans up normally.
+        drop(returned);
+        assert!(
+            !staged_dir.exists(),
+            "dropping the returned PreparedPasskeyWallet should still clean up its temp dir"
+        );
     }
 }
 

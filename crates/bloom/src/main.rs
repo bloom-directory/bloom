@@ -2171,7 +2171,8 @@ async fn run(cli: Cli) -> Result<()> {
             if final_dir.exists() {
                 bail!("wallet '{name}' already exists");
             }
-            let finalized = bloom_keystore::finalize_passkey_wallet(prepared, &final_dir)?;
+            let finalized = bloom_keystore::finalize_passkey_wallet(prepared, &final_dir)
+                .map_err(|(_prepared, e)| e)?;
             d.keystore.cache_unlocked_signer(&name, signer);
             audit_wallet_created(&d.audit, &name, "passkey");
             let address = bloom_proto::checksum_address(&finalized.address);
