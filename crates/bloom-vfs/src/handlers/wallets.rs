@@ -3095,6 +3095,14 @@ mod tests {
     impl bloom_auth_api::WalletRegistrationCoordinator for FakeRegistrationCoordinator {
         fn mark_listener_bound(&self, _base_url: &str) {}
 
+        async fn reconcile_after_restart(
+            &self,
+            _reason: &str,
+            _now_ms: u64,
+        ) -> Result<u64, AuthApiError> {
+            Ok(0)
+        }
+
         async fn stage(
             &self,
             wallet: &str,

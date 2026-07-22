@@ -227,6 +227,18 @@ pub trait WalletRegistrationCoordinator: Send + Sync {
     /// succeeds. Before this is called, [`Self::stage`] fails closed.
     fn mark_listener_bound(&self, base_url: &str);
 
+    /// Restart reconciliation: mark every persisted, non-terminal
+    /// registration session `failed` with `reason`. Must be called only by
+    /// the process that just proved exclusive ownership of the shared
+    /// ceremony listener (i.e. immediately before [`Self::mark_listener_bound`],
+    /// after a successful bind) — a one-shot CLI command that merely
+    /// constructs a coordinator without ever binding the listener has no
+    /// basis for concluding any persisted session is actually dead, and
+    /// calling this unconditionally would let it stomp on state a live
+    /// `bloom serve` still owns in memory.
+    async fn reconcile_after_restart(&self, reason: &str, now_ms: u64)
+    -> Result<u64, AuthApiError>;
+
     // ── VFS-facing (wallet-keyed) ───────────────────────────────────────
 
     /// Create or idempotently return the one live registration session for

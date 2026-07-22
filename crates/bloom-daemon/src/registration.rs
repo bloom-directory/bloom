@@ -185,6 +185,16 @@ impl WalletRegistrationCoordinator for RegistrationCoordinator {
         *self.listener_base_url.write() = Some(base_url.to_string());
     }
 
+    async fn reconcile_after_restart(
+        &self,
+        reason: &str,
+        now_ms: u64,
+    ) -> Result<u64, AuthApiError> {
+        self.writer
+            .mark_unfinished_wallet_registrations_failed(reason, now_ms)
+            .await
+    }
+
     async fn stage(
         &self,
         wallet: &str,

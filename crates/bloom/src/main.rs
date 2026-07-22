@@ -2127,6 +2127,17 @@ async fn run(cli: Cli) -> Result<()> {
             // docs/plans/2026-07-21-async-vfs-passkey-registration.md). The
             // private key never leaves this process; it is held only in
             // memory for the duration of the ceremony below.
+            //
+            // Validate explicitly rather than relying on `info_unverified`'s
+            // `.is_ok()` as an existence proxy: `info_unverified` itself
+            // calls `validate_name` first, so an invalid name (`../x`, a
+            // path separator, empty, absolute) makes it return `Err` too —
+            // indistinguishable from "not found" under `.is_ok()`. That let
+            // invalid names flow into `temp_id`, `prepare_passkey_wallet`,
+            // and `root.join(&name)` below, which can escape the keystore
+            // root.
+            bloom_keystore::Keystore::validate_name(&name)
+                .map_err(|e| anyhow::anyhow!(e.to_string()))?;
             if d.keystore.info_unverified(&name).is_ok() {
                 bail!("wallet '{name}' already exists");
             }

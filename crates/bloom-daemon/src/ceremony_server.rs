@@ -111,7 +111,23 @@ pub async fn spawn(daemon: &Daemon) -> std::io::Result<CeremonyServer> {
     // the one loopback ceremony listener — `stage()` fails closed until
     // this is called, which is the fix for the historical port-18734
     // double-bind: no VFS/IPC registration path can reach a second bind.
+    //
+    // Restart reconciliation runs here, not in `Daemon::from_home_inner`:
+    // the successful bind above is the actual proof that no other process
+    // (a live `bloom serve`, or another command-scoped fallback ceremony)
+    // currently owns registration state, so any persisted non-terminal
+    // session really is orphaned. A one-shot CLI command that never reaches
+    // this point never reconciles anything.
     if let Some(coordinator) = daemon.auth_services.registration_coordinator() {
+        if let Err(e) = coordinator
+            .reconcile_after_restart(
+                "daemon restarted before this registration finished",
+                crate::registration::now_ms(),
+            )
+            .await
+        {
+            tracing::warn!(err = %e, "daemon.wallet_registration_restart_reconciliation_failed");
+        }
         coordinator.mark_listener_bound(&format!("http://localhost:{LOCAL_CEREMONY_PORT}"));
     }
     let shutdown_signal = shutdown.clone();

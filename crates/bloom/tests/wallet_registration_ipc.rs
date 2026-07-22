@@ -22,10 +22,13 @@
 //!
 //! This test binds the real, fixed `LOCAL_CEREMONY_PORT` (18734) — it must
 //! not run concurrently with another instance of itself or with a real
-//! `bloom serve` on the same machine.
+//! `bloom serve` on the same machine. Every test in this file that spawns a
+//! `bloom serve` subprocess acquires [`PORT_18734_LOCK`] first so they never
+//! race each other for the port under `cargo test`'s default parallelism.
 
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use assert_cmd::Command as AssertCommand;
@@ -33,6 +36,10 @@ use predicates::prelude::*;
 use tempfile::TempDir;
 
 const LOCAL_CEREMONY_PORT: u16 = 18734;
+
+/// Held for the duration of any test that binds the real, fixed
+/// `LOCAL_CEREMONY_PORT` via a spawned `bloom serve` subprocess.
+static PORT_18734_LOCK: Mutex<()> = Mutex::new(());
 
 fn fresh_home() -> TempDir {
     tempfile::tempdir().expect("create temp home")
@@ -102,6 +109,7 @@ fn bloom_cmd(home: &Path) -> AssertCommand {
 
 #[test]
 fn two_terminal_vfs_write_stages_without_port_conflict() {
+    let _port_guard = PORT_18734_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let home = fresh_home();
     let mut guard = spawn_serve(home.path());
     wait_for_socket(home.path());
@@ -171,6 +179,52 @@ fn in_process_write_without_daemon_fails_before_staging() {
         .args(["vfs", "cat", "/wallets/registrations/solo/status.json"])
         .assert()
         .failure();
+}
+
+/// `wallet list` builds its own in-process `Daemon` unconditionally (it
+/// never tries IPC — see `Cmd::Wallet(WalletCmd::List)`), which used to run
+/// restart reconciliation as a side effect of construction and would mark a
+/// live `bloom serve` registration `failed` purely because this second,
+/// unrelated process had no in-memory session to compare against. Restart
+/// reconciliation must instead run only in the process that actually binds
+/// the shared ceremony listener — i.e. `bloom serve` itself, once, at
+/// startup — so a concurrent read-only command must leave a live session
+/// completely untouched.
+#[test]
+fn read_only_command_does_not_fail_a_live_serve_registration() {
+    let _port_guard = PORT_18734_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = fresh_home();
+    let mut guard = spawn_serve(home.path());
+    wait_for_socket(home.path());
+    wait_for_ceremony_listener();
+
+    bloom_cmd(home.path())
+        .args(["vfs", "write", "--data", "test", "/wallets/new"])
+        .assert()
+        .success();
+
+    // A read-only command against the same home, while `bloom serve` is
+    // still alive and still owns the ceremony listener. This constructs a
+    // second, independent `Daemon` in-process.
+    bloom_cmd(home.path())
+        .args(["wallet", "list"])
+        .assert()
+        .success();
+
+    assert!(
+        guard.child_still_running(),
+        "bloom serve process exited during the read-only command"
+    );
+
+    // The live session must still be `awaiting_user`, not `failed`.
+    bloom_cmd(home.path())
+        .args(["vfs", "cat", "/wallets/registrations/test/status.json"])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("\"state\": \"awaiting_user\"")
+                .or(predicate::str::contains("\"state\":\"awaiting_user\"")),
+        );
 }
 
 trait ChildStillRunning {

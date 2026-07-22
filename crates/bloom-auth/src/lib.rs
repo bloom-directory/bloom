@@ -114,22 +114,6 @@ impl<S> StoreApprovalVerifier<S> {
             signature_verifier,
         }
     }
-
-    /// Synchronous restart-reconciliation helper for callers (daemon
-    /// startup) that run before an async runtime context is convenient to
-    /// use. Equivalent to the async
-    /// `AuthStoreWriter::mark_unfinished_wallet_registrations_failed`.
-    pub fn mark_unfinished_wallet_registrations_failed_sync(
-        &self,
-        reason: &str,
-        now_ms: u64,
-    ) -> Result<u64, AuthStoreError> {
-        let mut store = self
-            .store
-            .lock()
-            .map_err(|_| AuthStoreError::Denied("auth store mutex poisoned".into()))?;
-        store.mark_unfinished_wallet_registrations_failed(reason, now_ms)
-    }
 }
 
 #[async_trait]

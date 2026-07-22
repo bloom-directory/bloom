@@ -2002,10 +2002,16 @@ impl Daemon {
         // Wallet registration coordinator: always constructed (so every
         // VFS/IPC caller sees the same instance), but stays unarmed until
         // `ceremony_server::spawn` marks the shared loopback listener bound.
-        // Restart reconciliation runs here unconditionally — a harmless
-        // no-op if there is nothing unfinished, and correct regardless of
-        // whether this process ends up being `bloom serve` or a one-shot
-        // CLI command.
+        // Restart reconciliation deliberately does NOT run here: this
+        // constructor runs for every `Daemon`, including one-shot read-only
+        // CLI commands (`wallet list`, `status`, ...) invoked alongside a
+        // live `bloom serve`. Running reconciliation unconditionally would
+        // let such a command mark a still-live `bloom serve` registration
+        // session `failed` in the shared store purely because this second
+        // process has no in-memory session of its own to compare against.
+        // `ceremony_server::spawn` runs it instead, gated on this process
+        // having just proven exclusive listener ownership via a successful
+        // bind.
         let registration_coordinator: Arc<dyn bloom_auth_api::WalletRegistrationCoordinator> =
             Arc::new(registration::RegistrationCoordinator::new(
                 keystore.clone(),
@@ -2013,12 +2019,6 @@ impl Daemon {
                 auth_verifier.clone(),
                 home.keystore_dir(),
             ));
-        if let Err(e) = auth_verifier.mark_unfinished_wallet_registrations_failed_sync(
-            "daemon restarted before this registration finished",
-            registration::now_ms(),
-        ) {
-            warn!(err = %e, "daemon.wallet_registration_restart_reconciliation_failed");
-        }
 
         let auth_services = auth_services
             .with_grant_store(grant_store)
