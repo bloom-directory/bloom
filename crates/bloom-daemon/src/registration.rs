@@ -786,10 +786,10 @@ impl WalletRegistrationCoordinator for RegistrationCoordinator {
         Ok(())
     }
 
-    async fn sweep_expired(&self, now_ms: u64) -> Result<(), AuthApiError> {
-        let expired: Vec<(String, String)> = {
-            let mut state = self.state.lock();
-            let expired_tokens: Vec<String> = state
+    async fn sweep_expired(&self, now_ms: u64) -> Result<usize, AuthApiError> {
+        let expired_tokens: Vec<String> = {
+            let state = self.state.lock();
+            state
                 .sessions
                 .iter()
                 .filter(|(_, s)| {
@@ -809,30 +809,93 @@ impl WalletRegistrationCoordinator for RegistrationCoordinator {
                     deadline <= now_ms
                 })
                 .map(|(t, _)| t.clone())
-                .collect();
-            expired_tokens
-                .into_iter()
-                .filter_map(|token| {
-                    state.sessions.remove(&token).map(|session| {
-                        state.by_wallet.remove(&session.wallet);
-                        (token, session.wallet)
-                    })
-                })
                 .collect()
         };
-        for (token, wallet) in expired {
-            if let Ok(Some(mut status)) = self.store.wallet_registration_status(&wallet).await
-                && !status.state.is_terminal()
-            {
-                status.state = WalletRegistrationState::Expired;
-                status.ceremony_url = None;
-                let _ = self
-                    .writer
-                    .upsert_wallet_registration_status(&token, &status, now_ms)
-                    .await;
+
+        // The in-memory session is deliberately NOT removed until its
+        // persisted status has actually been written `Expired` — a session
+        // removed first and then lost to a transient store error used to
+        // leave a stale `awaiting_user`/`awaiting_recovery_ack` row with a
+        // dead `ceremony_url` behind forever (nothing left in memory to
+        // retry it with, and the persisted row can also block the unique
+        // live-registration index for that wallet). Leaving it in memory on
+        // failure means the next sweep tick (it is still past its deadline)
+        // picks the same token back up and retries.
+        let mut swept = 0usize;
+        let mut failed = 0usize;
+        for token in expired_tokens {
+            let wallet = match self.state.lock().sessions.get(&token) {
+                Some(s) => s.wallet.clone(),
+                None => continue, // already reconciled concurrently (ack/cancel/a prior sweep tick)
+            };
+
+            let status = match self.store.wallet_registration_status(&wallet).await {
+                Ok(Some(status)) => status,
+                Ok(None) => {
+                    tracing::warn!(
+                        wallet = %wallet,
+                        "wallet_registration.sweep_status_missing"
+                    );
+                    Self::remove_session_if_current(&mut self.state.lock(), &token, &wallet);
+                    continue;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        wallet = %wallet,
+                        err = %e,
+                        "wallet_registration.sweep_status_read_failed"
+                    );
+                    failed += 1;
+                    continue;
+                }
+            };
+            if status.state.is_terminal() {
+                // Already terminal for some other reason (e.g. concurrently
+                // cancelled/acknowledged) — just drop the dead session.
+                Self::remove_session_if_current(&mut self.state.lock(), &token, &wallet);
+                continue;
             }
+
+            let mut status = status;
+            status.state = WalletRegistrationState::Expired;
+            status.ceremony_url = None;
+            if let Err(e) = self
+                .writer
+                .upsert_wallet_registration_status(&token, &status, now_ms)
+                .await
+            {
+                tracing::warn!(
+                    wallet = %wallet,
+                    err = %e,
+                    "wallet_registration.sweep_status_write_failed"
+                );
+                failed += 1;
+                continue;
+            }
+            Self::remove_session_if_current(&mut self.state.lock(), &token, &wallet);
+            swept += 1;
         }
-        Ok(())
+
+        if failed > 0 {
+            return Err(AuthApiError::Store(format!(
+                "wallet registration sweep: {failed} session(s) failed to persist as expired \
+                 and will be retried next sweep"
+            )));
+        }
+        Ok(swept)
+    }
+}
+
+impl RegistrationCoordinator {
+    /// Remove `token`'s session, and `wallet`'s `by_wallet` mapping only if
+    /// it still points at `token` — a concurrent fresh `stage()` for the
+    /// same wallet name may already have replaced it with a newer live
+    /// token, which must not be clobbered here.
+    fn remove_session_if_current(state: &mut CoordinatorState, token: &str, wallet: &str) {
+        state.sessions.remove(token);
+        if state.by_wallet.get(wallet).map(String::as_str) == Some(token) {
+            state.by_wallet.remove(wallet);
+        }
     }
 }
 
@@ -1152,10 +1215,11 @@ mod tests {
         coordinator.mark_listener_bound("http://localhost:18734");
         coordinator.stage("alice", 1_000).await.unwrap();
 
-        coordinator
+        let swept = coordinator
             .sweep_expired(1_000 + SESSION_TTL_MS + 1)
             .await
             .unwrap();
+        assert_eq!(swept, 1, "exactly the one stale session must be counted");
         let status = coordinator.status("alice").await.unwrap().unwrap();
         assert_eq!(status.state, WalletRegistrationState::Expired);
         assert!(status.ceremony_url.is_none());
@@ -1166,6 +1230,13 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(fresh.state, WalletRegistrationState::AwaitingUser);
+
+        // Nothing left to sweep — a repeat call is a harmless no-op.
+        let swept_again = coordinator
+            .sweep_expired(1_000 + SESSION_TTL_MS + 2)
+            .await
+            .unwrap();
+        assert_eq!(swept_again, 0);
     }
 
     #[test]

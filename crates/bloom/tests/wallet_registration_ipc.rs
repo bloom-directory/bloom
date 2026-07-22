@@ -159,6 +159,48 @@ fn two_terminal_vfs_write_stages_without_port_conflict() {
         resp.is_ok(),
         "ceremony_url's listener is not reachable on the pre-bound port"
     );
+
+    // Every response on this token-keyed route group — the page and all of
+    // its JSON endpoints, including `/complete`'s one-time response
+    // carrying the plaintext recovery key — must be marked uncacheable.
+    // `page()` used to set this manually and the JSON endpoints never did
+    // at all; it's now applied by a single layer over the whole group.
+    let token_path = url
+        .trim()
+        .split_once(&format!(":{LOCAL_CEREMONY_PORT}"))
+        .map(|(_, path)| path)
+        .expect("ceremony_url must contain the ceremony port");
+    let page_headers = http_get_response_head(token_path);
+    assert!(
+        page_headers
+            .to_ascii_lowercase()
+            .contains("cache-control: no-store"),
+        "GET {token_path} missing no-store Cache-Control:\n{page_headers}"
+    );
+    let session_json_headers = http_get_response_head(&format!("{token_path}/session.json"));
+    assert!(
+        session_json_headers
+            .to_ascii_lowercase()
+            .contains("cache-control: no-store"),
+        "GET {token_path}/session.json missing no-store Cache-Control:\n{session_json_headers}"
+    );
+}
+
+/// Issues a raw `GET` on the pre-bound ceremony listener and returns the
+/// response's status line + headers (everything up to the blank line
+/// separating headers from body).
+fn http_get_response_head(path: &str) -> String {
+    use std::io::{Read, Write};
+    let mut stream = std::net::TcpStream::connect(("127.0.0.1", LOCAL_CEREMONY_PORT))
+        .expect("connect to ceremony listener");
+    write!(
+        stream,
+        "GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
+    )
+    .expect("write request");
+    let mut buf = String::new();
+    stream.read_to_string(&mut buf).expect("read response");
+    buf.split("\r\n\r\n").next().unwrap_or(&buf).to_string()
 }
 
 /// In-process `bloom vfs write` (no daemon reachable) must fail closed

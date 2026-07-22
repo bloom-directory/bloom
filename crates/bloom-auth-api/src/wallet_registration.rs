@@ -301,8 +301,14 @@ pub trait WalletRegistrationCoordinator: Send + Sync {
 
     // ── Maintenance ──────────────────────────────────────────────────────
 
-    /// Expire timed-out sessions/attempts and remove their secret/temp state.
-    async fn sweep_expired(&self, now_ms: u64) -> Result<(), AuthApiError>;
+    /// Expire timed-out sessions/attempts and remove their secret/temp
+    /// state. Returns the number of sessions successfully reconciled to a
+    /// persisted `Expired` status. A session whose persisted-status write
+    /// fails is deliberately left in memory (not counted, and not removed)
+    /// so the next sweep retries it — on retry-exhaustion-adjacent failure
+    /// this returns `Err` so callers can surface it, mirroring
+    /// `bloom_tx::Outbox::sweep_expired`'s `Ok(usize)`/`Err` shape.
+    async fn sweep_expired(&self, now_ms: u64) -> Result<usize, AuthApiError>;
 }
 
 #[cfg(test)]

@@ -3210,8 +3210,8 @@ mod tests {
             Err(AuthApiError::Store("not used in VFS tests".into()))
         }
 
-        async fn sweep_expired(&self, _now_ms: u64) -> Result<(), AuthApiError> {
-            Ok(())
+        async fn sweep_expired(&self, _now_ms: u64) -> Result<usize, AuthApiError> {
+            Ok(0)
         }
     }
 

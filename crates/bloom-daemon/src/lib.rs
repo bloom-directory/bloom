@@ -2871,10 +2871,12 @@ impl Daemon {
                             Ok(n) => info!(swept = n, "outbox.sweep_expired"),
                             Err(e) => warn!(error = %e, "outbox.sweep_expired_failed"),
                         }
-                        if let Some(coordinator) = &registration_coordinator
-                            && let Err(e) = coordinator.sweep_expired(now_ms as u64).await
-                        {
-                            warn!(error = %e, "wallet_registration.sweep_expired_failed");
+                        if let Some(coordinator) = &registration_coordinator {
+                            match coordinator.sweep_expired(now_ms as u64).await {
+                                Ok(0) => tracing::trace!("wallet_registration.sweep_expired.empty"),
+                                Ok(n) => info!(swept = n, "wallet_registration.sweep_expired"),
+                                Err(e) => warn!(error = %e, "wallet_registration.sweep_expired_failed"),
+                            }
                         }
                     }
                     _ = rx.changed() => {

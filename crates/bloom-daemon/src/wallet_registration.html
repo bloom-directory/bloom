@@ -95,7 +95,7 @@
     button:disabled{opacity:.48;cursor:wait;box-shadow:none}
     .hint{display:flex;align-items:flex-start;justify-content:center;gap:7px;margin:12px 8px 0;color:var(--graphite);font-size:11px;line-height:1.45;text-align:center}
     .hint svg{width:14px;height:14px;flex:0 0 auto;margin-top:1px;color:var(--leaf)}
-    #status{display:none;margin:14px 0 0;padding:13px 15px;border:1px solid transparent;border-radius:8px;font-size:12px;line-height:1.5;overflow-wrap:anywhere}
+    #status,#ack-error{display:none;margin:14px 0 0;padding:13px 15px;border:1px solid transparent;border-radius:8px;font-size:12px;line-height:1.5;overflow-wrap:anywhere}
     .pending{display:block!important;border-color:var(--rule)!important;background:var(--paper);color:var(--ink-2)}
     .ok{display:block!important;border-color:rgba(53,95,71,.25)!important;background:var(--success-bg);color:var(--success)}
     .err{display:block!important;border-color:rgba(122,34,48,.2)!important;background:var(--error-bg);color:var(--error)}
@@ -271,6 +271,7 @@
           <label for="ack-checkbox">I have saved this recovery key somewhere safe.</label>
         </div>
         <button id="ack-btn" type="button" disabled>Continue</button>
+        <div id="ack-error"></div>
       </div>
 
       <div class="panel state-panel" id="panel-done">
@@ -597,6 +598,9 @@ document.getElementById('ack-checkbox').addEventListener('change',function(){
 document.getElementById('ack-btn').addEventListener('click',function(){
   var btn=this;
   btn.disabled=true;
+  var ackError=document.getElementById('ack-error');
+  ackError.className='';
+  ackError.textContent='';
   var attemptId='ack'; // path segment is unused server-side; token+receipt authorize this call
   fetch(BASE+'/attempts/'+attemptId+'/recovery-ack',{
     method:'POST',headers:{'Content-Type':'application/json'},
@@ -605,8 +609,14 @@ document.getElementById('ack-btn').addEventListener('click',function(){
     PENDING_RECEIPT=null;
     showPanel('panel-done');
   }).catch(function(e){
+    // A transient failure here (network blip, a momentary server error)
+    // must not strand the user: PENDING_RECEIPT is still valid, so stay on
+    // this panel, show an inline error, and let them retry — switching to
+    // the dead-end terminal panel would make the receipt unreachable
+    // (a reload loses it by design) with no way to finish.
     btn.disabled=false;
-    showTerminal('Could not finish registration',e.message||String(e));
+    ackError.className='err';
+    ackError.textContent='Could not finish registration: '+(e.message||String(e));
   });
 });
 

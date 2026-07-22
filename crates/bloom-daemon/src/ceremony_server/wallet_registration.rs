@@ -32,7 +32,14 @@ const FONT_JETBRAINS_MONO: &[u8] =
     include_bytes!("../wallet_registration_assets/fonts/jetbrains-mono-latin.woff2");
 
 pub(super) fn router() -> Router<CeremonyState> {
-    Router::new()
+    // Every route keyed by the URL token (the page itself and all of its
+    // JSON endpoints, including `/complete`'s one-time response carrying
+    // the plaintext recovery key) must never be cacheable by an
+    // intermediary or the browser's disk cache — apply the same
+    // `no-store` policy uniformly via a layer instead of repeating a
+    // header on each handler, so a new token route can't accidentally be
+    // added without it.
+    let token_routes = Router::new()
         .route("/wallet-registration/{token}", get(page))
         .route(
             "/wallet-registration/{token}/session.json",
@@ -55,6 +62,9 @@ pub(super) fn router() -> Router<CeremonyState> {
             post(recovery_ack),
         )
         .route("/wallet-registration/{token}/cancel", post(cancel))
+        .layer(axum::middleware::from_fn(no_store_cache_control));
+
+    let asset_routes = Router::new()
         .route(
             "/wallet-registration-assets/favicon-light.svg",
             get(favicon_light),
@@ -78,7 +88,21 @@ pub(super) fn router() -> Router<CeremonyState> {
         .route(
             "/wallet-registration-assets/fonts/jetbrains-mono-latin.woff2",
             get(font_jetbrains_mono),
-        )
+        );
+
+    token_routes.merge(asset_routes)
+}
+
+async fn no_store_cache_control(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let mut response = next.run(req).await;
+    response.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store, no-cache, must-revalidate"),
+    );
+    response
 }
 
 /// Never include `AuthApiError`'s message verbatim for variants that might
@@ -118,14 +142,9 @@ async fn page(State(state): State<CeremonyState>, Path(token): Path<String>) -> 
         Err(status) => return status.into_response(),
     };
     match coordinator.session_view(&token, now_ms()).await {
-        Ok(_) => (
-            [(
-                axum::http::header::CACHE_CONTROL,
-                "no-store, no-cache, must-revalidate",
-            )],
-            Html(WALLET_REGISTRATION_HTML),
-        )
-            .into_response(),
+        // Cache-Control is applied uniformly by `no_store_cache_control`'s
+        // layer over this whole route group, not set here.
+        Ok(_) => Html(WALLET_REGISTRATION_HTML).into_response(),
         Err(e) => err_response(e),
     }
 }
