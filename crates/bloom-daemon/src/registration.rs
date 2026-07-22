@@ -198,9 +198,9 @@ impl RegistrationCoordinator {
             let session = state.sessions.get(&token).ok_or_else(|| {
                 AuthApiError::NotFound("unknown or already-terminal registration session".into())
             })?;
-            if session.completion.is_some() {
+            if session.completion.is_some() || session.completing {
                 return Err(AuthApiError::Denied(
-                    "registration already completed; acknowledge recovery or let it expire".into(),
+                    "registration is completing or completed; it cannot be cancelled".into(),
                 ));
             }
             (token, session.wallet.clone())
@@ -1211,6 +1211,26 @@ mod tests {
         coordinator.cancel_by_token(&token, 2_000).await.unwrap();
         let after = coordinator.status("alice").await.unwrap().unwrap();
         assert_eq!(after.state, WalletRegistrationState::Cancelled);
+    }
+
+    #[tokio::test]
+    async fn cancel_rejects_while_completion_is_reserved() {
+        let (coordinator, _tmp) = coordinator();
+        coordinator.mark_listener_bound("http://localhost:18734");
+        let token = stage_token(&coordinator, "alice", 1_000).await;
+        coordinator
+            .state
+            .lock()
+            .sessions
+            .get_mut(&token)
+            .unwrap()
+            .completing = true;
+        assert!(coordinator.cancel("alice", 1_001).await.is_err());
+        assert!(coordinator.cancel_by_token(&token, 1_001).await.is_err());
+        assert_eq!(
+            coordinator.status("alice").await.unwrap().unwrap().state,
+            WalletRegistrationState::AwaitingUser
+        );
     }
 
     #[test]

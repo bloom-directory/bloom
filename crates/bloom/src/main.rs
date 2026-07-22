@@ -2032,13 +2032,10 @@ async fn run(cli: Cli) -> Result<()> {
                     .context("completed registration status missing address")?
             };
 
-            audit_wallet_created(
-                &Daemon::from_home(home.clone())
-                    .context("build daemon")?
-                    .audit,
-                &name,
-                "passkey",
-            );
+            match bloom_proto::AuditLog::open(home.audit_path()) {
+                Ok(audit) => audit_wallet_created(&audit, &name, "passkey"),
+                Err(error) => tracing::warn!(%error, "wallet.created audit unavailable"),
+            }
             println!("created wallet '{name}': {address}");
             println!(
                 "the recovery key was shown once in the browser during the ceremony; it is \
