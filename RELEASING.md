@@ -23,8 +23,8 @@ The `prepare` job enforces these hard gates
 4. The workspace `version` in `Cargo.toml` at that commit equals the tag
    (`X.Y.Z`).
 
-**Nothing else is checked by the publish workflow.** In particular, `release.yml`
-does **not** verify that:
+**No other release-eligibility policy is checked by the workflow.** In
+particular, `release.yml` does **not** verify that:
 
 - the bump arrived via a pull request,
 - the new version is greater than the previous one (monotonicity),
@@ -38,6 +38,12 @@ Direct pushes to `master` are not permitted.
 
 The version bump must land on `master` via a merged PR, then the merge commit is
 tagged.
+
+The repository's `v*` tag rules must allow new tag creation while preventing
+updates, deletion, and non-fast-forward changes. This permits each release tag
+to be created once and keeps it immutable afterward. If **Restrict creations**
+is enabled for `v*`, a repository administrator must disable it before the tag
+can be pushed.
 
 ```sh
 # 1. Branch off latest master and bump the workspace version.
@@ -73,10 +79,14 @@ version.)
 Actions UI (workflow_dispatch) with the next version, and it opens the bump PR
 for you. Two caveats:
 
-- It requires the `RELEASE_PR_TOKEN` repository secret (a GitHub App or
-  fine-grained PAT). PRs opened with the default `GITHUB_TOKEN` do not run CI on
-  themselves, so a separate token is used; without it the workflow hard-fails
-  (`.github/workflows/propose-release.yml:42-46`).
+- It requires the `RELEASE_PR_TOKEN` repository secret containing a
+  fine-grained PAT with **Contents: read/write** and **Pull requests:
+  read/write** access to this repository. PRs opened with the default
+  `GITHUB_TOKEN` receive approval-required CI runs; the separate token lets CI
+  run normally. Without it the workflow hard-fails
+  (`.github/workflows/propose-release.yml:43-47`). A GitHub App requires a
+  workflow change to mint a short-lived installation token rather than storing
+  an installation token directly as this secret.
 - Unlike the publish workflow, the **propose** workflow does enforce two extra
   rules:
   - the proposed version must be strictly greater than the current one
@@ -108,9 +118,10 @@ The publish workflow will not catch it.
   `Release` workflow for the same tag. Do not delete or move a public release
   tag. If the failure requires a code change, merge the fix and cut a new
   version. To de-risk, let CI pass on the bump PR before tagging.
-- **`Cargo.toml` has two `version = "0.x.y"` lines.** Only the one under
-  `[workspace.package]` is the release version (line 33). The other is a
-  dependency pin and must not be changed.
+- **The release version has one source of truth.** Edit only the `version` under
+  `[workspace.package]` in `Cargo.toml` (line 33). Dependency version
+  constraints elsewhere in the file are unrelated to the bloom release
+  version.
 - **Versioning scheme.** This project follows semver. While `0.x`, a bump in the
   second component (`0.1.0` → `0.2.0`) is a minor/breaking-ish release; a bump
   in the third (`0.1.0` → `0.1.1`) is a patch. The propose workflow enforces

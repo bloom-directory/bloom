@@ -3,10 +3,11 @@ name: Propose Release
 # This workflow prepares a reviewed version-bump PR. It never writes to the
 # default branch, creates a stable tag, or publishes a GitHub release.
 #
-# RELEASE_PR_TOKEN must be a repository secret backed by a GitHub App token or
-# fine-grained token with Contents: read/write and Pull requests: read/write.
-# A token other than GITHUB_TOKEN is required so the generated PR receives the
-# normal pull_request CI checks.
+# RELEASE_PR_TOKEN must be a repository secret containing a fine-grained PAT
+# with Contents: read/write and Pull requests: read/write. A separate token lets
+# the generated PR receive normal pull_request CI without manual approval.
+# Using a GitHub App instead requires minting its short-lived installation token
+# in this workflow rather than storing an installation token as this secret.
 
 on:
   workflow_dispatch:
