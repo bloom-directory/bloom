@@ -37,6 +37,7 @@ use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::{Shell, generate};
 use tracing::{debug, info, trace};
 use tracing_subscriber::EnvFilter;
+use zeroize::{Zeroize as _, Zeroizing};
 
 #[cfg(target_os = "linux")]
 const DEFAULT_MOUNT_PATH: &str = "/bloom";
@@ -2104,10 +2105,13 @@ async fn run(cli: Cli) -> Result<()> {
             if d.keystore.info_unverified(&name).is_ok() {
                 bail!("wallet '{name}' already exists");
             }
+            let private_key = Zeroizing::new(private_key);
             let key_bytes = bloom_keystore::decode_priv_hex(&private_key)
                 .map_err(|e| anyhow::anyhow!("private key: {e}"))?;
-            let signer = alloy::signers::local::PrivateKeySigner::from_bytes(&key_bytes.into())
+            let signer = alloy::signers::local::PrivateKeySigner::from_bytes(&(*key_bytes).into())
                 .map_err(|e| anyhow::anyhow!("private key: {e}"))?;
+            drop(key_bytes);
+            drop(private_key);
             let policy_toml =
                 bloom_keystore::default_passkey_policy_toml().context("default policy")?;
             let mut prf_salt = [0u8; 32];
@@ -2136,6 +2140,9 @@ async fn run(cli: Cli) -> Result<()> {
             }
             let finalized = bloom_keystore::finalize_passkey_wallet(prepared, &final_dir)
                 .map_err(|(_prepared, e)| e)?;
+            let mut recovery_bytes = signer.to_bytes();
+            let recovery_key = Zeroizing::new(hex::encode(&recovery_bytes[..]));
+            recovery_bytes.zeroize();
             d.keystore.cache_unlocked_signer(&name, signer);
             audit_wallet_created(&d.audit, &name, "passkey");
             let address = bloom_proto::checksum_address(&finalized.address);
@@ -2147,7 +2154,7 @@ async fn run(cli: Cli) -> Result<()> {
                     d.home.config_path().display()
                 );
             }
-            acknowledge_recovery_key(&name, &hex::encode(key_bytes));
+            acknowledge_recovery_key(&name, &recovery_key);
             Ok(())
         }
         Cmd::Wallet(WalletCmd::List) => {

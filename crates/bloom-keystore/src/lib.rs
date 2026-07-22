@@ -727,7 +727,7 @@ impl Keystore {
     ) -> Result<WalletInfo, KeystoreError> {
         let bytes = decode_priv_hex(private_key_hex)
             .map_err(|e| KeystoreError::Malformed(format!("private key: {e}")))?;
-        let signer = PrivateKeySigner::from_bytes(&bytes.into())
+        let signer = PrivateKeySigner::from_bytes(&(*bytes).into())
             .map_err(|e| KeystoreError::Signer(e.to_string()))?;
         self.import_local(name, &signer, passphrase)
     }
@@ -1022,16 +1022,13 @@ fn write_atomic(path: &Path, body: &[u8]) -> Result<(), KeystoreError> {
     Ok(())
 }
 
-/// Decode a `0x`-prefixed or bare hex-encoded 32-byte private key.
-pub fn decode_priv_hex(s: &str) -> Result<[u8; 32], String> {
+/// Decode a `0x`-prefixed or bare hex-encoded 32-byte private key into a
+/// buffer that zeroizes on drop.
+pub fn decode_priv_hex(s: &str) -> Result<Zeroizing<[u8; 32]>, String> {
     let s = s.trim();
     let s = s.strip_prefix("0x").unwrap_or(s);
-    let v = hex::decode(s).map_err(|e| e.to_string())?;
-    if v.len() != 32 {
-        return Err(format!("expected 32 bytes, got {}", v.len()));
-    }
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&v);
+    let mut out = Zeroizing::new([0u8; 32]);
+    hex::decode_to_slice(s, &mut *out).map_err(|e| e.to_string())?;
     Ok(out)
 }
 
