@@ -90,6 +90,8 @@ pub enum KeystoreError {
     Locked(String),
     #[error("invalid wallet name '{0}'")]
     InvalidName(String),
+    #[error("invalid temporary wallet identifier '{0}'")]
+    InvalidTempId(String),
     #[error("alloy signer error: {0}")]
     Signer(String),
     #[error("policy parse error: {0}")]

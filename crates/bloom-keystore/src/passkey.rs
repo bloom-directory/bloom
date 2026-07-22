@@ -1470,6 +1470,17 @@ impl Drop for PreparedPasskeyWallet {
     }
 }
 
+fn registration_temp_dir(root: &Path, temp_id: &str) -> Result<PathBuf, KeystoreError> {
+    if temp_id.is_empty()
+        || !temp_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+    {
+        return Err(KeystoreError::InvalidTempId(temp_id.into()));
+    }
+    Ok(root.join(format!(".bloom-tmp-registration-{temp_id}")))
+}
+
 /// Encrypt `signer` under a PRF-derived wrap key and write a passkey
 /// wallet's files into `<root>/.bloom-tmp-registration-<temp_id>`, without
 /// making it visible at its final wallet path (`<root>/<name>`).
@@ -1488,7 +1499,9 @@ pub fn prepare_passkey_wallet(
     mut prf_output: [u8; 32],
     policy_toml: &str,
 ) -> Result<PreparedPasskeyWallet, KeystoreError> {
-    let tmp_dir = root.join(format!(".bloom-tmp-registration-{temp_id}"));
+    let tmp_dir = registration_temp_dir(root, temp_id).inspect_err(|_| {
+        prf_output.zeroize();
+    })?;
     let _ = std::fs::remove_dir_all(&tmp_dir); // clean up any stale temp dir
     std::fs::create_dir_all(&tmp_dir).map_err(|source| KeystoreError::Io {
         path: tmp_dir.clone(),
@@ -2258,6 +2271,24 @@ impl super::Keystore {
 #[cfg(test)]
 mod registration_primitive_tests {
     use super::*;
+
+    #[test]
+    fn registration_temp_id_rejects_traversal_before_cleanup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("keystore");
+        let victim = tmp.path().join("victim");
+        std::fs::create_dir_all(&victim).unwrap();
+        std::fs::write(victim.join("sentinel"), b"keep").unwrap();
+
+        for temp_id in ["", "../../../victim", "nested/id", r"nested\id"] {
+            assert!(matches!(
+                registration_temp_dir(&root, temp_id),
+                Err(KeystoreError::InvalidTempId(_))
+            ));
+        }
+        assert!(registration_temp_dir(&root, "token_attempt-123").is_ok());
+        assert!(victim.join("sentinel").exists());
+    }
 
     #[test]
     fn start_registration_challenge_binds_requested_challenge_and_prf() {

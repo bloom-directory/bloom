@@ -213,7 +213,7 @@ mod tests {
                 "{name} must document wallets/registrations/<name>/status.json"
             );
             assert!(
-                !s.contains("plain name") || !s.contains("creates a local wallet"),
+                !(s.contains("plain name") && s.contains("creates a local wallet")),
                 "{name} must not describe a plain /wallets/new write as creating a local wallet"
             );
         }
