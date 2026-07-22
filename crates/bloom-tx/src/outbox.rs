@@ -1007,7 +1007,9 @@ impl Outbox {
     }
 
     /// Sum the structured valuation of every staged tx for `wallet` whose
-    /// `created_ms >= since_ms`, across all chains and all states.
+    /// `created_ms >= since_ms`, across all chains and the Pending and Sent
+    /// states. Failed outbox entries and terminal unsuccessful transaction
+    /// statuses are excluded.
     ///
     /// Used by the policy engine to enforce `caps.per_day_usd`. We
     /// include pending entries (not just sent) on purpose: a pending
@@ -1036,10 +1038,7 @@ impl Outbox {
             if !c.file_type()?.is_dir() {
                 continue;
             }
-            for state in [OutboxState::Pending, OutboxState::Sent, OutboxState::Failed] {
-                if state == OutboxState::Failed {
-                    continue;
-                }
+            for state in [OutboxState::Pending, OutboxState::Sent] {
                 let state_dir = c.path().join(state.dirname());
                 if !state_dir.exists() {
                     continue;
