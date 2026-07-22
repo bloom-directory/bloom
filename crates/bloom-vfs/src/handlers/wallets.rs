@@ -2073,17 +2073,24 @@ impl WalletsHandler {
         }
         let wallet = &rest[0];
         let status = self.registration_status(wallet).await?;
+        let created_at_ms = status.created_at_ms as u128;
         if rest.len() == 1 {
-            return Ok(Entry::dir(wallet));
+            return Ok(Entry::dir(wallet).with_modified_ms(created_at_ms));
         }
-        match rest[1].as_str() {
-            "status.json" if rest.len() == 2 => Ok(Entry::file("status.json")),
+        let entry = match rest[1].as_str() {
+            "status.json" if rest.len() == 2 => Entry::file("status.json"),
             "ceremony_url" if rest.len() == 2 && status.ceremony_url.is_some() => {
-                Ok(Entry::file("ceremony_url"))
+                Entry::file("ceremony_url")
             }
-            "cancel" if rest.len() == 2 => Ok(Entry::writable_file("cancel")),
-            _ => Err(HandlerError::not_found(rest.join("/"))),
-        }
+            "cancel"
+                if rest.len() == 2
+                    && status.state == bloom_auth_api::WalletRegistrationState::AwaitingUser =>
+            {
+                Entry::writable_file("cancel")
+            }
+            _ => return Err(HandlerError::not_found(rest.join("/"))),
+        };
+        Ok(entry.with_modified_ms(created_at_ms))
     }
 
     async fn read_registrations(&self, rest: &[String]) -> Result<Vec<u8>, HandlerError> {
@@ -2120,16 +2127,27 @@ impl WalletsHandler {
         let coordinator = self.auth_services.require_registration_coordinator()?;
         if rest.is_empty() {
             let wallets = coordinator.list_wallets().await.map_err(err_be)?;
-            return Ok(wallets.iter().map(|w| Entry::dir(w)).collect());
+            let mut out = Vec::with_capacity(wallets.len());
+            for wallet in wallets {
+                let status = self.registration_status(&wallet).await?;
+                out.push(Entry::dir(&wallet).with_modified_ms(status.created_at_ms as u128));
+            }
+            return Ok(out);
         }
         if rest.len() == 1 {
             let status = self.registration_status(&rest[0]).await?;
+            let created_at_ms = status.created_at_ms as u128;
             let mut out = vec![Entry::file("status.json")];
             if status.ceremony_url.is_some() {
                 out.push(Entry::file("ceremony_url"));
             }
-            out.push(Entry::writable_file("cancel"));
-            return Ok(out);
+            if status.state == bloom_auth_api::WalletRegistrationState::AwaitingUser {
+                out.push(Entry::writable_file("cancel"));
+            }
+            return Ok(out
+                .into_iter()
+                .map(|entry| entry.with_modified_ms(created_at_ms))
+                .collect());
         }
         Err(HandlerError::NotADir(rest.join("/")))
     }
@@ -3691,6 +3709,24 @@ mod tests {
                 .unwrap()
                 .contains("wallet-registration")
         );
+        let created_at_ms = status["created_at_ms"].as_u64().unwrap() as u128;
+        let entries = f
+            .handler
+            .list(&VfsPath::parse("/registrations/bob").unwrap())
+            .await
+            .unwrap();
+        let registration_dir = f
+            .handler
+            .lookup(&VfsPath::parse("/registrations/bob").unwrap())
+            .await
+            .unwrap();
+        assert!(entries.iter().chain([&registration_dir]).all(|entry| {
+            entry.modified.and_then(|time| {
+                time.duration_since(std::time::SystemTime::UNIX_EPOCH)
+                    .ok()
+                    .map(|duration| duration.as_millis())
+            }) == Some(created_at_ms)
+        }));
     }
 
     #[tokio::test]
@@ -3781,6 +3817,14 @@ mod tests {
         let status: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(status["state"], "cancelled");
         assert!(status.get("ceremony_url").is_none());
+
+        let entries = f
+            .handler
+            .list(&VfsPath::parse("/registrations/grace").unwrap())
+            .await
+            .unwrap();
+        assert!(!entries.iter().any(|entry| entry.name == "cancel"));
+        assert!(f.handler.lookup(&cancel_path).await.is_err());
 
         // Cancelling again fails — no live session left.
         assert!(f.handler.write(&cancel_path, b"").await.is_err());
