@@ -3352,6 +3352,22 @@ pub trait AuthStoreView: Send + Sync {
             "wallet_registration_wallets is not supported by this auth store view".into(),
         ))
     }
+
+    /// `(session_id, status)` for every wallet-registration session whose
+    /// persisted state is not yet terminal (`awaiting_user` or
+    /// `awaiting_recovery_ack`). Used for restart reconciliation: a bulk
+    /// "mark everything failed" can't tell a truly abandoned session apart
+    /// from one whose wallet was actually installed on disk before the
+    /// daemon died, so the caller needs the individual rows to check each
+    /// against keystore state itself.
+    async fn non_terminal_wallet_registration_sessions(
+        &self,
+    ) -> Result<Vec<(String, WalletRegistrationStatus)>, AuthApiError> {
+        Err(AuthApiError::Store(
+            "non_terminal_wallet_registration_sessions is not supported by this auth store view"
+                .into(),
+        ))
+    }
 }
 
 #[async_trait]
@@ -3521,22 +3537,6 @@ pub trait AuthStoreWriter: Send + Sync {
         let _ = (session_id, status, now_ms);
         Err(AuthApiError::Store(
             "upsert_wallet_registration_status is not supported by this auth store writer".into(),
-        ))
-    }
-
-    /// Restart reconciliation (invariant 9): mark every non-terminal
-    /// persisted registration session `failed` with `reason`. Returns the
-    /// number of rows updated. Never restores secret session state — a
-    /// fresh registration is required after this.
-    async fn mark_unfinished_wallet_registrations_failed(
-        &self,
-        reason: &str,
-        now_ms: u64,
-    ) -> Result<u64, AuthApiError> {
-        let _ = (reason, now_ms);
-        Err(AuthApiError::Store(
-            "mark_unfinished_wallet_registrations_failed is not supported by this auth store writer"
-                .into(),
         ))
     }
 }

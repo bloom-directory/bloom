@@ -1924,21 +1924,47 @@ impl AuthStore {
         Ok(out)
     }
 
-    /// Restart reconciliation: mark every non-terminal persisted
-    /// registration session `failed` with `reason`. Returns the number of
-    /// rows updated.
-    pub fn mark_unfinished_wallet_registrations_failed(
-        &mut self,
-        reason: &str,
-        now_ms: u64,
-    ) -> Result<u64, AuthStoreError> {
-        let changed = self.conn.execute(
-            "UPDATE wallet_registration_sessions
-             SET state = 'failed', error = ?1, ceremony_url = NULL, updated_ms = ?2
+    /// `(session_id, status)` for every wallet-registration session whose
+    /// persisted state is not yet terminal. For restart reconciliation: the
+    /// caller checks each wallet against on-disk keystore state itself,
+    /// since a bulk `UPDATE` can't tell "actually installed before the
+    /// daemon died" apart from "truly abandoned."
+    pub fn non_terminal_wallet_registration_sessions(
+        &self,
+    ) -> Result<Vec<(String, WalletRegistrationStatus)>, AuthStoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT session_id, wallet, state, created_at_ms, expires_at_ms, ceremony_url, address, error
+             FROM wallet_registration_sessions
              WHERE state IN ('awaiting_user', 'awaiting_recovery_ack')",
-            params![reason, now_ms as i64],
         )?;
-        Ok(changed as u64)
+        let mut rows = stmt.query([])?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            let session_id: String = row.get(0)?;
+            let wallet: String = row.get(1)?;
+            let state: String = row.get(2)?;
+            let created_at_ms: i64 = row.get(3)?;
+            let expires_at_ms: i64 = row.get(4)?;
+            let ceremony_url: Option<String> = row.get(5)?;
+            let address: Option<String> = row.get(6)?;
+            let error: Option<String> = row.get(7)?;
+            let state = WalletRegistrationState::parse(&state)
+                .ok_or_else(|| AuthStoreError::InvalidState(state.clone()))?;
+            out.push((
+                session_id,
+                WalletRegistrationStatus {
+                    schema: bloom_auth_api::WALLET_REGISTRATION_STATUS_SCHEMA_V1.into(),
+                    wallet,
+                    state,
+                    created_at_ms: created_at_ms as u64,
+                    expires_at_ms: expires_at_ms as u64,
+                    ceremony_url,
+                    address,
+                    error,
+                },
+            ));
+        }
+        Ok(out)
     }
 
     pub fn orphan_standing_sessions(
@@ -2222,6 +2248,16 @@ where
             .map_err(|_| AuthApiError::Store("auth store mutex poisoned".into()))?;
         Ok(store.wallet_registration_wallets()?)
     }
+
+    async fn non_terminal_wallet_registration_sessions(
+        &self,
+    ) -> Result<Vec<(String, WalletRegistrationStatus)>, AuthApiError> {
+        let store = self
+            .store
+            .lock()
+            .map_err(|_| AuthApiError::Store("auth store mutex poisoned".into()))?;
+        Ok(store.non_terminal_wallet_registration_sessions()?)
+    }
 }
 
 #[async_trait]
@@ -2399,18 +2435,6 @@ where
             .lock()
             .map_err(|_| AuthApiError::Store("auth store mutex poisoned".into()))?;
         Ok(store.upsert_wallet_registration_status(session_id, status, now_ms)?)
-    }
-
-    async fn mark_unfinished_wallet_registrations_failed(
-        &self,
-        reason: &str,
-        now_ms: u64,
-    ) -> Result<u64, AuthApiError> {
-        let mut store = self
-            .store
-            .lock()
-            .map_err(|_| AuthApiError::Store("auth store mutex poisoned".into()))?;
-        Ok(store.mark_unfinished_wallet_registrations_failed(reason, now_ms)?)
     }
 
     async fn release_evm_owner_session_use(
@@ -5075,7 +5099,7 @@ mod tests {
     }
 
     #[test]
-    fn mark_unfinished_wallet_registrations_failed_is_restart_reconciliation() {
+    fn non_terminal_wallet_registration_sessions_excludes_terminal_rows() {
         let mut store = AuthStore::open_in_memory_for_tests().unwrap();
         let live = WalletRegistrationStatus::awaiting_user(
             "main",
@@ -5100,18 +5124,11 @@ mod tests {
             .upsert_wallet_registration_status("tok-2", &other, 1_000)
             .unwrap();
 
-        let changed = store
-            .mark_unfinished_wallet_registrations_failed("daemon restarted", 9_000)
-            .unwrap();
-        assert_eq!(changed, 1);
-
-        let got = store.wallet_registration_status("main").unwrap().unwrap();
-        assert_eq!(got.state, WalletRegistrationState::Failed);
-        assert_eq!(got.error.as_deref(), Some("daemon restarted"));
-        assert!(got.ceremony_url.is_none());
-
-        // Already-terminal sessions are untouched.
-        let got_other = store.wallet_registration_status("second").unwrap().unwrap();
-        assert_eq!(got_other.state, WalletRegistrationState::Completed);
+        let rows = store.non_terminal_wallet_registration_sessions().unwrap();
+        assert_eq!(rows.len(), 1, "only the non-terminal row must be returned");
+        let (token, status) = &rows[0];
+        assert_eq!(token, "tok-1");
+        assert_eq!(status.wallet, "main");
+        assert_eq!(status.state, WalletRegistrationState::AwaitingUser);
     }
 }
