@@ -1496,12 +1496,11 @@ pub fn prepare_passkey_wallet(
     signer: &PrivateKeySigner,
     credential: &Passkey,
     prf_salt: &[u8; 32],
-    mut prf_output: [u8; 32],
+    prf_output: [u8; 32],
     policy_toml: &str,
 ) -> Result<PreparedPasskeyWallet, KeystoreError> {
-    let tmp_dir = registration_temp_dir(root, temp_id).inspect_err(|_| {
-        prf_output.zeroize();
-    })?;
+    let prf_output = Zeroizing::new(prf_output);
+    let tmp_dir = registration_temp_dir(root, temp_id)?;
     let _ = std::fs::remove_dir_all(&tmp_dir); // clean up any stale temp dir
     std::fs::create_dir_all(&tmp_dir).map_err(|source| KeystoreError::Io {
         path: tmp_dir.clone(),
@@ -1516,12 +1515,10 @@ pub fn prepare_passkey_wallet(
     let guard = TmpGuard(tmp_dir.clone());
 
     // Encrypt the secp256k1 private key with the PRF-derived wrap key.
-    // Zeroize unconditionally before propagating any error so that
-    // prf_output and key_bytes are never left un-zeroed on the error path
-    // ([u8;32] does not auto-zeroize on drop).
+    // `prf_output` is RAII-zeroized on every return path; clear the signer
+    // bytes explicitly before propagating an encryption error.
     let mut key_bytes = signer.to_bytes();
     let enc_result = encrypt_passkey_key(key_bytes.as_ref(), &prf_output);
-    prf_output.zeroize();
     key_bytes.zeroize();
     let enc = enc_result?;
     let enc_blob = serde_json::to_vec(&enc).map_err(|e| KeystoreError::Malformed(e.to_string()))?;
