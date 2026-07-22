@@ -55,7 +55,6 @@ fn gen_id(prefix: &str) -> String {
 struct SecretAttempt {
     policy_toml: String,
     reg_state: PasskeyRegistration,
-    used: bool,
     busy: bool,
     fallback: Option<(Passkey, PasskeyAuthentication, serde_json::Value)>,
 }
@@ -74,7 +73,6 @@ enum CompletionPhase {
 
 enum CompleteWork {
     Replay {
-        wallet: String,
         address: String,
         recovery_key: zeroize::Zeroizing<String>,
         receipt: String,
@@ -145,8 +143,6 @@ pub struct RegistrationCoordinator {
     /// ceremony listener. `stage()` fails closed while this is `None`.
     listener_base_url: RwLock<Option<String>>,
     state: Mutex<CoordinatorState>,
-    /// Serializes memory+SQLite publication/removal transitions without
-    /// holding a synchronous mutex across `.await`.
     transitions: tokio::sync::Mutex<()>,
 }
 
@@ -217,8 +213,6 @@ impl RegistrationCoordinator {
         Ok(())
     }
 
-    /// Insert a fresh session for `wallet` under a new token. Caller must
-    /// already hold `state`'s lock.
     fn fresh_session(wallet: &str, now_ms: u64) -> (String, SecretSession) {
         let mut prf_salt = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut prf_salt);
@@ -268,20 +262,10 @@ impl WalletRegistrationLifecycle for RegistrationCoordinator {
         let rows = self.store.non_terminal().await?;
         let mut reconciled = 0u64;
         for (token, mut status) in rows {
-            let dir = self.keystore_root.join(&status.wallet);
-            if dir.exists() {
-                // `recovery_ack`'s rename can succeed and then the process
-                // can die before its persisted `Completed` write confirms.
-                // A bulk "mark everything failed" can't see that — check
-                // the keystore directly and reconcile to `Completed` with
-                // the real address instead of misrepresenting a wallet
-                // that genuinely exists as failed.
-                let address = std::fs::read_to_string(dir.join("address"))
-                    .ok()
-                    .map(|s| s.trim().to_string());
+            if let Ok(info) = self.keystore.info_unverified(&status.wallet) {
                 status.state = WalletRegistrationState::Completed;
                 status.ceremony_url = None;
-                status.address = address;
+                status.address = Some(bloom_proto::checksum_address(&info.address));
             } else {
                 status.state = WalletRegistrationState::Failed;
                 status.ceremony_url = None;
@@ -301,11 +285,6 @@ impl WalletRegistrationVfs for RegistrationCoordinator {
         wallet: &str,
         now_ms: u64,
     ) -> Result<WalletRegistrationStatus, AuthApiError> {
-        // Defense in depth: `wallet` is joined into a filesystem path below
-        // and, on a successful ceremony, again in `recovery_ack`'s
-        // `finalize_passkey_wallet` rename target. Reject anything that
-        // could escape `keystore_root` even if a future caller stages
-        // sessions without going through `WalletsHandler`'s own check.
         Keystore::validate_name(wallet).map_err(|e| AuthApiError::Denied(e.to_string()))?;
 
         let base = self.base_url()?;
@@ -349,8 +328,6 @@ impl WalletRegistrationVfs for RegistrationCoordinator {
             session.expires_at_ms,
             url,
         );
-        // Persist before publishing the routing capability in memory. A
-        // failed write leaves no half-created session to wedge retries.
         self.store.upsert(&token, &status, now_ms).await?;
         let mut state = self.state.lock();
         if let Some(stale) = state.by_wallet.insert(wallet.to_string(), token.clone()) {
@@ -476,6 +453,11 @@ impl WalletRegistrationCeremony for RegistrationCoordinator {
             let session = state.sessions.get_mut(token).ok_or_else(|| {
                 AuthApiError::NotFound("unknown or expired registration session".into())
             })?;
+            if session.expires_at_ms <= now_ms {
+                return Err(AuthApiError::NotFound(
+                    "unknown or expired registration session".into(),
+                ));
+            }
             if session.completion.is_some() {
                 return Err(AuthApiError::Denied(
                     "registration already completed".into(),
@@ -491,7 +473,6 @@ impl WalletRegistrationCeremony for RegistrationCoordinator {
                 SecretAttempt {
                     policy_toml: canonical_policy_toml.clone(),
                     reg_state,
-                    used: false,
                     busy: false,
                     fallback: None,
                 },
@@ -532,7 +513,7 @@ impl WalletRegistrationCeremony for RegistrationCoordinator {
                     request_options_json: options.clone(),
                 });
             }
-            if attempt.used || attempt.busy {
+            if attempt.busy {
                 return Err(AuthApiError::Denied(
                     "attempt is already in progress".into(),
                 ));
@@ -553,16 +534,19 @@ impl WalletRegistrationCeremony for RegistrationCoordinator {
         })();
 
         let mut state = self.state.lock();
-        let attempt = state
+        let session = state
             .sessions
             .get_mut(token)
-            .and_then(|s| s.attempts.get_mut(attempt_id))
+            .filter(|session| session.expires_at_ms > now_ms && session.completion.is_none())
+            .ok_or_else(|| {
+                AuthApiError::NotFound("registration session is no longer active".into())
+            })?;
+        let attempt = session
+            .attempts
+            .get_mut(attempt_id)
             .ok_or_else(|| AuthApiError::NotFound("registration attempt disappeared".into()))?;
         attempt.busy = false;
         let (passkey, auth_state, options) = generated?;
-        if attempt.used {
-            return Err(AuthApiError::Denied("attempt already used".into()));
-        }
         attempt.fallback = Some((passkey, auth_state, options.clone()));
         Ok(WalletRegistrationFallbackOptions {
             request_options_json: options,
@@ -590,7 +574,6 @@ impl WalletRegistrationCeremony for RegistrationCoordinator {
                         && winner.request_digest == request_digest =>
                 {
                     CompleteWork::Replay {
-                        wallet: session.wallet.clone(),
                         address: bloom_proto::checksum_address(&winner.prepared.address),
                         recovery_key: winner.prepared.recovery_key.clone(),
                         receipt: winner.receipt.clone(),
@@ -608,7 +591,7 @@ impl WalletRegistrationCeremony for RegistrationCoordinator {
                     let attempt = session.attempts.get_mut(attempt_id).ok_or_else(|| {
                         AuthApiError::NotFound("unknown registration attempt".into())
                     })?;
-                    if attempt.used || attempt.busy {
+                    if attempt.busy {
                         return Err(AuthApiError::Denied(
                             "attempt is already in progress".into(),
                         ));
@@ -632,14 +615,10 @@ impl WalletRegistrationCeremony for RegistrationCoordinator {
 
         let (address, recovery_key, receipt) = match work {
             CompleteWork::Replay {
-                wallet,
                 address,
                 recovery_key,
                 receipt,
-            } => {
-                let _ = wallet;
-                (address, recovery_key, receipt)
-            }
+            } => (address, recovery_key, receipt),
             CompleteWork::New(work) => {
                 let CompleteNew {
                     wallet,
@@ -733,7 +712,6 @@ impl WalletRegistrationCeremony for RegistrationCoordinator {
                     AuthApiError::NotFound("registration attempt disappeared".into())
                 })?;
                 attempt.busy = false;
-                attempt.used = true;
                 session.completing = false;
                 session.completion = Some(CompletionPhase::Won(Box::new(WinnerState {
                     prepared,
@@ -1538,15 +1516,21 @@ mod tests {
 
     #[tokio::test]
     async fn reconcile_after_restart_completes_an_already_installed_wallet() {
-        let (coordinator, tmp) = coordinator();
+        let (coordinator, _tmp) = coordinator();
         coordinator.mark_listener_bound("http://localhost:18734");
 
         // Simulate a wallet that `recovery_ack` successfully renamed into
         // place before the process died, whose persisted status never got
         // to `Completed`.
-        let wallet_dir = tmp.path().join("keystore").join("alice");
-        std::fs::create_dir_all(&wallet_dir).unwrap();
-        std::fs::write(wallet_dir.join("address"), "0xabc\n").unwrap();
+        coordinator
+            .keystore
+            .add_watch(
+                "alice",
+                "0x0000000000000000000000000000000000000abc"
+                    .parse()
+                    .unwrap(),
+            )
+            .unwrap();
         let mut status = WalletRegistrationStatus::awaiting_user(
             "alice",
             1_000,
@@ -1581,7 +1565,10 @@ mod tests {
 
         let alice = coordinator.status("alice").await.unwrap().unwrap();
         assert_eq!(alice.state, WalletRegistrationState::Completed);
-        assert_eq!(alice.address.as_deref(), Some("0xabc"));
+        assert_eq!(
+            alice.address.as_deref(),
+            Some("0x0000000000000000000000000000000000000aBc")
+        );
 
         let bob = coordinator.status("bob").await.unwrap().unwrap();
         assert_eq!(bob.state, WalletRegistrationState::Failed);

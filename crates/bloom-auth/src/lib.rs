@@ -1876,7 +1876,7 @@ impl AuthStore {
                 "SELECT wallet, state, created_at_ms, expires_at_ms, ceremony_url, address, error
                  FROM wallet_registration_sessions
                  WHERE wallet = ?1
-                 ORDER BY created_at_ms DESC
+                 ORDER BY created_at_ms DESC, rowid DESC
                  LIMIT 1",
                 params![wallet],
                 registration_status_row,
@@ -5100,8 +5100,8 @@ mod tests {
             .unwrap();
         let fresh = WalletRegistrationStatus::awaiting_user(
             "main",
-            3_000,
-            3_000 + 300_000,
+            1_000,
+            1_000 + 300_000,
             "http://localhost:18734/wallet-registration/tok-3",
         );
         store
