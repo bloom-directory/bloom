@@ -6,11 +6,7 @@
 //!
 //! Paths handled:
 //! - `wallets/`                                                     — list wallets
-//! - `wallets/new`                                                  — write to create wallet; plain name or `kind = "passkey"` starts an asynchronous registration (see `registrations/` below), not a local wallet
-//! - `wallets/registrations/`                                       — list wallets with a known passkey-registration session
-//! - `wallets/registrations/<wallet>/status.json`                   — read-only registration status
-//! - `wallets/registrations/<wallet>/ceremony_url`                  — read-only ceremony URL (present while actionable)
-//! - `wallets/registrations/<wallet>/cancel`                        — write-only: cancel a live registration
+//! - `wallets/new`                                                  — write to create wallet (plain name or TOML spec)
 //! - `wallets/<wallet>/address`                                     — checksummed owner/signer address
 //! - `wallets/<wallet>/address.qr.svg`                              — scannable QR image for the owner/signer address
 //! - `wallets/<wallet>/address.qr.png`                              — scannable QR image for the owner/signer address
@@ -1967,9 +1963,6 @@ impl WalletsHandler {
         if segs.len() == 1 && segs[0] == "new" {
             return Ok(Entry::writable_file("new"));
         }
-        if segs[0] == "registrations" {
-            return self.lookup_registrations(&segs[1..]).await;
-        }
         let wallet = &segs[0];
         let info = self.keystore.info_unverified(wallet).map_err(err_be)?;
         self.migrate_legacy_policy_updates(wallet);
@@ -2089,26 +2082,7 @@ impl WalletsHandler {
             return Err(HandlerError::NotAFile(path.to_string_path()));
         }
         if segs.len() == 1 && segs[0] == "new" {
-            return Ok(
-                b"# write a wallet name (plain text) or a TOML spec to create a wallet\n\
-# a plain name starts an ASYNCHRONOUS PASSKEY REGISTRATION -- it does NOT\n\
-# create a local wallet, and the write returns before the ceremony completes.\n\
-# examples:\n\
-#   echo alice > /wallets/new                          # starts passkey registration\n\
-#   printf 'name = \"alice\"\\nkind = \"watch\"\\naddress = \"0xabc\"\\n' > /wallets/new\n\
-# kind: passkey (default, async) | local | import (with private_key) | watch (with address)\n\
-# local/import require allow_passphrase_wallet = true and a passphrase field.\n\
-# passkey-import is not supported via the VFS yet.\n\
-#\n\
-# after a passkey write, read:\n\
-#   /wallets/registrations/<name>/status.json   -- registration state\n\
-#   /wallets/registrations/<name>/ceremony_url  -- URL to open/forward to a human\n\
-# requires a running `bloom serve` daemon; the write fails clearly if none is reachable.\n"
-                    .to_vec(),
-            );
-        }
-        if segs[0] == "registrations" {
-            return self.read_registrations(&segs[1..]).await;
+            return Ok(b"# write a wallet name (plain text) or a TOML spec to create a wallet\n# defaults to a passkey (WebAuthn) wallet; passkey is the safe default.\n# examples:\n#   echo alice > /wallets/new                          # passkey ceremony\n#   printf 'name = \"alice\"\\nkind = \"watch\"\\naddress = \"0xabc\"\\n' > /wallets/new\n# kind: passkey (default) | local | import (with private_key) | watch (with address)\n# local/import require allow_passphrase_wallet = true and a passphrase field.\n".to_vec());
         }
         let wallet = &segs[0];
         let info = self.keystore.info_unverified(wallet).map_err(err_be)?;
@@ -2188,9 +2162,6 @@ impl WalletsHandler {
         }
         if segs.len() == 1 && segs[0] == "new" {
             return self.write_new_wallet(data).await;
-        }
-        if segs[0] == "registrations" {
-            return self.write_registrations(&segs[1..], data).await;
         }
         let wallet = &segs[0];
         let info = self.keystore.info(wallet).map_err(err_be)?;
@@ -2275,11 +2246,7 @@ impl WalletsHandler {
             let infos = self.keystore.list().map_err(err_be)?;
             let mut out: Vec<Entry> = infos.into_iter().map(|i| Entry::dir(&i.name)).collect();
             out.push(Entry::writable_file("new"));
-            out.push(Entry::dir("registrations"));
             return Ok(out);
-        }
-        if segs[0] == "registrations" {
-            return self.list_registrations(&segs[1..]).await;
         }
         let wallet = &segs[0];
         let info = self.keystore.info_unverified(wallet).map_err(err_be)?;
@@ -2335,87 +2302,6 @@ impl WalletsHandler {
 }
 
 impl WalletsHandler {
-    async fn lookup_registrations(&self, rest: &[String]) -> Result<Entry, HandlerError> {
-        if rest.is_empty() {
-            return Ok(Entry::dir("registrations"));
-        }
-        let coordinator = self.auth_services.require_registration_coordinator()?;
-        let wallet = &rest[0];
-        let status = coordinator
-            .status(wallet)
-            .await
-            .map_err(err_be)?
-            .ok_or_else(|| HandlerError::not_found(format!("registration '{wallet}'")))?;
-        if rest.len() == 1 {
-            return Ok(Entry::dir(wallet));
-        }
-        match rest[1].as_str() {
-            "status.json" if rest.len() == 2 => Ok(Entry::file("status.json")),
-            "ceremony_url" if rest.len() == 2 && status.ceremony_url.is_some() => {
-                Ok(Entry::file("ceremony_url"))
-            }
-            "cancel" if rest.len() == 2 => Ok(Entry::writable_file("cancel")),
-            _ => Err(HandlerError::not_found(rest.join("/"))),
-        }
-    }
-
-    async fn read_registrations(&self, rest: &[String]) -> Result<Vec<u8>, HandlerError> {
-        if rest.len() != 2 {
-            return Err(HandlerError::NotAFile(rest.join("/")));
-        }
-        let coordinator = self.auth_services.require_registration_coordinator()?;
-        let wallet = &rest[0];
-        let status = coordinator
-            .status(wallet)
-            .await
-            .map_err(err_be)?
-            .ok_or_else(|| HandlerError::not_found(format!("registration '{wallet}'")))?;
-        match rest[1].as_str() {
-            "status.json" => serde_json::to_vec_pretty(&status).map_err(err_be),
-            "ceremony_url" => {
-                let url = status.ceremony_url.ok_or_else(|| {
-                    HandlerError::not_found("ceremony_url (registration is terminal)".to_string())
-                })?;
-                Ok(format!("{url}\n").into_bytes())
-            }
-            _ => Err(HandlerError::NotAFile(rest.join("/"))),
-        }
-    }
-
-    async fn write_registrations(&self, rest: &[String], _data: &[u8]) -> Result<(), HandlerError> {
-        if rest.len() != 2 || rest[1] != "cancel" {
-            return Err(HandlerError::PermissionDenied);
-        }
-        self.write_permit()?;
-        let coordinator = self.auth_services.require_registration_coordinator()?;
-        coordinator
-            .cancel(&rest[0], now_ms_u64())
-            .await
-            .map_err(err_be)
-    }
-
-    async fn list_registrations(&self, rest: &[String]) -> Result<Vec<Entry>, HandlerError> {
-        let coordinator = self.auth_services.require_registration_coordinator()?;
-        if rest.is_empty() {
-            let wallets = coordinator.list_wallets().await.map_err(err_be)?;
-            return Ok(wallets.iter().map(|w| Entry::dir(w)).collect());
-        }
-        if rest.len() == 1 {
-            let status = coordinator
-                .status(&rest[0])
-                .await
-                .map_err(err_be)?
-                .ok_or_else(|| HandlerError::not_found(format!("registration '{}'", rest[0])))?;
-            let mut out = vec![Entry::file("status.json")];
-            if status.ceremony_url.is_some() {
-                out.push(Entry::file("ceremony_url"));
-            }
-            out.push(Entry::writable_file("cancel"));
-            return Ok(out);
-        }
-        Err(HandlerError::NotADir(rest.join("/")))
-    }
-
     async fn lookup_chain(
         &self,
         _wallet: &str,
@@ -2988,39 +2874,6 @@ impl WalletsHandler {
             }
         }
 
-        // PasskeyGated: stage an asynchronous registration session and
-        // return without waiting for a browser. This has zero reachable
-        // path to a foreground WebAuthn ceremony or a second bind of the
-        // daemon's loopback ceremony listener — see
-        // docs/plans/2026-07-21-async-vfs-passkey-registration.md.
-        if spec.kind == "passkey" {
-            // Unlike local/import/watch (which validate the name inside the
-            // keystore methods they call), staging goes straight to the
-            // registration coordinator, which later joins the name into a
-            // filesystem path. Validate here with the same rule the keystore
-            // itself uses, so a name like "../../escape" is rejected before
-            // it ever reaches that join.
-            bloom_keystore::Keystore::validate_name(&spec.name).map_err(err_be)?;
-            self.write_permit()?;
-            let status = self
-                .auth_services
-                .require_registration_coordinator()?
-                .stage(&spec.name, now_ms_u64())
-                .await
-                .map_err(err_be)?;
-            tracing::info!(wallet = %spec.name, state = status.state.as_str(), "wallet.registration_staged");
-            return Ok(());
-        }
-        if spec.kind == "passkey-import" {
-            return Err(HandlerError::Unsupported(
-                "passkey-import via the VFS is not supported yet: asynchronous passkey-import \
-                 requires holding a caller-supplied private key in session state, which this \
-                 protocol does not yet support safely. Use `bloom wallet import <name> \
-                 <private-key>` from a trusted foreground terminal instead."
-                    .into(),
-            ));
-        }
-
         let info = match spec.kind.as_str() {
             "local" => {
                 let pass = spec.passphrase.as_deref().unwrap_or("");
@@ -3053,6 +2906,23 @@ impl WalletsHandler {
                     .parse()
                     .map_err(|e| HandlerError::invalid(format!("address: {e}")))?;
                 self.keystore.add_watch(&spec.name, addr).map_err(err_be)?
+            }
+            // PasskeyGated: opens a browser WebAuthn registration ceremony.
+            "passkey" => self
+                .keystore
+                .create_passkey(&spec.name)
+                .await
+                .map_err(err_be)?,
+            // PasskeyGated from an existing hex private key.
+            "passkey-import" => {
+                let key = spec
+                    .private_key
+                    .as_deref()
+                    .ok_or_else(|| HandlerError::invalid("passkey-import requires private_key"))?;
+                self.keystore
+                    .import_passkey(&spec.name, key)
+                    .await
+                    .map_err(err_be)?
             }
             other => {
                 return Err(HandlerError::invalid(format!(
@@ -3347,156 +3217,6 @@ mod tests {
 
         async fn audit(&self, _event: bloom_auth_api::AuditEvent) -> Result<(), AuthApiError> {
             Ok(())
-        }
-    }
-
-    /// Minimal in-memory fake of the daemon-owned registration coordinator,
-    /// for VFS-layer tests that only exercise `stage`/`status`/`cancel`/
-    /// `list_wallets` — the wallet-keyed surface `WalletsHandler` calls. The
-    /// token-keyed HTTP surface (attempts/complete/recovery-ack) is exercised
-    /// by `bloom-daemon`'s own coordinator tests, not here.
-    struct FakeRegistrationCoordinator {
-        armed: bool,
-        statuses:
-            Mutex<std::collections::HashMap<String, bloom_auth_api::WalletRegistrationStatus>>,
-    }
-
-    impl FakeRegistrationCoordinator {
-        fn armed() -> Self {
-            Self {
-                armed: true,
-                statuses: Mutex::new(Default::default()),
-            }
-        }
-        fn unarmed() -> Self {
-            Self {
-                armed: false,
-                statuses: Mutex::new(Default::default()),
-            }
-        }
-    }
-
-    #[async_trait]
-    impl bloom_auth_api::WalletRegistrationCoordinator for FakeRegistrationCoordinator {
-        fn mark_listener_bound(&self, _base_url: &str) {}
-
-        async fn reconcile_after_restart(
-            &self,
-            _reason: &str,
-            _now_ms: u64,
-        ) -> Result<u64, AuthApiError> {
-            Ok(0)
-        }
-
-        async fn stage(
-            &self,
-            wallet: &str,
-            now_ms: u64,
-        ) -> Result<bloom_auth_api::WalletRegistrationStatus, AuthApiError> {
-            if !self.armed {
-                return Err(AuthApiError::Denied(
-                    "wallet registration requires a running `bloom serve` daemon".into(),
-                ));
-            }
-            let mut statuses = self.statuses.lock().unwrap();
-            if let Some(existing) = statuses.get(wallet) {
-                if existing.state.is_live() {
-                    return Ok(existing.clone());
-                }
-                if existing.state == bloom_auth_api::WalletRegistrationState::Completed {
-                    return Err(AuthApiError::Denied(format!(
-                        "wallet '{wallet}' already exists"
-                    )));
-                }
-            }
-            let status = bloom_auth_api::WalletRegistrationStatus::awaiting_user(
-                wallet,
-                now_ms,
-                now_ms + 300_000,
-                format!("http://localhost:18734/wallet-registration/tok-{wallet}"),
-            );
-            statuses.insert(wallet.to_string(), status.clone());
-            Ok(status)
-        }
-
-        async fn status(
-            &self,
-            wallet: &str,
-        ) -> Result<Option<bloom_auth_api::WalletRegistrationStatus>, AuthApiError> {
-            Ok(self.statuses.lock().unwrap().get(wallet).cloned())
-        }
-
-        async fn list_wallets(&self) -> Result<Vec<String>, AuthApiError> {
-            let mut names: Vec<String> = self.statuses.lock().unwrap().keys().cloned().collect();
-            names.sort();
-            Ok(names)
-        }
-
-        async fn cancel(&self, wallet: &str, _now_ms: u64) -> Result<(), AuthApiError> {
-            let mut statuses = self.statuses.lock().unwrap();
-            let status = statuses
-                .get_mut(wallet)
-                .ok_or_else(|| AuthApiError::NotFound("no live registration".into()))?;
-            if !status.state.is_live() {
-                return Err(AuthApiError::NotFound("no live registration".into()));
-            }
-            status.state = bloom_auth_api::WalletRegistrationState::Cancelled;
-            status.ceremony_url = None;
-            Ok(())
-        }
-
-        async fn session_view(
-            &self,
-            _token: &str,
-            _now_ms: u64,
-        ) -> Result<bloom_auth_api::WalletRegistrationSessionView, AuthApiError> {
-            Err(AuthApiError::Store("not used in VFS tests".into()))
-        }
-
-        async fn create_attempt(
-            &self,
-            _token: &str,
-            _policy_toml: String,
-            _now_ms: u64,
-        ) -> Result<bloom_auth_api::WalletRegistrationAttemptOptions, AuthApiError> {
-            Err(AuthApiError::Store("not used in VFS tests".into()))
-        }
-
-        async fn fallback_options(
-            &self,
-            _token: &str,
-            _attempt_id: &str,
-            _credential_json: serde_json::Value,
-            _now_ms: u64,
-        ) -> Result<bloom_auth_api::WalletRegistrationFallbackOptions, AuthApiError> {
-            Err(AuthApiError::Store("not used in VFS tests".into()))
-        }
-
-        async fn complete(
-            &self,
-            _token: &str,
-            _attempt_id: &str,
-            _body: bloom_auth_api::WalletRegistrationCompleteBody,
-            _now_ms: u64,
-        ) -> Result<bloom_auth_api::WalletRegistrationCompleteOutcome, AuthApiError> {
-            Err(AuthApiError::Store("not used in VFS tests".into()))
-        }
-
-        async fn recovery_ack(
-            &self,
-            _token: &str,
-            _receipt: &str,
-            _now_ms: u64,
-        ) -> Result<String, AuthApiError> {
-            Err(AuthApiError::Store("not used in VFS tests".into()))
-        }
-
-        async fn cancel_by_token(&self, _token: &str, _now_ms: u64) -> Result<(), AuthApiError> {
-            Err(AuthApiError::Store("not used in VFS tests".into()))
-        }
-
-        async fn sweep_expired(&self, _now_ms: u64) -> Result<usize, AuthApiError> {
-            Ok(0)
         }
     }
 
@@ -3926,170 +3646,6 @@ mod tests {
             wallet_name: "alice".to_string(),
             wallet_addr: info.address,
         }
-    }
-
-    /// Fixture with a registration coordinator wired (armed or unarmed), for
-    /// the asynchronous `/wallets/new` passkey tests below.
-    fn make_handler_with_registration(armed: bool) -> Fixture {
-        let tmp = tempfile::tempdir().unwrap();
-        let ks_root = tmp.path().join("keystore");
-        let outbox_root = tmp.path().join("outbox");
-        let keystore = bloom_keystore::Keystore::new(&ks_root).unwrap();
-        let info = keystore.create_local("alice", "passphrase").unwrap();
-        keystore.unlock("alice", "passphrase").unwrap();
-        let chains = ChainRegistry::new();
-        let outbox = Outbox::new(&outbox_root).unwrap();
-        let tx_engine = TxEngine::new(outbox, 60_000);
-        let address_book = AddressBook::default();
-        let home = bloom_proto::HomeDir::at(tmp.path().join("home"));
-        let permit = Arc::new(HomeWritePermit::acquire(&home).unwrap());
-        let coordinator: Arc<dyn bloom_auth_api::WalletRegistrationCoordinator> = if armed {
-            Arc::new(FakeRegistrationCoordinator::armed())
-        } else {
-            Arc::new(FakeRegistrationCoordinator::unarmed())
-        };
-        let auth_services = AuthServices::default().with_registration_coordinator(coordinator);
-        let handler = WalletsHandler::new(keystore, chains, tx_engine, address_book)
-            .with_home_write_permit(permit)
-            .with_auth_services(auth_services);
-        Fixture {
-            _tmp: tmp,
-            handler,
-            wallet_name: "alice".to_string(),
-            wallet_addr: info.address,
-        }
-    }
-
-    #[tokio::test]
-    async fn passkey_new_wallet_stages_and_returns_promptly() {
-        let f = make_handler_with_registration(true);
-        let p = VfsPath::parse("/new").unwrap();
-        f.handler.write(&p, b"bob").await.unwrap();
-
-        // No local wallet was created synchronously.
-        assert!(f.handler.keystore.info_unverified("bob").is_err());
-
-        let status_path = VfsPath::parse("/registrations/bob/status.json").unwrap();
-        let bytes = f.handler.read(&status_path).await.unwrap();
-        let status: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(status["state"], "awaiting_user");
-        assert_eq!(status["wallet"], "bob");
-        assert!(status["ceremony_url"].as_str().unwrap().contains("bob"));
-
-        let url_path = VfsPath::parse("/registrations/bob/ceremony_url").unwrap();
-        let url_bytes = f.handler.read(&url_path).await.unwrap();
-        assert!(
-            String::from_utf8(url_bytes)
-                .unwrap()
-                .contains("wallet-registration")
-        );
-    }
-
-    #[tokio::test]
-    async fn plain_text_new_wallet_defaults_to_passkey_not_local() {
-        let f = make_handler_with_registration(true);
-        let p = VfsPath::parse("/new").unwrap();
-        f.handler.write(&p, b"carol").await.unwrap();
-        // A plain name never creates a local wallet synchronously — only a
-        // registration session.
-        assert!(f.handler.keystore.info_unverified("carol").is_err());
-        let status_path = VfsPath::parse("/registrations/carol/status.json").unwrap();
-        assert!(f.handler.read(&status_path).await.is_ok());
-    }
-
-    #[tokio::test]
-    async fn passkey_new_wallet_without_daemon_fails_before_staging() {
-        let f = make_handler_with_registration(false);
-        let p = VfsPath::parse("/new").unwrap();
-        let err = f.handler.write(&p, b"dave").await.unwrap_err();
-        assert!(
-            matches!(err, HandlerError::Backend(_)),
-            "expected Backend, got {err:?}"
-        );
-        assert!(err.to_string().contains("bloom serve"));
-        let status_path = VfsPath::parse("/registrations/dave/status.json").unwrap();
-        assert!(f.handler.read(&status_path).await.is_err());
-    }
-
-    #[tokio::test]
-    async fn repeated_live_passkey_write_is_idempotent() {
-        let f = make_handler_with_registration(true);
-        let p = VfsPath::parse("/new").unwrap();
-        f.handler.write(&p, b"erin").await.unwrap();
-        let status_path = VfsPath::parse("/registrations/erin/status.json").unwrap();
-        let first = f.handler.read(&status_path).await.unwrap();
-
-        // Repeat write while the session is still live: no rotation.
-        f.handler.write(&p, b"erin").await.unwrap();
-        let second = f.handler.read(&status_path).await.unwrap();
-        assert_eq!(first, second, "repeated live write rotated the session/URL");
-    }
-
-    #[tokio::test]
-    async fn passkey_new_wallet_rejects_path_traversal_names() {
-        let f = make_handler_with_registration(true);
-        let p = VfsPath::parse("/new").unwrap();
-        for name in ["../../escape", "a/b", "..", "/etc/passwd"] {
-            let body = format!("name = \"{name}\"\nkind = \"passkey\"\n");
-            let err = f.handler.write(&p, body.as_bytes()).await.unwrap_err();
-            assert!(
-                matches!(err, HandlerError::Backend(_)),
-                "expected Backend (invalid name), got {err:?} for {name:?}"
-            );
-        }
-        // The coordinator never staged a session for any rejected name —
-        // if it had, this would list it (see registrations_listing_enumerates_known_wallets).
-        let list_path = VfsPath::parse("/registrations").unwrap();
-        let entries = f.handler.list(&list_path).await.unwrap();
-        assert!(entries.is_empty(), "entries={entries:?}");
-    }
-
-    #[tokio::test]
-    async fn passkey_import_via_vfs_is_rejected_with_precise_message() {
-        let f = make_handler_with_registration(true);
-        let p = VfsPath::parse("/new").unwrap();
-        let body = b"name = \"frank\"\nkind = \"passkey-import\"\nprivate_key = \"0x01\"\n";
-        let err = f.handler.write(&p, body).await.unwrap_err();
-        match err {
-            HandlerError::Unsupported(msg) => {
-                assert!(msg.contains("passkey-import"));
-                assert!(msg.contains("bloom wallet import"));
-            }
-            other => panic!("expected Unsupported, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn cancel_registration_is_write_only_and_terminal() {
-        let f = make_handler_with_registration(true);
-        let p = VfsPath::parse("/new").unwrap();
-        f.handler.write(&p, b"grace").await.unwrap();
-
-        let cancel_path = VfsPath::parse("/registrations/grace/cancel").unwrap();
-        f.handler.write(&cancel_path, b"").await.unwrap();
-
-        let status_path = VfsPath::parse("/registrations/grace/status.json").unwrap();
-        let bytes = f.handler.read(&status_path).await.unwrap();
-        let status: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(status["state"], "cancelled");
-        assert!(status.get("ceremony_url").is_none());
-
-        // Cancelling again fails — no live session left.
-        assert!(f.handler.write(&cancel_path, b"").await.is_err());
-    }
-
-    #[tokio::test]
-    async fn registrations_listing_enumerates_known_wallets() {
-        let f = make_handler_with_registration(true);
-        let p = VfsPath::parse("/new").unwrap();
-        f.handler.write(&p, b"henry").await.unwrap();
-        f.handler.write(&p, b"ida").await.unwrap();
-
-        let list_path = VfsPath::parse("/registrations").unwrap();
-        let entries = f.handler.list(&list_path).await.unwrap();
-        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
-        assert!(names.contains(&"henry"));
-        assert!(names.contains(&"ida"));
     }
 
     #[tokio::test]

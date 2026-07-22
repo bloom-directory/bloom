@@ -25,24 +25,6 @@ echo y > /bloom/wallets/alice/chains/anvil/outbox/pending/0001-*/confirm
 ls /bloom/wallets/alice/chains/anvil/outbox/sent/
 ```
 
-## Creating a wallet (asynchronous passkey registration)
-
-```sh
-# 1. Start registration — this is NOT a local wallet and does not block.
-printf 'main\n' > /bloom/wallets/new
-
-# 2. Read status and the ceremony URL, and open/forward the URL to a human.
-cat /bloom/wallets/registrations/main/status.json
-cat /bloom/wallets/registrations/main/ceremony_url
-
-# 3. Poll status until "state" is "completed", then read the new wallet.
-cat /bloom/wallets/registrations/main/status.json
-cat /bloom/wallets/main/address
-```
-
-Requires a running `bloom serve` daemon. Cancel a live registration with
-`printf 'x' > /bloom/wallets/registrations/main/cancel`.
-
 ## Tools
 
 ```sh

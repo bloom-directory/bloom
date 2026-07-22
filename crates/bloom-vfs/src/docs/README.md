@@ -125,32 +125,6 @@ cat /bloom/chains/ethereum/contracts/<contract>/nft/token_uri/<id>
 cat /bloom/chains/ethereum/contracts/<contract>/nft/is_approved_for_all/<owner>/<operator>
 ```
 
-## Creating a wallet
-
-`wallets/new` creates a wallet. A **plain name** (or a TOML spec that omits
-`kind`, or sets `kind = "passkey"`) starts an **asynchronous passkey
-registration** — it does not create a local wallet, and the write returns
-before the WebAuthn ceremony completes:
-
-```sh
-printf 'main\n' > /bloom/wallets/new
-cat /bloom/wallets/registrations/main/status.json
-cat /bloom/wallets/registrations/main/ceremony_url
-```
-
-Open or forward `ceremony_url` to a human, then poll `status.json` until its
-`state` is `completed`; only then does `wallets/main/address` exist. Write to
-`wallets/registrations/<name>/cancel` to cancel a live registration. This
-requires a running `bloom serve` daemon — an in-process `bloom vfs write`
-fails clearly, before staging anything, if no daemon is reachable.
-
-Explicit `kind = "local"` / `kind = "import"` wallets remain synchronous and
-require `allow_passphrase_wallet = true` plus a passphrase field — passkey is
-the default specifically to avoid silently minting a fund-holding wallet with
-a machine-chosen passphrase. `kind = "passkey-import"` is not yet supported
-through the VFS; use `bloom wallet import <name> <key>` from a trusted
-foreground terminal instead.
-
 ## Wallet addresses & roles
 
 A wallet has **one owner/signer key**. Petals may associate it with additional

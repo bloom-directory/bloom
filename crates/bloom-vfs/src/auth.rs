@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use bloom_auth_api::{
     ApprovalVerifier, AuthStoreView, AuthStoreWriter, GrantStore, PetalHost, PolicyEvaluator,
-    SigningAttestationSchemaRegistry, WalletRegistrationCoordinator,
+    SigningAttestationSchemaRegistry,
 };
 
 use crate::handler::HandlerError;
@@ -26,8 +26,6 @@ pub struct AuthServices {
     attestation_registry: Option<Arc<dyn SigningAttestationSchemaRegistry>>,
     /// WS-3: policy taxonomy evaluator (Hard / StepUp / Informational).
     policy_evaluator: Option<Arc<dyn PolicyEvaluator>>,
-    /// Daemon-owned asynchronous passkey registration coordinator.
-    registration_coordinator: Option<Arc<dyn WalletRegistrationCoordinator>>,
 }
 
 impl AuthServices {
@@ -44,7 +42,6 @@ impl AuthServices {
             petal_host: None,
             attestation_registry: None,
             policy_evaluator: None,
-            registration_coordinator: None,
         }
     }
 
@@ -83,14 +80,6 @@ impl AuthServices {
 
     pub fn with_policy_evaluator(mut self, policy_evaluator: Arc<dyn PolicyEvaluator>) -> Self {
         self.policy_evaluator = Some(policy_evaluator);
-        self
-    }
-
-    pub fn with_registration_coordinator(
-        mut self,
-        coordinator: Arc<dyn WalletRegistrationCoordinator>,
-    ) -> Self {
-        self.registration_coordinator = Some(coordinator);
         self
     }
 
@@ -166,22 +155,6 @@ impl AuthServices {
             .ok_or_else(|| HandlerError::Unsupported("Policy evaluator is not wired".into()))
     }
 
-    pub fn registration_coordinator(&self) -> Option<&Arc<dyn WalletRegistrationCoordinator>> {
-        self.registration_coordinator.as_ref()
-    }
-
-    pub fn require_registration_coordinator(
-        &self,
-    ) -> Result<&Arc<dyn WalletRegistrationCoordinator>, HandlerError> {
-        self.registration_coordinator.as_ref().ok_or_else(|| {
-            HandlerError::Unsupported(
-                "wallet registration requires a running `bloom serve` daemon; start it and \
-                 retry"
-                    .into(),
-            )
-        })
-    }
-
     pub fn is_wired(&self) -> bool {
         self.approval_verifier.is_some()
             || self.store.is_some()
@@ -190,6 +163,5 @@ impl AuthServices {
             || self.petal_host.is_some()
             || self.attestation_registry.is_some()
             || self.policy_evaluator.is_some()
-            || self.registration_coordinator.is_some()
     }
 }

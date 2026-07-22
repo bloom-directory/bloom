@@ -49,42 +49,6 @@ Read `/defi/README.md` for DeFi intents via Enso shortcuts.
 
 When asked for an address for a certain wallet, consider displaying in-line the QR code image for the relevant wallet e.g. `wallets/<wallet>/address.qr.png`.
 
-## Creating a wallet (asynchronous passkey registration)
-
-Writing a plain name to `wallets/new` **starts a passkey registration — it
-does not create a local wallet**, and the write returns before the ceremony
-completes:
-
-```sh
-printf 'main\n' > wallets/new
-cat wallets/registrations/main/status.json
-cat wallets/registrations/main/ceremony_url
-```
-
-- Read `status.json` and `ceremony_url` right after the write.
-- Open or forward `ceremony_url` to a human; do not attempt it yourself. Never
-  imitate WebAuthn, supply PRF material, read recovery material, or silently
-  downgrade to a passphrase wallet — none of that is available or safe from
-  an agent.
-- If the registration page reports an unsupported passkey method, ask the
-  human to retry with a browser/device passkey, a password-manager passkey
-  (iCloud Keychain, Google Password Manager), or a compatible hardware
-  security key — and specifically to choose **"Use browser, device, or
-  hardware key"** if Bitwarden intercepts the prompt.
-- Do not proceed until `status.json`'s `state` is `completed`; only then read
-  the new wallet's address at `wallets/<name>/address`.
-- Asynchronous passkey registration requires a running `bloom serve` daemon.
-  If no registration service is available, the write fails clearly and tells
-  you to start `bloom serve`; retry after it is running rather than falling
-  back to any other wallet-creation path.
-- To cancel a live registration, write anything to
-  `wallets/registrations/<name>/cancel`.
-
-Explicit `kind = "local"` and `kind = "import"` wallets remain synchronous and
-require `allow_passphrase_wallet = true` plus a passphrase in the TOML spec —
-passkey is the default for a reason. `kind = "passkey-import"` is not yet
-supported through the VFS.
-
 ## Mounted Sealed Approval flow
 
 When working through a mounted tree, a confirm write that needs fresh owner

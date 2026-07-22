@@ -473,18 +473,6 @@ mod tests {
             !text.contains("bloom vfs"),
             "guidance should not mention the bloom vfs CLI"
         );
-        // Documentation assertion (plan:
-        // docs/plans/2026-07-21-async-vfs-passkey-registration.md): agent
-        // guidance must describe asynchronous passkey registration.
-        assert!(
-            text.contains("wallets/registrations/") && text.contains("status.json"),
-            "guidance must document wallets/registrations/<name>/status.json"
-        );
-        assert!(
-            text.contains("does not create a local wallet")
-                || text.contains("does NOT create a local wallet"),
-            "guidance must explicitly say a plain /wallets/new write does not create a local wallet"
-        );
     }
 
     #[tokio::test]

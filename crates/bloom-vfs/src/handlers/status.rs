@@ -505,11 +505,6 @@ struct DaemonInfo {
     started_at: String,
     uptime_secs: u64,
     chains: Vec<String>,
-    /// Registration-protocol version this daemon speaks
-    /// (`bloom_auth_api::WALLET_REGISTRATION_PROTOCOL_VERSION`). A newer CLI
-    /// talking to an older daemon that lacks this field, or reports a lower
-    /// number, should tell the caller to restart `bloom serve`.
-    wallet_registration_protocol_version: u32,
 }
 
 #[async_trait]
@@ -688,8 +683,6 @@ impl StatusHandler {
                     started_at: self.started_at_rfc3339(),
                     uptime_secs: self.uptime_secs(),
                     chains: self.chains.list_names(),
-                    wallet_registration_protocol_version:
-                        bloom_auth_api::WALLET_REGISTRATION_PROTOCOL_VERSION,
                 };
                 Ok(serde_json::to_vec_pretty(&info).unwrap())
             }

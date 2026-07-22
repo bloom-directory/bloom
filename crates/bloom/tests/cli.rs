@@ -924,46 +924,6 @@ fn wallet_created_audit_event() {
     );
 }
 
-/// `wallet import <name> <key>` (passkey, the default — no `--local`) must
-/// reject a malformed name *before* it can reach `prepare_passkey_wallet`'s
-/// `root.join(temp_id)`/`finalize_passkey_wallet`'s `root.join(&name)`. This
-/// used to rely on `keystore.info_unverified(&name).is_ok()` as an
-/// "already exists" check, but `info_unverified` validates the name first —
-/// so an invalid name also returns `Err`, indistinguishable under `.is_ok()`
-/// from "not found," and the name flowed straight through to the
-/// filesystem-path joins below. Every name here must be rejected before any
-/// WebAuthn ceremony would launch (this test would hang on a browser
-/// otherwise), and none may leave a trace on disk.
-#[test]
-fn wallet_import_passkey_rejects_path_traversal_names() {
-    let home = fresh_home();
-    for name in ["../escape", "../../escape", "a/b", "..", "/etc/passwd"] {
-        let assert = bloom_cmd(home.path())
-            .args(["wallet", "import", name, "deadbeef"])
-            .assert()
-            .failure();
-        let err = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
-        assert!(
-            err.contains("invalid wallet name"),
-            "name={name:?} expected invalid-name error, got: {err}"
-        );
-    }
-    assert!(
-        !home.path().join("keystore").join("escape").exists(),
-        "traversal name must not create a wallet dir"
-    );
-    assert!(
-        !home
-            .path()
-            .join("keystore")
-            .parent()
-            .unwrap()
-            .join("escape")
-            .exists(),
-        "traversal name must not escape the keystore root"
-    );
-}
-
 #[test]
 fn request_cli_dry_run_uses_vfs_lifecycle_and_body_receipt_helpers() {
     let home = fresh_home();

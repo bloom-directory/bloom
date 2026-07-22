@@ -1004,112 +1004,6 @@ fn is_ipc_handler_permission_denied(e: &std::io::Error) -> bool {
     s.contains("-32007") || s.contains("permission denied")
 }
 
-/// Poll `/wallets/registrations/<name>/status.json` over IPC until the
-/// registration reaches a terminal state, printing (and opening) the
-/// ceremony URL the first time it's seen. Returns the terminal status JSON.
-async fn poll_wallet_registration_ipc(
-    client: &IpcClient,
-    client_endpoint: &ResolvedEndpoint,
-    name: &str,
-) -> Result<serde_json::Value> {
-    let status_path = format!("/wallets/registrations/{name}/status.json");
-    let mut printed_url = false;
-    loop {
-        let res = try_ipc(
-            client,
-            client_endpoint,
-            "read",
-            serde_json::json!({ "path": status_path }),
-        )
-        .await
-        .with_context(|| format!("ipc read via {}", client_endpoint.display))?
-        .context("daemon disappeared mid-registration")?;
-        let b64 = res
-            .get("bytes_b64")
-            .and_then(|v| v.as_str())
-            .context("ipc read: missing bytes_b64")?;
-        let bytes = B64.decode(b64).context("ipc read: bad base64")?;
-        let status: serde_json::Value =
-            serde_json::from_slice(&bytes).context("parse registration status.json")?;
-        let state = status.get("state").and_then(|v| v.as_str()).unwrap_or("");
-        if !printed_url && let Some(url) = status.get("ceremony_url").and_then(|v| v.as_str()) {
-            eprintln!("[bloom] Open this URL to complete passkey registration: {url}");
-            let _ = bloom_keystore::launch_browser(url);
-            printed_url = true;
-        }
-        match state {
-            "completed" => return Ok(status),
-            "failed" | "expired" | "cancelled" => {
-                let err = status
-                    .get("error")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or(state);
-                anyhow::bail!("passkey registration {state}: {err}");
-            }
-            _ => {
-                // Backstop for a wedged daemon: the daemon's own sweep
-                // normally flips a stale session to `expired` within a
-                // minute of `expires_at_ms`, but if its background task
-                // ever stops running, that transition never happens and
-                // this loop would otherwise spin forever.
-                if let Some(expires_at_ms) = status.get("expires_at_ms").and_then(|v| v.as_u64())
-                    && system_time_to_unix_ms(SystemTime::now()) as u64 > expires_at_ms
-                {
-                    anyhow::bail!(
-                        "passkey registration timed out: past its expiry with no terminal \
-                         state from the daemon (it may be stuck) — try again"
-                    );
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(1500)).await
-            }
-        }
-    }
-}
-
-/// In-process equivalent of [`poll_wallet_registration_ipc`], for the
-/// command-scoped fallback ceremony used when no daemon is reachable.
-async fn poll_wallet_registration_inproc(
-    coordinator: &Arc<dyn bloom_auth_api::WalletRegistrationCoordinator>,
-    name: &str,
-) -> Result<bloom_auth_api::WalletRegistrationStatus> {
-    use bloom_auth_api::WalletRegistrationState::*;
-    let mut printed_url = false;
-    loop {
-        let status = coordinator
-            .status(name)
-            .await
-            .map_err(|e| anyhow::anyhow!(e.to_string()))?
-            .context("registration session disappeared")?;
-        if !printed_url && let Some(url) = &status.ceremony_url {
-            eprintln!("[bloom] Open this URL to complete passkey registration: {url}");
-            let _ = bloom_keystore::launch_browser(url);
-            printed_url = true;
-        }
-        match status.state {
-            Completed => return Ok(status),
-            Failed | Expired | Cancelled => {
-                anyhow::bail!(
-                    "passkey registration {}: {}",
-                    status.state.as_str(),
-                    status.error.as_deref().unwrap_or("no further detail")
-                );
-            }
-            AwaitingUser | AwaitingRecoveryAck => {
-                // Same expiry backstop as the IPC poller: the coordinator's
-                // own sweep should reach this first, but don't spin forever
-                // if it doesn't.
-                if system_time_to_unix_ms(SystemTime::now()) as u64 > status.expires_at_ms {
-                    anyhow::bail!(
-                        "passkey registration timed out: past its expiry with no terminal \
-                         state (it may be stuck) — try again"
-                    );
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(1500)).await
-            }
-        }
-    }
-}
-
 fn system_time_to_unix_ms(time: SystemTime) -> u128 {
     time.duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -1634,8 +1528,8 @@ async fn run(cli: Cli) -> Result<()> {
             allow_passphrase_wallet,
             passphrase_file,
         }) => {
-            if local {
-                let (_home_permit, d) = build_write_daemon(home)?;
+            let (_home_permit, d) = build_write_daemon(home)?;
+            let info = if local {
                 let pass = resolve_new_wallet_passphrase(
                     allow_passphrase_wallet,
                     passphrase_file.as_deref(),
@@ -1646,131 +1540,30 @@ async fn run(cli: Cli) -> Result<()> {
                     "passphrase recovery file: {} (mode 0600) — store or delete after migrating to passkey",
                     recovery.display()
                 );
-                audit_wallet_created(&d.audit, &info.name, "local");
-                println!("created wallet '{}': {}", info.name, info.address);
-                if set_default_wallet_if_empty(&d.home, &info.name)? {
-                    println!(
-                        "default_wallet: {} (set in {})",
-                        info.name,
-                        d.home.config_path().display()
-                    );
-                }
-                if let Some(ref key) = info.recovery_key {
-                    acknowledge_recovery_key(&info.name, key);
-                }
-                println!("\n── deposit ──");
-                commands::qr::print_deposit(&bloom_proto::checksum_address(&info.address));
-                return Ok(());
-            }
-
-            // Passkey (default): same asynchronous attempt/completion
-            // implementation as `bloom vfs write /wallets/new` — prefer a
-            // running `bloom serve` over IPC; fall back to a command-scoped
-            // instance of the identical ceremony-server/coordinator
-            // machinery when no daemon is reachable. Never a second,
-            // separate registration implementation.
-            let client = IpcClient::new(&client_endpoint.socket);
-            // Guard against a still-running `bloom serve` started before
-            // this CLI's async registration protocol existed: treating its
-            // `/wallets/new` as if it spoke the current contract would fail
-            // in a confusing way (e.g. racing its own port-18734 bind)
-            // rather than a clear "restart the daemon" error.
-            if let Some(daemon_status) = try_ipc(
-                &client,
-                &client_endpoint,
-                "read",
-                serde_json::json!({ "path": "/status/daemon.json" }),
-            )
-            .await
-            .with_context(|| format!("ipc read via {}", client_endpoint.display))?
-            {
-                let b64 = daemon_status
-                    .get("bytes_b64")
-                    .and_then(|v| v.as_str())
-                    .context("ipc read: missing bytes_b64")?;
-                let bytes = B64.decode(b64).context("ipc read: bad base64")?;
-                let daemon_info: serde_json::Value =
-                    serde_json::from_slice(&bytes).context("parse status/daemon.json")?;
-                let daemon_protocol_version = daemon_info
-                    .get("wallet_registration_protocol_version")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
-                if daemon_protocol_version
-                    < bloom_auth_api::WALLET_REGISTRATION_PROTOCOL_VERSION as u64
-                {
-                    anyhow::bail!(
-                        "the running `bloom serve` daemon does not speak this CLI's async \
-                         passkey registration protocol — restart `bloom serve` to pick up \
-                         the matching daemon version, then retry"
-                    );
-                }
-            }
-            let ipc_res = try_ipc(
-                &client,
-                &client_endpoint,
-                "write",
-                serde_json::json!({ "path": "/wallets/new", "bytes_b64": B64.encode(name.as_bytes()) }),
-            )
-            .await
-            .with_context(|| format!("ipc write via {}", client_endpoint.display))?;
-
-            let address = if ipc_res.is_some() {
-                debug!(endpoint = %client_endpoint.display, "cli.wallet.new.via_ipc");
-                let status = poll_wallet_registration_ipc(&client, &client_endpoint, &name).await?;
-                status
-                    .get("address")
-                    .and_then(|v| v.as_str())
-                    .context("completed registration status missing address")?
-                    .to_string()
+                info
             } else {
-                debug!("cli.wallet.new.via_inproc: no daemon socket present");
-                let (_home_permit, d) = build_write_daemon(home.clone())?;
-                let ceremony = bloom_daemon::ceremony_server::spawn(&d)
-                    .await
-                    .context("bind local passkey ceremony listener")?;
-                let coordinator = d
-                    .auth_services
-                    .require_registration_coordinator()
-                    .map_err(|e| anyhow::anyhow!(e.to_string()))?
-                    .clone();
-                let stage_result = coordinator
-                    .stage(&name, system_time_to_unix_ms(SystemTime::now()) as u64)
-                    .await
-                    .map_err(|e| anyhow::anyhow!(e.to_string()));
-                let result = match stage_result {
-                    Ok(_) => poll_wallet_registration_inproc(&coordinator, &name).await,
-                    Err(e) => Err(e),
-                };
-                ceremony.shutdown().await;
-                let status = result?;
-                status
-                    .address
-                    .context("completed registration status missing address")?
+                d.keystore.create_passkey(&name).await?
             };
-
             audit_wallet_created(
-                &Daemon::from_home(home.clone())
-                    .context("build daemon")?
-                    .audit,
-                &name,
-                "passkey",
+                &d.audit,
+                &info.name,
+                if local { "local" } else { "passkey" },
             );
-            println!("created wallet '{name}': {address}");
-            println!(
-                "the recovery key was shown once in the browser during the ceremony; it is \
-                 not available here — store it like a seed phrase."
-            );
-            if set_default_wallet_if_empty(&home, &name)? {
+            println!("created wallet '{}': {}", info.name, info.address);
+            if set_default_wallet_if_empty(&d.home, &info.name)? {
                 println!(
                     "default_wallet: {} (set in {})",
-                    name,
-                    home.config_path().display()
+                    info.name,
+                    d.home.config_path().display()
                 );
+            }
+            if let Some(ref key) = info.recovery_key {
+                acknowledge_recovery_key(&info.name, key);
             }
             // Show the deposit QR + address right away — a fresh wallet's first
             // need is to receive funds.
             println!("\n── deposit ──");
-            commands::qr::print_deposit(&address);
+            commands::qr::print_deposit(&bloom_proto::checksum_address(&info.address));
             Ok(())
         }
         Cmd::Wallet(WalletCmd::Import {
@@ -1781,7 +1574,7 @@ async fn run(cli: Cli) -> Result<()> {
             passphrase_file,
         }) => {
             let (_home_permit, d) = build_write_daemon(home)?;
-            if local {
+            let info = if local {
                 let pass = resolve_new_wallet_passphrase(
                     allow_passphrase_wallet,
                     passphrase_file.as_deref(),
@@ -1792,85 +1585,26 @@ async fn run(cli: Cli) -> Result<()> {
                     "passphrase recovery file: {} (mode 0600) — store or delete after migrating to passkey",
                     recovery.display()
                 );
-                audit_wallet_created(&d.audit, &info.name, "local");
-                println!("imported wallet '{}': {}", info.name, info.address);
-                if set_default_wallet_if_empty(&d.home, &info.name)? {
-                    println!(
-                        "default_wallet: {} (set in {})",
-                        info.name,
-                        d.home.config_path().display()
-                    );
-                }
-                if let Some(ref key) = info.recovery_key {
-                    acknowledge_recovery_key(&info.name, key);
-                }
-                return Ok(());
-            }
-
-            // Passkey-import: foreground-only, not routed through the VFS
-            // asynchronous registration coordinator (which does not accept
-            // a caller-supplied private key — see
-            // docs/plans/2026-07-21-async-vfs-passkey-registration.md). The
-            // private key never leaves this process; it is held only in
-            // memory for the duration of the ceremony below.
-            //
-            // Validate explicitly rather than relying on `info_unverified`'s
-            // `.is_ok()` as an existence proxy: `info_unverified` itself
-            // calls `validate_name` first, so an invalid name (`../x`, a
-            // path separator, empty, absolute) makes it return `Err` too —
-            // indistinguishable from "not found" under `.is_ok()`. That let
-            // invalid names flow into `temp_id`, `prepare_passkey_wallet`,
-            // and `root.join(&name)` below, which can escape the keystore
-            // root.
-            bloom_keystore::Keystore::validate_name(&name)
-                .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-            if d.keystore.info_unverified(&name).is_ok() {
-                bail!("wallet '{name}' already exists");
-            }
-            let key_bytes = bloom_keystore::decode_priv_hex(&private_key)
-                .map_err(|e| anyhow::anyhow!("private key: {e}"))?;
-            let signer = alloy::signers::local::PrivateKeySigner::from_bytes(&key_bytes.into())
-                .map_err(|e| anyhow::anyhow!("private key: {e}"))?;
-            let policy_toml =
-                bloom_keystore::default_passkey_policy_toml().context("default policy")?;
-            let mut prf_salt = [0u8; 32];
-            {
-                use rand::RngCore as _;
-                rand::thread_rng().fill_bytes(&mut prf_salt);
-            }
-            let (credential, prf_output) =
-                bloom_keystore::foreground_registration_ceremony(&name, &prf_salt)
-                    .await
-                    .map_err(|e| anyhow::anyhow!(e))?;
-            let temp_id = format!("import-{name}");
-            let prepared = bloom_keystore::prepare_passkey_wallet(
-                d.keystore.root(),
-                &temp_id,
-                &name,
-                &signer,
-                &credential,
-                &prf_salt,
-                prf_output,
-                &policy_toml,
-            )?;
-            let final_dir = d.keystore.root().join(&name);
-            if final_dir.exists() {
-                bail!("wallet '{name}' already exists");
-            }
-            let finalized = bloom_keystore::finalize_passkey_wallet(prepared, &final_dir)
-                .map_err(|(_prepared, e)| e)?;
-            d.keystore.cache_unlocked_signer(&name, signer);
-            audit_wallet_created(&d.audit, &name, "passkey");
-            let address = bloom_proto::checksum_address(&finalized.address);
-            println!("imported wallet '{name}': {address}");
-            if set_default_wallet_if_empty(&d.home, &name)? {
+                info
+            } else {
+                d.keystore.import_passkey(&name, &private_key).await?
+            };
+            audit_wallet_created(
+                &d.audit,
+                &info.name,
+                if local { "local" } else { "passkey" },
+            );
+            println!("imported wallet '{}': {}", info.name, info.address);
+            if set_default_wallet_if_empty(&d.home, &info.name)? {
                 println!(
                     "default_wallet: {} (set in {})",
-                    name,
+                    info.name,
                     d.home.config_path().display()
                 );
             }
-            acknowledge_recovery_key(&name, &hex::encode(key_bytes));
+            if let Some(ref key) = info.recovery_key {
+                acknowledge_recovery_key(&info.name, key);
+            }
             Ok(())
         }
         Cmd::Wallet(WalletCmd::List) => {

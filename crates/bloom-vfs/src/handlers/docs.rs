@@ -194,28 +194,4 @@ mod tests {
         let err = h.read(&VfsPath::root()).await.unwrap_err();
         assert!(matches!(err, HandlerError::NotAFile(_)));
     }
-
-    /// Documentation assertion (plan:
-    /// docs/plans/2026-07-21-async-vfs-passkey-registration.md): embedded
-    /// docs must describe the asynchronous registration path and must never
-    /// describe plain `/wallets/new` as creating a local wallet.
-    #[tokio::test]
-    async fn wallet_creation_docs_describe_async_registration_not_local_wallet() {
-        let h = DocsHandler::new();
-        for name in ["README.md", "examples.md"] {
-            let bytes = h
-                .read(&VfsPath::parse(&format!("/{name}")).unwrap())
-                .await
-                .unwrap();
-            let s = String::from_utf8(bytes).unwrap();
-            assert!(
-                s.contains("wallets/registrations/") && s.contains("status.json"),
-                "{name} must document wallets/registrations/<name>/status.json"
-            );
-            assert!(
-                !s.contains("plain name") || !s.contains("creates a local wallet"),
-                "{name} must not describe a plain /wallets/new write as creating a local wallet"
-            );
-        }
-    }
 }

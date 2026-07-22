@@ -30,17 +30,7 @@
 
 pub mod ephemeral;
 pub(crate) mod passkey;
-pub use passkey::{
-    FinalizedPasskeyWallet, PreparedPasskeyWallet, SealedCeremonyChallenge, bind_local,
-    client_data_challenge_b64, default_passkey_policy_toml, finalize_passkey_wallet,
-    finish_registration, finish_registration_fallback_assertion, foreground_registration_ceremony,
-    launch_browser, prepare_passkey_wallet, start_registration_challenge,
-    start_registration_fallback_assertion,
-};
-pub use webauthn_rs::prelude::{
-    AuthenticationResult, Passkey, PasskeyAuthentication, PasskeyRegistration, PublicKeyCredential,
-    RegisterPublicKeyCredential,
-};
+pub use passkey::{SealedCeremonyChallenge, client_data_challenge_b64};
 pub mod petal_host;
 pub mod xdsa;
 #[cfg(test)]
@@ -503,14 +493,7 @@ impl Keystore {
         self.inner.root.join(name)
     }
 
-    /// Validate a wallet name: non-empty, at most 64 bytes, and restricted to
-    /// `[A-Za-z0-9_-]` — no path separators, `..`, or other characters that
-    /// could escape the keystore root once the name is joined into a
-    /// filesystem path. `pub` so callers that stage a wallet without going
-    /// through a `Keystore` method first (e.g. the daemon's asynchronous
-    /// passkey registration coordinator) can apply the identical rule before
-    /// the name ever reaches a `Path::join`.
-    pub fn validate_name(name: &str) -> Result<(), KeystoreError> {
+    fn validate_name(name: &str) -> Result<(), KeystoreError> {
         if name.is_empty() || name.len() > 64 {
             return Err(KeystoreError::InvalidName(name.into()));
         }
@@ -751,6 +734,27 @@ impl Keystore {
             policy: Policy::default(),
             recovery_key: None,
         })
+    }
+
+    /// Create a new PasskeyGated wallet. Opens the browser for a WebAuthn
+    /// registration ceremony; blocks until completion or the 120 s timeout.
+    pub async fn create_passkey(&self, name: &str) -> Result<WalletInfo, KeystoreError> {
+        let signer = PrivateKeySigner::random();
+        self.import_passkey_inner(name, &signer).await
+    }
+
+    /// Import an existing hex private key as a PasskeyGated wallet.
+    /// Opens the browser for a WebAuthn registration ceremony.
+    pub async fn import_passkey(
+        &self,
+        name: &str,
+        private_key_hex: &str,
+    ) -> Result<WalletInfo, KeystoreError> {
+        let bytes = decode_priv_hex(private_key_hex)
+            .map_err(|e| KeystoreError::Malformed(format!("private key: {e}")))?;
+        let signer = PrivateKeySigner::from_bytes(&bytes.into())
+            .map_err(|e| KeystoreError::Signer(e.to_string()))?;
+        self.import_passkey_inner(name, &signer).await
     }
 
     // ── unlock ────────────────────────────────────────────────────────────────
@@ -1020,8 +1024,7 @@ fn write_atomic(path: &Path, body: &[u8]) -> Result<(), KeystoreError> {
     Ok(())
 }
 
-/// Decode a `0x`-prefixed or bare hex-encoded 32-byte private key.
-pub fn decode_priv_hex(s: &str) -> Result<[u8; 32], String> {
+fn decode_priv_hex(s: &str) -> Result<[u8; 32], String> {
     let s = s.trim();
     let s = s.strip_prefix("0x").unwrap_or(s);
     let v = hex::decode(s).map_err(|e| e.to_string())?;

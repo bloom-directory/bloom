@@ -1,0 +1,244 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>bloom — Register Passkey</title>
+  <style>
+    body{font-family:monospace;max-width:620px;margin:60px auto;padding:0 20px}
+    h1{font-size:1.1em;margin-bottom:0.2em}
+    .wallet{color:#888;font-size:0.9em;margin:0 0 1.4em}
+    .section{margin-bottom:1.2em}
+    .section-label{font-size:0.75em;text-transform:uppercase;letter-spacing:0.08em;color:#888;margin:0 0 0.5em}
+    .field{display:flex;align-items:baseline;gap:0.6em;margin-bottom:0.4em}
+    .field label{font-size:0.85em;color:#444;min-width:220px}
+    .field input[type=number]{font-family:monospace;font-size:0.85em;width:90px;padding:0.2em 0.4em;border:1px solid #ccc;border-radius:3px}
+    .field input[type=checkbox]{width:14px;height:14px;cursor:pointer}
+    .field .unit{font-size:0.8em;color:#888}
+    .field .opt{font-size:0.75em;color:#aaa;margin-left:0.2em}
+    button{font-family:monospace;font-size:0.95em;padding:0.55em 1.2em;background:#1a1a2e;color:#fff;border:none;border-radius:4px;cursor:pointer;margin-top:0.6em}
+    button:disabled{opacity:0.45;cursor:default}
+    .hint{color:#888;font-size:0.8em;margin-top:0.4em}
+    #status{margin-top:1em;padding:0.8em 1em;border-radius:4px;line-height:1.5;display:none}
+    .ok{background:#d4edda;color:#155724;display:block!important}
+    .err{background:#f8d7da;color:#721c24;display:block!important}
+    hr{border:none;border-top:1px solid #e8e8e8;margin:1.2em 0}
+  </style>
+</head>
+<body>
+  <h1>bloom — Register Passkey</h1>
+  <p class="wallet" id="wallet-name">Loading…</p>
+
+  <div class="section">
+    <p class="section-label">Spend limits</p>
+    <div class="field">
+      <label>Hard cap per tx</label>
+      <input type="number" id="max_value_eth" min="0" step="0.01" placeholder="none">
+      <span class="unit">ETH</span><span class="opt">(optional)</span>
+    </div>
+    <div class="field">
+      <label>Require override above</label>
+      <input type="number" id="require_override_above_eth" min="0" step="0.01" placeholder="none">
+      <span class="unit">ETH</span><span class="opt">(optional)</span>
+    </div>
+    <div class="field">
+      <label>Require confirm above</label>
+      <input type="number" id="require_confirm_above_usd" min="0" step="1" placeholder="none">
+      <span class="unit">USD</span><span class="opt">(optional)</span>
+    </div>
+  </div>
+
+  <div class="section">
+    <p class="section-label">Swap protection</p>
+    <div class="field">
+      <label>Max slippage</label>
+      <input type="number" id="max_slippage_pct" min="0.01" max="50" step="0.01" value="1">
+      <span class="unit">%</span>
+    </div>
+    <div class="field">
+      <label>Fail on high-risk routes</label>
+      <input type="checkbox" id="fail_on_high_risk">
+    </div>
+  </div>
+
+  <div class="section">
+    <p class="section-label">Privacy</p>
+    <div class="field">
+      <label>Route via MEV Blocker</label>
+      <input type="checkbox" id="private_enabled">
+    </div>
+  </div>
+
+  <hr>
+  <button id="btn" disabled>Save policy &amp; register passkey</button>
+  <p class="hint">Your authenticator (Touch ID, security key, etc.) will be prompted after clicking.</p>
+  <div id="status"></div>
+
+<script>
+var TK=new URLSearchParams(location.search).get('t')||'';
+var PASSKEY_FLOW_ACTIVE=false;
+function dec(s){
+  s=s.replace(/-/g,'+').replace(/_/g,'/');
+  while(s.length%4)s+='=';
+  return Uint8Array.from(atob(s),c=>c.charCodeAt(0));
+}
+function enc(b){
+  return btoa(String.fromCharCode(...new Uint8Array(b)))
+    .replace(/\+/g,'-').replace(/\//g,'_').replace(/=/g,'');
+}
+function fval(id){return document.getElementById(id).value.trim();}
+function fchecked(id){return document.getElementById(id).checked;}
+function buildToml(){
+  var lines=['[caps]'];
+  var maxEth=fval('max_value_eth');
+  var overEth=fval('require_override_above_eth');
+  var confUsd=fval('require_confirm_above_usd');
+  if(maxEth)  lines.push('max_value_eth = '+parseFloat(maxEth));
+  if(overEth) lines.push('require_override_above_eth = '+parseFloat(overEth));
+  if(confUsd) lines.push('require_confirm_above_usd = '+parseFloat(confUsd));
+  var slippageBps=Math.round(parseFloat(fval('max_slippage_pct')||'1')*100);
+  lines.push('','[mev]',
+    'max_slippage_bps = '+slippageBps,
+    'fail_on_high_risk = '+(fchecked('fail_on_high_risk')?'true':'false'));
+  lines.push('','[private]',
+    'enabled = '+(fchecked('private_enabled')?'true':'false'),
+    'provider = "mev_blocker"');
+  lines.push('','[bump]',
+    'stuck_after_secs = 90',
+    'basefee_overrun_pct = 20');
+  return lines.join('\n');
+}
+function populateForm(toml){
+  function match(key){var m=toml.match(new RegExp(key+'\\s*=\\s*([^\\n]+)'));return m?m[1].trim():null;}
+  var maxEth=match('max_value_eth');         if(maxEth) document.getElementById('max_value_eth').value=maxEth;
+  var overEth=match('require_override_above_eth'); if(overEth) document.getElementById('require_override_above_eth').value=overEth;
+  var confUsd=match('require_confirm_above_usd'); if(confUsd) document.getElementById('require_confirm_above_usd').value=confUsd;
+  var bps=match('max_slippage_bps'); if(bps) document.getElementById('max_slippage_pct').value=(parseInt(bps)/100).toFixed(2);
+  var fhr=match('fail_on_high_risk'); if(fhr) document.getElementById('fail_on_high_risk').checked=(fhr==='true');
+  var priv=match('enabled'); if(priv) document.getElementById('private_enabled').checked=(priv==='true');
+}
+async function init(){
+  var name=await(await fetch('/name')).text();
+  document.getElementById('wallet-name').textContent='wallet: '+name;
+  var toml=await(await fetch('/policy')).text();
+  populateForm(toml);
+  document.getElementById('btn').disabled=false;
+}
+async function register(){
+  var btn=document.getElementById('btn');
+  var st=document.getElementById('status');
+  btn.disabled=true;
+  st.style.display='block';
+  st.className='';
+  if(!navigator.credentials||!navigator.credentials.create){
+    st.className='err';
+    st.textContent='WebAuthn is not available in this browser. Try Chrome or Safari on this device.';
+    return;
+  }
+  var toml=buildToml();
+  var upd=await fetch('/policy/update',{method:'POST',headers:{'Content-Type':'text/plain','x-bloom-token':TK},body:toml});
+  if(!upd.ok){
+    st.className='err';
+    st.textContent='Policy validation failed (invalid TOML). Please check your inputs.';
+    btn.disabled=false;
+    return;
+  }
+  st.textContent='Waiting for passkey interaction (Touch ID / security key)…';
+  PASSKEY_FLOW_ACTIVE=true;
+  try{
+    var opts=await(await fetch('/challenge')).json();
+    opts.publicKey.challenge=dec(opts.publicKey.challenge);
+    opts.publicKey.user.id=dec(opts.publicKey.user.id);
+    if(opts.publicKey.excludeCredentials)
+      opts.publicKey.excludeCredentials=opts.publicKey.excludeCredentials.map(function(c){return{...c,id:dec(c.id)};});
+    // Decode the PRF salt from base64url to ArrayBuffer for the WebAuthn API.
+    var prfSaltBytes=null;
+    if(opts.publicKey.extensions&&opts.publicKey.extensions.prf&&opts.publicKey.extensions.prf.eval&&opts.publicKey.extensions.prf.eval.first){
+      prfSaltBytes=dec(opts.publicKey.extensions.prf.eval.first);
+      opts.publicKey.extensions.prf.eval.first=prfSaltBytes;
+    }
+    var cred=await navigator.credentials.create(opts);
+    var ext=cred.getClientExtensionResults();
+    var prfFirst=ext&&ext.prf&&ext.prf.results&&ext.prf.results.first;
+
+    if(prfFirst){
+      // PRF output returned during create — most common path (macOS Touch ID + Chrome).
+      await fetch('/prf-output',{method:'POST',headers:{'Content-Type':'application/json','x-bloom-token':TK},body:JSON.stringify({prf_output_b64:enc(prfFirst),client_data_json_b64:enc(cred.response.clientDataJSON)})});
+    }else if(ext&&ext.prf&&ext.prf.enabled){
+      // PRF is supported but output only available during get(), not create().
+      // Run a secondary authentication to extract PRF output.
+      st.textContent='Almost done — please authenticate once more to complete PRF setup…';
+      var challengeData=await(await fetch('/auth-challenge')).json();
+      var fallbackChallenge=dec(challengeData.challenge);
+      var credId=new Uint8Array(cred.rawId);
+      var authOpts={
+        publicKey:{
+          challenge:fallbackChallenge,
+          timeout:60000,
+          allowCredentials:[{id:credId,type:'public-key'}],
+          extensions:{prf:{eval:{first:prfSaltBytes}}}
+        }
+      };
+      var authCred=await navigator.credentials.get(authOpts);
+      var authExt=authCred.getClientExtensionResults();
+      var authPrfFirst=authExt&&authExt.prf&&authExt.prf.results&&authExt.prf.results.first;
+      if(!authPrfFirst){
+        st.className='err';
+        st.textContent='PRF output not available from your authenticator. Supported: Touch ID (macOS/iOS), YubiKey 5+, Windows Hello (Chrome 147+), security keys with hmac-secret. On Linux: Chromium has no built-in passkey manager — install Google Chrome instead.';
+        btn.disabled=false;
+        return;
+      }
+      await fetch('/prf-output',{method:'POST',headers:{'Content-Type':'application/json','x-bloom-token':TK},body:JSON.stringify({prf_output_b64:enc(authPrfFirst),client_data_json_b64:enc(authCred.response.clientDataJSON)})});
+    }else{
+      // PRF not supported at all by this authenticator.
+      st.className='err';
+      st.textContent='Your authenticator does not support the PRF extension required by bloom passkey wallets. Supported: Touch ID (macOS/iOS), YubiKey 5+, Windows Hello (Chrome 147+), security keys with hmac-secret. On Linux: Chromium has no built-in passkey manager — install Google Chrome instead.';
+      btn.disabled=false;
+      return;
+    }
+
+    await fetch('/register',{method:'POST',headers:{'Content-Type':'application/json','x-bloom-token':TK},body:JSON.stringify({
+      id:cred.id,rawId:enc(cred.rawId),type:cred.type,
+      response:{
+        attestationObject:enc(cred.response.attestationObject),
+        clientDataJSON:enc(cred.response.clientDataJSON)
+      }
+    })});
+    st.className='ok';
+    st.textContent='✓ Passkey registered. You can close this tab.';
+    btn.style.display='none';
+  }catch(e){
+    btn.disabled=false;
+    st.className='err';
+    var m=e.message||'';
+    if(m.indexOf('connection')!==-1||m.indexOf('Receiving end')!==-1||m.indexOf('extension')!==-1){
+      st.innerHTML='A browser extension (e.g. Bitwarden) is interfering with passkey creation.<br><br>Fix: in the extension settings, disable passkey management for this browser. <b>Do not use incognito on Linux</b> — passkeys are not saved to the OS keychain from incognito mode. Alternatively, install Google Chrome and disable Bitwarden passkeys there.<br><br>Error: '+m;
+    }else{
+      st.textContent='Error: '+m;
+    }
+  }finally{
+    PASSKEY_FLOW_ACTIVE=false;
+  }
+}
+document.getElementById('btn').addEventListener('click',function(){
+  register().catch(function(e){
+    PASSKEY_FLOW_ACTIVE=false;
+    var st=document.getElementById('status');
+    st.className='err';
+    st.textContent='Error: '+e.message;
+    document.getElementById('btn').disabled=false;
+  });
+});
+window.addEventListener('unhandledrejection',function(e){
+  if(!PASSKEY_FLOW_ACTIVE) return;
+  var st=document.getElementById('status');
+  var msg=(e.reason&&e.reason.message)?e.reason.message:String(e.reason||'unknown error');
+  st.className='err';
+  st.textContent='Error: '+msg+' (during passkey registration)';
+  e.preventDefault();
+});
+init().catch(function(e){
+  document.getElementById('btn').disabled=false;
+});
+</script>
+</body>
+</html>
