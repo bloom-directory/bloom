@@ -111,17 +111,24 @@ async fn no_store_cache_control(
 /// `AuthApiError`), but keep the mapping explicit rather than falling back
 /// to a blanket `Display`.
 fn err_response(e: AuthApiError) -> Response {
-    let status = match &e {
-        AuthApiError::NotFound(_) => StatusCode::NOT_FOUND,
-        AuthApiError::Denied(_) => StatusCode::FORBIDDEN,
-        AuthApiError::InvalidSubject(_) | AuthApiError::InvalidAssuranceTransition(_) => {
-            StatusCode::BAD_REQUEST
+    let (status, message) = match &e {
+        AuthApiError::NotFound(message) => (StatusCode::NOT_FOUND, message.as_str()),
+        AuthApiError::Denied(message) => (StatusCode::FORBIDDEN, message.as_str()),
+        AuthApiError::InvalidSubject(message)
+        | AuthApiError::InvalidAssuranceTransition(message) => {
+            (StatusCode::BAD_REQUEST, message.as_str())
         }
-        AuthApiError::Json(_) | AuthApiError::Store(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        AuthApiError::Json(_) | AuthApiError::Store(_) => {
+            tracing::warn!(error = %e, "wallet_registration.request_failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal registration error",
+            )
+        }
     };
     (
         status,
-        Json(serde_json::json!({ "ok": false, "error": e.to_string() })),
+        Json(serde_json::json!({ "ok": false, "error": message })),
     )
         .into_response()
 }
@@ -136,85 +143,78 @@ fn coordinator_or_404(
         .ok_or(StatusCode::NOT_FOUND)
 }
 
-async fn page(State(state): State<CeremonyState>, Path(token): Path<String>) -> Response {
-    let coordinator = match coordinator_or_404(&state) {
-        Ok(c) => c,
-        Err(status) => return status.into_response(),
-    };
-    match coordinator.session_view(&token, now_ms()).await {
-        // Cache-Control is applied uniformly by `no_store_cache_control`'s
-        // layer over this whole route group, not set here.
-        Ok(_) => Html(WALLET_REGISTRATION_HTML).into_response(),
-        Err(e) => err_response(e),
-    }
+async fn page(
+    State(state): State<CeremonyState>,
+    Path(token): Path<String>,
+) -> Result<Response, Response> {
+    coordinator_or_404(&state)
+        .map_err(IntoResponse::into_response)?
+        .session_view(&token, now_ms())
+        .await
+        .map(|_| Html(WALLET_REGISTRATION_HTML).into_response())
+        .map_err(err_response)
 }
 
-async fn session_json(State(state): State<CeremonyState>, Path(token): Path<String>) -> Response {
-    let coordinator = match coordinator_or_404(&state) {
-        Ok(c) => c,
-        Err(status) => return status.into_response(),
-    };
-    match coordinator.session_view(&token, now_ms()).await {
-        Ok(view) => Json(view).into_response(),
-        Err(e) => err_response(e),
-    }
+async fn session_json(
+    State(state): State<CeremonyState>,
+    Path(token): Path<String>,
+) -> Result<Response, Response> {
+    coordinator_or_404(&state)
+        .map_err(IntoResponse::into_response)?
+        .session_view(&token, now_ms())
+        .await
+        .map(|view| Json(view).into_response())
+        .map_err(err_response)
 }
 
 async fn create_attempt(
     State(state): State<CeremonyState>,
     Path(token): Path<String>,
     body: String,
-) -> Response {
-    let coordinator = match coordinator_or_404(&state) {
-        Ok(c) => c,
-        Err(status) => return status.into_response(),
-    };
-    match coordinator.create_attempt(&token, body, now_ms()).await {
-        Ok(opts) => Json(opts).into_response(),
-        Err(e) => err_response(e),
-    }
+) -> Result<Response, Response> {
+    coordinator_or_404(&state)
+        .map_err(IntoResponse::into_response)?
+        .create_attempt(&token, body, now_ms())
+        .await
+        .map(|options| Json(options).into_response())
+        .map_err(err_response)
 }
 
 async fn fallback_options(
     State(state): State<CeremonyState>,
     Path((token, attempt)): Path<(String, String)>,
     Json(credential): Json<serde_json::Value>,
-) -> Response {
-    let coordinator = match coordinator_or_404(&state) {
-        Ok(c) => c,
-        Err(status) => return status.into_response(),
-    };
-    match coordinator
+) -> Result<Response, Response> {
+    coordinator_or_404(&state)
+        .map_err(IntoResponse::into_response)?
         .fallback_options(&token, &attempt, credential, now_ms())
         .await
-    {
-        Ok(opts) => Json(opts).into_response(),
-        Err(e) => err_response(e),
-    }
+        .map(|options| Json(options).into_response())
+        .map_err(err_response)
 }
 
 async fn complete(
     State(state): State<CeremonyState>,
     Path((token, attempt)): Path<(String, String)>,
     Json(body): Json<WalletRegistrationCompleteBody>,
-) -> Response {
-    let coordinator = match coordinator_or_404(&state) {
-        Ok(c) => c,
-        Err(status) => return status.into_response(),
-    };
-    match coordinator.complete(&token, &attempt, body, now_ms()).await {
-        // The only place `recovery_key`/`receipt` are ever serialized —
-        // never logged (this response body is not traced) and never
-        // written to any persisted status/session record.
-        Ok(outcome) => Json(serde_json::json!({
-            "ok": true,
-            "address": outcome.address,
-            "recovery_key": outcome.recovery_key.as_str(),
-            "receipt": outcome.receipt.as_str(),
-        }))
-        .into_response(),
-        Err(e) => err_response(e),
-    }
+) -> Result<Response, Response> {
+    coordinator_or_404(&state)
+        .map_err(IntoResponse::into_response)?
+        .complete(&token, &attempt, body, now_ms())
+        .await
+        .map(|outcome| {
+            // The only place `recovery_key`/`receipt` are ever serialized —
+            // never logged (this response body is not traced) and never
+            // written to any persisted status/session record.
+            Json(serde_json::json!({
+                "ok": true,
+                "address": outcome.address,
+                "recovery_key": outcome.recovery_key.as_str(),
+                "receipt": outcome.receipt.as_str(),
+            }))
+            .into_response()
+        })
+        .map_err(err_response)
 }
 
 #[derive(serde::Deserialize)]
@@ -226,29 +226,25 @@ async fn recovery_ack(
     State(state): State<CeremonyState>,
     Path((token, _attempt)): Path<(String, String)>,
     Json(body): Json<RecoveryAckBody>,
-) -> Response {
-    let coordinator = match coordinator_or_404(&state) {
-        Ok(c) => c,
-        Err(status) => return status.into_response(),
-    };
-    match coordinator
+) -> Result<Response, Response> {
+    coordinator_or_404(&state)
+        .map_err(IntoResponse::into_response)?
         .recovery_ack(&token, &body.receipt, now_ms())
         .await
-    {
-        Ok(address) => Json(serde_json::json!({ "ok": true, "address": address })).into_response(),
-        Err(e) => err_response(e),
-    }
+        .map(|address| Json(serde_json::json!({ "ok": true, "address": address })).into_response())
+        .map_err(err_response)
 }
 
-async fn cancel(State(state): State<CeremonyState>, Path(token): Path<String>) -> Response {
-    let coordinator = match coordinator_or_404(&state) {
-        Ok(c) => c,
-        Err(status) => return status.into_response(),
-    };
-    match coordinator.cancel_by_token(&token, now_ms()).await {
-        Ok(()) => Json(serde_json::json!({ "ok": true })).into_response(),
-        Err(e) => err_response(e),
-    }
+async fn cancel(
+    State(state): State<CeremonyState>,
+    Path(token): Path<String>,
+) -> Result<Response, Response> {
+    coordinator_or_404(&state)
+        .map_err(IntoResponse::into_response)?
+        .cancel_by_token(&token, now_ms())
+        .await
+        .map(|()| Json(serde_json::json!({ "ok": true })).into_response())
+        .map_err(err_response)
 }
 
 async fn favicon_light() -> impl IntoResponse {

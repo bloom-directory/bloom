@@ -76,11 +76,15 @@ struct CeremonyState {
 pub struct CeremonyServer {
     shutdown: Arc<Notify>,
     handle: Option<JoinHandle<()>>,
+    registration: Option<Arc<dyn bloom_auth_api::WalletRegistrationCoordinator>>,
 }
 
 impl CeremonyServer {
     /// Signal graceful shutdown and wait for the server task to exit.
     pub async fn shutdown(mut self) {
+        if let Some(coordinator) = self.registration.take() {
+            coordinator.mark_listener_unbound();
+        }
         self.shutdown.notify_waiters();
         if let Some(h) = self.handle.take() {
             let _ = h.await;
@@ -90,6 +94,9 @@ impl CeremonyServer {
 
 impl Drop for CeremonyServer {
     fn drop(&mut self) {
+        if let Some(coordinator) = self.registration.take() {
+            coordinator.mark_listener_unbound();
+        }
         self.shutdown.notify_waiters();
         if let Some(h) = self.handle.take() {
             h.abort();
@@ -118,7 +125,8 @@ pub async fn spawn(daemon: &Daemon) -> std::io::Result<CeremonyServer> {
     // currently owns registration state, so any persisted non-terminal
     // session really is orphaned. A one-shot CLI command that never reaches
     // this point never reconciles anything.
-    if let Some(coordinator) = daemon.auth_services.registration_coordinator() {
+    let registration = daemon.auth_services.registration_coordinator().cloned();
+    if let Some(coordinator) = &registration {
         if let Err(e) = coordinator
             .reconcile_after_restart(
                 "daemon restarted before this registration finished",
@@ -131,14 +139,22 @@ pub async fn spawn(daemon: &Daemon) -> std::io::Result<CeremonyServer> {
         coordinator.mark_listener_bound(&format!("http://localhost:{LOCAL_CEREMONY_PORT}"));
     }
     let shutdown_signal = shutdown.clone();
+    let task_registration = registration.clone();
     let handle = tokio::spawn(async move {
-        let _ = axum::serve(listener, app)
+        if let Err(error) = axum::serve(listener, app)
             .with_graceful_shutdown(async move { shutdown_signal.notified().await })
-            .await;
+            .await
+        {
+            tracing::error!(%error, "ceremony.server.failed");
+        }
+        if let Some(coordinator) = task_registration {
+            coordinator.mark_listener_unbound();
+        }
     });
     Ok(CeremonyServer {
         shutdown,
         handle: Some(handle),
+        registration,
     })
 }
 

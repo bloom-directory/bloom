@@ -1162,17 +1162,13 @@ fn is_ipc_handler_permission_denied(e: &std::io::Error) -> bool {
     s.contains("-32007") || s.contains("permission denied")
 }
 
-/// Poll `/wallets/registrations/<name>/status.json` over IPC until the
-/// registration reaches a terminal state, printing (and opening) the
-/// ceremony URL the first time it's seen. Returns the terminal status JSON.
 async fn poll_wallet_registration_ipc(
     client: &IpcClient,
     client_endpoint: &ResolvedEndpoint,
     name: &str,
-) -> Result<serde_json::Value> {
+) -> Result<bloom_auth_api::WalletRegistrationStatus> {
     let status_path = format!("/wallets/registrations/{name}/status.json");
-    let mut printed_url = false;
-    loop {
+    poll_wallet_registration(|| async {
         let res = try_ipc(
             client,
             client_endpoint,
@@ -1187,57 +1183,36 @@ async fn poll_wallet_registration_ipc(
             .and_then(|v| v.as_str())
             .context("ipc read: missing bytes_b64")?;
         let bytes = B64.decode(b64).context("ipc read: bad base64")?;
-        let status: serde_json::Value =
-            serde_json::from_slice(&bytes).context("parse registration status.json")?;
-        let state = status.get("state").and_then(|v| v.as_str()).unwrap_or("");
-        if !printed_url && let Some(url) = status.get("ceremony_url").and_then(|v| v.as_str()) {
-            eprintln!("[bloom] Open this URL to complete passkey registration: {url}");
-            let _ = bloom_keystore::launch_browser(url);
-            printed_url = true;
-        }
-        match state {
-            "completed" => return Ok(status),
-            "failed" | "expired" | "cancelled" => {
-                let err = status
-                    .get("error")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or(state);
-                anyhow::bail!("passkey registration {state}: {err}");
-            }
-            _ => {
-                // Backstop for a wedged daemon: the daemon's own sweep
-                // normally flips a stale session to `expired` within a
-                // minute of `expires_at_ms`, but if its background task
-                // ever stops running, that transition never happens and
-                // this loop would otherwise spin forever.
-                if let Some(expires_at_ms) = status.get("expires_at_ms").and_then(|v| v.as_u64())
-                    && system_time_to_unix_ms(SystemTime::now()) as u64 > expires_at_ms
-                {
-                    anyhow::bail!(
-                        "passkey registration timed out: past its expiry with no terminal \
-                         state from the daemon (it may be stuck) — try again"
-                    );
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(1500)).await
-            }
-        }
-    }
+        serde_json::from_slice(&bytes).context("parse registration status.json")
+    })
+    .await
 }
 
-/// In-process equivalent of [`poll_wallet_registration_ipc`], for the
-/// command-scoped fallback ceremony used when no daemon is reachable.
 async fn poll_wallet_registration_inproc(
     coordinator: &Arc<dyn bloom_auth_api::WalletRegistrationCoordinator>,
     name: &str,
 ) -> Result<bloom_auth_api::WalletRegistrationStatus> {
-    use bloom_auth_api::WalletRegistrationState::*;
-    let mut printed_url = false;
-    loop {
-        let status = coordinator
+    poll_wallet_registration(|| async {
+        coordinator
             .status(name)
             .await
             .map_err(|e| anyhow::anyhow!(e.to_string()))?
-            .context("registration session disappeared")?;
+            .context("registration session disappeared")
+    })
+    .await
+}
+
+async fn poll_wallet_registration<F, Fut>(
+    mut status: F,
+) -> Result<bloom_auth_api::WalletRegistrationStatus>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<bloom_auth_api::WalletRegistrationStatus>>,
+{
+    use bloom_auth_api::WalletRegistrationState::*;
+    let mut printed_url = false;
+    loop {
+        let status = status().await?;
         if !printed_url && let Some(url) = &status.ceremony_url {
             eprintln!("[bloom] Open this URL to complete passkey registration: {url}");
             let _ = bloom_keystore::launch_browser(url);
@@ -1253,9 +1228,6 @@ async fn poll_wallet_registration_inproc(
                 );
             }
             AwaitingUser | AwaitingRecoveryAck => {
-                // Same expiry backstop as the IPC poller: the coordinator's
-                // own sweep should reach this first, but don't spin forever
-                // if it doesn't.
                 if system_time_to_unix_ms(SystemTime::now()) as u64 > status.expires_at_ms {
                     anyhow::bail!(
                         "passkey registration timed out: past its expiry with no terminal \
@@ -2032,10 +2004,8 @@ async fn run(cli: Cli) -> Result<()> {
                 debug!(endpoint = %client_endpoint.display, "cli.wallet.new.via_ipc");
                 let status = poll_wallet_registration_ipc(&client, &client_endpoint, &name).await?;
                 status
-                    .get("address")
-                    .and_then(|v| v.as_str())
+                    .address
                     .context("completed registration status missing address")?
-                    .to_string()
             } else {
                 debug!("cli.wallet.new.via_inproc: no daemon socket present");
                 let (_home_permit, d) = build_write_daemon(home.clone())?;

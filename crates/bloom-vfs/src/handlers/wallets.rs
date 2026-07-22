@@ -2055,17 +2055,24 @@ impl WalletsHandler {
 }
 
 impl WalletsHandler {
+    async fn registration_status(
+        &self,
+        wallet: &str,
+    ) -> Result<bloom_auth_api::WalletRegistrationStatus, HandlerError> {
+        self.auth_services
+            .require_registration_coordinator()?
+            .status(wallet)
+            .await
+            .map_err(err_be)?
+            .ok_or_else(|| HandlerError::not_found(format!("registration '{wallet}'")))
+    }
+
     async fn lookup_registrations(&self, rest: &[String]) -> Result<Entry, HandlerError> {
         if rest.is_empty() {
             return Ok(Entry::dir("registrations"));
         }
-        let coordinator = self.auth_services.require_registration_coordinator()?;
         let wallet = &rest[0];
-        let status = coordinator
-            .status(wallet)
-            .await
-            .map_err(err_be)?
-            .ok_or_else(|| HandlerError::not_found(format!("registration '{wallet}'")))?;
+        let status = self.registration_status(wallet).await?;
         if rest.len() == 1 {
             return Ok(Entry::dir(wallet));
         }
@@ -2083,13 +2090,8 @@ impl WalletsHandler {
         if rest.len() != 2 {
             return Err(HandlerError::NotAFile(rest.join("/")));
         }
-        let coordinator = self.auth_services.require_registration_coordinator()?;
         let wallet = &rest[0];
-        let status = coordinator
-            .status(wallet)
-            .await
-            .map_err(err_be)?
-            .ok_or_else(|| HandlerError::not_found(format!("registration '{wallet}'")))?;
+        let status = self.registration_status(wallet).await?;
         match rest[1].as_str() {
             "status.json" => serde_json::to_vec_pretty(&status).map_err(err_be),
             "ceremony_url" => {
@@ -2121,11 +2123,7 @@ impl WalletsHandler {
             return Ok(wallets.iter().map(|w| Entry::dir(w)).collect());
         }
         if rest.len() == 1 {
-            let status = coordinator
-                .status(&rest[0])
-                .await
-                .map_err(err_be)?
-                .ok_or_else(|| HandlerError::not_found(format!("registration '{}'", rest[0])))?;
+            let status = self.registration_status(&rest[0]).await?;
             let mut out = vec![Entry::file("status.json")];
             if status.ceremony_url.is_some() {
                 out.push(Entry::file("ceremony_url"));
@@ -3092,8 +3090,10 @@ mod tests {
     }
 
     #[async_trait]
-    impl bloom_auth_api::WalletRegistrationCoordinator for FakeRegistrationCoordinator {
+    impl bloom_auth_api::WalletRegistrationLifecycle for FakeRegistrationCoordinator {
         fn mark_listener_bound(&self, _base_url: &str) {}
+
+        fn mark_listener_unbound(&self) {}
 
         async fn reconcile_after_restart(
             &self,
@@ -3102,7 +3102,10 @@ mod tests {
         ) -> Result<u64, AuthApiError> {
             Ok(0)
         }
+    }
 
+    #[async_trait]
+    impl bloom_auth_api::WalletRegistrationVfs for FakeRegistrationCoordinator {
         async fn stage(
             &self,
             wallet: &str,
@@ -3159,7 +3162,10 @@ mod tests {
             status.ceremony_url = None;
             Ok(())
         }
+    }
 
+    #[async_trait]
+    impl bloom_auth_api::WalletRegistrationCeremony for FakeRegistrationCoordinator {
         async fn session_view(
             &self,
             _token: &str,
@@ -3209,7 +3215,10 @@ mod tests {
         async fn cancel_by_token(&self, _token: &str, _now_ms: u64) -> Result<(), AuthApiError> {
             Err(AuthApiError::Store("not used in VFS tests".into()))
         }
+    }
 
+    #[async_trait]
+    impl bloom_auth_api::WalletRegistrationMaintenance for FakeRegistrationCoordinator {
         async fn sweep_expired(&self, _now_ms: u64) -> Result<usize, AuthApiError> {
             Ok(0)
         }

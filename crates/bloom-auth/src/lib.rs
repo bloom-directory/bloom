@@ -20,7 +20,8 @@ use bloom_auth_api::{
     GrantStore, NonceState, PriceOracle, ReservationRecord, ReservationState, ReviewSessionRecord,
     SealedAction, SealedApprovalGrant, SealedIntentRecord, SessionDenialReason, SignedApproval,
     SignerKind, StandingSessionRecord, UnsignedApproval, ValuationPolicy, ValuationQuote,
-    WalletRegistrationState, WalletRegistrationStatus, WebAuthnAssertionRecord,
+    WalletRegistrationState, WalletRegistrationStatus, WalletRegistrationStore,
+    WebAuthnAssertionRecord,
 };
 use bloom_prices::{CoinId, PricesClient};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
@@ -113,6 +114,12 @@ impl<S> StoreApprovalVerifier<S> {
             store: Mutex::new(store),
             signature_verifier,
         }
+    }
+
+    fn lock_store(&self) -> Result<std::sync::MutexGuard<'_, AuthStore>, AuthApiError> {
+        self.store
+            .lock()
+            .map_err(|_| AuthApiError::Store("auth store mutex poisoned".into()))
     }
 }
 
@@ -1872,42 +1879,26 @@ impl AuthStore {
                  ORDER BY created_at_ms DESC
                  LIMIT 1",
                 params![wallet],
-                |row| {
-                    let wallet: String = row.get(0)?;
-                    let state: String = row.get(1)?;
-                    let created_at_ms: i64 = row.get(2)?;
-                    let expires_at_ms: i64 = row.get(3)?;
-                    let ceremony_url: Option<String> = row.get(4)?;
-                    let address: Option<String> = row.get(5)?;
-                    let error: Option<String> = row.get(6)?;
-                    Ok((
-                        wallet,
-                        state,
-                        created_at_ms,
-                        expires_at_ms,
-                        ceremony_url,
-                        address,
-                        error,
-                    ))
-                },
+                registration_status_row,
             )
             .optional()?
-            .map(
-                |(wallet, state, created_at_ms, expires_at_ms, ceremony_url, address, error)| {
-                    let state = WalletRegistrationState::parse(&state)
-                        .ok_or_else(|| AuthStoreError::InvalidState(state.clone()))?;
-                    Ok(WalletRegistrationStatus {
-                        schema: bloom_auth_api::WALLET_REGISTRATION_STATUS_SCHEMA_V1.into(),
-                        wallet,
-                        state,
-                        created_at_ms: created_at_ms as u64,
-                        expires_at_ms: expires_at_ms as u64,
-                        ceremony_url,
-                        address,
-                        error,
-                    })
-                },
+            .map(registration_status_from_row)
+            .transpose()
+    }
+
+    pub fn wallet_registration_status_by_session(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<WalletRegistrationStatus>, AuthStoreError> {
+        self.conn
+            .query_row(
+                "SELECT wallet, state, created_at_ms, expires_at_ms, ceremony_url, address, error
+                 FROM wallet_registration_sessions WHERE session_id = ?1",
+                params![session_id],
+                registration_status_row,
             )
+            .optional()?
+            .map(registration_status_from_row)
             .transpose()
     }
 
@@ -1941,27 +1932,9 @@ impl AuthStore {
         let mut out = Vec::new();
         while let Some(row) = rows.next()? {
             let session_id: String = row.get(0)?;
-            let wallet: String = row.get(1)?;
-            let state: String = row.get(2)?;
-            let created_at_ms: i64 = row.get(3)?;
-            let expires_at_ms: i64 = row.get(4)?;
-            let ceremony_url: Option<String> = row.get(5)?;
-            let address: Option<String> = row.get(6)?;
-            let error: Option<String> = row.get(7)?;
-            let state = WalletRegistrationState::parse(&state)
-                .ok_or_else(|| AuthStoreError::InvalidState(state.clone()))?;
             out.push((
                 session_id,
-                WalletRegistrationStatus {
-                    schema: bloom_auth_api::WALLET_REGISTRATION_STATUS_SCHEMA_V1.into(),
-                    wallet,
-                    state,
-                    created_at_ms: created_at_ms as u64,
-                    expires_at_ms: expires_at_ms as u64,
-                    ceremony_url,
-                    address,
-                    error,
-                },
+                registration_status_from_row(registration_status_row_at(row, 1)?)?,
             ));
         }
         Ok(out)
@@ -2116,6 +2089,52 @@ impl AuthStore {
     }
 }
 
+type RegistrationStatusRow = (
+    String,
+    String,
+    i64,
+    i64,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
+fn registration_status_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RegistrationStatusRow> {
+    registration_status_row_at(row, 0)
+}
+
+fn registration_status_row_at(
+    row: &rusqlite::Row<'_>,
+    offset: usize,
+) -> rusqlite::Result<RegistrationStatusRow> {
+    Ok((
+        row.get(offset)?,
+        row.get(offset + 1)?,
+        row.get(offset + 2)?,
+        row.get(offset + 3)?,
+        row.get(offset + 4)?,
+        row.get(offset + 5)?,
+        row.get(offset + 6)?,
+    ))
+}
+
+fn registration_status_from_row(
+    (wallet, state, created_at_ms, expires_at_ms, ceremony_url, address, error): RegistrationStatusRow,
+) -> Result<WalletRegistrationStatus, AuthStoreError> {
+    let state = WalletRegistrationState::parse(&state)
+        .ok_or_else(|| AuthStoreError::InvalidState(state))?;
+    Ok(WalletRegistrationStatus {
+        schema: bloom_auth_api::WALLET_REGISTRATION_STATUS_SCHEMA_V1.into(),
+        wallet,
+        state,
+        created_at_ms: created_at_ms as u64,
+        expires_at_ms: expires_at_ms as u64,
+        ceremony_url,
+        address,
+        error,
+    })
+}
+
 #[async_trait]
 impl<S> ApprovalVerifier for StoreApprovalVerifier<S>
 where
@@ -2228,35 +2247,6 @@ where
             .lock()
             .map_err(|_| AuthApiError::Store("auth store mutex poisoned".into()))?;
         Ok(store.active_standing_sessions(wallet, session_kind, now_ms)?)
-    }
-
-    async fn wallet_registration_status(
-        &self,
-        wallet: &str,
-    ) -> Result<Option<WalletRegistrationStatus>, AuthApiError> {
-        let store = self
-            .store
-            .lock()
-            .map_err(|_| AuthApiError::Store("auth store mutex poisoned".into()))?;
-        Ok(store.wallet_registration_status(wallet)?)
-    }
-
-    async fn wallet_registration_wallets(&self) -> Result<Vec<String>, AuthApiError> {
-        let store = self
-            .store
-            .lock()
-            .map_err(|_| AuthApiError::Store("auth store mutex poisoned".into()))?;
-        Ok(store.wallet_registration_wallets()?)
-    }
-
-    async fn non_terminal_wallet_registration_sessions(
-        &self,
-    ) -> Result<Vec<(String, WalletRegistrationStatus)>, AuthApiError> {
-        let store = self
-            .store
-            .lock()
-            .map_err(|_| AuthApiError::Store("auth store mutex poisoned".into()))?;
-        Ok(store.non_terminal_wallet_registration_sessions()?)
     }
 }
 
@@ -2424,19 +2414,6 @@ where
         Ok(store.commit_evm_owner_session_use(session_id, reservation_id, now_ms)?)
     }
 
-    async fn upsert_wallet_registration_status(
-        &self,
-        session_id: &str,
-        status: &WalletRegistrationStatus,
-        now_ms: u64,
-    ) -> Result<(), AuthApiError> {
-        let mut store = self
-            .store
-            .lock()
-            .map_err(|_| AuthApiError::Store("auth store mutex poisoned".into()))?;
-        Ok(store.upsert_wallet_registration_status(session_id, status, now_ms)?)
-    }
-
     async fn release_evm_owner_session_use(
         &self,
         session_id: &str,
@@ -2448,6 +2425,46 @@ where
             .lock()
             .map_err(|_| AuthApiError::Store("auth store mutex poisoned".into()))?;
         Ok(store.release_evm_owner_session_use(session_id, reservation_id, now_ms)?)
+    }
+}
+
+#[async_trait]
+impl<S: Send + Sync> WalletRegistrationStore for StoreApprovalVerifier<S> {
+    async fn status_for_wallet(
+        &self,
+        wallet: &str,
+    ) -> Result<Option<WalletRegistrationStatus>, AuthApiError> {
+        Ok(self.lock_store()?.wallet_registration_status(wallet)?)
+    }
+
+    async fn status_for_session(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<WalletRegistrationStatus>, AuthApiError> {
+        Ok(self
+            .lock_store()?
+            .wallet_registration_status_by_session(session_id)?)
+    }
+
+    async fn wallets(&self) -> Result<Vec<String>, AuthApiError> {
+        Ok(self.lock_store()?.wallet_registration_wallets()?)
+    }
+
+    async fn non_terminal(&self) -> Result<Vec<(String, WalletRegistrationStatus)>, AuthApiError> {
+        Ok(self
+            .lock_store()?
+            .non_terminal_wallet_registration_sessions()?)
+    }
+
+    async fn upsert(
+        &self,
+        session_id: &str,
+        status: &WalletRegistrationStatus,
+        now_ms: u64,
+    ) -> Result<(), AuthApiError> {
+        Ok(self
+            .lock_store()?
+            .upsert_wallet_registration_status(session_id, status, now_ms)?)
     }
 }
 

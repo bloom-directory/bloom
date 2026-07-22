@@ -1,18 +1,5 @@
-//! Daemon-owned coordinator for asynchronous, VFS-exposed passkey
-//! registration. See `docs/plans/2026-07-21-async-vfs-passkey-registration.md`
-//! for the full protocol and its numbered security invariants.
-//!
-//! All secret session/attempt state (signers, PRF salts, WebAuthn
-//! verification state, prepared wallet files, recovery keys, completion
-//! receipts) lives only in [`CoordinatorState`], guarded by one
-//! [`parking_lot::Mutex`]. Only [`WalletRegistrationStatus`]'s public fields
-//! are ever persisted, via [`AuthStoreWriter::upsert_wallet_registration_status`].
-//!
-//! Every state-mutating operation that must be atomic (attempt creation
-//! bounds, winner selection, recovery-ack) runs its verification and its
-//! state mutation inside one lock acquisition — no `.await` is ever held
-//! across the lock, so a concurrent racer either sees the mutation applied
-//! in full or not at all.
+//! Daemon-owned asynchronous passkey registration. Secret ceremony state is
+//! memory-only; [`WalletRegistrationStore`] persists its public projection.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -23,11 +10,11 @@ use alloy::signers::local::PrivateKeySigner;
 use async_trait::async_trait;
 use base64::Engine as _;
 use bloom_auth_api::{
-    AuthApiError, AuthStoreView, AuthStoreWriter, RegistrationIntent,
-    WalletRegistrationAttemptOptions, WalletRegistrationCompleteBody,
-    WalletRegistrationCompleteOutcome, WalletRegistrationCoordinator,
-    WalletRegistrationFallbackOptions, WalletRegistrationSessionView, WalletRegistrationState,
-    WalletRegistrationStatus,
+    AuthApiError, RegistrationIntent, WalletRegistrationAttemptOptions, WalletRegistrationCeremony,
+    WalletRegistrationCompleteBody, WalletRegistrationCompleteOutcome,
+    WalletRegistrationFallbackOptions, WalletRegistrationLifecycle, WalletRegistrationMaintenance,
+    WalletRegistrationSessionView, WalletRegistrationState, WalletRegistrationStatus,
+    WalletRegistrationStore, WalletRegistrationVfs,
 };
 use bloom_keystore::{
     Keystore, Passkey, PasskeyAuthentication, PasskeyRegistration, PreparedPasskeyWallet,
@@ -39,17 +26,8 @@ use parking_lot::{Mutex, RwLock};
 use rand::RngCore;
 use zeroize::Zeroize;
 
-/// Initial session TTL (spec: "Use a five-minute initial TTL unless product
-/// requirements select another value").
 const SESSION_TTL_MS: u64 = 5 * 60 * 1000;
-/// Deadline for acknowledging recovery, counted from the moment `/complete`
-/// installs a winner — deliberately separate from (and later than)
-/// `SESSION_TTL_MS`, which bounds the WebAuthn ceremony itself. A completion
-/// that lands close to the original session deadline must not leave the
-/// human only seconds to read and save the recovery key.
 const RECOVERY_ACK_TTL_MS: u64 = 5 * 60 * 1000;
-/// Bound on attempts per session (spec: "Bound attempts per session (for
-/// example, five)").
 const MAX_ATTEMPTS: usize = 5;
 
 pub(crate) fn now_ms() -> u64 {
@@ -74,50 +52,45 @@ fn gen_id(prefix: &str) -> String {
     )
 }
 
-/// One immutable policy attempt within a session. `reg_state`/`fallback` are
-/// WebAuthn verification state — never serialized, never leave this process.
 struct SecretAttempt {
     policy_toml: String,
     reg_state: PasskeyRegistration,
     used: bool,
-    /// Set by `fallback_options` once the registration credential has been
-    /// verified and consumed: the freshly-registered `Passkey` plus the
-    /// authentication challenge state for the PRF-fallback assertion.
-    fallback: Option<(Passkey, PasskeyAuthentication)>,
+    busy: bool,
+    fallback: Option<(Passkey, PasskeyAuthentication, serde_json::Value)>,
 }
 
-/// The winning attempt's prepared-but-uncommitted wallet, awaiting recovery
-/// acknowledgment. Dropping this without [`finalize_passkey_wallet`] removes
-/// the prepared wallet's temp directory (via `PreparedPasskeyWallet::Drop`).
 struct WinnerState {
     prepared: PreparedPasskeyWallet,
     receipt: String,
-    /// Identifies the exact `/complete` request that won, so an identical
-    /// retry (e.g. after a dropped response) can be answered with the same
-    /// outcome instead of erroring — the recovery key/receipt only ever
-    /// existed in that one lost response.
     attempt_id: String,
     request_digest: [u8; 32],
 }
 
-/// A session's post-`/complete` phase. `recovery_ack`'s own rename can
-/// itself fail or its persisted-status write can be lost after a
-/// successful rename — `Finalized` is the phase in between: the wallet is
-/// already durably on disk, but the coordinator hasn't yet confirmed that
-/// in the persisted store. A retried acknowledgment in that phase must not
-/// re-run finalize (`prepared` was already consumed) — just re-confirm the
-/// receipt and retry the persist.
 enum CompletionPhase {
-    /// `prepare_passkey_wallet` succeeded; not yet renamed into place.
     Won(Box<WinnerState>),
-    /// `finalize_passkey_wallet`'s rename succeeded.
     Finalized { address: String, receipt: String },
 }
 
-/// Digest identifying a `/complete` request's content, for detecting an
-/// exact client retry. Not a security boundary (the attempt/credential are
-/// already consumed by this point) — only used to decide whether a second
-/// `/complete` call is the same request replayed, not a genuinely new one.
+enum CompleteWork {
+    Replay {
+        wallet: String,
+        address: String,
+        recovery_key: zeroize::Zeroizing<String>,
+        receipt: String,
+    },
+    New(Box<CompleteNew>),
+}
+
+struct CompleteNew {
+    wallet: String,
+    signer: PrivateKeySigner,
+    prf_salt: [u8; 32],
+    policy_toml: String,
+    reg_state: PasskeyRegistration,
+    fallback: Option<(Passkey, PasskeyAuthentication)>,
+}
+
 fn complete_body_digest(attempt_id: &str, body: &WalletRegistrationCompleteBody) -> [u8; 32] {
     let (kind, credential, prf_output_b64) = match body {
         WalletRegistrationCompleteBody::Registration {
@@ -146,21 +119,11 @@ struct SecretSession {
     expires_at_ms: u64,
     attempts: HashMap<String, SecretAttempt>,
     completion: Option<CompletionPhase>,
-    /// Set once `/complete` installs a winner (alongside `completion`);
-    /// `None` beforehand. Independent of which `CompletionPhase` variant is
-    /// active — the recovery-ack window starts at the moment of
-    /// completion, not at finalization.
+    completing: bool,
     recovery_ack_deadline: Option<u64>,
 }
 
 impl SecretSession {
-    /// The deadline past which this session is considered dead: the later,
-    /// separate recovery-ack deadline once a winner is installed, otherwise
-    /// the original WebAuthn-ceremony deadline. Every place that gates a
-    /// session lookup on expiry must use this, not `expires_at_ms` directly,
-    /// so `stage`, `session_view`, `complete`'s replay handling, and
-    /// `sweep_expired` all agree on how long an awaiting-ack session stays
-    /// alive.
     fn effective_deadline(&self) -> u64 {
         self.recovery_ack_deadline.unwrap_or(self.expires_at_ms)
     }
@@ -176,29 +139,30 @@ struct CoordinatorState {
 
 pub struct RegistrationCoordinator {
     keystore: Keystore,
-    store: Arc<dyn AuthStoreView>,
-    writer: Arc<dyn AuthStoreWriter>,
+    store: Arc<dyn WalletRegistrationStore>,
     keystore_root: PathBuf,
     /// Set exactly once, by the process that binds the shared loopback
     /// ceremony listener. `stage()` fails closed while this is `None`.
     listener_base_url: RwLock<Option<String>>,
     state: Mutex<CoordinatorState>,
+    /// Serializes memory+SQLite publication/removal transitions without
+    /// holding a synchronous mutex across `.await`.
+    transitions: tokio::sync::Mutex<()>,
 }
 
 impl RegistrationCoordinator {
     pub fn new(
         keystore: Keystore,
-        store: Arc<dyn AuthStoreView>,
-        writer: Arc<dyn AuthStoreWriter>,
+        store: Arc<dyn WalletRegistrationStore>,
         keystore_root: PathBuf,
     ) -> Self {
         Self {
             keystore,
             store,
-            writer,
             keystore_root,
             listener_base_url: RwLock::new(None),
             state: Mutex::new(CoordinatorState::default()),
+            transitions: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -216,41 +180,84 @@ impl RegistrationCoordinator {
         format!("{base}/wallet-registration/{token}")
     }
 
+    async fn cancel_inner(
+        &self,
+        wallet: Option<&str>,
+        token: Option<&str>,
+        now_ms: u64,
+    ) -> Result<(), AuthApiError> {
+        let _transition = self.transitions.lock().await;
+        let (token, wallet) = {
+            let state = self.state.lock();
+            let token = match (wallet, token) {
+                (Some(wallet), None) => state.by_wallet.get(wallet).cloned(),
+                (None, Some(token)) => Some(token.to_string()),
+                _ => None,
+            }
+            .ok_or_else(|| AuthApiError::NotFound("no live registration session".into()))?;
+            let session = state.sessions.get(&token).ok_or_else(|| {
+                AuthApiError::NotFound("unknown or already-terminal registration session".into())
+            })?;
+            if session.completion.is_some() {
+                return Err(AuthApiError::Denied(
+                    "registration already completed; acknowledge recovery or let it expire".into(),
+                ));
+            }
+            (token, session.wallet.clone())
+        };
+        let mut status = self
+            .store
+            .status_for_session(&token)
+            .await?
+            .ok_or_else(|| AuthApiError::Store("registration session status missing".into()))?;
+        status.state = WalletRegistrationState::Cancelled;
+        status.ceremony_url = None;
+        self.store.upsert(&token, &status, now_ms).await?;
+        Self::remove_session_if_current(&mut self.state.lock(), &token, &wallet);
+        Ok(())
+    }
+
     /// Insert a fresh session for `wallet` under a new token. Caller must
     /// already hold `state`'s lock.
-    fn insert_fresh_session(
-        state: &mut CoordinatorState,
-        wallet: &str,
-        now_ms: u64,
-    ) -> (String, u64, u64) {
+    fn fresh_session(wallet: &str, now_ms: u64) -> (String, SecretSession) {
         let mut prf_salt = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut prf_salt);
         let token = gen_token();
         let created_at_ms = now_ms;
         let expires_at_ms = now_ms + SESSION_TTL_MS;
-        state.sessions.insert(
-            token.clone(),
-            SecretSession {
-                wallet: wallet.to_string(),
-                signer: PrivateKeySigner::random(),
-                prf_salt,
-                server_nonce: gen_id("nonce"),
-                created_at_ms,
-                expires_at_ms,
-                attempts: HashMap::new(),
-                completion: None,
-                recovery_ack_deadline: None,
-            },
-        );
-        state.by_wallet.insert(wallet.to_string(), token.clone());
-        (token, created_at_ms, expires_at_ms)
+        let session = SecretSession {
+            wallet: wallet.to_string(),
+            signer: PrivateKeySigner::random(),
+            prf_salt,
+            server_nonce: gen_id("nonce"),
+            created_at_ms,
+            expires_at_ms,
+            attempts: HashMap::new(),
+            completion: None,
+            completing: false,
+            recovery_ack_deadline: None,
+        };
+        (token, session)
+    }
+
+    fn release_completion(&self, token: &str, attempt_id: &str) {
+        if let Some(session) = self.state.lock().sessions.get_mut(token) {
+            session.completing = false;
+            if let Some(attempt) = session.attempts.get_mut(attempt_id) {
+                attempt.busy = false;
+            }
+        }
     }
 }
 
 #[async_trait]
-impl WalletRegistrationCoordinator for RegistrationCoordinator {
+impl WalletRegistrationLifecycle for RegistrationCoordinator {
     fn mark_listener_bound(&self, base_url: &str) {
         *self.listener_base_url.write() = Some(base_url.to_string());
+    }
+
+    fn mark_listener_unbound(&self) {
+        *self.listener_base_url.write() = None;
     }
 
     async fn reconcile_after_restart(
@@ -258,10 +265,7 @@ impl WalletRegistrationCoordinator for RegistrationCoordinator {
         reason: &str,
         now_ms: u64,
     ) -> Result<u64, AuthApiError> {
-        let rows = self
-            .store
-            .non_terminal_wallet_registration_sessions()
-            .await?;
+        let rows = self.store.non_terminal().await?;
         let mut reconciled = 0u64;
         for (token, mut status) in rows {
             let dir = self.keystore_root.join(&status.wallet);
@@ -283,14 +287,15 @@ impl WalletRegistrationCoordinator for RegistrationCoordinator {
                 status.ceremony_url = None;
                 status.error = Some(reason.to_string());
             }
-            self.writer
-                .upsert_wallet_registration_status(&token, &status, now_ms)
-                .await?;
+            self.store.upsert(&token, &status, now_ms).await?;
             reconciled += 1;
         }
         Ok(reconciled)
     }
+}
 
+#[async_trait]
+impl WalletRegistrationVfs for RegistrationCoordinator {
     async fn stage(
         &self,
         wallet: &str,
@@ -304,13 +309,14 @@ impl WalletRegistrationCoordinator for RegistrationCoordinator {
         Keystore::validate_name(wallet).map_err(|e| AuthApiError::Denied(e.to_string()))?;
 
         let base = self.base_url()?;
+        let _transition = self.transitions.lock().await;
 
         if self.keystore_root.join(wallet).exists() {
             return Err(AuthApiError::Denied(format!(
                 "wallet '{wallet}' already exists"
             )));
         }
-        if let Some(persisted) = self.store.wallet_registration_status(wallet).await?
+        if let Some(persisted) = self.store.status_for_wallet(wallet).await?
             && persisted.state == WalletRegistrationState::Completed
         {
             return Err(AuthApiError::Denied(format!(
@@ -318,109 +324,57 @@ impl WalletRegistrationCoordinator for RegistrationCoordinator {
             )));
         }
 
-        // `is_fresh` distinguishes "found an existing live session" from
-        // "inserted a new one" — only the fresh case should construct and
-        // persist an `awaiting_user` status. Re-staging over an existing
-        // live session (which may already be `awaiting_recovery_ack`, i.e.
-        // a winner is installed) must not downgrade its persisted status
-        // back to `awaiting_user`; it must also use the session's own
-        // `effective_deadline()`, not just `expires_at_ms`, or a session
-        // past the original ceremony deadline but still within its
-        // recovery-ack window would look dead here and get dropped —
-        // destroying an installed winner to start a fresh session.
-        let (token, is_fresh, created_at_ms, expires_at_ms) = {
-            let mut state = self.state.lock();
-            let live = state.by_wallet.get(wallet).cloned().and_then(|token| {
+        let live_token = {
+            let state = self.state.lock();
+            state.by_wallet.get(wallet).cloned().filter(|token| {
                 state
                     .sessions
-                    .get(&token)
-                    .filter(|s| s.effective_deadline() > now_ms)
-                    .map(|s| (token, s.created_at_ms, s.expires_at_ms))
-            });
-            match live {
-                Some((token, created_at_ms, expires_at_ms)) => {
-                    (token, false, created_at_ms, expires_at_ms)
-                }
-                None => {
-                    // Terminal/expired in-memory session for this wallet, if
-                    // any: drop it before starting a fresh one.
-                    if let Some(stale) = state.by_wallet.remove(wallet) {
-                        state.sessions.remove(&stale);
-                    }
-                    let (token, created_at_ms, expires_at_ms) =
-                        Self::insert_fresh_session(&mut state, wallet, now_ms);
-                    (token, true, created_at_ms, expires_at_ms)
-                }
-            }
+                    .get(token)
+                    .is_some_and(|s| s.effective_deadline() > now_ms)
+            })
         };
-
-        if !is_fresh {
-            // Idempotently return the existing persisted status unchanged
-            // — it already reflects whatever transition last touched it.
+        if let Some(token) = live_token {
             return self
                 .store
-                .wallet_registration_status(wallet)
+                .status_for_session(&token)
                 .await?
                 .ok_or_else(|| AuthApiError::Store("registration session status missing".into()));
         }
 
+        let (token, session) = Self::fresh_session(wallet, now_ms);
         let url = Self::ceremony_url(&base, &token);
-        let status =
-            WalletRegistrationStatus::awaiting_user(wallet, created_at_ms, expires_at_ms, url);
-        self.writer
-            .upsert_wallet_registration_status(&token, &status, now_ms)
-            .await?;
+        let status = WalletRegistrationStatus::awaiting_user(
+            wallet,
+            session.created_at_ms,
+            session.expires_at_ms,
+            url,
+        );
+        // Persist before publishing the routing capability in memory. A
+        // failed write leaves no half-created session to wedge retries.
+        self.store.upsert(&token, &status, now_ms).await?;
+        let mut state = self.state.lock();
+        if let Some(stale) = state.by_wallet.insert(wallet.to_string(), token.clone()) {
+            state.sessions.remove(&stale);
+        }
+        state.sessions.insert(token, session);
         Ok(status)
     }
 
     async fn status(&self, wallet: &str) -> Result<Option<WalletRegistrationStatus>, AuthApiError> {
-        self.store.wallet_registration_status(wallet).await
+        self.store.status_for_wallet(wallet).await
     }
 
     async fn list_wallets(&self) -> Result<Vec<String>, AuthApiError> {
-        self.store.wallet_registration_wallets().await
+        self.store.wallets().await
     }
 
     async fn cancel(&self, wallet: &str, now_ms: u64) -> Result<(), AuthApiError> {
-        let token = {
-            let mut state = self.state.lock();
-            let token = state.by_wallet.get(wallet).cloned().ok_or_else(|| {
-                AuthApiError::NotFound(format!(
-                    "no live registration session for wallet '{wallet}'"
-                ))
-            })?;
-            // Mirrors `cancel_by_token`'s guard: a session with an
-            // installed winner has already produced a real credential and
-            // (once finalized) a durably-installed wallet — destroying it
-            // here would either lose a prepared-but-not-yet-renamed wallet
-            // or desync the persisted status from a wallet that already
-            // exists on disk. Nothing left to cancel at that point.
-            if let Some(session) = state.sessions.get(&token)
-                && session.completion.is_some()
-            {
-                return Err(AuthApiError::Denied(
-                    "registration already completed — acknowledge recovery or let it expire; \
-                     it can no longer be cancelled"
-                        .into(),
-                ));
-            }
-            state.sessions.remove(&token);
-            state.by_wallet.remove(wallet);
-            token
-        };
-        let mut status = self
-            .store
-            .wallet_registration_status(wallet)
-            .await?
-            .ok_or_else(|| AuthApiError::Store("registration session status missing".into()))?;
-        status.state = WalletRegistrationState::Cancelled;
-        status.ceremony_url = None;
-        self.writer
-            .upsert_wallet_registration_status(&token, &status, now_ms)
-            .await?;
-        Ok(())
+        self.cancel_inner(Some(wallet), None, now_ms).await
     }
+}
 
+#[async_trait]
+impl WalletRegistrationCeremony for RegistrationCoordinator {
     async fn session_view(
         &self,
         token: &str,
@@ -538,6 +492,7 @@ impl WalletRegistrationCoordinator for RegistrationCoordinator {
                     policy_toml: canonical_policy_toml.clone(),
                     reg_state,
                     used: false,
+                    busy: false,
                     fallback: None,
                 },
             );
@@ -562,52 +517,55 @@ impl WalletRegistrationCoordinator for RegistrationCoordinator {
             .map_err(|e| AuthApiError::Denied(format!("invalid credential: {e}")))?;
 
         let (prf_salt, reg_state) = {
-            let state = self.state.lock();
+            let mut state = self.state.lock();
             let session = state
                 .sessions
-                .get(token)
+                .get_mut(token)
                 .filter(|s| s.expires_at_ms > now_ms)
-                .ok_or_else(|| {
-                    AuthApiError::NotFound("unknown or expired registration session".into())
-                })?;
-            let attempt = session
-                .attempts
-                .get(attempt_id)
-                .ok_or_else(|| AuthApiError::NotFound("unknown registration attempt".into()))?;
-            if attempt.used {
-                return Err(AuthApiError::Denied("attempt already used".into()));
-            }
-            (session.prf_salt, attempt.reg_state.clone())
-        };
-
-        // Verify and consume the registration credential *before* issuing a
-        // fallback assertion challenge — an invalid credential must not
-        // poison this attempt or block the legitimate browser from retrying.
-        let passkey = finish_registration(&credential, &reg_state).map_err(AuthApiError::Denied)?;
-
-        let mut fallback_challenge = [0u8; 32];
-        rand::thread_rng().fill_bytes(&mut fallback_challenge);
-        let (request_options_json, auth_state) =
-            start_registration_fallback_assertion(&passkey, &prf_salt, &fallback_challenge)
-                .map_err(AuthApiError::Denied)?;
-
-        {
-            let mut state = self.state.lock();
-            let session = state.sessions.get_mut(token).ok_or_else(|| {
-                AuthApiError::NotFound("unknown or expired registration session".into())
-            })?;
+                .ok_or_else(|| AuthApiError::NotFound("unknown or expired session".into()))?;
             let attempt = session
                 .attempts
                 .get_mut(attempt_id)
                 .ok_or_else(|| AuthApiError::NotFound("unknown registration attempt".into()))?;
-            if attempt.used {
-                return Err(AuthApiError::Denied("attempt already used".into()));
+            if let Some((_, _, options)) = &attempt.fallback {
+                return Ok(WalletRegistrationFallbackOptions {
+                    request_options_json: options.clone(),
+                });
             }
-            attempt.fallback = Some((passkey, auth_state));
-        }
+            if attempt.used || attempt.busy {
+                return Err(AuthApiError::Denied(
+                    "attempt is already in progress".into(),
+                ));
+            }
+            attempt.busy = true;
+            (session.prf_salt, attempt.reg_state.clone())
+        };
 
+        let generated = (|| {
+            let passkey =
+                finish_registration(&credential, &reg_state).map_err(AuthApiError::Denied)?;
+            let mut challenge = [0u8; 32];
+            rand::thread_rng().fill_bytes(&mut challenge);
+            let (options, auth_state) =
+                start_registration_fallback_assertion(&passkey, &prf_salt, &challenge)
+                    .map_err(AuthApiError::Denied)?;
+            Ok::<_, AuthApiError>((passkey, auth_state, options))
+        })();
+
+        let mut state = self.state.lock();
+        let attempt = state
+            .sessions
+            .get_mut(token)
+            .and_then(|s| s.attempts.get_mut(attempt_id))
+            .ok_or_else(|| AuthApiError::NotFound("registration attempt disappeared".into()))?;
+        attempt.busy = false;
+        let (passkey, auth_state, options) = generated?;
+        if attempt.used {
+            return Err(AuthApiError::Denied("attempt already used".into()));
+        }
+        attempt.fallback = Some((passkey, auth_state, options.clone()));
         Ok(WalletRegistrationFallbackOptions {
-            request_options_json,
+            request_options_json: options,
         })
     }
 
@@ -618,156 +576,187 @@ impl WalletRegistrationCoordinator for RegistrationCoordinator {
         body: WalletRegistrationCompleteBody,
         now_ms: u64,
     ) -> Result<WalletRegistrationCompleteOutcome, AuthApiError> {
-        let (wallet, address, recovery_key, receipt) = {
+        let request_digest = complete_body_digest(attempt_id, &body);
+        let work = {
             let mut state = self.state.lock();
             let session = state
                 .sessions
                 .get_mut(token)
                 .filter(|s| s.effective_deadline() > now_ms)
-                .ok_or_else(|| {
-                    AuthApiError::NotFound("unknown or expired registration session".into())
-                })?;
+                .ok_or_else(|| AuthApiError::NotFound("unknown or expired session".into()))?;
             match &session.completion {
-                Some(CompletionPhase::Won(winner)) => {
-                    // Idempotent replay: the recovery key/receipt only ever
-                    // existed in the one HTTP response for the request that
-                    // won. If the browser lost that response (network drop)
-                    // and retries the exact same request, hand back the
-                    // same outcome instead of erroring into a state the
-                    // user cannot recover from.
+                Some(CompletionPhase::Won(winner))
                     if winner.attempt_id == attempt_id
-                        && winner.request_digest == complete_body_digest(attempt_id, &body)
-                    {
-                        return Ok(WalletRegistrationCompleteOutcome {
-                            address: bloom_proto::checksum_address(&winner.prepared.address),
-                            recovery_key: winner.prepared.recovery_key.clone(),
-                            receipt: winner.receipt.clone().into(),
-                        });
+                        && winner.request_digest == request_digest =>
+                {
+                    CompleteWork::Replay {
+                        wallet: session.wallet.clone(),
+                        address: bloom_proto::checksum_address(&winner.prepared.address),
+                        recovery_key: winner.prepared.recovery_key.clone(),
+                        receipt: winner.receipt.clone(),
                     }
+                }
+                Some(_) => {
                     return Err(AuthApiError::Denied(
                         "registration already completed".into(),
                     ));
                 }
-                Some(CompletionPhase::Finalized { .. }) => {
-                    // Already renamed into place by `recovery_ack` — no
-                    // outcome to replay (the recovery key isn't retained
-                    // past finalization) and nothing left for `/complete`
-                    // to do.
-                    return Err(AuthApiError::Denied(
-                        "registration already completed".into(),
-                    ));
-                }
-                None => {}
-            }
-            let wallet = session.wallet.clone();
-            let prf_salt = session.prf_salt;
-            let signer = session.signer.clone();
-
-            let attempt = session
-                .attempts
-                .get_mut(attempt_id)
-                .ok_or_else(|| AuthApiError::NotFound("unknown registration attempt".into()))?;
-            if attempt.used {
-                return Err(AuthApiError::Denied("attempt already used".into()));
-            }
-
-            // Verify the credential/assertion BEFORE touching the adjacent
-            // PRF output (invariant 2, 4, 5).
-            let (passkey, prf_output_b64): (Passkey, String) = match &body {
-                WalletRegistrationCompleteBody::Registration {
-                    credential,
-                    prf_output_b64,
-                } => {
-                    let credential: RegisterPublicKeyCredential =
-                        serde_json::from_value(credential.clone()).map_err(|e| {
-                            AuthApiError::Denied(format!("invalid credential: {e}"))
-                        })?;
-                    let passkey = finish_registration(&credential, &attempt.reg_state)
-                        .map_err(AuthApiError::Denied)?;
-                    (passkey, prf_output_b64.clone())
-                }
-                WalletRegistrationCompleteBody::Fallback {
-                    credential,
-                    prf_output_b64,
-                } => {
-                    let credential: PublicKeyCredential =
-                        serde_json::from_value(credential.clone()).map_err(|e| {
-                            AuthApiError::Denied(format!("invalid credential: {e}"))
-                        })?;
-                    let (passkey, auth_state) = attempt.fallback.clone().ok_or_else(|| {
-                        AuthApiError::Denied(
-                            "no fallback attempt in progress for this attempt".into(),
-                        )
+                None => {
+                    if session.completing {
+                        return Err(AuthApiError::Denied("another attempt is completing".into()));
+                    }
+                    let attempt = session.attempts.get_mut(attempt_id).ok_or_else(|| {
+                        AuthApiError::NotFound("unknown registration attempt".into())
                     })?;
-                    finish_registration_fallback_assertion(&credential, &auth_state)
-                        .map_err(AuthApiError::Denied)?;
-                    (passkey, prf_output_b64.clone())
+                    if attempt.used || attempt.busy {
+                        return Err(AuthApiError::Denied(
+                            "attempt is already in progress".into(),
+                        ));
+                    }
+                    attempt.busy = true;
+                    session.completing = true;
+                    CompleteWork::New(Box::new(CompleteNew {
+                        wallet: session.wallet.clone(),
+                        signer: session.signer.clone(),
+                        prf_salt: session.prf_salt,
+                        policy_toml: attempt.policy_toml.clone(),
+                        reg_state: attempt.reg_state.clone(),
+                        fallback: attempt
+                            .fallback
+                            .as_ref()
+                            .map(|(passkey, auth, _)| (passkey.clone(), auth.clone())),
+                    }))
                 }
-            };
-
-            let mut prf_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-                .decode(prf_output_b64.trim())
-                .map_err(|_| AuthApiError::Denied("prf_output_b64 is not valid base64".into()))?;
-            if prf_bytes.len() != 32 {
-                prf_bytes.zeroize();
-                return Err(AuthApiError::Denied("prf_output must be 32 bytes".into()));
             }
-            let mut prf_arr = [0u8; 32];
-            prf_arr.copy_from_slice(&prf_bytes);
-            prf_bytes.zeroize();
-
-            // Atomically mark this attempt (and the session) as won before
-            // preparing wallet files — a concurrent second /complete for
-            // this session now observes `used`/`winner` and loses.
-            attempt.used = true;
-            let policy_toml = attempt.policy_toml.clone();
-            let request_digest = complete_body_digest(attempt_id, &body);
-
-            let temp_id = format!("{token}-{attempt_id}");
-            let prepared = match prepare_passkey_wallet(
-                &self.keystore_root,
-                &temp_id,
-                &wallet,
-                &signer,
-                &passkey,
-                &prf_salt,
-                prf_arr,
-                &policy_toml,
-            ) {
-                Ok(p) => p,
-                Err(e) => return Err(AuthApiError::Store(e.to_string())),
-            };
-
-            let receipt = gen_token();
-            let address = bloom_proto::checksum_address(&prepared.address);
-            let recovery_key = prepared.recovery_key.clone();
-            session.completion = Some(CompletionPhase::Won(Box::new(WinnerState {
-                prepared,
-                receipt: receipt.clone(),
-                attempt_id: attempt_id.to_string(),
-                request_digest,
-            })));
-            session.recovery_ack_deadline = Some(now_ms + RECOVERY_ACK_TTL_MS);
-
-            (wallet, address, recovery_key, receipt)
         };
 
+        let (address, recovery_key, receipt) = match work {
+            CompleteWork::Replay {
+                wallet,
+                address,
+                recovery_key,
+                receipt,
+            } => {
+                let _ = wallet;
+                (address, recovery_key, receipt)
+            }
+            CompleteWork::New(work) => {
+                let CompleteNew {
+                    wallet,
+                    signer,
+                    prf_salt,
+                    policy_toml,
+                    reg_state,
+                    fallback,
+                } = *work;
+                let prepared = (|| {
+                    // WebAuthn verification and filesystem writes deliberately
+                    // run outside the coordinator mutex.
+                    let (passkey, prf_output_b64) = match &body {
+                        WalletRegistrationCompleteBody::Registration {
+                            credential,
+                            prf_output_b64,
+                        } => {
+                            let credential: RegisterPublicKeyCredential =
+                                serde_json::from_value(credential.clone()).map_err(|e| {
+                                    AuthApiError::Denied(format!("invalid credential: {e}"))
+                                })?;
+                            (
+                                finish_registration(&credential, &reg_state)
+                                    .map_err(AuthApiError::Denied)?,
+                                prf_output_b64,
+                            )
+                        }
+                        WalletRegistrationCompleteBody::Fallback {
+                            credential,
+                            prf_output_b64,
+                        } => {
+                            let credential: PublicKeyCredential =
+                                serde_json::from_value(credential.clone()).map_err(|e| {
+                                    AuthApiError::Denied(format!("invalid credential: {e}"))
+                                })?;
+                            let (passkey, auth_state) = fallback.as_ref().ok_or_else(|| {
+                                AuthApiError::Denied("no fallback attempt in progress".into())
+                            })?;
+                            finish_registration_fallback_assertion(&credential, auth_state)
+                                .map_err(AuthApiError::Denied)?;
+                            (passkey.clone(), prf_output_b64)
+                        }
+                    };
+                    let mut bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                        .decode(prf_output_b64.trim())
+                        .map_err(|_| AuthApiError::Denied("invalid PRF output".into()))?;
+                    if bytes.len() != 32 {
+                        bytes.zeroize();
+                        return Err(AuthApiError::Denied("PRF output must be 32 bytes".into()));
+                    }
+                    let mut prf = [0; 32];
+                    prf.copy_from_slice(&bytes);
+                    bytes.zeroize();
+                    prepare_passkey_wallet(
+                        &self.keystore_root,
+                        &format!("{token}-{attempt_id}"),
+                        &wallet,
+                        &signer,
+                        &passkey,
+                        &prf_salt,
+                        prf,
+                        &policy_toml,
+                    )
+                    .map_err(|e| AuthApiError::Store(e.to_string()))
+                })();
+
+                let prepared = match prepared {
+                    Ok(prepared) => prepared,
+                    Err(error) => {
+                        self.release_completion(token, attempt_id);
+                        return Err(error);
+                    }
+                };
+                let address = bloom_proto::checksum_address(&prepared.address);
+                let recovery_key = prepared.recovery_key.clone();
+                let receipt = gen_token();
+                let mut state = self.state.lock();
+                let session = state.sessions.get_mut(token).ok_or_else(|| {
+                    AuthApiError::NotFound("registration session disappeared".into())
+                })?;
+                if session.effective_deadline() <= now_ms || session.completion.is_some() {
+                    session.completing = false;
+                    if let Some(attempt) = session.attempts.get_mut(attempt_id) {
+                        attempt.busy = false;
+                    }
+                    return Err(AuthApiError::Denied(
+                        "registration session is no longer active".into(),
+                    ));
+                }
+                let attempt = session.attempts.get_mut(attempt_id).ok_or_else(|| {
+                    AuthApiError::NotFound("registration attempt disappeared".into())
+                })?;
+                attempt.busy = false;
+                attempt.used = true;
+                session.completing = false;
+                session.completion = Some(CompletionPhase::Won(Box::new(WinnerState {
+                    prepared,
+                    receipt: receipt.clone(),
+                    attempt_id: attempt_id.to_string(),
+                    request_digest,
+                })));
+                session.recovery_ack_deadline = Some(now_ms + RECOVERY_ACK_TTL_MS);
+                (address, recovery_key, receipt)
+            }
+        };
+
+        // Replays retry this write too, repairing a prior response-path store
+        // failure rather than returning early with stale public status.
         let mut status = self
             .store
-            .wallet_registration_status(&wallet)
+            .status_for_session(token)
             .await?
             .ok_or_else(|| AuthApiError::Store("registration session status missing".into()))?;
         status.state = WalletRegistrationState::AwaitingRecoveryAck;
-        status.address = None; // not committed until recovery is acknowledged
-        // Extend the persisted deadline to match the in-memory
-        // recovery-ack window — otherwise a poller reading the stale
-        // original ceremony deadline (e.g. the CLI's own expiry-based
-        // timeout) would conclude the registration is dead while the
-        // server still considers it live and awaiting acknowledgment.
+        status.address = None;
         status.expires_at_ms = now_ms + RECOVERY_ACK_TTL_MS;
-        self.writer
-            .upsert_wallet_registration_status(token, &status, now_ms)
-            .await?;
+        self.store.upsert(token, &status, now_ms).await?;
 
         Ok(WalletRegistrationCompleteOutcome {
             address,
@@ -782,9 +771,6 @@ impl WalletRegistrationCoordinator for RegistrationCoordinator {
         receipt: &str,
         now_ms: u64,
     ) -> Result<String, AuthApiError> {
-        // Phase 1 (locked): validate, and either finalize a `Won` session
-        // or re-confirm an already-`Finalized` one. Either way, produce the
-        // address to persist — nothing here removes the session yet.
         let (wallet, address) = {
             let mut state = self.state.lock();
             let session = state.sessions.get_mut(token).ok_or_else(|| {
@@ -800,11 +786,6 @@ impl WalletRegistrationCoordinator for RegistrationCoordinator {
                     address,
                     receipt: stored_receipt,
                 }) => {
-                    // The wallet is already durably on disk from a prior
-                    // call whose persisted-status write never confirmed
-                    // (crash, DB error, lost response). Don't re-run
-                    // finalize — `prepared` was already consumed — just
-                    // re-confirm the receipt and retry the persist below.
                     if stored_receipt != receipt {
                         return Err(AuthApiError::Denied(
                             "invalid recovery acknowledgment receipt".into(),
@@ -816,10 +797,6 @@ impl WalletRegistrationCoordinator for RegistrationCoordinator {
                     if let Some(deadline) = session.recovery_ack_deadline
                         && now_ms > deadline
                     {
-                        // Same deadline `sweep_expired` uses — don't let
-                        // this race sweep's 60s cadence: a request past the
-                        // deadline is denied here regardless of whether the
-                        // sweeper has already run.
                         return Err(AuthApiError::Denied(
                             "recovery acknowledgment window has expired".into(),
                         ));
@@ -837,9 +814,6 @@ impl WalletRegistrationCoordinator for RegistrationCoordinator {
                     match finalize_passkey_wallet(winner.prepared, &final_dir) {
                         Ok(finalized) => {
                             let address = bloom_proto::checksum_address(&finalized.address);
-                            // Durably on disk now — move to `Finalized` so a
-                            // retried ack (if the persist below fails) can't
-                            // re-attempt the rename.
                             session.completion = Some(CompletionPhase::Finalized {
                                 address: address.clone(),
                                 receipt: winner.receipt,
@@ -847,12 +821,6 @@ impl WalletRegistrationCoordinator for RegistrationCoordinator {
                             (wallet, address)
                         }
                         Err((prepared, e)) => {
-                            // Preserve the prepared wallet on a failed
-                            // rename (disk full, cross-device, permissions)
-                            // rather than losing the only copy of the
-                            // recovery key over a transient error — a
-                            // retried acknowledgment with the same receipt
-                            // can still succeed.
                             session.completion =
                                 Some(CompletionPhase::Won(Box::new(WinnerState {
                                     prepared: *prepared,
@@ -867,14 +835,8 @@ impl WalletRegistrationCoordinator for RegistrationCoordinator {
             }
         };
 
-        // Phase 2 (unlocked): persist `Completed`. Only after this succeeds
-        // is the in-memory session discarded — a failure here (crash, DB
-        // error, lost response) leaves the session in `Finalized` phase so
-        // a retried acknowledgment with the same receipt returns the same
-        // address instead of the session simply vanishing (which used to
-        // 404 a retry even though the wallet was already durably created).
-        self.persist_completed(token, &wallet, &address, now_ms)
-            .await?;
+        // Retain `Finalized` until persistence succeeds so acknowledgment is retryable.
+        self.persist_completed(token, &address, now_ms).await?;
 
         {
             let mut state = self.state.lock();
@@ -888,48 +850,12 @@ impl WalletRegistrationCoordinator for RegistrationCoordinator {
     }
 
     async fn cancel_by_token(&self, token: &str, now_ms: u64) -> Result<(), AuthApiError> {
-        let wallet = {
-            let mut state = self.state.lock();
-            // A session with an installed winner has already produced a
-            // real WebAuthn credential and a recovery key the browser may
-            // already hold — "cancelling" it here would silently destroy
-            // that prepared wallet (via `PreparedPasskeyWallet::Drop`)
-            // while `/complete` might still be finishing its own response,
-            // or after the browser has already shown the recovery key.
-            // There is nothing left to cancel at that point: the caller
-            // must acknowledge recovery or let it expire.
-            match state.sessions.get(token) {
-                None => {
-                    return Err(AuthApiError::NotFound(
-                        "unknown or already-terminal registration session".into(),
-                    ));
-                }
-                Some(session) if session.completion.is_some() => {
-                    return Err(AuthApiError::Denied(
-                        "registration already completed — acknowledge recovery or let it \
-                         expire; it can no longer be cancelled"
-                            .into(),
-                    ));
-                }
-                Some(_) => {}
-            }
-            let session = state.sessions.remove(token).expect("checked Some above");
-            state.by_wallet.remove(&session.wallet);
-            session.wallet
-        };
-        let mut status = self
-            .store
-            .wallet_registration_status(&wallet)
-            .await?
-            .ok_or_else(|| AuthApiError::Store("registration session status missing".into()))?;
-        status.state = WalletRegistrationState::Cancelled;
-        status.ceremony_url = None;
-        self.writer
-            .upsert_wallet_registration_status(token, &status, now_ms)
-            .await?;
-        Ok(())
+        self.cancel_inner(None, Some(token), now_ms).await
     }
+}
 
+#[async_trait]
+impl WalletRegistrationMaintenance for RegistrationCoordinator {
     async fn sweep_expired(&self, now_ms: u64) -> Result<usize, AuthApiError> {
         let expired_tokens: Vec<String> = {
             let state = self.state.lock();
@@ -941,14 +867,7 @@ impl WalletRegistrationCoordinator for RegistrationCoordinator {
                 .collect()
         };
 
-        // The in-memory session is deliberately NOT removed until its
-        // persisted status has actually been written — a session removed
-        // first and then lost to a transient store error used to leave a
-        // stale row behind forever (nothing left in memory to retry it
-        // with, and the persisted row can also block the unique
-        // live-registration index for that wallet). Leaving it in memory on
-        // failure means the next sweep tick (it is still past its deadline)
-        // picks the same token back up and retries.
+        // Remove memory only after terminal status persists; failures retry next tick.
         let mut swept = 0usize;
         let mut failed = 0usize;
         for token in expired_tokens {
@@ -964,16 +883,7 @@ impl WalletRegistrationCoordinator for RegistrationCoordinator {
             };
 
             if let Some(address) = finalized_address {
-                // The wallet is already durably on disk (a prior
-                // `recovery_ack` call finalized it) but its persisted
-                // status never confirmed `Completed` — same situation
-                // `recovery_ack` itself retries on. Retry the same persist
-                // here instead of marking it `Expired`, which would hide a
-                // wallet that actually exists.
-                match self
-                    .persist_completed(&token, &wallet, &address, now_ms)
-                    .await
-                {
+                match self.persist_completed(&token, &address, now_ms).await {
                     Ok(()) => {
                         Self::remove_session_if_current(&mut self.state.lock(), &token, &wallet);
                         swept += 1;
@@ -990,7 +900,7 @@ impl WalletRegistrationCoordinator for RegistrationCoordinator {
                 continue;
             }
 
-            let status = match self.store.wallet_registration_status(&wallet).await {
+            let status = match self.store.status_for_session(&token).await {
                 Ok(Some(status)) => status,
                 Ok(None) => {
                     tracing::warn!(
@@ -1020,11 +930,7 @@ impl WalletRegistrationCoordinator for RegistrationCoordinator {
             let mut status = status;
             status.state = WalletRegistrationState::Expired;
             status.ceremony_url = None;
-            if let Err(e) = self
-                .writer
-                .upsert_wallet_registration_status(&token, &status, now_ms)
-                .await
-            {
+            if let Err(e) = self.store.upsert(&token, &status, now_ms).await {
                 tracing::warn!(
                     wallet = %wallet,
                     err = %e,
@@ -1048,10 +954,6 @@ impl WalletRegistrationCoordinator for RegistrationCoordinator {
 }
 
 impl RegistrationCoordinator {
-    /// Remove `token`'s session, and `wallet`'s `by_wallet` mapping only if
-    /// it still points at `token` — a concurrent fresh `stage()` for the
-    /// same wallet name may already have replaced it with a newer live
-    /// token, which must not be clobbered here.
     fn remove_session_if_current(state: &mut CoordinatorState, token: &str, wallet: &str) {
         state.sessions.remove(token);
         if state.by_wallet.get(wallet).map(String::as_str) == Some(token) {
@@ -1059,29 +961,21 @@ impl RegistrationCoordinator {
         }
     }
 
-    /// Persist a session's terminal `Completed` status. Shared by
-    /// `recovery_ack` (the live request path) and `sweep_expired` (which
-    /// retries the exact same persist for a session stuck in `Finalized`
-    /// phase — its wallet is already on disk, so it must not be marked
-    /// `Expired`).
     async fn persist_completed(
         &self,
         token: &str,
-        wallet: &str,
         address: &str,
         now_ms: u64,
     ) -> Result<(), AuthApiError> {
         let mut status = self
             .store
-            .wallet_registration_status(wallet)
+            .status_for_session(token)
             .await?
             .ok_or_else(|| AuthApiError::Store("registration session status missing".into()))?;
         status.state = WalletRegistrationState::Completed;
         status.ceremony_url = None;
         status.address = Some(address.to_string());
-        self.writer
-            .upsert_wallet_registration_status(token, &status, now_ms)
-            .await
+        self.store.upsert(token, &status, now_ms).await
     }
 }
 
@@ -1098,11 +992,27 @@ mod tests {
             store,
             RejectingApprovalSignatureVerifier,
         ));
-        let view: Arc<dyn AuthStoreView> = verifier.clone();
-        let writer: Arc<dyn AuthStoreWriter> = verifier;
+        let store: Arc<dyn WalletRegistrationStore> = verifier;
         let coordinator =
-            RegistrationCoordinator::new(keystore, view, writer, tmp.path().join("keystore"));
+            RegistrationCoordinator::new(keystore, store, tmp.path().join("keystore"));
         (coordinator, tmp)
+    }
+
+    async fn stage_token(
+        coordinator: &RegistrationCoordinator,
+        wallet: &str,
+        now_ms: u64,
+    ) -> String {
+        coordinator
+            .stage(wallet, now_ms)
+            .await
+            .unwrap()
+            .ceremony_url
+            .unwrap()
+            .rsplit('/')
+            .next()
+            .unwrap()
+            .to_string()
     }
 
     #[tokio::test]
@@ -1110,6 +1020,43 @@ mod tests {
         let (coordinator, _tmp) = coordinator();
         let err = coordinator.stage("alice", 1_000).await.unwrap_err();
         assert!(err.to_string().contains("bloom serve"));
+    }
+
+    #[tokio::test]
+    async fn stage_fails_closed_after_listener_stops() {
+        let (coordinator, _tmp) = coordinator();
+        coordinator.mark_listener_bound("http://localhost:18734");
+        coordinator.mark_listener_unbound();
+        assert!(coordinator.stage("alice", 1_000).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn failed_stage_does_not_publish_an_in_memory_session() {
+        let (coordinator, _tmp) = coordinator();
+        coordinator.mark_listener_bound("http://localhost:18734");
+        let mut blocker = WalletRegistrationStatus::awaiting_user(
+            "alice",
+            500,
+            2_000,
+            "http://localhost:18734/wallet-registration/blocker",
+        );
+        coordinator
+            .store
+            .upsert("blocker", &blocker, 500)
+            .await
+            .unwrap();
+
+        assert!(coordinator.stage("alice", 1_000).await.is_err());
+        assert!(coordinator.state.lock().sessions.is_empty());
+
+        blocker.state = WalletRegistrationState::Cancelled;
+        blocker.ceremony_url = None;
+        coordinator
+            .store
+            .upsert("blocker", &blocker, 1_001)
+            .await
+            .unwrap();
+        assert!(coordinator.stage("alice", 1_002).await.is_ok());
     }
 
     #[tokio::test]
@@ -1133,11 +1080,6 @@ mod tests {
         assert!(err.to_string().contains("already exists"));
     }
 
-    /// Defense in depth alongside `WalletsHandler`'s own name validation:
-    /// even a caller that reaches the coordinator directly cannot stage a
-    /// name that would later escape `keystore_root` when joined into a path
-    /// (used by both the initial existence check and, on completion,
-    /// `recovery_ack`'s rename target).
     #[tokio::test]
     async fn stage_rejects_path_traversal_names() {
         let (coordinator, _tmp) = coordinator();
@@ -1181,14 +1123,7 @@ mod tests {
     async fn create_attempt_rejects_invalid_policy_without_touching_session() {
         let (coordinator, _tmp) = coordinator();
         coordinator.mark_listener_bound("http://localhost:18734");
-        let status = coordinator.stage("alice", 1_000).await.unwrap();
-        let token = status
-            .ceremony_url
-            .unwrap()
-            .rsplit('/')
-            .next()
-            .unwrap()
-            .to_string();
+        let token = stage_token(&coordinator, "alice", 1_000).await;
 
         let err = coordinator
             .create_attempt(&token, "not valid toml {{{".into(), 1_000)
@@ -1205,14 +1140,7 @@ mod tests {
     async fn create_attempt_is_bounded() {
         let (coordinator, _tmp) = coordinator();
         coordinator.mark_listener_bound("http://localhost:18734");
-        let status = coordinator.stage("alice", 1_000).await.unwrap();
-        let token = status
-            .ceremony_url
-            .unwrap()
-            .rsplit('/')
-            .next()
-            .unwrap()
-            .to_string();
+        let token = stage_token(&coordinator, "alice", 1_000).await;
         let policy_toml = default_passkey_policy_toml().unwrap();
 
         for _ in 0..MAX_ATTEMPTS {
@@ -1232,14 +1160,7 @@ mod tests {
     async fn malformed_completion_does_not_advance_or_poison_the_session() {
         let (coordinator, _tmp) = coordinator();
         coordinator.mark_listener_bound("http://localhost:18734");
-        let status = coordinator.stage("alice", 1_000).await.unwrap();
-        let token = status
-            .ceremony_url
-            .unwrap()
-            .rsplit('/')
-            .next()
-            .unwrap()
-            .to_string();
+        let token = stage_token(&coordinator, "alice", 1_000).await;
         let policy_toml = default_passkey_policy_toml().unwrap();
         let opts = coordinator
             .create_attempt(&token, policy_toml, 1_000)
@@ -1275,34 +1196,23 @@ mod tests {
         // half-completed state, and the attempt can still be retried.
         let after = coordinator.status("alice").await.unwrap().unwrap();
         assert_eq!(after.state, WalletRegistrationState::AwaitingUser);
+        let state = coordinator.state.lock();
+        let session = state.sessions.get(&token).unwrap();
+        assert!(!session.completing);
+        assert!(!session.attempts[&opts.attempt_id].busy);
     }
 
-    /// `cancel_by_token` must still work exactly as before when no winner
-    /// has been installed — the new "reject once completed" guard must not
-    /// affect the ordinary cancellation path.
     #[tokio::test]
     async fn cancel_by_token_still_works_before_any_completion() {
         let (coordinator, _tmp) = coordinator();
         coordinator.mark_listener_bound("http://localhost:18734");
-        let status = coordinator.stage("alice", 1_000).await.unwrap();
-        let token = status
-            .ceremony_url
-            .unwrap()
-            .rsplit('/')
-            .next()
-            .unwrap()
-            .to_string();
+        let token = stage_token(&coordinator, "alice", 1_000).await;
 
         coordinator.cancel_by_token(&token, 2_000).await.unwrap();
         let after = coordinator.status("alice").await.unwrap().unwrap();
         assert_eq!(after.state, WalletRegistrationState::Cancelled);
     }
 
-    /// `complete_body_digest` is the sole mechanism `complete()` uses to
-    /// decide whether a second call for an already-won session is the exact
-    /// same request replayed (answer with the cached outcome) or a
-    /// genuinely different one (deny). It must be sensitive to every field
-    /// that distinguishes one `/complete` request from another.
     #[test]
     fn complete_body_digest_is_stable_and_sensitive_to_every_field() {
         let cred_a = serde_json::json!({"id": "a"});
@@ -1362,14 +1272,7 @@ mod tests {
     async fn recovery_ack_requires_a_prior_completion() {
         let (coordinator, _tmp) = coordinator();
         coordinator.mark_listener_bound("http://localhost:18734");
-        let status = coordinator.stage("alice", 1_000).await.unwrap();
-        let token = status
-            .ceremony_url
-            .unwrap()
-            .rsplit('/')
-            .next()
-            .unwrap()
-            .to_string();
+        let token = stage_token(&coordinator, "alice", 1_000).await;
         let err = coordinator
             .recovery_ack(&token, "not-a-real-receipt", 1_000)
             .await
@@ -1425,14 +1328,6 @@ mod tests {
         assert_eq!(swept_again, 0);
     }
 
-    /// Directly installs a `Finalized` completion phase on `wallet`'s live
-    /// session, bypassing the WebAuthn/PRF ceremony entirely — no
-    /// virtual-authenticator harness exists in this codebase to drive a
-    /// real `/complete` to a winning credential. Everything the recent
-    /// findings are about (stage/cancel/sweep/session_view/recovery_ack
-    /// around an already-completed session) happens *after* a winner
-    /// exists, so this is sufficient to exercise all of it without one.
-    /// Mirrors what `complete()` itself does to the persisted status.
     async fn stage_and_finalize_directly(
         coordinator: &RegistrationCoordinator,
         wallet: &str,
@@ -1441,14 +1336,7 @@ mod tests {
         now_ms: u64,
         ack_ttl_ms: u64,
     ) -> String {
-        let status = coordinator.stage(wallet, now_ms).await.unwrap();
-        let token = status
-            .ceremony_url
-            .unwrap()
-            .rsplit('/')
-            .next()
-            .unwrap()
-            .to_string();
+        let token = stage_token(coordinator, wallet, now_ms).await;
         let recovery_ack_deadline = now_ms + ack_ttl_ms;
         {
             let mut state = coordinator.state.lock();
@@ -1464,8 +1352,8 @@ mod tests {
         persisted.address = None;
         persisted.expires_at_ms = recovery_ack_deadline;
         coordinator
-            .writer
-            .upsert_wallet_registration_status(&token, &persisted, now_ms)
+            .store
+            .upsert(&token, &persisted, now_ms)
             .await
             .unwrap();
         token
@@ -1647,8 +1535,8 @@ mod tests {
         );
         status.state = WalletRegistrationState::AwaitingRecoveryAck;
         coordinator
-            .writer
-            .upsert_wallet_registration_status("tok-installed", &status, 1_000)
+            .store
+            .upsert("tok-installed", &status, 1_000)
             .await
             .unwrap();
 
@@ -1660,8 +1548,8 @@ mod tests {
             "http://localhost:18734/wallet-registration/tok-abandoned",
         );
         coordinator
-            .writer
-            .upsert_wallet_registration_status("tok-abandoned", &abandoned, 1_000)
+            .store
+            .upsert("tok-abandoned", &abandoned, 1_000)
             .await
             .unwrap();
 

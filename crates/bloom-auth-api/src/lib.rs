@@ -3332,42 +3332,6 @@ pub trait AuthStoreView: Send + Sync {
             "active_standing_sessions is not supported by this auth store view".into(),
         ))
     }
-
-    /// Most-recently-created wallet registration session row for `wallet`
-    /// (live if one exists, else the latest terminal one). Serves both
-    /// `status.json` reads and idempotent re-staging.
-    async fn wallet_registration_status(
-        &self,
-        wallet: &str,
-    ) -> Result<Option<WalletRegistrationStatus>, AuthApiError> {
-        let _ = wallet;
-        Err(AuthApiError::Store(
-            "wallet_registration_status is not supported by this auth store view".into(),
-        ))
-    }
-
-    /// All wallet names with a known registration session (live or recent).
-    async fn wallet_registration_wallets(&self) -> Result<Vec<String>, AuthApiError> {
-        Err(AuthApiError::Store(
-            "wallet_registration_wallets is not supported by this auth store view".into(),
-        ))
-    }
-
-    /// `(session_id, status)` for every wallet-registration session whose
-    /// persisted state is not yet terminal (`awaiting_user` or
-    /// `awaiting_recovery_ack`). Used for restart reconciliation: a bulk
-    /// "mark everything failed" can't tell a truly abandoned session apart
-    /// from one whose wallet was actually installed on disk before the
-    /// daemon died, so the caller needs the individual rows to check each
-    /// against keystore state itself.
-    async fn non_terminal_wallet_registration_sessions(
-        &self,
-    ) -> Result<Vec<(String, WalletRegistrationStatus)>, AuthApiError> {
-        Err(AuthApiError::Store(
-            "non_terminal_wallet_registration_sessions is not supported by this auth store view"
-                .into(),
-        ))
-    }
 }
 
 #[async_trait]
@@ -3520,23 +3484,6 @@ pub trait AuthStoreWriter: Send + Sync {
         let _ = (session_id, reservation_id, now_ms);
         Err(AuthApiError::Store(
             "release_evm_owner_session_use is not supported by this auth store writer".into(),
-        ))
-    }
-
-    /// Insert or update the public status row for a wallet registration
-    /// session, keyed by `session_id` (the URL token — never logged, never
-    /// exposed through [`WalletRegistrationStatus`] itself). Never persist
-    /// PRF bytes, private keys, recovery keys, or completion receipts
-    /// through this method — only `status`'s public fields.
-    async fn upsert_wallet_registration_status(
-        &self,
-        session_id: &str,
-        status: &WalletRegistrationStatus,
-        now_ms: u64,
-    ) -> Result<(), AuthApiError> {
-        let _ = (session_id, status, now_ms);
-        Err(AuthApiError::Store(
-            "upsert_wallet_registration_status is not supported by this auth store writer".into(),
         ))
     }
 }
