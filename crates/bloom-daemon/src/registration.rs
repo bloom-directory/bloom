@@ -303,14 +303,16 @@ impl WalletRegistrationVfs for RegistrationCoordinator {
             )));
         }
 
-        let live_token = {
+        let (live_token, stale_token) = {
             let state = self.state.lock();
-            state.by_wallet.get(wallet).cloned().filter(|token| {
-                state
-                    .sessions
-                    .get(token)
-                    .is_some_and(|s| s.effective_deadline() > now_ms)
-            })
+            let token = state.by_wallet.get(wallet).cloned();
+            match token.as_ref().and_then(|token| state.sessions.get(token)) {
+                Some(session) if session.effective_deadline() > now_ms || session.completing => {
+                    (token, None)
+                }
+                Some(_) => (None, token),
+                None => (None, None),
+            }
         };
         if let Some(token) = live_token {
             return self
@@ -318,6 +320,19 @@ impl WalletRegistrationVfs for RegistrationCoordinator {
                 .status_for_session(&token)
                 .await?
                 .ok_or_else(|| AuthApiError::Store("registration session status missing".into()));
+        }
+        if let Some(token) = stale_token {
+            let mut status = self
+                .store
+                .status_for_session(&token)
+                .await?
+                .ok_or_else(|| AuthApiError::Store("registration session status missing".into()))?;
+            if !status.state.is_terminal() {
+                status.state = WalletRegistrationState::Expired;
+                status.ceremony_url = None;
+                self.store.upsert(&token, &status, now_ms).await?;
+            }
+            Self::remove_session_if_current(&mut self.state.lock(), &token, wallet);
         }
 
         let (token, session) = Self::fresh_session(wallet, now_ms);
@@ -562,6 +577,9 @@ impl WalletRegistrationCeremony for RegistrationCoordinator {
     ) -> Result<WalletRegistrationCompleteOutcome, AuthApiError> {
         let request_digest = complete_body_digest(attempt_id, &body);
         let work = {
+            // Serialize the reservation with cancel/stage/sweep, then release
+            // the lifecycle gate before WebAuthn and filesystem work.
+            let _transition = self.transitions.lock().await;
             let mut state = self.state.lock();
             let session = state
                 .sessions
@@ -749,6 +767,7 @@ impl WalletRegistrationCeremony for RegistrationCoordinator {
         receipt: &str,
         now_ms: u64,
     ) -> Result<String, AuthApiError> {
+        let _transition = self.transitions.lock().await;
         let (wallet, address) = {
             let mut state = self.state.lock();
             let session = state.sessions.get_mut(token).ok_or_else(|| {
@@ -835,12 +854,13 @@ impl WalletRegistrationCeremony for RegistrationCoordinator {
 #[async_trait]
 impl WalletRegistrationMaintenance for RegistrationCoordinator {
     async fn sweep_expired(&self, now_ms: u64) -> Result<usize, AuthApiError> {
+        let _transition = self.transitions.lock().await;
         let expired_tokens: Vec<String> = {
             let state = self.state.lock();
             state
                 .sessions
                 .iter()
-                .filter(|(_, s)| s.effective_deadline() <= now_ms)
+                .filter(|(_, s)| s.effective_deadline() <= now_ms && !s.completing)
                 .map(|(t, _)| t.clone())
                 .collect()
         };
@@ -1046,6 +1066,21 @@ mod tests {
         let second = coordinator.stage("alice", 1_050).await.unwrap();
         assert_eq!(first.ceremony_url, second.ceremony_url);
         assert_eq!(first.created_at_ms, second.created_at_ms);
+    }
+
+    #[tokio::test]
+    async fn stage_replaces_an_expired_session_before_the_next_sweep() {
+        let (coordinator, _tmp) = coordinator();
+        coordinator.mark_listener_bound("http://localhost:18734");
+
+        let first = coordinator.stage("alice", 1_000).await.unwrap();
+        let fresh = coordinator
+            .stage("alice", 1_000 + SESSION_TTL_MS + 1)
+            .await
+            .unwrap();
+
+        assert_ne!(fresh.ceremony_url, first.ceremony_url);
+        assert_eq!(fresh.state, WalletRegistrationState::AwaitingUser);
     }
 
     #[tokio::test]
