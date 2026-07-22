@@ -9,7 +9,6 @@
 #![forbid(unsafe_code)]
 
 mod commands {
-    pub mod polymarket;
     pub mod qr;
 }
 mod github_source;
@@ -18,7 +17,10 @@ use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 use std::sync::Arc;
+use std::sync::atomic::AtomicI32;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+static UPDATE_EXIT_CODE: AtomicI32 = AtomicI32::new(0);
 
 use anyhow::{Context, Result, bail};
 use base64::Engine as _;
@@ -226,12 +228,13 @@ enum Cmd {
     /// Manage wasm petals: install, app, list, uninstall.
     #[command(subcommand, visible_alias = "petal")]
     Petals(PetalsCmd),
-    /// Polymarket venue workflows.
-    #[command(subcommand)]
-    Polymarket(PolymarketCmd),
     /// Hyperliquid HyperCore reads and tightly scoped test actions.
     #[command(subcommand)]
     Hyperliquid(HyperliquidCmd),
+    /// Check for newer bloom releases on GitHub and inspect the
+    /// current update-checker state.
+    #[command(subcommand)]
+    Update(UpdateCmd),
     /// Initialise ~/.bloom with default config + dirs.
     Init,
 
@@ -267,8 +270,8 @@ enum VfsCmd {
         data: Option<String>,
         /// Unlock this wallet and run the write in an in-process daemon — the
         /// signing key must be unlocked in the same process that signs.
-        /// Required for VFS writes whose handler signs, such as Polymarket
-        /// onboarding. NOTE: this BYPASSES any running `bloom serve` daemon and
+        /// Required for VFS writes whose handler signs. NOTE: this BYPASSES any
+        /// running `bloom serve` daemon and
         /// its IPC; without this flag, writes route over IPC to that daemon.
         /// For passkey wallets it must run in the FOREGROUND — it opens a
         /// WebAuthn ceremony; backgrounding it will hang.
@@ -311,192 +314,15 @@ enum PetalsCmd {
 }
 
 #[derive(Subcommand, Debug)]
-enum PolymarketCmd {
-    /// Run the Polymarket onboarding state machine for a wallet. Blocks
-    /// until completion or a pause point. With --target-pusd the fund stage
-    /// is satisfied automatically (one swap, at most once per invocation).
-    Onboard {
-        wallet: String,
-        /// Auto-fund: swap native into pUSD until the funding address holds
-        /// this much (decimal). Requires --max-spend.
-        #[arg(long)]
-        target_pusd: Option<String>,
-        /// Input-spend bound for the auto-funding swap, in native units.
-        #[arg(long)]
-        max_spend: Option<String>,
-        /// Route slippage bound in basis points (default 50 = 0.5%).
-        #[arg(long, default_value_t = 50)]
-        slippage_bps: u16,
-        /// Acknowledge EVM policy warnings on the funding transactions.
-        #[arg(long)]
-        confirm_risk: bool,
-        /// Passphrase for local wallets (passkey wallets ignore this).
-        #[arg(long, env = "BLOOM_PASSPHRASE", hide = true)]
-        passphrase: Option<String>,
+enum PetalAppCmd {
+    /// Validate a v2 package directory and optionally emit a deterministic `.petal.tar`.
+    Build {
+        /// Package directory containing petal.toml, README.md, AGENTS.md, and app/<name>/.
+        package_dir: String,
+        /// Write a deterministic `.petal.tar` archive.
+        #[arg(long, value_name = "ARCHIVE")]
+        out: Option<String>,
     },
-    /// Buy into a market. Default is a marketable limit (FAK: fills at or
-    /// under --max-price, never rests). Pass --limit-price for an explicit
-    /// resting limit order (GTC). Creates a durable, reviewable draft first;
-    /// --dry-run stops there.
-    Order {
-        wallet: String,
-        /// Market slug (e.g. "fifwc-arg-alg-2026-06-16-arg").
-        slug: String,
-        /// YES or NO.
-        outcome: String,
-        /// pUSD amount to spend, decimal (e.g. "10" = $10).
-        amount: String,
-        /// Refuse rather than pay more than this per share (decimal).
-        #[arg(long)]
-        max_price: Option<String>,
-        /// Place a resting limit at exactly this price instead of a
-        /// marketable order (defaults the order type to GTC).
-        #[arg(long)]
-        limit_price: Option<String>,
-        /// FAK | FOK | GTC (default: FAK marketable, GTC with --limit-price).
-        #[arg(long)]
-        order_type: Option<String>,
-        /// Build and persist the reviewable draft, then exit before any
-        /// signature.
-        #[arg(long)]
-        dry_run: bool,
-        /// Acknowledge policy warnings (require_flag_above_usd). Deny-level
-        /// policy can never be bypassed from the command line.
-        #[arg(long)]
-        confirm_risk: bool,
-        #[arg(long, env = "BLOOM_PASSPHRASE", hide = true)]
-        passphrase: Option<String>,
-    },
-    /// Revalidate and execute a previously created draft (see --dry-run).
-    Confirm {
-        wallet: String,
-        /// Draft id (e.g. "0001").
-        draft_id: String,
-        #[arg(long)]
-        confirm_risk: bool,
-        #[arg(long, env = "BLOOM_PASSPHRASE", hide = true)]
-        passphrase: Option<String>,
-    },
-    /// Sell shares of a position (sell-to-close). Risk-reducing. Verifies current
-    /// holdings cover the sale before signing.
-    Sell {
-        wallet: String,
-        slug: String,
-        /// YES or NO.
-        outcome: String,
-        /// Share count to sell, decimal (e.g. "14.38").
-        shares: String,
-        /// Refuse rather than receive less than this per share (decimal).
-        #[arg(long)]
-        min_price: Option<String>,
-        /// Place a resting limit at exactly this price (GTC).
-        #[arg(long)]
-        limit_price: Option<String>,
-        #[arg(long)]
-        order_type: Option<String>,
-        #[arg(long)]
-        dry_run: bool,
-        #[arg(long)]
-        confirm_risk: bool,
-        #[arg(long, env = "BLOOM_PASSPHRASE", hide = true)]
-        passphrase: Option<String>,
-    },
-    /// Cancel a resting Polymarket order. Cancellation is risk-reducing.
-    /// Needs no wallet unlock — CLOB credentials are enough.
-    Cancel {
-        wallet: String,
-        /// CLOB order id (from the post response or account orders.json).
-        order_id: String,
-    },
-    /// Show open Polymarket positions and required exit actions. Read-only;
-    /// useful for cold-start agents and operational reminders.
-    Obligations { wallet: String },
-    /// Redeem a resolved position back to pUSD through the deposit wallet.
-    /// Refuses before the passkey ceremony unless the Data API marks the
-    /// matching position redeemable.
-    Redeem {
-        wallet: String,
-        /// Market slug to redeem.
-        slug: String,
-        /// Preflight the redeem call and print the plan without unlocking or submitting.
-        #[arg(long)]
-        dry_run: bool,
-        #[arg(long, env = "BLOOM_PASSPHRASE", hide = true)]
-        passphrase: Option<String>,
-    },
-    /// Revoke the pUSD/CTF spending approvals onboarding granted to the four
-    /// contracts (the inverse of onboarding's approve stage). Withdraws the
-    /// trading contracts' authority over the deposit wallet's collateral and
-    /// positions; trading needs re-onboarding afterward.
-    RevokeApprovals {
-        wallet: String,
-        /// Print the plan without unlocking or submitting.
-        #[arg(long)]
-        dry_run: bool,
-        #[arg(long, env = "BLOOM_PASSPHRASE", hide = true)]
-        passphrase: Option<String>,
-    },
-    /// Transfer pUSD out of the Polymarket deposit wallet to the owner EOA.
-    WithdrawPusd {
-        wallet: String,
-        /// Amount of pUSD to withdraw, or "all".
-        amount: String,
-        /// Print the plan without unlocking or submitting.
-        #[arg(long)]
-        dry_run: bool,
-        #[arg(long, env = "BLOOM_PASSPHRASE", hide = true)]
-        passphrase: Option<String>,
-    },
-    /// Swap into pUSD until the Polymarket funding address holds the target
-    /// amount. Target-denominated: --target-pusd 50 means "end with at least
-    /// 50 pUSD", never "spend 50 of the input token". Input spend is bounded
-    /// by --max-spend. Goes through the standard tx engine (EVM policy, plan,
-    /// outbox audit, allow_broadcast).
-    Fund {
-        wallet: String,
-        /// Desired pUSD balance at the funding address (decimal). Required
-        /// unless --request is given.
-        #[arg(long, required_unless_present = "request")]
-        target_pusd: Option<String>,
-        /// Hard cap on input spend, in input-token units (decimal). Required
-        /// unless --request is given.
-        #[arg(long, required_unless_present = "request")]
-        max_spend: Option<String>,
-        /// Input token: "native" (default; POL on Polygon) or an 0x… ERC-20
-        /// address on the settlement chain.
-        #[arg(long)]
-        from_token: Option<String>,
-        /// Route slippage bound in basis points (default 50 = 0.5%).
-        #[arg(long, default_value_t = 50)]
-        slippage_bps: u16,
-        /// Execute a fund request staged via the VFS (`polymarket/fund/<wallet>/new`):
-        /// sources target/max-spend/from-token/slippage from the stored request,
-        /// re-reading live balances + quotes at execute time. Conflicts with the
-        /// individual flags above.
-        #[arg(long, conflicts_with_all = ["target_pusd", "max_spend", "from_token"])]
-        request: Option<String>,
-        /// Stage the swap into the outbox and stop before any signature.
-        #[arg(long)]
-        dry_run: bool,
-        /// Acknowledge EVM policy warnings on the staged transactions.
-        #[arg(long)]
-        confirm_risk: bool,
-        #[arg(long, env = "BLOOM_PASSPHRASE", hide = true)]
-        passphrase: Option<String>,
-    },
-    /// Manage builder API keys (relayer submission auth, auto-created from
-    /// CLOB credentials; never wallet authority).
-    #[command(subcommand)]
-    BuilderKeys(BuilderKeysCmd),
-}
-
-#[derive(Subcommand, Debug)]
-enum BuilderKeysCmd {
-    /// List builder API keys on the account (key ids only; no secrets).
-    List { wallet: String },
-    /// Revoke a builder API key. With no KEY, uses the official client's
-    /// no-body form. Bloom's stored creds are deleted when they match.
-    Revoke { wallet: String, key: Option<String> },
 }
 
 #[derive(Subcommand, Debug)]
@@ -536,6 +362,16 @@ enum RequestCmd {
     Body { id: String },
     /// Print receipt JSON for an id or `latest`.
     Receipt { id: String },
+}
+
+/// Subcommands for `bloom update`.
+#[derive(Subcommand, Debug)]
+enum UpdateCmd {
+    /// Force a refresh against GitHub and print the result as JSON.
+    /// Exits 0 if up to date, 1 if behind, 2 if unknown/error.
+    Check,
+    /// Print the cached snapshot without making a network call.
+    Status,
 }
 
 #[derive(Subcommand, Debug)]
@@ -1045,7 +881,13 @@ async fn main() -> ExitCode {
         .try_init();
 
     match run(cli).await {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(()) => {
+            let code = UPDATE_EXIT_CODE.load(std::sync::atomic::Ordering::SeqCst);
+            if code != 0 {
+                return ExitCode::from(code as u8);
+            }
+            ExitCode::SUCCESS
+        }
         Err(e) => {
             eprintln!("error: {:#}", e);
             ExitCode::FAILURE
@@ -1352,10 +1194,13 @@ async fn run(cli: Cli) -> Result<()> {
     match cli.cmd {
         Cmd::Init => {
             eprintln!("{ALPHA_DISCLOSURE}");
-            let d = Daemon::from_home(home.clone()).context("init daemon")?;
+            let (_home_permit, d) = build_write_daemon(home.clone()).context("init daemon")?;
+            let preinstalled = github_source::ensure_preinstalled_petals(&home, &d)
+                .context("provision configured pre-installed Petals")?;
             println!("home: {}", d.home.root().display());
             println!("config: {}", d.home.config_path().display());
             println!("chains: {:?}", d.chains.list_names());
+            println!("preinstalled_petals: {preinstalled:?}");
             println!("next: bloom wallet new main");
             println!("then: bloom wallet address main --qr");
             println!("mount: mkdir -p ~/bloom && bloom serve --mount ~/bloom");
@@ -1401,6 +1246,24 @@ async fn run(cli: Cli) -> Result<()> {
             } else {
                 println!("deposit: bloom wallet address <wallet> --qr");
                 println!("agent workflow: browse the mounted VFS or use bloom vfs cat/ls/write");
+            }
+            if let Some(snap) = d.update_checker.quick_check_cached() {
+                let latest = snap.latest.as_deref().unwrap_or("?");
+                let latest_display = latest.strip_prefix('v').unwrap_or(latest);
+                let available = match snap.available() {
+                    bloom_update::UpdateAvailable::OutOfDate => "out_of_date",
+                    bloom_update::UpdateAvailable::UpToDate => "up_to_date",
+                    bloom_update::UpdateAvailable::Unknown => "unknown",
+                };
+                println!("latest_release: {}", latest);
+                println!("update_available: {}", available);
+                if matches!(snap.available(), bloom_update::UpdateAvailable::OutOfDate) {
+                    eprintln!(
+                        "hint: bloom v{} is available (you have v{}); see /status/update",
+                        latest_display,
+                        env!("CARGO_PKG_VERSION")
+                    );
+                }
             }
             Ok(())
         }
@@ -1501,176 +1364,6 @@ async fn run(cli: Cli) -> Result<()> {
                 }
             };
             if let Some(wallet) = unlock_wallet {
-                if let Some(confirm) = polymarket_trade_confirm_write(&wallet, &p, &body)? {
-                    let (_home_permit, d) = build_write_daemon(home)?;
-                    commands::polymarket::confirm(
-                        &d,
-                        &wallet,
-                        &confirm.draft_id,
-                        confirm.confirm_risk,
-                        passphrase.as_deref(),
-                    )
-                    .await?;
-                    return Ok(());
-                }
-
-                if let Some(confirm) = polymarket_fund_confirm_write(&wallet, &p, &body)? {
-                    let (_home_permit, d) = build_write_daemon(home)?;
-                    commands::polymarket::fund_from_request(
-                        &d,
-                        &wallet,
-                        &confirm.request_id,
-                        confirm.dry_run,
-                        confirm.confirm_risk,
-                        passphrase,
-                    )
-                    .await?;
-                    return Ok(());
-                }
-
-                if let Some(req) = polymarket_redeem_confirm_write(&wallet, &p, &body)? {
-                    let (_home_permit, d) = build_write_daemon(home)?;
-                    commands::polymarket::redeem(
-                        &d,
-                        &wallet,
-                        &req.slug,
-                        false,
-                        passphrase.as_deref(),
-                    )
-                    .await?;
-                    return Ok(());
-                }
-
-                if polymarket_revoke_approvals_confirm_write(&wallet, &p, &body)?.is_some() {
-                    let (_home_permit, d) = build_write_daemon(home)?;
-                    commands::polymarket::revoke_approvals(
-                        &d,
-                        &wallet,
-                        false,
-                        passphrase.as_deref(),
-                    )
-                    .await?;
-                    return Ok(());
-                }
-
-                if let Some(req) = polymarket_withdraw_pusd_confirm_write(&wallet, &p, &body)? {
-                    let (_home_permit, d) = build_write_daemon(home)?;
-                    commands::polymarket::withdraw_pusd(
-                        &d,
-                        &wallet,
-                        &req.amount,
-                        false,
-                        passphrase.as_deref(),
-                    )
-                    .await?;
-                    return Ok(());
-                }
-
-                if let Some(onboard_wallet) = polymarket_onboard_begin_write(&p) {
-                    if onboard_wallet != wallet {
-                        bail!(
-                            "--unlock-wallet '{}' does not match Polymarket onboarding path wallet '{}'",
-                            wallet,
-                            onboard_wallet
-                        );
-                    }
-                    let ceremony_daemon =
-                        Daemon::from_home(home.clone()).context("build daemon for onboarding")?;
-                    let info = ceremony_daemon.keystore.info(&wallet)?;
-                    if matches!(info.kind, bloom_keystore::WalletKind::PasskeyGated) {
-                        let params = serde_json::json!({
-                            "path": path,
-                            "bytes_b64": B64.encode(&body),
-                        });
-                        let client = IpcClient::new(&client_endpoint.socket);
-                        match try_ipc(&client, &client_endpoint, "write", params.clone()).await {
-                            Ok(Some(_)) => {
-                                debug!(endpoint = %client_endpoint.display, "cli.vfs.polymarket_onboard.via_ipc");
-                                return Ok(());
-                            }
-                            Ok(None) => {
-                                debug!(
-                                    "cli.vfs.polymarket_onboard.via_inproc: no daemon socket present"
-                                );
-                            }
-                            Err(e) if is_ipc_handler_permission_denied(&e) => {
-                                let intent = polymarket_onboard_ceremony_intent(
-                                    &ceremony_daemon,
-                                    &wallet,
-                                    &p,
-                                )?;
-                                let approved =
-                                    sign_polymarket_onboard_sealed_approval_if_challenged(
-                                        &ceremony_daemon,
-                                        &wallet,
-                                        Some(intent),
-                                    )
-                                    .await
-                                    .context("Polymarket onboarding Sealed Approval ceremony")?;
-                                if !approved {
-                                    return Err(anyhow::Error::new(e)).context(
-                                        "Polymarket onboarding denied but no approval challenge was staged",
-                                    );
-                                }
-                                let retry = try_ipc(&client, &client_endpoint, "write", params)
-                                    .await
-                                    .with_context(|| {
-                                        format!(
-                                            "ipc Polymarket onboarding retry via {}",
-                                            client_endpoint.display
-                                        )
-                                    })?;
-                                if retry.is_some() {
-                                    debug!(endpoint = %client_endpoint.display, "cli.vfs.polymarket_onboard.via_ipc.after_ceremony");
-                                    return Ok(());
-                                }
-                                bail!(
-                                    "Polymarket onboarding retry did not reach the daemon after Sealed Approval"
-                                );
-                            }
-                            Err(e) => {
-                                return Err(anyhow::Error::new(e)).with_context(|| {
-                                    format!(
-                                        "ipc Polymarket onboarding via {}",
-                                        client_endpoint.display
-                                    )
-                                });
-                            }
-                        }
-
-                        let (_home_permit, d) = build_write_daemon(home)?;
-                        match d.vfs.write(&p, &body).await {
-                            Ok(()) => {}
-                            Err(first_err)
-                                if matches!(first_err, HandlerError::PermissionDenied) =>
-                            {
-                                let intent = polymarket_onboard_ceremony_intent(&d, &wallet, &p)?;
-                                if sign_polymarket_onboard_sealed_approval_if_challenged(
-                                    &d,
-                                    &wallet,
-                                    Some(intent),
-                                )
-                                .await?
-                                {
-                                    d.vfs
-                                        .write(&p, &body)
-                                        .await
-                                        .context("Polymarket onboarding after Sealed Approval")?;
-                                } else {
-                                    return Err(first_err).context("Polymarket onboarding");
-                                }
-                            }
-                            Err(e) => return Err(e).context("Polymarket onboarding"),
-                        }
-                        if let Some(status_path) = polymarket_onboard_status_path(&p) {
-                            poll_polymarket_onboard_status_until_stable(&d, &status_path).await?;
-                        } else {
-                            poll_polymarket_onboard_until_stable(&d, &wallet).await?;
-                        }
-                        return Ok(());
-                    }
-                }
-
                 let client = IpcClient::new(&client_endpoint.socket);
                 let ipc_res = try_ipc(
                     &client,
@@ -1703,13 +1396,6 @@ async fn run(cli: Cli) -> Result<()> {
                     }
                 }
                 d.vfs.write(&p, &body).await.context("vfs write")?;
-
-                // If this is a polymarket `begin` write, the handler spawned a background
-                // task. In in-process mode we must poll until the task reaches a stable
-                // stage, else the process exits and kills the task.
-                if let Some(status_path) = polymarket_onboard_status_path(&p) {
-                    poll_polymarket_onboard_status_until_stable(&d, &status_path).await?;
-                }
                 return Ok(());
             }
             let client = IpcClient::new(&client_endpoint.socket);
@@ -2159,22 +1845,13 @@ async fn run(cli: Cli) -> Result<()> {
         }
         Cmd::Wallet(WalletCmd::List) => {
             let d = Daemon::from_home(home).context("build daemon")?;
-            let onboard = bloom_polymarket::OnboardStore::new(d.home.polymarket_dir());
             for info in d.keystore.list()? {
                 let kind = match info.kind {
                     bloom_keystore::WalletKind::Local => "local",
                     bloom_keystore::WalletKind::Watch => "watch",
                     bloom_keystore::WalletKind::PasskeyGated => "passkey",
                 };
-                // Surface the Polymarket deposit/funder address (if onboarded)
-                // so it is never mistaken for the wallet's own owner address.
-                let deposit = onboard
-                    .load(&info.name)
-                    .ok()
-                    .flatten()
-                    .map(|st| st.deposit_wallet)
-                    .unwrap_or_else(|| "-".to_string());
-                println!("{}\t{}\t{}\t{}", info.name, info.address, kind, deposit);
+                println!("{}\t{}\t{}", info.name, info.address, kind);
             }
             Ok(())
         }
@@ -2837,7 +2514,9 @@ async fn run(cli: Cli) -> Result<()> {
         }
         Cmd::Serve { endpoint, mount } => {
             eprintln!("{ALPHA_DISCLOSURE}");
-            let (_home_permit, d) = build_write_daemon(home)?;
+            let (_home_permit, d) = build_write_daemon(home.clone())?;
+            github_source::ensure_preinstalled_petals(&home, &d)
+                .context("provision configured pre-installed Petals before serving")?;
             // Spawn the outbox expiry sweeper for the lifetime of the
             // serve command (fix #3). The handle is dropped (and the task
             // signalled to stop) right before the function returns.
@@ -2904,197 +2583,8 @@ async fn run(cli: Cli) -> Result<()> {
             println!("shutting down");
             Ok(())
         }
-        Cmd::Polymarket(PolymarketCmd::Onboard {
-            wallet,
-            target_pusd,
-            max_spend,
-            slippage_bps,
-            confirm_risk,
-            passphrase,
-        }) => {
-            let (_home_permit, d) = build_write_daemon(home)?;
-            commands::polymarket::onboard(
-                &d,
-                commands::polymarket::OnboardArgs {
-                    wallet,
-                    target_pusd,
-                    max_spend,
-                    slippage_bps,
-                    confirm_risk,
-                    passphrase,
-                },
-            )
-            .await
-        }
-        Cmd::Polymarket(PolymarketCmd::Order {
-            wallet,
-            slug,
-            outcome,
-            amount,
-            max_price,
-            limit_price,
-            order_type,
-            dry_run,
-            confirm_risk,
-            passphrase,
-        }) => {
-            let (_home_permit, d) = build_write_daemon(home)?;
-            commands::polymarket::place(
-                &d,
-                commands::polymarket::PlaceArgs {
-                    wallet,
-                    slug,
-                    outcome,
-                    side: bloom_polymarket::Side::Buy,
-                    amount,
-                    price_bound: max_price,
-                    limit_price,
-                    order_type,
-                    dry_run,
-                    confirm_risk,
-                    passphrase,
-                },
-            )
-            .await
-        }
-        Cmd::Polymarket(PolymarketCmd::Sell {
-            wallet,
-            slug,
-            outcome,
-            shares,
-            min_price,
-            limit_price,
-            order_type,
-            dry_run,
-            confirm_risk,
-            passphrase,
-        }) => {
-            let (_home_permit, d) = build_write_daemon(home)?;
-            commands::polymarket::place(
-                &d,
-                commands::polymarket::PlaceArgs {
-                    wallet,
-                    slug,
-                    outcome,
-                    side: bloom_polymarket::Side::Sell,
-                    amount: shares,
-                    price_bound: min_price,
-                    limit_price,
-                    order_type,
-                    dry_run,
-                    confirm_risk,
-                    passphrase,
-                },
-            )
-            .await
-        }
-        Cmd::Polymarket(PolymarketCmd::Confirm {
-            wallet,
-            draft_id,
-            confirm_risk,
-            passphrase,
-        }) => {
-            let (_home_permit, d) = build_write_daemon(home)?;
-            commands::polymarket::confirm(
-                &d,
-                &wallet,
-                &draft_id,
-                confirm_risk,
-                passphrase.as_deref(),
-            )
-            .await
-        }
-        Cmd::Polymarket(PolymarketCmd::Cancel { wallet, order_id }) => {
-            let (_home_permit, d) = build_write_daemon(home)?;
-            commands::polymarket::cancel(&d, &wallet, &order_id).await
-        }
-        Cmd::Polymarket(PolymarketCmd::Obligations { wallet }) => {
-            let d = Daemon::from_home(home).context("build daemon")?;
-            commands::polymarket::obligations(&d, &wallet).await
-        }
-        Cmd::Polymarket(PolymarketCmd::Redeem {
-            wallet,
-            slug,
-            dry_run,
-            passphrase,
-        }) => {
-            let (_home_permit, d) = build_write_daemon(home)?;
-            commands::polymarket::redeem(&d, &wallet, &slug, dry_run, passphrase.as_deref()).await
-        }
-        Cmd::Polymarket(PolymarketCmd::RevokeApprovals {
-            wallet,
-            dry_run,
-            passphrase,
-        }) => {
-            let (_home_permit, d) = build_write_daemon(home)?;
-            commands::polymarket::revoke_approvals(&d, &wallet, dry_run, passphrase.as_deref())
-                .await
-        }
-        Cmd::Polymarket(PolymarketCmd::WithdrawPusd {
-            wallet,
-            amount,
-            dry_run,
-            passphrase,
-        }) => {
-            let (_home_permit, d) = build_write_daemon(home)?;
-            commands::polymarket::withdraw_pusd(
-                &d,
-                &wallet,
-                &amount,
-                dry_run,
-                passphrase.as_deref(),
-            )
-            .await
-        }
-        Cmd::Polymarket(PolymarketCmd::BuilderKeys(BuilderKeysCmd::List { wallet })) => {
-            let d = Daemon::from_home(home).context("build daemon")?;
-            commands::polymarket::builder_keys_list(&d, &wallet).await
-        }
-        Cmd::Polymarket(PolymarketCmd::BuilderKeys(BuilderKeysCmd::Revoke { wallet, key })) => {
-            let (_home_permit, d) = build_write_daemon(home)?;
-            commands::polymarket::builder_keys_revoke(&d, &wallet, key.as_deref()).await
-        }
-        Cmd::Polymarket(PolymarketCmd::Fund {
-            wallet,
-            target_pusd,
-            max_spend,
-            from_token,
-            slippage_bps,
-            request,
-            dry_run,
-            confirm_risk,
-            passphrase,
-        }) => {
-            let (_home_permit, d) = build_write_daemon(home)?;
-            if let Some(id) = request {
-                commands::polymarket::fund_from_request(
-                    &d,
-                    &wallet,
-                    &id,
-                    dry_run,
-                    confirm_risk,
-                    passphrase,
-                )
-                .await
-            } else {
-                commands::polymarket::fund(
-                    &d,
-                    commands::polymarket::FundArgs {
-                        wallet,
-                        // `required_unless_present = "request"` guarantees these.
-                        target_pusd: target_pusd.expect("target_pusd required without --request"),
-                        from_token,
-                        max_spend: max_spend.expect("max_spend required without --request"),
-                        slippage_bps,
-                        dry_run,
-                        confirm_risk,
-                        passphrase,
-                    },
-                )
-                .await
-            }
-        }
         Cmd::Hyperliquid(cmd) => handle_hyperliquid(home, &client_endpoint, cmd).await,
+        Cmd::Update(cmd) => handle_update(&home, cmd).await,
         Cmd::Petals(cmd) => {
             let _home_permit = HomeWritePermit::acquire(&home)?;
             run_petals(home, cmd).await
@@ -3741,159 +3231,6 @@ async fn sign_request_sealed_approval_if_challenged(
     Ok(true)
 }
 
-fn polymarket_onboard_begin_write(path: &VfsPath) -> Option<String> {
-    let segs = path.segments();
-    if segs.len() == 4 && segs[0] == "polymarket" && segs[1] == "onboard" && segs[3] == "begin" {
-        Some(segs[2].clone())
-    } else if segs.len() == 5
-        && segs[0] == "petals"
-        && segs[1] == "polymarket"
-        && segs[2] == "onboard"
-        && segs[4] == "begin"
-    {
-        Some(segs[3].clone())
-    } else {
-        None
-    }
-}
-
-fn polymarket_onboard_status_path(path: &VfsPath) -> Option<String> {
-    let segs = path.segments();
-    if segs.len() == 4 && segs[0] == "polymarket" && segs[1] == "onboard" && segs[3] == "begin" {
-        Some(format!("polymarket/onboard/{}/status.json", segs[2]))
-    } else if segs.len() == 5
-        && segs[0] == "petals"
-        && segs[1] == "polymarket"
-        && segs[2] == "onboard"
-        && segs[4] == "begin"
-    {
-        Some(format!("petals/polymarket/onboard/{}/status.json", segs[3]))
-    } else {
-        None
-    }
-}
-
-fn polymarket_onboard_ceremony_intent(
-    d: &Daemon,
-    wallet: &str,
-    path: &VfsPath,
-) -> Result<CeremonyIntent> {
-    let info = d.keystore.info(wallet)?;
-    Ok(bloom_polymarket::polymarket_onboard_ceremony_intent(
-        wallet,
-        Some(&path.to_string_path()),
-        Some(bloom_proto::checksum_address(&info.address)),
-    ))
-}
-
-async fn poll_polymarket_onboard_until_stable(d: &Daemon, wallet: &str) -> Result<()> {
-    poll_polymarket_onboard_status_until_stable(
-        d,
-        &format!("polymarket/onboard/{wallet}/status.json"),
-    )
-    .await
-}
-
-async fn poll_polymarket_onboard_status_until_stable(d: &Daemon, status_path: &str) -> Result<()> {
-    loop {
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-        let status_path = VfsPath::parse(status_path).context("parse status path")?;
-        if let Ok(bytes) = d.vfs.read(&status_path).await
-            && let Ok(st) = serde_json::from_slice::<serde_json::Value>(&bytes)
-        {
-            let stage = st["stage"].as_str().unwrap_or("unknown");
-            info!(stage, "polymarket.onboard.stage");
-            if matches!(stage, "complete" | "fund") || st["last_error"].is_string() {
-                if stage == "fund" {
-                    let addr = st["deposit_wallet"].as_str().unwrap_or("?");
-                    println!("funding address: {addr}");
-                    println!("send pUSD to this address on Polygon, then re-run onboarding");
-                }
-                break;
-            }
-        }
-    }
-    Ok(())
-}
-
-async fn sign_polymarket_onboard_sealed_approval_if_challenged(
-    d: &Daemon,
-    wallet: &str,
-    intent: Option<CeremonyIntent>,
-) -> Result<bool> {
-    let dir = d.home.polymarket_dir().join(wallet);
-    let challenge_path = dir.join("approval_challenge.json");
-    if !challenge_path.exists() {
-        return Ok(false);
-    }
-
-    let challenge: ApprovalChallenge = serde_json::from_slice(
-        &std::fs::read(&challenge_path)
-            .with_context(|| format!("read {}", challenge_path.display()))?,
-    )
-    .with_context(|| format!("parse {}", challenge_path.display()))?;
-    let sealed = d
-        .auth_services
-        .require_store()
-        .context("Sealed Approval auth store is not wired")?
-        .sealed_intent(&challenge.intent_hash)
-        .await
-        .context("read sealed intent for Polymarket onboarding challenge")?;
-    anyhow::ensure!(
-        sealed.envelope.header.wallet == wallet,
-        "approval challenge wallet mismatch: sealed action belongs to '{}'",
-        sealed.envelope.header.wallet
-    );
-    anyhow::ensure!(
-        challenge.action_id
-            == bloom_vfs::handlers::polymarket::polymarket_onboard_action_id(wallet),
-        "approval challenge action mismatch for Polymarket onboarding"
-    );
-
-    let review_session_id = if challenge.assurance == AssuranceLevel::Hardened {
-        let review_session_id = sealed_review_session_id(&challenge);
-        d.auth_services
-            .require_writer()
-            .context("Sealed Approval auth store writer is not wired")?
-            .issue_review_session(
-                &review_session_id,
-                &challenge.surface,
-                &challenge.action_id,
-                challenge.expiry_ms,
-                cli_now_ms(),
-            )
-            .await
-            .context("issue hardened Polymarket onboarding review session")?;
-        Some(review_session_id)
-    } else {
-        None
-    };
-
-    let unsigned = UnsignedApproval::for_challenge(
-        &challenge,
-        SignerTransport::BrowserWebauthn,
-        None,
-        review_session_id,
-    );
-    let (_grant, approval) = bloom_daemon::sealed_ceremony::run_sealed_approval_ceremony(
-        &d.keystore,
-        &d.auth_services,
-        unsigned,
-        intent,
-        cli_now_ms(),
-        d.signer_cache.as_ref(),
-    )
-    .await
-    .context("run Polymarket onboarding sealed approval browser ceremony")?;
-    let approval_path = dir.join("approval.json");
-    std::fs::write(
-        &approval_path,
-        serde_json::to_vec_pretty(&approval).context("encode Polymarket onboarding approval")?,
-    )
-    .with_context(|| format!("write {}", approval_path.display()))?;
-    Ok(true)
-}
-
 fn resolve_pending_request_id(home: &Path, id: &str) -> Result<String> {
     if id != "latest" {
         return Ok(id.to_string());
@@ -4104,357 +3441,6 @@ async fn wallet_outbox_action_vfs_write(input: WalletOutboxActionWrite<'_>) -> R
     Ok(())
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct PolymarketFundConfirmWrite {
-    request_id: String,
-    dry_run: bool,
-    confirm_risk: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct PolymarketTradeConfirmWrite {
-    draft_id: String,
-    confirm_risk: bool,
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct PolymarketFundConfirmBody {
-    #[serde(default)]
-    confirm: Option<bool>,
-    #[serde(default)]
-    dry_run: bool,
-    #[serde(default)]
-    confirm_risk: bool,
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct PolymarketTradeConfirmBody {
-    #[serde(default)]
-    confirm: Option<bool>,
-    #[serde(default)]
-    confirm_risk: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct PolymarketRedeemConfirmWrite {
-    slug: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct PolymarketRevokeApprovalsConfirmWrite;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct PolymarketWithdrawPusdConfirmWrite {
-    amount: String,
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct PolymarketRedeemConfirmBody {
-    #[serde(default)]
-    confirm: Option<bool>,
-    #[serde(default)]
-    dry_run: bool,
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct PolymarketRevokeApprovalsConfirmBody {
-    #[serde(default)]
-    confirm: Option<bool>,
-    #[serde(default)]
-    dry_run: bool,
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct PolymarketWithdrawPusdConfirmBody {
-    #[serde(default)]
-    confirm: Option<bool>,
-    #[serde(default)]
-    amount: Option<String>,
-    #[serde(default)]
-    dry_run: bool,
-}
-
-fn polymarket_trade_confirm_write(
-    wallet: &str,
-    path: &VfsPath,
-    body: &[u8],
-) -> Result<Option<PolymarketTradeConfirmWrite>> {
-    let segs = path.segments();
-    let [root, trade, w, drafts, draft_id, confirm] = segs else {
-        return Ok(None);
-    };
-    if root != "polymarket" || trade != "trade" || drafts != "drafts" || confirm != "confirm" {
-        return Ok(None);
-    }
-    if w != wallet {
-        bail!("unlock wallet '{wallet}' does not match Polymarket trade confirm path wallet '{w}'");
-    }
-    validate_polymarket_artifact_id(draft_id, "trade draft")?;
-    let body = std::str::from_utf8(body).context("polymarket trade confirm body must be utf-8")?;
-    let trimmed = body.trim();
-    if trimmed.is_empty() {
-        bail!("polymarket trade confirm requires body 'confirm', 'y', or JSON/TOML confirmation");
-    }
-    if matches!(
-        trimmed.to_ascii_lowercase().as_str(),
-        "confirm" | "y" | "yes"
-    ) {
-        return Ok(Some(PolymarketTradeConfirmWrite {
-            draft_id: draft_id.clone(),
-            confirm_risk: false,
-        }));
-    }
-
-    let parsed: PolymarketTradeConfirmBody = serde_json::from_str(trimmed)
-        .or_else(|json_err| {
-            toml::from_str(trimmed).map_err(|toml_err| {
-                anyhow::anyhow!("confirm body must be 'confirm', 'y', JSON, or TOML: JSON: {json_err}; TOML: {toml_err}")
-            })
-        })?;
-    if parsed.confirm != Some(true) {
-        bail!("polymarket trade confirm body must set confirm=true");
-    }
-    Ok(Some(PolymarketTradeConfirmWrite {
-        draft_id: draft_id.clone(),
-        confirm_risk: parsed.confirm_risk,
-    }))
-}
-
-fn polymarket_fund_confirm_write(
-    wallet: &str,
-    path: &VfsPath,
-    body: &[u8],
-) -> Result<Option<PolymarketFundConfirmWrite>> {
-    let segs = path.segments();
-    let [root, fund, w, request_id, confirm] = segs else {
-        return Ok(None);
-    };
-    if root != "polymarket" || fund != "fund" || confirm != "confirm" {
-        return Ok(None);
-    }
-    if w != wallet {
-        bail!("unlock wallet '{wallet}' does not match Polymarket fund confirm path wallet '{w}'");
-    }
-    validate_polymarket_artifact_id(request_id, "fund request")?;
-    let body = std::str::from_utf8(body).context("polymarket fund confirm body must be utf-8")?;
-    let trimmed = body.trim();
-    if trimmed.is_empty() {
-        bail!("polymarket fund confirm requires body 'confirm', 'y', or JSON/TOML confirmation");
-    }
-    if matches!(
-        trimmed.to_ascii_lowercase().as_str(),
-        "confirm" | "y" | "yes"
-    ) {
-        return Ok(Some(PolymarketFundConfirmWrite {
-            request_id: request_id.clone(),
-            dry_run: false,
-            confirm_risk: false,
-        }));
-    }
-
-    let parsed: PolymarketFundConfirmBody = serde_json::from_str(trimmed)
-        .or_else(|json_err| {
-            toml::from_str(trimmed).map_err(|toml_err| {
-                anyhow::anyhow!("confirm body must be 'confirm', 'y', JSON, or TOML: JSON: {json_err}; TOML: {toml_err}")
-            })
-        })?;
-    if parsed.confirm != Some(true) {
-        bail!("polymarket fund confirm body must set confirm=true");
-    }
-    Ok(Some(PolymarketFundConfirmWrite {
-        request_id: request_id.clone(),
-        dry_run: parsed.dry_run,
-        confirm_risk: parsed.confirm_risk,
-    }))
-}
-
-/// `bloom vfs write /polymarket/redeem/<wallet>/<slug>/confirm --unlock-wallet
-/// <wallet> --data confirm` → foreground dispatch to the shared redeem core.
-/// Slug is carried by the path; the body is an affirmative ack only.
-fn polymarket_redeem_confirm_write(
-    wallet: &str,
-    path: &VfsPath,
-    body: &[u8],
-) -> Result<Option<PolymarketRedeemConfirmWrite>> {
-    let segs = path.segments();
-    let [root, redeem, w, slug, confirm] = segs else {
-        return Ok(None);
-    };
-    if root != "polymarket" || redeem != "redeem" || confirm != "confirm" {
-        return Ok(None);
-    }
-    if w != wallet {
-        bail!(
-            "unlock wallet '{wallet}' does not match Polymarket redeem confirm path wallet '{w}'"
-        );
-    }
-    validate_polymarket_artifact_id(slug, "redeem slug")?;
-    let body = std::str::from_utf8(body).context("polymarket redeem confirm body must be utf-8")?;
-    let trimmed = body.trim();
-    if trimmed.is_empty() {
-        bail!("polymarket redeem confirm requires body 'confirm', 'y', or JSON/TOML confirmation");
-    }
-    if matches!(
-        trimmed.to_ascii_lowercase().as_str(),
-        "confirm" | "y" | "yes"
-    ) {
-        return Ok(Some(PolymarketRedeemConfirmWrite { slug: slug.clone() }));
-    }
-    let parsed: PolymarketRedeemConfirmBody = serde_json::from_str(trimmed)
-        .or_else(|json_err| {
-            toml::from_str(trimmed).map_err(|toml_err| {
-                anyhow::anyhow!(
-                    "confirm body must be 'confirm', 'y', JSON, or TOML: JSON: {json_err}; TOML: {toml_err}"
-                )
-            })
-        })?;
-    if parsed.confirm != Some(true) {
-        bail!("polymarket redeem confirm body must set confirm=true");
-    }
-    if parsed.dry_run {
-        bail!(
-            "dry-run is not available on the redeem confirm path; use \
-             'bloom polymarket redeem <wallet> <slug> --dry-run' for a plan-only run"
-        );
-    }
-    Ok(Some(PolymarketRedeemConfirmWrite { slug: slug.clone() }))
-}
-
-/// `bloom vfs write /polymarket/revoke-approvals/<wallet>/request/confirm
-/// --unlock-wallet <wallet> --data confirm` → foreground dispatch to the shared
-/// revoke-approvals core. Singleton action (no id beyond the literal `request`).
-fn polymarket_revoke_approvals_confirm_write(
-    wallet: &str,
-    path: &VfsPath,
-    body: &[u8],
-) -> Result<Option<PolymarketRevokeApprovalsConfirmWrite>> {
-    let segs = path.segments();
-    let [root, revoke, w, request, confirm] = segs else {
-        return Ok(None);
-    };
-    if root != "polymarket"
-        || revoke != "revoke-approvals"
-        || request != "request"
-        || confirm != "confirm"
-    {
-        return Ok(None);
-    }
-    if w != wallet {
-        bail!(
-            "unlock wallet '{wallet}' does not match Polymarket revoke-approvals confirm path wallet '{w}'"
-        );
-    }
-    let body = std::str::from_utf8(body)
-        .context("polymarket revoke-approvals confirm body must be utf-8")?;
-    let trimmed = body.trim();
-    if trimmed.is_empty() {
-        bail!(
-            "polymarket revoke-approvals confirm requires body 'confirm', 'y', or JSON/TOML confirmation"
-        );
-    }
-    if matches!(
-        trimmed.to_ascii_lowercase().as_str(),
-        "confirm" | "y" | "yes"
-    ) {
-        return Ok(Some(PolymarketRevokeApprovalsConfirmWrite));
-    }
-    let parsed: PolymarketRevokeApprovalsConfirmBody = serde_json::from_str(trimmed)
-        .or_else(|json_err| {
-            toml::from_str(trimmed).map_err(|toml_err| {
-                anyhow::anyhow!(
-                    "confirm body must be 'confirm', 'y', JSON, or TOML: JSON: {json_err}; TOML: {toml_err}"
-                )
-            })
-        })?;
-    if parsed.confirm != Some(true) {
-        bail!("polymarket revoke-approvals confirm body must set confirm=true");
-    }
-    if parsed.dry_run {
-        bail!(
-            "dry-run is not available on the revoke-approvals confirm path; use \
-             'bloom polymarket revoke-approvals <wallet> --dry-run' for a plan-only run"
-        );
-    }
-    Ok(Some(PolymarketRevokeApprovalsConfirmWrite))
-}
-
-/// `bloom vfs write /polymarket/withdraw/<wallet>/pusd/confirm --unlock-wallet
-/// <wallet> --data '{"confirm":true,"amount":"<amount|all>"}'` → foreground
-/// dispatch to the shared withdraw-pusd core. The amount is value-moving and
-/// MUST be stated in the body (the path carries no amount slot); a bare `confirm`
-/// ack is rejected so an agent cannot accidentally withdraw all pUSD.
-fn polymarket_withdraw_pusd_confirm_write(
-    wallet: &str,
-    path: &VfsPath,
-    body: &[u8],
-) -> Result<Option<PolymarketWithdrawPusdConfirmWrite>> {
-    let segs = path.segments();
-    let [root, withdraw, w, pusd, confirm] = segs else {
-        return Ok(None);
-    };
-    if root != "polymarket" || withdraw != "withdraw" || pusd != "pusd" || confirm != "confirm" {
-        return Ok(None);
-    }
-    if w != wallet {
-        bail!(
-            "unlock wallet '{wallet}' does not match Polymarket withdraw-pusd confirm path wallet '{w}'"
-        );
-    }
-    let body =
-        std::str::from_utf8(body).context("polymarket withdraw-pusd confirm body must be utf-8")?;
-    let trimmed = body.trim();
-    if trimmed.is_empty() {
-        bail!(
-            "polymarket withdraw-pusd confirm requires a JSON/TOML body with confirm=true and amount, e.g. {{\"confirm\":true,\"amount\":\"all\"}}"
-        );
-    }
-    // A bare ack is intentionally rejected: the amount is value-moving and must
-    // be stated explicitly so an agent cannot default to withdrawing everything.
-    if matches!(
-        trimmed.to_ascii_lowercase().as_str(),
-        "confirm" | "y" | "yes"
-    ) {
-        bail!(
-            "polymarket withdraw-pusd confirm requires an explicit amount in the body (the path \
-             carries no amount); use e.g. {{\"confirm\":true,\"amount\":\"all\"}} or \
-             {{\"confirm\":true,\"amount\":\"10\"}}"
-        );
-    }
-    let parsed: PolymarketWithdrawPusdConfirmBody = serde_json::from_str(trimmed)
-        .or_else(|json_err| {
-            toml::from_str(trimmed).map_err(|toml_err| {
-                anyhow::anyhow!(
-                    "confirm body must be JSON or TOML with confirm=true and amount: JSON: {json_err}; TOML: {toml_err}"
-                )
-            })
-        })?;
-    if parsed.confirm != Some(true) {
-        bail!("polymarket withdraw-pusd confirm body must set confirm=true");
-    }
-    if parsed.dry_run {
-        bail!(
-            "dry-run is not available on the withdraw-pusd confirm path; use \
-             'bloom polymarket withdraw-pusd <wallet> <amount|all> --dry-run' for a plan-only run"
-        );
-    }
-    let amount = parsed.amount.ok_or_else(|| {
-        anyhow::anyhow!(
-            "polymarket withdraw-pusd confirm body must include an explicit amount \
-             (the path carries no amount slot); use e.g. {{\"confirm\":true,\"amount\":\"all\"}} \
-             or {{\"confirm\":true,\"amount\":\"10\"}}"
-        )
-    })?;
-    validate_polymarket_artifact_id(&amount, "withdraw amount")?;
-    Ok(Some(PolymarketWithdrawPusdConfirmWrite { amount }))
-}
-
-fn validate_polymarket_artifact_id(id: &str, label: &str) -> Result<()> {
-    if id.is_empty() || id.contains('/') || id.contains('\\') || id == "." || id == ".." {
-        bail!("invalid Polymarket {label} id '{id}'");
-    }
-    Ok(())
-}
-
 fn request_body_with_wallet(mut request: String, wallet: Option<&str>) -> String {
     let Some(wallet) = wallet else {
         return request;
@@ -4640,6 +3626,37 @@ async fn handle_hyperliquid(
                 },
             )
             .await
+        }
+    }
+}
+
+async fn handle_update(home: &HomeDir, cmd: UpdateCmd) -> Result<()> {
+    match cmd {
+        UpdateCmd::Status => {
+            let installed = env!("CARGO_PKG_VERSION");
+            let snap = bloom_update::read_cache_only(installed, &home.cache_dir());
+            let json = serde_json::to_string_pretty(&snap).context("serialise update snapshot")?;
+            println!("{json}");
+            Ok(())
+        }
+        UpdateCmd::Check => {
+            // An explicit check needs only a checker; avoid constructing
+            // the full daemon and its unrelated VFS/transaction services.
+            let checker =
+                bloom_update::UpdateChecker::new(env!("CARGO_PKG_VERSION"), home.cache_dir())
+                    .context("build update checker")?;
+            let snap = checker.refresh().await;
+            let json = serde_json::to_string_pretty(&snap).context("serialise update snapshot")?;
+            println!("{json}");
+            let code = match snap.available() {
+                bloom_update::UpdateAvailable::OutOfDate => 1,
+                bloom_update::UpdateAvailable::UpToDate => 0,
+                bloom_update::UpdateAvailable::Unknown => 2,
+            };
+            if code != 0 {
+                UPDATE_EXIT_CODE.store(code, std::sync::atomic::Ordering::SeqCst);
+            }
+            Ok(())
         }
     }
 }
@@ -5178,13 +4195,7 @@ async fn unmount_bloom(handle: Option<()>) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        format_petal_consent_net_rule, polymarket_fund_confirm_write,
-        polymarket_redeem_confirm_write, polymarket_revoke_approvals_confirm_write,
-        polymarket_trade_confirm_write, polymarket_withdraw_pusd_confirm_write,
-        request_body_with_wallet,
-    };
-    use bloom_vfs::VfsPath;
+    use super::{format_petal_consent_net_rule, request_body_with_wallet};
 
     #[test]
     fn petal_consent_network_line_includes_named_binding() {
@@ -5210,433 +4221,9 @@ mod tests {
             "{\"ok\":true}"
         )
         .to_string();
-
         let output = request_body_with_wallet(input, Some("gavin"));
-
         assert!(output.starts_with("POST https://api.example.com/data wallet=gavin\n"));
         assert!(output.ends_with("\n\n{\"ok\":true}"));
-        assert!(!output.ends_with("wallet=gavin"));
-    }
-
-    #[test]
-    fn request_wallet_injection_keeps_one_line_request_attrs() {
-        let output = request_body_with_wallet(
-            "GET https://api.example.com/data max_amount_usd=0.05".to_string(),
-            Some("gavin"),
-        );
-
-        assert_eq!(
-            output,
-            "GET https://api.example.com/data max_amount_usd=0.05 wallet=gavin"
-        );
-    }
-
-    #[test]
-    fn request_wallet_injection_preserves_valid_toml_shape() {
-        let output = request_body_with_wallet(
-            r#"# comment before keys
-max_amount_usd = "0.05"
-url = "https://api.example.com/data"
-method = "POST"
-
-[headers]
-content-type = "application/json"
-"#
-            .to_string(),
-            Some("gavin"),
-        );
-        let parsed: toml::Value = output.parse().unwrap();
-        assert_eq!(parsed["wallet"].as_str(), Some("gavin"));
-        assert_eq!(parsed["url"].as_str(), Some("https://api.example.com/data"));
-        assert_eq!(parsed["method"].as_str(), Some("POST"));
-        assert_eq!(
-            parsed["headers"]["content-type"].as_str(),
-            Some("application/json")
-        );
-    }
-
-    #[test]
-    fn polymarket_fund_confirm_vfs_write_accepts_ack_body() {
-        let path = VfsPath::parse("/polymarket/fund/my-wallet/fund-000000001/confirm").unwrap();
-        let parsed = polymarket_fund_confirm_write("my-wallet", &path, b"confirm")
-            .unwrap()
-            .expect("fund confirm path");
-
-        assert_eq!(parsed.request_id, "fund-000000001");
-        assert!(!parsed.dry_run);
-        assert!(!parsed.confirm_risk);
-    }
-
-    #[test]
-    fn polymarket_fund_confirm_vfs_write_accepts_structured_body() {
-        let path = VfsPath::parse("/polymarket/fund/my-wallet/fund-000000002/confirm").unwrap();
-        let parsed = polymarket_fund_confirm_write(
-            "my-wallet",
-            &path,
-            br#"{"confirm":true,"dry_run":true,"confirm_risk":true}"#,
-        )
-        .unwrap()
-        .expect("fund confirm path");
-
-        assert_eq!(parsed.request_id, "fund-000000002");
-        assert!(parsed.dry_run);
-        assert!(parsed.confirm_risk);
-    }
-
-    #[test]
-    fn polymarket_fund_confirm_vfs_write_rejects_mismatched_wallet() {
-        let path = VfsPath::parse("/polymarket/fund/other/fund-000000001/confirm").unwrap();
-        let err = polymarket_fund_confirm_write("my-wallet", &path, b"confirm").unwrap_err();
-
-        assert!(err.to_string().contains("does not match"));
-    }
-
-    #[test]
-    fn polymarket_fund_confirm_vfs_write_ignores_other_paths() {
-        let path = VfsPath::parse("/wallets/my-wallet/policy.toml").unwrap();
-
-        assert!(
-            polymarket_fund_confirm_write("my-wallet", &path, b"confirm")
-                .unwrap()
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn polymarket_trade_confirm_vfs_write_accepts_ack_body() {
-        let path =
-            VfsPath::parse("/polymarket/trade/my-wallet/drafts/order-000000001/confirm").unwrap();
-        let parsed = polymarket_trade_confirm_write("my-wallet", &path, b"confirm")
-            .unwrap()
-            .expect("trade confirm path");
-
-        assert_eq!(parsed.draft_id, "order-000000001");
-        assert!(!parsed.confirm_risk);
-    }
-
-    #[test]
-    fn polymarket_trade_confirm_vfs_write_accepts_structured_body() {
-        let path =
-            VfsPath::parse("/polymarket/trade/my-wallet/drafts/order-000000002/confirm").unwrap();
-        let parsed = polymarket_trade_confirm_write(
-            "my-wallet",
-            &path,
-            br#"{"confirm":true,"confirm_risk":true}"#,
-        )
-        .unwrap()
-        .expect("trade confirm path");
-
-        assert_eq!(parsed.draft_id, "order-000000002");
-        assert!(parsed.confirm_risk);
-    }
-
-    #[test]
-    fn polymarket_trade_confirm_vfs_write_accepts_toml_body() {
-        let path =
-            VfsPath::parse("/polymarket/trade/my-wallet/drafts/order-000000003/confirm").unwrap();
-        let parsed = polymarket_trade_confirm_write(
-            "my-wallet",
-            &path,
-            b"confirm = true\nconfirm_risk = true\n",
-        )
-        .unwrap()
-        .expect("trade confirm path");
-
-        assert_eq!(parsed.draft_id, "order-000000003");
-        assert!(parsed.confirm_risk);
-    }
-
-    #[test]
-    fn polymarket_trade_confirm_vfs_write_rejects_mismatched_wallet() {
-        let path =
-            VfsPath::parse("/polymarket/trade/other/drafts/order-000000001/confirm").unwrap();
-        let err = polymarket_trade_confirm_write("my-wallet", &path, b"confirm").unwrap_err();
-
-        assert!(err.to_string().contains("does not match"));
-    }
-
-    #[test]
-    fn polymarket_trade_confirm_vfs_write_rejects_unconfirmed_body() {
-        let path =
-            VfsPath::parse("/polymarket/trade/my-wallet/drafts/order-000000001/confirm").unwrap();
-        let err = polymarket_trade_confirm_write("my-wallet", &path, br#"{"confirm":false}"#)
-            .unwrap_err();
-
-        assert!(err.to_string().contains("confirm=true"));
-    }
-
-    #[test]
-    fn polymarket_trade_confirm_vfs_write_ignores_other_paths() {
-        let path = VfsPath::parse("/polymarket/trade/my-wallet/new").unwrap();
-
-        assert!(
-            polymarket_trade_confirm_write("my-wallet", &path, b"confirm")
-                .unwrap()
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn polymarket_redeem_confirm_vfs_write_accepts_ack_body() {
-        let path =
-            VfsPath::parse("/polymarket/redeem/my-wallet/will-some-slug-resolve/confirm").unwrap();
-        let parsed = polymarket_redeem_confirm_write("my-wallet", &path, b"confirm")
-            .unwrap()
-            .expect("redeem confirm path");
-
-        assert_eq!(parsed.slug, "will-some-slug-resolve");
-    }
-
-    #[test]
-    fn polymarket_redeem_confirm_vfs_write_accepts_structured_body() {
-        let path =
-            VfsPath::parse("/polymarket/redeem/my-wallet/will-some-slug-resolve/confirm").unwrap();
-        let parsed = polymarket_redeem_confirm_write("my-wallet", &path, br#"{"confirm":true}"#)
-            .unwrap()
-            .expect("redeem confirm path");
-
-        assert_eq!(parsed.slug, "will-some-slug-resolve");
-    }
-
-    #[test]
-    fn polymarket_redeem_confirm_vfs_write_accepts_toml_body() {
-        let path =
-            VfsPath::parse("/polymarket/redeem/my-wallet/will-some-slug-resolve/confirm").unwrap();
-        let parsed = polymarket_redeem_confirm_write("my-wallet", &path, b"confirm = true\n")
-            .unwrap()
-            .expect("redeem confirm path");
-
-        assert_eq!(parsed.slug, "will-some-slug-resolve");
-    }
-
-    #[test]
-    fn polymarket_redeem_confirm_vfs_write_rejects_mismatched_wallet() {
-        let path =
-            VfsPath::parse("/polymarket/redeem/other/will-some-slug-resolve/confirm").unwrap();
-        let err = polymarket_redeem_confirm_write("my-wallet", &path, b"confirm").unwrap_err();
-
-        assert!(err.to_string().contains("does not match"));
-    }
-
-    #[test]
-    fn polymarket_redeem_confirm_vfs_write_rejects_unconfirmed_body() {
-        let path =
-            VfsPath::parse("/polymarket/redeem/my-wallet/will-some-slug-resolve/confirm").unwrap();
-        let err = polymarket_redeem_confirm_write("my-wallet", &path, br#"{"confirm":false}"#)
-            .unwrap_err();
-
-        assert!(err.to_string().contains("confirm=true"));
-    }
-
-    #[test]
-    fn polymarket_redeem_confirm_vfs_write_ignores_other_paths() {
-        let path = VfsPath::parse("/polymarket/redeem/my-wallet/some-slug").unwrap();
-
-        assert!(
-            polymarket_redeem_confirm_write("my-wallet", &path, b"confirm")
-                .unwrap()
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn polymarket_revoke_approvals_confirm_vfs_write_accepts_ack_body() {
-        let path =
-            VfsPath::parse("/polymarket/revoke-approvals/my-wallet/request/confirm").unwrap();
-        polymarket_revoke_approvals_confirm_write("my-wallet", &path, b"confirm")
-            .unwrap()
-            .expect("revoke-approvals confirm path");
-    }
-
-    #[test]
-    fn polymarket_revoke_approvals_confirm_vfs_write_accepts_structured_body() {
-        let path =
-            VfsPath::parse("/polymarket/revoke-approvals/my-wallet/request/confirm").unwrap();
-        polymarket_revoke_approvals_confirm_write("my-wallet", &path, br#"{"confirm":true}"#)
-            .unwrap()
-            .expect("revoke-approvals confirm path");
-    }
-
-    #[test]
-    fn polymarket_revoke_approvals_confirm_vfs_write_rejects_mismatched_wallet() {
-        let path = VfsPath::parse("/polymarket/revoke-approvals/other/request/confirm").unwrap();
-        let err =
-            polymarket_revoke_approvals_confirm_write("my-wallet", &path, b"confirm").unwrap_err();
-
-        assert!(err.to_string().contains("does not match"));
-    }
-
-    #[test]
-    fn polymarket_revoke_approvals_confirm_vfs_write_rejects_unconfirmed_body() {
-        let path =
-            VfsPath::parse("/polymarket/revoke-approvals/my-wallet/request/confirm").unwrap();
-        let err =
-            polymarket_revoke_approvals_confirm_write("my-wallet", &path, br#"{"confirm":false}"#)
-                .unwrap_err();
-
-        assert!(err.to_string().contains("confirm=true"));
-    }
-
-    #[test]
-    fn polymarket_revoke_approvals_confirm_vfs_write_ignores_other_paths() {
-        let path = VfsPath::parse("/polymarket/revoke-approvals/my-wallet/request").unwrap();
-
-        assert!(
-            polymarket_revoke_approvals_confirm_write("my-wallet", &path, b"confirm")
-                .unwrap()
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn polymarket_withdraw_pusd_confirm_vfs_write_accepts_all_body() {
-        let path = VfsPath::parse("/polymarket/withdraw/my-wallet/pusd/confirm").unwrap();
-        let parsed = polymarket_withdraw_pusd_confirm_write(
-            "my-wallet",
-            &path,
-            br#"{"confirm":true,"amount":"all"}"#,
-        )
-        .unwrap()
-        .expect("withdraw-pusd confirm path");
-
-        assert_eq!(parsed.amount, "all");
-    }
-
-    #[test]
-    fn polymarket_withdraw_pusd_confirm_vfs_write_accepts_amount_body() {
-        let path = VfsPath::parse("/polymarket/withdraw/my-wallet/pusd/confirm").unwrap();
-        let parsed = polymarket_withdraw_pusd_confirm_write(
-            "my-wallet",
-            &path,
-            br#"{"confirm":true,"amount":"10.5"}"#,
-        )
-        .unwrap()
-        .expect("withdraw-pusd confirm path");
-
-        assert_eq!(parsed.amount, "10.5");
-    }
-
-    #[test]
-    fn polymarket_withdraw_pusd_confirm_vfs_write_accepts_toml_body() {
-        let path = VfsPath::parse("/polymarket/withdraw/my-wallet/pusd/confirm").unwrap();
-        let parsed = polymarket_withdraw_pusd_confirm_write(
-            "my-wallet",
-            &path,
-            b"confirm = true\namount = \"all\"\n",
-        )
-        .unwrap()
-        .expect("withdraw-pusd confirm path");
-
-        assert_eq!(parsed.amount, "all");
-    }
-
-    #[test]
-    fn polymarket_withdraw_pusd_confirm_vfs_write_rejects_bare_ack() {
-        let path = VfsPath::parse("/polymarket/withdraw/my-wallet/pusd/confirm").unwrap();
-        let err =
-            polymarket_withdraw_pusd_confirm_write("my-wallet", &path, b"confirm").unwrap_err();
-
-        assert!(err.to_string().contains("explicit amount"), "got: {err}");
-    }
-
-    #[test]
-    fn polymarket_withdraw_pusd_confirm_vfs_write_rejects_missing_amount() {
-        let path = VfsPath::parse("/polymarket/withdraw/my-wallet/pusd/confirm").unwrap();
-        let err =
-            polymarket_withdraw_pusd_confirm_write("my-wallet", &path, br#"{"confirm":true}"#)
-                .unwrap_err();
-
-        assert!(err.to_string().contains("explicit amount"), "got: {err}");
-    }
-
-    #[test]
-    fn polymarket_withdraw_pusd_confirm_vfs_write_rejects_mismatched_wallet() {
-        let path = VfsPath::parse("/polymarket/withdraw/other/pusd/confirm").unwrap();
-        let err = polymarket_withdraw_pusd_confirm_write(
-            "my-wallet",
-            &path,
-            br#"{"confirm":true,"amount":"all"}"#,
-        )
-        .unwrap_err();
-
-        assert!(err.to_string().contains("does not match"));
-    }
-
-    #[test]
-    fn polymarket_withdraw_pusd_confirm_vfs_write_rejects_unconfirmed_body() {
-        let path = VfsPath::parse("/polymarket/withdraw/my-wallet/pusd/confirm").unwrap();
-        let err = polymarket_withdraw_pusd_confirm_write(
-            "my-wallet",
-            &path,
-            br#"{"confirm":false,"amount":"all"}"#,
-        )
-        .unwrap_err();
-
-        assert!(err.to_string().contains("confirm=true"));
-    }
-
-    #[test]
-    fn polymarket_withdraw_pusd_confirm_vfs_write_ignores_other_paths() {
-        let path = VfsPath::parse("/polymarket/withdraw/my-wallet/pusd").unwrap();
-
-        assert!(
-            polymarket_withdraw_pusd_confirm_write(
-                "my-wallet",
-                &path,
-                br#"{"confirm":true,"amount":"all"}"#,
-            )
-            .unwrap()
-            .is_none()
-        );
-    }
-
-    #[test]
-    fn polymarket_redeem_confirm_vfs_write_rejects_dry_run() {
-        let path = VfsPath::parse("/polymarket/redeem/my-wallet/some-slug/confirm").unwrap();
-        let err = polymarket_redeem_confirm_write(
-            "my-wallet",
-            &path,
-            br#"{"confirm":true,"dry_run":true}"#,
-        )
-        .unwrap_err();
-
-        assert!(
-            err.to_string().contains("dry-run is not available"),
-            "got: {err}"
-        );
-    }
-
-    #[test]
-    fn polymarket_revoke_approvals_confirm_vfs_write_rejects_dry_run() {
-        let path =
-            VfsPath::parse("/polymarket/revoke-approvals/my-wallet/request/confirm").unwrap();
-        let err = polymarket_revoke_approvals_confirm_write(
-            "my-wallet",
-            &path,
-            br#"{"confirm":true,"dry_run":true}"#,
-        )
-        .unwrap_err();
-
-        assert!(
-            err.to_string().contains("dry-run is not available"),
-            "got: {err}"
-        );
-    }
-
-    #[test]
-    fn polymarket_withdraw_pusd_confirm_vfs_write_rejects_dry_run() {
-        let path = VfsPath::parse("/polymarket/withdraw/my-wallet/pusd/confirm").unwrap();
-        let err = polymarket_withdraw_pusd_confirm_write(
-            "my-wallet",
-            &path,
-            br#"{"confirm":true,"amount":"all","dry_run":true}"#,
-        )
-        .unwrap_err();
-
-        assert!(
-            err.to_string().contains("dry-run is not available"),
-            "got: {err}"
-        );
     }
 }
 

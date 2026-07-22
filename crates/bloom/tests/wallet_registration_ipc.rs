@@ -42,7 +42,13 @@ const LOCAL_CEREMONY_PORT: u16 = 18734;
 static PORT_18734_LOCK: Mutex<()> = Mutex::new(());
 
 fn fresh_home() -> TempDir {
-    tempfile::tempdir().expect("create temp home")
+    let home = tempfile::tempdir().expect("create temp home");
+    let mut config = bloom_proto::Config::local_default();
+    config.petals.preinstalled.clear();
+    config
+        .save(&home.path().join("config.toml"))
+        .expect("save config without network-backed preinstalled Petals");
+    home
 }
 
 /// Kills the child `bloom serve` process on drop, so a panicking assertion

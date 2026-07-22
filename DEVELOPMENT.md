@@ -346,6 +346,10 @@ bloom vfs ls  /status/chains/base/endpoints              # health snapshots, 0-i
 bloom vfs cat /status/chains/base/endpoints/0/success_rate
 bloom vfs cat /status/outbox/pending_count               # pending tx count
 bloom vfs cat /status/backends/summary.json              # which data source each surface uses
+bloom vfs cat /status/update/installed                   # this binary's compiled-in version
+bloom vfs cat /status/update/summary.json                # latest known GitHub release + verdict
+bloom update check                                       # force-refresh and print as JSON (exit 0/1/2)
+bloom update status                                      # print cached snapshot as JSON
 ```
 
 ### IPC introspection

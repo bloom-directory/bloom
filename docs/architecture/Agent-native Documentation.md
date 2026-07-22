@@ -46,7 +46,7 @@ from the release it ships with.
 - the mounted Sealed Approval lifecycle for the EVM slice: permission-denied
   confirm writes, `approval_challenge.json`, `ceremony_url`, grant / grant +
   execute, and retrying after a grant-only approval;
-- Hyperliquid session-first trading and Polymarket opt-in gating;
+- Hyperliquid session-first trading and discovery of installed Petal docs;
 - passkey policy signing and `under_policy` semantics.
 
 As additional Petals adopt the mounted Sealed Approval flow described in
@@ -57,14 +57,22 @@ forwarding or opening `ceremony_url`, the grant / grant + execute choice, and
 retrying the confirm write after a grant-only approval. There is no per-action
 hint file and no per-directory README duplication of global contracts.
 
-## Per-Petal READMEs
+## Per-surface documentation
 
-Petal handlers embed their own read-only, Petal-local documentation the same
-way (compile-time constants served as `README.md` inside the Petal's
-subtree): `/hyperliquid/README.md` (plus `asset_ids.md`),
-`/polymarket/README.md`, `/defi/README.md`, ENS, and the per-address
-`tokens/README.md` under chain handlers. Per-request `plan.md` files under
+Built-in handlers embed read-only, handler-local documentation, while external
+Petals expose package-defined route documentation under `/petals/<name>/`.
+For example, Hyperliquid exposes `/hyperliquid/README.md`, and the default
+installed Polymarket Petal exposes `/petals/polymarket/README.md`,
+`/petals/polymarket/AGENTS.md`, and
+`/petals/polymarket/meta/route-contract.json`. Per-request `plan.md` files under
 `/requests` are per-instance previews rather than static docs.
+
+An installed Petal's `README.md` and `AGENTS.md` come directly from its
+validated, content-addressed package. The Bloom Petal router serves those two
+files read-only at the Petal mount root instead of dispatching them through
+Petal-supplied WASM. This keeps operator and agent guidance available before an
+agent invokes any Petal route and prevents a dynamic route from shadowing the
+packaged documentation.
 
 The division of labor:
 
@@ -73,6 +81,11 @@ The division of labor:
 - a Petal README documents only Petal-local paths and semantics, and links
   back to the shared contracts rather than restating them.
 
+Venue integrations that graduate to external Petals must not retain a native
+CLI, root-level VFS subtree, daemon mount, or daemon-owned venue state. The
+installed package documentation becomes authoritative, while Bloom retains
+only generic host capabilities and any wallet-policy schema the Petal consumes.
+
 ## Keeping It Honest
 
 Two mechanisms keep the served documentation truthful:
@@ -80,9 +93,10 @@ Two mechanisms keep the served documentation truthful:
 **Tests pin the surface.** The router tests assert that the root lists both
 `AGENTS.md` and `CLAUDE.md` as read-only files, that the served bytes are
 byte-identical to the vendored source file, and that the content passes
-sanity checks. Petal handlers carry similar tests for their READMEs (for
-example, that the Hyperliquid README documents safe reads and API-wallet
-risk).
+sanity checks. Petal router tests assert that package `README.md` and
+`AGENTS.md` files are listed, readable, and immutable. Built-in handlers carry
+similar tests for their READMEs (for example, that the Hyperliquid README
+documents safe reads and API-wallet risk).
 
 **The PR checklist enforces updates.** The repository's pull request
 template includes a mandatory "Agent Documentation updated" item, enforced

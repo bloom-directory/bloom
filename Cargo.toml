@@ -14,7 +14,6 @@ members = [
   "crates/bloom-keystore",
   "crates/bloom-mempool",
   "crates/bloom-defi",
-  "crates/bloom-polymarket",
   "crates/bloom-hyperliquid",
   "crates/bloom-watch",
   "crates/bloom-mount",
@@ -26,6 +25,7 @@ members = [
   "crates/bloom-revert",
   "crates/bloom-petals",
   "crates/bloom-it",
+  "crates/bloom-update",
 ]
 resolver = "2"
 
@@ -43,6 +43,7 @@ tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "signal"
 tokio-tungstenite = { version = "0.24", default-features = false, features = ["rustls-tls-webpki-roots", "connect"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+semver = "1"
 toml = "0.8"
 clap = { version = "4", features = ["derive", "env"] }
 clap_complete = "4"
@@ -65,6 +66,7 @@ ml-dsa = { version = "0.1.0", features = ["getrandom", "zeroize"] }
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 rusqlite = { version = "0.31", features = ["bundled"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+flate2 = "1"
 mpp = { version = "0.10.4", default-features = false, features = ["client", "tempo", "reqwest-rustls-tls"] }
 url = "2"
 humantime = "2"
@@ -110,7 +112,6 @@ bloom-paid-x402 = { path = "crates/bloom-paid-x402" }
 bloom-paid-http = { path = "crates/bloom-paid-http" }
 bloom-tools    = { path = "crates/bloom-tools" }
 bloom-defi     = { path = "crates/bloom-defi" }
-bloom-polymarket = { path = "crates/bloom-polymarket" }
 bloom-hyperliquid = { path = "crates/bloom-hyperliquid" }
 bloom-watch    = { path = "crates/bloom-watch" }
 bloom-mount    = { path = "crates/bloom-mount" }
@@ -123,6 +124,7 @@ bloom-petal-contract = { git = "https://github.com/bloom-directory/petal", rev =
 bloom-daemon   = { path = "crates/bloom-daemon" }
 bloom-auth-api = { path = "crates/bloom-auth-api" }
 bloom-auth     = { path = "crates/bloom-auth" }
+bloom-update   = { path = "crates/bloom-update" }
 # ---- example core petal: generic capability primitives (/bloom/core/cap) ----
 
 [profile.release]

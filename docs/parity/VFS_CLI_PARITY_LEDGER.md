@@ -1,9 +1,13 @@
-# VFS/CLI Parity Ledger
+# Historical VFS/CLI Parity Ledger
 
 Date: 2026-06-28
 Inspected Bloom baseline commit: `1ea1e65` (`Add VFS CLI parity ledger and fund confirm path`)
 
-This ledger classifies user-facing workflows across the `bloom` CLI and VFS.
+> Historical snapshot: this ledger describes the baseline above and is not a
+> current product contract. In particular, its native Polymarket rows were
+> superseded by the external package at `/petals/polymarket/`.
+
+This ledger classified user-facing workflows across the `bloom` CLI and VFS.
 Statuses:
 
 - `parity`: both surfaces complete the workflow end-to-end with equivalent gates.

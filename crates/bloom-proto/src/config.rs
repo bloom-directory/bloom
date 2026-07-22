@@ -44,10 +44,6 @@ pub struct Config {
     pub etherscan: Option<EtherscanConfig>,
     #[serde(default)]
     pub enso: Option<EnsoConfig>,
-    /// Polymarket read and trading surface. Enabled with public Polygon
-    /// endpoints by default; a `[polymarket]` table can override them.
-    #[serde(default = "default_polymarket_config")]
-    pub polymarket: Option<PolymarketConfig>,
     /// Trusted, daemon-owned runtime settings for installed Petals.
     /// Endpoint overrides are matched to named manifest bindings and may only
     /// replace the HTTPS authority; the signed method/path policy remains the
@@ -70,11 +66,28 @@ pub struct Config {
     pub backends: BackendsConfig,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PetalsConfig {
+    /// Built-in Petals provisioned by explicit lifecycle commands such as
+    /// `bloom init`. An explicit empty list is a persistent opt-out.
+    #[serde(default = "default_preinstalled_petals")]
+    pub preinstalled: Vec<String>,
     #[serde(default)]
     pub runtime: BTreeMap<String, PetalRuntimeConfig>,
+}
+
+impl Default for PetalsConfig {
+    fn default() -> Self {
+        Self {
+            preinstalled: default_preinstalled_petals(),
+            runtime: BTreeMap::new(),
+        }
+    }
+}
+
+fn default_preinstalled_petals() -> Vec<String> {
+    vec!["polymarket".to_string()]
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -186,90 +199,6 @@ pub struct EnsoConfig {
     pub api_url: String,
 }
 
-/// Polymarket client configuration. Every field has a default so a bare
-/// `[polymarket]` TOML table parses to the public-endpoint defaults on Polygon.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PolymarketConfig {
-    /// Mount the Polymarket VFS integration. Defaults to true; set false for a
-    /// serialization-safe opt-out.
-    #[serde(default = "default_polymarket_enabled")]
-    pub enabled: bool,
-    #[serde(default = "default_gamma_url")]
-    pub gamma_url: String,
-    #[serde(default = "default_data_url")]
-    pub data_url: String,
-    #[serde(default = "default_clob_url")]
-    pub clob_url: String,
-    /// Relayer for gasless deposit-wallet deploys/batches (onboarding).
-    #[serde(default = "default_relayer_url")]
-    pub relayer_url: String,
-    /// Settlement chain id (Polygon mainnet by default).
-    #[serde(default = "default_polymarket_chain_id")]
-    pub chain_id: u64,
-    /// Optional builder code for order attribution (unused by the read surface).
-    #[serde(default)]
-    pub builder_code: Option<String>,
-    /// Manual relayer API key + the address that owns it — sent as
-    /// `RELAYER_API_KEY` / `RELAYER_API_KEY_ADDRESS` headers on relayer calls.
-    /// Create one at `polymarket.com/settings?tab=api-keys`. Optional advanced
-    /// override: the default path auto-creates a **builder API key** instead
-    /// (see `builder_key_mode`). When set, it takes precedence over the
-    /// builder key.
-    #[serde(default)]
-    pub relayer_api_key: Option<String>,
-    #[serde(default)]
-    pub relayer_api_key_address: Option<String>,
-    /// How the relayer credential is obtained for the (default) deposit-wallet
-    /// trading mode:
-    /// - `"auto"` (default): bloom creates a **builder API key** from the
-    ///   wallet's CLOB credentials (`POST /auth/builder-api-key`) and uses it
-    ///   for relayer submission auth. Disclosed during onboarding; revocable
-    ///   with `bloom polymarket builder-keys revoke`. Submission auth only —
-    ///   it never holds wallet authority.
-    /// - `"manual"`: only the `relayer_api_key`/`relayer_api_key_address`
-    ///   pair is used; refuse with setup instructions when absent.
-    /// - `"disabled"`: never create or use relayer auth automatically;
-    ///   deposit-wallet trading is unavailable.
-    #[serde(default = "default_builder_key_mode")]
-    pub builder_key_mode: String,
-    /// Explicit opt-in to the legacy EOA onboarding mode (signatureType 0).
-    /// The CLOB rejects EOA makers at order placement ("maker address not
-    /// allowed"), so this mode cannot trade — it exists for read/creds-only
-    /// setups and backward compatibility.
-    #[serde(default)]
-    pub legacy_eoa_mode: bool,
-}
-
-impl Default for PolymarketConfig {
-    fn default() -> Self {
-        Self {
-            enabled: default_polymarket_enabled(),
-            gamma_url: default_gamma_url(),
-            data_url: default_data_url(),
-            clob_url: default_clob_url(),
-            relayer_url: default_relayer_url(),
-            chain_id: default_polymarket_chain_id(),
-            builder_code: None,
-            relayer_api_key: None,
-            relayer_api_key_address: None,
-            builder_key_mode: default_builder_key_mode(),
-            legacy_eoa_mode: false,
-        }
-    }
-}
-
-fn default_polymarket_config() -> Option<PolymarketConfig> {
-    Some(PolymarketConfig::default())
-}
-
-fn default_polymarket_enabled() -> bool {
-    true
-}
-
-fn default_builder_key_mode() -> String {
-    "auto".into()
-}
-
 /// Hyperliquid HyperCore API configuration. Every field has a default so a
 /// bare `[hyperliquid]` TOML table uses the official public endpoints.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -334,18 +263,6 @@ fn default_etherscan_url() -> String {
 fn default_enso_url() -> String {
     "https://api.enso.finance".to_string()
 }
-fn default_gamma_url() -> String {
-    "https://gamma-api.polymarket.com".to_string()
-}
-fn default_data_url() -> String {
-    "https://data-api.polymarket.com".to_string()
-}
-fn default_clob_url() -> String {
-    "https://clob.polymarket.com".to_string()
-}
-fn default_relayer_url() -> String {
-    "https://relayer-v2.polymarket.com".to_string()
-}
 fn default_hyperliquid_mainnet_url() -> String {
     "https://api.hyperliquid.xyz".to_string()
 }
@@ -357,9 +274,6 @@ fn default_hyperliquid_bridge() -> String {
 }
 fn default_hyperliquid_deposit_chain_id() -> u64 {
     crate::hyperliquid::DEPOSIT_CHAIN_ID
-}
-fn default_polymarket_chain_id() -> u64 {
-    137
 }
 fn default_max_index_size() -> usize {
     50_000
@@ -533,7 +447,6 @@ impl Config {
             chains,
             etherscan: None,
             enso: None,
-            polymarket: default_polymarket_config(),
             petals: PetalsConfig::default(),
             hyperliquid: Some(HyperliquidConfig::default()),
             mempool: BTreeMap::new(),
@@ -544,8 +457,9 @@ impl Config {
 
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
         let s = std::fs::read_to_string(path)?;
+        let document: toml::Value = toml::from_str(&s)?;
         let mut cfg: Self = toml::from_str(&s)?;
-        cfg.migrate();
+        cfg.migrate(&document);
         cfg.validate()?;
         Ok(cfg)
     }
@@ -573,9 +487,26 @@ impl Config {
     ///
     /// Currently infers `op_stack` for well-known OP-stack chain IDs
     /// (Optimism=10, Base=8453, …) that predate the `op_stack` field.
-    fn migrate(&mut self) {
+    fn migrate(&mut self, document: &toml::Value) {
         for spec in self.chains.values_mut() {
             spec.infer_op_stack();
+        }
+
+        // Bloom versions immediately before native Polymarket removal used
+        // `[polymarket] enabled = false` as the persistent opt-out. Preserve
+        // that explicit choice unless the operator has already configured the
+        // replacement `petals.preinstalled` list.
+        let legacy_polymarket_disabled = document
+            .get("polymarket")
+            .and_then(|value| value.get("enabled"))
+            .and_then(toml::Value::as_bool)
+            == Some(false);
+        let preinstalled_is_explicit = document
+            .get("petals")
+            .and_then(|value| value.get("preinstalled"))
+            .is_some();
+        if legacy_polymarket_disabled && !preinstalled_is_explicit {
+            self.petals.preinstalled.retain(|name| name != "polymarket");
         }
     }
 
@@ -651,6 +582,20 @@ impl Config {
                 }
             }
         }
+        let mut seen_preinstalled = std::collections::BTreeSet::new();
+        for name in &self.petals.preinstalled {
+            validate_petal_runtime_name("preinstalled entry", name)?;
+            if !matches!(name.as_str(), "polymarket" | "near-intents") {
+                return Err(ConfigError::Invalid(format!(
+                    "unknown preinstalled Petal {name:?}"
+                )));
+            }
+            if !seen_preinstalled.insert(name) {
+                return Err(ConfigError::Invalid(format!(
+                    "duplicate preinstalled Petal {name:?}"
+                )));
+            }
+        }
         Ok(())
     }
 
@@ -719,11 +664,7 @@ mod tests {
         assert_eq!(cfg.nfs_listen_addr, "127.0.0.1:12049");
         assert!(cfg.etherscan.is_none());
         assert!(cfg.enso.is_none());
-        let polymarket = cfg
-            .polymarket
-            .as_ref()
-            .expect("Polymarket is enabled by default");
-        assert_eq!(polymarket.chain_id, 137);
+        assert_eq!(cfg.petals.preinstalled, ["polymarket"]);
         let hyperliquid = cfg
             .hyperliquid
             .as_ref()
@@ -806,6 +747,35 @@ mod tests {
     }
 
     #[test]
+    fn preinstalled_petals_support_persistent_opt_out_and_validate_catalog_names() {
+        let mut cfg = Config::local_default();
+        cfg.petals.preinstalled.clear();
+        assert!(cfg.petals.preinstalled.is_empty());
+        cfg.validate().unwrap();
+
+        let serialized = toml::to_string_pretty(&cfg).unwrap();
+        let reloaded: Config = toml::from_str(&serialized).unwrap();
+        assert!(reloaded.petals.preinstalled.is_empty());
+
+        cfg.petals.preinstalled = vec!["near-intents".into()];
+        cfg.validate().unwrap();
+
+        cfg.petals.preinstalled = vec!["unknown".into()];
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("unknown preinstalled Petal \"unknown\""),
+            "{err}"
+        );
+
+        cfg.petals.preinstalled = vec!["polymarket".into(), "polymarket".into()];
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("duplicate preinstalled Petal \"polymarket\""),
+            "{err}"
+        );
+    }
+
+    #[test]
     fn legacy_petals_apps_config_is_rejected() {
         let err = toml::from_str::<PetalsConfig>(
             r#"
@@ -822,57 +792,6 @@ mod tests {
         let s = toml::to_string_pretty(&cfg).unwrap();
         let back: Config = toml::from_str(&s).unwrap();
         assert_configs_equivalent(&cfg, &back);
-    }
-
-    #[test]
-    fn bare_polymarket_block_parses_to_public_defaults() {
-        let pm: PolymarketConfig = toml::from_str("").unwrap();
-        assert!(pm.enabled);
-        assert_eq!(pm.gamma_url, "https://gamma-api.polymarket.com");
-        assert_eq!(pm.data_url, "https://data-api.polymarket.com");
-        assert_eq!(pm.clob_url, "https://clob.polymarket.com");
-        assert_eq!(pm.relayer_url, "https://relayer-v2.polymarket.com");
-        assert_eq!(pm.chain_id, 137);
-        assert!(pm.builder_code.is_none());
-        // Absent relayer key → EOA path is selected downstream.
-        assert!(pm.relayer_api_key.is_none() && pm.relayer_api_key_address.is_none());
-
-        // Overrides stick and round-trip.
-        let pm: PolymarketConfig =
-            toml::from_str("relayer_url = \"http://localhost:1\"\nchain_id = 80002\n").unwrap();
-        assert_eq!(pm.relayer_url, "http://localhost:1");
-        assert_eq!(pm.chain_id, 80_002);
-        let back: PolymarketConfig = toml::from_str(&toml::to_string(&pm).unwrap()).unwrap();
-        assert_eq!(back.relayer_url, pm.relayer_url);
-
-        // Relayer key present → deposit-wallet path is selected downstream.
-        let pm: PolymarketConfig =
-            toml::from_str("relayer_api_key = \"k-123\"\nrelayer_api_key_address = \"0xabc\"\n")
-                .unwrap();
-        assert_eq!(pm.relayer_api_key.as_deref(), Some("k-123"));
-        assert_eq!(pm.relayer_api_key_address.as_deref(), Some("0xabc"));
-    }
-
-    #[test]
-    fn missing_polymarket_block_enables_public_defaults() {
-        let cfg: Config = toml::from_str("").unwrap();
-        let pm = cfg
-            .polymarket
-            .expect("Polymarket should be enabled when the block is omitted");
-        assert!(pm.enabled);
-        assert_eq!(pm.chain_id, 137);
-        assert_eq!(pm.gamma_url, "https://gamma-api.polymarket.com");
-    }
-
-    #[test]
-    fn polymarket_disabled_setting_survives_toml_round_trip() {
-        let cfg: Config = toml::from_str("[polymarket]\nenabled = false\n").unwrap();
-        assert!(!cfg.polymarket.as_ref().unwrap().enabled);
-
-        let serialized = toml::to_string_pretty(&cfg).unwrap();
-        assert!(serialized.contains("enabled = false"));
-        let reloaded: Config = toml::from_str(&serialized).unwrap();
-        assert!(!reloaded.polymarket.unwrap().enabled);
     }
 
     #[test]
@@ -952,6 +871,25 @@ allow_broadcast = false
         let cfg = Config::load_or_init(&path).unwrap();
         assert!(!cfg.chains["anvil"].allow_broadcast);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), existing);
+    }
+
+    #[test]
+    fn load_preserves_legacy_polymarket_opt_out_until_new_setting_is_explicit() {
+        let td = tempdir().unwrap();
+        let path = td.path().join("config.toml");
+        let default = toml::to_string_pretty(&Config::local_default()).unwrap();
+        let legacy = default
+            .replace("preinstalled = [\"polymarket\"]\n", "")
+            .replace("preinstalled = [\n    \"polymarket\",\n]\n", "");
+        assert!(!legacy.contains("preinstalled"));
+        std::fs::write(&path, format!("{legacy}\n[polymarket]\nenabled = false\n")).unwrap();
+
+        let migrated = Config::load(&path).unwrap();
+        assert!(migrated.petals.preinstalled.is_empty());
+
+        std::fs::write(&path, format!("{default}\n[polymarket]\nenabled = false\n")).unwrap();
+        let explicitly_enabled = Config::load(&path).unwrap();
+        assert_eq!(explicitly_enabled.petals.preinstalled, vec!["polymarket"]);
     }
 
     #[test]

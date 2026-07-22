@@ -18,6 +18,22 @@ use parking_lot::RwLock;
 
 pub type SessionId = String;
 
+/// Authorization facts that determine whether a staged action is eligible for
+/// a bounded policy session. Sessions only cover typed, verified actions that
+/// do not change authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionActionFacts {
+    pub value_moving: bool,
+    pub calldata_verified: bool,
+    pub authority_change: bool,
+}
+
+impl SessionActionFacts {
+    fn eligible(self) -> bool {
+        self.calldata_verified && !self.authority_change
+    }
+}
+
 /// A live, bounded authorization minted by one ceremony.
 #[derive(Debug, Clone)]
 pub struct ActiveSession {
@@ -101,9 +117,12 @@ impl SessionStore {
         chain_id: u64,
         pending_id: &str,
         tx_micro_usd: Option<i128>,
-        value_moving: bool,
+        facts: SessionActionFacts,
         now_ms: u128,
     ) -> bool {
+        if !facts.eligible() {
+            return false;
+        }
         let key = pending_key(chain_id, pending_id);
         self.inner.read().values().any(|session| {
             if session.wallet != wallet
@@ -117,7 +136,7 @@ impl SessionStore {
                 Some(value) => {
                     session.spent_micro_usd.saturating_add(value) <= session.max_micro_usd
                 }
-                None => !value_moving,
+                None => !facts.value_moving,
             }
         })
     }
@@ -143,9 +162,12 @@ impl SessionStore {
         chain_id: u64,
         pending_id: &str,
         tx_micro_usd: Option<i128>,
-        value_moving: bool,
+        facts: SessionActionFacts,
         now_ms: u128,
     ) -> Option<(SessionId, i128)> {
+        if !facts.eligible() {
+            return None;
+        }
         let key = pending_key(chain_id, pending_id);
         let mut guard = self.inner.write();
         for s in guard.values_mut() {
@@ -168,7 +190,7 @@ impl SessionStore {
                 }
                 // Unpriced value-moving tx: we can't debit it against the dollar
                 // cap, so no session may silently cover it (fail closed).
-                None if value_moving => continue,
+                None if facts.value_moving => continue,
                 // Unpriced value-neutral tx: the explicit id allowlist is the
                 // bound; debit 0.
                 None => 0,
@@ -190,6 +212,14 @@ impl SessionStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn verified_facts(value_moving: bool) -> SessionActionFacts {
+        SessionActionFacts {
+            value_moving,
+            calldata_verified: true,
+            authority_change: false,
+        }
+    }
 
     fn session(id: &str, max: i128, ids: &[&str]) -> ActiveSession {
         ActiveSession {
@@ -214,13 +244,13 @@ mod tests {
         // The same bare id on Arbitrum (42161) must NOT be authorized.
         assert!(
             store
-                .authorize_and_debit("alice", 42161, "0001-a", Some(1), true, 1)
+                .authorize_and_debit("alice", 42161, "0001-a", Some(1), verified_facts(true), 1)
                 .is_none()
         );
         // The exact (chain, id) it was minted for is authorized.
         assert!(
             store
-                .authorize_and_debit("alice", 8453, "0001-a", Some(1), true, 1)
+                .authorize_and_debit("alice", 8453, "0001-a", Some(1), verified_facts(true), 1)
                 .is_some()
         );
     }
@@ -230,14 +260,42 @@ mod tests {
         let store = SessionStore::new();
         store.mint(session("s1", 10_000_000, &["0001-a"]));
 
-        assert!(store.covers("alice", 42161, "0001-a", Some(4_000_000), true, 1));
-        assert!(store.covers("alice", 42161, "0001-a", Some(4_000_000), true, 1));
+        assert!(store.covers(
+            "alice",
+            42161,
+            "0001-a",
+            Some(4_000_000),
+            verified_facts(true),
+            1
+        ));
+        assert!(store.covers(
+            "alice",
+            42161,
+            "0001-a",
+            Some(4_000_000),
+            verified_facts(true),
+            1
+        ));
 
         let debit = store
-            .authorize_and_debit("alice", 42161, "0001-a", Some(7_000_000), true, 1)
+            .authorize_and_debit(
+                "alice",
+                42161,
+                "0001-a",
+                Some(7_000_000),
+                verified_facts(true),
+                1,
+            )
             .expect("coverage probes must not consume budget");
         assert_eq!(debit.1, 7_000_000);
-        assert!(!store.covers("alice", 42161, "0001-a", Some(4_000_000), true, 1));
+        assert!(!store.covers(
+            "alice",
+            42161,
+            "0001-a",
+            Some(4_000_000),
+            verified_facts(true),
+            1
+        ));
     }
 
     #[test]
@@ -246,7 +304,14 @@ mod tests {
         store.mint(session("s1", 10_000_000, &["0001-a"]));
         assert!(
             store
-                .authorize_and_debit("alice", 42161, "0001-a", Some(1_000_000), true, 1)
+                .authorize_and_debit(
+                    "alice",
+                    42161,
+                    "0001-a",
+                    Some(1_000_000),
+                    verified_facts(true),
+                    1
+                )
                 .is_some()
         );
     }
@@ -258,25 +323,32 @@ mod tests {
         // expired
         assert!(
             store
-                .authorize_and_debit("alice", 42161, "0001-a", Some(1), true, 99_999)
+                .authorize_and_debit(
+                    "alice",
+                    42161,
+                    "0001-a",
+                    Some(1),
+                    verified_facts(true),
+                    99_999
+                )
                 .is_none()
         );
         // chain not in set
         assert!(
             store
-                .authorize_and_debit("alice", 1, "0001-a", Some(1), true, 1)
+                .authorize_and_debit("alice", 1, "0001-a", Some(1), verified_facts(true), 1)
                 .is_none()
         );
         // id not in allowlist
         assert!(
             store
-                .authorize_and_debit("alice", 42161, "0009-z", Some(1), true, 1)
+                .authorize_and_debit("alice", 42161, "0009-z", Some(1), verified_facts(true), 1)
                 .is_none()
         );
         // wrong wallet
         assert!(
             store
-                .authorize_and_debit("bob", 42161, "0001-a", Some(1), true, 1)
+                .authorize_and_debit("bob", 42161, "0001-a", Some(1), verified_facts(true), 1)
                 .is_none()
         );
     }
@@ -287,19 +359,40 @@ mod tests {
         store.mint(session("s1", 10_000_000, &["a", "b"]));
         assert!(
             store
-                .authorize_and_debit("alice", 42161, "a", Some(7_000_000), true, 1)
+                .authorize_and_debit(
+                    "alice",
+                    42161,
+                    "a",
+                    Some(7_000_000),
+                    verified_facts(true),
+                    1
+                )
                 .is_some()
         );
         // Second confirm would exceed the $10 cap → refused.
         assert!(
             store
-                .authorize_and_debit("alice", 42161, "b", Some(4_000_000), true, 1)
+                .authorize_and_debit(
+                    "alice",
+                    42161,
+                    "b",
+                    Some(4_000_000),
+                    verified_facts(true),
+                    1
+                )
                 .is_none()
         );
         // A smaller one still fits.
         assert!(
             store
-                .authorize_and_debit("alice", 42161, "b", Some(3_000_000), true, 1)
+                .authorize_and_debit(
+                    "alice",
+                    42161,
+                    "b",
+                    Some(3_000_000),
+                    verified_facts(true),
+                    1
+                )
                 .is_some()
         );
     }
@@ -309,13 +402,27 @@ mod tests {
         let store = SessionStore::new();
         store.mint(session("s1", 10_000_000, &["a"]));
         let (id, amt) = store
-            .authorize_and_debit("alice", 42161, "a", Some(9_000_000), true, 1)
+            .authorize_and_debit(
+                "alice",
+                42161,
+                "a",
+                Some(9_000_000),
+                verified_facts(true),
+                1,
+            )
             .unwrap();
         store.refund(&id, amt);
         // Full budget available again.
         assert!(
             store
-                .authorize_and_debit("alice", 42161, "a", Some(9_000_000), true, 1)
+                .authorize_and_debit(
+                    "alice",
+                    42161,
+                    "a",
+                    Some(9_000_000),
+                    verified_facts(true),
+                    1
+                )
                 .is_some()
         );
     }
@@ -327,14 +434,44 @@ mod tests {
         // No USD valuation + value-moving → no session may cover it.
         assert!(
             store
-                .authorize_and_debit("alice", 42161, "a", None, true, 1)
+                .authorize_and_debit("alice", 42161, "a", None, verified_facts(true), 1)
                 .is_none()
         );
         // No USD valuation + value-neutral → covered by the id allowlist, debit 0.
         let (_, debit) = store
-            .authorize_and_debit("alice", 42161, "a", None, false, 1)
+            .authorize_and_debit("alice", 42161, "a", None, verified_facts(false), 1)
             .expect("value-neutral unpriced tx is covered");
         assert_eq!(debit, 0);
+    }
+
+    #[test]
+    fn approvals_and_unverified_calldata_are_never_session_eligible() {
+        let store = SessionStore::new();
+        store.mint(session("s1", 10_000_000, &["a"]));
+        for facts in [
+            SessionActionFacts {
+                value_moving: true,
+                calldata_verified: true,
+                authority_change: true,
+            },
+            SessionActionFacts {
+                value_moving: true,
+                calldata_verified: false,
+                authority_change: false,
+            },
+        ] {
+            assert!(!store.covers("alice", 42161, "a", Some(1), facts, 1));
+            assert!(
+                store
+                    .authorize_and_debit("alice", 42161, "a", Some(1), facts, 1)
+                    .is_none()
+            );
+            assert!(
+                store
+                    .authorize_and_debit("alice", 42161, "a", None, facts, 1)
+                    .is_none()
+            );
+        }
     }
 
     #[test]

@@ -10,8 +10,8 @@ Bloom actions must work through three interaction modes:
 3. Mounted VFS with a Bloom Machine
 
 This requirement applies to every Petal, including first-party Petals such as
-EVM wallet, paid HTTP, DeFi, Polymarket, Hyperliquid, wallet policy, and future
-WASM Petals.
+EVM wallet, paid HTTP, DeFi, Hyperliquid, and wallet policy, plus installed
+WASM Petals such as Polymarket.
 
 The user and agent should not need to learn a different authorization model for
 each Petal. A Petal may expose domain-specific paths and commands, but those
@@ -224,9 +224,10 @@ These are examples of the same interaction contract, not separate systems:
 - Paid HTTP: stage a paid request, confirm the payment credential, run Sealed
   Approval when policy/session authority is insufficient, then send the HTTP
   request.
-- Polymarket: stage onboarding, funding, order, redeem, withdrawal, or approval
-  revocation actions; run the ceremony for any owner-signing or authority
-  change; execute only from sealed action bytes.
+- Installed Polymarket Petal: stage onboarding, funding, order, redeem,
+  withdrawal, or approval-revocation actions under `/petals/polymarket`; run the
+  ceremony for owner signing or authority changes and execute only from sealed
+  action bytes.
 - Hyperliquid: stage owner-signed `approveAgent`, `usdSend`, or recovery
   actions; run the ceremony for owner authority; subsequent bounded API-wallet
   trades may execute under the approved session.

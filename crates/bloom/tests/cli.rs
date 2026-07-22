@@ -239,7 +239,29 @@ fn help_lists_all_subcommands() {
         .stdout(predicate::str::contains("serve"))
         .stdout(predicate::str::contains("ipc"))
         .stdout(predicate::str::contains("petals"))
-        .stdout(predicate::str::contains("init"));
+        .stdout(predicate::str::contains("init"))
+        .stdout(predicate::str::contains("polymarket").not());
+}
+
+#[test]
+fn init_respects_persistent_preinstalled_petal_opt_out_without_network() {
+    let home = fresh_home();
+    let home_dir = bloom_proto::HomeDir::at(home.path());
+    let mut config = bloom_proto::Config::local_default();
+    config.petals.preinstalled.clear();
+    config.save(&home_dir.config_path()).unwrap();
+
+    bloom_cmd(home.path())
+        .arg("init")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("preinstalled_petals: []"));
+
+    bloom_cmd(home.path())
+        .args(["petals", "ls"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("(no petals installed)"));
 }
 
 #[test]
@@ -267,145 +289,6 @@ fn wallet_help_lists_outbox_cancel_and_replace() {
         .stdout(predicate::str::contains("cancel"))
         .stdout(predicate::str::contains("replace"))
         .stdout(predicate::str::contains("confirm"));
-}
-
-#[test]
-fn polymarket_help_lists_obligations() {
-    let home = fresh_home();
-    bloom_cmd(home.path())
-        .args(["polymarket", "--help"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("obligations"))
-        .stdout(predicate::str::contains("redeem"));
-}
-
-#[test]
-fn polymarket_vfs_trade_confirm_reaches_cli_confirm_path_for_durable_drafts() {
-    let home = fresh_home();
-    let expected = "no draft order-000000001 for wallet my-wallet";
-
-    bloom_cmd(home.path())
-        .args(["polymarket", "confirm", "my-wallet", "order-000000001"])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains(expected));
-
-    bloom_cmd(home.path())
-        .args([
-            "vfs",
-            "write",
-            "/polymarket/trade/my-wallet/drafts/order-000000001/confirm",
-            "--unlock-wallet",
-            "my-wallet",
-            "--data",
-            "confirm",
-        ])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains(expected));
-}
-
-#[test]
-fn polymarket_vfs_redeem_confirm_shares_cli_redeem_core() {
-    // Both the CLI command and the foreground VFS confirm path must dispatch
-    // into the same redeem core and fail at the same durable refusal (missing
-    // wallet) before any network or signing work.
-    let home = fresh_home();
-    let expected = "wallet 'my-wallet' not found";
-
-    bloom_cmd(home.path())
-        .args(["polymarket", "redeem", "my-wallet", "some-slug"])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains(expected));
-
-    bloom_cmd(home.path())
-        .args([
-            "vfs",
-            "write",
-            "/polymarket/redeem/my-wallet/some-slug/confirm",
-            "--unlock-wallet",
-            "my-wallet",
-            "--data",
-            "confirm",
-        ])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains(expected));
-}
-
-#[test]
-fn polymarket_vfs_revoke_approvals_confirm_shares_cli_core() {
-    let home = fresh_home();
-    let expected = "wallet 'my-wallet' not found";
-
-    bloom_cmd(home.path())
-        .args(["polymarket", "revoke-approvals", "my-wallet"])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains(expected));
-
-    bloom_cmd(home.path())
-        .args([
-            "vfs",
-            "write",
-            "/polymarket/revoke-approvals/my-wallet/request/confirm",
-            "--unlock-wallet",
-            "my-wallet",
-            "--data",
-            "confirm",
-        ])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains(expected));
-}
-
-#[test]
-fn polymarket_vfs_withdraw_pusd_confirm_shares_cli_core() {
-    let home = fresh_home();
-    let expected = "wallet 'my-wallet' not found";
-
-    // CLI: amount is a positional; VFS: amount rides in the confirm body.
-    bloom_cmd(home.path())
-        .args(["polymarket", "withdraw-pusd", "my-wallet", "all"])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains(expected));
-
-    bloom_cmd(home.path())
-        .args([
-            "vfs",
-            "write",
-            "/polymarket/withdraw/my-wallet/pusd/confirm",
-            "--unlock-wallet",
-            "my-wallet",
-            "--data",
-            r#"{"confirm":true,"amount":"all"}"#,
-        ])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains(expected));
-}
-
-#[test]
-fn polymarket_vfs_withdraw_pusd_confirm_rejects_bare_ack() {
-    // A bare ack has no amount; the foreground decoder must refuse before any
-    // daemon/network work so an agent cannot default to withdrawing everything.
-    let home = fresh_home();
-    bloom_cmd(home.path())
-        .args([
-            "vfs",
-            "write",
-            "/polymarket/withdraw/my-wallet/pusd/confirm",
-            "--unlock-wallet",
-            "my-wallet",
-            "--data",
-            "confirm",
-        ])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("explicit amount"));
 }
 
 #[test]
@@ -446,6 +329,10 @@ fn vfs_ls_root_lists_top_level_handlers() {
             "expected `{required}` in vfs ls /, got:\n{out}"
         );
     }
+    assert!(
+        !out.lines().any(|line| line.starts_with("polymarket\t")),
+        "native polymarket handler must not be mounted:\n{out}"
+    );
 }
 
 #[test]
@@ -568,6 +455,100 @@ fn vfs_default_missing_socket_falls_back_in_process() {
 }
 
 #[test]
+fn vfs_ls_status_includes_update_subtree() {
+    let home = fresh_home();
+    let out = bloom_cmd(home.path())
+        .args(["vfs", "ls", "/status"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    assert!(
+        stdout.contains("update"),
+        "expected `update` in ls /status, got:\n{stdout}"
+    );
+}
+
+#[test]
+fn vfs_cat_status_update_installed_matches_pkg_version() {
+    let home = fresh_home();
+    let expected = format!("{}\n", env!("CARGO_PKG_VERSION"));
+    bloom_cmd(home.path())
+        .args(["vfs", "cat", "/status/update/installed"])
+        .assert()
+        .success()
+        .stdout(predicate::eq(expected));
+}
+
+#[test]
+fn vfs_cat_status_update_when_no_cache_reports_unknown() {
+    let home = fresh_home();
+    bloom_cmd(home.path())
+        .args(["vfs", "cat", "/status/update/available"])
+        .assert()
+        .success()
+        .stdout(predicate::eq("unknown\n"));
+    bloom_cmd(home.path())
+        .args(["vfs", "cat", "/status/update/latest"])
+        .assert()
+        .success()
+        .stdout(predicate::eq("\n"));
+    bloom_cmd(home.path())
+        .args(["vfs", "cat", "/status/update/behind_by"])
+        .assert()
+        .success()
+        .stdout(predicate::eq("0\n"));
+}
+
+#[test]
+fn vfs_cat_status_update_with_seed_cache_reports_behind() {
+    let home = fresh_home();
+    let cache_dir = home.path().join("cache");
+    std::fs::create_dir_all(&cache_dir).unwrap();
+    let cache = serde_json::json!({
+        "version": 1,
+        "installed": "0.1.0",
+        "latest": "0.2.0",
+        "release_url": "https://github.com/bloom-directory/bloom/releases/tag/v0.2.0",
+        "checked_at": null,
+        "status": "ok"
+    });
+    std::fs::write(
+        cache_dir.join("update_cache.json"),
+        serde_json::to_vec_pretty(&cache).unwrap(),
+    )
+    .unwrap();
+    bloom_cmd(home.path())
+        .args(["vfs", "cat", "/status/update/latest"])
+        .assert()
+        .success()
+        .stdout(predicate::eq("0.2.0\n"));
+    bloom_cmd(home.path())
+        .args(["vfs", "cat", "/status/update/available"])
+        .assert()
+        .success()
+        .stdout(predicate::eq(
+            if bloom_update::compare_semver(env!("CARGO_PKG_VERSION"), "0.2.0")
+                == std::cmp::Ordering::Less
+            {
+                "out_of_date\n"
+            } else {
+                "up_to_date\n"
+            },
+        ));
+}
+
+#[test]
+fn bloom_update_status_prints_cached_snapshot() {
+    let home = fresh_home();
+    bloom_cmd(home.path())
+        .args(["update", "status"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"installed\""))
+        .stdout(predicate::str::contains("\"status\""));
+}
+
+#[test]
 fn vfs_explicit_missing_endpoint_fails_closed() {
     let home = fresh_home();
     let socket = home.path().join("run").join("missing.sock");
@@ -670,6 +651,23 @@ fn serve_refuses_when_home_write_lock_is_live() {
 
     bloom_cmd(home.path())
         .arg("serve")
+        .assert()
+        .failure()
+        .stderr(
+            predicate::str::contains("already open for writing")
+                .and(predicate::str::contains(lock.display().to_string())),
+        );
+}
+
+#[test]
+fn init_refuses_when_home_write_lock_is_live() {
+    let home = fresh_home();
+    let _permit = bloom_proto::HomeWritePermit::acquire(&bloom_proto::HomeDir::at(home.path()))
+        .expect("hold home write permit");
+    let lock = home.path().join("run").join(".daemon.lock");
+
+    bloom_cmd(home.path())
+        .arg("init")
         .assert()
         .failure()
         .stderr(
@@ -1342,13 +1340,30 @@ fn petal_cli_build_install_list_and_vfs_read_happy_path() {
         .assert()
         .success()
         .stdout(predicate::eq("component"));
+
+    bloom_cmd(home.path())
+        .args(["vfs", "cat", "/petals/demo/README.md"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("# demo"));
 }
 
 #[test]
 #[ignore = "clones and builds the public Polymarket Petal source repo"]
 fn github_source_install_polymarket_dispatches_route_contract() {
-    let petal_ref = "f2d7adbd64f76fccf515e7f39f46af048047a4e3";
+    let petal_ref = "e2e898b69046c9f5d905dd2cd66b3a57ef195542";
     let home = fresh_home();
+    let home_dir = bloom_proto::HomeDir::at(home.path());
+    let mut config = bloom_proto::Config::local_default();
+    config.petals.preinstalled.clear();
+    config.save(&home_dir.config_path()).unwrap();
+
+    bloom_cmd(home.path())
+        .arg("init")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("preinstalled_petals: []"));
+
     bloom_cmd(home.path())
         .args([
             "petals",
@@ -1360,12 +1375,15 @@ fn github_source_install_polymarket_dispatches_route_contract() {
         .assert()
         .success()
         .stdout(predicate::str::contains(format!(
-            "source: bloom-directory/bloom-petal-polymarket@{petal_ref}"
+            "Resolved commit: {petal_ref}"
         )))
-        .stdout(predicate::str::contains(format!(
-            "resolved_commit: {petal_ref}"
-        )))
-        .stdout(predicate::str::contains("routes: 94"));
+        .stdout(predicate::str::contains("\"routes\": 95"));
+
+    bloom_cmd(home.path())
+        .arg("init")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("preinstalled_petals: []"));
 
     bloom_cmd(home.path())
         .args(["petals", "ls"])
@@ -1382,6 +1400,12 @@ fn github_source_install_polymarket_dispatches_route_contract() {
         .stdout(predicate::str::contains(
             "bloom.polymarket.petal-route-contract.v1",
         ));
+
+    bloom_cmd(home.path())
+        .args(["vfs", "cat", "/petals/polymarket/README.md"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("# Polymarket Petal"));
 }
 
 #[test]

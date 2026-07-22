@@ -921,6 +921,7 @@ mod tests {
                         native_value_wei: "1".into(),
                         token_amount_base_units: None,
                         valuation_usd_micro: Some(1),
+                        valuation: None,
                     },
                     token: None,
                     method: "native_transfer".into(),

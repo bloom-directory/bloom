@@ -83,12 +83,12 @@ async fn anvil_full_stage_confirm_flow() -> Result<()> {
         .map_err(|e| anyhow!("create_local: {e}"))?;
     let alice_addr = format!("{:#x}", info.address);
 
-    // Keep the staged transaction inside ordinary policy limits. Broadcast
-    // still requires a pre-minted Sealed Approval grant below.
+    // Keep broadcast in fresh-review mode. The pre-minted Sealed Approval
+    // grant below is the explicit authorization used by this test.
     let wallet_dir = tmp.path().join("keystore").join("alice");
     std::fs::write(
         wallet_dir.join("policy.toml"),
-        "[approval]\nagent_autonomy = \"under_policy\"\n\n[limits]\nmax_tx_usd = \"1000\"\nmax_day_usd = \"10000\"\n",
+        "[approval]\nagent_autonomy = \"prompt_all\"\n",
     )?;
 
     // 4. Fund alice from anvil's prefunded #0 via `cast send`.
@@ -322,7 +322,7 @@ async fn anvil_confirm_refuses_nonce_gap() -> Result<()> {
     let wallet_dir = tmp.path().join("keystore").join("alice");
     std::fs::write(
         wallet_dir.join("policy.toml"),
-        "[approval]\nagent_autonomy = \"under_policy\"\n\n[limits]\nmax_tx_usd = \"1000\"\nmax_day_usd = \"10000\"\n",
+        "[approval]\nagent_autonomy = \"prompt_all\"\n",
     )?;
 
     // Fund alice so gas is affordable — the refusal must be the nonce gap, not

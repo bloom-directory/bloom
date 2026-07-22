@@ -22,9 +22,8 @@ through the VFS.
 
 Fund the deposit address, then review every staged plan before signing. Caps
 and allow/deny live in each wallet's `policy.toml`; value-moving actions still
-go through the stage → review → confirm outbox flow. Polymarket trading
-additionally requires `bloom polymarket onboard <wallet>` (see `AGENTS.md`).
-Re-display a deposit address any time with `bloom wallet address <name> --qr`.
+go through the stage → review → confirm outbox flow. Re-display a deposit
+address any time with `bloom wallet address <name> --qr`.
 
 ## Prerequisites
 
@@ -223,22 +222,10 @@ it expire after the configured TTL) cancels the stage.
   `/hyperliquid/<network>/agent_sessions/<wallet>/...`. One-off
   owner-signed writes at `/hyperliquid/<network>/exchange/<wallet>/...`
   labeled ADVANCED. Read `/hyperliquid/README.md`.
-- **Polymarket** — prediction-market trading via CLI (`bloom polymarket
-  ...`). VFS staging at `/polymarket/...`; pUSD funding requests can be
-  confirmed with `bloom vfs write /polymarket/fund/<wallet>/<id>/confirm
-  --unlock-wallet <wallet> --data confirm`, and trade drafts can be posted with
-  `bloom vfs write /polymarket/trade/<wallet>/drafts/<id>/confirm
-  --unlock-wallet <wallet> --data confirm`. Exit actions also have VFS parity:
-  cancel runs directly at `/polymarket/trade/<wallet>/orders/<order-id>/cancel`
-  (no unlock — risk-reducing, CLOB creds only), while redeem, revoke-approvals,
-  and pUSD withdraw are owner-signed and confirm through the foreground path
-  (`/polymarket/redeem/<wallet>/<slug>/confirm`,
-  `/polymarket/revoke-approvals/<wallet>/request/confirm`,
-  `/polymarket/withdraw/<wallet>/pusd/confirm` with
-  `--data '{"confirm":true,"amount":"..."}'`). A capability primitive (scoped
-  approve, TTL, caps) is in active development — see
-  `docs/plans/2026-06-20-agent-obvious-capability-model.md`.
-  Read `/polymarket/README.md`.
+- **Polymarket** — `bloom init` provisions the pinned default
+  `bloom-petal-polymarket` package. It appears at `/petals/polymarket/`; inspect
+  `meta/route-contract.json` and list the route tree for the exact installed
+  workflow.
 - **Zero-config chain reads** — Ethereum, Base, Arbitrum, Optimism,
   Polygon, BNB Smart Chain, Avalanche, Gnosis, Linea, HyperEVM, and
   Anvil are present after `bloom init`; live-network broadcasts remain

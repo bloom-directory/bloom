@@ -16,6 +16,8 @@
 #![forbid(unsafe_code)]
 
 use alloy::primitives::{Address, Bytes, U256};
+use alloy::sol;
+use alloy::sol_types::{SolCall, SolValue};
 use serde::{Deserialize, Serialize};
 use url::Url;
 
@@ -23,6 +25,22 @@ const DEFAULT_BASE_URL: &str = "https://api.enso.finance";
 
 /// Sentinel address Enso uses for the chain's native token (ETH, MATIC, …).
 pub const NATIVE_TOKEN: &str = "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+
+// Enso Router V2 wraps the actual shortcut calldata in one of these calls.
+// The input token is deliberately decoded from this outer envelope rather
+// than guessed from the opaque downstream shortcut payload.
+sol! {
+    #[allow(missing_docs)]
+    interface IEnsoRouter {
+        struct Token {
+            uint8 tokenType;
+            bytes data;
+        }
+
+        function routeSingle(Token tokenIn, bytes data) external payable;
+        function routeMulti(Token[] tokensIn, bytes data) external payable;
+    }
+}
 
 #[derive(thiserror::Error, Debug)]
 pub enum EnsoError {
@@ -191,6 +209,58 @@ pub struct RouteResponse {
 }
 
 impl RouteResponse {
+    /// Verify that the executable Router V2 transaction carries the same
+    /// source asset and amount as the request. Enso's route metadata is useful
+    /// for display, but the router calldata is the transaction fact that will
+    /// actually move the input.
+    ///
+    /// The generic DeFi shortcut payload is intentionally not decoded here:
+    /// Router V2 transfers the input into its shortcut contract first, so the
+    /// outer `Token` envelope is the authoritative source-side fact. Routes
+    /// with an unsupported envelope fail closed.
+    pub fn input_matches_request(&self, req: &RouteRequest) -> bool {
+        if self.tx.from != req.from_address {
+            return false;
+        }
+
+        let Some(token) = (if let Ok(call) = IEnsoRouter::routeSingleCall::abi_decode(&self.tx.data)
+        {
+            Some(call.tokenIn)
+        } else if let Ok(call) = IEnsoRouter::routeMultiCall::abi_decode(&self.tx.data) {
+            (call.tokensIn.len() == 1).then(|| call.tokensIn.into_iter().next().unwrap())
+        } else {
+            None
+        }) else {
+            return false;
+        };
+
+        match token.tokenType {
+            // Enso Router V2 TokenType.Native.
+            0 => {
+                let Ok((amount,)) = <(U256,)>::abi_decode_params(&token.data) else {
+                    return false;
+                };
+                req.token_in == NATIVE_TOKEN.parse::<Address>().unwrap()
+                    && amount == req.amount_in
+                    && self.tx.value == amount
+            }
+            // Enso Router V2 TokenType.ERC20.
+            1 => {
+                let Ok((token_in, amount)) = <(Address, U256)>::abi_decode_params(&token.data)
+                else {
+                    return false;
+                };
+                req.token_in != NATIVE_TOKEN.parse::<Address>().unwrap()
+                    && token_in == req.token_in
+                    && amount == req.amount_in
+                    && self.tx.value == U256::ZERO
+            }
+            // ERC-721/1155 inputs are not part of RouteRequest's single-token
+            // fungible input model.
+            _ => false,
+        }
+    }
+
     /// Conservatively extract protocol names from the opaque `route` array.
     ///
     /// Returns `(protocols, unknown)`. `unknown = true` means bloom could not
@@ -1151,6 +1221,75 @@ mod tests {
             !r.calldata_contains_receiver(other),
             "an address we did not request must not be found"
         );
+    }
+
+    #[test]
+    fn route_calldata_binds_input_token_and_amount() {
+        let body = include_str!("../tests/fixtures/route_same_chain_receiver_placeholder.json");
+        let r: RouteResponse = serde_json::from_str(body).unwrap();
+        let req = RouteRequest {
+            from_address: "0x1111111111111111111111111111111111111111"
+                .parse()
+                .unwrap(),
+            chain_id: 137,
+            destination_chain_id: None,
+            token_in: "0x3c499c542cef5e3811e1192ce70d8cc03d5c3359"
+                .parse()
+                .unwrap(),
+            token_out: "0xc011a7e12a19f7b1f670d46f03b03f3342e82dfb"
+                .parse()
+                .unwrap(),
+            amount_in: U256::from(5_000_000u64),
+            slippage_bps: 50,
+            routing_strategy: Some(RoutingStrategy::Router),
+            receiver: None,
+        };
+        assert!(r.input_matches_request(&req));
+
+        let mut wrong_amount = req.clone();
+        wrong_amount.amount_in += U256::from(1u64);
+        assert!(!r.input_matches_request(&wrong_amount));
+    }
+
+    #[test]
+    fn native_route_calldata_binds_msg_value() {
+        let from: Address = "0x1111111111111111111111111111111111111111"
+            .parse()
+            .unwrap();
+        let amount = U256::from(1_000_000_000_000_000_000u128);
+        let data = IEnsoRouter::routeSingleCall {
+            tokenIn: IEnsoRouter::Token {
+                tokenType: 0,
+                data: (amount,).abi_encode_params().into(),
+            },
+            data: Bytes::new(),
+        }
+        .abi_encode();
+        let route = RouteResponse {
+            tx: RouteTx {
+                to: Address::ZERO,
+                data: data.into(),
+                value: amount,
+                from,
+            },
+            amount_out: "1".into(),
+            gas: None,
+            route: serde_json::Value::Null,
+            price_impact: None,
+            destination_chain_id: None,
+        };
+        let req = RouteRequest::new(
+            from,
+            1,
+            NATIVE_TOKEN.parse().unwrap(),
+            Address::ZERO,
+            amount,
+        );
+        assert!(route.input_matches_request(&req));
+
+        let mut wrong_value = route.clone();
+        wrong_value.tx.value += U256::from(1u64);
+        assert!(!wrong_value.input_matches_request(&req));
     }
 
     #[test]

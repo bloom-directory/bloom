@@ -123,11 +123,6 @@ impl HomeDir {
     pub fn logs_dir(&self) -> PathBuf {
         self.root.join("logs")
     }
-    /// Polymarket per-wallet state (CLOB creds + onboarding state).
-    pub fn polymarket_dir(&self) -> PathBuf {
-        self.root.join("polymarket")
-    }
-
     pub fn canonical_root(&self) -> Result<PathBuf, HomeError> {
         std::fs::canonicalize(&self.root).map_err(|source| HomeError::Io {
             path: self.root.clone(),

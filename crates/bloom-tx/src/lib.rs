@@ -14,4 +14,6 @@ pub mod tx_engine;
 pub use bump_scanner::{BasefeeProvider, BumpScanner, BumpScannerConfig, MempoolIndexes};
 pub use oracle::{DynPriceOracle, PriceOracle};
 pub use outbox::{Outbox, OutboxEntry, OutboxError, OutboxState, SentEntry};
-pub use tx_engine::{ApprovalRequirement, Eip1559FeeOverrides, TxEngine, TxEngineError};
+pub use tx_engine::{
+    ApprovalRequirement, BoundValuationTarget, Eip1559FeeOverrides, TxEngine, TxEngineError,
+};

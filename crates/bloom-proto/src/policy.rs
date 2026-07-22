@@ -513,6 +513,9 @@ pub struct AuthorizationSubject {
     pub total_value_usd_micro: Option<i128>,
     pub value_moving: bool,
     pub calldata_verified: bool,
+    /// Allowance or other authority changes require a fresh review and are
+    /// never covered by a standing spend session.
+    pub authority_change: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -734,6 +737,12 @@ pub fn evaluate_action_authorization(
         };
     }
 
+    if subject.authority_change {
+        return AutonomyDecision::NeedsFreshReview {
+            reason: "authority-changing action requires fresh review".into(),
+        };
+    }
+
     if !subject.value_moving {
         return AutonomyDecision::ApprovedAutonomous {
             reason: "non-value-moving action".into(),
@@ -758,17 +767,17 @@ pub fn evaluate_action_authorization(
                 };
             }
             if !subject.calldata_verified {
-                return AutonomyDecision::Denied {
+                return AutonomyDecision::NeedsFreshReview {
                     reason: "calldata/order facts are not verified".into(),
                 };
             }
             let Some(value) = subject.total_value_usd_micro else {
-                return AutonomyDecision::Denied {
+                return AutonomyDecision::NeedsFreshReview {
                     reason: "USD valuation unavailable".into(),
                 };
             };
             let Some(snapshot) = budget else {
-                return AutonomyDecision::Denied {
+                return AutonomyDecision::NeedsFreshReview {
                     reason: "budget ledger unavailable".into(),
                 };
             };
@@ -1219,6 +1228,7 @@ uv_above_usd = "1.0000001"
             value_moving: true,
             total_value_usd_micro: Some(1_000_000),
             calldata_verified: true,
+            authority_change: false,
         };
         let budget = BudgetSnapshot {
             spent_day_micro_usd: 0,
@@ -1287,6 +1297,7 @@ uv_above_usd = "1.0000001"
             total_value_usd_micro: value,
             value_moving: true,
             calldata_verified: true,
+            authority_change: false,
         }
     }
 
@@ -1315,7 +1326,7 @@ uv_above_usd = "1.0000001"
     }
 
     #[test]
-    fn under_policy_denies_unknown_usd() {
+    fn under_policy_requires_review_for_unknown_usd() {
         let mut p = Policy::default();
         p.approval.agent_autonomy = Some(AgentAutonomyMode::UnderPolicy);
         p.limits.max_tx_usd = Some("3".into());
@@ -1329,7 +1340,7 @@ uv_above_usd = "1.0000001"
                 None,
                 AuthorizationSurface::Vfs,
             ),
-            AutonomyDecision::Denied { reason } if reason.contains("USD valuation")
+            AutonomyDecision::NeedsFreshReview { reason } if reason.contains("USD valuation")
         ));
     }
 
@@ -1377,7 +1388,7 @@ uv_above_usd = "1.0000001"
     }
 
     #[test]
-    fn under_policy_denies_unverified_calldata() {
+    fn under_policy_requires_review_for_unverified_calldata() {
         let mut p = Policy::default();
         p.approval.agent_autonomy = Some(AgentAutonomyMode::UnderPolicy);
         p.limits.max_tx_usd = Some("3".into());
@@ -1391,13 +1402,35 @@ uv_above_usd = "1.0000001"
                 &p, &[], &subject, Some(&budget()), None,
                 AuthorizationSurface::Vfs,
             ),
-            AutonomyDecision::Denied { reason }
+            AutonomyDecision::NeedsFreshReview { reason }
                 if reason.contains("calldata/order facts")
         ));
     }
 
     #[test]
-    fn under_policy_denies_missing_budget() {
+    fn authority_changes_always_require_fresh_review() {
+        let mut p = Policy::default();
+        p.approval.agent_autonomy = Some(AgentAutonomyMode::UnderPolicy);
+        let subject = AuthorizationSubject {
+            authority_change: true,
+            ..auth_subject(Some(1_000_000))
+        };
+        assert!(matches!(
+            evaluate_action_authorization(
+                &p,
+                &[],
+                &subject,
+                Some(&budget()),
+                None,
+                AuthorizationSurface::Vfs,
+            ),
+            AutonomyDecision::NeedsFreshReview { reason }
+                if reason.contains("authority-changing")
+        ));
+    }
+
+    #[test]
+    fn under_policy_requires_review_for_missing_budget() {
         let mut p = Policy::default();
         p.approval.agent_autonomy = Some(AgentAutonomyMode::UnderPolicy);
         p.limits.max_tx_usd = Some("3".into());
@@ -1407,7 +1440,7 @@ uv_above_usd = "1.0000001"
                 &p, &[], &auth_subject(Some(1_000_000)), None, None,
                 AuthorizationSurface::Vfs,
             ),
-            AutonomyDecision::Denied { reason }
+            AutonomyDecision::NeedsFreshReview { reason }
                 if reason.contains("budget ledger")
         ));
     }

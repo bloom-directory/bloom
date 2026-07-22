@@ -25,6 +25,13 @@
 //!   (`contract_metadata`, `address_history`, `event_logs`, `storage_reads`,
 //!   `proxy_detection`); each returns one of `etherscan`, `rpc`, `indexer`.
 //! - `status/backends/summary.json`              — JSON map of all of the above
+//! - `status/update/`                            — only present when the
+//!   daemon wired an update snapshot producer (see
+//!   [`StatusHandler::with_update_snapshot_fn`]). The subtree
+//!   exposes the installed version, the latest known GitHub release,
+//!   a computed `available` verdict, the `behind_by` patch diff,
+//!   the `checked_at` timestamp, the `release_url`, and a
+//!   `summary.json` bundling them all.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -63,6 +70,34 @@ pub struct PrivateRpcBackendStatus {
     pub last_probed_at: u64, // unix secs
 }
 
+/// Flat DTO mirroring the daemon's [`UpdateSnapshot`](bloom_update::UpdateSnapshot),
+/// kept in `bloom-vfs` so the VFS handler can stay decoupled from
+/// the `bloom-update` crate (the daemon converts at the closure
+/// boundary). The VFS only reads these fields; nothing here is
+/// `pub` for mutation beyond construction.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct UpdateSnapshot {
+    /// The version this binary was compiled with.
+    pub installed: String,
+    /// The latest known release tag from GitHub (e.g. `Some("0.2.0")`).
+    pub latest: Option<String>,
+    /// Computed verdict: are we behind, up to date, or unknown?
+    pub available: UpdateAvailable,
+    /// Patch-equivalent difference (see `bloom_update::cache::behind_by`).
+    pub behind_by: Option<u64>,
+    /// When the last successful refresh happened.
+    pub checked_at: Option<SystemTime>,
+    /// HTML URL of the latest release.
+    pub release_url: Option<String>,
+}
+
+/// Verdicts the VFS can render for the `update/available` leaf and
+/// the `summary.json.available` field. Re-exported from
+/// `bloom-update` so the VFS handler and the upstream checker share
+/// a single source of truth — adding a new verdict in one place
+/// would silently desync the JSON payload otherwise.
+pub use bloom_update::UpdateAvailable;
+
 #[derive(Clone)]
 pub struct StatusHandler {
     pub chains: ChainRegistry,
@@ -76,6 +111,13 @@ pub struct StatusHandler {
     pub home: PathBuf,
     pub started_at: SystemTime,
     pub version: String,
+    /// Snapshot producer for the `status/update/*` subtree. The
+    /// daemon wires this in via
+    /// [`StatusHandler::with_update_snapshot_fn`]; when `None`, the
+    /// `update/` directory is not advertised (existing tests that
+    /// don't care about update info see no `update` entry in the
+    /// top-level listing).
+    pub update_snapshot_fn: Option<Arc<dyn Fn() -> Option<UpdateSnapshot> + Send + Sync>>,
     chain_cache: Arc<RwLock<std::collections::HashMap<String, ChainProbeCache>>>,
     mempool_statuses: Arc<RwLock<BTreeMap<String, MempoolBackendStatus>>>,
     private_rpc_healths: Arc<RwLock<BTreeMap<(String, String), PrivateRpcBackendStatus>>>,
@@ -151,10 +193,24 @@ impl StatusHandler {
             home,
             started_at,
             version: version.into(),
+            update_snapshot_fn: None,
             chain_cache: Arc::new(RwLock::new(std::collections::HashMap::new())),
             mempool_statuses: Arc::new(RwLock::new(BTreeMap::new())),
             private_rpc_healths: Arc::new(RwLock::new(BTreeMap::new())),
         }
+    }
+
+    /// Wire the closure that produces the `update/*` subtree's
+    /// snapshot. The daemon passes a closure that calls
+    /// `bloom_update::UpdateChecker::snapshot` and converts to the
+    /// VFS DTO. When this is not called, the `update/` directory is
+    /// not advertised in `ls /status`.
+    pub fn with_update_snapshot_fn(
+        mut self,
+        f: Arc<dyn Fn() -> Option<UpdateSnapshot> + Send + Sync>,
+    ) -> Self {
+        self.update_snapshot_fn = Some(f);
+        self
     }
 
     /// Replace the per-chain mempool status snapshot. Used by the daemon
@@ -590,6 +646,32 @@ impl StatusHandler {
                     Err(HandlerError::not_found(path.to_string_path()))
                 }
             }
+            [a] if a == "update" => {
+                if self.update_snapshot_fn.is_some() {
+                    Ok(Entry::dir("update"))
+                } else {
+                    Err(HandlerError::not_found(path.to_string_path()))
+                }
+            }
+            [a, leaf] if a == "update" => {
+                if self.update_snapshot_fn.is_none() {
+                    return Err(HandlerError::not_found(path.to_string_path()));
+                }
+                if matches!(
+                    leaf.as_str(),
+                    "installed"
+                        | "latest"
+                        | "available"
+                        | "behind_by"
+                        | "checked_at"
+                        | "release_url"
+                        | "summary.json"
+                ) {
+                    Ok(Entry::file(leaf))
+                } else {
+                    Err(HandlerError::not_found(path.to_string_path()))
+                }
+            }
             _ => Err(HandlerError::not_found(path.to_string_path())),
         }
     }
@@ -747,6 +829,55 @@ impl StatusHandler {
                 serde_json::to_vec_pretty(&by_chain)
                     .map_err(|e| HandlerError::backend(e.to_string()))
             }
+            [a] if a == "update" => {
+                // Reading the directory as a file is invalid; the
+                // VFS caller should use list instead.
+                Err(HandlerError::NotAFile(path.to_string_path()))
+            }
+            [a, leaf] if a == "update" => {
+                // Every update leaf reads from the snapshot. The
+                // daemon's closure always produces a snapshot, so
+                // `installed` is always populated (with the
+                // compile-time version) even when no GitHub refresh
+                // has happened yet. When no snapshot producer is
+                // wired at all (e.g. some VFS tests), all leaves
+                // are not-found.
+                if self.update_snapshot_fn.is_none() {
+                    return Err(HandlerError::not_found(path.to_string_path()));
+                }
+                let snap = match self.update_snapshot_fn.as_ref().and_then(|f| f()) {
+                    Some(s) => s,
+                    None => return Err(HandlerError::not_found(path.to_string_path())),
+                };
+                match leaf.as_str() {
+                    "installed" => Ok(format!("{}\n", snap.installed).into_bytes()),
+                    "latest" => {
+                        Ok(format!("{}\n", snap.latest.as_deref().unwrap_or("")).into_bytes())
+                    }
+                    "available" => Ok(match snap.available {
+                        UpdateAvailable::OutOfDate => b"out_of_date\n".to_vec(),
+                        UpdateAvailable::UpToDate => b"up_to_date\n".to_vec(),
+                        UpdateAvailable::Unknown => b"unknown\n".to_vec(),
+                    }),
+                    "behind_by" => Ok(format!("{}\n", snap.behind_by.unwrap_or(0)).into_bytes()),
+                    "checked_at" => {
+                        Ok(format!("{}\n", format_update_checked_at(snap.checked_at)).into_bytes())
+                    }
+                    "release_url" => {
+                        Ok(format!("{}\n", snap.release_url.as_deref().unwrap_or("")).into_bytes())
+                    }
+                    "summary.json" => serde_json::to_vec_pretty(&serde_json::json!({
+                        "installed": snap.installed,
+                        "latest": snap.latest.as_deref().unwrap_or(""),
+                        "available": update_available_label(snap.available),
+                        "behind_by": snap.behind_by.unwrap_or(0),
+                        "checked_at": format_update_checked_at(snap.checked_at),
+                        "release_url": snap.release_url.as_deref().unwrap_or(""),
+                    }))
+                    .map_err(|e| HandlerError::backend(e.to_string())),
+                    _ => Err(HandlerError::NotAFile(path.to_string_path())),
+                }
+            }
             _ => Err(HandlerError::NotAFile(path.to_string_path())),
         }
     }
@@ -765,7 +896,17 @@ impl StatusHandler {
                 Entry::dir("outbox"),
                 Entry::dir("backends"),
                 Entry::dir("private_rpc"),
-            ]),
+            ]
+            .into_iter()
+            // `update/` is only advertised when the daemon wired a
+            // snapshot producer. Existing tests that don't care
+            // about update info continue to see no `update` entry.
+            .chain(if self.update_snapshot_fn.is_some() {
+                vec![Entry::dir("update")]
+            } else {
+                vec![]
+            })
+            .collect()),
             [a] if a == "chains" => Ok(self
                 .chains
                 .list_names()
@@ -842,6 +983,21 @@ impl StatusHandler {
                     map.keys().map(|(_, prov)| prov.clone()).collect();
                 Ok(unique.into_iter().map(|p| Entry::file(&p)).collect())
             }
+            [a] if a == "update" => {
+                if self.update_snapshot_fn.is_some() {
+                    Ok(vec![
+                        Entry::file("installed"),
+                        Entry::file("latest"),
+                        Entry::file("available"),
+                        Entry::file("behind_by"),
+                        Entry::file("checked_at"),
+                        Entry::file("release_url"),
+                        Entry::file("summary.json"),
+                    ])
+                } else {
+                    Err(HandlerError::NotADir(path.to_string_path()))
+                }
+            }
             _ => Err(HandlerError::NotADir(path.to_string_path())),
         }
     }
@@ -877,6 +1033,14 @@ impl StatusHandler {
             // `backends/private_rpc` JSON view above so cached reads
             // can't diverge between the two surfaces.
             Some("private_rpc") => Some(Duration::from_secs(5)),
+            // `update/installed` is daemon-static (compile-time
+            // version); everything else in the subtree is bounded
+            // by the underlying 5-minute background refresh, so 5s
+            // is the right router-level ceiling.
+            Some("update") => match segs.get(1).map(|s| s.as_str()) {
+                Some("installed") => Some(Duration::from_secs(86_400)),
+                _ => Some(Duration::from_secs(5)),
+            },
             _ => None,
         }
     }
@@ -924,6 +1088,25 @@ fn unix_to_civil(secs: u64) -> (i64, u32, u32, u32, u32, u32) {
     let mo = if mp < 10 { mp + 3 } else { mp - 9 } as u32; // [1, 12]
     let y = if mo <= 2 { y + 1 } else { y };
     (y, mo, d, h, m, s)
+}
+
+fn format_update_checked_at(time: Option<SystemTime>) -> String {
+    let Some(secs) = time
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+    else {
+        return String::new();
+    };
+    let (y, mo, d, h, mi, se) = unix_to_civil(secs);
+    format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", y, mo, d, h, mi, se)
+}
+
+fn update_available_label(available: UpdateAvailable) -> &'static str {
+    match available {
+        UpdateAvailable::OutOfDate => "out_of_date",
+        UpdateAvailable::UpToDate => "up_to_date",
+        UpdateAvailable::Unknown => "unknown",
+    }
 }
 
 #[cfg(test)]
@@ -1037,6 +1220,183 @@ mod tests {
         ] {
             assert!(names.contains(&required), "missing top-level: {required}");
         }
+        // No update snapshot wired in this test → no `update` entry.
+        assert!(
+            !names.contains(&"update"),
+            "update must not be advertised when snapshot_fn is None"
+        );
+    }
+
+    /// Build a `StatusHandler` with a canned update snapshot wired in.
+    /// Used by the update-subtree tests below.
+    fn make_handler_with_update(home: &std::path::Path, snap: UpdateSnapshot) -> StatusHandler {
+        let mut h = make_handler(home);
+        h.update_snapshot_fn = Some(Arc::new(move || Some(snap.clone())));
+        h
+    }
+
+    #[tokio::test]
+    async fn update_dir_listed_when_snapshot_fn_wired() {
+        let dir = tempfile::tempdir().unwrap();
+        let snap = UpdateSnapshot {
+            installed: "0.1.0".into(),
+            latest: Some("0.2.0".into()),
+            available: UpdateAvailable::OutOfDate,
+            behind_by: Some(100),
+            checked_at: Some(std::time::SystemTime::UNIX_EPOCH),
+            release_url: Some(
+                "https://github.com/bloom-directory/bloom/releases/tag/v0.2.0".into(),
+            ),
+        };
+        let h = make_handler_with_update(dir.path(), snap);
+        let entries = h.list(&VfsPath::parse("").unwrap()).await.unwrap();
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"update"), "update must be advertised");
+        let leaves = h.list(&VfsPath::parse("update").unwrap()).await.unwrap();
+        let leaf_names: Vec<&str> = leaves.iter().map(|e| e.name.as_str()).collect();
+        for required in [
+            "installed",
+            "latest",
+            "available",
+            "behind_by",
+            "checked_at",
+            "release_url",
+            "summary.json",
+        ] {
+            assert!(
+                leaf_names.contains(&required),
+                "missing update leaf: {required}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn update_leaves_render_for_known_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let snap = UpdateSnapshot {
+            installed: "0.1.0".into(),
+            latest: Some("0.2.0".into()),
+            available: UpdateAvailable::OutOfDate,
+            behind_by: Some(100),
+            checked_at: Some(std::time::SystemTime::UNIX_EPOCH),
+            release_url: Some(
+                "https://github.com/bloom-directory/bloom/releases/tag/v0.2.0".into(),
+            ),
+        };
+        let h = make_handler_with_update(dir.path(), snap);
+
+        // Plain text leaves.
+        let installed = h
+            .read(&VfsPath::parse("update/installed").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(installed, b"0.1.0\n");
+        let latest = h
+            .read(&VfsPath::parse("update/latest").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(latest, b"0.2.0\n");
+        let available = h
+            .read(&VfsPath::parse("update/available").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(available, b"out_of_date\n");
+        let behind = h
+            .read(&VfsPath::parse("update/behind_by").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(behind, b"100\n");
+        let url = h
+            .read(&VfsPath::parse("update/release_url").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            url,
+            b"https://github.com/bloom-directory/bloom/releases/tag/v0.2.0\n"
+        );
+
+        // summary.json
+        let body = h
+            .read(&VfsPath::parse("update/summary.json").unwrap())
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["installed"], serde_json::json!("0.1.0"));
+        assert_eq!(v["latest"], serde_json::json!("0.2.0"));
+        assert_eq!(v["available"], serde_json::json!("out_of_date"));
+        assert_eq!(v["behind_by"], serde_json::json!(100));
+        assert_eq!(v["checked_at"], serde_json::json!("1970-01-01T00:00:00Z"));
+        assert_eq!(
+            v["release_url"],
+            serde_json::json!("https://github.com/bloom-directory/bloom/releases/tag/v0.2.0")
+        );
+    }
+
+    #[tokio::test]
+    async fn update_leaves_render_for_unknown_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let snap = UpdateSnapshot {
+            installed: "0.1.0".into(),
+            latest: None,
+            available: UpdateAvailable::Unknown,
+            behind_by: None,
+            checked_at: None,
+            release_url: None,
+        };
+        let h = make_handler_with_update(dir.path(), snap);
+        assert_eq!(
+            h.read(&VfsPath::parse("update/latest").unwrap())
+                .await
+                .unwrap(),
+            b"\n",
+            "unknown latest should be an empty line, not 404"
+        );
+        assert_eq!(
+            h.read(&VfsPath::parse("update/available").unwrap())
+                .await
+                .unwrap(),
+            b"unknown\n"
+        );
+        assert_eq!(
+            h.read(&VfsPath::parse("update/behind_by").unwrap())
+                .await
+                .unwrap(),
+            b"0\n",
+            "unknown behind_by should be 0, not 404"
+        );
+        assert_eq!(
+            h.read(&VfsPath::parse("update/checked_at").unwrap())
+                .await
+                .unwrap(),
+            b"\n",
+            "unknown checked_at should be an empty line, not the Unix epoch"
+        );
+        let body = h
+            .read(&VfsPath::parse("update/summary.json").unwrap())
+            .await
+            .unwrap();
+        let summary: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(summary["latest"], serde_json::json!(""));
+        assert_eq!(summary["available"], serde_json::json!("unknown"));
+        assert_eq!(summary["behind_by"], serde_json::json!(0));
+        assert_eq!(summary["checked_at"], serde_json::json!(""));
+        assert_eq!(summary["release_url"], serde_json::json!(""));
+    }
+
+    #[tokio::test]
+    async fn update_leaves_not_found_when_snapshot_fn_unwired() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = make_handler(dir.path());
+        // No update dir at top level.
+        let entries = h.list(&VfsPath::parse("").unwrap()).await.unwrap();
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert!(!names.contains(&"update"));
+        // Direct lookup of an update leaf should be NotFound.
+        let err = h
+            .read(&VfsPath::parse("update/installed").unwrap())
+            .await
+            .expect_err("must not find update leaf without snapshot_fn");
+        let _ = err;
     }
 
     #[tokio::test]

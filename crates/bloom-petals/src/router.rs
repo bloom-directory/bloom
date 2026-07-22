@@ -17,7 +17,7 @@ use bloom_vfs::path::VfsPath;
 use crate::abi::{DispatchEntry, DispatchEntryKind, DispatchOp, DispatchRequest, DispatchResponse};
 use crate::error::PetalError;
 use crate::host::PetalHost;
-use crate::runner::PetalRunner;
+use crate::runner::{PETAL_DOCUMENT_NAMES, PetalRunner};
 use crate::vm::{COMPONENT_NOT_A_DIR_CODE, COMPONENT_UNSUPPORTED_CODE, RunOptions};
 
 #[derive(Clone)]
@@ -91,6 +91,16 @@ impl PetalRouter {
         self.runner.resolve_petal_mount(mount).is_ok()
     }
 
+    fn is_petal_document(path: &str) -> bool {
+        PETAL_DOCUMENT_NAMES.contains(&path)
+    }
+
+    fn add_petal_documents(mut entries: Vec<Entry>) -> Vec<Entry> {
+        entries.retain(|entry| !Self::is_petal_document(&entry.name));
+        entries.extend(PETAL_DOCUMENT_NAMES.map(Entry::read_only_file));
+        entries
+    }
+
     async fn dispatch_petal(
         &self,
         mount: &str,
@@ -128,6 +138,15 @@ impl Handler for PetalRouter {
                     return Err(HandlerError::NotFound(path.to_string_path()));
                 }
                 Ok(Entry::dir(mount))
+            }
+            [mount, name] if Self::is_petal_document(name) => {
+                let bytes = self
+                    .runner
+                    .petal_document(mount, name)
+                    .map_err(map_petal_err)?;
+                let mut entry = Entry::read_only_file(name);
+                entry.size = bytes.len() as u64;
+                Ok(entry)
             }
             _ => {
                 let (mount, rest) = Self::mount_path(path)?;
@@ -167,6 +186,12 @@ impl Handler for PetalRouter {
         if !self.is_petal(mount) {
             return Err(HandlerError::NotFound(path.to_string_path()));
         }
+        if Self::is_petal_document(&rest) {
+            return self
+                .runner
+                .petal_document(mount, &rest)
+                .map_err(map_petal_err);
+        }
         match self
             .dispatch_petal(mount, DispatchOp::Read, rest, Vec::new())
             .await?
@@ -186,6 +211,9 @@ impl Handler for PetalRouter {
         }
         if !self.is_petal(mount) {
             return Err(HandlerError::NotFound(path.to_string_path()));
+        }
+        if Self::is_petal_document(&rest) {
+            return Err(HandlerError::PermissionDenied);
         }
         match self
             .dispatch_petal(mount, DispatchOp::Write, rest, data.to_vec())
@@ -214,19 +242,26 @@ impl Handler for PetalRouter {
                     .await
                 {
                     Ok(DispatchResponse::List(entries)) => {
-                        entries.into_iter().map(entry_to_vfs).collect()
+                        let entries = entries
+                            .into_iter()
+                            .map(entry_to_vfs)
+                            .collect::<Result<Vec<_>, _>>()?;
+                        Ok(Self::add_petal_documents(entries))
                     }
                     Ok(DispatchResponse::Error { code, message }) => {
                         Err(dispatch_error(code, message, path.to_string_path()))
                     }
                     Ok(other) => Err(unexpected_response("list", other)),
-                    Err(HandlerError::NotFound(_)) => self
-                        .runner
-                        .petal_static_list(mount, "")
-                        .map_err(map_petal_err)?
-                        .into_iter()
-                        .map(entry_to_vfs)
-                        .collect(),
+                    Err(HandlerError::NotFound(_)) => {
+                        let entries = self
+                            .runner
+                            .petal_static_list(mount, "")
+                            .map_err(map_petal_err)?
+                            .into_iter()
+                            .map(entry_to_vfs)
+                            .collect::<Result<Vec<_>, _>>()?;
+                        Ok(Self::add_petal_documents(entries))
+                    }
                     Err(e) => Err(e),
                 }
             }
@@ -572,6 +607,37 @@ name = "example"
             .await
             .unwrap();
         assert!(app_entries.iter().any(|entry| entry.name == "hello.txt"));
+        assert!(app_entries.iter().any(|entry| entry.name == "README.md"));
+        assert!(app_entries.iter().any(|entry| entry.name == "AGENTS.md"));
+
+        let readme = vfs
+            .read(&VfsPath::parse("/petals/demo/README.md").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(readme, b"# demo");
+
+        let agents = vfs
+            .read(&VfsPath::parse("/petals/demo/AGENTS.md").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(agents, b"# demo agents");
+
+        let readme_entry = vfs
+            .lookup(&VfsPath::parse("/petals/demo/README.md").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(readme_entry.kind, bloom_vfs::EntryKind::File);
+        assert_eq!(readme_entry.mode, 0o444);
+        assert_eq!(readme_entry.size, 6);
+
+        let write_error = vfs
+            .write(
+                &VfsPath::parse("/petals/demo/README.md").unwrap(),
+                b"replace",
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(write_error, HandlerError::PermissionDenied));
 
         let bytes = vfs
             .read(&VfsPath::parse("/petals/demo/hello.txt").unwrap())

@@ -6,29 +6,7 @@
 
 use std::sync::Arc;
 
-use alloy::primitives::U256;
-use async_trait::async_trait;
-
-/// Convert native-asset wei into USD.
-///
-/// `chain_name` lets implementations distinguish "ETH on mainnet" from
-/// "ETH on Base" if their backing API treats them differently. `value_wei`
-/// is the raw on-chain value of the staged tx; `native_decimals` is the
-/// chain's native-asset decimal count (always 18 for ETH-style chains
-/// today, but kept explicit so non-ETH chains slot in cleanly).
-///
-/// Implementations should return `None` when the oracle is unavailable
-/// or doesn't recognise the chain — the caller treats that as "no USD
-/// data, surface a Warn check" rather than a failure.
-#[async_trait]
-pub trait PriceOracle: Send + Sync {
-    async fn native_usd(
-        &self,
-        chain_name: &str,
-        value_wei: U256,
-        native_decimals: u8,
-    ) -> Option<f64>;
-}
+pub use bloom_auth_api::{AuthApiError, PriceOracle, ValuationQuote};
 
 /// Type alias to keep call sites short.
 pub type DynPriceOracle = Arc<dyn PriceOracle>;
@@ -36,9 +14,10 @@ pub type DynPriceOracle = Arc<dyn PriceOracle>;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
 
     /// A deterministic in-test oracle: always returns the configured
-    /// price-per-native-unit. Exposed so unit tests in this crate
+    /// price-per-unit. Exposed so unit tests in this crate
     /// (and downstream consumers) can plug it in without bringing up
     /// HTTP fixtures.
     pub struct FakeOracle {
@@ -47,16 +26,31 @@ mod tests {
 
     #[async_trait]
     impl PriceOracle for FakeOracle {
-        async fn native_usd(
+        async fn quote_usd(
             &self,
-            _chain_name: &str,
-            value_wei: U256,
-            native_decimals: u8,
-        ) -> Option<f64> {
-            let scale = 10f64.powi(native_decimals as i32);
-            // Lossy but bounded: we only need ~6 sig figs for USD caps.
-            let units: f64 = format!("{}", value_wei).parse::<f64>().ok()? / scale;
-            Some(units * self.price_per_unit)
+            asset_id: &str,
+            amount_base_units: &str,
+            asset_decimals: u8,
+            now_ms: u64,
+        ) -> Result<ValuationQuote, AuthApiError> {
+            let amount = amount_base_units
+                .parse::<f64>()
+                .map_err(|e| AuthApiError::Denied(e.to_string()))?;
+            let decimals = asset_decimals;
+            Ok(ValuationQuote {
+                asset_id: asset_id.into(),
+                amount_base_units: amount_base_units.into(),
+                usd_micro: (amount / 10f64.powi(decimals.into())
+                    * self.price_per_unit
+                    * 1_000_000.0)
+                    .round() as i128,
+                source: "test-oracle".into(),
+                quote_timestamp_ms: now_ms,
+                fetched_at_ms: now_ms,
+                max_age_ms: 30_000,
+                confidence_ppm: None,
+                stablecoin_assumption: false,
+            })
         }
     }
 
@@ -66,8 +60,10 @@ mod tests {
             price_per_unit: 2_500.0,
         };
         // 1 ETH at $2500 = $2500.
-        let one_eth = U256::from(1u64) * U256::from(10u64).pow(U256::from(18u64));
-        let usd = o.native_usd("ethereum", one_eth, 18).await.unwrap();
-        assert!((usd - 2_500.0).abs() < 0.001);
+        let quote = o
+            .quote_usd("native:ethereum", "1000000000000000000", 18, 1_000)
+            .await
+            .unwrap();
+        assert_eq!(quote.usd_micro, 2_500_000_000);
     }
 }

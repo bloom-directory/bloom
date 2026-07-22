@@ -7,7 +7,7 @@ A point of caution on naming: leaves are exactly what the source advertises. The
 ## Daemon
 
 ```sh
-ls /bloom/status/                                      # daemon.json, version, uptime, started_at, home, chains/, audit/, cache/, policies/, wallets/, outbox/, backends/
+ls /bloom/status/                                      # daemon.json, version, uptime, started_at, home, chains/, audit/, cache/, policies/, wallets/, outbox/, backends/, update/
 cat /bloom/status/version                              # daemon version (text, e.g. 0.0.0)
 cat /bloom/status/uptime                               # "Ns" under a minute, "HH:MM:SS" otherwise (text)
 cat /bloom/status/started_at                           # RFC3339 UTC, e.g. 2026-05-10T08:30:00Z (text)
@@ -134,3 +134,20 @@ cat /bloom/docs/examples.md                            # end-to-end demos: anvil
 ```
 
 If you want to refresh what the daemon ships with after a workspace update, just `cat` these — they update with the binary.
+
+## Update checker
+
+`status/update/` is the daemon's self-update view. A long-lived `bloom serve` daemon refreshes it every 5 minutes by GETting `https://api.github.com/repos/bloom-directory/bloom/releases/latest` and caching the response at `~/.bloom/cache/update_cache.json`. Short-lived in-process CLI commands only read that cache; they do not contact GitHub. Set `BLOOM_DISABLE_UPDATE_CHECK=1` to disable the automatic daemon refresher; explicit `bloom update check` still performs a check.
+
+```sh
+ls /bloom/status/update/                               # installed, latest, available, behind_by, checked_at, release_url, summary.json
+cat /bloom/status/update/installed                      # this binary's compiled-in version (always known, even with no cache)
+cat /bloom/status/update/latest                         # latest known GitHub release tag (e.g. "0.2.0"), empty line if unknown
+cat /bloom/status/update/available                     # "out_of_date" | "up_to_date" | "unknown"
+cat /bloom/status/update/behind_by                     # weighted version distance (major*10000 + minor*100 + patch): 0 if up to date or unknown
+cat /bloom/status/update/checked_at                     # RFC3339 of the last successful refresh
+cat /bloom/status/update/release_url                    # HTML URL of the latest release, empty line if unknown
+cat /bloom/status/update/summary.json                   # all of the above, JSON
+```
+
+The leaves are read-only. The `update/` directory is only advertised when the daemon is running (the in-process `Daemon::from_home` always wires an update-snapshot producer; tests that construct a `StatusHandler` directly without a producer see no `update` entry). Force a refresh with `bloom update check`; print the cached snapshot with `bloom update status`. The CLI's `bloom status` subcommand also prints a one-line `update_available:` line and a stderr hint when the cached snapshot says you're behind.

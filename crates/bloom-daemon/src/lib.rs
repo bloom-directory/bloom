@@ -50,7 +50,6 @@ use bloom_petals::{
     PetalHost, PetalRouter, PetalRunner, PetalStore, PetalVm, SignBatchOutcome, SignBatchRequest,
     SignOutcome, SignRequest,
 };
-use bloom_polymarket::{ClobClient, CredentialStore, DataClient, GammaClient};
 use bloom_prices::PricesClient;
 use bloom_proto::audit::AuditRecord;
 use bloom_proto::{
@@ -61,15 +60,15 @@ use bloom_revert::{
     AbiSource, BuiltinDecoder, DecoderChain, EtherscanAbiDecoder, EtherscanAbiSource,
     OpenchainDecoder, boxed,
 };
+use bloom_tx::DynPriceOracle;
 use bloom_tx::outbox::{CentralActionIdentity, CentralOutboxProjection, Outbox, OutboxState};
 use bloom_tx::tx_engine::{Eip1559FeeOverrides, TxEngine};
 use bloom_vfs::handlers::outbox::StagedPetalIdentity;
-use bloom_vfs::handlers::polymarket::{ChainClientReader, PolymarketOnboarding, build_onboarder};
 use bloom_vfs::handlers::status::{MempoolBackendStatus, PrivateRpcBackendStatus};
 use bloom_vfs::handlers::{
     AddressBookHandler, CentralOutbox, ChainsHandler, DefiHandler, DocsHandler, EnsHandler,
-    HyperliquidHandler, OutboxHandler, PolymarketHandler, PricesHandler, RequestsHandler,
-    SimulateHandler, StatusHandler, ToolsHandler, WalletsHandler, WatchHandler,
+    HyperliquidHandler, OutboxHandler, PricesHandler, RequestsHandler, SimulateHandler,
+    StatusHandler, ToolsHandler, WalletsHandler, WatchHandler,
 };
 use bloom_vfs::{AuthServices, PathCache, Vfs};
 use bloom_watch::{WatchExecutor, WatchRegistry};
@@ -1713,6 +1712,10 @@ pub struct Daemon {
     pub petals: PetalRunner,
     pub watch_registry: Arc<WatchRegistry>,
     pub watch_executor: Arc<WatchExecutor>,
+    /// Update checker for newer GitHub releases. Construction loads its
+    /// cached snapshot without making a network request; the 5-minute
+    /// refresher starts only with [`Self::spawn_background_tasks`].
+    pub update_checker: Arc<bloom_update::UpdateChecker>,
     /// Shutdown handles for spawned mempool subscription tasks. Dropping
     /// these signals each task to exit at its next iteration.
     pub mempool_shutdown: Arc<parking_lot::Mutex<Vec<tokio::sync::oneshot::Sender<()>>>>,
@@ -1720,6 +1723,10 @@ pub struct Daemon {
     /// Sent on shutdown; safe even when no scanner / probe was spawned.
     pub bump_shutdown: Arc<parking_lot::Mutex<Vec<tokio::sync::oneshot::Sender<()>>>>,
     pub probe_shutdown: Arc<parking_lot::Mutex<Vec<tokio::sync::oneshot::Sender<()>>>>,
+    /// Shutdown handle for the update-checker background refresher.
+    /// `Daemon::shutdown` drains this alongside the other
+    /// background-task shutdown channels.
+    pub update_shutdown: Arc<parking_lot::Mutex<Vec<tokio::sync::oneshot::Sender<()>>>>,
 }
 
 impl Daemon {
@@ -2059,8 +2066,9 @@ impl Daemon {
         // Wire the prices client into the policy USD-cap path. The trait
         // lives in bloom-tx; the adapter is in this crate so bloom-tx
         // doesn't pull reqwest+rustls.
-        tx_engine =
-            tx_engine.with_price_oracle(Arc::new(price_oracle::PricesOracle::new(prices.clone())));
+        let price_oracle: DynPriceOracle =
+            Arc::new(price_oracle::PricesOracle::new(prices.clone()));
+        tx_engine = tx_engine.with_price_oracle(price_oracle.clone());
 
         // Wire mempool indexes into TxEngine (drives nonce-conflict
         // checks + cancel.tx targeting). Done before private-RPC
@@ -2163,6 +2171,16 @@ impl Daemon {
             );
         }
 
+        // Construct the update checker here (before StatusHandler) so
+        // the handler can wire its snapshot producer. Construction only
+        // loads the on-disk cache; the network refresher is started by
+        // `spawn_background_tasks` for long-lived daemon processes.
+        let update_checker: Arc<bloom_update::UpdateChecker> = Arc::new(
+            bloom_update::UpdateChecker::new(env!("CARGO_PKG_VERSION"), home.cache_dir())
+                .map_err(|e| DaemonError::Audit(format!("update checker init: {e}")))?,
+        );
+        let update_checker_for_vfs = update_checker.clone();
+
         let status_handler = Arc::new(
             StatusHandler::with_backends(
                 chains.clone(),
@@ -2181,7 +2199,41 @@ impl Daemon {
                 SystemTime::now(),
                 env!("CARGO_PKG_VERSION"),
             )
-            .with_mempool_statuses(initial_mempool_statuses),
+            .with_mempool_statuses(initial_mempool_statuses)
+            .with_update_snapshot_fn(Arc::new(move || {
+                // Always produce a snapshot. The VFS renders the
+                // fields that depend on a successful refresh
+                // (latest, available, behind_by, release_url,
+                // checked_at) as empty / "unknown" / 0 when the
+                // in-memory snapshot is in the `Unknown` state
+                // (e.g. fresh daemon, no cache file yet). The
+                // `installed` field is always populated because it
+                // is baked into the binary at compile time.
+                //
+                // `bloom_vfs::handlers::status::UpdateAvailable` is a
+                // re-export of `bloom_update::UpdateAvailable`, so the
+                // `available()` verdict passes through without a
+                // three-arm match.
+                let s = update_checker_for_vfs.snapshot();
+                let available = s.available();
+                let behind_by = s.behind_by();
+                let bloom_update::UpdateSnapshot {
+                    installed,
+                    latest,
+                    release_url,
+                    checked_at,
+                    status: _,
+                    error_reason: _,
+                } = s;
+                Some(bloom_vfs::handlers::status::UpdateSnapshot {
+                    installed,
+                    latest,
+                    available,
+                    behind_by,
+                    checked_at,
+                    release_url,
+                })
+            })),
         );
 
         // Build the petals runtime: content-addressed store under
@@ -2291,7 +2343,6 @@ impl Daemon {
                     .with_auth_services(auth_services.clone())
                     .with_home_write_permit_opt(home_write_permit.clone())
                     .with_mempool_indexes(mempool_indexes.clone())
-                    .with_polymarket_root(home.polymarket_dir())
                     .with_hyperliquid_handler(hyperliquid_handler.clone()),
                 ) as _,
             )
@@ -2383,90 +2434,16 @@ impl Daemon {
                         address_book_arc.clone(),
                     )
                     .with_auth_services(auth_services.clone())
+                    .with_price_oracle(price_oracle.clone())
                     .with_home_write_permit_opt(home_write_permit.clone())
                     .with_default_chain(config.default_chain.clone())
                     .with_store_root(home.root().join("defi"))
-                    .with_polymarket_root(home.polymarket_dir())
                     .with_revert_decoder(decoder_chain.clone())
                     .with_hyperliquid(hl_bridge, hl_deposit_chain_id),
                 ) as _,
             );
         } else {
             debug!("daemon.defi_skipped: no [enso] config");
-        }
-
-        // Polymarket: public read surface (Gamma/Data/CLOB) plus, when a
-        // `[chains]` entry matches the Polymarket chain id (Polygon 137), the
-        // onboarding state machine and L2 account views. Polymarket is enabled
-        // by default with public endpoints; `[polymarket] enabled = false`
-        // provides a persistent opt-out and other fields override the defaults.
-        // Signing never leaves the daemon (Keystore::signer → KeystoreSigner).
-        if let Some(pm_cfg) = config.polymarket.as_ref().filter(|cfg| cfg.enabled) {
-            let pm_url = |raw: &str| match url::Url::parse(raw) {
-                Ok(u) => Some(u),
-                Err(e) => {
-                    warn!(url = %raw, error = %e, "daemon.polymarket_url_invalid_using_default");
-                    None
-                }
-            };
-            let mut gamma = GammaClient::new();
-            if let Some(u) = pm_url(&pm_cfg.gamma_url) {
-                gamma = gamma.with_base_url(u);
-            }
-            let mut data = DataClient::new();
-            if let Some(u) = pm_url(&pm_cfg.data_url) {
-                data = data.with_base_url(u);
-            }
-            let mut clob = ClobClient::new(pm_cfg.chain_id);
-            if let Some(u) = pm_url(&pm_cfg.clob_url) {
-                clob = clob.with_base_url(u);
-            }
-
-            let mut handler = PolymarketHandler::new(gamma, data, clob.clone(), keystore.clone())
-                .with_auth_services(auth_services.clone())
-                .with_order_store(bloom_polymarket::OrderStore::new(home.polymarket_dir()))
-                .with_fund_store(home.polymarket_dir())
-                .with_builder_key_store(bloom_polymarket::BuilderCredentialStore::new(
-                    home.polymarket_dir(),
-                ));
-            // Resolve the settlement chain by id — onboarding needs RPC reads
-            // (code/balances/allowances) for its idempotency probes.
-            let polygon = chains
-                .list_names()
-                .into_iter()
-                .filter_map(|n| chains.get(&n))
-                .find(|c| c.spec().chain_id == pm_cfg.chain_id);
-            match polygon {
-                Some(chain_client) => {
-                    let state_dir = home.polymarket_dir();
-                    let chain: Arc<dyn bloom_polymarket::ChainReader> =
-                        Arc::new(ChainClientReader(chain_client.clone()));
-                    // Factory selects the path (relayer_api_key present ⇒
-                    // deposit-wallet, else EOA) and applies the configured URLs.
-                    let onboarder = build_onboarder(pm_cfg, chain_client, &state_dir);
-                    debug!(
-                        chain_id = pm_cfg.chain_id,
-                        "daemon.polymarket_onboarding_wired"
-                    );
-                    handler = handler
-                        .with_onboarding(PolymarketOnboarding {
-                            onboarder: Arc::new(onboarder),
-                            auth_dir: state_dir.clone(),
-                            creds: CredentialStore::new(&state_dir),
-                            chain,
-                        })
-                        .with_audit(audit_arc.clone());
-                }
-                None => warn!(
-                    chain_id = pm_cfg.chain_id,
-                    "polymarket onboarding disabled: no [chains.*] entry with this chain_id; \
-                     mounting the read surface only"
-                ),
-            }
-            debug!(chain_id = pm_cfg.chain_id, "daemon.polymarket_mounted");
-            vfs_builder = vfs_builder.mount("polymarket", Arc::new(handler) as _);
-        } else {
-            debug!("daemon.polymarket_skipped: disabled by config");
         }
 
         // /next.md — brutally-scoped next-action aggregator for agents.
@@ -2800,9 +2777,11 @@ impl Daemon {
             petals,
             watch_registry,
             watch_executor,
+            update_checker,
             mempool_shutdown: Arc::new(parking_lot::Mutex::new(mempool_shutdown)),
             bump_shutdown: Arc::new(parking_lot::Mutex::new(bump_shutdown)),
             probe_shutdown: Arc::new(parking_lot::Mutex::new(probe_shutdown)),
+            update_shutdown: Arc::new(parking_lot::Mutex::new(Vec::new())),
         })
     }
 
@@ -2817,9 +2796,9 @@ impl Daemon {
     }
 
     /// Stop background workers cleanly. Signals all spawned mempool
-    /// subscription tasks, the bump scanner, and the backends probe,
-    /// then shuts down the watch executor's polling task. Safe to call
-    /// multiple times.
+    /// subscription tasks, the bump scanner, the backends probe, and
+    /// the update-checker refresher, then shuts down the watch
+    /// executor's polling task. Safe to call multiple times.
     pub async fn shutdown(&self) {
         for s in self.mempool_shutdown.lock().drain(..) {
             let _ = s.send(());
@@ -2828,6 +2807,9 @@ impl Daemon {
             let _ = s.send(());
         }
         for s in self.probe_shutdown.lock().drain(..) {
+            let _ = s.send(());
+        }
+        for s in self.update_shutdown.lock().drain(..) {
             let _ = s.send(());
         }
         self.watch_executor.stop().await;
@@ -2839,16 +2821,33 @@ impl Daemon {
         Self::from_home(home)
     }
 
-    /// Spawn long-lived background tasks: currently the outbox expiry
-    /// sweeper that runs every 60s and moves any pending entry past its
-    /// `expires_ms` into `failed/` (fix #3). Caller keeps the returned
-    /// [`BackgroundTasks`] alive; dropping it triggers graceful shutdown.
+    /// Spawn long-lived background tasks: the update checker and the
+    /// outbox expiry sweeper that runs every 60s and moves any pending
+    /// entry past its `expires_ms` into `failed/` (fix #3). Caller keeps
+    /// the returned [`BackgroundTasks`] alive; dropping it triggers
+    /// graceful shutdown of the sweeper.
     ///
-    /// Safe to call multiple times — each call spawns a fresh task and
-    /// returns its own handle. Short-lived CLI commands generally don't
-    /// need this; it's primarily for `bloom serve` and the in-process
+    /// Safe to call multiple times — each call spawns a fresh sweeper and
+    /// returns its own handle, while the update refresher starts at most
+    /// once per daemon. Short-lived CLI commands generally don't need
+    /// these tasks; this is primarily for `bloom serve` and the in-process
     /// daemon used by integration tests.
     pub fn spawn_background_tasks(&self) -> BackgroundTasks {
+        // Only long-lived daemons poll GitHub. Most CLI commands construct
+        // an in-process Daemon, so starting this in `from_home` would turn
+        // every `vfs cat`/`ls` invocation into an immediate API request.
+        let mut update_shutdown = self.update_shutdown.lock();
+        if update_shutdown.is_empty() && !bloom_update::automatic_checks_disabled() {
+            update_shutdown.push(Arc::clone(&self.update_checker).spawn_background());
+            debug!("daemon.update_checker_spawned");
+        } else if update_shutdown.is_empty() {
+            debug!(
+                env = bloom_update::DISABLE_AUTO_CHECK_ENV,
+                "daemon.update_checker_disabled"
+            );
+        }
+        drop(update_shutdown);
+
         let outbox = self.tx_engine.outbox.clone();
         let registration_coordinator = self.auth_services.registration_coordinator().cloned();
         let (tx, mut rx) = watch::channel(false);
@@ -3058,22 +3057,9 @@ mod tests {
             "fresh homes should mount Hyperliquid with public defaults"
         );
         assert!(
-            d.vfs.handler("polymarket").is_some(),
-            "fresh homes should mount Polymarket with public defaults"
+            d.vfs.handler("polymarket").is_none(),
+            "native Polymarket must not be mounted; use petals/polymarket"
         );
-    }
-
-    #[test]
-    fn explicit_polymarket_opt_out_skips_vfs_mount() {
-        let dir = tempfile::tempdir().unwrap();
-        let home = HomeDir::at(dir.path());
-        let mut config = Config::local_default();
-        config.polymarket.as_mut().unwrap().enabled = false;
-        config.save(&home.config_path()).unwrap();
-
-        let d = Daemon::from_home(home).unwrap();
-        assert!(!d.config.polymarket.as_ref().unwrap().enabled);
-        assert!(d.vfs.handler("polymarket").is_none());
     }
 
     #[tokio::test]
@@ -3510,10 +3496,12 @@ mod tests {
             created_ms: 1,
             expires_ms: u128::MAX,
             status: bloom_proto::TxStatus::Pending,
+            action_kind: bloom_proto::TxActionKind::Unknown,
             tx_hash: Some(tx_hash.clone()),
             token: None,
             nft: None,
             usd_value: None,
+            valuation: None,
             depends_on: None,
             action_id: None,
             execution_origin: Some(DaemonPetalHost::petal_execution_origin(&context).unwrap()),
@@ -3798,6 +3786,17 @@ ws_url = "wss://example.invalid"
             .expect("shutdown timed out");
     }
 
+    #[tokio::test]
+    async fn daemon_construction_does_not_start_update_refresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = Daemon::from_home(HomeDir::at(dir.path())).unwrap();
+
+        assert!(
+            daemon.update_shutdown.lock().is_empty(),
+            "short-lived daemon construction must not start the GitHub update refresher"
+        );
+    }
+
     /// Fix #3: the spawned sweeper drops expired pending entries into
     /// `failed/` on its own. We don't wait for the natural 60s tick;
     /// instead the test calls `outbox.sweep_expired` itself to keep
@@ -3809,6 +3808,11 @@ ws_url = "wss://example.invalid"
         let home = HomeDir::at(dir.path());
         let d = Daemon::from_home(home).unwrap();
         let tasks = d.spawn_background_tasks();
+        assert_eq!(
+            d.update_shutdown.lock().len(),
+            1,
+            "long-lived background tasks should start one update refresher"
+        );
         // Seed an already-expired pending entry; the foreground call
         // exercises the same code the spawned task runs.
         let staged = bloom_proto::StagedTx {
@@ -3829,10 +3833,12 @@ ws_url = "wss://example.invalid"
             created_ms: 0,
             expires_ms: 1,
             status: bloom_proto::TxStatus::Pending,
+            action_kind: bloom_proto::TxActionKind::Unknown,
             tx_hash: None,
             token: None,
             nft: None,
             usd_value: None,
+            valuation: None,
             depends_on: None,
             action_id: None,
             execution_origin: None,

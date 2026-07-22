@@ -2474,6 +2474,7 @@ impl PriceOracle for BloomPricesOracle {
         &self,
         asset_id: &str,
         amount_base_units: &str,
+        asset_decimals: u8,
         now_ms: u64,
     ) -> Result<ValuationQuote, AuthApiError> {
         let coin = parse_coin_id(asset_id)?;
@@ -2482,13 +2483,17 @@ impl PriceOracle for BloomPricesOracle {
             .current(coin)
             .await
             .map_err(|err| AuthApiError::Denied(format!("price oracle unavailable: {err}")))?;
-        let decimals = quote
-            .decimals
-            .ok_or_else(|| AuthApiError::Denied("price quote decimals missing".into()))?;
+        if let Some(provider_decimals) = quote.decimals
+            && provider_decimals != asset_decimals
+        {
+            return Err(AuthApiError::Denied(format!(
+                "price quote decimals mismatch: provider={provider_decimals} trusted={asset_decimals}"
+            )));
+        }
         if quote.timestamp == 0 {
             return Err(AuthApiError::Denied("price quote timestamp missing".into()));
         }
-        let usd_micro = amount_to_usd_micro(amount_base_units, decimals, quote.price)
+        let usd_micro = amount_to_usd_micro(amount_base_units, asset_decimals, quote.price)
             .map_err(AuthApiError::Denied)?;
         let confidence_ppm = match quote.confidence {
             Some(confidence) if confidence.is_finite() && confidence >= 0.0 => {
@@ -2529,7 +2534,7 @@ fn amount_to_usd_micro(
     decimals: u8,
     price_usd: f64,
 ) -> Result<i128, String> {
-    if !price_usd.is_finite() || price_usd < 0.0 {
+    if !price_usd.is_finite() || price_usd <= 0.0 {
         return Err("price quote is invalid".into());
     }
     let amount = amount_base_units
@@ -2543,7 +2548,10 @@ fn amount_to_usd_micro(
     if !usd_micro.is_finite() || usd_micro < 0.0 || usd_micro > i128::MAX as f64 {
         return Err("computed USD value is invalid".into());
     }
-    Ok(usd_micro.round() as i128)
+    if amount == 0 {
+        return Ok(0);
+    }
+    Ok(usd_micro.ceil().max(1.0) as i128)
 }
 
 fn parse_entry_state(value: &str) -> Result<AuthEntryState, AuthStoreError> {

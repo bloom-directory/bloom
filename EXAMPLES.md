@@ -1352,19 +1352,39 @@ echo "delete" > /bloom/addressbook/vitalik
 
 The `status/` tree is the daemon's introspection layer: uptime and
 version, per-chain RPC reachability, the audit-log digest, cache and
-outbox counts, the active backend mapping, and a per-endpoint health
-snapshot for every configured RPC URL.
+outbox counts, the active backend mapping, a per-endpoint health
+snapshot for every configured RPC URL, and (when the daemon has
+network access) the current release-checker state.
 
 ### Daemon
 
 ```sh
-ls /bloom/status/                                      # daemon.json, version, uptime, started_at, home, chains/, audit/, cache/, policies/, wallets/, outbox/, backends/
+ls /bloom/status/                                      # daemon.json, version, uptime, started_at, home, chains/, audit/, cache/, policies/, wallets/, outbox/, backends/, update/
 cat /bloom/status/version                              # daemon version, e.g. 0.0.0
 cat /bloom/status/uptime                               # "Ns" under a minute, "HH:MM:SS" otherwise
 cat /bloom/status/started_at                           # RFC3339 UTC
 cat /bloom/status/home                                 # absolute home dir, e.g. /home/you/.bloom
 cat /bloom/status/daemon.json                          # JSON: {version, started_unix_ms, started_at, uptime_secs, home, chains}
 ```
+
+### Update checker
+
+```sh
+ls /bloom/status/update/                               # installed, latest, available, behind_by, checked_at, release_url, summary.json
+cat /bloom/status/update/installed                      # this binary's compiled-in version
+cat /bloom/status/update/latest                         # latest known GitHub release tag (e.g. "0.2.0"), empty if unknown
+cat /bloom/status/update/available                     # "out_of_date" | "up_to_date" | "unknown"
+cat /bloom/status/update/behind_by                     # weighted version distance (major*10000 + minor*100 + patch), 0 if up to date or unknown
+cat /bloom/status/update/checked_at                     # RFC3339 of the last successful refresh
+cat /bloom/status/update/release_url                    # HTML URL of the latest release, empty if unknown
+cat /bloom/status/update/summary.json                   # all of the above, JSON
+```
+
+The daemon refreshes this state every 5 minutes. Use
+`bloom update check` to force a refresh, or `bloom update status` to
+print the cached snapshot to stdout. The CLI also prints a one-line
+hint to stderr from `bloom status` when the cached snapshot says
+you're behind.
 
 ### Chains
 
@@ -1570,73 +1590,19 @@ echo '{"asset":"ETH","is_cross":false,"leverage":5}' \
 
 ---
 
-## 17. Polymarket trading
+## 17. Polymarket (external Petal)
 
-Prediction-market trading via the `bloom polymarket ...` CLI plus the
-`/polymarket/` VFS surface. VFS can stage trade drafts and pUSD funding
-requests; funding requests can be confirmed with foreground
-`bloom vfs write --unlock-wallet`. Trade drafts can be posted through the same
-foreground VFS pattern, which dispatches to the same execution path as
-`bloom polymarket confirm`. Read `/polymarket/README.md` for the full safety
-model.
-
-### Quick path
+Bloom no longer includes a native `bloom polymarket` command or `/polymarket/`
+VFS handler. `bloom init` provisions the pinned default Polymarket Petal, which
+is available at `/petals/polymarket/`:
 
 ```sh
-# 1) Onboard (one-time, human-present)
-bloom polymarket onboard <wallet>
-
-# 2) Fund (send pUSD to the deposit wallet)
-bloom polymarket fund <wallet> --target-pusd 10 --max-spend 100
-
-# Or stage/review a funding request through VFS, then execute the same request
-# through the foreground CLI VFS path.
-bloom vfs write /polymarket/fund/<wallet>/new \
-  --data '{"target_pusd":"10","max_spend":"100","from_token":"native","slippage_bps":50}'
-cat /bloom/polymarket/fund/<wallet>/<fund-id>/plan.md
-bloom vfs write /polymarket/fund/<wallet>/<fund-id>/confirm \
-  --unlock-wallet <wallet> \
-  --data confirm
-
-# 3) Stage a draft in the VFS
-echo '{"slug":"will-canada-win-2026-world-cup-755",
-  "outcome":"yes","amount":"1","max_price":"0.01"}' \
-  > /bloom/polymarket/trade/<wallet>/new
-
-cat /bloom/polymarket/trade/<wallet>/drafts/<id>/plan.md
-
-# 4) Confirm (requires unlock or passkey ceremony per trade)
-bloom vfs write /polymarket/trade/<wallet>/drafts/<id>/confirm \
-  --unlock-wallet <wallet> \
-  --data confirm
-
-# Equivalent dedicated CLI command:
-bloom polymarket confirm <wallet> <id>
-
-# 5) Cancel a resting order — risk-reducing, runs directly in the VFS (no unlock)
-bloom vfs write /polymarket/trade/<wallet>/orders/<order-id> \
-  --data confirm
-# Equivalent: bloom polymarket cancel <wallet> <order-id>
-
-# 6) Exit actions after resolution (owner-signed → foreground CLI VFS path)
-bloom polymarket redeem <wallet> <slug> --dry-run        # print the plan first
-bloom vfs write /polymarket/redeem/<wallet>/<slug>/confirm \
-  --unlock-wallet <wallet> --data confirm
-# Equivalent: bloom polymarket redeem <wallet> <slug>
-
-bloom vfs write /polymarket/withdraw/<wallet>/pusd/confirm \
-  --unlock-wallet <wallet> \
-  --data '{"confirm":true,"amount":"all"}'
-# Equivalent: bloom polymarket withdraw-pusd <wallet> all
-
-bloom vfs write /polymarket/revoke-approvals/<wallet>/request/confirm \
-  --unlock-wallet <wallet> --data confirm
-# Equivalent: bloom polymarket revoke-approvals <wallet>
+bloom init
+bloom vfs cat /petals/polymarket/meta/route-contract.json
 ```
 
-A Polymarket capability primitive (scoped approve, TTL, caps,
-bounded window without per-trade ceremony) is in active development — see
-`docs/plans/2026-06-20-agent-obvious-capability-model.md`.
+The installed route contract describes the supported workflow for that exact
+Petal version.
 
 ---
 

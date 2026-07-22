@@ -42,7 +42,7 @@ pub struct CentralOutbox {
 
 /// Petal identity attached to a staged central action.
 ///
-/// Forwarded by callers (EVM/Hyperliquid/Polymarket/Wallets/Requests) once
+/// Forwarded by callers (EVM/Hyperliquid/Wallets/Requests) once
 /// WS-4..9 wires them up. Today, every first-party `petal_digest` is a
 /// placeholder; once reproducible build/source digests land, the same field
 /// can carry a real `build`-labelled digest without changing this struct.

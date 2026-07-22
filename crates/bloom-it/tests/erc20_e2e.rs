@@ -30,8 +30,9 @@ use bloom_auth_api::{
     EVM_SEALED_INTENT_SUBJECT_KIND, EVM_SEALED_INTENT_SUBJECT_SCHEMA_V1, EVM_TX_SIGN_INTENT,
     EvmFeePolicy, EvmOwnerSigningSessionCounters, EvmOwnerSigningSessionScope,
     EvmOwnerSigningSessionUse, ExecutorKind, GrantStore, PetalHost, PetalPolicySnapshot,
-    ReviewSessionRecord, SealedAction, SealedPetalContext, SealedSignature, SignHashRequest,
-    SignedApproval, SigningAttestation, SigningAttestationSchemaRegistry,
+    PriceOracle, ReviewSessionRecord, SealedAction, SealedPetalContext, SealedSignature,
+    SignHashRequest, SignedApproval, SigningAttestation, SigningAttestationSchemaRegistry,
+    ValuationQuote,
     petal_identity::{PETAL_ID_EVM_WALLET, PLACEHOLDER_DIGEST_EVM_WALLET},
 };
 use bloom_evm::{ChainClient, IERC20};
@@ -73,6 +74,31 @@ impl ApprovalVerifier for DenyingApprovalVerifier {
 }
 
 struct UnusedAuthWriter;
+
+struct TestPriceOracle;
+
+#[async_trait::async_trait]
+impl PriceOracle for TestPriceOracle {
+    async fn quote_usd(
+        &self,
+        asset_id: &str,
+        amount_base_units: &str,
+        _asset_decimals: u8,
+        now_ms: u64,
+    ) -> std::result::Result<ValuationQuote, AuthApiError> {
+        Ok(ValuationQuote {
+            asset_id: asset_id.into(),
+            amount_base_units: amount_base_units.into(),
+            usd_micro: 1_000_000,
+            source: "integration-test-oracle".into(),
+            quote_timestamp_ms: now_ms,
+            fetched_at_ms: now_ms,
+            max_age_ms: 30_000,
+            confidence_ppm: None,
+            stablecoin_assumption: false,
+        })
+    }
+}
 
 #[async_trait::async_trait]
 impl AuthStoreWriter for UnusedAuthWriter {
@@ -476,6 +502,7 @@ async fn replace_keeps_nonce_and_bumps_fees() -> Result<()> {
     let outbox = Outbox::new(tmp.path().join("outbox")).map_err(|e| anyhow!("outbox: {e}"))?;
     let grant_store: Arc<dyn GrantStore> = Arc::new(InMemoryGrantStore::default());
     let engine = TxEngine::new(outbox, 60_000)
+        .with_price_oracle(Arc::new(TestPriceOracle))
         .with_auth_services(
             Arc::new(DenyingApprovalVerifier),
             Arc::new(UnusedAuthWriter),

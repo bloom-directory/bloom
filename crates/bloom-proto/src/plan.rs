@@ -20,6 +20,21 @@ pub enum TxStatus {
     Cancelled,
 }
 
+/// Typed classification used by authorization and valuation. Unsupported
+/// transaction forms remain review-only until their calldata facts can be
+/// verified and valued safely.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TxActionKind {
+    #[default]
+    Unknown,
+    NativeTransfer,
+    Erc20Transfer,
+    ContractCall,
+    Approval,
+    NftTransfer,
+}
+
 impl std::fmt::Display for TxStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let s = match self {
@@ -93,6 +108,10 @@ pub struct StagedTx {
     pub created_ms: u128,
     pub expires_ms: u128,
     pub status: TxStatus,
+    /// Typed action classification used for autonomous authorization. Missing
+    /// on historical entries, which therefore remain unsupported/review-only.
+    #[serde(default)]
+    pub action_kind: TxActionKind,
     /// Tx hash once broadcast.
     #[serde(default)]
     pub tx_hash: Option<String>,
@@ -110,6 +129,10 @@ pub struct StagedTx {
     /// can sum historical sends without re-querying prices.
     #[serde(default)]
     pub usd_value: Option<f64>,
+    /// Structured valuation snapshot. `usd_value` remains for compatibility
+    /// with older outbox entries and is derived from this field for new txs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valuation: Option<bloom_auth_api::ValuationQuote>,
     /// Outbox id of a tx on the **same chain** that must mine successfully
     /// before this one may broadcast (e.g. an ERC-20 approve preceding the
     /// route that spends it). `confirm` refuses to broadcast until the
@@ -147,6 +170,10 @@ pub struct TokenRef {
     pub recipient: String,
     /// Human-readable amount in token units (e.g. "100" for 100 USDC).
     pub amount: String,
+    /// Exact amount encoded in calldata, in token base units. Optional for
+    /// historical staged transactions that predate structured valuation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub amount_base_units: Option<String>,
 }
 
 /// What kind of NFT-write action this staged tx encodes.
@@ -334,10 +361,12 @@ mod tests {
             created_ms: 1_700_000_000_000,
             expires_ms: 1_700_000_003_600,
             status: TxStatus::Pending,
+            action_kind: TxActionKind::NativeTransfer,
             tx_hash: None,
             token: None,
             nft: None,
             usd_value: None,
+            valuation: None,
             depends_on: None,
             action_id: None,
             execution_origin: None,
@@ -461,6 +490,7 @@ Write `y` to `confirm` to broadcast, `cancel` to discard, `override` to bypass s
             decimals: 6,
             recipient: "0xbob".to_string(),
             amount: "100".to_string(),
+            amount_base_units: Some("100000000".to_string()),
         });
         let out = PlanRender::render(&staged, "ETH", 18);
         assert!(

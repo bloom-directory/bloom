@@ -36,16 +36,16 @@ Bloom Machine records audit/result
 ```
 
 The model is intentionally Petal-neutral. EVM transactions, paid HTTP
-credentials, Polymarket onboarding, Hyperliquid owner actions, wallet policy
-updates, and future WASM Petals all use the same authorization spine.
+credentials, installed-Petal onboarding, Hyperliquid owner actions, wallet
+policy updates, and future WASM Petals all use the same authorization spine.
 
 ## Core Objects
 
 **Action**
 
 A user-meaningful unit of work such as an EVM transfer, paid HTTP payment,
-Polymarket onboarding batch, Hyperliquid `approveAgent`, DeFi route, or wallet
-policy update.
+an installed Petal's onboarding batch, Hyperliquid `approveAgent`, DeFi route,
+or wallet policy update.
 
 **Central outbox**
 
@@ -372,11 +372,13 @@ The sealed subject is the request, selected payment challenge, spending cap,
 and policy facts. The grant allows the paid HTTP Petal to sign the x402 or MPP
 credential needed for that request.
 
-**Polymarket**
+**Installed Polymarket Petal**
 
 The sealed subject may be an onboarding batch, order, redeem, withdrawal, or
 approval-revocation action. Batch actions must commit to ordered steps and
-allowed signing intents for each required owner signature.
+allowed signing intents for each required owner signature. These semantics
+live in the external package; Bloom validates them through the generic
+local-app signing and outbox contracts.
 
 **Hyperliquid**
 

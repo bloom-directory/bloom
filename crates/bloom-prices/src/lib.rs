@@ -80,6 +80,9 @@ impl CoinId {
         let (left, right) = s
             .split_once(':')
             .ok_or_else(|| PricesError::InvalidCoinId(s.to_string()))?;
+        if left.eq_ignore_ascii_case("native") {
+            return Ok(CoinId::Native(right.to_ascii_lowercase()));
+        }
         if left.eq_ignore_ascii_case("coingecko") {
             return Ok(CoinId::Native(format!("coingecko:{right}")));
         }
@@ -127,7 +130,7 @@ fn resolve_native(chain: &str) -> Option<String> {
     // names to coingecko slugs.
     Some(
         match s.as_str() {
-            "ethereum" => "coingecko:ethereum",
+            "ethereum" | "mainnet" | "anvil" | "local" => "coingecko:ethereum",
             "bitcoin" => "coingecko:bitcoin",
             "polygon" | "matic" => "coingecko:matic-network",
             "optimism" => "coingecko:ethereum", // OP chain native is ETH
@@ -603,6 +606,22 @@ mod tests {
             }
             _ => panic!("expected erc20"),
         }
+    }
+
+    #[test]
+    fn coin_id_parse_accepts_canonical_native_asset_ids() {
+        assert_eq!(
+            CoinId::parse("native:base").unwrap().to_query(),
+            "coingecko:ethereum"
+        );
+        assert_eq!(
+            CoinId::parse("native:anvil").unwrap().to_query(),
+            "coingecko:ethereum"
+        );
+        assert_eq!(
+            CoinId::parse("native:polygon").unwrap().to_query(),
+            "coingecko:matic-network"
+        );
     }
 
     #[test]
