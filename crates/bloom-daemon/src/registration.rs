@@ -22,6 +22,7 @@ use bloom_keystore::{
     finalize_passkey_wallet, finish_registration, finish_registration_fallback_assertion,
     prepare_passkey_wallet, start_registration_challenge, start_registration_fallback_assertion,
 };
+use bloom_proto::{AuditLog, AuditRecord};
 use parking_lot::{Mutex, RwLock};
 use rand::RngCore;
 use zeroize::Zeroize;
@@ -138,6 +139,7 @@ struct CoordinatorState {
 pub struct RegistrationCoordinator {
     keystore: Keystore,
     store: Arc<dyn WalletRegistrationStore>,
+    audit: Arc<AuditLog>,
     keystore_root: PathBuf,
     /// Set exactly once, by the process that binds the shared loopback
     /// ceremony listener. `stage()` fails closed while this is `None`.
@@ -150,11 +152,13 @@ impl RegistrationCoordinator {
     pub fn new(
         keystore: Keystore,
         store: Arc<dyn WalletRegistrationStore>,
+        audit: Arc<AuditLog>,
         keystore_root: PathBuf,
     ) -> Self {
         Self {
             keystore,
             store,
+            audit,
             keystore_root,
             listener_base_url: RwLock::new(None),
             state: Mutex::new(CoordinatorState::default()),
@@ -242,6 +246,20 @@ impl RegistrationCoordinator {
             }
         }
     }
+
+    fn audit_wallet_created(&self, wallet: &str) {
+        if let Err(error) = self.audit.append(AuditRecord {
+            ts_ms: 0,
+            kind: "wallet.created".into(),
+            wallet: Some(wallet.into()),
+            chain: None,
+            data: serde_json::json!({"kind": "passkey", "source": "wallet_registration"}),
+            prev: String::new(),
+            digest: String::new(),
+        }) {
+            tracing::warn!(%error, %wallet, "wallet.created audit unavailable");
+        }
+    }
 }
 
 #[async_trait]
@@ -262,16 +280,21 @@ impl WalletRegistrationLifecycle for RegistrationCoordinator {
         let rows = self.store.non_terminal().await?;
         let mut reconciled = 0u64;
         for (token, mut status) in rows {
-            if let Ok(info) = self.keystore.info_unverified(&status.wallet) {
+            let installed = if let Ok(info) = self.keystore.info_unverified(&status.wallet) {
                 status.state = WalletRegistrationState::Completed;
                 status.ceremony_url = None;
                 status.address = Some(bloom_proto::checksum_address(&info.address));
+                true
             } else {
                 status.state = WalletRegistrationState::Failed;
                 status.ceremony_url = None;
                 status.error = Some(reason.to_string());
-            }
+                false
+            };
             self.store.upsert(&token, &status, now_ms).await?;
+            if installed {
+                self.audit_wallet_created(&status.wallet);
+            }
             reconciled += 1;
         }
         Ok(reconciled)
@@ -973,7 +996,9 @@ impl RegistrationCoordinator {
         status.state = WalletRegistrationState::Completed;
         status.ceremony_url = None;
         status.address = Some(address.to_string());
-        self.store.upsert(token, &status, now_ms).await
+        self.store.upsert(token, &status, now_ms).await?;
+        self.audit_wallet_created(&status.wallet);
+        Ok(())
     }
 }
 
@@ -991,9 +1016,20 @@ mod tests {
             RejectingApprovalSignatureVerifier,
         ));
         let store: Arc<dyn WalletRegistrationStore> = verifier;
+        let audit = Arc::new(AuditLog::open(tmp.path().join("audit.jsonl")).unwrap());
         let coordinator =
-            RegistrationCoordinator::new(keystore, store, tmp.path().join("keystore"));
+            RegistrationCoordinator::new(keystore, store, audit, tmp.path().join("keystore"));
         (coordinator, tmp)
+    }
+
+    fn wallet_created_records(coordinator: &RegistrationCoordinator) -> Vec<AuditRecord> {
+        coordinator
+            .audit
+            .tail(10)
+            .unwrap()
+            .into_iter()
+            .filter(|record| record.kind == "wallet.created")
+            .collect()
     }
 
     async fn stage_token(
@@ -1493,6 +1529,7 @@ mod tests {
         let status = coordinator.status("alice").await.unwrap().unwrap();
         assert_eq!(status.state, WalletRegistrationState::Completed);
         assert_eq!(status.address.as_deref(), Some("0xabc"));
+        assert_eq!(wallet_created_records(&coordinator).len(), 1);
 
         // The session is gone — a repeat with the same receipt now 404s,
         // same as any other terminal session (idempotent completion of the
@@ -1503,6 +1540,7 @@ mod tests {
                 .await
                 .is_err()
         );
+        assert_eq!(wallet_created_records(&coordinator).len(), 1);
     }
 
     #[tokio::test]
@@ -1608,6 +1646,11 @@ mod tests {
         let bob = coordinator.status("bob").await.unwrap().unwrap();
         assert_eq!(bob.state, WalletRegistrationState::Failed);
         assert_eq!(bob.error.as_deref(), Some("daemon restarted"));
+
+        let records = wallet_created_records(&coordinator);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].wallet.as_deref(), Some("alice"));
+        assert_eq!(records[0].data["source"], "wallet_registration");
     }
 
     #[test]

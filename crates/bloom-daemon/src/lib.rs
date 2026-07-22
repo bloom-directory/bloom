@@ -2016,6 +2016,7 @@ impl Daemon {
             Arc::new(registration::RegistrationCoordinator::new(
                 keystore.clone(),
                 auth_verifier.clone(),
+                audit_arc.clone(),
                 home.keystore_dir(),
             ));
 
