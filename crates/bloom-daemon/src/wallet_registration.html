@@ -546,7 +546,24 @@ async function register(){
     st.className='err';
     var m=e.message||String(e);
     if(m.indexOf('connection')!==-1||m.indexOf('Receiving end')!==-1||m.indexOf('extension')!==-1){
-      st.innerHTML='A browser extension (e.g. Bitwarden) is interfering with passkey creation.<br><br>Fix: in the extension settings, disable passkey management for this browser. <b>Do not use incognito on Linux</b> — passkeys are not saved to the OS keychain from incognito mode. Alternatively, install Google Chrome and disable Bitwarden passkeys there.<br><br>Error: '+m;
+      // Build with DOM nodes rather than innerHTML: `m` comes from a
+      // server-supplied error string (or a browser exception message), and
+      // this page later holds the recovery key in memory — never let
+      // untrusted text be parsed as markup here.
+      st.textContent='';
+      var frag=document.createDocumentFragment();
+      frag.appendChild(document.createTextNode('A browser extension (e.g. Bitwarden) is interfering with passkey creation.'));
+      frag.appendChild(document.createElement('br'));
+      frag.appendChild(document.createElement('br'));
+      frag.appendChild(document.createTextNode('Fix: in the extension settings, disable passkey management for this browser. '));
+      var strong=document.createElement('b');
+      strong.textContent='Do not use incognito on Linux';
+      frag.appendChild(strong);
+      frag.appendChild(document.createTextNode(' — passkeys are not saved to the OS keychain from incognito mode. Alternatively, install Google Chrome and disable Bitwarden passkeys there.'));
+      frag.appendChild(document.createElement('br'));
+      frag.appendChild(document.createElement('br'));
+      frag.appendChild(document.createTextNode('Error: '+m));
+      st.appendChild(frag);
     }else{
       st.textContent='Error: '+m;
     }

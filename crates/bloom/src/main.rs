@@ -1204,7 +1204,22 @@ async fn poll_wallet_registration_ipc(
                     .unwrap_or(state);
                 anyhow::bail!("passkey registration {state}: {err}");
             }
-            _ => tokio::time::sleep(std::time::Duration::from_millis(1500)).await,
+            _ => {
+                // Backstop for a wedged daemon: the daemon's own sweep
+                // normally flips a stale session to `expired` within a
+                // minute of `expires_at_ms`, but if its background task
+                // ever stops running, that transition never happens and
+                // this loop would otherwise spin forever.
+                if let Some(expires_at_ms) = status.get("expires_at_ms").and_then(|v| v.as_u64())
+                    && system_time_to_unix_ms(SystemTime::now()) as u64 > expires_at_ms
+                {
+                    anyhow::bail!(
+                        "passkey registration timed out: past its expiry with no terminal \
+                         state from the daemon (it may be stuck) — try again"
+                    );
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(1500)).await
+            }
         }
     }
 }
@@ -1238,6 +1253,15 @@ async fn poll_wallet_registration_inproc(
                 );
             }
             AwaitingUser | AwaitingRecoveryAck => {
+                // Same expiry backstop as the IPC poller: the coordinator's
+                // own sweep should reach this first, but don't spin forever
+                // if it doesn't.
+                if system_time_to_unix_ms(SystemTime::now()) as u64 > status.expires_at_ms {
+                    anyhow::bail!(
+                        "passkey registration timed out: past its expiry with no terminal \
+                         state (it may be stuck) — try again"
+                    );
+                }
                 tokio::time::sleep(std::time::Duration::from_millis(1500)).await
             }
         }
@@ -1960,6 +1984,41 @@ async fn run(cli: Cli) -> Result<()> {
             // machinery when no daemon is reachable. Never a second,
             // separate registration implementation.
             let client = IpcClient::new(&client_endpoint.socket);
+            // Guard against a still-running `bloom serve` started before
+            // this CLI's async registration protocol existed: treating its
+            // `/wallets/new` as if it spoke the current contract would fail
+            // in a confusing way (e.g. racing its own port-18734 bind)
+            // rather than a clear "restart the daemon" error.
+            if let Some(daemon_status) = try_ipc(
+                &client,
+                &client_endpoint,
+                "read",
+                serde_json::json!({ "path": "/status/daemon.json" }),
+            )
+            .await
+            .with_context(|| format!("ipc read via {}", client_endpoint.display))?
+            {
+                let b64 = daemon_status
+                    .get("bytes_b64")
+                    .and_then(|v| v.as_str())
+                    .context("ipc read: missing bytes_b64")?;
+                let bytes = B64.decode(b64).context("ipc read: bad base64")?;
+                let daemon_info: serde_json::Value =
+                    serde_json::from_slice(&bytes).context("parse status/daemon.json")?;
+                let daemon_protocol_version = daemon_info
+                    .get("wallet_registration_protocol_version")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                if daemon_protocol_version
+                    < bloom_auth_api::WALLET_REGISTRATION_PROTOCOL_VERSION as u64
+                {
+                    anyhow::bail!(
+                        "the running `bloom serve` daemon does not speak this CLI's async \
+                         passkey registration protocol — restart `bloom serve` to pick up \
+                         the matching daemon version, then retry"
+                    );
+                }
+            }
             let ipc_res = try_ipc(
                 &client,
                 &client_endpoint,
