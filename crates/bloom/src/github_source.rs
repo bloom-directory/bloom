@@ -15,7 +15,7 @@ use url::Url;
 
 const TRUSTED_GITHUB_OWNER: &str = "bloom-directory";
 const POLYMARKET_PARITY_COMMIT: &str = "e2e898b69046c9f5d905dd2cd66b3a57ef195542";
-const NEAR_INTENTS_INITIAL_RELEASE_COMMIT: &str = "320b2b466bc0eb087a5cae3e658a5797198ce8ba";
+const NEAR_INTENTS_RELEASE_COMMIT: &str = "08e9bd83786425656bdd87e35031030cb7f3dc14";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PreinstalledPetal {
@@ -39,10 +39,10 @@ const PREINSTALLED_POLYMARKET: PreinstalledPetal = PreinstalledPetal {
 const PREINSTALLED_NEAR_INTENTS: PreinstalledPetal = PreinstalledPetal {
     name: "near-intents",
     repository: "https://github.com/bloom-directory/bloom-petal-near",
-    commit: NEAR_INTENTS_INITIAL_RELEASE_COMMIT,
-    release_tag: "v0.1.0",
-    archive: "near-intents-v0.1.0.petal.tar.gz",
-    expected_hash: Some("c78316d538e8364e837ed488fa74f04429d2477a617c36e7a6dc0c0fc68edee0"),
+    commit: NEAR_INTENTS_RELEASE_COMMIT,
+    release_tag: "v0.1.1",
+    archive: "near-intents-v0.1.1.petal.tar.gz",
+    expected_hash: Some("c3f714c01e17f642b8add45b7501d6675c851a13210ce9e834fd16d23330f166"),
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -930,9 +930,9 @@ mod tests {
             format!("polymarket-{}.petal.tar.gz", entry.release_tag)
         );
         let near = preinstalled_petal("near-intents").unwrap();
-        assert_eq!(near.release_tag, "v0.1.0");
+        assert_eq!(near.release_tag, "v0.1.1");
         assert_eq!(near.commit.len(), 40);
-        assert_eq!(near.archive, "near-intents-v0.1.0.petal.tar.gz");
+        assert_eq!(near.archive, "near-intents-v0.1.1.petal.tar.gz");
         assert!(near.repository.ends_with("/bloom-petal-near"));
         assert!(preinstalled_petal("unknown").is_none());
     }

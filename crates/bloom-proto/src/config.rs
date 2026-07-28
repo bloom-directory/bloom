@@ -87,7 +87,7 @@ impl Default for PetalsConfig {
 }
 
 fn default_preinstalled_petals() -> Vec<String> {
-    vec!["polymarket".to_string()]
+    vec!["polymarket".to_string(), "near-intents".to_string()]
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -664,7 +664,7 @@ mod tests {
         assert_eq!(cfg.nfs_listen_addr, "127.0.0.1:12049");
         assert!(cfg.etherscan.is_none());
         assert!(cfg.enso.is_none());
-        assert_eq!(cfg.petals.preinstalled, ["polymarket"]);
+        assert_eq!(cfg.petals.preinstalled, ["polymarket", "near-intents"]);
         let hyperliquid = cfg
             .hyperliquid
             .as_ref()
@@ -878,18 +878,25 @@ allow_broadcast = false
         let td = tempdir().unwrap();
         let path = td.path().join("config.toml");
         let default = toml::to_string_pretty(&Config::local_default()).unwrap();
-        let legacy = default
-            .replace("preinstalled = [\"polymarket\"]\n", "")
-            .replace("preinstalled = [\n    \"polymarket\",\n]\n", "");
+        let mut legacy_document: toml::Value = toml::from_str(&default).unwrap();
+        legacy_document
+            .get_mut("petals")
+            .and_then(toml::Value::as_table_mut)
+            .unwrap()
+            .remove("preinstalled");
+        let legacy = toml::to_string_pretty(&legacy_document).unwrap();
         assert!(!legacy.contains("preinstalled"));
         std::fs::write(&path, format!("{legacy}\n[polymarket]\nenabled = false\n")).unwrap();
 
         let migrated = Config::load(&path).unwrap();
-        assert!(migrated.petals.preinstalled.is_empty());
+        assert_eq!(migrated.petals.preinstalled, vec!["near-intents"]);
 
         std::fs::write(&path, format!("{default}\n[polymarket]\nenabled = false\n")).unwrap();
         let explicitly_enabled = Config::load(&path).unwrap();
-        assert_eq!(explicitly_enabled.petals.preinstalled, vec!["polymarket"]);
+        assert_eq!(
+            explicitly_enabled.petals.preinstalled,
+            vec!["polymarket", "near-intents"]
+        );
     }
 
     #[test]
