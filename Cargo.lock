@@ -2256,7 +2256,7 @@ dependencies = [
 
 [[package]]
 name = "bloom"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "alloy 2.0.5",
  "anyhow",
@@ -2299,7 +2299,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-auth"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -2316,7 +2316,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-auth-api"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -2329,7 +2329,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-daemon"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "alloy 2.0.5",
  "anyhow",
@@ -2376,7 +2376,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-defi"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "alloy 2.0.5",
  "bloom-proto",
@@ -2392,7 +2392,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-ens"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "alloy 2.0.5",
  "bloom-evm",
@@ -2407,7 +2407,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-etherscan"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "alloy 2.0.5",
  "async-trait",
@@ -2425,7 +2425,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-evm"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "alloy 2.0.5",
  "bloom-proto",
@@ -2443,7 +2443,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-hyperliquid"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "alloy 2.0.5",
  "alloy-dyn-abi",
@@ -2460,7 +2460,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-it"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "alloy 2.0.5",
  "anyhow",
@@ -2486,7 +2486,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-keystore"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "alloy 2.0.5",
  "argon2",
@@ -2520,7 +2520,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-mempool"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "alloy 2.0.5",
  "anyhow",
@@ -2542,7 +2542,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-mount"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "bloom-vfs",
@@ -2558,7 +2558,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-paid-http"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -2573,7 +2573,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-paid-mpp"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "alloy 2.0.5",
  "async-trait",
@@ -2589,7 +2589,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-paid-x402"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "alloy 2.0.5",
  "async-trait",
@@ -2612,7 +2612,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-petals"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2644,7 +2644,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-prices"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "parking_lot",
  "reqwest 0.12.28",
@@ -2657,7 +2657,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-proto"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "alloy 2.0.5",
  "blake3",
@@ -2678,7 +2678,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-revert"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "alloy 2.0.5",
  "alloy-dyn-abi",
@@ -2700,7 +2700,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-rpc"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "alloy 2.0.5",
  "bloom-proto",
@@ -2716,7 +2716,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-tools"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "alloy 2.0.5",
  "alloy-dyn-abi",
@@ -2730,7 +2730,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-tx"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "alloy 2.0.5",
  "anyhow",
@@ -2757,7 +2757,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-update"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "parking_lot",
  "reqwest 0.12.28",
@@ -2772,7 +2772,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-vfs"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "alloy 2.0.5",
  "async-trait",
@@ -2817,7 +2817,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-watch"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "alloy 2.0.5",
  "anyhow",
