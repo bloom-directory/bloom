@@ -246,7 +246,37 @@ fn install_github_source_with_expectation(
     })
 }
 
+/// How an already-installed owner relates to the pinned catalog entry.
+///
+/// Anything that is neither of these two states is a refusal: Bloom only ever
+/// replaces a Petal it can prove it installed itself from the same trusted
+/// catalog repository.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PreinstalledState {
+    /// The installed owner is exactly the pinned commit and package hash.
+    Current,
+    /// Same Petal name, same trusted catalog repository, older pinned commit.
+    Outdated { installed_commit: String },
+}
+
 pub(crate) fn ensure_preinstalled_petals(_home: &HomeDir, daemon: &Daemon) -> Result<Vec<String>> {
+    ensure_preinstalled_petals_with(
+        daemon,
+        |name| preinstalled_petal(name).copied(),
+        install_prebuilt_release_petal,
+    )
+}
+
+/// Provision every configured pre-installed Petal, replacing catalogued
+/// installations that are pinned to an older commit.
+///
+/// `resolve` and `acquire` are injected so tests can drive the classification
+/// and replacement logic against local fixtures without reaching GitHub.
+fn ensure_preinstalled_petals_with(
+    daemon: &Daemon,
+    resolve: impl Fn(&str) -> Option<PreinstalledPetal>,
+    acquire: impl Fn(&Daemon, &PreinstalledPetal) -> Result<GitHubInstallOutput>,
+) -> Result<Vec<String>> {
     let owners = daemon
         .petals
         .store()
@@ -258,36 +288,61 @@ pub(crate) fn ensure_preinstalled_petals(_home: &HomeDir, daemon: &Daemon) -> Re
     let mut ready = Vec::new();
 
     for name in &daemon.config.petals.preinstalled {
-        let entry = preinstalled_petal(name)
-            .ok_or_else(|| anyhow!("unknown pre-installed Petal {name:?}"))?;
-        if let Some(hash) = owners.get(name) {
-            let meta = daemon.petals.store().load_meta(hash).with_context(|| {
-                format!("load installed metadata for pre-installed Petal {name}")
-            })?;
-            validate_existing_preinstalled(entry, &meta)?;
-            println!(
-                "preinstalled_petal: {name} (already installed at {})",
-                &hash[..hash.len().min(bloom_petals::store::HASH_PREFIX_LEN)]
-            );
-            ready.push(name.clone());
-            continue;
-        }
+        let entry = resolve(name).ok_or_else(|| anyhow!("unknown pre-installed Petal {name:?}"))?;
+        let entry = &entry;
+        let replacing = match owners.get(name) {
+            Some(hash) => {
+                let meta = daemon.petals.store().load_meta(hash).with_context(|| {
+                    format!("load installed metadata for pre-installed Petal {name}")
+                })?;
+                // A refusal here (untrusted repository, missing provenance, or
+                // an unexpected identity) stops init/serve with the old Petal
+                // installed and active.
+                match classify_existing_preinstalled(entry, &meta)? {
+                    PreinstalledState::Current => {
+                        println!(
+                            "preinstalled_petal: {name} (already installed at {})",
+                            &hash[..hash.len().min(bloom_petals::store::HASH_PREFIX_LEN)]
+                        );
+                        ready.push(name.clone());
+                        continue;
+                    }
+                    PreinstalledState::Outdated { installed_commit } => {
+                        println!(
+                            "preinstalled_petal: updating {} from {} to {}",
+                            entry.name, installed_commit, entry.commit
+                        );
+                        true
+                    }
+                }
+            }
+            None => {
+                println!(
+                    "preinstalled_petal: installing {} from {}@{}",
+                    entry.name, entry.repository, entry.commit
+                );
+                false
+            }
+        };
 
-        println!(
-            "preinstalled_petal: installing {} from {}@{}",
-            entry.name, entry.repository, entry.commit
-        );
-        let installed = install_prebuilt_release_petal(daemon, entry)
+        // No uninstall precedes this. The verified release installer downloads
+        // and validates the pinned manifest, checksums, archive, package hash,
+        // and source commit, and only then does the store atomically swap the
+        // owner record. Any failure below leaves the previous owner active.
+        let installed = acquire(daemon, entry)
         .with_context(|| {
+            let action = if replacing { "update" } else { "provision" };
             format!(
-                "provision pre-installed Petal {} from {} release {} at commit {}; fix the cause and retry `bloom init`, or persistently opt out with `[petals] preinstalled = []`",
+                "{action} pre-installed Petal {} from {} release {} at commit {}; fix the cause and retry `bloom init`, or persistently opt out with `[petals] preinstalled = []`",
                 entry.name, entry.repository, entry.release_tag, entry.commit
             )
         })?;
         validate_existing_preinstalled(entry, &installed.meta)?;
         println!(
-            "preinstalled_petal: {} ready at petals/{}/",
-            entry.name, entry.name
+            "preinstalled_petal: {} {} at petals/{}/",
+            entry.name,
+            if replacing { "updated" } else { "ready" },
+            entry.name
         );
         ready.push(name.clone());
     }
@@ -509,10 +564,17 @@ fn preinstalled_petal(name: &str) -> Option<&'static PreinstalledPetal> {
     }
 }
 
-fn validate_existing_preinstalled(
+/// Classify an installed owner against the pinned catalog entry.
+///
+/// Returns `Current` when the installation is already the pinned commit and
+/// hash, and `Outdated` when it is the same Petal from the same trusted catalog
+/// repository at a different commit. Every other shape — missing provenance, a
+/// different repository, or an identity that contradicts itself — is refused so
+/// that manually sourced or untrusted ownership is never overwritten.
+fn classify_existing_preinstalled(
     expected: &PreinstalledPetal,
     meta: &bloom_petals::meta::PetalMeta,
-) -> Result<()> {
+) -> Result<PreinstalledState> {
     let package = meta
         .petal
         .as_ref()
@@ -535,10 +597,7 @@ fn validate_existing_preinstalled(
         .strip_prefix("https://github.com/")
         .unwrap_or(expected.repository);
     let actual_repo = format!("{}/{}", source.owner, source.repo);
-    if source.source_kind != "github"
-        || actual_repo != expected_repo
-        || source.resolved_commit != expected.commit
-    {
+    if source.source_kind != "github" || actual_repo != expected_repo {
         bail!(
             "pre-installed Petal {} is already owned by {}@{} instead of {}@{}; Bloom will not overwrite it automatically",
             expected.name,
@@ -548,6 +607,8 @@ fn validate_existing_preinstalled(
             expected.commit
         );
     }
+    // The provenance record must describe the package it is attached to before
+    // any of it can be trusted to authorise a replacement.
     if source.package_hash != meta.hash {
         bail!(
             "pre-installed Petal {} source provenance hash {} does not match installed hash {}",
@@ -556,6 +617,14 @@ fn validate_existing_preinstalled(
             meta.hash
         );
     }
+    if source.resolved_commit != expected.commit {
+        return Ok(PreinstalledState::Outdated {
+            installed_commit: source.resolved_commit.clone(),
+        });
+    }
+    // The pinned commit must reproduce the pinned artifact. A package claiming
+    // this commit with a different hash is an unexpected identity, not an
+    // upgrade candidate.
     if let Some(expected_hash) = expected.expected_hash
         && meta.hash != expected_hash
     {
@@ -566,7 +635,25 @@ fn validate_existing_preinstalled(
             expected_hash
         );
     }
-    Ok(())
+    Ok(PreinstalledState::Current)
+}
+
+/// Require that an installed owner is exactly the pinned catalog entry.
+///
+/// Used to re-verify what the store committed after an install or update.
+fn validate_existing_preinstalled(
+    expected: &PreinstalledPetal,
+    meta: &bloom_petals::meta::PetalMeta,
+) -> Result<()> {
+    match classify_existing_preinstalled(expected, meta)? {
+        PreinstalledState::Current => Ok(()),
+        PreinstalledState::Outdated { installed_commit } => bail!(
+            "pre-installed Petal {} is installed at commit {} instead of the pinned commit {}",
+            expected.name,
+            installed_commit,
+            expected.commit
+        ),
+    }
 }
 
 fn is_raw_remote_wasm(input: &str) -> bool {
@@ -964,20 +1051,50 @@ mod tests {
                 package_hash: hash,
             }),
         };
+        assert_eq!(
+            classify_existing_preinstalled(entry, &meta).unwrap(),
+            PreinstalledState::Current
+        );
         validate_existing_preinstalled(entry, &meta).unwrap();
 
+        // Same Petal, same trusted repository, older pinned commit: update.
         meta.source.as_mut().unwrap().resolved_commit = "b".repeat(40);
-        let err = validate_existing_preinstalled(entry, &meta)
+        assert_eq!(
+            classify_existing_preinstalled(entry, &meta).unwrap(),
+            PreinstalledState::Outdated {
+                installed_commit: "b".repeat(40)
+            }
+        );
+
+        // A different repository is never overwritten, however stale it is.
+        meta.source.as_mut().unwrap().repo = "bloom-petal-impostor".into();
+        let err = classify_existing_preinstalled(entry, &meta)
             .unwrap_err()
             .to_string();
         assert!(err.contains("will not overwrite it automatically"), "{err}");
 
+        meta.source.as_mut().unwrap().repo = "bloom-petal-polymarket".into();
         meta.source.as_mut().unwrap().resolved_commit = entry.commit.into();
         meta.source.as_mut().unwrap().package_hash = "c".repeat(64);
-        let err = validate_existing_preinstalled(entry, &meta)
+        let err = classify_existing_preinstalled(entry, &meta)
             .unwrap_err()
             .to_string();
         assert!(err.contains("provenance hash"), "{err}");
+
+        // The pinned commit must reproduce the pinned artifact.
+        meta.hash = "c".repeat(64);
+        let err = classify_existing_preinstalled(entry, &meta)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("does not match expected hash"), "{err}");
+
+        // Provenance-free ownership is refused outright.
+        meta.hash = entry.expected_hash.unwrap().into();
+        meta.source = None;
+        let err = classify_existing_preinstalled(entry, &meta)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("without source provenance"), "{err}");
     }
 
     #[test]
@@ -1006,6 +1123,319 @@ mod tests {
                 .list_petal_owners()
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    const NEAR_OLD_COMMIT: &str = "1111111111111111111111111111111111111111";
+    const NEAR_NEW_COMMIT: &str = "2222222222222222222222222222222222222222";
+    const NEAR_REPO: &str = "bloom-petal-near";
+
+    /// A built `near-intents` package plus the release archive carrying it.
+    struct PetalRelease {
+        package: PreparedPetalPackage,
+        archive: tempfile::NamedTempFile,
+    }
+
+    fn build_near_release(version: &str) -> PetalRelease {
+        let source = tempfile::tempdir().unwrap();
+        write_named_source_repo(
+            &source,
+            NEAR_REPO,
+            "near-intents",
+            true,
+            &BuildScript::Success,
+            version,
+        )
+        .unwrap();
+        run_source_build(source.path()).unwrap();
+        let package = PreparedPetalPackage::from_dir(source.path()).unwrap();
+        let archive = tempfile::NamedTempFile::new().unwrap();
+        let mut encoder =
+            flate2::write::GzEncoder::new(archive.reopen().unwrap(), flate2::Compression::best());
+        package.write_petal_tar(&mut encoder).unwrap();
+        encoder.finish().unwrap();
+        PetalRelease { package, archive }
+    }
+
+    fn near_catalog_entry(
+        commit: &'static str,
+        release_tag: &'static str,
+        archive: &'static str,
+        expected_hash: Option<&'static str>,
+    ) -> PreinstalledPetal {
+        PreinstalledPetal {
+            name: "near-intents",
+            repository: "https://github.com/bloom-directory/bloom-petal-near",
+            commit,
+            release_tag,
+            archive,
+            expected_hash,
+        }
+    }
+
+    fn near_release_manifest(
+        entry: &PreinstalledPetal,
+        package_hash: &str,
+    ) -> PetalReleaseManifest {
+        PetalReleaseManifest {
+            schema: "bloom.petal.release.v1".into(),
+            petal_name: entry.name.into(),
+            source_repository: format!("bloom-directory/{NEAR_REPO}"),
+            source_commit: entry.commit.into(),
+            release_tag: entry.release_tag.into(),
+            archive: entry.archive.into(),
+            archive_sha256: "2".repeat(64),
+            package_hash: package_hash.into(),
+            tooling_repository: "bloom-directory/petal".into(),
+            tooling_commit: "3".repeat(40),
+        }
+    }
+
+    /// A home whose `near-intents` owner came from `repo` at `commit`, matching
+    /// what a real catalogued install of that release would have recorded.
+    fn near_home_with_installed(
+        package: &PreparedPetalPackage,
+        repo: &str,
+        commit: &str,
+        source: Option<PetalSourceProvenance>,
+    ) -> (TempDir, HomeDir, Daemon) {
+        let home = tempfile::tempdir().unwrap();
+        let home_dir = HomeDir::at(home.path());
+        home_dir.ensure().unwrap();
+        let mut config = bloom_proto::Config::local_default();
+        config.petals.preinstalled = vec!["near-intents".into()];
+        config.save(&home_dir.config_path()).unwrap();
+        let daemon = Daemon::from_home(home_dir.clone()).unwrap();
+
+        let provenance = source.unwrap_or_else(|| PetalSourceProvenance {
+            source_kind: "github".into(),
+            url: format!("https://github.com/bloom-directory/{repo}"),
+            owner: "bloom-directory".into(),
+            repo: repo.into(),
+            requested_ref: "v0.1.0".into(),
+            resolved_commit: commit.into(),
+            selected_tag: Some("v0.1.0".into()),
+            package_hash: package.hash.clone(),
+        });
+        daemon
+            .petals
+            .store()
+            .install_prepared_petal_package_with_source(package.clone(), Some(provenance))
+            .unwrap();
+        (home, home_dir, daemon)
+    }
+
+    fn installed_owner(daemon: &Daemon) -> Option<String> {
+        daemon
+            .petals
+            .store()
+            .resolve_petal_owner("near-intents")
+            .unwrap()
+    }
+
+    #[test]
+    fn catalogued_near_install_updates_to_pinned_release_then_serves_idempotently() {
+        let old = build_near_release("v0.1.0");
+        let new = build_near_release("v0.1.1");
+        assert_ne!(
+            old.package.hash, new.package.hash,
+            "the two releases must be distinguishable packages"
+        );
+
+        let (home, home_dir, daemon) =
+            near_home_with_installed(&old.package, NEAR_REPO, NEAR_OLD_COMMIT, None);
+        assert_eq!(
+            installed_owner(&daemon).as_deref(),
+            Some(&*old.package.hash)
+        );
+
+        let new_hash: &'static str = Box::leak(new.package.hash.clone().into_boxed_str());
+        let entry = near_catalog_entry(
+            NEAR_NEW_COMMIT,
+            "v0.1.1",
+            "near-intents-v0.1.1.petal.tar.gz",
+            Some(new_hash),
+        );
+        let acquisitions = std::cell::Cell::new(0usize);
+
+        let ready = ensure_preinstalled_petals_with(
+            &daemon,
+            |name| (name == "near-intents").then_some(entry),
+            |daemon, entry| {
+                acquisitions.set(acquisitions.get() + 1);
+                // Nothing has been uninstalled: the previous release is still
+                // the authoritative owner while the new one is acquired.
+                assert_eq!(installed_owner(daemon).as_deref(), Some(&*old.package.hash));
+                install_prebuilt_petal_archive(
+                    daemon,
+                    entry,
+                    &near_release_manifest(entry, new_hash),
+                    new.archive.path(),
+                )
+            },
+        )
+        .unwrap();
+
+        assert_eq!(ready, vec!["near-intents".to_string()]);
+        assert_eq!(acquisitions.get(), 1);
+        assert_eq!(installed_owner(&daemon).as_deref(), Some(new_hash));
+        let meta = daemon.petals.store().load_meta(new_hash).unwrap();
+        assert_eq!(
+            meta.source.as_ref().unwrap().resolved_commit,
+            NEAR_NEW_COMMIT
+        );
+        assert_eq!(
+            meta.source.as_ref().unwrap().selected_tag.as_deref(),
+            Some("v0.1.1")
+        );
+        // The swap was an owner-record rename, not an uninstall: the previous
+        // package data is still on disk for in-flight readers.
+        assert!(
+            daemon.petals.store().contains_package(&old.package.hash),
+            "the replaced package must survive the atomic owner swap"
+        );
+
+        drop(daemon);
+
+        // `bloom serve` re-opens the home and provisions again before serving.
+        let serve_daemon = Daemon::from_home(home_dir.clone()).unwrap();
+        let ready = ensure_preinstalled_petals_with(
+            &serve_daemon,
+            |name| (name == "near-intents").then_some(entry),
+            |_, _| panic!("a current installation must not be re-acquired"),
+        )
+        .unwrap();
+        assert_eq!(ready, vec!["near-intents".to_string()]);
+        assert_eq!(acquisitions.get(), 1);
+        assert_eq!(installed_owner(&serve_daemon).as_deref(), Some(new_hash));
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let body = rt
+            .block_on(
+                serve_daemon
+                    .vfs
+                    .read(&VfsPath::parse("/petals/near-intents/hello.txt").unwrap()),
+            )
+            .unwrap();
+        assert_eq!(body, b"component");
+
+        // A third run over the same home changes nothing.
+        let ready = ensure_preinstalled_petals_with(
+            &serve_daemon,
+            |name| (name == "near-intents").then_some(entry),
+            |_, _| panic!("provisioning must be idempotent"),
+        )
+        .unwrap();
+        assert_eq!(ready, vec!["near-intents".to_string()]);
+        assert_eq!(installed_owner(&serve_daemon).as_deref(), Some(new_hash));
+        drop(home);
+    }
+
+    #[test]
+    fn failed_replacement_verification_leaves_the_previous_owner_active() {
+        let old = build_near_release("v0.1.0");
+        let new = build_near_release("v0.1.1");
+        let (_home, _home_dir, daemon) =
+            near_home_with_installed(&old.package, NEAR_REPO, NEAR_OLD_COMMIT, None);
+
+        let new_hash: &'static str = Box::leak(new.package.hash.clone().into_boxed_str());
+        let entry = near_catalog_entry(
+            NEAR_NEW_COMMIT,
+            "v0.1.1",
+            "near-intents-v0.1.1.petal.tar.gz",
+            Some(new_hash),
+        );
+
+        // The downloaded archive does not carry the pinned package hash.
+        let err = ensure_preinstalled_petals_with(
+            &daemon,
+            |name| (name == "near-intents").then_some(entry),
+            |daemon, entry| {
+                install_prebuilt_petal_archive(
+                    daemon,
+                    entry,
+                    &near_release_manifest(entry, new_hash),
+                    old.archive.path(),
+                )
+            },
+        )
+        .unwrap_err();
+        let err = format!("{err:#}");
+        assert!(
+            err.contains("does not match release manifest hash"),
+            "{err}"
+        );
+        assert!(
+            err.contains("update pre-installed Petal near-intents"),
+            "{err}"
+        );
+
+        assert_eq!(
+            installed_owner(&daemon).as_deref(),
+            Some(&*old.package.hash)
+        );
+        let meta = daemon.petals.store().load_meta(&old.package.hash).unwrap();
+        assert_eq!(
+            meta.source.as_ref().unwrap().resolved_commit,
+            NEAR_OLD_COMMIT
+        );
+        assert!(!daemon.petals.store().contains_package(new_hash));
+    }
+
+    #[test]
+    fn replacement_refuses_untrusted_repository_and_provenance_free_ownership() {
+        let old = build_near_release("v0.1.0");
+        let new_hash: &'static str =
+            Box::leak(build_near_release("v0.1.1").package.hash.into_boxed_str());
+        let entry = near_catalog_entry(
+            NEAR_NEW_COMMIT,
+            "v0.1.1",
+            "near-intents-v0.1.1.petal.tar.gz",
+            Some(new_hash),
+        );
+
+        // Installed from a different repository under the same Petal name.
+        let (_fork_home, _fork_home_dir, fork_daemon) =
+            near_home_with_installed(&old.package, "bloom-petal-near-fork", NEAR_OLD_COMMIT, None);
+        let err = ensure_preinstalled_petals_with(
+            &fork_daemon,
+            |name| (name == "near-intents").then_some(entry),
+            |_, _| panic!("an untrusted installation must never be replaced"),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("will not overwrite it automatically"), "{err}");
+        assert!(err.contains("bloom-petal-near-fork"), "{err}");
+        assert_eq!(
+            installed_owner(&fork_daemon).as_deref(),
+            Some(&*old.package.hash)
+        );
+
+        // Installed manually, with no source provenance at all.
+        let manual_home = tempfile::tempdir().unwrap();
+        let manual_home_dir = HomeDir::at(manual_home.path());
+        manual_home_dir.ensure().unwrap();
+        let mut config = bloom_proto::Config::local_default();
+        config.petals.preinstalled = vec!["near-intents".into()];
+        config.save(&manual_home_dir.config_path()).unwrap();
+        let manual_daemon = Daemon::from_home(manual_home_dir).unwrap();
+        manual_daemon
+            .petals
+            .store()
+            .install_prepared_petal_package(old.package.clone())
+            .unwrap();
+
+        let err = ensure_preinstalled_petals_with(
+            &manual_daemon,
+            |name| (name == "near-intents").then_some(entry),
+            |_, _| panic!("a manually sourced installation must never be replaced"),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("without source provenance"), "{err}");
+        assert_eq!(
+            installed_owner(&manual_daemon).as_deref(),
+            Some(&*old.package.hash)
         );
     }
 
@@ -1576,9 +2006,27 @@ mod tests {
         build_script: &BuildScript,
         readme_suffix: &str,
     ) -> Result<()> {
+        write_named_source_repo(
+            work,
+            repo,
+            "demo",
+            include_manifest,
+            build_script,
+            readme_suffix,
+        )
+    }
+
+    fn write_named_source_repo(
+        work: &TempDir,
+        repo: &str,
+        petal_name: &str,
+        include_manifest: bool,
+        build_script: &BuildScript,
+        readme_suffix: &str,
+    ) -> Result<()> {
         if include_manifest {
             let manifest = r#"schema = "bloom.petal.package.v1"
-name = "demo"
+name = "PETAL_NAME"
 
 [source]
 kind = "github"
@@ -1586,17 +2034,18 @@ repository = "bloom-directory/REPO_NAME"
 
 [build]
 command = "scripts/build.sh"
-outputs = ["petal/demo"]
+outputs = ["petal/PETAL_NAME"]
 
 [consent]
 summary = "Demo app used by source install tests."
 "#
-            .replace("REPO_NAME", repo);
+            .replace("REPO_NAME", repo)
+            .replace("PETAL_NAME", petal_name);
             std::fs::write(work.path().join("petal.toml"), manifest)?;
         }
         std::fs::write(
             work.path().join("README.md"),
-            format!("# demo {readme_suffix}\n"),
+            format!("# {petal_name} {readme_suffix}\n"),
         )?;
         std::fs::write(work.path().join("AGENTS.md"), b"# demo agents\n")?;
         std::fs::create_dir_all(work.path().join("components"))?;
@@ -1606,10 +2055,10 @@ summary = "Demo app used by source install tests."
         )?;
         std::fs::create_dir_all(work.path().join("scripts"))?;
         let script = match build_script {
-            BuildScript::Success => {
-                "#!/usr/bin/env bash\nset -euo pipefail\nmkdir -p petal/demo\ncp components/route.wasm petal/demo/hello.txt.wasm\n"
-            }
-            BuildScript::Failure => "#!/usr/bin/env bash\nset -euo pipefail\nexit 42\n",
+            BuildScript::Success => format!(
+                "#!/usr/bin/env bash\nset -euo pipefail\nmkdir -p petal/{petal_name}\ncp components/route.wasm petal/{petal_name}/hello.txt.wasm\n"
+            ),
+            BuildScript::Failure => "#!/usr/bin/env bash\nset -euo pipefail\nexit 42\n".to_string(),
         };
         let script_path = work.path().join("scripts/build.sh");
         std::fs::write(&script_path, script)?;
