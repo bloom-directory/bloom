@@ -1019,20 +1019,14 @@ fn outbox_confirm_unlock_intent(
         .join("plan.md");
     let plan = std::fs::read_to_string(&plan_path).ok()?;
     let plan_hash = blake3::hash(plan.as_bytes()).to_hex().to_string();
-    let defi_review = find_defi_review_for_outbox(outbox_root?, wallet, chain, id);
+    // DeFi session enrichment was removed when the native handler was replaced
+    // by the enso Petal.
     let mut intent = CeremonyIntent::new(
         wallet,
         format!("Approve {} Transaction", chain),
         CeremonyIntentKind::EvmTransaction,
     );
     intent.wallet_address = wallet_address;
-    intent.summary_lines = defi_review
-        .as_ref()
-        .map(|review| review.summary_lines.clone())
-        .unwrap_or_default();
-    if !intent.summary_lines.is_empty() {
-        intent.summary_lines.push("Transaction to sign:".into());
-    }
     intent.summary_lines.extend(
         plan.lines()
             .filter(|line| {
@@ -1052,31 +1046,14 @@ fn outbox_confirm_unlock_intent(
             .summary_lines
             .push(format!("Broadcast staged transaction {id} on {chain}."));
     }
-    intent.risk_lines = defi_review
-        .as_ref()
-        .map(|review| review.risk_lines.clone())
-        .unwrap_or_default();
-    intent.risk_lines.extend(vec![
+    intent.risk_lines = vec![
         "Approving will sign and broadcast this transaction.".into(),
         "For cross-chain routes, source-chain confirmation is not destination settlement.".into(),
         "The OS passkey prompt only proves your presence; review the transaction on this page."
             .into(),
-    ]);
-    intent.policy_lines = defi_review
-        .as_ref()
-        .map(|review| {
-            let mut lines: Vec<String> = review.plan_md.lines().map(str::to_string).collect();
-            lines.extend(["".into(), "---".into(), "".into()]);
-            lines.extend(plan.lines().map(str::to_string));
-            lines
-        })
-        .unwrap_or_else(|| plan.lines().map(str::to_string).collect());
+    ];
+    intent.policy_lines = plan.lines().map(str::to_string).collect();
     intent.artifact_paths = vec![path_s.to_string(), plan_path.display().to_string()];
-    if let Some(review) = &defi_review {
-        intent
-            .artifact_paths
-            .push(format!("defi session {}", review.id));
-    }
     intent.canonical_subject = json!({
         "kind": "outbox_confirm",
         "wallet": wallet,
@@ -1084,112 +1061,8 @@ fn outbox_confirm_unlock_intent(
         "outbox_id": id,
         "path": path_s,
         "plan_blake3": plan_hash,
-        "defi_session_id": defi_review.as_ref().map(|review| review.id.as_str()),
-        "defi_plan_blake3": defi_review.as_ref().map(|review| review.plan_hash.as_str()),
     });
     Some(intent)
-}
-
-#[derive(Debug, Clone)]
-#[cfg(test)]
-struct DefiReview {
-    id: String,
-    plan_md: String,
-    plan_hash: String,
-    summary_lines: Vec<String>,
-    risk_lines: Vec<String>,
-}
-
-#[cfg(test)]
-fn find_defi_review_for_outbox(
-    outbox_root: &Path,
-    wallet: &str,
-    chain: &str,
-    outbox_id: &str,
-) -> Option<DefiReview> {
-    let home = if outbox_root.file_name().is_some_and(|name| name == "outbox") {
-        outbox_root.parent().unwrap_or(outbox_root)
-    } else {
-        outbox_root
-    };
-    let sessions = home.join("defi").join(wallet).join("sessions");
-    for entry in std::fs::read_dir(sessions).ok()? {
-        // Skip an unreadable/corrupt sibling rather than aborting the whole scan
-        // (which would silently drop a valid same-chain review later in the dir).
-        let Ok(entry) = entry else { continue };
-        let path = entry.path();
-        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
-            continue;
-        }
-        let Ok(raw) = std::fs::read_to_string(&path) else {
-            continue;
-        };
-        let Ok(value) = serde_json::from_str::<Value>(&raw) else {
-            continue;
-        };
-        // Outbox ids are scoped per chain (`.../wallet/<chain>/pending/<id>`),
-        // so the same id can exist on two chains. Bind the review to the chain
-        // being confirmed, or a session for a *different* chain (e.g. a Polygon
-        // route) could shadow this confirm's copy with the wrong chain.
-        let chain_matches = value.get("chain").and_then(|v| v.as_str()) == Some(chain);
-        let staged = value
-            .get("staged_ids")
-            .and_then(|v| v.as_array())
-            .is_some_and(|ids| ids.iter().any(|id| id.as_str() == Some(outbox_id)));
-        if !chain_matches || !staged {
-            continue;
-        }
-        let id = value
-            .get("id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown")
-            .to_string();
-        let plan_md = value
-            .get("plan_md")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let plan_hash = blake3::hash(plan_md.as_bytes()).to_hex().to_string();
-        let mut summary_lines = vec![format!("DeFi route intent {id}:")];
-        summary_lines.extend(plan_md.lines().filter_map(|line| {
-            let trimmed = line.trim();
-            if trimmed.starts_with("Intent:")
-                || trimmed.starts_with("Chain:")
-                || trimmed.starts_with("Dest chain:")
-                || trimmed.starts_with("Receiver:")
-                || trimmed.starts_with("Token in:")
-                || trimmed.starts_with("Token out:")
-                || trimmed.starts_with("Slippage:")
-                || trimmed.starts_with("Router:")
-                || trimmed.starts_with("Protocols:")
-                || trimmed.starts_with("Tx value:")
-            {
-                Some(trimmed.to_string())
-            } else {
-                None
-            }
-        }));
-        let risk_lines = value
-            .get("policy_checks")
-            .and_then(|v| v.as_array())
-            .into_iter()
-            .flatten()
-            .filter(|check| check.get("outcome").and_then(|v| v.as_str()) == Some("warn"))
-            .filter_map(|check| {
-                let rule = check.get("rule").and_then(|v| v.as_str()).unwrap_or("defi");
-                let message = check.get("message").and_then(|v| v.as_str())?;
-                Some(format!("{rule}: {message}"))
-            })
-            .collect();
-        return Some(DefiReview {
-            id,
-            plan_md,
-            plan_hash,
-            summary_lines,
-            risk_lines,
-        });
-    }
-    None
 }
 
 fn parse_path(params: &Value) -> Result<VfsPath, HandlerError> {
@@ -1432,7 +1305,6 @@ summary = "Demo app used by IPC tests."
         }
 
         for path in [
-            "/defi/intents/minnow/0001/confirm",
             // policy.toml now reaches the VFS handler, which stages a Sealed
             // Approval for passkey wallets rather than being denied at the lane.
             "/wallets/minnow/policy.toml",
@@ -1602,116 +1474,6 @@ allow_vault_or_subaccount = false
                 .join("\n")
                 .contains("# Staged tx 0001-test")
         );
-    }
-
-    #[test]
-    fn outbox_confirm_unlock_intent_includes_defi_route_plan() {
-        let tmp = tempfile::tempdir().unwrap();
-        let outbox_root = tmp.path().join("outbox");
-        let dir = outbox_root
-            .join("minnow")
-            .join("base")
-            .join("pending")
-            .join("0001-test");
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(
-            dir.join("plan.md"),
-            "# Staged tx 0001-test\n\nWallet: minnow\nFrom:   0xabc\nTo:     0xdef\nChain:  base (id 8453)\nValue:  0.1 ETH\nNonce:  7\nGas:    limit=1\nData:   4 bytes\n",
-        )
-        .unwrap();
-        let sessions = tmp.path().join("defi").join("minnow").join("sessions");
-        std::fs::create_dir_all(&sessions).unwrap();
-        std::fs::write(
-            sessions.join("0001-route.json"),
-            serde_json::to_vec_pretty(&json!({
-                "id": "0001-route",
-                "chain": "base",
-                "staged_ids": ["0001-test"],
-                "plan_md": "# DeFi intent\n\nIntent:    swap 5 USDC to MATIC\nChain:     base (id 8453)\nDest chain:polygon (id 137)\nReceiver:  0xabc\nToken in:  USDC amount=5000000 (raw)\nToken out: MATIC amountOut≈1\nSlippage:  50 bps\nRouter:    0xrouter\nProtocols: stargate -> 1inch\nTx value:  1 wei\n",
-                "policy_checks": [
-                    {
-                        "outcome": "warn",
-                        "rule": "defi.min_output",
-                        "message": "minimum-output is quote-derived"
-                    }
-                ]
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-        let p =
-            VfsPath::parse("/wallets/minnow/chains/base/outbox/pending/0001-test/confirm").unwrap();
-        let intent = write_unlocked_intent(
-            "minnow",
-            &p,
-            b"y",
-            Some("0xabc".into()),
-            Some(outbox_root),
-            None,
-        );
-        let summary = intent.summary_lines.join("\n");
-        assert!(summary.contains("DeFi route intent 0001-route"));
-        assert!(summary.contains("Intent:    swap 5 USDC to MATIC"));
-        assert!(summary.contains("Transaction to sign:"));
-        assert!(intent.risk_lines.join("\n").contains("defi.min_output"));
-        assert!(intent.policy_lines.join("\n").contains("# DeFi intent"));
-        assert!(
-            intent
-                .policy_lines
-                .join("\n")
-                .contains("# Staged tx 0001-test")
-        );
-        assert_eq!(intent.canonical_subject["defi_session_id"], "0001-route");
-    }
-
-    #[test]
-    fn outbox_confirm_ignores_defi_review_for_a_different_chain() {
-        // Regression: outbox ids are per-chain, so a same-id session on another
-        // chain must NOT shadow this confirm's copy (the stale "Polygon" bleed).
-        let tmp = tempfile::tempdir().unwrap();
-        let outbox_root = tmp.path().join("outbox");
-        let dir = outbox_root
-            .join("minnow")
-            .join("base")
-            .join("pending")
-            .join("0001-test");
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(
-            dir.join("plan.md"),
-            "# Staged tx 0001-test\n\nWallet: minnow\nFrom:   0xabc\nTo:     0xdef\nChain:  base (id 8453)\nValue:  0.1 ETH\nNonce:  7\nGas:    limit=1\nData:   4 bytes\n",
-        )
-        .unwrap();
-        // A *Polygon* session that happens to reference the same outbox id.
-        let sessions = tmp.path().join("defi").join("minnow").join("sessions");
-        std::fs::create_dir_all(&sessions).unwrap();
-        std::fs::write(
-            sessions.join("0001-route.json"),
-            serde_json::to_vec_pretty(&json!({
-                "id": "0001-route",
-                "chain": "polygon",
-                "staged_ids": ["0001-test"],
-                "plan_md": "# DeFi intent\n\nIntent:    swap 1 USDC to MATIC\nChain:     polygon (id 137)\n",
-                "policy_checks": []
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-        let p =
-            VfsPath::parse("/wallets/minnow/chains/base/outbox/pending/0001-test/confirm").unwrap();
-        let intent = write_unlocked_intent(
-            "minnow",
-            &p,
-            b"y",
-            Some("0xabc".into()),
-            Some(outbox_root),
-            None,
-        );
-        let summary = intent.summary_lines.join("\n");
-        // The Base confirm shows Base, never the Polygon session's copy.
-        assert!(summary.contains("Chain:  base (id 8453)"));
-        assert!(!summary.contains("DeFi route intent"));
-        assert!(!summary.to_lowercase().contains("polygon"));
-        assert!(intent.canonical_subject["defi_session_id"].is_null());
     }
 
     #[tokio::test]

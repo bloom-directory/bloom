@@ -29,7 +29,6 @@ blake3.workspace = true
 bloom-mount = { workspace = true, optional = true }
 bloom-keystore.workspace = true
 bloom-evm.workspace = true
-bloom-defi.workspace = true
 bloom-tx.workspace = true
 url.workspace = true
 bloom-vfs.workspace = true

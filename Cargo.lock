@@ -2266,7 +2266,6 @@ dependencies = [
  "blake3",
  "bloom-auth-api",
  "bloom-daemon",
- "bloom-defi",
  "bloom-evm",
  "bloom-hyperliquid",
  "bloom-keystore",
@@ -2339,7 +2338,6 @@ dependencies = [
  "blake3",
  "bloom-auth",
  "bloom-auth-api",
- "bloom-defi",
  "bloom-ens",
  "bloom-etherscan",
  "bloom-evm",
@@ -2372,22 +2370,6 @@ dependencies = [
  "url",
  "webauthn-rs",
  "zeroize",
-]
-
-[[package]]
-name = "bloom-defi"
-version = "0.1.2"
-dependencies = [
- "alloy 2.0.5",
- "bloom-proto",
- "hex",
- "reqwest 0.12.28",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
- "url",
 ]
 
 [[package]]
@@ -2780,7 +2762,6 @@ dependencies = [
  "blake3",
  "bloom-auth",
  "bloom-auth-api",
- "bloom-defi",
  "bloom-ens",
  "bloom-etherscan",
  "bloom-evm",

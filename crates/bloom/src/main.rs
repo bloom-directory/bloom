@@ -3001,20 +3001,15 @@ fn outbox_confirm_unlock_intent(
         .join("plan.md");
     let plan = std::fs::read_to_string(&plan_path).ok()?;
     let plan_hash = blake3::hash(plan.as_bytes()).to_hex().to_string();
-    let defi_review = find_defi_review_for_outbox(outbox_root?, wallet, chain, id);
+    // DeFi session enrichment was removed when the native handler was replaced
+    // by the enso Petal. The ceremony still includes the plan.md transaction
+    // details and standard risk lines.
     let mut intent = CeremonyIntent::new(
         wallet,
         format!("Approve {} Transaction", chain),
         CeremonyIntentKind::EvmTransaction,
     );
     intent.wallet_address = wallet_address;
-    intent.summary_lines = defi_review
-        .as_ref()
-        .map(|review| review.summary_lines.clone())
-        .unwrap_or_default();
-    if !intent.summary_lines.is_empty() {
-        intent.summary_lines.push("Transaction to sign:".into());
-    }
     intent.summary_lines.extend(
         plan.lines()
             .filter(|line| {
@@ -3034,31 +3029,14 @@ fn outbox_confirm_unlock_intent(
             .summary_lines
             .push(format!("Broadcast staged transaction {id} on {chain}."));
     }
-    intent.risk_lines = defi_review
-        .as_ref()
-        .map(|review| review.risk_lines.clone())
-        .unwrap_or_default();
-    intent.risk_lines.extend(vec![
+    intent.risk_lines = vec![
         "Approving will sign and broadcast this transaction.".into(),
         "For cross-chain routes, source-chain confirmation is not destination settlement.".into(),
         "The OS passkey prompt only proves your presence; review the transaction on this page."
             .into(),
-    ]);
-    intent.policy_lines = defi_review
-        .as_ref()
-        .map(|review| {
-            let mut lines: Vec<String> = review.plan_md.lines().map(str::to_string).collect();
-            lines.extend(["".into(), "---".into(), "".into()]);
-            lines.extend(plan.lines().map(str::to_string));
-            lines
-        })
-        .unwrap_or_else(|| plan.lines().map(str::to_string).collect());
+    ];
+    intent.policy_lines = plan.lines().map(str::to_string).collect();
     intent.artifact_paths = vec![path_s.to_string(), plan_path.display().to_string()];
-    if let Some(review) = &defi_review {
-        intent
-            .artifact_paths
-            .push(format!("defi session {}", review.id));
-    }
     intent.canonical_subject = serde_json::json!({
         "kind": "outbox_confirm",
         "wallet": wallet,
@@ -3066,8 +3044,6 @@ fn outbox_confirm_unlock_intent(
         "outbox_id": id,
         "path": path_s,
         "plan_blake3": plan_hash,
-        "defi_session_id": defi_review.as_ref().map(|review| review.id.as_str()),
-        "defi_plan_blake3": defi_review.as_ref().map(|review| review.plan_hash.as_str()),
     });
     Some(intent)
 }
@@ -3266,103 +3242,6 @@ fn cli_now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
-}
-
-#[derive(Debug, Clone)]
-struct DefiReview {
-    id: String,
-    plan_md: String,
-    plan_hash: String,
-    summary_lines: Vec<String>,
-    risk_lines: Vec<String>,
-}
-
-fn find_defi_review_for_outbox(
-    outbox_root: &std::path::Path,
-    wallet: &str,
-    chain: &str,
-    outbox_id: &str,
-) -> Option<DefiReview> {
-    let home = if outbox_root.file_name().is_some_and(|name| name == "outbox") {
-        outbox_root.parent().unwrap_or(outbox_root)
-    } else {
-        outbox_root
-    };
-    let sessions = home.join("defi").join(wallet).join("sessions");
-    for entry in std::fs::read_dir(sessions).ok()? {
-        // Skip an unreadable/corrupt sibling rather than aborting the whole scan.
-        let Ok(entry) = entry else { continue };
-        let path = entry.path();
-        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
-            continue;
-        }
-        let Ok(raw) = std::fs::read_to_string(&path) else {
-            continue;
-        };
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) else {
-            continue;
-        };
-        // Outbox ids are scoped per chain, so bind the review to the chain
-        // being confirmed — a different chain's session must not shadow it.
-        let chain_matches = value.get("chain").and_then(|v| v.as_str()) == Some(chain);
-        let staged = value
-            .get("staged_ids")
-            .and_then(|v| v.as_array())
-            .is_some_and(|ids| ids.iter().any(|id| id.as_str() == Some(outbox_id)));
-        if !chain_matches || !staged {
-            continue;
-        }
-        let id = value
-            .get("id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown")
-            .to_string();
-        let plan_md = value
-            .get("plan_md")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let plan_hash = blake3::hash(plan_md.as_bytes()).to_hex().to_string();
-        let mut summary_lines = vec![format!("DeFi route intent {id}:")];
-        summary_lines.extend(plan_md.lines().filter_map(|line| {
-            let trimmed = line.trim();
-            if trimmed.starts_with("Intent:")
-                || trimmed.starts_with("Chain:")
-                || trimmed.starts_with("Dest chain:")
-                || trimmed.starts_with("Receiver:")
-                || trimmed.starts_with("Token in:")
-                || trimmed.starts_with("Token out:")
-                || trimmed.starts_with("Slippage:")
-                || trimmed.starts_with("Router:")
-                || trimmed.starts_with("Protocols:")
-                || trimmed.starts_with("Tx value:")
-            {
-                Some(trimmed.to_string())
-            } else {
-                None
-            }
-        }));
-        let risk_lines = value
-            .get("policy_checks")
-            .and_then(|v| v.as_array())
-            .into_iter()
-            .flatten()
-            .filter(|check| check.get("outcome").and_then(|v| v.as_str()) == Some("warn"))
-            .filter_map(|check| {
-                let rule = check.get("rule").and_then(|v| v.as_str()).unwrap_or("defi");
-                let message = check.get("message").and_then(|v| v.as_str())?;
-                Some(format!("{rule}: {message}"))
-            })
-            .collect();
-        return Some(DefiReview {
-            id,
-            plan_md,
-            plan_hash,
-            summary_lines,
-            risk_lines,
-        });
-    }
-    None
 }
 
 fn is_policy_session_new(wallet: &str, path: &VfsPath) -> bool {

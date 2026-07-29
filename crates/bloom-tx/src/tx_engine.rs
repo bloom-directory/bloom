@@ -1072,7 +1072,7 @@ impl TxEngine {
                 Ok((contract_addr, U256::ZERO, calldata, None, Some(nft_ref)))
             }
             RawIntentBody::Enso { .. } => Err(TxEngineError::Unimplemented(
-                "Enso intents flow through bloom-defi (not in v1 stage path)".into(),
+                "Enso intents flow through the enso petal (not in tx stage path)".into(),
             )),
         }
     }
@@ -3914,7 +3914,7 @@ impl TxEngine {
     /// encoding pipeline `stage` uses, but the original nonce is
     /// preserved. Fees are bumped at least `bump_pct%` (floored at 10).
     /// Enso-flavoured intents are rejected here for the same reason
-    /// they're rejected in stage — they need bloom-defi's HTTP path.
+    /// they're rejected in stage — they go through the enso petal's HTTP path.
     #[allow(clippy::too_many_arguments)]
     pub async fn replace_with_intent(
         &self,

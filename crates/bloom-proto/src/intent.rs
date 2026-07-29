@@ -208,7 +208,7 @@ impl ShellIntent {
     }
 }
 
-/// Enso intent body (placeholder; full client lives in `bloom-defi`).
+/// Enso intent body (placeholder; full client lives in the enso petal).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EnsoIntent {
     pub intent: String,

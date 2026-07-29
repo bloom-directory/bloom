@@ -35,7 +35,6 @@ use bloom_auth_api::{
 };
 use bloom_evm::{ChainClient, ChainRegistry};
 
-use bloom_defi::EnsoClient;
 use bloom_ens::EnsClient;
 use bloom_etherscan::EtherscanClient;
 use bloom_hyperliquid::{HyperliquidClient, HyperliquidNetwork};
@@ -66,9 +65,9 @@ use bloom_tx::tx_engine::{Eip1559FeeOverrides, TxEngine};
 use bloom_vfs::handlers::outbox::StagedPetalIdentity;
 use bloom_vfs::handlers::status::{MempoolBackendStatus, PrivateRpcBackendStatus};
 use bloom_vfs::handlers::{
-    AddressBookHandler, CentralOutbox, ChainsHandler, DefiHandler, DocsHandler, EnsHandler,
-    HyperliquidHandler, OutboxHandler, PricesHandler, RequestsHandler, SimulateHandler,
-    StatusHandler, ToolsHandler, WalletsHandler, WatchHandler,
+    AddressBookHandler, CentralOutbox, ChainsHandler, DocsHandler, EnsHandler, HyperliquidHandler,
+    OutboxHandler, PricesHandler, RequestsHandler, SimulateHandler, StatusHandler, ToolsHandler,
+    WalletsHandler, WatchHandler,
 };
 use bloom_vfs::{AuthServices, PathCache, Vfs};
 use bloom_watch::{WatchExecutor, WatchRegistry};
@@ -2392,59 +2391,8 @@ impl Daemon {
                 ) as _,
             );
 
-        // DeFi: Enso's public REST works without an API key for chains
-        // they support keyless (currently quote+route on Base mainnet).
-        // Mount whenever an `[enso]` block exists in config; an empty
-        // api_key just means unauthenticated calls (rate-limited).
-        if let Some(enso_cfg) = &config.enso {
-            let mut enso = EnsoClient::new(&enso_cfg.api_key);
-            match url::Url::parse(&enso_cfg.api_url) {
-                Ok(url) => {
-                    debug!(api_url = %url, "daemon.enso_configured");
-                    enso = enso.with_base_url(url);
-                }
-                Err(e) => {
-                    warn!(api_url = %enso_cfg.api_url, error = %e, "daemon.enso_url_invalid_using_default");
-                }
-            }
-            if enso_cfg.api_key.is_empty() {
-                warn!("enso api_key empty; mounting defi/ for keyless access (rate-limited)");
-            }
-            debug!("daemon.defi_mounted");
-            // Hyperliquid deposit goal: bridge address + deposit chain, from
-            // `[hyperliquid]` config when present, else the mainnet defaults.
-            let (hl_bridge, hl_deposit_chain_id) = {
-                let cfg = config.hyperliquid.clone().unwrap_or_default();
-                let bridge = cfg.bridge_address.parse().unwrap_or_else(|_| {
-                    warn!(addr = %cfg.bridge_address, "daemon.hyperliquid_bridge_invalid_using_default");
-                    bloom_proto::hyperliquid::MAINNET_BRIDGE
-                        .parse()
-                        .expect("valid bridge const")
-                });
-                (bridge, cfg.deposit_chain_id)
-            };
-            vfs_builder = vfs_builder.mount(
-                "defi",
-                Arc::new(
-                    DefiHandler::new(
-                        enso,
-                        chains.clone(),
-                        keystore.clone(),
-                        tx_engine.clone(),
-                        address_book_arc.clone(),
-                    )
-                    .with_auth_services(auth_services.clone())
-                    .with_price_oracle(price_oracle.clone())
-                    .with_home_write_permit_opt(home_write_permit.clone())
-                    .with_default_chain(config.default_chain.clone())
-                    .with_store_root(home.root().join("defi"))
-                    .with_revert_decoder(decoder_chain.clone())
-                    .with_hyperliquid(hl_bridge, hl_deposit_chain_id),
-                ) as _,
-            );
-        } else {
-            debug!("daemon.defi_skipped: no [enso] config");
-        }
+        // DeFi (Enso) is now served by the `enso` Petal at `petals/enso/`.
+        // The native DefiHandler and bloom-defi crate have been removed.
 
         // /next.md — brutally-scoped next-action aggregator for agents.
         // Answers: what wallets need attention, what confirms are pending,
@@ -2756,7 +2704,7 @@ impl Daemon {
             home = %home.root().display(),
             chains = ?config.chains.keys().collect::<Vec<_>>(),
             etherscan = etherscan_arc.is_some(),
-            enso = config.enso.is_some(),
+            enso = true, // now served via petal, always available
             ens_resolver = ens_client.is_some(),
             heimdall = cfg!(feature = "bytecode-decompile"),
             "daemon.built"

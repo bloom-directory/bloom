@@ -4,7 +4,7 @@
 //! deliberately-minimal table (majors only) is the single source of truth
 //! for symbol→address and symbol→decimals resolution. It lives in
 //! `bloom-proto` so the send path (`bloom-tx`), the route path
-//! (`bloom-defi`), and the VFS token surface (`bloom-vfs`) all resolve from
+//! the enso petal, and the VFS token surface (`bloom-vfs`) all resolve from
 //! the *same* data instead of three hand-maintained tables that drift.
 //!
 //! Addresses are stored lowercase and re-checksummed by callers at display

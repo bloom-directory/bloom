@@ -213,7 +213,7 @@ jobs:
             --run-ignored ignored-only \
             --no-fail-fast
           cargo nextest run --archive-file target/nextest-archive.tar.zst \
-            -E 'kind(lib) and (package(bloom-defi) or package(bloom-etherscan) or package(bloom-prices))' \
+            -E 'kind(lib) and (package(bloom-etherscan) or package(bloom-prices))' \
             --run-ignored ignored-only \
             --no-fail-fast
           cargo nextest run --archive-file target/nextest-archive.tar.zst \

@@ -1221,7 +1221,7 @@ mod tests {
 // These tests spin up a tiny dispatching JSON-RPC server on `127.0.0.1:0` and
 // point a `ChainClient` at it. We avoid pulling in `mockito`/`wiremock`/etc.
 // — a hand-rolled tokio listener mirrors the pattern used in `bloom-prices`
-// and `bloom-defi`.
+// and the enso petal.
 //
 // Rules for the mock:
 //   * Each test owns its own listener; no global state, no port reuse.
