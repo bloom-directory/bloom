@@ -732,6 +732,11 @@ mod tests {
 
     #[test]
     fn sealed_approval_page_reuses_wallet_registration_design_system() {
+        let normalized_html = CEREMONY_HTML
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+
         for shared_asset in [
             "/wallet-registration-assets/favicon-light.svg",
             "/wallet-registration-assets/fonts/instrument-serif-normal-latin.woff2",
@@ -768,7 +773,7 @@ mod tests {
         assert!(CEREMONY_HTML.contains("id=\"grantExecute\""));
         assert!(CEREMONY_HTML.contains("role=\"status\""));
         assert!(CEREMONY_HTML.contains("<h1 id=\"page-title\">Approve this action?</h1>"));
-        assert!(CEREMONY_HTML.contains("Approve\n            </button>"));
+        assert!(normalized_html.contains("Approve </button>"));
         assert!(!CEREMONY_HTML.contains("Approve with confidence"));
         assert!(!CEREMONY_HTML.contains("Approve grant"));
         assert!(!CEREMONY_HTML.contains("addMeta('Wallet'"));
@@ -780,6 +785,8 @@ mod tests {
         );
         assert!(!CEREMONY_HTML.contains("Ready to approve"));
         assert!(!CEREMONY_HTML.contains("choice-notes"));
+        assert!(CEREMONY_HTML.contains("typeof COLOR_SCHEME_MEDIA.addEventListener==='function'"));
+        assert!(CEREMONY_HTML.contains("typeof COLOR_SCHEME_MEDIA.addListener==='function'"));
         for protocol_hook in [
             "PATH+'/plan.json'",
             "PATH+'/challenge'",

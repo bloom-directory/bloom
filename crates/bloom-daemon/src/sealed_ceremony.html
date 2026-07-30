@@ -215,7 +215,10 @@ function syncFavicon(){
   if(FAVICON_LINK) FAVICON_LINK.href=COLOR_SCHEME_MEDIA&&COLOR_SCHEME_MEDIA.matches?'/wallet-registration-assets/favicon-dark.svg':'/wallet-registration-assets/favicon-light.svg';
 }
 syncFavicon();
-if(COLOR_SCHEME_MEDIA) COLOR_SCHEME_MEDIA.addEventListener('change',syncFavicon);
+if(COLOR_SCHEME_MEDIA){
+  if(typeof COLOR_SCHEME_MEDIA.addEventListener==='function')COLOR_SCHEME_MEDIA.addEventListener('change',syncFavicon);
+  else if(typeof COLOR_SCHEME_MEDIA.addListener==='function')COLOR_SCHEME_MEDIA.addListener(syncFavicon);
+}
 
 var PATH=location.pathname.replace(/\/$/,'');
 function dec(s){s=s.replace(/-/g,'+').replace(/_/g,'/');while(s.length%4)s+='=';var b=atob(s);var u=new Uint8Array(b.length);for(var i=0;i<b.length;i++)u[i]=b.charCodeAt(i);return u;}
