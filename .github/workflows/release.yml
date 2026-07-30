@@ -13,8 +13,9 @@ name: Release
 #      on each of the four native runners. A verify step asserts that
 #      `bloom --version` matches the tag.
 #   4. `publish` verifies the tag still resolves to the built SHA,
-#      downloads the four tarballs, generates SHA256SUMS, and creates
-#      or updates the GitHub release for that existing tag.
+#      downloads the four tarballs, generates SHA256SUMS and release notes
+#      from commits since the previous version tag, then creates or updates
+#      the GitHub release for that existing tag.
 #
 # The floating `latest` git tag is intentionally NOT touched here.
 # GitHub's `/releases/latest/download/<file>` route follows whichever
@@ -219,6 +220,7 @@ jobs:
       - name: Create or update GitHub release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPOSITORY: ${{ github.repository }}
           TAG: ${{ needs.prepare.outputs.release_tag }}
           VERSION: ${{ needs.prepare.outputs.release_version }}
           SHA: ${{ needs.prepare.outputs.release_sha }}
@@ -230,25 +232,57 @@ jobs:
             echo "::error::refusing to publish: tag $TAG resolves to $TAG_SHA, built SHA is $SHA"
             exit 1
           fi
+
+          PREVIOUS_TAG=""
+          while IFS= read -r CANDIDATE; do
+            if [[ "$CANDIDATE" != "$TAG" \
+              && "$CANDIDATE" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              PREVIOUS_TAG="$CANDIDATE"
+              break
+            fi
+          done < <(git tag --merged "$SHA" --sort=-version:refname)
+
+          RANGE="$SHA"
+          CHANGE_HEADING="### Changes"
+          if [[ -n "$PREVIOUS_TAG" ]]; then
+            RANGE="$PREVIOUS_TAG..$SHA"
+            CHANGE_HEADING="### Changes since \`$PREVIOUS_TAG\`"
+          fi
+
           NOTES="$(mktemp)"
           cat > "$NOTES" <<EOF
           ## bloom v$VERSION
 
           Automated release for tag \`$TAG\`.
 
+          $CHANGE_HEADING
+
+          EOF
+          while IFS=$'\t' read -r COMMIT SHORT_SHA SUBJECT; do
+            printf -- '- %s ([`%s`](https://github.com/%s/commit/%s))\n' \
+              "$SUBJECT" "$SHORT_SHA" "$REPOSITORY" "$COMMIT" >> "$NOTES"
+          done < <(git log --first-parent --format='%H%x09%h%x09%s' "$RANGE")
+
+          if [[ -n "$PREVIOUS_TAG" ]]; then
+            printf '\n**Full Changelog**: https://github.com/%s/compare/%s...%s\n' \
+              "$REPOSITORY" "$PREVIOUS_TAG" "$TAG" >> "$NOTES"
+          fi
+
+          cat >> "$NOTES" <<EOF
+
           ### Downloads
 
           Stable per-version URLs — pick the one for your platform:
           \`\`\`
-          https://github.com/${{ github.repository }}/releases/download/$TAG/bloom-linux-x86_64.tar.gz
-          https://github.com/${{ github.repository }}/releases/download/$TAG/bloom-linux-aarch64.tar.gz
-          https://github.com/${{ github.repository }}/releases/download/$TAG/bloom-macos-x86_64.tar.gz
-          https://github.com/${{ github.repository }}/releases/download/$TAG/bloom-macos-aarch64.tar.gz
+          https://github.com/$REPOSITORY/releases/download/$TAG/bloom-linux-x86_64.tar.gz
+          https://github.com/$REPOSITORY/releases/download/$TAG/bloom-linux-aarch64.tar.gz
+          https://github.com/$REPOSITORY/releases/download/$TAG/bloom-macos-x86_64.tar.gz
+          https://github.com/$REPOSITORY/releases/download/$TAG/bloom-macos-aarch64.tar.gz
           \`\`\`
 
           Latest-alias URL (resolves to the release marked latest):
           \`\`\`
-          https://github.com/${{ github.repository }}/releases/latest/download/bloom-linux-x86_64.tar.gz
+          https://github.com/$REPOSITORY/releases/latest/download/bloom-linux-x86_64.tar.gz
           \`\`\`
 
           Verify your download with \`SHA256SUMS\`.
