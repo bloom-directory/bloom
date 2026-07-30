@@ -88,8 +88,6 @@
     .button.secondary{border-color:var(--rule-2);background:var(--surface);color:var(--ink-2);box-shadow:none}
     .button.secondary:hover:not(:disabled){border-color:var(--graphite);background:var(--paper-2);box-shadow:none}
     .button:disabled{opacity:.48;cursor:wait;box-shadow:none}
-    .choice-notes{display:grid;grid-template-columns:1fr 1fr;gap:11px;margin-top:10px}
-    .choice-note{margin:0;padding:0 4px;color:var(--graphite);font-size:10px;line-height:1.45;text-align:center}
     .passkey-hint{display:flex;align-items:flex-start;justify-content:center;gap:7px;margin:15px 7px 0;color:var(--graphite);font-size:11px;line-height:1.45;text-align:center}
     .passkey-hint svg{width:14px;height:14px;flex:0 0 auto;margin-top:1px;color:var(--leaf)}
     #status:empty{display:none}
@@ -116,8 +114,7 @@
       .state-badge{margin-top:16px}
       .panel-header,.section,.actions{padding-left:20px;padding-right:20px}
       .meta-grid{grid-template-columns:1fr}
-      .button-list,.choice-notes{grid-template-columns:1fr}
-      .choice-notes{display:none}
+      .button-list{grid-template-columns:1fr}
       .button{min-height:52px}
       .plan{min-height:110px;max-height:280px;padding:15px;font-size:11px}
     }
@@ -146,7 +143,7 @@
     <div class="layout">
       <section class="intro" aria-labelledby="page-title">
         <p class="eyebrow">Passkey-protected authorization</p>
-        <h1 id="page-title">Approve with confidence.</h1>
+        <h1 id="page-title">Approve this action?</h1>
         <p class="lede">Review exactly what Bloom intends to do, then authorize it with the passkey stored by your device.</p>
         <p class="wallet" id="wallet-name" aria-live="polite">Loading wallet…</p>
 
@@ -197,16 +194,12 @@
           <div class="button-list">
             <button id="grant" class="button" type="button" disabled>
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M12 3 20 7v5c0 4.6-3.1 7.5-8 9-4.9-1.5-8-4.4-8-9V7l8-4Z"/><path d="m8.5 12 2.2 2.2 4.8-5"/></svg>
-              Approve grant
+              Approve
             </button>
             <button id="grantExecute" class="button secondary" type="button" disabled>
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M5 12h13M14 7l5 5-5 5"/></svg>
               Approve &amp; execute
             </button>
-          </div>
-          <div class="choice-notes" aria-hidden="true">
-            <p class="choice-note">Mint a short-lived in-memory grant. The client executes when it retries.</p>
-            <p class="choice-note">Approve and broadcast this sealed action immediately.</p>
           </div>
           <p class="passkey-hint"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><circle cx="8" cy="15" r="4"/><path d="m11 12 8-8M15 8l3 3M17 6l2 2"/></svg>Your device will ask for Touch ID, Windows Hello, or a security key.</p>
           <div id="status" role="status" aria-live="polite"></div>
@@ -263,8 +256,6 @@ async function loadPlan(){
   var p=await r.json();
   var meta=document.getElementById('meta');
   meta.textContent='';
-  addMeta('Wallet',p.wallet||'Unknown');
-  addMeta('Surface',p.surface||'Unknown');
   addMeta('Assurance',p.assurance||'Standard');
   addMeta('Valid until',expiryText(p.expiry_ms));
   addMeta('Action ID',p.action_id||'Unknown');
