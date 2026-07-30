@@ -40,10 +40,6 @@ aggregator expose the current capability and next-action view when the daemon
 has the relevant handlers mounted.
 
 Read `/hyperliquid/README.md` for Hyperliquid trading (session-first).
-For wallet extensions, read `docs/petals.md` to discover the Petals installed
-in this Bloom home, their mount directories, summaries, and declared
-capabilities. Then read the selected Petal's immutable `README.md` and
-`AGENTS.md` before using its routes.
 
 ## Wallets
 
