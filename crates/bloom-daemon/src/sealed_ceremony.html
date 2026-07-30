@@ -256,15 +256,13 @@ async function loadPlan(){
   var p=await r.json();
   var meta=document.getElementById('meta');
   meta.textContent='';
-  addMeta('Assurance',p.assurance||'Standard');
-  addMeta('Valid until',expiryText(p.expiry_ms));
   addMeta('Action ID',p.action_id||'Unknown');
   addMeta('Intent hash',p.intent_hash||'Unknown');
   setText('wallet-name','Wallet · '+(p.wallet||'Unknown'));
   var plan=document.getElementById('plan');
   plan.className='plan';
   plan.textContent=p.plan&&p.plan.length?p.plan:'(no plan text)';
-  setText('state-badge','Ready to approve');
+  setText('state-badge','Valid until '+expiryText(p.expiry_ms));
   setButtons(false);
 }
 async function approve(mode){

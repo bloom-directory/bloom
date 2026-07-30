@@ -773,6 +773,12 @@ mod tests {
         assert!(!CEREMONY_HTML.contains("Approve grant"));
         assert!(!CEREMONY_HTML.contains("addMeta('Wallet'"));
         assert!(!CEREMONY_HTML.contains("addMeta('Surface'"));
+        assert!(!CEREMONY_HTML.contains("addMeta('Assurance'"));
+        assert!(!CEREMONY_HTML.contains("addMeta('Valid until'"));
+        assert!(
+            CEREMONY_HTML.contains("setText('state-badge','Valid until '+expiryText(p.expiry_ms))")
+        );
+        assert!(!CEREMONY_HTML.contains("Ready to approve"));
         assert!(!CEREMONY_HTML.contains("choice-notes"));
         for protocol_hook in [
             "PATH+'/plan.json'",
