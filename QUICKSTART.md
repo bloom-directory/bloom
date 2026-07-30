@@ -208,9 +208,9 @@ it expire after the configured TTL) cancels the stage.
 - **ENS** — recipient names like `vitalik.eth` resolve in tx intents
   via the canonical mainnet registry; forward resolution is also
   exposed at `ens/<name>.eth`.
-- **DeFi intents** — install the
-  [Enso Petal](https://github.com/bloom-directory/bloom-petal-enso), then use
-  `petals/enso/intents/<wallet>/...`. Store the API key through
+- **DeFi intents** — `bloom init` provisions the pinned
+  [Enso Petal](https://github.com/bloom-directory/bloom-petal-enso). Use
+  `petals/enso/intents/<wallet>/...` and store the API key through
   `petals/enso/settings/api-key`; review the route and simulation before the
   Petal confirmation stages anything into the wallet outbox.
 - **Prices** — keyless DefiLlama at `prices/spot/<coin>(.usd)` and

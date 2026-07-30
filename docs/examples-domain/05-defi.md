@@ -1,20 +1,16 @@
 # Enso Petal
 
-Enso route discovery and swap execution are provided by the optional
+Enso route discovery and swap execution are provided by the pre-installed
 [bloom-petal-enso](https://github.com/bloom-directory/bloom-petal-enso)
-package. Bloom core no longer exposes a native `/defi` subtree. Install the
-Petal, inspect its consent summary, and confirm that it appears at
-`/petals/enso/`:
+package. Bloom core no longer exposes a native `/defi` subtree. `bloom init`
+provisions the pinned release. Inspect the installed Petal discovery document
+and confirm that it appears at `/petals/enso/`:
 
 ```sh
-bloom petals install https://github.com/bloom-directory/bloom-petal-enso
+bloom vfs cat /docs/petals.md
 bloom petals ls
 bloom vfs ls /petals/enso
 ```
-
-Source installs execute the package's declared build command as the current
-OS user. Pin an explicit release tag or commit with `--ref` when
-reproducibility matters.
 
 ## Configure the API key
 

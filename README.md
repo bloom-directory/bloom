@@ -144,10 +144,11 @@ A fresh Bloom VFS root exposes these default entries:
 - `prices/{spot,change_24h}/<coin>` — DefiLlama keyless price oracle.
 - `addressbook/<alias>` — local petname directory.
 - `ens/<name>.eth` — ENS forward resolution as a read surface.
-- `petals/` — installed local Petal app surfaces. The default pre-installed
-  Polymarket package is available at `petals/polymarket/`; the optional
-  [Enso Petal](https://github.com/bloom-directory/bloom-petal-enso) is
-  available at `petals/enso/` after installation.
+- `petals/` — installed local Petal app surfaces. `bloom init` provisions the
+  pinned Polymarket, Near Intents, and
+  [Enso](https://github.com/bloom-directory/bloom-petal-enso) packages.
+  Read `docs/petals.md` in the VFS for the exact installed set, mount
+  directories, summaries, and declared capabilities.
 - `requests/` — free and paid HTTP requests. Paid HTTP 402 challenges are
   staged under `pending/`, exposed as `plan.md`, and only signed after a
   confirm write.

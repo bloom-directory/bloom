@@ -2270,6 +2270,9 @@ impl Daemon {
         };
         let petal_app_host = Arc::new(petal_app_host);
         debug!(root = %petals_root.display(), "daemon.petals_initialised");
+        let petals_for_docs = petals.clone();
+        let petals_doc_renderer: Arc<dyn Fn() -> Vec<u8> + Send + Sync> =
+            Arc::new(move || render_installed_petals_doc(&petals_for_docs));
 
         let mut vfs_builder = Vfs::builder()
             .mount(
@@ -2359,7 +2362,10 @@ impl Daemon {
                 ) as _,
             )
             .mount("status", status_handler.clone() as _)
-            .mount("docs", Arc::new(DocsHandler::new()) as _)
+            .mount(
+                "docs",
+                Arc::new(DocsHandler::new().with_petals_renderer(petals_doc_renderer)) as _,
+            )
             .mount(
                 "simulate",
                 Arc::new(SimulateHandler::new(
@@ -2390,9 +2396,6 @@ impl Daemon {
                         .map_err(|e| DaemonError::Audit(e.to_string()))?,
                 ) as _,
             );
-
-        // DeFi (Enso) is now served by the `enso` Petal at `petals/enso/`.
-        // The native DefiHandler and bloom-defi crate have been removed.
 
         // /next.md — brutally-scoped next-action aggregator for agents.
         // Answers: what wallets need attention, what confirms are pending,
@@ -2704,7 +2707,6 @@ impl Daemon {
             home = %home.root().display(),
             chains = ?config.chains.keys().collect::<Vec<_>>(),
             etherscan = etherscan_arc.is_some(),
-            enso = true, // now served via petal, always available
             ens_resolver = ens_client.is_some(),
             heimdall = cfg!(feature = "bytecode-decompile"),
             "daemon.built"
@@ -2957,6 +2959,61 @@ fn pick_ens_client(chains: &ChainRegistry) -> Option<EnsClient> {
     None
 }
 
+fn render_installed_petals_doc(petals: &PetalRunner) -> Vec<u8> {
+    match petals.installed_petal_discovery() {
+        Ok(installed) => render_petal_discovery_markdown(&installed),
+        Err(error) => {
+            warn!(error = %error, "daemon.petals_docs_render_failed");
+            format!(
+                "# Installed Petals\n\n\
+                 Bloom could not read the installed Petal manifests: `{error}`\n"
+            )
+            .into_bytes()
+        }
+    }
+}
+
+fn render_petal_discovery_markdown(installed: &[bloom_petals::package::PetalDiscovery]) -> Vec<u8> {
+    let mut markdown = String::from(
+        "# Installed Petals\n\n\
+         This file is generated from the immutable `petal.toml` manifests of \
+         the Petals installed in this Bloom home.\n\n",
+    );
+    if installed.is_empty() {
+        markdown.push_str("No Petals are currently installed.\n");
+        return markdown.into_bytes();
+    }
+
+    for petal in installed {
+        let summary = petal
+            .summary
+            .as_deref()
+            .map(|summary| summary.split_whitespace().collect::<Vec<_>>().join(" "))
+            .filter(|summary| !summary.is_empty())
+            .unwrap_or_else(|| "No consent summary was declared.".to_string());
+        let capabilities = if petal.capabilities.is_empty() {
+            "none".to_string()
+        } else {
+            petal
+                .capabilities
+                .iter()
+                .map(|capability| format!("`{capability}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        markdown.push_str(&format!(
+            "## `{name}`\n\n\
+             - Directory: `petals/{name}/`\n\
+             - Summary: {summary}\n\
+             - Declared capabilities: {capabilities}\n\
+             - Package documentation: `petals/{name}/README.md`, \
+             `petals/{name}/AGENTS.md`\n\n",
+            name = petal.name,
+        ));
+    }
+    markdown.into_bytes()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2983,6 +3040,21 @@ mod tests {
             bloom_tx::TxEngineError::ApprovalRequired(requirement),
             bloom_tx::TxEngineError::ApprovalRequired(_)
         ));
+    }
+
+    #[test]
+    fn installed_petal_markdown_exposes_mount_summary_and_capabilities() {
+        let markdown = render_petal_discovery_markdown(&[bloom_petals::package::PetalDiscovery {
+            name: "enso".into(),
+            summary: Some("Request routes,\n simulate, and stage swap transactions.".into()),
+            capabilities: vec!["bloom:chain".into(), "bloom:tx.outbox".into()],
+        }]);
+        let markdown = String::from_utf8(markdown).unwrap();
+        assert!(markdown.contains("## `enso`"));
+        assert!(markdown.contains("`petals/enso/`"));
+        assert!(markdown.contains("Request routes, simulate, and stage swap transactions."));
+        assert!(markdown.contains("`bloom:chain`, `bloom:tx.outbox`"));
+        assert!(markdown.contains("`petals/enso/README.md`"));
     }
 
     #[test]

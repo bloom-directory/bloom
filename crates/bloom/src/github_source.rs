@@ -16,6 +16,7 @@ use url::Url;
 const TRUSTED_GITHUB_OWNER: &str = "bloom-directory";
 const POLYMARKET_PARITY_COMMIT: &str = "e2e898b69046c9f5d905dd2cd66b3a57ef195542";
 const NEAR_INTENTS_RELEASE_COMMIT: &str = "08e9bd83786425656bdd87e35031030cb7f3dc14";
+const ENSO_RELEASE_COMMIT: &str = "59e3c884f83c9c97b69b1b415becf8572791273b";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PreinstalledPetal {
@@ -43,6 +44,15 @@ const PREINSTALLED_NEAR_INTENTS: PreinstalledPetal = PreinstalledPetal {
     release_tag: "v0.1.1",
     archive: "near-intents-v0.1.1.petal.tar.gz",
     expected_hash: Some("c3f714c01e17f642b8add45b7501d6675c851a13210ce9e834fd16d23330f166"),
+};
+
+const PREINSTALLED_ENSO: PreinstalledPetal = PreinstalledPetal {
+    name: "enso",
+    repository: "https://github.com/bloom-directory/bloom-petal-enso",
+    commit: ENSO_RELEASE_COMMIT,
+    release_tag: "v0.1.2",
+    archive: "enso-v0.1.2.petal.tar.gz",
+    expected_hash: Some("82e541b237cd8dde0a566dfca7f3d20d6e688aacd23f62b1d0f1306f9c76ecb7"),
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -560,6 +570,7 @@ fn preinstalled_petal(name: &str) -> Option<&'static PreinstalledPetal> {
     match name {
         "polymarket" => Some(&PREINSTALLED_POLYMARKET),
         "near-intents" => Some(&PREINSTALLED_NEAR_INTENTS),
+        "enso" => Some(&PREINSTALLED_ENSO),
         _ => None,
     }
 }
@@ -1021,6 +1032,11 @@ mod tests {
         assert_eq!(near.commit.len(), 40);
         assert_eq!(near.archive, "near-intents-v0.1.1.petal.tar.gz");
         assert!(near.repository.ends_with("/bloom-petal-near"));
+        let enso = preinstalled_petal("enso").unwrap();
+        assert_eq!(enso.release_tag, "v0.1.2");
+        assert_eq!(enso.commit, ENSO_RELEASE_COMMIT);
+        assert_eq!(enso.archive, "enso-v0.1.2.petal.tar.gz");
+        assert!(enso.repository.ends_with("/bloom-petal-enso"));
         assert!(preinstalled_petal("unknown").is_none());
     }
 

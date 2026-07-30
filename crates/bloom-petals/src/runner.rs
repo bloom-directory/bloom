@@ -19,9 +19,9 @@ use crate::error::PetalError;
 use crate::host::{DenyHost, HostError, HostVfsEntry, HostVfsEntryKind, PetalHost};
 use crate::meta::Capability;
 use crate::package::{
-    InstallRouteMetadata, RouteAbi, RouteEntryKind, RouteIndex, RouteIndexRecord, RouteOp,
-    narrow_runtime_route_metadata, sign_intents_from_manifest_toml,
-    store_policy_from_manifest_toml,
+    InstallRouteMetadata, PetalDiscovery, RouteAbi, RouteEntryKind, RouteIndex, RouteIndexRecord,
+    RouteOp, narrow_runtime_route_metadata, petal_discovery_from_manifest_toml,
+    sign_intents_from_manifest_toml, store_policy_from_manifest_toml,
 };
 use crate::policy::NetPolicy;
 use crate::registry::NameRegistry;
@@ -321,6 +321,25 @@ impl PetalRunner {
 
     pub fn local_petal_mounts(&self) -> Result<Vec<(String, String)>, PetalError> {
         self.store.list_petal_owners()
+    }
+
+    /// Return installed Petals as agent-facing discovery records sourced from
+    /// each immutable installed package's retained `petal.toml`.
+    pub fn installed_petal_discovery(&self) -> Result<Vec<PetalDiscovery>, PetalError> {
+        let mut installed = Vec::new();
+        for (mount, hash) in self.store.list_petal_owners()? {
+            let manifest =
+                std::fs::read(self.store.package_path(&hash)?.join("source/petal.toml"))?;
+            let discovery = petal_discovery_from_manifest_toml(&manifest)?;
+            if discovery.name != mount {
+                return Err(PetalError::InvalidWasm(format!(
+                    "installed Petal mount {mount:?} does not match manifest name {:?}",
+                    discovery.name
+                )));
+            }
+            installed.push(discovery);
+        }
+        Ok(installed)
     }
 
     pub fn resolve_petal_mount(&self, mount: &str) -> Result<String, PetalError> {
@@ -807,6 +826,12 @@ mod tests {
             "petal.toml",
             br#"schema = "bloom.petal.package.v1"
 name = "echo"
+
+[consent]
+summary = "Echo values for discovery tests."
+
+[caps]
+allowed = ["bloom:vfs.read"]
 "#,
         );
         write_package_file(&package, "README.md", b"# echo");
@@ -843,6 +868,22 @@ name = "echo"
 
         assert_eq!(r.resolve(&hash).unwrap(), hash);
         assert_eq!(r.resolve("echo").unwrap(), hash);
+    }
+
+    #[test]
+    fn installed_petal_discovery_reads_retained_manifest_metadata() {
+        let (dir, r) = runner();
+        install_echo_app(&dir, &r);
+
+        let installed = r.installed_petal_discovery().unwrap();
+        assert_eq!(
+            installed,
+            vec![PetalDiscovery {
+                name: "echo".into(),
+                summary: Some("Echo values for discovery tests.".into()),
+                capabilities: vec!["bloom:vfs.read".into()],
+            }]
+        );
     }
 
     #[test]

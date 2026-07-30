@@ -16,8 +16,9 @@ All paths below are relative to the Bloom VFS root.
 - `defi/intents/` — Enso-mediated DeFi intents (write `quote` / `execute`).
 - `hyperliquid/` — HyperCore reads plus signed exchange and agent-session
   writes; read `hyperliquid/README.md` for the mounted workflow documentation.
-- `petals/<name>/` — installed external Petal surfaces. Polymarket is provided
-  by the default pre-installed package at `petals/polymarket/`, not built in.
+- `petals/<name>/` — installed wallet extensions. Read `docs/petals.md` for
+  the exact installed names, mount directories, consent summaries, and
+  declared capabilities.
 - `watch/` — long-running subscriptions (head, addr, log) executed by the
   daemon and persisted to JSONL.
 - `simulate/` — out-of-band tx simulation with state overrides
@@ -265,8 +266,8 @@ echo replace > /bloom/wallets/alice/chains/ethereum/outbox/pending/<id>/replace
 echo cancel  > /bloom/wallets/alice/chains/ethereum/outbox/pending/<id>/cancel
 ```
 
-The optional Enso Petal accepts natural-language or JSON swap intents at its
-own application mount:
+The pre-installed Enso Petal accepts natural-language or JSON swap intents at
+its own application mount:
 
 ```sh
 echo 'swap 0.1 eth to USDC on base' \

@@ -1,6 +1,7 @@
 //! `docs/` — vendored markdown docs about how to use the FS.
 
 use async_trait::async_trait;
+use std::sync::Arc;
 
 use crate::handler::{Entry, Handler, HandlerError};
 use crate::path::VfsPath;
@@ -9,6 +10,7 @@ use crate::path::VfsPath;
 pub struct DocsHandler {
     readme: String,
     examples: String,
+    petals: Arc<dyn Fn() -> Vec<u8> + Send + Sync>,
 }
 
 impl Default for DocsHandler {
@@ -16,6 +18,9 @@ impl Default for DocsHandler {
         Self {
             readme: include_str!("../docs/README.md").to_string(),
             examples: include_str!("../docs/examples.md").to_string(),
+            petals: Arc::new(|| {
+                b"# Installed Petals\n\nNo Petals are currently installed.\n".to_vec()
+            }),
         }
     }
 }
@@ -23,6 +28,14 @@ impl Default for DocsHandler {
 impl DocsHandler {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn with_petals_renderer(
+        mut self,
+        renderer: Arc<dyn Fn() -> Vec<u8> + Send + Sync>,
+    ) -> Self {
+        self.petals = renderer;
+        self
     }
 }
 
@@ -59,6 +72,7 @@ impl DocsHandler {
             [] => Ok(Entry::dir("")),
             [s] if s == "README.md" => Ok(Entry::file("README.md")),
             [s] if s == "examples.md" => Ok(Entry::file("examples.md")),
+            [s] if s == "petals.md" => Ok(Entry::file("petals.md")),
             _ => Err(HandlerError::not_found(path.to_string_path())),
         }
     }
@@ -67,13 +81,18 @@ impl DocsHandler {
         match path.segments() {
             [s] if s == "README.md" => Ok(self.readme.as_bytes().to_vec()),
             [s] if s == "examples.md" => Ok(self.examples.as_bytes().to_vec()),
+            [s] if s == "petals.md" => Ok((self.petals)()),
             _ => Err(HandlerError::NotAFile(path.to_string_path())),
         }
     }
 
     async fn list_inner(&self, path: &VfsPath) -> Result<Vec<Entry>, HandlerError> {
         if path.is_root() {
-            Ok(vec![Entry::file("README.md"), Entry::file("examples.md")])
+            Ok(vec![
+                Entry::file("README.md"),
+                Entry::file("examples.md"),
+                Entry::file("petals.md"),
+            ])
         } else {
             Err(HandlerError::NotADir(path.to_string_path()))
         }
@@ -86,11 +105,11 @@ mod tests {
     use crate::handler::EntryKind;
 
     #[tokio::test]
-    async fn root_lists_only_readme_and_examples() {
+    async fn root_lists_embedded_and_dynamic_docs() {
         let h = DocsHandler::new();
         let entries = h.list(&VfsPath::root()).await.unwrap();
         let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
-        assert_eq!(names, ["README.md", "examples.md"]);
+        assert_eq!(names, ["README.md", "examples.md", "petals.md"]);
         for e in &entries {
             assert_eq!(e.kind, EntryKind::File);
             // Entry::file => read-only mode.
@@ -119,7 +138,7 @@ mod tests {
     #[tokio::test]
     async fn lookup_known_files_are_files() {
         let h = DocsHandler::new();
-        for name in ["README.md", "examples.md"] {
+        for name in ["README.md", "examples.md", "petals.md"] {
             let p = VfsPath::parse(&format!("/{name}")).unwrap();
             let e = h.lookup(&p).await.unwrap();
             assert_eq!(e.kind, EntryKind::File);
@@ -175,6 +194,22 @@ mod tests {
             .unwrap();
         assert!(!examples.is_empty(), "examples.md must have content");
         assert!(std::str::from_utf8(&examples).is_ok());
+    }
+
+    #[tokio::test]
+    async fn petals_doc_is_rendered_at_read_time() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let renderer_calls = calls.clone();
+        let h = DocsHandler::new().with_petals_renderer(Arc::new(move || {
+            let call = renderer_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            format!("# Installed Petals\n\nrender {call}\n").into_bytes()
+        }));
+        let path = VfsPath::parse("/petals.md").unwrap();
+
+        let first = String::from_utf8(h.read(&path).await.unwrap()).unwrap();
+        let second = String::from_utf8(h.read(&path).await.unwrap()).unwrap();
+        assert!(first.contains("render 1"));
+        assert!(second.contains("render 2"));
     }
 
     #[tokio::test]

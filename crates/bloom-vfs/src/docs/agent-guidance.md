@@ -10,6 +10,7 @@ Useful commands:
 - `ls docs` lists the embedded documentation.
 - `cat docs/README.md` reads the VFS overview.
 - `cat docs/examples.md` reads workflow examples.
+- `cat docs/petals.md` discovers the Petals installed in this Bloom home.
 
 For more information, start in the `docs` folder. It contains the canonical
 VFS usage notes and examples exposed by the mounted tree.
@@ -39,12 +40,10 @@ aggregator expose the current capability and next-action view when the daemon
 has the relevant handlers mounted.
 
 Read `/hyperliquid/README.md` for Hyperliquid trading (session-first).
-If the external Polymarket Petal is installed, start with
-`cat petals/polymarket/README.md`, read `petals/polymarket/AGENTS.md`, then
-inspect `petals/polymarket/meta/route-contract.json` and list its route tree
-before using its prediction-market routes.
-When the Enso Petal is installed, read `/petals/enso/README.md` and use its
-documented intent, review, simulation, and confirmation lifecycle.
+For wallet extensions, read `docs/petals.md` to discover the Petals installed
+in this Bloom home, their mount directories, summaries, and declared
+capabilities. Then read the selected Petal's immutable `README.md` and
+`AGENTS.md` before using its routes.
 
 ## Wallets
 
@@ -285,16 +284,24 @@ Hyperliquid trading uses Sealed Approval for owner authority:
   Generic owner-signed order/cancel/update-leverage writes are disabled; use
   agent sessions.
 
-## Polymarket Petal
+## Petals
 
-Polymarket is not built into Bloom. `bloom init` provisions the pinned default
-`bloom-directory/bloom-petal-polymarket` package at `/petals/polymarket/`.
-Start with `cat petals/polymarket/README.md`; also read
-`petals/polymarket/AGENTS.md` and inspect
-`petals/polymarket/meta/route-contract.json` for the current onboarding, policy,
-approval, and trading workflow. The README and AGENTS files are immutable
-documents from the installed package. Do not use the removed `/polymarket`
-paths or `bloom polymarket` commands.
+Petals are installed wallet extensions. They add application-specific routes
+under `petals/<name>/` while using Bloom's wallet, policy, approval, network,
+storage, and transaction capabilities.
+
+Installed Petals vary by Bloom home; do not assume a particular extension is
+present. Read `docs/petals.md` first. It is generated from the immutable
+`petal.toml` manifests of the currently installed packages and lists:
+
+- the installed Petal name and its `petals/<name>/` directory;
+- the package's `[consent].summary`; and
+- the capabilities declared by that package.
+
+After choosing a Petal, read `petals/<name>/README.md` and
+`petals/<name>/AGENTS.md`, then list its directory to discover the current
+route tree. Treat those package documents as authoritative for its workflows
+and review requirements.
 
 ## Passkey policy mode
 

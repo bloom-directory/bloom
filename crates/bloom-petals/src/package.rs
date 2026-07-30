@@ -256,6 +256,15 @@ pub struct PetalConsentSummary {
     pub routes: Vec<PetalConsentRoute>,
 }
 
+/// Agent-facing identity and capability metadata retained in an installed
+/// package's `source/petal.toml`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PetalDiscovery {
+    pub name: String,
+    pub summary: Option<String>,
+    pub capabilities: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PetalConsentNetRule {
     pub binding: Option<String>,
@@ -1016,6 +1025,23 @@ pub fn petal_consent_summary(
         sign_intents,
         store_namespaces,
         routes,
+    })
+}
+
+/// Read the discovery fields agents need directly from an installed package
+/// manifest. Installed packages retain the validated source `petal.toml`, so
+/// this remains the single source of truth for both consent and documentation.
+pub fn petal_discovery_from_manifest_toml(bytes: &[u8]) -> Result<PetalDiscovery, PetalError> {
+    let manifest_toml = std::str::from_utf8(bytes)
+        .map_err(|_| PetalError::InvalidWasm("petal.toml is not utf-8".into()))?;
+    let manifest: PetalToml = toml::from_str(manifest_toml)?;
+    let mut capabilities = manifest.caps.allowed;
+    capabilities.sort();
+    capabilities.dedup();
+    Ok(PetalDiscovery {
+        name: manifest.name,
+        summary: manifest.consent.summary,
+        capabilities,
     })
 }
 

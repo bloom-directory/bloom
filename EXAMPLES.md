@@ -1030,12 +1030,12 @@ timestamp on each `live` / `history` record.
 
 ## 9. Enso Petal
 
-Enso swaps are supplied by the optional
+Enso swaps are supplied by the pre-installed
 [bloom-petal-enso](https://github.com/bloom-directory/bloom-petal-enso)
-package, not a native Bloom core handler. Install it and provision the API key:
+package, not a native Bloom core handler. `bloom init` provisions the pinned
+release. Provision the API key:
 
 ```sh
-bloom petals install https://github.com/bloom-directory/bloom-petal-enso
 bloom vfs write /petals/enso/settings/api-key --data 'your-enso-api-key'
 ```
 

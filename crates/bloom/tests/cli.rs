@@ -366,6 +366,27 @@ fn vfs_cat_root_agent_guidance_returns_identical_content() {
 }
 
 #[test]
+fn docs_petals_discovers_installed_package_from_manifest() {
+    let home = fresh_home();
+    let package = home.path().join("demo-petal");
+    write_demo_petal_package(&package);
+    bloom_cmd(home.path())
+        .args(["petals", "install", package.to_str().unwrap()])
+        .assert()
+        .success();
+
+    bloom_cmd(home.path())
+        .args(["vfs", "cat", "/docs/petals.md"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("## `demo`"))
+        .stdout(predicate::str::contains("`petals/demo/`"))
+        .stdout(predicate::str::contains("Demo app used by CLI tests."))
+        .stdout(predicate::str::contains("Declared capabilities: none"))
+        .stdout(predicate::str::contains("`petals/demo/README.md`"));
+}
+
+#[test]
 fn vfs_ls_status_lists_known_files() {
     let home = fresh_home();
     let assert = bloom_cmd(home.path())
