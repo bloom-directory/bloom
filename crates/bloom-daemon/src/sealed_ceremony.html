@@ -1,126 +1,341 @@
 <!doctype html>
 <html lang="en">
 <head>
-<meta charset="utf-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>Bloom Sealed Approval</title>
-<style>
-  :root { color-scheme: light dark; }
-  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-         max-width: 640px; margin: 2rem auto; padding: 0 1rem; line-height: 1.5; }
-  h1 { font-size: 1.3rem; }
-  .card { border: 1px solid rgba(128,128,128,.35); border-radius: 10px; padding: 1rem 1.2rem; margin: 1rem 0; }
-  .plan { white-space: pre-wrap; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-          font-size: .9rem; background: rgba(128,128,128,.1); padding: .8rem; border-radius: 8px; }
-  .kv { font-family: ui-monospace, monospace; font-size: .82rem; word-break: break-all; }
-  .kv b { font-family: inherit; }
-  button { font-size: 1rem; padding: .6rem 1rem; border-radius: 8px; border: 1px solid rgba(128,128,128,.5);
-           cursor: pointer; margin-right: .6rem; margin-top: .4rem; }
-  button.primary { background: #2563eb; color: #fff; border-color: #2563eb; }
-  button:disabled { opacity: .5; cursor: default; }
-  #status { margin-top: 1rem; font-weight: 600; }
-  .ok { color: #16a34a; } .err { color: #dc2626; }
-  .muted { opacity: .7; font-size: .85rem; }
-</style>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#f4efe6">
+  <meta name="referrer" content="no-referrer">
+  <title>/bloom — Sealed Approval</title>
+  <link rel="icon" type="image/svg+xml" href="/wallet-registration-assets/favicon-light.svg" data-favicon-link>
+  <style>
+    @font-face{font-family:"Instrument Serif";font-style:normal;font-weight:400;font-display:swap;src:url("/wallet-registration-assets/fonts/instrument-serif-normal-latin.woff2") format("woff2")}
+    @font-face{font-family:"Instrument Serif";font-style:italic;font-weight:400;font-display:swap;src:url("/wallet-registration-assets/fonts/instrument-serif-italic-latin.woff2") format("woff2")}
+    @font-face{font-family:"Inter Tight";font-style:normal;font-weight:300 600;font-display:swap;src:url("/wallet-registration-assets/fonts/inter-tight-latin.woff2") format("woff2")}
+    @font-face{font-family:"JetBrains Mono";font-style:normal;font-weight:300 500;font-display:swap;src:url("/wallet-registration-assets/fonts/jetbrains-mono-latin.woff2") format("woff2")}
+    :root{
+      --paper:#f4efe6;
+      --paper-2:#ece4d6;
+      --surface:#faf7f1;
+      --ink:#15130f;
+      --ink-2:#342d24;
+      --graphite:#706757;
+      --muted:#9a907f;
+      --rule:#d5c9b6;
+      --rule-2:#c4b59d;
+      --leaf:#526f51;
+      --leaf-2:#2f4f3b;
+      --accent:#8a2a3a;
+      --accent-deep:#5e1a26;
+      --success:#355f47;
+      --success-bg:#e2eadf;
+      --error:#7a2230;
+      --error-bg:#f2dfe0;
+      --serif:"Instrument Serif","Iowan Old Style","Palatino Linotype",Georgia,serif;
+      --sans:"Inter Tight",Inter,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+      --mono:"JetBrains Mono","SFMono-Regular",Consolas,"Liberation Mono",monospace;
+    }
+    *{box-sizing:border-box}
+    html{min-height:100%;background:var(--paper);color:var(--ink);-webkit-text-size-adjust:100%}
+    body{min-height:100vh;min-height:100svh;margin:0;font-family:var(--sans);font-size:16px;line-height:1.5;-webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility;overflow-x:hidden}
+    body::before{content:"";position:fixed;inset:0;pointer-events:none;background:linear-gradient(115deg,rgba(255,255,255,.62),transparent 35%),linear-gradient(180deg,rgba(82,111,81,.08),transparent 48%),linear-gradient(0deg,rgba(138,42,58,.055),transparent 38%)}
+    body::after{content:"";position:fixed;width:440px;height:440px;right:-180px;top:-190px;border:1px solid rgba(138,42,58,.13);border-radius:50%;box-shadow:0 0 0 72px rgba(138,42,58,.025),0 0 0 144px rgba(82,111,81,.02);pointer-events:none}
+    button{font:inherit;touch-action:manipulation}
+    button:focus-visible{outline:3px solid rgba(138,42,58,.2);outline-offset:3px}
+    .page{position:relative;z-index:1;width:min(1180px,100%);min-height:100vh;min-height:100svh;margin:0 auto;padding:28px clamp(20px,4vw,56px) clamp(32px,5vw,64px)}
+    .brand-lockup{display:inline-flex;min-width:0;align-items:center;gap:10px;color:var(--ink);font-family:var(--mono);font-size:12px;line-height:1.15;text-decoration:none;text-transform:uppercase}
+    .brand-mark{width:30px;height:30px;flex:0 0 auto}
+    .brand-lockup strong{color:var(--accent-deep);font-weight:600}
+    .layout{display:grid;grid-template-columns:minmax(280px,.72fr) minmax(480px,1fr);gap:clamp(48px,8vw,108px);align-items:start;margin-top:32px}
+    .intro{position:sticky;top:28px;padding-top:12px}
+    .eyebrow{margin:0 0 17px;color:var(--accent);font-family:var(--mono);font-size:11px;font-weight:500;letter-spacing:.06em;text-transform:uppercase}
+    h1{width:100%;max-width:none;margin:0;font-family:var(--serif);font-size:clamp(52px,6.1vw,76px);font-style:italic;font-weight:400;line-height:.94;letter-spacing:-.025em;text-wrap:balance}
+    .lede{max-width:28rem;margin:24px 0 0;color:var(--ink-2);font-size:18px;line-height:1.48}
+    .wallet{display:inline-flex;max-width:100%;align-items:center;gap:9px;margin:28px 0 0;padding:8px 12px;border:1px solid var(--rule);border-radius:999px;background:rgba(250,247,241,.64);color:var(--ink-2);font-family:var(--mono);font-size:11px;overflow-wrap:anywhere}
+    .wallet::before{content:"";width:7px;height:7px;flex:0 0 auto;border-radius:50%;background:var(--leaf);box-shadow:0 0 0 4px rgba(82,111,81,.12)}
+    .trust-list{display:grid;gap:15px;margin:40px 0 0;padding:25px 0 0;border-top:1px solid var(--rule)}
+    .trust-item{display:grid;grid-template-columns:26px 1fr;gap:11px;align-items:start;color:var(--graphite);font-size:13px;line-height:1.45}
+    .trust-item svg{width:20px;height:20px;margin-top:1px;color:var(--leaf)}
+    .trust-item strong{display:block;margin-bottom:2px;color:var(--ink-2);font-size:14px;font-weight:600}
+    .panel{overflow:hidden;border:1px solid var(--rule-2);border-radius:18px;background:rgba(250,247,241,.91);box-shadow:0 24px 70px rgba(52,45,36,.09),0 2px 8px rgba(52,45,36,.04);backdrop-filter:blur(12px)}
+    .panel-header{display:flex;align-items:flex-start;justify-content:space-between;gap:22px;padding:27px 30px 23px;border-bottom:1px solid var(--rule);background:rgba(236,228,214,.38)}
+    .panel-kicker{margin:0 0 6px;color:var(--graphite);font-family:var(--mono);font-size:10px;letter-spacing:.08em;text-transform:uppercase}
+    .panel-title{margin:0;font-family:var(--serif);font-size:30px;font-weight:400;line-height:1.15}
+    .panel-copy{margin:7px 0 0;color:var(--graphite);font-size:13px}
+    .state-badge{display:inline-flex;flex:0 0 auto;align-items:center;gap:7px;margin-top:2px;padding:7px 10px;border:1px solid rgba(82,111,81,.25);border-radius:999px;background:rgba(226,234,223,.72);color:var(--leaf-2);font-family:var(--mono);font-size:9px;font-weight:500;letter-spacing:.05em;text-transform:uppercase}
+    .state-badge::before{content:"";width:6px;height:6px;border-radius:50%;background:var(--leaf)}
+    .section{padding:25px 30px;border-bottom:1px solid var(--rule)}
+    .section-heading{display:flex;align-items:center;gap:10px;margin:0 0 18px}
+    .section-icon{display:grid;width:30px;height:30px;flex:0 0 auto;place-items:center;border:1px solid var(--rule);border-radius:50%;color:var(--accent);background:var(--paper)}
+    .section-icon svg{width:15px;height:15px}
+    .section-label{margin:0;color:var(--ink);font-family:var(--mono);font-size:11px;font-weight:500;letter-spacing:.05em;text-transform:uppercase}
+    .meta-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:11px}
+    .meta-item{min-width:0;padding:12px 13px;border:1px solid var(--rule);border-radius:8px;background:rgba(244,239,230,.58)}
+    .meta-label{display:block;margin:0 0 5px;color:var(--graphite);font-family:var(--mono);font-size:9px;letter-spacing:.06em;text-transform:uppercase}
+    .meta-value{display:block;color:var(--ink-2);font-family:var(--mono);font-size:11px;line-height:1.45;overflow-wrap:anywhere}
+    .plan-wrap{position:relative;overflow:hidden;border:1px solid var(--rule-2);border-radius:10px;background:var(--ink)}
+    .plan-topbar{display:flex;align-items:center;gap:6px;padding:10px 12px;border-bottom:1px solid rgba(255,255,255,.1);background:#201d18}
+    .plan-dot{width:6px;height:6px;border-radius:50%;background:#716b62}
+    .plan-file{margin-left:5px;color:#bdb4a5;font-family:var(--mono);font-size:9px;letter-spacing:.05em;text-transform:uppercase}
+    .plan{min-height:124px;max-height:340px;margin:0;padding:17px 18px;overflow:auto;color:#eee7dc;font-family:var(--mono);font-size:12px;line-height:1.62;white-space:pre-wrap;overflow-wrap:anywhere;tab-size:2}
+    .plan.loading{color:#aaa195}
+    .plan.error{color:#e5a9b1}
+    .actions{padding:26px 30px 29px;background:rgba(236,228,214,.22)}
+    .button-list{display:grid;grid-template-columns:1fr 1fr;gap:11px}
+    .button{display:flex;width:100%;min-height:50px;align-items:center;justify-content:center;gap:9px;padding:13px 15px;border:1px solid var(--accent);border-radius:9px;background:var(--accent);color:var(--paper);font-family:var(--mono);font-size:11px;font-weight:500;letter-spacing:.01em;cursor:pointer;box-shadow:0 8px 20px rgba(94,26,38,.17);transition:transform 160ms ease,background 160ms ease,box-shadow 160ms ease,opacity 160ms ease}
+    .button svg{width:16px;height:16px;flex:0 0 auto}
+    .button:hover:not(:disabled){transform:translateY(-1px);background:var(--accent-deep);border-color:var(--accent-deep);box-shadow:0 11px 24px rgba(94,26,38,.22)}
+    .button:active:not(:disabled){transform:translateY(0)}
+    .button.secondary{border-color:var(--rule-2);background:var(--surface);color:var(--ink-2);box-shadow:none}
+    .button.secondary:hover:not(:disabled){border-color:var(--graphite);background:var(--paper-2);box-shadow:none}
+    .button:disabled{opacity:.48;cursor:wait;box-shadow:none}
+    .choice-notes{display:grid;grid-template-columns:1fr 1fr;gap:11px;margin-top:10px}
+    .choice-note{margin:0;padding:0 4px;color:var(--graphite);font-size:10px;line-height:1.45;text-align:center}
+    .passkey-hint{display:flex;align-items:flex-start;justify-content:center;gap:7px;margin:15px 7px 0;color:var(--graphite);font-size:11px;line-height:1.45;text-align:center}
+    .passkey-hint svg{width:14px;height:14px;flex:0 0 auto;margin-top:1px;color:var(--leaf)}
+    #status:empty{display:none}
+    #status{margin:14px 0 0;padding:13px 15px;border:1px solid var(--rule);border-radius:8px;background:var(--paper);color:var(--ink-2);font-size:12px;line-height:1.5;overflow-wrap:anywhere}
+    #status.ok{border-color:rgba(53,95,71,.25);background:var(--success-bg);color:var(--success)}
+    #status.err{border-color:rgba(122,34,48,.2);background:var(--error-bg);color:var(--error)}
+    @media(max-width:940px){
+      .page{padding-top:24px}
+      .layout{grid-template-columns:1fr;gap:34px;margin-top:30px}
+      .intro{position:static;padding-top:0}
+      h1{font-size:clamp(48px,11vw,68px)}
+      .lede{font-size:17px}
+      .trust-list{grid-template-columns:repeat(2,minmax(0,1fr));margin-top:30px}
+    }
+    @media(max-width:560px){
+      .page{padding:19px 14px 28px}
+      .layout{margin-top:28px;gap:28px}
+      h1{font-size:46px}
+      .lede{margin-top:18px;font-size:16px}
+      .wallet{margin-top:22px}
+      .trust-list{grid-template-columns:1fr;gap:12px;padding-top:20px}
+      .panel{border-radius:14px}
+      .panel-header{display:block}
+      .state-badge{margin-top:16px}
+      .panel-header,.section,.actions{padding-left:20px;padding-right:20px}
+      .meta-grid{grid-template-columns:1fr}
+      .button-list,.choice-notes{grid-template-columns:1fr}
+      .choice-notes{display:none}
+      .button{min-height:52px}
+      .plan{min-height:110px;max-height:280px;padding:15px;font-size:11px}
+    }
+    @media(prefers-reduced-motion:reduce){*{scroll-behavior:auto!important;transition:none!important}}
+  </style>
 </head>
 <body>
-<h1>Bloom Sealed Approval</h1>
-<p class="muted">Review the daemon-produced plan below. Approving runs a passkey
-ceremony on this device. Bloom never opens this page for you — you opened it
-deliberately from a challenge you were expecting.</p>
+  <main class="page">
+    <header>
+      <div class="brand-lockup" aria-label="Bloom walletFS">
+        <svg class="brand-mark" viewBox="0 0 1024 1024" aria-hidden="true">
+          <g stroke-linejoin="round" stroke-linecap="round">
+            <path d="M24.58 0C96.09 141.31 209.14 141.31 282.62 0" fill="none" stroke="#7a2230" stroke-width="30" transform="translate(512 512) rotate(-72.5) scale(1.24)"/>
+            <path d="M24.58 0C96.09 141.31 209.14 141.31 282.62 0C209.14-141.31 96.09-141.31 24.58 0Z" fill="#9d2d3f" transform="translate(512 512) rotate(-12.5) scale(1.24)"/>
+            <path d="M24.58 0C96.09 141.31 209.14 141.31 282.62 0C209.14-141.31 96.09-141.31 24.58 0Z" fill="none" stroke="#7a2230" stroke-width="30" transform="translate(512 512) rotate(47.5) scale(1.24)"/>
+            <path d="M24.58 0C96.09 141.31 209.14 141.31 282.62 0C209.14-141.31 96.09-141.31 24.58 0Z" fill="#9d2d3f" transform="translate(512 512) rotate(107.5) scale(1.24)"/>
+            <path d="M24.58 0C96.09 141.31 209.14 141.31 282.62 0C209.14-141.31 96.09-141.31 24.58 0Z" fill="none" stroke="#7a2230" stroke-width="30" transform="translate(512 512) rotate(167.5) scale(1.24)"/>
+            <path d="M24.58 0C96.09 141.31 209.14 141.31 282.62 0C209.14-141.31 96.09-141.31 24.58 0Z" fill="#9d2d3f" transform="translate(512 512) rotate(227.5) scale(1.24)"/>
+            <path d="M282.62 0C209.14-141.31 96.09-141.31 24.58 0" fill="none" stroke="#7a2230" stroke-width="30" transform="translate(512 512) rotate(-72.5) scale(1.24)"/>
+          </g>
+        </svg>
+        <span><strong>/bloom</strong> walletFS</span>
+      </div>
+    </header>
 
-<div class="card">
-  <div id="meta" class="kv"></div>
-  <div class="plan" id="plan">Loading plan…</div>
-</div>
+    <div class="layout">
+      <section class="intro" aria-labelledby="page-title">
+        <p class="eyebrow">Passkey-protected authorization</p>
+        <h1 id="page-title">Approve with confidence.</h1>
+        <p class="lede">Review exactly what Bloom intends to do, then authorize it with the passkey stored by your device.</p>
+        <p class="wallet" id="wallet-name" aria-live="polite">Loading wallet…</p>
 
-<div class="card">
-  <button id="grant" class="primary" disabled>Approve (grant only)</button>
-  <button id="grantExecute" disabled>Approve &amp; execute now</button>
-  <div class="muted">“Approve (grant only)” mints an in-memory grant; the action
-  executes when the client retries. “Approve &amp; execute now” broadcasts
-  immediately after approval.</div>
-  <div id="status"></div>
-</div>
+        <div class="trust-list" aria-label="Approval security details">
+          <div class="trust-item">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="M12 3 20 7v5c0 4.6-3.1 7.5-8 9-4.9-1.5-8-4.4-8-9V7l8-4Z"/><path d="m8.5 12 2.2 2.2 4.8-5"/></svg>
+            <div><strong>Bound to this intent</strong>Your approval is cryptographically tied to the action and policy shown here.</div>
+          </div>
+          <div class="trust-item">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><rect x="4" y="10" width="16" height="10" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3M12 14v2"/></svg>
+            <div><strong>Keys stay isolated</strong>Your private key remains encrypted and is never exposed to the requesting agent.</div>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel" aria-labelledby="approval-title">
+        <div class="panel-header">
+          <div>
+            <p class="panel-kicker">Sealed Approval</p>
+            <h2 class="panel-title" id="approval-title">Review this action</h2>
+            <p class="panel-copy">The daemon produced and sealed this plan before opening the approval flow.</p>
+          </div>
+          <span class="state-badge" id="state-badge">Awaiting review</span>
+        </div>
+
+        <section class="section" aria-labelledby="identity-heading">
+          <div class="section-heading">
+            <span class="section-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="M4 7h16v12H4zM8 7V5h8v2M8 12h8M8 16h5"/></svg></span>
+            <h3 class="section-label" id="identity-heading">Action identity</h3>
+          </div>
+          <div class="meta-grid" id="meta" aria-live="polite">
+            <div class="meta-item"><span class="meta-label">Status</span><span class="meta-value">Loading sealed details…</span></div>
+          </div>
+        </section>
+
+        <section class="section" aria-labelledby="plan-heading">
+          <div class="section-heading">
+            <span class="section-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="M7 3h8l4 4v14H7zM15 3v5h4M10 12h6M10 16h6"/></svg></span>
+            <h3 class="section-label" id="plan-heading">Daemon-produced plan</h3>
+          </div>
+          <div class="plan-wrap">
+            <div class="plan-topbar" aria-hidden="true"><span class="plan-dot"></span><span class="plan-dot"></span><span class="plan-dot"></span><span class="plan-file">sealed-plan.txt</span></div>
+            <pre class="plan loading" id="plan">Loading plan…</pre>
+          </div>
+        </section>
+
+        <div class="actions">
+          <div class="button-list">
+            <button id="grant" class="button" type="button" disabled>
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M12 3 20 7v5c0 4.6-3.1 7.5-8 9-4.9-1.5-8-4.4-8-9V7l8-4Z"/><path d="m8.5 12 2.2 2.2 4.8-5"/></svg>
+              Approve grant
+            </button>
+            <button id="grantExecute" class="button secondary" type="button" disabled>
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M5 12h13M14 7l5 5-5 5"/></svg>
+              Approve &amp; execute
+            </button>
+          </div>
+          <div class="choice-notes" aria-hidden="true">
+            <p class="choice-note">Mint a short-lived in-memory grant. The client executes when it retries.</p>
+            <p class="choice-note">Approve and broadcast this sealed action immediately.</p>
+          </div>
+          <p class="passkey-hint"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><circle cx="8" cy="15" r="4"/><path d="m11 12 8-8M15 8l3 3M17 6l2 2"/></svg>Your device will ask for Touch ID, Windows Hello, or a security key.</p>
+          <div id="status" role="status" aria-live="polite"></div>
+        </div>
+      </section>
+    </div>
+  </main>
 
 <script>
-const PATH = location.pathname.replace(/\/$/, "");
-function dec(s){ s=s.replace(/-/g,'+').replace(/_/g,'/'); while(s.length%4)s+='='; const b=atob(s); const u=new Uint8Array(b.length); for(let i=0;i<b.length;i++)u[i]=b.charCodeAt(i); return u; }
-function enc(buf){ const u=new Uint8Array(buf); let s=''; for(let i=0;i<u.length;i++)s+=String.fromCharCode(u[i]); return btoa(s).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,''); }
+var FAVICON_LINK=document.querySelector('link[data-favicon-link]');
+var COLOR_SCHEME_MEDIA=window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)');
+function syncFavicon(){
+  if(FAVICON_LINK) FAVICON_LINK.href=COLOR_SCHEME_MEDIA&&COLOR_SCHEME_MEDIA.matches?'/wallet-registration-assets/favicon-dark.svg':'/wallet-registration-assets/favicon-light.svg';
+}
+syncFavicon();
+if(COLOR_SCHEME_MEDIA) COLOR_SCHEME_MEDIA.addEventListener('change',syncFavicon);
 
+var PATH=location.pathname.replace(/\/$/,'');
+function dec(s){s=s.replace(/-/g,'+').replace(/_/g,'/');while(s.length%4)s+='=';var b=atob(s);var u=new Uint8Array(b.length);for(var i=0;i<b.length;i++)u[i]=b.charCodeAt(i);return u;}
+function enc(buf){var u=new Uint8Array(buf);var s='';for(var i=0;i<u.length;i++)s+=String.fromCharCode(u[i]);return btoa(s).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');}
+function setText(id,text){var el=document.getElementById(id);if(el)el.textContent=String(text==null?'':text);}
+function addMeta(label,value){
+  var item=document.createElement('div');
+  item.className='meta-item';
+  var key=document.createElement('span');
+  key.className='meta-label';
+  key.textContent=label;
+  var val=document.createElement('span');
+  val.className='meta-value';
+  val.textContent=String(value==null?'—':value);
+  item.appendChild(key);
+  item.appendChild(val);
+  document.getElementById('meta').appendChild(item);
+}
+function expiryText(ms){
+  var date=new Date(Number(ms));
+  if(!Number.isFinite(date.getTime()))return 'Not provided';
+  return new Intl.DateTimeFormat(undefined,{dateStyle:'medium',timeStyle:'short'}).format(date);
+}
+function setButtons(disabled){
+  document.getElementById('grant').disabled=disabled;
+  document.getElementById('grantExecute').disabled=disabled;
+}
 async function loadPlan(){
-  const r = await fetch(PATH + "/plan.json");
+  var r=await fetch(PATH+'/plan.json');
   if(!r.ok){
-    document.getElementById('plan').textContent =
-      r.status===410 ? "This approval URL has expired or was already used."
-      : r.status===404 ? "Unknown approval URL."
-      : "Could not load the approval plan.";
+    var message=r.status===410?'This approval URL has expired or was already used.':r.status===404?'Unknown approval URL.':'Could not load the approval plan.';
+    var plan=document.getElementById('plan');
+    plan.className='plan error';
+    plan.textContent=message;
+    setText('state-badge','Unavailable');
     return;
   }
-  const p = await r.json();
-  document.getElementById('meta').innerHTML =
-    "<div><b>wallet</b>: "+p.wallet+"</div>"+
-    "<div><b>action_id</b>: "+p.action_id+"</div>"+
-    "<div><b>intent_hash</b>: "+p.intent_hash+"</div>"+
-    "<div><b>assurance</b>: "+p.assurance+"</div>";
-  document.getElementById('plan').textContent = p.plan && p.plan.length ? p.plan : "(no plan text)";
-  document.getElementById('grant').disabled = false;
-  document.getElementById('grantExecute').disabled = false;
+  var p=await r.json();
+  var meta=document.getElementById('meta');
+  meta.textContent='';
+  addMeta('Wallet',p.wallet||'Unknown');
+  addMeta('Surface',p.surface||'Unknown');
+  addMeta('Assurance',p.assurance||'Standard');
+  addMeta('Valid until',expiryText(p.expiry_ms));
+  addMeta('Action ID',p.action_id||'Unknown');
+  addMeta('Intent hash',p.intent_hash||'Unknown');
+  setText('wallet-name','Wallet · '+(p.wallet||'Unknown'));
+  var plan=document.getElementById('plan');
+  plan.className='plan';
+  plan.textContent=p.plan&&p.plan.length?p.plan:'(no plan text)';
+  setText('state-badge','Ready to approve');
+  setButtons(false);
 }
-
 async function approve(mode){
-  const st = document.getElementById('status');
-  const g = document.getElementById('grant'), ge = document.getElementById('grantExecute');
-  g.disabled = true; ge.disabled = true;
-  st.className = ''; st.textContent = 'Waiting for passkey (Touch ID / security key)…';
+  var st=document.getElementById('status');
+  setButtons(true);
+  st.className='';
+  st.textContent='Waiting for passkey interaction (Touch ID / security key)…';
+  setText('state-badge','Passkey required');
   try{
-    if(!navigator.credentials || !navigator.credentials.get) throw new Error('WebAuthn not available in this browser');
-    const opts = await (await fetch(PATH + "/challenge")).json();
-    opts.publicKey.challenge = dec(opts.publicKey.challenge);
-    if(opts.publicKey.allowCredentials)
-      opts.publicKey.allowCredentials = opts.publicKey.allowCredentials.map(c=>({...c, id:dec(c.id)}));
-    if(opts.publicKey.extensions && opts.publicKey.extensions.prf && opts.publicKey.extensions.prf.eval && opts.publicKey.extensions.prf.eval.first)
-      opts.publicKey.extensions.prf.eval.first = dec(opts.publicKey.extensions.prf.eval.first);
-    const cred = await navigator.credentials.get(opts);
-    const ext = cred.getClientExtensionResults();
-    const prfFirst = ext && ext.prf && ext.prf.results && ext.prf.results.first;
-    if(!prfFirst) throw new Error('PRF output not returned by this authenticator. Supported: Touch ID (macOS/iOS), Windows Hello (Chrome 147+), YubiKey 5+.');
-    const clientDataJSON = enc(cred.response.clientDataJSON);
-    const body = {
-      mode: mode,
-      credential: {
-        id: cred.id, rawId: enc(cred.rawId), type: cred.type,
-        response: {
-          authenticatorData: enc(cred.response.authenticatorData),
-          clientDataJSON: clientDataJSON,
-          signature: enc(cred.response.signature),
-          userHandle: cred.response.userHandle ? enc(cred.response.userHandle) : null
+    if(!navigator.credentials||!navigator.credentials.get)throw new Error('WebAuthn is not available in this browser. Try Chrome or Safari on this device.');
+    var challengeResponse=await fetch(PATH+'/challenge');
+    if(!challengeResponse.ok)throw new Error('Could not prepare the passkey challenge (HTTP '+challengeResponse.status+').');
+    var opts=await challengeResponse.json();
+    opts.publicKey.challenge=dec(opts.publicKey.challenge);
+    if(opts.publicKey.allowCredentials)opts.publicKey.allowCredentials=opts.publicKey.allowCredentials.map(function(c){return Object.assign({},c,{id:dec(c.id)});});
+    if(opts.publicKey.extensions&&opts.publicKey.extensions.prf&&opts.publicKey.extensions.prf.eval&&opts.publicKey.extensions.prf.eval.first)opts.publicKey.extensions.prf.eval.first=dec(opts.publicKey.extensions.prf.eval.first);
+    var cred=await navigator.credentials.get(opts);
+    var ext=cred.getClientExtensionResults();
+    var prfFirst=ext&&ext.prf&&ext.prf.results&&ext.prf.results.first;
+    if(!prfFirst)throw new Error('PRF output was not returned by this authenticator. Supported: Touch ID (macOS/iOS), Windows Hello (Chrome 147+), YubiKey 5+, or security keys with hmac-secret.');
+    var clientDataJSON=enc(cred.response.clientDataJSON);
+    var body={
+      mode:mode,
+      credential:{
+        id:cred.id,rawId:enc(cred.rawId),type:cred.type,
+        response:{
+          authenticatorData:enc(cred.response.authenticatorData),
+          clientDataJSON:clientDataJSON,
+          signature:enc(cred.response.signature),
+          userHandle:cred.response.userHandle?enc(cred.response.userHandle):null
         }
       },
-      prf_output_b64: enc(prfFirst),
-      prf_client_data_json_b64: clientDataJSON
+      prf_output_b64:enc(prfFirst),
+      prf_client_data_json_b64:clientDataJSON
     };
-    const r = await fetch(PATH + "/complete", { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) });
-    const out = await r.json().catch(()=>({}));
-    if(!r.ok || !out.ok){
-      st.className = 'err';
-      st.textContent = 'Approval failed: ' + (out.error || ('HTTP '+r.status));
-      g.disabled = false; ge.disabled = false;
+    var r=await fetch(PATH+'/complete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    var out=await r.json().catch(function(){return {};});
+    if(!r.ok||!out.ok){
+      st.className='err';
+      st.textContent='Approval failed: '+(out.error||('HTTP '+r.status));
+      setText('state-badge','Approval failed');
+      setButtons(false);
       return;
     }
-    st.className = 'ok';
-    st.textContent = out.executed
-      ? ('Approved and executed. tx_hash=' + (out.tx_hash || '?') + '. You can close this tab.')
-      : 'Approved. Grant minted — the client can now execute. You can close this tab.';
+    st.className='ok';
+    st.textContent=out.executed?'Approved and executed. Transaction '+(out.tx_hash||'submitted')+'. You can close this tab.':'Approved. Grant minted — the client can now execute. You can close this tab.';
+    setText('state-badge',out.executed?'Executed':'Approved');
   }catch(e){
-    st.className = 'err';
-    st.textContent = 'Error: ' + (e && e.message ? e.message : e);
-    g.disabled = false; ge.disabled = false;
+    st.className='err';
+    st.textContent='Error: '+(e&&e.message?e.message:e);
+    setText('state-badge','Try again');
+    setButtons(false);
   }
 }
-document.getElementById('grant').addEventListener('click', ()=>approve('grant'));
-document.getElementById('grantExecute').addEventListener('click', ()=>approve('grant_execute'));
-loadPlan().catch(e=>{ document.getElementById('plan').textContent = 'Error: '+e.message; });
+document.getElementById('grant').addEventListener('click',function(){approve('grant');});
+document.getElementById('grantExecute').addEventListener('click',function(){approve('grant_execute');});
+loadPlan().catch(function(e){
+  var plan=document.getElementById('plan');
+  plan.className='plan error';
+  plan.textContent='Error: '+e.message;
+  setText('state-badge','Unavailable');
+});
 </script>
 </body>
 </html>
