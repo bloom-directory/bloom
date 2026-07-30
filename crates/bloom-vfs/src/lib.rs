@@ -9,7 +9,7 @@
 //!
 //! - `chains/<chain>/...` — read-only chain views
 //! - `wallets/<wallet>/...` — managed wallets, including the outbox
-//! - `petals/...` — installed application surfaces such as the Enso Petal
+//! - `defi/intents/...` — Enso-mediated DeFi intents (stub)
 //! - `watch/...` — subscriptions (stub)
 //! - `tools/...` — pure helpers (keccak, checksum, units)
 //! - `status/...` — daemon health

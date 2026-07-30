@@ -208,11 +208,12 @@ it expire after the configured TTL) cancels the stage.
 - **ENS** — recipient names like `vitalik.eth` resolve in tx intents
   via the canonical mainnet registry; forward resolution is also
   exposed at `ens/<name>.eth`.
-- **DeFi intents** — install the
-  [Enso Petal](https://github.com/bloom-directory/bloom-petal-enso), then use
-  `petals/enso/intents/<wallet>/...`. Store the API key through
-  `petals/enso/settings/api-key`; review the route and simulation before the
-  Petal confirmation stages anything into the wallet outbox.
+- **DeFi intents** — `defi/intents/<wallet>/...` (Enso shortcuts).
+  Mounted whenever an `[enso]` block is present in `config.toml`.
+  Requires an Enso API key (`BLOOM_ENSO_KEY` or `ENSO_API_KEY`); the
+  client returns `MissingKey` otherwise. ERC-20 token-in routes
+  auto-stage an `approve(spender, max)` ahead of the swap when
+  needed; default slippage is 50 bps.
 - **Prices** — keyless DefiLlama at `prices/spot/<coin>(.usd)` and
   `prices/change_24h/<coin>`.
 - **Hyperliquid** — perp and spot market data, order books, candles,
@@ -259,9 +260,10 @@ home. Exit the subshell to tear everything down.
 native ETH send and an ERC-20 transfer, and verifies the mounted Sealed
 Approval gate: initial confirm is denied, `approval_challenge.json` is
 written in both the wallet projection and central `/outbox/pending/<action_id>`
-store, and the challenge includes a local `ceremony_url`.
+store, and the challenge includes a local `ceremony_url`. Optional Uniswap V2 /
+Enso scenarios on a mainnet fork run when `BLOOM_MAINNET_RPC` is set.
 
-`tests/docker/run.sh` is the dockerized harness with four modes:
+`tests/docker/run.sh` is the dockerized harness with six modes:
 
 - `--mount` (default) — privileged container exercising the NFS
   kernel mount (`tests/docker/test.sh`).
@@ -269,12 +271,18 @@ store, and the challenge includes a local `ceremony_url`.
   image; no privileges needed.
 - `--fork` — sandboxed end-to-end via `docker compose --profile fork`:
   spins up an anvil fork of Base, exercises wallet/outbox + chain
-  reads through the mount.
+  reads through the mount. No Enso key required.
+- `--enso` — `docker compose --profile enso`: same anvil fork, runs
+  the full Enso → Aave intent flow. Requires `BLOOM_ENSO_KEY`.
 - `--mempool` — `docker compose --profile mempool`: spins up an
   in-container WebSocket mock that emulates Alchemy's
   `alchemy_pendingTransactions` feed and asserts the daemon's
   `chains/<c>/mempool/{status.json,recent.jsonl}` surface populates.
   No external keys required.
+- `--enso-live` — runs the Enso + Aave flow against Base **mainnet**
+  with real funds through the mounted filesystem surface. Gated on
+  a sourced `test.env` with `BLOOM_ENSO_KEY`, `BLOOM_LIVE_HOME`,
+  `BLOOM_LIVE_DEST1`, and `BLOOM_PASSPHRASE`.
 
 Shared scaffolding (logging, mount lifecycle, pending-stage helpers,
 receipt assertions, deterministic Anvil constants) lives in
@@ -321,8 +329,8 @@ is mainnet-only. Unsupported chains return an explicit
 `PrivateNotSupportedOnChain` error rather than silently broadcasting
 publicly.
 
-To run the opt-in Sepolia live send test, fund a dedicated test keystore
-wallet with Sepolia ETH, then run:
+To run the opt-in Sepolia live send test, fund the same keystore wallet
+used by `--enso-live` with Sepolia ETH, then run:
 
 ```sh
 set -a && source test.env && set +a

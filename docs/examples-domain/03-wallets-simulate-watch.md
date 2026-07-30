@@ -453,8 +453,7 @@ cat /bloom/simulate/$ID/simulation.json   # return_data_hex carries the balance
 
 NFT intents are not simulated through `/simulate` — they go through
 the wallet outbox stage path. Enso routes are not simulated through
-`/simulate` either; the installed Enso Petal exposes its own simulation under
-`/petals/enso/intents/<wallet>/<session>/simulation.json`.
+`/simulate` either (use `defi/intents/`).
 
 ## 4. Watch
 
