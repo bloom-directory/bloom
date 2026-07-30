@@ -11,15 +11,8 @@ log()  { printf '%s[%s]%s %s\n' "$GREEN"  "$LOG_PREFIX" "$RESET" "$*" >&2; }
 warn() { printf '%s[%s]%s %s\n' "$YELLOW" "$LOG_PREFIX" "$RESET" "$*" >&2; }
 fail() { printf '%s[%s]%s %s\n' "$RED"    "$LOG_PREFIX" "$RESET" "$*" >&2; exit 1; }
 
-require_env() {
-    local name
-    for name in "$@"; do
-        [[ -n "${!name:-}" ]] || fail "$name not set"
-    done
-}
-
 # ---------- shared mount layout ----------
-# The chain tests (enso, fork) mount at /bloom so user-facing paths read
+# The chain tests mount at /bloom so user-facing paths read
 # `/bloom/wallets/...`. The basic mount test overrides MNT/SENTINEL before
 # sourcing this file. PIDFILE/LOGFILE are stable across all of them.
 : "${MNT:=/bloom}"
@@ -35,10 +28,6 @@ ANVIL_KEY=0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80
 DEST1=0xf39Fd6e51aad88F6F4ce6aB8827279cfFFb92266
 RECIPIENT=0x70997970C51812dc3A010C7d01b50e0d17dc79C8
 
-# Base mainnet token addresses used by the DeFi tests.
-USDC=0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913
-AUSDC=0x4e65fE4DbA92790696d040ac24Aa414708F5c0AB
-
 # ---------- home dir prep ----------
 prepare_home_dir() {
     local home_dir=$1
@@ -46,22 +35,8 @@ prepare_home_dir() {
     rm -rf "$home_dir"/*
 }
 
-# Live-mode only: copy the canonical keystore from the read-only mount
-# into the throwaway home so an in-container daemon write can't corrupt
-# it. Bails if the requested wallet is missing.
-prepare_live_home() {
-    local home_dir=$1 wallet=$2
-    [[ -d /bloom-live-home/keystore ]] \
-        || fail "/bloom-live-home/keystore missing (mount via run.sh --enso-live)"
-    log "copying live keystore -> $home_dir/keystore (in-container, throwaway)"
-    cp -r /bloom-live-home/keystore "$home_dir/keystore"
-    [[ -d "$home_dir/keystore/$wallet" ]] \
-        || fail "no '$wallet' entry under /bloom-live-home/keystore"
-}
-
 write_base_config() {
     local home_dir=$1 rpc_url=$2 display_name=$3
-    local enso_key=${4:-}
 
     log "writing config.toml (rpc: $rpc_url)"
     cat > "$home_dir/config.toml" <<EOF
@@ -78,14 +53,6 @@ native_symbol = "ETH"
 native_decimals = 18
 legacy_tx = false
 EOF
-
-    if [[ -n "$enso_key" ]]; then
-        cat >> "$home_dir/config.toml" <<EOF
-
-[enso]
-api_key = "$enso_key"
-EOF
-    fi
 }
 
 build_mount_demo() {
@@ -216,14 +183,6 @@ wait_for_new_pending_stages() {
         sleep 1
     done
     return 1
-}
-
-# Newest entry under defi/intents/<wallet> excluding the sink `new`.
-# Used to learn the session id created by the most recent intent post.
-latest_session() {
-    local wallet=$1
-    ls "$MNT/defi/intents/$wallet" 2>/dev/null \
-        | grep -v '^new$' | sort | tail -n1 || true
 }
 
 # Confirm a single staged tx and echo the resulting tx hash. Caller

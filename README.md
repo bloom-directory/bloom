@@ -50,8 +50,8 @@ Bloom gives an agent a safe wallet workspace:
   methods, storage, events, NFTs, ENS, prices, and address history;
 - create/import encrypted wallets without exposing private keys through
   the filesystem;
-- stage native ETH, ERC-20, NFT, contract-call, signing, and DeFi
-  intents by writing plain-language or structured files;
+- stage native ETH, ERC-20, NFT, contract-call, signing, and installed-Petal
+  DeFi intents by writing plain-language or structured files;
 - stage free or paid HTTP requests through `/requests`, including HTTP
   402 payment flows that are reviewed before x402 or Tempo MPP credentials
   are signed;
@@ -145,8 +145,9 @@ A fresh Bloom VFS root exposes these default entries:
 - `addressbook/<alias>` — local petname directory.
 - `ens/<name>.eth` — ENS forward resolution as a read surface.
 - `petals/` — installed local Petal app surfaces. The default pre-installed
-  Polymarket package is available beneath it at `petals/polymarket/`; Bloom has
-  no native `polymarket/` subtree or `bloom polymarket` CLI.
+  Polymarket package is available at `petals/polymarket/`; the optional
+  [Enso Petal](https://github.com/bloom-directory/bloom-petal-enso) is
+  available at `petals/enso/` after installation.
 - `requests/` — free and paid HTTP requests. Paid HTTP 402 challenges are
   staged under `pending/`, exposed as `plan.md`, and only signed after a
   confirm write.
@@ -154,14 +155,14 @@ A fresh Bloom VFS root exposes these default entries:
   counts, policy flags, wallet/outbox counts, and backend declarations.
 - `docs/` — in-tree help, vendored from `crates/bloom-vfs/src/docs/`.
 
-Config-gated surfaces may add more entries. For example,
-`defi/intents/<wallet>/` appears when Enso is configured: write a
-natural-language intent, inspect `plan.md`, then confirm to stage into
-the wallet outbox.
+Application-specific surfaces live under `petals/`, not in Bloom core. For
+example, the Enso Petal accepts swap intents at
+`petals/enso/intents/<wallet>/new`, exposes a reviewable `plan.md`, and stages
+confirmed transactions into the standard wallet outbox.
 
-See [QUICKSTART.md](./QUICKSTART.md) for an Anvil-backed walkthrough
-and [docs/AUDIT.md](./docs/AUDIT.md) for the per-surface implementation
-map and live-network verification log. The
+See [QUICKSTART.md](./QUICKSTART.md) for an Anvil-backed walkthrough.
+[docs/AUDIT.md](./docs/AUDIT.md) preserves the dated 2026-05-09
+implementation map and live-network verification log. The
 [VFS/CLI parity ledger](./docs/parity/VFS_CLI_PARITY_LEDGER.md) is retained as
 a dated historical snapshot, not as current product documentation.
 
@@ -178,7 +179,6 @@ Bloom is a Rust Cargo workspace. The main user-facing/runtime crates are:
 | `bloom-tx` | Tx staging, simulation, signing, broadcast, nonce management, and policy enforcement. |
 | `bloom-keystore` | Encrypted local key storage and signer integration. |
 | `bloom-mempool` | Optional pending-transaction indexing for configured WebSocket providers. |
-| `bloom-defi` | Enso Shortcuts client and natural-language DeFi intent support. |
 | `bloom-watch` | Subscription registry and polling executor. |
 | `bloom-mount` | NFSv4 adapter that mounts Bloom's VFS as an ordinary filesystem. |
 | `bloom-tools` | Pure crypto/encoding helpers. |

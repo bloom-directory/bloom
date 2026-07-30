@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 # tests/docker/test_fork_mount.sh — dockerized fork-mode mount test.
 #
-# Sibling of test_enso_aave.sh, but limited to the wallet/outbox +
-# chain read surface. No Enso, no DeFi route. The point is to prove
+# Limited to the wallet/outbox and chain-read surfaces. The point is to prove
 # that an agent with shell access to /bloom/ can:
 #
 #   1. Stage a plain native-ETH transfer via /bloom/wallets/<w>/chains/<c>/outbox/new.tx
@@ -154,7 +153,7 @@ assert_json_file_starts_with "$HEAD_JSON" "{" "head full.json"
 
 # Read 2: tx receipt for the broadcast tx. Multiple files under the
 # tx subtree — verify the high-value ones are populated. (This mirrors
-# the assertions test_enso_aave.sh runs after a successful broadcast.)
+# the assertions a transaction workflow runs after a successful broadcast.)
 TX_DIR="$MNT/chains/$CHAIN/tx/$HASH_1"
 log "read tx receipt subtree: $TX_DIR"
 assert_tx_receipt_paths "$TX_DIR"

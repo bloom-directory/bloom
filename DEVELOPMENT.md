@@ -27,12 +27,12 @@ and [QUICKSTART.md](./QUICKSTART.md); this file covers the dev loop.
 | Foundry (`anvil`, `cast`, `forge`) | All anvil-backed integration tests, the acceptance script, and the playground. Override the binary paths with `BLOOM_ANVIL_BIN` / `BLOOM_CAST_BIN`. |
 | `jq` | Acceptance script and Docker drivers. |
 | Docker (compose v1 or v2) | Dockerized tests and `scripts/play.sh`. |
-| Linux kernel NFS client | `--mount`/`--fork`/`--enso(-live)` Docker tests (requires `SYS_ADMIN`, `apparmor=unconfined`, `/dev/fuse`). |
-| Optional API keys | `BLOOM_ETHERSCAN_KEY`, `BLOOM_ENSO_KEY`, `BLOOM_MAINNET_RPC` — populate `test.env` (gitignored) and `source` it. |
+| Linux kernel NFS client | `--mount`/`--fork` Docker tests (requires `SYS_ADMIN`, `apparmor=unconfined`, `/dev/fuse`). |
+| Optional API keys | `BLOOM_ETHERSCAN_KEY`, `BLOOM_MAINNET_RPC` — populate `test.env` (gitignored) and `source` it. |
 
 ## Building
 
-The workspace contains 26 crates (`Cargo.toml` `[workspace]`). Default builds
+The workspace contains 25 crates (`Cargo.toml` `[workspace]`). Default builds
 exclude the optional NFS mount adapter; opt in with the `mount` feature when
 you need it.
 
@@ -90,13 +90,7 @@ Every `BLOOM_*` variable used by the binary, scripts, or test harness:
 | `BLOOM_HOME` | binary, all scripts | Override home dir. Default `~/.bloom`. |
 | `BLOOM_PASSPHRASE` | binary, scripts | Argon2id-derived KEK for the keystore. |
 | `BLOOM_ETHERSCAN_KEY` | bloom-etherscan, live tests | Etherscan API key. |
-| `BLOOM_ENSO_KEY` | bloom-defi, docker `--enso*` | Enso Shortcuts key. |
 | `BLOOM_MAINNET_RPC` | bloom-ens live test, acceptance.sh §3/§4 | Optional; scenarios skip cleanly when unset. |
-| `BLOOM_LIVE_HOME` | docker `--enso-live` | Path to a real keystore (mounted **read-only** into container). |
-| `BLOOM_LIVE_DEST1/2/3` | docker `--enso-live` | Base mainnet sender + sweep targets. |
-| `BLOOM_BASE_USDC`, `BLOOM_BASE_AUSDC` | docker `--enso*` | Canonical Base token addresses. |
-| `BLOOM_BASE_RPC_URL` | docker `--enso-live` | Defaults to `https://base.publicnode.com`. |
-| `BLOOM_SWAP_AMOUNT_ETH` | docker `--enso-live` | Default `0.001` — **real funds**. |
 | `BLOOM_ANVIL_BIN`, `BLOOM_CAST_BIN` | bloom-it, bloom-watch | Override Foundry binary paths. |
 | `BLOOM_TEST_WALLET_NAME/KEY/PASSPHRASE` | docker drivers | Pre-seeds the daemon wallet. |
 | `BLOOM_PLAY_HOME`, `BLOOM_PLAY_PERSIST`, `BLOOM_PLAY_DAEMON_LOG` | scripts/play.sh | Playground knobs. |
@@ -119,8 +113,7 @@ CI separates the suites by dependency boundary in `.github/workflows/ci.yml`:
 - `e2e_tests` is the live-network lane for ignored external-service tests. It
   is isolated from fork PRs and reports which optional secrets are present
   before tests self-skip or run.
-- Docker mount/Enso/live-funds e2e jobs are manual-only (`workflow_dispatch`),
-  with the real-funds path guarded by `BLOOM_RUN_LIVE_FUNDS_E2E=1`.
+- The Docker mount job is manual-only (`workflow_dispatch`).
 
 ### Rust unit tests
 
@@ -145,7 +138,6 @@ cargo test -p bloom-tools            # 22  tests — keccak/sha/abi/rlp helpers
 cargo test -p bloom-prices           # 21  tests — DefiLlama oracle
 cargo test -p bloom-rpc              # 17  tests — failover, health, sessions
 cargo test -p bloom-watch            # 17  tests — watch executor & log rotation
-cargo test -p bloom-defi             # 10  tests — Enso route + intent parser
 cargo test -p bloom-daemon           # 7   tests — IPC dispatch, lifecycle
 cargo test -p bloom-ens              # 6   tests — namehash, encoder
 cargo test -p bloom-keystore         # 5   tests — argon2id + chacha20poly1305
@@ -197,11 +189,11 @@ and an `AnvilGuard` RAII wrapper that kills the child on drop.
 
 ### Dockerized tests (`tests/docker/`)
 
-The Docker harness exists for two reasons: kernel NFS mounts work on Linux
-but not on macOS host, and live-network DeFi flows need a controlled wallet.
+The Docker harness exists because kernel NFS mounts work on Linux but not on
+macOS hosts.
 The host orchestrator is `tests/docker/run.sh`; it builds a Linux `rust:bookworm`
 image once (`Dockerfile`), caches the cargo target dir in the
-`bloom-cargo-cache` named volume, and dispatches into one of five
+`bloom-cargo-cache` named volume, and dispatches into one of four
 in-container drivers.
 
 ```sh
@@ -214,13 +206,6 @@ bash tests/docker/run.sh --workspace           # → tests/docker/test_workspace
 # Wallet staging + chain reads against an anvil fork of Base
 bash tests/docker/run.sh --fork                # → tests/docker/test_fork_mount.sh
 
-# DeFi intent (Enso → Aave) on an anvil fork — needs BLOOM_ENSO_KEY
-bash tests/docker/run.sh --enso                # → tests/docker/test_enso_aave.sh
-
-# Same flow against live Base mainnet — broadcasts and spends real funds
-source test.env
-bash tests/docker/run.sh --enso-live           # → tests/docker/test_enso_aave.sh
-
 # Force a no-cache rebuild of the test image
 bash tests/docker/run.sh --rebuild --mount
 ```
@@ -232,8 +217,6 @@ Coverage per mode:
 | `--workspace` | single container | The unit-test suite passes on Linux as well as macOS. CI-shape regression for OS-specific code. |
 | `--mount` (default) | single privileged container | NFS server + kernel mount: `ls`, `cat /status/version`, `cat /tools/keccak/abc`, `write /watch/new`. Regression-tests the WRITE-stability bug that returned EREMOTEIO. |
 | `--fork` | compose: anvil-fork sidecar + driver | End-to-end wallet flow over the mount: stage → confirm → broadcast → poll receipt → fee-bump replace; chain reads under `/bloom/chains/base/{head,tx,gas,blocks}`. |
-| `--enso` | compose: anvil-fork + driver | Full DeFi intent: post NL intent → confirm session → poll outbox → broadcast → assert aBaseUSDC > 0. Generous 5% slippage and 300s gas-estimation budget to absorb fork drift. |
-| `--enso-live` | single privileged container | Same flow against real Base mainnet, plus a balance-neutral unwind (redeem aBaseUSDC → ETH). Mounts `$BLOOM_LIVE_HOME` read-only and copies the keystore to a throwaway home. |
 
 In-container drivers and their helpers all live in `tests/docker/`:
 
@@ -241,27 +224,28 @@ In-container drivers and their helpers all live in `tests/docker/`:
   `ca-certificates`, `procps`, `curl`, `jq`. Pins rustfmt + clippy to dodge
   transient registry hiccups.
 - `docker-compose.yml` — anvil-fork sidecar (Base mainnet at chain_id 8453,
-  port 8545, healthcheck via `cast chain-id`); driver profiles (`enso`,
-  `fork`, `mempool`) sharing the sidecar.
+  port 8545, healthcheck via `cast chain-id`); driver profiles (`fork` and
+  `mempool`) sharing the sidecar.
 - `lib.sh` — bash helpers (`prepare_home_dir`, `build_mount_demo`,
   `start_mount_demo`, `wait_for_mount`, `wait_tx_success`,
   `top_up_anvil_balance`, etc.) plus the deterministic Anvil fixtures.
-- `test.sh`, `test_workspace.sh`, `test_fork_mount.sh`, `test_enso_aave.sh` —
-  the per-mode drivers invoked by `run.sh`.
+- `test.sh`, `test_workspace.sh`, `test_fork_mount.sh`, and
+  `test_mempool_mock.sh` — the per-mode drivers invoked by `run.sh`.
 
 Common gotchas (more in each script's header comment):
 
-- The `--mount`, `--fork`, and `--enso(-live)` containers run with
+- The `--mount` and `--fork` containers run with
   `--cap-add SYS_ADMIN`, `--device /dev/fuse`, and `--security-opt
   apparmor=unconfined`. The `--workspace` mode does not.
 - `CARGO_TARGET_DIR=/tmp/cargo-target` is set in-container so Linux artifacts
   don't trample the macOS host's `target/`. The `bloom-cargo-cache` named
   volume persists this between runs; `docker volume rm bloom-cargo-cache`
   to nuke.
-- Public Base RPC has 1–2 block lag across replicas. `--enso-live` polls final
-  balances for 60s and accepts ≤5 raw aBaseUSDC dust as success.
-- `--enso-live` mounts the live home **read-only**; the daemon runs from a
-  throwaway copy of the keystore. A bad test cannot corrupt the canonical home.
+Enso-specific integration tests now live with the
+[Enso Petal](https://github.com/bloom-directory/bloom-petal-enso). Validate
+that package with `scripts/check-route-architecture.sh`,
+`cargo test --manifest-path route/Cargo.toml`, `scripts/build.sh`, and
+`petal check --root .` from its source checkout.
 
 ### Acceptance script (`scripts/acceptance.sh`)
 
@@ -373,7 +357,7 @@ Useful when you suspect the CLI shim is hiding a daemon-side error.
 
 ```
 $BLOOM_HOME/
-├── config.toml          # chain config, etherscan/enso keys, broadcast policy
+├── config.toml          # chain config, etherscan key, broadcast policy
 ├── addressbook.toml     # local petname directory
 ├── audit.jsonl          # hash-chained audit log
 ├── run/bloom.sock        # UDS JSON-RPC socket (mode 0600)
@@ -411,10 +395,9 @@ Quick "if I changed X, what should I run?" matrix.
 | `bloom-revert` | `cargo test -p bloom-revert` then `cargo test -p bloom-it --test revert_decoding -- --ignored` (and `revert_decoding_fallbacks` with `--features bytecode-decompile` if you touched the heimdall path) |
 | `bloom-watch` | `cargo test -p bloom-watch -- --ignored` then `cargo test -p bloom-it --test rpc_ws_watch_handover -- --ignored` |
 | `bloom-mount` | `cargo test -p bloom-mount --features mount` then `bash tests/docker/run.sh --mount` (and `--fork` if you touched plumbing the wallet flow uses) |
-| `bloom-defi` (Enso client + parser) | `cargo test -p bloom-defi` then `bash tests/docker/run.sh --enso` (needs `BLOOM_ENSO_KEY`) |
 | `bloom-etherscan` | `cargo test -p bloom-etherscan` (and the live test if you have a key) |
 | `bloom-ens` | `cargo test -p bloom-ens` then the live test with `BLOOM_MAINNET_RPC` if applicable |
 | `bloom-prices` | `cargo test -p bloom-prices` |
 | `bloom-daemon` IPC / lifecycle | `cargo test -p bloom-daemon` then `cargo test -p bloom --test cli` |
 | `bloom` CLI | `cargo test -p bloom --test cli` then `./scripts/acceptance.sh` |
-| Anything load-bearing for live use | `bash tests/docker/run.sh --enso-live` (sources `test.env`, real funds) |
+| An installed Petal | Run its repository checks, then `bloom petals install <source> --ref <commit>` in an isolated Bloom home and inspect its route contract. |

@@ -43,7 +43,8 @@ If the external Polymarket Petal is installed, start with
 `cat petals/polymarket/README.md`, read `petals/polymarket/AGENTS.md`, then
 inspect `petals/polymarket/meta/route-contract.json` and list its route tree
 before using its prediction-market routes.
-Read `/defi/README.md` for DeFi intents via Enso shortcuts.
+When the Enso Petal is installed, read `/petals/enso/README.md` and use its
+documented intent, review, simulation, and confirmation lifecycle.
 
 ## Wallets
 

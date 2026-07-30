@@ -24,7 +24,7 @@ do not).
 6. [Outbox — stage, confirm, broadcast](#6-outbox--stage-confirm-broadcast)
 7. [Simulate — `eth_call` with overrides](#7-simulate--eth_call-with-overrides)
 8. [Watch — subscriptions](#8-watch--subscriptions)
-9. [DeFi intents (Enso shortcuts)](#9-defi-intents-enso-shortcuts)
+9. [Enso Petal](#9-enso-petal)
 10. [Tools — keccak, abi, rlp, eip-712, units](#10-tools--keccak-abi-rlp-eip-712-units)
 11. [ENS — forward, text, contenthash](#11-ens--forward-text-contenthash)
 12. [Prices (DefiLlama)](#12-prices-defillama)
@@ -937,8 +937,8 @@ ID=$(cat /bloom/simulate/last)
 cat /bloom/simulate/$ID/simulation.json    # return_data_hex carries the balance
 ```
 
-NFT intents go through the wallet outbox stage path. Enso routes go
-through `defi/intents/`.
+NFT intents go through the wallet outbox stage path. Enso routes use the
+installed Petal's `/petals/enso/intents/` surface.
 
 ---
 
@@ -1028,154 +1028,48 @@ timestamp on each `live` / `history` record.
 
 ---
 
-## 9. DeFi intents (Enso shortcuts)
+## 9. Enso Petal
 
-The `defi/intents/<wallet>/` surface is an "intent compiler": it turns
-a natural-language or JSON DeFi request into one or more concrete
-`RawIntent`s using the Enso Shortcuts API and forwards them — on
-confirm — into the wallet outbox.
-
-There are always two confirms:
-
-1. `defi/intents/<wallet>/<id>/confirm` — stages the routed plan
-   into `wallets/<w>/chains/<c>/outbox/pending/<tx-id>/`.
-2. `wallets/<w>/chains/<c>/outbox/pending/<tx-id>/confirm` — the
-   actual broadcast, where ordering, gas, and policy checks live.
-
-Sessions are durable under `~/.bloom/defi/<wallet>/sessions/`; one-shot
-`.../new` writes can be followed by later one-shot reads/confirm. Confirm is
-idempotent per prepared intent and reuses an already staged outbox entry.
-
-### Session layout
-
-```
-defi/
-  intents/
-    <wallet>/
-      new                 (writable; creates a session)
-      <session-id>/
-        intent.txt        (original NL intent)
-        route.json        (full Enso RouteResponse)
-        plan.md           (human narrative)
-        tx.json           (the prepared RawIntent list)
-        simulation.json   (eth_call result; recomputed on each cat)
-        settlement.json   (latest destination-chain settlement observation)
-        wait_settlement   (blocking settlement poller for cross-chain legs)
-        confirm           (writable; stages tx.json into outbox)
-```
-
-Session IDs include sequence, process id, and high-resolution timestamp.
-
-### Lifecycle: USDC → ETH on Ethereum (auto-approve)
+Enso swaps are supplied by the optional
+[bloom-petal-enso](https://github.com/bloom-directory/bloom-petal-enso)
+package, not a native Bloom core handler. Install it and provision the API key:
 
 ```sh
-# 1) Open a session — default chain is `ethereum`.
-echo 'swap 100 usdc to eth' > /bloom/defi/intents/alice/new
-
-# 2) See sessions.
-ls /bloom/defi/intents/alice/
-# new
-# 0001-12345
-
-# 3) Inspect.
-ls /bloom/defi/intents/alice/0001-12345/
-# intent.txt  route.json  plan.md  tx.json  simulation.json  settlement.json  wait_settlement  confirm
-
-cat /bloom/defi/intents/alice/0001-12345/plan.md
-# # DeFi intent
-#
-# Intent:    swap 100 usdc to eth
-# Chain:     ethereum (id 1)
-# From:      0xAlice...
-# Token in:  0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48  amount=100000000
-# Token out: 0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
-# Slippage:  50 bps
-# Tx to:     0x<EnsoRouter>
-#
-# ## Auto-approve
-# Existing allowance for 0xA0b8...eB48 -> 0x<EnsoRouter> is below 100000000.
-# An ERC-20 `approve(spender, max)` will be staged ahead of the swap.
-
-# 4) Read the prepared RawIntent list. For ERC-20 -> ETH with insufficient
-#    allowance, this is [approve(token, spender, max), raw(swap)].
-cat /bloom/defi/intents/alice/0001-12345/tx.json
-
-# 5) Optional dry-run via eth_call. Reverts get tiered-decoded.
-cat /bloom/defi/intents/alice/0001-12345/simulation.json
-
-# 6) First confirm: stage both intents into the wallet outbox.
-echo y > /bloom/defi/intents/alice/0001-12345/confirm
-
-# 7) Outbox now has two pending entries (approve, then swap).
-ls /bloom/wallets/alice/chains/ethereum/outbox/pending/
-
-# 8) Second confirm: the actual broadcast. Approve must mine first.
-echo y > /bloom/wallets/alice/chains/ethereum/outbox/pending/<approve-id>/confirm
-echo y > /bloom/wallets/alice/chains/ethereum/outbox/pending/<swap-id>/confirm
+bloom petals install https://github.com/bloom-directory/bloom-petal-enso
+bloom vfs write /petals/enso/settings/api-key --data 'your-enso-api-key'
 ```
 
-### JSON-explicit, receiver, and slippage override
-
-The handler accepts NL-only `echo '...' > new`, or JSON with `intent`,
-optional `chain`, `destination_chain`, `receiver`, and `slippage_bps`.
-`intent` stays in NL form for the Enso parser.
+Create a swap session, inspect every prepared artifact, then confirm:
 
 ```sh
-echo '{"intent":"swap 100 usdc to eth","chain":"ethereum"}' \
-  > /bloom/defi/intents/alice/new
+bloom vfs write /petals/enso/intents/alice/new \
+  --data 'swap 100 usdc to eth on base'
+bloom vfs ls /petals/enso/intents/alice
 
-# Override the 50-bps default slippage:
-echo '{"intent":"swap 100 usdc to eth","slippage_bps":100}' \
-  > /bloom/defi/intents/alice/new
-
-# Cross-chain routes must have a receiver. If omitted, Bloom defaults receiver
-# to the wallet EOA; for special destinations such as a Polymarket deposit
-# wallet, pass it explicitly and inspect `Receiver:` in plan.md.
-echo '{"intent":"swap 4.2 usdc to 0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174","chain":"base","destination_chain":"polygon","receiver":"0x1000000000000000000000000000000000000001","slippage_bps":50}' \
-  > /bloom/defi/intents/alice/new
-
-# To feed an explicit token address, embed the hex in the NL string:
-echo 'swap 100 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48 to ETH' \
-  > /bloom/defi/intents/alice/new
+session='<session-id>'
+bloom vfs cat "/petals/enso/intents/alice/$session/plan.md"
+bloom vfs cat "/petals/enso/intents/alice/$session/route.json"
+bloom vfs cat "/petals/enso/intents/alice/$session/tx.json"
+bloom vfs cat "/petals/enso/intents/alice/$session/simulation.json"
+bloom vfs write "/petals/enso/intents/alice/$session/confirm" --data confirm
 ```
 
-NL-only writes always use the 50-bps default; only the JSON form
-carries `slippage_bps`.
-
-### Cross-chain settlement
-
-For a cross-chain route, source-chain broadcast is not completion. After the
-outbox transaction is broadcast, read:
+The Petal confirmation stages into the standard wallet outbox; it does not
+broadcast. If the route needs an ERC-20 approval, the first confirmation stages
+only an exact-amount approval. Broadcast it, wait for a successful receipt, and
+confirm the Petal session again to stage the swap.
 
 ```sh
-cat /bloom/defi/intents/alice/<session>/settlement.json
-cat /bloom/defi/intents/alice/<session>/wait_settlement
+bloom vfs cat /wallets/alice/chains/base/outbox/pending/<id>/plan.md
+bloom vfs write \
+  /wallets/alice/chains/base/outbox/pending/<id>/confirm \
+  --data confirm
+bloom vfs cat \
+  "/petals/enso/intents/alice/$session/settlement.json"
 ```
 
-`settlement.json` reports chains, token, receiver, expected output, observed
-destination balance, and status. `wait_settlement` blocks until the destination
-token delta is observed or exits with `timeout_check_bridge`. Only create or
-confirm a dependent second leg after status is `destination_received`.
-
-### More swap examples
-
-```sh
-# ETH -> USDC on Ethereum (native in, no approve; tx.value carries ETH).
-echo 'swap 0.5 eth to usdc' > /bloom/defi/intents/alice/new
-
-# USDC -> DAI on Base (different chain, auto-approve).
-# Base USDC: 0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913
-# Base DAI:  0x50c5725949A6F0c72E6C4a641F24049A917DB0Cb
-echo 'swap 100 usdc to 0x50c5725949A6F0c72E6C4a641F24049A917DB0Cb on base' \
-  > /bloom/defi/intents/alice/new
-
-# ETH -> stETH on Lido (Lido stETH: 0xae7a...fE84).
-echo 'swap 1 eth to 0xae7ab96520DE3A18E5e111B5EaAb095312D7fE84' \
-  > /bloom/defi/intents/alice/new
-```
-
-The handler resolves only `USDC` by symbol on Base today; everything
-else needs the explicit hex address in the NL string.
+Read `docs/examples-domain/05-defi.md` and the installed Petal documentation
+for its complete safety model and current route contract.
 
 ---
 

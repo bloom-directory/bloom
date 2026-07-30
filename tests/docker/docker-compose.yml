@@ -1,10 +1,10 @@
 # Compose stack for the dockerized chain-mode integration tests.
 #
-# Two test driver services share one anvil-fork sidecar and one shared
-# cargo cache volume. Profiles select which driver runs:
+# Test driver services share one anvil-fork sidecar and one cargo cache
+# volume. Profiles select which driver runs:
 #
-#   docker compose -f tests/docker/docker-compose.yml --profile enso up
 #   docker compose -f tests/docker/docker-compose.yml --profile fork up
+#   docker compose -f tests/docker/docker-compose.yml --profile mempool up
 #
 # `anvil-fork` has no profile, so it always starts when *any* driver
 # is brought up. The two drivers never run together in practice (they
@@ -23,7 +23,7 @@ x-bloom-test: &bloom-test
   # Mount-side privileges: SYS_ADMIN for mount(), apparmor=unconfined to
   # bypass Debian's mount-blocking profile, /dev/fuse for the eventual
   # FUSE adapter (harmless today). seccomp=unconfined matches what the
-  # privileged single-container `--enso-live` path uses in run.sh.
+  # the single-container mount path uses in run.sh.
   cap_add:
     - SYS_ADMIN
   security_opt:
@@ -70,17 +70,6 @@ services:
       timeout: 2s
       retries: 60
       start_period: 5s
-
-  bloom-test-enso:
-    <<: *bloom-test
-    profiles: ["enso"]
-    container_name: bloom-enso-driver
-    environment:
-      - BLOOM_ENSO_KEY
-      - BLOOM_TEST_WALLET_PASSPHRASE=test
-      - BASE_FORK_INTERNAL_URL=http://anvil-fork:8545
-      - RUST_LOG=info
-    command: ["bash", "tests/docker/test_enso_aave.sh"]
 
   bloom-test-fork:
     <<: *bloom-test
@@ -131,8 +120,8 @@ services:
 volumes:
   bloom-cargo-cache:
     # Pin the literal name so this volume is the same one the
-    # non-compose paths in tests/docker/run.sh (--mount, --workspace,
-    # --enso-live) mount as `bloom-cargo-cache`. Without this,
+    # non-compose paths in tests/docker/run.sh (--mount and --workspace)
+    # mount as `bloom-cargo-cache`. Without this,
     # compose would mangle it to `<project>_bloom-cargo-cache` and
     # the cargo cache wouldn't carry over between modes.
     name: bloom-cargo-cache

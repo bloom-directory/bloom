@@ -1,5 +1,11 @@
 # bloom full-spec audit
 
+> Historical snapshot: this audit records the 2026-05-09 native-core
+> implementation. Enso was subsequently extracted into
+> [bloom-petal-enso](https://github.com/bloom-directory/bloom-petal-enso).
+> Current Enso paths begin at `/petals/enso/`; the former `/defi` handler,
+> `bloom-defi` crate, and core `--enso` Docker modes no longer exist.
+
 **Audit date:** 2026-05-09
 **Spec audited:** `docs/specs/2026-05-08-bloom-design.md`
 **Workspace:** 15 crates · `cargo build --workspace` clean ·
@@ -9,8 +15,9 @@ send) + 2 (ERC-20 transfer) through the mounted Sealed Approval gate
 against Anvil: initial confirm is denied and the central
 `approval_challenge.json` includes a local `ceremony_url`. Scenarios 3 + 4
 (Uniswap V2 + Enso on a mainnet fork) auto-skip without `BLOOM_MAINNET_RPC`.
-**Live:** `tests/docker/run.sh --enso-live` exercises Enso + Aave on
-Base mainnet through the mounted filesystem surface.
+**Historical live evidence:** the native implementation exercised Enso + Aave
+on Base mainnet before the Petal extraction. Current validation lives in the
+Enso Petal repository.
 
 This document is the prompt-to-artifact checklist required by the
 goal's quality gates. Statuses below: **shipped**, **partial**, or
@@ -76,7 +83,7 @@ data or rely on their own internal caches, e.g. the etherscan client).
 | Wallets: metadata, balance, nonce, policy round-trip | `wallets/<w>/{address,public_key,kind,policy.toml,chains/<c>/{balance,balance.raw,balance.json,nonce}}` | shipped | `wallets.rs`; covered by outbox tests + `acceptance.sh` |
 | Wallets: outbox stage / confirm | `wallets/<w>/chains/<c>/outbox/{new.tx,pending/<id>/{plan.md,policy_check.json,confirm},sent/<id>/*,failed/<id>/*}` | shipped | `wallets.rs::write_outbox` → `crates/bloom-tx/src/tx_engine.rs`. Intents: `send` (native + ERC-20), `approve`, `call`, `raw`, plus NFT writes — `nft_transfer` (auto-detects ERC-721 vs ERC-1155, optional `safe`/`amount`/`data`), `nft_approve` (per-token, ERC-721 only), `nft_approve_all` (`setApprovalForAll`, policy-warned). |
 | Wallets: sign — EIP-191 + raw hash + EIP-712 | `wallets/<w>/sign/{message,hash,typed_data}` (+ `.sig`) | shipped | `wallets.rs::write_sign` |
-| DeFi (Enso intents, route quoting, stage-confirm) | `defi/intents/<wallet>/{new,<sess>/{intent.txt,route.json,plan.md,tx.json,simulation.json,confirm}}` | shipped | `crates/bloom-vfs/src/handlers/defi.rs` + `crates/bloom-defi/src/lib.rs` |
+| DeFi (Enso intents, route quoting, stage-confirm) | `petals/enso/intents/<wallet>/{new,<sess>/{intent.txt,route.json,plan.md,tx.json,simulation.json,confirm}}` | extracted to Petal | [`bloom-petal-enso`](https://github.com/bloom-directory/bloom-petal-enso); installed applications mount through `crates/bloom-petals` |
 | Watch (subscriptions, executor task, events tail) | `watch/{new,<id>/{spec.toml,live,history.jsonl[.n],delete}}` | shipped | `crates/bloom-vfs/src/handlers/watch.rs` + `crates/bloom-watch/src/{lib.rs,executor.rs}`; executor started by `Daemon::from_home` |
 | Simulate (eth_call + state override + best-effort trace) | `simulate/{new,last,<id>/{intent.json,state-override.json,simulation.json,plan.md,trace.json}}` | shipped | `crates/bloom-vfs/src/handlers/simulate.rs` |
 | Tools (keccak, selector, address checksum, sha256, blake3, hex, base64, units, ABI encode/decode, RLP, EIP-712 hash) | `tools/{keccak,selector,address/checksum,sha256,blake3,hex,base64,unit/{parse,format},abi,rlp,eip712}/...` | shipped | `crates/bloom-vfs/src/handlers/tools.rs` + `crates/bloom-tools/src/lib.rs` (units helpers come from `crates/bloom-proto/src/units.rs`). |
@@ -163,12 +170,12 @@ Verified end-to-end via `tests/docker/run.sh --mempool`.
 | `cargo test --workspace --lib` | passing |
 | Anvil-backed tests (RPC, no mocks) | passing — `simulate::tests::anvil_*`, `acceptance.sh` |
 | Acceptance demo (native + ERC-20 on Anvil) | passing — `scripts/acceptance.sh` |
-| Acceptance demo (Uniswap V2 + Enso on mainnet fork) | gated on `BLOOM_MAINNET_RPC`; auto-skips with a clear message. |
+| Historical acceptance demo (Uniswap V2 + native Enso on mainnet fork) | retired with the native Enso integration; retained here as historical evidence. |
 | Dockerized NFS kernel-mount test | harness at `tests/docker/{Dockerfile,docker-compose.yml,lib.sh,run.sh,test*.sh}`. Native suite `cargo test -p bloom-mount --features mount` passing. |
 | Dockerized workspace tests | passing — `tests/docker/run.sh --workspace`. |
 | Dockerized fork-mode end-to-end | passing — `tests/docker/run.sh --fork` (compose profile `fork`) drives a native send + chain reads through the mount against an anvil fork of Base; no Enso key needed. |
-| Dockerized Enso/Aave on a fork | passing — `tests/docker/run.sh --enso` (compose profile `enso`) exercises the Enso → Aave flow against an anvil fork; gated on `BLOOM_ENSO_KEY`. |
-| Live broadcast on Base mainnet | passing — `tests/docker/run.sh --enso-live` exercises Enso + Aave with real Base broadcasts. |
+| Enso Petal route and package checks | maintained in `bloom-petal-enso`: route architecture, route crate tests, package build, and `petal check`. |
+| Historical live Enso broadcast evidence | retained below as provenance; the removed core `--enso-live` harness is not a current verification command. |
 
 ## Live-network verification (Base mainnet)
 
@@ -183,7 +190,7 @@ Verified end-to-end via `tests/docker/run.sh --mempool`.
 | Native ETH send (live) | Base, chain_id 8453 | `0xd4a496fb…3c40` — 0.001 ETH dest1→dest2 |
 | Enso swap (live) | Base, ETH → USDC via Enso router | `0x016fc370…9fc3` — 0.001 ETH → 2.306996 USDC |
 | Enso swap + Aave V3 deposit (live) | Base, ETH → aBaseUSDC | `0xab687461…e3ce` — 0.001 ETH → 2.308456 aBaseUSDC |
-| Aave V3 unwind | Base, aBaseUSDC → ETH via Enso route | exercised by `tests/docker/run.sh --enso-live` cleanup path. No Aave-specific code path: aToken→ETH goes through the same `EnsoClient::route` surface as any other swap; the auto-approve hop in `defi.rs` covers the aToken allowance. |
+| Aave V3 unwind | Base, aBaseUSDC → ETH via the former native Enso route | historical evidence from the retired native integration harness. |
 
 ## Known limitations / deferred items
 
@@ -224,7 +231,7 @@ crates/
 ├── bloom-chain          # alloy provider pool, ChainRegistry, ERC-20 reads
 ├── bloom-tx             # Tx engine, intent parser, policy_engine, RecipientResolver, PriceOracle, Outbox (rolling-USD)
 ├── bloom-keystore       # argon2id + chacha20poly1305 encrypted keystore
-├── bloom-defi           # Enso shortcuts client + natural-language intent parser
+├── bloom-petals         # installed application packages and /petals/<name>/ routing
 ├── bloom-watch          # Subscription registry + executor task + event log rotation
 ├── bloom-tools          # Pure crypto/abi/encoding utilities
 ├── bloom-etherscan      # Etherscan client + TTL cache
@@ -243,10 +250,13 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace --lib
 cargo build --release -p bloom
 scripts/acceptance.sh                              # native + ERC-20 on Anvil
-BLOOM_MAINNET_RPC=... scripts/acceptance.sh          # adds Uniswap V2 + Enso scenarios
+BLOOM_MAINNET_RPC=... scripts/acceptance.sh          # enables applicable live-network scenarios
 tests/docker/run.sh                                 # NFS kernel-mount harness (default)
 tests/docker/run.sh --workspace                     # workspace tests inside container
 tests/docker/run.sh --fork                          # native send + chain reads via anvil-fork
-tests/docker/run.sh --enso                          # Enso → Aave flow via anvil-fork (needs BLOOM_ENSO_KEY)
-tests/docker/run.sh --enso-live                     # live Base broadcasts
+# In a bloom-petal-enso checkout:
+scripts/check-route-architecture.sh
+cargo test --manifest-path route/Cargo.toml
+scripts/build.sh
+petal check --root .
 ```
