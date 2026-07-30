@@ -233,10 +233,25 @@ jobs:
             exit 1
           fi
 
+          version_at_least() {
+            local left right lpart rpart
+            IFS=. read -r -a left <<< "${1#v}"
+            IFS=. read -r -a right <<< "${2#v}"
+            for i in 0 1 2; do
+              lpart=$((10#${left[$i]}))
+              rpart=$((10#${right[$i]}))
+              if (( lpart > rpart )); then return 0; fi
+              if (( lpart < rpart )); then return 1; fi
+            done
+            return 0
+          }
+
           PREVIOUS_TAG=""
           while IFS= read -r CANDIDATE; do
             if [[ "$CANDIDATE" != "$TAG" \
-              && "$CANDIDATE" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              && "$CANDIDATE" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+              && ! version_at_least "$CANDIDATE" "$TAG"
+            then
               PREVIOUS_TAG="$CANDIDATE"
               break
             fi
@@ -302,18 +317,6 @@ jobs:
               exit "$GH_STATUS"
             fi
           fi
-          version_at_least() {
-            local left right lpart rpart
-            IFS=. read -r -a left <<< "${1#v}"
-            IFS=. read -r -a right <<< "${2#v}"
-            for i in 0 1 2; do
-              lpart=$((10#${left[$i]}))
-              rpart=$((10#${right[$i]}))
-              if (( lpart > rpart )); then return 0; fi
-              if (( lpart < rpart )); then return 1; fi
-            done
-            return 0
-          }
           MARK_LATEST=false
           if [[ -z "$CURRENT_LATEST" || "$CURRENT_LATEST" == "latest" ]]; then
             MARK_LATEST=true
