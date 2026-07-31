@@ -11,6 +11,8 @@ Useful commands:
 - `cat docs/README.md` reads the VFS overview.
 - `cat docs/examples.md` reads workflow examples.
 - `cat docs/petals.md` discovers the Petals installed in this Bloom home.
+- `ls chains` lists configured networks; fresh homes include Robinhood Chain as
+  `chains/robinhood` (chain ID `4663`).
 
 For more information, start in the `docs` folder. It contains the canonical
 VFS usage notes and examples exposed by the mounted tree.

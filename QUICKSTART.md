@@ -42,11 +42,12 @@ BLOOM_HOME=/tmp/bloom-demo cargo run -p bloom -- init
 ```
 
 This prints the home dir, config path, and configured chains. The
-default config registers eleven read-ready public EVM chains (Ethereum,
-Base, Tempo, Arbitrum, Optimism, Polygon, BNB Smart Chain, Avalanche,
-Gnosis, Linea, HyperEVM) plus `anvil` at `http://127.0.0.1:8545`. Per-chain
-`allow_broadcast` defaults to `true`. Value-moving actions still require the
-applicable signing, policy, and confirmation gates.
+default config registers twelve read-ready public EVM chains (Ethereum,
+Base, Tempo, Robinhood Chain, Arbitrum, Optimism, Polygon, BNB Smart Chain,
+Avalanche, Gnosis, Linea, HyperEVM) plus `anvil` at
+`http://127.0.0.1:8545`. Per-chain `allow_broadcast` defaults to `true`.
+Value-moving actions still require the applicable signing, policy, and
+confirmation gates.
 
 ## 2. Start a local devnet
 
@@ -225,10 +226,9 @@ it expire after the configured TTL) cancels the stage.
   `bloom-petal-polymarket` package. It appears at `/petals/polymarket/`; inspect
   `meta/route-contract.json` and list the route tree for the exact installed
   workflow.
-- **Zero-config chain reads** — Ethereum, Base, Arbitrum, Optimism,
-  Polygon, BNB Smart Chain, Avalanche, Gnosis, Linea, HyperEVM, and
-  Anvil are present after `bloom init`; live-network broadcasts remain
-  opt-in.
+- **Zero-config chain reads** — Ethereum, Base, Tempo, Robinhood Chain,
+  Arbitrum, Optimism, Polygon, BNB Smart Chain, Avalanche, Gnosis, Linea,
+  HyperEVM, and Anvil are present after `bloom init`.
 - **Address book** — `addressbook/<alias>` round-trips via FS.
 - **EIP-712 / personal_sign / raw-hash signing** — write to
   `wallets/<w>/sign/{message,hash,typed_data}`; the signature lands at

@@ -32,10 +32,10 @@ All paths below are relative to the Bloom VFS root.
 - `prices/` — DefiLlama price oracle (current / historical).
 - `addressbook/` — local petname directory.
 
-Default config includes read-ready RPCs for Ethereum, Base, Arbitrum,
-Optimism, Polygon, BNB Smart Chain, Avalanche, Gnosis, Linea, HyperEVM,
-and local Anvil. Live-network broadcasts remain disabled until the user
-opts in via config.
+Default config includes read-ready RPCs for Ethereum, Base, Tempo, Robinhood
+Chain, Arbitrum, Optimism, Polygon, BNB Smart Chain, Avalanche, Gnosis, Linea,
+HyperEVM, and local Anvil. Per-chain broadcasting is enabled by default;
+value-moving actions still require the applicable approval gates.
 
 ## Reading
 

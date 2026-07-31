@@ -349,6 +349,13 @@ fn default_chains() -> BTreeMap<String, ChainSpec> {
             "ETH",
         ),
         evm_chain(
+            "robinhood",
+            4663,
+            &["https://rpc.mainnet.chain.robinhood.com"],
+            "Robinhood Chain",
+            "ETH",
+        ),
+        evm_chain(
             "arbitrum",
             42161,
             &[
@@ -681,7 +688,7 @@ mod tests {
             hyperliquid.testnet_url,
             "https://api.hyperliquid-testnet.xyz"
         );
-        assert_eq!(cfg.chains.len(), 12);
+        assert_eq!(cfg.chains.len(), 13);
         let ethereum = cfg.chains.get("ethereum").expect("ethereum entry");
         assert_eq!(ethereum.chain_id, 1);
         assert!(ethereum.allow_broadcast);
@@ -691,6 +698,14 @@ mod tests {
         let tempo = cfg.chains.get("tempo").expect("tempo entry");
         assert_eq!(tempo.chain_id, 4217);
         assert_eq!(tempo.rpc_urls, vec!["https://rpc.tempo.xyz"]);
+        let robinhood = cfg.chains.get("robinhood").expect("robinhood entry");
+        assert_eq!(robinhood.chain_id, 4663);
+        assert_eq!(
+            robinhood.rpc_urls,
+            vec!["https://rpc.mainnet.chain.robinhood.com"]
+        );
+        assert_eq!(robinhood.display_name.as_deref(), Some("Robinhood Chain"));
+        assert_eq!(robinhood.native_symbol, "ETH");
         let hyperliquid = cfg.chains.get("hyperliquid").expect("hyperliquid entry");
         assert_eq!(hyperliquid.chain_id, 999);
         let anvil = cfg.chains.get("anvil").expect("anvil entry");
