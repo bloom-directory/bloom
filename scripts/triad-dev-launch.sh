@@ -25,8 +25,10 @@ while [ "$#" -gt 0 ]; do
     *) die "unknown argument: $1" ;;
   esac
 done
-for value in "$developer_root" "$machine_home" "$mount_dir" "$machine_socket" "$log_dir" "$ready_file"; do
-  [ -n "$value" ] || die "all launcher paths are required"
+required_paths=("$developer_root" "$machine_home" "$machine_socket" "$log_dir" "$ready_file")
+for value in "${required_paths[@]}"; do
+  [ -n "$value" ] ||
+    die "developer root, Machine home/socket, log dir, and ready file are required"
 done
 case "$install_authority_fixture" in
   0|1) ;;
@@ -38,10 +40,20 @@ umask 077
 mkdir -p "$developer_root"
 chmod 0700 "$developer_root"
 developer_root="$(cd "$developer_root" && pwd -P)"
-mkdir -p "$machine_home" "$mount_dir" "$log_dir" \
+mkdir -p "$machine_home" "$log_dir" \
   "$(dirname "$machine_socket")" "$(dirname "$ready_file")"
 machine_home="$(cd "$machine_home" && pwd -P)"
-mount_dir="$(cd "$mount_dir" && pwd -P)"
+if [ -d "${HOME}/.bloom" ]; then
+  canonical_machine_home="$(cd "${HOME}/.bloom" && pwd -P)"
+else
+  canonical_machine_home="$(cd "$HOME" && pwd -P)/.bloom"
+fi
+[ "$machine_home" != "$canonical_machine_home" ] ||
+  die "refusing to use canonical ~/.bloom as the mutable developer Machine home"
+if [ -n "$mount_dir" ]; then
+  mkdir -p "$mount_dir"
+  mount_dir="$(cd "$mount_dir" && pwd -P)"
+fi
 log_dir="$(cd "$log_dir" && pwd -P)"
 machine_socket="$(cd "$(dirname "$machine_socket")" && pwd -P)/$(basename "$machine_socket")"
 ready_file="$(cd "$(dirname "$ready_file")" && pwd -P)/$(basename "$ready_file")"
@@ -182,6 +194,8 @@ env_file="${log_dir}/triad.env"
   printf 'export BLOOM_TRIAD_DEVELOPER_ROOT=%q\n' "$developer_root"
   printf 'export BLOOM_TRIAD_DEVELOPER_RUNTIME=%q\n' "$runtime_dir"
   printf 'export BLOOM_HOME=%q\n' "$machine_home"
+  printf 'export BLOOM_BIN=%q\n' "$bloom_bin"
+  printf 'export BLOOM_RPC_ENDPOINT=%q\n' "unix:${machine_socket}"
   printf 'export BLOOM_BROKER_SOCKET=%q\n' "$broker_socket"
   printf 'export BLOOM_BROKER_AUDIT_CHECKPOINT_DIR=%q\n' "$broker_checkpoint_dir"
   printf 'export BLOOM_SIGNER_AUDIT_CHECKPOINT_DIR=%q\n' "$signer_checkpoint_dir"
@@ -216,12 +230,20 @@ wait_for_socket() {
   while [ ! -S "$path" ]; do
     kill -0 "$pid" 2>/dev/null || {
       tail -n 80 "${log_dir}/${label}.log" >&2 || true
+      if [ "$label" = machine ] && [ -n "$mount_dir" ]; then
+        mount_fallback_hint
+      fi
       die "$label exited before publishing its socket"
     }
     attempts=$((attempts + 1))
     [ "$attempts" -lt 300 ] || die "$label did not publish its socket"
     sleep 0.1
   done
+}
+
+mount_fallback_hint() {
+  printf '%s\n' \
+    'If this macOS version cannot mount NFS 4.1, restart without --mount and use bloom vfs commands.' >&2
 }
 
 BLOOM_TRIAD_DEVELOPER_ROOT="$developer_root" \
@@ -337,39 +359,60 @@ mount_is_live() {
 
 start_machine() {
   rm -f -- "$machine_socket"
+  machine_args=(--home "$machine_home" serve --endpoint "unix:${machine_socket}")
+  if [ -n "$mount_dir" ]; then
+    machine_args+=(--mount "$mount_dir")
+  fi
   BLOOM_TRIAD_DEVELOPER_ROOT="$developer_root" \
   BLOOM_BROKER_SOCKET="$broker_socket" \
   BLOOM_MACHINE_IDENTITY="${config_dir}/machine-identity.json" \
   BLOOM_EDGE_MANIFEST="${config_dir}/edge-manifest.json" \
   BLOOM_PROVENANCE_CATALOG="${config_dir}/provenance-catalog.json" \
-    "$bloom_bin" --home "$machine_home" serve \
-      --endpoint "unix:${machine_socket}" --mount "$mount_dir" \
+    "$bloom_bin" "${machine_args[@]}" \
       >>"${log_dir}/machine.log" 2>&1 &
   machine_pid=$!
   printf '%s\n' "$machine_pid" > "${log_dir}/machine.pid"
   chmod 0600 "${log_dir}/machine.pid"
   wait_for_socket "$machine_socket" "$machine_pid" machine
-  mount_attempts=0
-  while ! mount_is_live; do
-    kill -0 "$machine_pid" 2>/dev/null || die "Machine exited before its kernel mount became ready"
-    mount_attempts=$((mount_attempts + 1))
-    [ "$mount_attempts" -lt 300 ] || die "Machine socket became ready but its kernel mount did not"
-    sleep 0.1
-  done
+  wait_for_machine_ipc
+  if [ -n "$mount_dir" ]; then
+    mount_attempts=0
+    while ! mount_is_live; do
+      kill -0 "$machine_pid" 2>/dev/null || {
+        tail -n 80 "${log_dir}/machine.log" >&2 || true
+        mount_fallback_hint
+        die "Machine exited before its requested kernel mount became ready"
+      }
+      mount_attempts=$((mount_attempts + 1))
+      [ "$mount_attempts" -lt 300 ] || {
+        mount_fallback_hint
+        die "Machine socket became ready but its requested kernel mount did not"
+      }
+      sleep 0.1
+    done
+  fi
 }
 
 : > "${log_dir}/machine.log"
 start_machine
 printf 'ready\n' > "$ready_file"
-while kill -0 "$machine_pid" 2>/dev/null; do
-  if ! mount_is_live; then
-    printf 'triad developer launcher: Machine mount disappeared; restarting Machine only\n' >&2
-    kill "$machine_pid" 2>/dev/null || true
-    wait "$machine_pid" 2>/dev/null || true
-    machine_pid=""
-    start_machine
-    printf 'ready\n' > "$ready_file"
-  fi
-  sleep 1
-done
+if [ -z "$mount_dir" ]; then
+  printf '%s\n' \
+    'Bloom is ready without a kernel mount.' \
+    "  source ${env_file}" \
+    '  "$BLOOM_BIN" vfs ls /' \
+    '  "$BLOOM_BIN" vfs cat /next.md'
+else
+  while kill -0 "$machine_pid" 2>/dev/null; do
+    if ! mount_is_live; then
+      printf 'triad developer launcher: Machine mount disappeared; restarting Machine only\n' >&2
+      kill "$machine_pid" 2>/dev/null || true
+      wait "$machine_pid" 2>/dev/null || true
+      machine_pid=""
+      start_machine
+      printf 'ready\n' > "$ready_file"
+    fi
+    sleep 1
+  done
+fi
 wait "$machine_pid"

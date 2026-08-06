@@ -102,10 +102,39 @@ source /tmp/bloom-triad-logs/triad.env
 target/debug/bloom wallet import WALLET_NAME   # or: wallet new WALLET_NAME
 ```
 
+If macOS cannot mount Bloom's NFS 4.1 VFS, omit `--mount` and use the VFS CLI
+against the same running triad:
+
+```bash
+mkdir -p ~/.bloom/triad-dev/machine-home /tmp/bloom-triad-logs
+scripts/triad-dev-launch.sh \
+  --developer-root ~/.bloom/triad-dev \
+  --machine-home ~/.bloom/triad-dev/machine-home \
+  --machine-socket /tmp/bloom-triad-machine.sock \
+  --log-dir /tmp/bloom-triad-logs \
+  --ready-file /tmp/bloom-triad-ready
+```
+
+Then, from another terminal:
+
+```bash
+source /tmp/bloom-triad-logs/triad.env
+"$BLOOM_BIN" vfs ls /
+"$BLOOM_BIN" vfs cat /next.md
+```
+
+`triad.env` selects both the exact developer binary and its authenticated
+Machine IPC endpoint. Supplying `--mount` remains fail-closed: the launcher
+will not silently switch modes when a requested mount fails. The
+`local-mainnet-integration.sh` and projection-fidelity runners below still
+require a supported kernel mount because they intentionally test mounted path
+behavior.
+
 Open the printed Broker ceremony URL. Registration creates a fresh address;
 import requires entering the key only in the Broker-hosted browser ceremony.
-Stop the launcher after the wallet appears under the mount. Subsequent runner
-invocations reuse that Signer state and select it with `--wallet WALLET_NAME`.
+Stop the launcher after the wallet appears under the mount, or under
+`"$BLOOM_BIN" vfs ls /wallets` in VFS-only mode. Subsequent runner invocations
+reuse that Signer state and select it with `--wallet WALLET_NAME`.
 
 ## 1. Run preflight
 

@@ -267,6 +267,49 @@ fn release_bundle_rejects_triad_developer_harness_artifacts() {
 }
 
 #[test]
+fn triad_developer_launcher_supports_vfs_only_mode() {
+    let launcher = fs::read_to_string(workspace().join("scripts/triad-dev-launch.sh")).unwrap();
+
+    assert!(
+        launcher.contains("required_paths=(\"$developer_root\" \"$machine_home\" \"$machine_socket\" \"$log_dir\" \"$ready_file\")"),
+        "the developer launcher must not require --mount"
+    );
+    assert!(
+        launcher.contains("Bloom is ready without a kernel mount")
+            && launcher.contains("\"$BLOOM_BIN\" vfs ls /")
+            && launcher.contains("\"$BLOOM_BIN\" vfs cat /next.md"),
+        "VFS-only startup must tell the developer how to use the running Machine"
+    );
+}
+
+#[test]
+fn triad_developer_launcher_exports_its_machine_connection() {
+    let launcher = fs::read_to_string(workspace().join("scripts/triad-dev-launch.sh")).unwrap();
+
+    assert!(
+        launcher.contains("printf 'export BLOOM_RPC_ENDPOINT=%q\\n' \"unix:${machine_socket}\"")
+            && launcher.contains("printf 'export BLOOM_BIN=%q\\n' \"$bloom_bin\""),
+        "triad.env must select the launched Machine and exact bloom binary"
+    );
+}
+
+#[test]
+fn triad_developer_launcher_keeps_explicit_mounts_fail_closed() {
+    let launcher = fs::read_to_string(workspace().join("scripts/triad-dev-launch.sh")).unwrap();
+
+    assert!(
+        launcher.contains("if [ -n \"$mount_dir\" ]; then")
+            && launcher.contains("machine_args+=(--mount \"$mount_dir\")"),
+        "an explicitly requested mount must still be passed to bloom serve"
+    );
+    assert!(
+        launcher.contains("Machine exited before its requested kernel mount became ready")
+            && launcher.contains("restart without --mount and use bloom vfs commands"),
+        "a requested mount must fail with an actionable VFS-only fallback"
+    );
+}
+
+#[test]
 fn production_release_rejects_machine_audit_test_features() {
     let gate =
         fs::read_to_string(workspace().join("packaging/triad/release/triad-release-gate.sh"))
