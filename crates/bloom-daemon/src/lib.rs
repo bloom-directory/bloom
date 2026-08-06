@@ -2711,9 +2711,6 @@ impl Daemon {
                 ));
             }
         }
-        if broker.is_some() && tokio::runtime::Handle::try_current().is_ok() {
-            spawn_wallet_projection_refresh(wallet_projections.clone(), audit_arc.clone());
-        }
         let path_cache = Arc::new(PathCache::new());
 
         let watch_registry = Arc::new(
@@ -3054,46 +3051,10 @@ impl Daemon {
         // Answers: what wallets need attention, what confirms are pending,
         // what capabilities are active/expired/orphaned, what risk data is stale.
         let next_wallet_projections = wallet_projections.clone();
-        let next_renderer: Arc<dyn Fn() -> Vec<u8> + Send + Sync> = Arc::new(move || {
-            let mut md = String::from("# Next Actions\n\n");
-            let (wallets, wallet_projection_unavailable) =
-                match next_wallet_projections.cached_wallets() {
-                    Ok(wallets) => (wallets, false),
-                    Err(_) => (Vec::new(), true),
-                };
-
-            if wallet_projection_unavailable {
-                md.push_str("## Wallet Projections Unavailable\n\n");
-                md.push_str(
-                    "Broker is offline and no cached public wallet projection is available. Authority operations remain fail-closed.\n\n",
-                );
-            }
-
-            // 1. Stale public projections remain readable but never authorize.
-            let stale_wallets: Vec<String> = wallets
-                .iter()
-                .filter(|projection| {
-                    projection.freshness == bloom_machine_client::ProjectionFreshness::Stale
-                })
-                .map(|projection| projection.wallet.wallet_id.as_str().to_owned())
-                .collect();
-            if !stale_wallets.is_empty() {
-                md.push_str("## Stale Wallet Projections\n\n");
-                for wallet in &stale_wallets {
-                    md.push_str(&format!(
-                        "- `{wallet}`: cached public data is **stale**; signing and custody still require Broker\n"
-                    ));
-                }
-                md.push('\n');
-            }
-
-            if !wallet_projection_unavailable && stale_wallets.is_empty() {
-                md.push_str("No wallets with pending actions.\n\n");
-                md.push_str("All policies are signed and no outbox confirms await review.\n");
-            }
-            md.into_bytes()
+        vfs_builder = vfs_builder.with_root_dynamic("next.md", move || {
+            let projections = next_wallet_projections.clone();
+            async move { render_next_actions(projections.as_ref()).await }
         });
-        vfs_builder = vfs_builder.with_root_dynamic("next.md", next_renderer);
 
         let vfs = vfs_builder
             .with_audit(audit_arc.clone())
@@ -3353,6 +3314,11 @@ impl Daemon {
     /// these tasks; this is primarily for `bloom serve` and the in-process
     /// daemon used by integration tests.
     pub fn spawn_background_tasks(&self) -> BackgroundTasks {
+        // Refresh public wallet projections only for a long-lived daemon.
+        // The refresh is deliberately best-effort: cached projections and
+        // Broker-independent VFS routes remain available while Broker is down.
+        spawn_wallet_projection_refresh(self.wallet_projections.clone(), self.audit.clone());
+
         // Only long-lived daemons poll GitHub. Most CLI commands construct
         // an in-process Daemon, so starting this in `from_home` would turn
         // every `vfs cat`/`ls` invocation into an immediate API request.
@@ -3423,6 +3389,45 @@ impl Daemon {
     ) -> Result<bloom_mount::NfsMountHandle, bloom_mount::MountError> {
         bloom_mount::serve_nfs(self.vfs.clone(), path).await
     }
+}
+
+async fn render_next_actions(projections: &dyn WalletProjectionReader) -> Vec<u8> {
+    let mut md = String::from("# Next Actions\n\n");
+    let (wallets, wallet_projection_unavailable) = match projections.list_wallets().await {
+        Ok(wallets) => (wallets, false),
+        Err(_) => (Vec::new(), true),
+    };
+
+    if wallet_projection_unavailable {
+        md.push_str("## Wallet Projections Unavailable\n\n");
+        md.push_str(
+            "Broker is offline and no cached public wallet projection is available. Authority operations remain fail-closed.\n\n",
+        );
+    }
+
+    // Stale public projections remain readable but never authorize.
+    let stale_wallets: Vec<String> = wallets
+        .iter()
+        .filter(|projection| {
+            projection.freshness == bloom_machine_client::ProjectionFreshness::Stale
+        })
+        .map(|projection| projection.wallet.wallet_id.as_str().to_owned())
+        .collect();
+    if !stale_wallets.is_empty() {
+        md.push_str("## Stale Wallet Projections\n\n");
+        for wallet in &stale_wallets {
+            md.push_str(&format!(
+                "- `{wallet}`: cached public data is **stale**; signing and custody still require Broker\n"
+            ));
+        }
+        md.push('\n');
+    }
+
+    if !wallet_projection_unavailable && stale_wallets.is_empty() {
+        md.push_str("No wallets with pending actions.\n\n");
+        md.push_str("All policies are signed and no outbox confirms await review.\n");
+    }
+    md.into_bytes()
 }
 
 fn run_expiry_sweep_once(
@@ -3757,6 +3762,26 @@ mod tests {
         {
             Ok(Vec::new())
         }
+    }
+
+    #[tokio::test]
+    async fn next_actions_refreshes_wallet_projections_before_rendering() {
+        let projections = ProjectionRefreshFixture {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+
+        let rendered = render_next_actions(&projections).await;
+
+        assert_eq!(
+            projections.calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "/next.md must explicitly request the current wallet projection"
+        );
+        assert!(
+            String::from_utf8(rendered)
+                .unwrap()
+                .starts_with("# Next Actions\n")
+        );
     }
 
     #[async_trait::async_trait]
@@ -5243,6 +5268,47 @@ ws_url = "wss://example.invalid"
             daemon.update_shutdown.lock().is_empty(),
             "short-lived daemon construction must not start the GitHub update refresher"
         );
+    }
+
+    #[test]
+    fn daemon_construction_does_not_launch_wallet_projection_refresh() {
+        let source = include_str!("lib.rs");
+        let constructor_start = source.find("fn from_home_inner(").unwrap();
+        let constructor_end = source[constructor_start..]
+            .find("\n    pub fn start_workers")
+            .map(|offset| constructor_start + offset)
+            .unwrap();
+        let constructor = &source[constructor_start..constructor_end];
+
+        assert!(
+            !constructor.contains("spawn_wallet_projection_refresh("),
+            "short-lived daemon construction must not contact Broker to refresh wallet projections"
+        );
+    }
+
+    #[tokio::test]
+    async fn long_lived_background_tasks_launch_wallet_projection_refresh() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut daemon = Daemon::from_home(HomeDir::at(directory.path())).unwrap();
+        let projections = Arc::new(ProjectionRefreshFixture {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        daemon.wallet_projections = projections.clone();
+
+        let tasks = daemon.spawn_background_tasks();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while projections.calls.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("long-lived daemon did not launch wallet projection refresh");
+        assert_eq!(
+            projections.calls.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        tasks.shutdown().await;
+        daemon.shutdown().await;
     }
 
     /// Fix #3: the spawned sweeper drops expired pending entries into

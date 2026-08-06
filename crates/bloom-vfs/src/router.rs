@@ -11,6 +11,8 @@
 //!    invalidate the exact path and the whole top-level prefix.
 
 use std::collections::BTreeMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -43,7 +45,8 @@ pub struct Vfs {
     root_dynamic: Arc<BTreeMap<String, Arc<RootContentRenderer>>>,
 }
 
-type RootContentRenderer = dyn Fn() -> Vec<u8> + Send + Sync;
+type RootContentFuture = Pin<Box<dyn Future<Output = Vec<u8>> + Send + 'static>>;
+type RootContentRenderer = dyn Fn() -> RootContentFuture + Send + Sync;
 
 impl Default for Vfs {
     fn default() -> Self {
@@ -283,7 +286,7 @@ impl Handler for Vfs {
             return Ok(AGENT_GUIDANCE.to_vec());
         }
         if let Some(renderer) = root_dynamic_renderer(path, &self.root_dynamic) {
-            return Ok(renderer());
+            return Ok(renderer().await);
         }
         let head = path
             .first()
@@ -452,8 +455,13 @@ impl VfsBuilder {
         self
     }
 
-    pub fn with_root_dynamic(mut self, name: &str, renderer: Arc<RootContentRenderer>) -> Self {
-        self.root_dynamic.insert(name.into(), renderer);
+    pub fn with_root_dynamic<F, Fut>(mut self, name: &str, renderer: F) -> Self
+    where
+        F: Fn() -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Vec<u8>> + Send + 'static,
+    {
+        self.root_dynamic
+            .insert(name.into(), Arc::new(move || Box::pin(renderer())));
         self
     }
 
@@ -620,6 +628,30 @@ mod tests {
         let vfs = Vfs::builder().mount("echo", Arc::new(EchoHandler)).build();
         let r = vfs.lookup(&VfsPath::parse("/nope").unwrap()).await;
         assert!(matches!(r, Err(HandlerError::NotFound(_))));
+    }
+
+    #[tokio::test]
+    async fn root_dynamic_renderer_awaits_async_content() {
+        let rendered = Arc::new(AtomicUsize::new(0));
+        let rendered_by_source = rendered.clone();
+        let vfs = Vfs::builder()
+            .with_root_dynamic("dynamic.md", move || {
+                let rendered = rendered_by_source.clone();
+                async move {
+                    tokio::task::yield_now().await;
+                    rendered.fetch_add(1, Ordering::SeqCst);
+                    b"async root content".to_vec()
+                }
+            })
+            .build();
+
+        let body = vfs
+            .read(&VfsPath::parse("/dynamic.md").unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(body, b"async root content");
+        assert_eq!(rendered.load(Ordering::SeqCst), 1);
     }
 
     /// Handler that counts calls so we can prove the cache is short-
