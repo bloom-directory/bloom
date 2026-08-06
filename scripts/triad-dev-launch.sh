@@ -57,6 +57,9 @@ fi
 log_dir="$(cd "$log_dir" && pwd -P)"
 machine_socket="$(cd "$(dirname "$machine_socket")" && pwd -P)/$(basename "$machine_socket")"
 ready_file="$(cd "$(dirname "$ready_file")" && pwd -P)/$(basename "$ready_file")"
+if [ -e "$machine_socket" ] || [ -L "$machine_socket" ]; then
+  die "machine socket path already exists: $machine_socket"
+fi
 
 bloom_bin="${BLOOM_INTEGRATION_MACHINE_BIN:-${repo_root}/target/debug/bloom}"
 broker_bin="${BLOOM_INTEGRATION_BROKER_BIN:-${broker_repo}/target/debug/bloom-broker}"
@@ -236,7 +239,12 @@ wait_for_socket() {
       die "$label exited before publishing its socket"
     }
     attempts=$((attempts + 1))
-    [ "$attempts" -lt 300 ] || die "$label did not publish its socket"
+    [ "$attempts" -lt 300 ] || {
+      if [ "$label" = machine ] && [ -n "$mount_dir" ]; then
+        mount_fallback_hint
+      fi
+      die "$label did not publish its socket"
+    }
     sleep 0.1
   done
 }
@@ -244,6 +252,21 @@ wait_for_socket() {
 mount_fallback_hint() {
   printf '%s\n' \
     'If this macOS version cannot mount NFS 4.1, restart without --mount and use bloom vfs commands.' >&2
+}
+
+wait_for_machine_ipc() {
+  attempts=0
+  while ! BLOOM_RPC_ENDPOINT="unix:${machine_socket}" \
+    "$bloom_bin" --home "$machine_home" vfs ls / >/dev/null 2>&1
+  do
+    kill -0 "$machine_pid" 2>/dev/null || {
+      tail -n 80 "${log_dir}/machine.log" >&2 || true
+      die "Machine exited before its IPC endpoint became ready"
+    }
+    attempts=$((attempts + 1))
+    [ "$attempts" -lt 300 ] || die "Machine socket did not pass its IPC readiness probe"
+    sleep 0.1
+  done
 }
 
 BLOOM_TRIAD_DEVELOPER_ROOT="$developer_root" \
@@ -395,6 +418,7 @@ start_machine() {
 
 : > "${log_dir}/machine.log"
 start_machine
+kill -0 "$machine_pid" 2>/dev/null || die "Machine exited before readiness could be published"
 printf 'ready\n' > "$ready_file"
 if [ -z "$mount_dir" ]; then
   printf '%s\n' \

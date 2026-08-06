@@ -13,6 +13,7 @@ mod price_oracle;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use alloy::network::TransactionBuilder;
@@ -71,6 +72,8 @@ use thiserror::Error;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
+
+const WALLET_PROJECTION_LIVE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// §20 production background-effect inventory. Security-relevant network
 /// decisions and durable projections are journaled; purely observational
@@ -2359,6 +2362,9 @@ pub struct Daemon {
     /// `Daemon::shutdown` drains this alongside the other
     /// background-task shutdown channels.
     pub update_shutdown: Arc<parking_lot::Mutex<Vec<tokio::sync::oneshot::Sender<()>>>>,
+    /// Shared one-shot latch preventing duplicate audited boot refreshes when
+    /// background task startup is requested more than once.
+    pub wallet_projection_refresh_started: Arc<AtomicBool>,
 }
 
 impl Daemon {
@@ -3051,7 +3057,7 @@ impl Daemon {
         // Answers: what wallets need attention, what confirms are pending,
         // what capabilities are active/expired/orphaned, what risk data is stale.
         let next_wallet_projections = wallet_projections.clone();
-        vfs_builder = vfs_builder.with_root_dynamic("next.md", move || {
+        vfs_builder = vfs_builder.with_root_dynamic_async("next.md", move || {
             let projections = next_wallet_projections.clone();
             async move { render_next_actions(projections.as_ref()).await }
         });
@@ -3262,6 +3268,7 @@ impl Daemon {
             bump_shutdown: Arc::new(parking_lot::Mutex::new(bump_shutdown)),
             probe_shutdown: Arc::new(parking_lot::Mutex::new(probe_shutdown)),
             update_shutdown: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            wallet_projection_refresh_started: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -3317,7 +3324,13 @@ impl Daemon {
         // Refresh public wallet projections only for a long-lived daemon.
         // The refresh is deliberately best-effort: cached projections and
         // Broker-independent VFS routes remain available while Broker is down.
-        spawn_wallet_projection_refresh(self.wallet_projections.clone(), self.audit.clone());
+        let projection_refresh = self
+            .wallet_projection_refresh_started
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .ok()
+            .map(|_| {
+                spawn_wallet_projection_refresh(self.wallet_projections.clone(), self.audit.clone())
+            });
 
         // Only long-lived daemons poll GitHub. Most CLI commands construct
         // an in-process Daemon, so starting this in `from_home` would turn
@@ -3368,6 +3381,7 @@ impl Daemon {
         BackgroundTasks {
             cancel: tx,
             handle: Some(handle),
+            projection_refresh,
         }
     }
 
@@ -3392,10 +3406,22 @@ impl Daemon {
 }
 
 async fn render_next_actions(projections: &dyn WalletProjectionReader) -> Vec<u8> {
+    render_next_actions_with_timeout(projections, WALLET_PROJECTION_LIVE_TIMEOUT).await
+}
+
+async fn render_next_actions_with_timeout(
+    projections: &dyn WalletProjectionReader,
+    live_timeout: Duration,
+) -> Vec<u8> {
     let mut md = String::from("# Next Actions\n\n");
-    let (wallets, wallet_projection_unavailable) = match projections.list_wallets().await {
-        Ok(wallets) => (wallets, false),
-        Err(_) => (Vec::new(), true),
+    let live = tokio::time::timeout(live_timeout, projections.list_wallets()).await;
+    let (wallets, wallet_projection_unavailable) = match live {
+        Ok(Ok(wallets)) => (wallets, false),
+        Ok(Err(_)) => (Vec::new(), true),
+        Err(_) => match projections.cached_wallets() {
+            Ok(wallets) => (wallets, false),
+            Err(_) => (Vec::new(), true),
+        },
     };
 
     if wallet_projection_unavailable {
@@ -3484,17 +3510,75 @@ fn run_expiry_sweep_once(
 fn spawn_wallet_projection_refresh(
     projections: Arc<dyn WalletProjectionReader>,
     audit: Arc<AuditLog>,
-) {
+) -> JoinHandle<()> {
     tokio::spawn(async move {
         if let Err(error) = refresh_wallet_projections_once(projections.as_ref(), &audit).await {
             warn!(%error, "Machine wallet projection refresh failed");
         }
-    });
+    })
+}
+
+struct WalletProjectionRefreshAudit<'a> {
+    audit: &'a AuditLog,
+    correlation_id: String,
+    finished: bool,
+}
+
+impl WalletProjectionRefreshAudit<'_> {
+    fn append_result(&self, result: serde_json::Value) -> Result<(), String> {
+        self.audit
+            .append(AuditRecord {
+                ts_ms: 0,
+                kind: "machine.effect.result".into(),
+                wallet: None,
+                chain: None,
+                data: serde_json::json!({
+                    "operation": "machine.wallet_projection.boot_refresh",
+                    "correlation_id": self.correlation_id,
+                    "result": result,
+                }),
+                prev: String::new(),
+                digest: String::new(),
+            })
+            .map(|_| ())
+            .map_err(|error| format!("Machine audit unavailable after wallet refresh: {error}"))
+    }
+
+    fn finish(mut self, result: serde_json::Value) -> Result<(), String> {
+        // A failed durable result append must remain visible as degradation;
+        // do not let Drop disguise it with a second write attempt.
+        self.finished = true;
+        self.append_result(result)
+    }
+}
+
+impl Drop for WalletProjectionRefreshAudit<'_> {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        let result = serde_json::json!({
+            "outcome": "cancelled",
+            "error": "wallet projection refresh was cancelled before completion",
+        });
+        if let Err(error) = self.append_result(result) {
+            warn!(%error, "Machine wallet projection cancellation audit failed");
+        }
+    }
 }
 
 async fn refresh_wallet_projections_once(
     projections: &dyn WalletProjectionReader,
     audit: &AuditLog,
+) -> Result<(), String> {
+    refresh_wallet_projections_once_with_timeout(projections, audit, WALLET_PROJECTION_LIVE_TIMEOUT)
+        .await
+}
+
+async fn refresh_wallet_projections_once_with_timeout(
+    projections: &dyn WalletProjectionReader,
+    audit: &AuditLog,
+    live_timeout: Duration,
 ) -> Result<(), String> {
     let operation_id = bloom_tools::sha256_hex(b"machine.wallet_projection.boot_refresh/v1");
     let correlation_id = format!("{operation_id}:{}", audit.sequence() + 1);
@@ -3517,7 +3601,18 @@ async fn refresh_wallet_projections_once(
             digest: String::new(),
         })
         .map_err(|error| format!("Machine audit unavailable before wallet refresh: {error}"))?;
-    let refreshed = projections.list_wallets().await;
+    let refresh_audit = WalletProjectionRefreshAudit {
+        audit,
+        correlation_id,
+        finished: false,
+    };
+    let refreshed = match tokio::time::timeout(live_timeout, projections.list_wallets()).await {
+        Ok(result) => result.map_err(|error| error.to_string()),
+        Err(_) => Err(format!(
+            "wallet projection live refresh exceeded {}ms",
+            live_timeout.as_millis()
+        )),
+    };
     let result = match &refreshed {
         Ok(wallets) => serde_json::json!({
             "outcome": "refreshed",
@@ -3528,22 +3623,8 @@ async fn refresh_wallet_projections_once(
             "error": error.to_string(),
         }),
     };
-    audit
-        .append(AuditRecord {
-            ts_ms: 0,
-            kind: "machine.effect.result".into(),
-            wallet: None,
-            chain: None,
-            data: serde_json::json!({
-                "operation": "machine.wallet_projection.boot_refresh",
-                "correlation_id": correlation_id,
-                "result": result,
-            }),
-            prev: String::new(),
-            digest: String::new(),
-        })
-        .map_err(|error| format!("Machine audit unavailable after wallet refresh: {error}"))?;
-    refreshed.map(|_| ()).map_err(|error| error.to_string())
+    refresh_audit.finish(result)?;
+    refreshed.map(|_| ())
 }
 
 /// Handle to background tasks owned by a running [`Daemon`]. Drop to
@@ -3552,6 +3633,7 @@ async fn refresh_wallet_projections_once(
 pub struct BackgroundTasks {
     cancel: watch::Sender<bool>,
     handle: Option<JoinHandle<()>>,
+    projection_refresh: Option<JoinHandle<()>>,
 }
 
 impl BackgroundTasks {
@@ -3559,6 +3641,9 @@ impl BackgroundTasks {
     pub async fn shutdown(mut self) {
         let _ = self.cancel.send(true);
         if let Some(h) = self.handle.take() {
+            let _ = h.await;
+        }
+        if let Some(h) = self.projection_refresh.take() {
             let _ = h.await;
         }
     }
@@ -3573,6 +3658,11 @@ impl Drop for BackgroundTasks {
         if let Some(h) = self.handle.take() {
             h.abort();
         }
+        // An audited projection refresh may already have written its intent.
+        // Detach it instead of aborting so it can still append the matching
+        // result while the runtime remains alive. Long-lived callers must use
+        // `shutdown` to await completion before tearing the runtime down.
+        let _ = self.projection_refresh.take();
     }
 }
 
@@ -3735,6 +3825,16 @@ mod tests {
         calls: std::sync::atomic::AtomicUsize,
     }
 
+    struct BlockingProjectionRefreshFixture {
+        started: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+        completed: std::sync::atomic::AtomicBool,
+    }
+
+    struct NeverCompletingProjectionRefreshFixture {
+        cached_calls: std::sync::atomic::AtomicUsize,
+    }
+
     #[async_trait::async_trait]
     impl WalletProjectionReader for ProjectionRefreshFixture {
         async fn list_wallets(
@@ -3764,6 +3864,65 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait]
+    impl WalletProjectionReader for BlockingProjectionRefreshFixture {
+        async fn list_wallets(
+            &self,
+        ) -> Result<Vec<bloom_machine_client::WalletProjection>, bloom_broker_api::ProtocolError>
+        {
+            self.started.notify_one();
+            self.release.notified().await;
+            self.completed
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(Vec::new())
+        }
+
+        async fn get_wallet(
+            &self,
+            _wallet_id: &bloom_broker_api::Token,
+        ) -> Result<bloom_machine_client::WalletProjection, bloom_broker_api::ProtocolError>
+        {
+            Err(bloom_broker_api::ProtocolError::new(
+                bloom_broker_api::ProtocolErrorCode::ServiceUnavailable,
+                "fixture has no wallet",
+            ))
+        }
+
+        fn cached_wallets(
+            &self,
+        ) -> Result<Vec<bloom_machine_client::WalletProjection>, bloom_broker_api::ProtocolError>
+        {
+            Ok(Vec::new())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl WalletProjectionReader for NeverCompletingProjectionRefreshFixture {
+        async fn list_wallets(
+            &self,
+        ) -> Result<Vec<bloom_machine_client::WalletProjection>, bloom_broker_api::ProtocolError>
+        {
+            futures::future::pending().await
+        }
+
+        async fn get_wallet(
+            &self,
+            _wallet_id: &bloom_broker_api::Token,
+        ) -> Result<bloom_machine_client::WalletProjection, bloom_broker_api::ProtocolError>
+        {
+            futures::future::pending().await
+        }
+
+        fn cached_wallets(
+            &self,
+        ) -> Result<Vec<bloom_machine_client::WalletProjection>, bloom_broker_api::ProtocolError>
+        {
+            self.cached_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Vec::new())
+        }
+    }
+
     #[tokio::test]
     async fn next_actions_refreshes_wallet_projections_before_rendering() {
         let projections = ProjectionRefreshFixture {
@@ -3781,6 +3940,28 @@ mod tests {
             String::from_utf8(rendered)
                 .unwrap()
                 .starts_with("# Next Actions\n")
+        );
+    }
+
+    #[tokio::test]
+    async fn next_actions_timeout_falls_back_to_cached_projections() {
+        let projections = NeverCompletingProjectionRefreshFixture {
+            cached_calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+
+        let rendered =
+            render_next_actions_with_timeout(&projections, Duration::from_millis(10)).await;
+
+        assert_eq!(
+            projections
+                .cached_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert!(
+            String::from_utf8(rendered)
+                .unwrap()
+                .contains("No wallets with pending actions.")
         );
     }
 
@@ -5311,6 +5492,69 @@ ws_url = "wss://example.invalid"
         daemon.shutdown().await;
     }
 
+    #[tokio::test]
+    async fn background_task_shutdown_awaits_wallet_projection_refresh() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut daemon = Daemon::from_home(HomeDir::at(directory.path())).unwrap();
+        let projections = Arc::new(BlockingProjectionRefreshFixture {
+            started: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+            completed: std::sync::atomic::AtomicBool::new(false),
+        });
+        daemon.wallet_projections = projections.clone();
+
+        let tasks = daemon.spawn_background_tasks();
+        projections.started.notified().await;
+        let mut shutdown = tokio::spawn(tasks.shutdown());
+        tokio::task::yield_now().await;
+        assert!(
+            !shutdown.is_finished(),
+            "graceful shutdown returned while the audited projection refresh was in flight"
+        );
+
+        projections.release.notify_one();
+        tokio::time::timeout(Duration::from_secs(2), &mut shutdown)
+            .await
+            .expect("graceful shutdown did not await the projection refresh")
+            .unwrap();
+        assert!(
+            projections
+                .completed
+                .load(std::sync::atomic::Ordering::SeqCst)
+        );
+        daemon.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn repeated_background_startup_coalesces_wallet_projection_refresh() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut daemon = Daemon::from_home(HomeDir::at(directory.path())).unwrap();
+        let projections = Arc::new(ProjectionRefreshFixture {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        daemon.wallet_projections = projections.clone();
+
+        let first = daemon.spawn_background_tasks();
+        let second = daemon.spawn_background_tasks();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while projections.calls.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("long-lived daemon did not launch wallet projection refresh");
+        tokio::task::yield_now().await;
+        assert_eq!(
+            projections.calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "repeated background startup must not duplicate the audited boot refresh"
+        );
+
+        second.shutdown().await;
+        first.shutdown().await;
+        daemon.shutdown().await;
+    }
+
     /// Fix #3: the spawned sweeper drops expired pending entries into
     /// `failed/` on its own. We don't wait for the natural 60s tick;
     /// instead the test calls `outbox.sweep_expired` itself to keep
@@ -5461,5 +5705,53 @@ ws_url = "wss://example.invalid"
         let restarted = AuditLog::open(&path).unwrap();
         assert!(restarted.mutation_degradation().is_some());
         assert_eq!(restarted.pending_effect_correlations().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn cancelled_wallet_projection_refresh_closes_its_audit_correlation() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("audit.jsonl");
+        let audit = Arc::new(AuditLog::open(&path).unwrap());
+        let projections = Arc::new(BlockingProjectionRefreshFixture {
+            started: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+            completed: std::sync::atomic::AtomicBool::new(false),
+        });
+
+        let refresh = spawn_wallet_projection_refresh(projections.clone(), audit.clone());
+        projections.started.notified().await;
+        refresh.abort();
+        assert!(refresh.await.unwrap_err().is_cancelled());
+        drop(audit);
+
+        let restarted = AuditLog::open(&path).unwrap();
+        assert!(
+            restarted.pending_effect_correlations().unwrap().is_empty(),
+            "cancelling an in-flight refresh must append a terminal audit result"
+        );
+    }
+
+    #[tokio::test]
+    async fn wallet_projection_boot_refresh_timeout_closes_its_audit_correlation() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("audit.jsonl");
+        let audit = AuditLog::open(&path).unwrap();
+        let projections = NeverCompletingProjectionRefreshFixture {
+            cached_calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+
+        assert!(
+            refresh_wallet_projections_once_with_timeout(
+                &projections,
+                &audit,
+                Duration::from_millis(10),
+            )
+            .await
+            .is_err()
+        );
+        drop(audit);
+
+        let restarted = AuditLog::open(&path).unwrap();
+        assert!(restarted.pending_effect_correlations().unwrap().is_empty());
     }
 }

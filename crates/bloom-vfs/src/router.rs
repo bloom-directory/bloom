@@ -455,7 +455,15 @@ impl VfsBuilder {
         self
     }
 
-    pub fn with_root_dynamic<F, Fut>(mut self, name: &str, renderer: F) -> Self
+    pub fn with_root_dynamic(
+        self,
+        name: &str,
+        renderer: Arc<dyn Fn() -> Vec<u8> + Send + Sync>,
+    ) -> Self {
+        self.with_root_dynamic_async(name, move || std::future::ready(renderer()))
+    }
+
+    pub fn with_root_dynamic_async<F, Fut>(mut self, name: &str, renderer: F) -> Self
     where
         F: Fn() -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Vec<u8>> + Send + 'static,
@@ -631,11 +639,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn root_dynamic_renderer_preserves_synchronous_builder_api() {
+        let renderer: Arc<dyn Fn() -> Vec<u8> + Send + Sync> =
+            Arc::new(|| b"synchronous root content".to_vec());
+        let vfs = Vfs::builder()
+            .with_root_dynamic("dynamic.md", renderer)
+            .build();
+
+        let body = vfs
+            .read(&VfsPath::parse("/dynamic.md").unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(body, b"synchronous root content");
+    }
+
+    #[tokio::test]
     async fn root_dynamic_renderer_awaits_async_content() {
         let rendered = Arc::new(AtomicUsize::new(0));
         let rendered_by_source = rendered.clone();
         let vfs = Vfs::builder()
-            .with_root_dynamic("dynamic.md", move || {
+            .with_root_dynamic_async("dynamic.md", move || {
                 let rendered = rendered_by_source.clone();
                 async move {
                     tokio::task::yield_now().await;

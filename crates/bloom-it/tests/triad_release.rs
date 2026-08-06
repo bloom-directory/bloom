@@ -280,6 +280,16 @@ fn triad_developer_launcher_supports_vfs_only_mode() {
             && launcher.contains("\"$BLOOM_BIN\" vfs cat /next.md"),
         "VFS-only startup must tell the developer how to use the running Machine"
     );
+    assert!(
+        launcher.contains("wait_for_machine_ipc")
+            && launcher.contains("BLOOM_RPC_ENDPOINT=\"unix:${machine_socket}\"")
+            && launcher.contains("\"$bloom_bin\" --home \"$machine_home\" vfs ls /"),
+        "VFS-only readiness must actively probe the exact launched endpoint"
+    );
+    assert!(
+        launcher.contains("machine socket path already exists"),
+        "the launcher must reject stale or foreign socket paths before startup"
+    );
 }
 
 #[test]
@@ -306,6 +316,33 @@ fn triad_developer_launcher_keeps_explicit_mounts_fail_closed() {
         launcher.contains("Machine exited before its requested kernel mount became ready")
             && launcher.contains("restart without --mount and use bloom vfs commands"),
         "a requested mount must fail with an actionable VFS-only fallback"
+    );
+    assert!(
+        launcher.contains("[ \"$attempts\" -lt 300 ] || {\n      if [ \"$label\" = machine ] && [ -n \"$mount_dir\" ]; then")
+            && launcher.contains("die \"$label did not publish its socket\""),
+        "a Machine socket timeout must retain the explicit-mount fallback hint"
+    );
+}
+
+#[test]
+fn serve_starts_audited_projection_refresh_after_fallible_setup() {
+    let source = fs::read_to_string(workspace().join("crates/bloom/src/main.rs")).unwrap();
+    let serve = source
+        .split("Cmd::Serve { endpoint, mount } => {")
+        .nth(1)
+        .expect("serve command arm");
+    let mount = serve.find("let mount_handle = mount_bloom").unwrap();
+    let endpoint = serve
+        .find("let endpoint = resolve_server_endpoint")
+        .unwrap();
+    let server = serve.find("let server = IpcServer::new").unwrap();
+    let background = serve
+        .find("let sweeper = d.spawn_background_tasks()")
+        .unwrap();
+
+    assert!(
+        mount < background && endpoint < background && server < background,
+        "audited background refresh must start only after fallible serve setup succeeds"
     );
 }
 

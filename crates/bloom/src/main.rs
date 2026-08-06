@@ -2548,10 +2548,6 @@ async fn run(cli: Cli) -> Result<()> {
             let (_home_permit, d) = build_write_daemon(home.clone())?;
             github_source::ensure_preinstalled_petals(&home, &d)
                 .context("provision configured pre-installed Petals before serving")?;
-            // Spawn the outbox expiry sweeper for the lifetime of the
-            // serve command (fix #3). The handle is dropped (and the task
-            // signalled to stop) right before the function returns.
-            let sweeper = d.spawn_background_tasks();
             let mount_handle = mount_bloom(&d, mount.as_deref()).await?;
             let chains: Vec<String> = d.chains.list_names();
             println!(
@@ -2573,6 +2569,10 @@ async fn run(cli: Cli) -> Result<()> {
                 .with_batch_confirmation(
                     d.batch_confirmation_service().map_err(anyhow::Error::msg)?,
                 );
+            // Start audited and durable background effects only after every
+            // fallible serve setup step has succeeded. The handle is shut
+            // down and awaited before the runtime can return.
+            let sweeper = d.spawn_background_tasks();
             let server2 = server.clone();
             // Trigger graceful shutdown on Ctrl-C or SIGTERM.
             let shutdown = tokio::spawn(async move {
