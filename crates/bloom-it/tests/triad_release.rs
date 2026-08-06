@@ -1262,6 +1262,32 @@ fn macos_installer_stages_unix_principals_launchdaemons_and_confirmed_uninstall(
 }
 
 #[test]
+fn macos_installer_creates_enrollment_workspace_with_private_modes() {
+    let installer = fs::read_to_string(release_script("install-macos.sh")).unwrap();
+    assert!(
+        installer.contains(r#"mkdir -m 0700 "$templates" "$material""#),
+        "macOS enrollment generation directories must not inherit a permissive umask"
+    );
+}
+
+#[test]
+fn macos_installer_silences_transient_health_failures_and_replays_the_last_error() {
+    let installer = fs::read_to_string(release_script("install-macos.sh")).unwrap();
+    assert!(
+        installer.contains(r#"health_output="$(mktemp "$scratch/health-check.XXXXXX")""#),
+        "health-check output must be captured privately during activation retries"
+    );
+    assert!(
+        installer.contains(r#">"$health_output" 2>&1; then return"#),
+        "a successful readiness retry must suppress earlier transient failures"
+    );
+    assert!(
+        installer.contains(r#"cat "$health_output" >&2"#),
+        "the final readiness diagnostic must be replayed when activation fails"
+    );
+}
+
+#[test]
 fn macos_installer_never_repairs_or_overwrites_a_digest_named_release() {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().join("root");
