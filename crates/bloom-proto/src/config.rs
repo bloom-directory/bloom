@@ -91,6 +91,7 @@ fn default_preinstalled_petals() -> Vec<String> {
         "polymarket".to_string(),
         "near-intents".to_string(),
         "enso".to_string(),
+        "hyperliquid".to_string(),
     ]
 }
 
@@ -596,7 +597,7 @@ impl Config {
         let mut seen_preinstalled = std::collections::BTreeSet::new();
         for name in &self.petals.preinstalled {
             validate_petal_runtime_name("preinstalled entry", name)?;
-            if !matches!(name.as_str(), "polymarket" | "near-intents" | "enso") {
+            if !matches!(name.as_str(), "polymarket" | "near-intents" | "enso" | "hyperliquid") {
                 return Err(ConfigError::Invalid(format!(
                     "unknown preinstalled Petal {name:?}"
                 )));
@@ -677,7 +678,7 @@ mod tests {
         assert!(cfg.enso.is_none());
         assert_eq!(
             cfg.petals.preinstalled,
-            ["polymarket", "near-intents", "enso"]
+            ["polymarket", "near-intents", "enso", "hyperliquid"]
         );
         let hyperliquid = cfg
             .hyperliquid
@@ -917,7 +918,7 @@ allow_broadcast = false
         let explicitly_enabled = Config::load(&path).unwrap();
         assert_eq!(
             explicitly_enabled.petals.preinstalled,
-            vec!["polymarket", "near-intents", "enso"]
+            vec!["polymarket", "near-intents", "enso", "hyperliquid"]
         );
     }
 
