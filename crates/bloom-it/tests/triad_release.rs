@@ -388,7 +388,7 @@ fn triad_developer_launcher_owns_only_its_service_processes() {
 fn serve_starts_audited_projection_refresh_after_fallible_setup() {
     let source = fs::read_to_string(workspace().join("crates/bloom/src/main.rs")).unwrap();
     let serve = source
-        .split("Cmd::Serve { endpoint, mount } => {")
+        .split("Cmd::Serve {")
         .nth(1)
         .expect("serve command arm");
     let mount = serve.find("let mount_handle = mount_bloom").unwrap();
@@ -1276,7 +1276,8 @@ fn macos_installer_stages_unix_principals_launchdaemons_and_confirmed_uninstall(
     }
     let containment_plist = root.join("Library/LaunchDaemons/com.bloom.containment.plist");
     let containment_source = fs::read_to_string(&containment_plist).unwrap();
-    assert!(containment_source.contains("--triad-pf-monitor-once"));
+    assert!(containment_source.contains("<string>serve</string>"));
+    assert!(containment_source.contains("<string>triad-pf-monitor-once</string>"));
     assert!(!containment_source.contains("@BLOOM_"));
     assert_eq!(
         fs::metadata(&containment_plist)

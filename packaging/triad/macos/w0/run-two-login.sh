@@ -168,7 +168,7 @@ installed_a=true
 release_digest="$(field "$login_uid_a" release_digest)"
 [[ "$(field "$login_uid_a" state)" == "active" ]]
 sudo -u "$login_user_a" \
-  "$machine_binary" --triad-health-check "$release_digest"
+  "$machine_binary" serve triad-health-check "$release_digest"
 
 # Leave A enrolled and its socket-activated LaunchDaemons loaded, but remove its
 # login-session sentinel so B can become the first canonical-listener owner.
@@ -184,7 +184,7 @@ installed_b=true
 [[ "$(field "$login_uid_b" release_digest)" == "$release_digest" ]]
 [[ "$(field "$login_uid_b" state)" == "active" ]]
 sudo -u "$login_user_b" \
-  "$machine_binary" --triad-health-check "$release_digest"
+  "$machine_binary" serve triad-health-check "$release_digest"
 
 launchctl bootstrap "gui/$login_uid_a" "$session_plist"
 session_socket_a="/private/var/run/bloom/$login_uid_a/session/session.sock"
@@ -259,14 +259,14 @@ if [[ -n "$upgrade_payload" ]]; then
   deadline=$((SECONDS + 20))
   while [[ $SECONDS -lt $deadline ]]; do
     if sudo -u "$login_user_b" \
-      "$machine_binary" --triad-health-check "$release_digest"
+      "$machine_binary" serve triad-health-check "$release_digest"
     then
       break
     fi
     sleep 1
   done
   sudo -u "$login_user_b" \
-    "$machine_binary" --triad-health-check "$release_digest"
+    "$machine_binary" serve triad-health-check "$release_digest"
   launchctl bootstrap system "$broker_plist_a"
 fi
 
@@ -281,7 +281,7 @@ done
 
 if machine_failure="$(
   sudo -u "$login_user_a" \
-    "$machine_binary" --triad-health-check "$release_digest" 2>&1
+    "$machine_binary" serve triad-health-check "$release_digest" 2>&1
 )"
 then
   echo "second Broker reported healthy while login B owned the canonical listener" >&2
@@ -307,7 +307,7 @@ then
   exit 1
 fi
 sudo -u "$login_user_b" \
-  "$machine_binary" --triad-health-check "$release_digest"
+  "$machine_binary" serve triad-health-check "$release_digest"
 
 # End B's complete GUI launchd domain. A's already-failed Broker must acquire
 # the freed port through failure-only KeepAlive before any new Machine request.
@@ -346,7 +346,7 @@ lsof -nP -a -u "bloom-broker-$login_uid_a" \
   exit 1
 }
 sudo -u "$login_user_a" \
-  "$machine_binary" --triad-health-check "$release_digest"
+  "$machine_binary" serve triad-health-check "$release_digest"
 
 if [[ -n "${BLOOM_MACOS_W0_EVIDENCE_DIR:-}" ]]; then
   evidence_dir="$BLOOM_MACOS_W0_EVIDENCE_DIR"

@@ -249,7 +249,7 @@ install_config() {
     if $live; then
       scratch="$(mktemp -d "$product/.material.XXXXXX")"; templates="$scratch/templates"; material="$scratch/material"
       mkdir -m 0700 "$templates" "$material"; cp "$payload/installer/macos/config/"* "$templates/"
-      "$machine_binary" --triad-render-macos-enrollment "$templates" "$material" "$login_uid" \
+      "$machine_binary" init triad-render-macos-enrollment "$templates" "$material" "$login_uid" \
         "$BLOOM_MACOS_BROKER_UID" "$BLOOM_MACOS_SIGNER_UID" "$BLOOM_MACOS_REVOKE_GID" "$BLOOM_RELEASE_DIGEST"
       source_config="$material"
     else source_config="$payload/config"; fi
@@ -294,12 +294,12 @@ secure_ownership() {
 start_and_check() {
   plutil -lint "$broker_plist" "$signer_plist" "$containment_plist" "$session_plist" >/dev/null; pfctl -nf "$pf_anchor"
   launchctl bootout system/com.bloom.containment 2>/dev/null || true; launchctl bootstrap system "$containment_plist"
-  "$machine_binary" --triad-pf-monitor-once
+  "$machine_binary" serve triad-pf-monitor-once
   for label in "gui/$login_uid/com.bloom.session" "system/com.bloom.broker.$login_uid" "system/com.bloom.signer.$login_uid"; do launchctl bootout "$label" 2>/dev/null || true; done
   launchctl bootstrap "gui/$login_uid" "$session_plist"; launchctl bootstrap system "$signer_plist"; launchctl bootstrap system "$broker_plist"
   health_output="$(mktemp "$scratch/health-check.XXXXXX")"
   for _ in {1..20}; do
-    if sudo -n -u "$login_user" -- "$machine_binary" --triad-health-check "$BLOOM_RELEASE_DIGEST" >"$health_output" 2>&1; then return; fi
+    if sudo -n -u "$login_user" -- "$machine_binary" serve triad-health-check "$BLOOM_RELEASE_DIGEST" >"$health_output" 2>&1; then return; fi
     sleep 1
   done
   cat "$health_output" >&2

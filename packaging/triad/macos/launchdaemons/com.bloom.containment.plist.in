@@ -14,7 +14,8 @@
   <key>ProgramArguments</key>
   <array>
     <string>@BLOOM_MACHINE_BINARY@</string>
-    <string>--triad-pf-monitor-once</string>
+    <string>serve</string>
+    <string>triad-pf-monitor-once</string>
   </array>
   <key>RunAtLoad</key>
   <true/>

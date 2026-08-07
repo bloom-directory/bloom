@@ -2222,6 +2222,7 @@ dependencies = [
  "bloom-update",
  "bloom-vfs",
  "bloom-watch",
+ "fs2",
  "futures",
  "hex",
  "parking_lot",

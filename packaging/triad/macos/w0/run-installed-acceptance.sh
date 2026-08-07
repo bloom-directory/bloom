@@ -158,7 +158,7 @@ signer_uid="$(plutil -extract signer_uid raw -o - "$enrollment")"
 assert_installed_process bloom-broker "$broker_uid" "$release_root/bloom-broker"
 assert_installed_process bloom-signer "$signer_uid" "$release_root/bloom-signer"
 sudo -u "$login_user" \
-  "$release_root/bloom" --triad-health-check "$release_digest"
+  "$release_root/bloom" serve triad-health-check "$release_digest"
 
 machine_identity="/Library/Application Support/BloomTriad/config/$login_uid/machine/identity.json"
 edge_manifest="/Library/Application Support/BloomTriad/config/$login_uid/edge-manifest.json"
@@ -176,14 +176,14 @@ edge_manifest="/Library/Application Support/BloomTriad/config/$login_uid/edge-ma
 deadline=$((SECONDS + 20))
 while [[ $SECONDS -lt $deadline ]]; do
   if sudo -u "$login_user" \
-    "$release_root/bloom" --triad-health-check "$release_digest"
+    "$release_root/bloom" serve triad-health-check "$release_digest"
   then
     break
   fi
   sleep 1
 done
 sudo -u "$login_user" \
-  "$release_root/bloom" --triad-health-check "$release_digest"
+  "$release_root/bloom" serve triad-health-check "$release_digest"
 
 source_revision() {
   key="$1"
@@ -294,7 +294,7 @@ assert_source "$signer_root" BLOOM_SIGNER_SHA
 assert_installed_process bloom-broker "$broker_uid" "$release_root/bloom-broker"
 assert_installed_process bloom-signer "$signer_uid" "$release_root/bloom-signer"
 sudo -u "$login_user" \
-  "$release_root/bloom" --triad-health-check "$release_digest"
+  "$release_root/bloom" serve triad-health-check "$release_digest"
 
 subject_digest="$(
   "$main_root/packaging/triad/release/macos-conformance-subject.sh" "$payload"

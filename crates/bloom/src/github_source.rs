@@ -1886,7 +1886,7 @@ mod tests {
             .with_petals(daemon.petals.clone())
             .with_petal_source_installer(std::sync::Arc::new(installer));
         let socket_dir = tempfile::tempdir().unwrap();
-        let socket = socket_dir.path().join("bloom.sock");
+        let socket = socket_dir.path().join("private-run/bloom.sock");
         let serving = server.clone();
         let serving_socket = socket.clone();
         let task = tokio::spawn(async move { serving.serve(&serving_socket).await.unwrap() });

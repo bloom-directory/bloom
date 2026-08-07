@@ -40,7 +40,7 @@ status because the confined Broker cannot initiate even a loopback SYN. A
 successful retry removes the stale diagnostic.
 
 The global `com.bloom.session` LaunchAgent invokes only Machine's
-`--session-sentinel` mode. It exits successfully for an unenrolled login,
+`serve session-sentinel` mode. It exits successfully for an unenrolled login,
 keeps no custody or signing authority, and is destroyed with its GUI login
 domain. It owns `session/session.sock` as the login UID and authenticates a
 separately pinned `bloom-session` identity. The socket reuses the already

@@ -9,7 +9,35 @@ Bloom exposes actions through three client interaction modes:
 2. the foreground `bloom vfs` facade; and
 3. a VFS mounted by a long-running Bloom Machine.
 
-All three modes use the same production authority plane. Machine stages,
+The `bloom` CLI has exactly two local lifecycle commands: `bloom init` creates
+the home, and `bloom serve` owns the long-running Machine. Every other command,
+including `status`, `completions`, `update`, `petals`, and the `bloom vfs`
+facade—and `bloom --version`—is only a client proxy to that running Machine over the configured IPC
+endpoint. A missing, refused, or inaccessible default or explicit endpoint is
+an error which names the endpoint and tells the user to start `bloom serve`.
+There is no one-shot Machine construction or local Broker fallback.
+Hidden platform bootstrap and supervision helpers are submodes of `init` or
+`serve`; the binary has no pre-parser execution modes outside those lifecycle
+namespaces.
+
+The daemon publishes its socket without exposing a permissive bind-to-chmod
+window. It creates a unique `0700` staging directory inside the endpoint's
+resolved parent, binds the listener there, changes the socket to `0600`, verifies
+its owner, type, mode, and inode, then atomically renames that secured inode to
+the endpoint and verifies it again. Before inspecting or publishing the endpoint,
+`bloom serve` acquires a nonblocking exclusive lock on a persistent, regular,
+same-owner, owner-only lock file beside it and holds that lock for the listener's
+full lifetime. A second server therefore fails without replacing the live
+listener. The parent itself only needs to be a real writable and traversable
+directory; Bloom neither changes its permissions nor requires it to be private,
+so conventional `/tmp` and `0755` runtime directories remain compatible. Kernel
+peer credentials must match the daemon's effective UID before it reads any
+request. Clients never remove or replace an endpoint, including after
+`ConnectionRefused`. Shutdown leaves an inert socket in place; on the next
+startup, the lock-owning server validates that it is a same-owner socket and
+atomically replaces it. Invalid endpoint paths are refused without deletion.
+
+All three client surfaces use the same production authority plane. Machine stages,
 simulates, executes Petals, and projects public status. Broker is the only
 Machine-facing authorization service and owns Sealed Approvals and ceremony
 HTTP. Signer is the only process that holds wallet or delegated private keys
@@ -44,8 +72,8 @@ subsequent operation with its own operation identity.
 
 | Mode | Machine execution state | Ceremony launch UX | Authority behavior |
 |---|---|---|---|
-| Foreground CLI | Key-free Machine composition in the foreground command | The deliberate command may open the Broker-provided URL | Broker and Signer remain separate authenticated services |
-| Foreground `bloom vfs` | Same key-free Machine composition used by the CLI | The deliberate facade command may open or print the Broker-provided URL | Identical Broker/Signer protocol; no local approval path |
+| Foreground CLI | IPC proxy to the running Machine | The deliberate command may open the Broker-provided URL | Broker and Signer remain separate authenticated services |
+| Foreground `bloom vfs` | IPC proxy to the same running Machine VFS | The deliberate facade command may open or print the Broker-provided URL | Identical Broker/Signer protocol; no local approval path |
 | Mounted VFS | Long-running Bloom Machine | The mount never opens a browser; the expecting client reads and opens or forwards the URL | Identical Broker/Signer protocol; Machine projects status only |
 
 Broker or Signer unavailability leaves cached public reads, staging, and
@@ -54,6 +82,17 @@ policy mutation, and custody fail closed. No interaction mode restores legacy
 authority.
 
 ## Foreground clients
+
+Foreground clients may parse presentation flags, read bounded policy or
+migration inputs for transport, format an authoritative daemon response, or
+write presentation outputs such as QR files. For local Petal install and build,
+the client resolves caller paths to absolute paths; the daemon reads the package,
+generates artifacts, and writes any requested archive under its serialized Petal
+mutation lane. Foreground clients do not acquire the home write lock, open
+Machine state, contact Broker directly, or infer an operation identity from a
+later mutable `latest` read. Creation RPCs return the identity projection
+under the same VFS mutation gate used by ordinary IPC and mounted writes, so a
+concurrent mutation cannot replace the identity before it is captured.
 
 A foreground command may make ceremony UX convenient, but it does not own the
 ceremony. When fresh approval is required it:

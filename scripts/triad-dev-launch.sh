@@ -126,7 +126,7 @@ if [ ! -f "${config_dir}/edge-manifest.json" ]; then
   fi
   mkdir "$config_dir"
   chmod 0700 "$config_dir"
-  "$bloom_bin" --triad-render-developer-enrollment \
+  "$bloom_bin" init triad-render-developer-enrollment \
     "$template_dir" "$config_dir" "$release_digest"
   rm -rf -- "$template_dir"
 fi
@@ -300,7 +300,7 @@ supervise_services() {
 
 BLOOM_TRIAD_DEVELOPER_ROOT="$developer_root" \
 BLOOM_TRIAD_DEVELOPER_RUNTIME="$runtime_dir" \
-  "$bloom_bin" --session-sentinel >"${log_dir}/session.log" 2>&1 &
+  "$bloom_bin" serve session-sentinel >"${log_dir}/session.log" 2>&1 &
 session_pid=$!
 wait_for_socket "$session_socket" "$session_pid" session
 

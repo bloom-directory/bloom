@@ -399,7 +399,7 @@ assert_substitution_rejected hard-link
 assert_metadata "$edge_manifest" "0:0:644"
 sudo -u "$login_user" \
   "$machine_binary" \
-  --triad-health-check \
+  serve triad-health-check \
   "$release_digest"
 
 unrelated_user="nobody"
@@ -514,7 +514,7 @@ wait "$hostile_session_pid" 2>/dev/null || true
 hostile_session_pid=""
 sudo -u "$login_user" \
   "$machine_binary" \
-  --triad-health-check \
+  serve triad-health-check \
   "$release_digest"
 
 launchctl bootout "$session_label"
@@ -545,7 +545,7 @@ while [[ $SECONDS -lt $deadline ]]; do
   if [[ -S "$session_socket" ]] &&
     sudo -u "$login_user" \
       "$machine_binary" \
-      --triad-health-check \
+      serve triad-health-check \
       "$release_digest"
   then
     break
@@ -554,7 +554,7 @@ while [[ $SECONDS -lt $deadline ]]; do
 done
 sudo -u "$login_user" \
   "$machine_binary" \
-  --triad-health-check \
+  serve triad-health-check \
   "$release_digest"
 
 ceremony_headers=""
@@ -640,7 +640,7 @@ assert_metadata \
 if foreign_machine_failure="$(
   sudo -u "$login_user" \
     "$machine_binary" \
-    --triad-health-check "$release_digest" 2>&1
+    serve triad-health-check "$release_digest" 2>&1
 )"
 then
   echo "Machine reported healthy while a foreign process owned the ceremony port" >&2
@@ -684,7 +684,7 @@ deadline=$((SECONDS + 60))
 while [[ $SECONDS -lt $deadline ]]; do
   if sudo -u "$login_user" \
     "$machine_binary" \
-    --triad-health-check \
+    serve triad-health-check \
     "$release_digest"
   then
     break
@@ -693,7 +693,7 @@ while [[ $SECONDS -lt $deadline ]]; do
 done
 sudo -u "$login_user" \
   "$machine_binary" \
-  --triad-health-check \
+  serve triad-health-check \
   "$release_digest"
 [[ ! -e "$broker_startup_status" ]] || {
   echo "Broker retained a stale startup diagnostic after acquiring the listener" >&2
@@ -780,7 +780,7 @@ deadline=$((SECONDS + 20))
 while [[ $SECONDS -lt $deadline ]]; do
   if sudo -u "$login_user" \
     "$machine_binary" \
-    --triad-health-check \
+    serve triad-health-check \
     "$release_digest"
   then
     break
@@ -789,7 +789,7 @@ while [[ $SECONDS -lt $deadline ]]; do
 done
 sudo -u "$login_user" \
   "$machine_binary" \
-  --triad-health-check \
+  serve triad-health-check \
   "$release_digest"
 
 pfctl -a "com.bloom.triad/$login_uid" -F rules
@@ -808,7 +808,7 @@ done
 }
 if sudo -u "$login_user" \
   "$machine_binary" \
-  --triad-health-check \
+  serve triad-health-check \
   "$release_digest"
 then
   echo "Broker remained ready after its packet-filter anchor disappeared" >&2
@@ -817,10 +817,10 @@ fi
 pfctl \
   -a "com.bloom.triad/$login_uid" \
   -f "/etc/pf.anchors/com.bloom.triad.$login_uid"
-"$machine_binary" --triad-pf-monitor-once
+"$machine_binary" serve triad-pf-monitor-once
 sudo -u "$login_user" \
   "$machine_binary" \
-  --triad-health-check \
+  serve triad-health-check \
   "$release_digest"
 
 current_good_payload="$payload"

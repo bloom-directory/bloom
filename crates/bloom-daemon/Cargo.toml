@@ -58,10 +58,11 @@ url.workspace = true
 base64.workspace = true
 blake3.workspace = true
 futures.workspace = true
+fs2.workspace = true
 hex.workspace = true
 reqwest = { workspace = true, features = ["stream"] }
 rustix.workspace = true
+tempfile.workspace = true
 
 [dev-dependencies]
 bloom-proto = { workspace = true, features = ["audit-test-seam"] }
-tempfile.workspace = true

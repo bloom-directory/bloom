@@ -87,7 +87,8 @@ fn session_agent_has_no_service_authority_and_stops_with_the_login_domain() {
     .expect("read session LaunchAgent source");
 
     assert!(source.contains("@BLOOM_MACHINE_BINARY@"));
-    assert!(source.contains("<string>--session-sentinel</string>"));
+    assert!(source.contains("<string>serve</string>"));
+    assert!(source.contains("<string>session-sentinel</string>"));
     assert!(source.contains("BLOOM_CONFIG_ROOT"));
     assert!(source.contains("/private/var/run/bloom"));
     assert!(source.contains("<string>Aqua</string>"));
@@ -168,7 +169,8 @@ fn root_pf_monitor_has_no_rpc_or_custody_surface_and_services_require_its_attest
     )
     .unwrap();
     assert!(plist.contains("<string>root</string>"));
-    assert!(plist.contains("--triad-pf-monitor-once"));
+    assert!(plist.contains("<string>serve</string>"));
+    assert!(plist.contains("<string>triad-pf-monitor-once</string>"));
     assert!(plist.contains("<key>StartInterval</key>"));
     assert!(!plist.contains("<key>Sockets</key>"));
 
@@ -225,7 +227,7 @@ fn live_installer_provisions_fail_closed_directory_service_records() {
         "AuthenticationAuthority ';DisabledUser;'",
         "BLOOM_RELEASE_PUBLIC_KEY",
         "pinned release key must be root owned",
-        "--triad-render-macos-enrollment",
+        "init triad-render-macos-enrollment",
         "$payload/installer/macos/config/",
         "dsmemberutil flushcache",
         "chown \"$broker_user:$machine_broker_group\" \"$runtime/machine-broker\"",
@@ -271,7 +273,7 @@ fn macos_installer_does_not_hide_removed_lifecycle_logic() {
     let source =
         fs::read_to_string(workspace().join("packaging/triad/release/install-macos.sh")).unwrap();
     for removed in [
-        "--triad-render-macos-identity-rotation",
+        "init triad-render-macos-identity-rotation",
         "recover_interrupted",
         "retained_restore",
         "transaction_staging",

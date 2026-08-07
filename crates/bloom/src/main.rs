@@ -26,13 +26,13 @@ use anyhow::{Context, Result, bail};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
 use bloom_daemon::Daemon;
-use bloom_daemon::ipc::{IpcClient, IpcServer, default_socket_path};
-use bloom_machine_client::{MachineJournalHeadProvider, WalletProjectionReader as _};
-use bloom_proto::{AuditIdentity, AuditLog, HomeDir, HomeWritePermit};
-use bloom_vfs::{
-    VfsPath,
-    handler::{Entry, EntryKind, Handler},
+use bloom_daemon::ipc::{
+    IpcClient, IpcClientError, IpcServer, MachineCeremonyAction, MachineCommand,
+    MachineCommandFuture, MachineCommandOutput, MachineCommandService, MachineCustodyKind,
+    MachineError, MachineErrorKind, MachineOperationAction, default_socket_path,
 };
+use bloom_machine_client::MachineJournalHeadProvider;
+use bloom_proto::{AuditIdentity, AuditLog, HomeDir, HomeWritePermit};
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::{Shell, generate};
 use tracing::{debug, info, trace};
@@ -46,16 +46,9 @@ const DEFAULT_MOUNT_PATH: &str = "/Volumes/bloom";
 const DEFAULT_MOUNT_PATH: &str = "/bloom";
 
 const ALPHA_DISCLOSURE: &str = "⚠️  Bloom is experimental, unaudited alpha software. Do not use with funds you cannot afford to lose. Review every generated transaction plan before signing.";
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum EndpointSource {
-    Default,
-    Explicit,
-}
-
 #[derive(Debug, Clone)]
 struct ResolvedEndpoint {
     socket: PathBuf,
-    source: EndpointSource,
     display: String,
 }
 
@@ -65,7 +58,6 @@ impl ResolvedEndpoint {
         Self {
             display: format!("unix:{}", socket.display()),
             socket,
-            source: EndpointSource::Default,
         }
     }
 
@@ -74,7 +66,6 @@ impl ResolvedEndpoint {
         Ok(Self {
             display: format!("unix:{}", path.display()),
             socket: path,
-            source: EndpointSource::Explicit,
         })
     }
 
@@ -82,12 +73,7 @@ impl ResolvedEndpoint {
         Self {
             display: format!("unix:{}", path.display()),
             socket: path,
-            source: EndpointSource::Explicit,
         }
-    }
-
-    fn is_explicit(&self) -> bool {
-        matches!(self.source, EndpointSource::Explicit)
     }
 }
 
@@ -127,25 +113,6 @@ fn resolve_server_endpoint(home: &HomeDir, endpoint: Option<&str>) -> Result<Res
 
 fn configured_broker_client(home: &HomeDir) -> Result<bloom_machine_client::MachineBrokerClient> {
     configured_broker_client_with_activation(home, false)
-}
-
-fn configured_wallet_projection_reader(
-    home: &HomeDir,
-) -> Result<bloom_machine_client::CachedWalletProjectionReader> {
-    let broker = match configured_broker_client(home) {
-        Ok(client) => Some(client),
-        Err(error) => {
-            debug!(error = %error, "wallet projection using stale cache until Broker is available");
-            None
-        }
-    };
-    bloom_machine_client::CachedWalletProjectionReader::new(
-        broker,
-        bloom_machine_client::FileProjectionStore::new(
-            home.cache_dir().join("wallet-projections.json"),
-        ),
-    )
-    .context("open Machine wallet projection cache")
 }
 
 fn validate_wallet_name(name: &str) -> Result<()> {
@@ -554,37 +521,6 @@ fn build_write_daemon(home: HomeDir) -> Result<(Arc<HomeWritePermit>, Daemon)> {
     Ok((permit, daemon))
 }
 
-fn build_authenticated_read_daemon(home: HomeDir) -> Result<Daemon> {
-    // Reads may still execute effectful VFS routes (for example provider
-    // refreshes), so production never constructs the unsigned developer
-    // composition merely because the long-running Machine socket is absent.
-    match configured_broker_connection(&home) {
-        Ok((broker, catalog)) => Daemon::from_home_with_broker(home, broker, catalog)
-            .context("build authenticated read daemon"),
-        Err(error) => {
-            #[cfg(debug_assertions)]
-            {
-                debug!(error = %error, "authenticated Broker edge absent; using key-free debug read composition");
-                Daemon::from_home_without_broker_for_debug(home)
-                    .context("build key-free debug read daemon")
-            }
-            #[cfg(not(debug_assertions))]
-            {
-                Err(error).context("load authenticated Machine identity and Broker edge")
-            }
-        }
-    }
-}
-
-fn configured_machine_audit(home: &HomeDir) -> Result<AuditLog> {
-    let client = configured_raw_broker_client_with_activation(false)
-        .context("load authenticated Machine identity for local audit operation")?;
-    let identity = client
-        .local_application_identity()
-        .context("authenticated Machine client did not retain its application identity")?;
-    open_configured_machine_audit(home, identity)
-}
-
 fn machine_audit_status(audit: &AuditLog) -> serde_json::Value {
     let (pending, pending_read_error) = match audit.pending_effect_correlations() {
         Ok(pending) => (pending, None),
@@ -626,13 +562,6 @@ fn execute_audit_command(command: &AuditCmd, audit: &AuditLog) -> Result<String>
             &audit.reconcile_pending_effect(correlation_id, outcome, confirm)?,
         )?),
     }
-}
-
-fn open_configured_machine_audit(
-    home: &HomeDir,
-    identity: bloom_triad_local_transport::LocalIdentity,
-) -> Result<AuditLog> {
-    open_configured_machine_audit_with_activation(home, identity, false)
 }
 
 fn open_configured_machine_audit_with_activation(
@@ -756,16 +685,29 @@ async fn launch_custody_ceremony(
     wallet_id: Option<bloom_broker_api::Token>,
     expected_input_class: &str,
     legacy_migration: Option<LegacyMigrationLaunch>,
-) -> Result<()> {
+) -> Result<String> {
     use rand::RngCore as _;
     use sha2::Digest as _;
 
-    validate_wallet_name(requested_name)
-        .context("requested wallet name must be a safe single path segment")?;
-    let requested_wallet_id = bloom_broker_api::Token::new(requested_name.to_owned())
-        .context("requested wallet name must be a protocol token")?;
-    let client = configured_broker_client(home)
-        .context("custody requires the authenticated Machine-to-Broker edge")?;
+    validate_wallet_name(requested_name).map_err(|error| {
+        machine_error(
+            MachineErrorKind::InvalidParams,
+            format!("requested wallet name must be a safe single path segment: {error:#}"),
+        )
+    })?;
+    let requested_wallet_id =
+        bloom_broker_api::Token::new(requested_name.to_owned()).map_err(|error| {
+            machine_error(
+                MachineErrorKind::InvalidParams,
+                format!("requested wallet name must be a protocol token: {error}"),
+            )
+        })?;
+    let client = configured_broker_client(home).map_err(|error| {
+        machine_error(
+            MachineErrorKind::Unavailable,
+            format!("custody requires the authenticated Machine-to-Broker edge: {error:#}"),
+        )
+    })?;
     let (operation_id, exact_terms_digest, legacy_passkey_migration) =
         if let Some(migration) = legacy_migration {
             (
@@ -820,15 +762,14 @@ async fn launch_custody_ceremony(
     .map_err(anyhow::Error::new)
     .context("construct Machine custody projection")?;
     let projection_path = persist_ceremony_projection(home, &projection)?;
-    println!("operation_id: {}", response.custody_operation_id);
-    println!("ceremony_kind: {:?}", response.ceremony_kind);
-    println!("ceremony_url: {}", response.ceremony_url);
-    println!(
-        "ceremony_expires_at_ms: {}",
-        response.ceremony_expires_at_ms.get()
-    );
-    println!("projection: {}", projection_path.display());
-    Ok(())
+    Ok(format!(
+        "operation_id: {}\nceremony_kind: {:?}\nceremony_url: {}\nceremony_expires_at_ms: {}\nprojection: {}\n",
+        response.custody_operation_id,
+        response.ceremony_kind,
+        response.ceremony_url,
+        response.ceremony_expires_at_ms.get(),
+        projection_path.display(),
+    ))
 }
 
 struct LegacyMigrationLaunch {
@@ -837,7 +778,439 @@ struct LegacyMigrationLaunch {
     public_terms: bloom_broker_api::LegacyPasskeyMigrationPublic,
 }
 
-#[derive(serde::Deserialize)]
+#[derive(Clone)]
+struct DaemonMachineCommands {
+    home: HomeDir,
+    daemon: Daemon,
+}
+
+impl MachineCommandService for DaemonMachineCommands {
+    fn execute(&self, command: MachineCommand) -> MachineCommandFuture<'_> {
+        Box::pin(async move {
+            execute_machine_command(&self.home, &self.daemon, command)
+                .await
+                .map_err(machine_error_from_anyhow)
+        })
+    }
+}
+
+fn machine_error_from_anyhow(error: anyhow::Error) -> MachineError {
+    let message = format!("{error:#}");
+    for cause in error.chain() {
+        if let Some(error) = cause.downcast_ref::<MachineError>() {
+            return MachineError::new(error.kind, error.code.clone(), message);
+        }
+        if let Some(error) = cause.downcast_ref::<bloom_broker_api::ProtocolError>() {
+            return machine_error_from_protocol(error, message);
+        }
+        if let Some(error) = cause.downcast_ref::<bloom_vfs::HandlerError>() {
+            return machine_error_from_handler(error, message);
+        }
+        if cause.downcast_ref::<bloom_vfs::path::PathError>().is_some() {
+            return machine_error(MachineErrorKind::InvalidParams, message);
+        }
+        if let Some(error) = cause.downcast_ref::<std::io::Error>() {
+            return machine_error_from_io(error, message);
+        }
+    }
+    machine_error(MachineErrorKind::Internal, message)
+}
+
+fn machine_error_from_protocol(
+    error: &bloom_broker_api::ProtocolError,
+    message: String,
+) -> MachineError {
+    use bloom_broker_api::ProtocolErrorCode as Code;
+    let kind = match error.code {
+        Code::MalformedFrame
+        | Code::LimitExceededFrame
+        | Code::UnknownField
+        | Code::UnknownMethod
+        | Code::UnsupportedVersion
+        | Code::BackendInvalidRequest => MachineErrorKind::InvalidParams,
+        Code::ApprovalNotFound => MachineErrorKind::NotFound,
+        Code::OperationIdConflict | Code::PolicyBaselineStale | Code::CeremonyReplay => {
+            MachineErrorKind::Conflict
+        }
+        Code::ServiceUnavailable
+        | Code::AssuranceUnavailable
+        | Code::ClockUntrusted
+        | Code::ClockRollback
+        | Code::BackendUnsupported => MachineErrorKind::Unavailable,
+        Code::AmbiguousProviderEffect => MachineErrorKind::Internal,
+        Code::UnauthenticatedPeer
+        | Code::ApprovalExpired
+        | Code::ApprovalRevoked
+        | Code::ApprovalRearmRequired
+        | Code::RevocationEpochUnreconciled
+        | Code::SelectorMismatch
+        | Code::SuiteNotAllowed
+        | Code::KeyrefMismatch
+        | Code::LimitExceededOperations
+        | Code::LimitExceededSignatures
+        | Code::LimitExceededValue
+        | Code::LimitExceededRate
+        | Code::SignerRateBackstopDenied
+        | Code::ClaimInvalid
+        | Code::ProvenanceMismatch
+        | Code::CeremonyRateLimited
+        | Code::CeremonyKindMismatch
+        | Code::QuotaExceeded => MachineErrorKind::PermissionDenied,
+    };
+    machine_error(kind, message)
+}
+
+fn machine_wallet_lookup_error(error: bloom_broker_api::ProtocolError) -> MachineError {
+    use bloom_broker_api::ProtocolErrorCode as Code;
+    let message = error.to_string();
+    match error.code {
+        // The projection reader currently uses BackendInvalidRequest for a
+        // well-formed wallet identifier absent from the authoritative list.
+        // At this operation boundary that is a missing resource, not malformed
+        // command input.
+        Code::BackendInvalidRequest => machine_error(MachineErrorKind::NotFound, message),
+        _ => machine_error_from_protocol(&error, message),
+    }
+}
+
+fn machine_error_from_handler(error: &bloom_vfs::HandlerError, message: String) -> MachineError {
+    let kind = match error {
+        bloom_vfs::HandlerError::NotFound(_) => MachineErrorKind::NotFound,
+        bloom_vfs::HandlerError::PermissionDenied
+        | bloom_vfs::HandlerError::OperationNotPermitted => MachineErrorKind::PermissionDenied,
+        bloom_vfs::HandlerError::Invalid(_)
+        | bloom_vfs::HandlerError::NotADir(_)
+        | bloom_vfs::HandlerError::NotAFile(_)
+        | bloom_vfs::HandlerError::Unsupported(_) => MachineErrorKind::InvalidParams,
+        bloom_vfs::HandlerError::Backend(_) => MachineErrorKind::Internal,
+        bloom_vfs::HandlerError::Io(error) => return machine_error_from_io(error, message),
+    };
+    machine_error(kind, message)
+}
+
+fn machine_error_from_io(error: &std::io::Error, message: String) -> MachineError {
+    let kind = match error.kind() {
+        std::io::ErrorKind::NotFound => MachineErrorKind::NotFound,
+        std::io::ErrorKind::PermissionDenied => MachineErrorKind::PermissionDenied,
+        std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::WouldBlock => {
+            MachineErrorKind::Conflict
+        }
+        std::io::ErrorKind::ConnectionRefused
+        | std::io::ErrorKind::ConnectionReset
+        | std::io::ErrorKind::ConnectionAborted
+        | std::io::ErrorKind::NotConnected
+        | std::io::ErrorKind::TimedOut
+        | std::io::ErrorKind::BrokenPipe => MachineErrorKind::Unavailable,
+        std::io::ErrorKind::InvalidInput | std::io::ErrorKind::InvalidData => {
+            MachineErrorKind::InvalidParams
+        }
+        _ => MachineErrorKind::Internal,
+    };
+    machine_error(kind, message)
+}
+
+fn machine_error(kind: MachineErrorKind, message: impl Into<String>) -> MachineError {
+    let code = match kind {
+        MachineErrorKind::InvalidParams => "INVALID_ARGUMENT",
+        MachineErrorKind::PermissionDenied => "PERMISSION_DENIED",
+        MachineErrorKind::Unavailable => "UNAVAILABLE",
+        MachineErrorKind::Conflict => "CONFLICT",
+        MachineErrorKind::NotFound => "NOT_FOUND",
+        MachineErrorKind::Internal => "INTERNAL",
+    };
+    MachineError::new(kind, code, message)
+}
+
+async fn execute_machine_command(
+    home: &HomeDir,
+    daemon: &Daemon,
+    command: MachineCommand,
+) -> Result<MachineCommandOutput> {
+    let output = match command {
+        MachineCommand::Status => {
+            let wallets = match daemon.wallet_projections.list_wallets().await {
+                Ok(wallets) => Some(wallets),
+                Err(error)
+                    if error.code == bloom_broker_api::ProtocolErrorCode::ServiceUnavailable =>
+                {
+                    None
+                }
+                Err(error) => return Err(error.into()),
+            };
+            let mut output = format!(
+                "version: {}\nhome: {}\nchains: {:?}\ndefault_chain: {}\ndefault_wallet: {}\ntry: bloom vfs ls /\n",
+                env!("CARGO_PKG_VERSION"),
+                home.root().display(),
+                daemon.chains.list_names(),
+                daemon.config.default_chain,
+                daemon.config.default_wallet.as_deref().unwrap_or("<none>"),
+            );
+            match wallets {
+                Some(wallets) if wallets.is_empty() => output.push_str("no wallets yet — create one with bloom wallet new main\n"),
+                Some(_) => output.push_str("deposit: bloom wallet address <wallet> --qr\nagent workflow: browse the mounted VFS or use bloom vfs cat/ls/write\n"),
+                None => output.push_str("wallets: unavailable (Broker offline and no cached public projection)\n"),
+            }
+            let mut stderr = String::new();
+            let checker =
+                bloom_update::UpdateChecker::new(env!("CARGO_PKG_VERSION"), home.cache_dir())?;
+            if let Some(snapshot) = checker.quick_check_cached() {
+                let latest = snapshot.latest.as_deref().unwrap_or("?");
+                let available = match snapshot.available() {
+                    bloom_update::UpdateAvailable::OutOfDate => "out_of_date",
+                    bloom_update::UpdateAvailable::UpToDate => "up_to_date",
+                    bloom_update::UpdateAvailable::Unknown => "unknown",
+                };
+                output.push_str(&format!(
+                    "latest_release: {latest}\nupdate_available: {available}\n"
+                ));
+                if matches!(
+                    snapshot.available(),
+                    bloom_update::UpdateAvailable::OutOfDate
+                ) {
+                    let latest_display = latest.strip_prefix('v').unwrap_or(latest);
+                    stderr.push_str(&format!(
+                        "hint: bloom v{latest_display} is available (you have v{}); see /status/update\n",
+                        env!("CARGO_PKG_VERSION")
+                    ));
+                }
+            }
+            return Ok(MachineCommandOutput {
+                stdout: output,
+                stderr,
+                exit_code: 0,
+            });
+        }
+        MachineCommand::AuditStatus => {
+            format!("{}\n", machine_audit_status_output(daemon.audit.as_ref())?)
+        }
+        MachineCommand::AuditReconcile {
+            correlation_id,
+            outcome,
+            confirm,
+        } => format!(
+            "{}\n",
+            execute_audit_command(
+                &AuditCmd::Reconcile {
+                    correlation_id,
+                    outcome,
+                    confirm,
+                },
+                daemon.audit.as_ref(),
+            )?
+        ),
+        MachineCommand::WalletList => {
+            let mut output = String::new();
+            for projection in daemon.wallet_projections.list_wallets().await? {
+                output.push_str(&format!(
+                    "{}\t{}\t{}\n",
+                    projection.wallet.wallet_id,
+                    projection.primary_address()?,
+                    projection.wallet.wallet_kind
+                ));
+            }
+            output
+        }
+        MachineCommand::WalletProjection { name } => {
+            let wallet_id = bloom_broker_api::Token::new(name)?;
+            let projection = daemon
+                .wallet_projections
+                .get_wallet(&wallet_id)
+                .await
+                .map_err(machine_wallet_lookup_error)?;
+            format!("{}\n", serde_json::to_string_pretty(&projection)?)
+        }
+        MachineCommand::WalletAddress { name } => {
+            let wallet_id = bloom_broker_api::Token::new(name)?;
+            let projection = daemon
+                .wallet_projections
+                .get_wallet(&wallet_id)
+                .await
+                .map_err(machine_wallet_lookup_error)?;
+            let address: alloy::primitives::Address = projection.primary_address()?.parse()?;
+            bloom_proto::checksum_address(&address)
+        }
+        MachineCommand::WalletUnlock { name } => {
+            return Err(machine_error(
+                MachineErrorKind::PermissionDenied,
+                format!(
+                    "wallet unlock for '{}' is fail-closed: §17.1 defines wallet.unlock_prepare but §13.1 has no wallet_unlock ceremony_kind",
+                    name
+                ),
+            )
+            .into());
+        }
+        MachineCommand::WalletCustody { name, kind } => {
+            let (method, ceremony_kind, wallet_id, input_class) = match kind {
+                MachineCustodyKind::New => (
+                    bloom_machine_client::CustodyPrepareMethod::WalletRegistration,
+                    bloom_broker_api::CeremonyKind::WalletRegistration,
+                    None,
+                    "passkey-prf",
+                ),
+                MachineCustodyKind::Import => (
+                    bloom_machine_client::CustodyPrepareMethod::WalletImport,
+                    bloom_broker_api::CeremonyKind::WalletImport,
+                    None,
+                    "raw-wallet-import",
+                ),
+                MachineCustodyKind::Rebind => (
+                    bloom_machine_client::CustodyPrepareMethod::CredentialReplace,
+                    bloom_broker_api::CeremonyKind::CredentialReplace,
+                    Some(bloom_broker_api::Token::new(name.clone())?),
+                    "credential-prf",
+                ),
+                MachineCustodyKind::Delete => (
+                    bloom_machine_client::CustodyPrepareMethod::WalletDelete,
+                    bloom_broker_api::CeremonyKind::WalletDelete,
+                    Some(bloom_broker_api::Token::new(name.clone())?),
+                    "none",
+                ),
+            };
+            launch_custody_ceremony(
+                home,
+                &name,
+                method,
+                ceremony_kind,
+                wallet_id,
+                input_class,
+                None,
+            )
+            .await?
+        }
+        MachineCommand::WalletMigrate { receipt } => {
+            let receipt: LegacyMigrationReceiptFile =
+                serde_json::from_value(serde_json::to_value(receipt)?)?;
+            let (name, migration) = receipt.into_launch()?;
+            launch_custody_ceremony(
+                home,
+                &name,
+                bloom_machine_client::CustodyPrepareMethod::WalletImport,
+                bloom_broker_api::CeremonyKind::WalletImport,
+                None,
+                "legacy_passkey_v1_prf",
+                Some(migration),
+            )
+            .await?
+        }
+        MachineCommand::WalletPolicyPrepare {
+            name,
+            policy,
+            assurance_level,
+        } => prepare_policy_update(home, &name, &policy, &assurance_level).await?,
+        MachineCommand::WalletPolicyCommit { operation_id } => {
+            commit_policy_update(home, operation_id).await?
+        }
+        MachineCommand::WalletOutboxCancel {
+            wallet,
+            chain,
+            id,
+            text,
+        } => {
+            execute_wallet_outbox_action(
+                &daemon.vfs,
+                &wallet,
+                &chain,
+                &id,
+                "cancel",
+                text.as_bytes(),
+            )
+            .await?;
+            format!("cancel submitted for {id}\n")
+        }
+        MachineCommand::WalletOutboxReplace {
+            wallet,
+            chain,
+            id,
+            intent,
+        } => {
+            execute_wallet_outbox_action(
+                &daemon.vfs,
+                &wallet,
+                &chain,
+                &id,
+                "replace",
+                intent.as_bytes(),
+            )
+            .await?;
+            format!("replacement submitted for {id}\n")
+        }
+        MachineCommand::Ceremony {
+            action,
+            operation_id,
+        } => {
+            let command = match action {
+                MachineCeremonyAction::Status => CeremonyCmd::Status { operation_id },
+                MachineCeremonyAction::Cancel => CeremonyCmd::Cancel { operation_id },
+                MachineCeremonyAction::Result => CeremonyCmd::Result { operation_id },
+            };
+            handle_ceremony(home, command).await?
+        }
+        MachineCommand::Operation {
+            action,
+            operation_id,
+        } => {
+            let command = match action {
+                MachineOperationAction::Status => OperationCmd::Status { operation_id },
+                MachineOperationAction::Cancel => OperationCmd::Cancel { operation_id },
+            };
+            handle_operation(home, command).await?
+        }
+        MachineCommand::UpdateStatus => handle_update(home, UpdateCmd::Status).await?.0,
+        MachineCommand::UpdateCheck => {
+            let (output, code) = handle_update(home, UpdateCmd::Check).await?;
+            return Ok(MachineCommandOutput {
+                stdout: output,
+                stderr: String::new(),
+                exit_code: code,
+            });
+        }
+        MachineCommand::Completions { shell } => {
+            let shell: Shell = shell
+                .parse()
+                .map_err(|_| machine_error(MachineErrorKind::InvalidParams, "invalid shell"))?;
+            let mut bytes = Vec::new();
+            generate(shell, &mut Cli::command(), "bloom", &mut bytes);
+            String::from_utf8(bytes)?
+        }
+    };
+    Ok(MachineCommandOutput {
+        stdout: output,
+        stderr: String::new(),
+        exit_code: 0,
+    })
+}
+
+async fn execute_wallet_outbox_action(
+    vfs: &bloom_vfs::Vfs,
+    wallet: &str,
+    chain: &str,
+    id: &str,
+    action: &str,
+    body: &[u8],
+) -> Result<()> {
+    for (label, value) in [("wallet", wallet), ("chain", chain), ("id", id)] {
+        if value.is_empty()
+            || value == "."
+            || value == ".."
+            || value
+                .chars()
+                .any(|character| matches!(character, '/' | '\\' | '\0'))
+        {
+            return Err(machine_error(
+                MachineErrorKind::InvalidParams,
+                format!("invalid wallet outbox {label}"),
+            )
+            .into());
+        }
+    }
+    let path = bloom_vfs::VfsPath::parse(&format!(
+        "/wallets/{wallet}/chains/{chain}/outbox/pending/{id}/{action}"
+    ))?;
+    bloom_vfs::Handler::write(vfs, &path, body).await?;
+    Ok(())
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 struct LegacyMigrationReceiptFile {
     schema: String,
@@ -889,42 +1262,54 @@ const MAX_POLICY_DOCUMENT_BYTES: u64 = 1024 * 1024;
 async fn prepare_policy_update(
     home: &HomeDir,
     requested_name: &str,
-    policy_file: &Path,
+    input: &[u8],
     assurance_level: &str,
-) -> Result<()> {
+) -> Result<String> {
     use rand::RngCore as _;
     use sha2::Digest as _;
 
-    validate_wallet_name(requested_name)
-        .context("wallet name must be a safe single path segment")?;
+    validate_wallet_name(requested_name).map_err(|error| {
+        machine_error(
+            MachineErrorKind::InvalidParams,
+            format!("wallet name must be a safe single path segment: {error:#}"),
+        )
+    })?;
     let wallet_id = bloom_broker_api::Token::new(requested_name.to_owned())
         .context("wallet name must be a protocol token")?;
     let assurance_level = bloom_broker_api::Token::new(assurance_level.to_owned())
         .context("assurance level must be a protocol token")?;
-    let metadata = std::fs::metadata(policy_file)
-        .with_context(|| format!("inspect proposed policy {}", policy_file.display()))?;
-    anyhow::ensure!(
-        metadata.is_file() && metadata.len() <= MAX_POLICY_DOCUMENT_BYTES,
-        "proposed policy must be a regular file no larger than {MAX_POLICY_DOCUMENT_BYTES} bytes"
-    );
-    let input = std::fs::read(policy_file)
-        .with_context(|| format!("read proposed policy {}", policy_file.display()))?;
-    let proposed: bloom_broker_api::CanonicalWalletPolicy = serde_json::from_slice(&input)
-        .with_context(|| {
+    if input.len() as u64 > MAX_POLICY_DOCUMENT_BYTES {
+        return Err(machine_error(
+            MachineErrorKind::InvalidParams,
             format!(
-                "parse proposed policy {} as canonical policy JSON",
-                policy_file.display()
+                "proposed policy must be a regular file no larger than {MAX_POLICY_DOCUMENT_BYTES} bytes"
+            ),
+        )
+        .into());
+    }
+    let proposed: bloom_broker_api::CanonicalWalletPolicy =
+        serde_json::from_slice(input).map_err(|error| {
+            machine_error(
+                MachineErrorKind::InvalidParams,
+                format!("parse proposed policy as canonical policy JSON: {error}"),
             )
         })?;
-    anyhow::ensure!(
-        proposed.wallet_id == wallet_id,
-        "proposed policy wallet_id does not match requested wallet"
-    );
+    if proposed.wallet_id != wallet_id {
+        return Err(machine_error(
+            MachineErrorKind::InvalidParams,
+            "proposed policy wallet_id does not match requested wallet",
+        )
+        .into());
+    }
     let proposed_bytes =
         serde_jcs::to_vec(&proposed).context("canonicalize proposed policy document")?;
 
-    let client = configured_broker_client(home)
-        .context("policy update requires the authenticated Machine-to-Broker edge")?;
+    let client = configured_broker_client(home).map_err(|error| {
+        machine_error(
+            MachineErrorKind::Unavailable,
+            format!("policy update requires the authenticated Machine-to-Broker edge: {error:#}"),
+        )
+    })?;
     let baseline = client
         .policy(wallet_id.clone())
         .await
@@ -977,26 +1362,26 @@ async fn prepare_policy_update(
             .map_err(anyhow::Error::new)
             .context("construct Machine policy-update projection")?;
     let projection_path = persist_ceremony_projection(home, &projection)?;
-    println!("operation_id: {}", response.operation_id);
-    println!("ceremony_kind: {:?}", response.ceremony_kind);
-    println!(
-        "review_manifest_digest: {}",
-        response.review_manifest_digest
-    );
-    println!("ceremony_url: {}", response.ceremony_url);
-    println!(
-        "ceremony_expires_at_ms: {}",
-        response.ceremony_expires_at_ms.get()
-    );
-    println!("projection: {}", projection_path.display());
-    Ok(())
+    Ok(format!(
+        "operation_id: {}\nceremony_kind: {:?}\nreview_manifest_digest: {}\nceremony_url: {}\nceremony_expires_at_ms: {}\nprojection: {}\n",
+        response.operation_id,
+        response.ceremony_kind,
+        response.review_manifest_digest,
+        response.ceremony_url,
+        response.ceremony_expires_at_ms.get(),
+        projection_path.display(),
+    ))
 }
 
-async fn commit_policy_update(home: &HomeDir, operation_id: String) -> Result<()> {
+async fn commit_policy_update(home: &HomeDir, operation_id: String) -> Result<String> {
     let operation_id = bloom_broker_api::OperationId::new(operation_id)
         .context("operation ID must be 64 lowercase hexadecimal characters")?;
-    let client = configured_broker_client(home)
-        .context("policy commit requires the authenticated Machine-to-Broker edge")?;
+    let client = configured_broker_client(home).map_err(|error| {
+        machine_error(
+            MachineErrorKind::Unavailable,
+            format!("policy commit requires the authenticated Machine-to-Broker edge: {error:#}"),
+        )
+    })?;
     let ceremony_receipt = client
         .custody_result(bloom_broker_api::OperationRequest {
             operation_id: operation_id.clone(),
@@ -1040,11 +1425,10 @@ async fn commit_policy_update(home: &HomeDir, operation_id: String) -> Result<()
         persist_ceremony_projection(home, &projection)?;
     }
 
-    println!(
-        "{}",
+    Ok(format!(
+        "{}\n",
         serde_json::to_string_pretty(&receipt).context("encode policy commit receipt")?
-    );
-    Ok(())
+    ))
 }
 
 fn is_completed_policy_update_receipt(
@@ -1131,7 +1515,7 @@ fn load_ceremony_projection(
     }
 }
 
-async fn handle_ceremony(home: &HomeDir, command: CeremonyCmd) -> Result<()> {
+async fn handle_ceremony(home: &HomeDir, command: CeremonyCmd) -> Result<String> {
     let (operation_id, action) = match command {
         CeremonyCmd::Status { operation_id } => (operation_id, "status"),
         CeremonyCmd::Cancel { operation_id } => (operation_id, "cancel"),
@@ -1139,8 +1523,14 @@ async fn handle_ceremony(home: &HomeDir, command: CeremonyCmd) -> Result<()> {
     };
     let operation_id = bloom_broker_api::OperationId::new(operation_id)
         .context("operation ID must be 64 lowercase hexadecimal characters")?;
-    let client = configured_broker_client(home)
-        .context("ceremony operations require the authenticated Machine-to-Broker edge")?;
+    let client = configured_broker_client(home).map_err(|error| {
+        machine_error(
+            MachineErrorKind::Unavailable,
+            format!(
+                "ceremony operations require the authenticated Machine-to-Broker edge: {error:#}"
+            ),
+        )
+    })?;
     if action == "result" {
         let result = client
             .custody_result(bloom_broker_api::OperationRequest {
@@ -1153,8 +1543,8 @@ async fn handle_ceremony(home: &HomeDir, command: CeremonyCmd) -> Result<()> {
             result.custody_operation_id == operation_id,
             "Broker custody result operation identity mismatch"
         );
-        println!(
-            "{}",
+        return Ok(format!(
+            "{}\n",
             serde_json::to_string_pretty(&serde_json::json!({
                 "ceremony_kind": result.ceremony_kind,
                 "operation_id": result.custody_operation_id,
@@ -1166,8 +1556,7 @@ async fn handle_ceremony(home: &HomeDir, command: CeremonyCmd) -> Result<()> {
                 "has_encrypted_browser_result": result.encrypted_browser_result.is_some(),
             }))
             .context("encode public custody result")?
-        );
-        return Ok(());
+        ));
     }
 
     let status = if action == "cancel" {
@@ -1202,23 +1591,28 @@ async fn handle_ceremony(home: &HomeDir, command: CeremonyCmd) -> Result<()> {
     };
     projection.expire_launch_secret(now_ms);
     let path = persist_ceremony_projection(home, &projection)?;
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&projection).context("encode ceremony projection")?
-    );
-    println!("projection: {}", path.display());
-    Ok(())
+    Ok(format!(
+        "{}\nprojection: {}\n",
+        serde_json::to_string_pretty(&projection).context("encode ceremony projection")?,
+        path.display(),
+    ))
 }
 
-async fn handle_operation(home: &HomeDir, command: OperationCmd) -> Result<()> {
+async fn handle_operation(home: &HomeDir, command: OperationCmd) -> Result<String> {
     let (raw_operation_id, cancel) = match command {
         OperationCmd::Status { operation_id } => (operation_id, false),
         OperationCmd::Cancel { operation_id } => (operation_id, true),
     };
     let operation_id = bloom_broker_api::OperationId::new(raw_operation_id)
         .context("operation ID must be 64 lowercase hexadecimal characters")?;
-    let client = configured_broker_client(home)
-        .context("operation lifecycle requires the authenticated Machine-to-Broker edge")?;
+    let client = configured_broker_client(home).map_err(|error| {
+        machine_error(
+            MachineErrorKind::Unavailable,
+            format!(
+                "operation lifecycle requires the authenticated Machine-to-Broker edge: {error:#}"
+            ),
+        )
+    })?;
     let status = if cancel {
         client
             .cancel_operation(operation_id.clone())
@@ -1236,20 +1630,25 @@ async fn handle_operation(home: &HomeDir, command: OperationCmd) -> Result<()> {
         status.operation_id == operation_id,
         "Broker operation status identity mismatch"
     );
-    serde_json::to_writer_pretty(std::io::stdout().lock(), &status)
-        .context("encode Broker operation status")?;
-    println!();
-    Ok(())
+    Ok(format!(
+        "{}\n",
+        serde_json::to_string_pretty(&status).context("encode Broker operation status")?
+    ))
 }
 
 #[derive(Parser, Debug)]
 #[command(
     name = "bloom",
-    version,
+    disable_version_flag = true,
+    arg_required_else_help = true,
     about = "Bloom — an agentic Ethereum wallet as a virtual filesystem",
     long_about = "Bloom mounts an agentic Ethereum wallet as a directory for agents. EXPERIMENTAL / UNAUDITED ALPHA: do not use with funds you cannot afford to lose, and review every generated transaction plan before signing. Read balances, contracts, ENS, prices, and status with cat/ls; stage wallet actions by writing intents into an outbox; confirm only after reviewing the generated plan. New agents should read https://bloom.directory/SKILL.md, then run bloom init and bloom serve --mount ~/bloom. Use bloom vfs only as a fallback when mounting is unavailable."
 )]
 struct Cli {
+    /// Show the version reported by the running Bloom daemon.
+    #[arg(long)]
+    version: bool,
+
     /// Override home directory (default: ~/.bloom).
     #[arg(long, env = "BLOOM_HOME")]
     home: Option<PathBuf>,
@@ -1272,7 +1671,43 @@ struct Cli {
     quiet: bool,
 
     #[command(subcommand)]
-    cmd: Cmd,
+    cmd: Option<Cmd>,
+}
+
+#[derive(Subcommand, Debug)]
+enum InitInternal {
+    #[cfg(feature = "triad-dev-harness")]
+    #[command(name = "triad-render-developer-enrollment", hide = true)]
+    TriadRenderDeveloperEnrollment {
+        template_dir: PathBuf,
+        output_dir: PathBuf,
+        release_digest: String,
+    },
+    #[command(name = "triad-render-macos-enrollment", hide = true)]
+    TriadRenderMacosEnrollment {
+        template_dir: PathBuf,
+        output_dir: PathBuf,
+        login_uid: u32,
+        broker_uid: u32,
+        signer_uid: u32,
+        session_socket_gid: u32,
+        release_digest: String,
+    },
+    #[command(name = "triad-render-macos-identity-rotation", hide = true)]
+    TriadRenderMacosIdentityRotation {
+        current_identity: PathBuf,
+        replacement_identity: PathBuf,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ServeInternal {
+    #[command(name = "triad-health-check", hide = true)]
+    TriadHealthCheck { expected_build: String },
+    #[command(name = "triad-pf-monitor-once", hide = true)]
+    TriadPfMonitorOnce,
+    #[command(name = "session-sentinel", hide = true)]
+    SessionSentinel,
 }
 
 #[derive(Subcommand, Debug)]
@@ -1317,6 +1752,9 @@ enum Cmd {
             default_missing_value = DEFAULT_MOUNT_PATH
         )]
         mount: Option<PathBuf>,
+
+        #[command(subcommand)]
+        internal: Option<ServeInternal>,
     },
     /// Talk to a running `bloom serve` over its UDS JSON-RPC socket.
     #[command(subcommand)]
@@ -1329,7 +1767,10 @@ enum Cmd {
     #[command(subcommand)]
     Update(UpdateCmd),
     /// Initialise ~/.bloom with default config + dirs.
-    Init,
+    Init {
+        #[command(subcommand)]
+        internal: Option<InitInternal>,
+    },
 
     /// Print a shell completion script.
     Completions { shell: Shell },
@@ -1587,97 +2028,6 @@ enum WalletCmd {
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    #[cfg(feature = "triad-dev-harness")]
-    if std::env::args_os().len() == 5
-        && std::env::args_os().nth(1).as_deref()
-            == Some(std::ffi::OsStr::new("--triad-render-developer-enrollment"))
-    {
-        return match triad_enrollment::run_developer_from_process_args() {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(error) => {
-                eprintln!("Bloom developer triad enrollment generation failed: {error:#}");
-                ExitCode::FAILURE
-            }
-        };
-    }
-    if std::env::args_os().len() == 4
-        && std::env::args_os().nth(1).as_deref()
-            == Some(std::ffi::OsStr::new(
-                "--triad-render-macos-identity-rotation",
-            ))
-    {
-        return match triad_enrollment::run_identity_rotation_from_process_args() {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(error) => {
-                eprintln!("Bloom macOS identity rotation generation failed: {error:#}");
-                ExitCode::FAILURE
-            }
-        };
-    }
-    if std::env::args_os().len() == 9
-        && std::env::args_os().nth(1).as_deref()
-            == Some(std::ffi::OsStr::new("--triad-render-macos-enrollment"))
-    {
-        return match triad_enrollment::run_from_process_args() {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(error) => {
-                eprintln!("Bloom macOS enrollment generation failed: {error:#}");
-                ExitCode::FAILURE
-            }
-        };
-    }
-    if std::env::args_os().len() == 3
-        && std::env::args_os().nth(1).as_deref()
-            == Some(std::ffi::OsStr::new("--triad-health-check"))
-    {
-        let expected_build = match std::env::args_os().nth(2) {
-            Some(value) => match value.into_string() {
-                Ok(value) => value,
-                Err(_) => {
-                    eprintln!("Bloom triad health check failed: build digest is not UTF-8");
-                    return ExitCode::FAILURE;
-                }
-            },
-            None => return ExitCode::FAILURE,
-        };
-        return match installed_triad_health_check(&expected_build).await {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(error) => {
-                eprintln!("Bloom triad health check failed: {error:#}");
-                ExitCode::FAILURE
-            }
-        };
-    }
-    if std::env::args_os().len() == 2
-        && std::env::args_os().nth(1).as_deref()
-            == Some(std::ffi::OsStr::new("--triad-pf-monitor-once"))
-    {
-        return match pf_monitor::run_once() {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(error) => {
-                eprintln!("Bloom packet-filter monitor failed: {error:#}");
-                ExitCode::FAILURE
-            }
-        };
-    }
-    if std::env::args_os().len() == 2
-        && std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--session-sentinel"))
-    {
-        let _ = tracing_subscriber::fmt()
-            .with_env_filter(
-                EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-            )
-            .with_target(false)
-            .with_writer(std::io::stderr)
-            .try_init();
-        return match session_sentinel::run().await {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(error) => {
-                eprintln!("Bloom session sentinel failed: {error:#}");
-                ExitCode::FAILURE
-            }
-        };
-    }
     let cli = Cli::parse();
 
     // RUST_LOG wins when set; otherwise default to `info`, or `error`
@@ -1706,85 +2056,56 @@ async fn main() -> ExitCode {
     }
 }
 
-/// Returns `None` when no daemon socket is present (daemon not started),
-/// propagating all other errors normally. A stale socket (file exists but
-/// connection refused) is removed and surfaced as an error rather than
-/// silently falling back to in-process — a stale socket almost always
-/// means the daemon crashed and the caller should restart it explicitly.
+/// Calls the configured daemon endpoint. A missing daemon is always an error:
+/// `init` and `serve` are the only CLI commands allowed to execute without the
+/// long-running Machine process.
 async fn try_ipc(
     client: &IpcClient,
     endpoint: &ResolvedEndpoint,
     method: &str,
     params: serde_json::Value,
-) -> std::io::Result<Option<serde_json::Value>> {
+) -> std::io::Result<serde_json::Value> {
     match client.call(method, params).await {
-        Ok(v) => Ok(Some(v)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            if endpoint.is_explicit() {
-                return Err(std::io::Error::new(
-                    e.kind(),
-                    format!(
-                        "explicit Bloom endpoint {} is not available: {e}",
-                        endpoint.display
-                    ),
-                ));
-            }
-            debug!(error = %e, "ipc.no_daemon_fallback");
-            Ok(None)
+        Ok(v) => Ok(v),
+        Err(IpcClientError::Rpc(error)) => Err(std::io::Error::other(error)),
+        Err(IpcClientError::Transport(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+            Err(std::io::Error::new(
+                e.kind(),
+                format!(
+                    "Bloom daemon endpoint {} is not available: {e}; start it with 'bloom serve'",
+                    endpoint.display
+                ),
+            ))
         }
-        Err(e) if is_endpoint_permission_denial(&e) => {
-            if endpoint.is_explicit() {
-                return Err(std::io::Error::new(
-                    e.kind(),
-                    format!("explicit Bloom endpoint {} failed: {e}", endpoint.display),
-                ));
-            }
-            debug!(endpoint = %endpoint.display, error = %e, "ipc.permission_fallback");
-            Ok(None)
+        Err(IpcClientError::Transport(e)) if is_endpoint_permission_denial(&e) => {
+            Err(endpoint_connection_error(&endpoint.display, e))
         }
-        Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
-            if endpoint.is_explicit() {
-                return Err(std::io::Error::new(
-                    e.kind(),
-                    format!(
-                        "explicit Bloom endpoint {} is not responding: {e}",
-                        endpoint.display
-                    ),
-                ));
-            }
-            // Only remove if it is actually a socket, not a regular
-            // file or symlink placed by another process.
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::FileTypeExt;
-                let removed = std::fs::symlink_metadata(client.socket())
-                    .is_ok_and(|m| m.file_type().is_socket())
-                    && std::fs::remove_file(client.socket()).is_ok();
-                let detail = if removed {
-                    "stale socket removed"
-                } else {
-                    "socket not responding"
-                };
-                Err(std::io::Error::other(format!(
-                    "daemon socket exists but is not responding ({detail}); \
-                     start the daemon with 'bloom serve'",
-                )))
-            }
-            #[cfg(not(unix))]
-            {
-                let _ = std::fs::remove_file(client.socket());
-                return Err(std::io::Error::other(
-                    "daemon socket exists but is not responding (stale socket removed); \
-                     start the daemon with 'bloom serve'",
-                ));
-            }
+        Err(IpcClientError::Transport(e)) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
+            Err(std::io::Error::other(format!(
+                "Bloom daemon endpoint {} is not responding: {e}; start it with 'bloom serve'",
+                endpoint.display,
+            )))
         }
-        Err(e) => Err(e),
+        Err(IpcClientError::Transport(e)) => Err(endpoint_connection_error(&endpoint.display, e)),
+        Err(IpcClientError::Protocol(message)) => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "Bloom daemon endpoint {} returned {message}",
+                endpoint.display
+            ),
+        )),
     }
 }
 
 fn is_endpoint_permission_denial(e: &std::io::Error) -> bool {
     e.kind() == std::io::ErrorKind::PermissionDenied || e.raw_os_error() == Some(1)
+}
+
+fn endpoint_connection_error(endpoint: &str, error: std::io::Error) -> std::io::Error {
+    std::io::Error::new(
+        error.kind(),
+        format!("Bloom daemon endpoint {endpoint} failed: {error}; start it with 'bloom serve'"),
+    )
 }
 
 fn system_time_to_unix_ms(time: SystemTime) -> u128 {
@@ -1796,14 +2117,6 @@ fn system_time_to_unix_ms(time: SystemTime) -> u128 {
 fn unix_ms_to_system_time(ms: u128) -> SystemTime {
     let ms = ms.min(u64::MAX as u128) as u64;
     UNIX_EPOCH + std::time::Duration::from_millis(ms)
-}
-
-fn entry_kind_label(kind: EntryKind) -> &'static str {
-    match kind {
-        EntryKind::Dir => "dir",
-        EntryKind::File => "file",
-        EntryKind::Symlink => "symlink",
-    }
 }
 
 fn print_vfs_stat(
@@ -1833,18 +2146,6 @@ fn print_vfs_stat(
     }
 }
 
-fn print_vfs_stat_entry(path: &str, entry: &Entry) {
-    print_vfs_stat(
-        path,
-        &entry.name,
-        entry_kind_label(entry.kind),
-        entry.mode,
-        entry.size,
-        entry.link_target.as_deref(),
-        entry.modified,
-    )
-}
-
 fn print_vfs_stat_json(path: &str, entry: &serde_json::Value) -> Result<()> {
     let name = entry
         .get("name")
@@ -1871,7 +2172,59 @@ fn print_vfs_stat_json(path: &str, entry: &serde_json::Value) -> Result<()> {
     Ok(())
 }
 
+async fn ipc_read(endpoint: &ResolvedEndpoint, path: &str) -> Result<Vec<u8>> {
+    let result = try_ipc(
+        &IpcClient::new(&endpoint.socket),
+        endpoint,
+        "read",
+        serde_json::json!({ "path": path }),
+    )
+    .await
+    .with_context(|| format!("ipc read {path} via {}", endpoint.display))?;
+    let encoded = result
+        .get("bytes_b64")
+        .and_then(|value| value.as_str())
+        .context("ipc read: missing bytes_b64")?;
+    B64.decode(encoded).context("ipc read: bad base64")
+}
+
+async fn ipc_read_to_stdout(endpoint: &ResolvedEndpoint, path: &str, context: &str) -> Result<()> {
+    let bytes = ipc_read(endpoint, path)
+        .await
+        .with_context(|| context.to_owned())?;
+    std::io::Write::write_all(&mut std::io::stdout(), &bytes)?;
+    Ok(())
+}
+
+async fn machine_command(
+    endpoint: &ResolvedEndpoint,
+    command: MachineCommand,
+) -> Result<MachineCommandOutput> {
+    let result = try_ipc(
+        &IpcClient::new(&endpoint.socket),
+        endpoint,
+        "machine.execute",
+        serde_json::to_value(command)?,
+    )
+    .await?;
+    serde_json::from_value(result).context("decode daemon Machine command response")
+}
+
+async fn call_machine_command(endpoint: &ResolvedEndpoint, command: MachineCommand) -> Result<()> {
+    let output = machine_command(endpoint, command).await?;
+    std::io::Write::write_all(&mut std::io::stdout(), output.stdout.as_bytes())?;
+    std::io::Write::write_all(&mut std::io::stderr(), output.stderr.as_bytes())?;
+    if output.exit_code != 0 {
+        UPDATE_EXIT_CODE.store(output.exit_code, std::sync::atomic::Ordering::SeqCst);
+    }
+    Ok(())
+}
+
 async fn run(cli: Cli) -> Result<()> {
+    anyhow::ensure!(
+        !cli.version || cli.cmd.is_none(),
+        "--version cannot be combined with a command"
+    );
     let (connect, ipc_socket) = if cli.connect.is_some() {
         (cli.connect, None)
     } else if cli.ipc_socket.is_some() {
@@ -1895,8 +2248,65 @@ async fn run(cli: Cli) -> Result<()> {
         .context("resolve Bloom endpoint")?;
     trace!(cmd = ?cli.cmd, home = %home.root().display(), "cli.dispatch");
 
-    match cli.cmd {
-        Cmd::Init => {
+    if cli.version {
+        let version = try_ipc(
+            &IpcClient::new(&client_endpoint.socket),
+            &client_endpoint,
+            "version",
+            serde_json::Value::Null,
+        )
+        .await
+        .with_context(|| format!("ipc version via {}", client_endpoint.display))?;
+        println!(
+            "bloom {}",
+            version
+                .as_str()
+                .context("daemon version response is not a string")?
+        );
+        return Ok(());
+    }
+
+    match cli.cmd.context("a command is required")? {
+        Cmd::Init { internal } => {
+            if let Some(internal) = internal {
+                return match internal {
+                    #[cfg(feature = "triad-dev-harness")]
+                    InitInternal::TriadRenderDeveloperEnrollment {
+                        template_dir,
+                        output_dir,
+                        release_digest,
+                    } => {
+                        triad_enrollment::run_developer(&template_dir, &output_dir, release_digest)
+                            .context("Bloom developer triad enrollment generation failed")
+                    }
+                    InitInternal::TriadRenderMacosEnrollment {
+                        template_dir,
+                        output_dir,
+                        login_uid,
+                        broker_uid,
+                        signer_uid,
+                        session_socket_gid,
+                        release_digest,
+                    } => triad_enrollment::run(
+                        template_dir,
+                        output_dir,
+                        login_uid,
+                        broker_uid,
+                        signer_uid,
+                        session_socket_gid,
+                        release_digest,
+                    )
+                    .context("Bloom macOS enrollment generation failed"),
+                    InitInternal::TriadRenderMacosIdentityRotation {
+                        current_identity,
+                        replacement_identity,
+                    } => triad_enrollment::run_identity_rotation(
+                        &current_identity,
+                        &replacement_identity,
+                    )
+                    .context("Bloom macOS identity rotation generation failed"),
+                };
+            }
             eprintln!("{ALPHA_DISCLOSURE}");
             let (_home_permit, d) = build_write_daemon(home.clone()).context("init daemon")?;
             let preinstalled = github_source::ensure_preinstalled_petals(&home, &d)
@@ -1912,85 +2322,25 @@ async fn run(cli: Cli) -> Result<()> {
             println!("agent setup: https://bloom.directory/SKILL.md");
             Ok(())
         }
-        Cmd::Status => {
-            // Status is a public, projection-only surface. Do not construct a
-            // Daemon here: that composition still opens legacy authority
-            // stores while the extraction milestones are in progress.
-            let config = if home.config_path().is_file() {
-                bloom_proto::Config::load(&home.config_path()).context("load config")?
-            } else {
-                bloom_proto::Config::local_default()
-            };
-            let projected_wallets = match configured_wallet_projection_reader(&home)?
-                .list_wallets()
-                .await
-            {
-                Ok(wallets) => Some(wallets),
-                Err(error)
-                    if error.code == bloom_broker_api::ProtocolErrorCode::ServiceUnavailable =>
-                {
-                    None
-                }
-                Err(error) => return Err(error.into()),
-            };
-            println!("version: {}", env!("CARGO_PKG_VERSION"));
-            println!("home: {}", home.root().display());
-            println!(
-                "chains: {:?}",
-                config.chains.keys().cloned().collect::<Vec<_>>()
-            );
-            println!("default_chain: {}", config.default_chain);
-            println!(
-                "default_wallet: {}",
-                config.default_wallet.as_deref().unwrap_or("<none>")
-            );
-            println!("try: bloom vfs ls /");
-            match projected_wallets {
-                Some(wallets) if wallets.is_empty() => {
-                    println!("no wallets yet — create one with bloom wallet new main");
-                }
-                Some(_) => {
-                    println!("deposit: bloom wallet address <wallet> --qr");
-                    println!(
-                        "agent workflow: browse the mounted VFS or use bloom vfs cat/ls/write"
-                    );
-                }
-                None => println!(
-                    "wallets: unavailable (Broker offline and no cached public projection)"
-                ),
-            }
-            let update_checker =
-                bloom_update::UpdateChecker::new(env!("CARGO_PKG_VERSION"), home.cache_dir())
-                    .context("build update checker")?;
-            if let Some(snap) = update_checker.quick_check_cached() {
-                let latest = snap.latest.as_deref().unwrap_or("?");
-                let latest_display = latest.strip_prefix('v').unwrap_or(latest);
-                let available = match snap.available() {
-                    bloom_update::UpdateAvailable::OutOfDate => "out_of_date",
-                    bloom_update::UpdateAvailable::UpToDate => "up_to_date",
-                    bloom_update::UpdateAvailable::Unknown => "unknown",
-                };
-                println!("latest_release: {}", latest);
-                println!("update_available: {}", available);
-                if matches!(snap.available(), bloom_update::UpdateAvailable::OutOfDate) {
-                    eprintln!(
-                        "hint: bloom v{} is available (you have v{}); see /status/update",
-                        latest_display,
-                        env!("CARGO_PKG_VERSION")
-                    );
-                }
-            }
-            Ok(())
-        }
+        Cmd::Status => call_machine_command(&client_endpoint, MachineCommand::Status).await,
         Cmd::Audit(command) => {
-            let audit = configured_machine_audit(&home)?;
-            println!("{}", execute_audit_command(&command, &audit)?);
-            Ok(())
+            let command = match command {
+                AuditCmd::Status => MachineCommand::AuditStatus,
+                AuditCmd::Reconcile {
+                    correlation_id,
+                    outcome,
+                    confirm,
+                } => MachineCommand::AuditReconcile {
+                    correlation_id,
+                    outcome,
+                    confirm,
+                },
+            };
+            call_machine_command(&client_endpoint, command).await
         }
         Cmd::Vfs(VfsCmd::Cat { path }) => {
-            let p = VfsPath::parse(&path).context("parse path")?;
             let client = IpcClient::new(&client_endpoint.socket);
-            let ipc_res = try_ipc(
+            let res = try_ipc(
                 &client,
                 &client_endpoint,
                 "read",
@@ -1998,25 +2348,18 @@ async fn run(cli: Cli) -> Result<()> {
             )
             .await
             .with_context(|| format!("ipc read via {}", client_endpoint.display))?;
-            let bytes = if let Some(res) = ipc_res {
-                debug!(endpoint = %client_endpoint.display, "cli.vfs.cat.via_ipc");
-                let b64 = res
-                    .get("bytes_b64")
-                    .and_then(|v| v.as_str())
-                    .context("ipc read: missing bytes_b64")?;
-                B64.decode(b64).context("ipc read: bad base64")?
-            } else {
-                debug!("cli.vfs.cat.via_inproc: no daemon socket present");
-                let d = build_authenticated_read_daemon(home)?;
-                d.vfs.read(&p).await.context("vfs read")?
-            };
+            debug!(endpoint = %client_endpoint.display, "cli.vfs.cat.via_ipc");
+            let b64 = res
+                .get("bytes_b64")
+                .and_then(|v| v.as_str())
+                .context("ipc read: missing bytes_b64")?;
+            let bytes = B64.decode(b64).context("ipc read: bad base64")?;
             std::io::Write::write_all(&mut std::io::stdout(), &bytes)?;
             Ok(())
         }
         Cmd::Vfs(VfsCmd::Ls { path }) => {
-            let p = VfsPath::parse(&path).context("parse path")?;
             let client = IpcClient::new(&client_endpoint.socket);
-            let ipc_res = try_ipc(
+            let res = try_ipc(
                 &client,
                 &client_endpoint,
                 "list",
@@ -2024,32 +2367,22 @@ async fn run(cli: Cli) -> Result<()> {
             )
             .await
             .with_context(|| format!("ipc list via {}", client_endpoint.display))?;
-            if let Some(res) = ipc_res {
-                debug!(endpoint = %client_endpoint.display, "cli.vfs.ls.via_ipc");
-                let arr = res.as_array().context("ipc list: expected array")?;
-                for e in arr {
-                    let name = e.get("name").and_then(|v| v.as_str()).unwrap_or("?");
-                    let kind = match e.get("kind").and_then(|v| v.as_str()).unwrap_or("file") {
-                        "dir" => "Dir",
-                        "symlink" => "Symlink",
-                        _ => "File",
-                    };
-                    println!("{}\t{}", name, kind);
-                }
-            } else {
-                debug!("cli.vfs.ls.via_inproc: no daemon socket present");
-                let d = build_authenticated_read_daemon(home)?;
-                let entries = d.vfs.list(&p).await.context("vfs list")?;
-                for e in entries {
-                    println!("{}\t{:?}", e.name, e.kind);
-                }
+            debug!(endpoint = %client_endpoint.display, "cli.vfs.ls.via_ipc");
+            let arr = res.as_array().context("ipc list: expected array")?;
+            for e in arr {
+                let name = e.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+                let kind = match e.get("kind").and_then(|v| v.as_str()).unwrap_or("file") {
+                    "dir" => "Dir",
+                    "symlink" => "Symlink",
+                    _ => "File",
+                };
+                println!("{}\t{}", name, kind);
             }
             Ok(())
         }
         Cmd::Vfs(VfsCmd::Stat { path }) => {
-            let p = VfsPath::parse(&path).context("parse path")?;
             let client = IpcClient::new(&client_endpoint.socket);
-            let ipc_res = try_ipc(
+            let res = try_ipc(
                 &client,
                 &client_endpoint,
                 "lookup",
@@ -2057,19 +2390,11 @@ async fn run(cli: Cli) -> Result<()> {
             )
             .await
             .with_context(|| format!("ipc lookup via {}", client_endpoint.display))?;
-            if let Some(res) = ipc_res {
-                debug!(endpoint = %client_endpoint.display, "cli.vfs.stat.via_ipc");
-                print_vfs_stat_json(&path, &res)?;
-            } else {
-                debug!("cli.vfs.stat.via_inproc: no daemon socket present");
-                let d = build_authenticated_read_daemon(home)?;
-                let entry = d.vfs.lookup(&p).await.context("vfs lookup")?;
-                print_vfs_stat_entry(&path, &entry);
-            }
+            debug!(endpoint = %client_endpoint.display, "cli.vfs.stat.via_ipc");
+            print_vfs_stat_json(&path, &res)?;
             Ok(())
         }
         Cmd::Vfs(VfsCmd::Write { path, data }) => {
-            let p = VfsPath::parse(&path).context("parse path")?;
             let body = match data {
                 Some(s) => s.into_bytes(),
                 None => {
@@ -2079,7 +2404,7 @@ async fn run(cli: Cli) -> Result<()> {
                 }
             };
             let client = IpcClient::new(&client_endpoint.socket);
-            let ipc_res = try_ipc(
+            try_ipc(
                 &client,
                 &client_endpoint,
                 "write",
@@ -2087,13 +2412,7 @@ async fn run(cli: Cli) -> Result<()> {
             )
             .await
             .with_context(|| format!("ipc write via {}", client_endpoint.display))?;
-            if ipc_res.is_some() {
-                debug!(endpoint = %client_endpoint.display, "cli.vfs.write.via_ipc");
-            } else {
-                debug!("cli.vfs.write.via_inproc: no daemon socket present");
-                let (_home_permit, d) = build_write_daemon(home)?;
-                d.vfs.write(&p, &body).await.context("vfs write")?;
-            }
+            debug!(endpoint = %client_endpoint.display, "cli.vfs.write.via_ipc");
             Ok(())
         }
         Cmd::Request(RequestCmd::New {
@@ -2108,49 +2427,43 @@ async fn run(cli: Cli) -> Result<()> {
                 "/requests/new"
             };
             let client = IpcClient::new(&client_endpoint.socket);
-            let ipc_res = try_ipc(
+            try_ipc(
                 &client,
                 &client_endpoint,
-                "write",
-                serde_json::json!({ "path": path, "bytes_b64": B64.encode(body.as_bytes()) }),
+                "write_with_lookup",
+                serde_json::json!({
+                    "path": path,
+                    "bytes_b64": B64.encode(body.as_bytes()),
+                    "projection_path": "/requests/latest",
+                }),
             )
             .await
-            .with_context(|| format!("ipc request new via {}", client_endpoint.display))?;
-            if ipc_res.is_some() {
-                debug!(endpoint = %client_endpoint.display, "cli.request.new.via_ipc");
-                if dry_run {
-                    println!("dry_run: true (unpaid probe/staging only; no spend/signing)");
-                }
-                return Ok(());
-            }
-            debug!("cli.request.new.via_inproc: no daemon socket present");
-            let (_home_permit, d) = build_write_daemon(home)?;
-            d.vfs
-                .write(&VfsPath::parse(path)?, body.as_bytes())
-                .await
-                .context("request new")?;
-            let latest = d
-                .vfs
-                .read(&VfsPath::parse("/requests/latest")?)
-                .await
-                .context("read latest request")?;
-            let latest = String::from_utf8_lossy(&latest);
-            println!("request: {}", latest.trim());
+            .with_context(|| format!("ipc request new via {}", client_endpoint.display))
+            .and_then(|entry| {
+                let target = entry
+                    .get("link_target")
+                    .and_then(serde_json::Value::as_str)
+                    .context("ipc request new: latest projection is missing link_target")?;
+                println!("request: {target}");
+                Ok(entry)
+            })?;
+            debug!(endpoint = %client_endpoint.display, "cli.request.new.via_ipc");
             if dry_run {
                 println!("dry_run: true (unpaid probe/staging only; no spend/signing)");
             }
             Ok(())
         }
         Cmd::Request(RequestCmd::Plan { id }) => {
-            let d = build_authenticated_read_daemon(home)?;
-            let path = VfsPath::parse(&format!("/requests/{id}/plan.md"))?;
-            let bytes = d.vfs.read(&path).await.context("request plan")?;
-            std::io::Write::write_all(&mut std::io::stdout(), &bytes)?;
+            ipc_read_to_stdout(
+                &client_endpoint,
+                &format!("/requests/{id}/plan.md"),
+                "request plan",
+            )
+            .await?;
             Ok(())
         }
         Cmd::Request(RequestCmd::Confirm { id, text }) => {
             let path = format!("/requests/{id}/confirm");
-            let p = VfsPath::parse(&path)?;
             let body = text.into_bytes();
             let client = IpcClient::new(&client_endpoint.socket);
             // Confirmation uses the ordinary Machine VFS lane. Any signing
@@ -2160,60 +2473,47 @@ async fn run(cli: Cli) -> Result<()> {
                 "path": path,
                 "bytes_b64": B64.encode(&body),
             });
-            match try_ipc(&client, &client_endpoint, "write", confirm_params.clone()).await {
-                Ok(Some(_)) => {
-                    debug!(endpoint = %client_endpoint.display, "cli.request.confirm.via_ipc");
-                    return Ok(());
-                }
-                Ok(None) => {
-                    debug!("cli.request.confirm.via_inproc: no daemon socket present");
-                    // Fall through to the in-process fallback below.
-                }
-                Err(e) => {
-                    return Err(anyhow::Error::new(e)).with_context(|| {
-                        format!("ipc request confirm via {}", client_endpoint.display)
-                    });
-                }
-            }
-            let (_home_permit, d) = build_write_daemon(home)?;
-            d.vfs.write(&p, &body).await.context("request confirm")?;
+            try_ipc(&client, &client_endpoint, "write", confirm_params)
+                .await
+                .with_context(|| format!("ipc request confirm via {}", client_endpoint.display))?;
+            debug!(endpoint = %client_endpoint.display, "cli.request.confirm.via_ipc");
             Ok(())
         }
         Cmd::Request(RequestCmd::Body { id }) => {
-            let d = build_authenticated_read_daemon(home)?;
-            let path = VfsPath::parse(&format!("/requests/{id}/response/body"))?;
-            let bytes = d.vfs.read(&path).await.context("request body")?;
-            std::io::Write::write_all(&mut std::io::stdout(), &bytes)?;
+            ipc_read_to_stdout(
+                &client_endpoint,
+                &format!("/requests/{id}/response/body"),
+                "request body",
+            )
+            .await?;
             Ok(())
         }
         Cmd::Request(RequestCmd::Receipt { id }) => {
-            let d = build_authenticated_read_daemon(home)?;
-            let path = VfsPath::parse(&format!("/requests/{id}/receipt.json"))?;
-            let bytes = d.vfs.read(&path).await.context("request receipt")?;
-            std::io::Write::write_all(&mut std::io::stdout(), &bytes)?;
+            ipc_read_to_stdout(
+                &client_endpoint,
+                &format!("/requests/{id}/receipt.json"),
+                "request receipt",
+            )
+            .await?;
             Ok(())
         }
         Cmd::Wallet(WalletCmd::New { name }) => {
-            launch_custody_ceremony(
-                &home,
-                &name,
-                bloom_machine_client::CustodyPrepareMethod::WalletRegistration,
-                bloom_broker_api::CeremonyKind::WalletRegistration,
-                None,
-                "passkey-prf",
-                None,
+            call_machine_command(
+                &client_endpoint,
+                MachineCommand::WalletCustody {
+                    name,
+                    kind: MachineCustodyKind::New,
+                },
             )
             .await
         }
         Cmd::Wallet(WalletCmd::Import { name }) => {
-            launch_custody_ceremony(
-                &home,
-                &name,
-                bloom_machine_client::CustodyPrepareMethod::WalletImport,
-                bloom_broker_api::CeremonyKind::WalletImport,
-                None,
-                "raw-wallet-import",
-                None,
+            call_machine_command(
+                &client_endpoint,
+                MachineCommand::WalletCustody {
+                    name,
+                    kind: MachineCustodyKind::Import,
+                },
             )
             .await
         }
@@ -2245,52 +2545,24 @@ async fn run(cli: Cli) -> Result<()> {
             }
             let receipt: LegacyMigrationReceiptFile =
                 serde_json::from_slice(&encoded).context("parse legacy migration receipt")?;
-            let (name, migration) = receipt.into_launch()?;
-            launch_custody_ceremony(
-                &home,
-                &name,
-                bloom_machine_client::CustodyPrepareMethod::WalletImport,
-                bloom_broker_api::CeremonyKind::WalletImport,
-                None,
-                "legacy_passkey_v1_prf",
-                Some(migration),
+            call_machine_command(
+                &client_endpoint,
+                MachineCommand::WalletMigrate {
+                    receipt: serde_json::from_value(serde_json::to_value(receipt)?)?,
+                },
             )
             .await
         }
         Cmd::Wallet(WalletCmd::List) => {
-            let reader = configured_wallet_projection_reader(&home)?;
-            for projection in reader.list_wallets().await? {
-                println!(
-                    "{}\t{}\t{}",
-                    projection.wallet.wallet_id,
-                    projection.primary_address()?,
-                    projection.wallet.wallet_kind
-                );
-            }
-            Ok(())
+            call_machine_command(&client_endpoint, MachineCommand::WalletList).await
         }
         Cmd::Wallet(WalletCmd::Projection { name }) => {
-            let reader = configured_wallet_projection_reader(&home)?;
-            let wallet_id =
-                bloom_broker_api::Token::new(name).context("wallet ID must be a protocol token")?;
-            let projection = reader.get_wallet(&wallet_id).await?;
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&projection)
-                    .context("encode public wallet projection")?
-            );
-            Ok(())
+            call_machine_command(&client_endpoint, MachineCommand::WalletProjection { name }).await
         }
         Cmd::Wallet(WalletCmd::Address { name, qr, qr_out }) => {
-            let reader = configured_wallet_projection_reader(&home)?;
-            let wallet_id =
-                bloom_broker_api::Token::new(name).context("wallet ID must be a protocol token")?;
-            let projection = reader.get_wallet(&wallet_id).await?;
-            let address: alloy::primitives::Address = projection
-                .primary_address()?
-                .parse()
-                .context("Broker wallet projection contains an invalid address")?;
-            let address = bloom_proto::checksum_address(&address);
+            let result =
+                machine_command(&client_endpoint, MachineCommand::WalletAddress { name }).await?;
+            let address = result.stdout;
             if let Some(path) = qr_out {
                 match commands::qr::render_qr_svg(&address) {
                     Some(svg) => {
@@ -2308,44 +2580,55 @@ async fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
         Cmd::Wallet(WalletCmd::Unlock { name }) => {
-            bail!(
-                "wallet unlock for '{name}' is fail-closed: §17.1 defines \
-                 wallet.unlock_prepare but §13.1 has no wallet_unlock ceremony_kind"
-            )
+            call_machine_command(&client_endpoint, MachineCommand::WalletUnlock { name }).await
         }
         Cmd::Wallet(WalletCmd::UpdatePolicy {
             name,
             file,
             assurance_level,
-        }) => prepare_policy_update(&home, &name, &file, &assurance_level).await,
+        }) => {
+            let metadata = std::fs::metadata(&file)
+                .with_context(|| format!("inspect proposed policy {}", file.display()))?;
+            anyhow::ensure!(
+                metadata.is_file() && metadata.len() <= MAX_POLICY_DOCUMENT_BYTES,
+                "proposed policy must be a regular file no larger than {MAX_POLICY_DOCUMENT_BYTES} bytes"
+            );
+            let policy = std::fs::read(&file)
+                .with_context(|| format!("read proposed policy {}", file.display()))?;
+            call_machine_command(
+                &client_endpoint,
+                MachineCommand::WalletPolicyPrepare {
+                    name,
+                    policy,
+                    assurance_level,
+                },
+            )
+            .await
+        }
         Cmd::Wallet(WalletCmd::CommitPolicy { operation_id }) => {
-            commit_policy_update(&home, operation_id).await
+            call_machine_command(
+                &client_endpoint,
+                MachineCommand::WalletPolicyCommit { operation_id },
+            )
+            .await
         }
         Cmd::Wallet(WalletCmd::RebindPasskey { name }) => {
-            let wallet_id = bloom_broker_api::Token::new(name.clone())
-                .context("wallet ID must be a protocol token")?;
-            launch_custody_ceremony(
-                &home,
-                &name,
-                bloom_machine_client::CustodyPrepareMethod::CredentialReplace,
-                bloom_broker_api::CeremonyKind::CredentialReplace,
-                Some(wallet_id),
-                "credential-prf",
-                None,
+            call_machine_command(
+                &client_endpoint,
+                MachineCommand::WalletCustody {
+                    name,
+                    kind: MachineCustodyKind::Rebind,
+                },
             )
             .await
         }
         Cmd::Wallet(WalletCmd::Delete { name }) => {
-            let wallet_id = bloom_broker_api::Token::new(name.clone())
-                .context("wallet ID must be a protocol token")?;
-            launch_custody_ceremony(
-                &home,
-                &name,
-                bloom_machine_client::CustodyPrepareMethod::WalletDelete,
-                bloom_broker_api::CeremonyKind::WalletDelete,
-                Some(wallet_id),
-                "none",
-                None,
+            call_machine_command(
+                &client_endpoint,
+                MachineCommand::WalletCustody {
+                    name,
+                    kind: MachineCustodyKind::Delete,
+                },
             )
             .await
         }
@@ -2364,53 +2647,27 @@ async fn run(cli: Cli) -> Result<()> {
             };
             let path = format!("/wallets/{wallet}/chains/{chain}/outbox/new.tx");
             let client = IpcClient::new(&client_endpoint.socket);
-            let ipc_res = try_ipc(
+            let projection = try_ipc(
                 &client,
                 &client_endpoint,
-                "write",
-                serde_json::json!({ "path": path, "bytes_b64": B64.encode(body.as_bytes()) }),
+                "write_with_lookup",
+                serde_json::json!({
+                    "path": path,
+                    "bytes_b64": B64.encode(body.as_bytes()),
+                    "projection_path": format!("/wallets/{wallet}/chains/{chain}/outbox/latest"),
+                }),
             )
             .await
             .with_context(|| format!("ipc wallet stage via {}", client_endpoint.display))?;
-            if ipc_res.is_some() {
-                debug!(endpoint = %client_endpoint.display, "cli.wallet.stage.via_ipc");
-                return Ok(());
-            }
-            debug!("cli.wallet.stage.via_inproc: no daemon socket present");
-            let (home_permit, d) = build_write_daemon(home)?;
-            let parsed = bloom_tx::intent_parser::parse(&body).context("parse intent")?;
-            let wallet_id = bloom_broker_api::Token::new(wallet.clone())
-                .context("wallet ID must be a protocol token")?;
-            let projection = d
-                .wallet_projections
-                .get_wallet(&wallet_id)
-                .await
-                .context("load authenticated or cached public wallet projection")?;
-            let address = projection
-                .primary_address()
-                .context("projected wallet has no primary address")?
-                .parse()
-                .context("parse projected wallet address")?;
-            let policy = bloom_vfs::advisory_evm_policy(&projection, &chain)
-                .map_err(anyhow::Error::msg)
-                .context("derive key-free advisory staging policy")?;
-            let client = d
-                .chains
-                .get(&chain)
-                .with_context(|| format!("chain '{}'", chain))?;
-            let staged = d
-                .tx_engine
-                .stage(
-                    &home_permit,
-                    &wallet,
-                    address,
-                    parsed,
-                    &client,
-                    &policy,
-                    Some(&d.address_book),
-                )
-                .await?;
-            println!("{}", staged.id);
+            debug!(endpoint = %client_endpoint.display, "cli.wallet.stage.via_ipc");
+            let target = projection
+                .get("link_target")
+                .and_then(serde_json::Value::as_str)
+                .context("ipc wallet stage: latest projection is missing link_target")?;
+            let id = target
+                .strip_prefix("pending/")
+                .context("ipc wallet stage: invalid latest target")?;
+            println!("{id}");
             Ok(())
         }
         Cmd::Wallet(WalletCmd::Confirm {
@@ -2422,7 +2679,7 @@ async fn run(cli: Cli) -> Result<()> {
             let path = format!("/wallets/{wallet}/chains/{chain}/outbox/pending/{id}/confirm");
             let body = text.into_bytes();
             let client = IpcClient::new(&client_endpoint.socket);
-            let ipc_res = try_ipc(
+            try_ipc(
                 &client,
                 &client_endpoint,
                 "write",
@@ -2433,16 +2690,7 @@ async fn run(cli: Cli) -> Result<()> {
             )
             .await
             .with_context(|| format!("ipc wallet confirm via {}", client_endpoint.display))?;
-            if ipc_res.is_some() {
-                debug!(endpoint = %client_endpoint.display, "cli.wallet.confirm.via_ipc");
-                return Ok(());
-            }
-            debug!("cli.wallet.confirm.via_inproc: no daemon socket present");
-            let (_home_permit, d) = build_write_daemon(home)?;
-            d.vfs
-                .write(&VfsPath::parse(&path)?, &body)
-                .await
-                .context("wallet confirm")?;
+            debug!(endpoint = %client_endpoint.display, "cli.wallet.confirm.via_ipc");
             Ok(())
         }
         Cmd::Wallet(WalletCmd::Cancel {
@@ -2451,18 +2699,16 @@ async fn run(cli: Cli) -> Result<()> {
             id,
             text,
         }) => {
-            wallet_outbox_action_vfs_write(WalletOutboxActionWrite {
-                home,
-                client_endpoint: &client_endpoint,
-                wallet: wallet.clone(),
-                chain,
-                id: id.clone(),
-                action: "cancel",
-                body: text.into_bytes(),
-            })
-            .await?;
-            println!("cancel submitted for {id}");
-            Ok(())
+            call_machine_command(
+                &client_endpoint,
+                MachineCommand::WalletOutboxCancel {
+                    wallet,
+                    chain,
+                    id,
+                    text,
+                },
+            )
+            .await
         }
         Cmd::Wallet(WalletCmd::Replace {
             wallet,
@@ -2478,18 +2724,16 @@ async fn run(cli: Cli) -> Result<()> {
                     buf
                 }
             };
-            wallet_outbox_action_vfs_write(WalletOutboxActionWrite {
-                home,
-                client_endpoint: &client_endpoint,
-                wallet,
-                chain,
-                id: id.clone(),
-                action: "replace",
-                body: body.into_bytes(),
-            })
-            .await?;
-            println!("replacement submitted for {id}");
-            Ok(())
+            call_machine_command(
+                &client_endpoint,
+                MachineCommand::WalletOutboxReplace {
+                    wallet,
+                    chain,
+                    id,
+                    intent: body,
+                },
+            )
+            .await
         }
         Cmd::Wallet(WalletCmd::ConfirmBatch { wallet, txs, text }) => {
             if txs.is_empty() {
@@ -2500,36 +2744,77 @@ async fn run(cli: Cli) -> Result<()> {
             }
             let request = bloom_daemon::ipc::BatchConfirmIpcRequest { wallet, txs, text };
             let client = IpcClient::new(&client_endpoint.socket);
-            let result = match try_ipc(
+            let result = try_ipc(
                 &client,
                 &client_endpoint,
                 "confirm_batch",
                 serde_json::to_value(&request)?,
             )
             .await
-            .with_context(|| format!("ipc wallet confirm-batch via {}", client_endpoint.display))?
-            {
-                Some(result) => {
-                    debug!(endpoint = %client_endpoint.display, "cli.wallet.confirm_batch.via_ipc");
-                    result
-                }
-                None => {
-                    debug!("cli.wallet.confirm_batch.via_inproc: no daemon socket present");
-                    let (_home_permit, daemon) = build_write_daemon(home)?;
-                    daemon
-                        .batch_confirmation_service()
-                        .map_err(anyhow::Error::msg)?
-                        .confirm_batch(request)
-                        .await
-                        .map_err(anyhow::Error::msg)?
-                }
-            };
+            .with_context(|| format!("ipc wallet confirm-batch via {}", client_endpoint.display))?;
+            debug!(endpoint = %client_endpoint.display, "cli.wallet.confirm_batch.via_ipc");
             println!("{}", serde_json::to_string_pretty(&result)?);
             Ok(())
         }
-        Cmd::Ceremony(command) => handle_ceremony(&home, command).await,
-        Cmd::Operation(command) => handle_operation(&home, command).await,
-        Cmd::Serve { endpoint, mount } => {
+        Cmd::Ceremony(command) => {
+            let (action, operation_id) = match command {
+                CeremonyCmd::Status { operation_id } => {
+                    (MachineCeremonyAction::Status, operation_id)
+                }
+                CeremonyCmd::Cancel { operation_id } => {
+                    (MachineCeremonyAction::Cancel, operation_id)
+                }
+                CeremonyCmd::Result { operation_id } => {
+                    (MachineCeremonyAction::Result, operation_id)
+                }
+            };
+            call_machine_command(
+                &client_endpoint,
+                MachineCommand::Ceremony {
+                    action,
+                    operation_id,
+                },
+            )
+            .await
+        }
+        Cmd::Operation(command) => {
+            let (action, operation_id) = match command {
+                OperationCmd::Status { operation_id } => {
+                    (MachineOperationAction::Status, operation_id)
+                }
+                OperationCmd::Cancel { operation_id } => {
+                    (MachineOperationAction::Cancel, operation_id)
+                }
+            };
+            call_machine_command(
+                &client_endpoint,
+                MachineCommand::Operation {
+                    action,
+                    operation_id,
+                },
+            )
+            .await
+        }
+        Cmd::Serve {
+            endpoint,
+            mount,
+            internal,
+        } => {
+            if let Some(internal) = internal {
+                return match internal {
+                    ServeInternal::TriadHealthCheck { expected_build } => {
+                        installed_triad_health_check(&expected_build)
+                            .await
+                            .context("Bloom triad health check failed")
+                    }
+                    ServeInternal::TriadPfMonitorOnce => {
+                        pf_monitor::run_once().context("Bloom packet-filter monitor failed")
+                    }
+                    ServeInternal::SessionSentinel => session_sentinel::run()
+                        .await
+                        .context("Bloom session sentinel failed"),
+                };
+            }
             eprintln!("{ALPHA_DISCLOSURE}");
             let (_home_permit, d) = build_write_daemon(home.clone())?;
             github_source::ensure_preinstalled_petals(&home, &d)
@@ -2566,7 +2851,11 @@ async fn run(cli: Cli) -> Result<()> {
                 }))
                 .with_batch_confirmation(
                     d.batch_confirmation_service().map_err(anyhow::Error::msg)?,
-                );
+                )
+                .with_machine_commands(Arc::new(DaemonMachineCommands {
+                    home: home.clone(),
+                    daemon: d.clone(),
+                }));
             // Start audited and durable background effects only after every
             // fallible serve setup step has succeeded. The handle is shut
             // down and awaited before the runtime can return.
@@ -2604,12 +2893,23 @@ async fn run(cli: Cli) -> Result<()> {
             println!("shutting down");
             Ok(())
         }
-        Cmd::Update(cmd) => handle_update(&home, cmd).await,
+        Cmd::Update(cmd) => {
+            let command = match cmd {
+                UpdateCmd::Status => MachineCommand::UpdateStatus,
+                UpdateCmd::Check => MachineCommand::UpdateCheck,
+            };
+            call_machine_command(&client_endpoint, command).await
+        }
         Cmd::Petals(cmd) => run_petals(&client_endpoint, cmd).await,
 
         Cmd::Completions { shell } => {
-            generate(shell, &mut Cli::command(), "bloom", &mut std::io::stdout());
-            Ok(())
+            call_machine_command(
+                &client_endpoint,
+                MachineCommand::Completions {
+                    shell: shell.to_string(),
+                },
+            )
+            .await
         }
         Cmd::Ipc(IpcCmd::Call { method, params }) => {
             let endpoint = client_endpoint;
@@ -2622,10 +2922,7 @@ async fn run(cli: Cli) -> Result<()> {
                 None => serde_json::Value::Null,
             };
             debug!(%method, endpoint = %endpoint.display, "cli.ipc.call");
-            let result = client
-                .call(&method, v)
-                .await
-                .with_context(|| format!("ipc call to {}", endpoint.display))?;
+            let result = try_ipc(&client, &endpoint, &method, v).await?;
             println!("{}", serde_json::to_string_pretty(&result)?);
             Ok(())
         }
@@ -2750,20 +3047,43 @@ fn absolute_cli_path(path: &str) -> Result<PathBuf> {
     }
 }
 
+fn validate_petal_archive_output(package_dir: &str, out: &str) -> Result<()> {
+    let package_dir = std::fs::canonicalize(package_dir)
+        .with_context(|| format!("resolve Petal package directory {package_dir}"))?;
+    let out_path = Path::new(out);
+    let parent = out_path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let output = std::fs::canonicalize(parent)
+        .with_context(|| format!("resolve Petal archive parent {}", parent.display()))?
+        .join(
+            out_path
+                .file_name()
+                .context("Petal archive path has no file name")?,
+        );
+    anyhow::ensure!(
+        !output.starts_with(package_dir),
+        "--out must be outside the package directory so archives are not packaged into future builds"
+    );
+    Ok(())
+}
+
 async fn run_petals(endpoint: &ResolvedEndpoint, cmd: PetalsCmd) -> Result<()> {
     let client = IpcClient::new(&endpoint.socket);
     match cmd {
         PetalsCmd::Install { path, ref_ } => {
-            let rpc_path = if path.contains("://") || path.starts_with("git@github.com:") {
-                path.clone()
+            let params = if path.contains("://") || path.starts_with("git@github.com:") {
+                serde_json::json!({ "path": path, "ref": ref_ })
             } else {
-                absolute_cli_path(&path)?.to_string_lossy().into_owned()
+                anyhow::ensure!(
+                    ref_.is_none(),
+                    "--ref is only supported for trusted GitHub source installs"
+                );
+                let local = absolute_cli_path(&path)?;
+                serde_json::json!({ "path": local, "ref": null })
             };
-            let result = client
-                .call(
-                    "petals.install",
-                    serde_json::json!({ "path": rpc_path, "ref": ref_ }),
-                )
+            let result = try_ipc(&client, endpoint, "petals.install", params)
                 .await
                 .with_context(|| format!("ipc petals install via {}", endpoint.display))?;
             if result.get("progress_lines").is_some() {
@@ -2799,15 +3119,19 @@ async fn run_petals(endpoint: &ResolvedEndpoint, cmd: PetalsCmd) -> Result<()> {
             Ok(())
         }
         PetalsCmd::Build { package_dir, out } => {
+            if let Some(out) = out.as_deref() {
+                validate_petal_archive_output(&package_dir, out)?;
+            }
             let rpc_package_dir = absolute_cli_path(&package_dir)?;
             let rpc_out = out.as_deref().map(absolute_cli_path).transpose()?;
-            let result = client
-                .call(
-                    "petals.build",
-                    serde_json::json!({ "package_dir": rpc_package_dir, "out": rpc_out }),
-                )
-                .await
-                .with_context(|| format!("ipc petals build via {}", endpoint.display))?;
+            let result = try_ipc(
+                &client,
+                endpoint,
+                "petals.build",
+                serde_json::json!({ "package_dir": rpc_package_dir, "out": rpc_out }),
+            )
+            .await
+            .with_context(|| format!("ipc petals build via {}", endpoint.display))?;
             for field in ["hash", "contract", "wit_digest", "petal_mount", "routes"] {
                 let value = result
                     .get(field)
@@ -2827,8 +3151,7 @@ async fn run_petals(endpoint: &ResolvedEndpoint, cmd: PetalsCmd) -> Result<()> {
             Ok(())
         }
         PetalsCmd::Ls => {
-            let result = client
-                .call("petals.list", serde_json::Value::Null)
+            let result = try_ipc(&client, endpoint, "petals.list", serde_json::Value::Null)
                 .await
                 .with_context(|| format!("ipc petals list via {}", endpoint.display))?;
             let entries = result
@@ -2871,10 +3194,14 @@ async fn run_petals(endpoint: &ResolvedEndpoint, cmd: PetalsCmd) -> Result<()> {
             Ok(())
         }
         PetalsCmd::Uninstall { target } => {
-            let result = client
-                .call("petals.uninstall", serde_json::json!({ "hash": target }))
-                .await
-                .with_context(|| format!("ipc petals uninstall via {}", endpoint.display))?;
+            let result = try_ipc(
+                &client,
+                endpoint,
+                "petals.uninstall",
+                serde_json::json!({ "hash": target }),
+            )
+            .await
+            .with_context(|| format!("ipc petals uninstall via {}", endpoint.display))?;
             let removed = result["removed"]
                 .as_bool()
                 .context("ipc petals uninstall: missing removed")?;
@@ -2998,60 +3325,6 @@ async fn mount_bloom(
     }
 }
 
-struct WalletOutboxActionWrite<'a> {
-    home: HomeDir,
-    client_endpoint: &'a ResolvedEndpoint,
-    wallet: String,
-    chain: String,
-    id: String,
-    action: &'a str,
-    body: Vec<u8>,
-}
-
-async fn wallet_outbox_action_vfs_write(input: WalletOutboxActionWrite<'_>) -> Result<()> {
-    let WalletOutboxActionWrite {
-        home,
-        client_endpoint,
-        wallet,
-        chain,
-        id,
-        action,
-        body,
-    } = input;
-    if !matches!(action, "cancel" | "replace") {
-        bail!("unsupported wallet outbox action '{action}'");
-    }
-    let path = format!("/wallets/{wallet}/chains/{chain}/outbox/pending/{id}/{action}");
-    let client = IpcClient::new(&client_endpoint.socket);
-    let ipc_res = try_ipc(
-        &client,
-        client_endpoint,
-        "write",
-        serde_json::json!({
-            "path": path,
-            "bytes_b64": B64.encode(&body),
-        }),
-    )
-    .await
-    .with_context(|| format!("ipc wallet outbox {action} via {}", client_endpoint.display))?;
-    if ipc_res.is_some() {
-        debug!(endpoint = %client_endpoint.display, action, "cli.wallet.outbox_action.via_ipc");
-        return Ok(());
-    }
-
-    debug!(
-        action,
-        "cli.wallet.outbox_action.via_inproc: no daemon socket present"
-    );
-    let p = VfsPath::parse(&path)?;
-    let (_home_permit, d) = build_write_daemon(home)?;
-    d.vfs
-        .write(&p, &body)
-        .await
-        .with_context(|| format!("wallet outbox {action}"))?;
-    Ok(())
-}
-
 fn request_body_with_wallet(mut request: String, wallet: Option<&str>) -> String {
     let Some(wallet) = wallet else {
         return request;
@@ -3089,14 +3362,13 @@ fn parse_batch_tx_ref(s: &str) -> Result<(String, String)> {
     Ok((chain.to_string(), id.to_string()))
 }
 
-async fn handle_update(home: &HomeDir, cmd: UpdateCmd) -> Result<()> {
+async fn handle_update(home: &HomeDir, cmd: UpdateCmd) -> Result<(String, i32)> {
     match cmd {
         UpdateCmd::Status => {
             let installed = env!("CARGO_PKG_VERSION");
             let snap = bloom_update::read_cache_only(installed, &home.cache_dir());
             let json = serde_json::to_string_pretty(&snap).context("serialise update snapshot")?;
-            println!("{json}");
-            Ok(())
+            Ok((format!("{json}\n"), 0))
         }
         UpdateCmd::Check => {
             // An explicit check needs only a checker; avoid constructing
@@ -3106,16 +3378,12 @@ async fn handle_update(home: &HomeDir, cmd: UpdateCmd) -> Result<()> {
                     .context("build update checker")?;
             let snap = checker.refresh().await;
             let json = serde_json::to_string_pretty(&snap).context("serialise update snapshot")?;
-            println!("{json}");
             let code = match snap.available() {
                 bloom_update::UpdateAvailable::OutOfDate => 1,
                 bloom_update::UpdateAvailable::UpToDate => 0,
                 bloom_update::UpdateAvailable::Unknown => 2,
             };
-            if code != 0 {
-                UPDATE_EXIT_CODE.store(code, std::sync::atomic::Ordering::SeqCst);
-            }
-            Ok(())
+            Ok((format!("{json}\n"), code))
         }
     }
 }
@@ -3150,14 +3418,157 @@ async fn unmount_bloom(handle: Option<()>) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
+    use async_trait::async_trait;
     use clap::Parser as _;
 
     use super::{
         Cli, Cmd, LegacyMigrationReceiptFile, WalletCmd, ceremony_projection_path,
-        enrollment_state_is_usable, execute_audit_command, format_petal_consent_net_rule,
-        is_completed_policy_update_receipt, load_ceremony_projection,
-        open_machine_audit_with_history, persist_ceremony_projection, request_body_with_wallet,
+        endpoint_connection_error, enrollment_state_is_usable, execute_audit_command,
+        execute_wallet_outbox_action, format_petal_consent_net_rule,
+        is_completed_policy_update_receipt, load_ceremony_projection, machine_error_from_anyhow,
+        machine_wallet_lookup_error, open_machine_audit_with_history, persist_ceremony_projection,
+        request_body_with_wallet,
     };
+
+    #[derive(Default)]
+    struct RecordingOutboxHandler(Mutex<Vec<(String, Vec<u8>)>>);
+
+    #[async_trait]
+    impl bloom_vfs::Handler for RecordingOutboxHandler {
+        async fn lookup(
+            &self,
+            path: &bloom_vfs::VfsPath,
+        ) -> Result<bloom_vfs::Entry, bloom_vfs::HandlerError> {
+            Ok(bloom_vfs::Entry::writable_file(
+                path.segments().last().map(String::as_str).unwrap_or(""),
+            ))
+        }
+
+        async fn write(
+            &self,
+            path: &bloom_vfs::VfsPath,
+            data: &[u8],
+        ) -> Result<(), bloom_vfs::HandlerError> {
+            self.0
+                .lock()
+                .unwrap()
+                .push((path.to_string_path(), data.to_vec()));
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn daemon_owned_wallet_outbox_actions_use_the_canonical_vfs_handler() {
+        let handler = std::sync::Arc::new(RecordingOutboxHandler::default());
+        let vfs = bloom_vfs::Vfs::builder()
+            .mount("wallets", handler.clone())
+            .build();
+
+        execute_wallet_outbox_action(&vfs, "alice", "base", "tx-1", "cancel", b"approve")
+            .await
+            .unwrap();
+        execute_wallet_outbox_action(
+            &vfs,
+            "alice",
+            "base",
+            "tx-1",
+            "replace",
+            b"replacement intent",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            *handler.0.lock().unwrap(),
+            vec![
+                (
+                    "/alice/chains/base/outbox/pending/tx-1/cancel".into(),
+                    b"approve".to_vec(),
+                ),
+                (
+                    "/alice/chains/base/outbox/pending/tx-1/replace".into(),
+                    b"replacement intent".to_vec(),
+                ),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn daemon_owned_wallet_outbox_actions_reject_path_shaping_params() {
+        let vfs = bloom_vfs::Vfs::new();
+        for invalid in ["bad/segment", "bad\\segment", "bad\0segment"] {
+            for (wallet, chain, id) in [
+                (invalid, "base", "tx-1"),
+                ("alice", invalid, "tx-1"),
+                ("alice", "base", invalid),
+            ] {
+                let error =
+                    execute_wallet_outbox_action(&vfs, wallet, chain, id, "cancel", b"approve")
+                        .await
+                        .unwrap_err();
+                let error = error
+                    .downcast_ref::<bloom_daemon::ipc::MachineError>()
+                    .unwrap();
+                assert_eq!(
+                    error.kind,
+                    bloom_daemon::ipc::MachineErrorKind::InvalidParams,
+                    "{wallet:?} {chain:?} {id:?}"
+                );
+                assert_eq!(error.code, "INVALID_ARGUMENT");
+            }
+        }
+    }
+
+    #[test]
+    fn machine_error_mapping_uses_concrete_causes_not_context_words() {
+        use bloom_broker_api::ProtocolErrorCode as Code;
+        use bloom_daemon::ipc::MachineErrorKind as Kind;
+
+        let cases = [
+            (Code::MalformedFrame, Kind::InvalidParams),
+            (Code::UnauthenticatedPeer, Kind::PermissionDenied),
+            (Code::OperationIdConflict, Kind::Conflict),
+            (Code::ServiceUnavailable, Kind::Unavailable),
+        ];
+        for (code, expected) in cases {
+            let source = bloom_broker_api::ProtocolError::new(code, "typed cause");
+            let mapped = machine_error_from_anyhow(anyhow::Error::new(source));
+            assert_eq!(mapped.kind, expected, "{code:?}");
+        }
+
+        let missing = machine_wallet_lookup_error(bloom_broker_api::ProtocolError::new(
+            Code::BackendInvalidRequest,
+            "wallet absent",
+        ));
+        assert_eq!(missing.kind, Kind::NotFound);
+
+        let refused = machine_error_from_anyhow(anyhow::Error::new(std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            "Broker socket refused",
+        )));
+        assert_eq!(refused.kind, Kind::Unavailable);
+
+        let misleading = anyhow::Error::new(bloom_broker_api::ProtocolError::new(
+            Code::ServiceUnavailable,
+            "Broker socket refused",
+        ))
+        .context("permission denied and invalid words in outer context");
+        assert_eq!(
+            machine_error_from_anyhow(misleading).kind,
+            Kind::Unavailable
+        );
+
+        let unexpected = machine_error_from_anyhow(anyhow::anyhow!("unexpected failure"));
+        assert_eq!(unexpected.kind, Kind::Internal);
+
+        let invalid_path = machine_error_from_anyhow(anyhow::Error::new(
+            bloom_vfs::path::PathError::InvalidSegment("bad\\segment".into()),
+        ));
+        assert_eq!(invalid_path.kind, Kind::InvalidParams);
+        assert_eq!(invalid_path.code, "INVALID_ARGUMENT");
+    }
 
     #[test]
     fn legacy_migration_receipt_is_digest_bound_and_cli_is_explicit() {
@@ -3208,7 +3619,7 @@ mod tests {
             Cli::try_parse_from(["bloom", "wallet", "migrate-passkey", "receipt.json"]).unwrap();
         assert!(matches!(
             cli.cmd,
-            Cmd::Wallet(WalletCmd::MigratePasskey { receipt })
+            Some(Cmd::Wallet(WalletCmd::MigratePasskey { receipt }))
                 if receipt.as_os_str() == "receipt.json"
         ));
     }
@@ -3260,7 +3671,7 @@ mod tests {
         file.sync_all().unwrap();
 
         let cli = Cli::try_parse_from(["bloom", "audit", "status"]).unwrap();
-        let Cmd::Audit(command) = cli.cmd else {
+        let Some(Cmd::Audit(command)) = cli.cmd else {
             panic!("audit status must parse to the audit command handler");
         };
         let output = execute_audit_command(&command, &audit).unwrap();
@@ -3451,11 +3862,11 @@ mod tests {
         .unwrap();
         assert!(matches!(
             prepared.cmd,
-            Cmd::Wallet(WalletCmd::UpdatePolicy {
+            Some(Cmd::Wallet(WalletCmd::UpdatePolicy {
                 name,
                 file,
                 assurance_level,
-            }) if name == "wallet"
+            })) if name == "wallet"
                 && file.as_os_str() == "proposed.json"
                 && assurance_level == "user_verified"
         ));
@@ -3464,7 +3875,7 @@ mod tests {
             Cli::try_parse_from(["bloom", "wallet", "commit-policy", &"ab".repeat(32)]).unwrap();
         assert!(matches!(
             committed.cmd,
-            Cmd::Wallet(WalletCmd::CommitPolicy { .. })
+            Some(Cmd::Wallet(WalletCmd::CommitPolicy { .. }))
         ));
         assert!(
             Cli::try_parse_from(["bloom", "wallet", "update-policy", "wallet"]).is_err(),
@@ -3502,14 +3913,38 @@ mod tests {
     }
 
     #[test]
-    fn production_cli_has_no_unsigned_daemon_fallback_call_site() {
+    fn production_cli_has_no_in_process_daemon_fallback_call_site() {
         let source = include_str!("main.rs");
-        let forbidden = concat!("Daemon::", "from_home(");
+        let read_fallback = concat!("build_authenticated_", "read_daemon");
+        let in_process_log = concat!("via_", "inproc");
+        let fallback_log = concat!("ipc.no_daemon_", "fallback");
+        let write_builder = concat!("build_write_", "daemon(home.clone())");
         assert!(
-            !source.contains(forbidden),
-            "production CLI fallbacks must retain the authenticated Machine identity"
+            !source.contains(read_fallback),
+            "production CLI commands must never construct a read fallback daemon"
         );
-        assert!(source.contains("build_authenticated_read_daemon(home)"));
-        assert!(source.contains("Daemon::from_home_with_broker(home, broker, catalog)"));
+        assert_eq!(
+            source.matches(write_builder).count(),
+            2,
+            "only init and serve may construct the daemon"
+        );
+        assert!(!source.contains(fallback_log));
+        assert!(!source.contains(in_process_log));
+        let raw_process_args = concat!("std::env::", "args_os()");
+        assert!(
+            !source.contains(raw_process_args),
+            "internal lifecycle protocols must be parsed below init or serve, not before Clap"
+        );
+    }
+
+    #[test]
+    fn permission_denied_endpoint_error_includes_daemon_recovery_instruction() {
+        let error = endpoint_connection_error(
+            "unix:/restricted/bloom.sock",
+            std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied"),
+        );
+        let message = error.to_string();
+        assert!(message.contains("unix:/restricted/bloom.sock"), "{message}");
+        assert!(message.contains("bloom serve"), "{message}");
     }
 }

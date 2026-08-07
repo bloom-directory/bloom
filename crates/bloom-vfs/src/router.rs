@@ -223,6 +223,55 @@ impl Vfs {
         let rest = path.shift();
         h.read_at_block(&rest, block).await
     }
+
+    async fn write_under_mutation_gate(
+        &self,
+        path: &VfsPath,
+        data: &[u8],
+    ) -> Result<(), HandlerError> {
+        let head = path.first().ok_or(HandlerError::PermissionDenied)?;
+        let h = self
+            .handlers
+            .get(head)
+            .ok_or_else(|| HandlerError::NotFound(path.to_string_path()))?;
+        let rest = path.shift();
+        let correlation = self.begin_effect(AUDIT_KIND_WRITE, path, data)?;
+        let write_result = h.write(&rest, data).await;
+        match &write_result {
+            Ok(()) => self.finish_effect(
+                AUDIT_KIND_WRITE,
+                path,
+                correlation.as_deref(),
+                "ok",
+                serde_json::json!({}),
+            )?,
+            Err(error) => self.finish_effect(
+                AUDIT_KIND_WRITE,
+                path,
+                correlation.as_deref(),
+                "error",
+                serde_json::json!({"error": error.to_string()}),
+            )?,
+        }
+        write_result?;
+        if let Some(cache) = &self.cache {
+            cache.invalidate(&path_to_cache_key(path));
+        }
+        Ok(())
+    }
+
+    /// Write and capture its identity projection while excluding every other
+    /// write through this VFS, including mounted and IPC writes.
+    pub async fn write_then_lookup(
+        &self,
+        write_path: &VfsPath,
+        data: &[u8],
+        projection_path: &VfsPath,
+    ) -> Result<Entry, HandlerError> {
+        let _mutation_guard = self.audit_effect_lock.lock().await;
+        self.write_under_mutation_gate(write_path, data).await?;
+        Handler::lookup(self, projection_path).await
+    }
 }
 
 fn root_agent_guidance_entry(path: &VfsPath) -> Option<&'static str> {
@@ -352,40 +401,8 @@ impl Handler for Vfs {
     }
 
     async fn write(&self, path: &VfsPath, data: &[u8]) -> Result<(), HandlerError> {
-        let head = path.first().ok_or(HandlerError::PermissionDenied)?;
-        let h = self
-            .handlers
-            .get(head)
-            .ok_or_else(|| HandlerError::NotFound(path.to_string_path()))?;
-        let rest = path.shift();
-        let _audit_guard = self.audit_effect_lock.lock().await;
-        let correlation = self.begin_effect(AUDIT_KIND_WRITE, path, data)?;
-        let write_result = h.write(&rest, data).await;
-        match &write_result {
-            Ok(()) => self.finish_effect(
-                AUDIT_KIND_WRITE,
-                path,
-                correlation.as_deref(),
-                "ok",
-                serde_json::json!({}),
-            )?,
-            Err(error) => self.finish_effect(
-                AUDIT_KIND_WRITE,
-                path,
-                correlation.as_deref(),
-                "error",
-                serde_json::json!({"error": error.to_string()}),
-            )?,
-        }
-        write_result?;
-
-        // Successful write — invalidate cache, then audit. Cache
-        // invalidation goes first so a concurrent reader can't observe
-        // a stale value with the audit entry already present.
-        if let Some(cache) = &self.cache {
-            cache.invalidate(&path_to_cache_key(path));
-        }
-        Ok(())
+        let _mutation_guard = self.audit_effect_lock.lock().await;
+        self.write_under_mutation_gate(path, data).await
     }
 
     async fn prepare_write_open(&self, path: &VfsPath) -> Result<(), HandlerError> {
@@ -507,6 +524,7 @@ mod tests {
     use crate::handler::Entry;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
+    use tokio::sync::{Mutex, Notify};
 
     struct EchoHandler;
 
@@ -531,6 +549,67 @@ mod tests {
                 Err(HandlerError::NotADir(p.to_string_path()))
             }
         }
+    }
+
+    struct AtomicProjectionHandler {
+        latest: Mutex<String>,
+        lookup_started: Notify,
+        release_lookup: Notify,
+    }
+
+    #[async_trait]
+    impl Handler for AtomicProjectionHandler {
+        async fn lookup(&self, path: &VfsPath) -> Result<Entry, HandlerError> {
+            if path.to_string_path() != "/latest" {
+                return Err(HandlerError::NotFound(path.to_string_path()));
+            }
+            self.lookup_started.notify_one();
+            self.release_lookup.notified().await;
+            let latest = self.latest.lock().await.clone();
+            Ok(Entry::symlink("latest", &latest))
+        }
+
+        async fn write(&self, _path: &VfsPath, data: &[u8]) -> Result<(), HandlerError> {
+            *self.latest.lock().await = String::from_utf8(data.to_vec()).unwrap();
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn write_then_lookup_excludes_direct_vfs_writes_until_identity_is_captured() {
+        let handler = Arc::new(AtomicProjectionHandler {
+            latest: Mutex::new(String::new()),
+            lookup_started: Notify::new(),
+            release_lookup: Notify::new(),
+        });
+        let vfs = Vfs::builder().mount("ids", handler.clone()).build();
+        let atomic_vfs = vfs.clone();
+        let atomic = tokio::spawn(async move {
+            atomic_vfs
+                .write_then_lookup(
+                    &VfsPath::parse("/ids/new").unwrap(),
+                    b"atomic",
+                    &VfsPath::parse("/ids/latest").unwrap(),
+                )
+                .await
+                .unwrap()
+        });
+
+        handler.lookup_started.notified().await;
+        let ordinary_vfs = vfs.clone();
+        let ordinary = tokio::spawn(async move {
+            ordinary_vfs
+                .write(&VfsPath::parse("/ids/new").unwrap(), b"ordinary")
+                .await
+                .unwrap();
+        });
+        tokio::task::yield_now().await;
+        handler.release_lookup.notify_one();
+
+        let identity = atomic.await.unwrap();
+        ordinary.await.unwrap();
+        assert_eq!(identity.link_target.as_deref(), Some("atomic"));
+        assert_eq!(&*handler.latest.lock().await, "ordinary");
     }
 
     #[tokio::test]

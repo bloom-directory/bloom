@@ -22,33 +22,34 @@ const MAX_TEMPLATE_BYTES: u64 = 1024 * 1024;
 const PUBLIC_TEMPLATE_FILES: [&str; 3] =
     ["edge-manifest.json.in", "broker.json.in", "signer.json.in"];
 
-pub fn run_from_process_args() -> Result<()> {
+pub fn run(
+    template_dir: PathBuf,
+    output_dir: PathBuf,
+    login_uid: u32,
+    broker_uid: u32,
+    signer_uid: u32,
+    session_socket_gid: u32,
+    release_digest: String,
+) -> Result<()> {
     if rustix::process::geteuid().as_raw() != 0 {
         bail!("macOS enrollment material generation requires root");
     }
     if std::env::consts::OS != "macos" {
         bail!("macOS enrollment material generation requires Darwin");
     }
-    let args = std::env::args_os().collect::<Vec<_>>();
-    if args.len() != 9 {
-        bail!("invalid macOS enrollment material invocation");
-    }
     generate(&EnrollmentPlan {
-        template_dir: PathBuf::from(&args[2]),
-        output_dir: PathBuf::from(&args[3]),
-        login_uid: decimal_arg(&args[4], "login UID")?,
-        broker_uid: decimal_arg(&args[5], "Broker UID")?,
-        signer_uid: decimal_arg(&args[6], "Signer UID")?,
-        session_socket_gid: decimal_arg(&args[7], "session socket GID")?,
-        release_digest: args[8]
-            .to_str()
-            .ok_or_else(|| anyhow::anyhow!("release digest is not UTF-8"))?
-            .to_owned(),
+        template_dir,
+        output_dir,
+        login_uid,
+        broker_uid,
+        signer_uid,
+        session_socket_gid,
+        release_digest,
     })
 }
 
 #[cfg(feature = "triad-dev-harness")]
-pub fn run_developer_from_process_args() -> Result<()> {
+pub fn run_developer(template_dir: &Path, output_dir: &Path, release_digest: String) -> Result<()> {
     let uid = rustix::process::geteuid().as_raw();
     let gid = rustix::process::getegid().as_raw();
     if uid == 0 {
@@ -57,18 +58,10 @@ pub fn run_developer_from_process_args() -> Result<()> {
     if std::env::consts::OS != "macos" {
         bail!("developer enrollment material generation requires Darwin");
     }
-    let args = std::env::args_os().collect::<Vec<_>>();
-    if args.len() != 5 {
-        bail!("invalid developer enrollment material invocation");
-    }
-    let template_dir = fs::canonicalize(Path::new(&args[2]))
+    let template_dir = fs::canonicalize(template_dir)
         .context("canonicalize developer enrollment template directory")?;
-    let output_dir = fs::canonicalize(Path::new(&args[3]))
+    let output_dir = fs::canonicalize(output_dir)
         .context("canonicalize developer enrollment output directory")?;
-    let release_digest = args[4]
-        .to_str()
-        .context("developer release digest is not UTF-8")?
-        .to_owned();
     let plan = EnrollmentPlan {
         template_dir,
         output_dir,
@@ -156,18 +149,14 @@ fn rewrite_private_json(path: &Path, value: &serde_json::Value) -> Result<()> {
     result
 }
 
-pub fn run_identity_rotation_from_process_args() -> Result<()> {
+pub fn run_identity_rotation(current_identity: &Path, replacement_identity: &Path) -> Result<()> {
     if rustix::process::geteuid().as_raw() != 0 {
         bail!("macOS identity rotation generation requires root");
     }
     if std::env::consts::OS != "macos" {
         bail!("macOS identity rotation generation requires Darwin");
     }
-    let args = std::env::args_os().collect::<Vec<_>>();
-    if args.len() != 4 {
-        bail!("invalid macOS identity rotation invocation");
-    }
-    generate_identity_rotation_for_owner(Path::new(&args[2]), Path::new(&args[3]), 0)
+    generate_identity_rotation_for_owner(current_identity, replacement_identity, 0)
 }
 
 #[derive(Clone, Debug)]
@@ -587,19 +576,6 @@ fn write_new_private(path: &Path, bytes: &[u8]) -> Result<()> {
         .with_context(|| format!("write {}", path.display()))?;
     file.sync_all()
         .with_context(|| format!("sync {}", path.display()))
-}
-
-fn decimal_arg(value: &std::ffi::OsStr, name: &str) -> Result<u32> {
-    let value = value
-        .to_str()
-        .ok_or_else(|| anyhow::anyhow!("{name} is not UTF-8"))?;
-    let parsed = value
-        .parse::<u32>()
-        .with_context(|| format!("{name} is not a decimal 32-bit ID"))?;
-    if parsed == 0 || parsed.to_string() != value {
-        bail!("{name} is not a canonical positive decimal ID");
-    }
-    Ok(parsed)
 }
 
 struct ApplicationIdentity {
