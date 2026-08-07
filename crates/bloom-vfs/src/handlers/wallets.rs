@@ -1480,7 +1480,7 @@ impl WalletsHandler {
 
     fn outbox_dir_entries() -> Vec<Entry> {
         vec![
-            Entry::file("new.tx"),
+            Entry::writable_file("new.tx"),
             Entry::dir("pending"),
             Entry::dir("sent"),
             Entry::dir("failed"),
@@ -3916,6 +3916,17 @@ mod tests {
         .unwrap();
         let r = f.handler.list(&p).await;
         assert!(r.is_err(), "expected NotFound, got {r:?}");
+    }
+
+    #[tokio::test]
+    async fn outbox_listing_advertises_new_tx_as_writable() {
+        let f = make_handler_with_chain(true);
+        let p = VfsPath::parse(&format!("/{}/chains/anvil/outbox", f.wallet_name)).unwrap();
+
+        let entries = f.handler.list(&p).await.unwrap();
+        let new_tx = entries.iter().find(|entry| entry.name == "new.tx").unwrap();
+
+        assert_eq!(new_tx.mode, 0o644);
     }
 
     /// Fix #9: writing an empty body to `pending/<id>/confirm` must
