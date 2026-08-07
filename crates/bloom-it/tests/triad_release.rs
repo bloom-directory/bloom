@@ -325,6 +325,66 @@ fn triad_developer_launcher_keeps_explicit_mounts_fail_closed() {
 }
 
 #[test]
+fn triad_developer_launcher_can_leave_machine_developer_managed() {
+    let launcher_path = workspace().join("scripts/triad-dev-launch.sh");
+    let launcher = fs::read_to_string(&launcher_path).unwrap();
+
+    assert!(launcher.contains("--services-only) services_only=1; shift ;;"));
+    assert!(launcher.contains("if [ \"$services_only\" -eq 1 ]; then"));
+    assert!(launcher.contains("Bloom triad services are ready; Machine is developer-managed."));
+    assert!(launcher.contains("supervise_services"));
+
+    let directory = tempfile::tempdir().unwrap();
+    let rejected = Command::new(launcher_path)
+        .args([
+            "--services-only",
+            "--developer-root",
+            directory.path().join("developer").to_str().unwrap(),
+            "--machine-home",
+            directory.path().join("machine").to_str().unwrap(),
+            "--mount",
+            directory.path().join("mount").to_str().unwrap(),
+            "--machine-socket",
+            directory.path().join("machine.sock").to_str().unwrap(),
+            "--log-dir",
+            directory.path().join("logs").to_str().unwrap(),
+            "--ready-file",
+            directory.path().join("ready").to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(!rejected.status.success());
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr)
+            .contains("--services-only cannot be combined with --mount"),
+        "{}",
+        String::from_utf8_lossy(&rejected.stderr)
+    );
+}
+
+#[test]
+fn triad_developer_launcher_exports_debug_machine_on_path() {
+    let launcher = fs::read_to_string(workspace().join("scripts/triad-dev-launch.sh")).unwrap();
+
+    assert!(launcher.contains("bloom_bin_dir=\"$(cd \"$(dirname \"$bloom_bin\")\" && pwd -P)\""));
+    assert!(launcher.contains("printf 'export PATH=%q:\"$PATH\"\\n' \"$bloom_bin_dir\""));
+}
+
+#[test]
+fn triad_developer_launcher_owns_only_its_service_processes() {
+    let launcher = fs::read_to_string(workspace().join("scripts/triad-dev-launch.sh")).unwrap();
+
+    assert!(launcher.contains("trap cleanup EXIT INT TERM HUP"));
+    assert!(
+        launcher.contains(
+            "for pid in \"$machine_pid\" \"$broker_pid\" \"$signer_pid\" \"$session_pid\""
+        )
+    );
+    assert!(launcher.contains("rm -f -- \"$ready_file\""));
+    assert!(launcher.contains("die \"$label exited while supervising triad services\""));
+}
+
+#[test]
 fn serve_starts_audited_projection_refresh_after_fallible_setup() {
     let source = fs::read_to_string(workspace().join("crates/bloom/src/main.rs")).unwrap();
     let serve = source

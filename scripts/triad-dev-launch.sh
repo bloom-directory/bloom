@@ -10,6 +10,7 @@ mount_dir=""
 machine_socket=""
 log_dir=""
 ready_file=""
+services_only=0
 install_authority_fixture="${BLOOM_TRIAD_DEV_AUTHORITY_FIXTURE:-0}"
 
 die() { printf 'triad developer launcher: %s\n' "$*" >&2; exit 1; }
@@ -22,6 +23,7 @@ while [ "$#" -gt 0 ]; do
     --machine-socket) need_value "$@"; machine_socket="$2"; shift 2 ;;
     --log-dir) need_value "$@"; log_dir="$2"; shift 2 ;;
     --ready-file) need_value "$@"; ready_file="$2"; shift 2 ;;
+    --services-only) services_only=1; shift ;;
     *) die "unknown argument: $1" ;;
   esac
 done
@@ -30,6 +32,9 @@ for value in "${required_paths[@]}"; do
   [ -n "$value" ] ||
     die "developer root, Machine home/socket, log dir, and ready file are required"
 done
+if [ "$services_only" -eq 1 ] && [ -n "$mount_dir" ]; then
+  die "--services-only cannot be combined with --mount"
+fi
 case "$install_authority_fixture" in
   0|1) ;;
   *) die "BLOOM_TRIAD_DEV_AUTHORITY_FIXTURE must be 0 or 1" ;;
@@ -60,6 +65,9 @@ ready_file="$(cd "$(dirname "$ready_file")" && pwd -P)/$(basename "$ready_file")
 if [ -e "$machine_socket" ] || [ -L "$machine_socket" ]; then
   die "machine socket path already exists: $machine_socket"
 fi
+if [ -e "$ready_file" ] || [ -L "$ready_file" ]; then
+  die "ready file path already exists: $ready_file"
+fi
 
 bloom_bin="${BLOOM_INTEGRATION_MACHINE_BIN:-${repo_root}/target/debug/bloom}"
 broker_bin="${BLOOM_INTEGRATION_BROKER_BIN:-${broker_repo}/target/debug/bloom-broker}"
@@ -77,6 +85,8 @@ fi
 for binary in "$bloom_bin" "$broker_bin" "$signer_bin"; do
   [ -x "$binary" ] || die "required binary is not executable: $binary"
 done
+bloom_bin_dir="$(cd "$(dirname "$bloom_bin")" && pwd -P)"
+bloom_bin="${bloom_bin_dir}/$(basename "$bloom_bin")"
 
 release_digest="$(
   shasum -a 256 "$bloom_bin" "$broker_bin" "$signer_bin" |
@@ -198,6 +208,7 @@ env_file="${log_dir}/triad.env"
   printf 'export BLOOM_TRIAD_DEVELOPER_RUNTIME=%q\n' "$runtime_dir"
   printf 'export BLOOM_HOME=%q\n' "$machine_home"
   printf 'export BLOOM_BIN=%q\n' "$bloom_bin"
+  printf 'export PATH=%q:"$PATH"\n' "$bloom_bin_dir"
   printf 'export BLOOM_RPC_ENDPOINT=%q\n' "unix:${machine_socket}"
   printf 'export BLOOM_BROKER_SOCKET=%q\n' "$broker_socket"
   printf 'export BLOOM_BROKER_AUDIT_CHECKPOINT_DIR=%q\n' "$broker_checkpoint_dir"
@@ -212,7 +223,8 @@ chmod 0600 "$env_file"
 session_pid=""; signer_pid=""; broker_pid=""; machine_pid=""
 cleanup() {
   status=$?
-  trap - EXIT INT TERM
+  trap - EXIT INT TERM HUP
+  rm -f -- "$ready_file"
   for pid in "$machine_pid" "$broker_pid" "$signer_pid" "$session_pid"; do
     if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then kill "$pid" 2>/dev/null || true; fi
   done
@@ -225,7 +237,7 @@ cleanup() {
   esac
   exit "$status"
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT INT TERM HUP
 
 wait_for_socket() {
   path="$1"; pid="$2"; label="$3"
@@ -266,6 +278,23 @@ wait_for_machine_ipc() {
     attempts=$((attempts + 1))
     [ "$attempts" -lt 300 ] || die "Machine socket did not pass its IPC readiness probe"
     sleep 0.1
+  done
+}
+
+supervise_services() {
+  while :; do
+    for label in session signer broker; do
+      case "$label" in
+        session) pid="$session_pid" ;;
+        signer) pid="$signer_pid" ;;
+        broker) pid="$broker_pid" ;;
+      esac
+      if ! kill -0 "$pid" 2>/dev/null; then
+        tail -n 80 "${log_dir}/${label}.log" >&2 || true
+        die "$label exited while supervising triad services"
+      fi
+    done
+    sleep 0.25
   done
 }
 
@@ -375,6 +404,17 @@ awk '
 ' "$machine_config" > "$machine_config_new"
 chmod 0600 "$machine_config_new"
 mv -f "$machine_config_new" "$machine_config"
+
+if [ "$services_only" -eq 1 ]; then
+  printf 'ready\n' > "$ready_file"
+  printf '%s\n' \
+    'Bloom triad services are ready; Machine is developer-managed.' \
+    "  source ${env_file}" \
+    "  cd ${repo_root}" \
+    '  cargo build -p bloom --no-default-features --features mount,triad-dev-harness' \
+    '  bloom serve --endpoint "$BLOOM_RPC_ENDPOINT"'
+  supervise_services
+fi
 
 mount_is_live() {
   mount | grep -F " on ${mount_dir} " >/dev/null 2>&1 && command ls "$mount_dir" >/dev/null 2>&1
