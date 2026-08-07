@@ -6,7 +6,7 @@
 //!
 //! Paths handled:
 //! - `wallets/`                                                     — list wallets
-//! - `wallets/new`                                                  — write non-secret metadata to prepare registration
+//! - `wallets/new`                                                  — write a wallet name to prepare registration
 //! - `wallets/registrations/<operation>/{status.json,result.json}`  — public registration projection
 //! - `wallets/registrations/<operation>/cancel`                     — write `cancel` before acceptance
 //! - `wallets/<wallet>/address`                                     — checksummed owner/signer address
@@ -80,13 +80,6 @@ struct ApprovalCeremonyProjection {
     operation_id: bloom_broker_api::OperationId,
     source_approval_id: Option<bloom_broker_api::Digest32>,
     response: bloom_broker_api::SealedApprovalPrepareResponse,
-}
-
-#[derive(Clone, Debug, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct WalletRegistrationRequest {
-    schema: String,
-    requested_name: String,
 }
 
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
@@ -384,27 +377,19 @@ impl WalletsHandler {
     async fn prepare_wallet_registration(&self, data: &[u8]) -> Result<(), HandlerError> {
         use sha2::Digest as _;
 
-        const REQUEST_SCHEMA: &str = "bloom.wallet-registration-request.1";
         const PROJECTION_SCHEMA: &str = "bloom.machine-wallet-registration-projection.1";
         const MAX_REQUEST_BYTES: usize = 4096;
         if data.len() > MAX_REQUEST_BYTES {
-            return Err(HandlerError::invalid(
-                "wallet registration metadata is too large",
-            ));
+            return Err(HandlerError::invalid("wallet name is too large"));
         }
-        let request: WalletRegistrationRequest = serde_json::from_slice(data).map_err(|error| {
-            HandlerError::invalid(format!(
-                "wallet registration requires JSON metadata: {error}"
-            ))
-        })?;
-        if request.schema != REQUEST_SCHEMA {
-            return Err(HandlerError::invalid(format!(
-                "wallet registration schema must be {REQUEST_SCHEMA}"
-            )));
-        }
-        if request.requested_name.is_empty()
-            || request.requested_name.len() > 64
-            || !request.requested_name.chars().all(|character| {
+        let requested_name = std::str::from_utf8(data)
+            .map_err(|error| {
+                HandlerError::invalid(format!("wallet name must be valid UTF-8: {error}"))
+            })?
+            .trim();
+        if requested_name.is_empty()
+            || requested_name.len() > 64
+            || !requested_name.chars().all(|character| {
                 character.is_ascii_alphanumeric() || matches!(character, '-' | '_')
             })
         {
@@ -412,7 +397,7 @@ impl WalletsHandler {
                 "wallet name must be 1-64 ASCII alphanumeric, '-' or '_' characters",
             ));
         }
-        let wallet_id = bloom_broker_api::Token::new(request.requested_name.clone())
+        let wallet_id = bloom_broker_api::Token::new(requested_name.to_owned())
             .map_err(|error| HandlerError::invalid(error.to_string()))?;
 
         let mut operation_bytes = [0_u8; 32];
@@ -455,7 +440,7 @@ impl WalletsHandler {
         }
         let projection = WalletRegistrationProjection {
             schema: PROJECTION_SCHEMA.into(),
-            requested_name: request.requested_name,
+            requested_name: requested_name.to_owned(),
             operation_id,
             ceremony_kind: prepared.ceremony_kind,
             ceremony_state: bloom_broker_api::CeremonyState::AwaitingUser,
@@ -1980,7 +1965,7 @@ impl WalletsHandler {
             return Err(HandlerError::NotAFile(path.to_string_path()));
         }
         if segs.len() == 1 && segs[0] == "new" {
-            return Ok(b"{\"schema\":\"bloom.wallet-registration-request.1\",\"requested_name\":\"main\"}\n".to_vec());
+            return Ok(b"Write a wallet name matching [A-Za-z0-9_-]{1,64}.\n".to_vec());
         }
         if segs[0] == "registrations" {
             return match segs {
@@ -3372,9 +3357,12 @@ mod tests {
     async fn direct_machine_wallet_creation_is_removed_for_every_legacy_body() {
         let f = make_handler();
         let path = VfsPath::parse("/new").unwrap();
+        assert!(matches!(
+            f.handler.write(&path, b"alice").await,
+            Err(HandlerError::Backend(_))
+        ));
         for body in [
-            &b"alice"[..],
-            b"name = \"bob\"\nkind = \"local\"\npassphrase = \"secret\"\n",
+            &b"name = \"bob\"\nkind = \"local\"\npassphrase = \"secret\"\n"[..],
             b"name = \"observer\"\nkind = \"watch\"\naddress = \"0x0000000000000000000000000000000000000001\"\n",
             b"name = \"imported\"\nkind = \"import\"\nprivate_key = \"secret\"\n",
         ] {
@@ -3399,7 +3387,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mounted_registration_is_non_secret_broker_custody_adapter() {
+    async fn mounted_registration_accepts_a_trimmed_plain_name() {
         let mut fixture = make_handler();
         let broker = Arc::new(RegistrationBroker {
             requests: Mutex::new(Vec::new()),
@@ -3411,26 +3399,12 @@ mod tests {
             .with_broker(Some(MachineBrokerClient::new(broker.clone())));
 
         let new = VfsPath::parse("/new").unwrap();
-        let secret_attempt = br#"{"schema":"bloom.wallet-registration-request.1","requested_name":"main","private_key":"nope"}"#;
-        assert!(matches!(
-            fixture.handler.write(&new, secret_attempt).await,
-            Err(HandlerError::Invalid(_))
-        ));
-        assert!(matches!(
-            fixture.handler.write(
-                &new,
-                br#"{"schema":"bloom.wallet-registration-request.1","requested_name":"main/sub"}"#,
-            ).await,
-            Err(HandlerError::Invalid(_))
-        ));
-        fixture
-            .handler
-            .write(
-                &new,
-                br#"{"schema":"bloom.wallet-registration-request.1","requested_name":"main"}"#,
-            )
-            .await
-            .unwrap();
+        fixture.handler.write(&new, b" \nmain\t\n").await.unwrap();
+
+        assert_eq!(
+            fixture.handler.read(&new).await.unwrap(),
+            b"Write a wallet name matching [A-Za-z0-9_-]{1,64}.\n"
+        );
 
         let registrations = fixture
             .handler
@@ -3448,16 +3422,19 @@ mod tests {
             status["ceremony_url"],
             "http://localhost:18734/ceremony/registration-secret"
         );
-        let requests = broker.requests.lock().unwrap();
-        let registration = requests.iter().find_map(|request| match request {
-            MachineBrokerRequest::WalletRegistrationPrepare(request) => Some(request),
-            _ => None,
-        });
-        assert_eq!(
-            registration.and_then(|request| request.wallet_id.as_ref()),
-            Some(&token("main"))
-        );
-        drop(requests);
+        let registration_wallet_id =
+            broker
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .find_map(|request| match request {
+                    MachineBrokerRequest::WalletRegistrationPrepare(request) => {
+                        request.wallet_id.clone()
+                    }
+                    _ => None,
+                });
+        assert_eq!(registration_wallet_id.as_ref(), Some(&token("main")));
 
         *broker.omit_ceremony_url.lock().unwrap() = true;
         assert!(matches!(
@@ -3510,6 +3487,67 @@ mod tests {
                     MachineBrokerRequest::WalletRegistrationPrepare(_)
                 ))
         );
+    }
+
+    #[tokio::test]
+    async fn mounted_registration_rejects_invalid_names_without_calling_broker() {
+        let mut fixture = make_handler();
+        let broker = Arc::new(RegistrationBroker {
+            requests: Mutex::new(Vec::new()),
+            state: Mutex::new(CeremonyState::AwaitingUser),
+            omit_ceremony_url: Mutex::new(false),
+        });
+        fixture.handler = fixture
+            .handler
+            .with_broker(Some(MachineBrokerClient::new(broker.clone())));
+        let new = VfsPath::parse("/new").unwrap();
+
+        for body in [
+            &b" \n\t"[..],
+            b"main/sub",
+            br#"{"schema":"bloom.wallet-registration-request.1","requested_name":"main"}"#,
+            &[0xff],
+            &[b'a'; 65],
+        ] {
+            assert!(
+                matches!(
+                    fixture.handler.write(&new, body).await,
+                    Err(HandlerError::Invalid(_))
+                ),
+                "unexpected registration result for {body:?}"
+            );
+            assert!(
+                broker.requests.lock().unwrap().is_empty(),
+                "invalid registration reached Broker for {body:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn mounted_registration_accepts_a_64_character_name() {
+        let mut fixture = make_handler();
+        let broker = Arc::new(RegistrationBroker {
+            requests: Mutex::new(Vec::new()),
+            state: Mutex::new(CeremonyState::AwaitingUser),
+            omit_ceremony_url: Mutex::new(false),
+        });
+        fixture.handler = fixture
+            .handler
+            .with_broker(Some(MachineBrokerClient::new(broker.clone())));
+        let name = "a".repeat(64);
+
+        fixture
+            .handler
+            .write(&VfsPath::parse("/new").unwrap(), name.as_bytes())
+            .await
+            .unwrap();
+
+        let requests = broker.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        let MachineBrokerRequest::WalletRegistrationPrepare(request) = &requests[0] else {
+            panic!("expected wallet registration prepare request")
+        };
+        assert_eq!(request.wallet_id.as_ref(), Some(&token(&name)));
     }
 
     #[tokio::test]

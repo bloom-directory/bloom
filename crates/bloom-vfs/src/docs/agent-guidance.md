@@ -49,12 +49,20 @@ does not create a local wallet**, and the write returns before the ceremony
 completes:
 
 ```sh
+BEFORE_REGISTRATIONS="$(mktemp)"
+ls wallets/registrations > "$BEFORE_REGISTRATIONS"
 printf 'main\n' > wallets/new
-cat wallets/registrations/main/status.json
-cat wallets/registrations/main/ceremony_url
+AFTER_REGISTRATIONS="$(mktemp)"
+ls wallets/registrations > "$AFTER_REGISTRATIONS"
+comm -13 "$BEFORE_REGISTRATIONS" "$AFTER_REGISTRATIONS"
+REGISTRATION_ID='<candidate-operation-id>'
+cat wallets/registrations/"$REGISTRATION_ID"/status.json
 ```
 
-- Read `status.json` and `ceremony_url` right after the write.
+- Compare the before and after listings. For every new candidate, verify its
+  `requested_name` before opening or polling its `ceremony_url`, or cancelling
+  it. Concurrent registrations for the same requested name remain ambiguous
+  through this write-only sink, so serialize same-name writes.
 - Open or forward `ceremony_url` to a human; do not attempt it yourself. Never
   imitate WebAuthn, supply PRF material, read recovery material, or silently
   downgrade to a Machine-local credential flow — none of that is available or safe from
@@ -64,13 +72,13 @@ cat wallets/registrations/main/ceremony_url
   (iCloud Keychain, Google Password Manager), or a compatible hardware
   security key — and specifically to choose **"Use browser, device, or
   hardware key"** if Bitwarden intercepts the prompt.
-- Do not proceed until `status.json`'s `state` is `completed`; only then read
+- Do not proceed until `status.json`'s `ceremony_state` is `COMPLETED`; only then read
   the new wallet's address at `wallets/<name>/address`.
 - Registration requires Machine's authenticated Broker edge. If Broker or
   Signer is unavailable, the write fails closed; do not fall back to a
   Machine-owned wallet-creation path.
-- To cancel a live registration, write anything to
-  `wallets/registrations/<name>/cancel`.
+- To cancel a live registration, write `cancel` to
+  `wallets/registrations/<operation-id>/cancel`.
 
 Import, recovery, rebind, and deletion are also Broker custody operations.
 Sensitive inputs belong only in the Broker-hosted owner ceremony, never in a

@@ -49,13 +49,22 @@ Registration is a Broker custody operation completed by Signer. The write
 projects a browser ceremony; it does not create custody inside Machine.
 
 ```sh
+BEFORE_REGISTRATIONS="$(mktemp)"
+ls wallets/registrations > "$BEFORE_REGISTRATIONS"
 printf 'alice\n' > wallets/new
-cat wallets/registrations/alice/status.json
-cat wallets/registrations/alice/ceremony_url
+AFTER_REGISTRATIONS="$(mktemp)"
+ls wallets/registrations > "$AFTER_REGISTRATIONS"
+comm -13 "$BEFORE_REGISTRATIONS" "$AFTER_REGISTRATIONS"
+REGISTRATION_ID='<candidate-operation-id>'
+cat wallets/registrations/"$REGISTRATION_ID"/status.json
 ```
 
-Complete the passkey ceremony, wait for completed status, then inspect the
-public wallet projection:
+Compare the before and after listings. Verify that each candidate's
+`requested_name` is `alice` before opening its `ceremony_url`, polling it, or
+cancelling it. Concurrent registrations for the same requested name remain
+ambiguous through this write-only sink, so serialize same-name writes. Complete
+the passkey ceremony and wait for `ceremony_state` to become `COMPLETED`, then
+inspect the public wallet projection:
 
 ```sh
 cat wallets/alice/address

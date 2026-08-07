@@ -276,9 +276,16 @@ mod tests {
                 .await
                 .unwrap();
             let s = String::from_utf8(bytes).unwrap();
+            let normalized = s.to_ascii_lowercase();
             assert!(
                 s.contains("wallets/registrations/") && s.contains("status.json"),
-                "{name} must document wallets/registrations/<name>/status.json"
+                "{name} must document operation-ID registration status"
+            );
+            assert!(
+                normalized.contains("requested_name")
+                    && normalized.contains("before")
+                    && normalized.contains("concurrent"),
+                "{name} must document safe registration correlation and its concurrency limit"
             );
             assert!(
                 !(s.contains("plain name") && s.contains("creates a local wallet")),

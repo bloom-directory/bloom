@@ -34,15 +34,24 @@ Wallet paths are authenticated public projections, not key storage.
 ## Register a wallet
 
 ```sh
+BEFORE_REGISTRATIONS="$(mktemp)"
+ls /bloom/wallets/registrations > "$BEFORE_REGISTRATIONS"
 printf 'alice\n' > /bloom/wallets/new
-cat /bloom/wallets/registrations/alice/status.json
-cat /bloom/wallets/registrations/alice/ceremony_url
+AFTER_REGISTRATIONS="$(mktemp)"
+ls /bloom/wallets/registrations > "$AFTER_REGISTRATIONS"
+comm -13 "$BEFORE_REGISTRATIONS" "$AFTER_REGISTRATIONS"
+REGISTRATION_ID='<candidate-operation-id>'
+cat /bloom/wallets/registrations/"$REGISTRATION_ID"/status.json
 ```
 
-Broker originates the custody ceremony and Signer creates the key after owner
+Compare the before and after listings. Verify that each candidate's
+`requested_name` is `alice` before opening its `ceremony_url`, polling it, or
+cancelling it. Concurrent registrations for the same requested name remain
+ambiguous through this write-only sink, so serialize same-name writes. Broker
+originates the custody ceremony and Signer creates the key after owner
 authentication. Machine exposes only the resulting public projection. Import,
-recovery, rebind, credential changes, and deletion use the same custody
-boundary and never accept secret material through the mount.
+recovery, rebind, credential changes, and deletion use the same custody boundary
+and never accept secret material through the mount.
 
 ## Stage, review, and confirm
 

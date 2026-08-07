@@ -16,15 +16,24 @@ Writing a plain name to `new` starts an asynchronous Broker custody ceremony;
 it never creates or imports key material in Machine.
 
 ```sh
+BEFORE_REGISTRATIONS="$(mktemp)"
+ls /bloom/wallets/registrations > "$BEFORE_REGISTRATIONS"
 printf 'alice\n' > /bloom/wallets/new
-cat /bloom/wallets/registrations/alice/status.json
-cat /bloom/wallets/registrations/alice/ceremony_url
+AFTER_REGISTRATIONS="$(mktemp)"
+ls /bloom/wallets/registrations > "$AFTER_REGISTRATIONS"
+comm -13 "$BEFORE_REGISTRATIONS" "$AFTER_REGISTRATIONS"
+REGISTRATION_ID='<candidate-operation-id>'
+cat /bloom/wallets/registrations/"$REGISTRATION_ID"/status.json
 ```
 
-Wallet names must match `[A-Za-z0-9_-]{1,64}`. Complete the projected browser
-ceremony and wait for `status.json` to report `completed` before reading the
-wallet. Import, recovery, rebind, and deletion are likewise Broker custody
-operations; sensitive inputs belong only in the Broker-hosted ceremony.
+Wallet names must match `[A-Za-z0-9_-]{1,64}`. Compare the before and after
+listings and verify each candidate's `requested_name` before opening its
+`ceremony_url`, polling it, or cancelling it. Concurrent registrations for the
+same requested name remain ambiguous through this write-only sink, so serialize
+same-name writes. Complete the projected browser ceremony and wait for
+`ceremony_state` to report `COMPLETED` before reading the wallet. Import,
+recovery, rebind, and deletion are likewise Broker custody operations; sensitive
+inputs belong only in the Broker-hosted ceremony.
 
 ### Per-wallet leaves
 
