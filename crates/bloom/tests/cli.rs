@@ -355,6 +355,104 @@ fn spawn_batch_ipc_server(
     (server, server_thread)
 }
 
+fn spawn_petals_ipc_server(
+    home: &Path,
+) -> (bloom_daemon::ipc::IpcServer, std::thread::JoinHandle<()>) {
+    use bloom_daemon::ipc::{IpcServer, default_socket_path};
+
+    let socket = default_socket_path(home);
+    std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+    let store = bloom_petals::PetalStore::open(home.join("petals/store")).unwrap();
+    let registry =
+        Arc::new(bloom_petals::NameRegistry::open(home.join("petals/registry")).unwrap());
+    let runner =
+        bloom_petals::PetalRunner::new(store, registry, bloom_petals::PetalVm::new().unwrap());
+    let server = IpcServer::new(
+        bloom_vfs::Vfs::builder().build(),
+        "ipc-test-version",
+        vec![],
+    )
+    .with_petals(runner)
+    .with_petal_source_installer(Arc::new(TestPetalSourceInstaller));
+    let server_for_thread = server.clone();
+    let socket_for_thread = socket.clone();
+    let server_thread = std::thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async move {
+                server_for_thread.serve(&socket_for_thread).await.unwrap();
+            });
+    });
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !socket.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "Petal IPC server never created socket at {}",
+            socket.display()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    (server, server_thread)
+}
+
+struct TestPetalSourceInstaller;
+
+impl bloom_daemon::ipc::PetalSourceInstallService for TestPetalSourceInstaller {
+    fn install_source(&self, params: serde_json::Value) -> Result<serde_json::Value, String> {
+        let path = params["path"].as_str().unwrap_or_default();
+        if path.contains("github.com/not-bloom/") {
+            return Err("unsupported GitHub owner".to_owned());
+        }
+        if path.contains("/raw/") || path.ends_with(".wasm") {
+            return Err("raw remote .wasm installs are not supported".to_owned());
+        }
+        if path == "https://github.com/bloom-directory/demo" {
+            return Ok(serde_json::json!({
+            "hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "mode": "petal",
+            "size": 42,
+            "already_present": false,
+            "petal_mount": "petals/demo/",
+            "routes": 1,
+            "source": "bloom-directory/demo@v1.0.0",
+            "resolved_commit": "0123456789abcdef",
+                "progress_lines": [
+                    "Resolving https://github.com/bloom-directory/demo",
+                    "Selected tag: v1.0.0",
+                    "Resolved commit: 0123456789abcdef",
+                    "Building source package..."
+                ],
+                "build_stdout": "{\"routes\": 95}\n",
+                "build_stderr": "build warning\n",
+                "completion_progress_lines": ["Validating Petal package..."],
+                "consent_lines": ["consent:", "  docs: README.md"]
+            }));
+        }
+        if path == "https://github.com/bloom-directory/failing-demo" {
+            let output = std::process::Command::new("sh")
+                .args([
+                    "-c",
+                    "echo 'partial build output'; echo 'build exploded' >&2; exit 42",
+                ])
+                .output()
+                .map_err(|error| error.to_string())?;
+            return Ok(serde_json::json!({
+                "progress_lines": [
+                    "Resolving https://github.com/bloom-directory/failing-demo",
+                    "Resolved commit: deadbeef",
+                    "Building source package..."
+                ],
+                "build_stdout": String::from_utf8_lossy(&output.stdout),
+                "build_stderr": String::from_utf8_lossy(&output.stderr),
+                "operation_error": format!("build command failed: scripts/build.sh (status {})", output.status),
+            }));
+        }
+        Err("network source installs are disabled in CLI tests".to_owned())
+    }
+}
+
 fn stop_ipc_server(
     server: bloom_daemon::ipc::IpcServer,
     server_thread: std::thread::JoinHandle<()>,
@@ -368,6 +466,55 @@ fn stop_ipc_server(
         std::thread::sleep(Duration::from_millis(20));
     }
     server_thread.join().expect("ipc server thread panicked");
+}
+
+fn spawn_bloom_serve(home: &Path) -> std::process::Child {
+    let binary = Command::cargo_bin("bloom")
+        .expect("locate bloom binary")
+        .get_program()
+        .to_owned();
+    let mut child = std::process::Command::new(binary)
+        .env("BLOOM_HOME", home)
+        .env("RUST_LOG", "error")
+        .arg("serve")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn bloom serve");
+    let socket = bloom_daemon::ipc::default_socket_path(home);
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !socket.exists() {
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "bloom serve exited before binding {}",
+            socket.display()
+        );
+        assert!(
+            std::time::Instant::now() < deadline,
+            "bloom serve did not bind {}",
+            socket.display()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    child
+}
+
+fn stop_bloom_serve(home: &Path, mut child: std::process::Child) {
+    bloom_cmd(home)
+        .args(["ipc", "call", "shutdown"])
+        .assert()
+        .success();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if child.try_wait().unwrap().is_some() {
+            return;
+        }
+        if std::time::Instant::now() >= deadline {
+            child.kill().expect("kill stuck bloom serve");
+            panic!("bloom serve did not stop after shutdown RPC");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 fn http_fixture(
@@ -437,11 +584,13 @@ fn init_respects_persistent_preinstalled_petal_opt_out_without_network() {
         .success()
         .stdout(predicate::str::contains("preinstalled_petals: []"));
 
+    let (server, server_thread) = spawn_petals_ipc_server(home.path());
     bloom_cmd(home.path())
         .args(["petals", "ls"])
         .assert()
         .success()
         .stdout(predicate::str::contains("(no petals installed)"));
+    stop_ipc_server(server, server_thread);
 }
 
 #[test]
@@ -546,10 +695,12 @@ fn docs_petals_discovers_installed_package_from_manifest() {
     let home = fresh_home();
     let package = home.path().join("demo-petal");
     write_demo_petal_package(&package);
+    let (server, server_thread) = spawn_petals_ipc_server(home.path());
     bloom_cmd(home.path())
         .args(["petals", "install", package.to_str().unwrap()])
         .assert()
         .success();
+    stop_ipc_server(server, server_thread);
 
     bloom_cmd(home.path())
         .args(["vfs", "cat", "/docs/petals.md"])
@@ -560,6 +711,171 @@ fn docs_petals_discovers_installed_package_from_manifest() {
         .stdout(predicate::str::contains("Demo app used by CLI tests."))
         .stdout(predicate::str::contains("Declared capabilities: none"))
         .stdout(predicate::str::contains("`petals/demo/README.md`"));
+}
+
+#[test]
+fn petals_commands_route_through_ipc_while_home_write_lock_is_live() {
+    let home = fresh_home();
+    let package = home.path().join("demo-petal");
+    let archive = home.path().join("demo.petal.tar");
+    write_demo_petal_package(&package);
+    let _permit = bloom_proto::HomeWritePermit::acquire(&bloom_proto::HomeDir::at(home.path()))
+        .expect("hold home write permit as the running daemon would");
+    let (server, server_thread) = spawn_petals_ipc_server(home.path());
+
+    bloom_cmd(home.path())
+        .args(["petals", "install", package.to_str().unwrap()])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("already open for writing").not())
+        .stdout(predicate::str::contains("petal_mount: petals/demo/"));
+
+    bloom_cmd(home.path())
+        .args(["petals", "ls"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("already open for writing").not())
+        .stdout(predicate::str::contains("app=petals/demo/"));
+
+    bloom_cmd(home.path())
+        .args([
+            "petals",
+            "build",
+            package.to_str().unwrap(),
+            "--out",
+            archive.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("already open for writing").not())
+        .stdout(predicate::str::contains("archive:"));
+    assert!(
+        archive.is_file(),
+        "daemon should write the requested archive"
+    );
+
+    bloom_cmd(home.path())
+        .args(["petals", "uninstall", "demo"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("already open for writing").not())
+        .stdout(predicate::str::contains("removed demo"));
+
+    stop_ipc_server(server, server_thread);
+}
+
+#[test]
+fn petals_commands_fail_against_an_explicit_missing_endpoint() {
+    let home = fresh_home();
+    let package = home.path().join("demo-petal");
+    write_demo_petal_package(&package);
+    let socket = home.path().join("run/missing-petals.sock");
+    let endpoint = format!("unix:{}", socket.display());
+
+    for args in [
+        vec!["petals", "ls"],
+        vec!["petals", "install", package.to_str().unwrap()],
+        vec!["petals", "build", package.to_str().unwrap()],
+        vec!["petals", "uninstall", "demo"],
+    ] {
+        bloom_cmd(home.path())
+            .args(["--connect", &endpoint])
+            .args(args)
+            .assert()
+            .failure()
+            .stderr(
+                predicate::str::contains("ipc")
+                    .and(predicate::str::contains(socket.display().to_string())),
+            );
+    }
+}
+
+#[test]
+fn petals_relative_package_paths_are_resolved_from_the_cli_working_directory() {
+    let home = fresh_home();
+    let work = tempfile::tempdir().expect("create caller workdir");
+    let package = work.path().join("demo-package");
+    let archive = work.path().join("demo.petal.tar");
+    write_demo_petal_package(&package);
+    let (server, server_thread) = spawn_petals_ipc_server(home.path());
+
+    bloom_cmd(home.path())
+        .current_dir(work.path())
+        .args(["petals", "build", "demo-package", "--out", "demo.petal.tar"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("archive: demo.petal.tar"));
+    assert!(
+        archive.is_file(),
+        "relative --out must be written under the CLI working directory"
+    );
+
+    bloom_cmd(home.path())
+        .current_dir(work.path())
+        .args(["petals", "install", "demo.petal.tar"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("petal_mount: petals/demo/"));
+
+    stop_ipc_server(server, server_thread);
+}
+
+#[test]
+fn petals_source_install_prints_daemon_progress() {
+    let home = fresh_home();
+    let (server, server_thread) = spawn_petals_ipc_server(home.path());
+
+    bloom_cmd(home.path())
+        .args([
+            "petals",
+            "install",
+            "https://github.com/bloom-directory/demo",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Resolving https://github.com/bloom-directory/demo",
+        ))
+        .stdout(predicate::str::contains("Selected tag: v1.0.0"))
+        .stdout(predicate::str::contains(
+            "Resolved commit: 0123456789abcdef",
+        ))
+        .stdout(predicate::str::contains("Building source package..."))
+        .stdout(predicate::str::contains("{\"routes\": 95}"))
+        .stderr(predicate::str::contains("build warning"))
+        .stdout(predicate::str::contains("Validating Petal package..."));
+
+    stop_ipc_server(server, server_thread);
+}
+
+#[test]
+fn petals_source_build_failure_replays_output_before_returning_an_error() {
+    let home = fresh_home();
+    let (server, server_thread) = spawn_petals_ipc_server(home.path());
+
+    let assert = bloom_cmd(home.path())
+        .args([
+            "petals",
+            "install",
+            "https://github.com/bloom-directory/failing-demo",
+        ])
+        .assert()
+        .failure();
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout);
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr);
+    let resolving = stdout
+        .find("Resolving https://github.com/bloom-directory/failing-demo")
+        .unwrap();
+    let building = stdout.find("Building source package...").unwrap();
+    let build_output = stdout.find("partial build output").unwrap();
+    assert!(resolving < building && building < build_output, "{stdout}");
+    let build_stderr = stderr.find("build exploded").unwrap();
+    let final_error = stderr
+        .find("build command failed: scripts/build.sh")
+        .unwrap();
+    assert!(build_stderr < final_error, "{stderr}");
+
+    stop_ipc_server(server, server_thread);
 }
 
 #[test]
@@ -1382,6 +1698,7 @@ fn petal_cli_build_install_list_and_vfs_read_happy_path() {
 
     let package_arg = package.to_str().unwrap();
     let archive_arg = archive.to_str().unwrap();
+    let (server, server_thread) = spawn_petals_ipc_server(home.path());
     bloom_cmd(home.path())
         .args(["petals", "build", package_arg, "--out", archive_arg])
         .assert()
@@ -1408,6 +1725,8 @@ fn petal_cli_build_install_list_and_vfs_read_happy_path() {
         .assert()
         .success()
         .stdout(predicate::str::contains("app=petals/demo/"));
+
+    stop_ipc_server(server, server_thread);
 
     bloom_cmd(home.path())
         .args(["vfs", "cat", "/petals/demo/hello.txt"])
@@ -1440,6 +1759,8 @@ fn github_source_install_polymarket_dispatches_route_contract() {
         .success()
         .stdout(predicate::str::contains("preinstalled_petals: []"));
 
+    let daemon = spawn_bloom_serve(home.path());
+
     bloom_cmd(home.path())
         .args([
             "petals",
@@ -1453,13 +1774,10 @@ fn github_source_install_polymarket_dispatches_route_contract() {
         .stdout(predicate::str::contains(format!(
             "Resolved commit: {petal_ref}"
         )))
-        .stdout(predicate::str::contains("\"routes\": 95"));
-
-    bloom_cmd(home.path())
-        .arg("init")
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("preinstalled_petals: []"));
+        .stdout(predicate::str::contains("Building source package..."))
+        .stdout(predicate::str::contains("Validating Petal package..."))
+        .stdout(predicate::str::contains("\"routes\": 95"))
+        .stdout(predicate::str::contains("routes: 95"));
 
     bloom_cmd(home.path())
         .args(["petals", "ls"])
@@ -1482,11 +1800,14 @@ fn github_source_install_polymarket_dispatches_route_contract() {
         .assert()
         .success()
         .stdout(predicate::str::contains("# Polymarket Petal"));
+
+    stop_bloom_serve(home.path(), daemon);
 }
 
 #[test]
 fn petals_install_rejects_untrusted_owner_and_raw_remote_wasm() {
     let home = fresh_home();
+    let (server, server_thread) = spawn_petals_ipc_server(home.path());
     bloom_cmd(home.path())
         .args(["petals", "install", "https://github.com/not-bloom/petal"])
         .assert()
@@ -1504,4 +1825,5 @@ fn petals_install_rejects_untrusted_owner_and_raw_remote_wasm() {
         .stderr(predicate::str::contains(
             "raw remote .wasm installs are not supported",
         ));
+    stop_ipc_server(server, server_thread);
 }

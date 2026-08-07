@@ -15,12 +15,17 @@
 //! | `version`  | `null`                                | `"x.y.z"`                 |
 //! | `chains`   | `null`                                | `[ "ethereum", ... ]`     |
 //! | `confirm_batch` | `{ "wallet", "txs", "text" }` | batch result              |
+//! | `petals.install` | `{ "path", "ref"? }`             | package metadata          |
+//! | `petals.build` | `{ "package_dir", "out"? }`       | package metadata          |
+//! | `petals.list` | `null`                              | `[ package, ... ]`        |
+//! | `petals.uninstall` | `{ "hash" }`                   | `{ "removed" }`          |
 //! | `shutdown` | `null`                                | `null`                    |
 //!
 //! Wire framing is one JSON document per line. Encoding/decoding errors
 //! produce a JSON-RPC `-32700` parse-error response and the connection
 //! continues. Unknown methods produce `-32601`.
 
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -131,6 +136,13 @@ pub trait BatchConfirmationService: Send + Sync {
     fn confirm_batch<'a>(&'a self, request: BatchConfirmIpcRequest) -> BatchConfirmFuture<'a>;
 }
 
+/// Narrow seam for trusted remote-source installs. Local package install,
+/// build, list, and uninstall stay implemented by the IPC server against its
+/// daemon-owned [`PetalRunner`].
+pub trait PetalSourceInstallService: Send + Sync {
+    fn install_source(&self, params: Value) -> Result<Value, String>;
+}
+
 /// Server context. Cloning is cheap (Arc-shared).
 #[derive(Clone)]
 pub struct IpcServer {
@@ -138,6 +150,9 @@ pub struct IpcServer {
     pub version: String,
     pub chains: Vec<String>,
     petals: Option<PetalRunner>,
+    petal_runtime_endpoints: BTreeMap<String, BTreeMap<String, String>>,
+    petal_source_installer: Option<Arc<dyn PetalSourceInstallService>>,
+    petal_mutation: Arc<tokio::sync::Mutex<()>>,
     batch_confirmation: Option<Arc<dyn BatchConfirmationService>>,
     shutdown: Arc<Notify>,
 }
@@ -149,6 +164,9 @@ impl IpcServer {
             version: version.into(),
             chains,
             petals: None,
+            petal_runtime_endpoints: BTreeMap::new(),
+            petal_source_installer: None,
+            petal_mutation: Arc::new(tokio::sync::Mutex::new(())),
             batch_confirmation: None,
             shutdown: Arc::new(Notify::new()),
         }
@@ -158,6 +176,22 @@ impl IpcServer {
     /// `-32601 method not found`.
     pub fn with_petals(mut self, runner: PetalRunner) -> Self {
         self.petals = Some(runner);
+        self
+    }
+
+    pub fn with_petal_runtime_endpoints(
+        mut self,
+        endpoints: BTreeMap<String, BTreeMap<String, String>>,
+    ) -> Self {
+        self.petal_runtime_endpoints = endpoints;
+        self
+    }
+
+    pub fn with_petal_source_installer(
+        mut self,
+        installer: Arc<dyn PetalSourceInstallService>,
+    ) -> Self {
+        self.petal_source_installer = Some(installer);
         self
     }
 
@@ -324,6 +358,10 @@ impl IpcServer {
                 Ok(v) => Response::ok(id, v),
                 Err(e) => map_petal_err(id, e),
             },
+            "petals.build" => match self.do_petals_build(&req.params).await {
+                Ok(v) => Response::ok(id, v),
+                Err(e) => map_petal_err(id, e),
+            },
             "petals.run" => match self.do_petals_run(&req.params).await {
                 Ok(v) => Response::ok(id, v),
                 Err(e) => map_petal_err(id, e),
@@ -384,12 +422,114 @@ impl IpcServer {
             .ok_or_else(|| PetalError::vm("petals not enabled on this daemon"))
     }
 
-    /// `params`: `{ bytes_b64? | text?, name?, caps?: ["vfs.read","vfs.write"] }`.
-    /// Either `bytes_b64` (raw wasm or WAT) or `text` (WAT only) must be set.
-    async fn do_petals_install(&self, _params: &Value) -> Result<Value, PetalError> {
-        Err(PetalError::vm(
-            "raw petal IPC install is unsupported; use `bloom petals install <package-dir|.petal.tar|github-url>`",
-        ))
+    /// `params`: `{ path, ref? }` where path is a package directory,
+    /// `.petal.tar`, or trusted remote source URL.
+    async fn do_petals_install(&self, params: &Value) -> Result<Value, PetalError> {
+        let path = params
+            .get("path")
+            .and_then(Value::as_str)
+            .ok_or_else(|| PetalError::vm("missing 'path'"))?;
+        if path.contains("://") || path.starts_with("git@github.com:") {
+            let installer = self.petal_source_installer.clone().ok_or_else(|| {
+                PetalError::vm("trusted remote Petal installs are not enabled on this daemon")
+            })?;
+            let params = params.clone();
+            let mutation = self.petal_mutation.clone().lock_owned().await;
+            return tokio::task::spawn_blocking(move || {
+                let _mutation = mutation;
+                installer.install_source(params)
+            })
+            .await
+            .map_err(|error| {
+                PetalError::vm(format!("petal source install worker failed: {error}"))
+            })?
+            .map_err(PetalError::vm);
+        }
+        if params.get("ref").is_some_and(|value| !value.is_null()) {
+            return Err(PetalError::vm(
+                "--ref is only supported for trusted GitHub source installs",
+            ));
+        }
+
+        let runner = self.petals()?.clone();
+        let path = path.to_owned();
+        let bindings_by_name = self.petal_runtime_endpoints.clone();
+        let mutation = self.petal_mutation.clone().lock_owned().await;
+        tokio::task::spawn_blocking(move || {
+            let _mutation = mutation;
+            let metadata = std::fs::metadata(&path)?;
+            let is_dir = metadata.is_dir();
+            if !is_dir && !path.ends_with(".petal.tar") {
+                return Err(PetalError::vm(
+                    "petals install only accepts Petal package directories, .petal.tar archives, or trusted GitHub source repositories",
+                ));
+            }
+            let package = if is_dir {
+                bloom_petals::package::PreparedPetalPackage::from_dir(&path)?
+            } else {
+                bloom_petals::package::PreparedPetalPackage::from_petal_tar(&path)?
+            };
+            let mut consent = bloom_petals::package::petal_consent_summary(&package)?;
+            let bindings = bindings_by_name
+                .get(&consent.name)
+                .cloned()
+                .unwrap_or_default();
+            bloom_petals::package::apply_petal_consent_endpoint_bindings(
+                &mut consent,
+                &bindings,
+            )?;
+            let (result, meta, index) = if is_dir {
+                runner.store().install_petal_package_dir(&path)?
+            } else {
+                runner.store().install_petal_package_tar(&path)?
+            };
+            Ok(json!({
+                "hash": result.hash,
+                "mode": "petal",
+                "size": result.size,
+                "already_present": result.already_present,
+                "petal_mount": meta.petal.as_ref().map(|petal| format!("petals/{}/", petal.name)),
+                "routes": index.routes.len(),
+                "consent_lines": petal_consent_lines(&consent),
+            }))
+        })
+        .await
+        .map_err(|error| PetalError::vm(format!("petal install worker failed: {error}")))?
+    }
+
+    /// `params`: `{ package_dir, out? }`.
+    async fn do_petals_build(&self, params: &Value) -> Result<Value, PetalError> {
+        self.petals()?;
+        let package_dir = params
+            .get("package_dir")
+            .and_then(Value::as_str)
+            .ok_or_else(|| PetalError::vm("missing 'package_dir'"))?;
+        let package_dir = package_dir.to_owned();
+        let out = params.get("out").and_then(Value::as_str).map(str::to_owned);
+        let mutation = self.petal_mutation.clone().lock_owned().await;
+        tokio::task::spawn_blocking(move || {
+            let _mutation = mutation;
+            if let Some(out) = out.as_deref() {
+                reject_archive_output_inside_package(&package_dir, out)?;
+            }
+            let package = bloom_petals::package::build_petal_package_dir(&package_dir)?;
+            let consent = bloom_petals::package::petal_consent_summary(&package)?;
+            if let Some(out) = out.as_deref() {
+                package.write_petal_tar(std::fs::File::create(out)?)?;
+            }
+            Ok(json!({
+                "hash": package.hash,
+                "contract": bloom_petals::package::ROUTE_PACKAGE,
+                "wit_digest": bloom_petals::package::contract_wit_digest(),
+                "petal_mount": format!("petals/{}/", package.name),
+                "routes": package.route_index.routes.len(),
+                "artifacts": format!("{package_dir}/artifacts"),
+                "archive": out,
+                "consent_lines": petal_consent_lines(&consent),
+            }))
+        })
+        .await
+        .map_err(|error| PetalError::vm(format!("petal build worker failed: {error}")))?
     }
 
     /// `params`: `{ name_or_hash, stdin_b64?, input?, cap_mask?: ["vfs.read",...] }`.
@@ -401,50 +541,63 @@ impl IpcServer {
     }
 
     async fn do_petals_list(&self) -> Result<Value, PetalError> {
-        let runner = self.petals()?;
-        let names = runner.registry().snapshot();
-        // Build a hash → first-matching-name reverse map so each entry
-        // can carry its registered name (or null).
-        let mut name_for_hash: std::collections::BTreeMap<String, String> = Default::default();
-        for (name, hash) in &names {
-            name_for_hash.entry(hash.clone()).or_insert(name.clone());
-        }
-        let hashes = runner.store().list_package_hashes()?;
-        let mut out = Vec::with_capacity(hashes.len());
-        for hash in hashes {
-            let meta = runner.store().load_meta(&hash)?;
-            let petal_mount = meta
-                .petal
-                .as_ref()
-                .map(|app| format!("petals/{}/", app.name));
-            out.push(json!({
-                "hash": meta.hash,
-                "size": meta.size,
-                "name": name_for_hash.get(&meta.hash).cloned(),
-                "caps": meta.caps.iter().map(|c| c.as_str()).collect::<Vec<_>>(),
-                "installed_at_ms": meta.installed_at_ms,
-                "mode": meta.mode_str(),
-                "petal_mount": petal_mount,
-                "petal": meta.petal,
-                "source": meta.source,
-            }));
-        }
-        Ok(Value::Array(out))
+        let runner = self.petals()?.clone();
+        let mutation = self.petal_mutation.clone().lock_owned().await;
+        tokio::task::spawn_blocking(move || {
+            let _mutation = mutation;
+            let names = runner.registry().snapshot();
+            // Build a hash → first-matching-name reverse map so each entry
+            // can carry its registered name (or null).
+            let mut name_for_hash: BTreeMap<String, String> = Default::default();
+            for (name, hash) in &names {
+                name_for_hash.entry(hash.clone()).or_insert(name.clone());
+            }
+            let hashes = runner.store().list_package_hashes()?;
+            let mut out = Vec::with_capacity(hashes.len());
+            for hash in hashes {
+                let meta = runner.store().load_meta(&hash)?;
+                let petal_mount = meta
+                    .petal
+                    .as_ref()
+                    .map(|app| format!("petals/{}/", app.name));
+                out.push(json!({
+                    "hash": meta.hash,
+                    "size": meta.size,
+                    "name": name_for_hash.get(&meta.hash).cloned(),
+                    "caps": meta.caps.iter().map(|c| c.as_str()).collect::<Vec<_>>(),
+                    "installed_at_ms": meta.installed_at_ms,
+                    "mode": meta.mode_str(),
+                    "petal_mount": petal_mount,
+                    "petal": meta.petal,
+                    "source": meta.source,
+                }));
+            }
+            Ok(Value::Array(out))
+        })
+        .await
+        .map_err(|error| PetalError::vm(format!("petal list worker failed: {error}")))?
     }
 
     async fn do_petals_resolve(&self, params: &Value) -> Result<Value, PetalError> {
-        let runner = self.petals()?;
+        let runner = self.petals()?.clone();
         let target = params
             .get("name_or_hash")
             .and_then(|v| v.as_str())
             .ok_or_else(|| PetalError::vm("missing 'name_or_hash'"))?;
-        let hash = runner.resolve(target)?;
-        Ok(json!({ "hash": hash }))
+        let target = target.to_owned();
+        let mutation = self.petal_mutation.clone().lock_owned().await;
+        tokio::task::spawn_blocking(move || {
+            let _mutation = mutation;
+            let hash = runner.resolve(&target)?;
+            Ok(json!({ "hash": hash }))
+        })
+        .await
+        .map_err(|error| PetalError::vm(format!("petal resolve worker failed: {error}")))?
     }
 
     /// `params`: `{ name, hash? }`. Omitted/empty `hash` unsets the name.
     async fn do_petals_name(&self, params: &Value) -> Result<Value, PetalError> {
-        let runner = self.petals()?;
+        let runner = self.petals()?.clone();
         let name = params
             .get("name")
             .and_then(|v| v.as_str())
@@ -452,27 +605,42 @@ impl IpcServer {
         let hash = params
             .get("hash")
             .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty());
-        match hash {
-            Some(h) => {
-                runner.registry().set(name, h)?;
-                Ok(json!({ "name": name, "hash": h }))
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
+        let name = name.to_owned();
+        let mutation = self.petal_mutation.clone().lock_owned().await;
+        tokio::task::spawn_blocking(move || {
+            let _mutation = mutation;
+            match hash {
+                Some(hash) => {
+                    runner.registry().set(&name, &hash)?;
+                    Ok(json!({ "name": name, "hash": hash }))
+                }
+                None => {
+                    let removed = runner.registry().unset(&name)?;
+                    Ok(json!({ "name": name, "removed": removed }))
+                }
             }
-            None => {
-                let removed = runner.registry().unset(name)?;
-                Ok(json!({ "name": name, "removed": removed }))
-            }
-        }
+        })
+        .await
+        .map_err(|error| PetalError::vm(format!("petal name worker failed: {error}")))?
     }
 
     async fn do_petals_uninstall(&self, params: &Value) -> Result<Value, PetalError> {
-        let runner = self.petals()?;
+        let runner = self.petals()?.clone();
         let hash = params
             .get("hash")
             .and_then(|v| v.as_str())
             .ok_or_else(|| PetalError::vm("missing 'hash'"))?;
-        let removed = runner.uninstall(hash)?;
-        Ok(json!({ "removed": removed }))
+        let hash = hash.to_owned();
+        let mutation = self.petal_mutation.clone().lock_owned().await;
+        tokio::task::spawn_blocking(move || {
+            let _mutation = mutation;
+            let removed = runner.uninstall(&hash)?;
+            Ok(json!({ "removed": removed }))
+        })
+        .await
+        .map_err(|error| PetalError::vm(format!("petal uninstall worker failed: {error}")))?
     }
 }
 
@@ -529,6 +697,112 @@ fn parse_write_bytes(params: &Value) -> Result<Vec<u8>, HandlerError> {
     } else {
         Err(HandlerError::invalid("write needs bytes_b64 or text"))
     }
+}
+
+fn reject_archive_output_inside_package(package_dir: &str, out: &str) -> Result<(), PetalError> {
+    let package_dir = std::fs::canonicalize(package_dir)?;
+    let out_path = Path::new(out);
+    let out_parent = out_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let out_abs = std::fs::canonicalize(out_parent)?.join(out_path.file_name().unwrap_or_default());
+    if out_abs.starts_with(package_dir) {
+        return Err(PetalError::vm(
+            "--out must be outside the package directory so archives are not packaged into future builds",
+        ));
+    }
+    Ok(())
+}
+
+fn petal_consent_lines(summary: &bloom_petals::package::PetalConsentSummary) -> Vec<String> {
+    let mut lines = vec!["consent:".to_owned()];
+    if let Some(package_summary) = &summary.package_summary {
+        lines.push(format!("  summary: {package_summary}"));
+    }
+    lines.push(format!("  docs: {}", summary.docs.join(", ")));
+    if !summary.capabilities.is_empty() {
+        lines.push(format!(
+            "  capabilities: {}",
+            summary.capabilities.join(", ")
+        ));
+    }
+    if !summary.network.is_empty() {
+        lines.push("  network:".to_owned());
+        for rule in &summary.network {
+            let binding = rule
+                .binding
+                .as_deref()
+                .map(|binding| format!(" binding={binding}"))
+                .unwrap_or_default();
+            let effective = rule
+                .effective_origin
+                .as_deref()
+                .map(|origin| format!(" effective_origin={origin}"))
+                .unwrap_or_default();
+            lines.push(format!(
+                "    - declared_host={}{}{} methods=[{}] paths=[{}]",
+                rule.host,
+                binding,
+                effective,
+                rule.methods.join(","),
+                rule.paths.join(",")
+            ));
+        }
+    }
+    if !summary.sign_intents.is_empty() {
+        lines.push(format!(
+            "  signing_intents: {}",
+            summary.sign_intents.join(", ")
+        ));
+    }
+    if !summary.store_namespaces.is_empty() {
+        lines.push("  private_store:".to_owned());
+        for namespace in &summary.store_namespaces {
+            let visibility = if namespace.secret {
+                "secret"
+            } else {
+                "private"
+            };
+            lines.push(format!("    - {} {visibility}", namespace.namespace));
+        }
+    }
+    if !summary.routes.is_empty() {
+        lines.push("  routes:".to_owned());
+        for route in &summary.routes {
+            let ops = route
+                .ops
+                .iter()
+                .map(|op| format!("{op:?}").to_ascii_lowercase())
+                .collect::<Vec<_>>()
+                .join(",");
+            let mut flags = Vec::new();
+            if route.side_effecting_read {
+                flags.push("side_effecting_read".to_owned());
+            }
+            if route.write_async {
+                flags.push("write_async".to_owned());
+            }
+            if let Some(ttl) = route.cache_ttl_ms {
+                flags.push(format!("cache_ttl_ms={ttl}"));
+            }
+            let caps = if route.required_caps.is_empty() {
+                "-".to_owned()
+            } else {
+                route.required_caps.join(",")
+            };
+            let flags = if flags.is_empty() {
+                String::new()
+            } else {
+                format!(" flags=[{}]", flags.join(","))
+            };
+            lines.push(format!(
+                "    - {} ops=[{}] caps=[{}]{}",
+                route.path, ops, caps, flags
+            ));
+        }
+    }
+    lines
 }
 
 fn entry_to_json(e: &Entry) -> Value {
@@ -653,9 +927,27 @@ impl IpcClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
 
     struct MockBatchConfirmation;
+
+    struct TrackingSourceInstaller {
+        active: AtomicUsize,
+        max_active: AtomicUsize,
+    }
+
+    impl PetalSourceInstallService for TrackingSourceInstaller {
+        fn install_source(&self, _params: Value) -> Result<Value, String> {
+            let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_active.fetch_max(active, Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            self.active.fetch_sub(1, Ordering::SeqCst);
+            Ok(json!({"installed": true}))
+        }
+    }
 
     impl BatchConfirmationService for MockBatchConfirmation {
         fn confirm_batch<'a>(&'a self, request: BatchConfirmIpcRequest) -> BatchConfirmFuture<'a> {
@@ -858,6 +1150,110 @@ summary = "Demo app used by IPC tests."
         assert_eq!(entries[0]["mode"], "local");
         assert_eq!(entries[0]["petal_mount"], "petals/demo/");
         assert_eq!(entries[0]["petal"]["name"], "demo");
+    }
+
+    #[tokio::test]
+    async fn petals_package_build_and_install_are_daemon_owned_rpc_operations() {
+        let dir = tempfile::tempdir().unwrap();
+        let package = dir.path().join("demo-package");
+        let archive = dir.path().join("demo.petal.tar");
+        write_demo_petal_package(&package);
+
+        let store = bloom_petals::PetalStore::open(dir.path().join("store")).unwrap();
+        let registry =
+            Arc::new(bloom_petals::NameRegistry::open(dir.path().join("registry")).unwrap());
+        let runner = PetalRunner::new(store, registry, bloom_petals::PetalVm::new().unwrap());
+        let server = IpcServer::new(vfs(), "0", vec![]).with_petals(runner);
+
+        let build = server
+            .dispatch(Request {
+                jsonrpc: "2.0".into(),
+                id: json!(1),
+                method: "petals.build".into(),
+                params: json!({
+                    "package_dir": package,
+                    "out": archive,
+                }),
+            })
+            .await;
+        assert!(build.error.is_none());
+        assert_eq!(build.result.unwrap()["routes"], 1);
+        assert!(archive.is_file());
+
+        let install = server
+            .dispatch(Request {
+                jsonrpc: "2.0".into(),
+                id: json!(2),
+                method: "petals.install".into(),
+                params: json!({ "path": archive }),
+            })
+            .await;
+        assert!(install.error.is_none());
+        let result = install.result.unwrap();
+        assert_eq!(result["mode"], "petal");
+        assert_eq!(result["petal_mount"], "petals/demo/");
+        assert_eq!(result["routes"], 1);
+    }
+
+    #[tokio::test]
+    async fn petal_mutations_are_serialized_across_concurrent_connections() {
+        let installer = Arc::new(TrackingSourceInstaller {
+            active: AtomicUsize::new(0),
+            max_active: AtomicUsize::new(0),
+        });
+        let server =
+            IpcServer::new(vfs(), "0", vec![]).with_petal_source_installer(installer.clone());
+        let first = server.dispatch(Request {
+            jsonrpc: "2.0".into(),
+            id: json!(1),
+            method: "petals.install".into(),
+            params: json!({"path": "https://github.com/bloom-directory/first"}),
+        });
+        let second = server.dispatch(Request {
+            jsonrpc: "2.0".into(),
+            id: json!(2),
+            method: "petals.install".into(),
+            params: json!({"path": "https://github.com/bloom-directory/second"}),
+        });
+
+        let (first, second) = tokio::join!(first, second);
+        assert!(first.error.is_none());
+        assert!(second.error.is_none());
+        assert_eq!(
+            installer.max_active.load(Ordering::SeqCst),
+            1,
+            "daemon must allow only one Petal mutation at a time"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn blocking_petal_source_work_does_not_stall_the_async_runtime() {
+        let installer = Arc::new(TrackingSourceInstaller {
+            active: AtomicUsize::new(0),
+            max_active: AtomicUsize::new(0),
+        });
+        let server =
+            IpcServer::new(vfs(), "0", vec![]).with_petal_source_installer(installer.clone());
+        let started = std::time::Instant::now();
+        let install = tokio::spawn(async move {
+            server
+                .dispatch(Request {
+                    jsonrpc: "2.0".into(),
+                    id: json!(1),
+                    method: "petals.install".into(),
+                    params: json!({"path": "https://github.com/bloom-directory/slow"}),
+                })
+                .await
+        });
+
+        while installer.active.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(75),
+            "synchronous source work stalled the current-thread runtime"
+        );
+        assert!(install.await.unwrap().error.is_none());
     }
 
     #[tokio::test]

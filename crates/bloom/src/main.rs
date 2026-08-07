@@ -1706,25 +1706,6 @@ async fn main() -> ExitCode {
     }
 }
 
-fn reject_archive_output_inside_package(package_dir: &str, out: &str) -> Result<()> {
-    let package_dir = std::fs::canonicalize(package_dir)
-        .with_context(|| format!("canonicalize package dir {package_dir}"))?;
-    let out_path = std::path::Path::new(out);
-    let out_parent = out_path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| std::path::Path::new("."));
-    let out_parent = std::fs::canonicalize(out_parent)
-        .with_context(|| format!("canonicalize archive parent {out}"))?;
-    let out_abs = out_parent.join(out_path.file_name().unwrap_or_default());
-    if out_abs.starts_with(&package_dir) {
-        bail!(
-            "--out must be outside the package directory so archives are not packaged into future builds"
-        );
-    }
-    Ok(())
-}
-
 /// Returns `None` when no daemon socket is present (daemon not started),
 /// propagating all other errors normally. A stale socket (file exists but
 /// connection refused) is removed and surfaced as an error rather than
@@ -2571,6 +2552,18 @@ async fn run(cli: Cli) -> Result<()> {
             info!(home = %d.home.root().display(), chains = ?chains, endpoint = %endpoint.display, socket = %socket.display(), mount = ?mount, "cli.serve.starting");
             let server = IpcServer::new(d.vfs.clone(), env!("CARGO_PKG_VERSION"), chains)
                 .with_petals(d.petals.clone())
+                .with_petal_runtime_endpoints(
+                    d.config
+                        .petals
+                        .runtime
+                        .iter()
+                        .map(|(name, runtime)| (name.clone(), runtime.endpoints.clone()))
+                        .collect(),
+                )
+                .with_petal_source_installer(Arc::new(CanonicalPetalSourceInstaller {
+                    home: home.clone(),
+                    daemon: d.clone(),
+                }))
                 .with_batch_confirmation(
                     d.batch_confirmation_service().map_err(anyhow::Error::msg)?,
                 );
@@ -2612,10 +2605,7 @@ async fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
         Cmd::Update(cmd) => handle_update(&home, cmd).await,
-        Cmd::Petals(cmd) => {
-            let _home_permit = HomeWritePermit::acquire(&home)?;
-            run_petals(home, cmd).await
-        }
+        Cmd::Petals(cmd) => run_petals(&client_endpoint, cmd).await,
 
         Cmd::Completions { shell } => {
             generate(shell, &mut Cli::command(), "bloom", &mut std::io::stdout());
@@ -2642,147 +2632,238 @@ async fn run(cli: Cli) -> Result<()> {
     }
 }
 
-async fn run_petals(home: HomeDir, cmd: PetalsCmd) -> Result<()> {
-    let cmd = match cmd {
-        PetalsCmd::Build { package_dir, out } => {
-            if let Some(out) = out.as_deref() {
-                reject_archive_output_inside_package(&package_dir, out)?;
-            }
-            let package = bloom_petals::package::build_petal_package_dir(&package_dir)
-                .with_context(|| format!("build Petal package {package_dir}"))?;
-            let consent = bloom_petals::package::petal_consent_summary(&package)
-                .context("build Petal consent summary")?;
-            println!("hash: {}", package.hash);
-            println!("contract: {}", bloom_petals::package::ROUTE_PACKAGE);
-            println!(
-                "wit_digest: {}",
-                bloom_petals::package::contract_wit_digest()
-            );
-            println!("petal_mount: petals/{}/", package.name);
-            println!("routes: {}", package.route_index.routes.len());
-            println!("artifacts: {package_dir}/artifacts");
-            print_petal_consent(&consent);
-            if let Some(out) = out {
-                let file =
-                    std::fs::File::create(&out).with_context(|| format!("create archive {out}"))?;
-                package
-                    .write_petal_tar(file)
-                    .with_context(|| format!("write archive {out}"))?;
-                println!("archive: {out}");
-            }
-            return Ok(());
-        }
-        other => other,
-    };
+#[derive(Clone)]
+struct CanonicalPetalSourceInstaller {
+    home: HomeDir,
+    daemon: Daemon,
+}
 
-    let d = build_authenticated_read_daemon(home.clone())?;
+impl bloom_daemon::ipc::PetalSourceInstallService for CanonicalPetalSourceInstaller {
+    fn install_source(&self, params: serde_json::Value) -> Result<serde_json::Value, String> {
+        let path = params
+            .get("path")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| "missing 'path'".to_owned())?;
+        let requested_ref = params.get("ref").and_then(serde_json::Value::as_str);
+        let repo = github_source::parse_github_install_url(path)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| {
+                "trusted source installer requires a GitHub repository URL".to_owned()
+            })?;
+        let installed = match github_source::install_github_source(
+            &self.home,
+            &self.daemon,
+            &repo,
+            requested_ref,
+        ) {
+            Ok(installed) => installed,
+            Err(error) => {
+                if let Some(failure) = github_source::source_build_failure(&error) {
+                    return Ok(serde_json::json!({
+                        "progress_lines": failure.progress,
+                        "build_stdout": failure.stdout,
+                        "build_stderr": failure.stderr,
+                        "operation_error": failure.message,
+                    }));
+                }
+                return Err(error.to_string());
+            }
+        };
+        let selected = installed
+            .provenance
+            .selected_tag
+            .as_deref()
+            .unwrap_or(&installed.provenance.requested_ref);
+        Ok(serde_json::json!({
+            "hash": installed.result.hash,
+            "mode": "petal",
+            "size": installed.result.size,
+            "already_present": installed.result.already_present,
+            "petal_mount": installed.meta.petal.as_ref().map(|petal| format!("petals/{}/", petal.name)),
+            "routes": installed.index.routes.len(),
+            "source": format!("{}/{}@{}", installed.provenance.owner, installed.provenance.repo, selected),
+            "resolved_commit": installed.provenance.resolved_commit,
+            "progress_lines": installed.progress,
+            "build_stdout": installed.build_stdout,
+            "build_stderr": installed.build_stderr,
+            "completion_progress_lines": installed.completion_progress,
+            "consent_lines": petal_consent_lines(&installed.consent),
+        }))
+    }
+}
+
+fn required_petal_string<'a>(value: &'a serde_json::Value, field: &str) -> Result<&'a str> {
+    value
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .with_context(|| format!("ipc petals response: missing {field}"))
+}
+
+fn required_petal_u64(value: &serde_json::Value, field: &str) -> Result<u64> {
+    value
+        .get(field)
+        .and_then(serde_json::Value::as_u64)
+        .with_context(|| format!("ipc petals response: missing {field}"))
+}
+
+fn print_ipc_lines(value: &serde_json::Value, field: &str) -> Result<()> {
+    for line in value
+        .get(field)
+        .and_then(serde_json::Value::as_array)
+        .with_context(|| format!("ipc petals response: missing {field}"))?
+    {
+        println!(
+            "{}",
+            line.as_str()
+                .with_context(|| format!("ipc petals response: non-string {field}"))?
+        );
+    }
+    Ok(())
+}
+
+fn print_ipc_captured_build_output(value: &serde_json::Value) -> Result<()> {
+    if let Some(stdout) = value
+        .get("build_stdout")
+        .and_then(serde_json::Value::as_str)
+    {
+        std::io::Write::write_all(&mut std::io::stdout(), stdout.as_bytes())?;
+        std::io::Write::flush(&mut std::io::stdout())?;
+    }
+    if let Some(stderr) = value
+        .get("build_stderr")
+        .and_then(serde_json::Value::as_str)
+    {
+        std::io::Write::write_all(&mut std::io::stderr(), stderr.as_bytes())?;
+        std::io::Write::flush(&mut std::io::stderr())?;
+    }
+    Ok(())
+}
+
+fn absolute_cli_path(path: &str) -> Result<PathBuf> {
+    let path = PathBuf::from(path);
+    if path.is_absolute() {
+        Ok(path)
+    } else {
+        Ok(std::env::current_dir()
+            .context("resolve CLI working directory")?
+            .join(path))
+    }
+}
+
+async fn run_petals(endpoint: &ResolvedEndpoint, cmd: PetalsCmd) -> Result<()> {
+    let client = IpcClient::new(&endpoint.socket);
     match cmd {
         PetalsCmd::Install { path, ref_ } => {
-            if let Some(repo) = github_source::parse_github_install_url(&path)? {
-                let installed =
-                    github_source::install_github_source(&home, &d, &repo, ref_.as_deref())?;
-                println!();
-                println!("hash: {}", installed.result.hash);
-                println!("mode: petal");
-                println!("size: {} bytes", installed.result.size);
-                if installed.result.already_present {
-                    println!("note: already installed");
-                }
-                if let Some(app) = &installed.meta.petal {
-                    println!("petal_mount: petals/{}/", app.name);
-                }
-                println!("routes: {}", installed.index.routes.len());
-                println!(
-                    "source: {}/{}@{}",
-                    installed.provenance.owner,
-                    installed.provenance.repo,
-                    installed
-                        .provenance
-                        .selected_tag
-                        .as_deref()
-                        .unwrap_or(&installed.provenance.requested_ref)
-                );
-                println!("resolved_commit: {}", installed.provenance.resolved_commit);
-                print_petal_consent(&installed.consent);
-                return Ok(());
-            }
-
-            if ref_.is_some() {
-                bail!("--ref is only supported for trusted GitHub source installs");
-            }
-            let path_meta = std::fs::metadata(&path).with_context(|| format!("stat {path}"))?;
-            let is_petal_dir = path_meta.is_dir();
-            if !is_petal_dir && !path.ends_with(".petal.tar") {
-                bail!(
-                    "petals install only accepts Petal package directories, .petal.tar archives, or trusted GitHub source repositories"
-                );
-            }
-            let consent_package = if is_petal_dir {
-                bloom_petals::package::PreparedPetalPackage::from_dir(&path)
-                    .with_context(|| format!("read Petal package dir {path}"))?
+            let rpc_path = if path.contains("://") || path.starts_with("git@github.com:") {
+                path.clone()
             } else {
-                bloom_petals::package::PreparedPetalPackage::from_petal_tar(&path)
-                    .with_context(|| format!("read Petal package archive {path}"))?
+                absolute_cli_path(&path)?.to_string_lossy().into_owned()
             };
-            let mut consent = bloom_petals::package::petal_consent_summary(&consent_package)
-                .context("build app consent summary")?;
-            apply_configured_petal_endpoints(&d, &mut consent)?;
-            let (result, meta, index) = if is_petal_dir {
-                d.petals
-                    .store()
-                    .install_petal_package_dir(&path)
-                    .with_context(|| format!("install Petal package dir {path}"))?
-            } else {
-                d.petals
-                    .store()
-                    .install_petal_package_tar(&path)
-                    .with_context(|| format!("install Petal package archive {path}"))?
-            };
-            println!("hash: {}", result.hash);
+            let result = client
+                .call(
+                    "petals.install",
+                    serde_json::json!({ "path": rpc_path, "ref": ref_ }),
+                )
+                .await
+                .with_context(|| format!("ipc petals install via {}", endpoint.display))?;
+            if result.get("progress_lines").is_some() {
+                print_ipc_lines(&result, "progress_lines")?;
+            }
+            print_ipc_captured_build_output(&result)?;
+            if result.get("completion_progress_lines").is_some() {
+                print_ipc_lines(&result, "completion_progress_lines")?;
+            }
+            if let Some(error) = result
+                .get("operation_error")
+                .and_then(serde_json::Value::as_str)
+            {
+                bail!("{error}");
+            }
+            println!("hash: {}", required_petal_string(&result, "hash")?);
             println!("mode: petal");
-            println!("size: {} bytes", result.size);
-            if result.already_present {
+            println!("size: {} bytes", required_petal_u64(&result, "size")?);
+            if result["already_present"].as_bool() == Some(true) {
                 println!("note: already installed");
             }
-            if let Some(app) = &meta.petal {
-                println!("petal_mount: petals/{}/", app.name);
+            if let Some(mount) = result["petal_mount"].as_str() {
+                println!("petal_mount: {mount}");
             }
-            println!("routes: {}", index.routes.len());
-            print_petal_consent(&consent);
+            println!("routes: {}", required_petal_u64(&result, "routes")?);
+            if let Some(source) = result["source"].as_str() {
+                println!("source: {source}");
+            }
+            if let Some(commit) = result["resolved_commit"].as_str() {
+                println!("resolved_commit: {commit}");
+            }
+            print_ipc_lines(&result, "consent_lines")?;
             Ok(())
         }
-        PetalsCmd::Build { .. } => {
-            unreachable!("Petal build commands are handled before daemon startup")
+        PetalsCmd::Build { package_dir, out } => {
+            let rpc_package_dir = absolute_cli_path(&package_dir)?;
+            let rpc_out = out.as_deref().map(absolute_cli_path).transpose()?;
+            let result = client
+                .call(
+                    "petals.build",
+                    serde_json::json!({ "package_dir": rpc_package_dir, "out": rpc_out }),
+                )
+                .await
+                .with_context(|| format!("ipc petals build via {}", endpoint.display))?;
+            for field in ["hash", "contract", "wit_digest", "petal_mount", "routes"] {
+                let value = result
+                    .get(field)
+                    .context("ipc petals build: missing response field")?;
+                println!(
+                    "{field}: {}",
+                    value
+                        .as_str()
+                        .map_or_else(|| value.to_string(), str::to_owned)
+                );
+            }
+            println!("artifacts: {package_dir}/artifacts");
+            print_ipc_lines(&result, "consent_lines")?;
+            if let Some(archive) = out {
+                println!("archive: {archive}");
+            }
+            Ok(())
         }
         PetalsCmd::Ls => {
-            let package_hashes = d
-                .petals
-                .store()
-                .list_package_hashes()
-                .context("list Petal packages")?;
-            if package_hashes.is_empty() {
+            let result = client
+                .call("petals.list", serde_json::Value::Null)
+                .await
+                .with_context(|| format!("ipc petals list via {}", endpoint.display))?;
+            let entries = result
+                .as_array()
+                .context("ipc petals list: expected array")?;
+            if entries.is_empty() {
                 println!("(no petals installed)");
                 return Ok(());
             }
-            for h in package_hashes {
-                let meta = d.petals.store().load_meta(&h).context("load meta")?;
-                let app = meta
-                    .petal
-                    .as_ref()
-                    .map(|app| format!("  app=petals/{}/", app.name))
+            for entry in entries {
+                let hash = required_petal_string(entry, "hash")?;
+                let app = entry["petal_mount"]
+                    .as_str()
+                    .map(|mount| format!("  app={mount}"))
                     .unwrap_or_default();
-                let source = meta.source.as_ref().map_or_else(String::new, |source| {
-                    let selected = source
-                        .selected_tag
-                        .as_deref()
-                        .unwrap_or(&source.requested_ref);
-                    format!("  source={}/{}@{}", source.owner, source.repo, selected)
-                });
+                let source = entry["source"]
+                    .as_object()
+                    .map_or_else(String::new, |source| {
+                        let selected = source
+                            .get("selected_tag")
+                            .and_then(|v| v.as_str())
+                            .or_else(|| source.get("requested_ref").and_then(|v| v.as_str()))
+                            .unwrap_or("?");
+                        format!(
+                            "  source={}/{}@{}",
+                            source.get("owner").and_then(|v| v.as_str()).unwrap_or("?"),
+                            source.get("repo").and_then(|v| v.as_str()).unwrap_or("?"),
+                            selected
+                        )
+                    });
                 println!(
                     "{}  {:<7}  {:>7}  caps=[]  name=-{}{}",
-                    &meta.hash[..bloom_petals::store::HASH_PREFIX_LEN],
+                    &hash[..bloom_petals::store::HASH_PREFIX_LEN.min(hash.len())],
                     "app",
-                    meta.size,
+                    required_petal_u64(entry, "size")?,
                     app,
                     source
                 );
@@ -2790,7 +2871,13 @@ async fn run_petals(home: HomeDir, cmd: PetalsCmd) -> Result<()> {
             Ok(())
         }
         PetalsCmd::Uninstall { target } => {
-            let removed = d.petals.uninstall(&target).context("uninstall petal")?;
+            let result = client
+                .call("petals.uninstall", serde_json::json!({ "hash": target }))
+                .await
+                .with_context(|| format!("ipc petals uninstall via {}", endpoint.display))?;
+            let removed = result["removed"]
+                .as_bool()
+                .context("ipc petals uninstall: missing removed")?;
             if removed {
                 println!("removed {target}");
             } else {
@@ -2801,33 +2888,39 @@ async fn run_petals(home: HomeDir, cmd: PetalsCmd) -> Result<()> {
     }
 }
 
-fn print_petal_consent(summary: &bloom_petals::package::PetalConsentSummary) {
-    println!("consent:");
+fn petal_consent_lines(summary: &bloom_petals::package::PetalConsentSummary) -> Vec<String> {
+    let mut lines = vec!["consent:".to_owned()];
     if let Some(package_summary) = &summary.package_summary {
-        println!("  summary: {package_summary}");
+        lines.push(format!("  summary: {package_summary}"));
     }
-    println!("  docs: {}", summary.docs.join(", "));
+    lines.push(format!("  docs: {}", summary.docs.join(", ")));
     if !summary.capabilities.is_empty() {
-        println!("  capabilities: {}", summary.capabilities.join(", "));
+        lines.push(format!(
+            "  capabilities: {}",
+            summary.capabilities.join(", ")
+        ));
     }
     if !summary.network.is_empty() {
-        println!("  network:");
+        lines.push("  network:".to_owned());
         for rule in &summary.network {
-            println!("{}", format_petal_consent_net_rule(rule));
+            lines.push(format_petal_consent_net_rule(rule));
         }
     }
     if !summary.sign_intents.is_empty() {
-        println!("  signing_intents: {}", summary.sign_intents.join(", "));
+        lines.push(format!(
+            "  signing_intents: {}",
+            summary.sign_intents.join(", ")
+        ));
     }
     if !summary.store_namespaces.is_empty() {
-        println!("  private_store:");
+        lines.push("  private_store:".to_owned());
         for ns in &summary.store_namespaces {
             let visibility = if ns.secret { "secret" } else { "private" };
-            println!("    - {} {}", ns.namespace, visibility);
+            lines.push(format!("    - {} {}", ns.namespace, visibility));
         }
     }
     if !summary.routes.is_empty() {
-        println!("  routes:");
+        lines.push("  routes:".to_owned());
         for route in &summary.routes {
             let ops = route
                 .ops
@@ -2851,34 +2944,22 @@ fn print_petal_consent(summary: &bloom_petals::package::PetalConsentSummary) {
                 route.required_caps.join(",")
             };
             if flags.is_empty() {
-                println!("    - {} ops=[{}] caps=[{}]", route.path, ops, caps);
+                lines.push(format!(
+                    "    - {} ops=[{}] caps=[{}]",
+                    route.path, ops, caps
+                ));
             } else {
-                println!(
+                lines.push(format!(
                     "    - {} ops=[{}] caps=[{}] flags=[{}]",
                     route.path,
                     ops,
                     caps,
                     flags.join(",")
-                );
+                ));
             }
         }
     }
-}
-
-fn apply_configured_petal_endpoints(
-    daemon: &Daemon,
-    summary: &mut bloom_petals::package::PetalConsentSummary,
-) -> Result<()> {
-    let bindings = daemon
-        .config
-        .petals
-        .runtime
-        .get(&summary.name)
-        .map(|app| &app.endpoints)
-        .cloned()
-        .unwrap_or_default();
-    bloom_petals::package::apply_petal_consent_endpoint_bindings(summary, &bindings)
-        .context("apply configured Petal endpoint bindings")
+    lines
 }
 
 fn format_petal_consent_net_rule(rule: &bloom_petals::package::PetalConsentNetRule) -> String {

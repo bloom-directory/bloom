@@ -60,6 +60,58 @@ pub(crate) struct GitHubInstallOutput {
     pub index: RouteIndex,
     pub consent: PetalConsentSummary,
     pub provenance: PetalSourceProvenance,
+    pub progress: Vec<String>,
+    pub build_stdout: String,
+    pub build_stderr: String,
+    pub completion_progress: Vec<String>,
+}
+
+struct SourceBuildOutput {
+    stdout: String,
+    stderr: String,
+}
+
+#[derive(Clone, Debug)]
+struct SourceBuildCommandFailure {
+    message: String,
+    stdout: String,
+    stderr: String,
+}
+
+impl std::fmt::Display for SourceBuildCommandFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "{}\nstdout:\n{}\nstderr:\n{}",
+            self.message, self.stdout, self.stderr
+        )
+    }
+}
+
+impl std::error::Error for SourceBuildCommandFailure {}
+
+#[derive(Debug)]
+pub(crate) struct GitHubSourceBuildFailure {
+    pub progress: Vec<String>,
+    pub stdout: String,
+    pub stderr: String,
+    pub message: String,
+}
+
+impl std::fmt::Display for GitHubSourceBuildFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "{}\nstdout:\n{}\nstderr:\n{}",
+            self.message, self.stdout, self.stderr
+        )
+    }
+}
+
+impl std::error::Error for GitHubSourceBuildFailure {}
+
+pub(crate) fn source_build_failure(error: &anyhow::Error) -> Option<&GitHubSourceBuildFailure> {
+    error.downcast_ref()
 }
 
 #[derive(Debug, Deserialize)]
@@ -163,7 +215,7 @@ fn install_github_source_with_expectation(
     requested_ref: Option<&str>,
     expected: Option<&PreinstalledPetal>,
 ) -> Result<GitHubInstallOutput> {
-    println!("Resolving {}", repo.canonical_url);
+    let mut progress = vec![format!("Resolving {}", repo.canonical_url)];
     let cache = fetch_repo_cache(home, repo)?;
     let resolved = resolve_ref(&cache, repo, requested_ref)?;
     if let Some(expected) = expected
@@ -177,18 +229,31 @@ fn install_github_source_with_expectation(
         );
     }
     if let Some(tag) = &resolved.selected_tag {
-        println!("Selected tag: {tag}");
+        progress.push(format!("Selected tag: {tag}"));
     }
-    println!("Resolved commit: {}", resolved.commit);
+    progress.push(format!("Resolved commit: {}", resolved.commit));
 
     let tmp = tempfile::tempdir().context("create source checkout tempdir")?;
     checkout_source(&cache, tmp.path(), &resolved.commit)?;
     validate_source_manifest(tmp.path(), repo)?;
 
-    println!("Building source package...");
-    run_source_build(tmp.path())?;
+    progress.push("Building source package...".to_owned());
+    let build_output = match run_source_build(tmp.path()) {
+        Ok(output) => output,
+        Err(error) => {
+            if let Some(failure) = error.downcast_ref::<SourceBuildCommandFailure>() {
+                return Err(anyhow::Error::new(GitHubSourceBuildFailure {
+                    progress,
+                    stdout: failure.stdout.clone(),
+                    stderr: failure.stderr.clone(),
+                    message: failure.message.clone(),
+                }));
+            }
+            return Err(error);
+        }
+    };
 
-    println!("Validating Petal package...");
+    let completion_progress = vec!["Validating Petal package...".to_owned()];
     let package =
         PreparedPetalPackage::from_dir(tmp.path()).context("validate generated Petal package")?;
     if let Some(expected) = expected {
@@ -243,6 +308,10 @@ fn install_github_source_with_expectation(
         index,
         consent,
         provenance,
+        progress,
+        build_stdout: build_output.stdout,
+        build_stderr: build_output.stderr,
+        completion_progress,
     })
 }
 
@@ -553,6 +622,10 @@ fn install_prebuilt_petal_archive(
         index,
         consent,
         provenance,
+        progress: Vec::new(),
+        build_stdout: String::new(),
+        build_stderr: String::new(),
+        completion_progress: Vec::new(),
     })
 }
 
@@ -852,7 +925,7 @@ fn validate_source_manifest(root: &Path, repo: &GitHubRepo) -> Result<()> {
     Ok(())
 }
 
-fn run_source_build(root: &Path) -> Result<()> {
+fn run_source_build(root: &Path) -> Result<SourceBuildOutput> {
     let manifest = read_source_manifest(root)?;
     let build = manifest
         .build
@@ -862,12 +935,21 @@ fn run_source_build(root: &Path) -> Result<()> {
     if !command.is_file() {
         bail!("build command missing: {}", build.command);
     }
-    let status = Command::new(&command)
+    let output = Command::new(&command)
         .current_dir(root)
-        .status()
+        .output()
         .with_context(|| format!("run build command {}", build.command))?;
-    if !status.success() {
-        bail!("build command failed: {}", build.command);
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    if !output.status.success() {
+        return Err(anyhow::Error::new(SourceBuildCommandFailure {
+            message: format!(
+                "build command failed: {} (status {})",
+                build.command, output.status
+            ),
+            stdout,
+            stderr,
+        }));
     }
     for output in build.outputs {
         validate_repo_relative_path(&output, "build.outputs")?;
@@ -875,7 +957,7 @@ fn run_source_build(root: &Path) -> Result<()> {
             bail!("build output missing: {output}");
         }
     }
-    Ok(())
+    Ok(SourceBuildOutput { stdout, stderr })
 }
 
 fn read_source_manifest(root: &Path) -> Result<SourcePetalToml> {
@@ -1492,6 +1574,50 @@ mod tests {
     }
 
     #[test]
+    fn source_build_captures_stdout_and_stderr_instead_of_inheriting_daemon_stdio() {
+        let source = tempfile::tempdir().unwrap();
+        write_source_repo(
+            &source,
+            "bloom-petal-test-output",
+            true,
+            &BuildScript::Output,
+            "output",
+        )
+        .unwrap();
+
+        let output = run_source_build(source.path()).unwrap();
+        assert_eq!(output.stdout, "{\"routes\": 95}\n");
+        assert_eq!(output.stderr, "build warning\n");
+    }
+
+    #[test]
+    fn failed_source_build_retains_progress_and_both_output_streams() {
+        let fixture = source_repo_fixture(SourceRepoOptions {
+            repo: "bloom-petal-test-output-failure",
+            tags: vec!["v0.1.0"],
+            include_manifest: true,
+            build_script: BuildScript::OutputFailure,
+        })
+        .unwrap();
+        let repo = source_test_repo(fixture.bare.path(), "bloom-petal-test-output-failure");
+        let home = tempfile::tempdir().unwrap();
+        let home_dir = HomeDir::at(home.path());
+        let daemon = Daemon::from_home(home_dir.clone()).unwrap();
+
+        let error = install_github_source(&home_dir, &daemon, &repo, Some("v0.1.0")).unwrap_err();
+        let failure = source_build_failure(&error).expect("structured source-build failure");
+        assert!(
+            failure
+                .progress
+                .iter()
+                .any(|line| line == "Building source package...")
+        );
+        assert_eq!(failure.stdout, "partial build output\n");
+        assert_eq!(failure.stderr, "build exploded\n");
+        assert!(failure.message.contains("status exit status: 42"));
+    }
+
+    #[test]
     fn release_checksum_verification_is_name_bound_and_fail_closed() {
         let archive = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(archive.path(), b"petal archive").unwrap();
@@ -1715,6 +1841,80 @@ mod tests {
             )
             .unwrap();
         assert_eq!(body, b"component");
+    }
+
+    #[tokio::test]
+    async fn source_build_output_is_returned_by_the_daemon_ipc_operation() {
+        #[derive(Clone)]
+        struct FixtureSourceInstaller {
+            home: HomeDir,
+            daemon: Daemon,
+            repo: GitHubRepo,
+        }
+
+        impl bloom_daemon::ipc::PetalSourceInstallService for FixtureSourceInstaller {
+            fn install_source(
+                &self,
+                _params: serde_json::Value,
+            ) -> Result<serde_json::Value, String> {
+                let installed =
+                    install_github_source(&self.home, &self.daemon, &self.repo, Some("v0.1.0"))
+                        .map_err(|error| error.to_string())?;
+                Ok(serde_json::json!({
+                    "build_stdout": installed.build_stdout,
+                    "build_stderr": installed.build_stderr,
+                }))
+            }
+        }
+
+        let fixture = source_repo_fixture(SourceRepoOptions {
+            repo: "bloom-petal-test-output-ipc",
+            tags: vec!["v0.1.0"],
+            include_manifest: true,
+            build_script: BuildScript::Output,
+        })
+        .unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let home_dir = HomeDir::at(home.path());
+        let daemon = Daemon::from_home(home_dir.clone()).unwrap();
+        let installer = FixtureSourceInstaller {
+            home: home_dir,
+            daemon: daemon.clone(),
+            repo: source_test_repo(fixture.bare.path(), "bloom-petal-test-output-ipc"),
+        };
+        let server = bloom_daemon::ipc::IpcServer::new(daemon.vfs.clone(), "0", vec![])
+            .with_petals(daemon.petals.clone())
+            .with_petal_source_installer(std::sync::Arc::new(installer));
+        let socket_dir = tempfile::tempdir().unwrap();
+        let socket = socket_dir.path().join("bloom.sock");
+        let serving = server.clone();
+        let serving_socket = socket.clone();
+        let task = tokio::spawn(async move { serving.serve(&serving_socket).await.unwrap() });
+        for _ in 0..100 {
+            if socket.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        let result = bloom_daemon::ipc::IpcClient::new(&socket)
+            .call(
+                "petals.install",
+                serde_json::json!({
+                    "path": "https://github.com/bloom-directory/bloom-petal-test-output-ipc",
+                    "ref": "v0.1.0",
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["build_stdout"], "{\"routes\": 95}\n");
+        assert_eq!(result["build_stderr"], "build warning\n");
+
+        server.trigger_shutdown();
+        tokio::time::timeout(std::time::Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     #[test]
@@ -1942,6 +2142,8 @@ mod tests {
 
     enum BuildScript {
         Success,
+        Output,
+        OutputFailure,
         Failure,
     }
 
@@ -2054,6 +2256,10 @@ summary = "Demo app used by source install tests."
             BuildScript::Success => format!(
                 "#!/usr/bin/env bash\nset -euo pipefail\nmkdir -p petal/{petal_name}\ncp components/route.wasm petal/{petal_name}/hello.txt.wasm\n"
             ),
+            BuildScript::Output => format!(
+                "#!/usr/bin/env bash\nset -euo pipefail\necho '{{\"routes\": 95}}'\necho 'build warning' >&2\nmkdir -p petal/{petal_name}\ncp components/route.wasm petal/{petal_name}/hello.txt.wasm\n"
+            ),
+            BuildScript::OutputFailure => "#!/usr/bin/env bash\nset -euo pipefail\necho 'partial build output'\necho 'build exploded' >&2\nexit 42\n".to_string(),
             BuildScript::Failure => "#!/usr/bin/env bash\nset -euo pipefail\nexit 42\n".to_string(),
         };
         let script_path = work.path().join("scripts/build.sh");
