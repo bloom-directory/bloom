@@ -99,7 +99,7 @@ The launcher writes the exact authenticated connection environment to
 
 ```bash
 source /tmp/bloom-triad-logs/triad.env
-target/debug/bloom wallet import WALLET_NAME   # or: wallet new WALLET_NAME
+bloom wallet import WALLET_NAME   # or: wallet new WALLET_NAME
 ```
 
 If macOS cannot mount Bloom's NFS 4.1 VFS, omit `--mount` and use the VFS CLI
@@ -129,6 +129,42 @@ will not silently switch modes when a requested mount fails. The
 `local-mainnet-integration.sh` and projection-fidelity runners below still
 require a supported kernel mount because they intentionally test mounted path
 behavior.
+
+### Keep Broker and Signer running while iterating on Machine
+
+To rebuild and restart Machine without disturbing Broker or Signer, run the
+launcher in services-only mode in the first terminal:
+
+```bash
+mkdir -p ~/.bloom/triad-dev/machine-home /tmp/bloom-triad-logs
+scripts/triad-dev-launch.sh \
+  --services-only \
+  --developer-root ~/.bloom/triad-dev \
+  --machine-home ~/.bloom/triad-dev/machine-home \
+  --machine-socket /tmp/bloom-triad-machine.sock \
+  --log-dir /tmp/bloom-triad-logs \
+  --ready-file /tmp/bloom-triad-ready
+```
+
+The launcher prepares the isolated Machine home and developer Petals, starts
+the Session Sentinel, Signer, and Broker, and then stays in the foreground. It
+does not start or own Machine. In a second terminal, source the generated
+environment and run Machine in your own rebuild loop:
+
+```bash
+source /tmp/bloom-triad-logs/triad.env
+cd /path/to/bloom
+cargo build -p bloom --no-default-features --features mount,triad-dev-harness && \
+  bloom serve --endpoint "$BLOOM_RPC_ENDPOINT"
+```
+
+`triad.env` prepends the selected debug binary directory to that terminal's
+`PATH`, so `bloom` resolves to the newly rebuilt debug binary. Stop Machine with
+`Ctrl-C`, rebuild, and run it again; the other services and their state remain
+alive. Stop the services launcher with `Ctrl-C` when finished. It tears down
+only the Session Sentinel, Signer, and Broker; Machine remains owned by its own
+terminal. `--services-only` cannot be combined with `--mount`; add `--mount`
+to the manual `bloom serve` command if the host supports it.
 
 Open the printed Broker ceremony URL. Registration creates a fresh address;
 import requires entering the key only in the Broker-hosted browser ceremony.
