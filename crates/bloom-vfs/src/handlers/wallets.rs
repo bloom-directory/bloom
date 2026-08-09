@@ -26,7 +26,7 @@
 //! - `wallets/<wallet>/chains/<chain>/outbox/sent/<id>/<file>`      — read sent
 //! - `wallets/<wallet>/chains/<chain>/outbox/failed/<id>/<file>`    — read failed
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -1673,6 +1673,18 @@ fn parse_state_seg(s: &str) -> Result<OutboxState, HandlerError> {
     OutboxState::parse(s).ok_or_else(|| HandlerError::not_found(format!("outbox state '{}'", s)))
 }
 
+fn regular_outbox_artifact(dir: &Path, fname: &str) -> Result<PathBuf, HandlerError> {
+    let path = dir.join(fname);
+    match std::fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.file_type().is_file() => Ok(path),
+        Ok(_) => Err(HandlerError::not_found(fname)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Err(HandlerError::not_found(fname))
+        }
+        Err(error) => Err(HandlerError::Io(error)),
+    }
+}
+
 fn first_confirm_line(confirm_text: &str) -> &str {
     confirm_text.lines().next().unwrap_or(confirm_text).trim()
 }
@@ -2331,6 +2343,7 @@ impl WalletsHandler {
                 {
                     Ok(Entry::writable_file(fname).with_modified_ms(entry.staged.created_ms))
                 } else {
+                    regular_outbox_artifact(&entry.dir, fname)?;
                     Ok(Entry::file(fname).with_modified_ms(entry.staged.created_ms))
                 }
             }
@@ -2456,8 +2469,14 @@ impl WalletsHandler {
                     .outbox
                     .read_in_state(wallet, chain, id, st)
                     .map_err(err_be)?;
-                let path = entry.dir.join(fname.as_str());
-                let bytes = std::fs::read(&path).map_err(HandlerError::Io)?;
+                let path = regular_outbox_artifact(&entry.dir, fname)?;
+                let bytes = std::fs::read(&path).map_err(|error| {
+                    if error.kind() == std::io::ErrorKind::NotFound {
+                        HandlerError::not_found(fname)
+                    } else {
+                        HandlerError::Io(error)
+                    }
+                })?;
                 Ok(bytes)
             }
             [s] if s == "pending_external.jsonl" => {
@@ -2620,27 +2639,23 @@ impl WalletsHandler {
                 let mut out = Vec::new();
                 if let Ok(rd) = std::fs::read_dir(&entry.dir) {
                     for r in rd.flatten() {
-                        if let Some(n) = r.file_name().to_str() {
-                            if r.file_type().map(|t| t.is_file()).unwrap_or(false) {
-                                // Pending entries' control files are writable;
-                                // everything else is read-only metadata.
-                                if entry.state == OutboxState::Pending
-                                    && matches!(
-                                        n,
-                                        "confirm" | "confirm.override" | "replace" | "cancel"
-                                    )
-                                {
-                                    out.push(
-                                        Entry::writable_file(n)
-                                            .with_modified_ms(entry.staged.created_ms),
-                                    );
-                                } else {
-                                    out.push(
-                                        Entry::file(n).with_modified_ms(entry.staged.created_ms),
-                                    );
-                                }
+                        if let Some(n) = r.file_name().to_str()
+                            && r.file_type().map(|t| t.is_file()).unwrap_or(false)
+                        {
+                            // Pending entries' control files are writable;
+                            // everything else is read-only metadata.
+                            if entry.state == OutboxState::Pending
+                                && matches!(
+                                    n,
+                                    "confirm" | "confirm.override" | "replace" | "cancel"
+                                )
+                            {
+                                out.push(
+                                    Entry::writable_file(n)
+                                        .with_modified_ms(entry.staged.created_ms),
+                                );
                             } else {
-                                out.push(Entry::dir(n).with_modified_ms(entry.staged.created_ms));
+                                out.push(Entry::file(n).with_modified_ms(entry.staged.created_ms));
                             }
                         }
                     }
@@ -3965,6 +3980,134 @@ mod tests {
         let new_tx = entries.iter().find(|entry| entry.name == "new.tx").unwrap();
 
         assert_eq!(new_tx.mode, 0o644);
+    }
+
+    #[tokio::test]
+    async fn outbox_lookup_rejects_absent_artifacts_but_preserves_virtual_sinks() {
+        let f = make_handler_with_chain(true);
+        for (state_name, state, id) in [
+            ("pending", OutboxState::Pending, "0001-pending"),
+            ("sent", OutboxState::Sent, "0002-sent"),
+            ("failed", OutboxState::Failed, "0003-failed"),
+        ] {
+            seed_pending(&f, id);
+            let entry = f
+                .handler
+                .tx_engine
+                .outbox
+                .read_in_state(&f.wallet_name, "anvil", id, OutboxState::Pending)
+                .unwrap();
+            std::fs::write(entry.dir.join("runtime-result-42.json"), state_name).unwrap();
+            if state != OutboxState::Pending {
+                f.handler
+                    .tx_engine
+                    .outbox
+                    .transition(&entry, state)
+                    .unwrap();
+            }
+
+            let real_suffix = format!("{state_name}/{id}/runtime-result-42.json");
+            let real = VfsPath::parse(&format!(
+                "/{}/chains/anvil/outbox/{real_suffix}",
+                f.wallet_name
+            ))
+            .unwrap();
+            let metadata = f.handler.lookup(&real).await.unwrap();
+            assert_eq!(metadata.kind, crate::handler::EntryKind::File);
+            assert_eq!(metadata.mode, 0o444);
+            assert_eq!(f.handler.read(&real).await.unwrap(), state_name.as_bytes());
+
+            let absent = VfsPath::parse(&format!(
+                "/{}/chains/anvil/outbox/{state_name}/{id}/does-not-exist.json",
+                f.wallet_name
+            ))
+            .unwrap();
+            assert!(matches!(
+                f.handler.lookup(&absent).await,
+                Err(HandlerError::NotFound(_))
+            ));
+            assert!(matches!(
+                f.handler.read(&absent).await,
+                Err(HandlerError::NotFound(_))
+            ));
+        }
+
+        let new_tx =
+            VfsPath::parse(&format!("/{}/chains/anvil/outbox/new.tx", f.wallet_name)).unwrap();
+        let metadata = f.handler.lookup(&new_tx).await.unwrap();
+        assert_eq!(metadata.kind, crate::handler::EntryKind::File);
+        assert_eq!(metadata.mode, 0o644);
+
+        for control in ["confirm", "confirm.override", "replace", "cancel"] {
+            let path = VfsPath::parse(&format!(
+                "/{}/chains/anvil/outbox/pending/0001-pending/{control}",
+                f.wallet_name
+            ))
+            .unwrap();
+            let metadata = f.handler.lookup(&path).await.unwrap();
+            assert_eq!(metadata.kind, crate::handler::EntryKind::File);
+            assert_eq!(metadata.mode, 0o644);
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn outbox_lookup_and_read_reject_non_regular_artifacts() {
+        use std::os::unix::fs::symlink;
+
+        let f = make_handler_with_chain(true);
+        seed_pending(&f, "0001-test");
+        let entry = f
+            .handler
+            .tx_engine
+            .outbox
+            .read_in_state(&f.wallet_name, "anvil", "0001-test", OutboxState::Pending)
+            .unwrap();
+        std::fs::create_dir(entry.dir.join("artifact-dir")).unwrap();
+        let outside = f._tmp.path().join("outside-secret.json");
+        std::fs::write(&outside, b"secret").unwrap();
+        symlink(&outside, entry.dir.join("artifact-link.json")).unwrap();
+
+        for artifact in ["artifact-dir", "artifact-link.json"] {
+            let path = VfsPath::parse(&format!(
+                "/{}/chains/anvil/outbox/pending/0001-test/{artifact}",
+                f.wallet_name
+            ))
+            .unwrap();
+            assert!(matches!(
+                f.handler.lookup(&path).await,
+                Err(HandlerError::NotFound(_))
+            ));
+            assert!(matches!(
+                f.handler.read(&path).await,
+                Err(HandlerError::NotFound(_))
+            ));
+        }
+
+        let directory = VfsPath::parse(&format!(
+            "/{}/chains/anvil/outbox/pending/0001-test",
+            f.wallet_name
+        ))
+        .unwrap();
+        let entries = f.handler.list(&directory).await.unwrap();
+        assert!(!entries.iter().any(|entry| entry.name == "artifact-dir"));
+        assert!(
+            !entries
+                .iter()
+                .any(|entry| entry.name == "artifact-link.json")
+        );
+
+        let intent = entries
+            .iter()
+            .find(|entry| entry.name == "intent.json")
+            .unwrap();
+        assert_eq!(intent.kind, crate::handler::EntryKind::File);
+        assert_eq!(intent.mode, 0o444);
+        for control in ["confirm", "confirm.override", "replace", "cancel"] {
+            let metadata = entries.iter().find(|entry| entry.name == control).unwrap();
+            assert_eq!(metadata.kind, crate::handler::EntryKind::File);
+            assert_eq!(metadata.mode, 0o644);
+        }
     }
 
     /// Fix #9: writing an empty body to `pending/<id>/confirm` must
