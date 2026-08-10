@@ -23,9 +23,13 @@
 //! | `machine.execute` | tagged [`MachineCommand`]        | [`MachineCommandOutput`] |
 //! | `shutdown` | `null`                                | `null`                    |
 //!
-//! Wire framing is one JSON document per line. Encoding/decoding errors
-//! produce a JSON-RPC `-32700` parse-error response and the connection
-//! continues. Unknown methods produce `-32601`. Every request and response
+//! Wire framing is one JSON document per line. Logical documents above the
+//! physical frame limit use ordered base64 chunk envelopes and are capped at
+//! [`MAX_IPC_MESSAGE_BYTES`]. Long-running operations may emit `bloom.output`
+//! notifications containing base64-encoded stdout/stderr bytes before their
+//! final response. Dropping the connection cancels the active operation.
+//! Encoding/decoding errors produce a JSON-RPC `-32700` parse-error response.
+//! Unknown methods produce `-32601`. Every request, response, and notification
 //! carries a `bloom_protocol` range; peers fail closed when the ranges do not
 //! overlap.
 
@@ -34,7 +38,10 @@ use std::future::Future;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::UNIX_EPOCH;
 
 use base64::Engine as _;
@@ -44,15 +51,18 @@ use bloom_vfs::{Entry, EntryKind, Handler, HandlerError, Vfs, VfsPath};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{
+    AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader,
+};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Notify;
 use tracing::{debug, info, trace, warn};
 
-/// Maximum JSON document size on the newline-delimited IPC transport.
-/// Source-build output is capped well below this so successful diagnostic
-/// responses still leave room for package metadata and JSON encoding.
+/// Maximum physical newline-delimited frame and reassembled logical message.
+/// Logical messages above one frame are transported as ordered base64 chunks.
 const MAX_IPC_FRAME_BYTES: usize = 4 * 1024 * 1024;
+const MAX_IPC_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
+const IPC_CHUNK_BYTES: usize = 2 * 1024 * 1024;
 
 /// Current Bloom CLI-to-daemon IPC protocol and the range this build can
 /// decode. Package versions are diagnostic; this range is the compatibility
@@ -136,6 +146,109 @@ where
     }
 }
 
+#[derive(Debug, Deserialize, Serialize)]
+struct IpcChunkEnvelope {
+    bloom_chunk: IpcChunk,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct IpcChunk {
+    sequence: u32,
+    final_chunk: bool,
+    bytes_b64: String,
+}
+
+async fn read_ipc_message<R>(reader: &mut R) -> std::io::Result<Option<Vec<u8>>>
+where
+    R: AsyncBufRead + Unpin,
+{
+    let Some(first) = read_bounded_frame(reader).await? else {
+        return Ok(None);
+    };
+    let Ok(mut envelope) = serde_json::from_slice::<IpcChunkEnvelope>(&first) else {
+        return Ok(Some(first));
+    };
+    let mut message = Vec::new();
+    let mut expected_sequence = 0_u32;
+    loop {
+        if envelope.bloom_chunk.sequence != expected_sequence {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "IPC chunk sequence is not contiguous",
+            ));
+        }
+        let chunk = B64
+            .decode(&envelope.bloom_chunk.bytes_b64)
+            .map_err(|error| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("IPC chunk is not valid base64: {error}"),
+                )
+            })?;
+        if message.len().saturating_add(chunk.len()) > MAX_IPC_MESSAGE_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("IPC message exceeds {MAX_IPC_MESSAGE_BYTES} bytes"),
+            ));
+        }
+        message.extend_from_slice(&chunk);
+        if envelope.bloom_chunk.final_chunk {
+            return Ok(Some(message));
+        }
+        expected_sequence = expected_sequence.checked_add(1).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "IPC chunk sequence overflow",
+            )
+        })?;
+        let next = read_bounded_frame(reader).await?.ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "IPC chunked message ended before its final chunk",
+            )
+        })?;
+        envelope = serde_json::from_slice(&next).map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("invalid IPC chunk envelope: {error}"),
+            )
+        })?;
+    }
+}
+
+async fn write_ipc_message<W>(writer: &mut W, message: &[u8]) -> std::io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    if message.len() > MAX_IPC_MESSAGE_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("IPC message exceeds {MAX_IPC_MESSAGE_BYTES} bytes"),
+        ));
+    }
+    if message.len() <= MAX_IPC_FRAME_BYTES {
+        writer.write_all(message).await?;
+        writer.write_all(b"\n").await?;
+        return writer.flush().await;
+    }
+    let chunks = message.chunks(IPC_CHUNK_BYTES);
+    let chunk_count = chunks.len();
+    for (sequence, chunk) in chunks.enumerate() {
+        let frame = serde_json::to_vec(&IpcChunkEnvelope {
+            bloom_chunk: IpcChunk {
+                sequence: sequence as u32,
+                final_chunk: sequence + 1 == chunk_count,
+                bytes_b64: B64.encode(chunk),
+            },
+        })
+        .expect("IPC chunk envelope serializes");
+        debug_assert!(frame.len() <= MAX_IPC_FRAME_BYTES);
+        writer.write_all(&frame).await?;
+        writer.write_all(b"\n").await?;
+    }
+    writer.flush().await
+}
+
 #[derive(Debug, Error)]
 pub enum IpcError {
     #[error("io: {0}")]
@@ -194,6 +307,34 @@ struct Response {
     result: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<RpcError>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct OutputNotification {
+    jsonrpc: &'static str,
+    method: &'static str,
+    bloom_protocol: IpcProtocolRange,
+    params: OutputNotificationParams,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct OutputNotificationParams {
+    stream: IpcOutputStream,
+    bytes_b64: String,
+}
+
+impl OutputNotification {
+    fn new(event: IpcOutputEvent) -> Self {
+        Self {
+            jsonrpc: "2.0",
+            method: "bloom.output",
+            bloom_protocol: IpcProtocolRange::supported(),
+            params: OutputNotificationParams {
+                stream: event.stream,
+                bytes_b64: B64.encode(event.bytes),
+            },
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -309,7 +450,71 @@ pub trait BatchConfirmationService: Send + Sync {
 /// build, list, and uninstall stay implemented by the IPC server against its
 /// daemon-owned [`PetalRunner`].
 pub trait PetalSourceInstallService: Send + Sync {
-    fn install_source(&self, params: Value) -> Result<Value, String>;
+    fn install_source(&self, params: Value, context: IpcOperationContext) -> Result<Value, String>;
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IpcOutputStream {
+    Stdout,
+    Stderr,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IpcOutputEvent {
+    pub stream: IpcOutputStream,
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Clone)]
+pub struct IpcOperationContext {
+    output: Option<tokio::sync::mpsc::UnboundedSender<IpcOutputEvent>>,
+    cancelled: Arc<AtomicBool>,
+}
+
+impl IpcOperationContext {
+    fn connected(output: tokio::sync::mpsc::UnboundedSender<IpcOutputEvent>) -> Self {
+        Self {
+            output: Some(output),
+            cancelled: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    #[cfg(test)]
+    fn detached() -> Self {
+        Self {
+            output: None,
+            cancelled: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    pub fn emit(&self, stream: IpcOutputStream, bytes: impl Into<Vec<u8>>) -> bool {
+        if self.is_cancelled() {
+            return false;
+        }
+        let Some(output) = &self.output else {
+            return true;
+        };
+        if output
+            .send(IpcOutputEvent {
+                stream,
+                bytes: bytes.into(),
+            })
+            .is_err()
+        {
+            self.cancel();
+            return false;
+        }
+        true
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+
+    fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -514,9 +719,13 @@ impl IpcServer {
         use std::os::unix::fs::PermissionsExt as _;
         std::fs::set_permissions(&staged_socket, std::fs::Permissions::from_mode(0o600))?;
         let identity = verify_socket_security(&staged_socket, rustix::process::geteuid().as_raw())?;
-        let replacing_stale = validate_stale_socket(&target)?;
+        let stale_identity = validate_stale_socket(&target)?;
+        let revalidated_stale_identity = validate_stale_socket(&target)?;
+        if stale_identity != revalidated_stale_identity {
+            return Err(IpcError::EndpointBusy(target));
+        }
         std::fs::rename(&staged_socket, &target)?;
-        if replacing_stale {
+        if stale_identity.is_some() {
             debug!(socket = %target.display(), "ipc.stale_socket_replaced");
         }
         drop(staging);
@@ -580,7 +789,7 @@ impl IpcServer {
         let (rd, mut wr) = stream.into_split();
         let mut rd = BufReader::new(rd);
         loop {
-            let Some(line) = read_bounded_frame(&mut rd).await? else {
+            let Some(line) = read_ipc_message(&mut rd).await? else {
                 return Ok(());
             };
             if line.iter().all(u8::is_ascii_whitespace) {
@@ -591,7 +800,56 @@ impl IpcServer {
                     trace!(method = %wire.request.method, "ipc.request");
                     match wire.bloom_protocol {
                         Some(peer) if IpcProtocolRange::supported().negotiate(peer).is_some() => {
-                            self.dispatch(wire.request).await
+                            let (output_tx, mut output_rx) = tokio::sync::mpsc::unbounded_channel();
+                            let context = IpcOperationContext::connected(output_tx);
+                            let mut dispatched =
+                                Box::pin(self.dispatch_with_context(wire.request, context.clone()));
+                            let mut disconnect = [0_u8; 1];
+                            let response = loop {
+                                tokio::select! {
+                                    biased;
+                                    event = output_rx.recv() => {
+                                        if let Some(event) = event {
+                                            let notification = serde_json::to_vec(
+                                                &OutputNotification::new(event)
+                                            ).expect("IPC output notification serializes");
+                                            if let Err(error) = write_ipc_message(&mut wr, &notification).await {
+                                                context.cancel();
+                                                let _ = dispatched.await;
+                                                return Err(error);
+                                            }
+                                        }
+                                    }
+                                    response = &mut dispatched => break response,
+                                    read = rd.read(&mut disconnect) => {
+                                        match read {
+                                            Ok(0) => {
+                                                context.cancel();
+                                                let _ = dispatched.await;
+                                                return Ok(());
+                                            }
+                                            Ok(_) => {
+                                                context.cancel();
+                                                return Err(std::io::Error::new(
+                                                    std::io::ErrorKind::InvalidData,
+                                                    "pipelined IPC requests are unsupported",
+                                                ));
+                                            }
+                                            Err(error) => {
+                                                context.cancel();
+                                                return Err(error);
+                                            }
+                                        }
+                                    }
+                                }
+                            };
+                            while let Ok(event) = output_rx.try_recv() {
+                                let notification =
+                                    serde_json::to_vec(&OutputNotification::new(event))
+                                        .expect("IPC output notification serializes");
+                                write_ipc_message(&mut wr, &notification).await?;
+                            }
+                            response
                         }
                         Some(peer) => Response::err(
                             wire.request.id,
@@ -613,7 +871,7 @@ impl IpcServer {
                     Response::err(Value::Null, -32700, format!("parse error: {e}"))
                 }
             };
-            let mut out = serde_json::to_vec(&resp).unwrap_or_else(|e| {
+            let out = serde_json::to_vec(&resp).unwrap_or_else(|e| {
                 debug!(error = %e, "ipc.response_serialise_failed");
                 // We cannot echo the request id here (serialisation of the
                 // proper Response already failed, so we may not have a
@@ -622,21 +880,17 @@ impl IpcServer {
                 br#"{"jsonrpc":"2.0","id":null,"error":{"code":-32603,"message":"internal error"}}"#
                     .to_vec()
             });
-            if out.len() > MAX_IPC_FRAME_BYTES {
-                out = serde_json::to_vec(&Response::err(
-                    resp.id.clone(),
-                    -32002,
-                    format!("IPC response exceeds {MAX_IPC_FRAME_BYTES} bytes"),
-                ))
-                .expect("bounded IPC error response serializes");
-            }
-            out.push(b'\n');
-            wr.write_all(&out).await?;
-            wr.flush().await?;
+            write_ipc_message(&mut wr, &out).await?;
         }
     }
 
+    #[cfg(test)]
     async fn dispatch(&self, req: Request) -> Response {
+        self.dispatch_with_context(req, IpcOperationContext::detached())
+            .await
+    }
+
+    async fn dispatch_with_context(&self, req: Request, context: IpcOperationContext) -> Response {
         if !req.jsonrpc.is_empty() && req.jsonrpc != "2.0" {
             debug!(version = %req.jsonrpc, "ipc.dispatch.bad_version");
             return Response::err(req.id, -32600, "jsonrpc must be 2.0");
@@ -694,11 +948,11 @@ impl IpcServer {
                 Ok(v) => Response::ok(id, v),
                 Err(e) => map_handler_err(id, e),
             },
-            "petals.install" => match self.do_petals_install(&req.params).await {
+            "petals.install" => match self.do_petals_install(&req.params, context.clone()).await {
                 Ok(v) => Response::ok(id, v),
                 Err(e) => map_petal_err(id, e),
             },
-            "petals.build" => match self.do_petals_build(&req.params).await {
+            "petals.build" => match self.do_petals_build(&req.params, context).await {
                 Ok(v) => Response::ok(id, v),
                 Err(e) => map_petal_err(id, e),
             },
@@ -811,7 +1065,11 @@ impl IpcServer {
 
     /// `params`: `{ path, ref? }` where path is a package directory,
     /// `.petal.tar`, or trusted remote source URL.
-    async fn do_petals_install(&self, params: &Value) -> Result<Value, PetalError> {
+    async fn do_petals_install(
+        &self,
+        params: &Value,
+        context: IpcOperationContext,
+    ) -> Result<Value, PetalError> {
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
         struct InstallRequest {
@@ -832,7 +1090,10 @@ impl IpcServer {
             let mutation = self.petal_mutation.clone().lock_owned().await;
             return tokio::task::spawn_blocking(move || {
                 let _mutation = mutation;
-                installer.install_source(params)
+                if context.is_cancelled() {
+                    return Err("Petal source install cancelled by disconnected client".to_owned());
+                }
+                installer.install_source(params, context)
             })
             .await
             .map_err(|error| {
@@ -855,6 +1116,11 @@ impl IpcServer {
         let mutation = self.petal_mutation.clone().lock_owned().await;
         tokio::task::spawn_blocking(move || {
             let _mutation = mutation;
+            if context.is_cancelled() {
+                return Err(PetalError::vm(
+                    "Petal install cancelled by disconnected client",
+                ));
+            }
             let is_dir = std::fs::metadata(&path)?.is_dir();
             let package = if is_dir {
                 bloom_petals::package::PreparedPetalPackage::from_dir(&path)?
@@ -867,6 +1133,11 @@ impl IpcServer {
                 .cloned()
                 .unwrap_or_default();
             bloom_petals::package::apply_petal_consent_endpoint_bindings(&mut consent, &bindings)?;
+            if context.is_cancelled() {
+                return Err(PetalError::vm(
+                    "Petal install cancelled by disconnected client",
+                ));
+            }
             let (result, meta, index) = if is_dir {
                 runner.store().install_petal_package_dir(&path)?
             } else {
@@ -887,7 +1158,11 @@ impl IpcServer {
     }
 
     /// `params`: `{ package_dir, out? }`.
-    async fn do_petals_build(&self, params: &Value) -> Result<Value, PetalError> {
+    async fn do_petals_build(
+        &self,
+        params: &Value,
+        context: IpcOperationContext,
+    ) -> Result<Value, PetalError> {
         self.petals()?;
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
@@ -918,14 +1193,29 @@ impl IpcServer {
         let mutation = self.petal_mutation.clone().lock_owned().await;
         tokio::task::spawn_blocking(move || {
             let _mutation = mutation;
+            if context.is_cancelled() {
+                return Err(PetalError::vm(
+                    "Petal build cancelled by disconnected client",
+                ));
+            }
             let package = bloom_petals::package::build_petal_package_dir(&package_dir)?;
             let consent = bloom_petals::package::petal_consent_summary(&package)?;
+            if context.is_cancelled() {
+                return Err(PetalError::vm(
+                    "Petal build cancelled by disconnected client",
+                ));
+            }
             if let Some(out) = output.as_ref() {
                 let parent = out.parent().expect("validated archive has a parent");
                 let mut archive = tempfile::NamedTempFile::new_in(parent)?;
                 package.write_petal_tar(&mut archive)?;
                 archive.flush()?;
                 archive.as_file().sync_all()?;
+                if context.is_cancelled() {
+                    return Err(PetalError::vm(
+                        "Petal build cancelled by disconnected client",
+                    ));
+                }
                 archive.persist(out).map_err(|error| error.error)?;
             }
             Ok(json!({
@@ -1159,12 +1449,12 @@ fn endpoint_lock_path(socket_path: &Path) -> Result<PathBuf, IpcError> {
     Ok(socket_path.with_file_name(std::ffi::OsString::from_vec(lock_name)))
 }
 
-fn validate_stale_socket(socket_path: &Path) -> Result<bool, IpcError> {
+fn validate_stale_socket(socket_path: &Path) -> Result<Option<SocketIdentity>, IpcError> {
     use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
 
     let metadata = match std::fs::symlink_metadata(socket_path) {
         Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error.into()),
     };
     let effective_uid = rustix::process::geteuid().as_raw();
@@ -1174,7 +1464,32 @@ fn validate_stale_socket(socket_path: &Path) -> Result<bool, IpcError> {
             reason: "pre-existing path is not a socket owned by the daemon user".to_owned(),
         });
     }
-    Ok(true)
+    let identity = SocketIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    };
+    match std::os::unix::net::UnixStream::connect(socket_path) {
+        Ok(_) => return Err(IpcError::EndpointBusy(socket_path.to_owned())),
+        Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => {}
+        Err(error) => {
+            return Err(IpcError::InsecureSocket {
+                path: socket_path.to_owned(),
+                reason: format!("cannot prove pre-existing socket is stale: {error}"),
+            });
+        }
+    }
+    let revalidated = std::fs::symlink_metadata(socket_path)?;
+    let revalidated_identity = SocketIdentity {
+        device: revalidated.dev(),
+        inode: revalidated.ino(),
+    };
+    if !revalidated.file_type().is_socket()
+        || revalidated.uid() != effective_uid
+        || revalidated_identity != identity
+    {
+        return Err(IpcError::EndpointBusy(socket_path.to_owned()));
+    }
+    Ok(Some(identity))
 }
 
 fn verify_socket_security(
@@ -1471,6 +1786,8 @@ pub enum IpcClientError {
     Rpc(RpcCallError),
     #[error("invalid IPC response: {0}")]
     Protocol(String),
+    #[error("refusing insecure Bloom daemon endpoint: {0}")]
+    EndpointSecurity(String),
     #[error("incompatible Bloom IPC protocol: client supports {client}, daemon supports {daemon}")]
     Incompatible {
         client: IpcProtocolRange,
@@ -1483,6 +1800,7 @@ pub struct IpcCallResult {
     pub result: Value,
     pub daemon_protocol: IpcProtocolRange,
     pub negotiated_protocol: u32,
+    pub output_events: usize,
 }
 
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
@@ -1513,6 +1831,18 @@ impl IpcClient {
         method: &str,
         params: Value,
     ) -> Result<IpcCallResult, IpcClientError> {
+        self.call_streaming(method, params, |_| Ok(())).await
+    }
+
+    pub async fn call_streaming<F>(
+        &self,
+        method: &str,
+        params: Value,
+        mut on_output: F,
+    ) -> Result<IpcCallResult, IpcClientError>
+    where
+        F: FnMut(IpcOutputEvent) -> std::io::Result<()>,
+    {
         trace!(socket = %self.socket_path.display(), %method, "ipc.client.call");
         let client_protocol = IpcProtocolRange::supported();
         let req = json!({
@@ -1522,23 +1852,79 @@ impl IpcClient {
             "params": params,
             "bloom_protocol": client_protocol,
         });
-        let mut out = serde_json::to_vec(&req).unwrap();
-        if out.len() > MAX_IPC_FRAME_BYTES {
+        let out = serde_json::to_vec(&req).unwrap();
+        if out.len() > MAX_IPC_MESSAGE_BYTES {
             return Err(IpcClientError::Protocol(format!(
-                "IPC request exceeds {MAX_IPC_FRAME_BYTES} bytes"
+                "IPC request exceeds {MAX_IPC_MESSAGE_BYTES} bytes"
             )));
         }
-        out.push(b'\n');
+        match verify_socket_security(&self.socket_path, rustix::process::geteuid().as_raw()) {
+            Ok(_) => {}
+            Err(IpcError::Io(error)) => return Err(IpcClientError::Transport(error)),
+            Err(error) => return Err(IpcClientError::EndpointSecurity(error.to_string())),
+        }
         let stream = UnixStream::connect(&self.socket_path).await?;
+        let observed_uid = stream.peer_cred()?.uid();
+        let expected_uid = rustix::process::geteuid().as_raw();
+        if !peer_uid_allowed(expected_uid, observed_uid) {
+            return Err(IpcClientError::EndpointSecurity(format!(
+                "daemon peer uid mismatch: expected {expected_uid}, observed {observed_uid}"
+            )));
+        }
         let (rd, mut wr) = stream.into_split();
         let mut rd = BufReader::new(rd);
-        wr.write_all(&out).await?;
-        wr.flush().await?;
-        let line = read_bounded_frame(&mut rd).await?.ok_or_else(|| {
-            IpcClientError::Protocol("daemon closed the connection without a response".into())
-        })?;
-        let v: Value = serde_json::from_slice(&line)
-            .map_err(|error| IpcClientError::Protocol(error.to_string()))?;
+        write_ipc_message(&mut wr, &out).await?;
+        let mut output_events = 0_usize;
+        let v = loop {
+            let line = read_ipc_message(&mut rd).await?.ok_or_else(|| {
+                IpcClientError::Protocol("daemon closed the connection without a response".into())
+            })?;
+            let value: Value = serde_json::from_slice(&line)
+                .map_err(|error| IpcClientError::Protocol(error.to_string()))?;
+            if value.get("method").and_then(Value::as_str) == Some("bloom.output") {
+                let notification_protocol = value
+                    .get("bloom_protocol")
+                    .cloned()
+                    .ok_or_else(|| {
+                        IpcClientError::Protocol(
+                            "output notification does not advertise a Bloom IPC protocol version"
+                                .into(),
+                        )
+                    })
+                    .and_then(|value| {
+                        serde_json::from_value::<IpcProtocolRange>(value)
+                            .map_err(|error| IpcClientError::Protocol(error.to_string()))
+                    })?;
+                if client_protocol.negotiate(notification_protocol).is_none() {
+                    return Err(IpcClientError::Incompatible {
+                        client: client_protocol,
+                        daemon: notification_protocol,
+                    });
+                }
+                let params = value.get("params").ok_or_else(|| {
+                    IpcClientError::Protocol("output notification is missing params".into())
+                })?;
+                let stream = serde_json::from_value::<IpcOutputStream>(
+                    params.get("stream").cloned().ok_or_else(|| {
+                        IpcClientError::Protocol("output notification is missing its stream".into())
+                    })?,
+                )
+                .map_err(|error| IpcClientError::Protocol(error.to_string()))?;
+                let bytes =
+                    B64.decode(params.get("bytes_b64").and_then(Value::as_str).ok_or_else(
+                        || {
+                            IpcClientError::Protocol(
+                                "output notification is missing bytes_b64".into(),
+                            )
+                        },
+                    )?)
+                    .map_err(|error| IpcClientError::Protocol(error.to_string()))?;
+                on_output(IpcOutputEvent { stream, bytes })?;
+                output_events = output_events.saturating_add(1);
+                continue;
+            }
+            break value;
+        };
         let daemon_protocol = v
             .get("bloom_protocol")
             .cloned()
@@ -1576,6 +1962,7 @@ impl IpcClient {
             result: v.get("result").cloned().unwrap_or(Value::Null),
             daemon_protocol,
             negotiated_protocol,
+            output_events,
         })
     }
 }
@@ -1585,7 +1972,7 @@ mod tests {
     use super::*;
     use std::sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     };
 
     #[tokio::test]
@@ -1624,7 +2011,7 @@ mod tests {
         let error = client
             .call(
                 "oversized",
-                json!({ "payload": "x".repeat(MAX_IPC_FRAME_BYTES) }),
+                json!({ "payload": "x".repeat(MAX_IPC_MESSAGE_BYTES) }),
             )
             .await
             .unwrap_err();
@@ -1637,6 +2024,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("legacy.sock");
         let listener = UnixListener::bind(&socket).unwrap();
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
         let legacy_daemon = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let (rd, mut wr) = stream.into_split();
@@ -1655,6 +2044,33 @@ mod tests {
         assert!(matches!(error, IpcClientError::Protocol(_)));
         assert!(error.to_string().contains("does not advertise"));
         legacy_daemon.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn chunked_transport_round_trips_messages_above_the_physical_frame_limit() {
+        let message = vec![0xa5; MAX_IPC_FRAME_BYTES + 17];
+        let expected = message.clone();
+        let (mut writer, reader) = tokio::io::duplex(64 * 1024);
+        let writing = tokio::spawn(async move { write_ipc_message(&mut writer, &message).await });
+        let mut reader = BufReader::new(reader);
+        let received = read_ipc_message(&mut reader).await.unwrap().unwrap();
+        writing.await.unwrap().unwrap();
+        assert_eq!(received, expected);
+    }
+
+    #[tokio::test]
+    async fn client_rejects_insecure_socket_metadata_before_sending_a_request() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("insecure.sock");
+        let _listener = UnixListener::bind(&socket).unwrap();
+        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o666)).unwrap();
+        let error = IpcClient::new(&socket)
+            .call("version", Value::Null)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, IpcClientError::EndpointSecurity(_)));
     }
 
     struct MockBatchConfirmation;
@@ -1687,8 +2103,33 @@ mod tests {
         max_active: AtomicUsize,
     }
 
+    struct BlockingSourceInstaller {
+        started: AtomicBool,
+        cancelled: AtomicBool,
+        committed: AtomicBool,
+    }
+
+    impl PetalSourceInstallService for BlockingSourceInstaller {
+        fn install_source(
+            &self,
+            _params: Value,
+            context: IpcOperationContext,
+        ) -> Result<Value, String> {
+            self.started.store(true, Ordering::SeqCst);
+            while !context.is_cancelled() {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            self.cancelled.store(true, Ordering::SeqCst);
+            Err("cancelled before commit".to_owned())
+        }
+    }
+
     impl PetalSourceInstallService for TrackingSourceInstaller {
-        fn install_source(&self, _params: Value) -> Result<Value, String> {
+        fn install_source(
+            &self,
+            _params: Value,
+            _context: IpcOperationContext,
+        ) -> Result<Value, String> {
             let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
             self.max_active.fetch_max(active, Ordering::SeqCst);
             std::thread::sleep(std::time::Duration::from_millis(100));
@@ -1714,6 +2155,25 @@ mod tests {
     struct SingleFileHandler {
         name: String,
         body: Vec<u8>,
+    }
+
+    struct CapturedWriteHandler(tokio::sync::Mutex<Vec<u8>>);
+
+    #[async_trait::async_trait]
+    impl Handler for CapturedWriteHandler {
+        async fn lookup(&self, path: &VfsPath) -> Result<Entry, HandlerError> {
+            Ok(Entry::file(
+                path.segments()
+                    .last()
+                    .map(String::as_str)
+                    .unwrap_or("large"),
+            ))
+        }
+
+        async fn write(&self, _path: &VfsPath, data: &[u8]) -> Result<(), HandlerError> {
+            *self.0.lock().await = data.to_vec();
+            Ok(())
+        }
     }
 
     struct AtomicProjectionHandler {
@@ -1965,7 +2425,7 @@ mod tests {
     }
 
     #[test]
-    fn peer_uid_policy_accepts_only_the_effective_uid() {
+    fn peer_uid_policy_protects_both_server_and_client_directions() {
         assert!(peer_uid_allowed(501, 501));
         assert!(!peer_uid_allowed(501, 0));
         assert!(!peer_uid_allowed(501, 502));
@@ -1986,6 +2446,26 @@ mod tests {
             .unwrap_err();
         assert!(matches!(error, IpcError::InsecureSocket { .. }));
         assert_eq!(std::fs::read(&socket).unwrap(), b"do not remove");
+    }
+
+    #[tokio::test]
+    async fn server_refuses_to_replace_an_independently_bound_live_listener() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("independent.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let inode = std::fs::symlink_metadata(&socket).unwrap().ino();
+
+        let error = IpcServer::new(vfs(), "replacement", vec![])
+            .serve(&socket)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, IpcError::EndpointBusy(_)));
+        assert_eq!(std::fs::symlink_metadata(&socket).unwrap().ino(), inode);
+        assert!(std::os::unix::net::UnixStream::connect(&socket).is_ok());
+        drop(listener);
     }
 
     #[tokio::test]
@@ -2684,6 +3164,63 @@ summary = "Demo app used by IPC tests."
     }
 
     #[tokio::test]
+    async fn disconnect_cancels_blocked_source_install_before_commit() {
+        let installer = Arc::new(BlockingSourceInstaller {
+            started: AtomicBool::new(false),
+            cancelled: AtomicBool::new(false),
+            committed: AtomicBool::new(false),
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("private-run/bloom.sock");
+        let server =
+            IpcServer::new(vfs(), "0", vec![]).with_petal_source_installer(installer.clone());
+        let serving = server.clone();
+        let serving_socket = socket.clone();
+        let server_task =
+            tokio::spawn(async move { serving.serve(&serving_socket).await.unwrap() });
+        for _ in 0..100 {
+            if socket.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        let client = IpcClient::new(&socket);
+        let install_task = tokio::spawn(async move {
+            client
+                .call(
+                    "petals.install",
+                    json!({"path": "https://github.com/bloom-directory/blocked"}),
+                )
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !installer.started.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        install_task.abort();
+        let _ = install_task.await;
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !installer.cancelled.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!installer.committed.load(Ordering::SeqCst));
+
+        server.trigger_shutdown();
+        tokio::time::timeout(std::time::Duration::from_secs(2), server_task)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn end_to_end_over_uds() {
         let dir = tempfile::tempdir().unwrap();
         let sock = dir.path().join("private-run/bloom.sock");
@@ -2733,6 +3270,86 @@ summary = "Demo app used by IPC tests."
 
         let _ = client.call("shutdown", Value::Null).await;
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
+    }
+
+    #[tokio::test]
+    async fn vfs_read_succeeds_below_and_above_the_single_frame_base64_threshold() {
+        let effective_threshold = MAX_IPC_FRAME_BYTES / 4 * 3;
+        for size in [
+            effective_threshold - 64 * 1024,
+            effective_threshold + 64 * 1024,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let socket = dir.path().join("private-run/bloom.sock");
+            let body = vec![0x5a; size];
+            let vfs = Vfs::builder()
+                .mount(
+                    "stub",
+                    Arc::new(SingleFileHandler::new("large", body.clone())),
+                )
+                .build();
+            let server = IpcServer::new(vfs, "0", vec![]);
+            let serving = server.clone();
+            let serving_socket = socket.clone();
+            let handle = tokio::spawn(async move { serving.serve(&serving_socket).await.unwrap() });
+            for _ in 0..100 {
+                if socket.exists() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            let result = IpcClient::new(&socket)
+                .call("read", json!({"path": "/stub/large"}))
+                .await
+                .unwrap();
+            assert_eq!(
+                B64.decode(result["bytes_b64"].as_str().unwrap()).unwrap(),
+                body
+            );
+            IpcClient::new(&socket)
+                .call("shutdown", Value::Null)
+                .await
+                .unwrap();
+            handle.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn vfs_write_succeeds_above_the_single_frame_base64_threshold() {
+        let size = MAX_IPC_FRAME_BYTES / 4 * 3 + 64 * 1024;
+        let body = vec![0x5a; size];
+        let handler = Arc::new(CapturedWriteHandler(tokio::sync::Mutex::new(Vec::new())));
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("private-run/bloom.sock");
+        let server = IpcServer::new(
+            Vfs::builder().mount("capture", handler.clone()).build(),
+            "0",
+            vec![],
+        );
+        let serving = server.clone();
+        let serving_socket = socket.clone();
+        let server_task =
+            tokio::spawn(async move { serving.serve(&serving_socket).await.unwrap() });
+        for _ in 0..100 {
+            if socket.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        IpcClient::new(&socket)
+            .call(
+                "write",
+                json!({"path": "/capture/large", "bytes_b64": B64.encode(&body)}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(&*handler.0.lock().await, &body);
+        IpcClient::new(&socket)
+            .call("shutdown", Value::Null)
+            .await
+            .unwrap();
+        server_task.await.unwrap();
     }
 
     #[tokio::test]

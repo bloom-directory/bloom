@@ -27,9 +27,10 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
 use bloom_daemon::Daemon;
 use bloom_daemon::ipc::{
-    IpcClient, IpcClientError, IpcProtocolRange, IpcServer, MachineCeremonyAction, MachineCommand,
-    MachineCommandFuture, MachineCommandOutput, MachineCommandService, MachineCustodyKind,
-    MachineError, MachineErrorKind, MachineOperationAction, default_socket_path,
+    IpcCallResult, IpcClient, IpcClientError, IpcOutputEvent, IpcOutputStream, IpcProtocolRange,
+    IpcServer, MachineCeremonyAction, MachineCommand, MachineCommandFuture, MachineCommandOutput,
+    MachineCommandService, MachineCustodyKind, MachineError, MachineErrorKind,
+    MachineOperationAction, default_socket_path,
 };
 use bloom_machine_client::MachineJournalHeadProvider;
 use bloom_proto::{AuditIdentity, AuditLog, HomeDir, HomeWritePermit};
@@ -2133,40 +2134,69 @@ async fn try_ipc(
 ) -> std::io::Result<serde_json::Value> {
     match client.call(method, params).await {
         Ok(v) => Ok(v),
-        Err(IpcClientError::Rpc(error)) => Err(std::io::Error::other(error)),
-        Err(IpcClientError::Transport(e)) if e.kind() == std::io::ErrorKind::NotFound => {
-            Err(std::io::Error::new(
+        Err(error) => Err(map_ipc_client_error(endpoint, error)),
+    }
+}
+
+async fn try_ipc_streaming<F>(
+    client: &IpcClient,
+    endpoint: &ResolvedEndpoint,
+    method: &str,
+    params: serde_json::Value,
+    on_output: F,
+) -> std::io::Result<IpcCallResult>
+where
+    F: FnMut(IpcOutputEvent) -> std::io::Result<()>,
+{
+    client
+        .call_streaming(method, params, on_output)
+        .await
+        .map_err(|error| map_ipc_client_error(endpoint, error))
+}
+
+fn map_ipc_client_error(endpoint: &ResolvedEndpoint, error: IpcClientError) -> std::io::Error {
+    match error {
+        IpcClientError::Rpc(error) => std::io::Error::other(error),
+        IpcClientError::Transport(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            std::io::Error::new(
                 e.kind(),
                 format!(
                     "Bloom daemon endpoint {} is not available: {e}; start it with 'bloom serve'",
                     endpoint.display
                 ),
-            ))
+            )
         }
-        Err(IpcClientError::Transport(e)) if is_endpoint_permission_denial(&e) => {
-            Err(endpoint_connection_error(&endpoint.display, e))
+        IpcClientError::Transport(e) if is_endpoint_permission_denial(&e) => {
+            endpoint_connection_error(&endpoint.display, e)
         }
-        Err(IpcClientError::Transport(e)) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
-            Err(std::io::Error::other(format!(
+        IpcClientError::Transport(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
+            std::io::Error::other(format!(
                 "Bloom daemon endpoint {} is not responding: {e}; start it with 'bloom serve'",
                 endpoint.display,
-            )))
+            ))
         }
-        Err(IpcClientError::Transport(e)) => Err(endpoint_connection_error(&endpoint.display, e)),
-        Err(IpcClientError::Protocol(message)) => Err(std::io::Error::new(
+        IpcClientError::Transport(e) => endpoint_connection_error(&endpoint.display, e),
+        IpcClientError::Protocol(message) => std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!(
                 "Bloom daemon endpoint {} returned {message}",
                 endpoint.display
             ),
-        )),
-        Err(error @ IpcClientError::Incompatible { .. }) => Err(std::io::Error::new(
+        ),
+        IpcClientError::EndpointSecurity(message) => std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "Bloom daemon endpoint {} is insecure: {message}",
+                endpoint.display
+            ),
+        ),
+        error @ IpcClientError::Incompatible { .. } => std::io::Error::new(
             std::io::ErrorKind::Unsupported,
             format!(
                 "Bloom daemon endpoint {} rejected: {error}",
                 endpoint.display
             ),
-        )),
+        ),
     }
 }
 
@@ -2298,7 +2328,10 @@ async fn run(cli: Cli) -> Result<()> {
         !cli.version || cli.cmd.is_none(),
         "--version cannot be combined with a command"
     );
-    let (connect, ipc_socket) = if cli.connect.is_some() {
+    let lifecycle_command = matches!(cli.cmd.as_ref(), Some(Cmd::Init { .. } | Cmd::Serve { .. }));
+    let (connect, ipc_socket) = if lifecycle_command {
+        (None, None)
+    } else if cli.connect.is_some() {
         (cli.connect, None)
     } else if cli.ipc_socket.is_some() {
         (None, cli.ipc_socket)
@@ -2317,8 +2350,12 @@ async fn run(cli: Cli) -> Result<()> {
         }
         None => HomeDir::resolve("~/.bloom").context("resolving home dir")?,
     };
-    let client_endpoint = resolve_client_endpoint(&home, connect.as_deref(), ipc_socket.as_deref())
-        .context("resolve Bloom endpoint")?;
+    let client_endpoint = if lifecycle_command {
+        ResolvedEndpoint::default_for_home(&home)
+    } else {
+        resolve_client_endpoint(&home, connect.as_deref(), ipc_socket.as_deref())
+            .context("resolve Bloom endpoint")?
+    };
     trace!(cmd = ?cli.cmd, home = %home.root().display(), "cli.dispatch");
 
     if cli.version {
@@ -3025,7 +3062,11 @@ struct CanonicalPetalSourceInstaller {
 }
 
 impl bloom_daemon::ipc::PetalSourceInstallService for CanonicalPetalSourceInstaller {
-    fn install_source(&self, params: serde_json::Value) -> Result<serde_json::Value, String> {
+    fn install_source(
+        &self,
+        params: serde_json::Value,
+        context: bloom_daemon::ipc::IpcOperationContext,
+    ) -> Result<serde_json::Value, String> {
         let path = params
             .get("path")
             .and_then(serde_json::Value::as_str)
@@ -3036,19 +3077,20 @@ impl bloom_daemon::ipc::PetalSourceInstallService for CanonicalPetalSourceInstal
             .ok_or_else(|| {
                 "trusted source installer requires a GitHub repository URL".to_owned()
             })?;
-        let installed = match github_source::install_github_source(
+        let installed = match github_source::install_github_source_streaming(
             &self.home,
             &self.daemon,
             &repo,
             requested_ref,
+            &context,
         ) {
             Ok(installed) => installed,
             Err(error) => {
                 if let Some(failure) = github_source::source_install_failure(&error) {
                     return Ok(serde_json::json!({
                         "progress_lines": failure.progress,
-                        "build_stdout": failure.stdout,
-                        "build_stderr": failure.stderr,
+                        "build_stdout_b64": B64.encode(&failure.stdout),
+                        "build_stderr_b64": B64.encode(&failure.stderr),
                         "completion_progress_lines": failure.completion_progress,
                         "operation_error": failure.message,
                     }));
@@ -3071,8 +3113,8 @@ impl bloom_daemon::ipc::PetalSourceInstallService for CanonicalPetalSourceInstal
             "source": format!("{}/{}@{}", installed.provenance.owner, installed.provenance.repo, selected),
             "resolved_commit": installed.provenance.resolved_commit,
             "progress_lines": installed.progress,
-            "build_stdout": installed.build_stdout,
-            "build_stderr": installed.build_stderr,
+            "build_stdout_b64": B64.encode(&installed.build_stdout),
+            "build_stderr_b64": B64.encode(&installed.build_stderr),
             "completion_progress_lines": installed.completion_progress,
             "consent_lines": petal_consent_lines(&installed.consent),
         }))
@@ -3110,20 +3152,35 @@ fn print_ipc_lines(value: &serde_json::Value, field: &str) -> Result<()> {
 
 fn print_ipc_captured_build_output(value: &serde_json::Value) -> Result<()> {
     if let Some(stdout) = value
-        .get("build_stdout")
+        .get("build_stdout_b64")
         .and_then(serde_json::Value::as_str)
     {
-        std::io::Write::write_all(&mut std::io::stdout(), stdout.as_bytes())?;
+        let bytes = B64.decode(stdout).context("decode captured build stdout")?;
+        std::io::Write::write_all(&mut std::io::stdout(), &bytes)?;
         std::io::Write::flush(&mut std::io::stdout())?;
     }
     if let Some(stderr) = value
-        .get("build_stderr")
+        .get("build_stderr_b64")
         .and_then(serde_json::Value::as_str)
     {
-        std::io::Write::write_all(&mut std::io::stderr(), stderr.as_bytes())?;
+        let bytes = B64.decode(stderr).context("decode captured build stderr")?;
+        std::io::Write::write_all(&mut std::io::stderr(), &bytes)?;
         std::io::Write::flush(&mut std::io::stderr())?;
     }
     Ok(())
+}
+
+fn write_ipc_output_event(event: IpcOutputEvent) -> std::io::Result<()> {
+    match event.stream {
+        IpcOutputStream::Stdout => {
+            std::io::Write::write_all(&mut std::io::stdout(), &event.bytes)?;
+            std::io::Write::flush(&mut std::io::stdout())
+        }
+        IpcOutputStream::Stderr => {
+            std::io::Write::write_all(&mut std::io::stderr(), &event.bytes)?;
+            std::io::Write::flush(&mut std::io::stderr())
+        }
+    }
 }
 
 fn absolute_cli_path(path: &str) -> Result<PathBuf> {
@@ -3173,14 +3230,23 @@ async fn run_petals(endpoint: &ResolvedEndpoint, cmd: PetalsCmd) -> Result<()> {
                 let local = absolute_cli_path(&path)?;
                 serde_json::json!({ "path": local, "ref": null })
             };
-            let result = try_ipc(&client, endpoint, "petals.install", params)
-                .await
-                .with_context(|| format!("ipc petals install via {}", endpoint.display))?;
-            if result.get("progress_lines").is_some() {
+            let reply = try_ipc_streaming(
+                &client,
+                endpoint,
+                "petals.install",
+                params,
+                write_ipc_output_event,
+            )
+            .await
+            .with_context(|| format!("ipc petals install via {}", endpoint.display))?;
+            let result = reply.result;
+            if reply.output_events == 0 && result.get("progress_lines").is_some() {
                 print_ipc_lines(&result, "progress_lines")?;
             }
-            print_ipc_captured_build_output(&result)?;
-            if result.get("completion_progress_lines").is_some() {
+            if reply.output_events == 0 {
+                print_ipc_captured_build_output(&result)?;
+            }
+            if reply.output_events == 0 && result.get("completion_progress_lines").is_some() {
                 print_ipc_lines(&result, "completion_progress_lines")?;
             }
             if let Some(error) = result

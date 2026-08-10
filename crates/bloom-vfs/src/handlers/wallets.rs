@@ -31,6 +31,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use bloom_broker_api::ProtocolErrorCode;
 use bloom_evm::ChainRegistry;
 use bloom_machine_client::WalletProjection;
 use bloom_machine_client::{MachineBrokerClient, WalletProjectionReader};
@@ -83,7 +84,7 @@ struct ApprovalCeremonyProjection {
     response: bloom_broker_api::SealedApprovalPrepareResponse,
 }
 
-#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 struct WalletRegistrationProjection {
     schema: String,
@@ -209,17 +210,28 @@ impl WalletsHandler {
             .map_err(|error| HandlerError::backend(error.to_string()))
     }
 
-    async fn wallet_projection_list(&self) -> Vec<WalletProjection> {
+    async fn wallet_projection_list(&self) -> Result<Vec<WalletProjection>, HandlerError> {
         let Some(projections) = &self.wallet_projections else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
         match projections.list_wallets().await {
-            Ok(wallets) => wallets,
+            Ok(wallets) => Ok(wallets),
             // Root directory enumeration is navigation, not an authority
             // decision. Prefer a previously authenticated cache when the live
             // edge is unavailable, and keep `new`/`registrations` reachable
             // even if no safe cached projection remains.
-            Err(_) => projections.cached_wallets().unwrap_or_default(),
+            Err(error) if error.code == ProtocolErrorCode::ServiceUnavailable => {
+                match projections.cached_wallets() {
+                    Ok(wallets) => Ok(wallets),
+                    Err(cache_error)
+                        if cache_error.code == ProtocolErrorCode::ServiceUnavailable =>
+                    {
+                        Ok(Vec::new())
+                    }
+                    Err(cache_error) => Err(HandlerError::backend(cache_error.to_string())),
+                }
+            }
+            Err(error) => Err(HandlerError::backend(error.to_string())),
         }
     }
 
@@ -390,6 +402,37 @@ impl WalletsHandler {
                     "Machine wallet registration projection identity is invalid",
                 ));
             }
+            if let Some(existing_index) = records.iter().position(
+                |(_, existing): &(std::path::PathBuf, WalletRegistrationProjection)| {
+                    existing.requested_name == projection.requested_name
+                },
+            ) {
+                let canonical_path = self.registration_path(&projection.requested_name);
+                let (existing_path, existing_projection) = &records[existing_index];
+                if existing_projection != &projection
+                    || existing_projection.operation_id != projection.operation_id
+                    || (existing_path != &canonical_path && path != canonical_path)
+                {
+                    return Err(HandlerError::backend(
+                        "multiple wallet registration projections claim the same petname",
+                    ));
+                }
+                let legacy_path = if path == canonical_path {
+                    let legacy = existing_path.clone();
+                    records[existing_index] = (path, projection);
+                    legacy
+                } else {
+                    path
+                };
+                if let Err(error) = std::fs::remove_file(&legacy_path) {
+                    tracing::warn!(
+                        path = %legacy_path.display(),
+                        %error,
+                        "wallet_registration.legacy_duplicate_cleanup_failed"
+                    );
+                }
+                continue;
+            }
             records.push((path, projection));
         }
         Ok(records)
@@ -556,22 +599,6 @@ impl WalletsHandler {
         requested_name: &str,
     ) -> Result<WalletRegistrationProjection, HandlerError> {
         let (path, mut projection) = self.registration_record(requested_name)?;
-        if projection.ceremony_state == bloom_broker_api::CeremonyState::AwaitingUser
-            && projection
-                .ceremony_expires_at_ms
-                .as_ref()
-                .is_some_and(|expires_at| expires_at.get() <= now_ms_u64())
-        {
-            // Ceremony launch data is already bound to a trusted expiry. Do
-            // not turn an expired, persisted registration into filesystem EIO
-            // merely because the Broker no longer retains the operation (for
-            // example after restarting a local development triad).
-            projection.ceremony_state = bloom_broker_api::CeremonyState::Expired;
-            projection.ceremony_url = None;
-            projection.ceremony_expires_at_ms = None;
-            write_atomic_json(&path, &projection)?;
-            return Ok(projection);
-        }
         if matches!(
             projection.ceremony_state,
             bloom_broker_api::CeremonyState::Completed
@@ -582,11 +609,30 @@ impl WalletsHandler {
         ) {
             return Ok(projection);
         }
-        let status = self
+        let local_launch_expired = projection
+            .ceremony_expires_at_ms
+            .as_ref()
+            .is_some_and(|expires_at| expires_at.get() <= now_ms_u64());
+        let status = match self
             .custody_broker()?
             .ceremony_status(projection.operation_id.clone())
             .await
-            .map_err(|error| HandlerError::backend(error.to_string()))?;
+        {
+            Ok(status) => status,
+            Err(error)
+                if local_launch_expired && error.code == ProtocolErrorCode::ServiceUnavailable =>
+            {
+                // Never infer a terminal result from the launch deadline. The
+                // owner may have completed at the boundary while Broker was
+                // becoming unavailable. Remove only the stale bearer URL and
+                // retain the operation for a later authoritative retry.
+                projection.ceremony_url = None;
+                projection.ceremony_expires_at_ms = None;
+                write_atomic_json(&path, &projection)?;
+                return Err(HandlerError::backend(error.to_string()));
+            }
+            Err(error) => return Err(HandlerError::backend(error.to_string())),
+        };
         if status.operation_id != projection.operation_id
             || status.ceremony_kind != bloom_broker_api::CeremonyKind::WalletRegistration
         {
@@ -2322,7 +2368,7 @@ impl WalletsHandler {
         if segs.is_empty() {
             let mut out: Vec<Entry> = self
                 .wallet_projection_list()
-                .await
+                .await?
                 .into_iter()
                 .map(|projection| Entry::dir(projection.wallet.wallet_id.as_str()))
                 .collect();
@@ -3015,6 +3061,7 @@ mod tests {
         requests: Mutex<Vec<MachineBrokerRequest>>,
         state: Mutex<CeremonyState>,
         omit_ceremony_url: Mutex<bool>,
+        status_error: Mutex<Option<ProtocolErrorCode>>,
     }
 
     impl MachineBrokerService for RegistrationBroker {
@@ -3037,6 +3084,12 @@ mod tests {
                         }),
                     ),
                     MachineBrokerRequest::CeremonyStatus(request) => {
+                        if let Some(code) = *self.status_error.lock().unwrap() {
+                            return Err(ProtocolError::new(
+                                code,
+                                "registration status unavailable",
+                            ));
+                        }
                         let state = *self.state.lock().unwrap();
                         let omit_ceremony_url = *self.omit_ceremony_url.lock().unwrap();
                         Ok(MachineBrokerResponse::CeremonyStatus(
@@ -3097,6 +3150,31 @@ mod tests {
     struct StaticProjection(WalletProjection);
 
     struct UnavailableProjection;
+
+    struct IntegrityFailureProjection(Arc<dyn WalletProjectionReader>);
+
+    #[async_trait]
+    impl WalletProjectionReader for IntegrityFailureProjection {
+        async fn list_wallets(
+            &self,
+        ) -> Result<Vec<WalletProjection>, bloom_broker_api::ProtocolError> {
+            Err(ProtocolError::new(
+                ProtocolErrorCode::MalformedFrame,
+                "wallet projection identity is invalid",
+            ))
+        }
+
+        async fn get_wallet(
+            &self,
+            wallet_id: &Token,
+        ) -> Result<WalletProjection, bloom_broker_api::ProtocolError> {
+            self.0.get_wallet(wallet_id).await
+        }
+
+        fn cached_wallets(&self) -> Result<Vec<WalletProjection>, bloom_broker_api::ProtocolError> {
+            self.0.cached_wallets()
+        }
+    }
 
     #[async_trait]
     impl WalletProjectionReader for UnavailableProjection {
@@ -3590,12 +3668,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn wallet_root_does_not_mask_projection_integrity_failures_with_cached_wallets() {
+        let mut f = make_handler();
+        let cached = f.handler.wallet_projections.take().unwrap();
+        f.handler.wallet_projections = Some(Arc::new(IntegrityFailureProjection(cached)));
+        let error = f
+            .handler
+            .list(&VfsPath::parse("/").unwrap())
+            .await
+            .unwrap_err();
+        assert!(matches!(error, HandlerError::Backend(_)));
+        assert!(
+            error
+                .to_string()
+                .contains("wallet projection identity is invalid")
+        );
+    }
+
+    #[tokio::test]
     async fn mounted_registration_accepts_a_trimmed_plain_name() {
         let mut fixture = make_handler();
         let broker = Arc::new(RegistrationBroker {
             requests: Mutex::new(Vec::new()),
             state: Mutex::new(CeremonyState::AwaitingUser),
             omit_ceremony_url: Mutex::new(false),
+            status_error: Mutex::new(None),
         });
         fixture.handler = fixture
             .handler
@@ -3779,7 +3876,7 @@ mod tests {
         completion_projection.ceremony_state = CeremonyState::AwaitingUser;
         completion_projection.ceremony_url =
             Some("http://localhost:18734/ceremony/registration-secret".into());
-        completion_projection.ceremony_expires_at_ms = Some(DecimalU64::new(u64::MAX));
+        completion_projection.ceremony_expires_at_ms = Some(DecimalU64::new(1));
         write_atomic_json(&projection_path, &completion_projection).unwrap();
         *broker.state.lock().unwrap() = CeremonyState::Completed;
         let _: serde_json::Value =
@@ -3822,6 +3919,7 @@ mod tests {
         expired_projection.ceremony_url = Some("http://localhost:18734/ceremony/expired".into());
         expired_projection.ceremony_expires_at_ms = Some(DecimalU64::new(1));
         write_atomic_json(&projection_path, &expired_projection).unwrap();
+        *broker.state.lock().unwrap() = CeremonyState::Expired;
         let requests_before_expiry_reconciliation = broker.requests.lock().unwrap().len();
 
         let expired: serde_json::Value =
@@ -3830,15 +3928,15 @@ mod tests {
         assert!(expired["ceremony_url"].is_null());
         assert_eq!(
             broker.requests.lock().unwrap().len(),
-            requests_before_expiry_reconciliation,
-            "trusted local expiry must reconcile without a Broker request"
+            requests_before_expiry_reconciliation + 1,
+            "local expiry must reconcile with Broker before becoming terminal"
         );
         let expired_again: serde_json::Value =
             serde_json::from_slice(&fixture.handler.read(&status_path).await.unwrap()).unwrap();
         assert_eq!(expired_again["ceremony_state"], "EXPIRED");
         assert_eq!(
             broker.requests.lock().unwrap().len(),
-            requests_before_expiry_reconciliation,
+            requests_before_expiry_reconciliation + 1,
             "persisted terminal status must not be refreshed from the Broker"
         );
     }
@@ -3850,6 +3948,7 @@ mod tests {
             requests: Mutex::new(Vec::new()),
             state: Mutex::new(CeremonyState::AwaitingUser),
             omit_ceremony_url: Mutex::new(false),
+            status_error: Mutex::new(None),
         });
         fixture.handler = fixture
             .handler
@@ -3878,12 +3977,97 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn identical_canonical_and_legacy_registration_records_recover_after_crash() {
+        let mut fixture = make_handler();
+        let broker = Arc::new(RegistrationBroker {
+            requests: Mutex::new(Vec::new()),
+            state: Mutex::new(CeremonyState::AwaitingUser),
+            omit_ceremony_url: Mutex::new(false),
+            status_error: Mutex::new(None),
+        });
+        fixture.handler = fixture
+            .handler
+            .with_broker(Some(MachineBrokerClient::new(broker.clone())));
+        fixture
+            .handler
+            .write(&VfsPath::parse("/new").unwrap(), b"main")
+            .await
+            .unwrap();
+
+        let canonical = fixture.handler.registration_path("main");
+        let projection: WalletRegistrationProjection = read_json(&canonical).unwrap();
+        let legacy = fixture
+            .handler
+            .registration_path(projection.operation_id.as_str());
+        std::fs::copy(&canonical, &legacy).unwrap();
+
+        let entries = fixture
+            .handler
+            .list(&VfsPath::parse("/registrations").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "main");
+        assert!(canonical.is_file());
+        assert!(!legacy.exists());
+        assert_eq!(
+            broker
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|request| matches!(
+                    request,
+                    MachineBrokerRequest::WalletRegistrationPrepare(_)
+                ))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_registration_clears_stale_url_but_stays_retryable_when_broker_is_unavailable()
+    {
+        let mut fixture = make_handler();
+        let broker = Arc::new(RegistrationBroker {
+            requests: Mutex::new(Vec::new()),
+            state: Mutex::new(CeremonyState::AwaitingUser),
+            omit_ceremony_url: Mutex::new(false),
+            status_error: Mutex::new(None),
+        });
+        fixture.handler = fixture
+            .handler
+            .with_broker(Some(MachineBrokerClient::new(broker.clone())));
+        fixture
+            .handler
+            .write(&VfsPath::parse("/new").unwrap(), b"main")
+            .await
+            .unwrap();
+        let (path, mut projection) = fixture.handler.registration_record("main").unwrap();
+        projection.ceremony_expires_at_ms = Some(DecimalU64::new(1));
+        write_atomic_json(&path, &projection).unwrap();
+        *broker.status_error.lock().unwrap() = Some(ProtocolErrorCode::ServiceUnavailable);
+
+        let error = fixture
+            .handler
+            .read(&VfsPath::parse("/registrations/main/status.json").unwrap())
+            .await
+            .unwrap_err();
+        assert!(matches!(error, HandlerError::Backend(_)));
+        let retained: WalletRegistrationProjection = read_json(&path).unwrap();
+        assert_eq!(retained.ceremony_state, CeremonyState::AwaitingUser);
+        assert!(retained.ceremony_url.is_none());
+        assert!(retained.ceremony_expires_at_ms.is_none());
+    }
+
+    #[tokio::test]
     async fn mounted_registration_accepts_a_64_character_name() {
         let mut fixture = make_handler();
         let broker = Arc::new(RegistrationBroker {
             requests: Mutex::new(Vec::new()),
             state: Mutex::new(CeremonyState::AwaitingUser),
             omit_ceremony_url: Mutex::new(false),
+            status_error: Mutex::new(None),
         });
         fixture.handler = fixture
             .handler

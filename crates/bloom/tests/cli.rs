@@ -18,6 +18,7 @@ use std::time::{Duration, UNIX_EPOCH};
 
 use assert_cmd::Command;
 use async_trait::async_trait;
+use base64::Engine as _;
 use bloom_broker_api::{
     Base64UrlBytes, CanonicalWalletPolicy, CryptoSuite, DecimalU64, Digest32, KeyPublic, KeyRef,
     KeyRole, KeySpec, SignedPolicySnapshot, Token, WalletPublic,
@@ -625,7 +626,11 @@ fn spawn_petals_ipc_server(
 struct TestPetalSourceInstaller;
 
 impl bloom_daemon::ipc::PetalSourceInstallService for TestPetalSourceInstaller {
-    fn install_source(&self, params: serde_json::Value) -> Result<serde_json::Value, String> {
+    fn install_source(
+        &self,
+        params: serde_json::Value,
+        _context: bloom_daemon::ipc::IpcOperationContext,
+    ) -> Result<serde_json::Value, String> {
         let path = params["path"].as_str().unwrap_or_default();
         if path.contains("github.com/not-bloom/") {
             return Err("unsupported GitHub owner".to_owned());
@@ -649,8 +654,8 @@ impl bloom_daemon::ipc::PetalSourceInstallService for TestPetalSourceInstaller {
                     "Resolved commit: 0123456789abcdef",
                     "Building source package..."
                 ],
-                "build_stdout": "{\"routes\": 95}\n",
-                "build_stderr": "build warning\n",
+                "build_stdout_b64": base64::engine::general_purpose::STANDARD.encode(b"{\"routes\": 95}\n"),
+                "build_stderr_b64": base64::engine::general_purpose::STANDARD.encode(b"build warning\n"),
                 "completion_progress_lines": ["Validating Petal package..."],
                 "consent_lines": ["consent:", "  docs: README.md"]
             }));
@@ -669,8 +674,8 @@ impl bloom_daemon::ipc::PetalSourceInstallService for TestPetalSourceInstaller {
                     "Resolved commit: deadbeef",
                     "Building source package..."
                 ],
-                "build_stdout": String::from_utf8_lossy(&output.stdout),
-                "build_stderr": String::from_utf8_lossy(&output.stderr),
+                "build_stdout_b64": base64::engine::general_purpose::STANDARD.encode(&output.stdout),
+                "build_stderr_b64": base64::engine::general_purpose::STANDARD.encode(&output.stderr),
                 "operation_error": format!("build command failed: scripts/build.sh (status {})", output.status),
             }));
         }
@@ -1385,12 +1390,14 @@ fn vfs_explicit_missing_endpoint_fails_closed() {
 #[cfg(unix)]
 #[test]
 fn refused_endpoint_is_never_unlinked_by_a_client() {
+    use std::os::unix::fs::PermissionsExt as _;
     use std::os::unix::net::UnixListener;
 
     let home = fresh_home();
     let socket = home.path().join("run/refused.sock");
     std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
     let listener = UnixListener::bind(&socket).unwrap();
+    std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
     drop(listener);
     let endpoint = format!("unix:{}", socket.display());
 
@@ -1461,6 +1468,50 @@ fn connect_flag_beats_rpc_endpoint_env() {
             predicate::str::contains(flag_socket.display().to_string())
                 .and(predicate::str::contains(env_socket.display().to_string()).not()),
         );
+}
+
+#[test]
+fn lifecycle_commands_ignore_invalid_client_endpoint_configuration() {
+    let home = fresh_home();
+    let home_dir = bloom_proto::HomeDir::at(home.path());
+    let mut config = bloom_proto::Config::local_default();
+    config.petals.preinstalled.clear();
+    config.save(&home_dir.config_path()).unwrap();
+    bloom_cmd(home.path())
+        .env("BLOOM_RPC_ENDPOINT", "tcp:invalid")
+        .arg("init")
+        .assert()
+        .success();
+
+    let binary = Command::cargo_bin("bloom").expect("locate bloom binary");
+    let mut child = std::process::Command::new(binary.get_program())
+        .env("BLOOM_HOME", home.path())
+        .env("BLOOM_RPC_ENDPOINT", "tcp:invalid")
+        .env("RUST_LOG", "error")
+        .env(bloom_update::DISABLE_AUTO_CHECK_ENV, "1")
+        .arg("serve")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("start Bloom daemon with invalid client endpoint configuration");
+    let socket = bloom_daemon::ipc::default_socket_path(home.path());
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while std::time::Instant::now() < deadline && !ipc_endpoint_accepting(&socket) {
+        if child.try_wait().unwrap().is_some() {
+            let mut stderr = String::new();
+            child
+                .stderr
+                .take()
+                .unwrap()
+                .read_to_string(&mut stderr)
+                .unwrap();
+            panic!("lifecycle daemon exited before binding its socket: {stderr}");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(ipc_endpoint_accepting(&socket));
+    child.kill().unwrap();
+    child.wait().unwrap();
 }
 
 #[test]
