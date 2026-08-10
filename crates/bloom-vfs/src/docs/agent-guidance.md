@@ -70,7 +70,7 @@ cat wallets/registrations/main/status.json
 - Registration requires Machine's authenticated Broker edge. If Broker or
   Signer is unavailable, the write fails closed; do not fall back to a
   Machine-owned wallet-creation path.
-- To cancel a live registration, write `cancel` to
+- To cancel a live registration, write `y`, `yes`, or `cancel` to
   `wallets/registrations/<petname>/cancel`.
 
 Import, recovery, rebind, and deletion are also Broker custody operations.

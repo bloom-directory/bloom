@@ -9,7 +9,7 @@
 //! - `wallets/new`                                                  — write a wallet name to prepare registration
 //! - `wallets/registrations/<petname>/status.json`                 — public registration projection
 //! - `wallets/registrations/<petname>/result.json`                 — completed registration result
-//! - `wallets/registrations/<petname>/cancel`                       — write `cancel` before acceptance
+//! - `wallets/registrations/<petname>/cancel`                       — write `y`, `yes`, or `cancel` before acceptance
 //! - `wallets/<wallet>/address`                                     — checksummed owner/signer address
 //! - `wallets/<wallet>/address.qr.svg`                              — scannable QR image for the owner/signer address
 //! - `wallets/<wallet>/address.qr.png`                              — scannable QR image for the owner/signer address
@@ -2244,9 +2244,19 @@ impl WalletsHandler {
                 && leaf == "cancel"
             {
                 self.write_permit()?;
-                if data != b"cancel" && data != b"cancel\n" {
+                let confirmation = std::str::from_utf8(data)
+                    .map_err(|_| {
+                        HandlerError::invalid(
+                            "registration cancellation requires UTF-8 confirmation",
+                        )
+                    })?
+                    .trim();
+                if !confirmation.eq_ignore_ascii_case("y")
+                    && !confirmation.eq_ignore_ascii_case("yes")
+                    && !confirmation.eq_ignore_ascii_case("cancel")
+                {
                     return Err(HandlerError::invalid(
-                        "registration cancellation accepts only `cancel`",
+                        "registration cancellation accepts only `y`, `yes`, or `cancel`",
                     ));
                 }
                 return self.cancel_wallet_registration(requested_name).await;
@@ -3716,12 +3726,22 @@ mod tests {
                 .await,
             Err(HandlerError::Invalid(_))
         ));
+        assert!(matches!(
+            fixture
+                .handler
+                .write(
+                    &VfsPath::parse("/registrations/main/cancel").unwrap(),
+                    b"maybe\n",
+                )
+                .await,
+            Err(HandlerError::Invalid(_))
+        ));
 
         fixture
             .handler
             .write(
                 &VfsPath::parse("/registrations/main/cancel").unwrap(),
-                b"cancel\n",
+                b"y\n",
             )
             .await
             .unwrap();

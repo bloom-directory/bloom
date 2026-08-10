@@ -30,7 +30,7 @@ There is also one low-severity contract pin drift and one AWS multi-key concern 
   - The embedded README repeats the same invalid workflow: `crates/bloom-vfs/src/docs/README.md:129`.
   - Domain examples do likewise: `docs/examples-domain/03-wallets-simulate-watch.md:15`.
 - **Why existing tests failed to catch it:** The handler test uses correct JSON and discovers the operation ID by listing `registrations`. Documentation tests merely assert that the text contains `wallets/registrations/` and `status.json`; `crates/bloom-vfs/src/router.rs:573` explicitly enshrines the incorrect `<name>` terminology.
-- **Smallest appropriate fix:** Correct all mounted examples to write the documented JSON schema, list `wallets/registrations`, select the operation whose `status.json.requested_name` matches, and read the URL from `status.json`. Document `cancel` as accepting exactly `cancel`.
+- **Smallest appropriate fix:** Correct all mounted examples to write the documented JSON schema, list `wallets/registrations`, select the operation whose `status.json.requested_name` matches, and read the URL from `status.json`. Document the `cancel` confirmation values explicitly.
 - **Focused regression test:** Execute every documented registration command against the real handler and prove preparation, operation discovery, status read, cancellation, and result recovery.
 
 ### Medium — Expired exact Petal approvals cannot be restaged under the same action identity
