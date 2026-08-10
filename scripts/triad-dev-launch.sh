@@ -27,10 +27,10 @@ while [ "$#" -gt 0 ]; do
     *) die "unknown argument: $1" ;;
   esac
 done
-required_paths=("$developer_root" "$machine_home" "$machine_socket" "$log_dir" "$ready_file")
+required_paths=("$developer_root" "$machine_socket" "$log_dir" "$ready_file")
 for value in "${required_paths[@]}"; do
   [ -n "$value" ] ||
-    die "developer root, Machine home/socket, log dir, and ready file are required"
+    die "developer root, Machine socket, log dir, and ready file are required"
 done
 if [ "$services_only" -eq 1 ] && [ -n "$mount_dir" ]; then
   die "--services-only cannot be combined with --mount"
@@ -45,9 +45,16 @@ umask 077
 mkdir -p "$developer_root"
 chmod 0700 "$developer_root"
 developer_root="$(cd "$developer_root" && pwd -P)"
+if [ -z "$machine_home" ]; then
+  machine_home="${developer_root}/state/machine"
+fi
 mkdir -p "$machine_home" "$log_dir" \
   "$(dirname "$machine_socket")" "$(dirname "$ready_file")"
 machine_home="$(cd "$machine_home" && pwd -P)"
+case "$machine_home" in
+  "${developer_root}"/*) ;;
+  *) die "Machine home must be inside the developer root so its persistent identity and audit journal share one lifetime" ;;
+esac
 if [ -d "${HOME}/.bloom" ]; then
   canonical_machine_home="$(cd "${HOME}/.bloom" && pwd -P)"
 else
@@ -157,6 +164,18 @@ if [ "$install_authority_fixture" -eq 1 ]; then
         .subject.package_hash == $package_hash and .subject.route == "r000001")
   ' "${config_dir}/provenance-catalog.json" >/dev/null ||
     die "developer enrollment predates the current fixture; create a fresh developer root"
+fi
+hyperliquid_package="${BLOOM_TRIAD_DEV_HYPERLIQUID_PACKAGE:-}"
+if [ -n "$hyperliquid_package" ]; then
+  [ -d "$hyperliquid_package" ] ||
+    die "integration Petal package is missing: $hyperliquid_package"
+  [ -x "${hyperliquid_package}/scripts/build.sh" ] ||
+    die "integration Petal build script is missing: ${hyperliquid_package}/scripts/build.sh"
+  (cd "$hyperliquid_package" && scripts/build.sh)
+  "$bloom_bin" --home "${developer_root}/package-scan" petals build \
+    "$hyperliquid_package" >/dev/null
+  "$bloom_bin" init triad-enroll-developer-petal-provenance \
+    "$config_dir" "$hyperliquid_package"
 fi
 mkdir -p "${developer_root}/state/broker" "${developer_root}/state/signer"
 chmod 0700 "${developer_root}/state" \

@@ -13,8 +13,14 @@ use anyhow::{Context as _, Result, bail};
 use bloom_broker_api::{
     Base64UrlBytes, PROVENANCE_RECORD_SIGNATURE_DOMAIN, ProvenanceCatalog, Token,
 };
+#[cfg(feature = "triad-dev-harness")]
+use bloom_broker_api::{ProvenanceOperationClass, ProvenanceRecord, ProvenanceSubject};
+#[cfg(feature = "triad-dev-harness")]
+use bloom_petals::package::PreparedPetalPackage;
 use ed25519_dalek::{Signer as _, SigningKey};
 use rand::{RngCore as _, rngs::OsRng};
+#[cfg(feature = "triad-dev-harness")]
+use serde::Deserialize;
 use serde::Serialize;
 use zeroize::Zeroize as _;
 
@@ -77,6 +83,131 @@ pub fn run_developer(template_dir: &Path, output_dir: &Path, release_digest: Str
         .parent()
         .context("developer config output has no parent root")?;
     render_developer_runtime_paths(&plan.output_dir, developer_root)
+}
+
+#[cfg(feature = "triad-dev-harness")]
+pub fn run_developer_petal_provenance(config_dir: &Path, petal_dir: &Path) -> Result<()> {
+    let uid = rustix::process::geteuid().as_raw();
+    if uid == 0 {
+        bail!("developer Petal provenance enrollment refuses root");
+    }
+    if std::env::consts::OS != "macos" {
+        bail!("developer Petal provenance enrollment is only supported on macOS");
+    }
+    let config_dir =
+        fs::canonicalize(config_dir).context("canonicalize developer triad config directory")?;
+    let petal_dir =
+        fs::canonicalize(petal_dir).context("canonicalize developer Petal package directory")?;
+    enroll_developer_petal_provenance(&config_dir, &petal_dir, uid)
+}
+
+#[cfg(feature = "triad-dev-harness")]
+fn enroll_developer_petal_provenance(
+    config_dir: &Path,
+    petal_dir: &Path,
+    expected_owner: u32,
+) -> Result<()> {
+    require_private_developer_file(
+        &config_dir.join("installer-identity.json"),
+        expected_owner,
+        "installer identity",
+    )?;
+    require_private_developer_file(
+        &config_dir.join("provenance-catalog.json"),
+        expected_owner,
+        "provenance catalog",
+    )?;
+
+    let mut identity_bytes = fs::read(config_dir.join("installer-identity.json"))?;
+    let mut identity: OwnedInstallerIdentity =
+        serde_json::from_slice(&identity_bytes).context("parse developer installer identity")?;
+    identity_bytes.zeroize();
+    if identity.schema != "bloom.installer-identity.1" {
+        bail!("developer installer identity has an unsupported schema");
+    }
+    let mut seed = hex::decode(identity.private_key_seed_hex.as_bytes())
+        .context("decode developer installer signing seed")?;
+    identity.private_key_seed_hex.zeroize();
+    let mut seed_array: [u8; 32] = seed
+        .as_slice()
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("developer installer signing seed is not 32 bytes"))?;
+    let signing_key = SigningKey::from_bytes(&seed_array);
+    seed_array.zeroize();
+    seed.zeroize();
+    if hex::encode(signing_key.verifying_key().to_bytes()) != identity.public_key_hex {
+        bail!("developer installer identity public key does not match its signing seed");
+    }
+    let installer_key_id = Token::new(identity.key_id)?;
+
+    let package = PreparedPetalPackage::from_dir(petal_dir)
+        .map_err(|error| anyhow::anyhow!("prepare developer Petal package: {error}"))?;
+    let publisher = Token::new("bloom-developer-local-package")?;
+    let package_hash = bloom_broker_api::Digest32::new(package.hash.clone())?;
+    let mut additions = Vec::new();
+    for route in &package.route_index.routes {
+        let Some(intent) = route.install_metadata.sign_intent.as_deref() else {
+            continue;
+        };
+        additions.push(ProvenanceRecord {
+            subject: ProvenanceSubject::Petal {
+                package_hash: package_hash.clone(),
+                route: route.route_id.clone(),
+            },
+            publisher: publisher.clone(),
+            operation_classes: vec![ProvenanceOperationClass {
+                operation_class: Token::new(intent.to_owned())?,
+                fee_asset: None,
+            }],
+            installer_key_id: installer_key_id.clone(),
+            installer_signature: Base64UrlBytes::from_bytes(&[]),
+        });
+    }
+    if additions.is_empty() {
+        bail!(
+            "developer Petal {} imports signing but declares no route sign intents",
+            package.name
+        );
+    }
+
+    let catalog_path = config_dir.join("provenance-catalog.json");
+    let mut catalog: ProvenanceCatalog =
+        serde_json::from_slice(&fs::read(&catalog_path)?).context("parse provenance catalog")?;
+    catalog.records.retain(|record| {
+        !matches!(
+            &record.subject,
+            ProvenanceSubject::Petal { package_hash: existing, .. } if existing == &package_hash
+        )
+    });
+    for record in &mut additions {
+        let mut message = PROVENANCE_RECORD_SIGNATURE_DOMAIN.to_vec();
+        message.extend_from_slice(&record.unsigned_canonical_bytes()?);
+        record.installer_signature =
+            Base64UrlBytes::from_bytes(&signing_key.sign(&message).to_bytes());
+        message.zeroize();
+    }
+    catalog.records.extend(additions);
+    catalog.records.sort_by_key(|record| {
+        serde_jcs::to_vec(&record.subject).expect("provenance subject is serializable")
+    });
+    catalog.validate_shape()?;
+    rewrite_private_json(&catalog_path, &serde_json::to_value(catalog)?)?;
+    Ok(())
+}
+
+#[cfg(feature = "triad-dev-harness")]
+fn require_private_developer_file(path: &Path, expected_owner: u32, label: &str) -> Result<()> {
+    let metadata = fs::symlink_metadata(path).with_context(|| format!("inspect {label}"))?;
+    if !metadata.file_type().is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.uid() != expected_owner
+        || metadata.mode() & 0o7777 != 0o600
+        || metadata.nlink() != 1
+        || metadata.len() > MAX_TEMPLATE_BYTES
+    {
+        bail!("developer {label} is not an owner-only regular file");
+    }
+    Ok(())
 }
 
 #[cfg(any(test, feature = "triad-dev-harness"))]
@@ -653,6 +784,16 @@ struct InstallerIdentity<'a> {
     key_id: &'a str,
     private_key_seed_hex: &'a str,
     public_key_hex: &'a str,
+}
+
+#[cfg(feature = "triad-dev-harness")]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OwnedInstallerIdentity {
+    schema: String,
+    key_id: String,
+    private_key_seed_hex: String,
+    public_key_hex: String,
 }
 
 #[cfg(test)]

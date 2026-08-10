@@ -650,11 +650,28 @@ fn install_metadata_for_route(
         sign_intent: None,
     };
 
-    if validation.abi != RouteAbi::ComponentBloomRoute010 || !route.params.is_empty() {
+    if validation.abi != RouteAbi::ComponentBloomRoute010 {
         return Ok(metadata);
     }
-    let component_metadata =
-        evaluate_static_component_metadata(package_hash, petal_root, route, artifact_bytes)?;
+    if !route.params.is_empty()
+        && !validation
+            .required_caps
+            .iter()
+            .any(|cap| cap == "bloom:sign")
+    {
+        return Ok(metadata);
+    }
+    let component_metadata = evaluate_component_metadata(
+        package_hash,
+        petal_root,
+        &route.pattern,
+        artifact_bytes,
+        route
+            .params
+            .iter()
+            .map(|name| (name.clone(), "provenance".to_string()))
+            .collect(),
+    )?;
     validate_component_metadata_policy(
         &route.route_id,
         route_kind,
@@ -663,6 +680,21 @@ fn install_metadata_for_route(
         allowed_caps,
         allowed_sign_intents,
     )?;
+    if component_metadata.sign_intent.is_some()
+        && !validation
+            .required_caps
+            .iter()
+            .any(|cap| cap == "bloom:sign")
+    {
+        return Err(PetalError::InvalidWasm(format!(
+            "Petal route {} metadata sign_intent is not backed by a signing import",
+            route.route_id
+        )));
+    }
+    metadata.sign_intent = component_metadata.sign_intent.clone();
+    if !route.params.is_empty() {
+        return Ok(metadata);
+    }
     metadata.mode = component_metadata.mode;
     metadata.cache_ttl_ms = component_metadata.cache_ttl_ms;
     metadata.side_effecting_read = component_metadata.side_effecting_read;
@@ -673,15 +705,6 @@ fn install_metadata_for_route(
         .into_iter()
         .filter(|cap| validation.required_caps.contains(cap))
         .collect();
-    if component_metadata.sign_intent.is_some()
-        && !metadata.required_caps.iter().any(|cap| cap == "bloom:sign")
-    {
-        return Err(PetalError::InvalidWasm(format!(
-            "Petal route {} metadata sign_intent is not backed by a signing import",
-            route.route_id
-        )));
-    }
-    metadata.sign_intent = component_metadata.sign_intent;
     Ok(metadata)
 }
 
@@ -761,16 +784,17 @@ pub fn narrow_runtime_route_metadata(
     })
 }
 
-fn evaluate_static_component_metadata(
+fn evaluate_component_metadata(
     package_hash: &str,
     petal_root: &str,
-    route: &RouteRecord,
+    path: &str,
     artifact_bytes: &[u8],
+    route_params: Vec<(String, String)>,
 ) -> Result<ComponentRouteMetadata, PetalError> {
     let wasm = artifact_bytes.to_vec();
     let package_hash = package_hash.to_string();
     let petal_root = petal_root.to_string();
-    let path = route.pattern.clone();
+    let path = path.to_string();
     let handle = std::thread::spawn(move || {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -785,7 +809,7 @@ fn evaluate_static_component_metadata(
                     &package_hash,
                     &petal_root,
                     &path,
-                    Vec::new(),
+                    route_params,
                     RunOptions {
                         deterministic_env: true,
                         ..RunOptions::default()

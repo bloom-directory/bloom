@@ -11,9 +11,8 @@ readonly MAX_USD="25"
 readonly FIXTURE_PACKAGE_HASH="2e2344e74b7ed11d4bb4c939671be9da72e13147dd16c3f6b6c347ae2c84d1ad"
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-# Broker/Signer developer state remains persistent so existing passkey wallets
-# stay available. Machine runs from a disposable overlay and only receives a
-# copy of the canonical public wallet projection.
+# Broker, Signer, and Machine developer state remain persistent so existing
+# passkey wallets and the independently retained audit heads cannot diverge.
 canonical_home="${BLOOM_INTEGRATION_TEST_HOME:-${HOME}/.bloom}"
 developer_root="${BLOOM_TRIAD_DEV_ROOT:-${canonical_home}/triad-dev}"
 wallet=""
@@ -138,17 +137,13 @@ if [ "$live" -eq 1 ]; then
 fi
 
 run_dir="$(mktemp -d "${TMPDIR:-/tmp}/bloom-mainnet-integration.XXXXXX")"
-machine_home="${run_dir}/machine-home"
+machine_home="${developer_root}/state/machine"
 socket="${run_dir}/bloom.sock"
 mount_dir="${run_dir}/mount"
 server_log="${run_dir}/serve.log"
 ready_file="${run_dir}/triad.ready"
 server_pid=""
 mkdir -p "$mount_dir" "${machine_home}/cache"
-canonical_wallet_projection="${canonical_home}/cache/wallet-projections.json"
-if [ -f "$canonical_wallet_projection" ] && [ ! -L "$canonical_wallet_projection" ]; then
-  cp "$canonical_wallet_projection" "${machine_home}/cache/wallet-projections.json"
-fi
 
 mounted_path() {
   case "$1" in

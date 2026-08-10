@@ -52,12 +52,13 @@ test ! -e "${test_root}/preflight-state/approval-invalid"
 test -f "${test_root}/preflight-state/fixture-signed"
 cmp "${test_root}/before/config.toml" "${canonical_home}/config.toml"
 diff -r "${test_root}/before/petals" "${canonical_home}/petals"
-cmp "${canonical_home}/cache/wallet-projections.json" \
-  "${test_root}/preflight-state/wallet-projection-copy"
-test "$(cat "${test_root}/preflight-state/machine-home")" != "$canonical_home"
+expected_machine_home="$(cd "${canonical_home}/triad-dev/state/machine" && pwd -P)"
+recorded_machine_home="$(cat "${test_root}/preflight-state/machine-home")"
+recorded_machine_home="$(cd "$recorded_machine_home" && pwd -P)"
+test "$recorded_machine_home" = "$expected_machine_home"
 
-# The real launcher refuses the persistent canonical home before it builds or
-# starts any service, preventing direct callers from restoring this regression.
+# The real launcher refuses any Machine home outside the developer root before
+# it builds or starts a service, including the persistent canonical home.
 guard_home="${test_root}/guard-user"
 mkdir -p "$guard_home" "${test_root}/guard-canonical"
 ln -s "${test_root}/guard-canonical" "${guard_home}/.bloom"
@@ -73,7 +74,8 @@ then
   printf 'developer launcher unexpectedly accepted canonical ~/.bloom\n' >&2
   exit 1
 fi
-grep -q 'refusing to use canonical ~/.bloom' "${test_root}/canonical-guard.out"
+grep -q 'Machine home must be inside the developer root' \
+  "${test_root}/canonical-guard.out"
 
 # Substituting a policy digest in the mounted public projection must not fool
 # the authority double into activating an approval. This proves the fake binds

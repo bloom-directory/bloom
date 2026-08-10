@@ -312,8 +312,15 @@ fn triad_developer_launcher_supports_vfs_only_mode() {
     let launcher = fs::read_to_string(workspace().join("scripts/triad-dev-launch.sh")).unwrap();
 
     assert!(
-        launcher.contains("required_paths=(\"$developer_root\" \"$machine_home\" \"$machine_socket\" \"$log_dir\" \"$ready_file\")"),
+        launcher.contains(
+            "required_paths=(\"$developer_root\" \"$machine_socket\" \"$log_dir\" \"$ready_file\")"
+        ),
         "the developer launcher must not require --mount"
+    );
+    assert!(
+        launcher.contains("machine_home=\"${developer_root}/state/machine\"")
+            && launcher.contains("Machine home must be inside the developer root"),
+        "the persistent developer identity must not be paired with a disposable Machine journal"
     );
     assert!(
         launcher.contains("Bloom is ready without a kernel mount")

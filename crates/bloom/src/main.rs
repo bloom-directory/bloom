@@ -1750,6 +1750,12 @@ enum InitInternal {
         output_dir: PathBuf,
         release_digest: String,
     },
+    #[cfg(feature = "triad-dev-harness")]
+    #[command(name = "triad-enroll-developer-petal-provenance", hide = true)]
+    TriadEnrollDeveloperPetalProvenance {
+        config_dir: PathBuf,
+        petal_dir: PathBuf,
+    },
     #[command(name = "triad-render-macos-enrollment", hide = true)]
     TriadRenderMacosEnrollment {
         template_dir: PathBuf,
@@ -2430,6 +2436,12 @@ async fn run(cli: Cli) -> Result<()> {
                         triad_enrollment::run_developer(&template_dir, &output_dir, release_digest)
                             .context("Bloom developer triad enrollment generation failed")
                     }
+                    #[cfg(feature = "triad-dev-harness")]
+                    InitInternal::TriadEnrollDeveloperPetalProvenance {
+                        config_dir,
+                        petal_dir,
+                    } => triad_enrollment::run_developer_petal_provenance(&config_dir, &petal_dir)
+                        .context("Bloom developer Petal provenance enrollment failed"),
                     InitInternal::TriadRenderMacosEnrollment {
                         template_dir,
                         output_dir,
