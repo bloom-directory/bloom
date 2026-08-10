@@ -1037,9 +1037,19 @@ impl FileSystem for BloomFs {
                                 e.size
                             }
                             Err(error) => {
-                                self.render_cache.put_error(path, error, RENDER_CACHE_TTL);
-                                warn!(path = %path, ?error, "mount.adapter.getattr.render_failed");
-                                return Err(error);
+                                if e.size > 0 && matches!(error, FsError::Io) {
+                                    // The handler supplied a trustworthy local
+                                    // size hint. Keep filesystem metadata
+                                    // usable when rendering dynamic content
+                                    // fails, and leave the error uncached so
+                                    // an explicit READ can retry the backend.
+                                    warn!(path = %path, ?error, "mount.adapter.getattr.using_size_hint_after_render_failure");
+                                    e.size
+                                } else {
+                                    self.render_cache.put_error(path, error, RENDER_CACHE_TTL);
+                                    warn!(path = %path, ?error, "mount.adapter.getattr.render_failed");
+                                    return Err(error);
+                                }
                             }
                         },
                     }
@@ -3044,6 +3054,7 @@ mod tests {
 
     struct ClassifiedReadHandler {
         result: TestReadResult,
+        size_hint: u64,
         reads: parking_lot::Mutex<u32>,
     }
 
@@ -3051,6 +3062,15 @@ mod tests {
         fn new(result: TestReadResult) -> Arc<Self> {
             Arc::new(Self {
                 result,
+                size_hint: 0,
+                reads: parking_lot::Mutex::new(0),
+            })
+        }
+
+        fn with_size_hint(result: TestReadResult, size_hint: u64) -> Arc<Self> {
+            Arc::new(Self {
+                result,
+                size_hint,
                 reads: parking_lot::Mutex::new(0),
             })
         }
@@ -3065,7 +3085,7 @@ mod tests {
         async fn lookup(&self, p: &VfsPath) -> Result<Entry, HandlerError> {
             match p.segments() {
                 [] => Ok(Entry::dir("")),
-                [name] if name == "value" => Ok(Entry::file("value")),
+                [name] if name == "value" => Ok(Entry::file("value").with_size(self.size_hint)),
                 _ => Err(HandlerError::NotFound(p.to_string_path())),
             }
         }
@@ -3081,7 +3101,7 @@ mod tests {
 
         async fn list(&self, p: &VfsPath) -> Result<Vec<Entry>, HandlerError> {
             if p.is_root() {
-                Ok(vec![Entry::file("value")])
+                Ok(vec![Entry::file("value").with_size(self.size_hint)])
             } else {
                 Err(HandlerError::NotADir(p.to_string_path()))
             }
@@ -3104,6 +3124,19 @@ mod tests {
         let error = fs.getattr(&fake_ctx(), &value).await.unwrap_err();
         assert_eq!(error, FsError::Io);
         assert_eq!(handler.read_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn getattr_backend_error_uses_local_size_hint_without_caching_the_error() {
+        let handler = ClassifiedReadHandler::with_size_hint(TestReadResult::Backend, 410);
+        let (fs, value) = classified_read_handle(handler.clone()).await;
+        let attrs = fs.getattr(&fake_ctx(), &value).await.unwrap();
+        assert_eq!(attrs.size, 410);
+        assert_eq!(handler.read_count(), 1);
+
+        let error = fs.read(&fake_ctx(), &value, 0, 1024).await.unwrap_err();
+        assert_eq!(error, FsError::Io);
+        assert_eq!(handler.read_count(), 2);
     }
 
     #[tokio::test]

@@ -471,6 +471,12 @@ impl AuditLog {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
+        if identity.is_none() && path.exists() && first_nonempty_line_is_signed(&path)? {
+            return Err(AuditError::Degraded(
+                "refusing to reopen a signed audit journal without its application identity"
+                    .to_owned(),
+            ));
+        }
         let rotation_recovery_error = recover_rotation_marker
             .then(|| {
                 identity.as_ref().and_then(|current| {
@@ -1948,6 +1954,27 @@ mod tests {
         assert_eq!(genesis.data["legacy_count"], 2);
         assert!(path.with_extension("legacy-unsigned-v0.jsonl").is_file());
         AuditLog::verify_signed(&path, &identity).unwrap();
+    }
+
+    #[test]
+    fn signed_journal_cannot_be_reopened_or_extended_as_unsigned() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let signed = AuditLog::open_signed(&path, identity(81, "machine-audit-signed")).unwrap();
+        signed.append(record("signed", 1)).unwrap();
+        let original = std::fs::read(&path).unwrap();
+        drop(signed);
+
+        let error = match AuditLog::open(&path) {
+            Ok(_) => panic!("signed journal reopened without its identity"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("without its application identity")
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), original);
     }
 
     #[test]

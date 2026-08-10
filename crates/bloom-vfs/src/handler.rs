@@ -107,6 +107,13 @@ impl Entry {
         self
     }
 
+    pub fn with_size(mut self, size: u64) -> Self {
+        if self.kind == EntryKind::File {
+            self.size = size;
+        }
+        self
+    }
+
     pub fn with_modified_ms(self, modified_ms: u128) -> Self {
         if modified_ms > u64::MAX as u128 {
             return self;
@@ -355,6 +362,12 @@ mod tests {
         let modified = SystemTime::UNIX_EPOCH + Duration::from_secs(123);
         let e = Entry::file("artifact.json").with_modified(modified);
         assert_eq!(e.modified, Some(modified));
+    }
+
+    #[test]
+    fn with_size_records_file_hint_but_not_directory_hint() {
+        assert_eq!(Entry::file("status.json").with_size(410).size, 410);
+        assert_eq!(Entry::dir("wallets").with_size(410).size, 0);
     }
 
     #[test]
