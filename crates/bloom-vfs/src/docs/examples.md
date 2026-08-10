@@ -28,31 +28,23 @@ ls /bloom/wallets/alice/chains/anvil/outbox/sent/
 ## Creating a wallet (asynchronous passkey registration)
 
 ```sh
-# 1. Capture the existing IDs, then start registration. This does not block.
-BEFORE_REGISTRATIONS="$(mktemp)"
-ls /bloom/wallets/registrations > "$BEFORE_REGISTRATIONS"
+# 1. Start registration. This does not block.
 printf 'main\n' > /bloom/wallets/new
 
-# 2. Compare the after-listing and inspect each new candidate.
-AFTER_REGISTRATIONS="$(mktemp)"
-ls /bloom/wallets/registrations > "$AFTER_REGISTRATIONS"
-comm -13 "$BEFORE_REGISTRATIONS" "$AFTER_REGISTRATIONS"
-REGISTRATION_ID='<candidate-operation-id>'
-cat /bloom/wallets/registrations/"$REGISTRATION_ID"/status.json
+# 2. Inspect the projection keyed by the requested petname.
+cat /bloom/wallets/registrations/main/status.json
 
 # 3. Open/forward its ceremony_url to a human. Poll until ceremony_state is
 #    COMPLETED, then read the new wallet.
-cat /bloom/wallets/registrations/"$REGISTRATION_ID"/status.json
+cat /bloom/wallets/registrations/main/status.json
 cat /bloom/wallets/main/address
 ```
 
-Verify the candidate's `requested_name` before opening its `ceremony_url`,
-polling it, or cancelling it. Concurrent registrations for the same requested
-name remain ambiguous through this write-only sink, so serialize same-name
-writes.
+Verify the projection's `requested_name` before opening its `ceremony_url`,
+polling it, or cancelling it.
 
 Requires a running `bloom serve` daemon. Cancel a live registration with
-`printf 'cancel' > /bloom/wallets/registrations/"$REGISTRATION_ID"/cancel`.
+`printf 'cancel' > /bloom/wallets/registrations/main/cancel`.
 
 ## Tools
 

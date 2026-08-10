@@ -1940,10 +1940,6 @@ fn component_evm_outbox_outcome(outcome: EvmOutboxOutcome) -> ComponentVal {
     let approval = outcome.approval_required.map(|approval| {
         Box::new(ComponentVal::Record(vec![
             ("action-id".into(), ComponentVal::String(approval.action_id)),
-            (
-                "ceremony-url".into(),
-                ComponentVal::String(approval.ceremony_url),
-            ),
             ("expires-ms".into(), ComponentVal::U64(approval.expires_ms)),
         ]))
     });
@@ -4682,6 +4678,16 @@ paths = ["/status"]
             )
             .unwrap(),
             "action-1"
+        );
+        assert!(
+            !approval_fields
+                .iter()
+                .any(|(field, _)| field == "ceremony-url"),
+            "owner-only ceremony URLs must not reach Petal component code"
+        );
+        assert_eq!(
+            component_field(approval_fields, "expires-ms").unwrap(),
+            &ComponentVal::U64(500)
         );
         {
             let calls = host.tx_stage_calls.lock();

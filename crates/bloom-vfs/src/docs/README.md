@@ -131,23 +131,16 @@ does not create a Machine-local wallet and returns before the owner ceremony
 completes:
 
 ```sh
-BEFORE_REGISTRATIONS="$(mktemp)"
-ls /bloom/wallets/registrations > "$BEFORE_REGISTRATIONS"
 printf 'main\n' > /bloom/wallets/new
-AFTER_REGISTRATIONS="$(mktemp)"
-ls /bloom/wallets/registrations > "$AFTER_REGISTRATIONS"
-comm -13 "$BEFORE_REGISTRATIONS" "$AFTER_REGISTRATIONS"
-REGISTRATION_ID='<candidate-operation-id>'
-cat /bloom/wallets/registrations/"$REGISTRATION_ID"/status.json
+cat /bloom/wallets/registrations/main/status.json
 ```
 
-Compare the before and after listings. For every new candidate, verify that
-`requested_name` in `status.json` is `main` before opening its `ceremony_url`,
-polling it, or cancelling it. Concurrent registrations for the same requested
-name remain ambiguous through this write-only sink, so serialize same-name
-writes. Poll until `ceremony_state` is `COMPLETED`; only then does
+The registration projection is keyed by the requested wallet petname. Verify
+that `requested_name` in `status.json` is `main` before opening its
+`ceremony_url`, polling it, or cancelling it. Poll until `ceremony_state` is
+`COMPLETED`; only then does
 `wallets/main/address` exist. Write `cancel` to
-`wallets/registrations/<operation-id>/cancel` to cancel a live registration. Broker
+`wallets/registrations/<petname>/cancel` to cancel a live registration. Broker
 owns ceremony orchestration and Signer owns custody. If either is unavailable,
 the operation fails closed; Machine has no local fallback. Import, recovery,
 rebind, and deletion likewise use Broker custody ceremonies, never mounted

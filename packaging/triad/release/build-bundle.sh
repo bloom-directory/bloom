@@ -55,18 +55,52 @@ reject_machine_legacy_authority_files() {
 
 reject_legacy_authority_symbols() {
   local binary="$1"
-  local symbol
+  local file_description symbol status
   # Scripts are used by the unit-level bundle fixtures. Real release binaries
   # are Mach-O or ELF and must pass both their symbol table (when retained) and
   # printable-string scans. A stripped table is not treated as proof of
   # cleanliness; the resolved Cargo graph is checked before the release build.
-  if ! file -b "$binary" | grep -Eq '^(Mach-O|ELF) '; then
+  if ! file_description="$(file -b -- "$binary")"; then
+    echo "failed to inspect production binary format: $binary" >&2
+    return 1
+  fi
+  if [[ ! "$file_description" =~ ^(Mach-O|ELF)[[:space:]] ]]; then
     return
   fi
-  symbol="$({ nm -a "$binary" 2>/dev/null || true; } | LC_ALL=C grep -E -m1 \
-    'KeystorePetalHost|StoreApprovalVerifier|KeystoreApprovalSignatureVerifier|SignerCache|EphemeralAgentKey|RegistrationCoordinator|AuthServices|InMemoryGrantStore|sign_hash_sync' || true)"
+  if ! symbol="$(nm -a -- "$binary" 2>&1)"; then
+    echo "failed to inspect production binary symbols: $binary" >&2
+    return 1
+  fi
+  if symbol="$(LC_ALL=C grep -E -m1 \
+    'KeystorePetalHost|StoreApprovalVerifier|KeystoreApprovalSignatureVerifier|SignerCache|EphemeralAgentKey|RegistrationCoordinator|AuthServices|InMemoryGrantStore|sign_hash_sync' <<<"$symbol")"; then
+    status=0
+  else
+    status=$?
+  fi
+  case "$status" in
+    0) ;;
+    1) symbol="" ;;
+    *)
+      echo "failed to scan production binary symbols: $binary" >&2
+      return 1
+      ;;
+  esac
   if [[ -n "$symbol" ]]; then
     echo "forbidden production Machine symbol in bin/$(basename "$binary"): $symbol" >&2
+    return 1
+  fi
+}
+
+require_binary_format() {
+  local binary="$1"
+  local expected_format="$2"
+  local file_description
+  if ! file_description="$(file -b -- "$binary")"; then
+    echo "failed to inspect production binary format: $binary" >&2
+    return 1
+  fi
+  if [[ "$file_description" != *"$expected_format"* ]]; then
+    echo "$(basename "$binary") is not a $expected_format production binary" >&2
     return 1
   fi
 }
@@ -74,13 +108,19 @@ reject_legacy_authority_symbols() {
 reject_markers_in_paths() {
   local scope="$1"
   shift
-  local marker path
+  local marker path status
   while IFS= read -r marker; do
     [[ -z "$marker" ]] && continue
     for path in "$@"; do
       [[ ! -e "$path" && ! -L "$path" ]] && continue
       if LC_ALL=C grep -aR -F "$marker" "$path" >/dev/null; then
         echo "forbidden $scope marker: $marker" >&2
+        return 1
+      else
+        status=$?
+      fi
+      if [[ "$status" -ne 1 ]]; then
+        echo "failed to scan $scope for marker: $marker" >&2
         return 1
       fi
     done
@@ -199,10 +239,7 @@ platform_claim="${BLOOM_PLATFORM_CLAIM:-test-unclaimed}"
 case "$platform_claim" in
   linux)
     for binary in bloom bloom-broker bloom-signer bloom-signer-migrate; do
-      file -b "$staging/bin/$binary" | grep -F 'ELF ' >/dev/null || {
-        echo "Linux platform claim requires ELF production binaries" >&2
-        exit 65
-      }
+      require_binary_format "$staging/bin/$binary" 'ELF ' || exit 65
     done
     ;;
   macos-unix-principals-w0)
@@ -212,10 +249,7 @@ case "$platform_claim" in
       exit 65
     }
     for binary in bloom bloom-broker bloom-signer bloom-signer-migrate; do
-      file -b "$staging/bin/$binary" | grep -F 'Mach-O ' >/dev/null || {
-        echo "macOS W0 claim requires Mach-O production binaries" >&2
-        exit 65
-      }
+      require_binary_format "$staging/bin/$binary" 'Mach-O ' || exit 65
     done
     ;;
   macos-unix-principals)
@@ -224,10 +258,7 @@ case "$platform_claim" in
       exit 69
     }
     for binary in bloom bloom-broker bloom-signer bloom-signer-migrate; do
-      file -b "$staging/bin/$binary" | grep -F 'Mach-O ' >/dev/null || {
-        echo "production macOS claim requires Mach-O production binaries" >&2
-        exit 65
-      }
+      require_binary_format "$staging/bin/$binary" 'Mach-O ' || exit 65
     done
     for evidence_name in \
       BLOOM_MACOS_CONFORMANCE_REPORT \
@@ -297,10 +328,14 @@ fi
 if [[ "$platform_claim" == "macos-unix-principals" ||
   "$platform_claim" == "macos-unix-principals-w0" ]]
 then
-  if find "$payload" -type f \
-    \( -name '*identity*.json' -o -name '*credentials*' \) |
-    grep . >/dev/null
-  then
+  if identity_shaped_files="$(find "$payload" -type f \
+    \( -name '*identity*.json' -o -name '*credentials*' \) -print)"; then
+    :
+  else
+    echo "failed to scan bundle for identity-shaped files" >&2
+    exit 65
+  fi
+  if [[ -n "$identity_shaped_files" ]]; then
     echo "macOS Unix-principal bundle contains a private identity-shaped file" >&2
     exit 65
   fi
@@ -310,6 +345,12 @@ then
   then
     echo "macOS Unix-principal bundle contains private key material" >&2
     exit 65
+  else
+    grep_status=$?
+    if [[ "$grep_status" -ne 1 ]]; then
+      echo "failed to scan bundle for private key material" >&2
+      exit 65
+    fi
   fi
 fi
 

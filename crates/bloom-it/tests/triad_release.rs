@@ -203,6 +203,47 @@ fn build(staging: &Path, output: &Path, key: &Path) -> std::process::Output {
 }
 
 #[test]
+fn release_bundle_fails_closed_when_binary_format_scanner_fails() {
+    let directory = tempfile::tempdir().unwrap();
+    let staging = make_staging(directory.path());
+    let key = directory.path().join("release-key");
+    let archive = directory.path().join("bundle.tar.gz");
+    generate_ed25519_key(&key);
+
+    let tools = directory.path().join("scanner-failure-bin");
+    fs::create_dir_all(&tools).unwrap();
+    let file = tools.join("file");
+    fs::write(&file, "#!/usr/bin/env bash\nexit 2\n").unwrap();
+    let mut permissions = fs::metadata(&file).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&file, permissions).unwrap();
+    let path = format!(
+        "{}:{}",
+        tools.display(),
+        std::env::var("PATH").expect("PATH is set for release tooling")
+    );
+
+    let built = Command::new(release_script("build-bundle.sh"))
+        .args([staging.as_os_str(), archive.as_os_str(), key.as_os_str()])
+        .arg("1700000000")
+        .env("BLOOM_MACHINE_SHA", "1111111")
+        .env("BLOOM_BROKER_SHA", "2222222")
+        .env("BLOOM_SIGNER_SHA", "3333333")
+        .env("BLOOM_ALLOW_TEST_UNCLAIMED", "true")
+        .env("PATH", path)
+        .output()
+        .unwrap();
+    assert!(
+        !built.status.success(),
+        "a failed binary-format scanner must reject the release bundle"
+    );
+    assert!(
+        String::from_utf8_lossy(&built.stderr)
+            .contains("failed to inspect production binary format")
+    );
+}
+
+#[test]
 fn release_bundle_excludes_source_only_macos_w0_tooling() {
     let script = fs::read_to_string(release_script("build-bundle.sh")).unwrap();
     assert!(script.contains("macos_input"));

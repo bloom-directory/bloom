@@ -2173,7 +2173,7 @@ dependencies = [
 [[package]]
 name = "bloom-audit-checkpoint"
 version = "0.1.3"
-source = "git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=2ebfdfd607bdeba0e9675def7cf9a0d3727d4410#2ebfdfd607bdeba0e9675def7cf9a0d3727d4410"
+source = "git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=2e402f03814166406ea6489b60422b0865d1f6c2#2e402f03814166406ea6489b60422b0865d1f6c2"
 dependencies = [
  "bloom-rpc-wire",
  "ed25519-dalek",
@@ -2188,7 +2188,7 @@ dependencies = [
 [[package]]
 name = "bloom-broker-api"
 version = "0.1.0"
-source = "git+https://github.com/bloom-directory/bloom-broker.git?rev=cdea630d599c8848fda3b99f470bbfc3634e2e38#cdea630d599c8848fda3b99f470bbfc3634e2e38"
+source = "git+https://github.com/bloom-directory/bloom-broker.git?rev=c05d9519b97dc74cf49fb293daf374f8db30c7af#c05d9519b97dc74cf49fb293daf374f8db30c7af"
 dependencies = [
  "bloom-rpc-wire",
  "serde",
@@ -2448,7 +2448,7 @@ dependencies = [
 [[package]]
 name = "bloom-petal-contract"
 version = "0.1.0"
-source = "git+https://github.com/bloom-directory/petal?rev=4f6fb57063a70f95cba288f68bdc139e3ecac7a5#4f6fb57063a70f95cba288f68bdc139e3ecac7a5"
+source = "git+https://github.com/bloom-directory/petal?rev=eda6647c523bba161eaa22812aa0e75ec7782404#eda6647c523bba161eaa22812aa0e75ec7782404"
 dependencies = [
  "sha2 0.10.9",
 ]
@@ -2562,7 +2562,7 @@ dependencies = [
 [[package]]
 name = "bloom-rpc-wire"
 version = "0.1.3"
-source = "git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=2ebfdfd607bdeba0e9675def7cf9a0d3727d4410#2ebfdfd607bdeba0e9675def7cf9a0d3727d4410"
+source = "git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=2e402f03814166406ea6489b60422b0865d1f6c2#2e402f03814166406ea6489b60422b0865d1f6c2"
 dependencies = [
  "base64 0.22.1",
  "ed25519-dalek",
@@ -2577,7 +2577,7 @@ dependencies = [
 [[package]]
 name = "bloom-service-activation"
 version = "0.1.3"
-source = "git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=2ebfdfd607bdeba0e9675def7cf9a0d3727d4410#2ebfdfd607bdeba0e9675def7cf9a0d3727d4410"
+source = "git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=2e402f03814166406ea6489b60422b0865d1f6c2#2e402f03814166406ea6489b60422b0865d1f6c2"
 dependencies = [
  "bloom-rpc-wire",
  "libc",
@@ -2601,7 +2601,7 @@ dependencies = [
 [[package]]
 name = "bloom-triad-local-transport"
 version = "0.1.3"
-source = "git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=2ebfdfd607bdeba0e9675def7cf9a0d3727d4410#2ebfdfd607bdeba0e9675def7cf9a0d3727d4410"
+source = "git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=2e402f03814166406ea6489b60422b0865d1f6c2#2e402f03814166406ea6489b60422b0865d1f6c2"
 dependencies = [
  "bloom-rpc-wire",
  "bloom-trusted-time",
@@ -2619,7 +2619,7 @@ dependencies = [
 [[package]]
 name = "bloom-trusted-time"
 version = "0.1.3"
-source = "git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=2ebfdfd607bdeba0e9675def7cf9a0d3727d4410#2ebfdfd607bdeba0e9675def7cf9a0d3727d4410"
+source = "git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=2e402f03814166406ea6489b60422b0865d1f6c2#2e402f03814166406ea6489b60422b0865d1f6c2"
 dependencies = [
  "libc",
  "thiserror 2.0.18",
@@ -4036,7 +4036,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -5662,7 +5662,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -7475,7 +7475,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -7543,7 +7543,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -8349,7 +8349,7 @@ dependencies = [
  "getrandom 0.4.2",
  "once_cell",
  "rustix 1.1.4",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -9754,7 +9754,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]

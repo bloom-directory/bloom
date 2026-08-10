@@ -279,13 +279,11 @@ mod tests {
             let normalized = s.to_ascii_lowercase();
             assert!(
                 s.contains("wallets/registrations/") && s.contains("status.json"),
-                "{name} must document operation-ID registration status"
+                "{name} must document petname-keyed registration status"
             );
             assert!(
-                normalized.contains("requested_name")
-                    && normalized.contains("before")
-                    && normalized.contains("concurrent"),
-                "{name} must document safe registration correlation and its concurrency limit"
+                normalized.contains("requested_name") && normalized.contains("petname"),
+                "{name} must document the petname-keyed registration projection"
             );
             assert!(
                 !(s.contains("plain name") && s.contains("creates a local wallet")),

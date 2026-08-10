@@ -7,12 +7,12 @@ on:
         description: Public bloom-broker ref
         required: false
         type: string
-        default: master
+        default: c05d9519b97dc74cf49fb293daf374f8db30c7af
       signer_ref:
         description: Public bloom-signer ref
         required: false
         type: string
-        default: master
+        default: 3571bf4dc70919d56e3c3d0d47f005b833960306
       login_uid_a:
         description: First active GUI login UID
         required: true
@@ -34,11 +34,11 @@ on:
       broker_ref:
         description: Public bloom-broker ref
         required: true
-        default: master
+        default: c05d9519b97dc74cf49fb293daf374f8db30c7af
       signer_ref:
         description: Public bloom-signer ref
         required: true
-        default: master
+        default: 3571bf4dc70919d56e3c3d0d47f005b833960306
       login_uid_a:
         description: First active GUI login UID
         required: true
@@ -73,13 +73,13 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: bloom-directory/bloom-broker
-          ref: ${{ inputs.broker_ref || 'master' }}
+          ref: ${{ inputs.broker_ref || 'c05d9519b97dc74cf49fb293daf374f8db30c7af' }}
           path: bloom-broker
       - name: Check out Signer
         uses: actions/checkout@v4
         with:
           repository: bloom-directory/bloom-signer
-          ref: ${{ inputs.signer_ref || 'master' }}
+          ref: ${{ inputs.signer_ref || '3571bf4dc70919d56e3c3d0d47f005b833960306' }}
           path: bloom-signer
       - uses: dtolnay/rust-toolchain@stable
 

@@ -49,20 +49,13 @@ does not create a local wallet**, and the write returns before the ceremony
 completes:
 
 ```sh
-BEFORE_REGISTRATIONS="$(mktemp)"
-ls wallets/registrations > "$BEFORE_REGISTRATIONS"
 printf 'main\n' > wallets/new
-AFTER_REGISTRATIONS="$(mktemp)"
-ls wallets/registrations > "$AFTER_REGISTRATIONS"
-comm -13 "$BEFORE_REGISTRATIONS" "$AFTER_REGISTRATIONS"
-REGISTRATION_ID='<candidate-operation-id>'
-cat wallets/registrations/"$REGISTRATION_ID"/status.json
+cat wallets/registrations/main/status.json
 ```
 
-- Compare the before and after listings. For every new candidate, verify its
-  `requested_name` before opening or polling its `ceremony_url`, or cancelling
-  it. Concurrent registrations for the same requested name remain ambiguous
-  through this write-only sink, so serialize same-name writes.
+- The registration projection is keyed by the requested wallet petname. Verify
+  its `requested_name` before opening or polling its `ceremony_url`, or
+  cancelling it.
 - Open or forward `ceremony_url` to a human; do not attempt it yourself. Never
   imitate WebAuthn, supply PRF material, read recovery material, or silently
   downgrade to a Machine-local credential flow — none of that is available or safe from
@@ -78,7 +71,7 @@ cat wallets/registrations/"$REGISTRATION_ID"/status.json
   Signer is unavailable, the write fails closed; do not fall back to a
   Machine-owned wallet-creation path.
 - To cancel a live registration, write `cancel` to
-  `wallets/registrations/<operation-id>/cancel`.
+  `wallets/registrations/<petname>/cancel`.
 
 Import, recovery, rebind, and deletion are also Broker custody operations.
 Sensitive inputs belong only in the Broker-hosted owner ceremony, never in a

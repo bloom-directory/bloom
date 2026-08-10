@@ -40,13 +40,13 @@
 
 **Files:**
 - Modify: `crates/bloom-vfs/src/handlers/wallets.rs`
-- Modify: registration examples in `crates/bloom-vfs/src/docs/`, `QUICKSTART.md`, `EXAMPLES.md`, and `docs/examples-domain/03-wallets-simulate-watch.md` only where necessary to describe the existing operation-ID projection honestly.
+- Modify: registration examples in `crates/bloom-vfs/src/docs/`, `QUICKSTART.md`, `EXAMPLES.md`, and `docs/examples-domain/03-wallets-simulate-watch.md` only where necessary to describe the existing registration projection honestly.
 
 - [ ] Replace the JSON-body registration test with a plain-name test and add rejection coverage for empty, unsafe, and JSON bodies.
 - [ ] Run the focused test and observe the JSON-deserialization failure.
 - [ ] Parse a trimmed UTF-8 wallet name and feed it into the unchanged Broker custody preparation path.
 - [ ] Make the readable `wallets/new` help advertise the plain-name body.
-- [ ] Align examples with the existing operation-ID registration directories and status fields without changing that process.
+- [ ] Align examples with the petname-keyed registration directories and status fields supplied by the updated base branch without changing the Broker operation process.
 - [ ] Run wallet registration and embedded-documentation tests.
 - [ ] Commit only this change as `fix(vfs): restore plain-name wallet registration sink`.
 

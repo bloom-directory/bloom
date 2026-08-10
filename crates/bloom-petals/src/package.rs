@@ -2280,7 +2280,7 @@ fn component_route_type_import(name: &str) -> Option<&'static str> {
 fn component_import_caps(name: &str) -> Option<&'static [&'static str]> {
     if matches!(
         name,
-        "bloom:sign/signing@0.2.0" | "bloom:sign/signing@0.3.0" | "bloom:sign/signing@0.4.0"
+        "bloom:sign/signing@0.1.0" | "bloom:sign/signing@0.2.0" | "bloom:sign/signing@0.3.0"
     ) {
         return Some(&["bloom:sign"]);
     }
@@ -2306,6 +2306,9 @@ enum ComponentHostInterface {
 }
 
 fn component_host_interface(name: &str) -> Option<ComponentHostInterface> {
+    if name == "bloom:sign/signing@0.1.0" {
+        return Some(ComponentHostInterface::SignSigningV1);
+    }
     if name == "bloom:sign/signing@0.2.0" {
         return Some(ComponentHostInterface::SignSigningV2);
     }
@@ -2321,7 +2324,8 @@ fn component_host_interface(name: &str) -> Option<ComponentHostInterface> {
     match bloom_petal_contract::host_interface(name)? {
         ContractHostInterface::HttpFetch => Some(ComponentHostInterface::HttpFetch),
         ContractHostInterface::StoreKv => Some(ComponentHostInterface::StoreKv),
-        ContractHostInterface::SignSigning => Some(ComponentHostInterface::SignSigningV1),
+        ContractHostInterface::SignSigning => Some(ComponentHostInterface::SignSigningV4),
+        ContractHostInterface::KeyDerive => Some(ComponentHostInterface::KeyDerive),
         ContractHostInterface::TxOutbox => Some(ComponentHostInterface::TxOutbox),
         ContractHostInterface::ChainRead => Some(ComponentHostInterface::ChainRead),
         ContractHostInterface::VfsReadwrite => Some(ComponentHostInterface::VfsReadwrite),
@@ -3435,7 +3439,16 @@ fn is_outbox_approval_required(
     types: &[ComponentTypeEntry<'_>],
     depth: usize,
 ) -> bool {
-    is_approval_required(ty, types, depth)
+    with_defined_type(ty, types, depth, |defined, types, depth| {
+        let ComponentDefinedType::Record(fields) = defined else {
+            return false;
+        };
+        fields.as_ref().len() == 2
+            && fields[0].0 == "action-id"
+            && is_string(&fields[0].1)
+            && fields[1].0 == "expires-ms"
+            && is_u64(&fields[1].1, types, depth)
+    })
 }
 
 fn is_staged_transaction(

@@ -7,8 +7,8 @@
 //! Paths handled:
 //! - `wallets/`                                                     — list wallets
 //! - `wallets/new`                                                  — write a wallet name to prepare registration
-//! - `wallets/registrations/<operation>/{status.json,result.json}`  — public registration projection
-//! - `wallets/registrations/<operation>/cancel`                     — write `cancel` before acceptance
+//! - `wallets/registrations/<petname>/{status.json,result.json}`    — public registration projection
+//! - `wallets/registrations/<petname>/cancel`                       — write `cancel` before acceptance
 //! - `wallets/<wallet>/address`                                     — checksummed owner/signer address
 //! - `wallets/<wallet>/address.qr.svg`                              — scannable QR image for the owner/signer address
 //! - `wallets/<wallet>/address.qr.png`                              — scannable QR image for the owner/signer address
@@ -345,17 +345,19 @@ impl WalletsHandler {
         self.policy_projection_root.join("registrations")
     }
 
-    fn registration_path(&self, operation_id: &str) -> std::path::PathBuf {
+    fn registration_path(&self, requested_name: &str) -> std::path::PathBuf {
         self.registration_root()
-            .join(format!("{operation_id}.json"))
+            .join(format!("{requested_name}.json"))
     }
 
-    fn registration_ids(&self) -> Result<Vec<String>, HandlerError> {
+    fn registration_records(
+        &self,
+    ) -> Result<Vec<(std::path::PathBuf, WalletRegistrationProjection)>, HandlerError> {
         let root = self.registration_root();
-        let mut ids = Vec::new();
+        let mut records = Vec::new();
         let entries = match std::fs::read_dir(root) {
             Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(ids),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(records),
             Err(error) => return Err(error.into()),
         };
         for entry in entries {
@@ -364,14 +366,60 @@ impl WalletsHandler {
             if path.extension().and_then(|value| value.to_str()) != Some("json") {
                 continue;
             }
-            if let Some(stem) = path.file_stem().and_then(|value| value.to_str())
-                && bloom_broker_api::OperationId::new(stem.to_owned()).is_ok()
+            let projection: WalletRegistrationProjection = read_json(&path)?;
+            let stem = path
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .ok_or_else(|| {
+                    HandlerError::backend("registration projection filename is invalid")
+                })?;
+            if projection.schema != "bloom.machine-wallet-registration-projection.1"
+                || projection.ceremony_kind != bloom_broker_api::CeremonyKind::WalletRegistration
+                || Self::wallet_id(&projection.requested_name).is_err()
+                || (stem != projection.requested_name && stem != projection.operation_id.as_str())
             {
-                ids.push(stem.to_owned());
+                return Err(HandlerError::backend(
+                    "Machine wallet registration projection identity is invalid",
+                ));
             }
+            records.push((path, projection));
         }
-        ids.sort();
-        Ok(ids)
+        Ok(records)
+    }
+
+    fn registration_names(&self) -> Result<Vec<String>, HandlerError> {
+        let mut names = self
+            .registration_records()?
+            .into_iter()
+            .map(|(_, projection)| projection.requested_name)
+            .collect::<Vec<_>>();
+        names.sort();
+        if names.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(HandlerError::backend(
+                "multiple wallet registration projections claim the same petname",
+            ));
+        }
+        Ok(names)
+    }
+
+    fn registration_record(
+        &self,
+        requested_name: &str,
+    ) -> Result<(std::path::PathBuf, WalletRegistrationProjection), HandlerError> {
+        Self::wallet_id(requested_name)?;
+        let mut matches = self
+            .registration_records()?
+            .into_iter()
+            .filter(|(_, projection)| projection.requested_name == requested_name);
+        let record = matches.next().ok_or_else(|| {
+            HandlerError::not_found(format!("wallet registration {requested_name:?}"))
+        })?;
+        if matches.next().is_some() {
+            return Err(HandlerError::backend(
+                "multiple wallet registration projections claim the same petname",
+            ));
+        }
+        Ok(record)
     }
 
     async fn prepare_wallet_registration(&self, data: &[u8]) -> Result<(), HandlerError> {
@@ -399,6 +447,20 @@ impl WalletsHandler {
         }
         let wallet_id = bloom_broker_api::Token::new(requested_name.to_owned())
             .map_err(|error| HandlerError::invalid(error.to_string()))?;
+        let mut existing_paths =
+            self.registration_records()?
+                .into_iter()
+                .filter_map(|(path, existing)| {
+                    (existing.requested_name == requested_name).then_some(path)
+                });
+        let registration_path = existing_paths
+            .next()
+            .unwrap_or_else(|| self.registration_path(requested_name));
+        if existing_paths.next().is_some() {
+            return Err(HandlerError::backend(
+                "multiple wallet registration projections claim the same petname",
+            ));
+        }
 
         let mut operation_bytes = [0_u8; 32];
         rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut operation_bytes);
@@ -448,31 +510,17 @@ impl WalletsHandler {
             ceremony_expires_at_ms: Some(prepared.ceremony_expires_at_ms),
             signer_contribution_digest: prepared.signer_contribution_digest,
         };
-        write_atomic_json(
-            &self.registration_path(projection.operation_id.as_str()),
-            &projection,
-        )
+        write_atomic_json(&registration_path, &projection)
     }
 
     async fn registration_projection(
         &self,
-        operation_id: &str,
+        requested_name: &str,
     ) -> Result<WalletRegistrationProjection, HandlerError> {
-        let operation_id = bloom_broker_api::OperationId::new(operation_id.to_owned())
-            .map_err(|error| HandlerError::invalid(error.to_string()))?;
-        let path = self.registration_path(operation_id.as_str());
-        let mut projection: WalletRegistrationProjection = read_json(&path)?;
-        if projection.schema != "bloom.machine-wallet-registration-projection.1"
-            || projection.operation_id != operation_id
-            || projection.ceremony_kind != bloom_broker_api::CeremonyKind::WalletRegistration
-        {
-            return Err(HandlerError::backend(
-                "Machine wallet registration projection identity is invalid",
-            ));
-        }
+        let (path, mut projection) = self.registration_record(requested_name)?;
         let status = self
             .broker()?
-            .ceremony_status(operation_id)
+            .ceremony_status(projection.operation_id.clone())
             .await
             .map_err(|error| HandlerError::backend(error.to_string()))?;
         if status.operation_id != projection.operation_id
@@ -507,10 +555,9 @@ impl WalletsHandler {
         Ok(projection)
     }
 
-    async fn cancel_wallet_registration(&self, operation_id: &str) -> Result<(), HandlerError> {
-        let operation_id = bloom_broker_api::OperationId::new(operation_id.to_owned())
-            .map_err(|error| HandlerError::invalid(error.to_string()))?;
-        let projection = self.registration_projection(operation_id.as_str()).await?;
+    async fn cancel_wallet_registration(&self, requested_name: &str) -> Result<(), HandlerError> {
+        let projection = self.registration_projection(requested_name).await?;
+        let operation_id = projection.operation_id.clone();
         if projection.ceremony_state != bloom_broker_api::CeremonyState::AwaitingUser {
             return Err(HandlerError::invalid(
                 "wallet registration is no longer cancellable",
@@ -529,16 +576,16 @@ impl WalletsHandler {
                 "Broker did not confirm wallet registration cancellation",
             ));
         }
-        let _ = self.registration_projection(operation_id.as_str()).await?;
+        let _ = self.registration_projection(requested_name).await?;
         Ok(())
     }
 
     async fn wallet_registration_result_json(
         &self,
-        operation_id: &str,
+        requested_name: &str,
     ) -> Result<Vec<u8>, HandlerError> {
-        let operation_id = bloom_broker_api::OperationId::new(operation_id.to_owned())
-            .map_err(|error| HandlerError::invalid(error.to_string()))?;
+        let projection = self.registration_projection(requested_name).await?;
+        let operation_id = projection.operation_id;
         let result = self
             .broker()?
             .custody_result(bloom_broker_api::OperationRequest {
@@ -1836,18 +1883,18 @@ impl WalletsHandler {
         if segs[0] == "registrations" {
             return match segs {
                 [_] => Ok(Entry::dir("registrations")),
-                [_, operation_id] => {
-                    let _ = self.registration_projection(operation_id).await?;
-                    Ok(Entry::dir(operation_id))
+                [_, requested_name] => {
+                    let _ = self.registration_projection(requested_name).await?;
+                    Ok(Entry::dir(requested_name))
                 }
-                [_, operation_id, leaf]
+                [_, requested_name, leaf]
                     if matches!(leaf.as_str(), "status.json" | "result.json") =>
                 {
-                    let _ = self.registration_projection(operation_id).await?;
+                    let _ = self.registration_projection(requested_name).await?;
                     Ok(Entry::file(leaf))
                 }
-                [_, operation_id, leaf] if leaf == "cancel" => {
-                    let _ = self.registration_projection(operation_id).await?;
+                [_, requested_name, leaf] if leaf == "cancel" => {
+                    let _ = self.registration_projection(requested_name).await?;
                     Ok(Entry::writable_file("cancel"))
                 }
                 _ => Err(HandlerError::not_found(path.to_string_path())),
@@ -1981,15 +2028,15 @@ impl WalletsHandler {
         }
         if segs[0] == "registrations" {
             return match segs {
-                [_, operation_id, leaf] if leaf == "status.json" => {
-                    let projection = self.registration_projection(operation_id).await?;
+                [_, requested_name, leaf] if leaf == "status.json" => {
+                    let projection = self.registration_projection(requested_name).await?;
                     let mut bytes = serde_json::to_vec_pretty(&projection)
                         .map_err(|error| HandlerError::backend(error.to_string()))?;
                     bytes.push(b'\n');
                     Ok(bytes)
                 }
-                [_, operation_id, leaf] if leaf == "result.json" => {
-                    self.wallet_registration_result_json(operation_id).await
+                [_, requested_name, leaf] if leaf == "result.json" => {
+                    self.wallet_registration_result_json(requested_name).await
                 }
                 _ => Err(HandlerError::NotAFile(path.to_string_path())),
             };
@@ -2125,7 +2172,7 @@ impl WalletsHandler {
             return self.prepare_wallet_registration(data).await;
         }
         if segs[0] == "registrations" {
-            if let [_, operation_id, leaf] = segs
+            if let [_, requested_name, leaf] = segs
                 && leaf == "cancel"
             {
                 self.write_permit()?;
@@ -2134,7 +2181,7 @@ impl WalletsHandler {
                         "registration cancellation accepts only `cancel`",
                     ));
                 }
-                return self.cancel_wallet_registration(operation_id).await;
+                return self.cancel_wallet_registration(requested_name).await;
             }
             return Err(HandlerError::PermissionDenied);
         }
@@ -2190,12 +2237,12 @@ impl WalletsHandler {
         if segs[0] == "registrations" {
             return match segs {
                 [_] => Ok(self
-                    .registration_ids()?
+                    .registration_names()?
                     .into_iter()
-                    .map(|id| Entry::dir(&id))
+                    .map(|name| Entry::dir(&name))
                     .collect()),
-                [_, operation_id] => {
-                    let _ = self.registration_projection(operation_id).await?;
+                [_, requested_name] => {
+                    let _ = self.registration_projection(requested_name).await?;
                     Ok(vec![
                         Entry::file("status.json"),
                         Entry::writable_file("cancel"),
@@ -3421,15 +3468,35 @@ mod tests {
             b"Write a wallet name matching [A-Za-z0-9_-]{1,64}.\n"
         );
 
+        let petnamed_projection_path = fixture.handler.registration_path("main");
+        assert!(petnamed_projection_path.is_file());
+        let persisted: WalletRegistrationProjection = read_json(&petnamed_projection_path).unwrap();
+        let legacy_operation_path = fixture
+            .handler
+            .registration_path(persisted.operation_id.as_str());
+        std::fs::rename(&petnamed_projection_path, &legacy_operation_path).unwrap();
+
         let registrations = fixture
             .handler
             .list(&VfsPath::parse("/registrations").unwrap())
             .await
             .unwrap();
         assert_eq!(registrations.len(), 1);
-        let operation_id = registrations[0].name.clone();
-        let status_path =
-            VfsPath::parse(&format!("/registrations/{operation_id}/status.json")).unwrap();
+        assert_eq!(registrations[0].name, "main");
+        assert!(
+            fixture
+                .handler
+                .lookup(
+                    &VfsPath::parse(&format!(
+                        "/registrations/{}/status.json",
+                        persisted.operation_id
+                    ))
+                    .unwrap()
+                )
+                .await
+                .is_err()
+        );
+        let status_path = VfsPath::parse("/registrations/main/status.json").unwrap();
         let status: serde_json::Value =
             serde_json::from_slice(&fixture.handler.read(&status_path).await.unwrap()).unwrap();
         assert_eq!(status["requested_name"], "main");
@@ -3461,10 +3528,7 @@ mod tests {
         assert!(matches!(
             fixture
                 .handler
-                .write(
-                    &VfsPath::parse(&format!("/registrations/{operation_id}/cancel")).unwrap(),
-                    b"",
-                )
+                .write(&VfsPath::parse("/registrations/main/cancel").unwrap(), b"",)
                 .await,
             Err(HandlerError::Invalid(_))
         ));
@@ -3472,7 +3536,7 @@ mod tests {
         fixture
             .handler
             .write(
-                &VfsPath::parse(&format!("/registrations/{operation_id}/cancel")).unwrap(),
+                &VfsPath::parse("/registrations/main/cancel").unwrap(),
                 b"cancel\n",
             )
             .await
@@ -3483,7 +3547,7 @@ mod tests {
         assert!(terminal["ceremony_url"].is_null());
         let result = fixture
             .handler
-            .read(&VfsPath::parse(&format!("/registrations/{operation_id}/result.json")).unwrap())
+            .read(&VfsPath::parse("/registrations/main/result.json").unwrap())
             .await
             .unwrap();
         assert!(
