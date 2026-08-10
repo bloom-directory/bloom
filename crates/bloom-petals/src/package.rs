@@ -925,24 +925,96 @@ pub fn store_policy_from_manifest_toml(bytes: &[u8]) -> Result<StoreNamespacePol
 }
 
 pub fn build_petal_package_dir(root: impl AsRef<Path>) -> Result<PreparedPetalPackage, PetalError> {
+    build_petal_package_dir_guarded(root, || Ok(()))
+}
+
+pub fn build_petal_package_dir_guarded<F>(
+    root: impl AsRef<Path>,
+    commit_guard: F,
+) -> Result<PreparedPetalPackage, PetalError>
+where
+    F: FnOnce() -> Result<(), PetalError>,
+{
     let root = root.as_ref();
     PetalPackage::scan_dir(root)?;
     validate_generated_artifact_paths(root)?;
-    remove_generated_artifacts(root)?;
-    let source_package = PreparedPetalPackage::from_dir(root)?;
+    let source_files = collect_package_dir(root)?
+        .into_iter()
+        .filter(|file| {
+            file.path != "artifacts/build-manifest.json"
+                && !file.path.starts_with("artifacts/routes/")
+        })
+        .collect::<Vec<_>>();
+    let source_package = PreparedPetalPackage::from_files(source_files.clone())?;
     let manifest = build_manifest_for_package(&source_package)?;
+    let parent = root
+        .parent()
+        .ok_or_else(|| PetalError::InvalidWasm("Petal package directory has no parent".into()))?;
+    let staged = tempfile::tempdir_in(parent)?;
 
     for route in &source_package.route_index.routes {
         let artifact = route_artifact_bytes(&source_package, route)?;
-        write_package_file(root, &route.artifact_path, &artifact)?;
+        write_package_file(staged.path(), &route.artifact_path, &artifact)?;
     }
     write_package_file(
-        root,
+        staged.path(),
         "artifacts/build-manifest.json",
         &serde_json::to_vec_pretty(&manifest)?,
     )?;
+    let mut final_files = source_files;
+    final_files.extend(collect_package_dir(staged.path())?);
+    let package = PreparedPetalPackage::from_files(final_files)?;
 
-    PreparedPetalPackage::from_dir(root)
+    commit_guard()?;
+    commit_generated_artifacts(root, staged.path())?;
+    Ok(package)
+}
+
+fn commit_generated_artifacts(root: &Path, staged_root: &Path) -> Result<(), PetalError> {
+    let artifacts = root.join("artifacts");
+    std::fs::create_dir_all(&artifacts)?;
+    let backup =
+        tempfile::tempdir_in(root.parent().ok_or_else(|| {
+            PetalError::InvalidWasm("Petal package directory has no parent".into())
+        })?)?;
+    let routes = artifacts.join("routes");
+    let manifest = artifacts.join("build-manifest.json");
+    let backup_routes = backup.path().join("routes");
+    let backup_manifest = backup.path().join("build-manifest.json");
+    let staged_routes = staged_root.join("artifacts/routes");
+    let staged_manifest = staged_root.join("artifacts/build-manifest.json");
+
+    let had_routes = routes.exists();
+    let had_manifest = manifest.exists();
+    if had_routes {
+        std::fs::rename(&routes, &backup_routes)?;
+    }
+    if had_manifest && let Err(error) = std::fs::rename(&manifest, &backup_manifest) {
+        if had_routes {
+            let _ = std::fs::rename(&backup_routes, &routes);
+        }
+        return Err(error.into());
+    }
+
+    let install_result = (|| -> Result<(), std::io::Error> {
+        if staged_routes.exists() {
+            std::fs::rename(&staged_routes, &routes)?;
+        }
+        std::fs::rename(&staged_manifest, &manifest)?;
+        Ok(())
+    })();
+    if let Err(error) = install_result {
+        let _ = std::fs::remove_dir_all(&routes);
+        let _ = std::fs::remove_file(&manifest);
+        if had_routes {
+            let _ = std::fs::rename(&backup_routes, &routes);
+        }
+        if had_manifest {
+            let _ = std::fs::rename(&backup_manifest, &manifest);
+        }
+        return Err(error.into());
+    }
+    Ok(())
 }
 
 pub fn petal_consent_summary(
@@ -1350,35 +1422,6 @@ fn validate_generated_artifact_paths(root: &Path) -> Result<(), PetalError> {
         ));
     }
     Ok(())
-}
-
-fn remove_generated_artifacts(root: &Path) -> Result<(), PetalError> {
-    let artifacts = root.join("artifacts");
-    let routes = artifacts.join("routes");
-    match std::fs::remove_dir_all(&routes) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(PetalError::Io(e)),
-    }?;
-
-    let manifest = artifacts.join("build-manifest.json");
-    match std::fs::remove_file(&manifest) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(PetalError::Io(e)),
-    }?;
-    match std::fs::remove_dir(&artifacts) {
-        Ok(()) => Ok(()),
-        Err(e)
-            if matches!(
-                e.kind(),
-                std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty
-            ) =>
-        {
-            Ok(())
-        }
-        Err(e) => Err(PetalError::Io(e)),
-    }
 }
 
 fn route_kind_and_ops(source_path: &str) -> (RouteEntryKind, Vec<RouteOp>) {
@@ -4962,6 +5005,37 @@ name = "echo"
         let artifact = std::fs::read(tmp.path().join(&route.artifact_path)).unwrap();
         let source = std::fs::read(tmp.path().join(&route.source_path)).unwrap();
         assert_eq!(artifact, source);
+    }
+
+    #[test]
+    fn cancelled_petal_build_preserves_existing_generated_artifacts() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_petal_package(tmp.path());
+        write_package_file(
+            tmp.path(),
+            "artifacts/routes/r000001.wasm",
+            b"previous artifact",
+        );
+        write_package_file(
+            tmp.path(),
+            "artifacts/build-manifest.json",
+            b"previous manifest",
+        );
+
+        let error = build_petal_package_dir_guarded(tmp.path(), || {
+            Err(PetalError::vm("cancelled before commit"))
+        })
+        .unwrap_err();
+
+        assert!(error.to_string().contains("cancelled before commit"));
+        assert_eq!(
+            std::fs::read(tmp.path().join("artifacts/routes/r000001.wasm")).unwrap(),
+            b"previous artifact"
+        );
+        assert_eq!(
+            std::fs::read(tmp.path().join("artifacts/build-manifest.json")).unwrap(),
+            b"previous manifest"
+        );
     }
 
     #[cfg(unix)]

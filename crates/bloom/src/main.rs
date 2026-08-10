@@ -2276,14 +2276,39 @@ fn print_vfs_stat_json(path: &str, entry: &serde_json::Value) -> Result<()> {
 }
 
 async fn ipc_read(endpoint: &ResolvedEndpoint, path: &str) -> Result<Vec<u8>> {
-    let result = try_ipc(
+    let mut streamed = Vec::new();
+    let reply = try_ipc_streaming(
         &IpcClient::new(&endpoint.socket),
         endpoint,
         "read",
         serde_json::json!({ "path": path }),
+        |event| match event.stream {
+            IpcOutputStream::Data => {
+                streamed.extend_from_slice(&event.bytes);
+                Ok(())
+            }
+            IpcOutputStream::Stdout | IpcOutputStream::Stderr => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "IPC read returned command output",
+            )),
+        },
     )
     .await
     .with_context(|| format!("ipc read {path} via {}", endpoint.display))?;
+    let result = reply.result;
+    if result.get("streamed").and_then(serde_json::Value::as_bool) == Some(true) {
+        let expected = result
+            .get("len")
+            .and_then(serde_json::Value::as_u64)
+            .context("ipc read: streamed response is missing len")?;
+        anyhow::ensure!(
+            streamed.len() as u64 == expected,
+            "ipc read: streamed byte count mismatch (expected {expected}, received {})",
+            streamed.len()
+        );
+        return Ok(streamed);
+    }
+    anyhow::ensure!(streamed.is_empty(), "ipc read: unexpected streamed data");
     let encoded = result
         .get("bytes_b64")
         .and_then(|value| value.as_str())
@@ -3180,6 +3205,10 @@ fn write_ipc_output_event(event: IpcOutputEvent) -> std::io::Result<()> {
             std::io::Write::write_all(&mut std::io::stderr(), &event.bytes)?;
             std::io::Write::flush(&mut std::io::stderr())
         }
+        IpcOutputStream::Data => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "command emitted an unexpected IPC data stream",
+        )),
     }
 }
 

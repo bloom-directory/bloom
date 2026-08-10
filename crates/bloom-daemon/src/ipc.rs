@@ -63,6 +63,8 @@ use tracing::{debug, info, trace, warn};
 const MAX_IPC_FRAME_BYTES: usize = 4 * 1024 * 1024;
 const MAX_IPC_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
 const IPC_CHUNK_BYTES: usize = 2 * 1024 * 1024;
+const IPC_DATA_CHUNK_BYTES: usize = 1024 * 1024;
+const IPC_OUTPUT_CHANNEL_CAPACITY: usize = 8;
 
 /// Current Bloom CLI-to-daemon IPC protocol and the range this build can
 /// decode. Package versions are diagnostic; this range is the compatibility
@@ -458,6 +460,7 @@ pub trait PetalSourceInstallService: Send + Sync {
 pub enum IpcOutputStream {
     Stdout,
     Stderr,
+    Data,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -468,12 +471,12 @@ pub struct IpcOutputEvent {
 
 #[derive(Clone)]
 pub struct IpcOperationContext {
-    output: Option<tokio::sync::mpsc::UnboundedSender<IpcOutputEvent>>,
+    output: Option<tokio::sync::mpsc::Sender<IpcOutputEvent>>,
     cancelled: Arc<AtomicBool>,
 }
 
 impl IpcOperationContext {
-    fn connected(output: tokio::sync::mpsc::UnboundedSender<IpcOutputEvent>) -> Self {
+    fn connected(output: tokio::sync::mpsc::Sender<IpcOutputEvent>) -> Self {
         Self {
             output: Some(output),
             cancelled: Arc::new(AtomicBool::new(false)),
@@ -496,12 +499,26 @@ impl IpcOperationContext {
             return true;
         };
         if output
-            .send(IpcOutputEvent {
+            .blocking_send(IpcOutputEvent {
                 stream,
                 bytes: bytes.into(),
             })
             .is_err()
         {
+            self.cancel();
+            return false;
+        }
+        true
+    }
+
+    async fn emit_async(&self, stream: IpcOutputStream, bytes: Vec<u8>) -> bool {
+        if self.is_cancelled() {
+            return false;
+        }
+        let Some(output) = &self.output else {
+            return true;
+        };
+        if output.send(IpcOutputEvent { stream, bytes }).await.is_err() {
             self.cancel();
             return false;
         }
@@ -800,7 +817,8 @@ impl IpcServer {
                     trace!(method = %wire.request.method, "ipc.request");
                     match wire.bloom_protocol {
                         Some(peer) if IpcProtocolRange::supported().negotiate(peer).is_some() => {
-                            let (output_tx, mut output_rx) = tokio::sync::mpsc::unbounded_channel();
+                            let (output_tx, mut output_rx) =
+                                tokio::sync::mpsc::channel(IPC_OUTPUT_CHANNEL_CAPACITY);
                             let context = IpcOperationContext::connected(output_tx);
                             let mut dispatched =
                                 Box::pin(self.dispatch_with_context(wire.request, context.clone()));
@@ -908,7 +926,7 @@ impl IpcServer {
                 Ok(v) => Response::ok(id, v),
                 Err(e) => map_handler_err(id, e),
             },
-            "read" => match self.do_read(&req.params).await {
+            "read" => match self.do_read(&req.params, &context).await {
                 Ok(v) => Response::ok(id, v),
                 Err(e) => map_handler_err(id, e),
             },
@@ -1014,9 +1032,27 @@ impl IpcServer {
         Ok(entry_to_json(&e))
     }
 
-    async fn do_read(&self, params: &Value) -> Result<Value, HandlerError> {
+    async fn do_read(
+        &self,
+        params: &Value,
+        context: &IpcOperationContext,
+    ) -> Result<Value, HandlerError> {
         let path = parse_path(params)?;
         let bytes = self.vfs.read(&path).await?;
+        if bytes.len() > IPC_DATA_CHUNK_BYTES {
+            let len = bytes.len();
+            for chunk in bytes.chunks(IPC_DATA_CHUNK_BYTES) {
+                if !context
+                    .emit_async(IpcOutputStream::Data, chunk.to_vec())
+                    .await
+                {
+                    return Err(HandlerError::backend(
+                        "IPC read cancelled by disconnected client",
+                    ));
+                }
+            }
+            return Ok(json!({ "streamed": true, "len": len }));
+        }
         Ok(json!({ "bytes_b64": B64.encode(&bytes), "len": bytes.len() }))
     }
 
@@ -1138,11 +1174,17 @@ impl IpcServer {
                     "Petal install cancelled by disconnected client",
                 ));
             }
-            let (result, meta, index) = if is_dir {
-                runner.store().install_petal_package_dir(&path)?
-            } else {
-                runner.store().install_petal_package_tar(&path)?
-            };
+            let (result, meta, index) = runner
+                .store()
+                .install_prepared_petal_package_with_source_guarded(package, None, || {
+                    if context.is_cancelled() {
+                        Err(PetalError::vm(
+                            "Petal install cancelled by disconnected client",
+                        ))
+                    } else {
+                        Ok(())
+                    }
+                })?;
             Ok(json!({
                 "hash": result.hash,
                 "mode": "petal",
@@ -1198,7 +1240,16 @@ impl IpcServer {
                     "Petal build cancelled by disconnected client",
                 ));
             }
-            let package = bloom_petals::package::build_petal_package_dir(&package_dir)?;
+            let package =
+                bloom_petals::package::build_petal_package_dir_guarded(&package_dir, || {
+                    if context.is_cancelled() {
+                        Err(PetalError::vm(
+                            "Petal build cancelled by disconnected client",
+                        ))
+                    } else {
+                        Ok(())
+                    }
+                })?;
             let consent = bloom_petals::package::petal_consent_summary(&package)?;
             if context.is_cancelled() {
                 return Err(PetalError::vm(
@@ -1831,7 +1882,36 @@ impl IpcClient {
         method: &str,
         params: Value,
     ) -> Result<IpcCallResult, IpcClientError> {
-        self.call_streaming(method, params, |_| Ok(())).await
+        let mut streamed_data = Vec::new();
+        let mut reply = self
+            .call_streaming(method, params, |event| {
+                if event.stream == IpcOutputStream::Data {
+                    streamed_data.extend_from_slice(&event.bytes);
+                }
+                Ok(())
+            })
+            .await?;
+        if reply.result.get("streamed").and_then(Value::as_bool) == Some(true) {
+            let expected = reply
+                .result
+                .get("len")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| {
+                    IpcClientError::Protocol("streamed response is missing len".into())
+                })?;
+            if streamed_data.len() as u64 != expected {
+                return Err(IpcClientError::Protocol(format!(
+                    "streamed byte count mismatch: expected {expected}, received {}",
+                    streamed_data.len()
+                )));
+            }
+            let result = reply.result.as_object_mut().ok_or_else(|| {
+                IpcClientError::Protocol("streamed response is not an object".into())
+            })?;
+            result.insert("bytes_b64".into(), Value::String(B64.encode(streamed_data)));
+            result.remove("streamed");
+        }
+        Ok(reply)
     }
 
     pub async fn call_streaming<F>(
@@ -3312,6 +3392,48 @@ summary = "Demo app used by IPC tests."
                 .unwrap();
             handle.await.unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn vfs_read_streams_above_the_logical_message_limit() {
+        let size = MAX_IPC_MESSAGE_BYTES / 4 * 3 + 64 * 1024;
+        let body = vec![0x5a; size];
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("private-run/bloom.sock");
+        let vfs = Vfs::builder()
+            .mount(
+                "stub",
+                Arc::new(SingleFileHandler::new("large", body.clone())),
+            )
+            .build();
+        let server = IpcServer::new(vfs, "0", vec![]);
+        let serving = server.clone();
+        let serving_socket = socket.clone();
+        let handle = tokio::spawn(async move { serving.serve(&serving_socket).await.unwrap() });
+        for _ in 0..100 {
+            if socket.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        let mut received = Vec::new();
+        let result = IpcClient::new(&socket)
+            .call_streaming("read", json!({"path": "/stub/large"}), |event| {
+                assert_eq!(event.stream, IpcOutputStream::Data);
+                received.extend_from_slice(&event.bytes);
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert_eq!(result.result["streamed"], true);
+        assert_eq!(received, body);
+
+        IpcClient::new(&socket)
+            .call("shutdown", Value::Null)
+            .await
+            .unwrap();
+        handle.await.unwrap();
     }
 
     #[tokio::test]

@@ -356,7 +356,19 @@ fn install_github_source_with_expectation(
         let (result, meta, index) = daemon
             .petals
             .store()
-            .install_prepared_petal_package_with_source(package, Some(provenance.clone()))
+            .install_prepared_petal_package_with_source_guarded(
+                package,
+                Some(provenance.clone()),
+                || {
+                    if context.is_some_and(|context| context.is_cancelled()) {
+                        Err(bloom_petals::PetalError::vm(
+                            "Petal source install cancelled by disconnected client",
+                        ))
+                    } else {
+                        Ok(())
+                    }
+                },
+            )
             .context("install generated Petal package")?;
         Ok((result, meta, index, consent, provenance))
     })();
@@ -2190,6 +2202,9 @@ mod tests {
                     bloom_daemon::ipc::IpcOutputStream::Stderr => {
                         stderr.extend_from_slice(&event.bytes)
                     }
+                    bloom_daemon::ipc::IpcOutputStream::Data => {
+                        panic!("source build emitted an IPC data stream")
+                    }
                 }
             }
         })
@@ -2208,6 +2223,9 @@ mod tests {
                 }
                 bloom_daemon::ipc::IpcOutputStream::Stderr => {
                     stderr.extend_from_slice(&event.bytes)
+                }
+                bloom_daemon::ipc::IpcOutputStream::Data => {
+                    panic!("source build emitted an IPC data stream")
                 }
             }
         }

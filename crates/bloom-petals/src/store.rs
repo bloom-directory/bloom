@@ -207,6 +207,18 @@ impl PetalStore {
         package: PreparedPetalPackage,
         source: Option<PetalSourceProvenance>,
     ) -> Result<(InstallResult, PetalMeta, RouteIndex), PetalError> {
+        self.install_prepared_petal_package_with_source_guarded(package, source, || Ok(()))
+    }
+
+    pub fn install_prepared_petal_package_with_source_guarded<F>(
+        &self,
+        package: PreparedPetalPackage,
+        source: Option<PetalSourceProvenance>,
+        commit_guard: F,
+    ) -> Result<(InstallResult, PetalMeta, RouteIndex), PetalError>
+    where
+        F: Fn() -> Result<(), PetalError>,
+    {
         verify_prepared_package(&package)?;
         let hash = package.hash.clone();
         validate_hash_arg(&hash)?;
@@ -277,11 +289,13 @@ impl PetalStore {
             route_index_schema: ROUTE_INDEX_SCHEMA.to_string(),
         });
         meta.source = source;
+        commit_guard()?;
         self.write_meta(&meta)?;
 
         // This atomic rename is the installation commit point. Before it,
         // readers continue to resolve the previous package; after it, they
         // resolve only this fully prepared and verified package.
+        commit_guard()?;
         self.write_petal_owner(&package.name, &hash)?;
 
         // Keep prior package data until the next store open. A request that
@@ -1013,6 +1027,37 @@ name = "echo"
         assert_eq!(meta.source.as_ref(), Some(&provenance));
         let loaded = store.load_meta(&result.hash).unwrap();
         assert_eq!(loaded.source.as_ref(), Some(&provenance));
+    }
+
+    #[test]
+    fn cancelled_prepared_install_does_not_publish_an_owner() {
+        let (d, store) = store();
+        let package_dir = d.path().join("cancelled-pkg");
+        write_file(
+            &package_dir,
+            "petal.toml",
+            br#"schema = "bloom.petal.package.v1"
+name = "echo"
+"#,
+        );
+        write_file(&package_dir, "README.md", b"# echo");
+        write_file(&package_dir, "AGENTS.md", b"# echo agents");
+        write_file(
+            &package_dir,
+            "petal/echo/[name].txt.wasm",
+            route_component_wasm(),
+        );
+        let package = PreparedPetalPackage::from_dir(&package_dir).unwrap();
+
+        let error = store
+            .install_prepared_petal_package_with_source_guarded(package, None, || {
+                Err(PetalError::vm("cancelled before commit"))
+            })
+            .unwrap_err();
+
+        assert!(error.to_string().contains("cancelled before commit"));
+        assert_eq!(store.resolve_petal_owner("echo").unwrap(), None);
+        assert!(store.list_package_hashes().unwrap().is_empty());
     }
 
     #[test]
