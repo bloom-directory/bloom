@@ -12,13 +12,21 @@ Bloom exposes actions through three client interaction modes:
 The `bloom` CLI has exactly two local lifecycle commands: `bloom init` creates
 the home, and `bloom serve` owns the long-running Machine. Every other command,
 including `status`, `completions`, `update`, `petals`, and the `bloom vfs`
-facade—and `bloom --version`—is only a client proxy to that running Machine over the configured IPC
+facade is only a client proxy to that running Machine over the configured IPC
 endpoint. A missing, refused, or inaccessible default or explicit endpoint is
 an error which names the endpoint and tells the user to start `bloom serve`.
+`bloom --version` is the diagnostic exception: it always reports the local CLI
+version and, when reachable, the daemon version and negotiated IPC protocol;
+it reports the daemon as unavailable without constructing a one-shot Machine.
 There is no one-shot Machine construction or local Broker fallback.
 Hidden platform bootstrap and supervision helpers are submodes of `init` or
 `serve`; the binary has no pre-parser execution modes outside those lifecycle
 namespaces.
+
+Every IPC request advertises the client's current and supported Bloom protocol
+range, and every response advertises the daemon's. Both peers fail closed when
+the ranges do not overlap or the metadata is absent; package versions are
+reported for diagnosis but are not used as the compatibility contract.
 
 The daemon publishes its socket without exposing a permissive bind-to-chmod
 window. It creates a unique `0700` staging directory inside the endpoint's

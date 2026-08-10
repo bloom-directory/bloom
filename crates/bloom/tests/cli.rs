@@ -132,7 +132,6 @@ fn every_non_lifecycle_command_family_requires_the_daemon_endpoint() {
     let home = fresh_home();
     let operation_id = "11".repeat(32);
     let commands: Vec<Vec<&str>> = vec![
-        vec!["--version"],
         vec!["status"],
         vec!["audit", "status"],
         vec!["vfs", "ls", "/"],
@@ -157,15 +156,36 @@ fn every_non_lifecycle_command_family_requires_the_daemon_endpoint() {
 }
 
 #[test]
-fn version_is_reported_by_the_running_daemon() {
+fn version_reports_the_cli_when_the_daemon_is_unavailable() {
     let home = fresh_home();
-    let (server, server_thread) = spawn_ipc_server(home.path(), bloom_vfs::Vfs::new());
+    let expected = format!(
+        "bloom {}\nbloom-daemon unavailable\nbloom-ipc {} (not negotiated)\n",
+        env!("CARGO_PKG_VERSION"),
+        bloom_daemon::ipc::IPC_PROTOCOL_CURRENT,
+    );
 
     bloom_cmd(home.path())
         .arg("--version")
         .assert()
         .success()
-        .stdout(predicate::eq("bloom ipc-test-version\n"));
+        .stdout(predicate::eq(expected));
+}
+
+#[test]
+fn version_reports_cli_daemon_and_negotiated_ipc_versions() {
+    let home = fresh_home();
+    let (server, server_thread) = spawn_ipc_server(home.path(), bloom_vfs::Vfs::new());
+    let protocol = bloom_daemon::ipc::IPC_PROTOCOL_CURRENT;
+    let expected = format!(
+        "bloom {}\nbloom-daemon ipc-test-version\nbloom-ipc {protocol} (compatible; cli {protocol}, daemon {protocol})\n",
+        env!("CARGO_PKG_VERSION"),
+    );
+
+    bloom_cmd(home.path())
+        .arg("--version")
+        .assert()
+        .success()
+        .stdout(predicate::eq(expected));
 
     stop_ipc_server(server, server_thread);
 }

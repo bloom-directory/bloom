@@ -25,7 +25,9 @@
 //!
 //! Wire framing is one JSON document per line. Encoding/decoding errors
 //! produce a JSON-RPC `-32700` parse-error response and the connection
-//! continues. Unknown methods produce `-32601`.
+//! continues. Unknown methods produce `-32601`. Every request and response
+//! carries a `bloom_protocol` range; peers fail closed when the ranges do not
+//! overlap.
 
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -51,6 +53,57 @@ use tracing::{debug, info, trace, warn};
 /// Source-build output is capped well below this so successful diagnostic
 /// responses still leave room for package metadata and JSON encoding.
 const MAX_IPC_FRAME_BYTES: usize = 4 * 1024 * 1024;
+
+/// Current Bloom CLI-to-daemon IPC protocol and the range this build can
+/// decode. Package versions are diagnostic; this range is the compatibility
+/// contract enforced on every request and response.
+pub const IPC_PROTOCOL_CURRENT: u32 = 1;
+pub const IPC_PROTOCOL_MIN_SUPPORTED: u32 = 1;
+pub const IPC_PROTOCOL_MAX_SUPPORTED: u32 = IPC_PROTOCOL_CURRENT;
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct IpcProtocolRange {
+    pub current: u32,
+    pub min: u32,
+    pub max: u32,
+}
+
+impl IpcProtocolRange {
+    pub const fn supported() -> Self {
+        Self {
+            current: IPC_PROTOCOL_CURRENT,
+            min: IPC_PROTOCOL_MIN_SUPPORTED,
+            max: IPC_PROTOCOL_MAX_SUPPORTED,
+        }
+    }
+
+    fn is_valid(self) -> bool {
+        self.min <= self.current && self.current <= self.max
+    }
+
+    pub fn negotiate(self, peer: Self) -> Option<u32> {
+        if !self.is_valid() || !peer.is_valid() {
+            return None;
+        }
+        let minimum = self.min.max(peer.min);
+        let maximum = self.max.min(peer.max);
+        (minimum <= maximum).then_some(maximum)
+    }
+}
+
+impl std::fmt::Display for IpcProtocolRange {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.min == self.max {
+            write!(f, "{}", self.current)
+        } else {
+            write!(
+                f,
+                "{} (supported {}..={})",
+                self.current, self.min, self.max
+            )
+        }
+    }
+}
 
 async fn read_bounded_frame<R>(reader: &mut R) -> std::io::Result<Option<Vec<u8>>>
 where
@@ -124,10 +177,19 @@ struct Request {
     params: Value,
 }
 
+#[derive(Debug, Deserialize)]
+struct WireRequest {
+    #[serde(flatten)]
+    request: Request,
+    #[serde(default)]
+    bloom_protocol: Option<IpcProtocolRange>,
+}
+
 #[derive(Debug, Serialize)]
 struct Response {
     jsonrpc: &'static str,
     id: Value,
+    bloom_protocol: IpcProtocolRange,
     #[serde(skip_serializing_if = "Option::is_none")]
     result: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -191,6 +253,7 @@ impl Response {
         Self {
             jsonrpc: "2.0",
             id,
+            bloom_protocol: IpcProtocolRange::supported(),
             result: Some(result),
             error: None,
         }
@@ -199,6 +262,7 @@ impl Response {
         Self {
             jsonrpc: "2.0",
             id,
+            bloom_protocol: IpcProtocolRange::supported(),
             result: None,
             error: Some(RpcError {
                 code,
@@ -212,6 +276,7 @@ impl Response {
         Self {
             jsonrpc: "2.0",
             id,
+            bloom_protocol: IpcProtocolRange::supported(),
             result: None,
             error: Some(RpcError {
                 code: error.rpc_code(),
@@ -521,10 +586,27 @@ impl IpcServer {
             if line.iter().all(u8::is_ascii_whitespace) {
                 continue;
             }
-            let resp = match serde_json::from_slice::<Request>(&line) {
-                Ok(req) => {
-                    trace!(method = %req.method, "ipc.request");
-                    self.dispatch(req).await
+            let resp = match serde_json::from_slice::<WireRequest>(&line) {
+                Ok(wire) => {
+                    trace!(method = %wire.request.method, "ipc.request");
+                    match wire.bloom_protocol {
+                        Some(peer) if IpcProtocolRange::supported().negotiate(peer).is_some() => {
+                            self.dispatch(wire.request).await
+                        }
+                        Some(peer) => Response::err(
+                            wire.request.id,
+                            -32010,
+                            format!(
+                                "incompatible Bloom IPC protocol: daemon supports {}, client supports {peer}",
+                                IpcProtocolRange::supported()
+                            ),
+                        ),
+                        None => Response::err(
+                            wire.request.id,
+                            -32010,
+                            "missing Bloom IPC protocol metadata; upgrade the CLI and daemon together",
+                        ),
+                    }
                 }
                 Err(e) => {
                     debug!(error = %e, "ipc.parse_error");
@@ -1389,6 +1471,18 @@ pub enum IpcClientError {
     Rpc(RpcCallError),
     #[error("invalid IPC response: {0}")]
     Protocol(String),
+    #[error("incompatible Bloom IPC protocol: client supports {client}, daemon supports {daemon}")]
+    Incompatible {
+        client: IpcProtocolRange,
+        daemon: IpcProtocolRange,
+    },
+}
+
+#[derive(Debug)]
+pub struct IpcCallResult {
+    pub result: Value,
+    pub daemon_protocol: IpcProtocolRange,
+    pub negotiated_protocol: u32,
 }
 
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
@@ -1411,12 +1505,22 @@ impl IpcClient {
     }
 
     pub async fn call(&self, method: &str, params: Value) -> Result<Value, IpcClientError> {
+        Ok(self.call_with_protocol(method, params).await?.result)
+    }
+
+    pub async fn call_with_protocol(
+        &self,
+        method: &str,
+        params: Value,
+    ) -> Result<IpcCallResult, IpcClientError> {
         trace!(socket = %self.socket_path.display(), %method, "ipc.client.call");
+        let client_protocol = IpcProtocolRange::supported();
         let req = json!({
             "jsonrpc": "2.0",
             "id": 1,
             "method": method,
             "params": params,
+            "bloom_protocol": client_protocol,
         });
         let mut out = serde_json::to_vec(&req).unwrap();
         if out.len() > MAX_IPC_FRAME_BYTES {
@@ -1435,6 +1539,26 @@ impl IpcClient {
         })?;
         let v: Value = serde_json::from_slice(&line)
             .map_err(|error| IpcClientError::Protocol(error.to_string()))?;
+        let daemon_protocol = v
+            .get("bloom_protocol")
+            .cloned()
+            .ok_or_else(|| {
+                IpcClientError::Protocol(
+                    "daemon does not advertise a Bloom IPC protocol version; upgrade or restart the daemon"
+                        .to_owned(),
+                )
+            })
+            .and_then(|value| {
+                serde_json::from_value::<IpcProtocolRange>(value)
+                    .map_err(|error| IpcClientError::Protocol(error.to_string()))
+            })?;
+        let negotiated_protocol =
+            client_protocol
+                .negotiate(daemon_protocol)
+                .ok_or(IpcClientError::Incompatible {
+                    client: client_protocol,
+                    daemon: daemon_protocol,
+                })?;
         if let Some(error) = v.get("error") {
             debug!(%method, error = %error, "ipc.client.rpc_error");
             let error: RpcError = serde_json::from_value(error.clone())
@@ -1448,7 +1572,11 @@ impl IpcClient {
                 machine,
             }));
         }
-        Ok(v.get("result").cloned().unwrap_or(Value::Null))
+        Ok(IpcCallResult {
+            result: v.get("result").cloned().unwrap_or(Value::Null),
+            daemon_protocol,
+            negotiated_protocol,
+        })
     }
 }
 
@@ -1469,6 +1597,27 @@ mod tests {
         assert!(error.to_string().contains("IPC frame exceeds"));
     }
 
+    #[test]
+    fn protocol_ranges_negotiate_the_highest_shared_version() {
+        let local = IpcProtocolRange {
+            current: 3,
+            min: 1,
+            max: 3,
+        };
+        let overlapping = IpcProtocolRange {
+            current: 4,
+            min: 2,
+            max: 4,
+        };
+        let disjoint = IpcProtocolRange {
+            current: 5,
+            min: 4,
+            max: 5,
+        };
+        assert_eq!(local.negotiate(overlapping), Some(3));
+        assert_eq!(local.negotiate(disjoint), None);
+    }
+
     #[tokio::test]
     async fn client_rejects_oversized_request_before_connecting() {
         let client = IpcClient::new("/definitely/missing/bloom.sock");
@@ -1481,6 +1630,31 @@ mod tests {
             .unwrap_err();
         assert!(matches!(error, IpcClientError::Protocol(_)));
         assert!(error.to_string().contains("IPC request exceeds"));
+    }
+
+    #[tokio::test]
+    async fn client_rejects_a_daemon_that_does_not_advertise_its_protocol() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("legacy.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let legacy_daemon = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (rd, mut wr) = stream.into_split();
+            let mut rd = BufReader::new(rd);
+            let mut request = String::new();
+            rd.read_line(&mut request).await.unwrap();
+            wr.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":\"0.0.0-old\"}\n")
+                .await
+                .unwrap();
+        });
+
+        let error = IpcClient::new(&socket)
+            .call("version", Value::Null)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, IpcClientError::Protocol(_)));
+        assert!(error.to_string().contains("does not advertise"));
+        legacy_daemon.await.unwrap();
     }
 
     struct MockBatchConfirmation;
@@ -2536,8 +2710,13 @@ summary = "Demo app used by IPC tests."
         }
         let client = IpcClient::new(&sock);
 
-        let v = client.call("version", Value::Null).await.unwrap();
-        assert_eq!(v.as_str().unwrap(), "0.0.0-test");
+        let version = client
+            .call_with_protocol("version", Value::Null)
+            .await
+            .unwrap();
+        assert_eq!(version.result.as_str().unwrap(), "0.0.0-test");
+        assert_eq!(version.daemon_protocol, IpcProtocolRange::supported());
+        assert_eq!(version.negotiated_protocol, IPC_PROTOCOL_CURRENT);
 
         let chains = client.call("chains", Value::Null).await.unwrap();
         assert_eq!(chains[0], "ethereum");
@@ -2611,6 +2790,29 @@ summary = "Demo app used by IPC tests."
         let stream = UnixStream::connect(&sock).await.unwrap();
         let (rd, mut wr) = stream.into_split();
         let mut rd = BufReader::new(rd);
+
+        for bloom_protocol in [None, Some(json!({"current": 2, "min": 2, "max": 2}))] {
+            let mut request = json!({
+                "jsonrpc": "2.0",
+                "id": "incompatible",
+                "method": "version",
+                "params": null,
+            });
+            if let Some(protocol) = bloom_protocol {
+                request["bloom_protocol"] = protocol;
+            }
+            wr.write_all(serde_json::to_string(&request).unwrap().as_bytes())
+                .await
+                .unwrap();
+            wr.write_all(b"\n").await.unwrap();
+            wr.flush().await.unwrap();
+            let mut line = String::new();
+            rd.read_line(&mut line).await.unwrap();
+            let response: Value = serde_json::from_str(line.trim()).unwrap();
+            assert_eq!(response["error"]["code"], -32010);
+            assert_eq!(response["bloom_protocol"]["current"], IPC_PROTOCOL_CURRENT);
+        }
+
         for (id, method) in ["nope", "write_unlocked", "wallet.sign_policy"]
             .into_iter()
             .enumerate()
@@ -2619,7 +2821,8 @@ summary = "Demo app used by IPC tests."
                 "jsonrpc": "2.0",
                 "id": id,
                 "method": method,
-                "params": {}
+                "params": {},
+                "bloom_protocol": IpcProtocolRange::supported(),
             });
             wr.write_all(serde_json::to_string(&request).unwrap().as_bytes())
                 .await

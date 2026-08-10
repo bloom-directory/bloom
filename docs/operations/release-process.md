@@ -89,7 +89,7 @@ git diff -- Cargo.toml Cargo.lock
 
 # 4. Build and verify the binary.
 cargo build --release -p bloom --all-features --locked
-./target/release/bloom --version    # must print "bloom $VERSION"
+./target/release/bloom --version    # first line must print "bloom $VERSION"
 
 # 5. Commit the bump on a release-prep branch and open a PR. Do not
 #    push directly to master; the default branch requires its status
@@ -108,7 +108,7 @@ git switch master
 git pull --ff-only origin master
 test "$(sed -n -E 's/^version = "([0-9]+\.[0-9]+\.[0-9]+)"/\1/p' Cargo.toml | head -n 1)" = "$VERSION"
 cargo build --release -p bloom --all-features --locked
-./target/release/bloom --version    # must print "bloom $VERSION"
+./target/release/bloom --version    # first line must print "bloom $VERSION"
 git tag "v$VERSION"
 git push origin "v$VERSION"
 ```

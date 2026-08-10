@@ -785,10 +785,8 @@ fn acceptance_rerun_is_bound_to_the_verified_bundle_when_present() {
             .output()
             .unwrap();
         assert!(output.status.success());
-        assert_eq!(
-            String::from_utf8(output.stdout).unwrap().trim(),
-            expected_version
-        );
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert_eq!(stdout.lines().next().unwrap_or_default(), expected_version);
     }
 }
 

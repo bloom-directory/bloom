@@ -27,7 +27,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
 use bloom_daemon::Daemon;
 use bloom_daemon::ipc::{
-    IpcClient, IpcClientError, IpcServer, MachineCeremonyAction, MachineCommand,
+    IpcClient, IpcClientError, IpcProtocolRange, IpcServer, MachineCeremonyAction, MachineCommand,
     MachineCommandFuture, MachineCommandOutput, MachineCommandService, MachineCustodyKind,
     MachineError, MachineErrorKind, MachineOperationAction, default_socket_path,
 };
@@ -1711,7 +1711,7 @@ async fn handle_operation(home: &HomeDir, command: OperationCmd) -> Result<Strin
     long_about = "Bloom mounts an agentic Ethereum wallet as a directory for agents. EXPERIMENTAL / UNAUDITED ALPHA: do not use with funds you cannot afford to lose, and review every generated transaction plan before signing. Read balances, contracts, ENS, prices, and status with cat/ls; stage wallet actions by writing intents into an outbox; confirm only after reviewing the generated plan. New agents should read https://bloom.directory/SKILL.md, then run bloom init and bloom serve --mount ~/bloom. Use bloom vfs only as a fallback when mounting is unavailable."
 )]
 struct Cli {
-    /// Show the version reported by the running Bloom daemon.
+    /// Show CLI, daemon, and negotiated IPC protocol versions.
     #[arg(long)]
     version: bool,
 
@@ -2160,6 +2160,13 @@ async fn try_ipc(
                 endpoint.display
             ),
         )),
+        Err(error @ IpcClientError::Incompatible { .. }) => Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            format!(
+                "Bloom daemon endpoint {} rejected: {error}",
+                endpoint.display
+            ),
+        )),
     }
 }
 
@@ -2315,20 +2322,36 @@ async fn run(cli: Cli) -> Result<()> {
     trace!(cmd = ?cli.cmd, home = %home.root().display(), "cli.dispatch");
 
     if cli.version {
-        let version = try_ipc(
-            &IpcClient::new(&client_endpoint.socket),
-            &client_endpoint,
-            "version",
-            serde_json::Value::Null,
-        )
-        .await
-        .with_context(|| format!("ipc version via {}", client_endpoint.display))?;
-        println!(
-            "bloom {}",
-            version
-                .as_str()
-                .context("daemon version response is not a string")?
-        );
+        let client_protocol = IpcProtocolRange::supported();
+        println!("bloom {}", env!("CARGO_PKG_VERSION"));
+        match IpcClient::new(&client_endpoint.socket)
+            .call_with_protocol("version", serde_json::Value::Null)
+            .await
+        {
+            Ok(reply) => {
+                let daemon_version = reply
+                    .result
+                    .as_str()
+                    .context("daemon version response is not a string")?;
+                println!("bloom-daemon {daemon_version}");
+                println!(
+                    "bloom-ipc {} (compatible; cli {}, daemon {})",
+                    reply.negotiated_protocol, client_protocol, reply.daemon_protocol
+                );
+            }
+            Err(IpcClientError::Transport(_)) => {
+                println!("bloom-daemon unavailable");
+                println!("bloom-ipc {client_protocol} (not negotiated)");
+            }
+            Err(IpcClientError::Incompatible { client, daemon }) => {
+                println!("bloom-daemon incompatible");
+                println!("bloom-ipc incompatible (cli {client}, daemon {daemon})");
+            }
+            Err(error) => {
+                println!("bloom-daemon incompatible");
+                println!("bloom-ipc {client_protocol} (not negotiated: {error})");
+            }
+        }
         return Ok(());
     }
 

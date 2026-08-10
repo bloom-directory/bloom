@@ -172,7 +172,7 @@ jobs:
           VERSION: ${{ needs.prepare.outputs.release_version }}
         run: |
           set -euo pipefail
-          ACTUAL="$(./target/release/${{ matrix.binary }} --version | awk '{print $2}')"
+          ACTUAL="$(./target/release/${{ matrix.binary }} --version | head -n 1 | awk '{print $2}')"
           if [[ "$ACTUAL" != "$VERSION" ]]; then
             echo "::error::binary version '$ACTUAL' does not match tag '$VERSION'"
             exit 1
