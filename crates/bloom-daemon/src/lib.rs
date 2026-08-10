@@ -4651,12 +4651,20 @@ mod tests {
         let payload = b"exact owner order".to_vec();
         let payload_digest =
             bloom_broker_api::Digest32::from_bytes(sha2::Sha256::digest(&payload).into());
+        let claim_payload_digest = {
+            let mut digest = sha2::Sha256::new();
+            digest.update(b"bloom.petal.payload-batch.v1\0");
+            digest.update(1_u64.to_be_bytes());
+            digest.update((payload.len() as u64).to_be_bytes());
+            digest.update(&payload);
+            bloom_broker_api::Digest32::from_bytes(digest.finalize().into())
+        };
         let claim = bloom_broker_api::PetalUseClaim {
             package_hash: bloom_broker_api::Digest32::from_bytes([0xbb; 32]),
             route: context.route_id.clone(),
             operation_class: bloom_broker_api::Token::new("order.place").unwrap(),
             crypto_suite: bloom_broker_api::CryptoSuite::Secp256k1Sha256Recoverable,
-            payload_digest: payload_digest.clone(),
+            payload_digest: claim_payload_digest,
             ordered_hashes: vec![payload_digest.clone()],
             declared_debits: Vec::new(),
             declared_destinations: Vec::new(),

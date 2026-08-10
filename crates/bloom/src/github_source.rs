@@ -1,5 +1,6 @@
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, anyhow, bail};
 use bloom_daemon::Daemon;
@@ -14,6 +15,8 @@ use sha2::{Digest, Sha256};
 use url::Url;
 
 const TRUSTED_GITHUB_OWNER: &str = "bloom-directory";
+// Two maximally JSON-escaped streams still fit within the 4 MiB IPC frame.
+const SOURCE_BUILD_STREAM_LIMIT: usize = 256 * 1024;
 const NEAR_INTENTS_RELEASE_COMMIT: &str = "08e9bd83786425656bdd87e35031030cb7f3dc14";
 const ENSO_RELEASE_COMMIT: &str = "59e3c884f83c9c97b69b1b415becf8572791273b";
 
@@ -72,13 +75,13 @@ struct SourceBuildOutput {
 }
 
 #[derive(Clone, Debug)]
-struct SourceBuildCommandFailure {
+struct SourceBuildFailure {
     message: String,
     stdout: String,
     stderr: String,
 }
 
-impl std::fmt::Display for SourceBuildCommandFailure {
+impl std::fmt::Display for SourceBuildFailure {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             formatter,
@@ -88,17 +91,18 @@ impl std::fmt::Display for SourceBuildCommandFailure {
     }
 }
 
-impl std::error::Error for SourceBuildCommandFailure {}
+impl std::error::Error for SourceBuildFailure {}
 
 #[derive(Debug)]
-pub(crate) struct GitHubSourceBuildFailure {
+pub(crate) struct GitHubSourceInstallFailure {
     pub progress: Vec<String>,
+    pub completion_progress: Vec<String>,
     pub stdout: String,
     pub stderr: String,
     pub message: String,
 }
 
-impl std::fmt::Display for GitHubSourceBuildFailure {
+impl std::fmt::Display for GitHubSourceInstallFailure {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             formatter,
@@ -108,9 +112,9 @@ impl std::fmt::Display for GitHubSourceBuildFailure {
     }
 }
 
-impl std::error::Error for GitHubSourceBuildFailure {}
+impl std::error::Error for GitHubSourceInstallFailure {}
 
-pub(crate) fn source_build_failure(error: &anyhow::Error) -> Option<&GitHubSourceBuildFailure> {
+pub(crate) fn source_install_failure(error: &anyhow::Error) -> Option<&GitHubSourceInstallFailure> {
     error.downcast_ref()
 }
 
@@ -241,66 +245,88 @@ fn install_github_source_with_expectation(
     let build_output = match run_source_build(tmp.path()) {
         Ok(output) => output,
         Err(error) => {
-            if let Some(failure) = error.downcast_ref::<SourceBuildCommandFailure>() {
-                return Err(anyhow::Error::new(GitHubSourceBuildFailure {
+            if let Some(failure) = error.downcast_ref::<SourceBuildFailure>() {
+                return Err(anyhow::Error::new(GitHubSourceInstallFailure {
                     progress,
+                    completion_progress: Vec::new(),
                     stdout: failure.stdout.clone(),
                     stderr: failure.stderr.clone(),
                     message: failure.message.clone(),
                 }));
             }
-            return Err(error);
+            return Err(anyhow::Error::new(GitHubSourceInstallFailure {
+                progress,
+                completion_progress: Vec::new(),
+                stdout: String::new(),
+                stderr: String::new(),
+                message: format!("{error:#}"),
+            }));
         }
     };
 
-    let completion_progress = vec!["Validating Petal package...".to_owned()];
-    let package =
-        PreparedPetalPackage::from_dir(tmp.path()).context("validate generated Petal package")?;
-    if let Some(expected) = expected {
-        if package.name != expected.name {
-            bail!(
-                "pre-installed Petal {} built unexpected package name {:?}",
-                expected.name,
-                package.name
-            );
+    let mut completion_progress = Vec::new();
+    let installed = (|| -> Result<_> {
+        completion_progress.push("Validating Petal package...".to_owned());
+        let package = PreparedPetalPackage::from_dir(tmp.path())
+            .context("validate generated Petal package")?;
+        if let Some(expected) = expected {
+            if package.name != expected.name {
+                bail!(
+                    "pre-installed Petal {} built unexpected package name {:?}",
+                    expected.name,
+                    package.name
+                );
+            }
+            if let Some(expected_hash) = expected.expected_hash
+                && package.hash != expected_hash
+            {
+                bail!(
+                    "pre-installed Petal {} package hash {} does not match expected hash {}",
+                    expected.name,
+                    package.hash,
+                    expected_hash
+                );
+            }
         }
-        if let Some(expected_hash) = expected.expected_hash
-            && package.hash != expected_hash
-        {
-            bail!(
-                "pre-installed Petal {} package hash {} does not match expected hash {}",
-                expected.name,
-                package.hash,
-                expected_hash
-            );
-        }
-    }
-    let mut consent = petal_consent_summary(&package).context("build app consent summary")?;
-    let bindings = daemon
-        .config
-        .petals
-        .runtime
-        .get(&consent.name)
-        .map(|app| &app.endpoints)
-        .cloned()
-        .unwrap_or_default();
-    bloom_petals::package::apply_petal_consent_endpoint_bindings(&mut consent, &bindings)
-        .context("apply configured Petal endpoint bindings")?;
-    let provenance = PetalSourceProvenance {
-        source_kind: "github".to_string(),
-        url: repo.canonical_url.clone(),
-        owner: repo.owner.clone(),
-        repo: repo.repo.clone(),
-        requested_ref: resolved.requested_ref.clone(),
-        resolved_commit: resolved.commit.clone(),
-        selected_tag: resolved.selected_tag.clone(),
-        package_hash: package.hash.clone(),
-    };
-    let (result, meta, index) = daemon
-        .petals
-        .store()
-        .install_prepared_petal_package_with_source(package, Some(provenance.clone()))
-        .context("install generated Petal package")?;
+        completion_progress.push("Building Petal consent summary...".to_owned());
+        let mut consent = petal_consent_summary(&package).context("build app consent summary")?;
+        let bindings = daemon
+            .config
+            .petals
+            .runtime
+            .get(&consent.name)
+            .map(|app| &app.endpoints)
+            .cloned()
+            .unwrap_or_default();
+        bloom_petals::package::apply_petal_consent_endpoint_bindings(&mut consent, &bindings)
+            .context("apply configured Petal endpoint bindings")?;
+        let provenance = PetalSourceProvenance {
+            source_kind: "github".to_string(),
+            url: repo.canonical_url.clone(),
+            owner: repo.owner.clone(),
+            repo: repo.repo.clone(),
+            requested_ref: resolved.requested_ref.clone(),
+            resolved_commit: resolved.commit.clone(),
+            selected_tag: resolved.selected_tag.clone(),
+            package_hash: package.hash.clone(),
+        };
+        completion_progress.push("Installing Petal package...".to_owned());
+        let (result, meta, index) = daemon
+            .petals
+            .store()
+            .install_prepared_petal_package_with_source(package, Some(provenance.clone()))
+            .context("install generated Petal package")?;
+        Ok((result, meta, index, consent, provenance))
+    })();
+    let (result, meta, index, consent, provenance) = installed.map_err(|error| {
+        anyhow::Error::new(GitHubSourceInstallFailure {
+            progress: progress.clone(),
+            completion_progress: completion_progress.clone(),
+            stdout: build_output.stdout.clone(),
+            stderr: build_output.stderr.clone(),
+            message: format!("{error:#}"),
+        })
+    })?;
 
     Ok(GitHubInstallOutput {
         result,
@@ -935,29 +961,81 @@ fn run_source_build(root: &Path) -> Result<SourceBuildOutput> {
     if !command.is_file() {
         bail!("build command missing: {}", build.command);
     }
-    let output = Command::new(&command)
+    let mut child = Command::new(&command)
         .current_dir(root)
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .with_context(|| format!("run build command {}", build.command))?;
-    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-    if !output.status.success() {
-        return Err(anyhow::Error::new(SourceBuildCommandFailure {
+    let stdout = child.stdout.take().context("capture source-build stdout")?;
+    let stderr = child.stderr.take().context("capture source-build stderr")?;
+    let stdout_reader = std::thread::spawn(move || capture_bounded_stream(stdout));
+    let stderr_reader = std::thread::spawn(move || capture_bounded_stream(stderr));
+    let status = child
+        .wait()
+        .with_context(|| format!("wait for build command {}", build.command))?;
+    let stdout = join_captured_stream(stdout_reader, "stdout")?;
+    let stderr = join_captured_stream(stderr_reader, "stderr")?;
+    if !status.success() {
+        return Err(anyhow::Error::new(SourceBuildFailure {
             message: format!(
                 "build command failed: {} (status {})",
-                build.command, output.status
+                build.command, status
             ),
             stdout,
             stderr,
         }));
     }
     for output in build.outputs {
-        validate_repo_relative_path(&output, "build.outputs")?;
+        if let Err(error) = validate_repo_relative_path(&output, "build.outputs") {
+            return Err(anyhow::Error::new(SourceBuildFailure {
+                message: format!("{error:#}"),
+                stdout,
+                stderr,
+            }));
+        }
         if !root.join(&output).is_dir() {
-            bail!("build output missing: {output}");
+            return Err(anyhow::Error::new(SourceBuildFailure {
+                message: format!("build output missing: {output}"),
+                stdout,
+                stderr,
+            }));
         }
     }
     Ok(SourceBuildOutput { stdout, stderr })
+}
+
+fn capture_bounded_stream(mut reader: impl Read) -> std::io::Result<String> {
+    let mut retained = Vec::with_capacity(SOURCE_BUILD_STREAM_LIMIT);
+    let mut omitted = 0usize;
+    let mut buffer = [0u8; 16 * 1024];
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        let remaining = SOURCE_BUILD_STREAM_LIMIT.saturating_sub(retained.len());
+        let keep = remaining.min(read);
+        retained.extend_from_slice(&buffer[..keep]);
+        omitted = omitted.saturating_add(read - keep);
+    }
+    let mut output = String::from_utf8_lossy(&retained).into_owned();
+    if omitted > 0 {
+        output.push_str(&format!(
+            "\n[bloom: output truncated; {omitted} bytes omitted]\n"
+        ));
+    }
+    Ok(output)
+}
+
+fn join_captured_stream(
+    reader: std::thread::JoinHandle<std::io::Result<String>>,
+    stream: &str,
+) -> Result<String> {
+    reader
+        .join()
+        .map_err(|_| anyhow!("source-build {stream} reader panicked"))?
+        .with_context(|| format!("read source-build {stream}"))
 }
 
 fn read_source_manifest(root: &Path) -> Result<SourcePetalToml> {
@@ -1605,7 +1683,7 @@ mod tests {
         let daemon = Daemon::from_home(home_dir.clone()).unwrap();
 
         let error = install_github_source(&home_dir, &daemon, &repo, Some("v0.1.0")).unwrap_err();
-        let failure = source_build_failure(&error).expect("structured source-build failure");
+        let failure = source_install_failure(&error).expect("structured source-build failure");
         assert!(
             failure
                 .progress
@@ -1615,6 +1693,42 @@ mod tests {
         assert_eq!(failure.stdout, "partial build output\n");
         assert_eq!(failure.stderr, "build exploded\n");
         assert!(failure.message.contains("status exit status: 42"));
+        assert!(failure.completion_progress.is_empty());
+    }
+
+    #[test]
+    fn successful_build_retains_output_and_full_validation_error_chain() {
+        let fixture = source_repo_fixture(SourceRepoOptions {
+            repo: "bloom-petal-test-invalid-output",
+            tags: vec!["v0.1.0"],
+            include_manifest: true,
+            build_script: BuildScript::InvalidOutput,
+        })
+        .unwrap();
+        let repo = source_test_repo(fixture.bare.path(), "bloom-petal-test-invalid-output");
+        let home = tempfile::tempdir().unwrap();
+        let home_dir = HomeDir::at(home.path());
+        let daemon = Daemon::from_home(home_dir.clone()).unwrap();
+
+        let error = install_github_source(&home_dir, &daemon, &repo, Some("v0.1.0")).unwrap_err();
+        let failure = source_install_failure(&error).expect("structured source-install failure");
+        assert!(failure.stdout.contains("invalid package generated"));
+        assert!(failure.stderr.contains("validation should explain this"));
+        assert_eq!(failure.completion_progress, ["Validating Petal package..."]);
+        assert!(failure.message.contains("validate generated Petal package"));
+        assert!(
+            failure.message.contains("invalid wasm"),
+            "{}",
+            failure.message
+        );
+    }
+
+    #[test]
+    fn captured_build_stream_is_bounded_and_reports_omitted_bytes() {
+        let input = vec![b'x'; SOURCE_BUILD_STREAM_LIMIT + 17];
+        let output = capture_bounded_stream(std::io::Cursor::new(input)).unwrap();
+        assert!(output.starts_with(&"x".repeat(SOURCE_BUILD_STREAM_LIMIT)));
+        assert!(output.ends_with("[bloom: output truncated; 17 bytes omitted]\n"));
     }
 
     #[test]
@@ -2144,6 +2258,7 @@ mod tests {
         Success,
         Output,
         OutputFailure,
+        InvalidOutput,
         Failure,
     }
 
@@ -2260,6 +2375,9 @@ summary = "Demo app used by source install tests."
                 "#!/usr/bin/env bash\nset -euo pipefail\necho '{{\"routes\": 95}}'\necho 'build warning' >&2\nmkdir -p petal/{petal_name}\ncp components/route.wasm petal/{petal_name}/hello.txt.wasm\n"
             ),
             BuildScript::OutputFailure => "#!/usr/bin/env bash\nset -euo pipefail\necho 'partial build output'\necho 'build exploded' >&2\nexit 42\n".to_string(),
+            BuildScript::InvalidOutput => format!(
+                "#!/usr/bin/env bash\nset -euo pipefail\necho 'invalid package generated'\necho 'validation should explain this' >&2\nmkdir -p petal/{petal_name}\nprintf 'not wasm' > petal/{petal_name}/broken.wasm\n"
+            ),
             BuildScript::Failure => "#!/usr/bin/env bash\nset -euo pipefail\nexit 42\n".to_string(),
         };
         let script_path = work.path().join("scripts/build.sh");

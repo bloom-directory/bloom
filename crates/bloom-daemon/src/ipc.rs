@@ -42,10 +42,46 @@ use bloom_vfs::{Entry, EntryKind, Handler, HandlerError, Vfs, VfsPath};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Notify;
 use tracing::{debug, info, trace, warn};
+
+/// Maximum JSON document size on the newline-delimited IPC transport.
+/// Source-build output is capped well below this so successful diagnostic
+/// responses still leave room for package metadata and JSON encoding.
+const MAX_IPC_FRAME_BYTES: usize = 4 * 1024 * 1024;
+
+async fn read_bounded_frame<R>(reader: &mut R) -> std::io::Result<Option<Vec<u8>>>
+where
+    R: AsyncBufRead + Unpin,
+{
+    let mut frame = Vec::new();
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            return if frame.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(frame))
+            };
+        }
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let payload_len = newline.unwrap_or(available.len());
+        if frame.len().saturating_add(payload_len) > MAX_IPC_FRAME_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("IPC frame exceeds {MAX_IPC_FRAME_BYTES} bytes"),
+            ));
+        }
+        frame.extend_from_slice(&available[..payload_len]);
+        let consumed = payload_len + usize::from(newline.is_some());
+        reader.consume(consumed);
+        if newline.is_some() {
+            return Ok(Some(frame));
+        }
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum IpcError {
@@ -478,18 +514,14 @@ impl IpcServer {
     async fn handle_conn(&self, stream: UnixStream) -> std::io::Result<()> {
         let (rd, mut wr) = stream.into_split();
         let mut rd = BufReader::new(rd);
-        let mut line = String::new();
         loop {
-            line.clear();
-            let n = rd.read_line(&mut line).await?;
-            if n == 0 {
+            let Some(line) = read_bounded_frame(&mut rd).await? else {
                 return Ok(());
-            }
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
+            };
+            if line.iter().all(u8::is_ascii_whitespace) {
                 continue;
             }
-            let resp = match serde_json::from_str::<Request>(trimmed) {
+            let resp = match serde_json::from_slice::<Request>(&line) {
                 Ok(req) => {
                     trace!(method = %req.method, "ipc.request");
                     self.dispatch(req).await
@@ -508,6 +540,14 @@ impl IpcServer {
                 br#"{"jsonrpc":"2.0","id":null,"error":{"code":-32603,"message":"internal error"}}"#
                     .to_vec()
             });
+            if out.len() > MAX_IPC_FRAME_BYTES {
+                out = serde_json::to_vec(&Response::err(
+                    resp.id.clone(),
+                    -32002,
+                    format!("IPC response exceeds {MAX_IPC_FRAME_BYTES} bytes"),
+                ))
+                .expect("bounded IPC error response serializes");
+            }
             out.push(b'\n');
             wr.write_all(&out).await?;
             wr.flush().await?;
@@ -1372,9 +1412,6 @@ impl IpcClient {
 
     pub async fn call(&self, method: &str, params: Value) -> Result<Value, IpcClientError> {
         trace!(socket = %self.socket_path.display(), %method, "ipc.client.call");
-        let stream = UnixStream::connect(&self.socket_path).await?;
-        let (rd, mut wr) = stream.into_split();
-        let mut rd = BufReader::new(rd);
         let req = json!({
             "jsonrpc": "2.0",
             "id": 1,
@@ -1382,12 +1419,21 @@ impl IpcClient {
             "params": params,
         });
         let mut out = serde_json::to_vec(&req).unwrap();
+        if out.len() > MAX_IPC_FRAME_BYTES {
+            return Err(IpcClientError::Protocol(format!(
+                "IPC request exceeds {MAX_IPC_FRAME_BYTES} bytes"
+            )));
+        }
         out.push(b'\n');
+        let stream = UnixStream::connect(&self.socket_path).await?;
+        let (rd, mut wr) = stream.into_split();
+        let mut rd = BufReader::new(rd);
         wr.write_all(&out).await?;
         wr.flush().await?;
-        let mut line = String::new();
-        rd.read_line(&mut line).await?;
-        let v: Value = serde_json::from_str(line.trim())
+        let line = read_bounded_frame(&mut rd).await?.ok_or_else(|| {
+            IpcClientError::Protocol("daemon closed the connection without a response".into())
+        })?;
+        let v: Value = serde_json::from_slice(&line)
             .map_err(|error| IpcClientError::Protocol(error.to_string()))?;
         if let Some(error) = v.get("error") {
             debug!(%method, error = %error, "ipc.client.rpc_error");
@@ -1413,6 +1459,29 @@ mod tests {
         Arc,
         atomic::{AtomicUsize, Ordering},
     };
+
+    #[tokio::test]
+    async fn bounded_frame_reader_rejects_oversized_input_before_newline() {
+        let input = vec![b'x'; MAX_IPC_FRAME_BYTES + 1];
+        let mut reader = BufReader::new(input.as_slice());
+        let error = read_bounded_frame(&mut reader).await.unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("IPC frame exceeds"));
+    }
+
+    #[tokio::test]
+    async fn client_rejects_oversized_request_before_connecting() {
+        let client = IpcClient::new("/definitely/missing/bloom.sock");
+        let error = client
+            .call(
+                "oversized",
+                json!({ "payload": "x".repeat(MAX_IPC_FRAME_BYTES) }),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, IpcClientError::Protocol(_)));
+        assert!(error.to_string().contains("IPC request exceeds"));
+    }
 
     struct MockBatchConfirmation;
 

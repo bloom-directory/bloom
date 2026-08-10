@@ -2955,15 +2955,16 @@ impl bloom_daemon::ipc::PetalSourceInstallService for CanonicalPetalSourceInstal
         ) {
             Ok(installed) => installed,
             Err(error) => {
-                if let Some(failure) = github_source::source_build_failure(&error) {
+                if let Some(failure) = github_source::source_install_failure(&error) {
                     return Ok(serde_json::json!({
                         "progress_lines": failure.progress,
                         "build_stdout": failure.stdout,
                         "build_stderr": failure.stderr,
+                        "completion_progress_lines": failure.completion_progress,
                         "operation_error": failure.message,
                     }));
                 }
-                return Err(error.to_string());
+                return Err(format!("{error:#}"));
             }
         };
         let selected = installed

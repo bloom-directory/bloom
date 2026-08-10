@@ -87,7 +87,8 @@ impl RunningBloom {
         }
         let mut child = command.spawn().expect("start Bloom daemon for CLI test");
         let socket = bloom_daemon::ipc::default_socket_path(home);
-        for _ in 0..200 {
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while std::time::Instant::now() < deadline {
             if ipc_endpoint_accepting(&socket) {
                 return Self(child);
             }
@@ -108,7 +109,14 @@ impl RunningBloom {
         }
         let _ = child.kill();
         let _ = child.wait();
-        panic!("Bloom daemon did not create {}", socket.display());
+        let mut stderr = String::new();
+        if let Some(mut pipe) = child.stderr.take() {
+            let _ = pipe.read_to_string(&mut stderr);
+        }
+        panic!(
+            "Bloom daemon did not accept connections at {} within 30 seconds: {stderr}",
+            socket.display()
+        );
     }
 }
 
@@ -2254,7 +2262,8 @@ fn github_source_install_polymarket_dispatches_route_contract() {
     if std::env::var_os("BLOOM_RUN_NETWORK_TESTS").as_deref() != Some(std::ffi::OsStr::new("1")) {
         return;
     }
-    let petal_ref = "e2e898b69046c9f5d905dd2cd66b3a57ef195542";
+    // This commit uses the same canonical Petal contract revision as Bloom.
+    let petal_ref = "f92a800ce21ac594e3158c93e390aade683327c5";
     let home = fresh_home();
     let home_dir = bloom_proto::HomeDir::at(home.path());
     let mut config = bloom_proto::Config::local_default();
@@ -2284,8 +2293,8 @@ fn github_source_install_polymarket_dispatches_route_contract() {
         )))
         .stdout(predicate::str::contains("Building source package..."))
         .stdout(predicate::str::contains("Validating Petal package..."))
-        .stdout(predicate::str::contains("\"routes\": 95"))
-        .stdout(predicate::str::contains("routes: 95"));
+        .stdout(predicate::str::contains("\"routes\": 97"))
+        .stdout(predicate::str::contains("routes: 97"));
 
     bloom_cmd(home.path())
         .args(["petals", "ls"])
