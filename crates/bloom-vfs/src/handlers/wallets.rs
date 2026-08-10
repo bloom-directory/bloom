@@ -343,6 +343,12 @@ impl WalletsHandler {
         })
     }
 
+    fn custody_broker(&self) -> Result<&MachineBrokerClient, HandlerError> {
+        self.broker.as_ref().ok_or_else(|| {
+            HandlerError::backend("custody requires the authenticated Machine-to-Broker edge")
+        })
+    }
+
     fn registration_root(&self) -> std::path::PathBuf {
         self.policy_projection_root.join("registrations")
     }
@@ -499,7 +505,7 @@ impl WalletsHandler {
         }))
         .map_err(|error| HandlerError::invalid(format!("canonicalize registration: {error}")))?;
         let prepared = self
-            .broker()?
+            .custody_broker()?
             .prepare_custody(
                 bloom_machine_client::CustodyPrepareMethod::WalletRegistration,
                 bloom_broker_api::CustodyPrepareRequest {
@@ -577,7 +583,7 @@ impl WalletsHandler {
             return Ok(projection);
         }
         let status = self
-            .broker()?
+            .custody_broker()?
             .ceremony_status(projection.operation_id.clone())
             .await
             .map_err(|error| HandlerError::backend(error.to_string()))?;
@@ -622,7 +628,7 @@ impl WalletsHandler {
             ));
         }
         let status = self
-            .broker()?
+            .custody_broker()?
             .cancel_ceremony(operation_id.clone())
             .await
             .map_err(|error| HandlerError::backend(error.to_string()))?;
@@ -645,7 +651,7 @@ impl WalletsHandler {
         let projection = self.registration_projection(requested_name).await?;
         let operation_id = projection.operation_id;
         let result = self
-            .broker()?
+            .custody_broker()?
             .custody_result(bloom_broker_api::OperationRequest {
                 operation_id: operation_id.clone(),
             })
@@ -3541,10 +3547,14 @@ mod tests {
     async fn direct_machine_wallet_creation_is_removed_for_every_legacy_body() {
         let f = make_handler();
         let path = VfsPath::parse("/new").unwrap();
-        assert!(matches!(
-            f.handler.write(&path, b"alice").await,
-            Err(HandlerError::Backend(_))
-        ));
+        let error = f.handler.write(&path, b"alice").await.unwrap_err();
+        assert!(matches!(&error, HandlerError::Backend(_)));
+        assert!(
+            error
+                .to_string()
+                .contains("custody requires the authenticated Machine-to-Broker edge"),
+            "unexpected missing-Broker error: {error}"
+        );
         for body in [
             &b"name = \"bob\"\nkind = \"local\"\npassphrase = \"secret\"\n"[..],
             b"name = \"observer\"\nkind = \"watch\"\naddress = \"0x0000000000000000000000000000000000000001\"\n",
