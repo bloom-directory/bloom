@@ -1008,14 +1008,22 @@ mod tests {
         let temporary = tempfile::tempdir().unwrap();
         let state = temporary.path().join("petal-exact.json");
         let payload = b"exact venue payload";
-        let payload_digest = Digest32::from_bytes(Sha256::digest(payload).into());
+        let ordered_hash = Digest32::from_bytes(Sha256::digest(payload).into());
+        let claim_payload_digest = {
+            let mut digest = Sha256::new();
+            digest.update(b"bloom.petal.payload-batch.v1\0");
+            digest.update(1_u64.to_be_bytes());
+            digest.update((payload.len() as u64).to_be_bytes());
+            digest.update(payload);
+            Digest32::from_bytes(digest.finalize().into())
+        };
         let claim = PetalUseClaim {
             package_hash,
             route: "orders/place".into(),
             operation_class: token("order.place"),
             crypto_suite: CryptoSuite::Secp256k1Sha256Recoverable,
-            payload_digest: payload_digest.clone(),
-            ordered_hashes: vec![payload_digest.clone()],
+            payload_digest: claim_payload_digest,
+            ordered_hashes: vec![ordered_hash.clone()],
             declared_debits: Vec::new(),
             declared_destinations: Vec::new(),
             declared_fee: bloom_broker_api::DeclaredFee::None,
@@ -1030,7 +1038,7 @@ mod tests {
                 "wallet",
                 "order.place",
                 payload,
-                payload_digest.clone(),
+                ordered_hash.clone(),
                 CryptoSuite::Secp256k1Sha256Recoverable,
                 &serde_json::json!({"asset": "BTC"}),
                 &subject,
@@ -1050,7 +1058,7 @@ mod tests {
                 "wallet",
                 "order.place",
                 payload,
-                payload_digest,
+                ordered_hash,
                 CryptoSuite::Secp256k1Sha256Recoverable,
                 &serde_json::json!({"asset": "BTC"}),
                 &subject,
