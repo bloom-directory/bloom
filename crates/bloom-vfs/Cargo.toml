@@ -47,6 +47,7 @@ fs2.workspace = true
 rand.workspace = true
 mpp.workspace = true
 qrcode.workspace = true
+rustix.workspace = true
 
 [dev-dependencies]
 bloom-proto = { workspace = true, features = ["audit-test-seam"] }

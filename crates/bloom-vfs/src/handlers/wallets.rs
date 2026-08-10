@@ -27,7 +27,7 @@
 //! - `wallets/<wallet>/chains/<chain>/outbox/sent/<id>/<file>`      — read sent
 //! - `wallets/<wallet>/chains/<chain>/outbox/failed/<id>/<file>`    — read failed
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -1778,16 +1778,28 @@ fn parse_state_seg(s: &str) -> Result<OutboxState, HandlerError> {
     OutboxState::parse(s).ok_or_else(|| HandlerError::not_found(format!("outbox state '{}'", s)))
 }
 
-fn regular_outbox_artifact(dir: &Path, fname: &str) -> Result<PathBuf, HandlerError> {
+fn open_regular_outbox_artifact(dir: &Path, fname: &str) -> Result<std::fs::File, HandlerError> {
     let path = dir.join(fname);
-    match std::fs::symlink_metadata(&path) {
-        Ok(metadata) if metadata.file_type().is_file() => Ok(path),
-        Ok(_) => Err(HandlerError::not_found(fname)),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            Err(HandlerError::not_found(fname))
+    let descriptor = rustix::fs::open(
+        &path,
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::CLOEXEC
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::NONBLOCK,
+        rustix::fs::Mode::empty(),
+    )
+    .map_err(|error| {
+        if matches!(error, rustix::io::Errno::NOENT | rustix::io::Errno::LOOP) {
+            HandlerError::not_found(fname)
+        } else {
+            HandlerError::Io(std::io::Error::from_raw_os_error(error.raw_os_error()))
         }
-        Err(error) => Err(HandlerError::Io(error)),
+    })?;
+    let file = std::fs::File::from(descriptor);
+    if !file.metadata()?.file_type().is_file() {
+        return Err(HandlerError::not_found(fname));
     }
+    Ok(file)
 }
 
 fn first_confirm_line(confirm_text: &str) -> &str {
@@ -2474,7 +2486,7 @@ impl WalletsHandler {
                 {
                     Ok(Entry::writable_file(fname).with_modified_ms(entry.staged.created_ms))
                 } else {
-                    regular_outbox_artifact(&entry.dir, fname)?;
+                    open_regular_outbox_artifact(&entry.dir, fname)?;
                     Ok(Entry::file(fname).with_modified_ms(entry.staged.created_ms))
                 }
             }
@@ -2600,14 +2612,9 @@ impl WalletsHandler {
                     .outbox
                     .read_in_state(wallet, chain, id, st)
                     .map_err(err_be)?;
-                let path = regular_outbox_artifact(&entry.dir, fname)?;
-                let bytes = std::fs::read(&path).map_err(|error| {
-                    if error.kind() == std::io::ErrorKind::NotFound {
-                        HandlerError::not_found(fname)
-                    } else {
-                        HandlerError::Io(error)
-                    }
-                })?;
+                let mut file = open_regular_outbox_artifact(&entry.dir, fname)?;
+                let mut bytes = Vec::new();
+                std::io::Read::read_to_end(&mut file, &mut bytes)?;
                 Ok(bytes)
             }
             [s] if s == "pending_external.jsonl" => {
@@ -4430,6 +4437,32 @@ mod tests {
             assert_eq!(metadata.kind, crate::handler::EntryKind::File);
             assert_eq!(metadata.mode, 0o644);
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opened_outbox_artifact_is_pinned_across_path_replacement() {
+        use std::io::Read as _;
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let artifact = directory.path().join("result.json");
+        let displaced = directory.path().join("result.original.json");
+        let outside = directory.path().join("outside-secret.json");
+        std::fs::write(&artifact, b"original").unwrap();
+        std::fs::write(&outside, b"secret").unwrap();
+
+        let mut opened = open_regular_outbox_artifact(directory.path(), "result.json").unwrap();
+        std::fs::rename(&artifact, &displaced).unwrap();
+        symlink(&outside, &artifact).unwrap();
+
+        let mut bytes = Vec::new();
+        opened.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"original");
+        assert!(matches!(
+            open_regular_outbox_artifact(directory.path(), "result.json"),
+            Err(HandlerError::NotFound(_))
+        ));
     }
 
     /// Fix #9: writing an empty body to `pending/<id>/confirm` must
