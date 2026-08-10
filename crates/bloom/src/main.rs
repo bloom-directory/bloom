@@ -772,6 +772,71 @@ async fn launch_custody_ceremony(
     ))
 }
 
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WalletRegistrationLaunchProjection {
+    schema: String,
+    requested_name: String,
+    operation_id: bloom_broker_api::OperationId,
+    ceremony_kind: bloom_broker_api::CeremonyKind,
+    ceremony_state: bloom_broker_api::CeremonyState,
+    ceremony_url: Option<String>,
+    ceremony_expires_at_ms: Option<bloom_broker_api::DecimalU64>,
+    signer_contribution_digest: bloom_broker_api::Digest32,
+}
+
+async fn launch_wallet_registration_via_vfs(
+    vfs: &bloom_vfs::Vfs,
+    requested_name: &str,
+) -> Result<String> {
+    validate_wallet_name(requested_name).map_err(|error| {
+        machine_error(
+            MachineErrorKind::InvalidParams,
+            format!("requested wallet name must be a safe single path segment: {error:#}"),
+        )
+    })?;
+    let write_path = bloom_vfs::VfsPath::parse("/wallets/new")?;
+    bloom_vfs::Handler::write(vfs, &write_path, requested_name.as_bytes()).await?;
+
+    let projection_path = format!("/wallets/registrations/{requested_name}/status.json");
+    let projection_path_parsed = bloom_vfs::VfsPath::parse(&projection_path)?;
+    let projection: WalletRegistrationLaunchProjection =
+        serde_json::from_slice(&bloom_vfs::Handler::read(vfs, &projection_path_parsed).await?)
+            .context("decode mounted wallet registration projection")?;
+    let _ = &projection.signer_contribution_digest;
+    if projection.schema != "bloom.machine-wallet-registration-projection.1"
+        || projection.requested_name != requested_name
+        || projection.ceremony_kind != bloom_broker_api::CeremonyKind::WalletRegistration
+        || projection.ceremony_state != bloom_broker_api::CeremonyState::AwaitingUser
+    {
+        return Err(machine_error(
+            MachineErrorKind::Internal,
+            "mounted wallet registration returned a mismatched or non-actionable projection",
+        )
+        .into());
+    }
+    let ceremony_url = projection.ceremony_url.ok_or_else(|| {
+        machine_error(
+            MachineErrorKind::Internal,
+            "mounted wallet registration omitted its ceremony URL",
+        )
+    })?;
+    let ceremony_expires_at_ms = projection.ceremony_expires_at_ms.ok_or_else(|| {
+        machine_error(
+            MachineErrorKind::Internal,
+            "mounted wallet registration omitted its ceremony expiry",
+        )
+    })?;
+    Ok(format!(
+        "operation_id: {}\nceremony_kind: {:?}\nceremony_url: {}\nceremony_expires_at_ms: {}\nprojection: {}\n",
+        projection.operation_id,
+        projection.ceremony_kind,
+        ceremony_url,
+        ceremony_expires_at_ms.get(),
+        projection_path,
+    ))
+}
+
 struct LegacyMigrationLaunch {
     operation_id: bloom_broker_api::OperationId,
     exact_terms_digest: bloom_broker_api::Digest32,
@@ -1040,42 +1105,43 @@ async fn execute_machine_command(
             .into());
         }
         MachineCommand::WalletCustody { name, kind } => {
-            let (method, ceremony_kind, wallet_id, input_class) = match kind {
-                MachineCustodyKind::New => (
-                    bloom_machine_client::CustodyPrepareMethod::WalletRegistration,
-                    bloom_broker_api::CeremonyKind::WalletRegistration,
+            if kind == MachineCustodyKind::New {
+                launch_wallet_registration_via_vfs(&daemon.vfs, &name).await?
+            } else {
+                let (method, ceremony_kind, wallet_id, input_class) = match kind {
+                    MachineCustodyKind::New => {
+                        unreachable!("wallet registration uses the VFS adapter")
+                    }
+                    MachineCustodyKind::Import => (
+                        bloom_machine_client::CustodyPrepareMethod::WalletImport,
+                        bloom_broker_api::CeremonyKind::WalletImport,
+                        None,
+                        "raw-wallet-import",
+                    ),
+                    MachineCustodyKind::Rebind => (
+                        bloom_machine_client::CustodyPrepareMethod::CredentialReplace,
+                        bloom_broker_api::CeremonyKind::CredentialReplace,
+                        Some(bloom_broker_api::Token::new(name.clone())?),
+                        "credential-prf",
+                    ),
+                    MachineCustodyKind::Delete => (
+                        bloom_machine_client::CustodyPrepareMethod::WalletDelete,
+                        bloom_broker_api::CeremonyKind::WalletDelete,
+                        Some(bloom_broker_api::Token::new(name.clone())?),
+                        "none",
+                    ),
+                };
+                launch_custody_ceremony(
+                    home,
+                    &name,
+                    method,
+                    ceremony_kind,
+                    wallet_id,
+                    input_class,
                     None,
-                    "passkey-prf",
-                ),
-                MachineCustodyKind::Import => (
-                    bloom_machine_client::CustodyPrepareMethod::WalletImport,
-                    bloom_broker_api::CeremonyKind::WalletImport,
-                    None,
-                    "raw-wallet-import",
-                ),
-                MachineCustodyKind::Rebind => (
-                    bloom_machine_client::CustodyPrepareMethod::CredentialReplace,
-                    bloom_broker_api::CeremonyKind::CredentialReplace,
-                    Some(bloom_broker_api::Token::new(name.clone())?),
-                    "credential-prf",
-                ),
-                MachineCustodyKind::Delete => (
-                    bloom_machine_client::CustodyPrepareMethod::WalletDelete,
-                    bloom_broker_api::CeremonyKind::WalletDelete,
-                    Some(bloom_broker_api::Token::new(name.clone())?),
-                    "none",
-                ),
-            };
-            launch_custody_ceremony(
-                home,
-                &name,
-                method,
-                ceremony_kind,
-                wallet_id,
-                input_class,
-                None,
-            )
-            .await?
+                )
+                .await?
+            }
         }
         MachineCommand::WalletMigrate { receipt } => {
             let receipt: LegacyMigrationReceiptFile =
@@ -3427,13 +3493,82 @@ mod tests {
         Cli, Cmd, LegacyMigrationReceiptFile, WalletCmd, ceremony_projection_path,
         endpoint_connection_error, enrollment_state_is_usable, execute_audit_command,
         execute_wallet_outbox_action, format_petal_consent_net_rule,
-        is_completed_policy_update_receipt, load_ceremony_projection, machine_error_from_anyhow,
-        machine_wallet_lookup_error, open_machine_audit_with_history, persist_ceremony_projection,
-        request_body_with_wallet,
+        is_completed_policy_update_receipt, launch_wallet_registration_via_vfs,
+        load_ceremony_projection, machine_error_from_anyhow, machine_wallet_lookup_error,
+        open_machine_audit_with_history, persist_ceremony_projection, request_body_with_wallet,
     };
 
     #[derive(Default)]
     struct RecordingOutboxHandler(Mutex<Vec<(String, Vec<u8>)>>);
+
+    #[derive(Default)]
+    struct RecordingRegistrationHandler(Mutex<Vec<(String, Vec<u8>)>>);
+
+    #[async_trait]
+    impl bloom_vfs::Handler for RecordingRegistrationHandler {
+        async fn lookup(
+            &self,
+            path: &bloom_vfs::VfsPath,
+        ) -> Result<bloom_vfs::Entry, bloom_vfs::HandlerError> {
+            match path.segments() {
+                [name] if name == "new" => Ok(bloom_vfs::Entry::writable_file("new")),
+                [_, _, leaf] if leaf == "status.json" => Ok(bloom_vfs::Entry::file("status.json")),
+                _ => Err(bloom_vfs::HandlerError::NotFound(path.to_string_path())),
+            }
+        }
+
+        async fn read(
+            &self,
+            path: &bloom_vfs::VfsPath,
+        ) -> Result<Vec<u8>, bloom_vfs::HandlerError> {
+            if path.to_string_path() != "/registrations/gavin/status.json" {
+                return Err(bloom_vfs::HandlerError::NotFound(path.to_string_path()));
+            }
+            Ok(serde_json::to_vec(&serde_json::json!({
+                "schema": "bloom.machine-wallet-registration-projection.1",
+                "requested_name": "gavin",
+                "operation_id": "11".repeat(32),
+                "ceremony_kind": "wallet_registration",
+                "ceremony_state": "AWAITING_USER",
+                "ceremony_url": "http://localhost:18734/ceremony/test-token",
+                "ceremony_expires_at_ms": u64::MAX.to_string(),
+                "signer_contribution_digest": "22".repeat(32),
+            }))
+            .unwrap())
+        }
+
+        async fn write(
+            &self,
+            path: &bloom_vfs::VfsPath,
+            data: &[u8],
+        ) -> Result<(), bloom_vfs::HandlerError> {
+            self.0
+                .lock()
+                .unwrap()
+                .push((path.to_string_path(), data.to_vec()));
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn wallet_new_machine_command_uses_the_mounted_registration_projection() {
+        let handler = std::sync::Arc::new(RecordingRegistrationHandler::default());
+        let vfs = bloom_vfs::Vfs::builder()
+            .mount("wallets", handler.clone())
+            .build();
+
+        let output = launch_wallet_registration_via_vfs(&vfs, "gavin")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            *handler.0.lock().unwrap(),
+            vec![("/new".into(), b"gavin".to_vec())]
+        );
+        assert!(output.contains("operation_id: "));
+        assert!(output.contains("ceremony_url: http://localhost:18734/ceremony/test-token\n"));
+        assert!(output.contains("projection: /wallets/registrations/gavin/status.json\n"));
+    }
 
     #[async_trait]
     impl bloom_vfs::Handler for RecordingOutboxHandler {
