@@ -2,7 +2,7 @@ name: Release
 
 # Tag-driven release workflow. Mirrors the structure of vibefi/client's
 # release.yml but adapted to this repo: no cargo-packager, four native
-# runners (no --target cross-compile), per-binary verify step, and a
+# runner platforms plus an aarch64 musl build, per-binary verification, and a
 # reviewed workspace version bump (no --config magic, no cargo-edit).
 #
 # Flow:
@@ -10,10 +10,10 @@ name: Release
 #      matching `vX.Y.Z` tag. `propose-release.yml` can open that PR.
 #   2. `prepare` resolves and validates the existing tag (vX.Y.Z).
 #   3. `build` checks out that exact SHA and runs `cargo build --locked`
-#      on each of the four native runners. A verify step asserts that
+#      for each release target. Verification asserts that
 #      `bloom --version` matches the tag.
 #   4. `publish` verifies the tag still resolves to the built SHA,
-#      downloads the four tarballs, generates SHA256SUMS and release notes
+#      downloads the five tarballs, generates SHA256SUMS and release notes
 #      from commits since the previous version tag, then creates or updates
 #      the GitHub release for that existing tag.
 #
@@ -139,15 +139,28 @@ jobs:
           - asset_name: bloom-linux-x86_64.tar.gz
             os: ubuntu-latest
             binary: bloom
+            target: x86_64-unknown-linux-gnu
+            static: false
           - asset_name: bloom-linux-aarch64.tar.gz
             os: ubuntu-24.04-arm
             binary: bloom
+            target: aarch64-unknown-linux-gnu
+            static: false
+          - asset_name: bloom-linux-aarch64-musl.tar.gz
+            os: ubuntu-24.04-arm
+            binary: bloom
+            target: aarch64-unknown-linux-musl
+            static: true
           - asset_name: bloom-macos-x86_64.tar.gz
             os: macos-26-intel
             binary: bloom
+            target: x86_64-apple-darwin
+            static: false
           - asset_name: bloom-macos-aarch64.tar.gz
             os: macos-26
             binary: bloom
+            target: aarch64-apple-darwin
+            static: false
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
@@ -157,7 +170,13 @@ jobs:
           persist-credentials: false
 
       - name: Install Rust toolchain
-        run: rustup show
+        run: rustup target add "${{ matrix.target }}"
+
+      - name: Install musl toolchain
+        if: matrix.static
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes make musl-tools perl
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
@@ -165,25 +184,45 @@ jobs:
           cache-targets: false
 
       - name: Build release binary (locked)
-        run: cargo build --release -p bloom --all-features --locked
+        env:
+          AR_aarch64_unknown_linux_musl: ar
+          CC_aarch64_unknown_linux_musl: musl-gcc
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+        run: cargo build --release -p bloom --all-features --locked --target "${{ matrix.target }}"
 
       - name: Verify binary version matches tag
         env:
           VERSION: ${{ needs.prepare.outputs.release_version }}
         run: |
           set -euo pipefail
-          ACTUAL="$(./target/release/${{ matrix.binary }} --version | awk '{print $2}')"
+          BINARY="./target/${{ matrix.target }}/release/${{ matrix.binary }}"
+          ACTUAL="$("$BINARY" --version | awk '{print $2}')"
           if [[ "$ACTUAL" != "$VERSION" ]]; then
             echo "::error::binary version '$ACTUAL' does not match tag '$VERSION'"
             exit 1
           fi
           echo "Verified: ${{ matrix.binary }} --version = $ACTUAL"
 
+      - name: Verify static linkage
+        if: matrix.static
+        run: |
+          set -euo pipefail
+          BINARY="./target/${{ matrix.target }}/release/${{ matrix.binary }}"
+          if readelf --program-headers "$BINARY" | grep -q 'Requesting program interpreter'; then
+            echo "::error::$BINARY has a dynamic program interpreter"
+            exit 1
+          fi
+          if readelf --dynamic "$BINARY" 2>/dev/null | grep -q '(NEEDED)'; then
+            echo "::error::$BINARY has dynamic library dependencies"
+            exit 1
+          fi
+          file "$BINARY"
+
       - name: Stage package
         run: |
           set -euo pipefail
           mkdir -p package dist
-          cp "target/release/${{ matrix.binary }}" package/
+          cp "target/${{ matrix.target }}/release/${{ matrix.binary }}" package/
           cp README.md LICENSE package/
           tar -czf "dist/${{ matrix.asset_name }}" -C package .
 
