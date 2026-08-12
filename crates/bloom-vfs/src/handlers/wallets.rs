@@ -2292,12 +2292,10 @@ impl WalletsHandler {
             let wallets = coordinator.list_wallets().await.map_err(err_be)?;
             let mut out = Vec::new();
             for wallet in wallets {
-                if let Ok(status) = self.registration_status(&wallet).await {
-                    if !status.state.is_terminal() {
-                        out.push(
-                            Entry::dir(&wallet).with_modified_ms(status.created_at_ms as u128),
-                        );
-                    }
+                if let Ok(status) = self.registration_status(&wallet).await
+                    && !status.state.is_terminal()
+                {
+                    out.push(Entry::dir(&wallet).with_modified_ms(status.created_at_ms as u128));
                 }
             }
             return Ok(out);

@@ -7,6 +7,7 @@
 
 pub mod ceremony_server;
 pub mod ipc;
+mod private_input;
 pub mod registration;
 pub mod sealed_ceremony;
 pub mod sign_hash;
@@ -18,7 +19,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use alloy::network::TransactionBuilder;
-use alloy::primitives::{Address, Bytes, U256};
+use alloy::primitives::{Address, B256, Bytes, U256};
 use alloy::rpc::types::eth::TransactionRequest;
 #[cfg(feature = "unsafe-debug-signer")]
 use alloy::signers::SignerSync;
@@ -37,11 +38,11 @@ use bloom_evm::{ChainClient, ChainRegistry};
 
 use bloom_ens::EnsClient;
 use bloom_etherscan::EtherscanClient;
-use bloom_keystore::{Keystore, KeystoreApprovalSignatureVerifier};
+use bloom_keystore::{Keystore, KeystoreApprovalSignatureVerifier, WalletKind};
 use bloom_paid_http::PaidHttpChainRpcResolver;
 use bloom_petals::abi::{
     ApprovalRequired, ChainRequest, ChainResponse, EvmOutboxInspection, EvmOutboxOutcome,
-    EvmTransactionRequest, PetalRouteContext,
+    EvmTransactionRequest, PetalRouteContext, PrivateInputOutcome, PrivateInputRequest,
 };
 use bloom_petals::{
     HostError, HostVfsEntry, HttpRequest, HttpResponse, LateVfsHost, NameRegistry, NetPolicy,
@@ -264,6 +265,8 @@ struct DaemonPetalHost {
     tx_stage_lock: tokio::sync::Mutex<()>,
     sign_batch_lock: tokio::sync::Mutex<()>,
     petal_action_identities: Mutex<PetalActionIdentityCache>,
+    private_inputs: Arc<private_input::PrivateInputManager>,
+    keystore: Option<Keystore>,
     #[cfg(feature = "unsafe-debug-signer")]
     unsafe_debug_signer: Option<(String, Arc<PrivateKeySigner>)>,
 }
@@ -293,9 +296,24 @@ impl DaemonPetalHost {
             tx_stage_lock: tokio::sync::Mutex::new(()),
             sign_batch_lock: tokio::sync::Mutex::new(()),
             petal_action_identities: Mutex::new(PetalActionIdentityCache::default()),
+            private_inputs: Arc::new(private_input::PrivateInputManager::default()),
+            keystore: None,
             #[cfg(feature = "unsafe-debug-signer")]
             unsafe_debug_signer: None,
         }
+    }
+
+    fn with_private_inputs(
+        mut self,
+        private_inputs: Arc<private_input::PrivateInputManager>,
+    ) -> Self {
+        self.private_inputs = private_inputs;
+        self
+    }
+
+    fn with_keystore(mut self, keystore: Keystore) -> Self {
+        self.keystore = Some(keystore);
+        self
     }
 
     fn with_tx_outbox(mut self, tx_outbox: PetalTxOutbox) -> Self {
@@ -973,6 +991,40 @@ impl PetalHost for DaemonPetalHost {
         unreachable!("bounded redirect loop returns before exhausting iterator")
     }
 
+    async fn private_input_request(
+        &self,
+        mut req: PrivateInputRequest,
+    ) -> Result<PrivateInputOutcome, HostError> {
+        let wallets = self
+            .keystore
+            .as_ref()
+            .ok_or_else(|| HostError::Backend("private-input keystore is unavailable".into()))?
+            .list()
+            .map_err(|error| HostError::Backend(format!("list approval wallets: {error}")))?;
+        req.approval_wallet = Some(choose_private_input_approval_wallet(
+            req.approval_wallet.as_deref(),
+            &req.wallet,
+            wallets.into_iter().map(|wallet| (wallet.name, wallet.kind)),
+        )?);
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_millis() as u64)
+            .unwrap_or(0);
+        self.private_inputs.request(req, now_ms)
+    }
+
+    async fn private_input_consume(
+        &self,
+        id: String,
+        context: Option<PetalRouteContext>,
+    ) -> Result<(), HostError> {
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_millis() as u64)
+            .unwrap_or(0);
+        self.private_inputs.consume(&id, context, now_ms)
+    }
+
     async fn sign_hash(&self, req: SignRequest) -> Result<Vec<u8>, HostError> {
         match self.sign_hash_outcome(req).await? {
             SignOutcome::Signature(signature) => Ok(signature),
@@ -1465,6 +1517,38 @@ impl PetalHost for DaemonPetalHost {
     }
 }
 
+fn choose_private_input_approval_wallet(
+    requested: Option<&str>,
+    note_wallet: &str,
+    wallets: impl IntoIterator<Item = (String, WalletKind)>,
+) -> Result<String, HostError> {
+    let passkeys = wallets
+        .into_iter()
+        .filter_map(|(name, kind)| (kind == WalletKind::PasskeyGated).then_some(name))
+        .collect::<Vec<_>>();
+    if let Some(requested) = requested {
+        return passkeys
+            .iter()
+            .find(|name| name.as_str() == requested)
+            .cloned()
+            .ok_or_else(|| {
+                HostError::Denied("approval_wallet does not name a passkey wallet".into())
+            });
+    }
+    if passkeys.iter().any(|name| name == note_wallet) {
+        return Ok(note_wallet.to_string());
+    }
+    match passkeys.as_slice() {
+        [] => Err(HostError::Denied(
+            "private input requires a passkey wallet; create one or set approval_wallet".into(),
+        )),
+        [only] => Ok(only.clone()),
+        _ => Err(HostError::Invalid(
+            "multiple passkey wallets exist; set approval_wallet explicitly".into(),
+        )),
+    }
+}
+
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PetalEthCall {
@@ -1487,13 +1571,13 @@ async fn daemon_petal_chain_read(
     let params: Vec<serde_json::Value> = serde_json::from_str(params_json)
         .map_err(|e| HostError::Invalid(format!("chain params-json must be an array: {e}")))?;
     let result = match method {
-        "eth_chainId" if params.is_empty() => format!(
+        "eth_chainId" if params.is_empty() => serde_json::Value::String(format!(
             "0x{:x}",
             chain
                 .chain_id()
                 .await
                 .map_err(|e| HostError::Backend(format!("chain id: {e}")))?
-        ),
+        )),
         "eth_getBalance" if matches!(params.len(), 1 | 2) => {
             require_latest_block_param(&params, 1)?;
             let address = parse_petal_address(&params[0], "eth_getBalance address")?;
@@ -1501,7 +1585,7 @@ async fn daemon_petal_chain_read(
                 .balance(address)
                 .await
                 .map_err(|e| HostError::Backend(format!("native balance: {e}")))?;
-            format!("{balance:#x}")
+            serde_json::Value::String(format!("{balance:#x}"))
         }
         "eth_getCode" if matches!(params.len(), 1 | 2) => {
             require_latest_block_param(&params, 1)?;
@@ -1510,7 +1594,7 @@ async fn daemon_petal_chain_read(
                 .code(address)
                 .await
                 .map_err(|e| HostError::Backend(format!("contract code: {e}")))?;
-            format!("0x{}", hex::encode(code))
+            serde_json::Value::String(format!("0x{}", hex::encode(code)))
         }
         "eth_call" if matches!(params.len(), 1 | 2) => {
             require_latest_block_param(&params, 1)?;
@@ -1541,9 +1625,27 @@ async fn daemon_petal_chain_read(
                 .eth_call_at_block(tx, Some("latest"))
                 .await
                 .map_err(|e| HostError::Backend(format!("eth_call: {e}")))?;
-            format!("0x{}", hex::encode(bytes))
+            serde_json::Value::String(format!("0x{}", hex::encode(bytes)))
         }
-        "eth_chainId" | "eth_getBalance" | "eth_getCode" | "eth_call" => {
+        "eth_getTransactionReceipt" if params.len() == 1 => {
+            let hash = params[0]
+                .as_str()
+                .ok_or_else(|| {
+                    HostError::Invalid("eth_getTransactionReceipt hash must be a string".into())
+                })?
+                .parse::<B256>()
+                .map_err(|e| HostError::Invalid(format!("eth_getTransactionReceipt hash: {e}")))?;
+            chain
+                .receipt_json(hash)
+                .await
+                .map_err(|e| HostError::Backend(format!("eth_getTransactionReceipt: {e}")))?
+                .unwrap_or(serde_json::Value::Null)
+        }
+        "eth_chainId"
+        | "eth_getBalance"
+        | "eth_getCode"
+        | "eth_call"
+        | "eth_getTransactionReceipt" => {
             return Err(HostError::Invalid(format!(
                 "invalid {method} parameters; only latest-block reads are allowed"
             )));
@@ -1736,6 +1838,7 @@ pub struct Daemon {
     pub audit: Arc<AuditLog>,
     pub auth_services: AuthServices,
     pub signer_cache: Arc<bloom_keystore::petal_host::SignerCache>,
+    pub(crate) private_inputs: Arc<private_input::PrivateInputManager>,
     pub vfs: Vfs,
     pub petals: PetalRunner,
     pub watch_registry: Arc<WatchRegistry>,
@@ -2289,11 +2392,14 @@ impl Daemon {
         let petal_vm = PetalVm::new().map_err(|e| DaemonError::Audit(format!("petals vm: {e}")))?;
         let petals = PetalRunner::new(petal_store.clone(), petal_registry.clone(), petal_vm);
         let petal_vfs_host = Arc::new(LateVfsHost::new());
+        let private_inputs = Arc::new(private_input::PrivateInputManager::default());
         let petal_app_host = DaemonPetalHost::new(
             petal_vfs_host.clone(),
             audit_arc.clone(),
             auth_services.clone(),
         )
+        .with_private_inputs(private_inputs.clone())
+        .with_keystore(keystore.clone())
         .with_tx_outbox(PetalTxOutbox {
             tx_engine: tx_engine.clone(),
             chains: chains.clone(),
@@ -2663,6 +2769,7 @@ impl Daemon {
             audit: audit_arc,
             auth_services,
             signer_cache,
+            private_inputs,
             vfs,
             petals,
             watch_registry,
@@ -2961,6 +3068,38 @@ mod tests {
     use bloom_vfs::handler::Handler;
 
     #[test]
+    fn private_input_approval_wallet_is_unambiguous_and_passkey_only() {
+        let wallets = || {
+            vec![
+                ("dev".to_string(), WalletKind::Local),
+                ("owner".to_string(), WalletKind::PasskeyGated),
+            ]
+        };
+        assert_eq!(
+            choose_private_input_approval_wallet(None, "dev", wallets()).unwrap(),
+            "owner"
+        );
+        assert_eq!(
+            choose_private_input_approval_wallet(Some("owner"), "dev", wallets()).unwrap(),
+            "owner"
+        );
+        assert!(choose_private_input_approval_wallet(Some("dev"), "dev", wallets()).is_err());
+    }
+
+    #[test]
+    fn private_input_prefers_passkey_note_wallet_but_rejects_ambiguous_fallback() {
+        let wallets = vec![
+            ("note".to_string(), WalletKind::PasskeyGated),
+            ("other".to_string(), WalletKind::PasskeyGated),
+        ];
+        assert_eq!(
+            choose_private_input_approval_wallet(None, "note", wallets.clone()).unwrap(),
+            "note"
+        );
+        assert!(choose_private_input_approval_wallet(None, "dev", wallets).is_err());
+    }
+
+    #[test]
     fn approval_error_display_text_cannot_trigger_ceremony_routing() {
         let error = bloom_tx::TxEngineError::ApprovalServiceUnavailable(
             "Sealed Approval is mentioned, but no ceremony can recover this".into(),
@@ -3143,7 +3282,10 @@ mod tests {
         // lifecycle cannot be revived.
         let (after_expiry, _) = host.petal_action(&req, ctx, start.expires_ms).unwrap();
         assert_ne!(start.action_id(), after_expiry.action_id());
-        assert_eq!(after_expiry.expires_ms, start.expires_ms + PETAL_ACTION_TTL_MS);
+        assert_eq!(
+            after_expiry.expires_ms,
+            start.expires_ms + PETAL_ACTION_TTL_MS
+        );
     }
 
     #[test]
@@ -3397,6 +3539,8 @@ mod tests {
                 "eth_call",
                 r#"[{"to":"0x0000000000000000000000000000000000000001","stateOverride":{}},"latest"]"#,
             ),
+            ("eth_getTransactionReceipt", "[]"),
+            ("eth_getTransactionReceipt", r#"["not-a-transaction-hash"]"#),
         ] {
             let error = host
                 .chain_read(ChainRequest {
@@ -3510,6 +3654,7 @@ mod tests {
             tx_hash: tx_hash.clone(),
             block_number: Some(42),
             revert_reason: None,
+            logs: None,
         };
         daemon
             .tx_engine

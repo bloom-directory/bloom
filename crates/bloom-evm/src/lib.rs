@@ -1086,11 +1086,15 @@ mod tests {
         let r = ChainRegistry::new();
         r.add(c);
         assert!(r.get("ethereum").is_some());
-        assert!(r.get("mainnet").is_some(), "'mainnet' must alias to 'ethereum'");
+        assert!(
+            r.get("mainnet").is_some(),
+            "'mainnet' must alias to 'ethereum'"
+        );
         assert!(r.get("eth").is_some(), "'eth' must alias to 'ethereum'");
         assert!(r.get("sepolia").is_none(), "unknown names still miss");
         assert_eq!(
-            r.get("mainnet").unwrap().spec().name, "ethereum",
+            r.get("mainnet").unwrap().spec().name,
+            "ethereum",
             "alias resolves to the ethereum client",
         );
     }

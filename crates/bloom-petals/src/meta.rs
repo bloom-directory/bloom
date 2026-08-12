@@ -29,6 +29,9 @@ pub enum Capability {
     /// May stage and confirm generic EVM outbox entries.
     #[serde(rename = "tx.outbox")]
     TxOutbox,
+    /// May collect typed owner input through a private ceremony.
+    #[serde(rename = "private_input")]
+    PrivateInput,
 }
 
 impl Capability {
@@ -41,6 +44,7 @@ impl Capability {
             Capability::Store => "store",
             Capability::Chain => "chain",
             Capability::TxOutbox => "tx.outbox",
+            Capability::PrivateInput => "private_input",
         }
     }
 
@@ -53,6 +57,7 @@ impl Capability {
             "store" => Some(Capability::Store),
             "chain" => Some(Capability::Chain),
             "tx.outbox" => Some(Capability::TxOutbox),
+            "private_input" => Some(Capability::PrivateInput),
             _ => None,
         }
     }
@@ -150,6 +155,7 @@ pub fn validate_mode_caps(
                     | Capability::Store
                     | Capability::Chain
                     | Capability::TxOutbox
+                    | Capability::PrivateInput
             )
         );
         if !ok {
@@ -182,6 +188,10 @@ mod tests {
         assert_eq!(Capability::parse("store"), Some(Capability::Store));
         assert_eq!(Capability::parse("chain"), Some(Capability::Chain));
         assert_eq!(Capability::parse("tx.outbox"), Some(Capability::TxOutbox));
+        assert_eq!(
+            Capability::parse("private_input"),
+            Some(Capability::PrivateInput)
+        );
         assert_eq!(Capability::parse("nope"), None);
     }
 

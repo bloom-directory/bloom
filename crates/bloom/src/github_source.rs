@@ -19,7 +19,7 @@ const HYPERLIQUID_RELEASE_COMMIT: &str = "fa722a986c2a0a23977e9e00df54ebd291a686
 const NEAR_INTENTS_RELEASE_COMMIT: &str = "08e9bd83786425656bdd87e35031030cb7f3dc14";
 const ENSO_RELEASE_COMMIT: &str = "59e3c884f83c9c97b69b1b415becf8572791273b";
 const GASLESS_RELEASE_COMMIT: &str = "73ccf05b4f10d7993fbc8fa453e8f91987564aab";
-const PRIVACY_POOLS_RELEASE_COMMIT: &str = "ae01a7d398416af4fa38a985b684ac973e128208";
+const PRIVACY_POOLS_RELEASE_COMMIT: &str = "c661942fd07205221f9fff62c000ea01a55d67bd";
 const VENICE_X402_RELEASE_COMMIT: &str = "f8d6a1b287397b2c66fa11ca777fe2b762640964";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -96,9 +96,9 @@ const PREINSTALLED_PRIVACY_POOLS: PreinstalledPetal = PreinstalledPetal {
     name: "privacy-pools",
     repository: "https://github.com/bloom-directory/bloom-petal-privacy-pools",
     commit: PRIVACY_POOLS_RELEASE_COMMIT,
-    release_tag: "v0.1.2",
-    archive: "privacy-pools-v0.1.2.petal.tar.gz",
-    expected_hash: Some("f86cf4fac3dcd5dc86fa6d60daadeb2377b7d3a655774f64a109a7f5aca446b4"),
+    release_tag: "v0.1.3",
+    archive: "privacy-pools-v0.1.3.petal.tar.gz",
+    expected_hash: Some("5d665b7f0a74f9046f38bd39a3aa879eb455b3c17f7f34bf9b57c3b23071fc8f"),
     upgrade_policy: PreinstalledUpgradePolicy::Automatic,
 };
 
@@ -1088,7 +1088,15 @@ mod tests {
         let defaults = bloom_proto::Config::local_default().petals.preinstalled;
         assert_eq!(
             defaults,
-            ["polymarket", "near-intents", "enso", "hyperliquid"]
+            [
+                "polymarket",
+                "near-intents",
+                "enso",
+                "hyperliquid",
+                "gasless",
+                "privacy-pools",
+                "venice-x402",
+            ]
         );
         for name in defaults {
             let entry = preinstalled_petal(&name).unwrap();
@@ -1126,7 +1134,14 @@ mod tests {
             preinstalled_petal("hyperliquid").unwrap().upgrade_policy,
             PreinstalledUpgradePolicy::ManualStateMigration
         );
-        for name in ["polymarket", "near-intents", "enso"] {
+        for name in [
+            "polymarket",
+            "near-intents",
+            "enso",
+            "gasless",
+            "privacy-pools",
+            "venice-x402",
+        ] {
             assert_eq!(
                 preinstalled_petal(name).unwrap().upgrade_policy,
                 PreinstalledUpgradePolicy::Automatic

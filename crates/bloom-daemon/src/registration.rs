@@ -1546,8 +1546,15 @@ mod tests {
         // recovery-ack deadline (300_000ms out) outlives the original
         // SESSION_TTL_MS (also 300_000ms in these tests) only if we push
         // "now" past the original expiry but before the ack deadline.
-        stage_and_finalize_directly(&coordinator, "alice", "0xabc", "receipt-1", 1_000, SESSION_TTL_MS + 300_000)
-            .await;
+        stage_and_finalize_directly(
+            &coordinator,
+            "alice",
+            "0xabc",
+            "receipt-1",
+            1_000,
+            SESSION_TTL_MS + 300_000,
+        )
+        .await;
 
         // Past the original ceremony deadline, but still within the ack
         // window: must NOT be treated as dead.

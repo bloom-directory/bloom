@@ -41,6 +41,7 @@ use tokio::task::JoinHandle;
 
 use crate::Daemon;
 
+mod private_input_ceremony;
 mod wallet_registration;
 
 const CEREMONY_HTML: &str = include_str!("sealed_ceremony.html");
@@ -68,7 +69,7 @@ fn sealed_review_session_id(challenge: &ApprovalChallenge) -> String {
 }
 
 #[derive(Clone)]
-struct CeremonyState {
+pub(super) struct CeremonyState {
     daemon: Daemon,
 }
 
@@ -165,8 +166,13 @@ fn router(state: CeremonyState) -> Router {
         .route("/ceremony/{token}/challenge", get(challenge_json))
         .route("/ceremony/{token}/complete", post(complete))
         .merge(wallet_registration::router())
+        .merge(private_input_ceremony::router())
         .layer(axum::middleware::from_fn(require_local_origin))
         .with_state(state)
+}
+
+pub(crate) fn private_input_url(token: &str) -> String {
+    format!("http://localhost:{LOCAL_CEREMONY_PORT}/private-input/{token}")
 }
 
 /// Reject cross-site POSTs. Loopback GETs carry no Origin; POSTs from the

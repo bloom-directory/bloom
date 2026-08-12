@@ -77,8 +77,7 @@ impl Reconciler {
                 tx_hash: format!("{:#x}", se.hash),
                 block_number: receipt.block_number,
                 revert_reason,
-                logs: serde_json::to_value(&receipt.inner.logs())
-                    .ok(),
+                logs: serde_json::to_value(receipt.inner.logs()).ok(),
             };
             match serde_json::to_vec_pretty(&record) {
                 Ok(bytes) => match self.outbox.write_sent_sibling(&se, RECEIPT_FILE, &bytes) {

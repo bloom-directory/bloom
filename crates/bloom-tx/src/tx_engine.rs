@@ -607,6 +607,34 @@ impl TxEngine {
         Ok(())
     }
 
+    fn private_rpc_provider(
+        &self,
+        chain_id: u64,
+        provider_id: &str,
+    ) -> Result<Arc<dyn bloom_mempool::PrivateRpcProvider>, TxEngineError> {
+        self.private_rpcs
+            .read()
+            .get(&(chain_id, provider_id.to_string()))
+            .cloned()
+            .ok_or_else(|| TxEngineError::PrivateProviderNotConfigured(provider_id.to_string()))
+    }
+
+    fn ensure_private_rpc_available(
+        &self,
+        staged: &StagedTx,
+        policy: &Policy,
+    ) -> Result<(), TxEngineError> {
+        if policy.private.enabled
+            && matches!(
+                staged.chain_id,
+                bloom_mempool::MAINNET_CHAIN_ID | bloom_mempool::SEPOLIA_CHAIN_ID
+            )
+        {
+            self.private_rpc_provider(staged.chain_id, &policy.private.provider)?;
+        }
+        Ok(())
+    }
+
     /// Submit a signed raw tx via the configured private RPC provider
     /// keyed by `(chain_id, provider_id)`. Returns the hash returned by
     /// the provider on success, or a typed error if the provider is not
@@ -621,12 +649,7 @@ impl TxEngine {
     ) -> Result<alloy::primitives::B256, TxEngineError> {
         // Take the lock, clone the Arc out, drop the guard before .await — no
         // lock is held across the network call.
-        let provider = self
-            .private_rpcs
-            .read()
-            .get(&(chain_id, provider_id.to_string()))
-            .cloned()
-            .ok_or_else(|| TxEngineError::PrivateProviderNotConfigured(provider_id.to_string()))?;
+        let provider = self.private_rpc_provider(chain_id, provider_id)?;
         provider
             .submit(raw)
             .await
@@ -1786,6 +1809,11 @@ impl TxEngine {
             self.simulate_or_reject(&staged, chain).await?;
         }
 
+        // Fail local private-routing misconfiguration before opening an owner
+        // approval ceremony. The selected provider must already be registered
+        // for this chain.
+        self.ensure_private_rpc_available(&staged, policy)?;
+
         let subject = self.authorization_subject(&staged);
         if self.session_store.covers(
             wallet,
@@ -1945,6 +1973,8 @@ impl TxEngine {
         if !override_warnings {
             self.simulate_or_reject(&staged, chain).await?;
         }
+
+        self.ensure_private_rpc_available(&staged, policy)?;
 
         // Authorization. The policy gates above (hard deny / unoverridden warn)
         // have already passed, so a bounded policy session may authorize this
@@ -2109,14 +2139,8 @@ impl TxEngine {
 
         match attempt.transport {
             BroadcastTransport::PrivateRpc => {
-                self.write_reconcile_ambiguous(
-                    entry,
-                    "private relay attempt absent from public RPC; refusing to leak to public mempool",
-                )?;
-                Err(TxEngineError::BroadcastAttemptAmbiguous {
-                    id: entry.staged.id.clone(),
-                    reason: "private relay attempt unresolved".into(),
-                })
+                self.resubmit_private_attempt(entry, &attempt, tx_hash, chain)
+                    .await
             }
             BroadcastTransport::PublicRpc => {
                 let spec = chain.spec();
@@ -2163,6 +2187,38 @@ impl TxEngine {
                 self.finalize_sent(entry, tx_hash, chain)
             }
         }
+    }
+
+    async fn resubmit_private_attempt(
+        &self,
+        entry: &crate::outbox::OutboxEntry,
+        attempt: &BroadcastAttempt,
+        tx_hash: B256,
+        chain: &ChainClient,
+    ) -> Result<StagedTx, TxEngineError> {
+        // Replaying identical signed bytes to the same private relay is
+        // idempotent and never leaks them to the public mempool. This closes
+        // the crash/error window between persisting the attempt and observing
+        // the relay response.
+        let provider = attempt.private_provider.as_deref().ok_or_else(|| {
+            TxEngineError::BroadcastAttemptAmbiguous {
+                id: entry.staged.id.clone(),
+                reason: "private attempt does not record its provider".into(),
+            }
+        })?;
+        let raw =
+            self.outbox
+                .read_broadcast_raw_tx(entry, BroadcastAttemptKind::Confirm, attempt)?;
+        let returned = self
+            .submit_via_private(attempt.chain_id, provider, &Bytes::from(raw))
+            .await?;
+        if returned != tx_hash {
+            return Err(TxEngineError::BroadcastHashMismatch {
+                expected: format!("{tx_hash:#x}"),
+                returned: format!("{returned:#x}"),
+            });
+        }
+        self.finalize_sent(entry, tx_hash, chain)
     }
 
     fn finalize_sent(
@@ -2579,6 +2635,13 @@ impl TxEngine {
                 staged.chain_id,
                 bloom_mempool::MAINNET_CHAIN_ID | bloom_mempool::SEPOLIA_CHAIN_ID
             );
+        // Resolve private routing before any owner ceremony or durable
+        // broadcast marker. A missing provider is a local configuration error,
+        // not an ambiguous network attempt, and must be reported while the
+        // transaction is still unsigned.
+        if private_eligible {
+            self.private_rpc_provider(staged.chain_id, &policy.private.provider)?;
+        }
         // Refuse to broadcast into a nonce gap (would be queued and never mine).
         // Do this before signing/marker writes so a refused attempt leaves no
         // half-broadcast state — just an advisory beside the pending entry.
@@ -2621,8 +2684,7 @@ impl TxEngine {
             } else {
                 BroadcastTransport::PublicRpc
             },
-            private_provider: private_eligible
-                .then(|| policy.private.provider.clone()),
+            private_provider: private_eligible.then(|| policy.private.provider.clone()),
         };
         self.outbox.write_broadcast_attempt(entry, kind, &attempt)?;
         let submitted = self
@@ -6381,6 +6443,7 @@ mod tests {
             tx_hash: dep.tx_hash.clone().unwrap(),
             block_number: Some(1),
             revert_reason: Some("ERC20: insufficient allowance".into()),
+            logs: None,
         };
         engine
             .outbox
@@ -6399,6 +6462,7 @@ mod tests {
             tx_hash: dep.tx_hash.clone().unwrap(),
             block_number: Some(1),
             revert_reason: None,
+            logs: None,
         };
         engine
             .outbox
@@ -7785,6 +7849,92 @@ mod tests {
         }
     }
 
+    #[test]
+    fn private_rpc_preflight_fails_before_signing_when_provider_is_missing() {
+        let (engine, _spec, _dir) = fake_engine(60_000);
+        let mut staged = fake_staged_1559("0001-private-preflight");
+        staged.chain_id = bloom_mempool::MAINNET_CHAIN_ID;
+        let mut policy = bloom_proto::Policy::default();
+        policy.private.enabled = true;
+        policy.private.provider = "mev_blocker".into();
+
+        assert!(matches!(
+            engine.ensure_private_rpc_available(&staged, &policy),
+            Err(TxEngineError::PrivateProviderNotConfigured(provider)) if provider == "mev_blocker"
+        ));
+
+        engine
+            .register_private_rpc(
+                bloom_mempool::MAINNET_CHAIN_ID,
+                Arc::new(bloom_mempool::MockPrivateRpcProvider::new("mev_blocker")),
+            )
+            .unwrap();
+        engine
+            .ensure_private_rpc_available(&staged, &policy)
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn private_rpc_reconciliation_replays_retained_bytes_to_same_provider() {
+        let (engine, mut spec, _dir) = fake_engine(60_000);
+        spec.chain_id = bloom_mempool::MAINNET_CHAIN_ID;
+        let chain = bloom_evm::ChainClient::new(spec).unwrap();
+        let provider = Arc::new(bloom_mempool::MockPrivateRpcProvider::new("mev_blocker"));
+        engine
+            .register_private_rpc(bloom_mempool::MAINNET_CHAIN_ID, provider.clone())
+            .unwrap();
+
+        let staged = fake_staged_1559("0001-private-replay");
+        engine
+            .outbox
+            .write_pending(&staged, "private replay")
+            .unwrap();
+        let entry = engine
+            .outbox
+            .read("alice", "anvil", "0001-private-replay")
+            .unwrap();
+        let raw = Bytes::from_static(b"retained signed transaction");
+        let tx_hash = alloy::primitives::keccak256(&raw);
+        let attempt = BroadcastAttempt {
+            schema: "bloom.broadcast_attempted.v1".into(),
+            tx_hash: format!("{tx_hash:#x}"),
+            raw_tx_blake3: blake3::hash(&raw).to_hex().to_string(),
+            raw_tx_path: BroadcastAttemptKind::Confirm.raw_name().into(),
+            from: staged.from.clone(),
+            to: staged.to.clone(),
+            nonce: staged.nonce,
+            chain_id: bloom_mempool::MAINNET_CHAIN_ID,
+            created_ms: now_ms(),
+            transport: BroadcastTransport::PrivateRpc,
+            private_provider: Some("mev_blocker".into()),
+        };
+        engine
+            .outbox
+            .write_broadcast_raw_tx(&entry, BroadcastAttemptKind::Confirm, &raw)
+            .unwrap();
+        engine
+            .outbox
+            .write_broadcast_attempt(&entry, BroadcastAttemptKind::Confirm, &attempt)
+            .unwrap();
+
+        let sent = engine
+            .resubmit_private_attempt(&entry, &attempt, tx_hash, &chain)
+            .await
+            .unwrap();
+        assert_eq!(sent.status, TxStatus::Sent);
+        assert_eq!(
+            sent.tx_hash.as_deref(),
+            Some(format!("{tx_hash:#x}").as_str())
+        );
+        assert_eq!(provider.submissions(), vec![raw]);
+        assert!(
+            engine
+                .outbox
+                .read_in_state("alice", "anvil", "0001-private-replay", OutboxState::Sent)
+                .is_ok()
+        );
+    }
+
     /// The registry is keyed by `(chain_id, provider_id)`, so two
     /// providers registered on the same chain must be reachable
     /// independently and only the one keyed by the requested id should
@@ -7893,11 +8043,8 @@ mod tests {
         // Must NOT be rejected for private-RPC support; instead it falls back
         // to the public RPC (which only fails here because `fake_engine` points
         // at a dummy RPC URL → a chain transport error).
-        match r {
-            Err(TxEngineError::PrivateNotSupportedOnChain(_)) => {
-                panic!("expected public-RPC fallback, got PrivateNotSupportedOnChain");
-            }
-            _ => {}
+        if let Err(TxEngineError::PrivateNotSupportedOnChain(_)) = r {
+            panic!("expected public-RPC fallback, got PrivateNotSupportedOnChain");
         }
     }
 

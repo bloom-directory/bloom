@@ -121,6 +121,34 @@ pub struct ChainResponse {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrivateInputKind {
+    EvmAddress,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrivateInputRequest {
+    pub id: String,
+    pub wallet: String,
+    pub approval_wallet: Option<String>,
+    pub title: String,
+    pub prompt: String,
+    pub kind: PrivateInputKind,
+    pub context: Option<PetalRouteContext>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingPrivateInput {
+    pub ceremony_url: String,
+    pub expires_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PrivateInputOutcome {
+    Pending(PendingPrivateInput),
+    Ready(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DispatchOp {
     Lookup,
     List,

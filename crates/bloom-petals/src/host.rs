@@ -10,8 +10,8 @@ use async_trait::async_trait;
 
 use crate::abi::{
     ChainRequest, ChainResponse, EvmOutboxInspection, EvmOutboxOutcome, EvmTransactionRequest,
-    HttpRequest, HttpResponse, PetalRouteContext, SignBatchOutcome, SignBatchRequest, SignOutcome,
-    SignRequest,
+    HttpRequest, HttpResponse, PetalRouteContext, PrivateInputOutcome, PrivateInputRequest,
+    SignBatchOutcome, SignBatchRequest, SignOutcome, SignRequest,
 };
 use crate::policy::NetPolicy;
 
@@ -140,6 +140,26 @@ pub trait PetalHost: Send + Sync {
     /// opt in explicitly so chain RPC access remains policy mediated.
     async fn chain_read(&self, _req: ChainRequest) -> Result<ChainResponse, HostError> {
         Err(HostError::Denied("chain_read".into()))
+    }
+
+    /// Request owner-supplied data through a daemon-owned private ceremony.
+    /// The value is returned only to the calling component and never projected
+    /// through the VFS by the host.
+    async fn private_input_request(
+        &self,
+        _req: PrivateInputRequest,
+    ) -> Result<PrivateInputOutcome, HostError> {
+        Err(HostError::Denied("private_input_request".into()))
+    }
+
+    /// Consume a ready private-input session after the component has durably
+    /// persisted the value in its secret namespace.
+    async fn private_input_consume(
+        &self,
+        _id: String,
+        _context: Option<PetalRouteContext>,
+    ) -> Result<(), HostError> {
+        Err(HostError::Denied("private_input_consume".into()))
     }
 }
 

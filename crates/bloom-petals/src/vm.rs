@@ -845,6 +845,15 @@ fn link_component_host_imports(linker: &mut ComponentLinker<StoreData>) -> anyho
             Box::new(async move { component_env_setting(store, params, results).await })
         })?;
     }
+    {
+        let mut private_input = linker.instance("bloom:private-input/ceremony@0.1.0")?;
+        private_input.func_new_async("request-input", |store, params, results| {
+            Box::new(async move { component_private_input_request(store, params, results).await })
+        })?;
+        private_input.func_new_async("consume", |store, params, results| {
+            Box::new(async move { component_private_input_consume(store, params, results).await })
+        })?;
+    }
     Ok(())
 }
 
@@ -1821,6 +1830,90 @@ async fn component_env_setting(
             value.map(|value| Box::new(ComponentVal::String(value))),
         ))),
     )
+}
+
+async fn component_private_input_request(
+    store: StoreContextMut<'_, StoreData>,
+    params: &[ComponentVal],
+    results: &mut [ComponentVal],
+) -> anyhow::Result<()> {
+    if !store.data().caps.contains(&Capability::PrivateInput) {
+        log_denied(store.data(), "component_private_input_request");
+        return set_component_result(
+            results,
+            component_host_err(HostError::Denied("private_input".into())),
+        );
+    }
+    let [ComponentVal::Record(fields)] = params else {
+        return set_component_result(
+            results,
+            component_host_err(HostError::Invalid("invalid private-input request".into())),
+        );
+    };
+    let kind = match component_record_field(fields, "kind")? {
+        ComponentVal::Enum(name) if name == "evm-address" => {
+            crate::abi::PrivateInputKind::EvmAddress
+        }
+        _ => {
+            return set_component_result(
+                results,
+                component_host_err(HostError::Invalid("unsupported private-input kind".into())),
+            );
+        }
+    };
+    let request = crate::abi::PrivateInputRequest {
+        id: component_record_string(fields, "id")?,
+        wallet: component_record_string(fields, "wallet")?,
+        approval_wallet: component_optional_string_field(fields, "approval-wallet")?,
+        title: component_record_string(fields, "title")?,
+        prompt: component_record_string(fields, "prompt")?,
+        kind,
+        context: store.data().sign_context.clone(),
+    };
+    let host = store.data().host.clone();
+    let value = match host.private_input_request(request).await {
+        Ok(crate::abi::PrivateInputOutcome::Pending(pending)) => ComponentVal::Variant(
+            "pending".into(),
+            Some(Box::new(ComponentVal::Record(vec![
+                (
+                    "ceremony-url".into(),
+                    ComponentVal::String(pending.ceremony_url),
+                ),
+                ("expires-ms".into(), ComponentVal::U64(pending.expires_ms)),
+            ]))),
+        ),
+        Ok(crate::abi::PrivateInputOutcome::Ready(value)) => {
+            ComponentVal::Variant("ready".into(), Some(Box::new(ComponentVal::String(value))))
+        }
+        Err(err) => return set_component_result(results, component_host_err(err)),
+    };
+    set_component_result(results, component_ok(Some(value)))
+}
+
+async fn component_private_input_consume(
+    store: StoreContextMut<'_, StoreData>,
+    params: &[ComponentVal],
+    results: &mut [ComponentVal],
+) -> anyhow::Result<()> {
+    if !store.data().caps.contains(&Capability::PrivateInput) {
+        log_denied(store.data(), "component_private_input_consume");
+        return set_component_result(
+            results,
+            component_host_err(HostError::Denied("private_input".into())),
+        );
+    }
+    let id = match component_single_string_param(params, "id") {
+        Ok(id) => id,
+        Err(err) => return set_component_result(results, component_host_err(err)),
+    };
+    let host = store.data().host.clone();
+    match host
+        .private_input_consume(id, store.data().sign_context.clone())
+        .await
+    {
+        Ok(()) => set_component_result(results, component_ok(None)),
+        Err(err) => set_component_result(results, component_host_err(err)),
+    }
 }
 
 fn set_component_result(results: &mut [ComponentVal], val: ComponentVal) -> anyhow::Result<()> {

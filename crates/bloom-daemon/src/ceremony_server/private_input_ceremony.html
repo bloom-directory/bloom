@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <title>/bloom — Private Privacy Pools destination</title>
+  <style>
+    :root{color-scheme:light dark;font-family:system-ui,sans-serif;background:#f4efe6;color:#18140f}
+    body{margin:0;min-height:100vh;display:grid;place-items:center;background:linear-gradient(135deg,#f8f3ea,#e7dfd2)}
+    main{width:min(560px,calc(100% - 32px));padding:32px;border:1px solid #cbbda9;border-radius:18px;background:#fffaf2;box-shadow:0 24px 70px #4a38251f}
+    h1{margin:0 0 10px;font:italic 42px Georgia,serif}.muted{color:#6e6456;line-height:1.5}
+    label{display:block;margin:26px 0 8px;font-weight:650}input{width:100%;box-sizing:border-box;padding:14px;border:1px solid #aa9c88;border-radius:9px;background:white;color:#18140f;font:14px ui-monospace,monospace}
+    button{width:100%;margin-top:16px;padding:14px;border:0;border-radius:9px;background:#7a2230;color:white;font-weight:650;cursor:pointer}button:disabled{opacity:.55;cursor:wait}
+    #status{min-height:1.5em;margin-top:16px;color:#6e2430}.privacy{margin-top:24px;padding-top:18px;border-top:1px solid #d8ccba;font-size:13px;color:#6e6456}
+  </style>
+</head>
+<body><main>
+  <p class="muted" id="wallet">Loading ceremony…</p>
+  <h1 id="title">Private destination</h1>
+  <p class="muted" id="prompt"></p>
+  <form id="form">
+    <label for="destination">Ethereum withdrawal address</label>
+    <input id="destination" name="destination" inputmode="text" autocomplete="off" spellcheck="false" placeholder="0x…" required pattern="0x[0-9a-fA-F]{40}">
+    <button id="approve" type="submit">Verify with passkey</button>
+  </form>
+  <div id="status" role="status" aria-live="polite"></div>
+  <p class="privacy">The address is submitted directly to the local Bloom daemon. It is not returned through VFS. Your passkey approval is bound to its digest, so the prepared address cannot be swapped afterward.</p>
+</main><script>
+var PATH=location.pathname.replace(/\/$/,'');
+function dec(s){s=s.replace(/-/g,'+').replace(/_/g,'/');while(s.length%4)s+='=';var b=atob(s),a=new Uint8Array(b.length);for(var i=0;i<b.length;i++)a[i]=b.charCodeAt(i);return a.buffer}
+function enc(b){var a=new Uint8Array(b),s='';for(var i=0;i<a.length;i++)s+=String.fromCharCode(a[i]);return btoa(s).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'')}
+fetch(PATH+'/request.json').then(function(r){if(!r.ok)throw new Error('Ceremony unavailable');return r.json()}).then(function(v){
+  document.getElementById('title').textContent=v.title;document.getElementById('prompt').textContent=v.prompt;document.getElementById('wallet').textContent='Passkey wallet · '+v.approval_wallet+' · Note wallet · '+v.note_wallet;
+}).catch(function(e){document.getElementById('status').textContent=e.message;document.getElementById('approve').disabled=true});
+document.getElementById('form').addEventListener('submit',async function(event){
+  event.preventDefault();var button=document.getElementById('approve'),status=document.getElementById('status'),value=document.getElementById('destination').value.trim();button.disabled=true;status.textContent='Preparing an approval bound to this address…';
+  try{
+    var prepared=await fetch(PATH+'/prepare',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({value:value})});var opts=await prepared.json();if(!prepared.ok)throw new Error(opts.error||'Could not prepare ceremony');
+    opts.publicKey.challenge=dec(opts.publicKey.challenge);if(opts.publicKey.allowCredentials)opts.publicKey.allowCredentials=opts.publicKey.allowCredentials.map(function(c){return Object.assign({},c,{id:dec(c.id)})});
+    if(opts.publicKey.extensions&&opts.publicKey.extensions.prf&&opts.publicKey.extensions.prf.eval&&opts.publicKey.extensions.prf.eval.first)opts.publicKey.extensions.prf.eval.first=dec(opts.publicKey.extensions.prf.eval.first);
+    status.textContent='Confirm the exact address above with your passkey…';var cred=await navigator.credentials.get(opts);
+    var body={credential:{id:cred.id,response:{authenticatorData:enc(cred.response.authenticatorData),clientDataJSON:enc(cred.response.clientDataJSON),signature:enc(cred.response.signature),userHandle:cred.response.userHandle?enc(cred.response.userHandle):null}}};
+    var completed=await fetch(PATH+'/complete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});var out=await completed.json();if(!completed.ok||!out.ok)throw new Error(out.error||'Approval failed');
+    status.textContent='Destination approved and held privately. You can close this tab.';document.getElementById('destination').value='';
+  }catch(e){status.textContent='Error: '+(e&&e.message?e.message:e);button.disabled=false}
+});
+</script></body></html>

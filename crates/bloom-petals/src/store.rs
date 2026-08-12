@@ -289,30 +289,30 @@ impl PetalStore {
         // migrate it to the new hash BEFORE committing the owner write.
         // Without this, reinstalling a petal silently orphans all secrets —
         // for privacy-pools that means locked deposits (unrecoverable).
-        if let Ok(Some(old_hash)) = self.resolve_petal_owner(&package.name) {
-            if old_hash != hash {
-                let data_root = self.private_data_root();
-                let old_dir = data_root.join(&old_hash);
-                let new_dir = data_root.join(&hash);
-                if old_dir.is_dir() {
-                    match migrate_private_store(&old_dir, &new_dir) {
-                        Ok(count) if count > 0 => {
-                            eprintln!(
-                                "[bloom] petal store migration: copied {} files from \
-                                 prior {} (hash {:.12}) to new hash {:.12} — secrets \
-                                 preserved across reinstall",
-                                count, package.name, old_hash, hash
-                            );
-                        }
-                        Ok(_) => {}
-                        Err(e) => {
-                            eprintln!(
-                                "[bloom] WARNING: could not migrate private store for \
-                                 {} ({:.12} → {:.12}): {}. \
-                                 Back up secrets via /recovery/ before proceeding.",
-                                package.name, old_hash, hash, e
-                            );
-                        }
+        if let Ok(Some(old_hash)) = self.resolve_petal_owner(&package.name)
+            && old_hash != hash
+        {
+            let data_root = self.private_data_root();
+            let old_dir = data_root.join(&old_hash);
+            let new_dir = data_root.join(&hash);
+            if old_dir.is_dir() {
+                match migrate_private_store(&old_dir, &new_dir) {
+                    Ok(count) if count > 0 => {
+                        eprintln!(
+                            "[bloom] petal store migration: copied {} files from \
+                             prior {} (hash {:.12}) to new hash {:.12} — secrets \
+                             preserved across reinstall",
+                            count, package.name, old_hash, hash
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        eprintln!(
+                            "[bloom] WARNING: could not migrate private store for \
+                             {} ({:.12} → {:.12}): {}. \
+                             Back up secrets via /recovery/ before proceeding.",
+                            package.name, old_hash, hash, e
+                        );
                     }
                 }
             }
@@ -804,7 +804,6 @@ fn validate_owner(owner: &AppOwner) -> Result<(), PetalError> {
 /// permissions (secret files are 0600). Existing files in the target are
 /// not overwritten — a partial prior migration won't clobber fresh data.
 fn migrate_private_store(source: &Path, target: &Path) -> Result<usize, PetalError> {
-    use std::os::unix::fs::PermissionsExt;
     let mut count = 0;
     migrate_dir(source, target, &mut count)?;
     Ok(count)
@@ -1222,12 +1221,21 @@ name = "echo"
         assert_ne!(first_hash, second_hash);
 
         // The new hash's private store should have the migrated data.
-        let migrated_secret = data_root.join(&second_hash).join("secrets/deposit_note.json");
+        let migrated_secret = data_root
+            .join(&second_hash)
+            .join("secrets/deposit_note.json");
         assert!(migrated_secret.exists(), "secret file was not migrated");
-        assert_eq!(std::fs::read(&migrated_secret).unwrap(), b"{\"nullifier\":\"0xabc\"}");
+        assert_eq!(
+            std::fs::read(&migrated_secret).unwrap(),
+            b"{\"nullifier\":\"0xabc\"}"
+        );
 
         // File permissions preserved (0600 for secrets).
-        let mode = std::fs::metadata(&migrated_secret).unwrap().permissions().mode() & 0o777;
+        let mode = std::fs::metadata(&migrated_secret)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
         assert_eq!(mode, 0o600, "secret file permissions not preserved");
 
         // State files migrated too.

@@ -1229,6 +1229,7 @@ mod tests {
             tx_hash: staged.tx_hash.clone().unwrap(),
             block_number: Some(123),
             revert_reason: None,
+            logs: None,
         };
         let se = &ob.walk_all_sent().unwrap()[0];
         ob.write_sent_sibling(se, RECEIPT_FILE, &serde_json::to_vec(&rec).unwrap())
