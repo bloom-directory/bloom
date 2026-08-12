@@ -330,6 +330,7 @@ jobs:
           \`\`\`
           https://github.com/$REPOSITORY/releases/download/$TAG/bloom-linux-x86_64.tar.gz
           https://github.com/$REPOSITORY/releases/download/$TAG/bloom-linux-aarch64.tar.gz
+          https://github.com/$REPOSITORY/releases/download/$TAG/bloom-linux-aarch64-musl.tar.gz
           https://github.com/$REPOSITORY/releases/download/$TAG/bloom-macos-x86_64.tar.gz
           https://github.com/$REPOSITORY/releases/download/$TAG/bloom-macos-aarch64.tar.gz
           \`\`\`
