@@ -12,6 +12,7 @@ log_dir=""
 ready_file=""
 services_only=0
 install_authority_fixture="${BLOOM_TRIAD_DEV_AUTHORITY_FIXTURE:-0}"
+build_integration_petals="${BLOOM_TRIAD_DEV_BUILD_PETALS:-1}"
 
 die() { printf 'triad developer launcher: %s\n' "$*" >&2; exit 1; }
 need_value() { [ "$#" -ge 2 ] || die "$1 requires a value"; }
@@ -39,6 +40,17 @@ case "$install_authority_fixture" in
   0|1) ;;
   *) die "BLOOM_TRIAD_DEV_AUTHORITY_FIXTURE must be 0 or 1" ;;
 esac
+case "$build_integration_petals" in
+  0|1) ;;
+  *) die "BLOOM_TRIAD_DEV_BUILD_PETALS must be 0 or 1" ;;
+esac
+
+[ "$(id -u)" -ne 0 ] || die "developer harness refuses root"
+host_os="$(uname -s)"
+case "$host_os" in
+  Darwin|Linux) ;;
+  *) die "developer harness requires Linux or macOS" ;;
+esac
 
 command -v jq >/dev/null 2>&1 || die "jq is required"
 umask 077
@@ -65,6 +77,19 @@ fi
 if [ -n "$mount_dir" ]; then
   mkdir -p "$mount_dir"
   mount_dir="$(cd "$mount_dir" && pwd -P)"
+  if [ "$host_os" = Linux ]; then
+    command -v sudo >/dev/null 2>&1 || die "Linux developer mounts require sudo"
+    mount_nfs_bin="$(command -v mount.nfs4 || true)"
+    umount_bin="$(command -v umount || true)"
+    [ -n "$mount_nfs_bin" ] || die "Linux developer mounts require mount.nfs4"
+    [ -n "$umount_bin" ] || die "Linux developer mounts require umount"
+    mount_probe_opts="actimeo=0,vers=4.1,proto=tcp,port=1,rsize=65536,wsize=65536,timeo=10"
+    sudo -n -l -- "$mount_nfs_bin" -o "$mount_probe_opts" \
+      "127.0.0.1:/" "$mount_dir" >/dev/null 2>&1 ||
+      die "Linux developer mount privilege is not installed for $mount_dir"
+    sudo -n -l -- "$umount_bin" -l -f "$mount_dir" >/dev/null 2>&1 ||
+      die "Linux developer unmount privilege is not installed for $mount_dir"
+  fi
 fi
 log_dir="$(cd "$log_dir" && pwd -P)"
 machine_socket="$(cd "$(dirname "$machine_socket")" && pwd -P)/$(basename "$machine_socket")"
@@ -113,7 +138,11 @@ if [ ! -f "${config_dir}/edge-manifest.json" ]; then
   template_dir="$(mktemp -d "${developer_root}/templates.XXXXXX")"
   chmod 0700 "$template_dir"
   for name in edge-manifest.json.in broker.json.in signer.json.in provenance-catalog.unsigned.json; do
-    cp "${repo_root}/packaging/triad/macos/config/${name}" "${template_dir}/${name}"
+    template_source="${repo_root}/packaging/triad/macos/config/${name}"
+    if [ "$host_os" = Linux ] && [ "$name" = edge-manifest.json.in ]; then
+      template_source="${repo_root}/packaging/triad/linux/config/${name}"
+    fi
+    cp "$template_source" "${template_dir}/${name}"
     chmod 0600 "${template_dir}/${name}"
   done
   if [ "$install_authority_fixture" -eq 1 ]; then
@@ -167,9 +196,11 @@ hyperliquid_package="${BLOOM_TRIAD_DEV_HYPERLIQUID_PACKAGE:-}"
 if [ -n "$hyperliquid_package" ]; then
   [ -d "$hyperliquid_package" ] ||
     die "integration Petal package is missing: $hyperliquid_package"
-  [ -x "${hyperliquid_package}/scripts/build.sh" ] ||
-    die "integration Petal build script is missing: ${hyperliquid_package}/scripts/build.sh"
-  (cd "$hyperliquid_package" && scripts/build.sh)
+  if [ "$build_integration_petals" -eq 1 ]; then
+    [ -x "${hyperliquid_package}/scripts/build.sh" ] ||
+      die "integration Petal build script is missing: ${hyperliquid_package}/scripts/build.sh"
+    (cd "$hyperliquid_package" && scripts/build.sh)
+  fi
   "$bloom_bin" init triad-enroll-developer-petal-provenance \
     "$config_dir" "$hyperliquid_package"
 fi
@@ -248,6 +279,7 @@ cleanup() {
   for pid in "$machine_pid" "$broker_pid" "$signer_pid" "$session_pid"; do
     if [ -n "$pid" ]; then wait "$pid" 2>/dev/null || true; fi
   done
+  rm -f -- "$machine_socket"
   case "$runtime_dir" in
     "${developer_root}/runtime."*) rm -rf -- "$runtime_dir" ;;
     *) printf 'refusing to remove unexpected runtime: %s\n' "$runtime_dir" >&2 ;;
@@ -279,8 +311,13 @@ wait_for_socket() {
 }
 
 mount_fallback_hint() {
-  printf '%s\n' \
-    'If this macOS version cannot mount NFS 4.1, restart without --mount and use bloom vfs commands.' >&2
+  if [ "$host_os" = Linux ]; then
+    printf '%s\n' \
+      'Check the exact Linux developer mount sudo policy, or restart without --mount and use bloom vfs commands.' >&2
+  else
+    printf '%s\n' \
+      'If this macOS version cannot mount NFS 4.1, restart without --mount and use bloom vfs commands.' >&2
+  fi
 }
 
 wait_for_machine_ipc() {

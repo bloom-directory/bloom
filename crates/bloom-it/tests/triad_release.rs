@@ -420,6 +420,36 @@ fn triad_developer_launcher_keeps_explicit_mounts_fail_closed() {
 }
 
 #[test]
+fn triad_developer_launcher_supports_linux_without_weakening_root_boundary() {
+    let launcher = fs::read_to_string(workspace().join("scripts/triad-dev-launch.sh")).unwrap();
+
+    assert!(launcher.contains("developer harness refuses root"));
+    assert!(launcher.contains("Darwin|Linux)"));
+    assert!(launcher.contains("Linux developer mounts require mount.nfs4"));
+    assert!(launcher.contains("sudo -n -l -- \"$mount_nfs_bin\""));
+    assert!(launcher.contains("sudo -n -l -- \"$umount_bin\" -l -f \"$mount_dir\""));
+    assert!(launcher.contains("Linux developer mount privilege is not installed"));
+    assert!(launcher.contains("packaging/triad/linux/config/${name}"));
+
+    let linux_manifest =
+        fs::read_to_string(workspace().join("packaging/triad/linux/config/edge-manifest.json.in"))
+            .unwrap();
+    assert!(linux_manifest.contains("\"trusted_time_source\": \"linux-chrony-nts\""));
+    assert!(!linux_manifest.contains("macos-managed-timed"));
+}
+
+#[test]
+fn triad_developer_launcher_accepts_explicit_prebuilt_petals() {
+    let launcher = fs::read_to_string(workspace().join("scripts/triad-dev-launch.sh")).unwrap();
+
+    assert!(launcher.contains("BLOOM_TRIAD_DEV_BUILD_PETALS:-1"));
+    assert!(launcher.contains("BLOOM_TRIAD_DEV_BUILD_PETALS must be 0 or 1"));
+    assert!(launcher.contains("if [ \"$build_integration_petals\" -eq 1 ]; then"));
+    assert!(launcher.contains("triad-enroll-developer-petal-provenance"));
+    assert!(launcher.contains("machine_cli petals install"));
+}
+
+#[test]
 fn triad_developer_launcher_can_leave_machine_developer_managed() {
     let launcher_path = workspace().join("scripts/triad-dev-launch.sh");
     let launcher = fs::read_to_string(&launcher_path).unwrap();
@@ -476,6 +506,7 @@ fn triad_developer_launcher_owns_only_its_service_processes() {
         )
     );
     assert!(launcher.contains("rm -f -- \"$ready_file\""));
+    assert!(launcher.contains("rm -f -- \"$machine_socket\""));
     assert!(launcher.contains("die \"$label exited while supervising triad services\""));
 }
 

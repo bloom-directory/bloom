@@ -58,12 +58,7 @@ pub fn run(
 pub fn run_developer(template_dir: &Path, output_dir: &Path, release_digest: String) -> Result<()> {
     let uid = rustix::process::geteuid().as_raw();
     let gid = rustix::process::getegid().as_raw();
-    if uid == 0 {
-        bail!("developer enrollment material generation refuses root");
-    }
-    if std::env::consts::OS != "macos" {
-        bail!("developer enrollment material generation requires Darwin");
-    }
+    validate_developer_caller(uid, std::env::consts::OS)?;
     let template_dir = fs::canonicalize(template_dir)
         .context("canonicalize developer enrollment template directory")?;
     let output_dir = fs::canonicalize(output_dir)
@@ -88,17 +83,23 @@ pub fn run_developer(template_dir: &Path, output_dir: &Path, release_digest: Str
 #[cfg(feature = "triad-dev-harness")]
 pub fn run_developer_petal_provenance(config_dir: &Path, petal_dir: &Path) -> Result<()> {
     let uid = rustix::process::geteuid().as_raw();
-    if uid == 0 {
-        bail!("developer Petal provenance enrollment refuses root");
-    }
-    if std::env::consts::OS != "macos" {
-        bail!("developer Petal provenance enrollment is only supported on macOS");
-    }
+    validate_developer_caller(uid, std::env::consts::OS)?;
     let config_dir =
         fs::canonicalize(config_dir).context("canonicalize developer triad config directory")?;
     let petal_dir =
         fs::canonicalize(petal_dir).context("canonicalize developer Petal package directory")?;
     enroll_developer_petal_provenance(&config_dir, &petal_dir, uid)
+}
+
+#[cfg(any(test, feature = "triad-dev-harness"))]
+fn validate_developer_caller(uid: u32, os: &str) -> Result<()> {
+    if uid == 0 {
+        bail!("developer enrollment material generation refuses root");
+    }
+    if !matches!(os, "linux" | "macos") {
+        bail!("developer enrollment material generation requires Linux or macOS");
+    }
+    Ok(())
 }
 
 #[cfg(feature = "triad-dev-harness")]
@@ -809,6 +810,25 @@ mod tests {
             .and_then(Path::parent)
             .unwrap()
             .join("packaging/triad/macos/config")
+    }
+
+    #[test]
+    fn developer_enrollment_platform_policy_accepts_non_root_linux_and_macos_only() {
+        validate_developer_caller(1000, "linux").unwrap();
+        validate_developer_caller(501, "macos").unwrap();
+
+        assert!(
+            validate_developer_caller(0, "linux")
+                .unwrap_err()
+                .to_string()
+                .contains("refuses root")
+        );
+        assert!(
+            validate_developer_caller(1000, "windows")
+                .unwrap_err()
+                .to_string()
+                .contains("Linux or macOS")
+        );
     }
 
     #[test]

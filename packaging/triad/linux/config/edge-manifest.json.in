@@ -1,0 +1,40 @@
+{
+  "schema": "bloom.edge-manifest.1",
+  "trusted_time_source": "linux-chrony-nts",
+  "machine": {
+    "effective_uid": @LOGIN_UID@,
+    "service_id": "bloom-machine",
+    "boot_epoch": "@MACHINE_BOOT_EPOCH@",
+    "application_key_id": "@MACHINE_APPLICATION_KEY_ID@",
+    "application_public_key_hex": "@MACHINE_APPLICATION_PUBLIC_KEY_HEX@"
+  },
+  "broker": {
+    "effective_uid": @BLOOM_BROKER_UID@,
+    "service_id": "bloom-broker",
+    "boot_epoch": "@BROKER_BOOT_EPOCH@",
+    "application_key_id": "@BROKER_APPLICATION_KEY_ID@",
+    "application_public_key_hex": "@BROKER_APPLICATION_PUBLIC_KEY_HEX@"
+  },
+  "signer": {
+    "effective_uid": @BLOOM_SIGNER_UID@,
+    "service_id": "bloom-signer",
+    "boot_epoch": "@SIGNER_BOOT_EPOCH@",
+    "application_key_id": "@SIGNER_APPLICATION_KEY_ID@",
+    "application_public_key_hex": "@SIGNER_APPLICATION_PUBLIC_KEY_HEX@"
+  },
+  "revoke_client": {
+    "effective_uid": @LOGIN_UID@,
+    "service_id": "bloom-revoke-client",
+    "boot_epoch": "@REVOKE_BOOT_EPOCH@",
+    "application_key_id": "@REVOKE_APPLICATION_KEY_ID@",
+    "application_public_key_hex": "@REVOKE_APPLICATION_PUBLIC_KEY_HEX@"
+  },
+  "session": {
+    "effective_uid": @LOGIN_UID@,
+    "service_id": "bloom-session",
+    "boot_epoch": "@SESSION_BOOT_EPOCH@",
+    "application_key_id": "@SESSION_APPLICATION_KEY_ID@",
+    "application_public_key_hex": "@SESSION_APPLICATION_PUBLIC_KEY_HEX@"
+  },
+  "session_socket_gid": @SESSION_SOCKET_GID@
+}
