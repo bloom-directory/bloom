@@ -1,0 +1,30 @@
+schema_version = "1.4"
+
+[task]
+name = "bloom/hyperliquid-order-cancel"
+version = "0.1.0"
+authors = [{ name = "Bloom", email = "engineering@bloom.directory" }]
+keywords = ["bloom", "hyperliquid", "mainnet", "agent-actions"]
+
+[metadata]
+difficulty = "medium"
+category = "agent-actions"
+tags = ["mainnet", "trading", "cleanup-required"]
+
+[agent]
+timeout_sec = 900.0
+
+[verifier]
+timeout_sec = 120.0
+
+[environment]
+build_timeout_sec = 600.0
+cpus = 2
+memory_mb = 4096
+storage_mb = 10240
+network_mode = "public"
+mcp_servers = []
+
+[verifier.env]
+
+[solution.env]
