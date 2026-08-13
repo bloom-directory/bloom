@@ -189,6 +189,7 @@ fn exact_signer(wallet: WalletPublic) -> (BrokerExactPayloadSigner, Arc<ExactBro
                 operation_class: token(class),
             },
             publisher: token("bloom-installer"),
+            petal_lineage: None,
             operation_classes: vec![ProvenanceOperationClass {
                 operation_class: token(class),
                 fee_asset: None,

@@ -4758,6 +4758,7 @@ mod tests {
                     operation_class: Token::new("transaction.confirm").unwrap(),
                 },
                 publisher: Token::new("bloom-installer").unwrap(),
+                petal_lineage: None,
                 operation_classes: vec![ProvenanceOperationClass {
                     operation_class: Token::new("transaction.confirm").unwrap(),
                     fee_asset: Some(ProvenanceFeeAsset {
