@@ -89,11 +89,13 @@ transport, Broker-owned ceremony HTTP, genuine WebAuthn, and Signer-held keys.
 The developer feature is rejected by production release packaging.
 
 The launcher writes public authenticated connection settings to
-`/tmp/bloom-triad-logs/triad.env`. Source it only in a second developer shell:
+`/tmp/bloom-triad-logs/triad.env`. Source it only in a second developer shell.
+This prepends the selected debug binary directory to `PATH` in that terminal,
+so use `bloom` directly for commands against the running Machine:
 
 ```sh
 source /tmp/bloom-triad-logs/triad.env
-target/debug/bloom wallet new test-wallet
+bloom wallet new test-wallet
 ```
 
 Wallet registration, import, credential changes, policy updates, delegated-key
