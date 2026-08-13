@@ -84,9 +84,19 @@ scripts/triad-dev-launch.sh \
 ```
 
 The developer profile runs all processes under the current non-root login UID
-on Linux or macOS and makes no production principal-isolation claim. Linux
-kernel mounts additionally require a narrowly scoped noninteractive sudo rule
-for the exact mountpoint; VFS-only and services-only modes need no privilege.
+on Linux or macOS and makes no production principal-isolation claim. On Linux,
+Broker and Signer use temporary per-user systemd socket and service units so
+the unchanged production listener code consumes real named socket-activation
+descriptors. The login must therefore have an active systemd user manager. For
+a dedicated persistent eval account, an administrator can enable it once with
+`loginctl enable-linger LOGIN_USER`; ordinary interactive logins usually
+already have an active user manager. Linux developer paths used by these units
+must contain only ASCII letters, digits, and `_./:@+-`.
+
+Linux kernel mounts additionally require a narrowly scoped noninteractive sudo
+rule for the exact mountpoint; VFS-only and services-only modes need no mount
+privilege. The temporary user units and sockets are removed when the launcher
+exits.
 Linux uses the reviewed `linux-chrony-nts` trusted-time profile and therefore
 requires a synchronized host clock backed by the production two-source NTS
 configuration; the developer harness does not substitute unauthenticated NTP.
