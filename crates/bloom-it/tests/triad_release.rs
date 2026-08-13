@@ -433,6 +433,36 @@ fn triad_developer_launcher_supports_linux_without_weakening_root_boundary() {
     assert!(launcher.contains("sudo -n -l -- \"$umount_bin\" -l -f \"$mount_dir\""));
     assert!(launcher.contains("Linux developer mount privilege is not installed"));
     assert!(launcher.contains("packaging/triad/linux/config/${name}"));
+    assert!(launcher.contains("systemctl --user"));
+    assert!(launcher.contains("export LC_ALL=C"));
+    assert!(launcher.contains("Linux developer systemd user unit directory is unsafe"));
+    assert!(launcher.contains("Linux developer systemd unit paths may contain only ASCII"));
+    assert!(launcher.contains("printf 'FileDescriptorName=%s\\n' \"$descriptor\""));
+    assert!(launcher.contains(
+        "'Bloom developer Signer socket' \"$signer_socket\" signer \"$signer_service_unit\""
+    ));
+    assert!(launcher.contains(
+        "'Bloom developer Signer control socket' \"$signer_control_socket\" signer-control \"$signer_service_unit\""
+    ));
+    assert!(launcher.contains(
+        "'Bloom developer Broker socket' \"$broker_socket\" broker \"$broker_service_unit\""
+    ));
+    assert!(launcher.contains(
+        "'Bloom developer Broker control socket' \"$broker_control_socket\" broker-control \"$broker_service_unit\""
+    ));
+    assert!(launcher.contains(
+        "printf 'Sockets=%s\\n' \"$signer_socket_unit\" \"$signer_control_socket_unit\""
+    ));
+    assert!(launcher.contains(
+        "printf 'Sockets=%s\\n' \"$broker_socket_unit\" \"$broker_control_socket_unit\""
+    ));
+    assert_eq!(
+        launcher
+            .matches("\"BLOOM_AUTHORITY_EDGE_HISTORY=$authority_edge_history\"")
+            .count(),
+        2
+    );
+    assert!(launcher.contains("Linux developer services require an active systemd user manager"));
 
     let linux_manifest =
         fs::read_to_string(workspace().join("packaging/triad/linux/config/edge-manifest.json.in"))
@@ -507,6 +537,7 @@ fn triad_developer_launcher_owns_only_its_service_processes() {
     let launcher = fs::read_to_string(workspace().join("scripts/triad-dev-launch.sh")).unwrap();
 
     assert!(launcher.contains("trap cleanup EXIT INT TERM HUP"));
+    assert!(launcher.contains("trap '' INT TERM HUP"));
     assert!(
         launcher.contains(
             "for pid in \"$machine_pid\" \"$broker_pid\" \"$signer_pid\" \"$session_pid\""
