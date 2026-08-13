@@ -55,35 +55,43 @@ PY
 
 bash -n "${repo_root}/scripts/evals/run-harbor-hyperliquid.sh"
 bash -n "${task}/tests/test.sh"
-grep -F 'dirname "${BASH_SOURCE[0]}")/../..' \
-  "${repo_root}/scripts/evals/run-harbor-hyperliquid.sh" >/dev/null
-grep -F -- '--authenticator-seed-file support' \
-  "${repo_root}/scripts/evals/run-harbor-hyperliquid.sh" >/dev/null
-grep -F 'duration_ms:1800000' \
-  "${repo_root}/scripts/evals/run-harbor-hyperliquid.sh" >/dev/null
-grep -F "jq -e 'length != 0'" \
-  "${repo_root}/scripts/evals/run-harbor-hyperliquid.sh" >/dev/null
-grep -F '{type:"bind",source:$bloom,target:"/bloom",read_only:true}' \
-  "${repo_root}/scripts/evals/run-harbor-hyperliquid.sh" >/dev/null
-grep -F '["order.json", "cancel.json", "update_leverage.json", "cancel_all"]' \
-  "${repo_root}/scripts/evals/run-harbor-hyperliquid.sh" >/dev/null
-grep -F 'source:($bloom + "/petals/hyperliquid/mainnet/agent_sessions/"' \
-  "${repo_root}/scripts/evals/run-harbor-hyperliquid.sh" >/dev/null
-if grep -F '"stop"] | map' "${repo_root}/scripts/evals/run-harbor-hyperliquid.sh" >/dev/null; then
-  echo 'stop route must not be writable in the evaluated container' >&2
-  exit 1
-fi
-if grep -F '"$driver" complete "$ceremony_url" "$seed"' \
-  "${repo_root}/scripts/evals/run-harbor-hyperliquid.sh" >/dev/null; then
-  echo 'authenticator seed must not be passed on the debug-driver command line' >&2
-  exit 1
-fi
+PYTHONPATH="${repo_root}/evals/harbor" python3 -m unittest discover \
+  -s "${repo_root}/evals/harbor/harness_tests" -v
 
-set +e
-preflight="$({ BLOOM_EVAL_WALLET="$wallet" \
-  "${repo_root}/scripts/evals/run-harbor-hyperliquid.sh" codex; } 2>&1)"
-preflight_status=$?
-set -e
-[ "$preflight_status" -ne 0 ]
-grep -F 'BLOOM_EVAL_MAINNET_ACK=PLACE_AND_CANCEL_BTC_MAINNET_UP_TO_11_USD' <<<"$preflight" >/dev/null
+# Validate our programmatic configuration against the exact Harbor API version
+# used by the launcher. This does not start Docker or touch Hyperliquid.
+TMP_JOB_DIR="$tmp/job-plan" PYTHONPATH="${repo_root}/evals/harbor" \
+  uv run --isolated --no-project --with harbor==0.21.0 python - <<'PY'
+import asyncio
+import os
+from pathlib import Path
+
+from harbor.job_plan import JobPlan
+from harbor.models.environment_type import EnvironmentType
+from harbor.models.job.config import JobConfig, RetryConfig
+from harbor.models.trial.config import AgentConfig, EnvironmentConfig, TaskConfig, VerifierConfig
+
+config = JobConfig(
+    job_name="api-smoke",
+    jobs_dir=Path(os.environ["TMP_JOB_DIR"]),
+    n_attempts=1,
+    n_concurrent_trials=1,
+    retry=RetryConfig(max_retries=0),
+    agents=[AgentConfig(name="codex", model_name="gpt-5.6-terra", n_concurrent=1)],
+    environment=EnvironmentConfig(
+        type=EnvironmentType.DOCKER,
+        mounts=[{"type":"bind", "source":"/tmp", "target":"/bloom", "read_only":True}],
+    ),
+    verifier=VerifierConfig(),
+    tasks=[TaskConfig(path=Path("evals/harbor/tasks/hyperliquid-order-cancel").resolve())],
+)
+assert config.n_attempts == 1
+assert config.n_concurrent_trials == 1
+assert config.retry.max_retries == 0
+assert config.environment.mounts[0]["read_only"] is True
+plan = asyncio.run(JobPlan.from_config(config))
+assert len(plan.trial_configs) == 1
+assert plan.trial_configs[0].task.path.name == "hyperliquid-order-cancel"
+assert plan.trial_configs[0].environment.mounts[0]["read_only"] is True
+PY
 printf '%s\n' 'Harbor eval static tests passed.'

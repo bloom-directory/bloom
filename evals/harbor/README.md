@@ -23,7 +23,7 @@ audit data outside the agent-controlled container.
 
 ## Prerequisites
 
-- Linux with Docker, `uvx`, `jq`, `flock`, Claude Code and/or Codex auth. Use a
+- Linux with Docker, `uv`, Python 3, Claude Code and/or Codex auth. Use a
   dedicated, revocable model credential for evals rather than an unrelated
   production credential.
 - A running Bloom triad mounted at `/bloom`, with the Hyperliquid Petal installed.
@@ -35,7 +35,7 @@ audit data outside the agent-controlled container.
 - A mode-`0600` file containing the matching authenticator seed.
 
 No wallet key, API wallet key, credential seed, or model credential is committed.
-The host runner invokes the debug driver before Harbor starts. The agent
+The Python host harness invokes the debug driver before Harbor starts. The agent
 container receives the complete `/bloom` tree read-only so discovery matches the
 normal installed-agent experience. Docker over-mounts only that session's
 `order.json`, `cancel.json`, `update_leverage.json`, and `cancel_all` action files
@@ -68,15 +68,22 @@ scripts/evals/run-harbor-hyperliquid.sh claude
 scripts/evals/run-harbor-hyperliquid.sh codex
 ```
 
-The runner pins Harbor 0.21.0 by default. Override with `HARBOR_VERSION` only
-after running the static tests and a dry environment build.
+The launcher pins Harbor 0.21.0 by default and then delegates to the reusable
+Python harness under `evals/harbor/harness`. The harness uses Harbor's public
+`JobConfig`, `Job.create()`, and `Job.run()` API rather than spawning the Harbor
+CLI. Shared locking, lifecycle, result validation, signal handling, and cleanup
+live in `core.py`; each eval supplies its own prerequisite, capability,
+mount/environment, and cleanup implementation. New evals should add another
+`EvalDefinition` and register it in `harness/__main__.py`, not copy the
+Hyperliquid runner. Override `HARBOR_VERSION` only after running the static tests
+and a dry environment build.
 
 ## Safety and cleanup
 
 The runner fails closed unless the exact mainnet acknowledgement is set,
 `/bloom` is a real mount, the dedicated wallet has no open orders or positions,
 the debug driver and protected seed file exist, and Docker is available. It uses
-`flock`, `--n-concurrent 1`, one attempt, and no retries.
+an advisory file lock, Harbor concurrency 1, one attempt, and no retries.
 
 A unique session ID and client order ID are generated per trial. The runner
 creates the exact bounded session, completes its passkey ceremony on the host,
@@ -85,10 +92,10 @@ starting Harbor. Cleanup runs:
 
 1. in the task after the agent;
 2. in the Harbor verifier; and
-3. from the host runner's exit/signal trap.
+3. from the Python host harness's unconditional cleanup block.
 
 The task and verifier invoke `cancel_all` and verify that the client order ID is
-absent. Only the host trap can write `stop`; after cancellation checks pass it
+absent. Only the host harness can write `stop`; after cancellation checks pass it
 stops the session and verifies the stopped state. Any cleanup failure fails the
 run and operators must inspect the wallet before another trial. Cleanup never
 attempts `close_all`, because this eval must not alter positions.
@@ -97,15 +104,12 @@ attempts `close_all`, because this eval must not alter positions.
 
 ```bash
 scripts/test-harbor-evals.sh
-uvx --from harbor==0.21.0 harbor run \
-  --path evals/harbor/tasks/hyperliquid-order-cancel \
-  --agent codex --model gpt-5.6-terra --print-config
 ```
 
-The first command tests valid and adversarial reports, shell syntax, task TOML,
-and the full-tree/read-only plus action-file/read-write mount contract.
-`--print-config` resolves Harbor configuration without
-starting an agent or touching Hyperliquid.
+This tests valid and adversarial reports, shell syntax, task TOML, lifecycle
+failure paths, byte-identical ceremony retries, the full-tree/read-only plus
+action-file/read-write mount contract, and configuration against Harbor 0.21.0's
+actual Python API. It does not start an agent or touch Hyperliquid.
 
 ## Self-contained triad follow-up
 
