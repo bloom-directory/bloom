@@ -401,6 +401,8 @@ if [ "$services_only" -eq 1 ]; then
   printf 'ready\n' > "$ready_file"
   printf '%s\n' \
     'Bloom triad services are ready; Machine is developer-managed.' \
+    'Source triad.env to put the selected debug bloom binary first on PATH;' \
+    'then use bloom directly in that terminal:' \
     "  source ${env_file}" \
     "  cd ${repo_root}" \
     '  cargo build -p bloom --no-default-features --features mount,triad-dev-harness' \
@@ -486,9 +488,11 @@ printf 'ready\n' > "$ready_file"
 if [ -z "$mount_dir" ]; then
   printf '%s\n' \
     'Bloom is ready without a kernel mount.' \
+    'Source triad.env to put the selected debug bloom binary first on PATH;' \
+    'then use bloom directly in that terminal:' \
     "  source ${env_file}" \
-    '  "$BLOOM_BIN" vfs ls /' \
-    '  "$BLOOM_BIN" vfs cat /next.md'
+    '  bloom vfs ls /' \
+    '  bloom vfs cat /next.md'
 else
   while kill -0 "$machine_pid" 2>/dev/null; do
     if ! mount_is_live; then

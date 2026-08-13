@@ -367,8 +367,11 @@ fn triad_developer_launcher_supports_vfs_only_mode() {
     );
     assert!(
         launcher.contains("Bloom is ready without a kernel mount")
-            && launcher.contains("\"$BLOOM_BIN\" vfs ls /")
-            && launcher.contains("\"$BLOOM_BIN\" vfs cat /next.md"),
+            && launcher
+                .contains("Source triad.env to put the selected debug bloom binary first on PATH;")
+            && launcher.contains("then use bloom directly in that terminal:")
+            && launcher.contains("bloom vfs ls /")
+            && launcher.contains("bloom vfs cat /next.md"),
         "VFS-only startup must tell the developer how to use the running Machine"
     );
     assert!(
@@ -427,6 +430,10 @@ fn triad_developer_launcher_can_leave_machine_developer_managed() {
     assert!(launcher.contains("--services-only) services_only=1; shift ;;"));
     assert!(launcher.contains("if [ \"$services_only\" -eq 1 ]; then"));
     assert!(launcher.contains("Bloom triad services are ready; Machine is developer-managed."));
+    assert!(
+        launcher.contains("Source triad.env to put the selected debug bloom binary first on PATH;")
+    );
+    assert!(launcher.contains("then use bloom directly in that terminal:"));
     assert!(launcher.contains("supervise_services"));
 
     let directory = tempfile::tempdir().unwrap();
