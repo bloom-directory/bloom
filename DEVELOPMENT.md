@@ -83,10 +83,19 @@ scripts/triad-dev-launch.sh \
   --ready-file /tmp/bloom-triad-ready
 ```
 
-The developer profile runs all processes under the current login UID and makes
-no production principal-isolation claim. It still uses authenticated triad
+The developer profile runs all processes under the current non-root login UID
+on Linux or macOS and makes no production principal-isolation claim. Linux
+kernel mounts additionally require a narrowly scoped noninteractive sudo rule
+for the exact mountpoint; VFS-only and services-only modes need no privilege.
+Linux uses the reviewed `linux-chrony-nts` trusted-time profile and therefore
+requires a synchronized host clock backed by the production two-source NTS
+configuration; the developer harness does not substitute unauthenticated NTP.
+It still uses authenticated triad
 transport, Broker-owned ceremony HTTP, genuine WebAuthn, and Signer-held keys.
 The developer feature is rejected by production release packaging.
+Set `BLOOM_TRIAD_DEV_BUILD_PETALS=0` only when the selected integration Petal
+has already been built from its reviewed revision. Bloom still prepares,
+hashes, provenance-enrolls, and validates the package before installation.
 
 The launcher writes public authenticated connection settings to
 `/tmp/bloom-triad-logs/triad.env`. Source it only in a second developer shell.

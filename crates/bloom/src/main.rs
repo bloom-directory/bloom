@@ -1742,6 +1742,7 @@ struct Cli {
 }
 
 #[derive(Subcommand, Debug)]
+#[allow(clippy::enum_variant_names)]
 enum InitInternal {
     #[cfg(feature = "triad-dev-harness")]
     #[command(name = "triad-render-developer-enrollment", hide = true)]

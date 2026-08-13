@@ -6,6 +6,9 @@ the kernel-mounted NFS VFS and interactive browser ceremonies with Machine,
 Broker, and Signer running as separate processes.
 
 It is deliberately not a deployment mode and makes no UID-isolation claim.
+The same-UID developer profile supports non-root Linux and macOS. On Linux,
+an explicit kernel mount requires a narrowly scoped sudo policy for only the
+selected NFS mountpoint and its unmount operation.
 The `triad-dev-harness` feature adds only same-UID developer enrollment and
 transport bootstrap; it adds no custody, passkey verification, or signing code
 to Machine. Signer keeps custody, Broker owns the ceremony origin, and normal
