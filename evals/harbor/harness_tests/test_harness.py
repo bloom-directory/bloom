@@ -314,7 +314,7 @@ class HyperliquidDefinitionTests(unittest.TestCase):
             raise AssertionError(path)
 
         self.definition._write_route = mock.Mock(side_effect=write)
-        self.definition._read_json = mock.Mock(side_effect=read)
+        self.definition._read_json_if_exists = mock.Mock(side_effect=read)
         context = self.definition.provision("codex")
 
         request = __import__("json").loads(written[0][1])
@@ -396,8 +396,14 @@ class HyperliquidDefinitionTests(unittest.TestCase):
                 )
             return SimpleNamespace(returncode=1, stdout=b"ambiguous", stderr=b"")
 
+        reads = 0
+
         def read(_path: Path, timeout: int = 20) -> object:
+            nonlocal reads
             del timeout
+            reads += 1
+            if reads == 1:
+                return None
             request = json.loads(writes[0])
             return {
                 "schema": "bloom.hyperliquid_agent_session.v1",
@@ -459,8 +465,7 @@ class HyperliquidDefinitionTests(unittest.TestCase):
 
         self.assertEqual(context.eval_name, "hyperliquid-order-cancel")
         self.assertTrue(self.definition.session_created)
-        self.assertEqual(len(written), 2)
-        self.assertEqual(written[0], written[1])
+        self.assertEqual(len(written), 1)
 
     def test_provision_redacts_live_ceremony_url_from_failure(self) -> None:
         ceremony = "http://localhost:18734/ceremony/" + "A" * 43
