@@ -30,6 +30,7 @@ parking_lot.workspace = true
 bytes = { version = "1", optional = true }
 lru = { workspace = true, optional = true }
 futures = { workspace = true, optional = true }
+rustix.workspace = true
 
 # Embedded NFSv4.1 server. Pinned to the bloom-directory fork revision that
 # exposes OpenSupport so path-derived denials can surface from NFS OPEN.

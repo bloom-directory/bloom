@@ -204,6 +204,15 @@ fn system_time_to_ts(time: SystemTime) -> Timestamp {
 
 fn stable_attrs(object_type: ObjectType, fileid: u64) -> Attrs {
     let mut attrs = Attrs::new(object_type, fileid);
+    // Report the identity that serves the in-process NFS filesystem. Leaving
+    // embednfs' uid/gid defaults at zero makes owner-writable (0644) command
+    // sinks unwritable when the daemon runs unprivileged: the kernel sees
+    // root ownership, root is squashed by NFS, and the daemon user only gets
+    // the read-only "other" bits. Bloom's VFS already enforces path-level
+    // write policy; these attrs must make its owner mode reachable by the
+    // actual serving process.
+    attrs.uid = rustix::process::geteuid().as_raw();
+    attrs.gid = rustix::process::getegid().as_raw();
     let ts = epoch_ts();
     attrs.atime = ts;
     attrs.mtime = ts;
@@ -2378,6 +2387,19 @@ mod tests {
         let inbox = fs.lookup(&ctx, &dir, "inbox").await.unwrap();
         let attrs = fs.getattr(&ctx, &inbox).await.unwrap();
         assert_eq!(attrs.mode & 0o777, 0o644);
+        assert_eq!(attrs.uid, rustix::process::geteuid().as_raw());
+        assert_eq!(attrs.gid, rustix::process::getegid().as_raw());
+    }
+
+    #[tokio::test]
+    async fn getattr_root_reports_serving_process_owner() {
+        let recorder = RecordingHandler::new();
+        let vfs = Vfs::builder().mount("box", recorder).build();
+        let fs = BloomFs::new(vfs);
+        let attrs = fs.getattr(&fake_ctx(), &BloomHandle::Root).await.unwrap();
+
+        assert_eq!(attrs.uid, rustix::process::geteuid().as_raw());
+        assert_eq!(attrs.gid, rustix::process::getegid().as_raw());
     }
 
     #[tokio::test]
