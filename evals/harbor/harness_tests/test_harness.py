@@ -114,6 +114,11 @@ class HyperliquidDefinitionTests(unittest.TestCase):
         self.wallet_id = "eval-wallet"
         self.package_hash = "b" * 64
         self.driver = self.root / "driver"
+        self.owner_record = self.root / "hyperliquid-owner.json"
+        self.owner_record.write_text(
+            json.dumps({"name": "hyperliquid", "hash": self.package_hash})
+        )
+        self.owner_record.chmod(0o644)
         self.seed = self.root / "seed"
         self.seed.write_text("seed")
         self.seed.chmod(0o600)
@@ -121,6 +126,7 @@ class HyperliquidDefinitionTests(unittest.TestCase):
             "BLOOM_EVAL_WALLET": self.wallet,
             "BLOOM_EVAL_WALLET_ID": self.wallet_id,
             "BLOOM_EVAL_HYPERLIQUID_PACKAGE_HASH": self.package_hash,
+            "BLOOM_EVAL_PETAL_OWNER_RECORD": str(self.owner_record),
             "BLOOM_EVAL_MAINNET_ACK": MAINNET_ACK,
             "BLOOM_EVAL_AUTHENTICATOR_SEED_FILE": str(self.seed),
             "BLOOM_EVAL_AUTHENTICATOR_SIGN_COUNT": "4",
@@ -207,8 +213,82 @@ class HyperliquidDefinitionTests(unittest.TestCase):
             ]
         )
 
-        with self.assertRaisesRegex(EvalError, "must not retain funding destinations"):
+        with self.assertRaisesRegex(
+            EvalError, "does not match the exact bounded policy"
+        ):
             self.definition._require_exact_wallet_policy()
+
+    def test_exact_wallet_policy_rejects_extra_verifier(self) -> None:
+        policy = {
+            "allowed_destinations": [],
+            "allowed_petal_packages": [self.package_hash],
+            "maximum_approval_lifetime_ms": 2_592_000_000,
+            "required_verifiers": ["unexpected"],
+            "wallet_id": self.wallet_id,
+        }
+        digest = hashlib.sha256(
+            json.dumps(policy, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        self.definition._read_json = mock.Mock(
+            side_effect=[
+                {
+                    "owner": self.wallet,
+                    "policy_status": "broker_verified",
+                    "freshness": "fresh",
+                    "policy_digest": digest,
+                },
+                policy,
+            ]
+        )
+        with self.assertRaisesRegex(
+            EvalError, "does not match the exact bounded policy"
+        ):
+            self.definition._require_exact_wallet_policy()
+
+    def test_installed_package_hash_must_match_owner_record(self) -> None:
+        self.owner_record.write_text(
+            json.dumps({"name": "hyperliquid", "hash": "c" * 64})
+        )
+        with self.assertRaisesRegex(
+            EvalError, "does not match the installed owner record"
+        ):
+            self.definition._require_installed_package_hash()
+
+    def test_pending_key_ceremony_is_resolved_from_exact_owner_projection(self) -> None:
+        ceremony = "http://localhost:18734/ceremony/" + "A" * 43
+        self.definition.session_id = "exact-session"
+        root = self.mount / "petal-key-requests"
+        root.mkdir(parents=True)
+        (root / ("d" * 64 + ".json")).write_text(
+            json.dumps(
+                {
+                    "schema": "bloom.machine.petal-key-request.v2",
+                    "key_slot": "hyperliquid-exact-session",
+                    "scope": {
+                        "wallet_id": self.wallet_id,
+                        "package_hash": self.package_hash,
+                    },
+                    "status": "awaiting_user",
+                    "ceremony_url": ceremony,
+                }
+            )
+        )
+        (root / ("e" * 64 + ".json")).write_text(
+            json.dumps(
+                {
+                    "schema": "bloom.machine.petal-key-request.v2",
+                    "key_slot": "hyperliquid-other-session",
+                    "scope": {
+                        "wallet_id": self.wallet_id,
+                        "package_hash": self.package_hash,
+                    },
+                    "status": "awaiting_user",
+                    "ceremony_url": "http://localhost:18734/ceremony/" + "B" * 43,
+                }
+            )
+        )
+
+        self.assertEqual(self.definition._pending_petal_key_ceremony(), ceremony)
 
     def test_provision_creates_session_then_builds_least_authority_mounts(self) -> None:
         written: list[tuple[Path, bytes]] = []
@@ -256,20 +336,53 @@ class HyperliquidDefinitionTests(unittest.TestCase):
         self.assertNotIn(str(self.seed), str(context.mounts))
         self.assertNotIn(str(self.driver), str(context.mounts))
 
-    def test_cleanup_before_session_creation_only_verifies_empty_wallet(self) -> None:
+    def test_cleanup_before_session_creation_verifies_no_orphan_state(self) -> None:
         self.definition.session_id = "not-created"
         self.definition.session_base = self.mount / "not-created"
         self.definition._require_empty_wallet = mock.Mock()
-        self.definition._read_json_if_exists = mock.Mock(return_value=None)
+        self.definition._read_session_status = mock.Mock(return_value=None)
+        self.definition._pending_petal_key_ceremony = mock.Mock(return_value=None)
         self.definition._write_route = mock.Mock()
 
         self.definition.cleanup()
 
         self.definition._require_empty_wallet.assert_called_once_with()
-        self.definition._read_json_if_exists.assert_called_once_with(
-            self.definition.session_base / "status.json"
-        )
+        self.definition._read_session_status.assert_called_once_with()
+        self.definition._pending_petal_key_ceremony.assert_called_once_with()
         self.definition._write_route.assert_not_called()
+
+    def test_cleanup_fails_on_orphan_venue_agent(self) -> None:
+        self.definition.session_id = "not-created"
+        self.definition.session_base = self.mount / "not-created"
+        self.definition._read_session_status = mock.Mock(return_value=None)
+        self.definition._pending_petal_key_ceremony = mock.Mock(return_value=None)
+        self.definition._require_empty_wallet = mock.Mock(
+            side_effect=EvalError("dedicated wallet retains a Hyperliquid API agent")
+        )
+        with self.assertRaisesRegex(EvalError, "retains a Hyperliquid API agent"):
+            self.definition.cleanup()
+
+    def test_cleanup_closes_residual_position_before_stopping(self) -> None:
+        self.definition.session_id = "created"
+        self.definition.session_base = self.mount / "created"
+        self.definition._read_session_status = mock.Mock(
+            return_value={"stopped": False}
+        )
+        self.definition._read_json = mock.Mock(side_effect=[[], {"stopped": True}])
+        self.definition._nonzero_positions = mock.Mock(
+            side_effect=[[{"position": {"szi": "0.0001"}}], []]
+        )
+        self.definition._require_no_orders_or_positions = mock.Mock()
+        self.definition._write_route = mock.Mock(
+            return_value=SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+        )
+
+        self.definition.cleanup()
+
+        routes = [
+            call.args[0].name for call in self.definition._write_route.call_args_list
+        ]
+        self.assertEqual(routes, ["cancel_all", "close_all", "stop"])
 
     def test_provision_accepts_durable_session_after_ambiguous_retry(self) -> None:
         ceremony = "http://localhost:18734/ceremony/" + "A" * 43
@@ -340,12 +453,32 @@ class HyperliquidDefinitionTests(unittest.TestCase):
 
         self.definition._write_route = mock.Mock(side_effect=write)
         self.definition._read_json_if_exists = mock.Mock(side_effect=read)
+        self.definition._pending_petal_key_ceremony = mock.Mock(return_value=None)
 
         context = self.definition.provision("codex")
 
         self.assertEqual(context.eval_name, "hyperliquid-order-cancel")
         self.assertTrue(self.definition.session_created)
-        self.assertEqual(len(written), 1)
+        self.assertEqual(len(written), 2)
+        self.assertEqual(written[0], written[1])
+
+    def test_provision_redacts_live_ceremony_url_from_failure(self) -> None:
+        ceremony = "http://localhost:18734/ceremony/" + "A" * 43
+        self.definition._write_route = mock.Mock(
+            side_effect=[
+                SimpleNamespace(returncode=1, stdout=ceremony.encode(), stderr=b""),
+                SimpleNamespace(returncode=1, stdout=b"retry failed", stderr=b""),
+            ]
+        )
+        self.definition._read_session_status = mock.Mock(return_value=None)
+        with mock.patch("harness.hyperliquid_order_cancel.subprocess.run") as run:
+            run.return_value = SimpleNamespace(
+                returncode=1, stdout=ceremony.encode(), stderr=b"driver failed"
+            )
+            with self.assertRaises(EvalError) as raised:
+                self.definition.provision("codex")
+        self.assertNotIn(ceremony, str(raised.exception))
+        self.assertIn("[REDACTED_CEREMONY_URL]", str(raised.exception))
 
 
 if __name__ == "__main__":
