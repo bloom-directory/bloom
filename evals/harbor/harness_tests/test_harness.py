@@ -318,6 +318,7 @@ class HyperliquidDefinitionTests(unittest.TestCase):
         context = self.definition.provision("codex")
 
         request = __import__("json").loads(written[0][1])
+        self.assertEqual(request["wallet_id"], self.definition.wallet_id)
         self.assertLessEqual(len(request["agent_name"]), 16)
         self.assertTrue(request["agent_name"].startswith("be-cod-"))
         self.assertEqual(request["max_notional_usd"], "11")

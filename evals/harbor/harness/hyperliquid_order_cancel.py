@@ -370,6 +370,7 @@ class HyperliquidOrderCancelEval(EvalDefinition):
         )
         request = {
             "id": self.session_id,
+            "wallet_id": self.wallet_id,
             "agent_name": f"be-{agent_name[:3]}-{random_hex[:8]}",
             "duration_ms": 1_800_000,
             "max_notional_usd": "11",
