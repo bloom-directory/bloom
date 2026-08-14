@@ -2392,6 +2392,7 @@ dependencies = [
  "futures",
  "lru 0.12.5",
  "parking_lot",
+ "rustix 1.1.4",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
