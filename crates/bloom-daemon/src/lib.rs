@@ -3113,7 +3113,7 @@ impl Daemon {
         //
         // The canonical Broker policy has no Machine-local bump tuning.
         // Resolve wallet existence from the public projection and use the
-        // scanner's explicit defaults; never reopen legacy policy.toml.
+        // scanner's explicit defaults; never reopen Machine-local policy state.
         let mut bump_shutdown: Vec<tokio::sync::oneshot::Sender<()>> = Vec::new();
         if !mempool_indexes.is_empty() && tokio::runtime::Handle::try_current().is_ok() {
             let shared_indexes: bloom_tx::bump_scanner::MempoolIndexes =

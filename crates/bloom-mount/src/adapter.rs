@@ -916,7 +916,7 @@ impl BloomFs {
     ///
     /// Mode bits are *not* a useful gate here. Many writable files
     /// (mode 0o644) are also legitimately readable — addressbook
-    /// aliases resolve to an address, `policy.toml` reads back the
+    /// aliases resolve to an address, `policy.json` reads back the
     /// committed config, etc. A pure write-only sink (e.g.
     /// `outbox/pending/<id>/confirm`) returns a NotAFile-style error
     /// from `read`; that flows through `render_with_dedup` and falls
@@ -1077,7 +1077,7 @@ impl FileSystem for BloomFs {
         // views, wallet metadata, watch outputs). Those entries report
         // mode 0o444 from the VFS; only a small handful of injection
         // points (wallets/new, sign/*, outbox writes, watch/new, defi
-        // intents new+confirm, policy.toml) report 0o644. Reflect that
+        // intents new+confirm, policy.json) report 0o644. Reflect that
         // here so clients see a faithful permission view in `stat` /
         // `access(2)` rather than discovering write rejection only at
         // write-time.
@@ -1909,7 +1909,7 @@ mod tests {
         // Handler-owned Sealed Approval actions must reach the VFS handler, not
         // be denied at the mount signer lane. Broker remains authoritative.
         for path in [
-            "/wallets/minnow/policy.toml",
+            "/wallets/minnow/policy.json",
             "/wallets/minnow/sealed-approvals/new.json",
             "/wallets/minnow/sealed-approvals/approval-id/renew",
             "/wallets/minnow/sealed-approvals/approval-id/revoke",
@@ -2981,7 +2981,7 @@ mod tests {
     }
 
     /// Bug #1 acceptance: a writable file (mode 0o644) whose `read`
-    /// returns content — addressbook aliases, `policy.toml`, etc — is
+    /// returns content — addressbook aliases, `policy.json`, etc — is
     /// rendered at GETATTR so `cat` sees a non-zero size. The old
     /// "skip if writable" gate broke these read-write files; the only
     /// real reason to skip is `is_read_side_effecting`, not the mode

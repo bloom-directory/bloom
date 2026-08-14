@@ -230,6 +230,7 @@ pub fn exact_signing_catalog(operation_classes: &[&str]) -> ProvenanceCatalog {
                     operation_class: Token::new(*operation_class).unwrap(),
                 },
                 publisher: Token::new("bloom-installer").unwrap(),
+                petal_lineage: None,
                 operation_classes: vec![ProvenanceOperationClass {
                     operation_class: Token::new(*operation_class).unwrap(),
                     fee_asset: Some(ProvenanceFeeAsset {

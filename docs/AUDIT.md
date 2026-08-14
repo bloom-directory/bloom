@@ -80,7 +80,7 @@ data or rely on their own internal caches, e.g. the etherscan client).
 | Tx lookups | `chains/<chain>/tx/<hash>/{receipt.json,status,block_number,gas_used,logs.json,full.json}` | shipped | `chains.rs` (eth_getTransactionByHash + receipt) |
 | Etherscan history (txs, internal, ERC-20, ERC-721, source, abi) | `chains/<chain>/addresses/<a>/{txs,internal_txs,erc20_txs,erc721_txs}` and `chains/<chain>/contracts/<a>/{source,abi}` | shipped | `chains_history.rs` + `crates/bloom-etherscan/src/lib.rs` (TTL cache in `cache.rs`) |
 | Wallets: VFS-driven creation (local / import / watch) | `wallets/new` (writable) | shipped | `wallets.rs::write_new_wallet` + `parse_new_wallet_spec` |
-| Wallets: metadata, balance, nonce, policy round-trip | `wallets/<w>/{address,public_key,kind,policy.toml,chains/<c>/{balance,balance.raw,balance.json,nonce}}` | shipped | `wallets.rs`; covered by outbox tests + `acceptance.sh` |
+| Wallets: metadata, balance, nonce, policy round-trip | `wallets/<w>/{address,public_key,kind,policy.json,chains/<c>/{balance,balance.raw,balance.json,nonce}}` | shipped | `wallets.rs`; covered by outbox tests + `acceptance.sh` |
 | Wallets: outbox stage / confirm | `wallets/<w>/chains/<c>/outbox/{new.tx,pending/<id>/{plan.md,policy_check.json,confirm},sent/<id>/*,failed/<id>/*}` | shipped | `wallets.rs::write_outbox` → `crates/bloom-tx/src/tx_engine.rs`. Intents: `send` (native + ERC-20), `approve`, `call`, `raw`, plus NFT writes — `nft_transfer` (auto-detects ERC-721 vs ERC-1155, optional `safe`/`amount`/`data`), `nft_approve` (per-token, ERC-721 only), `nft_approve_all` (`setApprovalForAll`, policy-warned). |
 | Wallets: sign — EIP-191 + raw hash + EIP-712 | `wallets/<w>/sign/{message,hash,typed_data}` (+ `.sig`) | shipped | `wallets.rs::write_sign` |
 | DeFi (Enso intents, route quoting, stage-confirm) | `petals/enso/intents/<wallet>/{new,<sess>/{intent.txt,route.json,plan.md,tx.json,simulation.json,confirm}}` | extracted to Petal | [`bloom-petal-enso`](https://github.com/bloom-directory/bloom-petal-enso); installed applications mount through `crates/bloom-petals` |
@@ -147,7 +147,7 @@ Verified end-to-end via `tests/docker/run.sh --mempool`.
 | Direct contract `call` intents | shipped | `RawIntent::call` (method + args); covered by tx-engine tests and mount-driven transaction flows. |
 | EIP-1559 + legacy fallback per chain spec | shipped | `crates/bloom-proto/src/chain.rs::ChainSpec.legacy_tx`; `tx_engine.rs` branches accordingly. |
 | Replacement / cancel | shipped | `tx_engine.rs::replace_with_intent` substitutes (to/value/data) from the posted body and bumps fees ≥10%; cancel is a same-nonce self-send. |
-| Per-wallet `policy.toml` enforcement | shipped | `crates/bloom-tx/src/policy_engine.rs` — per-tx + rolling 24h USD caps backed by `Outbox::sum_usd_since`, allow/deny lists, contract-call gating; results land at `pending/<id>/policy_check.json`. |
+| Per-wallet policy enforcement | shipped | `crates/bloom-tx/src/policy_engine.rs` — per-tx + rolling 24h USD caps backed by `Outbox::sum_usd_since`, allow/deny lists, contract-call gating; results land at `pending/<id>/policy_check.json`. |
 | USD-priced policy caps via DefiLlama | shipped | `bloom-tx/src/oracle.rs` (`PriceOracle` trait) wired to `bloom-daemon/src/price_oracle.rs::PricesOracle` over `bloom-prices`. |
 | Reverse ENS at `chains/<chain>/addresses/<addr>/ens` | shipped | `bloom-vfs/src/handlers/chains.rs` (`with_ens` builder); cross-checked by `EnsClient::reverse`. |
 

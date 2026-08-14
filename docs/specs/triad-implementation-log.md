@@ -221,6 +221,5 @@ wire detail. It does not amend that specification.
   canonical bytes but does not assign a VFS filename or a TOML translation.
   Production VFS therefore exposes Broker's authenticated canonical projection
   as `wallets/<wallet>/policy.json` and accepts complete policy replacement
-  there. The legacy `policy.toml` projection is read-only in production:
-  translating its narrower schema would omit authority fields and could not
-  preserve the exact proposed bytes bound by the policy-update ceremony.
+  there. No secondary policy projection or translation is exposed: policy
+  review and commit remain bound to the exact canonical bytes.

@@ -696,13 +696,7 @@ mod tests {
                 && text.contains("exact same proposed bytes"),
             "guidance must document the canonical mounted triad policy-update flow"
         );
-        for stale in [
-            "> wallets/<wallet>/policy.toml",
-            "policy.toml.sig",
-            "host signer",
-            "the grant",
-            "a grant",
-        ] {
+        for stale in ["policy.toml", "host signer", "the grant", "a grant"] {
             assert!(
                 !text.contains(stale),
                 "guidance retains stale Machine-authority vocabulary {stale:?}"

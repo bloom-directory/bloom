@@ -64,8 +64,8 @@ The mounted policy surface uses Broker's policy custody protocol:
 5. Broker calls Signer `policy.compare_and_swap` with the proposed bytes,
    ceremony receipt, and Broker validation receipt.
 
-A direct commit, local policy writer, `policy.toml.sig`, `approval.json`, or
-`policy-session` path is not part of the architecture.
+A direct commit, local policy writer, `approval.json`, or `policy-session` path
+is not part of the architecture.
 
 ## Degraded operation
 

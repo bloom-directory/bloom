@@ -211,8 +211,7 @@ and example crates used by the broader Bloom runtime and examples.
   when a non-empty confirm file is written.
 - **Policy custody before signing.** The writable `policy.json` surface uses
   Broker `policy.validate_update`, a Signer-completed `policy_update` custody
-  ceremony, and receipt-only `policy.commit_update`. The legacy `policy.toml`
-  view is read-only.
+  ceremony, and receipt-only `policy.commit_update`.
 - **Private orderflow is opt-in and fail-closed.** On unsupported
   chains, private broadcast returns an error instead of silently falling
   back to public RPC.
