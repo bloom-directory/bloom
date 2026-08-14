@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import tempfile
 import unittest
@@ -109,14 +111,19 @@ class HyperliquidDefinitionTests(unittest.TestCase):
         self.repo.mkdir()
         self.mount = self.root / "bloom"
         self.wallet = "0x" + "a" * 40
+        self.wallet_id = "eval-wallet"
+        self.package_hash = "b" * 64
         self.driver = self.root / "driver"
         self.seed = self.root / "seed"
         self.seed.write_text("seed")
         self.seed.chmod(0o600)
         self.env = {
             "BLOOM_EVAL_WALLET": self.wallet,
+            "BLOOM_EVAL_WALLET_ID": self.wallet_id,
+            "BLOOM_EVAL_HYPERLIQUID_PACKAGE_HASH": self.package_hash,
             "BLOOM_EVAL_MAINNET_ACK": MAINNET_ACK,
             "BLOOM_EVAL_AUTHENTICATOR_SEED_FILE": str(self.seed),
+            "BLOOM_EVAL_AUTHENTICATOR_SIGN_COUNT": "4",
             "BLOOM_EVAL_DEBUG_DRIVER_BIN": str(self.driver),
             "BLOOM_EVAL_BLOOM_MOUNT": str(self.mount),
             "BLOOM_EVAL_JOBS_DIR": str(self.root / "jobs"),
@@ -134,12 +141,74 @@ class HyperliquidDefinitionTests(unittest.TestCase):
         with self.assertRaisesRegex(EvalError, "AUTHENTICATOR_SEED_FILE is required"):
             definition.preflight()
 
+    def test_missing_sign_count_fails_closed(self) -> None:
+        env = dict(self.env)
+        del env["BLOOM_EVAL_AUTHENTICATOR_SIGN_COUNT"]
+        definition = HyperliquidOrderCancelEval(self.repo, env)
+        with self.assertRaisesRegex(EvalError, "SIGN_COUNT must be an integer"):
+            definition.preflight()
+
+    def test_out_of_range_sign_count_fails_closed(self) -> None:
+        env = dict(self.env)
+        env["BLOOM_EVAL_AUTHENTICATOR_SIGN_COUNT"] = "0"
+        definition = HyperliquidOrderCancelEval(self.repo, env)
+        with self.assertRaisesRegex(EvalError, "must be between 1 and 4294967295"):
+            definition.preflight()
+
     def test_malformed_position_size_fails_closed(self) -> None:
         self.definition._read_json = mock.Mock(
             side_effect=[[], {"assetPositions": [{"position": {"szi": "unknown"}}]}]
         )
         with self.assertRaisesRegex(EvalError, "position size is not numeric"):
             self.definition._require_empty_wallet()
+
+    def test_exact_wallet_policy_accepts_matching_broker_projection(self) -> None:
+        policy = {
+            "allowed_destinations": [],
+            "allowed_petal_packages": [self.package_hash],
+            "maximum_approval_lifetime_ms": 2_592_000_000,
+            "required_verifiers": [],
+            "wallet_id": self.wallet_id,
+        }
+        digest = hashlib.sha256(
+            json.dumps(policy, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        self.definition._read_json = mock.Mock(
+            side_effect=[
+                {
+                    "owner": self.wallet,
+                    "policy_status": "broker_verified",
+                    "freshness": "fresh",
+                    "policy_digest": digest,
+                },
+                policy,
+            ]
+        )
+
+        self.definition._require_exact_wallet_policy()
+
+    def test_exact_wallet_policy_rejects_funding_destination(self) -> None:
+        policy = {
+            "wallet_id": self.wallet_id,
+            "allowed_destinations": [
+                {"chain": "arbitrum", "destination": "0x" + "c" * 40}
+            ],
+            "allowed_petal_packages": [self.package_hash],
+        }
+        self.definition._read_json = mock.Mock(
+            side_effect=[
+                {
+                    "owner": self.wallet,
+                    "policy_status": "broker_verified",
+                    "freshness": "fresh",
+                    "policy_digest": "d" * 64,
+                },
+                policy,
+            ]
+        )
+
+        with self.assertRaisesRegex(EvalError, "must not retain funding destinations"):
+            self.definition._require_exact_wallet_policy()
 
     def test_provision_creates_session_then_builds_least_authority_mounts(self) -> None:
         written: list[tuple[Path, bytes]] = []
@@ -169,6 +238,8 @@ class HyperliquidDefinitionTests(unittest.TestCase):
         context = self.definition.provision("codex")
 
         request = __import__("json").loads(written[0][1])
+        self.assertLessEqual(len(request["agent_name"]), 16)
+        self.assertTrue(request["agent_name"].startswith("be-cod-"))
         self.assertEqual(request["max_notional_usd"], "11")
         self.assertEqual(request["max_leverage"], 1)
         self.assertEqual(request["assets"], ["0"])
@@ -185,7 +256,22 @@ class HyperliquidDefinitionTests(unittest.TestCase):
         self.assertNotIn(str(self.seed), str(context.mounts))
         self.assertNotIn(str(self.driver), str(context.mounts))
 
-    def test_provision_completes_ceremony_and_retries_identical_body(self) -> None:
+    def test_cleanup_before_session_creation_only_verifies_empty_wallet(self) -> None:
+        self.definition.session_id = "not-created"
+        self.definition.session_base = self.mount / "not-created"
+        self.definition._require_empty_wallet = mock.Mock()
+        self.definition._read_json_if_exists = mock.Mock(return_value=None)
+        self.definition._write_route = mock.Mock()
+
+        self.definition.cleanup()
+
+        self.definition._require_empty_wallet.assert_called_once_with()
+        self.definition._read_json_if_exists.assert_called_once_with(
+            self.definition.session_base / "status.json"
+        )
+        self.definition._write_route.assert_not_called()
+
+    def test_provision_accepts_durable_session_after_ambiguous_retry(self) -> None:
         ceremony = "http://localhost:18734/ceremony/" + "A" * 43
         writes: list[bytes] = []
 
@@ -195,11 +281,11 @@ class HyperliquidDefinitionTests(unittest.TestCase):
                 return SimpleNamespace(
                     returncode=1, stdout=ceremony.encode(), stderr=b""
                 )
-            return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+            return SimpleNamespace(returncode=1, stdout=b"ambiguous", stderr=b"")
 
         def read(_path: Path, timeout: int = 20) -> object:
             del timeout
-            request = __import__("json").loads(writes[0])
+            request = json.loads(writes[0])
             return {
                 "schema": "bloom.hyperliquid_agent_session.v1",
                 "network": "mainnet",
@@ -212,7 +298,7 @@ class HyperliquidDefinitionTests(unittest.TestCase):
             }
 
         self.definition._write_route = mock.Mock(side_effect=write)
-        self.definition._read_json = mock.Mock(side_effect=read)
+        self.definition._read_json_if_exists = mock.Mock(side_effect=read)
         with mock.patch("harness.hyperliquid_order_cancel.subprocess.run") as run:
             run.return_value = SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
             self.definition.provision("claude")
@@ -224,11 +310,42 @@ class HyperliquidDefinitionTests(unittest.TestCase):
                 ceremony,
                 "--authenticator-seed-file",
                 str(self.seed),
+                "--sign-count",
+                "4",
             ],
-            check=True,
+            check=False,
             capture_output=True,
             timeout=45,
         )
+
+    def test_provision_accepts_durable_session_after_error_without_url(self) -> None:
+        written: list[bytes] = []
+
+        def write(_path: Path, body: bytes, _timeout: int) -> SimpleNamespace:
+            written.append(body)
+            return SimpleNamespace(returncode=1, stdout=b"transport error", stderr=b"")
+
+        def read(_path: Path) -> object:
+            request = json.loads(written[0])
+            return {
+                "schema": "bloom.hyperliquid_agent_session.v1",
+                "network": "mainnet",
+                "wallet": self.wallet,
+                "id": request["id"],
+                "max_notional_usd": "11",
+                "max_leverage": 1,
+                "assets": ["0"],
+                "stopped": False,
+            }
+
+        self.definition._write_route = mock.Mock(side_effect=write)
+        self.definition._read_json_if_exists = mock.Mock(side_effect=read)
+
+        context = self.definition.provision("codex")
+
+        self.assertEqual(context.eval_name, "hyperliquid-order-cancel")
+        self.assertTrue(self.definition.session_created)
+        self.assertEqual(len(written), 1)
 
 
 if __name__ == "__main__":
