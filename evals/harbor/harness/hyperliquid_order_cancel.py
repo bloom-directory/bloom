@@ -142,6 +142,8 @@ class HyperliquidOrderCancelEval(EvalDefinition):
         root = self.bloom_mount / "petal-key-requests"
         try:
             names = sorted(os.listdir(root))
+        except FileNotFoundError:
+            return None
         except OSError as error:
             raise EvalError(
                 f"could not list owner Petal key requests: {error}"
@@ -378,48 +380,72 @@ class HyperliquidOrderCancelEval(EvalDefinition):
         new_route = self.network_root / "agent_sessions" / self.wallet / "new.json"
 
         first = self._write_route(new_route, body, 45)
-        if first.returncode != 0:
-            output = (first.stdout + first.stderr).decode(errors="replace")
-            match = CEREMONY_URL.search(output)
+        output = (first.stdout + first.stderr).decode(errors="replace")
+        status_data: Any | None = None
+        ceremony_url: str | None = None
+        output_match = CEREMONY_URL.search(output)
+
+        # Mounted Petal writes are asynchronous. A zero write exit code means
+        # accepted for dispatch, not that the route completed successfully.
+        # Wait for one of the two durable owner-visible outcomes regardless of
+        # the write result: a bounded session or a key-derivation ceremony.
+        for _ in range(50):
+            status_data = self._read_json_if_exists(self.session_base / "status.json")
+            if status_data is not None:
+                break
             ceremony_url = (
-                match.group(0)
-                if match is not None
+                output_match.group(0)
+                if output_match is not None
                 else self._pending_petal_key_ceremony()
             )
             if ceremony_url is not None:
-                try:
-                    completed = subprocess.run(
-                        [
-                            str(self.driver),
-                            "complete",
-                            ceremony_url,
-                            "--authenticator-seed-file",
-                            str(self.seed_file),
-                            "--sign-count",
-                            str(sign_count),
-                        ],
-                        check=False,
-                        capture_output=True,
-                        timeout=45,
-                    )
-                    if completed.returncode != 0:
-                        output += (completed.stdout + completed.stderr).decode(
-                            errors="replace"
-                        )
-                except (OSError, subprocess.SubprocessError) as error:
-                    output += f"debug-driver ceremony completion failed: {error}"
-            retry = self._write_route(new_route, body, 45)
-            if retry.returncode != 0:
-                output += (retry.stdout + retry.stderr).decode(errors="replace")
+                break
+            time.sleep(0.2)
 
-            status_data = self._read_session_status()
-            if status_data is None:
-                raise EvalError(
-                    "session creation failed without durable session readback: "
-                    + self._redact_ceremony_urls(output)
+        if status_data is None and ceremony_url is not None:
+            try:
+                completed = subprocess.run(
+                    [
+                        str(self.driver),
+                        "complete",
+                        ceremony_url,
+                        "--authenticator-seed-file",
+                        str(self.seed_file),
+                        "--sign-count",
+                        str(sign_count),
+                    ],
+                    check=False,
+                    capture_output=True,
+                    timeout=45,
                 )
-        else:
-            status_data = self._read_json(self.session_base / "status.json")
+                output += (completed.stdout + completed.stderr).decode(errors="replace")
+            except (OSError, subprocess.SubprocessError) as error:
+                raise EvalError(
+                    "debug-driver ceremony completion failed: "
+                    + self._redact_ceremony_urls(str(error))
+                ) from error
+            if completed.returncode != 0:
+                raise EvalError(
+                    "session key ceremony failed: " + self._redact_ceremony_urls(output)
+                )
+
+            # Replay byte-identical session terms only after the owner ceremony
+            # succeeds; WebAuthn counter reuse is never attempted.
+            retry = self._write_route(new_route, body, 45)
+            output += (retry.stdout + retry.stderr).decode(errors="replace")
+            for _ in range(50):
+                status_data = self._read_json_if_exists(
+                    self.session_base / "status.json"
+                )
+                if status_data is not None:
+                    break
+                time.sleep(0.2)
+
+        if status_data is None:
+            raise EvalError(
+                "session creation failed without durable session or ceremony readback: "
+                + self._redact_ceremony_urls(output)
+            )
 
         self.session_created = True
         expected = {
