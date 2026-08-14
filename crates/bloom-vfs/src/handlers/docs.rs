@@ -215,13 +215,7 @@ mod tests {
             help.contains("same proposed bytes") && help.contains("**exact"),
             "{help}"
         );
-        for stale in [
-            "> /bloom/wallets/alice/policy.toml",
-            "policy.toml.sig",
-            "host signer",
-            "the grant",
-            "a grant",
-        ] {
+        for stale in ["policy.toml", "host signer", "the grant", "a grant"] {
             assert!(
                 !help.contains(stale),
                 "mounted help retains stale Machine-authority vocabulary {stale:?}"

@@ -920,6 +920,7 @@ mod tests {
                         operation_class: token("transaction.confirm"),
                     },
                     publisher: token("bloom-installer"),
+                    petal_lineage: None,
                     operation_classes: vec![ProvenanceOperationClass {
                         operation_class: token("transaction.confirm"),
                         fee_asset: None,
@@ -996,6 +997,7 @@ mod tests {
                 records: vec![ProvenanceRecord {
                     subject: subject.clone(),
                     publisher: token("bloom-installer"),
+                    petal_lineage: None,
                     operation_classes: vec![ProvenanceOperationClass {
                         operation_class: token("order.place"),
                         fee_asset: None,

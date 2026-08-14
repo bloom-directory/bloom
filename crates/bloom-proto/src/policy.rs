@@ -1,7 +1,6 @@
 //! Per-wallet policy: caps, allow/deny lists, automation knobs.
 //!
-//! See spec §6.3. The on-disk representation is `policy.toml`. The
-//! `Policy` type is the *parsed* form used by the tx engine.
+//! The `Policy` type is the parsed form used by the tx engine.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -12,9 +11,7 @@ use serde::{Deserialize, Serialize};
 pub struct Policy {
     #[serde(default)]
     pub caps: PolicyCaps,
-    /// Legacy per-section allow/deny — kept for backward compatibility
-    /// with existing policy.toml files that use `[contracts]`/`[tokens]`
-    /// blocks.
+    /// Per-section allow/deny compatibility fields.
     #[serde(default)]
     pub contracts: PolicyAllowDeny,
     #[serde(default)]
@@ -47,8 +44,7 @@ pub struct Policy {
     #[serde(default)]
     pub approval: ApprovalPolicy,
     /// Cross-surface spending limits used by the agent-autonomy evaluator.
-    /// These are parsed from signed `policy.toml` and apply to CLI, VFS, IPC,
-    /// and daemon surfaces alike.
+    /// These apply to CLI, VFS, IPC, and daemon surfaces alike.
     #[serde(default)]
     pub limits: LimitsPolicy,
     /// Polymarket order policy (`[polymarket]`). Trading is enabled by default;

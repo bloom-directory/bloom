@@ -122,8 +122,7 @@ action id; do not treat them as separate approval queues.
 ## Updating wallet policy
 
 `wallets/<wallet>/policy.json` is the only writable policy surface. It accepts
-the complete canonical JSON document. `policy.toml` is a legacy read-only
-projection and must never be used as an update target.
+the complete canonical JSON document.
 
 ```sh
 # 1. Read the current canonical policy and prepare exact replacement bytes.

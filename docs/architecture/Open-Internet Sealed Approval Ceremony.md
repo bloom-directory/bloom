@@ -20,7 +20,7 @@ mounted-VFS implementation supports Bloom Machine-owned loopback ceremony URLs o
 `http://localhost:18734`: `approval_challenge.json` carries a local
 `ceremony_url`, the token is derived from `server_nonce`, and the Bloom Machine owns
 grant minting for the mounted flows (the EVM outbox, paid-HTTP `/requests`, and
-wallet `policy.toml` updates). This document is the target design for
+wallet policy updates). This document is the target design for
 making that same ceremony reachable from another device over the open internet.
 The `ceremony_url` contract itself — the field in `approval_challenge.json`,
 single-use token, `expiry_ms` bound — is defined in
@@ -148,8 +148,8 @@ ways:
   `http://localhost:18734` with RP ID `localhost`; it does not expose that
   endpoint over the open internet.
 - Today `approval_challenge.json` carries a local loopback `ceremony_url` for
-  the mounted flows (EVM outbox, paid-HTTP `/requests`, and wallet
-  `policy.toml` updates). In the target relay design, the same projection
+  the mounted flows (EVM outbox, paid-HTTP `/requests`, and wallet policy
+  updates). In the target relay design, the same projection
   points at a per-install HTTPS hostname.
 - Today there is no relay, per-install hostname, internet exposure setting, or
   Bloom Machine-held public certificate for a relay hostname.

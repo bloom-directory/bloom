@@ -2902,7 +2902,7 @@ summary = "Demo app used by IPC tests."
         for path in [
             // Policy updates and Sealed Approval lifecycle operations reach the
             // VFS handler and are delegated to Broker.
-            "/wallets/minnow/policy.toml",
+            "/wallets/minnow/policy.json",
             "/wallets/minnow/sealed-approvals/new.json",
             "/wallets/minnow/sealed-approvals/approval-1/revoke",
             "/wallets/minnow/chains/polygon/outbox/new.tx",

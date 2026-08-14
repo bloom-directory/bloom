@@ -91,10 +91,9 @@ pub struct DefiPolicy {
     ///
     /// Boundaries:
     /// - This is a **policy-file setting only**. It must **never** be exposed
-    ///   as a CLI flag (`--trust-route` / `--no-verify` etc.) — flipping it is
-    ///   an operator act in the wallet's `policy.toml`, signature-gated for
-    ///   passkey wallets (`bloom wallet sign-policy`), so an agent cannot flip
-    ///   it mid-run.
+    ///   as a CLI flag (`--trust-route` / `--no-verify` etc.) — changing it is
+    ///   an authenticated wallet-policy update, so an agent cannot flip it
+    ///   mid-run.
     /// - **Do not set `false` for wallets driven by autonomous/unattended
     ///   agents.** It is intended for operator-initiated routes where a human
     ///   reviews the rendered plan before confirming.

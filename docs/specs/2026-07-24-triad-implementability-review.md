@@ -170,7 +170,7 @@ The current handler's complete public categories route as follows:
 |---|---|
 | `/wallets/new` and registration `status.json`, `ceremony_url`, `cancel` | daemon projection over keystore `wallet.registration_*`; local/raw secret fields are removed from VFS |
 | wallet `address`, QR, `addresses.json`, `public_key`, `kind` | daemon read projection from `wallet.get_public`; no key material |
-| `policy.toml` and `policy-updates/{pending,confirmed,failed}` | daemon workflow projection → signing validate/review → keystore policy CAS |
+| `policy.json` and `policy-updates/{pending,confirmed,failed}` | daemon workflow projection → signing validate/review → keystore policy CAS |
 | `unlock-passkey` | daemon returns keystore trusted UI from `wallet.unlock_prepare`; PRF never returns through VFS |
 | `sign/{message,hash,typed_data}` | remains rejected; it is not restored as an opaque signing bypass |
 | `policy-session/new`, `active.json`, `<id>/use`, `<id>/revoke` | standing `prepare/list/status/budget_state/revoke`; `use` becomes an ordinary semantic sign operation under the authority |

@@ -241,8 +241,7 @@ cat /bloom/wallets/alice/policy-updates/latest/status.json
 
 The mounted status and challenge files are public projections of operation,
 review, receipt, ceremony, and commit state. Receipt authority remains between
-Broker and Signer. The legacy `policy.toml` projection is read-only; Machine
-never writes it or creates a policy signature.
+Broker and Signer. Machine has no direct policy writer.
 
 ## Writing (stage-confirm)
 

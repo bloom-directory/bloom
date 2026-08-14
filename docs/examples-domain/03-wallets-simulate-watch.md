@@ -57,8 +57,7 @@ cp proposed-policy.json /bloom/wallets/alice/policy.json
 ```
 
 Broker carries the completed custody and validation receipts to Signer's
-compare-and-swap. Machine never signs or installs policy. The legacy
-`policy.toml` view, when present for compatibility, is read-only.
+compare-and-swap. Machine never signs or installs policy.
 
 ERC-20 reads are not under `wallets/` — they live under the
 chain-rooted reader at

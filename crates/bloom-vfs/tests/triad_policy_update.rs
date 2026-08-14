@@ -302,6 +302,27 @@ async fn signer_wallet_is_visible_in_vfs_without_a_legacy_keystore_record() {
             .unwrap(),
         b"passkey\n"
     );
+    let wallet_entries = handler
+        .list(&VfsPath::parse("/alice").unwrap())
+        .await
+        .unwrap();
+    assert!(
+        wallet_entries
+            .iter()
+            .any(|entry| entry.name == "policy.json")
+    );
+    assert!(
+        !wallet_entries
+            .iter()
+            .any(|entry| entry.name == "policy.toml"),
+        "removed compatibility policy surface must not be discoverable"
+    );
+    assert!(matches!(
+        handler
+            .lookup(&VfsPath::parse("/alice/policy.toml").unwrap())
+            .await,
+        Err(HandlerError::NotFound(_))
+    ));
 
     fixture.available.store(false, Ordering::SeqCst);
     let stale_projections = Arc::new(
@@ -340,38 +361,6 @@ async fn signer_wallet_is_visible_in_vfs_without_a_legacy_keystore_record() {
         expected_policy,
         "canonical policy must remain readable from the authenticated stale projection"
     );
-}
-
-#[tokio::test]
-async fn vfs_policy_write_without_broker_never_mutates_legacy_policy_bytes() {
-    let temp = tempfile::tempdir().unwrap();
-    let legacy_policy = temp.path().join("keystore/alice/policy.toml");
-    std::fs::create_dir_all(legacy_policy.parent().unwrap()).unwrap();
-    let before = b"legacy policy bytes remain opaque\n";
-    std::fs::write(&legacy_policy, before).unwrap();
-    let proposed_legacy_toml = "# direct-write probe\n";
-    let home = HomeDir::at(temp.path().join("home"));
-    let permit = Arc::new(HomeWritePermit::acquire(&home).unwrap());
-    let handler = WalletsHandler::new(
-        bloom_evm::ChainRegistry::default(),
-        TxEngine::new(Outbox::new(temp.path().join("outbox")).unwrap(), 60_000),
-        AddressBook::default(),
-        projection_reader(temp.path().join("cache/no-broker-wallets.json"), None),
-        temp.path().join("machine-policy-projections"),
-    )
-    .with_home_write_permit(permit);
-
-    let error = handler
-        .write(
-            &VfsPath::parse("alice/policy.toml").unwrap(),
-            proposed_legacy_toml.as_bytes(),
-        )
-        .await
-        .unwrap_err();
-    assert!(
-        matches!(error, HandlerError::Unsupported(ref message) if message.contains("read-only"))
-    );
-    assert_eq!(std::fs::read(legacy_policy).unwrap(), before);
 }
 
 #[tokio::test]

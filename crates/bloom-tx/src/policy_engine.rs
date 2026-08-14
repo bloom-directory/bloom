@@ -1,4 +1,4 @@
-//! Translate per-wallet policy.toml into a list of `PolicyCheck` entries
+//! Translate per-wallet policy into a list of `PolicyCheck` entries
 //! attached to a staged tx.
 //!
 //! Rules covered:

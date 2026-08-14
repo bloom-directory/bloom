@@ -4758,6 +4758,7 @@ mod tests {
                     operation_class: Token::new("transaction.confirm").unwrap(),
                 },
                 publisher: Token::new("bloom-installer").unwrap(),
+                petal_lineage: None,
                 operation_classes: vec![ProvenanceOperationClass {
                     operation_class: Token::new("transaction.confirm").unwrap(),
                     fee_asset: Some(ProvenanceFeeAsset {
@@ -6849,7 +6850,7 @@ mod tests {
         assert!(matches!(err, TxEngineError::Token(_)), "got {err:?}");
     }
 
-    /// Fix #11: the override sentinel comes from policy.toml, not a hard
+    /// Fix #11: the override sentinel comes from wallet policy, not a hard
     /// "override" string. A custom token must be honoured.
     #[tokio::test]
     async fn policy_hard_deny_blocks_confirm_and_marks_failed() {

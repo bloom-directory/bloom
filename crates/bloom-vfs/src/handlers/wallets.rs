@@ -16,7 +16,6 @@
 //! - `wallets/<wallet>/addresses.json`                              — owner/signer + role addresses
 //! - `wallets/<wallet>/public_key`                                  — secp256k1 pubkey hex
 //! - `wallets/<wallet>/kind`                                        — local/watch
-//! - `wallets/<wallet>/policy.toml`                                 — legacy read-only policy
 //! - `wallets/<wallet>/policy.json`                                 — canonical triad policy
 //! - `wallets/<wallet>/sealed-approvals/*`                          — Broker approval lifecycle
 //! - `wallets/<wallet>/chains/<chain>/{balance,balance.raw,balance.json}` — native balance
@@ -1611,7 +1610,6 @@ impl WalletsHandler {
             Entry::file("public_key"),
             Entry::file("kind"),
             Entry::file("projection.json"),
-            Entry::file("policy.toml"),
             Entry::writable_file("policy.json"),
             Entry::dir("chains"),
             Entry::dir("sealed-approvals"),
@@ -2036,7 +2034,6 @@ impl WalletsHandler {
         match segs[1].as_str() {
             "address" | "address.qr.png" | "address.qr.svg" | "addresses.json" | "public_key"
             | "kind" | "projection.json" => Ok(Entry::file(&segs[1])),
-            "policy.toml" => Ok(Entry::file("policy.toml")),
             "policy.json" => Ok(Entry::writable_file("policy.json")),
             "chains" => match segs.len() {
                 2 => Ok(Entry::dir("chains")),
@@ -2215,14 +2212,6 @@ impl WalletsHandler {
                 out.push(b'\n');
                 Ok(out)
             }
-            "policy.toml" => {
-                let projection = self.wallet_projection(wallet).await?;
-                let policy: bloom_broker_api::CanonicalWalletPolicy =
-                    serde_json::from_slice(&projection.policy.canonical_policy.decode())
-                        .map_err(err_be)?;
-                let body = toml::to_string_pretty(&policy).map_err(err_be)?;
-                Ok(body.into_bytes())
-            }
             "policy.json" => self.read_triad_wallet_policy(wallet).await,
             "chains" if segs.len() >= 4 => self.read_chain(wallet, &segs[2], &segs[3..]).await,
             "sealed-approvals" if segs.len() == 3 && segs[2] == "new.json" => {
@@ -2330,13 +2319,6 @@ impl WalletsHandler {
         let wallet = &segs[0];
         if segs.len() >= 4 && segs[1] == "chains" && segs[3] == "outbox" {
             return self.write_outbox(wallet, &segs[2], &segs[4..], data).await;
-        }
-        if segs.len() == 2 && segs[1] == "policy.toml" {
-            return Err(HandlerError::Unsupported(
-                "legacy policy.toml is read-only; write the complete canonical policy document \
-                 to policy.json so Broker can prepare a policy_update custody ceremony"
-                    .into(),
-            ));
         }
         if segs.len() == 2 && segs[1] == "policy.json" {
             self.write_permit()?;
@@ -3039,6 +3021,13 @@ mod tests {
     use bloom_tx::tx_engine::TxEngine;
     use sha2::Digest as _;
     use std::sync::Mutex;
+
+    #[test]
+    fn wallet_directory_excludes_retired_policy_toml_surface() {
+        let entries = WalletsHandler::wallet_dir_entries();
+        assert!(entries.iter().any(|entry| entry.name == "policy.json"));
+        assert!(!entries.iter().any(|entry| entry.name == "policy.toml"));
+    }
 
     struct Fixture {
         _tmp: tempfile::TempDir,

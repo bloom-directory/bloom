@@ -48,7 +48,7 @@ impl Entry {
     /// views, status, tools output, prices, docs, audit views, wallet
     /// metadata files, watch outputs. Per the v1 spec only a small set
     /// of injection points (wallets/new, sign/*, outbox writes,
-    /// watch/new, defi intents new+confirm, policy.toml) are writable;
+    /// watch/new, defi intents new+confirm, policy.json) are writable;
     /// those should use [`Entry::writable_file`].
     pub fn file(name: &str) -> Self {
         Self::read_only_file(name)
@@ -326,8 +326,8 @@ mod tests {
 
     #[test]
     fn writable_file_defaults() {
-        let e = Entry::writable_file("policy.toml");
-        assert_eq!(e.name, "policy.toml");
+        let e = Entry::writable_file("policy.json");
+        assert_eq!(e.name, "policy.json");
         assert_eq!(e.kind, EntryKind::File);
         assert_eq!(e.size, 0);
         assert_eq!(e.mode, 0o644);
