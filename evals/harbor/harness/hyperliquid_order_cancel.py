@@ -10,6 +10,7 @@ import secrets
 import stat
 import subprocess
 import sys
+import time
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -34,6 +35,8 @@ class HyperliquidOrderCancelEval(EvalDefinition):
         self.wallet = self.env.get("BLOOM_EVAL_WALLET", "")
         self.wallet_id = self.env.get("BLOOM_EVAL_WALLET_ID", "")
         self.package_hash = self.env.get("BLOOM_EVAL_HYPERLIQUID_PACKAGE_HASH", "")
+        self.owner_record_value = self.env.get("BLOOM_EVAL_PETAL_OWNER_RECORD", "")
+        self.owner_record = Path(self.owner_record_value)
         self.bloom_mount = Path(self.env.get("BLOOM_EVAL_BLOOM_MOUNT", "/bloom"))
         self.driver = Path(
             self.env.get(
@@ -123,20 +126,97 @@ class HyperliquidOrderCancelEval(EvalDefinition):
             raise EvalError(f"route write to {path} failed: {error}") from error
 
     def _read_json_if_exists(self, path: Path) -> Any | None:
+        # Dynamic Petal routes can make getattr/stat succeed for arbitrary
+        # session IDs. The parent listing is the durable existence boundary.
         try:
-            path.stat()
+            session_ids = os.listdir(path.parent.parent)
         except FileNotFoundError:
             return None
         except OSError as error:
-            raise EvalError(f"could not stat {path}: {error}") from error
+            raise EvalError(f"could not list {path.parent.parent}: {error}") from error
+        if path.parent.name not in session_ids:
+            return None
         return self._read_json(path)
+
+    def _pending_petal_key_ceremony(self) -> str | None:
+        root = self.bloom_mount / "petal-key-requests"
+        try:
+            names = sorted(os.listdir(root))
+        except OSError as error:
+            raise EvalError(
+                f"could not list owner Petal key requests: {error}"
+            ) from error
+        matches: list[str] = []
+        for name in names:
+            if re.fullmatch(r"[0-9a-f]{64}\.json", name) is None:
+                continue
+            record = self._read_json(root / name)
+            scope = record.get("scope") if isinstance(record, dict) else None
+            if not isinstance(scope, dict):
+                continue
+            if (
+                record.get("schema") != "bloom.machine.petal-key-request.v2"
+                or record.get("key_slot") != f"hyperliquid-{self.session_id}"
+                or scope.get("wallet_id") != self.wallet_id
+                or scope.get("package_hash") != self.package_hash
+            ):
+                continue
+            ceremony_url = record.get("ceremony_url")
+            if record.get("status") == "awaiting_user" and isinstance(
+                ceremony_url, str
+            ):
+                if CEREMONY_URL.fullmatch(ceremony_url) is None:
+                    raise EvalError(
+                        "owner Petal key request has an invalid ceremony URL"
+                    )
+                matches.append(ceremony_url)
+        if len(matches) > 1:
+            raise EvalError("multiple Petal key ceremonies match the exact session")
+        return matches[0] if matches else None
+
+    def _redact_ceremony_urls(self, output: str) -> str:
+        return CEREMONY_URL.sub("[REDACTED_CEREMONY_URL]", output)
+
+    def _read_session_status(self, attempts: int = 3) -> Any | None:
+        if self.session_base is None:
+            return None
+        for attempt in range(attempts):
+            status_data = self._read_json_if_exists(self.session_base / "status.json")
+            if status_data is not None:
+                return status_data
+            if attempt + 1 < attempts:
+                time.sleep(0.2)
+        return None
+
+    def _require_installed_package_hash(self) -> None:
+        if not self.owner_record_value:
+            raise EvalError("BLOOM_EVAL_PETAL_OWNER_RECORD is required")
+        try:
+            metadata = self.owner_record.lstat()
+        except OSError as error:
+            raise EvalError(f"Petal owner record is unavailable: {error}") from error
+        if not stat.S_ISREG(metadata.st_mode) or self.owner_record.is_symlink():
+            raise EvalError("Petal owner record must be a regular non-symlink file")
+        if stat.S_IMODE(metadata.st_mode) & 0o022:
+            raise EvalError("Petal owner record must not be group/other writable")
+        try:
+            record = json.loads(self.owner_record.read_bytes())
+        except (OSError, json.JSONDecodeError) as error:
+            raise EvalError(f"Petal owner record is invalid: {error}") from error
+        if not isinstance(record, dict) or record != {
+            "name": "hyperliquid",
+            "hash": self.package_hash,
+        }:
+            raise EvalError(
+                "configured Hyperliquid BLAKE3 does not match the installed owner record"
+            )
 
     def _require_exact_wallet_policy(self) -> None:
         if not WALLET_ID.fullmatch(self.wallet_id):
             raise EvalError("BLOOM_EVAL_WALLET_ID must be a lowercase wallet ID")
         if not PACKAGE_HASH.fullmatch(self.package_hash):
             raise EvalError(
-                "BLOOM_EVAL_HYPERLIQUID_PACKAGE_HASH must be a lowercase SHA-256"
+                "BLOOM_EVAL_HYPERLIQUID_PACKAGE_HASH must be a lowercase BLAKE3"
             )
 
         addresses = self._read_json(self.wallet_root / "addresses.json")
@@ -151,13 +231,16 @@ class HyperliquidOrderCancelEval(EvalDefinition):
         policy = self._read_json(self.wallet_root / "policy.json")
         if not isinstance(policy, dict):
             raise EvalError("eval wallet policy is not a JSON object")
-        if policy.get("wallet_id") != self.wallet_id:
-            raise EvalError("eval wallet policy contains a different wallet ID")
-        if policy.get("allowed_destinations") != []:
-            raise EvalError("eval wallet policy must not retain funding destinations")
-        if policy.get("allowed_petal_packages") != [self.package_hash]:
+        expected_policy = {
+            "allowed_destinations": [],
+            "allowed_petal_packages": [self.package_hash],
+            "maximum_approval_lifetime_ms": 2_592_000_000,
+            "required_verifiers": [],
+            "wallet_id": self.wallet_id,
+        }
+        if policy != expected_policy:
             raise EvalError(
-                "eval wallet policy must allow only the configured Hyperliquid package"
+                "eval wallet policy does not match the exact bounded policy"
             )
         canonical = json.dumps(policy, sort_keys=True, separators=(",", ":")).encode()
         digest = hashlib.sha256(canonical).hexdigest()
@@ -166,15 +249,7 @@ class HyperliquidOrderCancelEval(EvalDefinition):
                 "eval wallet policy digest does not match its public projection"
             )
 
-    def _require_empty_wallet(self) -> None:
-        orders = self._read_json(self.user_root / "open_orders.json")
-        if not isinstance(orders, list):
-            raise EvalError("open-orders projection is not a JSON array")
-        if orders:
-            raise EvalError(
-                "dedicated wallet already has an open order; use an empty eval wallet"
-            )
-
+    def _nonzero_positions(self) -> list[dict[str, Any]]:
         clearinghouse = self._read_json(self.user_root / "clearinghouse.json")
         positions = (
             clearinghouse.get("assetPositions")
@@ -183,24 +258,44 @@ class HyperliquidOrderCancelEval(EvalDefinition):
         )
         if not isinstance(positions, list):
             raise EvalError("clearinghouse projection has no assetPositions array")
+        nonzero_positions: list[dict[str, Any]] = []
         for item in positions:
             if not isinstance(item, dict):
                 raise EvalError("clearinghouse contains a malformed position entry")
             position = item.get("position", item)
             if not isinstance(position, dict) or "szi" not in position:
                 raise EvalError("clearinghouse position has no size")
-            raw_size = position["szi"]
             try:
-                size = Decimal(str(raw_size))
+                size = Decimal(str(position["szi"]))
             except (InvalidOperation, TypeError, ValueError) as error:
                 raise EvalError("clearinghouse position size is not numeric") from error
             if not size.is_finite():
                 raise EvalError("clearinghouse position size is not finite")
-            nonzero = size != 0
-            if nonzero:
-                raise EvalError(
-                    "dedicated wallet has an open position; use an empty eval wallet"
-                )
+            if size != 0:
+                nonzero_positions.append(item)
+        return nonzero_positions
+
+    def _require_no_orders_or_positions(self) -> None:
+        orders = self._read_json(self.user_root / "open_orders.json")
+        if not isinstance(orders, list):
+            raise EvalError("open-orders projection is not a JSON array")
+        if orders:
+            raise EvalError(
+                "dedicated wallet already has an open order; use an empty eval wallet"
+            )
+
+        if self._nonzero_positions():
+            raise EvalError(
+                "dedicated wallet has an open position; use an empty eval wallet"
+            )
+
+    def _require_empty_wallet(self) -> None:
+        self._require_no_orders_or_positions()
+        agents = self._read_json(self.user_root / "extra_agents.json")
+        if not isinstance(agents, list):
+            raise EvalError("extra-agents projection is not a JSON array")
+        if agents:
+            raise EvalError("dedicated wallet retains a Hyperliquid API agent")
 
     def preflight(self) -> None:
         if not WALLET.fullmatch(self.wallet):
@@ -252,6 +347,7 @@ class HyperliquidOrderCancelEval(EvalDefinition):
         ):
             if not (self.network_root / relative).exists():
                 raise EvalError(label)
+        self._require_installed_package_hash()
         self._require_exact_wallet_policy()
         try:
             subprocess.run(
@@ -285,13 +381,18 @@ class HyperliquidOrderCancelEval(EvalDefinition):
         if first.returncode != 0:
             output = (first.stdout + first.stderr).decode(errors="replace")
             match = CEREMONY_URL.search(output)
-            if match is not None:
+            ceremony_url = (
+                match.group(0)
+                if match is not None
+                else self._pending_petal_key_ceremony()
+            )
+            if ceremony_url is not None:
                 try:
                     completed = subprocess.run(
                         [
                             str(self.driver),
                             "complete",
-                            match.group(0),
+                            ceremony_url,
                             "--authenticator-seed-file",
                             str(self.seed_file),
                             "--sign-count",
@@ -307,15 +408,15 @@ class HyperliquidOrderCancelEval(EvalDefinition):
                         )
                 except (OSError, subprocess.SubprocessError) as error:
                     output += f"debug-driver ceremony completion failed: {error}"
-                retry = self._write_route(new_route, body, 45)
-                if retry.returncode != 0:
-                    output += (retry.stdout + retry.stderr).decode(errors="replace")
+            retry = self._write_route(new_route, body, 45)
+            if retry.returncode != 0:
+                output += (retry.stdout + retry.stderr).decode(errors="replace")
 
-            status_data = self._read_json_if_exists(self.session_base / "status.json")
+            status_data = self._read_session_status()
             if status_data is None:
                 raise EvalError(
                     "session creation failed without durable session readback: "
-                    + output
+                    + self._redact_ceremony_urls(output)
                 )
         else:
             status_data = self._read_json(self.session_base / "status.json")
@@ -375,26 +476,30 @@ class HyperliquidOrderCancelEval(EvalDefinition):
     def cleanup(self) -> None:
         if self.session_base is None or self.session_id is None:
             return
-        if not self.session_created:
-            status_data = self._read_json_if_exists(self.session_base / "status.json")
-            if status_data is not None:
-                self.session_created = True
-            else:
-                try:
-                    self._require_empty_wallet()
-                except EvalError as error:
-                    raise EvalError(
-                        f"residual-state cleanup failed for {self.session_id}: {error}"
-                    ) from error
-                return
         failures: list[str] = []
-        status_data: Any = {}
-        try:
-            status_data = self._read_json(self.session_base / "status.json")
-        except EvalError as error:
-            failures.append(str(error))
+        status_data = self._read_session_status()
+        if status_data is None:
+            try:
+                if self._pending_petal_key_ceremony() is not None:
+                    failures.append(
+                        "matching Petal key ceremony is still awaiting user action"
+                    )
+            except EvalError as error:
+                failures.append(str(error))
+            try:
+                self._require_empty_wallet()
+            except EvalError as error:
+                failures.append(str(error))
+            if failures:
+                raise EvalError(
+                    f"residual-state cleanup failed for {self.session_id}: "
+                    + "; ".join(failures)
+                )
+            return
 
-        if not (isinstance(status_data, dict) and status_data.get("stopped") is True):
+        self.session_created = True
+        stopped = isinstance(status_data, dict) and status_data.get("stopped") is True
+        if not stopped:
             cancel = self._write_route(
                 self.session_base / "cancel_all", b"host-cleanup", 30
             )
@@ -408,19 +513,27 @@ class HyperliquidOrderCancelEval(EvalDefinition):
         except EvalError as error:
             failures.append(str(error))
 
-        if not failures:
-            try:
-                status_data = self._read_json(self.session_base / "status.json")
-            except EvalError:
-                status_data = {}
-            if not (
-                isinstance(status_data, dict) and status_data.get("stopped") is True
-            ):
-                stopped = self._write_route(
-                    self.session_base / "stop", b"host-cleanup", 10
+        try:
+            positions = self._nonzero_positions()
+            if positions and not stopped:
+                closed = self._write_route(
+                    self.session_base / "close_all", b"host-cleanup", 45
                 )
-                if stopped.returncode != 0:
-                    failures.append("session stop failed")
+                if closed.returncode != 0:
+                    failures.append("session close_all failed")
+                elif self._nonzero_positions():
+                    failures.append("dedicated wallet still has an open position")
+            elif positions:
+                failures.append("stopped session cannot close the residual position")
+        except EvalError as error:
+            failures.append(str(error))
+
+        if not failures and not stopped:
+            stopped_result = self._write_route(
+                self.session_base / "stop", b"host-cleanup", 10
+            )
+            if stopped_result.returncode != 0:
+                failures.append("session stop failed")
 
         try:
             final_status = self._read_json(self.session_base / "status.json")
@@ -429,6 +542,11 @@ class HyperliquidOrderCancelEval(EvalDefinition):
                 or final_status.get("stopped") is not True
             ):
                 failures.append("session is not stopped")
+        except EvalError as error:
+            failures.append(str(error))
+
+        try:
+            self._require_no_orders_or_positions()
         except EvalError as error:
             failures.append(str(error))
 

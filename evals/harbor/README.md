@@ -32,7 +32,13 @@ audit data outside the agent-controlled container.
 - A built `bloom-broker-debug-driver` from the sibling `bloom-broker` repository.
 - The debug driver must include `--authenticator-seed-file` support from
   [`bloom-broker#1`](https://github.com/bloom-directory/bloom-broker/pull/1).
+- Broker PR #1 must be at commit
+  `7b2ca77c1182dbf1a94dc6a4b738ff8cade9517b` or later so authority and
+  ceremony mutations verify the dedicated audit journal, not another SQLite DB.
 - A mode-`0600` file containing the matching authenticator seed.
+- The immutable Machine owner record for the installed Hyperliquid Petal. This
+  is normally `.../state/machine/petals/store/owners/hyperliquid.json`; pass its
+  exact host path as `BLOOM_EVAL_PETAL_OWNER_RECORD`.
 - The dedicated wallet's active Broker policy must contain no funding
   destinations and allow only the exact installed Hyperliquid package hash.
 
@@ -59,11 +65,15 @@ serialized attempt.
 ```bash
 export BLOOM_EVAL_WALLET=0x... # dedicated, lowercase address
 export BLOOM_EVAL_WALLET_ID=... # dedicated Bloom wallet ID
-export BLOOM_EVAL_HYPERLIQUID_PACKAGE_HASH=bae1e7890e36785ebbe31b104c5a4cfdc01d46a4fce10dc2f73f83d33490a509
+export BLOOM_EVAL_PETAL_OWNER_RECORD=/path/to/state/machine/petals/store/owners/hyperliquid.json
+export BLOOM_EVAL_HYPERLIQUID_PACKAGE_HASH=$(python3 -c \
+  'import json,sys; print(json.load(open(sys.argv[1]))["hash"])' \
+  "$BLOOM_EVAL_PETAL_OWNER_RECORD")
 export BLOOM_EVAL_AUTHENTICATOR_SEED_FILE="$HOME/.config/bloom/eval-authenticator-seed"
 # Strictly greater than this credential's last accepted WebAuthn signature counter.
-# Use 1 for a fresh credential; increment for every completed ceremony.
-export BLOOM_EVAL_AUTHENTICATOR_SIGN_COUNT=1
+# Registration with the deterministic debug driver consumes counter 1, so the
+# first post-registration ceremony uses 2. Increment after every completion.
+export BLOOM_EVAL_AUTHENTICATOR_SIGN_COUNT=2
 export BLOOM_EVAL_MAINNET_ACK=PLACE_AND_CANCEL_BTC_MAINNET_UP_TO_11_USD
 
 # Claude Code / Sonnet 5
@@ -78,27 +88,39 @@ scripts/evals/run-harbor-hyperliquid.sh codex
 ### Reproduce the package-only wallet policy
 
 The example at `evals/harbor/policies/hyperliquid-only.example.json` matches the
-package hash used by the verified local run. Re-check Bloom's pinned catalog hash
-whenever the installed Petal release changes. Copy the example to a private
-temporary file, replace `wallet_id`, and retain those exact canonical bytes for
-both writes:
+package hash used by the verified local run. Bloom package IDs are BLAKE3
+digests, not SHA-256 values. Always derive the current hash from the immutable
+installed owner record as shown above. Copy the example to a private temporary
+file, replace `wallet_id`, and retain those exact canonical bytes for both
+writes. Save and validate the original deny-by-default policy before staging so
+it can be restored after the trial:
 
 ```bash
 policy_file=$(mktemp)
-python3 - "$BLOOM_EVAL_WALLET_ID" "$policy_file" <<'PY'
+original_policy=$(mktemp)
+pending_before=$(mktemp)
+trap 'rm -f "$policy_file" "$original_policy" "$pending_before"' EXIT
+cat "/bloom/wallets/$BLOOM_EVAL_WALLET_ID/policy.json" >"$original_policy"
+python3 - "$BLOOM_EVAL_WALLET_ID" "$BLOOM_EVAL_HYPERLIQUID_PACKAGE_HASH" "$policy_file" "$original_policy" <<'PY'
 import json, pathlib, sys
 source = pathlib.Path("evals/harbor/policies/hyperliquid-only.example.json")
 policy = json.loads(source.read_text())
 policy["wallet_id"] = sys.argv[1]
-pathlib.Path(sys.argv[2]).write_text(
+policy["allowed_petal_packages"] = [sys.argv[2]]
+pathlib.Path(sys.argv[3]).write_text(
     json.dumps(policy, sort_keys=True, separators=(",", ":")) + "\n"
 )
+original = json.loads(pathlib.Path(sys.argv[4]).read_text())
+expected_original = dict(policy, allowed_petal_packages=[])
+if original != expected_original:
+    raise SystemExit("original eval-wallet policy is not deny-by-default")
 PY
 
 # First write stages validation and returns the owner-approval boundary.
+ls "/bloom/wallets/$BLOOM_EVAL_WALLET_ID/policy-updates/pending" | sort >"$pending_before"
 cp "$policy_file" "/bloom/wallets/$BLOOM_EVAL_WALLET_ID/policy.json"
-ls "/bloom/wallets/$BLOOM_EVAL_WALLET_ID/policy-updates/pending"
-action_id=... # new pending action; do not assume `latest` is chronological
+action_id=$(comm -13 "$pending_before" <(ls "/bloom/wallets/$BLOOM_EVAL_WALLET_ID/policy-updates/pending" | sort))
+[ "$(printf '%s\n' "$action_id" | sed '/^$/d' | wc -l)" -eq 1 ]
 challenge="/bloom/wallets/$BLOOM_EVAL_WALLET_ID/policy-updates/pending/$action_id/approval_challenge.json"
 ceremony_url=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["ceremony_url"])' "$challenge")
 
@@ -110,7 +132,10 @@ bloom-broker-debug-driver complete "$ceremony_url" \
 cp "$policy_file" "/bloom/wallets/$BLOOM_EVAL_WALLET_ID/policy.json"
 cat "/bloom/wallets/$BLOOM_EVAL_WALLET_ID/addresses.json"
 cat "/bloom/wallets/$BLOOM_EVAL_WALLET_ID/policy.json"
-rm -f "$policy_file"
+
+# After the eval, repeat this same stage/approve/byte-identical replay process
+# with "$original_policy" and the next strictly greater WebAuthn counter. Verify
+# policy.json equals original_policy and addresses.json reports broker_verified.
 ```
 
 The policy ceremony consumes the configured WebAuthn counter. Increment
@@ -151,7 +176,16 @@ The task and verifier invoke `cancel_all` and verify that the client order ID is
 absent. Only the host harness can write `stop`; after cancellation checks pass it
 stops the session and verifies the stopped state. Any cleanup failure fails the
 run and operators must inspect the wallet before another trial. Cleanup never
-attempts `close_all`, because this eval must not alter positions.
+ignores a filled order: after `cancel_all` it invokes host-only `close_all` only
+when an independent clearinghouse projection shows a residual position, then
+requires zero orders and positions before stopping.
+
+Hyperliquid does not expose a documented API-wallet revoke action through the
+official exchange API, and the current Petal has no revoke-agent route. A
+durable stopped session retires Bloom-side use of its key; restoring the original
+deny-by-default wallet policy is therefore a mandatory final authority boundary.
+If session persistence is missing, any new `extra_agents.json` entry is treated
+as an orphan and cleanup fails rather than claiming success.
 
 ## Validate without trading
 
