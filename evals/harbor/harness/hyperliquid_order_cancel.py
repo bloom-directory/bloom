@@ -26,6 +26,13 @@ PACKAGE_HASH = re.compile(r"[0-9a-f]{64}")
 ACTION_FILES = ("order.json", "cancel.json", "update_leverage.json", "cancel_all")
 
 
+def session_key_slot(session_id: str) -> str:
+    digest = hashlib.sha256(
+        b"bloom-hyperliquid-session-key/v1\0" + session_id.encode()
+    ).hexdigest()
+    return f"hyperliquid-{digest[:52]}"
+
+
 class HyperliquidOrderCancelEval(EvalDefinition):
     name = "hyperliquid-order-cancel"
 
@@ -139,6 +146,8 @@ class HyperliquidOrderCancelEval(EvalDefinition):
         return self._read_json(path)
 
     def _pending_petal_key_ceremony(self) -> str | None:
+        if self.session_id is None:
+            raise EvalError("session ID is unavailable while resolving Petal key ceremony")
         root = self.bloom_mount / "petal-key-requests"
         try:
             names = sorted(os.listdir(root))
@@ -158,7 +167,7 @@ class HyperliquidOrderCancelEval(EvalDefinition):
                 continue
             if (
                 record.get("schema") != "bloom.machine.petal-key-request.v2"
-                or record.get("key_slot") != f"hyperliquid-{self.session_id}"
+                or record.get("key_slot") != session_key_slot(self.session_id)
                 or scope.get("wallet_id") != self.wallet_id
                 or scope.get("package_hash") != self.package_hash
             ):
