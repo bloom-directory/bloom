@@ -33,6 +33,8 @@ audit data outside the agent-controlled container.
 - The debug driver must include `--authenticator-seed-file` support from
   [`bloom-broker#1`](https://github.com/bloom-directory/bloom-broker/pull/1).
 - A mode-`0600` file containing the matching authenticator seed.
+- The dedicated wallet's active Broker policy must contain no funding
+  destinations and allow only the exact installed Hyperliquid package hash.
 
 No wallet key, API wallet key, credential seed, or model credential is committed.
 The Python host harness invokes the debug driver before Harbor starts. The agent
@@ -56,7 +58,12 @@ serialized attempt.
 
 ```bash
 export BLOOM_EVAL_WALLET=0x... # dedicated, lowercase address
+export BLOOM_EVAL_WALLET_ID=... # dedicated Bloom wallet ID
+export BLOOM_EVAL_HYPERLIQUID_PACKAGE_HASH=bae1e7890e36785ebbe31b104c5a4cfdc01d46a4fce10dc2f73f83d33490a509
 export BLOOM_EVAL_AUTHENTICATOR_SEED_FILE="$HOME/.config/bloom/eval-authenticator-seed"
+# Strictly greater than this credential's last accepted WebAuthn signature counter.
+# Use 1 for a fresh credential; increment for every completed ceremony.
+export BLOOM_EVAL_AUTHENTICATOR_SIGN_COUNT=1
 export BLOOM_EVAL_MAINNET_ACK=PLACE_AND_CANCEL_BTC_MAINNET_UP_TO_11_USD
 
 # Claude Code / Sonnet 5
@@ -67,6 +74,50 @@ scripts/evals/run-harbor-hyperliquid.sh claude
 # Uses OPENAI_API_KEY when set; otherwise ~/.codex/auth.json.
 scripts/evals/run-harbor-hyperliquid.sh codex
 ```
+
+### Reproduce the package-only wallet policy
+
+The example at `evals/harbor/policies/hyperliquid-only.example.json` matches the
+package hash used by the verified local run. Re-check Bloom's pinned catalog hash
+whenever the installed Petal release changes. Copy the example to a private
+temporary file, replace `wallet_id`, and retain those exact canonical bytes for
+both writes:
+
+```bash
+policy_file=$(mktemp)
+python3 - "$BLOOM_EVAL_WALLET_ID" "$policy_file" <<'PY'
+import json, pathlib, sys
+source = pathlib.Path("evals/harbor/policies/hyperliquid-only.example.json")
+policy = json.loads(source.read_text())
+policy["wallet_id"] = sys.argv[1]
+pathlib.Path(sys.argv[2]).write_text(
+    json.dumps(policy, sort_keys=True, separators=(",", ":")) + "\n"
+)
+PY
+
+# First write stages validation and returns the owner-approval boundary.
+cp "$policy_file" "/bloom/wallets/$BLOOM_EVAL_WALLET_ID/policy.json"
+ls "/bloom/wallets/$BLOOM_EVAL_WALLET_ID/policy-updates/pending"
+action_id=... # new pending action; do not assume `latest` is chronological
+challenge="/bloom/wallets/$BLOOM_EVAL_WALLET_ID/policy-updates/pending/$action_id/approval_challenge.json"
+ceremony_url=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["ceremony_url"])' "$challenge")
+
+bloom-broker-debug-driver complete "$ceremony_url" \
+  --authenticator-seed-file "$BLOOM_EVAL_AUTHENTICATOR_SEED_FILE" \
+  --sign-count "$BLOOM_EVAL_AUTHENTICATOR_SIGN_COUNT"
+
+# Commit by replaying byte-identical bytes, then verify the public projection.
+cp "$policy_file" "/bloom/wallets/$BLOOM_EVAL_WALLET_ID/policy.json"
+cat "/bloom/wallets/$BLOOM_EVAL_WALLET_ID/addresses.json"
+cat "/bloom/wallets/$BLOOM_EVAL_WALLET_ID/policy.json"
+rm -f "$policy_file"
+```
+
+The policy ceremony consumes the configured WebAuthn counter. Increment
+`BLOOM_EVAL_AUTHENTICATOR_SIGN_COUNT` before starting the eval session. If a
+proposal expires or is cancelled, query or cancel it by its exact action ID and
+replay its byte-identical policy once to reconcile the mounted lifecycle before
+staging different bytes.
 
 The launcher pins Harbor 0.21.0 by default and then delegates to the reusable
 Python harness under `evals/harbor/harness`. The harness uses Harbor's public
@@ -80,7 +131,9 @@ and a dry environment build.
 
 ## Safety and cleanup
 
-The runner fails closed unless the exact mainnet acknowledgement is set,
+The runner fails closed unless the exact mainnet acknowledgement, wallet ID,
+installed package hash, and next WebAuthn signature counter are set. The wallet
+policy must match that package-only authority exactly,
 `/bloom` is a real mount, the dedicated wallet has no open orders or positions,
 the debug driver and protected seed file exist, and Docker is available. It uses
 an advisory file lock, Harbor concurrency 1, one attempt, and no retries.
