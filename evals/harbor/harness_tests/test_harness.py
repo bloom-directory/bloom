@@ -14,6 +14,7 @@ from harness.hyperliquid_order_cancel import (
     ACTION_FILES,
     MAINNET_ACK,
     HyperliquidOrderCancelEval,
+    session_key_slot,
 )
 
 
@@ -263,7 +264,7 @@ class HyperliquidDefinitionTests(unittest.TestCase):
             json.dumps(
                 {
                     "schema": "bloom.machine.petal-key-request.v2",
-                    "key_slot": "hyperliquid-exact-session",
+                    "key_slot": session_key_slot("exact-session"),
                     "scope": {
                         "wallet_id": self.wallet_id,
                         "package_hash": self.package_hash,
@@ -277,7 +278,7 @@ class HyperliquidDefinitionTests(unittest.TestCase):
             json.dumps(
                 {
                     "schema": "bloom.machine.petal-key-request.v2",
-                    "key_slot": "hyperliquid-other-session",
+                    "key_slot": session_key_slot("other-session"),
                     "scope": {
                         "wallet_id": self.wallet_id,
                         "package_hash": self.package_hash,
@@ -289,6 +290,18 @@ class HyperliquidDefinitionTests(unittest.TestCase):
         )
 
         self.assertEqual(self.definition._pending_petal_key_ceremony(), ceremony)
+
+    def test_session_key_slot_is_a_case_sensitive_lowercase_broker_token(self) -> None:
+        upper = session_key_slot(
+            "bloom-eval-codex-20260814T150000Z-0123456789abcdef"
+        )
+        lower = session_key_slot(
+            "bloom-eval-codex-20260814t150000z-0123456789abcdef"
+        )
+
+        self.assertEqual(len(upper), 64)
+        self.assertRegex(upper, r"^[a-z0-9-]{64}$")
+        self.assertNotEqual(upper, lower)
 
     def test_provision_creates_session_then_builds_least_authority_mounts(self) -> None:
         written: list[tuple[Path, bytes]] = []
