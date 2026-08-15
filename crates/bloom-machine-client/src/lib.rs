@@ -1036,11 +1036,19 @@ impl MachineBrokerClient {
         &self,
         request: ApprovalPrepareRequest,
     ) -> Result<SealedApprovalPrepareResponse, ProtocolError> {
+        let expected_approval_id = request.terms.approval_id()?;
         match self
             .request(MachineBrokerRequest::SealedApprovalPrepare(request))
             .await?
         {
-            MachineBrokerResponse::SealedApprovalPrepare(response) => Ok(response),
+            MachineBrokerResponse::SealedApprovalPrepare(response)
+                if response.approval_id == expected_approval_id =>
+            {
+                Ok(response)
+            }
+            MachineBrokerResponse::SealedApprovalPrepare(_) => {
+                Err(response_identity_mismatch("sealed_approval.prepare"))
+            }
             _ => Err(response_mismatch("sealed_approval.prepare")),
         }
     }
@@ -1094,11 +1102,19 @@ impl MachineBrokerClient {
         &self,
         request: ApprovalRenewRequest,
     ) -> Result<SealedApprovalPrepareResponse, ProtocolError> {
+        let expected_approval_id = request.replacement_terms.approval_id()?;
         match self
             .request(MachineBrokerRequest::SealedApprovalRenew(request))
             .await?
         {
-            MachineBrokerResponse::SealedApprovalRenew(response) => Ok(response),
+            MachineBrokerResponse::SealedApprovalRenew(response)
+                if response.approval_id == expected_approval_id =>
+            {
+                Ok(response)
+            }
+            MachineBrokerResponse::SealedApprovalRenew(_) => {
+                Err(response_identity_mismatch("sealed_approval.renew"))
+            }
             _ => Err(response_mismatch("sealed_approval.renew")),
         }
     }
@@ -1178,11 +1194,20 @@ impl MachineBrokerClient {
         &self,
         request: PolicyUpdateRequest,
     ) -> Result<PolicyUpdatePrepareResponse, ProtocolError> {
+        let expected_operation_id = request.operation_id.clone();
         match self
             .request(MachineBrokerRequest::PolicyValidateUpdate(request))
             .await?
         {
-            MachineBrokerResponse::PolicyValidateUpdate(response) => Ok(response),
+            MachineBrokerResponse::PolicyValidateUpdate(response)
+                if response.operation_id == expected_operation_id
+                    && response.ceremony_kind == bloom_broker_api::CeremonyKind::PolicyUpdate =>
+            {
+                Ok(response)
+            }
+            MachineBrokerResponse::PolicyValidateUpdate(_) => {
+                Err(response_identity_mismatch("policy.validate_update"))
+            }
             _ => Err(response_mismatch("policy.validate_update")),
         }
     }
@@ -1345,6 +1370,8 @@ impl MachineBrokerClient {
         method: CustodyPrepareMethod,
         request: CustodyPrepareRequest,
     ) -> Result<CustodyPrepareResponse, ProtocolError> {
+        let expected_operation_id = request.custody_operation_id.clone();
+        let expected_ceremony_kind = request.ceremony_kind;
         let request = match method {
             CustodyPrepareMethod::WalletRegistration => {
                 MachineBrokerRequest::WalletRegistrationPrepare(request)
@@ -1417,7 +1444,13 @@ impl MachineBrokerClient {
                 MachineBrokerResponse::CredentialRemovePrepare(response),
             )
             | (CustodyPrepareMethod::Recovery, MachineBrokerResponse::RecoveryPrepare(response)) => {
-                Ok(response)
+                if response.custody_operation_id != expected_operation_id
+                    || response.ceremony_kind != expected_ceremony_kind
+                {
+                    Err(response_identity_mismatch(expected))
+                } else {
+                    Ok(response)
+                }
             }
             _ => Err(response_mismatch(expected)),
         }
@@ -2274,6 +2307,13 @@ fn response_mismatch(method: &str) -> ProtocolError {
     )
 }
 
+fn response_identity_mismatch(method: &str) -> ProtocolError {
+    ProtocolError::new(
+        ProtocolErrorCode::OperationIdConflict,
+        format!("Broker returned a response for different {method} terms"),
+    )
+}
+
 fn service_unavailable(message: impl Into<String>) -> ProtocolError {
     ProtocolError::new(ProtocolErrorCode::ServiceUnavailable, message.into())
 }
@@ -2474,7 +2514,11 @@ mod tests {
                     MachineBrokerRequest::SealedApprovalPrepare(request) => {
                         Ok(MachineBrokerResponse::SealedApprovalPrepare(
                             SealedApprovalPrepareResponse {
-                                approval_id: request.terms.approval_id()?,
+                                approval_id: if self.corrupt_response {
+                                    digest(99)
+                                } else {
+                                    request.terms.approval_id()?
+                                },
                                 state: ApprovalPrepareState::AwaitingCeremony,
                                 ceremony_url: "http://localhost:18734/ceremony/exact-owner-secret"
                                     .into(),
@@ -2518,11 +2562,50 @@ mod tests {
                     ),
                     MachineBrokerRequest::SealedApprovalRenew(request) => Ok(
                         MachineBrokerResponse::SealedApprovalRenew(SealedApprovalPrepareResponse {
-                            approval_id: request.replacement_terms.approval_id()?,
+                            approval_id: if self.corrupt_response {
+                                digest(99)
+                            } else {
+                                request.replacement_terms.approval_id()?
+                            },
                             state: ApprovalPrepareState::AwaitingCeremony,
                             ceremony_url: "http://localhost:18734/ceremony/renew".into(),
                             ceremony_expires_at_ms: request.replacement_terms.expires_at_ms,
                             review_manifest_digest: digest(72),
+                        }),
+                    ),
+                    MachineBrokerRequest::PolicyValidateUpdate(request) => Ok(
+                        MachineBrokerResponse::PolicyValidateUpdate(PolicyUpdatePrepareResponse {
+                            operation_id: if self.corrupt_response {
+                                OperationId::from_bytes([99; 32])
+                            } else {
+                                request.operation_id
+                            },
+                            ceremony_kind: if self.corrupt_response {
+                                CeremonyKind::WalletDelete
+                            } else {
+                                CeremonyKind::PolicyUpdate
+                            },
+                            ceremony_url: "http://localhost:18734/ceremony/policy".into(),
+                            ceremony_expires_at_ms: DecimalU64::new(9_000),
+                            review_manifest_digest: digest(74),
+                        }),
+                    ),
+                    MachineBrokerRequest::WalletImportPrepare(request) => Ok(
+                        MachineBrokerResponse::WalletImportPrepare(CustodyPrepareResponse {
+                            ceremony_kind: if self.corrupt_response {
+                                CeremonyKind::WalletDelete
+                            } else {
+                                request.ceremony_kind
+                            },
+                            custody_operation_id: if self.corrupt_response {
+                                OperationId::from_bytes([99; 32])
+                            } else {
+                                request.custody_operation_id
+                            },
+                            state: CustodyPrepareState::AwaitingUser,
+                            ceremony_url: "http://localhost:18734/ceremony/import".into(),
+                            ceremony_expires_at_ms: DecimalU64::new(9_000),
+                            signer_contribution_digest: digest(75),
                         }),
                     ),
                     MachineBrokerRequest::SealedApprovalRevoke(request) => Ok(
@@ -3398,6 +3481,84 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(error.code, ProtocolErrorCode::OperationIdConflict);
+    }
+
+    #[tokio::test]
+    async fn prepare_wrappers_reject_crossed_operation_and_terms_responses() {
+        let broker = Arc::new(MockBroker {
+            wallet: WalletPublic {
+                wallet_id: token("wallet"),
+                wallet_kind: token("local"),
+                root_key_ref: key_ref(),
+                key_refs: vec![key_ref()],
+                policy_version: DecimalU64::new(2),
+                policy_digest: digest(82),
+                wallet_revocation_epoch: DecimalU64::new(1),
+            },
+            requests: Mutex::new(Vec::new()),
+            corrupt_response: true,
+        });
+        let client = MachineBrokerClient::new(broker);
+
+        let approval = ApprovalPrepareRequest {
+            operation_id: OperationId::from_bytes([94; 32]),
+            terms: approval_terms("wallet", None),
+            canonical_plan_facts_digest: digest(95),
+        };
+        assert_eq!(
+            client.prepare_approval(approval).await.unwrap_err().code,
+            ProtocolErrorCode::OperationIdConflict
+        );
+
+        let old_approval_id = digest(70);
+        let renewal = ApprovalRenewRequest {
+            operation_id: OperationId::from_bytes([95; 32]),
+            old_approval_id: old_approval_id.clone(),
+            replacement_terms: approval_terms("wallet", Some(old_approval_id)),
+        };
+        assert_eq!(
+            client.renew_approval(renewal).await.unwrap_err().code,
+            ProtocolErrorCode::OperationIdConflict
+        );
+
+        let policy = PolicyUpdateRequest {
+            operation_id: OperationId::from_bytes([96; 32]),
+            wallet_id: token("wallet"),
+            baseline_version: DecimalU64::new(2),
+            baseline_digest: digest(82),
+            proposed_canonical_policy: Base64UrlBytes::from_bytes(b"{}"),
+            proposed_policy_digest: digest(83),
+            authority_diff_digest: digest(84),
+            assurance_level: token("passkey"),
+        };
+        assert_eq!(
+            client
+                .validate_policy_update(policy)
+                .await
+                .unwrap_err()
+                .code,
+            ProtocolErrorCode::OperationIdConflict
+        );
+
+        let custody = CustodyPrepareRequest {
+            ceremony_kind: CeremonyKind::WalletImport,
+            custody_operation_id: OperationId::from_bytes([97; 32]),
+            wallet_id: None,
+            key_ref: None,
+            exact_terms_digest: digest(85),
+            expected_input_class: token("raw-wallet-import"),
+            browser_output_recipient_key: None,
+            petal_key_scope: None,
+            legacy_passkey_migration: None,
+        };
+        assert_eq!(
+            client
+                .prepare_custody(CustodyPrepareMethod::WalletImport, custody)
+                .await
+                .unwrap_err()
+                .code,
+            ProtocolErrorCode::OperationIdConflict
+        );
     }
 
     fn token(value: &str) -> Token {

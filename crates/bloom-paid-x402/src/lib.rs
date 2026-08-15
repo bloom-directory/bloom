@@ -166,7 +166,8 @@ impl X402PaymentSigner for HostX402PaymentSigner {
             &candidate,
             ctx.wallet_address,
         )?;
-        let (preimage, signing_hash) = exact_signing_payload(&unsigned_header, &payment_required)?;
+        let (preimage, signing_hash) =
+            exact_signing_payload(&unsigned_header, &payment_required, &candidate)?;
         if let Some(observed) = *observed_hash.lock().expect("draft hash lock")
             && observed != signing_hash
         {
@@ -400,6 +401,7 @@ fn validate_unsigned_draft(
 fn exact_signing_payload(
     header: &str,
     required: &proto::PaymentRequired,
+    candidate: &x402_types::scheme::client::PaymentCandidate,
 ) -> Result<(Vec<u8>, [u8; 32]), String> {
     let decoded = Base64Bytes::from(header.as_bytes())
         .decode()
@@ -414,7 +416,12 @@ fn exact_signing_payload(
                 .iter()
                 .filter_map(|raw| v1_exact::types::PaymentRequirements::try_from(raw).ok())
                 .find(|entry| {
-                    entry.network == payload.network
+                    networks_equivalent(&entry.network, &payload.network)
+                        && networks_equivalent(&entry.network, &candidate.chain_id.to_string())
+                        && entry
+                            .asset
+                            .to_string()
+                            .eq_ignore_ascii_case(&candidate.asset)
                         && entry.pay_to == authorization.to
                         && entry.max_amount_required == authorization.value
                 })
@@ -554,7 +561,7 @@ fn hex_lower(bytes: &[u8]) -> String {
 mod tests {
     use super::{
         HostX402PaymentSigner, X402PaymentSigner, X402SignContext, candidate_matches_requirement,
-        parse_payment_required,
+        eip3009_preimage, exact_signing_payload, parse_payment_required, proto, v1_exact,
     };
     use alloy::primitives::{Address, U256};
     use async_trait::async_trait;
@@ -567,6 +574,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use url::Url;
     use x402_types::chain::ChainId;
+    use x402_types::proto::OriginalJson;
     use x402_types::scheme::client::{PaymentCandidate, PaymentCandidateSigner, X402Error};
     use x402_types::util::Base64Bytes;
 
@@ -661,6 +669,74 @@ mod tests {
 
         assert!(candidate_matches_requirement(&candidate(10_000), &requirement).unwrap());
         assert!(!candidate_matches_requirement(&candidate(5_000_000), &requirement).unwrap());
+    }
+
+    #[test]
+    fn v1_preimage_reconstruction_keeps_the_selected_asset() {
+        let first_asset = "0x1111111111111111111111111111111111111111";
+        let selected_asset = "0x2222222222222222222222222222222222222222";
+        let pay_to = "0x93053f1e7A5eFEDa532Fe69CbbE43cBEc3A0F13f";
+        let requirement = |asset: &str, name: &str, version: &str| {
+            serde_json::json!({
+                "scheme": "exact",
+                "network": "base",
+                "maxAmountRequired": "10000",
+                "resource": "https://example.test/paid",
+                "description": "paid resource",
+                "mimeType": "application/json",
+                "payTo": pay_to,
+                "maxTimeoutSeconds": 300,
+                "asset": asset,
+                "extra": {"name": name, "version": version}
+            })
+        };
+        let required: proto::v1::PaymentRequired<OriginalJson> =
+            serde_json::from_value(serde_json::json!({
+                "x402Version": 1,
+                "accepts": [
+                    requirement(first_asset, "First Token", "1"),
+                    requirement(selected_asset, "Selected Token", "2")
+                ],
+                "error": null
+            }))
+            .unwrap();
+        let payment_required = proto::PaymentRequired::V1(required);
+        let unsigned_payload = serde_json::json!({
+            "x402Version": 1,
+            "scheme": "exact",
+            "network": "base",
+            "payload": {
+                "signature": "0x",
+                "authorization": {
+                    "from": "0x1111111111111111111111111111111111111111",
+                    "to": pay_to,
+                    "value": "10000",
+                    "validAfter": "1",
+                    "validBefore": "301",
+                    "nonce": format!("0x{}", "33".repeat(32))
+                }
+            }
+        });
+        let header =
+            Base64Bytes::encode(serde_json::to_vec(&unsigned_payload).unwrap()).to_string();
+        let mut selected = candidate(10_000);
+        selected.asset = selected_asset.into();
+
+        let (actual_preimage, actual_hash) =
+            exact_signing_payload(&header, &payment_required, &selected).unwrap();
+        let decoded = Base64Bytes::from(header.as_bytes()).decode().unwrap();
+        let payload: v1_exact::types::PaymentPayload = serde_json::from_slice(&decoded).unwrap();
+        let (expected_preimage, expected_hash) = eip3009_preimage(
+            8453,
+            selected_asset.parse().unwrap(),
+            "Selected Token",
+            "2",
+            payload.payload.authorization,
+        )
+        .unwrap();
+
+        assert_eq!(actual_preimage, expected_preimage);
+        assert_eq!(actual_hash, expected_hash);
     }
 
     #[tokio::test]

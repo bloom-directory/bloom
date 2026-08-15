@@ -58,6 +58,7 @@ use bloom_proto::{
     StagedTx, TokenRef, TxActionKind, TxStatus, ValuationPolicy, parse_amount, parse_eth,
     parse_units,
 };
+use fs2::FileExt as _;
 use parking_lot::RwLock;
 use sha2::Digest as _;
 use thiserror::Error;
@@ -1876,6 +1877,14 @@ impl TxEngine {
                 )));
             }
         }
+        let parent_state_path =
+            batch_signing_state_path(self.outbox.root(), wallet, &ordered_refs)?;
+        // The batch projection is the recovery authority for approval, signing,
+        // and partial broadcast. Hold one process-wide file lock from the first
+        // outbox read through the final state transition so concurrent daemon
+        // connections and standalone Machine invocations cannot create or act
+        // on competing operation identities for the same ref set.
+        let _batch_state_guard = lock_triad_batch_signing_state(&parent_state_path).await?;
 
         let mut entries = Vec::with_capacity(targets.len());
         let mut prepared = Vec::with_capacity(targets.len());
@@ -1967,8 +1976,6 @@ impl TxEngine {
             already_attempted.push(attempt);
         }
 
-        let parent_state_path =
-            batch_signing_state_path(self.outbox.root(), wallet, &ordered_refs)?;
         let recovering_parent = read_triad_batch_signing_state(&parent_state_path)?.is_some();
         if !recovering_parent
             && entries
@@ -4161,6 +4168,45 @@ fn batch_signing_state_path(
         .join(TRIAD_BATCH_STATE_FILE))
 }
 
+async fn lock_triad_batch_signing_state(
+    state_path: &std::path::Path,
+) -> Result<std::fs::File, TxEngineError> {
+    #[cfg(unix)]
+    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+
+    let state_path = state_path.to_owned();
+    tokio::task::spawn_blocking(move || -> Result<std::fs::File, String> {
+        let parent = state_path
+            .parent()
+            .ok_or_else(|| "batch ceremony projection has no parent directory".to_owned())?;
+        std::fs::create_dir_all(parent)
+            .map_err(|error| format!("create batch ceremony directory: {error}"))?;
+        #[cfg(unix)]
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
+            .map_err(|error| format!("secure batch ceremony directory: {error}"))?;
+        let lock_path = state_path.with_extension("lock");
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let file = options
+            .open(&lock_path)
+            .map_err(|error| format!("open batch ceremony lock: {error}"))?;
+        let metadata = file
+            .metadata()
+            .map_err(|error| format!("inspect batch ceremony lock: {error}"))?;
+        if !metadata.file_type().is_file() {
+            return Err("batch ceremony lock is not a regular file".into());
+        }
+        file.lock_exclusive()
+            .map_err(|error| format!("acquire batch ceremony lock: {error}"))?;
+        Ok(file)
+    })
+    .await
+    .map_err(|error| TxEngineError::ApprovalState(format!("join batch ceremony lock: {error}")))?
+    .map_err(TxEngineError::ApprovalState)
+}
+
 async fn expected_evm_batch_sign_operation_digest(
     broker: &MachineBrokerClient,
     wallet_id: &str,
@@ -5671,6 +5717,34 @@ mod tests {
             .collect::<Vec<_>>();
         let (preimages, hashes): (Vec<_>, Vec<_>) = prepared.into_iter().unzip();
         (refs, staged, preimages, hashes)
+    }
+
+    #[tokio::test]
+    async fn batch_signing_state_lock_serializes_competing_confirmations() {
+        let directory = tempfile::tempdir().unwrap();
+        let state_path = directory.path().join("batch/ceremony.json");
+        let first = lock_triad_batch_signing_state(&state_path).await.unwrap();
+        let second_acquired = Arc::new(AtomicBool::new(false));
+        let acquired_by_task = second_acquired.clone();
+        let second_path = state_path.clone();
+        let second = tokio::spawn(async move {
+            let guard = lock_triad_batch_signing_state(&second_path).await.unwrap();
+            acquired_by_task.store(true, Ordering::SeqCst);
+            guard
+        });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !second_acquired.load(Ordering::SeqCst),
+            "a competing confirmation acquired the same batch state lock"
+        );
+        drop(first);
+        let second_guard = tokio::time::timeout(Duration::from_secs(1), second)
+            .await
+            .expect("competing confirmation did not resume after lock release")
+            .unwrap();
+        assert!(second_acquired.load(Ordering::SeqCst));
+        drop(second_guard);
     }
 
     #[tokio::test]

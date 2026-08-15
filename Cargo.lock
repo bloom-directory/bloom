@@ -2642,6 +2642,7 @@ dependencies = [
  "bloom-proto",
  "bloom-rpc",
  "bloom-tools",
+ "fs2",
  "hex",
  "parking_lot",
  "rand 0.8.6",
