@@ -10,12 +10,12 @@ The `release.yml` workflow:
 1. Validates the tag shape.
 2. Verifies that the tagged commit is reachable from the default branch and
    already has workspace version `X.Y.Z`.
-3. Builds the exact
-   commit SHA on four runners (Linux x86_64 + aarch64, macOS x86_64 +
-   aarch64) with `--locked`.
+3. Builds the exact commit SHA on four runner platforms (Linux x86_64 +
+   aarch64, macOS x86_64 + aarch64) with `--locked`, including both glibc
+   and static musl artifacts for Linux aarch64.
 4. Verifies the resulting binary's `bloom --version` matches the tag.
 5. Verifies the tag still resolves to the built SHA, then creates a
-   GitHub release `vX.Y.Z` with the four tarballs and a `SHA256SUMS`
+   GitHub release `vX.Y.Z` with the five tarballs and a `SHA256SUMS`
    file. It advances GitHub's latest-release alias only when this version is
    at least as new as the current latest release; failures resolving that
    release abort publication rather than treating the result as empty.
@@ -26,6 +26,11 @@ workflow. It is owned by the old (now-retired) branch-driven
 `latest` tag are removed in the cleanup step below. GitHub's
 `/releases/latest/download/...` route follows the release marked
 latest; it does not require a git tag literally named `latest`.
+
+Linux aarch64 releases include two variants. Use
+`bloom-linux-aarch64.tar.gz` on glibc distributions and
+`bloom-linux-aarch64-musl.tar.gz` on Termux/Android, Alpine Linux, and
+minimal Linux systems without glibc. The musl binary is statically linked.
 
 ## CI-proposed release
 
@@ -115,7 +120,7 @@ git push origin "v$VERSION"
 
 The tag push starts the workflow automatically. Because the tag already
 points at the reviewed version-bumped commit, the build jobs use that exact
-SHA and the publish job creates the `v$VERSION` release with the four
+SHA and the publish job creates the `v$VERSION` release with the five
 tarballs and `SHA256SUMS`. A manual `release.yml` run is available only to
 retry an existing tag and never creates commits or tags.
 
@@ -174,9 +179,10 @@ checks, set `BLOOM_DISABLE_UPDATE_CHECK=1` in the service environment.
 - **A floating `latest` git tag**: removed during legacy cleanup. The
   versioned URL is canonical, while GitHub's latest-release URL remains
   a stable convenience alias.
-- **Cross-compiled builds**: each runner builds natively (`cargo
-  build --release` without `--target`), matching the previous
-  workflow. Cross-compilation is a separate effort.
+- **Cross-architecture builds**: each artifact is built on a runner with the
+  matching CPU architecture. The release workflow selects explicit Rust
+  targets, including musl on the native aarch64 runner, but does not emulate
+  or cross-compile between CPU architectures.
 - **Windows builds**: intentionally out of scope. Historical commit
   `cce4250 remove Windows release builds` removed them; the current
   CI has no Windows tests.
