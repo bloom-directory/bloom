@@ -17,8 +17,12 @@ mnemonic nor individual private keys. Adding or replacing a passkey must not
 change any chain address.
 
 The first profiles are EVM secp256k1 through BIP-32/BIP-44 and Solana Ed25519
-through hardened SLIP-10. BIP-39 provides portable recovery and Open Wallet
-Standard compatibility, but Bloom retains the triad custody and approval model.
+through hardened SLIP-10. BIP-39 provides portable key recovery (addresses
+reconstructed into a new wallet), distinct from Bloom wallet recovery via the
+recovery factor. Bloom targets OWS EVM and Solana chain-profile interoperability
+for BIP-39 derivation paths, CAIP identifiers, and golden vectors; it does not
+implement OWS storage, API-key, policy, signing, or lifecycle conformance. Bloom
+retains the triad custody and approval model.
 
 ## Non-goals
 
@@ -104,6 +108,26 @@ step. A future profile can add paths without silently changing v1.
 
 ### 4. Recovery is explicit custody authority
 
+There are two distinct recovery products with different guarantees:
+
+- **wallet recovery** uses the recovery factor (triad specification §13.5) plus
+  a backup/state snapshot to restore the *same* Bloom wallet identity and
+  credential records — same `wallet_id`, WKEK, policy, approvals, derivation
+  registry, and audit lineage; it registers a new passkey and may revoke lost
+  credentials;
+- **portable key recovery** (also called asset recovery) uses the BIP-39
+  mnemonic alone to reconstruct chain keys and addresses into a *new* Bloom
+  wallet; it does not recover the old control-plane identity or history.
+
+The loss matrix is:
+
+| Available material | Result |
+|---|---|
+| Passkey | Unlock existing wallet |
+| Recovery factor + backup/state | Recover existing Bloom wallet |
+| Mnemonic only | Recover addresses into a new Bloom wallet |
+| None | Funds unrecoverable |
+
 The default creation ceremony does not display the mnemonic. Users should add
 a second passkey during onboarding when possible. Mnemonic export is an
 explicit, high-assurance Broker-hosted custody ceremony whose exact terms name
@@ -112,7 +136,8 @@ the wallet, export format, destination mode, and consequences.
 Import and recovery are separate ceremonies:
 
 - **import** creates a new Bloom wallet from entered BIP-39 entropy and scans
-  only supported versioned profiles;
+  only supported versioned profiles; it performs portable key recovery, not
+  wallet recovery;
 - **recovery** unwraps an existing Bloom wallet using its recovery factor,
   registers a new passkey, re-wraps the same WKEK, then optionally revokes lost
   credentials;
@@ -129,6 +154,12 @@ Agents and Petals receive typed public child accounts plus scoped approval
 capabilities. Bloom must never reproduce OWS's construction in which a bearer
 token also decrypts a copy of the complete wallet secret. A compromised Machine
 or Petal remains unable to export the seed or allocate arbitrary children.
+
+This remains true when a chain implementation is a
+[verified chain Petal](../architecture/Verified%20Chain%20Petals.md). The driver
+selects an already registered public child `KeyRef` and submits the exact final
+payload through Machine; it cannot choose root entropy, derive an unregistered
+path, unwrap WKEK, or contact Broker/Signer directly.
 
 ## Durable model
 
@@ -148,6 +179,9 @@ Signer backup and restore must treat the following as one atomic wallet set:
 
 Restore refuses new derivation when the registry is missing or inconsistent.
 It must never reconstruct allocation state by scanning addresses and guessing.
+Every component of the atomic set carries one snapshot epoch/manifest, and
+restore rejects mixed-generation components. Derivation counters and tombstones
+are monotonic and never decrease.
 
 ## Contract changes
 
@@ -178,6 +212,31 @@ Signer owns these operations:
 - activate through a credential or recovery wrap;
 - exact-sign using a registered child;
 - atomically back up/restore the root and registry.
+
+Child allocation is an idempotent state machine:
+
+```text
+PREPARED → INDEX_COMMITTED
+INDEX_COMMITTED → ACCOUNT_COMMITTED | TOMBSTONED
+ACCOUNT_COMMITTED → ACTIVATED | TOMBSTONED
+ACTIVATED → RETIRED
+```
+
+`PREPARED` may be discarded without consuming an index. `INDEX_COMMITTED` and
+`ACCOUNT_COMMITTED` may transition to `TOMBSTONED`; `ACTIVATED` transitions to
+`RETIRED` through the retire operation. Every committed index remains consumed.
+
+Invariants:
+
+- an index is permanently consumed once committed;
+- retrying the same operation ID returns the same child;
+- different operation IDs never receive the same index;
+- a Broker crash cannot roll back a Signer allocation;
+- incomplete allocations reconcile deterministically by replaying the bound
+  operation ID (bound into the allocation record at `INDEX_COMMITTED`);
+- backups carry a common snapshot epoch/manifest;
+- restore rejects mixed-generation components;
+- tombstones and committed counters never decrease.
 
 ### Broker API and ceremonies
 
@@ -226,15 +285,25 @@ cannot silently choose a different key or allocate a path.
 Before defining a migration algorithm, inspect the released local Signer format
 and classify every existing wallet:
 
-1. original seed entropy retained in a form suitable for the new profile;
-2. only a BIP-32 master/extended secp256k1 key retained;
-3. only a standalone secp256k1 private key retained;
-4. imported/external backend whose key cannot participate in HD derivation.
+1. genuine BIP-39 entropy with known passphrase and path semantics;
+2. raw BIP-32 seed;
+3. BIP-32 master/extended secp256k1 key;
+4. standalone secp256k1 scalar;
+5. imported/external backend whose key cannot participate in HD derivation.
 
 Only class 1 can become standard BIP-39 multi-curve without changing its
 cryptographic root, and only if provenance and exact seed semantics are known.
-A BIP-32 extended key or secp256k1 scalar must not be treated as BIP-39 entropy
-or a SLIP-10 seed.
+A BIP-32 seed, extended key, or secp256k1 scalar must not be treated as BIP-39
+entropy or a SLIP-10 seed.
+
+Class 1 is currently empty in the inspected Signer backend (revision
+`1a1d52376919fff4cb295207e67c54dff60c745d`): it stores either a raw `Bip32Seed`
+fed directly into BIP-32 or a `Secp256k1Scalar`, and neither contains BIP-39
+entropy. Address-preserving conversion of classes 2–5 is not expected: treating
+a raw BIP-32 seed as BIP-39 entropy changes the cryptographic root by
+construction, and reproducing the existing key from a mnemonic and path would
+require a cryptographically infeasible preimage or collision, so standard BIP-39
+derivation yields different addresses at every path.
 
 ### Compatibility behavior
 
@@ -243,11 +312,12 @@ or a SLIP-10 seed.
   lineage remain unchanged.
 - An owner may create a new BIP-39 wallet and move funds explicitly, but Bloom
   does not silently transfer or alias authority.
-- If an exact address-preserving migration is proven possible, it runs as a
-  restart-safe custody ceremony with preflight backup, public-address equality
-  checks, atomic commit, and an idempotent receipt.
-- Solana enablement for a legacy wallet may require explicit wallet upgrade or
-  a new BIP-39 wallet; it must not invent a Bloom-only cross-curve derivation.
+- No transparent, address-preserving migration is planned: because class 1 is
+  empty, every migration to a BIP-39 root changes addresses. The only supported
+  transition is the explicit move-funds workflow above.
+- Solana enablement for a legacy wallet requires a new BIP-39 wallet plus the
+  explicit move-funds workflow; there is no in-place root upgrade, and Bloom
+  must not invent a cross-curve derivation.
 
 ## Work sequence
 
@@ -264,10 +334,11 @@ or a SLIP-10 seed.
    unhardened Ed25519 path, wrong curve/profile, altered path, duplicate
    allocation, tombstone reuse, and missing registry.
 6. Complete the released-wallet inventory and choose explicit behavior for each
-   legacy class.
+   legacy class; confirm class 1 (genuine BIP-39 entropy) is empty.
 
-Gate: all repositories consume identical canonical vectors and the migration
-classification has no unknown wallet format.
+Gate: all repositories consume identical canonical vectors; the migration
+classification has no unknown wallet format and confirms class 1 is empty, so no
+address-preserving migration is planned.
 
 ### Phase 1 — Signer root and derivation primitives
 
@@ -281,8 +352,11 @@ classification has no unknown wallet format.
 6. Extend backup/restore/delete/rekey so the root, credentials, recovery record,
    registry, policies, and audit lineage remain one consistent set.
 
-Gate: vectors, restart, backup/restore, corrupted registry, concurrency,
-cross-profile denial, and zeroization-oriented tests pass.
+Gate: vectors, restart, backup/restore, corrupted registry, cross-profile
+denial, and zeroization-oriented tests pass; crash after `INDEX_COMMITTED` and
+before `ACCOUNT_COMMITTED`, crash during snapshot creation, concurrent
+allocations, operation-ID replay idempotency, and mixed-generation restore
+rejection pass.
 
 ### Phase 2 — Broker ceremonies and edges
 
@@ -310,20 +384,23 @@ all projected children remain byte-for-byte identical after restart and restore.
    or child private keys.
 
 Gate: fresh-install creation, unlock, EVM signing, passkey replacement, export,
-import, recovery, and loss-of-all-factors behavior pass end to end.
+import, recovery, and every row of the loss matrix in Architectural decisions §4
+pass end to end.
 
-### Phase 4 — Legacy migration and compatibility
+### Phase 4 — Legacy compatibility and move-funds
 
 1. Ship legacy profile readers before changing the default.
-2. Add migration preflight/reporting and only the proven address-preserving
-   migrations from the inventory gate.
+2. Add an explicit move-funds workflow (not a migration ceremony); report the
+   empty class-1 inventory and confirm no address-preserving migration exists.
 3. Test old backups, policies, approvals, restart states, and public projections
    against the new binaries.
-4. Add OWS-compatible mnemonic/path import vectors without treating OWS files as
-   Bloom authority.
+4. Add OWS chain-profile-compatible mnemonic/path import vectors without treating
+   OWS files as Bloom authority.
 
 Gate: no released wallet loses access or changes an existing address, and every
-unsupported migration remains usable under an explicit legacy profile.
+legacy wallet remains usable under an explicit legacy profile; move-funds
+produces linked receipts in the old and new wallet lineages without aliasing
+authority.
 
 ### Phase 5 — Release verification
 
@@ -362,6 +439,9 @@ UX.
 - roots cannot sign and callers cannot choose arbitrary derivation paths;
 - mnemonic import/export/recovery occur only through explicit custody
   ceremonies and never expose secrets to Machine or Petals;
+- portable key recovery (mnemonic) and wallet recovery (recovery factor) are
+  distinct, documented products matching the loss matrix in Architectural
+  decisions §4;
 - backup/restore includes the complete derivation and recovery authority set;
 - existing wallets preserve their addresses and remain usable;
 - a released and pinned Ed25519 child edge unblocks bloom#156.
@@ -371,6 +451,7 @@ UX.
 - [Triad process architecture](../specs/2026-07-23-triad-process-architecture.md)
 - [Wallet architecture](../architecture/Wallet.md)
 - [Open Wallet Standard core](https://github.com/open-wallet-standard/core)
+- [Open Wallet Standard conformance targets](https://github.com/open-wallet-standard/core/blob/main/docs/00-specification.md#conformance-targets)
 - [BIP-39](https://github.com/bitcoin/bips/blob/master/bip-0039.mediawiki)
 - [BIP-32](https://github.com/bitcoin/bips/blob/master/bip-0032.mediawiki)
 - [BIP-44](https://github.com/bitcoin/bips/blob/master/bip-0044.mediawiki)
