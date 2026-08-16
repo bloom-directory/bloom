@@ -20,7 +20,12 @@ def parser() -> argparse.ArgumentParser:
         choices=("hyperliquid-order-cancel",),
         help="host-side evaluation definition",
     )
-    value.add_argument("agent", choices=("claude", "codex"))
+    value.add_argument("agent", nargs="?", choices=("claude", "codex"))
+    value.add_argument(
+        "--preauthorization-only",
+        action="store_true",
+        help="verify package ownership and active lineage without inspecting wallet policy",
+    )
     return value
 
 
@@ -32,8 +37,19 @@ def main(argv: list[str] | None = None) -> int:
     definitions = {
         "hyperliquid-order-cancel": lambda: HyperliquidOrderCancelEval(repo_root)
     }
+    definition = definitions[args.eval]()
     try:
-        run_eval(definitions[args.eval](), args.agent)
+        if args.preauthorization_only:
+            if args.agent is not None:
+                raise EvalError(
+                    "--preauthorization-only does not accept an agent argument"
+                )
+            definition.preauthorization_preflight()
+            print("Bloom Harbor preauthorization: active Petal lineage verified")
+        else:
+            if args.agent is None:
+                raise EvalError("an agent is required unless --preauthorization-only is set")
+            run_eval(definition, args.agent)
     except (EvalError, KeyboardInterrupt) as error:
         print(f"Bloom Harbor eval: {error}", file=sys.stderr)
         return 1

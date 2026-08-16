@@ -120,6 +120,59 @@ class HyperliquidDefinitionTests(unittest.TestCase):
             json.dumps({"name": "hyperliquid", "hash": self.package_hash})
         )
         self.owner_record.chmod(0o644)
+        self.petal_store = self.root / "petal-store"
+        route_dir = self.petal_store / "packages" / self.package_hash
+        route_dir.mkdir(parents=True)
+        self.route_index = route_dir / "route-index.json"
+        self.route_index.write_text(
+            json.dumps(
+                {
+                    "schema": "bloom.petal.route-index.v1",
+                    "routes": [
+                        {
+                            "route_id": "r000021",
+                            "pattern": "[network]/agent_sessions/[wallet]/new.json",
+                            "install_metadata": {
+                                "required_caps": [
+                                    "bloom:http",
+                                    "bloom:key.derive",
+                                    "bloom:sign",
+                                    "bloom:store",
+                                ],
+                                "sign_intent": "hyperliquid.approve_agent",
+                            },
+                        }
+                    ],
+                }
+            )
+        )
+        self.route_index.chmod(0o644)
+        self.provenance_catalog = self.root / "provenance-catalog.json"
+        self.provenance_catalog.write_text(
+            json.dumps(
+                {
+                    "schema": "bloom.provenance-catalog.1",
+                    "records": [
+                        {
+                            "subject": {
+                                "kind": "petal",
+                                "package_hash": self.package_hash,
+                                "route": "r000021",
+                            },
+                            "petal_lineage": {
+                                "lineage_id": "pln1_" + "a" * 52,
+                                "release_sequence": "1",
+                                "predecessor_package_hashes": [],
+                                "controller_key_id": "developer-controller",
+                                "controller_signature": "AQ",
+                                "active": True,
+                            },
+                        }
+                    ],
+                }
+            )
+        )
+        self.provenance_catalog.chmod(0o600)
         self.seed = self.root / "seed"
         self.seed.write_text("seed")
         self.seed.chmod(0o600)
@@ -128,6 +181,8 @@ class HyperliquidDefinitionTests(unittest.TestCase):
             "BLOOM_EVAL_WALLET_ID": self.wallet_id,
             "BLOOM_EVAL_HYPERLIQUID_PACKAGE_HASH": self.package_hash,
             "BLOOM_EVAL_PETAL_OWNER_RECORD": str(self.owner_record),
+            "BLOOM_EVAL_PETAL_STORE": str(self.petal_store),
+            "BLOOM_EVAL_PROVENANCE_CATALOG": str(self.provenance_catalog),
             "BLOOM_EVAL_MAINNET_ACK": MAINNET_ACK,
             "BLOOM_EVAL_AUTHENTICATOR_SEED_FILE": str(self.seed),
             "BLOOM_EVAL_AUTHENTICATOR_SIGN_COUNT": "4",
@@ -254,6 +309,32 @@ class HyperliquidDefinitionTests(unittest.TestCase):
             EvalError, "does not match the installed owner record"
         ):
             self.definition._require_installed_package_hash()
+
+    def test_active_installed_lineage_satisfies_preauthorization_gate(self) -> None:
+        self.definition.preauthorization_preflight()
+
+    def test_preauthorization_rejects_missing_installed_lineage(self) -> None:
+        catalog = json.loads(self.provenance_catalog.read_text())
+        catalog["records"] = []
+        self.provenance_catalog.write_text(json.dumps(catalog))
+        with self.assertRaisesRegex(
+            EvalError, "has no installer-provenance record"
+        ):
+            self.definition.preauthorization_preflight()
+
+    def test_preauthorization_rejects_inactive_installed_lineage(self) -> None:
+        catalog = json.loads(self.provenance_catalog.read_text())
+        catalog["records"][0]["petal_lineage"]["active"] = False
+        self.provenance_catalog.write_text(json.dumps(catalog))
+        with self.assertRaisesRegex(EvalError, "does not have active Petal lineage"):
+            self.definition.preauthorization_preflight()
+
+    def test_preauthorization_does_not_require_or_inspect_temporary_policy(self) -> None:
+        self.definition._require_exact_wallet_policy = mock.Mock(
+            side_effect=AssertionError("temporary policy must remain unopened")
+        )
+        self.definition.preauthorization_preflight()
+        self.definition._require_exact_wallet_policy.assert_not_called()
 
     def test_pending_key_ceremony_is_resolved_from_exact_owner_projection(self) -> None:
         ceremony = "http://localhost:18734/ceremony/" + "A" * 43

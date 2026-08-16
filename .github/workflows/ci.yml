@@ -8,6 +8,7 @@ on:
       - "Cargo.lock"
       - "rust-toolchain.toml"
       - "crates/**"
+      - "evals/harbor/**"
       - "packaging/**"
       - "scripts/**"
       - "tests/**"
@@ -37,6 +38,15 @@ jobs:
         run: rustup show
       - name: Check formatting
         run: cargo fmt --all -- --check
+
+  harbor_eval_static:
+    name: Harbor eval static checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v7
+      - name: Validate bounded Harbor harness
+        run: scripts/test-harbor-evals.sh
 
   clippy:
     name: clippy
