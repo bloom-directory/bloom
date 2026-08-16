@@ -14,7 +14,10 @@ use bloom_broker_api::{
     Base64UrlBytes, PROVENANCE_RECORD_SIGNATURE_DOMAIN, ProvenanceCatalog, Token,
 };
 #[cfg(feature = "triad-dev-harness")]
-use bloom_broker_api::{ProvenanceOperationClass, ProvenanceRecord, ProvenanceSubject};
+use bloom_broker_api::{
+    DecimalU64, Digest32, PetalLineageMembership, ProvenanceOperationClass, ProvenanceRecord,
+    ProvenanceSubject,
+};
 #[cfg(feature = "triad-dev-harness")]
 use bloom_petals::package::PreparedPetalPackage;
 use ed25519_dalek::{Signer as _, SigningKey};
@@ -103,6 +106,92 @@ fn validate_developer_caller(uid: u32, os: &str) -> Result<()> {
 }
 
 #[cfg(feature = "triad-dev-harness")]
+const DEVELOPER_PETAL_LINEAGE_DOMAIN: &[u8] = b"bloom-developer-petal-lineage/v1";
+
+#[cfg(feature = "triad-dev-harness")]
+#[derive(Serialize)]
+struct DeveloperPetalLineageStatement<'a> {
+    schema: &'static str,
+    lineage_id: &'a str,
+    package_hash: &'a Digest32,
+    release_sequence: DecimalU64,
+    predecessor_package_hashes: &'a [Digest32],
+    controller_key_id: &'a Token,
+    publisher: &'a Token,
+    active: bool,
+}
+
+#[cfg(feature = "triad-dev-harness")]
+struct DeveloperPetalLineageInput<'a> {
+    lineage_id: &'a str,
+    package_hash: &'a Digest32,
+    release_sequence: u64,
+    predecessor_package_hashes: Vec<Digest32>,
+    controller_key_id: &'a Token,
+    publisher: &'a Token,
+    active: bool,
+}
+
+#[cfg(feature = "triad-dev-harness")]
+fn base32_lower_no_pad(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
+    let mut output = String::with_capacity(bytes.len().div_ceil(5) * 8);
+    let mut accumulator = 0_u32;
+    let mut bits = 0_u8;
+    for byte in bytes {
+        accumulator = (accumulator << 8) | u32::from(*byte);
+        bits += 8;
+        while bits >= 5 {
+            bits -= 5;
+            output.push(ALPHABET[((accumulator >> bits) & 0x1f) as usize] as char);
+        }
+    }
+    if bits != 0 {
+        output.push(ALPHABET[((accumulator << (5 - bits)) & 0x1f) as usize] as char);
+    }
+    output
+}
+
+#[cfg(feature = "triad-dev-harness")]
+fn developer_petal_lineage_id(publisher: &Token, package_name: &str) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(DEVELOPER_PETAL_LINEAGE_DOMAIN);
+    hasher.update(&[0]);
+    hasher.update(publisher.as_str().as_bytes());
+    hasher.update(&[0]);
+    hasher.update(package_name.as_bytes());
+    format!("pln1_{}", base32_lower_no_pad(hasher.finalize().as_bytes()))
+}
+
+#[cfg(feature = "triad-dev-harness")]
+fn sign_developer_petal_lineage(
+    signing_key: &SigningKey,
+    input: DeveloperPetalLineageInput<'_>,
+) -> Result<PetalLineageMembership> {
+    let mut message = DEVELOPER_PETAL_LINEAGE_DOMAIN.to_vec();
+    message.extend_from_slice(&serde_jcs::to_vec(&DeveloperPetalLineageStatement {
+        schema: "bloom.developer-petal-lineage.1",
+        lineage_id: input.lineage_id,
+        package_hash: input.package_hash,
+        release_sequence: DecimalU64::new(input.release_sequence),
+        predecessor_package_hashes: &input.predecessor_package_hashes,
+        controller_key_id: input.controller_key_id,
+        publisher: input.publisher,
+        active: input.active,
+    })?);
+    let controller_signature = Base64UrlBytes::from_bytes(&signing_key.sign(&message).to_bytes());
+    message.zeroize();
+    Ok(PetalLineageMembership {
+        lineage_id: input.lineage_id.to_owned(),
+        release_sequence: DecimalU64::new(input.release_sequence),
+        predecessor_package_hashes: input.predecessor_package_hashes,
+        controller_key_id: input.controller_key_id.clone(),
+        controller_signature,
+        active: input.active,
+    })
+}
+
+#[cfg(feature = "triad-dev-harness")]
 fn enroll_developer_petal_provenance(
     config_dir: &Path,
     petal_dir: &Path,
@@ -144,7 +233,100 @@ fn enroll_developer_petal_provenance(
     let package = PreparedPetalPackage::from_dir(petal_dir)
         .map_err(|error| anyhow::anyhow!("prepare developer Petal package: {error}"))?;
     let publisher = Token::new("bloom-developer-local-package")?;
-    let package_hash = bloom_broker_api::Digest32::new(package.hash.clone())?;
+    let package_hash = Digest32::new(package.hash.clone())?;
+    let lineage_id = developer_petal_lineage_id(&publisher, &package.name);
+    let catalog_path = config_dir.join("provenance-catalog.json");
+    let mut catalog: ProvenanceCatalog =
+        serde_json::from_slice(&fs::read(&catalog_path)?).context("parse provenance catalog")?;
+    catalog.validate_shape()?;
+
+    let mut current_membership: Option<PetalLineageMembership> = None;
+    let mut maximum_release_sequence = 0_u64;
+    let mut active_predecessors = Vec::new();
+    for record in &catalog.records {
+        let (
+            ProvenanceSubject::Petal {
+                package_hash: existing,
+                ..
+            },
+            Some(membership),
+        ) = (&record.subject, &record.petal_lineage)
+        else {
+            continue;
+        };
+        if membership.lineage_id != lineage_id {
+            continue;
+        }
+        if membership.controller_key_id != installer_key_id {
+            bail!("developer Petal lineage is controlled by a different signing key");
+        }
+        maximum_release_sequence = maximum_release_sequence.max(membership.release_sequence.get());
+        if existing == &package_hash {
+            if current_membership
+                .as_ref()
+                .is_some_and(|current| current != membership)
+            {
+                bail!("developer Petal package has inconsistent lineage memberships");
+            }
+            current_membership = Some(membership.clone());
+        } else if membership.active && !active_predecessors.contains(existing) {
+            active_predecessors.push(existing.clone());
+        }
+    }
+    active_predecessors.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+
+    let lineage = if let Some(current) = current_membership {
+        if !current.active {
+            bail!("developer enrollment refuses to reactivate an inactive Petal package");
+        }
+        if !active_predecessors.is_empty() {
+            bail!("developer Petal lineage has a conflicting active package");
+        }
+        current
+    } else {
+        let release_sequence = maximum_release_sequence
+            .checked_add(1)
+            .context("developer Petal lineage release sequence overflow")?;
+        for record in &mut catalog.records {
+            let ProvenanceSubject::Petal {
+                package_hash: existing,
+                ..
+            } = &record.subject
+            else {
+                continue;
+            };
+            let Some(membership) = &record.petal_lineage else {
+                continue;
+            };
+            if membership.lineage_id == lineage_id && membership.active {
+                record.petal_lineage = Some(sign_developer_petal_lineage(
+                    &signing_key,
+                    DeveloperPetalLineageInput {
+                        lineage_id: &lineage_id,
+                        package_hash: existing,
+                        release_sequence: membership.release_sequence.get(),
+                        predecessor_package_hashes: membership.predecessor_package_hashes.clone(),
+                        controller_key_id: &installer_key_id,
+                        publisher: &record.publisher,
+                        active: false,
+                    },
+                )?);
+            }
+        }
+        sign_developer_petal_lineage(
+            &signing_key,
+            DeveloperPetalLineageInput {
+                lineage_id: &lineage_id,
+                package_hash: &package_hash,
+                release_sequence,
+                predecessor_package_hashes: active_predecessors,
+                controller_key_id: &installer_key_id,
+                publisher: &publisher,
+                active: true,
+            },
+        )?
+    };
+
     let mut additions = Vec::new();
     for route in &package.route_index.routes {
         let Some(intent) = route.install_metadata.sign_intent.as_deref() else {
@@ -160,7 +342,7 @@ fn enroll_developer_petal_provenance(
                 operation_class: Token::new(intent.to_owned())?,
                 fee_asset: None,
             }],
-            petal_lineage: None,
+            petal_lineage: Some(lineage.clone()),
             installer_key_id: installer_key_id.clone(),
             installer_signature: Base64UrlBytes::from_bytes(&[]),
         });
@@ -172,9 +354,6 @@ fn enroll_developer_petal_provenance(
         );
     }
 
-    let catalog_path = config_dir.join("provenance-catalog.json");
-    let mut catalog: ProvenanceCatalog =
-        serde_json::from_slice(&fs::read(&catalog_path)?).context("parse provenance catalog")?;
     catalog.records.retain(|record| {
         !matches!(
             &record.subject,
@@ -831,6 +1010,115 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "triad-dev-harness")]
+    #[test]
+    fn enrolled_linux_petal_satisfies_the_machine_active_lineage_gate() {
+        validate_developer_caller(1000, "linux").unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("config");
+        fs::create_dir(&output).unwrap();
+        fs::set_permissions(&output, fs::Permissions::from_mode(0o700)).unwrap();
+        let owner = rustix::process::geteuid().as_raw();
+        let plan = EnrollmentPlan {
+            template_dir: template_dir(),
+            output_dir: output.clone(),
+            login_uid: 1_001,
+            broker_uid: 1_002,
+            signer_uid: 1_003,
+            session_socket_gid: 1_004,
+            release_digest: "44".repeat(32),
+        };
+        generate_for_owner(&plan, owner).unwrap();
+        let petal_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .unwrap()
+            .join("tests/fixtures/triad-authority-petal");
+        let package = PreparedPetalPackage::from_dir(&petal_dir).unwrap();
+
+        enroll_developer_petal_provenance(&output, &petal_dir, owner).unwrap();
+        let first: ProvenanceCatalog =
+            serde_json::from_slice(&fs::read(output.join("provenance-catalog.json")).unwrap())
+                .unwrap();
+        first.validate_shape().unwrap();
+        let records = first
+            .records
+            .iter()
+            .filter(|record| {
+                matches!(
+                    &record.subject,
+                    ProvenanceSubject::Petal { package_hash, .. }
+                        if package_hash.as_str() == package.hash
+                )
+            })
+            .collect::<Vec<_>>();
+        assert!(!records.is_empty());
+        let membership = records[0].petal_lineage.as_ref().unwrap();
+        assert!(membership.active);
+        assert_eq!(membership.release_sequence.get(), 1);
+        assert!(membership.predecessor_package_hashes.is_empty());
+        assert!(!membership.controller_signature.decode().is_empty());
+        assert!(records.iter().all(|record| {
+            record
+                .petal_lineage
+                .as_ref()
+                .filter(|value| value.active)
+                .is_some()
+        }));
+        assert!(
+            records
+                .iter()
+                .all(|record| record.petal_lineage.as_ref() == Some(membership))
+        );
+        let installer: serde_json::Value =
+            serde_json::from_slice(&fs::read(output.join("installer-identity.json")).unwrap())
+                .unwrap();
+        let public: [u8; 32] = hex::decode(installer["public_key_hex"].as_str().unwrap())
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let verifier = VerifyingKey::from_bytes(&public).unwrap();
+        let ProvenanceSubject::Petal { package_hash, .. } = &records[0].subject else {
+            unreachable!();
+        };
+        let mut controller_message = DEVELOPER_PETAL_LINEAGE_DOMAIN.to_vec();
+        controller_message.extend_from_slice(
+            &serde_jcs::to_vec(&DeveloperPetalLineageStatement {
+                schema: "bloom.developer-petal-lineage.1",
+                lineage_id: &membership.lineage_id,
+                package_hash,
+                release_sequence: membership.release_sequence.clone(),
+                predecessor_package_hashes: &membership.predecessor_package_hashes,
+                controller_key_id: &membership.controller_key_id,
+                publisher: &records[0].publisher,
+                active: membership.active,
+            })
+            .unwrap(),
+        );
+        let signature: [u8; 64] = membership.controller_signature.decode().try_into().unwrap();
+        verifier
+            .verify(&controller_message, &Signature::from_bytes(&signature))
+            .unwrap();
+
+        enroll_developer_petal_provenance(&output, &petal_dir, owner).unwrap();
+        let second: ProvenanceCatalog =
+            serde_json::from_slice(&fs::read(output.join("provenance-catalog.json")).unwrap())
+                .unwrap();
+        let second_membership = second
+            .records
+            .iter()
+            .find_map(|record| match &record.subject {
+                ProvenanceSubject::Petal { package_hash, .. }
+                    if package_hash.as_str() == package.hash =>
+                {
+                    record.petal_lineage.as_ref()
+                }
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(second_membership, membership);
+    }
+
     #[test]
     fn generated_material_is_fresh_cross_pinned_and_provenance_signed() {
         let directory = tempfile::tempdir().unwrap();
@@ -942,10 +1230,10 @@ mod tests {
         let plan = EnrollmentPlan {
             template_dir: template_dir(),
             output_dir: output.clone(),
-            login_uid: uid,
-            broker_uid: uid,
-            signer_uid: uid,
-            session_socket_gid: rustix::process::getegid().as_raw(),
+            login_uid: 1_001,
+            broker_uid: 1_002,
+            signer_uid: 1_003,
+            session_socket_gid: 1_004,
             release_digest: "33".repeat(32),
         };
         generate_for_owner(&plan, uid).unwrap();

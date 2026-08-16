@@ -23,6 +23,9 @@ CEREMONY_URL = re.compile(r"http://localhost:18734/ceremony/[A-Za-z0-9_-]{43}")
 WALLET = re.compile(r"0x[0-9a-f]{40}")
 WALLET_ID = re.compile(r"[a-z0-9][a-z0-9-]{0,62}")
 PACKAGE_HASH = re.compile(r"[0-9a-f]{64}")
+LINEAGE_ID = re.compile(r"pln1_[a-z2-7]{52}")
+BASE64URL = re.compile(r"[A-Za-z0-9_-]+")
+HYPERLIQUID_SESSION_ROUTE = "[network]/agent_sessions/[wallet]/new.json"
 ACTION_FILES = ("order.json", "cancel.json", "update_leverage.json", "cancel_all")
 
 
@@ -44,6 +47,12 @@ class HyperliquidOrderCancelEval(EvalDefinition):
         self.package_hash = self.env.get("BLOOM_EVAL_HYPERLIQUID_PACKAGE_HASH", "")
         self.owner_record_value = self.env.get("BLOOM_EVAL_PETAL_OWNER_RECORD", "")
         self.owner_record = Path(self.owner_record_value)
+        self.petal_store_value = self.env.get("BLOOM_EVAL_PETAL_STORE", "")
+        self.petal_store = Path(self.petal_store_value)
+        self.provenance_catalog_value = self.env.get(
+            "BLOOM_EVAL_PROVENANCE_CATALOG", ""
+        )
+        self.provenance_catalog = Path(self.provenance_catalog_value)
         self.bloom_mount = Path(self.env.get("BLOOM_EVAL_BLOOM_MOUNT", "/bloom"))
         self.driver = Path(
             self.env.get(
@@ -222,6 +231,132 @@ class HyperliquidOrderCancelEval(EvalDefinition):
                 "configured Hyperliquid BLAKE3 does not match the installed owner record"
             )
 
+    def _read_local_json(self, path: Path, label: str) -> Any:
+        try:
+            metadata = path.lstat()
+        except OSError as error:
+            raise EvalError(f"{label} is unavailable: {error}") from error
+        if not stat.S_ISREG(metadata.st_mode) or path.is_symlink():
+            raise EvalError(f"{label} must be a regular non-symlink file")
+        if stat.S_IMODE(metadata.st_mode) & 0o022:
+            raise EvalError(f"{label} must not be group/other writable")
+        if metadata.st_size > 8 * 1024 * 1024:
+            raise EvalError(f"{label} exceeds the 8 MiB inspection limit")
+        try:
+            return json.loads(path.read_bytes())
+        except (OSError, json.JSONDecodeError) as error:
+            raise EvalError(f"{label} is invalid: {error}") from error
+
+    def _require_active_petal_lineage(self) -> None:
+        if not self.petal_store_value:
+            raise EvalError("BLOOM_EVAL_PETAL_STORE is required")
+        if not self.provenance_catalog_value:
+            raise EvalError("BLOOM_EVAL_PROVENANCE_CATALOG is required")
+        route_index = self._read_local_json(
+            self.petal_store / "packages" / self.package_hash / "route-index.json",
+            "installed Hyperliquid route index",
+        )
+        routes = route_index.get("routes") if isinstance(route_index, dict) else None
+        if (
+            not isinstance(route_index, dict)
+            or route_index.get("schema") != "bloom.petal.route-index.v1"
+            or not isinstance(routes, list)
+        ):
+            raise EvalError("installed Hyperliquid route index has an unsupported shape")
+        matches = [
+            route
+            for route in routes
+            if isinstance(route, dict)
+            and route.get("pattern") == HYPERLIQUID_SESSION_ROUTE
+        ]
+        if len(matches) != 1:
+            raise EvalError(
+                "installed Hyperliquid package must contain exactly one agent-session route"
+            )
+        route = matches[0]
+        route_id = route.get("route_id")
+        metadata = route.get("install_metadata")
+        required_caps = metadata.get("required_caps") if isinstance(metadata, dict) else None
+        if (
+            not isinstance(route_id, str)
+            or re.fullmatch(r"r[0-9]{6}", route_id) is None
+            or not isinstance(metadata, dict)
+            or metadata.get("sign_intent") != "hyperliquid.approve_agent"
+            or not isinstance(required_caps, list)
+            or any(not isinstance(capability, str) for capability in required_caps)
+            or not {"bloom:key.derive", "bloom:sign"}.issubset(set(required_caps))
+        ):
+            raise EvalError(
+                "installed Hyperliquid agent-session route lacks its exact custody bindings"
+            )
+
+        catalog = self._read_local_json(
+            self.provenance_catalog, "Machine provenance catalog"
+        )
+        records = catalog.get("records") if isinstance(catalog, dict) else None
+        if (
+            not isinstance(catalog, dict)
+            or catalog.get("schema") != "bloom.provenance-catalog.1"
+            or not isinstance(records, list)
+        ):
+            raise EvalError("Machine provenance catalog has an unsupported shape")
+        matching_records = [
+            record
+            for record in records
+            if isinstance(record, dict)
+            and record.get("subject")
+            == {
+                "kind": "petal",
+                "package_hash": self.package_hash,
+                "route": route_id,
+            }
+        ]
+        if not matching_records:
+            raise EvalError(
+                "installed Hyperliquid agent-session route has no installer-provenance record"
+            )
+        if len(matching_records) != 1:
+            raise EvalError(
+                "installed Hyperliquid agent-session route has duplicate provenance records"
+            )
+        lineage = matching_records[0].get("petal_lineage")
+        if not isinstance(lineage, dict) or lineage.get("active") is not True:
+            raise EvalError(
+                "installed Hyperliquid agent-session route does not have active Petal lineage"
+            )
+        release_sequence = lineage.get("release_sequence")
+        if isinstance(release_sequence, str):
+            release_sequence_valid = (
+                re.fullmatch(r"[1-9][0-9]*", release_sequence) is not None
+                and len(release_sequence) <= 20
+                and int(release_sequence) <= 0xFFFF_FFFF_FFFF_FFFF
+            )
+        else:
+            release_sequence_valid = (
+                isinstance(release_sequence, int)
+                and not isinstance(release_sequence, bool)
+                and 0 < release_sequence <= 0xFFFF_FFFF_FFFF_FFFF
+            )
+        if (
+            not isinstance(lineage.get("lineage_id"), str)
+            or LINEAGE_ID.fullmatch(lineage["lineage_id"]) is None
+            or not release_sequence_valid
+            or not isinstance(lineage.get("controller_key_id"), str)
+            or not isinstance(lineage.get("controller_signature"), str)
+            or BASE64URL.fullmatch(lineage["controller_signature"]) is None
+        ):
+            raise EvalError(
+                "installed Hyperliquid agent-session route has malformed Petal lineage"
+            )
+
+    def preauthorization_preflight(self) -> None:
+        if not PACKAGE_HASH.fullmatch(self.package_hash):
+            raise EvalError(
+                "BLOOM_EVAL_HYPERLIQUID_PACKAGE_HASH must be a lowercase BLAKE3"
+            )
+        self._require_installed_package_hash()
+        self._require_active_petal_lineage()
+
     def _require_exact_wallet_policy(self) -> None:
         if not WALLET_ID.fullmatch(self.wallet_id):
             raise EvalError("BLOOM_EVAL_WALLET_ID must be a lowercase wallet ID")
@@ -358,7 +493,7 @@ class HyperliquidOrderCancelEval(EvalDefinition):
         ):
             if not (self.network_root / relative).exists():
                 raise EvalError(label)
-        self._require_installed_package_hash()
+        self.preauthorization_preflight()
         self._require_exact_wallet_policy()
         try:
             subprocess.run(
