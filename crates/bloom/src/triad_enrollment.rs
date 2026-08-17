@@ -329,19 +329,17 @@ fn enroll_developer_petal_provenance(
 
     let mut additions = Vec::new();
     for route in &package.route_index.routes {
-        let Some(intent) = route.install_metadata.sign_intent.as_deref() else {
+        let operation_classes = developer_route_operation_classes(route)?;
+        if operation_classes.is_empty() {
             continue;
-        };
+        }
         additions.push(ProvenanceRecord {
             subject: ProvenanceSubject::Petal {
                 package_hash: package_hash.clone(),
                 route: route.route_id.clone(),
             },
             publisher: publisher.clone(),
-            operation_classes: vec![ProvenanceOperationClass {
-                operation_class: Token::new(intent.to_owned())?,
-                fee_asset: None,
-            }],
+            operation_classes,
             petal_lineage: Some(lineage.clone()),
             installer_key_id: installer_key_id.clone(),
             installer_signature: Base64UrlBytes::from_bytes(&[]),
@@ -349,7 +347,7 @@ fn enroll_developer_petal_provenance(
     }
     if additions.is_empty() {
         bail!(
-            "developer Petal {} imports signing but declares no route sign intents",
+            "developer Petal {} declares no route provenance operation classes",
             package.name
         );
     }
@@ -374,6 +372,29 @@ fn enroll_developer_petal_provenance(
     catalog.validate_shape()?;
     rewrite_private_json(&catalog_path, &serde_json::to_value(catalog)?)?;
     Ok(())
+}
+
+#[cfg(feature = "triad-dev-harness")]
+fn developer_route_operation_classes(
+    route: &bloom_petals::package::RouteIndexRecord,
+) -> Result<Vec<ProvenanceOperationClass>> {
+    let mut classes = route
+        .key_derive_operation_classes
+        .iter()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    if let Some(intent) = &route.install_metadata.sign_intent {
+        classes.insert(intent.clone());
+    }
+    classes
+        .into_iter()
+        .map(|operation_class| {
+            Ok(ProvenanceOperationClass {
+                operation_class: Token::new(operation_class)?,
+                fee_asset: None,
+            })
+        })
+        .collect()
 }
 
 #[cfg(feature = "triad-dev-harness")]
@@ -1012,6 +1033,44 @@ mod tests {
 
     #[cfg(feature = "triad-dev-harness")]
     #[test]
+    fn developer_route_provenance_unions_only_immediate_and_explicit_classes() {
+        let route = bloom_petals::package::RouteIndexRecord {
+            route_id: "r000001".into(),
+            pattern: "session.json".into(),
+            source_path: "petal/fixture/session.json.wasm".into(),
+            artifact_path: "artifacts/routes/r000001.wasm".into(),
+            artifact_hash: "00".repeat(32),
+            abi: bloom_petals::package::RouteAbi::ComponentBloomRoute010,
+            kind: bloom_petals::package::RouteEntryKind::File,
+            ops: vec![bloom_petals::package::RouteOp::Read],
+            params: Vec::new(),
+            specificity: [1, 1, 1],
+            install_metadata: bloom_petals::package::InstallRouteMetadata {
+                mode: 0o444,
+                cache_ttl_ms: None,
+                side_effecting_read: false,
+                write_async: false,
+                executable: false,
+                required_caps: vec!["bloom:key.derive".into(), "bloom:sign".into()],
+                sign_intent: Some("fixture.immediate".into()),
+            },
+            key_derive_operation_classes: vec![
+                "fixture.delegated".into(),
+                "fixture.immediate".into(),
+            ],
+        };
+
+        let classes = developer_route_operation_classes(&route)
+            .unwrap()
+            .into_iter()
+            .map(|class| class.operation_class.to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(classes, ["fixture.delegated", "fixture.immediate"]);
+        assert!(!classes.contains(&"fixture.package_wide".to_string()));
+    }
+
+    #[cfg(feature = "triad-dev-harness")]
+    #[test]
     fn enrolled_linux_petal_satisfies_the_machine_active_lineage_gate() {
         validate_developer_caller(1000, "linux").unwrap();
         let directory = tempfile::tempdir().unwrap();
@@ -1070,6 +1129,14 @@ mod tests {
                 .iter()
                 .all(|record| record.petal_lineage.as_ref() == Some(membership))
         );
+        assert_eq!(records.len(), 1);
+        let operation_classes = records[0]
+            .operation_classes
+            .iter()
+            .map(|class| class.operation_class.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(operation_classes, ["fixture.payload"]);
+        assert!(!operation_classes.contains(&"fixture.unrelated"));
         let installer: serde_json::Value =
             serde_json::from_slice(&fs::read(output.join("installer-identity.json")).unwrap())
                 .unwrap();
@@ -1078,6 +1145,14 @@ mod tests {
             .try_into()
             .unwrap();
         let verifier = VerifyingKey::from_bytes(&public).unwrap();
+        for record in &records {
+            let signature: [u8; 64] = record.installer_signature.decode().try_into().unwrap();
+            let mut message = PROVENANCE_RECORD_SIGNATURE_DOMAIN.to_vec();
+            message.extend_from_slice(&record.unsigned_canonical_bytes().unwrap());
+            verifier
+                .verify(&message, &Signature::from_bytes(&signature))
+                .unwrap();
+        }
         let ProvenanceSubject::Petal { package_hash, .. } = &records[0].subject else {
             unreachable!();
         };

@@ -88,6 +88,8 @@ struct PetalToml {
     #[serde(default)]
     sign: SignPolicy,
     #[serde(default)]
+    key: KeyPolicyToml,
+    #[serde(default)]
     store: StorePolicyToml,
     #[serde(default, rename = "source")]
     _source: Option<SourcePolicyToml>,
@@ -132,6 +134,20 @@ struct NetAllowToml {
 struct SignPolicy {
     #[serde(default)]
     allowed_intents: Vec<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct KeyPolicyToml {
+    #[serde(default, rename = "derive")]
+    derive_routes: Vec<KeyDerivePolicyToml>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct KeyDerivePolicyToml {
+    route: String,
+    operation_classes: Vec<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -316,6 +332,8 @@ pub struct RouteIndexRecord {
     pub params: Vec<String>,
     pub specificity: [usize; 3],
     pub install_metadata: InstallRouteMetadata,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub key_derive_operation_classes: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -470,6 +488,8 @@ impl PreparedPetalPackage {
                 manifest.name
             )));
         }
+        let key_derive_operation_classes =
+            validate_key_derive_policy(&manifest.key, &route_files, &allowed_sign_intents)?;
         let policy_hash = hex::encode(blake3::hash(manifest_bytes).as_bytes());
         let mut route_index = RouteIndex {
             schema: ROUTE_INDEX_SCHEMA.to_string(),
@@ -555,6 +575,21 @@ impl PreparedPetalPackage {
                 }
                 source_validation
             };
+            let route_key_derive_operation_classes = key_derive_operation_classes
+                .get(&route.pattern)
+                .cloned()
+                .unwrap_or_default();
+            if !route_key_derive_operation_classes.is_empty()
+                && !validation
+                    .required_caps
+                    .iter()
+                    .any(|cap| cap == "bloom:key.derive")
+            {
+                return Err(PetalError::InvalidWasm(format!(
+                    "Petal [[key.derive]] route {:?} does not import bloom:key.derive",
+                    route.pattern
+                )));
+            }
             let (kind, mut ops) = route_kind_and_ops(&source_path);
             if let Some(sidecar) = &sidecar
                 && !sidecar.ops.is_empty()
@@ -599,6 +634,7 @@ impl PreparedPetalPackage {
                 params: route.params,
                 specificity: route.specificity.as_array(),
                 install_metadata,
+                key_derive_operation_classes: route_key_derive_operation_classes,
             });
         }
 
@@ -3809,6 +3845,58 @@ fn validate_sign_policy(
     Ok(())
 }
 
+fn validate_key_derive_policy(
+    policy: &KeyPolicyToml,
+    routes: &[RouteRecord],
+    allowed_sign_intents: &BTreeSet<String>,
+) -> Result<BTreeMap<String, Vec<String>>, PetalError> {
+    let route_patterns = routes
+        .iter()
+        .map(|route| route.pattern.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut declarations = BTreeMap::new();
+    for declaration in &policy.derive_routes {
+        if !route_patterns.contains(declaration.route.as_str()) {
+            return Err(PetalError::InvalidWasm(format!(
+                "Petal [[key.derive]] declares unknown route {:?}",
+                declaration.route
+            )));
+        }
+        if declaration.operation_classes.is_empty() {
+            return Err(PetalError::InvalidWasm(format!(
+                "Petal [[key.derive]] route {:?} operation_classes must be non-empty",
+                declaration.route
+            )));
+        }
+
+        let mut classes = BTreeSet::new();
+        for operation_class in &declaration.operation_classes {
+            validate_sign_intent(operation_class)?;
+            if !allowed_sign_intents.contains(operation_class) {
+                return Err(PetalError::InvalidWasm(format!(
+                    "Petal [[key.derive]] operation class {operation_class:?} is not declared in [sign].allowed_intents"
+                )));
+            }
+            if !classes.insert(operation_class.clone()) {
+                return Err(PetalError::InvalidWasm(format!(
+                    "Petal [[key.derive]] route {:?} has duplicate operation class {operation_class:?}",
+                    declaration.route
+                )));
+            }
+        }
+        if declarations
+            .insert(declaration.route.clone(), classes.into_iter().collect())
+            .is_some()
+        {
+            return Err(PetalError::InvalidWasm(format!(
+                "Petal [[key.derive]] has a duplicate declaration for route {:?}",
+                declaration.route
+            )));
+        }
+    }
+    Ok(declarations)
+}
+
 fn store_policy_from_manifest(manifest: &PetalToml) -> StoreNamespacePolicy {
     StoreNamespacePolicy::from_namespaces(
         manifest.store.namespaces.iter().cloned(),
@@ -5675,6 +5763,7 @@ name = "echo"
                 required_caps: vec!["bloom:http".into(), "bloom:store".into()],
                 sign_intent: None,
             },
+            key_derive_operation_classes: Vec::new(),
         };
         let metadata = ComponentRouteMetadata {
             kind: ComponentRouteEntryKind::File,
@@ -5715,6 +5804,7 @@ name = "echo"
                 required_caps: vec!["bloom:store".into()],
                 sign_intent: None,
             },
+            key_derive_operation_classes: Vec::new(),
         };
         let metadata = ComponentRouteMetadata {
             kind: ComponentRouteEntryKind::File,
@@ -5990,6 +6080,7 @@ imports = ["components/helper.wasm"]
                 required_caps: Vec::new(),
                 sign_intent: None,
             },
+            key_derive_operation_classes: Vec::new(),
         };
         let metadata = ComponentRouteMetadata {
             kind: ComponentRouteEntryKind::File,
@@ -6152,6 +6243,7 @@ secret_namespaces = ["secrets"]
             ("consent", "summry"),
             ("caps", "allowd"),
             ("sign", "allowed_intent"),
+            ("key", "derivations"),
             ("store", "namespace"),
             ("source", "repo"),
             ("build", "output"),
@@ -6512,6 +6604,167 @@ allowed_intents = ["test.intent"]
     }
 
     #[test]
+    fn petal_key_derive_policy_is_route_scoped_in_the_immutable_index() {
+        let package = prepared_triad_fixture_with_manifest(
+            br#"schema = "bloom.petal.package.v1"
+name = "triad-authority-fixture"
+[caps]
+allowed = ["bloom:key.derive", "bloom:sign", "bloom:store"]
+
+[sign]
+allowed_intents = ["fixture.unrelated", "fixture.secondary", "fixture.payload"]
+
+[store]
+namespaces = ["fixture-public"]
+
+[[key.derive]]
+route = "session.json"
+operation_classes = ["fixture.secondary", "fixture.payload"]
+"#,
+        )
+        .unwrap();
+
+        let route = &package.route_index.routes[0];
+        assert_eq!(route.pattern, "session.json");
+        assert_eq!(
+            route.key_derive_operation_classes,
+            vec![
+                "fixture.payload".to_string(),
+                "fixture.secondary".to_string()
+            ]
+        );
+        assert!(
+            !route
+                .key_derive_operation_classes
+                .contains(&"fixture.unrelated".to_string())
+        );
+
+        let serialized = serde_json::to_value(route).unwrap();
+        assert_eq!(
+            serialized["key_derive_operation_classes"],
+            serde_json::json!(["fixture.payload", "fixture.secondary"])
+        );
+        let mut legacy = serialized;
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("key_derive_operation_classes");
+        let legacy: RouteIndexRecord = serde_json::from_value(legacy).unwrap();
+        assert!(legacy.key_derive_operation_classes.is_empty());
+    }
+
+    #[test]
+    fn petal_key_derive_policy_rejects_ambiguous_or_broadened_authority() {
+        let cases = [
+            (
+                "unknown route",
+                r#"[[key.derive]]
+route = "missing.json"
+operation_classes = ["fixture.payload"]
+"#,
+                "unknown route",
+            ),
+            (
+                "duplicate route",
+                r#"[[key.derive]]
+route = "session.json"
+operation_classes = ["fixture.payload"]
+
+[[key.derive]]
+route = "session.json"
+operation_classes = ["fixture.payload"]
+"#,
+                "duplicate declaration",
+            ),
+            (
+                "empty classes",
+                r#"[[key.derive]]
+route = "session.json"
+operation_classes = []
+"#,
+                "operation_classes must be non-empty",
+            ),
+            (
+                "duplicate classes",
+                r#"[[key.derive]]
+route = "session.json"
+operation_classes = ["fixture.payload", "fixture.payload"]
+"#,
+                "duplicate operation class",
+            ),
+            (
+                "invalid class",
+                r#"[[key.derive]]
+route = "session.json"
+operation_classes = ["fixture/payload"]
+"#,
+                "unsupported byte",
+            ),
+            (
+                "undeclared class",
+                r#"[[key.derive]]
+route = "session.json"
+operation_classes = ["fixture.undeclared"]
+"#,
+                "is not declared in [sign].allowed_intents",
+            ),
+            (
+                "unknown declaration field",
+                r#"[[key.derive]]
+route = "session.json"
+operation_class = ["fixture.payload"]
+operation_classes = ["fixture.payload"]
+"#,
+                "unknown field `operation_class`",
+            ),
+        ];
+
+        for (label, declaration, expected) in cases {
+            let manifest = format!(
+                r#"schema = "bloom.petal.package.v1"
+name = "triad-authority-fixture"
+[caps]
+allowed = ["bloom:key.derive", "bloom:sign", "bloom:store"]
+
+[sign]
+allowed_intents = ["fixture.payload"]
+
+[store]
+namespaces = ["fixture-public"]
+
+{declaration}"#
+            );
+            let error = prepared_triad_fixture_with_manifest(manifest.as_bytes()).unwrap_err();
+            assert!(error.to_string().contains(expected), "{label}: {error}");
+        }
+
+        let no_import = tempfile::tempdir().unwrap();
+        write_petal_package_with_manifest_and_route(
+            no_import.path(),
+            br#"schema = "bloom.petal.package.v1"
+name = "echo"
+[caps]
+allowed = ["bloom:key.derive"]
+
+[sign]
+allowed_intents = ["fixture.payload"]
+
+[[key.derive]]
+route = "hello.txt"
+operation_classes = ["fixture.payload"]
+"#,
+            route_component_no_imports(),
+        );
+        let error = PreparedPetalPackage::from_dir(no_import.path()).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("does not import bloom:key.derive"),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn petal_store_cap_requires_declared_namespaces() {
         let tmp = tempfile::tempdir().unwrap();
         write_petal_package_with_manifest_and_route(
@@ -6621,6 +6874,20 @@ name = "echo"
         write_package_file(root, "README.md", b"# echo");
         write_package_file(root, "AGENTS.md", b"# echo agents");
         write_package_file(root, "petal/echo/hello.txt.wasm", route);
+    }
+
+    fn prepared_triad_fixture_with_manifest(
+        manifest: &[u8],
+    ) -> Result<PreparedPetalPackage, PetalError> {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/triad-authority-petal");
+        let mut files = collect_package_dir(&fixture)?;
+        files
+            .iter_mut()
+            .find(|file| file.path == "petal.toml")
+            .expect("fixture manifest")
+            .bytes = manifest.to_vec();
+        PreparedPetalPackage::from_files(files)
     }
 
     fn route_component_no_imports() -> &'static [u8] {

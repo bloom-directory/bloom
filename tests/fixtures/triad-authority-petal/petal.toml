@@ -8,7 +8,11 @@ summary = "Developer-only fixture proving mounted Petal child-key custody and pa
 allowed = ["bloom:key.derive", "bloom:sign", "bloom:store"]
 
 [sign]
-allowed_intents = ["fixture.payload"]
+allowed_intents = ["fixture.payload", "fixture.unrelated"]
+
+[[key.derive]]
+route = "session.json"
+operation_classes = ["fixture.payload"]
 
 [store]
 namespaces = ["fixture-public"]

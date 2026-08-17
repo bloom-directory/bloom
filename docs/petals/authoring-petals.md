@@ -62,6 +62,7 @@ Supported component imports map to manifest capabilities as follows:
 | `bloom:http/fetch@0.1.0` | `bloom:http` plus `[[net.allow]]` |
 | `bloom:store/kv@0.1.0` | `bloom:store` plus `[store]` namespaces |
 | `bloom:sign/signing@0.2.0` | `bloom:sign` plus `[sign].allowed_intents`; exact payload, optional Signer-owned Petal KeyRef selector, and atomic ordered batches |
+| `bloom:key/derive@0.1.0` | `bloom:key.derive`; routes delegating child-key operation classes must also use `[[key.derive]]` |
 | `bloom:tx/outbox@0.1.0` | `bloom:tx.outbox` |
 | `bloom:chain/read@0.1.0` | `bloom:chain` |
 | `bloom:vfs/readwrite@0.1.0` | `bloom:vfs.read` and/or `bloom:vfs.write`, according to used exports |
@@ -72,6 +73,22 @@ narrow installed authority at runtime but may not widen it. A package declaring
 `bloom:sign` must list allowed intents, and each signing route's metadata must
 select one of them. The retired `bloom:sign/signing@0.1.0` hash-only import is
 incompatible with production signing and fails closed.
+
+Child-key operation classes are distinct from the signing intent used
+immediately by the route that requests the key. Declare each delegated class on
+the exact route pattern that imports `bloom:key/derive@0.1.0`:
+
+```toml
+[[key.derive]]
+route = "[network]/agent_sessions/[wallet]/new.json"
+operation_classes = ["venue.agent_action"]
+```
+
+Every listed class must also appear in `[sign].allowed_intents`. Bloom rejects
+unknown or duplicate routes, empty or duplicate class lists, invalid class
+tokens, and declarations on routes without the key-derivation import. The
+installer records only the route's immediate signing intent and these explicit
+delegated classes; other package-level signing intents are not inherited.
 
 ## Routes and ABI
 
