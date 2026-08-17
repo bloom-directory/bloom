@@ -39,7 +39,7 @@ use parking_lot::Mutex;
 use wasmtime::component::{Component, Linker as ComponentLinker, Val as ComponentVal};
 use wasmtime::{Caller, Config, Engine, Linker, Memory, Module, Store, StoreContextMut};
 use wasmtime_wasi::WasiCtxBuilder;
-use wasmtime_wasi::pipe::{MemoryInputPipe, MemoryOutputPipe};
+use wasmtime_wasi::p2::pipe::{MemoryInputPipe, MemoryOutputPipe};
 use wasmtime_wasi::preview1::{self, WasiP1Ctx};
 
 use crate::abi::{
