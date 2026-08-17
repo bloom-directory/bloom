@@ -450,10 +450,26 @@ impl Config {
     /// Apply post-load migrations for backwards compatibility.
     ///
     /// Currently infers `op_stack` for well-known OP-stack chain IDs
-    /// (Optimism=10, Base=8453, …) that predate the `op_stack` field.
-    fn migrate(&mut self, _document: &toml::Value) {
+    /// (Optimism=10, Base=8453, …) that predate the `op_stack` field and
+    /// removes Polymarket from the exact pre-triad default Petal catalog.
+    fn migrate(&mut self, document: &toml::Value) {
         for spec in self.chains.values_mut() {
             spec.infer_op_stack();
+        }
+
+        let persisted_preinstalled = document
+            .get("petals")
+            .and_then(|petals| petals.get("preinstalled"))
+            .and_then(toml::Value::as_array);
+        let is_legacy_default = persisted_preinstalled.is_some_and(|entries| {
+            entries.iter().map(toml::Value::as_str).eq([
+                Some("polymarket"),
+                Some("near-intents"),
+                Some("enso"),
+            ])
+        });
+        if is_legacy_default {
+            self.petals.preinstalled.retain(|name| name != "polymarket");
         }
     }
 
@@ -734,6 +750,27 @@ mod tests {
         let err = cfg.validate().unwrap_err().to_string();
         assert!(
             err.contains("duplicate preinstalled Petal \"near-intents\""),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn load_migrates_the_legacy_default_petal_catalog_only() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+
+        let mut cfg = Config::local_default();
+        cfg.petals.preinstalled = vec!["polymarket".into(), "near-intents".into(), "enso".into()];
+        cfg.save(&path).unwrap();
+
+        let migrated = Config::load(&path).unwrap();
+        assert_eq!(migrated.petals.preinstalled, ["near-intents", "enso"]);
+
+        cfg.petals.preinstalled = vec!["polymarket".into()];
+        cfg.save(&path).unwrap();
+        let err = Config::load(&path).unwrap_err().to_string();
+        assert!(
+            err.contains("unknown preinstalled Petal \"polymarket\""),
             "{err}"
         );
     }
