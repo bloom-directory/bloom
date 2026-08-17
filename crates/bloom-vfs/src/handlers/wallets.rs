@@ -4301,7 +4301,8 @@ mod tests {
             .unwrap_err();
         assert!(matches!(
             error,
-            HandlerError::Backend(message) if message.contains("immutable request")
+            HandlerError::Backend(message)
+                if message.contains("different sealed_approval.prepare terms")
         ));
         assert!(!f.handler.approval_projection_path("alice", None).exists());
     }

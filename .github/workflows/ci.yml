@@ -220,6 +220,7 @@ jobs:
     env:
       BLOOM_MAINNET_RPC: ${{ secrets.BLOOM_MAINNET_RPC }}
       BLOOM_ETHERSCAN_KEY: ${{ secrets.BLOOM_ETHERSCAN_KEY }}
+      BLOOM_RUN_LIVE_TESTS: 1
     steps:
       - uses: actions/checkout@v6
       - name: Install Rust toolchain
@@ -248,12 +249,10 @@ jobs:
         run: |
           cargo nextest run --archive-file target/nextest-archive.tar.zst \
             -E 'package(bloom-ens) and binary(live_mainnet)' \
-            --run-ignored ignored-only \
             --no-tests=pass \
             --no-fail-fast
           cargo nextest run --archive-file target/nextest-archive.tar.zst \
             -E 'kind(lib) and (package(bloom-etherscan) or package(bloom-prices))' \
-            --run-ignored ignored-only \
             --no-tests=pass \
             --no-fail-fast
           BLOOM_RUN_NETWORK_TESTS=1 cargo nextest run \

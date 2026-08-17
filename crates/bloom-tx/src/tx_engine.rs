@@ -3046,6 +3046,13 @@ impl TxEngine {
                         "Broker ceremony is not complete",
                     )?));
                 }
+                ApprovalLifecycleState::Expired | ApprovalLifecycleState::Cancelled => {
+                    // The immutable payload is still valid, but this owner ceremony
+                    // can no longer activate its approval. Start a fresh approval and
+                    // signing lineage instead of permanently stranding the outbox row.
+                    state = new_state()?;
+                    write_triad_signing_state(&state_path, &state)?;
+                }
                 terminal => {
                     state.ceremony_url = None;
                     state.ceremony_expires_at_ms = None;
@@ -3310,6 +3317,12 @@ impl TxEngine {
                         &state,
                         "Broker ceremony is not complete",
                     )?));
+                }
+                ApprovalLifecycleState::Expired | ApprovalLifecycleState::Cancelled => {
+                    // Preserve the exact ordered batch identity while replacing the
+                    // unusable ceremony and every operation identifier derived for it.
+                    state = new_state()?;
+                    write_triad_batch_signing_state(&state_path, &state)?;
                 }
                 terminal => {
                     return Err(TxEngineError::ApprovalDenied(format!(
@@ -4645,6 +4658,7 @@ mod tests {
 
     struct TriadBrokerFixture {
         active: AtomicBool,
+        approval_terminal: parking_lot::Mutex<Option<ApprovalLifecycleState>>,
         lose_sign_response_once: AtomicBool,
         corrupt_status_result: AtomicBool,
         completed_result: parking_lot::Mutex<Option<SigningResult>>,
@@ -4696,25 +4710,31 @@ mod tests {
                             },
                         ))
                     }
-                    MachineBrokerRequest::SealedApprovalStatus(request) => Ok(
-                        MachineBrokerResponse::SealedApprovalStatus(ApprovalPublicStatus {
-                            approval_id: request.id,
-                            wallet_id: Token::new("alice").unwrap(),
-                            state: if self.completed_result.lock().is_some() {
-                                ApprovalLifecycleState::Exhausted
-                            } else if self.active.load(Ordering::SeqCst) {
-                                ApprovalLifecycleState::Active
-                            } else {
-                                ApprovalLifecycleState::AwaitingCeremony
+                    MachineBrokerRequest::SealedApprovalStatus(request) => {
+                        let state = if self.completed_result.lock().is_some() {
+                            ApprovalLifecycleState::Exhausted
+                        } else if let Some(state) = *self.approval_terminal.lock() {
+                            state
+                        } else if self.active.load(Ordering::SeqCst) {
+                            ApprovalLifecycleState::Active
+                        } else {
+                            ApprovalLifecycleState::AwaitingCeremony
+                        };
+                        let awaiting = state == ApprovalLifecycleState::AwaitingCeremony;
+                        Ok(MachineBrokerResponse::SealedApprovalStatus(
+                            ApprovalPublicStatus {
+                                approval_id: request.id,
+                                wallet_id: Token::new("alice").unwrap(),
+                                state,
+                                effective_claim_assurance: None,
+                                ceremony_url: awaiting.then(|| {
+                                    "http://localhost:18734/ceremony/triad-test-secret".into()
+                                }),
+                                ceremony_expires_at_ms: awaiting
+                                    .then(|| DecimalU64::new((now_ms() as u64) + 60_000)),
                             },
-                            effective_claim_assurance: None,
-                            ceremony_url: (!self.active.load(Ordering::SeqCst)).then(|| {
-                                "http://localhost:18734/ceremony/triad-test-secret".into()
-                            }),
-                            ceremony_expires_at_ms: (!self.active.load(Ordering::SeqCst))
-                                .then(|| DecimalU64::new((now_ms() as u64) + 60_000)),
-                        }),
-                    ),
+                        ))
+                    }
                     MachineBrokerRequest::OperationStatus(request) => {
                         let mut result = self.completed_result.lock().clone().ok_or_else(|| {
                             bloom_broker_api::ProtocolError::new(
@@ -5557,6 +5577,7 @@ mod tests {
             .unwrap();
         let fixture = Arc::new(TriadBrokerFixture {
             active: AtomicBool::new(false),
+            approval_terminal: parking_lot::Mutex::new(None),
             lose_sign_response_once: AtomicBool::new(false),
             corrupt_status_result: AtomicBool::new(false),
             completed_result: parking_lot::Mutex::new(None),
@@ -5654,6 +5675,76 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn triad_confirm_reissues_an_expired_approval_with_fresh_operation_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        let outbox = Outbox::new(directory.path().join("outbox")).unwrap();
+        let mut staged = fake_staged_1559("triad-expired");
+        staged.wallet = "alice".into();
+        staged.created_ms = now_ms();
+        outbox.write_pending(&staged, "exact EVM review").unwrap();
+        let entry = outbox
+            .read_in_state("alice", "anvil", "triad-expired", OutboxState::Pending)
+            .unwrap();
+        let (engine, fixture, _) = triad_batch_fixture(outbox, false, false);
+        let unsigned = UnsignedEvmTx::Eip1559(TxEip1559 {
+            chain_id: staged.chain_id,
+            nonce: staged.nonce,
+            gas_limit: staged.gas_limit,
+            max_fee_per_gas: 100,
+            max_priority_fee_per_gas: 10,
+            to: TxKind::Call(staged.to.parse().unwrap()),
+            value: U256::ZERO,
+            access_list: AccessList::default(),
+            input: Bytes::new(),
+        });
+        let preimage = TxEngine::unsigned_signing_preimage(&unsigned);
+        let signing_hash = TxEngine::unsigned_signing_hash(&unsigned);
+
+        assert!(matches!(
+            engine
+                .triad_sign_evm_payload(
+                    &entry,
+                    &staged,
+                    EvmOutboxActionKind::Confirm,
+                    &preimage,
+                    signing_hash,
+                )
+                .await,
+            Err(TxEngineError::ApprovalRequired(_))
+        ));
+        let state_path = entry.dir.join(TRIAD_SIGNING_STATE_FILE);
+        let first = read_triad_signing_state(&state_path).unwrap().unwrap();
+        *fixture.approval_terminal.lock() = Some(ApprovalLifecycleState::Expired);
+
+        assert!(matches!(
+            engine
+                .triad_sign_evm_payload(
+                    &entry,
+                    &staged,
+                    EvmOutboxActionKind::Confirm,
+                    &preimage,
+                    signing_hash,
+                )
+                .await,
+            Err(TxEngineError::ApprovalRequired(_))
+        ));
+        let reissued = read_triad_signing_state(&state_path).unwrap().unwrap();
+        assert_ne!(reissued.approval_operation_id, first.approval_operation_id);
+        assert_ne!(reissued.signing_operation_id, first.signing_operation_id);
+        assert_ne!(reissued.request_nonce, first.request_nonce);
+        assert_ne!(reissued.approval_id, first.approval_id);
+        assert_eq!(
+            fixture
+                .requests
+                .lock()
+                .iter()
+                .filter(|request| matches!(request, MachineBrokerRequest::SealedApprovalPrepare(_)))
+                .count(),
+            2
+        );
+    }
+
     fn triad_batch_fixture(
         outbox: Outbox,
         active: bool,
@@ -5661,6 +5752,7 @@ mod tests {
     ) -> (TxEngine, Arc<TriadBrokerFixture>, MachineBrokerClient) {
         let fixture = Arc::new(TriadBrokerFixture {
             active: AtomicBool::new(active),
+            approval_terminal: parking_lot::Mutex::new(None),
             lose_sign_response_once: AtomicBool::new(lose_sign_response_once),
             corrupt_status_result: AtomicBool::new(false),
             completed_result: parking_lot::Mutex::new(None),
@@ -5794,6 +5886,49 @@ mod tests {
             !requests
                 .iter()
                 .any(|request| matches!(request, MachineBrokerRequest::SigningSign(_)))
+        );
+    }
+
+    #[tokio::test]
+    async fn triad_batch_reissues_a_cancelled_approval_with_fresh_operation_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        let outbox = Outbox::new(directory.path().join("outbox")).unwrap();
+        let (engine, fixture, _) = triad_batch_fixture(outbox.clone(), false, false);
+        let (refs, staged, preimages, hashes) = batch_material(&["cancelled-a", "cancelled-b"]);
+
+        assert!(matches!(
+            engine
+                .triad_sign_evm_batch("alice", &refs, &staged, &preimages, &hashes)
+                .await,
+            Err(TxEngineError::ApprovalRequired(_))
+        ));
+        let state_path = batch_signing_state_path(outbox.root(), "alice", &refs).unwrap();
+        let first = read_triad_batch_signing_state(&state_path)
+            .unwrap()
+            .unwrap();
+        *fixture.approval_terminal.lock() = Some(ApprovalLifecycleState::Cancelled);
+
+        assert!(matches!(
+            engine
+                .triad_sign_evm_batch("alice", &refs, &staged, &preimages, &hashes)
+                .await,
+            Err(TxEngineError::ApprovalRequired(_))
+        ));
+        let reissued = read_triad_batch_signing_state(&state_path)
+            .unwrap()
+            .unwrap();
+        assert_ne!(reissued.approval_operation_id, first.approval_operation_id);
+        assert_ne!(reissued.signing_operation_id, first.signing_operation_id);
+        assert_ne!(reissued.request_nonce, first.request_nonce);
+        assert_ne!(reissued.approval_id, first.approval_id);
+        assert_eq!(
+            fixture
+                .requests
+                .lock()
+                .iter()
+                .filter(|request| matches!(request, MachineBrokerRequest::SealedApprovalPrepare(_)))
+                .count(),
+            2
         );
     }
 

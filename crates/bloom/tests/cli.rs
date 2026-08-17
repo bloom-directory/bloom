@@ -2334,7 +2334,7 @@ fn github_source_install_polymarket_dispatches_route_contract() {
         return;
     }
     // This commit uses the same canonical Petal contract revision as Bloom.
-    let petal_ref = "f92a800ce21ac594e3158c93e390aade683327c5";
+    let petal_ref = "a47e7e462c2be117d497a3edd2399fb1f4acfe8d";
     let home = fresh_home();
     let home_dir = bloom_proto::HomeDir::at(home.path());
     let mut config = bloom_proto::Config::local_default();

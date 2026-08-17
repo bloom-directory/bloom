@@ -309,7 +309,7 @@ impl BrokerExactPayloadSigner {
             state.approval_id = None;
         }
         write_state(state_path, &state)?;
-        let request = ExactPayloadSignRequest {
+        let mut request = ExactPayloadSignRequest {
             wallet_id,
             preimage: preimage.to_vec(),
             claimed_hash,
@@ -328,7 +328,21 @@ impl BrokerExactPayloadSigner {
             claim_assurance_evidence: petal_claim
                 .and_then(|(_, evidence)| evidence.map(<[u8]>::to_vec)),
         };
-        match self.broker.sign_exact_payload(request).await {
+        let mut response = self.broker.sign_exact_payload(request.clone()).await;
+        if response
+            .as_ref()
+            .is_err_and(|error| error.code == ProtocolErrorCode::OperationIdConflict)
+            && state.approval_id.is_some()
+        {
+            // A prior attempt may have committed at Broker before its response
+            // reached Machine. Keep the activated approval and immutable payload,
+            // but never retry a signing reservation that Broker finalized.
+            state.signing_operation_id = random_operation_id();
+            request.signing_operation_id = state.signing_operation_id.clone();
+            write_state(state_path, &state)?;
+            response = self.broker.sign_exact_payload(request).await;
+        }
+        match response {
             Ok(ExactPayloadSignOutcome::ApprovalRequired(prepared)) => {
                 state.approval_id = Some(prepared.approval_id.clone());
                 write_state(state_path, &state)?;
@@ -816,7 +830,10 @@ fn write_state<T: Serialize>(path: &Path, state: &T) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Arc, Mutex};
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    };
 
     use bloom_broker_api::{
         ApprovalPrepareState, Base64UrlBytes, KeyPublic, KeyRef, KeyRole, KeySpec,
@@ -828,6 +845,7 @@ mod tests {
 
     struct MockBroker {
         requests: Mutex<Vec<MachineBrokerRequest>>,
+        conflict_sign_once: AtomicBool,
     }
 
     impl MachineBrokerService for MockBroker {
@@ -874,6 +892,12 @@ mod tests {
                         ))
                     }
                     MachineBrokerRequest::SigningSign(request) => {
+                        if self.conflict_sign_once.swap(false, Ordering::SeqCst) {
+                            return Err(ProtocolError::new(
+                                ProtocolErrorCode::OperationIdConflict,
+                                "simulated finalized signing reservation",
+                            ));
+                        }
                         Ok(MachineBrokerResponse::SigningSign(SigningResult {
                             operation_id: request.operation_id,
                             operation_digest: request.operation_digest,
@@ -909,6 +933,7 @@ mod tests {
     async fn persists_identity_reuses_approval_and_rejects_payload_drift() {
         let broker = Arc::new(MockBroker {
             requests: Mutex::new(Vec::new()),
+            conflict_sign_once: AtomicBool::new(false),
         });
         let signer = BrokerExactPayloadSigner::new(
             MachineBrokerClient::new(broker.clone()),
@@ -950,6 +975,7 @@ mod tests {
             first,
             ExactPayloadOutcome::ApprovalRequired { .. }
         ));
+        broker.conflict_sign_once.store(true, Ordering::SeqCst);
         let second = signer
             .sign_or_prepare(
                 &state,
@@ -963,6 +989,21 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(second, ExactPayloadOutcome::Signed(vec![7_u8; 65]));
+        let signing_operation_ids = broker
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|request| match request {
+                MachineBrokerRequest::SigningSign(request) => Some(request.operation_id.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(signing_operation_ids.len(), 2);
+        assert_ne!(signing_operation_ids[0], signing_operation_ids[1]);
+        let persisted: ExactSigningState =
+            serde_json::from_slice(&fs::read(&state).unwrap()).unwrap();
+        assert_eq!(persisted.signing_operation_id, signing_operation_ids[1]);
         let requests_after_sign = broker.requests.lock().unwrap().len();
         let error = signer
             .sign_or_prepare(
@@ -984,6 +1025,7 @@ mod tests {
     async fn petal_retry_preserves_the_requested_crypto_suite_through_prepare_and_sign() {
         let broker = Arc::new(MockBroker {
             requests: Mutex::new(Vec::new()),
+            conflict_sign_once: AtomicBool::new(false),
         });
         let package_hash = digest(20);
         let subject = ProvenanceSubject::Petal {
