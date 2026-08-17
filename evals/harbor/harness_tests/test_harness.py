@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import copy
 import hashlib
 import json
 import os
@@ -124,10 +126,19 @@ class HyperliquidDefinitionTests(unittest.TestCase):
         route_dir = self.petal_store / "packages" / self.package_hash
         route_dir.mkdir(parents=True)
         self.route_index = route_dir / "route-index.json"
+        action_routes = (
+            "[network]/agent_sessions/[wallet]/[session]/cancel.json",
+            "[network]/agent_sessions/[wallet]/[session]/cancel_all",
+            "[network]/agent_sessions/[wallet]/[session]/close_all",
+            "[network]/agent_sessions/[wallet]/[session]/order.json",
+            "[network]/agent_sessions/[wallet]/[session]/schedule_cancel.json",
+            "[network]/agent_sessions/[wallet]/[session]/update_leverage.json",
+        )
         self.route_index.write_text(
             json.dumps(
                 {
                     "schema": "bloom.petal.route-index.v1",
+                    "package_hash": self.package_hash,
                     "routes": [
                         {
                             "route_id": "r000021",
@@ -141,13 +152,32 @@ class HyperliquidDefinitionTests(unittest.TestCase):
                                 ],
                                 "sign_intent": "hyperliquid.approve_agent",
                             },
+                            "key_derive_operation_classes": [
+                                "hyperliquid.agent_action"
+                            ],
                         }
+                    ]
+                    + [
+                        {
+                            "route_id": f"r{index:06d}",
+                            "pattern": pattern,
+                            "install_metadata": {
+                                "required_caps": [
+                                    "bloom:http",
+                                    "bloom:sign",
+                                    "bloom:store",
+                                ],
+                                "sign_intent": "hyperliquid.agent_action",
+                            },
+                        }
+                        for index, pattern in enumerate(action_routes, start=1)
                     ],
                 }
             )
         )
         self.route_index.chmod(0o644)
         self.provenance_catalog = self.root / "provenance-catalog.json"
+        signature = base64.urlsafe_b64encode(b"\x01" * 64).rstrip(b"=").decode()
         self.provenance_catalog.write_text(
             json.dumps(
                 {
@@ -164,9 +194,22 @@ class HyperliquidDefinitionTests(unittest.TestCase):
                                 "release_sequence": "1",
                                 "predecessor_package_hashes": [],
                                 "controller_key_id": "developer-controller",
-                                "controller_signature": "AQ",
+                                "controller_signature": signature,
                                 "active": True,
                             },
+                            "publisher": "bloom-installer",
+                            "operation_classes": [
+                                {
+                                    "operation_class": "hyperliquid.agent_action",
+                                    "fee_asset": None,
+                                },
+                                {
+                                    "operation_class": "hyperliquid.approve_agent",
+                                    "fee_asset": None,
+                                },
+                            ],
+                            "installer_key_id": "developer-installer",
+                            "installer_signature": signature,
                         }
                     ],
                 }
@@ -313,14 +356,71 @@ class HyperliquidDefinitionTests(unittest.TestCase):
     def test_active_installed_lineage_satisfies_preauthorization_gate(self) -> None:
         self.definition.preauthorization_preflight()
 
-    def test_preauthorization_rejects_missing_installed_lineage(self) -> None:
-        catalog = json.loads(self.provenance_catalog.read_text())
-        catalog["records"] = []
-        self.provenance_catalog.write_text(json.dumps(catalog))
-        with self.assertRaisesRegex(
-            EvalError, "has no installer-provenance record"
+    def test_preauthorization_rejects_broadened_or_mismatched_authority(self) -> None:
+        base_routes = json.loads(self.route_index.read_text())
+        base_catalog = json.loads(self.provenance_catalog.read_text())
+
+        for case in (
+            "missing record",
+            "missing delegated route class",
+            "overbroad delegated route class",
+            "delegated class on wrong route",
+            "provenance record for wrong route",
+            "missing installer-signed delegated class",
+            "overbroad installer-signed delegated class",
+            "missing installer signature",
+            "downstream route missing bloom:sign",
+            "downstream route has wrong operation class",
+            "mismatched route-index package",
+            "mismatched provenance package",
         ):
-            self.definition.preauthorization_preflight()
+            routes = copy.deepcopy(base_routes)
+            catalog = copy.deepcopy(base_catalog)
+            if case == "missing record":
+                catalog["records"] = []
+            elif case == "missing delegated route class":
+                routes["routes"][0]["key_derive_operation_classes"] = []
+            elif case == "overbroad delegated route class":
+                routes["routes"][0]["key_derive_operation_classes"].append(
+                    "hyperliquid.order"
+                )
+            elif case == "delegated class on wrong route":
+                routes["routes"][0]["key_derive_operation_classes"] = []
+                routes["routes"][1]["key_derive_operation_classes"] = [
+                    "hyperliquid.agent_action"
+                ]
+            elif case == "provenance record for wrong route":
+                catalog["records"][0]["subject"]["route"] = "r999999"
+            elif case == "missing installer-signed delegated class":
+                catalog["records"][0]["operation_classes"] = [
+                    {
+                        "operation_class": "hyperliquid.approve_agent",
+                        "fee_asset": None,
+                    }
+                ]
+            elif case == "overbroad installer-signed delegated class":
+                catalog["records"][0]["operation_classes"].append(
+                    {"operation_class": "hyperliquid.order", "fee_asset": None}
+                )
+            elif case == "missing installer signature":
+                catalog["records"][0]["installer_signature"] = ""
+            elif case == "downstream route missing bloom:sign":
+                routes["routes"][1]["install_metadata"]["required_caps"].remove(
+                    "bloom:sign"
+                )
+            elif case == "downstream route has wrong operation class":
+                routes["routes"][1]["install_metadata"]["sign_intent"] = (
+                    "hyperliquid.cancel"
+                )
+            elif case == "mismatched route-index package":
+                routes["package_hash"] = "c" * 64
+            elif case == "mismatched provenance package":
+                catalog["records"][0]["subject"]["package_hash"] = "c" * 64
+
+            self.route_index.write_text(json.dumps(routes))
+            self.provenance_catalog.write_text(json.dumps(catalog))
+            with self.subTest(case=case), self.assertRaises(EvalError):
+                self.definition.preauthorization_preflight()
 
     def test_preauthorization_rejects_inactive_installed_lineage(self) -> None:
         catalog = json.loads(self.provenance_catalog.read_text())
@@ -333,8 +433,12 @@ class HyperliquidDefinitionTests(unittest.TestCase):
         self.definition._require_exact_wallet_policy = mock.Mock(
             side_effect=AssertionError("temporary policy must remain unopened")
         )
+        self.definition._write_route = mock.Mock(
+            side_effect=AssertionError("preauthorization must not write mounted routes")
+        )
         self.definition.preauthorization_preflight()
         self.definition._require_exact_wallet_policy.assert_not_called()
+        self.definition._write_route.assert_not_called()
 
     def test_pending_key_ceremony_is_resolved_from_exact_owner_projection(self) -> None:
         ceremony = "http://localhost:18734/ceremony/" + "A" * 43

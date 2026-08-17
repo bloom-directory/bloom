@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
 import json
 import os
@@ -26,6 +28,15 @@ PACKAGE_HASH = re.compile(r"[0-9a-f]{64}")
 LINEAGE_ID = re.compile(r"pln1_[a-z2-7]{52}")
 BASE64URL = re.compile(r"[A-Za-z0-9_-]+")
 HYPERLIQUID_SESSION_ROUTE = "[network]/agent_sessions/[wallet]/new.json"
+HYPERLIQUID_AGENT_ACTION = "hyperliquid.agent_action"
+HYPERLIQUID_SESSION_ACTION_ROUTES = (
+    "[network]/agent_sessions/[wallet]/[session]/cancel.json",
+    "[network]/agent_sessions/[wallet]/[session]/cancel_all",
+    "[network]/agent_sessions/[wallet]/[session]/close_all",
+    "[network]/agent_sessions/[wallet]/[session]/order.json",
+    "[network]/agent_sessions/[wallet]/[session]/schedule_cancel.json",
+    "[network]/agent_sessions/[wallet]/[session]/update_leverage.json",
+)
 ACTION_FILES = ("order.json", "cancel.json", "update_leverage.json", "cancel_all")
 
 
@@ -247,6 +258,16 @@ class HyperliquidOrderCancelEval(EvalDefinition):
         except (OSError, json.JSONDecodeError) as error:
             raise EvalError(f"{label} is invalid: {error}") from error
 
+    @staticmethod
+    def _is_base64url_signature(value: Any) -> bool:
+        if not isinstance(value, str) or BASE64URL.fullmatch(value) is None:
+            return False
+        try:
+            decoded = base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
+        except (ValueError, binascii.Error):
+            return False
+        return len(decoded) == 64
+
     def _require_active_petal_lineage(self) -> None:
         if not self.petal_store_value:
             raise EvalError("BLOOM_EVAL_PETAL_STORE is required")
@@ -260,9 +281,12 @@ class HyperliquidOrderCancelEval(EvalDefinition):
         if (
             not isinstance(route_index, dict)
             or route_index.get("schema") != "bloom.petal.route-index.v1"
+            or route_index.get("package_hash") != self.package_hash
             or not isinstance(routes, list)
         ):
-            raise EvalError("installed Hyperliquid route index has an unsupported shape")
+            raise EvalError(
+                "installed Hyperliquid route index has an unsupported shape or package hash"
+            )
         matches = [
             route
             for route in routes
@@ -277,6 +301,7 @@ class HyperliquidOrderCancelEval(EvalDefinition):
         route_id = route.get("route_id")
         metadata = route.get("install_metadata")
         required_caps = metadata.get("required_caps") if isinstance(metadata, dict) else None
+        delegated_classes = route.get("key_derive_operation_classes")
         if (
             not isinstance(route_id, str)
             or re.fullmatch(r"r[0-9]{6}", route_id) is None
@@ -288,6 +313,67 @@ class HyperliquidOrderCancelEval(EvalDefinition):
         ):
             raise EvalError(
                 "installed Hyperliquid agent-session route lacks its exact custody bindings"
+            )
+        if delegated_classes != [HYPERLIQUID_AGENT_ACTION]:
+            raise EvalError(
+                "installed Hyperliquid agent-session route lacks the exact delegated operation class"
+            )
+
+        for candidate in routes:
+            if not isinstance(candidate, dict):
+                raise EvalError("installed Hyperliquid route index contains a malformed route")
+            if candidate is not route and candidate.get("key_derive_operation_classes") not in (
+                None,
+                [],
+            ):
+                raise EvalError(
+                    "installed Hyperliquid delegated operation class is scoped to the wrong route"
+                )
+
+        action_route_ids: set[str] = set()
+        for pattern in HYPERLIQUID_SESSION_ACTION_ROUTES:
+            action_matches = [
+                candidate for candidate in routes if candidate.get("pattern") == pattern
+            ]
+            if len(action_matches) != 1:
+                raise EvalError(
+                    f"installed Hyperliquid package must contain exactly one child-key action route for {pattern}"
+                )
+            action_route = action_matches[0]
+            action_route_id = action_route.get("route_id")
+            action_metadata = action_route.get("install_metadata")
+            action_caps = (
+                action_metadata.get("required_caps")
+                if isinstance(action_metadata, dict)
+                else None
+            )
+            if (
+                not isinstance(action_route_id, str)
+                or re.fullmatch(r"r[0-9]{6}", action_route_id) is None
+                or action_route_id == route_id
+                or action_route_id in action_route_ids
+                or not isinstance(action_caps, list)
+                or any(not isinstance(capability, str) for capability in action_caps)
+                or "bloom:sign" not in action_caps
+                or not isinstance(action_metadata, dict)
+                or action_metadata.get("sign_intent") != HYPERLIQUID_AGENT_ACTION
+            ):
+                raise EvalError(
+                    f"installed Hyperliquid child-key action route {pattern} lacks bloom:sign or its exact operation class"
+                )
+            action_route_ids.add(action_route_id)
+
+        unexpected_agent_action_routes = [
+            candidate.get("pattern")
+            for candidate in routes
+            if isinstance(candidate.get("install_metadata"), dict)
+            and candidate["install_metadata"].get("sign_intent")
+            == HYPERLIQUID_AGENT_ACTION
+            and candidate.get("pattern") not in HYPERLIQUID_SESSION_ACTION_ROUTES
+        ]
+        if unexpected_agent_action_routes:
+            raise EvalError(
+                "installed Hyperliquid package grants the child-key operation class to unexpected routes"
             )
 
         catalog = self._read_local_json(
@@ -319,7 +405,28 @@ class HyperliquidOrderCancelEval(EvalDefinition):
             raise EvalError(
                 "installed Hyperliquid agent-session route has duplicate provenance records"
             )
-        lineage = matching_records[0].get("petal_lineage")
+        record = matching_records[0]
+        operation_classes = record.get("operation_classes")
+        expected_operation_classes = [
+            {"operation_class": HYPERLIQUID_AGENT_ACTION, "fee_asset": None},
+            {"operation_class": "hyperliquid.approve_agent", "fee_asset": None},
+        ]
+        if operation_classes != expected_operation_classes:
+            raise EvalError(
+                "installed Hyperliquid agent-session provenance lacks the exact installer-signed operation classes"
+            )
+        if (
+            not isinstance(record.get("publisher"), str)
+            or not record["publisher"]
+            or not isinstance(record.get("installer_key_id"), str)
+            or not record["installer_key_id"]
+            or not self._is_base64url_signature(record.get("installer_signature"))
+        ):
+            raise EvalError(
+                "installed Hyperliquid agent-session provenance lacks installer signature material"
+            )
+
+        lineage = record.get("petal_lineage")
         if not isinstance(lineage, dict) or lineage.get("active") is not True:
             raise EvalError(
                 "installed Hyperliquid agent-session route does not have active Petal lineage"
@@ -342,8 +449,8 @@ class HyperliquidOrderCancelEval(EvalDefinition):
             or LINEAGE_ID.fullmatch(lineage["lineage_id"]) is None
             or not release_sequence_valid
             or not isinstance(lineage.get("controller_key_id"), str)
-            or not isinstance(lineage.get("controller_signature"), str)
-            or BASE64URL.fullmatch(lineage["controller_signature"]) is None
+            or not lineage["controller_key_id"]
+            or not self._is_base64url_signature(lineage.get("controller_signature"))
         ):
             raise EvalError(
                 "installed Hyperliquid agent-session route has malformed Petal lineage"

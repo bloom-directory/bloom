@@ -39,6 +39,13 @@ audit data outside the agent-controlled container.
 - The immutable Machine owner record for the installed Hyperliquid Petal. This
   is normally `.../state/machine/petals/store/owners/hyperliquid.json`; pass its
   exact host path as `BLOOM_EVAL_PETAL_OWNER_RECORD`.
+- The Machine Petal store and signed provenance catalog. The installed route
+  index must bind the exact package hash and give only the session-creation
+  route the delegated `hyperliquid.agent_action` class. Its installer-signed
+  provenance record must contain exactly that class plus
+  `hyperliquid.approve_agent`, with active lineage. Every downstream session
+  action route must attest `bloom:sign` and `hyperliquid.agent_action` at
+  runtime.
 - The dedicated wallet's active Broker policy must contain no funding
   destinations and allow only the exact installed Hyperliquid package hash.
 
@@ -66,6 +73,8 @@ serialized attempt.
 export BLOOM_EVAL_WALLET=0x... # dedicated, lowercase address
 export BLOOM_EVAL_WALLET_ID=... # dedicated Bloom wallet ID
 export BLOOM_EVAL_PETAL_OWNER_RECORD=/path/to/state/machine/petals/store/owners/hyperliquid.json
+export BLOOM_EVAL_PETAL_STORE=/path/to/state/machine/petals/store
+export BLOOM_EVAL_PROVENANCE_CATALOG=/path/to/config/provenance-catalog.json
 export BLOOM_EVAL_HYPERLIQUID_PACKAGE_HASH=$(python3 -c \
   'import json,sys; print(json.load(open(sys.argv[1]))["hash"])' \
   "$BLOOM_EVAL_PETAL_OWNER_RECORD")
@@ -75,6 +84,11 @@ export BLOOM_EVAL_AUTHENTICATOR_SEED_FILE="$HOME/.config/bloom/eval-authenticato
 # first post-registration ceremony uses 2. Increment after every completion.
 export BLOOM_EVAL_AUTHENTICATOR_SIGN_COUNT=2
 export BLOOM_EVAL_MAINNET_ACK=PLACE_AND_CANCEL_BTC_MAINNET_UP_TO_11_USD
+
+# Run this while the wallet remains deny-by-default. It reads only immutable
+# local package/provenance files: no policy inspection, ceremony, mounted write,
+# agent, Docker job, or external call is possible in this mode.
+scripts/evals/run-harbor-hyperliquid.sh --preauthorization-only
 
 # Claude Code / Sonnet 5
 export CLAUDE_CODE_OAUTH_TOKEN=... # or ANTHROPIC_API_KEY
@@ -157,8 +171,9 @@ and a dry environment build.
 ## Safety and cleanup
 
 The runner fails closed unless the exact mainnet acknowledgement, wallet ID,
-installed package hash, and next WebAuthn signature counter are set. The wallet
-policy must match that package-only authority exactly,
+installed package hash, delegated class, downstream signing-route metadata,
+installer-signature material, active lineage, and next WebAuthn signature
+counter are set. The wallet policy must match that package-only authority exactly,
 `/bloom` is a real mount, the dedicated wallet has no open orders or positions,
 the debug driver and protected seed file exist, and Docker is available. It uses
 an advisory file lock, Harbor concurrency 1, one attempt, and no retries.

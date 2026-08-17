@@ -24,7 +24,10 @@ def parser() -> argparse.ArgumentParser:
     value.add_argument(
         "--preauthorization-only",
         action="store_true",
-        help="verify package ownership and active lineage without inspecting wallet policy",
+        help=(
+            "verify installed ownership, delegated provenance, action-route signing "
+            "metadata, and active lineage without inspecting wallet policy"
+        ),
     )
     return value
 
@@ -45,7 +48,10 @@ def main(argv: list[str] | None = None) -> int:
                     "--preauthorization-only does not accept an agent argument"
                 )
             definition.preauthorization_preflight()
-            print("Bloom Harbor preauthorization: active Petal lineage verified")
+            print(
+                "Bloom Harbor preauthorization: installed package, delegated "
+                "provenance, action routes, and active lineage verified"
+            )
         else:
             if args.agent is None:
                 raise EvalError("an agent is required unless --preauthorization-only is set")
