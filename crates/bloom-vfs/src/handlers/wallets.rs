@@ -563,6 +563,9 @@ impl WalletsHandler {
                     browser_output_recipient_key: None,
                     petal_key_scope: None,
                     legacy_passkey_migration: None,
+                    wallet_seed_profile: None,
+                    derivation_request: None,
+                    account_terms: None,
                 },
             )
             .await
@@ -1655,6 +1658,7 @@ impl WalletsHandler {
             Entry::file("public_key"),
             Entry::file("kind"),
             Entry::file("projection.json"),
+            Entry::file("accounts.json"),
             Entry::writable_file("policy.json"),
             Entry::dir("chains"),
             Entry::dir("sealed-approvals"),
@@ -2241,6 +2245,21 @@ impl WalletsHandler {
             "addresses.json" => {
                 let projection = self.wallet_projection(wallet).await?;
                 self.projection_addresses_json(&projection)
+            }
+            "accounts.json" => {
+                let broker = self.broker.as_ref().ok_or_else(|| {
+                    HandlerError::backend("Broker edge is unavailable for wallet accounts")
+                })?;
+                let accounts = broker
+                    .wallet_accounts(
+                        bloom_broker_api::Token::new(wallet.to_owned())
+                            .map_err(|error| HandlerError::invalid(error.to_string()))?,
+                    )
+                    .await
+                    .map_err(|error| HandlerError::backend(error.to_string()))?;
+                let mut out = serde_json::to_vec_pretty(&accounts).map_err(err_be)?;
+                out.push(b'\n');
+                Ok(out)
             }
             "public_key" => {
                 let projection = self.wallet_projection(wallet).await?;
@@ -3319,7 +3338,7 @@ mod tests {
             wallet: WalletPublic {
                 wallet_id: wallet_id.clone(),
                 wallet_kind: token("local"),
-                root_key_ref: key_ref.clone(),
+                root_key_ref: Some(key_ref.clone()),
                 key_refs: vec![key_ref.clone()],
                 policy_version: DecimalU64::new(1),
                 policy_digest: policy_digest.clone(),

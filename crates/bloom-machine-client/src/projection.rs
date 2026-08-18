@@ -12,8 +12,8 @@ use std::{
 
 use async_trait::async_trait;
 use bloom_broker_api::{
-    CredentialPublic, Digest32, KeyPublic, KeyRequest, KeyRole, ProtocolError, ProtocolErrorCode,
-    SignedPolicySnapshot, Token, WalletPublic,
+    CredentialPublic, DerivationRef, Digest32, KeyPublic, KeyRequest, KeyRole, KeySpec,
+    ProtocolError, ProtocolErrorCode, SignedPolicySnapshot, Token, WalletPublic,
 };
 use fs2::FileExt as _;
 use serde::{Deserialize, Serialize};
@@ -63,16 +63,41 @@ impl WalletProjection {
     }
 
     pub fn primary_key(&self) -> Result<&KeyPublic, ProtocolError> {
-        let key_ref = &self.wallet.root_key_ref;
-        self.keys
-            .iter()
-            .find(|key| &key.key_ref == key_ref && key.role == KeyRole::WalletRoot)
-            .ok_or_else(|| {
-                invalid_projection(format!(
-                    "wallet {} primary key is absent from projection",
-                    self.wallet.wallet_id.as_str()
-                ))
-            })
+        match &self.wallet.root_key_ref {
+            Some(root) => self
+                .keys
+                .iter()
+                .find(|key| &key.key_ref == root && key.role == KeyRole::WalletRoot)
+                .ok_or_else(|| {
+                    invalid_projection(format!(
+                        "wallet {} primary key is absent from projection",
+                        self.wallet.wallet_id.as_str()
+                    ))
+                }),
+            // A BIP-39 wallet has no signable root; its primary key is the
+            // canonical initial EVM child m/44'/60'/0'/0/0.
+            None => {
+                let evm_children = self.keys.iter().filter(|key| {
+                    key.role == KeyRole::Derived && key.key_ref.key_spec == KeySpec::Secp256k1
+                });
+                evm_children
+                    .clone()
+                    .find(|key| {
+                        matches!(
+                            &key.key_ref.derivation,
+                            Some(DerivationRef::Bip39Multicurve { path, .. })
+                                if path == "m/44'/60'/0'/0/0"
+                        )
+                    })
+                    .or_else(|| evm_children.into_iter().next())
+                    .ok_or_else(|| {
+                        invalid_projection(format!(
+                            "wallet {} has no derived EVM primary key",
+                            self.wallet.wallet_id.as_str()
+                        ))
+                    })
+            }
+        }
     }
 
     pub fn primary_address(&self) -> Result<&str, ProtocolError> {
@@ -592,25 +617,41 @@ fn validate_projection(projection: &WalletProjection) -> Result<(), ProtocolErro
         .map(|key| serde_json::to_string(&key.key_ref))
         .collect::<Result<BTreeSet<_>, _>>()
         .map_err(|error| invalid_projection(format!("encode public key reference: {error}")))?;
-    let encoded_root = serde_json::to_string(&projection.wallet.root_key_ref).map_err(|error| {
-        invalid_projection(format!("encode wallet root key reference: {error}"))
-    })?;
-    if !projection
-        .wallet
-        .key_refs
-        .contains(&projection.wallet.root_key_ref)
-        || !projection.keys.iter().any(|key| {
-            key.key_ref == projection.wallet.root_key_ref && key.role == KeyRole::WalletRoot
-        })
-        || projection.keys.iter().any(|key| {
-            key.role == KeyRole::WalletRoot && key.key_ref != projection.wallet.root_key_ref
-        })
-        || !key_refs.contains(&encoded_root)
-    {
-        return Err(invalid_projection(format!(
-            "wallet {} root key projection is inconsistent",
-            wallet_id.as_str()
-        )));
+    match &projection.wallet.root_key_ref {
+        Some(root) => {
+            let encoded_root = serde_json::to_string(root).map_err(|error| {
+                invalid_projection(format!("encode wallet root key reference: {error}"))
+            })?;
+            if !projection.wallet.key_refs.contains(root)
+                || !projection
+                    .keys
+                    .iter()
+                    .any(|key| key.key_ref == *root && key.role == KeyRole::WalletRoot)
+                || projection
+                    .keys
+                    .iter()
+                    .any(|key| key.role == KeyRole::WalletRoot && key.key_ref != *root)
+                || !key_refs.contains(&encoded_root)
+            {
+                return Err(invalid_projection(format!(
+                    "wallet {} root key projection is inconsistent",
+                    wallet_id.as_str()
+                )));
+            }
+        }
+        None => {
+            // A BIP-39 wallet has no signable root; only derived children.
+            if projection
+                .keys
+                .iter()
+                .any(|key| key.role == KeyRole::WalletRoot)
+            {
+                return Err(invalid_projection(format!(
+                    "wallet {} projection claims a root for a BIP-39 wallet",
+                    wallet_id.as_str()
+                )));
+            }
+        }
     }
     for key_ref in &projection.wallet.key_refs {
         let encoded = serde_json::to_string(key_ref)
@@ -819,7 +860,7 @@ mod tests {
         derived.role = KeyRole::Derived;
         fixture.wallet.key_refs.insert(0, derived.key_ref.clone());
         fixture.keys.insert(0, derived);
-        let expected_root = fixture.wallet.root_key_ref.clone();
+        let expected_root = fixture.wallet.root_key_ref.clone().unwrap();
         let projection = build_projection(
             fixture.wallet,
             fixture.keys,
@@ -1033,7 +1074,7 @@ mod tests {
             wallet: WalletPublic {
                 wallet_id: wallet_id.clone(),
                 wallet_kind: token("passkey"),
-                root_key_ref: key_ref.clone(),
+                root_key_ref: Some(key_ref.clone()),
                 key_refs: vec![key_ref.clone()],
                 policy_version: DecimalU64::new(version),
                 policy_digest: policy_digest.clone(),

@@ -751,6 +751,9 @@ async fn launch_custody_ceremony(
                 browser_output_recipient_key: None,
                 petal_key_scope: None,
                 legacy_passkey_migration,
+                wallet_seed_profile: None,
+                derivation_request: None,
+                account_terms: None,
             },
         )
         .await
@@ -763,6 +766,119 @@ async fn launch_custody_ceremony(
     .map_err(anyhow::Error::new)
     .context("construct Machine custody projection")?;
     let projection_path = persist_ceremony_projection(home, &projection)?;
+    Ok(format!(
+        "operation_id: {}\nceremony_kind: {:?}\nceremony_url: {}\nceremony_expires_at_ms: {}\nprojection: {}\n",
+        response.custody_operation_id,
+        response.ceremony_kind,
+        response.ceremony_url,
+        response.ceremony_expires_at_ms.get(),
+        projection_path.display(),
+    ))
+}
+
+async fn launch_account_allocation(
+    daemon: &Daemon,
+    wallet_id: &bloom_broker_api::Token,
+    profile: &str,
+) -> Result<String> {
+    use bloom_broker_api::{AccountTerms, DerivationProfile, DerivedAccountRequest};
+    use rand::RngCore as _;
+
+    let (derivation_profile, requested_role) = match profile {
+        "bip44-evm-secp256k1-v1" => (DerivationProfile::Bip44EvmSecp256k1V1, "primary-evm"),
+        "bip44-solana-slip10-ed25519-v1" => (
+            DerivationProfile::Bip44SolanaSlip10Ed25519V1,
+            "solana-account",
+        ),
+        other => {
+            return Err(machine_error(
+                MachineErrorKind::InvalidParams,
+                format!(
+                    "unknown derivation profile '{other}'; expected \
+                     bip44-evm-secp256k1-v1 or bip44-solana-slip10-ed25519-v1"
+                ),
+            )
+            .into());
+        }
+    };
+
+    let projection = daemon
+        .wallet_projections
+        .get_wallet(wallet_id)
+        .await
+        .map_err(machine_wallet_lookup_error)?;
+    let wallet = &projection.wallet;
+    if wallet.root_key_ref.is_some() {
+        return Err(machine_error(
+            MachineErrorKind::InvalidParams,
+            format!(
+                "wallet '{}' is not a BIP-39 wallet; account allocation requires a mnemonic root",
+                wallet_id.as_str()
+            ),
+        )
+        .into());
+    }
+
+    let mut operation_bytes = [0_u8; 32];
+    rand::thread_rng().fill_bytes(&mut operation_bytes);
+    let operation_id = bloom_broker_api::OperationId::from_bytes(operation_bytes);
+    let derivation = DerivedAccountRequest {
+        derivation_profile,
+        requested_role: bloom_broker_api::Token::new(requested_role)
+            .map_err(|error| machine_error(MachineErrorKind::InvalidParams, error.to_string()))?,
+        account: Some(0),
+    };
+    let expires_at_ms = current_unix_ms().saturating_add(30 * 60 * 1_000);
+    let terms = AccountTerms {
+        schema: bloom_broker_api::Token::new("bloom.account_terms.v1")
+            .map_err(|error| machine_error(MachineErrorKind::InvalidParams, error.to_string()))?,
+        wallet_id: wallet_id.clone(),
+        seed_profile: bloom_broker_api::WalletSeedProfile::Bip39MulticurveV1,
+        derivation: Some(derivation.clone()),
+        retire_key_fingerprint: None,
+        path_template: derivation_profile.path_template().to_owned(),
+        key_spec: derivation_profile.key_spec(),
+        allowed_crypto_suites: derivation_profile.frozen_crypto_suites().to_vec(),
+        policy_version: wallet.policy_version.clone(),
+        revocation_epoch: wallet.wallet_revocation_epoch.clone(),
+        replay_id: operation_id.clone(),
+        expires_at_ms: bloom_broker_api::DecimalU64::new(expires_at_ms),
+        audit_purpose: bloom_broker_api::Token::new("allocate-derived-account")
+            .map_err(|error| machine_error(MachineErrorKind::InvalidParams, error.to_string()))?,
+    };
+    let exact_terms_digest = terms.request_digest().map_err(anyhow::Error::new)?;
+    let client = configured_broker_client(&daemon.home).map_err(|error| {
+        machine_error(
+            MachineErrorKind::Unavailable,
+            format!("custody requires the authenticated Machine-to-Broker edge: {error:#}"),
+        )
+    })?;
+    let response = client
+        .account_allocate(bloom_broker_api::CustodyPrepareRequest {
+            ceremony_kind: bloom_broker_api::CeremonyKind::AccountAllocate,
+            custody_operation_id: operation_id,
+            wallet_id: Some(wallet_id.clone()),
+            key_ref: None,
+            exact_terms_digest,
+            expected_input_class: bloom_broker_api::Token::new("generic-custody-v1")
+                .context("custody input class")?,
+            browser_output_recipient_key: None,
+            petal_key_scope: None,
+            legacy_passkey_migration: None,
+            wallet_seed_profile: None,
+            derivation_request: Some(derivation),
+            account_terms: Some(terms),
+        })
+        .await
+        .map_err(anyhow::Error::new)
+        .context("prepare Broker account allocation ceremony")?;
+    let projection = bloom_machine_client::CeremonyProjection::from_custody_prepare(
+        &response,
+        current_unix_ms(),
+    )
+    .map_err(anyhow::Error::new)
+    .context("construct Machine custody projection")?;
+    let projection_path = persist_ceremony_projection(&daemon.home, &projection)?;
     Ok(format!(
         "operation_id: {}\nceremony_kind: {:?}\nceremony_url: {}\nceremony_expires_at_ms: {}\nprojection: {}\n",
         response.custody_operation_id,
@@ -1084,6 +1200,25 @@ async fn execute_machine_command(
                 .await
                 .map_err(machine_wallet_lookup_error)?;
             format!("{}\n", serde_json::to_string_pretty(&projection)?)
+        }
+        MachineCommand::WalletAccounts { name } => {
+            let wallet_id = bloom_broker_api::Token::new(name)?;
+            let client = configured_broker_client(home).map_err(|error| {
+                machine_error(
+                    MachineErrorKind::Unavailable,
+                    format!("wallet accounts requires the authenticated Machine-to-Broker edge: {error:#}"),
+                )
+            })?;
+            let accounts = client
+                .wallet_accounts(wallet_id)
+                .await
+                .map_err(machine_wallet_lookup_error)?;
+            format!("{}\n", serde_json::to_string_pretty(&accounts)?)
+        }
+        MachineCommand::WalletAccountAllocate { name, profile } => {
+            let wallet_id = bloom_broker_api::Token::new(name)?;
+            let prepared = launch_account_allocation(daemon, &wallet_id, &profile).await?;
+            format!("{}\n", serde_json::to_string_pretty(&prepared)?)
         }
         MachineCommand::WalletAddress { name } => {
             let wallet_id = bloom_broker_api::Token::new(name)?;
@@ -2010,6 +2145,17 @@ enum WalletCmd {
     /// This contains public keys, public credential descriptors, and the
     /// signed policy snapshot; it never contains custody material.
     Projection { name: String },
+    /// Print the wallet's derived-account projection (BIP-39 `wallet.accounts`).
+    Accounts { name: String },
+    /// Start a Broker-hosted AccountAllocate ceremony to derive a new account
+    /// under the wallet's BIP-39 root.
+    AccountAllocate {
+        name: String,
+        /// Derivation profile: `bip44-evm-secp256k1-v1` or
+        /// `bip44-solana-slip10-ed25519-v1`.
+        #[arg(long)]
+        profile: String,
+    },
     /// Print a wallet's deposit address. Default output is the bare checksummed
     /// address (one line, scriptable); `--qr` adds a scannable QR block above it,
     /// and `--qr-out <path>` writes a scannable SVG of the address to a file.
@@ -2722,6 +2868,16 @@ async fn run(cli: Cli) -> Result<()> {
         }
         Cmd::Wallet(WalletCmd::Projection { name }) => {
             call_machine_command(&client_endpoint, MachineCommand::WalletProjection { name }).await
+        }
+        Cmd::Wallet(WalletCmd::Accounts { name }) => {
+            call_machine_command(&client_endpoint, MachineCommand::WalletAccounts { name }).await
+        }
+        Cmd::Wallet(WalletCmd::AccountAllocate { name, profile }) => {
+            call_machine_command(
+                &client_endpoint,
+                MachineCommand::WalletAccountAllocate { name, profile },
+            )
+            .await
         }
         Cmd::Wallet(WalletCmd::Address { name, qr, qr_out }) => {
             let result =

@@ -148,6 +148,19 @@ An advanced non-empty BIP-39 passphrase mode is deferred. Adding one later
 requires an explicit profile because losing or omitting the passphrase produces
 a different wallet while the words still appear valid.
 
+### Import word-count policy (12–24 words)
+
+Import accepts every standard BIP-39 English word count — 12, 15, 18, 21, or 24
+words, corresponding to 128, 160, 192, 224, or 256 bits of entropy — always with
+the empty passphrase and strict NFKD normalization plus checksum verification.
+The imported entropy length is recorded (`entropy_bits`) so a later export
+reproduces the exact word count that was imported; it is never rounded up to a
+"preferred" length. Wallet *generation* uses 256-bit entropy (24 words), but
+import is not restricted to it: a shorter valid mnemonic is a legitimate root,
+and every supported length derives the same way (entropy → mnemonic → PBKDF2
+seed → BIP-32/SLIP-10). Non-standard lengths, non-empty passphrases, and
+unnormalized input are rejected, not silently coerced.
+
 ### 5. Agent authority remains bounded signing authority
 
 Agents and Petals receive typed public child accounts plus scoped approval

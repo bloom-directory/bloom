@@ -1242,6 +1242,9 @@ impl PetalHost for DaemonPetalHost {
                     browser_output_recipient_key: None,
                     petal_key_scope: Some(scope.clone()),
                     legacy_passkey_migration: None,
+                    wallet_seed_profile: None,
+                    derivation_request: None,
+                    account_terms: None,
                 },
             )
             .await
@@ -4546,7 +4549,7 @@ mod tests {
                         MachineBrokerResponse::WalletGetPublic(bloom_broker_api::WalletPublic {
                             wallet_id: request.wallet_id,
                             wallet_kind: bloom_broker_api::Token::new("local").unwrap(),
-                            root_key_ref: self.root.clone(),
+                            root_key_ref: Some(self.root.clone()),
                             key_refs: vec![self.root.clone()],
                             policy_version: bloom_broker_api::DecimalU64::new(1),
                             policy_digest: bloom_broker_api::Digest32::from_bytes([0x32; 32]),
@@ -4706,7 +4709,7 @@ mod tests {
                             bloom_broker_api::WalletPublic {
                                 wallet_id: request.wallet_id,
                                 wallet_kind: bloom_broker_api::Token::new("local").unwrap(),
-                                root_key_ref: self.parent.clone(),
+                                root_key_ref: Some(self.parent.clone()),
                                 // A previously derived Petal child is also in the public
                                 // projection. It must never make root selection ambiguous.
                                 key_refs: vec![self.parent.clone(), self.child.clone()],
