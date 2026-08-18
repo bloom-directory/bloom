@@ -56,8 +56,8 @@ use bloom_broker_api::{
     PolicyCommitUpdateRequest, PolicyUpdatePrepareResponse, PolicyUpdateRequest, ProtocolError,
     ProtocolErrorCode, ProvenanceCatalog, ProvenanceSubject, RequestNonce, RevocationState,
     RevokeRequest, SealedApprovalPrepareResponse, SealedApprovalTerms, SignedPolicySnapshot,
-    SigningPayloads, SigningResult, Token, TypedRequestMethod, WalletOperationRequest,
-    WalletPublic, WalletRequest, is_read_only_method,
+    SigningPayloads, SigningResult, Token, TypedRequestMethod, WalletAccountsPublic,
+    WalletOperationRequest, WalletPublic, WalletRequest, is_read_only_method,
 };
 use bloom_triad_local_transport::{LocalIdentity, PeerAcl};
 use serde::{Deserialize, Serialize};
@@ -761,7 +761,7 @@ impl MachineBrokerClient {
             }
         };
         let key_ref = self
-            .verified_wallet_root(&wallet, request.crypto_suite)
+            .verified_signing_key(&wallet, request.crypto_suite)
             .await?;
         let activation_mode = request
             .activation_mode
@@ -915,7 +915,7 @@ impl MachineBrokerClient {
             }
         };
         let key_ref = self
-            .verified_wallet_root(&wallet, request.crypto_suite)
+            .verified_signing_key(&wallet, request.crypto_suite)
             .await?;
         let activation_mode = request
             .activation_mode
@@ -1056,7 +1056,7 @@ impl MachineBrokerClient {
         }
         let wallet = self.wallet(request.wallet_id.clone()).await?;
         let key_ref = self
-            .verified_wallet_root(&wallet, request.crypto_suite)
+            .verified_signing_key(&wallet, request.crypto_suite)
             .await?;
         let activation_mode = request
             .activation_mode
@@ -1408,6 +1408,37 @@ impl MachineBrokerClient {
         }
     }
 
+    /// The wallet's derived-account projection (BIP-39 only). Imported-scalar
+    /// and legacy wallets project an empty collection.
+    pub async fn wallet_accounts(
+        &self,
+        wallet_id: Token,
+    ) -> Result<WalletAccountsPublic, ProtocolError> {
+        match self
+            .request(MachineBrokerRequest::WalletAccounts(WalletRequest {
+                wallet_id,
+            }))
+            .await?
+        {
+            MachineBrokerResponse::WalletAccounts(accounts) => Ok(accounts),
+            _ => Err(response_mismatch("wallet.accounts")),
+        }
+    }
+
+    /// Prepare an AccountAllocate custody ceremony bound to exact terms.
+    pub async fn account_allocate(
+        &self,
+        request: CustodyPrepareRequest,
+    ) -> Result<CustodyPrepareResponse, ProtocolError> {
+        match self
+            .request(MachineBrokerRequest::AccountAllocatePrepare(request))
+            .await?
+        {
+            MachineBrokerResponse::AccountAllocatePrepare(prepared) => Ok(prepared),
+            _ => Err(response_mismatch("account.allocate_prepare")),
+        }
+    }
+
     pub async fn key(&self, request: KeyRequest) -> Result<KeyPublic, ProtocolError> {
         match self
             .request(MachineBrokerRequest::KeyGetPublic(request))
@@ -1418,42 +1449,63 @@ impl MachineBrokerClient {
         }
     }
 
-    async fn verified_wallet_root(
+    /// The wallet's signable key for `suite`: the root for legacy/imported-scalar
+    /// wallets, or the single derived child whose key spec matches `suite` for
+    /// BIP-39 wallets (whose root is a non-signable seed).
+    async fn verified_signing_key(
         &self,
         wallet: &WalletPublic,
         suite: CryptoSuite,
     ) -> Result<KeyRef, ProtocolError> {
-        let root = wallet.root_key_ref.clone();
-        if !wallet.key_refs.contains(&root) {
+        let (key_ref, expected_role) = match &wallet.root_key_ref {
+            Some(root) => (root.clone(), KeyRole::WalletRoot),
+            None => {
+                let matching: Vec<&KeyRef> = wallet
+                    .key_refs
+                    .iter()
+                    .filter(|key| key.key_spec == suite.key_spec())
+                    .collect();
+                match matching.as_slice() {
+                    [child] => ((*child).clone(), KeyRole::Derived),
+                    _ => {
+                        return Err(ProtocolError::new(
+                            ProtocolErrorCode::KeyrefMismatch,
+                            "BIP-39 wallet must have exactly one derived child for the requested CryptoSuite",
+                        ));
+                    }
+                }
+            }
+        };
+        if !wallet.key_refs.contains(&key_ref) {
             return Err(ProtocolError::new(
                 ProtocolErrorCode::KeyrefMismatch,
-                "wallet root key is absent from the wallet key set",
+                "wallet signing key is absent from the wallet key set",
             ));
         }
-        if root.key_spec != suite.key_spec() {
+        if key_ref.key_spec != suite.key_spec() {
             return Err(ProtocolError::new(
                 ProtocolErrorCode::SuiteNotAllowed,
-                "wallet root key is incompatible with the requested CryptoSuite",
+                "wallet signing key is incompatible with the requested CryptoSuite",
             ));
         }
         let public = self
             .key(KeyRequest {
-                key_ref: root.clone(),
+                key_ref: key_ref.clone(),
             })
             .await?;
-        if public.key_ref != root || public.role != KeyRole::WalletRoot {
+        if public.key_ref != key_ref || public.role != expected_role {
             return Err(ProtocolError::new(
                 ProtocolErrorCode::KeyrefMismatch,
-                "Broker did not confirm the selected wallet root",
+                "Broker did not confirm the selected wallet signing key",
             ));
         }
         if !public.supported_crypto_suites.contains(&suite) {
             return Err(ProtocolError::new(
                 ProtocolErrorCode::SuiteNotAllowed,
-                "wallet root does not support the requested CryptoSuite",
+                "wallet signing key does not support the requested CryptoSuite",
             ));
         }
-        Ok(root)
+        Ok(key_ref)
     }
 
     pub async fn credentials(
@@ -2905,7 +2957,7 @@ mod tests {
             wallet: WalletPublic {
                 wallet_id: token("wallet"),
                 wallet_kind: token("local"),
-                root_key_ref: key_ref.clone(),
+                root_key_ref: Some(key_ref.clone()),
                 key_refs: vec![key_ref.clone()],
                 policy_version: DecimalU64::new(7),
                 policy_digest: digest(7),
@@ -2974,7 +3026,7 @@ mod tests {
             wallet: WalletPublic {
                 wallet_id: token("wallet"),
                 wallet_kind: token("local"),
-                root_key_ref: root_key_ref.clone(),
+                root_key_ref: Some(root_key_ref.clone()),
                 key_refs: vec![root_key_ref],
                 policy_version: DecimalU64::new(7),
                 policy_digest: digest(7),
@@ -3178,7 +3230,7 @@ mod tests {
             wallet: WalletPublic {
                 wallet_id: token("wallet"),
                 wallet_kind: token("local"),
-                root_key_ref: root_key_ref.clone(),
+                root_key_ref: Some(root_key_ref.clone()),
                 key_refs: vec![derived_key_ref, root_key_ref.clone()],
                 policy_version: DecimalU64::new(7),
                 policy_digest: digest(7),
@@ -3245,7 +3297,7 @@ mod tests {
             wallet: WalletPublic {
                 wallet_id: token("wallet"),
                 wallet_kind: token("local"),
-                root_key_ref: key_ref(),
+                root_key_ref: Some(key_ref()),
                 key_refs: vec![key_ref()],
                 policy_version: DecimalU64::new(7),
                 policy_digest: digest(7),
@@ -3290,7 +3342,7 @@ mod tests {
             wallet: WalletPublic {
                 wallet_id: token("wallet"),
                 wallet_kind: token("local"),
-                root_key_ref: key_ref(),
+                root_key_ref: Some(key_ref()),
                 key_refs: vec![key_ref()],
                 policy_version: DecimalU64::new(7),
                 policy_digest: digest(7),
@@ -3371,7 +3423,7 @@ mod tests {
             wallet: WalletPublic {
                 wallet_id: token("wallet"),
                 wallet_kind: token("local"),
-                root_key_ref: key_ref(),
+                root_key_ref: Some(key_ref()),
                 key_refs: vec![key_ref()],
                 policy_version: DecimalU64::new(1),
                 policy_digest: digest(1),
@@ -3396,7 +3448,7 @@ mod tests {
             wallet: WalletPublic {
                 wallet_id: token("wallet"),
                 wallet_kind: token("local"),
-                root_key_ref: key_ref(),
+                root_key_ref: Some(key_ref()),
                 key_refs: vec![key_ref()],
                 policy_version: DecimalU64::new(1),
                 policy_digest: digest(1),
@@ -3421,7 +3473,7 @@ mod tests {
             wallet: WalletPublic {
                 wallet_id: token("wallet"),
                 wallet_kind: token("local"),
-                root_key_ref: key_ref(),
+                root_key_ref: Some(key_ref()),
                 key_refs: vec![key_ref()],
                 policy_version: DecimalU64::new(1),
                 policy_digest: digest(1),
@@ -3572,7 +3624,7 @@ mod tests {
             wallet: WalletPublic {
                 wallet_id: token("wallet"),
                 wallet_kind: token("local"),
-                root_key_ref: key_ref(),
+                root_key_ref: Some(key_ref()),
                 key_refs: vec![key_ref()],
                 policy_version: DecimalU64::new(1),
                 policy_digest: digest(1),
@@ -3611,7 +3663,7 @@ mod tests {
             wallet: WalletPublic {
                 wallet_id: token("wallet"),
                 wallet_kind: token("local"),
-                root_key_ref: key_ref(),
+                root_key_ref: Some(key_ref()),
                 key_refs: vec![key_ref()],
                 policy_version: DecimalU64::new(1),
                 policy_digest: digest(1),
@@ -3644,7 +3696,7 @@ mod tests {
             wallet: WalletPublic {
                 wallet_id: token("wallet"),
                 wallet_kind: token("local"),
-                root_key_ref: key_ref(),
+                root_key_ref: Some(key_ref()),
                 key_refs: vec![key_ref()],
                 policy_version: DecimalU64::new(1),
                 policy_digest: digest(1),
@@ -3697,7 +3749,7 @@ mod tests {
             wallet: WalletPublic {
                 wallet_id: token("wallet"),
                 wallet_kind: token("local"),
-                root_key_ref: key_ref(),
+                root_key_ref: Some(key_ref()),
                 key_refs: vec![key_ref()],
                 policy_version: DecimalU64::new(2),
                 policy_digest: digest(82),
@@ -3758,6 +3810,9 @@ mod tests {
             browser_output_recipient_key: None,
             petal_key_scope: None,
             legacy_passkey_migration: None,
+            wallet_seed_profile: None,
+            derivation_request: None,
+            account_terms: None,
         };
         assert_eq!(
             client
@@ -3812,7 +3867,7 @@ mod tests {
             wallet: WalletPublic {
                 wallet_id: token("wallet"),
                 wallet_kind: token("local"),
-                root_key_ref: key_ref(),
+                root_key_ref: Some(key_ref()),
                 key_refs: vec![key_ref()],
                 policy_version: DecimalU64::new(2),
                 policy_digest: digest(82),

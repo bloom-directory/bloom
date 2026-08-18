@@ -73,7 +73,7 @@ impl ExactSigningBrokerFixture {
         WalletPublic {
             wallet_id,
             wallet_kind: Token::new("local").unwrap(),
-            root_key_ref: self.key_ref.clone(),
+            root_key_ref: Some(self.key_ref.clone()),
             key_refs: vec![self.key_ref.clone()],
             policy_version: DecimalU64::new(1),
             policy_digest: policy.policy_digest,

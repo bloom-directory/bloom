@@ -50,7 +50,7 @@ impl MachineBrokerService for ExactBroker {
                     Ok(MachineBrokerResponse::WalletGetPublic(self.wallet.clone()))
                 }
                 MachineBrokerRequest::KeyGetPublic(request)
-                    if request.key_ref == self.wallet.root_key_ref =>
+                    if Some(request.key_ref.clone()) == self.wallet.root_key_ref =>
                 {
                     Ok(MachineBrokerResponse::KeyGetPublic(KeyPublic {
                         key_ref: request.key_ref,
@@ -140,7 +140,7 @@ fn projection(address: String) -> (WalletPublic, Arc<dyn WalletProjectionReader>
     let wallet = WalletPublic {
         wallet_id: token("alice"),
         wallet_kind: token("local"),
-        root_key_ref: key_ref.clone(),
+        root_key_ref: Some(key_ref.clone()),
         key_refs: vec![key_ref.clone()],
         policy_version: DecimalU64::new(1),
         policy_digest: policy_digest.clone(),

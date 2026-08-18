@@ -645,6 +645,13 @@ pub enum MachineCommand {
     WalletProjection {
         name: String,
     },
+    WalletAccounts {
+        name: String,
+    },
+    WalletAccountAllocate {
+        name: String,
+        profile: String,
+    },
     WalletAddress {
         name: String,
     },
