@@ -183,6 +183,17 @@ proposal expires or is cancelled, query or cancel it by its exact action ID and
 replay its byte-identical policy once to reconcile the mounted lifecycle before
 staging different bytes.
 
+A session consumes more than one counter, so the next run does not simply start
+one higher. Creating a session stages two owner ceremonies — the Signer key
+derivation, then the `approve_agent` signature that registers the agent with the
+venue — and each completion must use a strictly greater counter than the last
+accepted one. Starting from `BLOOM_EVAL_AUTHENTICATOR_SIGN_COUNT=N`, a session
+therefore consumes `N` and `N+1`, and the next run must start at `N+2` or above.
+The harness reports the first counter it did not consume in its failure text;
+prefer that value over recounting by hand. A counter that is not strictly
+greater than the last accepted one is rejected, which fails the run without
+placing an order.
+
 The launcher pins Harbor 0.21.0 by default and then delegates to the reusable
 Python harness under `evals/harbor/harness`. The harness uses Harbor's public
 `JobConfig`, `Job.create()`, and `Job.run()` API rather than spawning the Harbor

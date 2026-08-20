@@ -488,6 +488,76 @@ class HyperliquidDefinitionTests(unittest.TestCase):
         self.assertRegex(upper, r"^[a-z0-9-]{64}$")
         self.assertNotEqual(upper, lower)
 
+    def test_session_completes_both_ceremonies_with_increasing_counters(self) -> None:
+        # Creating a session stages key derivation and then agent approval.
+        # Completing only the first leaves the session permanently pending.
+        writes: list[tuple[Path, bytes]] = []
+        pending = ["key", "approve"]
+
+        def write(path: Path, body: bytes, _timeout: int) -> SimpleNamespace:
+            writes.append((path, body))
+            return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+
+        def key_ceremony() -> str | None:
+            return (
+                "http://localhost:18734/ceremony/" + "k" * 28
+                if pending and pending[0] == "key"
+                else None
+            )
+
+        def approve_ceremony() -> str | None:
+            return (
+                "http://localhost:18734/ceremony/" + "a" * 28
+                if pending and pending[0] == "approve"
+                else None
+            )
+
+        def read(path: Path, timeout: int = 20) -> object:
+            del timeout
+            if path.name == "status.json" and not pending:
+                request = json.loads(writes[0][1])
+                return {
+                    "schema": "bloom.hyperliquid_agent_session.v1",
+                    "network": "mainnet",
+                    "wallet": self.wallet,
+                    "id": request["id"],
+                    "max_notional_usd": "11",
+                    "max_leverage": 1,
+                    "assets": ["0"],
+                    "stopped": False,
+                }
+            return None
+
+        counters: list[str] = []
+
+        def fake_run(cmd, **kwargs):
+            del kwargs
+            counters.append(cmd[cmd.index("--sign-count") + 1])
+            if pending:
+                pending.pop(0)
+            return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+
+        self.definition._write_route = mock.Mock(side_effect=write)
+        self.definition._read_json_if_exists = mock.Mock(side_effect=read)
+        self.definition._pending_petal_key_ceremony = mock.Mock(
+            side_effect=key_ceremony
+        )
+        self.definition._pending_agent_approval_ceremony = mock.Mock(
+            side_effect=approve_ceremony
+        )
+
+        with mock.patch(
+            "harness.hyperliquid_order_cancel.subprocess.run", side_effect=fake_run
+        ):
+            self.definition.provision("codex")
+
+        # Both ceremonies ran, and no WebAuthn counter was reused: the venue
+        # rejects any counter that is not strictly greater than the last.
+        self.assertEqual(len(counters), 2)
+        base = int(self.definition.sign_count_value)
+        self.assertEqual(counters, [str(base), str(base + 1)])
+        self.assertEqual(self.definition.next_sign_count, base + 2)
+
     def test_session_route_is_addressed_by_wallet_id_not_owner_address(self) -> None:
         written: list[tuple[Path, bytes]] = []
 

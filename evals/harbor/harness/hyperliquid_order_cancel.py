@@ -38,6 +38,10 @@ HYPERLIQUID_SESSION_ACTION_ROUTES = (
     "[network]/agent_sessions/[wallet]/[session]/update_leverage.json",
 )
 ACTION_FILES = ("order.json", "cancel.json", "update_leverage.json", "cancel_all")
+# Session creation currently stages two owner ceremonies, key derivation then
+# agent approval. The cap bounds a misbehaving route rather than describing the
+# expected count, and is deliberately larger than two.
+MAX_SESSION_CEREMONIES = 4
 
 
 def session_key_slot(session_id: str) -> str:
@@ -78,6 +82,9 @@ class HyperliquidOrderCancelEval(EvalDefinition):
         self.seed_file = Path(self.seed_file_value)
         self.sign_count_value = self.env.get("BLOOM_EVAL_AUTHENTICATOR_SIGN_COUNT", "")
         self.sign_count: int | None = None
+        # The first counter this run has not consumed. A session spends one per
+        # ceremony, so the operator's next run must start at or above this.
+        self.next_sign_count: int | None = None
         self.jobs_dir = Path(
             self.env.get(
                 "BLOOM_EVAL_JOBS_DIR", str(self.repo_root / "evals/harbor/jobs")
@@ -203,6 +210,51 @@ class HyperliquidOrderCancelEval(EvalDefinition):
                 matches.append(ceremony_url)
         if len(matches) > 1:
             raise EvalError("multiple Petal key ceremonies match the exact session")
+        return matches[0] if matches else None
+
+    def _pending_agent_approval_ceremony(self) -> str | None:
+        """Resolve the owner approval that registers the session's API agent.
+
+        Creating a session stages two owner ceremonies: the Signer key
+        derivation, published under `petal-key-requests`, and then the
+        `approve_agent` signature, published here. This projection carries no
+        session id, so bind it as tightly as the available fields allow and
+        refuse to act when more than one candidate matches.
+        """
+        root = self.bloom_mount / "petal-signing-requests"
+        try:
+            names = sorted(os.listdir(root))
+        except FileNotFoundError:
+            return None
+        except OSError as error:
+            raise EvalError(
+                f"could not list owner Petal signing requests: {error}"
+            ) from error
+        matches: list[str] = []
+        for name in names:
+            if re.fullmatch(r"[0-9a-f]{64}\.json", name) is None:
+                continue
+            record = self._read_json(root / name)
+            if not isinstance(record, dict):
+                continue
+            if (
+                record.get("schema") != "bloom.machine.petal-signing-request.v1"
+                or record.get("status") != "awaiting_owner_approval"
+                or record.get("wallet") != self.wallet_id
+                or record.get("package_hash") != self.package_hash
+                or record.get("operation_class") != "hyperliquid.approve_agent"
+            ):
+                continue
+            ceremony_url = record.get("ceremony_url")
+            if not isinstance(ceremony_url, str):
+                continue
+            if CEREMONY_URL.fullmatch(ceremony_url) is None:
+                raise EvalError(
+                    "owner Petal signing request has an invalid ceremony URL"
+                )
+            matches.append(ceremony_url)
+        if len(matches) > 1:
+            raise EvalError("multiple agent-approval ceremonies match the exact wallet")
         return matches[0] if matches else None
 
     def _redact_ceremony_urls(self, output: str) -> str:
@@ -639,28 +691,43 @@ class HyperliquidOrderCancelEval(EvalDefinition):
 
         first = self._write_route(new_route, body, 45)
         output = (first.stdout + first.stderr).decode(errors="replace")
+        last_output = output
         status_data: Any | None = None
-        ceremony_url: str | None = None
-        output_match = CEREMONY_URL.search(output)
 
-        # Mounted Petal writes are asynchronous. A zero write exit code means
-        # accepted for dispatch, not that the route completed successfully.
-        # Wait for one of the two durable owner-visible outcomes regardless of
-        # the write result: a bounded session or a key-derivation ceremony.
-        for _ in range(50):
-            status_data = self._read_json_if_exists(self.session_base / "status.json")
-            if status_data is not None:
-                break
-            ceremony_url = (
-                output_match.group(0)
-                if output_match is not None
-                else self._pending_petal_key_ceremony()
-            )
-            if ceremony_url is not None:
-                break
-            time.sleep(0.2)
+        # Creating a session stages more than one owner ceremony: the Signer
+        # key derivation, then the `approve_agent` signature that registers the
+        # agent with the venue. Completing only the first leaves the session
+        # permanently pending, so drive ceremonies until a bounded session
+        # exists. Each WebAuthn completion must use a strictly greater counter
+        # than the last accepted one, so the counter advances per ceremony and
+        # is never reused.
+        counter = sign_count
+        for _ in range(MAX_SESSION_CEREMONIES):
+            ceremony_url: str | None = None
+            # Mounted Petal writes are asynchronous. A zero write exit code
+            # means accepted for dispatch, not that the route completed.
+            for _ in range(50):
+                status_data = self._read_json_if_exists(
+                    self.session_base / "status.json"
+                )
+                if status_data is not None:
+                    break
+                match = CEREMONY_URL.search(last_output)
+                ceremony_url = (
+                    match.group(0)
+                    if match is not None
+                    else (
+                        self._pending_petal_key_ceremony()
+                        or self._pending_agent_approval_ceremony()
+                    )
+                )
+                if ceremony_url is not None:
+                    break
+                time.sleep(0.2)
 
-        if status_data is None and ceremony_url is not None:
+            if status_data is not None or ceremony_url is None:
+                break
+
             try:
                 completed = subprocess.run(
                     [
@@ -670,7 +737,7 @@ class HyperliquidOrderCancelEval(EvalDefinition):
                         "--authenticator-seed-file",
                         str(self.seed_file),
                         "--sign-count",
-                        str(sign_count),
+                        str(counter),
                     ],
                     check=False,
                     capture_output=True,
@@ -684,24 +751,24 @@ class HyperliquidOrderCancelEval(EvalDefinition):
                 ) from error
             if completed.returncode != 0:
                 raise EvalError(
-                    "session key ceremony failed: " + self._redact_ceremony_urls(output)
+                    f"session ceremony failed at sign count {counter} "
+                    f"(next unused counter is {counter + 1}): "
+                    + self._redact_ceremony_urls(output)
                 )
+            counter += 1
+            self.next_sign_count = counter
 
             # Replay byte-identical session terms only after the owner ceremony
             # succeeds; WebAuthn counter reuse is never attempted.
             retry = self._write_route(new_route, body, 45)
-            output += (retry.stdout + retry.stderr).decode(errors="replace")
-            for _ in range(50):
-                status_data = self._read_json_if_exists(
-                    self.session_base / "status.json"
-                )
-                if status_data is not None:
-                    break
-                time.sleep(0.2)
+            last_output = (retry.stdout + retry.stderr).decode(errors="replace")
+            output += last_output
 
         if status_data is None:
             raise EvalError(
-                "session creation failed without durable session or ceremony readback: "
+                "session creation failed without durable session or ceremony "
+                f"readback after consuming sign counts {sign_count}..{counter - 1} "
+                f"(next unused counter is {counter}): "
                 + self._redact_ceremony_urls(output)
             )
 
