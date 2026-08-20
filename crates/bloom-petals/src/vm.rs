@@ -1447,7 +1447,13 @@ async fn component_petal_key_request(
                 ))),
             ),
         },
-        Err(error) => set_component_result(results, component_host_err(error)),
+        Err(error) => {
+            // The guest collapses a host error to its variant name, so the
+            // reason reaches neither the Petal nor the mount. Record it
+            // host-side, where it is not observable by an evaluated agent.
+            log_host_error(store.data(), "component_petal_key_request", &error);
+            set_component_result(results, component_host_err(error))
+        }
     }
 }
 
@@ -2618,6 +2624,16 @@ fn link_vfs_imports(linker: &mut Linker<StoreData>, module: &'static str) -> any
         },
     )?;
     Ok(())
+}
+
+fn log_host_error(d: &StoreData, op: &str, error: &HostError) {
+    tracing::warn!(
+        target: "bloom_petals::vm",
+        petal = %d.petal_hash,
+        op,
+        error = %error,
+        "host call failed"
+    );
 }
 
 fn log_denied(d: &StoreData, op: &str) {

@@ -234,7 +234,14 @@ class HyperliquidOrderCancelEval(EvalDefinition):
         for name in names:
             if re.fullmatch(r"[0-9a-f]{64}\.json", name) is None:
                 continue
-            record = self._read_json(root / name)
+            # An expired signing request stays listed but stops rendering, so
+            # reading it fails with an IO error. A record this scan cannot read
+            # is not a candidate for completion; refusing to scan at all would
+            # let one stale entry block every later run.
+            try:
+                record = self._read_json(root / name)
+            except EvalError:
+                continue
             if not isinstance(record, dict):
                 continue
             if (
