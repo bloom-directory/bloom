@@ -488,6 +488,56 @@ class HyperliquidDefinitionTests(unittest.TestCase):
         self.assertRegex(upper, r"^[a-z0-9-]{64}$")
         self.assertNotEqual(upper, lower)
 
+    def test_session_route_is_addressed_by_wallet_id_not_owner_address(self) -> None:
+        written: list[tuple[Path, bytes]] = []
+
+        def write(path: Path, body: bytes, _timeout: int) -> SimpleNamespace:
+            written.append((path, body))
+            return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+
+        def read(path: Path, timeout: int = 20) -> object:
+            del timeout
+            if path.name == "status.json":
+                request = __import__("json").loads(written[0][1])
+                return {
+                    "schema": "bloom.hyperliquid_agent_session.v1",
+                    "network": "mainnet",
+                    "wallet": self.wallet,
+                    "id": request["id"],
+                    "max_notional_usd": "11",
+                    "max_leverage": 1,
+                    "assets": ["0"],
+                    "stopped": False,
+                }
+            raise AssertionError(path)
+
+        self.definition._write_route = mock.Mock(side_effect=write)
+        self.definition._read_json_if_exists = mock.Mock(side_effect=read)
+        context = self.definition.provision("codex")
+
+        # Owner signing for approve_agent validates the `[wallet]` segment as a
+        # Broker token: 1-64 bytes of [a-z0-9._/-] that must begin with a
+        # lowercase letter. An on-chain address begins with a digit, so passing
+        # one here fails inside Broker as an unqualified permission error.
+        route_parts = written[0][0].parts
+        segment = route_parts[route_parts.index("agent_sessions") + 1]
+        self.assertEqual(segment, self.definition.wallet_id)
+        self.assertNotEqual(segment, self.definition.wallet)
+        self.assertRegex(segment, r"^[a-z][a-z0-9._/-]{0,63}$")
+
+        # The address still has to reach the Petal, just in the body.
+        request = __import__("json").loads(written[0][1])
+        self.assertEqual(request["owner_address"], self.definition.wallet)
+
+        # The container's bind-mount targets must agree with the host paths, and
+        # the agent needs both identifiers to address sessions and account reads.
+        for mount in context.mounts[1:]:
+            self.assertIn(f"/agent_sessions/{self.definition.wallet_id}/", mount["target"])
+        self.assertEqual(
+            context.agent_env["BLOOM_EVAL_WALLET_ID"], self.definition.wallet_id
+        )
+        self.assertEqual(context.agent_env["BLOOM_EVAL_WALLET"], self.definition.wallet)
+
     def test_provision_creates_session_then_builds_least_authority_mounts(self) -> None:
         written: list[tuple[Path, bytes]] = []
 

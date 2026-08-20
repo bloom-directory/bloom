@@ -616,12 +616,18 @@ class HyperliquidOrderCancelEval(EvalDefinition):
         random_hex = secrets.token_hex(8)
         self.session_id = f"bloom-eval-{agent_name}-{stamp}-{random_hex}"
         cloid = "0x" + hashlib.sha256(self.session_id.encode()).hexdigest()[:32]
+        # The `[wallet]` path segment is a Bloom wallet id, not an on-chain
+        # address. Owner signing for `approve_agent` validates that segment as a
+        # Broker token, which must start with a lowercase letter, so a `0x…`
+        # address fails deep inside signing as an unqualified permission error.
+        # The address travels in `owner_address` instead.
         self.session_base = (
-            self.network_root / "agent_sessions" / self.wallet / self.session_id
+            self.network_root / "agent_sessions" / self.wallet_id / self.session_id
         )
         request = {
             "id": self.session_id,
             "wallet_id": self.wallet_id,
+            "owner_address": self.wallet,
             "agent_name": f"be-{agent_name[:3]}-{random_hex[:8]}",
             "duration_ms": 1_800_000,
             "max_notional_usd": "11",
@@ -629,7 +635,7 @@ class HyperliquidOrderCancelEval(EvalDefinition):
             "assets": ["0"],
         }
         body = json.dumps(request, separators=(",", ":")).encode()
-        new_route = self.network_root / "agent_sessions" / self.wallet / "new.json"
+        new_route = self.network_root / "agent_sessions" / self.wallet_id / "new.json"
 
         first = self._write_route(new_route, body, 45)
         output = (first.stdout + first.stderr).decode(errors="replace")
@@ -725,7 +731,7 @@ class HyperliquidOrderCancelEval(EvalDefinition):
         ]
         container_base = (
             f"/bloom/petals/hyperliquid/mainnet/agent_sessions/"
-            f"{self.wallet}/{self.session_id}"
+            f"{self.wallet_id}/{self.session_id}"
         )
         mounts.extend(
             {
@@ -735,8 +741,12 @@ class HyperliquidOrderCancelEval(EvalDefinition):
             }
             for action in ACTION_FILES
         )
+        # Both identifiers are required and are not interchangeable. Session
+        # routes are addressed by wallet id; Hyperliquid account queries under
+        # `users/[account]/` are addressed by the on-chain address.
         runtime_env = {
             "BLOOM_EVAL_WALLET": self.wallet,
+            "BLOOM_EVAL_WALLET_ID": self.wallet_id,
             "BLOOM_EVAL_SESSION_ID": self.session_id,
             "BLOOM_EVAL_CLOID": cloid,
         }
