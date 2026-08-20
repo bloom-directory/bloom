@@ -23,10 +23,17 @@ audit data outside the agent-controlled container.
 
 ## Prerequisites
 
-- Linux with Docker, `uv`, Python 3, Claude Code and/or Codex auth. Use a
-  dedicated, revocable model credential for evals rather than an unrelated
-  production credential.
-- A running Bloom triad mounted at `/bloom`, with the Hyperliquid Petal installed.
+- Linux or macOS with Docker, `uv`, Python 3.11 or newer (`scripts/test-harbor-evals.sh`
+  reads task TOML with `tomllib`), Claude Code and/or Codex auth. Use
+  a dedicated, revocable model credential for evals rather than an unrelated
+  production credential. macOS works when its NFS 4.1 client can mount the
+  Machine export; this is per-machine, so verify with `--mount` before relying
+  on it.
+- A running Bloom triad mounted at `/bloom`, with the Hyperliquid Petal
+  installed. Set `BLOOM_EVAL_BLOOM_MOUNT` when the mount is somewhere else; the
+  `/bloom` paths throughout this document are then relative to that value. A
+  home-directory mount avoids needing `/etc/synthetic.conf` on macOS, whose
+  sealed system volume will not accept a bare `mkdir /bloom`.
 - A dedicated mainnet wallet created with the deterministic Broker debug-driver
   credential. Do not use a wallet with any open order or position.
 - A built `bloom-broker-debug-driver` from the sibling `bloom-broker` repository.
@@ -112,8 +119,7 @@ it can be restored after the trial:
 ```bash
 policy_file=$(mktemp)
 original_policy=$(mktemp)
-pending_before=$(mktemp)
-trap 'rm -f "$policy_file" "$original_policy" "$pending_before"' EXIT
+trap 'rm -f "$policy_file" "$original_policy"' EXIT
 cat "/bloom/wallets/$BLOOM_EVAL_WALLET_ID/policy.json" >"$original_policy"
 python3 - "$BLOOM_EVAL_WALLET_ID" "$BLOOM_EVAL_HYPERLIQUID_PACKAGE_HASH" "$policy_file" "$original_policy" <<'PY'
 import json, pathlib, sys
@@ -130,12 +136,31 @@ if original != expected_original:
     raise SystemExit("original eval-wallet policy is not deny-by-default")
 PY
 
-# First write stages validation and returns the owner-approval boundary.
-ls "/bloom/wallets/$BLOOM_EVAL_WALLET_ID/policy-updates/pending" | sort >"$pending_before"
+# First write stages validation and returns the owner-approval boundary. The
+# pending entry is published asynchronously, so listing the pending directory
+# immediately after the write can still observe nothing, particularly over an
+# NFS mount. Resolve the staged action through `policy-updates/latest`, which
+# points at the most recently staged pending action and is absent whenever none
+# is pending, then confirm it is bound to these exact proposed bytes.
 cp "$policy_file" "/bloom/wallets/$BLOOM_EVAL_WALLET_ID/policy.json"
-action_id=$(comm -13 "$pending_before" <(ls "/bloom/wallets/$BLOOM_EVAL_WALLET_ID/policy-updates/pending" | sort))
-[ "$(printf '%s\n' "$action_id" | sed '/^$/d' | wc -l)" -eq 1 ]
-challenge="/bloom/wallets/$BLOOM_EVAL_WALLET_ID/policy-updates/pending/$action_id/approval_challenge.json"
+challenge="/bloom/wallets/$BLOOM_EVAL_WALLET_ID/policy-updates/latest/approval_challenge.json"
+# Allow a generous window: publication is fast on a warm Machine but has taken
+# well over ten seconds on the first staged update after a restart.
+for _ in $(seq 1 120); do
+  [ -r "$challenge" ] && break
+  sleep 0.5
+done
+[ -r "$challenge" ] || { echo "no policy-update ceremony was staged" >&2; exit 1; }
+proposed_digest=$(python3 -c \
+  'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],"rb").read().rstrip(b"\n")).hexdigest())' \
+  "$policy_file")
+python3 - "$challenge" "$proposed_digest" <<'PY'
+import json, sys
+projection = json.load(open(sys.argv[1]))
+if projection["proposed_policy_digest"] != sys.argv[2]:
+    raise SystemExit("staged ceremony is bound to different canonical policy bytes")
+PY
+action_id=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["operation_id"])' "$challenge")
 ceremony_url=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["ceremony_url"])' "$challenge")
 
 bloom-broker-debug-driver complete "$ceremony_url" \
