@@ -1173,6 +1173,12 @@ impl PetalHost for DaemonPetalHost {
             HostError::Backend("SERVICE_UNAVAILABLE: Broker client is not configured".into())
         })?;
         let context = req.context.as_ref().ok_or_else(|| {
+            warn!(
+                wallet = %req.wallet,
+                operation_class = %req.operation_class,
+                reason = "request carried no trusted Petal route context",
+                "petal.sign_payload_denied"
+            );
             HostError::Denied("payload signing requires trusted Petal route provenance".into())
         })?;
         let crypto_suite = match req.signature_algorithm.as_str() {
@@ -1204,6 +1210,14 @@ impl PetalHost for DaemonPetalHost {
             .map_err(|error| HostError::Invalid(error.to_string()))?;
         if req.selector == bloom_broker_api::PetalSignSelector::Exact {
             if req.key_ref.is_some() {
+                warn!(
+                    wallet = %req.wallet,
+                    operation_class = %req.operation_class,
+                    package_hash = %context.package_hash,
+                    route = %context.route_id,
+                    reason = "exact Petal signing supplied a key reference",
+                    "petal.sign_payload_denied"
+                );
                 return Err(HostError::Denied(
                     "exact Petal signing uses Machine-owned root selection and approval state"
                         .into(),
@@ -1225,6 +1239,15 @@ impl PetalHost for DaemonPetalHost {
                 .as_deref()
                 .is_some_and(|hint| hint != request_id)
             {
+                warn!(
+                    wallet = %req.wallet,
+                    operation_class = %req.operation_class,
+                    package_hash = %context.package_hash,
+                    route = %context.route_id,
+                    request_id = %request_id,
+                    reason = "approval hint does not match the derived request id",
+                    "petal.sign_payload_denied"
+                );
                 return Err(HostError::Denied(
                     "approval artifact does not match the exact Petal operation".into(),
                 ));
@@ -1269,7 +1292,24 @@ impl PetalHost for DaemonPetalHost {
                     req.claim_assurance_evidence.as_deref(),
                 )
                 .await
-                .map_err(HostError::Denied)?;
+                .map_err(|reason| {
+                    // Host-side only. The Petal guest and the mount both
+                    // collapse this to an unqualified permission error, so
+                    // without this line an operator cannot tell which
+                    // condition refused the signature. Machine logs never
+                    // enter an evaluated agent's container, so recording the
+                    // reason here does not widen what the guest can observe.
+                    warn!(
+                        wallet = %req.wallet,
+                        operation_class = %req.operation_class,
+                        package_hash = %context.package_hash,
+                        route = %context.route_id,
+                        request_id = %request_id,
+                        reason = %reason,
+                        "petal.sign_payload_denied"
+                    );
+                    HostError::Denied(reason)
+                })?;
             return match outcome {
                 bloom_vfs::ExactPayloadOutcome::ApprovalRequired {
                     approval_id,
