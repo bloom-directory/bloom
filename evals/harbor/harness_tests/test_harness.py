@@ -519,7 +519,7 @@ class HyperliquidDefinitionTests(unittest.TestCase):
                 return {
                     "schema": "bloom.hyperliquid_agent_session.v1",
                     "network": "mainnet",
-                    "wallet": self.wallet,
+                    "wallet": self.wallet_id,
                     "id": request["id"],
                     "max_notional_usd": "11",
                     "max_leverage": 1,
@@ -572,7 +572,7 @@ class HyperliquidDefinitionTests(unittest.TestCase):
                 return {
                     "schema": "bloom.hyperliquid_agent_session.v1",
                     "network": "mainnet",
-                    "wallet": self.wallet,
+                    "wallet": self.wallet_id,
                     "id": request["id"],
                     "max_notional_usd": "11",
                     "max_leverage": 1,
@@ -622,7 +622,7 @@ class HyperliquidDefinitionTests(unittest.TestCase):
                 return {
                     "schema": "bloom.hyperliquid_agent_session.v1",
                     "network": "mainnet",
-                    "wallet": self.wallet,
+                    "wallet": self.wallet_id,
                     "id": request["id"],
                     "max_notional_usd": "11",
                     "max_leverage": 1,
@@ -638,7 +638,9 @@ class HyperliquidDefinitionTests(unittest.TestCase):
         request = __import__("json").loads(written[0][1])
         self.assertEqual(request["wallet_id"], self.definition.wallet_id)
         self.assertLessEqual(len(request["agent_name"]), 16)
-        self.assertTrue(request["agent_name"].startswith("be-cod-"))
+        # Stable for the wallet, so Hyperliquid replaces the previous agent by
+        # name instead of the account accumulating one per run.
+        self.assertEqual(request["agent_name"], self.definition.agent_name)
         self.assertEqual(request["max_notional_usd"], "11")
         self.assertEqual(request["max_leverage"], 1)
         self.assertEqual(request["assets"], ["0"])
@@ -727,7 +729,7 @@ class HyperliquidDefinitionTests(unittest.TestCase):
             return {
                 "schema": "bloom.hyperliquid_agent_session.v1",
                 "network": "mainnet",
-                "wallet": self.wallet,
+                "wallet": self.wallet_id,
                 "id": request["id"],
                 "max_notional_usd": "11",
                 "max_leverage": 1,
@@ -768,7 +770,7 @@ class HyperliquidDefinitionTests(unittest.TestCase):
             return {
                 "schema": "bloom.hyperliquid_agent_session.v1",
                 "network": "mainnet",
-                "wallet": self.wallet,
+                "wallet": self.wallet_id,
                 "id": request["id"],
                 "max_notional_usd": "11",
                 "max_leverage": 1,
@@ -803,6 +805,60 @@ class HyperliquidDefinitionTests(unittest.TestCase):
                 self.definition.provision("codex")
         self.assertNotIn(ceremony, str(raised.exception))
         self.assertIn("[REDACTED_CEREMONY_URL]", str(raised.exception))
+
+    def test_agent_name_is_stable_for_the_wallet(self) -> None:
+        # Hyperliquid replaces a named agent when approveAgent arrives under the
+        # same name. A name that varied per run would accumulate agents, and
+        # clearing them would require deregistration, after which HyperCore may
+        # prune nonce state and re-registering the address is replay-unsafe.
+        first = self.definition.agent_name
+        second = HyperliquidOrderCancelEval(self.repo, dict(self.env)).agent_name
+        self.assertEqual(first, second)
+        self.assertLessEqual(len(first), 16)
+        other_env = dict(self.env)
+        other_env["BLOOM_EVAL_WALLET_ID"] = "another-eval-wallet"
+        other = HyperliquidOrderCancelEval(self.repo, other_env).agent_name
+        self.assertNotEqual(first, other, "distinct wallets must not share an agent name")
+    def test_agent_name_override_adopts_an_existing_agent(self) -> None:
+        # A wallet carrying an agent from an earlier naming scheme cannot be
+        # reconciled by a derived name, and the old agent cannot be safely
+        # removed. Naming it keeps preflight an exact match rather than
+        # widening it to a pattern.
+        env = dict(self.env)
+        env["BLOOM_EVAL_AGENT_NAME"] = "be-cla-da335ada"
+        definition = HyperliquidOrderCancelEval(self.repo, env)
+        self.assertEqual(definition.agent_name, "be-cla-da335ada")
+        self.assertNotEqual(definition.agent_name, self.definition.agent_name)
+
+        definition._require_no_orders_or_positions = mock.Mock()
+        definition._read_json = mock.Mock(
+            return_value=[{"name": "be-cla-da335ada", "address": "0x" + "e" * 40}]
+        )
+        definition._require_empty_wallet()
+
+        definition._read_json = mock.Mock(
+            return_value=[{"name": "be-other", "address": "0x" + "f" * 40}]
+        )
+        with self.assertRaisesRegex(EvalError, "this eval did not create"):
+            definition._require_empty_wallet()
+
+        over_long = dict(self.env)
+        over_long["BLOOM_EVAL_AGENT_NAME"] = "b" * 17
+        with self.assertRaisesRegex(EvalError, "at most 16 characters"):
+            _ = HyperliquidOrderCancelEval(self.repo, over_long).agent_name
+
+    def test_preflight_tolerates_this_evals_agent_but_not_a_foreign_one(self) -> None:
+        own = [{"name": self.definition.agent_name, "address": "0x" + "c" * 40}]
+        foreign = [{"name": "someone-else", "address": "0x" + "d" * 40}]
+        self.definition._require_no_orders_or_positions = mock.Mock()
+        self.definition._read_json = mock.Mock(return_value=own)
+        self.definition._require_empty_wallet()
+        self.definition._read_json = mock.Mock(return_value=foreign)
+        with self.assertRaisesRegex(EvalError, "this eval did not create"):
+            self.definition._require_empty_wallet()
+        self.definition._read_json = mock.Mock(return_value=own + foreign)
+        with self.assertRaisesRegex(EvalError, "this eval did not create"):
+            self.definition._require_empty_wallet()
 
 
 if __name__ == "__main__":

@@ -25,7 +25,10 @@ class AgentSpec:
 
 
 AGENTS: dict[str, AgentSpec] = {
-    "claude": AgentSpec("claude-code", "sonnet-5"),
+    # Model ids are the API's, not the marketing names: "sonnet-5" is rejected
+    # with a 404 unrecognized_model, which surfaces as an errored Harbor trial
+    # rather than a configuration error.
+    "claude": AgentSpec("claude-code", "claude-sonnet-5"),
     "codex": AgentSpec("codex", "gpt-5.6-terra"),
 }
 

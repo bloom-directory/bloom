@@ -42,6 +42,12 @@ ACTION_FILES = ("order.json", "cancel.json", "update_leverage.json", "cancel_all
 # agent approval. The cap bounds a misbehaving route rather than describing the
 # expected count, and is deliberately larger than two.
 MAX_SESSION_CEREMONIES = 4
+# Petal reads are live venue round-trips, not disk reads.
+VENUE_READ_TIMEOUT_SECONDS = 45
+VENUE_READ_ATTEMPTS = 3
+# Writing a session route stages owner ceremonies and makes venue calls before
+# the mount returns, so it inherits the same latency as a read and then some.
+SESSION_WRITE_TIMEOUT_SECONDS = 120
 
 
 def session_key_slot(session_id: str) -> str:
@@ -59,6 +65,7 @@ class HyperliquidOrderCancelEval(EvalDefinition):
         self.env = dict(os.environ if environ is None else environ)
         self.wallet = self.env.get("BLOOM_EVAL_WALLET", "")
         self.wallet_id = self.env.get("BLOOM_EVAL_WALLET_ID", "")
+        self.agent_name_override = self.env.get("BLOOM_EVAL_AGENT_NAME", "").strip()
         self.package_hash = self.env.get("BLOOM_EVAL_HYPERLIQUID_PACKAGE_HASH", "")
         self.owner_record_value = self.env.get("BLOOM_EVAL_PETAL_OWNER_RECORD", "")
         self.owner_record = Path(self.owner_record_value)
@@ -126,20 +133,37 @@ class HyperliquidOrderCancelEval(EvalDefinition):
     def wallet_root(self) -> Path:
         return self.bloom_mount / "wallets" / self.wallet_id
 
-    def _read_json(self, path: Path, timeout: int = 20) -> Any:
-        try:
-            completed = subprocess.run(
-                ["cat", str(path)],
-                check=True,
-                capture_output=True,
-                timeout=timeout,
-            )
-        except (OSError, subprocess.SubprocessError) as error:
-            raise EvalError(f"could not read {path}: {error}") from error
-        try:
-            return json.loads(completed.stdout)
-        except json.JSONDecodeError as error:
-            raise EvalError(f"{path} is not valid JSON: {error}") from error
+    def _read_json(self, path: Path, timeout: int = VENUE_READ_TIMEOUT_SECONDS) -> Any:
+        # Reads under the Petal are not local file reads: they are live venue
+        # round-trips made by wasm and returned over the mount, so their latency
+        # is the venue's, not the disk's. Observed between 0.1s and 8s for the
+        # same path minutes apart. A single tight timeout loses whole runs to
+        # latency the harness does not control, so allow more time and retry a
+        # timeout rather than failing the run on one slow fetch.
+        last_error: BaseException | None = None
+        for attempt in range(VENUE_READ_ATTEMPTS):
+            try:
+                completed = subprocess.run(
+                    ["cat", str(path)],
+                    check=True,
+                    capture_output=True,
+                    timeout=timeout,
+                )
+            except subprocess.TimeoutExpired as error:
+                last_error = error
+                if attempt + 1 < VENUE_READ_ATTEMPTS:
+                    time.sleep(1.0)
+                continue
+            except (OSError, subprocess.SubprocessError) as error:
+                raise EvalError(f"could not read {path}: {error}") from error
+            try:
+                return json.loads(completed.stdout)
+            except json.JSONDecodeError as error:
+                raise EvalError(f"{path} is not valid JSON: {error}") from error
+        raise EvalError(
+            f"could not read {path} after {VENUE_READ_ATTEMPTS} attempts "
+            f"of {timeout}s: {last_error}"
+        ) from last_error
 
     def _write_route(
         self, path: Path, body: bytes, timeout: int
@@ -601,13 +625,52 @@ class HyperliquidOrderCancelEval(EvalDefinition):
                 "dedicated wallet has an open position; use an empty eval wallet"
             )
 
+    @property
+    def agent_name(self) -> str:
+        """The venue-side name this eval registers its API agent under.
+
+        Hyperliquid replaces a named agent when a new `approveAgent` arrives
+        under the same name, so a name that is stable for the wallet means each
+        run supersedes its predecessor instead of adding to the account. A name
+        that varied per run would accumulate agents, and clearing them would
+        mean deregistration, after which HyperCore may prune the agent's nonce
+        state and re-registering that address becomes replay-unsafe.
+
+        `BLOOM_EVAL_AGENT_NAME` adopts an existing agent instead of deriving a
+        new one. A wallet that already carries an agent from an earlier naming
+        scheme cannot otherwise be reconciled: the old name will never match a
+        derived one, and the old agent cannot be safely removed. Naming it
+        explicitly keeps the preflight check an exact match rather than
+        widening it to a pattern, and records which agent the operator intends
+        this eval to take over.
+        """
+        if self.agent_name_override:
+            if len(self.agent_name_override) > 16:
+                raise EvalError("BLOOM_EVAL_AGENT_NAME must be at most 16 characters")
+            return self.agent_name_override
+        digest = hashlib.sha256(
+            b"bloom-eval-hyperliquid-agent/v1\0" + self.wallet_id.encode()
+        ).hexdigest()
+        return f"be-{digest[:8]}"
+
     def _require_empty_wallet(self) -> None:
         self._require_no_orders_or_positions()
         agents = self._read_json(self.user_root / "extra_agents.json")
         if not isinstance(agents, list):
             raise EvalError("extra-agents projection is not a JSON array")
-        if agents:
-            raise EvalError("dedicated wallet retains a Hyperliquid API agent")
+        # This eval's own agent may legitimately still be registered: it is
+        # superseded by name on the next run and is never deregistered. Any
+        # other agent is delegated authority this eval did not create, and the
+        # wallet is not safe to use.
+        foreign = [
+            agent
+            for agent in agents
+            if not isinstance(agent, dict) or agent.get("name") != self.agent_name
+        ]
+        if foreign:
+            raise EvalError(
+                "dedicated wallet retains a Hyperliquid API agent this eval did not create"
+            )
 
     def preflight(self) -> None:
         if not WALLET.fullmatch(self.wallet):
@@ -687,7 +750,7 @@ class HyperliquidOrderCancelEval(EvalDefinition):
             "id": self.session_id,
             "wallet_id": self.wallet_id,
             "owner_address": self.wallet,
-            "agent_name": f"be-{agent_name[:3]}-{random_hex[:8]}",
+            "agent_name": self.agent_name,
             "duration_ms": 1_800_000,
             "max_notional_usd": "11",
             "max_leverage": 1,
@@ -696,7 +759,7 @@ class HyperliquidOrderCancelEval(EvalDefinition):
         body = json.dumps(request, separators=(",", ":")).encode()
         new_route = self.network_root / "agent_sessions" / self.wallet_id / "new.json"
 
-        first = self._write_route(new_route, body, 45)
+        first = self._write_route(new_route, body, SESSION_WRITE_TIMEOUT_SECONDS)
         output = (first.stdout + first.stderr).decode(errors="replace")
         last_output = output
         status_data: Any | None = None
@@ -709,6 +772,11 @@ class HyperliquidOrderCancelEval(EvalDefinition):
         # than the last accepted one, so the counter advances per ceremony and
         # is never reused.
         counter = sign_count
+        # A ceremony's owner-visible projection lags its completion, so the same
+        # ceremony can still resolve as pending immediately after it succeeded.
+        # Completing it twice fails against a consumed session, so remember what
+        # this provision has already driven and wait for the session instead.
+        completed_ceremonies: set[str] = set()
         for _ in range(MAX_SESSION_CEREMONIES):
             ceremony_url: str | None = None
             # Mounted Petal writes are asynchronous. A zero write exit code
@@ -728,13 +796,20 @@ class HyperliquidOrderCancelEval(EvalDefinition):
                         or self._pending_agent_approval_ceremony()
                     )
                 )
-                if ceremony_url is not None:
+                if ceremony_url is not None and ceremony_url not in completed_ceremonies:
                     break
+                ceremony_url = None
                 time.sleep(0.2)
 
             if status_data is not None or ceremony_url is None:
                 break
 
+            # One attempt only. The Broker marks a consumed or absent ceremony
+            # CEREMONY_REPLAY with retry "never", so a second attempt cannot
+            # succeed and only burns another WebAuthn counter. An earlier
+            # revision retried here on the theory that a freshly published
+            # ceremony URL might not yet resolve; that theory was wrong, and the
+            # retries turned one failure into three.
             try:
                 completed = subprocess.run(
                     [
@@ -750,24 +825,25 @@ class HyperliquidOrderCancelEval(EvalDefinition):
                     capture_output=True,
                     timeout=45,
                 )
-                output += (completed.stdout + completed.stderr).decode(errors="replace")
             except (OSError, subprocess.SubprocessError) as error:
                 raise EvalError(
                     "debug-driver ceremony completion failed: "
                     + self._redact_ceremony_urls(str(error))
                 ) from error
-            if completed.returncode != 0:
-                raise EvalError(
-                    f"session ceremony failed at sign count {counter} "
-                    f"(next unused counter is {counter + 1}): "
-                    + self._redact_ceremony_urls(output)
-                )
+            output += (completed.stdout + completed.stderr).decode(errors="replace")
             counter += 1
             self.next_sign_count = counter
+            if completed.returncode != 0:
+                raise EvalError(
+                    f"session ceremony failed at sign count {counter - 1} "
+                    f"(next unused counter is {counter}): "
+                    + self._redact_ceremony_urls(output)
+                )
+            completed_ceremonies.add(ceremony_url)
 
             # Replay byte-identical session terms only after the owner ceremony
             # succeeds; WebAuthn counter reuse is never attempted.
-            retry = self._write_route(new_route, body, 45)
+            retry = self._write_route(new_route, body, SESSION_WRITE_TIMEOUT_SECONDS)
             last_output = (retry.stdout + retry.stderr).decode(errors="replace")
             output += last_output
 
@@ -781,9 +857,18 @@ class HyperliquidOrderCancelEval(EvalDefinition):
 
         self.session_created = True
         expected = {
-            "schema": "bloom.hyperliquid_agent_session.v1",
+            # The session's status projection does not carry a schema tag. The
+            # Petal's Session type has one, but the status route builds its JSON
+            # field by field and omits it, so requiring it here fails every
+            # session. The bounded terms below are what this check exists to
+            # enforce; the schema tag would be a useful addition to the
+            # projection, but asserting a field the surface never emits is not a
+            # check, it is an outage.
             "network": "mainnet",
-            "wallet": self.wallet,
+            # The session records the `[wallet]` route parameter, which is a
+            # Bloom wallet id. The on-chain address is reported separately as
+            # `agent_address`, and reaches the Petal as `owner_address`.
+            "wallet": self.wallet_id,
             "id": self.session_id,
             "max_notional_usd": "11",
             "max_leverage": 1,

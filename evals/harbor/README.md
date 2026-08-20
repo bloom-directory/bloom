@@ -91,6 +91,15 @@ export BLOOM_EVAL_AUTHENTICATOR_SEED_FILE="$HOME/.config/bloom/eval-authenticato
 # first post-registration ceremony uses 2. Increment after every completion.
 export BLOOM_EVAL_AUTHENTICATOR_SIGN_COUNT=2
 export BLOOM_EVAL_MAINNET_ACK=PLACE_AND_CANCEL_BTC_MAINNET_UP_TO_11_USD
+# Optional. The eval registers its Hyperliquid API agent under a name derived
+# from the wallet id, so each run replaces the previous agent rather than the
+# account accumulating one per run. Set this only to adopt an agent that is
+# already registered under a different name, which is the one case a derived
+# name cannot reconcile: Hyperliquid replaces a named agent but offers no safe
+# removal, since a deregistered agent's nonce state may be pruned and
+# re-registering that address is then replay-unsafe. Preflight matches this
+# name exactly and rejects any other agent.
+# export BLOOM_EVAL_AGENT_NAME=be-...
 
 # Run this while the wallet remains deny-by-default. It reads only immutable
 # local package/provenance files: no policy inspection, ceremony, mounted write,
