@@ -636,7 +636,11 @@ class HyperliquidDefinitionTests(unittest.TestCase):
         context = self.definition.provision("codex")
 
         request = __import__("json").loads(written[0][1])
-        self.assertEqual(request["wallet_id"], self.definition.wallet_id)
+        # The wallet id is the route parameter, not a body field: carrying it
+        # in both places let them disagree, deriving a key for one wallet while
+        # state was recorded and signing attempted under another.
+        self.assertNotIn("wallet_id", request)
+        self.assertEqual(request["owner_address"], self.definition.wallet)
         self.assertLessEqual(len(request["agent_name"]), 16)
         # Stable for the wallet, so Hyperliquid replaces the previous agent by
         # name instead of the account accumulating one per run.

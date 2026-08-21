@@ -748,7 +748,8 @@ class HyperliquidOrderCancelEval(EvalDefinition):
         )
         request = {
             "id": self.session_id,
-            "wallet_id": self.wallet_id,
+            # The wallet id is the route parameter and is deliberately not
+            # repeated here: carrying it in both places let them disagree.
             "owner_address": self.wallet,
             "agent_name": self.agent_name,
             "duration_ms": 1_800_000,
