@@ -2174,7 +2174,7 @@ dependencies = [
 [[package]]
 name = "bloom-audit-checkpoint"
 version = "0.1.3"
-source = "git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=2e402f03814166406ea6489b60422b0865d1f6c2#2e402f03814166406ea6489b60422b0865d1f6c2"
+source = "git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=19d0465d53b279e6e1c98bac533510a1e7eb8f44#19d0465d53b279e6e1c98bac533510a1e7eb8f44"
 dependencies = [
  "bloom-rpc-wire",
  "ed25519-dalek",
@@ -2189,7 +2189,7 @@ dependencies = [
 [[package]]
 name = "bloom-broker-api"
 version = "0.1.0"
-source = "git+https://github.com/bloom-directory/bloom-broker.git?rev=1cbb549bea07f78c564ef1e66e52fb087b5f2ffa#1cbb549bea07f78c564ef1e66e52fb087b5f2ffa"
+source = "git+https://github.com/bloom-directory/bloom-broker.git?rev=33450e3b7fbdf661161b486b00599c4c9e8c3c8f#33450e3b7fbdf661161b486b00599c4c9e8c3c8f"
 dependencies = [
  "bloom-rpc-wire",
  "serde",
@@ -2564,7 +2564,7 @@ dependencies = [
 [[package]]
 name = "bloom-rpc-wire"
 version = "0.1.3"
-source = "git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=2e402f03814166406ea6489b60422b0865d1f6c2#2e402f03814166406ea6489b60422b0865d1f6c2"
+source = "git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=19d0465d53b279e6e1c98bac533510a1e7eb8f44#19d0465d53b279e6e1c98bac533510a1e7eb8f44"
 dependencies = [
  "base64 0.22.1",
  "ed25519-dalek",
@@ -2579,7 +2579,7 @@ dependencies = [
 [[package]]
 name = "bloom-service-activation"
 version = "0.1.3"
-source = "git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=2e402f03814166406ea6489b60422b0865d1f6c2#2e402f03814166406ea6489b60422b0865d1f6c2"
+source = "git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=19d0465d53b279e6e1c98bac533510a1e7eb8f44#19d0465d53b279e6e1c98bac533510a1e7eb8f44"
 dependencies = [
  "bloom-rpc-wire",
  "libc",
@@ -2603,7 +2603,7 @@ dependencies = [
 [[package]]
 name = "bloom-triad-local-transport"
 version = "0.1.3"
-source = "git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=2e402f03814166406ea6489b60422b0865d1f6c2#2e402f03814166406ea6489b60422b0865d1f6c2"
+source = "git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=19d0465d53b279e6e1c98bac533510a1e7eb8f44#19d0465d53b279e6e1c98bac533510a1e7eb8f44"
 dependencies = [
  "bloom-rpc-wire",
  "bloom-trusted-time",
@@ -2621,7 +2621,7 @@ dependencies = [
 [[package]]
 name = "bloom-trusted-time"
 version = "0.1.3"
-source = "git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=2e402f03814166406ea6489b60422b0865d1f6c2#2e402f03814166406ea6489b60422b0865d1f6c2"
+source = "git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=19d0465d53b279e6e1c98bac533510a1e7eb8f44#19d0465d53b279e6e1c98bac533510a1e7eb8f44"
 dependencies = [
  "libc",
  "thiserror 2.0.18",
