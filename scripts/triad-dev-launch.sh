@@ -256,8 +256,6 @@ broker_control_socket="${runtime_dir}/broker/control.sock"
 unit_token="$(basename "$runtime_dir")"
 unit_prefix="bloom-triad-dev-$(id -u)-${unit_token}"
 signer_service_unit="${unit_prefix}-signer.service"
-signer_socket_unit="${unit_prefix}-signer.socket"
-signer_control_socket_unit="${unit_prefix}-signer-control.socket"
 broker_service_unit="${unit_prefix}-broker.service"
 broker_socket_unit="${unit_prefix}-broker.socket"
 broker_control_socket_unit="${unit_prefix}-broker-control.socket"
@@ -314,14 +312,11 @@ stop_linux_authority_units() {
   [ "$host_os" = Linux ] || return 0
   systemctl --user stop "$broker_service_unit" "$signer_service_unit" >/dev/null 2>&1 || true
   systemctl --user stop \
-    "$broker_socket_unit" "$broker_control_socket_unit" \
-    "$signer_socket_unit" "$signer_control_socket_unit" >/dev/null 2>&1 || true
+    "$broker_socket_unit" "$broker_control_socket_unit" >/dev/null 2>&1 || true
   if [ "$systemd_units_installed" -eq 1 ]; then
     rm -f -- \
       "${user_unit_dir}/${broker_socket_unit}" \
       "${user_unit_dir}/${broker_control_socket_unit}" \
-      "${user_unit_dir}/${signer_socket_unit}" \
-      "${user_unit_dir}/${signer_control_socket_unit}" \
       "${user_unit_dir}/${broker_service_unit}" \
       "${user_unit_dir}/${signer_service_unit}"
     systemctl --user daemon-reload >/dev/null 2>&1 || true
@@ -448,10 +443,6 @@ start_linux_authority_services() {
   # Mark ownership before the first write so the EXIT trap removes even a
   # partially rendered unit set.
   systemd_units_installed=1
-  write_linux_socket_unit "$signer_socket_unit" \
-    'Bloom developer Signer socket' "$signer_socket" signer "$signer_service_unit"
-  write_linux_socket_unit "$signer_control_socket_unit" \
-    'Bloom developer Signer control socket' "$signer_control_socket" signer-control "$signer_service_unit"
   write_linux_socket_unit "$broker_socket_unit" \
     'Bloom developer Broker socket' "$broker_socket" broker "$broker_service_unit"
   write_linux_socket_unit "$broker_control_socket_unit" \
@@ -459,8 +450,7 @@ start_linux_authority_services() {
 
   : > "${log_dir}/signer.log"
   {
-    printf '%s\n' '[Unit]' 'Description=Bloom developer Signer' \
-      "Requires=$signer_socket_unit $signer_control_socket_unit" '' \
+    printf '%s\n' '[Unit]' 'Description=Bloom developer Signer' '' \
       '[Service]' 'Type=simple' 'UMask=0077'
     printf 'ExecStart=%s\n' "$signer_bin"
     printf 'StandardOutput=append:%s\n' "${log_dir}/signer.log"
@@ -473,9 +463,8 @@ start_linux_authority_services() {
       "BLOOM_SIGNER_AUDIT_CHECKPOINT_DIR=$signer_checkpoint_dir" \
       "BLOOM_AUTHORITY_EDGE_HISTORY=$authority_edge_history" \
       "BLOOM_SESSION_SOCKET=$session_socket" \
-      'BLOOM_SIGNER_ACTIVATION_NAME=signer' \
-      'BLOOM_SIGNER_CONTROL_ACTIVATION_NAME=signer-control'
-    printf 'Sockets=%s\n' "$signer_socket_unit" "$signer_control_socket_unit"
+      "BLOOM_SIGNER_SOCKET=$signer_socket" \
+      "BLOOM_SIGNER_CONTROL_SOCKET=$signer_control_socket"
   } > "${user_unit_dir}/${signer_service_unit}"
   chmod 0600 "${user_unit_dir}/${signer_service_unit}"
 
@@ -483,7 +472,7 @@ start_linux_authority_services() {
   {
     printf '%s\n' '[Unit]' 'Description=Bloom developer Broker' \
       "Requires=$broker_socket_unit $broker_control_socket_unit" \
-      "After=$signer_socket_unit $signer_control_socket_unit" '' \
+      "After=$signer_service_unit" '' \
       '[Service]' 'Type=simple' 'UMask=0077'
     printf 'ExecStart=%s\n' "$broker_bin"
     printf 'StandardOutput=append:%s\n' "${log_dir}/broker.log"
@@ -504,17 +493,19 @@ start_linux_authority_services() {
 
   systemctl --user daemon-reload
   systemctl --user start \
-    "$signer_socket_unit" "$signer_control_socket_unit" \
     "$broker_socket_unit" "$broker_control_socket_unit"
-  systemctl --user start "$signer_service_unit" "$broker_service_unit"
-
-  systemctl --user is-active --quiet "$signer_service_unit" "$broker_service_unit"
+  systemctl --user start "$signer_service_unit"
   signer_pid="$(systemctl --user show "$signer_service_unit" -p MainPID --value)"
-  broker_pid="$(systemctl --user show "$broker_service_unit" -p MainPID --value)"
-  [ "$signer_pid" -gt 0 ] && [ "$broker_pid" -gt 0 ] ||
-    die "Linux developer authority services did not publish main processes"
+  [ "$signer_pid" -gt 0 ] ||
+    die "Linux developer Signer did not publish a main process"
   wait_for_socket "$signer_socket" "$signer_pid" signer
+
+  systemctl --user start "$broker_service_unit"
+  broker_pid="$(systemctl --user show "$broker_service_unit" -p MainPID --value)"
+  [ "$broker_pid" -gt 0 ] ||
+    die "Linux developer Broker did not publish a main process"
   wait_for_socket "$broker_socket" "$broker_pid" broker
+  systemctl --user is-active --quiet "$signer_service_unit" "$broker_service_unit"
 }
 
 BLOOM_TRIAD_DEVELOPER_ROOT="$developer_root" \

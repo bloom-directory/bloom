@@ -438,20 +438,16 @@ fn triad_developer_launcher_supports_linux_without_weakening_root_boundary() {
     assert!(launcher.contains("Linux developer systemd user unit directory is unsafe"));
     assert!(launcher.contains("Linux developer systemd unit paths may contain only ASCII"));
     assert!(launcher.contains("printf 'FileDescriptorName=%s\\n' \"$descriptor\""));
-    assert!(launcher.contains(
-        "'Bloom developer Signer socket' \"$signer_socket\" signer \"$signer_service_unit\""
-    ));
-    assert!(launcher.contains(
-        "'Bloom developer Signer control socket' \"$signer_control_socket\" signer-control \"$signer_service_unit\""
-    ));
+    assert!(!launcher.contains("signer_socket_unit"));
+    assert!(!launcher.contains("BLOOM_SIGNER_ACTIVATION_NAME"));
+    assert!(!launcher.contains("BLOOM_SIGNER_CONTROL_ACTIVATION_NAME"));
+    assert!(launcher.contains("\"BLOOM_SIGNER_SOCKET=$signer_socket\""));
+    assert!(launcher.contains("\"BLOOM_SIGNER_CONTROL_SOCKET=$signer_control_socket\""));
     assert!(launcher.contains(
         "'Bloom developer Broker socket' \"$broker_socket\" broker \"$broker_service_unit\""
     ));
     assert!(launcher.contains(
         "'Bloom developer Broker control socket' \"$broker_control_socket\" broker-control \"$broker_service_unit\""
-    ));
-    assert!(launcher.contains(
-        "printf 'Sockets=%s\\n' \"$signer_socket_unit\" \"$signer_control_socket_unit\""
     ));
     assert!(launcher.contains(
         "printf 'Sockets=%s\\n' \"$broker_socket_unit\" \"$broker_control_socket_unit\""
