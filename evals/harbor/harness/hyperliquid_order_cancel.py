@@ -742,15 +742,15 @@ class HyperliquidOrderCancelEval(EvalDefinition):
         # address. Owner signing for `approve_agent` validates that segment as a
         # Broker token, which must start with a lowercase letter, so a `0x…`
         # address fails deep inside signing as an unqualified permission error.
-        # The address travels in `owner_address` instead.
         self.session_base = (
             self.network_root / "agent_sessions" / self.wallet_id / self.session_id
         )
         request = {
             "id": self.session_id,
-            # The wallet id is the route parameter and is deliberately not
-            # repeated here: carrying it in both places let them disagree.
-            "owner_address": self.wallet,
+            # Neither the wallet id nor the owner address is carried here. The
+            # wallet id is the route parameter, and the owner address is
+            # recovered by the Petal from the approveAgent signature; sending
+            # either let the body disagree with the wallet actually being used.
             "agent_name": self.agent_name,
             "duration_ms": 1_800_000,
             "max_notional_usd": "11",
@@ -868,7 +868,7 @@ class HyperliquidOrderCancelEval(EvalDefinition):
             "network": "mainnet",
             # The session records the `[wallet]` route parameter, which is a
             # Bloom wallet id. The on-chain address is reported separately as
-            # `agent_address`, and reaches the Petal as `owner_address`.
+            # `agent_address`.
             "wallet": self.wallet_id,
             "id": self.session_id,
             "max_notional_usd": "11",

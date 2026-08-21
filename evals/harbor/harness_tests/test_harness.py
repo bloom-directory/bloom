@@ -595,9 +595,10 @@ class HyperliquidDefinitionTests(unittest.TestCase):
         self.assertNotEqual(segment, self.definition.wallet)
         self.assertRegex(segment, r"^[a-z][a-z0-9._/-]{0,63}$")
 
-        # The address still has to reach the Petal, just in the body.
+        # The address does not travel in the body at all: the Petal recovers it
+        # from the owner's approveAgent signature.
         request = __import__("json").loads(written[0][1])
-        self.assertEqual(request["owner_address"], self.definition.wallet)
+        self.assertNotIn("owner_address", request)
 
         # The container's bind-mount targets must agree with the host paths, and
         # the agent needs both identifiers to address sessions and account reads.
@@ -640,7 +641,10 @@ class HyperliquidDefinitionTests(unittest.TestCase):
         # in both places let them disagree, deriving a key for one wallet while
         # state was recorded and signing attempted under another.
         self.assertNotIn("wallet_id", request)
-        self.assertEqual(request["owner_address"], self.definition.wallet)
+        # Same for the owner address, which additionally fed the venue reads
+        # behind max_leverage, cancel_all and close_all: a caller-chosen value
+        # aimed those checks at an account the session never traded on.
+        self.assertNotIn("owner_address", request)
         self.assertLessEqual(len(request["agent_name"]), 16)
         # Stable for the wallet, so Hyperliquid replaces the previous agent by
         # name instead of the account accumulating one per run.
