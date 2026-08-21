@@ -13,6 +13,7 @@ import stat
 import subprocess
 import sys
 import time
+from collections.abc import Callable
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -48,6 +49,16 @@ VENUE_READ_ATTEMPTS = 3
 # Writing a session route stages owner ceremonies and makes venue calls before
 # the mount returns, so it inherits the same latency as a read and then some.
 SESSION_WRITE_TIMEOUT_SECONDS = 120
+# Mounted Petal writes are accepted for dispatch, not completed, when the write
+# returns. Cleanup therefore polls each postcondition rather than reading once.
+# Venue-backed postconditions (orders, positions) cost a live Hyperliquid round
+# trip each and degrade badly when issued concurrently (see bloom#172), so they
+# get few attempts spaced widely apart. `status.json` is a local store read and
+# can be polled tightly.
+VENUE_SETTLE_ATTEMPTS = 6
+VENUE_SETTLE_DELAY_SECONDS = 5.0
+STATUS_SETTLE_ATTEMPTS = 50
+STATUS_SETTLE_DELAY_SECONDS = 0.2
 
 
 def session_key_slot(session_id: str) -> str:
@@ -182,6 +193,30 @@ class HyperliquidOrderCancelEval(EvalDefinition):
             )
         except (OSError, subprocess.SubprocessError) as error:
             raise EvalError(f"route write to {path} failed: {error}") from error
+
+    def _poll_until(
+        self,
+        predicate: Callable[[], bool],
+        attempts: int,
+        delay: float,
+    ) -> bool:
+        """Poll `predicate` until it holds or the budget is spent.
+
+        Returns True as soon as it holds. An `EvalError` from the predicate is
+        treated as "not yet": a read that fails mid-settle should be retried
+        within the budget, and the caller reports the failure if it never
+        clears.
+        """
+        for attempt in range(attempts):
+            try:
+                if predicate():
+                    return True
+            except EvalError:
+                if attempt == attempts - 1:
+                    raise
+            if attempt < attempts - 1:
+                time.sleep(delay)
+        return False
 
     def _read_json_if_exists(self, path: Path) -> Any | None:
         # Dynamic Petal routes can make getattr/stat succeed for arbitrary
@@ -927,13 +962,24 @@ class HyperliquidOrderCancelEval(EvalDefinition):
         failures: list[str] = []
         status_data = self._read_session_status()
         if status_data is None:
-            try:
-                if self._pending_petal_key_ceremony() is not None:
-                    failures.append(
-                        "matching Petal key ceremony is still awaiting user action"
-                    )
-            except EvalError as error:
-                failures.append(str(error))
+            # Both projections have to be checked. Creating a session stages two
+            # owner ceremonies, and the second one outlives the first: once key
+            # derivation completes, `approve_agent` can sit awaiting approval
+            # while `session.json` still does not exist. The key projection is
+            # then already consumed and `_require_empty_wallet` passes, because
+            # the agent was never registered at the venue. Checking only the key
+            # ceremony reports a clean cleanup over an open owner ceremony.
+            for pending, label in (
+                (self._pending_petal_key_ceremony, "Petal key"),
+                (self._pending_agent_approval_ceremony, "agent approval"),
+            ):
+                try:
+                    if pending() is not None:
+                        failures.append(
+                            f"matching {label} ceremony is still awaiting user action"
+                        )
+                except EvalError as error:
+                    failures.append(str(error))
             try:
                 self._require_empty_wallet()
             except EvalError as error:
@@ -955,8 +1001,13 @@ class HyperliquidOrderCancelEval(EvalDefinition):
                 failures.append("session cancel_all failed")
 
         try:
-            orders = self._read_json(self.user_root / "open_orders.json")
-            if not isinstance(orders, list) or orders:
+            def no_open_orders() -> bool:
+                orders = self._read_json(self.user_root / "open_orders.json")
+                return isinstance(orders, list) and not orders
+
+            if not self._poll_until(
+                no_open_orders, VENUE_SETTLE_ATTEMPTS, VENUE_SETTLE_DELAY_SECONDS
+            ):
                 failures.append("dedicated wallet still has open orders")
         except EvalError as error:
             failures.append(str(error))
@@ -969,7 +1020,11 @@ class HyperliquidOrderCancelEval(EvalDefinition):
                 )
                 if closed.returncode != 0:
                     failures.append("session close_all failed")
-                elif self._nonzero_positions():
+                elif not self._poll_until(
+                    lambda: not self._nonzero_positions(),
+                    VENUE_SETTLE_ATTEMPTS,
+                    VENUE_SETTLE_DELAY_SECONDS,
+                ):
                     failures.append("dedicated wallet still has an open position")
             elif positions:
                 failures.append("stopped session cannot close the residual position")
@@ -984,10 +1039,15 @@ class HyperliquidOrderCancelEval(EvalDefinition):
                 failures.append("session stop failed")
 
         try:
-            final_status = self._read_json(self.session_base / "status.json")
-            if (
-                not isinstance(final_status, dict)
-                or final_status.get("stopped") is not True
+            def session_stopped() -> bool:
+                final_status = self._read_json(self.session_base / "status.json")
+                return (
+                    isinstance(final_status, dict)
+                    and final_status.get("stopped") is True
+                )
+
+            if not self._poll_until(
+                session_stopped, STATUS_SETTLE_ATTEMPTS, STATUS_SETTLE_DELAY_SECONDS
             ):
                 failures.append("session is not stopped")
         except EvalError as error:

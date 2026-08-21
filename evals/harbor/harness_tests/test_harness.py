@@ -11,6 +11,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
+from harness import hyperliquid_order_cancel
 from harness.core import AgentSpec, EvalDefinition, EvalError, EvalRunContext, run_eval
 from harness.hyperliquid_order_cancel import (
     ACTION_FILES,
@@ -671,6 +672,7 @@ class HyperliquidDefinitionTests(unittest.TestCase):
         self.definition._require_empty_wallet = mock.Mock()
         self.definition._read_session_status = mock.Mock(return_value=None)
         self.definition._pending_petal_key_ceremony = mock.Mock(return_value=None)
+        self.definition._pending_agent_approval_ceremony = mock.Mock(return_value=None)
         self.definition._write_route = mock.Mock()
 
         self.definition.cleanup()
@@ -678,6 +680,7 @@ class HyperliquidDefinitionTests(unittest.TestCase):
         self.definition._require_empty_wallet.assert_called_once_with()
         self.definition._read_session_status.assert_called_once_with()
         self.definition._pending_petal_key_ceremony.assert_called_once_with()
+        self.definition._pending_agent_approval_ceremony.assert_called_once_with()
         self.definition._write_route.assert_not_called()
 
     def test_cleanup_fails_on_orphan_venue_agent(self) -> None:
@@ -690,6 +693,79 @@ class HyperliquidDefinitionTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(EvalError, "retains a Hyperliquid API agent"):
             self.definition.cleanup()
+
+    def test_cleanup_fails_on_pending_agent_approval_ceremony(self) -> None:
+        # Creating a session stages two owner ceremonies. Once key derivation
+        # completes, `approve_agent` can sit awaiting approval while the durable
+        # session still does not exist: the key projection is consumed, and the
+        # wallet looks empty because the agent was never registered at the venue.
+        # Cleanup used to report success and leave that ceremony open.
+        self.definition.session_id = "not-created"
+        self.definition.session_base = self.mount / "not-created"
+        self.definition._read_session_status = mock.Mock(return_value=None)
+        self.definition._pending_petal_key_ceremony = mock.Mock(return_value=None)
+        self.definition._pending_agent_approval_ceremony = mock.Mock(
+            return_value="http://localhost:18734/ceremony/" + "B" * 43
+        )
+        self.definition._require_empty_wallet = mock.Mock()
+
+        with self.assertRaisesRegex(
+            EvalError, "agent approval ceremony is still awaiting user action"
+        ):
+            self.definition.cleanup()
+
+    def test_cleanup_polls_postconditions_after_accepted_writes(self) -> None:
+        # A mounted write returns once accepted for dispatch, so the first read
+        # after `cancel_all`, `close_all`, or `stop` can still observe the
+        # pre-write state. Reading once turned that into a spurious failure,
+        # which then skipped `stop` and left the session live.
+        self.definition.session_id = "created"
+        self.definition.session_base = self.mount / "created"
+        self.definition._read_session_status = mock.Mock(
+            return_value={"stopped": False}
+        )
+        # open_orders: stale, stale, then settled. status.json: stale then stopped.
+        self.definition._read_json = mock.Mock(
+            side_effect=[
+                [{"oid": 1}],
+                [{"oid": 1}],
+                [],
+                {"stopped": False},
+                {"stopped": True},
+            ]
+        )
+        self.definition._nonzero_positions = mock.Mock(return_value=[])
+        self.definition._require_no_orders_or_positions = mock.Mock()
+        self.definition._write_route = mock.Mock(
+            return_value=SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+        )
+
+        with mock.patch.object(hyperliquid_order_cancel.time, "sleep"):
+            self.definition.cleanup()
+
+        routes = [
+            call.args[0].name for call in self.definition._write_route.call_args_list
+        ]
+        self.assertEqual(routes, ["cancel_all", "stop"])
+
+    def test_cleanup_reports_failure_when_postcondition_never_settles(self) -> None:
+        # Polling must not paper over a genuine failure: a budget that expires
+        # still fails cleanup.
+        self.definition.session_id = "created"
+        self.definition.session_base = self.mount / "created"
+        self.definition._read_session_status = mock.Mock(
+            return_value={"stopped": False}
+        )
+        self.definition._read_json = mock.Mock(return_value=[{"oid": 1}])
+        self.definition._nonzero_positions = mock.Mock(return_value=[])
+        self.definition._require_no_orders_or_positions = mock.Mock()
+        self.definition._write_route = mock.Mock(
+            return_value=SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+        )
+
+        with mock.patch.object(hyperliquid_order_cancel.time, "sleep"):
+            with self.assertRaisesRegex(EvalError, "still has open orders"):
+                self.definition.cleanup()
 
     def test_cleanup_closes_residual_position_before_stopping(self) -> None:
         self.definition.session_id = "created"
