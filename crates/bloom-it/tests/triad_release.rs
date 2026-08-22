@@ -438,24 +438,20 @@ fn triad_developer_launcher_supports_linux_without_weakening_root_boundary() {
     assert!(launcher.contains("Linux developer systemd user unit directory is unsafe"));
     assert!(launcher.contains("Linux developer systemd unit paths may contain only ASCII"));
     assert!(launcher.contains("printf 'FileDescriptorName=%s\\n' \"$descriptor\""));
-    assert!(launcher.contains(
-        "'Bloom developer Signer socket' \"$signer_socket\" signer \"$signer_service_unit\""
-    ));
-    assert!(launcher.contains(
-        "'Bloom developer Signer control socket' \"$signer_control_socket\" signer-control \"$signer_service_unit\""
-    ));
-    assert!(launcher.contains(
-        "'Bloom developer Broker socket' \"$broker_socket\" broker \"$broker_service_unit\""
-    ));
-    assert!(launcher.contains(
-        "'Bloom developer Broker control socket' \"$broker_control_socket\" broker-control \"$broker_service_unit\""
-    ));
-    assert!(launcher.contains(
-        "printf 'Sockets=%s\\n' \"$signer_socket_unit\" \"$signer_control_socket_unit\""
-    ));
-    assert!(launcher.contains(
-        "printf 'Sockets=%s\\n' \"$broker_socket_unit\" \"$broker_control_socket_unit\""
-    ));
+    assert!(!launcher.contains("signer_socket_unit"));
+    assert!(!launcher.contains("BLOOM_SIGNER_ACTIVATION_NAME"));
+    assert!(!launcher.contains("BLOOM_SIGNER_CONTROL_ACTIVATION_NAME"));
+    assert!(launcher.contains("\"BLOOM_SIGNER_SOCKET=$signer_socket\""));
+    assert!(launcher.contains("\"BLOOM_SIGNER_CONTROL_SOCKET=$signer_control_socket\""));
+    assert!(!launcher.contains("broker_socket_unit"));
+    assert!(!launcher.contains("broker_control_socket_unit"));
+    assert!(!launcher.contains("BLOOM_BROKER_ACTIVATION_NAME"));
+    assert!(!launcher.contains("BLOOM_BROKER_CONTROL_ACTIVATION_NAME"));
+    assert!(launcher.contains("\"BLOOM_BROKER_SOCKET=$broker_socket\""));
+    assert!(launcher.contains("\"BLOOM_BROKER_CONTROL_SOCKET=$broker_control_socket\""));
+    assert!(launcher.contains("broker_ceremony_socket_unit"));
+    assert!(launcher.contains("'127.0.0.1:18734' broker-ceremony"));
+    assert!(launcher.contains("BLOOM_BROKER_CEREMONY_ACTIVATION_NAME=broker-ceremony"));
     assert_eq!(
         launcher
             .matches("\"BLOOM_AUTHORITY_EDGE_HISTORY=$authority_edge_history\"")
@@ -463,6 +459,7 @@ fn triad_developer_launcher_supports_linux_without_weakening_root_boundary() {
         2
     );
     assert!(launcher.contains("Linux developer services require an active systemd user manager"));
+    assert!(launcher.contains("BLOOM_TRIAD_DEV_SOCKET_TIMEOUT_SECONDS"));
 
     let linux_manifest =
         fs::read_to_string(workspace().join("packaging/triad/linux/config/edge-manifest.json.in"))
