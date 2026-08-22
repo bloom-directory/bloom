@@ -14,6 +14,7 @@ ready_file=""
 services_only=0
 install_authority_fixture="${BLOOM_TRIAD_DEV_AUTHORITY_FIXTURE:-0}"
 build_integration_petals="${BLOOM_TRIAD_DEV_BUILD_PETALS:-1}"
+socket_timeout_seconds="${BLOOM_TRIAD_DEV_SOCKET_TIMEOUT_SECONDS:-30}"
 
 die() { printf 'triad developer launcher: %s\n' "$*" >&2; exit 1; }
 need_value() { [ "$#" -ge 2 ] || die "$1 requires a value"; }
@@ -45,6 +46,10 @@ case "$build_integration_petals" in
   0|1) ;;
   *) die "BLOOM_TRIAD_DEV_BUILD_PETALS must be 0 or 1" ;;
 esac
+case "$socket_timeout_seconds" in
+  ''|*[!0-9]*|0) die "BLOOM_TRIAD_DEV_SOCKET_TIMEOUT_SECONDS must be a positive integer" ;;
+esac
+socket_wait_attempts=$((socket_timeout_seconds * 10))
 
 [ "$(id -u)" -ne 0 ] || die "developer harness refuses root"
 host_os="$(uname -s)"
@@ -257,8 +262,7 @@ unit_token="$(basename "$runtime_dir")"
 unit_prefix="bloom-triad-dev-$(id -u)-${unit_token}"
 signer_service_unit="${unit_prefix}-signer.service"
 broker_service_unit="${unit_prefix}-broker.service"
-broker_socket_unit="${unit_prefix}-broker.socket"
-broker_control_socket_unit="${unit_prefix}-broker-control.socket"
+broker_ceremony_socket_unit="${unit_prefix}-broker-ceremony.socket"
 broker_checkpoint_dir="${developer_root}/audit-checkpoints/broker"
 signer_checkpoint_dir="${developer_root}/audit-checkpoints/signer"
 machine_checkpoint_dir="${machine_home}/audit-checkpoints/machine"
@@ -311,12 +315,10 @@ systemd_units_installed=0
 stop_linux_authority_units() {
   [ "$host_os" = Linux ] || return 0
   systemctl --user stop "$broker_service_unit" "$signer_service_unit" >/dev/null 2>&1 || true
-  systemctl --user stop \
-    "$broker_socket_unit" "$broker_control_socket_unit" >/dev/null 2>&1 || true
+  systemctl --user stop "$broker_ceremony_socket_unit" >/dev/null 2>&1 || true
   if [ "$systemd_units_installed" -eq 1 ]; then
     rm -f -- \
-      "${user_unit_dir}/${broker_socket_unit}" \
-      "${user_unit_dir}/${broker_control_socket_unit}" \
+      "${user_unit_dir}/${broker_ceremony_socket_unit}" \
       "${user_unit_dir}/${broker_service_unit}" \
       "${user_unit_dir}/${signer_service_unit}"
     systemctl --user daemon-reload >/dev/null 2>&1 || true
@@ -358,7 +360,7 @@ wait_for_socket() {
       die "$label exited before publishing its socket"
     }
     attempts=$((attempts + 1))
-    [ "$attempts" -lt 300 ] || {
+    [ "$attempts" -lt "$socket_wait_attempts" ] || {
       if [ "$label" = machine ] && [ -n "$mount_dir" ]; then
         mount_fallback_hint
       fi
@@ -443,10 +445,8 @@ start_linux_authority_services() {
   # Mark ownership before the first write so the EXIT trap removes even a
   # partially rendered unit set.
   systemd_units_installed=1
-  write_linux_socket_unit "$broker_socket_unit" \
-    'Bloom developer Broker socket' "$broker_socket" broker "$broker_service_unit"
-  write_linux_socket_unit "$broker_control_socket_unit" \
-    'Bloom developer Broker control socket' "$broker_control_socket" broker-control "$broker_service_unit"
+  write_linux_socket_unit "$broker_ceremony_socket_unit" \
+    'Bloom developer Broker ceremony listener' '127.0.0.1:18734' broker-ceremony "$broker_service_unit"
 
   : > "${log_dir}/signer.log"
   {
@@ -471,7 +471,7 @@ start_linux_authority_services() {
   : > "${log_dir}/broker.log"
   {
     printf '%s\n' '[Unit]' 'Description=Bloom developer Broker' \
-      "Requires=$broker_socket_unit $broker_control_socket_unit" \
+      "Requires=$broker_ceremony_socket_unit" \
       "After=$signer_service_unit" '' \
       '[Service]' 'Type=simple' 'UMask=0077'
     printf 'ExecStart=%s\n' "$broker_bin"
@@ -485,15 +485,15 @@ start_linux_authority_services() {
       "BLOOM_BROKER_AUDIT_CHECKPOINT_DIR=$broker_checkpoint_dir" \
       "BLOOM_AUTHORITY_EDGE_HISTORY=$authority_edge_history" \
       "BLOOM_SESSION_SOCKET=$session_socket" \
-      'BLOOM_BROKER_ACTIVATION_NAME=broker' \
-      'BLOOM_BROKER_CONTROL_ACTIVATION_NAME=broker-control'
-    printf 'Sockets=%s\n' "$broker_socket_unit" "$broker_control_socket_unit"
+      "BLOOM_BROKER_SOCKET=$broker_socket" \
+      "BLOOM_BROKER_CONTROL_SOCKET=$broker_control_socket" \
+      'BLOOM_BROKER_CEREMONY_ACTIVATION_NAME=broker-ceremony'
+    printf 'Sockets=%s\n' "$broker_ceremony_socket_unit"
   } > "${user_unit_dir}/${broker_service_unit}"
   chmod 0600 "${user_unit_dir}/${broker_service_unit}"
 
   systemctl --user daemon-reload
-  systemctl --user start \
-    "$broker_socket_unit" "$broker_control_socket_unit"
+  systemctl --user start "$broker_ceremony_socket_unit"
   systemctl --user start "$signer_service_unit"
   signer_pid="$(systemctl --user show "$signer_service_unit" -p MainPID --value)"
   [ "$signer_pid" -gt 0 ] ||
@@ -505,6 +505,7 @@ start_linux_authority_services() {
   [ "$broker_pid" -gt 0 ] ||
     die "Linux developer Broker did not publish a main process"
   wait_for_socket "$broker_socket" "$broker_pid" broker
+  wait_for_socket "$broker_control_socket" "$broker_pid" broker
   systemctl --user is-active --quiet "$signer_service_unit" "$broker_service_unit"
 }
 
