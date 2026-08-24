@@ -962,11 +962,11 @@ impl PetalHost for DaemonPetalHost {
         let eligible_parents = wallet
             .key_refs
             .iter()
-            .cloned()
             .filter(|key| {
                 key.derivation.is_none()
                     && suites.iter().all(|suite| suite.key_spec() == key.key_spec)
             })
+            .cloned()
             .collect::<Vec<_>>();
         let [parent_key_ref] = eligible_parents.as_slice() else {
             return Err(HostError::Denied(
