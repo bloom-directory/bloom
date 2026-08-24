@@ -6,12 +6,16 @@ reward=0
 cleanup_status=0
 
 cleanup() {
-  local base="/bloom/petals/hyperliquid/mainnet/agent_sessions/${BLOOM_EVAL_WALLET}/${BLOOM_EVAL_SESSION_ID}"
+  local base="/bloom/petals/hyperliquid/mainnet/agent_sessions/${BLOOM_EVAL_WALLET_ID}/${BLOOM_EVAL_SESSION_ID}"
   local open_orders="/bloom/petals/hyperliquid/mainnet/users/${BLOOM_EVAL_WALLET}/open_orders.json"
   if [ -e "${base}/cancel_all" ] && ! { [ -s "${base}/status.json" ] && jq -e '.stopped == true' "${base}/status.json" >/dev/null 2>&1; }; then
     timeout 30 bash -c 'printf %s cleanup > "$1"' _ "${base}/cancel_all" >/dev/null 2>&1 || cleanup_status=1
   fi
-  if ! timeout 20 jq -e 'type == "array" and length == 0' "$open_orders" >/dev/null 2>&1; then
+  if ! timeout 30 bash -c '
+    until jq -e '\''type == "array" and length == 0'\'' "$1" >/dev/null 2>&1; do
+      sleep 1
+    done
+  ' _ "$open_orders"; then
     cleanup_status=1
   fi
 }
