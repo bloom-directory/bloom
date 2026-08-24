@@ -478,7 +478,7 @@ impl DaemonPetalHost {
                     "Petal reusable approval route {route:?} is absent from installer provenance"
                 ))
             })?;
-            let allowed_operation_classes = record
+            let mut allowed_operation_classes = record
                 .operation_classes
                 .iter()
                 .filter(|entry| {
@@ -488,6 +488,7 @@ impl DaemonPetalHost {
                 })
                 .map(|entry| entry.operation_class.clone())
                 .collect::<Vec<_>>();
+            allowed_operation_classes.sort_by(|left, right| left.as_str().cmp(right.as_str()));
             if allowed_operation_classes.is_empty() {
                 return Err(HostError::Denied(format!(
                     "Petal reusable approval route {route:?} has no scoped provenance class"
