@@ -1592,7 +1592,7 @@ fn inspect(
         f.seek(SeekFrom::End(-1))?;
         let mut final_byte = [0_u8; 1];
         f.read_exact(&mut final_byte)?;
-        if final_byte != [b'\n'] {
+        if final_byte[0] != b'\n' {
             return Err(AuditError::Degraded(
                 "audit journal is not newline-terminated".to_owned(),
             ));
