@@ -34,7 +34,7 @@ futures = { workspace = true, optional = true }
 # Embedded NFSv4.1 server. Pinned to the bloom-directory fork revision that
 # exposes OpenSupport so path-derived denials can surface from NFS OPEN.
 # Marked optional so non-mount builds don't fetch the git source.
-embednfs = { git = "https://github.com/bloom-directory/embednfs.git", rev = "6cf74877518ea0b5e7f9d3c1fa5ee0b461cd3eb3", optional = true }
+embednfs = { git = "https://github.com/bloom-directory/embednfs.git", rev = "ac1bcb92c5d6342239595cafd1284858e40300a6", optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }

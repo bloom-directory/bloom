@@ -168,7 +168,10 @@ pub fn detect_mount_command() -> &'static str {
 ///
 /// * **Linux** (`mount.nfs4`): `actimeo=0` disables attribute caching
 ///   without relying on `lookupcache=none`, which is rejected by some
-///   minimal CI images.
+///   minimal CI images. `soft,retrans=2` bounds failures when the local
+///   in-process server exits: this VFS is a command interface, so returning
+///   an I/O error is safer than leaving callers indefinitely blocked in an
+///   uninterruptible kernel RPC wait.
 /// * **macOS** (`mount_nfs`): `actimeo=0` zeros the attribute-cache
 ///   timeouts. The Linux-only `lookupcache=none`, `nocallback`, and
 ///   `nonegnamecache` knobs are *not* recognised by macOS and would
@@ -195,7 +198,9 @@ pub fn build_mount_args(cfg: &MountConfig, server: SocketAddr) -> Vec<String> {
 
 #[cfg(target_os = "linux")]
 fn build_mount_opts(port: u16) -> String {
-    format!("actimeo=0,vers=4.1,proto=tcp,port={port},rsize=65536,wsize=65536,timeo=10")
+    format!(
+        "actimeo=0,vers=4.1,proto=tcp,port={port},rsize=65536,wsize=65536,timeo=10,soft,retrans=2"
+    )
 }
 
 #[cfg(target_os = "macos")]
@@ -281,6 +286,10 @@ mod tests {
         assert!(
             !joined.contains("mountport="),
             "linux opts must avoid nfs2/nfs3 mountport= on nfs4: {joined}"
+        );
+        assert!(
+            joined.contains("soft") && joined.contains("retrans=2"),
+            "local in-process NFS failures must be bounded: {joined}"
         );
     }
 
