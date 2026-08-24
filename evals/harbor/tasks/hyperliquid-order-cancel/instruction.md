@@ -1,10 +1,16 @@
 Use the Bloom filesystem mounted at `/bloom` to perform this exact task on **Hyperliquid mainnet**:
 
+`/bloom` is a dynamic virtual filesystem: directory traversal can execute live
+venue reads. Never run `find`, `tree`, `rg --files`, recursive `ls`, or any
+broad enumeration under `/bloom`, and never issue concurrent `/bloom` commands.
+Access only the exact paths named below, one command at a time. A direct read
+may take several seconds; wait for it to finish instead of starting another.
+
 1. Use the dedicated wallet in `BLOOM_EVAL_WALLET` and the stable session ID in `BLOOM_EVAL_SESSION_ID`. Two identifiers name this wallet and they are not interchangeable. `BLOOM_EVAL_WALLET_ID` is the Bloom wallet id, and it is the path segment for every session route: `/bloom/petals/hyperliquid/mainnet/agent_sessions/$BLOOM_EVAL_WALLET_ID/$BLOOM_EVAL_SESSION_ID/`. `BLOOM_EVAL_WALLET` is the on-chain address, and it is the path segment for Hyperliquid account reads such as `/bloom/petals/hyperliquid/mainnet/users/$BLOOM_EVAL_WALLET/`. Using one where the other belongs fails as an unqualified permission error.
 2. The trusted host has already created and owner-approved the session. Read its `status.json` and refuse to continue unless it is active, mainnet, BTC-only (asset ID `0`), capped at `11` USD notional and 1x leverage.
-3. Set BTC cross leverage to exactly 1 through the session's `update_leverage.json` route and confirm that action succeeded.
-4. Read the current BTC mark/mid through Bloom. Submit one BTC **post-only (ALO) buy** with client order ID `BLOOM_EVAL_CLOID`. Its limit price must be 5% below the observed mark (round down only as needed for Hyperliquid's tick rules). Choose a five-decimal-or-less BTC size whose notional at the limit price is at least $10 and no more than $11.
-5. Confirm the order response says the order is resting. Cancel that exact order, preferably by its returned order ID, and confirm the cancel succeeded.
+3. Read the session's `update_leverage.json` leaf and follow its `request_schema` and `example` exactly to set BTC cross leverage to 1. Confirm that action succeeded using the evidence named by the leaf.
+4. Read the current BTC mark from `/bloom/petals/hyperliquid/mainnet/mids.json`. Then read the session's `order.json` leaf and follow its `request_schema` and `example` to submit one BTC **post-only (ALO) buy** with client order ID `BLOOM_EVAL_CLOID`. Its limit price must be 5% below the observed mark (round down only as needed for Hyperliquid's tick rules). Choose a five-decimal-or-less BTC size whose notional at the limit price is at least $10 and no more than $11.
+5. Confirm the new order response says the order is resting. Read the session's `cancel.json` leaf, cancel that exact order using its documented request shape, and confirm the cancel succeeded.
 6. Read open orders through Bloom and confirm no order with `BLOOM_EVAL_CLOID` remains. Invoke the session's `cancel_all` cleanup endpoint, but leave the session active so the verifier and host can independently repeat cleanup and stop it.
 7. Write exactly one JSON object to `/logs/artifacts/result.json`, matching the schema below. Harbor re-materializes that conventional artifact path unchanged for the verifier. Decimal values must be JSON strings.
 
@@ -33,4 +39,4 @@ Use the Bloom filesystem mounted at `/bloom` to perform this exact task on **Hyp
 }
 ```
 
-Read `/bloom/petals/hyperliquid/README.md`, the relevant route descriptions, status, response, and error files before writing. A successful filesystem write alone is not evidence that Hyperliquid accepted an action. The complete `/bloom` mount is available for normal discovery, but this task authorizes writes only to the exact bounded Hyperliquid session named above. Do not use any other wallet, asset, network, amount, side, order type, or client order ID. Submit exactly one order action and do not place a replacement order if it is rejected. Never stop the session yourself. If any step fails, invoke `cancel_all`, leave the session active for host cleanup, and do not report `complete`.
+Read `/bloom/petals/hyperliquid/README.md`, then address the exact session and account leaves described above directly; do not enumerate their parent directories. The installed route leaves are the authoritative API contract; do not substitute payloads from external documentation or another repository revision. Read the relevant status, action, audit, response, and error files one at a time. A successful filesystem write or a previously stored `last_response.json` alone is not evidence that Hyperliquid accepted the current action. This task authorizes writes only to the exact bounded Hyperliquid session named above. Do not use any other wallet, asset, network, amount, side, order type, or client order ID. Submit exactly one order action and do not place a replacement order if it is rejected. Never stop the session yourself. If any step fails, invoke `cancel_all`, leave the session active for host cleanup, and do not report `complete`.
