@@ -93,6 +93,29 @@ case "$action" in
         exit 66
       }
     done
+    chrony_service=""
+    if [[ "$root" == "/" ]]; then
+      for required_command in chronyd chronyc; do
+        command -v "$required_command" >/dev/null || {
+          echo "Linux installation requires chrony with NTS support ($required_command is missing)" >&2
+          exit 69
+        }
+      done
+      if systemctl is-active --quiet systemd-timesyncd.service; then
+        echo "disable systemd-timesyncd and enable chrony before installing Bloom" >&2
+        exit 69
+      fi
+      for candidate in chronyd.service chrony.service; do
+        if systemctl cat "$candidate" >/dev/null 2>&1; then
+          chrony_service="$candidate"
+          break
+        fi
+      done
+      [[ -n "$chrony_service" ]] || {
+        echo "Linux installation could not find a chrony systemd service" >&2
+        exit 69
+      }
+    fi
     installed_config_root="$root/etc/bloom/$login_uid"
     fresh_install=true
     if [[ -e "$installed_config_root/edge-manifest.json" ]]; then
@@ -200,6 +223,14 @@ case "$action" in
     } > "$chrony_target.new"
     chmod 0644 "$chrony_target.new"
     mv -f "$chrony_target.new" "$chrony_target"
+    if [[ "$root" == "/" ]]; then
+      systemctl enable --now "$chrony_service"
+      systemctl restart "$chrony_service"
+      chronyc waitsync 30 0.5 1000 1 >/dev/null || {
+        echo "chrony did not synchronize from the required authenticated NTS sources" >&2
+        exit 69
+      }
+    fi
 
     enrollment_scratch=""
     trap 'if [[ -n "${enrollment_scratch:-}" && -d "$enrollment_scratch" ]]; then find "$enrollment_scratch" -depth -delete; fi' EXIT

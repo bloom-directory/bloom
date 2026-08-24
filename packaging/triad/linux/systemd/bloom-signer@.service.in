@@ -24,7 +24,9 @@ PrivateNetwork=yes
 PrivateTmp=yes
 ProtectSystem=strict
 ProtectHome=yes
-ProtectClock=yes
+# ProtectClock cannot be enabled here: it blocks the read-only adjtimex query
+# used to verify that the configured trusted UTC source is synchronized.
+# CapabilityBoundingSet= still denies CAP_SYS_TIME and therefore clock writes.
 ProtectControlGroups=yes
 ProtectKernelLogs=yes
 ProtectKernelModules=yes

@@ -171,6 +171,14 @@ fn service_sandboxes_remove_machine_and_network_authority() {
                 "{name} sandbox is missing {required}"
             );
         }
+        assert!(
+            !unit.contains("ProtectClock="),
+            "{name} must be able to make the read-only adjtimex synchronization query"
+        );
+        assert!(
+            unit.contains("CapabilityBoundingSet=") && unit.contains("AmbientCapabilities="),
+            "{name} must still lack CAP_SYS_TIME after ProtectClock is removed"
+        );
     }
     assert!(broker.contains("User=bloom-broker-%i"));
     assert!(broker.contains("RestrictAddressFamilies=AF_UNIX AF_INET"));
