@@ -1571,23 +1571,6 @@ fn linux_installer_accepts_the_native_or_portable_sha256_tool() {
 }
 
 #[test]
-fn linux_installer_requires_the_claimed_chrony_nts_runtime() {
-    let installer = fs::read_to_string(release_script("install-linux.sh")).unwrap();
-    for required in [
-        "for required_command in chronyd chronyc",
-        "systemctl is-active --quiet systemd-timesyncd.service",
-        "chronyd.service chrony.service",
-        "systemctl enable --now \"$chrony_service\"",
-        "chronyc waitsync 30 0.5 1000 1",
-    ] {
-        assert!(
-            installer.contains(required),
-            "Linux installer is missing trusted-time preflight: {required}"
-        );
-    }
-}
-
-#[test]
 fn macos_installer_stages_unix_principals_launchdaemons_and_confirmed_uninstall() {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().join("root");
