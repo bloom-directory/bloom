@@ -12,6 +12,84 @@ session="bloom-eval-test"
 cloid="0x22222222222222222222222222222222"
 export BLOOM_EVAL_WALLET="$wallet" BLOOM_EVAL_SESSION_ID="$session" BLOOM_EVAL_CLOID="$cloid"
 
+# Serve deterministic orderStatus responses so the verifier's HTTP trust
+# boundary is exercised without touching mainnet. Production does not set the
+# URL override and queries https://api.hyperliquid.xyz/info directly.
+cat >"$tmp/fake_hyperliquid.py" <<'PY'
+import json
+import os
+import pathlib
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+wallet = os.environ["BLOOM_EVAL_WALLET"]
+cloid = os.environ["BLOOM_EVAL_CLOID"]
+order = {
+    "coin": "BTC",
+    "side": "B",
+    "limitPx": "95000",
+    "sz": "0",
+    "oid": 123,
+    "timestamp": 1,
+    "triggerCondition": "N/A",
+    "isTrigger": False,
+    "triggerPx": "0",
+    "children": [],
+    "isPositionTpsl": False,
+    "reduceOnly": False,
+    "orderType": "Limit",
+    "origSz": "0.00011",
+    "tif": "Alo",
+    "cloid": cloid,
+}
+
+
+class Handler(BaseHTTPRequestHandler):
+    def do_POST(self):
+        length = int(self.headers.get("content-length", "0"))
+        request = json.loads(self.rfile.read(length))
+        if (
+            request.get("type") == "orderStatus"
+            and request.get("user") == wallet
+            and request.get("oid") in (cloid, 123)
+        ):
+            response = {
+                "status": "order",
+                "order": {
+                    "order": order,
+                    "status": "canceled",
+                    "statusTimestamp": 2,
+                },
+            }
+        else:
+            response = {"status": "unknownOid"}
+        body = json.dumps(response).encode()
+        self.send_response(200)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, _format, *_args):
+        pass
+
+
+server = HTTPServer(("127.0.0.1", 0), Handler)
+pathlib.Path(os.environ["FAKE_HYPERLIQUID_PORT_FILE"]).write_text(
+    str(server.server_port)
+)
+server.serve_forever()
+PY
+port_file="$tmp/fake-hyperliquid.port"
+FAKE_HYPERLIQUID_PORT_FILE="$port_file" python3 "$tmp/fake_hyperliquid.py" &
+fake_hyperliquid_pid=$!
+trap 'kill "$fake_hyperliquid_pid" 2>/dev/null || true; rm -rf "$tmp"' EXIT
+for _ in $(seq 1 50); do
+  [ -s "$port_file" ] && break
+  sleep 0.1
+done
+[ -s "$port_file" ] || { echo "fake Hyperliquid server did not start" >&2; exit 1; }
+export BLOOM_EVAL_HYPERLIQUID_INFO_URL="http://127.0.0.1:$(cat "$port_file")/info"
+
 cat >"$tmp/good.json" <<EOF
 {"schema":"bloom.eval.hyperliquid_order_cancel.v1","status":"complete","network":"mainnet","wallet":"$wallet","session_id":"$session","asset":"BTC","asset_id":0,"side":"buy","leverage":1,"post_only":true,"mark_price":"100000","limit_price":"95000","size":"0.00011","notional_usd":"10.45","cloid":"$cloid","order_status":"resting","order_id":123,"cancel_status":"success","matching_open_orders_after_cancel":0,"session_left_active_for_harness_cleanup":true}
 EOF

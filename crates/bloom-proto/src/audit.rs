@@ -4,7 +4,7 @@
 //! with any line breaks the chain.
 
 use std::fs::OpenOptions;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -1586,7 +1586,19 @@ fn inspect(
             },
         ));
     }
-    let f = std::fs::File::open(path)?;
+    let mut f = std::fs::File::open(path)?;
+    let len = f.metadata()?.len();
+    if len != 0 {
+        f.seek(SeekFrom::End(-1))?;
+        let mut final_byte = [0_u8; 1];
+        f.read_exact(&mut final_byte)?;
+        if final_byte != [b'\n'] {
+            return Err(AuditError::Degraded(
+                "audit journal is not newline-terminated".to_owned(),
+            ));
+        }
+        f.seek(SeekFrom::Start(0))?;
+    }
     let mut prev = String::new();
     let mut sequence = 0_u64;
     let mut pending_effects = std::collections::BTreeSet::new();
@@ -2002,6 +2014,28 @@ mod tests {
             );
             assert!(running.mutation_degradation().is_some());
         }
+    }
+
+    #[test]
+    fn startup_rejects_signed_tail_without_record_delimiter() {
+        let (_dir, path, identity) = signed_fixture(2);
+        let file = OpenOptions::new().write(true).open(&path).unwrap();
+        let len = file.metadata().unwrap().len();
+        assert_eq!(std::fs::read(&path).unwrap().last(), Some(&b'\n'));
+        file.set_len(len - 1).unwrap();
+        drop(file);
+        let truncated = std::fs::read(&path).unwrap();
+
+        let restarted = AuditLog::open_signed(&path, identity).unwrap();
+        assert_eq!(
+            restarted.mutation_degradation().as_deref(),
+            Some("audit journal is degraded: audit journal is not newline-terminated")
+        );
+        assert!(matches!(
+            restarted.append(record("must-not-concatenate", 3)),
+            Err(AuditError::Degraded(_))
+        ));
+        assert_eq!(std::fs::read(&path).unwrap(), truncated);
     }
 
     #[test]

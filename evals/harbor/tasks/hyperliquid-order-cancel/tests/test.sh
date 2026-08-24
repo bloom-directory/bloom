@@ -21,6 +21,10 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# The Python verifier queries Hyperliquid's public orderStatus endpoint by the
+# host-generated CLOID and again by the returned venue order id. The report is
+# only a claimed transcript; it is not evidence that an order rested or was
+# canceled.
 if python3 /tests/verify_result.py /logs/artifacts/result.json; then
   reward=1
 fi
@@ -34,7 +38,7 @@ fi
 
 printf '%s\n' "$reward" > /logs/verifier/reward.txt
 if [ "$reward" -eq 1 ]; then
-  printf '%s\n' 'Bloom Hyperliquid result report passed.'
+  printf '%s\n' 'Bloom Hyperliquid result and venue order evidence passed.'
   exit 0
 fi
 exit 1

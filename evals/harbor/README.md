@@ -16,10 +16,12 @@ wallet. Each trial must:
 - confirm the order rests, cancel it, confirm no matching order remains, and
   leave the session active for harness-owned cleanup.
 
-The v0 verifier intentionally grades the agent's strict `result.json` report,
-as agreed for the first eval slice. It checks task parameters and arithmetic but
-is **not yet independent venue evidence**. A follow-up should grade Bloom/venue
-audit data outside the agent-controlled container.
+The verifier validates the agent's strict `result.json` report and independently
+queries Hyperliquid `orderStatus` first by the host-generated CLOID and then by
+the returned venue order ID. It requires the venue record to be a canceled BTC
+ALO buy and binds its immutable price, original size, and order ID back to the
+report; agent-authored status fields are not accepted as placement or
+cancellation evidence.
 
 ## Prerequisites
 
