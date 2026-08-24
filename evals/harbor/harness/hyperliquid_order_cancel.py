@@ -43,6 +43,11 @@ ACTION_FILES = ("order.json", "cancel.json", "update_leverage.json", "cancel_all
 # agent approval. The cap bounds a misbehaving route rather than describing the
 # expected count, and is deliberately larger than two.
 MAX_SESSION_CEREMONIES = 4
+# Session writes can return before Machine publishes the owner-visible
+# ceremony, especially while the NFS adapter is busy validating a large Petal.
+# Keep discovery within the route's 120-second write budget rather than giving
+# up after the previous fixed 10-second window.
+CEREMONY_DISCOVERY_ATTEMPTS = 600
 # Petal reads are live venue round-trips, not disk reads.
 VENUE_READ_TIMEOUT_SECONDS = 45
 VENUE_READ_ATTEMPTS = 3
@@ -817,7 +822,7 @@ class HyperliquidOrderCancelEval(EvalDefinition):
             ceremony_url: str | None = None
             # Mounted Petal writes are asynchronous. A zero write exit code
             # means accepted for dispatch, not that the route completed.
-            for _ in range(50):
+            for _ in range(CEREMONY_DISCOVERY_ATTEMPTS):
                 status_data = self._read_json_if_exists(
                     self.session_base / "status.json"
                 )
