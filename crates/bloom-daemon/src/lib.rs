@@ -254,24 +254,26 @@ struct PetalKeyRequestState {
     ceremony_url: Option<String>,
     ceremony_expires_at_ms: bloom_broker_api::DecimalU64,
     public_key: Option<bloom_broker_api::KeyPublic>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reusable_approval_id: Option<bloom_broker_api::Digest32>,
 }
 
 impl PetalKeyRequestState {
     fn guest_outcome(&self) -> Result<bloom_petals::PetalKeyOutcome, HostError> {
         let operation_id = self.scope.custody_operation_id.as_str().to_string();
         let scope_digest = self.scope_digest.as_str().to_string();
-        match &self.public_key {
-            None => Ok(bloom_petals::PetalKeyOutcome::Pending {
-                operation_id,
-                scope_digest,
-            }),
-            Some(key) => Ok(bloom_petals::PetalKeyOutcome::Ready {
+        match (&self.status[..], &self.public_key) {
+            ("succeeded", Some(key)) => Ok(bloom_petals::PetalKeyOutcome::Ready {
                 operation_id,
                 scope_digest,
                 key_ref_jcs: serde_jcs::to_vec(&key.key_ref).map_err(|error| {
                     HostError::Backend(format!("canonicalize public Petal KeyRef: {error}"))
                 })?,
                 addresses: key.addresses.clone(),
+            }),
+            _ => Ok(bloom_petals::PetalKeyOutcome::Pending {
+                operation_id,
+                scope_digest,
             }),
         }
     }
@@ -449,6 +451,212 @@ impl DaemonPetalHost {
             ))
         })?;
         Ok(())
+    }
+
+    async fn prepare_petal_key_reusable_approval(
+        &self,
+        broker: &MachineBrokerClient,
+        wallet: &bloom_broker_api::WalletPublic,
+        scope: &bloom_broker_api::PetalKeyScope,
+        key_ref: &bloom_broker_api::KeyRef,
+        provenance_digest: bloom_broker_api::Digest32,
+    ) -> Result<bloom_broker_api::SealedApprovalPrepareResponse, HostError> {
+        let catalog = self.provenance_catalog.as_ref().ok_or_else(|| {
+            HostError::Backend("installer provenance catalog is not configured".into())
+        })?;
+        let mut routes = scope.allowed_routes.clone();
+        routes.sort();
+        routes.dedup();
+        let mut route_grants = Vec::with_capacity(routes.len());
+        for route in routes {
+            let subject = bloom_broker_api::ProvenanceSubject::Petal {
+                package_hash: scope.package_hash.clone(),
+                route: route.clone(),
+            };
+            let record = catalog.record(&subject).ok_or_else(|| {
+                HostError::Denied(format!(
+                    "Petal reusable approval route {route:?} is absent from installer provenance"
+                ))
+            })?;
+            let allowed_operation_classes = record
+                .operation_classes
+                .iter()
+                .filter(|entry| {
+                    scope
+                        .allowed_operation_classes
+                        .contains(&entry.operation_class)
+                })
+                .map(|entry| entry.operation_class.clone())
+                .collect::<Vec<_>>();
+            if allowed_operation_classes.is_empty() {
+                return Err(HostError::Denied(format!(
+                    "Petal reusable approval route {route:?} has no scoped provenance class"
+                )));
+            }
+            route_grants.push(bloom_broker_api::PetalRouteGrant {
+                route,
+                allowed_operation_classes,
+                provenance_digest: record.digest().map_err(|error| {
+                    HostError::Denied(format!("digest route provenance: {error}"))
+                })?,
+            });
+        }
+        let subject_classes = route_grants
+            .iter()
+            .find(|grant| grant.route == scope.route)
+            .map(|grant| grant.allowed_operation_classes.clone())
+            .ok_or_else(|| HostError::Denied("derived-key origin route is not granted".into()))?;
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_millis() as u64)
+            .map_err(|error| HostError::Backend(format!("read system time: {error}")))?;
+        let lifetime_ms = scope.maximum_lifetime_ms.get();
+        let approval_lifetime_ms = if lifetime_ms > 120_000 {
+            lifetime_ms - 60_000
+        } else {
+            lifetime_ms / 2
+        };
+        if approval_lifetime_ms == 0 {
+            return Err(HostError::Denied(
+                "derived-key lifetime is too short for reusable approval".into(),
+            ));
+        }
+        let scope_digest = scope
+            .digest()
+            .map_err(|error| HostError::Invalid(error.to_string()))?;
+        let operation_digest = blake3::hash(
+            [
+                b"bloom-petal-reusable-approval-operation/v1\0".as_slice(),
+                scope_digest.as_str().as_bytes(),
+                key_ref.public_key_fingerprint.as_str().as_bytes(),
+            ]
+            .concat()
+            .as_slice(),
+        );
+        let operation_id = bloom_broker_api::OperationId::from_bytes(*operation_digest.as_bytes());
+        let request_nonce_hex = hex::encode(sha2::Sha256::digest(
+            [
+                b"bloom-petal-reusable-approval-nonce/v1\0".as_slice(),
+                operation_id.as_str().as_bytes(),
+            ]
+            .concat(),
+        ));
+        let request_nonce = bloom_broker_api::RequestNonce::new(&request_nonce_hex[..32])
+            .map_err(|error| HostError::Invalid(error.to_string()))?;
+        let terms = bloom_broker_api::SealedApprovalTerms {
+            subject: bloom_broker_api::ApprovalSubject::Petal {
+                package_hash: scope.package_hash.clone(),
+                route: scope.route.clone(),
+                agent_id: Some(scope.key_slot.as_str().into()),
+            },
+            wallet_id: scope.wallet_id.clone(),
+            key_ref: key_ref.clone(),
+            allowed_crypto_suites: scope.allowed_crypto_suites.clone(),
+            selector: bloom_broker_api::ApprovalSelector::Petal {
+                package_hash: scope.package_hash.clone(),
+                route: scope.route.clone(),
+                allowed_operation_classes: subject_classes,
+                route_grants,
+                required_claim_assurance: bloom_broker_api::ClaimAssuranceLevel::MachineAsserted,
+            },
+            limits: bloom_broker_api::ApprovalLimits {
+                max_operations: bloom_broker_api::DecimalU64::new(256),
+                max_signatures: bloom_broker_api::DecimalU64::new(256),
+                operation_rate_limits: Vec::new(),
+                signature_rate_limits: Vec::new(),
+                value_limits: Vec::new(),
+            },
+            activation_mode: if key_ref.backend.as_str() == "local" {
+                bloom_broker_api::ActivationMode::BootBound
+            } else {
+                bloom_broker_api::ActivationMode::BackendManaged
+            },
+            wallet_revocation_epoch: wallet.wallet_revocation_epoch.clone(),
+            policy_version: wallet.policy_version.clone(),
+            policy_digest: wallet.policy_digest.clone(),
+            provenance_digest,
+            request_nonce,
+            issued_at_ms: bloom_broker_api::DecimalU64::new(now_ms),
+            not_before_ms: bloom_broker_api::DecimalU64::new(now_ms),
+            expires_at_ms: bloom_broker_api::DecimalU64::new(
+                now_ms.saturating_add(approval_lifetime_ms),
+            ),
+            renewal_of: None,
+        };
+        let plan = serde_json::json!({
+            "schema": "bloom.machine.petal-key-reusable-approval-facts.v1",
+            "wallet_id": &scope.wallet_id,
+            "package_hash": &scope.package_hash,
+            "key_slot": &scope.key_slot,
+            "key_ref": key_ref,
+            "selector": &terms.selector,
+            "limits": &terms.limits,
+            "expires_at_ms": &terms.expires_at_ms,
+        });
+        let plan_digest = bloom_broker_api::Digest32::from_bytes(
+            sha2::Sha256::digest(serde_jcs::to_vec(&plan).map_err(|error| {
+                HostError::Invalid(format!("canonicalize approval plan: {error}"))
+            })?)
+            .into(),
+        );
+        broker
+            .prepare_approval(bloom_broker_api::ApprovalPrepareRequest {
+                operation_id,
+                terms,
+                canonical_plan_facts_digest: plan_digest,
+            })
+            .await
+            .map_err(|error| {
+                HostError::Denied(format!("{}: {}", error.code.as_str(), error.message))
+            })
+    }
+
+    fn reusable_approval_for_key(
+        &self,
+        key_ref: &bloom_broker_api::KeyRef,
+    ) -> Result<Option<bloom_broker_api::Digest32>, HostError> {
+        let Some(root) = &self.petal_key_state_root else {
+            return Ok(None);
+        };
+        let entries = match std::fs::read_dir(root) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(HostError::Backend(format!(
+                    "list Petal key approval state: {error}"
+                )));
+            }
+        };
+        let mut matched = None;
+        for entry in entries.take(1024) {
+            let path = entry
+                .map_err(|error| {
+                    HostError::Backend(format!("read Petal key state entry: {error}"))
+                })?
+                .path();
+            if path.extension().and_then(|value| value.to_str()) != Some("json") {
+                continue;
+            }
+            let Some(state) = Self::read_petal_key_state(&path)? else {
+                continue;
+            };
+            if state.status == "succeeded"
+                && state
+                    .public_key
+                    .as_ref()
+                    .is_some_and(|public| &public.key_ref == key_ref)
+            {
+                let approval_id = state.reusable_approval_id.ok_or_else(|| {
+                    HostError::Denied("Petal key has no reusable approval binding".into())
+                })?;
+                if matched.replace(approval_id).is_some() {
+                    return Err(HostError::Denied(
+                        "multiple reusable approvals match the selected Petal key".into(),
+                    ));
+                }
+            }
+        }
+        Ok(matched)
     }
 
     fn petal_signing_paths(
@@ -752,7 +960,8 @@ impl PetalHost for DaemonPetalHost {
         })?;
         let eligible_parents = wallet
             .key_refs
-            .into_iter()
+            .iter()
+            .cloned()
             .filter(|key| {
                 key.derivation.is_none()
                     && suites.iter().all(|suite| suite.key_spec() == key.key_spec)
@@ -839,12 +1048,57 @@ impl PetalHost for DaemonPetalHost {
                         stored.public_key.is_some(),
                         stored.ceremony_url.is_some()
                     ),
-                    ("awaiting_user", false, true) | ("succeeded", true, false)
+                    ("awaiting_user", false, true)
+                        | ("awaiting_user", true, true)
+                        | ("succeeded", true, false)
                 )
             {
                 return Err(HostError::Denied(
                     "Petal key request_id was already used with different terms".into(),
                 ));
+            }
+            if let Some(public) = stored.public_key.as_ref() {
+                if stored.reusable_approval_id.is_none() {
+                    let reusable = self
+                        .prepare_petal_key_reusable_approval(
+                            broker,
+                            &wallet,
+                            &scope,
+                            &public.key_ref,
+                            provenance_digest.clone().ok_or_else(|| {
+                                HostError::Denied("Petal provenance digest is missing".into())
+                            })?,
+                        )
+                        .await?;
+                    stored.reusable_approval_id = Some(reusable.approval_id);
+                    stored.status = "awaiting_user".into();
+                    stored.ceremony_url = Some(reusable.ceremony_url);
+                    stored.ceremony_expires_at_ms = reusable.ceremony_expires_at_ms;
+                    Self::write_petal_key_state(&path, &stored)?;
+                    return stored.guest_outcome();
+                }
+                let approval_id = stored
+                    .reusable_approval_id
+                    .clone()
+                    .expect("checked reusable approval id");
+                let approval = broker.approval_status(approval_id).await.map_err(|error| {
+                    HostError::Denied(format!("{}: {}", error.code.as_str(), error.message))
+                })?;
+                return match approval.state {
+                    bloom_broker_api::ApprovalLifecycleState::Active => {
+                        stored.status = "succeeded".into();
+                        stored.ceremony_url = None;
+                        Self::write_petal_key_state(&path, &stored)?;
+                        stored.guest_outcome()
+                    }
+                    bloom_broker_api::ApprovalLifecycleState::Prepared
+                    | bloom_broker_api::ApprovalLifecycleState::AwaitingCeremony => {
+                        stored.guest_outcome()
+                    }
+                    state => Err(HostError::Denied(format!(
+                        "Petal reusable approval is not active: {state:?}"
+                    ))),
+                };
             }
             match broker
                 .custody_result(bloom_broker_api::OperationRequest {
@@ -896,9 +1150,22 @@ impl PetalHost for DaemonPetalHost {
                                 .into(),
                         ));
                     }
+                    let reusable = self
+                        .prepare_petal_key_reusable_approval(
+                            broker,
+                            &wallet,
+                            &scope,
+                            &public.key_ref,
+                            provenance_digest.clone().ok_or_else(|| {
+                                HostError::Denied("Petal provenance digest is missing".into())
+                            })?,
+                        )
+                        .await?;
                     stored.public_key = Some(public);
-                    stored.status = "succeeded".into();
-                    stored.ceremony_url = None;
+                    stored.reusable_approval_id = Some(reusable.approval_id);
+                    stored.status = "awaiting_user".into();
+                    stored.ceremony_url = Some(reusable.ceremony_url);
+                    stored.ceremony_expires_at_ms = reusable.ceremony_expires_at_ms;
                     Self::write_petal_key_state(&path, &stored)?;
                     return stored.guest_outcome();
                 }
@@ -965,6 +1232,7 @@ impl PetalHost for DaemonPetalHost {
             ceremony_url: Some(prepared.ceremony_url),
             ceremony_expires_at_ms: prepared.ceremony_expires_at_ms,
             public_key: None,
+            reusable_approval_id: None,
         };
         Self::write_petal_key_state(&path, &stored)?;
         stored.guest_outcome()
@@ -1358,12 +1626,18 @@ impl PetalHost for DaemonPetalHost {
                 }
             };
         }
-        let approval_id = req
-            .approval_hint
+        let selected_key_ref = req.key_ref;
+        let approval_hint = match (req.approval_hint, selected_key_ref.as_ref()) {
+            (Some(hint), _) => Some(hint),
+            (None, Some(key_ref)) => self
+                .reusable_approval_for_key(key_ref)?
+                .map(|approval_id| approval_id.as_str().to_owned()),
+            (None, None) => None,
+        };
+        let approval_id = approval_hint
             .map(bloom_broker_api::Digest32::new)
             .transpose()
             .map_err(|error| HostError::Invalid(error.to_string()))?;
-        let selected_key_ref = req.key_ref;
         let trusted_request = TrustedPetalSignRequest {
             wallet_id: bloom_broker_api::Token::new(req.wallet)
                 .map_err(|error| HostError::Invalid(error.to_string()))?,
@@ -1392,6 +1666,12 @@ impl PetalHost for DaemonPetalHost {
             None => broker.sign_petal_payload(trusted_request).await,
         }
         .map_err(|error| {
+            warn!(
+                package_hash = %context.package_hash,
+                route = %context.route_id,
+                reason = %error,
+                "petal.sign_payload_denied"
+            );
             HostError::Denied(format!("{}: {}", error.code.as_str(), error.message))
         })?;
         let [signature] = result.signatures.as_slice() else {
@@ -4055,6 +4335,7 @@ mod tests {
 
     struct PetalKeyBrokerFixture {
         completed: std::sync::atomic::AtomicBool,
+        approval_active: std::sync::atomic::AtomicBool,
         prepares: std::sync::atomic::AtomicUsize,
         parent: bloom_broker_api::KeyRef,
         child: bloom_broker_api::KeyRef,
@@ -4235,6 +4516,7 @@ mod tests {
             });
             Self {
                 completed: std::sync::atomic::AtomicBool::new(false),
+                approval_active: std::sync::atomic::AtomicBool::new(false),
                 prepares: std::sync::atomic::AtomicUsize::new(0),
                 parent: key_ref("wallet/primary/root", 1),
                 child,
@@ -4326,6 +4608,49 @@ mod tests {
                                     // narrower scope independently on every use.
                                     bloom_broker_api::CryptoSuite::Secp256k1Sha256Recoverable,
                                 ],
+                            },
+                        ))
+                    }
+                    MachineBrokerRequest::SealedApprovalPrepare(request) => {
+                        let bloom_broker_api::ApprovalSelector::Petal { route_grants, .. } =
+                            &request.terms.selector
+                        else {
+                            panic!("derived key must prepare a Petal approval")
+                        };
+                        assert_eq!(route_grants.len(), 1);
+                        assert_eq!(route_grants[0].route, "r000007");
+                        let approval_id = request.terms.approval_id()?;
+                        Ok(MachineBrokerResponse::SealedApprovalPrepare(
+                            bloom_broker_api::SealedApprovalPrepareResponse {
+                                approval_id,
+                                state: bloom_broker_api::ApprovalPrepareState::AwaitingCeremony,
+                                ceremony_url: "http://127.0.0.1:18734/ceremony/reusable-owner-only"
+                                    .into(),
+                                ceremony_expires_at_ms: bloom_broker_api::DecimalU64::new(u64::MAX),
+                                review_manifest_digest: bloom_broker_api::Digest32::from_bytes(
+                                    [8; 32],
+                                ),
+                            },
+                        ))
+                    }
+                    MachineBrokerRequest::SealedApprovalStatus(request) => {
+                        let active = self
+                            .approval_active
+                            .load(std::sync::atomic::Ordering::SeqCst);
+                        Ok(MachineBrokerResponse::SealedApprovalStatus(
+                            bloom_broker_api::ApprovalPublicStatus {
+                                approval_id: request.id,
+                                wallet_id: bloom_broker_api::Token::new("primary").unwrap(),
+                                state: if active {
+                                    bloom_broker_api::ApprovalLifecycleState::Active
+                                } else {
+                                    bloom_broker_api::ApprovalLifecycleState::AwaitingCeremony
+                                },
+                                effective_claim_assurance: Some(
+                                    bloom_broker_api::ClaimAssuranceLevel::MachineAsserted,
+                                ),
+                                ceremony_url: None,
+                                ceremony_expires_at_ms: None,
                             },
                         ))
                     }
@@ -4651,6 +4976,23 @@ mod tests {
 
         fixture
             .completed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let reusable_pending = host.petal_key_request(request.clone()).await.unwrap();
+        assert_eq!(
+            serde_json::to_value(&reusable_pending).unwrap()["state"],
+            "pending"
+        );
+        let approval_owner_status: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
+        assert_eq!(approval_owner_status["status"], "awaiting_user");
+        assert_eq!(
+            approval_owner_status["ceremony_url"],
+            "http://127.0.0.1:18734/ceremony/reusable-owner-only"
+        );
+        assert!(approval_owner_status["reusable_approval_id"].is_string());
+
+        fixture
+            .approval_active
             .store(true, std::sync::atomic::Ordering::SeqCst);
         let ready = host.petal_key_request(request.clone()).await.unwrap();
         let ready_json = serde_json::to_value(&ready).unwrap();
