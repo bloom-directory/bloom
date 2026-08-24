@@ -13,7 +13,9 @@ audit-test-seam = []
 
 [dependencies]
 serde.workspace = true
-serde_json.workspace = true
+# Audit signatures bind serialized `Value` insertion order. Production builds
+# already enabled this transitively; make the compatibility requirement local.
+serde_json = { workspace = true, features = ["preserve_order"] }
 toml.workspace = true
 thiserror.workspace = true
 hex.workspace = true
