@@ -324,6 +324,7 @@ impl BrokerExactPayloadSigner {
             expires_at_ms: state.expires_at_ms.clone(),
             canonical_plan_facts_digest,
             approval_id: state.approval_id.clone(),
+            account_key_ref: None,
             petal_use_claim: petal_claim.map(|(claim, _)| claim.clone()),
             claim_assurance_evidence: petal_claim
                 .and_then(|(_, evidence)| evidence.map(<[u8]>::to_vec)),
@@ -582,6 +583,7 @@ impl BrokerExactPayloadSigner {
             expires_at_ms: state.expires_at_ms.clone(),
             canonical_plan_facts_digest,
             approval_id: state.approval_id.clone(),
+            account_key_ref: None,
             petal_use_claim: Some(claim.clone()),
             claim_assurance_evidence: claim_assurance_evidence.map(<[u8]>::to_vec),
         };
@@ -718,6 +720,7 @@ impl BrokerExactPayloadSigner {
             expires_at_ms: state.expires_at_ms.clone(),
             canonical_plan_facts_digest,
             approval_id: state.approval_id.clone(),
+            account_key_ref: None,
             petal_use_claim: Some(claim.clone()),
             claim_assurance_evidence: claim_assurance_evidence.map(<[u8]>::to_vec),
         };

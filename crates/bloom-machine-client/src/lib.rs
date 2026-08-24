@@ -643,7 +643,11 @@ impl MachineBrokerClient {
             }
         };
         let key_ref = self
-            .verified_signing_key(&wallet, request.crypto_suite)
+            .verified_signing_key(
+                &wallet,
+                request.crypto_suite,
+                request.account_key_ref.as_ref(),
+            )
             .await?;
         let activation_mode = request
             .activation_mode
@@ -797,7 +801,11 @@ impl MachineBrokerClient {
             }
         };
         let key_ref = self
-            .verified_signing_key(&wallet, request.crypto_suite)
+            .verified_signing_key(
+                &wallet,
+                request.crypto_suite,
+                request.account_key_ref.as_ref(),
+            )
             .await?;
         let activation_mode = request
             .activation_mode
@@ -938,7 +946,11 @@ impl MachineBrokerClient {
         }
         let wallet = self.wallet(request.wallet_id.clone()).await?;
         let key_ref = self
-            .verified_signing_key(&wallet, request.crypto_suite)
+            .verified_signing_key(
+                &wallet,
+                request.crypto_suite,
+                request.account_key_ref.as_ref(),
+            )
             .await?;
         let activation_mode = request
             .activation_mode
@@ -1332,29 +1344,69 @@ impl MachineBrokerClient {
     }
 
     /// The wallet's signable key for `suite`: the root for legacy/imported-scalar
-    /// wallets, or the single derived child whose key spec matches `suite` for
-    /// BIP-39 wallets (whose root is a non-signable seed).
+    /// wallets, or a derived child for BIP-39 wallets (whose root is a
+    /// non-signable seed).
+    ///
+    /// `selected` names one exact derived account. It is required whenever a
+    /// BIP-39 wallet holds more than one child for `suite` — without it the
+    /// choice is ambiguous, so selection fails closed rather than guessing.
+    /// The key returned here is bound into `SealedApprovalTerms::key_ref` when
+    /// an approval is prepared and into `SignOperationIdentity::key_ref` when
+    /// one is spent, so an approval issued for one account can never authorise
+    /// a signature from another.
     async fn verified_signing_key(
         &self,
         wallet: &WalletPublic,
         suite: CryptoSuite,
+        selected: Option<&KeyRef>,
     ) -> Result<KeyRef, ProtocolError> {
         let (key_ref, expected_role) = match &wallet.root_key_ref {
-            Some(root) => (root.clone(), KeyRole::WalletRoot),
+            Some(root) => {
+                if let Some(selected) = selected
+                    && selected != root
+                {
+                    return Err(ProtocolError::new(
+                        ProtocolErrorCode::KeyrefMismatch,
+                        "wallet signs with its root key; no derived account may be selected",
+                    ));
+                }
+                (root.clone(), KeyRole::WalletRoot)
+            }
             None => {
                 let matching: Vec<&KeyRef> = wallet
                     .key_refs
                     .iter()
                     .filter(|key| key.key_spec == suite.key_spec())
                     .collect();
-                match matching.as_slice() {
-                    [child] => ((*child).clone(), KeyRole::Derived),
-                    _ => {
-                        return Err(ProtocolError::new(
-                            ProtocolErrorCode::KeyrefMismatch,
-                            "BIP-39 wallet must have exactly one derived child for the requested CryptoSuite",
-                        ));
+                match selected {
+                    Some(selected) => {
+                        let chosen = matching
+                            .iter()
+                            .copied()
+                            .find(|key| *key == selected)
+                            .ok_or_else(|| {
+                                ProtocolError::new(
+                                    ProtocolErrorCode::KeyrefMismatch,
+                                    "selected account is not a derived child of this wallet for the requested CryptoSuite",
+                                )
+                            })?;
+                        (chosen.clone(), KeyRole::Derived)
                     }
+                    None => match matching.as_slice() {
+                        [child] => ((*child).clone(), KeyRole::Derived),
+                        [] => {
+                            return Err(ProtocolError::new(
+                                ProtocolErrorCode::KeyrefMismatch,
+                                "BIP-39 wallet has no derived child for the requested CryptoSuite",
+                            ));
+                        }
+                        _ => {
+                            return Err(ProtocolError::new(
+                                ProtocolErrorCode::KeyrefMismatch,
+                                "BIP-39 wallet has multiple derived children for the requested CryptoSuite; select an account",
+                            ));
+                        }
+                    },
                 }
             }
         };
@@ -1589,6 +1641,10 @@ pub struct ExactPayloadSignRequest {
     pub approval_id: Option<Digest32>,
     pub petal_use_claim: Option<PetalUseClaim>,
     pub claim_assurance_evidence: Option<Vec<u8>>,
+    /// The exact derived account to sign with. Required when the wallet is
+    /// BIP-39 and holds more than one child for `crypto_suite`; `None` keeps
+    /// the single-account and legacy-root behaviour.
+    pub account_key_ref: Option<KeyRef>,
 }
 
 #[derive(Clone, Debug)]
@@ -1611,6 +1667,10 @@ pub struct ExactPayloadBatchSignRequest {
     pub approval_id: Option<Digest32>,
     pub petal_use_claim: Option<PetalUseClaim>,
     pub claim_assurance_evidence: Option<Vec<u8>>,
+    /// The exact derived account to sign with. Required when the wallet is
+    /// BIP-39 and holds more than one child for `crypto_suite`; `None` keeps
+    /// the single-account and legacy-root behaviour.
+    pub account_key_ref: Option<KeyRef>,
 }
 
 impl ExactPayloadBatchSignRequest {
@@ -2515,7 +2575,9 @@ mod tests {
                             returned_key_ref.locator = "wallet/delegated/substituted".into();
                         }
                         Ok(MachineBrokerResponse::KeyGetPublic(KeyPublic {
-                            role: if returned_key_ref.locator.contains("delegated") {
+                            role: if returned_key_ref.locator.contains("delegated")
+                                || returned_key_ref.locator.contains("derived")
+                            {
                                 KeyRole::Derived
                             } else {
                                 KeyRole::WalletRoot
@@ -2980,6 +3042,7 @@ mod tests {
             approval_id,
             petal_use_claim: None,
             claim_assurance_evidence: None,
+            account_key_ref: None,
         }
     }
 
@@ -3011,7 +3074,79 @@ mod tests {
             approval_id,
             petal_use_claim: None,
             claim_assurance_evidence: None,
+            account_key_ref: None,
         }
+    }
+
+    #[tokio::test]
+    async fn bip39_multi_account_signing_requires_and_honours_an_account_selector() {
+        // A BIP-39 wallet has no signable root; it holds one derived child per
+        // account. Two accounts on the same suite is the case that previously
+        // made every wallet-level signing call fail with KeyrefMismatch.
+        let mut account_one = key_ref();
+        account_one.locator = "wallet/derived/account-0".into();
+        account_one.public_key_fingerprint = digest(11);
+        let mut account_two = key_ref();
+        account_two.locator = "wallet/derived/account-1".into();
+        account_two.public_key_fingerprint = digest(12);
+
+        let broker = Arc::new(MockBroker {
+            wallet: WalletPublic {
+                wallet_id: token("wallet"),
+                wallet_kind: token("bip39"),
+                root_key_ref: None,
+                key_refs: vec![account_one.clone(), account_two.clone()],
+                policy_version: DecimalU64::new(7),
+                policy_digest: digest(7),
+                wallet_revocation_epoch: DecimalU64::new(2),
+            },
+            requests: Mutex::new(Vec::new()),
+            corrupt_response: false,
+        });
+        let client = MachineBrokerClient::new(broker.clone());
+        let payload = b"canonical unsigned EVM envelope".to_vec();
+
+        // With two candidates and no selector the choice is ambiguous, so
+        // selection fails closed rather than silently picking one.
+        let error = client
+            .sign_exact_payload(exact_request(payload.clone(), None))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, ProtocolErrorCode::KeyrefMismatch);
+
+        // Each account signs under its own approval, bound to its own KeyRef.
+        for account in [&account_one, &account_two] {
+            broker.requests.lock().unwrap().clear();
+            let mut request = exact_request(payload.clone(), None);
+            request.account_key_ref = Some(account.clone());
+            let prepared = client.sign_exact_payload(request).await.unwrap();
+            let ExactPayloadSignOutcome::ApprovalRequired(_) = prepared else {
+                panic!("first call must prepare an exact approval");
+            };
+            let requests = broker.requests.lock().unwrap();
+            let MachineBrokerRequest::SealedApprovalPrepare(prepare) = &requests[2] else {
+                panic!("third call must be sealed_approval.prepare");
+            };
+            assert_eq!(
+                &prepare.terms.key_ref, account,
+                "the approval must bind the selected account, never the other one"
+            );
+        }
+
+        // A KeyRef that is not a child of this wallet is refused before any
+        // approval is prepared.
+        broker.requests.lock().unwrap().clear();
+        let mut foreign = key_ref();
+        foreign.locator = "wallet/derived/not-mine".into();
+        let mut request = exact_request(payload, None);
+        request.account_key_ref = Some(foreign);
+        let error = client.sign_exact_payload(request).await.unwrap_err();
+        assert_eq!(error.code, ProtocolErrorCode::KeyrefMismatch);
+        assert_eq!(
+            broker.requests.lock().unwrap().len(),
+            1,
+            "a foreign account must be rejected before Broker is asked for key metadata"
+        );
     }
 
     #[tokio::test]
