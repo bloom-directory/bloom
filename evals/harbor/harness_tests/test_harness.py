@@ -489,22 +489,21 @@ class HyperliquidDefinitionTests(unittest.TestCase):
         self.assertRegex(upper, r"^[a-z0-9-]{64}$")
         self.assertNotEqual(upper, lower)
 
-    def test_session_completes_both_ceremonies_with_increasing_counters(self) -> None:
-        # Creating a session stages key derivation and then agent approval.
-        # Completing only the first leaves the session permanently pending.
+    def test_session_completes_three_ceremonies_with_increasing_counters(self) -> None:
+        # Creating a session stages key derivation, reusable route authority,
+        # and then agent approval. Completing only the first leaves it pending.
         writes: list[tuple[Path, bytes]] = []
-        pending = ["key", "approve"]
+        pending = ["key", "authority", "approve"]
 
         def write(path: Path, body: bytes, _timeout: int) -> SimpleNamespace:
             writes.append((path, body))
             return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
 
         def key_ceremony() -> str | None:
-            return (
-                "http://localhost:18734/ceremony/" + "k" * 28
-                if pending and pending[0] == "key"
-                else None
-            )
+            if not pending or pending[0] not in {"key", "authority"}:
+                return None
+            marker = "k" if pending[0] == "key" else "r"
+            return "http://localhost:18734/ceremony/" + marker * 28
 
         def approve_ceremony() -> str | None:
             return (
@@ -552,12 +551,12 @@ class HyperliquidDefinitionTests(unittest.TestCase):
         ):
             self.definition.provision("codex")
 
-        # Both ceremonies ran, and no WebAuthn counter was reused: the venue
+        # All ceremonies ran, and no WebAuthn counter was reused: the venue
         # rejects any counter that is not strictly greater than the last.
-        self.assertEqual(len(counters), 2)
+        self.assertEqual(len(counters), 3)
         base = int(self.definition.sign_count_value)
-        self.assertEqual(counters, [str(base), str(base + 1)])
-        self.assertEqual(self.definition.next_sign_count, base + 2)
+        self.assertEqual(counters, [str(base), str(base + 1), str(base + 2)])
+        self.assertEqual(self.definition.next_sign_count, base + 3)
 
     def test_session_route_is_addressed_by_wallet_id_not_owner_address(self) -> None:
         written: list[tuple[Path, bytes]] = []
@@ -695,8 +694,8 @@ class HyperliquidDefinitionTests(unittest.TestCase):
             self.definition.cleanup()
 
     def test_cleanup_fails_on_pending_agent_approval_ceremony(self) -> None:
-        # Creating a session stages two owner ceremonies. Once key derivation
-        # completes, `approve_agent` can sit awaiting approval while the durable
+        # Creating a session stages three owner ceremonies. Once key derivation
+        # and reusable authority complete, `approve_agent` can sit awaiting approval while the durable
         # session still does not exist: the key projection is consumed, and the
         # wallet looks empty because the agent was never registered at the venue.
         # Cleanup used to report success and leave that ceremony open.

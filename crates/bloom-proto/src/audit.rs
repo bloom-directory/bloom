@@ -67,12 +67,32 @@ struct AuditInner {
     path: PathBuf,
     last_digest: String,
     sequence: u64,
+    pending_effects: std::collections::BTreeSet<String>,
+    journal_snapshot: Option<JournalSnapshot>,
     identity: Option<AuditIdentity>,
     degraded: Option<String>,
     #[cfg(any(test, feature = "audit-test-seam"))]
     fail_next_write: bool,
     #[cfg(any(test, feature = "audit-test-seam"))]
     fail_after_writes: Option<usize>,
+}
+
+/// Cheap identity and mutation evidence for the journal verified at startup.
+/// This detects replacement, truncation, growth, and ordinary in-place edits
+/// without re-authenticating every historical signature before each append.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct JournalSnapshot {
+    len: u64,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(unix)]
+    change_time_secs: i64,
+    #[cfg(unix)]
+    change_time_nanos: i64,
+    #[cfg(not(unix))]
+    modified: Option<SystemTime>,
 }
 
 /// The Machine service identity used to sign its local audit journal. This is
@@ -495,18 +515,24 @@ impl AuditLog {
         };
         let verifier = identity.as_ref().map(AuditIdentity::verifier);
         let inspected = inspect(&path, verifier.as_ref());
-        let (last_digest, sequence, degraded) = if path.exists() {
+        let (last_digest, sequence, pending_effects, degraded) = if path.exists() {
             match inspected {
                 Ok((digest, tail)) => {
                     let degraded = pending_effect_degradation(&tail.pending_effects);
-                    (digest, tail.sequence, degraded)
+                    (digest, tail.sequence, tail.pending_effects, degraded)
                 }
-                Err(error) if identity.is_some() => (String::new(), 0, Some(error.to_string())),
+                Err(error) if identity.is_some() => (
+                    String::new(),
+                    0,
+                    std::collections::BTreeSet::new(),
+                    Some(error.to_string()),
+                ),
                 Err(error) => return Err(error),
             }
         } else {
-            (String::new(), 0, None)
+            (String::new(), 0, std::collections::BTreeSet::new(), None)
         };
+        let journal_snapshot = journal_snapshot(&path)?;
         let history_error = identity
             .as_ref()
             .and_then(|current| {
@@ -518,6 +544,8 @@ impl AuditLog {
                 path,
                 last_digest,
                 sequence,
+                pending_effects,
+                journal_snapshot,
                 identity,
                 degraded: legacy_error
                     .or(degraded)
@@ -562,30 +590,27 @@ impl AuditLog {
         if !allow_degraded_reconciliation && let Some(reason) = &g.degraded {
             return Err(AuditError::Degraded(reason.clone()));
         }
-        // Re-read and authenticate the complete journal before every security
-        // mutation. Comparing the observed tail also detects replacement or
-        // truncation after startup.
-        let verifier = g.identity.as_ref().map(AuditIdentity::verifier);
-        match inspect(&g.path, verifier.as_ref()) {
-            Ok((digest, tail))
-                if digest == g.last_digest
-                    && (tail.sequence == g.sequence
-                        || (!g.path.exists()
-                            && digest.is_empty()
-                            && g.last_digest.is_empty()
-                            && tail.sequence == 0
-                            && g.sequence > 0))
-                    && prospective_effect_transition_is_valid(&tail.pending_effects, &record) => {}
-            Ok(_) => {
-                let reason = "journal changed since its last verified mutation".to_owned();
-                g.degraded = Some(reason.clone());
-                return Err(AuditError::Degraded(reason));
-            }
+        // The complete journal was authenticated at open. Keep mutation-time
+        // checks constant-time by comparing filesystem identity and mutation
+        // evidence with the state captured after the last durable append.
+        let observed_snapshot = match journal_snapshot(&g.path) {
+            Ok(snapshot) => snapshot,
             Err(error) => {
                 let reason = error.to_string();
                 g.degraded = Some(reason.clone());
                 return Err(AuditError::Degraded(reason));
             }
+        };
+        if observed_snapshot != g.journal_snapshot {
+            let reason = "journal changed since its last verified mutation".to_owned();
+            g.degraded = Some(reason.clone());
+            return Err(AuditError::Degraded(reason));
+        }
+        let mut next_pending_effects = g.pending_effects.clone();
+        if !apply_effect_transition(&mut next_pending_effects, &record) {
+            let reason = "audit effect transition is invalid".to_owned();
+            g.degraded = Some(reason.clone());
+            return Err(AuditError::Degraded(reason));
         }
         record.prev = g.last_digest.clone();
         record.ts_ms = now_ms();
@@ -634,31 +659,58 @@ impl AuditLog {
             }
             *remaining -= 1;
         }
-        let file_existed = g.path.exists();
-        let write_result = (|| -> Result<(), std::io::Error> {
+        let file_existed = g.journal_snapshot.is_some();
+        let write_result = (|| -> Result<JournalSnapshot, std::io::Error> {
             let mut options = OpenOptions::new();
-            options.create(true).append(true).write(true);
+            options.append(true).write(true);
+            if file_existed {
+                options.create(false);
+            } else {
+                options.create_new(true);
+            }
             #[cfg(unix)]
             {
                 use std::os::unix::fs::OpenOptionsExt as _;
                 options.mode(0o600);
             }
             let mut f = options.open(&g.path)?;
+            // Coordinate independent Machine processes as well as clones of
+            // this AuditLog. The metadata recheck after acquiring the lock
+            // turns a concurrent append into a fail-closed snapshot mismatch.
+            fs2::FileExt::lock_exclusive(&f)?;
+            let opened_snapshot = snapshot_from_metadata(&f.metadata()?);
+            if file_existed && Some(opened_snapshot.clone()) != g.journal_snapshot {
+                return Err(std::io::Error::other(
+                    "journal changed while opening it for append",
+                ));
+            }
             f.write_all(line.as_bytes())?;
             f.write_all(b"\n")?;
-            f.sync_data()
+            f.sync_data()?;
+            let written_snapshot = snapshot_from_metadata(&f.metadata()?);
+            if journal_snapshot(&g.path)? != Some(written_snapshot.clone()) {
+                return Err(std::io::Error::other(
+                    "journal changed while committing an append",
+                ));
+            }
+            Ok(written_snapshot)
         })();
-        if let Err(error) = write_result {
-            let reason = error.to_string();
-            g.degraded = Some(reason);
-            return Err(AuditError::Io(error));
-        }
+        let written_snapshot = match write_result {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                let reason = error.to_string();
+                g.degraded = Some(reason);
+                return Err(AuditError::Io(error));
+            }
+        };
         if !file_existed && let Err(error) = sync_parent(&g.path) {
             let reason = error.to_string();
             g.degraded = Some(reason);
             return Err(error);
         }
         g.last_digest = digest;
+        g.pending_effects = next_pending_effects;
+        g.journal_snapshot = Some(written_snapshot);
         if g.identity.is_some() {
             g.sequence += 1;
         }
@@ -748,6 +800,8 @@ impl AuditLog {
         }
         g.last_digest = digest;
         g.sequence = tail.sequence;
+        g.pending_effects = tail.pending_effects;
+        g.journal_snapshot = journal_snapshot(&g.path)?;
         let result = Self::append_locked(
             &mut g,
             AuditRecord {
@@ -771,6 +825,8 @@ impl AuditLog {
         )?;
         let verifier = g.identity.as_ref().map(AuditIdentity::verifier);
         let (_, tail) = inspect(&g.path, verifier.as_ref())?;
+        g.pending_effects = tail.pending_effects.clone();
+        g.journal_snapshot = journal_snapshot(&g.path)?;
         g.degraded = pending_effect_degradation(&tail.pending_effects);
         Ok(result)
     }
@@ -1488,6 +1544,35 @@ fn audit_signature_bytes(
     Ok(bytes)
 }
 
+fn journal_snapshot(path: &Path) -> Result<Option<JournalSnapshot>, std::io::Error> {
+    match std::fs::metadata(path) {
+        Ok(metadata) => Ok(Some(snapshot_from_metadata(&metadata))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn snapshot_from_metadata(metadata: &std::fs::Metadata) -> JournalSnapshot {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        JournalSnapshot {
+            len: metadata.len(),
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            change_time_secs: metadata.ctime(),
+            change_time_nanos: metadata.ctime_nsec(),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        JournalSnapshot {
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+        }
+    }
+}
+
 fn inspect(
     path: &Path,
     expected_identity: Option<&AuditVerifierIdentity>,
@@ -1626,16 +1711,16 @@ fn effect_correlation(record: &AuditRecord) -> Option<&str> {
         .and_then(serde_json::Value::as_str)
 }
 
-fn prospective_effect_transition_is_valid(
-    pending: &std::collections::BTreeSet<String>,
+fn apply_effect_transition(
+    pending: &mut std::collections::BTreeSet<String>,
     record: &AuditRecord,
 ) -> bool {
     match record.kind.as_str() {
         "machine.effect.intent" => effect_correlation(record).is_some_and(|correlation| {
-            pending.len() < MAX_PENDING_MACHINE_EFFECTS && !pending.contains(correlation)
+            pending.len() < MAX_PENDING_MACHINE_EFFECTS && pending.insert(correlation.to_owned())
         }),
         "machine.effect.result" => {
-            effect_correlation(record).is_some_and(|correlation| pending.contains(correlation))
+            effect_correlation(record).is_some_and(|correlation| pending.remove(correlation))
         }
         _ => true,
     }
@@ -1881,6 +1966,42 @@ mod tests {
         assert!(restarted.mutation_degradation().is_some());
         assert!(restarted.append(record("blocked", 4)).is_err());
         assert_eq!(restarted.tail(10).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn runtime_snapshot_rejects_growth_truncation_and_replacement() {
+        for mutation in ["growth", "truncation", "replacement"] {
+            let (_dir, path, identity) = signed_fixture(2);
+            let running = AuditLog::open_signed(&path, identity).unwrap();
+            match mutation {
+                "growth" => {
+                    OpenOptions::new()
+                        .append(true)
+                        .open(&path)
+                        .unwrap()
+                        .write_all(b"unexpected\n")
+                        .unwrap();
+                }
+                "truncation" => {
+                    let file = OpenOptions::new().write(true).open(&path).unwrap();
+                    file.set_len(file.metadata().unwrap().len() / 2).unwrap();
+                }
+                "replacement" => {
+                    let original = std::fs::read(&path).unwrap();
+                    std::fs::rename(&path, path.with_extension("replaced.jsonl")).unwrap();
+                    std::fs::write(&path, original).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                matches!(
+                    running.append(record("blocked", 3)),
+                    Err(AuditError::Degraded(_))
+                ),
+                "{mutation} must latch mutations"
+            );
+            assert!(running.mutation_degradation().is_some());
+        }
     }
 
     #[test]

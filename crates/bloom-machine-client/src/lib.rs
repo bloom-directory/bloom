@@ -1002,6 +1002,7 @@ impl MachineBrokerClient {
                 package_hash: package_hash.clone(),
                 route: route.clone(),
                 allowed_operation_classes: vec![operation_class],
+                route_grants: Vec::new(),
                 required_claim_assurance: claim.claim_assurance.level(),
             },
             limits: ApprovalLimits {

@@ -66,8 +66,12 @@ The immutable approval binds at least:
 - the review manifest and provenance record used at preparation.
 
 An exact selector commits to the exact payload or ordered batch. A reusable
-Petal selector commits to package hash, route, allowed operation classes, and
-allowed suites. It does not silently become generic wallet authorization.
+Petal selector commits to one package hash and either its legacy singleton
+route or a canonical non-empty list of route grants. Each grant binds one
+route to its own allowed operation classes and installer-signed provenance
+digest, avoiding Cartesian-product authority across routes and classes.
+Suites and usage limits remain shared across the approval. It does not silently
+become generic wallet authorization.
 
 The canonical approval is durable in Broker. Signer stores the enforcement
 projection it independently needs. Machine stores only public status and
@@ -76,7 +80,7 @@ launch projections; deleting or altering them cannot authorize a signature.
 ## Petal claims and trust boundary
 
 Each reusable Petal signing operation carries a normalized `PetalUseClaim`
-binding the installed package and route, operation class, suite, payload
+binding the installed package and actual executing route, operation class, suite, payload
 digest, ordered hashes, declared debits and destinations, fee declaration,
 nonce, and claim-assurance mode.
 
@@ -152,7 +156,12 @@ workflow. Signer derives and owns a child `KeyRef` whose immutable scope binds
 the wallet, parent key, installer-pinned package hash, route, derivation
 purpose, allowed suites, and lifecycle. Petal and Machine receive public key
 metadata only. Every use still requires a matching Sealed Approval and is
-independently scope-checked by Broker and Signer.
+independently scope-checked by Broker and Signer. Machine may provision one
+reusable approval immediately after key derivation, covering only the typed
+routes and route-specific classes present in both the immutable derived-key
+scope and installer-signed provenance. Machine retains the public approval
+binding with the `KeyRef`; the Petal receives neither an approval capability
+nor another ceremony for each matching action.
 
 Venue-specific custody and signing protocols do not belong in Machine, Broker,
 or Signer. An installed Hyperliquid Petal, for example, uses this generic scope

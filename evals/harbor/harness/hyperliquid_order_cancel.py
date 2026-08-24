@@ -39,10 +39,15 @@ HYPERLIQUID_SESSION_ACTION_ROUTES = (
     "[network]/agent_sessions/[wallet]/[session]/update_leverage.json",
 )
 ACTION_FILES = ("order.json", "cancel.json", "update_leverage.json", "cancel_all")
-# Session creation currently stages two owner ceremonies, key derivation then
-# agent approval. The cap bounds a misbehaving route rather than describing the
-# expected count, and is deliberately larger than two.
+# Session creation currently stages three owner ceremonies: key derivation, a
+# reusable typed-route approval, then venue agent approval. The cap bounds a
+# misbehaving route rather than describing the expected count.
 MAX_SESSION_CEREMONIES = 4
+# Session writes can return before Machine publishes the owner-visible
+# ceremony, especially while the NFS adapter is busy validating a large Petal.
+# Keep discovery within the route's 120-second write budget rather than giving
+# up after the previous fixed 10-second window.
+CEREMONY_DISCOVERY_ATTEMPTS = 600
 # Petal reads are live venue round-trips, not disk reads.
 VENUE_READ_TIMEOUT_SECONDS = 45
 VENUE_READ_ATTEMPTS = 3
@@ -274,9 +279,10 @@ class HyperliquidOrderCancelEval(EvalDefinition):
     def _pending_agent_approval_ceremony(self) -> str | None:
         """Resolve the owner approval that registers the session's API agent.
 
-        Creating a session stages two owner ceremonies: the Signer key
-        derivation, published under `petal-key-requests`, and then the
-        `approve_agent` signature, published here. This projection carries no
+        Creating a session stages three owner ceremonies: the Signer key
+        derivation and reusable route approval, both published under
+        `petal-key-requests`, and then the `approve_agent` signature, published
+        here. This projection carries no
         session id, so bind it as tightly as the available fields allow and
         refuse to act when more than one candidate matches.
         """
@@ -801,8 +807,9 @@ class HyperliquidOrderCancelEval(EvalDefinition):
         status_data: Any | None = None
 
         # Creating a session stages more than one owner ceremony: the Signer
-        # key derivation, then the `approve_agent` signature that registers the
-        # agent with the venue. Completing only the first leaves the session
+        # key derivation, the reusable typed-route approval, then the
+        # `approve_agent` signature that registers the agent with the venue.
+        # Completing only the first leaves the session
         # permanently pending, so drive ceremonies until a bounded session
         # exists. Each WebAuthn completion must use a strictly greater counter
         # than the last accepted one, so the counter advances per ceremony and
@@ -817,7 +824,7 @@ class HyperliquidOrderCancelEval(EvalDefinition):
             ceremony_url: str | None = None
             # Mounted Petal writes are asynchronous. A zero write exit code
             # means accepted for dispatch, not that the route completed.
-            for _ in range(50):
+            for _ in range(CEREMONY_DISCOVERY_ATTEMPTS):
                 status_data = self._read_json_if_exists(
                     self.session_base / "status.json"
                 )

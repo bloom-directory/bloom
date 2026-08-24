@@ -193,11 +193,12 @@ replay its byte-identical policy once to reconcile the mounted lifecycle before
 staging different bytes.
 
 A session consumes more than one counter, so the next run does not simply start
-one higher. Creating a session stages two owner ceremonies — the Signer key
-derivation, then the `approve_agent` signature that registers the agent with the
-venue — and each completion must use a strictly greater counter than the last
-accepted one. Starting from `BLOOM_EVAL_AUTHENTICATOR_SIGN_COUNT=N`, a session
-therefore consumes `N` and `N+1`, and the next run must start at `N+2` or above.
+one higher. Creating a session stages three owner ceremonies — the Signer key
+derivation, one reusable approval for the key's typed action routes, then the
+`approve_agent` signature that registers the agent with the venue — and each
+completion must use a strictly greater counter than the last accepted one.
+Starting from `BLOOM_EVAL_AUTHENTICATOR_SIGN_COUNT=N`, a session therefore
+consumes `N`, `N+1`, and `N+2`, and the next run must start at `N+3` or above.
 The harness reports the first counter it did not consume in its failure text;
 prefer that value over recounting by hand. A counter that is not strictly
 greater than the last accepted one is rejected, which fails the run without
