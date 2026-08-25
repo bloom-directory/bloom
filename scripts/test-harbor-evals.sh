@@ -128,6 +128,10 @@ with Path("${task}/task.toml").open("rb") as handle:
     task = tomllib.load(handle)
 assert task["task"]["name"] == "bloom/hyperliquid-order-cancel"
 assert task["environment"]["network_mode"] == "public"
+assert task["environment"]["docker_image"] == (
+    "ghcr.io/bloom-directory/bloom-eval-agent-base@"
+    "sha256:20988c7f8a6751c25e0115c2136710a885bef69d245e077d2ae3b2cc2c0837fd"
+)
 assert task["agent"]["timeout_sec"] == 900.0
 PY
 
