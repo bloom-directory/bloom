@@ -689,6 +689,7 @@ impl MachineBrokerClient {
                 payload: Base64UrlBytes::from_bytes(&request.preimage),
             },
             petal_use_claim,
+            system_use_claim: None,
             claim_assurance_evidence,
             provenance: request.trusted_provenance,
         })
@@ -797,6 +798,7 @@ impl MachineBrokerClient {
                         payload: Base64UrlBytes::from_bytes(&request.preimage),
                     },
                     petal_use_claim: request.petal_use_claim,
+                    system_use_claim: None,
                     claim_assurance_evidence: request
                         .claim_assurance_evidence
                         .as_deref()
@@ -839,6 +841,8 @@ impl MachineBrokerClient {
             operation_id: request.approval_operation_id,
             terms,
             canonical_plan_facts_digest: request.canonical_plan_facts_digest,
+            petal_use_claim: request.petal_use_claim.clone(),
+            system_use_claim: None,
         })
         .await
         .map(ExactPayloadSignOutcome::ApprovalRequired)
@@ -959,6 +963,7 @@ impl MachineBrokerClient {
                             .collect(),
                     },
                     petal_use_claim: request.petal_use_claim,
+                    system_use_claim: None,
                     claim_assurance_evidence: request
                         .claim_assurance_evidence
                         .as_deref()
@@ -1007,6 +1012,8 @@ impl MachineBrokerClient {
             operation_id: request.approval_operation_id,
             terms,
             canonical_plan_facts_digest: request.canonical_plan_facts_digest,
+            petal_use_claim: request.petal_use_claim.clone(),
+            system_use_claim: None,
         })
         .await
         .map(ExactPayloadSignOutcome::ApprovalRequired)
@@ -1106,6 +1113,7 @@ impl MachineBrokerClient {
                             .collect(),
                     },
                     petal_use_claim: Some(claim.clone()),
+                    system_use_claim: None,
                     claim_assurance_evidence: request
                         .claim_assurance_evidence
                         .as_deref()
@@ -1158,6 +1166,8 @@ impl MachineBrokerClient {
             operation_id: request.approval_operation_id,
             terms,
             canonical_plan_facts_digest: request.canonical_plan_facts_digest,
+            petal_use_claim: request.petal_use_claim.clone(),
+            system_use_claim: None,
         })
         .await
         .map(ExactPayloadSignOutcome::ApprovalRequired)
@@ -3899,6 +3909,8 @@ mod tests {
             operation_id: OperationId::from_bytes([94; 32]),
             terms: approval_terms("wallet", None),
             canonical_plan_facts_digest: digest(95),
+            petal_use_claim: None,
+            system_use_claim: None,
         };
         assert_eq!(
             client.prepare_approval(approval).await.unwrap_err().code,
