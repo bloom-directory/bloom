@@ -160,7 +160,10 @@ class HyperliquidOrderCancelEval(EvalDefinition):
         # is the venue's, not the disk's. Observed between 0.1s and 8s for the
         # same path minutes apart. A single tight timeout loses whole runs to
         # latency the harness does not control, so allow more time and retry a
-        # timeout rather than failing the run on one slow fetch.
+        # timeout rather than failing the run on one slow fetch. Owner-visible
+        # projections can also be replaced while NFS is serving a read; retry
+        # a malformed snapshot rather than treating that transient overlap as
+        # durable corruption.
         last_error: BaseException | None = None
         for attempt in range(VENUE_READ_ATTEMPTS):
             try:
@@ -180,7 +183,10 @@ class HyperliquidOrderCancelEval(EvalDefinition):
             try:
                 return json.loads(completed.stdout)
             except json.JSONDecodeError as error:
-                raise EvalError(f"{path} is not valid JSON: {error}") from error
+                last_error = error
+                if attempt + 1 < VENUE_READ_ATTEMPTS:
+                    time.sleep(0.2)
+                continue
         raise EvalError(
             f"could not read {path} after {VENUE_READ_ATTEMPTS} attempts "
             f"of {timeout}s: {last_error}"

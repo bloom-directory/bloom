@@ -241,6 +241,24 @@ class HyperliquidDefinitionTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temp.cleanup()
 
+    def test_read_json_retries_transient_malformed_nfs_snapshot(self) -> None:
+        malformed = subprocess.CompletedProcess([], 0, b'{"status":"old"}{"status":"new"}', b"")
+        valid = subprocess.CompletedProcess([], 0, b'{"status":"new"}', b"")
+        with (
+            mock.patch.object(
+                hyperliquid_order_cancel.subprocess,
+                "run",
+                side_effect=[malformed, valid],
+            ) as run,
+            mock.patch.object(hyperliquid_order_cancel.time, "sleep") as sleep,
+        ):
+            self.assertEqual(
+                self.definition._read_json(self.mount / "projection.json"),
+                {"status": "new"},
+            )
+        self.assertEqual(run.call_count, 2)
+        sleep.assert_called_once_with(0.2)
+
     def test_missing_seed_variable_fails_closed(self) -> None:
         env = dict(self.env)
         del env["BLOOM_EVAL_AUTHENTICATOR_SEED_FILE"]
