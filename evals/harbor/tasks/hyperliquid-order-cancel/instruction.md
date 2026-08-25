@@ -3,8 +3,10 @@ Use the Bloom filesystem mounted at `/bloom` to perform this exact task on **Hyp
 `/bloom` is a dynamic virtual filesystem: directory traversal can execute live
 venue reads. Never run `find`, `tree`, `rg --files`, recursive `ls`, or any
 broad enumeration under `/bloom`, and never issue concurrent `/bloom` commands.
-Access only the exact paths named below, one command at a time. A direct read
-may take several seconds; wait for it to finish instead of starting another.
+You may reduce model round trips by using one shell invocation to read multiple
+exact paths named below sequentially, with each path labeled in the output. Do
+not use background jobs or parallel tools. A direct read may take several
+seconds; let it finish before the next read starts.
 
 1. Use the dedicated wallet in `BLOOM_EVAL_WALLET` and the stable session ID in `BLOOM_EVAL_SESSION_ID`. Two identifiers name this wallet and they are not interchangeable. `BLOOM_EVAL_WALLET_ID` is the Bloom wallet id, and it is the path segment for every session route: `/bloom/petals/hyperliquid/mainnet/agent_sessions/$BLOOM_EVAL_WALLET_ID/$BLOOM_EVAL_SESSION_ID/`. `BLOOM_EVAL_WALLET` is the on-chain address, and it is the path segment for Hyperliquid account reads such as `/bloom/petals/hyperliquid/mainnet/users/$BLOOM_EVAL_WALLET/`. Using one where the other belongs fails as an unqualified permission error.
 2. The trusted host has already created and owner-approved the session. Read its `status.json` and refuse to continue unless it is active, mainnet, BTC-only (asset ID `0`), capped at `11` USD notional and 1x leverage.

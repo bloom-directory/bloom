@@ -219,7 +219,10 @@ and a dry environment build.
 The task pins the multi-architecture `bloom-eval-agent-base` manifest by digest.
 That image provides Node.js and the Codex and Claude Code CLIs, so Harbor detects
 the selected agent on `PATH` instead of installing it in every disposable trial
-container. Update the digest deliberately when upgrading either CLI.
+container. Preflight pulls that immutable digest before creating the bounded
+mainnet session, so a cold or unavailable image cannot consume the session's
+30-minute authority window. Update the digest deliberately when upgrading
+either CLI.
 
 ## Safety and cleanup
 

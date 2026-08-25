@@ -5,6 +5,7 @@ import copy
 import hashlib
 import json
 import os
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -942,6 +943,31 @@ class HyperliquidDefinitionTests(unittest.TestCase):
         self.definition._read_json = mock.Mock(return_value=own + foreign)
         with self.assertRaisesRegex(EvalError, "this eval did not create"):
             self.definition._require_empty_wallet()
+
+    def test_eval_image_is_pulled_by_immutable_digest(self) -> None:
+        completed = subprocess.CompletedProcess([], 0, stdout="pulled", stderr="")
+        with mock.patch.object(
+            hyperliquid_order_cancel.subprocess, "run", return_value=completed
+        ) as run:
+            self.definition._pull_eval_image()
+
+        self.assertEqual(
+            run.call_args.args[0],
+            ["docker", "pull", hyperliquid_order_cancel.EVAL_IMAGE],
+        )
+        self.assertIn("@sha256:", hyperliquid_order_cancel.EVAL_IMAGE)
+
+    def test_eval_image_pull_fails_closed(self) -> None:
+        completed = subprocess.CompletedProcess(
+            [], 1, stdout="", stderr="manifest unavailable"
+        )
+        with mock.patch.object(
+            hyperliquid_order_cancel.subprocess, "run", return_value=completed
+        ):
+            with self.assertRaisesRegex(
+                EvalError, "pinned Harbor eval image: manifest unavailable"
+            ):
+                self.definition._pull_eval_image()
 
 
 if __name__ == "__main__":
