@@ -39,7 +39,7 @@ use parking_lot::Mutex;
 use wasmtime::component::{Component, Linker as ComponentLinker, Val as ComponentVal};
 use wasmtime::{Caller, Config, Engine, Linker, Memory, Module, Store, StoreContextMut};
 use wasmtime_wasi::WasiCtxBuilder;
-use wasmtime_wasi::pipe::{MemoryInputPipe, MemoryOutputPipe};
+use wasmtime_wasi::p2::pipe::{MemoryInputPipe, MemoryOutputPipe};
 use wasmtime_wasi::preview1::{self, WasiP1Ctx};
 
 use crate::abi::{
@@ -196,6 +196,18 @@ impl PetalVm {
         config.cranelift_nan_canonicalization(true);
         config.wasm_relaxed_simd(true);
         config.relaxed_simd_deterministic(true);
+        // Keep memory64 outside the Petal runtime profile. This is separate
+        // from the `bloom:route@0.1.0` WIT ABI: changing that interface would
+        // not make 64-bit linear memories safe or compatible with older
+        // hosts. Wasmtime 36 enables the core proposal by default even though
+        // its component-model integration is still incomplete (tracked by
+        // upstream issue #4311). The `MemLimiter` cap applies to either
+        // address width, so this is a compatibility/support boundary rather
+        // than a memory-exhaustion fix. Enable it only with an explicit Petal
+        // runtime-feature contract and component-level conformance coverage.
+        // `accepted_petal_component_surface_is_pinned` below catches future
+        // Wasmtime default changes.
+        config.wasm_memory64(false);
         let engine = Engine::new(&config).map_err(|e| PetalError::vm(e.to_string()))?;
         Ok(Self {
             engine,
@@ -2971,6 +2983,46 @@ mod tests {
             after > before,
             "dropping a Wasmtime store must drop its owned memory limiter"
         );
+    }
+
+    /// The core-Wasm proposals accepted inside a Petal component form a host
+    /// runtime profile, separate from the component's `bloom:route@0.1.0` WIT
+    /// ABI. Most are inherited from moving Wasmtime defaults. Upgrading
+    /// Wasmtime 26 -> 36 silently flipped `memory64` from rejected to accepted;
+    /// this test makes the next such change an explicit compatibility choice.
+    ///
+    /// Adding a row here is fine. Flipping one changes the runtime profile.
+    #[test]
+    fn accepted_petal_component_surface_is_pinned() {
+        let vm = PetalVm::new().expect("engine");
+        // (proposal, core module body, accepted inside a component?)
+        let cases: &[(&str, &str, bool)] = &[
+            ("memory64", r#"(memory i64 1)"#, false),
+            ("threads/shared-memory", r#"(memory 1 1 shared)"#, false),
+            (
+                "wide-arithmetic",
+                r#"(func (result i64 i64)
+                     (i64.const 1) (i64.const 2) (i64.mul_wide_s))"#,
+                false,
+            ),
+            ("multi-memory", r#"(memory 1) (memory 1)"#, true),
+            ("tail-call", r#"(func $a) (func $b (return_call $a))"#, true),
+        ];
+        for (name, module_body, want_accepted) in cases {
+            // A proposal can be refused either by the text parser or by
+            // component validation; for this profile both count as rejected.
+            let component = format!("(component (core module {module_body}))");
+            let accepted = wat::parse_str(&component)
+                .ok()
+                .is_some_and(|bytes| Component::from_binary(&vm.engine, &bytes).is_ok());
+            assert_eq!(
+                accepted, *want_accepted,
+                "accepted Petal component surface changed for the {name} proposal: \
+                 expected accepted={want_accepted}, got accepted={accepted}. \
+                 If this is intended, update the runtime profile and its \
+                 compatibility documentation."
+            );
+        }
     }
 
     /// Petal that writes to stdout via `fd_write`. We do this by

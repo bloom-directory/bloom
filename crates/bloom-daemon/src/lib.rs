@@ -236,6 +236,19 @@ struct DaemonPetalHost {
 const PETAL_KEY_STATE_SCHEMA: &str = "bloom.machine.petal-key-request.v2";
 const PETAL_KEY_INPUT_CLASS: &str = "petal-key-scope-v2";
 
+/// Status written over any Petal ceremony projection that still advertised an
+/// owner ceremony when this process started.
+///
+/// Broker holds ceremony sessions in memory only, so a URL staged by an
+/// earlier run resolves to nothing once the triad restarts: completing it
+/// fails with an unexplained `403` or `CEREMONY_REPLAY`. A durable projection
+/// that keeps claiming `awaiting_user` / `awaiting_owner_approval` is
+/// indistinguishable from a live one, so a consumer scanning for work picks it
+/// up and burns real authenticator counters on it. Machine cannot vouch for a
+/// ceremony it staged before its own start, so it stops advertising it and
+/// names the reason. Both projections restage on the next Petal call.
+const PETAL_CEREMONY_INVALIDATED_STATUS: &str = "ceremony_unavailable_after_restart";
+
 /// Machine-owned public reconciliation record. The ceremony URL is retained
 /// here for an owner-readable status projection, but is never returned across
 /// the Petal host boundary.
@@ -1052,54 +1065,66 @@ impl PetalHost for DaemonPetalHost {
                     ("awaiting_user", false, true)
                         | ("awaiting_user", true, true)
                         | ("succeeded", true, false)
+                        // A record this process retired at startup advertises
+                        // no ceremony. Its terms are still this request's
+                        // terms, so it is reconciled and restaged below rather
+                        // than rejected as a conflicting reuse forever.
+                        | (PETAL_CEREMONY_INVALIDATED_STATUS, _, false)
                 )
             {
                 return Err(HostError::Denied(
                     "Petal key request_id was already used with different terms".into(),
                 ));
             }
-            if let Some(public) = stored.public_key.as_ref() {
-                if stored.reusable_approval_id.is_none() {
-                    let reusable = self
-                        .prepare_petal_key_reusable_approval(
-                            broker,
-                            &wallet,
-                            &scope,
-                            &public.key_ref,
-                            provenance_digest.clone().ok_or_else(|| {
-                                HostError::Denied("Petal provenance digest is missing".into())
-                            })?,
-                        )
-                        .await?;
-                    stored.reusable_approval_id = Some(reusable.approval_id);
-                    stored.status = "awaiting_user".into();
-                    stored.ceremony_url = Some(reusable.ceremony_url);
-                    stored.ceremony_expires_at_ms = reusable.ceremony_expires_at_ms;
-                    Self::write_petal_key_state(&path, &stored)?;
-                    return stored.guest_outcome();
+            if let Some(derived_key_ref) = stored.public_key.as_ref().map(|key| key.key_ref.clone())
+            {
+                if let Some(approval_id) = stored.reusable_approval_id.clone() {
+                    let approval = broker.approval_status(approval_id).await.map_err(|error| {
+                        HostError::Denied(format!("{}: {}", error.code.as_str(), error.message))
+                    })?;
+                    match approval.state {
+                        bloom_broker_api::ApprovalLifecycleState::Active => {
+                            stored.status = "succeeded".into();
+                            stored.ceremony_url = None;
+                            Self::write_petal_key_state(&path, &stored)?;
+                            return stored.guest_outcome();
+                        }
+                        bloom_broker_api::ApprovalLifecycleState::Prepared
+                        | bloom_broker_api::ApprovalLifecycleState::AwaitingCeremony
+                            if stored.status != PETAL_CEREMONY_INVALIDATED_STATUS =>
+                        {
+                            return stored.guest_outcome();
+                        }
+                        // The approval is still waiting on an owner, but the
+                        // ceremony that would have carried it was retired at
+                        // startup. Leaving it as is would advertise nothing an
+                        // owner can act on ever again, so stage a fresh one.
+                        bloom_broker_api::ApprovalLifecycleState::Prepared
+                        | bloom_broker_api::ApprovalLifecycleState::AwaitingCeremony => {}
+                        state => {
+                            return Err(HostError::Denied(format!(
+                                "Petal reusable approval is not active: {state:?}"
+                            )));
+                        }
+                    }
                 }
-                let approval_id = stored
-                    .reusable_approval_id
-                    .clone()
-                    .expect("checked reusable approval id");
-                let approval = broker.approval_status(approval_id).await.map_err(|error| {
-                    HostError::Denied(format!("{}: {}", error.code.as_str(), error.message))
-                })?;
-                return match approval.state {
-                    bloom_broker_api::ApprovalLifecycleState::Active => {
-                        stored.status = "succeeded".into();
-                        stored.ceremony_url = None;
-                        Self::write_petal_key_state(&path, &stored)?;
-                        stored.guest_outcome()
-                    }
-                    bloom_broker_api::ApprovalLifecycleState::Prepared
-                    | bloom_broker_api::ApprovalLifecycleState::AwaitingCeremony => {
-                        stored.guest_outcome()
-                    }
-                    state => Err(HostError::Denied(format!(
-                        "Petal reusable approval is not active: {state:?}"
-                    ))),
-                };
+                let reusable = self
+                    .prepare_petal_key_reusable_approval(
+                        broker,
+                        &wallet,
+                        &scope,
+                        &derived_key_ref,
+                        provenance_digest.clone().ok_or_else(|| {
+                            HostError::Denied("Petal provenance digest is missing".into())
+                        })?,
+                    )
+                    .await?;
+                stored.reusable_approval_id = Some(reusable.approval_id);
+                stored.status = "awaiting_user".into();
+                stored.ceremony_url = Some(reusable.ceremony_url);
+                stored.ceremony_expires_at_ms = reusable.ceremony_expires_at_ms;
+                Self::write_petal_key_state(&path, &stored)?;
+                return stored.guest_outcome();
             }
             match broker
                 .custody_result(bloom_broker_api::OperationRequest {
@@ -1173,16 +1198,23 @@ impl PetalHost for DaemonPetalHost {
                 Err(error)
                     if error.code == bloom_broker_api::ProtocolErrorCode::ApprovalNotFound =>
                 {
-                    let now_ms = SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .map(|duration| duration.as_millis() as u64)
-                        .unwrap_or(0);
-                    if stored.ceremony_expires_at_ms.get() <= now_ms {
-                        return Err(HostError::Denied(
-                            "Petal key custody ceremony expired before completion".into(),
-                        ));
+                    // Broker never completed the custody operation this record
+                    // was staged for, and a record retired at startup no longer
+                    // advertises a ceremony that could complete it. Nothing is
+                    // left to wait on, so fall through to restage custody from
+                    // the start under the same deterministic operation ID.
+                    if stored.status != PETAL_CEREMONY_INVALIDATED_STATUS {
+                        let now_ms = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .map(|duration| duration.as_millis() as u64)
+                            .unwrap_or(0);
+                        if stored.ceremony_expires_at_ms.get() <= now_ms {
+                            return Err(HostError::Denied(
+                                "Petal key custody ceremony expired before completion".into(),
+                            ));
+                        }
+                        return stored.guest_outcome();
                     }
-                    return stored.guest_outcome();
                 }
                 Err(error) => {
                     return Err(HostError::Denied(format!(
@@ -2710,6 +2742,133 @@ pub struct Daemon {
     pub wallet_projection_refresh_started: Arc<AtomicBool>,
 }
 
+/// Regular `*.json` records directly under a Petal ceremony projection root.
+///
+/// Symlinks are skipped for the same reason the mounted handlers refuse to
+/// follow them: the projection roots are owner-readable, and a link planted
+/// there must not redirect a Machine rewrite outside the cache.
+fn ceremony_projection_records(root: &Path) -> Result<Vec<PathBuf>, DaemonError> {
+    let entries = match std::fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(DaemonError::Audit(format!(
+                "list Petal ceremony projections {}: {error}",
+                root.display()
+            )));
+        }
+    };
+    let mut records = Vec::new();
+    for entry in entries {
+        let path = entry
+            .map_err(|error| {
+                DaemonError::Audit(format!(
+                    "read Petal ceremony projection entry in {}: {error}",
+                    root.display()
+                ))
+            })?
+            .path();
+        if path.extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        if !std::fs::symlink_metadata(&path)
+            .map(|metadata| metadata.file_type().is_file())
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        records.push(path);
+    }
+    records.sort();
+    Ok(records)
+}
+
+/// Stop every durable Petal ceremony projection from advertising an owner
+/// ceremony staged before this process started.
+///
+/// See [`PETAL_CEREMONY_INVALIDATED_STATUS`]. Records that already advertise
+/// nothing — a derived key that succeeded, a payload already signed — are
+/// authoritative Machine state and are left exactly as they are. A record this
+/// build cannot parse is reported and left alone rather than deleted: Machine
+/// must not destroy owner-visible state it does not understand.
+fn invalidate_stale_ceremony_projections(cache_dir: &Path) -> Result<usize, DaemonError> {
+    let mut invalidated = 0usize;
+
+    for path in ceremony_projection_records(&cache_dir.join("petal-key-requests"))? {
+        let state = match DaemonPetalHost::read_petal_key_state(&path) {
+            Ok(Some(state)) => state,
+            Ok(None) => continue,
+            Err(error) => {
+                warn!(path = %path.display(), error = %error, "petal.key_projection_unreadable");
+                continue;
+            }
+        };
+        if state.schema != PETAL_KEY_STATE_SCHEMA || state.ceremony_url.is_none() {
+            continue;
+        }
+        // `reusable_approval_id` is deliberately preserved: it names a durable
+        // Broker approval, not the lost ceremony session, so the next Petal
+        // key call can reconcile it and adopt an approval the owner completed.
+        // Only when Broker no longer has it does that call stage a fresh one.
+        let invalidated_state = PetalKeyRequestState {
+            status: PETAL_CEREMONY_INVALIDATED_STATUS.into(),
+            ceremony_url: None,
+            ..state
+        };
+        DaemonPetalHost::write_petal_key_state(&path, &invalidated_state).map_err(|error| {
+            DaemonError::Audit(format!(
+                "invalidate Petal key projection {}: {error}",
+                path.display()
+            ))
+        })?;
+        invalidated += 1;
+    }
+
+    for path in ceremony_projection_records(&cache_dir.join("petal-signing-requests"))? {
+        // A record that cannot be read is reported and skipped for the same
+        // reason an unparseable one is: an owner-visible projection Machine
+        // cannot interpret must not take the whole daemon down at startup.
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                warn!(path = %path.display(), error = %error, "petal.signing_projection_unreadable");
+                continue;
+            }
+        };
+        let projection: PetalSigningRequestProjection = match serde_json::from_slice(&bytes) {
+            Ok(projection) => projection,
+            Err(error) => {
+                warn!(path = %path.display(), error = %error, "petal.signing_projection_unreadable");
+                continue;
+            }
+        };
+        if projection.schema != PETAL_SIGNING_STATE_SCHEMA || projection.ceremony_url.is_none() {
+            continue;
+        }
+        // `approval_id` is deliberately preserved: the mounted handler
+        // reconciles this record against Broker on every read, so a Broker
+        // that did survive can restore the projection to an actionable state
+        // with a URL it still resolves.
+        let invalidated_projection = PetalSigningRequestProjection {
+            status: PETAL_CEREMONY_INVALIDATED_STATUS.into(),
+            ceremony_url: None,
+            ceremony_expires_at_ms: None,
+            ..projection
+        };
+        DaemonPetalHost::write_petal_signing_projection(&path, &invalidated_projection).map_err(
+            |error| {
+                DaemonError::Audit(format!(
+                    "invalidate Petal signing projection {}: {error}",
+                    path.display()
+                ))
+            },
+        )?;
+        invalidated += 1;
+    }
+
+    Ok(invalidated)
+}
+
 impl Daemon {
     /// Build the narrow Machine-local batch execution service used by the CLI
     /// IPC endpoint. No custody, approval verifier, or private signing object
@@ -2793,6 +2952,16 @@ impl Daemon {
         provenance_catalog: Option<bloom_broker_api::ProvenanceCatalog>,
     ) -> Result<Self, DaemonError> {
         home.ensure()?;
+        // Before anything can serve or scan these projections, retire the
+        // ceremonies a previous run left advertised.
+        let invalidated = invalidate_stale_ceremony_projections(&home.cache_dir())?;
+        if invalidated > 0 {
+            warn!(
+                count = invalidated,
+                status = PETAL_CEREMONY_INVALIDATED_STATUS,
+                "petal.ceremony_projections_invalidated_on_start"
+            );
+        }
         let config_path = home.config_path();
         let config_existed = config_path.exists();
         let config = Config::load_or_init(&config_path)?;
