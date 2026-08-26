@@ -45,8 +45,8 @@ use bloom_broker_api::{
     ApprovalPrepareRequest, ApprovalPublicStatus, ApprovalRenewRequest, ApprovalSelector,
     ApprovalSubject, BROKER_API_CURRENT, BROKER_API_RANGE, Base64UrlBytes, CeremonyPublicStatus,
     CeremonyState, CredentialPublic, CryptoSuite, CustodyPrepareRequest, CustodyPrepareResponse,
-    CustodyResult, DecimalU64, Digest32, IdRequest, KeyPublic, KeyRef, KeyRequest, KeyRole,
-    MachineBrokerRequest, MachineBrokerResponse, MachineBrokerService, MachineSignRequest,
+    CustodyResult, DecimalU64, DerivationRef, Digest32, IdRequest, KeyPublic, KeyRef, KeyRequest,
+    KeyRole, MachineBrokerRequest, MachineBrokerResponse, MachineBrokerService, MachineSignRequest,
     OperationId, OperationPublicStatus, OperationRequest, PetalUseClaim, PolicyCommitReceipt,
     PolicyCommitUpdateRequest, PolicyUpdatePrepareResponse, PolicyUpdateRequest, ProtocolError,
     ProtocolErrorCode, ProvenanceCatalog, ProvenanceSubject, RequestNonce, RevocationState,
@@ -1387,7 +1387,11 @@ impl MachineBrokerClient {
                             .ok_or_else(|| {
                                 ProtocolError::new(
                                     ProtocolErrorCode::KeyrefMismatch,
-                                    "selected account is not a derived child of this wallet for the requested CryptoSuite",
+                                    format!(
+                                        "selected account is not a derived child of this wallet \
+                                         for the requested CryptoSuite; this wallet offers: {}",
+                                        describe_candidates(&matching),
+                                    ),
                                 )
                             })?;
                         (chosen.clone(), KeyRole::Derived)
@@ -1400,10 +1404,19 @@ impl MachineBrokerClient {
                                 "BIP-39 wallet has no derived child for the requested CryptoSuite",
                             ));
                         }
-                        _ => {
+                        // Never fall back to the first match. The candidates
+                        // are named so the caller can pick one, because an
+                        // error that only says "ambiguous" leaves no way
+                        // forward.
+                        candidates => {
                             return Err(ProtocolError::new(
                                 ProtocolErrorCode::KeyrefMismatch,
-                                "BIP-39 wallet has multiple derived children for the requested CryptoSuite; select an account",
+                                format!(
+                                    "BIP-39 wallet has {} derived children for the requested \
+                                     CryptoSuite; select one by account fingerprint: {}",
+                                    candidates.len(),
+                                    describe_candidates(candidates),
+                                ),
                             ));
                         }
                     },
@@ -2411,6 +2424,25 @@ impl CustodyPrepareMethod {
             Self::Recovery => "recovery.prepare",
         }
     }
+}
+
+/// Name each candidate child so an ambiguity error can be acted on: the public
+/// key fingerprint that selects it, and the derivation path that identifies it
+/// to a human. Ordering here is presentational only — it must never be used to
+/// choose a key.
+fn describe_candidates(candidates: &[&KeyRef]) -> String {
+    candidates
+        .iter()
+        .map(|key| {
+            let path = match &key.derivation {
+                Some(DerivationRef::Bip39Multicurve { path, .. })
+                | Some(DerivationRef::Bip32Secp256k1 { path, .. }) => path.as_str(),
+                None => "<no derivation path>",
+            };
+            format!("{} ({path})", key.public_key_fingerprint.as_str())
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn response_mismatch(method: &str) -> ProtocolError {
@@ -4076,5 +4108,189 @@ mod tests {
             public_key_fingerprint: digest(3),
             derivation: None,
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Explicit derived-account selection (Finding R1).
+    //
+    // A BIP-39 wallet has no signable root, so `root_key_ref` is None and the
+    // signable keys are its derived children. Two active children of the same
+    // key spec are exactly the ambiguity these cover.
+    // ------------------------------------------------------------------
+
+    fn derived_child(account: u32, fingerprint: u8) -> KeyRef {
+        KeyRef {
+            backend: token("local"),
+            backend_instance: token("primary"),
+            locator: format!("wallet/derived/{account}"),
+            key_spec: KeySpec::Secp256k1,
+            public_key_fingerprint: digest(fingerprint),
+            derivation: Some(DerivationRef::Bip39Multicurve {
+                wallet_seed_ref: token("seed"),
+                profile: bloom_broker_api::DerivationProfile::Bip44EvmSecp256k1V1,
+                path: format!("m/44'/60'/{account}'/0/0"),
+            }),
+        }
+    }
+
+    fn multi_account_broker(children: Vec<KeyRef>) -> Arc<MockBroker> {
+        Arc::new(MockBroker {
+            wallet: WalletPublic {
+                wallet_id: token("wallet"),
+                wallet_kind: token("local"),
+                // A BIP-39 seed root is not signable.
+                root_key_ref: None,
+                key_refs: children,
+                policy_version: DecimalU64::new(7),
+                policy_digest: digest(7),
+                wallet_revocation_epoch: DecimalU64::new(2),
+            },
+            requests: Mutex::new(Vec::new()),
+            corrupt_response: false,
+        })
+    }
+
+    #[test]
+    fn candidate_description_names_every_fingerprint_and_path() {
+        let described = describe_candidates(&[&derived_child(0, 0xa1), &derived_child(1, 0xb2)]);
+        assert!(described.contains(digest(0xa1).as_str()));
+        assert!(described.contains(digest(0xb2).as_str()));
+        assert!(described.contains("m/44'/60'/0'/0/0"));
+        assert!(described.contains("m/44'/60'/1'/0/0"));
+
+        // A key with no derivation metadata is still nameable by fingerprint.
+        let rootish = describe_candidates(&[&key_ref()]);
+        assert!(rootish.contains(digest(3).as_str()));
+        assert!(rootish.contains("<no derivation path>"));
+    }
+
+    #[tokio::test]
+    async fn omitted_selector_with_two_active_children_fails_and_names_both() {
+        let broker = multi_account_broker(vec![derived_child(0, 0xa1), derived_child(1, 0xb2)]);
+        let client = MachineBrokerClient::new(broker.clone());
+        let error = client
+            .sign_exact_payload(exact_request(b"exact bytes".to_vec(), None))
+            .await
+            .expect_err("two compatible active children must not resolve implicitly");
+
+        assert_eq!(error.code, ProtocolErrorCode::KeyrefMismatch);
+        // Actionable: the caller can pick one from the error itself.
+        assert!(
+            error.message.contains(digest(0xa1).as_str()),
+            "{}",
+            error.message
+        );
+        assert!(
+            error.message.contains(digest(0xb2).as_str()),
+            "{}",
+            error.message
+        );
+        assert!(
+            error.message.contains("m/44'/60'/0'/0/0"),
+            "{}",
+            error.message
+        );
+        assert!(
+            error.message.contains("m/44'/60'/1'/0/0"),
+            "{}",
+            error.message
+        );
+    }
+
+    #[tokio::test]
+    async fn a_single_active_child_still_resolves_without_a_selector() {
+        let broker = multi_account_broker(vec![derived_child(0, 0xa1)]);
+        let client = MachineBrokerClient::new(broker.clone());
+        client
+            .sign_exact_payload(exact_request(b"exact bytes".to_vec(), None))
+            .await
+            .expect("one compatible child keeps the pre-selector behaviour");
+    }
+
+    #[tokio::test]
+    async fn each_selected_child_binds_its_own_key_and_never_the_other() {
+        for (account, fingerprint) in [(0_u32, 0xa1_u8), (1, 0xb2)] {
+            let children = vec![derived_child(0, 0xa1), derived_child(1, 0xb2)];
+            let selected = derived_child(account, fingerprint);
+            let broker = multi_account_broker(children);
+            let client = MachineBrokerClient::new(broker.clone());
+            let mut request = exact_request(b"exact bytes".to_vec(), None);
+            request.account_key_ref = Some(selected.clone());
+            client
+                .sign_exact_payload(request)
+                .await
+                .expect("an explicitly selected active child signs");
+
+            // The approval must be bound to the selected child, not to
+            // whichever child happened to be listed first.
+            let requests = broker.requests.lock().unwrap();
+            let bound: Vec<&KeyRef> = requests
+                .iter()
+                .filter_map(|request| match request {
+                    MachineBrokerRequest::SealedApprovalPrepare(prepare) => {
+                        Some(&prepare.terms.key_ref)
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert!(!bound.is_empty(), "the flow must prepare an approval");
+            for key_ref in bound {
+                assert_eq!(
+                    key_ref, &selected,
+                    "approval bound a key other than the selected account"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_foreign_selector_is_refused_and_names_the_real_children() {
+        let broker = multi_account_broker(vec![derived_child(0, 0xa1), derived_child(1, 0xb2)]);
+        let client = MachineBrokerClient::new(broker.clone());
+        let mut request = exact_request(b"exact bytes".to_vec(), None);
+        // Same shape, but not a child of this wallet.
+        request.account_key_ref = Some(derived_child(9, 0xc3));
+        let error = client
+            .sign_exact_payload(request)
+            .await
+            .expect_err("a key outside the wallet must never be selectable");
+
+        assert_eq!(error.code, ProtocolErrorCode::KeyrefMismatch);
+        assert!(
+            error.message.contains(digest(0xa1).as_str()),
+            "{}",
+            error.message
+        );
+        assert!(
+            error.message.contains(digest(0xb2).as_str()),
+            "{}",
+            error.message
+        );
+    }
+
+    #[tokio::test]
+    async fn a_selector_is_refused_on_a_wallet_that_signs_with_its_root() {
+        let root = key_ref();
+        let broker = Arc::new(MockBroker {
+            wallet: WalletPublic {
+                wallet_id: token("wallet"),
+                wallet_kind: token("local"),
+                root_key_ref: Some(root.clone()),
+                key_refs: vec![root],
+                policy_version: DecimalU64::new(7),
+                policy_digest: digest(7),
+                wallet_revocation_epoch: DecimalU64::new(2),
+            },
+            requests: Mutex::new(Vec::new()),
+            corrupt_response: false,
+        });
+        let client = MachineBrokerClient::new(broker);
+        let mut request = exact_request(b"exact bytes".to_vec(), None);
+        request.account_key_ref = Some(derived_child(0, 0xa1));
+        let error = client
+            .sign_exact_payload(request)
+            .await
+            .expect_err("a root-signing wallet has no derived account to select");
+        assert_eq!(error.code, ProtocolErrorCode::KeyrefMismatch);
     }
 }
