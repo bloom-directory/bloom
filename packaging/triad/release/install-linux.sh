@@ -46,6 +46,25 @@ case "$action" in
     validate_root_uid "$1" "$2"
     login_user="$3"
     payload="$(cd "$4" && pwd -P)"
+    test -f "$payload/ARTIFACT_CLASS" || {
+      echo "payload is missing ARTIFACT_CLASS" >&2
+      exit 66
+    }
+    artifact_class="$(<"$payload/ARTIFACT_CLASS")"
+    canary_class='solana-mainnet-''canary-v1'
+    case "$artifact_class" in
+      production) ;;
+      "$canary_class")
+        [[ "${BLOOM_ALLOW_SOLANA_MAINNET_CANARY_BUNDLE:-}" == "true" ]] || {
+          echo "Solana mainnet canary installation was not explicitly enabled" >&2
+          exit 65
+        }
+        ;;
+      *)
+        echo "payload has an unknown artifact class" >&2
+        exit 65
+        ;;
+    esac
     platform_claim="$(<"$payload/PLATFORM_CLAIM")"
     if [[ "$platform_claim" != "linux" ]] &&
       [[ ! ("$platform_claim" == "test-unclaimed" &&
@@ -175,6 +194,7 @@ case "$action" in
     mkdir -p "$config_root/broker" "$config_root/signer"
     chmod 0711 "$config_root"
     chmod 0700 "$config_root/broker" "$config_root/signer"
+    atomic_install "$payload/ARTIFACT_CLASS" "$config_root/ARTIFACT_CLASS" 0644
     atomic_install "$payload/config/edge-manifest.json" "$config_root/edge-manifest.json" 0644
     machine_audit_history_source="$config_root/.machine-audit-history.source.$$"
     printf '%s\n' \

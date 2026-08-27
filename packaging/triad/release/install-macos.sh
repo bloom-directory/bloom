@@ -135,7 +135,8 @@ allocate_accounts() {
 }
 
 verify_payload() {
-  for path in bin/bloom bin/bloom-broker bin/bloom-signer bin/bloom-signer-migrate PLATFORM_CLAIM; do [[ -f "$payload/$path" ]] || die "payload missing $path"; done
+  for path in bin/bloom bin/bloom-broker bin/bloom-signer bin/bloom-signer-migrate ARTIFACT_CLASS PLATFORM_CLAIM; do [[ -f "$payload/$path" ]] || die "payload missing $path"; done
+  [[ "$(<"$payload/ARTIFACT_CLASS")" == production ]] || die "macOS installation requires a production artifact class"
   claim="$(<"$payload/PLATFORM_CLAIM")"
   if $live; then
     case "$claim" in

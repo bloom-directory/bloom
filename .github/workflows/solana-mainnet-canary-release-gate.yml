@@ -1,0 +1,44 @@
+name: Solana mainnet canary release gate
+
+on:
+  workflow_dispatch:
+    inputs:
+      broker_ref:
+        description: bloom-broker ref
+        required: true
+      signer_ref:
+        description: bloom-signer ref
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  canary-release-gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Check out Machine
+        uses: actions/checkout@v6
+        with:
+          path: bloom
+      - name: Check out Broker
+        uses: actions/checkout@v6
+        with:
+          repository: bloom-directory/bloom-broker
+          ref: ${{ inputs.broker_ref }}
+          token: ${{ secrets.TRIAD_REPOSITORY_TOKEN }}
+          path: bloom-broker
+      - name: Check out Signer
+        uses: actions/checkout@v6
+        with:
+          repository: bloom-directory/bloom-signer
+          ref: ${{ inputs.signer_ref }}
+          token: ${{ secrets.TRIAD_REPOSITORY_TOKEN }}
+          path: bloom-signer
+      - name: Install Rust toolchain
+        run: rustup show
+        working-directory: bloom
+      - name: Run locked non-production canary release gate
+        working-directory: bloom
+        run: packaging/triad/release/solana-mainnet-canary-release-gate.sh --test-signing-key
