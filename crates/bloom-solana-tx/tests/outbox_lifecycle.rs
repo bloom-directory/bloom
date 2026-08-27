@@ -11,6 +11,7 @@ fn staged(id: &str) -> StagedSolanaTransfer {
         chain: "solana-devnet".into(),
         fee_payer: "FEEPAYER111111111111111111111111111111111".into(),
         account_fingerprint: None,
+        account_derivation_path: None,
         destination: "DEST111111111111111111111111111111111111111".into(),
         lamports: 1_000_000,
         fee_lamports: 5_000,

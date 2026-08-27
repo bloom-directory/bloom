@@ -41,6 +41,11 @@ pub struct StagedSolanaTransfer {
     /// which stays unambiguous because they cannot have had a second child.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account_fingerprint: Option<String>,
+    /// Canonical hardened derivation path of the selected child. New entries
+    /// always carry it beside the fingerprint; optional only for legacy
+    /// records created before explicit account selection existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_derivation_path: Option<String>,
     /// Transfer destination, base58.
     pub destination: String,
     /// Native SOL debit in lamports.

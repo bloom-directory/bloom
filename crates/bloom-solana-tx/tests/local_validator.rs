@@ -245,6 +245,7 @@ async fn local_validator_lifecycle_stage_sign_broadcast_reconcile() {
             "wallet",
             &fee_payer,
             None,
+            None,
             &destination,
             transfer_lamports,
             now_ms(),

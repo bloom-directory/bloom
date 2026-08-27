@@ -3058,6 +3058,18 @@ impl WalletsHandler {
                 let (child, key_ref) = self
                     .resolve_solana_child(wallet, intent.account_fingerprint.as_deref())
                     .await?;
+                let derivation_path = match key_ref.derivation.as_ref() {
+                    Some(bloom_broker_api::DerivationRef::Bip39Multicurve {
+                        profile: bloom_broker_api::DerivationProfile::Bip44SolanaSlip10Ed25519V1,
+                        path,
+                        ..
+                    }) => path.clone(),
+                    _ => {
+                        return Err(HandlerError::backend(
+                            "Solana child must carry its canonical BIP-39 derivation path",
+                        ));
+                    }
+                };
                 let staged = engine
                     .stage(
                         wallet,
@@ -3065,6 +3077,7 @@ impl WalletsHandler {
                         // Pin the full fingerprint, never the user's prefix:
                         // a prefix could later resolve to a different child.
                         Some(key_ref.public_key_fingerprint.as_str().to_owned()),
+                        Some(derivation_path),
                         &destination,
                         intent.lamports,
                         now_ms_u128(),
@@ -4294,6 +4307,7 @@ mod tests {
             chain: "solana-devnet".into(),
             fee_payer: "FEEPAYER111111111111111111111111111111111".into(),
             account_fingerprint: None,
+            account_derivation_path: None,
             destination: "DEST111111111111111111111111111111111111111".into(),
             lamports: 1_000_000,
             fee_lamports: 5_000,
