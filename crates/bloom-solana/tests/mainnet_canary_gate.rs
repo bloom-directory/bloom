@@ -71,7 +71,7 @@ fn mainnet_spec(endpoint: &str) -> SolanaSpec {
 fn write_authorization(path: &Path) {
     let artifact =
         bloom_proto::canary::running_artifact_sha256().expect("hash the running test binary");
-    let mut auth = CanaryAuthorization {
+    let auth = CanaryAuthorization {
         schema: AUTHORIZATION_SCHEMA.into(),
         artifact_sha256: artifact,
         chain: CHAIN.into(),
@@ -85,9 +85,7 @@ fn write_authorization(path: &Path) {
         max_fee_lamports: 10_000,
         max_transactions: bloom_proto::canary::MAX_TRANSACTIONS,
         expires_ms: u128::from(u64::MAX),
-        acknowledgement: String::new(),
     };
-    auth.acknowledgement = auth.canonical_acknowledgement();
     auth.validate_shape()
         .expect("the fixture must be well formed");
     std::fs::write(path, serde_json::to_vec(&auth).unwrap()).unwrap();
@@ -203,9 +201,6 @@ async fn an_authorization_for_another_chain_or_artifact_does_not_open_the_gate()
         let mut auth: CanaryAuthorization =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         mutate(&mut auth);
-        // The acknowledgement is re-derived so the refusal is attributable to
-        // the mutated field rather than to a stale sentence.
-        auth.acknowledgement = auth.canonical_acknowledgement();
         std::fs::write(&path, serde_json::to_vec(&auth).unwrap()).unwrap();
 
         let output = Command::new(std::env::current_exe().unwrap())

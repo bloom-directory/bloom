@@ -50,7 +50,6 @@ order an attacker or an accident would meet them:
 | Build-time artifact label | The feature alone does not compile. `BLOOM_MAINNET_CANARY_ARTIFACT` must also be set, so `--all-features` and every release path fail loudly rather than silently producing a capable binary. |
 | Out-of-band authorization | The authorization is a file named by `BLOOM_SOLANA_MAINNET_CANARY_AUTHORIZATION`, never a config key. No `config.toml` spelling enables mainnet. |
 | Artifact binding | The authorization carries the SHA-256 of the binary it was issued for and is refused by any other binary. |
-| Typed acknowledgement | The operator must reproduce a canonical sentence containing every bound value. Editing any value invalidates the acknowledgement written for the old one. |
 | Exact-match caps | One wallet, one key fingerprint, one source, one destination, one exact amount, a fee ceiling, and a live-read balance ceiling. |
 | Expiry | A wall-clock deadline, re-checked at boot and at send. |
 | Single-use ledger | `create_new` on a sibling `.spent` file, claimed *before* the send. |
@@ -58,6 +57,15 @@ order an attacker or an accident would meet them:
 Broker policy, semantic verification, and the human approval ceremony are
 untouched and still run exactly as on devnet. The canary decides only whether
 mainnet-beta is reachable at all; everything downstream still has to agree.
+
+**Human approval is the passkey ceremony, and only the passkey ceremony.** An
+earlier revision of this design also required the operator to reproduce a typed
+acknowledgement sentence in the authorization file. That was removed: it added a
+second human ritual without adding a second decision. The passkey ceremony
+already binds the exact staged message, so an authorization edited after the
+fact still cannot produce a broadcast — the transfer it describes is not the one
+that was approved. The remaining bindings in the file are machine-checked and
+need no human ceremony of their own.
 
 ## Threat model
 
@@ -72,9 +80,9 @@ refusals cite the label variable, and that a labelled build succeeds.
 **An authorization is reused against a newer binary.** Refused: the artifact
 hash will not match.
 
-**An authorization is quietly re-pointed** at a larger amount or a different
-destination. Refused: the acknowledgement no longer matches the canonical
-sentence for the edited values.
+**A staged transfer is re-pointed** at a larger amount or a different
+destination. Refused: the transfer must exactly match the values in the
+artifact-bound canary capability.
 
 **The amount is reduced** rather than raised. Still refused. The amount is
 compared for equality, not as a ceiling, because a smaller debit is still not
@@ -109,7 +117,7 @@ exact-match caps and the single-use ledger do not depend on the clock.
 
 ## Test coverage
 
-- 11 unit tests over the authorization's decisions, run in **both** build
+- 9 unit tests over the authorization's decisions, run in **both** build
   configurations.
 - 2 integration tests driving the real environment variable into the real guard
   via a re-exec, asserting that a production build refuses even when handed a

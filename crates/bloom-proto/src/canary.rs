@@ -26,10 +26,14 @@
 //!   destination, one amount, a fee ceiling, a balance ceiling, an expiry, and
 //!   a transaction ceiling that must be exactly 1, spent through a durable
 //!   single-use ledger.
-//! * **Typed acknowledgement.** The operator must reproduce, verbatim, a
-//!   sentence derived from those same fields. A boilerplate "yes" does not
-//!   parse, and editing any bound value invalidates the acknowledgement that
-//!   was written for the old one.
+//!
+//! There is deliberately **no typed acknowledgement** in this file. Human
+//! approval of a mainnet transfer is the passkey ceremony, which binds the
+//! exact staged message and runs unchanged from devnet. A second out-of-band
+//! human ritual would add friction without adding a decision: re-pointing this
+//! file at another destination or a larger amount still cannot broadcast,
+//! because the resulting transfer is then not the one the passkey approved,
+//! and the caps below are re-checked against the staged transfer regardless.
 //!
 //! None of this replaces Broker policy, semantic verification, or the human
 //! approval ceremony. Those still run exactly as they do on devnet; the canary
@@ -129,34 +133,9 @@ pub struct CanaryAuthorization {
     pub max_transactions: u32,
     /// Unix milliseconds after which this authorization is dead.
     pub expires_ms: u128,
-    /// Must equal [`CanaryAuthorization::canonical_acknowledgement`].
-    pub acknowledgement: String,
 }
 
 impl CanaryAuthorization {
-    /// The exact sentence the operator must reproduce in `acknowledgement`.
-    ///
-    /// Every bound value appears here, so editing any of them after the fact
-    /// invalidates the acknowledgement written for the previous values. This
-    /// is what stops an authorization from being quietly re-pointed at a
-    /// different destination or a larger amount.
-    pub fn canonical_acknowledgement(&self) -> String {
-        format!(
-            "I authorize Bloom to broadcast exactly {transfer} lamports on Solana mainnet-beta \
-             from {source} ({path}, fingerprint {fingerprint}) to {destination}, paying at most \
-             {fee} lamports in fees, with at most {balance} lamports at risk, expiring at \
-             {expiry} ms. I accept that these funds may be lost.",
-            transfer = self.transfer_lamports,
-            source = self.source_address,
-            path = self.derivation_path,
-            fingerprint = self.key_fingerprint,
-            destination = self.destination,
-            fee = self.max_fee_lamports,
-            balance = self.max_balance_lamports,
-            expiry = self.expires_ms,
-        )
-    }
-
     /// Structural validation, independent of the running binary and clock.
     pub fn validate_shape(&self) -> Result<(), CanaryError> {
         if self.schema != AUTHORIZATION_SCHEMA {
@@ -204,11 +183,6 @@ impl CanaryAuthorization {
                 "transfer {} + fee {} exceeds the {} lamport balance cap",
                 self.transfer_lamports, self.max_fee_lamports, self.max_balance_lamports
             )));
-        }
-        if self.acknowledgement != self.canonical_acknowledgement() {
-            return Err(CanaryError::invalid(
-                "acknowledgement does not match the canonical sentence for these exact values",
-            ));
         }
         Ok(())
     }
@@ -477,7 +451,7 @@ mod tests {
     use super::*;
 
     fn authorization_fixture() -> CanaryAuthorization {
-        let mut auth = CanaryAuthorization {
+        CanaryAuthorization {
             schema: AUTHORIZATION_SCHEMA.into(),
             artifact_sha256: "ab".repeat(32),
             chain: "solana-mainnet-canary".into(),
@@ -491,10 +465,7 @@ mod tests {
             max_fee_lamports: 10_000,
             max_transactions: MAX_TRANSACTIONS,
             expires_ms: 10_000,
-            acknowledgement: String::new(),
-        };
-        auth.acknowledgement = auth.canonical_acknowledgement();
-        auth
+        }
     }
 
     #[test]
@@ -508,37 +479,10 @@ mod tests {
     }
 
     #[test]
-    fn a_boilerplate_acknowledgement_is_refused() {
-        let mut auth = authorization_fixture();
-        auth.acknowledgement = "yes".into();
-        let error = auth.validate_shape().expect_err("'yes' must not authorize");
-        assert!(format!("{error}").contains("acknowledgement"), "{error}");
-    }
-
-    #[test]
-    fn editing_a_bound_value_invalidates_the_acknowledgement_written_for_the_old_one() {
-        let mut auth = authorization_fixture();
-        // The operator was shown — and signed for — 1_000_000 lamports.
-        auth.transfer_lamports = 1_500_000;
-        let error = auth
-            .validate_shape()
-            .expect_err("a re-pointed amount must not keep its old acknowledgement");
-        assert!(format!("{error}").contains("acknowledgement"), "{error}");
-
-        let mut auth = authorization_fixture();
-        auth.destination = "OtherDestination1111111111111111111111111".into();
-        let error = auth
-            .validate_shape()
-            .expect_err("a re-pointed destination must not keep its old acknowledgement");
-        assert!(format!("{error}").contains("acknowledgement"), "{error}");
-    }
-
-    #[test]
     fn the_transaction_ceiling_is_exactly_one() {
         for count in [0, 2, 100] {
             let mut auth = authorization_fixture();
             auth.max_transactions = count;
-            auth.acknowledgement = auth.canonical_acknowledgement();
             let error = auth.validate_shape().expect_err("only 1 is permitted");
             assert!(format!("{error}").contains("max_transactions"), "{error}");
         }
@@ -548,7 +492,6 @@ mod tests {
     fn the_balance_cap_must_actually_bound_the_debit() {
         let mut auth = authorization_fixture();
         auth.max_balance_lamports = auth.transfer_lamports; // no room for the fee
-        auth.acknowledgement = auth.canonical_acknowledgement();
         let error = auth
             .validate_shape()
             .expect_err("a cap that cannot cover transfer+fee is not a loss bound");
