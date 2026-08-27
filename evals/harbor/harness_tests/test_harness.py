@@ -281,6 +281,44 @@ class HyperliquidDefinitionTests(unittest.TestCase):
         with self.assertRaisesRegex(EvalError, "AUTHENTICATOR_SEED_FILE is required"):
             definition.preflight()
 
+    def test_full_eval_requires_explicit_mount_before_external_work(self) -> None:
+        env = dict(self.env)
+        del env["BLOOM_EVAL_BLOOM_MOUNT"]
+        definition = HyperliquidOrderCancelEval(self.repo, env)
+        with (
+            mock.patch.object(hyperliquid_order_cancel.subprocess, "run") as run,
+            self.assertRaisesRegex(
+                EvalError, "BLOOM_EVAL_BLOOM_MOUNT is required"
+            ),
+        ):
+            definition.preflight()
+        run.assert_not_called()
+
+    def test_full_eval_rejects_invalid_explicit_mount(self) -> None:
+        definition = HyperliquidOrderCancelEval(
+            self.repo, self.env | {"BLOOM_EVAL_BLOOM_MOUNT": "/not-a-mount"}
+        )
+        with (
+            mock.patch.object(
+                hyperliquid_order_cancel.os.path, "ismount", return_value=False
+            ) as ismount,
+            self.assertRaisesRegex(EvalError, "Bloom is not mounted at /not-a-mount"),
+        ):
+            definition._require_bloom_mount()
+        ismount.assert_called_once_with(Path("/not-a-mount"))
+
+    def test_full_eval_accepts_valid_custom_mount_selection(self) -> None:
+        custom = self.root / "custom-mount"
+        definition = HyperliquidOrderCancelEval(
+            self.repo, self.env | {"BLOOM_EVAL_BLOOM_MOUNT": str(custom)}
+        )
+        with mock.patch.object(
+            hyperliquid_order_cancel.os.path, "ismount", return_value=True
+        ) as ismount:
+            definition._require_bloom_mount()
+        self.assertEqual(definition.bloom_mount, custom)
+        ismount.assert_called_once_with(custom)
+
     def test_missing_sign_count_fails_closed(self) -> None:
         env = dict(self.env)
         del env["BLOOM_EVAL_AUTHENTICATOR_SIGN_COUNT"]

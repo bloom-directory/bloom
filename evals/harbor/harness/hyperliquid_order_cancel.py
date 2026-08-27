@@ -102,7 +102,8 @@ class HyperliquidOrderCancelEval(EvalDefinition):
             "BLOOM_EVAL_PROVENANCE_CATALOG", ""
         )
         self.provenance_catalog = Path(self.provenance_catalog_value)
-        self.bloom_mount = Path(self.env.get("BLOOM_EVAL_BLOOM_MOUNT", "/bloom"))
+        self.bloom_mount_value = self.env.get("BLOOM_EVAL_BLOOM_MOUNT", "")
+        self.bloom_mount = Path(self.bloom_mount_value)
         self.driver = Path(
             self.env.get(
                 "BLOOM_EVAL_DEBUG_DRIVER_BIN",
@@ -758,7 +759,16 @@ class HyperliquidOrderCancelEval(EvalDefinition):
             detail = (completed.stderr or completed.stdout).strip()
             raise EvalError(f"could not pull pinned Harbor eval image: {detail}")
 
+    def _require_bloom_mount_selection(self) -> None:
+        if not self.bloom_mount_value:
+            raise EvalError("BLOOM_EVAL_BLOOM_MOUNT is required for a full eval")
+
+    def _require_bloom_mount(self) -> None:
+        if not os.path.ismount(self.bloom_mount):
+            raise EvalError(f"Bloom is not mounted at {self.bloom_mount}")
+
     def preflight(self) -> None:
+        self._require_bloom_mount_selection()
         if not WALLET.fullmatch(self.wallet):
             raise EvalError("BLOOM_EVAL_WALLET must be a lowercase 0x address")
         if self.env.get("BLOOM_EVAL_MAINNET_ACK") != MAINNET_ACK:
@@ -799,8 +809,7 @@ class HyperliquidOrderCancelEval(EvalDefinition):
                 "debug driver lacks --authenticator-seed-file support; "
                 "build bloom-broker PR #1 or newer"
             )
-        if not os.path.ismount(self.bloom_mount):
-            raise EvalError(f"Bloom is not mounted at {self.bloom_mount}")
+        self._require_bloom_mount()
         for relative, label in (
             ("mids.json", "Hyperliquid mainnet Petal is not installed"),
             ("perp_meta.json", "Hyperliquid perpetual metadata route is missing"),

@@ -33,8 +33,9 @@ cancellation evidence.
   Machine export; this is per-machine, so verify with `--mount` before relying
   on it.
 - A running Bloom triad mounted at the path supplied as
-  `BLOOM_EVAL_BLOOM_MOUNT`, with the Hyperliquid Petal installed. The harness
-  defaults to `/bloom` only for compatibility with older manual runs. A
+  `BLOOM_EVAL_BLOOM_MOUNT`, with the Hyperliquid Petal installed. Every full
+  environment-driven eval requires this variable; `/bloom` is conventional but
+  is never selected implicitly. A
   home-directory mount avoids needing `/etc/synthetic.conf` on macOS, whose
   sealed system volume will not accept a bare `mkdir /bloom`.
 - A dedicated mainnet wallet created with the deterministic Broker debug-driver
@@ -227,11 +228,13 @@ not the semantically equivalent direct CLI path.
 
 The following environment-driven workflow remains available for harness
 development and diagnosis. Prefer the operator workflow for a full live eval.
+Mount selection is mandatory and deliberately not auto-discovered because more
+than one Bloom mount may exist.
 
 ```bash
 export BLOOM_EVAL_WALLET=0x... # dedicated, lowercase address
 export BLOOM_EVAL_WALLET_ID=... # dedicated Bloom wallet ID
-export BLOOM_EVAL_BLOOM_MOUNT=/path/to/active/machine/mount
+export BLOOM_EVAL_BLOOM_MOUNT=/bloom # or the triad's exact custom --mount path
 export BLOOM_EVAL_PETAL_OWNER_RECORD=/path/to/state/machine/petals/store/owners/hyperliquid.json
 export BLOOM_EVAL_PETAL_STORE=/path/to/state/machine/petals/store
 export BLOOM_EVAL_PROVENANCE_CATALOG=/path/to/config/provenance-catalog.json
