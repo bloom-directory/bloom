@@ -1458,7 +1458,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -1469,7 +1469,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -2181,7 +2181,7 @@ dependencies = [
 [[package]]
 name = "bloom-audit-checkpoint"
 version = "0.1.3"
-source = "git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=8e0aa7645c484b02ea9d994c3ce5f6f37abd9360#8e0aa7645c484b02ea9d994c3ce5f6f37abd9360"
+source = "git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=d4150dd2d383836a50edb6188029210bae02c4b6#d4150dd2d383836a50edb6188029210bae02c4b6"
 dependencies = [
  "bloom-rpc-wire",
  "ed25519-dalek",
@@ -2197,7 +2197,7 @@ dependencies = [
 [[package]]
 name = "bloom-broker-api"
 version = "0.1.0"
-source = "git+https://github.com/bloom-directory/bloom-broker.git?rev=ae46fd4fb57b5db15bc70e617a9c94d7c0f6651b#ae46fd4fb57b5db15bc70e617a9c94d7c0f6651b"
+source = "git+https://github.com/bloom-directory/bloom-broker.git?rev=ba25a02bcb3ed940895adf6eda01c810bff753ee#ba25a02bcb3ed940895adf6eda01c810bff753ee"
 dependencies = [
  "bloom-rpc-wire",
  "serde",
@@ -2589,7 +2589,7 @@ dependencies = [
 [[package]]
 name = "bloom-rpc-wire"
 version = "0.1.3"
-source = "git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=8e0aa7645c484b02ea9d994c3ce5f6f37abd9360#8e0aa7645c484b02ea9d994c3ce5f6f37abd9360"
+source = "git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=d4150dd2d383836a50edb6188029210bae02c4b6#d4150dd2d383836a50edb6188029210bae02c4b6"
 dependencies = [
  "base64",
  "ed25519-dalek",
@@ -2604,7 +2604,7 @@ dependencies = [
 [[package]]
 name = "bloom-service-activation"
 version = "0.1.3"
-source = "git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=8e0aa7645c484b02ea9d994c3ce5f6f37abd9360#8e0aa7645c484b02ea9d994c3ce5f6f37abd9360"
+source = "git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=d4150dd2d383836a50edb6188029210bae02c4b6#d4150dd2d383836a50edb6188029210bae02c4b6"
 dependencies = [
  "bloom-rpc-wire",
  "libc",
@@ -2614,7 +2614,7 @@ dependencies = [
 [[package]]
 name = "bloom-signer-derive"
 version = "0.1.0"
-source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=6f902ba455256793c14d7855c115d39ff7a30327#6f902ba455256793c14d7855c115d39ff7a30327"
+source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=2ef153a7394d4ae36dac1166b69de4b3e618de3d#2ef153a7394d4ae36dac1166b69de4b3e618de3d"
 dependencies = [
  "bip39",
  "ed25519-dalek",
@@ -2693,7 +2693,7 @@ dependencies = [
 [[package]]
 name = "bloom-triad-local-transport"
 version = "0.1.3"
-source = "git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=8e0aa7645c484b02ea9d994c3ce5f6f37abd9360#8e0aa7645c484b02ea9d994c3ce5f6f37abd9360"
+source = "git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=d4150dd2d383836a50edb6188029210bae02c4b6#d4150dd2d383836a50edb6188029210bae02c4b6"
 dependencies = [
  "bloom-rpc-wire",
  "bloom-trusted-time",
@@ -2711,7 +2711,7 @@ dependencies = [
 [[package]]
 name = "bloom-trusted-time"
 version = "0.1.3"
-source = "git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=8e0aa7645c484b02ea9d994c3ce5f6f37abd9360#8e0aa7645c484b02ea9d994c3ce5f6f37abd9360"
+source = "git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=d4150dd2d383836a50edb6188029210bae02c4b6#d4150dd2d383836a50edb6188029210bae02c4b6"
 dependencies = [
  "libc",
  "thiserror 2.0.18",
@@ -5792,7 +5792,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -8265,7 +8265,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3a766e1110788c36f4fa1c2b71b387a7815aa65f88ce0229841826633d93723e"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
