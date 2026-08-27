@@ -189,6 +189,7 @@ fn make_staging(root: &Path) -> PathBuf {
         fs::write(&path, script).unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
     }
+    fs::write(staging.join("ARTIFACT_CLASS"), b"production\n").unwrap();
     fs::write(staging.join("PLATFORM_CLAIM"), b"test-unclaimed\n").unwrap();
     staging
 }
@@ -263,6 +264,108 @@ fn build(staging: &Path, output: &Path, key: &Path) -> std::process::Output {
         .env("BLOOM_ALLOW_TEST_UNCLAIMED", "true")
         .output()
         .unwrap()
+}
+
+fn label_canary_machine(staging: &Path) {
+    let machine = staging.join("bin/bloom");
+    let mut contents = fs::read_to_string(&machine).unwrap();
+    contents.push_str(
+        "# BLOOM_MAINNET_CANARY_ARTIFACT\n\
+         # BLOOM_SOLANA_MAINNET_CANARY_AUTHORIZATION\n\
+         # NON-PRODUCTION-MAINNET-CANARY\n\
+         # mainnet-canary\n",
+    );
+    fs::write(machine, contents).unwrap();
+}
+
+fn build_canary(staging: &Path, output: &Path, key: &Path) -> std::process::Output {
+    Command::new(release_script("build-bundle.sh"))
+        .args([staging.as_os_str(), output.as_os_str(), key.as_os_str()])
+        .arg("1700000000")
+        .env("BLOOM_MACHINE_SHA", "1111111")
+        .env("BLOOM_BROKER_SHA", "2222222")
+        .env("BLOOM_SIGNER_SHA", "3333333")
+        .env("BLOOM_ALLOW_TEST_UNCLAIMED", "true")
+        .env("BLOOM_ARTIFACT_CLASS", "solana-mainnet-canary-v1")
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn production_bundle_rejects_a_canary_machine() {
+    let directory = tempfile::tempdir().unwrap();
+    let staging = make_staging(directory.path());
+    label_canary_machine(&staging);
+    let key = directory.path().join("release-key");
+    generate_ed25519_key(&key);
+    let built = build(&staging, &directory.path().join("production.tar.gz"), &key);
+    assert!(!built.status.success());
+    assert!(
+        String::from_utf8_lossy(&built.stderr).contains("forbidden production artifact marker")
+    );
+}
+
+#[test]
+fn canary_bundle_is_signed_classified_and_requires_explicit_verification() {
+    let directory = tempfile::tempdir().unwrap();
+    let staging = make_staging(directory.path());
+    label_canary_machine(&staging);
+    let key = directory.path().join("release-key");
+    let archive = directory.path().join("canary.tar.gz");
+    generate_ed25519_key(&key);
+    let built = build_canary(&staging, &archive, &key);
+    assert!(
+        built.status.success(),
+        "{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+
+    let checksum = PathBuf::from(format!("{}.sha256", archive.display()));
+    let signature = PathBuf::from(format!("{}.sig", archive.display()));
+    let public_key = PathBuf::from(format!("{}.pub", archive.display()));
+    let verify = |allow_canary: bool| {
+        let mut command = Command::new(release_script("verify-bundle.sh"));
+        command
+            .args([
+                archive.as_os_str(),
+                checksum.as_os_str(),
+                signature.as_os_str(),
+                public_key.as_os_str(),
+            ])
+            .env("BLOOM_ALLOW_TEST_UNCLAIMED", "true");
+        if allow_canary {
+            command.env("BLOOM_ALLOW_SOLANA_MAINNET_CANARY_BUNDLE", "true");
+        }
+        command.output().unwrap()
+    };
+    let refused = verify(false);
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("not explicitly enabled"));
+    let accepted = verify(true);
+    assert!(
+        accepted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&accepted.stderr)
+    );
+
+    let extracted = directory.path().join("extracted");
+    fs::create_dir(&extracted).unwrap();
+    assert!(
+        Command::new("tar")
+            .args(["-xzf"])
+            .arg(&archive)
+            .args(["-C"])
+            .arg(&extracted)
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert_eq!(
+        fs::read_to_string(extracted.join("bloom-triad/ARTIFACT_CLASS"))
+            .unwrap()
+            .trim(),
+        "solana-mainnet-canary-v1"
+    );
 }
 
 #[test]
@@ -1243,6 +1346,51 @@ fn bundle_rejects_a_service_outside_the_current_only_matrix() {
     );
     assert!(!built.status.success());
     assert!(String::from_utf8_lossy(&built.stderr).contains("compatibility matrix"));
+}
+
+#[test]
+fn linux_installer_requires_explicit_canary_opt_in_and_records_the_class() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("root");
+    fs::create_dir(&root).unwrap();
+    let payload = make_installer_payload(directory.path());
+    fs::write(
+        payload.join("ARTIFACT_CLASS"),
+        b"solana-mainnet-canary-v1\n",
+    )
+    .unwrap();
+    let installer = release_script("install-linux.sh");
+    let refused = Command::new(&installer)
+        .args(["install"])
+        .arg(&root)
+        .args(["1000", "alice"])
+        .arg(&payload)
+        .env("BLOOM_ALLOW_TEST_UNCLAIMED", "true")
+        .output()
+        .unwrap();
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("not explicitly enabled"));
+
+    let installed = Command::new(&installer)
+        .args(["install"])
+        .arg(&root)
+        .args(["1000", "alice"])
+        .arg(&payload)
+        .env("BLOOM_ALLOW_TEST_UNCLAIMED", "true")
+        .env("BLOOM_ALLOW_SOLANA_MAINNET_CANARY_BUNDLE", "true")
+        .output()
+        .unwrap();
+    assert!(
+        installed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&installed.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("etc/bloom/1000/ARTIFACT_CLASS"))
+            .unwrap()
+            .trim(),
+        "solana-mainnet-canary-v1"
+    );
 }
 
 #[test]

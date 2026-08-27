@@ -1,8 +1,35 @@
 # Solana mainnet-beta canary: design and threat model
 
-**Status:** implemented, pre-review. Not yet independently reviewed.
+**Status:** implemented, review requested. Not yet independently approved.
 **Scope:** one bounded, single-transaction mainnet-beta transfer for the purpose
 of exercising Bloom's mainnet broadcast and reconciliation path once.
+
+The operational authority, fixed milestone-one limits, artifact-promotion
+rules, and reconciliation decision procedure are normative in
+[`../operations/solana-mainnet-canary.md`](../operations/solana-mainnet-canary.md).
+That runbook does not authorize funding or broadcast by itself.
+
+## Milestone-one decision
+
+The first canary is exactly one native SOL transfer. Its maximum funded balance
+and total-loss budget is 10,000,000 lamports (0.01 SOL), its exact transfer is
+5,000,000 lamports (0.005 SOL), and its fee ceiling is 10,000 lamports
+(0.00001 SOL). Raising any limit invalidates approval. Repeatable sessions,
+tokens, programs, exchanges, bridges, sweeps, and a generic production mainnet
+switch are out of scope.
+
+The capital owner and passkey actor approve funding and broadcast separately.
+The execution operator cannot substitute for either approval. An independent
+security reviewer approves the implementation, this threat model, the runbook,
+and the post-merge range-diff; the implementation author cannot self-satisfy
+that gate.
+
+Review before merging is provisional. After bottom-up merges and immutable
+repins, the reviewer must compare the final heads to the provisionally approved
+heads with `git range-diff`. A limited confirmation is valid only for expected
+ancestry, exact pin changes, lockfiles, compatibility catalogs, and previously
+approved conflict resolution. Any semantic code, policy, release-script, or
+threat-model change requires full re-review of the affected area.
 
 ## Why this exists
 
@@ -50,6 +77,7 @@ order an attacker or an accident would meet them:
 | --- | --- |
 | Compile-time feature, off by default | Production binaries contain no code that can enable mainnet-beta. `authorization_at` is a function returning `None`. |
 | Build-time artifact label | The feature alone does not compile. `BLOOM_MAINNET_CANARY_ARTIFACT` must also be set, so `--all-features` and every release path fail loudly rather than silently producing a capable binary. |
+| Signed artifact class | The canary release path signs `ARTIFACT_CLASS=solana-mainnet-canary-v1`; the verifier and Linux installer reject it unless separately opted in, and production packaging still refuses it. |
 | Out-of-band authorization | The authorization is a file named by `BLOOM_SOLANA_MAINNET_CANARY_AUTHORIZATION`, never a config key. No `config.toml` spelling enables mainnet. |
 | Artifact binding | The authorization carries the SHA-256 of the binary it was issued for and is refused by any other binary. |
 | Exact-match caps | One wallet, one key fingerprint, one canonical derivation path, one source, one destination, one exact amount, a fee ceiling, and a live-read balance ceiling. |
@@ -59,6 +87,20 @@ order an attacker or an accident would meet them:
 Broker policy, semantic verification, and the human approval ceremony are
 untouched and still run exactly as on devnet. The canary decides only whether
 mainnet-beta is reachable at all; everything downstream still has to agree.
+
+The same signed Machine binary digest is used for local-validator acceptance,
+public-devnet identity checks, recovery rehearsal, and mainnet. It is copied,
+never rebuilt between environments. With no mainnet authorization present, the
+canary-capable binary must still refuse mainnet. Recovery and installed
+acceptance promote a candidate digest to the final artifact; any rebuild
+invalidates that promotion.
+
+A funded public-devnet transfer is desirable evidence but not a hard gate when
+public faucets are unavailable. The hard execution gate is the complete
+separate-process happy-path, adversarial, response-loss, and restart matrix on
+the pinned Agave validator. Public devnet remains mandatory for live devnet
+genesis, blockhash, fee, simulation, and mismatch-refusal evidence. This gate
+substitution must itself be accepted by the independent reviewer.
 
 **Human approval is the passkey ceremony, and only the passkey ceremony.** An
 earlier revision of this design also required the operator to reproduce a typed
@@ -98,7 +140,12 @@ claim about the account now.
 *before* the send, so a crash or timeout leaves the canary spent. This is
 deliberate: an automatic retry is the one behaviour that could double-send real
 funds. The outcome is recovered by reconciling the deterministic signature, not
-by resending.
+by resending. `FINALIZED-ABSENT` is not inferred from a wall-clock timeout: two
+independent healthy RPC providers must advance beyond the transaction's final
+valid height and independently return no historical status and no finalized
+transaction under the repeated procedure in the runbook. The authorization
+stays spent even then; another attempt starts from a fresh stage, authorization,
+passkey ceremony, and capital-owner approval.
 
 **Two processes race.** `create_new` admits exactly one claimant.
 
@@ -117,6 +164,10 @@ exact-match caps and the single-use ledger do not depend on the clock.
 - This document and the implementation share an author. Per handoff §9 the
   threat model and the code require an independent reviewer, which has **not**
   happened yet.
+- No reviewed production release key is evidenced yet. CI and the completed
+  local release gates used a generated test-only key. Before artifact promotion,
+  a named release-key custodian must establish an out-of-band OpenSSH Ed25519
+  trust root and the install host must pin its reviewed public key.
 
 ## Test coverage
 

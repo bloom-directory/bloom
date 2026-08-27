@@ -31,6 +31,7 @@ for required in \
   bin/bloom-broker \
   bin/bloom-signer \
   bin/bloom-signer-migrate \
+  ARTIFACT_CLASS \
   PLATFORM_CLAIM \
   compatibility-v1.toml \
   installer/release/install-linux.sh \
@@ -49,6 +50,74 @@ do
     exit 65
   }
 done
+
+artifact_class="$(<"$payload/ARTIFACT_CLASS")"
+canary_class='solana-mainnet-''canary-v1'
+canary_upper='CAN''ARY'
+canary_lower='can''ary'
+scan_canary_markers() {
+  local mode="$1"
+  local path marker status
+  while IFS= read -r path; do
+    [[ "$mode" == canary &&
+      ("$path" == "$payload/bin/bloom" || "$path" == "$payload/ARTIFACT_CLASS") ]] && continue
+    while IFS= read -r marker; do
+      if LC_ALL=C grep -aF "$marker" "$path" >/dev/null; then
+        echo "forbidden canary marker in ${path#"$payload/"}: $marker" >&2
+        return 1
+      else
+        status=$?
+      fi
+      if [[ "$status" -ne 1 ]]; then
+        echo "failed to scan ${path#"$payload/"} for canary marker: $marker" >&2
+        return 1
+      fi
+    done <<EOF
+BLOOM_MAINNET_${canary_upper}_ARTIFACT
+BLOOM_SOLANA_MAINNET_${canary_upper}_AUTHORIZATION
+NON-PRODUCTION-MAINNET-${canary_upper}
+mainnet-${canary_lower}
+EOF
+  done < <(find "$payload" -type f -print)
+}
+require_canary_machine_markers() {
+  local marker status
+  while IFS= read -r marker; do
+    if LC_ALL=C grep -aF "$marker" "$payload/bin/bloom" >/dev/null; then
+      continue
+    else
+      status=$?
+    fi
+    if [[ "$status" -eq 1 ]]; then
+      echo "canary Machine artifact is missing required marker: $marker" >&2
+    else
+      echo "failed to scan canary Machine artifact for marker: $marker" >&2
+    fi
+    return 1
+  done <<EOF
+BLOOM_MAINNET_${canary_upper}_ARTIFACT
+BLOOM_SOLANA_MAINNET_${canary_upper}_AUTHORIZATION
+NON-PRODUCTION-MAINNET-${canary_upper}
+mainnet-${canary_lower}
+EOF
+}
+case "$artifact_class" in
+  production)
+    scan_canary_markers production
+    ;;
+  "$canary_class")
+    [[ "${BLOOM_ALLOW_SOLANA_MAINNET_CANARY_BUNDLE:-}" == "true" ]] || {
+      echo "Solana mainnet canary bundle verification was not explicitly enabled" >&2
+      exit 65
+    }
+    require_canary_machine_markers
+    scan_canary_markers canary
+    ;;
+  *)
+    echo "bundle has an unknown artifact class" >&2
+    exit 65
+    ;;
+esac
 "$script_dir/ssh-ed25519-verify.sh" \
   "$payload/RELEASE_PUBLIC_KEY.pem" \
   bloom-release-payload-v1 \
@@ -97,6 +166,12 @@ if grep -Eq '^[[:space:]]*(protocol_major|protocol_minor_min|protocol_minor_max)
   exit 65
 fi
 platform_claim="$(<"$payload/PLATFORM_CLAIM")"
+if [[ "$artifact_class" == "$canary_class" &&
+  "$platform_claim" != linux && "$platform_claim" != test-unclaimed ]]
+then
+  echo "the Solana mainnet canary artifact class is supported only on Linux" >&2
+  exit 65
+fi
 case "$platform_claim" in
   linux)
     for binary in bloom bloom-broker bloom-signer bloom-signer-migrate; do

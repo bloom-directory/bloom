@@ -173,6 +173,11 @@ jobs:
           cargo nextest run --archive-file target/nextest-archive.tar.zst \
             -E 'package(bloom-it) and (binary(anvil_e2e) or binary(erc20_e2e))' \
             --no-fail-fast
+      - name: Run signed release-bundle policy tests from archive
+        run: |
+          cargo nextest run --archive-file target/nextest-archive.tar.zst \
+            -E 'package(bloom-it) and binary(triad_release)' \
+            --no-fail-fast
       # Every `solana_*` binary drives a local Agave validator, which this job
       # does not start; they run in the dedicated solana-validator workflow.
       # Matching the prefix rather than one binary name keeps a new Solana
