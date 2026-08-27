@@ -6,7 +6,7 @@ After=bloom-session.service network-online.target
 
 [Service]
 Type=simple
-Environment=BLOOM_NFS_LISTEN=127.0.0.1:18735
+EnvironmentFile=/etc/bloom/%U/machine.env
 Environment=BLOOM_MOUNT_FROM_FSTAB=true
 ExecStart=/usr/bin/bloom serve --mount %h/bloom
 Restart=on-failure

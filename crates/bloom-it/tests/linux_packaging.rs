@@ -134,7 +134,7 @@ fn login_session_sentinel_is_installed_with_persistent_machine_paths() {
 
     let machine = source("systemd-user/bloom-machine.service");
     assert!(machine.contains("ExecStart=/usr/bin/bloom serve --mount %h/bloom"));
-    assert!(machine.contains("Environment=BLOOM_NFS_LISTEN=127.0.0.1:18735"));
+    assert!(machine.contains("EnvironmentFile=/etc/bloom/%U/machine.env"));
     assert!(machine.contains("Environment=BLOOM_MOUNT_FROM_FSTAB=true"));
     assert!(machine.contains("Wants=bloom-session.service"));
     assert!(machine.contains("After=bloom-session.service"));

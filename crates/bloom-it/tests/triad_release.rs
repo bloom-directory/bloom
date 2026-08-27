@@ -1,3 +1,4 @@
+use sha2::{Digest as _, Sha256};
 use std::{
     fs,
     os::unix::fs::PermissionsExt as _,
@@ -275,6 +276,7 @@ fn make_staging(root: &Path) -> PathBuf {
 fn make_installer_payload(root: &Path) -> PathBuf {
     let payload = make_staging(root);
     fs::write(payload.join("SHA256SUMS"), b"test payload\n").unwrap();
+    let release_digest = hex::encode(Sha256::digest(b"test payload\n"));
     fs::copy(
         release_script("compatibility-v1.toml"),
         payload.join("compatibility-v1.toml"),
@@ -297,6 +299,13 @@ fn make_installer_payload(root: &Path) -> PathBuf {
         "config/provenance-catalog.unsigned.json",
         "bin/bloom",
         "bin/bloom-uninstall",
+        "sysusers.d/bloom-login.conf.in",
+        "tmpfiles.d/bloom-login.conf.in",
+        "systemd/bloom-broker-ceremony@.socket",
+        "systemd/bloom-session@.path",
+        "systemd/bloom-broker@.service.in",
+        "systemd/bloom-signer@.service.in",
+        "systemd/instance-dropins/bloom-signer@LOGIN_UID.service.d/50-aws-kms.conf.in",
         "systemd-user/bloom-session.service",
         "systemd-user/bloom-machine.service",
     ] {
@@ -304,6 +313,9 @@ fn make_installer_payload(root: &Path) -> PathBuf {
         fs::create_dir_all(destination.parent().unwrap()).unwrap();
         fs::copy(linux.join(relative), destination).unwrap();
     }
+    let release_installer = payload.join("installer/release/install-linux.sh");
+    fs::create_dir_all(release_installer.parent().unwrap()).unwrap();
+    fs::copy(release_script("install-linux.sh"), release_installer).unwrap();
     fs::create_dir_all(payload.join("config")).unwrap();
     for config in [
         "edge-manifest.json",
@@ -318,6 +330,13 @@ fn make_installer_payload(root: &Path) -> PathBuf {
         "provenance-catalog.json",
     ] {
         fs::write(payload.join("config").join(config), b"{}").unwrap();
+    }
+    for config in ["broker.json", "signer.json"] {
+        fs::write(
+            payload.join("config").join(config),
+            format!(r#"{{"build_digest":"{release_digest}"}}"#),
+        )
+        .unwrap();
     }
     fs::write(
         payload.join("config/edge-manifest.json"),
@@ -1502,8 +1521,12 @@ fn linux_installer_upgrade_rotation_and_confirmed_uninstall_are_staged_safely() 
     assert!(machine_unit.contains("ExecStart=/usr/bin/bloom serve --mount %h/bloom"));
     let fstab = fs::read_to_string(root.join("etc/fstab")).unwrap();
     assert!(fstab.contains(
-        "127.0.0.1:/ /home/alice/bloom nfs4 noauto,user,nosuid,nodev,noexec,actimeo=0,vers=4.1,proto=tcp,port=18735,rsize=65536,wsize=65536,timeo=10 0 0 # x-bloom.login-uid=1000"
+        "127.0.0.1:/ /home/alice/bloom nfs4 noauto,user,nosuid,nodev,noexec,actimeo=0,vers=4.1,proto=tcp,port=20000,rsize=65536,wsize=65536,timeo=10 0 0 # x-bloom.login-uid=1000"
     ));
+    assert_eq!(
+        fs::read_to_string(root.join("etc/bloom/1000/machine.env")).unwrap(),
+        "BLOOM_NFS_LISTEN=127.0.0.1:20000\n"
+    );
     assert!(root.join("home/alice/bloom").is_dir());
     assert_eq!(
         fs::metadata(root.join("home/alice/bloom"))
@@ -1670,7 +1693,12 @@ fn linux_installer_upgrade_rotation_and_confirmed_uninstall_are_staged_safely() 
     fs::write(payload.join("config/edge-manifest.json"), payload_manifest).unwrap();
 
     let rotated = directory.path().join("rotated.json");
-    fs::write(&rotated, b"{\"maximum_connections\":63}").unwrap();
+    let installed_digest = hex::encode(Sha256::digest(b"test payload\n"));
+    fs::write(
+        &rotated,
+        format!(r#"{{"build_digest":"{installed_digest}","maximum_connections":63}}"#),
+    )
+    .unwrap();
     assert!(
         Command::new(&installer)
             .args(["rotate-config"])
@@ -1683,7 +1711,7 @@ fn linux_installer_upgrade_rotation_and_confirmed_uninstall_are_staged_safely() 
     );
     assert_eq!(
         fs::read(root.join("etc/bloom/1000/signer/config.json")).unwrap(),
-        b"{\"maximum_connections\":63}"
+        format!(r#"{{"build_digest":"{installed_digest}","maximum_connections":63}}"#).as_bytes()
     );
 
     for (principal, forbidden) in [
@@ -1849,6 +1877,17 @@ fn linux_installer_authenticates_payload_before_mutating_existing_files() {
     let first_mutation = installer_source.find("installed_config_root=").unwrap();
     assert!(snapshot < verify && verify < first_mutation);
     assert!(installer_source.contains("payload contains a symlink or non-regular entry"));
+    assert!(!installer_source.contains("$script_dir/linux/"));
+    assert!(!installer_source.contains("$script_dir/release/install-linux.sh"));
+    for authenticated_input in [
+        "$payload/installer/release/install-linux.sh",
+        "$payload/installer/linux/sysusers.d/bloom-login.conf.in",
+        "$payload/installer/linux/tmpfiles.d/bloom-login.conf.in",
+        "$payload/installer/linux/systemd/bloom-broker@.service.in",
+        "$payload/installer/linux/systemd/bloom-signer@.service.in",
+    ] {
+        assert!(installer_source.contains(authenticated_input));
+    }
 
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().join("root");
@@ -1899,6 +1938,128 @@ fn linux_installer_authenticates_payload_before_mutating_existing_files() {
             .contains("payload release signature is invalid")
     );
     assert_eq!(fs::read(&installed_binary).unwrap(), b"existing-install");
+}
+
+#[test]
+fn linux_installer_allocates_distinct_ports_and_rejects_mixed_release_sets() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("root");
+    fs::create_dir(&root).unwrap();
+    let payload = make_installer_payload(&directory.path().join("release-a"));
+    let installer = release_script("install-linux.sh");
+    for (uid, user) in [("1000", "alice"), ("2000", "bob")] {
+        let installed = Command::new(&installer)
+            .args(["install"])
+            .arg(&root)
+            .args([uid, user])
+            .arg(&payload)
+            .env("BLOOM_ALLOW_TEST_UNCLAIMED", "true")
+            .output()
+            .unwrap();
+        assert!(
+            installed.status.success(),
+            "{}",
+            String::from_utf8_lossy(&installed.stderr)
+        );
+    }
+    assert_eq!(
+        fs::read_to_string(root.join("etc/bloom/1000/machine.env")).unwrap(),
+        "BLOOM_NFS_LISTEN=127.0.0.1:20000\n"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("etc/bloom/2000/machine.env")).unwrap(),
+        "BLOOM_NFS_LISTEN=127.0.0.1:20001\n"
+    );
+    let fstab = fs::read_to_string(root.join("etc/fstab")).unwrap();
+    assert!(fstab.contains("port=20000") && fstab.contains("port=20001"));
+
+    let installed_binary = root.join("usr/libexec/bloom/bloom-broker");
+    let before = fs::read(&installed_binary).unwrap();
+    let broker_config = root.join("etc/bloom/1000/broker/config.json");
+    let original_broker_config = fs::read(&broker_config).unwrap();
+    fs::write(
+        &broker_config,
+        format!(r#"{{"build_digest":"{}"}}"#, "00".repeat(32)),
+    )
+    .unwrap();
+    let inconsistent = Command::new(&installer)
+        .args(["install"])
+        .arg(&root)
+        .args(["1000", "alice"])
+        .arg(&payload)
+        .env("BLOOM_ALLOW_TEST_UNCLAIMED", "true")
+        .output()
+        .unwrap();
+    assert!(!inconsistent.status.success());
+    assert!(
+        String::from_utf8_lossy(&inconsistent.stderr)
+            .contains("service build digest is inconsistent")
+    );
+    assert_eq!(fs::read(&installed_binary).unwrap(), before);
+    fs::write(&broker_config, original_broker_config).unwrap();
+
+    let other_payload = make_installer_payload(&directory.path().join("release-b"));
+    fs::write(
+        other_payload.join("SHA256SUMS"),
+        b"different signed manifest\n",
+    )
+    .unwrap();
+    fs::write(
+        other_payload.join("bin/bloom-broker"),
+        b"different release broker",
+    )
+    .unwrap();
+    let rejected = Command::new(&installer)
+        .args(["install"])
+        .arg(&root)
+        .args(["3000", "carol"])
+        .arg(&other_payload)
+        .env("BLOOM_ALLOW_TEST_UNCLAIMED", "true")
+        .output()
+        .unwrap();
+    assert!(!rejected.status.success());
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr)
+            .contains("requires the exact release used by every enrollment")
+    );
+    assert_eq!(fs::read(&installed_binary).unwrap(), before);
+    assert!(!root.join("etc/bloom/3000").exists());
+
+    let retained = Command::new(&installer)
+        .args(["uninstall", "--retain-custody"])
+        .arg(&root)
+        .arg("2000")
+        .output()
+        .unwrap();
+    assert!(retained.status.success());
+    let retained_record = fs::read_to_string(root.join("etc/bloom/retained/2000.json")).unwrap();
+    assert!(retained_record.contains("\"release_digest\":"));
+    assert!(retained_record.contains("\"nfs_port\":20001"));
+    let rejected_restore = Command::new(&installer)
+        .args(["install"])
+        .arg(&root)
+        .args(["2000", "bob"])
+        .arg(&other_payload)
+        .env("BLOOM_ALLOW_TEST_UNCLAIMED", "true")
+        .output()
+        .unwrap();
+    assert!(!rejected_restore.status.success());
+    assert!(root.join("etc/bloom/retained/2000.json").is_file());
+}
+
+#[test]
+fn macos_live_installer_verifies_and_reads_a_root_owned_payload_snapshot() {
+    let installer = fs::read_to_string(release_script("install-macos.sh")).unwrap();
+    let snapshot = installer.find("snapshot_live_payload;").unwrap();
+    let verify = installer.find("paths; verify_payload;").unwrap();
+    assert!(snapshot < verify);
+    assert!(
+        installer.contains(
+            "payload_scratch=\"$(mktemp -d /private/var/tmp/bloom-macos-payload.XXXXXX)\""
+        )
+    );
+    assert!(installer.contains("payload=\"$payload_scratch\""));
+    assert!(installer.contains("payload contains a symlink or non-regular entry"));
 }
 
 #[test]

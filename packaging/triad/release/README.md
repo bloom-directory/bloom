@@ -144,7 +144,7 @@ packaged public templates and the host CSPRNG; it does not require site-specific
 private identity inputs. It enables a login-user Machine service that maintains
 the `~/bloom` mount without interactive sudo by installing one exact
 `user,nosuid,nodev,noexec` loopback-NFS fstab authorization, including the fixed
-`127.0.0.1:18735` listener and complete NFS option set; no Bloom process is
+per-login loopback listener and complete NFS option set; no Bloom process is
 given root identity or broad mount capability. It remains an operator-integration prerelease because
 the Linux release lane does not yet prove live installed systemd health on a
 disposable host. The website must remain pinned to v0.1.3 until that acceptance
@@ -155,8 +155,17 @@ separately obtained, root-owned, non-writable copy of
 `bloom-release-v1.pub`. Before stopping services or writing installation
 state, the installer verifies that pin against `RELEASE_PUBLIC_KEY.pem`,
 verifies the `bloom-release-payload-v1` signature over `SHA256SUMS`, and then
-verifies every listed payload file. The public key is data, not another time
+verifies every listed payload file from a private root-owned snapshot. Every
+installed executable, unit, account template, and configuration template is
+read from that verified snapshot. The public key is data, not another time
 service or software package.
+
+Linux binaries are shared by all enrolled logins, so an install first requires
+every active or retained enrollment and both service configurations to name the
+candidate release digest. Digest-distinct reinstall and restore are rejected
+before services stop or files change; a future Linux release upgrade requires a
+separate coordinated host-wide transaction. Retained records preserve the exact
+release digest and allocated NFS port.
 
 Linux installs provide `bloom-uninstall`. Its default `--retain-custody` mode
 stops and disables the selected enrollment, removes runtime integration, and
@@ -182,7 +191,9 @@ directory. Bundle build and verification reject concrete private seeds and
 identity-shaped JSON for a production macOS claim.
 
 The macOS installer stages an immutable release before stopping any installed
-triad. It then journals the old and new digests, stops every enrollment before
+triad. A live install first copies the candidate into a private root-owned
+snapshot and authenticates and installs exclusively from that snapshot. It then
+journals the old and new digests, stops every enrollment before
 the shared atomic `current` switch, updates build-digest state, and validates
 each installed triad before publishing all enrollments active. Failed activation
 and a transaction found after interruption restore the old release, integration
