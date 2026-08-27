@@ -4055,7 +4055,13 @@ mod tests {
                             public_key_fingerprint: bloom_broker_api::Digest32::from_bytes(
                                 sha2::Sha256::digest(&child_spki).into(),
                             ),
-                            derivation: None,
+                            derivation: Some(bloom_broker_api::DerivationRef::Bip39Multicurve {
+                                wallet_seed_ref: bloom_broker_api::Token::new("wallet-seed")
+                                    .unwrap(),
+                                profile:
+                                    bloom_broker_api::DerivationProfile::Bip44SolanaSlip10Ed25519V1,
+                                path: "m/44'/501'/0'/0'".into(),
+                            }),
                         };
                         Ok(bloom_broker_api::MachineBrokerResponse::WalletAccounts(
                             bloom_broker_api::WalletAccountsPublic {
