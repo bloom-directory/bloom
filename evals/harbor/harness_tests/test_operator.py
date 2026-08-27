@@ -297,6 +297,39 @@ class PolicyRecoveryTests(unittest.TestCase):
         self.assertEqual(self.definition._read_json.call_count, 2)
         sleep.assert_called_once_with(0.5)
 
+    def test_policy_replay_retries_only_known_previous_bytes(self) -> None:
+        target = dict(self.original, allowed_petal_packages=["b" * 64])
+        target_bytes = canonical_json(target)
+        previous_bytes = canonical_json(self.original)
+        failed = SimpleNamespace(returncode=1, stdout=b"", stderr=b"")
+        succeeded = SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+        self.definition._write_route = mock.Mock(side_effect=[failed, succeeded])
+        self.lifecycle._read_policy = mock.Mock(
+            return_value=(self.original, previous_bytes)
+        )
+        self.lifecycle._wait_for_policy_commit = mock.Mock()
+        with mock.patch("harness.operator.time.sleep") as sleep:
+            self.lifecycle._commit_policy_replay(
+                target_bytes, target_bytes, previous_bytes
+            )
+        self.assertEqual(self.definition._write_route.call_count, 2)
+        self.lifecycle._wait_for_policy_commit.assert_called_once_with(
+            target_bytes, previous_bytes
+        )
+        sleep.assert_called_once_with(0.5)
+
+    def test_policy_replay_accepts_exact_target_after_nonzero_write(self) -> None:
+        target = dict(self.original, allowed_petal_packages=["b" * 64])
+        target_bytes = canonical_json(target)
+        self.definition._write_route = mock.Mock(
+            return_value=SimpleNamespace(returncode=1, stdout=b"", stderr=b"")
+        )
+        self.lifecycle._read_policy = mock.Mock(return_value=(target, target_bytes))
+        self.lifecycle._commit_policy_replay(
+            target_bytes, target_bytes, canonical_json(self.original)
+        )
+        self.definition._write_route.assert_called_once()
+
     def test_init_rejects_matching_pending_owner_request(self) -> None:
         request_root = self.root / "mount/petal-signing-requests"
         request_root.mkdir(parents=True)

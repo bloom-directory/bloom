@@ -408,6 +408,40 @@ class PolicyLifecycle:
             ) from last_read_error
         raise EvalError("exact policy commit did not become visible")
 
+    def _commit_policy_replay(
+        self, target: bytes, expected: bytes, previous: bytes
+    ) -> None:
+        last_read_error: EvalError | None = None
+        for attempt in range(5):
+            replay = self.definition._write_route(self.policy_path, target, 120)
+            if replay.returncode == 0:
+                self._wait_for_policy_commit(expected, previous)
+                return
+            # A failed mounted write is ambiguous: the asynchronous command
+            # may still have reached Machine. Resolve that ambiguity from the
+            # canonical Broker-backed projection before replaying exact bytes.
+            try:
+                _, current = self._read_policy()
+            except EvalError as error:
+                last_read_error = error
+            else:
+                last_read_error = None
+                if current == expected:
+                    return
+                if current != previous:
+                    raise EvalError(
+                        "wallet policy changed to unexpected canonical bytes"
+                    )
+            if attempt + 1 < 5:
+                time.sleep(0.5)
+        if last_read_error is not None:
+            raise EvalError(
+                "completed policy replay remained ambiguous after transient read failures"
+            ) from last_read_error
+        raise EvalError(
+            "completed policy could not be committed by bounded byte-identical replay"
+        )
+
     def apply(self, target: bytes) -> None:
         expected = json.loads(target)
         expected_bytes = canonical_json(expected)
@@ -460,12 +494,7 @@ class PolicyLifecycle:
                 f"policy ceremony failed at counter {counter}; "
                 f"next candidate is {counter + 1}"
             )
-        replay = self.definition._write_route(self.policy_path, target, 120)
-        if replay.returncode != 0:
-            raise EvalError(
-                "completed policy could not be committed by byte-identical replay"
-            )
-        self._wait_for_policy_commit(expected_bytes, previous_bytes)
+        self._commit_policy_replay(target, expected_bytes, previous_bytes)
 
     def activate(self) -> None:
         original, original_bytes = self._read_policy()
