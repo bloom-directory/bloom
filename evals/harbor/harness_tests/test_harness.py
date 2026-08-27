@@ -333,6 +333,24 @@ class HyperliquidDefinitionTests(unittest.TestCase):
             )
         run.assert_called_once()
 
+    def test_direct_write_preserves_owner_ceremony_response(self) -> None:
+        transport = VfsTransport(self.mount, self.direct_vfs_env())
+        denied = subprocess.CompletedProcess(
+            [], 1, b"", b"PermissionError: [Errno 1] Operation not permitted"
+        )
+        ceremony = subprocess.CompletedProcess(
+            [], 1, b"owner ceremony required", b""
+        )
+        with mock.patch.object(
+            hyperliquid_order_cancel.subprocess,
+            "run",
+            side_effect=[denied, ceremony],
+        ):
+            result = transport.write(
+                self.mount / "wallets/eval/policy.json", b"{}", 12
+            )
+        self.assertIs(result, ceremony)
+
     def test_list_fallback_parses_supported_vfs_cli_format(self) -> None:
         transport = VfsTransport(self.mount, self.direct_vfs_env())
         direct = subprocess.CompletedProcess(

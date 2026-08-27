@@ -7,6 +7,7 @@ out/
 /evals/harbor/operator-state*.json
 /evals/harbor/*policy-backup*.json
 /evals/harbor/harbor-summaries/
+/evals/harbor/harbor-mainnet.lock
 
 # Generated Python bytecode.
 __pycache__/

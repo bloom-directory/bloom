@@ -149,7 +149,11 @@ class VfsTransport:
             raise
         except (OSError, subprocess.SubprocessError) as error:
             raise EvalError(f"direct VFS {operation} transport failed") from error
-        if completed.returncode != 0:
+        # Route writes may legitimately return a nonzero status while publishing
+        # an owner ceremony. Callers must inspect that result and drive the
+        # ceremony; treating it as a transport failure loses the durable
+        # challenge even though dispatch already occurred.
+        if completed.returncode != 0 and operation != "write":
             raise EvalError(f"direct VFS {operation} failed")
         return completed
 
