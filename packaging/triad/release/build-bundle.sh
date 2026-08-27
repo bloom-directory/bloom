@@ -232,7 +232,8 @@ for identity in \
 do
   binary="${identity%%:*}"
   expected="${identity#*:}"
-  actual="$("$staging/bin/$binary" --version | awk '{print $2}')"
+  version_line="$("$staging/bin/$binary" --version | sed -n '1p')"
+  actual="$(awk -v binary="$binary" '$1 == binary && NF == 2 { print $2 }' <<<"$version_line")"
   [[ "$actual" == "$expected" ]] || {
     echo "$binary version $actual is outside the compatibility matrix ($expected)" >&2
     exit 65
