@@ -255,6 +255,33 @@ class PolicyRecoveryTests(unittest.TestCase):
             self.lifecycle.apply(target)
         self.assertEqual(self.store.read()["next_sign_count"], 8)
 
+    def test_policy_commit_retries_read_error_and_known_previous_bytes(self) -> None:
+        target = dict(self.original, allowed_petal_packages=["b" * 64])
+        expected = canonical_json(target)
+        previous = canonical_json(self.original)
+        self.lifecycle._read_policy = mock.Mock(
+            side_effect=[
+                EvalError("transient mounted read"),
+                (self.original, previous),
+                (target, expected),
+            ]
+        )
+        with mock.patch("harness.operator.time.sleep") as sleep:
+            self.lifecycle._wait_for_policy_commit(expected, previous)
+        self.assertEqual(self.lifecycle._read_policy.call_count, 3)
+        self.assertEqual(sleep.call_count, 2)
+
+    def test_policy_commit_rejects_unexpected_canonical_bytes(self) -> None:
+        target = dict(self.original, allowed_petal_packages=["b" * 64])
+        unexpected = dict(self.original, required_verifiers=["unexpected"])
+        self.lifecycle._read_policy = mock.Mock(
+            return_value=(unexpected, canonical_json(unexpected))
+        )
+        with self.assertRaisesRegex(EvalError, "unexpected canonical bytes"):
+            self.lifecycle._wait_for_policy_commit(
+                canonical_json(target), canonical_json(self.original)
+            )
+
     def test_init_rejects_matching_pending_owner_request(self) -> None:
         request_root = self.root / "mount/petal-signing-requests"
         request_root.mkdir(parents=True)

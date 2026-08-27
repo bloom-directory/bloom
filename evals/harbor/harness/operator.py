@@ -381,17 +381,46 @@ class PolicyLifecycle:
             time.sleep(0.5)
         return None
 
+    def _wait_for_policy_commit(self, expected: bytes, previous: bytes) -> None:
+        last_read_error: EvalError | None = None
+        for attempt in range(60):
+            try:
+                _, current = self._read_policy()
+            except EvalError as error:
+                # Mounted policy reads can transiently fail while the
+                # asynchronous command handler publishes the Broker-backed
+                # projection. Retry only within this bounded commit window.
+                last_read_error = error
+            else:
+                last_read_error = None
+                if current == expected:
+                    return
+                if current != previous:
+                    raise EvalError(
+                        "wallet policy changed to unexpected canonical bytes"
+                    )
+            if attempt + 1 < 60:
+                time.sleep(0.2)
+        if last_read_error is not None:
+            raise EvalError(
+                "exact policy commit did not become visible after transient read failures"
+            ) from last_read_error
+        raise EvalError("exact policy commit did not become visible")
+
     def apply(self, target: bytes) -> None:
         expected = json.loads(target)
-        current, _ = self._read_policy()
-        if current == expected:
+        expected_bytes = canonical_json(expected)
+        if target.rstrip(b"\n") != expected_bytes:
+            raise EvalError("policy update target is not canonical JSON")
+        _, previous_bytes = self._read_policy()
+        if previous_bytes == expected_bytes:
             return
-        digest = hashlib.sha256(target.rstrip(b"\n")).hexdigest()
+        digest = hashlib.sha256(expected_bytes).hexdigest()
         self.definition._write_route(self.policy_path, target, 120)
         challenge = self._wait_challenge(digest)
         if challenge is None:
-            current, _ = self._read_policy()
-            if current == expected:
+            _, current_bytes = self._read_policy()
+            if current_bytes == expected_bytes:
                 return
             raise EvalError("no matching policy-update ceremony was published")
         operation_id = challenge.get("operation_id")
@@ -435,12 +464,7 @@ class PolicyLifecycle:
             raise EvalError(
                 "completed policy could not be committed by byte-identical replay"
             )
-        for _ in range(60):
-            current, _ = self._read_policy()
-            if current == expected:
-                return
-            time.sleep(0.2)
-        raise EvalError("policy commit did not become visible")
+        self._wait_for_policy_commit(expected_bytes, previous_bytes)
 
     def activate(self) -> None:
         original, original_bytes = self._read_policy()
