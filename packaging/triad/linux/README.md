@@ -30,9 +30,13 @@ mounts its VFS at `~/bloom` for the lifetime of the login session. NFS mounts
 normally require privilege, so the installer adds one exact `/etc/fstab`
 authorization from `127.0.0.1:/` to that login's `~/bloom` with
 `noauto,user,nosuid,nodev,noexec` and the complete fixed-port NFS option set.
-The packaged Machine listens only on `127.0.0.1:18735` and asks the existing
-system mount helper to resolve `~/bloom` from fstab; it cannot supply a different
-source, target, port, or mount option. Machine still runs as the login principal
+The installer allocates a distinct loopback port for every enrolled login,
+records it in the root-owned enrollment and Machine environment, and renders the
+same port into that login's fstab authorization. The packaged Machine asks the
+existing system mount helper to resolve `~/bloom` from fstab; it cannot supply a
+different source, target, port, or mount option. Before mounting, Machine
+detects and force-detaches only the expected stale loopback NFS mount; a foreign
+filesystem at `~/bloom` is rejected. Machine still runs as the login principal
 and receives neither a sudoers rule nor `CAP_SYS_ADMIN`. The service deliberately
 does not block the distribution's setuid mount helper, because that helper is
 what enforces the exact fstab delegation. The unit therefore cannot use systemd

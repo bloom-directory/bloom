@@ -25,6 +25,7 @@ action="$1"; shift
 live=false
 lock=""
 scratch=""
+payload_scratch=""
 created_users=""
 created_groups=""
 upgrade_transaction=""
@@ -41,6 +42,7 @@ cleanup() {
     rollback_upgrade || echo "automatic macOS upgrade rollback remains incomplete" >&2
   fi
   [[ -z "$scratch" || ! -d "$scratch" ]] || rm -rf -- "$scratch"
+  [[ -z "$payload_scratch" || ! -d "$payload_scratch" ]] || rm -rf -- "$payload_scratch"
   if ((rc != 0)) && $live; then
     for user in $created_users; do dscl . -delete "/Users/$user" 2>/dev/null || true; done
     for group in $created_groups; do dscl . -delete "/Groups/$group" 2>/dev/null || true; done
@@ -71,6 +73,20 @@ lock_installer() {
     rm -f "$lock/pid"; rmdir "$lock" || exit 75; mkdir -m 0700 "$lock" || exit 75
   fi
   chown root:wheel "$lock"; printf '%s\n' "$$" >"$lock/pid"; chmod 0600 "$lock/pid"
+}
+
+snapshot_live_payload() {
+  local source_payload="$payload"
+  payload_scratch="$(mktemp -d /private/var/tmp/bloom-macos-payload.XXXXXX)"
+  chmod 0700 "$payload_scratch"
+  cp -R "$source_payload/." "$payload_scratch/"
+  if find "$payload_scratch" \
+    \( -type l -o \( ! -type f ! -type d \) \) -print -quit | grep -q .
+  then
+    die "payload contains a symlink or non-regular entry"
+  fi
+  chown -R root:wheel "$payload_scratch"
+  payload="$payload_scratch"
 }
 
 field() {
@@ -232,6 +248,20 @@ has_active_enrollments() {
     [[ -f "$record" && ! -L "$record" ]] && return 0
   done
   return 1
+}
+
+validate_active_release_set() {
+  local expected_digest="$1" record state digest
+  for record in "$enrollments"/*.json; do
+    [[ -e "$record" || -L "$record" ]] || continue
+    [[ -f "$record" && ! -L "$record" ]] || die "installed enrollment record is unsafe"
+    [[ "$(field "$record" schema)" == bloom.macos-enrollment.1 ]] || die "unsupported installed enrollment schema"
+    state="$(field "$record" state)"
+    [[ "$state" == active || "$state" == activating ]] || die "installed enrollment set is not active"
+    digest="$(field "$record" release_digest)"
+    [[ "$expected_digest" =~ ^[0-9a-f]{64}$ && "$digest" == "$expected_digest" ]] ||
+      die "installed enrollment set does not match the shared release"
+  done
 }
 
 pf_reference() {
@@ -543,11 +573,12 @@ case "$action" in
   install|restore)
     [[ $# -eq 4 ]] || usage; root_and_uid "$1" "$2"; login_user="$3"; payload="$(cd "$4" && pwd -P)"
     [[ "$login_user" =~ ^[a-z_][a-z0-9_-]*$ ]] || { echo "unsafe LOGIN_USER" >&2; exit 64; }
-    $live && { lock_installer; [[ "$(id -u "$login_user")" == "$login_uid" ]] || die "LOGIN_USER does not match LOGIN_UID"; launchctl print "gui/$login_uid" >/dev/null 2>&1 || die "LOGIN_USER has no active GUI domain"; }
+    $live && { lock_installer; [[ "$(id -u "$login_user")" == "$login_uid" ]] || die "LOGIN_USER does not match LOGIN_UID"; launchctl print "gui/$login_uid" >/dev/null 2>&1 || die "LOGIN_USER has no active GUI domain"; snapshot_live_payload; }
     requested_uid="$login_uid"; requested_user="$login_user"; load_names; paths; verify_payload; preflight_compatibility
     recover_interrupted_upgrade
     login_uid="$requested_uid"; login_user="$requested_user"; load_names; paths
     shared_digest="$(current_release_digest)"
+    validate_active_release_set "$shared_digest"
     had_active=false; has_active_enrollments && had_active=true
     if [[ "$action" == restore && "$had_active" == true && "$shared_digest" != "$BLOOM_RELEASE_DIGEST" ]]; then
       die "restore cannot change the shared release used by active enrollments"

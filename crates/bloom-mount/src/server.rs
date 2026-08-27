@@ -33,6 +33,12 @@ const FSTAB_UMOUNT_COMMAND_TIMEOUT: Duration = Duration::from_secs(15);
 
 type CommandAttempt = (String, Vec<String>);
 
+#[derive(Debug, PartialEq, Eq)]
+struct MountedFilesystem {
+    source: String,
+    filesystem_type: String,
+}
+
 fn unmount_args(path: &Path) -> Vec<String> {
     #[cfg(target_os = "linux")]
     {
@@ -125,6 +131,122 @@ fn run_command_attempts(
         }
     }
     Err(MountError::Mount(errors.join("; ")))
+}
+
+#[cfg(target_os = "linux")]
+fn mounted_filesystem(path: &Path) -> Result<Option<MountedFilesystem>, MountError> {
+    let args = vec![
+        "--noheadings".to_string(),
+        "--output".to_string(),
+        "SOURCE,FSTYPE".to_string(),
+        "--mountpoint".to_string(),
+        path.display().to_string(),
+    ];
+    let output = run_command_with_timeout("findmnt", &args, UMOUNT_COMMAND_TIMEOUT)?;
+    if output.status.code() == Some(1) {
+        return Ok(None);
+    }
+    if !output.status.success() {
+        return Err(MountError::Mount(format!(
+            "findmnt failed for {}: {}",
+            path.display(),
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut fields = stdout.split_whitespace();
+    let source = fields.next().unwrap_or_default();
+    let filesystem_type = fields.next().unwrap_or_default();
+    if source.is_empty() || filesystem_type.is_empty() || fields.next().is_some() {
+        return Err(MountError::Mount(format!(
+            "findmnt returned an ambiguous mount for {}",
+            path.display()
+        )));
+    }
+    Ok(Some(MountedFilesystem {
+        source: source.to_string(),
+        filesystem_type: filesystem_type.to_string(),
+    }))
+}
+
+#[cfg(target_os = "macos")]
+fn mounted_filesystem(path: &Path) -> Result<Option<MountedFilesystem>, MountError> {
+    let output = run_command_with_timeout("mount", &[], UMOUNT_COMMAND_TIMEOUT)?;
+    if !output.status.success() {
+        return Err(MountError::Mount(format!(
+            "mount listing failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+    let marker = format!(" on {} (", path.display());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut matches = stdout.lines().filter_map(|line| {
+        let (source, suffix) = line.split_once(&marker)?;
+        let filesystem_type = suffix.split(',').next()?.trim_end_matches(')').trim();
+        Some(MountedFilesystem {
+            source: source.to_string(),
+            filesystem_type: filesystem_type.to_string(),
+        })
+    });
+    let mounted = matches.next();
+    if matches.next().is_some() {
+        return Err(MountError::Mount(format!(
+            "mount returned multiple filesystems for {}",
+            path.display()
+        )));
+    }
+    Ok(mounted)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn mounted_filesystem(_path: &Path) -> Result<Option<MountedFilesystem>, MountError> {
+    Ok(None)
+}
+
+fn validate_stale_mount(mounted: &MountedFilesystem, cfg: &MountConfig) -> Result<(), MountError> {
+    let expected_source = format!("{}:/", cfg.nfs_listen.ip());
+    if mounted.source == expected_source && mounted.filesystem_type.starts_with("nfs") {
+        return Ok(());
+    }
+    Err(MountError::Config(format!(
+        "mount path {} contains foreign filesystem {} ({})",
+        cfg.mount_path.display(),
+        mounted.source,
+        mounted.filesystem_type
+    )))
+}
+
+fn stale_unmount_attempts(path: &Path, from_fstab: bool) -> Vec<CommandAttempt> {
+    if cfg!(target_os = "linux") && from_fstab {
+        return vec![(
+            "umount".to_string(),
+            vec![
+                "-f".to_string(),
+                "-l".to_string(),
+                path.display().to_string(),
+            ],
+        )];
+    }
+    unmount_attempts(path, from_fstab)
+}
+
+fn reconcile_stale_mount(cfg: &MountConfig, from_fstab: bool) -> Result<(), MountError> {
+    let Some(mounted) = mounted_filesystem(&cfg.mount_path)? else {
+        return Ok(());
+    };
+    validate_stale_mount(&mounted, cfg)?;
+    run_command_attempts(
+        stale_unmount_attempts(&cfg.mount_path, from_fstab),
+        FSTAB_UMOUNT_COMMAND_TIMEOUT,
+    )?;
+    if mounted_filesystem(&cfg.mount_path)?.is_some() {
+        return Err(MountError::Mount(format!(
+            "stale NFS mount remains at {}",
+            cfg.mount_path.display()
+        )));
+    }
+    info!(mount_path = %cfg.mount_path.display(), "mount.stale_reconciled");
+    Ok(())
 }
 
 fn linux_mount_fallback_args(cfg: &MountConfig, server: SocketAddr) -> Vec<String> {
@@ -313,6 +435,11 @@ async fn serve_nfs_config(
             cfg.mount_path.display()
         )));
     }
+
+    let reconcile_cfg = cfg.clone();
+    tokio::task::spawn_blocking(move || reconcile_stale_mount(&reconcile_cfg, from_fstab))
+        .await
+        .map_err(|e| MountError::Mount(format!("stale mount reconciliation join: {e}")))??;
 
     // Bind the embednfs server on the requested address. Resolve the
     // OS-assigned port immediately so we can wire it into the mount
@@ -572,6 +699,49 @@ mod tests {
         assert_eq!(
             attempts,
             vec![("umount".to_string(), vec!["/home/alice/bloom".to_string()])]
+        );
+    }
+
+    #[test]
+    fn stale_mount_validation_accepts_only_the_expected_loopback_nfs_export() {
+        let cfg = MountConfig {
+            mount_path: PathBuf::from("/home/alice/bloom"),
+            nfs_listen: "127.0.0.1:20000".parse().unwrap(),
+            readonly: false,
+        };
+        let expected = MountedFilesystem {
+            source: "127.0.0.1:/".to_string(),
+            filesystem_type: "nfs4".to_string(),
+        };
+        assert!(validate_stale_mount(&expected, &cfg).is_ok());
+
+        let foreign = MountedFilesystem {
+            source: "/dev/sda1".to_string(),
+            filesystem_type: "ext4".to_string(),
+        };
+        let error = validate_stale_mount(&foreign, &cfg).unwrap_err();
+        assert!(error.to_string().contains("foreign filesystem"));
+    }
+
+    #[test]
+    fn stale_fstab_mount_is_force_detached_by_exact_target() {
+        let attempts = stale_unmount_attempts(Path::new("/home/alice/bloom"), true);
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            attempts,
+            vec![(
+                "umount".to_string(),
+                vec![
+                    "-f".to_string(),
+                    "-l".to_string(),
+                    "/home/alice/bloom".to_string(),
+                ],
+            )]
+        );
+        #[cfg(not(target_os = "linux"))]
+        assert_eq!(
+            attempts,
+            vec![("umount".to_string(), vec!["/home/alice/bloom".to_string()],)]
         );
     }
 

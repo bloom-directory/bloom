@@ -15,7 +15,6 @@ EOF
 [[ $# -ge 1 ]] || usage
 action="$1"
 shift
-script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 payload_scratch=""
 enrollment_scratch=""
 
@@ -184,6 +183,7 @@ install_linux_mount_authorization() {
   local mount_uid="$2"
   local mount_gid="$3"
   local login_home="$4"
+  local nfs_port="$5"
   local fstab="$install_root/etc/fstab"
   local marker="x-bloom.login-uid=$mount_uid"
   local mount_path="${login_home%/}/bloom"
@@ -226,9 +226,137 @@ install_linux_mount_authorization() {
     chmod 0644 "$replacement"
   fi
   escaped_mount_path="$(fstab_escape_path "$mount_path")"
-  printf '127.0.0.1:/ %s nfs4 noauto,user,nosuid,nodev,noexec,actimeo=0,vers=4.1,proto=tcp,port=18735,rsize=65536,wsize=65536,timeo=10 0 0 # %s\n' \
-    "$escaped_mount_path" "$marker" >> "$replacement"
+  [[ "$nfs_port" =~ ^[0-9]+$ ]] && ((nfs_port >= 20000 && nfs_port <= 60999)) || {
+    echo "Bloom NFS port is outside the enrolled range" >&2
+    return 65
+  }
+  printf '127.0.0.1:/ %s nfs4 noauto,user,nosuid,nodev,noexec,actimeo=0,vers=4.1,proto=tcp,port=%s,rsize=65536,wsize=65536,timeo=10 0 0 # %s\n' \
+    "$escaped_mount_path" "$nfs_port" "$marker" >> "$replacement"
   mv -f "$replacement" "$fstab"
+}
+
+linux_record_string() {
+  local record="$1"
+  local key="$2"
+  sed -n "s/.*\"$key\":\"\([^\"]*\)\".*/\1/p" "$record"
+}
+
+linux_record_number() {
+  local record="$1"
+  local key="$2"
+  sed -n "s/.*\"$key\":\([0-9][0-9]*\).*/\1/p" "$record"
+}
+
+validate_linux_release_set() {
+  local install_root="$1"
+  local candidate_digest="$2"
+  local directory record filename_uid record_uid record_state record_digest record_port counterpart
+  local principal service_config service_digest prior_uid
+  local -A port_owners=()
+
+  for directory in enrollments retained; do
+    for record in "$install_root/etc/bloom/$directory"/*.json; do
+      [[ -e "$record" || -L "$record" ]] || continue
+      [[ -f "$record" && ! -L "$record" ]] || {
+        echo "installed Linux enrollment record is unsafe" >&2
+        return 65
+      }
+      filename_uid="${record##*/}"
+      filename_uid="${filename_uid%.json}"
+      record_uid="$(linux_record_number "$record" login_uid)"
+      record_state="$(linux_record_string "$record" state)"
+      record_digest="$(linux_record_string "$record" release_digest)"
+      record_port="$(linux_record_number "$record" nfs_port)"
+      [[ "$(linux_record_string "$record" schema)" == bloom.linux-enrollment.1 && \
+        "$record_uid" == "$filename_uid" && "$record_uid" =~ ^[1-9][0-9]*$ && \
+        "$record_digest" =~ ^[0-9a-f]{64}$ && \
+        "$record_port" =~ ^[0-9]+$ ]] || {
+        echo "installed Linux enrollment record is malformed" >&2
+        return 65
+      }
+      if [[ "$directory" == enrollments ]]; then
+        [[ "$record_state" == active ]] || {
+          echo "installed Linux enrollment is not active" >&2
+          return 65
+        }
+      else
+        [[ "$record_state" == retained ]] || {
+          echo "retained Linux enrollment record is invalid" >&2
+          return 65
+        }
+      fi
+      ((record_port >= 20000 && record_port <= 60999)) || {
+        echo "installed Linux enrollment NFS port is invalid" >&2
+        return 65
+      }
+      prior_uid="${port_owners[$record_port]:-}"
+      [[ -z "$prior_uid" || "$prior_uid" == "$record_uid" ]] || {
+        echo "installed Linux enrollments reuse an NFS port" >&2
+        return 65
+      }
+      port_owners[$record_port]="$record_uid"
+      [[ "$record_digest" == "$candidate_digest" ]] || {
+        echo "Linux installation requires the exact release used by every enrollment" >&2
+        return 65
+      }
+      for principal in broker signer; do
+        service_config="$install_root/etc/bloom/$record_uid/$principal/config.json"
+        [[ -f "$service_config" && ! -L "$service_config" ]] || {
+          echo "installed Linux enrollment is incomplete; refusing replacement" >&2
+          return 65
+        }
+        service_digest="$(linux_record_string "$service_config" build_digest)"
+        [[ "$service_digest" == "$record_digest" ]] || {
+          echo "installed Linux service build digest is inconsistent" >&2
+          return 65
+        }
+      done
+      counterpart=retained
+      [[ "$directory" == retained ]] && counterpart=enrollments
+      [[ ! -e "$install_root/etc/bloom/$counterpart/$filename_uid.json" && \
+        ! -L "$install_root/etc/bloom/$counterpart/$filename_uid.json" ]] || {
+        echo "Linux login has both active and retained enrollment records" >&2
+        return 65
+      }
+    done
+  done
+}
+
+allocate_linux_nfs_port() {
+  local install_root="$1"
+  local selected_uid="$2"
+  local record record_uid record_port candidate used
+
+  for record in \
+    "$install_root/etc/bloom/enrollments/$selected_uid.json" \
+    "$install_root/etc/bloom/retained/$selected_uid.json"
+  do
+    if [[ -f "$record" && ! -L "$record" ]]; then
+      linux_record_number "$record" nfs_port
+      return 0
+    fi
+  done
+  for ((candidate = 20000; candidate <= 60999; candidate++)); do
+    used=false
+    for record in \
+      "$install_root/etc/bloom/enrollments"/*.json \
+      "$install_root/etc/bloom/retained"/*.json
+    do
+      [[ -f "$record" && ! -L "$record" ]] || continue
+      record_uid="$(linux_record_number "$record" login_uid)"
+      record_port="$(linux_record_number "$record" nfs_port)"
+      if [[ "$record_uid" != "$selected_uid" && "$record_port" == "$candidate" ]]; then
+        used=true
+        break
+      fi
+    done
+    if [[ "$used" == false ]]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  echo "no per-login Bloom NFS port is available" >&2
+  return 69
 }
 
 remove_linux_mount_authorization() {
@@ -416,14 +544,29 @@ case "$action" in
       installer/linux/config/provenance-catalog.unsigned.json \
       installer/linux/bin/bloom \
       installer/linux/bin/bloom-uninstall \
+      installer/linux/sysusers.d/bloom-login.conf.in \
+      installer/linux/tmpfiles.d/bloom-login.conf.in \
+      installer/linux/systemd/bloom-broker-ceremony@.socket \
+      installer/linux/systemd/bloom-session@.path \
+      installer/linux/systemd/bloom-broker@.service.in \
+      installer/linux/systemd/bloom-signer@.service.in \
+      installer/linux/systemd/instance-dropins/bloom-signer@LOGIN_UID.service.d/50-aws-kms.conf.in \
       installer/linux/systemd-user/bloom-session.service \
-      installer/linux/systemd-user/bloom-machine.service
+      installer/linux/systemd-user/bloom-machine.service \
+      installer/release/install-linux.sh
     do
       [[ -f "$payload/$required" && ! -L "$payload/$required" ]] || {
         echo "payload is missing $required" >&2
         exit 66
       }
     done
+    release_digest="$(sha256_digest "$payload/SHA256SUMS")"
+    [[ "$release_digest" =~ ^[0-9a-f]{64}$ ]] || {
+      echo "signed payload release digest is invalid" >&2
+      exit 65
+    }
+    validate_linux_release_set "$root" "$release_digest"
+    nfs_port="$(allocate_linux_nfs_port "$root" "$login_uid")"
     installed_config_root="$root/etc/bloom/$login_uid"
     installed_state_root="$root/var/lib/bloom/$login_uid"
     fresh_install=true
@@ -441,7 +584,8 @@ case "$action" in
         machine/revoke-identity.json \
         session/identity.json \
         installer-identity.json \
-        provenance-catalog.json
+        provenance-catalog.json \
+        machine.env
       do
         [[ -f "$installed_config_root/$installed_relative" && \
           ! -L "$installed_config_root/$installed_relative" ]] || {
@@ -479,7 +623,7 @@ case "$action" in
       "$root/usr/bin/bloom-uninstall" \
       0755
     atomic_install \
-      "$script_dir/release/install-linux.sh" \
+      "$payload/installer/release/install-linux.sh" \
       "$binary_root/bloom-linux-maintenance" \
       0755
 
@@ -489,24 +633,24 @@ case "$action" in
     sed \
       -e "s/@LOGIN_UID@/$login_uid/g" \
       -e "s/@LOGIN_USER@/$login_user/g" \
-      "$script_dir/linux/sysusers.d/bloom-login.conf.in" > "$sysusers.new"
+      "$payload/installer/linux/sysusers.d/bloom-login.conf.in" > "$sysusers.new"
     chmod 0644 "$sysusers.new"
     mv -f "$sysusers.new" "$sysusers"
     sed \
       -e "s/@LOGIN_UID@/$login_uid/g" \
       -e "s/@LOGIN_GID@/$login_gid/g" \
-      "$script_dir/linux/tmpfiles.d/bloom-login.conf.in" > "$tmpfiles.new"
+      "$payload/installer/linux/tmpfiles.d/bloom-login.conf.in" > "$tmpfiles.new"
     chmod 0644 "$tmpfiles.new"
     mv -f "$tmpfiles.new" "$tmpfiles"
 
     unit_root="$root/usr/lib/systemd/system"
     mkdir -p "$unit_root"
     atomic_install \
-      "$script_dir/linux/systemd/bloom-broker-ceremony@.socket" \
+      "$payload/installer/linux/systemd/bloom-broker-ceremony@.socket" \
       "$unit_root/bloom-broker-ceremony@.socket" \
       0644
     atomic_install \
-      "$script_dir/linux/systemd/bloom-session@.path" \
+      "$payload/installer/linux/systemd/bloom-session@.path" \
       "$unit_root/bloom-session@.path" \
       0644
     for obsolete_socket in \
@@ -528,26 +672,18 @@ case "$action" in
       0644
     sed \
       -e "s|@BLOOM_BROKER_BINARY@|/usr/libexec/bloom/bloom-broker|g" \
-      "$script_dir/linux/systemd/bloom-broker@.service.in" \
+      "$payload/installer/linux/systemd/bloom-broker@.service.in" \
       > "$unit_root/bloom-broker@.service.new"
     chmod 0644 "$unit_root/bloom-broker@.service.new"
     mv -f "$unit_root/bloom-broker@.service.new" "$unit_root/bloom-broker@.service"
     sed \
       -e "s|@BLOOM_SIGNER_BINARY@|/usr/libexec/bloom/bloom-signer|g" \
-      "$script_dir/linux/systemd/bloom-signer@.service.in" \
+      "$payload/installer/linux/systemd/bloom-signer@.service.in" \
       > "$unit_root/bloom-signer@.service.new"
     chmod 0644 "$unit_root/bloom-signer@.service.new"
     mv -f "$unit_root/bloom-signer@.service.new" "$unit_root/bloom-signer@.service"
 
     source_config=""
-    release_digest="test-unclaimed"
-    if [[ "$root" == "/" ]]; then
-      release_digest="$(sha256_digest "$payload/SHA256SUMS")"
-      [[ "$release_digest" =~ ^[0-9a-f]{64}$ ]] || {
-        echo "signed payload release digest is invalid" >&2
-        exit 65
-      }
-    fi
     if [[ "$root" == "/" ]]; then
       systemd-sysusers "$sysusers"
       # tmpfiles may run before NSS observes identities just created by
@@ -555,8 +691,14 @@ case "$action" in
       # silently skipped because a fresh account name is unresolved.
       numericize_linux_tmpfiles_ownership "$tmpfiles" "$login_uid"
     fi
+    mkdir -p "$installed_config_root"
+    chmod 0711 "$installed_config_root"
+    machine_environment="$installed_config_root/.machine-env.source.$$"
+    printf 'BLOOM_NFS_LISTEN=127.0.0.1:%s\n' "$nfs_port" > "$machine_environment"
+    atomic_install "$machine_environment" "$installed_config_root/machine.env" 0644
+    rm -f -- "$machine_environment"
     install_linux_mount_authorization \
-      "$root" "$login_uid" "$login_gid" "$login_home"
+      "$root" "$login_uid" "$login_gid" "$login_home" "$nfs_port"
     if [[ "$fresh_install" == true ]]; then
       if [[ "$root" == "/" ]]; then
         broker_uid="$(id -u "bloom-broker-$login_uid")"
@@ -634,8 +776,8 @@ case "$action" in
     mkdir -p "$enrollment_root"
     chmod 0755 "$enrollment_root"
     enrollment_source="$config_root/.enrollment.source.$$"
-    printf '{"schema":"bloom.linux-enrollment.1","state":"active","login_uid":%s,"login_user":"%s","release_digest":"%s"}\n' \
-      "$login_uid" "$login_user" "$release_digest" > "$enrollment_source"
+    printf '{"schema":"bloom.linux-enrollment.1","state":"active","login_uid":%s,"login_user":"%s","release_digest":"%s","nfs_port":%s}\n' \
+      "$login_uid" "$login_user" "$release_digest" "$nfs_port" > "$enrollment_source"
     atomic_install "$enrollment_source" "$enrollment_root/$login_uid.json" 0644
     rm -f -- \
       "$enrollment_source" \
@@ -711,7 +853,7 @@ case "$action" in
             print
           }
         }' \
-        "$script_dir/linux/systemd/instance-dropins/bloom-signer@LOGIN_UID.service.d/50-aws-kms.conf.in" |
+        "$payload/installer/linux/systemd/instance-dropins/bloom-signer@LOGIN_UID.service.d/50-aws-kms.conf.in" |
         sed '/@AWS_KMS_IP_ALLOW_DIRECTIVES@/d' \
         > "$dropin_root/50-aws-kms.conf.new"
       chmod 0644 "$dropin_root/50-aws-kms.conf.new"
@@ -904,12 +1046,30 @@ PY
     remove_linux_mount_authorization "$root" "$login_uid"
     rm -rf -- "$run_target"
     if [[ "$retain_custody" == true ]]; then
+      custody_record="$root/etc/bloom/enrollments/$login_uid.json"
+      if [[ ! -f "$custody_record" || -L "$custody_record" ]]; then
+        custody_record="$root/etc/bloom/retained/$login_uid.json"
+      fi
+      [[ -f "$custody_record" && ! -L "$custody_record" ]] || {
+        echo "Linux custody record is missing or unsafe" >&2
+        exit 65
+      }
+      retained_login_user="$(linux_record_string "$custody_record" login_user)"
+      retained_release_digest="$(linux_record_string "$custody_record" release_digest)"
+      retained_nfs_port="$(linux_record_number "$custody_record" nfs_port)"
+      [[ "$retained_login_user" =~ ^[a-z_][a-z0-9_-]*$ && \
+        "$retained_release_digest" =~ ^[0-9a-f]{64}$ && \
+        "$retained_nfs_port" =~ ^[0-9]+$ ]] || {
+        echo "Linux custody record is malformed" >&2
+        exit 65
+      }
       retained_root="$root/etc/bloom/retained"
       mkdir -p "$retained_root"
       chmod 0755 "$retained_root"
       retained_source="$retained_root/.retained-$login_uid.$$"
-      printf '{"schema":"bloom.linux-enrollment.1","state":"retained","login_uid":%s}\n' \
-        "$login_uid" > "$retained_source"
+      printf '{"schema":"bloom.linux-enrollment.1","state":"retained","login_uid":%s,"login_user":"%s","release_digest":"%s","nfs_port":%s}\n' \
+        "$login_uid" "$retained_login_user" "$retained_release_digest" \
+        "$retained_nfs_port" > "$retained_source"
       atomic_install "$retained_source" "$retained_root/$login_uid.json" 0644
       rm -f -- "$retained_source"
     else
