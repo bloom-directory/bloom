@@ -115,6 +115,19 @@ fn machine_authority_boundary_is_directly_enforced_and_strict_release_is_blocked
 }
 
 #[test]
+fn standalone_release_uses_only_production_features_and_scans_the_binary() {
+    let workflow = fs::read_to_string(workspace().join(".github/workflows/release.yml")).unwrap();
+    assert!(!workflow.contains("cargo build --release -p bloom --all-features"));
+    assert!(workflow.contains("--features mount,bytecode-decompile"));
+    assert!(workflow.contains("check-machine-authority-boundary.sh --require-clean"));
+    assert!(workflow.contains("check-production-machine-binary.sh"));
+
+    let ci = fs::read_to_string(workspace().join(".github/workflows/ci.yml")).unwrap();
+    assert!(ci.contains("check-production-machine-binary.sh target/release/bloom"));
+    assert!(ci.contains("--features mount,triad-dev-harness"));
+}
+
+#[test]
 fn legacy_hash_only_routes_are_checked_by_release_and_installed_acceptance() {
     let release_dir = workspace().join("packaging/triad/release");
     let release_gate = fs::read_to_string(release_dir.join("triad-release-gate.sh")).unwrap();
@@ -1571,7 +1584,11 @@ fn macos_installer_stages_unix_principals_launchdaemons_and_confirmed_uninstall(
     std::os::unix::fs::symlink(&substituted, &signer_checkpoints).unwrap();
     let rejected = stage_macos_install(&installer, &root, &payload);
     assert!(!rejected.status.success());
-    assert!(String::from_utf8_lossy(&rejected.stderr).contains("security directory"));
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr).contains("security directory"),
+        "{}",
+        String::from_utf8_lossy(&rejected.stderr)
+    );
     assert_eq!(
         fs::metadata(&substituted).unwrap().permissions().mode() & 0o777,
         0o777,

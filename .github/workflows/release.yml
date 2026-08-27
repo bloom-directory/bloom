@@ -127,6 +127,9 @@ jobs:
       - name: Run workspace tests (locked)
         run: cargo test --workspace --locked
 
+      - name: Verify production Machine feature boundary
+        run: packaging/triad/release/check-machine-authority-boundary.sh --require-clean
+
   build:
     name: build ${{ matrix.asset_name }}
     needs: [prepare, test]
@@ -188,7 +191,9 @@ jobs:
           AR_aarch64_unknown_linux_musl: ar
           CC_aarch64_unknown_linux_musl: musl-gcc
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
-        run: cargo build --release -p bloom --all-features --locked --target "${{ matrix.target }}"
+        run: |
+          cargo build --release -p bloom --locked --no-default-features \
+            --features mount,bytecode-decompile --target "${{ matrix.target }}"
 
       - name: Verify binary version matches tag
         env:
@@ -202,6 +207,11 @@ jobs:
             exit 1
           fi
           echo "Verified: ${{ matrix.binary }} --version = $ACTUAL"
+
+      - name: Reject developer and canary capabilities in the release artifact
+        run: |
+          packaging/triad/release/check-production-machine-binary.sh \
+            "./target/${{ matrix.target }}/release/${{ matrix.binary }}"
 
       - name: Verify static linkage
         if: matrix.static

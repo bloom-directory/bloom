@@ -31,8 +31,10 @@ Four independent refusals, none of which are weakened by this work:
 2. **Daemon boot** (`admit_solana_chain`) performs a *live* `getGenesisHash`
    and refuses to construct a transfer engine for a mainnet-beta cluster,
    regardless of what the chain is named.
-3. **Broadcast client** (`SolanaClient::verify_genesis`) checks live genesis
-   again immediately before the client is used to send.
+3. **Broadcast client** (`SolanaClient::send_transaction`) checks every
+   configured endpoint's live genesis immediately before sending, refuses any
+   mismatch or unreachable endpoint, and sends through exactly one endpoint
+   without automatic failover.
 4. **Transfer engine** (`SolanaTransferEngine::broadcast`) enforces the
    per-value caps described below.
 
@@ -50,7 +52,7 @@ order an attacker or an accident would meet them:
 | Build-time artifact label | The feature alone does not compile. `BLOOM_MAINNET_CANARY_ARTIFACT` must also be set, so `--all-features` and every release path fail loudly rather than silently producing a capable binary. |
 | Out-of-band authorization | The authorization is a file named by `BLOOM_SOLANA_MAINNET_CANARY_AUTHORIZATION`, never a config key. No `config.toml` spelling enables mainnet. |
 | Artifact binding | The authorization carries the SHA-256 of the binary it was issued for and is refused by any other binary. |
-| Exact-match caps | One wallet, one key fingerprint, one source, one destination, one exact amount, a fee ceiling, and a live-read balance ceiling. |
+| Exact-match caps | One wallet, one key fingerprint, one canonical derivation path, one source, one destination, one exact amount, a fee ceiling, and a live-read balance ceiling. |
 | Expiry | A wall-clock deadline, re-checked at boot and at send. |
 | Single-use ledger | `create_new` on a sibling `.spent` file, claimed *before* the send. |
 
@@ -106,8 +108,9 @@ exact-match caps and the single-use ledger do not depend on the clock.
 ## Residual risks
 
 - The canary artifact is a real capability. Anyone who can both build it with
-  the label and write an authorization file bound to that artifact can move the
-  authorized amount to the authorized destination — and nothing else.
+  the label and write an authorization file bound to that artifact can attempt
+  the one exact authorized transfer — and nothing else. Broker policy and the
+  passkey approval still have to authorize the staged message.
 - The genesis constant remains the root of trust for cluster identity. It is
   pinned and independently verified, but a compromised constant would defeat
   identity checking; that risk predates this work and is unchanged.
@@ -117,15 +120,19 @@ exact-match caps and the single-use ledger do not depend on the clock.
 
 ## Test coverage
 
-- 9 unit tests over the authorization's decisions, run in **both** build
+- 10 unit tests over the authorization's decisions, run in **both** build
   configurations.
 - 2 integration tests driving the real environment variable into the real guard
   via a re-exec, asserting that a production build refuses even when handed a
-  valid authorization, and that a canary build refuses a wrong chain, a wrong
-  artifact, and an expired window.
-- 4 CI build gates over the packaging refusals.
+  valid authorization, that a canary build executes the guarded single send and
+  durably records its use, and that wrong-chain, wrong-artifact, and expired
+  authorizations are refused.
+- Transport regressions prove mixed-genesis endpoints fail before send and an
+  ambiguous send is never retried against a backup.
+- CI and release gates build an explicit production feature set and scan the
+  optimized Machine binary for developer or canary capability markers.
 
 Not yet covered, and required before the canary is used a second time or at any
 larger amount: destination substitution and cap violations exercised through the
-full engine against a live cluster, restart mid-broadcast, and production
-release-bundle rejection of a canary artifact.
+full engine against a live cluster, and restart mid-broadcast against a live
+cluster.

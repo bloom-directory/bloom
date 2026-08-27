@@ -69,6 +69,12 @@ For one candidate payload `C`, the disposable evidence matrix is:
 
 The signer refuses a mixture of evidence from different candidates.
 
+`check-production-machine-binary.sh` is run by the standalone GitHub release
+workflow and normal CI. It fails if an optimized Machine artifact contains a
+developer-harness, unsafe debug-approval, or mainnet-canary marker. The release
+workflow also builds from an explicit production feature set instead of
+`--all-features`.
+
 `triad-release-gate.sh` rejects modified or untracked release inputs, runs
 locked fmt, clippy, and tests in all three sibling workspaces, builds release
 binaries, assembles the bundle twice, verifies both, requires byte-identical
