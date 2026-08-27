@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import base64
 import binascii
-import errno
 import hashlib
 import json
 import os
@@ -72,180 +71,6 @@ EVAL_IMAGE = (
 EVAL_IMAGE_PULL_TIMEOUT_SECONDS = 600
 
 
-class VfsTransport:
-    """Use the kernel mount, with an exact-triad RPC fallback on host EPERM.
-
-    The real mount remains the source passed to Docker.  This transport only
-    protects host-side orchestration from the macOS failure mode where NFS
-    metadata succeeds but opening a file is denied.  Ordinary route failures
-    never fall back, because replaying an ambiguously accepted write would be
-    unsafe.
-    """
-
-    _PERMISSION_TEXT = (b"operation not permitted", b"permission denied")
-
-    def __init__(self, mount: Path, env: dict[str, str]) -> None:
-        self.mount = mount.resolve()
-        self.bloom_bin = env.get("BLOOM_EVAL_VFS_BLOOM_BIN", "")
-        self.machine_home = env.get("BLOOM_EVAL_VFS_MACHINE_HOME", "")
-        self.rpc_endpoint = env.get("BLOOM_EVAL_VFS_RPC_ENDPOINT", "")
-        self.triad_root = env.get("BLOOM_EVAL_VFS_TRIAD_ROOT", "")
-        self.broker_socket = env.get("BLOOM_EVAL_VFS_BROKER_SOCKET", "")
-        self.machine_identity = env.get("BLOOM_EVAL_VFS_MACHINE_IDENTITY", "")
-        self.edge_manifest = env.get("BLOOM_EVAL_VFS_EDGE_MANIFEST", "")
-        self.provenance_catalog = env.get("BLOOM_EVAL_VFS_PROVENANCE_CATALOG", "")
-
-    def _vfs_path(self, path: Path) -> str:
-        absolute = path if path.is_absolute() else self.mount / path
-        try:
-            relative = absolute.resolve(strict=False).relative_to(self.mount)
-        except ValueError as error:
-            raise EvalError(
-                "refusing direct VFS access outside the Bloom mount"
-            ) from error
-        if ".." in relative.parts:
-            raise EvalError("refusing a non-canonical direct VFS path")
-        return "/" + relative.as_posix().lstrip("/")
-
-    def _direct_env(self) -> dict[str, str]:
-        required = {
-            "BLOOM_RPC_ENDPOINT": self.rpc_endpoint,
-            "BLOOM_TRIAD_DEVELOPER_ROOT": self.triad_root,
-            "BLOOM_BROKER_SOCKET": self.broker_socket,
-            "BLOOM_MACHINE_IDENTITY": self.machine_identity,
-            "BLOOM_EDGE_MANIFEST": self.edge_manifest,
-            "BLOOM_PROVENANCE_CATALOG": self.provenance_catalog,
-        }
-        if (
-            not self.bloom_bin
-            or not self.machine_home
-            or any(not value for value in required.values())
-        ):
-            raise EvalError("direct VFS fallback is not bound to a complete triad")
-        return dict(os.environ, **required)
-
-    def _direct(
-        self, operation: str, path: Path, *, body: bytes | None, timeout: int
-    ) -> subprocess.CompletedProcess[bytes]:
-        command = [
-            self.bloom_bin,
-            "--home",
-            self.machine_home,
-            "vfs",
-            "--quiet",
-            operation,
-            self._vfs_path(path),
-        ]
-        try:
-            completed = subprocess.run(
-                command,
-                input=body,
-                capture_output=True,
-                check=False,
-                timeout=timeout,
-                env=self._direct_env(),
-            )
-        except subprocess.TimeoutExpired:
-            raise
-        except (OSError, subprocess.SubprocessError) as error:
-            raise EvalError(f"direct VFS {operation} transport failed") from error
-        # Route writes may legitimately return a nonzero status while publishing
-        # an owner ceremony. Callers must inspect that result and drive the
-        # ceremony; treating it as a transport failure loses the durable
-        # challenge even though dispatch already occurred.
-        if completed.returncode != 0 and operation != "write":
-            raise EvalError(f"direct VFS {operation} failed")
-        return completed
-
-    @classmethod
-    def _permission_failure(cls, completed: subprocess.CompletedProcess[bytes]) -> bool:
-        detail = (completed.stderr or b"").lower()
-        return completed.returncode != 0 and any(
-            marker in detail for marker in cls._PERMISSION_TEXT
-        )
-
-    def read(self, path: Path, timeout: int) -> bytes:
-        try:
-            completed = subprocess.run(
-                ["cat", str(path)],
-                check=False,
-                capture_output=True,
-                timeout=timeout,
-            )
-        except OSError as error:
-            if error.errno not in (errno.EACCES, errno.EPERM):
-                raise EvalError(f"could not read {path}: {error}") from error
-            return self._direct("cat", path, body=None, timeout=timeout).stdout
-        except subprocess.TimeoutExpired:
-            raise
-        except subprocess.SubprocessError as error:
-            raise EvalError(f"could not read {path}: {error}") from error
-        if completed.returncode == 0:
-            return completed.stdout
-        if self._permission_failure(completed):
-            return self._direct("cat", path, body=None, timeout=timeout).stdout
-        raise EvalError(f"could not read {path}")
-
-    def write(
-        self, path: Path, body: bytes, timeout: int
-    ) -> subprocess.CompletedProcess[bytes]:
-        writer = (
-            "import pathlib,sys; "
-            "pathlib.Path(sys.argv[1]).write_bytes(sys.stdin.buffer.read())"
-        )
-        try:
-            completed = subprocess.run(
-                [sys.executable, "-c", writer, str(path)],
-                input=body,
-                capture_output=True,
-                check=False,
-                timeout=timeout,
-            )
-        except OSError as error:
-            if error.errno not in (errno.EACCES, errno.EPERM):
-                raise EvalError(f"route write to {path} failed: {error}") from error
-            return self._direct("write", path, body=body, timeout=timeout)
-        except subprocess.SubprocessError as error:
-            raise EvalError(f"route write to {path} failed: {error}") from error
-        if self._permission_failure(completed):
-            return self._direct("write", path, body=body, timeout=timeout)
-        return completed
-
-    def list(self, path: Path, *, missing_ok: bool = False) -> list[str] | None:
-        try:
-            return os.listdir(path)
-        except FileNotFoundError:
-            if missing_ok:
-                return None
-            raise EvalError(f"required VFS directory does not exist: {path}")
-        except OSError as error:
-            if error.errno not in (errno.EACCES, errno.EPERM):
-                raise EvalError(f"could not list {path}: {error}") from error
-        output = self._direct("ls", path, body=None, timeout=10).stdout.decode()
-        names: list[str] = []
-        for line in output.splitlines():
-            try:
-                name, kind = line.rsplit("\t", 1)
-            except ValueError as error:
-                raise EvalError("direct VFS list returned malformed output") from error
-            if kind not in {"File", "Dir", "Symlink"} or not name or "/" in name:
-                raise EvalError("direct VFS list returned an invalid entry")
-            names.append(name)
-        return names
-
-    def exists(self, path: Path) -> bool:
-        try:
-            path.stat()
-            return True
-        except FileNotFoundError:
-            return False
-        except OSError as error:
-            if error.errno not in (errno.EACCES, errno.EPERM):
-                raise EvalError(f"could not inspect {path}: {error}") from error
-        self._direct("stat", path, body=None, timeout=10)
-        return True
-
-
 def session_key_slot(session_id: str) -> str:
     digest = hashlib.sha256(
         b"bloom-hyperliquid-session-key/v1\0" + session_id.encode()
@@ -278,7 +103,6 @@ class HyperliquidOrderCancelEval(EvalDefinition):
         )
         self.provenance_catalog = Path(self.provenance_catalog_value)
         self.bloom_mount = Path(self.env.get("BLOOM_EVAL_BLOOM_MOUNT", "/bloom"))
-        self.vfs = VfsTransport(self.bloom_mount, self.env)
         self.driver = Path(
             self.env.get(
                 "BLOOM_EVAL_DEBUG_DRIVER_BIN",
@@ -351,14 +175,21 @@ class HyperliquidOrderCancelEval(EvalDefinition):
         last_error: BaseException | None = None
         for attempt in range(VENUE_READ_ATTEMPTS):
             try:
-                contents = self.vfs.read(path, timeout)
+                completed = subprocess.run(
+                    ["cat", str(path)],
+                    check=True,
+                    capture_output=True,
+                    timeout=timeout,
+                )
             except subprocess.TimeoutExpired as error:
                 last_error = error
                 if attempt + 1 < VENUE_READ_ATTEMPTS:
                     time.sleep(1.0)
                 continue
+            except (OSError, subprocess.SubprocessError) as error:
+                raise EvalError(f"could not read {path}: {error}") from error
             try:
-                return json.loads(contents)
+                return json.loads(completed.stdout)
             except json.JSONDecodeError as error:
                 last_error = error
                 if attempt + 1 < VENUE_READ_ATTEMPTS:
@@ -372,7 +203,20 @@ class HyperliquidOrderCancelEval(EvalDefinition):
     def _write_route(
         self, path: Path, body: bytes, timeout: int
     ) -> subprocess.CompletedProcess[bytes]:
-        return self.vfs.write(path, body, timeout)
+        writer = (
+            "import pathlib,sys; "
+            "pathlib.Path(sys.argv[1]).write_bytes(sys.stdin.buffer.read())"
+        )
+        try:
+            return subprocess.run(
+                [sys.executable, "-c", writer, str(path)],
+                input=body,
+                capture_output=True,
+                check=False,
+                timeout=timeout,
+            )
+        except (OSError, subprocess.SubprocessError) as error:
+            raise EvalError(f"route write to {path} failed: {error}") from error
 
     def _poll_until(
         self,
@@ -401,9 +245,12 @@ class HyperliquidOrderCancelEval(EvalDefinition):
     def _read_json_if_exists(self, path: Path) -> Any | None:
         # Dynamic Petal routes can make getattr/stat succeed for arbitrary
         # session IDs. The parent listing is the durable existence boundary.
-        session_ids = self.vfs.list(path.parent.parent, missing_ok=True)
-        if session_ids is None:
+        try:
+            session_ids = os.listdir(path.parent.parent)
+        except FileNotFoundError:
             return None
+        except OSError as error:
+            raise EvalError(f"could not list {path.parent.parent}: {error}") from error
         if path.parent.name not in session_ids:
             return None
         return self._read_json(path)
@@ -415,9 +262,13 @@ class HyperliquidOrderCancelEval(EvalDefinition):
             )
         root = self.bloom_mount / "petal-key-requests"
         try:
-            names = sorted(self.vfs.list(root, missing_ok=True) or [])
-        except EvalError as error:
-            raise EvalError("could not list owner Petal key requests") from error
+            names = sorted(os.listdir(root))
+        except FileNotFoundError:
+            return None
+        except OSError as error:
+            raise EvalError(
+                f"could not list owner Petal key requests: {error}"
+            ) from error
         matches: list[str] = []
         for name in names:
             if re.fullmatch(r"[0-9a-f]{64}\.json", name) is None:
@@ -458,9 +309,13 @@ class HyperliquidOrderCancelEval(EvalDefinition):
         """
         root = self.bloom_mount / "petal-signing-requests"
         try:
-            names = sorted(self.vfs.list(root, missing_ok=True) or [])
-        except EvalError as error:
-            raise EvalError("could not list owner Petal signing requests") from error
+            names = sorted(os.listdir(root))
+        except FileNotFoundError:
+            return None
+        except OSError as error:
+            raise EvalError(
+                f"could not list owner Petal signing requests: {error}"
+            ) from error
         matches: list[str] = []
         for name in names:
             if re.fullmatch(r"[0-9a-f]{64}\.json", name) is None:
@@ -951,7 +806,7 @@ class HyperliquidOrderCancelEval(EvalDefinition):
             ("perp_meta.json", "Hyperliquid perpetual metadata route is missing"),
             ("../README.md", "Hyperliquid Petal README is missing"),
         ):
-            if not self.vfs.exists(self.network_root / relative):
+            if not (self.network_root / relative).exists():
                 raise EvalError(label)
         self.preauthorization_preflight()
         self._require_exact_wallet_policy()

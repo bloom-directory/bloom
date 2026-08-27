@@ -94,10 +94,8 @@ The state schema is `bloom.eval.operator-state.v1`. It records
 `lineage`, and triad `binaries` with SHA-256 digests. `paths` contains the triad
 root, Machine mount, owner record, Petal store, provenance catalog,
 authenticator-seed file path, debug-driver path, lock/job directories, and the
-three sibling source repositories. It also binds the exact running triad's
-Machine and Broker sockets, Machine identity, edge manifest, Machine home, and
-debug Bloom binary. The seed and model credential are never stored. `purpose`,
-`handoff`, and `field_guide` make the JSON self-describing;
+three sibling source repositories. The seed and model credential are never
+stored. `purpose`, `handoff`, and `field_guide` make the JSON self-describing;
 `handoff.safe_fields` lists the fields intended for the designated eval
 operator, while `required_secret_path_fields` names the required seed *path*
 without storing its contents. `recovery` records the exact protected state,
@@ -217,14 +215,13 @@ for deliberately managed non-default deployments, but it is not needed for the
 standard cold-start handoff. `BLOOM_EVAL_BLOOM_MOUNT` is never hard-coded by the
 operator; all host paths are derived from the initialized state.
 
-On macOS, an active NFS mount can occasionally allow metadata operations while
-returning `EPERM` for host file reads or writes. The operator uses the real mount
-first and, only for that permission failure, transparently retries the same VFS
-operation through `target/debug/bloom vfs` over the exact Machine RPC binding
-captured at `init`. Directory listings use the CLI's `name<TAB>File|Dir` output.
-Ordinary route failures and timeouts are never replayed through the fallback,
-and changed socket/config/binary bindings make `status` fail closed. Docker still
-receives the real mount, so the evaluated agent sees the production mount shape.
+The operator and evaluated agent exercise the mounted drive exclusively through
+ordinary filesystem operations. They must not invoke `bloom vfs`, connect to a
+Machine RPC endpoint, or use another transport as a fallback. A mount that
+returns `EPERM`, times out, or otherwise cannot serve a standard read or write is
+an eval-environment failure and must be repaired or remounted before retrying.
+This is intentional: the eval covers the installed NFS filesystem experience,
+not the semantically equivalent direct CLI path.
 
 ## Low-level/manual run
 
@@ -369,6 +366,11 @@ mount/environment, and cleanup implementation. New evals should add another
 `EvalDefinition` and register it in `harness/__main__.py`, not copy the
 Hyperliquid runner. Override `HARBOR_VERSION` only after running the static tests
 and a dry environment build.
+
+Both host orchestration and task execution use the mounted Bloom tree directly.
+The host harness performs reads with standard `cat`, listings with normal
+directory operations, and writes through the mounted path. The evaluated task
+is explicitly prohibited from invoking `bloom vfs` or any Machine RPC fallback.
 
 The task pins the multi-architecture `bloom-eval-agent-base` manifest by digest.
 That image provides Node.js and the Codex and Claude Code CLIs, so Harbor detects

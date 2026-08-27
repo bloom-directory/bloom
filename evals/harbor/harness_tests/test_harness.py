@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import base64
 import copy
-import errno
 import hashlib
 import json
 import os
@@ -19,7 +18,6 @@ from harness.hyperliquid_order_cancel import (
     ACTION_FILES,
     MAINNET_ACK,
     HyperliquidOrderCancelEval,
-    VfsTransport,
     session_key_slot,
 )
 
@@ -255,126 +253,6 @@ class HyperliquidDefinitionTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.temp.cleanup()
-
-    def direct_vfs_env(self) -> dict[str, str]:
-        return {
-            "BLOOM_EVAL_VFS_BLOOM_BIN": str(self.repo / "target/debug/bloom"),
-            "BLOOM_EVAL_VFS_MACHINE_HOME": str(self.root / "triad/state/machine"),
-            "BLOOM_EVAL_VFS_RPC_ENDPOINT": f"unix:{self.root}/triad/machine.sock",
-            "BLOOM_EVAL_VFS_TRIAD_ROOT": str(self.root / "triad"),
-            "BLOOM_EVAL_VFS_BROKER_SOCKET": str(
-                self.root / "triad/runtime/broker/broker.sock"
-            ),
-            "BLOOM_EVAL_VFS_MACHINE_IDENTITY": str(
-                self.root / "triad/config/machine-identity.json"
-            ),
-            "BLOOM_EVAL_VFS_EDGE_MANIFEST": str(
-                self.root / "triad/config/edge-manifest.json"
-            ),
-            "BLOOM_EVAL_VFS_PROVENANCE_CATALOG": str(
-                self.root / "triad/config/provenance-catalog.json"
-            ),
-        }
-
-    def test_read_falls_back_to_exact_triad_vfs_on_host_permission_error(self) -> None:
-        transport = VfsTransport(self.mount, self.direct_vfs_env())
-        denied = subprocess.CompletedProcess(
-            [], 1, b"", b"cat: Operation not permitted"
-        )
-        direct = subprocess.CompletedProcess([], 0, b'{"ok":true}', b"")
-        with mock.patch.object(
-            hyperliquid_order_cancel.subprocess,
-            "run",
-            side_effect=[denied, direct],
-        ) as run:
-            self.assertEqual(
-                transport.read(self.mount / "wallets/eval/addresses.json", 12),
-                b'{"ok":true}',
-            )
-        command = run.call_args_list[1].args[0]
-        kwargs = run.call_args_list[1].kwargs
-        self.assertEqual(command[-2:], ["cat", "/wallets/eval/addresses.json"])
-        self.assertEqual(
-            kwargs["env"]["BLOOM_RPC_ENDPOINT"],
-            self.direct_vfs_env()["BLOOM_EVAL_VFS_RPC_ENDPOINT"],
-        )
-        self.assertEqual(
-            kwargs["env"]["BLOOM_BROKER_SOCKET"],
-            self.direct_vfs_env()["BLOOM_EVAL_VFS_BROKER_SOCKET"],
-        )
-
-    def test_write_falls_back_only_for_host_permission_error(self) -> None:
-        transport = VfsTransport(self.mount, self.direct_vfs_env())
-        denied = subprocess.CompletedProcess(
-            [], 1, b"", b"PermissionError: [Errno 1] Operation not permitted"
-        )
-        direct = subprocess.CompletedProcess([], 0, b"", b"")
-        with mock.patch.object(
-            hyperliquid_order_cancel.subprocess,
-            "run",
-            side_effect=[denied, direct],
-        ) as run:
-            result = transport.write(self.mount / "wallets/eval/policy.json", b"{}", 12)
-        self.assertEqual(result.returncode, 0)
-        self.assertEqual(run.call_args_list[1].kwargs["input"], b"{}")
-        self.assertEqual(
-            run.call_args_list[1].args[0][-2:], ["write", "/wallets/eval/policy.json"]
-        )
-
-        route_failure = subprocess.CompletedProcess([], 1, b"rejected", b"")
-        with mock.patch.object(
-            hyperliquid_order_cancel.subprocess,
-            "run",
-            return_value=route_failure,
-        ) as run:
-            self.assertIs(
-                transport.write(self.mount / "wallets/eval/policy.json", b"{}", 12),
-                route_failure,
-            )
-        run.assert_called_once()
-
-    def test_direct_write_preserves_owner_ceremony_response(self) -> None:
-        transport = VfsTransport(self.mount, self.direct_vfs_env())
-        denied = subprocess.CompletedProcess(
-            [], 1, b"", b"PermissionError: [Errno 1] Operation not permitted"
-        )
-        ceremony = subprocess.CompletedProcess(
-            [], 1, b"owner ceremony required", b""
-        )
-        with mock.patch.object(
-            hyperliquid_order_cancel.subprocess,
-            "run",
-            side_effect=[denied, ceremony],
-        ):
-            result = transport.write(
-                self.mount / "wallets/eval/policy.json", b"{}", 12
-            )
-        self.assertIs(result, ceremony)
-
-    def test_list_fallback_parses_supported_vfs_cli_format(self) -> None:
-        transport = VfsTransport(self.mount, self.direct_vfs_env())
-        direct = subprocess.CompletedProcess(
-            [], 0, b"one.json\tFile\nsessions\tDir\n", b""
-        )
-        with (
-            mock.patch.object(
-                hyperliquid_order_cancel.os,
-                "listdir",
-                side_effect=PermissionError(errno.EPERM, "Operation not permitted"),
-            ),
-            mock.patch.object(
-                hyperliquid_order_cancel.subprocess, "run", return_value=direct
-            ),
-        ):
-            self.assertEqual(
-                transport.list(self.mount / "petal-key-requests"),
-                ["one.json", "sessions"],
-            )
-
-    def test_direct_vfs_fallback_refuses_paths_outside_mount(self) -> None:
-        transport = VfsTransport(self.mount, self.direct_vfs_env())
-        with self.assertRaisesRegex(EvalError, "outside the Bloom mount"):
-            transport._vfs_path(self.root / "secret")
 
     def test_read_json_retries_transient_malformed_nfs_snapshot(self) -> None:
         malformed = subprocess.CompletedProcess(

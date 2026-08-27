@@ -140,6 +140,10 @@ PY
 bash -n "${repo_root}/scripts/evals/run-harbor-hyperliquid.sh"
 bash -n "${repo_root}/scripts/evals/operate-harbor-hyperliquid.sh"
 git -C "$repo_root" check-ignore -q evals/harbor/operator-state.json
+! rg -n 'BLOOM_EVAL_VFS_|VfsTransport|bloom vfs' \
+  "${repo_root}/evals/harbor/harness"/*.py
+rg -q '`bloom vfs`, the `bloom` executable' \
+  "${task}/instruction.md"
 bash -n "${task}/tests/test.sh"
 PYTHONPATH="${repo_root}/evals/harbor" "${python_cmd[@]}" -m unittest discover \
   -s "${repo_root}/evals/harbor/harness_tests" -v
