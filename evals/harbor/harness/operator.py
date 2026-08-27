@@ -373,12 +373,19 @@ class PolicyLifecycle:
             except EvalError:
                 value = None
             if isinstance(value, dict):
-                if value.get("proposed_policy_digest") == expected_digest:
+                operation_id = value.get("operation_id")
+                ceremony_url = value.get("ceremony_url")
+                if (
+                    value.get("proposed_policy_digest") == expected_digest
+                    and isinstance(operation_id, str)
+                    and isinstance(ceremony_url, str)
+                ):
                     return value
                 # `latest` may still project the preceding completed ceremony
                 # while the asynchronous policy command publishes the new
-                # challenge. Never complete the mismatched ceremony; keep
-                # polling for the exact requested digest within this bound.
+                # challenge, or a matching prepared projection may not have a
+                # live Broker ceremony URL yet. Never complete an incomplete
+                # or mismatched ceremony; keep polling within this bound.
             time.sleep(0.5)
         return None
 

@@ -297,6 +297,24 @@ class PolicyRecoveryTests(unittest.TestCase):
         self.assertEqual(self.definition._read_json.call_count, 2)
         sleep.assert_called_once_with(0.5)
 
+    def test_policy_challenge_poll_ignores_incomplete_matching_digest(self) -> None:
+        incomplete = {
+            "operation_id": "prepared-operation",
+            "ceremony_url": None,
+            "proposed_policy_digest": "expected",
+        }
+        matching = {
+            "operation_id": "live-operation",
+            "ceremony_url": "http://localhost:18734/ceremony/" + "A" * 43,
+            "proposed_policy_digest": "expected",
+        }
+        self.definition._read_json = mock.Mock(side_effect=[incomplete, matching])
+        with mock.patch("harness.operator.time.sleep") as sleep:
+            observed = self.lifecycle._wait_challenge("expected")
+        self.assertEqual(observed, matching)
+        self.assertEqual(self.definition._read_json.call_count, 2)
+        sleep.assert_called_once_with(0.5)
+
     def test_policy_replay_retries_only_known_previous_bytes(self) -> None:
         target = dict(self.original, allowed_petal_packages=["b" * 64])
         target_bytes = canonical_json(target)
