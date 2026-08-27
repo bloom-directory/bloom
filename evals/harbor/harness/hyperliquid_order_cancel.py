@@ -64,6 +64,11 @@ VENUE_SETTLE_ATTEMPTS = 6
 VENUE_SETTLE_DELAY_SECONDS = 5.0
 STATUS_SETTLE_ATTEMPTS = 50
 STATUS_SETTLE_DELAY_SECONDS = 0.2
+EVAL_IMAGE = (
+    "ghcr.io/bloom-directory/bloom-eval-agent-base@"
+    "sha256:20988c7f8a6751c25e0115c2136710a885bef69d245e077d2ae3b2cc2c0837fd"
+)
+EVAL_IMAGE_PULL_TIMEOUT_SECONDS = 600
 
 
 def session_key_slot(session_id: str) -> str:
@@ -155,7 +160,10 @@ class HyperliquidOrderCancelEval(EvalDefinition):
         # is the venue's, not the disk's. Observed between 0.1s and 8s for the
         # same path minutes apart. A single tight timeout loses whole runs to
         # latency the harness does not control, so allow more time and retry a
-        # timeout rather than failing the run on one slow fetch.
+        # timeout rather than failing the run on one slow fetch. Owner-visible
+        # projections can also be replaced while NFS is serving a read; retry
+        # a malformed snapshot rather than treating that transient overlap as
+        # durable corruption.
         last_error: BaseException | None = None
         for attempt in range(VENUE_READ_ATTEMPTS):
             try:
@@ -175,7 +183,10 @@ class HyperliquidOrderCancelEval(EvalDefinition):
             try:
                 return json.loads(completed.stdout)
             except json.JSONDecodeError as error:
-                raise EvalError(f"{path} is not valid JSON: {error}") from error
+                last_error = error
+                if attempt + 1 < VENUE_READ_ATTEMPTS:
+                    time.sleep(0.2)
+                continue
         raise EvalError(
             f"could not read {path} after {VENUE_READ_ATTEMPTS} attempts "
             f"of {timeout}s: {last_error}"
@@ -713,6 +724,22 @@ class HyperliquidOrderCancelEval(EvalDefinition):
                 "dedicated wallet retains a Hyperliquid API agent this eval did not create"
             )
 
+    def _pull_eval_image(self) -> None:
+        """Make the immutable Harbor image ready before creating authority."""
+        try:
+            completed = subprocess.run(
+                ["docker", "pull", EVAL_IMAGE],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=EVAL_IMAGE_PULL_TIMEOUT_SECONDS,
+            )
+        except (OSError, subprocess.SubprocessError) as error:
+            raise EvalError(f"could not pull pinned Harbor eval image: {error}") from error
+        if completed.returncode != 0:
+            detail = (completed.stderr or completed.stdout).strip()
+            raise EvalError(f"could not pull pinned Harbor eval image: {detail}")
+
     def preflight(self) -> None:
         if not WALLET.fullmatch(self.wallet):
             raise EvalError("BLOOM_EVAL_WALLET must be a lowercase 0x address")
@@ -771,6 +798,10 @@ class HyperliquidOrderCancelEval(EvalDefinition):
             )
         except (OSError, subprocess.SubprocessError) as error:
             raise EvalError(f"Docker daemon is unavailable: {error}") from error
+        # Harbor otherwise discovers a missing image only after provision() has
+        # created the bounded mainnet session and started its 30-minute clock.
+        # Pulling the immutable digest here fails before any authority exists.
+        self._pull_eval_image()
         self._require_empty_wallet()
 
     def provision(self, agent_name: str) -> EvalRunContext:

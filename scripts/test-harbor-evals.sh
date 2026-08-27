@@ -122,12 +122,17 @@ for name, values in mutations.items():
 PY
 
 python3 - <<PY
+import sys
 import tomllib
 from pathlib import Path
+sys.path.insert(0, str(Path("${repo_root}/evals/harbor")))
+from harness.hyperliquid_order_cancel import EVAL_IMAGE
+
 with Path("${task}/task.toml").open("rb") as handle:
     task = tomllib.load(handle)
 assert task["task"]["name"] == "bloom/hyperliquid-order-cancel"
 assert task["environment"]["network_mode"] == "public"
+assert task["environment"]["docker_image"] == EVAL_IMAGE
 assert task["agent"]["timeout_sec"] == 900.0
 PY
 
