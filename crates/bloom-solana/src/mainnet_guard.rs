@@ -240,6 +240,16 @@ mod tests {
                 .to_string()
                 .contains("broadcast to Solana mainnet-beta is disabled")
         );
+
+        let error = client
+            .send_transaction("signed-transaction")
+            .await
+            .expect_err("the write method itself must retain the mainnet guard");
+        assert!(
+            error
+                .to_string()
+                .contains("broadcast to Solana mainnet-beta is disabled")
+        );
     }
 
     #[test]

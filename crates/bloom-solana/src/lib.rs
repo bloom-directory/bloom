@@ -158,16 +158,10 @@ impl SolanaClient {
     /// live check on every call; callers use it at stage and broadcast so an
     /// endpoint or DNS change cannot silently cross clusters.
     pub async fn verify_genesis(&self) -> Result<String, SolanaRpcError> {
-        let observed = self.get_genesis_hash().await?;
-        if let Some(expected) = &self.inner.expected_genesis_hex
-            && expected != &observed
-        {
-            return Err(SolanaRpcError::GenesisMismatch {
-                chain: self.chain_name().to_string(),
-                expected: expected.clone(),
-                observed,
-            });
-        }
+        let observed = match &self.inner.expected_genesis_hex {
+            Some(expected) => self.inner.rpc.verify_all_genesis(expected).await?,
+            None => self.get_genesis_hash().await?,
+        };
         if self.inner.allow_broadcast && observed == crate::MAINNET_BETA_GENESIS_HASH {
             // The third independent refusal, checked against the *live*
             // genesis immediately before the client is used to send. It stands
@@ -289,16 +283,44 @@ impl SolanaClient {
     }
 
     /// Submit a signed transaction (base64) to the cluster. Returns the
-    /// transaction signature. This is the write path the transaction engine
-    /// gates — the read client itself performs no gating beyond the transport.
+    /// transaction signature.
+    ///
+    /// Every configured endpoint must first prove the pinned genesis. The
+    /// transaction is then sent exactly once through the highest-priority
+    /// endpoint; an ambiguous response is reconciled by signature and is never
+    /// retried by the transport. Mainnet-beta remains unconditionally blocked
+    /// in the ordinary build.
     pub async fn send_transaction(&self, tx_b64: &str) -> Result<String, SolanaRpcError> {
+        if !self.inner.allow_broadcast {
+            return Err(SolanaRpcError::Invalid(format!(
+                "broadcast is disabled for chain '{}'",
+                self.chain_name()
+            )));
+        }
+        let expected = self.inner.expected_genesis_hex.as_deref().ok_or_else(|| {
+            SolanaRpcError::Invalid(format!(
+                "chain '{}' cannot broadcast without an expected genesis hash",
+                self.chain_name()
+            ))
+        })?;
+        if expected == crate::MAINNET_BETA_GENESIS_HASH {
+            return Err(SolanaRpcError::Invalid(
+                "broadcast to Solana mainnet-beta is disabled".into(),
+            ));
+        }
         self.inner
             .rpc
-            .call(
+            .call_raw_after_genesis_check(
+                expected,
                 "sendTransaction",
                 &json!([tx_b64, { "encoding": "base64" }]),
+                || Ok(()),
             )
             .await
+            .and_then(|value| {
+                serde_json::from_value(value)
+                    .map_err(|error| SolanaRpcError::Decode(format!("sendTransaction: {error}")))
+            })
     }
 
     /// Request a faucet airdrop to a base58 account (local/devnet only). The

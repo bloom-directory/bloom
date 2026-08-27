@@ -167,6 +167,58 @@ impl SolanaRpcClient {
         Err(last.unwrap_or_else(|| SolanaRpcError::NoEndpoints(self.chain_name.clone())))
     }
 
+    /// Verify that every configured HTTP endpoint belongs to `expected`.
+    ///
+    /// Ordinary reads may fail over as soon as one endpoint answers. A write
+    /// cannot use that rule: checking endpoint A and later submitting through
+    /// endpoint B would leave B's cluster identity unproved. Any unreachable,
+    /// malformed, or mismatched endpoint therefore fails the whole check.
+    pub async fn verify_all_genesis(&self, expected: &str) -> Result<String, SolanaRpcError> {
+        for endpoint in &self.endpoints {
+            let observed = self
+                .post(endpoint, "getGenesisHash", &serde_json::json!([]))
+                .await
+                .map_err(|failure| failure.error)?;
+            let observed = observed.as_str().ok_or_else(|| {
+                SolanaRpcError::Decode(format!(
+                    "getGenesisHash from {} returned {observed}",
+                    endpoint.url
+                ))
+            })?;
+            if observed != expected {
+                return Err(SolanaRpcError::GenesisMismatch {
+                    chain: self.chain_name.clone(),
+                    expected: expected.to_string(),
+                    observed: observed.to_string(),
+                });
+            }
+        }
+        Ok(expected.to_string())
+    }
+
+    /// Submit one write through the highest-priority endpoint, after every
+    /// configured endpoint has proved the pinned genesis.
+    ///
+    /// The write is deliberately attempted exactly once. A transport error can
+    /// be an ambiguous outcome, so retry/failover belongs in signature-based
+    /// reconciliation rather than in the RPC transport.
+    pub async fn call_raw_after_genesis_check<F>(
+        &self,
+        expected: &str,
+        method: &str,
+        params: &Value,
+        before_send: F,
+    ) -> Result<Value, SolanaRpcError>
+    where
+        F: FnOnce() -> Result<(), SolanaRpcError>,
+    {
+        self.verify_all_genesis(expected).await?;
+        before_send()?;
+        self.post(&self.endpoints[0], method, params)
+            .await
+            .map_err(|failure| failure.error)
+    }
+
     /// One raw HTTP POST, collapsing transport + node errors into a
     /// classified [`CallFailure`].
     async fn post(
