@@ -487,6 +487,61 @@ impl SolanaTransferEngine {
     /// signature instead of being misreported as a safe-to-retry pending
     /// transfer. `sent` means "a broadcast may have been attempted", not that
     /// the endpoint acknowledged or the cluster finalized it.
+
+    /// The fourth and last mainnet-beta gate: the per-value caps.
+    ///
+    /// The three preceding gates only decide whether mainnet-beta may be
+    /// reached at all. This one decides whether *this exact transfer* is the
+    /// one the operator authorized — same wallet, same key fingerprint, same
+    /// source, same destination, same amount, a fee inside the ceiling, and a
+    /// funded balance inside the stated total loss budget.
+    ///
+    /// Returns the authorization so the caller can spend its single use
+    /// immediately before sending. On any non-mainnet cluster this is `None`
+    /// and nothing changes.
+    async fn authorized_mainnet_canary(
+        &self,
+        entry: &SolanaOutboxEntry,
+        observed_genesis: &str,
+        now_ms: u128,
+    ) -> Result<Option<bloom_solana::canary::LoadedAuthorization>, EngineError> {
+        if observed_genesis != bloom_solana::MAINNET_BETA_GENESIS_HASH {
+            return Ok(None);
+        }
+        let loaded =
+            bloom_solana::canary::authorization_for(&self.chain, now_ms).ok_or_else(|| {
+                EngineError::Invalid(
+                    "mainnet-beta broadcast requires a valid canary authorization".into(),
+                )
+            })?;
+        let fingerprint = entry.staged.account_fingerprint.as_deref().ok_or_else(|| {
+            EngineError::Invalid(
+                "mainnet canary requires a transfer pinned to an exact key fingerprint".into(),
+            )
+        })?;
+        loaded
+            .authorization
+            .authorizes_transfer(
+                &entry.staged.wallet,
+                fingerprint,
+                &entry.staged.fee_payer,
+                &entry.staged.destination,
+                entry.staged.lamports,
+                entry.staged.fee_lamports,
+            )
+            .map_err(|error| EngineError::Invalid(error.to_string()))?;
+        // The balance is read live rather than trusted from staging time: the
+        // loss budget the operator agreed to is a statement about the funded
+        // account right now, not about what it held when the transfer was
+        // built.
+        let balance = self.client.get_balance(&entry.staged.fee_payer).await?;
+        loaded
+            .authorization
+            .authorizes_balance(balance)
+            .map_err(|error| EngineError::Invalid(error.to_string()))?;
+        Ok(Some(loaded))
+    }
+
     pub async fn broadcast(
         &self,
         wallet: &str,
@@ -508,6 +563,9 @@ impl SolanaTransferEngine {
                 observed_genesis, entry.staged.genesis_hash
             )));
         }
+        let canary = self
+            .authorized_mainnet_canary(&entry, &observed_genesis, now_ms)
+            .await?;
         let signature_b58 = self
             .outbox
             .recorded_signature(&entry)?
@@ -564,6 +622,23 @@ impl SolanaTransferEngine {
         // complete and hash-verifiable after a crash.
         self.outbox
             .write_broadcast_attempt(&entry, &signature_b58, &tx_bytes, now_ms)?;
+
+        // Spend the canary's single use *before* the send, not after. A crash
+        // or a lost response between here and the node must leave the canary
+        // spent: an ambiguous outcome is exactly the case where an automatic
+        // retry could double-send real funds, so the authorization has to be
+        // gone even though we may never learn what happened. Reconciliation by
+        // the deterministic signature is how the outcome is recovered.
+        if let Some(loaded) = &canary {
+            loaded
+                .claim_single_use(&format!("{} {} {}", entry.staged.wallet, id, signature_b58))
+                .map_err(|error| EngineError::Invalid(error.to_string()))?;
+            tracing::warn!(
+                chain = %self.chain,
+                signature = %signature_b58,
+                "solana.mainnet_canary_single_use_claimed"
+            );
+        }
 
         // Claim the entry for reconciliation before sendTransaction. Once in
         // `sent`, neither cancel nor restage can race the network write, and a

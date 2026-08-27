@@ -330,8 +330,36 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           cache-targets: false
+      # Deliberately not `--all-features`: that would enable `mainnet-canary`,
+      # which builds a NON-PRODUCTION artifact able to broadcast to Solana
+      # mainnet-beta. The canary's own gates are exercised in the step below.
       - name: Build full-feature binary with locked dependencies
-        run: cargo build --release -p bloom --all-features --locked
+        run: |
+          cargo build --release -p bloom --locked \
+            --features mount,bytecode-decompile,triad-dev-harness
+      - name: Release builds must reject the mainnet canary
+        run: |
+          set -euo pipefail
+          echo "== --all-features must not silently produce a canary artifact =="
+          if cargo check -p bloom --all-features --locked 2>err.log; then
+            echo "FAIL: --all-features built with the mainnet canary enabled"; exit 1
+          fi
+          grep -q "BLOOM_MAINNET_CANARY_ARTIFACT" err.log || {
+            echo "FAIL: --all-features failed for an unrelated reason"; cat err.log; exit 1; }
+          echo "ok: refused, and for the right reason"
+          echo "== the canary feature alone is not enough =="
+          if cargo check -p bloom --features mainnet-canary --locked 2>err2.log; then
+            echo "FAIL: the canary built without an explicit artifact label"; exit 1
+          fi
+          grep -q "BLOOM_MAINNET_CANARY_ARTIFACT" err2.log || {
+            echo "FAIL: refused for an unrelated reason"; cat err2.log; exit 1; }
+          echo "ok: an unlabelled canary artifact cannot be built"
+          echo "== a deliberately labelled canary artifact does build =="
+          BLOOM_MAINNET_CANARY_ARTIFACT=1 \
+            cargo check -p bloom --features mainnet-canary --locked
+          echo "ok: labelled canary builds"
+      - name: Production build refuses mainnet even with an authorization present
+        run: "cargo test -p bloom-proto --lib canary:: --locked"
       - name: Show sccache stats
         if: always()
         run: sccache --show-stats

@@ -10,6 +10,9 @@ default = []
 # Fault injection for audit failure-path tests. Never enabled by packaged
 # Machine builds.
 audit-test-seam = []
+# The isolated Solana mainnet-beta canary. Never enabled by packaged builds;
+# release packaging rejects an artifact built with it (see `scripts/lib.sh`).
+mainnet-canary = []
 
 [dependencies]
 serde.workspace = true
@@ -19,6 +22,7 @@ serde_json = { workspace = true, features = ["preserve_order"] }
 toml.workspace = true
 thiserror.workspace = true
 hex.workspace = true
+sha2.workspace = true
 blake3.workspace = true
 humantime-serde.workspace = true
 tracing.workspace = true

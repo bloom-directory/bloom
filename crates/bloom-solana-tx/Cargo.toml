@@ -5,6 +5,11 @@ edition.workspace = true
 license.workspace = true
 description = "Solana transaction engine: durable outbox and reconciliation, mirroring bloom-tx's pattern for the new Signer+Broker custody triad"
 
+[features]
+# The isolated Solana mainnet-beta canary. Never enabled by packaged builds;
+# release packaging rejects an artifact built with it.
+mainnet-canary = ["bloom-solana/mainnet-canary"]
+
 [dependencies]
 bloom-solana.workspace = true
 bloom-broker-api.workspace = true

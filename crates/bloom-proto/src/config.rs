@@ -567,7 +567,14 @@ impl Config {
                 if !valid_pin {
                     return Err(ConfigError::Invalid(format!(
                         "solana chain '{key}' enables broadcast without a valid 32-byte base58 \
-                         expected_genesis_base58 pin",
+                        expected_genesis_base58 pin",
+                    )));
+                }
+                if pin == crate::chain::SOLANA_MAINNET_BETA_GENESIS_HASH
+                    && !crate::canary::config_permits_mainnet_chain(key)
+                {
+                    return Err(ConfigError::Invalid(format!(
+                        "solana chain '{key}' cannot enable broadcast for mainnet-beta"
                     )));
                 }
             }

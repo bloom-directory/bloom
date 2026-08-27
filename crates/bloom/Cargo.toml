@@ -10,6 +10,9 @@ name = "bloom"
 path = "src/main.rs"
 
 [features]
+# The isolated Solana mainnet-beta canary. Never enabled by packaged builds;
+# release packaging rejects an artifact built with it.
+mainnet-canary = ["bloom-proto/mainnet-canary", "bloom-daemon/mainnet-canary"]
 default = ["mount"]
 # Enable the embedded NFS mount adapter through the daemon crate. This remains
 # a named feature so portable builds can opt out with `--no-default-features`.

@@ -10,6 +10,7 @@ pub mod address;
 pub mod assurance;
 pub mod audit;
 pub mod audit_ext;
+pub mod canary;
 pub mod capability;
 pub mod ceremony;
 pub mod chain;
