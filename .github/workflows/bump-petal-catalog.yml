@@ -142,7 +142,7 @@ jobs:
               echo "$notes"
               echo
             } >> "$context"
-          done < <(grep -E '^[a-z0-9-]+: v[0-9].+ -> v[0-9]' "$RUNNER_TEMP/summary.md" | awk '{print $1, $2, $4}')
+          done < <(grep -E '^[a-z0-9-]+: .+ -> v[0-9]' "$RUNNER_TEMP/summary.md" | awk '{print $1, $2, $4}')
 
           if ! grep -q '^### ' "$context"; then
             echo "::warning::no release notes collected; using the fallback body"

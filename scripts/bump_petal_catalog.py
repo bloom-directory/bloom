@@ -32,7 +32,6 @@ from pathlib import Path
 # upgrade_policy ManualStateMigration (currently hyperliquid) must NOT be
 # listed here.
 AUTO_PETALS: list[tuple[str, str]] = [
-    ("polymarket", "bloom-directory/bloom-petal-polymarket"),
     ("near-intents", "bloom-directory/bloom-petal-near"),
     ("enso", "bloom-directory/bloom-petal-enso"),
 ]
@@ -197,12 +196,19 @@ def main() -> int:
 
     for petal, repo in AUTO_PETALS:
         tag = latest_semver_release(repo)
-        match = re.search(
-            r'PreinstalledPetal \{[^}]*?name: "%s",' % re.escape(petal), source, re.DOTALL
-        )
-        if not match:
+        # The current tag must be read from the full const block (up to
+        # `};`), not from a match that ends at the name field.
+        chunks = source.split("PreinstalledPetal {")
+        current_tag = None
+        for chunk in chunks[1:]:
+            block = chunk[: chunk.find("};")]
+            if block_field(block, "name") == petal:
+                current_tag = block_field(block, "release_tag")
+                break
+        if current_tag is None and not any(
+            block_field(c[: c.find("};")], "name") == petal for c in chunks[1:]
+        ):
             raise RuntimeError(f"{petal}: no PREINSTALLED_* block found in source")
-        current_tag = block_field(match.group(0), "release_tag")
         if current_tag == tag:
             print(f"{petal}: up to date at {tag}")
             continue
