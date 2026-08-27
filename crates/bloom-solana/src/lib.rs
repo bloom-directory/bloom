@@ -323,6 +323,70 @@ impl SolanaClient {
             })
     }
 
+    /// Submit the one explicitly authorized mainnet-beta canary transaction.
+    ///
+    /// This entry point does not exist in a production build. It revalidates
+    /// the active artifact-bound authorization, proves the genesis of every
+    /// configured endpoint, durably spends the authorization, and only then
+    /// makes one non-retrying `sendTransaction` attempt.
+    #[cfg(feature = "mainnet-canary")]
+    pub async fn send_mainnet_canary_transaction(
+        &self,
+        tx_b64: &str,
+        loaded: &bloom_proto::canary::LoadedAuthorization,
+        spend_note: &str,
+        now_ms: u128,
+    ) -> Result<String, SolanaRpcError> {
+        if !self.inner.allow_broadcast {
+            return Err(SolanaRpcError::Invalid(format!(
+                "broadcast is disabled for chain '{}'",
+                self.chain_name()
+            )));
+        }
+        let expected = self.inner.expected_genesis_hex.as_deref().ok_or_else(|| {
+            SolanaRpcError::Invalid(format!(
+                "chain '{}' cannot broadcast without an expected genesis hash",
+                self.chain_name()
+            ))
+        })?;
+        if expected != crate::MAINNET_BETA_GENESIS_HASH {
+            return Err(SolanaRpcError::Invalid(
+                "mainnet canary send requires the pinned mainnet-beta genesis".into(),
+            ));
+        }
+        let active =
+            bloom_proto::canary::authorization_for(self.chain_name(), now_ms).ok_or_else(|| {
+                SolanaRpcError::Invalid("mainnet canary authorization is not active".into())
+            })?;
+        if active.path != loaded.path || active.authorization != loaded.authorization {
+            return Err(SolanaRpcError::Invalid(
+                "mainnet canary authorization changed after transfer validation".into(),
+            ));
+        }
+        self.inner
+            .rpc
+            .call_raw_after_genesis_check(
+                expected,
+                "sendTransaction",
+                &json!([tx_b64, { "encoding": "base64" }]),
+                || {
+                    loaded
+                        .claim_single_use(spend_note)
+                        .map_err(|error| SolanaRpcError::Invalid(error.to_string()))?;
+                    tracing::warn!(
+                        chain = %self.chain_name(),
+                        "solana.mainnet_canary_single_use_claimed"
+                    );
+                    Ok(())
+                },
+            )
+            .await
+            .and_then(|value| {
+                serde_json::from_value(value)
+                    .map_err(|error| SolanaRpcError::Decode(format!("sendTransaction: {error}")))
+            })
+    }
+
     /// Request a faucet airdrop to a base58 account (local/devnet only). The
     /// returned value is the airdrop transaction signature.
     pub async fn request_airdrop(
