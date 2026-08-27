@@ -25,8 +25,9 @@ cancellation evidence.
 
 ## Prerequisites
 
-- Linux or macOS with Docker, `uv`, Python 3.11 or newer (`scripts/test-harbor-evals.sh`
-  reads task TOML with `tomllib`), Claude Code and/or Codex auth. Use
+- Linux or macOS with Docker, `uv`, and Claude Code and/or Codex auth. The
+  repository scripts obtain their isolated Python 3.12 runtime through `uv`; no
+  ambient Python installation is required. Use
   a dedicated, revocable model credential for evals rather than an unrelated
   production credential. macOS works when its NFS 4.1 client can mount the
   Machine export; this is per-machine, so verify with `--mount` before relying
@@ -93,8 +94,10 @@ The state schema is `bloom.eval.operator-state.v1`. It records
 `lineage`, and triad `binaries` with SHA-256 digests. `paths` contains the triad
 root, Machine mount, owner record, Petal store, provenance catalog,
 authenticator-seed file path, debug-driver path, lock/job directories, and the
-three sibling source repositories. The seed and model credential are never
-stored. `purpose`, `handoff`, and `field_guide` make the JSON self-describing;
+three sibling source repositories. It also binds the exact running triad's
+Machine and Broker sockets, Machine identity, edge manifest, Machine home, and
+debug Bloom binary. The seed and model credential are never stored. `purpose`,
+`handoff`, and `field_guide` make the JSON self-describing;
 `handoff.safe_fields` lists the fields intended for the designated eval
 operator, while `required_secret_path_fields` names the required seed *path*
 without storing its contents. `recovery` records the exact protected state,
@@ -213,6 +216,15 @@ path. `--state /private/path/to/state.json` remains available on every command
 for deliberately managed non-default deployments, but it is not needed for the
 standard cold-start handoff. `BLOOM_EVAL_BLOOM_MOUNT` is never hard-coded by the
 operator; all host paths are derived from the initialized state.
+
+On macOS, an active NFS mount can occasionally allow metadata operations while
+returning `EPERM` for host file reads or writes. The operator uses the real mount
+first and, only for that permission failure, transparently retries the same VFS
+operation through `target/debug/bloom vfs` over the exact Machine RPC binding
+captured at `init`. Directory listings use the CLI's `name<TAB>File|Dir` output.
+Ordinary route failures and timeouts are never replayed through the fallback,
+and changed socket/config/binary bindings make `status` fail closed. Docker still
+receives the real mount, so the evaluated agent sees the production mount shape.
 
 ## Low-level/manual run
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import socket
 import stat
 import tempfile
 import unittest
@@ -19,6 +20,7 @@ from harness.operator import (
     atomic_write,
     canonical_json,
     definition_env,
+    discover_vfs_paths,
     handoff_metadata,
     initialize,
     parser,
@@ -61,6 +63,14 @@ class OperatorStateTests(unittest.TestCase):
                 "debug_driver": str(self.root / "driver"),
                 "lock_file": str(self.root / "lock"),
                 "jobs_dir": str(self.root / "jobs"),
+                "bloom_binary": str(self.root / "bloom"),
+                "machine_socket": str(self.root / "triad/machine.sock"),
+                "broker_socket": str(self.root / "triad/runtime/broker.sock"),
+                "machine_home": str(self.root / "triad/state/machine"),
+                "machine_identity": str(
+                    self.root / "triad/config/machine-identity.json"
+                ),
+                "edge_manifest": str(self.root / "triad/config/edge-manifest.json"),
             },
         }
         self.store.write(self.state)
@@ -124,7 +134,53 @@ class OperatorStateTests(unittest.TestCase):
         self.assertEqual(
             env["BLOOM_EVAL_PETAL_OWNER_RECORD"], str(self.root / "owner.json")
         )
+        self.assertEqual(
+            env["BLOOM_EVAL_VFS_RPC_ENDPOINT"],
+            f"unix:{self.root}/triad/machine.sock",
+        )
+        self.assertEqual(
+            env["BLOOM_EVAL_VFS_BROKER_SOCKET"],
+            str(self.root / "triad/runtime/broker.sock"),
+        )
         self.assertNotIn("BLOOM_EVAL_AGENT_NAME", env)
+
+    def test_direct_vfs_binding_is_discovered_from_protected_triad_env(self) -> None:
+        triad = self.root / "triad"
+        runtime = triad / "runtime.current/broker"
+        config = triad / "config"
+        logs = triad / "logs"
+        machine_home = triad / "state/machine"
+        bloom_binary = self.root / "target/debug/bloom"
+        for directory in (runtime, config, logs, machine_home, bloom_binary.parent):
+            directory.mkdir(parents=True, exist_ok=True)
+        for path in (
+            config / "machine-identity.json",
+            config / "edge-manifest.json",
+            config / "provenance-catalog.json",
+            bloom_binary,
+        ):
+            path.write_text("{}")
+        machine_socket_path = triad / "runtime/machine.sock"
+        machine_socket_path.parent.mkdir()
+        broker_socket_path = runtime / "broker.sock"
+        machine_socket = socket.socket(socket.AF_UNIX)
+        broker_socket = socket.socket(socket.AF_UNIX)
+        self.addCleanup(machine_socket.close)
+        self.addCleanup(broker_socket.close)
+        machine_socket.bind(str(machine_socket_path))
+        broker_socket.bind(str(broker_socket_path))
+        env_file = logs / "triad.env"
+        env_file.write_text(
+            f"export BLOOM_RPC_ENDPOINT=unix:{machine_socket_path}\n"
+            f"export BLOOM_BROKER_SOCKET={broker_socket_path}\n"
+        )
+        env_file.chmod(0o600)
+
+        paths = discover_vfs_paths(triad.resolve(), self.root.resolve())
+
+        self.assertEqual(paths["machine_socket"], str(machine_socket_path.resolve()))
+        self.assertEqual(paths["broker_socket"], str(broker_socket_path.resolve()))
+        self.assertEqual(paths["bloom_binary"], str(bloom_binary.resolve()))
 
     def test_redaction_removes_identifiers_paths_and_ceremony_urls(self) -> None:
         ceremony = "http://localhost:18734/ceremony/" + "A" * 43
@@ -154,6 +210,11 @@ class FakePolicyDefinition:
         self.driver = root / "driver"
         self.seed_file = root / "seed"
         self.sign_count_value = "7"
+        self.vfs = SimpleNamespace(
+            list=lambda path, missing_ok=False: (
+                [entry.name for entry in path.iterdir()] if path.exists() else None
+            )
+        )
 
     def _read_json(self, path: Path, timeout: int = 45) -> object:
         del timeout

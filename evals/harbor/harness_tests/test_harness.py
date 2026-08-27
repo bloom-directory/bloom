@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import copy
+import errno
 import hashlib
 import json
 import os
@@ -18,6 +19,7 @@ from harness.hyperliquid_order_cancel import (
     ACTION_FILES,
     MAINNET_ACK,
     HyperliquidOrderCancelEval,
+    VfsTransport,
     session_key_slot,
 )
 
@@ -254,8 +256,112 @@ class HyperliquidDefinitionTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temp.cleanup()
 
+    def direct_vfs_env(self) -> dict[str, str]:
+        return {
+            "BLOOM_EVAL_VFS_BLOOM_BIN": str(self.repo / "target/debug/bloom"),
+            "BLOOM_EVAL_VFS_MACHINE_HOME": str(self.root / "triad/state/machine"),
+            "BLOOM_EVAL_VFS_RPC_ENDPOINT": f"unix:{self.root}/triad/machine.sock",
+            "BLOOM_EVAL_VFS_TRIAD_ROOT": str(self.root / "triad"),
+            "BLOOM_EVAL_VFS_BROKER_SOCKET": str(
+                self.root / "triad/runtime/broker/broker.sock"
+            ),
+            "BLOOM_EVAL_VFS_MACHINE_IDENTITY": str(
+                self.root / "triad/config/machine-identity.json"
+            ),
+            "BLOOM_EVAL_VFS_EDGE_MANIFEST": str(
+                self.root / "triad/config/edge-manifest.json"
+            ),
+            "BLOOM_EVAL_VFS_PROVENANCE_CATALOG": str(
+                self.root / "triad/config/provenance-catalog.json"
+            ),
+        }
+
+    def test_read_falls_back_to_exact_triad_vfs_on_host_permission_error(self) -> None:
+        transport = VfsTransport(self.mount, self.direct_vfs_env())
+        denied = subprocess.CompletedProcess(
+            [], 1, b"", b"cat: Operation not permitted"
+        )
+        direct = subprocess.CompletedProcess([], 0, b'{"ok":true}', b"")
+        with mock.patch.object(
+            hyperliquid_order_cancel.subprocess,
+            "run",
+            side_effect=[denied, direct],
+        ) as run:
+            self.assertEqual(
+                transport.read(self.mount / "wallets/eval/addresses.json", 12),
+                b'{"ok":true}',
+            )
+        command = run.call_args_list[1].args[0]
+        kwargs = run.call_args_list[1].kwargs
+        self.assertEqual(command[-2:], ["cat", "/wallets/eval/addresses.json"])
+        self.assertEqual(
+            kwargs["env"]["BLOOM_RPC_ENDPOINT"],
+            self.direct_vfs_env()["BLOOM_EVAL_VFS_RPC_ENDPOINT"],
+        )
+        self.assertEqual(
+            kwargs["env"]["BLOOM_BROKER_SOCKET"],
+            self.direct_vfs_env()["BLOOM_EVAL_VFS_BROKER_SOCKET"],
+        )
+
+    def test_write_falls_back_only_for_host_permission_error(self) -> None:
+        transport = VfsTransport(self.mount, self.direct_vfs_env())
+        denied = subprocess.CompletedProcess(
+            [], 1, b"", b"PermissionError: [Errno 1] Operation not permitted"
+        )
+        direct = subprocess.CompletedProcess([], 0, b"", b"")
+        with mock.patch.object(
+            hyperliquid_order_cancel.subprocess,
+            "run",
+            side_effect=[denied, direct],
+        ) as run:
+            result = transport.write(self.mount / "wallets/eval/policy.json", b"{}", 12)
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(run.call_args_list[1].kwargs["input"], b"{}")
+        self.assertEqual(
+            run.call_args_list[1].args[0][-2:], ["write", "/wallets/eval/policy.json"]
+        )
+
+        route_failure = subprocess.CompletedProcess([], 1, b"rejected", b"")
+        with mock.patch.object(
+            hyperliquid_order_cancel.subprocess,
+            "run",
+            return_value=route_failure,
+        ) as run:
+            self.assertIs(
+                transport.write(self.mount / "wallets/eval/policy.json", b"{}", 12),
+                route_failure,
+            )
+        run.assert_called_once()
+
+    def test_list_fallback_parses_supported_vfs_cli_format(self) -> None:
+        transport = VfsTransport(self.mount, self.direct_vfs_env())
+        direct = subprocess.CompletedProcess(
+            [], 0, b"one.json\tFile\nsessions\tDir\n", b""
+        )
+        with (
+            mock.patch.object(
+                hyperliquid_order_cancel.os,
+                "listdir",
+                side_effect=PermissionError(errno.EPERM, "Operation not permitted"),
+            ),
+            mock.patch.object(
+                hyperliquid_order_cancel.subprocess, "run", return_value=direct
+            ),
+        ):
+            self.assertEqual(
+                transport.list(self.mount / "petal-key-requests"),
+                ["one.json", "sessions"],
+            )
+
+    def test_direct_vfs_fallback_refuses_paths_outside_mount(self) -> None:
+        transport = VfsTransport(self.mount, self.direct_vfs_env())
+        with self.assertRaisesRegex(EvalError, "outside the Bloom mount"):
+            transport._vfs_path(self.root / "secret")
+
     def test_read_json_retries_transient_malformed_nfs_snapshot(self) -> None:
-        malformed = subprocess.CompletedProcess([], 0, b'{"status":"old"}{"status":"new"}', b"")
+        malformed = subprocess.CompletedProcess(
+            [], 0, b'{"status":"old"}{"status":"new"}', b""
+        )
         valid = subprocess.CompletedProcess([], 0, b'{"status":"new"}', b"")
         with (
             mock.patch.object(
@@ -462,7 +568,9 @@ class HyperliquidDefinitionTests(unittest.TestCase):
         with self.assertRaisesRegex(EvalError, "does not have active Petal lineage"):
             self.definition.preauthorization_preflight()
 
-    def test_preauthorization_does_not_require_or_inspect_temporary_policy(self) -> None:
+    def test_preauthorization_does_not_require_or_inspect_temporary_policy(
+        self,
+    ) -> None:
         self.definition._require_exact_wallet_policy = mock.Mock(
             side_effect=AssertionError("temporary policy must remain unopened")
         )
@@ -510,12 +618,8 @@ class HyperliquidDefinitionTests(unittest.TestCase):
         self.assertEqual(self.definition._pending_petal_key_ceremony(), ceremony)
 
     def test_session_key_slot_is_a_case_sensitive_lowercase_broker_token(self) -> None:
-        upper = session_key_slot(
-            "bloom-eval-codex-20260814T150000Z-0123456789abcdef"
-        )
-        lower = session_key_slot(
-            "bloom-eval-codex-20260814t150000z-0123456789abcdef"
-        )
+        upper = session_key_slot("bloom-eval-codex-20260814T150000Z-0123456789abcdef")
+        lower = session_key_slot("bloom-eval-codex-20260814t150000z-0123456789abcdef")
 
         self.assertEqual(len(upper), 64)
         self.assertRegex(upper, r"^[a-z0-9-]{64}$")
@@ -638,7 +742,9 @@ class HyperliquidDefinitionTests(unittest.TestCase):
         # The container's bind-mount targets must agree with the host paths, and
         # the agent needs both identifiers to address sessions and account reads.
         for mount in context.mounts[1:]:
-            self.assertIn(f"/agent_sessions/{self.definition.wallet_id}/", mount["target"])
+            self.assertIn(
+                f"/agent_sessions/{self.definition.wallet_id}/", mount["target"]
+            )
         self.assertEqual(
             context.agent_env["BLOOM_EVAL_WALLET_ID"], self.definition.wallet_id
         )
@@ -797,9 +903,11 @@ class HyperliquidDefinitionTests(unittest.TestCase):
             return_value=SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
         )
 
-        with mock.patch.object(hyperliquid_order_cancel.time, "sleep"):
-            with self.assertRaisesRegex(EvalError, "still has open orders"):
-                self.definition.cleanup()
+        with (
+            mock.patch.object(hyperliquid_order_cancel.time, "sleep"),
+            self.assertRaisesRegex(EvalError, "still has open orders"),
+        ):
+            self.definition.cleanup()
 
     def test_cleanup_closes_residual_position_before_stopping(self) -> None:
         self.definition.session_id = "created"
@@ -936,7 +1044,10 @@ class HyperliquidDefinitionTests(unittest.TestCase):
         other_env = dict(self.env)
         other_env["BLOOM_EVAL_WALLET_ID"] = "another-eval-wallet"
         other = HyperliquidOrderCancelEval(self.repo, other_env).agent_name
-        self.assertNotEqual(first, other, "distinct wallets must not share an agent name")
+        self.assertNotEqual(
+            first, other, "distinct wallets must not share an agent name"
+        )
+
     def test_agent_name_override_adopts_an_existing_agent(self) -> None:
         # A wallet carrying an agent from an earlier naming scheme cannot be
         # reconciled by a derived name, and the old agent cannot be safely
@@ -995,13 +1106,15 @@ class HyperliquidDefinitionTests(unittest.TestCase):
         completed = subprocess.CompletedProcess(
             [], 1, stdout="", stderr="manifest unavailable"
         )
-        with mock.patch.object(
-            hyperliquid_order_cancel.subprocess, "run", return_value=completed
-        ):
-            with self.assertRaisesRegex(
+        with (
+            mock.patch.object(
+                hyperliquid_order_cancel.subprocess, "run", return_value=completed
+            ),
+            self.assertRaisesRegex(
                 EvalError, "pinned Harbor eval image: manifest unavailable"
-            ):
-                self.definition._pull_eval_image()
+            ),
+        ):
+            self.definition._pull_eval_image()
 
 
 if __name__ == "__main__":

@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import stat
 import subprocess
 import sys
@@ -242,6 +243,82 @@ def safe_json(path: Path) -> Any:
         raise EvalError("required discovery input is unavailable or invalid") from error
 
 
+def discover_vfs_paths(triad_root: Path, repo_root: Path) -> dict[str, str]:
+    """Bind fallback RPC access to the exact currently running dev triad."""
+    env_file = triad_root / "logs/triad.env"
+    try:
+        metadata = env_file.lstat()
+        lines = env_file.read_text().splitlines()
+    except OSError as error:
+        raise EvalError("current triad environment is unavailable") from error
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or env_file.is_symlink()
+        or stat.S_IMODE(metadata.st_mode) & 0o077
+    ):
+        raise EvalError("current triad environment file is unsafe")
+    values_by_name: dict[str, str] = {}
+    prefixes = {
+        "broker_socket": "export BLOOM_BROKER_SOCKET=",
+        "rpc_endpoint": "export BLOOM_RPC_ENDPOINT=",
+    }
+    for line in lines:
+        for name, prefix in prefixes.items():
+            if not line.startswith(prefix):
+                continue
+            try:
+                parsed = shlex.split(line[len(prefix) :])
+            except ValueError as error:
+                raise EvalError(f"current triad {name} is malformed") from error
+            if len(parsed) != 1 or name in values_by_name:
+                raise EvalError(f"current triad {name} is ambiguous")
+            values_by_name[name] = parsed[0]
+    if set(values_by_name) != set(prefixes):
+        raise EvalError("current triad socket binding is incomplete")
+    if not values_by_name["rpc_endpoint"].startswith("unix:"):
+        raise EvalError("current triad Machine endpoint is not a Unix socket")
+
+    broker_socket = Path(values_by_name["broker_socket"]).resolve()
+    machine_socket = Path(values_by_name["rpc_endpoint"][len("unix:") :]).resolve()
+    for label, socket_path in (
+        ("Broker", broker_socket),
+        ("Machine", machine_socket),
+    ):
+        try:
+            socket_path.relative_to(triad_root)
+        except ValueError as error:
+            raise EvalError(
+                f"current triad {label} socket escapes the triad root"
+            ) from error
+    paths = {
+        "machine_socket": machine_socket,
+        "broker_socket": broker_socket,
+        "machine_home": triad_root / "state/machine",
+        "machine_identity": triad_root / "config/machine-identity.json",
+        "edge_manifest": triad_root / "config/edge-manifest.json",
+        "provenance_catalog": triad_root / "config/provenance-catalog.json",
+        "bloom_binary": repo_root / "target/debug/bloom",
+    }
+    for name, path in paths.items():
+        try:
+            metadata = path.lstat()
+        except OSError as error:
+            raise EvalError(
+                f"current triad {name.replace('_', ' ')} is unavailable"
+            ) from error
+        if name.endswith("socket"):
+            if not stat.S_ISSOCK(metadata.st_mode):
+                raise EvalError(
+                    f"current triad {name.replace('_', ' ')} is not a socket"
+                )
+        elif name == "machine_home":
+            if not stat.S_ISDIR(metadata.st_mode) or path.is_symlink():
+                raise EvalError("current triad machine home is unsafe")
+        elif not stat.S_ISREG(metadata.st_mode) or path.is_symlink():
+            raise EvalError(f"current triad {name.replace('_', ' ')} is unsafe")
+    return {name: str(path) for name, path in paths.items()}
+
+
 def require_deny_policy(definition: HyperliquidOrderCancelEval, wallet_id: str) -> None:
     expected = {
         "allowed_destinations": [],
@@ -263,10 +340,8 @@ def require_no_pending_owner_requests(
     ):
         root = definition.bloom_mount / root_name
         try:
-            names = os.listdir(root)
-        except FileNotFoundError:
-            continue
-        except OSError as error:
+            names = definition.vfs.list(root, missing_ok=True) or []
+        except EvalError as error:
             raise EvalError("could not inspect pending owner requests") from error
         for name in names:
             if re.fullmatch(r"[0-9a-f]{64}\.json", name) is None:
@@ -308,6 +383,14 @@ def definition_env(state: dict[str, Any]) -> dict[str, str]:
         BLOOM_EVAL_LOCK_FILE=paths["lock_file"],
         BLOOM_EVAL_JOBS_DIR=paths["jobs_dir"],
         BLOOM_EVAL_MAINNET_ACK=MAINNET_ACK,
+        BLOOM_EVAL_VFS_BLOOM_BIN=paths["bloom_binary"],
+        BLOOM_EVAL_VFS_RPC_ENDPOINT=f"unix:{paths['machine_socket']}",
+        BLOOM_EVAL_VFS_TRIAD_ROOT=paths["triad_root"],
+        BLOOM_EVAL_VFS_BROKER_SOCKET=paths["broker_socket"],
+        BLOOM_EVAL_VFS_MACHINE_HOME=paths["machine_home"],
+        BLOOM_EVAL_VFS_MACHINE_IDENTITY=paths["machine_identity"],
+        BLOOM_EVAL_VFS_EDGE_MANIFEST=paths["edge_manifest"],
+        BLOOM_EVAL_VFS_PROVENANCE_CATALOG=paths["provenance_catalog"],
         **(
             {"BLOOM_EVAL_AGENT_NAME": state["agent_name"]}
             if state.get("agent_name")
@@ -493,7 +576,25 @@ def initialize(args: argparse.Namespace, repo_root: Path) -> None:
     owner_record = machine_home / "petals/store/owners/hyperliquid.json"
     petal_store = machine_home / "petals/store"
     catalog = triad_root / "config/provenance-catalog.json"
-    addresses = safe_json(mount / "wallets" / args.wallet_id / "addresses.json")
+    if not os.path.ismount(mount):
+        raise EvalError("configured Bloom path is not an active mount")
+    vfs_paths = discover_vfs_paths(triad_root, repo_root)
+    bootstrap_env = dict(
+        os.environ,
+        BLOOM_EVAL_BLOOM_MOUNT=str(mount),
+        BLOOM_EVAL_VFS_BLOOM_BIN=vfs_paths["bloom_binary"],
+        BLOOM_EVAL_VFS_RPC_ENDPOINT=f"unix:{vfs_paths['machine_socket']}",
+        BLOOM_EVAL_VFS_TRIAD_ROOT=str(triad_root),
+        BLOOM_EVAL_VFS_BROKER_SOCKET=vfs_paths["broker_socket"],
+        BLOOM_EVAL_VFS_MACHINE_HOME=vfs_paths["machine_home"],
+        BLOOM_EVAL_VFS_MACHINE_IDENTITY=vfs_paths["machine_identity"],
+        BLOOM_EVAL_VFS_EDGE_MANIFEST=vfs_paths["edge_manifest"],
+        BLOOM_EVAL_VFS_PROVENANCE_CATALOG=vfs_paths["provenance_catalog"],
+    )
+    discovery = HyperliquidOrderCancelEval(repo_root, bootstrap_env)
+    addresses = discovery._read_json(
+        mount / "wallets" / args.wallet_id / "addresses.json"
+    )
     owner = addresses.get("owner") if isinstance(addresses, dict) else None
     if not isinstance(owner, str) or WALLET.fullmatch(owner.lower()) is None:
         raise EvalError("wallet owner projection is invalid")
@@ -576,14 +677,13 @@ def initialize(args: argparse.Namespace, repo_root: Path) -> None:
             "broker_repo": str(broker_repo),
             "signer_repo": str(signer_repo),
             "hyperliquid_repo": str(hyperliquid_repo),
+            **vfs_paths,
         },
         "lineage": lineage,
         "binaries": binaries,
         "recovery": recovery,
     }
     definition = HyperliquidOrderCancelEval(repo_root, definition_env(state))
-    if not os.path.ismount(mount):
-        raise EvalError("configured Bloom path is not an active mount")
     definition.preauthorization_preflight()
     require_deny_policy(definition, args.wallet_id)
     require_no_pending_owner_requests(definition, args.wallet_id, package_hash)
@@ -596,6 +696,11 @@ def initialize(args: argparse.Namespace, repo_root: Path) -> None:
 
 def validate_lineage(state: dict[str, Any], repo_root: Path) -> None:
     paths = state["paths"]
+    expected_vfs_paths = discover_vfs_paths(Path(paths["triad_root"]), repo_root)
+    if any(paths.get(name) != value for name, value in expected_vfs_paths.items()):
+        raise EvalError(
+            "direct VFS binding changed; re-run init before creating authority"
+        )
     actual = discover_lineage(
         repo_root,
         Path(paths["broker_repo"]),
@@ -623,13 +728,17 @@ def status(store: StateStore, repo_root: Path) -> None:
         checks["lineage_current"] = True
     except EvalError:
         checks["lineage_current"] = False
-    try:
-        definition = HyperliquidOrderCancelEval(repo_root, definition_env(state))
-        definition.preauthorization_preflight()
-        require_deny_policy(definition, state["wallet_id"])
-        checks["preauthorization"] = True
-        checks["deny_by_default"] = True
-    except EvalError:
+    if checks["lineage_current"]:
+        try:
+            definition = HyperliquidOrderCancelEval(repo_root, definition_env(state))
+            definition.preauthorization_preflight()
+            require_deny_policy(definition, state["wallet_id"])
+            checks["preauthorization"] = True
+            checks["deny_by_default"] = True
+        except EvalError:
+            checks["preauthorization"] = False
+            checks["deny_by_default"] = False
+    else:
         checks["preauthorization"] = False
         checks["deny_by_default"] = False
     report = {
