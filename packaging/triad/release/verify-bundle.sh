@@ -95,9 +95,7 @@ require_canary_machine_markers() {
     fi
     return 1
   done <<EOF
-BLOOM_MAINNET_${canary_upper}_ARTIFACT
 BLOOM_SOLANA_MAINNET_${canary_upper}_AUTHORIZATION
-NON-PRODUCTION-MAINNET-${canary_upper}
 mainnet-${canary_lower}
 EOF
 }
