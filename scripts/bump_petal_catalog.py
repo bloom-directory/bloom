@@ -75,11 +75,13 @@ def latest_semver_release(repo: str) -> str:
 
 
 def block_field(block: str, field: str) -> str | None:
-    match = re.search(rf'{field}: "([^"]+)"', block)
+    match = re.search(rf'(?<![A-Za-z0-9_]){field}: "([^"]+)"', block)
     return match.group(1) if match else None
 
 
-def rewrite_block(source: str, petal: str, commit: str, tag: str, archive: str, sha256: str) -> str:
+def rewrite_block(
+    source: str, petal: str, commit: str, tag: str, archive: str, archive_sha256: str, package_hash: str
+) -> str:
     """Rewrite one PREINSTALLED_* const block (and its named commit const)."""
     chunks = source.split("PreinstalledPetal {")
     for index in range(1, len(chunks)):
@@ -89,15 +91,20 @@ def rewrite_block(source: str, petal: str, commit: str, tag: str, archive: str, 
             continue
 
         new_block = block
-        new_block = re.sub(r'(release_tag: ")[^"]+(")', r"\g<1>" + tag + r"\g<2>", new_block)
-        new_block = re.sub(r'(archive: ")[^"]+(")', r"\g<1>" + archive + r"\g<2>", new_block)
+        new_block = re.sub(r'(?<![A-Za-z0-9_])(release_tag: ")[^"]+(")', r"\g<1>" + tag + r"\g<2>", new_block)
+        new_block = re.sub(r'(?<![A-Za-z0-9_])(archive: ")[^"]+(")', r"\g<1>" + archive + r"\g<2>", new_block)
         new_block = re.sub(
-            r'(expected_hash: Some\(")[0-9a-f]{64}("\))',
-            r"\g<1>" + sha256 + r"\g<2>",
+            r'(?<![A-Za-z0-9_])(archive_sha256: ")[0-9a-f]{64}(")',
+            r"\g<1>" + archive_sha256 + r"\g<2>",
+            new_block,
+        )
+        new_block = re.sub(
+            r'(?<![A-Za-z0-9_])(expected_hash: Some\(")[0-9a-f]{64}("\))',
+            r"\g<1>" + package_hash + r"\g<2>",
             new_block,
         )
 
-        commit_match = re.search(r"commit: ([A-Za-z_][A-Za-z0-9_]*)", new_block)
+        commit_match = re.search(r"(?<![A-Za-z0-9_])commit: ([A-Za-z_][A-Za-z0-9_]*)", new_block)
         if commit_match:
             const_name = commit_match.group(1)
             preamble = chunks[0]
@@ -112,7 +119,7 @@ def rewrite_block(source: str, petal: str, commit: str, tag: str, archive: str, 
                 )
             chunks[0] = new_preamble
         else:
-            new_block = re.sub(r'(commit: ")[0-9a-f]{40}(")', r"\g<1>" + commit + r"\g<2>", new_block)
+            new_block = re.sub(r'(?<![A-Za-z0-9_])(commit: ")[0-9a-f]{40}(")', r"\g<1>" + commit + r"\g<2>", new_block)
 
         chunks[index] = new_block + chunks[index][block_end:]
         rebuilt = [chunks[0]] + [f"PreinstalledPetal {{{chunk}" for chunk in chunks[1:]]
@@ -121,8 +128,8 @@ def rewrite_block(source: str, petal: str, commit: str, tag: str, archive: str, 
     raise RuntimeError(f"{petal}: no PREINSTALLED_* block found in source")
 
 
-def verify_release(petal: str, repo: str, tag: str) -> tuple[str, str, str, str]:
-    """Download and verify release assets; return (commit, tag, archive, sha256)."""
+def verify_release(petal: str, repo: str, tag: str) -> tuple[str, str, str, str, str]:
+    """Download and verify release assets; return (commit, tag, archive, archive_sha256, package_hash)."""
     with tempfile.TemporaryDirectory() as tmp:
         gh(
             "release", "download", tag, "-R", repo, "-D", tmp,
@@ -175,7 +182,7 @@ def verify_release(petal: str, repo: str, tag: str) -> tuple[str, str, str, str]
         if not re.fullmatch(r"[0-9a-f]{64}", package_hash or ""):
             raise RuntimeError(f"{petal}: provenance package_hash is not a 64-hex digest")
 
-        return commit, tag, archive_name, package_hash
+        return commit, tag, archive_name, digest, package_hash
 
 
 def main() -> int:
@@ -205,17 +212,22 @@ def main() -> int:
             if block_field(block, "name") == petal:
                 current_tag = block_field(block, "release_tag")
                 break
-        if current_tag is None and not any(
-            block_field(c[: c.find("};")], "name") == petal for c in chunks[1:]
-        ):
-            raise RuntimeError(f"{petal}: no PREINSTALLED_* block found in source")
+        if current_tag is None:
+            raise RuntimeError(
+                f"{petal}: no PREINSTALLED_* block with a readable release_tag found in source"
+            )
         if current_tag == tag:
             print(f"{petal}: up to date at {tag}")
             continue
 
-        commit, tag, archive, sha256 = verify_release(petal, repo, tag)
-        source = rewrite_block(source, petal, commit, tag, archive, sha256)
-        print(f"{petal}: {current_tag} -> {tag} (commit {commit[:12]}, sha256 {sha256[:12]}...)")
+        commit, tag, archive, archive_sha256, package_hash = verify_release(petal, repo, tag)
+        source = rewrite_block(
+            source, petal, commit, tag, archive, archive_sha256, package_hash
+        )
+        print(
+            f"{petal}: {current_tag} -> {tag}"
+            f" (commit {commit[:12]}, package_hash {package_hash[:12]}...)"
+        )
         changed = True
 
     if changed and not args.dry_run:

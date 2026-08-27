@@ -110,7 +110,11 @@ jobs:
               continue
             fi
 
-            for file in $(git grep -l "$old" -- '*.toml'); do
+            # Only workspace manifests: packaging/triad/release/
+          # compatibility-v1.toml pins released contract revisions as an
+          # independently governed compatibility contract and must not
+          # ride an upstream HEAD bump.
+          for file in $(git grep -l "$old" -- 'Cargo.toml' '**/Cargo.toml'); do
               sed -i "s/$old/$new/g" "$file"
             done
 
