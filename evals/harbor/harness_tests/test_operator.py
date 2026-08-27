@@ -282,6 +282,21 @@ class PolicyRecoveryTests(unittest.TestCase):
                 canonical_json(target), canonical_json(self.original)
             )
 
+    def test_policy_challenge_poll_ignores_stale_digest(self) -> None:
+        matching = {
+            "operation_id": "matching-operation",
+            "ceremony_url": "http://localhost:18734/ceremony/" + "A" * 43,
+            "proposed_policy_digest": "expected",
+        }
+        self.definition._read_json = mock.Mock(
+            side_effect=[{"proposed_policy_digest": "stale"}, matching]
+        )
+        with mock.patch("harness.operator.time.sleep") as sleep:
+            observed = self.lifecycle._wait_challenge("expected")
+        self.assertEqual(observed, matching)
+        self.assertEqual(self.definition._read_json.call_count, 2)
+        sleep.assert_called_once_with(0.5)
+
     def test_init_rejects_matching_pending_owner_request(self) -> None:
         request_root = self.root / "mount/petal-signing-requests"
         request_root.mkdir(parents=True)

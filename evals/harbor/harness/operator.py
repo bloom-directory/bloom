@@ -373,11 +373,12 @@ class PolicyLifecycle:
             except EvalError:
                 value = None
             if isinstance(value, dict):
-                if value.get("proposed_policy_digest") != expected_digest:
-                    raise EvalError(
-                        "pending policy ceremony is bound to different bytes"
-                    )
-                return value
+                if value.get("proposed_policy_digest") == expected_digest:
+                    return value
+                # `latest` may still project the preceding completed ceremony
+                # while the asynchronous policy command publishes the new
+                # challenge. Never complete the mismatched ceremony; keep
+                # polling for the exact requested digest within this bound.
             time.sleep(0.5)
         return None
 
