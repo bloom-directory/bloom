@@ -519,11 +519,21 @@ impl SolanaTransferEngine {
                 "mainnet canary requires a transfer pinned to an exact key fingerprint".into(),
             )
         })?;
+        let derivation_path = entry
+            .staged
+            .account_derivation_path
+            .as_deref()
+            .ok_or_else(|| {
+                EngineError::Invalid(
+                    "mainnet canary requires a transfer pinned to an exact derivation path".into(),
+                )
+            })?;
         loaded
             .authorization
             .authorizes_transfer(
                 &entry.staged.wallet,
                 fingerprint,
+                derivation_path,
                 &entry.staged.fee_payer,
                 &entry.staged.destination,
                 entry.staged.lamports,
@@ -623,23 +633,6 @@ impl SolanaTransferEngine {
         self.outbox
             .write_broadcast_attempt(&entry, &signature_b58, &tx_bytes, now_ms)?;
 
-        // Spend the canary's single use *before* the send, not after. A crash
-        // or a lost response between here and the node must leave the canary
-        // spent: an ambiguous outcome is exactly the case where an automatic
-        // retry could double-send real funds, so the authorization has to be
-        // gone even though we may never learn what happened. Reconciliation by
-        // the deterministic signature is how the outcome is recovered.
-        if let Some(loaded) = &canary {
-            loaded
-                .claim_single_use(&format!("{} {} {}", entry.staged.wallet, id, signature_b58))
-                .map_err(|error| EngineError::Invalid(error.to_string()))?;
-            tracing::warn!(
-                chain = %self.chain,
-                signature = %signature_b58,
-                "solana.mainnet_canary_single_use_claimed"
-            );
-        }
-
         // Claim the entry for reconciliation before sendTransaction. Once in
         // `sent`, neither cancel nor restage can race the network write, and a
         // crash or ambiguous response is recoverable by deterministic
@@ -655,7 +648,29 @@ impl SolanaTransferEngine {
         };
         self.outbox.rewrite_intent(&sent_entry)?;
 
-        let submitted = self.client.send_transaction(&tx_b64).await?;
+        let submitted = match canary.as_ref() {
+            Some(loaded) => {
+                #[cfg(feature = "mainnet-canary")]
+                {
+                    self.client
+                        .send_mainnet_canary_transaction(
+                            &tx_b64,
+                            loaded,
+                            &format!("{} {} {}", entry.staged.wallet, id, signature_b58),
+                            now_ms,
+                        )
+                        .await?
+                }
+                #[cfg(not(feature = "mainnet-canary"))]
+                {
+                    let _ = loaded;
+                    return Err(EngineError::Invalid(
+                        "mainnet canary authorization reached a production build".into(),
+                    ));
+                }
+            }
+            None => self.client.send_transaction(&tx_b64).await?,
+        };
         if submitted != signature_b58 {
             return Err(EngineError::Invalid(format!(
                 "RPC returned transaction signature {submitted}, but Bloom submitted {signature_b58}"

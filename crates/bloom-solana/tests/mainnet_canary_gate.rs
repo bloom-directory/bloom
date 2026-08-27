@@ -23,6 +23,8 @@ use bloom_proto::canary::{AUTHORIZATION_ENV, AUTHORIZATION_SCHEMA, CanaryAuthori
 use bloom_solana::{MAINNET_BETA_GENESIS_HASH, SolanaClient, SolanaSpec};
 
 const CHILD_ENDPOINT: &str = "BLOOM_CANARY_TEST_ENDPOINT";
+#[cfg(feature = "mainnet-canary")]
+const CHILD_SEND: &str = "BLOOM_CANARY_TEST_SEND";
 const CHILD_TEST: &str = "the_mainnet_gate_consults_the_canary_authorization";
 const CHAIN: &str = "solana-mainnet-canary";
 const EXIT_PERMITTED: i32 = 30;
@@ -98,7 +100,20 @@ fn write_authorization(path: &Path) {
 async fn run_child() -> ! {
     let endpoint = std::env::var(CHILD_ENDPOINT).expect("endpoint");
     let client = SolanaClient::build(&mainnet_spec(&endpoint)).expect("build client");
-    match client.verify_genesis().await {
+    let verdict = match client.verify_genesis().await {
+        #[cfg(feature = "mainnet-canary")]
+        Ok(_) if std::env::var_os(CHILD_SEND).is_some() => {
+            let loaded = bloom_proto::canary::authorization_for(CHAIN, 0)
+                .expect("validated child authorization");
+            client
+                .send_mainnet_canary_transaction("signed-transaction", &loaded, "test claim", 0)
+                .await
+                .map(|_| MAINNET_BETA_GENESIS_HASH.to_string())
+        }
+        Ok(_) => Ok(MAINNET_BETA_GENESIS_HASH.to_string()),
+        Err(error) => Err(error),
+    };
+    match verdict {
         Ok(_) => {
             eprintln!("PERMITTED");
             std::process::exit(EXIT_PERMITTED);
@@ -167,8 +182,29 @@ async fn the_mainnet_gate_consults_the_canary_authorization() {
             output.status.code(),
             Some(EXIT_PERMITTED),
             "a labelled canary build holding a valid authorization must be \
-             permitted past the genesis gate.\nstderr: {stderr}"
+            permitted past the genesis gate.\nstderr: {stderr}"
         );
+
+        let output = Command::new(std::env::current_exe().unwrap())
+            .arg(CHILD_TEST)
+            .arg("--exact")
+            .arg("--nocapture")
+            .env(CHILD_ENDPOINT, &endpoint)
+            .env(CHILD_SEND, "1")
+            .env(AUTHORIZATION_ENV, &auth_path)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn send child")
+            .wait_with_output()
+            .expect("send child output");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            output.status.code(),
+            Some(EXIT_PERMITTED),
+            "the canary send path must pass only after the guarded single-use claim.\nstderr: {stderr}"
+        );
+        assert!(auth_path.with_file_name("canary.json.spent").exists());
     }
 }
 

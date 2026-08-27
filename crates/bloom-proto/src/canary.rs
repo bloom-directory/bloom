@@ -168,6 +168,17 @@ impl CanaryAuthorization {
                 "destination must differ from the source address",
             ));
         }
+        let account = self
+            .derivation_path
+            .strip_prefix("m/44'/501'/")
+            .and_then(|tail| tail.strip_suffix("'/0'"))
+            .and_then(|account| account.parse::<u32>().ok());
+        if account.is_none_or(|account| self.derivation_path != format!("m/44'/501'/{account}'/0'"))
+        {
+            return Err(CanaryError::invalid(
+                "derivation_path must be canonical m/44'/501'/account'/0'",
+            ));
+        }
         if self.transfer_lamports == 0 {
             return Err(CanaryError::invalid("transfer_lamports must be non-zero"));
         }
@@ -228,6 +239,7 @@ impl CanaryAuthorization {
         &self,
         wallet: &str,
         key_fingerprint: &str,
+        derivation_path: &str,
         source_address: &str,
         destination: &str,
         lamports: u64,
@@ -243,6 +255,12 @@ impl CanaryAuthorization {
             return Err(CanaryError::invalid(
                 "signing key is not the authorized key fingerprint",
             ));
+        }
+        if derivation_path != self.derivation_path {
+            return Err(CanaryError::invalid(format!(
+                "derivation path '{derivation_path}' is not the authorized path '{}'",
+                self.derivation_path
+            )));
         }
         if source_address != self.source_address {
             return Err(CanaryError::invalid(format!(
@@ -321,8 +339,23 @@ impl LoadedAuthorization {
         {
             Ok(mut file) => {
                 use std::io::Write as _;
-                let _ = writeln!(file, "{note}");
-                let _ = file.sync_all();
+                writeln!(file, "{note}").map_err(|error| CanaryError::Io {
+                    path: path.display().to_string(),
+                    kind: error.kind(),
+                })?;
+                file.sync_all().map_err(|error| CanaryError::Io {
+                    path: path.display().to_string(),
+                    kind: error.kind(),
+                })?;
+                drop(file);
+                if let Some(parent) = path.parent() {
+                    std::fs::File::open(parent)
+                        .and_then(|directory| directory.sync_all())
+                        .map_err(|error| CanaryError::Io {
+                            path: parent.display().to_string(),
+                            kind: error.kind(),
+                        })?;
+                }
                 Ok(())
             }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -499,6 +532,23 @@ mod tests {
     }
 
     #[test]
+    fn the_derivation_path_must_be_canonical_and_exact() {
+        for path in [
+            "m/44'/501'/02'/0'",
+            "m/44'/501'/+2'/0'",
+            "m/44'/501'/2'/1'",
+            "m/44'/60'/2'/0'",
+        ] {
+            let mut auth = authorization_fixture();
+            auth.derivation_path = path.into();
+            let error = auth
+                .validate_shape()
+                .expect_err("a noncanonical Solana path must be refused");
+            assert!(format!("{error}").contains("derivation_path"), "{error}");
+        }
+    }
+
+    #[test]
     fn another_artifact_expired_window_or_other_chain_is_refused() {
         let auth = authorization_fixture();
         let wrong_artifact = auth
@@ -524,16 +574,25 @@ mod tests {
         let other_key = "ee".repeat(32);
         let source = auth.source_address.clone();
         let destination = auth.destination.clone();
-        let ok =
-            |w: &str, k: &str, s: &str, d: &str, l, f| auth.authorizes_transfer(w, k, s, d, l, f);
-        ok("canary", &key, &source, &destination, 1_000_000, 5_000)
-            .expect("the exact authorized transfer must pass");
+        let ok = |w: &str, k: &str, p: &str, s: &str, d: &str, l, f| {
+            auth.authorizes_transfer(w, k, p, s, d, l, f)
+        };
+        ok(
+            "canary",
+            &key,
+            "m/44'/501'/0'/0'",
+            &source,
+            &destination,
+            1_000_000,
+            5_000,
+        )
+        .expect("the exact authorized transfer must pass");
 
-        assert!(ok("other", &key, &source, &destination, 1_000_000, 5_000).is_err());
         assert!(
             ok(
-                "canary",
-                &other_key,
+                "other",
+                &key,
+                "m/44'/501'/0'/0'",
                 &source,
                 &destination,
                 1_000_000,
@@ -541,11 +600,79 @@ mod tests {
             )
             .is_err()
         );
-        assert!(ok("canary", &key, "Elsewhere", &destination, 1_000_000, 5_000).is_err());
-        assert!(ok("canary", &key, &source, "Elsewhere", 1_000_000, 5_000).is_err());
+        assert!(
+            ok(
+                "canary",
+                &other_key,
+                "m/44'/501'/0'/0'",
+                &source,
+                &destination,
+                1_000_000,
+                5_000
+            )
+            .is_err()
+        );
+        assert!(
+            ok(
+                "canary",
+                &key,
+                "m/44'/501'/1'/0'",
+                &source,
+                &destination,
+                1_000_000,
+                5_000
+            )
+            .is_err()
+        );
+        assert!(
+            ok(
+                "canary",
+                &key,
+                "m/44'/501'/0'/0'",
+                "Elsewhere",
+                &destination,
+                1_000_000,
+                5_000
+            )
+            .is_err()
+        );
+        assert!(
+            ok(
+                "canary",
+                &key,
+                "m/44'/501'/0'/0'",
+                &source,
+                "Elsewhere",
+                1_000_000,
+                5_000
+            )
+            .is_err()
+        );
         // A *smaller* amount is still not the amount that was authorized.
-        assert!(ok("canary", &key, &source, &destination, 999_999, 5_000).is_err());
-        assert!(ok("canary", &key, &source, &destination, 1_000_000, 10_001).is_err());
+        assert!(
+            ok(
+                "canary",
+                &key,
+                "m/44'/501'/0'/0'",
+                &source,
+                &destination,
+                999_999,
+                5_000
+            )
+            .is_err()
+        );
+        assert!(
+            ok(
+                "canary",
+                &key,
+                "m/44'/501'/0'/0'",
+                &source,
+                &destination,
+                1_000_000,
+                10_001
+            )
+            .is_err()
+        );
     }
 
     #[test]
