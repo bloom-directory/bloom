@@ -3076,8 +3076,10 @@ impl WalletsHandler {
                         &child,
                         // Pin the full fingerprint, never the user's prefix:
                         // a prefix could later resolve to a different child.
-                        Some(key_ref.public_key_fingerprint.as_str().to_owned()),
-                        Some(derivation_path),
+                        bloom_solana_tx::engine::SolanaAccountPin {
+                            fingerprint: Some(key_ref.public_key_fingerprint.as_str().to_owned()),
+                            derivation_path: Some(derivation_path),
+                        },
                         &destination,
                         intent.lamports,
                         now_ms_u128(),

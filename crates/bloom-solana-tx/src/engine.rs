@@ -65,6 +65,17 @@ pub struct SolanaTransferIntent {
     pub account_fingerprint: Option<String>,
 }
 
+/// Optional exact child-account binding persisted with a staged transfer.
+///
+/// Keeping the fingerprint and derivation path together prevents this API
+/// from growing a separate positional argument for every account identity
+/// fact while preserving legacy stages that may carry only a fingerprint.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SolanaAccountPin {
+    pub fingerprint: Option<String>,
+    pub derivation_path: Option<String>,
+}
+
 impl SolanaTransferIntent {
     /// The destination as its raw 32-byte public key.
     pub fn destination_bytes(&self) -> Result<[u8; 32], String> {
@@ -161,8 +172,7 @@ impl SolanaTransferEngine {
         &self,
         wallet: &str,
         fee_payer: &[u8; 32],
-        account_fingerprint: Option<String>,
-        account_derivation_path: Option<String>,
+        account_pin: SolanaAccountPin,
         destination: &[u8; 32],
         lamports: u64,
         now_ms: u128,
@@ -197,8 +207,8 @@ impl SolanaTransferEngine {
             wallet: wallet.to_string(),
             chain: self.chain.clone(),
             fee_payer: bs58::encode(fee_payer).into_string(),
-            account_fingerprint,
-            account_derivation_path,
+            account_fingerprint: account_pin.fingerprint,
+            account_derivation_path: account_pin.derivation_path,
             destination: bs58::encode(destination).into_string(),
             lamports,
             fee_lamports,
@@ -275,8 +285,10 @@ impl SolanaTransferEngine {
                 // The replacement is the same transfer from the same account,
                 // so it carries the original pin forward rather than being
                 // re-resolved.
-                entry.staged.account_fingerprint.clone(),
-                entry.staged.account_derivation_path.clone(),
+                SolanaAccountPin {
+                    fingerprint: entry.staged.account_fingerprint.clone(),
+                    derivation_path: entry.staged.account_derivation_path.clone(),
+                },
                 &destination,
                 entry.staged.lamports,
                 now_ms,
@@ -411,15 +423,15 @@ impl SolanaTransferEngine {
             })?;
         loaded
             .authorization
-            .authorizes_transfer(
-                &entry.staged.wallet,
-                fingerprint,
+            .authorizes_transfer(&bloom_solana::canary::CanaryTransfer {
+                wallet: &entry.staged.wallet,
+                key_fingerprint: fingerprint,
                 derivation_path,
-                &entry.staged.fee_payer,
-                &entry.staged.destination,
-                entry.staged.lamports,
-                entry.staged.fee_lamports,
-            )
+                source_address: &entry.staged.fee_payer,
+                destination: &entry.staged.destination,
+                lamports: entry.staged.lamports,
+                fee_lamports: entry.staged.fee_lamports,
+            })
             .map_err(|error| EngineError::Invalid(error.to_string()))?;
         // The balance is read live rather than trusted from staging time: the
         // loss budget the operator agreed to is a statement about the funded

@@ -287,8 +287,7 @@ async fn stage_refuses_an_already_stale_latest_blockhash() {
         .stage(
             "wallet",
             &fee_payer,
-            None,
-            None,
+            Default::default(),
             &destination,
             1_000_000,
             now_ms,
@@ -327,8 +326,7 @@ async fn stage_with_a_fresh_blockhash_is_not_reaped_immediately() {
         .stage(
             "wallet",
             &fee_payer,
-            None,
-            None,
+            Default::default(),
             &destination,
             1_000_000,
             now_ms,
@@ -383,8 +381,7 @@ async fn full_transfer_lifecycle_stage_sign_broadcast() {
         .stage(
             "wallet",
             &fee_payer,
-            None,
-            None,
+            Default::default(),
             &destination,
             1_000_000,
             1_000,
@@ -652,8 +649,7 @@ async fn stage_and_sign(
         .stage(
             "wallet",
             &fee_payer,
-            None,
-            None,
+            Default::default(),
             &destination,
             1_000_000,
             1_000,
@@ -813,8 +809,7 @@ async fn signing_and_broadcast_both_refuse_an_expired_blockhash() {
         .stage(
             "wallet",
             &broker.child_pubkey(),
-            None,
-            None,
+            Default::default(),
             &destination,
             1_000_000,
             1_000,
@@ -880,8 +875,7 @@ async fn expired_transfer_restages_with_fresh_facts_and_no_reused_authority() {
         .stage(
             "wallet",
             &broker.child_pubkey(),
-            None,
-            None,
+            Default::default(),
             &destination,
             1_000_000,
             1_000,

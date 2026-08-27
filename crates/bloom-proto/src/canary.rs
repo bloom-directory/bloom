@@ -135,6 +135,19 @@ pub struct CanaryAuthorization {
     pub expires_ms: u128,
 }
 
+/// Exact staged facts checked against the authorization immediately before
+/// broadcast.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CanaryTransfer<'a> {
+    pub wallet: &'a str,
+    pub key_fingerprint: &'a str,
+    pub derivation_path: &'a str,
+    pub source_address: &'a str,
+    pub destination: &'a str,
+    pub lamports: u64,
+    pub fee_lamports: u64,
+}
+
 impl CanaryAuthorization {
     /// Structural validation, independent of the running binary and clock.
     pub fn validate_shape(&self) -> Result<(), CanaryError> {
@@ -235,55 +248,49 @@ impl CanaryAuthorization {
     /// The amount is compared for equality, not as a ceiling: the operator
     /// authorized one specific debit, and a smaller one is still not the one
     /// they were shown.
-    pub fn authorizes_transfer(
-        &self,
-        wallet: &str,
-        key_fingerprint: &str,
-        derivation_path: &str,
-        source_address: &str,
-        destination: &str,
-        lamports: u64,
-        fee_lamports: u64,
-    ) -> Result<(), CanaryError> {
-        if wallet != self.wallet {
+    pub fn authorizes_transfer(&self, transfer: &CanaryTransfer<'_>) -> Result<(), CanaryError> {
+        if transfer.wallet != self.wallet {
             return Err(CanaryError::invalid(format!(
-                "wallet '{wallet}' is not the authorized wallet '{}'",
-                self.wallet
+                "wallet '{}' is not the authorized wallet '{}'",
+                transfer.wallet, self.wallet
             )));
         }
-        if !key_fingerprint.eq_ignore_ascii_case(&self.key_fingerprint) {
+        if !transfer
+            .key_fingerprint
+            .eq_ignore_ascii_case(&self.key_fingerprint)
+        {
             return Err(CanaryError::invalid(
                 "signing key is not the authorized key fingerprint",
             ));
         }
-        if derivation_path != self.derivation_path {
+        if transfer.derivation_path != self.derivation_path {
             return Err(CanaryError::invalid(format!(
-                "derivation path '{derivation_path}' is not the authorized path '{}'",
-                self.derivation_path
+                "derivation path '{}' is not the authorized path '{}'",
+                transfer.derivation_path, self.derivation_path
             )));
         }
-        if source_address != self.source_address {
+        if transfer.source_address != self.source_address {
             return Err(CanaryError::invalid(format!(
-                "source '{source_address}' is not the authorized source '{}'",
-                self.source_address
+                "source '{}' is not the authorized source '{}'",
+                transfer.source_address, self.source_address
             )));
         }
-        if destination != self.destination {
+        if transfer.destination != self.destination {
             return Err(CanaryError::invalid(format!(
-                "destination '{destination}' is not the authorized destination '{}'",
-                self.destination
+                "destination '{}' is not the authorized destination '{}'",
+                transfer.destination, self.destination
             )));
         }
-        if lamports != self.transfer_lamports {
+        if transfer.lamports != self.transfer_lamports {
             return Err(CanaryError::invalid(format!(
-                "amount {lamports} is not the authorized amount {}",
-                self.transfer_lamports
+                "amount {} is not the authorized amount {}",
+                transfer.lamports, self.transfer_lamports
             )));
         }
-        if fee_lamports > self.max_fee_lamports {
+        if transfer.fee_lamports > self.max_fee_lamports {
             return Err(CanaryError::invalid(format!(
-                "fee {fee_lamports} exceeds the authorized maximum {}",
-                self.max_fee_lamports
+                "fee {} exceeds the authorized maximum {}",
+                transfer.fee_lamports, self.max_fee_lamports
             )));
         }
         Ok(())
@@ -594,7 +601,15 @@ mod tests {
         let source = auth.source_address.clone();
         let destination = auth.destination.clone();
         let ok = |w: &str, k: &str, p: &str, s: &str, d: &str, l, f| {
-            auth.authorizes_transfer(w, k, p, s, d, l, f)
+            auth.authorizes_transfer(&CanaryTransfer {
+                wallet: w,
+                key_fingerprint: k,
+                derivation_path: p,
+                source_address: s,
+                destination: d,
+                lamports: l,
+                fee_lamports: f,
+            })
         };
         ok(
             "canary",
