@@ -530,15 +530,15 @@ impl SolanaTransferEngine {
             })?;
         loaded
             .authorization
-            .authorizes_transfer(
-                &entry.staged.wallet,
-                fingerprint,
+            .authorizes_transfer(&bloom_solana::canary::CanaryTransfer {
+                wallet: &entry.staged.wallet,
+                key_fingerprint: fingerprint,
                 derivation_path,
-                &entry.staged.fee_payer,
-                &entry.staged.destination,
-                entry.staged.lamports,
-                entry.staged.fee_lamports,
-            )
+                source_address: &entry.staged.fee_payer,
+                destination: &entry.staged.destination,
+                lamports: entry.staged.lamports,
+                fee_lamports: entry.staged.fee_lamports,
+            })
             .map_err(|error| EngineError::Invalid(error.to_string()))?;
         // The balance is read live rather than trusted from staging time: the
         // loss budget the operator agreed to is a statement about the funded
