@@ -270,9 +270,7 @@ fn label_canary_machine(staging: &Path) {
     let machine = staging.join("bin/bloom");
     let mut contents = fs::read_to_string(&machine).unwrap();
     contents.push_str(
-        "# BLOOM_MAINNET_CANARY_ARTIFACT\n\
-         # BLOOM_SOLANA_MAINNET_CANARY_AUTHORIZATION\n\
-         # NON-PRODUCTION-MAINNET-CANARY\n\
+        "# BLOOM_SOLANA_MAINNET_CANARY_AUTHORIZATION\n\
          # mainnet-canary\n",
     );
     fs::write(machine, contents).unwrap();

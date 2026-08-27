@@ -171,9 +171,7 @@ require_canary_machine_markers() {
   local root="$1"
   local marker status
   for marker in \
-    BLOOM_MAINNET_CANARY_ARTIFACT \
     BLOOM_SOLANA_MAINNET_CANARY_AUTHORIZATION \
-    NON-PRODUCTION-MAINNET-CANARY \
     mainnet-canary
   do
     if LC_ALL=C grep -aF "$marker" "$root/bin/bloom" >/dev/null; then

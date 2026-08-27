@@ -27,8 +27,10 @@ Every signed payload carries an `ARTIFACT_CLASS`. The default and ordinary
 release class is `production`; it continues to reject every mainnet-canary
 marker. The only other accepted class is `solana-mainnet-canary-v1`, selected
 with `BLOOM_ARTIFACT_CLASS`, and it requires all canary markers in the Machine
-binary while rejecting them anywhere else. It is a Linux-only,
-non-production artifact. Verification and installation each require the
+binary while rejecting them anywhere else. Required presence checks use the
+runtime authorization/capability markers; optimized linking may remove the
+compile-only label string. It is a Linux-only, non-production artifact.
+Verification and installation each require the
 separate `BLOOM_ALLOW_SOLANA_MAINNET_CANARY_BUNDLE=true` opt in, and the Linux
 installer records the class beside the installed instance configuration.
 
