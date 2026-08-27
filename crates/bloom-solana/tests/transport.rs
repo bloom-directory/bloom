@@ -53,6 +53,64 @@ async fn spawn_stub() -> String {
     format!("http://{addr}/")
 }
 
+async fn spawn_write_stub(genesis: String, send_status: u16, send_calls: Arc<AtomicU64>) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                break;
+            };
+            let genesis = genesis.clone();
+            let send_calls = send_calls.clone();
+            tokio::spawn(async move {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = vec![0u8; 8192];
+                let n = socket.read(&mut buf).await.unwrap_or(0);
+                let body = String::from_utf8_lossy(&buf[..n])
+                    .split("\r\n\r\n")
+                    .nth(1)
+                    .unwrap_or_default()
+                    .to_string();
+                let method = serde_json::from_str::<serde_json::Value>(&body)
+                    .ok()
+                    .and_then(|value| {
+                        value
+                            .get("method")
+                            .and_then(|method| method.as_str())
+                            .map(str::to_owned)
+                    })
+                    .unwrap_or_default();
+                if method == "sendTransaction" {
+                    send_calls.fetch_add(1, Ordering::SeqCst);
+                }
+                let payload = match method.as_str() {
+                    "getGenesisHash" => {
+                        format!(r#"{{"jsonrpc":"2.0","id":1,"result":"{genesis}"}}"#)
+                    }
+                    "sendTransaction" if send_status == 200 => {
+                        r#"{"jsonrpc":"2.0","id":1,"result":"signature"}"#.to_string()
+                    }
+                    _ => String::new(),
+                };
+                let response = if send_status != 200 && method == "sendTransaction" {
+                    format!(
+                        "HTTP/1.1 {send_status} Service Unavailable\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                    )
+                } else {
+                    format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                        payload.len(),
+                        payload
+                    )
+                };
+                let _ = socket.write_all(response.as_bytes()).await;
+            });
+        }
+    });
+    format!("http://{addr}/")
+}
+
 fn spec(endpoint: &str) -> SolanaSpec {
     SolanaSpec {
         name: "solana-test".into(),
@@ -91,6 +149,57 @@ async fn genesis_mismatch_is_refused() {
         matches!(err, SolanaRpcError::GenesisMismatch { .. }),
         "{err}"
     );
+}
+
+#[tokio::test]
+async fn mixed_genesis_endpoints_are_refused_before_any_send() {
+    let primary_sends = Arc::new(AtomicU64::new(0));
+    let backup_sends = Arc::new(AtomicU64::new(0));
+    let primary = spawn_write_stub("G".repeat(32), 200, primary_sends.clone()).await;
+    let backup = spawn_write_stub("X".repeat(32), 200, backup_sends.clone()).await;
+    let mut spec = spec(&primary);
+    spec.allow_broadcast = true;
+    spec.endpoints.push(bloom_proto::EndpointSpec {
+        url: backup,
+        weight: 50,
+        cu_per_sec: None,
+        max_rps: None,
+        http_only: false,
+    });
+    let client = SolanaClient::build(&spec).unwrap();
+
+    let error = client
+        .send_transaction("signed-transaction")
+        .await
+        .expect_err("every configured endpoint must prove the pinned genesis");
+    assert!(matches!(error, SolanaRpcError::GenesisMismatch { .. }));
+    assert_eq!(primary_sends.load(Ordering::SeqCst), 0);
+    assert_eq!(backup_sends.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn ambiguous_send_is_attempted_once_without_failover() {
+    let primary_sends = Arc::new(AtomicU64::new(0));
+    let backup_sends = Arc::new(AtomicU64::new(0));
+    let primary = spawn_write_stub("G".repeat(32), 503, primary_sends.clone()).await;
+    let backup = spawn_write_stub("G".repeat(32), 200, backup_sends.clone()).await;
+    let mut spec = spec(&primary);
+    spec.allow_broadcast = true;
+    spec.endpoints.push(bloom_proto::EndpointSpec {
+        url: backup,
+        weight: 50,
+        cu_per_sec: None,
+        max_rps: None,
+        http_only: false,
+    });
+    let client = SolanaClient::build(&spec).unwrap();
+
+    client
+        .send_transaction("signed-transaction")
+        .await
+        .expect_err("an ambiguous write must not retry or fail over");
+    assert_eq!(primary_sends.load(Ordering::SeqCst), 1);
+    assert_eq!(backup_sends.load(Ordering::SeqCst), 0);
 }
 
 /// A stub that fails the first N requests with 503, then succeeds, to prove
