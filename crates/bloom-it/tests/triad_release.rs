@@ -179,7 +179,14 @@ fn make_staging(root: &Path) -> PathBuf {
     ] {
         let path = staging.join("bin").join(binary);
         let version = if binary == "bloom" { "0.1.3" } else { "0.1.0" };
-        fs::write(&path, format!("#!/bin/sh\necho {binary} {version}\n")).unwrap();
+        let script = if binary == "bloom" {
+            format!(
+                "#!/bin/sh\nprintf '{binary} {version}\\nbloom-daemon unavailable\\nbloom-ipc 1 (not negotiated)\\n'\n"
+            )
+        } else {
+            format!("#!/bin/sh\necho {binary} {version}\n")
+        };
+        fs::write(&path, script).unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
     }
     fs::write(staging.join("PLATFORM_CLAIM"), b"test-unclaimed\n").unwrap();
