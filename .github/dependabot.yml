@@ -5,14 +5,20 @@ updates:
     schedule:
       interval: weekly
       day: monday
+    # Minor and patch bumps (including security fixes) ride together;
+    # semver-major bumps open their own PRs so they never block the group.
     groups:
-      cargo-dependencies:
-        patterns: ["*"]
+      cargo-minor-and-patch:
+        update-types:
+          - minor
+          - patch
   - package-ecosystem: github-actions
     directory: /
     schedule:
       interval: weekly
       day: monday
     groups:
-      github-actions:
-        patterns: ["*"]
+      github-actions-minor-and-patch:
+        update-types:
+          - minor
+          - patch
