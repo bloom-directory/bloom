@@ -309,13 +309,16 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           cache-targets: false
-      # Deliberately not `--all-features`: that would enable `mainnet-canary`,
-      # which builds a NON-PRODUCTION artifact able to broadcast to Solana
-      # mainnet-beta. The canary's own gates are exercised in the step below.
-      - name: Build full-feature binary with locked dependencies
+      - name: Build production-feature binary with locked dependencies
         run: |
-          cargo build --release -p bloom --locked \
-            --features mount,bytecode-decompile,triad-dev-harness
+          cargo build --release -p bloom --locked --no-default-features \
+            --features mount,bytecode-decompile
+      - name: Production binary must exclude developer and canary capabilities
+        run: packaging/triad/release/check-production-machine-binary.sh target/release/bloom
+      - name: Check developer harness separately from the production artifact
+        run: |
+          cargo check -p bloom --locked --no-default-features \
+            --features mount,triad-dev-harness
       - name: Release builds must reject the mainnet canary
         run: |
           set -euo pipefail

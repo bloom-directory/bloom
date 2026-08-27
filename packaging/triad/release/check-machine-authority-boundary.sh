@@ -239,7 +239,7 @@ forbidden_dependencies() {
 
 feature_is_forbidden() {
   case "${1#*:}" in
-    local-integration|unsafe-debug-signer|triad-dev-harness|unsigned-audit-test-seam|audit-test-seam)
+    local-integration|unsafe-debug-signer|unsafe-debug-approver|triad-dev-harness|mainnet-canary|unsigned-audit-test-seam|audit-test-seam)
       return 0
       ;;
     *) return 1 ;;
@@ -305,7 +305,7 @@ require_clean_dependencies() {
   while IFS=$'\t' read -r label package defaults features; do
     [[ -z "$label" || "$label" == \#* ]] && continue
     case ",${features}," in
-      *,unsafe-debug-signer,*|*,local-integration,*|*,triad-dev-harness,*|*,unsigned-audit-test-seam,*|*,audit-test-seam,*)
+      *,unsafe-debug-signer,*|*,unsafe-debug-approver,*|*,local-integration,*|*,triad-dev-harness,*|*,mainnet-canary,*|*,unsigned-audit-test-seam,*|*,audit-test-seam,*)
         echo "forbidden production Machine feature in $label: $features" >&2
         failed=1
         ;;

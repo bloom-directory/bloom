@@ -73,7 +73,15 @@ lock_installer() {
   chown root:wheel "$lock"; printf '%s\n' "$$" >"$lock/pid"; chmod 0600 "$lock/pid"
 }
 
-field() { plutil -extract "$2" raw -o - "$1"; }
+field() {
+  if command -v plutil >/dev/null 2>&1; then
+    plutil -extract "$2" raw -o - "$1"
+  else
+    # Staged-root conformance tests run on Linux, where enrollment records are
+    # still JSON but Apple's plutil is unavailable.
+    python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))[sys.argv[2]])' "$1" "$2"
+  fi
+}
 record_exists() { dscl . -read "/$1/$2" >/dev/null 2>&1; }
 next_id() {
   dscl . -list "/$1" "$2" | awk '$NF~/^[0-9]+$/&&$NF>m{m=$NF} END{if(m>=2147483646)exit 1;print m+1}'
@@ -323,8 +331,13 @@ switch_release() {
   ln -s "releases/$digest" "$release_base/current.new.$$"
   $live && chown -h root:wheel "$release_base/current.new.$$"
   # BSD mv otherwise follows a destination symlink to a directory and moves
-  # the candidate link inside the old immutable release.
-  mv -fh "$release_base/current.new.$$" "$release_base/current"
+  # the candidate link inside the old immutable release. GNU mv needs -T for
+  # the equivalent no-dereference replacement and does not implement BSD's -h.
+  if [[ "$(uname -s)" == "Darwin" ]]; then
+    mv -fh "$release_base/current.new.$$" "$release_base/current"
+  else
+    mv -Tf "$release_base/current.new.$$" "$release_base/current"
+  fi
   machine_binary="$release_base/current/bloom"; broker_binary="$release_base/current/bloom-broker"; signer_binary="$release_base/current/bloom-signer"
 }
 

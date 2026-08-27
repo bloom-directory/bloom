@@ -13,6 +13,13 @@ source_date_epoch="$4"
 tar_command="${TAR:-tar}"
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 
+if "$tar_command" --version 2>/dev/null | grep -F 'GNU tar' >/dev/null; then
+  tar_owner_args=(--owner=0 --group=0 --numeric-owner)
+else
+  # libarchive/bsdtar uses separate numeric and textual owner flags.
+  tar_owner_args=(--uid=0 --gid=0 --uname=root --gname=root)
+fi
+
 python3 "$script_dir/check-legacy-hash-only-routes.py"
 
 machine_artifact_paths() {
@@ -138,10 +145,15 @@ accepting_verifier
 mint_approval
 BLOOM_TRIAD_DEVELOPER_ROOT
 unsafe-debug-signer
+unsafe-debug-approver
 unsigned-audit-test-seam
 audit-test-seam
 local-integration
 triad-dev-harness
+BLOOM_MAINNET_CANARY_ARTIFACT
+BLOOM_SOLANA_MAINNET_CANARY_AUTHORIZATION
+NON-PRODUCTION-MAINNET-CANARY
+mainnet-canary
 triad-authority-fixture
 test-only-release-key
 test_credential
@@ -405,10 +417,7 @@ archive_tmp="$work/archive.tar"
   find bloom-triad -print | LC_ALL=C sort > archive-files
   "$tar_command" \
   --format=ustar \
-  --uid=0 \
-  --gid=0 \
-  --uname=root \
-  --gname=root \
+  "${tar_owner_args[@]}" \
   --no-recursion \
   -cf "$archive_tmp" \
   -T archive-files

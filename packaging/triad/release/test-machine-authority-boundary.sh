@@ -58,6 +58,7 @@ done
 cat >"$work/forbidden-feature-sets.tsv" <<'EOF'
 # label	package	default-features	features
 forbidden-dev-harness	bloom	no	triad-dev-harness
+forbidden-mainnet-canary	bloom	no	mainnet-canary
 EOF
 if BLOOM_MACHINE_PRODUCTION_FEATURE_SETS="$work/forbidden-feature-sets.tsv" \
   "$checker" --require-clean >"$work/forbidden-feature.out" 2>&1
@@ -66,6 +67,8 @@ then
   exit 1
 fi
 grep -F 'forbidden production Machine feature in forbidden-dev-harness: triad-dev-harness' \
+  "$work/forbidden-feature.out" >/dev/null
+grep -F 'forbidden production Machine feature in forbidden-mainnet-canary: mainnet-canary' \
   "$work/forbidden-feature.out" >/dev/null
 
 for audit_feature in audit-test-seam; do
@@ -223,5 +226,31 @@ grep -F 'failed to resolve production Machine source roots' \
 
 "$checker" --require-clean >"$work/strict.out"
 grep -Fx 'Machine production authority boundary is clean' "$work/strict.out" >/dev/null
+
+binary_checker="$script_dir/check-production-machine-binary.sh"
+printf '#!/bin/sh\nprintf "production\\n"\n' >"$work/clean-machine"
+chmod +x "$work/clean-machine"
+"$binary_checker" "$work/clean-machine" >"$work/clean-machine.out"
+grep -Fx 'Production Machine binary contains no developer or canary capability' \
+  "$work/clean-machine.out" >/dev/null
+
+for marker in \
+  BLOOM_TRIAD_DEVELOPER_ROOT \
+  triad-dev-harness \
+  unsafe-debug-approver \
+  BLOOM_SOLANA_MAINNET_CANARY_AUTHORIZATION \
+  NON-PRODUCTION-MAINNET-CANARY
+do
+  printf '#!/bin/sh\n%s\n' "$marker" >"$work/forbidden-machine"
+  chmod +x "$work/forbidden-machine"
+  if "$binary_checker" "$work/forbidden-machine" \
+    >"$work/forbidden-machine.out" 2>&1
+  then
+    echo "synthetic production binary containing $marker unexpectedly passed" >&2
+    exit 1
+  fi
+  grep -F "forbidden developer/canary marker in production Machine binary: $marker" \
+    "$work/forbidden-machine.out" >/dev/null
+done
 
 echo "Machine authority boundary M6 tests passed"

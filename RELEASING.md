@@ -23,8 +23,13 @@ The `prepare` job enforces these hard gates
 4. The workspace `version` in `Cargo.toml` at that commit equals the tag
    (`X.Y.Z`).
 
-**No other release-eligibility policy is checked by the workflow.** In
-particular, `release.yml` does **not** verify that:
+Before any artifact is built, the test job also verifies the production
+Machine authority boundary. Every release target is built from the explicit
+`mount,bytecode-decompile` production feature set with default features
+disabled, then the resulting binary is scanned for developer-harness and
+mainnet-canary markers before packaging.
+
+The workflow does **not** verify that:
 
 - the bump arrived via a pull request,
 - the new version is greater than the previous one (monotonicity),
