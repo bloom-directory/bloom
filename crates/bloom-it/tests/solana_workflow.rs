@@ -275,7 +275,11 @@ async fn solana_full_stage_confirm_flow() -> Result<()> {
             locator: "wallet/derived/solana-0".into(),
             key_spec: KeySpec::Ed25519,
             public_key_fingerprint: Digest32::from_bytes(Sha256::digest(spki(&pubkey)).into()),
-            derivation: None,
+            derivation: Some(DerivationRef::Bip39Multicurve {
+                wallet_seed_ref: tok("wallet-seed"),
+                profile: DerivationProfile::Bip44SolanaSlip10Ed25519V1,
+                path: derived.path.clone(),
+            }),
         },
         approval_active: AtomicBool::new(false),
         sign_calls: parking_lot::Mutex::new(Vec::new()),
