@@ -844,6 +844,7 @@ mod tests {
             chain: "solana-devnet".into(),
             fee_payer: "11111111111111111111111111111111".into(),
             account_fingerprint: None,
+            account_derivation_path: None,
             destination: "11111111111111111111111111111111".into(),
             lamports: 1,
             fee_lamports: 5000,

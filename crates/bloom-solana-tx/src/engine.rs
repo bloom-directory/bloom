@@ -162,6 +162,7 @@ impl SolanaTransferEngine {
         wallet: &str,
         fee_payer: &[u8; 32],
         account_fingerprint: Option<String>,
+        account_derivation_path: Option<String>,
         destination: &[u8; 32],
         lamports: u64,
         now_ms: u128,
@@ -197,6 +198,7 @@ impl SolanaTransferEngine {
             chain: self.chain.clone(),
             fee_payer: bs58::encode(fee_payer).into_string(),
             account_fingerprint,
+            account_derivation_path,
             destination: bs58::encode(destination).into_string(),
             lamports,
             fee_lamports,
@@ -274,6 +276,7 @@ impl SolanaTransferEngine {
                 // so it carries the original pin forward rather than being
                 // re-resolved.
                 entry.staged.account_fingerprint.clone(),
+                entry.staged.account_derivation_path.clone(),
                 &destination,
                 entry.staged.lamports,
                 now_ms,
@@ -570,6 +573,25 @@ fn validate_staged_account(
             "selected Solana account differs from the account this transfer was staged for".into(),
         ));
     }
+    if let Some(expected_path) = staged.account_derivation_path.as_deref() {
+        let selected_path = match selected.derivation.as_ref() {
+            Some(bloom_broker_api::DerivationRef::Bip39Multicurve {
+                profile: bloom_broker_api::DerivationProfile::Bip44SolanaSlip10Ed25519V1,
+                path,
+                ..
+            }) => path.as_str(),
+            _ => {
+                return Err(EngineError::Invalid(
+                    "selected Solana account has no canonical BIP-39 derivation path".into(),
+                ));
+            }
+        };
+        if selected_path != expected_path {
+            return Err(EngineError::Invalid(
+                "selected Solana account derivation path differs from the staged transfer".into(),
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -626,7 +648,11 @@ mod tests {
             locator: "wallet/derived/0".into(),
             key_spec: bloom_broker_api::KeySpec::Ed25519,
             public_key_fingerprint: Digest32::new(fingerprint.to_owned()).unwrap(),
-            derivation: None,
+            derivation: Some(bloom_broker_api::DerivationRef::Bip39Multicurve {
+                wallet_seed_ref: bloom_broker_api::Token::new("wallet-seed").unwrap(),
+                profile: bloom_broker_api::DerivationProfile::Bip44SolanaSlip10Ed25519V1,
+                path: "m/44'/501'/0'/0'".into(),
+            }),
         }
     }
 
@@ -658,6 +684,23 @@ mod tests {
             matches!(&error, EngineError::Invalid(message) if message.contains("none was selected")),
             "{error:?}"
         );
+
+        staged.account_derivation_path = Some("m/44'/501'/0'/0'".into());
+        validate_staged_account(&staged, Some(&key_ref_with(&pinned)))
+            .expect("the canonical staged path matches the selected account");
+        let mut wrong_path = key_ref_with(&pinned);
+        let Some(bloom_broker_api::DerivationRef::Bip39Multicurve { path, .. }) =
+            wrong_path.derivation.as_mut()
+        else {
+            unreachable!()
+        };
+        *path = "m/44'/501'/1'/0'".into();
+        let error = validate_staged_account(&staged, Some(&wrong_path))
+            .expect_err("a substituted derivation path must fail closed");
+        assert!(
+            matches!(&error, EngineError::Invalid(message) if message.contains("derivation path differs")),
+            "{error:?}"
+        );
     }
 
     #[test]
@@ -683,6 +726,7 @@ mod tests {
             chain: "solana-devnet".into(),
             fee_payer: bs58::encode(payer).into_string(),
             account_fingerprint: None,
+            account_derivation_path: None,
             destination: bs58::encode(destination).into_string(),
             lamports: 1_000_000,
             fee_lamports: 5_000,

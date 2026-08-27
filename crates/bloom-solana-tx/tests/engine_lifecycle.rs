@@ -284,7 +284,15 @@ async fn stage_refuses_an_already_stale_latest_blockhash() {
         .to_bytes();
     let now_ms = 1_000_000u128;
     let error = engine
-        .stage("wallet", &fee_payer, None, &destination, 1_000_000, now_ms)
+        .stage(
+            "wallet",
+            &fee_payer,
+            None,
+            None,
+            &destination,
+            1_000_000,
+            now_ms,
+        )
         .await
         .unwrap_err();
     assert!(error.to_string().contains("staged blockhash expired"));
@@ -316,7 +324,15 @@ async fn stage_with_a_fresh_blockhash_is_not_reaped_immediately() {
         .to_bytes();
     let now_ms = 1_000_000u128;
     let staged = engine
-        .stage("wallet", &fee_payer, None, &destination, 1_000_000, now_ms)
+        .stage(
+            "wallet",
+            &fee_payer,
+            None,
+            None,
+            &destination,
+            1_000_000,
+            now_ms,
+        )
         .await
         .unwrap();
     assert!(
@@ -364,7 +380,15 @@ async fn full_transfer_lifecycle_stage_sign_broadcast() {
 
     // Stage.
     let staged = engine
-        .stage("wallet", &fee_payer, None, &destination, 1_000_000, 1_000)
+        .stage(
+            "wallet",
+            &fee_payer,
+            None,
+            None,
+            &destination,
+            1_000_000,
+            1_000,
+        )
         .await
         .unwrap();
     assert_eq!(staged.status, SolanaTxStatus::Pending);
@@ -625,7 +649,15 @@ async fn stage_and_sign(
         .verifying_key()
         .to_bytes();
     let staged = engine
-        .stage("wallet", &fee_payer, None, &destination, 1_000_000, 1_000)
+        .stage(
+            "wallet",
+            &fee_payer,
+            None,
+            None,
+            &destination,
+            1_000_000,
+            1_000,
+        )
         .await
         .unwrap();
     let first = engine
@@ -782,6 +814,7 @@ async fn signing_and_broadcast_both_refuse_an_expired_blockhash() {
             "wallet",
             &broker.child_pubkey(),
             None,
+            None,
             &destination,
             1_000_000,
             1_000,
@@ -847,6 +880,7 @@ async fn expired_transfer_restages_with_fresh_facts_and_no_reused_authority() {
         .stage(
             "wallet",
             &broker.child_pubkey(),
+            None,
             None,
             &destination,
             1_000_000,
