@@ -714,6 +714,16 @@ async fn launch_custody_ceremony(
             format!("custody requires the authenticated Machine-to-Broker edge: {error:#}"),
         )
     })?;
+    let workflow = if legacy_migration.is_some() {
+        "credential_migration"
+    } else {
+        match ceremony_kind {
+            bloom_broker_api::CeremonyKind::WalletImport => "wallet_import",
+            bloom_broker_api::CeremonyKind::CredentialReplace => "credential_rebind",
+            bloom_broker_api::CeremonyKind::WalletDelete => "wallet_delete",
+            _ => "wallet_custody",
+        }
+    };
     let (operation_id, exact_terms_digest, legacy_passkey_migration) =
         if let Some(migration) = legacy_migration {
             (
@@ -761,21 +771,26 @@ async fn launch_custody_ceremony(
         .await
         .map_err(anyhow::Error::new)
         .context("prepare Broker custody ceremony")?;
-    let projection = bloom_machine_client::CeremonyProjection::from_custody_prepare(
-        &response,
-        current_unix_ms(),
-    )
-    .map_err(anyhow::Error::new)
-    .context("construct Machine custody projection")?;
-    let projection_path = persist_ceremony_projection(home, &projection)?;
-    Ok(format!(
-        "operation_id: {}\nceremony_kind: {:?}\nceremony_url: {}\nceremony_expires_at_ms: {}\nprojection: {}\n",
-        response.custody_operation_id,
-        response.ceremony_kind,
-        response.ceremony_url,
-        response.ceremony_expires_at_ms.get(),
-        projection_path.display(),
-    ))
+    let prepared_operation_id = response.custody_operation_id.as_str().to_owned();
+    emit_remote_preparation(workflow, Some(&prepared_operation_id));
+    let local_result = (|| {
+        let projection = bloom_machine_client::CeremonyProjection::from_custody_prepare(
+            &response,
+            current_unix_ms(),
+        )
+        .map_err(anyhow::Error::new)
+        .context("construct Machine custody projection")?;
+        let projection_path = persist_ceremony_projection(home, &projection)?;
+        Ok(format!(
+            "operation_id: {}\nceremony_kind: {:?}\nceremony_url: {}\nceremony_expires_at_ms: {}\nprojection: {}\n",
+            response.custody_operation_id,
+            response.ceremony_kind,
+            response.ceremony_url,
+            response.ceremony_expires_at_ms.get(),
+            projection_path.display(),
+        ))
+    })();
+    finish_remote_preparation(workflow, Some(&prepared_operation_id), local_result)
 }
 
 #[derive(serde::Deserialize)]
@@ -864,12 +879,14 @@ impl MachineCommandService for DaemonMachineCommands {
                 MachineCommandEventClass::DurableMutation => {
                     emit_machine_mutation(workflow, operation_id.as_deref(), "started");
                 }
-                MachineCommandEventClass::Prepared => info!(
-                    event = "machine.workflow_transition",
-                    workflow,
-                    operation_id = operation_id.as_deref().unwrap_or(""),
-                    state = "started"
-                ),
+                MachineCommandEventClass::Prepared | MachineCommandEventClass::RemotePrepared => {
+                    info!(
+                        event = "machine.workflow_transition",
+                        workflow,
+                        operation_id = operation_id.as_deref().unwrap_or(""),
+                        state = "started"
+                    )
+                }
                 MachineCommandEventClass::Read => {}
             }
             let result = execute_machine_command(&self.home, &self.daemon, command).await;
@@ -891,6 +908,13 @@ impl MachineCommandService for DaemonMachineCommands {
                         "rejected"
                     }
                 ),
+                MachineCommandEventClass::RemotePrepared => {
+                    emit_machine_preparation_rejection_if_needed(
+                        workflow,
+                        operation_id.as_deref(),
+                        &result,
+                    );
+                }
                 MachineCommandEventClass::Read => debug!(
                     event = "machine.command_outcome",
                     workflow,
@@ -900,6 +924,24 @@ impl MachineCommandService for DaemonMachineCommands {
             }
             result.map_err(machine_error_from_anyhow)
         })
+    }
+}
+
+fn emit_machine_preparation_rejection_if_needed<T>(
+    workflow: &str,
+    operation_id: Option<&str>,
+    result: &Result<T>,
+) {
+    let Some(error) = result.as_ref().err() else {
+        return;
+    };
+    if !error.is::<RemotePreparationCompleted>() {
+        info!(
+            event = "machine.workflow_transition",
+            workflow,
+            operation_id = operation_id.unwrap_or(""),
+            state = "rejected"
+        );
     }
 }
 
@@ -934,6 +976,7 @@ fn emit_machine_ready() {
 enum MachineCommandEventClass {
     Read,
     Prepared,
+    RemotePrepared,
     DurableMutation,
 }
 
@@ -954,12 +997,16 @@ fn machine_command_event_fields(
                 MachineCustodyKind::Delete => "wallet_delete",
             },
             None,
-            MachineCommandEventClass::Prepared,
+            if matches!(kind, MachineCustodyKind::New) {
+                MachineCommandEventClass::Prepared
+            } else {
+                MachineCommandEventClass::RemotePrepared
+            },
         ),
         MachineCommand::WalletMigrate { .. } => (
             "credential_migration",
             None,
-            MachineCommandEventClass::Prepared,
+            MachineCommandEventClass::RemotePrepared,
         ),
         MachineCommand::WalletPolicyPrepare { .. } => {
             ("policy_update", None, MachineCommandEventClass::Prepared)
@@ -1306,7 +1353,7 @@ async fn execute_machine_command(
                 Some(migration.clone()),
             )
             .await?;
-            daemon
+            let local_result = daemon
                 .wallet_projections
                 .begin_legacy_migration(
                     &migration.operation_id,
@@ -1315,8 +1362,13 @@ async fn execute_machine_command(
                 )
                 .await
                 .map_err(anyhow::Error::new)
-                .context("record pending legacy migration")?;
-            output
+                .context("record pending legacy migration")
+                .map(|()| output);
+            finish_remote_preparation(
+                "credential_migration",
+                Some(migration.operation_id.as_str()),
+                local_result,
+            )?
         }
         MachineCommand::WalletPolicyPrepare {
             name,
@@ -1913,6 +1965,43 @@ impl std::fmt::Display for RemoteMutationCommitted {
 
 impl std::error::Error for RemoteMutationCommitted {}
 
+#[derive(Debug)]
+struct RemotePreparationCompleted;
+
+impl std::fmt::Display for RemotePreparationCompleted {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("remote preparation completed before local processing")
+    }
+}
+
+impl std::error::Error for RemotePreparationCompleted {}
+
+fn emit_remote_preparation(workflow: &str, operation_id: Option<&str>) {
+    info!(
+        event = "machine.workflow_transition",
+        workflow,
+        operation_id = operation_id.unwrap_or(""),
+        state = "prepared"
+    );
+}
+
+fn finish_remote_preparation<T>(
+    workflow: &str,
+    operation_id: Option<&str>,
+    result: Result<T>,
+) -> Result<T> {
+    if result.is_err() {
+        warn!(
+            event = "machine.local_post_prepare_failed",
+            workflow,
+            operation_id = operation_id.unwrap_or(""),
+            remote_state = "prepared",
+            error_kind = "local_processing"
+        );
+    }
+    result.context(RemotePreparationCompleted)
+}
+
 fn finish_ceremony_cancel_projection<T>(operation_id: &str, result: Result<T>) -> Result<T> {
     if result.is_err() {
         emit_ceremony_local_projection_failure(operation_id);
@@ -1953,11 +2042,12 @@ async fn handle_operation(home: &HomeDir, command: OperationCmd) -> Result<Strin
         )
     })?;
     let status = if cancel {
-        client
-            .cancel_operation(operation_id.clone())
-            .await
-            .map_err(anyhow::Error::new)
-            .context("cancel Broker operation before downstream acceptance")?
+        operation_cancel_remote_result(
+            operation_id.as_str(),
+            client.cancel_operation(operation_id.clone()).await,
+        )
+        .map_err(anyhow::Error::new)
+        .context("cancel Broker operation before downstream acceptance")?
     } else {
         client
             .operation_status(operation_id.clone())
@@ -1965,14 +2055,41 @@ async fn handle_operation(home: &HomeDir, command: OperationCmd) -> Result<Strin
             .map_err(anyhow::Error::new)
             .context("read Broker operation status")?
     };
-    anyhow::ensure!(
-        status.operation_id == operation_id,
-        "Broker operation status identity mismatch"
-    );
-    Ok(format!(
-        "{}\n",
-        serde_json::to_string_pretty(&status).context("encode Broker operation status")?
-    ))
+    let local_result = (|| {
+        anyhow::ensure!(
+            status.operation_id == operation_id,
+            "Broker operation status identity mismatch"
+        );
+        Ok(format!(
+            "{}\n",
+            serde_json::to_string_pretty(&status).context("encode Broker operation status")?
+        ))
+    })();
+    if cancel {
+        finish_operation_cancel_local_result(operation_id.as_str(), local_result)
+    } else {
+        local_result
+    }
+}
+
+fn operation_cancel_remote_result<T, E>(operation_id: &str, result: Result<T, E>) -> Result<T, E> {
+    if result.is_ok() {
+        emit_machine_mutation("operation", Some(operation_id), "committed");
+    }
+    result
+}
+
+fn finish_operation_cancel_local_result<T>(operation_id: &str, result: Result<T>) -> Result<T> {
+    if result.is_err() {
+        warn!(
+            event = "machine.local_post_commit_failed",
+            workflow = "operation",
+            operation_id,
+            remote_state = "committed",
+            error_kind = "local_processing"
+        );
+    }
+    result.context(RemoteMutationCommitted)
 }
 
 #[derive(Parser, Debug)]
@@ -4083,16 +4200,21 @@ mod tests {
     use super::{
         CeremonyCmd, Cli, Cmd, LegacyMigrationReceiptFile, MachineCommandEventClass, WalletCmd,
         ceremony_cancel_remote_result, ceremony_projection_path, commit_policy_update,
-        emit_machine_mutation, emit_machine_mutation_rejection_if_needed, emit_machine_ready,
+        emit_machine_mutation, emit_machine_mutation_rejection_if_needed,
+        emit_machine_preparation_rejection_if_needed, emit_machine_ready, emit_remote_preparation,
         endpoint_connection_error, enrollment_state_is_usable, execute_audit_command,
         execute_wallet_outbox_action, finish_ceremony_cancel_projection,
-        finish_policy_commit_local_result, format_petal_consent_net_rule, handle_ceremony,
+        finish_operation_cancel_local_result, finish_policy_commit_local_result,
+        finish_remote_preparation, format_petal_consent_net_rule, handle_ceremony,
         is_completed_policy_update_receipt, launch_wallet_registration_via_vfs,
         load_ceremony_projection, long_running_role, machine_command_event_fields,
         machine_error_from_anyhow, machine_wallet_lookup_error, open_machine_audit_with_history,
-        persist_ceremony_projection, policy_commit_remote_result, request_body_with_wallet,
+        operation_cancel_remote_result, persist_ceremony_projection, policy_commit_remote_result,
+        request_body_with_wallet,
     };
-    use bloom_daemon::ipc::{MachineCeremonyAction, MachineCommand, MachineOperationAction};
+    use bloom_daemon::ipc::{
+        MachineCeremonyAction, MachineCommand, MachineCustodyKind, MachineOperationAction,
+    };
 
     #[derive(Default)]
     struct RecordingOutboxHandler(Mutex<Vec<(String, Vec<u8>)>>);
@@ -4787,6 +4909,98 @@ mod tests {
                 .iter()
                 .any(|event| event["fields"]["state"] == "rejected")
         );
+    }
+
+    #[test]
+    fn operation_cancel_keeps_remote_commit_when_local_processing_fails() {
+        let capture = bloom_service_observability::CapturedWriter::default();
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_subscriber::fmt::layer()
+                .json()
+                .with_writer(capture.clone()),
+        );
+        let operation_id = "de".repeat(32);
+        let marker_secret = "MARKER_OPERATION_FORMAT_FAILURE_DO_NOT_LOG";
+        tracing::subscriber::with_default(subscriber, || {
+            emit_machine_mutation("operation", Some(&operation_id), "started");
+            operation_cancel_remote_result::<_, ()>(&operation_id, Ok(())).unwrap();
+            let result = finish_operation_cancel_local_result::<()>(
+                &operation_id,
+                Err(anyhow::anyhow!(marker_secret)),
+            );
+            emit_machine_mutation_rejection_if_needed("operation", Some(&operation_id), &result);
+        });
+
+        let output = capture.text();
+        assert!(!output.contains(marker_secret));
+        let events = output
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        let states = events
+            .iter()
+            .filter(|event| event["fields"]["event"] == "machine.durable_mutation")
+            .map(|event| event["fields"]["state"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(states, ["started", "committed"]);
+        assert!(events.iter().any(|event| {
+            event["fields"]["event"] == "machine.local_post_commit_failed"
+                && event["fields"]["workflow"] == "operation"
+                && event["fields"]["remote_state"] == "committed"
+        }));
+    }
+
+    #[test]
+    fn custody_prepare_keeps_remote_transition_when_local_processing_fails() {
+        assert_eq!(
+            machine_command_event_fields(&MachineCommand::WalletCustody {
+                name: "wallet".into(),
+                kind: MachineCustodyKind::Import,
+            })
+            .2,
+            MachineCommandEventClass::RemotePrepared
+        );
+        let capture = bloom_service_observability::CapturedWriter::default();
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_subscriber::fmt::layer()
+                .json()
+                .with_writer(capture.clone()),
+        );
+        let operation_id = "ac".repeat(32);
+        let marker_secret = "MARKER_CUSTODY_PROJECTION_FAILURE_DO_NOT_LOG";
+        tracing::subscriber::with_default(subscriber, || {
+            info!(
+                event = "machine.workflow_transition",
+                workflow = "wallet_import",
+                operation_id = "",
+                state = "started"
+            );
+            emit_remote_preparation("wallet_import", Some(&operation_id));
+            let result = finish_remote_preparation::<()>(
+                "wallet_import",
+                Some(&operation_id),
+                Err(anyhow::anyhow!(marker_secret)),
+            );
+            emit_machine_preparation_rejection_if_needed("wallet_import", None, &result);
+        });
+
+        let output = capture.text();
+        assert!(!output.contains(marker_secret));
+        let events = output
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        let states = events
+            .iter()
+            .filter(|event| event["fields"]["event"] == "machine.workflow_transition")
+            .map(|event| event["fields"]["state"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(states, ["started", "prepared"]);
+        assert!(events.iter().any(|event| {
+            event["fields"]["event"] == "machine.local_post_prepare_failed"
+                && event["fields"]["workflow"] == "wallet_import"
+                && event["fields"]["remote_state"] == "prepared"
+        }));
     }
 
     #[tokio::test(flavor = "current_thread")]
