@@ -45,11 +45,28 @@ pub async fn run() -> Result<()> {
     if std::env::consts::OS != "macos" {
         bail!("the packet-filter monitor requires macOS");
     }
+    tracing::info!(event = "service.ready", monitor = "packet-filter");
+    crate::native_lifecycle("containment-monitor", "ready");
+    let mut interval = tokio::time::interval(MONITOR_INTERVAL);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
-        if let Err(error) = run_once() {
-            eprintln!("Bloom packet-filter monitor refresh failed: {error:#}");
+        tokio::select! {
+            result = crate::termination_signal() => {
+                result.context("wait for containment shutdown signal")?;
+                tracing::info!(event = "service.shutdown", reason = "signal");
+                crate::native_lifecycle("containment-monitor", "shutdown");
+                return Ok(());
+            }
+            _ = interval.tick() => {
+                if let Err(error) = run_once() {
+                    let _ = error;
+                    tracing::warn!(
+                        event = "containment.refresh_failed",
+                        error_kind = "platform_status"
+                    );
+                }
+            }
         }
-        tokio::time::sleep(MONITOR_INTERVAL).await;
     }
 }
 

@@ -1664,10 +1664,11 @@ fn serve_refuses_when_home_write_lock_is_live() {
     let lock = home.path().join("run").join(".daemon.lock");
 
     let mut command = bloom_cmd(home.path());
-    command.arg("serve");
+    command.env("BLOOM_LOG_OUTPUT", "json-stderr").arg("serve");
     command.assert().failure().stderr(
-        predicate::str::contains("already open for writing")
-            .and(predicate::str::contains(lock.display().to_string())),
+        predicate::str::contains("Bloom service exited after a runtime failure")
+            .and(predicate::str::contains("service.fatal_exit"))
+            .and(predicate::str::contains(lock.display().to_string()).not()),
     );
 }
 

@@ -8,7 +8,11 @@ After=bloom-session.service network-online.target
 Type=simple
 EnvironmentFile=/etc/bloom/%U/machine.env
 Environment=BLOOM_MOUNT_FROM_FSTAB=true
+Environment=BLOOM_LOG_OUTPUT=json-stderr
 ExecStart=/usr/bin/bloom serve --mount %h/bloom
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=bloom-machine
 Restart=on-failure
 RestartSec=5s
 UMask=0077

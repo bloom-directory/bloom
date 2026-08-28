@@ -7,6 +7,9 @@ User=bloom-signer-%i
 Group=bloom-signer-%i
 UMask=0077
 ExecStart=@BLOOM_SIGNER_BINARY@
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=bloom-signer-%i
 Environment=BLOOM_SIGNER_IDENTITY=/etc/bloom/%i/signer/identity.json
 Environment=BLOOM_SIGNER_CONFIG=/etc/bloom/%i/signer/config.json
 Environment=BLOOM_EDGE_MANIFEST=/etc/bloom/%i/edge-manifest.json

@@ -35,10 +35,10 @@ use bloom_daemon::ipc::{
 };
 use bloom_machine_client::MachineJournalHeadProvider;
 use bloom_proto::{AuditIdentity, AuditLog, HomeDir, HomeWritePermit};
+use bloom_service_observability::LogOutput;
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::{Shell, generate};
-use tracing::{debug, info, trace};
-use tracing_subscriber::EnvFilter;
+use tracing::{Instrument as _, debug, info, trace};
 
 #[cfg(target_os = "linux")]
 const DEFAULT_MOUNT_PATH: &str = "/bloom";
@@ -510,7 +510,11 @@ fn build_write_daemon(home: HomeDir) -> Result<(Arc<HomeWritePermit>, Daemon)> {
         Err(error) => {
             #[cfg(debug_assertions)]
             {
-                debug!(error = %error, "authenticated Broker edge absent; using key-free debug Machine composition");
+                let _ = error;
+                debug!(
+                    error_kind = "broker_edge_unavailable",
+                    "authenticated Broker edge absent; using key-free debug Machine composition"
+                );
                 Daemon::from_home_with_permit_without_broker_for_debug(home, permit.clone())
                     .context("build key-free debug daemon")?
             }
@@ -855,10 +859,134 @@ struct DaemonMachineCommands {
 impl MachineCommandService for DaemonMachineCommands {
     fn execute(&self, command: MachineCommand) -> MachineCommandFuture<'_> {
         Box::pin(async move {
-            execute_machine_command(&self.home, &self.daemon, command)
-                .await
-                .map_err(machine_error_from_anyhow)
+            let (workflow, operation_id, class) = machine_command_event_fields(&command);
+            match class {
+                MachineCommandEventClass::DurableMutation => {
+                    emit_machine_mutation(workflow, operation_id.as_deref(), "started");
+                }
+                MachineCommandEventClass::Prepared => info!(
+                    event = "machine.workflow_transition",
+                    workflow,
+                    operation_id = operation_id.as_deref().unwrap_or(""),
+                    state = "started"
+                ),
+                MachineCommandEventClass::Read => {}
+            }
+            let result = execute_machine_command(&self.home, &self.daemon, command).await;
+            match class {
+                MachineCommandEventClass::DurableMutation if result.is_err() => {
+                    emit_machine_mutation(workflow, operation_id.as_deref(), "rejected");
+                }
+                MachineCommandEventClass::Prepared => info!(
+                    event = "machine.workflow_transition",
+                    workflow,
+                    operation_id = operation_id.as_deref().unwrap_or(""),
+                    state = if result.is_ok() {
+                        "prepared"
+                    } else {
+                        "rejected"
+                    }
+                ),
+                MachineCommandEventClass::Read => debug!(
+                    event = "machine.command_outcome",
+                    workflow,
+                    operation_id = operation_id.as_deref().unwrap_or(""),
+                    outcome = if result.is_ok() { "read" } else { "rejected" }
+                ),
+                MachineCommandEventClass::DurableMutation => {}
+            }
+            result.map_err(machine_error_from_anyhow)
         })
+    }
+}
+
+fn emit_machine_mutation(workflow: &str, operation_id: Option<&str>, state: &str) {
+    info!(
+        event = "machine.durable_mutation",
+        workflow,
+        operation_id = operation_id.unwrap_or(""),
+        state
+    );
+}
+
+fn emit_machine_ready() {
+    info!(event = "service.ready", listener_kind = "unix");
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MachineCommandEventClass {
+    Read,
+    Prepared,
+    DurableMutation,
+}
+
+fn machine_command_event_fields(
+    command: &MachineCommand,
+) -> (&'static str, Option<String>, MachineCommandEventClass) {
+    match command {
+        MachineCommand::AuditReconcile { correlation_id, .. } => (
+            "audit_reconcile",
+            Some(correlation_id.clone()),
+            MachineCommandEventClass::DurableMutation,
+        ),
+        MachineCommand::WalletCustody { kind, .. } => (
+            match kind {
+                MachineCustodyKind::New => "wallet_registration",
+                MachineCustodyKind::Import => "wallet_import",
+                MachineCustodyKind::Rebind => "credential_rebind",
+                MachineCustodyKind::Delete => "wallet_delete",
+            },
+            None,
+            MachineCommandEventClass::Prepared,
+        ),
+        MachineCommand::WalletMigrate { .. } => (
+            "credential_migration",
+            None,
+            MachineCommandEventClass::Prepared,
+        ),
+        MachineCommand::WalletPolicyPrepare { .. } => {
+            ("policy_update", None, MachineCommandEventClass::Prepared)
+        }
+        MachineCommand::WalletPolicyCommit { operation_id } => (
+            "policy_update",
+            Some(operation_id.clone()),
+            MachineCommandEventClass::DurableMutation,
+        ),
+        MachineCommand::WalletOutboxCancel { id, .. } => (
+            "wallet_outbox_cancel",
+            Some(id.clone()),
+            MachineCommandEventClass::DurableMutation,
+        ),
+        MachineCommand::WalletOutboxReplace { id, .. } => (
+            "wallet_outbox_replace",
+            Some(id.clone()),
+            MachineCommandEventClass::DurableMutation,
+        ),
+        MachineCommand::Ceremony {
+            action,
+            operation_id,
+        } => (
+            "ceremony",
+            Some(operation_id.clone()),
+            if matches!(action, MachineCeremonyAction::Cancel) {
+                MachineCommandEventClass::DurableMutation
+            } else {
+                MachineCommandEventClass::Read
+            },
+        ),
+        MachineCommand::Operation {
+            action,
+            operation_id,
+        } => (
+            "operation",
+            Some(operation_id.clone()),
+            if matches!(action, MachineOperationAction::Cancel) {
+                MachineCommandEventClass::DurableMutation
+            } else {
+                MachineCommandEventClass::Read
+            },
+        ),
+        _ => ("read", None, MachineCommandEventClass::Read),
     }
 }
 
@@ -1055,17 +1183,18 @@ async fn execute_machine_command(
             correlation_id,
             outcome,
             confirm,
-        } => format!(
-            "{}\n",
-            execute_audit_command(
+        } => {
+            let output = execute_audit_command(
                 &AuditCmd::Reconcile {
-                    correlation_id,
+                    correlation_id: correlation_id.clone(),
                     outcome,
                     confirm,
                 },
                 daemon.audit.as_ref(),
-            )?
-        ),
+            )?;
+            emit_machine_mutation("audit_reconcile", Some(&correlation_id), "committed");
+            format!("{output}\n")
+        }
         MachineCommand::WalletList => {
             let mut output = String::new();
             for projection in daemon.wallet_projections.list_wallets().await? {
@@ -1178,7 +1307,9 @@ async fn execute_machine_command(
             assurance_level,
         } => prepare_policy_update(home, &name, &policy, &assurance_level).await?,
         MachineCommand::WalletPolicyCommit { operation_id } => {
-            commit_policy_update(home, operation_id).await?
+            let output = commit_policy_update(home, operation_id.clone()).await?;
+            emit_machine_mutation("policy_update", Some(&operation_id), "committed");
+            output
         }
         MachineCommand::WalletOutboxCancel {
             wallet,
@@ -1195,6 +1326,7 @@ async fn execute_machine_command(
                 text.as_bytes(),
             )
             .await?;
+            emit_machine_mutation("wallet_outbox_cancel", Some(&id), "committed");
             format!("cancel submitted for {id}\n")
         }
         MachineCommand::WalletOutboxReplace {
@@ -1212,28 +1344,49 @@ async fn execute_machine_command(
                 intent.as_bytes(),
             )
             .await?;
+            emit_machine_mutation("wallet_outbox_replace", Some(&id), "committed");
             format!("replacement submitted for {id}\n")
         }
         MachineCommand::Ceremony {
             action,
             operation_id,
         } => {
+            let mutation = matches!(action, MachineCeremonyAction::Cancel);
             let command = match action {
-                MachineCeremonyAction::Status => CeremonyCmd::Status { operation_id },
-                MachineCeremonyAction::Cancel => CeremonyCmd::Cancel { operation_id },
-                MachineCeremonyAction::Result => CeremonyCmd::Result { operation_id },
+                MachineCeremonyAction::Status => CeremonyCmd::Status {
+                    operation_id: operation_id.clone(),
+                },
+                MachineCeremonyAction::Cancel => CeremonyCmd::Cancel {
+                    operation_id: operation_id.clone(),
+                },
+                MachineCeremonyAction::Result => CeremonyCmd::Result {
+                    operation_id: operation_id.clone(),
+                },
             };
-            handle_ceremony(home, command).await?
+            let output = handle_ceremony(home, command).await?;
+            if mutation {
+                emit_machine_mutation("ceremony", Some(&operation_id), "committed");
+            }
+            output
         }
         MachineCommand::Operation {
             action,
             operation_id,
         } => {
+            let mutation = matches!(action, MachineOperationAction::Cancel);
             let command = match action {
-                MachineOperationAction::Status => OperationCmd::Status { operation_id },
-                MachineOperationAction::Cancel => OperationCmd::Cancel { operation_id },
+                MachineOperationAction::Status => OperationCmd::Status {
+                    operation_id: operation_id.clone(),
+                },
+                MachineOperationAction::Cancel => OperationCmd::Cancel {
+                    operation_id: operation_id.clone(),
+                },
             };
-            handle_operation(home, command).await?
+            let output = handle_operation(home, command).await?;
+            if mutation {
+                emit_machine_mutation("operation", Some(&operation_id), "committed");
+            }
+            output
         }
         MachineCommand::UpdateStatus => handle_update(home, UpdateCmd::Status).await?.0,
         MachineCommand::UpdateCheck => {
@@ -1420,6 +1573,13 @@ async fn prepare_policy_update(
     let mut operation_bytes = [0_u8; 32];
     rand::thread_rng().fill_bytes(&mut operation_bytes);
     let operation_id = bloom_broker_api::OperationId::from_bytes(operation_bytes);
+    info!(
+        event = "machine.policy_update.transition",
+        operation_id = operation_id.as_str(),
+        wallet_id = wallet_id.as_str(),
+        baseline_version = baseline.version.get(),
+        state = "validation_requested"
+    );
     let request = bloom_broker_api::PolicyUpdateRequest {
         operation_id,
         wallet_id,
@@ -1437,6 +1597,12 @@ async fn prepare_policy_update(
         .await
         .map_err(anyhow::Error::new)
         .context("validate policy update and prepare Broker-originated custody ceremony")?;
+    info!(
+        event = "machine.policy_update.transition",
+        operation_id = response.operation_id.as_str(),
+        wallet_id = requested_name,
+        state = "ceremony_prepared"
+    );
     let projection =
         bloom_machine_client::CeremonyProjection::from_policy_prepare(&response, current_unix_ms())
             .map_err(anyhow::Error::new)
@@ -1456,6 +1622,11 @@ async fn prepare_policy_update(
 async fn commit_policy_update(home: &HomeDir, operation_id: String) -> Result<String> {
     let operation_id = bloom_broker_api::OperationId::new(operation_id)
         .context("operation ID must be 64 lowercase hexadecimal characters")?;
+    info!(
+        event = "machine.policy_update.transition",
+        operation_id = operation_id.as_str(),
+        state = "commit_requested"
+    );
     let client = configured_broker_client(home).map_err(|error| {
         machine_error(
             MachineErrorKind::Unavailable,
@@ -1485,6 +1656,12 @@ async fn commit_policy_update(home: &HomeDir, operation_id: String) -> Result<St
     anyhow::ensure!(
         receipt.operation_id == operation_id,
         "Broker policy commit receipt operation identity mismatch"
+    );
+    info!(
+        event = "machine.policy_update.transition",
+        operation_id = operation_id.as_str(),
+        policy_version = receipt.committed.version.get(),
+        state = "committed"
     );
 
     if let Ok(status) = client.ceremony_status(operation_id.clone()).await {
@@ -2137,16 +2314,36 @@ enum WalletCmd {
 async fn main() -> ExitCode {
     let cli = Cli::parse();
 
-    // RUST_LOG wins when set; otherwise default to `info`, or `error`
-    // under `--quiet` so `vfs cat`/`ls` output stays clean.
-    let default_level = if cli.quiet { "error" } else { "info" };
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_level)),
-        )
-        .with_target(false)
-        .with_writer(std::io::stderr)
-        .try_init();
+    let role = long_running_role(&cli);
+    if let Some(role) = role {
+        let output = if std::env::var("BLOOM_LOG_OUTPUT").as_deref() == Ok("json-stderr") {
+            LogOutput::JsonStderr
+        } else {
+            LogOutput::Interactive
+        };
+        if let Err(error) =
+            bloom_service_observability::init(role, env!("CARGO_PKG_VERSION"), output)
+        {
+            let _ = error;
+            eprintln!("Bloom service logging initialization failed");
+            return ExitCode::FAILURE;
+        }
+        if matches!(role, "session-sentinel" | "containment-monitor") {
+            native_lifecycle(role, "startup");
+        }
+    } else {
+        // Interactive commands retain the existing human-readable stderr and
+        // quiet behavior. Service startup uses the shared initializer above.
+        let default_level = if cli.quiet { "error" } else { "info" };
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default_level)),
+            )
+            .with_target(false)
+            .with_writer(std::io::stderr)
+            .try_init();
+    }
 
     match run(cli).await {
         Ok(()) => {
@@ -2157,9 +2354,59 @@ async fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(e) => {
-            eprintln!("error: {:#}", e);
+            if let Some(role) = role {
+                tracing::error!(
+                    event = "service.fatal_exit",
+                    service_role = role,
+                    error_kind = "runtime"
+                );
+                if matches!(role, "session-sentinel" | "containment-monitor") {
+                    native_lifecycle(role, "fatal_exit");
+                }
+            }
+            if role.is_some() {
+                eprintln!("Bloom service exited after a runtime failure");
+            } else {
+                eprintln!("error: {:#}", e);
+            }
             ExitCode::FAILURE
         }
+    }
+}
+
+fn long_running_role(cli: &Cli) -> Option<&'static str> {
+    match cli.cmd.as_ref()? {
+        Cmd::Serve { internal: None, .. } => Some("machine"),
+        Cmd::Serve {
+            internal: Some(ServeInternal::TriadPfMonitor),
+            ..
+        } => Some("containment-monitor"),
+        Cmd::Serve {
+            internal: Some(ServeInternal::SessionSentinel),
+            ..
+        } => Some("session-sentinel"),
+        _ => None,
+    }
+}
+
+fn structured_service_output() -> bool {
+    std::env::var("BLOOM_LOG_OUTPUT").as_deref() == Ok("json-stderr")
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn native_lifecycle(category: &str, event: &str) {
+    oslog::OsLog::new("com.bloom.triad", category).default(event);
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn native_lifecycle(_category: &str, _event: &str) {}
+
+pub(crate) async fn termination_signal() -> Result<()> {
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut sigterm = signal(SignalKind::terminate()).context("register SIGTERM handler")?;
+    tokio::select! {
+        result = tokio::signal::ctrl_c() => result.context("wait for Ctrl-C"),
+        _ = sigterm.recv() => Ok(()),
     }
 }
 
@@ -2394,6 +2641,7 @@ async fn run(cli: Cli) -> Result<()> {
         "--version cannot be combined with a command"
     );
     let lifecycle_command = matches!(cli.cmd.as_ref(), Some(Cmd::Init { .. } | Cmd::Serve { .. }));
+    let is_long_running = long_running_role(&cli).is_some();
     let (connect, ipc_socket) = if lifecycle_command {
         (None, None)
     } else if cli.connect.is_some() {
@@ -2421,7 +2669,9 @@ async fn run(cli: Cli) -> Result<()> {
         resolve_client_endpoint(&home, connect.as_deref(), ipc_socket.as_deref())
             .context("resolve Bloom endpoint")?
     };
-    trace!(cmd = ?cli.cmd, home = %home.root().display(), "cli.dispatch");
+    if !is_long_running {
+        trace!(cmd = ?cli.cmd, home = %home.root().display(), "cli.dispatch");
+    }
 
     if cli.version {
         let client_protocol = IpcProtocolRange::supported();
@@ -2522,7 +2772,9 @@ async fn run(cli: Cli) -> Result<()> {
                     .context("Bloom macOS identity rotation generation failed"),
                 };
             }
-            eprintln!("{ALPHA_DISCLOSURE}");
+            if !structured_service_output() {
+                eprintln!("{ALPHA_DISCLOSURE}");
+            }
             let (_home_permit, d) = build_write_daemon(home.clone()).context("init daemon")?;
             let preinstalled = github_source::ensure_preinstalled_petals(&home, &d)
                 .context("provision configured pre-installed Petals")?;
@@ -3036,27 +3288,52 @@ async fn run(cli: Cli) -> Result<()> {
                         .context("Bloom session sentinel failed"),
                 };
             }
-            eprintln!("{ALPHA_DISCLOSURE}");
+            if !structured_service_output() {
+                eprintln!("{ALPHA_DISCLOSURE}");
+            }
             let (_home_permit, d) = build_write_daemon(home.clone())?;
             github_source::ensure_preinstalled_petals(&home, &d)
                 .context("provision configured pre-installed Petals before serving")?;
             let mount_handle =
                 mount_bloom(&d, mount.as_deref(), mount_nfs_listen, mount_from_fstab).await?;
             let chains: Vec<String> = d.chains.list_names();
-            println!(
-                "bloom serve: home={} chains={:?}",
-                d.home.root().display(),
-                chains
-            );
-            if let Some(mount_path) = mount.as_deref() {
-                println!("mount: {}", mount_path.display());
+            if !structured_service_output() {
+                println!(
+                    "bloom serve: home={} chains={:?}",
+                    d.home.root().display(),
+                    chains
+                );
+                if let Some(mount_path) = mount.as_deref() {
+                    println!("mount: {}", mount_path.display());
+                }
             }
             let endpoint = resolve_server_endpoint(&d.home, endpoint.as_deref())
                 .context("resolve serve endpoint")?;
             let socket = endpoint.socket.clone();
-            println!("ipc endpoint: {}", endpoint.display);
-            println!("ipc socket: {}", socket.display());
-            info!(home = %d.home.root().display(), chains = ?chains, endpoint = %endpoint.display, socket = %socket.display(), mount = ?mount, "cli.serve.starting");
+            if !structured_service_output() {
+                println!("ipc endpoint: {}", endpoint.display);
+                println!("ipc socket: {}", socket.display());
+            }
+            let release_digest = std::env::var("BLOOM_RELEASE_DIGEST").ok();
+            info!(
+                event = "service.identity_loaded",
+                service_id = "bloom-machine",
+                enrolled_login_uid = rustix::process::geteuid().as_raw(),
+                release_digest = release_digest.as_deref()
+            );
+            let service_span = bloom_service_observability::service_span(
+                "machine",
+                env!("CARGO_PKG_VERSION"),
+                "bloom-machine",
+                Some(rustix::process::geteuid().as_raw()),
+                release_digest.as_deref(),
+            );
+            info!(
+                event = "service.configuration_loaded",
+                chain_count = chains.len(),
+                listener_kind = "unix",
+                mount_enabled = mount.is_some()
+            );
             let server = IpcServer::new(d.vfs.clone(), env!("CARGO_PKG_VERSION"), chains)
                 .with_petals(d.petals.clone())
                 .with_petal_runtime_endpoints(
@@ -3077,42 +3354,62 @@ async fn run(cli: Cli) -> Result<()> {
                 .with_machine_commands(Arc::new(DaemonMachineCommands {
                     home: home.clone(),
                     daemon: d.clone(),
-                }));
+                }))
+                .with_ready_callback(Arc::new(emit_machine_ready));
             // Start audited and durable background effects only after every
             // fallible serve setup step has succeeded. The handle is shut
             // down and awaited before the runtime can return.
-            let sweeper = d.spawn_background_tasks();
+            let sweeper = {
+                let _entered = service_span.enter();
+                d.spawn_background_tasks()
+            };
             let server2 = server.clone();
             // Trigger graceful shutdown on Ctrl-C or SIGTERM.
-            let shutdown = tokio::spawn(async move {
-                #[cfg(unix)]
-                {
-                    use tokio::signal::unix::{SignalKind, signal};
-                    let mut sigterm = signal(SignalKind::terminate())
-                        .expect("SIGTERM handler registration failed");
-                    tokio::select! {
-                        _ = tokio::signal::ctrl_c() => info!("cli.serve.ctrl_c_received"),
-                        _ = sigterm.recv() => info!("cli.serve.sigterm_received"),
+            let shutdown_span = service_span.clone();
+            let shutdown = tokio::spawn(
+                async move {
+                    #[cfg(unix)]
+                    {
+                        use tokio::signal::unix::{SignalKind, signal};
+                        let mut sigterm = signal(SignalKind::terminate())
+                            .expect("SIGTERM handler registration failed");
+                        tokio::select! {
+                            _ = tokio::signal::ctrl_c() => info!("cli.serve.ctrl_c_received"),
+                            _ = sigterm.recv() => info!("cli.serve.sigterm_received"),
+                        }
                     }
+                    #[cfg(not(unix))]
+                    {
+                        let _ = tokio::signal::ctrl_c().await;
+                        info!("cli.serve.ctrl_c_received");
+                    }
+                    server2.trigger_shutdown();
                 }
-                #[cfg(not(unix))]
-                {
-                    let _ = tokio::signal::ctrl_c().await;
-                    info!("cli.serve.ctrl_c_received");
-                }
-                server2.trigger_shutdown();
-            });
-            let serve_result = server.serve(&socket).await.context("ipc serve");
+                .instrument(shutdown_span),
+            );
+            let serve_result = async { server.serve(&socket).await }
+                .instrument(service_span.clone())
+                .await
+                .context("ipc serve");
             shutdown.abort();
             // Stop the outbox expiry sweeper (fix #3) and any other
             // daemon-owned workers (watch executor, etc., fix #6).
-            let unmount_result = unmount_bloom(mount_handle).await;
-            sweeper.shutdown().await;
-            d.shutdown().await;
+            let unmount_result = async {
+                let result = unmount_bloom(mount_handle).await;
+                sweeper.shutdown().await;
+                d.shutdown().await;
+                result
+            }
+            .instrument(service_span.clone())
+            .await;
             serve_result?;
             unmount_result?;
-            info!("cli.serve.shutdown_complete");
-            println!("shutting down");
+            service_span.in_scope(|| {
+                info!(event = "service.shutdown", "cli.serve.shutdown_complete");
+            });
+            if !structured_service_output() {
+                println!("shutting down");
+            }
             Ok(())
         }
         Cmd::Update(cmd) => {
@@ -3698,15 +3995,19 @@ mod tests {
 
     use async_trait::async_trait;
     use clap::Parser as _;
+    use tracing::info;
+    use tracing_subscriber::prelude::*;
 
     use super::{
-        Cli, Cmd, LegacyMigrationReceiptFile, WalletCmd, ceremony_projection_path,
-        endpoint_connection_error, enrollment_state_is_usable, execute_audit_command,
-        execute_wallet_outbox_action, format_petal_consent_net_rule,
-        is_completed_policy_update_receipt, launch_wallet_registration_via_vfs,
-        load_ceremony_projection, machine_error_from_anyhow, machine_wallet_lookup_error,
+        Cli, Cmd, LegacyMigrationReceiptFile, MachineCommandEventClass, WalletCmd,
+        ceremony_projection_path, emit_machine_ready, endpoint_connection_error,
+        enrollment_state_is_usable, execute_audit_command, execute_wallet_outbox_action,
+        format_petal_consent_net_rule, is_completed_policy_update_receipt,
+        launch_wallet_registration_via_vfs, load_ceremony_projection, long_running_role,
+        machine_command_event_fields, machine_error_from_anyhow, machine_wallet_lookup_error,
         open_machine_audit_with_history, persist_ceremony_projection, request_body_with_wallet,
     };
+    use bloom_daemon::ipc::{MachineCeremonyAction, MachineCommand, MachineOperationAction};
 
     #[derive(Default)]
     struct RecordingOutboxHandler(Mutex<Vec<(String, Vec<u8>)>>);
@@ -4230,6 +4531,95 @@ mod tests {
             Cli::try_parse_from(["bloom", "wallet", "sign-policy", "wallet"]).is_err(),
             "the legacy direct policy-signing path must stay removed"
         );
+    }
+
+    #[test]
+    fn only_long_running_modes_use_service_observability() {
+        let machine = Cli::try_parse_from(["bloom", "serve"]).unwrap();
+        assert_eq!(long_running_role(&machine), Some("machine"));
+        let session = Cli::try_parse_from(["bloom", "serve", "session-sentinel"]).unwrap();
+        assert_eq!(long_running_role(&session), Some("session-sentinel"));
+        let containment = Cli::try_parse_from(["bloom", "serve", "triad-pf-monitor"]).unwrap();
+        assert_eq!(long_running_role(&containment), Some("containment-monitor"));
+        let status = Cli::try_parse_from(["bloom", "status"]).unwrap();
+        assert_eq!(long_running_role(&status), None);
+    }
+
+    #[test]
+    fn machine_events_keep_metadata_and_omit_policy_marker_secret() {
+        let capture = bloom_service_observability::CapturedWriter::default();
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_subscriber::fmt::layer()
+                .json()
+                .with_current_span(true)
+                .with_span_list(true)
+                .with_writer(capture.clone()),
+        );
+        let marker = "BLOOM_MARKER_POLICY_SECRET_7f82";
+        let operation_id = "ab".repeat(32);
+        let command = MachineCommand::WalletPolicyPrepare {
+            name: "main".into(),
+            policy: marker.as_bytes().to_vec(),
+            assurance_level: "user_verified".into(),
+        };
+        tracing::subscriber::with_default(subscriber, || {
+            let service = bloom_service_observability::service_span(
+                "machine",
+                "1.2.3",
+                "bloom-machine",
+                Some(501),
+                Some("cdcd"),
+            );
+            let _entered = service.enter();
+            emit_machine_ready();
+            let (workflow, _, class) = machine_command_event_fields(&command);
+            assert_eq!(class, MachineCommandEventClass::Prepared);
+            info!(
+                event = "machine.workflow_transition",
+                workflow,
+                operation_id = operation_id.as_str(),
+                state = "prepared"
+            );
+        });
+        let output = capture.text();
+        assert!(!output.contains(marker));
+        let events = output
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert!(events.iter().any(|event| {
+            event["fields"]["event"] == "service.ready"
+                && event["spans"].as_array().is_some_and(|spans| {
+                    spans.iter().any(|span| {
+                        span["service_id"] == "bloom-machine" && span["enrolled_login_uid"] == 501
+                    })
+                })
+        }));
+        assert!(events.iter().any(|event| {
+            event["fields"]["event"] == "machine.workflow_transition"
+                && event["fields"]["operation_id"] == operation_id
+                && event["fields"]["workflow"] == "policy_update"
+                && event["fields"]["state"] == "prepared"
+        }));
+        for command in [
+            MachineCommand::Ceremony {
+                action: MachineCeremonyAction::Status,
+                operation_id: operation_id.clone(),
+            },
+            MachineCommand::Ceremony {
+                action: MachineCeremonyAction::Result,
+                operation_id: operation_id.clone(),
+            },
+            MachineCommand::Operation {
+                action: MachineOperationAction::Status,
+                operation_id,
+            },
+        ] {
+            assert_eq!(
+                machine_command_event_fields(&command).2,
+                MachineCommandEventClass::Read
+            );
+        }
     }
 
     #[test]

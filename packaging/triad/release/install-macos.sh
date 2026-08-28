@@ -15,7 +15,7 @@ usage:
 
 Staged-root tests also supply BLOOM_MACOS_{BROKER,SIGNER}_{UID,GID},
 BLOOM_MACOS_{MACHINE_BROKER,BROKER_SIGNER,REVOKE}_GID, and
-BLOOM_RELEASE_DIGEST.
+BLOOM_MACOS_LOG_GID and BLOOM_RELEASE_DIGEST.
 EOF
   exit 64
 }
@@ -132,6 +132,7 @@ load_names() {
   signer_user="bloom-signer-$login_uid"; signer_group="$signer_user"
   machine_broker_group="bloom-machine-broker-$login_uid"
   broker_signer_group="bloom-broker-signer-$login_uid"; revoke_group="bloom-revoke-$login_uid"
+  log_group="bloom-log-$login_uid"
 }
 
 load_ids() {
@@ -142,6 +143,15 @@ load_ids() {
   BLOOM_MACOS_MACHINE_BROKER_GID="$(field "$enrollment" machine_broker_gid)"
   BLOOM_MACOS_BROKER_SIGNER_GID="$(field "$enrollment" broker_signer_gid)"
   BLOOM_MACOS_REVOKE_GID="$(field "$enrollment" revoke_gid)"
+  if BLOOM_MACOS_LOG_GID="$(field "$enrollment" log_gid 2>/dev/null)"; then return; fi
+  if [[ "$action" == uninstall ]]; then BLOOM_MACOS_LOG_GID=0; return; fi
+  if $live; then
+    record_exists Groups "$log_group" && die "legacy enrollment has an unrecorded log group"
+    BLOOM_MACOS_LOG_GID="$(next_id Groups PrimaryGroupID)"; new_group "$log_group" "$BLOOM_MACOS_LOG_GID"
+    join_group "$log_group" "$login_user"; dsmemberutil flushcache
+  else
+    [[ "${BLOOM_MACOS_LOG_GID:-}" =~ ^[1-9][0-9]*$ ]] || die "BLOOM_MACOS_LOG_GID must be positive decimal"
+  fi
 }
 
 allocate_accounts() {
@@ -150,6 +160,7 @@ allocate_accounts() {
   BLOOM_MACOS_MACHINE_BROKER_GID="$(next_id Groups PrimaryGroupID)"; new_group "$machine_broker_group" "$BLOOM_MACOS_MACHINE_BROKER_GID"
   BLOOM_MACOS_BROKER_SIGNER_GID="$(next_id Groups PrimaryGroupID)"; new_group "$broker_signer_group" "$BLOOM_MACOS_BROKER_SIGNER_GID"
   BLOOM_MACOS_REVOKE_GID="$(next_id Groups PrimaryGroupID)"; new_group "$revoke_group" "$BLOOM_MACOS_REVOKE_GID"
+  BLOOM_MACOS_LOG_GID="$(next_id Groups PrimaryGroupID)"; new_group "$log_group" "$BLOOM_MACOS_LOG_GID"
   BLOOM_MACOS_BROKER_UID="$(next_id Users UniqueID)"; new_user "$broker_user" "$BLOOM_MACOS_BROKER_UID" "$BLOOM_MACOS_BROKER_GID"
   BLOOM_MACOS_SIGNER_UID="$(next_id Users UniqueID)"; new_user "$signer_user" "$BLOOM_MACOS_SIGNER_UID" "$BLOOM_MACOS_SIGNER_GID"
   for pair in "$machine_broker_group:$login_user" "$machine_broker_group:$broker_user" \
@@ -157,6 +168,7 @@ allocate_accounts() {
     "$revoke_group:$login_user" "$revoke_group:$broker_user" "$revoke_group:$signer_user"; do
     join_group "${pair%%:*}" "${pair#*:}"
   done
+  join_group "$log_group" "$login_user"
   dsmemberutil flushcache
 }
 
@@ -187,7 +199,7 @@ verify_payload() {
   else
     [[ "$claim" == test-unclaimed && "${BLOOM_ALLOW_TEST_UNCLAIMED:-}" == true ]] || die "staged install requires test-unclaimed"
     [[ "${BLOOM_RELEASE_DIGEST:-}" =~ ^[0-9a-f]{64}$ ]] || die "invalid staged release digest"
-    for n in BROKER_UID SIGNER_UID BROKER_GID SIGNER_GID MACHINE_BROKER_GID BROKER_SIGNER_GID REVOKE_GID; do
+    for n in BROKER_UID SIGNER_UID BROKER_GID SIGNER_GID MACHINE_BROKER_GID BROKER_SIGNER_GID REVOKE_GID LOG_GID; do
       v="BLOOM_MACOS_$n"; [[ "${!v:-}" =~ ^[1-9][0-9]*$ ]] || die "$v must be positive decimal"
     done
   fi
@@ -217,7 +229,9 @@ render() {
     -e "s|@BLOOM_BROKER_STARTUP_STATUS@|$runtime/status/broker-startup.json|g" \
     -e "s|@BLOOM_CONTAINMENT_STATUS@|$runtime/containment/status.json|g" \
     -e "s|@BLOOM_PROVENANCE_CATALOG@|$config/provenance-catalog.json|g" \
-    -e "s|@BLOOM_BROKER_LOG@|$broker_state/broker.log|g" -e "s|@BLOOM_SIGNER_LOG@|$signer_state/signer.log|g" \
+    -e "s|@BLOOM_BROKER_LOG_PATH@|$broker_log|g" -e "s|@BLOOM_SIGNER_LOG_PATH@|$signer_log|g" \
+    -e "s|@BLOOM_BROKER_BOOTSTRAP_LOG@|$broker_bootstrap_log|g" -e "s|@BLOOM_SIGNER_BOOTSTRAP_LOG@|$signer_bootstrap_log|g" \
+    -e "s|@BLOOM_LOG_READER_GID@|$BLOOM_MACOS_LOG_GID|g" \
     "$src" >"$tmp"; chmod "$mode" "$tmp"; mv -f "$tmp" "$dst"
 }
 
@@ -229,11 +243,14 @@ paths() {
   if $live; then variable=/private/var; else variable="$root_prefix/var"; fi
   broker_state="$variable/db/bloom/$login_uid/broker"; signer_state="$variable/db/bloom/$login_uid/signer"
   machine_state="$variable/db/bloom/$login_uid/machine"; runtime="$variable/run/bloom/$login_uid"
+  log_root="$variable/log/bloom/$login_uid"; broker_log="$log_root/broker.jsonl"; signer_log="$log_root/signer.jsonl"
+  broker_bootstrap_log="$log_root/broker-bootstrap.log"; signer_bootstrap_log="$log_root/signer-bootstrap.log"
   broker_plist="$root_prefix/Library/LaunchDaemons/com.bloom.broker.$login_uid.plist"
   signer_plist="$root_prefix/Library/LaunchDaemons/com.bloom.signer.$login_uid.plist"
   containment_plist="$root_prefix/Library/LaunchDaemons/com.bloom.containment.plist"
   session_plist="$root_prefix/Library/LaunchAgents/com.bloom.session.plist"
   pf_anchor="$root_prefix/etc/pf.anchors/com.bloom.triad.$login_uid"
+  newsyslog_config="$root_prefix/etc/newsyslog.d/bloom-$login_uid.conf"
 }
 
 current_release_digest() {
@@ -284,18 +301,18 @@ rollback_failed_restore() {
     done
     pf_reference remove || return 1
   fi
-  rm -f "$broker_plist" "$signer_plist" "$pf_anchor" "$enrollments/$login_uid.json"
-  rm -rf "$runtime"
+  rm -f "$broker_plist" "$signer_plist" "$pf_anchor" "$newsyslog_config" "$enrollments/$login_uid.json"
+  rm -rf "$runtime" "$log_root"
   restore_pending=false
 }
 
 write_enrollment() {
   state="$1"; tmp="$enrollment.new.$$"
-  printf '{"schema":"bloom.macos-enrollment.1","state":"%s","login_uid":%s,"login_user":"%s","broker_user":"%s","broker_uid":%s,"broker_group":"%s","broker_gid":%s,"signer_user":"%s","signer_uid":%s,"signer_group":"%s","signer_gid":%s,"machine_broker_group":"%s","machine_broker_gid":%s,"broker_signer_group":"%s","broker_signer_gid":%s,"revoke_group":"%s","revoke_gid":%s,"release_digest":"%s"}\n' \
+  printf '{"schema":"bloom.macos-enrollment.1","state":"%s","login_uid":%s,"login_user":"%s","broker_user":"%s","broker_uid":%s,"broker_group":"%s","broker_gid":%s,"signer_user":"%s","signer_uid":%s,"signer_group":"%s","signer_gid":%s,"machine_broker_group":"%s","machine_broker_gid":%s,"broker_signer_group":"%s","broker_signer_gid":%s,"revoke_group":"%s","revoke_gid":%s,"log_group":"%s","log_gid":%s,"release_digest":"%s"}\n' \
     "$state" "$login_uid" "$login_user" "$broker_user" "$BLOOM_MACOS_BROKER_UID" "$broker_group" "$BLOOM_MACOS_BROKER_GID" \
     "$signer_user" "$BLOOM_MACOS_SIGNER_UID" "$signer_group" "$BLOOM_MACOS_SIGNER_GID" "$machine_broker_group" \
     "$BLOOM_MACOS_MACHINE_BROKER_GID" "$broker_signer_group" "$BLOOM_MACOS_BROKER_SIGNER_GID" "$revoke_group" \
-    "$BLOOM_MACOS_REVOKE_GID" "$BLOOM_RELEASE_DIGEST" >"$tmp"
+    "$BLOOM_MACOS_REVOKE_GID" "$log_group" "$BLOOM_MACOS_LOG_GID" "$BLOOM_RELEASE_DIGEST" >"$tmp"
   chmod 0644 "$tmp"; $live && chown root:wheel "$tmp"; mv -f "$tmp" "$enrollment"
 }
 
@@ -389,12 +406,12 @@ install_config() {
   mkdir -p "$enrollments" "$broker_config" "$signer_config" "$machine_config" "$session_config" "$installer_config" \
     "$broker_state/audit-checkpoints" "$signer_state/audit-checkpoints" "$machine_state/audit-checkpoints" \
     "$runtime/machine-broker" "$runtime/broker-signer" "$runtime/revoke/broker" "$runtime/revoke/signer" \
-    "$runtime/session" "$runtime/containment" "$runtime/status"
+    "$runtime/session" "$runtime/containment" "$runtime/status" "$variable/log/bloom" "$log_root"
   for directory in "$enrollments" "$broker_config" "$signer_config" "$machine_config" "$session_config" \
     "$installer_config" "$broker_state" "$signer_state" "$machine_state" "$broker_state/audit-checkpoints" \
     "$signer_state/audit-checkpoints" "$machine_state/audit-checkpoints" "$runtime" "$runtime/machine-broker" \
     "$runtime/broker-signer" "$runtime/revoke" "$runtime/revoke/broker" "$runtime/revoke/signer" "$runtime/session" \
-    "$runtime/containment" "$runtime/status"; do
+    "$runtime/containment" "$runtime/status" "$variable/log/bloom" "$log_root"; do
     [[ -d "$directory" && ! -L "$directory" ]] || die "security directory is missing or substituted: $directory"
   done
   chmod 0711 "$config" "$runtime" "$runtime/revoke"
@@ -404,6 +421,14 @@ install_config() {
   chmod 0710 "$runtime/machine-broker" "$runtime/broker-signer" "$runtime/revoke/broker" \
     "$runtime/revoke/signer" "$runtime/session"
   chmod 0755 "$runtime/containment"; chmod 0750 "$runtime/status"
+  # Service principals traverse to their owner-writable file; only the log
+  # group can read it. No principal can replace entries in this root directory.
+  chmod 0711 "$variable/log/bloom" "$log_root"
+  for service_log in "$broker_log" "$signer_log" "$broker_bootstrap_log" "$signer_bootstrap_log"; do
+    if [[ ! -e "$service_log" ]]; then install -m 0640 /dev/null "$service_log"; fi
+    [[ -f "$service_log" && ! -L "$service_log" ]] || die "service log is missing or substituted: $service_log"
+    chmod 0640 "$service_log"
+  done
   if [[ ! -f "$config/edge-manifest.json" ]]; then
     if $live; then
       scratch="$(mktemp -d "$product/.material.XXXXXX")"; templates="$scratch/templates"; material="$scratch/material"
@@ -445,10 +470,17 @@ install_assets() {
   render "$base/launchdaemons/com.bloom.containment.plist.in" "$containment_plist" 0644
   render "$base/launchagents/com.bloom.session.plist.in" "$session_plist" 0644
   render "$base/pf/com.bloom.login.conf.in" "$pf_anchor" 0600
+  mkdir -p "$(dirname "$newsyslog_config")"
+  newsyslog_tmp="$newsyslog_config.new.$$"
+  printf '%s %s:%s 640 5 1024 * BN\n%s %s:%s 640 5 1024 * BN\n%s %s:%s 640 2 128 * BN\n%s %s:%s 640 2 128 * BN\n' \
+    "$broker_log" "$broker_user" "$log_group" "$signer_log" "$signer_user" "$log_group" \
+    "$broker_bootstrap_log" "$broker_user" "$log_group" "$signer_bootstrap_log" "$signer_user" "$log_group" >"$newsyslog_tmp"
+  chmod 0644 "$newsyslog_tmp"; mv -f "$newsyslog_tmp" "$newsyslog_config"
 }
 
 secure_ownership() {
-  chown -R root:wheel "$release_base" "$product"; chown root:wheel "$broker_plist" "$signer_plist" "$containment_plist" "$session_plist" "$pf_anchor"
+  chown -R root:wheel "$release_base"
+  chown root:wheel "$product" "$enrollments" "$config" "$broker_plist" "$signer_plist" "$containment_plist" "$session_plist" "$pf_anchor" "$newsyslog_config"
   chown -R "$broker_user:$broker_group" "$broker_config" "$broker_state"
   chown -R "$signer_user:$signer_group" "$signer_config" "$signer_state"
   chown -R "$login_user:$machine_broker_group" "$machine_config" "$machine_state"
@@ -458,6 +490,9 @@ secure_ownership() {
   chown "$broker_user:$machine_broker_group" "$runtime/machine-broker" "$runtime/status"
   chown "$signer_user:$broker_signer_group" "$runtime/broker-signer"
   chown "$broker_user:$revoke_group" "$runtime/revoke/broker"; chown "$signer_user:$revoke_group" "$runtime/revoke/signer"
+  chown root:"$log_group" "$log_root"
+  chown "$broker_user:$log_group" "$broker_log"; chown "$signer_user:$log_group" "$signer_log"
+  chown "$broker_user:$log_group" "$broker_bootstrap_log"; chown "$signer_user:$log_group" "$signer_bootstrap_log"
 }
 
 start_and_check() {
@@ -488,6 +523,8 @@ stop_all_enrollments() {
 
 rewrite_all_enrollments() {
   local digest="$1" state="$2" record
+  # Provision every enrollment first. Ownership is a separate pass so
+  # securing one enrollment cannot disturb an enrollment already repaired.
   for record in "$enrollments"/*.json; do
     [[ -f "$record" && ! -L "$record" ]] || continue
     login_uid="${record##*/}"; login_uid="${login_uid%.json}"; enrollment="$record"
@@ -497,8 +534,17 @@ rewrite_all_enrollments() {
       plutil -replace build_digest -string "$digest" "$broker_config/config.json"
       plutil -replace build_digest -string "$digest" "$signer_config/config.json"
     fi
+    install_config
     install_assets
   done
+  if $live; then
+    for record in "$enrollments"/*.json; do
+      [[ -f "$record" && ! -L "$record" ]] || continue
+      login_uid="${record##*/}"; login_uid="${login_uid%.json}"; enrollment="$record"
+      login_user="$(field "$record" login_user)"; load_names; paths; load_ids
+      secure_ownership
+    done
+  fi
 }
 
 activate_installed_set() {
@@ -636,17 +682,18 @@ case "$action" in
       for label in "system/com.bloom.broker.$login_uid" "system/com.bloom.signer.$login_uid" "gui/$login_uid/com.bloom.session"; do launchctl bootout "$label" 2>/dev/null || true; done
       pf_reference remove
     fi
-    rm -f "$broker_plist" "$signer_plist" "$pf_anchor"
+    rm -f "$broker_plist" "$signer_plist" "$pf_anchor" "$newsyslog_config"
     if $retain; then
       mkdir -p "$product/retained"; enrollment="$retained"; write_enrollment retained
-      rm -f "$enrollments/$login_uid.json"; rm -rf "$runtime"
+      rm -f "$enrollments/$login_uid.json"; rm -rf "$runtime" "$log_root"
       echo "Bloom macOS runtime removed; custody retained for restore"
     else
-      rm -f "$enrollments/$login_uid.json" "$retained"; rm -rf "$config" "$variable/db/bloom/$login_uid" "$runtime"
+      rm -f "$enrollments/$login_uid.json" "$retained"; rm -rf "$config" "$variable/db/bloom/$login_uid" "$runtime" "$log_root"
     fi
     if $live && ! $retain; then
       for name in "$broker_user" "$signer_user"; do dscl . -delete "/Users/$name"; done
       for name in "$broker_group" "$signer_group" "$machine_broker_group" "$broker_signer_group" "$revoke_group"; do dscl . -delete "/Groups/$name"; done
+      record_exists Groups "$log_group" && dscl . -delete "/Groups/$log_group"
       dsmemberutil flushcache
     fi
     if ! find "$enrollments" -type f -name '*.json' -maxdepth 1 2>/dev/null | grep . >/dev/null; then

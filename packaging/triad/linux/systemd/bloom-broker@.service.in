@@ -9,6 +9,9 @@ User=bloom-broker-%i
 Group=bloom-broker-%i
 UMask=0077
 ExecStart=@BLOOM_BROKER_BINARY@
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=bloom-broker-%i
 Environment=BLOOM_BROKER_IDENTITY=/etc/bloom/%i/broker/identity.json
 Environment=BLOOM_BROKER_CONFIG=/etc/bloom/%i/broker/config.json
 Environment=BLOOM_EDGE_MANIFEST=/etc/bloom/%i/edge-manifest.json

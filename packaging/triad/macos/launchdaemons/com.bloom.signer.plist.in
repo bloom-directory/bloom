@@ -38,6 +38,12 @@
     <string>@BLOOM_SIGNER_CONTROL_SOCKET@</string>
     <key>BLOOM_SESSION_SOCKET</key>
     <string>@BLOOM_SESSION_SOCKET@</string>
+    <key>BLOOM_SIGNER_LOG_PATH</key>
+    <string>@BLOOM_SIGNER_LOG_PATH@</string>
+    <key>BLOOM_SIGNER_LOG_OWNER_UID</key>
+    <string>@BLOOM_SIGNER_UID@</string>
+    <key>BLOOM_SIGNER_LOG_READER_GID</key>
+    <string>@BLOOM_LOG_READER_GID@</string>
   </dict>
 
   <key>KeepAlive</key>
@@ -70,8 +76,8 @@
     <integer>64</integer>
   </dict>
   <key>StandardOutPath</key>
-  <string>@BLOOM_SIGNER_LOG@</string>
+  <string>/dev/null</string>
   <key>StandardErrorPath</key>
-  <string>@BLOOM_SIGNER_LOG@</string>
+  <string>@BLOOM_SIGNER_BOOTSTRAP_LOG@</string>
 </dict>
 </plist>

@@ -5,6 +5,10 @@ ConditionPathExists=/etc/bloom/%U/edge-manifest.json
 [Service]
 Type=simple
 ExecStart=/usr/libexec/bloom/bloom serve session-sentinel
+Environment=BLOOM_LOG_OUTPUT=json-stderr
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=bloom-session
 Restart=on-failure
 RestartSec=5s
 UMask=0077

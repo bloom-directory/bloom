@@ -12,6 +12,7 @@ async-trait.workspace = true
 bloom-audit-checkpoint.workspace = true
 bloom-triad-local-transport.workspace = true
 bloom-broker-api.workspace = true
+bloom-rpc-wire.workspace = true
 fs2.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -23,6 +24,8 @@ tracing.workspace = true
 ed25519-dalek.workspace = true
 
 [dev-dependencies]
+bloom-service-observability.workspace = true
 ed25519-dalek.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
+tracing-subscriber.workspace = true

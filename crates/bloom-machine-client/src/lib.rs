@@ -39,7 +39,9 @@ where
 }
 
 pub use bloom_audit_checkpoint::AuthorityEdgeHistory;
-use bloom_audit_checkpoint::{CheckpointSink, CheckpointStore, PinnedAuditKey};
+use bloom_audit_checkpoint::{
+    CheckpointDecision, CheckpointDecisionOutcome, CheckpointStore, PinnedAuditKey,
+};
 use bloom_broker_api::{
     ActivationMode, ApprovalLifecycleState, ApprovalLimitState, ApprovalLimits,
     ApprovalPrepareRequest, ApprovalPublicStatus, ApprovalRenewRequest, ApprovalSelector,
@@ -181,6 +183,8 @@ impl UnixMachineBrokerService {
         request: MachineBrokerRequest,
     ) -> Result<MachineBrokerResponse, ProtocolError> {
         let method = request.method()?;
+        let operation_id = request.operation_id()?.map(|value| value.to_string());
+        let started = std::time::Instant::now();
         let (provider, checkpoints) = {
             let state = self
                 .journals
@@ -198,7 +202,12 @@ impl UnixMachineBrokerService {
                     sequence,
                     head_hash,
                 );
-                if let Err(error) = checkpoints.append_peer_head(&head) {
+                if let Err(error) = append_checkpoint_with_event(
+                    &checkpoints,
+                    &head,
+                    method.as_str(),
+                    operation_id.as_deref(),
+                ) {
                     provider.latch_mutations(format!(
                         "persist Machine authority-edge audit head: {error}"
                     ));
@@ -223,7 +232,9 @@ impl UnixMachineBrokerService {
         let mut stream = tokio::net::UnixStream::connect(&self.socket_path)
             .await
             .map_err(|error| service_unavailable(format!("connect Broker: {error}")))?;
-        bloom_triad_local_transport::call_with_journal_head(
+        let checkpoint_method = method.clone();
+        let checkpoint_operation_id = operation_id.clone();
+        let result = bloom_triad_local_transport::call_with_journal_head(
             &mut stream,
             &self.identity,
             &self.broker,
@@ -233,11 +244,16 @@ impl UnixMachineBrokerService {
             30_000,
             sender_head,
             move |peer_head| {
-                if let Err(error) = checkpoints.append_peer_head(peer_head) {
+                if let Err(error) = append_checkpoint_with_event(
+                    &checkpoints,
+                    peer_head,
+                    checkpoint_method.as_str(),
+                    checkpoint_operation_id.as_deref(),
+                ) {
                     provider.latch_mutations(format!(
                         "persist Broker authority-edge audit head: {error}"
                     ));
-                    if !is_read_only_method(&method) {
+                    if !is_read_only_method(&checkpoint_method) {
                         return Err(service_unavailable(format!(
                             "persist Broker audit checkpoint before publishing mutation result: {error}"
                         )));
@@ -246,7 +262,106 @@ impl UnixMachineBrokerService {
                 Ok(())
             },
         )
-        .await
+        .await;
+        let duration_ms = started.elapsed().as_millis() as u64;
+        match &result {
+            Ok(_) if is_read_only_method(&method) => tracing::debug!(
+                event = "rpc.request_completed",
+                peer_service_id = self.broker.service_id.as_str(),
+                method = method.as_str(),
+                operation_id = operation_id.as_deref().unwrap_or(""),
+                duration_ms,
+                outcome = "ok"
+            ),
+            Ok(_) => tracing::info!(
+                event = "rpc.request_completed",
+                peer_service_id = self.broker.service_id.as_str(),
+                method = method.as_str(),
+                operation_id = operation_id.as_deref().unwrap_or(""),
+                duration_ms,
+                outcome = "ok"
+            ),
+            Err(error) => tracing::warn!(
+                event = "rpc.request_completed",
+                peer_service_id = self.broker.service_id.as_str(),
+                method = method.as_str(),
+                operation_id = operation_id.as_deref().unwrap_or(""),
+                duration_ms,
+                outcome = "error",
+                protocol_error_code = error.code.as_str()
+            ),
+        }
+        result
+    }
+}
+
+fn checkpoint_outcome(outcome: CheckpointDecisionOutcome) -> &'static str {
+    match outcome {
+        CheckpointDecisionOutcome::Appended => "appended",
+        CheckpointDecisionOutcome::AlreadyPresent => "already_present",
+        CheckpointDecisionOutcome::SequenceRollback => "sequence_rollback",
+        CheckpointDecisionOutcome::SequenceConflict => "sequence_conflict",
+        CheckpointDecisionOutcome::InvalidSignature => "invalid_signature",
+        CheckpointDecisionOutcome::UnpinnedPeer => "unpinned_peer",
+        CheckpointDecisionOutcome::StorageOrConfigurationFailure => {
+            "storage_or_configuration_failure"
+        }
+    }
+}
+
+fn emit_checkpoint_decision(
+    decision: &CheckpointDecision,
+    method: &str,
+    operation_id: Option<&str>,
+    mutations_disabled_latched: bool,
+) {
+    let retained = decision.retained.as_ref();
+    let recipient = decision
+        .recipient_service_id
+        .as_ref()
+        .map(|token| token.as_str())
+        .unwrap_or("");
+    macro_rules! emit {
+        ($level:ident) => {
+            tracing::$level!(
+                event = "audit.checkpoint_decision",
+                recipient_service_id = recipient,
+                peer_service_id = decision.attempted.service_id.as_str(),
+                peer_key_id = decision.attempted.key_id.as_str(),
+                method,
+                operation_id = operation_id.unwrap_or(""),
+                attempted_sequence = decision.attempted.sequence,
+                attempted_head_digest = decision.attempted.head_digest.as_str(),
+                retained_present = retained.is_some(),
+                retained_sequence = retained.map(|head| head.sequence).unwrap_or(0),
+                retained_head_digest = retained.map(|head| head.head_digest.as_str()).unwrap_or(""),
+                outcome = checkpoint_outcome(decision.outcome),
+                mutations_disabled_latched
+            )
+        };
+    }
+    match decision.outcome {
+        CheckpointDecisionOutcome::AlreadyPresent => emit!(debug),
+        CheckpointDecisionOutcome::Appended => emit!(info),
+        _ => emit!(error),
+    }
+}
+
+fn append_checkpoint_with_event(
+    checkpoints: &CheckpointStore,
+    head: &bloom_rpc_wire::SignedJournalHead,
+    method: &str,
+    operation_id: Option<&str>,
+) -> Result<(), bloom_audit_checkpoint::CheckpointError> {
+    match checkpoints.append_diagnosed(head) {
+        Ok(decision) => {
+            emit_checkpoint_decision(&decision, method, operation_id, false);
+            Ok(())
+        }
+        Err(failure) => {
+            emit_checkpoint_decision(&failure.decision, method, operation_id, true);
+            Err(failure.source)
+        }
     }
 }
 
@@ -2335,6 +2450,95 @@ mod tests {
         NormalizedSignature, RequestNonce, ServiceFuture, SignatureEncoding,
     };
     use ed25519_dalek::SigningKey;
+    use tracing_subscriber::prelude::*;
+
+    #[test]
+    fn checkpoint_event_has_exact_safe_evidence_and_omits_marker_secret() {
+        let capture = bloom_service_observability::CapturedWriter::default();
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_subscriber::fmt::layer()
+                .json()
+                .with_writer(capture.clone()),
+        );
+        let marker = "BLOOM_MARKER_CHECKPOINT_SECRET_2b1a";
+        let directory = tempfile::tempdir().unwrap();
+        let checkpoint_root = directory.path().join(marker);
+        std::fs::create_dir(&checkpoint_root).unwrap();
+        std::fs::set_permissions(&checkpoint_root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let uid = std::fs::metadata(&checkpoint_root).unwrap().uid();
+        let machine = local_identity("bloom-machine", "machine-key", 31);
+        let broker = local_identity("bloom-broker", "broker-key", 32);
+        let store = CheckpointStore::open_with_history(
+            &checkpoint_root,
+            uid,
+            machine.service_id.clone(),
+            [
+                PinnedAuditKey {
+                    service_id: machine.service_id.clone(),
+                    key_id: machine.application_key_id.clone(),
+                    verifying_key: machine.signing_key.verifying_key(),
+                },
+                PinnedAuditKey {
+                    service_id: broker.service_id.clone(),
+                    key_id: broker.application_key_id.clone(),
+                    verifying_key: broker.signing_key.verifying_key(),
+                },
+            ],
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+        std::fs::set_permissions(&checkpoint_root, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let failing_head = bloom_triad_local_transport::sign_journal_head(
+            &broker,
+            10,
+            Digest32::from_bytes([10; 32]),
+        );
+        let decision = CheckpointDecision {
+            recipient_service_id: Some(bloom_rpc_wire::Token::new("bloom-machine").unwrap()),
+            attempted: bloom_audit_checkpoint::CheckpointHeadMetadata {
+                service_id: bloom_rpc_wire::Token::new("bloom-broker").unwrap(),
+                key_id: bloom_rpc_wire::Token::new("broker-public-key").unwrap(),
+                sequence: 7,
+                head_digest: "aa".repeat(32),
+            },
+            retained: Some(bloom_audit_checkpoint::CheckpointHeadMetadata {
+                service_id: bloom_rpc_wire::Token::new("bloom-broker").unwrap(),
+                key_id: bloom_rpc_wire::Token::new("broker-public-key").unwrap(),
+                sequence: 9,
+                head_digest: "bb".repeat(32),
+            }),
+            outcome: CheckpointDecisionOutcome::SequenceRollback,
+        };
+        tracing::subscriber::with_default(subscriber, || {
+            assert!(
+                append_checkpoint_with_event(
+                    &store,
+                    &failing_head,
+                    "policy.commit_update",
+                    Some(&"cc".repeat(32)),
+                )
+                .is_err()
+            );
+            emit_checkpoint_decision(
+                &decision,
+                "policy.commit_update",
+                Some(&"cc".repeat(32)),
+                true,
+            );
+        });
+        let output = capture.text();
+        assert!(!output.contains(marker));
+        let event = output
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .find(|event| event["fields"]["outcome"] == "sequence_rollback")
+            .unwrap();
+        assert_eq!(event["fields"]["attempted_sequence"], 7);
+        assert_eq!(event["fields"]["retained_sequence"], 9);
+        assert_eq!(event["fields"]["outcome"], "sequence_rollback");
+        assert_eq!(event["fields"]["mutations_disabled_latched"], true);
+    }
 
     #[derive(Deserialize)]
     struct MachineSignOperationVector {

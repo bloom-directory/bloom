@@ -390,7 +390,7 @@ impl WalletProjectionReader for CachedWalletProjectionReader {
             Ok(projections) => Ok(projections),
             Err(error) if error.code == ProtocolErrorCode::ServiceUnavailable => {
                 tracing::warn!(
-                    error = %error,
+                    protocol_error_code = error.code.as_str(),
                     "Machine authority edge unavailable; serving cached wallet projections"
                 );
                 self.cached()
@@ -413,7 +413,7 @@ impl WalletProjectionReader for CachedWalletProjectionReader {
             Err(error) => return Err(error),
         };
         tracing::warn!(
-            error = %broker_error,
+            protocol_error_code = broker_error.code.as_str(),
             wallet_id = %wallet_id.as_str(),
             "Machine authority edge unavailable; serving cached wallet projection"
         );

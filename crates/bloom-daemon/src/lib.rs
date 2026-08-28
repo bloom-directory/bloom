@@ -71,7 +71,7 @@ use sha2::Digest as _;
 use thiserror::Error;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
-use tracing::{debug, info, warn};
+use tracing::{Instrument as _, debug, info, warn};
 
 const WALLET_PROJECTION_LIVE_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -1702,7 +1702,7 @@ impl PetalHost for DaemonPetalHost {
             warn!(
                 package_hash = %context.package_hash,
                 route = %context.route_id,
-                reason = %error,
+                protocol_error_code = error.code.as_str(),
                 "petal.sign_payload_denied"
             );
             HostError::Denied(format!("{}: {}", error.code.as_str(), error.message))
@@ -2799,7 +2799,11 @@ fn invalidate_stale_ceremony_projections(cache_dir: &Path) -> Result<usize, Daem
             Ok(Some(state)) => state,
             Ok(None) => continue,
             Err(error) => {
-                warn!(path = %path.display(), error = %error, "petal.key_projection_unreadable");
+                let _ = error;
+                warn!(
+                    error_kind = "key_projection",
+                    "petal.key_projection_unreadable"
+                );
                 continue;
             }
         };
@@ -2831,14 +2835,22 @@ fn invalidate_stale_ceremony_projections(cache_dir: &Path) -> Result<usize, Daem
         let bytes = match std::fs::read(&path) {
             Ok(bytes) => bytes,
             Err(error) => {
-                warn!(path = %path.display(), error = %error, "petal.signing_projection_unreadable");
+                let _ = error;
+                warn!(
+                    error_kind = "signing_projection",
+                    "petal.signing_projection_unreadable"
+                );
                 continue;
             }
         };
         let projection: PetalSigningRequestProjection = match serde_json::from_slice(&bytes) {
             Ok(projection) => projection,
             Err(error) => {
-                warn!(path = %path.display(), error = %error, "petal.signing_projection_unreadable");
+                let _ = error;
+                warn!(
+                    error_kind = "signing_projection",
+                    "petal.signing_projection_unreadable"
+                );
                 continue;
             }
         };
@@ -2975,7 +2987,10 @@ impl Daemon {
         for spec in config.chains.values() {
             match ChainClient::new(spec.clone()) {
                 Ok(c) => clients.push(c),
-                Err(e) => warn!(chain = %spec.name, error = %e, "daemon.chain_skipped"),
+                Err(error) => {
+                    let _ = error;
+                    warn!(chain = %spec.name, error_kind = "chain_configuration", "daemon.chain_skipped")
+                }
             }
         }
         let chains = ChainRegistry::default();
@@ -3144,7 +3159,11 @@ impl Daemon {
                 b
             }
             Err(e) => {
-                debug!(path = %address_book_path.display(), error = %e, "addressbook.load_failed_using_empty");
+                let _ = e;
+                debug!(
+                    error_kind = "address_book_load",
+                    "addressbook.load_failed_using_empty"
+                );
                 AddressBook::default()
             }
         };
@@ -3248,7 +3267,11 @@ impl Daemon {
                     EtherscanClient::with_base_url(c.api_key.clone(), url)
                 }
                 Err(e) => {
-                    warn!(api_url = %c.api_url, error = %e, "daemon.etherscan_url_invalid_using_default");
+                    let _ = e;
+                    warn!(
+                        error_kind = "etherscan_configuration",
+                        "daemon.etherscan_url_invalid_using_default"
+                    );
                     EtherscanClient::new(c.api_key.clone())
                 }
             });
@@ -3290,14 +3313,16 @@ impl Daemon {
                     Ok(p) => {
                         let arc_p: Arc<dyn bloom_mempool::PrivateRpcProvider> = Arc::new(p);
                         if let Err(e) = tx_engine.register_private_rpc(chain_id, arc_p.clone()) {
-                            warn!(chain = %chain_name, error = %e, "daemon.private_rpc_register_failed");
+                            let _ = e;
+                            warn!(chain = %chain_name, error_kind = "private_rpc_registration", "daemon.private_rpc_register_failed");
                         } else {
                             debug!(chain = %chain_name, provider = "mev_blocker", "daemon.private_rpc_registered");
                             private_rpc_probes.push((chain_name.clone(), arc_p));
                         }
                     }
                     Err(e) => {
-                        warn!(chain = %chain_name, error = %e, "daemon.mev_blocker_init_failed")
+                        let _ = e;
+                        warn!(chain = %chain_name, error_kind = "private_rpc_configuration", "daemon.mev_blocker_init_failed")
                     }
                 }
             }
@@ -3306,14 +3331,16 @@ impl Daemon {
                     Ok(p) => {
                         let arc_p: Arc<dyn bloom_mempool::PrivateRpcProvider> = Arc::new(p);
                         if let Err(e) = tx_engine.register_private_rpc(chain_id, arc_p.clone()) {
-                            warn!(chain = %chain_name, error = %e, "daemon.private_rpc_register_failed");
+                            let _ = e;
+                            warn!(chain = %chain_name, error_kind = "private_rpc_registration", "daemon.private_rpc_register_failed");
                         } else {
                             debug!(chain = %chain_name, provider = "flashbots", "daemon.private_rpc_registered");
                             private_rpc_probes.push((chain_name.clone(), arc_p));
                         }
                     }
                     Err(e) => {
-                        warn!(chain = %chain_name, error = %e, "daemon.flashbots_init_failed")
+                        let _ = e;
+                        warn!(chain = %chain_name, error_kind = "private_rpc_configuration", "daemon.flashbots_init_failed")
                     }
                 }
             }
@@ -3591,7 +3618,8 @@ impl Daemon {
         // mount serve loop) always have one.
         if tokio::runtime::Handle::try_current().is_ok() {
             if let Err(e) = watch_executor.start() {
-                warn!(error = %e, "watch.executor.start_failed");
+                let _ = e;
+                warn!(error_kind = "watch_executor", "watch.executor.start_failed");
             }
         } else {
             warn!("watch.executor.skipped: no tokio runtime; call Daemon::start_workers later");
@@ -3790,7 +3818,8 @@ impl Daemon {
     /// outside one.
     pub fn start_workers(&self) {
         if let Err(e) = self.watch_executor.start() {
-            warn!(error = %e, "watch.executor.start_failed");
+            let _ = e;
+            warn!(error_kind = "watch_executor", "watch.executor.start_failed");
         }
     }
 
@@ -3863,6 +3892,7 @@ impl Daemon {
         let audit = self.audit.clone();
         let (tx, mut rx) = watch::channel(false);
         let interval = Duration::from_secs(60);
+        let background_span = tracing::Span::current();
         let handle = tokio::spawn(async move {
             // Tick at `interval`, but exit promptly when the cancel
             // channel flips. We use `tokio::select!` so a long sleep
@@ -3879,7 +3909,10 @@ impl Daemon {
                         match run_expiry_sweep_once(&outbox, &audit, now_ms) {
                             Ok(0) => tracing::trace!("outbox.sweep_expired.empty"),
                             Ok(n) => info!(swept = n, "outbox.sweep_expired"),
-                            Err(e) => warn!(error = %e, "outbox.sweep_expired_failed"),
+                            Err(error) => {
+                                let _ = error;
+                                warn!(error_kind = "expiry_sweep", "outbox.sweep_expired_failed")
+                            },
                         }
                     }
                     _ = rx.changed() => {
@@ -3889,7 +3922,7 @@ impl Daemon {
                     }
                 }
             }
-        });
+        }.instrument(background_span));
         BackgroundTasks {
             cancel: tx,
             handle: Some(handle),
@@ -4043,11 +4076,20 @@ fn spawn_wallet_projection_refresh(
     projections: Arc<dyn WalletProjectionReader>,
     audit: Arc<AuditLog>,
 ) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        if let Err(error) = refresh_wallet_projections_once(projections.as_ref(), &audit).await {
-            warn!(%error, "Machine wallet projection refresh failed");
+    let background_span = tracing::Span::current();
+    tokio::spawn(
+        async move {
+            if let Err(error) = refresh_wallet_projections_once(projections.as_ref(), &audit).await
+            {
+                let _ = error;
+                warn!(
+                    error_kind = "wallet_projection_refresh",
+                    "Machine wallet projection refresh failed"
+                );
+            }
         }
-    })
+        .instrument(background_span),
+    )
 }
 
 struct WalletProjectionRefreshAudit<'a> {
@@ -4094,7 +4136,11 @@ impl Drop for WalletProjectionRefreshAudit<'_> {
             "error": "wallet projection refresh was cancelled before completion",
         });
         if let Err(error) = self.append_result(result) {
-            warn!(%error, "Machine wallet projection cancellation audit failed");
+            let _ = error;
+            warn!(
+                error_kind = "projection_cancellation_audit",
+                "Machine wallet projection cancellation audit failed"
+            );
         }
     }
 }
@@ -4269,7 +4315,11 @@ fn render_installed_petals_doc(petals: &PetalRunner) -> Vec<u8> {
     match petals.installed_petal_discovery() {
         Ok(installed) => render_petal_discovery_markdown(&installed),
         Err(error) => {
-            warn!(error = %error, "daemon.petals_docs_render_failed");
+            let _ = error;
+            warn!(
+                error_kind = "petal_docs_render",
+                "daemon.petals_docs_render_failed"
+            );
             format!(
                 "# Installed Petals\n\n\
                  Bloom could not read the installed Petal manifests: `{error}`\n"

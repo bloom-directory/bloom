@@ -129,7 +129,23 @@ pub async fn run() -> Result<()> {
         gid: socket_gid,
     };
 
-    serve_authenticated_services(listener, identity, [broker_acl, signer_acl]).await
+    tracing::info!(
+        event = "service.identity_loaded",
+        service_id = identity.service_id.as_str(),
+        enrolled_login_uid = effective_uid
+    );
+    tracing::info!(event = "service.ready", listener_kind = "unix");
+    crate::native_lifecycle("session-sentinel", "ready");
+
+    tokio::select! {
+        result = serve_authenticated_services(listener, identity, [broker_acl, signer_acl]) => result,
+        result = crate::termination_signal() => {
+            result.context("wait for session sentinel shutdown signal")?;
+            tracing::info!(event = "service.shutdown", reason = "signal");
+            crate::native_lifecycle("session-sentinel", "shutdown");
+            Ok(())
+        }
+    }
 }
 
 async fn serve_authenticated_services(
@@ -187,11 +203,14 @@ async fn serve_authenticated_services(
                     service_id = peer.service_id.as_str(),
                     "session_sentinel.unexpected_channel_data"
                 ),
-                Err(error) => tracing::warn!(
-                    %error,
-                    service_id = peer.service_id.as_str(),
-                    "session_sentinel.monitor_failed"
-                ),
+                Err(error) => {
+                    let _ = error;
+                    tracing::warn!(
+                        error_kind = "channel_read",
+                        service_id = peer.service_id.as_str(),
+                        "session_sentinel.monitor_failed"
+                    )
+                }
             }
         });
     }
