@@ -911,7 +911,7 @@ fn emit_machine_mutation_rejection_if_needed<T>(
     let Some(error) = result.as_ref().err() else {
         return;
     };
-    let remote_commit_recorded = workflow == "ceremony" && error.is::<CeremonyRemoteCommitted>();
+    let remote_commit_recorded = error.is::<RemoteMutationCommitted>();
     if !remote_commit_recorded {
         emit_machine_mutation(workflow, operation_id, "rejected");
     }
@@ -1324,9 +1324,7 @@ async fn execute_machine_command(
             assurance_level,
         } => prepare_policy_update(home, &name, &policy, &assurance_level).await?,
         MachineCommand::WalletPolicyCommit { operation_id } => {
-            let output = commit_policy_update(home, operation_id.clone()).await?;
-            emit_machine_mutation("policy_update", Some(&operation_id), "committed");
-            output
+            commit_policy_update(home, operation_id).await?
         }
         MachineCommand::WalletOutboxCancel {
             wallet,
@@ -1657,18 +1655,17 @@ async fn commit_policy_update(home: &HomeDir, operation_id: String) -> Result<St
         "policy commit requires the matching completed policy_update ceremony receipt"
     );
 
-    let receipt = client
-        .commit_policy_update(bloom_broker_api::PolicyCommitUpdateRequest {
-            operation_id: operation_id.clone(),
-            ceremony_receipt,
-        })
-        .await
-        .map_err(anyhow::Error::new)
-        .context("commit policy update through Broker and Signer compare-and-swap")?;
-    anyhow::ensure!(
-        receipt.operation_id == operation_id,
-        "Broker policy commit receipt operation identity mismatch"
-    );
+    let receipt = policy_commit_remote_result(
+        operation_id.as_str(),
+        client
+            .commit_policy_update(bloom_broker_api::PolicyCommitUpdateRequest {
+                operation_id: operation_id.clone(),
+                ceremony_receipt,
+            })
+            .await,
+    )
+    .map_err(anyhow::Error::new)
+    .context("commit policy update through Broker and Signer compare-and-swap")?;
     info!(
         event = "machine.policy_update.transition",
         operation_id = operation_id.as_str(),
@@ -1676,28 +1673,59 @@ async fn commit_policy_update(home: &HomeDir, operation_id: String) -> Result<St
         state = "committed"
     );
 
-    if let Ok(status) = client.ceremony_status(operation_id.clone()).await {
-        let now_ms = current_unix_ms();
-        let mut projection = match load_ceremony_projection(home, &operation_id)? {
-            Some(mut projection) => {
-                projection
-                    .reconcile_custody(&status, now_ms)
-                    .map_err(anyhow::Error::new)
-                    .context("reconcile committed policy-update projection")?;
-                projection
-            }
-            None => bloom_machine_client::CeremonyProjection::from_custody_status(&status, now_ms)
-                .map_err(anyhow::Error::new)
-                .context("rebuild committed policy-update projection")?,
-        };
-        projection.expire_launch_secret(now_ms);
-        persist_ceremony_projection(home, &projection)?;
-    }
+    let local_result = async {
+        anyhow::ensure!(
+            receipt.operation_id == operation_id,
+            "Broker policy commit receipt operation identity mismatch"
+        );
 
-    Ok(format!(
-        "{}\n",
-        serde_json::to_string_pretty(&receipt).context("encode policy commit receipt")?
-    ))
+        if let Ok(status) = client.ceremony_status(operation_id.clone()).await {
+            let now_ms = current_unix_ms();
+            let mut projection = match load_ceremony_projection(home, &operation_id)? {
+                Some(mut projection) => {
+                    projection
+                        .reconcile_custody(&status, now_ms)
+                        .map_err(anyhow::Error::new)
+                        .context("reconcile committed policy-update projection")?;
+                    projection
+                }
+                None => {
+                    bloom_machine_client::CeremonyProjection::from_custody_status(&status, now_ms)
+                        .map_err(anyhow::Error::new)
+                        .context("rebuild committed policy-update projection")?
+                }
+            };
+            projection.expire_launch_secret(now_ms);
+            persist_ceremony_projection(home, &projection)?;
+        }
+
+        Ok(format!(
+            "{}\n",
+            serde_json::to_string_pretty(&receipt).context("encode policy commit receipt")?
+        ))
+    }
+    .await;
+    finish_policy_commit_local_result(operation_id.as_str(), local_result)
+}
+
+fn policy_commit_remote_result<T, E>(operation_id: &str, result: Result<T, E>) -> Result<T, E> {
+    if result.is_ok() {
+        emit_machine_mutation("policy_update", Some(operation_id), "committed");
+    }
+    result
+}
+
+fn finish_policy_commit_local_result<T>(operation_id: &str, result: Result<T>) -> Result<T> {
+    if result.is_err() {
+        warn!(
+            event = "machine.local_post_commit_failed",
+            workflow = "policy_update",
+            operation_id,
+            remote_state = "committed",
+            error_kind = "local_processing"
+        );
+    }
+    result.context(RemoteMutationCommitted)
 }
 
 fn is_completed_policy_update_receipt(
@@ -1875,21 +1903,21 @@ async fn handle_ceremony(home: &HomeDir, command: CeremonyCmd) -> Result<String>
 }
 
 #[derive(Debug)]
-struct CeremonyRemoteCommitted;
+struct RemoteMutationCommitted;
 
-impl std::fmt::Display for CeremonyRemoteCommitted {
+impl std::fmt::Display for RemoteMutationCommitted {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("Broker ceremony cancellation committed before local projection update")
+        formatter.write_str("remote mutation committed before local processing completed")
     }
 }
 
-impl std::error::Error for CeremonyRemoteCommitted {}
+impl std::error::Error for RemoteMutationCommitted {}
 
 fn finish_ceremony_cancel_projection<T>(operation_id: &str, result: Result<T>) -> Result<T> {
     if result.is_err() {
         emit_ceremony_local_projection_failure(operation_id);
     }
-    result.context(CeremonyRemoteCommitted)
+    result.context(RemoteMutationCommitted)
 }
 
 fn ceremony_cancel_remote_result<T, E>(operation_id: &str, result: Result<T, E>) -> Result<T, E> {
@@ -4054,14 +4082,15 @@ mod tests {
 
     use super::{
         CeremonyCmd, Cli, Cmd, LegacyMigrationReceiptFile, MachineCommandEventClass, WalletCmd,
-        ceremony_cancel_remote_result, ceremony_projection_path, emit_machine_mutation,
-        emit_machine_mutation_rejection_if_needed, emit_machine_ready, endpoint_connection_error,
-        enrollment_state_is_usable, execute_audit_command, execute_wallet_outbox_action,
-        finish_ceremony_cancel_projection, format_petal_consent_net_rule, handle_ceremony,
+        ceremony_cancel_remote_result, ceremony_projection_path, commit_policy_update,
+        emit_machine_mutation, emit_machine_mutation_rejection_if_needed, emit_machine_ready,
+        endpoint_connection_error, enrollment_state_is_usable, execute_audit_command,
+        execute_wallet_outbox_action, finish_ceremony_cancel_projection,
+        finish_policy_commit_local_result, format_petal_consent_net_rule, handle_ceremony,
         is_completed_policy_update_receipt, launch_wallet_registration_via_vfs,
         load_ceremony_projection, long_running_role, machine_command_event_fields,
         machine_error_from_anyhow, machine_wallet_lookup_error, open_machine_audit_with_history,
-        persist_ceremony_projection, request_body_with_wallet,
+        persist_ceremony_projection, policy_commit_remote_result, request_body_with_wallet,
     };
     use bloom_daemon::ipc::{MachineCeremonyAction, MachineCommand, MachineOperationAction};
 
@@ -4758,6 +4787,92 @@ mod tests {
                 .iter()
                 .any(|event| event["fields"]["state"] == "rejected")
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn policy_commit_pre_remote_and_rpc_failures_close_started_mutations() {
+        let capture = bloom_service_observability::CapturedWriter::default();
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_subscriber::fmt::layer()
+                .json()
+                .with_writer(capture.clone()),
+        );
+        let temp = tempfile::tempdir().unwrap();
+        let home = bloom_proto::HomeDir::at(temp.path());
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let invalid_operation_id = "not-an-operation-id";
+        emit_machine_mutation("policy_update", Some(invalid_operation_id), "started");
+        let pre_remote = commit_policy_update(&home, invalid_operation_id.into()).await;
+        assert!(pre_remote.is_err());
+        emit_machine_mutation_rejection_if_needed(
+            "policy_update",
+            Some(invalid_operation_id),
+            &pre_remote,
+        );
+
+        let rpc_operation_id = "cd".repeat(32);
+        emit_machine_mutation("policy_update", Some(&rpc_operation_id), "started");
+        let rpc_failure = policy_commit_remote_result::<(), _>(
+            &rpc_operation_id,
+            Err(anyhow::anyhow!("Broker RPC unavailable")),
+        );
+        emit_machine_mutation_rejection_if_needed(
+            "policy_update",
+            Some(&rpc_operation_id),
+            &rpc_failure,
+        );
+        drop(_guard);
+
+        let states = capture
+            .text()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .filter(|event| event["fields"]["event"] == "machine.durable_mutation")
+            .map(|event| event["fields"]["state"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(states, ["started", "rejected", "started", "rejected"]);
+    }
+
+    #[test]
+    fn policy_commit_keeps_remote_commit_when_local_processing_fails() {
+        let capture = bloom_service_observability::CapturedWriter::default();
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_subscriber::fmt::layer()
+                .json()
+                .with_writer(capture.clone()),
+        );
+        let operation_id = "ab".repeat(32);
+        tracing::subscriber::with_default(subscriber, || {
+            emit_machine_mutation("policy_update", Some(&operation_id), "started");
+            policy_commit_remote_result::<_, ()>(&operation_id, Ok(())).unwrap();
+            let local_result = finish_policy_commit_local_result::<()>(
+                &operation_id,
+                Err(anyhow::anyhow!("projection marker secret")),
+            );
+            emit_machine_mutation_rejection_if_needed(
+                "policy_update",
+                Some(&operation_id),
+                &local_result,
+            );
+        });
+        let output = capture.text();
+        assert!(!output.contains("projection marker secret"));
+        let events = output
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert!(events.iter().any(|event| {
+            event["fields"]["event"] == "machine.local_post_commit_failed"
+                && event["fields"]["workflow"] == "policy_update"
+                && event["fields"]["remote_state"] == "committed"
+        }));
+        let states = events
+            .iter()
+            .filter(|event| event["fields"]["event"] == "machine.durable_mutation")
+            .map(|event| event["fields"]["state"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(states, ["started", "committed"]);
     }
 
     #[test]
