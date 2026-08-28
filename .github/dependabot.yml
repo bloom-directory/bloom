@@ -5,8 +5,6 @@ updates:
     schedule:
       interval: weekly
       day: monday
-    # Minor and patch bumps (including security fixes) ride together;
-    # semver-major bumps open their own PRs so they never block the group.
     groups:
       cargo-minor-and-patch:
         update-types:
@@ -22,3 +20,8 @@ updates:
         update-types:
           - minor
           - patch
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
