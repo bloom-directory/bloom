@@ -9,6 +9,7 @@
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;
 use std::sync::{
     Arc, Mutex,
@@ -36,6 +37,29 @@ use tempfile::TempDir;
 fn bloom_cmd(home: &Path) -> Command {
     let mut cmd = Command::cargo_bin("bloom").expect("locate bloom binary");
     cmd.env("BLOOM_HOME", home);
+    cmd.env(
+        "BLOOM_ENROLLMENT_ROOT",
+        home.join("config/test-enrollments"),
+    );
+    cmd.env("BLOOM_CONFIG_ROOT", home.join("config/test-triad-config"));
+    cmd.env("BLOOM_RUNTIME_ROOT", home.join("run/test-triad-runtime"));
+    cmd.env_remove("BLOOM_BROKER_SOCKET");
+    cmd.env(
+        "BLOOM_MACHINE_IDENTITY",
+        home.join("config/test-missing-machine-identity.json"),
+    );
+    cmd.env(
+        "BLOOM_EDGE_MANIFEST",
+        home.join("config/test-missing-edge-manifest.json"),
+    );
+    cmd.env(
+        "BLOOM_PROVENANCE_CATALOG",
+        home.join("config/test-missing-provenance-catalog.json"),
+    );
+    cmd.env(
+        "BLOOM_MACHINE_AUDIT_CHECKPOINT_DIR",
+        home.join("cache/test-machine-audit-checkpoints"),
+    );
     // Quiet logging keeps stdout/stderr predictable for assertions.
     cmd.env("RUST_LOG", "error");
     cmd
@@ -49,6 +73,14 @@ fn fresh_home() -> TempDir {
         .expect("create temp home");
     #[cfg(not(target_os = "macos"))]
     tempfile::tempdir().expect("create temp home")
+}
+
+fn prepare_hermetic_machine_state(home: &Path) {
+    let checkpoint_dir = home.join("cache/test-machine-audit-checkpoints");
+    std::fs::create_dir_all(&checkpoint_dir)
+        .expect("create hermetic Machine audit checkpoint directory");
+    std::fs::set_permissions(&checkpoint_dir, std::fs::Permissions::from_mode(0o700))
+        .expect("secure hermetic Machine audit checkpoint directory");
 }
 
 fn ipc_endpoint_accepting(socket: &Path) -> bool {
@@ -67,6 +99,7 @@ impl RunningBloom {
     }
 
     fn start_with_automatic_update_checks(home: &Path, automatic_update_checks: bool) -> Self {
+        prepare_hermetic_machine_state(home);
         let home_dir = bloom_proto::HomeDir::at(home);
         let mut config = if home_dir.config_path().is_file() {
             bloom_proto::Config::load(&home_dir.config_path()).unwrap()
@@ -79,6 +112,29 @@ impl RunningBloom {
         let mut command = std::process::Command::new(binary.get_program());
         command
             .env("BLOOM_HOME", home)
+            .env(
+                "BLOOM_ENROLLMENT_ROOT",
+                home.join("config/test-enrollments"),
+            )
+            .env("BLOOM_CONFIG_ROOT", home.join("config/test-triad-config"))
+            .env("BLOOM_RUNTIME_ROOT", home.join("run/test-triad-runtime"))
+            .env_remove("BLOOM_BROKER_SOCKET")
+            .env(
+                "BLOOM_MACHINE_IDENTITY",
+                home.join("config/test-missing-machine-identity.json"),
+            )
+            .env(
+                "BLOOM_EDGE_MANIFEST",
+                home.join("config/test-missing-edge-manifest.json"),
+            )
+            .env(
+                "BLOOM_PROVENANCE_CATALOG",
+                home.join("config/test-missing-provenance-catalog.json"),
+            )
+            .env(
+                "BLOOM_MACHINE_AUDIT_CHECKPOINT_DIR",
+                home.join("cache/test-machine-audit-checkpoints"),
+            )
             .env("RUST_LOG", "error")
             .arg("serve")
             .stdout(std::process::Stdio::null())
@@ -699,12 +755,36 @@ fn stop_ipc_server(
 }
 
 fn spawn_bloom_serve(home: &Path) -> std::process::Child {
+    prepare_hermetic_machine_state(home);
     let binary = Command::cargo_bin("bloom")
         .expect("locate bloom binary")
         .get_program()
         .to_owned();
     let mut child = std::process::Command::new(binary)
         .env("BLOOM_HOME", home)
+        .env(
+            "BLOOM_ENROLLMENT_ROOT",
+            home.join("config/test-enrollments"),
+        )
+        .env("BLOOM_CONFIG_ROOT", home.join("config/test-triad-config"))
+        .env("BLOOM_RUNTIME_ROOT", home.join("run/test-triad-runtime"))
+        .env_remove("BLOOM_BROKER_SOCKET")
+        .env(
+            "BLOOM_MACHINE_IDENTITY",
+            home.join("config/test-missing-machine-identity.json"),
+        )
+        .env(
+            "BLOOM_EDGE_MANIFEST",
+            home.join("config/test-missing-edge-manifest.json"),
+        )
+        .env(
+            "BLOOM_PROVENANCE_CATALOG",
+            home.join("config/test-missing-provenance-catalog.json"),
+        )
+        .env(
+            "BLOOM_MACHINE_AUDIT_CHECKPOINT_DIR",
+            home.join("cache/test-machine-audit-checkpoints"),
+        )
         .env("RUST_LOG", "error")
         .arg("serve")
         .stdout(std::process::Stdio::null())
@@ -1479,6 +1559,7 @@ fn connect_flag_beats_rpc_endpoint_env() {
 #[test]
 fn lifecycle_commands_ignore_invalid_client_endpoint_configuration() {
     let home = fresh_home();
+    prepare_hermetic_machine_state(home.path());
     let home_dir = bloom_proto::HomeDir::at(home.path());
     let mut config = bloom_proto::Config::local_default();
     config.petals.preinstalled.clear();
@@ -1492,6 +1573,37 @@ fn lifecycle_commands_ignore_invalid_client_endpoint_configuration() {
     let binary = Command::cargo_bin("bloom").expect("locate bloom binary");
     let mut child = std::process::Command::new(binary.get_program())
         .env("BLOOM_HOME", home.path())
+        .env(
+            "BLOOM_ENROLLMENT_ROOT",
+            home.path().join("config/test-enrollments"),
+        )
+        .env(
+            "BLOOM_CONFIG_ROOT",
+            home.path().join("config/test-triad-config"),
+        )
+        .env(
+            "BLOOM_RUNTIME_ROOT",
+            home.path().join("run/test-triad-runtime"),
+        )
+        .env_remove("BLOOM_BROKER_SOCKET")
+        .env(
+            "BLOOM_MACHINE_IDENTITY",
+            home.path()
+                .join("config/test-missing-machine-identity.json"),
+        )
+        .env(
+            "BLOOM_EDGE_MANIFEST",
+            home.path().join("config/test-missing-edge-manifest.json"),
+        )
+        .env(
+            "BLOOM_PROVENANCE_CATALOG",
+            home.path()
+                .join("config/test-missing-provenance-catalog.json"),
+        )
+        .env(
+            "BLOOM_MACHINE_AUDIT_CHECKPOINT_DIR",
+            home.path().join("cache/test-machine-audit-checkpoints"),
+        )
         .env("BLOOM_RPC_ENDPOINT", "tcp:invalid")
         .env("RUST_LOG", "error")
         .env(bloom_update::DISABLE_AUTO_CHECK_ENV, "1")

@@ -176,6 +176,27 @@ else
   "$install_payload/installer/release/install-linux.sh" \
     uninstall "$work/linux-root" 1000 delete-bloom-login-1000
   test ! -e "$work/linux-root/etc/bloom/1000"
+
+  mkdir -p "$work/macos-root"
+  release_digest="$(shasum -a 256 "$install_payload/SHA256SUMS" | awk '{print $1}')"
+  BLOOM_ALLOW_TEST_UNCLAIMED=true \
+    BLOOM_MACOS_BROKER_UID=250501 \
+    BLOOM_MACOS_SIGNER_UID=250502 \
+    BLOOM_MACOS_BROKER_GID=260499 \
+    BLOOM_MACOS_SIGNER_GID=260500 \
+    BLOOM_MACOS_MACHINE_BROKER_GID=260501 \
+    BLOOM_MACOS_BROKER_SIGNER_GID=260502 \
+    BLOOM_MACOS_REVOKE_GID=260503 \
+    BLOOM_RELEASE_DIGEST="$release_digest" \
+    "$install_payload/installer/release/install-macos.sh" \
+      install "$work/macos-root" 501 releaseuser "$install_payload"
+  test -x "$work/macos-root/usr/local/libexec/bloom/current/bloom-broker"
+  test -f \
+    "$work/macos-root/Library/Application Support/BloomTriad/enrollments/501.json"
+  "$install_payload/installer/release/install-macos.sh" \
+    uninstall "$work/macos-root" 501 delete-bloom-login-501
+  test ! -e \
+    "$work/macos-root/Library/Application Support/BloomTriad/enrollments/501.json"
 fi
 if [[ -n "$output_dir" ]]; then
   mkdir -p "$output_dir"

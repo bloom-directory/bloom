@@ -85,6 +85,18 @@ binds the candidate to the resolved version and all three full source commits.
 The candidate remains `test-unclaimed`; only the isolated signing pass rewrites
 that claim to `linux` before recalculating the signed payload manifest.
 
+`.github/workflows/macos-release-candidate.yml` is the manual, standard-runner
+macOS aarch64 counterpart to the Linux candidate build. It runs the same locked
+release gate on `macos-15`, proves both staged platform installers, rejects
+non-arm64 outputs, and uploads the four `bloom-triad-test-unclaimed.tar.gz*`
+files as `triad-macos-aarch64-candidate`. It has no push or pull-request trigger
+and does not use a larger macOS runner. The ephemeral candidate key is trusted
+only when a user explicitly selects that exact Actions artifact; the candidate
+is not a production macOS claim. Live candidate installation requires both a
+root-owned, non-writable pin of that artifact's ephemeral public key and the
+explicit `BLOOM_ALLOW_TEST_UNCLAIMED=true` installer opt-in, matching the Linux
+candidate trust boundary.
+
 `sign-release-candidate.sh` is the isolated production signing pass. It never
 executes a candidate-owned binary or script. It replaces the ephemeral inner
 signature, deterministically repacks the payload, signs the outer checksum,

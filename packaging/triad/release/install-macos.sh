@@ -168,6 +168,9 @@ verify_payload() {
       macos-unix-principals) ;;
       macos-unix-principals-w0)
         [[ "${BLOOM_RUN_MACOS_UNIX_W0:-}" == true ]] || die "W0 bundle requires disposable-host opt in" ;;
+      test-unclaimed)
+        [[ "${BLOOM_ALLOW_TEST_UNCLAIMED:-}" == true ]] ||
+          die "test-unclaimed bundle requires explicit candidate opt in" ;;
       *) die "live installation requires a macOS Unix-principal bundle" ;;
     esac
     for path in SHA256SUMS RELEASE_PUBLIC_KEY.pem RELEASE_SIGNATURE; do [[ -f "$payload/$path" && ! -L "$payload/$path" ]] || die "payload missing $path"; done

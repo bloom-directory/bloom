@@ -162,6 +162,39 @@ fn tag_release_builds_the_locked_triad_and_isolates_production_signing() {
 }
 
 #[test]
+fn macos_release_candidate_matches_the_linux_candidate_contract() {
+    let workflow =
+        fs::read_to_string(workspace().join(".github/workflows/macos-release-candidate.yml"))
+            .unwrap();
+    assert!(workflow.contains("workflow_dispatch:"));
+    assert!(!workflow.contains("push:"));
+    assert!(!workflow.contains("pull_request:"));
+    assert!(workflow.contains("runs-on: macos-15"));
+    assert!(
+        workflow
+            .lines()
+            .filter(|line| line.trim_start().starts_with("runs-on:"))
+            .all(|line| line.trim() == "runs-on: macos-15")
+    );
+    assert!(workflow.contains("uname -m | grep -Fx arm64"));
+    assert!(workflow.contains("packaging/triad/release/triad-release-gate.sh"));
+    assert!(workflow.contains("--test-signing-key"));
+    assert!(workflow.contains("--output-dir \"$RUNNER_TEMP/candidate\""));
+    assert!(workflow.contains("name: triad-macos-aarch64-candidate"));
+    assert!(workflow.contains("bloom-triad-test-unclaimed.tar.gz*"));
+
+    let release_gate = fs::read_to_string(release_script("triad-release-gate.sh")).unwrap();
+    assert!(release_gate.contains("installer/release/install-linux.sh"));
+    assert!(release_gate.contains("installer/release/install-macos.sh"));
+    assert!(release_gate.contains("BLOOM_ALLOW_TEST_UNCLAIMED=true"));
+    assert!(release_gate.contains("macos-root/usr/local/libexec/bloom/current/bloom-broker"));
+
+    let installer = fs::read_to_string(release_script("install-macos.sh")).unwrap();
+    assert!(installer.contains("test-unclaimed bundle requires explicit candidate opt in"));
+    assert!(installer.contains("${BLOOM_ALLOW_TEST_UNCLAIMED:-}"));
+}
+
+#[test]
 fn legacy_hash_only_routes_are_checked_by_release_and_installed_acceptance() {
     let release_dir = workspace().join("packaging/triad/release");
     let release_gate = fs::read_to_string(release_dir.join("triad-release-gate.sh")).unwrap();
