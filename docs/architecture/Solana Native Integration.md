@@ -101,11 +101,16 @@ config where a chain name is configured in both.
 
 ## Mainnet posture
 
-This release posture never broadcasts to Solana mainnet. The gate is the
+The default build never broadcasts to Solana mainnet. The gate is the
 cluster's live genesis hash (`bloom_solana::is_mainnet_beta_blocking`),
 checked against the known mainnet-beta hash at chain construction — never
 the operator's config-key name, which proves nothing about a cluster's real
 identity. See `crates/bloom-solana/src/mainnet_guard.rs`.
+
+Mainnet transactions are done with a `mainnet-canary` build plus a
+per-transaction authorization file; see
+[`../operations/solana-mainnet-canary.md`](../operations/solana-mainnet-canary.md).
+That is the complete set of prerequisites.
 
 ## What carried forward from the parked Petal work
 

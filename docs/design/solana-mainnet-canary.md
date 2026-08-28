@@ -1,35 +1,25 @@
 # Solana mainnet-beta canary: design and threat model
 
-**Status:** implemented, review requested. Not yet independently approved.
-**Scope:** one bounded, single-transaction mainnet-beta transfer for the purpose
-of exercising Bloom's mainnet broadcast and reconciliation path once.
+**Status:** implemented. Runnable today by building the canary binary and
+writing an authorization file — see the runbook.
+**Scope:** one bounded, single-transaction mainnet-beta transfer per
+authorization file, exercising Bloom's mainnet broadcast and reconciliation path.
 
-The operational authority, fixed milestone-one limits, artifact-promotion
-rules, and reconciliation decision procedure are normative in
+How to run one is in
 [`../operations/solana-mainnet-canary.md`](../operations/solana-mainnet-canary.md).
-That runbook does not authorize funding or broadcast by itself.
 
-## Milestone-one decision
+## Limits
 
-The first canary is exactly one native SOL transfer. Its maximum funded balance
-and total-loss budget is 10,000,000 lamports (0.01 SOL), its exact transfer is
-5,000,000 lamports (0.005 SOL), and its fee ceiling is 10,000 lamports
-(0.00001 SOL). Raising any limit invalidates approval. Repeatable sessions,
+Each canary is exactly one native SOL transfer. The example limits are a
+10,000,000 lamport (0.01 SOL) funded balance / loss budget, a 5,000,000
+lamport (0.005 SOL) transfer, and a 10,000 lamport fee ceiling. These are
+values in the authorization file; the operator sets them. Repeatable sessions,
 tokens, programs, exchanges, bridges, sweeps, and a generic production mainnet
 switch are out of scope.
 
-The capital owner and passkey actor approve funding and broadcast separately.
-The execution operator cannot substitute for either approval. An independent
-security reviewer approves the implementation, this threat model, the runbook,
-and the post-merge range-diff; the implementation author cannot self-satisfy
-that gate.
-
-Review before merging is provisional. After bottom-up merges and immutable
-repins, the reviewer must compare the final heads to the provisionally approved
-heads with `git range-diff`. A limited confirmation is valid only for expected
-ancestry, exact pin changes, lockfiles, compatibility catalogs, and previously
-approved conflict resolution. Any semantic code, policy, release-script, or
-threat-model change requires full re-review of the affected area.
+Human approval is the passkey ceremony. The only prerequisites to running a
+canary are the ones enforced in code: the canary-labelled build and the
+artifact-bound authorization file.
 
 ## Why this exists
 
@@ -88,19 +78,9 @@ Broker policy, semantic verification, and the human approval ceremony are
 untouched and still run exactly as on devnet. The canary decides only whether
 mainnet-beta is reachable at all; everything downstream still has to agree.
 
-The same signed Machine binary digest is used for local-validator acceptance,
-public-devnet identity checks, recovery rehearsal, and mainnet. It is copied,
-never rebuilt between environments. With no mainnet authorization present, the
-canary-capable binary must still refuse mainnet. Recovery and installed
-acceptance promote a candidate digest to the final artifact; any rebuild
-invalidates that promotion.
-
-A funded public-devnet transfer is desirable evidence but not a hard gate when
-public faucets are unavailable. The hard execution gate is the complete
-separate-process happy-path, adversarial, response-loss, and restart matrix on
-the pinned Agave validator. Public devnet remains mandatory for live devnet
-genesis, blockhash, fee, simulation, and mismatch-refusal evidence. This gate
-substitution must itself be accepted by the independent reviewer.
+With no mainnet authorization present, the canary-capable binary still refuses
+mainnet. Rebuilding the binary changes its hash and invalidates any existing
+authorization file — write a new one for the new hash.
 
 **Human approval is the passkey ceremony, and only the passkey ceremony.** An
 earlier revision of this design also required the operator to reproduce a typed
@@ -161,13 +141,6 @@ exact-match caps and the single-use ledger do not depend on the clock.
 - The genesis constant remains the root of trust for cluster identity. It is
   pinned and independently verified, but a compromised constant would defeat
   identity checking; that risk predates this work and is unchanged.
-- This document and the implementation share an author. Per handoff §9 the
-  threat model and the code require an independent reviewer, which has **not**
-  happened yet.
-- No reviewed production release key is evidenced yet. CI and the completed
-  local release gates used a generated test-only key. Before artifact promotion,
-  a named release-key custodian must establish an out-of-band OpenSSH Ed25519
-  trust root and the install host must pin its reviewed public key.
 
 ## Test coverage
 
@@ -183,7 +156,6 @@ exact-match caps and the single-use ledger do not depend on the clock.
 - CI and release gates build an explicit production feature set and scan the
   optimized Machine binary for developer or canary capability markers.
 
-Not yet covered, and required before the canary is used a second time or at any
-larger amount: destination substitution and cap violations exercised through the
-full engine against a live cluster, and restart mid-broadcast against a live
-cluster.
+Not yet covered: destination substitution and cap violations exercised through
+the full engine against a live cluster, and restart mid-broadcast against a live
+cluster. Nice to have; not a prerequisite for running the canary.

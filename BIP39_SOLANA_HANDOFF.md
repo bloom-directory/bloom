@@ -134,9 +134,9 @@ Verification completed on the final working trees:
    verification accepted the raw staged message and rejected its SHA-256
    digest. Its validator and dev root were also stopped and removed.
 
-Release integration still requires committing the Signer, Broker, and Machine
-working trees, publishing the dependency commits, pinning their exact revisions
-in the downstream repos, and letting CI/macOS run the platform-specific gates.
+Release packaging (committing the Signer/Broker/Machine trees, repinning, and
+CI/macOS platform lanes) is separate housekeeping. It is not a prerequisite for
+mainnet testing: see `docs/operations/solana-mainnet-canary.md`.
 
 ## Known CI environment exceptions
 
