@@ -839,6 +839,7 @@ async fn launch_wallet_registration_via_vfs(
     ))
 }
 
+#[derive(Clone)]
 struct LegacyMigrationLaunch {
     operation_id: bloom_broker_api::OperationId,
     exact_terms_digest: bloom_broker_api::Digest32,
@@ -1149,16 +1150,27 @@ async fn execute_machine_command(
             let receipt: LegacyMigrationReceiptFile =
                 serde_json::from_value(serde_json::to_value(receipt)?)?;
             let (name, migration) = receipt.into_launch()?;
-            launch_custody_ceremony(
+            let output = launch_custody_ceremony(
                 home,
                 &name,
                 bloom_machine_client::CustodyPrepareMethod::WalletImport,
                 bloom_broker_api::CeremonyKind::WalletImport,
                 None,
                 "legacy_passkey_v1_prf",
-                Some(migration),
+                Some(migration.clone()),
             )
-            .await?
+            .await?;
+            daemon
+                .wallet_projections
+                .begin_legacy_migration(
+                    &migration.operation_id,
+                    &migration.public_terms.wallet_name,
+                    &migration.exact_terms_digest,
+                )
+                .await
+                .map_err(anyhow::Error::new)
+                .context("record pending legacy migration")?;
+            output
         }
         MachineCommand::WalletPolicyPrepare {
             name,

@@ -48,6 +48,9 @@ after conversion.
    Signer never signs from, unlocks from, or falls back to a legacy record.
 8. A successful import consumes its staged migration record. Retrying the same
    operation returns the durable result; it does not decrypt or import twice.
+   Machine records the exact migration operation and preceding public wallet
+   generation after prepare, then automatically adopts the matching completed
+   result. A policy reset is never accepted from an ordinary wallet refresh.
 9. The original user-owned legacy directory is not silently deleted. After a
    successful conversion it is ignored by production Machine and may be
    explicitly archived or removed by the user. Signer's private staged copy is
@@ -148,6 +151,13 @@ Machine reads only the public receipt and calls the existing
 Machine does not validate legacy cryptography or inspect `~/.bloom/keystore`.
 The mounted VFS may expose the same operation later, but it is not required for
 the first implementation.
+
+After Broker prepare succeeds, Machine durably records the operation ID, wallet
+ID, exact terms digest, and preceding projection digest. Completion may replace
+that exact live generation or a tombstone derived from it. The successful
+Signer receipt and its restrictive initial policy are consumed automatically
+on the next authenticated projection refresh; no separate repair command is
+part of the migration flow.
 
 ### 5.2 Prepare
 
@@ -302,6 +312,9 @@ boundary.
 - Exact retry returns the same result; changed operation/digest/input fails.
 - Crash before commit is retryable; crash after commit reconciles without a
   duplicate wallet/backend/policy.
+- Machine automatically replaces the exact pre-migration live projection or
+  its derived tombstone, persists that consumption across restart, and rejects
+  replay after any later deletion.
 - A destination collision and credential collision fail without mutation.
 
 ### Broker and end-to-end

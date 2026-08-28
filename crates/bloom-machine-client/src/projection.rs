@@ -12,8 +12,9 @@ use std::{
 
 use async_trait::async_trait;
 use bloom_broker_api::{
-    CredentialPublic, Digest32, KeyPublic, KeyRequest, KeyRole, ProtocolError, ProtocolErrorCode,
-    SignedPolicySnapshot, Token, WalletPublic,
+    CanonicalWalletPolicy, CeremonyKind, CeremonyState, CredentialPublic, CredentialState,
+    Digest32, KeyPublic, KeyRequest, KeyRole, OperationId, OperationRequest, ProtocolError,
+    ProtocolErrorCode, SignedPolicySnapshot, Token, WalletPublic,
 };
 use fs2::FileExt as _;
 use serde::{Deserialize, Serialize};
@@ -98,6 +99,16 @@ impl WalletProjection {
 pub trait WalletProjectionReader: Send + Sync {
     async fn list_wallets(&self) -> Result<Vec<WalletProjection>, ProtocolError>;
     async fn get_wallet(&self, wallet_id: &Token) -> Result<WalletProjection, ProtocolError>;
+    async fn begin_legacy_migration(
+        &self,
+        _operation_id: &OperationId,
+        _wallet_id: &Token,
+        _exact_terms_digest: &Digest32,
+    ) -> Result<(), ProtocolError> {
+        Err(invalid_projection(
+            "wallet projection reader does not support legacy migration state",
+        ))
+    }
     fn cached_wallets(&self) -> Result<Vec<WalletProjection>, ProtocolError>;
 }
 
@@ -165,10 +176,24 @@ impl FileProjectionStore {
     fn replace_after_live_refresh(
         &self,
         observed: BTreeMap<String, WalletProjection>,
+        completed_migrations: BTreeMap<String, WalletProjection>,
         _refresh_lock: &ProjectionRefreshLock,
     ) -> Result<ProjectionCache, ProtocolError> {
         let mut cache = self.load()?;
-        cache.apply_live_refresh(observed)?;
+        cache.apply_live_refresh(observed, completed_migrations)?;
+        self.save_unlocked(&cache)?;
+        Ok(cache)
+    }
+
+    fn begin_legacy_migration(
+        &self,
+        operation_id: &OperationId,
+        wallet_id: &Token,
+        exact_terms_digest: &Digest32,
+        _refresh_lock: &ProjectionRefreshLock,
+    ) -> Result<ProjectionCache, ProtocolError> {
+        let mut cache = self.load()?;
+        cache.begin_legacy_migration(operation_id, wallet_id, exact_terms_digest)?;
         self.save_unlocked(&cache)?;
         Ok(cache)
     }
@@ -232,20 +257,9 @@ impl CachedWalletProjectionReader {
         self.broker.as_ref()
     }
 
-    async fn refresh(&self) -> Result<Vec<WalletProjection>, ProtocolError> {
-        let broker = self
-            .broker
-            .as_ref()
-            .ok_or_else(|| unavailable("authenticated Broker edge is unavailable"))?;
-        // Serialize the observation as well as the commit. Otherwise an older
-        // full-list response can arrive after a newer process has cached a
-        // newly-created wallet and incorrectly tombstone it.
-        let store = self.store.clone();
-        let refresh_lock = tokio::task::spawn_blocking(move || store.acquire_refresh_lock())
-            .await
-            .map_err(|error| {
-                unavailable(format!("join Machine projection lock task: {error}"))
-            })??;
+    async fn observe_wallets(
+        broker: &MachineBrokerClient,
+    ) -> Result<BTreeMap<String, WalletProjection>, ProtocolError> {
         let wallets = broker.wallets().await?;
         let mut observed = BTreeMap::new();
         for wallet in wallets {
@@ -290,9 +304,49 @@ impl CachedWalletProjectionReader {
             let projection = build_projection(wallet, keys, credentials, policy, now_ms()?)?;
             observed.insert(wallet_id.as_str().to_owned(), projection);
         }
-        let updated = self
-            .store
-            .replace_after_live_refresh(observed, &refresh_lock)?;
+        Ok(observed)
+    }
+
+    async fn refresh(&self) -> Result<Vec<WalletProjection>, ProtocolError> {
+        let broker = self
+            .broker
+            .as_ref()
+            .ok_or_else(|| unavailable("authenticated Broker edge is unavailable"))?;
+        // Serialize the observation as well as the commit. Otherwise an older
+        // full-list response can arrive after a newer process has cached a
+        // newly-created wallet and incorrectly tombstone it.
+        let store = self.store.clone();
+        let refresh_lock = tokio::task::spawn_blocking(move || store.acquire_refresh_lock())
+            .await
+            .map_err(|error| {
+                unavailable(format!("join Machine projection lock task: {error}"))
+            })??;
+        let baseline = self.store.load()?;
+        let observed = Self::observe_wallets(broker).await?;
+        let mut completed_migrations = BTreeMap::new();
+        for (operation_id, pending) in &baseline.pending_legacy_migrations {
+            let Some(candidate) = observed.get(&pending.wallet_id) else {
+                continue;
+            };
+            let operation_id = OperationId::new(operation_id.clone()).map_err(|error| {
+                unavailable(format!("invalid pending migration operation: {error}"))
+            })?;
+            let result = broker
+                .custody_result(OperationRequest {
+                    operation_id: operation_id.clone(),
+                })
+                .await?;
+            validate_completed_legacy_migration(
+                &result,
+                &operation_id,
+                &pending.wallet_id,
+                candidate,
+            )?;
+            completed_migrations.insert(operation_id.as_str().to_owned(), candidate.clone());
+        }
+        let updated =
+            self.store
+                .replace_after_live_refresh(observed, completed_migrations, &refresh_lock)?;
         let projections = updated.live(false);
         *self
             .cache
@@ -381,6 +435,31 @@ impl WalletProjectionReader for CachedWalletProjectionReader {
         }
     }
 
+    async fn begin_legacy_migration(
+        &self,
+        operation_id: &OperationId,
+        wallet_id: &Token,
+        exact_terms_digest: &Digest32,
+    ) -> Result<(), ProtocolError> {
+        let store = self.store.clone();
+        let refresh_lock = tokio::task::spawn_blocking(move || store.acquire_refresh_lock())
+            .await
+            .map_err(|error| {
+                unavailable(format!("join Machine projection lock task: {error}"))
+            })??;
+        let updated = self.store.begin_legacy_migration(
+            operation_id,
+            wallet_id,
+            exact_terms_digest,
+            &refresh_lock,
+        )?;
+        *self
+            .cache
+            .lock()
+            .map_err(|_| unavailable("Machine projection cache mutex poisoned"))? = updated;
+        Ok(())
+    }
+
     fn cached_wallets(&self) -> Result<Vec<WalletProjection>, ProtocolError> {
         let cache = self
             .cache
@@ -403,6 +482,10 @@ impl WalletProjectionReader for CachedWalletProjectionReader {
 struct ProjectionCache {
     schema: String,
     wallets: BTreeMap<String, CachedWallet>,
+    #[serde(default)]
+    pending_legacy_migrations: BTreeMap<String, PendingLegacyMigration>,
+    #[serde(default, alias = "reconciled_legacy_migrations")]
+    completed_legacy_migrations: BTreeMap<String, String>,
 }
 
 impl ProjectionCache {
@@ -410,6 +493,8 @@ impl ProjectionCache {
         Self {
             schema: CACHE_SCHEMA.to_owned(),
             wallets: BTreeMap::new(),
+            pending_legacy_migrations: BTreeMap::new(),
+            completed_legacy_migrations: BTreeMap::new(),
         }
     }
 
@@ -427,8 +512,38 @@ impl ProjectionCache {
     fn apply_live_refresh(
         &mut self,
         observed: BTreeMap<String, WalletProjection>,
+        completed_migrations: BTreeMap<String, WalletProjection>,
     ) -> Result<(), ProtocolError> {
+        let mut authorized_wallets = BTreeSet::new();
+        for (operation_id, candidate) in completed_migrations {
+            let pending = self
+                .pending_legacy_migrations
+                .get(&operation_id)
+                .ok_or_else(|| invalid_projection("completed migration has no pending intent"))?;
+            if candidate.wallet_id().as_str() != pending.wallet_id {
+                return Err(invalid_projection(
+                    "completed migration projection has a different wallet",
+                ));
+            }
+            let current_digest = self
+                .wallets
+                .get(&pending.wallet_id)
+                .map(CachedWallet::digest);
+            if current_digest != pending.predecessor_response_digest.as_ref() {
+                return Err(ProtocolError::new(
+                    ProtocolErrorCode::PolicyBaselineStale,
+                    "completed migration no longer matches the wallet generation it was started from",
+                ));
+            }
+            authorized_wallets.insert(pending.wallet_id.clone());
+            self.completed_legacy_migrations
+                .insert(operation_id.clone(), pending.wallet_id.clone());
+            self.pending_legacy_migrations.remove(&operation_id);
+        }
         for (wallet_id, candidate) in &observed {
+            if authorized_wallets.contains(wallet_id) {
+                continue;
+            }
             match self.wallets.get(wallet_id) {
                 Some(CachedWallet::Live(current))
                     if candidate.policy.version.get() < current.policy.version.get() =>
@@ -440,6 +555,17 @@ impl ProjectionCache {
                             current.policy.version.get(),
                             candidate.policy.version.get()
                         ),
+                    ));
+                }
+                Some(CachedWallet::Live(current))
+                    if candidate.policy.policy_signing_key_id
+                        != current.policy.policy_signing_key_id
+                        || candidate.policy.policy_verifying_key
+                            != current.policy.policy_verifying_key =>
+                {
+                    return Err(ProtocolError::new(
+                        ProtocolErrorCode::PolicyBaselineStale,
+                        format!("Broker changed the pinned policy key for wallet {wallet_id}"),
                     ));
                 }
                 Some(CachedWallet::Tombstone {
@@ -483,6 +609,52 @@ impl ProjectionCache {
         Ok(())
     }
 
+    fn begin_legacy_migration(
+        &mut self,
+        operation_id: &OperationId,
+        wallet_id: &Token,
+        exact_terms_digest: &Digest32,
+    ) -> Result<(), ProtocolError> {
+        if self
+            .completed_legacy_migrations
+            .contains_key(operation_id.as_str())
+        {
+            return Err(invalid_projection(
+                "legacy migration operation was already consumed",
+            ));
+        }
+        let pending = PendingLegacyMigration {
+            wallet_id: wallet_id.as_str().to_owned(),
+            exact_terms_digest: exact_terms_digest.clone(),
+            predecessor_response_digest: self
+                .wallets
+                .get(wallet_id.as_str())
+                .map(CachedWallet::digest)
+                .cloned(),
+        };
+        if let Some(existing) = self.pending_legacy_migrations.get(operation_id.as_str()) {
+            return if existing == &pending {
+                Ok(())
+            } else {
+                Err(invalid_projection(
+                    "legacy migration operation changed its binding",
+                ))
+            };
+        }
+        if self
+            .pending_legacy_migrations
+            .values()
+            .any(|existing| existing.wallet_id == wallet_id.as_str())
+        {
+            return Err(invalid_projection(
+                "wallet already has a pending legacy migration",
+            ));
+        }
+        self.pending_legacy_migrations
+            .insert(operation_id.as_str().to_owned(), pending);
+        Ok(())
+    }
+
     fn validate(&self) -> Result<(), ProtocolError> {
         if self.schema != CACHE_SCHEMA {
             return Err(unavailable(
@@ -504,8 +676,40 @@ impl ProjectionCache {
                 })?;
             }
         }
+        for (operation_id, wallet_id) in &self.completed_legacy_migrations {
+            OperationId::new(operation_id.clone()).map_err(|error| {
+                unavailable(format!(
+                    "Machine projection cache has an invalid migration operation: {error}"
+                ))
+            })?;
+            Token::new(wallet_id.clone()).map_err(|error| {
+                unavailable(format!(
+                    "Machine projection cache has an invalid migration wallet: {error}"
+                ))
+            })?;
+        }
+        for (operation_id, pending) in &self.pending_legacy_migrations {
+            OperationId::new(operation_id.clone()).map_err(|error| {
+                unavailable(format!(
+                    "Machine projection cache has an invalid pending migration: {error}"
+                ))
+            })?;
+            Token::new(pending.wallet_id.clone()).map_err(|error| {
+                unavailable(format!(
+                    "Machine projection cache has an invalid pending migration wallet: {error}"
+                ))
+            })?;
+        }
         Ok(())
     }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PendingLegacyMigration {
+    wallet_id: String,
+    exact_terms_digest: Digest32,
+    predecessor_response_digest: Option<Digest32>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -519,6 +723,84 @@ enum CachedWallet {
         response_digest: Digest32,
         observed_at_ms: u64,
     },
+}
+
+impl CachedWallet {
+    fn digest(&self) -> &Digest32 {
+        match self {
+            Self::Live(projection) => &projection.response_digest,
+            Self::Tombstone {
+                response_digest, ..
+            } => response_digest,
+        }
+    }
+}
+
+fn validate_completed_legacy_migration(
+    result: &bloom_broker_api::CustodyResult,
+    operation_id: &OperationId,
+    wallet_id: &str,
+    candidate: &WalletProjection,
+) -> Result<(), ProtocolError> {
+    if &result.custody_operation_id != operation_id
+        || result.ceremony_kind != CeremonyKind::WalletImport
+        || result.public_status != CeremonyState::Succeeded
+        || result.wallet_id.as_ref().map(Token::as_str) != Some(wallet_id)
+        || result.public_key_refs.is_empty()
+        || !result
+            .public_key_refs
+            .iter()
+            .all(|key_ref| candidate.wallet.key_refs.contains(key_ref))
+        || !result
+            .credential_summaries
+            .iter()
+            .filter(|credential| credential.active)
+            .any(|credential| {
+                candidate.credentials.iter().any(|projected| {
+                    projected.wallet_id.as_str() == wallet_id
+                        && projected.credential_id == credential.credential_id
+                        && projected.state == CredentialState::Active
+                })
+            })
+    {
+        return Err(invalid_projection(
+            "pending migration does not match the completed wallet-import receipt",
+        ));
+    }
+    let initial_policy = result.initial_policy.as_ref().ok_or_else(|| {
+        invalid_projection("completed migration omitted its signed initial policy")
+    })?;
+    if initial_policy != &candidate.policy
+        || initial_policy.wallet_id.as_str() != wallet_id
+        || initial_policy.version.get() != 1
+    {
+        return Err(invalid_projection(
+            "completed migration projection differs from its signed initial policy",
+        ));
+    }
+    let policy_bytes = initial_policy.canonical_policy.decode();
+    if Digest32::from_bytes(Sha256::digest(&policy_bytes).into()) != initial_policy.policy_digest {
+        return Err(invalid_projection(
+            "completed migration policy digest does not match its canonical bytes",
+        ));
+    }
+    let policy: CanonicalWalletPolicy = serde_json::from_slice(&policy_bytes).map_err(|error| {
+        invalid_projection(format!("parse completed migration policy: {error}"))
+    })?;
+    if serde_jcs::to_vec(&policy).map_err(|error| {
+        invalid_projection(format!("canonicalize completed migration policy: {error}"))
+    })? != policy_bytes
+        || policy.wallet_id.as_str() != wallet_id
+        || policy.maximum_approval_lifetime_ms != 30 * 24 * 60 * 60 * 1_000
+        || !policy.allowed_petal_packages.is_empty()
+        || !policy.allowed_destinations.is_empty()
+        || !policy.required_verifiers.is_empty()
+    {
+        return Err(invalid_projection(
+            "completed migration did not install the restrictive initial policy",
+        ));
+    }
+    Ok(())
 }
 
 fn build_projection(
@@ -684,8 +966,9 @@ mod tests {
     use std::sync::Mutex;
 
     use bloom_broker_api::{
-        Base64UrlBytes, CryptoSuite, DecimalU64, KeyRef, KeySpec, MachineBrokerRequest,
-        MachineBrokerResponse, MachineBrokerService, ServiceFuture, WalletRequest,
+        Base64UrlBytes, CredentialSummary, CryptoSuite, CustodyResult, DecimalU64, KeyRef, KeySpec,
+        MachineBrokerRequest, MachineBrokerResponse, MachineBrokerService, ServiceFuture,
+        WalletRequest,
     };
 
     use super::*;
@@ -701,6 +984,7 @@ mod tests {
     struct FakeBroker {
         available: Mutex<bool>,
         wallets: Mutex<BTreeMap<String, ProjectionFixture>>,
+        custody_results: Mutex<BTreeMap<String, CustodyResult>>,
     }
 
     struct BlockingEmptyBroker {
@@ -734,6 +1018,7 @@ mod tests {
                     fixture.wallet.wallet_id.as_str().to_owned(),
                     fixture,
                 )])),
+                custody_results: Mutex::new(BTreeMap::new()),
             }
         }
 
@@ -778,6 +1063,14 @@ mod tests {
                     MachineBrokerRequest::PolicyRead(_) => fixture
                         .map(|value| MachineBrokerResponse::PolicyRead(value.policy))
                         .ok_or_else(|| invalid_projection("unknown fake wallet")),
+                    MachineBrokerRequest::CustodyResult(request) => self
+                        .custody_results
+                        .lock()
+                        .unwrap()
+                        .get(request.operation_id.as_str())
+                        .cloned()
+                        .map(MachineBrokerResponse::CustodyResult)
+                        .ok_or_else(|| invalid_projection("unknown fake custody result")),
                     _ => Err(invalid_projection("unexpected fake Broker method")),
                 }
             })
@@ -967,7 +1260,7 @@ mod tests {
         let broker = Arc::new(FakeBroker::new(initial));
         let reader = CachedWalletProjectionReader::new(
             Some(MachineBrokerClient::new(broker.clone())),
-            store,
+            store.clone(),
         )
         .unwrap();
         reader.list_wallets().await.unwrap();
@@ -983,6 +1276,141 @@ mod tests {
             .insert("alice".into(), rolled_back);
         let error = reader.list_wallets().await.unwrap_err();
         assert_eq!(error.code, ProtocolErrorCode::PolicyBaselineStale);
+    }
+
+    #[tokio::test]
+    async fn legacy_migration_replaces_live_generation_automatically_and_pins_new_key() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = FileProjectionStore::new(directory.path().join("wallets.json"));
+        let broker = Arc::new(FakeBroker::new(fixture(5)));
+        let reader = CachedWalletProjectionReader::new(
+            Some(MachineBrokerClient::new(broker.clone())),
+            store.clone(),
+        )
+        .unwrap();
+        reader.list_wallets().await.unwrap();
+        let operation_id = OperationId::from_bytes([8; 32]);
+        reader
+            .begin_legacy_migration(
+                &operation_id,
+                &token("alice"),
+                &Digest32::from_bytes([7; 32]),
+            )
+            .await
+            .unwrap();
+
+        let migrated = migrated_fixture();
+        broker
+            .wallets
+            .lock()
+            .unwrap()
+            .insert("alice".into(), migrated.clone());
+        broker.custody_results.lock().unwrap().insert(
+            operation_id.as_str().to_owned(),
+            migration_result(operation_id.clone(), &migrated),
+        );
+        let projection = reader
+            .list_wallets()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|projection| projection.wallet_id().as_str() == "alice")
+            .unwrap();
+        assert_eq!(projection.policy, migrated.policy);
+
+        let restarted = CachedWalletProjectionReader::new(
+            Some(MachineBrokerClient::new(broker.clone())),
+            store,
+        )
+        .unwrap();
+        assert_eq!(
+            restarted.get_wallet(&token("alice")).await.unwrap().policy,
+            migrated.policy
+        );
+
+        broker
+            .wallets
+            .lock()
+            .unwrap()
+            .insert("alice".into(), fixture(5));
+        let rollback = restarted.list_wallets().await.unwrap_err();
+        assert_eq!(rollback.code, ProtocolErrorCode::PolicyBaselineStale);
+        assert!(rollback.message.contains("pinned policy key"));
+    }
+
+    #[tokio::test]
+    async fn legacy_migration_survives_tombstone_and_cannot_replay_after_later_deletion() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = FileProjectionStore::new(directory.path().join("wallets.json"));
+        let broker = Arc::new(FakeBroker::new(fixture(5)));
+        let reader = CachedWalletProjectionReader::new(
+            Some(MachineBrokerClient::new(broker.clone())),
+            store.clone(),
+        )
+        .unwrap();
+        reader.list_wallets().await.unwrap();
+        let operation_id = OperationId::from_bytes([9; 32]);
+        reader
+            .begin_legacy_migration(
+                &operation_id,
+                &token("alice"),
+                &Digest32::from_bytes([6; 32]),
+            )
+            .await
+            .unwrap();
+        broker.wallets.lock().unwrap().clear();
+        assert!(reader.list_wallets().await.unwrap().is_empty());
+        drop(reader);
+        let reader = CachedWalletProjectionReader::new(
+            Some(MachineBrokerClient::new(broker.clone())),
+            store,
+        )
+        .unwrap();
+
+        let migrated = migrated_fixture();
+        broker
+            .wallets
+            .lock()
+            .unwrap()
+            .insert("alice".into(), migrated.clone());
+        broker.custody_results.lock().unwrap().insert(
+            operation_id.as_str().to_owned(),
+            migration_result(operation_id.clone(), &migrated),
+        );
+        assert_eq!(
+            reader.list_wallets().await.unwrap()[0].policy.version.get(),
+            1
+        );
+
+        broker.wallets.lock().unwrap().clear();
+        assert!(reader.list_wallets().await.unwrap().is_empty());
+        broker
+            .wallets
+            .lock()
+            .unwrap()
+            .insert("alice".into(), migrated);
+        let replay = reader.list_wallets().await.unwrap_err();
+        assert_eq!(replay.code, ProtocolErrorCode::PolicyBaselineStale);
+    }
+
+    #[test]
+    fn legacy_reconciliation_cache_field_upgrades_to_completed_migrations() {
+        let operation_id = OperationId::from_bytes([14; 32]);
+        let mut value = serde_json::json!({
+            "schema": CACHE_SCHEMA,
+            "wallets": {},
+            "reconciled_legacy_migrations": BTreeMap::from([(
+                operation_id.as_str().to_owned(),
+                "alice".to_owned(),
+            )])
+        });
+        let cache: ProjectionCache = serde_json::from_value(value.take()).unwrap();
+        cache.validate().unwrap();
+        assert_eq!(
+            cache.completed_legacy_migrations.get(operation_id.as_str()),
+            Some(&"alice".to_owned())
+        );
+        assert!(serde_json::to_value(cache).unwrap()["completed_legacy_migrations"].is_object());
     }
 
     #[test]
@@ -1056,6 +1484,56 @@ mod tests {
                 policy_verifying_key: Base64UrlBytes::from_bytes(&[5; 32]),
                 signer_signature: Base64UrlBytes::from_bytes(&[6; 64]),
             },
+        }
+    }
+
+    fn migrated_fixture() -> ProjectionFixture {
+        let mut fixture = fixture(1);
+        let policy = CanonicalWalletPolicy {
+            wallet_id: token("alice"),
+            maximum_approval_lifetime_ms: 30 * 24 * 60 * 60 * 1_000,
+            allowed_petal_packages: Vec::new(),
+            allowed_destinations: Vec::new(),
+            required_verifiers: Vec::new(),
+        };
+        let policy_bytes = serde_jcs::to_vec(&policy).unwrap();
+        let policy_digest = Digest32::from_bytes(Sha256::digest(&policy_bytes).into());
+        fixture.wallet.policy_digest = policy_digest.clone();
+        fixture.policy = SignedPolicySnapshot {
+            wallet_id: token("alice"),
+            version: DecimalU64::new(1),
+            canonical_policy: Base64UrlBytes::from_bytes(&policy_bytes),
+            policy_digest,
+            policy_signing_key_id: token("migrated-policy-key"),
+            policy_verifying_key: Base64UrlBytes::from_bytes(&[9; 32]),
+            signer_signature: Base64UrlBytes::from_bytes(&[10; 64]),
+        };
+        fixture.credentials = vec![CredentialPublic {
+            credential_id: Base64UrlBytes::from_bytes(&[11; 16]),
+            wallet_id: token("alice"),
+            created_at_ms: DecimalU64::new(1),
+            state: CredentialState::Active,
+        }];
+        fixture
+    }
+
+    fn migration_result(operation_id: OperationId, fixture: &ProjectionFixture) -> CustodyResult {
+        CustodyResult {
+            ceremony_kind: CeremonyKind::WalletImport,
+            custody_operation_id: operation_id,
+            public_status: CeremonyState::Succeeded,
+            wallet_id: Some(fixture.wallet.wallet_id.clone()),
+            public_key_refs: vec![fixture.wallet.root_key_ref.clone()],
+            credential_summaries: vec![CredentialSummary {
+                credential_id: Base64UrlBytes::from_bytes(&[11; 16]),
+                rp_id: token("localhost"),
+                active: true,
+            }],
+            initial_policy: Some(fixture.policy.clone()),
+            receipt_digest: Digest32::from_bytes([12; 32]),
+            encrypted_browser_result: None,
+            signer_key_id: token("signer"),
+            signer_signature: Base64UrlBytes::from_bytes(&[13; 64]),
         }
     }
 
