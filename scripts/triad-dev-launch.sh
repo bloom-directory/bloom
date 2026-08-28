@@ -3,8 +3,12 @@ set -euo pipefail
 export LC_ALL=C
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
-broker_repo="$(cd "${repo_root}/../bloom-broker" && pwd -P)"
-signer_repo="$(cd "${repo_root}/../bloom-signer" && pwd -P)"
+# The sibling Broker and Signer checkouts are resolved after argument
+# validation, not here. Resolving them at load time made every invocation
+# depend on a full developer layout, so rejecting a bad argument required
+# repositories that a rejected invocation never touches.
+broker_repo=""
+signer_repo=""
 developer_root=""
 machine_home=""
 mount_dir=""
@@ -57,6 +61,17 @@ case "$host_os" in
   Darwin|Linux) ;;
   *) die "developer harness requires Linux or macOS" ;;
 esac
+
+# Arguments and environment are valid, so this invocation will actually build
+# and launch the triad and genuinely needs the sibling checkouts.
+resolve_sibling_repo() {
+  local name="$1" path
+  path="$(cd "${repo_root}/../${name}" 2>/dev/null && pwd -P)" ||
+    die "sibling repository '${name}' not found next to ${repo_root}; the developer harness expects bloom, bloom-broker, and bloom-signer to be checked out side by side"
+  printf '%s' "$path"
+}
+broker_repo="$(resolve_sibling_repo bloom-broker)"
+signer_repo="$(resolve_sibling_repo bloom-signer)"
 
 command -v jq >/dev/null 2>&1 || die "jq is required"
 user_unit_dir=""
