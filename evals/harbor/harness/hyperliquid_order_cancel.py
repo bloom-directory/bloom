@@ -102,7 +102,7 @@ class HyperliquidOrderCancelEval(EvalDefinition):
             "BLOOM_EVAL_PROVENANCE_CATALOG", ""
         )
         self.provenance_catalog = Path(self.provenance_catalog_value)
-        self.bloom_mount_value = self.env.get("BLOOM_EVAL_BLOOM_MOUNT", "")
+        self.bloom_mount_value = self.env.get("BLOOM_EVAL_BLOOM_MOUNT", "").strip()
         self.bloom_mount = Path(self.bloom_mount_value)
         self.driver = Path(
             self.env.get(

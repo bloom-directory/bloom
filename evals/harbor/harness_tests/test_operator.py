@@ -24,6 +24,7 @@ from harness.operator import (
     parser,
     redact,
     require_no_pending_owner_requests,
+    validate_lineage,
 )
 
 
@@ -145,6 +146,28 @@ class OperatorStateTests(unittest.TestCase):
         with self.assertRaisesRegex(EvalError, "recovery is pending"):
             initialize(Namespace(state=self.store.path), self.root)
 
+    def test_lineage_wraps_unavailable_binary_as_operator_error(self) -> None:
+        lineage = {"bloom": {"revision": "a" * 40, "dirty": False}}
+        state = {
+            "paths": {
+                "broker_repo": str(self.root / "broker"),
+                "signer_repo": str(self.root / "signer"),
+                "hyperliquid_repo": str(self.root / "hyperliquid"),
+            },
+            "lineage": lineage,
+            "binaries": {
+                "bloom": {
+                    "path": str(self.root / "missing-bloom"),
+                    "sha256": "0" * 64,
+                }
+            },
+        }
+        with (
+            mock.patch("harness.operator.discover_lineage", return_value=lineage),
+            self.assertRaisesRegex(EvalError, "bloom binary is unavailable"),
+        ):
+            validate_lineage(state, self.root)
+
 
 class FakePolicyDefinition:
     def __init__(self, root: Path) -> None:
@@ -220,6 +243,16 @@ class PolicyRecoveryTests(unittest.TestCase):
         self.assertEqual(observed, [True])
         self.assertEqual(stat.S_IMODE(self.store.backup_path.stat().st_mode), 0o600)
         self.assertIsNotNone(self.store.read()["pending_policy_recovery"])
+
+    def test_apply_rejects_invalid_or_non_object_policy_payloads(self) -> None:
+        for payload, message in (
+            (b"{", "invalid JSON"),
+            (b"[]", "unsupported shape"),
+        ):
+            with self.subTest(payload=payload):
+                with self.assertRaisesRegex(EvalError, message):
+                    self.lifecycle.apply(payload)
+        self.assertEqual(self.policy_path.read_bytes(), canonical_json(self.original))
 
     def test_restore_uses_exact_backup_then_clears_recovery_marker(self) -> None:
         atomic_write(self.store.backup_path, canonical_json(self.original) + b"\n")

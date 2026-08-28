@@ -450,7 +450,12 @@ class PolicyLifecycle:
         )
 
     def apply(self, target: bytes) -> None:
-        expected = json.loads(target)
+        try:
+            expected = json.loads(target)
+        except (json.JSONDecodeError, UnicodeDecodeError, TypeError) as error:
+            raise EvalError("policy update target is invalid JSON") from error
+        if not isinstance(expected, dict) or set(expected) != POLICY_KEYS:
+            raise EvalError("policy update target has an unsupported shape")
         expected_bytes = canonical_json(expected)
         if target.rstrip(b"\n") != expected_bytes:
             raise EvalError("policy update target is not canonical JSON")
@@ -666,7 +671,13 @@ def validate_lineage(state: dict[str, Any], repo_root: Path) -> None:
     if actual != state["lineage"]:
         raise EvalError("source lineage changed; re-run init before creating authority")
     for name, expected in state["binaries"].items():
-        if sha256_file(Path(expected["path"])) != expected["sha256"]:
+        try:
+            actual_digest = sha256_file(Path(expected["path"]))
+        except OSError as error:
+            raise EvalError(
+                f"{name} binary is unavailable; re-run init before creating authority"
+            ) from error
+        if actual_digest != expected["sha256"]:
             raise EvalError(
                 f"{name} binary changed; re-run init before creating authority"
             )

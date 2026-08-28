@@ -294,6 +294,19 @@ class HyperliquidDefinitionTests(unittest.TestCase):
             definition.preflight()
         run.assert_not_called()
 
+    def test_full_eval_treats_whitespace_only_mount_as_missing(self) -> None:
+        definition = HyperliquidOrderCancelEval(
+            self.repo, self.env | {"BLOOM_EVAL_BLOOM_MOUNT": " \t "}
+        )
+        with (
+            mock.patch.object(hyperliquid_order_cancel.subprocess, "run") as run,
+            self.assertRaisesRegex(
+                EvalError, "BLOOM_EVAL_BLOOM_MOUNT is required"
+            ),
+        ):
+            definition.preflight()
+        run.assert_not_called()
+
     def test_full_eval_rejects_invalid_explicit_mount(self) -> None:
         definition = HyperliquidOrderCancelEval(
             self.repo, self.env | {"BLOOM_EVAL_BLOOM_MOUNT": "/not-a-mount"}
