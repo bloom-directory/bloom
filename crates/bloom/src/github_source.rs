@@ -1371,12 +1371,14 @@ mod tests {
     #[test]
     fn built_in_entries_are_immutable_and_incompatible_petals_are_absent() {
         let near = preinstalled_petal("near-intents").unwrap();
+        assert_eq!(near.release_tag, "v0.1.1");
         assert_eq!(near.commit.len(), 40);
-        assert!(near.archive.starts_with("near-intents-"));
+        assert_eq!(near.archive, "near-intents-v0.1.1.petal.tar.gz");
         assert!(near.repository.ends_with("/bloom-petal-near"));
         let enso = preinstalled_petal("enso").unwrap();
+        assert_eq!(enso.release_tag, "v0.1.2");
         assert_eq!(enso.commit, ENSO_RELEASE_COMMIT);
-        assert!(enso.archive.starts_with("enso-"));
+        assert_eq!(enso.archive, "enso-v0.1.2.petal.tar.gz");
         assert!(enso.repository.ends_with("/bloom-petal-enso"));
         for name in ["gasless", "privacy-pools", "venice-x402"] {
             let entry = preinstalled_petal(name).unwrap();
