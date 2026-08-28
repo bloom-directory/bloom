@@ -38,7 +38,7 @@ use bloom_proto::{AuditIdentity, AuditLog, HomeDir, HomeWritePermit};
 use bloom_service_observability::LogOutput;
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::{Shell, generate};
-use tracing::{Instrument as _, debug, info, trace};
+use tracing::{Instrument as _, debug, info, trace, warn};
 
 #[cfg(target_os = "linux")]
 const DEFAULT_MOUNT_PATH: &str = "/bloom";
@@ -874,8 +874,12 @@ impl MachineCommandService for DaemonMachineCommands {
             }
             let result = execute_machine_command(&self.home, &self.daemon, command).await;
             match class {
-                MachineCommandEventClass::DurableMutation if result.is_err() => {
-                    emit_machine_mutation(workflow, operation_id.as_deref(), "rejected");
+                MachineCommandEventClass::DurableMutation => {
+                    emit_machine_mutation_rejection_if_needed(
+                        workflow,
+                        operation_id.as_deref(),
+                        &result,
+                    );
                 }
                 MachineCommandEventClass::Prepared => info!(
                     event = "machine.workflow_transition",
@@ -893,10 +897,23 @@ impl MachineCommandService for DaemonMachineCommands {
                     operation_id = operation_id.as_deref().unwrap_or(""),
                     outcome = if result.is_ok() { "read" } else { "rejected" }
                 ),
-                MachineCommandEventClass::DurableMutation => {}
             }
             result.map_err(machine_error_from_anyhow)
         })
+    }
+}
+
+fn emit_machine_mutation_rejection_if_needed<T>(
+    workflow: &str,
+    operation_id: Option<&str>,
+    result: &Result<T>,
+) {
+    let Some(error) = result.as_ref().err() else {
+        return;
+    };
+    let remote_commit_recorded = workflow == "ceremony" && error.is::<CeremonyRemoteCommitted>();
+    if !remote_commit_recorded {
+        emit_machine_mutation(workflow, operation_id, "rejected");
     }
 }
 
@@ -1351,7 +1368,6 @@ async fn execute_machine_command(
             action,
             operation_id,
         } => {
-            let mutation = matches!(action, MachineCeremonyAction::Cancel);
             let command = match action {
                 MachineCeremonyAction::Status => CeremonyCmd::Status {
                     operation_id: operation_id.clone(),
@@ -1363,11 +1379,7 @@ async fn execute_machine_command(
                     operation_id: operation_id.clone(),
                 },
             };
-            let output = handle_ceremony(home, command).await?;
-            if mutation {
-                emit_machine_mutation("ceremony", Some(&operation_id), "committed");
-            }
-            output
+            handle_ceremony(home, command).await?
         }
         MachineCommand::Operation {
             action,
@@ -1817,11 +1829,12 @@ async fn handle_ceremony(home: &HomeDir, command: CeremonyCmd) -> Result<String>
     }
 
     let status = if action == "cancel" {
-        client
-            .cancel_ceremony(operation_id.clone())
-            .await
-            .map_err(anyhow::Error::new)
-            .context("cancel Broker ceremony")?
+        ceremony_cancel_remote_result(
+            operation_id.as_str(),
+            client.cancel_ceremony(operation_id.clone()).await,
+        )
+        .map_err(anyhow::Error::new)
+        .context("cancel Broker ceremony")?
     } else {
         client
             .ceremony_status(operation_id.clone())
@@ -1829,30 +1842,71 @@ async fn handle_ceremony(home: &HomeDir, command: CeremonyCmd) -> Result<String>
             .map_err(anyhow::Error::new)
             .context("read Broker ceremony status")?
     };
-    anyhow::ensure!(
-        status.operation_id == operation_id,
-        "Broker ceremony status operation identity mismatch"
-    );
-    let now_ms = current_unix_ms();
-    let mut projection = match load_ceremony_projection(home, &operation_id)? {
-        Some(mut projection) => {
-            projection
-                .reconcile_custody(&status, now_ms)
+    let local_result = (|| -> Result<String> {
+        anyhow::ensure!(
+            status.operation_id == operation_id,
+            "Broker ceremony status operation identity mismatch"
+        );
+        let now_ms = current_unix_ms();
+        let mut projection = match load_ceremony_projection(home, &operation_id)? {
+            Some(mut projection) => {
+                projection
+                    .reconcile_custody(&status, now_ms)
+                    .map_err(anyhow::Error::new)
+                    .context("reconcile durable Machine ceremony projection")?;
+                projection
+            }
+            None => bloom_machine_client::CeremonyProjection::from_custody_status(&status, now_ms)
                 .map_err(anyhow::Error::new)
-                .context("reconcile durable Machine ceremony projection")?;
-            projection
-        }
-        None => bloom_machine_client::CeremonyProjection::from_custody_status(&status, now_ms)
-            .map_err(anyhow::Error::new)
-            .context("rebuild Machine ceremony projection from Broker")?,
-    };
-    projection.expire_launch_secret(now_ms);
-    let path = persist_ceremony_projection(home, &projection)?;
-    Ok(format!(
-        "{}\nprojection: {}\n",
-        serde_json::to_string_pretty(&projection).context("encode ceremony projection")?,
-        path.display(),
-    ))
+                .context("rebuild Machine ceremony projection from Broker")?,
+        };
+        projection.expire_launch_secret(now_ms);
+        let path = persist_ceremony_projection(home, &projection)?;
+        Ok(format!(
+            "{}\nprojection: {}\n",
+            serde_json::to_string_pretty(&projection).context("encode ceremony projection")?,
+            path.display(),
+        ))
+    })();
+    if action == "cancel" {
+        return finish_ceremony_cancel_projection(operation_id.as_str(), local_result);
+    }
+    local_result
+}
+
+#[derive(Debug)]
+struct CeremonyRemoteCommitted;
+
+impl std::fmt::Display for CeremonyRemoteCommitted {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Broker ceremony cancellation committed before local projection update")
+    }
+}
+
+impl std::error::Error for CeremonyRemoteCommitted {}
+
+fn finish_ceremony_cancel_projection<T>(operation_id: &str, result: Result<T>) -> Result<T> {
+    if result.is_err() {
+        emit_ceremony_local_projection_failure(operation_id);
+    }
+    result.context(CeremonyRemoteCommitted)
+}
+
+fn ceremony_cancel_remote_result<T, E>(operation_id: &str, result: Result<T, E>) -> Result<T, E> {
+    if result.is_ok() {
+        emit_machine_mutation("ceremony", Some(operation_id), "committed");
+    }
+    result
+}
+
+fn emit_ceremony_local_projection_failure(operation_id: &str) {
+    warn!(
+        event = "machine.local_projection_update_failed",
+        workflow = "ceremony",
+        operation_id,
+        remote_state = "committed",
+        error_kind = "local_projection"
+    );
 }
 
 async fn handle_operation(home: &HomeDir, command: OperationCmd) -> Result<String> {
@@ -3999,13 +4053,15 @@ mod tests {
     use tracing_subscriber::prelude::*;
 
     use super::{
-        Cli, Cmd, LegacyMigrationReceiptFile, MachineCommandEventClass, WalletCmd,
-        ceremony_projection_path, emit_machine_ready, endpoint_connection_error,
+        CeremonyCmd, Cli, Cmd, LegacyMigrationReceiptFile, MachineCommandEventClass, WalletCmd,
+        ceremony_cancel_remote_result, ceremony_projection_path, emit_machine_mutation,
+        emit_machine_mutation_rejection_if_needed, emit_machine_ready, endpoint_connection_error,
         enrollment_state_is_usable, execute_audit_command, execute_wallet_outbox_action,
-        format_petal_consent_net_rule, is_completed_policy_update_receipt,
-        launch_wallet_registration_via_vfs, load_ceremony_projection, long_running_role,
-        machine_command_event_fields, machine_error_from_anyhow, machine_wallet_lookup_error,
-        open_machine_audit_with_history, persist_ceremony_projection, request_body_with_wallet,
+        finish_ceremony_cancel_projection, format_petal_consent_net_rule, handle_ceremony,
+        is_completed_policy_update_receipt, launch_wallet_registration_via_vfs,
+        load_ceremony_projection, long_running_role, machine_command_event_fields,
+        machine_error_from_anyhow, machine_wallet_lookup_error, open_machine_audit_with_history,
+        persist_ceremony_projection, request_body_with_wallet,
     };
     use bloom_daemon::ipc::{MachineCeremonyAction, MachineCommand, MachineOperationAction};
 
@@ -4620,6 +4676,88 @@ mod tests {
                 MachineCommandEventClass::Read
             );
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ceremony_cancel_pre_remote_failure_closes_started_mutation() {
+        let capture = bloom_service_observability::CapturedWriter::default();
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_subscriber::fmt::layer()
+                .json()
+                .with_writer(capture.clone()),
+        );
+        let operation_id = "not-an-operation-id";
+        let temp = tempfile::tempdir().unwrap();
+        let home = bloom_proto::HomeDir::at(temp.path());
+        let _guard = tracing::subscriber::set_default(subscriber);
+        emit_machine_mutation("ceremony", Some(operation_id), "started");
+        let result = handle_ceremony(
+            &home,
+            CeremonyCmd::Cancel {
+                operation_id: operation_id.into(),
+            },
+        )
+        .await;
+        assert!(result.is_err());
+        emit_machine_mutation_rejection_if_needed("ceremony", Some(operation_id), &result);
+        drop(_guard);
+
+        let events = capture
+            .text()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        let states = events
+            .iter()
+            .filter(|event| event["fields"]["event"] == "machine.durable_mutation")
+            .map(|event| event["fields"]["state"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(states, ["started", "rejected"]);
+    }
+
+    #[test]
+    fn ceremony_cancel_keeps_remote_commit_when_local_projection_fails() {
+        let capture = bloom_service_observability::CapturedWriter::default();
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_subscriber::fmt::layer()
+                .json()
+                .with_writer(capture.clone()),
+        );
+        let operation_id = "ef".repeat(32);
+        tracing::subscriber::with_default(subscriber, || {
+            emit_machine_mutation("ceremony", Some(&operation_id), "started");
+            ceremony_cancel_remote_result::<_, ()>(&operation_id, Ok(())).unwrap();
+            let result = finish_ceremony_cancel_projection::<()>(
+                &operation_id,
+                Err(anyhow::anyhow!("local projection failed")),
+            );
+            emit_machine_mutation_rejection_if_needed("ceremony", Some(&operation_id), &result);
+        });
+        let events = capture
+            .text()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert!(events.iter().any(|event| {
+            event["fields"]["event"] == "machine.durable_mutation"
+                && event["fields"]["state"] == "committed"
+                && event["fields"]["operation_id"] == operation_id
+        }));
+        assert!(events.iter().any(|event| {
+            event["fields"]["event"] == "machine.local_projection_update_failed"
+                && event["fields"]["remote_state"] == "committed"
+        }));
+        let states = events
+            .iter()
+            .filter(|event| event["fields"]["event"] == "machine.durable_mutation")
+            .map(|event| event["fields"]["state"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(states, ["started", "committed"]);
+        assert!(
+            !events
+                .iter()
+                .any(|event| event["fields"]["state"] == "rejected")
+        );
     }
 
     #[test]

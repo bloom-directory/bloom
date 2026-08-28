@@ -143,8 +143,13 @@ load_ids() {
   BLOOM_MACOS_MACHINE_BROKER_GID="$(field "$enrollment" machine_broker_gid)"
   BLOOM_MACOS_BROKER_SIGNER_GID="$(field "$enrollment" broker_signer_gid)"
   BLOOM_MACOS_REVOKE_GID="$(field "$enrollment" revoke_gid)"
-  if BLOOM_MACOS_LOG_GID="$(field "$enrollment" log_gid 2>/dev/null)"; then return; fi
-  if [[ "$action" == uninstall ]]; then BLOOM_MACOS_LOG_GID=0; return; fi
+  if recorded_log_gid="$(field "$enrollment" log_gid 2>/dev/null)"; then
+    BLOOM_MACOS_LOG_GID="$recorded_log_gid"
+    return
+  fi
+  # Retained legacy records must remain legacy-shaped. Restore will then
+  # allocate/migrate the missing log group instead of trusting a fake GID.
+  if [[ "$action" == uninstall ]]; then BLOOM_MACOS_LOG_GID=""; return; fi
   if $live; then
     record_exists Groups "$log_group" && die "legacy enrollment has an unrecorded log group"
     BLOOM_MACOS_LOG_GID="$(next_id Groups PrimaryGroupID)"; new_group "$log_group" "$BLOOM_MACOS_LOG_GID"
@@ -308,11 +313,16 @@ rollback_failed_restore() {
 
 write_enrollment() {
   state="$1"; tmp="$enrollment.new.$$"
-  printf '{"schema":"bloom.macos-enrollment.1","state":"%s","login_uid":%s,"login_user":"%s","broker_user":"%s","broker_uid":%s,"broker_group":"%s","broker_gid":%s,"signer_user":"%s","signer_uid":%s,"signer_group":"%s","signer_gid":%s,"machine_broker_group":"%s","machine_broker_gid":%s,"broker_signer_group":"%s","broker_signer_gid":%s,"revoke_group":"%s","revoke_gid":%s,"log_group":"%s","log_gid":%s,"release_digest":"%s"}\n' \
+  if [[ -n "${BLOOM_MACOS_LOG_GID:-}" ]]; then
+    log_fields=",\"log_group\":\"$log_group\",\"log_gid\":$BLOOM_MACOS_LOG_GID"
+  else
+    log_fields=""
+  fi
+  printf '{"schema":"bloom.macos-enrollment.1","state":"%s","login_uid":%s,"login_user":"%s","broker_user":"%s","broker_uid":%s,"broker_group":"%s","broker_gid":%s,"signer_user":"%s","signer_uid":%s,"signer_group":"%s","signer_gid":%s,"machine_broker_group":"%s","machine_broker_gid":%s,"broker_signer_group":"%s","broker_signer_gid":%s,"revoke_group":"%s","revoke_gid":%s%s,"release_digest":"%s"}\n' \
     "$state" "$login_uid" "$login_user" "$broker_user" "$BLOOM_MACOS_BROKER_UID" "$broker_group" "$BLOOM_MACOS_BROKER_GID" \
     "$signer_user" "$BLOOM_MACOS_SIGNER_UID" "$signer_group" "$BLOOM_MACOS_SIGNER_GID" "$machine_broker_group" \
     "$BLOOM_MACOS_MACHINE_BROKER_GID" "$broker_signer_group" "$BLOOM_MACOS_BROKER_SIGNER_GID" "$revoke_group" \
-    "$BLOOM_MACOS_REVOKE_GID" "$log_group" "$BLOOM_MACOS_LOG_GID" "$BLOOM_RELEASE_DIGEST" >"$tmp"
+    "$BLOOM_MACOS_REVOKE_GID" "$log_fields" "$BLOOM_RELEASE_DIGEST" >"$tmp"
   chmod 0644 "$tmp"; $live && chown root:wheel "$tmp"; mv -f "$tmp" "$enrollment"
 }
 

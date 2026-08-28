@@ -74,7 +74,7 @@ tempfile = "3"
 futures = "0.3"
 lru = "0.12"
 fs2 = "0.4"
-bloom-audit-checkpoint = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "67727b20476a5e12beea4be9734afd83bf74dea4" }
+bloom-audit-checkpoint = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "d2542a07a988261fe2f82b738462de2127b317d2" }
 wasmtime = { version = "36.0.13", default-features = false, features = ["async", "cranelift", "runtime", "cache", "parallel-compilation"] }
 wasmtime-wasi = "36.0.13"
 wat = "1"
@@ -123,12 +123,12 @@ bloom-petals   = { path = "crates/bloom-petals" }
 bloom-petal-contract = { git = "https://github.com/bloom-directory/petal", rev = "61938d0c127cfe03c7e3e55baed0ba1439bc5ca2" }
 bloom-daemon   = { path = "crates/bloom-daemon" }
 bloom-update   = { path = "crates/bloom-update" }
-bloom-broker-api = { git = "https://github.com/bloom-directory/bloom-broker.git", rev = "f001cb9242c60d3d80c348506d329fdcfb126eb0" }
-bloom-rpc-wire = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "67727b20476a5e12beea4be9734afd83bf74dea4" }
-bloom-triad-local-transport = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "67727b20476a5e12beea4be9734afd83bf74dea4" }
-bloom-service-activation = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "67727b20476a5e12beea4be9734afd83bf74dea4" }
-bloom-service-observability = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "67727b20476a5e12beea4be9734afd83bf74dea4" }
-bloom-trusted-time = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "67727b20476a5e12beea4be9734afd83bf74dea4" }
+bloom-broker-api = { git = "https://github.com/bloom-directory/bloom-broker.git", rev = "77c30ccedbd6904c0f2f2ad19e48c5587061b04e" }
+bloom-rpc-wire = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "d2542a07a988261fe2f82b738462de2127b317d2" }
+bloom-triad-local-transport = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "d2542a07a988261fe2f82b738462de2127b317d2" }
+bloom-service-activation = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "d2542a07a988261fe2f82b738462de2127b317d2" }
+bloom-service-observability = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "d2542a07a988261fe2f82b738462de2127b317d2" }
+bloom-trusted-time = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "d2542a07a988261fe2f82b738462de2127b317d2" }
 bloom-machine-client = { path = "crates/bloom-machine-client" }
 # ---- example core petal: generic capability primitives (/bloom/core/cap) ----
 

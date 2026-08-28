@@ -2609,6 +2609,15 @@ fn macos_staged_lifecycle_upgrades_repairs_retains_restores_and_rejects_downgrad
         "same-digest repair must be idempotent"
     );
 
+    // A retained pre-observability enrollment must not acquire a sentinel
+    // log GID that prevents restore from performing the real migration.
+    let enrollment_501 = root.join("Library/Application Support/BloomTriad/enrollments/501.json");
+    let mut legacy: serde_json::Value =
+        serde_json::from_slice(&fs::read(&enrollment_501).unwrap()).unwrap();
+    legacy.as_object_mut().unwrap().remove("log_group");
+    legacy.as_object_mut().unwrap().remove("log_gid");
+    fs::write(&enrollment_501, serde_json::to_vec(&legacy).unwrap()).unwrap();
+
     let retained = Command::new(&installer)
         .args(["uninstall", "--retain-custody"])
         .arg(&root)
@@ -2628,6 +2637,11 @@ fn macos_staged_lifecycle_upgrades_repairs_retains_restores_and_rejects_downgrad
     assert!(
         root.join("Library/Application Support/BloomTriad/retained/501.json")
             .is_file()
+    );
+    assert!(
+        !fs::read_to_string(root.join("Library/Application Support/BloomTriad/retained/501.json"))
+            .unwrap()
+            .contains("log_gid")
     );
     assert_eq!(fs::read(&identity).unwrap(), identity_before);
 
