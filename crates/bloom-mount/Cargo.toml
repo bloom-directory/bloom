@@ -35,7 +35,7 @@ rustix.workspace = true
 # Embedded NFSv4.1 server. Pinned to the bloom-directory fork revision that
 # exposes OpenSupport so path-derived denials can surface from NFS OPEN.
 # Marked optional so non-mount builds don't fetch the git source.
-embednfs = { git = "https://github.com/bloom-directory/embednfs.git", rev = "b2ed40ddaf67675ecf8a24336dee97a659671a7f", optional = true }
+embednfs = { git = "https://github.com/bloom-directory/embednfs.git", rev = "09660bef6e41385f73120efe0083bcd0351aa921", optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
