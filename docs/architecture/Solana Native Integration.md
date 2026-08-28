@@ -109,7 +109,7 @@ identity. See `crates/bloom-solana/src/mainnet_guard.rs`.
 
 Mainnet transactions are done with a `mainnet-canary` build plus a
 per-transaction authorization file; see
-[`../design/solana-mainnet-canary.md`](../design/solana-mainnet-canary.md).
+[`../specs/2026-08-25-solana-mainnet-canary.md`](../specs/2026-08-25-solana-mainnet-canary.md).
 That is the complete set of prerequisites.
 
 ## What carried forward from the parked Petal work

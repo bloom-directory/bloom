@@ -10,7 +10,7 @@
 - Every validation item in `BIP39_SOLANA_HANDOFF.md` is DONE: local-Agave stage → passkey → sign → broadcast → finalized receipt, two-account selection, independent SLIP-10 cross-check.
 - Zero `TODO`/`FIXME`/`unimplemented!` in `bloom-solana`, `bloom-solana-tx`, or the daemon's Solana path.
 - Mainnet is possible today with a `mainnet-canary` build + one authorization file
-  (`docs/design/solana-mainnet-canary.md`). No process prerequisites.
+  (`docs/specs/2026-08-25-solana-mainnet-canary.md`). No process prerequisites.
 - Unmerged PR stack: bloom #169 → #170 → #191; signer #4; broker #5 → #13 → #15 → #17.
   Machine pins signer `2ef153a` (on signer #4) and broker `ba25a02` (on broker #17).
 - Legacy passkey → Triad migration (`2026-08-06` plan) is **already implemented** across all three repos despite the doc saying "Proposed".
@@ -57,7 +57,7 @@ Merge bottom-up so pins always point at master commits:
 
 - Umbrella BIP-39 plan and legacy-passkey migration plan marked `implemented`.
 - Solana architecture doc status updated; mainnet posture points at the canary doc.
-- Canary runbook folded into `docs/design/solana-mainnet-canary.md` ("How to run one");
+- Canary runbook folded into `docs/specs/2026-08-25-solana-mainnet-canary.md` ("How to run one");
   `docs/operations/solana-mainnet-canary.md` and root `BIP39_SOLANA_HANDOFF.md` removed.
 - Remaining: after the first mainnet transaction, note its signature in the architecture doc.
 
