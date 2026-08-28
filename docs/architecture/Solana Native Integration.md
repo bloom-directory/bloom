@@ -1,6 +1,6 @@
 # Solana Native Integration
 
-**Status:** implemented for local/devnet use; mainnet broadcast blocked
+**Status:** implemented. Local/devnet validated end to end; mainnet via the canary build (see "Mainnet posture")
 **Audience:** Bloom engineers, Petal authors, and implementation agents
 
 ## The decision
@@ -109,7 +109,7 @@ identity. See `crates/bloom-solana/src/mainnet_guard.rs`.
 
 Mainnet transactions are done with a `mainnet-canary` build plus a
 per-transaction authorization file; see
-[`../operations/solana-mainnet-canary.md`](../operations/solana-mainnet-canary.md).
+[`../design/solana-mainnet-canary.md`](../design/solana-mainnet-canary.md).
 That is the complete set of prerequisites.
 
 ## What carried forward from the parked Petal work

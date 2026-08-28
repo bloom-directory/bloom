@@ -2,7 +2,7 @@
 
 **Date:** 2026-08-06
 
-**Status:** Proposed
+**Status:** Implemented (Signer `legacy_passkey` module, Broker/Signer ceremony binding, Machine wiring)
 
 **Repositories:** `bloom`, `bloom-broker`, `bloom-signer`
 

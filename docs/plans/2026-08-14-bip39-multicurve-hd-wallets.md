@@ -1,6 +1,6 @@
 # BIP-39 Multi-Curve HD Wallets
 
-**Status:** proposed
+**Status:** implemented (phases 0–3 landed on the branch; phase 4 legacy move-funds and phase 5 full release matrix are follow-ups)
 
 **Issue:** [bloom#163](https://github.com/bloom-directory/bloom/issues/163)
 

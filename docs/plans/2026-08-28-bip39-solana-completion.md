@@ -10,7 +10,7 @@
 - Every validation item in `BIP39_SOLANA_HANDOFF.md` is DONE: local-Agave stage → passkey → sign → broadcast → finalized receipt, two-account selection, independent SLIP-10 cross-check.
 - Zero `TODO`/`FIXME`/`unimplemented!` in `bloom-solana`, `bloom-solana-tx`, or the daemon's Solana path.
 - Mainnet is possible today with a `mainnet-canary` build + one authorization file
-  (`docs/operations/solana-mainnet-canary.md`). No process prerequisites.
+  (`docs/design/solana-mainnet-canary.md`). No process prerequisites.
 - Unmerged PR stack: bloom #169 → #170 → #191; signer #4; broker #5 → #13 → #15 → #17.
   Machine pins signer `2ef153a` (on signer #4) and broker `ba25a02` (on broker #17).
 - Legacy passkey → Triad migration (`2026-08-06` plan) is **already implemented** across all three repos despite the doc saying "Proposed".
@@ -53,12 +53,13 @@ Merge bottom-up so pins always point at master commits:
 4. **bloom** — repin `Cargo.toml:133` (broker) and `crates/bloom-it/Cargo.toml:25` (signer) to the new master SHAs, `cargo update -p bloom-broker-api -p bloom-signer-derive`, then merge #169 → #170 → #191 into master.
 5. CI notes already known: `triad_release` needs `TAR=bsdtar` on the Linux runner; four macOS installer tests need a macOS runner. Neither touches Solana code — don't block the merge on them; file them as follow-ups if red.
 
-## Phase 4 — Doc truth-up (30 minutes, can be folded into Phase 3)
+## Phase 4 — Doc truth-up (DONE 2026-08-28)
 
-- `docs/plans/2026-08-14-bip39-multicurve-hd-wallets.md`: status → `implemented` for Phases 0–3; list Phase 4 (legacy move-funds) and Phase 5 (release verification matrix) as follow-ups.
-- `docs/plans/2026-08-06-signer-legacy-passkey-migration.md`: status → `implemented` (code exists in all three repos).
-- `docs/architecture/Solana Native Integration.md`: drop "implemented for local/devnet use; mainnet broadcast blocked" wording after Phase 1 succeeds; note the first mainnet signature.
-- Delete `BIP39_SOLANA_HANDOFF.md` from the repo root once merged (it was a test handoff, not architecture).
+- Umbrella BIP-39 plan and legacy-passkey migration plan marked `implemented`.
+- Solana architecture doc status updated; mainnet posture points at the canary doc.
+- Canary runbook folded into `docs/design/solana-mainnet-canary.md` ("How to run one");
+  `docs/operations/solana-mainnet-canary.md` and root `BIP39_SOLANA_HANDOFF.md` removed.
+- Remaining: after the first mainnet transaction, note its signature in the architecture doc.
 
 ## Explicitly deferred (not needed for the goal)
 
