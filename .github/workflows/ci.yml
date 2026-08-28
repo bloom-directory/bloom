@@ -176,7 +176,7 @@ jobs:
       - name: Run signed release-bundle policy tests from archive
         run: |
           cargo nextest run --archive-file target/nextest-archive.tar.zst \
-            -E 'package(bloom-it) and binary(triad_release)' \
+            -E 'package(bloom-it) and binary(triad_release) and test(/canary/)' \
             --no-fail-fast
       # Every `solana_*` binary drives a local Agave validator, which this job
       # does not start; they run in the dedicated solana-validator workflow.
