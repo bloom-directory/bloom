@@ -553,6 +553,18 @@ class SolanaTransferEval(EvalDefinition):
             not isinstance(fee, int) or fee > self.max_fee_lamports
         ):
             return False
+        # The staged entry pins the exact derived child it was built for, so the
+        # approver can check the same signing identity the canary will check
+        # again at broadcast. A second active child must never be able to have a
+        # message approved that was staged against the first.
+        fingerprint = intent.get("account_fingerprint")
+        if self.key_fingerprint and isinstance(fingerprint, str):
+            if fingerprint.lower() != self.key_fingerprint.lower():
+                return False
+        derivation = intent.get("account_derivation_path")
+        if self.derivation_path and isinstance(derivation, str):
+            if derivation != self.derivation_path:
+                return False
         return True
 
     def _approve_loop(self, ceremonies: CeremonyDriver) -> None:

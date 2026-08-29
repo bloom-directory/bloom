@@ -559,19 +559,38 @@ even inspected, because the Broker accepts the counter before a ceremony can
 fail. Set `BLOOM_EVAL_AUTHENTICATOR_SIGN_COUNT` to override or to seed the first
 run; the recorded value never moves backwards.
 
-A Solana transfer spends far fewer counters than a Hyperliquid session: one for
-the confirm, plus one for key derivation on first use, against Hyperliquid's
-three. **The exact count has not been measured against a live Machine yet**; the
-harness caps it rather than asserting it.
+A Solana transfer spends far fewer counters than a Hyperliquid session. A live
+local-validator run of `bloom-it`'s `solana_workflow` shows one signing call for
+the confirm, plus key derivation on first use, against Hyperliquid's three. The
+harness caps the count rather than asserting it.
+
+### What a live validator run has confirmed
+
+`cargo test -p bloom-it --test solana_workflow -- --ignored` drives a real
+`Daemon` against `solana-test-validator`. Running it settled the outbox
+behaviour this task depends on:
+
+- the first `confirm` is refused with a permission error, and `confirm` is
+  exposed at mode `644`;
+- `intent.json` carries `fee_payer`, `destination`, `lamports`, `fee_lamports`,
+  `blockhash`, and — for a staged entry — `account_fingerprint` (hex) and
+  `account_derivation_path`, which is what lets the approver check the signing
+  identity and not just the amount;
+- `receipt.json` is exactly `{outcome, signature, slot, confirmation_status}`,
+  reaching `success` / `finalized`;
+- `broadcast_attempted.json` carries the signature, fee payer, destination,
+  lamports, and blockhash;
+- pending ids look like `sol-<32 hex>`, so nothing may assume a numeric id.
 
 ### Not yet exercised
 
-The static tests cover the verifier, the authorization preflight, the approver's
-match check, the sweep, and the mount construction, all offline. The task has
-**not** been run against a live Machine, so these remain open: whether the outbox
-directory over-mount stays live inside Docker as `pending/<id>/` appears, the
-real ceremony count, and whether the configured timeouts suit local-validator
-finalization. Settle them on the local lane before the mainnet lane is used.
+The task has **not** been run end to end through Harbor against a mounted
+Machine. Two things remain open and should be settled on the local lane before
+the mainnet lane is used: whether the outbox directory over-mount stays live
+inside Docker as `pending/<id>/` appears, and whether the configured timeouts
+suit finalization in that setting. Everything else — verifier, canary preflight,
+approver match, sweep, mount construction, container boundary — is covered
+offline by `scripts/test-harbor-evals.sh`.
 
 ## Validate without trading
 

@@ -237,6 +237,8 @@ class ApproverMatchTests(SolanaEvalTestCase):
         self.definition.lamports = TRANSFER
         self.definition.max_fee_lamports = FEE_CAP
         self.definition.source_address = SOURCE
+        self.definition.key_fingerprint = FINGERPRINT
+        self.definition.derivation_path = DERIVATION
         # `HomeDir::solana_outbox_dir` is `<home>/.solana-outbox`, and entries
         # live at `<root>/<wallet>/<chain>/<state>/<id>/`.
         self.entry = (
@@ -245,11 +247,15 @@ class ApproverMatchTests(SolanaEvalTestCase):
         self.entry.mkdir(parents=True)
 
     def stage(self, **overrides: object) -> None:
+        # Field names and the hex fingerprint encoding are those of
+        # `StagedSolanaTransfer`, confirmed against a live local validator run.
         intent: dict[str, object] = {
             "destination": DESTINATION,
             "lamports": TRANSFER,
             "fee_payer": SOURCE,
             "fee_lamports": 5000,
+            "account_fingerprint": FINGERPRINT,
+            "account_derivation_path": DERIVATION,
         }
         intent.update(overrides)
         (self.entry / "intent.json").write_text(json.dumps(intent))
@@ -276,6 +282,20 @@ class ApproverMatchTests(SolanaEvalTestCase):
     def test_a_fee_above_the_ceiling_does_not_match(self) -> None:
         self.stage(fee_lamports=FEE_CAP + 1)
         self.assertFalse(self.matches())
+
+    def test_another_signing_account_does_not_match(self) -> None:
+        # A second active child must never have a message approved that was
+        # staged against the first.
+        self.stage(account_fingerprint="ffffffffffffffff")
+        self.assertFalse(self.matches())
+
+    def test_another_derivation_path_does_not_match(self) -> None:
+        self.stage(account_derivation_path="m/44'/501'/9'/0'")
+        self.assertFalse(self.matches())
+
+    def test_the_fingerprint_comparison_ignores_hex_case(self) -> None:
+        self.stage(account_fingerprint=FINGERPRINT.upper())
+        self.assertTrue(self.matches())
 
     def test_a_missing_intent_does_not_match(self) -> None:
         self.assertFalse(self.matches())
