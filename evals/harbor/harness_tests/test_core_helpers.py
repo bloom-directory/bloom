@@ -14,7 +14,14 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from harness.core import CeremonyDriver, EvalError, MountedTree, poll_until
+from harness.core import (
+    CeremonyDriver,
+    EvalError,
+    MountedTree,
+    SignCountStore,
+    poll_until,
+    resolve_sign_count,
+)
 
 
 class PollUntilTests(unittest.TestCase):
@@ -254,3 +261,67 @@ class CeremonyDriverTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SignCountStoreTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.path = Path(self.temp.name) / "nested" / "sign-count"
+        self.store = SignCountStore(self.path)
+
+    def test_an_absent_record_reads_as_none(self) -> None:
+        self.assertIsNone(self.store.read())
+
+    def test_a_written_counter_round_trips(self) -> None:
+        self.store.write(7)
+        self.assertEqual(self.store.read(), 7)
+
+    def test_the_counter_never_moves_backwards(self) -> None:
+        # A concurrent or earlier run may already have consumed further than
+        # this one knows about, and lowering the record would cause reuse.
+        self.store.write(10)
+        self.store.write(4)
+        self.assertEqual(self.store.read(), 10)
+
+    def test_a_non_integer_record_fails_closed(self) -> None:
+        self.path.parent.mkdir(parents=True)
+        self.path.write_text("banana")
+        with self.assertRaisesRegex(EvalError, "does not contain an integer"):
+            self.store.read()
+
+    def test_an_out_of_range_record_fails_closed(self) -> None:
+        self.path.parent.mkdir(parents=True)
+        self.path.write_text("0")
+        with self.assertRaisesRegex(EvalError, "out-of-range"):
+            self.store.read()
+
+    def test_the_environment_wins_over_the_record(self) -> None:
+        self.store.write(3)
+        self.assertEqual(resolve_sign_count("11", self.store, "VAR"), 11)
+
+    def test_the_record_is_used_when_the_environment_is_unset(self) -> None:
+        self.store.write(3)
+        self.assertEqual(resolve_sign_count("", self.store, "VAR"), 3)
+
+    def test_neither_source_fails_closed_with_guidance(self) -> None:
+        with self.assertRaisesRegex(EvalError, "no counter has been recorded"):
+            resolve_sign_count("", self.store, "VAR")
+
+    def test_the_driver_records_a_consumed_counter_before_judging_it(self) -> None:
+        # The Broker accepts the counter before a ceremony can fail, so a
+        # failure must still leave it spent.
+        seed = Path(self.temp.name) / "seed"
+        seed.write_bytes(b"x")
+        seed.chmod(0o600)
+        driver_path = Path(self.temp.name) / "driver"
+        driver_path.write_text("#!/bin/sh\nexit 0\n")
+        driver_path.chmod(0o755)
+        driver = CeremonyDriver(driver_path, seed, 5, store=self.store)
+        with mock.patch(
+            "harness.core.subprocess.run",
+            return_value=SimpleNamespace(returncode=1, stdout=b"", stderr=b""),
+        ):
+            with self.assertRaises(EvalError):
+                driver.complete("http://localhost:18734/ceremony/" + "A" * 43)
+        self.assertEqual(self.store.read(), 6)

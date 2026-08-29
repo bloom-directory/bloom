@@ -184,4 +184,187 @@ assert len(plan.trial_configs) == 1
 assert plan.trial_configs[0].task.path.name == "hyperliquid-order-cancel"
 assert plan.trial_configs[0].environment.mounts[0]["read_only"] is True
 PY
+
+printf '%s\n' 'Hyperliquid static checks passed; checking the Solana transfer task.'
+
+# --- Solana transfer task -------------------------------------------------
+solana_task="${repo_root}/evals/harbor/tasks/solana-transfer"
+bash -n "${repo_root}/scripts/evals/run-harbor.sh"
+bash -n "${solana_task}/tests/test.sh"
+
+python3 - <<SOLTOML
+import sys
+import tomllib
+from pathlib import Path
+sys.path.insert(0, str(Path("${repo_root}/evals/harbor")))
+from harness.hyperliquid_order_cancel import EVAL_IMAGE
+
+with Path("${solana_task}/task.toml").open("rb") as handle:
+    task = tomllib.load(handle)
+assert task["task"]["name"] == "bloom/solana-transfer"
+assert task["environment"]["network_mode"] == "public"
+# Both tasks ride the same pinned agent base image. Drift here means one of
+# them silently stopped matching the image the harness actually pulls.
+assert task["environment"]["docker_image"] == EVAL_IMAGE
+# The agent stages, hits the approval boundary, waits for an out-of-band owner
+# approval, retries, then waits for finalization.
+assert task["agent"]["timeout_sec"] >= 1200.0
+SOLTOML
+
+# Serve deterministic Solana RPC responses so the verifier's trust boundary is
+# exercised without touching a cluster. Production points the URL at a node.
+cat >"$tmp/fake_solana.py" <<'SOLSERVER'
+import json
+import os
+import pathlib
+import socket
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+SOURCE = os.environ["BLOOM_EVAL_SOLANA_SOURCE"]
+DESTINATION = os.environ["BLOOM_EVAL_SOLANA_DESTINATION"]
+LAMPORTS = int(os.environ["BLOOM_EVAL_SOLANA_LAMPORTS"])
+SIGNATURE = "5" * 87
+SLOT = 301442118
+FEE = 5000
+
+
+def result_for(method):
+    if method == "getSignaturesForAddress":
+        return [{"signature": SIGNATURE, "err": None}]
+    if method == "getTransaction":
+        return {
+            "slot": SLOT,
+            "meta": {"err": None, "fee": FEE, "innerInstructions": []},
+            "transaction": {
+                "message": {
+                    "instructions": [
+                        {
+                            "programId": "11111111111111111111111111111111",
+                            "program": "system",
+                            "parsed": {
+                                "type": "transfer",
+                                "info": {
+                                    "source": SOURCE,
+                                    "destination": DESTINATION,
+                                    "lamports": LAMPORTS,
+                                },
+                            },
+                        }
+                    ]
+                }
+            },
+        }
+    return None
+
+
+class Handler(BaseHTTPRequestHandler):
+    def do_POST(self):
+        body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        payload = {
+            "jsonrpc": "2.0",
+            "id": body.get("id"),
+            "result": result_for(body["method"]),
+        }
+        raw = json.dumps(payload).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
+    def log_message(self, *_args):
+        pass
+
+
+sock = socket.socket()
+sock.bind(("127.0.0.1", 0))
+port = sock.getsockname()[1]
+sock.close()
+pathlib.Path(os.environ["FAKE_SOLANA_PORT_FILE"]).write_text(str(port))
+HTTPServer(("127.0.0.1", port), Handler).serve_forever()
+SOLSERVER
+
+solana_port_file="$tmp/solana-port"
+export BLOOM_EVAL_SOLANA_NETWORK="mainnet-beta"
+export BLOOM_EVAL_SOLANA_CHAIN="solana-mainnet"
+export BLOOM_EVAL_SOLANA_WALLET_ID="eval-solana"
+export BLOOM_EVAL_SOLANA_SOURCE="9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin"
+export BLOOM_EVAL_SOLANA_DESTINATION="6dmNQ5jwLeLk5REvio1JcMshcbvkYMwy26sJ8pbkvStu"
+export BLOOM_EVAL_SOLANA_KEY_FINGERPRINT="a3f1c09b2e7d4856"
+export BLOOM_EVAL_SOLANA_DERIVATION_PATH="m/44'/501'/0'/0'"
+export BLOOM_EVAL_SOLANA_LAMPORTS="1003517"
+export BLOOM_EVAL_SOLANA_MAX_FEE_LAMPORTS="10000"
+
+FAKE_SOLANA_PORT_FILE="$solana_port_file" python3 "$tmp/fake_solana.py" &
+fake_solana_pid=$!
+trap 'kill "$fake_hyperliquid_pid" "$fake_solana_pid" 2>/dev/null || true; rm -rf "$tmp"' EXIT
+for _ in $(seq 1 100); do
+  [ -s "$solana_port_file" ] && break
+  sleep 0.1
+done
+[ -s "$solana_port_file" ] || { printf '%s\n' 'fake Solana RPC did not start' >&2; exit 1; }
+export BLOOM_EVAL_SOLANA_RPC_URL="http://127.0.0.1:$(cat "$solana_port_file")/"
+
+python3 - "$tmp" "${solana_task}/tests/verify_result.py" <<'SOLCASES'
+import json
+import pathlib
+import subprocess
+import sys
+
+tmp = pathlib.Path(sys.argv[1])
+verifier = sys.argv[2]
+
+good = {
+    "schema": "bloom.eval.solana_transfer.v1",
+    "status": "complete",
+    "network": "mainnet-beta",
+    "chain": "solana-mainnet",
+    "wallet_id": "eval-solana",
+    "source_address": "9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin",
+    "key_fingerprint": "a3f1c09b2e7d4856",
+    "derivation_path": "m/44'/501'/0'/0'",
+    "destination": "6dmNQ5jwLeLk5REvio1JcMshcbvkYMwy26sJ8pbkvStu",
+    "lamports": 1003517,
+    "fee_lamports": 5000,
+    "blockhash": "EkSnNWid2cvwEVnVx9aBqawnmiCNiDgp3gUdkDPTKN1N",
+    "pending_id": "0001",
+    "signature": "5" * 87,
+    "slot": 301442118,
+    "confirmation_status": "finalized",
+    "outcome": "success",
+    "pending_entries_after": 0,
+    "confirm_failed_before_approval": True,
+}
+
+
+def run(name, report):
+    path = tmp / f"solana_{name}.json"
+    path.write_text(json.dumps(report))
+    return subprocess.run([sys.executable, verifier, str(path)], capture_output=True)
+
+
+result = run("good", good)
+if result.returncode != 0:
+    raise SystemExit(
+        "truthful Solana report rejected: " + result.stderr.decode(errors="replace")
+    )
+
+adversarial = {
+    "wrong-amount": {"lamports": 1},
+    "wrong-destination": {"destination": "9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin"},
+    "wrong-signature": {"signature": "4" * 87},
+    "wrong-slot": {"slot": 1},
+    "wrong-fee": {"fee_lamports": 1},
+    "unfinalized": {"confirmation_status": "confirmed"},
+    "not-complete": {"status": "partial"},
+    "residual-pending": {"pending_entries_after": 1},
+    "boundary-not-observed": {"confirm_failed_before_approval": False},
+    "wrong-wallet": {"wallet_id": "someone-else"},
+}
+for name, changes in adversarial.items():
+    if run(name, dict(good, **changes)).returncode == 0:
+        raise SystemExit(f"invalid Solana fixture passed: {name}")
+SOLCASES
+
+printf '%s\n' 'Solana static checks passed.'
 printf '%s\n' 'Harbor eval static tests passed.'

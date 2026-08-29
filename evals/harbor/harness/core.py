@@ -164,6 +164,73 @@ class MountedTree:
         return poll_until(predicate, attempts, delay)
 
 
+class SignCountStore:
+    """Durable record of the next unused WebAuthn signature counter.
+
+    A counter that is not strictly greater than the last accepted one is
+    rejected, which fails a run without doing anything. Tracking that by hand
+    across two evals that share one authenticator is a reliable way to lose
+    runs, so the harness records it instead. The file holds a single integer.
+    """
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+
+    def read(self) -> int | None:
+        try:
+            raw = self.path.read_text().strip()
+        except FileNotFoundError:
+            return None
+        except OSError as error:
+            raise EvalError(f"could not read {self.path}: {error}") from error
+        if not raw:
+            return None
+        try:
+            value = int(raw)
+        except ValueError as error:
+            raise EvalError(
+                f"{self.path} does not contain an integer sign count"
+            ) from error
+        if value < 1 or value > 0xFFFF_FFFF:
+            raise EvalError(f"{self.path} holds an out-of-range sign count {value}")
+        return value
+
+    def write(self, value: int) -> None:
+        # Never move the recorded counter backwards: a concurrent or earlier
+        # run may already have consumed further than this one knows about.
+        current = self.read()
+        if current is not None and value <= current:
+            return
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = self.path.with_name(self.path.name + ".tmp")
+            temporary.write_text(f"{value}\n")
+            temporary.replace(self.path)
+        except OSError as error:
+            raise EvalError(f"could not record the sign count: {error}") from error
+
+
+def resolve_sign_count(env_value: str, store: SignCountStore, variable: str) -> int:
+    """Take the counter from the environment when set, else from the store."""
+    if env_value:
+        try:
+            value = int(env_value)
+        except ValueError as error:
+            raise EvalError(f"{variable} must be an integer") from error
+    else:
+        recorded = store.read()
+        if recorded is None:
+            raise EvalError(
+                f"{variable} is not set and no counter has been recorded at "
+                f"{store.path}; set it once from the authenticator's last "
+                "accepted signature counter plus one"
+            )
+        value = recorded
+    if value < 1 or value > 0xFFFF_FFFF:
+        raise EvalError(f"{variable} must be between 1 and 4294967295")
+    return value
+
+
 class CeremonyDriver:
     """Completes Broker owner ceremonies with strictly increasing counters.
 
@@ -181,11 +248,13 @@ class CeremonyDriver:
         start_count: int,
         *,
         timeout: int = 45,
+        store: SignCountStore | None = None,
     ) -> None:
         self.driver = driver
         self.seed_file = seed_file
         self.counter = start_count
         self.timeout = timeout
+        self.store = store
         self.completed: set[str] = set()
 
     @property
@@ -260,6 +329,11 @@ class CeremonyDriver:
         output = (completed.stdout + completed.stderr).decode(errors="replace")
         used = self.counter
         self.counter += 1
+        # Record before inspecting the result. The Broker accepts the counter
+        # before a ceremony can fail, so a crash or a failure here must still
+        # leave the counter spent; reusing it would only fail the next run.
+        if self.store is not None:
+            self.store.write(self.counter)
         if completed.returncode != 0:
             raise EvalError(
                 f"ceremony failed at sign count {used} "

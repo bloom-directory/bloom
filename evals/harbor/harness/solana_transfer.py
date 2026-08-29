@@ -42,6 +42,8 @@ from .core import (
     EvalError,
     EvalRunContext,
     MountedTree,
+    SignCountStore,
+    resolve_sign_count,
 )
 
 MAINNET_ACK = "TRANSFER_SOL_MAINNET_UP_TO_THE_AUTHORIZED_AMOUNT"
@@ -158,6 +160,14 @@ class SolanaTransferEval(EvalDefinition):
             read_timeout=CHAIN_READ_TIMEOUT_SECONDS,
             read_attempts=CHAIN_READ_ATTEMPTS,
         )
+        self.sign_counts = SignCountStore(
+            Path(
+                self.env.get(
+                    "BLOOM_EVAL_SIGN_COUNT_FILE",
+                    str(Path.home() / ".config/bloom/eval-sign-count"),
+                )
+            )
+        )
         self._approver: threading.Thread | None = None
         self._approver_stop = threading.Event()
         self._approver_error: str | None = None
@@ -196,17 +206,11 @@ class SolanaTransferEval(EvalDefinition):
     # ---- small helpers -------------------------------------------------
 
     def _require_sign_count(self) -> int:
-        try:
-            sign_count = int(self.sign_count_value)
-        except ValueError as error:
-            raise EvalError(
-                "BLOOM_EVAL_AUTHENTICATOR_SIGN_COUNT must be an integer"
-            ) from error
-        if sign_count < 1 or sign_count > 0xFFFF_FFFF:
-            raise EvalError(
-                "BLOOM_EVAL_AUTHENTICATOR_SIGN_COUNT must be between 1 and 4294967295"
-            )
-        return sign_count
+        return resolve_sign_count(
+            self.sign_count_value,
+            self.sign_counts,
+            "BLOOM_EVAL_AUTHENTICATOR_SIGN_COUNT",
+        )
 
     def _list_state(self, state: str) -> list[str]:
         try:
@@ -578,7 +582,9 @@ class SolanaTransferEval(EvalDefinition):
             self._approver_stop.wait(APPROVER_POLL_SECONDS)
 
     def _start_approver(self, sign_count: int) -> None:
-        ceremonies = CeremonyDriver(self.driver, self.seed_file, sign_count)
+        ceremonies = CeremonyDriver(
+            self.driver, self.seed_file, sign_count, store=self.sign_counts
+        )
         self.next_sign_count = ceremonies.next_sign_count
         self._approver = threading.Thread(
             target=self._approve_loop,

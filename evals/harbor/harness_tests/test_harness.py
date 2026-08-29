@@ -244,6 +244,7 @@ class HyperliquidDefinitionTests(unittest.TestCase):
             "BLOOM_EVAL_MAINNET_ACK": MAINNET_ACK,
             "BLOOM_EVAL_AUTHENTICATOR_SEED_FILE": str(self.seed),
             "BLOOM_EVAL_AUTHENTICATOR_SIGN_COUNT": "4",
+            "BLOOM_EVAL_SIGN_COUNT_FILE": str(self.root / "sign-count"),
             "BLOOM_EVAL_DEBUG_DRIVER_BIN": str(self.driver),
             "BLOOM_EVAL_BLOOM_MOUNT": str(self.mount),
             "BLOOM_EVAL_JOBS_DIR": str(self.root / "jobs"),
@@ -332,9 +333,25 @@ class HyperliquidDefinitionTests(unittest.TestCase):
         self.assertEqual(definition.bloom_mount, custom)
         ismount.assert_called_once_with(custom)
 
-    def test_missing_sign_count_fails_closed(self) -> None:
+    def test_missing_sign_count_with_no_record_fails_closed(self) -> None:
         env = dict(self.env)
         del env["BLOOM_EVAL_AUTHENTICATOR_SIGN_COUNT"]
+        definition = HyperliquidOrderCancelEval(self.repo, env)
+        with self.assertRaisesRegex(EvalError, "no counter has been recorded"):
+            definition.preflight()
+
+    def test_a_recorded_counter_is_used_when_the_variable_is_unset(self) -> None:
+        # Hand-tracking a monotonic counter across two evals that share one
+        # authenticator loses runs; the harness records it instead.
+        env = dict(self.env)
+        del env["BLOOM_EVAL_AUTHENTICATOR_SIGN_COUNT"]
+        Path(env["BLOOM_EVAL_SIGN_COUNT_FILE"]).write_text("9\n")
+        definition = HyperliquidOrderCancelEval(self.repo, env)
+        self.assertEqual(definition._require_sign_count(), 9)
+
+    def test_a_malformed_sign_count_variable_fails_closed(self) -> None:
+        env = dict(self.env)
+        env["BLOOM_EVAL_AUTHENTICATOR_SIGN_COUNT"] = "not-a-number"
         definition = HyperliquidOrderCancelEval(self.repo, env)
         with self.assertRaisesRegex(EvalError, "SIGN_COUNT must be an integer"):
             definition.preflight()

@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
+# Deprecated: superseded by `scripts/evals/run-harbor.sh <eval> <agent>`, which
+# dispatches every registered eval instead of one per integration. Kept so
+# existing runbooks and muscle memory keep working.
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
-harbor_version="${HARBOR_VERSION:-0.21.0}"
 
 if [ "$#" -ne 1 ]; then
   printf '%s\n' \
@@ -10,7 +12,8 @@ if [ "$#" -ne 1 ]; then
   exit 2
 fi
 
-export BLOOM_EVAL_REPO_ROOT="$repo_root"
-export PYTHONPATH="${repo_root}/evals/harbor${PYTHONPATH:+:${PYTHONPATH}}"
-exec uv run --isolated --no-project --with "harbor==${harbor_version}" \
-  python -m harness hyperliquid-order-cancel "$1"
+printf '%s\n' \
+  'note: run-harbor-hyperliquid.sh is deprecated; use' \
+  "      scripts/evals/run-harbor.sh hyperliquid-order-cancel $1" >&2
+
+exec "${repo_root}/scripts/evals/run-harbor.sh" hyperliquid-order-cancel "$1"
