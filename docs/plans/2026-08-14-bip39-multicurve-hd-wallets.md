@@ -1,6 +1,9 @@
 # BIP-39 Multi-Curve HD Wallets
 
-**Status:** proposed
+**Status:** implemented on the unmerged BIP-39/Solana PR stack; automated
+validation passes. Manual browser/passkey validation of mnemonic import,
+export/recovery, credential replacement, and the resulting Solana transfer is
+still pending.
 
 **Issue:** [bloom#163](https://github.com/bloom-directory/bloom/issues/163)
 
