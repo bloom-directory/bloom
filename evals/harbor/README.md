@@ -564,7 +564,24 @@ local-validator run of `bloom-it`'s `solana_workflow` shows one signing call for
 the confirm, plus key derivation on first use, against Hyperliquid's three. The
 harness caps the count rather than asserting it.
 
-### What a live validator run has confirmed
+### Validate against a live chain
+
+```bash
+solana-test-validator --ledger /tmp/bloom-eval-ledger --reset --quiet &
+scripts/evals/test-solana-live.sh
+```
+
+`scripts/test-harbor-evals.sh` drives the verifier against a deterministic fake
+RPC, which proves the logic but not that it matches what a Solana node actually
+returns. This runs the same code against a real validator with real transfers,
+and exercises the host sweep, which cannot be tested at all without a chain. It
+makes a truthful report pass, makes five tampered reports fail, pays the
+destination a second time and confirms the previously-valid report is then
+rejected, and finally sweeps the destination and confirms the drain from the
+chain. It refuses any endpoint that is not local, and refuses the mainnet-beta
+genesis outright.
+
+### What live runs have confirmed
 
 `cargo test -p bloom-it --test solana_workflow -- --ignored` drives a real
 `Daemon` against `solana-test-validator`. Running it settled the outbox
@@ -582,15 +599,40 @@ behaviour this task depends on:
   lamports, and blockhash;
 - pending ids look like `sol-<32 hex>`, so nothing may assume a numeric id.
 
+`scripts/evals/test-solana-live.sh` settled the chain-facing half:
+
+- the verifier's `jsonParsed` expectations match a real node's response exactly,
+  including `program`, `programId`, `parsed.type`, `info`, `meta.fee` and an
+  empty `innerInstructions`;
+- a report that disagrees with the chain on amount, slot, signature, fee, or
+  source is rejected against real data, not just against fixtures;
+- the freshness binding holds: paying the destination a second time invalidates
+  a report that passed moments earlier;
+- the host sweep drains a funded destination and returns the lamports, and a
+  second sweep over an empty one correctly does nothing;
+- a faucet credit is confirmed well before it is finalized, which is why every
+  balance this eval reads is a finalized one.
+
+The key fingerprint is lowercase hex: the wire crate declares
+`fixed_lower_hex!(Digest32, 32, ...)`.
+
 ### Not yet exercised
 
 The task has **not** been run end to end through Harbor against a mounted
-Machine. Two things remain open and should be settled on the local lane before
-the mainnet lane is used: whether the outbox directory over-mount stays live
-inside Docker as `pending/<id>/` appears, and whether the configured timeouts
-suit finalization in that setting. Everything else — verifier, canary preflight,
-approver match, sweep, mount construction, container boundary — is covered
-offline by `scripts/test-harbor-evals.sh`.
+Machine, and no agent has read the instruction and attempted it. Three things
+remain open and should be settled on the local lane before the mainnet lane is
+used:
+
+- whether the outbox directory over-mount stays live inside Docker as
+  `pending/<id>/` appears — the design decision with the least evidence behind
+  it, and the one with a documented fallback;
+- whether the configured timeouts suit finalization in that setting;
+- whether the background approver drives a real ceremony correctly; it has been
+  tested against staged fixtures but has never completed one.
+
+Everything else is covered: the verifier, the freshness binding and the sweep
+against a live chain, and the canary preflight, approver match logic, mount
+construction and container boundary offline.
 
 ## Validate without trading
 

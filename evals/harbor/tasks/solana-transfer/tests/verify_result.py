@@ -26,11 +26,11 @@ BASE58 = "[1-9A-HJ-NP-Za-km-z]"
 ADDRESS_RE = re.compile(f"^{BASE58}{{32,44}}$")
 SIGNATURE_RE = re.compile(f"^{BASE58}{{86,88}}$")
 BLOCKHASH_RE = re.compile(f"^{BASE58}{{32,44}}$")
-# The fingerprint's rendering in `accounts.json` is a Digest32, whose wire
-# encoding has not been confirmed against a live Machine. Accept either hex or
-# base64url as a shape guard; correctness comes from the exact match against the
-# authorization's value below, not from this pattern.
-FINGERPRINT_RE = re.compile(r"^(?:[0-9a-f]{16,64}|[A-Za-z0-9_-]{16,64})$")
+# `accounts.json` renders the fingerprint as a Digest32, which the wire crate
+# declares `fixed_lower_hex!(Digest32, 32, ...)` -- lowercase hex, 32 bytes. A
+# prefix is accepted where a fingerprint selects an account, so the length is a
+# range rather than exactly 64.
+FINGERPRINT_RE = re.compile(r"^[0-9a-f]{16,64}$")
 DERIVATION_RE = re.compile(r"^m/44'/501'/\d+'/0'$")
 SYSTEM_PROGRAM_ID = "11111111111111111111111111111111"
 RPC_TIMEOUT_SECONDS = 30
