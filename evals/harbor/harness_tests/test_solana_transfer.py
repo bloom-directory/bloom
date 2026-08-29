@@ -430,3 +430,46 @@ class SweepTests(SolanaEvalTestCase):
         ):
             with self.assertRaisesRegex(EvalError, "required for host cleanup"):
                 self.definition._require_sweep_tool()
+
+
+class ContainerBoundaryTests(SolanaEvalTestCase):
+    """Whatever else changes, these must never end up inside the container."""
+
+    def context(self):
+        definition = self.make()
+        definition.destination = DESTINATION
+        definition.source_address = SOURCE
+        definition.lamports = TRANSFER
+        with mock.patch.object(definition, "_start_approver"):
+            return definition, definition.provision("codex")
+
+    def test_no_host_secret_reaches_the_agent(self) -> None:
+        definition, context = self.context()
+        secrets_on_host = [
+            str(self.sweep),  # sweeping key: the eval's only route back
+            str(self.auth_path),  # canary authorization
+            str(definition.seed_file),  # authenticator seed
+            str(definition.driver),  # debug driver
+            str(definition.home_root),  # private outbox state
+        ]
+        rendered = json.dumps(
+            {
+                "env": dict(context.agent_env),
+                "mounts": [dict(m) for m in context.mounts],
+            }
+        )
+        for secret in secrets_on_host:
+            if secret and secret != ".":
+                self.assertNotIn(secret, rendered)
+
+    def test_the_agent_gets_no_rpc_endpoint(self) -> None:
+        # Reaching the chain directly would let the agent observe or act
+        # outside the mount, which is the surface under test.
+        _definition, context = self.context()
+        self.assertNotIn("BLOOM_EVAL_SOLANA_RPC_URL", context.agent_env)
+
+    def test_only_the_outbox_is_writable(self) -> None:
+        _definition, context = self.context()
+        writable = [m for m in context.mounts if not m.get("read_only")]
+        self.assertEqual(len(writable), 1)
+        self.assertTrue(writable[0]["target"].endswith("/outbox"))
