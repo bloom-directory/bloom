@@ -163,6 +163,13 @@ class CeremonyDriverTests(unittest.TestCase):
     def make(self, start: int = 2) -> CeremonyDriver:
         return CeremonyDriver(self.driver, self.seed, start)
 
+    def test_preflight_names_an_unset_seed_variable_as_such(self) -> None:
+        # An unset path lstats as `.` and would otherwise be reported as "not a
+        # regular file", which points the operator at the wrong problem.
+        driver = CeremonyDriver(self.driver, Path(""), 2)
+        with self.assertRaisesRegex(EvalError, "not configured"):
+            driver.preflight()
+
     def test_preflight_rejects_a_world_readable_seed(self) -> None:
         self.seed.chmod(0o644)
         with self.assertRaisesRegex(EvalError, "must have mode 0600"):
@@ -325,3 +332,46 @@ class SignCountStoreTests(unittest.TestCase):
             with self.assertRaises(EvalError):
                 driver.complete("http://localhost:18734/ceremony/" + "A" * 43)
         self.assertEqual(self.store.read(), 6)
+
+    def test_a_record_failure_is_not_reported_as_a_ceremony_failure(self) -> None:
+        # A ceremony that succeeded must never be reported as one that failed:
+        # the caller would unwind state that was actually created.
+        seed = Path(self.temp.name) / "seed2"
+        seed.write_bytes(b"x")
+        seed.chmod(0o600)
+        driver_path = Path(self.temp.name) / "driver2"
+        driver_path.write_text("#!/bin/sh\nexit 0\n")
+        driver_path.chmod(0o755)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text("banana")  # unreadable record
+        driver = CeremonyDriver(driver_path, seed, 5, store=self.store)
+        url = "http://localhost:18734/ceremony/" + "A" * 43
+        with mock.patch(
+            "harness.core.subprocess.run",
+            return_value=SimpleNamespace(returncode=0, stdout=b"ok", stderr=b""),
+        ):
+            with self.assertRaises(EvalError) as raised:
+                driver.complete(url)
+        message = str(raised.exception)
+        self.assertIn("succeeded but its counter could not be recorded", message)
+        self.assertIn("SIGN_COUNT=6", message)
+        # The ceremony really did happen, so it must be remembered as consumed.
+        self.assertIn(url, driver.completed)
+        self.assertEqual(driver.next_sign_count, 6)
+
+    def test_a_failed_ceremony_still_reports_as_a_ceremony_failure(self) -> None:
+        seed = Path(self.temp.name) / "seed3"
+        seed.write_bytes(b"x")
+        seed.chmod(0o600)
+        driver_path = Path(self.temp.name) / "driver3"
+        driver_path.write_text("#!/bin/sh\nexit 1\n")
+        driver_path.chmod(0o755)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text("banana")
+        driver = CeremonyDriver(driver_path, seed, 5, store=self.store)
+        with mock.patch(
+            "harness.core.subprocess.run",
+            return_value=SimpleNamespace(returncode=1, stdout=b"denied", stderr=b""),
+        ):
+            with self.assertRaisesRegex(EvalError, "ceremony failed at sign count 5"):
+                driver.complete("http://localhost:18734/ceremony/" + "A" * 43)

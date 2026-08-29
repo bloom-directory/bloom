@@ -268,6 +268,11 @@ class CeremonyDriver:
 
     def preflight(self) -> None:
         """Validate the seed file and driver without consuming a counter."""
+        # `Path("")` is `.`, whose lstat succeeds as a directory and then fails
+        # the regular-file check. That reports the wrong problem: the operator
+        # did not misconfigure the path, they never set it.
+        if not str(self.seed_file) or str(self.seed_file) == ".":
+            raise EvalError("the authenticator seed file is not configured")
         try:
             seed_stat = self.seed_file.lstat()
         except OSError as error:
@@ -332,14 +337,30 @@ class CeremonyDriver:
         # Record before inspecting the result. The Broker accepts the counter
         # before a ceremony can fail, so a crash or a failure here must still
         # leave the counter spent; reusing it would only fail the next run.
+        #
+        # A failure to record must not be mistaken for a failure to complete.
+        # Raising here directly would report a ceremony that actually succeeded
+        # as a failed one, leaving the caller to unwind state that was in fact
+        # created. Hold the error until the ceremony's own outcome is known.
+        record_error: str | None = None
         if self.store is not None:
-            self.store.write(self.counter)
+            try:
+                self.store.write(self.counter)
+            except EvalError as error:
+                record_error = str(error)
         if completed.returncode != 0:
             raise EvalError(
                 f"ceremony failed at sign count {used} "
                 f"(next unused counter is {self.counter}): " + self.redact(output)
             )
         self.completed.add(ceremony_url)
+        if record_error is not None:
+            raise EvalError(
+                f"the ceremony at sign count {used} succeeded but its counter "
+                f"could not be recorded ({record_error}); set "
+                f"BLOOM_EVAL_AUTHENTICATOR_SIGN_COUNT={self.counter} for the "
+                "next run"
+            )
         return output
 
 
