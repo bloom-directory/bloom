@@ -173,10 +173,33 @@ class SignCountStore:
     runs, so the harness records it instead. The file holds a single integer.
     """
 
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path | None) -> None:
         self.path = path
 
+    @classmethod
+    def for_seed_file(cls, seed_file: Path, override: str = "") -> SignCountStore:
+        """Record the counter beside the credential it belongs to.
+
+        A signature counter belongs to one authenticator, not to the machine.
+        Two evals may be configured with different seed files, so a single
+        shared record would carry one credential's counter into the other's
+        run. Deriving the path from the seed file makes the association
+        structural rather than something an operator has to remember.
+
+        With no seed file configured there is nothing to key a record to. That
+        is an error, but it is the seed-file validation's error to report, so
+        this yields a store that simply holds nothing rather than raising a
+        `ValueError` from `Path(".")` on the way past.
+        """
+        if override:
+            return cls(Path(override))
+        if not str(seed_file) or str(seed_file) == ".":
+            return cls(None)
+        return cls(seed_file.with_name(seed_file.name + ".sign-count"))
+
     def read(self) -> int | None:
+        if self.path is None:
+            return None
         try:
             raw = self.path.read_text().strip()
         except FileNotFoundError:
@@ -196,6 +219,8 @@ class SignCountStore:
         return value
 
     def write(self, value: int) -> None:
+        if self.path is None:
+            return
         # Never move the recorded counter backwards: a concurrent or earlier
         # run may already have consumed further than this one knows about.
         current = self.read()
@@ -220,11 +245,20 @@ def resolve_sign_count(env_value: str, store: SignCountStore, variable: str) -> 
     else:
         recorded = store.read()
         if recorded is None:
+            where = "" if store.path is None else f" at {store.path}"
             raise EvalError(
-                f"{variable} is not set and no counter has been recorded at "
-                f"{store.path}; set it once from the authenticator's last "
+                f"{variable} is not set and no counter has been recorded"
+                f"{where}; set it once from the authenticator's last "
                 "accepted signature counter plus one"
             )
+        # Say so rather than proceeding silently. These evals move real funds,
+        # and the counter is one of the few numbers an operator is expected to
+        # be deliberate about; taking it from a file should still be visible.
+        print(
+            f"{variable} is unset; using the recorded counter {recorded} "
+            f"from {store.path}",
+            file=sys.stderr,
+        )
         value = recorded
     if value < 1 or value > 0xFFFF_FFFF:
         raise EvalError(f"{variable} must be between 1 and 4294967295")

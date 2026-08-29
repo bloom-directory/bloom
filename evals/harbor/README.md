@@ -551,13 +551,20 @@ would defeat the bound the eval rests on.
 
 ### WebAuthn counters
 
-Both evals share one authenticator, so the harness records the next unused
-counter at `BLOOM_EVAL_SIGN_COUNT_FILE` (default
-`~/.config/bloom/eval-sign-count`) rather than leaving it to be tracked by hand.
+The harness records the next unused counter beside the seed file it belongs to,
+at `<seed file>.sign-count`, rather than leaving it to be tracked by hand. The
+record is keyed to the credential because a signature counter belongs to one
+authenticator, not to the machine: two evals may be configured with different
+seed files, and a shared record would carry one credential's counter into the
+other's run. `BLOOM_EVAL_SIGN_COUNT_FILE` overrides the location.
 It is written the moment a counter is consumed, before the ceremony's result is
 even inspected, because the Broker accepts the counter before a ceremony can
 fail. Set `BLOOM_EVAL_AUTHENTICATOR_SIGN_COUNT` to override or to seed the first
-run; the recorded value never moves backwards.
+run; the recorded value never moves backwards, and falling back to it prints a
+line naming the counter and the file it came from, so it is never silent. A
+stale record is safe in both directions: too low is rejected by the Broker and
+fails the run without moving anything, and too high is simply accepted, since
+counters only have to increase.
 
 A Solana transfer spends far fewer counters than a Hyperliquid session. A live
 local-validator run of `bloom-it`'s `solana_workflow` shows one signing call for

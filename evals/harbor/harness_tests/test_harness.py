@@ -332,12 +332,36 @@ class HyperliquidDefinitionTests(unittest.TestCase):
         self.assertEqual(definition.bloom_mount, custom)
         ismount.assert_called_once_with(custom)
 
-    def test_missing_sign_count_fails_closed(self) -> None:
+    def test_missing_sign_count_with_no_record_fails_closed(self) -> None:
         env = dict(self.env)
         del env["BLOOM_EVAL_AUTHENTICATOR_SIGN_COUNT"]
         definition = HyperliquidOrderCancelEval(self.repo, env)
+        with self.assertRaisesRegex(EvalError, "no counter has been recorded"):
+            definition.preflight()
+
+    def test_a_malformed_sign_count_variable_fails_closed(self) -> None:
+        env = dict(self.env)
+        env["BLOOM_EVAL_AUTHENTICATOR_SIGN_COUNT"] = "not-a-number"
+        definition = HyperliquidOrderCancelEval(self.repo, env)
         with self.assertRaisesRegex(EvalError, "SIGN_COUNT must be an integer"):
             definition.preflight()
+
+    def test_the_counter_record_lives_beside_its_own_credential(self) -> None:
+        # The counter belongs to one authenticator, not to the machine. Two
+        # evals may be configured with different seed files, and a shared
+        # record would carry one credential's counter into the other's run.
+        definition = HyperliquidOrderCancelEval(self.repo, dict(self.env))
+        self.assertEqual(
+            definition.sign_counts.path,
+            Path(self.env["BLOOM_EVAL_AUTHENTICATOR_SEED_FILE"] + ".sign-count"),
+        )
+
+    def test_a_recorded_counter_is_used_when_the_variable_is_unset(self) -> None:
+        env = dict(self.env)
+        del env["BLOOM_EVAL_AUTHENTICATOR_SIGN_COUNT"]
+        Path(env["BLOOM_EVAL_AUTHENTICATOR_SEED_FILE"] + ".sign-count").write_text("9\n")
+        definition = HyperliquidOrderCancelEval(self.repo, env)
+        self.assertEqual(definition._require_sign_count(), 9)
 
     def test_out_of_range_sign_count_fails_closed(self) -> None:
         env = dict(self.env)

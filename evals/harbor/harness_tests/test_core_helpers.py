@@ -375,3 +375,29 @@ class SignCountStoreTests(unittest.TestCase):
         ):
             with self.assertRaisesRegex(EvalError, "ceremony failed at sign count 5"):
                 driver.complete("http://localhost:18734/ceremony/" + "A" * 43)
+
+    def test_the_record_is_keyed_to_the_seed_file(self) -> None:
+        seed = Path(self.temp.name) / "eval-authenticator-seed"
+        store = SignCountStore.for_seed_file(seed)
+        self.assertEqual(store.path, seed.with_name(seed.name + ".sign-count"))
+
+    def test_two_credentials_get_two_records(self) -> None:
+        # A signature counter belongs to a credential, not to the machine.
+        a = SignCountStore.for_seed_file(Path(self.temp.name) / "seed-a")
+        b = SignCountStore.for_seed_file(Path(self.temp.name) / "seed-b")
+        self.assertNotEqual(a.path, b.path)
+
+    def test_an_explicit_override_wins(self) -> None:
+        store = SignCountStore.for_seed_file(Path("/seed"), "/tmp/elsewhere")
+        self.assertEqual(store.path, Path("/tmp/elsewhere"))
+
+    def test_an_unconfigured_seed_yields_a_store_that_holds_nothing(self) -> None:
+        # `Path("")` is `.`, and `with_name` on it raises ValueError. Reporting
+        # the missing seed file is the seed validation's job, not this one's,
+        # so the store must get out of the way rather than crash on the way past.
+        store = SignCountStore.for_seed_file(Path(""))
+        self.assertIsNone(store.path)
+        self.assertIsNone(store.read())
+        store.write(5)  # no-op, must not raise
+        with self.assertRaisesRegex(EvalError, "no counter has been recorded"):
+            resolve_sign_count("", store, "VAR")

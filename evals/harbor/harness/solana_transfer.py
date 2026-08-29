@@ -160,14 +160,6 @@ class SolanaTransferEval(EvalDefinition):
             read_timeout=CHAIN_READ_TIMEOUT_SECONDS,
             read_attempts=CHAIN_READ_ATTEMPTS,
         )
-        self.sign_counts = SignCountStore(
-            Path(
-                self.env.get(
-                    "BLOOM_EVAL_SIGN_COUNT_FILE",
-                    str(Path.home() / ".config/bloom/eval-sign-count"),
-                )
-            )
-        )
         self._approver: threading.Thread | None = None
         self._approver_stop = threading.Event()
         self._approver_error: str | None = None
@@ -178,6 +170,12 @@ class SolanaTransferEval(EvalDefinition):
     @property
     def lock_path(self) -> Path:
         return self._lock_path
+
+    @property
+    def sign_counts(self) -> SignCountStore:
+        return SignCountStore.for_seed_file(
+            self.seed_file, self.env.get("BLOOM_EVAL_SIGN_COUNT_FILE", "")
+        )
 
     @property
     def wallet_root(self) -> Path:
