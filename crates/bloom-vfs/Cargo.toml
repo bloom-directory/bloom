@@ -19,6 +19,7 @@ bloom-paid-x402.workspace = true
 bloom-evm.workspace = true
 bloom-rpc.workspace = true
 bloom-tx.workspace = true
+bloom-solana-tx.workspace = true
 bloom-tools.workspace = true
 bloom-watch.workspace = true
 bloom-prices.workspace = true
@@ -51,5 +52,7 @@ rustix.workspace = true
 
 [dev-dependencies]
 bloom-proto = { workspace = true, features = ["audit-test-seam"] }
+bloom-solana.workspace = true
+bs58.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["process", "rt-multi-thread", "macros", "time", "io-util"] }

@@ -1,0 +1,23 @@
+[package]
+name = "bloom-solana"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Read-only Solana chain client: layered JSON-RPC transport, account/balance/status lookups, transaction simulation"
+
+[dependencies]
+bloom-rpc-common.workspace = true
+bloom-proto.workspace = true
+base64.workspace = true
+bs58.workspace = true
+parking_lot.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

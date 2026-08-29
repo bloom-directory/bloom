@@ -4004,7 +4004,9 @@ fn exact_evm_sign_request(
         approval_id: state.approval_id.clone(),
         account_key_ref: None,
         petal_use_claim: None,
+        system_use_claim: None,
         claim_assurance_evidence: None,
+        approval_value_limits: Vec::new(),
     })
 }
 
