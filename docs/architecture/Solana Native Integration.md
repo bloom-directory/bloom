@@ -1,6 +1,8 @@
 # Solana Native Integration
 
 **Status:** implemented for local, devnet, and explicitly enabled mainnet use
+on the unmerged BIP-39/Solana stack. Automated validation and the real ceremony
+HTTP shell/cancellation path pass; manual passkey completion remains pending.
 **Audience:** Bloom engineers, Petal authors, and implementation agents
 
 ## The decision

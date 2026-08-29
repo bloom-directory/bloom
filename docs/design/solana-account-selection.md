@@ -1,6 +1,8 @@
 # Explicit derived-account selection
 
-**Status:** accepted
+**Status:** implemented on the unmerged native-Solana branch; automated
+selection and lifecycle regressions pass. Manual passkey validation remains
+pending.
 **Resolves:** [bloom#169 review thread](https://github.com/bloom-directory/bloom/pull/169#discussion_r3824025189) (Finding R1)
 
 ## Problem
