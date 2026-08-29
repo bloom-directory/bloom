@@ -1,5 +1,6 @@
-//! Root-only generation of per-login macOS triad identities and signing
-//! material from public release templates.
+//! Generation of per-login triad identities and signing material from public
+//! release templates. Production installation remains macOS-root-only; the
+//! feature-gated developer harness is supported on Unix hosts.
 
 use std::{
     collections::BTreeMap,

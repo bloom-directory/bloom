@@ -540,6 +540,8 @@ pub enum MachineCustodyKind {
     New,
     Import,
     ImportRawPrivateKey,
+    Export,
+    Recovery,
     Rebind,
     Delete,
 }
@@ -595,8 +597,22 @@ pub enum MachineCommand {
         name: String,
         profile: String,
     },
+    WalletAccountRetire {
+        name: String,
+        fingerprint: String,
+    },
     WalletAddress {
         name: String,
+        /// Optional derived-account family (`evm` or `solana`). Absent keeps
+        /// the legacy primary-address behavior.
+        #[serde(default)]
+        profile: Option<String>,
+        /// Which derived account to print, named by its public-key
+        /// fingerprint or a unique prefix. Required once the wallet has more
+        /// than one active account for the profile; absent stays valid for a
+        /// single account and is never a request to take the first listed.
+        #[serde(default)]
+        fingerprint: Option<String>,
     },
     WalletUnlock {
         name: String,

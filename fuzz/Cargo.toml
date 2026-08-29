@@ -1,0 +1,34 @@
+[package]
+name = "bloom-solana-tx-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.bloom-solana-tx]
+path = "../crates/bloom-solana-tx"
+
+[dependencies.solana-message]
+version = "4.5.0"
+features = ["wincode"]
+
+[dependencies.solana-transaction]
+version = "4.2.0"
+features = ["verify", "wincode"]
+
+[dependencies.wincode]
+version = "0.6"
+
+[[bin]]
+name = "message_codec"
+path = "fuzz_targets/message_codec.rs"
+test = false
+doc = false
+bench = false
