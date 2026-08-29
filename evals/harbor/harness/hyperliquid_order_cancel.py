@@ -25,8 +25,6 @@ from .core import (
     EvalError,
     EvalRunContext,
     MountedTree,
-    SignCountStore,
-    resolve_sign_count,
 )
 
 MAINNET_ACK = "PLACE_AND_CANCEL_BTC_MAINNET_UP_TO_11_USD"
@@ -144,25 +142,23 @@ class HyperliquidOrderCancelEval(EvalDefinition):
             read_timeout=VENUE_READ_TIMEOUT_SECONDS,
             read_attempts=VENUE_READ_ATTEMPTS,
         )
-        self.sign_counts = SignCountStore(
-            Path(
-                self.env.get(
-                    "BLOOM_EVAL_SIGN_COUNT_FILE",
-                    str(Path.home() / ".config/bloom/eval-sign-count"),
-                )
-            )
-        )
 
     @property
     def lock_path(self) -> Path:
         return self._lock_path
 
     def _require_sign_count(self) -> int:
-        return resolve_sign_count(
-            self.sign_count_value,
-            self.sign_counts,
-            "BLOOM_EVAL_AUTHENTICATOR_SIGN_COUNT",
-        )
+        try:
+            sign_count = int(self.sign_count_value)
+        except ValueError as error:
+            raise EvalError(
+                "BLOOM_EVAL_AUTHENTICATOR_SIGN_COUNT must be an integer"
+            ) from error
+        if sign_count < 1 or sign_count > 0xFFFF_FFFF:
+            raise EvalError(
+                "BLOOM_EVAL_AUTHENTICATOR_SIGN_COUNT must be between 1 and 4294967295"
+            )
+        return sign_count
 
     @property
     def network_root(self) -> Path:
@@ -798,9 +794,7 @@ class HyperliquidOrderCancelEval(EvalDefinition):
         # Completing it twice fails against a consumed session, so the driver
         # remembers what this provision has already driven and we wait for the
         # session instead.
-        ceremonies = CeremonyDriver(
-            self.driver, self.seed_file, sign_count, store=self.sign_counts
-        )
+        ceremonies = CeremonyDriver(self.driver, self.seed_file, sign_count)
         completed_ceremonies = ceremonies.completed
         for _ in range(MAX_SESSION_CEREMONIES):
             ceremony_url: str | None = None
