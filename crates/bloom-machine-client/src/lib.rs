@@ -51,8 +51,8 @@ use bloom_broker_api::{
     PolicyCommitUpdateRequest, PolicyUpdatePrepareResponse, PolicyUpdateRequest, ProtocolError,
     ProtocolErrorCode, ProvenanceCatalog, ProvenanceSubject, RequestNonce, RevocationState,
     RevokeRequest, SealedApprovalPrepareResponse, SealedApprovalTerms, SignedPolicySnapshot,
-    SigningPayloads, SigningResult, Token, TypedRequestMethod, WalletAccountsPublic,
-    WalletOperationRequest, WalletPublic, WalletRequest, is_read_only_method,
+    SigningPayloads, SigningResult, SystemUseClaim, Token, TypedRequestMethod, ValueLimit,
+    WalletAccountsPublic, WalletOperationRequest, WalletPublic, WalletRequest, is_read_only_method,
 };
 use bloom_triad_local_transport::{LocalIdentity, PeerAcl};
 use serde::{Deserialize, Serialize};
@@ -571,6 +571,7 @@ impl MachineBrokerClient {
                 payload: Base64UrlBytes::from_bytes(&request.preimage),
             },
             petal_use_claim,
+            system_use_claim: None,
             claim_assurance_evidence,
             provenance: request.trusted_provenance,
         })
@@ -597,51 +598,90 @@ impl MachineBrokerClient {
                 "exact payload hash does not match the selected CryptoSuite",
             ));
         }
-        let (petal_use_claim_digest, claim_assurance_digest) = match &request.petal_use_claim {
-            Some(claim) => {
-                let ProvenanceSubject::Petal {
-                    package_hash,
-                    route,
-                } = &request.provenance
-                else {
-                    return Err(ProtocolError::new(
-                        ProtocolErrorCode::ProvenanceMismatch,
-                        "PetalUseClaim requires trusted Petal provenance",
-                    ));
-                };
-                if &claim.package_hash != package_hash
-                    || &claim.route != route
-                    || claim.crypto_suite != request.crypto_suite
-                    || claim.payload_digest
-                        != petal_batch_payload_digest(std::slice::from_ref(&request.preimage))
-                    || claim.ordered_hashes.as_slice() != [ordered_hash.clone()]
-                {
-                    return Err(ProtocolError::new(
-                        ProtocolErrorCode::ProvenanceMismatch,
-                        "exact Petal claim does not match trusted provenance or payload",
-                    ));
+        if request.petal_use_claim.is_some() && request.system_use_claim.is_some() {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::MalformedFrame,
+                "one exact signing request cannot carry both Petal and system claims",
+            ));
+        }
+        let (petal_use_claim_digest, claim_assurance_digest) =
+            match (&request.petal_use_claim, &request.system_use_claim) {
+                (Some(claim), None) => {
+                    let ProvenanceSubject::Petal {
+                        package_hash,
+                        route,
+                    } = &request.provenance
+                    else {
+                        return Err(ProtocolError::new(
+                            ProtocolErrorCode::ProvenanceMismatch,
+                            "PetalUseClaim requires trusted Petal provenance",
+                        ));
+                    };
+                    if &claim.package_hash != package_hash
+                        || &claim.route != route
+                        || claim.crypto_suite != request.crypto_suite
+                        || claim.payload_digest
+                            != petal_batch_payload_digest(std::slice::from_ref(&request.preimage))
+                        || claim.ordered_hashes.as_slice() != [ordered_hash.clone()]
+                    {
+                        return Err(ProtocolError::new(
+                            ProtocolErrorCode::ProvenanceMismatch,
+                            "exact Petal claim does not match trusted provenance or payload",
+                        ));
+                    }
+                    (
+                        Some(jcs_digest(claim)?),
+                        Some(jcs_digest(&claim.claim_assurance)?),
+                    )
                 }
-                (
-                    Some(jcs_digest(claim)?),
-                    Some(jcs_digest(&claim.claim_assurance)?),
-                )
-            }
-            None => {
-                if matches!(request.provenance, ProvenanceSubject::Petal { .. }) {
-                    return Err(ProtocolError::new(
-                        ProtocolErrorCode::ProvenanceMismatch,
-                        "trusted Petal exact signing requires a PetalUseClaim",
-                    ));
+                (None, Some(claim)) => {
+                    let ProvenanceSubject::System {
+                        component_id,
+                        operation_class,
+                    } = &request.provenance
+                    else {
+                        return Err(ProtocolError::new(
+                            ProtocolErrorCode::ProvenanceMismatch,
+                            "SystemUseClaim requires trusted System provenance",
+                        ));
+                    };
+                    if &claim.component_id != component_id
+                        || &claim.action_class != operation_class
+                        || claim.crypto_suite != request.crypto_suite
+                        || claim.payload_digest != payload_digest
+                        || claim.ordered_hashes.as_slice() != [ordered_hash.clone()]
+                    {
+                        return Err(ProtocolError::new(
+                            ProtocolErrorCode::ProvenanceMismatch,
+                            "exact system claim does not match trusted provenance or payload",
+                        ));
+                    }
+                    (
+                        Some(jcs_digest(claim)?),
+                        Some(jcs_digest(&claim.claim_assurance)?),
+                    )
                 }
-                if request.claim_assurance_evidence.is_some() {
-                    return Err(ProtocolError::new(
-                        ProtocolErrorCode::MalformedFrame,
-                        "claim assurance evidence requires a PetalUseClaim",
-                    ));
+                (None, None) => {
+                    // Petal execution has always required a package-scoped claim.
+                    // Native system operations may remain at the existing baseline
+                    // unless their chain path supplies a stronger SystemUseClaim
+                    // (as the Solana signer does below this API).
+                    if matches!(request.provenance, ProvenanceSubject::Petal { .. }) {
+                        return Err(ProtocolError::new(
+                            ProtocolErrorCode::ProvenanceMismatch,
+                            "trusted Petal exact signing requires a PetalUseClaim",
+                        ));
+                    }
+                    if request.claim_assurance_evidence.is_some() {
+                        return Err(ProtocolError::new(
+                            ProtocolErrorCode::MalformedFrame,
+                            "claim assurance evidence requires a use claim",
+                        ));
+                    }
+                    (None, None)
                 }
-                (None, None)
-            }
-        };
+                (Some(_), Some(_)) => unreachable!("mutual exclusion checked above"),
+            };
         let key_ref = self
             .verified_signing_key(
                 &wallet,
@@ -679,6 +719,7 @@ impl MachineBrokerClient {
                         payload: Base64UrlBytes::from_bytes(&request.preimage),
                     },
                     petal_use_claim: request.petal_use_claim,
+                    system_use_claim: request.system_use_claim,
                     claim_assurance_evidence: request
                         .claim_assurance_evidence
                         .as_deref()
@@ -703,7 +744,7 @@ impl MachineBrokerClient {
                 max_signatures: DecimalU64::new(1),
                 operation_rate_limits: Vec::new(),
                 signature_rate_limits: Vec::new(),
-                value_limits: Vec::new(),
+                value_limits: request.approval_value_limits,
             },
             activation_mode,
             wallet_revocation_epoch: wallet.wallet_revocation_epoch,
@@ -721,6 +762,8 @@ impl MachineBrokerClient {
             operation_id: request.approval_operation_id,
             terms,
             canonical_plan_facts_digest: request.canonical_plan_facts_digest,
+            petal_use_claim: request.petal_use_claim,
+            system_use_claim: request.system_use_claim,
         })
         .await
         .map(ExactPayloadSignOutcome::ApprovalRequired)
@@ -841,6 +884,7 @@ impl MachineBrokerClient {
                             .collect(),
                     },
                     petal_use_claim: request.petal_use_claim,
+                    system_use_claim: None,
                     claim_assurance_evidence: request
                         .claim_assurance_evidence
                         .as_deref()
@@ -889,6 +933,8 @@ impl MachineBrokerClient {
             operation_id: request.approval_operation_id,
             terms,
             canonical_plan_facts_digest: request.canonical_plan_facts_digest,
+            petal_use_claim: request.petal_use_claim,
+            system_use_claim: None,
         })
         .await
         .map(ExactPayloadSignOutcome::ApprovalRequired)
@@ -988,6 +1034,7 @@ impl MachineBrokerClient {
                             .collect(),
                     },
                     petal_use_claim: Some(claim.clone()),
+                    system_use_claim: None,
                     claim_assurance_evidence: request
                         .claim_assurance_evidence
                         .as_deref()
@@ -1040,6 +1087,8 @@ impl MachineBrokerClient {
             operation_id: request.approval_operation_id,
             terms,
             canonical_plan_facts_digest: request.canonical_plan_facts_digest,
+            petal_use_claim: Some(claim.clone()),
+            system_use_claim: None,
         })
         .await
         .map(ExactPayloadSignOutcome::ApprovalRequired)
@@ -1330,6 +1379,20 @@ impl MachineBrokerClient {
         {
             MachineBrokerResponse::AccountAllocatePrepare(prepared) => Ok(prepared),
             _ => Err(response_mismatch("account.allocate_prepare")),
+        }
+    }
+
+    /// Prepare an AccountRetire custody ceremony bound to exact terms.
+    pub async fn account_retire(
+        &self,
+        request: CustodyPrepareRequest,
+    ) -> Result<CustodyPrepareResponse, ProtocolError> {
+        match self
+            .request(MachineBrokerRequest::AccountRetirePrepare(request))
+            .await?
+        {
+            MachineBrokerResponse::AccountRetirePrepare(prepared) => Ok(prepared),
+            _ => Err(response_mismatch("account.retire_prepare")),
         }
     }
 
@@ -1653,7 +1716,12 @@ pub struct ExactPayloadSignRequest {
     pub canonical_plan_facts_digest: Digest32,
     pub approval_id: Option<Digest32>,
     pub petal_use_claim: Option<PetalUseClaim>,
+    pub system_use_claim: Option<SystemUseClaim>,
     pub claim_assurance_evidence: Option<Vec<u8>>,
+    /// Value movement authorized by the reviewed exact claim. System callers
+    /// must supply an exact per-asset ceiling; non-value signing leaves this
+    /// empty.
+    pub approval_value_limits: Vec<ValueLimit>,
     /// The exact derived account to sign with. Required when the wallet is
     /// BIP-39 and holds more than one child for `crypto_suite`; `None` keeps
     /// the single-account and legacy-root behaviour.
@@ -3073,7 +3141,9 @@ mod tests {
             canonical_plan_facts_digest: digest(64),
             approval_id,
             petal_use_claim: None,
+            system_use_claim: None,
             claim_assurance_evidence: None,
+            approval_value_limits: Vec::new(),
             account_key_ref: None,
         }
     }
@@ -3724,6 +3794,8 @@ mod tests {
             operation_id: OperationId::from_bytes([94; 32]),
             terms: approval_terms("wallet", None),
             canonical_plan_facts_digest: digest(95),
+            petal_use_claim: None,
+            system_use_claim: None,
         };
         assert_eq!(
             client.prepare_approval(approval).await.unwrap_err().code,

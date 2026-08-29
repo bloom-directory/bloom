@@ -1,8 +1,9 @@
 # Working with bloom
 
-bloom exposes Ethereum workflows as a virtual filesystem. Prefer inspecting the
-mounted tree with normal filesystem tools. Run commands from the mount root
-(the directory containing this file) so examples can use relative paths.
+bloom exposes chain workflows — EVM and Solana — as a virtual filesystem.
+Prefer inspecting the mounted tree with normal filesystem tools. Run
+commands from the mount root (the directory containing this file) so
+examples can use relative paths.
 
 Useful commands:
 
@@ -28,9 +29,9 @@ bloom gatekeeps every value-moving action through capabilities:
 - **Automated action uses a capability.** Create a bounded session/capability
   first — the human approves the bounds once, then the agent operates inside
   them without re-prompting until expiry, breach, or revocation.
-- **The owner key is never handed off.** EVM and installed-Petal authority is
-  prepared by Broker and signed only by Signer; Machine never receives the
-  private key.
+- **The owner key is never handed off.** EVM, Solana, and installed-Petal
+  authority is prepared by Broker and signed only by Signer; Machine never
+  receives the private key.
 
 To see what a wallet can do without a human, check its per-chain state, outbox,
 and the mounted capability views of installed Petals.
@@ -41,6 +42,14 @@ has the relevant handlers mounted.
 ## Wallets
 
 When asked for an address for a certain wallet, consider displaying in-line the QR code image for the relevant wallet e.g. `wallets/<wallet>/address.qr.png`.
+
+A wallet's chains are listed at `wallets/<wallet>/chains` and include both
+EVM chains and any configured Solana chains — `ls wallets/<wallet>/chains`
+enumerates both together. Solana chains route through the exact same
+`wallets/<wallet>/chains/<chain>/outbox/...` route family described below
+(stage at `outbox/new.tx`, confirm/cancel under `outbox/pending/<id>/`,
+inspect `outbox/{pending,sent,failed}/<id>/`) — there is no separate
+Solana-specific surface to look for.
 
 ## Creating a wallet (asynchronous passkey registration)
 

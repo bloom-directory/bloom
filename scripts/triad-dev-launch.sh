@@ -183,6 +183,15 @@ if [ ! -f "${config_dir}/edge-manifest.json" ]; then
     cp "$template_source" "${template_dir}/${name}"
     chmod 0600 "${template_dir}/${name}"
   done
+  case "$(uname -s)" in
+    Darwin) developer_trusted_time_source="macos-managed-timed" ;;
+    Linux) developer_trusted_time_source="linux-chrony-nts" ;;
+    *) die "developer triad launcher supports only Darwin and Linux" ;;
+  esac
+  sed "s/\"trusted_time_source\": \"macos-managed-timed\"/\"trusted_time_source\": \"${developer_trusted_time_source}\"/" \
+    "${template_dir}/edge-manifest.json.in" > "${template_dir}/edge-manifest.json.in.new"
+  chmod 0600 "${template_dir}/edge-manifest.json.in.new"
+  mv -f "${template_dir}/edge-manifest.json.in.new" "${template_dir}/edge-manifest.json.in"
   if [ "$install_authority_fixture" -eq 1 ]; then
     catalog="${template_dir}/provenance-catalog.unsigned.json"
     catalog_new="${catalog}.new"

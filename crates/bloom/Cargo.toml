@@ -35,6 +35,7 @@ bloom-broker-api.workspace = true
 blake3.workspace = true
 bloom-mount = { workspace = true, optional = true }
 bloom-evm.workspace = true
+bloom-solana-tx.workspace = true
 bloom-tx.workspace = true
 url.workspace = true
 bloom-vfs.workspace = true

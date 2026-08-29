@@ -19,7 +19,7 @@
   <a href="https://bloom.directory/SKILL.md"><strong>Agent setup skill</strong></a>
 </p>
 
-Bloom is an **agentic Ethereum wallet mounted as a virtual filesystem**.
+Bloom is an **agentic EVM and Solana wallet mounted as a virtual filesystem**.
 Reads are blockchain queries, writes are transaction intents, and the
 primary interface is an ordinary directory your agent can inspect with
 normal filesystem tools (`ls`, `cat`, `echo`). Depending on OS and
@@ -50,6 +50,8 @@ Bloom gives an agent a safe wallet workspace:
   methods, storage, events, NFTs, ENS, prices, and address history;
 - create/import encrypted wallets without exposing private keys through
   the filesystem;
+- derive EVM and Solana accounts from one BIP-39 mnemonic root, with
+  secp256k1 BIP-44 and hardened Ed25519 SLIP-10 paths;
 - stage native ETH, ERC-20, NFT, contract-call, signing, and installed-Petal
   DeFi intents by writing plain-language or structured files;
 - stage free or paid HTTP requests through `/requests`, including HTTP
@@ -67,6 +69,21 @@ broadcasting is enabled by default; set `allow_broadcast = false` on a chain to
 disable it.
 Public reads, simulations, and planning work without adding API keys;
 local devnet sends require a running Anvil node.
+
+Mnemonic import is the default wallet-import profile. The legacy raw
+secp256k1 scalar profile remains available only when selected explicitly:
+
+```sh
+bloom wallet import main
+bloom wallet account-allocate main --profile bip44-solana-slip10-ed25519-v1
+bloom wallet address main --profile solana
+```
+
+Native Solana transfers use the same wallet outbox shape as EVM transfers,
+with genesis pinning, exact-message semantic verification in Broker,
+signature-verifying simulation, explicit owner approval, and finalized
+receipt reconciliation. Solana mainnet-beta uses the same explicitly enabled,
+genesis-pinned transaction path.
 
 ## Try it
 
@@ -183,6 +200,7 @@ Bloom is a Rust Cargo workspace. The main user-facing/runtime crates are:
 | `bloom-vfs` | Path router, handler trait, per-path caching, and vendored docs. |
 | `bloom-evm` / `bloom-rpc` | RPC pools, per-chain engines, chain reads, and provider health. |
 | `bloom-tx` | Unsigned transaction staging, simulation, Broker signing orchestration, broadcast, and nonce management. |
+| `bloom-solana` / `bloom-solana-tx` | Genesis-bound Solana RPC, canonical native transfers, durable outbox, simulation, broadcast, restaging, and reconciliation. |
 | `bloom-mempool` | Optional pending-transaction indexing for configured WebSocket providers. |
 | `bloom-watch` | Subscription registry and polling executor. |
 | `bloom-mount` | NFSv4 adapter that mounts Bloom's VFS as an ordinary filesystem. |

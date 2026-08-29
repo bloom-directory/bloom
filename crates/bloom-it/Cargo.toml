@@ -19,8 +19,12 @@ bloom-watch.workspace = true
 bloom-tx.workspace = true
 bloom-vfs.workspace = true
 bloom-daemon.workspace = true
+bloom-solana-tx.workspace = true
 bloom-machine-client.workspace = true
 bloom-broker-api.workspace = true
+bloom-signer-derive = { git = "https://github.com/bloom-directory/bloom-signer.git", rev = "4636c6a18c535493d958b88f767acb788383cc60" }
+ed25519-dalek.workspace = true
+bs58.workspace = true
 bloom-revert.workspace = true
 alloy.workspace = true
 alloy-signer-local = "2.0.5"
@@ -32,7 +36,7 @@ sha2.workspace = true
 hex.workspace = true
 tempfile.workspace = true
 tracing-subscriber.workspace = true
-reqwest.workspace = true
+reqwest = { workspace = true, features = ["blocking"] }
 futures.workspace = true
 base64.workspace = true
 parking_lot.workspace = true
