@@ -4,8 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import fcntl
+import json
 import os
+import re
 import signal
+import stat
+import subprocess
+import sys
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Coroutine, Mapping, Sequence
@@ -16,6 +21,252 @@ from typing import Any
 
 class EvalError(RuntimeError):
     """A fail-closed evaluation error suitable for operator display."""
+
+
+# The Broker publishes owner ceremonies at a fixed local origin with a
+# base64url-encoded 32-byte secret. The shape is Broker-wide, not specific to
+# any one Petal or chain, so every eval that drives a passkey ceremony matches
+# and redacts it the same way.
+CEREMONY_URL = re.compile(r"http://localhost:18734/ceremony/[A-Za-z0-9_-]{43}")
+
+# Mounted reads are not local file reads. Under a Petal they are live venue
+# round-trips made by wasm; under a chain outbox they can wait on an RPC. Both
+# are the network's latency, not the disk's, so the defaults are generous and a
+# timeout is retried rather than failing the run.
+DEFAULT_READ_TIMEOUT_SECONDS = 45
+DEFAULT_READ_ATTEMPTS = 3
+
+
+def poll_until(
+    predicate: Callable[[], bool],
+    attempts: int,
+    delay: float,
+) -> bool:
+    """Poll `predicate` until it holds or the budget is spent.
+
+    Returns True as soon as it holds. An `EvalError` from the predicate is
+    treated as "not yet": a read that fails mid-settle should be retried within
+    the budget, and the caller reports the failure if it never clears.
+    """
+    for attempt in range(attempts):
+        try:
+            if predicate():
+                return True
+        except EvalError:
+            if attempt == attempts - 1:
+                raise
+        if attempt < attempts - 1:
+            time.sleep(delay)
+    return False
+
+
+class MountedTree:
+    """Reads and writes against a live Bloom mount.
+
+    Every method here treats the mount as a remote, asynchronous surface rather
+    than a filesystem: reads are retried, writes are dispatched through a
+    subprocess so a hung mount cannot block the harness indefinitely, and
+    existence is decided by a parent listing rather than by `stat`.
+    """
+
+    def __init__(
+        self,
+        *,
+        read_timeout: int = DEFAULT_READ_TIMEOUT_SECONDS,
+        read_attempts: int = DEFAULT_READ_ATTEMPTS,
+    ) -> None:
+        self.read_timeout = read_timeout
+        self.read_attempts = read_attempts
+
+    def read_json(self, path: Path, timeout: int | None = None) -> Any:
+        """Read and parse JSON, retrying timeouts and torn snapshots.
+
+        Owner-visible projections can be replaced while NFS is serving a read,
+        so a malformed snapshot is retried rather than treated as durable
+        corruption.
+        """
+        budget = self.read_timeout if timeout is None else timeout
+        last_error: BaseException | None = None
+        for attempt in range(self.read_attempts):
+            try:
+                completed = subprocess.run(
+                    ["cat", str(path)],
+                    check=True,
+                    capture_output=True,
+                    timeout=budget,
+                )
+            except subprocess.TimeoutExpired as error:
+                last_error = error
+                if attempt + 1 < self.read_attempts:
+                    time.sleep(1.0)
+                continue
+            except (OSError, subprocess.SubprocessError) as error:
+                raise EvalError(f"could not read {path}: {error}") from error
+            try:
+                return json.loads(completed.stdout)
+            except json.JSONDecodeError as error:
+                last_error = error
+                if attempt + 1 < self.read_attempts:
+                    time.sleep(0.2)
+                continue
+        raise EvalError(
+            f"could not read {path} after {self.read_attempts} attempts "
+            f"of {budget}s: {last_error}"
+        ) from last_error
+
+    def read_json_if_listed(
+        self, path: Path, listing_dir: Path, name: str
+    ) -> Any | None:
+        """Read `path` only when `name` actually appears in `listing_dir`.
+
+        Dynamic routes can make `stat` succeed for identifiers that were never
+        created, so a parent listing is the durable existence boundary. Returns
+        None when the listing directory is absent or does not contain `name`.
+        """
+        try:
+            listed = os.listdir(listing_dir)
+        except FileNotFoundError:
+            return None
+        except OSError as error:
+            raise EvalError(f"could not list {listing_dir}: {error}") from error
+        if name not in listed:
+            return None
+        return self.read_json(path)
+
+    def write_route(
+        self, path: Path, body: bytes, timeout: int
+    ) -> subprocess.CompletedProcess[bytes]:
+        """Write one complete payload to a mounted write sink.
+
+        The write runs in a subprocess so the timeout is enforceable: a mounted
+        route write stages ceremonies and can make network calls before it
+        returns. A zero exit code means accepted for dispatch, never completed.
+        """
+        writer = (
+            "import pathlib,sys; "
+            "pathlib.Path(sys.argv[1]).write_bytes(sys.stdin.buffer.read())"
+        )
+        try:
+            return subprocess.run(
+                [sys.executable, "-c", writer, str(path)],
+                input=body,
+                capture_output=True,
+                check=False,
+                timeout=timeout,
+            )
+        except (OSError, subprocess.SubprocessError) as error:
+            raise EvalError(f"route write to {path} failed: {error}") from error
+
+    @staticmethod
+    def poll_until(
+        predicate: Callable[[], bool], attempts: int, delay: float
+    ) -> bool:
+        return poll_until(predicate, attempts, delay)
+
+
+class CeremonyDriver:
+    """Completes Broker owner ceremonies with strictly increasing counters.
+
+    Every WebAuthn completion must use a counter strictly greater than the last
+    accepted one, so the counter advances per ceremony and is never reused. The
+    driver owns that bookkeeping rather than leaving it to each eval, and
+    reports the first counter it did not consume so an operator never has to
+    recount by hand.
+    """
+
+    def __init__(
+        self,
+        driver: Path,
+        seed_file: Path,
+        start_count: int,
+        *,
+        timeout: int = 45,
+    ) -> None:
+        self.driver = driver
+        self.seed_file = seed_file
+        self.counter = start_count
+        self.timeout = timeout
+        self.completed: set[str] = set()
+
+    @property
+    def next_sign_count(self) -> int:
+        """The first counter this run has not consumed."""
+        return self.counter
+
+    @staticmethod
+    def redact(output: str) -> str:
+        return CEREMONY_URL.sub("[REDACTED_CEREMONY_URL]", output)
+
+    def preflight(self) -> None:
+        """Validate the seed file and driver without consuming a counter."""
+        try:
+            seed_stat = self.seed_file.lstat()
+        except OSError as error:
+            raise EvalError(
+                f"authenticator seed file is unavailable: {error}"
+            ) from error
+        if not stat.S_ISREG(seed_stat.st_mode) or self.seed_file.is_symlink():
+            raise EvalError(
+                "authenticator seed file must be a regular non-symlink file"
+            )
+        if stat.S_IMODE(seed_stat.st_mode) != 0o600:
+            raise EvalError("authenticator seed file must have mode 0600")
+        if seed_stat.st_size == 0:
+            raise EvalError("authenticator seed file is empty")
+        if not self.driver.is_file() or not os.access(self.driver, os.X_OK):
+            raise EvalError(f"debug driver is missing or not executable: {self.driver}")
+        try:
+            usage = subprocess.run(
+                [str(self.driver)],
+                capture_output=True,
+                check=False,
+                text=True,
+                timeout=10,
+            )
+        except (OSError, subprocess.SubprocessError) as error:
+            raise EvalError(f"could not inspect debug driver: {error}") from error
+        if "--authenticator-seed-file" not in usage.stdout + usage.stderr:
+            raise EvalError(
+                "debug driver lacks --authenticator-seed-file support; "
+                "build bloom-broker PR #1 or newer"
+            )
+
+    def complete(self, ceremony_url: str) -> str:
+        """Complete one ceremony. Exactly one attempt, then the counter moves.
+
+        The Broker marks a consumed or absent ceremony CEREMONY_REPLAY with
+        retry "never", so a second attempt cannot succeed and only burns
+        another counter. Retrying here once turned one failure into three.
+        """
+        try:
+            completed = subprocess.run(
+                [
+                    str(self.driver),
+                    "complete",
+                    ceremony_url,
+                    "--authenticator-seed-file",
+                    str(self.seed_file),
+                    "--sign-count",
+                    str(self.counter),
+                ],
+                check=False,
+                capture_output=True,
+                timeout=self.timeout,
+            )
+        except (OSError, subprocess.SubprocessError) as error:
+            raise EvalError(
+                "debug-driver ceremony completion failed: " + self.redact(str(error))
+            ) from error
+        output = (completed.stdout + completed.stderr).decode(errors="replace")
+        used = self.counter
+        self.counter += 1
+        if completed.returncode != 0:
+            raise EvalError(
+                f"ceremony failed at sign count {used} "
+                f"(next unused counter is {self.counter}): " + self.redact(output)
+            )
+        self.completed.add(ceremony_url)
+        return output
 
 
 @dataclass(frozen=True)

@@ -1002,14 +1002,19 @@ class HyperliquidDefinitionTests(unittest.TestCase):
             ]
         )
         self.definition._read_session_status = mock.Mock(return_value=None)
-        with mock.patch("harness.hyperliquid_order_cancel.subprocess.run") as run:
+        # The debug driver is invoked by `CeremonyDriver`, so the subprocess
+        # boundary to patch is `harness.core`. Patching this module's would
+        # leave the driver running for real and pass for the wrong reason.
+        with mock.patch("harness.core.subprocess.run") as run:
             run.return_value = SimpleNamespace(
                 returncode=1, stdout=ceremony.encode(), stderr=b"driver failed"
             )
             with self.assertRaises(EvalError) as raised:
                 self.definition.provision("codex")
+        run.assert_called()
         self.assertNotIn(ceremony, str(raised.exception))
         self.assertIn("[REDACTED_CEREMONY_URL]", str(raised.exception))
+        self.assertIn("next unused counter is", str(raised.exception))
 
     def test_agent_name_is_stable_for_the_wallet(self) -> None:
         # Hyperliquid replaces a named agent when approveAgent arrives under the
