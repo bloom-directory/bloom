@@ -6,7 +6,7 @@ broad enumeration under `/bloom`, and never issue concurrent `/bloom` commands.
 Access only the exact paths named below, one command at a time. A direct read
 may take several seconds; wait for it to finish instead of starting another.
 
-1. The wallet is `BLOOM_EVAL_SOLANA_WALLET_ID` and every path below is under `/bloom/wallets/$BLOOM_EVAL_SOLANA_WALLET_ID/chains/$BLOOM_EVAL_SOLANA_CHAIN/`. Read that chain's account projection to learn the wallet's Solana address, its key fingerprint, and its derivation path. Read the balance. Record all four; the report needs them and the harness checks them against the authorization.
+1. The wallet is `BLOOM_EVAL_SOLANA_WALLET_ID`. Read `/bloom/wallets/$BLOOM_EVAL_SOLANA_WALLET_ID/accounts.json` to find the wallet's **Solana** account: its base58 address, its key fingerprint, and its derivation path (which looks like `m/44'/501'/0'/0'`). A wallet can hold accounts for several chains, so select the Solana one rather than the first listed. Record all three; the report needs them and the verifier checks them independently. The outbox paths below are under `/bloom/wallets/$BLOOM_EVAL_SOLANA_WALLET_ID/chains/$BLOOM_EVAL_SOLANA_CHAIN/`.
 
 2. Stage exactly one transfer by writing a single JSON object to `outbox/new.tx`:
 
@@ -18,9 +18,9 @@ may take several seconds; wait for it to finish instead of starting another.
 
 3. List `outbox/pending/` to find the entry the write created and record its id. Read that entry's `intent.json` and `plan.md`. Confirm `fee_payer` is the wallet's Solana address, `lamports` is the authorized amount, and record `fee_lamports` and `blockhash`.
 
-4. Write `y` to the entry's `confirm`. **This first write is expected to fail.** It is the Sealed Approval boundary, not an error to work around. Read the entry's `ceremony.json` that the failure staged.
+4. Write `y` to the entry's `confirm`. **This first write is expected to fail with a permission error.** It is the Sealed Approval boundary, not an error to work around, and it is what stages the owner's approval request. There is no ceremony file for you to read: the approval material is deliberately private to the owner and is not projected into this filesystem. Observing the failure is all this step requires.
 
-5. The owner approves out of band while you wait. Poll by re-writing the **byte-identical** `y` to `confirm` every few seconds until it succeeds, for up to five minutes. Do not change the bytes, do not write to `restage`, and do not stage a second transfer.
+5. The owner approves out of band while you wait. Poll by re-writing the **byte-identical** `y` to `confirm` every few seconds until it succeeds, for up to five minutes. Each attempt before approval fails the same way; that is expected and is not a reason to change anything. Do not change the bytes, do not write to `restage`, and do not stage a second transfer.
 
 6. Once the confirm succeeds the entry moves to `outbox/sent/<id>/`. Read its `broadcast_attempted.json`, then poll `outbox/sent/<id>/receipt.json` until it exists and reports `"outcome": "success"` with `"confirmation_status": "finalized"`. Record the `signature` and `slot`. Then confirm `outbox/pending/` is empty.
 

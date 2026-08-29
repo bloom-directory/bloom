@@ -13,6 +13,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 from harness.core import EvalError
@@ -230,11 +231,18 @@ class ApproverMatchTests(SolanaEvalTestCase):
 
     def setUp(self) -> None:
         super().setUp()
-        self.definition = self.make()
+        self.home = self.root / "home"
+        self.definition = self.make(BLOOM_EVAL_SOLANA_HOME_ROOT=str(self.home))
         self.definition.destination = DESTINATION
         self.definition.lamports = TRANSFER
         self.definition.max_fee_lamports = FEE_CAP
         self.definition.source_address = SOURCE
+        # `HomeDir::solana_outbox_dir` is `<home>/.solana-outbox`, and entries
+        # live at `<root>/<wallet>/<chain>/<state>/<id>/`.
+        self.entry = (
+            self.home / ".solana-outbox" / WALLET_ID / CHAIN / "pending" / "0001"
+        )
+        self.entry.mkdir(parents=True)
 
     def stage(self, **overrides: object) -> None:
         intent: dict[str, object] = {
@@ -244,11 +252,7 @@ class ApproverMatchTests(SolanaEvalTestCase):
             "fee_lamports": 5000,
         }
         intent.update(overrides)
-        self.read = mock.patch.object(
-            self.definition.mount, "read_json_if_listed", return_value=intent
-        )
-        self.read.start()
-        self.addCleanup(self.read.stop)
+        (self.entry / "intent.json").write_text(json.dumps(intent))
 
     def matches(self) -> bool:
         return self.definition._ceremony_matches_authorized_transfer("0001")
@@ -274,10 +278,40 @@ class ApproverMatchTests(SolanaEvalTestCase):
         self.assertFalse(self.matches())
 
     def test_a_missing_intent_does_not_match(self) -> None:
-        with mock.patch.object(
-            self.definition.mount, "read_json_if_listed", return_value=None
-        ):
-            self.assertFalse(self.matches())
+        self.assertFalse(self.matches())
+
+
+class CeremonyDiscoveryTests(ApproverMatchTests):
+    """The Solana outbox publishes no `ceremony.json` through the mount: the
+    confirm route writes a private `approval.json` beside the staged entry and
+    returns a bare permission error. The host reads that file directly."""
+
+    def test_no_approval_file_yet_means_no_ceremony(self) -> None:
+        self.assertIsNone(self.definition._pending_confirm_ceremony("0001"))
+
+    def test_the_ceremony_url_is_read_from_the_private_approval_file(self) -> None:
+        url = "http://localhost:18734/ceremony/" + "A" * 43
+        (self.entry / "approval.json").write_text(
+            json.dumps({"approval_id": "a" * 64, "ceremony_url": url})
+        )
+        self.assertEqual(self.definition._pending_confirm_ceremony("0001"), url)
+
+    def test_a_malformed_ceremony_url_is_refused(self) -> None:
+        (self.entry / "approval.json").write_text(
+            json.dumps({"approval_id": "a" * 64, "ceremony_url": "http://evil/x"})
+        )
+        with self.assertRaisesRegex(EvalError, "invalid ceremony URL"):
+            self.definition._pending_confirm_ceremony("0001")
+
+    def test_a_torn_write_reads_as_not_yet_published(self) -> None:
+        # The file is written atomically, so unparseable bytes mean a rename
+        # caught in flight, not corruption.
+        (self.entry / "approval.json").write_text('{"ceremony_ur')
+        self.assertIsNone(self.definition._pending_confirm_ceremony("0001"))
+
+    def test_host_state_listing_finds_the_staged_entry(self) -> None:
+        self.assertEqual(self.definition._list_host_state("pending"), ["0001"])
+        self.assertEqual(self.definition._list_host_state("sent"), [])
 
 
 class ProvisionTests(SolanaEvalTestCase):
@@ -330,3 +364,69 @@ class TrialAmountTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SweepTests(SolanaEvalTestCase):
+    """Cleanup's sweep is what makes the eval repeatable: the transfer cannot
+    be undone, but the destination is host-controlled, so the lamports come
+    back and only the fees are actually spent."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.definition = self.make()
+        self.definition.destination = DESTINATION
+        self.definition.source_address = SOURCE
+
+    def test_an_empty_destination_needs_no_sweep(self) -> None:
+        with mock.patch.object(self.definition, "_balance", return_value=0) as balance:
+            self.assertIsNone(self.definition.sweep_destination())
+        balance.assert_called_once()
+
+    def test_a_funded_destination_is_drained_and_confirmed(self) -> None:
+        balances = [TRANSFER, 0]
+        with mock.patch.object(
+            self.definition, "_balance", side_effect=lambda _a: balances.pop(0)
+        ):
+            with mock.patch(
+                "harness.solana_transfer.subprocess.run",
+                return_value=SimpleNamespace(
+                    returncode=0, stdout='{"signature":"sig-1"}', stderr=""
+                ),
+            ) as run:
+                self.assertEqual(self.definition.sweep_destination(), "sig-1")
+        command = run.call_args.args[0]
+        self.assertIn("transfer", command)
+        self.assertIn(SOURCE, command)
+        self.assertIn("ALL", command)
+        self.assertIn(str(self.sweep), command)
+
+    def test_a_failed_sweep_is_an_error(self) -> None:
+        with mock.patch.object(self.definition, "_balance", return_value=TRANSFER):
+            with mock.patch(
+                "harness.solana_transfer.subprocess.run",
+                return_value=SimpleNamespace(
+                    returncode=1, stdout="", stderr="insufficient funds"
+                ),
+            ):
+                with self.assertRaisesRegex(EvalError, "insufficient funds"):
+                    self.definition.sweep_destination()
+
+    def test_a_sweep_that_does_not_drain_is_an_error(self) -> None:
+        # The CLI's exit code is not evidence; the chain is.
+        with mock.patch.object(self.definition, "_balance", return_value=TRANSFER):
+            with mock.patch(
+                "harness.solana_transfer.subprocess.run",
+                return_value=SimpleNamespace(returncode=0, stdout="{}", stderr=""),
+            ):
+                with mock.patch.object(self.definition.mount, "poll_until", return_value=False):
+                    with self.assertRaisesRegex(EvalError, "did not drain"):
+                        self.definition.sweep_destination()
+
+    def test_a_missing_solana_cli_is_caught_in_preflight(self) -> None:
+        # Discovering this after a mainnet broadcast would be too late.
+        with mock.patch(
+            "harness.solana_transfer.subprocess.run",
+            side_effect=FileNotFoundError("no solana"),
+        ):
+            with self.assertRaisesRegex(EvalError, "required for host cleanup"):
+                self.definition._require_sweep_tool()

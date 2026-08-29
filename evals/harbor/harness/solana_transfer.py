@@ -26,8 +26,11 @@ import os
 import re
 import secrets
 import stat
+import subprocess
 import threading
 import time
+import urllib.error
+import urllib.request
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -73,6 +76,11 @@ APPROVER_BUDGET_SECONDS = 420.0
 # bounds a misbehaving route rather than describing the expected count.
 MAX_TRANSFER_CEREMONIES = 3
 
+RPC_TIMEOUT_SECONDS = 30
+SWEEP_TIMEOUT_SECONDS = 180
+SWEEP_SETTLE_ATTEMPTS = 20
+SWEEP_SETTLE_DELAY_SECONDS = 3.0
+
 PENDING_DRAIN_ATTEMPTS = 30
 PENDING_DRAIN_DELAY_SECONDS = 2.0
 RECEIPT_SETTLE_ATTEMPTS = 45
@@ -107,6 +115,11 @@ class SolanaTransferEval(EvalDefinition):
         )
         self.authorization_path = Path(self.authorization_value)
         self.machine_binary = Path(self.env.get("BLOOM_EVAL_SOLANA_MACHINE_BINARY", ""))
+        # The Machine's home root, on the host filesystem. The Solana outbox
+        # keeps a private `approval.json` beside each staged entry that the
+        # mount deliberately does not project, so the approver reads it here.
+        self.home_root = Path(self.env.get("BLOOM_EVAL_SOLANA_HOME_ROOT", ""))
+        self.solana_cli = self.env.get("BLOOM_EVAL_SOLANA_CLI", "solana")
         self.sweep_keypair = Path(
             self.env.get("BLOOM_EVAL_SOLANA_SWEEP_KEYPAIR_FILE", "")
         )
@@ -168,6 +181,18 @@ class SolanaTransferEval(EvalDefinition):
     def outbox_root(self) -> Path:
         return self.chain_root / "outbox"
 
+    @property
+    def host_outbox_root(self) -> Path:
+        """The Solana outbox on the host filesystem, not through the mount.
+
+        `HomeDir::solana_outbox_dir` is `<home>/.solana-outbox`, and entries
+        live at `<root>/<wallet>/<chain>/<state>/<id>/`.
+        """
+        return self.home_root / ".solana-outbox" / self.wallet_id / self.chain
+
+    def _host_entry(self, state: str, entry_id: str) -> Path:
+        return self.host_outbox_root / state / entry_id
+
     # ---- small helpers -------------------------------------------------
 
     def _require_sign_count(self) -> int:
@@ -190,6 +215,19 @@ class SolanaTransferEval(EvalDefinition):
             return []
         except OSError as error:
             raise EvalError(f"could not list outbox/{state}: {error}") from error
+
+    def _list_host_state(self, state: str) -> list[str]:
+        """List outbox entries from the host state directory.
+
+        The approver uses this rather than the mount: its decision must not be
+        delayed by a live chain read behind a directory listing.
+        """
+        try:
+            return sorted(os.listdir(self.host_outbox_root / state))
+        except FileNotFoundError:
+            return []
+        except OSError as error:
+            raise EvalError(f"could not list host outbox/{state}: {error}") from error
 
     def _read_private_json(self, path: Path, label: str) -> Any:
         """Read a local, immutable host file. Never a mounted path."""
@@ -399,8 +437,23 @@ class SolanaTransferEval(EvalDefinition):
             if ADDRESS.fullmatch(self.destination) is None:
                 raise EvalError("BLOOM_EVAL_SOLANA_DESTINATION must be a base58 address")
 
+        # The approver reads the private `approval.json` the confirm route
+        # stages, which the mount deliberately does not project.
+        if not str(self.home_root):
+            raise EvalError(
+                "BLOOM_EVAL_SOLANA_HOME_ROOT is required: the Solana confirm "
+                "ceremony is published only as a private host-side artifact"
+            )
+        if not self.home_root.is_dir():
+            raise EvalError(f"Machine home root is not a directory: {self.home_root}")
+
         self.sign_count = self._require_sign_count()
         CeremonyDriver(self.driver, self.seed_file, self.sign_count).preflight()
+
+        if self.lane == "mainnet-canary":
+            # Cleanup must be able to return the lamports. Discovering that the
+            # sweep tool is missing after a mainnet broadcast is too late.
+            self._require_sweep_tool()
 
         if not os.path.ismount(self.bloom_mount):
             raise EvalError(f"Bloom is not mounted at {self.bloom_mount}")
@@ -432,19 +485,41 @@ class SolanaTransferEval(EvalDefinition):
     # ---- background approver -------------------------------------------
 
     def _pending_confirm_ceremony(self, pending_id: str) -> str | None:
-        """The ceremony URL staged by a failed confirm, if one is published."""
-        ceremony = self.outbox_root / "pending" / pending_id / "ceremony.json"
-        data = self.mount.read_json_if_listed(
-            ceremony, self.outbox_root / "pending", pending_id
+        """The ceremony URL staged by a failed confirm, if one is published.
+
+        Unlike the EVM outbox, the Solana outbox publishes no `ceremony.json`
+        through the mount: on `ApprovalRequired` the confirm route writes a
+        private `approval.json` beside the staged entry and returns a bare
+        permission error carrying no URL. That is deliberate -- the agent has
+        no business holding an owner ceremony URL -- so the host reads the
+        private file directly from the Machine's state directory instead.
+        """
+        approval = self._read_host_json(
+            self._host_entry("pending", pending_id) / "approval.json"
         )
-        if not isinstance(data, dict):
+        if not isinstance(approval, dict):
             return None
-        url = data.get("ceremony_url")
+        url = approval.get("ceremony_url")
         if url is None:
             return None
         if not isinstance(url, str) or CEREMONY_URL.fullmatch(url) is None:
-            raise EvalError("staged ceremony has an invalid ceremony URL")
+            raise EvalError("staged approval has an invalid ceremony URL")
         return url
+
+    def _read_host_json(self, path: Path) -> Any | None:
+        """Read a private host-side artifact, or None when it does not exist."""
+        try:
+            raw = path.read_bytes()
+        except FileNotFoundError:
+            return None
+        except OSError as error:
+            raise EvalError(f"could not read {path}: {error}") from error
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            # The file is written atomically, so a torn read means we caught a
+            # rename in flight. Treat it as not-yet-published.
+            return None
 
     def _ceremony_matches_authorized_transfer(self, pending_id: str) -> bool:
         """Refuse to approve anything but the exact authorized transfer.
@@ -453,11 +528,13 @@ class SolanaTransferEval(EvalDefinition):
         rubber stamp for whatever the agent happened to stage. This is an
         independent check from the canary: the canary refuses at broadcast,
         this refuses at approval.
+
+        The staged intent is read from the host state directory rather than
+        through the mount, so the decision cannot be affected by mount latency
+        or by a projection replaced mid-read.
         """
-        intent = self.mount.read_json_if_listed(
-            self.outbox_root / "pending" / pending_id / "intent.json",
-            self.outbox_root / "pending",
-            pending_id,
+        intent = self._read_host_json(
+            self._host_entry("pending", pending_id) / "intent.json"
         )
         if not isinstance(intent, dict):
             return False
@@ -478,7 +555,7 @@ class SolanaTransferEval(EvalDefinition):
         deadline = time.monotonic() + APPROVER_BUDGET_SECONDS
         while not self._approver_stop.is_set() and time.monotonic() < deadline:
             try:
-                pending = self._list_state("pending")
+                pending = self._list_host_state("pending")
                 for pending_id in pending:
                     url = self._pending_confirm_ceremony(pending_id)
                     if url is None or url in ceremonies.completed:
@@ -516,6 +593,120 @@ class SolanaTransferEval(EvalDefinition):
         if self._approver is not None:
             self._approver.join(timeout=30)
             self._approver = None
+
+    # ---- host sweep ----------------------------------------------------
+
+    def _require_sweep_tool(self) -> None:
+        try:
+            version = subprocess.run(
+                [self.solana_cli, "--version"],
+                capture_output=True,
+                check=False,
+                text=True,
+                timeout=20,
+            )
+        except (OSError, subprocess.SubprocessError) as error:
+            raise EvalError(
+                f"the Solana CLI ({self.solana_cli}) is required for host cleanup "
+                f"but could not be run: {error}"
+            ) from error
+        if version.returncode != 0:
+            raise EvalError(
+                f"the Solana CLI ({self.solana_cli}) is required for host cleanup "
+                f"but failed: {version.stderr.strip()}"
+            )
+
+    def _rpc(self, method: str, params: list[Any]) -> Any:
+        body = json.dumps(
+            {"jsonrpc": "2.0", "id": 1, "method": method, "params": params},
+            separators=(",", ":"),
+        ).encode()
+        request = urllib.request.Request(
+            self.rpc_url,
+            data=body,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=RPC_TIMEOUT_SECONDS) as response:
+                payload = json.loads(response.read())
+        except (OSError, urllib.error.URLError, json.JSONDecodeError) as error:
+            raise EvalError(f"Solana {method} failed: {error}") from error
+        if "error" in payload:
+            raise EvalError(f"Solana {method} returned an error: {payload['error']}")
+        return payload.get("result")
+
+    def _balance(self, address: str) -> int:
+        result = self._rpc("getBalance", [address, {"commitment": "finalized"}])
+        if not isinstance(result, dict) or not isinstance(result.get("value"), int):
+            raise EvalError(f"could not read the finalized balance of {address}")
+        return result["value"]
+
+    def sweep_destination(self) -> str | None:
+        """Return the destination's lamports to the source.
+
+        This is what makes the eval economically reversible and therefore
+        repeatable: the transfer itself cannot be undone, but the destination
+        is host-controlled, so the lamports come back and only the fees are
+        actually spent. The container never sees this key.
+
+        Returns the sweep signature, or None when there was nothing to sweep.
+        """
+        balance = self._balance(self.destination)
+        if balance == 0:
+            return None
+        # `ALL` drains the account and lets the CLI compute the fee, which
+        # avoids leaving dust behind or over-spending on a hand-computed
+        # amount. The destination is a plain system account with no rent-exempt
+        # reserve to preserve, so draining it fully is correct.
+        command = [
+            self.solana_cli,
+            "transfer",
+            self.source_address,
+            "ALL",
+            "--from",
+            str(self.sweep_keypair),
+            "--fee-payer",
+            str(self.sweep_keypair),
+            "--keypair",
+            str(self.sweep_keypair),
+            "--url",
+            self.rpc_url,
+            "--commitment",
+            "finalized",
+            "--allow-unfunded-recipient",
+            "--output",
+            "json",
+        ]
+        try:
+            completed = subprocess.run(
+                command, capture_output=True, check=False, text=True, timeout=SWEEP_TIMEOUT_SECONDS
+            )
+        except (OSError, subprocess.SubprocessError) as error:
+            raise EvalError(f"host sweep failed to run: {error}") from error
+        if completed.returncode != 0:
+            raise EvalError(
+                "host sweep failed: " + (completed.stderr or completed.stdout).strip()
+            )
+        signature = None
+        try:
+            parsed = json.loads(completed.stdout)
+            if isinstance(parsed, dict):
+                signature = parsed.get("signature")
+        except json.JSONDecodeError:
+            signature = completed.stdout.strip() or None
+
+        # Confirm from the chain rather than trusting the CLI's exit code.
+        if not self.mount.poll_until(
+            lambda: self._balance(self.destination) == 0,
+            SWEEP_SETTLE_ATTEMPTS,
+            SWEEP_SETTLE_DELAY_SECONDS,
+        ):
+            raise EvalError(
+                f"host sweep did not drain {self.destination}; "
+                f"{self._balance(self.destination)} lamports remain"
+            )
+        return signature
 
     # ---- provision -----------------------------------------------------
 
@@ -640,20 +831,24 @@ class SolanaTransferEval(EvalDefinition):
             ):
                 failures.append(f"sent entry {sent_id} never reconciled to a receipt")
 
-        # 3. Sweep the destination back to the source. NOT YET IMPLEMENTED.
+        # 3. Sweep the destination back to the source.
         #
-        # The eval's whole claim to being repeatable is that the transfer is
-        # economically reversible: the destination is host-controlled, so
-        # cleanup returns the lamports and only the fee is spent. Until that
-        # sweep exists, a mainnet trial leaks its transfer amount on every run,
-        # so the mainnet lane fails closed here rather than reporting a clean
-        # cleanup it did not perform. The local lane is unaffected: those
-        # lamports are worthless.
-        if self.lane == "mainnet-canary" and sent:
+        # This is what makes the eval repeatable. The transfer cannot be undone,
+        # but the destination is host-controlled, so the lamports come back and
+        # only the fees are actually spent. It runs unconditionally rather than
+        # only when a `sent/` entry exists: a broadcast that the outbox failed
+        # to record still moved funds, and that is exactly the case where
+        # skipping the sweep would be worst.
+        if self.source_address and self.destination:
+            try:
+                signature = self.sweep_destination()
+                if signature is not None:
+                    self.sweep_signature = signature
+            except EvalError as error:
+                failures.append(f"host sweep: {error}")
+        else:
             failures.append(
-                "host sweep of the destination back to the source is not implemented; "
-                f"{self.lamports} lamports remain at {self.destination} and must be "
-                "returned manually before another trial"
+                "cannot sweep: the source or destination address is unknown"
             )
 
         if failures:
