@@ -132,6 +132,13 @@ impl SolanaClient {
         })
     }
 
+    /// The pinned cluster genesis hash, if one is configured. `None` means
+    /// nothing is pinned, so a genesis observation cannot be *verified* —
+    /// only reported.
+    pub fn configured_genesis(&self) -> Option<&str> {
+        self.inner.expected_genesis_hex.as_deref()
+    }
+
     /// Whether broadcasting is enabled for this cluster (the operator's
     /// release posture). The transaction engine refuses to submit without it.
     pub fn allow_broadcast(&self) -> bool {
