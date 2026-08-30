@@ -253,12 +253,16 @@ fn require_login_owned_private_file(path: &Path, effective_uid: u32) -> Result<(
 fn require_session_directory(path: &Path, uid: u32, gid: u32) -> Result<()> {
     let metadata =
         fs::symlink_metadata(path).with_context(|| format!("inspect {}", path.display()))?;
+    // Deliberately no link-count check. `nlink >= 2` treated the traditional
+    // `.`-plus-parent-entry count as evidence of a real directory, but btrfs
+    // reports `nlink == 1` for every directory, so this refused a perfectly
+    // safe session directory there while proving nothing extra elsewhere
+    // (mirrors the Broker's `verified_status_parent`).
     if !metadata.file_type().is_dir()
         || metadata.file_type().is_symlink()
         || metadata.uid() != uid
         || metadata.gid() != gid
         || metadata.mode() & 0o7777 != 0o710
-        || metadata.nlink() < 2
     {
         bail!("session socket directory has the wrong owner, group, mode, or type");
     }
