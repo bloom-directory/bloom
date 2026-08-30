@@ -2062,8 +2062,8 @@ async fn handle_operation(home: &HomeDir, command: OperationCmd) -> Result<Strin
     name = "bloom",
     disable_version_flag = true,
     arg_required_else_help = true,
-    about = "Bloom — an agentic Ethereum wallet as a virtual filesystem",
-    long_about = "Bloom mounts an agentic Ethereum wallet as a directory for agents. EXPERIMENTAL / UNAUDITED ALPHA: do not use with funds you cannot afford to lose, and review every generated transaction plan before signing. Read balances, contracts, ENS, prices, and status with cat/ls; stage wallet actions by writing intents into an outbox; confirm only after reviewing the generated plan. New agents should read https://bloom.directory/SKILL.md, then run bloom init and bloom serve --mount ~/bloom. Use bloom vfs only as a fallback when mounting is unavailable."
+    about = "Bloom — an agentic EVM and Solana wallet as a virtual filesystem",
+    long_about = "Bloom mounts an agentic EVM and Solana wallet as a directory for agents. EXPERIMENTAL / UNAUDITED ALPHA: do not use with funds you cannot afford to lose, and review every generated transaction plan before signing. Read balances, contracts, ENS, prices, and chain status with cat/ls, on EVM chains and on Solana; stage wallet actions by writing intents into an outbox; confirm only after reviewing the generated plan. New agents should read https://bloom.directory/SKILL.md, then run bloom init and bloom serve --mount ~/bloom. Use bloom vfs only as a fallback when mounting is unavailable."
 )]
 struct Cli {
     /// Show CLI, daemon, and negotiated IPC protocol versions.

@@ -6729,4 +6729,89 @@ mod tests {
             );
         }
     }
+
+    /// `accounts/` is unconditional for a configured Solana chain, so the
+    /// namespace does not change shape when the first child is allocated or
+    /// the last is retired. With none active it lists empty, while the
+    /// top-level aliases report that there is nothing to read.
+    #[tokio::test]
+    async fn accounts_dir_exists_with_zero_active_children() {
+        let f = make_handler();
+        let handler = solana_reads_handler(&f, spawn_solana_node().await, vec![]);
+        let w = &f.wallet_name;
+
+        let dir = VfsPath::parse(&format!("/{w}/chains/solana-devnet/accounts")).unwrap();
+        handler.lookup(&dir).await.expect("accounts/ must exist");
+        assert!(
+            handler.list(&dir).await.unwrap().is_empty(),
+            "no active children means an empty directory, not a missing one"
+        );
+
+        // The chain directory still advertises the whole read surface.
+        let chain = VfsPath::parse(&format!("/{w}/chains/solana-devnet")).unwrap();
+        let names: Vec<String> = handler
+            .list(&chain)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        for expected in ["balance", "balance.raw", "balance.json", "accounts"] {
+            assert!(names.contains(&expected.to_string()), "missing {expected}");
+        }
+
+        for leaf in ["balance", "balance.raw", "balance.json"] {
+            let p = VfsPath::parse(&format!("/{w}/chains/solana-devnet/{leaf}")).unwrap();
+            assert!(
+                matches!(handler.read(&p).await, Err(HandlerError::NotFound(_))),
+                "{leaf} should report no active Solana account"
+            );
+        }
+    }
+
+    /// An RPC outage must degrade only what genuinely needs the chain. The
+    /// projection-derived surface keeps working, which is what makes the
+    /// wallet inspectable while a cluster is unreachable.
+    #[tokio::test]
+    async fn rpc_outage_leaves_the_projection_surface_readable() {
+        let f = make_handler();
+        let handler = solana_reads_handler(&f, "http://127.0.0.1:1".into(), vec![[0xaa; 32]]);
+        let w = &f.wallet_name;
+        let fp = solana_projection([0xaa; 32])
+            .key_ref
+            .public_key_fingerprint
+            .as_str()
+            .to_ascii_lowercase();
+
+        // Listing, stat and address all resolve from the Broker projection.
+        handler
+            .list(&VfsPath::parse(&format!("/{w}/chains/solana-devnet/accounts")).unwrap())
+            .await
+            .unwrap();
+        let addr = handler
+            .read(
+                &VfsPath::parse(&format!("/{w}/chains/solana-devnet/accounts/{fp}/address"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(addr).unwrap().trim(),
+            bs58::encode([0xaa_u8; 32]).into_string()
+        );
+
+        // Only the balance read fails, and it fails as a backend error
+        // rather than pretending the account does not exist.
+        let err = handler
+            .read(
+                &VfsPath::parse(&format!("/{w}/chains/solana-devnet/accounts/{fp}/balance"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, HandlerError::Backend(_)),
+            "an unreachable cluster is a backend failure, got {err:?}"
+        );
+    }
 }

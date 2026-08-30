@@ -1941,6 +1941,119 @@ mod tests {
         }
     }
 
+    /// Models a chain directory whose listing and lookup disagree — the
+    /// shape of the `accounts.json` and Solana chain-directory defects.
+    /// `advertised` is returned by `list`; only `resolvable` is accepted by
+    /// `lookup`. Used to pin the failure mode the NFS layer actually shows a
+    /// user, and to prove the adapter neither masks nor invents entries.
+    struct DriftingHandler {
+        advertised: Vec<&'static str>,
+        resolvable: Vec<&'static str>,
+    }
+
+    #[async_trait]
+    impl Handler for DriftingHandler {
+        async fn lookup(&self, p: &VfsPath) -> Result<Entry, HandlerError> {
+            if p.is_root() {
+                return Ok(Entry::dir(""));
+            }
+            match p.first() {
+                Some(name) if self.resolvable.contains(&name) => Ok(Entry::file(name)),
+                Some(name) => Err(HandlerError::NotFound(name.to_string())),
+                None => Err(HandlerError::NotFound(p.to_string_path())),
+            }
+        }
+        async fn read(&self, p: &VfsPath) -> Result<Vec<u8>, HandlerError> {
+            match p.first() {
+                Some(name) if self.resolvable.contains(&name) => {
+                    Ok(format!("{name}\n").into_bytes())
+                }
+                _ => Err(HandlerError::NotFound(p.to_string_path())),
+            }
+        }
+        async fn list(&self, p: &VfsPath) -> Result<Vec<Entry>, HandlerError> {
+            if p.is_root() {
+                Ok(self.advertised.iter().map(|n| Entry::file(n)).collect())
+            } else {
+                Err(HandlerError::NotADir(p.to_string_path()))
+            }
+        }
+    }
+
+    /// Every name a directory advertises must resolve and read through the
+    /// mount. This is the NFS-layer half of the VFS contract: `readdir`
+    /// alone is not evidence a file is reachable, because NFS resolves each
+    /// name with a separate LOOKUP before any READ.
+    #[tokio::test]
+    async fn readdir_lookup_and_read_agree_through_the_mount() {
+        let names = vec!["address", "balance", "balance.json", "accounts.json"];
+        let vfs = Vfs::builder()
+            .mount(
+                "chain",
+                Arc::new(DriftingHandler {
+                    advertised: names.clone(),
+                    resolvable: names.clone(),
+                }),
+            )
+            .build();
+        let fs = BloomFs::new(vfs);
+        let ctx = fake_ctx();
+        let dir = fs.lookup(&ctx, &BloomHandle::Root, "chain").await.unwrap();
+
+        let page = fs.readdir(&ctx, &dir, 0, 100, true).await.unwrap();
+        let listed: Vec<String> = page.entries.iter().map(|e| e.name.to_string()).collect();
+        assert_eq!(listed, names);
+
+        for name in &listed {
+            let h = fs
+                .lookup(&ctx, &dir, name)
+                .await
+                .unwrap_or_else(|e| panic!("listed {name} failed LOOKUP through the mount: {e:?}"));
+            let r = fs.read(&ctx, &h, 0, 1024).await.unwrap();
+            assert_eq!(
+                String::from_utf8(r.data.to_vec()).unwrap(),
+                format!("{name}\n")
+            );
+        }
+    }
+
+    /// The regression this pins: a leaf present in `readdir` but missing
+    /// from `lookup` reaches the user as a file that `ls` shows and `stat`
+    /// rejects. The adapter must surface that faithfully rather than hiding
+    /// it, so a handler-level drift stays observable at the mount.
+    #[tokio::test]
+    async fn a_listed_but_unresolvable_leaf_fails_lookup_through_the_mount() {
+        let vfs = Vfs::builder()
+            .mount(
+                "chain",
+                Arc::new(DriftingHandler {
+                    advertised: vec!["address", "accounts.json"],
+                    // `accounts.json` is advertised but not resolvable.
+                    resolvable: vec!["address"],
+                }),
+            )
+            .build();
+        let fs = BloomFs::new(vfs);
+        let ctx = fake_ctx();
+        let dir = fs.lookup(&ctx, &BloomHandle::Root, "chain").await.unwrap();
+
+        let page = fs.readdir(&ctx, &dir, 0, 100, true).await.unwrap();
+        let listed: Vec<String> = page.entries.iter().map(|e| e.name.to_string()).collect();
+        assert!(
+            listed.iter().any(|n| n == "accounts.json"),
+            "readdir should still advertise it: {listed:?}"
+        );
+
+        fs.lookup(&ctx, &dir, "address")
+            .await
+            .expect("resolvable leaf must stat");
+        assert!(
+            fs.lookup(&ctx, &dir, "accounts.json").await.is_err(),
+            "an advertised-but-unresolvable leaf must fail LOOKUP, which is \
+             exactly how the defect reached users: visible to ls, ENOENT on cat"
+        );
+    }
+
     #[tokio::test]
     async fn lookup_then_read_yields_file_contents() {
         let vfs = Vfs::builder()
