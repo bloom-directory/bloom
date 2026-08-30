@@ -13,6 +13,16 @@
 //! - `status/chains/<chain>/rpc_url`             — first configured RPC URL (redacted)
 //! - `status/chains/<chain>/endpoints/`          — list of endpoint indices
 //! - `status/chains/<chain>/endpoints/<idx>/`    — leaves per endpoint health snapshot
+//!
+//! Solana chains appear in the same tree with chain-appropriate leaves —
+//! there is no `chain_id` and no single `block_number`, so publishing an
+//! EVM-shaped view of them would be a lie of convenience:
+//!
+//! - `status/chains/<solana-chain>/status.json`   — full chain status document
+//! - `status/chains/<solana-chain>/connected`     — RPC health
+//! - `status/chains/<solana-chain>/slot`          — current slot
+//! - `status/chains/<solana-chain>/block_height`  — current block height
+//! - `status/chains/<solana-chain>/endpoints/`    — redacted endpoint health
 //!   - `url` (redacted), `score`, `cooldown_until`, `latency_ms`,
 //!     `success_rate`, `last_block`
 //! - `status/audit/head`                         — hex of head record digest
@@ -298,6 +308,187 @@ impl StatusHandler {
         format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", y, mo, d, h, mi, se)
     }
 
+    /// A read-only Solana client for `name`, if one is configured.
+    fn solana_client(&self, name: &str) -> Option<bloom_solana::SolanaClient> {
+        self.solana_chains.as_ref().and_then(|c| c.get(name))
+    }
+
+    fn solana_chain_names(&self) -> Vec<String> {
+        self.solana_chains
+            .as_ref()
+            .map(|c| c.list_names())
+            .unwrap_or_default()
+    }
+
+    /// Every chain name status can serve, EVM and Solana together.
+    fn all_chain_names(&self) -> Vec<String> {
+        let mut names: std::collections::BTreeSet<String> =
+            self.chains.list_names().into_iter().collect();
+        names.extend(self.solana_chain_names());
+        names.into_iter().collect()
+    }
+
+    /// The leaves published under a Solana chain directory. Deliberately not
+    /// the EVM set: Solana has no `chain_id` and no single `block_number`,
+    /// and reporting an EVM-shaped view of it would be a lie of convenience.
+    const SOLANA_CHAIN_LEAVES: [&'static str; 4] =
+        ["status.json", "connected", "slot", "block_height"];
+
+    /// Endpoint leaves for a Solana endpoint. `url` is always redacted.
+    const SOLANA_ENDPOINT_LEAVES: [&'static str; 6] = [
+        "url",
+        "score",
+        "latency_ms",
+        "success_rate",
+        "last_block",
+        "cooldown_until",
+    ];
+
+    /// One endpoint's health, shaped for publication.
+    ///
+    /// `EndpointHealthSnapshot` is never serialised directly: its `url` may
+    /// carry credentials, and its `cooldown_until` is a `SystemTime` whose
+    /// default serialisation is a `secs`/`nanos_since_epoch` object rather
+    /// than a stable scalar.
+    fn solana_endpoint_dto(snap: &EndpointHealthSnapshot) -> serde_json::Value {
+        serde_json::json!({
+            "url": Self::redact_url(&snap.url),
+            "score": snap.score,
+            "latency_ms": snap.latency_ms,
+            "success_rate": snap.success_rate,
+            "last_block": snap.last_block,
+            "cooldown_until_unix_ms": snap.cooldown_until.map(|t| {
+                t.duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+            }),
+        })
+    }
+
+    /// Redact every URL-shaped span in an error string before publishing it.
+    ///
+    /// Transport errors quote the endpoint they failed against, which may
+    /// embed an API key. Matching against the *configured* URL is not enough:
+    /// reqwest reports a normalised form (userinfo stripped, default path
+    /// added) that does not string-match what was configured, so the secret
+    /// survives. Redacting any `http(s)://…` span catches it whatever shape
+    /// the reporter chose.
+    fn sanitize_error(error: &str) -> String {
+        let mut out = String::with_capacity(error.len());
+        let mut rest = error;
+        while let Some(start) = rest.find("http") {
+            let (head, tail) = rest.split_at(start);
+            out.push_str(head);
+            let end = tail
+                .find(|c: char| c.is_whitespace() || matches!(c, ')' | ',' | '"' | '\''))
+                .unwrap_or(tail.len());
+            let (candidate, remainder) = tail.split_at(end);
+            if candidate.starts_with("http://") || candidate.starts_with("https://") {
+                out.push_str(&Self::redact_url(candidate));
+            } else {
+                out.push_str(candidate);
+            }
+            rest = remainder;
+        }
+        out.push_str(rest);
+        out
+    }
+
+    /// Assemble `status/chains/<solana-chain>/status.json`.
+    ///
+    /// Every observation is attempted independently and a failure degrades
+    /// only its own field: a diagnostics document that disappears when one
+    /// call fails is useless exactly when it is needed. Failed fields render
+    /// `null` and record their reason under `errors`.
+    async fn solana_status_json(&self, name: &str) -> Result<serde_json::Value, HandlerError> {
+        let client = self
+            .solana_client(name)
+            .ok_or_else(|| HandlerError::not_found(name.to_owned()))?;
+        let mut errors = serde_json::Map::new();
+        let mut record = |field: &str, error: String| {
+            errors.insert(
+                field.to_string(),
+                serde_json::Value::String(Self::sanitize_error(&error)),
+            );
+        };
+
+        let rpc_healthy = match client.get_health().await {
+            Ok(()) => Some(true),
+            Err(e) => {
+                record("rpc_healthy", e.to_string());
+                Some(false)
+            }
+        };
+        let slot = match client.get_slot().await {
+            Ok(v) => Some(v),
+            Err(e) => {
+                record("slot", e.to_string());
+                None
+            }
+        };
+        let block_height = match client.get_block_height().await {
+            Ok(v) => Some(v),
+            Err(e) => {
+                record("block_height", e.to_string());
+                None
+            }
+        };
+        let observed = match client.get_genesis_hash().await {
+            Ok(v) => Some(v),
+            Err(e) => {
+                record("genesis.observed", e.to_string());
+                None
+            }
+        };
+
+        // `verify_genesis` checks *every* configured endpoint when a genesis
+        // is pinned. With none pinned nothing is verified, so the answer is
+        // `null` — not `true`, which would claim a check that never ran.
+        let configured = client.configured_genesis().map(str::to_owned);
+        let all_verified = if configured.is_some() {
+            match client.verify_genesis().await {
+                Ok(_) => Some(true),
+                Err(e) => {
+                    record("genesis.all_endpoints_verified", e.to_string());
+                    Some(false)
+                }
+            }
+        } else {
+            None
+        };
+
+        // Eligibility means an attempt is permitted — configuration allows
+        // broadcast and the live cluster identity checked out on every
+        // endpoint. It is never a prediction that a transaction will land.
+        let broadcast_enabled = client.allow_broadcast();
+        let broadcast_eligible = broadcast_enabled && all_verified == Some(true);
+
+        Ok(serde_json::json!({
+            "schema": "bloom.solana_chain_status.v1",
+            "chain": name,
+            "rpc_healthy": rpc_healthy,
+            "slot": slot,
+            "block_height": block_height,
+            "genesis": {
+                "configured": configured,
+                "observed": observed,
+                "all_endpoints_verified": all_verified,
+            },
+            "broadcast": {
+                "enabled": broadcast_enabled,
+                "eligible": broadcast_eligible,
+            },
+            "endpoints": client
+                .endpoints_snapshot()
+                .iter()
+                .map(Self::solana_endpoint_dto)
+                .collect::<Vec<_>>(),
+            "observed_at_ms": SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0),
+            "errors": errors,
+        }))
+    }
+
     async fn probe_chain(&self, name: &str) -> ChainProbeCache {
         if let Some(cached) = self.chain_cache.read().get(name).cloned()
             && cached.fetched.elapsed() < CHAIN_CACHE_TTL
@@ -581,6 +772,18 @@ impl StatusHandler {
             {
                 Ok(Entry::dir(s))
             }
+            [a, name] if a == "chains" && self.solana_client(name).is_some() => {
+                Ok(Entry::dir(name))
+            }
+            [a, name, leaf] if a == "chains" && self.solana_client(name).is_some() => {
+                if Self::SOLANA_CHAIN_LEAVES.contains(&leaf.as_str()) {
+                    Ok(Entry::file(leaf))
+                } else if leaf == "endpoints" {
+                    Ok(Entry::dir(leaf))
+                } else {
+                    Err(HandlerError::not_found(path.to_string_path()))
+                }
+            }
             [a, name] if a == "chains" => {
                 if self.chains.get(name).is_none() {
                     return Err(HandlerError::not_found(name.clone()));
@@ -601,6 +804,32 @@ impl StatusHandler {
                 } else {
                     Err(HandlerError::not_found(path.to_string_path()))
                 }
+            }
+            [a, name, eps, idx]
+                if a == "chains" && eps == "endpoints" && self.solana_client(name).is_some() =>
+            {
+                let client = self.solana_client(name).expect("checked");
+                let i: usize = idx
+                    .parse()
+                    .map_err(|_| HandlerError::not_found(path.to_string_path()))?;
+                if i >= client.endpoints_snapshot().len() {
+                    return Err(HandlerError::not_found(path.to_string_path()));
+                }
+                Ok(Entry::dir(idx))
+            }
+            [a, name, eps, idx, leaf]
+                if a == "chains" && eps == "endpoints" && self.solana_client(name).is_some() =>
+            {
+                let client = self.solana_client(name).expect("checked");
+                let i: usize = idx
+                    .parse()
+                    .map_err(|_| HandlerError::not_found(path.to_string_path()))?;
+                if i >= client.endpoints_snapshot().len()
+                    || !Self::SOLANA_ENDPOINT_LEAVES.contains(&leaf.as_str())
+                {
+                    return Err(HandlerError::not_found(path.to_string_path()));
+                }
+                Ok(Entry::file(leaf))
             }
             [a, name, eps, idx] if a == "chains" && eps == "endpoints" => {
                 let client = self
@@ -714,9 +943,33 @@ impl StatusHandler {
                     started_unix_ms: self.started_unix_ms(),
                     started_at: self.started_at_rfc3339(),
                     uptime_secs: self.uptime_secs(),
-                    chains: self.chains.list_names(),
+                    chains: self.all_chain_names(),
                 };
                 Ok(serde_json::to_vec_pretty(&info).unwrap())
+            }
+            [a, name, leaf] if a == "chains" && self.solana_client(name).is_some() => {
+                let status = self.solana_status_json(name).await?;
+                match leaf.as_str() {
+                    "status.json" => {
+                        let mut v = serde_json::to_vec_pretty(&status)
+                            .map_err(|e| HandlerError::backend(e.to_string()))?;
+                        v.push(b'\n');
+                        Ok(v)
+                    }
+                    // Scalars come from the same assembled document, so a
+                    // leaf can never disagree with `status.json`. A field
+                    // that failed to observe renders empty rather than 0.
+                    "connected" => Ok(format!(
+                        "{}\n",
+                        status["rpc_healthy"].as_bool().unwrap_or(false)
+                    )
+                    .into_bytes()),
+                    "slot" | "block_height" => match status[leaf.as_str()].as_u64() {
+                        Some(v) => Ok(format!("{v}\n").into_bytes()),
+                        None => Ok(b"\n".to_vec()),
+                    },
+                    _ => Err(HandlerError::not_found(path.to_string_path())),
+                }
             }
             [a, name, leaf] if a == "chains" => {
                 let client = self
@@ -744,6 +997,29 @@ impl StatusHandler {
                         }
                     }
                     _ => Err(HandlerError::not_found(path.to_string_path())),
+                }
+            }
+            [a, name, eps, idx, leaf]
+                if a == "chains" && eps == "endpoints" && self.solana_client(name).is_some() =>
+            {
+                let client = self.solana_client(name).expect("checked");
+                let i: usize = idx
+                    .parse()
+                    .map_err(|_| HandlerError::not_found(path.to_string_path()))?;
+                let snaps = client.endpoints_snapshot();
+                let snap = snaps
+                    .get(i)
+                    .ok_or_else(|| HandlerError::not_found(path.to_string_path()))?;
+                let dto = Self::solana_endpoint_dto(snap);
+                let key = if leaf == "cooldown_until" {
+                    "cooldown_until_unix_ms"
+                } else {
+                    leaf.as_str()
+                };
+                match dto.get(key) {
+                    Some(serde_json::Value::Null) | None => Ok(b"\n".to_vec()),
+                    Some(serde_json::Value::String(v)) => Ok(format!("{v}\n").into_bytes()),
+                    Some(v) => Ok(format!("{v}\n").into_bytes()),
                 }
             }
             [a, name, eps, idx, leaf] if a == "chains" && eps == "endpoints" => {
@@ -965,11 +1241,40 @@ impl StatusHandler {
             })
             .collect()),
             [a] if a == "chains" => Ok(self
-                .chains
-                .list_names()
+                .all_chain_names()
                 .into_iter()
                 .map(|n| Entry::dir(&n))
                 .collect()),
+            [a, name] if a == "chains" && self.solana_client(name).is_some() => {
+                Ok(Self::SOLANA_CHAIN_LEAVES
+                    .iter()
+                    .map(|l| Entry::file(l))
+                    .chain(std::iter::once(Entry::dir("endpoints")))
+                    .collect())
+            }
+            [a, name, eps]
+                if a == "chains" && eps == "endpoints" && self.solana_client(name).is_some() =>
+            {
+                let client = self.solana_client(name).expect("checked");
+                Ok((0..client.endpoints_snapshot().len())
+                    .map(|i| Entry::dir(&i.to_string()))
+                    .collect())
+            }
+            [a, name, eps, idx]
+                if a == "chains" && eps == "endpoints" && self.solana_client(name).is_some() =>
+            {
+                let client = self.solana_client(name).expect("checked");
+                let i: usize = idx
+                    .parse()
+                    .map_err(|_| HandlerError::not_found(path.to_string_path()))?;
+                if i >= client.endpoints_snapshot().len() {
+                    return Err(HandlerError::not_found(path.to_string_path()));
+                }
+                Ok(Self::SOLANA_ENDPOINT_LEAVES
+                    .iter()
+                    .map(|l| Entry::file(l))
+                    .collect())
+            }
             [a, name] if a == "chains" => {
                 if self.chains.get(name).is_none() {
                     return Err(HandlerError::not_found(name.clone()));
@@ -1927,5 +2232,167 @@ mod tests {
         let mut names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
         names.sort();
         assert_eq!(names, vec!["flashbots", "mev_blocker"]);
+    }
+
+    fn solana_status_handler(
+        home: &std::path::Path,
+        url: String,
+        pin: Option<&str>,
+    ) -> StatusHandler {
+        let registry = bloom_solana::SolanaChainRegistry::new();
+        registry.add(
+            bloom_solana::SolanaClient::build(&bloom_solana::SolanaSpec {
+                name: "solana-devnet".into(),
+                endpoints: vec![bloom_solana::EndpointSpec {
+                    url,
+                    weight: 100,
+                    cu_per_sec: None,
+                    max_rps: None,
+                    http_only: false,
+                }],
+                expected_genesis_hex: pin.map(str::to_owned),
+                allow_broadcast: pin.is_some(),
+            })
+            .unwrap(),
+        );
+        make_handler(home).with_solana_chains(registry)
+    }
+
+    /// A diagnostics document that vanishes when one call fails is useless
+    /// exactly when it is needed, so each observation degrades only itself.
+    /// Here every RPC fails (closed port): the read still succeeds, the
+    /// failed fields are null, and each records a reason.
+    #[tokio::test]
+    async fn solana_status_degrades_field_by_field() {
+        let tmp = tempfile::tempdir().unwrap();
+        let h = solana_status_handler(tmp.path(), "http://127.0.0.1:1".into(), Some("pinned-abc"));
+
+        let body = h
+            .read(&VfsPath::parse("/chains/solana-devnet/status.json").unwrap())
+            .await
+            .expect("status.json must still render when the chain is unreachable");
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(v["schema"], "bloom.solana_chain_status.v1");
+        assert_eq!(v["chain"], "solana-devnet");
+        assert_eq!(v["rpc_healthy"], false);
+        assert!(v["slot"].is_null(), "unobservable slot must be null");
+        assert!(v["block_height"].is_null());
+        assert!(v["genesis"]["observed"].is_null());
+        for field in ["slot", "block_height", "genesis.observed"] {
+            assert!(
+                v["errors"].get(field).is_some(),
+                "expected an error entry for {field}, got {}",
+                v["errors"]
+            );
+        }
+
+        // Pinned but unverifiable: broadcast is configured, not eligible.
+        assert_eq!(v["genesis"]["configured"], "pinned-abc");
+        assert_eq!(v["genesis"]["all_endpoints_verified"], false);
+        assert_eq!(v["broadcast"]["enabled"], true);
+        assert_eq!(
+            v["broadcast"]["eligible"], false,
+            "eligibility requires live all-endpoint genesis verification"
+        );
+
+        // Scalar leaves are projections of the same document, so they can
+        // never disagree with it; unobservable ones render empty.
+        let connected = h
+            .read(&VfsPath::parse("/chains/solana-devnet/connected").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(String::from_utf8(connected).unwrap(), "false\n");
+        let slot = h
+            .read(&VfsPath::parse("/chains/solana-devnet/slot").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(String::from_utf8(slot).unwrap(), "\n");
+    }
+
+    /// With no genesis pinned nothing is verified, so the answer is `null` —
+    /// reporting `true` would claim a check that never ran.
+    #[tokio::test]
+    async fn unpinned_genesis_reports_null_not_verified() {
+        let tmp = tempfile::tempdir().unwrap();
+        let h = solana_status_handler(tmp.path(), "http://127.0.0.1:1".into(), None);
+        let body = h
+            .read(&VfsPath::parse("/chains/solana-devnet/status.json").unwrap())
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(v["genesis"]["configured"].is_null());
+        assert!(
+            v["genesis"]["all_endpoints_verified"].is_null(),
+            "unpinned genesis must be null, not true"
+        );
+        assert_eq!(v["broadcast"]["enabled"], false);
+        assert_eq!(v["broadcast"]["eligible"], false);
+    }
+
+    /// Endpoint URLs may carry credentials, so nothing published may quote
+    /// one verbatim — neither the endpoint DTO nor a transport error that
+    /// embedded it.
+    #[tokio::test]
+    async fn endpoint_credentials_are_never_published() {
+        let tmp = tempfile::tempdir().unwrap();
+        let secret = "http://user:hunter2@127.0.0.1:1/?apikey=s3cr3t";
+        let h = solana_status_handler(tmp.path(), secret.into(), Some("pinned-abc"));
+
+        let body = h
+            .read(&VfsPath::parse("/chains/solana-devnet/status.json").unwrap())
+            .await
+            .unwrap();
+        let rendered = String::from_utf8(body).unwrap();
+        for leaked in ["hunter2", "s3cr3t"] {
+            assert!(
+                !rendered.contains(leaked),
+                "status.json leaked {leaked}: {rendered}"
+            );
+        }
+
+        let url = h
+            .read(&VfsPath::parse("/chains/solana-devnet/endpoints/0/url").unwrap())
+            .await
+            .unwrap();
+        let url = String::from_utf8(url).unwrap();
+        assert!(!url.contains("hunter2") && !url.contains("s3cr3t"), "{url}");
+    }
+
+    /// Solana chains appear in the global chain tree beside EVM ones, and
+    /// their leaves are Solana-shaped rather than an EVM view of them.
+    #[tokio::test]
+    async fn solana_chains_join_the_global_chain_tree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let h = solana_status_handler(tmp.path(), "http://127.0.0.1:1".into(), None);
+
+        let chains = h.list(&VfsPath::parse("/chains").unwrap()).await.unwrap();
+        assert!(chains.iter().any(|e| e.name == "solana-devnet"));
+
+        let entries = h
+            .list(&VfsPath::parse("/chains/solana-devnet").unwrap())
+            .await
+            .unwrap();
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        for expected in [
+            "status.json",
+            "connected",
+            "slot",
+            "block_height",
+            "endpoints",
+        ] {
+            assert!(names.contains(&expected), "missing {expected} in {names:?}");
+        }
+        assert!(
+            !names.contains(&"chain_id") && !names.contains(&"block_number"),
+            "Solana must not publish EVM-shaped leaves: {names:?}"
+        );
+
+        // list -> lookup agreement, the contract that bit twice already.
+        for name in &names {
+            h.lookup(&VfsPath::parse(&format!("/chains/solana-devnet/{name}")).unwrap())
+                .await
+                .unwrap_or_else(|e| panic!("listed {name} does not resolve: {e:?}"));
+        }
     }
 }
