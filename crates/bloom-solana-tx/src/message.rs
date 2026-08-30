@@ -77,13 +77,9 @@ pub fn assemble_transaction(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // Frozen golden vectors, mirrored from the Broker-side verifier crate
-    // (`bloom-broker/crates/bloom-solana/src/golden.rs`) — the shared contract.
-    const FEE_PAYER: &str = "FAe4sisG95oZ42w7buUn5qEE4TAnfTTFPiguZUHmhiF";
-    const DESTINATION: &str = "CZ8YUVdk7znjrUmnb5n7kgySk9yRAsQDYmyCxzfSky9t";
-    const MESSAGE_HEX: &str = "0100010303a107bff3ce10be1d70dd18e74bc09967e4d6309ba50d5f1ddc8664125531b8abababababababababababababababababababababababababababababababab0000000000000000000000000000000000000000000000000000000000000000424242424242424242424242424242424242424242424242424242424242424201020200010c0200000000ca9a3b00000000";
-    const SIGNATURE_HEX: &str = "cb7ccec4699662f08de156e8322e71e00abcf88506055ecdd849e5749f15b8590a65883e433069bad539fc8206781f4d9ec56c2bbd15c061cbf5570ce9ebbf0e";
+    use bloom_broker_api::solana_vectors::{
+        BLOCKHASH_HEX, DESTINATION, FEE_PAYER, LAMPORTS, MESSAGE_HEX, SIGNATURE_HEX,
+    };
 
     fn base58_to_bytes(s: &str) -> [u8; 32] {
         bs58::decode(s).into_vec().unwrap().try_into().unwrap()
@@ -95,7 +91,7 @@ mod tests {
         base58_to_bytes(DESTINATION)
     }
     fn blockhash() -> [u8; 32] {
-        [0x42; 32]
+        hex::decode(BLOCKHASH_HEX).unwrap().try_into().unwrap()
     }
     fn message_bytes() -> Vec<u8> {
         hex::decode(MESSAGE_HEX).unwrap()
@@ -107,8 +103,7 @@ mod tests {
     #[test]
     fn reproduces_golden_message_bytes() {
         let bytes =
-            build_transfer_message(&fee_payer(), &destination(), 1_000_000_000, &blockhash())
-                .unwrap();
+            build_transfer_message(&fee_payer(), &destination(), LAMPORTS, &blockhash()).unwrap();
         assert_eq!(hex::encode(&bytes), MESSAGE_HEX);
         assert_eq!(bytes.len(), 150);
     }
