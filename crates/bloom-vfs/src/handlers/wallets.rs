@@ -1903,18 +1903,100 @@ fn solana_state(s: &str) -> Option<bloom_solana_tx::outbox::SolanaOutboxState> {
     bloom_solana_tx::outbox::SolanaOutboxState::parse(s)
 }
 
+/// The public read-only artifacts a Solana outbox entry may expose.
+///
+/// Single source of truth for both the visibility check and the directory
+/// listing: a name present in one but not the other is exactly the
+/// listing/lookup drift this consolidates away. State-dependent controls
+/// (`confirm`, `cancel`, `restage`) are deliberately not here.
+const PUBLIC_SOLANA_OUTBOX_ARTIFACTS: &[&str] = &[
+    "intent.json",
+    "plan.md",
+    "simulation.json",
+    "receipt.json",
+    "broadcast_attempted.json",
+    "approval_challenge.json",
+    "restage_advice.json",
+    "restage.md",
+];
+
+/// A Solana child account as projected by the Broker.
+///
+/// Constructed from `DerivedAccountPublic` alone — no chain access — so
+/// listing and `stat` never fan out RPC calls.
+#[derive(Clone, Debug)]
+struct SolanaAccount {
+    /// Raw Ed25519 public key: the fee payer / transfer source.
+    pubkey: [u8; 32],
+    /// Base58 account address.
+    address: String,
+    /// Full canonical lowercase hex fingerprint — the `accounts/` path name.
+    fingerprint: String,
+    /// BIP-44/SLIP-10 derivation path this child was allocated at.
+    derivation_path: String,
+    key_ref: bloom_broker_api::KeyRef,
+}
+
+/// The child's canonical BIP-39 Solana derivation path, from its `KeyRef`.
+///
+/// Deliberately read from the `KeyRef` rather than the projection's `path`
+/// string: the `KeyRef` is what staging pins, so sourcing both from one place
+/// keeps a balance read and a transfer bound to the same account identity.
+fn derivation_path(key_ref: &bloom_broker_api::KeyRef) -> Result<String, HandlerError> {
+    match key_ref.derivation.as_ref() {
+        Some(bloom_broker_api::DerivationRef::Bip39Multicurve {
+            profile: bloom_broker_api::DerivationProfile::Bip44SolanaSlip10Ed25519V1,
+            path,
+            ..
+        }) => Ok(path.clone()),
+        _ => Err(HandlerError::backend(
+            "Solana child must carry its canonical BIP-39 derivation path",
+        )),
+    }
+}
+
+impl SolanaAccount {
+    /// Canonical Ed25519 SPKI DER prefix. A Solana child's
+    /// `canonical_public_key` is this followed by the raw 32-byte key.
+    const ED25519_SPKI_PREFIX: [u8; 12] = [
+        0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
+    ];
+
+    fn from_projection(
+        account: &bloom_broker_api::DerivedAccountPublic,
+    ) -> Result<Self, HandlerError> {
+        if account.key_ref.key_spec != bloom_broker_api::KeySpec::Ed25519
+            || account.public_key_encoding != bloom_broker_api::PublicKeyEncoding::Ed25519SpkiDer
+        {
+            return Err(HandlerError::backend(
+                "Solana child must use canonical Ed25519 SPKI DER",
+            ));
+        }
+        let spki = account.canonical_public_key.decode();
+        if spki.len() != 44 || spki[..Self::ED25519_SPKI_PREFIX.len()] != Self::ED25519_SPKI_PREFIX
+        {
+            return Err(HandlerError::backend(
+                "Solana child public key is not canonical Ed25519 SPKI DER",
+            ));
+        }
+        let mut pubkey = [0_u8; 32];
+        pubkey.copy_from_slice(&spki[Self::ED25519_SPKI_PREFIX.len()..]);
+        Ok(Self {
+            address: bs58::encode(pubkey).into_string(),
+            pubkey,
+            fingerprint: account
+                .key_ref
+                .public_key_fingerprint
+                .as_str()
+                .to_ascii_lowercase(),
+            derivation_path: derivation_path(&account.key_ref)?,
+            key_ref: account.key_ref.clone(),
+        })
+    }
+}
+
 fn is_public_solana_outbox_artifact(name: &str) -> bool {
-    matches!(
-        name,
-        "intent.json"
-            | "plan.md"
-            | "simulation.json"
-            | "receipt.json"
-            | "broadcast_attempted.json"
-            | "approval_challenge.json"
-            | "restage_advice.json"
-            | "restage.md"
-    )
+    PUBLIC_SOLANA_OUTBOX_ARTIFACTS.contains(&name)
 }
 
 fn solana_outbox_err(e: bloom_solana_tx::outbox::OutboxError) -> HandlerError {
@@ -3068,19 +3150,48 @@ impl WalletsHandler {
         }
     }
 
+    /// One resolved Solana child, derived entirely from the Broker's
+    /// `wallet.accounts` projection. Every field here is projection-derived,
+    /// so building it costs no chain calls.
+    ///
+    /// `fingerprint` is the full canonical lowercase hex fingerprint — the
+    /// durable path identity under `accounts/`. Prefixes are accepted as
+    /// *input* convenience by `new.tx`, never used as a path.
+    async fn solana_accounts(&self, wallet: &str) -> Result<Vec<SolanaAccount>, HandlerError> {
+        let broker = self.broker.as_ref().ok_or_else(|| {
+            HandlerError::backend("Broker edge is unavailable for Solana accounts")
+        })?;
+        let accounts = broker
+            .wallet_accounts(
+                bloom_broker_api::Token::new(wallet.to_owned())
+                    .map_err(|error| HandlerError::invalid(error.to_string()))?,
+            )
+            .await
+            .map_err(|error| HandlerError::backend(error.to_string()))?;
+        bloom_solana_tx::account::active_accounts(
+            &accounts.accounts,
+            bloom_broker_api::DerivationProfile::Bip44SolanaSlip10Ed25519V1,
+        )
+        .into_iter()
+        .map(SolanaAccount::from_projection)
+        .collect()
+    }
+
     /// Resolve the exact active Solana derived child to transact with, from
-    /// the Broker's `wallet.accounts` projection: its Ed25519 public key (the
-    /// fee payer / transfer source) and the `KeyRef` that names it.
+    /// the Broker's `wallet.accounts` projection.
     ///
     /// `selector` is a public-key fingerprint, or a unique prefix of one. It
     /// is required whenever the wallet has more than one active Solana child:
     /// projection order is not a selection criterion, and silently taking the
     /// first would spend from an account the user never named.
+    ///
+    /// Staging and balance reads both resolve through here, so a balance is
+    /// always read from the same child a transfer would spend from.
     async fn resolve_solana_child(
         &self,
         wallet: &str,
         selector: Option<&str>,
-    ) -> Result<([u8; 32], bloom_broker_api::KeyRef), HandlerError> {
+    ) -> Result<SolanaAccount, HandlerError> {
         let broker = self.broker.as_ref().ok_or_else(|| {
             HandlerError::backend("Broker edge is unavailable for Solana transfers")
         })?;
@@ -3104,25 +3215,7 @@ impl WalletsHandler {
                 other => HandlerError::invalid(other.to_string()),
             },
         )?;
-        if account.key_ref.key_spec != bloom_broker_api::KeySpec::Ed25519
-            || account.public_key_encoding != bloom_broker_api::PublicKeyEncoding::Ed25519SpkiDer
-        {
-            return Err(HandlerError::backend(
-                "Solana child must use canonical Ed25519 SPKI DER",
-            ));
-        }
-        const ED25519_SPKI_PREFIX: [u8; 12] = [
-            0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
-        ];
-        let spki = account.canonical_public_key.decode();
-        if spki.len() != 44 || spki[..ED25519_SPKI_PREFIX.len()] != ED25519_SPKI_PREFIX {
-            return Err(HandlerError::backend(
-                "Solana child public key is not canonical Ed25519 SPKI DER",
-            ));
-        }
-        let mut raw = [0_u8; 32];
-        raw.copy_from_slice(&spki[ED25519_SPKI_PREFIX.len()..]);
-        Ok((raw, account.key_ref.clone()))
+        SolanaAccount::from_projection(account)
     }
 
     async fn write_solana_outbox(
@@ -3140,30 +3233,18 @@ impl WalletsHandler {
                 let intent: bloom_solana_tx::SolanaTransferIntent = serde_json::from_slice(data)
                     .map_err(|e| HandlerError::invalid(format!("invalid Solana intent: {e}")))?;
                 let destination = intent.destination_bytes().map_err(HandlerError::invalid)?;
-                let (child, key_ref) = self
+                let child = self
                     .resolve_solana_child(wallet, intent.account_fingerprint.as_deref())
                     .await?;
-                let derivation_path = match key_ref.derivation.as_ref() {
-                    Some(bloom_broker_api::DerivationRef::Bip39Multicurve {
-                        profile: bloom_broker_api::DerivationProfile::Bip44SolanaSlip10Ed25519V1,
-                        path,
-                        ..
-                    }) => path.clone(),
-                    _ => {
-                        return Err(HandlerError::backend(
-                            "Solana child must carry its canonical BIP-39 derivation path",
-                        ));
-                    }
-                };
                 let staged = engine
                     .stage(
                         wallet,
-                        &child,
+                        &child.pubkey,
                         // Pin the full fingerprint, never the user's prefix:
                         // a prefix could later resolve to a different child.
                         bloom_solana_tx::engine::SolanaAccountPin {
-                            fingerprint: Some(key_ref.public_key_fingerprint.as_str().to_owned()),
-                            derivation_path: Some(derivation_path),
+                            fingerprint: Some(child.fingerprint.clone()),
+                            derivation_path: Some(child.derivation_path.clone()),
                         },
                         &destination,
                         intent.lamports,
@@ -3200,7 +3281,7 @@ impl WalletsHandler {
                 // Re-select the exact account this transfer was staged
                 // against. Resolving the wallet's children again would let a
                 // second active child sign a message staged for the first.
-                let (child, key_ref) = self
+                let child = self
                     .resolve_solana_child(wallet, entry.staged.account_fingerprint.as_deref())
                     .await?;
                 let approval_id = std::fs::read(
@@ -3229,7 +3310,14 @@ impl WalletsHandler {
                         })
                 });
                 match engine
-                    .sign(wallet, id, &child, Some(key_ref), approval_id, now)
+                    .sign(
+                        wallet,
+                        id,
+                        &child.pubkey,
+                        Some(child.key_ref.clone()),
+                        approval_id,
+                        now,
+                    )
                     .await
                     .map_err(|e| HandlerError::backend(e.to_string()))?
                 {
@@ -3315,11 +3403,11 @@ impl WalletsHandler {
                     .outbox()
                     .read_restageable(wallet, chain, id)
                     .map_err(solana_outbox_err)?;
-                let (child, _) = self
+                let child = self
                     .resolve_solana_child(wallet, expired.staged.account_fingerprint.as_deref())
                     .await?;
                 let replacement = engine
-                    .restage_expired(wallet, id, &child, now_ms_u128())
+                    .restage_expired(wallet, id, &child.pubkey, now_ms_u128())
                     .await
                     .map_err(|error| HandlerError::invalid(error.to_string()))?;
                 tracing::info!(
