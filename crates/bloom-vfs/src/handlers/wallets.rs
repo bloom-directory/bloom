@@ -154,6 +154,11 @@ pub struct WalletsHandler {
     solana: Option<
         Arc<std::collections::BTreeMap<String, Arc<bloom_solana_tx::engine::SolanaTransferEngine>>>,
     >,
+    /// Read-only Solana clients keyed by chain name. Deliberately separate
+    /// from `solana`: balances and chain reads need only a working RPC
+    /// client, while staging needs the whole signing seam. A chain present
+    /// here but absent from `solana` is readable but cannot stage.
+    solana_reads: Option<bloom_solana::SolanaChainRegistry>,
 }
 
 impl WalletsHandler {
@@ -174,6 +179,7 @@ impl WalletsHandler {
             wallet_projections: Some(wallet_projections),
             policy_projection_root: policy_projection_root.into(),
             solana: None,
+            solana_reads: None,
         }
     }
 
@@ -189,6 +195,38 @@ impl WalletsHandler {
     ) -> Self {
         self.solana = Some(Arc::new(engines));
         self
+    }
+
+    /// Attach the read-only Solana client registry. Independent of
+    /// [`Self::with_solana`]: chain listing and balance reads resolve
+    /// through this, so they keep working when no transfer engine could be
+    /// built (no Broker edge, or no provenance catalog).
+    pub fn with_solana_reads(mut self, chains: bloom_solana::SolanaChainRegistry) -> Self {
+        self.solana_reads = Some(chains);
+        self
+    }
+
+    /// A read-only client for `chain`, if one is configured.
+    fn solana_client(&self, chain: &str) -> Option<bloom_solana::SolanaClient> {
+        self.solana_reads
+            .as_ref()
+            .and_then(|chains| chains.get(chain))
+    }
+
+    /// Whether `chain` is a Solana chain at all — readable, stageable, or
+    /// both. Dispatch keys off this rather than the engine map so a
+    /// reads-only chain still routes to the Solana handlers instead of
+    /// falling through to the EVM path and reporting an unknown chain.
+    fn is_solana_chain(&self, chain: &str) -> bool {
+        self.solana_client(chain).is_some() || self.solana_engine(chain).is_some()
+    }
+
+    /// Every Solana chain name this handler can serve reads for.
+    fn solana_chain_names(&self) -> Vec<String> {
+        self.solana_reads
+            .as_ref()
+            .map(|chains| chains.list_names())
+            .unwrap_or_default()
     }
 
     fn solana_engine(
@@ -2522,6 +2560,15 @@ impl WalletsHandler {
                     .write_solana_outbox(wallet, &segs[2], &segs[4..], data, &engine)
                     .await;
             }
+            // A Solana chain with no engine is readable but cannot stage.
+            // Say so, rather than falling through to the EVM outbox — that
+            // would hand a Solana path to a backend that cannot serve it.
+            if self.is_solana_chain(&segs[2]) {
+                return Err(HandlerError::not_found(format!(
+                    "chain '{}' is configured for reads only; staging is unavailable",
+                    segs[2]
+                )));
+            }
             return self.write_outbox(wallet, &segs[2], &segs[4..], data).await;
         }
         if segs.len() == 2 && segs[1] == "policy.json" {
@@ -2617,6 +2664,7 @@ impl WalletsHandler {
                 // and keeps a stable sorted order.
                 let mut names: std::collections::BTreeSet<String> =
                     self.chains.list_names().into_iter().collect();
+                names.extend(self.solana_chain_names());
                 if let Some(solana) = &self.solana {
                     names.extend(solana.keys().cloned());
                 }
@@ -2695,8 +2743,10 @@ impl WalletsHandler {
         chain: &str,
         rest: &[String],
     ) -> Result<Entry, HandlerError> {
-        if let Some(engine) = self.solana_engine(chain) {
-            return self.lookup_solana_chain(wallet, chain, rest, &engine).await;
+        if self.is_solana_chain(chain) {
+            return self
+                .lookup_solana_chain(wallet, chain, rest, self.solana_engine(chain))
+                .await;
         }
         let _client = self
             .chains
@@ -2721,8 +2771,19 @@ impl WalletsHandler {
         wallet: &str,
         chain: &str,
         rest: &[String],
-        engine: &Arc<bloom_solana_tx::engine::SolanaTransferEngine>,
+        engine: Option<Arc<bloom_solana_tx::engine::SolanaTransferEngine>>,
     ) -> Result<Entry, HandlerError> {
+        if rest.is_empty() {
+            return Ok(Entry::dir(chain));
+        }
+        // The chain directory itself resolves for any configured Solana
+        // chain. Everything below is outbox routing, which needs a transfer
+        // engine — a read-only chain has none.
+        let engine = engine.ok_or_else(|| {
+            HandlerError::not_found(format!(
+                "chain '{chain}' is configured for reads only; staging is unavailable"
+            ))
+        })?;
         match rest {
             [] => Ok(Entry::dir(chain)),
             [s] if s == "outbox" => Ok(Entry::dir("outbox")),
@@ -2886,8 +2947,10 @@ impl WalletsHandler {
         chain: &str,
         rest: &[String],
     ) -> Result<Vec<u8>, HandlerError> {
-        if let Some(engine) = self.solana_engine(chain) {
-            return self.read_solana_chain(wallet, chain, rest, &engine).await;
+        if self.is_solana_chain(chain) {
+            return self
+                .read_solana_chain(wallet, chain, rest, self.solana_engine(chain))
+                .await;
         }
         // Read-only chain leaves (balance/nonce): never gated on policy sig.
         let address: alloy::primitives::Address = self
@@ -3049,8 +3112,17 @@ impl WalletsHandler {
         wallet: &str,
         chain: &str,
         rest: &[String],
-        engine: &Arc<bloom_solana_tx::engine::SolanaTransferEngine>,
+        engine: Option<Arc<bloom_solana_tx::engine::SolanaTransferEngine>>,
     ) -> Result<Vec<u8>, HandlerError> {
+        // The chain directory itself resolves for any configured Solana
+        // chain. Everything below is outbox routing, which needs a transfer
+        // engine — a read-only chain has none.
+        let engine = engine.ok_or_else(|| {
+            HandlerError::not_found(format!(
+                "chain '{chain}' is configured for reads only; staging is unavailable"
+            ))
+        })?;
+
         // IPC reads bypass lookup, so Solana must enforce the same wallet
         // projection availability gate as the EVM read path.
         let _projection = self.wallet_projection(wallet).await?;
@@ -3079,8 +3151,25 @@ impl WalletsHandler {
         wallet: &str,
         chain: &str,
         rest: &[String],
-        engine: &Arc<bloom_solana_tx::engine::SolanaTransferEngine>,
+        engine: Option<Arc<bloom_solana_tx::engine::SolanaTransferEngine>>,
     ) -> Result<Vec<Entry>, HandlerError> {
+        if rest.is_empty() {
+            // `outbox/` is advertised only when this chain can actually
+            // stage; a reads-only chain lists no writable surface.
+            let mut entries = Vec::new();
+            if engine.is_some() {
+                entries.push(Entry::dir("outbox"));
+            }
+            return Ok(entries);
+        }
+        // The chain directory itself resolves for any configured Solana
+        // chain. Everything below is outbox routing, which needs a transfer
+        // engine — a read-only chain has none.
+        let engine = engine.ok_or_else(|| {
+            HandlerError::not_found(format!(
+                "chain '{chain}' is configured for reads only; staging is unavailable"
+            ))
+        })?;
         match rest {
             [] => Ok(vec![Entry::dir("outbox")]),
             [s] if s == "outbox" => {
@@ -3415,8 +3504,10 @@ impl WalletsHandler {
         chain: &str,
         rest: &[String],
     ) -> Result<Vec<Entry>, HandlerError> {
-        if let Some(engine) = self.solana_engine(chain) {
-            return self.list_solana_chain(wallet, chain, rest, &engine).await;
+        if self.is_solana_chain(chain) {
+            return self
+                .list_solana_chain(wallet, chain, rest, self.solana_engine(chain))
+                .await;
         }
         let _projection = self.wallet_projection(wallet).await?;
         let _client = self
@@ -6267,5 +6358,78 @@ mod tests {
         let parsed: WalletAccountsPublic = serde_json::from_slice(&body).unwrap();
         assert_eq!(parsed.wallet_id.as_str(), f.wallet_name);
         assert!(parsed.accounts.is_empty());
+    }
+
+    /// The registry split's whole point: a Solana chain with a working RPC
+    /// client but no transfer engine (no Broker edge, or no provenance
+    /// catalog) must still be visible and enterable, while every staging
+    /// surface stays closed. Before the split the chain was invisible,
+    /// because listing and dispatch both keyed off the engine map.
+    #[tokio::test]
+    async fn solana_chains_are_readable_without_a_transfer_engine() {
+        let f = make_handler();
+        let node = spawn_solana_node().await;
+        let registry = bloom_solana::SolanaChainRegistry::new();
+        registry.add(
+            bloom_solana::SolanaClient::build(&bloom_solana::SolanaSpec {
+                name: "solana-devnet".into(),
+                endpoints: vec![bloom_solana::EndpointSpec {
+                    url: node,
+                    weight: 100,
+                    cu_per_sec: None,
+                    max_rps: None,
+                    http_only: false,
+                }],
+                expected_genesis_hex: Some("test-genesis".into()),
+                allow_broadcast: false,
+            })
+            .unwrap(),
+        );
+        // Note: no `.with_solana(..)` — there is no engine for this chain.
+        let handler = f.handler.with_solana_reads(registry);
+        let w = &f.wallet_name;
+
+        // The chain is listed alongside EVM chains...
+        let chains = handler
+            .list(&VfsPath::parse(&format!("/{w}/chains")).unwrap())
+            .await
+            .unwrap();
+        assert!(
+            chains.iter().any(|e| e.name == "solana-devnet"),
+            "reads-only Solana chain should be listed, got {:?}",
+            chains.iter().map(|e| &e.name).collect::<Vec<_>>()
+        );
+
+        // ...and its directory resolves...
+        let chain_dir = VfsPath::parse(&format!("/{w}/chains/solana-devnet")).unwrap();
+        handler.lookup(&chain_dir).await.unwrap();
+
+        // ...but advertises no outbox, because it cannot stage.
+        let entries = handler.list(&chain_dir).await.unwrap();
+        assert!(
+            !entries.iter().any(|e| e.name == "outbox"),
+            "reads-only chain must not advertise outbox, got {:?}",
+            entries.iter().map(|e| &e.name).collect::<Vec<_>>()
+        );
+
+        // Staging surfaces stay closed rather than falling through to EVM.
+        let new_tx = VfsPath::parse(&format!("/{w}/chains/solana-devnet/outbox/new.tx")).unwrap();
+        assert!(matches!(
+            handler.lookup(&new_tx).await,
+            Err(HandlerError::NotFound(_))
+        ));
+        let intent = serde_json::json!({
+            "destination": bs58::encode([0xbbu8; 32]).into_string(),
+            "lamports": 1_000_000,
+        });
+        assert!(
+            matches!(
+                handler
+                    .write(&new_tx, serde_json::to_vec(&intent).unwrap().as_slice())
+                    .await,
+                Err(HandlerError::NotFound(_))
+            ),
+            "staging on a reads-only chain must not reach the EVM outbox"
+        );
     }
 }

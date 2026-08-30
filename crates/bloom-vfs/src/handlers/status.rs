@@ -103,6 +103,9 @@ pub use bloom_update::UpdateAvailable;
 #[derive(Clone)]
 pub struct StatusHandler {
     pub chains: ChainRegistry,
+    /// Read-only Solana clients. Chain status is chain-scoped, so it lives
+    /// here rather than being repeated under every wallet.
+    pub solana_chains: Option<bloom_solana::SolanaChainRegistry>,
     pub wallet_projections: Option<Arc<dyn WalletProjectionReader>>,
     pub tx_engine: TxEngine,
     pub audit: Arc<AuditLog>,
@@ -172,6 +175,14 @@ impl StatusHandler {
     /// Production constructor: wallet status is derived exclusively from the
     /// authenticated public projection. No key-bearing store is accepted.
     #[allow(clippy::too_many_arguments)]
+    /// Attach the read-only Solana chain registry. Chain status is
+    /// chain-scoped, so Solana clients live here alongside the EVM
+    /// registry rather than under each wallet.
+    pub fn with_solana_chains(mut self, chains: bloom_solana::SolanaChainRegistry) -> Self {
+        self.solana_chains = Some(chains);
+        self
+    }
+
     pub fn with_backends(
         chains: ChainRegistry,
         tx_engine: TxEngine,
@@ -187,6 +198,7 @@ impl StatusHandler {
     ) -> Self {
         Self {
             chains,
+            solana_chains: None,
             wallet_projections: Some(wallet_projections),
             tx_engine,
             audit,
