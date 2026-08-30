@@ -175,14 +175,6 @@ impl StatusHandler {
     /// Production constructor: wallet status is derived exclusively from the
     /// authenticated public projection. No key-bearing store is accepted.
     #[allow(clippy::too_many_arguments)]
-    /// Attach the read-only Solana chain registry. Chain status is
-    /// chain-scoped, so Solana clients live here alongside the EVM
-    /// registry rather than under each wallet.
-    pub fn with_solana_chains(mut self, chains: bloom_solana::SolanaChainRegistry) -> Self {
-        self.solana_chains = Some(chains);
-        self
-    }
-
     pub fn with_backends(
         chains: ChainRegistry,
         tx_engine: TxEngine,
@@ -214,6 +206,14 @@ impl StatusHandler {
             mempool_statuses: Arc::new(RwLock::new(BTreeMap::new())),
             private_rpc_healths: Arc::new(RwLock::new(BTreeMap::new())),
         }
+    }
+
+    /// Attach the read-only Solana chain registry. Chain status is
+    /// chain-scoped, so Solana clients live here alongside the EVM
+    /// registry rather than under each wallet.
+    pub fn with_solana_chains(mut self, chains: bloom_solana::SolanaChainRegistry) -> Self {
+        self.solana_chains = Some(chains);
+        self
     }
 
     /// Wire the closure that produces the `update/*` subtree's
