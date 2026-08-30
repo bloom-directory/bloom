@@ -26,6 +26,7 @@
 //! - `wallets/<wallet>/chains/<chain>/outbox/sent/<id>/<file>`      — read sent
 //! - `wallets/<wallet>/chains/<chain>/outbox/failed/<id>/<file>`    — read failed
 
+use sha2::Digest as _;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -2053,6 +2054,15 @@ struct SolanaAccount {
     key_ref: bloom_broker_api::KeyRef,
 }
 
+/// A Broker projection that contradicts itself. Distinct from a transport
+/// failure: the edge answered, but the answer is not internally consistent,
+/// so nothing downstream may rely on the identity it describes.
+fn integrity(detail: &str) -> HandlerError {
+    HandlerError::backend(format!(
+        "Broker wallet.accounts projection is inconsistent: {detail}"
+    ))
+}
+
 /// The child's canonical BIP-39 Solana derivation path, from its `KeyRef`.
 ///
 /// Deliberately read from the `KeyRef` rather than the projection's `path`
@@ -2081,6 +2091,13 @@ impl SolanaAccount {
     fn from_projection(
         account: &bloom_broker_api::DerivedAccountPublic,
     ) -> Result<Self, HandlerError> {
+        if account.derivation_profile
+            != bloom_broker_api::DerivationProfile::Bip44SolanaSlip10Ed25519V1
+        {
+            return Err(integrity(
+                "account is not a bip44-solana-slip10-ed25519-v1 child",
+            ));
+        }
         if account.key_ref.key_spec != bloom_broker_api::KeySpec::Ed25519
             || account.public_key_encoding != bloom_broker_api::PublicKeyEncoding::Ed25519SpkiDer
         {
@@ -2095,17 +2112,55 @@ impl SolanaAccount {
                 "Solana child public key is not canonical Ed25519 SPKI DER",
             ));
         }
+
+        // Defence in depth: the Broker checks this too, but the Machine must
+        // not take a projected identity on trust. `fingerprint = SHA-256(spki)`.
+        let computed: [u8; 32] = sha2::Sha256::digest(&spki).into();
+        if bloom_broker_api::Digest32::from_bytes(computed) != account.public_key_fingerprint {
+            return Err(integrity(
+                "account fingerprint does not match its canonical public key",
+            ));
+        }
+
+        // The KeyRef derivation is authoritative because it is what signing
+        // pins. The projection's `path` is redundant, so a disagreement is a
+        // projection-integrity fault — never a reason to prefer one silently.
+        let derivation_path = derivation_path(&account.key_ref)?;
+        if account.path != derivation_path {
+            return Err(integrity(&format!(
+                "account path '{}' disagrees with its KeyRef derivation path '{}'",
+                account.path, derivation_path
+            )));
+        }
+
         let mut pubkey = [0_u8; 32];
         pubkey.copy_from_slice(&spki[Self::ED25519_SPKI_PREFIX.len()..]);
+        let address = bs58::encode(pubkey).into_string();
+
+        // A chain projection is present only when the Broker has a matching
+        // configured projection target, so absence is a configuration state
+        // rather than corruption. When one *is* projected, its address must
+        // agree with the key we derived the address from.
+        for projection in &account.chain_projections {
+            if projection.address_encoding == bloom_broker_api::AddressEncoding::Base58
+                && projection.address != address
+            {
+                return Err(integrity(&format!(
+                    "chain projection address '{}' does not match the derived account address '{}'",
+                    projection.address, address
+                )));
+            }
+        }
+
         Ok(Self {
-            address: bs58::encode(pubkey).into_string(),
+            address,
             pubkey,
             fingerprint: account
                 .key_ref
                 .public_key_fingerprint
                 .as_str()
                 .to_ascii_lowercase(),
-            derivation_path: derivation_path(&account.key_ref)?,
+            derivation_path,
             key_ref: account.key_ref.clone(),
         })
     }
@@ -6519,5 +6574,102 @@ mod tests {
             ),
             "staging on a reads-only chain must not reach the EVM outbox"
         );
+    }
+
+    /// A valid Solana child projection, as the Broker would emit it.
+    fn solana_projection(pubkey: [u8; 32]) -> bloom_broker_api::DerivedAccountPublic {
+        let mut spki = vec![
+            0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
+        ];
+        spki.extend_from_slice(&pubkey);
+        let fingerprint =
+            bloom_broker_api::Digest32::from_bytes(sha2::Sha256::digest(&spki).into());
+        bloom_broker_api::DerivedAccountPublic {
+            key_ref: bloom_broker_api::KeyRef {
+                backend: bloom_broker_api::Token::new("local").unwrap(),
+                backend_instance: bloom_broker_api::Token::new("primary").unwrap(),
+                locator: "wallet/derived/solana-0".into(),
+                key_spec: bloom_broker_api::KeySpec::Ed25519,
+                public_key_fingerprint: fingerprint.clone(),
+                derivation: Some(bloom_broker_api::DerivationRef::Bip39Multicurve {
+                    wallet_seed_ref: bloom_broker_api::Token::new("wallet-seed").unwrap(),
+                    profile: bloom_broker_api::DerivationProfile::Bip44SolanaSlip10Ed25519V1,
+                    path: "m/44'/501'/0'/0'".into(),
+                }),
+            },
+            wallet_seed_profile: bloom_broker_api::WalletSeedProfile::Bip39MulticurveV1,
+            derivation_profile: bloom_broker_api::DerivationProfile::Bip44SolanaSlip10Ed25519V1,
+            path: "m/44'/501'/0'/0'".into(),
+            canonical_public_key: bloom_broker_api::Base64UrlBytes::from_bytes(&spki),
+            public_key_encoding: bloom_broker_api::PublicKeyEncoding::Ed25519SpkiDer,
+            public_key_fingerprint: fingerprint,
+            supported_crypto_suites: vec![bloom_broker_api::CryptoSuite::Ed25519Message],
+            chain_projections: vec![],
+            lifecycle: bloom_broker_api::AccountLifecycleState::Active,
+        }
+    }
+
+    /// The resolver is the Machine's trust boundary over a Broker-supplied
+    /// identity: a projection that contradicts itself must be refused, not
+    /// silently reconciled by preferring one field over another.
+    #[test]
+    fn inconsistent_account_projections_are_refused() {
+        let pubkey = [0xcc_u8; 32];
+        assert!(
+            SolanaAccount::from_projection(&solana_projection(pubkey)).is_ok(),
+            "baseline projection should resolve"
+        );
+
+        // path recorded on the projection disagrees with the signing KeyRef
+        let mut a = solana_projection(pubkey);
+        a.path = "m/44'/501'/1'/0'".into();
+        expect_integrity(&a, "disagrees with its KeyRef derivation path");
+
+        // fingerprint does not commit to the canonical public key
+        let mut a = solana_projection(pubkey);
+        a.public_key_fingerprint = bloom_broker_api::Digest32::from_bytes([0xab; 32]);
+        expect_integrity(&a, "does not match its canonical public key");
+
+        // wrong derivation profile for a Solana child
+        let mut a = solana_projection(pubkey);
+        a.derivation_profile = bloom_broker_api::DerivationProfile::Bip44EvmSecp256k1V1;
+        expect_integrity(&a, "not a bip44-solana-slip10-ed25519-v1 child");
+
+        // a projected base58 address that is not this account's address
+        let mut a = solana_projection(pubkey);
+        a.chain_projections = vec![bloom_broker_api::ChainAccountProjection {
+            chain_family: bloom_broker_api::Token::new("solana").unwrap(),
+            caip2: "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp".into(),
+            caip10: "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp:11111111111111111111111111111111"
+                .into(),
+            address: bs58::encode([0x11_u8; 32]).into_string(),
+            address_encoding: bloom_broker_api::AddressEncoding::Base58,
+        }];
+        expect_integrity(&a, "does not match the derived account address");
+
+        // wrong key spec / non-canonical encoding
+        let mut a = solana_projection(pubkey);
+        a.key_ref.key_spec = bloom_broker_api::KeySpec::Secp256k1;
+        assert!(SolanaAccount::from_projection(&a).is_err());
+
+        // truncated SPKI is not canonical
+        let mut a = solana_projection(pubkey);
+        a.canonical_public_key = bloom_broker_api::Base64UrlBytes::from_bytes(&[0x30, 0x2a]);
+        assert!(SolanaAccount::from_projection(&a).is_err());
+
+        // a child with no derivation cannot be pinned by signing
+        let mut a = solana_projection(pubkey);
+        a.key_ref.derivation = None;
+        assert!(SolanaAccount::from_projection(&a).is_err());
+    }
+
+    fn expect_integrity(account: &bloom_broker_api::DerivedAccountPublic, needle: &str) {
+        match SolanaAccount::from_projection(account) {
+            Err(HandlerError::Backend(msg)) => assert!(
+                msg.contains(needle),
+                "expected an integrity error mentioning {needle:?}, got {msg:?}"
+            ),
+            other => panic!("expected a projection-integrity error, got {other:?}"),
+        }
     }
 }
