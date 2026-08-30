@@ -1,4 +1,5 @@
 target/
+target-canary/
 target-docker/
 cache/
 out/
