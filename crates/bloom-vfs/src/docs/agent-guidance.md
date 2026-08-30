@@ -65,6 +65,44 @@ enumerates both together. Solana chains route through the exact same
 inspect `outbox/{pending,sent,failed}/<id>/`) — there is no separate
 Solana-specific surface to look for.
 
+### Reading Solana balances
+
+A Solana chain directory exposes an account-addressed surface:
+
+```sh
+ls  wallets/<wallet>/chains/<solana-chain>/accounts/       # one dir per active child
+cat wallets/<wallet>/chains/<solana-chain>/accounts/<fingerprint>/address
+cat wallets/<wallet>/chains/<solana-chain>/accounts/<fingerprint>/balance
+```
+
+Directory names are the **full** lowercase account fingerprint. A unique
+prefix is accepted when staging a transfer (`account_fingerprint` in
+`new.tx`), but not as a path — a prefix that is unique today stops being
+unique when another account is allocated.
+
+`chains/<chain>/balance`, `balance.raw` and `balance.json` are shortcuts for
+a wallet with exactly one active Solana account. On a wallet with several
+they fail and list the canonical `accounts/<fingerprint>/` paths; Bloom will
+not pick an account for you, because spending from the wrong one is not
+recoverable.
+
+Listing accounts, stat-ing any leaf, and reading `address` need only Bloom's
+own projection, so they keep working when a Solana node is unreachable. Only
+`balance*` contacts the chain. If a balance read fails but `address` still
+works, the account is fine and the cluster is not.
+
+Chain health lives once per chain, not per wallet:
+
+```sh
+cat status/chains/<solana-chain>/status.json   # health, slot, genesis, broadcast posture
+cat status/chains/<solana-chain>/connected
+```
+
+`status.json` still renders when calls fail — the failed fields are `null`
+and `errors` says why. `broadcast.eligible` means an attempt is *permitted*
+(broadcast enabled, genesis verified on every endpoint); it does not promise
+a transaction will land.
+
 ## Creating a wallet (asynchronous passkey registration)
 
 Writing a plain name to `wallets/new` **starts a passkey registration — it

@@ -112,6 +112,61 @@ configured endpoint against that genesis at staging and again before its
 single broadcast attempt. Broker policy and the passkey ceremony remain
 mandatory.
 
+### Broadcast eligibility is not a delivery guarantee
+
+`status/chains/<chain>/status.json` reports `broadcast.eligible`. That means
+only two things held: the operator enabled broadcast, and live genesis
+verification succeeded against **every** configured endpoint at the moment of
+the read. It is not a prediction that a transaction will be accepted or will
+land — fees, blockhash expiry, account state and validator admission all
+still apply, and none of them are observable from a status read.
+
+Genesis reporting distinguishes three states rather than two:
+
+| `genesis.all_endpoints_verified` | meaning |
+| --- | --- |
+| `true` | a genesis is pinned and every configured endpoint matched it |
+| `false` | a genesis is pinned and verification failed or could not run |
+| `null` | nothing is pinned, so nothing was verified — not an implicit pass |
+
+## Reading Solana state through the VFS
+
+Solana chains appear beside EVM chains under `wallets/<wallet>/chains/` and
+in the global `status/chains/` tree. Two rules shape the surface.
+
+**Accounts are addressed by full fingerprint.** The canonical per-account
+path is `chains/<chain>/accounts/<full-lowercase-fingerprint>/`, exposing
+`address`, `balance`, `balance.raw` and `balance.json`. `accounts/` exists
+whenever the chain is configured — empty when no child is active — so the
+namespace does not change shape as children are allocated or retired. A
+unique fingerprint *prefix* is accepted as input convenience when staging a
+transfer through `new.tx`, but never as a path: a prefix that is unique today
+becomes ambiguous when the next child is allocated.
+
+The chain-level `balance`, `balance.raw` and `balance.json` leaves are
+single-child conveniences. On a wallet with several active Solana children
+they fail and name the canonical `accounts/<fingerprint>/` paths rather than
+selecting by projection order.
+
+**Reads that need the chain are exactly the reads that say so.** Listing an
+account directory, stat-ing any leaf, and reading `address` are served from
+the Broker's `wallet.accounts` projection alone. Only `balance*` and the
+chain status leaves contact a Solana node. A wallet therefore stays
+inspectable while a cluster is unreachable, and listing a wallet never fans
+out one RPC call per child.
+
+Chain status is published once per chain under
+`status/chains/<solana-chain>/`, not repeated beneath every wallet, because
+RPC health, cluster identity and broadcast posture are properties of the
+chain. Each observation in `status.json` is attempted independently: a failed
+call degrades its own field to `null` and records a reason under `errors`
+while the rest of the document still renders. Endpoint URLs are redacted
+wherever they appear, including inside error text.
+
+Solana chain directories deliberately do not carry `chain_id` or
+`block_number`. Solana has neither, and publishing an EVM-shaped view of it
+would be a lie of convenience; it exposes `slot` and `block_height` instead.
+
 ## What carried forward from the parked Petal work
 
 Not everything from PR #166 was Petal-hosting machinery with nothing left
