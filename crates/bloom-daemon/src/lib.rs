@@ -3161,39 +3161,48 @@ impl Daemon {
         // read-only handle per Solana chain) doesn't have to reach back
         // through an engine to get one.
         let solana_chain_registry = bloom_solana::SolanaChainRegistry::new();
-        if let (Some(broker), Some(catalog)) = (&broker, &provenance_catalog) {
-            for (name, spec) in &config.solana_chains {
-                let client = match bloom_solana::SolanaClient::build(spec) {
-                    Ok(client) => client,
-                    Err(bloom_solana::SolanaRpcError::Invalid(error)) => {
-                        return Err(DaemonError::SolanaConfig(error));
-                    }
-                    Err(e) => {
-                        warn!(chain = %name, error = %e, "daemon.solana_chain_degraded");
-                        continue;
-                    }
-                };
-                let signer = match bloom_solana_tx::signing::SolanaTransferSigner::from_catalog(
-                    broker.clone(),
-                    catalog,
-                ) {
-                    Ok(signer) => signer,
-                    Err(e) => {
-                        warn!(chain = %name, error = %e, "daemon.solana_signer_skipped");
-                        continue;
-                    }
-                };
-                let outbox = bloom_solana_tx::outbox::SolanaOutbox::new(home.solana_outbox_dir())
-                    .map_err(|e| DaemonError::Outbox(e.to_string()))?;
-                solana_chain_registry.add(client.clone());
-                let engine = bloom_solana_tx::engine::SolanaTransferEngine::new(
-                    outbox,
-                    client,
-                    signer,
-                    name.clone(),
-                );
-                solana_engines.insert(name.clone(), Arc::new(engine));
-            }
+        // Read-only surfaces (balances, chain status) need only a valid
+        // client, so every configured chain that builds enters the registry
+        // even when custody is unavailable. Staging additionally needs the
+        // Broker and the provenance catalog — the exact-signing seam — so a
+        // transfer engine is built only when both are present. Keeping these
+        // independent is what lets `status/chains/<chain>` and wallet balance
+        // reads work on a daemon that cannot sign.
+        for (name, spec) in &config.solana_chains {
+            let client = match bloom_solana::SolanaClient::build(spec) {
+                Ok(client) => client,
+                Err(bloom_solana::SolanaRpcError::Invalid(error)) => {
+                    return Err(DaemonError::SolanaConfig(error));
+                }
+                Err(e) => {
+                    warn!(chain = %name, error = %e, "daemon.solana_chain_degraded");
+                    continue;
+                }
+            };
+            solana_chain_registry.add(client.clone());
+            let (Some(broker), Some(catalog)) = (&broker, &provenance_catalog) else {
+                debug!(chain = %name, "daemon.solana_reads_only");
+                continue;
+            };
+            let signer = match bloom_solana_tx::signing::SolanaTransferSigner::from_catalog(
+                broker.clone(),
+                catalog,
+            ) {
+                Ok(signer) => signer,
+                Err(e) => {
+                    warn!(chain = %name, error = %e, "daemon.solana_signer_skipped");
+                    continue;
+                }
+            };
+            let outbox = bloom_solana_tx::outbox::SolanaOutbox::new(home.solana_outbox_dir())
+                .map_err(|e| DaemonError::Outbox(e.to_string()))?;
+            let engine = bloom_solana_tx::engine::SolanaTransferEngine::new(
+                outbox,
+                client,
+                signer,
+                name.clone(),
+            );
+            solana_engines.insert(name.clone(), Arc::new(engine));
         }
         // `solana_engines` itself is moved into the wallets handler below;
         // capture whether there's anything to reconcile before that happens.
@@ -3457,6 +3466,7 @@ impl Daemon {
                 env!("CARGO_PKG_VERSION"),
                 wallet_projections.clone(),
             )
+            .with_solana_chains(solana_chain_registry.clone())
             .with_mempool_statuses(initial_mempool_statuses)
             .with_update_snapshot_fn(Arc::new(move || {
                 // Always produce a snapshot. The VFS renders the
@@ -3574,7 +3584,8 @@ impl Daemon {
             .with_broker(broker.clone())
             .with_home_write_permit_opt(home_write_permit.clone())
             .with_mempool_indexes(mempool_indexes.clone())
-            .with_solana(solana_engines);
+            .with_solana(solana_engines)
+            .with_solana_reads(solana_chain_registry.clone());
 
         vfs_builder = vfs_builder
             .mount("wallets", Arc::new(wallets_handler) as _)
