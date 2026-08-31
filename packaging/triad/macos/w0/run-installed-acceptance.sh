@@ -159,6 +159,14 @@ assert_installed_process bloom-broker "$broker_uid" "$release_root/bloom-broker"
 assert_installed_process bloom-signer "$signer_uid" "$release_root/bloom-signer"
 sudo -u "$login_user" \
   "$release_root/bloom" serve triad-health-check "$release_digest"
+machine_label="gui/$login_uid/com.bloom.machine"
+machine_plist="/Library/LaunchAgents/com.bloom.machine.plist"
+machine_pid="$(launchctl print "$machine_label" | sed -n 's/^[[:space:]]*pid = //p')"
+[[ "$machine_pid" =~ ^[1-9][0-9]*$ ]]
+[[ "$(ps -p "$machine_pid" -o uid= | tr -d ' ')" == "$login_uid" ]]
+lsof -nP -a -p "$machine_pid" -d txt -Fn |
+  grep -Fx -e "n$release_root/bloom" -e 'n/usr/local/libexec/bloom/current/bloom' >/dev/null
+sudo -H -u "$login_user" "$release_root/bloom" status >/dev/null
 
 machine_identity="/Library/Application Support/BloomTriad/config/$login_uid/machine/identity.json"
 edge_manifest="/Library/Application Support/BloomTriad/config/$login_uid/edge-manifest.json"
@@ -196,6 +204,7 @@ while [[ $SECONDS -lt $deadline ]]; do
 done
 sudo -u "$login_user" \
   "$release_root/bloom" serve triad-health-check "$release_digest"
+launchctl bootout "$machine_label"
 "$main_root/packaging/triad/macos/w0/run-packaged-machine-negative.sh" \
   "$release_root/bloom" \
   "$login_uid" \
@@ -227,6 +236,8 @@ ditto "$runtime_negative_snapshot/broker" "$broker_state"
 ditto "$runtime_negative_snapshot/signer" "$signer_state"
 launchctl bootstrap system "$signer_plist"
 launchctl bootstrap system "$broker_plist"
+launchctl bootstrap "gui/$login_uid" "$machine_plist"
+launchctl kickstart -k "$machine_label"
 
 # The restored installed Broker and Signer must return to authenticated health.
 deadline=$((SECONDS + 20))
@@ -240,6 +251,14 @@ while [[ $SECONDS -lt $deadline ]]; do
 done
 sudo -u "$login_user" \
   "$release_root/bloom" serve triad-health-check "$release_digest"
+deadline=$((SECONDS + 20))
+until sudo -H -u "$login_user" "$release_root/bloom" status >/dev/null 2>&1; do
+  [[ $SECONDS -lt $deadline ]] || {
+    echo "installed Machine service did not restore after runtime-negative acceptance" >&2
+    exit 1
+  }
+  sleep 1
+done
 
 source_revision() {
   key="$1"
@@ -351,6 +370,7 @@ assert_installed_process bloom-broker "$broker_uid" "$release_root/bloom-broker"
 assert_installed_process bloom-signer "$signer_uid" "$release_root/bloom-signer"
 sudo -u "$login_user" \
   "$release_root/bloom" serve triad-health-check "$release_digest"
+sudo -H -u "$login_user" "$release_root/bloom" status >/dev/null
 
 subject_digest="$(
   "$main_root/packaging/triad/release/macos-conformance-subject.sh" "$payload"

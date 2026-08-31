@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.bloom.machine</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>@BLOOM_MACHINE_BINARY@</string>
+    <string>serve</string>
+    <string>--mount-home</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>BLOOM_ENROLLMENT_ROOT</key>
+    <string>/Library/Application Support/BloomTriad/enrollments</string>
+    <key>BLOOM_CONFIG_ROOT</key>
+    <string>/Library/Application Support/BloomTriad/config</string>
+    <key>BLOOM_RUNTIME_ROOT</key>
+    <string>/private/var/run/bloom</string>
+    <key>BLOOM_LOG_OUTPUT</key>
+    <string>json-file-home</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+  <key>ThrottleInterval</key>
+  <integer>5</integer>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>LimitLoadToSessionType</key>
+  <array>
+    <string>Aqua</string>
+    <string>Background</string>
+  </array>
+  <key>SoftResourceLimits</key>
+  <dict>
+    <key>Core</key>
+    <integer>0</integer>
+    <key>NumberOfFiles</key>
+    <integer>1024</integer>
+  </dict>
+  <key>HardResourceLimits</key>
+  <dict>
+    <key>Core</key>
+    <integer>0</integer>
+    <key>NumberOfFiles</key>
+    <integer>4096</integer>
+  </dict>
+</dict>
+</plist>

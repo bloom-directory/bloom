@@ -274,6 +274,7 @@ paths() {
   signer_plist="$root_prefix/Library/LaunchDaemons/com.bloom.signer.$login_uid.plist"
   containment_plist="$root_prefix/Library/LaunchDaemons/com.bloom.containment.plist"
   session_plist="$root_prefix/Library/LaunchAgents/com.bloom.session.plist"
+  machine_plist="$root_prefix/Library/LaunchAgents/com.bloom.machine.plist"
   pf_anchor="$root_prefix/etc/pf.anchors/com.bloom.triad.$login_uid"
   newsyslog_config="$root_prefix/etc/newsyslog.d/bloom-$login_uid.conf"
 }
@@ -323,7 +324,7 @@ pf_reference() {
 
 rollback_failed_restore() {
   if $live; then
-    for label in "system/com.bloom.broker.$login_uid" "system/com.bloom.signer.$login_uid" "gui/$login_uid/com.bloom.session"; do
+    for label in "gui/$login_uid/com.bloom.machine" "system/com.bloom.broker.$login_uid" "system/com.bloom.signer.$login_uid" "gui/$login_uid/com.bloom.session"; do
       launchctl bootout "$label" 2>/dev/null || true
     done
     pf_reference remove || return 1
@@ -501,6 +502,7 @@ install_assets() {
   render "$base/launchdaemons/com.bloom.signer.plist.in" "$signer_plist" 0644
   render "$base/launchdaemons/com.bloom.containment.plist.in" "$containment_plist" 0644
   render "$base/launchagents/com.bloom.session.plist.in" "$session_plist" 0644
+  render "$base/launchagents/com.bloom.machine.plist.in" "$machine_plist" 0644
   render "$base/pf/com.bloom.login.conf.in" "$pf_anchor" 0600
   mkdir -p "$(dirname "$newsyslog_config")"
   newsyslog_tmp="$newsyslog_config.new.$$"
@@ -512,7 +514,7 @@ install_assets() {
 
 secure_ownership() {
   chown -R root:wheel "$release_base"
-  chown root:wheel "$product" "$enrollments" "$config" "$broker_plist" "$signer_plist" "$containment_plist" "$session_plist" "$pf_anchor" "$newsyslog_config"
+  chown root:wheel "$product" "$enrollments" "$config" "$broker_plist" "$signer_plist" "$containment_plist" "$session_plist" "$machine_plist" "$pf_anchor" "$newsyslog_config"
   chown -R "$broker_user:$broker_group" "$broker_config" "$broker_state"
   chown -R "$signer_user:$signer_group" "$signer_config" "$signer_state"
   chown -R "$login_user:$machine_broker_group" "$machine_config" "$machine_state"
@@ -541,13 +543,14 @@ reload_launchd_job() {
 }
 
 reload_current_enrollment() {
-  plutil -lint "$broker_plist" "$signer_plist" "$containment_plist" "$session_plist" >/dev/null; pfctl -nf "$pf_anchor"
+  plutil -lint "$broker_plist" "$signer_plist" "$containment_plist" "$session_plist" "$machine_plist" >/dev/null; pfctl -nf "$pf_anchor"
   reload_launchd_job system com.bloom.containment "$containment_plist"
   "$machine_binary" serve triad-pf-monitor-once 2>/dev/null ||
     echo "Bloom installed, but containment readiness is deferred" >&2
   reload_launchd_job "gui/$login_uid" com.bloom.session "$session_plist"
   reload_launchd_job system "com.bloom.signer.$login_uid" "$signer_plist"
   reload_launchd_job system "com.bloom.broker.$login_uid" "$broker_plist"
+  reload_launchd_job "gui/$login_uid" com.bloom.machine "$machine_plist"
 }
 
 stop_all_enrollments() {
@@ -556,7 +559,7 @@ stop_all_enrollments() {
   for record in "$enrollments"/*.json; do
     [[ -f "$record" && ! -L "$record" ]] || continue
     uid="${record##*/}"; uid="${uid%.json}"; [[ "$uid" =~ ^[1-9][0-9]*$ ]] || return 65
-    for label in "gui/$uid/com.bloom.session" "system/com.bloom.broker.$uid" "system/com.bloom.signer.$uid"; do launchctl bootout "$label" 2>/dev/null || true; done
+    for label in "gui/$uid/com.bloom.machine" "gui/$uid/com.bloom.session" "system/com.bloom.broker.$uid" "system/com.bloom.signer.$uid"; do launchctl bootout "$label" 2>/dev/null || true; done
   done
 }
 
@@ -597,6 +600,7 @@ reload_installed_set() {
     reload_launchd_job "gui/$uid" com.bloom.session "$root_prefix/Library/LaunchAgents/com.bloom.session.plist"
     reload_launchd_job system "com.bloom.signer.$uid" "$root_prefix/Library/LaunchDaemons/com.bloom.signer.$uid.plist"
     reload_launchd_job system "com.bloom.broker.$uid" "$root_prefix/Library/LaunchDaemons/com.bloom.broker.$uid.plist"
+    reload_launchd_job "gui/$uid" com.bloom.machine "$root_prefix/Library/LaunchAgents/com.bloom.machine.plist"
   done
 }
 
@@ -692,7 +696,7 @@ case "$action" in
     [[ -f "$record" && ! -L "$record" ]] || die "enrollment or retained custody record missing"
     enrollment="$record"; login_user="$(field "$record" login_user)"; BLOOM_RELEASE_DIGEST="$(field "$record" release_digest)"; load_ids
     if $live; then
-      for label in "system/com.bloom.broker.$login_uid" "system/com.bloom.signer.$login_uid" "gui/$login_uid/com.bloom.session"; do launchctl bootout "$label" 2>/dev/null || true; done
+      for label in "gui/$login_uid/com.bloom.machine" "system/com.bloom.broker.$login_uid" "system/com.bloom.signer.$login_uid" "gui/$login_uid/com.bloom.session"; do launchctl bootout "$label" 2>/dev/null || true; done
       pf_reference remove
     fi
     rm -f "$broker_plist" "$signer_plist" "$pf_anchor" "$newsyslog_config"
@@ -710,7 +714,7 @@ case "$action" in
       dsmemberutil flushcache
     fi
     if ! find "$enrollments" -type f -name '*.json' -maxdepth 1 2>/dev/null | grep . >/dev/null; then
-      $live && launchctl bootout system/com.bloom.containment 2>/dev/null || true; rm -f "$containment_plist" "$session_plist"
+      $live && launchctl bootout system/com.bloom.containment 2>/dev/null || true; rm -f "$containment_plist" "$session_plist" "$machine_plist"
       if ! find "$product/retained" -type f -name '*.json' -maxdepth 1 2>/dev/null | grep . >/dev/null; then rm -rf "$release_base"; fi
     fi
     $retain || echo "Bloom macOS enrollment permanently purged; custody is unrecoverable"

@@ -35,7 +35,7 @@ use bloom_daemon::ipc::{
 };
 use bloom_machine_client::MachineJournalHeadProvider;
 use bloom_proto::{AuditIdentity, AuditLog, HomeDir, HomeWritePermit};
-use bloom_service_observability::LogOutput;
+use bloom_service_observability::{LogOutput, SecureLogFile};
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::{Shell, generate};
 use tracing::{Instrument as _, debug, info, trace, warn};
@@ -2228,6 +2228,10 @@ enum Cmd {
         )]
         mount: Option<PathBuf>,
 
+        /// Mount at the login user's ~/bloom directory.
+        #[arg(long, hide = true, conflicts_with = "mount")]
+        mount_home: bool,
+
         /// Fixed loopback listener used by the packaged fstab mount.
         #[arg(long, env = "BLOOM_NFS_LISTEN", value_name = "ADDRESS", hide = true)]
         mount_nfs_listen: Option<SocketAddr>,
@@ -2515,14 +2519,15 @@ async fn main() -> ExitCode {
 
     let role = long_running_role(&cli);
     if let Some(role) = role {
-        let output = if std::env::var("BLOOM_LOG_OUTPUT").as_deref() == Ok("json-stderr") {
-            LogOutput::JsonStderr
-        } else {
-            LogOutput::Interactive
+        let output = match std::env::var("BLOOM_LOG_OUTPUT").as_deref() {
+            Ok("json-stderr") => Ok(LogOutput::JsonStderr),
+            Ok("json-file-home") if role == "machine" => machine_log_output(&cli),
+            _ => Ok(LogOutput::Interactive),
         };
-        if let Err(error) =
+        if let Err(error) = output.and_then(|output| {
             bloom_service_observability::init(role, env!("CARGO_PKG_VERSION"), output)
-        {
+                .map_err(anyhow::Error::from)
+        }) {
             let _ = error;
             eprintln!("Bloom service logging initialization failed");
             return ExitCode::FAILURE;
@@ -2557,7 +2562,8 @@ async fn main() -> ExitCode {
                 tracing::error!(
                     event = "service.fatal_exit",
                     service_role = role,
-                    error_kind = "runtime"
+                    error_kind = "runtime",
+                    error = %format!("{e:#}")
                 );
                 if matches!(role, "session-sentinel" | "containment-monitor") {
                     native_lifecycle(role, "fatal_exit");
@@ -2589,7 +2595,36 @@ fn long_running_role(cli: &Cli) -> Option<&'static str> {
 }
 
 fn structured_service_output() -> bool {
-    std::env::var("BLOOM_LOG_OUTPUT").as_deref() == Ok("json-stderr")
+    matches!(
+        std::env::var("BLOOM_LOG_OUTPUT").as_deref(),
+        Ok("json-stderr" | "json-file-home")
+    )
+}
+
+fn machine_log_output(cli: &Cli) -> Result<LogOutput> {
+    use std::fs::OpenOptions;
+    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
+
+    let home = match &cli.home {
+        Some(path) => HomeDir::at(path),
+        None => HomeDir::resolve("~/.bloom").context("resolve Machine home for logging")?,
+    };
+    let log_dir = home.root().join("logs");
+    std::fs::create_dir_all(&log_dir)
+        .with_context(|| format!("create Machine log directory at {}", log_dir.display()))?;
+    std::fs::set_permissions(&log_dir, std::fs::Permissions::from_mode(0o700))?;
+    let log_path = log_dir.join("machine.jsonl");
+    let file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(&log_path)
+        .with_context(|| format!("open Machine log at {}", log_path.display()))?;
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    let metadata = file.metadata()?;
+    Ok(LogOutput::JsonFile(
+        SecureLogFile::new(&log_path, metadata.uid(), metadata.gid()).with_mode(0o600),
+    ))
 }
 
 #[cfg(target_os = "macos")]
@@ -3464,7 +3499,8 @@ async fn run(cli: Cli) -> Result<()> {
         }
         Cmd::Serve {
             endpoint,
-            mount,
+            mut mount,
+            mount_home,
             mount_nfs_listen,
             mount_from_fstab,
             internal,
@@ -3489,6 +3525,20 @@ async fn run(cli: Cli) -> Result<()> {
             }
             if !structured_service_output() {
                 eprintln!("{ALPHA_DISCLOSURE}");
+            }
+            if mount_home {
+                let login_home = home
+                    .root()
+                    .parent()
+                    .context("resolve login home from Bloom home")?;
+                let login_mount = login_home.join("bloom");
+                std::fs::create_dir_all(&login_mount).with_context(|| {
+                    format!(
+                        "create login user's Bloom mount at {}",
+                        login_mount.display()
+                    )
+                })?;
+                mount = Some(login_mount);
             }
             let (_home_permit, d) = build_write_daemon(home.clone())?;
             github_source::ensure_preinstalled_petals(&home, &d)
@@ -4744,6 +4794,15 @@ mod tests {
     fn only_long_running_modes_use_service_observability() {
         let machine = Cli::try_parse_from(["bloom", "serve"]).unwrap();
         assert_eq!(long_running_role(&machine), Some("machine"));
+        let installed_machine = Cli::try_parse_from(["bloom", "serve", "--mount-home"]).unwrap();
+        assert!(matches!(
+            installed_machine.cmd,
+            Some(Cmd::Serve {
+                mount: None,
+                mount_home: true,
+                ..
+            })
+        ));
         let session = Cli::try_parse_from(["bloom", "serve", "session-sentinel"]).unwrap();
         assert_eq!(long_running_role(&session), Some("session-sentinel"));
         let containment = Cli::try_parse_from(["bloom", "serve", "triad-pf-monitor"]).unwrap();

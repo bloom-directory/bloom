@@ -36,6 +36,7 @@ for required in \
   installer/release/install-linux.sh \
   installer/linux/bin/bloom-uninstall \
   installer/linux/systemd-user/bloom-machine.service \
+  installer/macos/launchagents/com.bloom.machine.plist.in \
   installer/release/install-macos.sh \
   installer/release/macos-conformance-subject.sh \
   installer/release/sign-macos-conformance-report.sh \

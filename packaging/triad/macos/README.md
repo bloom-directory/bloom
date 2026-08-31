@@ -53,6 +53,12 @@ session socket's enrolled UID, group, mode, and type and kickstarts only that
 enrollment's stopped Signer and Broker jobs. It does nothing while the
 sentinel is absent; the LaunchAgent itself has no system-job control authority.
 
+The global `com.bloom.machine` LaunchAgent runs `bloom serve --mount-home` for
+each enrolled login. Machine resolves the effective login's installed
+enrollment, serves its normal `~/.bloom/run/bloom.sock` endpoint, and mounts the
+VFS at `~/bloom`. The generic template contains no username or home-directory
+literal and exits fail-closed when the effective login is not enrolled.
+
 ## Filesystem and network boundaries
 
 The installer renders the root-owned release, edge manifest, account/group

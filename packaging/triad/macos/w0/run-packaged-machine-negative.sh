@@ -722,9 +722,9 @@ PY
     "$work/$label-audit-status.log" >/dev/null
 }
 
-# Launch the installed production executable in its long-running Machine
-# service mode. macOS packages `bloom`; `serve` is its Machine service mode
-# (there is no separately installed bloom-machine payload or Machine plist).
+# The installed Machine LaunchAgent is stopped by the caller while this
+# isolated negative harness launches the same packaged `bloom serve` binary
+# against its private home, endpoint, and mount.
 sudo -H -u "$login_user" env \
   BLOOM_HOME="$clean_home" \
   BLOOM_BROKER_SOCKET="$broker_socket" \

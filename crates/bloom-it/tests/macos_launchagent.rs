@@ -99,6 +99,25 @@ fn session_agent_has_no_service_authority_and_stops_with_the_login_domain() {
 }
 
 #[test]
+fn machine_agent_runs_bloom_serve_and_mounts_the_login_home() {
+    let source = fs::read_to_string(
+        workspace().join("packaging/triad/macos/launchagents/com.bloom.machine.plist.in"),
+    )
+    .expect("read Machine LaunchAgent source");
+
+    assert!(source.contains("<string>com.bloom.machine</string>"));
+    assert!(source.contains("@BLOOM_MACHINE_BINARY@"));
+    assert!(source.contains("<string>serve</string>"));
+    assert!(source.contains("<string>--mount-home</string>"));
+    assert!(source.contains("<key>RunAtLoad</key>"));
+    assert!(source.contains("<key>KeepAlive</key>"));
+    assert!(source.contains("<string>json-file-home</string>"));
+    assert!(!source.contains("<key>NumberOfProcesses</key>"));
+    assert!(!source.contains("UserName"));
+    assert!(!source.contains("/Users/"));
+}
+
+#[test]
 fn broker_requires_the_authenticated_session_socket_before_ceremonies() {
     let source = fs::read_to_string(
         workspace().join("packaging/triad/macos/launchdaemons/com.bloom.broker.plist.in"),
