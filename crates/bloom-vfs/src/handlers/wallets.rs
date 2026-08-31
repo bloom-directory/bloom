@@ -1301,6 +1301,76 @@ impl WalletsHandler {
         }
     }
 
+    /// Gate an explicit caller operation without treating policy completion as submission.
+    pub async fn require_petal_eligibility(
+        &self,
+        wallet: &str,
+        package_hash: &bloom_broker_api::Digest32,
+    ) -> Result<(), HandlerError> {
+        match self.ensure_petal_eligibility(wallet, package_hash).await? {
+            bloom_machine_client::PetalEligibility::Allowed(_) => Ok(()),
+            bloom_machine_client::PetalEligibility::AwaitingPolicyApproval(pending) => {
+                Err(HandlerError::backend(format!(
+                    "POLICY_APPROVAL_REQUIRED: complete the owner ceremony at {} then retry this operation; status: {}",
+                    pending
+                        .prepare
+                        .as_ref()
+                        .map(|prepare| prepare.ceremony_url.as_str())
+                        .unwrap_or(&pending.status_path),
+                    pending.status_path,
+                )))
+            }
+        }
+    }
+
+    /// The persisted producing route, not the caller's follow-up route, owns an outbox item.
+    pub async fn require_outbox_petal_eligibility(
+        &self,
+        wallet: &str,
+        chain: &str,
+        id: &str,
+    ) -> Result<(), HandlerError> {
+        self.require_outbox_petal_eligibility_for_action(wallet, chain, id, false)
+            .await
+    }
+
+    async fn require_outbox_petal_eligibility_for_action(
+        &self,
+        wallet: &str,
+        chain: &str,
+        id: &str,
+        signs_sent_transaction: bool,
+    ) -> Result<(), HandlerError> {
+        let entry = self
+            .tx_engine
+            .outbox
+            .read(wallet, chain, id)
+            .map_err(err_be)?;
+        // Confirm recovery is read-only; cancel/replace of Sent requires a new signature.
+        if entry.state != OutboxState::Pending
+            && !(entry.state == OutboxState::Sent && signs_sent_transaction)
+        {
+            return Ok(());
+        }
+        let Some(origin) = entry.staged.execution_origin.as_ref() else {
+            return Ok(());
+        };
+        if origin == &bloom_proto::plan::ExecutionOrigin::default() {
+            return Ok(());
+        }
+        origin
+            .route_id
+            .as_ref()
+            .filter(|route| !route.is_empty())
+            .ok_or_else(|| {
+                HandlerError::invalid(
+                    "Petal outbox has no trusted producing route; restage the transaction",
+                )
+            })?;
+        let package_hash =
+            bloom_broker_api::Digest32::new(origin.petal_digest.clone()).map_err(err_be)?;
+        self.require_petal_eligibility(wallet, &package_hash).await
+    }
     fn lock_wallet_policy_update(&self, wallet: &str) -> Result<std::fs::File, HandlerError> {
         // This public coordinator receives a wallet directly, without VfsPath parsing.
         bloom_broker_api::Token::new(wallet.to_owned()).map_err(err_be)?;
@@ -3180,6 +3250,8 @@ impl WalletsHandler {
                         "cancel requires non-empty content (e.g. 'y' or override token)",
                     ));
                 }
+                self.require_outbox_petal_eligibility_for_action(wallet, chain, id, true)
+                    .await?;
                 let _ = self
                     .tx_engine
                     .cancel(
@@ -3214,6 +3286,8 @@ impl WalletsHandler {
                 // possibly different to / value / data. Use the
                 // address book the handler holds so name lookups in
                 // the body resolve identically to a fresh stage.
+                self.require_outbox_petal_eligibility_for_action(wallet, chain, id, true)
+                    .await?;
                 let _ = self
                     .tx_engine
                     .replace_with_intent(
