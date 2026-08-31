@@ -2,15 +2,14 @@
 //!
 //! The in-tree analogue of `bloom-tx` for Solana, on the new Signer+Broker
 //! custody triad. It mirrors `bloom-tx`'s durable-state pattern exactly —
-//! `<home>/outbox/<wallet>/<chain>/{pending,sent,failed}/<id>/` with a
+//! `<home>/.solana-outbox/<wallet>/<chain>/{pending,sent,failed}/<id>/` with a
 //! write-once `intent.json`, a `receipt.json` mined-outcome sibling, and
 //! broadcast-attempt markers — but every field is Solana-typed (base58 keys,
 //! lamports, blockhash / `lastValidBlockHeight`), never `alloy`.
 //!
-//! This crate currently ships the *durable-state* half only: staging,
-//! transitions, and the reconciliation polling loop. Signing and broadcast
-//! land once the bip39 agent's §4 wires `wallet.accounts`/`AccountAllocate`
-//! and the `TriadSigningService`-equivalent path into `bloom` (see the plan).
+//! Staging, exact-message signing through the Broker/Signer boundary,
+//! single-attempt broadcast, and finalized reconciliation all share this
+//! durable state machine.
 
 #![forbid(unsafe_code)]
 

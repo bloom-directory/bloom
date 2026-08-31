@@ -144,70 +144,6 @@ impl SolanaOutbox {
         &self.inner.root
     }
 
-    /// Move legacy Solana entries out of the shared EVM/Solana root. Only
-    /// directories whose `intent.json` is a valid Solana transfer are moved;
-    /// EVM entries and malformed data remain in place for their owner.
-    pub fn migrate_legacy_root(
-        legacy_root: impl AsRef<Path>,
-        solana_root: impl AsRef<Path>,
-    ) -> Result<usize, OutboxError> {
-        let legacy_root = legacy_root.as_ref();
-        let solana_root = solana_root.as_ref();
-        if !legacy_root.exists() {
-            return Ok(0);
-        }
-        fs::create_dir_all(solana_root)?;
-        let mut moved = 0;
-        for wallet in fs::read_dir(legacy_root)? {
-            let wallet = wallet?;
-            if !wallet.file_type()?.is_dir() {
-                continue;
-            }
-            for chain in fs::read_dir(wallet.path())? {
-                let chain = chain?;
-                if !chain.file_type()?.is_dir() {
-                    continue;
-                }
-                for state_name in ["pending", "sent", "failed"] {
-                    let state = chain.path().join(state_name);
-                    if !state.is_dir() {
-                        continue;
-                    }
-                    for entry in fs::read_dir(&state)? {
-                        let entry = entry?;
-                        if !entry.file_type()?.is_dir() {
-                            continue;
-                        }
-                        let intent = entry.path().join("intent.json");
-                        let Ok(bytes) = fs::read(&intent) else {
-                            continue;
-                        };
-                        if serde_json::from_slice::<StagedSolanaTransfer>(&bytes).is_err() {
-                            continue;
-                        }
-                        let destination = solana_root
-                            .join(wallet.file_name())
-                            .join(chain.file_name())
-                            .join(state_name)
-                            .join(entry.file_name());
-                        if destination.exists() {
-                            return Err(OutboxError::Other(format!(
-                                "legacy Solana entry already exists at {}",
-                                destination.display()
-                            )));
-                        }
-                        if let Some(parent) = destination.parent() {
-                            fs::create_dir_all(parent)?;
-                        }
-                        fs::rename(entry.path(), destination)?;
-                        moved += 1;
-                    }
-                }
-            }
-        }
-        Ok(moved)
-    }
-
     fn validate_segment(seg: &str) -> Result<(), OutboxError> {
         if seg.is_empty() || seg.contains('/') || seg.contains('\\') || seg == "." || seg == ".." {
             return Err(OutboxError::InvalidWallet(seg.into()));
@@ -859,36 +795,6 @@ mod tests {
             status: SolanaTxStatus::Sent,
             action_id: None,
         }
-    }
-
-    #[test]
-    fn migrates_legacy_solana_entry_and_leaves_evm_data_alone() {
-        let td = tempdir().unwrap();
-        let legacy = td.path().join("outbox");
-        let primary = td.path().join(".solana-outbox");
-        let old = legacy.join("alice/solana-devnet/sent/0001");
-        fs::create_dir_all(&old).unwrap();
-        fs::write(
-            old.join("intent.json"),
-            serde_json::to_vec(&staged("0001")).unwrap(),
-        )
-        .unwrap();
-        let evm = legacy.join("alice/anvil/sent/0002");
-        fs::create_dir_all(&evm).unwrap();
-        fs::write(evm.join("intent.json"), br#"{"kind":"send"}"#).unwrap();
-
-        assert_eq!(
-            SolanaOutbox::migrate_legacy_root(&legacy, &primary).unwrap(),
-            1
-        );
-        assert!(
-            primary
-                .join("alice/solana-devnet/sent/0001/intent.json")
-                .exists()
-        );
-        assert!(evm.join("intent.json").exists());
-        let outbox = SolanaOutbox::new(&primary).unwrap();
-        assert_eq!(outbox.walk_all_sent().unwrap().len(), 1);
     }
 
     /// Place `id` directly into `state` with the given status.
