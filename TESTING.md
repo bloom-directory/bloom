@@ -16,6 +16,53 @@ CI runs workspace tests through the split jobs in `.github/workflows/ci.yml`.
 Ignored live-network and docker suites are run only by the CI lanes that opt in
 with `--run-ignored`.
 
+## Triad and Solana ladders
+
+Do not begin with the most expensive integration suite. For an authority
+change, test the owning repository first, then its downstream protocol seam,
+then the real out-of-process triad. The exact cross-repository workflow is in
+[`DEVELOPMENT.md`](./DEVELOPMENT.md).
+
+Machine-side triad seams:
+
+```sh
+cargo test -p bloom-machine-client
+cargo test -p bloom-vfs
+cargo test -p bloom-petals --test triad_authority_fixture
+scripts/test-local-mainnet-integration.sh
+```
+
+Full BIP-39 projection fidelity is deliberately separate:
+
+```sh
+scripts/acceptance.sh
+```
+
+That script starts the real Machine, Broker, and Signer, builds the Broker
+debug ceremony driver, installs the deterministic authority fixture, and uses
+a kernel mount. It requires the sibling repositories and the same systemd,
+trusted-time, and mount prerequisites as the full developer launcher.
+
+Run native Solana tests from cheap to expensive:
+
+```sh
+cargo test -p bloom-solana
+cargo test -p bloom-solana-tx
+cargo test -p bloom-it --test solana_workflow -- --ignored --nocapture
+```
+
+The validator-backed tests require the pinned Agave v3.0.0 validator from
+`.github/workflows/solana-validator.yml`:
+
+```sh
+SOLANA_VALIDATOR_HTTP=http://127.0.0.1:8899 \
+  cargo test -p bloom-solana-tx --test local_validator -- \
+  --ignored --nocapture
+SOLANA_VALIDATOR_HTTP=http://127.0.0.1:8899 \
+  cargo test -p bloom-it --test solana_multi_account -- \
+  --ignored --nocapture
+```
+
 ## Categories
 
 ### unit
@@ -137,3 +184,8 @@ semantics and a worked example of how a wallet extension petal behaves.
 | --- | --- | --- |
 | `RUST_LOG` | all | Tracing filter; default to `warn` for tests. |
 | `BLOOM_BIN` | CLI-subprocess | Override compiled bloom binary path. |
+| `BLOOM_INTEGRATION_MACHINE_BIN` | triad | Exact Machine binary under test. |
+| `BLOOM_INTEGRATION_BROKER_BIN` | triad | Exact Broker binary under test. |
+| `BLOOM_INTEGRATION_SIGNER_BIN` | triad | Exact Signer binary under test. |
+| `BLOOM_INTEGRATION_STARTUP_TIMEOUT_SECS` | triad | Bounded full-stack startup timeout. |
+| `SOLANA_VALIDATOR_HTTP` | Solana acceptance | Local validator JSON-RPC endpoint. |
