@@ -305,7 +305,7 @@ async fn solana_full_stage_confirm_flow() -> Result<()> {
                 max_rps: None,
                 http_only: false,
             }],
-            expected_genesis_hex: Some(genesis.clone()),
+            expected_genesis_base58: Some(genesis.clone()),
             allow_broadcast: true,
         },
     );

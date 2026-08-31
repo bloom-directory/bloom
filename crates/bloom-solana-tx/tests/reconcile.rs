@@ -1,12 +1,19 @@
 //! Reconciliation test: a staged+sent transfer is reconciled to a receipt
 //! via a stubbed `getSignatureStatuses` node.
 
+use std::sync::Arc;
+
+use bloom_proto::AuditLog;
 use bloom_solana::{EndpointSpec, SolanaChainRegistry, SolanaClient, SolanaSpec};
 use bloom_solana_tx::outbox::{SolanaOutbox, SolanaOutboxState};
 use bloom_solana_tx::reconcile::SolanaReconciler;
 use bloom_solana_tx::types::{SolanaTxStatus, StagedSolanaTransfer};
 use serde_json::json;
 use tempfile::TempDir;
+
+fn audit(dir: &TempDir) -> Arc<AuditLog> {
+    Arc::new(AuditLog::open(dir.path().join("audit.jsonl")).unwrap())
+}
 
 async fn spawn_status_stub(
     confirmations: Option<u64>,
@@ -131,7 +138,7 @@ fn client(endpoint: &str) -> SolanaClient {
             max_rps: None,
             http_only: false,
         }],
-        expected_genesis_hex: None,
+        expected_genesis_base58: None,
         allow_broadcast: false,
     })
     .unwrap()
@@ -152,7 +159,7 @@ async fn reconciles_success_to_receipt() {
 
     let registry = SolanaChainRegistry::new();
     registry.add(client(&endpoint));
-    let reconciler = SolanaReconciler::new(outbox.clone(), registry);
+    let reconciler = SolanaReconciler::new(outbox.clone(), registry, audit(&dir));
     let updated = reconciler.tick().await;
     assert_eq!(updated, 1);
 
@@ -181,7 +188,7 @@ async fn reconciles_failure_to_receipt() {
 
     let registry = SolanaChainRegistry::new();
     registry.add(client(&endpoint));
-    let reconciler = SolanaReconciler::new(outbox.clone(), registry);
+    let reconciler = SolanaReconciler::new(outbox.clone(), registry, audit(&dir));
     assert_eq!(reconciler.tick().await, 1);
 
     let receipt = outbox
@@ -208,7 +215,7 @@ async fn unseen_signature_stays_unreconciled() {
 
     let registry = SolanaChainRegistry::new();
     registry.add(client(&endpoint));
-    let reconciler = SolanaReconciler::new(outbox.clone(), registry);
+    let reconciler = SolanaReconciler::new(outbox.clone(), registry, audit(&dir));
     assert_eq!(reconciler.tick().await, 0);
     assert!(
         outbox
@@ -233,7 +240,7 @@ async fn processed_signature_stays_unreconciled() {
 
     let registry = SolanaChainRegistry::new();
     registry.add(client(&endpoint));
-    let reconciler = SolanaReconciler::new(outbox.clone(), registry);
+    let reconciler = SolanaReconciler::new(outbox.clone(), registry, audit(&dir));
     assert_eq!(reconciler.tick().await, 0);
     assert!(
         outbox
@@ -258,7 +265,7 @@ async fn unseen_signature_becomes_terminal_after_blockhash_expiry() {
 
     let registry = SolanaChainRegistry::new();
     registry.add(client(&endpoint));
-    let reconciler = SolanaReconciler::new(outbox.clone(), registry);
+    let reconciler = SolanaReconciler::new(outbox.clone(), registry, audit(&dir));
     assert_eq!(reconciler.tick().await, 1);
     let receipt = outbox
         .read_receipt("alice", "solana-devnet", "0001-00001")
@@ -267,4 +274,65 @@ async fn unseen_signature_becomes_terminal_after_blockhash_expiry() {
     assert_eq!(receipt.outcome, "failed");
     assert_eq!(receipt.slot, None);
     assert_eq!(receipt.err.unwrap()["kind"], "blockhash_expired_unseen");
+}
+
+#[tokio::test]
+async fn audit_prewrite_failure_prevents_receipt_projection() {
+    let endpoint = spawn_status_stub(Some(1), false, true, 1).await;
+    let dir = TempDir::new().unwrap();
+    let outbox = SolanaOutbox::new(dir.path().join("outbox")).unwrap();
+    let staged = sent_entry("0001-00001");
+    outbox.write_pending(&staged, "plan").unwrap();
+    let entry = outbox.read("alice", "solana-devnet", "0001-00001").unwrap();
+    outbox
+        .write_broadcast_attempt(&entry, staged.signature.as_deref().unwrap(), b"raw", 1)
+        .unwrap();
+    outbox.transition(&entry, SolanaOutboxState::Sent).unwrap();
+
+    let registry = SolanaChainRegistry::new();
+    registry.add(client(&endpoint));
+    let audit = audit(&dir);
+    audit.fail_next_write_for_test();
+    let reconciler = SolanaReconciler::new(outbox.clone(), registry, audit.clone());
+    assert_eq!(reconciler.tick().await, 0);
+    assert!(
+        outbox
+            .read_receipt("alice", "solana-devnet", "0001-00001")
+            .unwrap()
+            .is_none()
+    );
+    assert!(audit.mutation_degradation().is_some());
+}
+
+#[tokio::test]
+async fn receipt_projection_result_loss_latches_on_restart() {
+    let endpoint = spawn_status_stub(Some(1), false, true, 1).await;
+    let dir = TempDir::new().unwrap();
+    let outbox = SolanaOutbox::new(dir.path().join("outbox")).unwrap();
+    let staged = sent_entry("0001-00001");
+    outbox.write_pending(&staged, "plan").unwrap();
+    let entry = outbox.read("alice", "solana-devnet", "0001-00001").unwrap();
+    outbox
+        .write_broadcast_attempt(&entry, staged.signature.as_deref().unwrap(), b"raw", 1)
+        .unwrap();
+    outbox.transition(&entry, SolanaOutboxState::Sent).unwrap();
+
+    let registry = SolanaChainRegistry::new();
+    registry.add(client(&endpoint));
+    let audit_path = dir.path().join("audit.jsonl");
+    let audit = audit(&dir);
+    audit.fail_after_writes_for_test(1);
+    let reconciler = SolanaReconciler::new(outbox.clone(), registry, audit.clone());
+    assert_eq!(reconciler.tick().await, 0);
+    assert!(
+        outbox
+            .read_receipt("alice", "solana-devnet", "0001-00001")
+            .unwrap()
+            .is_some()
+    );
+    drop(reconciler);
+    drop(audit);
+    let restarted = AuditLog::open(audit_path).unwrap();
+    assert!(restarted.mutation_degradation().is_some());
+    assert_eq!(restarted.pending_effect_correlations().unwrap().len(), 1);
 }

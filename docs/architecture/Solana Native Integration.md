@@ -104,7 +104,7 @@ config where a chain name is configured in both.
 ## Mainnet posture
 
 Mainnet uses the ordinary Solana transaction path. Operators must explicitly
-enable `allow_broadcast` and pin `expected_genesis_hex`; Machine verifies every
+enable `allow_broadcast` and pin `expected_genesis_base58`; Machine verifies every
 configured endpoint against that genesis at staging and again before its
 single broadcast attempt. Broker policy and the passkey ceremony remain
 mandatory.

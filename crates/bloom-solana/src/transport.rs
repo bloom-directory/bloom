@@ -24,6 +24,10 @@ const MAX_ATTEMPTS: usize = 3;
 /// Initial backoff; doubles per attempt (200 → 400 → 800 ms).
 const INITIAL_BACKOFF_MS: u64 = 200;
 
+/// Hard bound for one HTTP request, including body receipt. Without this a
+/// connected endpoint that stops responding can stall failover indefinitely.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Active probe interval, matching `bloom-rpc`'s cadence.
 const PROBE_INTERVAL: Duration = Duration::from_secs(15);
 
@@ -53,18 +57,19 @@ impl SolanaRpcClient {
     /// Build the transport from a spec. Fails with
     /// [`SolanaRpcError::NoEndpoints`] when no usable endpoint is configured.
     pub fn build(spec: &crate::SolanaSpec) -> Result<Self, SolanaRpcError> {
+        let client = reqwest::Client::builder()
+            .timeout(REQUEST_TIMEOUT)
+            .build()
+            .map_err(|e| SolanaRpcError::Transport(e.to_string()))?;
         let mut endpoints = Vec::new();
         for ep in &spec.endpoints {
             if ep.url.starts_with("ws://") || ep.url.starts_with("wss://") {
                 continue; // read client is HTTP-only for now
             }
-            let client = reqwest::Client::builder()
-                .build()
-                .map_err(|e| SolanaRpcError::Transport(e.to_string()))?;
             endpoints.push(Endpoint {
                 url: ep.url.clone(),
                 weight: ep.weight,
-                client,
+                client: client.clone(),
             });
         }
         if endpoints.is_empty() {

@@ -167,7 +167,7 @@ async fn local_validator_lifecycle_stage_sign_broadcast_reconcile() {
     let discovery_client = SolanaClient::build(&SolanaSpec {
         name: "solana-local-discovery".into(),
         endpoints: vec![endpoint_spec.clone()],
-        expected_genesis_hex: None,
+        expected_genesis_base58: None,
         allow_broadcast: false,
     })
     .unwrap();
@@ -178,7 +178,7 @@ async fn local_validator_lifecycle_stage_sign_broadcast_reconcile() {
     let client = SolanaClient::build(&SolanaSpec {
         name: "solana-local".into(),
         endpoints: vec![endpoint_spec],
-        expected_genesis_hex: Some(genesis),
+        expected_genesis_base58: Some(genesis),
         allow_broadcast: true,
     })
     .unwrap();
@@ -281,7 +281,8 @@ async fn local_validator_lifecycle_stage_sign_broadcast_reconcile() {
     // Reconcile: the sent entry must reach a confirmed receipt.
     let registry = SolanaChainRegistry::new();
     registry.add(client);
-    let reconciler = SolanaReconciler::new(outbox.clone(), registry);
+    let audit = Arc::new(bloom_proto::AuditLog::open(dir.path().join("audit.jsonl")).unwrap());
+    let reconciler = SolanaReconciler::new(outbox.clone(), registry, audit);
     for _ in 0..30 {
         if reconciler.tick().await > 0 {
             break;

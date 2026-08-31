@@ -704,7 +704,7 @@ mod tests {
             SolanaSpec {
                 name: "ethereum".into(),
                 endpoints: vec![],
-                expected_genesis_hex: None,
+                expected_genesis_base58: None,
                 allow_broadcast: false,
             },
         );
@@ -723,7 +723,7 @@ mod tests {
             SolanaSpec {
                 name: "solana-devnet".into(),
                 endpoints: vec![],
-                expected_genesis_hex: None,
+                expected_genesis_base58: None,
                 allow_broadcast: false,
             },
         );
@@ -1064,7 +1064,9 @@ allow_broadcast = true
                     max_rps: None,
                     http_only: false,
                 }],
-                expected_genesis_hex: Some(crate::chain::SOLANA_MAINNET_BETA_GENESIS_HASH.into()),
+                expected_genesis_base58: Some(
+                    crate::chain::SOLANA_MAINNET_BETA_GENESIS_HASH.into(),
+                ),
                 allow_broadcast: true,
             },
         );

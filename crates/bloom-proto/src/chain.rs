@@ -215,7 +215,8 @@ pub struct SolanaSpec {
     /// to a node whose `getGenesisHash` differs — the Solana analogue of
     /// EVM's chain-id binding (a message carries a blockhash, not a chain id).
     #[serde(default)]
-    pub expected_genesis_hex: Option<String>,
+    #[serde(alias = "expected_genesis_hex")]
+    pub expected_genesis_base58: Option<String>,
     /// Whether broadcasting is enabled on this cluster.
     #[serde(default)]
     pub allow_broadcast: bool,

@@ -435,7 +435,7 @@ async fn two_active_solana_children_select_sign_and_reconcile_independently() ->
                 max_rps: None,
                 http_only: false,
             }],
-            expected_genesis_hex: Some(genesis.clone()),
+            expected_genesis_base58: Some(genesis.clone()),
             allow_broadcast: true,
         },
     );
