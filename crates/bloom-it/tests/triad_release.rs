@@ -415,8 +415,16 @@ fn triad_developer_launcher_keeps_explicit_mounts_fail_closed() {
         !launcher.contains("command ls \"$mount_dir\""),
         "mount readiness must not issue an unbounded filesystem operation"
     );
+    // The socket wait is bounded by `$socket_wait_attempts`, not a literal.
+    // Asserting the literal made this test pass only until the bound was
+    // parameterised, so it matches the guard and the bounded comparison
+    // separately rather than one frozen line of shell.
     assert!(
-        launcher.contains("[ \"$attempts\" -lt 300 ] || {\n      if [ \"$label\" = machine ] && [ -n \"$mount_dir\" ]; then")
+        launcher.contains("[ \"$attempts\" -lt \"$socket_wait_attempts\" ] || {"),
+        "the Machine socket wait must stay bounded"
+    );
+    assert!(
+        launcher.contains("if [ \"$label\" = machine ] && [ -n \"$mount_dir\" ]; then")
             && launcher.contains("die \"$label did not publish its socket\""),
         "a Machine socket timeout must retain the explicit-mount fallback hint"
     );
