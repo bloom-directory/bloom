@@ -1362,8 +1362,7 @@ async fn execute_machine_command(
         }
         MachineCommand::WalletAccountRetire { name, fingerprint } => {
             let wallet_id = bloom_broker_api::Token::new(name)?;
-            let prepared = launch_account_retirement(daemon, &wallet_id, &fingerprint).await?;
-            format!("{}\n", serde_json::to_string_pretty(&prepared)?)
+            launch_account_retirement(daemon, &wallet_id, &fingerprint).await?
         }
         MachineCommand::WalletAddress {
             name,
