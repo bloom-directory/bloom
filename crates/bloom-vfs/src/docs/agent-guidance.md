@@ -42,6 +42,19 @@ has the relevant handlers mounted.
 
 When asked for an address for a certain wallet, consider displaying in-line the QR code image for the relevant wallet e.g. `wallets/<wallet>/address.qr.png`.
 
+`wallets/<wallet>/accounts.json` is the authenticated Broker projection of a
+BIP-39 wallet's public derived accounts. It includes public fingerprints,
+derivation paths, lifecycle state, supported suites, and chain projections; it
+never contains a mnemonic, seed, passphrase, PRF output, or private child key.
+Do not choose the first account in this list. A value-moving path with multiple
+compatible children must name the exact account or fail as ambiguous.
+
+Mnemonic import is an owner custody ceremony, not a mounted agent write. V1
+accepts the standard mnemonic with the empty BIP-39 passphrase only; a
+non-empty passphrase is unsupported. BIP-39 import creates the canonical EVM
+account. Additional account allocation exposed by Machine is currently limited
+to Solana children until EVM transaction surfaces carry an explicit selector.
+
 ## Creating a wallet (asynchronous passkey registration)
 
 Writing a plain name to `wallets/new` **starts a passkey registration — it
