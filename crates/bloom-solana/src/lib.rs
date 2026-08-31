@@ -234,7 +234,10 @@ impl SolanaClient {
             .rpc
             .call(
                 "getFeeForMessage",
-                &json!([message_b64, { "encoding": "base64" }]),
+                // The message carries the `processed` blockhash fetched by
+                // `get_latest_blockhash`. Quote it at the same commitment so
+                // a newly produced hash is visible to both calls.
+                &json!([message_b64, { "commitment": "processed" }]),
             )
             .await?;
         Ok(result.get("value").and_then(|v| v.as_u64()))
@@ -292,7 +295,16 @@ impl SolanaClient {
             .call_raw_after_genesis_check(
                 expected,
                 "sendTransaction",
-                &json!([tx_b64, { "encoding": "base64" }]),
+                // Preflight must observe the same bank used to fetch the
+                // transaction's recent blockhash. Otherwise a valid, newly
+                // staged transaction can fail as "Blockhash not found".
+                &json!([
+                    tx_b64,
+                    {
+                        "encoding": "base64",
+                        "preflightCommitment": "processed"
+                    }
+                ]),
                 || Ok(()),
             )
             .await
