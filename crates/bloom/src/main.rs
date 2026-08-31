@@ -786,33 +786,47 @@ async fn launch_account_allocation(
     wallet_id: &bloom_broker_api::Token,
     profile: &str,
 ) -> Result<String> {
-    use bloom_broker_api::{AccountTerms, DerivationProfile, DerivedAccountRequest};
+    use bloom_broker_api::{
+        ACCOUNT_TERMS_SCHEMA, AccountTerms, DerivationProfile, DerivedAccountRequest,
+    };
     use rand::RngCore as _;
 
     let (derivation_profile, requested_role) = match profile {
-        "bip44-evm-secp256k1-v1" => (DerivationProfile::Bip44EvmSecp256k1V1, "primary-evm"),
         "bip44-solana-slip10-ed25519-v1" => (
             DerivationProfile::Bip44SolanaSlip10Ed25519V1,
             "solana-account",
         ),
+        "bip44-evm-secp256k1-v1" => {
+            return Err(machine_error(
+                MachineErrorKind::InvalidParams,
+                "BIP-39 import already allocates the canonical EVM account; additional EVM \
+                 accounts are not exposed until EVM transaction surfaces accept an explicit \
+                 account selector",
+            )
+            .into());
+        }
         other => {
             return Err(machine_error(
                 MachineErrorKind::InvalidParams,
                 format!(
                     "unknown derivation profile '{other}'; expected \
-                     bip44-evm-secp256k1-v1 or bip44-solana-slip10-ed25519-v1"
+                     bip44-solana-slip10-ed25519-v1"
                 ),
             )
             .into());
         }
     };
 
-    let projection = daemon
-        .wallet_projections
-        .get_wallet(wallet_id)
+    let client = configured_broker_client(&daemon.home).map_err(|error| {
+        machine_error(
+            MachineErrorKind::Unavailable,
+            format!("custody requires the authenticated Machine-to-Broker edge: {error:#}"),
+        )
+    })?;
+    let wallet = client
+        .wallet(wallet_id.clone())
         .await
         .map_err(machine_wallet_lookup_error)?;
-    let wallet = &projection.wallet;
     if wallet.root_key_ref.is_some() {
         return Err(machine_error(
             MachineErrorKind::InvalidParams,
@@ -824,14 +838,6 @@ async fn launch_account_allocation(
         .into());
     }
 
-    // Authenticated Machine→Broker edge for the allocation request below.
-    let client = configured_broker_client(&daemon.home).map_err(|error| {
-        machine_error(
-            MachineErrorKind::Unavailable,
-            format!("custody requires the authenticated Machine-to-Broker edge: {error:#}"),
-        )
-    })?;
-
     let mut operation_bytes = [0_u8; 32];
     rand::thread_rng().fill_bytes(&mut operation_bytes);
     let operation_id = bloom_broker_api::OperationId::from_bytes(operation_bytes);
@@ -839,19 +845,11 @@ async fn launch_account_allocation(
         derivation_profile,
         requested_role: bloom_broker_api::Token::new(requested_role)
             .map_err(|error| machine_error(MachineErrorKind::InvalidParams, error.to_string()))?,
-        // EVM allocates successive address indices within account 0. Solana
-        // has no address-index path component, so `None` delegates automatic,
-        // never-reusing account selection to the authoritative Signer registry
-        // transaction (which sees active, retired, and tombstoned rows).
-        account: (!matches!(
-            derivation_profile,
-            DerivationProfile::Bip44SolanaSlip10Ed25519V1
-        ))
-        .then_some(0),
+        account: None,
     };
     let expires_at_ms = current_unix_ms().saturating_add(30 * 60 * 1_000);
     let terms = AccountTerms {
-        schema: bloom_broker_api::Token::new("bloom.account_terms.v1")
+        schema: bloom_broker_api::Token::new(ACCOUNT_TERMS_SCHEMA)
             .map_err(|error| machine_error(MachineErrorKind::InvalidParams, error.to_string()))?,
         wallet_id: wallet_id.clone(),
         seed_profile: bloom_broker_api::WalletSeedProfile::Bip39MulticurveV1,
@@ -1330,8 +1328,7 @@ async fn execute_machine_command(
         }
         MachineCommand::WalletAccountAllocate { name, profile } => {
             let wallet_id = bloom_broker_api::Token::new(name)?;
-            let prepared = launch_account_allocation(daemon, &wallet_id, &profile).await?;
-            format!("{}\n", serde_json::to_string_pretty(&prepared)?)
+            launch_account_allocation(daemon, &wallet_id, &profile).await?
         }
         MachineCommand::WalletAccountRetire { name, fingerprint } => {
             let wallet_id = bloom_broker_api::Token::new(name)?;
@@ -2382,8 +2379,8 @@ enum WalletCmd {
     /// under the wallet's BIP-39 root.
     AccountAllocate {
         name: String,
-        /// Derivation profile: `bip44-evm-secp256k1-v1` or
-        /// `bip44-solana-slip10-ed25519-v1`.
+        /// Derivation profile. V1 exposes `bip44-solana-slip10-ed25519-v1`;
+        /// BIP-39 import creates the canonical EVM account itself.
         #[arg(long)]
         profile: String,
     },
