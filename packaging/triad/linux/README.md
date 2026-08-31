@@ -90,3 +90,16 @@ service's state root and passes its absolute path through
 its checkpoint records. In particular, the Machine login and Broker cannot
 read the Signer checkpoint root. Runtime checkpoint writes reject symlinks,
 non-owned directories, sequence rollback, and replacement.
+
+## Service logs
+
+Machine, Broker, Signer, and the session sentinel emit JSON Lines to journald
+under stable identifiers. For example:
+
+```sh
+journalctl --user -u bloom-machine.service -o cat
+sudo journalctl -t bloom-broker-$(id -u) -o cat
+sudo journalctl -t bloom-signer-$(id -u) -o cat
+```
+
+Journal persistence, retention, and read access remain host policy.

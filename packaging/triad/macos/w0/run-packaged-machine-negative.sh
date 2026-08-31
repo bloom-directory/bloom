@@ -271,6 +271,7 @@ sudo -H -u "$login_user" env \
   BLOOM_BROKER_SOCKET="$installed_broker_socket" \
   BLOOM_MACHINE_IDENTITY="$machine_identity" \
   BLOOM_EDGE_MANIFEST="$edge_manifest" \
+  BLOOM_LOG_OUTPUT=json-stderr \
   "$machine_binary" --home "$clean_home" serve \
     --endpoint "unix:$machine_socket" \
     >"$work/seed-machine-service.log" 2>&1 &
@@ -369,6 +370,72 @@ sudo -H -u "$login_user" env \
   "$machine_binary" --home "$clean_home" --connect "unix:$machine_socket" \
     wallet commit-policy "$policy_operation_id" \
   >"$work/policy-commit-live.log" 2>&1
+
+broker_log="/private/var/log/bloom/$login_uid/broker.jsonl"
+signer_log="/private/var/log/bloom/$login_uid/signer.jsonl"
+newsyslog_config="/etc/newsyslog.d/bloom-$login_uid.conf"
+for service_log in "$broker_log" "$signer_log"; do
+  sudo -u "$login_user" test -r "$service_log"
+  if sudo -u "$login_user" test -w "$service_log"; then
+    echo "enrolled user can write canonical service log $service_log" >&2
+    exit 1
+  fi
+done
+for protected_state in \
+  "/private/var/db/bloom/$login_uid/broker/journal.db" \
+  "/private/var/db/bloom/$login_uid/signer/journal.db"
+do
+  if sudo -u "$login_user" test -r "$protected_state"; then
+    echo "enrolled user can read protected service state $protected_state" >&2
+    exit 1
+  fi
+done
+grep -F "$policy_operation_id" "$broker_log" >/dev/null
+grep -F "$policy_operation_id" "$signer_log" >/dev/null
+/usr/bin/python3 - "$work/seed-machine-service.log" "$policy_operation_id" <<'PY'
+import json
+import pathlib
+import sys
+
+events = [json.loads(line) for line in pathlib.Path(sys.argv[1]).read_text().splitlines()]
+operation_id = sys.argv[2]
+if not any(
+    event.get("fields", {}).get("operation_id") == operation_id
+    and event.get("fields", {}).get("event") in {
+        "machine.policy_update.transition",
+        "machine.durable_mutation",
+        "rpc.request_completed",
+    }
+    for event in events
+):
+    raise SystemExit("Machine structured log omitted the policy operation ID")
+PY
+
+# Force the package-owned rotation while both services remain loaded. Their
+# per-event writers must reopen the canonical path rather than retaining the
+# renamed inode.
+/usr/sbin/newsyslog -F -f "$newsyslog_config"
+sudo -u "$login_user" "$machine_binary" serve triad-health-check "$(
+  plutil -extract build_digest raw -o - \
+    "/Library/Application Support/BloomTriad/config/$login_uid/broker/config.json"
+)" >/dev/null
+/usr/bin/python3 - "$broker_log.0" "$signer_log.0" "$broker_log" "$signer_log" <<'PY'
+import json
+import pathlib
+import sys
+
+for raw in sys.argv[1:]:
+    path = pathlib.Path(raw)
+    lines = path.read_text().splitlines()
+    if not lines:
+        raise SystemExit(f"rotated/current service log is empty: {path}")
+    for line in lines:
+        json.loads(line)
+PY
+for service_log in "$broker_log" "$signer_log"; do
+  sudo -u "$login_user" test -r "$service_log"
+  if sudo -u "$login_user" test -w "$service_log"; then exit 1; fi
+done
 sudo -H -u "$login_user" env \
   BLOOM_HOME="$clean_home" \
   BLOOM_MACHINE_IDENTITY="$machine_identity" \

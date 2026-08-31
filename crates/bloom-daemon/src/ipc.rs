@@ -56,7 +56,7 @@ use tokio::io::{
 };
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Notify;
-use tracing::{debug, info, trace, warn};
+use tracing::{Instrument as _, debug, info, trace, warn};
 
 /// Maximum physical newline-delimited frame and reassembled logical message.
 /// Logical messages above one frame are transported as ordered base64 chunks.
@@ -665,6 +665,7 @@ pub struct IpcServer {
     petal_mutation: Arc<tokio::sync::Mutex<()>>,
     batch_confirmation: Option<Arc<dyn BatchConfirmationService>>,
     machine_commands: Option<Arc<dyn MachineCommandService>>,
+    ready: Option<Arc<dyn Fn() + Send + Sync>>,
     shutdown: Arc<Notify>,
 }
 
@@ -680,6 +681,7 @@ impl IpcServer {
             petal_mutation: Arc::new(tokio::sync::Mutex::new(())),
             batch_confirmation: None,
             machine_commands: None,
+            ready: None,
             shutdown: Arc::new(Notify::new()),
         }
     }
@@ -714,6 +716,12 @@ impl IpcServer {
 
     pub fn with_machine_commands(mut self, service: Arc<dyn MachineCommandService>) -> Self {
         self.machine_commands = Some(service);
+        self
+    }
+
+    /// Run a small notification after the secured socket is published.
+    pub fn with_ready_callback(mut self, ready: Arc<dyn Fn() + Send + Sync>) -> Self {
+        self.ready = Some(ready);
         self
     }
 
@@ -757,6 +765,9 @@ impl IpcServer {
         listener.set_nonblocking(true)?;
         let listener = UnixListener::from_std(listener)?;
         info!(socket = %socket_path.display(), "ipc.listening");
+        if let Some(ready) = &self.ready {
+            ready();
+        }
 
         loop {
             tokio::select! {
@@ -770,7 +781,8 @@ impl IpcServer {
                             let observed_uid = match stream.peer_cred() {
                                 Ok(credential) => credential.uid(),
                                 Err(error) => {
-                                    warn!(%error, "ipc.peer_credentials_failed");
+                                    let _ = error;
+                                    warn!(error_kind = "peer_credentials", "ipc.peer_credentials_failed");
                                     continue;
                                 }
                             };
@@ -783,15 +795,20 @@ impl IpcServer {
                             }
                             trace!("ipc.conn_accepted");
                             let me = self.clone();
+                            let connection_span = tracing::Span::current();
                             tokio::spawn(async move {
                                 match me.handle_conn(stream).await {
                                     Ok(()) => trace!("ipc.conn_closed"),
-                                    Err(e) => warn!(error = %e, "ipc.conn_err"),
+                                    Err(error) => {
+                                        let _ = error;
+                                        warn!(error_kind = "connection_io", "ipc.conn_err")
+                                    },
                                 }
-                            });
+                            }.instrument(connection_span));
                         }
-                        Err(e) => {
-                            warn!(error = %e, "ipc.accept_err");
+                        Err(error) => {
+                            let _ = error;
+                            warn!(error_kind = "listener_accept", "ipc.accept_err");
                         }
                     }
                 }
@@ -885,12 +902,15 @@ impl IpcServer {
                     }
                 }
                 Err(e) => {
-                    debug!(error = %e, "ipc.parse_error");
+                    debug!(error_kind = "request_parse", "ipc.parse_error");
                     Response::err(Value::Null, -32700, format!("parse error: {e}"))
                 }
             };
-            let out = serde_json::to_vec(&resp).unwrap_or_else(|e| {
-                debug!(error = %e, "ipc.response_serialise_failed");
+            let out = serde_json::to_vec(&resp).unwrap_or_else(|_error| {
+                debug!(
+                    error_kind = "response_serialise",
+                    "ipc.response_serialise_failed"
+                );
                 // We cannot echo the request id here (serialisation of the
                 // proper Response already failed, so we may not have a
                 // well-formed id either). `null` is the safe default per
@@ -2026,7 +2046,7 @@ impl IpcClient {
                     daemon: daemon_protocol,
                 })?;
         if let Some(error) = v.get("error") {
-            debug!(%method, error = %error, "ipc.client.rpc_error");
+            debug!(%method, error_kind = "remote_rpc", "ipc.client.rpc_error");
             let error: RpcError = serde_json::from_value(error.clone())
                 .map_err(|error| IpcClientError::Protocol(error.to_string()))?;
             let machine = error

@@ -719,9 +719,7 @@ fn serve_starts_audited_projection_refresh_after_fallible_setup() {
         .find("let endpoint = resolve_server_endpoint")
         .unwrap();
     let server = serve.find("let server = IpcServer::new").unwrap();
-    let background = serve
-        .find("let sweeper = d.spawn_background_tasks()")
-        .unwrap();
+    let background = serve.find("d.spawn_background_tasks()").unwrap();
 
     assert!(
         mount < background && endpoint < background && server < background,
@@ -1040,6 +1038,7 @@ fn stage_macos_install_digest(
         .env("BLOOM_MACOS_MACHINE_BROKER_GID", "260501")
         .env("BLOOM_MACOS_BROKER_SIGNER_GID", "260502")
         .env("BLOOM_MACOS_REVOKE_GID", "260503")
+        .env("BLOOM_MACOS_LOG_GID", "260504")
         .env("BLOOM_RELEASE_DIGEST", digest)
         .output()
         .unwrap()
@@ -1525,6 +1524,7 @@ fn linux_installer_upgrade_rotation_and_confirmed_uninstall_are_staged_safely() 
     let root = directory.path().join("root");
     fs::create_dir(&root).unwrap();
     let payload = make_installer_payload(directory.path());
+    let release_digest = hex::encode(Sha256::digest(b"test payload\n"));
     let installer = release_script("install-linux.sh");
     let install = Command::new(&installer)
         .args(["install"])
@@ -1558,7 +1558,10 @@ fn linux_installer_upgrade_rotation_and_confirmed_uninstall_are_staged_safely() 
     ));
     assert_eq!(
         fs::read_to_string(root.join("etc/bloom/1000/machine.env")).unwrap(),
-        "BLOOM_NFS_LISTEN=127.0.0.1:20000\n"
+        format!(
+            "BLOOM_NFS_LISTEN=127.0.0.1:20000\nBLOOM_RELEASE_DIGEST={}\n",
+            release_digest
+        )
     );
     assert!(root.join("home/alice/bloom").is_dir());
     assert_eq!(
@@ -1979,6 +1982,7 @@ fn linux_installer_allocates_distinct_ports_and_rejects_mixed_release_sets() {
     let root = directory.path().join("root");
     fs::create_dir(&root).unwrap();
     let payload = make_installer_payload(&directory.path().join("release-a"));
+    let release_digest = hex::encode(Sha256::digest(b"test payload\n"));
     let installer = release_script("install-linux.sh");
     for (uid, user) in [("1000", "alice"), ("2000", "bob")] {
         let installed = Command::new(&installer)
@@ -1997,11 +2001,17 @@ fn linux_installer_allocates_distinct_ports_and_rejects_mixed_release_sets() {
     }
     assert_eq!(
         fs::read_to_string(root.join("etc/bloom/1000/machine.env")).unwrap(),
-        "BLOOM_NFS_LISTEN=127.0.0.1:20000\n"
+        format!(
+            "BLOOM_NFS_LISTEN=127.0.0.1:20000\nBLOOM_RELEASE_DIGEST={}\n",
+            release_digest
+        )
     );
     assert_eq!(
         fs::read_to_string(root.join("etc/bloom/2000/machine.env")).unwrap(),
-        "BLOOM_NFS_LISTEN=127.0.0.1:20001\n"
+        format!(
+            "BLOOM_NFS_LISTEN=127.0.0.1:20001\nBLOOM_RELEASE_DIGEST={}\n",
+            release_digest
+        )
     );
     let fstab = fs::read_to_string(root.join("etc/fstab")).unwrap();
     assert!(fstab.contains("port=20000") && fstab.contains("port=20001"));
@@ -2105,6 +2115,32 @@ fn linux_installer_demand_starts_only_the_active_login_ceremony_socket() {
     assert!(!installer.contains(
         "systemctl enable --now \\\n        \"bloom-broker-ceremony@$login_uid.socket\""
     ));
+}
+
+#[test]
+fn linux_services_send_structured_stderr_to_stable_journal_identifiers() {
+    let root = workspace().join("packaging/triad/linux");
+    for (relative, identifier) in [
+        ("systemd-user/bloom-machine.service", "bloom-machine"),
+        ("systemd-user/bloom-session.service", "bloom-session"),
+        ("systemd/bloom-broker@.service.in", "bloom-broker-%i"),
+        ("systemd/bloom-signer@.service.in", "bloom-signer-%i"),
+    ] {
+        let source = fs::read_to_string(root.join(relative)).unwrap();
+        assert!(source.contains("StandardOutput=journal"));
+        assert!(source.contains("StandardError=journal"));
+        assert!(source.contains(&format!("SyslogIdentifier={identifier}")));
+    }
+    for relative in [
+        "systemd-user/bloom-machine.service",
+        "systemd-user/bloom-session.service",
+    ] {
+        assert!(
+            fs::read_to_string(root.join(relative))
+                .unwrap()
+                .contains("Environment=BLOOM_LOG_OUTPUT=json-stderr")
+        );
+    }
 }
 
 #[test]
@@ -2309,6 +2345,16 @@ fn macos_installer_stages_unix_principals_launchdaemons_and_confirmed_uninstall(
             service.to_ascii_uppercase()
         )));
         assert!(source.contains("BLOOM_AUTHORITY_EDGE_HISTORY"));
+        assert!(source.contains(&format!("BLOOM_{}_LOG_PATH", service.to_ascii_uppercase())));
+        assert!(source.contains(&format!(
+            "BLOOM_{}_LOG_OWNER_UID",
+            service.to_ascii_uppercase()
+        )));
+        assert!(source.contains(&format!(
+            "BLOOM_{}_LOG_READER_GID",
+            service.to_ascii_uppercase()
+        )));
+        assert!(source.contains("<string>/dev/null</string>"));
         assert!(source.contains("<key>UserName</key>"));
         assert_eq!(
             fs::metadata(plist).unwrap().permissions().mode() & 0o777,
@@ -2354,6 +2400,21 @@ fn macos_installer_stages_unix_principals_launchdaemons_and_confirmed_uninstall(
             & 0o777,
         0o700
     );
+    for service in ["broker", "signer"] {
+        for name in [
+            format!("{service}.jsonl"),
+            format!("{service}-bootstrap.log"),
+        ] {
+            let log = root.join("var/log/bloom/501").join(name);
+            assert_eq!(
+                fs::metadata(log).unwrap().permissions().mode() & 0o777,
+                0o640
+            );
+        }
+    }
+    let rotation = fs::read_to_string(root.join("etc/newsyslog.d/bloom-501.conf")).unwrap();
+    assert!(rotation.contains("broker.jsonl bloom-broker-501:bloom-log-501 640 5 1024 * BN"));
+    assert!(rotation.contains("signer.jsonl bloom-signer-501:bloom-log-501 640 5 1024 * BN"));
     let authority_history = fs::read_to_string(
         root.join("Library/Application Support/BloomTriad/config/501/authority-edge-history.json"),
     )
@@ -2490,6 +2551,28 @@ fn macos_staged_lifecycle_upgrades_repairs_retains_restores_and_rejects_downgrad
             .status
             .success()
     );
+    let second = Command::new(&installer)
+        .args(["install"])
+        .arg(&root)
+        .args(["502", "bob"])
+        .arg(&baseline)
+        .env("BLOOM_ALLOW_TEST_UNCLAIMED", "true")
+        .env("BLOOM_MACOS_BROKER_UID", "250511")
+        .env("BLOOM_MACOS_SIGNER_UID", "250512")
+        .env("BLOOM_MACOS_BROKER_GID", "260509")
+        .env("BLOOM_MACOS_SIGNER_GID", "260510")
+        .env("BLOOM_MACOS_MACHINE_BROKER_GID", "260511")
+        .env("BLOOM_MACOS_BROKER_SIGNER_GID", "260512")
+        .env("BLOOM_MACOS_REVOKE_GID", "260513")
+        .env("BLOOM_MACOS_LOG_GID", "260514")
+        .env("BLOOM_RELEASE_DIGEST", &old_digest)
+        .output()
+        .unwrap();
+    assert!(
+        second.status.success(),
+        "{}",
+        String::from_utf8_lossy(&second.stderr)
+    );
     let identity =
         root.join("Library/Application Support/BloomTriad/config/501/signer/identity.json");
     let identity_before = fs::read(&identity).unwrap();
@@ -2505,12 +2588,35 @@ fn macos_staged_lifecycle_upgrades_repairs_retains_restores_and_rejects_downgrad
         Path::new("releases").join(&new_digest)
     );
     assert_eq!(fs::read(&identity).unwrap(), identity_before);
+    for uid in ["501", "502"] {
+        let enrollment = fs::read_to_string(root.join(format!(
+            "Library/Application Support/BloomTriad/enrollments/{uid}.json"
+        )))
+        .unwrap();
+        assert!(enrollment.contains(&new_digest));
+        for service in ["broker", "signer"] {
+            let log = root.join(format!("var/log/bloom/{uid}/{service}.jsonl"));
+            assert_eq!(
+                fs::metadata(log).unwrap().permissions().mode() & 0o777,
+                0o640
+            );
+        }
+    }
     assert!(
         stage_macos_install_digest(&installer, &root, &candidate, &new_digest)
             .status
             .success(),
         "same-digest repair must be idempotent"
     );
+
+    // A retained pre-observability enrollment must not acquire a sentinel
+    // log GID that prevents restore from performing the real migration.
+    let enrollment_501 = root.join("Library/Application Support/BloomTriad/enrollments/501.json");
+    let mut legacy: serde_json::Value =
+        serde_json::from_slice(&fs::read(&enrollment_501).unwrap()).unwrap();
+    legacy.as_object_mut().unwrap().remove("log_group");
+    legacy.as_object_mut().unwrap().remove("log_gid");
+    fs::write(&enrollment_501, serde_json::to_vec(&legacy).unwrap()).unwrap();
 
     let retained = Command::new(&installer)
         .args(["uninstall", "--retain-custody"])
@@ -2532,6 +2638,11 @@ fn macos_staged_lifecycle_upgrades_repairs_retains_restores_and_rejects_downgrad
         root.join("Library/Application Support/BloomTriad/retained/501.json")
             .is_file()
     );
+    assert!(
+        !fs::read_to_string(root.join("Library/Application Support/BloomTriad/retained/501.json"))
+            .unwrap()
+            .contains("log_gid")
+    );
     assert_eq!(fs::read(&identity).unwrap(), identity_before);
 
     let restored = Command::new(&installer)
@@ -2547,6 +2658,7 @@ fn macos_staged_lifecycle_upgrades_repairs_retains_restores_and_rejects_downgrad
         .env("BLOOM_MACOS_MACHINE_BROKER_GID", "260501")
         .env("BLOOM_MACOS_BROKER_SIGNER_GID", "260502")
         .env("BLOOM_MACOS_REVOKE_GID", "260503")
+        .env("BLOOM_MACOS_LOG_GID", "260504")
         .env("BLOOM_RELEASE_DIGEST", &new_digest)
         .output()
         .unwrap();
@@ -2621,6 +2733,7 @@ fn macos_restore_cannot_downgrade_the_release_shared_by_an_active_login() {
         .env("BLOOM_MACOS_MACHINE_BROKER_GID", "260511")
         .env("BLOOM_MACOS_BROKER_SIGNER_GID", "260512")
         .env("BLOOM_MACOS_REVOKE_GID", "260513")
+        .env("BLOOM_MACOS_LOG_GID", "260514")
         .env("BLOOM_RELEASE_DIGEST", &new_digest)
         .output()
         .unwrap();
@@ -2643,6 +2756,7 @@ fn macos_restore_cannot_downgrade_the_release_shared_by_an_active_login() {
         .env("BLOOM_MACOS_MACHINE_BROKER_GID", "260501")
         .env("BLOOM_MACOS_BROKER_SIGNER_GID", "260502")
         .env("BLOOM_MACOS_REVOKE_GID", "260503")
+        .env("BLOOM_MACOS_LOG_GID", "260504")
         .env("BLOOM_RELEASE_DIGEST", &old_digest)
         .output()
         .unwrap();

@@ -107,3 +107,17 @@ Static template and staged-root tests are conformance inputs, not proof of an
 operating-system boundary. Tests that create accounts, load LaunchDaemons,
 change `pf`, or exercise multiple GUI users run only on disposable macOS VMs.
 The guarded harness and its current coverage are documented under `w0/`.
+
+## Service logs
+
+Broker and Signer write complete JSON Lines records to
+`/private/var/log/bloom/LOGIN_UID/{broker,signer}.jsonl`. The enrolled user can
+read these files without `sudo` but cannot modify them; service state remains
+private. Rotation is bounded by `/etc/newsyslog.d/bloom-LOGIN_UID.conf` and
+does not require restarting either daemon. Session and containment lifecycle
+messages use launchd's native process logging rather than the per-enrollment
+diagnostic files.
+
+Each daemon also has a small bounded `SERVICE-bootstrap.log` launchd stderr
+fallback. It is only for fixed, sanitized initialization failures that happen
+before the canonical app writer is available; routine events never use it.
