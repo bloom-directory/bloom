@@ -251,7 +251,7 @@ async fn solana_full_stage_confirm_flow() -> Result<()> {
     //    derivation crate — not a hardcoded fixture key.
     step("1", "derive the Solana account from the BIP-39 mnemonic");
     let seed =
-        bloom_signer_derive::seed_from_mnemonic(MNEMONIC, "").map_err(|e| anyhow!("seed: {e}"))?;
+        bloom_signer_derive::seed_from_mnemonic(MNEMONIC).map_err(|e| anyhow!("seed: {e}"))?;
     let seed64: [u8; 64] = (*seed).as_slice().try_into().unwrap();
     let derived = bloom_signer_derive::derive_solana_account(&seed64, 0)
         .map_err(|e| anyhow!("derive: {e}"))?;
