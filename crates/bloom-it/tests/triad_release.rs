@@ -176,6 +176,7 @@ fn macos_release_candidate_matches_the_linux_candidate_contract() {
     assert!(release_gate.contains("installer/release/install-linux.sh"));
     assert!(release_gate.contains("installer/release/install-macos.sh"));
     assert!(release_gate.contains("BLOOM_ALLOW_TEST_UNCLAIMED=true"));
+    assert!(release_gate.contains("BLOOM_MACOS_LOG_GID=260504"));
     assert!(release_gate.contains("macos-root/usr/local/libexec/bloom/current/bloom-broker"));
 
     let installer = fs::read_to_string(release_script("install-macos.sh")).unwrap();

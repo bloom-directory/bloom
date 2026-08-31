@@ -186,6 +186,7 @@ else
     BLOOM_MACOS_MACHINE_BROKER_GID=260501 \
     BLOOM_MACOS_BROKER_SIGNER_GID=260502 \
     BLOOM_MACOS_REVOKE_GID=260503 \
+    BLOOM_MACOS_LOG_GID=260504 \
     BLOOM_RELEASE_DIGEST="$release_digest" \
     "$install_payload/installer/release/install-macos.sh" \
       install "$work/macos-root" 501 releaseuser "$install_payload"
