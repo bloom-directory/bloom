@@ -2705,6 +2705,8 @@ fn macos_active_legacy_enrollment_migrates_log_identity_before_upgrade() {
         serde_json::from_slice(&fs::read(&enrollment).unwrap()).unwrap();
     legacy.as_object_mut().unwrap().remove("log_group");
     legacy.as_object_mut().unwrap().remove("log_gid");
+    legacy["state"] = serde_json::Value::String("activating".to_owned());
+    legacy["release_digest"] = serde_json::Value::String("33".repeat(32));
     fs::write(&enrollment, serde_json::to_vec(&legacy).unwrap()).unwrap();
     let transaction = root.join("Library/Application Support/BloomTriad/upgrade-transaction");
     fs::create_dir(&transaction).unwrap();
@@ -2714,7 +2716,7 @@ fn macos_active_legacy_enrollment_migrates_log_identity_before_upgrade() {
     )
     .unwrap();
     fs::write(transaction.join("old-digest"), format!("{old_digest}\n")).unwrap();
-    fs::write(transaction.join("new-digest"), format!("{new_digest}\n")).unwrap();
+    fs::write(transaction.join("new-digest"), format!("{}\n", "33".repeat(32))).unwrap();
 
     let migrated = stage_macos_install_digest(&installer, &root, &candidate, &new_digest);
     assert!(
@@ -2722,6 +2724,8 @@ fn macos_active_legacy_enrollment_migrates_log_identity_before_upgrade() {
         "{}",
         String::from_utf8_lossy(&migrated.stderr)
     );
+    assert!(String::from_utf8_lossy(&migrated.stderr)
+        .contains("resuming interrupted Bloom macOS upgrade toward the requested release"));
     let migrated_enrollment = fs::read_to_string(&enrollment).unwrap();
     assert!(migrated_enrollment.contains(r#""log_group":"bloom-log-501""#));
     assert!(migrated_enrollment.contains(r#""log_gid":260504"#));
@@ -2811,19 +2815,19 @@ fn macos_restore_cannot_downgrade_the_release_shared_by_an_active_login() {
 }
 
 #[test]
-fn macos_installer_silences_transient_health_failures_and_replays_the_last_error() {
+fn macos_installer_does_not_gate_installation_on_runtime_health() {
     let installer = fs::read_to_string(release_script("install-macos.sh")).unwrap();
     assert!(
-        installer.contains(r#"health_output="$(mktemp "$scratch/health-check.XXXXXX")""#),
-        "health-check output must be captured privately during activation retries"
+        installer.contains(r#"launchctl kickstart -k "$domain/$label""#),
+        "loaded launchd jobs must be explicitly started when the domain defers RunAtLoad"
     );
     assert!(
-        installer.contains(r#">"$health_output" 2>&1; then return"#),
-        "a successful readiness retry must suppress earlier transient failures"
+        installer.contains("Bloom installed, but launchd deferred"),
+        "deferred runtime startup must be reported without reversing the upgrade"
     );
     assert!(
-        installer.contains(r#"cat "$health_output" >&2"#),
-        "the final readiness diagnostic must be replayed when activation fails"
+        !installer.contains("triad-health-check"),
+        "runtime health belongs to post-install diagnostics, not the upgrade transaction"
     );
 }
 

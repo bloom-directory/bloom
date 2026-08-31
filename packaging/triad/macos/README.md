@@ -64,16 +64,16 @@ The installer keeps digest-named releases immutable. A same-digest install
 verifies every installed binary and repairs integration files without replacing
 custody. A compatible different digest is staged, all enrolled jobs are stopped,
 the shared `current` symlink and enrollment build digests are switched
-atomically, and each installed triad is checked before the new digest is
-published `active`. A durable transaction makes the next invocation roll an
-interrupted or failed activation back to the prior complete digest. Compatibility
-metadata is mandatory and a state-schema downgrade is rejected before services
-are stopped.
+atomically, and launchd is asked to reload the installed jobs. A durable forward
+intent makes the next invocation continue toward the newly requested signed
+digest after interruption; upgrades never roll back to an older binary because
+a runtime job is unhealthy or deferred. Compatibility metadata is mandatory and
+a state-schema downgrade is rejected before services are stopped.
 
 `uninstall --retain-custody / LOGIN_UID` removes launchd, packet-filter, and
 runtime integration while preserving service principals, identities, and
 encrypted state. `restore` accepts only the exact signed retained release and
-publishes Machine access after triad health succeeds. Permanent deletion remains
+reinstalls its integration without rotating custody. Permanent deletion remains
 a separate `delete-bloom-login-LOGIN_UID` confirmation and is described as a
 purge because it destroys custody irrecoverably. Upgrade and restore never run
 enrollment-material generation and never rotate transport or custody identity.
@@ -83,12 +83,12 @@ enrollment-material mode against the signed public templates in `config/`.
 Five application identities and the Broker/Signer signing authorities are
 fresh per login; only their public cross-pins enter the root-owned manifest.
 The temporary root-only generation directory is removed on success or error.
-The root-owned enrollment record is published as `activating`; only the session
-sentinel, PF monitor, and private installer health probe accept that state.
-Ordinary Machine discovery requires `active`, which is atomically published
-only after authenticated Broker and Signer health succeeds. A failed fresh
-install removes Directory Service records created by that invocation. The
-operator must explicitly uninstall any other partial state before retrying.
+The root-owned enrollment record uses `activating` while durable files are being
+converged and is published `active` once the requested digest is selected.
+Runtime health is reported by Bloom after installation and is not an installer
+commit condition. A failed fresh install removes Directory Service records
+created by that invocation. An interrupted upgrade retains its forward intent
+so the next invocation can finish the same convergence safely.
 
 The packet-filter template denies new Broker IP flows and all Signer TCP/UDP
 flows by numeric effective UID. A root/wheel one-shot monitor is launched once
@@ -99,7 +99,7 @@ ownership, mode, availability bit, and freshness before readiness or any
 signing/custody/policy mutation; revocation and public status remain
 available. Production activation is prohibited until the disposable macOS W0
 lane proves IPv4/IPv6, TCP/UDP, loopback, accepted Broker responses, anchor
-drift, Fast User Switching, upgrade/rollback, interrupted recovery,
+drift, Fast User Switching, forward upgrades, interrupted resumption,
 retain/restore, same-digest repair, and purge behavior. Local Signer is the only
 initial backend.
 

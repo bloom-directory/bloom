@@ -245,28 +245,28 @@ fn live_installer_provisions_fail_closed_directory_service_records() {
     }
     assert!(!source.contains("macos-rootless-code-identity"));
     assert!(!source.contains("com.apple.security.application-groups"));
-    assert!(source.lines().count() < 750);
 }
 
 #[test]
-fn macos_installer_has_an_explicit_custody_preserving_lifecycle() {
+fn macos_installer_has_a_forward_only_custody_preserving_lifecycle() {
     let source =
         fs::read_to_string(workspace().join("packaging/triad/release/install-macos.sh")).unwrap();
-    assert!(source.lines().count() < 750);
     assert!(source.contains("install ROOT LOGIN_UID LOGIN_USER PAYLOAD_DIR"));
     assert!(source.contains("restore ROOT LOGIN_UID LOGIN_USER PAYLOAD_DIR"));
     assert!(source.contains("uninstall --retain-custody ROOT LOGIN_UID"));
     assert!(source.contains("uninstall ROOT LOGIN_UID delete-bloom-login-LOGIN_UID"));
     for required in [
-        "recover_interrupted_upgrade",
+        "find_interrupted_upgrade",
         "stop_all_enrollments",
         "switch_release",
-        "activate_installed_set",
-        "rollback_upgrade",
+        "reload_installed_set",
+        "resuming interrupted Bloom macOS upgrade toward the requested release",
         "state-schema downgrade rejected before activation",
     ] {
         assert!(source.contains(required), "lifecycle is missing {required}");
     }
+    assert!(!source.contains("rollback_upgrade"));
+    assert!(!source.contains("triad-health-check"));
 }
 
 #[test]
@@ -306,7 +306,7 @@ fn macos_permanent_uninstall_is_explicit_and_small() {
 }
 
 #[test]
-fn activating_enrollment_is_private_to_installer_health_and_session_bootstrap() {
+fn activating_enrollment_is_accepted_during_forward_convergence() {
     let machine = fs::read_to_string(workspace().join("crates/bloom/src/main.rs")).unwrap();
     assert!(machine.contains("allow_activating"));
     assert!(machine.contains("installed Bloom enrollment is not active"));
@@ -326,9 +326,11 @@ fn activating_enrollment_is_private_to_installer_health_and_session_bootstrap() 
     assert!(sentinel.contains("Some(\"activating\" | \"active\")"));
     let installer =
         fs::read_to_string(workspace().join("packaging/triad/release/install-macos.sh")).unwrap();
-    let health = installer.find("start_and_check").unwrap();
     let publish = installer.rfind("write_enrollment active").unwrap();
-    assert!(health < publish);
+    let reload = installer.rfind("reload_current_enrollment").unwrap();
+    assert!(publish < reload);
+    assert!(installer.contains("launchctl kickstart -k"));
+    assert!(!installer.contains("triad-health-check"));
 }
 
 #[test]

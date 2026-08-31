@@ -29,17 +29,12 @@ payload_scratch=""
 created_users=""
 created_groups=""
 upgrade_transaction=""
-rollback_active=false
 restore_pending=false
 
 cleanup() {
   rc=$?
   if ((rc != 0)) && $restore_pending; then
     rollback_failed_restore || echo "automatic macOS custody-restore cleanup remains incomplete" >&2
-  fi
-  if ((rc != 0)) && [[ -n "$upgrade_transaction" && -d "$upgrade_transaction" ]] && ! $rollback_active; then
-    rollback_active=true
-    rollback_upgrade || echo "automatic macOS upgrade rollback remains incomplete" >&2
   fi
   [[ -z "$scratch" || ! -d "$scratch" ]] || rm -rf -- "$scratch"
   [[ -z "$payload_scratch" || ! -d "$payload_scratch" ]] || rm -rf -- "$payload_scratch"
@@ -309,7 +304,9 @@ validate_active_release_set() {
     state="$(field "$record" state)"
     [[ "$state" == active || "$state" == activating ]] || die "installed enrollment set is not active"
     digest="$(field "$record" release_digest)"
-    [[ "$expected_digest" =~ ^[0-9a-f]{64}$ && "$digest" == "$expected_digest" ]] ||
+    [[ "$expected_digest" =~ ^[0-9a-f]{64}$ && "$digest" =~ ^[0-9a-f]{64}$ ]] ||
+      die "installed enrollment set has an invalid release"
+    [[ -n "$upgrade_transaction" || "$digest" == "$expected_digest" ]] ||
       die "installed enrollment set does not match the shared release"
   done
 }
@@ -530,20 +527,27 @@ secure_ownership() {
   chown "$broker_user:$log_group" "$broker_bootstrap_log"; chown "$signer_user:$log_group" "$signer_bootstrap_log"
 }
 
-start_and_check() {
+reload_launchd_job() {
+  local domain="$1" label="$2" plist="$3"
+  launchctl bootout "$domain/$label" 2>/dev/null || true
+  if ! launchctl bootstrap "$domain" "$plist" 2>/dev/null; then
+    if ! launchctl print "$domain/$label" >/dev/null 2>&1; then
+      echo "Bloom installed, but launchd deferred $label" >&2
+      return 0
+    fi
+  fi
+  launchctl kickstart -k "$domain/$label" 2>/dev/null ||
+    echo "Bloom installed, but launchd deferred $label" >&2
+}
+
+reload_current_enrollment() {
   plutil -lint "$broker_plist" "$signer_plist" "$containment_plist" "$session_plist" >/dev/null; pfctl -nf "$pf_anchor"
-  launchctl bootout system/com.bloom.containment 2>/dev/null || true; launchctl bootstrap system "$containment_plist"
-  "$machine_binary" serve triad-pf-monitor-once
-  for label in "gui/$login_uid/com.bloom.session" "system/com.bloom.broker.$login_uid" "system/com.bloom.signer.$login_uid"; do launchctl bootout "$label" 2>/dev/null || true; done
-  launchctl bootstrap "gui/$login_uid" "$session_plist"; launchctl bootstrap system "$signer_plist"; launchctl bootstrap system "$broker_plist"
-  health_output="$(mktemp "$scratch/health-check.XXXXXX")"
-  for _ in {1..20}; do
-    # shellcheck disable=SC2024 # the installer, not the login user, owns this diagnostic file
-    if sudo -n -u "$login_user" -- "$machine_binary" serve triad-health-check "$BLOOM_RELEASE_DIGEST" >"$health_output" 2>&1; then return; fi
-    sleep 1
-  done
-  cat "$health_output" >&2
-  die "Bloom triad activation failed for login UID $login_uid"
+  reload_launchd_job system com.bloom.containment "$containment_plist"
+  "$machine_binary" serve triad-pf-monitor-once 2>/dev/null ||
+    echo "Bloom installed, but containment readiness is deferred" >&2
+  reload_launchd_job "gui/$login_uid" com.bloom.session "$session_plist"
+  reload_launchd_job system "com.bloom.signer.$login_uid" "$signer_plist"
+  reload_launchd_job system "com.bloom.broker.$login_uid" "$broker_plist"
 }
 
 stop_all_enrollments() {
@@ -582,67 +586,39 @@ rewrite_all_enrollments() {
   fi
 }
 
-activate_installed_set() {
-  local expected="$1" record uid user healthy label; $live || return 0
-  launchctl bootstrap system "$containment_plist"
-  "$release_base/current/bloom" serve triad-pf-monitor-once
-  for record in "$enrollments"/*.json; do
-    [[ -f "$record" && ! -L "$record" ]] || continue
-    uid="${record##*/}"; uid="${uid%.json}"; user="$(field "$record" login_user)"
-    launchctl bootstrap "gui/$uid" "$root_prefix/Library/LaunchAgents/com.bloom.session.plist"
-    launchctl bootstrap system "$root_prefix/Library/LaunchDaemons/com.bloom.signer.$uid.plist"
-    launchctl bootstrap system "$root_prefix/Library/LaunchDaemons/com.bloom.broker.$uid.plist"
-    healthy=false
-    for _ in {1..20}; do
-      if sudo -n -u "$user" -- "$release_base/current/bloom" serve triad-health-check "$expected" >/dev/null 2>&1; then healthy=true; break; fi
-      sleep 1
-    done
-    $healthy || { echo "Bloom triad activation failed for login UID $uid" >&2; return 69; }
-    for label in "system/com.bloom.broker.$uid" "system/com.bloom.signer.$uid" "gui/$uid/com.bloom.session"; do launchctl bootout "$label" 2>/dev/null || true; done
-  done
+reload_installed_set() {
+  local record uid; $live || return 0
+  reload_launchd_job system com.bloom.containment "$containment_plist"
+  "$release_base/current/bloom" serve triad-pf-monitor-once 2>/dev/null ||
+    echo "Bloom installed, but containment readiness is deferred" >&2
   for record in "$enrollments"/*.json; do
     [[ -f "$record" && ! -L "$record" ]] || continue
     uid="${record##*/}"; uid="${uid%.json}"
-    launchctl bootstrap "gui/$uid" "$root_prefix/Library/LaunchAgents/com.bloom.session.plist"
-    launchctl bootstrap system "$root_prefix/Library/LaunchDaemons/com.bloom.signer.$uid.plist"
-    launchctl bootstrap system "$root_prefix/Library/LaunchDaemons/com.bloom.broker.$uid.plist"
+    reload_launchd_job "gui/$uid" com.bloom.session "$root_prefix/Library/LaunchAgents/com.bloom.session.plist"
+    reload_launchd_job system "com.bloom.signer.$uid" "$root_prefix/Library/LaunchDaemons/com.bloom.signer.$uid.plist"
+    reload_launchd_job system "com.bloom.broker.$uid" "$root_prefix/Library/LaunchDaemons/com.bloom.broker.$uid.plist"
   done
 }
 
-rollback_upgrade() {
-  local old recovered_state=activating
-  [[ -d "$upgrade_transaction" && ! -L "$upgrade_transaction" ]] || return 65
-  grep -Fx bloom.macos-upgrade-transaction.2 "$upgrade_transaction/schema" >/dev/null || return 65
-  old="$(<"$upgrade_transaction/old-digest")"; [[ "$old" =~ ^[0-9a-f]{64}$ ]] || return 65
-  stop_all_enrollments
-  switch_release "$old"
-  rewrite_all_enrollments "$old" activating
-  activate_installed_set "$old"
-  $live && recovered_state=active
-  rewrite_all_enrollments "$old" "$recovered_state"
-  rm -rf -- "$upgrade_transaction"; upgrade_transaction=""
-}
-
-recover_interrupted_upgrade() {
-  local candidate_digest="$BLOOM_RELEASE_DIGEST"
+find_interrupted_upgrade() {
+  local recorded_old recorded_new
   upgrade_transaction="$product/upgrade-transaction"
   [[ -e "$upgrade_transaction" ]] || { upgrade_transaction=""; return 0; }
-  echo "recovering interrupted Bloom macOS activation" >&2
-  rollback_upgrade || die "interrupted Bloom activation could not be rolled back safely"
-  BLOOM_RELEASE_DIGEST="$candidate_digest"
+  [[ -d "$upgrade_transaction" && ! -L "$upgrade_transaction" ]] || die "invalid interrupted Bloom upgrade"
+  grep -Fx bloom.macos-upgrade-transaction.2 "$upgrade_transaction/schema" >/dev/null || die "invalid interrupted Bloom upgrade"
+  recorded_old="$(<"$upgrade_transaction/old-digest")"
+  recorded_new="$(<"$upgrade_transaction/new-digest")"
+  [[ "$recorded_old" =~ ^[0-9a-f]{64}$ && "$recorded_new" =~ ^[0-9a-f]{64}$ ]] || die "invalid interrupted Bloom upgrade"
+  echo "resuming interrupted Bloom macOS upgrade toward the requested release" >&2
 }
 
 upgrade_release() {
-  local old="$1" new="$2"; [[ "$old" != "$new" ]] || return 0
-  if $live; then
-    for record in "$enrollments"/*.json; do
-      [[ -f "$record" && ! -L "$record" ]] || continue
-      uid="${record##*/}"; uid="${uid%.json}"
-      launchctl print "gui/$uid" >/dev/null 2>&1 || die "atomic upgrade requires an active GUI domain for every enrollment"
-    done
+  local old="$1" new="$2"
+  upgrade_transaction="$product/upgrade-transaction"
+  if [[ ! -e "$upgrade_transaction" ]]; then
+    mkdir -m 0700 "$upgrade_transaction"
   fi
-  upgrade_transaction="$product/upgrade-transaction"; [[ ! -e "$upgrade_transaction" ]] || die "unrecovered upgrade transaction exists"
-  mkdir -m 0700 "$upgrade_transaction"
+  [[ -d "$upgrade_transaction" && ! -L "$upgrade_transaction" ]] || die "invalid interrupted Bloom upgrade"
   printf '%s\n' bloom.macos-upgrade-transaction.2 >"$upgrade_transaction/schema"
   printf '%s\n' "$old" >"$upgrade_transaction/old-digest"
   printf '%s\n' "$new" >"$upgrade_transaction/new-digest"
@@ -650,9 +626,9 @@ upgrade_release() {
   stop_all_enrollments
   rewrite_all_enrollments "$new" activating
   switch_release "$new"
-  activate_installed_set "$new"
   rewrite_all_enrollments "$new" active
   write_state_schema
+  reload_installed_set
   rm -rf -- "$upgrade_transaction"; upgrade_transaction=""
 }
 
@@ -662,7 +638,7 @@ case "$action" in
     [[ "$login_user" =~ ^[a-z_][a-z0-9_-]*$ ]] || { echo "unsafe LOGIN_USER" >&2; exit 64; }
     $live && { lock_installer; [[ "$(id -u "$login_user")" == "$login_uid" ]] || die "LOGIN_USER does not match LOGIN_UID"; launchctl print "gui/$login_uid" >/dev/null 2>&1 || die "LOGIN_USER has no active GUI domain"; snapshot_live_payload; }
     requested_uid="$login_uid"; requested_user="$login_user"; load_names; paths; verify_payload; preflight_compatibility
-    recover_interrupted_upgrade
+    find_interrupted_upgrade
     login_uid="$requested_uid"; login_user="$requested_user"; load_names; paths
     shared_digest="$(current_release_digest)"
     validate_active_release_set "$shared_digest"
@@ -689,20 +665,19 @@ case "$action" in
       die "new enrollment cannot change the shared release used by active enrollments"
     fi
     $live && $fresh && allocate_accounts
-    old_digest=""; $fresh || old_digest="$(field "$enrollment" release_digest)"
     install_release
-    if [[ -n "$old_digest" && "$old_digest" != "$BLOOM_RELEASE_DIGEST" && "$restoring" == false ]]; then
-      expected_installed_state=activating; $live && expected_installed_state=active
-      for record in "$enrollments"/*.json; do
-        [[ -f "$record" && ! -L "$record" ]] || continue
-        [[ "$(field "$record" schema)" == bloom.macos-enrollment.1 && "$(field "$record" state)" == "$expected_installed_state" && "$(field "$record" release_digest)" == "$old_digest" ]] || die "installed enrollment set is not compatible with atomic upgrade"
-      done
-      upgrade_release "$old_digest" "$BLOOM_RELEASE_DIGEST"
+    if [[ "$had_active" == true && "$shared_digest" != "$BLOOM_RELEASE_DIGEST" && "$restoring" == false ]]; then
+      upgrade_release "$shared_digest" "$BLOOM_RELEASE_DIGEST"
+      echo "Bloom macOS release upgraded atomically"
+      exit 0
+    fi
+    if [[ -n "$upgrade_transaction" ]]; then
+      upgrade_release "$shared_digest" "$BLOOM_RELEASE_DIGEST"
       echo "Bloom macOS release upgraded atomically"
       exit 0
     fi
     switch_release "$BLOOM_RELEASE_DIGEST"; install_config; write_enrollment activating; install_assets
-    if $live; then secure_ownership; pf_reference add; start_and_check; write_enrollment active; created_users=""; created_groups=""; fi
+    if $live; then secure_ownership; pf_reference add; write_enrollment active; reload_current_enrollment; created_users=""; created_groups=""; fi
     write_state_schema
     if $restoring; then rm -f "$retained"; restore_pending=false; echo "Bloom macOS retained custody restored"; else echo "Bloom macOS enrollment installed or repaired"; fi
     ;;

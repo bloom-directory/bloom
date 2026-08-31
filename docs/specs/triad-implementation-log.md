@@ -37,18 +37,14 @@ wire detail. It does not amend that specification.
   its LaunchDaemon supplies only reviewed endpoint paths. Failure-only
   `KeepAlive` retries a fatal `127.0.0.1:18734` conflict. The disposable macOS
   test uses a real direct-bind child, not launchd TCP handover.
-- A complete-version upgrade may have several recorded Broker LaunchDaemons
-  but only one Broker can pass readiness while owning the host-wide canonical
-  listener. Upgrade and rollback therefore restore every session and Signer
-  job first, then bootstrap, authenticate, and stop each recorded Broker with
-  an active login-session job serially against the candidate release.
-  The compact self-contained installer therefore preflights an active GUI
-  domain for every enrollment before it creates the transaction or stops a
-  job. It validates each Broker serially, then restores the complete job set.
-  An operator must perform a shared-release upgrade while all enrolled logins
-  are active; otherwise it fails before the commit boundary. This validates
-  the runnable enrollment set without weakening AC-31 or introducing a
-  fallback port.
+- A complete-version upgrade converges every enrollment toward one requested
+  signed digest, switches the shared content-addressed release, and asks
+  launchd to reload each recorded job. The installer does not serialize runtime
+  health probes or roll a durable upgrade back because a GUI domain defers a
+  LaunchAgent. Runtime readiness and canonical-listener ownership remain
+  fail-closed service concerns and disposable-W0 release evidence. Interrupted
+  installation records forward intent; the next invocation resumes toward the
+  newly requested compatible digest.
 - Until a disposable W0 VM proves account creation/rollback, system-domain
   launchd ownership, socket modes, `pf` behavior, and uninstall, the installer
   accepts live test activation only for the non-production
