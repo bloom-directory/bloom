@@ -2613,7 +2613,7 @@ dependencies = [
 [[package]]
 name = "bloom-signer-derive"
 version = "0.1.0"
-source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=1e6cdab28a5b7802213935342e7a00f0586a25a1#1e6cdab28a5b7802213935342e7a00f0586a25a1"
+source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=303a77a2221bdbddf468ca8bf48a8663f08cc824#303a77a2221bdbddf468ca8bf48a8663f08cc824"
 dependencies = [
  "bip39",
  "ed25519-dalek",

@@ -363,7 +363,7 @@ async fn two_active_solana_children_select_sign_and_reconcile_independently() ->
         "derive Solana accounts 0 and 1 from the BIP-39 mnemonic",
     );
     let seed =
-        bloom_signer_derive::seed_from_mnemonic(MNEMONIC, "").map_err(|e| anyhow!("seed: {e}"))?;
+        bloom_signer_derive::seed_from_mnemonic(MNEMONIC).map_err(|e| anyhow!("seed: {e}"))?;
     let seed64: [u8; 64] = (*seed).as_slice().try_into().unwrap();
     let account0 = Child::derive(&seed64, 0)?;
     let account1 = Child::derive(&seed64, 1)?;
