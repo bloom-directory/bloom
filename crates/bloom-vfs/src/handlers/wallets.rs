@@ -2946,7 +2946,7 @@ impl WalletsHandler {
             [s] if s == "outbox" => Ok(Entry::dir("outbox")),
             [s, fname] if s == "outbox" && fname == "new.tx" => Ok(Entry::writable_file("new.tx")),
             [s, fname] if s == "outbox" && fname == "latest" => {
-                let target = Self::latest_solana_pending_target(engine, wallet, chain)?
+                let target = Self::latest_solana_pending_target(&engine, wallet, chain)?
                     .ok_or_else(|| HandlerError::not_found("outbox/latest"))?;
                 Ok(Entry::symlink("latest", &target))
             }
@@ -3383,7 +3383,7 @@ impl WalletsHandler {
                     Entry::dir("sent"),
                     Entry::dir("failed"),
                 ];
-                if let Some(target) = Self::latest_solana_pending_target(engine, wallet, chain)? {
+                if let Some(target) = Self::latest_solana_pending_target(&engine, wallet, chain)? {
                     entries.push(Entry::symlink("latest", &target));
                 }
                 Ok(entries)
