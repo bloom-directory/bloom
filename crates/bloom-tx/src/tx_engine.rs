@@ -2,6 +2,9 @@
 //! then on confirm sign and broadcast. Also handles same-nonce
 //! replacement / cancel txs and a legacy (non-1559) build path.
 
+#[path = "outbox_claim.rs"]
+mod outbox_claim;
+
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -47,10 +50,12 @@ sol! {
         ) external;
     }
 }
+#[cfg(test)]
+use bloom_broker_api::ProvenanceRecord;
 use bloom_broker_api::{
     ApprovalLifecycleState, CryptoSuite, DecimalU64, Digest32, OperationId, OperationState,
-    ProtocolErrorCode, ProvenanceCatalog, ProvenanceRecord, ProvenanceSubject, RequestNonce,
-    SigningResult, Token,
+    PetalUseClaim, ProtocolErrorCode, ProvenanceCatalog, ProvenanceSubject, RequestNonce,
+    ResolvedProvenance, SigningResult, Token,
 };
 use bloom_proto::plan::ExecutionOrigin;
 use bloom_proto::{
@@ -445,6 +450,8 @@ struct TriadEvmSigningState {
     sign_dispatched: bool,
     #[serde(default)]
     expected_operation_digest: Option<Digest32>,
+    #[serde(default)]
+    petal_use_claim: Option<PetalUseClaim>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
@@ -477,6 +484,8 @@ struct TriadEvmBatchSigningState {
     sign_dispatched: bool,
     #[serde(default)]
     expected_operation_digest: Option<Digest32>,
+    #[serde(default)]
+    petal_use_claim: Option<PetalUseClaim>,
 }
 
 /// Stage / confirm the lifecycle.
@@ -2032,8 +2041,30 @@ impl TxEngine {
             .iter()
             .map(|entry| entry.staged.clone())
             .collect::<Vec<_>>();
+        let claims = prepared
+            .iter()
+            .enumerate()
+            .map(|(index, item)| {
+                outbox_claim::build(
+                    &staged_plans[index],
+                    targets[index].chain.spec(),
+                    &item.unsigned,
+                    EvmOutboxActionKind::Confirm,
+                    &preimages[index],
+                    hashes[index],
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let petal_use_claim = outbox_claim::aggregate(claims, &preimages)?;
         let result = self
-            .triad_sign_evm_batch(wallet, &ordered_refs, &staged_plans, &preimages, &hashes)
+            .triad_sign_evm_batch(
+                wallet,
+                &ordered_refs,
+                &staged_plans,
+                &preimages,
+                &hashes,
+                petal_use_claim,
+            )
             .await?;
         if result.signatures.len() != prepared.len() {
             return Err(TxEngineError::Signer(
@@ -2797,6 +2828,14 @@ impl TxEngine {
             return Err(e);
         }
         let signing_preimage = Self::unsigned_signing_preimage(&prepared.unsigned);
+        let petal_use_claim = outbox_claim::build(
+            staged,
+            chain.spec(),
+            &prepared.unsigned,
+            action_kind,
+            &signing_preimage,
+            prepared.signing_hash,
+        )?;
         let signature = self
             .host_sign_evm_hash(
                 entry,
@@ -2804,6 +2843,7 @@ impl TxEngine {
                 action_kind,
                 &signing_preimage,
                 prepared.signing_hash,
+                petal_use_claim,
             )
             .await?;
         let signed = self.assemble_signed_raw_tx(staged, prepared.unsigned, signature)?;
@@ -2855,6 +2895,7 @@ impl TxEngine {
         action_kind: EvmOutboxActionKind,
         signing_preimage: &[u8],
         signing_hash: B256,
+        petal_use_claim: Option<PetalUseClaim>,
     ) -> Result<Signature, TxEngineError> {
         let service = self.triad_signing.as_ref().ok_or_else(|| {
             TxEngineError::ApprovalServiceUnavailable(
@@ -2862,16 +2903,14 @@ impl TxEngine {
             )
         })?;
         let operation_class = triad_operation_class(action_kind);
-        let provenance = service
-            .provenance_catalog
-            .records
-            .iter()
-            .find(|record| provenance_action_class(&record.subject) == Some(operation_class))
-            .ok_or_else(|| {
-                TxEngineError::ApprovalDenied(format!(
-                    "installer provenance does not authorize {operation_class}"
-                ))
-            })?;
+        let provenance = outbox_claim::resolve(service, staged, operation_class).await?;
+        if matches!(provenance, ResolvedProvenance::OwnerRegistered { .. })
+            != petal_use_claim.is_some()
+        {
+            return Err(TxEngineError::ApprovalDenied(
+                "Petal outbox signing requires final-payload accounting".into(),
+            ));
+        }
         let action_id = outbox_action_id(staged, action_kind);
         let payload_digest = Digest32::from_bytes(sha2::Sha256::digest(signing_preimage).into());
         let claimed_hash = Digest32::from_bytes(signing_hash.0);
@@ -2879,6 +2918,10 @@ impl TxEngine {
             .digest()
             .map_err(|error| TxEngineError::ApprovalConstruction(error.to_string()))?;
         let state_path = entry.dir.join(TRIAD_SIGNING_STATE_FILE);
+        let mut canonical_staged = staged.clone();
+        canonical_staged.status = TxStatus::Pending;
+        canonical_staged.tx_hash = None;
+        let canonical_plan_facts_digest = outbox_claim::digest(&canonical_staged)?;
         let new_state = || -> Result<TriadEvmSigningState, TxEngineError> {
             let now = now_ms() as u64;
             let expires = now.saturating_add(TRIAD_EXACT_APPROVAL_TTL_MS);
@@ -2892,6 +2935,7 @@ impl TxEngine {
                     "staged transaction expired before approval prepare".into(),
                 ));
             }
+            let request_nonce = random_request_nonce();
             Ok(TriadEvmSigningState {
                 schema: "bloom.machine-evm-signing.1".into(),
                 action_id: action_id.clone(),
@@ -2900,17 +2944,11 @@ impl TxEngine {
                 provenance_digest: provenance_digest.clone(),
                 approval_operation_id: random_operation_id(),
                 signing_operation_id: random_operation_id(),
-                request_nonce: random_request_nonce(),
+                petal_use_claim: outbox_claim::with_nonce(&petal_use_claim, &request_nonce),
+                request_nonce,
                 issued_at_ms: DecimalU64::new(now),
                 expires_at_ms: DecimalU64::new(expires),
-                canonical_plan_facts_digest: Digest32::from_bytes(
-                    sha2::Sha256::digest(serde_jcs::to_vec(staged).map_err(|error| {
-                        TxEngineError::ApprovalConstruction(format!(
-                            "canonicalize staged transaction plan: {error}"
-                        ))
-                    })?)
-                    .into(),
-                ),
+                canonical_plan_facts_digest: canonical_plan_facts_digest.clone(),
                 approval_id: None,
                 ceremony_url: None,
                 ceremony_expires_at_ms: None,
@@ -2926,6 +2964,9 @@ impl TxEngine {
                     || state.payload_digest != payload_digest
                     || state.claimed_hash != claimed_hash
                     || state.provenance_digest != provenance_digest
+                    || state.canonical_plan_facts_digest != canonical_plan_facts_digest
+                    || state.petal_use_claim
+                        != outbox_claim::with_nonce(&petal_use_claim, &state.request_nonce)
                 {
                     if state.action_id != action_id
                         && state.sign_dispatched
@@ -3065,7 +3106,7 @@ impl TxEngine {
         }
 
         let request =
-            exact_evm_sign_request(staged, signing_preimage, signing_hash, provenance, &state)?;
+            exact_evm_sign_request(staged, signing_preimage, signing_hash, &provenance, &state)?;
         if state.approval_id.is_some() {
             let expected_operation_digest = expected_evm_sign_operation_digest(
                 &service.broker,
@@ -3120,22 +3161,32 @@ impl TxEngine {
         staged_plans: &[StagedTx],
         preimages: &[Vec<u8>],
         hashes: &[B256],
+        petal_use_claim: Option<PetalUseClaim>,
     ) -> Result<SigningResult, TxEngineError> {
         let service = self.triad_signing.as_ref().ok_or_else(|| {
             TxEngineError::ApprovalServiceUnavailable(
                 "payload-bearing Machine-to-Broker batch signing is not configured".into(),
             )
         })?;
-        let provenance = service
-            .provenance_catalog
-            .records
-            .iter()
-            .find(|record| provenance_action_class(&record.subject) == Some("transaction.confirm"))
-            .ok_or_else(|| {
-                TxEngineError::ApprovalDenied(
-                    "installer provenance does not authorize transaction.confirm".into(),
-                )
-            })?;
+        let first = staged_plans
+            .first()
+            .ok_or_else(|| TxEngineError::ApprovalDenied("empty transaction batch".into()))?;
+        let subject = outbox_claim::subject(first)?;
+        for staged in staged_plans {
+            if staged.wallet != wallet || outbox_claim::subject(staged)? != subject {
+                return Err(TxEngineError::ApprovalDenied(
+                    "transaction batch requires one wallet and exact producing subject".into(),
+                ));
+            }
+        }
+        let provenance = outbox_claim::resolve(service, first, "transaction.confirm").await?;
+        if matches!(provenance, ResolvedProvenance::OwnerRegistered { .. })
+            != petal_use_claim.is_some()
+        {
+            return Err(TxEngineError::ApprovalDenied(
+                "Petal batch requires final-payload accounting".into(),
+            ));
+        }
         let provenance_digest = provenance
             .digest()
             .map_err(|error| TxEngineError::ApprovalConstruction(error.to_string()))?;
@@ -3189,6 +3240,7 @@ impl TxEngine {
                     "staged transaction batch expired before approval prepare".into(),
                 ));
             }
+            let request_nonce = random_request_nonce();
             Ok(TriadEvmBatchSigningState {
                 schema: "bloom.machine-evm-batch-signing.1".into(),
                 wallet: wallet.into(),
@@ -3198,7 +3250,8 @@ impl TxEngine {
                 provenance_digest: provenance_digest.clone(),
                 approval_operation_id: random_operation_id(),
                 signing_operation_id: random_operation_id(),
-                request_nonce: random_request_nonce(),
+                petal_use_claim: outbox_claim::with_nonce(&petal_use_claim, &request_nonce),
+                request_nonce,
                 issued_at_ms: DecimalU64::new(now),
                 expires_at_ms: DecimalU64::new(expires),
                 canonical_plan_facts_digest: canonical_plan_facts_digest.clone(),
@@ -3219,6 +3272,8 @@ impl TxEngine {
                     || state.ordered_hashes != ordered_hashes
                     || state.provenance_digest != provenance_digest
                     || state.canonical_plan_facts_digest != canonical_plan_facts_digest
+                    || state.petal_use_claim
+                        != outbox_claim::with_nonce(&petal_use_claim, &state.request_nonce)
                 {
                     return Err(TxEngineError::ApprovalState(
                         "durable Broker batch projection conflicts with exact ordered transaction bytes"
@@ -3338,7 +3393,7 @@ impl TxEngine {
             preimages: preimages.to_vec(),
             claimed_hashes: ordered_hashes.clone(),
             crypto_suite: CryptoSuite::Secp256k1Keccak256Recoverable,
-            provenance: provenance.subject.clone(),
+            provenance: provenance.subject(),
             provenance_digest: state.provenance_digest.clone(),
             activation_mode: None,
             approval_operation_id: state.approval_operation_id.clone(),
@@ -3348,7 +3403,7 @@ impl TxEngine {
             expires_at_ms: state.expires_at_ms.clone(),
             canonical_plan_facts_digest: state.canonical_plan_facts_digest.clone(),
             approval_id: state.approval_id.clone(),
-            petal_use_claim: None,
+            petal_use_claim: state.petal_use_claim.clone(),
             claim_assurance_evidence: None,
         };
         if state.approval_id.is_some() {
@@ -3403,9 +3458,17 @@ impl TxEngine {
         action_kind: EvmOutboxActionKind,
         signing_preimage: &[u8],
         signing_hash: B256,
+        petal_use_claim: Option<PetalUseClaim>,
     ) -> Result<Signature, TxEngineError> {
-        self.triad_sign_evm_payload(entry, staged, action_kind, signing_preimage, signing_hash)
-            .await
+        self.triad_sign_evm_payload(
+            entry,
+            staged,
+            action_kind,
+            signing_preimage,
+            signing_hash,
+            petal_use_claim,
+        )
+        .await
     }
 
     fn ensure_broadcast_allowed(&self, spec: &ChainSpec) -> Result<(), TxEngineError> {
@@ -3982,7 +4045,7 @@ fn exact_evm_sign_request(
     staged: &StagedTx,
     signing_preimage: &[u8],
     signing_hash: B256,
-    provenance: &ProvenanceRecord,
+    provenance: &ResolvedProvenance,
     state: &TriadEvmSigningState,
 ) -> Result<ExactPayloadSignRequest, TxEngineError> {
     Ok(ExactPayloadSignRequest {
@@ -3991,7 +4054,7 @@ fn exact_evm_sign_request(
         preimage: signing_preimage.to_vec(),
         claimed_hash: Digest32::from_bytes(signing_hash.0),
         crypto_suite: CryptoSuite::Secp256k1Keccak256Recoverable,
-        provenance: provenance.subject.clone(),
+        provenance: provenance.subject(),
         provenance_digest: state.provenance_digest.clone(),
         activation_mode: None,
         approval_operation_id: state.approval_operation_id.clone(),
@@ -4001,7 +4064,7 @@ fn exact_evm_sign_request(
         expires_at_ms: state.expires_at_ms.clone(),
         canonical_plan_facts_digest: state.canonical_plan_facts_digest.clone(),
         approval_id: state.approval_id.clone(),
-        petal_use_claim: None,
+        petal_use_claim: state.petal_use_claim.clone(),
         claim_assurance_evidence: None,
     })
 }
@@ -4042,8 +4105,16 @@ async fn expected_evm_sign_operation_digest(
         crypto_suite: suite,
         ordered_payload_digests: vec![payload_digest],
         ordered_hashes: vec![claimed_hash],
-        petal_use_claim_digest: None,
-        claim_assurance_digest: None,
+        petal_use_claim_digest: state
+            .petal_use_claim
+            .as_ref()
+            .map(outbox_claim::digest)
+            .transpose()?,
+        claim_assurance_digest: state
+            .petal_use_claim
+            .as_ref()
+            .map(|claim| outbox_claim::digest(&claim.claim_assurance))
+            .transpose()?,
         policy_version: wallet.policy_version,
         policy_digest: wallet.policy_digest,
     }
@@ -4255,8 +4326,16 @@ async fn expected_evm_batch_sign_operation_digest(
         crypto_suite: suite,
         ordered_payload_digests: state.ordered_payload_digests.clone(),
         ordered_hashes: state.ordered_hashes.clone(),
-        petal_use_claim_digest: None,
-        claim_assurance_digest: None,
+        petal_use_claim_digest: state
+            .petal_use_claim
+            .as_ref()
+            .map(outbox_claim::digest)
+            .transpose()?,
+        claim_assurance_digest: state
+            .petal_use_claim
+            .as_ref()
+            .map(|claim| outbox_claim::digest(&claim.claim_assurance))
+            .transpose()?,
         policy_version: wallet.policy_version,
         policy_digest: wallet.policy_digest,
     }
@@ -5610,6 +5689,7 @@ mod tests {
                 EvmOutboxActionKind::Confirm,
                 &preimage,
                 signing_hash,
+                None,
             )
             .await
             .unwrap_err();
@@ -5637,6 +5717,7 @@ mod tests {
                 EvmOutboxActionKind::Confirm,
                 &preimage,
                 signing_hash,
+                None,
             )
             .await
             .unwrap();
@@ -5709,6 +5790,7 @@ mod tests {
                     EvmOutboxActionKind::Confirm,
                     &preimage,
                     signing_hash,
+                    None
                 )
                 .await,
             Err(TxEngineError::ApprovalRequired(_))
@@ -5725,6 +5807,7 @@ mod tests {
                     EvmOutboxActionKind::Confirm,
                     &preimage,
                     signing_hash,
+                    None
                 )
                 .await,
             Err(TxEngineError::ApprovalRequired(_))
@@ -5847,14 +5930,14 @@ mod tests {
         let (refs, staged, preimages, hashes) = batch_material(&["batch-a", "batch-b"]);
 
         let error = engine
-            .triad_sign_evm_batch("alice", &refs, &staged, &preimages, &hashes)
+            .triad_sign_evm_batch("alice", &refs, &staged, &preimages, &hashes, None)
             .await
             .unwrap_err();
         assert!(matches!(error, TxEngineError::ApprovalRequired(_)));
         fixture.active.store(true, Ordering::SeqCst);
 
         let result = engine
-            .triad_sign_evm_batch("alice", &refs, &staged, &preimages, &hashes)
+            .triad_sign_evm_batch("alice", &refs, &staged, &preimages, &hashes, None)
             .await
             .unwrap();
         assert_eq!(result.signatures.len(), 2);
@@ -5898,7 +5981,7 @@ mod tests {
 
         assert!(matches!(
             engine
-                .triad_sign_evm_batch("alice", &refs, &staged, &preimages, &hashes)
+                .triad_sign_evm_batch("alice", &refs, &staged, &preimages, &hashes, None)
                 .await,
             Err(TxEngineError::ApprovalRequired(_))
         ));
@@ -5910,7 +5993,7 @@ mod tests {
 
         assert!(matches!(
             engine
-                .triad_sign_evm_batch("alice", &refs, &staged, &preimages, &hashes)
+                .triad_sign_evm_batch("alice", &refs, &staged, &preimages, &hashes, None)
                 .await,
             Err(TxEngineError::ApprovalRequired(_))
         ));
@@ -5940,7 +6023,7 @@ mod tests {
         let (refs, staged, preimages, hashes) = batch_material(&["loss-a", "loss-b"]);
         assert!(matches!(
             engine
-                .triad_sign_evm_batch("alice", &refs, &staged, &preimages, &hashes)
+                .triad_sign_evm_batch("alice", &refs, &staged, &preimages, &hashes, None)
                 .await,
             Err(TxEngineError::ApprovalRequired(_))
         ));
@@ -5950,7 +6033,7 @@ mod tests {
             .store(true, Ordering::SeqCst);
         assert!(matches!(
             engine
-                .triad_sign_evm_batch("alice", &refs, &staged, &preimages, &hashes)
+                .triad_sign_evm_batch("alice", &refs, &staged, &preimages, &hashes, None)
                 .await,
             Err(TxEngineError::ApprovalServiceUnavailable(_))
         ));
@@ -5959,7 +6042,7 @@ mod tests {
             .with_triad_signing(broker, triad_catalog())
             .unwrap();
         let result = restarted
-            .triad_sign_evm_batch("alice", &refs, &staged, &preimages, &hashes)
+            .triad_sign_evm_batch("alice", &refs, &staged, &preimages, &hashes, None)
             .await
             .unwrap();
         assert_eq!(result.signatures.len(), 2);
@@ -5987,7 +6070,7 @@ mod tests {
         let (refs, staged, preimages, hashes) = batch_material(&["bad-a", "bad-b"]);
         assert!(matches!(
             engine
-                .triad_sign_evm_batch("alice", &refs, &staged, &preimages, &hashes)
+                .triad_sign_evm_batch("alice", &refs, &staged, &preimages, &hashes, None)
                 .await,
             Err(TxEngineError::ApprovalRequired(_))
         ));
@@ -5997,14 +6080,14 @@ mod tests {
             .store(true, Ordering::SeqCst);
         assert!(matches!(
             engine
-                .triad_sign_evm_batch("alice", &refs, &staged, &preimages, &hashes)
+                .triad_sign_evm_batch("alice", &refs, &staged, &preimages, &hashes, None)
                 .await,
             Err(TxEngineError::ApprovalServiceUnavailable(_))
         ));
         fixture.corrupt_status_result.store(true, Ordering::SeqCst);
         assert!(matches!(
             engine
-                .triad_sign_evm_batch("alice", &refs, &staged, &preimages, &hashes)
+                .triad_sign_evm_batch("alice", &refs, &staged, &preimages, &hashes, None)
                 .await,
             Err(TxEngineError::ApprovalState(_))
         ));
@@ -6018,7 +6101,7 @@ mod tests {
         let (refs, staged, preimages, hashes) = batch_material(&["order-a", "order-b"]);
         assert!(matches!(
             engine
-                .triad_sign_evm_batch("alice", &refs, &staged, &preimages, &hashes)
+                .triad_sign_evm_batch("alice", &refs, &staged, &preimages, &hashes, None)
                 .await,
             Err(TxEngineError::ApprovalRequired(_))
         ));
@@ -6033,6 +6116,7 @@ mod tests {
                 &reversed_staged,
                 &reversed_preimages,
                 &reversed_hashes,
+                None,
             )
             .await
             .unwrap_err();
@@ -6283,13 +6367,13 @@ mod tests {
         let (engine, fixture, _) = triad_batch_fixture(outbox.clone(), false, false);
         assert!(matches!(
             engine
-                .triad_sign_evm_batch("alice", &refs, &staged, &preimages, &hashes)
+                .triad_sign_evm_batch("alice", &refs, &staged, &preimages, &hashes, None)
                 .await,
             Err(TxEngineError::ApprovalRequired(_))
         ));
         fixture.active.store(true, Ordering::SeqCst);
         let signing_result = engine
-            .triad_sign_evm_batch("alice", &refs, &staged, &preimages, &hashes)
+            .triad_sign_evm_batch("alice", &refs, &staged, &preimages, &hashes, None)
             .await
             .unwrap();
 
