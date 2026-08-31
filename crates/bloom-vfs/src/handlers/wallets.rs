@@ -2193,13 +2193,7 @@ impl WalletsHandler {
             "policy.json" => Ok(Entry::writable_file("policy.json")),
             "chains" => match segs.len() {
                 2 => Ok(Entry::dir("chains")),
-                3 => {
-                    let _ = self
-                        .chains
-                        .get(&segs[2])
-                        .ok_or_else(|| HandlerError::not_found(format!("chain '{}'", segs[2])))?;
-                    Ok(Entry::dir(&segs[2]))
-                }
+                3 => self.lookup_chain(wallet, &segs[2], &[]).await,
                 _ => self.lookup_chain(wallet, &segs[2], &segs[3..]).await,
             },
             "sealed-approvals" => match segs.len() {
@@ -4316,7 +4310,7 @@ mod tests {
                 max_rps: None,
                 http_only: false,
             }],
-            expected_genesis_hex: Some("test-genesis".into()),
+            expected_genesis_base58: Some("test-genesis".into()),
             allow_broadcast: true,
         })
         .unwrap();
@@ -4374,7 +4368,7 @@ mod tests {
                 max_rps: None,
                 http_only: false,
             }],
-            expected_genesis_hex: Some("test-genesis".into()),
+            expected_genesis_base58: Some("test-genesis".into()),
             allow_broadcast: true,
         })
         .unwrap();
@@ -4611,6 +4605,13 @@ mod tests {
         assert!(
             names.contains("solana-devnet"),
             "Solana chain must be listed alongside EVM ones, not just reachable by direct path"
+        );
+        assert!(
+            handler
+                .lookup(&VfsPath::parse("/alice/chains/solana-devnet").unwrap())
+                .await
+                .is_ok(),
+            "every advertised Solana chain directory must resolve through lookup"
         );
     }
 

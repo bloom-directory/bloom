@@ -121,7 +121,7 @@ fn spec(endpoint: &str) -> SolanaSpec {
             max_rps: None,
             http_only: false,
         }],
-        expected_genesis_hex: Some("G".repeat(32)),
+        expected_genesis_base58: Some("G".repeat(32)),
         allow_broadcast: false,
     }
 }
@@ -141,7 +141,7 @@ async fn typed_read_methods_roundtrip() {
 async fn genesis_mismatch_is_refused() {
     let endpoint = spawn_stub().await;
     let mut spec = spec(&endpoint);
-    spec.expected_genesis_hex = Some("X".repeat(32));
+    spec.expected_genesis_base58 = Some("X".repeat(32));
     let client = SolanaClient::build(&spec).unwrap();
 
     let err = client.verify_genesis().await.unwrap_err();
@@ -158,7 +158,7 @@ async fn pinned_mainnet_uses_the_standard_broadcast_path() {
     let endpoint = spawn_write_stub(genesis.into(), 200, send_calls.clone()).await;
     let mut spec = spec(&endpoint);
     spec.name = "solana-mainnet".into();
-    spec.expected_genesis_hex = Some(genesis.into());
+    spec.expected_genesis_base58 = Some(genesis.into());
     spec.allow_broadcast = true;
 
     let client = SolanaClient::build(&spec).unwrap();
@@ -336,7 +336,7 @@ fn empty_endpoint_list_is_refused() {
     let spec = SolanaSpec {
         name: "solana-test".into(),
         endpoints: vec![],
-        expected_genesis_hex: None,
+        expected_genesis_base58: None,
         allow_broadcast: false,
     };
     assert!(matches!(
@@ -348,7 +348,7 @@ fn empty_endpoint_list_is_refused() {
 #[test]
 fn broadcast_requires_an_expected_genesis_hash() {
     let mut spec = spec("http://127.0.0.1:1");
-    spec.expected_genesis_hex = None;
+    spec.expected_genesis_base58 = None;
     spec.allow_broadcast = true;
     let error = SolanaClient::build(&spec).err().unwrap();
     assert!(
