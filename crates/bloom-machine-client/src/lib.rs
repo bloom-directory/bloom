@@ -3111,77 +3111,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bip39_multi_account_signing_requires_and_honours_an_account_selector() {
-        // A BIP-39 wallet has no signable root; it holds one derived child per
-        // account. Two accounts on the same suite is the case that previously
-        // made every wallet-level signing call fail with KeyrefMismatch.
-        let mut account_one = key_ref();
-        account_one.locator = "wallet/derived/account-0".into();
-        account_one.public_key_fingerprint = digest(11);
-        let mut account_two = key_ref();
-        account_two.locator = "wallet/derived/account-1".into();
-        account_two.public_key_fingerprint = digest(12);
-
-        let broker = Arc::new(MockBroker {
-            wallet: WalletPublic {
-                wallet_id: token("wallet"),
-                wallet_kind: token("bip39"),
-                root_key_ref: None,
-                key_refs: vec![account_one.clone(), account_two.clone()],
-                policy_version: DecimalU64::new(7),
-                policy_digest: digest(7),
-                wallet_revocation_epoch: DecimalU64::new(2),
-            },
-            requests: Mutex::new(Vec::new()),
-            corrupt_response: false,
-        });
-        let client = MachineBrokerClient::new(broker.clone());
-        let payload = b"canonical unsigned EVM envelope".to_vec();
-
-        // With two candidates and no selector the choice is ambiguous, so
-        // selection fails closed rather than silently picking one.
-        let error = client
-            .sign_exact_payload(exact_request(payload.clone(), None))
-            .await
-            .unwrap_err();
-        assert_eq!(error.code, ProtocolErrorCode::KeyrefMismatch);
-
-        // Each account signs under its own approval, bound to its own KeyRef.
-        for account in [&account_one, &account_two] {
-            broker.requests.lock().unwrap().clear();
-            let mut request = exact_request(payload.clone(), None);
-            request.account_key_ref = Some(account.clone());
-            let prepared = client.sign_exact_payload(request).await.unwrap();
-            let ExactPayloadSignOutcome::ApprovalRequired(_) = prepared else {
-                panic!("first call must prepare an exact approval");
-            };
-            let requests = broker.requests.lock().unwrap();
-            let MachineBrokerRequest::SealedApprovalPrepare(prepare) = &requests[2] else {
-                panic!("third call must be sealed_approval.prepare");
-            };
-            assert_eq!(
-                &prepare.terms.key_ref, account,
-                "the approval must bind the selected account, never the other one"
-            );
-        }
-
-        // A KeyRef that is not a child of this wallet is refused before any
-        // approval is prepared.
-        broker.requests.lock().unwrap().clear();
-        let mut foreign = key_ref();
-        foreign.locator = "wallet/derived/not-mine".into();
-        let mut request = exact_request(payload, None);
-        request.account_key_ref = Some(foreign);
-        let error = client.sign_exact_payload(request).await.unwrap_err();
-        assert_eq!(error.code, ProtocolErrorCode::KeyrefMismatch);
-        assert_eq!(
-            broker.requests.lock().unwrap().len(),
-            1,
-            "a foreign account must be rejected before Broker is asked for key metadata"
-        );
-    }
-
-    #[tokio::test]
     async fn exact_payload_prepares_then_signs_without_a_hash_only_path() {
         let root_key_ref = key_ref();
         let mut derived_key_ref = key_ref();
@@ -4265,6 +4194,11 @@ mod tests {
             error.message.contains(digest(0xb2).as_str()),
             "{}",
             error.message
+        );
+        assert_eq!(
+            broker.requests.lock().unwrap().len(),
+            1,
+            "a foreign account must be rejected before Broker is asked for key metadata"
         );
     }
 

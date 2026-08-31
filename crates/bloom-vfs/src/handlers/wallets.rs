@@ -2037,7 +2037,7 @@ impl WalletsHandler {
         }
         match segs[1].as_str() {
             "address" | "address.qr.png" | "address.qr.svg" | "addresses.json" | "public_key"
-            | "kind" | "projection.json" => Ok(Entry::file(&segs[1])),
+            | "kind" | "projection.json" | "accounts.json" => Ok(Entry::file(&segs[1])),
             "policy.json" => Ok(Entry::writable_file("policy.json")),
             "chains" => match segs.len() {
                 2 => Ok(Entry::dir("chains")),
@@ -3032,7 +3032,7 @@ mod tests {
         MachineBrokerRequest, MachineBrokerResponse, MachineBrokerService, OperationId,
         ProtocolError, ProtocolErrorCode, RequestNonce, RevocationState, RevokeRequest,
         SealedApprovalPrepareResponse, SealedApprovalTerms, ServiceFuture, SignedPolicySnapshot,
-        Token, WalletOperationRequest, WalletPublic,
+        Token, WalletAccountsPublic, WalletOperationRequest, WalletPublic, WalletSeedProfile,
     };
     use bloom_machine_client::{ProjectionFreshness, ProjectionVerification};
     use bloom_proto::AddressBook;
@@ -3070,6 +3070,31 @@ mod tests {
         state: Mutex<CeremonyState>,
         omit_ceremony_url: Mutex<bool>,
         status_error: Mutex<Option<ProtocolErrorCode>>,
+    }
+
+    struct WalletAccountsBroker;
+
+    impl MachineBrokerService for WalletAccountsBroker {
+        fn dispatch<'a>(
+            &'a self,
+            request: MachineBrokerRequest,
+        ) -> ServiceFuture<'a, MachineBrokerResponse> {
+            Box::pin(async move {
+                match request {
+                    MachineBrokerRequest::WalletAccounts(request) => Ok(
+                        MachineBrokerResponse::WalletAccounts(WalletAccountsPublic {
+                            wallet_id: request.wallet_id,
+                            seed_profile: WalletSeedProfile::Bip39MulticurveV1,
+                            accounts: Vec::new(),
+                        }),
+                    ),
+                    other => Err(ProtocolError::new(
+                        ProtocolErrorCode::BackendUnsupported,
+                        format!("unexpected request in wallet-accounts fixture: {other:?}"),
+                    )),
+                }
+            })
+        }
     }
 
     impl MachineBrokerService for RegistrationBroker {
@@ -4975,5 +5000,35 @@ mod tests {
         .unwrap();
         let body = f.handler.read(&p).await.unwrap();
         assert!(body.is_empty());
+    }
+
+    #[tokio::test]
+    async fn wallet_entries_are_listed_looked_up_and_accounts_are_read_consistently() {
+        let f = make_handler();
+        let handler = f
+            .handler
+            .with_broker(Some(MachineBrokerClient::new(Arc::new(
+                WalletAccountsBroker,
+            ))));
+        let wallet_dir = VfsPath::parse(&format!("/{}", f.wallet_name)).unwrap();
+        let listed = handler.list(&wallet_dir).await.unwrap();
+        let names = listed
+            .iter()
+            .map(|entry| entry.name.clone())
+            .collect::<Vec<_>>();
+        assert!(names.iter().any(|name| name == "accounts.json"));
+
+        for name in &names {
+            let path = VfsPath::parse(&format!("/{}/{}", f.wallet_name, name)).unwrap();
+            handler.lookup(&path).await.unwrap_or_else(|error| {
+                panic!("listed entry {name:?} does not resolve through lookup: {error:?}")
+            });
+        }
+
+        let accounts = VfsPath::parse(&format!("/{}/accounts.json", f.wallet_name)).unwrap();
+        let body = handler.read(&accounts).await.unwrap();
+        let parsed: WalletAccountsPublic = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed.wallet_id.as_str(), f.wallet_name);
+        assert!(parsed.accounts.is_empty());
     }
 }

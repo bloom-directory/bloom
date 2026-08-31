@@ -76,27 +76,25 @@ impl WalletProjection {
                 }),
             // A BIP-39 wallet has no signable root; its primary key is the
             // canonical initial EVM child m/44'/60'/0'/0/0.
-            None => {
-                let evm_children = self.keys.iter().filter(|key| {
+            None => self
+                .keys
+                .iter()
+                .filter(|key| {
                     key.role == KeyRole::Derived && key.key_ref.key_spec == KeySpec::Secp256k1
-                });
-                evm_children
-                    .clone()
-                    .find(|key| {
-                        matches!(
-                            &key.key_ref.derivation,
-                            Some(DerivationRef::Bip39Multicurve { path, .. })
-                                if path == "m/44'/60'/0'/0/0"
-                        )
-                    })
-                    .or_else(|| evm_children.into_iter().next())
-                    .ok_or_else(|| {
-                        invalid_projection(format!(
-                            "wallet {} has no derived EVM primary key",
-                            self.wallet.wallet_id.as_str()
-                        ))
-                    })
-            }
+                })
+                .find(|key| {
+                    matches!(
+                        &key.key_ref.derivation,
+                        Some(DerivationRef::Bip39Multicurve { path, .. })
+                            if path == "m/44'/60'/0'/0/0"
+                    )
+                })
+                .ok_or_else(|| {
+                    invalid_projection(format!(
+                        "wallet {} has no derived EVM primary key",
+                        self.wallet.wallet_id.as_str()
+                    ))
+                }),
         }
     }
 
@@ -870,6 +868,32 @@ mod tests {
         )
         .unwrap();
         assert_eq!(projection.primary_key().unwrap().key_ref, expected_root);
+    }
+
+    #[test]
+    fn bip39_primary_key_never_falls_back_to_broker_list_order() {
+        let mut fixture = fixture(1);
+        fixture.wallet.root_key_ref = None;
+        fixture.wallet.wallet_kind = token("bip39");
+        fixture.keys[0].role = KeyRole::Derived;
+        fixture.keys[0].key_ref.derivation = Some(DerivationRef::Bip39Multicurve {
+            wallet_seed_ref: token("seed"),
+            profile: bloom_broker_api::DerivationProfile::Bip44EvmSecp256k1V1,
+            path: "m/44'/60'/1'/0/0".into(),
+        });
+        fixture.wallet.key_refs = vec![fixture.keys[0].key_ref.clone()];
+
+        let projection = build_projection(
+            fixture.wallet,
+            fixture.keys,
+            fixture.credentials,
+            fixture.policy,
+            1,
+        )
+        .unwrap();
+        let error = projection.primary_key().unwrap_err();
+        assert_eq!(error.code, ProtocolErrorCode::BackendInvalidRequest);
+        assert!(error.message.contains("no derived EVM primary key"));
     }
 
     #[tokio::test]
