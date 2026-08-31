@@ -6679,7 +6679,7 @@ mod tests {
                     max_rps: None,
                     http_only: false,
                 }],
-                expected_genesis_hex: Some("test-genesis".into()),
+                expected_genesis_base58: Some("test-genesis".into()),
                 allow_broadcast: false,
             })
             .unwrap(),
@@ -6870,7 +6870,7 @@ mod tests {
                     max_rps: None,
                     http_only: false,
                 }],
-                expected_genesis_hex: Some("test-genesis".into()),
+                expected_genesis_base58: Some("test-genesis".into()),
                 allow_broadcast: false,
             })
             .unwrap(),

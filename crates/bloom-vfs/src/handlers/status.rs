@@ -2250,7 +2250,7 @@ mod tests {
                     max_rps: None,
                     http_only: false,
                 }],
-                expected_genesis_hex: pin.map(str::to_owned),
+                expected_genesis_base58: pin.map(str::to_owned),
                 allow_broadcast: pin.is_some(),
             })
             .unwrap(),
