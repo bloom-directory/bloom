@@ -7,8 +7,9 @@ Service packages may advance independently when every edge remains inside its
 declared range; incompatible edges fail closed.
 It also records the exact Broker, Signer, service-runtime, and Petal-contract
 commits plus the current state schema and downgrade floor for Machine, Broker,
-and Signer. `check-external-pins.py` rejects mutable or abbreviated Git pins;
-its `--remote` mode additionally proves the recorded commits through GitHub.
+and Signer. `check-external-pins.py` rejects mutable or abbreviated Git pins.
+Its optional `--remote` mode proves the recorded commits through GitHub, but it
+is deliberately excluded from local artifact builds.
 
 `build-bundle.sh` accepts the three service binaries, the bounded
 `bloom-signer-migrate` staging tool, and an ephemeral candidate key. It verifies semantic versions, scans every

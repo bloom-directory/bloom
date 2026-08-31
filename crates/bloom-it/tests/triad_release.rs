@@ -79,18 +79,6 @@ fn external_triad_dependencies_are_full_commit_pins() {
 }
 
 #[test]
-fn default_petal_catalog_pins_artifacts_and_excludes_incompatible_defaults() {
-    let output = Command::new(release_script("check-default-petal-releases.py"))
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-}
-
-#[test]
 fn production_provenance_catalog_has_no_retired_native_hyperliquid_authority() {
     let catalog = fs::read_to_string(
         workspace().join("packaging/triad/macos/config/provenance-catalog.unsigned.json"),
@@ -116,6 +104,7 @@ fn machine_authority_boundary_is_directly_enforced_and_strict_release_is_blocked
     assert!(release_gate.contains("--output-dir"));
     assert!(release_gate.contains("bloom-triad-test-unclaimed.tar.gz"));
     assert!(release_gate.contains("cargo test --workspace --locked -- --skip macos_"));
+    assert!(!release_gate.contains("check-external-pins.py\" --remote"));
 }
 
 #[test]

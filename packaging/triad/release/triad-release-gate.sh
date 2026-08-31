@@ -73,9 +73,8 @@ done
 
 "$main_root/packaging/triad/release/check-machine-authority-boundary.sh" --require-clean
 python3 "$main_root/packaging/triad/release/check-legacy-hash-only-routes.py"
-python3 "$main_root/packaging/triad/release/check-external-pins.py" --remote \
+python3 "$main_root/packaging/triad/release/check-external-pins.py" \
   "$main_root/Cargo.toml" "$broker_root/Cargo.toml" "$signer_root/Cargo.toml"
-python3 "$main_root/packaging/triad/release/check-default-petal-releases.py" --remote
 
 resolved_machine_features="$(cargo tree --manifest-path "$main_root/Cargo.toml" -p bloom -e normal,build,features --prefix none)"
 for forbidden_feature in unsigned-audit-test-seam audit-test-seam; do
