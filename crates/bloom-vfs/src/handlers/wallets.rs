@@ -1965,6 +1965,7 @@ fn is_public_solana_outbox_artifact(name: &str) -> bool {
             | "simulation.json"
             | "receipt.json"
             | "broadcast_attempted.json"
+            | "approval_challenge.json"
             | "restage_advice.json"
             | "restage.md"
     )
@@ -3082,6 +3083,7 @@ impl WalletsHandler {
                     "simulation.json",
                     "receipt.json",
                     "broadcast_attempted.json",
+                    "approval_challenge.json",
                     "restage_advice.json",
                     "restage.md",
                 ] {
@@ -3240,14 +3242,31 @@ impl WalletsHandler {
                 let (child, key_ref) = self
                     .resolve_solana_child(wallet, entry.staged.account_fingerprint.as_deref())
                     .await?;
-                let approval_id = std::fs::read(entry.dir.join("approval.json"))
-                    .ok()
-                    .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
-                    .and_then(|v| {
-                        v.get("approval_id")
-                            .and_then(|id| id.as_str())
-                            .and_then(|s| bloom_broker_api::Digest32::new(s.to_owned()).ok())
-                    });
+                let approval_id = std::fs::read(
+                    entry
+                        .dir
+                        .join(bloom_solana_tx::outbox::APPROVAL_CHALLENGE_FILE),
+                )
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+                .and_then(|v| {
+                    v.get("approval_id")
+                        .and_then(|id| id.as_str())
+                        .and_then(|s| bloom_broker_api::Digest32::new(s.to_owned()).ok())
+                })
+                // Compatibility for pending entries produced by earlier
+                // unshipped Solana heads. New entries use the public
+                // challenge as their canonical resume projection.
+                .or_else(|| {
+                    std::fs::read(entry.dir.join("approval.json"))
+                        .ok()
+                        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+                        .and_then(|v| {
+                            v.get("approval_id")
+                                .and_then(|id| id.as_str())
+                                .and_then(|s| bloom_broker_api::Digest32::new(s.to_owned()).ok())
+                        })
+                });
                 match engine
                     .sign(wallet, id, &child, Some(key_ref), approval_id, now)
                     .await
@@ -3256,20 +3275,37 @@ impl WalletsHandler {
                     bloom_solana_tx::signing::SolanaSignOutcome::ApprovalRequired {
                         approval_id,
                         ceremony_url,
-                        ..
+                        ceremony_expires_at_ms,
                     } => {
-                        let approval = serde_json::to_vec_pretty(&serde_json::json!({
+                        let challenge = serde_json::to_vec_pretty(&serde_json::json!({
+                            "schema": "bloom.solana-approval-challenge/1",
+                            "action_id": entry.staged.action_id.as_deref().unwrap_or(&entry.staged.id),
+                            "tx_id": entry.staged.id,
+                            "wallet": wallet,
+                            "chain": chain,
                             "approval_id": approval_id.as_str(),
                             "ceremony_url": ceremony_url,
+                            "expiry_ms": ceremony_expires_at_ms,
+                            "account_fingerprint": entry.staged.account_fingerprint,
+                            "fee_payer": entry.staged.fee_payer,
+                            "destination": entry.staged.destination,
+                            "lamports": entry.staged.lamports,
+                            "fee_lamports": entry.staged.fee_lamports,
+                            "plan_path": format!("wallets/{wallet}/chains/{chain}/outbox/pending/{id}/plan.md"),
+                            "retry_path": format!("wallets/{wallet}/chains/{chain}/outbox/pending/{id}/confirm"),
                         }))
                         .map_err(|error| HandlerError::backend(error.to_string()))?;
                         engine
                             .outbox()
-                            .write_approval(&entry, &approval)
+                            .write_approval_challenge(&entry, &challenge)
                             .map_err(solana_outbox_err)?;
                         Err(HandlerError::PermissionDenied)
                     }
                     bloom_solana_tx::signing::SolanaSignOutcome::Signed { .. } => {
+                        engine
+                            .outbox()
+                            .clear_approval_challenge(&entry)
+                            .map_err(solana_outbox_err)?;
                         engine
                             .broadcast(wallet, id, now)
                             .await
@@ -4497,6 +4533,12 @@ mod tests {
         outbox
             .write_approval(&pending, b"secret approval evidence")
             .unwrap();
+        outbox
+            .write_approval_challenge(
+                &pending,
+                br#"{"schema":"bloom.solana-approval-challenge/1","approval_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","ceremony_url":"http://localhost:18734/ceremony/owner","expiry_ms":999999}"#,
+            )
+            .unwrap();
         std::fs::write(pending.dir.join("raw_tx"), b"secret signed transaction").unwrap();
 
         let handler = f.handler.with_solana(std::collections::BTreeMap::from([(
@@ -4529,6 +4571,26 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_slice(&intent).unwrap();
         assert_eq!(parsed["lamports"], 1_000_000);
         assert_eq!(parsed["chain"], "solana-devnet");
+
+        let action_dir =
+            VfsPath::parse("/alice/chains/solana-devnet/outbox/pending/0001-00001").unwrap();
+        let action_entries = handler.list(&action_dir).await.unwrap();
+        assert!(
+            action_entries
+                .iter()
+                .any(|entry| entry.name == "approval_challenge.json")
+        );
+        let challenge_path = VfsPath::parse(
+            "/alice/chains/solana-devnet/outbox/pending/0001-00001/approval_challenge.json",
+        )
+        .unwrap();
+        handler.lookup(&challenge_path).await.unwrap();
+        let challenge = handler.read(&challenge_path).await.unwrap();
+        let challenge: serde_json::Value = serde_json::from_slice(&challenge).unwrap();
+        assert_eq!(
+            challenge["ceremony_url"],
+            "http://localhost:18734/ceremony/owner"
+        );
 
         // The host outbox may contain signing and approval material needed
         // for crash recovery, but none of it is part of the wallet VFS. Only
