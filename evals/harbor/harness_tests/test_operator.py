@@ -206,6 +206,57 @@ class OperatorStateTests(unittest.TestCase):
 
         self.assertFalse(self.store.backup_path.exists())
 
+    def test_activation_failure_after_authority_mutation_restores_unconditionally(
+        self,
+    ) -> None:
+        current = self.store.read()
+        current["lineage"] = {}
+        self.store.write(current)
+        authority_active = False
+        events: list[str] = []
+
+        def activate() -> None:
+            nonlocal authority_active
+            atomic_write(self.store.backup_path, b"protected backup\n")
+            current = self.store.read()
+            current["pending_policy_recovery"] = {"operation_id": "operation"}
+            self.store.write(current)
+            authority_active = True
+            events.append("activated")
+            raise EvalError("activation verification failed")
+
+        def restore() -> None:
+            nonlocal authority_active
+            events.append("restored")
+            authority_active = False
+            current = self.store.read()
+            current["pending_policy_recovery"] = None
+            self.store.write(current)
+            self.store.backup_path.unlink()
+
+        definition = SimpleNamespace(phase_timings={})
+        policy = SimpleNamespace(activate=activate, restore=restore)
+        with (
+            mock.patch("harness.operator.validate_lineage"),
+            mock.patch(
+                "harness.operator.HyperliquidOrderCancelEval",
+                return_value=definition,
+            ),
+            mock.patch("harness.operator.PolicyLifecycle", return_value=policy),
+            mock.patch("builtins.print"),
+            self.assertRaisesRegex(EvalError, "activation verification failed"),
+        ):
+            run_or_recover(
+                Namespace(state=self.store.path, ack=MAINNET_ACK),
+                self.root,
+                recover_only=False,
+            )
+
+        self.assertEqual(events, ["activated", "restored"])
+        self.assertFalse(authority_active)
+        self.assertFalse(self.store.backup_path.exists())
+        self.assertIsNone(self.store.read()["pending_policy_recovery"])
+
 
 class FakePolicyDefinition:
     def __init__(self, root: Path) -> None:
@@ -301,11 +352,12 @@ class PolicyRecoveryTests(unittest.TestCase):
         self.assertEqual(self.policy_path.read_bytes(), canonical_json(self.original))
 
     def test_restore_uses_exact_backup_then_clears_recovery_marker(self) -> None:
-        atomic_write(self.store.backup_path, canonical_json(self.original) + b"\n")
+        backup = canonical_json(self.original)
+        atomic_write(self.store.backup_path, backup + b"\n")
         pending = self.store.read()
         pending["pending_policy_recovery"] = {
             "operation_id": None,
-            "target_digest": "x",
+            "target_digest": hashlib.sha256(backup).hexdigest(),
         }
         self.store.write(pending)
         applied: list[bytes] = []
@@ -346,6 +398,16 @@ class PolicyRecoveryTests(unittest.TestCase):
                 }
             )
         )
+        (action / "status.json").write_text(
+            json.dumps(
+                {
+                    "action_id": operation_id,
+                    "state": "pending",
+                    "status": "awaiting_custody",
+                    "ceremony_state": "AWAITING_USER",
+                }
+            )
+        )
         writes: list[Path] = []
 
         def cancel(path: Path, body: bytes, timeout: int) -> object:
@@ -382,7 +444,10 @@ class PolicyRecoveryTests(unittest.TestCase):
 
     def test_restore_retains_recovery_state_when_policy_cancel_fails(self) -> None:
         backup = canonical_json(self.original)
-        target_digest = "a" * 64
+        active = canonical_json(
+            dict(self.original, allowed_petal_packages=[self.state["package_hash"]])
+        )
+        target_digest = hashlib.sha256(active).hexdigest()
         operation_id = "policy-operation"
         atomic_write(self.store.backup_path, backup + b"\n")
         pending = self.store.read()
@@ -406,6 +471,16 @@ class PolicyRecoveryTests(unittest.TestCase):
                 }
             )
         )
+        (action / "status.json").write_text(
+            json.dumps(
+                {
+                    "action_id": operation_id,
+                    "state": "pending",
+                    "status": "awaiting_custody",
+                    "ceremony_state": "AWAITING_USER",
+                }
+            )
+        )
         self.definition._write_route = mock.Mock(
             return_value=SimpleNamespace(returncode=1, stdout=b"", stderr=b"failed")
         )
@@ -418,7 +493,10 @@ class PolicyRecoveryTests(unittest.TestCase):
 
     def test_restore_accepts_consumed_confirmed_allow_operation(self) -> None:
         backup = canonical_json(self.original)
-        target_digest = "a" * 64
+        active = canonical_json(
+            dict(self.original, allowed_petal_packages=[self.state["package_hash"]])
+        )
+        target_digest = hashlib.sha256(active).hexdigest()
         operation_id = "policy-operation"
         atomic_write(self.store.backup_path, backup + b"\n")
         pending = self.store.read()
@@ -449,6 +527,90 @@ class PolicyRecoveryTests(unittest.TestCase):
         self.lifecycle.restore()
 
         self.assertEqual(applied, [backup])
+        self.assertFalse(self.store.backup_path.exists())
+        self.assertIsNone(self.store.read()["pending_policy_recovery"])
+
+    def test_restore_reconciles_succeeded_pending_operation_before_deny(self) -> None:
+        backup = canonical_json(self.original)
+        active = canonical_json(
+            dict(self.original, allowed_petal_packages=[self.state["package_hash"]])
+        )
+        target_digest = hashlib.sha256(active).hexdigest()
+        operation_id = "policy-operation"
+        atomic_write(self.store.backup_path, backup + b"\n")
+        pending = self.store.read()
+        pending["pending_policy_recovery"] = {
+            "operation_id": operation_id,
+            "target_digest": target_digest,
+            "backup_digest": hashlib.sha256(backup).hexdigest(),
+        }
+        self.store.write(pending)
+        action = (
+            self.definition.wallet_root
+            / "policy-updates/pending"
+            / operation_id
+        )
+        action.mkdir(parents=True)
+        (action / "approval_challenge.json").write_text(
+            json.dumps(
+                {
+                    "operation_id": operation_id,
+                    "proposed_policy_digest": target_digest,
+                }
+            )
+        )
+        (action / "status.json").write_text(
+            json.dumps(
+                {
+                    "action_id": operation_id,
+                    "state": "pending",
+                    "status": "ready_to_commit",
+                    "ceremony_state": "SUCCEEDED",
+                }
+            )
+        )
+        writes: list[tuple[Path, bytes]] = []
+
+        def reconcile(path: Path, body: bytes, timeout: int) -> object:
+            del timeout
+            writes.append((path, body))
+            self.assertEqual(path, self.policy_path)
+            self.assertEqual(body, active)
+            self.policy_path.write_bytes(active)
+            confirmed = (
+                self.definition.wallet_root
+                / "policy-updates/confirmed"
+                / operation_id
+            )
+            confirmed.mkdir(parents=True)
+            (confirmed / "status.json").write_text(
+                json.dumps(
+                    {
+                        "action_id": operation_id,
+                        "state": "confirmed",
+                        "ceremony_state": "SUCCEEDED",
+                    }
+                )
+            )
+            for child in action.iterdir():
+                child.unlink()
+            action.rmdir()
+            return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+
+        self.definition._write_route = mock.Mock(side_effect=reconcile)
+        applied: list[bytes] = []
+
+        def apply_deny(target: bytes) -> None:
+            applied.append(target)
+            self.policy_path.write_bytes(target)
+
+        self.lifecycle.apply = mock.Mock(side_effect=apply_deny)
+
+        self.lifecycle.restore()
+
+        self.assertEqual(writes, [(self.policy_path, active)])
+        self.assertEqual(applied, [backup])
+        self.assertEqual(self.policy_path.read_bytes(), backup)
         self.assertFalse(self.store.backup_path.exists())
         self.assertIsNone(self.store.read()["pending_policy_recovery"])
 

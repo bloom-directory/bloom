@@ -509,7 +509,63 @@ class PolicyLifecycle:
                 matches.append(operation_id)
         return matches
 
-    def _cancel_pending_policy_update(self) -> None:
+    def _policy_update_status(self, state: str, operation_id: str) -> dict[str, Any]:
+        try:
+            status = self.definition._read_json(
+                self.definition.wallet_root
+                / "policy-updates"
+                / state
+                / operation_id
+                / "status.json",
+                timeout=2,
+            )
+        except (EvalError, OSError) as error:
+            raise EvalError(
+                f"stored policy-update operation has no {state} projection"
+            ) from error
+        if (
+            not isinstance(status, dict)
+            or status.get("action_id") != operation_id
+            or status.get("state") != state
+        ):
+            raise EvalError(f"stored {state} policy-update projection is invalid")
+        return status
+
+    def _reconcile_succeeded_policy_update(
+        self,
+        operation_id: str,
+        target: bytes,
+        expected: bytes,
+        previous: bytes,
+    ) -> None:
+        for attempt in range(5):
+            replay = self.definition._write_route(self.policy_path, target, 120)
+            confirmation_attempts = 10 if replay.returncode == 0 else 1
+            for confirmation_attempt in range(confirmation_attempts):
+                try:
+                    confirmed = self._policy_update_status("confirmed", operation_id)
+                except EvalError:
+                    confirmed = None
+                if confirmed is not None:
+                    if confirmed.get("ceremony_state") != "SUCCEEDED":
+                        raise EvalError(
+                            "reconciled policy-update projection is not successful"
+                        )
+                    self._wait_for_policy_commit(expected, previous)
+                    return
+                if confirmation_attempt + 1 < confirmation_attempts:
+                    time.sleep(0.2)
+            if replay.returncode == 0:
+                raise EvalError(
+                    "policy replay succeeded without a confirmed operation projection"
+                )
+            if attempt + 1 < 5:
+                time.sleep(0.5)
+        raise EvalError("succeeded policy update could not be reconciled")
+
+    def _resolve_pending_policy_update(
+        self, target: bytes, expected: bytes, previous: bytes
+    ) -> None:
         pending = self.store.read().get("pending_policy_recovery")
         if not isinstance(pending, dict):
             raise EvalError("policy recovery marker is invalid")
@@ -534,66 +590,89 @@ class PolicyLifecycle:
             # its ceremony has already been consumed, so it cannot later
             # broaden authority again after the deny policy is committed.
             try:
-                failed = self.definition._read_json(
-                    self.definition.wallet_root
-                    / "policy-updates/failed"
-                    / operation_id
-                    / "status.json",
-                    timeout=2,
-                )
-            except (EvalError, OSError):
+                failed = self._policy_update_status("failed", operation_id)
+            except EvalError:
                 failed = None
-            if isinstance(failed, dict) and failed.get("ceremony_state") == "CANCELLED":
+            if isinstance(failed, dict) and failed.get("ceremony_state") in {
+                "CANCELLED",
+                "EXPIRED",
+                "FAILED",
+            }:
                 return
             try:
-                confirmed = self.definition._read_json(
-                    self.definition.wallet_root
-                    / "policy-updates/confirmed"
-                    / operation_id
-                    / "status.json",
-                    timeout=2,
-                )
-            except (EvalError, OSError) as error:
+                confirmed = self._policy_update_status("confirmed", operation_id)
+            except EvalError as error:
                 raise EvalError(
                     "stored policy-update operation is neither pending nor terminal"
                 ) from error
             if (
-                not isinstance(confirmed, dict)
-                or confirmed.get("action_id") != operation_id
-                or confirmed.get("state") != "confirmed"
-                or confirmed.get("ceremony_state") != "SUCCEEDED"
+                confirmed.get("ceremony_state") != "SUCCEEDED"
             ):
                 raise EvalError("stored confirmed policy-update projection is invalid")
             return
 
-        cancel_path = (
-            self.definition.wallet_root
-            / "policy-updates/pending"
-            / operation_id
-            / "cancel"
-        )
-        cancelled = self.definition._write_route(cancel_path, b"cancel\n", 30)
-        if cancelled.returncode != 0:
-            raise EvalError("policy-update cancellation was not confirmed by the mount")
-        try:
-            failed = self.definition._read_json(
-                self.definition.wallet_root
-                / "policy-updates/failed"
-                / operation_id
-                / "status.json",
-                timeout=2,
-            )
-        except EvalError as error:
-            raise EvalError("cancelled policy update has no terminal projection") from error
-        if (
-            not isinstance(failed, dict)
-            or failed.get("action_id") != operation_id
-            or failed.get("state") != "failed"
-            or failed.get("ceremony_state") != "CANCELLED"
-        ):
-            raise EvalError("policy-update cancellation projection is invalid")
-        if operation_id in self._matching_pending_policy_updates(expected_digest):
-            raise EvalError("cancelled policy update remains live")
+        for attempt in range(20):
+            try:
+                status = self._policy_update_status("pending", operation_id)
+            except EvalError as pending_error:
+                try:
+                    failed = self._policy_update_status("failed", operation_id)
+                except EvalError:
+                    failed = None
+                if isinstance(failed, dict) and failed.get("ceremony_state") in {
+                    "CANCELLED",
+                    "EXPIRED",
+                    "FAILED",
+                }:
+                    return
+                try:
+                    confirmed = self._policy_update_status("confirmed", operation_id)
+                except EvalError:
+                    confirmed = None
+                if (
+                    isinstance(confirmed, dict)
+                    and confirmed.get("ceremony_state") == "SUCCEEDED"
+                ):
+                    return
+                raise pending_error
+            ceremony_state = status.get("ceremony_state")
+            if ceremony_state == "SUCCEEDED" and status.get("status") == "ready_to_commit":
+                self._reconcile_succeeded_policy_update(
+                    operation_id, target, expected, previous
+                )
+                return
+            if ceremony_state == "AWAITING_USER":
+                cancel_path = (
+                    self.definition.wallet_root
+                    / "policy-updates/pending"
+                    / operation_id
+                    / "cancel"
+                )
+                cancelled = self.definition._write_route(cancel_path, b"cancel\n", 30)
+                if cancelled.returncode != 0:
+                    # Completion can race cancellation. Re-read the
+                    # Broker-backed projection and reconcile it on this same
+                    # recovery attempt if it became successful.
+                    if attempt + 1 < 20:
+                        time.sleep(0.25)
+                        continue
+                    raise EvalError(
+                        "policy-update cancellation was not confirmed by the mount"
+                    )
+                failed = self._policy_update_status("failed", operation_id)
+                if failed.get("ceremony_state") != "CANCELLED":
+                    raise EvalError("policy-update cancellation projection is invalid")
+                if operation_id in self._matching_pending_policy_updates(expected_digest):
+                    raise EvalError("cancelled policy update remains live")
+                return
+            if ceremony_state in {"CANCELLED", "EXPIRED", "FAILED"}:
+                failed = self._policy_update_status("failed", operation_id)
+                if failed.get("ceremony_state") != ceremony_state:
+                    raise EvalError("terminal policy-update projection is invalid")
+                return
+            if attempt + 1 < 20:
+                time.sleep(0.25)
+        raise EvalError("pending policy update did not become recoverable")
 
     def apply(self, target: bytes) -> None:
         try:
@@ -692,7 +771,28 @@ class PolicyLifecycle:
         ):
             raise EvalError("protected policy backup is not the expected policy")
         self._bind_backup_digest(hashlib.sha256(backup).hexdigest())
-        self._cancel_pending_policy_update()
+        pending = self.store.read().get("pending_policy_recovery")
+        if not isinstance(pending, dict):
+            raise EvalError("policy recovery marker is invalid")
+        target_digest = pending.get("target_digest")
+        if not isinstance(target_digest, str):
+            raise EvalError("policy recovery target digest is invalid")
+        active = canonical_json(
+            dict(backup_value, allowed_petal_packages=[self.state["package_hash"]])
+        )
+        active_digest = hashlib.sha256(active).hexdigest()
+        backup_digest = hashlib.sha256(backup).hexdigest()
+        if target_digest == active_digest:
+            recovery_target, recovery_previous = active, backup
+        elif target_digest == backup_digest:
+            recovery_target, recovery_previous = backup, active
+        else:
+            raise EvalError("policy recovery target digest is not reconstructible")
+        self._resolve_pending_policy_update(
+            recovery_target,
+            recovery_target,
+            recovery_previous,
+        )
         self.apply(backup)
         pending = self.store.read().get("pending_policy_recovery")
         if not isinstance(pending, dict):
@@ -942,23 +1042,32 @@ def run_or_recover(
                 # prerequisites for restoring the exact digest-bound policy
                 # backup after a branch switch or rebuild.
                 validate_lineage(state, repo_root)
-                phase = time.monotonic()
-                policy.activate()
-                timings["policy_activation_seconds"] = time.monotonic() - phase
-                refreshed = store.read()
-                definition.sign_count_value = str(refreshed["next_sign_count"])
                 try:
+                    phase = time.monotonic()
+                    try:
+                        policy.activate()
+                    finally:
+                        timings["policy_activation_seconds"] = (
+                            time.monotonic() - phase
+                        )
+                    refreshed = store.read()
+                    definition.sign_count_value = str(refreshed["next_sign_count"])
                     result = run_eval(
                         definition,
                         state["model"],
                         acquire_lock=False,
                         phase_timings=timings,
                     )
-                    outcome = "passed"
                 finally:
-                    phase = time.monotonic()
-                    policy.restore()
-                    timings["policy_restoration_seconds"] = time.monotonic() - phase
+                    if store.backup_path.exists():
+                        phase = time.monotonic()
+                        try:
+                            policy.restore()
+                        finally:
+                            timings["policy_restoration_seconds"] = (
+                                time.monotonic() - phase
+                            )
+                outcome = "passed"
         except BaseException as error:
             error_text = redact(error, state)
             raise
