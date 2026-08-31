@@ -47,6 +47,20 @@ children remain unavailable until every EVM transaction and exact-signing
 surface can carry an explicit account selector. This avoids creating a wallet
 state that existing EVM UX cannot spend from safely.
 
+`bloom wallet import <name>` starts the mnemonic ceremony. The recovery phrase
+is entered only in the ceremony browser; it is never a command-line argument.
+`bloom wallet import <name> --raw-private-key` is the explicit migration path
+for an old local wallet after its secp256k1 key has been exported with the old
+offline tooling. The raw key is likewise entered only in the browser. Bloom
+does not accept or retain the old wallet passphrase.
+
+Raw-key migration preserves the corresponding EVM account, but it creates an
+`imported-secp256k1-scalar` wallet rather than a BIP-39 root. It cannot derive
+Solana accounts. A user who needs native Solana support must create or import a
+passphrase-free BIP-39 wallet and transfer assets to its derived accounts.
+Existing v1 passkey wallets use `bloom wallet migrate-passkey <receipt>`; that
+receipt carries public binding data, not the credential secret or root key.
+
 Broker projects public derived accounts through `wallet.accounts`; Machine
 exposes the authenticated collection as `wallets/<wallet>/accounts.json`.
 Selection binds the exact `KeyRef` into approval terms and signing identity.
