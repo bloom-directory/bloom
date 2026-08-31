@@ -242,14 +242,18 @@ def safe_json(path: Path) -> Any:
         raise EvalError("required discovery input is unavailable or invalid") from error
 
 
-def require_deny_policy(definition: HyperliquidOrderCancelEval, wallet_id: str) -> None:
-    expected = {
+def expected_deny_policy(wallet_id: str) -> dict[str, Any]:
+    return {
         "allowed_destinations": [],
         "allowed_petal_packages": [],
         "maximum_approval_lifetime_ms": 2_592_000_000,
         "required_verifiers": [],
         "wallet_id": wallet_id,
     }
+
+
+def require_deny_policy(definition: HyperliquidOrderCancelEval, wallet_id: str) -> None:
+    expected = expected_deny_policy(wallet_id)
     if definition._read_json(definition.wallet_root / "policy.json") != expected:
         raise EvalError("eval wallet policy is not deny-by-default")
 
@@ -350,10 +354,39 @@ class PolicyLifecycle:
 
     def _persist_pending(self, operation_id: str | None, digest: str) -> None:
         current = self.store.read()
-        current["pending_policy_recovery"] = {
+        existing = current.get("pending_policy_recovery")
+        if existing is not None and not isinstance(existing, dict):
+            raise EvalError("policy recovery marker is invalid")
+        pending = {
             "operation_id": operation_id,
             "target_digest": digest,
         }
+        if isinstance(existing, dict) and "backup_digest" in existing:
+            pending["backup_digest"] = existing["backup_digest"]
+        current["pending_policy_recovery"] = pending
+        self.store.write(current)
+        self.state = current
+
+    def _bind_backup_digest(self, digest: str) -> None:
+        current = self.store.read()
+        pending = current.get("pending_policy_recovery")
+        if pending is None:
+            pending = {"operation_id": None, "target_digest": digest}
+        elif not isinstance(pending, dict):
+            raise EvalError("policy recovery marker is invalid")
+        else:
+            pending = dict(pending)
+        bound_digest = pending.get("backup_digest")
+        if bound_digest is not None:
+            if not isinstance(bound_digest, str) or not re.fullmatch(
+                r"[0-9a-f]{64}", bound_digest
+            ):
+                raise EvalError("protected policy backup digest is invalid")
+            if bound_digest != digest:
+                raise EvalError("protected policy backup digest does not match")
+            return
+        pending["backup_digest"] = digest
+        current["pending_policy_recovery"] = pending
         self.store.write(current)
         self.state = current
 
@@ -476,6 +509,10 @@ class PolicyLifecycle:
             raise EvalError("policy-update challenge is incomplete")
         self._persist_pending(operation_id, digest)
         counter = int(self.store.read()["next_sign_count"])
+        # Persist the next unused counter before the assertion can leave this
+        # process. A timeout or interruption after Broker accepts it must not
+        # allow a later recovery attempt to reuse the consumed value.
+        self._advance_counter(counter + 1)
         try:
             completed = subprocess.run(
                 [
@@ -492,15 +529,10 @@ class PolicyLifecycle:
                 timeout=45,
             )
         except (OSError, subprocess.SubprocessError) as error:
-            # Once an assertion has been sent, its acceptance is ambiguous on a
-            # transport failure. Skipping a counter is valid; reusing an
-            # accepted one is not. Persist the first safe candidate atomically.
-            self._advance_counter(counter + 1)
             raise EvalError(
                 f"policy ceremony transport failed at counter {counter}; "
                 f"next candidate is {counter + 1}"
             ) from error
-        self._advance_counter(counter + 1)
         if completed.returncode != 0:
             raise EvalError(
                 f"policy ceremony failed at counter {counter}; "
@@ -510,17 +542,11 @@ class PolicyLifecycle:
 
     def activate(self) -> None:
         original, original_bytes = self._read_policy()
-        expected_original = {
-            "allowed_destinations": [],
-            "allowed_petal_packages": [],
-            "maximum_approval_lifetime_ms": 2_592_000_000,
-            "required_verifiers": [],
-            "wallet_id": self.state["wallet_id"],
-        }
+        expected_original = expected_deny_policy(self.state["wallet_id"])
         if original != expected_original:
             raise EvalError("eval wallet is not deny-by-default before activation")
         atomic_write(self.store.backup_path, original_bytes + b"\n")
-        self._persist_pending(None, hashlib.sha256(original_bytes).hexdigest())
+        self._bind_backup_digest(hashlib.sha256(original_bytes).hexdigest())
         active = dict(original, allowed_petal_packages=[self.state["package_hash"]])
         self.apply(canonical_json(active))
 
@@ -534,7 +560,23 @@ class PolicyLifecycle:
             or stat.S_IMODE(metadata.st_mode) != 0o600
         ):
             raise EvalError("protected policy backup is unsafe")
-        backup = self.store.backup_path.read_bytes().rstrip(b"\n")
+        try:
+            raw_backup = self.store.backup_path.read_bytes()
+        except OSError as error:
+            raise EvalError("protected policy backup is unreadable") from error
+        backup = raw_backup.rstrip(b"\n")
+        if raw_backup not in (backup, backup + b"\n"):
+            raise EvalError("protected policy backup is not canonical JSON")
+        try:
+            backup_value = json.loads(backup)
+        except (json.JSONDecodeError, UnicodeDecodeError) as error:
+            raise EvalError("protected policy backup is invalid JSON") from error
+        if (
+            backup_value != expected_deny_policy(self.state["wallet_id"])
+            or canonical_json(backup_value) != backup
+        ):
+            raise EvalError("protected policy backup is not the expected policy")
+        self._bind_backup_digest(hashlib.sha256(backup).hexdigest())
         self.apply(backup)
         current = self.store.read()
         current["pending_policy_recovery"] = None
@@ -739,7 +781,6 @@ def run_or_recover(
     state = store.read()
     if args.ack != MAINNET_ACK:
         raise EvalError(f"explicit acknowledgement must equal {MAINNET_ACK}")
-    validate_lineage(state, repo_root)
     lock_path = Path(state["paths"]["lock_file"])
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     started_total = time.monotonic()
@@ -773,6 +814,10 @@ def run_or_recover(
                     raise EvalError(
                         "interrupted policy lifecycle exists; run recover first"
                     )
+                # Source and binary lineage protect a new eval run, but are not
+                # prerequisites for restoring the exact digest-bound policy
+                # backup after a branch switch or rebuild.
+                validate_lineage(state, repo_root)
                 phase = time.monotonic()
                 policy.activate()
                 timings["policy_activation_seconds"] = time.monotonic() - phase

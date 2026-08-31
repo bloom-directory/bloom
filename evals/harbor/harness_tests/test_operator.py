@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import stat
+import subprocess
 import tempfile
 import unittest
 from argparse import Namespace
@@ -12,6 +14,7 @@ from unittest import mock
 from harness.core import EvalError
 from harness.operator import (
     DEFAULT_STATE_RELATIVE,
+    MAINNET_ACK,
     STATE_PURPOSE,
     STATE_SCHEMA,
     PolicyLifecycle,
@@ -24,6 +27,7 @@ from harness.operator import (
     parser,
     redact,
     require_no_pending_owner_requests,
+    run_or_recover,
     validate_lineage,
 )
 
@@ -168,6 +172,40 @@ class OperatorStateTests(unittest.TestCase):
         ):
             validate_lineage(state, self.root)
 
+    def test_recovery_does_not_require_original_source_or_binary_lineage(self) -> None:
+        state = self.store.read()
+        state["lineage"] = {"bloom": {"revision": "stale", "dirty": False}}
+        self.store.write(state)
+        atomic_write(self.store.backup_path, b"protected backup\n")
+
+        def restore() -> None:
+            current = self.store.read()
+            current["pending_policy_recovery"] = None
+            self.store.write(current)
+            self.store.backup_path.unlink()
+
+        definition = SimpleNamespace(phase_timings={})
+        policy = SimpleNamespace(restore=restore)
+        with (
+            mock.patch(
+                "harness.operator.validate_lineage",
+                side_effect=AssertionError("recovery must not validate lineage"),
+            ),
+            mock.patch(
+                "harness.operator.HyperliquidOrderCancelEval",
+                return_value=definition,
+            ),
+            mock.patch("harness.operator.PolicyLifecycle", return_value=policy),
+            mock.patch("builtins.print"),
+        ):
+            run_or_recover(
+                Namespace(state=self.store.path, ack=MAINNET_ACK),
+                self.root,
+                recover_only=True,
+            )
+
+        self.assertFalse(self.store.backup_path.exists())
+
 
 class FakePolicyDefinition:
     def __init__(self, root: Path) -> None:
@@ -242,7 +280,11 @@ class PolicyRecoveryTests(unittest.TestCase):
             self.lifecycle.activate()
         self.assertEqual(observed, [True])
         self.assertEqual(stat.S_IMODE(self.store.backup_path.stat().st_mode), 0o600)
-        self.assertIsNotNone(self.store.read()["pending_policy_recovery"])
+        pending = self.store.read()["pending_policy_recovery"]
+        self.assertEqual(
+            pending["backup_digest"],
+            hashlib.sha256(canonical_json(self.original)).hexdigest(),
+        )
 
     def test_apply_rejects_invalid_or_non_object_policy_payloads(self) -> None:
         for payload, message in (
@@ -271,6 +313,44 @@ class PolicyRecoveryTests(unittest.TestCase):
         self.assertFalse(self.store.backup_path.exists())
         self.assertIsNone(self.store.read()["pending_policy_recovery"])
 
+    def test_restore_rejects_backup_that_does_not_match_bound_digest(self) -> None:
+        atomic_write(self.store.backup_path, canonical_json(self.original) + b"\n")
+        pending = self.store.read()
+        pending["pending_policy_recovery"] = {
+            "operation_id": None,
+            "target_digest": "x",
+            "backup_digest": "0" * 64,
+        }
+        self.store.write(pending)
+        self.lifecycle.apply = mock.Mock()
+
+        with self.assertRaisesRegex(EvalError, "backup digest does not match"):
+            self.lifecycle.restore()
+
+        self.lifecycle.apply.assert_not_called()
+        self.assertTrue(self.store.backup_path.exists())
+
+    def test_restore_rejects_digest_bound_policy_other_than_known_deny_policy(
+        self,
+    ) -> None:
+        unexpected = dict(self.original, allowed_petal_packages=["b" * 64])
+        backup = canonical_json(unexpected)
+        atomic_write(self.store.backup_path, backup + b"\n")
+        pending = self.store.read()
+        pending["pending_policy_recovery"] = {
+            "operation_id": None,
+            "target_digest": "x",
+            "backup_digest": hashlib.sha256(backup).hexdigest(),
+        }
+        self.store.write(pending)
+        self.lifecycle.apply = mock.Mock()
+
+        with self.assertRaisesRegex(EvalError, "not the expected policy"):
+            self.lifecycle.restore()
+
+        self.lifecycle.apply.assert_not_called()
+        self.assertTrue(self.store.backup_path.exists())
+
     def test_failed_ceremony_advances_candidate_before_error(self) -> None:
         target = canonical_json(dict(self.original, allowed_petal_packages=["b" * 64]))
         challenge = {
@@ -278,10 +358,15 @@ class PolicyRecoveryTests(unittest.TestCase):
             "ceremony_url": "http://localhost:18734/ceremony/" + "A" * 43,
         }
         self.lifecycle._wait_challenge = mock.Mock(return_value=challenge)
+
+        def fail_after_observing_reservation(*_args, **_kwargs):
+            self.assertEqual(self.store.read()["next_sign_count"], 8)
+            raise subprocess.TimeoutExpired(["debug-driver"], 45)
+
         with (
             mock.patch(
                 "harness.operator.subprocess.run",
-                return_value=SimpleNamespace(returncode=1, stdout=b"", stderr=b""),
+                side_effect=fail_after_observing_reservation,
             ),
             self.assertRaisesRegex(EvalError, "next candidate is 8"),
         ):

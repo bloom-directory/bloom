@@ -644,6 +644,38 @@ class HyperliquidDefinitionTests(unittest.TestCase):
         self.assertEqual(self.definition.next_sign_count, base + 3)
         self.assertEqual(committed, [base + 1, base + 2, base + 3])
 
+    def test_session_timeout_durably_reserves_next_counter_before_driver(self) -> None:
+        ceremony = "http://localhost:18734/ceremony/" + "A" * 43
+        committed: list[int] = []
+        self.definition.counter_committed = committed.append
+        self.definition._write_route = mock.Mock(
+            return_value=SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+        )
+        self.definition._read_json_if_exists = mock.Mock(return_value=None)
+        self.definition._pending_petal_key_ceremony = mock.Mock(
+            return_value=ceremony
+        )
+        self.definition._pending_agent_approval_ceremony = mock.Mock(
+            return_value=None
+        )
+        base = int(self.definition.sign_count_value)
+
+        with (
+            mock.patch(
+                "harness.hyperliquid_order_cancel.subprocess.run",
+                side_effect=subprocess.TimeoutExpired(["debug-driver"], 45),
+            ) as run,
+            self.assertRaisesRegex(
+                EvalError, f"next unused counter is {base + 1}"
+            ),
+        ):
+            self.definition.provision("codex")
+
+        self.assertEqual(committed, [base + 1])
+        self.assertEqual(self.definition.next_sign_count, base + 1)
+        command = run.call_args.args[0]
+        self.assertEqual(command[command.index("--sign-count") + 1], str(base))
+
     def test_session_route_is_addressed_by_wallet_id_not_owner_address(self) -> None:
         written: list[tuple[Path, bytes]] = []
 
