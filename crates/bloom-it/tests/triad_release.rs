@@ -2706,6 +2706,15 @@ fn macos_active_legacy_enrollment_migrates_log_identity_before_upgrade() {
     legacy.as_object_mut().unwrap().remove("log_group");
     legacy.as_object_mut().unwrap().remove("log_gid");
     fs::write(&enrollment, serde_json::to_vec(&legacy).unwrap()).unwrap();
+    let transaction = root.join("Library/Application Support/BloomTriad/upgrade-transaction");
+    fs::create_dir(&transaction).unwrap();
+    fs::write(
+        transaction.join("schema"),
+        b"bloom.macos-upgrade-transaction.2\n",
+    )
+    .unwrap();
+    fs::write(transaction.join("old-digest"), format!("{old_digest}\n")).unwrap();
+    fs::write(transaction.join("new-digest"), format!("{new_digest}\n")).unwrap();
 
     let migrated = stage_macos_install_digest(&installer, &root, &candidate, &new_digest);
     assert!(
@@ -2717,6 +2726,7 @@ fn macos_active_legacy_enrollment_migrates_log_identity_before_upgrade() {
     assert!(migrated_enrollment.contains(r#""log_group":"bloom-log-501""#));
     assert!(migrated_enrollment.contains(r#""log_gid":260504"#));
     assert!(migrated_enrollment.contains(&new_digest));
+    assert!(!transaction.exists());
 }
 
 #[test]

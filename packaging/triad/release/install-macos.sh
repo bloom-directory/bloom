@@ -145,7 +145,7 @@ adopt_existing_log_group() {
     "$(dscl . -read "/Groups/$log_group" GroupMembers 2>/dev/null)" == "GroupMembers: $user_uuid" && \
     "$(dscl . -read "/Groups/$log_group" GroupMembership 2>/dev/null)" == "GroupMembership: $login_user" ]] ||
     die "pre-existing log group does not match the Bloom enrollment"
-  ! dscl . -read "/Groups/$log_group" NestedGroups >/dev/null 2>&1 ||
+  [[ -z "$(dscl . -read "/Groups/$log_group" NestedGroups 2>/dev/null)" ]] ||
     die "pre-existing log group has nested members"
   dscl . -list /Groups PrimaryGroupID | awk -v gid="$gid" '$NF==gid{n++} END{exit n==1?0:1}' ||
     die "pre-existing log group GID is not unique"
@@ -610,7 +610,7 @@ activate_installed_set() {
 }
 
 rollback_upgrade() {
-  local old
+  local old recovered_state=activating
   [[ -d "$upgrade_transaction" && ! -L "$upgrade_transaction" ]] || return 65
   grep -Fx bloom.macos-upgrade-transaction.2 "$upgrade_transaction/schema" >/dev/null || return 65
   old="$(<"$upgrade_transaction/old-digest")"; [[ "$old" =~ ^[0-9a-f]{64}$ ]] || return 65
@@ -618,15 +618,18 @@ rollback_upgrade() {
   switch_release "$old"
   rewrite_all_enrollments "$old" activating
   activate_installed_set "$old"
-  rewrite_all_enrollments "$old" active
+  $live && recovered_state=active
+  rewrite_all_enrollments "$old" "$recovered_state"
   rm -rf -- "$upgrade_transaction"; upgrade_transaction=""
 }
 
 recover_interrupted_upgrade() {
+  local candidate_digest="$BLOOM_RELEASE_DIGEST"
   upgrade_transaction="$product/upgrade-transaction"
   [[ -e "$upgrade_transaction" ]] || { upgrade_transaction=""; return 0; }
   echo "recovering interrupted Bloom macOS activation" >&2
   rollback_upgrade || die "interrupted Bloom activation could not be rolled back safely"
+  BLOOM_RELEASE_DIGEST="$candidate_digest"
 }
 
 upgrade_release() {
