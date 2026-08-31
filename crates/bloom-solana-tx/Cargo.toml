@@ -30,5 +30,6 @@ wincode = "0.6"
 
 [dev-dependencies]
 async-trait.workspace = true
+bloom-proto = { workspace = true, features = ["audit-test-seam"] }
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

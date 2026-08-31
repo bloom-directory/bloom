@@ -72,25 +72,29 @@ async fn spawn_write_stub(genesis: String, send_status: u16, send_calls: Arc<Ato
                     .nth(1)
                     .unwrap_or_default()
                     .to_string();
-                let method = serde_json::from_str::<serde_json::Value>(&body)
-                    .ok()
-                    .and_then(|value| {
-                        value
-                            .get("method")
-                            .and_then(|method| method.as_str())
-                            .map(str::to_owned)
-                    })
+                let request = serde_json::from_str::<serde_json::Value>(&body).unwrap_or_default();
+                let method = request
+                    .get("method")
+                    .and_then(|method| method.as_str())
+                    .map(str::to_owned)
                     .unwrap_or_default();
                 if method == "sendTransaction" {
                     send_calls.fetch_add(1, Ordering::SeqCst);
                 }
+                let send_config_matches_blockhash =
+                    request.get("params").and_then(|params| params.get(1))
+                        == Some(&serde_json::json!({
+                            "encoding": "base64",
+                            "preflightCommitment": "processed"
+                        }));
                 let payload = match method.as_str() {
                     "getGenesisHash" => {
                         format!(r#"{{"jsonrpc":"2.0","id":1,"result":"{genesis}"}}"#)
                     }
-                    "sendTransaction" if send_status == 200 => {
+                    "sendTransaction" if send_status == 200 && send_config_matches_blockhash => {
                         r#"{"jsonrpc":"2.0","id":1,"result":"signature"}"#.to_string()
                     }
+                    "sendTransaction" if send_status == 200 => r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"preflight commitment mismatch"}}"#.to_string(),
                     _ => String::new(),
                 };
                 let response = if send_status != 200 && method == "sendTransaction" {
@@ -107,6 +111,41 @@ async fn spawn_write_stub(genesis: String, send_status: u16, send_calls: Arc<Ato
                 let _ = socket.write_all(response.as_bytes()).await;
             });
         }
+    });
+    format!("http://{addr}/")
+}
+
+/// Accepts a fee quote only when it uses the same `processed` commitment as
+/// the blockhash fetch. A newly produced blockhash need not be visible at the
+/// RPC default commitment yet, in which case Agave returns a null fee.
+async fn spawn_fee_stub() -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut buf = vec![0u8; 8192];
+        let n = socket.read(&mut buf).await.unwrap_or(0);
+        let request = String::from_utf8_lossy(&buf[..n]);
+        let value = request
+            .split("\r\n\r\n")
+            .nth(1)
+            .and_then(|body| serde_json::from_str::<serde_json::Value>(body).ok())
+            .unwrap_or_default();
+        let expected = serde_json::json!(["serialized-message", { "commitment": "processed" }]);
+        let body = if value.get("method").and_then(|v| v.as_str()) == Some("getFeeForMessage")
+            && value.get("params") == Some(&expected)
+        {
+            r#"{"jsonrpc":"2.0","id":1,"result":{"context":{"slot":1},"value":5000}}"#
+        } else {
+            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"commitment mismatch"}}"#
+        };
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let _ = socket.write_all(response.as_bytes()).await;
     });
     format!("http://{addr}/")
 }
@@ -135,6 +174,20 @@ async fn typed_read_methods_roundtrip() {
     assert_eq!(client.get_genesis_hash().await.unwrap(), "G".repeat(32));
     assert_eq!(client.get_slot().await.unwrap(), 12345);
     assert_eq!(client.get_balance("irrelevant").await.unwrap(), 999);
+}
+
+#[tokio::test]
+async fn fee_quote_matches_the_blockhash_commitment() {
+    let endpoint = spawn_fee_stub().await;
+    let client = SolanaClient::build(&spec(&endpoint)).unwrap();
+
+    assert_eq!(
+        client
+            .get_fee_for_message("serialized-message")
+            .await
+            .unwrap(),
+        Some(5_000)
+    );
 }
 
 #[tokio::test]
