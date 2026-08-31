@@ -47,7 +47,7 @@ seam.
 
 | Tool | Use |
 |---|---|
-| Rust 1.85 or newer | Workspace builds and tests |
+| Rust 1.86 or newer | Workspace builds and tests |
 | Foundry (`anvil`, `cast`, `forge`) | Local EVM integration tests |
 | `jq` | Developer harnesses and shell tests |
 | Agave `solana-test-validator` v3.0.0 | Optional validator-backed Solana tests |
@@ -357,10 +357,12 @@ SOLANA_VALIDATOR_HTTP=http://127.0.0.1:8899 \
   cargo test -p bloom-solana-tx --test local_validator -- \
   --ignored --nocapture
 
-SOLANA_VALIDATOR_HTTP=http://127.0.0.1:8899 \
-  cargo test -p bloom-it --test solana_multi_account -- \
+cargo test -p bloom-it --test solana_multi_account -- \
   --ignored --nocapture
 ```
+
+`local_validator` reads `SOLANA_VALIDATOR_HTTP`; `solana_multi_account`
+intentionally targets the validator at `http://127.0.0.1:8899` directly.
 
 Mainnet uses the same transaction path and remains fail closed. Do not add a
 second mainnet signer, bypass ceremony approval, weaken genesis checks, or move

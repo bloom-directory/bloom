@@ -58,10 +58,12 @@ The validator-backed tests require the pinned Agave v3.0.0 validator from
 SOLANA_VALIDATOR_HTTP=http://127.0.0.1:8899 \
   cargo test -p bloom-solana-tx --test local_validator -- \
   --ignored --nocapture
-SOLANA_VALIDATOR_HTTP=http://127.0.0.1:8899 \
-  cargo test -p bloom-it --test solana_multi_account -- \
+cargo test -p bloom-it --test solana_multi_account -- \
   --ignored --nocapture
 ```
+
+`local_validator` reads `SOLANA_VALIDATOR_HTTP`; `solana_multi_account`
+intentionally targets `http://127.0.0.1:8899` directly.
 
 ## Categories
 
