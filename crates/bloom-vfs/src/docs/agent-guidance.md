@@ -59,10 +59,11 @@ Do not choose the first account in this list. A value-moving path with multiple
 compatible children must name the exact account or fail as ambiguous.
 
 Mnemonic import is an owner custody ceremony, not a mounted agent write. V1
-accepts the standard mnemonic with the empty BIP-39 passphrase only; a
-non-empty passphrase is unsupported. BIP-39 import creates the canonical EVM
-account. Additional account allocation exposed by Machine is currently limited
-to Solana children until EVM transaction surfaces carry an explicit selector.
+accepts the standard mnemonic and exposes no passphrase input;
+passphrase-protected mnemonics are unsupported. BIP-39 import creates the
+canonical EVM account. Additional account allocation exposed by Machine is
+currently limited to Solana children until EVM transaction surfaces carry an
+explicit selector.
 
 ## Creating a wallet (asynchronous passkey registration)
 
