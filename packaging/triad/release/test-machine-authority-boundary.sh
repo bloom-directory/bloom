@@ -194,6 +194,17 @@ fi
 grep -F 'failed to scan current Machine entry documentation:' \
   "$work/undecodable-entry-doc.out" >/dev/null
 
+printf '%s\n' 'bloom wallet import --passphrase-file /tmp/secret' \
+  >"$work/legacy-wallet-secret.sh"
+if BLOOM_MACHINE_WALLET_SECRET_EXTRA_PATHS="$work/legacy-wallet-secret.sh" \
+  "$checker" --require-clean >"$work/legacy-wallet-secret.out" 2>&1
+then
+  echo "synthetic legacy wallet-secret input unexpectedly passed" >&2
+  exit 1
+fi
+grep -F 'forbidden legacy wallet-secret input in ' \
+  "$work/legacy-wallet-secret.out" >/dev/null
+
 real_cargo="$(command -v cargo)"
 mkdir "$work/failing-cargo-bin"
 printf '0\n' >"$work/cargo-tree-count"

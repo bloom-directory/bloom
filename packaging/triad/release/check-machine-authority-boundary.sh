@@ -493,6 +493,58 @@ require_clean_current_entry_docs() {
   (( failed == 0 ))
 }
 
+require_no_legacy_wallet_secret_inputs() {
+  local failed=0 marker path count matches
+  local secret_word="pass""phrase"
+  local secret_word_upper="PASS""PHRASE"
+  local -a markers=(
+    "$secret_word"
+    "BLOOM_${secret_word_upper}"
+    "BLOOM_TEST_WALLET_${secret_word_upper}"
+    "--allow-${secret_word}-wallet"
+    "--${secret_word}-file"
+    "--${secret_word}"
+  )
+  local -a paths=(
+    "$workspace/scripts/play.sh"
+    "$workspace/scripts/acceptance.sh"
+    "$workspace/tests/docker/lib.sh"
+    "$workspace/tests/docker/test_fork_mount.sh"
+    "$workspace/tests/docker/test_mempool_mock.sh"
+    "$workspace/tests/docker/docker-compose.yml"
+  )
+  if [[ -n "${BLOOM_MACHINE_WALLET_SECRET_EXTRA_PATHS:-}" ]]; then
+    local -a extra_paths
+    IFS=':' read -r -a extra_paths <<<"$BLOOM_MACHINE_WALLET_SECRET_EXTRA_PATHS"
+    paths+=("${extra_paths[@]}")
+  fi
+  for marker in "${markers[@]}"; do
+    if ! matches="$(
+      run_scanner files --marker="$marker" --suffix .rs --suffix .html \
+        "$workspace/crates/bloom/src" "$workspace/crates/bloom-daemon/src"
+    )"; then
+      echo "failed to scan production sources for legacy wallet-secret input" >&2
+      failed=1
+    elif [[ -n "$matches" ]]; then
+      while IFS= read -r path; do
+        [[ -z "$path" ]] || echo "forbidden legacy wallet-secret input in ${path#"$workspace/"}" >&2
+      done <<<"$matches"
+      failed=1
+    fi
+    for path in "${paths[@]}"; do
+      [[ -f "$path" ]] || continue
+      if ! count="$(run_scanner count --marker="$marker" "$path")"; then
+        echo "failed to scan legacy wallet-secret inputs in ${path#"$workspace/"}" >&2
+        failed=1
+      elif (( count > 0 )); then
+        echo "forbidden legacy wallet-secret input in ${path#"$workspace/"}" >&2
+        failed=1
+      fi
+    done
+  done
+  (( failed == 0 ))
+}
+
 case "$mode" in
   --inventory)
     echo "schema: bloom.machine-authority-inventory.v1"
@@ -504,6 +556,7 @@ case "$mode" in
     require_clean_dependencies || failed=1
     require_clean_sources || failed=1
     require_clean_current_entry_docs || failed=1
+    require_no_legacy_wallet_secret_inputs || failed=1
     (( failed == 0 )) || exit 1
     echo "Machine production authority boundary is clean"
     ;;

@@ -2019,6 +2019,7 @@ dependencies = [
  "bitcoin_hashes",
  "serde",
  "unicode-normalization",
+ "zeroize",
 ]
 
 [[package]]
@@ -2197,7 +2198,7 @@ dependencies = [
 [[package]]
 name = "bloom-broker-api"
 version = "0.1.0"
-source = "git+https://github.com/bloom-directory/bloom-broker.git?rev=e1ba78ce8390f811adf2323474530f6c1183d675#e1ba78ce8390f811adf2323474530f6c1183d675"
+source = "git+https://github.com/bloom-directory/bloom-broker.git?rev=0241a8573e44c89053d9b2bc3aea4dc881dc654b#0241a8573e44c89053d9b2bc3aea4dc881dc654b"
 dependencies = [
  "bloom-rpc-wire",
  "serde",
@@ -2613,7 +2614,7 @@ dependencies = [
 [[package]]
 name = "bloom-signer-derive"
 version = "0.1.0"
-source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=191fa3fa4177c6004db9a0977733e5bd3765b43c#191fa3fa4177c6004db9a0977733e5bd3765b43c"
+source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=1c7cd97ec338d51fa0c7c483f9a5ba32df1e741b#1c7cd97ec338d51fa0c7c483f9a5ba32df1e741b"
 dependencies = [
  "bip39",
  "ed25519-dalek",
