@@ -1726,6 +1726,30 @@ impl WalletsHandler {
         Ok(newest_pending_target(pending))
     }
 
+    fn latest_solana_pending_target(
+        engine: &bloom_solana_tx::engine::SolanaTransferEngine,
+        wallet: &str,
+        chain: &str,
+    ) -> Result<Option<String>, HandlerError> {
+        let state = bloom_solana_tx::outbox::SolanaOutboxState::Pending;
+        let ids = engine
+            .outbox()
+            .list(wallet, chain, state)
+            .map_err(solana_outbox_err)?;
+        let mut pending = ids
+            .into_iter()
+            .filter_map(|id| {
+                engine
+                    .outbox()
+                    .read_in_state(wallet, chain, &id, state)
+                    .ok()
+                    .map(|entry| (entry.staged.created_ms, id))
+            })
+            .collect::<Vec<_>>();
+        pending.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+        Ok(pending.first().map(|(_, id)| format!("pending/{id}")))
+    }
+
     fn outbox_dir_entries(&self, wallet: &str, chain: &str) -> Result<Vec<Entry>, HandlerError> {
         let mut entries = vec![
             Entry::writable_file("new.tx"),
@@ -2703,6 +2727,11 @@ impl WalletsHandler {
             [] => Ok(Entry::dir(chain)),
             [s] if s == "outbox" => Ok(Entry::dir("outbox")),
             [s, fname] if s == "outbox" && fname == "new.tx" => Ok(Entry::writable_file("new.tx")),
+            [s, fname] if s == "outbox" && fname == "latest" => {
+                let target = Self::latest_solana_pending_target(engine, wallet, chain)?
+                    .ok_or_else(|| HandlerError::not_found("outbox/latest"))?;
+                Ok(Entry::symlink("latest", &target))
+            }
             [s, state] if s == "outbox" && solana_state(state).is_some() => Ok(Entry::dir(state)),
             [s, state, id] if s == "outbox" && solana_state(state).is_some() => {
                 let entry = engine
@@ -3054,12 +3083,18 @@ impl WalletsHandler {
     ) -> Result<Vec<Entry>, HandlerError> {
         match rest {
             [] => Ok(vec![Entry::dir("outbox")]),
-            [s] if s == "outbox" => Ok(vec![
-                Entry::writable_file("new.tx"),
-                Entry::dir("pending"),
-                Entry::dir("sent"),
-                Entry::dir("failed"),
-            ]),
+            [s] if s == "outbox" => {
+                let mut entries = vec![
+                    Entry::writable_file("new.tx"),
+                    Entry::dir("pending"),
+                    Entry::dir("sent"),
+                    Entry::dir("failed"),
+                ];
+                if let Some(target) = Self::latest_solana_pending_target(engine, wallet, chain)? {
+                    entries.push(Entry::symlink("latest", &target));
+                }
+                Ok(entries)
+            }
             [s, state] if s == "outbox" => {
                 let st = solana_state(state)
                     .ok_or_else(|| HandlerError::not_found(format!("outbox state '{state}'")))?;
@@ -4556,6 +4591,22 @@ mod tests {
             .await
             .unwrap();
         assert!(outbox_entries.iter().any(|entry| entry.name == "new.tx"));
+        assert_eq!(
+            outbox_entries
+                .iter()
+                .find(|entry| entry.name == "latest")
+                .and_then(|entry| entry.link_target.as_deref()),
+            Some("pending/0001-00001")
+        );
+        assert_eq!(
+            handler
+                .lookup(&VfsPath::parse("/alice/chains/solana-devnet/outbox/latest").unwrap())
+                .await
+                .unwrap()
+                .link_target
+                .as_deref(),
+            Some("pending/0001-00001")
+        );
 
         // The Solana chain's outbox routes through the Solana engine, not the
         // EVM one: the intent is Solana-typed and read from the Solana outbox.
