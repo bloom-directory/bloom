@@ -1,8 +1,9 @@
 # Solana Native Integration
 
 **Status:** implemented for local, devnet, and explicitly enabled mainnet use
-on the unmerged BIP-39/Solana stack. Automated validation and the real ceremony
-HTTP shell/cancellation path pass; manual passkey completion remains pending.
+on the unmerged BIP-39/Solana stack. Automated validation and genuine WebAuthn
+verification with a virtual authenticator pass; a physical-authenticator
+rehearsal remains a release gate.
 **Audience:** Bloom engineers, Petal authors, and implementation agents
 
 ## The decision
@@ -41,8 +42,10 @@ chain Bloom talks to directly.
   exactly: `<home>/.solana-outbox/<wallet>/<chain>/{pending,sent,failed}/<id>/...`,
   a public `intent.json` atomically updated on state transitions, and a
   `receipt.json` sibling once finalized. Pre-broadcast signatures and approval
-  resume state are private host sidecars and are not projected through VFS.
-  EVM's own
+  proofs remain private host sidecars. While owner action is required, a
+  sanitized `approval_challenge.json` exposes only the reviewed transfer facts,
+  approval id, expiry, ceremony URL, and exact retry path through the VFS; it is
+  removed before broadcast and on every terminal transition. EVM's own
   crates are `alloy`-typed throughout with no chain-agnostic trait to
   implement against, so this is a parallel crate family, not a shared
   abstraction over EVM's — see `crates/bloom-solana-tx/src/outbox.rs` vs

@@ -1,6 +1,8 @@
 //! Outbox lifecycle and reconciliation tests driven by fixtures (no network).
 
-use bloom_solana_tx::outbox::{OutboxError, SolanaOutbox, SolanaOutboxState};
+use bloom_solana_tx::outbox::{
+    APPROVAL_CHALLENGE_FILE, OutboxError, SolanaOutbox, SolanaOutboxState,
+};
 use bloom_solana_tx::types::{SolanaTxStatus, StagedSolanaTransfer};
 use tempfile::TempDir;
 
@@ -83,6 +85,38 @@ fn transition_moves_entry_atomically() {
             )
             .is_ok()
     );
+}
+
+#[test]
+fn approval_challenge_is_pending_only_and_cleared_on_terminal_transition() {
+    let (_dir, outbox) = outbox();
+    outbox
+        .write_pending(&staged("approval-challenge"), "plan")
+        .unwrap();
+    let entry = outbox
+        .read("alice", "solana-devnet", "approval-challenge")
+        .unwrap();
+
+    outbox
+        .write_approval_challenge(&entry, br#"{"ceremony_url":"http://localhost/owner"}"#)
+        .unwrap();
+    assert!(entry.dir.join(APPROVAL_CHALLENGE_FILE).exists());
+
+    let sent_dir = outbox.transition(&entry, SolanaOutboxState::Sent).unwrap();
+    assert!(!sent_dir.join(APPROVAL_CHALLENGE_FILE).exists());
+
+    let sent = outbox
+        .read_in_state(
+            "alice",
+            "solana-devnet",
+            "approval-challenge",
+            SolanaOutboxState::Sent,
+        )
+        .unwrap();
+    let error = outbox
+        .write_approval_challenge(&sent, b"stale challenge")
+        .unwrap_err();
+    assert!(matches!(error, OutboxError::StateMismatch { .. }));
 }
 
 #[test]
