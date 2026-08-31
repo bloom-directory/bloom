@@ -49,6 +49,101 @@ Release bundles must be built through the triad packaging scripts so resolved
 dependency, feature, marker, identity, socket, and runtime boundary checks run
 against the packaged artifacts.
 
+## Efficient triad development
+
+Treat the triad as one dependency chain, not as three repositories that can be
+advanced independently:
+
+```text
+Signer -> Broker -> Machine
+```
+
+Signer owns secret material, derivation, and signatures. Broker owns ceremony,
+policy, approval, and authorization. Machine owns public projections, staging,
+simulation, the CLI, and the VFS. Put a fix in the repository that owns the
+invariant; downstream repositories should normally receive only an exact
+revision pin and the integration coverage for their side of the seam.
+
+### Work from one candidate
+
+Keep the three repositories side by side. Before cross-repository testing,
+record their full commits and check that the worktrees are clean:
+
+```sh
+git -C ../bloom-signer status --short
+git -C ../bloom-broker status --short
+git status --short
+
+git -C ../bloom-signer rev-parse HEAD
+git -C ../bloom-broker rev-parse HEAD
+git rev-parse HEAD
+```
+
+Advance them from left to right. Finish and test the Signer change, push it,
+then update Broker's exact Signer revision once. Finish and test Broker, push
+it, then update Machine's exact Broker revision once. Regenerate each lockfile
+with the repository's declared toolchain and commit the manifest and lockfile
+together. Do not repeatedly repin downstream repositories while the upstream
+commit is still changing.
+
+Infrastructure or security work based on an upstream repository's `master`
+must be replayed onto the active feature branch before downstream pins move.
+Do not merge an independent `master`-based branch into Broker or Machine, and
+do not create a second implementation of the same fix downstream.
+
+### Use the shortest honest test ladder
+
+Run tests in increasing cost order and stop at the first failure:
+
+1. During editing, run the affected package or named test in the owning
+   repository.
+2. Before pushing an owning-repository commit, run its workspace formatting,
+   clippy, and test gates.
+3. After changing a cross-repository pin, run the downstream protocol and seam
+   tests before its full workspace.
+4. Run the out-of-process triad only after all three individual workspaces are
+   green at the recorded commits.
+5. Run release packaging and installed acceptance once, on the frozen
+   candidate, rather than after every intermediate commit.
+
+Do not start overlapping Cargo commands that share a target directory; they
+serialize on Cargo's target lock and often make a fast test look hung. Separate
+repositories can build concurrently because they have separate target
+directories. If two worktrees of the same repository must build concurrently,
+give each an explicit, distinct `CARGO_TARGET_DIR`.
+
+### Launch the binaries you actually tested
+
+The launcher discovers `../bloom-broker` and `../bloom-signer` by default. If
+the candidate lives in other worktrees, build those worktrees first and pass
+their binaries explicitly; otherwise a successful integration run may have
+used stale sibling binaries:
+
+```sh
+cargo build -p bloom --no-default-features --features mount,triad-dev-harness
+cargo build --manifest-path ../BROKER_WORKTREE/Cargo.toml \
+  -p bloom-broker --features triad-dev-harness
+cargo build --manifest-path ../SIGNER_WORKTREE/Cargo.toml \
+  -p bloom-signer --features triad-dev-harness
+
+BLOOM_INTEGRATION_MACHINE_BIN="$PWD/target/debug/bloom" \
+BLOOM_INTEGRATION_BROKER_BIN="$PWD/../BROKER_WORKTREE/target/debug/bloom-broker" \
+BLOOM_INTEGRATION_SIGNER_BIN="$PWD/../SIGNER_WORKTREE/target/debug/bloom-signer" \
+scripts/triad-dev-launch.sh \
+  --developer-root ~/.bloom/triad-dev \
+  --machine-home ~/.bloom/triad-dev/machine-home \
+  --mount /tmp/bloom-triad-mount \
+  --machine-socket /tmp/bloom-triad-machine.sock \
+  --log-dir /tmp/bloom-triad-logs \
+  --ready-file /tmp/bloom-triad-ready
+```
+
+Replace `BROKER_WORKTREE` and `SIGNER_WORKTREE` with the actual sibling
+directory names. Keep one small evidence note for the candidate containing the
+three commits, commands run, and pass/fail results. A source change invalidates
+that repository's evidence and the evidence of every repository to its right;
+it does not invalidate already-passing upstream tests.
+
 ## Running locally
 
 ### Read, stage, and simulate

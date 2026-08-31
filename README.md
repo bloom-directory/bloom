@@ -14,6 +14,8 @@
 <p align="center">
   <a href="./QUICKSTART.md"><strong>Quickstart</strong></a>
   ·
+  <a href="./DEVELOPMENT.md"><strong>Development</strong></a>
+  ·
   <a href="./docs/AGENTIC_WALLET.md"><strong>Wallet guide</strong></a>
   ·
   <a href="https://bloom.directory/SKILL.md"><strong>Agent setup skill</strong></a>
