@@ -353,7 +353,7 @@ fn client(endpoint: &str) -> SolanaClient {
             max_rps: None,
             http_only: false,
         }],
-        expected_genesis_hex: Some("test-genesis".into()),
+        expected_genesis_base58: Some("test-genesis".into()),
         allow_broadcast: true,
     })
     .unwrap()
@@ -1074,7 +1074,7 @@ async fn broadcast_refuses_when_operator_disables_it() {
             max_rps: None,
             http_only: false,
         }],
-        expected_genesis_hex: None,
+        expected_genesis_base58: None,
         allow_broadcast: false,
     };
     spec.allow_broadcast = false;

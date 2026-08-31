@@ -104,7 +104,7 @@ pub struct SolanaClient {
 
 struct Inner {
     rpc: Arc<SolanaRpcClient>,
-    expected_genesis_hex: Option<String>,
+    expected_genesis_base58: Option<String>,
     allow_broadcast: bool,
 }
 
@@ -113,7 +113,7 @@ impl SolanaClient {
     pub fn build(spec: &SolanaSpec) -> Result<Self, SolanaRpcError> {
         if spec.allow_broadcast
             && spec
-                .expected_genesis_hex
+                .expected_genesis_base58
                 .as_deref()
                 .is_none_or(str::is_empty)
         {
@@ -126,7 +126,7 @@ impl SolanaClient {
         Ok(Self {
             inner: Arc::new(Inner {
                 rpc,
-                expected_genesis_hex: spec.expected_genesis_hex.clone(),
+                expected_genesis_base58: spec.expected_genesis_base58.clone(),
                 allow_broadcast: spec.allow_broadcast,
             }),
         })
@@ -152,7 +152,7 @@ impl SolanaClient {
     /// live check on every call; callers use it at stage and broadcast so an
     /// endpoint or DNS change cannot silently cross clusters.
     pub async fn verify_genesis(&self) -> Result<String, SolanaRpcError> {
-        match &self.inner.expected_genesis_hex {
+        match &self.inner.expected_genesis_base58 {
             Some(expected) => self.inner.rpc.verify_all_genesis(expected).await,
             None => self.get_genesis_hash().await,
         }
@@ -182,7 +182,10 @@ impl SolanaClient {
 
     /// Current block height (processed blocks, not necessarily finalized).
     pub async fn get_block_height(&self) -> Result<u64, SolanaRpcError> {
-        self.inner.rpc.call("getBlockHeight", &json!([])).await
+        self.inner
+            .rpc
+            .call("getBlockHeight", &json!([{ "commitment": "processed" }]))
+            .await
     }
 
     /// Native SOL balance in lamports for a base58 account address.
@@ -199,7 +202,10 @@ impl SolanaClient {
         let result: Value = self
             .inner
             .rpc
-            .call("getLatestBlockhash", &json!([]))
+            .call(
+                "getLatestBlockhash",
+                &json!([{ "commitment": "processed" }]),
+            )
             .await?;
         let value = result
             .get("value")
@@ -271,12 +277,16 @@ impl SolanaClient {
                 self.chain_name()
             )));
         }
-        let expected = self.inner.expected_genesis_hex.as_deref().ok_or_else(|| {
-            SolanaRpcError::Invalid(format!(
-                "chain '{}' cannot broadcast without an expected genesis hash",
-                self.chain_name()
-            ))
-        })?;
+        let expected = self
+            .inner
+            .expected_genesis_base58
+            .as_deref()
+            .ok_or_else(|| {
+                SolanaRpcError::Invalid(format!(
+                    "chain '{}' cannot broadcast without an expected genesis hash",
+                    self.chain_name()
+                ))
+            })?;
         self.inner
             .rpc
             .call_raw_after_genesis_check(

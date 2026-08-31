@@ -2962,14 +2962,6 @@ impl Daemon {
         provenance_catalog: Option<bloom_broker_api::ProvenanceCatalog>,
     ) -> Result<Self, DaemonError> {
         home.ensure()?;
-        let migrated_solana = bloom_solana_tx::outbox::SolanaOutbox::migrate_legacy_root(
-            home.outbox_dir(),
-            home.solana_outbox_dir(),
-        )
-        .map_err(|e| DaemonError::Outbox(format!("Solana outbox migration: {e}")))?;
-        if migrated_solana > 0 {
-            info!(entries = migrated_solana, "daemon.solana_outbox_migrated");
-        }
 
         // Before anything can serve or scan these projections, retire the
         // ceremonies a previous run left advertised.
@@ -3762,6 +3754,7 @@ impl Daemon {
             let solana_reconciler = Arc::new(bloom_solana_tx::reconcile::SolanaReconciler::new(
                 solana_outbox,
                 solana_chain_registry.clone(),
+                audit_arc.clone(),
             ));
             bump_shutdown.push(solana_reconciler.spawn());
             debug!("daemon.solana_reconciler_spawned");
@@ -6246,7 +6239,7 @@ native_decimals = 18
 [solana_chains.solana-devnet]
 name = "solana-devnet"
 allow_broadcast = true
-expected_genesis_hex = "{genesis_hash}"
+expected_genesis_base58 = "{genesis_hash}"
 [[solana_chains.solana-devnet.endpoints]]
 url = "{rpc_endpoint}"
 weight = 100
