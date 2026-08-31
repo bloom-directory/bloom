@@ -413,8 +413,19 @@ struct MountRenderEntry {
 
 #[derive(Clone)]
 enum MountRenderResult {
-    Bytes(Bytes),
+    Bytes(RenderedFile),
     Error(FsError),
+}
+
+/// One coherent file snapshot exported through GETATTR and the following READ.
+///
+/// The handle's `Entry` is intentionally only a lookup-time identity snapshot.
+/// Mutable projections can replace their bytes and metadata while that handle
+/// remains open, so cache the fresh metadata alongside the rendered bytes.
+#[derive(Clone)]
+struct RenderedFile {
+    entry: Entry,
+    bytes: Bytes,
 }
 
 impl MountRenderCache {
@@ -438,9 +449,9 @@ impl MountRenderCache {
         }
     }
 
-    fn put(&self, path: &VfsPath, bytes: Bytes, ttl: Duration) {
+    fn put(&self, path: &VfsPath, rendered: RenderedFile, ttl: Duration) {
         let entry = MountRenderEntry {
-            result: MountRenderResult::Bytes(bytes),
+            result: MountRenderResult::Bytes(rendered),
             expires_at: Instant::now() + ttl,
         };
         self.inner.lock().put(path.clone(), entry);
@@ -469,7 +480,7 @@ impl MountRenderCache {
 ///
 /// `FsError` is cloneable, so native and Petal `HandlerError` values can be
 /// mapped through Bloom's existing NFS semantics before the future is shared.
-type RenderFuture = Shared<BoxFuture<'static, Result<Bytes, FsError>>>;
+type RenderFuture = Shared<BoxFuture<'static, Result<RenderedFile, FsError>>>;
 
 /// One stable, ordered directory view used by GETATTR and every READDIR page.
 struct DirectorySnapshot {
@@ -947,7 +958,7 @@ impl BloomFs {
     /// Render `path` with in-flight dedup and a hard timeout. Reuses
     /// an existing render future for the same path if one is already
     /// running.
-    async fn render_with_dedup(&self, path: &VfsPath) -> Result<Bytes, FsError> {
+    async fn render_with_dedup(&self, path: &VfsPath) -> Result<RenderedFile, FsError> {
         let fut: RenderFuture = {
             let mut map = self.in_flight.lock();
             if let Some(existing) = map.get(path) {
@@ -958,11 +969,24 @@ impl BloomFs {
                 let in_flight = self.in_flight.clone();
                 let path_for_cleanup = path.clone();
                 let render = async move {
-                    let result = tokio::time::timeout(RENDER_TIMEOUT, vfs.read(&path_owned)).await;
-                    let bytes = match result {
-                        Ok(Ok(b)) => Ok(Bytes::from(b)),
-                        Ok(Err(e)) => Err(map_err(e)),
-                        Err(_) => Err(FsError::Io),
+                    // Refresh metadata inside the same coalesced operation as
+                    // the render. NFS handles outlive lookup-time metadata;
+                    // mutable projections must not pair new bytes with the
+                    // stale mtime retained by the handle.
+                    let rendered = match vfs.lookup(&path_owned).await {
+                        Ok(entry) => {
+                            let result =
+                                tokio::time::timeout(RENDER_TIMEOUT, vfs.read(&path_owned)).await;
+                            match result {
+                                Ok(Ok(b)) => Ok(RenderedFile {
+                                    entry,
+                                    bytes: Bytes::from(b),
+                                }),
+                                Ok(Err(e)) => Err(map_err(e)),
+                                Err(_) => Err(FsError::Io),
+                            }
+                        }
+                        Err(error) => Err(map_err(error)),
                     };
                     // Remove ourselves from the in-flight map so the
                     // next request after this resolves can start a
@@ -970,7 +994,7 @@ impl BloomFs {
                     // been replaced if a different generation is
                     // running — only remove if it's still ours.
                     in_flight.lock().remove(&path_for_cleanup);
-                    bytes
+                    rendered
                 }
                 .boxed()
                 .shared();
@@ -979,7 +1003,7 @@ impl BloomFs {
             }
         };
         match fut.await {
-            Ok(b) => Ok(b),
+            Ok(rendered) => Ok(rendered),
             Err(error) => {
                 debug!(path = %path.to_string_path(), ?error, "mount.adapter.render_failed");
                 Err(error)
@@ -1021,15 +1045,20 @@ impl FileSystem for BloomFs {
                 // with `size = 0` and never trigger a render here —
                 // critical to avoid a `stat` triggering a sign or
                 // broadcast.
+                let mut attrs_entry = e.clone();
                 let size = if self.should_render_for_attrs(path, e) {
                     match self.render_cache.get(path) {
-                        Some(MountRenderResult::Bytes(bytes)) => bytes.len() as u64,
+                        Some(MountRenderResult::Bytes(rendered)) => {
+                            attrs_entry = rendered.entry;
+                            rendered.bytes.len() as u64
+                        }
                         Some(MountRenderResult::Error(FsError::IsDirectory)) => e.size,
                         Some(MountRenderResult::Error(error)) => return Err(error),
                         None => match self.render_with_dedup(path).await {
-                            Ok(bytes) => {
-                                let len = bytes.len() as u64;
-                                self.render_cache.put(path, bytes, RENDER_CACHE_TTL);
+                            Ok(rendered) => {
+                                let len = rendered.bytes.len() as u64;
+                                attrs_entry = rendered.entry.clone();
+                                self.render_cache.put(path, rendered, RENDER_CACHE_TTL);
                                 len
                             }
                             Err(FsError::IsDirectory) => {
@@ -1066,8 +1095,8 @@ impl FileSystem for BloomFs {
                     0
                 };
 
-                let mut attrs = entry_to_attrs(path, e, size);
-                if e.kind == EntryKind::Dir {
+                let mut attrs = entry_to_attrs(path, &attrs_entry, size);
+                if attrs_entry.kind == EntryKind::Dir {
                     attrs.change = self.dir_change(path).await?;
                 }
                 Ok(attrs)
@@ -1207,7 +1236,7 @@ impl FileSystem for BloomFs {
                 // re-issues GETATTR and gets a real size.
                 let size = if e.kind == EntryKind::File {
                     match self.render_cache.get(&child_path) {
-                        Some(MountRenderResult::Bytes(b)) => b.len() as u64,
+                        Some(MountRenderResult::Bytes(rendered)) => rendered.bytes.len() as u64,
                         Some(MountRenderResult::Error(_)) | None => e.size,
                     }
                 } else {
@@ -1262,7 +1291,7 @@ impl FileSystem for BloomFs {
         // is correct and tooling never sees NUL padding past EOF.
         let data: Bytes = if let Some(cached) = self.render_cache.get(&path) {
             match cached {
-                MountRenderResult::Bytes(b) => b,
+                MountRenderResult::Bytes(rendered) => rendered.bytes,
                 MountRenderResult::Error(error) => return Err(error),
             }
         } else {
@@ -1706,6 +1735,77 @@ mod tests {
         async fn list(&self, p: &VfsPath) -> Result<Vec<Entry>, HandlerError> {
             if p.is_root() {
                 Ok(vec![Entry::writable_file("challenge")])
+            } else {
+                Err(HandlerError::NotADir(p.to_string_path()))
+            }
+        }
+    }
+
+    struct MutableFileState {
+        bytes: Vec<u8>,
+        modified: SystemTime,
+    }
+
+    struct MutableFileHandler {
+        state: parking_lot::Mutex<MutableFileState>,
+        file_lookups: std::sync::atomic::AtomicU32,
+    }
+
+    impl MutableFileHandler {
+        fn new(bytes: &[u8], modified: SystemTime) -> Arc<Self> {
+            Arc::new(Self {
+                state: parking_lot::Mutex::new(MutableFileState {
+                    bytes: bytes.to_vec(),
+                    modified,
+                }),
+                file_lookups: std::sync::atomic::AtomicU32::new(0),
+            })
+        }
+
+        fn replace(&self, bytes: &[u8], modified: SystemTime) {
+            *self.state.lock() = MutableFileState {
+                bytes: bytes.to_vec(),
+                modified,
+            };
+        }
+
+        fn file_lookup_count(&self) -> u32 {
+            self.file_lookups.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl Handler for MutableFileHandler {
+        async fn lookup(&self, p: &VfsPath) -> Result<Entry, HandlerError> {
+            if p.is_root() {
+                return Ok(Entry::dir(""));
+            }
+            if p.first() != Some("request.json") {
+                return Err(HandlerError::NotFound(p.to_string_path()));
+            }
+            self.file_lookups.fetch_add(1, Ordering::SeqCst);
+            let state = self.state.lock();
+            Ok(Entry::file("request.json")
+                .with_size(state.bytes.len() as u64)
+                .with_modified(state.modified))
+        }
+
+        async fn read(&self, p: &VfsPath) -> Result<Vec<u8>, HandlerError> {
+            if p.first() == Some("request.json") {
+                Ok(self.state.lock().bytes.clone())
+            } else {
+                Err(HandlerError::NotAFile(p.to_string_path()))
+            }
+        }
+
+        async fn list(&self, p: &VfsPath) -> Result<Vec<Entry>, HandlerError> {
+            if p.is_root() {
+                let state = self.state.lock();
+                Ok(vec![
+                    Entry::file("request.json")
+                        .with_size(state.bytes.len() as u64)
+                        .with_modified(state.modified),
+                ])
             } else {
                 Err(HandlerError::NotADir(p.to_string_path()))
             }
@@ -2425,6 +2525,41 @@ mod tests {
         assert_eq!(attrs.mtime.seconds, 1_700_000_000);
         assert_eq!(attrs.ctime.seconds, 1_700_000_000);
         assert_eq!(attrs.atime.seconds, 1_700_000_000);
+    }
+
+    #[tokio::test]
+    async fn getattr_refreshes_mutable_file_metadata_once_per_render_snapshot() {
+        let first_modified = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let second_modified = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_002);
+        let handler = MutableFileHandler::new(br#"{"status":"first"}"#, first_modified);
+        let vfs = Vfs::builder().mount("box", handler.clone()).build();
+        let fs = BloomFs::new(vfs);
+        let ctx = fake_ctx();
+        let dir = fs.lookup(&ctx, &BloomHandle::Root, "box").await.unwrap();
+        let request = fs.lookup(&ctx, &dir, "request.json").await.unwrap();
+        assert_eq!(handler.file_lookup_count(), 1);
+
+        let replacement = br#"{"status":"awaiting_user","ceremony_url":"second"}"#;
+        handler.replace(replacement, second_modified);
+
+        let first_attrs = fs.getattr(&ctx, &request).await.unwrap();
+        assert_eq!(first_attrs.mtime.seconds, 1_700_000_002);
+        assert_eq!(first_attrs.size, replacement.len() as u64);
+        assert_eq!(handler.file_lookup_count(), 2);
+
+        let read = fs.read(&ctx, &request, 0, u32::MAX).await.unwrap();
+        assert_eq!(read.data.as_ref(), replacement);
+        assert!(read.eof);
+
+        let cached_attrs = fs.getattr(&ctx, &request).await.unwrap();
+        assert_eq!(cached_attrs.mtime, first_attrs.mtime);
+        assert_eq!(cached_attrs.size, first_attrs.size);
+        assert_ne!(cached_attrs.change, first_attrs.change);
+        assert_eq!(
+            handler.file_lookup_count(),
+            2,
+            "cache hits must reuse the coherent metadata/content snapshot"
+        );
     }
 
     /// Bug #5: ACCESS strips MODIFY/EXTEND/DELETE for a read-only path
