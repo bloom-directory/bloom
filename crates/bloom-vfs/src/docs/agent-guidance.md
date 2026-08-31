@@ -122,6 +122,18 @@ printf 'confirm\n' > wallets/<wallet>/chains/<chain>/outbox/pending/<id>/confirm
 cat outbox/pending/<action_id>/approval_challenge.json
 ```
 
+For a native Solana transfer, the challenge is projected beside the pending
+wallet transfer instead:
+
+```sh
+cat wallets/<wallet>/chains/<solana-chain>/outbox/pending/<id>/approval_challenge.json
+printf 'confirm\n' > wallets/<wallet>/chains/<solana-chain>/outbox/pending/<id>/confirm
+```
+
+Use the challenge's `retry_path` verbatim after the owner completes its
+`ceremony_url`; verify `tx_id`, `wallet`, `chain`, amount, destination, and
+`expiry_ms` first.
+
 Before opening the ceremony, verify that `approval_challenge.json` has the same
 `action_id` as the directory you are acting on and that `expiry_ms` is still in
 the future. Then open or forward `ceremony_url`.

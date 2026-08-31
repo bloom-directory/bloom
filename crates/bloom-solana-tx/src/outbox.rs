@@ -118,6 +118,7 @@ pub struct SolanaBroadcastAttempt {
 
 pub const BROADCAST_ATTEMPT_FILE: &str = "broadcast_attempted.json";
 pub const BROADCAST_RAW_TX: &str = "raw_tx";
+pub const APPROVAL_CHALLENGE_FILE: &str = "approval_challenge.json";
 const PRIVATE_SIGNATURE_FILE: &str = ".signature";
 const PRIVATE_APPROVAL_FILE: &str = "approval.json";
 const BROADCAST_SCHEMA: &str = "bloom.solana-broadcast-attempt/1";
@@ -285,6 +286,7 @@ impl SolanaOutbox {
             let _ = fs::remove_file(target.join(BROADCAST_RAW_TX));
             let _ = fs::remove_file(target.join(PRIVATE_SIGNATURE_FILE));
             let _ = fs::remove_file(target.join(PRIVATE_APPROVAL_FILE));
+            let _ = fs::remove_file(target.join(APPROVAL_CHALLENGE_FILE));
         }
         sync_dir(&target_parent)?;
         Ok(target)
@@ -574,6 +576,34 @@ impl SolanaOutbox {
             });
         }
         write_private_atomic(&entry.dir.join(PRIVATE_APPROVAL_FILE), body)
+    }
+
+    /// Atomically publish the sanitized owner-visible approval projection next
+    /// to a pending transfer. Unlike the compatibility-only private approval
+    /// sidecar, this file is intentionally readable through the wallet VFS.
+    pub fn write_approval_challenge(
+        &self,
+        entry: &SolanaOutboxEntry,
+        body: &[u8],
+    ) -> Result<(), OutboxError> {
+        if entry.state != SolanaOutboxState::Pending {
+            return Err(OutboxError::StateMismatch {
+                id: entry.staged.id.clone(),
+                expected: SolanaOutboxState::Pending.dirname(),
+                actual: entry.state.dirname(),
+            });
+        }
+        self.write_artefact(&entry.dir, APPROVAL_CHALLENGE_FILE, body)
+    }
+
+    /// Remove a completed or superseded approval projection so a stale
+    /// ceremony URL is never advertised after signing succeeds.
+    pub fn clear_approval_challenge(&self, entry: &SolanaOutboxEntry) -> Result<(), OutboxError> {
+        match fs::remove_file(entry.dir.join(APPROVAL_CHALLENGE_FILE)) {
+            Ok(()) => sync_dir(&entry.dir),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        }
     }
 
     /// Link an expired entry to its freshly staged successor without copying
