@@ -35,10 +35,8 @@ test.env
 # synthesized markdown under lit/ stays tracked. See lit/RESEARCH.md.
 docs/research/formal-verification/lit/data/
 
-# Root AGENTS.md is the tracked project guide. Nested AGENTS.md files remain
-# local unless explicitly added; use AGENTS.local.md for private overrides.
-AGENTS.md
-!/AGENTS.md
+# Project AGENTS.md files are tracked operating contracts. Use AGENTS.local.md
+# for private per-worktree instructions.
 CLAUDE.md
 DIRECTION.md
 PR.md
