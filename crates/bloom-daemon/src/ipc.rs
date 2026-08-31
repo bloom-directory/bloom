@@ -539,6 +539,7 @@ impl IpcOperationContext {
 pub enum MachineCustodyKind {
     New,
     Import,
+    ImportRawPrivateKey,
     Rebind,
     Delete,
 }

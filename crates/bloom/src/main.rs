@@ -678,13 +678,40 @@ fn configured_machine_audit_history_path_with_activation(
     )))
 }
 
+#[derive(Clone, Copy)]
+enum CustodyInputShape {
+    Bip39Mnemonic,
+    RawPrivateKey,
+    Named(&'static str),
+}
+
+impl CustodyInputShape {
+    const fn expected_input_class(self) -> &'static str {
+        match self {
+            Self::Bip39Mnemonic => "bip39-mnemonic",
+            Self::RawPrivateKey => "raw-wallet-import",
+            Self::Named(value) => value,
+        }
+    }
+
+    const fn wallet_seed_profile(self) -> Option<bloom_broker_api::WalletSeedProfile> {
+        match self {
+            Self::Bip39Mnemonic => Some(bloom_broker_api::WalletSeedProfile::Bip39MulticurveV1),
+            Self::RawPrivateKey => {
+                Some(bloom_broker_api::WalletSeedProfile::ImportedSecp256k1Scalar)
+            }
+            Self::Named(_) => None,
+        }
+    }
+}
+
 async fn launch_custody_ceremony(
     home: &HomeDir,
     requested_name: &str,
     method: bloom_machine_client::CustodyPrepareMethod,
     ceremony_kind: bloom_broker_api::CeremonyKind,
     wallet_id: Option<bloom_broker_api::Token>,
-    expected_input_class: &str,
+    input: CustodyInputShape,
     legacy_migration: Option<LegacyMigrationLaunch>,
 ) -> Result<String> {
     use rand::RngCore as _;
@@ -746,12 +773,12 @@ async fn launch_custody_ceremony(
                     .or(wallet_id),
                 key_ref: None,
                 exact_terms_digest,
-                expected_input_class: bloom_broker_api::Token::new(expected_input_class)
+                expected_input_class: bloom_broker_api::Token::new(input.expected_input_class())
                     .context("custody input class")?,
                 browser_output_recipient_key: None,
                 petal_key_scope: None,
                 legacy_passkey_migration,
-                wallet_seed_profile: None,
+                wallet_seed_profile: input.wallet_seed_profile(),
                 derivation_request: None,
                 account_terms: None,
             },
@@ -1251,7 +1278,7 @@ async fn execute_machine_command(
             if kind == MachineCustodyKind::New {
                 launch_wallet_registration_via_vfs(&daemon.vfs, &name).await?
             } else {
-                let (method, ceremony_kind, wallet_id, input_class) = match kind {
+                let (method, ceremony_kind, wallet_id, input) = match kind {
                     MachineCustodyKind::New => {
                         unreachable!("wallet registration uses the VFS adapter")
                     }
@@ -1259,31 +1286,29 @@ async fn execute_machine_command(
                         bloom_machine_client::CustodyPrepareMethod::WalletImport,
                         bloom_broker_api::CeremonyKind::WalletImport,
                         None,
-                        "raw-wallet-import",
+                        CustodyInputShape::Bip39Mnemonic,
+                    ),
+                    MachineCustodyKind::ImportRawPrivateKey => (
+                        bloom_machine_client::CustodyPrepareMethod::WalletImport,
+                        bloom_broker_api::CeremonyKind::WalletImport,
+                        None,
+                        CustodyInputShape::RawPrivateKey,
                     ),
                     MachineCustodyKind::Rebind => (
                         bloom_machine_client::CustodyPrepareMethod::CredentialReplace,
                         bloom_broker_api::CeremonyKind::CredentialReplace,
                         Some(bloom_broker_api::Token::new(name.clone())?),
-                        "credential-prf",
+                        CustodyInputShape::Named("credential-prf"),
                     ),
                     MachineCustodyKind::Delete => (
                         bloom_machine_client::CustodyPrepareMethod::WalletDelete,
                         bloom_broker_api::CeremonyKind::WalletDelete,
                         Some(bloom_broker_api::Token::new(name.clone())?),
-                        "none",
+                        CustodyInputShape::Named("none"),
                     ),
                 };
-                launch_custody_ceremony(
-                    home,
-                    &name,
-                    method,
-                    ceremony_kind,
-                    wallet_id,
-                    input_class,
-                    None,
-                )
-                .await?
+                launch_custody_ceremony(home, &name, method, ceremony_kind, wallet_id, input, None)
+                    .await?
             }
         }
         MachineCommand::WalletMigrate { receipt } => {
@@ -1296,7 +1321,7 @@ async fn execute_machine_command(
                 bloom_machine_client::CustodyPrepareMethod::WalletImport,
                 bloom_broker_api::CeremonyKind::WalletImport,
                 None,
-                "legacy_passkey_v1_prf",
+                CustodyInputShape::Named("legacy_passkey_v1_prf"),
                 Some(migration),
             )
             .await?
@@ -2135,13 +2160,27 @@ enum UpdateCmd {
     Status,
 }
 
+fn wallet_import_kind(raw_private_key: bool) -> MachineCustodyKind {
+    if raw_private_key {
+        MachineCustodyKind::ImportRawPrivateKey
+    } else {
+        MachineCustodyKind::Import
+    }
+}
+
 #[derive(Subcommand, Debug)]
 enum WalletCmd {
     /// Start a Broker-hosted wallet registration ceremony.
     New { name: String },
-    /// Start a Broker-hosted wallet import ceremony. The private key is entered
-    /// only in the ceremony browser and never crosses the Machine process.
-    Import { name: String },
+    /// Start a Broker-hosted BIP-39 mnemonic import ceremony. The recovery
+    /// phrase is entered only in the browser and never crosses Machine.
+    Import {
+        name: String,
+        /// Import a raw secp256k1 private key instead of a BIP-39 mnemonic.
+        /// The key is still entered only in the ceremony browser.
+        #[arg(long)]
+        raw_private_key: bool,
+    },
     /// Convert a staged v1 passkey wallet into Signer-owned Triad custody.
     /// The receipt contains public binding data only; Machine never opens the
     /// legacy wallet directory.
@@ -2824,12 +2863,15 @@ async fn run(cli: Cli) -> Result<()> {
             )
             .await
         }
-        Cmd::Wallet(WalletCmd::Import { name }) => {
+        Cmd::Wallet(WalletCmd::Import {
+            name,
+            raw_private_key,
+        }) => {
             call_machine_command(
                 &client_endpoint,
                 MachineCommand::WalletCustody {
                     name,
-                    kind: MachineCustodyKind::Import,
+                    kind: wallet_import_kind(raw_private_key),
                 },
             )
             .await
@@ -3785,12 +3827,13 @@ mod tests {
     use clap::Parser as _;
 
     use super::{
-        Cli, Cmd, LegacyMigrationReceiptFile, WalletCmd, ceremony_projection_path,
-        endpoint_connection_error, enrollment_state_is_usable, execute_audit_command,
-        execute_wallet_outbox_action, format_petal_consent_net_rule,
+        Cli, Cmd, CustodyInputShape, LegacyMigrationReceiptFile, WalletCmd,
+        ceremony_projection_path, endpoint_connection_error, enrollment_state_is_usable,
+        execute_audit_command, execute_wallet_outbox_action, format_petal_consent_net_rule,
         is_completed_policy_update_receipt, launch_wallet_registration_via_vfs,
         load_ceremony_projection, machine_error_from_anyhow, machine_wallet_lookup_error,
         open_machine_audit_with_history, persist_ceremony_projection, request_body_with_wallet,
+        wallet_import_kind,
     };
 
     #[derive(Default)]
@@ -4052,6 +4095,58 @@ mod tests {
             Some(Cmd::Wallet(WalletCmd::MigratePasskey { receipt }))
                 if receipt.as_os_str() == "receipt.json"
         ));
+    }
+
+    #[test]
+    fn wallet_import_defaults_to_bip39_and_raw_key_migration_is_explicit() {
+        let default = Cli::try_parse_from(["bloom", "wallet", "import", "recovered"]).unwrap();
+        assert!(matches!(
+            default.cmd,
+            Some(Cmd::Wallet(WalletCmd::Import {
+                name,
+                raw_private_key: false,
+            })) if name == "recovered"
+        ));
+        assert_eq!(
+            wallet_import_kind(false),
+            bloom_daemon::ipc::MachineCustodyKind::Import
+        );
+        assert_eq!(
+            CustodyInputShape::Bip39Mnemonic.wallet_seed_profile(),
+            Some(bloom_broker_api::WalletSeedProfile::Bip39MulticurveV1)
+        );
+        assert_eq!(
+            CustodyInputShape::Bip39Mnemonic.expected_input_class(),
+            "bip39-mnemonic"
+        );
+
+        let raw = Cli::try_parse_from([
+            "bloom",
+            "wallet",
+            "import",
+            "legacy-local",
+            "--raw-private-key",
+        ])
+        .unwrap();
+        assert!(matches!(
+            raw.cmd,
+            Some(Cmd::Wallet(WalletCmd::Import {
+                name,
+                raw_private_key: true,
+            })) if name == "legacy-local"
+        ));
+        assert_eq!(
+            wallet_import_kind(true),
+            bloom_daemon::ipc::MachineCustodyKind::ImportRawPrivateKey
+        );
+        assert_eq!(
+            CustodyInputShape::RawPrivateKey.wallet_seed_profile(),
+            Some(bloom_broker_api::WalletSeedProfile::ImportedSecp256k1Scalar)
+        );
+        assert_eq!(
+            CustodyInputShape::RawPrivateKey.expected_input_class(),
+            "raw-wallet-import"
+        );
     }
 
     #[test]
