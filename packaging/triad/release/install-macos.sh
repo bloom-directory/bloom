@@ -135,6 +135,29 @@ load_names() {
   log_group="bloom-log-$login_uid"
 }
 
+adopt_existing_log_group() {
+  local gid user_uuid real_name
+  gid="$(dscl . -read "/Groups/$log_group" PrimaryGroupID | awk 'NR==1{print $2}')"
+  user_uuid="$(dscl . -read "/Users/$login_user" GeneratedUID | awk 'NR==1{print $2}')"
+  real_name="$(dscl . -read "/Groups/$log_group" RealName | awk 'NR==1{sub(/^RealName:[[:space:]]*/,"");if(length)print;next}{sub(/^[[:space:]]*/,"");print}')"
+  [[ "$gid" =~ ^[1-9][0-9]*$ && "$user_uuid" =~ ^[0-9A-Fa-f-]+$ && \
+    "$real_name" == "Bloom isolated service group" && \
+    "$(dscl . -read "/Groups/$log_group" GroupMembers 2>/dev/null)" == "GroupMembers: $user_uuid" && \
+    "$(dscl . -read "/Groups/$log_group" GroupMembership 2>/dev/null)" == "GroupMembership: $login_user" ]] ||
+    die "pre-existing log group does not match the Bloom enrollment"
+  ! dscl . -read "/Groups/$log_group" NestedGroups >/dev/null 2>&1 ||
+    die "pre-existing log group has nested members"
+  dscl . -list /Groups PrimaryGroupID | awk -v gid="$gid" '$NF==gid{n++} END{exit n==1?0:1}' ||
+    die "pre-existing log group GID is not unique"
+  BLOOM_MACOS_LOG_GID="$gid"
+}
+
+persist_legacy_log_identity() {
+  local legacy_state legacy_digest candidate_digest="$BLOOM_RELEASE_DIGEST"
+  legacy_state="$(field "$enrollment" state)"; legacy_digest="$(field "$enrollment" release_digest)"
+  BLOOM_RELEASE_DIGEST="$legacy_digest"; write_enrollment "$legacy_state"; BLOOM_RELEASE_DIGEST="$candidate_digest"
+}
+
 load_ids() {
   BLOOM_MACOS_BROKER_UID="$(field "$enrollment" broker_uid)"
   BLOOM_MACOS_SIGNER_UID="$(field "$enrollment" signer_uid)"
@@ -147,16 +170,18 @@ load_ids() {
     BLOOM_MACOS_LOG_GID="$recorded_log_gid"
     return
   fi
-  # Retained legacy records must remain legacy-shaped. Restore will then
-  # allocate/migrate the missing log group instead of trusting a fake GID.
   if [[ "$action" == uninstall ]]; then BLOOM_MACOS_LOG_GID=""; return; fi
   if $live; then
-    record_exists Groups "$log_group" && die "legacy enrollment has an unrecorded log group"
-    BLOOM_MACOS_LOG_GID="$(next_id Groups PrimaryGroupID)"; new_group "$log_group" "$BLOOM_MACOS_LOG_GID"
-    join_group "$log_group" "$login_user"; dsmemberutil flushcache
+    if record_exists Groups "$log_group"; then adopt_existing_log_group
+    else
+      BLOOM_MACOS_LOG_GID="$(next_id Groups PrimaryGroupID)"; new_group "$log_group" "$BLOOM_MACOS_LOG_GID"
+      join_group "$log_group" "$login_user"; dsmemberutil flushcache
+    fi
   else
     [[ "${BLOOM_MACOS_LOG_GID:-}" =~ ^[1-9][0-9]*$ ]] || die "BLOOM_MACOS_LOG_GID must be positive decimal"
   fi
+  persist_legacy_log_identity
+  created_groups="${created_groups/ $log_group/}"
 }
 
 allocate_accounts() {

@@ -2686,6 +2686,40 @@ fn macos_staged_lifecycle_upgrades_repairs_retains_restores_and_rejects_downgrad
 }
 
 #[test]
+fn macos_active_legacy_enrollment_migrates_log_identity_before_upgrade() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("root");
+    fs::create_dir(&root).unwrap();
+    let baseline = make_installer_payload(&directory.path().join("baseline"));
+    let candidate = make_installer_payload(&directory.path().join("candidate"));
+    let installer = release_script("install-macos.sh");
+    let old_digest = "11".repeat(32);
+    let new_digest = "22".repeat(32);
+    assert!(
+        stage_macos_install_digest(&installer, &root, &baseline, &old_digest)
+            .status
+            .success()
+    );
+    let enrollment = root.join("Library/Application Support/BloomTriad/enrollments/501.json");
+    let mut legacy: serde_json::Value =
+        serde_json::from_slice(&fs::read(&enrollment).unwrap()).unwrap();
+    legacy.as_object_mut().unwrap().remove("log_group");
+    legacy.as_object_mut().unwrap().remove("log_gid");
+    fs::write(&enrollment, serde_json::to_vec(&legacy).unwrap()).unwrap();
+
+    let migrated = stage_macos_install_digest(&installer, &root, &candidate, &new_digest);
+    assert!(
+        migrated.status.success(),
+        "{}",
+        String::from_utf8_lossy(&migrated.stderr)
+    );
+    let migrated_enrollment = fs::read_to_string(&enrollment).unwrap();
+    assert!(migrated_enrollment.contains(r#""log_group":"bloom-log-501""#));
+    assert!(migrated_enrollment.contains(r#""log_gid":260504"#));
+    assert!(migrated_enrollment.contains(&new_digest));
+}
+
+#[test]
 fn macos_restore_cannot_downgrade_the_release_shared_by_an_active_login() {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().join("root");
