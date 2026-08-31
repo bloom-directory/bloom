@@ -285,6 +285,10 @@ class PolicyRecoveryTests(unittest.TestCase):
             pending["backup_digest"],
             hashlib.sha256(canonical_json(self.original)).hexdigest(),
         )
+        active = canonical_json(
+            dict(self.original, allowed_petal_packages=[self.state["package_hash"]])
+        )
+        self.assertEqual(pending["target_digest"], hashlib.sha256(active).hexdigest())
 
     def test_apply_rejects_invalid_or_non_object_policy_payloads(self) -> None:
         for payload, message in (
@@ -312,6 +316,105 @@ class PolicyRecoveryTests(unittest.TestCase):
         self.assertEqual(applied, [canonical_json(self.original)])
         self.assertFalse(self.store.backup_path.exists())
         self.assertIsNone(self.store.read()["pending_policy_recovery"])
+
+    def test_restore_cancels_live_allow_policy_before_clearing_recovery(self) -> None:
+        backup = canonical_json(self.original)
+        active = canonical_json(
+            dict(self.original, allowed_petal_packages=[self.state["package_hash"]])
+        )
+        target_digest = hashlib.sha256(active).hexdigest()
+        operation_id = "policy-operation"
+        atomic_write(self.store.backup_path, backup + b"\n")
+        pending = self.store.read()
+        pending["pending_policy_recovery"] = {
+            "operation_id": operation_id,
+            "target_digest": target_digest,
+            "backup_digest": hashlib.sha256(backup).hexdigest(),
+        }
+        self.store.write(pending)
+        action = (
+            self.definition.wallet_root
+            / "policy-updates/pending"
+            / operation_id
+        )
+        action.mkdir(parents=True)
+        (action / "approval_challenge.json").write_text(
+            json.dumps(
+                {
+                    "operation_id": operation_id,
+                    "proposed_policy_digest": target_digest,
+                }
+            )
+        )
+        writes: list[Path] = []
+
+        def cancel(path: Path, body: bytes, timeout: int) -> object:
+            del timeout
+            writes.append(path)
+            self.assertEqual(body, b"cancel\n")
+            failed = (
+                self.definition.wallet_root
+                / "policy-updates/failed"
+                / operation_id
+            )
+            failed.mkdir(parents=True)
+            (failed / "status.json").write_text(
+                json.dumps(
+                    {
+                        "action_id": operation_id,
+                        "state": "failed",
+                        "ceremony_state": "CANCELLED",
+                    }
+                )
+            )
+            for child in action.iterdir():
+                child.unlink()
+            action.rmdir()
+            return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+
+        self.definition._write_route = mock.Mock(side_effect=cancel)
+
+        self.lifecycle.restore()
+
+        self.assertEqual(writes, [action / "cancel"])
+        self.assertFalse(self.store.backup_path.exists())
+        self.assertIsNone(self.store.read()["pending_policy_recovery"])
+
+    def test_restore_retains_recovery_state_when_policy_cancel_fails(self) -> None:
+        backup = canonical_json(self.original)
+        target_digest = "a" * 64
+        operation_id = "policy-operation"
+        atomic_write(self.store.backup_path, backup + b"\n")
+        pending = self.store.read()
+        pending["pending_policy_recovery"] = {
+            "operation_id": operation_id,
+            "target_digest": target_digest,
+            "backup_digest": hashlib.sha256(backup).hexdigest(),
+        }
+        self.store.write(pending)
+        action = (
+            self.definition.wallet_root
+            / "policy-updates/pending"
+            / operation_id
+        )
+        action.mkdir(parents=True)
+        (action / "approval_challenge.json").write_text(
+            json.dumps(
+                {
+                    "operation_id": operation_id,
+                    "proposed_policy_digest": target_digest,
+                }
+            )
+        )
+        self.definition._write_route = mock.Mock(
+            return_value=SimpleNamespace(returncode=1, stdout=b"", stderr=b"failed")
+        )
+
+        with self.assertRaisesRegex(EvalError, "cancellation was not confirmed"):
+            self.lifecycle.restore()
+
+        self.assertTrue(self.store.backup_path.exists())
+        self.assertIsNotNone(self.store.read()["pending_policy_recovery"])
 
     def test_restore_rejects_backup_that_does_not_match_bound_digest(self) -> None:
         atomic_write(self.store.backup_path, canonical_json(self.original) + b"\n")

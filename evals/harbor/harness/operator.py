@@ -482,6 +482,100 @@ class PolicyLifecycle:
             "completed policy could not be committed by bounded byte-identical replay"
         )
 
+    def _matching_pending_policy_updates(self, expected_digest: str) -> list[str]:
+        pending_root = self.definition.wallet_root / "policy-updates/pending"
+        try:
+            action_dirs = sorted(path for path in pending_root.iterdir() if path.is_dir())
+        except FileNotFoundError:
+            return []
+        except OSError as error:
+            raise EvalError("could not enumerate pending policy updates") from error
+        matches: list[str] = []
+        for action_dir in action_dirs:
+            try:
+                challenge = self.definition._read_json(
+                    action_dir / "approval_challenge.json", timeout=2
+                )
+            except EvalError as error:
+                raise EvalError(
+                    "could not reconcile a pending policy-update projection"
+                ) from error
+            if not isinstance(challenge, dict):
+                raise EvalError("pending policy-update challenge is invalid")
+            operation_id = challenge.get("operation_id")
+            if not isinstance(operation_id, str) or operation_id != action_dir.name:
+                raise EvalError("pending policy-update operation identity is invalid")
+            if challenge.get("proposed_policy_digest") == expected_digest:
+                matches.append(operation_id)
+        return matches
+
+    def _cancel_pending_policy_update(self) -> None:
+        pending = self.store.read().get("pending_policy_recovery")
+        if not isinstance(pending, dict):
+            raise EvalError("policy recovery marker is invalid")
+        expected_digest = pending.get("target_digest")
+        operation_id = pending.get("operation_id")
+        if not isinstance(expected_digest, str):
+            raise EvalError("policy recovery target digest is invalid")
+        if operation_id is not None and not isinstance(operation_id, str):
+            raise EvalError("policy recovery operation ID is invalid")
+
+        matches = self._matching_pending_policy_updates(expected_digest)
+        if operation_id is None:
+            if len(matches) > 1:
+                raise EvalError("multiple matching pending policy updates require recovery")
+            if not matches:
+                return
+            operation_id = matches[0]
+            self._persist_pending(operation_id, expected_digest)
+        elif operation_id not in matches:
+            # A previously successful cancellation is the only safe reason for
+            # the stored operation to have left the pending lifecycle folder.
+            try:
+                failed = self.definition._read_json(
+                    self.definition.wallet_root
+                    / "policy-updates/failed"
+                    / operation_id
+                    / "status.json",
+                    timeout=2,
+                )
+            except EvalError as error:
+                raise EvalError(
+                    "stored policy-update operation is not cancellably pending"
+                ) from error
+            if not isinstance(failed, dict) or failed.get("ceremony_state") != "CANCELLED":
+                raise EvalError("stored policy-update operation was not cancelled")
+            return
+
+        cancel_path = (
+            self.definition.wallet_root
+            / "policy-updates/pending"
+            / operation_id
+            / "cancel"
+        )
+        cancelled = self.definition._write_route(cancel_path, b"cancel\n", 30)
+        if cancelled.returncode != 0:
+            raise EvalError("policy-update cancellation was not confirmed by the mount")
+        try:
+            failed = self.definition._read_json(
+                self.definition.wallet_root
+                / "policy-updates/failed"
+                / operation_id
+                / "status.json",
+                timeout=2,
+            )
+        except EvalError as error:
+            raise EvalError("cancelled policy update has no terminal projection") from error
+        if (
+            not isinstance(failed, dict)
+            or failed.get("action_id") != operation_id
+            or failed.get("state") != "failed"
+            or failed.get("ceremony_state") != "CANCELLED"
+        ):
+            raise EvalError("policy-update cancellation projection is invalid")
+        if operation_id in self._matching_pending_policy_updates(expected_digest):
+            raise EvalError("cancelled policy update remains live")
+
     def apply(self, target: bytes) -> None:
         try:
             expected = json.loads(target)
@@ -548,7 +642,9 @@ class PolicyLifecycle:
         atomic_write(self.store.backup_path, original_bytes + b"\n")
         self._bind_backup_digest(hashlib.sha256(original_bytes).hexdigest())
         active = dict(original, allowed_petal_packages=[self.state["package_hash"]])
-        self.apply(canonical_json(active))
+        active_bytes = canonical_json(active)
+        self._persist_pending(None, hashlib.sha256(active_bytes).hexdigest())
+        self.apply(active_bytes)
 
     def restore(self) -> None:
         try:
@@ -577,7 +673,16 @@ class PolicyLifecycle:
         ):
             raise EvalError("protected policy backup is not the expected policy")
         self._bind_backup_digest(hashlib.sha256(backup).hexdigest())
+        self._cancel_pending_policy_update()
         self.apply(backup)
+        pending = self.store.read().get("pending_policy_recovery")
+        if not isinstance(pending, dict):
+            raise EvalError("policy recovery marker disappeared before verification")
+        target_digest = pending.get("target_digest")
+        if not isinstance(target_digest, str):
+            raise EvalError("policy recovery target digest is invalid")
+        if self._matching_pending_policy_updates(target_digest):
+            raise EvalError("matching policy-update challenge remains live after recovery")
         current = self.store.read()
         current["pending_policy_recovery"] = None
         self.store.write(current)

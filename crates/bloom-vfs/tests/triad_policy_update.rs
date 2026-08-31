@@ -190,6 +190,20 @@ impl MachineBrokerService for BrokerFixture {
                         },
                     ))
                 }
+                MachineBrokerRequest::CeremonyCancel(request) => {
+                    *self.ceremony_state_override.lock() = Some(CeremonyState::Cancelled);
+                    Ok(MachineBrokerResponse::CeremonyCancel(
+                        CeremonyPublicStatus {
+                            ceremony_id: Digest32::from_bytes([7; 32]),
+                            ceremony_kind: CeremonyKind::PolicyUpdate,
+                            operation_id: OperationId::new(request.id.as_str().to_owned()).unwrap(),
+                            state: CeremonyState::Cancelled,
+                            expires_at_ms: DecimalU64::new(u64::MAX),
+                            ceremony_url: None,
+                            receipt_digest: None,
+                        },
+                    ))
+                }
                 MachineBrokerRequest::CustodyResult(request) => {
                     Ok(MachineBrokerResponse::CustodyResult(CustodyResult {
                         ceremony_kind: CeremonyKind::PolicyUpdate,
@@ -536,6 +550,81 @@ async fn vfs_policy_write_prepares_then_commits_only_with_completed_custody_rece
             MachineBrokerRequest::PolicyRead(_)
         ]
     ));
+}
+
+#[tokio::test]
+async fn vfs_policy_cancel_terminates_staged_ceremony_before_recovery_clears_it() {
+    let temp = tempfile::tempdir().unwrap();
+    let fixture = broker_fixture(false);
+    let service: Arc<dyn MachineBrokerService> = fixture.clone();
+    let home = HomeDir::at(temp.path().join("home"));
+    let handler = WalletsHandler::new(
+        bloom_evm::ChainRegistry::default(),
+        TxEngine::new(Outbox::new(temp.path().join("outbox")).unwrap(), 60_000),
+        AddressBook::default(),
+        projection_reader(
+            temp.path().join("cache/cancel-wallets.json"),
+            Some(MachineBrokerClient::new(service.clone())),
+        ),
+        temp.path().join("machine-policy-projections"),
+    )
+    .with_broker(Some(MachineBrokerClient::new(service)))
+    .with_home_write_permit(Arc::new(HomeWritePermit::acquire(&home).unwrap()));
+    let proposed = serde_json::to_vec_pretty(&policy(120_000)).unwrap();
+
+    assert!(matches!(
+        handler
+            .write(&VfsPath::parse("alice/policy.json").unwrap(), &proposed)
+            .await,
+        Err(HandlerError::PermissionDenied)
+    ));
+    let operation_id = fixture.state.lock().operation_id.clone().unwrap();
+    let action_path = format!("alice/policy-updates/pending/{operation_id}");
+    let entries = handler
+        .list(&VfsPath::parse(&action_path).unwrap())
+        .await
+        .unwrap();
+    assert!(entries.iter().any(|entry| entry.name == "cancel"));
+    handler
+        .write(
+            &VfsPath::parse(&format!("{action_path}/cancel")).unwrap(),
+            b"cancel\n",
+        )
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        handler.lookup(&VfsPath::parse(&action_path).unwrap()).await,
+        Err(HandlerError::NotFound(_))
+    ));
+    let failed: serde_json::Value = serde_json::from_slice(
+        &handler
+            .read(
+                &VfsPath::parse(&format!(
+                    "alice/policy-updates/failed/{operation_id}/status.json"
+                ))
+                .unwrap(),
+            )
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(failed["status"], "failed");
+    assert_eq!(failed["ceremony_state"], "CANCELLED");
+    assert_eq!(
+        handler
+            .read(&VfsPath::parse("alice/policy.json").unwrap())
+            .await
+            .unwrap(),
+        fixture.baseline.canonical_policy.decode()
+    );
+    assert!(
+        fixture
+            .requests
+            .lock()
+            .iter()
+            .any(|request| matches!(request, MachineBrokerRequest::CeremonyCancel(_)))
+    );
 }
 
 #[tokio::test]
