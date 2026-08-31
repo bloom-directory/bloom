@@ -32,6 +32,29 @@ The mounted wallet tree exposes those projections. Wallet creation, import,
 credential changes, deletion, and recovery start Broker custody operations and
 return ceremony information; Machine does not create or open a keystore.
 
+## BIP-39 roots and derived accounts
+
+The v1 BIP-39 profile accepts a standard English mnemonic only through the
+Broker-hosted owner ceremony and uses the interoperable empty BIP-39
+passphrase. Non-empty BIP-39 passphrases are unsupported and rejected. Signer
+stores encrypted root material behind the passkey/PRF wrapping path; Machine
+and Broker never persist the mnemonic, seed, passphrase, PRF output, or child
+private keys.
+
+Import allocates the canonical EVM child at `m/44'/60'/0'/0/0`. Machine's v1
+account-allocation command exposes Solana SLIP-10 children only; additional EVM
+children remain unavailable until every EVM transaction and exact-signing
+surface can carry an explicit account selector. This avoids creating a wallet
+state that existing EVM UX cannot spend from safely.
+
+Broker projects public derived accounts through `wallet.accounts`; Machine
+exposes the authenticated collection as `wallets/<wallet>/accounts.json`.
+Selection binds the exact `KeyRef` into approval terms and signing identity.
+When multiple compatible children exist, omission or ambiguity fails closed
+and names the public fingerprints and derivation paths; list order is never an
+authority decision. Top-level EVM address compatibility resolves only the
+canonical initial child and never falls back to another projected child.
+
 ## Signing
 
 Every retained wallet-signing route sends the exact structured payload to
