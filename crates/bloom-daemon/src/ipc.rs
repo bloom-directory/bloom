@@ -576,6 +576,9 @@ pub struct MachineLegacyMigrationReceipt {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
 pub enum MachineCommand {
+    TriadHealth {
+        expected_build: String,
+    },
     Status,
     AuditStatus,
     AuditReconcile {

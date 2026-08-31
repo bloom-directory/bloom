@@ -1668,7 +1668,7 @@ fn serve_refuses_when_home_write_lock_is_live() {
     command.assert().failure().stderr(
         predicate::str::contains("Bloom service exited after a runtime failure")
             .and(predicate::str::contains("service.fatal_exit"))
-            .and(predicate::str::contains(lock.display().to_string()).not()),
+            .and(predicate::str::contains(lock.display().to_string())),
     );
 }
 

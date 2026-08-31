@@ -700,10 +700,10 @@ fn triad_developer_launcher_owns_only_its_service_processes() {
 #[test]
 fn serve_starts_audited_projection_refresh_after_fallible_setup() {
     let source = fs::read_to_string(workspace().join("crates/bloom/src/main.rs")).unwrap();
-    let serve = source
-        .rsplit("Cmd::Serve {")
-        .next()
+    let serve_start = source
+        .find("\n        Cmd::Serve {\n            endpoint,")
         .expect("serve command arm");
+    let serve = &source[serve_start..];
     let mount = serve.find("let mount_handle =").unwrap();
     let endpoint = serve
         .find("let endpoint = resolve_server_endpoint")

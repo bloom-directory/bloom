@@ -2717,6 +2717,10 @@ pub struct Daemon {
     pub home_write_permit: Option<Arc<HomeWritePermit>>,
     pub address_book: Arc<AddressBook>,
     pub audit: Arc<AuditLog>,
+    /// The single authenticated Machine→Broker edge attached to `audit`.
+    /// Command handlers must reuse this client rather than reopening the
+    /// Machine journal and creating a second, stale in-memory head.
+    pub machine_broker: Option<MachineBrokerClient>,
     pub wallet_projections: Arc<dyn WalletProjectionReader>,
     pub vfs: Vfs,
     pub petals: PetalRunner,
@@ -3798,6 +3802,7 @@ impl Daemon {
             home_write_permit,
             address_book: address_book_arc,
             audit: audit_arc,
+            machine_broker: broker,
             wallet_projections,
             vfs,
             petals,

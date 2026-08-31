@@ -33,8 +33,9 @@ use bloom_daemon::ipc::{
     MachineCommandService, MachineCustodyKind, MachineError, MachineErrorKind,
     MachineOperationAction, default_socket_path,
 };
-use bloom_machine_client::MachineJournalHeadProvider;
-use bloom_proto::{AuditIdentity, AuditLog, HomeDir, HomeWritePermit};
+#[cfg(test)]
+use bloom_proto::AuditIdentity;
+use bloom_proto::{AuditLog, HomeDir, HomeWritePermit};
 use bloom_service_observability::{LogOutput, SecureLogFile};
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::{Shell, generate};
@@ -113,10 +114,6 @@ fn resolve_server_endpoint(home: &HomeDir, endpoint: Option<&str>) -> Result<Res
     Ok(ResolvedEndpoint::default_for_home(home))
 }
 
-fn configured_broker_client(home: &HomeDir) -> Result<bloom_machine_client::MachineBrokerClient> {
-    configured_broker_client_with_activation(home, false)
-}
-
 fn validate_wallet_name(name: &str) -> Result<()> {
     anyhow::ensure!(
         !name.is_empty()
@@ -127,46 +124,6 @@ fn validate_wallet_name(name: &str) -> Result<()> {
         "wallet name must be 1-64 ASCII alphanumeric, '-' or '_' characters"
     );
     Ok(())
-}
-
-fn configured_broker_client_with_activation(
-    home: &HomeDir,
-    allow_activating: bool,
-) -> Result<bloom_machine_client::MachineBrokerClient> {
-    let client = configured_raw_broker_client_with_activation(allow_activating)?;
-    let identity = client
-        .local_application_identity()
-        .context("authenticated Machine client did not retain its application identity")?;
-    let audit = Arc::new(open_configured_machine_audit_with_activation(
-        home,
-        identity,
-        allow_activating,
-    )?);
-    let checkpoint_root = configured_machine_checkpoint_path_with_activation(allow_activating)?;
-    #[cfg(feature = "triad-dev-harness")]
-    let history_owner = if std::env::var_os("BLOOM_TRIAD_DEVELOPER_ROOT").is_some() {
-        rustix::process::geteuid().as_raw()
-    } else {
-        0
-    };
-    #[cfg(not(feature = "triad-dev-harness"))]
-    let history_owner = 0;
-    let authority_history = bloom_machine_client::AuthorityEdgeHistory::load_trusted(
-        configured_authority_edge_history_path_with_activation(allow_activating)?,
-        history_owner,
-    )
-    .map_err(anyhow::Error::new)
-    .context("load packaging-owned authority-edge application-key history")?;
-    client
-        .attach_authority_journal_with_history(
-            Arc::new(ConfiguredMachineAuditHead(audit)),
-            checkpoint_root,
-            rustix::process::geteuid().as_raw(),
-            authority_history,
-        )
-        .map_err(anyhow::Error::new)
-        .context("attach signed Machine authority-edge journal")?;
-    Ok(client)
 }
 
 fn configured_raw_broker_client_with_activation(
@@ -212,7 +169,10 @@ fn configured_raw_broker_client_with_activation(
     client.context("load authenticated Machine-to-Broker edge")
 }
 
-async fn installed_triad_health_check(expected_build: &str) -> Result<()> {
+async fn installed_triad_health_check(
+    client: &bloom_machine_client::MachineBrokerClient,
+    expected_build: &str,
+) -> Result<()> {
     use bloom_broker_api::{
         Digest32, Empty, MachineBrokerRequest, MachineBrokerResponse, ReadinessState,
     };
@@ -222,9 +182,6 @@ async fn installed_triad_health_check(expected_build: &str) -> Result<()> {
     let installed = installed_macos_triad_paths_with_activation(true)
         .ok()
         .flatten();
-    let home = HomeDir::resolve("~/.bloom").context("resolve Machine home for health check")?;
-    let client = configured_broker_client_with_activation(&home, true)
-        .map_err(|error| enrich_broker_startup_failure(error, installed.as_ref()))?;
     let response = tokio::time::timeout(
         std::time::Duration::from_secs(5),
         client.request(MachineBrokerRequest::BrokerReadiness(Empty {})),
@@ -293,8 +250,6 @@ struct InstalledMacosTriadPaths {
     machine_identity: PathBuf,
     edge_manifest: PathBuf,
     provenance_catalog: PathBuf,
-    machine_audit_history: PathBuf,
-    authority_edge_history: PathBuf,
     startup_status: PathBuf,
     broker_uid: u32,
     machine_broker_gid: u32,
@@ -381,8 +336,6 @@ fn installed_macos_triad_paths_with_activation(
             machine_identity: config.join("machine/identity.json"),
             edge_manifest: config.join("edge-manifest.json"),
             provenance_catalog: config.join("provenance-catalog.json"),
-            machine_audit_history: config.join("machine-audit-history.json"),
-            authority_edge_history: config.join("authority-edge-history.json"),
             startup_status: PathBuf::from(format!(
                 "/private/var/run/bloom/{uid}/status/broker-startup.json"
             )),
@@ -462,8 +415,6 @@ mod broker_startup_failure_tests {
             machine_identity: PathBuf::new(),
             edge_manifest: PathBuf::new(),
             provenance_catalog: PathBuf::new(),
-            machine_audit_history: PathBuf::new(),
-            authority_edge_history: PathBuf::new(),
             startup_status,
             broker_uid: metadata.uid(),
             machine_broker_gid: metadata.gid(),
@@ -570,15 +521,7 @@ fn execute_audit_command(command: &AuditCmd, audit: &AuditLog) -> Result<String>
     }
 }
 
-fn open_configured_machine_audit_with_activation(
-    home: &HomeDir,
-    identity: bloom_triad_local_transport::LocalIdentity,
-    allow_activating: bool,
-) -> Result<AuditLog> {
-    let history_path = configured_machine_audit_history_path_with_activation(allow_activating)?;
-    open_machine_audit_with_history(home, identity, &history_path)
-}
-
+#[cfg(test)]
 fn open_machine_audit_with_history(
     home: &HomeDir,
     identity: bloom_triad_local_transport::LocalIdentity,
@@ -609,82 +552,8 @@ fn open_machine_audit_with_history(
     Ok(audit)
 }
 
-struct ConfiguredMachineAuditHead(Arc<AuditLog>);
-
-impl MachineJournalHeadProvider for ConfiguredMachineAuditHead {
-    fn verified_head(
-        &self,
-    ) -> Result<(u64, bloom_broker_api::Digest32), bloom_broker_api::ProtocolError> {
-        if let Some(reason) = self.0.mutation_degradation() {
-            return Err(bloom_broker_api::ProtocolError::new(
-                bloom_broker_api::ProtocolErrorCode::ServiceUnavailable,
-                format!("Machine audit journal is degraded: {reason}"),
-            ));
-        }
-        let hash = self.0.head_hash();
-        let hash = if hash.is_empty() {
-            "00".repeat(32)
-        } else {
-            hash
-        };
-        Ok((self.0.sequence(), bloom_broker_api::Digest32::new(hash)?))
-    }
-
-    fn latch_mutations(&self, reason: String) {
-        self.0.latch_mutations(reason);
-    }
-}
-
-fn configured_machine_checkpoint_path_with_activation(allow_activating: bool) -> Result<PathBuf> {
-    if let Some(path) = std::env::var_os("BLOOM_MACHINE_AUDIT_CHECKPOINT_DIR") {
-        return Ok(PathBuf::from(path));
-    }
-    let uid = rustix::process::geteuid().as_raw();
-    if installed_macos_triad_paths_with_activation(allow_activating)?.is_some() {
-        return Ok(PathBuf::from(format!(
-            "/private/var/db/bloom/{uid}/machine/audit-checkpoints"
-        )));
-    }
-    Ok(PathBuf::from(format!(
-        "/var/lib/bloom/{uid}/machine/audit-checkpoints"
-    )))
-}
-
-fn configured_authority_edge_history_path_with_activation(
-    allow_activating: bool,
-) -> Result<PathBuf> {
-    if let Some(path) = std::env::var_os("BLOOM_AUTHORITY_EDGE_HISTORY") {
-        return Ok(PathBuf::from(path));
-    }
-    if let Some(installed) = installed_macos_triad_paths_with_activation(allow_activating)? {
-        return Ok(installed.authority_edge_history);
-    }
-    let uid = rustix::process::geteuid().as_raw();
-    Ok(PathBuf::from(format!(
-        "/etc/bloom/{uid}/authority-edge-history.json"
-    )))
-}
-
-fn configured_machine_audit_history_path_with_activation(
-    allow_activating: bool,
-) -> Result<PathBuf> {
-    if let Some(path) = std::env::var_os("BLOOM_MACHINE_AUDIT_HISTORY") {
-        return Ok(PathBuf::from(path));
-    }
-    if let Some(installed) = installed_macos_triad_paths_with_activation(allow_activating)? {
-        return Ok(installed.machine_audit_history);
-    }
-    #[cfg(unix)]
-    let uid = rustix::process::geteuid().as_raw();
-    #[cfg(not(unix))]
-    let uid = 0_u32;
-    Ok(PathBuf::from(format!(
-        "/etc/bloom/{uid}/machine-audit-history.json"
-    )))
-}
-
 async fn launch_custody_ceremony(
-    home: &HomeDir,
+    daemon: &Daemon,
     requested_name: &str,
     method: bloom_machine_client::CustodyPrepareMethod,
     ceremony_kind: bloom_broker_api::CeremonyKind,
@@ -694,6 +563,14 @@ async fn launch_custody_ceremony(
 ) -> Result<String> {
     use rand::RngCore as _;
     use sha2::Digest as _;
+
+    let home = &daemon.home;
+    let client = daemon.machine_broker.as_ref().ok_or_else(|| {
+        machine_error(
+            MachineErrorKind::Unavailable,
+            "custody requires the daemon-owned authenticated Broker edge",
+        )
+    })?;
 
     validate_wallet_name(requested_name).map_err(|error| {
         machine_error(
@@ -708,12 +585,6 @@ async fn launch_custody_ceremony(
                 format!("requested wallet name must be a protocol token: {error}"),
             )
         })?;
-    let client = configured_broker_client(home).map_err(|error| {
-        machine_error(
-            MachineErrorKind::Unavailable,
-            format!("custody requires the authenticated Machine-to-Broker edge: {error:#}"),
-        )
-    })?;
     let workflow = if legacy_migration.is_some() {
         "credential_migration"
     } else {
@@ -1186,7 +1057,19 @@ async fn execute_machine_command(
     daemon: &Daemon,
     command: MachineCommand,
 ) -> Result<MachineCommandOutput> {
+    let machine_broker = || {
+        daemon.machine_broker.as_ref().ok_or_else(|| {
+            machine_error(
+                MachineErrorKind::Unavailable,
+                "Machine command requires the daemon-owned authenticated Broker edge",
+            )
+        })
+    };
     let output = match command {
+        MachineCommand::TriadHealth { expected_build } => {
+            installed_triad_health_check(machine_broker()?, &expected_build).await?;
+            String::new()
+        }
         MachineCommand::Status => {
             let wallets = match daemon.wallet_projections.list_wallets().await {
                 Ok(wallets) => Some(wallets),
@@ -1301,6 +1184,12 @@ async fn execute_machine_command(
             .into());
         }
         MachineCommand::WalletCustody { name, kind } => {
+            validate_wallet_name(&name).map_err(|error| {
+                machine_error(
+                    MachineErrorKind::InvalidParams,
+                    format!("requested wallet name must be a safe single path segment: {error:#}"),
+                )
+            })?;
             if kind == MachineCustodyKind::New {
                 launch_wallet_registration_via_vfs(&daemon.vfs, &name).await?
             } else {
@@ -1328,7 +1217,7 @@ async fn execute_machine_command(
                     ),
                 };
                 launch_custody_ceremony(
-                    home,
+                    daemon,
                     &name,
                     method,
                     ceremony_kind,
@@ -1344,7 +1233,7 @@ async fn execute_machine_command(
                 serde_json::from_value(serde_json::to_value(receipt)?)?;
             let (name, migration) = receipt.into_launch()?;
             let output = launch_custody_ceremony(
-                home,
+                daemon,
                 &name,
                 bloom_machine_client::CustodyPrepareMethod::WalletImport,
                 bloom_broker_api::CeremonyKind::WalletImport,
@@ -1374,9 +1263,11 @@ async fn execute_machine_command(
             name,
             policy,
             assurance_level,
-        } => prepare_policy_update(home, &name, &policy, &assurance_level).await?,
+        } => {
+            prepare_policy_update(home, machine_broker()?, &name, &policy, &assurance_level).await?
+        }
         MachineCommand::WalletPolicyCommit { operation_id } => {
-            commit_policy_update(home, operation_id).await?
+            commit_policy_update(home, machine_broker()?, operation_id).await?
         }
         MachineCommand::WalletOutboxCancel {
             wallet,
@@ -1429,7 +1320,7 @@ async fn execute_machine_command(
                     operation_id: operation_id.clone(),
                 },
             };
-            handle_ceremony(home, command).await?
+            handle_ceremony(home, machine_broker()?, command).await?
         }
         MachineCommand::Operation {
             action,
@@ -1444,7 +1335,7 @@ async fn execute_machine_command(
                     operation_id: operation_id.clone(),
                 },
             };
-            let output = handle_operation(home, command).await?;
+            let output = handle_operation(machine_broker()?, command).await?;
             if mutation {
                 emit_machine_mutation("operation", Some(&operation_id), "committed");
             }
@@ -1556,6 +1447,7 @@ const MAX_POLICY_DOCUMENT_BYTES: u64 = 1024 * 1024;
 
 async fn prepare_policy_update(
     home: &HomeDir,
+    client: &bloom_machine_client::MachineBrokerClient,
     requested_name: &str,
     input: &[u8],
     assurance_level: &str,
@@ -1599,12 +1491,6 @@ async fn prepare_policy_update(
     let proposed_bytes =
         serde_jcs::to_vec(&proposed).context("canonicalize proposed policy document")?;
 
-    let client = configured_broker_client(home).map_err(|error| {
-        machine_error(
-            MachineErrorKind::Unavailable,
-            format!("policy update requires the authenticated Machine-to-Broker edge: {error:#}"),
-        )
-    })?;
     let baseline = client
         .policy(wallet_id.clone())
         .await
@@ -1681,7 +1567,11 @@ async fn prepare_policy_update(
     ))
 }
 
-async fn commit_policy_update(home: &HomeDir, operation_id: String) -> Result<String> {
+async fn commit_policy_update(
+    home: &HomeDir,
+    client: &bloom_machine_client::MachineBrokerClient,
+    operation_id: String,
+) -> Result<String> {
     let operation_id = bloom_broker_api::OperationId::new(operation_id)
         .context("operation ID must be 64 lowercase hexadecimal characters")?;
     info!(
@@ -1689,12 +1579,6 @@ async fn commit_policy_update(home: &HomeDir, operation_id: String) -> Result<St
         operation_id = operation_id.as_str(),
         state = "commit_requested"
     );
-    let client = configured_broker_client(home).map_err(|error| {
-        machine_error(
-            MachineErrorKind::Unavailable,
-            format!("policy commit requires the authenticated Machine-to-Broker edge: {error:#}"),
-        )
-    })?;
     let ceremony_receipt = client
         .custody_result(bloom_broker_api::OperationRequest {
             operation_id: operation_id.clone(),
@@ -1864,7 +1748,11 @@ fn load_ceremony_projection(
     }
 }
 
-async fn handle_ceremony(home: &HomeDir, command: CeremonyCmd) -> Result<String> {
+async fn handle_ceremony(
+    home: &HomeDir,
+    client: &bloom_machine_client::MachineBrokerClient,
+    command: CeremonyCmd,
+) -> Result<String> {
     let (operation_id, action) = match command {
         CeremonyCmd::Status { operation_id } => (operation_id, "status"),
         CeremonyCmd::Cancel { operation_id } => (operation_id, "cancel"),
@@ -1872,14 +1760,6 @@ async fn handle_ceremony(home: &HomeDir, command: CeremonyCmd) -> Result<String>
     };
     let operation_id = bloom_broker_api::OperationId::new(operation_id)
         .context("operation ID must be 64 lowercase hexadecimal characters")?;
-    let client = configured_broker_client(home).map_err(|error| {
-        machine_error(
-            MachineErrorKind::Unavailable,
-            format!(
-                "ceremony operations require the authenticated Machine-to-Broker edge: {error:#}"
-            ),
-        )
-    })?;
     if action == "result" {
         let result = client
             .custody_result(bloom_broker_api::OperationRequest {
@@ -2026,21 +1906,16 @@ fn emit_ceremony_local_projection_failure(operation_id: &str) {
     );
 }
 
-async fn handle_operation(home: &HomeDir, command: OperationCmd) -> Result<String> {
+async fn handle_operation(
+    client: &bloom_machine_client::MachineBrokerClient,
+    command: OperationCmd,
+) -> Result<String> {
     let (raw_operation_id, cancel) = match command {
         OperationCmd::Status { operation_id } => (operation_id, false),
         OperationCmd::Cancel { operation_id } => (operation_id, true),
     };
     let operation_id = bloom_broker_api::OperationId::new(raw_operation_id)
         .context("operation ID must be 64 lowercase hexadecimal characters")?;
-    let client = configured_broker_client(home).map_err(|error| {
-        machine_error(
-            MachineErrorKind::Unavailable,
-            format!(
-                "operation lifecycle requires the authenticated Machine-to-Broker edge: {error:#}"
-            ),
-        )
-    })?;
     let status = if cancel {
         operation_cancel_remote_result(
             operation_id.as_str(),
@@ -3507,11 +3382,13 @@ async fn run(cli: Cli) -> Result<()> {
         } => {
             if let Some(internal) = internal {
                 return match internal {
-                    ServeInternal::TriadHealthCheck { expected_build } => {
-                        installed_triad_health_check(&expected_build)
-                            .await
-                            .context("Bloom triad health check failed")
-                    }
+                    ServeInternal::TriadHealthCheck { expected_build } => machine_command(
+                        &client_endpoint,
+                        MachineCommand::TriadHealth { expected_build },
+                    )
+                    .await
+                    .map(|_| ())
+                    .context("Bloom triad health check failed"),
                     ServeInternal::TriadPfMonitorOnce => {
                         pf_monitor::run_once().context("Bloom packet-filter monitor failed")
                     }
@@ -4266,6 +4143,21 @@ mod tests {
         MachineCeremonyAction, MachineCommand, MachineCustodyKind, MachineOperationAction,
     };
 
+    struct UnreachableBroker;
+
+    impl bloom_broker_api::MachineBrokerService for UnreachableBroker {
+        fn dispatch<'a>(
+            &'a self,
+            _request: bloom_broker_api::MachineBrokerRequest,
+        ) -> bloom_broker_api::ServiceFuture<'a, bloom_broker_api::MachineBrokerResponse> {
+            Box::pin(async { panic!("invalid-input test must not dispatch to Broker") })
+        }
+    }
+
+    fn unreachable_broker_client() -> bloom_machine_client::MachineBrokerClient {
+        bloom_machine_client::MachineBrokerClient::new(std::sync::Arc::new(UnreachableBroker))
+    }
+
     #[derive(Default)]
     struct RecordingOutboxHandler(Mutex<Vec<(String, Vec<u8>)>>);
 
@@ -4899,10 +4791,12 @@ mod tests {
         let operation_id = "not-an-operation-id";
         let temp = tempfile::tempdir().unwrap();
         let home = bloom_proto::HomeDir::at(temp.path());
+        let broker = unreachable_broker_client();
         let _guard = tracing::subscriber::set_default(subscriber);
         emit_machine_mutation("ceremony", Some(operation_id), "started");
         let result = handle_ceremony(
             &home,
+            &broker,
             CeremonyCmd::Cancel {
                 operation_id: operation_id.into(),
             },
@@ -5072,11 +4966,12 @@ mod tests {
         );
         let temp = tempfile::tempdir().unwrap();
         let home = bloom_proto::HomeDir::at(temp.path());
+        let broker = unreachable_broker_client();
         let _guard = tracing::subscriber::set_default(subscriber);
 
         let invalid_operation_id = "not-an-operation-id";
         emit_machine_mutation("policy_update", Some(invalid_operation_id), "started");
-        let pre_remote = commit_policy_update(&home, invalid_operation_id.into()).await;
+        let pre_remote = commit_policy_update(&home, &broker, invalid_operation_id.into()).await;
         assert!(pre_remote.is_err());
         emit_machine_mutation_rejection_if_needed(
             "policy_update",
@@ -5195,6 +5090,31 @@ mod tests {
         assert!(
             !source.contains(raw_process_args),
             "internal lifecycle protocols must be parsed below init or serve, not before Clap"
+        );
+    }
+
+    #[test]
+    fn production_commands_cannot_open_a_second_machine_authority_journal() {
+        let source = include_str!("main.rs");
+        let raw_connector = concat!("configured_raw_broker_client_", "with_activation(");
+        let journal_attachment = concat!("attach_authority_", "journal");
+        let daemon_edge = concat!("daemon.machine_", "broker.as_ref()");
+        assert_eq!(
+            source.matches(raw_connector).count(),
+            2,
+            "the raw authority edge may only be defined and passed into daemon construction"
+        );
+        assert!(
+            !source.contains(journal_attachment),
+            "only bloom-daemon may attach the Machine journal to a Broker client"
+        );
+        assert!(
+            source.contains(daemon_edge),
+            "Machine command handlers must reuse the daemon-owned authority edge"
+        );
+        assert!(
+            source.contains("MachineCommand::TriadHealth { expected_build }"),
+            "installer health must traverse Machine IPC instead of opening the journal"
         );
     }
 

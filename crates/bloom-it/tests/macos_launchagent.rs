@@ -327,17 +327,22 @@ fn macos_permanent_uninstall_is_explicit_and_small() {
 #[test]
 fn activating_enrollment_is_accepted_during_forward_convergence() {
     let machine = fs::read_to_string(workspace().join("crates/bloom/src/main.rs")).unwrap();
+    let ipc = fs::read_to_string(workspace().join("crates/bloom-daemon/src/ipc.rs")).unwrap();
     assert!(machine.contains("allow_activating"));
     assert!(machine.contains("installed Bloom enrollment is not active"));
-    for required in [
+    assert!(machine.contains("installed_macos_triad_paths_with_activation(true)"));
+    assert!(machine.contains("MachineCommand::TriadHealth { expected_build }"));
+    assert!(machine.contains("daemon.machine_broker.as_ref()"));
+    assert!(ipc.contains("TriadHealth"));
+    for forbidden in [
         "open_configured_machine_audit_with_activation",
         "configured_machine_checkpoint_path_with_activation",
         "configured_authority_edge_history_path_with_activation",
         "configured_machine_audit_history_path_with_activation",
     ] {
         assert!(
-            machine.contains(required),
-            "activation health does not carry its narrow enrollment allowance through {required}"
+            !machine.contains(forbidden),
+            "activation health must not create a second Machine journal owner through {forbidden}"
         );
     }
     let sentinel =
