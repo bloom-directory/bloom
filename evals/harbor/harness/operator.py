@@ -529,8 +529,10 @@ class PolicyLifecycle:
             operation_id = matches[0]
             self._persist_pending(operation_id, expected_digest)
         elif operation_id not in matches:
-            # A previously successful cancellation is the only safe reason for
-            # the stored operation to have left the pending lifecycle folder.
+            # A terminal cancellation is safe because it never installed the
+            # authority. A confirmed operation is also safe to restore over:
+            # its ceremony has already been consumed, so it cannot later
+            # broaden authority again after the deny policy is committed.
             try:
                 failed = self.definition._read_json(
                     self.definition.wallet_root
@@ -539,12 +541,29 @@ class PolicyLifecycle:
                     / "status.json",
                     timeout=2,
                 )
-            except EvalError as error:
+            except (EvalError, OSError):
+                failed = None
+            if isinstance(failed, dict) and failed.get("ceremony_state") == "CANCELLED":
+                return
+            try:
+                confirmed = self.definition._read_json(
+                    self.definition.wallet_root
+                    / "policy-updates/confirmed"
+                    / operation_id
+                    / "status.json",
+                    timeout=2,
+                )
+            except (EvalError, OSError) as error:
                 raise EvalError(
-                    "stored policy-update operation is not cancellably pending"
+                    "stored policy-update operation is neither pending nor terminal"
                 ) from error
-            if not isinstance(failed, dict) or failed.get("ceremony_state") != "CANCELLED":
-                raise EvalError("stored policy-update operation was not cancelled")
+            if (
+                not isinstance(confirmed, dict)
+                or confirmed.get("action_id") != operation_id
+                or confirmed.get("state") != "confirmed"
+                or confirmed.get("ceremony_state") != "SUCCEEDED"
+            ):
+                raise EvalError("stored confirmed policy-update projection is invalid")
             return
 
         cancel_path = (

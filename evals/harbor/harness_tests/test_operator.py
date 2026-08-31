@@ -416,6 +416,42 @@ class PolicyRecoveryTests(unittest.TestCase):
         self.assertTrue(self.store.backup_path.exists())
         self.assertIsNotNone(self.store.read()["pending_policy_recovery"])
 
+    def test_restore_accepts_consumed_confirmed_allow_operation(self) -> None:
+        backup = canonical_json(self.original)
+        target_digest = "a" * 64
+        operation_id = "policy-operation"
+        atomic_write(self.store.backup_path, backup + b"\n")
+        pending = self.store.read()
+        pending["pending_policy_recovery"] = {
+            "operation_id": operation_id,
+            "target_digest": target_digest,
+            "backup_digest": hashlib.sha256(backup).hexdigest(),
+        }
+        self.store.write(pending)
+        confirmed = (
+            self.definition.wallet_root
+            / "policy-updates/confirmed"
+            / operation_id
+        )
+        confirmed.mkdir(parents=True)
+        (confirmed / "status.json").write_text(
+            json.dumps(
+                {
+                    "action_id": operation_id,
+                    "state": "confirmed",
+                    "ceremony_state": "SUCCEEDED",
+                }
+            )
+        )
+        applied: list[bytes] = []
+        self.lifecycle.apply = mock.Mock(side_effect=applied.append)
+
+        self.lifecycle.restore()
+
+        self.assertEqual(applied, [backup])
+        self.assertFalse(self.store.backup_path.exists())
+        self.assertIsNone(self.store.read()["pending_policy_recovery"])
+
     def test_restore_rejects_backup_that_does_not_match_bound_digest(self) -> None:
         atomic_write(self.store.backup_path, canonical_json(self.original) + b"\n")
         pending = self.store.read()
