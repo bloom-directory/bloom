@@ -502,7 +502,7 @@ Useful public diagnostics include:
 
 ```sh
 bloom vfs cat /status/daemon.json
-bloom vfs cat /status/chains/<chain>/status.json
+bloom vfs cat /status/chains/<chain>/connected
 bloom vfs cat /status/outbox/pending_count
 bloom vfs cat /status/backends/summary.json
 bloom vfs cat /wallets/<wallet>/accounts.json
