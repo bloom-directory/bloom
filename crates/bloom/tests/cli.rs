@@ -788,17 +788,25 @@ fn spawn_bloom_serve(home: &Path) -> std::process::Child {
         .env("RUST_LOG", "error")
         .arg("serve")
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
         .spawn()
         .expect("spawn bloom serve");
     let socket = bloom_daemon::ipc::default_socket_path(home);
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     while !ipc_endpoint_accepting(&socket) {
-        assert!(
-            child.try_wait().unwrap().is_none(),
-            "bloom serve exited before binding {}",
-            socket.display()
-        );
+        if child.try_wait().unwrap().is_some() {
+            let mut stderr = String::new();
+            child
+                .stderr
+                .take()
+                .unwrap()
+                .read_to_string(&mut stderr)
+                .unwrap();
+            panic!(
+                "bloom serve exited before binding {}: {stderr}",
+                socket.display()
+            );
+        }
         assert!(
             std::time::Instant::now() < deadline,
             "bloom serve did not bind {}",
@@ -1654,6 +1662,24 @@ fn ipc_socket_flag_beats_rpc_endpoint_env() {
             predicate::str::contains(flag_socket.display().to_string())
                 .and(predicate::str::contains(env_socket.display().to_string()).not()),
         );
+}
+
+#[test]
+fn serve_remains_available_with_unavailable_defaults_on_repeated_starts() {
+    let home = fresh_home();
+    let home_dir = bloom_proto::HomeDir::at(home.path());
+    home_dir.ensure().unwrap();
+    let mut config = bloom_proto::Config::local_default();
+    config.petals.preinstalled = vec!["enso".into(), "gasless".into()];
+    config.save(&home_dir.config_path()).unwrap();
+    for _ in 0..2 {
+        let daemon = spawn_bloom_serve(home.path());
+        bloom_cmd(home.path())
+            .args(["ipc", "call", "version"])
+            .assert()
+            .success();
+        stop_bloom_serve(home.path(), daemon);
+    }
 }
 
 #[test]

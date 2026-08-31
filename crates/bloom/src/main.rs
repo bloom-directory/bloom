@@ -10,6 +10,7 @@ mod commands {
     pub mod qr;
 }
 mod github_source;
+mod petal_provisioning;
 mod pf_monitor;
 mod session_sentinel;
 mod triad_enrollment;
@@ -3418,8 +3419,6 @@ async fn run(cli: Cli) -> Result<()> {
                 mount = Some(login_mount);
             }
             let (_home_permit, d) = build_write_daemon(home.clone())?;
-            github_source::ensure_preinstalled_petals(&home, &d)
-                .context("provision configured pre-installed Petals before serving")?;
             let mount_handle =
                 mount_bloom(&d, mount.as_deref(), mount_nfs_listen, mount_from_fstab).await?;
             let chains: Vec<String> = d.chains.list_names();
@@ -3480,8 +3479,21 @@ async fn run(cli: Cli) -> Result<()> {
                 .with_machine_commands(Arc::new(DaemonMachineCommands {
                     home: home.clone(),
                     daemon: d.clone(),
-                }))
-                .with_ready_callback(Arc::new(emit_machine_ready));
+                }));
+            let provisioning_context = server.petal_operation_context();
+            let provisioning = Arc::new(std::sync::Mutex::new(None));
+            let ready_provisioning = provisioning.clone();
+            let ready_context = provisioning_context.clone();
+            let ready_daemon = d.clone();
+            let server = server.with_ready_callback(Arc::new(move || {
+                emit_machine_ready();
+                let daemon = ready_daemon.clone();
+                let context = ready_context.clone();
+                *ready_provisioning.lock().expect("provisioning handle") =
+                    Some(tokio::task::spawn_blocking(move || {
+                        petal_provisioning::provision(&daemon, &context)
+                    }));
+            }));
             // Start audited and durable background effects only after every
             // fallible serve setup step has succeeded. The handle is shut
             // down and awaited before the runtime can return.
@@ -3518,6 +3530,13 @@ async fn run(cli: Cli) -> Result<()> {
                 .await
                 .context("ipc serve");
             shutdown.abort();
+            provisioning_context.cancel();
+            let provisioning_task = provisioning.lock().expect("provisioning handle").take();
+            if let Some(task) = provisioning_task {
+                if let Err(error) = task.await {
+                    warn!(%error, "petal.provisioning_worker_failed");
+                }
+            }
             // Stop the outbox expiry sweeper (fix #3) and any other
             // daemon-owned workers (watch executor, etc., fix #6).
             let unmount_result = async {

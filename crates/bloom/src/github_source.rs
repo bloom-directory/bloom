@@ -404,21 +404,14 @@ fn install_github_source_with_expectation(
             "Installing Petal package...".to_owned(),
         )?;
         ensure_source_install_connected(context)?;
-        let (result, meta, index) = daemon
-            .petals
-            .store()
-            .install_prepared_petal_package_with_source_guarded(
+        let detached = bloom_daemon::ipc::IpcOperationContext::detached();
+        let (result, meta, index) = context
+            .unwrap_or(&detached)
+            .commit_petal_package(
+                daemon.petals.store(),
                 package,
                 Some(provenance.clone()),
-                || {
-                    if context.is_some_and(|context| context.is_cancelled()) {
-                        Err(bloom_petals::PetalError::vm(
-                            "Petal source install cancelled by disconnected client",
-                        ))
-                    } else {
-                        Ok(())
-                    }
-                },
+                None,
             )
             .context("install generated Petal package")?;
         Ok((result, meta, index, consent, provenance))
@@ -452,7 +445,7 @@ fn install_github_source_with_expectation(
 /// replaces a Petal it can prove it installed itself from the same trusted
 /// catalog repository.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum PreinstalledState {
+pub(crate) enum PreinstalledState {
     /// The installed owner is exactly the pinned commit and package hash.
     Current,
     /// Same Petal name, same trusted catalog repository, older pinned commit.
@@ -561,6 +554,50 @@ fn install_prebuilt_release_petal(
     daemon: &Daemon,
     entry: &PreinstalledPetal,
 ) -> Result<GitHubInstallOutput> {
+    let context = bloom_daemon::ipc::IpcOperationContext::detached();
+    prepare_prebuilt_release_petal(daemon, entry, &context)?.commit(daemon, &context, None)
+}
+
+pub(crate) struct PreparedReleasePetal {
+    package: PreparedPetalPackage,
+    consent: PetalConsentSummary,
+    provenance: PetalSourceProvenance,
+}
+
+impl PreparedReleasePetal {
+    pub(crate) fn commit(
+        self,
+        daemon: &Daemon,
+        context: &bloom_daemon::ipc::IpcOperationContext,
+        expected_owner: Option<Option<String>>,
+    ) -> Result<GitHubInstallOutput> {
+        let (result, meta, index) = context
+            .commit_petal_package(
+                daemon.petals.store(),
+                self.package,
+                Some(self.provenance.clone()),
+                expected_owner,
+            )
+            .context("install pre-built Petal package")?;
+        Ok(GitHubInstallOutput {
+            result,
+            meta,
+            index,
+            consent: self.consent,
+            provenance: self.provenance,
+            progress: Vec::new(),
+            build_stdout: Vec::new(),
+            build_stderr: Vec::new(),
+            completion_progress: Vec::new(),
+        })
+    }
+}
+
+pub(crate) fn prepare_prebuilt_release_petal(
+    daemon: &Daemon,
+    entry: &PreinstalledPetal,
+    context: &bloom_daemon::ipc::IpcOperationContext,
+) -> Result<PreparedReleasePetal> {
     let repo = parse_github_install_url(entry.repository)?
         .ok_or_else(|| anyhow!("built-in Petal repository is not a GitHub source URL"))?;
     let release_base = format!(
@@ -573,6 +610,7 @@ fn install_prebuilt_release_petal(
     curl_download(
         &format!("{release_base}/petal-release.json"),
         manifest_file.path(),
+        context,
     )?;
     let manifest: PetalReleaseManifest = serde_json::from_reader(
         std::fs::File::open(manifest_file.path()).context("open Petal release manifest")?,
@@ -582,10 +620,14 @@ fn install_prebuilt_release_petal(
 
     let url = format!("{release_base}/{}", entry.archive);
     let archive = tempfile::NamedTempFile::new().context("create pre-installed Petal download")?;
-    curl_download(&url, archive.path())?;
+    curl_download(&url, archive.path(), context)?;
 
     let checksums = tempfile::NamedTempFile::new().context("create release checksum download")?;
-    curl_download(&format!("{release_base}/SHA256SUMS"), checksums.path())?;
+    curl_download(
+        &format!("{release_base}/SHA256SUMS"),
+        checksums.path(),
+        context,
+    )?;
     let archive_sha = verify_release_checksum(archive.path(), entry.archive, checksums.path())?;
     if !archive_sha.eq_ignore_ascii_case(&manifest.archive_sha256) {
         bail!(
@@ -593,24 +635,94 @@ fn install_prebuilt_release_petal(
             entry.archive
         );
     }
-    install_prebuilt_petal_archive(daemon, entry, &manifest, archive.path())
+    prepare_prebuilt_petal_archive(daemon, entry, &manifest, archive.path())
 }
 
-fn curl_download(url: &str, output: &Path) -> Result<()> {
-    match Command::new("curl")
-        .args(["--fail", "--silent", "--show-error", "--location"])
+fn curl_download(
+    url: &str,
+    output: &Path,
+    context: &bloom_daemon::ipc::IpcOperationContext,
+) -> Result<()> {
+    let mut command = Command::new("curl");
+    command
+        .args([
+            "--fail",
+            "--silent",
+            "--show-error",
+            "--location",
+            "--connect-timeout",
+            "10",
+            "--max-time",
+            "120",
+        ])
         .arg(url)
         .arg("--output")
-        .arg(output)
-        .status()
-    {
-        Ok(status) if status.success() => Ok(()),
-        Ok(status) => bail!("download {url} with curl failed with status {status}"),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            bail!("curl is required to install pre-installed Petal releases")
-        }
-        Err(error) => Err(error).context("launch curl for pre-installed Petal archive"),
+        .arg(output);
+    let result = run_bounded_command(
+        &mut command,
+        Some(context),
+        std::time::Duration::from_secs(125),
+    )
+    .context("download pre-installed Petal release with curl")?;
+    if !result.status.success() {
+        bail!(
+            "download {url} with curl failed: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
     }
+    Ok(())
+}
+
+/// File-backed capture avoids pipe deadlocks while allowing cancellation and
+/// a finite deadline, including for noninteractive Git network operations.
+fn run_bounded_command(
+    command: &mut Command,
+    context: Option<&bloom_daemon::ipc::IpcOperationContext>,
+    timeout: std::time::Duration,
+) -> Result<std::process::Output> {
+    ensure_source_install_connected(context)?;
+    let stdout = tempfile::tempfile()?;
+    let stderr = tempfile::tempfile()?;
+    command
+        .stdin(Stdio::null())
+        .stdout(stdout.try_clone()?)
+        .stderr(stderr.try_clone()?);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        command.process_group(0);
+    }
+    let mut child = command.spawn().context("spawn acquisition command")?;
+    let deadline = std::time::Instant::now() + timeout;
+    let status = loop {
+        if context.is_some_and(|context| context.is_cancelled())
+            || std::time::Instant::now() >= deadline
+        {
+            #[cfg(unix)]
+            if let Some(pid) = rustix::process::Pid::from_raw(child.id() as i32) {
+                let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!("Petal acquisition cancelled or timed out");
+        }
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    use std::io::{Seek, SeekFrom};
+    let read_output = |mut file: std::fs::File| -> Result<Vec<u8>> {
+        file.seek(SeekFrom::Start(0))?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        Ok(bytes)
+    };
+    Ok(std::process::Output {
+        status,
+        stdout: read_output(stdout)?,
+        stderr: read_output(stderr)?,
+    })
 }
 
 fn verify_release_checksum(archive: &Path, name: &str, checksums: &Path) -> Result<String> {
@@ -694,12 +806,26 @@ fn validate_release_manifest(
     Ok(())
 }
 
+#[cfg(test)]
 fn install_prebuilt_petal_archive(
     daemon: &Daemon,
     entry: &PreinstalledPetal,
     release: &PetalReleaseManifest,
     archive: &Path,
 ) -> Result<GitHubInstallOutput> {
+    prepare_prebuilt_petal_archive(daemon, entry, release, archive)?.commit(
+        daemon,
+        &bloom_daemon::ipc::IpcOperationContext::detached(),
+        None,
+    )
+}
+
+fn prepare_prebuilt_petal_archive(
+    daemon: &Daemon,
+    entry: &PreinstalledPetal,
+    release: &PetalReleaseManifest,
+    archive: &Path,
+) -> Result<PreparedReleasePetal> {
     let file = std::fs::File::open(archive)
         .with_context(|| format!("open pre-installed Petal archive {}", archive.display()))?;
     let package = PreparedPetalPackage::from_reader(GzDecoder::new(file))
@@ -754,26 +880,14 @@ fn install_prebuilt_petal_archive(
         selected_tag: Some(entry.release_tag.to_string()),
         package_hash: package.hash.clone(),
     };
-    let (result, meta, index) = daemon
-        .petals
-        .store()
-        .install_prepared_petal_package_with_source(package, Some(provenance.clone()))
-        .context("install pre-built Petal package")?;
-
-    Ok(GitHubInstallOutput {
-        result,
-        meta,
-        index,
+    Ok(PreparedReleasePetal {
+        package,
         consent,
         provenance,
-        progress: Vec::new(),
-        build_stdout: Vec::new(),
-        build_stderr: Vec::new(),
-        completion_progress: Vec::new(),
     })
 }
 
-fn preinstalled_petal(name: &str) -> Option<&'static PreinstalledPetal> {
+pub(crate) fn preinstalled_petal(name: &str) -> Option<&'static PreinstalledPetal> {
     match name {
         "near-intents" => Some(&PREINSTALLED_NEAR_INTENTS),
         "enso" => Some(&PREINSTALLED_ENSO),
@@ -791,7 +905,7 @@ fn preinstalled_petal(name: &str) -> Option<&'static PreinstalledPetal> {
 /// repository at a different commit. Every other shape — missing provenance, a
 /// different repository, or an identity that contradicts itself — is refused so
 /// that manually sourced or untrusted ownership is never overwritten.
-fn classify_existing_preinstalled(
+pub(crate) fn classify_existing_preinstalled(
     expected: &PreinstalledPetal,
     meta: &bloom_petals::meta::PetalMeta,
 ) -> Result<PreinstalledState> {
@@ -1146,8 +1260,11 @@ fn run_source_build_streaming(
             bloom_daemon::ipc::IpcOutputStream::Stderr,
         )
     });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
     let status = loop {
-        if context.is_some_and(|context| context.is_cancelled()) {
+        if context.is_some_and(|context| context.is_cancelled())
+            || std::time::Instant::now() >= deadline
+        {
             #[cfg(unix)]
             if let Some(pid) = rustix::process::Pid::from_raw(child.id() as i32) {
                 let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
@@ -1157,7 +1274,7 @@ fn run_source_build_streaming(
             let _ = child.wait();
             let _ = join_captured_stream(stdout_reader, "stdout");
             let _ = join_captured_stream(stderr_reader, "stderr");
-            bail!("Petal source build cancelled by disconnected client");
+            bail!("Petal source build cancelled or timed out");
         }
         if let Some(status) = child
             .try_wait()
@@ -1329,7 +1446,8 @@ fn git_output(cwd: Option<&Path>, args: &[&str]) -> Result<std::process::Output>
         command.current_dir(cwd);
     }
     command.args(args);
-    command.output().context("spawn git")
+    command.env("GIT_TERMINAL_PROMPT", "0");
+    run_bounded_command(&mut command, None, std::time::Duration::from_secs(120))
 }
 
 #[cfg(test)]
@@ -1721,6 +1839,191 @@ mod tests {
         assert_eq!(ready, vec!["near-intents".to_string()]);
         assert_eq!(installed_owner(&serve_daemon).as_deref(), Some(new_hash));
         drop(home);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn background_acquisition_keeps_ipc_readable_and_cannot_overwrite_manual_install() {
+        use crate::petal_provisioning::{ProvisioningOutcome, provision_with};
+        use bloom_daemon::ipc::{IpcClient, IpcServer};
+        let old = build_near_release("old");
+        let pending = build_near_release("pending");
+        let manual = build_near_release("manual");
+        let (_home, _, daemon) =
+            near_home_with_installed(&old.package, NEAR_REPO, NEAR_OLD_COMMIT, None);
+        let entry = near_catalog_entry(NEAR_NEW_COMMIT, "v0.1.1", "near.tar.gz", None);
+        let server =
+            IpcServer::new(daemon.vfs.clone(), "test", vec![]).with_petals(daemon.petals.clone());
+        let context = server.petal_operation_context();
+        let socket_dir = tempfile::tempdir().unwrap();
+        let socket = socket_dir.path().join("run/bloom.sock");
+        let serving_socket = socket.clone();
+        let serving = server.clone();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let ready_tx = std::sync::Mutex::new(Some(ready_tx));
+        let serving = serving.with_ready_callback(std::sync::Arc::new(move || {
+            ready_tx.lock().unwrap().take().unwrap().send(()).unwrap();
+        }));
+        let server_task =
+            tokio::spawn(async move { serving.serve(&serving_socket).await.unwrap() });
+        ready_rx.await.unwrap();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let started_tx = std::sync::Mutex::new(Some(started_tx));
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let provisioning_daemon = daemon.clone();
+        let worker = tokio::task::spawn_blocking(move || {
+            provision_with(
+                &provisioning_daemon,
+                &context,
+                |_| Some(entry),
+                |daemon, entry, _| {
+                    started_tx.lock().unwrap().take().unwrap().send(()).unwrap();
+                    release_rx
+                        .recv_timeout(std::time::Duration::from_secs(10))
+                        .unwrap();
+                    prepare_prebuilt_petal_archive(
+                        daemon,
+                        entry,
+                        &near_release_manifest(entry, &pending.package.hash),
+                        pending.archive.path(),
+                    )
+                },
+            )
+        });
+        started_rx.await.unwrap();
+        let client = IpcClient::new(&socket);
+        let version = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            client.call("version", serde_json::Value::Null),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(version, "test");
+        let body = daemon
+            .vfs
+            .read(&VfsPath::parse("/petals/near-intents/hello.txt").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(body, b"component");
+        let manual_tar = tempfile::NamedTempFile::new().unwrap();
+        manual
+            .package
+            .write_petal_tar(manual_tar.reopen().unwrap())
+            .unwrap();
+        let installed = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            client.call(
+                "petals.install",
+                serde_json::json!({"path": manual_tar.path()}),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(installed["hash"], manual.package.hash);
+        release_tx.send(()).unwrap();
+        let results = worker.await.unwrap();
+        assert!(
+            matches!(&results[0].outcome, ProvisioningOutcome::Failed(message) if message.contains("owner changed")),
+            "{results:?}"
+        );
+        assert_eq!(
+            installed_owner(&daemon).as_deref(),
+            Some(manual.package.hash.as_str())
+        );
+        server.trigger_shutdown();
+        tokio::time::timeout(std::time::Duration::from_secs(2), server_task)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[test]
+    fn provisioning_attempts_each_entry_once_and_retries_only_on_next_pass() {
+        use crate::petal_provisioning::{ProvisioningOutcome, provision_with};
+        let old = build_near_release("old");
+        let next = build_near_release("new");
+        let (_home, _, mut daemon) =
+            near_home_with_installed(&old.package, NEAR_REPO, NEAR_OLD_COMMIT, None);
+        daemon.config.petals.preinstalled = vec!["offline".into(), "near-intents".into()];
+        let entry = near_catalog_entry(NEAR_NEW_COMMIT, "v0.1.1", "near.tar.gz", None);
+        let context = bloom_daemon::ipc::IpcOperationContext::detached();
+        let calls = std::cell::Cell::new(0);
+        let results = provision_with(
+            &daemon,
+            &context,
+            |name| {
+                Some(PreinstalledPetal {
+                    name: if name == "offline" {
+                        "offline"
+                    } else {
+                        "near-intents"
+                    },
+                    ..entry
+                })
+            },
+            |daemon, entry, _| {
+                calls.set(calls.get() + 1);
+                if entry.name == "offline" {
+                    bail!("offline fixture");
+                }
+                prepare_prebuilt_petal_archive(
+                    daemon,
+                    entry,
+                    &near_release_manifest(entry, &next.package.hash),
+                    next.archive.path(),
+                )
+            },
+        );
+        assert_eq!(calls.get(), 2);
+        assert!(
+            matches!(&results[0].outcome, ProvisioningOutcome::Failed(message) if message.contains("offline"))
+        );
+        assert_eq!(results[1].outcome, ProvisioningOutcome::Installed);
+        daemon.config.petals.preinstalled = vec!["near-intents".into()];
+        let results = provision_with(
+            &daemon,
+            &context,
+            |_| Some(entry),
+            |_, _, _| panic!("current package must not be acquired again"),
+        );
+        assert_eq!(results[0].outcome, ProvisioningOutcome::Current);
+    }
+
+    #[tokio::test]
+    async fn acquisition_command_cancels_and_times_out_without_waiting_for_child() {
+        let context = bloom_daemon::ipc::IpcOperationContext::detached();
+        let cancellation = context.clone();
+        let child = tokio::task::spawn_blocking(move || {
+            run_bounded_command(
+                Command::new("sh").args(["-c", "sleep 30"]),
+                Some(&context),
+                std::time::Duration::from_secs(60),
+            )
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        cancellation.cancel();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(2), child)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_err()
+        );
+        let timed_out = tokio::task::spawn_blocking(|| {
+            run_bounded_command(
+                Command::new("sh").args(["-c", "sleep 30"]),
+                None,
+                std::time::Duration::from_millis(30),
+            )
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(2), timed_out)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_err()
+        );
     }
 
     #[test]

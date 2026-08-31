@@ -40,6 +40,13 @@ pub struct PetalStore {
     base: PathBuf,
 }
 
+/// Verified package materialized privately before taking the install mutation lock.
+/// Dropping it before commit removes the staging directory.
+pub struct StagedPetalPackage {
+    package: PreparedPetalPackage,
+    directory: tempfile::TempDir,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InstallResult {
     pub hash: String,
@@ -100,10 +107,6 @@ impl PetalStore {
     pub fn package_path(&self, hash: &str) -> Result<PathBuf, PetalError> {
         validate_hash_arg(hash)?;
         Ok(self.package_path_unchecked(hash))
-    }
-
-    fn package_tmp_path(&self, hash: &str) -> PathBuf {
-        self.base.join(PACKAGES).join(format!(".{hash}.tmp"))
     }
 
     fn owner_path(&self, name: &str) -> PathBuf {
@@ -219,9 +222,48 @@ impl PetalStore {
     where
         F: Fn() -> Result<(), PetalError>,
     {
+        let staged = self.stage_petal_package(package)?;
+        self.install_staged_petal_package_with_source_guarded(staged, source, commit_guard)
+    }
+
+    pub fn stage_petal_package(
+        &self,
+        package: PreparedPetalPackage,
+    ) -> Result<StagedPetalPackage, PetalError> {
         verify_prepared_package(&package)?;
+        validate_hash_arg(&package.hash)?;
+        let directory = tempfile::Builder::new()
+            .prefix(".install-")
+            .tempdir_in(self.base.join(PACKAGES))?;
+        let tmp = directory.path();
+        std::fs::create_dir_all(tmp.join(SOURCE))?;
+        std::fs::create_dir_all(tmp.join(ARTIFACTS_ROUTES))?;
+        for file in &package.files {
+            write_package_file(&tmp.join(SOURCE), &file.path, &file.bytes)?;
+        }
+        for route in &package.route_index.routes {
+            let artifact = checked_route_artifact_bytes(&package, route)?;
+            write_package_file(tmp, &route.artifact_path, &artifact)?;
+        }
+        atomic_write(
+            &tmp.join(ROUTE_INDEX),
+            &serde_json::to_vec_pretty(&package.route_index)?,
+        )?;
+        Ok(StagedPetalPackage { package, directory })
+    }
+
+    /// Caller serializes this short store selection with other Petal mutations.
+    pub fn install_staged_petal_package_with_source_guarded<F>(
+        &self,
+        staged: StagedPetalPackage,
+        source: Option<PetalSourceProvenance>,
+        commit_guard: F,
+    ) -> Result<(InstallResult, PetalMeta, RouteIndex), PetalError>
+    where
+        F: Fn() -> Result<(), PetalError>,
+    {
+        let StagedPetalPackage { package, directory } = staged;
         let hash = package.hash.clone();
-        validate_hash_arg(&hash)?;
         let package_path = self.package_path_unchecked(&hash);
         let already_present = package_path.exists();
         let size = package
@@ -229,7 +271,7 @@ impl PetalStore {
             .iter()
             .map(|file| file.bytes.len() as u64)
             .sum();
-
+        commit_guard()?;
         let existing_meta = match self.load_meta(&hash) {
             Ok(existing) => {
                 if existing.mode != PetalMode::Local {
@@ -244,24 +286,7 @@ impl PetalStore {
         };
 
         if !already_present {
-            let tmp = self.package_tmp_path(&hash);
-            match std::fs::remove_dir_all(&tmp) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(PetalError::Io(e)),
-            }
-            std::fs::create_dir_all(tmp.join(SOURCE))?;
-            std::fs::create_dir_all(tmp.join(ARTIFACTS_ROUTES))?;
-            for file in &package.files {
-                write_package_file(&tmp.join(SOURCE), &file.path, &file.bytes)?;
-            }
-            for route in &package.route_index.routes {
-                let artifact = checked_route_artifact_bytes(&package, route)?;
-                write_package_file(&tmp, &route.artifact_path, &artifact)?;
-            }
-            let index_bytes = serde_json::to_vec_pretty(&package.route_index)?;
-            atomic_write(&tmp.join(ROUTE_INDEX), &index_bytes)?;
-            std::fs::rename(&tmp, &package_path)?;
+            std::fs::rename(directory.path(), &package_path)?;
         } else {
             self.verify_existing_petal_package(&package)?;
         }

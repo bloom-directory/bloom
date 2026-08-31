@@ -450,7 +450,8 @@ pub trait BatchConfirmationService: Send + Sync {
 
 /// Narrow seam for trusted remote-source installs. Local package install,
 /// build, list, and uninstall stay implemented by the IPC server against its
-/// daemon-owned [`PetalRunner`].
+/// daemon-owned [`PetalRunner`]. Acquisition runs without the mutation lock;
+/// implementations commit through [`IpcOperationContext::commit_petal_package`].
 pub trait PetalSourceInstallService: Send + Sync {
     fn install_source(&self, params: Value, context: IpcOperationContext) -> Result<Value, String>;
 }
@@ -473,6 +474,7 @@ pub struct IpcOutputEvent {
 pub struct IpcOperationContext {
     output: Option<tokio::sync::mpsc::Sender<IpcOutputEvent>>,
     cancelled: Arc<AtomicBool>,
+    petal_mutation: Option<Arc<tokio::sync::Mutex<()>>>,
 }
 
 impl IpcOperationContext {
@@ -480,15 +482,68 @@ impl IpcOperationContext {
         Self {
             output: Some(output),
             cancelled: Arc::new(AtomicBool::new(false)),
+            petal_mutation: None,
         }
     }
 
-    #[cfg(test)]
-    fn detached() -> Self {
+    pub fn detached() -> Self {
         Self {
             output: None,
             cancelled: Arc::new(AtomicBool::new(false)),
+            petal_mutation: None,
         }
+    }
+
+    /// Common installation seam for local, source and background installs.
+    /// Verification/materialization is outside the mutation lock; cancellation
+    /// and the optional expected owner are checked again at the atomic commit.
+    pub fn commit_petal_package(
+        &self,
+        store: &bloom_petals::PetalStore,
+        package: bloom_petals::package::PreparedPetalPackage,
+        source: Option<bloom_petals::meta::PetalSourceProvenance>,
+        expected_owner: Option<Option<String>>,
+    ) -> Result<
+        (
+            bloom_petals::store::InstallResult,
+            bloom_petals::meta::PetalMeta,
+            bloom_petals::package::RouteIndex,
+        ),
+        PetalError,
+    > {
+        let name = package.name.clone();
+        let check = || {
+            if self.is_cancelled() {
+                return Err(PetalError::vm("Petal install cancelled"));
+            }
+            if let Some(expected) = &expected_owner
+                && &store.resolve_petal_owner(&name)? != expected
+            {
+                return Err(PetalError::vm(format!(
+                    "Petal {name} owner changed during acquisition; refusing stale install"
+                )));
+            }
+            Ok(())
+        };
+        if self.is_cancelled() {
+            return Err(PetalError::vm("Petal install cancelled"));
+        }
+        let staged = store.stage_petal_package(package)?;
+        let _mutation = if let Some(mutation) = &self.petal_mutation {
+            Some(loop {
+                if self.is_cancelled() {
+                    return Err(PetalError::vm("Petal install cancelled"));
+                }
+                if let Ok(guard) = mutation.try_lock() {
+                    break guard;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            })
+        } else {
+            None
+        };
+        check()?;
+        store.install_staged_petal_package_with_source_guarded(staged, source, check)
     }
 
     pub fn emit(&self, stream: IpcOutputStream, bytes: impl Into<Vec<u8>>) -> bool {
@@ -529,7 +584,7 @@ impl IpcOperationContext {
         self.cancelled.load(Ordering::Acquire)
     }
 
-    fn cancel(&self) {
+    pub fn cancel(&self) {
         self.cancelled.store(true, Ordering::Release);
     }
 }
@@ -710,6 +765,13 @@ impl IpcServer {
     ) -> Self {
         self.petal_source_installer = Some(installer);
         self
+    }
+
+    /// Detached, cancellable operation sharing the daemon's install commit lock.
+    pub fn petal_operation_context(&self) -> IpcOperationContext {
+        let mut context = IpcOperationContext::detached();
+        context.petal_mutation = Some(self.petal_mutation.clone());
+        context
     }
 
     pub fn with_batch_confirmation(mut self, service: Arc<dyn BatchConfirmationService>) -> Self {
@@ -1127,8 +1189,9 @@ impl IpcServer {
     async fn do_petals_install(
         &self,
         params: &Value,
-        context: IpcOperationContext,
+        mut context: IpcOperationContext,
     ) -> Result<Value, PetalError> {
+        context.petal_mutation = Some(self.petal_mutation.clone());
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
         struct InstallRequest {
@@ -1146,9 +1209,7 @@ impl IpcServer {
                 PetalError::vm("trusted remote Petal installs are not enabled on this daemon")
             })?;
             let params = json!({"path": request.path, "ref": request.requested_ref});
-            let mutation = self.petal_mutation.clone().lock_owned().await;
             return tokio::task::spawn_blocking(move || {
-                let _mutation = mutation;
                 if context.is_cancelled() {
                     return Err("Petal source install cancelled by disconnected client".to_owned());
                 }
@@ -1172,9 +1233,7 @@ impl IpcServer {
             return Err(PetalError::vm("local Petal install path must be absolute"));
         }
         let bindings_by_name = self.petal_runtime_endpoints.clone();
-        let mutation = self.petal_mutation.clone().lock_owned().await;
         tokio::task::spawn_blocking(move || {
-            let _mutation = mutation;
             if context.is_cancelled() {
                 return Err(PetalError::vm(
                     "Petal install cancelled by disconnected client",
@@ -1197,17 +1256,8 @@ impl IpcServer {
                     "Petal install cancelled by disconnected client",
                 ));
             }
-            let (result, meta, index) = runner
-                .store()
-                .install_prepared_petal_package_with_source_guarded(package, None, || {
-                    if context.is_cancelled() {
-                        Err(PetalError::vm(
-                            "Petal install cancelled by disconnected client",
-                        ))
-                    } else {
-                        Ok(())
-                    }
-                })?;
+            let (result, meta, index) =
+                context.commit_petal_package(runner.store(), package, None, None)?;
             Ok(json!({
                 "hash": result.hash,
                 "mode": "petal",
@@ -2231,8 +2281,9 @@ mod tests {
         fn install_source(
             &self,
             _params: Value,
-            _context: IpcOperationContext,
+            context: IpcOperationContext,
         ) -> Result<Value, String> {
+            let _mutation = context.petal_mutation.as_ref().unwrap().blocking_lock();
             let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
             self.max_active.fetch_max(active, Ordering::SeqCst);
             std::thread::sleep(std::time::Duration::from_millis(100));
@@ -3203,6 +3254,72 @@ summary = "Demo app used by IPC tests."
         assert!(second.error.is_none(), "{:?}", second.error);
         assert!(package.join("artifacts/routes/r000001.wasm").is_file());
         assert!(package.join("artifacts/build-manifest.json").is_file());
+    }
+
+    #[tokio::test]
+    async fn blocked_source_acquisition_does_not_block_reads_or_another_install() {
+        let dir = tempfile::tempdir().unwrap();
+        let package = dir.path().join("demo-package");
+        write_demo_petal_package(&package);
+        let store = bloom_petals::PetalStore::open(dir.path().join("store")).unwrap();
+        store.install_petal_package_dir(&package).unwrap();
+        let registry =
+            Arc::new(bloom_petals::NameRegistry::open(dir.path().join("registry")).unwrap());
+        let runner = PetalRunner::new(store, registry, bloom_petals::PetalVm::new().unwrap());
+        let installer = Arc::new(BlockingSourceInstaller {
+            started: AtomicBool::new(false),
+            cancelled: AtomicBool::new(false),
+            committed: AtomicBool::new(false),
+        });
+        let server = IpcServer::new(vfs(), "0", vec![])
+            .with_petals(runner.clone())
+            .with_petal_source_installer(installer.clone());
+        let context = IpcOperationContext::detached();
+        let remote = server.clone();
+        let remote_context = context.clone();
+        let blocked = tokio::spawn(async move {
+            remote
+                .do_petals_install(
+                    &json!({"path": "https://github.com/bloom-directory/blocked"}),
+                    remote_context,
+                )
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !installer.started.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            runner
+                .store()
+                .resolve_petal_owner("demo")
+                .unwrap()
+                .is_some()
+        );
+        let read = server
+            .dispatch(Request {
+                jsonrpc: "2.0".into(),
+                id: json!(1),
+                method: "read".into(),
+                params: json!({"path": "/stub/greet"}),
+            })
+            .await;
+        assert!(read.error.is_none());
+        let installed = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            server.do_petals_install(&json!({"path": package}), IpcOperationContext::detached()),
+        )
+        .await;
+        context.cancel();
+        assert!(blocked.await.unwrap().is_err());
+        assert!(
+            installed.is_ok(),
+            "blocked acquisition held the shared mutation lock"
+        );
+        assert!(installed.unwrap().is_ok());
     }
 
     #[tokio::test]
