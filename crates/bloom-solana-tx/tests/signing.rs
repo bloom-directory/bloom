@@ -8,7 +8,7 @@ use bloom_broker_api::{
     MachineBrokerResponse, MachineBrokerService, MachineSignRequest, NormalizedSignature,
     ProtocolError, ProtocolErrorCode, ProvenanceCatalog, ProvenanceOperationClass,
     ProvenanceRecord, ProvenanceSubject, SealedApprovalPrepareResponse, ServiceFuture,
-    SigningPayloads, SigningResult, Token, WalletPublic, WalletRequest,
+    SigningPayloads, SigningResult, Token, WalletAccountsPublic, WalletPublic, WalletRequest,
 };
 use bloom_machine_client::MachineBrokerClient;
 use bloom_solana_tx::message::{build_transfer_message, verify_signature};
@@ -68,6 +68,27 @@ impl SolanaBrokerFixture {
         }
     }
 
+    /// The fresh account projection selection resolves from: the fixture's
+    /// single active Solana child.
+    fn accounts(&self, wallet_id: bloom_broker_api::Token) -> WalletAccountsPublic {
+        WalletAccountsPublic {
+            wallet_id,
+            seed_profile: bloom_broker_api::WalletSeedProfile::Bip39MulticurveV1,
+            accounts: vec![bloom_broker_api::DerivedAccountPublic {
+                key_ref: self.child_key_ref.clone(),
+                wallet_seed_profile: bloom_broker_api::WalletSeedProfile::Bip39MulticurveV1,
+                derivation_profile: bloom_broker_api::DerivationProfile::Bip44SolanaSlip10Ed25519V1,
+                path: "m/44'/501'/0'/0'".into(),
+                canonical_public_key: Base64UrlBytes::from_bytes(&self.child_pubkey()),
+                public_key_encoding: bloom_broker_api::PublicKeyEncoding::Ed25519SpkiDer,
+                public_key_fingerprint: self.child_key_ref.public_key_fingerprint.clone(),
+                supported_crypto_suites: vec![CryptoSuite::Ed25519Message],
+                chain_projections: vec![],
+                lifecycle: bloom_broker_api::AccountLifecycleState::Active,
+            }],
+        }
+    }
+
     fn sign_payload(
         &self,
         request: &MachineSignRequest,
@@ -121,6 +142,9 @@ impl MachineBrokerService for SolanaBrokerFixture {
                     wallet.wallet_id = wallet_id;
                     Ok(MachineBrokerResponse::WalletGetPublic(wallet))
                 }
+                MachineBrokerRequest::WalletAccounts(WalletRequest { wallet_id }) => Ok(
+                    MachineBrokerResponse::WalletAccounts(self.accounts(wallet_id)),
+                ),
                 MachineBrokerRequest::KeyGetPublic(KeyRequest { key_ref }) => {
                     let mut returned = key_ref;
                     let role = if returned.locator.contains("derived") {
