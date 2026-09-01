@@ -19,7 +19,7 @@ use bloom_broker_api::{
     ProvenanceSubject,
 };
 #[cfg(feature = "triad-dev-harness")]
-use bloom_petals::package::PreparedPetalPackage;
+use bloom_petals::package::build_petal_package_dir;
 use ed25519_dalek::{Signer as _, SigningKey};
 use rand::{RngCore as _, rngs::OsRng};
 #[cfg(feature = "triad-dev-harness")]
@@ -230,8 +230,12 @@ fn enroll_developer_petal_provenance(
     }
     let installer_key_id = Token::new(identity.key_id)?;
 
-    let package = PreparedPetalPackage::from_dir(petal_dir)
-        .map_err(|error| anyhow::anyhow!("prepare developer Petal package: {error}"))?;
+    // The Petal's source build may have changed its generated route components
+    // since a previous developer run left ignored package artifacts behind.
+    // Refresh those artifacts before signing provenance so enrollment, install,
+    // and subsequent cold-start runs all bind the same package bytes.
+    let package = build_petal_package_dir(petal_dir)
+        .map_err(|error| anyhow::anyhow!("build developer Petal package: {error}"))?;
     let publisher = Token::new("bloom-developer-local-package")?;
     let package_hash = Digest32::new(package.hash.clone())?;
     let lineage_id = developer_petal_lineage_id(&publisher, &package.name);

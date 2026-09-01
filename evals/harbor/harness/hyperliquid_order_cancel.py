@@ -81,7 +81,13 @@ def session_key_slot(session_id: str) -> str:
 class HyperliquidOrderCancelEval(EvalDefinition):
     name = "hyperliquid-order-cancel"
 
-    def __init__(self, repo_root: Path, environ: dict[str, str] | None = None) -> None:
+    def __init__(
+        self,
+        repo_root: Path,
+        environ: dict[str, str] | None = None,
+        *,
+        counter_committed: Callable[[int], None] | None = None,
+    ) -> None:
         self.repo_root = repo_root.resolve()
         self.env = dict(os.environ if environ is None else environ)
         self.wallet = self.env.get("BLOOM_EVAL_WALLET", "")
@@ -96,7 +102,8 @@ class HyperliquidOrderCancelEval(EvalDefinition):
             "BLOOM_EVAL_PROVENANCE_CATALOG", ""
         )
         self.provenance_catalog = Path(self.provenance_catalog_value)
-        self.bloom_mount = Path(self.env.get("BLOOM_EVAL_BLOOM_MOUNT", "/bloom"))
+        self.bloom_mount_value = self.env.get("BLOOM_EVAL_BLOOM_MOUNT", "").strip()
+        self.bloom_mount = Path(self.bloom_mount_value)
         self.driver = Path(
             self.env.get(
                 "BLOOM_EVAL_DEBUG_DRIVER_BIN",
@@ -124,6 +131,8 @@ class HyperliquidOrderCancelEval(EvalDefinition):
         self.session_id: str | None = None
         self.session_base: Path | None = None
         self.session_created = False
+        self.counter_committed = counter_committed
+        self.phase_timings: dict[str, float] = {}
 
     @property
     def lock_path(self) -> Path:
@@ -249,7 +258,9 @@ class HyperliquidOrderCancelEval(EvalDefinition):
 
     def _pending_petal_key_ceremony(self) -> str | None:
         if self.session_id is None:
-            raise EvalError("session ID is unavailable while resolving Petal key ceremony")
+            raise EvalError(
+                "session ID is unavailable while resolving Petal key ceremony"
+            )
         root = self.bloom_mount / "petal-key-requests"
         try:
             names = sorted(os.listdir(root))
@@ -435,7 +446,9 @@ class HyperliquidOrderCancelEval(EvalDefinition):
         route = matches[0]
         route_id = route.get("route_id")
         metadata = route.get("install_metadata")
-        required_caps = metadata.get("required_caps") if isinstance(metadata, dict) else None
+        required_caps = (
+            metadata.get("required_caps") if isinstance(metadata, dict) else None
+        )
         delegated_classes = route.get("key_derive_operation_classes")
         if (
             not isinstance(route_id, str)
@@ -456,8 +469,12 @@ class HyperliquidOrderCancelEval(EvalDefinition):
 
         for candidate in routes:
             if not isinstance(candidate, dict):
-                raise EvalError("installed Hyperliquid route index contains a malformed route")
-            if candidate is not route and candidate.get("key_derive_operation_classes") not in (
+                raise EvalError(
+                    "installed Hyperliquid route index contains a malformed route"
+                )
+            if candidate is not route and candidate.get(
+                "key_derive_operation_classes"
+            ) not in (
                 None,
                 [],
             ):
@@ -735,12 +752,23 @@ class HyperliquidOrderCancelEval(EvalDefinition):
                 timeout=EVAL_IMAGE_PULL_TIMEOUT_SECONDS,
             )
         except (OSError, subprocess.SubprocessError) as error:
-            raise EvalError(f"could not pull pinned Harbor eval image: {error}") from error
+            raise EvalError(
+                f"could not pull pinned Harbor eval image: {error}"
+            ) from error
         if completed.returncode != 0:
             detail = (completed.stderr or completed.stdout).strip()
             raise EvalError(f"could not pull pinned Harbor eval image: {detail}")
 
+    def _require_bloom_mount_selection(self) -> None:
+        if not self.bloom_mount_value:
+            raise EvalError("BLOOM_EVAL_BLOOM_MOUNT is required for a full eval")
+
+    def _require_bloom_mount(self) -> None:
+        if not os.path.ismount(self.bloom_mount):
+            raise EvalError(f"Bloom is not mounted at {self.bloom_mount}")
+
     def preflight(self) -> None:
+        self._require_bloom_mount_selection()
         if not WALLET.fullmatch(self.wallet):
             raise EvalError("BLOOM_EVAL_WALLET must be a lowercase 0x address")
         if self.env.get("BLOOM_EVAL_MAINNET_ACK") != MAINNET_ACK:
@@ -781,8 +809,7 @@ class HyperliquidOrderCancelEval(EvalDefinition):
                 "debug driver lacks --authenticator-seed-file support; "
                 "build bloom-broker PR #1 or newer"
             )
-        if not os.path.ismount(self.bloom_mount):
-            raise EvalError(f"Bloom is not mounted at {self.bloom_mount}")
+        self._require_bloom_mount()
         for relative, label in (
             ("mids.json", "Hyperliquid mainnet Petal is not installed"),
             ("perp_meta.json", "Hyperliquid perpetual metadata route is missing"),
@@ -801,7 +828,9 @@ class HyperliquidOrderCancelEval(EvalDefinition):
         # Harbor otherwise discovers a missing image only after provision() has
         # created the bounded mainnet session and started its 30-minute clock.
         # Pulling the immutable digest here fails before any authority exists.
+        image_started = time.monotonic()
         self._pull_eval_image()
+        self.phase_timings["image_pull_seconds"] = time.monotonic() - image_started
         self._require_empty_wallet()
 
     def provision(self, agent_name: str) -> EvalRunContext:
@@ -870,7 +899,10 @@ class HyperliquidOrderCancelEval(EvalDefinition):
                         or self._pending_agent_approval_ceremony()
                     )
                 )
-                if ceremony_url is not None and ceremony_url not in completed_ceremonies:
+                if (
+                    ceremony_url is not None
+                    and ceremony_url not in completed_ceremonies
+                ):
                     break
                 ceremony_url = None
                 time.sleep(0.2)
@@ -884,6 +916,15 @@ class HyperliquidOrderCancelEval(EvalDefinition):
             # revision retried here on the theory that a freshly published
             # ceremony URL might not yet resolve; that theory was wrong, and the
             # retries turned one failure into three.
+            # Reserve the next counter durably before invoking the driver. The
+            # assertion may reach Broker even when the local process times out
+            # or is interrupted, so persistence after subprocess completion is
+            # too late to guarantee that this counter will never be reused.
+            attempted_counter = counter
+            counter = attempted_counter + 1
+            if self.counter_committed is not None:
+                self.counter_committed(counter)
+            self.next_sign_count = counter
             try:
                 completed = subprocess.run(
                     [
@@ -893,7 +934,7 @@ class HyperliquidOrderCancelEval(EvalDefinition):
                         "--authenticator-seed-file",
                         str(self.seed_file),
                         "--sign-count",
-                        str(counter),
+                        str(attempted_counter),
                     ],
                     check=False,
                     capture_output=True,
@@ -901,15 +942,14 @@ class HyperliquidOrderCancelEval(EvalDefinition):
                 )
             except (OSError, subprocess.SubprocessError) as error:
                 raise EvalError(
-                    "debug-driver ceremony completion failed: "
+                    f"debug-driver ceremony completion failed at sign count "
+                    f"{attempted_counter} (next unused counter is {counter}): "
                     + self._redact_ceremony_urls(str(error))
                 ) from error
             output += (completed.stdout + completed.stderr).decode(errors="replace")
-            counter += 1
-            self.next_sign_count = counter
             if completed.returncode != 0:
                 raise EvalError(
-                    f"session ceremony failed at sign count {counter - 1} "
+                    f"session ceremony failed at sign count {attempted_counter} "
                     f"(next unused counter is {counter}): "
                     + self._redact_ceremony_urls(output)
                 )
@@ -1039,6 +1079,7 @@ class HyperliquidOrderCancelEval(EvalDefinition):
                 failures.append("session cancel_all failed")
 
         try:
+
             def no_open_orders() -> bool:
                 orders = self._read_json(self.user_root / "open_orders.json")
                 return isinstance(orders, list) and not orders
@@ -1077,6 +1118,7 @@ class HyperliquidOrderCancelEval(EvalDefinition):
                 failures.append("session stop failed")
 
         try:
+
             def session_stopped() -> bool:
                 final_status = self._read_json(self.session_base / "status.json")
                 return (

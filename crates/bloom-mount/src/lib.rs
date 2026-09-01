@@ -170,7 +170,9 @@ pub fn detect_mount_command() -> &'static str {
 ///   without relying on `lookupcache=none`, which is rejected by some
 ///   minimal CI images.
 /// * **macOS** (`mount_nfs`): `actimeo=0` zeros the attribute-cache
-///   timeouts. The Linux-only `lookupcache=none`, `nocallback`, and
+///   timeouts. `sync` keeps short-lived command writers attached until the
+///   server has replied to their NFS writes. The Linux-only
+///   `lookupcache=none`, `nocallback`, and
 ///   `nonegnamecache` knobs are *not* recognised by macOS and would
 ///   cause the mount to be rejected. `nolocks` is NFSv2/v3-only per
 ///   `mount_nfs(8)` and triggers `EINVAL` on a v4 mount; NFSv4 has
@@ -200,7 +202,7 @@ fn build_mount_opts(port: u16) -> String {
 
 #[cfg(target_os = "macos")]
 fn build_mount_opts(port: u16) -> String {
-    format!("actimeo=0,vers=4.1,proto=tcp,port={port},rsize=65536,wsize=65536,timeo=10")
+    format!("actimeo=0,sync,vers=4.1,proto=tcp,port={port},rsize=65536,wsize=65536,timeo=10")
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -286,7 +288,7 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn build_mount_args_macos_uses_actimeo_only() {
+    fn build_mount_args_macos_uses_sync_and_portable_cache_options() {
         let cfg = MountConfig {
             mount_path: PathBuf::from("/tmp/bloom"),
             nfs_listen: "127.0.0.1:0".parse().unwrap(),
@@ -298,6 +300,10 @@ mod tests {
         assert!(
             joined.contains("actimeo=0"),
             "macos opts must include actimeo=0: {joined}"
+        );
+        assert!(
+            joined.contains("sync"),
+            "macos opts must make NFS writes synchronous: {joined}"
         );
         // Linux-only knobs that mount_nfs doesn't recognise.
         assert!(
