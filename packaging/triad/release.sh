@@ -122,7 +122,7 @@ smoke_linux_installer() {
   mkdir -p "$work/linux-root"
   "$payload/installer/release/install-linux.sh" \
     install "$work/linux-root" 1000 releaseuser "$payload"
-  [[ -x "$work/linux-root/usr/libexec/bloom/bloom-broker" ]] ||
+  [[ -x "$work/linux-root/usr/libexec/bloom/current/bloom-broker" ]] ||
     die "staged Linux installer did not install Broker"
   [[ -f "$work/linux-root/etc/bloom/1000/signer/config.json" ]] ||
     die "staged Linux installer did not install Signer configuration"

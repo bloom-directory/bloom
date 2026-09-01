@@ -16,13 +16,21 @@ action="$1"
 shift
 payload_scratch=""
 enrollment_scratch=""
+upgrade_transaction=""
+upgrade_rollback_required=false
 
 cleanup_scratch() {
+  status=$?
+  trap - EXIT
+  if [[ "$upgrade_rollback_required" == true ]]; then
+    rollback_linux_upgrade || status=$?
+  fi
   for scratch_path in "$payload_scratch" "$enrollment_scratch"; do
     if [[ -n "$scratch_path" && -d "$scratch_path" ]]; then
       find "$scratch_path" -depth -delete
     fi
   done
+  exit "$status"
 }
 trap cleanup_scratch EXIT
 
@@ -266,12 +274,114 @@ linux_nfs_port_is_listening() {
   return 1
 }
 
+write_linux_record() {
+  local record="$1" state="$2" uid="$3" user="$4" digest="$5" port="$6"
+  local replacement="${record}.new.$$"
+
+  printf '{"schema":"bloom.linux-enrollment.1","state":"%s","login_uid":%s,"login_user":"%s","release_digest":"%s","nfs_port":%s}\n' \
+    "$state" "$uid" "$user" "$digest" "$port" > "$replacement"
+  chmod 0644 "$replacement"
+  mv -f "$replacement" "$record"
+}
+
+rewrite_linux_fstab_port() {
+  local install_root="$1" uid="$2" port="$3"
+  local fstab="$install_root/etc/fstab" marker="x-bloom.login-uid=$uid"
+  local replacement
+
+  [[ -e "$fstab" ]] || return 0
+  [[ -f "$fstab" && ! -L "$fstab" ]] || {
+    echo "Linux fstab is substituted or not a regular file" >&2
+    return 65
+  }
+  replacement="${fstab}.new.$$"
+  awk -v marker="$marker" -v port="$port" '
+    {
+      if (length($0) >= length(marker) &&
+          substr($0, length($0) - length(marker) + 1) == marker) {
+        sub(/port=[0-9]+/, "port=" port)
+      }
+      print
+    }
+  ' "$fstab" > "$replacement"
+  preserve_file_mode "$fstab" "$replacement"
+  mv -f "$replacement" "$fstab"
+}
+
+migrate_legacy_linux_records() {
+  local install_root="$1" directory record uid state user digest port candidate
+  local other other_port used machine_environment
+
+  for directory in enrollments retained; do
+    for record in "$install_root/etc/bloom/$directory"/*.json; do
+      [[ -e "$record" || -L "$record" ]] || continue
+      [[ -f "$record" && ! -L "$record" ]] || {
+        echo "installed Linux enrollment record is unsafe" >&2
+        return 65
+      }
+      port="$(linux_record_number "$record" nfs_port)"
+      [[ -z "$port" ]] || continue
+      uid="$(linux_record_number "$record" login_uid)"
+      state="$(linux_record_string "$record" state)"
+      user="$(linux_record_string "$record" login_user)"
+      digest="$(linux_record_string "$record" release_digest)"
+      [[ "$(linux_record_string "$record" schema)" == bloom.linux-enrollment.1 && \
+        "$uid" =~ ^[1-9][0-9]*$ && "$user" =~ ^[a-z_][a-z0-9_-]*$ && \
+        "$digest" =~ ^[0-9a-f]{64}$ && \
+        ( "$state" == active || "$state" == retained ) ]] || {
+        echo "installed Linux enrollment record is malformed" >&2
+        return 65
+      }
+      port=""
+      for ((candidate = 20000; candidate <= 60999; candidate++)); do
+        used=false
+        for other in \
+          "$install_root/etc/bloom/enrollments"/*.json \
+          "$install_root/etc/bloom/retained"/*.json
+        do
+          [[ -f "$other" && ! -L "$other" ]] || continue
+          other_port="$(linux_record_number "$other" nfs_port)"
+          if [[ "$other_port" == "$candidate" ]]; then
+            used=true
+            break
+          fi
+        done
+        if [[ "$used" == false ]]; then
+          port="$candidate"
+          break
+        fi
+      done
+      [[ -n "$port" ]] || {
+        echo "no per-login Bloom NFS port is available" >&2
+        return 69
+      }
+      write_linux_record "$record" "$state" "$uid" "$user" "$digest" "$port"
+      rewrite_linux_fstab_port "$install_root" "$uid" "$port"
+      if [[ -d "$install_root/etc/bloom/$uid" && \
+        ! -L "$install_root/etc/bloom/$uid" ]]
+      then
+        machine_environment="$install_root/etc/bloom/$uid/.machine-env.source.$$"
+        printf 'BLOOM_NFS_LISTEN=127.0.0.1:%s\nBLOOM_RELEASE_DIGEST=%s\n' \
+          "$port" "$digest" > "$machine_environment"
+        atomic_install \
+          "$machine_environment" \
+          "$install_root/etc/bloom/$uid/machine.env" \
+          0644
+        rm -f -- "$machine_environment"
+      fi
+    done
+  done
+}
+
+validated_release_digest=""
+
 validate_linux_release_set() {
   local install_root="$1"
-  local candidate_digest="$2"
   local directory record filename_uid record_uid record_state record_digest record_port counterpart
   local principal service_config service_digest prior_uid owner
   local port_owners=""
+
+  validated_release_digest=""
 
   for directory in enrollments retained; do
     for record in "$install_root/etc/bloom/$directory"/*.json; do
@@ -317,8 +427,11 @@ validate_linux_release_set() {
         return 65
       }
       port_owners="$port_owners $record_port:$record_uid"
-      [[ "$record_digest" == "$candidate_digest" ]] || {
-        echo "Linux installation requires the exact release used by every enrollment" >&2
+      if [[ -z "$validated_release_digest" ]]; then
+        validated_release_digest="$record_digest"
+      fi
+      [[ "$record_digest" == "$validated_release_digest" ]] || {
+        echo "installed Linux enrollments use different releases" >&2
         return 65
       }
       for principal in broker signer; do
@@ -342,6 +455,267 @@ validate_linux_release_set() {
       }
     done
   done
+}
+
+replace_linux_json_digest() {
+  local config="$1" digest="$2" replacement
+  replacement="${config}.new.$$"
+
+  [[ -f "$config" && ! -L "$config" ]] || {
+    echo "installed Linux service configuration is missing or unsafe" >&2
+    return 65
+  }
+  awk -v digest="$digest" '
+    BEGIN { changed = 0 }
+    {
+      if ($0 ~ /"build_digest"[[:space:]]*:[[:space:]]*"[0-9a-f]+"/) {
+        sub(/"build_digest"[[:space:]]*:[[:space:]]*"[0-9a-f]+"/,
+            "\"build_digest\":\"" digest "\"")
+        changed++
+      }
+      print
+    }
+    END { if (changed != 1) exit 65 }
+  ' "$config" > "$replacement" || {
+    rm -f -- "$replacement"
+    echo "installed Linux service build digest cannot be updated" >&2
+    return 65
+  }
+  preserve_file_mode "$config" "$replacement"
+  chown --reference="$config" "$replacement" 2>/dev/null || true
+  mv -f "$replacement" "$config"
+}
+
+rewrite_linux_release_set() {
+  local install_root="$1" digest="$2" active_state="$3"
+  local directory record uid state user port principal machine_environment
+
+  for directory in enrollments retained; do
+    for record in "$install_root/etc/bloom/$directory"/*.json; do
+      [[ -f "$record" && ! -L "$record" ]] || continue
+      uid="$(linux_record_number "$record" login_uid)"
+      state="$(linux_record_string "$record" state)"
+      user="$(linux_record_string "$record" login_user)"
+      port="$(linux_record_number "$record" nfs_port)"
+      for principal in broker signer; do
+        replace_linux_json_digest \
+          "$install_root/etc/bloom/$uid/$principal/config.json" \
+          "$digest"
+      done
+      machine_environment="$install_root/etc/bloom/$uid/.machine-env.source.$$"
+      printf 'BLOOM_NFS_LISTEN=127.0.0.1:%s\nBLOOM_RELEASE_DIGEST=%s\n' \
+        "$port" "$digest" > "$machine_environment"
+      atomic_install \
+        "$machine_environment" \
+        "$install_root/etc/bloom/$uid/machine.env" \
+        0644
+      rm -f -- "$machine_environment"
+      if [[ "$directory" == enrollments ]]; then
+        state="$active_state"
+      else
+        state=retained
+      fi
+      write_linux_record "$record" "$state" "$uid" "$user" "$digest" "$port"
+    done
+  done
+}
+
+install_linux_release() {
+  local install_root="$1" payload="$2" digest="$3"
+  local release_base="$install_root/usr/libexec/bloom"
+  local release="$release_base/releases/$digest" stage binary
+
+  mkdir -p "$release_base/releases"
+  if [[ -e "$release" || -L "$release" ]]; then
+    [[ -d "$release" && ! -L "$release" ]] || {
+      echo "installed Linux release is unsafe" >&2
+      return 65
+    }
+    for binary in bloom bloom-broker bloom-signer bloom-signer-migrate; do
+      [[ -f "$release/$binary" && ! -L "$release/$binary" ]] && \
+        cmp -s "$payload/bin/$binary" "$release/$binary" || {
+          echo "installed Linux release does not match signed payload" >&2
+          return 65
+        }
+    done
+    return 0
+  fi
+  stage="$release_base/.release.$$.new"
+  mkdir "$stage"
+  for binary in bloom bloom-broker bloom-signer bloom-signer-migrate; do
+    install -m 0755 "$payload/bin/$binary" "$stage/$binary"
+  done
+  mv "$stage" "$release"
+}
+
+capture_legacy_linux_release() {
+  local install_root="$1" digest="$2"
+  local release_base="$install_root/usr/libexec/bloom"
+  local release="$release_base/releases/$digest" stage binary target
+
+  [[ -n "$digest" ]] || return 0
+  if [[ -e "$release_base/current" || -L "$release_base/current" ]]; then
+    [[ -L "$release_base/current" ]] || {
+      echo "installed Linux current release is unsafe" >&2
+      return 65
+    }
+    target="$(readlink "$release_base/current")"
+    [[ "$target" == "releases/$digest" && \
+      -d "$release_base/$target" && ! -L "$release_base/$target" ]] || {
+      echo "installed Linux current release is inconsistent" >&2
+      return 65
+    }
+    return 0
+  fi
+  [[ ! -e "$release" && ! -L "$release" ]] || return 0
+  stage="$release_base/.legacy.$$.new"
+  mkdir -p "$stage"
+  for binary in bloom bloom-broker bloom-signer bloom-signer-migrate; do
+    [[ -f "$release_base/$binary" && ! -L "$release_base/$binary" ]] || {
+      rm -rf -- "$stage"
+      echo "legacy Linux release is incomplete" >&2
+      return 65
+    }
+    install -m 0755 "$release_base/$binary" "$stage/$binary"
+  done
+  mkdir -p "$release_base/releases"
+  mv "$stage" "$release"
+}
+
+switch_linux_release() {
+  local install_root="$1" digest="$2"
+  local release_base="$install_root/usr/libexec/bloom"
+  local replacement="$release_base/current.new.$$"
+
+  [[ -d "$release_base/releases/$digest" && \
+    ! -L "$release_base/releases/$digest" ]] || {
+    echo "Linux release switch target is missing" >&2
+    return 65
+  }
+  ln -s "releases/$digest" "$replacement"
+  mv -fT "$replacement" "$release_base/current"
+}
+
+stop_linux_release_set() {
+  local install_root="$1" record uid user user_runtime
+  [[ "$install_root" == "/" ]] || return 0
+
+  for record in "$install_root/etc/bloom/enrollments"/*.json; do
+    [[ -f "$record" && ! -L "$record" ]] || continue
+    uid="$(linux_record_number "$record" login_uid)"
+    user="$(linux_record_string "$record" login_user)"
+    user_runtime="/run/user/$uid"
+    if [[ -S "$user_runtime/bus" ]]; then
+      runuser -u "$user" -- env \
+        XDG_RUNTIME_DIR="$user_runtime" \
+        DBUS_SESSION_BUS_ADDRESS="unix:path=$user_runtime/bus" \
+        systemctl --user stop bloom-machine.service bloom-session.service \
+        2>/dev/null || true
+    fi
+    systemctl stop "bloom-session@$uid.path" 2>/dev/null || true
+    systemctl stop "bloom-broker-ceremony@$uid.socket" 2>/dev/null || true
+    systemctl stop "bloom-broker@$uid.service"
+    systemctl stop "bloom-signer@$uid.service"
+  done
+}
+
+start_linux_release_set() {
+  local install_root="$1" record uid user user_runtime
+  [[ "$install_root" == "/" ]] || return 0
+
+  systemctl daemon-reload
+  for record in "$install_root/etc/bloom/enrollments"/*.json; do
+    [[ -f "$record" && ! -L "$record" ]] || continue
+    uid="$(linux_record_number "$record" login_uid)"
+    user="$(linux_record_string "$record" login_user)"
+    user_runtime="/run/user/$uid"
+    systemctl enable --now "bloom-session@$uid.path"
+    if [[ -S "$user_runtime/bus" ]]; then
+      runuser -u "$user" -- env \
+        XDG_RUNTIME_DIR="$user_runtime" \
+        DBUS_SESSION_BUS_ADDRESS="unix:path=$user_runtime/bus" \
+        systemctl --user daemon-reload
+      runuser -u "$user" -- env \
+        XDG_RUNTIME_DIR="$user_runtime" \
+        DBUS_SESSION_BUS_ADDRESS="unix:path=$user_runtime/bus" \
+        systemctl --user start bloom-session.service bloom-machine.service
+    fi
+  done
+}
+
+upgrade_root=""
+upgrade_old_digest=""
+
+begin_linux_upgrade() {
+  local install_root="$1" old_digest="$2" new_digest="$3"
+  upgrade_transaction="$install_root/var/lib/bloom/upgrade-transaction"
+  [[ ! -e "$upgrade_transaction" && ! -L "$upgrade_transaction" ]] || {
+    echo "an interrupted Linux upgrade must be recovered first" >&2
+    return 65
+  }
+  mkdir -p "$upgrade_transaction"
+  chmod 0700 "$upgrade_transaction"
+  printf '%s\n' bloom.linux-upgrade-transaction.1 > "$upgrade_transaction/schema"
+  printf '%s\n' "$old_digest" > "$upgrade_transaction/old-digest"
+  printf '%s\n' "$new_digest" > "$upgrade_transaction/new-digest"
+  chmod 0600 "$upgrade_transaction"/*
+  upgrade_root="$install_root"
+  upgrade_old_digest="$old_digest"
+  upgrade_rollback_required=true
+}
+
+rollback_linux_upgrade() {
+  local rollback_status=0
+  [[ -n "$upgrade_root" && -n "$upgrade_old_digest" ]] || return 0
+  switch_linux_release "$upgrade_root" "$upgrade_old_digest" || rollback_status=$?
+  rewrite_linux_release_set "$upgrade_root" "$upgrade_old_digest" active || rollback_status=$?
+  rm -rf -- "$upgrade_transaction"
+  upgrade_rollback_required=false
+  start_linux_release_set "$upgrade_root" || rollback_status=$?
+  return "$rollback_status"
+}
+
+finish_linux_upgrade() {
+  rm -rf -- "$upgrade_transaction"
+  upgrade_rollback_required=false
+  upgrade_transaction=""
+  upgrade_root=""
+  upgrade_old_digest=""
+}
+
+recover_interrupted_linux_upgrade() {
+  local install_root="$1" requested_digest="$2"
+  local transaction="$install_root/var/lib/bloom/upgrade-transaction"
+  local schema old_digest new_digest
+
+  [[ -e "$transaction" || -L "$transaction" ]] || return 0
+  [[ -d "$transaction" && ! -L "$transaction" ]] || {
+    echo "invalid interrupted Linux upgrade" >&2
+    return 65
+  }
+  schema="$(<"$transaction/schema")"
+  old_digest="$(<"$transaction/old-digest")"
+  new_digest="$(<"$transaction/new-digest")"
+  [[ "$schema" == bloom.linux-upgrade-transaction.1 && \
+    "$old_digest" =~ ^[0-9a-f]{64}$ && \
+    "$new_digest" =~ ^[0-9a-f]{64}$ ]] || {
+    echo "invalid interrupted Linux upgrade" >&2
+    return 65
+  }
+  upgrade_transaction="$transaction"
+  upgrade_root="$install_root"
+  upgrade_old_digest="$old_digest"
+  upgrade_rollback_required=true
+  if [[ "$new_digest" == "$requested_digest" ]]; then
+    echo "completing interrupted Bloom Linux upgrade" >&2
+    switch_linux_release "$install_root" "$new_digest"
+    rewrite_linux_release_set "$install_root" "$new_digest" active
+    start_linux_release_set "$install_root"
+    finish_linux_upgrade
+  else
+    echo "rolling back interrupted Bloom Linux upgrade" >&2
+    rollback_linux_upgrade
+  fi
 }
 
 allocate_linux_nfs_port() {
@@ -611,7 +985,31 @@ case "$action" in
       echo "signed payload release digest is invalid" >&2
       exit 65
     }
-    validate_linux_release_set "$root" "$release_digest"
+    recover_interrupted_linux_upgrade "$root" "$release_digest"
+    migrate_legacy_linux_records "$root"
+    validate_linux_release_set "$root"
+    shared_release_digest="$validated_release_digest"
+    release_upgrade=false
+    if [[ -n "$shared_release_digest" && \
+      "$shared_release_digest" != "$release_digest" ]]
+    then
+      [[ -f "$root/etc/bloom/enrollments/$login_uid.json" && \
+        ! -L "$root/etc/bloom/enrollments/$login_uid.json" ]] || {
+        echo "a different Linux release must be installed through an active enrollment" >&2
+        exit 65
+      }
+      release_upgrade=true
+    fi
+    capture_legacy_linux_release "$root" "$shared_release_digest"
+    install_linux_release "$root" "$payload" "$release_digest"
+    if [[ "$release_upgrade" == true ]]; then
+      begin_linux_upgrade "$root" "$shared_release_digest" "$release_digest"
+      stop_linux_release_set "$root"
+      rewrite_linux_release_set "$root" "$release_digest" activating
+      switch_linux_release "$root" "$release_digest"
+    else
+      switch_linux_release "$root" "$release_digest"
+    fi
     nfs_port="$(allocate_linux_nfs_port "$root" "$login_uid")"
     installed_config_root="$root/etc/bloom/$login_uid"
     installed_state_root="$root/var/lib/bloom/$login_uid"
@@ -651,18 +1049,16 @@ case "$action" in
         DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$login_uid/bus" \
         systemctl --user stop bloom-machine.service 2>/dev/null || true
     fi
-    if [[ "$root" == "/" ]] && [[ -x "$root/usr/libexec/bloom/bloom-broker" ]]; then
+    if [[ "$release_upgrade" == false && "$root" == "/" ]] && \
+      [[ -x "$root/usr/libexec/bloom/current/bloom-broker" ]]
+    then
       systemctl stop "bloom-session@$login_uid.path" 2>/dev/null || true
       systemctl stop "bloom-broker-ceremony@$login_uid.socket" 2>/dev/null || true
       systemctl stop "bloom-broker@$login_uid.service"
       systemctl stop "bloom-signer@$login_uid.service"
     fi
 
-    binary_root="$root/usr/libexec/bloom"
-    mkdir -p "$binary_root"
-    for binary in bloom bloom-broker bloom-signer bloom-signer-migrate; do
-      atomic_install "$payload/bin/$binary" "$binary_root/$binary" 0755
-    done
+    binary_root="$root/usr/libexec/bloom/current"
     atomic_install "$payload/installer/linux/bin/bloom" "$root/usr/bin/bloom" 0755
     atomic_install \
       "$payload/installer/linux/bin/bloom-uninstall" \
@@ -670,7 +1066,7 @@ case "$action" in
       0755
     atomic_install \
       "$payload/installer/release/install-linux.sh" \
-      "$binary_root/bloom-linux-maintenance" \
+      "$root/usr/libexec/bloom/bloom-linux-maintenance" \
       0755
 
     sysusers="$root/usr/lib/sysusers.d/bloom-$login_uid.conf"
@@ -717,13 +1113,13 @@ case "$action" in
       "$user_unit_root/bloom-machine.service" \
       0644
     sed \
-      -e "s|@BLOOM_BROKER_BINARY@|/usr/libexec/bloom/bloom-broker|g" \
+      -e "s|@BLOOM_BROKER_BINARY@|/usr/libexec/bloom/current/bloom-broker|g" \
       "$payload/installer/linux/systemd/bloom-broker@.service.in" \
       > "$unit_root/bloom-broker@.service.new"
     chmod 0644 "$unit_root/bloom-broker@.service.new"
     mv -f "$unit_root/bloom-broker@.service.new" "$unit_root/bloom-broker@.service"
     sed \
-      -e "s|@BLOOM_SIGNER_BINARY@|/usr/libexec/bloom/bloom-signer|g" \
+      -e "s|@BLOOM_SIGNER_BINARY@|/usr/libexec/bloom/current/bloom-signer|g" \
       "$payload/installer/linux/systemd/bloom-signer@.service.in" \
       > "$unit_root/bloom-signer@.service.new"
     chmod 0644 "$unit_root/bloom-signer@.service.new"
@@ -926,6 +1322,10 @@ case "$action" in
       rmdir "$dropin_root" 2>/dev/null || true
     fi
 
+    if [[ "$release_upgrade" == true ]]; then
+      rewrite_linux_release_set "$root" "$release_digest" active
+    fi
+
     if [[ "$root" == "/" ]]; then
       systemctl daemon-reload
       user_runtime="/run/user/$login_uid"
@@ -958,11 +1358,18 @@ case "$action" in
       # activation boundary. Nothing between this check and path activation
       # may remove the directories named by ReadWritePaths in the services.
       materialize_linux_layout "$tmpfiles" "$login_uid"
-      systemctl enable --now "bloom-session@$login_uid.path"
+      if [[ "$release_upgrade" == true ]]; then
+        start_linux_release_set "$root"
+        finish_linux_upgrade
+      else
+        systemctl enable --now "bloom-session@$login_uid.path"
+      fi
       printf '%s\n' \
         "BLOOM_BIN=/usr/bin/bloom" \
         "BLOOM_INSTALL_MODE=triad-linux-systemd" \
-        "BLOOM_RELOGIN_REQUIRED=1"
+        "BLOOM_RELOGIN_REQUIRED=$([[ "$release_upgrade" == true ]] && printf 0 || printf 1)"
+    elif [[ "$release_upgrade" == true ]]; then
+      finish_linux_upgrade
     fi
     ;;
   uninstall)
@@ -1134,6 +1541,7 @@ case "$action" in
     if [[ "$active_enrollment" == false ]]; then
       rm -f -- \
         "$root/usr/bin/bloom" \
+        "$root/usr/libexec/bloom/current" \
         "$root/usr/libexec/bloom/bloom" \
         "$root/usr/libexec/bloom/bloom-broker" \
         "$root/usr/libexec/bloom/bloom-signer" \
@@ -1157,6 +1565,7 @@ case "$action" in
       rm -f -- \
         "$root/usr/bin/bloom-uninstall" \
         "$root/usr/libexec/bloom/bloom-linux-maintenance"
+      rm -rf -- "$root/usr/libexec/bloom/releases"
       rmdir "$root/usr/libexec/bloom" "$root/etc/bloom" \
         2>/dev/null || true
     fi

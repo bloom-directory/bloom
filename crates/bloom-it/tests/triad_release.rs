@@ -1330,7 +1330,7 @@ fn linux_installer_upgrade_rotation_and_confirmed_uninstall_are_staged_safely() 
     );
     let broker_unit =
         fs::read_to_string(root.join("usr/lib/systemd/system/bloom-broker@.service")).unwrap();
-    assert!(broker_unit.contains("ExecStart=/usr/libexec/bloom/bloom-broker"));
+    assert!(broker_unit.contains("ExecStart=/usr/libexec/bloom/current/bloom-broker"));
     assert!(!broker_unit.contains("@BLOOM_"));
     let sysusers = fs::read_to_string(root.join("usr/lib/sysusers.d/bloom-1000.conf")).unwrap();
     assert!(sysusers.contains("bloom-broker-1000"));
@@ -1380,6 +1380,7 @@ fn linux_installer_upgrade_rotation_and_confirmed_uninstall_are_staged_safely() 
     fs::remove_file(payload.join("credentials/aws-credentials")).unwrap();
     fs::remove_file(payload.join("config/aws-kms-ip-allow.conf")).unwrap();
     fs::write(payload.join("bin/bloom-broker"), b"upgraded-broker").unwrap();
+    fs::write(payload.join("SHA256SUMS"), b"upgraded payload\n").unwrap();
     assert!(
         Command::new(&installer)
             .args(["install"])
@@ -1392,7 +1393,7 @@ fn linux_installer_upgrade_rotation_and_confirmed_uninstall_are_staged_safely() 
             .success()
     );
     assert_eq!(
-        fs::read(root.join("usr/libexec/bloom/bloom-broker")).unwrap(),
+        fs::read(root.join("usr/libexec/bloom/current/bloom-broker")).unwrap(),
         b"upgraded-broker"
     );
     assert_eq!(
@@ -1548,7 +1549,7 @@ fn linux_installer_upgrade_rotation_and_confirmed_uninstall_are_staged_safely() 
             .join("usr/lib/systemd/system/bloom-signer@1000.service.d")
             .exists()
     );
-    assert!(!root.join("usr/libexec/bloom/bloom-broker").exists());
+    assert!(!root.join("usr/libexec/bloom/current/bloom-broker").exists());
     assert!(
         !root
             .join("usr/lib/systemd/user/bloom-machine.service")
@@ -1579,9 +1580,8 @@ fn linux_installer_rejects_missing_service_configs_before_replacement() {
             .unwrap()
             .success()
     );
-    let installed_binary = root.join("usr/libexec/bloom/bloom-broker");
-    fs::write(&installed_binary, b"installed-broker").unwrap();
-    fs::write(payload.join("bin/bloom-broker"), b"replacement-broker").unwrap();
+    let installed_binary = root.join("usr/libexec/bloom/current/bloom-broker");
+    let installed_binary_before = fs::read(&installed_binary).unwrap();
 
     for relative in ["broker/config.json", "signer/config.json"] {
         let installed_config = root.join("etc/bloom/1000").join(relative);
@@ -1600,7 +1600,7 @@ fn linux_installer_rejects_missing_service_configs_before_replacement() {
             String::from_utf8_lossy(&rejected.stderr)
                 .contains("installed Linux enrollment is incomplete")
         );
-        assert_eq!(fs::read(&installed_binary).unwrap(), b"installed-broker");
+        assert_eq!(fs::read(&installed_binary).unwrap(), installed_binary_before);
         fs::write(installed_config, original).unwrap();
     }
 
@@ -1620,7 +1620,7 @@ fn linux_installer_rejects_missing_service_configs_before_replacement() {
         String::from_utf8_lossy(&missing_manifest.stderr)
             .contains("residual Linux enrollment state exists without a manifest")
     );
-    assert_eq!(fs::read(&installed_binary).unwrap(), b"installed-broker");
+    assert_eq!(fs::read(&installed_binary).unwrap(), installed_binary_before);
     fs::write(&manifest, original_manifest).unwrap();
 
     let state_only_root = directory.path().join("state-only-root");
@@ -1678,7 +1678,7 @@ fn linux_installer_authenticates_payload_before_mutating_existing_files() {
     fs::remove_file(payload.join("config/aws-kms-ip-allow.conf")).unwrap();
     authenticate_installer_payload(&payload, &private_key);
 
-    let installed_binary = root.join("usr/libexec/bloom/bloom-broker");
+    let installed_binary = root.join("usr/libexec/bloom/current/bloom-broker");
     fs::create_dir_all(installed_binary.parent().unwrap()).unwrap();
     fs::write(&installed_binary, b"existing-install").unwrap();
     fs::write(
@@ -1787,7 +1787,7 @@ fn linux_installer_allocates_distinct_ports_and_rejects_mixed_release_sets() {
     let fstab = fs::read_to_string(root.join("etc/fstab")).unwrap();
     assert!(fstab.contains("port=20000") && fstab.contains("port=20001"));
 
-    let installed_binary = root.join("usr/libexec/bloom/bloom-broker");
+    let installed_binary = root.join("usr/libexec/bloom/current/bloom-broker");
     let before = fs::read(&installed_binary).unwrap();
     let broker_config = root.join("etc/bloom/1000/broker/config.json");
     let original_broker_config = fs::read(&broker_config).unwrap();
@@ -1834,7 +1834,7 @@ fn linux_installer_allocates_distinct_ports_and_rejects_mixed_release_sets() {
     assert!(!rejected.status.success());
     assert!(
         String::from_utf8_lossy(&rejected.stderr)
-            .contains("requires the exact release used by every enrollment")
+            .contains("different Linux release must be installed through an active enrollment")
     );
     assert_eq!(fs::read(&installed_binary).unwrap(), before);
     assert!(!root.join("etc/bloom/3000").exists());

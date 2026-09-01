@@ -13,4 +13,4 @@ export BLOOM_MACHINE_AUDIT_CHECKPOINT_DIR="/var/lib/bloom/$uid/machine/audit-che
 export BLOOM_MACHINE_AUDIT_HISTORY="$config_root/machine-audit-history.json"
 export BLOOM_AUTHORITY_EDGE_HISTORY="$config_root/authority-edge-history.json"
 
-exec /usr/libexec/bloom/bloom "$@"
+exec /usr/libexec/bloom/current/bloom "$@"

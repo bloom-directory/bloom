@@ -127,7 +127,7 @@ fn login_session_sentinel_is_installed_with_persistent_machine_paths() {
     );
 
     let sentinel = source("systemd-user/bloom-session.service");
-    assert!(sentinel.contains("ExecStart=/usr/libexec/bloom/bloom serve session-sentinel"));
+    assert!(sentinel.contains("ExecStart=/usr/libexec/bloom/current/bloom serve session-sentinel"));
     assert!(sentinel.contains("NoNewPrivileges=yes"));
     assert!(sentinel.contains("RestrictAddressFamilies=AF_UNIX"));
     assert!(!sentinel.contains("ProtectSystem=") && !sentinel.contains("ReadWritePaths="));
