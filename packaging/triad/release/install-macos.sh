@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# Self-contained macOS installer. Keep this file readable and below 750 lines:
+# Self-contained macOS installer. Keep this file readable and below 800 lines:
 # it is intentionally suitable for `curl ... | sudo bash -s -- ...`.
 
 die() { echo "$*" >&2; exit 65; }
@@ -39,9 +39,17 @@ cleanup() {
   [[ -z "$scratch" || ! -d "$scratch" ]] || rm -rf -- "$scratch"
   [[ -z "$payload_scratch" || ! -d "$payload_scratch" ]] || rm -rf -- "$payload_scratch"
   if ((rc != 0)) && $live; then
-    for user in $created_users; do dscl . -delete "/Users/$user" 2>/dev/null || true; done
-    for group in $created_groups; do dscl . -delete "/Groups/$group" 2>/dev/null || true; done
+    rollback_failed=false
+    for user in $created_users; do
+      dscl . -delete "/Users/$user" 2>/dev/null || { echo "failed to remove incomplete service user $user" >&2; rollback_failed=true; }
+    done
+    for group in $created_groups; do
+      dscl . -delete "/Groups/$group" 2>/dev/null || { echo "failed to remove incomplete service group $group" >&2; rollback_failed=true; }
+    done
     dsmemberutil flushcache 2>/dev/null || true
+    if $rollback_failed; then
+      echo "incomplete service-account rollback will be recovered by the next installer run" >&2
+    fi
   fi
   if [[ -n "$lock" && -d "$lock" ]]; then rm -f "$lock/pid"; rmdir "$lock" 2>/dev/null || true; fi
   ((rc == 0)) || echo "macOS installer failed (status $rc)" >&2
@@ -84,6 +92,17 @@ snapshot_live_payload() {
   payload="$payload_scratch"
 }
 
+prepare_verified_payload_for_execution() {
+  $live || return 0
+  xattr -dr com.apple.quarantine "$payload" || die "could not remove quarantine from the verified payload"
+  for binary in bloom bloom-broker bloom-signer bloom-signer-migrate; do
+    if xattr -p com.apple.quarantine "$payload/bin/$binary" >/dev/null 2>&1; then
+      die "verified payload binary remains quarantined: $binary"
+    fi
+  done
+  "$payload/bin/bloom" --version >/dev/null || die "verified Bloom candidate cannot execute on this Mac"
+}
+
 field() {
   if command -v plutil >/dev/null 2>&1; then
     plutil -extract "$2" raw -o - "$1"
@@ -109,16 +128,17 @@ next_id() {
 }
 new_group() {
   record_exists Groups "$1" && die "refusing to adopt pre-existing group $1"
-  dscl . -create "/Groups/$1"; dscl . -create "/Groups/$1" PrimaryGroupID "$2"
-  dscl . -create "/Groups/$1" RealName "Bloom isolated service group"; created_groups="$created_groups $1"
+  dscl . -create "/Groups/$1"; created_groups="$created_groups $1"
+  dscl . -create "/Groups/$1" PrimaryGroupID "$2"
+  dscl . -create "/Groups/$1" RealName "Bloom isolated service group"
 }
 new_user() {
   record_exists Users "$1" && die "refusing to adopt pre-existing user $1"
-  dscl . -create "/Users/$1"; dscl . -create "/Users/$1" UniqueID "$2"
+  dscl . -create "/Users/$1"; created_users="$created_users $1"
+  dscl . -create "/Users/$1" UniqueID "$2"
   dscl . -create "/Users/$1" PrimaryGroupID "$3"; dscl . -create "/Users/$1" RealName "Bloom isolated service"
   dscl . -create "/Users/$1" NFSHomeDirectory /var/empty; dscl . -create "/Users/$1" UserShell /usr/bin/false
   dscl . -create "/Users/$1" IsHidden 1; dscl . -create "/Users/$1" AuthenticationAuthority ';DisabledUser;'
-  created_users="$created_users $1"
 }
 join_group() { dseditgroup -o edit -a "$2" -t user "$1"; }
 
@@ -194,6 +214,33 @@ allocate_accounts() {
     join_group "${pair%%:*}" "${pair#*:}"
   done
   join_group "$log_group" "$login_user"
+  dsmemberutil flushcache
+}
+
+recover_interrupted_fresh_accounts() {
+  local found=false name value
+  [[ ! -e "$enrollment" && ! -e "$config/edge-manifest.json" ]] || return 0
+  for name in "$broker_user" "$signer_user"; do
+    record_exists Users "$name" || continue
+    found=true
+    value="$(dscl . -read "/Users/$name" 2>/dev/null)"
+    [[ "$value" == *$'RealName:\n Bloom isolated service\n'* && "$value" == *"NFSHomeDirectory: /var/empty"* && \
+      "$value" == *"UserShell: /usr/bin/false"* && "$value" == *"dsAttrTypeNative:IsHidden: 1"* ]] ||
+      die "pre-existing user $name is not a recoverable incomplete Bloom service account"
+  done
+  for name in "$broker_group" "$signer_group" "$machine_broker_group" "$broker_signer_group" "$revoke_group" "$log_group"; do
+    record_exists Groups "$name" || continue
+    found=true
+    value="$(dscl . -read "/Groups/$name" 2>/dev/null)"
+    [[ "$value" == *$'RealName:\n Bloom isolated service group\n'* ]] ||
+      die "pre-existing group $name is not a recoverable incomplete Bloom service group"
+  done
+  $found || return 0
+  echo "recovering an interrupted fresh Bloom account allocation" >&2
+  for name in "$broker_user" "$signer_user"; do record_exists Users "$name" && dscl . -delete "/Users/$name"; done
+  for name in "$broker_group" "$signer_group" "$machine_broker_group" "$broker_signer_group" "$revoke_group" "$log_group"; do
+    record_exists Groups "$name" && dscl . -delete "/Groups/$name"
+  done
   dsmemberutil flushcache
 }
 
@@ -641,7 +688,7 @@ case "$action" in
     [[ $# -eq 4 ]] || usage; root_and_uid "$1" "$2"; login_user="$3"; payload="$(cd "$4" && pwd -P)"
     [[ "$login_user" =~ ^[a-z_][a-z0-9_-]*$ ]] || { echo "unsafe LOGIN_USER" >&2; exit 64; }
     $live && { lock_installer; [[ "$(id -u "$login_user")" == "$login_uid" ]] || die "LOGIN_USER does not match LOGIN_UID"; launchctl print "gui/$login_uid" >/dev/null 2>&1 || die "LOGIN_USER has no active GUI domain"; snapshot_live_payload; }
-    requested_uid="$login_uid"; requested_user="$login_user"; load_names; paths; verify_payload; preflight_compatibility
+    requested_uid="$login_uid"; requested_user="$login_user"; load_names; paths; verify_payload; preflight_compatibility; prepare_verified_payload_for_execution
     find_interrupted_upgrade
     login_uid="$requested_uid"; login_user="$requested_user"; load_names; paths
     shared_digest="$(current_release_digest)"
@@ -664,6 +711,7 @@ case "$action" in
       [[ "$(field "$enrollment" schema)" == bloom.macos-enrollment.1 ]] || die "unsupported installed enrollment schema"
       fresh=false; load_ids
     fi
+    $live && $fresh && recover_interrupted_fresh_accounts
     validate_installed_security_inputs
     if [[ "$fresh" == true && "$had_active" == true && "$shared_digest" != "$BLOOM_RELEASE_DIGEST" ]]; then
       die "new enrollment cannot change the shared release used by active enrollments"
