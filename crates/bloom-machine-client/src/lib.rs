@@ -45,7 +45,7 @@ use bloom_broker_api::{
     ApprovalPrepareRequest, ApprovalPublicStatus, ApprovalRenewRequest, ApprovalSelector,
     ApprovalSubject, BROKER_API_CURRENT, BROKER_API_RANGE, Base64UrlBytes, CeremonyPublicStatus,
     CeremonyState, CredentialPublic, CryptoSuite, CustodyPrepareRequest, CustodyPrepareResponse,
-    CustodyResult, DecimalU64, DerivationRef, DerivedAccountPublic, Digest32, IdRequest, KeyPublic,
+    CustodyResult, DecimalU64, DerivedAccountPublic, Digest32, IdRequest, KeyPublic,
     KeyRef, KeyRequest, KeyRole, MachineBrokerRequest, MachineBrokerResponse, MachineBrokerService,
     MachineSignRequest, OperationId, OperationPublicStatus, OperationRequest, PetalUseClaim,
     PolicyCommitReceipt, PolicyCommitUpdateRequest, PolicyUpdatePrepareResponse,
