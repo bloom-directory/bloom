@@ -324,8 +324,8 @@ current_release_digest() {
 }
 
 has_active_enrollments() {
-  local record
-  for record in "$enrollments"/*.json; do
+  local directory="${1:-$enrollments}" record
+  for record in "$directory"/*.json; do
     [[ -f "$record" && ! -L "$record" ]] && return 0
   done
   return 1
@@ -749,9 +749,9 @@ case "$action" in
       record_exists Groups "$log_group" && dscl . -delete "/Groups/$log_group"
       dsmemberutil flushcache
     fi
-    if ! find "$enrollments" -type f -name '*.json' -maxdepth 1 2>/dev/null | grep . >/dev/null; then
+    if ! has_active_enrollments; then
       $live && launchctl bootout system/com.bloom.containment 2>/dev/null || true; rm -f "$containment_plist" "$session_plist" "$machine_plist"
-      if ! find "$product/retained" -type f -name '*.json' -maxdepth 1 2>/dev/null | grep . >/dev/null; then rm -rf "$release_base"; fi
+      if ! has_active_enrollments "$product/retained"; then rm -rf "$release_base"; fi
     fi
     $retain || echo "Bloom macOS enrollment permanently purged; custody is unrecoverable"
     ;;
