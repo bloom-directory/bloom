@@ -111,7 +111,8 @@ class SolanaTransferEval(EvalDefinition):
         self.chain = self.env.get("BLOOM_EVAL_SOLANA_CHAIN", "")
         self.network = self.env.get("BLOOM_EVAL_SOLANA_NETWORK", "")
         self.rpc_url = self.env.get("BLOOM_EVAL_SOLANA_RPC_URL", "")
-        self.bloom_mount = Path(self.env.get("BLOOM_EVAL_BLOOM_MOUNT", "/bloom"))
+        self.bloom_mount_value = self.env.get("BLOOM_EVAL_BLOOM_MOUNT", "").strip()
+        self.bloom_mount = Path(self.bloom_mount_value)
         self.authorization_value = self.env.get(
             "BLOOM_EVAL_SOLANA_CANARY_AUTHORIZATION", ""
         )
@@ -397,6 +398,8 @@ class SolanaTransferEval(EvalDefinition):
     # ---- preflight -----------------------------------------------------
 
     def preflight(self) -> None:
+        if not self.bloom_mount_value:
+            raise EvalError("BLOOM_EVAL_BLOOM_MOUNT is required for a full eval")
         if self.lane not in ("local", "mainnet-canary"):
             raise EvalError(f"unknown lane {self.lane!r}; use local or mainnet-canary")
         if WALLET_ID.fullmatch(self.wallet_id) is None:

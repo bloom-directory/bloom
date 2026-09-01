@@ -7,10 +7,10 @@ import fcntl
 import json
 import os
 import re
-import signal
 import stat
 import subprocess
 import sys
+import signal
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Coroutine, Mapping, Sequence
@@ -346,6 +346,17 @@ class CeremonyDriver:
         retry "never", so a second attempt cannot succeed and only burns
         another counter. Retrying here once turned one failure into three.
         """
+        used = self.counter
+        self.counter = used + 1
+
+        # Reserve the counter durably before invoking the driver. The assertion
+        # may reach Broker even when the local process times out or is
+        # interrupted, so persisting after subprocess completion can reuse a
+        # counter that Broker has already accepted. If persistence fails, do
+        # not attempt the ceremony at all.
+        if self.store is not None:
+            self.store.write(self.counter)
+
         try:
             completed = subprocess.run(
                 [
@@ -355,7 +366,7 @@ class CeremonyDriver:
                     "--authenticator-seed-file",
                     str(self.seed_file),
                     "--sign-count",
-                    str(self.counter),
+                    str(used),
                 ],
                 check=False,
                 capture_output=True,
@@ -363,38 +374,17 @@ class CeremonyDriver:
             )
         except (OSError, subprocess.SubprocessError) as error:
             raise EvalError(
-                "debug-driver ceremony completion failed: " + self.redact(str(error))
+                f"debug-driver ceremony completion failed at sign count {used} "
+                f"(next unused counter is {self.counter}): "
+                + self.redact(str(error))
             ) from error
         output = (completed.stdout + completed.stderr).decode(errors="replace")
-        used = self.counter
-        self.counter += 1
-        # Record before inspecting the result. The Broker accepts the counter
-        # before a ceremony can fail, so a crash or a failure here must still
-        # leave the counter spent; reusing it would only fail the next run.
-        #
-        # A failure to record must not be mistaken for a failure to complete.
-        # Raising here directly would report a ceremony that actually succeeded
-        # as a failed one, leaving the caller to unwind state that was in fact
-        # created. Hold the error until the ceremony's own outcome is known.
-        record_error: str | None = None
-        if self.store is not None:
-            try:
-                self.store.write(self.counter)
-            except EvalError as error:
-                record_error = str(error)
         if completed.returncode != 0:
             raise EvalError(
                 f"ceremony failed at sign count {used} "
                 f"(next unused counter is {self.counter}): " + self.redact(output)
             )
         self.completed.add(ceremony_url)
-        if record_error is not None:
-            raise EvalError(
-                f"the ceremony at sign count {used} succeeded but its counter "
-                f"could not be recorded ({record_error}); set "
-                f"BLOOM_EVAL_AUTHENTICATOR_SIGN_COUNT={self.counter} for the "
-                "next run"
-            )
         return output
 
 

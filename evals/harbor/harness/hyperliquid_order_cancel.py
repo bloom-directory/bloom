@@ -11,6 +11,7 @@ import re
 import secrets
 import stat
 import subprocess
+import sys
 import time
 from collections.abc import Callable
 from datetime import UTC, datetime
@@ -18,18 +19,10 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
-from .core import (
-    CEREMONY_URL,
-    CeremonyDriver,
-    EvalDefinition,
-    EvalError,
-    EvalRunContext,
-    MountedTree,
-    SignCountStore,
-    resolve_sign_count,
-)
+from .core import EvalDefinition, EvalError, EvalRunContext
 
 MAINNET_ACK = "PLACE_AND_CANCEL_BTC_MAINNET_UP_TO_11_USD"
+CEREMONY_URL = re.compile(r"http://localhost:18734/ceremony/[A-Za-z0-9_-]{43}")
 WALLET = re.compile(r"0x[0-9a-f]{40}")
 WALLET_ID = re.compile(r"[a-z0-9][a-z0-9-]{0,62}")
 PACKAGE_HASH = re.compile(r"[0-9a-f]{64}")
@@ -140,31 +133,23 @@ class HyperliquidOrderCancelEval(EvalDefinition):
         self.session_created = False
         self.counter_committed = counter_committed
         self.phase_timings: dict[str, float] = {}
-        self.mount = MountedTree(
-            read_timeout=VENUE_READ_TIMEOUT_SECONDS,
-            read_attempts=VENUE_READ_ATTEMPTS,
-        )
 
     @property
     def lock_path(self) -> Path:
         return self._lock_path
 
-    @property
-    def sign_counts(self) -> SignCountStore:
-        return SignCountStore.for_seed_file(
-            self.seed_file, self.env.get("BLOOM_EVAL_SIGN_COUNT_FILE", "")
-        )
-
     def _require_sign_count(self) -> int:
-        # A session spends one counter per ceremony, so the next run does not
-        # simply start one higher. The README used to ask an operator to read
-        # the next value out of a failure message and re-export it; the store
-        # records it instead. Setting the variable still overrides.
-        return resolve_sign_count(
-            self.sign_count_value,
-            self.sign_counts,
-            "BLOOM_EVAL_AUTHENTICATOR_SIGN_COUNT",
-        )
+        try:
+            sign_count = int(self.sign_count_value)
+        except ValueError as error:
+            raise EvalError(
+                "BLOOM_EVAL_AUTHENTICATOR_SIGN_COUNT must be an integer"
+            ) from error
+        if sign_count < 1 or sign_count > 0xFFFF_FFFF:
+            raise EvalError(
+                "BLOOM_EVAL_AUTHENTICATOR_SIGN_COUNT must be between 1 and 4294967295"
+            )
+        return sign_count
 
     @property
     def network_root(self) -> Path:
@@ -182,15 +167,57 @@ class HyperliquidOrderCancelEval(EvalDefinition):
         # Reads under the Petal are not local file reads: they are live venue
         # round-trips made by wasm and returned over the mount, so their latency
         # is the venue's, not the disk's. Observed between 0.1s and 8s for the
-        # same path minutes apart. The shared retry-and-reparse behaviour lives
-        # in `MountedTree`; the timeout default here is the venue's, not a
-        # filesystem's.
-        return self.mount.read_json(path, timeout)
+        # same path minutes apart. A single tight timeout loses whole runs to
+        # latency the harness does not control, so allow more time and retry a
+        # timeout rather than failing the run on one slow fetch. Owner-visible
+        # projections can also be replaced while NFS is serving a read; retry
+        # a malformed snapshot rather than treating that transient overlap as
+        # durable corruption.
+        last_error: BaseException | None = None
+        for attempt in range(VENUE_READ_ATTEMPTS):
+            try:
+                completed = subprocess.run(
+                    ["cat", str(path)],
+                    check=True,
+                    capture_output=True,
+                    timeout=timeout,
+                )
+            except subprocess.TimeoutExpired as error:
+                last_error = error
+                if attempt + 1 < VENUE_READ_ATTEMPTS:
+                    time.sleep(1.0)
+                continue
+            except (OSError, subprocess.SubprocessError) as error:
+                raise EvalError(f"could not read {path}: {error}") from error
+            try:
+                return json.loads(completed.stdout)
+            except json.JSONDecodeError as error:
+                last_error = error
+                if attempt + 1 < VENUE_READ_ATTEMPTS:
+                    time.sleep(0.2)
+                continue
+        raise EvalError(
+            f"could not read {path} after {VENUE_READ_ATTEMPTS} attempts "
+            f"of {timeout}s: {last_error}"
+        ) from last_error
 
     def _write_route(
         self, path: Path, body: bytes, timeout: int
     ) -> subprocess.CompletedProcess[bytes]:
-        return self.mount.write_route(path, body, timeout)
+        writer = (
+            "import pathlib,sys; "
+            "pathlib.Path(sys.argv[1]).write_bytes(sys.stdin.buffer.read())"
+        )
+        try:
+            return subprocess.run(
+                [sys.executable, "-c", writer, str(path)],
+                input=body,
+                capture_output=True,
+                check=False,
+                timeout=timeout,
+            )
+        except (OSError, subprocess.SubprocessError) as error:
+            raise EvalError(f"route write to {path} failed: {error}") from error
 
     def _poll_until(
         self,
@@ -198,14 +225,36 @@ class HyperliquidOrderCancelEval(EvalDefinition):
         attempts: int,
         delay: float,
     ) -> bool:
-        return self.mount.poll_until(predicate, attempts, delay)
+        """Poll `predicate` until it holds or the budget is spent.
+
+        Returns True as soon as it holds. An `EvalError` from the predicate is
+        treated as "not yet": a read that fails mid-settle should be retried
+        within the budget, and the caller reports the failure if it never
+        clears.
+        """
+        for attempt in range(attempts):
+            try:
+                if predicate():
+                    return True
+            except EvalError:
+                if attempt == attempts - 1:
+                    raise
+            if attempt < attempts - 1:
+                time.sleep(delay)
+        return False
 
     def _read_json_if_exists(self, path: Path) -> Any | None:
         # Dynamic Petal routes can make getattr/stat succeed for arbitrary
         # session IDs. The parent listing is the durable existence boundary.
-        return self.mount.read_json_if_listed(
-            path, path.parent.parent, path.parent.name
-        )
+        try:
+            session_ids = os.listdir(path.parent.parent)
+        except FileNotFoundError:
+            return None
+        except OSError as error:
+            raise EvalError(f"could not list {path.parent.parent}: {error}") from error
+        if path.parent.name not in session_ids:
+            return None
+        return self._read_json(path)
 
     def _pending_petal_key_ceremony(self) -> str | None:
         if self.session_id is None:
@@ -303,7 +352,7 @@ class HyperliquidOrderCancelEval(EvalDefinition):
         return matches[0] if matches else None
 
     def _redact_ceremony_urls(self, output: str) -> str:
-        return CeremonyDriver.redact(output)
+        return CEREMONY_URL.sub("[REDACTED_CEREMONY_URL]", output)
 
     def _read_session_status(self, attempts: int = 3) -> Any | None:
         if self.session_base is None:
@@ -729,7 +778,37 @@ class HyperliquidOrderCancelEval(EvalDefinition):
         if not self.seed_file_value:
             raise EvalError("BLOOM_EVAL_AUTHENTICATOR_SEED_FILE is required")
         self.sign_count = self._require_sign_count()
-        CeremonyDriver(self.driver, self.seed_file, self.sign_count).preflight()
+        try:
+            seed_stat = self.seed_file.lstat()
+        except OSError as error:
+            raise EvalError(
+                f"authenticator seed file is unavailable: {error}"
+            ) from error
+        if not stat.S_ISREG(seed_stat.st_mode) or self.seed_file.is_symlink():
+            raise EvalError(
+                "authenticator seed file must be a regular non-symlink file"
+            )
+        if stat.S_IMODE(seed_stat.st_mode) != 0o600:
+            raise EvalError("authenticator seed file must have mode 0600")
+        if seed_stat.st_size == 0:
+            raise EvalError("authenticator seed file is empty")
+        if not self.driver.is_file() or not os.access(self.driver, os.X_OK):
+            raise EvalError(f"debug driver is missing or not executable: {self.driver}")
+        try:
+            usage = subprocess.run(
+                [str(self.driver)],
+                capture_output=True,
+                check=False,
+                text=True,
+                timeout=10,
+            )
+        except (OSError, subprocess.SubprocessError) as error:
+            raise EvalError(f"could not inspect debug driver: {error}") from error
+        if "--authenticator-seed-file" not in usage.stdout + usage.stderr:
+            raise EvalError(
+                "debug driver lacks --authenticator-seed-file support; "
+                "build bloom-broker PR #1 or newer"
+            )
         self._require_bloom_mount()
         for relative, label in (
             ("mids.json", "Hyperliquid mainnet Petal is not installed"),
@@ -795,15 +874,12 @@ class HyperliquidOrderCancelEval(EvalDefinition):
         # exists. Each WebAuthn completion must use a strictly greater counter
         # than the last accepted one, so the counter advances per ceremony and
         # is never reused.
+        counter = sign_count
         # A ceremony's owner-visible projection lags its completion, so the same
         # ceremony can still resolve as pending immediately after it succeeded.
-        # Completing it twice fails against a consumed session, so the driver
-        # remembers what this provision has already driven and we wait for the
-        # session instead.
-        ceremonies = CeremonyDriver(
-            self.driver, self.seed_file, sign_count, store=self.sign_counts
-        )
-        completed_ceremonies = ceremonies.completed
+        # Completing it twice fails against a consumed session, so remember what
+        # this provision has already driven and wait for the session instead.
+        completed_ceremonies: set[str] = set()
         for _ in range(MAX_SESSION_CEREMONIES):
             ceremony_url: str | None = None
             # Mounted Petal writes are asynchronous. A zero write exit code
@@ -834,18 +910,42 @@ class HyperliquidOrderCancelEval(EvalDefinition):
             if status_data is not None or ceremony_url is None:
                 break
 
-            # One attempt only, enforced by the driver: the Broker marks a
-            # consumed or absent ceremony CEREMONY_REPLAY with retry "never", so
-            # a second attempt cannot succeed and only burns another WebAuthn
-            # counter.
+            # One attempt only. The Broker marks a consumed or absent ceremony
+            # CEREMONY_REPLAY with retry "never", so a second attempt cannot
+            # succeed and only burns another WebAuthn counter. An earlier
+            # revision retried here on the theory that a freshly published
+            # ceremony URL might not yet resolve; that theory was wrong, and the
+            # retries turned one failure into three.
             try:
-                output += ceremonies.complete(ceremony_url)
-            except EvalError as error:
+                completed = subprocess.run(
+                    [
+                        str(self.driver),
+                        "complete",
+                        ceremony_url,
+                        "--authenticator-seed-file",
+                        str(self.seed_file),
+                        "--sign-count",
+                        str(counter),
+                    ],
+                    check=False,
+                    capture_output=True,
+                    timeout=45,
+                )
+            except (OSError, subprocess.SubprocessError) as error:
                 raise EvalError(
-                    f"session {error}: " + self._redact_ceremony_urls(output)
+                    "debug-driver ceremony completion failed: "
+                    + self._redact_ceremony_urls(str(error))
                 ) from error
-            finally:
-                self.next_sign_count = ceremonies.next_sign_count
+            output += (completed.stdout + completed.stderr).decode(errors="replace")
+            counter += 1
+            self.next_sign_count = counter
+            if completed.returncode != 0:
+                raise EvalError(
+                    f"session ceremony failed at sign count {counter - 1} "
+                    f"(next unused counter is {counter}): "
+                    + self._redact_ceremony_urls(output)
+                )
+            completed_ceremonies.add(ceremony_url)
 
             # Replay byte-identical session terms only after the owner ceremony
             # succeeds; WebAuthn counter reuse is never attempted.
@@ -856,9 +956,8 @@ class HyperliquidOrderCancelEval(EvalDefinition):
         if status_data is None:
             raise EvalError(
                 "session creation failed without durable session or ceremony "
-                "readback after consuming sign counts "
-                f"{sign_count}..{ceremonies.next_sign_count - 1} "
-                f"(next unused counter is {ceremonies.next_sign_count}): "
+                f"readback after consuming sign counts {sign_count}..{counter - 1} "
+                f"(next unused counter is {counter}): "
                 + self._redact_ceremony_urls(output)
             )
 

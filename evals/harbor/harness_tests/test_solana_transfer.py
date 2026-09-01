@@ -202,6 +202,11 @@ class AuthorizationPreflightTests(SolanaEvalTestCase):
 
 
 class LanePreflightTests(SolanaEvalTestCase):
+    def test_the_full_eval_requires_an_explicit_mount_selection(self) -> None:
+        definition = self.make(BLOOM_EVAL_BLOOM_MOUNT="")
+        with self.assertRaisesRegex(EvalError, "BLOOM_EVAL_BLOOM_MOUNT is required"):
+            definition.preflight()
+
     def test_an_unknown_lane_is_rejected(self) -> None:
         with self.assertRaisesRegex(EvalError, "unknown lane"):
             self.make(BLOOM_EVAL_SOLANA_LANE="devnet").preflight()

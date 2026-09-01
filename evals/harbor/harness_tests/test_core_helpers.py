@@ -333,9 +333,9 @@ class SignCountStoreTests(unittest.TestCase):
                 driver.complete("http://localhost:18734/ceremony/" + "A" * 43)
         self.assertEqual(self.store.read(), 6)
 
-    def test_a_record_failure_is_not_reported_as_a_ceremony_failure(self) -> None:
-        # A ceremony that succeeded must never be reported as one that failed:
-        # the caller would unwind state that was actually created.
+    def test_a_record_failure_prevents_the_ceremony_attempt(self) -> None:
+        # If the next counter cannot be reserved durably, invoking the driver
+        # could consume a counter that a later run would reuse.
         seed = Path(self.temp.name) / "seed2"
         seed.write_bytes(b"x")
         seed.chmod(0o600)
@@ -346,35 +346,28 @@ class SignCountStoreTests(unittest.TestCase):
         self.path.write_text("banana")  # unreadable record
         driver = CeremonyDriver(driver_path, seed, 5, store=self.store)
         url = "http://localhost:18734/ceremony/" + "A" * 43
-        with mock.patch(
-            "harness.core.subprocess.run",
-            return_value=SimpleNamespace(returncode=0, stdout=b"ok", stderr=b""),
-        ):
-            with self.assertRaises(EvalError) as raised:
+        with mock.patch("harness.core.subprocess.run") as run:
+            with self.assertRaisesRegex(EvalError, "does not contain an integer"):
                 driver.complete(url)
-        message = str(raised.exception)
-        self.assertIn("succeeded but its counter could not be recorded", message)
-        self.assertIn("SIGN_COUNT=6", message)
-        # The ceremony really did happen, so it must be remembered as consumed.
-        self.assertIn(url, driver.completed)
+        run.assert_not_called()
+        self.assertNotIn(url, driver.completed)
         self.assertEqual(driver.next_sign_count, 6)
 
-    def test_a_failed_ceremony_still_reports_as_a_ceremony_failure(self) -> None:
+    def test_a_timeout_still_leaves_the_counter_reserved(self) -> None:
         seed = Path(self.temp.name) / "seed3"
         seed.write_bytes(b"x")
         seed.chmod(0o600)
         driver_path = Path(self.temp.name) / "driver3"
         driver_path.write_text("#!/bin/sh\nexit 1\n")
         driver_path.chmod(0o755)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text("banana")
         driver = CeremonyDriver(driver_path, seed, 5, store=self.store)
         with mock.patch(
             "harness.core.subprocess.run",
-            return_value=SimpleNamespace(returncode=1, stdout=b"denied", stderr=b""),
+            side_effect=subprocess.TimeoutExpired(cmd="driver", timeout=45),
         ):
-            with self.assertRaisesRegex(EvalError, "ceremony failed at sign count 5"):
+            with self.assertRaisesRegex(EvalError, "next unused counter is 6"):
                 driver.complete("http://localhost:18734/ceremony/" + "A" * 43)
+        self.assertEqual(self.store.read(), 6)
 
     def test_the_record_is_keyed_to_the_seed_file(self) -> None:
         seed = Path(self.temp.name) / "eval-authenticator-seed"
