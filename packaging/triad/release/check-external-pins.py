@@ -1,5 +1,15 @@
 #!/usr/bin/env python3
-"""Fail closed when triad Git dependencies or recorded revisions drift."""
+"""Fail closed when triad Git dependencies or recorded revisions drift.
+
+The compatibility matrix records the authority stack a bundle must attest.
+This checker proves the workspace manifests agree with it: every role the
+provided manifests can pin (Broker API, Signer API, service-runtime, Petal
+contract) must pin exactly the recorded revision, and every manifest must
+agree with every other. Machine-only invocations cannot see the Signer pin
+(the Machine workspace does not depend on it); the full triad gate invokes
+this script with all three workspace manifests, at which point every role is
+cross-checked.
+"""
 
 from __future__ import annotations
 
@@ -14,11 +24,28 @@ import urllib.request
 ROOT = pathlib.Path(__file__).resolve().parents[3]
 COMPAT = ROOT / "packaging/triad/release/compatibility-v1.toml"
 FULL = re.compile(r"^[0-9a-f]{40}$")
-EXPECTED = {
-    "broker_commit": ("bloom-directory/bloom-broker", "1cbb549bea07f78c564ef1e66e52fb087b5f2ffa"),
-    "signer_commit": ("bloom-directory/bloom-signer", "1a1d52376919fff4cb295207e67c54dff60c745d"),
-    "service_runtime_commit": ("bloom-directory/bloom-service-runtime", "2e402f03814166406ea6489b60422b0865d1f6c2"),
-    "petal_contract_commit": ("bloom-directory/petal", "61938d0c127cfe03c7e3e55baed0ba1439bc5ca2"),
+
+# Which manifest dependency names pin each recorded revision, and which
+# GitHub repository the revision must exist in.
+REVISION_ROLES = {
+    "broker_commit": (
+        "bloom-directory/bloom-broker",
+        ("bloom-broker-api",),
+    ),
+    "signer_commit": (
+        "bloom-directory/bloom-signer",
+        ("bloom-signer-api", "bloom-signer-vectors"),
+    ),
+    "service_runtime_commit": (
+        "bloom-directory/bloom-service-runtime",
+        ("bloom-audit-checkpoint", "bloom-rpc-wire", "bloom-triad-local-transport",
+         "bloom-service-activation", "bloom-service-observability",
+         "bloom-trusted-time", "bloom-platform-containment"),
+    ),
+    "petal_contract_commit": (
+        "bloom-directory/petal",
+        ("bloom-petal-contract",),
+    ),
 }
 
 
@@ -40,8 +67,10 @@ def dependency_tables(document: dict) -> list[dict]:
     return tables
 
 
-def check_manifest(path: pathlib.Path) -> None:
+def check_manifest_pins(path: pathlib.Path) -> dict[str, str]:
+    """Validate one manifest's Git pins and return name -> revision."""
     document = tomllib.loads(path.read_text())
+    pins: dict[str, str] = {}
     for table in dependency_tables(document):
         for name, spec in table.items():
             if not isinstance(spec, dict) or "git" not in spec:
@@ -51,6 +80,26 @@ def check_manifest(path: pathlib.Path) -> None:
             revision = spec.get("rev")
             if not isinstance(revision, str) or not FULL.fullmatch(revision):
                 fail(f"{path}: Git dependency {name} is not pinned to a full commit")
+            repository = str(spec["git"]).rstrip("/").rsplit("/", 1)[-1]
+            if repository.endswith(".git"):
+                repository = repository[: -len(".git")]
+            expected_repository = next(
+                (
+                    repo.rsplit("/", 1)[-1]
+                    for repo, names in REVISION_ROLES.values()
+                    if name in names
+                ),
+                None,
+            )
+            if expected_repository is not None and repository != expected_repository:
+                fail(
+                    f"{path}: dependency {name} must come from "
+                    f"{expected_repository}, not {repository}"
+                )
+            previous = pins.setdefault(name, revision)
+            if previous != revision:
+                fail(f"{path}: dependency {name} is pinned to conflicting revisions")
+    return pins
 
 
 def remote_commit_exists(repository: str, revision: str) -> None:
@@ -76,12 +125,6 @@ def main() -> None:
     revisions = compatibility.get("revisions")
     if not isinstance(revisions, dict):
         fail("compatibility manifest has no revisions table")
-    for name, (repository, expected) in EXPECTED.items():
-        actual = revisions.get(name)
-        if actual != expected or not isinstance(actual, str) or not FULL.fullmatch(actual):
-            fail(f"compatibility revision {name} is missing, mutable, or unexpected")
-        if args.remote:
-            remote_commit_exists(repository, actual)
 
     roots = args.manifests or [ROOT / "Cargo.toml"]
     manifests: set[pathlib.Path] = set()
@@ -93,8 +136,33 @@ def main() -> None:
             for path in root_manifest.parent.rglob("Cargo.toml")
             if "target" not in path.parts and ".git" not in path.parts
         )
+
+    observed: dict[str, dict[str, str]] = {role: {} for role in REVISION_ROLES}
     for manifest in sorted(manifests):
-        check_manifest(manifest)
+        pins = check_manifest_pins(manifest)
+        for role, (_, names) in REVISION_ROLES.items():
+            for name in names:
+                if name in pins:
+                    previous = observed[role].setdefault(name, pins[name])
+                    if previous != pins[name]:
+                        fail(
+                            f"{role}: {name} is pinned to {pins[name]} in {manifest} "
+                            f"but {previous} elsewhere; the workspaces disagree"
+                        )
+
+    for role, (repository, _) in REVISION_ROLES.items():
+        recorded = revisions.get(role)
+        if not isinstance(recorded, str) or not FULL.fullmatch(recorded):
+            fail(f"compatibility revision {role} is missing, mutable, or unexpected")
+        for name, revision in observed[role].items():
+            if revision != recorded:
+                fail(
+                    f"{role}: manifest pins {name}@{revision} but the compatibility "
+                    f"matrix records {recorded}; update them together"
+                )
+        if args.remote:
+            remote_commit_exists(repository, recorded)
+
     print("triad external dependency pins are immutable and compatible")
 
 

@@ -37,7 +37,7 @@ use bloom_machine_client::{MachineBrokerClient, WalletProjectionReader};
 use bloom_proto::{AddressBook, CapabilityViewEntry, HomeWritePermit, Policy, RawIntent};
 use bloom_tx::{
     intent_parser,
-    outbox::OutboxState,
+    outbox::{OutboxError, OutboxState},
     tx_engine::{TxEngine, TxEngineError},
 };
 use qrcode::QrCode;
@@ -1677,18 +1677,24 @@ impl WalletsHandler {
             .outbox
             .list(wallet, chain, OutboxState::Pending)
             .map_err(err_be)?;
-        let mut pending = ids
-            .into_iter()
-            .filter_map(|id| {
-                self.tx_engine
-                    .outbox
-                    .read_in_state(wallet, chain, &id, OutboxState::Pending)
-                    .ok()
-                    .map(|entry| (entry.staged.created_ms, id))
-            })
-            .collect::<Vec<_>>();
-        pending.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
-        Ok(pending.first().map(|(_, id)| format!("pending/{id}")))
+        let mut pending = Vec::with_capacity(ids.len());
+        for id in ids {
+            match self
+                .tx_engine
+                .outbox
+                .read_in_state(wallet, chain, &id, OutboxState::Pending)
+            {
+                Ok(entry) => pending.push((entry.staged.created_ms, id)),
+                // The entry transitioned between listing and reading; it is
+                // no longer a pending candidate.
+                Err(OutboxError::NotFound(_)) => {}
+                // `latest` is advertised as the atomic identity of the newest
+                // staged transfer. An unreadable newest entry must surface,
+                // not silently redirect the reader to an older transfer.
+                Err(error) => return Err(err_be(error)),
+            }
+        }
+        Ok(newest_pending_target(pending))
     }
 
     fn outbox_dir_entries(&self, wallet: &str, chain: &str) -> Result<Vec<Entry>, HandlerError> {
@@ -1707,6 +1713,19 @@ impl WalletsHandler {
 
 fn err_be(e: impl std::fmt::Display) -> HandlerError {
     HandlerError::backend(e.to_string())
+}
+
+/// Render the newest pending entry as a `pending/<id>` symlink target.
+///
+/// Ties on `created_ms` break toward the greater id: outbox ids come from a
+/// monotonically increasing allocation counter, so within one millisecond the
+/// greater id is the later staging. Newest first, deterministically.
+fn newest_pending_target(mut pending: Vec<(u128, String)>) -> Option<String> {
+    pending.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
+    pending
+        .into_iter()
+        .next()
+        .map(|(_, id)| format!("pending/{id}"))
 }
 
 /// Reject a policy-update action id that could escape its state directory
@@ -3711,6 +3730,10 @@ mod tests {
     /// Write a synthetic staged tx directly into the outbox so the tests
     /// that drive confirm/replace/cancel don't have to spin up a chain.
     fn seed_pending(f: &Fixture, id: &str) {
+        seed_pending_with_created_ms(f, id, 0);
+    }
+
+    fn seed_pending_with_created_ms(f: &Fixture, id: &str, created_ms: u128) {
         let staged = bloom_proto::StagedTx {
             id: id.into(),
             wallet: f.wallet_name.clone(),
@@ -3726,7 +3749,7 @@ mod tests {
             gas_price: None,
             nonce: 0,
             policy_checks: vec![],
-            created_ms: 0,
+            created_ms,
             // Far in the future so expiry never trips during tests.
             expires_ms: u128::MAX,
             status: bloom_proto::TxStatus::Pending,
@@ -4646,6 +4669,64 @@ mod tests {
         let new_tx = entries.iter().find(|entry| entry.name == "new.tx").unwrap();
 
         assert_eq!(new_tx.mode, 0o644);
+    }
+
+    #[tokio::test]
+    async fn outbox_latest_prefers_the_newest_staging_and_breaks_ties_by_allocation() {
+        let f = make_handler_with_chain(true);
+        // Same millisecond: ids are allocated from an increasing counter, so
+        // the greater id is the later staging and must own `latest`.
+        seed_pending_with_created_ms(&f, "0001-older", 5_000);
+        seed_pending_with_created_ms(&f, "0002-newer", 5_000);
+        // And a later millisecond still wins regardless of id.
+        seed_pending_with_created_ms(&f, "0003-newest", 9_000);
+
+        let root = VfsPath::parse(&format!("/{}/chains/anvil/outbox", f.wallet_name)).unwrap();
+        let listed = f.handler.list(&root).await.unwrap();
+        let latest = listed.iter().find(|entry| entry.name == "latest").unwrap();
+        assert_eq!(latest.link_target.as_deref(), Some("pending/0003-newest"));
+
+        // Remove the newest entry and the tie-break decides, deterministically
+        // toward the later allocation.
+        let entry = f
+            .handler
+            .tx_engine
+            .outbox
+            .read_in_state(&f.wallet_name, "anvil", "0003-newest", OutboxState::Pending)
+            .unwrap();
+        f.handler
+            .tx_engine
+            .outbox
+            .transition(&entry, OutboxState::Failed)
+            .unwrap();
+        let listed = f.handler.list(&root).await.unwrap();
+        let latest = listed.iter().find(|entry| entry.name == "latest").unwrap();
+        assert_eq!(latest.link_target.as_deref(), Some("pending/0002-newer"));
+    }
+
+    #[tokio::test]
+    async fn outbox_latest_fails_closed_when_the_newest_pending_entry_is_unreadable() {
+        let f = make_handler_with_chain(true);
+        seed_pending_with_created_ms(&f, "0001-older", 5_000);
+        seed_pending_with_created_ms(&f, "0002-newer", 9_000);
+        // Corrupt the newest entry's intent: an agent following `latest` as
+        // the advertised atomic identity must not be silently redirected to
+        // the older transfer.
+        let dir = f
+            ._tmp
+            .path()
+            .join("outbox")
+            .join(&f.wallet_name)
+            .join("anvil")
+            .join("pending")
+            .join("0002-newer");
+        std::fs::write(dir.join("intent.json"), b"{ not json").unwrap();
+
+        let root = VfsPath::parse(&format!("/{}/chains/anvil/outbox", f.wallet_name)).unwrap();
+        assert!(
+            f.handler.list(&root).await.is_err(),
+            "an unreadable newest pending entry must surface, not fall back to an older transfer"
+        );
     }
 
     #[tokio::test]
