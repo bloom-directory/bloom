@@ -48,11 +48,16 @@ EOF
 }
 
 build_mount_demo() {
-    log "cargo build --release --features mount --example mount_demo"
+    # The demo constructs its daemon through the debug/test-gated convenience
+    # constructor; release builds expose it only under the unsigned-audit test
+    # seam, which is precisely what this disposable docker test lane is for.
+    # Production release packaging resolves features for package `bloom` and
+    # continues to reject this seam.
+    log "cargo build --release --features mount,unsigned-audit-test-seam --example mount_demo"
     cargo build \
         --release \
         --package bloom-daemon \
-        --features mount \
+        --features mount,unsigned-audit-test-seam \
         --example mount_demo >&2
 
     EXAMPLE_BIN=${CARGO_TARGET_DIR:-target}/release/examples/mount_demo
