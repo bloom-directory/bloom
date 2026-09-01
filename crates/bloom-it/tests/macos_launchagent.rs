@@ -154,7 +154,7 @@ fn macos_packaging_pins_platform_time_checkpoint_and_future_rootless_separation(
 #[test]
 fn installed_acceptance_derives_the_signed_release_digest_and_reads_sources_as_login() {
     let source = fs::read_to_string(
-        workspace().join("packaging/triad/macos/w0/run-installed-acceptance.sh"),
+        workspace().join("tests/conformance/macos-unix-principals/run-installed-acceptance.sh"),
     )
     .unwrap();
     assert!(source.contains("shasum -a 256 \"$payload/SHA256SUMS\""));
@@ -393,46 +393,26 @@ fn production_macos_bundle_forbids_archived_private_identity_material() {
 }
 
 #[test]
-fn macos_w0_workflows_stage_every_required_bundle_binary() {
-    let builder =
-        fs::read_to_string(workspace().join("packaging/triad/release/build-bundle.sh")).unwrap();
-    let required = [
-        "bloom",
-        "bloom-broker",
-        "bloom-signer",
-        "bloom-signer-migrate",
-    ];
-    for workflow in ["macos-unix-w0.yml", "macos-two-login-w0.yml"] {
+fn macos_conformance_workflows_consume_unified_candidates() {
+    for workflow in [
+        "macos-unix-conformance.yml",
+        "macos-two-login-conformance.yml",
+    ] {
         let source =
             fs::read_to_string(workspace().join(".github/workflows").join(workflow)).unwrap();
-        for binary in required {
-            assert!(
-                builder
-                    .contains("for binary in bloom bloom-broker bloom-signer bloom-signer-migrate"),
-                "bundle builder required-binary declaration drifted"
-            );
-            assert!(
-                source.contains(&format!("release/{binary}")),
-                "{workflow} does not stage required bundle binary {binary}"
-            );
-        }
+        assert!(source.contains("packaging/triad/release.sh build macos"));
+        assert!(source.contains("bloom-triad-test-unclaimed.tar.gz"));
         assert!(source.contains("Reject mutable sibling refs"));
         assert!(source.contains("^[0-9a-f]{40}$"));
-        assert!(
-            source
-                .matches("$name-staging/bin/bloom-signer-migrate")
-                .count()
-                == 1
-                || workflow == "macos-unix-w0.yml",
-            "two-login baseline, candidate, and failing payload loop must share the complete artifact set"
-        );
     }
 }
 
 #[test]
 fn privileged_w0_harness_requires_an_external_disposable_host_marker() {
-    let source =
-        fs::read_to_string(workspace().join("packaging/triad/macos/w0/run-disposable.sh")).unwrap();
+    let source = fs::read_to_string(
+        workspace().join("tests/conformance/macos-unix-principals/run-disposable.sh"),
+    )
+    .unwrap();
     assert!(source.contains("BLOOM_RUN_MACOS_UNIX_W0"));
     assert!(source.contains("/private/var/db/bloom-w0-disposable-host"));
     assert!(source.contains("bloom-macos-unix-w0-disposable-v1"));
@@ -476,8 +456,10 @@ fn privileged_w0_harness_requires_an_external_disposable_host_marker() {
         "the repository must not self-authorize a host as disposable"
     );
 
-    let two_login =
-        fs::read_to_string(workspace().join("packaging/triad/macos/w0/run-two-login.sh")).unwrap();
+    let two_login = fs::read_to_string(
+        workspace().join("tests/conformance/macos-unix-principals/run-two-login.sh"),
+    )
+    .unwrap();
     assert!(two_login.contains("active GUI domains for both selected users"));
     assert!(two_login.contains("another_login_session"));
     assert!(two_login.contains("second Broker opened a fallback TCP listener"));
@@ -498,7 +480,7 @@ fn privileged_w0_harness_requires_an_external_disposable_host_marker() {
     );
 
     let installed_acceptance = fs::read_to_string(
-        workspace().join("packaging/triad/macos/w0/run-installed-acceptance.sh"),
+        workspace().join("tests/conformance/macos-unix-principals/run-installed-acceptance.sh"),
     )
     .unwrap();
     assert!(installed_acceptance.contains("installed_ac_01_35"));
@@ -523,14 +505,16 @@ fn privileged_w0_harness_requires_an_external_disposable_host_marker() {
     assert!(ci.contains("macos_unix_principal_disposable_w0"));
     assert!(ci.contains("github.event_name == 'workflow_dispatch'"));
     assert!(ci.contains("github.ref_name == 'triad-architecture'"));
-    assert!(ci.contains("uses: ./.github/workflows/macos-unix-w0.yml"));
+    assert!(ci.contains("uses: ./.github/workflows/macos-unix-conformance.yml"));
 
     let workflow =
-        fs::read_to_string(workspace().join(".github/workflows/macos-unix-w0.yml")).unwrap();
+        fs::read_to_string(workspace().join(".github/workflows/macos-unix-conformance.yml"))
+            .unwrap();
     assert!(workflow.contains("workflow_call:"));
 
     let two_login_workflow =
-        fs::read_to_string(workspace().join(".github/workflows/macos-two-login-w0.yml")).unwrap();
+        fs::read_to_string(workspace().join(".github/workflows/macos-two-login-conformance.yml"))
+            .unwrap();
     assert!(two_login_workflow.contains("bloom-two-login-disposable"));
     assert!(two_login_workflow.contains("test \"$(id -u)\" !="));
     assert!(two_login_workflow.contains("failing-broker.c"));

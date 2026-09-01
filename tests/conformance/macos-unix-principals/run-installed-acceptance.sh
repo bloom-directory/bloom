@@ -205,7 +205,7 @@ done
 sudo -u "$login_user" \
   "$release_root/bloom" serve triad-health-check "$release_digest"
 launchctl bootout "$machine_label"
-"$main_root/packaging/triad/macos/w0/run-packaged-machine-negative.sh" \
+"$main_root/tests/conformance/macos-unix-principals/run-packaged-machine-negative.sh" \
   "$release_root/bloom" \
   "$login_uid" \
   "$login_user" \

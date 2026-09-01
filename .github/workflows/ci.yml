@@ -186,7 +186,7 @@ jobs:
     if: >-
       github.event_name == 'workflow_dispatch' &&
       github.ref_name == 'triad-architecture'
-    uses: ./.github/workflows/macos-unix-w0.yml
+    uses: ./.github/workflows/macos-unix-conformance.yml
     with:
       broker_ref: 50050a272b90d2b0473d25c1014886a0ea8ae7d7
       signer_ref: 3e9473ce4354dfd17303c5ea68ed8218417c0b49

@@ -2,7 +2,19 @@
 set -Eeuo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-main_root="$(cd "$script_dir/../../../.." && pwd)"
+main_root="$(cd "$script_dir/../../.." && pwd)"
+[[ $# -eq 1 ]] || {
+  echo "usage: $0 CANDIDATE_ARCHIVE" >&2
+  exit 64
+}
+candidate_archive="$1"
+candidate_archive="$(cd "$(dirname "$candidate_archive")" && pwd -P)/$(basename "$candidate_archive")"
+for input in "$candidate_archive" "$candidate_archive.sha256" "$candidate_archive.sig" "$candidate_archive.pub"; do
+  [[ -f "$input" && ! -L "$input" ]] || {
+    echo "missing macOS candidate input: $input" >&2
+    exit 66
+  }
+done
 workspace_root="$(dirname "$main_root")"
 broker_root="${BLOOM_TART_BROKER_ROOT:-$workspace_root/bloom-broker}"
 signer_root="${BLOOM_TART_SIGNER_ROOT:-$workspace_root/bloom-signer}"
@@ -11,13 +23,11 @@ guest_password="${BLOOM_TART_GUEST_PASSWORD:-admin}"
 keep_failed="${BLOOM_TART_KEEP_FAILED:-false}"
 run_id="$(date -u +%Y%m%dT%H%M%SZ)-$$"
 run_name="bloom-macos-w0-run-$run_id"
-local_output_root="${BLOOM_TART_OUTPUT_ROOT:-$workspace_root/.w0-local/runs/$run_id}"
-build_vm_log="$local_output_root/build-vm.log"
+local_output_root="${BLOOM_TART_OUTPUT_ROOT:-$workspace_root/.macos-conformance/runs/$run_id}"
 run_vm_log="$local_output_root/run-vm.log"
-build_log="$local_output_root/build.log"
 w0_log="$local_output_root/w0.log"
 
-for command_name in tart jq sshpass ssh nc git; do
+for command_name in tart jq sshpass ssh nc git tar; do
   command -v "$command_name" >/dev/null 2>&1 || {
     echo "missing local Tart W0 dependency: $command_name" >&2
     exit 69
@@ -129,6 +139,21 @@ prepare_source_bundle() {
 prepare_source_bundle "$main_root" bloom
 prepare_source_bundle "$broker_root" bloom-broker
 prepare_source_bundle "$signer_root" bloom-signer
+
+distribution_root="$local_output_root/triad-dist"
+verified_root="$local_output_root/verified"
+artifact_name="bloom-triad-test-unclaimed.tar.gz"
+mkdir -p "$distribution_root" "$verified_root"
+for suffix in "" .sha256 .sig .pub; do
+  install -m 0644 "$candidate_archive$suffix" "$distribution_root/$artifact_name$suffix"
+done
+BLOOM_ALLOW_TEST_UNCLAIMED=true \
+  "$main_root/packaging/triad/release/verify-bundle.sh" \
+  "$distribution_root/$artifact_name" \
+  "$distribution_root/$artifact_name.sha256" \
+  "$distribution_root/$artifact_name.sig" \
+  "$distribution_root/$artifact_name.pub"
+tar -xzf "$distribution_root/$artifact_name" -C "$verified_root"
 
 ssh_options=(
   -o StrictHostKeyChecking=no
@@ -250,16 +275,7 @@ run_guest() {
     tee "$log_path"
 }
 
-echo "building W0 candidate in local Tart base $development_base"
-start_vm "$development_base" "$build_vm_log"
-builder_ip="$guest_ip"
-run_guest \
-  "$builder_ip" \
-  "$script_dir/tart-build-guest.sh" \
-  "$build_log"
-stop_active_vm
-
-echo "creating disposable local macOS W0 clone $run_name"
+echo "creating disposable local macOS conformance clone $run_name"
 tart clone "$development_base" "$run_name"
 tart set "$run_name" --random-mac
 start_vm "$run_name" "$run_vm_log"

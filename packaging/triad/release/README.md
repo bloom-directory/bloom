@@ -5,11 +5,10 @@ independently: the Machine–Broker and Broker–Signer authority APIs require
 exactly 1.3, while Signer control and login-session liveness accept 1.0–1.1.
 Service packages may advance independently when every edge remains inside its
 declared range; incompatible edges fail closed.
-It also records the exact Broker, Signer, service-runtime, and Petal-contract
-commits plus the current state schema and downgrade floor for Machine, Broker,
-and Signer. `check-external-pins.py` rejects mutable or abbreviated Git pins.
-Its optional `--remote` mode proves the recorded commits through GitHub, but it
-is deliberately excluded from local artifact builds.
+It also records the reviewed Broker, Signer, service-runtime, and
+Petal-contract commits plus the current state schema and downgrade floor for
+Machine, Broker, and Signer. Candidate builds resolve the current checkouts
+and write those exact Broker and Signer revisions into the artifact-local copy.
 
 `build-bundle.sh` accepts the three service binaries, the bounded
 `bloom-signer-migrate` staging tool, and an ephemeral candidate key. It verifies semantic versions, scans every
@@ -69,26 +68,24 @@ For one candidate payload `C`, the disposable evidence matrix is:
 
 The signer refuses a mixture of evidence from different candidates.
 
-`triad-release-gate.sh` rejects modified or untracked release inputs, requires
-the Broker and Signer checkouts to match the full revisions in the matrix, runs
-locked format checks across all three workspaces, applies strict Clippy to the
-Machine workspace, builds release
-binaries, assembles the bundle twice, verifies both, requires byte-identical
-archives, matches the signed source revisions back to the three clean
-workspaces, executes each extracted production binary, then reruns all three
-workspace suites with the verified bundle bound as acceptance input. The gate
-requires `--test-signing-key`; a production key is never available while a
-newly built binary or its tests execute. `--output-dir` preserves the verified
-candidate for the release workflow.
+`../release.sh` is the public local and CI entry point:
 
-`verify-release-candidate.sh` verifies the transferred ephemeral signature and
-binds the candidate to the resolved version and all three full source commits.
-The candidate remains `test-unclaimed`; only the isolated signing pass rewrites
-that claim to `linux` before recalculating the signed payload manifest.
+```sh
+packaging/triad/release.sh build linux --output-dir DIR
+packaging/triad/release.sh build macos --output-dir DIR
+```
+
+It defaults to the current `../bloom-broker` and `../bloom-signer` checkouts,
+rejects dirty source inputs, builds with locked dependencies, validates the
+selected binary architecture and installer, assembles and verifies the bundle
+twice, and publishes byte-identical `test-unclaimed` output. It does not run
+repository-wide formatting, Clippy, or test suites; those are independent CI
+source-quality gates. Both platforms emit the archive plus `.sha256`, `.sig`,
+and `.pub` sidecars.
 
 `.github/workflows/macos-release-candidate.yml` is the manual, standard-runner
-macOS aarch64 counterpart to the Linux candidate build. It runs the same locked
-release gate on `macos-15`, proves both staged platform installers, rejects
+macOS aarch64 counterpart to the Linux candidate build. It runs the same
+release command on `macos-15`, proves the staged macOS installer, rejects
 non-arm64 outputs, and uploads the four `bloom-triad-test-unclaimed.tar.gz*`
 files as `triad-macos-aarch64-candidate`. It has no push or pull-request trigger
 and does not use a larger macOS runner. The ephemeral candidate key is trusted
@@ -98,13 +95,16 @@ root-owned, non-writable pin of that artifact's ephemeral public key and the
 explicit `BLOOM_ALLOW_TEST_UNCLAIMED=true` installer opt-in, matching the Linux
 candidate trust boundary.
 
-`sign-release-candidate.sh` is the isolated production signing pass. It never
-executes a candidate-owned binary or script. It replaces the ephemeral inner
-signature, deterministically repacks the payload, signs the outer checksum,
-and refuses a private key that does not match `bloom-release-v1.pub`. GitHub
-Actions makes this key available only to the `production-release` signing job.
-The tag workflow publishes the Linux x86_64 artifact as a prerelease so it can
-be validated before anything directs agents to it.
+`release.sh sign linux|macos` is the isolated production signing pass. It never
+executes a candidate-owned binary or script. It verifies the expected version
+and three source revisions, replaces the ephemeral inner signature,
+deterministically repacks the payload, signs the outer checksum, and refuses a
+private key that does not match the reviewed public key. macOS signing also
+requires a complete report bound to the reviewed conformance-key fingerprint.
+GitHub Actions makes the release key available only to the
+`production-release` signing job. The tag workflow publishes the Linux x86_64
+artifact as a prerelease so it can be validated before anything directs agents
+to it.
 
 Before merging release-workflow changes, dispatch the branch with
 `dry_run=true`. That path builds the exact branch with an ephemeral test key,
@@ -112,17 +112,10 @@ uploads the `test-unclaimed` candidate for inspection, and skips both the
 protected production-signing job and the publish job. Normal tag pushes and tag
 retries cannot select dry-run mode.
 
-Before compiling, `check-machine-authority-boundary.sh --require-clean`
-resolves every entry in `machine-production-feature-sets.tsv` with locked
-Cargo metadata and walks the normal/build edge closure from the exact Machine
-root. It rejects legacy authority crates, concrete local/custody signer
-implementations, and authority-restoring resolved features; dev-dependencies
-are not treated as production edges. The same gate checks the reachable
-production source roots for forbidden authority markers and files. There are
-no file-wide source-marker exceptions: a forbidden marker anywhere in a
-production source root fails the build. Bundle assembly independently rejects forbidden
-paths, printable markers, and retained Machine symbols, so stripping symbols
-or changing one source spelling cannot substitute for the Cargo graph proof.
+Before compiling, `release.sh` rejects the remaining forbidden production
+Machine features from the resolved normal/build Cargo graph. Bundle assembly
+independently rejects forbidden paths, printable markers, and retained Machine
+symbols.
 Debug and accepting-test artifacts remain forbidden across the entire bundle.
 Legacy authority markers, files, and symbols are scoped to the Machine
 executable and explicit Machine-owned payload roots; conforming custody and

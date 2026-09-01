@@ -1,4 +1,4 @@
-name: macOS two-login Unix-principal W0
+name: macOS two-login Unix-principal conformance
 
 on:
   workflow_call:
@@ -95,32 +95,27 @@ jobs:
       - name: Install Rust toolchain
         run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
 
-      - name: Build baseline, candidate, and activation-failing payloads
+      - name: Build candidate and conformance fixture payloads
         shell: bash
         run: |
           set -Eeuo pipefail
-          for manifest_and_package in \
-            "bloom/Cargo.toml bloom" \
-            "bloom-broker/Cargo.toml bloom-broker" \
-            "bloom-signer/Cargo.toml bloom-signer" \
-            "bloom-signer/Cargo.toml bloom-signer-migrate"
-          do
-            manifest="${manifest_and_package%% *}"
-            package="${manifest_and_package#* }"
-            CARGO_TARGET_DIR="$RUNNER_TEMP/candidate-target" \
-              cargo build \
-              --manifest-path "$manifest" \
-              --release \
-              -p "$package" \
-              --locked
-          done
           /usr/bin/ssh-keygen \
             -q \
             -t ed25519 \
             -N '' \
             -f "$RUNNER_TEMP/w0-release-key"
+          CARGO_TARGET_DIR="$RUNNER_TEMP/candidate-target" \
+            bloom/packaging/triad/release.sh build macos \
+            --broker-root "$GITHUB_WORKSPACE/bloom-broker" \
+            --signer-root "$GITHUB_WORKSPACE/bloom-signer" \
+            --candidate-signing-key "$RUNNER_TEMP/w0-release-key" \
+            --output-dir "$RUNNER_TEMP/candidate-dist"
+          mkdir -p "$RUNNER_TEMP/candidate-verified"
+          tar -xzf \
+            "$RUNNER_TEMP/candidate-dist/bloom-triad-test-unclaimed.tar.gz" \
+            -C "$RUNNER_TEMP/candidate-verified"
 
-          for name in baseline candidate failing; do
+          for name in baseline failing; do
             mkdir -p \
               "$RUNNER_TEMP/$name-staging/bin" \
               "$RUNNER_TEMP/$name-dist" \
@@ -129,14 +124,10 @@ jobs:
           cp "$RUNNER_TEMP/candidate-target/release/bloom" \
             "$RUNNER_TEMP/baseline-staging/bin/bloom"
           cp "$RUNNER_TEMP/candidate-target/release/bloom" \
-            "$RUNNER_TEMP/candidate-staging/bin/bloom"
-          cp "$RUNNER_TEMP/candidate-target/release/bloom" \
             "$RUNNER_TEMP/failing-staging/bin/bloom"
-          for name in baseline candidate; do
-            cp "$RUNNER_TEMP/candidate-target/release/bloom-broker" \
-              "$RUNNER_TEMP/$name-staging/bin/bloom-broker"
-          done
-          for name in baseline candidate failing; do
+          cp "$RUNNER_TEMP/candidate-target/release/bloom-broker" \
+            "$RUNNER_TEMP/baseline-staging/bin/bloom-broker"
+          for name in baseline failing; do
             cp "$RUNNER_TEMP/candidate-target/release/bloom-signer" \
               "$RUNNER_TEMP/$name-staging/bin/bloom-signer"
             cp "$RUNNER_TEMP/candidate-target/release/bloom-signer-migrate" \
@@ -176,7 +167,8 @@ jobs:
             BLOOM_MACHINE_SHA="$(git -C "$source_root" rev-parse HEAD)"
             BLOOM_BROKER_SHA="$(git -C bloom-broker rev-parse HEAD)"
             BLOOM_SIGNER_SHA="$(git -C bloom-signer rev-parse HEAD)"
-            "$source_root/packaging/triad/release/build-bundle.sh" \
+            BLOOM_COMPATIBILITY_FILE="$RUNNER_TEMP/candidate-verified/bloom-triad/compatibility-v1.toml" \
+              "$source_root/packaging/triad/release/build-bundle.sh" \
               "$RUNNER_TEMP/$name-staging" \
               "$RUNNER_TEMP/$name-dist/bloom-triad.tar.gz" \
               "$RUNNER_TEMP/w0-release-key" \
@@ -192,7 +184,6 @@ jobs:
           }
 
           build_payload baseline bloom
-          build_payload candidate bloom
           build_payload failing bloom
 
       - name: Prove disposable two-login host prerequisites
@@ -224,7 +215,7 @@ jobs:
             BLOOM_RUN_MACOS_UNIX_W0=true \
             BLOOM_RELEASE_PUBLIC_KEY=/private/var/db/bloom-w0-release-key.pem \
             BLOOM_MACOS_W0_EVIDENCE_DIR="$RUNNER_TEMP/macos-two-login-evidence" \
-            bloom/packaging/triad/macos/w0/run-two-login.sh \
+            bloom/tests/conformance/macos-unix-principals/run-two-login.sh \
             "$RUNNER_TEMP/baseline-verified/bloom-triad" \
             "$BLOOM_W0_LOGIN_UID_A" \
             "$BLOOM_W0_LOGIN_USER_A" \

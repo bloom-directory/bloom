@@ -598,6 +598,9 @@ pub(crate) fn prepare_prebuilt_release_petal(
     entry: &PreinstalledPetal,
     context: &bloom_daemon::ipc::IpcOperationContext,
 ) -> Result<PreparedReleasePetal> {
+    if context.is_cancelled() {
+        bail!("Petal acquisition cancelled");
+    }
     let repo = parse_github_install_url(entry.repository)?
         .ok_or_else(|| anyhow!("built-in Petal repository is not a GitHub source URL"))?;
     let release_base = format!(

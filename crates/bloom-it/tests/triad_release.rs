@@ -81,11 +81,13 @@ fn tag_release_builds_the_locked_triad_and_isolates_production_signing() {
     assert!(workflow.contains("ref: ${{ needs.prepare.outputs.broker_sha }}"));
     assert!(workflow.contains("repository: bloom-directory/bloom-signer"));
     assert!(workflow.contains("ref: ${{ needs.prepare.outputs.signer_sha }}"));
-    assert!(workflow.contains("--test-signing-key"));
+    assert!(workflow.contains("packaging/triad/release.sh build linux"));
     assert!(!workflow.contains("--platform-claim linux"));
-    assert!(workflow.contains("verify-release-candidate.sh"));
     assert!(workflow.contains("environment: production-release"));
-    assert!(workflow.contains("sign-release-candidate.sh"));
+    assert!(workflow.contains("packaging/triad/release.sh sign linux"));
+    assert!(!workflow.contains("triad-release-gate.sh"));
+    assert!(!workflow.contains("verify-release-candidate.sh"));
+    assert!(!workflow.contains("sign-release-candidate.sh"));
     assert!(workflow.contains("packaging/triad/release/bloom-release-v1.pub"));
     assert!(workflow.contains("--prerelease"));
     assert!(workflow.contains("--latest=false"));
@@ -133,18 +135,11 @@ fn macos_release_candidate_matches_the_linux_candidate_contract() {
             .all(|line| line.trim() == "runs-on: macos-15")
     );
     assert!(workflow.contains("uname -m | grep -Fx arm64"));
-    assert!(workflow.contains("packaging/triad/release/triad-release-gate.sh"));
-    assert!(workflow.contains("--test-signing-key"));
+    assert!(workflow.contains("packaging/triad/release.sh build macos"));
+    assert!(!workflow.contains("triad-release-gate.sh"));
     assert!(workflow.contains("--output-dir \"$RUNNER_TEMP/candidate\""));
     assert!(workflow.contains("name: triad-macos-aarch64-candidate"));
     assert!(workflow.contains("bloom-triad-test-unclaimed.tar.gz*"));
-
-    let release_gate = fs::read_to_string(release_script("triad-release-gate.sh")).unwrap();
-    assert!(release_gate.contains("installer/release/install-linux.sh"));
-    assert!(release_gate.contains("installer/release/install-macos.sh"));
-    assert!(release_gate.contains("BLOOM_ALLOW_TEST_UNCLAIMED=true"));
-    assert!(release_gate.contains("BLOOM_MACOS_LOG_GID=260504"));
-    assert!(release_gate.contains("macos-root/usr/local/libexec/bloom/current/bloom-broker"));
 
     let installer = fs::read_to_string(release_script("install-macos.sh")).unwrap();
     assert!(installer.contains("test-unclaimed bundle requires explicit candidate opt in"));
@@ -323,6 +318,21 @@ fn make_installer_payload(root: &Path) -> PathBuf {
 }
 
 fn build(staging: &Path, output: &Path, key: &Path) -> std::process::Output {
+    let compatibility = PathBuf::from(format!("{}.compatibility.toml", output.display()));
+    let compatibility_source = fs::read_to_string(release_script("compatibility-v1.toml")).unwrap();
+    fs::write(
+        &compatibility,
+        compatibility_source
+            .replace(
+                "broker_commit = \"984616efaf9e1ab5db12ad97254eface98d1f89b\"",
+                &format!("broker_commit = \"{}\"", "22".repeat(20)),
+            )
+            .replace(
+                "signer_commit = \"3cb4e3b2a788fca360999423be32792bbb7dcc7b\"",
+                &format!("signer_commit = \"{}\"", "33".repeat(20)),
+            ),
+    )
+    .unwrap();
     Command::new(release_script("build-bundle.sh"))
         .args([staging.as_os_str(), output.as_os_str(), key.as_os_str()])
         .arg("1700000000")
@@ -330,6 +340,7 @@ fn build(staging: &Path, output: &Path, key: &Path) -> std::process::Output {
         .env("BLOOM_BROKER_SHA", "22".repeat(20))
         .env("BLOOM_SIGNER_SHA", "33".repeat(20))
         .env("BLOOM_ALLOW_TEST_UNCLAIMED", "true")
+        .env("BLOOM_COMPATIBILITY_FILE", compatibility)
         .output()
         .unwrap()
 }
@@ -656,9 +667,8 @@ fn serve_starts_audited_projection_refresh_after_fallible_setup() {
 
 #[test]
 fn production_release_rejects_machine_audit_test_features() {
-    let gate =
-        fs::read_to_string(workspace().join("packaging/triad/release/triad-release-gate.sh"))
-            .expect("read release gate");
+    let gate = fs::read_to_string(workspace().join("packaging/triad/release.sh"))
+        .expect("read release entrypoint");
     let bundle = fs::read_to_string(workspace().join("packaging/triad/release/build-bundle.sh"))
         .expect("read bundle builder");
     for forbidden in ["unsigned-audit-test-seam", "audit-test-seam"] {
@@ -760,7 +770,7 @@ fn release_bundle_allows_signer_authority_but_rejects_machine_owned_authority() 
 
 #[test]
 fn installed_acceptance_runs_the_packaged_machine_runtime_negative() {
-    let w0 = workspace().join("packaging/triad/macos/w0");
+    let w0 = workspace().join("tests/conformance/macos-unix-principals");
     let acceptance = fs::read_to_string(w0.join("run-installed-acceptance.sh")).unwrap();
     assert!(acceptance.contains("source cleanliness inspection failed"));
     assert!(acceptance.contains("if ! tracked_status=\"$("));
@@ -842,9 +852,9 @@ fn installed_acceptance_runs_the_packaged_machine_runtime_negative() {
 }
 
 #[test]
-fn tart_bundle_build_uses_verified_source_bundles() {
-    let w0 = workspace().join("packaging/triad/macos/w0");
-    let source = fs::read_to_string(w0.join("tart-build-guest.sh")).unwrap();
+fn tart_conformance_consumes_candidate_and_verified_source_bundles() {
+    let w0 = workspace().join("tests/conformance/macos-unix-principals");
+    let source = fs::read_to_string(w0.join("tart-run-guest.sh")).unwrap();
     assert!(source.contains("git clone --quiet \"$bundle\" \"$temporary\""));
     assert!(source.contains("git -C \"$temporary\" fsck --no-dangling"));
     assert!(source.contains("[[ ! -L \"$local_source_root\" ]]"));
@@ -852,6 +862,10 @@ fn tart_bundle_build_uses_verified_source_bundles() {
     assert!(!source.contains("readonly main_root=\"$shared_root/bloom\""));
 
     let runner = fs::read_to_string(w0.join("run-tart-local.sh")).unwrap();
+    assert!(runner.contains("CANDIDATE_ARCHIVE"));
+    assert!(runner.contains("verify-bundle.sh"));
+    assert!(!runner.contains("tart-build-guest.sh"));
+    assert!(!runner.contains("building W0 candidate"));
     assert!(runner.contains("git -C \"$repository_root\" bundle create"));
     assert!(runner.contains("git -C \"$repository_root\" bundle verify \"$temporary\""));
     assert!(runner.contains("git -C \"$repository_root\" bundle list-heads \"$temporary\""));
@@ -989,6 +1003,17 @@ fn triad_bundle_is_reproducible_signed_and_self_verifying() {
     );
     assert_eq!(fs::read(&first).unwrap(), fs::read(&second).unwrap());
 
+    let compatibility = Command::new("tar")
+        .args(["-xOzf"])
+        .arg(&first)
+        .arg("bloom-triad/compatibility-v1.toml")
+        .output()
+        .unwrap();
+    assert!(compatibility.status.success());
+    let compatibility = String::from_utf8(compatibility.stdout).unwrap();
+    assert!(compatibility.contains(&format!("broker_commit = \"{}\"", "22".repeat(20))));
+    assert!(compatibility.contains(&format!("signer_commit = \"{}\"", "33".repeat(20))));
+
     let checksum = PathBuf::from(format!("{}.sha256", first.display()));
     let signature = PathBuf::from(format!("{}.sig", first.display()));
     let public_key = PathBuf::from(format!("{}.pub", first.display()));
@@ -1018,138 +1043,6 @@ fn triad_bundle_is_reproducible_signed_and_self_verifying() {
     assert!(
         !wrong_namespace.status.success(),
         "an archive signature must not verify in the payload namespace"
-    );
-}
-
-#[test]
-fn production_candidate_signing_is_data_only_reproducible_and_key_pinned() {
-    let directory = tempfile::tempdir().unwrap();
-    let staging = make_staging(directory.path());
-    let execution_marker = directory.path().join("candidate-executed");
-    for binary in [
-        "bloom",
-        "bloom-broker",
-        "bloom-signer",
-        "bloom-signer-migrate",
-    ] {
-        let path = staging.join("bin").join(binary);
-        let script = fs::read_to_string(&path).unwrap();
-        fs::write(
-            &path,
-            script.replacen(
-                "#!/bin/sh\n",
-                &format!("#!/bin/sh\ntouch '{}'\n", execution_marker.display()),
-                1,
-            ),
-        )
-        .unwrap();
-    }
-
-    let candidate_key = directory.path().join("candidate-key");
-    generate_ed25519_key(&candidate_key);
-    let candidate = directory.path().join("candidate.tar.gz");
-    let built = build(&staging, &candidate, &candidate_key);
-    assert!(
-        built.status.success(),
-        "{}",
-        String::from_utf8_lossy(&built.stderr)
-    );
-    assert!(execution_marker.exists());
-    fs::remove_file(&execution_marker).unwrap();
-
-    let release_key = directory.path().join("release-key");
-    let release_public_key = directory.path().join("release-key.pub.pinned");
-    generate_ed25519_key(&release_key);
-    write_ed25519_public_key(&release_key, &release_public_key);
-    let first_dir = directory.path().join("signed-a");
-    let second_dir = directory.path().join("signed-b");
-    fs::create_dir(&first_dir).unwrap();
-    fs::create_dir(&second_dir).unwrap();
-    let first = first_dir.join("bloom-triad-linux-x86_64.tar.gz");
-    let second = second_dir.join("bloom-triad-linux-x86_64.tar.gz");
-    let expected_machine_sha = "11".repeat(20);
-    let expected_broker_sha = "22".repeat(20);
-    let expected_signer_sha = "33".repeat(20);
-    for output in [&first, &second] {
-        let signed = Command::new(release_script("sign-release-candidate.sh"))
-            .args([
-                candidate.as_os_str(),
-                output.as_os_str(),
-                release_key.as_os_str(),
-                release_public_key.as_os_str(),
-            ])
-            .args([
-                "1700000000",
-                env!("CARGO_PKG_VERSION"),
-                &expected_machine_sha,
-                &expected_broker_sha,
-                &expected_signer_sha,
-            ])
-            .output()
-            .unwrap();
-        assert!(
-            signed.status.success(),
-            "{}",
-            String::from_utf8_lossy(&signed.stderr)
-        );
-    }
-    assert!(!execution_marker.exists());
-    assert_eq!(fs::read(&first).unwrap(), fs::read(&second).unwrap());
-
-    let first_checksum = PathBuf::from(format!("{}.sha256", first.display()));
-    let first_signature = PathBuf::from(format!("{}.sig", first.display()));
-    let verifier_tools = directory.path().join("verifier-tools");
-    fs::create_dir(&verifier_tools).unwrap();
-    let file = verifier_tools.join("file");
-    fs::write(&file, "#!/bin/sh\necho 'ELF 64-bit LSB executable'\n").unwrap();
-    fs::set_permissions(&file, fs::Permissions::from_mode(0o755)).unwrap();
-    let verified = Command::new(release_script("verify-bundle.sh"))
-        .args([
-            first.as_os_str(),
-            first_checksum.as_os_str(),
-            first_signature.as_os_str(),
-            release_public_key.as_os_str(),
-        ])
-        .env(
-            "PATH",
-            format!(
-                "{}:{}",
-                verifier_tools.display(),
-                std::env::var("PATH").unwrap()
-            ),
-        )
-        .output()
-        .unwrap();
-    assert!(
-        verified.status.success(),
-        "{}",
-        String::from_utf8_lossy(&verified.stderr)
-    );
-
-    let wrong_key = directory.path().join("wrong-key");
-    let wrong_public_key = directory.path().join("wrong-key.pub.pinned");
-    generate_ed25519_key(&wrong_key);
-    write_ed25519_public_key(&wrong_key, &wrong_public_key);
-    let rejected = Command::new(release_script("sign-release-candidate.sh"))
-        .args([
-            candidate.as_os_str(),
-            directory.path().join("wrong.tar.gz").as_os_str(),
-            release_key.as_os_str(),
-            wrong_public_key.as_os_str(),
-        ])
-        .args([
-            "1700000000",
-            env!("CARGO_PKG_VERSION"),
-            &expected_machine_sha,
-            &expected_broker_sha,
-            &expected_signer_sha,
-        ])
-        .output()
-        .unwrap();
-    assert!(!rejected.status.success());
-    assert!(
-        String::from_utf8_lossy(&rejected.stderr)
-            .contains("does not match the reviewed public key")
     );
 }
 

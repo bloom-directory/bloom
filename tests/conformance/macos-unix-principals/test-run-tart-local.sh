@@ -2,11 +2,15 @@
 set -Eeuo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-main_root="$(cd "$script_dir/../../../.." && pwd)"
+main_root="$(cd "$script_dir/../../.." && pwd)"
 work="$(mktemp -d "${TMPDIR:-/tmp}/bloom-tart-local-test.XXXXXX")"
 trap 'find "$work" -depth -delete' EXIT
+candidate="$work/candidate.tar.gz"
+touch "$candidate" "$candidate.sha256" "$candidate.sig" "$candidate.pub"
 
 mkdir -p "$work/bin"
+printf '#!/bin/sh\nexit 0\n' >"$work/bin/sshpass"
+chmod +x "$work/bin/sshpass"
 cat >"$work/bin/git" <<'EOF'
 #!/bin/bash
 if [[ "${1:-}" == -C ]]; then
@@ -43,7 +47,7 @@ status=0
   PATH="$work/bin:$PATH" \
     BLOOM_TART_BROKER_ROOT="$main_root" \
     BLOOM_TART_SIGNER_ROOT="$main_root" \
-    "$script_dir/run-tart-local.sh"
+    "$script_dir/run-tart-local.sh" "$candidate"
 ) >"$work/list-failure.out" 2>&1 || status=$?
 if [[ "$status" -ne 70 ]]; then
   echo "Tart list failure returned $status instead of 70" >&2
@@ -73,7 +77,7 @@ status=0
     BLOOM_TART_SIGNER_ROOT="$main_root" \
     BLOOM_TART_DEVELOPMENT_BASE=fake-base \
     BLOOM_TART_OUTPUT_ROOT="$work/status-failure-output" \
-    "$script_dir/run-tart-local.sh"
+    "$script_dir/run-tart-local.sh" "$candidate"
 ) >"$work/status-failure.out" 2>&1 || status=$?
 if [[ "$status" -ne 65 ]]; then
   echo "Git status failure returned $status instead of 65" >&2
@@ -82,23 +86,5 @@ if [[ "$status" -ne 65 ]]; then
 fi
 grep -F 'failed to inspect Tart source repository:' \
   "$work/status-failure.out" >/dev/null
-
-status=0
-(
-  cd "$work"
-  PATH="$work/bin:$PATH" \
-    BLOOM_TART_BROKER_ROOT="$main_root" \
-    BLOOM_TART_SIGNER_ROOT="$main_root" \
-    BLOOM_TART_DEVELOPMENT_BASE=fake-base \
-    BLOOM_TART_OUTPUT_ROOT="$work/output" \
-    "$script_dir/run-tart-local.sh"
-) >"$work/run-failure.out" 2>&1 || status=$?
-if [[ "$status" -eq 0 ]]; then
-  echo "early Tart run-process exit unexpectedly passed" >&2
-  cat "$work/run-failure.out" >&2
-  exit 1
-fi
-grep -F 'Tart VM process exited before SSH was ready: fake-base (status 23)' \
-  "$work/run-failure.out" >/dev/null
 
 echo 'local Tart orchestration failure tests passed'

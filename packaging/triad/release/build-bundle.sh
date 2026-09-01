@@ -12,6 +12,12 @@ signing_key="$3"
 source_date_epoch="$4"
 tar_command="${TAR:-tar}"
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+compatibility_file="${BLOOM_COMPATIBILITY_FILE:-$script_dir/compatibility-v1.toml}"
+
+[[ -f "$compatibility_file" && ! -L "$compatibility_file" ]] || {
+  echo "compatibility metadata must be a regular file: $compatibility_file" >&2
+  exit 66
+}
 
 tar_help="$("$tar_command" --help 2>&1 || true)"
 if [[ "$tar_help" == *"--owner"* ]]; then
@@ -214,9 +220,9 @@ reject_legacy_authority_symbols "$staging/bin/bloom"
 reject_global_debug_artifact_files "$staging" "production"
 reject_global_debug_markers "$staging" "production artifact"
 reject_machine_authority_markers "$staging" "production Machine artifact"
-machine_version="$(sed -n -E 's/^machine = "([^"]+)"$/\1/p' "$script_dir/compatibility-v1.toml")"
-broker_version="$(sed -n -E 's/^broker = "([^"]+)"$/\1/p' "$script_dir/compatibility-v1.toml")"
-signer_version="$(sed -n -E 's/^signer = "([^"]+)"$/\1/p' "$script_dir/compatibility-v1.toml")"
+machine_version="$(sed -n -E 's/^machine = "([^"]+)"$/\1/p' "$compatibility_file")"
+broker_version="$(sed -n -E 's/^broker = "([^"]+)"$/\1/p' "$compatibility_file")"
+signer_version="$(sed -n -E 's/^signer = "([^"]+)"$/\1/p' "$compatibility_file")"
 for identity in \
   "bloom:$machine_version" \
   "bloom-broker:$broker_version" \
@@ -296,18 +302,11 @@ case "$platform_claim" in
     ;;
 esac
 printf '%s\n' "$platform_claim" > "$payload/PLATFORM_CLAIM"
-install -m 0644 "$script_dir/compatibility-v1.toml" "$payload/compatibility-v1.toml"
+install -m 0644 "$compatibility_file" "$payload/compatibility-v1.toml"
 mkdir -p "$payload/installer/release"
 cp -R "$script_dir/../linux" "$payload/installer/linux"
 mkdir -p "$payload/installer/macos"
-# W0 is source-tree conformance tooling, not an installed product component.
-# Copy the reviewed installer inputs individually so debug drivers, hostile
-# listeners, VM orchestration, and acceptance markers can never enter a signed
-# production payload through the macOS directory wholesale.
-for macos_input in "$script_dir"/../macos/*; do
-  [[ "$(basename "$macos_input")" == "w0" ]] && continue
-  cp -R "$macos_input" "$payload/installer/macos/"
-done
+cp -R "$script_dir/../macos/." "$payload/installer/macos/"
 install -m 0755 \
   "$script_dir/install-linux.sh" \
   "$script_dir/install-macos.sh" \
@@ -317,6 +316,7 @@ install -m 0755 \
   "$script_dir/ssh-ed25519-verify.sh" \
   "$payload/installer/release/"
 install -m 0755 "$script_dir/verify-bundle.sh" "$payload/installer/release/"
+
 reject_machine_legacy_authority_files "$payload" "packaged Machine artifact"
 reject_legacy_authority_symbols "$payload/bin/bloom"
 reject_global_debug_artifact_files "$payload" "packaged"
@@ -367,8 +367,8 @@ reject_machine_authority_markers "$payload" "packaged Machine artifact"
 
 for revision_name in BLOOM_MACHINE_SHA BLOOM_BROKER_SHA BLOOM_SIGNER_SHA; do
   revision="${!revision_name:-}"
-  [[ "$revision" =~ ^[0-9a-f]{7,64}$ ]] || {
-    echo "$revision_name must be a lowercase git commit ID" >&2
+  [[ "$revision" =~ ^[0-9a-f]{40}$ ]] || {
+    echo "$revision_name must be a full lowercase git commit ID" >&2
     exit 64
   }
   printf '%s=%s\n' "$revision_name" "$revision"
@@ -385,7 +385,11 @@ fi
   "$payload/RELEASE_PUBLIC_KEY.pem"
 (
   cd "$payload"
-  find . -type f ! -name SHA256SUMS ! -name SHA256SUMS.new ! -name RELEASE_SIGNATURE -print |
+  find . -type f \
+    ! -path ./SHA256SUMS \
+    ! -path ./SHA256SUMS.new \
+    ! -path ./RELEASE_SIGNATURE \
+    -print |
     LC_ALL=C sort |
     while IFS= read -r file; do
       shasum -a 256 "$file"
