@@ -133,9 +133,24 @@ smoke_linux_installer() {
 }
 
 smoke_macos_installer() {
-  local bundle="$1" work="$2" payload="$work/install-payload"
+  local bundle="$1" work="$2" payload="$work/install-payload" config
   local release_digest
   cp -R "$bundle" "$payload"
+  mkdir -p "$payload/config"
+  for config in \
+    edge-manifest.json \
+    broker.json \
+    signer.json \
+    machine-identity.json \
+    broker-identity.json \
+    signer-identity.json \
+    revoke-identity.json \
+    session-identity.json \
+    installer-identity.json \
+    provenance-catalog.json
+  do
+    printf '{}\n' >"$payload/config/$config"
+  done
   mkdir -p "$work/macos-root"
   release_digest="$(shasum -a 256 "$payload/SHA256SUMS" | awk '{print $1}')"
   BLOOM_ALLOW_TEST_UNCLAIMED=true \
