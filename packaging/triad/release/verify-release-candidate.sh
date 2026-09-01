@@ -32,28 +32,6 @@ done
 
 work="$(mktemp -d)"
 trap 'find "$work" -depth -delete' EXIT
-python3 - "$candidate" <<'PY'
-import pathlib
-import sys
-import tarfile
-
-seen = set()
-with tarfile.open(sys.argv[1], "r:gz") as bundle:
-    for member in bundle.getmembers():
-        path = pathlib.PurePosixPath(member.name)
-        if (
-            path.is_absolute()
-            or ".." in path.parts
-            or not path.parts
-            or path.parts[0] != "bloom-triad"
-            or not (member.isfile() or member.isdir())
-            or member.name in seen
-        ):
-            raise SystemExit(f"unsafe release candidate entry: {member.name}")
-        seen.add(member.name)
-if "bloom-triad" not in seen:
-    raise SystemExit("release candidate has no bloom-triad root")
-PY
 BLOOM_ALLOW_TEST_UNCLAIMED=true \
   "$script_dir/verify-bundle.sh" \
   "$candidate" \

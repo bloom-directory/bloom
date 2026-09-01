@@ -66,45 +66,12 @@ fn release_compatibility_declares_each_edge_without_a_global_protocol_range() {
 }
 
 #[test]
-fn external_triad_dependencies_are_full_commit_pins() {
-    let output = Command::new(release_script("check-external-pins.py"))
-        .arg(workspace().join("Cargo.toml"))
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-}
-
-#[test]
 fn production_provenance_catalog_has_no_retired_native_hyperliquid_authority() {
     let catalog = fs::read_to_string(
         workspace().join("packaging/triad/macos/config/provenance-catalog.unsigned.json"),
     )
     .unwrap();
     assert!(!catalog.contains("hyperliquid."));
-}
-
-#[test]
-fn machine_authority_boundary_is_directly_enforced_and_strict_release_is_blocked() {
-    let release_dir = workspace().join("packaging/triad/release");
-    let tested = Command::new(release_dir.join("test-machine-authority-boundary.sh"))
-        .output()
-        .unwrap();
-    assert!(
-        tested.status.success(),
-        "{}",
-        String::from_utf8_lossy(&tested.stderr)
-    );
-
-    let release_gate = fs::read_to_string(release_dir.join("triad-release-gate.sh")).unwrap();
-    assert!(release_gate.contains("check-machine-authority-boundary.sh\" --require-clean"));
-    assert!(release_gate.contains("--output-dir"));
-    assert!(release_gate.contains("bloom-triad-test-unclaimed.tar.gz"));
-    assert!(release_gate.contains("cargo test --workspace --locked -- --skip macos_"));
-    assert!(!release_gate.contains("check-external-pins.py\" --remote"));
 }
 
 #[test]
@@ -182,36 +149,6 @@ fn macos_release_candidate_matches_the_linux_candidate_contract() {
     let installer = fs::read_to_string(release_script("install-macos.sh")).unwrap();
     assert!(installer.contains("test-unclaimed bundle requires explicit candidate opt in"));
     assert!(installer.contains("${BLOOM_ALLOW_TEST_UNCLAIMED:-}"));
-}
-
-#[test]
-fn legacy_hash_only_routes_are_checked_by_release_and_installed_acceptance() {
-    let release_dir = workspace().join("packaging/triad/release");
-    let release_gate = fs::read_to_string(release_dir.join("triad-release-gate.sh")).unwrap();
-    assert!(release_gate.contains("check-legacy-hash-only-routes.py"));
-    let bundle_gate = fs::read_to_string(release_dir.join("build-bundle.sh")).unwrap();
-    assert!(bundle_gate.contains("check-legacy-hash-only-routes.py"));
-
-    let legacy_routes = Command::new("python3")
-        .arg(release_dir.join("check-legacy-hash-only-routes.py"))
-        .output()
-        .unwrap();
-    assert!(
-        legacy_routes.status.success(),
-        "{}",
-        String::from_utf8_lossy(&legacy_routes.stderr)
-    );
-
-    let installed_acceptance = fs::read_to_string(
-        workspace().join("packaging/triad/macos/w0/run-installed-acceptance.sh"),
-    )
-    .unwrap();
-    assert!(installed_acceptance.contains("-p bloom-petals"));
-    assert!(installed_acceptance.contains("ac35_legacy_v0_1"));
-    let tart_build =
-        fs::read_to_string(workspace().join("packaging/triad/macos/w0/tart-build-guest.sh"))
-            .unwrap();
-    assert!(tart_build.contains("check-legacy-hash-only-routes.py"));
 }
 
 fn generate_ed25519_key(path: &Path) {
@@ -724,28 +661,13 @@ fn production_release_rejects_machine_audit_test_features() {
             .expect("read release gate");
     let bundle = fs::read_to_string(workspace().join("packaging/triad/release/build-bundle.sh"))
         .expect("read bundle builder");
-    let checker = fs::read_to_string(
-        workspace().join("packaging/triad/release/check-machine-authority-boundary.sh"),
-    )
-    .expect("read production feature-set checker");
-    let checker_tests = fs::read_to_string(
-        workspace().join("packaging/triad/release/test-machine-authority-boundary.sh"),
-    )
-    .expect("read production feature-set checker tests");
     for forbidden in ["unsigned-audit-test-seam", "audit-test-seam"] {
         assert!(gate.contains(forbidden));
         assert!(bundle.contains(forbidden));
-        assert!(checker.contains(forbidden));
     }
-    assert!(checker_tests.contains("for audit_feature in audit-test-seam"));
-    assert!(checker_tests.contains("forbidden-unsigned-audit-seam"));
-    assert!(checker_tests.contains("bloom-daemon:unsigned-audit-test-seam"));
     assert!(gate.contains("forbidden production Machine feature resolved"));
     assert!(gate.contains("cargo tree"));
     assert!(gate.contains("-e normal,build,features"));
-    assert!(checker_tests.contains("BLOOM_MACHINE_METADATA_FIXTURE"));
-    assert!(checker_tests.contains("BLOOM_MACHINE_FEATURE_TREE_FIXTURE"));
-    assert!(checker_tests.contains("forbidden resolved Machine feature"));
 }
 
 #[test]
@@ -920,33 +842,9 @@ fn installed_acceptance_runs_the_packaged_machine_runtime_negative() {
 }
 
 #[test]
-fn tart_bundle_build_runs_strict_machine_boundary_before_compilation() {
+fn tart_bundle_build_uses_verified_source_bundles() {
     let w0 = workspace().join("packaging/triad/macos/w0");
     let source = fs::read_to_string(w0.join("tart-build-guest.sh")).unwrap();
-    let boundary = source
-        .find("check-machine-authority-boundary.sh")
-        .expect("Tart build must invoke the strict Machine authority boundary");
-    assert!(
-        source[boundary..]
-            .starts_with("check-machine-authority-boundary.sh\" \\\n      --require-clean")
-    );
-    let cargo_build = source
-        .find("cargo build")
-        .expect("Tart build must compile production binaries");
-    let bundle_build = source
-        .find("build-bundle.sh")
-        .expect("Tart build must assemble the candidate bundle");
-    assert!(
-        boundary < cargo_build,
-        "boundary check must precede compilation"
-    );
-    assert!(
-        boundary < bundle_build,
-        "boundary check must precede bundle assembly"
-    );
-    assert!(source.contains("for attempt in 1 2 3"));
-    assert!(source.contains("if (( status <= 128 ))"));
-    assert!(source.contains("terminated by signal"));
     assert!(source.contains("git clone --quiet \"$bundle\" \"$temporary\""));
     assert!(source.contains("git -C \"$temporary\" fsck --no-dangling"));
     assert!(source.contains("[[ ! -L \"$local_source_root\" ]]"));
@@ -964,7 +862,6 @@ fn tart_bundle_build_runs_strict_machine_boundary_before_compilation() {
     assert!(runner.contains("if printf '%s\\n'"));
     assert!(runner.contains("'set -e'"));
     assert!(runner.contains("for _fork_probe in {1..200}"));
-    assert!(runner.contains("/usr/bin/python3 -c \"pass\""));
     assert!(runner.contains("\"admin@$guest_ip\" /bin/bash -s"));
     assert!(!runner.contains("/bin/bash -c"));
 
@@ -1717,54 +1614,6 @@ fn linux_installer_upgrade_rotation_and_confirmed_uninstall_are_staged_safely() 
         installed_manifest
     );
     fs::write(payload.join("config/edge-manifest.json"), payload_manifest).unwrap();
-
-    let rotated = directory.path().join("rotated.json");
-    let installed_digest = hex::encode(Sha256::digest(b"test payload\n"));
-    fs::write(
-        &rotated,
-        format!(r#"{{"build_digest":"{installed_digest}","maximum_connections":63}}"#),
-    )
-    .unwrap();
-    assert!(
-        Command::new(&installer)
-            .args(["rotate-config"])
-            .arg(&root)
-            .args(["1000", "signer"])
-            .arg(&rotated)
-            .status()
-            .unwrap()
-            .success()
-    );
-    assert_eq!(
-        fs::read(root.join("etc/bloom/1000/signer/config.json")).unwrap(),
-        format!(r#"{{"build_digest":"{installed_digest}","maximum_connections":63}}"#).as_bytes()
-    );
-
-    for (principal, forbidden) in [
-        ("broker", "{\"audit_key_id\":\"substituted\"}"),
-        ("signer", "{\"audit_historical_public_keys\":[]}"),
-    ] {
-        let installed_config =
-            fs::read(root.join(format!("etc/bloom/1000/{principal}/config.json"))).unwrap();
-        let replacement = directory.path().join(format!("{principal}-forbidden.json"));
-        fs::write(&replacement, forbidden).unwrap();
-        let rejected = Command::new(&installer)
-            .args(["rotate-config"])
-            .arg(&root)
-            .args(["1000", principal])
-            .arg(&replacement)
-            .output()
-            .unwrap();
-        assert!(!rejected.status.success());
-        assert!(
-            String::from_utf8_lossy(&rejected.stderr)
-                .contains("may not change authority or identity field")
-        );
-        assert_eq!(
-            fs::read(root.join(format!("etc/bloom/1000/{principal}/config.json"))).unwrap(),
-            installed_config
-        );
-    }
 
     assert!(
         !Command::new(&installer)

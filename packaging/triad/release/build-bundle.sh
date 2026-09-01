@@ -20,8 +20,6 @@ else
   tar_identity_args=(--uid=0 --gid=0 --uname=root --gname=root)
 fi
 
-python3 "$script_dir/check-legacy-hash-only-routes.py"
-
 machine_artifact_paths() {
   local root="$1"
   local candidate

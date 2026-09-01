@@ -226,8 +226,7 @@ start_vm() {
       sleep 60
       if printf '%s\n' \
         'set -e' \
-        'for _fork_probe in {1..200}; do /usr/bin/true; done' \
-        '/usr/bin/python3 -c "pass"' |
+        'for _fork_probe in {1..200}; do /usr/bin/true; done' |
         sshpass -p "$guest_password" \
           ssh "${ssh_options[@]}" "admin@$guest_ip" /bin/bash -s \
         >/dev/null 2>&1

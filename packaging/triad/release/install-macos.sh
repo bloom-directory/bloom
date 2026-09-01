@@ -106,18 +106,6 @@ prepare_verified_payload_for_execution() {
 field() {
   if command -v plutil >/dev/null 2>&1; then
     plutil -extract "$2" raw -o - "$1"
-  elif ! $live && command -v python3 >/dev/null 2>&1; then
-    python3 - "$1" "$2" <<'PY'
-import json
-import pathlib
-import sys
-
-value = json.loads(pathlib.Path(sys.argv[1]).read_text())[sys.argv[2]]
-if isinstance(value, bool):
-    print("true" if value else "false")
-else:
-    print(value)
-PY
   else
     die "plutil is required for live macOS installation"
   fi

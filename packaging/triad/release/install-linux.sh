@@ -5,7 +5,6 @@ usage() {
   cat >&2 <<'EOF'
 usage:
   install-linux.sh install ROOT LOGIN_UID LOGIN_USER PAYLOAD_DIR
-  install-linux.sh rotate-config ROOT LOGIN_UID PRINCIPAL CONFIG_JSON
   install-linux.sh uninstall --retain-custody ROOT LOGIN_UID
   install-linux.sh uninstall ROOT LOGIN_UID CONFIRM_TOKEN
 EOF
@@ -907,66 +906,6 @@ case "$action" in
         "BLOOM_BIN=/usr/bin/bloom" \
         "BLOOM_INSTALL_MODE=triad-linux-systemd" \
         "BLOOM_RELOGIN_REQUIRED=1"
-    fi
-    ;;
-  rotate-config)
-    [[ $# -eq 4 ]] || usage
-    validate_root_uid "$1" "$2"
-    principal="$3"
-    config="$4"
-    [[ "$principal" == "broker" || "$principal" == "signer" ]] || usage
-    test -f "$config" || {
-      echo "replacement config is missing" >&2
-      exit 66
-    }
-    destination="$root/etc/bloom/$login_uid/$principal/config.json"
-    test -d "$(dirname "$destination")" || {
-      echo "principal is not installed" >&2
-      exit 66
-    }
-    command -v python3 >/dev/null || {
-      echo "Linux config rotation requires python3 for closed-field validation" >&2
-      exit 69
-    }
-    python3 - "$destination" "$config" "$principal" <<'PY'
-import json
-import pathlib
-import sys
-
-old_path, new_path, principal = sys.argv[1:]
-try:
-    old = json.loads(pathlib.Path(old_path).read_text())
-    new = json.loads(pathlib.Path(new_path).read_text())
-except (OSError, UnicodeError, json.JSONDecodeError) as error:
-    raise SystemExit(f"invalid Linux {principal} config rotation JSON: {error}")
-if not isinstance(old, dict) or not isinstance(new, dict):
-    raise SystemExit("Linux config rotation requires JSON objects")
-
-operational = {
-    "maximum_connections",
-    "maximum_in_flight_mutations",
-    "maximum_requests_per_window",
-    "request_window_ms",
-    "maximum_journal_admissions_per_window",
-    "journal_window_ms",
-    "control_maximum_connections",
-    "control_maximum_in_flight_mutations",
-    "control_maximum_requests_per_window",
-    "control_request_window_ms",
-    "control_maximum_journal_admissions_per_window",
-    "control_journal_window_ms",
-}
-missing = object()
-for field in sorted(set(old) | set(new)):
-    if field not in operational and old.get(field, missing) != new.get(field, missing):
-        raise SystemExit(
-            f"Linux config rotation may not change authority or identity field: {field}"
-        )
-PY
-    atomic_install "$config" "$destination" 0600
-    if [[ "$root" == "/" ]]; then
-      chown "bloom-$principal-$login_uid:bloom-$principal-$login_uid" "$destination"
-      systemctl restart "bloom-$principal@$login_uid.service"
     fi
     ;;
   uninstall)
