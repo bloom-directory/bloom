@@ -8,6 +8,9 @@
 //! via the read client's gated `sendTransaction`. Reconciliation is separate
 //! (see [`crate::reconcile`]).
 
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, Weak};
+
 use base64::Engine as _;
 use bloom_broker_api::{Digest32, KeyRef};
 use bloom_solana::{SolanaClient, SolanaRpcError};
@@ -76,6 +79,15 @@ pub struct SolanaAccountPin {
     pub derivation_path: Option<String>,
 }
 
+struct StageRequest<'a> {
+    wallet: &'a str,
+    fee_payer: &'a [u8; 32],
+    account_pin: SolanaAccountPin,
+    destination: &'a [u8; 32],
+    lamports: u64,
+    now_ms: u128,
+}
+
 impl SolanaTransferIntent {
     /// The destination as its raw 32-byte public key.
     pub fn destination_bytes(&self) -> Result<[u8; 32], String> {
@@ -108,6 +120,7 @@ pub struct SolanaTransferEngine {
     client: SolanaClient,
     signer: SolanaTransferSigner,
     chain: String,
+    operation_locks: Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>,
 }
 
 impl SolanaTransferEngine {
@@ -122,6 +135,7 @@ impl SolanaTransferEngine {
             client,
             signer,
             chain: chain.into(),
+            operation_locks: Mutex::new(HashMap::new()),
         }
     }
 
@@ -131,6 +145,21 @@ impl SolanaTransferEngine {
 
     pub fn chain(&self) -> &str {
         &self.chain
+    }
+
+    fn operation_lock(&self, wallet: &str, id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let key = format!("{wallet}\0{}\0{id}", self.chain);
+        let mut locks = self
+            .operation_locks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        if let Some(lock) = locks.get(&key).and_then(Weak::upgrade) {
+            return lock;
+        }
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        locks.insert(key, Arc::downgrade(&lock));
+        lock
     }
 
     async fn require_fresh_blockhash(
@@ -168,6 +197,12 @@ impl SolanaTransferEngine {
 
     /// Stage a native transfer: fetch a recent blockhash, build the canonical
     /// legacy message, and persist the write-once intent in `pending/<id>/`.
+    ///
+    /// Staging an economically identical active transfer is idempotent: the
+    /// same message (same payer, destination, lamports, and blockhash) is one
+    /// Solana transaction with one deterministic signature, so the existing
+    /// entry is returned instead of creating a second receipt-eligible
+    /// outbox identity for the same payment.
     pub async fn stage(
         &self,
         wallet: &str,
@@ -177,6 +212,40 @@ impl SolanaTransferEngine {
         lamports: u64,
         now_ms: u128,
     ) -> Result<StagedSolanaTransfer, EngineError> {
+        // The empty id cannot collide with real outbox ids, so it names the
+        // per-wallet staging lane: two concurrent stagings of the same
+        // economic intent must both pass (or fail) the duplicate check
+        // together, not interleave around it.
+        let operation_lock = self.operation_lock(wallet, "");
+        let _operation_guard = operation_lock.lock().await;
+        let id = self.outbox.allocate_id();
+        self.stage_with_id(
+            id,
+            StageRequest {
+                wallet,
+                fee_payer,
+                account_pin,
+                destination,
+                lamports,
+                now_ms,
+            },
+        )
+        .await
+    }
+
+    async fn stage_with_id(
+        &self,
+        id: String,
+        request: StageRequest<'_>,
+    ) -> Result<StagedSolanaTransfer, EngineError> {
+        let StageRequest {
+            wallet,
+            fee_payer,
+            account_pin,
+            destination,
+            lamports,
+            now_ms,
+        } = request;
         // Establish cluster identity before fetching the blockhash. Keeping
         // both observations on the same client makes endpoint failover safe:
         // every endpoint must identify as the configured cluster.
@@ -198,7 +267,26 @@ impl SolanaTransferEngine {
                 EngineError::Invalid("RPC could not quote the exact message fee".into())
             })?;
         let payload_digest_hex = hex::encode(Sha256::digest(&message));
-        let id = self.outbox.allocate_id();
+        // One message is one chain transaction: the Ed25519 signature over
+        // it is deterministic, so a duplicate staged entry could never buy a
+        // second payment — only a second success receipt for the same one.
+        match self
+            .outbox
+            .find_by_message(wallet, &self.chain, &message_b64)?
+        {
+            Some(crate::outbox::MessageDuplicate::Pending(existing)) => {
+                return Ok(*existing);
+            }
+            Some(crate::outbox::MessageDuplicate::Dispatched) => {
+                return Err(EngineError::Invalid(
+                    "an identical transfer (same account, destination, amount, and blockhash) \
+                     was already dispatched; its outcome is reconciled by signature — read its \
+                     receipt, or wait for the blockhash to rotate before paying again"
+                        .into(),
+                ));
+            }
+            None => {}
+        }
         let expires_ms = self
             .blockhash_expiry_ms(blockhash.last_valid_block_height, now_ms)
             .await?;
@@ -247,6 +335,8 @@ impl SolanaTransferEngine {
         fee_payer: &[u8; 32],
         now_ms: u128,
     ) -> Result<StagedSolanaTransfer, EngineError> {
+        let operation_lock = self.operation_lock(wallet, id);
+        let _operation_guard = operation_lock.lock().await;
         let (entry, found_in) = self.outbox.read_restageable(wallet, &self.chain, id)?;
         // A swept entry is only recoverable if it went stale. Anything else in
         // `failed` — a policy refusal, say — is a decision, not an accident,
@@ -278,22 +368,31 @@ impl SolanaTransferEngine {
             .map_err(|error| EngineError::Invalid(format!("destination base58: {error}")))?
             .try_into()
             .map_err(|_| EngineError::Invalid("destination must be 32 bytes".into()))?;
-        let replacement = self
-            .stage(
-                wallet,
-                fee_payer,
-                // The replacement is the same transfer from the same account,
-                // so it carries the original pin forward rather than being
-                // re-resolved.
-                SolanaAccountPin {
-                    fingerprint: entry.staged.account_fingerprint.clone(),
-                    derivation_path: entry.staged.account_derivation_path.clone(),
-                },
-                &destination,
-                entry.staged.lamports,
-                now_ms,
-            )
-            .await?;
+        let replacement_id = self.outbox.reserve_restage_replacement(&entry)?;
+        let replacement = match self.outbox.read(wallet, &self.chain, &replacement_id) {
+            Ok(replacement) => replacement.staged,
+            Err(OutboxError::NotFound(_)) => {
+                self.stage_with_id(
+                    replacement_id,
+                    StageRequest {
+                        wallet,
+                        fee_payer,
+                        // The replacement is the same transfer from the same account,
+                        // so it carries the original pin forward rather than being
+                        // re-resolved.
+                        account_pin: SolanaAccountPin {
+                            fingerprint: entry.staged.account_fingerprint.clone(),
+                            derivation_path: entry.staged.account_derivation_path.clone(),
+                        },
+                        destination: &destination,
+                        lamports: entry.staged.lamports,
+                        now_ms,
+                    },
+                )
+                .await?
+            }
+            Err(error) => return Err(error.into()),
+        };
 
         let mut expired = entry;
         expired.staged.status = SolanaTxStatus::Expired;
@@ -310,13 +409,22 @@ impl SolanaTransferEngine {
         Ok(replacement)
     }
 
+    /// Cancel a transfer only while no broadcast attempt can be in flight.
+    pub async fn cancel(&self, wallet: &str, id: &str) -> Result<(), EngineError> {
+        let operation_lock = self.operation_lock(wallet, id);
+        let _operation_guard = operation_lock.lock().await;
+        self.outbox.cancel(wallet, &self.chain, id)?;
+        Ok(())
+    }
+
     /// Confirm and sign a staged transfer. On `Signed` the signature is
     /// recorded in the outbox, but the entry **stays `pending`** — it only
-    /// moves to `sent` once [`Self::broadcast`] actually succeeds. A signed
+    /// moves to `sent` once [`Self::broadcast`] claims the submission before
+    /// dispatch. A signed
     /// message with no broadcast attempt yet is still exactly as
-    /// retryable/cancellable as an unsigned one (mirrors `bloom-tx`'s EVM
-    /// `confirm` path, which gates its `Sent` transition on the broadcast
-    /// RPC call itself succeeding, never on signing alone). On
+    /// retryable/cancellable as an unsigned one. After dispatch, `sent`
+    /// conservatively means the outcome may be unknown and reconciliation
+    /// owns the deterministic signature. On
     /// `ApprovalRequired` the ceremony details are returned and the entry
     /// stays pending for a retry with the returned `approval_id`.
     pub async fn sign(
@@ -344,22 +452,22 @@ impl SolanaTransferEngine {
 
         let outcome = self
             .signer
-            .sign_transfer(
-                wallet,
+            .sign_transfer(crate::signing::SignTransferRequest {
+                wallet_id: wallet,
                 fee_payer,
                 account_key_ref,
-                &message,
-                &entry.staged.destination,
-                entry.staged.lamports,
-                entry.staged.fee_lamports,
-                &entry.staged.genesis_hash,
-                &entry.staged.blockhash,
-                entry.staged.last_valid_block_height,
+                message_bytes: &message,
+                destination: &entry.staged.destination,
+                lamports: entry.staged.lamports,
+                fee_lamports: entry.staged.fee_lamports,
+                genesis_hash: &entry.staged.genesis_hash,
+                recent_blockhash: &entry.staged.blockhash,
+                last_valid_block_height: entry.staged.last_valid_block_height,
                 approval_id,
-                now_ms.min(u128::from(u64::MAX)) as u64,
-                (now_ms + u128::from(SIGN_TTL_MS)).min(u128::from(u64::MAX)) as u64,
-                plan_facts_digest,
-            )
+                issued_at_ms: now_ms.min(u128::from(u64::MAX)) as u64,
+                expires_at_ms: (now_ms + u128::from(SIGN_TTL_MS)).min(u128::from(u64::MAX)) as u64,
+                canonical_plan_facts_digest: plan_facts_digest,
+            })
             .await
             .map_err(EngineError::Signer)?;
 
@@ -371,22 +479,22 @@ impl SolanaTransferEngine {
         Ok(outcome)
     }
 
-    /// Broadcast a signed transfer: assemble the transaction from the
-    /// recorded signature + message and submit it. The entry transitions
-    /// `pending` → `sent` only *after* the broadcast RPC call actually
-    /// succeeds — if `send_transaction` fails (RPC timeout, node error, a
-    /// normal and expected failure mode), the entry is left exactly where
-    /// it was, still `pending` and so still retryable (call `sign`+
-    /// `broadcast` again — signing is idempotent, it just re-records the
-    /// same signature) or cancellable, never permanently stranded in a
-    /// `sent` state that reflects a broadcast that never happened.
-    /// Returns the transaction signature.
+    /// Broadcast a signed transfer with at-most-once submission semantics.
+    ///
+    /// The exact raw transaction and deterministic signature are durably
+    /// recorded, and the entry is made non-cancellable, before the network
+    /// write begins. A timeout or lost response is therefore reconciled by
+    /// signature instead of being misreported as a safe-to-retry pending
+    /// transfer. `sent` means "a broadcast may have been attempted", not that
+    /// the endpoint acknowledged or the cluster finalized it.
     pub async fn broadcast(
         &self,
         wallet: &str,
         id: &str,
         now_ms: u128,
     ) -> Result<String, EngineError> {
+        let operation_lock = self.operation_lock(wallet, id);
+        let _operation_guard = operation_lock.lock().await;
         if !self.client.allow_broadcast() {
             return Err(EngineError::BroadcastDisabled(self.chain.clone()));
         }
@@ -451,20 +559,16 @@ impl SolanaTransferEngine {
             )));
         }
 
-        // Broadcast first, while the entry is still `pending`: on failure
-        // it must stay exactly there, never move to `sent` for a broadcast
-        // that never actually happened.
-        let submitted = self.client.send_transaction(&tx_b64).await?;
-        if submitted != signature_b58 {
-            return Err(EngineError::Invalid(format!(
-                "RPC returned transaction signature {submitted}, but Bloom submitted {signature_b58}"
-            )));
-        }
+        // Persist the exact attempt before any network effect. The marker is
+        // written after the private raw bytes, so every published marker is
+        // complete and hash-verifiable after a crash.
+        self.outbox
+            .write_broadcast_attempt(&entry, &signature_b58, &tx_bytes, now_ms)?;
 
-        // Only a confirmed-successful broadcast earns the `sent` transition.
-        // `staged.status` and the on-disk directory must agree, so derive
-        // the target state from the status via `from_status` rather than
-        // hardcoding a state literal that could drift from it.
+        // Claim the entry for reconciliation before sendTransaction. Once in
+        // `sent`, neither cancel nor restage can race the network write, and a
+        // crash or ambiguous response is recoverable by deterministic
+        // signature without retrying the write.
         let mut staged = entry.staged.clone();
         staged.status = SolanaTxStatus::Sent;
         let target_state = SolanaOutboxState::from_status(&staged.status);
@@ -475,8 +579,13 @@ impl SolanaTransferEngine {
             dir: sent_dir,
         };
         self.outbox.rewrite_intent(&sent_entry)?;
-        self.outbox
-            .write_broadcast_attempt(&sent_entry, &submitted, &tx_bytes, now_ms)?;
+
+        let submitted = self.client.send_transaction(&tx_b64).await?;
+        if submitted != signature_b58 {
+            return Err(EngineError::Invalid(format!(
+                "RPC returned transaction signature {submitted}, but Bloom submitted {signature_b58}"
+            )));
+        }
         Ok(submitted)
     }
 }

@@ -39,6 +39,10 @@ fn outbox() -> (TempDir, SolanaOutbox) {
     (dir, outbox)
 }
 
+fn heights_past_window(chain: &str, height: u64) -> std::collections::HashMap<String, u64> {
+    std::collections::HashMap::from([(chain.to_string(), height)])
+}
+
 #[test]
 fn stage_and_read_roundtrip() {
     let (_dir, outbox) = outbox();
@@ -191,6 +195,31 @@ fn broadcast_attempt_binds_raw_tx_hash() {
 }
 
 #[test]
+fn broadcast_attempt_makes_a_pending_entry_non_cancellable() {
+    let (_dir, outbox) = outbox();
+    outbox.write_pending(&staged("0001-00001"), "plan").unwrap();
+    let entry = outbox.read("alice", "solana-devnet", "0001-00001").unwrap();
+    outbox
+        .write_broadcast_attempt(&entry, "SIG", b"signed-tx-bytes", 2000)
+        .unwrap();
+
+    let error = outbox
+        .cancel("alice", "solana-devnet", "0001-00001")
+        .unwrap_err();
+    assert!(matches!(error, OutboxError::BroadcastAttempted(_)));
+    assert!(
+        outbox
+            .read_in_state(
+                "alice",
+                "solana-devnet",
+                "0001-00001",
+                SolanaOutboxState::Pending,
+            )
+            .is_ok()
+    );
+}
+
+#[test]
 fn cancel_moves_pending_to_failed() {
     let (_dir, outbox) = outbox();
     outbox.write_pending(&staged("0001-00001"), "plan").unwrap();
@@ -210,7 +239,9 @@ fn sweep_expired_removes_only_expired() {
     outbox.write_pending(&expiring, "plan").unwrap();
     outbox.write_pending(&staged("0002-00002"), "plan").unwrap();
 
-    let removed = outbox.sweep_expired(1000).unwrap();
+    let removed = outbox
+        .sweep_expired(1000, &heights_past_window("solana-devnet", 123457))
+        .unwrap();
     assert_eq!(removed, 1);
     let expired = outbox
         .read_in_state(
@@ -234,6 +265,36 @@ fn sweep_expired_removes_only_expired() {
 }
 
 #[test]
+fn sweep_requires_live_cluster_height_not_just_the_wall_estimate() {
+    let (_dir, outbox) = outbox();
+    let mut expiring = staged("0001-00001");
+    expiring.expires_ms = 500;
+    outbox.write_pending(&expiring, "plan").unwrap();
+
+    // The wall-clock estimate has fired, but the cluster is still inside the
+    // blockhash window: `restage_expired` would refuse this entry, so the
+    // sweeper must not strand it in `failed` either.
+    assert_eq!(
+        outbox
+            .sweep_expired(1000, &heights_past_window("solana-devnet", 123456))
+            .unwrap(),
+        0
+    );
+    // No height observation at all (RPC down): retain and retry later.
+    assert_eq!(outbox.sweep_expired(1000, &Default::default()).unwrap(), 0);
+    assert!(
+        outbox
+            .read_in_state(
+                "alice",
+                "solana-devnet",
+                "0001-00001",
+                SolanaOutboxState::Pending
+            )
+            .is_ok()
+    );
+}
+
+#[test]
 fn sweep_does_not_reap_signed_pending_entry() {
     let (_dir, outbox) = outbox();
     let mut signed = staged("0001-signed");
@@ -242,7 +303,12 @@ fn sweep_does_not_reap_signed_pending_entry() {
         Some("SIG1111111111111111111111111111111111111111111111111111111111111".into());
     outbox.write_pending(&signed, "plan").unwrap();
 
-    assert_eq!(outbox.sweep_expired(1000).unwrap(), 0);
+    assert_eq!(
+        outbox
+            .sweep_expired(1000, &heights_past_window("solana-devnet", 999_999))
+            .unwrap(),
+        0
+    );
     assert!(
         outbox
             .read_in_state(

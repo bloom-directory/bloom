@@ -24,6 +24,7 @@ humantime-serde.workspace = true
 tracing.workspace = true
 parking_lot.workspace = true
 ed25519-dalek.workspace = true
+bs58.workspace = true
 alloy.workspace = true
 dirs.workspace = true
 url.workspace = true

@@ -44,6 +44,14 @@ struct CallFailure {
     retryable: bool,
 }
 
+/// One endpoint's direct answer to an all-endpoint probe, identified by a
+/// sanitized label so a degraded endpoint can be named without disclosing
+/// URL-carried credentials.
+pub struct EndpointProbe {
+    pub endpoint_label: String,
+    pub outcome: Result<Value, SolanaRpcError>,
+}
+
 /// The shared Solana RPC transport. Built once per [`crate::SolanaSpec`] and
 /// shared via `Arc`.
 pub struct SolanaRpcClient {
@@ -172,6 +180,32 @@ impl SolanaRpcClient {
         Err(last.unwrap_or_else(|| SolanaRpcError::NoEndpoints(self.chain_name.clone())))
     }
 
+    /// Ask every configured endpoint directly, bypassing the failover
+    /// ladder. Each endpoint answers exactly once, and its answer — including
+    /// its failure — is reported independently.
+    ///
+    /// Ordinary calls may accept the first successful response, because any
+    /// endpoint that answers describes the same cluster. Absence is not such
+    /// a fact: a lagging or non-archival endpoint can report `null` for a
+    /// signature another endpoint has finalized. Callers that want to treat a
+    /// `null` as evidence must collect every endpoint's observation and
+    /// decide from the quorum, never from one endpoint.
+    pub async fn probe_all_endpoints(&self, method: &str, params: &Value) -> Vec<EndpointProbe> {
+        let mut probes = Vec::with_capacity(self.endpoints.len());
+        for endpoint in &self.endpoints {
+            let label = endpoint_label(&endpoint.url);
+            let outcome = self
+                .post(endpoint, method, params)
+                .await
+                .map_err(|failure| failure.error);
+            probes.push(EndpointProbe {
+                endpoint_label: label,
+                outcome,
+            });
+        }
+        probes
+    }
+
     /// Verify that every configured HTTP endpoint belongs to `expected`.
     ///
     /// Ordinary reads may fail over as soon as one endpoint answers. A write
@@ -187,7 +221,7 @@ impl SolanaRpcClient {
             let observed = observed.as_str().ok_or_else(|| {
                 SolanaRpcError::Decode(format!(
                     "getGenesisHash from {} returned {observed}",
-                    endpoint.url
+                    endpoint_label(&endpoint.url)
                 ))
             })?;
             if observed != expected {
@@ -248,7 +282,7 @@ impl SolanaRpcClient {
             return Err(CallFailure {
                 error: SolanaRpcError::Transport(format!(
                     "{} returned HTTP {}",
-                    endpoint.url,
+                    endpoint_label(&endpoint.url),
                     status.as_u16()
                 )),
                 retryable,
@@ -345,12 +379,30 @@ fn backoff_for(attempt: usize) -> Duration {
 fn classify_reqwest_error(e: reqwest::Error) -> CallFailure {
     if e.is_timeout() || e.is_connect() {
         return CallFailure {
-            error: SolanaRpcError::Transport(e.to_string()),
+            error: SolanaRpcError::Transport(if e.is_timeout() {
+                "request timed out".to_owned()
+            } else {
+                "connection failed".to_owned()
+            }),
             retryable: true,
         };
     }
     CallFailure {
-        error: SolanaRpcError::Transport(e.to_string()),
+        // reqwest errors can carry the complete request URL. RPC vendor
+        // credentials commonly live in URL userinfo, path segments, or query
+        // parameters, so never forward that display value across the VFS.
+        error: SolanaRpcError::Transport("request failed".to_owned()),
         retryable: false,
     }
+}
+
+/// Identify an endpoint without exposing URL-carried credentials.
+///
+/// The origin is sufficient to distinguish configured providers in an
+/// operator error. Userinfo, path, query, and fragment are deliberately
+/// omitted rather than heuristically redacted.
+fn endpoint_label(raw: &str) -> String {
+    reqwest::Url::parse(raw)
+        .map(|url| url.origin().ascii_serialization())
+        .unwrap_or_else(|_| "<invalid endpoint>".to_owned())
 }

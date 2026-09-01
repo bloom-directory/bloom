@@ -2750,6 +2750,11 @@ pub struct Daemon {
     /// Shared one-shot latch preventing duplicate audited boot refreshes when
     /// background task startup is requested more than once.
     pub wallet_projection_refresh_started: Arc<AtomicBool>,
+    /// Read-only Solana clients by chain name. Read surfaces and the
+    /// reconciler use this directly; the expiry sweeper uses it to prove a
+    /// staged blockhash is genuinely past its validity window before
+    /// terminalizing an entry.
+    pub solana_chains: bloom_solana::SolanaChainRegistry,
 }
 
 /// Regular `*.json` records directly under a Petal ceremony projection root.
@@ -3875,6 +3880,7 @@ impl Daemon {
             probe_shutdown: Arc::new(parking_lot::Mutex::new(probe_shutdown)),
             update_shutdown: Arc::new(parking_lot::Mutex::new(Vec::new())),
             wallet_projection_refresh_started: Arc::new(AtomicBool::new(false)),
+            solana_chains: solana_chain_registry,
         })
     }
 
@@ -3969,6 +3975,9 @@ impl Daemon {
                     None
                 }
             };
+        // The sweep terminalizes entries from blockhash liveness, so it needs
+        // the same read registry the reconciler uses.
+        let solana_chains = self.solana_chains.clone();
         let (tx, mut rx) = watch::channel(false);
         let interval = Duration::from_secs(60);
         let handle = tokio::spawn(async move {
@@ -3990,7 +3999,26 @@ impl Daemon {
                             Err(e) => warn!(error = %e, "outbox.sweep_expired_failed"),
                         }
                         if let Some(solana_outbox) = &solana_outbox {
-                            match run_solana_expiry_sweep_once(solana_outbox, &audit, now_ms) {
+                            // Live heights first: a Solana entry may only be
+                            // terminally expired when the cluster itself has
+                            // moved past the blockhash window. Chains whose
+                            // height cannot be observed are retained this
+                            // tick rather than judged by the wall estimate.
+                            let mut live_heights = std::collections::HashMap::new();
+                            for name in solana_chains.list_names() {
+                                let Some(client) = solana_chains.get(&name) else {
+                                    continue;
+                                };
+                                match client.get_block_height().await {
+                                    Ok(height) => {
+                                        live_heights.insert(name, height);
+                                    }
+                                    Err(error) => {
+                                        warn!(chain = %name, error = %error, "solana_outbox.sweep_height_unavailable")
+                                    }
+                                }
+                            }
+                            match run_solana_expiry_sweep_once(solana_outbox, &audit, now_ms, &live_heights) {
                                 Ok(0) => tracing::trace!("solana_outbox.sweep_expired.empty"),
                                 Ok(n) => info!(swept = n, "solana_outbox.sweep_expired"),
                                 Err(e) => warn!(error = %e, "solana_outbox.sweep_expired_failed"),
@@ -4028,8 +4056,26 @@ impl Daemon {
         &self,
         path: &std::path::Path,
     ) -> Result<bloom_mount::NfsMountHandle, bloom_mount::MountError> {
-        bloom_mount::serve_nfs(self.vfs.clone(), path).await
+        bloom_mount::serve_nfs_with(self.vfs.clone(), configured_mount(&self.config, path)?).await
     }
+}
+
+#[cfg(feature = "mount")]
+fn configured_mount(
+    config: &Config,
+    path: &std::path::Path,
+) -> Result<bloom_mount::MountConfig, bloom_mount::MountError> {
+    let nfs_listen = config.nfs_listen_addr.parse().map_err(|error| {
+        bloom_mount::MountError::Config(format!(
+            "invalid nfs_listen_addr '{}': {error}",
+            config.nfs_listen_addr
+        ))
+    })?;
+    Ok(bloom_mount::MountConfig {
+        mount_path: path.to_path_buf(),
+        nfs_listen,
+        readonly: false,
+    })
 }
 
 async fn render_next_actions(projections: &dyn WalletProjectionReader) -> Vec<u8> {
@@ -4141,10 +4187,12 @@ fn run_solana_expiry_sweep_once(
     outbox: &bloom_solana_tx::outbox::SolanaOutbox,
     audit: &AuditLog,
     now_ms: u128,
+    live_block_heights: &std::collections::HashMap<String, u64>,
 ) -> Result<usize, String> {
     let intent = serde_json::json!({
         "operation": "solana_tx.outbox.sweep_expired",
         "cutoff_ms": now_ms.to_string(),
+        "live_block_heights": live_block_heights.len(),
         "scope": "all_pending_machine_solana_outbox_entries",
     });
     let operation_id =
@@ -4167,7 +4215,7 @@ fn run_solana_expiry_sweep_once(
         .map_err(|error| {
             format!("Machine audit unavailable before Solana expiry sweep: {error}")
         })?;
-    let swept = outbox.sweep_expired(now_ms);
+    let swept = outbox.sweep_expired(now_ms, live_block_heights);
     let result = match &swept {
         Ok(count) => serde_json::json!({"outcome": "completed", "swept": count}),
         Err(error) => serde_json::json!({"outcome": "error", "error": error.to_string()}),
@@ -4478,6 +4526,18 @@ mod tests {
     use bloom_vfs::VfsPath;
     use bloom_vfs::handler::Handler;
     use bloom_vfs::handler::{Entry, HandlerError};
+
+    #[cfg(feature = "mount")]
+    #[test]
+    fn mount_uses_the_configured_nfs_listener() {
+        let mut config = Config::local_default();
+        config.nfs_listen_addr = "127.0.0.1:23456".to_owned();
+        let mount = configured_mount(&config, std::path::Path::new("/tmp/bloom-mount")).unwrap();
+        assert_eq!(mount.nfs_listen, "127.0.0.1:23456".parse().unwrap());
+
+        config.nfs_listen_addr = "not-a-socket".to_owned();
+        assert!(configured_mount(&config, std::path::Path::new("/tmp/bloom-mount")).is_err());
+    }
 
     #[test]
     fn batch_approval_requirement_preserves_owner_launch_fields() {
@@ -6229,7 +6289,9 @@ mod tests {
     // the effect the *running daemon* produces on disk.
     #[tokio::test(flavor = "multi_thread")]
     async fn daemon_spawns_solana_reconciler_and_it_populates_receipt_json() {
-        let genesis_hash = "D".repeat(32);
+        // A real 32-byte base58 genesis hash: config validation rejects a
+        // broadcast-enabled pin that cannot decode to 32 bytes.
+        let genesis_hash = bloom_proto::SOLANA_MAINNET_BETA_GENESIS_HASH.to_string();
         let signature = "sig-0001".to_string();
         let rpc_endpoint = spawn_solana_node_stub(genesis_hash.clone()).await;
 
@@ -6643,7 +6705,13 @@ ws_url = "wss://example.invalid"
         };
         solana_outbox.write_pending(&staged, "plan").unwrap();
 
-        let n = run_solana_expiry_sweep_once(&solana_outbox, &d.audit, 2).unwrap();
+        let n = run_solana_expiry_sweep_once(
+            &solana_outbox,
+            &d.audit,
+            2,
+            &std::collections::HashMap::from([("solana-devnet".to_string(), 101_u64)]),
+        )
+        .unwrap();
         assert_eq!(n, 1, "an abandoned, expired Solana stage must be reaped");
         let records = d.audit.tail(2).unwrap();
         assert_eq!(records[0].kind, "machine.effect.intent");

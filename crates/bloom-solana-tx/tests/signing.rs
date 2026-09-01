@@ -12,7 +12,7 @@ use bloom_broker_api::{
 };
 use bloom_machine_client::MachineBrokerClient;
 use bloom_solana_tx::message::{build_transfer_message, verify_signature};
-use bloom_solana_tx::signing::{SolanaSignOutcome, SolanaTransferSigner};
+use bloom_solana_tx::signing::{SignTransferRequest, SolanaSignOutcome, SolanaTransferSigner};
 use sha2::{Digest as _, Sha256};
 
 /// A Broker fixture that signs with a real Ed25519 derived child.
@@ -228,22 +228,22 @@ async fn derived_child_signs_transfer_and_signature_verifies() {
 
     let now = 1_000u64;
     let outcome = signer
-        .sign_transfer(
-            "wallet",
-            &fee_payer,
-            None,
-            &message,
-            &bs58::encode(destination).into_string(),
-            1_000_000,
-            5_000,
-            "test-genesis",
-            &bs58::encode([0x42; 32]).into_string(),
-            100,
-            Some(digest(7)), // already-approved: sign directly
-            now,
-            now + 60_000,
-            plan_facts_digest(),
-        )
+        .sign_transfer(SignTransferRequest {
+            wallet_id: "wallet",
+            fee_payer: &fee_payer,
+            account_key_ref: None,
+            message_bytes: &message,
+            destination: &bs58::encode(destination).into_string(),
+            lamports: 1_000_000,
+            fee_lamports: 5_000,
+            genesis_hash: "test-genesis",
+            recent_blockhash: &bs58::encode([0x42; 32]).into_string(),
+            last_valid_block_height: 100,
+            approval_id: Some(digest(7)), // already-approved: sign directly
+            issued_at_ms: now,
+            expires_at_ms: now + 60_000,
+            canonical_plan_facts_digest: plan_facts_digest(),
+        })
         .await
         .unwrap();
 
@@ -279,22 +279,22 @@ async fn first_attempt_returns_approval_required() {
     let message = build_transfer_message(&fee_payer, &destination, 1, &[0x42; 32]).unwrap();
 
     let outcome = signer
-        .sign_transfer(
-            "wallet",
-            &fee_payer,
-            None,
-            &message,
-            &bs58::encode(destination).into_string(),
-            1,
-            5_000,
-            "test-genesis",
-            &bs58::encode([0x42; 32]).into_string(),
-            100,
-            None, // no approval yet: prepare the ceremony
-            1,
-            60_000,
-            plan_facts_digest(),
-        )
+        .sign_transfer(SignTransferRequest {
+            wallet_id: "wallet",
+            fee_payer: &fee_payer,
+            account_key_ref: None,
+            message_bytes: &message,
+            destination: &bs58::encode(destination).into_string(),
+            lamports: 1,
+            fee_lamports: 5_000,
+            genesis_hash: "test-genesis",
+            recent_blockhash: &bs58::encode([0x42; 32]).into_string(),
+            last_valid_block_height: 100,
+            approval_id: None, // no approval yet: prepare the ceremony
+            issued_at_ms: 1,
+            expires_at_ms: 60_000,
+            canonical_plan_facts_digest: plan_facts_digest(),
+        })
         .await
         .unwrap();
 
@@ -314,44 +314,44 @@ async fn ceremony_retry_preserves_claim_and_authority_identity() {
     let message = build_transfer_message(&fee_payer, &destination, 50, &[0x43; 32]).unwrap();
 
     let first = signer
-        .sign_transfer(
-            "wallet",
-            &fee_payer,
-            None,
-            &message,
-            &bs58::encode(destination).into_string(),
-            50,
-            5_000,
-            "test-genesis",
-            &bs58::encode([0x43; 32]).into_string(),
-            100,
-            None,
-            1,
-            60_000,
-            plan_facts_digest(),
-        )
+        .sign_transfer(SignTransferRequest {
+            wallet_id: "wallet",
+            fee_payer: &fee_payer,
+            account_key_ref: None,
+            message_bytes: &message,
+            destination: &bs58::encode(destination).into_string(),
+            lamports: 50,
+            fee_lamports: 5_000,
+            genesis_hash: "test-genesis",
+            recent_blockhash: &bs58::encode([0x43; 32]).into_string(),
+            last_valid_block_height: 100,
+            approval_id: None,
+            issued_at_ms: 1,
+            expires_at_ms: 60_000,
+            canonical_plan_facts_digest: plan_facts_digest(),
+        })
         .await
         .unwrap();
     let SolanaSignOutcome::ApprovalRequired { approval_id, .. } = first else {
         panic!("expected approval preparation");
     };
     let second = signer
-        .sign_transfer(
-            "wallet",
-            &fee_payer,
-            None,
-            &message,
-            &bs58::encode(destination).into_string(),
-            50,
-            5_000,
-            "test-genesis",
-            &bs58::encode([0x43; 32]).into_string(),
-            100,
-            Some(approval_id),
-            1,
-            60_000,
-            plan_facts_digest(),
-        )
+        .sign_transfer(SignTransferRequest {
+            wallet_id: "wallet",
+            fee_payer: &fee_payer,
+            account_key_ref: None,
+            message_bytes: &message,
+            destination: &bs58::encode(destination).into_string(),
+            lamports: 50,
+            fee_lamports: 5_000,
+            genesis_hash: "test-genesis",
+            recent_blockhash: &bs58::encode([0x43; 32]).into_string(),
+            last_valid_block_height: 100,
+            approval_id: Some(approval_id),
+            issued_at_ms: 1,
+            expires_at_ms: 60_000,
+            canonical_plan_facts_digest: plan_facts_digest(),
+        })
         .await
         .unwrap();
     assert!(matches!(second, SolanaSignOutcome::Signed { .. }));

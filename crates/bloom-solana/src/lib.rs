@@ -374,4 +374,65 @@ impl SolanaClient {
             })
             .collect()
     }
+
+    /// Ask every configured endpoint, independently, for one signature's
+    /// finalized status. Each probe is a single direct request — no retry,
+    /// no failover — so the returned quorum is honest per-endpoint evidence.
+    ///
+    /// Reconciliation uses this before turning a `null` from the ordinary
+    /// failover path into a terminal "never landed": one lagging or
+    /// non-archival endpoint must not be able to outweigh an endpoint that
+    /// actually observed the signature.
+    pub async fn probe_signature_status_all_endpoints(
+        &self,
+        signature: &str,
+    ) -> Vec<SignatureStatusProbe> {
+        self.inner
+            .rpc
+            .probe_all_endpoints(
+                "getSignatureStatuses",
+                &json!([
+                    [signature],
+                    {
+                        "commitment": "finalized",
+                        "searchTransactionHistory": true
+                    }
+                ]),
+            )
+            .await
+            .into_iter()
+            .map(|probe| SignatureStatusProbe {
+                endpoint_label: probe.endpoint_label,
+                status: probe.outcome.and_then(|result| {
+                    let entry = result
+                        .get("value")
+                        .and_then(|v| v.as_array())
+                        .and_then(|v| v.first().cloned())
+                        .ok_or_else(|| {
+                            SolanaRpcError::Decode(
+                                "getSignatureStatuses: response has no value array".into(),
+                            )
+                        })?;
+                    if entry.is_null() {
+                        Ok(None)
+                    } else {
+                        serde_json::from_value::<SignatureStatus>(entry)
+                            .map(Some)
+                            .map_err(|e| {
+                                SolanaRpcError::Decode(format!("getSignatureStatuses: {e}"))
+                            })
+                    }
+                }),
+            })
+            .collect()
+    }
+}
+
+/// One endpoint's independent finalized-status observation for a single
+/// signature, from [`SolanaClient::probe_signature_status_all_endpoints`].
+pub struct SignatureStatusProbe {
+    /// Sanitized endpoint origin; never carries URL credentials.
+    pub endpoint_label: String,
+    /// `Ok(None)` is that endpoint reporting the signature unseen.
+    pub status: Result<Option<SignatureStatus>, SolanaRpcError>,
 }

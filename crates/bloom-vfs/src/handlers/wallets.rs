@@ -1745,23 +1745,19 @@ impl WalletsHandler {
             .outbox
             .list(wallet, chain, OutboxState::Pending)
             .map_err(err_be)?;
-        let mut pending = Vec::with_capacity(ids.len());
-        for id in ids {
+        let pending = collect_newest_first(ids, |id| {
             match self
                 .tx_engine
                 .outbox
-                .read_in_state(wallet, chain, &id, OutboxState::Pending)
+                .read_in_state(wallet, chain, id, OutboxState::Pending)
             {
-                Ok(entry) => pending.push((entry.staged.created_ms, id)),
+                Ok(entry) => Ok(Some(entry.staged.created_ms)),
                 // The entry transitioned between listing and reading; it is
                 // no longer a pending candidate.
-                Err(OutboxError::NotFound(_)) => {}
-                // `latest` is advertised as the atomic identity of the newest
-                // staged transfer. An unreadable newest entry must surface,
-                // not silently redirect the reader to an older transfer.
-                Err(error) => return Err(err_be(error)),
+                Err(OutboxError::NotFound(_)) => Ok(None),
+                Err(error) => Err(err_be(error)),
             }
-        }
+        })?;
         Ok(newest_pending_target(pending))
     }
 
@@ -1775,18 +1771,14 @@ impl WalletsHandler {
             .outbox()
             .list(wallet, chain, state)
             .map_err(solana_outbox_err)?;
-        let mut pending = ids
-            .into_iter()
-            .filter_map(|id| {
-                engine
-                    .outbox()
-                    .read_in_state(wallet, chain, &id, state)
-                    .ok()
-                    .map(|entry| (entry.staged.created_ms, id))
-            })
-            .collect::<Vec<_>>();
-        pending.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
-        Ok(pending.first().map(|(_, id)| format!("pending/{id}")))
+        let pending = collect_newest_first(ids, |id| {
+            match engine.outbox().read_in_state(wallet, chain, id, state) {
+                Ok(entry) => Ok(Some(entry.staged.created_ms)),
+                Err(bloom_solana_tx::outbox::OutboxError::NotFound(_)) => Ok(None),
+                Err(error) => Err(solana_outbox_err(error)),
+            }
+        })?;
+        Ok(newest_pending_target(pending))
     }
 
     fn outbox_dir_entries(&self, wallet: &str, chain: &str) -> Result<Vec<Entry>, HandlerError> {
@@ -1807,6 +1799,24 @@ fn err_be(e: impl std::fmt::Display) -> HandlerError {
     HandlerError::backend(e.to_string())
 }
 
+/// Collect `(created_ms, id)` pairs for pending entries, skipping only
+/// entries that vanished between listing and reading (a state transition
+/// raced the listing) and surfacing every other read failure. Silently
+/// dropping an unreadable newest entry would point `latest` at an older
+/// transfer, and `latest` is advertised as the atomic identity of the newest
+/// staged intent.
+fn collect_newest_first(
+    ids: Vec<String>,
+    mut read: impl FnMut(&str) -> Result<Option<u128>, HandlerError>,
+) -> Result<Vec<(u128, String)>, HandlerError> {
+    let mut pending = Vec::with_capacity(ids.len());
+    for id in ids {
+        if let Some(created_ms) = read(&id)? {
+            pending.push((created_ms, id));
+        }
+    }
+    Ok(pending)
+}
 /// Render the newest pending entry as a `pending/<id>` symlink target.
 ///
 /// Ties on `created_ms` break toward the greater id: outbox ids come from a
@@ -3738,13 +3748,15 @@ impl WalletsHandler {
                     }
                 }
             }
-            // outbox/pending/<id>/cancel — legal only before signing.
+            // outbox/pending/<id>/cancel — legal until a durable broadcast
+            // attempt exists. The engine serializes it against broadcast so
+            // a successful cancel can never race an on-chain submission.
             [state, id, fname] if state == "pending" && fname == "cancel" => {
                 self.write_permit()?;
                 engine
-                    .outbox()
-                    .cancel(wallet, chain, id)
-                    .map_err(solana_outbox_err)?;
+                    .cancel(wallet, id)
+                    .await
+                    .map_err(|e| HandlerError::backend(e.to_string()))?;
                 Ok(())
             }
             // outbox/{pending,failed}/<id>/restage — preserve the economic
@@ -6163,6 +6175,64 @@ mod tests {
                 .link_target
                 .as_deref(),
             Some("pending/0001-pending")
+        );
+    }
+
+    #[tokio::test]
+    async fn outbox_latest_prefers_the_newest_staging_and_breaks_ties_by_allocation() {
+        let f = make_handler_with_chain(true);
+        // Same millisecond: ids are allocated from an increasing counter, so
+        // the greater id is the later staging and must own `latest`.
+        seed_pending_with_created_ms(&f, "0001-older", 5_000);
+        seed_pending_with_created_ms(&f, "0002-newer", 5_000);
+        // And a later millisecond still wins regardless of id.
+        seed_pending_with_created_ms(&f, "0003-newest", 9_000);
+
+        let root = VfsPath::parse(&format!("/{}/chains/anvil/outbox", f.wallet_name)).unwrap();
+        let listed = f.handler.list(&root).await.unwrap();
+        let latest = listed.iter().find(|entry| entry.name == "latest").unwrap();
+        assert_eq!(latest.link_target.as_deref(), Some("pending/0003-newest"));
+
+        // Remove the newest entry and the tie-break decides, deterministically
+        // toward the later allocation.
+        let entry = f
+            .handler
+            .tx_engine
+            .outbox
+            .read_in_state(&f.wallet_name, "anvil", "0003-newest", OutboxState::Pending)
+            .unwrap();
+        f.handler
+            .tx_engine
+            .outbox
+            .transition(&entry, OutboxState::Failed)
+            .unwrap();
+        let listed = f.handler.list(&root).await.unwrap();
+        let latest = listed.iter().find(|entry| entry.name == "latest").unwrap();
+        assert_eq!(latest.link_target.as_deref(), Some("pending/0002-newer"));
+    }
+
+    #[tokio::test]
+    async fn outbox_latest_fails_closed_when_the_newest_pending_entry_is_unreadable() {
+        let f = make_handler_with_chain(true);
+        seed_pending_with_created_ms(&f, "0001-older", 5_000);
+        seed_pending_with_created_ms(&f, "0002-newer", 9_000);
+        // Corrupt the newest entry's intent: an agent following `latest` as
+        // the advertised atomic identity must not be silently redirected to
+        // the older transfer.
+        let dir = f
+            ._tmp
+            .path()
+            .join("outbox")
+            .join(&f.wallet_name)
+            .join("anvil")
+            .join("pending")
+            .join("0002-newer");
+        std::fs::write(dir.join("intent.json"), b"{ not json").unwrap();
+
+        let root = VfsPath::parse(&format!("/{}/chains/anvil/outbox", f.wallet_name)).unwrap();
+        assert!(
+            f.handler.list(&root).await.is_err(),
+            "an unreadable newest pending entry must surface, not fall back to an older transfer"
         );
     }
 
