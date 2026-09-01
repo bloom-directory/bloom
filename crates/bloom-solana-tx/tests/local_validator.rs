@@ -74,26 +74,30 @@ impl MachineBrokerService for BrokerFixture {
                 }
                 // Selection resolves candidates from the fresh account
                 // projection; serve the fixture's single active child.
-                MachineBrokerRequest::WalletAccounts(WalletRequest { wallet_id }) => {
-                    Ok(MachineBrokerResponse::WalletAccounts(
-                        bloom_broker_api::WalletAccountsPublic {
-                            wallet_id,
-                            seed_profile: bloom_broker_api::WalletSeedProfile::Bip39MulticurveV1,
-                            accounts: vec![bloom_broker_api::DerivedAccountPublic {
-                                key_ref: self.child_key_ref.clone(),
-                                wallet_seed_profile: bloom_broker_api::WalletSeedProfile::Bip39MulticurveV1,
-                                derivation_profile: bloom_broker_api::DerivationProfile::Bip44SolanaSlip10Ed25519V1,
-                                path: "m/44'/501'/0'/0'".into(),
-                                canonical_public_key: Base64UrlBytes::from_bytes(&self.child_pubkey()),
-                                public_key_encoding: bloom_broker_api::PublicKeyEncoding::Ed25519SpkiDer,
-                                public_key_fingerprint: self.child_key_ref.public_key_fingerprint.clone(),
-                                supported_crypto_suites: vec![CryptoSuite::Ed25519Message],
-                                chain_projections: vec![],
-                                lifecycle: bloom_broker_api::AccountLifecycleState::Active,
-                            }],
-                        },
-                    ))
-                }
+                MachineBrokerRequest::WalletAccounts(WalletRequest { wallet_id }) => Ok(
+                    MachineBrokerResponse::WalletAccounts(bloom_broker_api::WalletAccountsPublic {
+                        wallet_id,
+                        seed_profile: bloom_broker_api::WalletSeedProfile::Bip39MulticurveV1,
+                        accounts: vec![bloom_broker_api::DerivedAccountPublic {
+                            key_ref: self.child_key_ref.clone(),
+                            wallet_seed_profile:
+                                bloom_broker_api::WalletSeedProfile::Bip39MulticurveV1,
+                            derivation_profile:
+                                bloom_broker_api::DerivationProfile::Bip44SolanaSlip10Ed25519V1,
+                            path: "m/44'/501'/0'/0'".into(),
+                            canonical_public_key: Base64UrlBytes::from_bytes(&self.child_pubkey()),
+                            public_key_encoding:
+                                bloom_broker_api::PublicKeyEncoding::Ed25519SpkiDer,
+                            public_key_fingerprint: self
+                                .child_key_ref
+                                .public_key_fingerprint
+                                .clone(),
+                            supported_crypto_suites: vec![CryptoSuite::Ed25519Message],
+                            chain_projections: vec![],
+                            lifecycle: bloom_broker_api::AccountLifecycleState::Active,
+                        }],
+                    }),
+                ),
                 MachineBrokerRequest::KeyGetPublic(KeyRequest { key_ref }) => {
                     Ok(MachineBrokerResponse::KeyGetPublic(KeyPublic {
                         role: KeyRole::Derived,
