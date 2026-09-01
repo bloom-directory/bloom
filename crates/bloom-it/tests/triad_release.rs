@@ -2055,7 +2055,7 @@ getent() {
     *) return 1 ;;
   esac
 }
-source <(sed -n '/^numericize_linux_tmpfiles_ownership()/,/^}/p' "$1")
+eval "$(sed -n '/^numericize_linux_tmpfiles_ownership()/,/^}/p' "$1")"
 numericize_linux_tmpfiles_ownership "$2" 1000
 "#,
         ])

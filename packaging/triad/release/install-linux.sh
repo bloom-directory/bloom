@@ -250,8 +250,8 @@ validate_linux_release_set() {
   local install_root="$1"
   local candidate_digest="$2"
   local directory record filename_uid record_uid record_state record_digest record_port counterpart
-  local principal service_config service_digest prior_uid
-  local -A port_owners=()
+  local principal service_config service_digest prior_uid owner
+  local port_owners=""
 
   for directory in enrollments retained; do
     for record in "$install_root/etc/bloom/$directory"/*.json; do
@@ -288,12 +288,15 @@ validate_linux_release_set() {
         echo "installed Linux enrollment NFS port is invalid" >&2
         return 65
       }
-      prior_uid="${port_owners[$record_port]:-}"
+      prior_uid=""
+      for owner in $port_owners; do
+        [[ "$owner" != "$record_port:"* ]] || prior_uid="${owner#*:}"
+      done
       [[ -z "$prior_uid" || "$prior_uid" == "$record_uid" ]] || {
         echo "installed Linux enrollments reuse an NFS port" >&2
         return 65
       }
-      port_owners[$record_port]="$record_uid"
+      port_owners="$port_owners $record_port:$record_uid"
       [[ "$record_digest" == "$candidate_digest" ]] || {
         echo "Linux installation requires the exact release used by every enrollment" >&2
         return 65
