@@ -44,6 +44,8 @@ pub enum OutboxError {
     InvalidChain(String),
     #[error("raw transaction bytes do not match the recorded hash")]
     RawTxHashMismatch,
+    #[error("transfer '{0}' already has a durable broadcast attempt and cannot be cancelled")]
+    BroadcastAttempted(String),
     #[error("outbox target already exists: {0}")]
     TargetExists(String),
     #[error("{0}")]
@@ -121,6 +123,7 @@ pub const BROADCAST_RAW_TX: &str = "raw_tx";
 pub const APPROVAL_CHALLENGE_FILE: &str = "approval_challenge.json";
 const PRIVATE_SIGNATURE_FILE: &str = ".signature";
 const PRIVATE_APPROVAL_FILE: &str = "approval.json";
+const RESTAGE_RESERVATION_FILE: &str = ".restage_replacement";
 const BROADCAST_SCHEMA: &str = "bloom.solana-broadcast-attempt/1";
 
 #[derive(Clone)]
@@ -130,6 +133,20 @@ pub struct SolanaOutbox {
 
 struct OutboxInner {
     root: PathBuf,
+}
+
+/// The result of searching an outbox for an entry carrying one exact
+/// serialized message.
+#[derive(Debug, PartialEq, Eq)]
+pub enum MessageDuplicate {
+    /// An identical still-pending entry already exists; staging the same
+    /// intent again must return it, not create a second transfer.
+    Pending(Box<StagedSolanaTransfer>),
+    /// An identical entry was already dispatched. Its deterministic
+    /// signature names one on-chain transaction, so a second entry could
+    /// never produce a second payment — only a second success receipt for
+    /// the same transfer.
+    Dispatched,
 }
 
 impl SolanaOutbox {
@@ -173,6 +190,26 @@ impl SolanaOutbox {
         let mut bytes = [0_u8; 16];
         rand::rngs::OsRng.fill_bytes(&mut bytes);
         format!("sol-{}", hex::encode(bytes))
+    }
+
+    /// Persist one replacement identity before staging it. Retries after any
+    /// later filesystem or process failure reuse this identity instead of
+    /// creating multiple independently actionable transfers.
+    pub fn reserve_restage_replacement(
+        &self,
+        entry: &SolanaOutboxEntry,
+    ) -> Result<String, OutboxError> {
+        let path = entry.dir.join(RESTAGE_RESERVATION_FILE);
+        if path.exists() {
+            let id = String::from_utf8(fs::read(path)?)
+                .map_err(|_| OutboxError::Other("restage replacement id is not UTF-8".into()))?;
+            Self::validate_segment(&id).map_err(|_| OutboxError::InvalidId(id.clone()))?;
+            return Ok(id);
+        }
+        let id = self.allocate_id();
+        write_private_atomic(&path, id.as_bytes())?;
+        sync_dir(&entry.dir)?;
+        Ok(id)
     }
 
     /// Persist a staged transfer in `pending/<id>/` along with its plan file.
@@ -231,21 +268,15 @@ impl SolanaOutbox {
             blockhash: entry.staged.blockhash.clone(),
             created_ms,
         };
+        // The marker makes this entry non-cancellable and discoverable by
+        // reconciliation, so publish it only after the complete private raw
+        // transaction has landed atomically. A crash can leave an unreferenced
+        // raw blob, but never a marker that names missing or partial bytes.
+        write_private_atomic(&entry.dir.join(BROADCAST_RAW_TX), raw_tx)?;
         write_atomic(
             entry.dir.join(BROADCAST_ATTEMPT_FILE),
             &serde_json::to_vec_pretty(&attempt)?,
         )?;
-        let path = entry.dir.join(BROADCAST_RAW_TX);
-        let mut opts = fs::OpenOptions::new();
-        opts.create(true).write(true).truncate(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
-        }
-        let mut file = opts.open(path)?;
-        file.write_all(raw_tx)?;
-        file.sync_all()?;
         let _ = fs::remove_file(entry.dir.join(PRIVATE_SIGNATURE_FILE));
         sync_dir(&entry.dir)?;
         Ok(())
@@ -279,12 +310,14 @@ impl SolanaOutbox {
             return Err(OutboxError::TargetExists(target.display().to_string()));
         }
         fs::rename(&entry.dir, &target)?;
+        if new_state == SolanaOutboxState::Failed {
+            let _ = fs::remove_file(target.join(BROADCAST_RAW_TX));
+            let _ = fs::remove_file(target.join(PRIVATE_SIGNATURE_FILE));
+        }
         if matches!(
             new_state,
             SolanaOutboxState::Sent | SolanaOutboxState::Failed
         ) {
-            let _ = fs::remove_file(target.join(BROADCAST_RAW_TX));
-            let _ = fs::remove_file(target.join(PRIVATE_SIGNATURE_FILE));
             let _ = fs::remove_file(target.join(PRIVATE_APPROVAL_FILE));
             let _ = fs::remove_file(target.join(APPROVAL_CHALLENGE_FILE));
         }
@@ -348,6 +381,38 @@ impl SolanaOutbox {
             }
         }
         Err(OutboxError::NotFound(id.into()))
+    }
+
+    /// Find any entry in this wallet+chain whose staged message is exactly
+    /// `message_b64`.
+    ///
+    /// The message commits to fee payer, destination, amount, and recent
+    /// blockhash, and the Ed25519 signature over it is deterministic, so two
+    /// entries with the same message are the same Solana transaction
+    /// regardless of their outbox IDs.
+    pub fn find_by_message(
+        &self,
+        wallet: &str,
+        chain: &str,
+        message_b64: &str,
+    ) -> Result<Option<MessageDuplicate>, OutboxError> {
+        for state in [SolanaOutboxState::Pending, SolanaOutboxState::Sent] {
+            for id in self.list(wallet, chain, state)? {
+                let dir = self.state_dir(wallet, chain, state)?.join(&id);
+                let intent = dir.join("intent.json");
+                if !intent.exists() {
+                    continue;
+                }
+                let staged: StagedSolanaTransfer = serde_json::from_slice(&fs::read(intent)?)?;
+                if staged.message_b64 == message_b64 {
+                    return Ok(Some(match state {
+                        SolanaOutboxState::Pending => MessageDuplicate::Pending(Box::new(staged)),
+                        _ => MessageDuplicate::Dispatched,
+                    }));
+                }
+            }
+        }
+        Ok(None)
     }
 
     /// Read `id` only if it currently lives in `expected`, mirroring
@@ -541,6 +606,11 @@ impl SolanaOutbox {
                 OutboxError::Other("recorded signature is not UTF-8".into())
             })?));
         }
+        let attempt_path = entry.dir.join(BROADCAST_ATTEMPT_FILE);
+        if attempt_path.exists() {
+            let attempt: SolanaBroadcastAttempt = serde_json::from_slice(&fs::read(attempt_path)?)?;
+            return Ok(Some(attempt.signature));
+        }
         Ok(entry.staged.signature.clone())
     }
 
@@ -639,6 +709,9 @@ impl SolanaOutbox {
     /// imply submission, so signed pending entries remain cancellable.
     pub fn cancel(&self, wallet: &str, chain: &str, id: &str) -> Result<(), OutboxError> {
         let entry = self.read_in_state(wallet, chain, id, SolanaOutboxState::Pending)?;
+        if entry.dir.join(BROADCAST_ATTEMPT_FILE).exists() {
+            return Err(OutboxError::BroadcastAttempted(id.to_owned()));
+        }
         let mut staged = entry.staged.clone();
         staged.status = SolanaTxStatus::Cancelled;
         let entry = SolanaOutboxEntry {
@@ -658,7 +731,20 @@ impl SolanaOutbox {
     }
 
     /// Remove pending entries whose expiry has elapsed.
-    pub fn sweep_expired(&self, now_ms: u128) -> Result<usize, OutboxError> {
+    ///
+    /// `expires_ms` is a wall-clock *estimate* of blockhash validity (slot
+    /// time × remaining height). An estimate must never terminate a transfer
+    /// on its own: an entry is only moved to `failed` when the cluster's
+    /// live block height — supplied by the caller per chain — has actually
+    /// passed the blockhash's `last_valid_block_height`. Entries whose chain
+    /// has no live height observation (RPC unavailable) are retained for a
+    /// later tick, as are entries whose height is still inside the window
+    /// even though the estimate has fired.
+    pub fn sweep_expired(
+        &self,
+        now_ms: u128,
+        live_block_heights: &std::collections::HashMap<String, u64>,
+    ) -> Result<usize, OutboxError> {
         let mut count = 0;
         if !self.inner.root.exists() {
             return Ok(0);
@@ -693,9 +779,13 @@ impl SolanaOutbox {
                         staged,
                         dir: ent.path(),
                     };
+                    let cluster_past_window = live_block_heights
+                        .get(&entry.staged.chain)
+                        .is_some_and(|height| *height > entry.staged.last_valid_block_height);
                     if self.recorded_signature(&entry)?.is_none()
                         && entry.staged.expires_ms != 0
                         && now_ms >= entry.staged.expires_ms
+                        && cluster_past_window
                     {
                         let mut expired = entry.clone();
                         expired.staged.status = SolanaTxStatus::Expired;

@@ -105,9 +105,11 @@ impl SolanaReconciler {
             .await
             .map_err(|e| OutboxError::Other(e.to_string()))?;
         let Some(Some(status)) = statuses.into_iter().next() else {
-            // Once the validity window has closed, a signature absent even
-            // from transaction history cannot newly land. Record that
-            // terminal fact instead of leaving the outbox in `sent` forever.
+            // The failover path observed `null`. That is one endpoint's
+            // absence, not the cluster's: a lagging or non-archival peer can
+            // report `null` for a signature another endpoint finalized. Only
+            // proceed once the validity window has closed, and then ask
+            // every configured endpoint before writing anything terminal.
             let current_height = chain
                 .get_block_height()
                 .await
@@ -115,6 +117,49 @@ impl SolanaReconciler {
             if current_height <= entry.last_valid_block_height {
                 return Ok(None);
             }
+            let quorum = chain
+                .probe_signature_status_all_endpoints(&entry.signature)
+                .await;
+            let mut finalized: Option<bloom_solana::SignatureStatus> = None;
+            let mut seen_unfinalized = false;
+            let mut absent = 0_usize;
+            let mut unavailable = 0_usize;
+            for probe in quorum {
+                match probe.status {
+                    Ok(None) => absent += 1,
+                    Ok(Some(status)) => {
+                        if status.confirmation_status.as_deref() == Some("finalized") {
+                            finalized = Some(status);
+                        } else {
+                            seen_unfinalized = true;
+                        }
+                    }
+                    Err(_) => unavailable += 1,
+                }
+            }
+            if let Some(status) = finalized {
+                // Some endpoint observed the transfer the failover path
+                // missed. Reconcile from that observation.
+                return self.write_outcome_receipt(entry, &status);
+            }
+            if seen_unfinalized {
+                // Observed, but not yet finalized on any answering endpoint;
+                // a durable receipt stays terminal-only.
+                return Ok(None);
+            }
+            if unavailable > 0 {
+                // Absence cannot be proven while endpoints are missing.
+                // Keep the entry unreconciled rather than risk recording an
+                // executed transfer as failed.
+                return Err(OutboxError::Other(format!(
+                    "signature absence not proven: {unavailable} of {} endpoints unavailable",
+                    absent + unavailable,
+                )));
+            }
+            // Once the validity window has closed, a signature no configured
+            // endpoint reports — even from transaction history — cannot newly
+            // land. Record that terminal fact instead of leaving the outbox
+            // in `sent` forever.
             let receipt = SolanaReceipt {
                 outcome: "failed".to_string(),
                 signature: entry.signature.clone(),
@@ -123,6 +168,7 @@ impl SolanaReconciler {
                     "kind": "blockhash_expired_unseen",
                     "last_valid_block_height": entry.last_valid_block_height,
                     "observed_block_height": current_height,
+                    "endpoints_reporting_unseen": absent,
                 })),
                 confirmation_status: None,
             };
@@ -136,7 +182,15 @@ impl SolanaReconciler {
         if status.confirmation_status.as_deref() != Some("finalized") {
             return Ok(None);
         }
+        self.write_outcome_receipt(entry, &status)
+    }
 
+    /// Record a receipt from a finalized on-chain observation.
+    fn write_outcome_receipt(
+        &self,
+        entry: &crate::types::SolanaSentEntry,
+        status: &bloom_solana::SignatureStatus,
+    ) -> Result<Option<SolanaReceipt>, OutboxError> {
         let outcome = if status.err.is_some() {
             "failed"
         } else {
@@ -146,8 +200,8 @@ impl SolanaReconciler {
             outcome: outcome.to_string(),
             signature: entry.signature.clone(),
             slot: Some(status.slot),
-            err: status.err,
-            confirmation_status: status.confirmation_status,
+            err: status.err.clone(),
+            confirmation_status: status.confirmation_status.clone(),
         };
         let bytes = serde_json::to_vec_pretty(&receipt)?;
         self.project_receipt(entry, &bytes)?;

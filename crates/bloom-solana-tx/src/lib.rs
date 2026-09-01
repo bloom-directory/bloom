@@ -26,5 +26,5 @@ pub use engine::{EngineError, SolanaTransferEngine, SolanaTransferIntent};
 pub use message::{MessageError, assemble_transaction, build_transfer_message, verify_signature};
 pub use outbox::{OutboxError, SolanaOutbox, SolanaOutboxState};
 pub use reconcile::SolanaReconciler;
-pub use signing::{SolanaSignOutcome, SolanaTransferSigner};
+pub use signing::{SignTransferRequest, SolanaSignOutcome, SolanaTransferSigner};
 pub use types::{SolanaReceipt, SolanaSentEntry, SolanaTxStatus, StagedSolanaTransfer};

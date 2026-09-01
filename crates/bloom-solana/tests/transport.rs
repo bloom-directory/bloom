@@ -274,6 +274,63 @@ async fn ambiguous_send_is_attempted_once_without_failover() {
     assert_eq!(backup_sends.load(Ordering::SeqCst), 0);
 }
 
+#[tokio::test]
+async fn transport_errors_never_expose_url_credentials() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = vec![0u8; 8192];
+                let _ = socket.read(&mut buf).await;
+                let _ = socket
+                    .write_all(
+                        b"HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                    )
+                    .await;
+            });
+        }
+    });
+    let endpoint =
+        format!("http://operator:password@{addr}/v2/ABCDEFGHIJKLMNOPQRSTUV?token=QUERYSECRET");
+    let client = SolanaClient::build(&spec(&endpoint)).unwrap();
+
+    let error = client.get_slot().await.unwrap_err().to_string();
+    assert!(error.contains(&addr.to_string()), "{error}");
+    for secret in [
+        "operator",
+        "password",
+        "ABCDEFGHIJKLMNOPQRSTUV",
+        "QUERYSECRET",
+    ] {
+        assert!(!error.contains(secret), "error exposed {secret}: {error}");
+    }
+}
+
+#[tokio::test]
+async fn connection_errors_never_expose_url_credentials() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+    let endpoint =
+        format!("http://operator:password@{addr}/v2/ABCDEFGHIJKLMNOPQRSTUV?token=QUERYSECRET");
+    let client = SolanaClient::build(&spec(&endpoint)).unwrap();
+
+    let error = client.get_slot().await.unwrap_err().to_string();
+    for secret in [
+        "operator",
+        "password",
+        "ABCDEFGHIJKLMNOPQRSTUV",
+        "QUERYSECRET",
+    ] {
+        assert!(!error.contains(secret), "error exposed {secret}: {error}");
+    }
+}
+
 /// A stub that fails the first N requests with 503, then succeeds, to prove
 /// the retry layer recovers a transient outage.
 #[tokio::test]

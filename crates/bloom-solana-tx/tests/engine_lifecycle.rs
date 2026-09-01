@@ -339,7 +339,12 @@ async fn stage_with_a_fresh_blockhash_is_not_reaped_immediately() {
         staged.expires_ms
     );
 
-    let swept = outbox.sweep_expired(now_ms).unwrap();
+    let swept = outbox
+        .sweep_expired(
+            now_ms,
+            &std::collections::HashMap::from([("solana-devnet".to_string(), 500_u64)]),
+        )
+        .unwrap();
     assert_eq!(swept, 0, "a not-yet-stale stage must survive a sweep pass");
 }
 
@@ -447,8 +452,8 @@ async fn full_transfer_lifecycle_stage_sign_broadcast() {
         .unwrap()
         .expect("signed entry");
 
-    // Broadcast: submits the assembled transaction, *then* transitions to
-    // sent and records the attempt.
+    // Broadcast: durably records the exact attempt and claims the entry for
+    // reconciliation before submitting the assembled transaction.
     let signature = engine.broadcast("wallet", &staged.id, 1_300).await.unwrap();
     assert_eq!(signature, expected_signature);
     let sent = outbox
@@ -479,6 +484,161 @@ async fn full_transfer_lifecycle_stage_sign_broadcast() {
     assert_eq!(
         bloom_solana_tx::outbox::SolanaOutboxState::from_status(&sent.staged.status),
         SolanaOutboxState::Sent
+    );
+}
+
+// ------------------------------------------------------------------
+// Staging idempotency: one message is one chain transaction.
+// ------------------------------------------------------------------
+
+#[tokio::test]
+async fn staging_an_identical_active_transfer_is_idempotent() {
+    let height = Arc::new(std::sync::atomic::AtomicU64::new(1));
+    let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let endpoint = spawn_node_with_controls(height, false, false, requests).await;
+    let dir = tempfile::tempdir().unwrap();
+    let outbox = SolanaOutbox::new(dir.path().join("outbox")).unwrap();
+    let broker = Arc::new(BrokerFixture::new());
+    let signer =
+        SolanaTransferSigner::from_catalog(MachineBrokerClient::new(broker.clone()), &catalog())
+            .unwrap();
+    let engine =
+        SolanaTransferEngine::new(outbox.clone(), client(&endpoint), signer, "solana-devnet");
+    let destination = ed25519_dalek::SigningKey::from_bytes(&[0xbb; 32])
+        .verifying_key()
+        .to_bytes();
+
+    // The stub serves one fixed recent blockhash, so two stagings of the
+    // same economic intent serialize to the same message — and therefore
+    // the same deterministic Solana signature.
+    let first = engine
+        .stage(
+            "wallet",
+            &broker.child_pubkey(),
+            Default::default(),
+            &destination,
+            1_000_000,
+            1_000,
+        )
+        .await
+        .unwrap();
+    let second = engine
+        .stage(
+            "wallet",
+            &broker.child_pubkey(),
+            Default::default(),
+            &destination,
+            1_000_000,
+            2_000,
+        )
+        .await
+        .unwrap();
+    assert_eq!(first.id, second.id, "the existing entry must be returned");
+    assert_eq!(first.message_b64, second.message_b64);
+    assert_eq!(
+        outbox
+            .list("wallet", "solana-devnet", SolanaOutboxState::Pending)
+            .unwrap()
+            .len(),
+        1,
+        "no second receipt-eligible identity for one on-chain transfer"
+    );
+
+    // A different amount is a genuinely different transfer and still stages.
+    let distinct = engine
+        .stage(
+            "wallet",
+            &broker.child_pubkey(),
+            Default::default(),
+            &destination,
+            2_000_000,
+            3_000,
+        )
+        .await
+        .unwrap();
+    assert_ne!(distinct.id, first.id);
+    assert_ne!(distinct.message_b64, first.message_b64);
+}
+
+#[tokio::test]
+async fn an_identical_transfer_cannot_be_staged_again_after_dispatch() {
+    let height = Arc::new(std::sync::atomic::AtomicU64::new(1));
+    let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let endpoint = spawn_node_with_controls(height, false, false, requests).await;
+    let dir = tempfile::tempdir().unwrap();
+    let outbox = SolanaOutbox::new(dir.path().join("outbox")).unwrap();
+    let broker = Arc::new(BrokerFixture::new());
+    let signer =
+        SolanaTransferSigner::from_catalog(MachineBrokerClient::new(broker.clone()), &catalog())
+            .unwrap();
+    let engine =
+        SolanaTransferEngine::new(outbox.clone(), client(&endpoint), signer, "solana-devnet");
+    let destination = ed25519_dalek::SigningKey::from_bytes(&[0xbb; 32])
+        .verifying_key()
+        .to_bytes();
+
+    let staged = engine
+        .stage(
+            "wallet",
+            &broker.child_pubkey(),
+            Default::default(),
+            &destination,
+            1_000_000,
+            1_000,
+        )
+        .await
+        .unwrap();
+    let first = engine
+        .sign(
+            "wallet",
+            &staged.id,
+            &broker.child_pubkey(),
+            None,
+            None,
+            1_100,
+        )
+        .await
+        .unwrap();
+    let approval_id = match first {
+        bloom_solana_tx::signing::SolanaSignOutcome::ApprovalRequired { approval_id, .. } => {
+            approval_id
+        }
+        other => panic!("expected ApprovalRequired, got {other:?}"),
+    };
+    engine
+        .sign(
+            "wallet",
+            &staged.id,
+            &broker.child_pubkey(),
+            None,
+            Some(approval_id),
+            1_200,
+        )
+        .await
+        .unwrap();
+    engine.broadcast("wallet", &staged.id, 1_300).await.unwrap();
+
+    // The same message was already dispatched: its single deterministic
+    // signature names one on-chain transaction, so a second outbox identity
+    // could only ever produce a second success receipt for that one payment.
+    let error = engine
+        .stage(
+            "wallet",
+            &broker.child_pubkey(),
+            Default::default(),
+            &destination,
+            1_000_000,
+            2_000,
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("already dispatched"), "{error}");
+    assert!(
+        outbox
+            .list("wallet", "solana-devnet", SolanaOutboxState::Pending)
+            .unwrap()
+            .is_empty(),
+        "the refused duplicate must not leave durable state behind"
     );
 }
 
@@ -684,11 +844,8 @@ async fn stage_and_sign(
     staged
 }
 
-// Fix C (PLAN-SOLANA-PR-FIXES.md): a broadcast RPC failure after a
-// successful `sign()` must never permanently strand the entry — it must
-// stay `pending`, exactly as retryable and cancellable as before signing.
 #[tokio::test]
-async fn broadcast_failure_leaves_entry_pending_and_retry_succeeds() {
+async fn ambiguous_broadcast_failure_is_durable_and_not_retried() {
     let fail_times = Arc::new(std::sync::atomic::AtomicU64::new(1));
     let endpoint = spawn_node_with_flaky_broadcast(fail_times).await;
     let dir = tempfile::tempdir().unwrap();
@@ -715,8 +872,9 @@ async fn broadcast_failure_leaves_entry_pending_and_retry_succeeds() {
         .unwrap()
         .unwrap();
 
-    // First broadcast attempt: the node returns a hard RPC error. The entry
-    // must not have moved to `sent` for a broadcast that never happened.
+    // A node error is ambiguous: the endpoint may have accepted the exact
+    // transaction before its response was lost. The entry must therefore be
+    // durable and non-cancellable before the request begins.
     let first_attempt = engine.broadcast("wallet", &staged.id, 1_300).await;
     assert!(
         first_attempt.is_err(),
@@ -727,34 +885,27 @@ async fn broadcast_failure_leaves_entry_pending_and_retry_succeeds() {
             "wallet",
             "solana-devnet",
             &staged.id,
-            SolanaOutboxState::Pending,
-        )
-        .expect("entry must remain pending after a failed broadcast, not stuck in sent");
-    assert!(
-        outbox.recorded_signature(&entry).unwrap().is_some(),
-        "the recorded signature from sign() survives the failed broadcast attempt"
-    );
-
-    // Retry: the node now accepts the same call. No re-signing needed —
-    // broadcast reads the already-recorded signature straight from the
-    // still-pending entry.
-    let signature = engine
-        .broadcast("wallet", &staged.id, 1_400)
-        .await
-        .expect("retried broadcast must succeed");
-    assert_eq!(signature, expected_signature);
-    outbox
-        .read_in_state(
-            "wallet",
-            "solana-devnet",
-            &staged.id,
             SolanaOutboxState::Sent,
         )
-        .expect("entry moves to sent once the retried broadcast actually succeeds");
+        .expect("an ambiguous attempt must be owned by reconciliation");
+    assert!(
+        entry
+            .dir
+            .join(bloom_solana_tx::outbox::BROADCAST_ATTEMPT_FILE)
+            .exists()
+    );
+    assert_eq!(
+        outbox.walk_all_sent().unwrap()[0].signature,
+        expected_signature
+    );
+
+    // Neither retry nor cancellation may create a second economic effect.
+    assert!(engine.broadcast("wallet", &staged.id, 1_400).await.is_err());
+    assert!(engine.cancel("wallet", &staged.id).await.is_err());
 }
 
 #[tokio::test]
-async fn broadcast_failure_leaves_entry_cancellable() {
+async fn a_durable_broadcast_attempt_is_not_cancellable() {
     // Never recovers: every `sendTransaction` call fails.
     let fail_times = Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX));
     let endpoint = spawn_node_with_flaky_broadcast(fail_times).await;
@@ -770,22 +921,19 @@ async fn broadcast_failure_leaves_entry_cancellable() {
     let staged = stage_and_sign(&engine, &broker).await;
     assert!(engine.broadcast("wallet", &staged.id, 1_300).await.is_err());
 
-    // The VFS write handler only permits `pending/<id>/cancel` on a Pending
-    // entry (see `bloom-vfs`'s wallets handler) — this is exactly the path
-    // that was unreachable before the fix, since the entry was already
-    // stuck in `sent`.
-    outbox
-        .cancel("wallet", "solana-devnet", &staged.id)
-        .expect("a signed-but-not-broadcast entry must still be cancellable");
-    let cancelled = outbox
+    engine
+        .cancel("wallet", &staged.id)
+        .await
+        .expect_err("a possibly-submitted transfer cannot be reported cancelled");
+    let attempted = outbox
         .read_in_state(
             "wallet",
             "solana-devnet",
             &staged.id,
-            SolanaOutboxState::Failed,
+            SolanaOutboxState::Sent,
         )
         .unwrap();
-    assert_eq!(cancelled.staged.status, SolanaTxStatus::Cancelled);
+    assert_eq!(attempted.staged.status, SolanaTxStatus::Sent);
 }
 
 #[tokio::test]
@@ -889,7 +1037,15 @@ async fn expired_transfer_restages_with_fresh_facts_and_no_reused_authority() {
         .unwrap_err();
     assert!(too_early.to_string().contains("remains valid"));
 
-    assert_eq!(outbox.sweep_expired(u128::MAX).unwrap(), 1);
+    assert_eq!(
+        outbox
+            .sweep_expired(
+                u128::MAX,
+                &std::collections::HashMap::from([("solana-devnet".to_string(), 1_000_000_u64)]),
+            )
+            .unwrap(),
+        1
+    );
     outbox
         .read_in_state(
             "wallet",
@@ -935,6 +1091,14 @@ async fn expired_transfer_restages_with_fresh_facts_and_no_reused_authority() {
         .unwrap();
     assert!(outbox.recorded_signature(&pending).unwrap().is_none());
     assert!(!pending.dir.join("approval.json").exists());
+
+    height.store(103, std::sync::atomic::Ordering::SeqCst);
+    let retried = engine
+        .restage_expired("wallet", &original.id, &broker.child_pubkey(), 1_400)
+        .await
+        .unwrap();
+    assert_eq!(retried.id, replacement.id);
+    assert_eq!(retried.message_b64, replacement.message_b64);
 }
 
 #[tokio::test]
@@ -987,7 +1151,7 @@ async fn failed_signature_verifying_simulation_is_persisted_and_blocks_broadcast
 }
 
 #[tokio::test]
-async fn mismatched_rpc_signature_never_marks_the_entry_sent() {
+async fn mismatched_rpc_signature_remains_a_reconcilable_sent_attempt() {
     let height = Arc::new(std::sync::atomic::AtomicU64::new(1));
     let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
     let endpoint = spawn_node_with_controls(height, false, true, requests).await;
@@ -1010,14 +1174,19 @@ async fn mismatched_rpc_signature_never_marks_the_entry_sent() {
             .to_string()
             .contains("RPC returned transaction signature")
     );
-    outbox
+    let sent = outbox
         .read_in_state(
             "wallet",
             "solana-devnet",
             &staged.id,
-            SolanaOutboxState::Pending,
+            SolanaOutboxState::Sent,
         )
-        .expect("an untrusted RPC response cannot advance durable state");
+        .expect("a dispatched request must remain reconcilable despite an untrusted response");
+    let recorded = outbox
+        .recorded_signature(&sent)
+        .expect("read local signature")
+        .expect("local deterministic signature");
+    assert_eq!(bs58::decode(recorded).into_vec().unwrap().len(), 64);
 }
 
 #[tokio::test]

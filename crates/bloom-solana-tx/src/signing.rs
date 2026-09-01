@@ -40,6 +40,44 @@ pub enum SolanaSignOutcome {
     },
 }
 
+/// The full set of inputs to [`SolanaTransferSigner::sign_transfer`].
+///
+/// Grouped into one request so the signing call cannot silently transpose the
+/// account, amount, fee, and blockhash fields — a real hazard when they were a
+/// dozen same-typed positional arguments.
+pub struct SignTransferRequest<'a> {
+    /// The wallet whose derived child signs.
+    pub wallet_id: &'a str,
+    /// The 32-byte Ed25519 public key that must be both fee payer and signer.
+    pub fee_payer: &'a [u8; 32],
+    /// The exact child to sign with. Required whenever the wallet holds more
+    /// than one active Solana child; see the method docs for why.
+    pub account_key_ref: Option<KeyRef>,
+    /// The canonical legacy transfer message bytes to be signed.
+    pub message_bytes: &'a [u8],
+    /// Base58 destination address.
+    pub destination: &'a str,
+    /// Transfer amount, in lamports.
+    pub lamports: u64,
+    /// Network fee, in lamports.
+    pub fee_lamports: u64,
+    /// Genesis hash binding the target chain identity.
+    pub genesis_hash: &'a str,
+    /// The recent blockhash embedded in `message_bytes`.
+    pub recent_blockhash: &'a str,
+    /// The last block height at which `recent_blockhash` is valid.
+    pub last_valid_block_height: u64,
+    /// `None` on the first attempt (prepares the ceremony) and the id returned
+    /// by [`SolanaSignOutcome::ApprovalRequired`] on retry.
+    pub approval_id: Option<Digest32>,
+    /// Approval issuance timestamp, in ms.
+    pub issued_at_ms: u64,
+    /// Approval expiry timestamp, in ms.
+    pub expires_at_ms: u64,
+    /// Digest of the canonical staged-transfer plan facts.
+    pub canonical_plan_facts_digest: Digest32,
+}
+
 /// Signs Solana transfers through the exact Broker signing seam.
 pub struct SolanaTransferSigner {
     broker: MachineBrokerClient,
@@ -88,24 +126,26 @@ impl SolanaTransferSigner {
     ///
     /// `approval_id` is `None` on first attempt (prepares the ceremony) and
     /// the id returned by [`SolanaSignOutcome::ApprovalRequired`] on retry.
-    #[allow(clippy::too_many_arguments)]
     pub async fn sign_transfer(
         &self,
-        wallet_id: &str,
-        fee_payer: &[u8; 32],
-        account_key_ref: Option<KeyRef>,
-        message_bytes: &[u8],
-        destination: &str,
-        lamports: u64,
-        fee_lamports: u64,
-        genesis_hash: &str,
-        recent_blockhash: &str,
-        last_valid_block_height: u64,
-        approval_id: Option<Digest32>,
-        issued_at_ms: u64,
-        expires_at_ms: u64,
-        canonical_plan_facts_digest: Digest32,
+        request: SignTransferRequest<'_>,
     ) -> Result<SolanaSignOutcome, String> {
+        let SignTransferRequest {
+            wallet_id,
+            fee_payer,
+            account_key_ref,
+            message_bytes,
+            destination,
+            lamports,
+            fee_lamports,
+            genesis_hash,
+            recent_blockhash,
+            last_valid_block_height,
+            approval_id,
+            issued_at_ms,
+            expires_at_ms,
+            canonical_plan_facts_digest,
+        } = request;
         let preimage = message_bytes.to_vec();
         let claimed_hash = Digest32::from_bytes(Sha256::digest(&preimage).into());
         let maximum_native_debit = lamports

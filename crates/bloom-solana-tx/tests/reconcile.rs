@@ -336,3 +336,114 @@ async fn receipt_projection_result_loss_latches_on_restart() {
     assert!(restarted.mutation_degradation().is_some());
     assert_eq!(restarted.pending_effect_correlations().unwrap().len(), 1);
 }
+
+// ------------------------------------------------------------------
+// Terminal absence is a quorum fact, not one endpoint's null.
+// ------------------------------------------------------------------
+
+fn seed_sent(dir: &TempDir) -> SolanaOutbox {
+    let outbox = SolanaOutbox::new(dir.path().join("outbox")).unwrap();
+    let staged = sent_entry("0001-00001");
+    outbox.write_pending(&staged, "plan").unwrap();
+    let entry = outbox.read("alice", "solana-devnet", "0001-00001").unwrap();
+    outbox
+        .write_broadcast_attempt(&entry, staged.signature.as_deref().unwrap(), b"raw", 1)
+        .unwrap();
+    outbox.transition(&entry, SolanaOutboxState::Sent).unwrap();
+    outbox
+}
+
+fn two_endpoint_client(preferred: &str, backup: &str) -> SolanaClient {
+    SolanaClient::build(&SolanaSpec {
+        name: "solana-devnet".into(),
+        endpoints: vec![
+            EndpointSpec {
+                url: preferred.to_string(),
+                weight: 100,
+                cu_per_sec: None,
+                max_rps: None,
+                http_only: false,
+            },
+            EndpointSpec {
+                url: backup.to_string(),
+                weight: 50,
+                cu_per_sec: None,
+                max_rps: None,
+                http_only: false,
+            },
+        ],
+        expected_genesis_base58: None,
+        allow_broadcast: false,
+    })
+    .unwrap()
+}
+
+async fn dead_endpoint() -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+    format!("http://{addr}/")
+}
+
+#[tokio::test]
+async fn a_null_from_the_preferred_endpoint_does_not_override_a_finalized_peer() {
+    // The preferred endpoint never saw the signature and reports a block
+    // height past the validity window; the second endpoint finalized it. A
+    // single-endpoint absence inference would record a false failure here.
+    let lagging = spawn_status_stub(None, false, true, 2).await;
+    let healthy = spawn_status_stub(Some(1), false, true, 1).await;
+    let dir = TempDir::new().unwrap();
+    let outbox = seed_sent(&dir);
+
+    let registry = SolanaChainRegistry::new();
+    registry.add(two_endpoint_client(&lagging, &healthy));
+    let reconciler = SolanaReconciler::new(outbox.clone(), registry, audit(&dir));
+    assert_eq!(reconciler.tick().await, 1);
+
+    let receipt = outbox
+        .read_receipt("alice", "solana-devnet", "0001-00001")
+        .unwrap()
+        .expect("the finalized peer's observation wins");
+    assert_eq!(receipt.outcome, "success");
+    assert_eq!(receipt.slot, Some(42));
+}
+
+#[tokio::test]
+async fn terminal_absence_requires_every_configured_endpoint() {
+    let first = spawn_status_stub(None, false, true, 2).await;
+    let second = spawn_status_stub(None, false, true, 3).await;
+    let dir = TempDir::new().unwrap();
+    let outbox = seed_sent(&dir);
+
+    let registry = SolanaChainRegistry::new();
+    registry.add(two_endpoint_client(&first, &second));
+    let reconciler = SolanaReconciler::new(outbox.clone(), registry, audit(&dir));
+    assert_eq!(reconciler.tick().await, 1);
+
+    let receipt = outbox
+        .read_receipt("alice", "solana-devnet", "0001-00001")
+        .unwrap()
+        .expect("all-null past the validity window is terminal");
+    assert_eq!(receipt.outcome, "failed");
+    assert_eq!(receipt.err.unwrap()["kind"], "blockhash_expired_unseen");
+}
+
+#[tokio::test]
+async fn an_unavailable_peer_blocks_terminal_absence() {
+    let answering = spawn_status_stub(None, false, true, 2).await;
+    let unreachable = dead_endpoint().await;
+    let dir = TempDir::new().unwrap();
+    let outbox = seed_sent(&dir);
+
+    let registry = SolanaChainRegistry::new();
+    registry.add(two_endpoint_client(&answering, &unreachable));
+    let reconciler = SolanaReconciler::new(outbox.clone(), registry, audit(&dir));
+    assert_eq!(reconciler.tick().await, 0);
+    assert!(
+        outbox
+            .read_receipt("alice", "solana-devnet", "0001-00001")
+            .unwrap()
+            .is_none(),
+        "absence must not be inferred while an endpoint cannot answer"
+    );
+}

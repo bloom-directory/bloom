@@ -2528,6 +2528,7 @@ version = "0.2.0"
 dependencies = [
  "alloy 2.0.5",
  "blake3",
+ "bs58",
  "dirs",
  "ed25519-dalek",
  "fs2",
