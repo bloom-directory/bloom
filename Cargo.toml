@@ -131,6 +131,14 @@ bloom-trusted-time = { git = "https://github.com/bloom-directory/bloom-service-r
 bloom-machine-client = { path = "crates/bloom-machine-client" }
 # ---- example core petal: generic capability primitives (/bloom/core/cap) ----
 
+[profile.dev]
+debug = "line-tables-only"
+incremental = true
+
+[profile.dev.package."*"]
+debug = false
+opt-level = 1
+
 [profile.release]
 lto = "thin"
 codegen-units = 1
