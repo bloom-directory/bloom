@@ -768,14 +768,6 @@ async fn launch_account_allocation(
         .into());
     }
 
-    // Authenticated Machine→Broker edge for the allocation request below.
-    let client = configured_broker_client(&daemon.home).map_err(|error| {
-        machine_error(
-            MachineErrorKind::Unavailable,
-            format!("custody requires the authenticated Machine-to-Broker edge: {error:#}"),
-        )
-    })?;
-
     let mut operation_bytes = [0_u8; 32];
     rand::thread_rng().fill_bytes(&mut operation_bytes);
     let operation_id = bloom_broker_api::OperationId::from_bytes(operation_bytes);
@@ -5665,8 +5657,10 @@ mod tests {
         let imported = Cli::try_parse_from(["bloom", "wallet", "import", "wallet"]).unwrap();
         assert!(matches!(
             imported.cmd,
-            Some(Cmd::Wallet(WalletCmd::Import { name, profile }))
-                if name == "wallet" && profile == "bip39-multicurve-v1"
+            Some(Cmd::Wallet(WalletCmd::Import {
+                name,
+                raw_private_key: false,
+            })) if name == "wallet"
         ));
 
         let address = Cli::try_parse_from([
