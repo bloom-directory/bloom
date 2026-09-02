@@ -104,6 +104,37 @@ class HarnessLifecycleTests(unittest.TestCase):
             with self.assertRaisesRegex(EvalError, "GLM Coding Plan auth is missing"):
                 _agent_spec("glm")
 
+    def test_deepseek_uses_anthropic_compatibility_with_a_turn_limit(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {"DEEPSEEK_API_KEY": "test-deepseek-key", "BLOOM_EVAL_MAX_TURNS": "15"},
+            clear=True,
+        ):
+            spec = _agent_spec("deepseek")
+
+        self.assertEqual(spec.harbor_name, "claude-code")
+        self.assertEqual(spec.model, "deepseek-v4-flash")
+        self.assertEqual(spec.env["ANTHROPIC_API_KEY"], "test-deepseek-key")
+        self.assertEqual(
+            spec.env["ANTHROPIC_BASE_URL"],
+            "https://api.deepseek.com/anthropic",
+        )
+        self.assertEqual(spec.kwargs["max_turns"], 15)
+
+    def test_deepseek_requires_its_api_key(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=True):
+            with self.assertRaisesRegex(EvalError, "DeepSeek auth is missing"):
+                _agent_spec("deepseek")
+
+    def test_claude_adapter_turn_limit_is_bounded(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {"DEEPSEEK_API_KEY": "test", "BLOOM_EVAL_MAX_TURNS": "101"},
+            clear=True,
+        ):
+            with self.assertRaisesRegex(EvalError, "must be from 1 to 100"):
+                _agent_spec("deepseek")
+
     def passing_result(self) -> SimpleNamespace:
         trial = SimpleNamespace(
             exception_info=None,

@@ -277,10 +277,16 @@ scripts/evals/run-harbor-hyperliquid.sh glm
 
 # Select another provider-compatible model without changing the harness.
 BLOOM_EVAL_MODEL=glm-5.3 scripts/evals/run-harbor-hyperliquid.sh glm
+
+# DeepSeek / V4 Flash through DeepSeek's Anthropic-compatible API.
+export DEEPSEEK_API_KEY=...
+BLOOM_EVAL_MAX_TURNS=15 scripts/evals/run-harbor-hyperliquid.sh deepseek
 ```
 
 Each agent has a reviewed default model. Set `BLOOM_EVAL_MODEL` to select a
 different model for a run; Harbor records the resolved model in the job config.
+Claude Code-backed agents default to at most 20 turns. Set
+`BLOOM_EVAL_MAX_TURNS` from 1 through 100 to choose a tighter or wider bound.
 
 ### Reproduce the package-only wallet policy
 

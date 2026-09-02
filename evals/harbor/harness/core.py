@@ -398,6 +398,7 @@ class AgentSpec:
     harbor_name: str
     model: str
     env: Mapping[str, str] = field(default_factory=dict)
+    kwargs: Mapping[str, Any] = field(default_factory=dict)
 
 
 AGENTS: dict[str, AgentSpec] = {
@@ -406,6 +407,9 @@ AGENTS: dict[str, AgentSpec] = {
     # rather than a configuration error.
     "claude": AgentSpec("claude-code", "claude-sonnet-5"),
     "codex": AgentSpec("codex", "gpt-5.6-terra"),
+    # DeepSeek exposes its current models through an Anthropic-compatible API,
+    # which lets the Claude Code adapter retain its normal tool loop.
+    "deepseek": AgentSpec("claude-code", "deepseek-v4-flash"),
     # Z.AI exposes GLM Coding Plan through an Anthropic-compatible endpoint,
     # so Harbor can run it with its existing Claude Code adapter.
     "glm": AgentSpec("claude-code", "glm-5.2"),
@@ -511,6 +515,7 @@ async def run_harbor_job(context: EvalRunContext, agent: AgentSpec) -> Any:
                 model_name=agent.model,
                 n_concurrent=1,
                 env=shared_env,
+                kwargs=dict(agent.kwargs),
             )
         ],
         environment=EnvironmentConfig(
@@ -560,6 +565,15 @@ def _agent_spec(name: str) -> AgentSpec:
             ANTHROPIC_BASE_URL="https://api.z.ai/api/anthropic",
             API_TIMEOUT_MS="3000000",
         )
+    if name == "deepseek":
+        api_key = os.getenv("DEEPSEEK_API_KEY")
+        if not api_key:
+            raise EvalError("DeepSeek auth is missing; set DEEPSEEK_API_KEY")
+        agent_env.update(
+            ANTHROPIC_API_KEY=api_key,
+            ANTHROPIC_BASE_URL="https://api.deepseek.com/anthropic",
+            API_TIMEOUT_MS="3000000",
+        )
     if name == "codex" and not os.getenv("OPENAI_API_KEY"):
         auth_file = Path.home() / ".codex" / "auth.json"
         if not auth_file.is_file():
@@ -569,7 +583,17 @@ def _agent_spec(name: str) -> AgentSpec:
     model = os.getenv("BLOOM_EVAL_MODEL", spec.model).strip()
     if not model:
         raise EvalError("BLOOM_EVAL_MODEL must not be empty")
-    return AgentSpec(spec.harbor_name, model, agent_env)
+    agent_kwargs = dict(spec.kwargs)
+    if spec.harbor_name == "claude-code":
+        raw_max_turns = os.getenv("BLOOM_EVAL_MAX_TURNS", "20").strip()
+        try:
+            max_turns = int(raw_max_turns)
+        except ValueError as error:
+            raise EvalError("BLOOM_EVAL_MAX_TURNS must be an integer") from error
+        if not 1 <= max_turns <= 100:
+            raise EvalError("BLOOM_EVAL_MAX_TURNS must be from 1 to 100")
+        agent_kwargs["max_turns"] = max_turns
+    return AgentSpec(spec.harbor_name, model, agent_env, agent_kwargs)
 
 
 def run_eval(
