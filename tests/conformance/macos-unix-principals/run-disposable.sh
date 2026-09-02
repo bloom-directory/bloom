@@ -62,7 +62,7 @@ capture_failure_evidence() {
   evidence_dir="${BLOOM_MACOS_W0_EVIDENCE_DIR:-}"
   [[ -n "$evidence_dir" && -d "$evidence_dir" ]] || return 0
   for service in broker signer; do
-    source_log="/private/var/db/bloom/$login_uid/$service/$service.log"
+    source_log="/private/var/log/bloom/$login_uid/$service.jsonl"
     if [[ -f "$source_log" && ! -L "$source_log" ]]; then
       install -m 0644 "$source_log" "$evidence_dir/$service.log" || true
     fi
@@ -571,7 +571,7 @@ grep -Fi \
 }
 
 broker_plist="/Library/LaunchDaemons/com.bloom.broker.$login_uid.plist"
-broker_log="/private/var/db/bloom/$login_uid/broker/broker.log"
+broker_log="/private/var/log/bloom/$login_uid/broker.jsonl"
 broker_state="/private/var/db/bloom/$login_uid/broker"
 broker_startup_status="/private/var/run/bloom/$login_uid/status/broker-startup.json"
 containment_status="/private/var/run/bloom/$login_uid/containment/status.json"
