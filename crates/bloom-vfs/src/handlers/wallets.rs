@@ -1695,7 +1695,15 @@ fn validate_policy_action_id(id: &str) -> Result<(), HandlerError> {
 
 fn tx_open_err(e: TxEngineError) -> HandlerError {
     match e {
-        TxEngineError::ApprovalRequired(_) => HandlerError::PermissionDenied,
+        // Carry the ceremony forward. Collapsing this to a permissions error
+        // told the caller they may not do the thing, when in fact the
+        // requirement was one owner ceremony whose URL was already in hand.
+        TxEngineError::ApprovalRequired(requirement) => HandlerError::ApprovalRequired {
+            action_id: requirement.action_id,
+            ceremony_url: requirement.ceremony_url,
+            expires_ms: requirement.expires_ms,
+            reason: requirement.reason,
+        },
         TxEngineError::PolicyDenied | TxEngineError::BroadcastDisabled(_) => {
             HandlerError::OperationNotPermitted
         }
@@ -3019,7 +3027,14 @@ impl WalletsHandler {
                         TxEngineError::EnsoQuoteStale { .. } => {
                             HandlerError::invalid(e.to_string())
                         }
-                        TxEngineError::ApprovalRequired(_) => HandlerError::PermissionDenied,
+                        TxEngineError::ApprovalRequired(requirement) => {
+                            HandlerError::ApprovalRequired {
+                                action_id: requirement.action_id,
+                                ceremony_url: requirement.ceremony_url,
+                                expires_ms: requirement.expires_ms,
+                                reason: requirement.reason,
+                            }
+                        }
                         other => err_be(other),
                     })?;
                 Ok(())
@@ -3092,6 +3107,32 @@ impl WalletsHandler {
 }
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn an_approval_requirement_reaches_the_caller_with_its_ceremony() {
+        // Regression: this was flattened to a bare PermissionDenied, so a
+        // caller was told they may not act when the real requirement was one
+        // owner ceremony whose URL the engine already held.
+        let err = tx_open_err(TxEngineError::ApprovalRequired(
+            bloom_tx::ApprovalRequirement {
+                action_id: "evm-abc123".into(),
+                ceremony_url: "http://localhost:18734/ceremony/TOKEN".into(),
+                expires_ms: 1_788_390_973_738,
+                reason: "transaction.confirm needs owner approval".into(),
+            },
+        ));
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("http://localhost:18734/ceremony/TOKEN"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("evm-abc123"), "{rendered}");
+        assert!(rendered.contains("approval required"), "{rendered}");
+        assert!(
+            !matches!(err, HandlerError::PermissionDenied),
+            "approval required is a step in the flow, not a refusal"
+        );
+    }
     use super::*;
     use alloy::primitives::Address;
     use bloom_broker_api::{
