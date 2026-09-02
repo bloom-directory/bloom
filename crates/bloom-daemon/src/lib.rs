@@ -226,6 +226,7 @@ struct DaemonPetalHost {
     tx_outbox: Option<PetalTxOutbox>,
     tx_stage_lock: tokio::sync::Mutex<()>,
     broker: Option<MachineBrokerClient>,
+    wallets: Option<Arc<WalletsHandler>>,
     provenance_catalog: Option<bloom_broker_api::ProvenanceCatalog>,
     petal_key_state_root: Option<PathBuf>,
     petal_key_lock: tokio::sync::Mutex<()>,
@@ -360,6 +361,7 @@ impl DaemonPetalHost {
             tx_outbox: None,
             tx_stage_lock: tokio::sync::Mutex::new(()),
             broker: None,
+            wallets: None,
             provenance_catalog: None,
             petal_key_state_root: None,
             petal_key_lock: tokio::sync::Mutex::new(()),
@@ -376,6 +378,31 @@ impl DaemonPetalHost {
     fn with_broker(mut self, broker: Option<MachineBrokerClient>) -> Self {
         self.broker = broker;
         self
+    }
+
+    fn with_wallets(mut self, wallets: Arc<WalletsHandler>) -> Self {
+        self.wallets = Some(wallets);
+        self
+    }
+
+    async fn ensure_petal_eligibility(
+        &self,
+        wallet: &str,
+        package_hash: &bloom_broker_api::Digest32,
+    ) -> Result<Option<bloom_machine_client::PendingPolicyUpdate>, HostError> {
+        let Some(wallets) = self.wallets.as_ref() else {
+            return Ok(None);
+        };
+        match wallets
+            .ensure_petal_eligibility(wallet, package_hash)
+            .await
+            .map_err(|error| HostError::Denied(error.to_string()))?
+        {
+            bloom_machine_client::PetalEligibility::Allowed(_) => Ok(None),
+            bloom_machine_client::PetalEligibility::AwaitingPolicyApproval(pending) => {
+                Ok(Some(pending))
+            }
+        }
     }
 
     fn with_provenance_catalog(
@@ -799,6 +826,7 @@ impl DaemonPetalHost {
             petal_id: format!("{PETAL_ID_PREFIX}{}", context.petal_root),
             petal_digest: context.package_hash.clone(),
             petal_version: "v1-package".into(),
+            route_id: Some(context.route_id.clone()),
         })
     }
 
@@ -1039,6 +1067,15 @@ impl PetalHost for DaemonPetalHost {
         let scope_digest = scope
             .digest()
             .map_err(|error| HostError::Invalid(error.to_string()))?;
+        if let Some(pending) = self
+            .ensure_petal_eligibility(&req.wallet_id, &scope.package_hash)
+            .await?
+        {
+            return Ok(bloom_petals::PetalKeyOutcome::Pending {
+                operation_id: pending.operation_id.as_str().to_owned(),
+                scope_digest: scope_digest.as_str().to_owned(),
+            });
+        }
         let provenance_digest = Some(
             provenance_record
                 .digest()
@@ -1576,6 +1613,19 @@ impl PetalHost for DaemonPetalHost {
             let catalog = self.provenance_catalog.clone().ok_or_else(|| {
                 HostError::Backend("installer provenance catalog is not configured".into())
             })?;
+            if let Some(pending) = self
+                .ensure_petal_eligibility(&req.wallet, &trusted_package_hash)
+                .await?
+            {
+                return Ok(SignOutcome::ApprovalPending(ApprovalPending {
+                    action_id: pending.operation_id.as_str().to_owned(),
+                    expires_ms: pending
+                        .prepare
+                        .as_ref()
+                        .map(|prepare| prepare.ceremony_expires_at_ms.get())
+                        .unwrap_or(0),
+                }));
+            }
             let signer = BrokerExactPayloadSigner::new(broker.clone(), catalog);
             let _guard = self.petal_signing_lock.lock().await;
             let outcome = signer
@@ -1815,6 +1865,19 @@ impl PetalHost for DaemonPetalHost {
             return Err(HostError::Denied(
                 "payload batch claim does not match trusted route or exact ordered payloads".into(),
             ));
+        }
+        if let Some(pending) = self
+            .ensure_petal_eligibility(&req.wallet, &trusted_package_hash)
+            .await?
+        {
+            return Ok(PayloadBatchSignOutcome::ApprovalPending(ApprovalPending {
+                action_id: pending.operation_id.as_str().to_owned(),
+                expires_ms: pending
+                    .prepare
+                    .as_ref()
+                    .map(|prepare| prepare.ceremony_expires_at_ms.get())
+                    .unwrap_or(0),
+            }));
         }
         let trusted_subject = bloom_broker_api::ProvenanceSubject::Petal {
             package_hash: trusted_package_hash,
@@ -3463,6 +3526,19 @@ impl Daemon {
             })),
         );
 
+        let wallets_handler = Arc::new(
+            WalletsHandler::new(
+                chains.clone(),
+                tx_engine.clone(),
+                address_book.clone(),
+                wallet_projections.clone(),
+                home.root().join("machine-policy-projections"),
+            )
+            .with_broker(broker.clone())
+            .with_home_write_permit_opt(home_write_permit.clone())
+            .with_mempool_indexes(mempool_indexes.clone()),
+        );
+
         // Build the petals runtime: content-addressed store under
         // `~/.bloom/petals/store`, name registry under
         // `~/.bloom/petals/registry`, and a wasmtime engine. Petal
@@ -3479,6 +3555,7 @@ impl Daemon {
         let petal_vfs_host = Arc::new(LateVfsHost::new());
         let petal_app_host = DaemonPetalHost::new(petal_vfs_host.clone(), audit_arc.clone())
             .with_broker(broker.clone())
+            .with_wallets(wallets_handler.clone())
             .with_provenance_catalog(provenance_catalog.clone())
             .with_petal_key_state_root(home.cache_dir().join("petal-key-requests"))
             .with_petal_signing_state_root(home.cache_dir().join("petal-signing-requests"))
@@ -3532,20 +3609,8 @@ impl Daemon {
                 ) as _,
             );
 
-        let wallets_handler = WalletsHandler::new(
-            chains.clone(),
-            tx_engine.clone(),
-            address_book.clone(),
-            wallet_projections.clone(),
-            home.root().join("machine-policy-projections"),
-        );
-        let wallets_handler = wallets_handler
-            .with_broker(broker.clone())
-            .with_home_write_permit_opt(home_write_permit.clone())
-            .with_mempool_indexes(mempool_indexes.clone());
-
         vfs_builder = vfs_builder
-            .mount("wallets", Arc::new(wallets_handler) as _)
+            .mount("wallets", wallets_handler as _)
             .mount("tools", Arc::new(ToolsHandler::new()) as _)
             .mount(
                 "requests",
@@ -5696,11 +5761,11 @@ mod tests {
         assert_eq!(origin.petal_id, "petal:polymarket");
         assert_eq!(origin.petal_digest, "a".repeat(64));
         assert_eq!(origin.petal_version, "v1-package");
+        assert_eq!(origin.route_id.as_deref(), Some("r000001"));
 
-        for mutate in ["route", "operation", "path"] {
+        for mutate in ["operation", "path"] {
             let mut changed = context.clone();
             match mutate {
-                "route" => changed.route_id = "r000002".into(),
                 "operation" => changed.op = "read".into(),
                 "path" => changed.path = "/fund/alice/two/confirm".into(),
                 _ => unreachable!(),

@@ -58,6 +58,10 @@ pub struct ExecutionOrigin {
     pub petal_id: String,
     pub petal_digest: String,
     pub petal_version: String,
+    /// Producing route injected by the host. Older staged plans require restaging
+    /// before they can use Petal-scoped signing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route_id: Option<String>,
 }
 
 impl Default for ExecutionOrigin {
@@ -66,11 +70,18 @@ impl Default for ExecutionOrigin {
             petal_id: PETAL_ID_EVM_WALLET.into(),
             petal_digest: PLACEHOLDER_DIGEST_EVM_WALLET.into(),
             petal_version: FIRST_PARTY_PETAL_VERSION_V0.into(),
+            route_id: None,
         }
     }
 }
 
 impl ExecutionOrigin {
+    pub fn same_package(&self, other: &Self) -> bool {
+        self.petal_id == other.petal_id
+            && self.petal_digest == other.petal_digest
+            && self.petal_version == other.petal_version
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         for (field, value) in [
             ("petal_id", self.petal_id.as_str()),

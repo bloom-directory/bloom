@@ -2042,6 +2042,12 @@ enum InitInternal {
         session_socket_gid: u32,
         release_digest: String,
     },
+    #[command(name = "triad-refresh-provenance-catalog", hide = true)]
+    RefreshProvenanceCatalog {
+        template: PathBuf,
+        installer_identity: PathBuf,
+        output: PathBuf,
+    },
     #[command(name = "triad-render-macos-identity-rotation", hide = true)]
     MacosIdentityRotation {
         current_identity: PathBuf,
@@ -2872,6 +2878,16 @@ async fn run(cli: Cli) -> Result<()> {
                         release_digest,
                     )
                     .context("Bloom Linux enrollment generation failed"),
+                    InitInternal::RefreshProvenanceCatalog {
+                        template,
+                        installer_identity,
+                        output,
+                    } => triad_enrollment::run_provenance_refresh(
+                        &template,
+                        &installer_identity,
+                        &output,
+                    )
+                    .context("Bloom provenance catalog refresh failed"),
                     InitInternal::MacosIdentityRotation {
                         current_identity,
                         replacement_identity,
@@ -3532,10 +3548,10 @@ async fn run(cli: Cli) -> Result<()> {
             shutdown.abort();
             provisioning_context.cancel();
             let provisioning_task = provisioning.lock().expect("provisioning handle").take();
-            if let Some(task) = provisioning_task {
-                if let Err(error) = task.await {
-                    warn!(%error, "petal.provisioning_worker_failed");
-                }
+            if let Some(task) = provisioning_task
+                && let Err(error) = task.await
+            {
+                warn!(%error, "petal.provisioning_worker_failed");
             }
             // Stop the outbox expiry sweeper (fix #3) and any other
             // daemon-owned workers (watch executor, etc., fix #6).

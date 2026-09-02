@@ -1784,6 +1784,7 @@ mod tests {
             petal_id: "petal:polymarket".into(),
             petal_digest: "a".repeat(64),
             petal_version: "v1-package".into(),
+            route_id: Some("r000001".into()),
         });
 
         ob.write_pending(&staged, "# plan").unwrap();

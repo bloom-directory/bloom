@@ -83,9 +83,11 @@ impl Default for PetalsConfig {
 }
 
 fn default_preinstalled_petals() -> Vec<String> {
-    // No Petal is a default until its immutable release archive has been
-    // installed and exercised against this exact Machine contract.
-    Vec::new()
+    vec![
+        "polymarket".into(),
+        "hyperliquid".into(),
+        "near-intents".into(),
+    ]
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -450,8 +452,7 @@ impl Config {
     ///
     /// Currently infers `op_stack` for well-known OP-stack chain IDs
     /// (Optimism=10, Base=8453, …) that predate the `op_stack` field and
-    /// removes exact historical default Petal catalogs whose released
-    /// archives are not compatible with the current Machine contract.
+    /// advances the v0.1.3 default Petal set to the current release defaults.
     fn migrate(&mut self, document: &toml::Value) {
         for spec in self.chains.values_mut() {
             spec.infer_op_stack();
@@ -464,10 +465,9 @@ impl Config {
         let is_legacy_default = persisted_preinstalled.is_some_and(|entries| {
             let entries = entries.iter().map(toml::Value::as_str).collect::<Vec<_>>();
             entries == [Some("near-intents"), Some("enso")]
-                || entries == [Some("polymarket"), Some("near-intents"), Some("enso")]
         });
         if is_legacy_default {
-            self.petals.preinstalled.clear();
+            self.petals.preinstalled = default_preinstalled_petals();
         }
     }
 
@@ -548,7 +548,13 @@ impl Config {
             validate_petal_runtime_name("preinstalled entry", name)?;
             if !matches!(
                 name.as_str(),
-                "near-intents" | "enso" | "gasless" | "privacy-pools" | "venice-x402"
+                "polymarket"
+                    | "hyperliquid"
+                    | "near-intents"
+                    | "enso"
+                    | "gasless"
+                    | "privacy-pools"
+                    | "venice-x402"
             ) {
                 return Err(ConfigError::Invalid(format!(
                     "unknown preinstalled Petal {name:?}"
@@ -724,18 +730,10 @@ mod tests {
         cfg.validate().unwrap();
 
         cfg.petals.preinstalled = vec!["hyperliquid".into()];
-        let err = cfg.validate().unwrap_err().to_string();
-        assert!(
-            err.contains("unknown preinstalled Petal \"hyperliquid\""),
-            "{err}"
-        );
+        cfg.validate().unwrap();
 
         cfg.petals.preinstalled = vec!["polymarket".into()];
-        let err = cfg.validate().unwrap_err().to_string();
-        assert!(
-            err.contains("unknown preinstalled Petal \"polymarket\""),
-            "{err}"
-        );
+        cfg.validate().unwrap();
 
         cfg.petals.preinstalled = vec!["unknown".into()];
         let err = cfg.validate().unwrap_err().to_string();
@@ -762,19 +760,21 @@ mod tests {
         cfg.save(&path).unwrap();
 
         let migrated = Config::load(&path).unwrap();
-        assert!(migrated.petals.preinstalled.is_empty());
+        assert_eq!(
+            migrated.petals.preinstalled,
+            vec!["polymarket", "near-intents", "enso"]
+        );
 
         cfg.petals.preinstalled = vec!["near-intents".into(), "enso".into()];
         cfg.save(&path).unwrap();
         let migrated = Config::load(&path).unwrap();
-        assert!(migrated.petals.preinstalled.is_empty());
+        assert_eq!(migrated.petals.preinstalled, default_preinstalled_petals());
 
         cfg.petals.preinstalled = vec!["polymarket".into()];
         cfg.save(&path).unwrap();
-        let err = Config::load(&path).unwrap_err().to_string();
-        assert!(
-            err.contains("unknown preinstalled Petal \"polymarket\""),
-            "{err}"
+        assert_eq!(
+            Config::load(&path).unwrap().petals.preinstalled,
+            vec!["polymarket"]
         );
     }
 

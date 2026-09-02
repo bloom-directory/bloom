@@ -1288,8 +1288,7 @@ impl WalletsHandler {
                             HandlerError::backend("prepared policy operation was not persisted")
                         })?;
                 let projection: TriadPolicyUpdateProjection = read_json(
-                    &self
-                        .policy_update_action_dir(wallet, "pending", &operation_id)
+                    self.policy_update_action_dir(wallet, "pending", &operation_id)
                         .join(APPROVAL_CHALLENGE_FILE),
                 )?;
                 projection.pending_view(package_hash)
@@ -1511,7 +1510,7 @@ impl WalletsHandler {
                     "pending",
                     "confirmed",
                 )?;
-                return Ok(());
+                Ok(())
             }
             bloom_broker_api::CeremonyState::Cancelled
             | bloom_broker_api::CeremonyState::Expired
@@ -1525,10 +1524,10 @@ impl WalletsHandler {
                     "pending",
                     "failed",
                 )?;
-                return Err(HandlerError::invalid(format!(
+                Err(HandlerError::invalid(format!(
                     "Broker policy ceremony is terminal: {:?}",
                     status.state
-                )));
+                )))
             }
             bloom_broker_api::CeremonyState::Completed => Err(HandlerError::backend(
                 "policy_update ceremony reported the wallet-registration-only COMPLETED state",
@@ -3504,7 +3503,6 @@ mod tests {
                             public_key_refs: Vec::new(),
                             credential_summaries: Vec::new(),
                             initial_policy: None,
-                            petal_registration_terms_digest: None,
                             receipt_digest: digest(63),
                             encrypted_browser_result: None,
                             signer_key_id: token("signer-key"),

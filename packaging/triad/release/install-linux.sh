@@ -774,6 +774,15 @@ case "$action" in
       atomic_install "$source_config/session-identity.json" "$config_root/session/identity.json" 0600
       atomic_install "$source_config/installer-identity.json" "$config_root/installer-identity.json" 0600
       atomic_install "$source_config/provenance-catalog.json" "$config_root/provenance-catalog.json" 0644
+    elif [[ "$root" == "/" ]]; then
+      provenance_candidate="$config_root/.provenance-catalog.source.$$"
+      rm -f -- "$provenance_candidate"
+      "$binary_root/bloom" init triad-refresh-provenance-catalog \
+        "$payload/installer/linux/config/provenance-catalog.unsigned.json" \
+        "$config_root/installer-identity.json" \
+        "$provenance_candidate"
+      atomic_install "$provenance_candidate" "$config_root/provenance-catalog.json" 0644
+      rm -f -- "$provenance_candidate"
     fi
     enrollment_root="$root/etc/bloom/enrollments"
     mkdir -p "$enrollment_root"

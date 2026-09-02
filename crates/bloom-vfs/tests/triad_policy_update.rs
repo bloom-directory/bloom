@@ -214,7 +214,6 @@ impl MachineBrokerService for BrokerFixture {
                         public_key_refs: Vec::new(),
                         credential_summaries: Vec::new(),
                         initial_policy: None,
-                        petal_registration_terms_digest: None,
                         receipt_digest: Digest32::from_bytes([8; 32]),
                         encrypted_browser_result: None,
                         signer_key_id: Token::new("signer-key").unwrap(),

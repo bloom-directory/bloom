@@ -608,6 +608,14 @@ rewrite_all_enrollments() {
     login_user="$(field "$record" login_user)"; load_names; paths; load_ids
     BLOOM_RELEASE_DIGEST="$digest"; write_enrollment "$state"
     if $live; then
+      catalog_candidate="$config/provenance-catalog.json.new.$$"
+      rm -f -- "$catalog_candidate"
+      "$release_base/releases/$digest/bloom" init triad-refresh-provenance-catalog \
+        "$payload/installer/macos/config/provenance-catalog.unsigned.json" \
+        "$installer_config/identity.json" "$catalog_candidate"
+      chmod 0644 "$catalog_candidate"
+      chown root:wheel "$catalog_candidate"
+      mv -f "$catalog_candidate" "$config/provenance-catalog.json"
       plutil -replace build_digest -string "$digest" "$broker_config/config.json"
       plutil -replace build_digest -string "$digest" "$signer_config/config.json"
     fi

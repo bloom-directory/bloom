@@ -78,11 +78,11 @@ require_compat_value() {
   }
 }
 require_compat_value protocols.machine_broker major 1
-require_compat_value protocols.machine_broker minor_min 5
-require_compat_value protocols.machine_broker minor_max 5
+require_compat_value protocols.machine_broker minor_min 4
+require_compat_value protocols.machine_broker minor_max 4
 require_compat_value protocols.broker_signer major 1
-require_compat_value protocols.broker_signer minor_min 3
-require_compat_value protocols.broker_signer minor_max 3
+require_compat_value protocols.broker_signer minor_min 4
+require_compat_value protocols.broker_signer minor_max 4
 for support_edge in signer_control session; do
   require_compat_value "protocols.$support_edge" major 1
   require_compat_value "protocols.$support_edge" minor_min 0
