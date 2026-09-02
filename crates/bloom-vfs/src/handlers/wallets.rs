@@ -1669,6 +1669,51 @@ impl WalletsHandler {
         Err(HandlerError::PermissionDenied)
     }
 
+    async fn cancel_wallet_policy_update(
+        &self,
+        wallet: &str,
+        operation_id: &str,
+    ) -> Result<(), HandlerError> {
+        validate_policy_action_id(operation_id)?;
+        let projection_path = self
+            .policy_update_action_dir(wallet, "pending", operation_id)
+            .join(APPROVAL_CHALLENGE_FILE);
+        let mut projection: TriadPolicyUpdateProjection = read_json(&projection_path)?;
+        if projection.schema != "bloom.machine-policy-update-projection.1"
+            || projection.wallet_id.as_str() != wallet
+            || projection.operation_id.as_str() != operation_id
+        {
+            return Err(HandlerError::backend(
+                "policy projection identity or schema is invalid",
+            ));
+        }
+        let status = self
+            .broker
+            .as_ref()
+            .ok_or_else(|| {
+                HandlerError::backend(
+                    "SERVICE_UNAVAILABLE: policy cancellation requires the authenticated Broker edge",
+                )
+            })?
+            .cancel_ceremony(projection.operation_id.clone())
+            .await
+            .map_err(|error| HandlerError::backend(error.to_string()))?;
+        if status.operation_id != projection.operation_id
+            || status.ceremony_kind != bloom_broker_api::CeremonyKind::PolicyUpdate
+            || status.state != bloom_broker_api::CeremonyState::Cancelled
+        {
+            return Err(HandlerError::backend(
+                "Broker did not confirm policy update cancellation",
+            ));
+        }
+        projection.ceremony_state = status.state;
+        projection.ceremony_url = None;
+        projection.ceremony_expires_at_ms = None;
+        write_atomic_json(&projection_path, &projection)?;
+        self.policy_update_transition(wallet, operation_id, "pending", "failed")?;
+        Ok(())
+    }
+
     /// The existing policy projection retains the exact canonical proposal for
     /// completion recovery. The root holds one subdirectory per
     /// lifecycle state (`pending`, `confirmed`, `failed`), matching the
@@ -2436,6 +2481,15 @@ impl WalletsHandler {
                         Err(HandlerError::not_found(path.to_string_path()))
                     }
                 }
+                5 if segs[2] == "pending" && segs[4] == "cancel" => {
+                    validate_policy_action_id(&segs[3])?;
+                    let dir = self.policy_update_action_dir(wallet, "pending", &segs[3]);
+                    if dir.is_dir() {
+                        Ok(Entry::writable_file("cancel"))
+                    } else {
+                        Err(HandlerError::not_found(path.to_string_path()))
+                    }
+                }
                 _ => Err(HandlerError::not_found(path.to_string_path())),
             },
             "capabilities" => match segs.len() {
@@ -2631,6 +2685,24 @@ impl WalletsHandler {
                 .write_wallet_policy_update(wallet, &path.to_string_path(), data)
                 .await;
         }
+        if segs.len() == 5
+            && segs[1] == "policy-updates"
+            && segs[2] == "pending"
+            && segs[4] == "cancel"
+        {
+            self.write_permit()?;
+            let confirmation = std::str::from_utf8(data)
+                .map_err(|_| {
+                    HandlerError::invalid("policy cancellation requires UTF-8 confirmation")
+                })?
+                .trim();
+            if !confirmation.eq_ignore_ascii_case("cancel") {
+                return Err(HandlerError::invalid(
+                    "policy cancellation accepts only `cancel`",
+                ));
+            }
+            return self.cancel_wallet_policy_update(wallet, &segs[3]).await;
+        }
         if segs.len() == 3 && segs[1] == "sealed-approvals" && segs[2] == "new.json" {
             self.write_permit()?;
             return self.prepare_sealed_approval(wallet, data).await;
@@ -2750,6 +2822,9 @@ impl WalletsHandler {
                     out.push(Entry::file("approval_challenge.json"));
                 }
                 out.push(Entry::file("status.json"));
+                if segs[2] == "pending" {
+                    out.push(Entry::writable_file("cancel"));
+                }
                 Ok(out)
             }
             n if n >= 3 && segs[1] == "chains" => {

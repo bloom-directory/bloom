@@ -1,5 +1,11 @@
 Use the Bloom filesystem mounted at `/bloom` to perform this exact task on **Hyperliquid mainnet**:
 
+Exercise the mounted filesystem using ordinary shell filesystem operations only
+(for example, `cat` for reads and shell redirection for writes). Do not invoke
+`bloom vfs`, the `bloom` executable, a Machine RPC endpoint, or any alternate
+transport. If a mounted operation fails, treat it as a task failure; do not
+bypass or replace the mount.
+
 `/bloom` is a dynamic virtual filesystem: directory traversal can execute live
 venue reads. Never run `find`, `tree`, `rg --files`, recursive `ls`, or any
 broad enumeration under `/bloom`, and never issue concurrent `/bloom` commands.
