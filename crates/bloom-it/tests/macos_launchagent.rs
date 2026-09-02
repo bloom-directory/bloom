@@ -418,7 +418,6 @@ fn privileged_w0_harness_requires_an_external_disposable_host_marker() {
     assert!(source.contains("bloom-macos-unix-w0-disposable-v1"));
     assert!(source.contains("macos-unix-principals-w0"));
     assert!(source.contains("/usr/bin/nc -lk 127.0.0.1 18734"));
-    assert!(source.contains("no fallback port will be used"));
     assert!(source.contains("Broker opened a fallback TCP listener"));
     assert!(source.contains("foreign_or_unverifiable_process"));
     assert!(source.contains("Bloom Broker startup failed: a foreign or unverifiable process"));

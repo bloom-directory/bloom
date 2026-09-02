@@ -571,7 +571,6 @@ grep -Fi \
 }
 
 broker_plist="/Library/LaunchDaemons/com.bloom.broker.$login_uid.plist"
-broker_log="/private/var/log/bloom/$login_uid/broker.jsonl"
 broker_state="/private/var/db/bloom/$login_uid/broker"
 broker_startup_status="/private/var/run/bloom/$login_uid/status/broker-startup.json"
 containment_status="/private/var/run/bloom/$login_uid/containment/status.json"
@@ -605,17 +604,15 @@ sleep "$(( (containment_maximum_age_ms + 999) / 1000 + 1 ))"
 launchctl bootstrap system "$broker_plist"
 deadline=$((SECONDS + 15))
 while [[ $SECONDS -lt $deadline ]]; do
-  if grep -F \
-    'fatal canonical ceremony listener ownership conflict at 127.0.0.1:18734; no fallback port will be used' \
-    "$broker_log" >/dev/null 2>&1
+  if [[ -f "$broker_startup_status" ]] &&
+    [[ "$(plutil -extract state raw -o - "$broker_startup_status" 2>/dev/null)" == "fatal" ]] &&
+    [[ "$(plutil -extract incident raw -o - "$broker_startup_status" 2>/dev/null)" == \
+      "foreign_or_unverifiable_process" ]]
   then
     break
   fi
   sleep 0.1
 done
-grep -F \
-  'fatal canonical ceremony listener ownership conflict at 127.0.0.1:18734; no fallback port will be used' \
-  "$broker_log" >/dev/null
 assert_metadata \
   "$broker_startup_status" \
   "$broker_uid:$machine_broker_gid:640"
