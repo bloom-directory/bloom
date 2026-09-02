@@ -11,8 +11,8 @@ use async_trait::async_trait;
 use crate::abi::{
     ChainRequest, ChainResponse, EvmOutboxInspection, EvmOutboxOutcome, EvmTransactionRequest,
     HttpRequest, HttpResponse, PayloadBatchSignOutcome, PayloadBatchSignRequest,
-    PayloadSignRequest, PetalKeyOutcome, PetalKeyRequest, PetalRouteContext, SignBatchOutcome,
-    SignBatchRequest, SignOutcome, SignRequest,
+    PayloadSignRequest, PetalKeyOutcome, PetalKeyRequest, PetalRouteContext, PrivateInputOutcome,
+    PrivateInputRequest, SignBatchOutcome, SignBatchRequest, SignOutcome, SignRequest,
 };
 use crate::policy::NetPolicy;
 
@@ -138,6 +138,15 @@ pub trait PetalHost: Send + Sync {
     /// only.
     async fn petal_key_request(&self, _req: PetalKeyRequest) -> Result<PetalKeyOutcome, HostError> {
         Err(HostError::Denied("petal_key_request".into()))
+    }
+
+    /// Collect a short-lived value through Broker's owner-facing browser
+    /// form. Implementations inject and bind the trusted route context.
+    async fn private_input_request(
+        &self,
+        _req: PrivateInputRequest,
+    ) -> Result<PrivateInputOutcome, HostError> {
+        Err(HostError::Denied("private_input_request".into()))
     }
 
     /// Stage a generic EVM transaction in the daemon outbox. Hosts default to

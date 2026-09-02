@@ -32,6 +32,9 @@ pub enum Capability {
     /// May request a Signer-owned, provenance-bound Petal sub-key.
     #[serde(rename = "key.derive")]
     KeyDerive,
+    /// May request a short-lived value through Broker's browser form.
+    #[serde(rename = "private.input")]
+    PrivateInput,
 }
 
 impl Capability {
@@ -45,6 +48,7 @@ impl Capability {
             Capability::Chain => "chain",
             Capability::TxOutbox => "tx.outbox",
             Capability::KeyDerive => "key.derive",
+            Capability::PrivateInput => "private.input",
         }
     }
 
@@ -58,6 +62,7 @@ impl Capability {
             "chain" => Some(Capability::Chain),
             "tx.outbox" => Some(Capability::TxOutbox),
             "key.derive" => Some(Capability::KeyDerive),
+            "private.input" => Some(Capability::PrivateInput),
             _ => None,
         }
     }
@@ -156,6 +161,7 @@ pub fn validate_mode_caps(
                     | Capability::Chain
                     | Capability::TxOutbox
                     | Capability::KeyDerive
+                    | Capability::PrivateInput
             )
         );
         if !ok {
@@ -181,6 +187,7 @@ mod tests {
         assert_eq!(Capability::Store.as_str(), "store");
         assert_eq!(Capability::Chain.as_str(), "chain");
         assert_eq!(Capability::TxOutbox.as_str(), "tx.outbox");
+        assert_eq!(Capability::PrivateInput.as_str(), "private.input");
         assert_eq!(Capability::parse("vfs.read"), Some(Capability::VfsRead));
         assert_eq!(Capability::parse("vfs.write"), Some(Capability::VfsWrite));
         assert_eq!(Capability::parse("net.fetch"), Some(Capability::NetFetch));
@@ -188,6 +195,10 @@ mod tests {
         assert_eq!(Capability::parse("store"), Some(Capability::Store));
         assert_eq!(Capability::parse("chain"), Some(Capability::Chain));
         assert_eq!(Capability::parse("tx.outbox"), Some(Capability::TxOutbox));
+        assert_eq!(
+            Capability::parse("private.input"),
+            Some(Capability::PrivateInput)
+        );
         assert_eq!(Capability::parse("nope"), None);
     }
 

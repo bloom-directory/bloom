@@ -25,10 +25,12 @@ pub use abi::{
     DispatchRequest, DispatchResponse, EvmOutboxInspection, EvmOutboxOutcome,
     EvmTransactionRequest, HttpRequest, HttpResponse, PayloadBatchSignOutcome,
     PayloadBatchSignRequest, PayloadSignItem, PayloadSignRequest, PetalKeyGuestRequest,
-    PetalKeyOutcome, PetalKeyRequest, SignBatchOutcome, SignBatchRequest, SignOutcome, SignRequest,
-    decode_dispatch_request, decode_dispatch_response, decode_http_request, decode_http_response,
-    decode_sign_request, decode_string_list, encode_dispatch_request, encode_dispatch_response,
-    encode_http_request, encode_http_response, encode_sign_request, encode_string_list,
+    PetalKeyOutcome, PetalKeyRequest, PrivateInputDisplayContext, PrivateInputKind,
+    PrivateInputOutcome, PrivateInputRequest, SignBatchOutcome, SignBatchRequest, SignOutcome,
+    SignRequest, decode_dispatch_request, decode_dispatch_response, decode_http_request,
+    decode_http_response, decode_sign_request, decode_string_list, encode_dispatch_request,
+    encode_dispatch_response, encode_http_request, encode_http_response, encode_sign_request,
+    encode_string_list,
 };
 pub use error::PetalError;
 pub use host::{DenyHost, HostError, HostVfsEntry, HostVfsEntryKind, PetalHost};

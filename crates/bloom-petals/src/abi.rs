@@ -177,6 +177,40 @@ pub struct PetalRouteContext {
     pub actor: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrivateInputKind {
+    EvmAddress,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrivateInputDisplayContext {
+    pub network: String,
+    pub asset: String,
+    pub amount_base_units: String,
+    pub decimals: u8,
+    pub source: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrivateInputRequest {
+    pub id: String,
+    pub kind: PrivateInputKind,
+    pub display_context: PrivateInputDisplayContext,
+    pub context: Option<PetalRouteContext>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PrivateInputOutcome {
+    Pending {
+        operation_id: String,
+        expires_ms: u64,
+        /// Owner-only launch material. The VM adapter strips this before the
+        /// result crosses into guest Wasm.
+        ceremony_url: String,
+    },
+    Ready(String),
+}
+
 /// Guest-supplied, provenance-free request for a Signer-owned Petal sub-key.
 ///
 /// The component ABI carries this as JSON bytes so the interface can evolve

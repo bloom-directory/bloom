@@ -46,7 +46,8 @@ use crate::abi::{
     ChainRequest, ChainResponse, DispatchOp, DispatchRequest, DispatchResponse,
     EvmOutboxInspection, EvmOutboxOutcome, EvmTransactionRequest, PayloadBatchSignOutcome,
     PayloadBatchSignRequest, PayloadSignItem, PayloadSignRequest, PetalKeyGuestRequest,
-    PetalKeyRequest, PetalRouteContext, SignOutcome,
+    PetalKeyRequest, PetalRouteContext, PrivateInputDisplayContext, PrivateInputKind,
+    PrivateInputOutcome, PrivateInputRequest, SignOutcome,
 };
 use crate::error::PetalError;
 use crate::host::{HostError, HostVfsEntry, HostVfsEntryKind, PetalHost};
@@ -845,6 +846,12 @@ fn link_component_host_imports(linker: &mut ComponentLinker<StoreData>) -> anyho
         })?;
     }
     {
+        let mut input = linker.instance("bloom:private-input/ceremony@0.2.0")?;
+        input.func_new_async("request-input", |store, params, results| {
+            Box::new(async move { component_private_input_request(store, params, results).await })
+        })?;
+    }
+    {
         let mut tx = linker.instance("bloom:tx/outbox@0.1.0")?;
         tx.func_new_async("stage", |store, params, results| {
             Box::new(async move { component_evm_tx_stage(store, params, results).await })
@@ -1464,6 +1471,110 @@ async fn component_petal_key_request(
             // reason reaches neither the Petal nor the mount. Record it
             // host-side, where it is not observable by an evaluated agent.
             log_host_error(store.data(), "component_petal_key_request", &error);
+            set_component_result(results, component_host_err(error))
+        }
+    }
+}
+
+async fn component_private_input_request(
+    store: StoreContextMut<'_, StoreData>,
+    params: &[ComponentVal],
+    results: &mut [ComponentVal],
+) -> anyhow::Result<()> {
+    if !store.data().caps.contains(&Capability::PrivateInput) {
+        log_denied(store.data(), "component_private_input_request");
+        return set_component_result(
+            results,
+            component_host_err(HostError::Denied("private.input".into())),
+        );
+    }
+    let [ComponentVal::Record(fields)] = params else {
+        return set_component_result(
+            results,
+            component_host_err(HostError::Invalid(
+                "invalid bloom:private-input request".into(),
+            )),
+        );
+    };
+    let parsed = (|| {
+        let string = |fields, name| {
+            component_string_field(fields, name)
+                .map_err(|error| HostError::Invalid(error.to_string()))
+        };
+        let id = string(fields, "id")?;
+        let kind = match component_enum_field(fields, "kind")
+            .map_err(|error| HostError::Invalid(error.to_string()))?
+            .as_str()
+        {
+            "evm-address" => PrivateInputKind::EvmAddress,
+            other => {
+                return Err(HostError::Invalid(format!(
+                    "unsupported private-input kind {other:?}"
+                )));
+            }
+        };
+        let context = match component_field(fields, "context")
+            .map_err(|error| HostError::Invalid(error.to_string()))?
+        {
+            ComponentVal::Record(context) => context,
+            other => {
+                return Err(HostError::Invalid(format!(
+                    "private-input context is not a record: {other:?}"
+                )));
+            }
+        };
+        let decimals = match component_field(context, "decimals")
+            .map_err(|error| HostError::Invalid(error.to_string()))?
+        {
+            ComponentVal::U8(value) => *value,
+            other => {
+                return Err(HostError::Invalid(format!(
+                    "private-input decimals is not a u8: {other:?}"
+                )));
+            }
+        };
+        Ok(PrivateInputRequest {
+            id,
+            kind,
+            display_context: PrivateInputDisplayContext {
+                network: string(context, "network")?,
+                asset: string(context, "asset")?,
+                amount_base_units: string(context, "amount-base-units")?,
+                decimals,
+                source: string(context, "source")?,
+            },
+            context: store.data().sign_context.clone(),
+        })
+    })();
+    let request = match parsed {
+        Ok(request) => request,
+        Err(error) => return set_component_result(results, component_host_err(error)),
+    };
+    let host = store.data().host.clone();
+    match host.private_input_request(request).await {
+        Ok(PrivateInputOutcome::Pending {
+            operation_id,
+            expires_ms,
+            ceremony_url: _,
+        }) => set_component_result(
+            results,
+            component_ok(Some(ComponentVal::Variant(
+                "pending".into(),
+                Some(Box::new(ComponentVal::Record(vec![
+                    ("operation-id".into(), ComponentVal::String(operation_id)),
+                    ("expires-ms".into(), ComponentVal::U64(expires_ms)),
+                ]))),
+            ))),
+        ),
+        Ok(PrivateInputOutcome::Ready(value)) => set_component_result(
+            results,
+            component_ok(Some(ComponentVal::Variant(
+                "ready".into(),
+                Some(Box::new(ComponentVal::String(value))),
+            ))),
+        ),
+        Err(error) => {
+            log_host_error(store.data(), "component_private_input_request", &error);
             set_component_result(results, component_host_err(error))
         }
     }
@@ -3121,6 +3232,8 @@ mod tests {
         payload_batch_outcome: Mutex<Option<PayloadBatchSignOutcome>>,
         petal_key_calls: Mutex<Vec<PetalKeyRequest>>,
         petal_key_outcomes: Mutex<Vec<crate::abi::PetalKeyOutcome>>,
+        private_input_calls: Mutex<Vec<PrivateInputRequest>>,
+        private_input_outcome: Mutex<Option<PrivateInputOutcome>>,
         authority_calls: Mutex<Vec<&'static str>>,
         tx_stage_calls: Mutex<Vec<EvmTransactionRequest>>,
         tx_confirm_calls: Mutex<Vec<TxConfirmCall>>,
@@ -3232,6 +3345,22 @@ mod tests {
                 operation_id: "11".repeat(32),
                 scope_digest: "22".repeat(32),
             })
+        }
+
+        async fn private_input_request(
+            &self,
+            req: PrivateInputRequest,
+        ) -> Result<PrivateInputOutcome, HostError> {
+            self.private_input_calls.lock().push(req);
+            Ok(self
+                .private_input_outcome
+                .lock()
+                .clone()
+                .unwrap_or_else(|| PrivateInputOutcome::Pending {
+                    operation_id: "33".repeat(32),
+                    expires_ms: 9_000,
+                    ceremony_url: "http://127.0.0.1:18734/input/owner-secret".into(),
+                }))
         }
 
         async fn evm_tx_stage(
@@ -3979,6 +4108,67 @@ paths = ["/status"]
         let calls = host.petal_key_calls.lock();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].context, Some(context));
+    }
+
+    #[tokio::test]
+    async fn component_private_input_injects_provenance_and_strips_launch_url() {
+        let host = Arc::new(MockHost::default());
+        let mut store = component_test_store(
+            BTreeSet::from([Capability::PrivateInput]),
+            None,
+            host.clone(),
+        );
+        let context = PetalRouteContext {
+            petal_root: "privacy-pools".into(),
+            package_hash: VALID_HASH.into(),
+            route_id: "r000042".into(),
+            op: "write".into(),
+            path: "withdrawals/alice/note-1.json".into(),
+            params: Vec::new(),
+            actor: None,
+        };
+        store.data_mut().sign_context = Some(context.clone());
+        let request = ComponentVal::Record(vec![
+            (
+                "id".into(),
+                ComponentVal::String("privacy-pools/withdraw/alice/note-1".into()),
+            ),
+            ("kind".into(), ComponentVal::Enum("evm-address".into())),
+            (
+                "context".into(),
+                ComponentVal::Record(vec![
+                    ("network".into(), ComponentVal::String("ethereum".into())),
+                    ("asset".into(), ComponentVal::String("eth".into())),
+                    (
+                        "amount-base-units".into(),
+                        ComponentVal::String("1000000000000000000".into()),
+                    ),
+                    ("decimals".into(), ComponentVal::U8(18)),
+                    ("source".into(), ComponentVal::String("alice/note-1".into())),
+                ]),
+            ),
+        ]);
+        let mut result = vec![ComponentVal::Bool(false)];
+        component_private_input_request(store.as_context_mut(), &[request], &mut result)
+            .await
+            .unwrap();
+
+        let ComponentVal::Result(Ok(Some(outcome))) = &result[0] else {
+            panic!("expected private-input result: {:?}", result[0]);
+        };
+        let ComponentVal::Variant(name, Some(pending)) = outcome.as_ref() else {
+            panic!("expected pending private-input result: {outcome:?}");
+        };
+        assert_eq!(name, "pending");
+        let ComponentVal::Record(fields) = pending.as_ref() else {
+            panic!("expected pending record: {pending:?}");
+        };
+        assert_eq!(fields.len(), 2, "guest result must contain no launch URL");
+        assert!(fields.iter().all(|(name, _)| name != "ceremony-url"));
+        let calls = host.private_input_calls.lock();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].context, Some(context));
+        assert_eq!(calls[0].display_context.decimals, 18);
     }
 
     #[tokio::test]

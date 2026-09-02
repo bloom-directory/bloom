@@ -2400,6 +2400,7 @@ enum ComponentHostInterface {
     SignSigningV1,
     SignSigningV2,
     KeyDerive,
+    PrivateInput,
     TxOutbox,
     ChainRead,
     VfsReadwrite,
@@ -2425,7 +2426,8 @@ fn component_host_interface(name: &str) -> Option<ComponentHostInterface> {
         ContractHostInterface::ChainRead => Some(ComponentHostInterface::ChainRead),
         ContractHostInterface::VfsReadwrite => Some(ComponentHostInterface::VfsReadwrite),
         ContractHostInterface::EnvRuntime => Some(ComponentHostInterface::EnvRuntime),
-        ContractHostInterface::RouteTypes | ContractHostInterface::PrivateInputCeremony => None,
+        ContractHostInterface::PrivateInputCeremony => Some(ComponentHostInterface::PrivateInput),
+        ContractHostInterface::RouteTypes => None,
     }
 }
 
@@ -2663,6 +2665,12 @@ enum HostTypeExport {
     PetalSignSelector,
     SignBatchResultStructured,
     PayloadBatchSignResultStructured,
+    PrivateInputKind,
+    PrivateInputDisplayContext,
+    PrivateInputRequest,
+    PrivateInputOperationId,
+    PrivateInputPending,
+    PrivateInputResult,
 }
 
 #[derive(Clone, Copy)]
@@ -2679,6 +2687,7 @@ enum HostFuncExport {
     SafeSignPayloadStructured,
     PayloadBatchSignStructured,
     PetalKeyRequest,
+    PrivateInputRequest,
     EvmTxStage,
     EvmTxConfirm,
     EvmTxInspect,
@@ -2837,6 +2846,24 @@ fn host_type_export(interface: ComponentHostInterface, name: &str) -> Option<Hos
         (ComponentHostInterface::SignSigningV1, "sign-batch-result") => {
             Some(HostTypeExport::SignBatchResultStructured)
         }
+        (ComponentHostInterface::PrivateInput, "input-kind") => {
+            Some(HostTypeExport::PrivateInputKind)
+        }
+        (ComponentHostInterface::PrivateInput, "display-context") => {
+            Some(HostTypeExport::PrivateInputDisplayContext)
+        }
+        (ComponentHostInterface::PrivateInput, "request") => {
+            Some(HostTypeExport::PrivateInputRequest)
+        }
+        (ComponentHostInterface::PrivateInput, "operation-id") => {
+            Some(HostTypeExport::PrivateInputOperationId)
+        }
+        (ComponentHostInterface::PrivateInput, "pending-input") => {
+            Some(HostTypeExport::PrivateInputPending)
+        }
+        (ComponentHostInterface::PrivateInput, "input-result") => {
+            Some(HostTypeExport::PrivateInputResult)
+        }
         _ => None,
     }
 }
@@ -2865,6 +2892,9 @@ fn host_func_export(interface: ComponentHostInterface, name: &str) -> Option<Hos
             Some(HostFuncExport::PayloadBatchSignStructured)
         }
         (ComponentHostInterface::KeyDerive, "request") => Some(HostFuncExport::PetalKeyRequest),
+        (ComponentHostInterface::PrivateInput, "request-input") => {
+            Some(HostFuncExport::PrivateInputRequest)
+        }
         (ComponentHostInterface::TxOutbox, "stage") => Some(HostFuncExport::EvmTxStage),
         (ComponentHostInterface::TxOutbox, "confirm") => Some(HostFuncExport::EvmTxConfirm),
         (ComponentHostInterface::TxOutbox, "inspect") => Some(HostFuncExport::EvmTxInspect),
@@ -2916,6 +2946,14 @@ fn host_type_export_matches(
         HostTypeExport::PayloadBatchSignResultStructured => {
             is_payload_batch_sign_result_petal(&ty, types, 0)
         }
+        HostTypeExport::PrivateInputKind => is_private_input_kind(&ty, types, 0),
+        HostTypeExport::PrivateInputDisplayContext => {
+            is_private_input_display_context(&ty, types, 0)
+        }
+        HostTypeExport::PrivateInputRequest => is_private_input_request(&ty, types, 0),
+        HostTypeExport::PrivateInputOperationId => is_private_input_operation_id(&ty, types, 0),
+        HostTypeExport::PrivateInputPending => is_private_input_pending(&ty, types, 0),
+        HostTypeExport::PrivateInputResult => is_private_input_result(&ty, types, 0),
     }
 }
 
@@ -3032,6 +3070,10 @@ fn host_func_export_matches(
             params_match(params, types, &[("request", is_byte_list)])
                 && result_matches(&ty.result, types, HostOkType::Bytes)
         }
+        HostFuncExport::PrivateInputRequest => {
+            params_match(params, types, &[("request", is_private_input_request)])
+                && result_matches(&ty.result, types, HostOkType::PrivateInputResult)
+        }
         HostFuncExport::EvmTxStage => {
             params_match(params, types, &[("tx", is_evm_transaction)])
                 && result_matches(&ty.result, types, HostOkType::StagedTransaction)
@@ -3130,6 +3172,7 @@ enum HostOkType {
     PayloadBatchSignResultStructured,
     StagedTransaction,
     OutboxInspection,
+    PrivateInputResult,
 }
 
 fn result_matches(
@@ -3169,9 +3212,122 @@ fn result_matches(
             }
             (HostOkType::StagedTransaction, Some(ty)) => is_staged_transaction(ty, types, depth),
             (HostOkType::OutboxInspection, Some(ty)) => is_outbox_inspection(ty, types, depth),
+            (HostOkType::PrivateInputResult, Some(ty)) => is_private_input_result(ty, types, depth),
             _ => false,
         };
         ok_matches && err.is_some_and(|ty| is_string(&ty))
+    })
+}
+
+fn is_private_input_kind(
+    ty: &ComponentValType,
+    types: &[ComponentTypeEntry<'_>],
+    depth: usize,
+) -> bool {
+    with_defined_type(
+        ty,
+        types,
+        depth,
+        |defined, _, _| matches!(defined, ComponentDefinedType::Enum(names) if names.as_ref() == ["evm-address"]),
+    )
+}
+
+fn is_private_input_display_context(
+    ty: &ComponentValType,
+    types: &[ComponentTypeEntry<'_>],
+    depth: usize,
+) -> bool {
+    with_defined_type(ty, types, depth, |defined, types, depth| {
+        let ComponentDefinedType::Record(fields) = defined else {
+            return false;
+        };
+        let fields = fields.as_ref();
+        fields.len() == 5
+            && fields[0].0 == "network"
+            && is_string(&fields[0].1)
+            && fields[1].0 == "asset"
+            && is_string(&fields[1].1)
+            && fields[2].0 == "amount-base-units"
+            && is_string(&fields[2].1)
+            && fields[3].0 == "decimals"
+            && is_u8(&fields[3].1, types, depth)
+            && fields[4].0 == "source"
+            && is_string(&fields[4].1)
+    })
+}
+
+fn is_private_input_operation_id(
+    ty: &ComponentValType,
+    types: &[ComponentTypeEntry<'_>],
+    depth: usize,
+) -> bool {
+    with_defined_type(ty, types, depth, |defined, _, _| {
+        matches!(
+            defined,
+            ComponentDefinedType::Primitive(ComponentPrimitiveValType::String)
+        )
+    })
+}
+
+fn is_private_input_request(
+    ty: &ComponentValType,
+    types: &[ComponentTypeEntry<'_>],
+    depth: usize,
+) -> bool {
+    with_defined_type(ty, types, depth, |defined, types, depth| {
+        let ComponentDefinedType::Record(fields) = defined else {
+            return false;
+        };
+        let fields = fields.as_ref();
+        fields.len() == 3
+            && fields[0].0 == "id"
+            && is_string(&fields[0].1)
+            && fields[1].0 == "kind"
+            && is_private_input_kind(&fields[1].1, types, depth)
+            && fields[2].0 == "context"
+            && is_private_input_display_context(&fields[2].1, types, depth)
+    })
+}
+
+fn is_private_input_pending(
+    ty: &ComponentValType,
+    types: &[ComponentTypeEntry<'_>],
+    depth: usize,
+) -> bool {
+    with_defined_type(ty, types, depth, |defined, types, depth| {
+        let ComponentDefinedType::Record(fields) = defined else {
+            return false;
+        };
+        let fields = fields.as_ref();
+        fields.len() == 2
+            && fields[0].0 == "operation-id"
+            && is_private_input_operation_id(&fields[0].1, types, depth)
+            && fields[1].0 == "expires-ms"
+            && is_u64(&fields[1].1, types, depth)
+    })
+}
+
+fn is_private_input_result(
+    ty: &ComponentValType,
+    types: &[ComponentTypeEntry<'_>],
+    depth: usize,
+) -> bool {
+    with_defined_type(ty, types, depth, |defined, types, depth| {
+        let ComponentDefinedType::Variant(cases) = defined else {
+            return false;
+        };
+        let cases = cases.as_ref();
+        cases.len() == 2
+            && cases[0].name == "pending"
+            && cases[0]
+                .ty
+                .as_ref()
+                .is_some_and(|ty| is_private_input_pending(ty, types, depth))
+            && cases[1].name == "ready"
+            && cases[1]
+                .ty
+                .as_ref()
+                .is_some_and(|ty| is_string_type(ty, types, depth))
     })
 }
 
@@ -6387,6 +6543,55 @@ paths = ["/*"]
                     (func (param "request" $bytes) (result $outcome)))
                   (export "request" (func (type $request)))))
               (import "bloom:key/derive@0.1.0"
+                (instance (type $interface))))"#,
+        ));
+    }
+
+    #[test]
+    fn petal_component_private_input_shape_and_capability_are_explicit() {
+        assert_eq!(
+            component_import_caps("bloom:private-input/ceremony@0.2.0"),
+            Some(&["bloom:private-input"][..])
+        );
+        assert!(matches!(
+            component_host_interface("bloom:private-input/ceremony@0.2.0"),
+            Some(ComponentHostInterface::PrivateInput)
+        ));
+        assert!(component_host_interface("bloom:private-input/ceremony@0.1.0").is_none());
+        assert!(host_import_instance_matches(
+            ComponentHostInterface::PrivateInput,
+            r#"(component
+              (type $interface
+                (instance
+                  (type $kind (enum "evm-address"))
+                  (export "input-kind" (type $kind-export (eq $kind)))
+                  (type $display (record
+                    (field "network" string)
+                    (field "asset" string)
+                    (field "amount-base-units" string)
+                    (field "decimals" u8)
+                    (field "source" string)))
+                  (export "display-context" (type $display-export (eq $display)))
+                  (type $request (record
+                    (field "id" string)
+                    (field "kind" $kind-export)
+                    (field "context" $display-export)))
+                  (export "request" (type $request-export (eq $request)))
+                  (type $operation-id string)
+                  (export "operation-id" (type $operation-id-export (eq $operation-id)))
+                  (type $pending (record
+                    (field "operation-id" $operation-id-export)
+                    (field "expires-ms" u64)))
+                  (export "pending-input" (type $pending-export (eq $pending)))
+                  (type $input-result (variant
+                    (case "pending" $pending-export)
+                    (case "ready" string)))
+                  (export "input-result" (type $input-result-export (eq $input-result)))
+                  (type $outcome (result $input-result-export (error string)))
+                  (type $request-func
+                    (func (param "request" $request-export) (result $outcome)))
+                  (export "request-input" (func (type $request-func)))))
+              (import "bloom:private-input/ceremony@0.2.0"
                 (instance (type $interface))))"#,
         ));
     }

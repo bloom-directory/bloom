@@ -47,12 +47,12 @@ use bloom_broker_api::{
     CeremonyState, CredentialPublic, CryptoSuite, CustodyPrepareRequest, CustodyPrepareResponse,
     CustodyResult, DecimalU64, Digest32, IdRequest, KeyPublic, KeyRef, KeyRequest, KeyRole,
     MachineBrokerRequest, MachineBrokerResponse, MachineBrokerService, MachineSignRequest,
-    OperationId, OperationPublicStatus, OperationRequest, PetalUseClaim, PolicyCommitReceipt,
-    PolicyCommitUpdateRequest, PolicyUpdatePrepareResponse, PolicyUpdateRequest, ProtocolError,
-    ProtocolErrorCode, ProvenanceCatalog, ProvenanceSubject, RequestNonce, RevocationState,
-    RevokeRequest, SealedApprovalPrepareResponse, SealedApprovalTerms, SignedPolicySnapshot,
-    SigningPayloads, SigningResult, Token, TypedRequestMethod, WalletOperationRequest,
-    WalletPublic, WalletRequest, is_read_only_method,
+    OperationId, OperationPublicStatus, OperationRequest, OwnerInputRequest, OwnerInputResponse,
+    PetalUseClaim, PolicyCommitReceipt, PolicyCommitUpdateRequest, PolicyUpdatePrepareResponse,
+    PolicyUpdateRequest, ProtocolError, ProtocolErrorCode, ProvenanceCatalog, ProvenanceSubject,
+    RequestNonce, RevocationState, RevokeRequest, SealedApprovalPrepareResponse,
+    SealedApprovalTerms, SignedPolicySnapshot, SigningPayloads, SigningResult, Token,
+    TypedRequestMethod, WalletOperationRequest, WalletPublic, WalletRequest, is_read_only_method,
 };
 use bloom_triad_local_transport::{LocalIdentity, PeerAcl};
 use serde::{Deserialize, Serialize};
@@ -438,6 +438,30 @@ impl MachineBrokerClient {
             MachineBrokerResponse::SigningSignBatch(result) => expected.validate(result),
             _ => Err(response_mismatch("signing.sign_batch")),
         }
+    }
+
+    /// Request or poll a Broker-hosted browser input form. This path carries
+    /// application data, not signing authority or Signer custody material.
+    pub async fn owner_input(
+        &self,
+        request: OwnerInputRequest,
+    ) -> Result<OwnerInputResponse, ProtocolError> {
+        let expected = request.operation_id.clone();
+        let response = match self
+            .request(MachineBrokerRequest::OwnerInputRequest(request))
+            .await?
+        {
+            MachineBrokerResponse::OwnerInputRequest(response) => response,
+            _ => return Err(response_mismatch("owner_input.request")),
+        };
+        let actual = match &response {
+            OwnerInputResponse::Pending { operation_id, .. }
+            | OwnerInputResponse::Ready { operation_id, .. } => operation_id,
+        };
+        if actual != &expected {
+            return Err(response_identity_mismatch("owner_input.request"));
+        }
+        Ok(response)
     }
 
     /// Validate and translate a payload-bearing Petal request. Provenance is

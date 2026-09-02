@@ -693,6 +693,7 @@ fn petal_capability(cap: &str) -> Option<Capability> {
         "bloom:chain" => Some(Capability::Chain),
         "bloom:tx.outbox" => Some(Capability::TxOutbox),
         "bloom:key.derive" => Some(Capability::KeyDerive),
+        "bloom:private-input" => Some(Capability::PrivateInput),
         "bloom:vfs.read" => Some(Capability::VfsRead),
         "bloom:vfs.write" => Some(Capability::VfsWrite),
         _ => Capability::parse(cap),

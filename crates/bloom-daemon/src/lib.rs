@@ -10,6 +10,7 @@ pub mod ipc;
 mod ens_resolver;
 mod price_oracle;
 
+use std::collections::BTreeMap;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -229,6 +230,7 @@ struct DaemonPetalHost {
     provenance_catalog: Option<bloom_broker_api::ProvenanceCatalog>,
     petal_key_state_root: Option<PathBuf>,
     petal_key_lock: tokio::sync::Mutex<()>,
+    private_input_launches: tokio::sync::Mutex<BTreeMap<String, String>>,
     petal_signing_state_root: Option<PathBuf>,
     petal_signing_lock: tokio::sync::Mutex<()>,
 }
@@ -363,6 +365,7 @@ impl DaemonPetalHost {
             provenance_catalog: None,
             petal_key_state_root: None,
             petal_key_lock: tokio::sync::Mutex::new(()),
+            private_input_launches: tokio::sync::Mutex::new(BTreeMap::new()),
             petal_signing_state_root: None,
             petal_signing_lock: tokio::sync::Mutex::new(()),
         }
@@ -924,6 +927,101 @@ impl PetalHost for DaemonPetalHost {
     async fn vfs_write(&self, path: &str, bytes: &[u8]) -> Result<(), HostError> {
         Self::authorize_guest_vfs_path(path)?;
         self.vfs.vfs_write(path, bytes).await
+    }
+
+    async fn private_input_request(
+        &self,
+        req: bloom_petals::PrivateInputRequest,
+    ) -> Result<bloom_petals::PrivateInputOutcome, HostError> {
+        let broker = self.broker.as_ref().ok_or_else(|| {
+            HostError::Backend("SERVICE_UNAVAILABLE: Broker client is not configured".into())
+        })?;
+        let route = req.context.as_ref().ok_or_else(|| {
+            HostError::Denied("Private input requires trusted route provenance".into())
+        })?;
+        Self::petal_execution_origin(route)?;
+        if req.id.trim().is_empty() {
+            return Err(HostError::Invalid(
+                "Private-input request id must not be empty".into(),
+            ));
+        }
+        let identity = serde_jcs::to_vec(&serde_json::json!({
+            "domain": "bloom-machine-private-input/v1",
+            "request": {
+                "id": req.id,
+                "kind": match req.kind {
+                    bloom_petals::PrivateInputKind::EvmAddress => "evm_address",
+                },
+                "context": {
+                    "network": req.display_context.network,
+                    "asset": req.display_context.asset,
+                    "amount_base_units": req.display_context.amount_base_units,
+                    "decimals": req.display_context.decimals,
+                    "source": req.display_context.source,
+                },
+            },
+            "route": {
+                "petal_root": route.petal_root,
+                "package_hash": route.package_hash,
+                "route_id": route.route_id,
+                "op": route.op,
+                "path": route.path,
+                "params": route.params,
+                "actor": route.actor,
+            },
+        }))
+        .map_err(|error| HostError::Backend(format!("encode private-input identity: {error}")))?;
+        let operation_id =
+            bloom_broker_api::OperationId::from_bytes(sha2::Sha256::digest(&identity).into());
+        let response = broker
+            .owner_input(bloom_broker_api::OwnerInputRequest {
+                operation_id: operation_id.clone(),
+                kind: match req.kind {
+                    bloom_petals::PrivateInputKind::EvmAddress => {
+                        bloom_broker_api::OwnerInputKind::EvmAddress
+                    }
+                },
+                context: bloom_broker_api::OwnerInputDisplayContext {
+                    network: req.display_context.network,
+                    asset: req.display_context.asset,
+                    amount_base_units: req.display_context.amount_base_units,
+                    decimals: req.display_context.decimals,
+                    source: req.display_context.source,
+                },
+            })
+            .await
+            .map_err(|error| HostError::Backend(format!("Broker private-input: {error}")))?;
+        match response {
+            bloom_broker_api::OwnerInputResponse::Pending {
+                operation_id,
+                ceremony_url,
+                expires_at_ms,
+            } => {
+                let mut launches = self.private_input_launches.lock().await;
+                let should_launch = launches.get(operation_id.as_str()) != Some(&ceremony_url);
+                if should_launch {
+                    open::that_detached(&ceremony_url).map_err(|error| {
+                        HostError::Backend(format!("launch private-input browser form: {error}"))
+                    })?;
+                    launches.insert(operation_id.as_str().to_owned(), ceremony_url.clone());
+                }
+                Ok(bloom_petals::PrivateInputOutcome::Pending {
+                    operation_id: operation_id.as_str().to_owned(),
+                    expires_ms: expires_at_ms.get(),
+                    ceremony_url,
+                })
+            }
+            bloom_broker_api::OwnerInputResponse::Ready {
+                operation_id,
+                value,
+            } => {
+                self.private_input_launches
+                    .lock()
+                    .await
+                    .remove(operation_id.as_str());
+                Ok(bloom_petals::PrivateInputOutcome::Ready(value))
+            }
+        }
     }
 
     async fn petal_key_request(
