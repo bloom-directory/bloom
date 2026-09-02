@@ -24,7 +24,7 @@ timeout_sec = 1200.0
 timeout_sec = 180.0
 
 [environment]
-docker_image = "ghcr.io/bloom-directory/bloom-eval-agent-base@sha256:20988c7f8a6751c25e0115c2136710a885bef69d245e077d2ae3b2cc2c0837fd"
+docker_image = "ghcr.io/bloom-directory/bloom-eval-agent-base@sha256:c1fa42378d25f356d791bc32b20e6e3898f1942368a765830d5419e446b81a7e"
 build_timeout_sec = 600.0
 cpus = 2
 memory_mb = 4096
