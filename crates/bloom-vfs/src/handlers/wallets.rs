@@ -26,6 +26,7 @@
 //! - `wallets/<wallet>/chains/<chain>/outbox/sent/<id>/<file>`      — read sent
 //! - `wallets/<wallet>/chains/<chain>/outbox/failed/<id>/<file>`    — read failed
 
+use sha2::Digest as _;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -149,6 +150,16 @@ pub struct WalletsHandler {
     pub wallet_projections: Option<Arc<dyn WalletProjectionReader>>,
     /// Machine-owned workflow projections; never a Broker or Signer state root.
     policy_projection_root: std::path::PathBuf,
+    /// Solana transfer engines keyed by chain name, dispatching the same
+    /// `chains/<chain>/outbox/...` route family as EVM for Solana chains.
+    solana: Option<
+        Arc<std::collections::BTreeMap<String, Arc<bloom_solana_tx::engine::SolanaTransferEngine>>>,
+    >,
+    /// Read-only Solana clients keyed by chain name. Deliberately separate
+    /// from `solana`: balances and chain reads need only a working RPC
+    /// client, while staging needs the whole signing seam. A chain present
+    /// here but absent from `solana` is readable but cannot stage.
+    solana_reads: Option<bloom_solana::SolanaChainRegistry>,
 }
 
 impl WalletsHandler {
@@ -168,7 +179,64 @@ impl WalletsHandler {
             broker: None,
             wallet_projections: Some(wallet_projections),
             policy_projection_root: policy_projection_root.into(),
+            solana: None,
+            solana_reads: None,
         }
+    }
+
+    /// Attach the Solana transfer engines (keyed by chain name). When set,
+    /// `chains/<chain>/outbox/...` dispatches Solana chains through their own
+    /// engine instead of the EVM `TxEngine`.
+    pub fn with_solana(
+        mut self,
+        engines: std::collections::BTreeMap<
+            String,
+            Arc<bloom_solana_tx::engine::SolanaTransferEngine>,
+        >,
+    ) -> Self {
+        self.solana = Some(Arc::new(engines));
+        self
+    }
+
+    /// Attach the read-only Solana client registry. Independent of
+    /// [`Self::with_solana`]: chain listing and balance reads resolve
+    /// through this, so they keep working when no transfer engine could be
+    /// built (no Broker edge, or no provenance catalog).
+    pub fn with_solana_reads(mut self, chains: bloom_solana::SolanaChainRegistry) -> Self {
+        self.solana_reads = Some(chains);
+        self
+    }
+
+    /// A read-only client for `chain`, if one is configured.
+    fn solana_client(&self, chain: &str) -> Option<bloom_solana::SolanaClient> {
+        self.solana_reads
+            .as_ref()
+            .and_then(|chains| chains.get(chain))
+    }
+
+    /// Whether `chain` is a Solana chain at all — readable, stageable, or
+    /// both. Dispatch keys off this rather than the engine map so a
+    /// reads-only chain still routes to the Solana handlers instead of
+    /// falling through to the EVM path and reporting an unknown chain.
+    fn is_solana_chain(&self, chain: &str) -> bool {
+        self.solana_client(chain).is_some() || self.solana_engine(chain).is_some()
+    }
+
+    /// Every Solana chain name this handler can serve reads for.
+    fn solana_chain_names(&self) -> Vec<String> {
+        self.solana_reads
+            .as_ref()
+            .map(|chains| chains.list_names())
+            .unwrap_or_default()
+    }
+
+    fn solana_engine(
+        &self,
+        chain: &str,
+    ) -> Option<Arc<bloom_solana_tx::engine::SolanaTransferEngine>> {
+        self.solana
+            .as_ref()
+            .and_then(|engines| engines.get(chain).cloned())
     }
 
     pub fn with_broker(mut self, broker: Option<MachineBrokerClient>) -> Self {
@@ -1677,23 +1745,39 @@ impl WalletsHandler {
             .outbox
             .list(wallet, chain, OutboxState::Pending)
             .map_err(err_be)?;
-        let mut pending = Vec::with_capacity(ids.len());
-        for id in ids {
+        let pending = collect_newest_first(ids, |id| {
             match self
                 .tx_engine
                 .outbox
-                .read_in_state(wallet, chain, &id, OutboxState::Pending)
+                .read_in_state(wallet, chain, id, OutboxState::Pending)
             {
-                Ok(entry) => pending.push((entry.staged.created_ms, id)),
+                Ok(entry) => Ok(Some(entry.staged.created_ms)),
                 // The entry transitioned between listing and reading; it is
                 // no longer a pending candidate.
-                Err(OutboxError::NotFound(_)) => {}
-                // `latest` is advertised as the atomic identity of the newest
-                // staged transfer. An unreadable newest entry must surface,
-                // not silently redirect the reader to an older transfer.
-                Err(error) => return Err(err_be(error)),
+                Err(OutboxError::NotFound(_)) => Ok(None),
+                Err(error) => Err(err_be(error)),
             }
-        }
+        })?;
+        Ok(newest_pending_target(pending))
+    }
+
+    fn latest_solana_pending_target(
+        engine: &bloom_solana_tx::engine::SolanaTransferEngine,
+        wallet: &str,
+        chain: &str,
+    ) -> Result<Option<String>, HandlerError> {
+        let state = bloom_solana_tx::outbox::SolanaOutboxState::Pending;
+        let ids = engine
+            .outbox()
+            .list(wallet, chain, state)
+            .map_err(solana_outbox_err)?;
+        let pending = collect_newest_first(ids, |id| {
+            match engine.outbox().read_in_state(wallet, chain, id, state) {
+                Ok(entry) => Ok(Some(entry.staged.created_ms)),
+                Err(bloom_solana_tx::outbox::OutboxError::NotFound(_)) => Ok(None),
+                Err(error) => Err(solana_outbox_err(error)),
+            }
+        })?;
         Ok(newest_pending_target(pending))
     }
 
@@ -1715,6 +1799,24 @@ fn err_be(e: impl std::fmt::Display) -> HandlerError {
     HandlerError::backend(e.to_string())
 }
 
+/// Collect `(created_ms, id)` pairs for pending entries, skipping only
+/// entries that vanished between listing and reading (a state transition
+/// raced the listing) and surfacing every other read failure. Silently
+/// dropping an unreadable newest entry would point `latest` at an older
+/// transfer, and `latest` is advertised as the atomic identity of the newest
+/// staged intent.
+fn collect_newest_first(
+    ids: Vec<String>,
+    mut read: impl FnMut(&str) -> Result<Option<u128>, HandlerError>,
+) -> Result<Vec<(u128, String)>, HandlerError> {
+    let mut pending = Vec::with_capacity(ids.len());
+    for id in ids {
+        if let Some(created_ms) = read(&id)? {
+            pending.push((created_ms, id));
+        }
+    }
+    Ok(pending)
+}
 /// Render the newest pending entry as a `pending/<id>` symlink target.
 ///
 /// Ties on `created_ms` break toward the greater id: outbox ids come from a
@@ -1924,6 +2026,174 @@ fn parse_state_seg(s: &str) -> Result<OutboxState, HandlerError> {
     OutboxState::parse(s).ok_or_else(|| HandlerError::not_found(format!("outbox state '{}'", s)))
 }
 
+fn solana_state(s: &str) -> Option<bloom_solana_tx::outbox::SolanaOutboxState> {
+    bloom_solana_tx::outbox::SolanaOutboxState::parse(s)
+}
+
+/// The public read-only artifacts a Solana outbox entry may expose.
+///
+/// Single source of truth for both the visibility check and the directory
+/// listing: a name present in one but not the other is exactly the
+/// listing/lookup drift this consolidates away. State-dependent controls
+/// (`confirm`, `cancel`, `restage`) are deliberately not here.
+const PUBLIC_SOLANA_OUTBOX_ARTIFACTS: &[&str] = &[
+    "intent.json",
+    "plan.md",
+    "simulation.json",
+    "receipt.json",
+    "broadcast_attempted.json",
+    "approval_challenge.json",
+    "restage_advice.json",
+    "restage.md",
+];
+
+/// A Solana child account as projected by the Broker.
+///
+/// Constructed from `DerivedAccountPublic` alone — no chain access — so
+/// listing and `stat` never fan out RPC calls.
+#[derive(Clone, Debug)]
+struct SolanaAccount {
+    /// Raw Ed25519 public key: the fee payer / transfer source.
+    pubkey: [u8; 32],
+    /// Base58 account address.
+    address: String,
+    /// Full canonical lowercase hex fingerprint — the `accounts/` path name.
+    fingerprint: String,
+    /// BIP-44/SLIP-10 derivation path this child was allocated at.
+    derivation_path: String,
+    key_ref: bloom_broker_api::KeyRef,
+}
+
+/// A Broker projection that contradicts itself. Distinct from a transport
+/// failure: the edge answered, but the answer is not internally consistent,
+/// so nothing downstream may rely on the identity it describes.
+fn integrity(detail: &str) -> HandlerError {
+    HandlerError::backend(format!(
+        "Broker wallet.accounts projection is inconsistent: {detail}"
+    ))
+}
+
+/// The child's canonical BIP-39 Solana derivation path, from its `KeyRef`.
+///
+/// Deliberately read from the `KeyRef` rather than the projection's `path`
+/// string: the `KeyRef` is what staging pins, so sourcing both from one place
+/// keeps a balance read and a transfer bound to the same account identity.
+fn derivation_path(key_ref: &bloom_broker_api::KeyRef) -> Result<String, HandlerError> {
+    match key_ref.derivation.as_ref() {
+        Some(bloom_broker_api::DerivationRef::Bip39Multicurve {
+            profile: bloom_broker_api::DerivationProfile::Bip44SolanaSlip10Ed25519V1,
+            path,
+            ..
+        }) => Ok(path.clone()),
+        _ => Err(HandlerError::backend(
+            "Solana child must carry its canonical BIP-39 derivation path",
+        )),
+    }
+}
+
+impl SolanaAccount {
+    /// Canonical Ed25519 SPKI DER prefix. A Solana child's
+    /// `canonical_public_key` is this followed by the raw 32-byte key.
+    const ED25519_SPKI_PREFIX: [u8; 12] = [
+        0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
+    ];
+
+    fn from_projection(
+        account: &bloom_broker_api::DerivedAccountPublic,
+    ) -> Result<Self, HandlerError> {
+        if account.derivation_profile
+            != bloom_broker_api::DerivationProfile::Bip44SolanaSlip10Ed25519V1
+        {
+            return Err(integrity(
+                "account is not a bip44-solana-slip10-ed25519-v1 child",
+            ));
+        }
+        if account.key_ref.key_spec != bloom_broker_api::KeySpec::Ed25519
+            || account.public_key_encoding != bloom_broker_api::PublicKeyEncoding::Ed25519SpkiDer
+        {
+            return Err(HandlerError::backend(
+                "Solana child must use canonical Ed25519 SPKI DER",
+            ));
+        }
+        let spki = account.canonical_public_key.decode();
+        if spki.len() != 44 || spki[..Self::ED25519_SPKI_PREFIX.len()] != Self::ED25519_SPKI_PREFIX
+        {
+            return Err(HandlerError::backend(
+                "Solana child public key is not canonical Ed25519 SPKI DER",
+            ));
+        }
+
+        // Defence in depth: the Broker checks this too, but the Machine must
+        // not take a projected identity on trust. `fingerprint = SHA-256(spki)`.
+        let computed: [u8; 32] = sha2::Sha256::digest(&spki).into();
+        if bloom_broker_api::Digest32::from_bytes(computed) != account.public_key_fingerprint {
+            return Err(integrity(
+                "account fingerprint does not match its canonical public key",
+            ));
+        }
+
+        // The KeyRef derivation is authoritative because it is what signing
+        // pins. The projection's `path` is redundant, so a disagreement is a
+        // projection-integrity fault — never a reason to prefer one silently.
+        let derivation_path = derivation_path(&account.key_ref)?;
+        if account.path != derivation_path {
+            return Err(integrity(&format!(
+                "account path '{}' disagrees with its KeyRef derivation path '{}'",
+                account.path, derivation_path
+            )));
+        }
+
+        let mut pubkey = [0_u8; 32];
+        pubkey.copy_from_slice(&spki[Self::ED25519_SPKI_PREFIX.len()..]);
+        let address = bs58::encode(pubkey).into_string();
+
+        // A chain projection is present only when the Broker has a matching
+        // configured projection target, so absence is a configuration state
+        // rather than corruption. When one *is* projected, its address must
+        // agree with the key we derived the address from.
+        for projection in &account.chain_projections {
+            if projection.address_encoding == bloom_broker_api::AddressEncoding::Base58
+                && projection.address != address
+            {
+                return Err(integrity(&format!(
+                    "chain projection address '{}' does not match the derived account address '{}'",
+                    projection.address, address
+                )));
+            }
+        }
+
+        Ok(Self {
+            address,
+            pubkey,
+            fingerprint: account
+                .key_ref
+                .public_key_fingerprint
+                .as_str()
+                .to_ascii_lowercase(),
+            derivation_path,
+            key_ref: account.key_ref.clone(),
+        })
+    }
+}
+
+fn is_public_solana_outbox_artifact(name: &str) -> bool {
+    PUBLIC_SOLANA_OUTBOX_ARTIFACTS.contains(&name)
+}
+
+fn solana_outbox_err(e: bloom_solana_tx::outbox::OutboxError) -> HandlerError {
+    match e {
+        bloom_solana_tx::outbox::OutboxError::NotFound(id) => HandlerError::not_found(id),
+        other => HandlerError::backend(other.to_string()),
+    }
+}
+
+fn now_ms_u128() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
+}
+
 fn open_regular_outbox_artifact(dir: &Path, fname: &str) -> Result<std::fs::File, HandlerError> {
     let path = dir.join(fname);
     let descriptor = rustix::fs::open(
@@ -2071,14 +2341,14 @@ impl Handler for WalletsHandler {
     /// broadcast just by stat'ing.
     fn is_read_side_effecting(&self, path: &VfsPath) -> bool {
         let segs = path.segments();
-        // wallets/<w>/chains/<c>/outbox/pending/<id>/{confirm,confirm.override,replace,cancel}
+        // wallets/<w>/chains/<c>/outbox/pending/<id>/{confirm,confirm.override,replace,cancel,restage}
         if segs.len() == 7
             && segs[1] == "chains"
             && segs[3] == "outbox"
             && segs[4] == "pending"
             && matches!(
                 segs[6].as_str(),
-                "confirm" | "confirm.override" | "replace" | "cancel"
+                "confirm" | "confirm.override" | "replace" | "cancel" | "restage"
             )
         {
             return true;
@@ -2133,13 +2403,7 @@ impl WalletsHandler {
             "policy.json" => Ok(Entry::writable_file("policy.json")),
             "chains" => match segs.len() {
                 2 => Ok(Entry::dir("chains")),
-                3 => {
-                    let _ = self
-                        .chains
-                        .get(&segs[2])
-                        .ok_or_else(|| HandlerError::not_found(format!("chain '{}'", segs[2])))?;
-                    Ok(Entry::dir(&segs[2]))
-                }
+                3 => self.lookup_chain(wallet, &segs[2], &[]).await,
                 _ => self.lookup_chain(wallet, &segs[2], &segs[3..]).await,
             },
             "sealed-approvals" => match segs.len() {
@@ -2438,6 +2702,20 @@ impl WalletsHandler {
         }
         let wallet = &segs[0];
         if segs.len() >= 4 && segs[1] == "chains" && segs[3] == "outbox" {
+            if let Some(engine) = self.solana_engine(&segs[2]) {
+                return self
+                    .write_solana_outbox(wallet, &segs[2], &segs[4..], data, &engine)
+                    .await;
+            }
+            // A Solana chain with no engine is readable but cannot stage.
+            // Say so, rather than falling through to the EVM outbox — that
+            // would hand a Solana path to a backend that cannot serve it.
+            if self.is_solana_chain(&segs[2]) {
+                return Err(HandlerError::not_found(format!(
+                    "chain '{}' is configured for reads only; staging is unavailable",
+                    segs[2]
+                )));
+            }
             return self.write_outbox(wallet, &segs[2], &segs[4..], data).await;
         }
         if segs.len() == 2 && segs[1] == "policy.json" {
@@ -2524,12 +2802,21 @@ impl WalletsHandler {
         let _projection = self.wallet_projection(wallet).await?;
         match segs.len() {
             1 => Ok(Self::wallet_dir_entries()),
-            2 if segs[1] == "chains" => Ok(self
-                .chains
-                .list_names()
-                .into_iter()
-                .map(|n| Entry::dir(&n))
-                .collect()),
+            2 if segs[1] == "chains" => {
+                // Solana chains dispatch through their own engine map
+                // (`self.solana`), not the EVM `ChainRegistry` — list both.
+                // A `BTreeSet` both de-dupes (defensive: `Config::validate`
+                // refuses a name colliding across the two, but listing
+                // shouldn't double-list even if that were ever bypassed)
+                // and keeps a stable sorted order.
+                let mut names: std::collections::BTreeSet<String> =
+                    self.chains.list_names().into_iter().collect();
+                names.extend(self.solana_chain_names());
+                if let Some(solana) = &self.solana {
+                    names.extend(solana.keys().cloned());
+                }
+                Ok(names.into_iter().map(|n| Entry::dir(&n)).collect())
+            }
             2 if segs[1] == "sealed-approvals" => {
                 let mut entries = vec![
                     Entry::writable_file("new.json"),
@@ -2599,10 +2886,15 @@ impl WalletsHandler {
 impl WalletsHandler {
     async fn lookup_chain(
         &self,
-        _wallet: &str,
+        wallet: &str,
         chain: &str,
         rest: &[String],
     ) -> Result<Entry, HandlerError> {
+        if self.is_solana_chain(chain) {
+            return self
+                .lookup_solana_chain(wallet, chain, rest, self.solana_engine(chain))
+                .await;
+        }
         let _client = self
             .chains
             .get(chain)
@@ -2616,7 +2908,89 @@ impl WalletsHandler {
                 Ok(Entry::file(s))
             }
             [s] if s == "outbox" => Ok(Entry::dir("outbox")),
-            [s, ..] if s == "outbox" => self.lookup_outbox(_wallet, chain, &rest[1..]).await,
+            [s, ..] if s == "outbox" => self.lookup_outbox(wallet, chain, &rest[1..]).await,
+            _ => Err(HandlerError::not_found(rest.join("/"))),
+        }
+    }
+
+    async fn lookup_solana_chain(
+        &self,
+        wallet: &str,
+        chain: &str,
+        rest: &[String],
+        engine: Option<Arc<bloom_solana_tx::engine::SolanaTransferEngine>>,
+    ) -> Result<Entry, HandlerError> {
+        if rest.is_empty() {
+            return Ok(Entry::dir(chain));
+        }
+        // Balance and account leaves resolve from the Broker projection
+        // alone — `stat` never reaches the chain.
+        match rest {
+            [s] if matches!(s.as_str(), "balance" | "balance.raw" | "balance.json") => {
+                self.solana_alias_account(wallet, chain).await?;
+                return Ok(Entry::file(s));
+            }
+            [s] if s == "accounts" => return Ok(Entry::dir("accounts")),
+            [s, fp] if s == "accounts" => {
+                self.solana_account_by_fingerprint(wallet, fp).await?;
+                return Ok(Entry::dir(fp));
+            }
+            [s, fp, leaf]
+                if s == "accounts" && Self::SOLANA_ACCOUNT_LEAVES.contains(&leaf.as_str()) =>
+            {
+                self.solana_account_by_fingerprint(wallet, fp).await?;
+                return Ok(Entry::file(leaf));
+            }
+            _ => {}
+        }
+        // The chain directory itself resolves for any configured Solana
+        // chain. Everything below is outbox routing, which needs a transfer
+        // engine — a read-only chain has none.
+        let engine = engine.ok_or_else(|| {
+            HandlerError::not_found(format!(
+                "chain '{chain}' is configured for reads only; staging is unavailable"
+            ))
+        })?;
+        match rest {
+            [] => Ok(Entry::dir(chain)),
+            [s] if s == "outbox" => Ok(Entry::dir("outbox")),
+            [s, fname] if s == "outbox" && fname == "new.tx" => Ok(Entry::writable_file("new.tx")),
+            [s, fname] if s == "outbox" && fname == "latest" => {
+                let target = Self::latest_solana_pending_target(&engine, wallet, chain)?
+                    .ok_or_else(|| HandlerError::not_found("outbox/latest"))?;
+                Ok(Entry::symlink("latest", &target))
+            }
+            [s, state] if s == "outbox" && solana_state(state).is_some() => Ok(Entry::dir(state)),
+            [s, state, id] if s == "outbox" && solana_state(state).is_some() => {
+                let entry = engine
+                    .outbox()
+                    .read_in_state(wallet, chain, id, solana_state(state).unwrap())
+                    .map_err(solana_outbox_err)?;
+                Ok(Entry::dir(id).with_modified_ms(entry.staged.created_ms))
+            }
+            [s, state, id, fname] if s == "outbox" && solana_state(state).is_some() => {
+                let entry = engine
+                    .outbox()
+                    .read_in_state(wallet, chain, id, solana_state(state).unwrap())
+                    .map_err(solana_outbox_err)?;
+                if solana_state(state) == Some(bloom_solana_tx::outbox::SolanaOutboxState::Pending)
+                    && matches!(fname.as_str(), "confirm" | "cancel" | "restage")
+                {
+                    return Ok(
+                        Entry::writable_file(fname).with_modified_ms(entry.staged.created_ms)
+                    );
+                }
+                if !is_public_solana_outbox_artifact(fname) {
+                    return Err(HandlerError::not_found(fname));
+                }
+                let fpath = entry.dir.join(fname);
+                if !fpath.exists() {
+                    return Err(HandlerError::not_found(format!(
+                        "/{wallet}/chains/{chain}/outbox/{state}/{id}/{fname}"
+                    )));
+                }
+                Ok(Entry::file(fname).with_modified_ms(entry.staged.created_ms))
+            }
             _ => Err(HandlerError::not_found(rest.join("/"))),
         }
     }
@@ -2740,6 +3114,11 @@ impl WalletsHandler {
         chain: &str,
         rest: &[String],
     ) -> Result<Vec<u8>, HandlerError> {
+        if self.is_solana_chain(chain) {
+            return self
+                .read_solana_chain(wallet, chain, rest, self.solana_engine(chain))
+                .await;
+        }
         // Read-only chain leaves (balance/nonce): never gated on policy sig.
         let address: alloy::primitives::Address = self
             .wallet_projection(wallet)
@@ -2895,12 +3274,552 @@ impl WalletsHandler {
         }
     }
 
+    async fn read_solana_chain(
+        &self,
+        wallet: &str,
+        chain: &str,
+        rest: &[String],
+        engine: Option<Arc<bloom_solana_tx::engine::SolanaTransferEngine>>,
+    ) -> Result<Vec<u8>, HandlerError> {
+        // IPC reads bypass lookup, so Solana must enforce the same wallet
+        // projection availability gate as the EVM read path.
+        let _projection = self.wallet_projection(wallet).await?;
+
+        // Account reads. `address` is projection-only; a balance leaf makes
+        // exactly one getBalance call for the account it names.
+        match rest {
+            [leaf] if matches!(leaf.as_str(), "balance" | "balance.raw" | "balance.json") => {
+                let account = self.solana_alias_account(wallet, chain).await?;
+                let lamports = self.solana_balance(chain, &account.address).await?;
+                return Ok(Self::solana_balance_bytes(leaf, chain, &account, lamports));
+            }
+            [s, fp, leaf] if s == "accounts" && leaf == "address" => {
+                let account = self.solana_account_by_fingerprint(wallet, fp).await?;
+                return Ok(format!("{}\n", account.address).into_bytes());
+            }
+            [s, fp, leaf]
+                if s == "accounts"
+                    && matches!(leaf.as_str(), "balance" | "balance.raw" | "balance.json") =>
+            {
+                let account = self.solana_account_by_fingerprint(wallet, fp).await?;
+                let lamports = self.solana_balance(chain, &account.address).await?;
+                return Ok(Self::solana_balance_bytes(leaf, chain, &account, lamports));
+            }
+            _ => {}
+        }
+
+        // Everything below is outbox routing, which needs a transfer engine —
+        // a read-only chain has none.
+        let engine = engine.ok_or_else(|| {
+            HandlerError::not_found(format!(
+                "chain '{chain}' is configured for reads only; staging is unavailable"
+            ))
+        })?;
+        match rest {
+            [s, state, id, fname] if s == "outbox" => {
+                if !is_public_solana_outbox_artifact(fname) {
+                    return Err(HandlerError::not_found(fname));
+                }
+                let st = solana_state(state)
+                    .ok_or_else(|| HandlerError::not_found(format!("outbox state '{state}'")))?;
+                let entry = engine
+                    .outbox()
+                    .read_in_state(wallet, chain, id, st)
+                    .map_err(solana_outbox_err)?;
+                let mut file = open_regular_outbox_artifact(&entry.dir, fname)?;
+                let mut bytes = Vec::new();
+                std::io::Read::read_to_end(&mut file, &mut bytes)?;
+                Ok(bytes)
+            }
+            _ => Err(HandlerError::NotAFile(rest.join("/"))),
+        }
+    }
+
+    async fn list_solana_chain(
+        &self,
+        wallet: &str,
+        chain: &str,
+        rest: &[String],
+        engine: Option<Arc<bloom_solana_tx::engine::SolanaTransferEngine>>,
+    ) -> Result<Vec<Entry>, HandlerError> {
+        if rest.is_empty() {
+            // `outbox/` is advertised only when this chain can actually
+            // stage; a reads-only chain lists no writable surface.
+            let mut entries = vec![
+                Entry::file("balance"),
+                Entry::file("balance.raw"),
+                Entry::file("balance.json"),
+                Entry::dir("accounts"),
+            ];
+            if engine.is_some() {
+                entries.push(Entry::dir("outbox"));
+            }
+            return Ok(entries);
+        }
+        match rest {
+            [s] if s == "accounts" => {
+                // One Broker fetch, no chain calls: listing never fans out
+                // balance lookups across children.
+                return Ok(self
+                    .solana_accounts(wallet)
+                    .await?
+                    .into_iter()
+                    .map(|a| Entry::dir(&a.fingerprint))
+                    .collect());
+            }
+            [s, fp] if s == "accounts" => {
+                self.solana_account_by_fingerprint(wallet, fp).await?;
+                return Ok(Self::SOLANA_ACCOUNT_LEAVES
+                    .iter()
+                    .map(|leaf| Entry::file(leaf))
+                    .collect());
+            }
+            _ => {}
+        }
+        // The chain directory itself resolves for any configured Solana
+        // chain. Everything below is outbox routing, which needs a transfer
+        // engine — a read-only chain has none.
+        let engine = engine.ok_or_else(|| {
+            HandlerError::not_found(format!(
+                "chain '{chain}' is configured for reads only; staging is unavailable"
+            ))
+        })?;
+        match rest {
+            [] => Ok(vec![Entry::dir("outbox")]),
+            [s] if s == "outbox" => {
+                let mut entries = vec![
+                    Entry::writable_file("new.tx"),
+                    Entry::dir("pending"),
+                    Entry::dir("sent"),
+                    Entry::dir("failed"),
+                ];
+                if let Some(target) = Self::latest_solana_pending_target(&engine, wallet, chain)? {
+                    entries.push(Entry::symlink("latest", &target));
+                }
+                Ok(entries)
+            }
+            [s, state] if s == "outbox" => {
+                let st = solana_state(state)
+                    .ok_or_else(|| HandlerError::not_found(format!("outbox state '{state}'")))?;
+                let ids = engine
+                    .outbox()
+                    .list(wallet, chain, st)
+                    .map_err(solana_outbox_err)?;
+                Ok(ids.into_iter().map(|id| Entry::dir(&id)).collect())
+            }
+            [s, state, id] if s == "outbox" => {
+                let st = solana_state(state)
+                    .ok_or_else(|| HandlerError::not_found(format!("outbox state '{state}'")))?;
+                let entry = engine
+                    .outbox()
+                    .read_in_state(wallet, chain, id, st)
+                    .map_err(solana_outbox_err)?;
+                let mut entries: Vec<Entry> = Vec::new();
+                for file in [
+                    "intent.json",
+                    "plan.md",
+                    "simulation.json",
+                    "receipt.json",
+                    "broadcast_attempted.json",
+                    "approval_challenge.json",
+                    "restage_advice.json",
+                    "restage.md",
+                ] {
+                    let fpath = entry.dir.join(file);
+                    if fpath.exists() {
+                        entries.push(Entry::file(file));
+                    }
+                }
+                if st == bloom_solana_tx::outbox::SolanaOutboxState::Pending {
+                    for control in ["confirm", "cancel", "restage"] {
+                        entries.push(Entry::writable_file(control));
+                    }
+                } else if st == bloom_solana_tx::outbox::SolanaOutboxState::Failed
+                    && entry.staged.status == bloom_solana_tx::SolanaTxStatus::Expired
+                {
+                    entries.push(Entry::writable_file("restage"));
+                }
+                Ok(entries)
+            }
+            _ => Err(HandlerError::NotADir(rest.join("/"))),
+        }
+    }
+
+    /// One resolved Solana child, derived entirely from the Broker's
+    /// `wallet.accounts` projection. Every field here is projection-derived,
+    /// so building it costs no chain calls.
+    ///
+    /// `fingerprint` is the full canonical lowercase hex fingerprint — the
+    /// durable path identity under `accounts/`. Prefixes are accepted as
+    /// *input* convenience by `new.tx`, never used as a path.
+    async fn solana_accounts(&self, wallet: &str) -> Result<Vec<SolanaAccount>, HandlerError> {
+        let broker = self.broker.as_ref().ok_or_else(|| {
+            HandlerError::backend("Broker edge is unavailable for Solana accounts")
+        })?;
+        let accounts = broker
+            .wallet_accounts(
+                bloom_broker_api::Token::new(wallet.to_owned())
+                    .map_err(|error| HandlerError::invalid(error.to_string()))?,
+            )
+            .await
+            .map_err(|error| HandlerError::backend(error.to_string()))?;
+        bloom_solana_tx::account::active_accounts(
+            &accounts.accounts,
+            bloom_broker_api::DerivationProfile::Bip44SolanaSlip10Ed25519V1,
+        )
+        .into_iter()
+        .map(SolanaAccount::from_projection)
+        .collect()
+    }
+
+    /// Resolve the child the top-level `balance*` aliases refer to.
+    ///
+    /// The aliases are a single-child convenience. With several active
+    /// children there is no defensible default, so this fails and names the
+    /// canonical `accounts/<fingerprint>/` paths instead of guessing.
+    async fn solana_alias_account(
+        &self,
+        wallet: &str,
+        chain: &str,
+    ) -> Result<SolanaAccount, HandlerError> {
+        let mut accounts = self.solana_accounts(wallet).await?;
+        match accounts.len() {
+            1 => Ok(accounts.remove(0)),
+            0 => Err(HandlerError::not_found(format!(
+                "wallet '{wallet}' has no active Solana account"
+            ))),
+            _ => {
+                let paths = accounts
+                    .iter()
+                    .map(|a| format!("chains/{chain}/accounts/{}/", a.fingerprint))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                Err(HandlerError::invalid(format!(
+                    "wallet '{wallet}' has {} active Solana accounts; read one of: {paths}",
+                    accounts.len()
+                )))
+            }
+        }
+    }
+
+    /// The active child named by a full canonical fingerprint.
+    ///
+    /// Only the full lowercase fingerprint is accepted as a path segment:
+    /// prefixes are input convenience for `new.tx`, but a prefix that is
+    /// unique today can become ambiguous when another child is allocated,
+    /// so it is not a durable path identity.
+    async fn solana_account_by_fingerprint(
+        &self,
+        wallet: &str,
+        fingerprint: &str,
+    ) -> Result<SolanaAccount, HandlerError> {
+        self.solana_accounts(wallet)
+            .await?
+            .into_iter()
+            .find(|a| a.fingerprint == fingerprint)
+            .ok_or_else(|| {
+                HandlerError::not_found(format!(
+                    "wallet '{wallet}' has no active Solana account '{fingerprint}'"
+                ))
+            })
+    }
+
+    /// Read a Solana account's lamport balance. The one place in the Solana
+    /// read surface that touches the chain.
+    async fn solana_balance(&self, chain: &str, address: &str) -> Result<u64, HandlerError> {
+        self.solana_client(chain)
+            .ok_or_else(|| HandlerError::not_found(format!("chain '{chain}'")))?
+            .get_balance(address)
+            .await
+            .map_err(|error| HandlerError::backend(error.to_string()))
+    }
+
+    /// The four leaves published under an account directory.
+    const SOLANA_ACCOUNT_LEAVES: [&'static str; 4] =
+        ["address", "balance", "balance.raw", "balance.json"];
+
+    fn solana_balance_bytes(
+        leaf: &str,
+        chain: &str,
+        account: &SolanaAccount,
+        lamports: u64,
+    ) -> Vec<u8> {
+        match leaf {
+            "balance.raw" => super::balances::raw_line(alloy::primitives::U256::from(lamports)),
+            "balance" => super::balances::display_line(
+                alloy::primitives::U256::from(lamports),
+                super::balances::SOL_DECIMALS,
+                super::balances::SOL_SYMBOL,
+            ),
+            _ => super::balances::solana_balance_json(
+                chain,
+                &account.address,
+                &account.fingerprint,
+                &account.derivation_path,
+                lamports,
+            ),
+        }
+    }
+
+    /// Resolve the exact active Solana derived child to transact with, from
+    /// the Broker's `wallet.accounts` projection.
+    ///
+    /// `selector` is a public-key fingerprint, or a unique prefix of one. It
+    /// is required whenever the wallet has more than one active Solana child:
+    /// projection order is not a selection criterion, and silently taking the
+    /// first would spend from an account the user never named.
+    ///
+    /// Staging and balance reads both resolve through here, so a balance is
+    /// always read from the same child a transfer would spend from.
+    async fn resolve_solana_child(
+        &self,
+        wallet: &str,
+        selector: Option<&str>,
+    ) -> Result<SolanaAccount, HandlerError> {
+        let broker = self.broker.as_ref().ok_or_else(|| {
+            HandlerError::backend("Broker edge is unavailable for Solana transfers")
+        })?;
+        let accounts = broker
+            .wallet_accounts(
+                bloom_broker_api::Token::new(wallet.to_owned())
+                    .map_err(|error| HandlerError::invalid(error.to_string()))?,
+            )
+            .await
+            .map_err(|error| HandlerError::backend(error.to_string()))?;
+        let active = bloom_solana_tx::account::active_accounts(
+            &accounts.accounts,
+            bloom_broker_api::DerivationProfile::Bip44SolanaSlip10Ed25519V1,
+        );
+        let account = bloom_solana_tx::account::select(wallet, &active, selector).map_err(
+            |error| match error {
+                bloom_solana_tx::AccountSelectionError::None { .. }
+                | bloom_solana_tx::AccountSelectionError::NoMatch { .. } => {
+                    HandlerError::not_found(error.to_string())
+                }
+                other => HandlerError::invalid(other.to_string()),
+            },
+        )?;
+        SolanaAccount::from_projection(account)
+    }
+
+    async fn write_solana_outbox(
+        &self,
+        wallet: &str,
+        chain: &str,
+        rest: &[String],
+        data: &[u8],
+        engine: &Arc<bloom_solana_tx::engine::SolanaTransferEngine>,
+    ) -> Result<(), HandlerError> {
+        match rest {
+            // outbox/new.tx — stage a native transfer.
+            [s] if s == "new.tx" => {
+                self.write_permit()?;
+                let intent: bloom_solana_tx::SolanaTransferIntent = serde_json::from_slice(data)
+                    .map_err(|e| HandlerError::invalid(format!("invalid Solana intent: {e}")))?;
+                let destination = intent.destination_bytes().map_err(HandlerError::invalid)?;
+                let child = self
+                    .resolve_solana_child(wallet, intent.account_fingerprint.as_deref())
+                    .await?;
+                let staged = engine
+                    .stage(
+                        wallet,
+                        &child.pubkey,
+                        // Pin the full fingerprint, never the user's prefix:
+                        // a prefix could later resolve to a different child.
+                        bloom_solana_tx::engine::SolanaAccountPin {
+                            fingerprint: Some(child.fingerprint.clone()),
+                            derivation_path: Some(child.derivation_path.clone()),
+                        },
+                        &destination,
+                        intent.lamports,
+                        now_ms_u128(),
+                    )
+                    .await
+                    .map_err(|e| HandlerError::backend(e.to_string()))?;
+                tracing::info!(wallet, chain, id = %staged.id, "solana_outbox.staged");
+                Ok(())
+            }
+            // outbox/pending/<id>/confirm — sign (ceremony) then broadcast.
+            [state, id, fname] if state == "pending" && fname == "confirm" => {
+                self.write_permit()?;
+                let confirm_text = std::str::from_utf8(data)
+                    .map_err(|_| HandlerError::invalid("non-utf8 confirm content"))?
+                    .trim();
+                if confirm_text.is_empty() {
+                    return Err(HandlerError::invalid(
+                        "confirm requires non-empty content (e.g. 'y')",
+                    ));
+                }
+                let now = now_ms_u128();
+                // Durable approval state: a prior `ApprovalRequired` stored
+                // the approval id in a sidecar; a retry reuses it.
+                let entry = engine
+                    .outbox()
+                    .read_in_state(
+                        wallet,
+                        chain,
+                        id,
+                        bloom_solana_tx::outbox::SolanaOutboxState::Pending,
+                    )
+                    .map_err(solana_outbox_err)?;
+                // Re-select the exact account this transfer was staged
+                // against. Resolving the wallet's children again would let a
+                // second active child sign a message staged for the first.
+                let child = self
+                    .resolve_solana_child(wallet, entry.staged.account_fingerprint.as_deref())
+                    .await?;
+                let approval_id = std::fs::read(
+                    entry
+                        .dir
+                        .join(bloom_solana_tx::outbox::APPROVAL_CHALLENGE_FILE),
+                )
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+                .and_then(|v| {
+                    v.get("approval_id")
+                        .and_then(|id| id.as_str())
+                        .and_then(|s| bloom_broker_api::Digest32::new(s.to_owned()).ok())
+                })
+                // Compatibility for pending entries produced by earlier
+                // unshipped Solana heads. New entries use the public
+                // challenge as their canonical resume projection.
+                .or_else(|| {
+                    std::fs::read(entry.dir.join("approval.json"))
+                        .ok()
+                        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+                        .and_then(|v| {
+                            v.get("approval_id")
+                                .and_then(|id| id.as_str())
+                                .and_then(|s| bloom_broker_api::Digest32::new(s.to_owned()).ok())
+                        })
+                });
+                match engine
+                    .sign(
+                        wallet,
+                        id,
+                        &child.pubkey,
+                        Some(child.key_ref.clone()),
+                        approval_id,
+                        now,
+                    )
+                    .await
+                    .map_err(|e| HandlerError::backend(e.to_string()))?
+                {
+                    bloom_solana_tx::signing::SolanaSignOutcome::ApprovalRequired {
+                        approval_id,
+                        ceremony_url,
+                        ceremony_expires_at_ms,
+                    } => {
+                        let challenge = serde_json::to_vec_pretty(&serde_json::json!({
+                            "schema": "bloom.solana-approval-challenge/1",
+                            "action_id": entry.staged.action_id.as_deref().unwrap_or(&entry.staged.id),
+                            "tx_id": entry.staged.id,
+                            "wallet": wallet,
+                            "chain": chain,
+                            "approval_id": approval_id.as_str(),
+                            "ceremony_url": ceremony_url,
+                            "expiry_ms": ceremony_expires_at_ms,
+                            "account_fingerprint": entry.staged.account_fingerprint,
+                            "fee_payer": entry.staged.fee_payer,
+                            "destination": entry.staged.destination,
+                            "lamports": entry.staged.lamports,
+                            "fee_lamports": entry.staged.fee_lamports,
+                            "plan_path": format!("wallets/{wallet}/chains/{chain}/outbox/pending/{id}/plan.md"),
+                            "retry_path": format!("wallets/{wallet}/chains/{chain}/outbox/pending/{id}/confirm"),
+                        }))
+                        .map_err(|error| HandlerError::backend(error.to_string()))?;
+                        engine
+                            .outbox()
+                            .write_approval_challenge(&entry, &challenge)
+                            .map_err(solana_outbox_err)?;
+                        Err(HandlerError::PermissionDenied)
+                    }
+                    bloom_solana_tx::signing::SolanaSignOutcome::Signed { .. } => {
+                        engine
+                            .outbox()
+                            .clear_approval_challenge(&entry)
+                            .map_err(solana_outbox_err)?;
+                        engine
+                            .broadcast(wallet, id, now)
+                            .await
+                            .map_err(|e| HandlerError::backend(e.to_string()))?;
+                        tracing::info!(wallet, chain, id, "solana_outbox.broadcast");
+                        Ok(())
+                    }
+                }
+            }
+            // outbox/pending/<id>/cancel — legal until a durable broadcast
+            // attempt exists. The engine serializes it against broadcast so
+            // a successful cancel can never race an on-chain submission.
+            [state, id, fname] if state == "pending" && fname == "cancel" => {
+                self.write_permit()?;
+                engine
+                    .cancel(wallet, id)
+                    .await
+                    .map_err(|e| HandlerError::backend(e.to_string()))?;
+                Ok(())
+            }
+            // outbox/{pending,failed}/<id>/restage — preserve the economic
+            // intent but replace an expired message with a fresh blockhash
+            // and approval. The sweeper moves stale entries to `failed`, so
+            // recovery must remain reachable from that terminal projection.
+            [state, id, fname]
+                if matches!(state.as_str(), "pending" | "failed") && fname == "restage" =>
+            {
+                self.write_permit()?;
+                let restage_text = std::str::from_utf8(data)
+                    .map_err(|_| HandlerError::invalid("non-utf8 restage content"))?
+                    .trim();
+                if restage_text.is_empty() {
+                    return Err(HandlerError::invalid(
+                        "restage requires non-empty content (e.g. 'y')",
+                    ));
+                }
+                // A restage rebuilds the message for the same account, so it
+                // reads the pinned fingerprint from the expired entry rather
+                // than resolving the wallet's children afresh.
+                //
+                // The sweeper moves stale entries to `failed`, so the pin has
+                // to be readable from either projection. Reading only
+                // `pending` here would make the engine's own failed-entry path
+                // unreachable and would report a state error for exactly the
+                // recovery case this sink exists to serve. Which states may
+                // actually be restaged stays the engine's decision.
+                let (expired, _) = engine
+                    .outbox()
+                    .read_restageable(wallet, chain, id)
+                    .map_err(solana_outbox_err)?;
+                let child = self
+                    .resolve_solana_child(wallet, expired.staged.account_fingerprint.as_deref())
+                    .await?;
+                let replacement = engine
+                    .restage_expired(wallet, id, &child.pubkey, now_ms_u128())
+                    .await
+                    .map_err(|error| HandlerError::invalid(error.to_string()))?;
+                tracing::info!(
+                    wallet,
+                    chain,
+                    expired_id = id,
+                    replacement_id = %replacement.id,
+                    "solana_outbox.restaged"
+                );
+                Ok(())
+            }
+            _ => Err(HandlerError::PermissionDenied),
+        }
+    }
+
     async fn list_chain(
         &self,
         wallet: &str,
         chain: &str,
         rest: &[String],
     ) -> Result<Vec<Entry>, HandlerError> {
+        if self.is_solana_chain(chain) {
+            return self
+                .list_solana_chain(wallet, chain, rest, self.solana_engine(chain))
+                .await;
+        }
         let _projection = self.wallet_projection(wallet).await?;
         let _client = self
             .chains
@@ -3166,7 +4085,6 @@ mod tests {
     use bloom_proto::AddressBook;
     use bloom_tx::outbox::Outbox;
     use bloom_tx::tx_engine::TxEngine;
-    use sha2::Digest as _;
     use std::sync::Mutex;
 
     #[test]
@@ -3710,6 +4628,506 @@ mod tests {
             wallet_name: "alice".to_string(),
             wallet_addr,
         }
+    }
+
+    /// A stub Broker service: the Solana outbox read path never reaches it,
+    /// so every method is a catch-all error.
+    struct StubBroker;
+    impl bloom_broker_api::MachineBrokerService for StubBroker {
+        fn dispatch<'a>(
+            &'a self,
+            request: bloom_broker_api::MachineBrokerRequest,
+        ) -> bloom_broker_api::ServiceFuture<'a, bloom_broker_api::MachineBrokerResponse> {
+            Box::pin(async move {
+                Err(bloom_broker_api::ProtocolError::new(
+                    bloom_broker_api::ProtocolErrorCode::UnknownMethod,
+                    format!("unhandled {request:?}"),
+                ))
+            })
+        }
+    }
+
+    /// A Broker fixture that reports one active Solana derived child, so the
+    /// write path can resolve the fee payer.
+    struct SolanaChildBroker {
+        child_pubkey: [u8; 32],
+    }
+    impl bloom_broker_api::MachineBrokerService for SolanaChildBroker {
+        fn dispatch<'a>(
+            &'a self,
+            request: bloom_broker_api::MachineBrokerRequest,
+        ) -> bloom_broker_api::ServiceFuture<'a, bloom_broker_api::MachineBrokerResponse> {
+            Box::pin(async move {
+                match request {
+                    bloom_broker_api::MachineBrokerRequest::WalletAccounts(
+                        bloom_broker_api::WalletRequest { wallet_id },
+                    ) => {
+                        let mut child_spki = vec![
+                            0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
+                        ];
+                        child_spki.extend_from_slice(&self.child_pubkey);
+                        let child_key_ref = bloom_broker_api::KeyRef {
+                            backend: bloom_broker_api::Token::new("local").unwrap(),
+                            backend_instance: bloom_broker_api::Token::new("primary").unwrap(),
+                            locator: "wallet/derived/solana-0".into(),
+                            key_spec: bloom_broker_api::KeySpec::Ed25519,
+                            public_key_fingerprint: bloom_broker_api::Digest32::from_bytes(
+                                sha2::Sha256::digest(&child_spki).into(),
+                            ),
+                            derivation: Some(bloom_broker_api::DerivationRef::Bip39Multicurve {
+                                wallet_seed_ref: bloom_broker_api::Token::new("wallet-seed")
+                                    .unwrap(),
+                                profile:
+                                    bloom_broker_api::DerivationProfile::Bip44SolanaSlip10Ed25519V1,
+                                path: "m/44'/501'/0'/0'".into(),
+                            }),
+                        };
+                        Ok(bloom_broker_api::MachineBrokerResponse::WalletAccounts(
+                            bloom_broker_api::WalletAccountsPublic {
+                                wallet_id,
+                                seed_profile: bloom_broker_api::WalletSeedProfile::Bip39MulticurveV1,
+                                accounts: vec![bloom_broker_api::DerivedAccountPublic {
+                                    key_ref: child_key_ref,
+                                    wallet_seed_profile:
+                                        bloom_broker_api::WalletSeedProfile::Bip39MulticurveV1,
+                                    derivation_profile:
+                                        bloom_broker_api::DerivationProfile::Bip44SolanaSlip10Ed25519V1,
+                                    path: "m/44'/501'/0'/0'".into(),
+                                    canonical_public_key: bloom_broker_api::Base64UrlBytes::from_bytes(
+                                        &child_spki,
+                                    ),
+                                    public_key_encoding:
+                                        bloom_broker_api::PublicKeyEncoding::Ed25519SpkiDer,
+                                    public_key_fingerprint: bloom_broker_api::Digest32::from_bytes(
+                                        sha2::Sha256::digest(&child_spki).into(),
+                                    ),
+                                    supported_crypto_suites: vec![
+                                        bloom_broker_api::CryptoSuite::Ed25519Message,
+                                    ],
+                                    chain_projections: vec![],
+                                    lifecycle: bloom_broker_api::AccountLifecycleState::Active,
+                                }],
+                            },
+                        ))
+                    }
+                    other => Err(bloom_broker_api::ProtocolError::new(
+                        bloom_broker_api::ProtocolErrorCode::UnknownMethod,
+                        format!("unhandled {other:?}"),
+                    )),
+                }
+            })
+        }
+    }
+
+    /// A stub Solana node answering getLatestBlockhash, so `stage` can fetch a
+    /// recent blockhash without a real cluster.
+    async fn spawn_solana_node() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = vec![0u8; 8192];
+                    let n = socket.read(&mut buf).await.unwrap_or(0);
+                    let request = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let body = request.split("\r\n\r\n").nth(1).unwrap_or_default();
+                    let method = serde_json::from_str::<serde_json::Value>(body)
+                        .ok()
+                        .and_then(|v| v.get("method").and_then(|m| m.as_str()).map(String::from))
+                        .unwrap_or_default();
+                    let result = match method.as_str() {
+                        "getGenesisHash" => r#""test-genesis""#.to_string(),
+                        "getLatestBlockhash" => {
+                            let blockhash = bs58::encode([0x42u8; 32]).into_string();
+                            format!(
+                                r#"{{"context":{{"slot":1}},"value":{{"blockhash":"{blockhash}","lastValidBlockHeight":100}}}}"#
+                            )
+                        }
+                        "getBlockHeight" => "1".to_string(),
+                        "getBalance" => r#"{"context":{"slot":1},"value":1500000000}"#.to_string(),
+                        "getFeeForMessage" => r#"{"context":{"slot":1},"value":5000}"#.to_string(),
+                        _ => r#"{"code":-32601,"message":"method not found"}"#.to_string(),
+                    };
+                    let payload = format!(r#"{{"jsonrpc":"2.0","id":1,"result":{result}}}"#);
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                        payload.len(),
+                        payload
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        format!("http://{addr}/")
+    }
+
+    fn solana_engine_fixture(
+        tmp: &tempfile::TempDir,
+    ) -> (
+        bloom_solana_tx::engine::SolanaTransferEngine,
+        bloom_solana_tx::outbox::SolanaOutbox,
+    ) {
+        let outbox =
+            bloom_solana_tx::outbox::SolanaOutbox::new(tmp.path().join("solana-outbox")).unwrap();
+        // A dead endpoint: the read path never touches the client.
+        let client = bloom_solana::SolanaClient::build(&bloom_solana::SolanaSpec {
+            name: "solana-devnet".into(),
+            endpoints: vec![bloom_solana::EndpointSpec {
+                url: "http://127.0.0.1:1".into(),
+                weight: 100,
+                cu_per_sec: None,
+                max_rps: None,
+                http_only: false,
+            }],
+            expected_genesis_base58: Some("test-genesis".into()),
+            allow_broadcast: true,
+        })
+        .unwrap();
+        let broker =
+            bloom_machine_client::MachineBrokerClient::new(std::sync::Arc::new(StubBroker));
+        let catalog = bloom_broker_api::ProvenanceCatalog {
+            schema: bloom_broker_api::PROVENANCE_CATALOG_SCHEMA.into(),
+            records: vec![bloom_broker_api::ProvenanceRecord {
+                subject: bloom_broker_api::ProvenanceSubject::System {
+                    component_id: bloom_broker_api::Token::new("bloom-machine").unwrap(),
+                    operation_class: bloom_broker_api::Token::new("solana.transfer.confirm")
+                        .unwrap(),
+                },
+                publisher: bloom_broker_api::Token::new("bloom-installer").unwrap(),
+                petal_lineage: None,
+                operation_classes: vec![bloom_broker_api::ProvenanceOperationClass {
+                    operation_class: bloom_broker_api::Token::new("solana.native-transfer")
+                        .unwrap(),
+                    fee_asset: Some(bloom_broker_api::ProvenanceFeeAsset {
+                        chain: bloom_broker_api::Token::new("solana").unwrap(),
+                        asset: "native".into(),
+                    }),
+                }],
+                installer_key_id: bloom_broker_api::Token::new("installer-key").unwrap(),
+                installer_signature: bloom_broker_api::Base64UrlBytes::from_bytes(&[11; 64]),
+            }],
+        };
+        let signer =
+            bloom_solana_tx::signing::SolanaTransferSigner::from_catalog(broker, &catalog).unwrap();
+        let engine = bloom_solana_tx::engine::SolanaTransferEngine::new(
+            outbox.clone(),
+            client,
+            signer,
+            "solana-devnet",
+        );
+        (engine, outbox)
+    }
+
+    #[tokio::test]
+    async fn solana_new_tx_stages_through_the_resolved_child() {
+        let f = make_handler_with_chain(true);
+        let node = spawn_solana_node().await;
+        let child_pubkey = [0xccu8; 32];
+        let broker = std::sync::Arc::new(SolanaChildBroker { child_pubkey });
+
+        let tmp = tempfile::tempdir().unwrap();
+        let outbox =
+            bloom_solana_tx::outbox::SolanaOutbox::new(tmp.path().join("solana-outbox")).unwrap();
+        let client = bloom_solana::SolanaClient::build(&bloom_solana::SolanaSpec {
+            name: "solana-devnet".into(),
+            endpoints: vec![bloom_solana::EndpointSpec {
+                url: node,
+                weight: 100,
+                cu_per_sec: None,
+                max_rps: None,
+                http_only: false,
+            }],
+            expected_genesis_base58: Some("test-genesis".into()),
+            allow_broadcast: true,
+        })
+        .unwrap();
+        let catalog = bloom_broker_api::ProvenanceCatalog {
+            schema: bloom_broker_api::PROVENANCE_CATALOG_SCHEMA.into(),
+            records: vec![bloom_broker_api::ProvenanceRecord {
+                subject: bloom_broker_api::ProvenanceSubject::System {
+                    component_id: bloom_broker_api::Token::new("bloom-machine").unwrap(),
+                    operation_class: bloom_broker_api::Token::new("solana.transfer.confirm")
+                        .unwrap(),
+                },
+                publisher: bloom_broker_api::Token::new("bloom-installer").unwrap(),
+                petal_lineage: None,
+                operation_classes: vec![bloom_broker_api::ProvenanceOperationClass {
+                    operation_class: bloom_broker_api::Token::new("solana.native-transfer")
+                        .unwrap(),
+                    fee_asset: Some(bloom_broker_api::ProvenanceFeeAsset {
+                        chain: bloom_broker_api::Token::new("solana").unwrap(),
+                        asset: "native".into(),
+                    }),
+                }],
+                installer_key_id: bloom_broker_api::Token::new("installer-key").unwrap(),
+                installer_signature: bloom_broker_api::Base64UrlBytes::from_bytes(&[11; 64]),
+            }],
+        };
+        let signer = bloom_solana_tx::signing::SolanaTransferSigner::from_catalog(
+            bloom_machine_client::MachineBrokerClient::new(broker.clone()),
+            &catalog,
+        )
+        .unwrap();
+        let engine = bloom_solana_tx::engine::SolanaTransferEngine::new(
+            outbox.clone(),
+            client,
+            signer,
+            "solana-devnet",
+        );
+
+        let handler = f
+            .handler
+            .with_broker(Some(bloom_machine_client::MachineBrokerClient::new(broker)))
+            .with_solana(std::collections::BTreeMap::from([(
+                "solana-devnet".to_string(),
+                std::sync::Arc::new(engine),
+            )]));
+
+        // Write a native-transfer intent to new.tx: the write path resolves
+        // the derived Solana child as fee payer and stages the message.
+        let destination = bs58::encode([0xbbu8; 32]).into_string();
+        let intent = serde_json::json!({ "destination": destination, "lamports": 1_000_000 });
+        handler
+            .write(
+                &VfsPath::parse("/alice/chains/solana-devnet/outbox/new.tx").unwrap(),
+                serde_json::to_vec(&intent).unwrap().as_slice(),
+            )
+            .await
+            .unwrap();
+
+        let listed = handler
+            .list(&VfsPath::parse("/alice/chains/solana-devnet/outbox/pending").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(listed.len(), 1);
+        let intent_bytes = handler
+            .read(
+                &VfsPath::parse(&format!(
+                    "/alice/chains/solana-devnet/outbox/pending/{}/intent.json",
+                    listed[0].name
+                ))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let staged: serde_json::Value = serde_json::from_slice(&intent_bytes).unwrap();
+        assert_eq!(staged["lamports"], 1_000_000);
+        assert_eq!(staged["destination"], destination);
+        assert_eq!(
+            staged["fee_payer"],
+            bs58::encode(child_pubkey).into_string(),
+            "the staged fee payer must be the resolved derived Solana child"
+        );
+    }
+
+    #[tokio::test]
+    async fn solana_chain_outbox_dispatches_through_the_solana_engine() {
+        let f = make_handler_with_chain(true);
+        let solana_tmp = tempfile::tempdir().unwrap();
+        let (engine, outbox) = solana_engine_fixture(&solana_tmp);
+        let staged = bloom_solana_tx::types::StagedSolanaTransfer {
+            id: "0001-00001".into(),
+            wallet: "alice".into(),
+            chain: "solana-devnet".into(),
+            fee_payer: "FEEPAYER111111111111111111111111111111111".into(),
+            account_fingerprint: None,
+            account_derivation_path: None,
+            destination: "DEST111111111111111111111111111111111111111".into(),
+            lamports: 1_000_000,
+            fee_lamports: 5_000,
+            genesis_hash: "GENESIS111111111111111111111111111111111111".into(),
+            blockhash: "BLOCKHASH111111111111111111111111111111111111".into(),
+            last_valid_block_height: 100,
+            message_b64: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, b"m"),
+            payload_digest_hex: "ab".repeat(32),
+            signature: None,
+            created_ms: 1,
+            expires_ms: 0,
+            status: bloom_solana_tx::types::SolanaTxStatus::Pending,
+            action_id: None,
+        };
+        outbox.write_pending(&staged, "plan").unwrap();
+        outbox
+            .record_signature(
+                "alice",
+                "solana-devnet",
+                &staged.id,
+                &bs58::encode([7u8; 64]).into_string(),
+            )
+            .unwrap();
+        let pending = outbox
+            .read_in_state(
+                "alice",
+                "solana-devnet",
+                &staged.id,
+                bloom_solana_tx::outbox::SolanaOutboxState::Pending,
+            )
+            .unwrap();
+        outbox
+            .write_approval(&pending, b"secret approval evidence")
+            .unwrap();
+        outbox
+            .write_approval_challenge(
+                &pending,
+                br#"{"schema":"bloom.solana-approval-challenge/1","approval_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","ceremony_url":"http://localhost:18734/ceremony/owner","expiry_ms":999999}"#,
+            )
+            .unwrap();
+        std::fs::write(pending.dir.join("raw_tx"), b"secret signed transaction").unwrap();
+
+        let handler = f.handler.with_solana(std::collections::BTreeMap::from([(
+            "solana-devnet".to_string(),
+            std::sync::Arc::new(engine),
+        )]));
+
+        let new_tx = handler
+            .lookup(&VfsPath::parse("/alice/chains/solana-devnet/outbox/new.tx").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(new_tx.mode, 0o644);
+        let outbox_entries = handler
+            .list(&VfsPath::parse("/alice/chains/solana-devnet/outbox").unwrap())
+            .await
+            .unwrap();
+        assert!(outbox_entries.iter().any(|entry| entry.name == "new.tx"));
+        assert_eq!(
+            outbox_entries
+                .iter()
+                .find(|entry| entry.name == "latest")
+                .and_then(|entry| entry.link_target.as_deref()),
+            Some("pending/0001-00001")
+        );
+        assert_eq!(
+            handler
+                .lookup(&VfsPath::parse("/alice/chains/solana-devnet/outbox/latest").unwrap())
+                .await
+                .unwrap()
+                .link_target
+                .as_deref(),
+            Some("pending/0001-00001")
+        );
+
+        // The Solana chain's outbox routes through the Solana engine, not the
+        // EVM one: the intent is Solana-typed and read from the Solana outbox.
+        let intent = handler
+            .read(
+                &VfsPath::parse(
+                    "/alice/chains/solana-devnet/outbox/pending/0001-00001/intent.json",
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&intent).unwrap();
+        assert_eq!(parsed["lamports"], 1_000_000);
+        assert_eq!(parsed["chain"], "solana-devnet");
+
+        let action_dir =
+            VfsPath::parse("/alice/chains/solana-devnet/outbox/pending/0001-00001").unwrap();
+        let action_entries = handler.list(&action_dir).await.unwrap();
+        assert!(
+            action_entries
+                .iter()
+                .any(|entry| entry.name == "approval_challenge.json")
+        );
+        let challenge_path = VfsPath::parse(
+            "/alice/chains/solana-devnet/outbox/pending/0001-00001/approval_challenge.json",
+        )
+        .unwrap();
+        handler.lookup(&challenge_path).await.unwrap();
+        let challenge = handler.read(&challenge_path).await.unwrap();
+        let challenge: serde_json::Value = serde_json::from_slice(&challenge).unwrap();
+        assert_eq!(
+            challenge["ceremony_url"],
+            "http://localhost:18734/ceremony/owner"
+        );
+
+        // The host outbox may contain signing and approval material needed
+        // for crash recovery, but none of it is part of the wallet VFS. Only
+        // explicitly public, sanitized artifacts are addressable there.
+        for private_artifact in [".signature", "approval.json", "raw_tx"] {
+            let path = VfsPath::parse(&format!(
+                "/alice/chains/solana-devnet/outbox/pending/0001-00001/{private_artifact}"
+            ))
+            .unwrap();
+            assert!(handler.lookup(&path).await.is_err());
+            assert!(handler.read(&path).await.is_err());
+        }
+
+        for control in ["confirm", "cancel", "restage"] {
+            assert!(
+                handler
+                    .lookup(
+                        &VfsPath::parse(&format!(
+                            "/alice/chains/solana-devnet/outbox/pending/0001-00001/{control}"
+                        ))
+                        .unwrap()
+                    )
+                    .await
+                    .is_ok()
+            );
+        }
+
+        let listed = handler
+            .list(&VfsPath::parse("/alice/chains/solana-devnet/outbox/pending").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].name, "0001-00001");
+
+        // The EVM chain is untouched: anvil still resolves through the EVM
+        // registry (a Solana chain name does not shadow it).
+        assert!(
+            handler
+                .lookup(&VfsPath::parse("/alice/chains/anvil/outbox").unwrap())
+                .await
+                .is_ok()
+        );
+        // An unknown Solana chain is still routed to the EVM registry and
+        // NotFound there.
+        assert!(
+            handler
+                .lookup(&VfsPath::parse("/alice/chains/solana-mainnet/outbox").unwrap())
+                .await
+                .is_err()
+        );
+    }
+
+    // Fix F (PLAN-SOLANA-PR-FIXES.md): `wallets/<wallet>/chains` listing
+    // only ever enumerated the EVM chain registry — Solana chains are
+    // reachable by direct path (see the dispatch test above) but never
+    // showed up when someone enumerated available chains.
+    #[tokio::test]
+    async fn chains_listing_includes_both_evm_and_solana_chains() {
+        let f = make_handler_with_chain(true);
+        let solana_tmp = tempfile::tempdir().unwrap();
+        let (engine, _outbox) = solana_engine_fixture(&solana_tmp);
+        let handler = f.handler.with_solana(std::collections::BTreeMap::from([(
+            "solana-devnet".to_string(),
+            std::sync::Arc::new(engine),
+        )]));
+
+        let listed = handler
+            .list(&VfsPath::parse("/alice/chains").unwrap())
+            .await
+            .unwrap();
+        let names: std::collections::BTreeSet<&str> =
+            listed.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains("anvil"), "EVM chain must still be listed");
+        assert!(
+            names.contains("solana-devnet"),
+            "Solana chain must be listed alongside EVM ones, not just reachable by direct path"
+        );
+        assert!(
+            handler
+                .lookup(&VfsPath::parse("/alice/chains/solana-devnet").unwrap())
+                .await
+                .is_ok(),
+            "every advertised Solana chain directory must resolve through lookup"
+        );
     }
 
     #[tokio::test]
@@ -4366,6 +5784,8 @@ mod tests {
             operation_id: OperationId::from_bytes([30; 32]),
             terms: approval_terms("alice", None),
             canonical_plan_facts_digest: digest(31),
+            petal_use_claim: None,
+            system_use_claim: None,
         };
         let path = VfsPath::parse("/alice/sealed-approvals/new.json").unwrap();
         f.handler
@@ -4410,6 +5830,8 @@ mod tests {
                 operation_id: OperationId::from_bytes([30; 32]),
                 terms: approval_terms("alice", None),
                 canonical_plan_facts_digest: digest(31),
+                petal_use_claim: None,
+                system_use_claim: None,
             };
             let path = VfsPath::parse("/alice/sealed-approvals/new.json").unwrap();
             f.handler
@@ -4439,6 +5861,8 @@ mod tests {
             operation_id: OperationId::from_bytes([30; 32]),
             terms: approval_terms("alice", None),
             canonical_plan_facts_digest: digest(31),
+            petal_use_claim: None,
+            system_use_claim: None,
         };
         let path = VfsPath::parse("/alice/sealed-approvals/new.json").unwrap();
         f.handler
@@ -4467,6 +5891,8 @@ mod tests {
             operation_id: OperationId::from_bytes([30; 32]),
             terms: approval_terms("alice", None),
             canonical_plan_facts_digest: digest(31),
+            petal_use_claim: None,
+            system_use_claim: None,
         };
         let path = VfsPath::parse("/alice/sealed-approvals/new.json").unwrap();
 
@@ -4672,6 +6098,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn outbox_latest_is_advertised_and_resolves_the_pending_identity() {
+        let f = make_handler_with_chain(true);
+        seed_pending(&f, "0001-pending");
+        let root = VfsPath::parse(&format!("/{}/chains/anvil/outbox", f.wallet_name)).unwrap();
+
+        let listed = f.handler.list(&root).await.unwrap();
+        let latest = listed.iter().find(|entry| entry.name == "latest").unwrap();
+        assert_eq!(latest.link_target.as_deref(), Some("pending/0001-pending"));
+
+        let latest_path =
+            VfsPath::parse(&format!("/{}/chains/anvil/outbox/latest", f.wallet_name)).unwrap();
+        assert_eq!(
+            f.handler
+                .lookup(&latest_path)
+                .await
+                .unwrap()
+                .link_target
+                .as_deref(),
+            Some("pending/0001-pending")
+        );
+    }
+
+    #[tokio::test]
     async fn outbox_latest_prefers_the_newest_staging_and_breaks_ties_by_allocation() {
         let f = make_handler_with_chain(true);
         // Same millisecond: ids are allocated from an increasing counter, so
@@ -4726,29 +6175,6 @@ mod tests {
         assert!(
             f.handler.list(&root).await.is_err(),
             "an unreadable newest pending entry must surface, not fall back to an older transfer"
-        );
-    }
-
-    #[tokio::test]
-    async fn outbox_latest_is_advertised_and_resolves_the_pending_identity() {
-        let f = make_handler_with_chain(true);
-        seed_pending(&f, "0001-pending");
-        let root = VfsPath::parse(&format!("/{}/chains/anvil/outbox", f.wallet_name)).unwrap();
-
-        let listed = f.handler.list(&root).await.unwrap();
-        let latest = listed.iter().find(|entry| entry.name == "latest").unwrap();
-        assert_eq!(latest.link_target.as_deref(), Some("pending/0001-pending"));
-
-        let latest_path =
-            VfsPath::parse(&format!("/{}/chains/anvil/outbox/latest", f.wallet_name)).unwrap();
-        assert_eq!(
-            f.handler
-                .lookup(&latest_path)
-                .await
-                .unwrap()
-                .link_target
-                .as_deref(),
-            Some("pending/0001-pending")
         );
     }
 
@@ -5243,5 +6669,425 @@ mod tests {
         let parsed: WalletAccountsPublic = serde_json::from_slice(&body).unwrap();
         assert_eq!(parsed.wallet_id.as_str(), f.wallet_name);
         assert!(parsed.accounts.is_empty());
+    }
+
+    /// The registry split's whole point: a Solana chain with a working RPC
+    /// client but no transfer engine (no Broker edge, or no provenance
+    /// catalog) must still be visible and enterable, while every staging
+    /// surface stays closed. Before the split the chain was invisible,
+    /// because listing and dispatch both keyed off the engine map.
+    #[tokio::test]
+    async fn solana_chains_are_readable_without_a_transfer_engine() {
+        let f = make_handler();
+        let node = spawn_solana_node().await;
+        let registry = bloom_solana::SolanaChainRegistry::new();
+        registry.add(
+            bloom_solana::SolanaClient::build(&bloom_solana::SolanaSpec {
+                name: "solana-devnet".into(),
+                endpoints: vec![bloom_solana::EndpointSpec {
+                    url: node,
+                    weight: 100,
+                    cu_per_sec: None,
+                    max_rps: None,
+                    http_only: false,
+                }],
+                expected_genesis_base58: Some("test-genesis".into()),
+                allow_broadcast: false,
+            })
+            .unwrap(),
+        );
+        // Note: no `.with_solana(..)` — there is no engine for this chain.
+        let handler = f.handler.with_solana_reads(registry);
+        let w = &f.wallet_name;
+
+        // The chain is listed alongside EVM chains...
+        let chains = handler
+            .list(&VfsPath::parse(&format!("/{w}/chains")).unwrap())
+            .await
+            .unwrap();
+        assert!(
+            chains.iter().any(|e| e.name == "solana-devnet"),
+            "reads-only Solana chain should be listed, got {:?}",
+            chains.iter().map(|e| &e.name).collect::<Vec<_>>()
+        );
+
+        // ...and its directory resolves...
+        let chain_dir = VfsPath::parse(&format!("/{w}/chains/solana-devnet")).unwrap();
+        handler.lookup(&chain_dir).await.unwrap();
+
+        // ...but advertises no outbox, because it cannot stage.
+        let entries = handler.list(&chain_dir).await.unwrap();
+        assert!(
+            !entries.iter().any(|e| e.name == "outbox"),
+            "reads-only chain must not advertise outbox, got {:?}",
+            entries.iter().map(|e| &e.name).collect::<Vec<_>>()
+        );
+
+        // Staging surfaces stay closed rather than falling through to EVM.
+        let new_tx = VfsPath::parse(&format!("/{w}/chains/solana-devnet/outbox/new.tx")).unwrap();
+        assert!(matches!(
+            handler.lookup(&new_tx).await,
+            Err(HandlerError::NotFound(_))
+        ));
+        let intent = serde_json::json!({
+            "destination": bs58::encode([0xbbu8; 32]).into_string(),
+            "lamports": 1_000_000,
+        });
+        assert!(
+            matches!(
+                handler
+                    .write(&new_tx, serde_json::to_vec(&intent).unwrap().as_slice())
+                    .await,
+                Err(HandlerError::NotFound(_))
+            ),
+            "staging on a reads-only chain must not reach the EVM outbox"
+        );
+    }
+
+    /// A valid Solana child projection, as the Broker would emit it.
+    fn solana_projection(pubkey: [u8; 32]) -> bloom_broker_api::DerivedAccountPublic {
+        let mut spki = vec![
+            0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
+        ];
+        spki.extend_from_slice(&pubkey);
+        let fingerprint =
+            bloom_broker_api::Digest32::from_bytes(sha2::Sha256::digest(&spki).into());
+        bloom_broker_api::DerivedAccountPublic {
+            key_ref: bloom_broker_api::KeyRef {
+                backend: bloom_broker_api::Token::new("local").unwrap(),
+                backend_instance: bloom_broker_api::Token::new("primary").unwrap(),
+                locator: "wallet/derived/solana-0".into(),
+                key_spec: bloom_broker_api::KeySpec::Ed25519,
+                public_key_fingerprint: fingerprint.clone(),
+                derivation: Some(bloom_broker_api::DerivationRef::Bip39Multicurve {
+                    wallet_seed_ref: bloom_broker_api::Token::new("wallet-seed").unwrap(),
+                    profile: bloom_broker_api::DerivationProfile::Bip44SolanaSlip10Ed25519V1,
+                    path: "m/44'/501'/0'/0'".into(),
+                }),
+            },
+            wallet_seed_profile: bloom_broker_api::WalletSeedProfile::Bip39MulticurveV1,
+            derivation_profile: bloom_broker_api::DerivationProfile::Bip44SolanaSlip10Ed25519V1,
+            path: "m/44'/501'/0'/0'".into(),
+            canonical_public_key: bloom_broker_api::Base64UrlBytes::from_bytes(&spki),
+            public_key_encoding: bloom_broker_api::PublicKeyEncoding::Ed25519SpkiDer,
+            public_key_fingerprint: fingerprint,
+            supported_crypto_suites: vec![bloom_broker_api::CryptoSuite::Ed25519Message],
+            chain_projections: vec![],
+            lifecycle: bloom_broker_api::AccountLifecycleState::Active,
+        }
+    }
+
+    /// The resolver is the Machine's trust boundary over a Broker-supplied
+    /// identity: a projection that contradicts itself must be refused, not
+    /// silently reconciled by preferring one field over another.
+    #[test]
+    fn inconsistent_account_projections_are_refused() {
+        let pubkey = [0xcc_u8; 32];
+        assert!(
+            SolanaAccount::from_projection(&solana_projection(pubkey)).is_ok(),
+            "baseline projection should resolve"
+        );
+
+        // path recorded on the projection disagrees with the signing KeyRef
+        let mut a = solana_projection(pubkey);
+        a.path = "m/44'/501'/1'/0'".into();
+        expect_integrity(&a, "disagrees with its KeyRef derivation path");
+
+        // fingerprint does not commit to the canonical public key
+        let mut a = solana_projection(pubkey);
+        a.public_key_fingerprint = bloom_broker_api::Digest32::from_bytes([0xab; 32]);
+        expect_integrity(&a, "does not match its canonical public key");
+
+        // wrong derivation profile for a Solana child
+        let mut a = solana_projection(pubkey);
+        a.derivation_profile = bloom_broker_api::DerivationProfile::Bip44EvmSecp256k1V1;
+        expect_integrity(&a, "not a bip44-solana-slip10-ed25519-v1 child");
+
+        // a projected base58 address that is not this account's address
+        let mut a = solana_projection(pubkey);
+        a.chain_projections = vec![bloom_broker_api::ChainAccountProjection {
+            chain_family: bloom_broker_api::Token::new("solana").unwrap(),
+            caip2: "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp".into(),
+            caip10: "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp:11111111111111111111111111111111"
+                .into(),
+            address: bs58::encode([0x11_u8; 32]).into_string(),
+            address_encoding: bloom_broker_api::AddressEncoding::Base58,
+        }];
+        expect_integrity(&a, "does not match the derived account address");
+
+        // wrong key spec / non-canonical encoding
+        let mut a = solana_projection(pubkey);
+        a.key_ref.key_spec = bloom_broker_api::KeySpec::Secp256k1;
+        assert!(SolanaAccount::from_projection(&a).is_err());
+
+        // truncated SPKI is not canonical
+        let mut a = solana_projection(pubkey);
+        a.canonical_public_key = bloom_broker_api::Base64UrlBytes::from_bytes(&[0x30, 0x2a]);
+        assert!(SolanaAccount::from_projection(&a).is_err());
+
+        // a child with no derivation cannot be pinned by signing
+        let mut a = solana_projection(pubkey);
+        a.key_ref.derivation = None;
+        assert!(SolanaAccount::from_projection(&a).is_err());
+    }
+
+    fn expect_integrity(account: &bloom_broker_api::DerivedAccountPublic, needle: &str) {
+        match SolanaAccount::from_projection(account) {
+            Err(HandlerError::Backend(msg)) => assert!(
+                msg.contains(needle),
+                "expected an integrity error mentioning {needle:?}, got {msg:?}"
+            ),
+            other => panic!("expected a projection-integrity error, got {other:?}"),
+        }
+    }
+
+    /// A Broker fixture projecting several active Solana children.
+    struct MultiChildBroker {
+        pubkeys: Vec<[u8; 32]>,
+    }
+    impl bloom_broker_api::MachineBrokerService for MultiChildBroker {
+        fn dispatch<'a>(
+            &'a self,
+            request: bloom_broker_api::MachineBrokerRequest,
+        ) -> bloom_broker_api::ServiceFuture<'a, bloom_broker_api::MachineBrokerResponse> {
+            Box::pin(async move {
+                match request {
+                    bloom_broker_api::MachineBrokerRequest::WalletAccounts(
+                        bloom_broker_api::WalletRequest { wallet_id },
+                    ) => Ok(bloom_broker_api::MachineBrokerResponse::WalletAccounts(
+                        bloom_broker_api::WalletAccountsPublic {
+                            wallet_id,
+                            seed_profile: bloom_broker_api::WalletSeedProfile::Bip39MulticurveV1,
+                            accounts: self.pubkeys.iter().map(|k| solana_projection(*k)).collect(),
+                        },
+                    )),
+                    other => Err(bloom_broker_api::ProtocolError::new(
+                        bloom_broker_api::ProtocolErrorCode::UnknownMethod,
+                        format!("unhandled {other:?}"),
+                    )),
+                }
+            })
+        }
+    }
+
+    fn solana_reads_handler(f: &Fixture, node: String, pubkeys: Vec<[u8; 32]>) -> WalletsHandler {
+        let registry = bloom_solana::SolanaChainRegistry::new();
+        registry.add(
+            bloom_solana::SolanaClient::build(&bloom_solana::SolanaSpec {
+                name: "solana-devnet".into(),
+                endpoints: vec![bloom_solana::EndpointSpec {
+                    url: node,
+                    weight: 100,
+                    cu_per_sec: None,
+                    max_rps: None,
+                    http_only: false,
+                }],
+                expected_genesis_base58: Some("test-genesis".into()),
+                allow_broadcast: false,
+            })
+            .unwrap(),
+        );
+        f.handler
+            .clone()
+            .with_broker(Some(bloom_machine_client::MachineBrokerClient::new(
+                std::sync::Arc::new(MultiChildBroker { pubkeys }),
+            )))
+            .with_solana_reads(registry)
+    }
+
+    /// Listing and stat must resolve from the Broker projection alone. Proven
+    /// structurally: the chain endpoint here is a closed port, so anything
+    /// that reached the chain would fail. Only reading a balance may.
+    #[tokio::test]
+    async fn solana_account_listing_and_lookup_never_touch_the_chain() {
+        let f = make_handler();
+        // A port nothing is listening on.
+        let dead = "http://127.0.0.1:1".to_string();
+        let handler = solana_reads_handler(&f, dead, vec![[0xaa; 32], [0xbb; 32]]);
+        let w = &f.wallet_name;
+        let fp_a = solana_projection([0xaa; 32])
+            .key_ref
+            .public_key_fingerprint
+            .as_str()
+            .to_ascii_lowercase();
+
+        let accounts_dir = VfsPath::parse(&format!("/{w}/chains/solana-devnet/accounts")).unwrap();
+        let listed = handler.list(&accounts_dir).await.unwrap();
+        assert_eq!(listed.len(), 2, "both active children should be listed");
+        assert!(listed.iter().all(|e| e.name.len() == 64));
+
+        handler
+            .lookup(&VfsPath::parse(&format!("/{w}/chains/solana-devnet/accounts/{fp_a}")).unwrap())
+            .await
+            .unwrap();
+        for leaf in ["address", "balance", "balance.raw", "balance.json"] {
+            handler
+                .lookup(
+                    &VfsPath::parse(&format!("/{w}/chains/solana-devnet/accounts/{fp_a}/{leaf}"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap_or_else(|e| panic!("lookup of {leaf} should not need the chain: {e:?}"));
+        }
+
+        // `address` is projection-only, so it reads with the chain down.
+        let addr = handler
+            .read(
+                &VfsPath::parse(&format!(
+                    "/{w}/chains/solana-devnet/accounts/{fp_a}/address"
+                ))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(addr).unwrap().trim(),
+            bs58::encode([0xaa_u8; 32]).into_string()
+        );
+
+        // A balance read is the one operation that needs the chain.
+        assert!(
+            handler
+                .read(
+                    &VfsPath::parse(&format!(
+                        "/{w}/chains/solana-devnet/accounts/{fp_a}/balance"
+                    ))
+                    .unwrap()
+                )
+                .await
+                .is_err(),
+            "balance must actually consult the chain"
+        );
+    }
+
+    /// Top-level `balance*` are single-child aliases. With several children
+    /// there is no defensible default, so they refuse and name the canonical
+    /// per-account paths rather than picking by projection order.
+    #[tokio::test]
+    async fn top_level_balance_aliases_are_single_child_only() {
+        let f = make_handler();
+        let node = spawn_solana_node().await;
+        let w = &f.wallet_name;
+        let alias = VfsPath::parse(&format!("/{w}/chains/solana-devnet/balance")).unwrap();
+
+        // one child: the alias resolves to it
+        let one = solana_reads_handler(&f, node.clone(), vec![[0xaa; 32]]);
+        let body = one.read(&alias).await.unwrap();
+        assert_eq!(String::from_utf8(body).unwrap(), "1.5 SOL\n");
+        let json = one
+            .read(&VfsPath::parse(&format!("/{w}/chains/solana-devnet/balance.json")).unwrap())
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&json).unwrap();
+        assert_eq!(v["schema"], "bloom.solana_native_balance.v1");
+        assert_eq!(v["raw"], "1500000000", "raw must stay a string");
+        assert_eq!(v["formatted"], "1.5");
+        assert_eq!(v["decimals"], 9);
+        assert_eq!(
+            v["account_address"],
+            bs58::encode([0xaa_u8; 32]).into_string()
+        );
+        assert_eq!(v["derivation_path"], "m/44'/501'/0'/0'");
+
+        // several children: refuse, and name the canonical candidate paths
+        let many = solana_reads_handler(&f, node, vec![[0xaa; 32], [0xbb; 32]]);
+        let err = many.read(&alias).await.unwrap_err();
+        let msg = format!("{err:?}");
+        for k in [[0xaa_u8; 32], [0xbb_u8; 32]] {
+            let fp = solana_projection(k)
+                .key_ref
+                .public_key_fingerprint
+                .as_str()
+                .to_ascii_lowercase();
+            assert!(
+                msg.contains(&format!("chains/solana-devnet/accounts/{fp}/")),
+                "ambiguity error should name the canonical path for {fp}, got {msg}"
+            );
+        }
+    }
+
+    /// `accounts/` is unconditional for a configured Solana chain, so the
+    /// namespace does not change shape when the first child is allocated or
+    /// the last is retired. With none active it lists empty, while the
+    /// top-level aliases report that there is nothing to read.
+    #[tokio::test]
+    async fn accounts_dir_exists_with_zero_active_children() {
+        let f = make_handler();
+        let handler = solana_reads_handler(&f, spawn_solana_node().await, vec![]);
+        let w = &f.wallet_name;
+
+        let dir = VfsPath::parse(&format!("/{w}/chains/solana-devnet/accounts")).unwrap();
+        handler.lookup(&dir).await.expect("accounts/ must exist");
+        assert!(
+            handler.list(&dir).await.unwrap().is_empty(),
+            "no active children means an empty directory, not a missing one"
+        );
+
+        // The chain directory still advertises the whole read surface.
+        let chain = VfsPath::parse(&format!("/{w}/chains/solana-devnet")).unwrap();
+        let names: Vec<String> = handler
+            .list(&chain)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        for expected in ["balance", "balance.raw", "balance.json", "accounts"] {
+            assert!(names.contains(&expected.to_string()), "missing {expected}");
+        }
+
+        for leaf in ["balance", "balance.raw", "balance.json"] {
+            let p = VfsPath::parse(&format!("/{w}/chains/solana-devnet/{leaf}")).unwrap();
+            assert!(
+                matches!(handler.read(&p).await, Err(HandlerError::NotFound(_))),
+                "{leaf} should report no active Solana account"
+            );
+        }
+    }
+
+    /// An RPC outage must degrade only what genuinely needs the chain. The
+    /// projection-derived surface keeps working, which is what makes the
+    /// wallet inspectable while a cluster is unreachable.
+    #[tokio::test]
+    async fn rpc_outage_leaves_the_projection_surface_readable() {
+        let f = make_handler();
+        let handler = solana_reads_handler(&f, "http://127.0.0.1:1".into(), vec![[0xaa; 32]]);
+        let w = &f.wallet_name;
+        let fp = solana_projection([0xaa; 32])
+            .key_ref
+            .public_key_fingerprint
+            .as_str()
+            .to_ascii_lowercase();
+
+        // Listing, stat and address all resolve from the Broker projection.
+        handler
+            .list(&VfsPath::parse(&format!("/{w}/chains/solana-devnet/accounts")).unwrap())
+            .await
+            .unwrap();
+        let addr = handler
+            .read(
+                &VfsPath::parse(&format!("/{w}/chains/solana-devnet/accounts/{fp}/address"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(addr).unwrap().trim(),
+            bs58::encode([0xaa_u8; 32]).into_string()
+        );
+
+        // Only the balance read fails, and it fails as a backend error
+        // rather than pretending the account does not exist.
+        let err = handler
+            .read(
+                &VfsPath::parse(&format!("/{w}/chains/solana-devnet/accounts/{fp}/balance"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, HandlerError::Backend(_)),
+            "an unreachable cluster is a backend failure, got {err:?}"
+        );
     }
 }

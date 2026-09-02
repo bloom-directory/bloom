@@ -1,5 +1,6 @@
 //! Durable Machine orchestration for the existing exact Broker signing flow.
 
+use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io::Write as _;
 use std::path::Path;
@@ -7,8 +8,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use bloom_broker_api::{
-    CryptoSuite, DecimalU64, Digest32, OperationId, PetalUseClaim, ProtocolErrorCode,
-    ProvenanceCatalog, ProvenanceSubject, RequestNonce, Token,
+    AssetId, CryptoSuite, DecimalU64, DecimalU256, DeclaredFee, Digest32, OperationId,
+    PetalUseClaim, ProtocolErrorCode, ProvenanceCatalog, ProvenanceSubject, RequestNonce, Token,
+    ValueLimit,
 };
 use bloom_machine_client::{
     ExactPayloadBatchSignRequest, ExactPayloadSignOutcome, ExactPayloadSignRequest,
@@ -22,6 +24,48 @@ use sha2::{Digest as _, Sha256};
 const STATE_SCHEMA: &str = "bloom.machine_exact_signing.v1";
 const APPROVAL_TTL_MS: u64 = 5 * 60 * 1000;
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+fn exact_claim_value_limits(claim: &PetalUseClaim) -> Result<Vec<ValueLimit>, String> {
+    let mut totals = BTreeMap::<(String, String), alloy::primitives::U256>::new();
+    let mut add = |chain: &Token, asset: &str, amount: &DecimalU256| -> Result<(), String> {
+        let value = amount
+            .as_str()
+            .parse::<alloy::primitives::U256>()
+            .map_err(|error| format!("parse exact claim value: {error}"))?;
+        let total = totals
+            .entry((chain.as_str().to_owned(), asset.to_owned()))
+            .or_default();
+        *total = total
+            .checked_add(value)
+            .ok_or_else(|| "exact claim value total exceeds uint256".to_owned())?;
+        Ok(())
+    };
+    for debit in &claim.declared_debits {
+        add(&debit.asset.chain, &debit.asset.asset, &debit.amount)?;
+    }
+    if let DeclaredFee::Fee {
+        chain,
+        asset,
+        amount,
+    } = &claim.declared_fee
+    {
+        add(chain, asset, amount)?;
+    }
+    totals
+        .into_iter()
+        .map(|((chain, asset), lifetime)| {
+            Ok(ValueLimit {
+                asset: AssetId {
+                    chain: Token::new(chain).map_err(|error| error.to_string())?,
+                    asset,
+                },
+                lifetime: DecimalU256::parse(lifetime.to_string())
+                    .map_err(|error| error.to_string())?,
+                rolling_windows: Vec::new(),
+            })
+        })
+        .collect()
+}
 
 #[derive(Clone)]
 pub struct BrokerExactPayloadSigner {
@@ -309,6 +353,10 @@ impl BrokerExactPayloadSigner {
             state.approval_id = None;
         }
         write_state(state_path, &state)?;
+        let approval_value_limits = petal_claim
+            .map(|(claim, _)| exact_claim_value_limits(claim))
+            .transpose()?
+            .unwrap_or_default();
         let mut request = ExactPayloadSignRequest {
             wallet_id,
             preimage: preimage.to_vec(),
@@ -326,8 +374,10 @@ impl BrokerExactPayloadSigner {
             approval_id: state.approval_id.clone(),
             account_key_ref: None,
             petal_use_claim: petal_claim.map(|(claim, _)| claim.clone()),
+            system_use_claim: None,
             claim_assurance_evidence: petal_claim
                 .and_then(|(_, evidence)| evidence.map(<[u8]>::to_vec)),
+            approval_value_limits,
         };
         let mut response = self.broker.sign_exact_payload(request.clone()).await;
         if response
@@ -1071,7 +1121,22 @@ mod tests {
             crypto_suite: CryptoSuite::Secp256k1Sha256Recoverable,
             payload_digest: claim_payload_digest,
             ordered_hashes: vec![ordered_hash.clone()],
-            declared_debits: Vec::new(),
+            declared_debits: vec![
+                bloom_broker_api::DeclaredDebit {
+                    asset: AssetId {
+                        chain: token("hyperliquid"),
+                        asset: "usdc".into(),
+                    },
+                    amount: DecimalU256::parse("7").unwrap(),
+                },
+                bloom_broker_api::DeclaredDebit {
+                    asset: AssetId {
+                        chain: token("hyperliquid"),
+                        asset: "usdc".into(),
+                    },
+                    amount: DecimalU256::parse("5").unwrap(),
+                },
+            ],
             declared_destinations: Vec::new(),
             declared_fee: bloom_broker_api::DeclaredFee::None,
             nonce: RequestNonce::from_bytes([21; 16]),
@@ -1123,6 +1188,18 @@ mod tests {
         assert_eq!(
             prepared.terms.allowed_crypto_suites,
             [CryptoSuite::Secp256k1Sha256Recoverable]
+        );
+        assert_eq!(prepared.terms.limits.value_limits.len(), 1);
+        assert_eq!(
+            prepared.terms.limits.value_limits[0].asset,
+            AssetId {
+                chain: token("hyperliquid"),
+                asset: "usdc".into(),
+            }
+        );
+        assert_eq!(
+            prepared.terms.limits.value_limits[0].lifetime.as_str(),
+            "12"
         );
         let MachineBrokerRequest::SigningSign(signed) = &requests[5] else {
             panic!("approved retry must sign");

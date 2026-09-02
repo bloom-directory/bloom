@@ -208,6 +208,8 @@ pub enum DaemonError {
     Config(#[from] bloom_proto::ConfigError),
     #[error("chain: {0}")]
     Chain(#[from] bloom_evm::ChainError),
+    #[error("solana config: {0}")]
+    SolanaConfig(String),
     #[error("outbox: {0}")]
     Outbox(String),
     #[error("audit: {0}")]
@@ -618,6 +620,11 @@ impl DaemonPetalHost {
                 operation_id,
                 terms,
                 canonical_plan_facts_digest: plan_digest,
+                // A Petal approval carries neither claim: the Petal path
+                // proves itself through provenance, and the system claim
+                // belongs to the native Solana transfer path.
+                petal_use_claim: None,
+                system_use_claim: None,
             })
             .await
             .map_err(|error| {
@@ -2720,6 +2727,7 @@ pub struct Daemon {
     pub home_write_permit: Option<Arc<HomeWritePermit>>,
     pub address_book: Arc<AddressBook>,
     pub audit: Arc<AuditLog>,
+    broker: Option<MachineBrokerClient>,
     pub wallet_projections: Arc<dyn WalletProjectionReader>,
     pub vfs: Vfs,
     pub petals: PetalRunner,
@@ -2743,6 +2751,11 @@ pub struct Daemon {
     /// Shared one-shot latch preventing duplicate audited boot refreshes when
     /// background task startup is requested more than once.
     pub wallet_projection_refresh_started: Arc<AtomicBool>,
+    /// Read-only Solana clients by chain name. Read surfaces and the
+    /// reconciler use this directly; the expiry sweeper uses it to prove a
+    /// staged blockhash is genuinely past its validity window before
+    /// terminalizing an entry.
+    pub solana_chains: bloom_solana::SolanaChainRegistry,
 }
 
 /// Regular `*.json` records directly under a Petal ceremony projection root.
@@ -2955,6 +2968,7 @@ impl Daemon {
         provenance_catalog: Option<bloom_broker_api::ProvenanceCatalog>,
     ) -> Result<Self, DaemonError> {
         home.ensure()?;
+
         // Before anything can serve or scan these projections, retire the
         // ceremonies a previous run left advertised.
         let invalidated = invalidate_stale_ceremony_projections(&home.cache_dir())?;
@@ -3139,6 +3153,66 @@ impl Daemon {
         } else {
             debug!("daemon.ens_resolver_skipped: no ENS-capable chain configured");
         }
+
+        // Solana chains: construct a transfer engine per configured Solana
+        // cluster, dispatching the same `chains/<chain>/outbox/...` route
+        // family as EVM. The engine needs the Broker + provenance catalog
+        // (the exact-signing seam); without them, Solana chains are not routed.
+        let mut solana_engines: std::collections::BTreeMap<
+            String,
+            Arc<bloom_solana_tx::engine::SolanaTransferEngine>,
+        > = std::collections::BTreeMap::new();
+        // Mirrors EVM's `chains` registry: fed alongside `solana_engines` so
+        // the reconciler spawned below (and anything else that needs a
+        // read-only handle per Solana chain) doesn't have to reach back
+        // through an engine to get one.
+        let solana_chain_registry = bloom_solana::SolanaChainRegistry::new();
+        // Read-only surfaces (balances, chain status) need only a valid
+        // client, so every configured chain that builds enters the registry
+        // even when custody is unavailable. Staging additionally needs the
+        // Broker and the provenance catalog — the exact-signing seam — so a
+        // transfer engine is built only when both are present. Keeping these
+        // independent is what lets `status/chains/<chain>` and wallet balance
+        // reads work on a daemon that cannot sign.
+        for (name, spec) in &config.solana_chains {
+            let client = match bloom_solana::SolanaClient::build(spec) {
+                Ok(client) => client,
+                Err(bloom_solana::SolanaRpcError::Invalid(error)) => {
+                    return Err(DaemonError::SolanaConfig(error));
+                }
+                Err(e) => {
+                    warn!(chain = %name, error = %e, "daemon.solana_chain_degraded");
+                    continue;
+                }
+            };
+            solana_chain_registry.add(client.clone());
+            let (Some(broker), Some(catalog)) = (&broker, &provenance_catalog) else {
+                debug!(chain = %name, "daemon.solana_reads_only");
+                continue;
+            };
+            let signer = match bloom_solana_tx::signing::SolanaTransferSigner::from_catalog(
+                broker.clone(),
+                catalog,
+            ) {
+                Ok(signer) => signer,
+                Err(e) => {
+                    warn!(chain = %name, error = %e, "daemon.solana_signer_skipped");
+                    continue;
+                }
+            };
+            let outbox = bloom_solana_tx::outbox::SolanaOutbox::new(home.solana_outbox_dir())
+                .map_err(|e| DaemonError::Outbox(e.to_string()))?;
+            let engine = bloom_solana_tx::engine::SolanaTransferEngine::new(
+                outbox,
+                client,
+                signer,
+                name.clone(),
+            );
+            solana_engines.insert(name.clone(), Arc::new(engine));
+        }
+        // `solana_engines` itself is moved into the wallets handler below;
+        // capture whether there's anything to reconcile before that happens.
+        let has_solana_chains = !solana_engines.is_empty();
 
         let address_book_path = home.root().join("addressbook.toml");
         let address_book = match AddressBook::load(&address_book_path) {
@@ -3398,6 +3472,7 @@ impl Daemon {
                 env!("CARGO_PKG_VERSION"),
                 wallet_projections.clone(),
             )
+            .with_solana_chains(solana_chain_registry.clone())
             .with_mempool_statuses(initial_mempool_statuses)
             .with_update_snapshot_fn(Arc::new(move || {
                 // Always produce a snapshot. The VFS renders the
@@ -3514,7 +3589,9 @@ impl Daemon {
         let wallets_handler = wallets_handler
             .with_broker(broker.clone())
             .with_home_write_permit_opt(home_write_permit.clone())
-            .with_mempool_indexes(mempool_indexes.clone());
+            .with_mempool_indexes(mempool_indexes.clone())
+            .with_solana(solana_engines)
+            .with_solana_reads(solana_chain_registry.clone());
 
         vfs_builder = vfs_builder
             .mount("wallets", Arc::new(wallets_handler) as _)
@@ -3680,6 +3757,26 @@ impl Daemon {
             debug!("daemon.reconciler_spawned");
         }
 
+        // Spawn the Solana receipt reconciler, mirroring the EVM one above:
+        // without this, a broadcast Solana transfer moves to `sent/` and
+        // nothing ever polls `getSignatureStatuses` or writes `receipt.json`
+        // for it — it stays "unconfirmed" from Bloom's perspective even
+        // after it finalizes on-chain. Only spawned when at least one
+        // Solana chain was actually admitted (mirrors the bump scanner's
+        // `!mempool_indexes.is_empty()` gate above).
+        if has_solana_chains && tokio::runtime::Handle::try_current().is_ok() {
+            let solana_outbox =
+                bloom_solana_tx::outbox::SolanaOutbox::new(home.solana_outbox_dir())
+                    .map_err(|e| DaemonError::Outbox(e.to_string()))?;
+            let solana_reconciler = Arc::new(bloom_solana_tx::reconcile::SolanaReconciler::new(
+                solana_outbox,
+                solana_chain_registry.clone(),
+                audit_arc.clone(),
+            ));
+            bump_shutdown.push(solana_reconciler.spawn());
+            debug!("daemon.solana_reconciler_spawned");
+        }
+
         // Spawn the backends probe task. Every 60s it:
         //   * refreshes `status/backends/mempool` from the live handler state
         //   * calls `health()` on each registered private RPC and writes the
@@ -3773,6 +3870,7 @@ impl Daemon {
             home_write_permit,
             address_book: address_book_arc,
             audit: audit_arc,
+            broker,
             wallet_projections,
             vfs,
             petals,
@@ -3784,7 +3882,15 @@ impl Daemon {
             probe_shutdown: Arc::new(parking_lot::Mutex::new(probe_shutdown)),
             update_shutdown: Arc::new(parking_lot::Mutex::new(Vec::new())),
             wallet_projection_refresh_started: Arc::new(AtomicBool::new(false)),
+            solana_chains: solana_chain_registry,
         })
+    }
+
+    /// Return the daemon's single authenticated Machine→Broker edge.
+    /// Clones share its transport ordering gate and attached audit provider;
+    /// callers must not construct a second edge over the same Machine journal.
+    pub fn broker_client(&self) -> Option<MachineBrokerClient> {
+        self.broker.clone()
     }
 
     /// Idempotent: ensure background workers are running. Already
@@ -3864,6 +3970,23 @@ impl Daemon {
 
         let outbox = self.tx_engine.outbox.clone();
         let audit = self.audit.clone();
+        // Solana staged transfers live in their own outbox root (same
+        // directory tree, disjoint chain subdirectories) — `bloom_tx::Outbox`
+        // above only ever walks EVM's. Best-effort construct a handle to it
+        // here too, so a real (non-zero, see Fix D's `stage()` change)
+        // Solana expiry actually gets swept instead of only ever being
+        // computed and never acted on.
+        let solana_outbox =
+            match bloom_solana_tx::outbox::SolanaOutbox::new(self.home.solana_outbox_dir()) {
+                Ok(o) => Some(o),
+                Err(e) => {
+                    warn!(error = %e, "daemon.solana_outbox_sweep_unavailable");
+                    None
+                }
+            };
+        // The sweep terminalizes entries from blockhash liveness, so it needs
+        // the same read registry the reconciler uses.
+        let solana_chains = self.solana_chains.clone();
         let (tx, mut rx) = watch::channel(false);
         let interval = Duration::from_secs(60);
         let handle = tokio::spawn(async move {
@@ -3883,6 +4006,32 @@ impl Daemon {
                             Ok(0) => tracing::trace!("outbox.sweep_expired.empty"),
                             Ok(n) => info!(swept = n, "outbox.sweep_expired"),
                             Err(e) => warn!(error = %e, "outbox.sweep_expired_failed"),
+                        }
+                        if let Some(solana_outbox) = &solana_outbox {
+                            // Live heights first: a Solana entry may only be
+                            // terminally expired when the cluster itself has
+                            // moved past the blockhash window. Chains whose
+                            // height cannot be observed are retained this
+                            // tick rather than judged by the wall estimate.
+                            let mut live_heights = std::collections::HashMap::new();
+                            for name in solana_chains.list_names() {
+                                let Some(client) = solana_chains.get(&name) else {
+                                    continue;
+                                };
+                                match client.get_block_height().await {
+                                    Ok(height) => {
+                                        live_heights.insert(name, height);
+                                    }
+                                    Err(error) => {
+                                        warn!(chain = %name, error = %error, "solana_outbox.sweep_height_unavailable")
+                                    }
+                                }
+                            }
+                            match run_solana_expiry_sweep_once(solana_outbox, &audit, now_ms, &live_heights) {
+                                Ok(0) => tracing::trace!("solana_outbox.sweep_expired.empty"),
+                                Ok(n) => info!(swept = n, "solana_outbox.sweep_expired"),
+                                Err(e) => warn!(error = %e, "solana_outbox.sweep_expired_failed"),
+                            }
                         }
                     }
                     _ = rx.changed() => {
@@ -3916,8 +4065,26 @@ impl Daemon {
         &self,
         path: &std::path::Path,
     ) -> Result<bloom_mount::NfsMountHandle, bloom_mount::MountError> {
-        bloom_mount::serve_nfs(self.vfs.clone(), path).await
+        bloom_mount::serve_nfs_with(self.vfs.clone(), configured_mount(&self.config, path)?).await
     }
+}
+
+#[cfg(feature = "mount")]
+fn configured_mount(
+    config: &Config,
+    path: &std::path::Path,
+) -> Result<bloom_mount::MountConfig, bloom_mount::MountError> {
+    let nfs_listen = config.nfs_listen_addr.parse().map_err(|error| {
+        bloom_mount::MountError::Config(format!(
+            "invalid nfs_listen_addr '{}': {error}",
+            config.nfs_listen_addr
+        ))
+    })?;
+    Ok(bloom_mount::MountConfig {
+        mount_path: path.to_path_buf(),
+        nfs_listen,
+        readonly: false,
+    })
 }
 
 async fn render_next_actions(projections: &dyn WalletProjectionReader) -> Vec<u8> {
@@ -4019,6 +4186,64 @@ fn run_expiry_sweep_once(
             digest: String::new(),
         })
         .map_err(|error| format!("Machine audit unavailable after expiry sweep: {error}"))?;
+    swept.map_err(|error| error.to_string())
+}
+
+/// Solana sibling of [`run_expiry_sweep_once`]: same audit-wrapped shape,
+/// over `bloom_solana_tx::outbox::SolanaOutbox` instead of EVM's
+/// `bloom_tx::outbox::Outbox` (Fix D, PLAN-SOLANA-PR-FIXES.md).
+fn run_solana_expiry_sweep_once(
+    outbox: &bloom_solana_tx::outbox::SolanaOutbox,
+    audit: &AuditLog,
+    now_ms: u128,
+    live_block_heights: &std::collections::HashMap<String, u64>,
+) -> Result<usize, String> {
+    let intent = serde_json::json!({
+        "operation": "solana_tx.outbox.sweep_expired",
+        "cutoff_ms": now_ms.to_string(),
+        "live_block_heights": live_block_heights.len(),
+        "scope": "all_pending_machine_solana_outbox_entries",
+    });
+    let operation_id =
+        bloom_tools::sha256_hex(&serde_jcs::to_vec(&intent).map_err(|error| error.to_string())?);
+    let correlation_id = format!("{operation_id}:{}", audit.sequence() + 1);
+    audit
+        .append(AuditRecord {
+            ts_ms: 0,
+            kind: "machine.effect.intent".into(),
+            wallet: None,
+            chain: None,
+            data: serde_json::json!({
+                "operation_id": operation_id,
+                "correlation_id": correlation_id,
+                "details": intent,
+            }),
+            prev: String::new(),
+            digest: String::new(),
+        })
+        .map_err(|error| {
+            format!("Machine audit unavailable before Solana expiry sweep: {error}")
+        })?;
+    let swept = outbox.sweep_expired(now_ms, live_block_heights);
+    let result = match &swept {
+        Ok(count) => serde_json::json!({"outcome": "completed", "swept": count}),
+        Err(error) => serde_json::json!({"outcome": "error", "error": error.to_string()}),
+    };
+    audit
+        .append(AuditRecord {
+            ts_ms: 0,
+            kind: "machine.effect.result".into(),
+            wallet: None,
+            chain: None,
+            data: serde_json::json!({
+                "operation": "solana_tx.outbox.sweep_expired",
+                "correlation_id": correlation_id,
+                "result": result,
+            }),
+            prev: String::new(),
+            digest: String::new(),
+        })
+        .map_err(|error| format!("Machine audit unavailable after Solana expiry sweep: {error}"))?;
     swept.map_err(|error| error.to_string())
 }
 
@@ -4310,6 +4535,18 @@ mod tests {
     use bloom_vfs::VfsPath;
     use bloom_vfs::handler::Handler;
     use bloom_vfs::handler::{Entry, HandlerError};
+
+    #[cfg(feature = "mount")]
+    #[test]
+    fn mount_uses_the_configured_nfs_listener() {
+        let mut config = Config::local_default();
+        config.nfs_listen_addr = "127.0.0.1:23456".to_owned();
+        let mount = configured_mount(&config, std::path::Path::new("/tmp/bloom-mount")).unwrap();
+        assert_eq!(mount.nfs_listen, "127.0.0.1:23456".parse().unwrap());
+
+        config.nfs_listen_addr = "not-a-socket".to_owned();
+        assert!(configured_mount(&config, std::path::Path::new("/tmp/bloom-mount")).is_err());
+    }
 
     #[test]
     fn batch_approval_requirement_preserves_owner_launch_fields() {
@@ -5944,6 +6181,228 @@ mod tests {
             .expect("shutdown timed out");
     }
 
+    /// A minimal loopback JSON-RPC stub answering just enough Solana RPC
+    /// methods to exercise a real daemon boot: `getGenesisHash` and
+    /// `getSignatureStatuses` (so the spawned reconciler can mine whatever
+    /// signature it asks about — this stub answers "finalized" for any of
+    /// them, since the caller controls which signature is actually staged).
+    async fn spawn_solana_node_stub(genesis_hash: String) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let genesis_hash = genesis_hash.clone();
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = vec![0u8; 8192];
+                    let n = socket.read(&mut buf).await.unwrap_or(0);
+                    let request = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let req_body = request.split("\r\n\r\n").nth(1).unwrap_or_default();
+                    let method = serde_json::from_str::<serde_json::Value>(req_body)
+                        .ok()
+                        .and_then(|v| v.get("method").and_then(|m| m.as_str()).map(String::from))
+                        .unwrap_or_default();
+                    let body = match method.as_str() {
+                        "getGenesisHash" => {
+                            format!(r#"{{"jsonrpc":"2.0","id":1,"result":"{genesis_hash}"}}"#)
+                        }
+                        "getSignatureStatuses" => r#"{"jsonrpc":"2.0","id":1,"result":{"context":{"slot":5},"value":[{"slot":5,"confirmations":null,"err":null,"confirmationStatus":"finalized"}]}}"#.to_string(),
+                        _ => r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"method not found"}}"#.to_string(),
+                    };
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        format!("http://{addr}/")
+    }
+
+    struct DaemonTestBroker;
+    impl bloom_broker_api::MachineBrokerService for DaemonTestBroker {
+        fn dispatch<'a>(
+            &'a self,
+            request: bloom_broker_api::MachineBrokerRequest,
+        ) -> bloom_broker_api::ServiceFuture<'a, bloom_broker_api::MachineBrokerResponse> {
+            Box::pin(async move {
+                Err(bloom_broker_api::ProtocolError::new(
+                    bloom_broker_api::ProtocolErrorCode::UnknownMethod,
+                    format!("unhandled {request:?}"),
+                ))
+            })
+        }
+    }
+
+    /// A provenance catalog authorizing both the EVM triad-signing seam
+    /// (`transaction.confirm`, required unconditionally whenever a broker +
+    /// catalog are supplied — see `from_home_inner`) and the Solana one
+    /// (`solana.transfer.confirm`), so `from_home_with_permit_and_broker`
+    /// actually reaches the Solana engine/reconciler construction path.
+    fn solana_and_evm_catalog() -> bloom_broker_api::ProvenanceCatalog {
+        bloom_broker_api::ProvenanceCatalog {
+            schema: bloom_broker_api::PROVENANCE_CATALOG_SCHEMA.into(),
+            records: vec![
+                bloom_broker_api::ProvenanceRecord {
+                    subject: bloom_broker_api::ProvenanceSubject::System {
+                        component_id: bloom_broker_api::Token::new("bloom-machine").unwrap(),
+                        operation_class: bloom_broker_api::Token::new("transaction.confirm")
+                            .unwrap(),
+                    },
+                    publisher: bloom_broker_api::Token::new("bloom-installer").unwrap(),
+                    petal_lineage: None,
+                    operation_classes: vec![bloom_broker_api::ProvenanceOperationClass {
+                        operation_class: bloom_broker_api::Token::new("transaction.confirm")
+                            .unwrap(),
+                        fee_asset: Some(bloom_broker_api::ProvenanceFeeAsset {
+                            chain: bloom_broker_api::Token::new("ethereum").unwrap(),
+                            asset: "native".into(),
+                        }),
+                    }],
+                    installer_key_id: bloom_broker_api::Token::new("installer-key").unwrap(),
+                    installer_signature: bloom_broker_api::Base64UrlBytes::from_bytes(&[11; 64]),
+                },
+                bloom_broker_api::ProvenanceRecord {
+                    subject: bloom_broker_api::ProvenanceSubject::System {
+                        component_id: bloom_broker_api::Token::new("bloom-machine").unwrap(),
+                        operation_class: bloom_broker_api::Token::new("solana.transfer.confirm")
+                            .unwrap(),
+                    },
+                    publisher: bloom_broker_api::Token::new("bloom-installer").unwrap(),
+                    petal_lineage: None,
+                    operation_classes: vec![bloom_broker_api::ProvenanceOperationClass {
+                        operation_class: bloom_broker_api::Token::new("solana.native-transfer")
+                            .unwrap(),
+                        fee_asset: Some(bloom_broker_api::ProvenanceFeeAsset {
+                            chain: bloom_broker_api::Token::new("solana").unwrap(),
+                            asset: "native".into(),
+                        }),
+                    }],
+                    installer_key_id: bloom_broker_api::Token::new("installer-key").unwrap(),
+                    installer_signature: bloom_broker_api::Base64UrlBytes::from_bytes(&[11; 64]),
+                },
+            ],
+        }
+    }
+
+    // Fix B (PLAN-SOLANA-PR-FIXES.md): SolanaReconciler is built and
+    // unit-tested in `bloom-solana-tx` but was never constructed or spawned
+    // by `bloom-daemon` — a broadcast Solana transfer's `receipt.json` never
+    // populated. This is a daemon-level test, not a direct
+    // `SolanaReconciler` invocation: it boots a real `Daemon` and asserts on
+    // the effect the *running daemon* produces on disk.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn daemon_spawns_solana_reconciler_and_it_populates_receipt_json() {
+        // A real 32-byte base58 genesis hash: config validation rejects a
+        // broadcast-enabled pin that cannot decode to 32 bytes.
+        let genesis_hash = bloom_proto::SOLANA_MAINNET_BETA_GENESIS_HASH.to_string();
+        let signature = "sig-0001".to_string();
+        let rpc_endpoint = spawn_solana_node_stub(genesis_hash.clone()).await;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = HomeDir::at(tmp.path());
+        home.ensure().unwrap();
+        let config_toml = format!(
+            r#"
+default_chain = "ethereum"
+
+[chains.ethereum]
+name = "ethereum"
+chain_id = 31337
+rpc_urls = ["http://127.0.0.1:1"]
+native_symbol = "ETH"
+native_decimals = 18
+
+[solana_chains.solana-devnet]
+name = "solana-devnet"
+allow_broadcast = true
+expected_genesis_base58 = "{genesis_hash}"
+[[solana_chains.solana-devnet.endpoints]]
+url = "{rpc_endpoint}"
+weight = 100
+"#
+        );
+        std::fs::write(home.config_path(), config_toml).unwrap();
+
+        // Seed a broadcast-but-unreconciled entry directly in the outbox
+        // the daemon's Solana engine (and reconciler) will be constructed
+        // over — written *before* boot so it's already there for the
+        // reconciler's first tick (which, per `tokio::time::interval`
+        // semantics, fires immediately on spawn, not after the interval).
+        let outbox = bloom_solana_tx::outbox::SolanaOutbox::new(home.solana_outbox_dir()).unwrap();
+        let staged = bloom_solana_tx::types::StagedSolanaTransfer {
+            id: "0001-00001".into(),
+            wallet: "alice".into(),
+            chain: "solana-devnet".into(),
+            fee_payer: "FEEPAYER111111111111111111111111111111111".into(),
+            account_fingerprint: None,
+            account_derivation_path: None,
+            destination: "DEST111111111111111111111111111111111111111".into(),
+            lamports: 1_000_000,
+            fee_lamports: 5_000,
+            genesis_hash,
+            blockhash: "BLOCKHASH111111111111111111111111111111111111".into(),
+            last_valid_block_height: 100,
+            message_b64: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, b"m"),
+            payload_digest_hex: "ab".repeat(32),
+            signature: None,
+            created_ms: 1,
+            expires_ms: 0,
+            status: bloom_solana_tx::types::SolanaTxStatus::Pending,
+            action_id: None,
+        };
+        outbox.write_pending(&staged, "plan").unwrap();
+        let entry = outbox
+            .record_signature("alice", "solana-devnet", &staged.id, &signature)
+            .unwrap();
+        outbox
+            .write_broadcast_attempt(&entry, &signature, b"raw", 1)
+            .unwrap();
+        outbox
+            .transition(&entry, bloom_solana_tx::outbox::SolanaOutboxState::Sent)
+            .unwrap();
+
+        let permit = Arc::new(HomeWritePermit::acquire(&home).unwrap());
+        let broker = MachineBrokerClient::new(Arc::new(DaemonTestBroker));
+        let daemon = Daemon::from_home_with_permit_and_broker(
+            home.clone(),
+            permit,
+            broker,
+            solana_and_evm_catalog(),
+        )
+        .expect("daemon boots");
+
+        let receipt_path = home
+            .solana_outbox_dir()
+            .join("alice")
+            .join("solana-devnet")
+            .join("sent")
+            .join(&staged.id)
+            .join("receipt.json");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !receipt_path.exists() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            receipt_path.exists(),
+            "the running daemon's spawned SolanaReconciler must write receipt.json \
+             for a broadcast, unreconciled transfer — not just a directly-invoked one"
+        );
+        let receipt: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&receipt_path).unwrap()).unwrap();
+        assert_eq!(receipt["outcome"], "success");
+        assert_eq!(receipt["signature"], signature);
+
+        tokio::time::timeout(Duration::from_secs(2), daemon.shutdown())
+            .await
+            .expect("shutdown timed out");
+    }
+
     #[test]
     fn daemon_boots_without_mempool_config() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -6215,6 +6674,71 @@ ws_url = "wss://example.invalid"
         tokio::time::timeout(std::time::Duration::from_secs(2), tasks.shutdown())
             .await
             .expect("background task did not honour shutdown signal");
+    }
+
+    // Fix D (PLAN-SOLANA-PR-FIXES.md): the periodic sweep task only ever
+    // knew about the EVM outbox — `solana_engines`' outbox root was never
+    // passed to it at all, so even a correctly-set Solana expiry wouldn't
+    // get swept. Same pattern as `sweep_background_task_handles_shutdown`
+    // above: call the sweep function directly rather than waiting on the
+    // real 60s tick, but exercise the exact outbox root
+    // `spawn_background_tasks` itself constructs (`home.outbox_dir()`).
+    #[tokio::test]
+    async fn solana_sweep_reaps_an_expired_staged_transfer() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = HomeDir::at(dir.path());
+        let d = Daemon::from_home(home.clone()).unwrap();
+
+        let solana_outbox =
+            bloom_solana_tx::outbox::SolanaOutbox::new(home.solana_outbox_dir()).unwrap();
+        let staged = bloom_solana_tx::types::StagedSolanaTransfer {
+            id: "0001-test".into(),
+            wallet: "alice".into(),
+            chain: "solana-devnet".into(),
+            fee_payer: "FEEPAYER111111111111111111111111111111111".into(),
+            account_fingerprint: None,
+            account_derivation_path: None,
+            destination: "DEST111111111111111111111111111111111111111".into(),
+            lamports: 1_000_000,
+            fee_lamports: 5_000,
+            genesis_hash: "GENESIS111111111111111111111111111111111111".into(),
+            blockhash: "BLOCKHASH111111111111111111111111111111111111".into(),
+            last_valid_block_height: 100,
+            message_b64: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, b"m"),
+            payload_digest_hex: "ab".repeat(32),
+            signature: None,
+            created_ms: 0,
+            expires_ms: 1,
+            status: bloom_solana_tx::types::SolanaTxStatus::Pending,
+            action_id: None,
+        };
+        solana_outbox.write_pending(&staged, "plan").unwrap();
+
+        let n = run_solana_expiry_sweep_once(
+            &solana_outbox,
+            &d.audit,
+            2,
+            &std::collections::HashMap::from([("solana-devnet".to_string(), 101_u64)]),
+        )
+        .unwrap();
+        assert_eq!(n, 1, "an abandoned, expired Solana stage must be reaped");
+        let records = d.audit.tail(2).unwrap();
+        assert_eq!(records[0].kind, "machine.effect.intent");
+        assert_eq!(
+            records[0].data["details"]["operation"],
+            "solana_tx.outbox.sweep_expired"
+        );
+        assert_eq!(records[1].kind, "machine.effect.result");
+        assert_eq!(records[1].data["result"]["swept"], 1);
+
+        solana_outbox
+            .read_in_state(
+                "alice",
+                "solana-devnet",
+                &staged.id,
+                bloom_solana_tx::outbox::SolanaOutboxState::Failed,
+            )
+            .expect("swept entry moves to failed");
     }
 
     #[test]

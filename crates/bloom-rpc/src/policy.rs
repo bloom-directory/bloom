@@ -6,13 +6,18 @@
 //! vendor-specific patterns alloy doesn't already match (Alchemy
 //! "exceeded its compute units", "over rate limit", "capacity"
 //! responses) plus the HTTP 408/502/504 set that surfaces from flaky
-//! frontends. Deterministic JSON-RPC errors like "method not supported"
-//! are explicitly NOT retried — pinned by a unit test below.
+//! frontends — sourced from [`bloom_rpc_common::retry`], the same
+//! chain-neutral rule table `bloom-solana`'s transport classifies
+//! against, so the two transports can't drift apart (Fix H,
+//! PLAN-SOLANA-PR-FIXES.md). Deterministic JSON-RPC errors like "method
+//! not supported" are explicitly NOT retried — pinned by a unit test
+//! below.
 
 use std::time::Duration;
 
 use alloy::transports::TransportError;
 use alloy::transports::layers::{RateLimitRetryPolicy, RetryPolicy};
+use bloom_rpc_common::retry::{RetrySignal, should_retry as shared_should_retry};
 
 /// Bloom's retry policy. Composes alloy's default with extra
 /// detection rules; the alloy policy still runs as the fallback so any
@@ -39,34 +44,28 @@ impl RetryPolicy for BloomRetryPolicy {
     }
 }
 
-/// Returns true if the error matches one of Bloom's extra retry rules
-/// (anything alloy's default `RateLimitRetryPolicy` already handles is
-/// out of scope here — `should_retry` consults the inner policy first).
+/// Returns true if the error matches one of the shared retry rules.
+/// Overlaps with what alloy's default `RateLimitRetryPolicy` already
+/// handles (429/503, -32005/-32007, "rate limited ...") are harmless —
+/// `should_retry` consults the inner policy first, this is the fallback —
+/// and keeping the full shared table here (rather than only the subset
+/// alloy doesn't cover) is exactly what keeps this in lockstep with
+/// `bloom-solana`'s classification instead of two hand-maintained lists.
 fn matches_extended_rule(error: &TransportError) -> bool {
     use alloy::transports::TransportErrorKind;
 
-    if let TransportError::Transport(TransportErrorKind::HttpError(http)) = error {
-        // 408 Request Timeout, 502 Bad Gateway, 504 Gateway Timeout —
-        // alloy retries 429 and 503 already. Public RPC frontends
-        // (Cloudflare-shaped infra) routinely surface the rest under
-        // load and they are safe to retry.
-        if matches!(http.status, 408 | 502 | 504) {
-            return true;
-        }
+    if let TransportError::Transport(TransportErrorKind::HttpError(http)) = error
+        && shared_should_retry(RetrySignal::HttpStatus(http.status))
+    {
+        return true;
     }
-    if let TransportError::ErrorResp(payload) = error {
-        let msg = &payload.message;
-        // Alchemy free-tier compute-unit cap. Distinct from -32005
-        // because it surfaces as a generic JSON-RPC error with status
-        // 200; alloy treats it as terminal.
-        if msg.contains("exceeded its compute units") {
-            return true;
-        }
-        // Some public endpoints surface throughput rejection with these
-        // free-form strings rather than a coded error.
-        if msg.contains("over rate limit") || msg.contains("capacity") {
-            return true;
-        }
+    if let TransportError::ErrorResp(payload) = error
+        && shared_should_retry(RetrySignal::RpcError {
+            code: payload.code,
+            message: &payload.message,
+        })
+    {
+        return true;
     }
     false
 }

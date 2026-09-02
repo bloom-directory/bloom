@@ -1,8 +1,9 @@
 # Working with bloom
 
-bloom exposes Ethereum workflows as a virtual filesystem. Prefer inspecting the
-mounted tree with normal filesystem tools. Run commands from the mount root
-(the directory containing this file) so examples can use relative paths.
+bloom exposes chain workflows — EVM and Solana — as a virtual filesystem.
+Prefer inspecting the mounted tree with normal filesystem tools. Run
+commands from the mount root (the directory containing this file) so
+examples can use relative paths.
 
 Useful commands:
 
@@ -28,9 +29,9 @@ bloom gatekeeps every value-moving action through capabilities:
 - **Automated action uses a capability.** Create a bounded session/capability
   first — the human approves the bounds once, then the agent operates inside
   them without re-prompting until expiry, breach, or revocation.
-- **The owner key is never handed off.** EVM and installed-Petal authority is
-  prepared by Broker and signed only by Signer; Machine never receives the
-  private key.
+- **The owner key is never handed off.** EVM, Solana, and installed-Petal
+  authority is prepared by Broker and signed only by Signer; Machine never
+  receives the private key.
 
 To see what a wallet can do without a human, check its per-chain state, outbox,
 and the mounted capability views of installed Petals.
@@ -55,6 +56,52 @@ passphrase-protected mnemonics are unsupported. BIP-39 import creates the
 canonical EVM account. Additional account allocation exposed by Machine is
 currently limited to Solana children until EVM transaction surfaces carry an
 explicit selector.
+
+A wallet's chains are listed at `wallets/<wallet>/chains` and include both
+EVM chains and any configured Solana chains — `ls wallets/<wallet>/chains`
+enumerates both together. Solana chains route through the exact same
+`wallets/<wallet>/chains/<chain>/outbox/...` route family described below
+(stage at `outbox/new.tx`, confirm/cancel under `outbox/pending/<id>/`,
+inspect `outbox/{pending,sent,failed}/<id>/`) — there is no separate
+Solana-specific surface to look for.
+
+### Reading Solana balances
+
+A Solana chain directory exposes an account-addressed surface:
+
+```sh
+ls  wallets/<wallet>/chains/<solana-chain>/accounts/       # one dir per active child
+cat wallets/<wallet>/chains/<solana-chain>/accounts/<fingerprint>/address
+cat wallets/<wallet>/chains/<solana-chain>/accounts/<fingerprint>/balance
+```
+
+Directory names are the **full** lowercase account fingerprint. A unique
+prefix is accepted when staging a transfer (`account_fingerprint` in
+`new.tx`), but not as a path — a prefix that is unique today stops being
+unique when another account is allocated.
+
+`chains/<chain>/balance`, `balance.raw` and `balance.json` are shortcuts for
+a wallet with exactly one active Solana account. On a wallet with several
+they fail and list the canonical `accounts/<fingerprint>/` paths; Bloom will
+not pick an account for you, because spending from the wrong one is not
+recoverable.
+
+Listing accounts, stat-ing any leaf, and reading `address` need only Bloom's
+own projection, so they keep working when a Solana node is unreachable. Only
+`balance*` contacts the chain. If a balance read fails but `address` still
+works, the account is fine and the cluster is not.
+
+Chain health lives once per chain, not per wallet:
+
+```sh
+cat status/chains/<solana-chain>/status.json   # health, slot, genesis, broadcast posture
+cat status/chains/<solana-chain>/connected
+```
+
+`status.json` still renders when calls fail — the failed fields are `null`
+and `errors` says why. `broadcast.eligible` means an attempt is *permitted*
+(broadcast enabled, genesis verified on every endpoint); it does not promise
+a transaction will land.
 
 ## Creating a wallet (asynchronous passkey registration)
 
@@ -113,6 +160,18 @@ printf 'confirm\n' > wallets/<wallet>/chains/<chain>/outbox/pending/<id>/confirm
 # 3. Read the challenge from the same central action directory.
 cat outbox/pending/<action_id>/approval_challenge.json
 ```
+
+For a native Solana transfer, the challenge is projected beside the pending
+wallet transfer instead:
+
+```sh
+cat wallets/<wallet>/chains/<solana-chain>/outbox/pending/<id>/approval_challenge.json
+printf 'confirm\n' > wallets/<wallet>/chains/<solana-chain>/outbox/pending/<id>/confirm
+```
+
+Use the challenge's `retry_path` verbatim after the owner completes its
+`ceremony_url`; verify `tx_id`, `wallet`, `chain`, amount, destination, and
+`expiry_ms` first.
 
 Before opening the ceremony, verify that `approval_challenge.json` has the same
 `action_id` as the directory you are acting on and that `expiry_ms` is still in

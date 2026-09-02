@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::chain::ChainSpec;
+use crate::chain::SolanaSpec;
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
@@ -40,6 +41,9 @@ pub struct Config {
     /// Map of chain name -> spec.
     #[serde(default)]
     pub chains: BTreeMap<String, ChainSpec>,
+    /// Map of Solana chain name -> spec.
+    #[serde(default)]
+    pub solana_chains: BTreeMap<String, SolanaSpec>,
     #[serde(default)]
     pub etherscan: Option<EtherscanConfig>,
     #[serde(default)]
@@ -410,6 +414,7 @@ impl Config {
             default_chain: default_chain_name(),
             stage_ttl: default_stage_ttl(),
             chains,
+            solana_chains: BTreeMap::new(),
             etherscan: None,
             enso: None,
             petals: PetalsConfig::default(),
@@ -507,6 +512,64 @@ impl Config {
                     "chain '{}' has no rpc_urls or rpc_endpoints",
                     k
                 )));
+            }
+        }
+        // A name configured in both `chains` (EVM) and `solana_chains` is
+        // ambiguous: per the wallets VFS dispatch order (Solana checked
+        // first), it would silently make the EVM chain of that name
+        // completely unreachable, with no error anywhere else.
+        for name in self.solana_chains.keys() {
+            if self.chains.contains_key(name) {
+                return Err(ConfigError::Invalid(format!(
+                    "chain name '{name}' is configured in both chains and solana_chains"
+                )));
+            }
+        }
+        // The Solana read registry, transfer engines, and outbox entries all
+        // key a chain by its map entry, while the runtime registry is keyed
+        // by `spec.name`; and the HTTP-only read client silently skips
+        // non-HTTP endpoints. Accepting a drifted or endpoint-less spec here
+        // would postpone the failure to a degraded or split runtime surface,
+        // so every entry must be coherent at load time.
+        for (key, spec) in &self.solana_chains {
+            if key != &spec.name {
+                return Err(ConfigError::Invalid(format!(
+                    "solana_chains key '{key}' != name '{}': reads and transfers would split \
+                     one configured chain across two namespaces",
+                    spec.name
+                )));
+            }
+            if spec.endpoints.is_empty() {
+                return Err(ConfigError::Invalid(format!(
+                    "solana chain '{key}' has no endpoints"
+                )));
+            }
+            for endpoint in &spec.endpoints {
+                let Some((scheme, _)) = endpoint.url.split_once("://") else {
+                    return Err(ConfigError::Invalid(format!(
+                        "solana chain '{key}' endpoint '{}' has no URL scheme",
+                        endpoint.url
+                    )));
+                };
+                if !matches!(scheme, "http" | "https") {
+                    return Err(ConfigError::Invalid(format!(
+                        "solana chain '{key}' endpoint scheme '{scheme}' is not supported: the \
+                         Solana read client speaks http(s) only",
+                    )));
+                }
+            }
+            if spec.allow_broadcast {
+                let pin = spec.expected_genesis_base58.as_deref().unwrap_or("");
+                let valid_pin = !pin.is_empty()
+                    && bs58::decode(pin)
+                        .into_vec()
+                        .is_ok_and(|bytes| bytes.len() == 32);
+                if !valid_pin {
+                    return Err(ConfigError::Invalid(format!(
+                        "solana chain '{key}' enables broadcast without a valid 32-byte base58 \
+                         expected_genesis_base58 pin",
+                    )));
+                }
             }
         }
         for (app_name, app) in &self.petals.runtime {
@@ -611,7 +674,18 @@ fn validate_petal_endpoint_origin(origin: &str) -> Result<(), ConfigError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chain::EndpointSpec;
     use tempfile::tempdir;
+
+    fn http_endpoint() -> EndpointSpec {
+        EndpointSpec {
+            url: "http://127.0.0.1:8899".into(),
+            weight: 1,
+            cu_per_sec: None,
+            max_rps: None,
+            http_only: false,
+        }
+    }
 
     fn assert_configs_equivalent(a: &Config, b: &Config) {
         // Config doesn't derive PartialEq (chains has custom inner types
@@ -665,6 +739,150 @@ mod tests {
     #[test]
     fn local_default_validates() {
         Config::local_default().validate().unwrap();
+    }
+
+    // Fix G (PLAN-SOLANA-PR-FIXES.md): a name configured in both `chains`
+    // and `solana_chains` silently made the EVM chain of that name
+    // unreachable (Solana is checked first in the wallets VFS dispatch
+    // order), with no error at config load and no error at runtime.
+    #[test]
+    fn colliding_solana_and_evm_chain_names_are_refused() {
+        let mut cfg = Config::local_default();
+        assert!(
+            cfg.chains.contains_key("ethereum"),
+            "test assumes the default config has an 'ethereum' EVM chain"
+        );
+        cfg.solana_chains.insert(
+            "ethereum".into(),
+            SolanaSpec {
+                name: "ethereum".into(),
+                endpoints: vec![],
+                expected_genesis_base58: None,
+                allow_broadcast: false,
+            },
+        );
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("ethereum"),
+            "error should name the colliding chain: {err}"
+        );
+    }
+
+    #[test]
+    fn non_colliding_solana_chain_with_coherent_endpoints_validates() {
+        let mut cfg = Config::local_default();
+        cfg.solana_chains.insert(
+            "solana-devnet".into(),
+            SolanaSpec {
+                name: "solana-devnet".into(),
+                endpoints: vec![http_endpoint()],
+                expected_genesis_base58: None,
+                allow_broadcast: false,
+            },
+        );
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn solana_chain_key_and_name_must_agree() {
+        let mut cfg = Config::local_default();
+        cfg.solana_chains.insert(
+            "solana-devnet".into(),
+            SolanaSpec {
+                name: "solana-testnet".into(),
+                endpoints: vec![http_endpoint()],
+                expected_genesis_base58: None,
+                allow_broadcast: false,
+            },
+        );
+        let error = cfg.validate().unwrap_err().to_string();
+        assert!(
+            error.contains("solana_chains key 'solana-devnet' != name 'solana-testnet'"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn solana_chain_requires_at_least_one_http_endpoint() {
+        let mut cfg = Config::local_default();
+        cfg.solana_chains.insert(
+            "solana-devnet".into(),
+            SolanaSpec {
+                name: "solana-devnet".into(),
+                endpoints: vec![],
+                expected_genesis_base58: None,
+                allow_broadcast: false,
+            },
+        );
+        assert!(
+            cfg.validate()
+                .unwrap_err()
+                .to_string()
+                .contains("solana chain 'solana-devnet' has no endpoints")
+        );
+
+        // A WebSocket-only list is equally unusable: the read client speaks
+        // HTTP(S) and would silently skip every configured endpoint.
+        let mut cfg = Config::local_default();
+        cfg.solana_chains.insert(
+            "solana-devnet".into(),
+            SolanaSpec {
+                name: "solana-devnet".into(),
+                endpoints: vec![EndpointSpec {
+                    url: "ws://127.0.0.1:8900".into(),
+                    weight: 1,
+                    cu_per_sec: None,
+                    max_rps: None,
+                    http_only: false,
+                }],
+                expected_genesis_base58: None,
+                allow_broadcast: false,
+            },
+        );
+        assert!(
+            cfg.validate()
+                .unwrap_err()
+                .to_string()
+                .contains("endpoint scheme 'ws' is not supported")
+        );
+    }
+
+    #[test]
+    fn solana_broadcast_requires_a_valid_genesis_pin() {
+        let mut cfg = Config::local_default();
+        cfg.solana_chains.insert(
+            "solana-devnet".into(),
+            SolanaSpec {
+                name: "solana-devnet".into(),
+                endpoints: vec![http_endpoint()],
+                expected_genesis_base58: Some("not-base58-$$$".into()),
+                allow_broadcast: true,
+            },
+        );
+        assert!(
+            cfg.validate()
+                .unwrap_err()
+                .to_string()
+                .contains("enables broadcast without a valid 32-byte base58")
+        );
+
+        let mut cfg = Config::local_default();
+        cfg.solana_chains.insert(
+            "solana-devnet".into(),
+            SolanaSpec {
+                name: "solana-devnet".into(),
+                endpoints: vec![http_endpoint()],
+                // Valid base58, but not 32 bytes: not a genesis hash.
+                expected_genesis_base58: Some("abc".into()),
+                allow_broadcast: true,
+            },
+        );
+        assert!(
+            cfg.validate()
+                .unwrap_err()
+                .to_string()
+                .contains("enables broadcast without a valid 32-byte base58")
+        );
     }
 
     #[test]
@@ -989,6 +1207,29 @@ allow_broadcast = true
         assert!(!cfg.broadcast_permitted(&ethereum));
         ethereum.allow_broadcast = true;
         assert!(cfg.broadcast_permitted(&ethereum));
+    }
+
+    #[test]
+    fn solana_broadcast_accepts_pinned_mainnet_genesis() {
+        let mut cfg = Config::local_default();
+        cfg.solana_chains.insert(
+            "solana-mainnet".into(),
+            SolanaSpec {
+                name: "solana-mainnet".into(),
+                endpoints: vec![crate::EndpointSpec {
+                    url: "https://example.invalid".into(),
+                    weight: 100,
+                    cu_per_sec: None,
+                    max_rps: None,
+                    http_only: false,
+                }],
+                expected_genesis_base58: Some(
+                    crate::chain::SOLANA_MAINNET_BETA_GENESIS_HASH.into(),
+                ),
+                allow_broadcast: true,
+            },
+        );
+        cfg.validate().unwrap();
     }
 
     #[test]

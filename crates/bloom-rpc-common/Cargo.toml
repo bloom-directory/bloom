@@ -1,0 +1,13 @@
+[package]
+name = "bloom-rpc-common"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Chain-neutral RPC transport machinery (endpoint health) shared by bloom-rpc and bloom-solana"
+
+[dependencies]
+parking_lot.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
