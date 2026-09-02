@@ -232,6 +232,8 @@ done
 [ -n "$genesis" ] || die "validator did not become ready; see $validator_log"
 
 nfs_port="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')"
+machine_config="${machine_home}/config.toml"
+machine_config_new="${machine_config}.new.$$"
 {
   printf 'default_chain = "local-disabled"\n'
   printf 'nfs_listen_addr = "127.0.0.1:%s"\n' "$nfs_port"
@@ -251,8 +253,9 @@ nfs_port="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0
   printf 'endpoints = [{ url = "%s", weight = 100 }]\n' "$rpc_url"
   printf 'expected_genesis_base58 = "%s"\n' "$genesis"
   printf 'allow_broadcast = true\n'
-} >> "${machine_home}/config.toml"
-chmod 0600 "${machine_home}/config.toml"
+} > "$machine_config_new"
+chmod 0600 "$machine_config_new"
+mv -f "$machine_config_new" "$machine_config"
 
 solana-keygen new --no-bip39-passphrase --silent --outfile "$sweep_key" >/dev/null
 chmod 0600 "$sweep_key"

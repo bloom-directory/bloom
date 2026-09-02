@@ -190,6 +190,7 @@ printf '%s\n' 'Hyperliquid static checks passed; checking the Solana transfer ta
 # --- Solana transfer task -------------------------------------------------
 solana_task="${repo_root}/evals/harbor/tasks/solana-transfer"
 bash -n "${repo_root}/scripts/evals/run-harbor.sh"
+bash -n "${repo_root}/scripts/evals/run-harbor-solana-local.sh"
 bash -n "${solana_task}/tests/test.sh"
 
 python3 - <<SOLTOML
