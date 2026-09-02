@@ -93,6 +93,15 @@ validator ledger; no persistent policy or test balance remains to restore. On
 Linux it prompts for sudo once for the localhost NFS mount and keeps only that
 temporary sudo timestamp alive; it does not install a persistent sudoers rule.
 
+Run the deterministic isolated-triad check without an API key, Docker, or a
+Harbor installation:
+
+```bash
+scripts/evals/run-harbor-solana-local.sh smoke
+```
+
+Model trials additionally require Docker and `uv`:
+
 ```bash
 GLM_API_KEY="$GLM_API_KEY" scripts/evals/run-harbor-solana-local.sh
 ```

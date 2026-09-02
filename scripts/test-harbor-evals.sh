@@ -192,6 +192,7 @@ solana_task="${repo_root}/evals/harbor/tasks/solana-transfer"
 bash -n "${repo_root}/scripts/evals/run-harbor.sh"
 bash -n "${repo_root}/scripts/evals/run-harbor-solana-local.sh"
 bash -n "${solana_task}/tests/test.sh"
+PYTHONPATH="${repo_root}/evals/harbor" python3 -m harness --help >/dev/null
 
 # The isolated Broker and Signer PRs were rebased during development. Keep the
 # launcher pinned to their reviewed current heads rather than stale hashes that

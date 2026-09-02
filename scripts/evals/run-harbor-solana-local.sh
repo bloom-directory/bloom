@@ -63,10 +63,15 @@ if [ "$agent" = deepseek ] || [ "$agent" = opencode ]; then
     die "DeepSeek auth is missing; export DEEPSEEK_API_KEY"
 fi
 
-for command in cargo docker flock git jq mount.nfs4 mountpoint openssl python3 solana \
-  solana-keygen solana-test-validator ss sudo uv; do
+for command in cargo flock git jq mount.nfs4 mountpoint openssl python3 solana \
+  solana-keygen solana-test-validator ss sudo; do
   command -v "$command" >/dev/null 2>&1 || die "$command is required"
 done
+if [ "$agent" != smoke ]; then
+  for command in docker uv; do
+    command -v "$command" >/dev/null 2>&1 || die "$command is required for model trials"
+  done
+fi
 for path in "$launcher" "$broker_repo" "$signer_repo"; do
   [ -e "$path" ] || die "required path is missing: $path"
 done
