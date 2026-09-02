@@ -26,6 +26,7 @@ pub fn for_chain(chain_id: u64) -> &'static [KnownToken] {
         10 => OPTIMISM,
         42161 => ARBITRUM,
         137 => POLYGON,
+        4663 => ROBINHOOD,
         _ => &[],
     }
 }
@@ -158,6 +159,24 @@ const POLYGON: &[KnownToken] = &[
     },
 ];
 
+/// Robinhood Chain. USDG (Global Dollar) is the chain's dollar token; there is
+/// no canonical USDC deployment. Robinhood Stock Tokens are deliberately absent
+/// — there are 180 of them, they are issued and upgraded by Robinhood Assets
+/// (Jersey), and the authoritative symbol→address mapping is the issuer's live
+/// asset registry, not a table compiled into Bloom.
+const ROBINHOOD: &[KnownToken] = &[
+    KnownToken {
+        address: "0x5fc5360d0400a0fd4f2af552add042d716f1d168",
+        symbol: "USDG",
+        decimals: 6,
+    },
+    KnownToken {
+        address: "0x0bd7d308f8e1639fab988df18a8011f41eacad73",
+        symbol: "WETH",
+        decimals: 18,
+    },
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -174,6 +193,25 @@ mod tests {
         for chain in [1u64, 8453, 10, 42161, 137] {
             let t = resolve_symbol(chain, "usdc").expect("usdc present");
             assert_eq!(t.decimals, 6, "chain {chain}");
+        }
+    }
+
+    #[test]
+    fn robinhood_dollar_token_is_usdg_with_6_decimals() {
+        // Robinhood Chain has no canonical USDC; a caller that assumes one
+        // would send to an address that does not exist on 4663.
+        assert!(resolve_symbol(4663, "USDC").is_none());
+        let t = resolve_symbol(4663, "usdg").expect("robinhood usdg");
+        assert_eq!(t.address, "0x5fc5360d0400a0fd4f2af552add042d716f1d168");
+        assert_eq!(t.decimals, 6);
+    }
+
+    #[test]
+    fn robinhood_stock_tokens_are_not_statically_listed() {
+        // The issuer's registry is the only authority on which address is the
+        // real TSLA; a look-alike with the same ticker is not a Stock Token.
+        for symbol in ["TSLA", "AAPL", "NVDA", "SPY"] {
+            assert!(resolve_symbol(4663, symbol).is_none(), "{symbol}");
         }
     }
 
