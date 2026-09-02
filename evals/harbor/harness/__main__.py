@@ -8,7 +8,7 @@ import sys
 from collections.abc import Callable
 from pathlib import Path
 
-from .core import AGENTS, EvalDefinition, EvalError, run_eval
+from .core import AGENTS, AgentSpec, EvalDefinition, EvalError, run_eval
 from .hyperliquid_order_cancel import HyperliquidOrderCancelEval
 from .solana_transfer import SolanaTransferEval
 
@@ -40,6 +40,11 @@ def parser() -> argparse.ArgumentParser:
             "local files only (solana-transfer)"
         ),
     )
+    value.add_argument(
+        "--smoke-only",
+        action="store_true",
+        help="run the deterministic Solana lifecycle without an LLM or API key",
+    )
     return value
 
 
@@ -50,6 +55,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     definition = DEFINITIONS[args.eval](repo_root)
     try:
+        if args.preauthorization_only and args.smoke_only:
+            raise EvalError("choose only one of --preauthorization-only or --smoke-only")
         if args.preauthorization_only:
             if args.agent is not None:
                 raise EvalError(
@@ -57,6 +64,18 @@ def main(argv: list[str] | None = None) -> int:
                 )
             definition.preauthorization_preflight()
             print(f"Bloom Harbor preauthorization verified for {definition.name}")
+        elif args.smoke_only:
+            if args.agent is not None:
+                raise EvalError("--smoke-only does not accept an agent argument")
+            if not isinstance(definition, SolanaTransferEval):
+                raise EvalError("--smoke-only is supported only for solana-transfer")
+            run_eval(
+                definition,
+                "smoke",
+                harbor_runner=definition.run_smoke,
+                agent_spec=AgentSpec("smoke", "deterministic"),
+            )
+            print("Bloom Harbor deterministic Solana smoke passed")
         else:
             if args.agent is None:
                 raise EvalError(

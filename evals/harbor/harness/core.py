@@ -148,8 +148,9 @@ class MountedTree:
         returns. A zero exit code means accepted for dispatch, never completed.
         """
         writer = (
-            "import pathlib,sys; "
-            "pathlib.Path(sys.argv[1]).write_bytes(sys.stdin.buffer.read())"
+            "import os,sys; data=sys.stdin.buffer.read(); "
+            "f=open(sys.argv[1],'wb',buffering=0); "
+            "f.write(data); os.fsync(f.fileno()); f.close()"
         )
         try:
             return subprocess.run(
@@ -603,9 +604,10 @@ def run_eval(
     harbor_runner: HarborRunner = run_harbor_job,
     acquire_lock: bool = True,
     phase_timings: dict[str, float] | None = None,
+    agent_spec: AgentSpec | None = None,
 ) -> Any:
     """Execute one provisioned eval and guarantee outer cleanup."""
-    agent = _agent_spec(agent_name)
+    agent = agent_spec if agent_spec is not None else _agent_spec(agent_name)
     definition.lock_path.parent.mkdir(parents=True, exist_ok=True)
     timings = phase_timings if phase_timings is not None else {}
 

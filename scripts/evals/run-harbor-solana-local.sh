@@ -35,14 +35,14 @@ rpc_url="http://127.0.0.1:${rpc_port}"
 die() { printf 'Bloom Solana local eval: %s\n' "$*" >&2; exit 1; }
 usage() {
   printf '%s\n' \
-    'Usage: scripts/evals/run-harbor-solana-local.sh [glm|deepseek|codex|claude]' \
+    'Usage: scripts/evals/run-harbor-solana-local.sh [smoke|glm|deepseek|codex|claude]' \
     '' \
     'Defaults to GLM-5.2 and a dedicated solana-eval wallet. The first run' \
     'creates an isolated local-only triad; later runs safely reuse it.'
 }
 
 case "$agent" in
-  glm|deepseek|codex|claude) ;;
+  smoke|glm|deepseek|codex|claude) ;;
   -h|--help) usage; exit 0 ;;
   *) usage >&2; exit 2 ;;
 esac
@@ -355,6 +355,11 @@ export BLOOM_EVAL_SIGN_COUNT_FILE="$counter_file"
 export BLOOM_EVAL_JOBS_DIR="${run_root}/jobs"
 export UV_CACHE_DIR="${BLOOM_EVAL_UV_CACHE_DIR:-${run_root}/uv-cache}"
 
-printf 'Bloom Solana local eval: running Harbor with %s (%s)...\n' \
-  "$agent" "${BLOOM_EVAL_MODEL:-provider default}" >&2
-"${repo_root}/scripts/evals/run-harbor.sh" solana-transfer "$agent"
+if [ "$agent" = smoke ]; then
+  printf 'Bloom Solana local eval: running deterministic zero-token smoke...\n' >&2
+  "${repo_root}/scripts/evals/run-harbor.sh" solana-transfer --smoke-only
+else
+  printf 'Bloom Solana local eval: running Harbor with %s (%s)...\n' \
+    "$agent" "${BLOOM_EVAL_MODEL:-provider default}" >&2
+  "${repo_root}/scripts/evals/run-harbor.sh" solana-transfer "$agent"
+fi

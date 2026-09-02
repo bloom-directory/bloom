@@ -20,6 +20,7 @@ mainnet-canary` requires the authorization and the acknowledgement.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import os
@@ -27,12 +28,14 @@ import re
 import secrets
 import stat
 import subprocess
+import sys
 import threading
 import time
 import urllib.error
 import urllib.request
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 from .core import (
@@ -87,6 +90,7 @@ PENDING_DRAIN_ATTEMPTS = 30
 PENDING_DRAIN_DELAY_SECONDS = 2.0
 RECEIPT_SETTLE_ATTEMPTS = 45
 RECEIPT_SETTLE_DELAY_SECONDS = 2.0
+SMOKE_CONFIRM_BUDGET_SECONDS = 45.0
 
 
 def trial_amount(base_lamports: int, trial_id: str) -> int:
@@ -118,9 +122,9 @@ class SolanaTransferEval(EvalDefinition):
         )
         self.authorization_path = Path(self.authorization_value)
         self.machine_binary = Path(self.env.get("BLOOM_EVAL_SOLANA_MACHINE_BINARY", ""))
-        # The Machine's home root, on the host filesystem. The Solana outbox
-        # keeps a private `approval.json` beside each staged entry that the
-        # mount deliberately does not project, so the approver reads it here.
+        # The Machine's home root, on the host filesystem. The approver reads
+        # the canonical approval challenge here so its decision is unaffected
+        # by mount latency or a projection changing during a read.
         self.home_root = Path(self.env.get("BLOOM_EVAL_SOLANA_HOME_ROOT", ""))
         self.solana_cli = self.env.get("BLOOM_EVAL_SOLANA_CLI", "solana")
         self.sweep_keypair = Path(
@@ -515,12 +519,14 @@ class SolanaTransferEval(EvalDefinition):
             if ADDRESS.fullmatch(self.destination) is None:
                 raise EvalError("BLOOM_EVAL_SOLANA_DESTINATION must be a base58 address")
 
-        # The approver reads the private `approval.json` the confirm route
-        # stages, which the mount deliberately does not project.
+        # The approver reads the canonical host-side approval challenge the
+        # confirm route stages. Current outboxes also project a sanitized copy
+        # to the owner filesystem; the host copy remains the stable boundary
+        # for matching the exact authorized intent before approval.
         if not str(self.home_root):
             raise EvalError(
-                "BLOOM_EVAL_SOLANA_HOME_ROOT is required: the Solana confirm "
-                "ceremony is published only as a private host-side artifact"
+                "BLOOM_EVAL_SOLANA_HOME_ROOT is required so the host approver "
+                "can read stable outbox state"
             )
         if not self.home_root.is_dir():
             raise EvalError(f"Machine home root is not a directory: {self.home_root}")
@@ -582,15 +588,12 @@ class SolanaTransferEval(EvalDefinition):
     def _pending_confirm_ceremony(self, pending_id: str) -> str | None:
         """The ceremony URL staged by a failed confirm, if one is published.
 
-        Unlike the EVM outbox, the Solana outbox publishes no `ceremony.json`
-        through the mount: on `ApprovalRequired` the confirm route writes a
-        private `approval.json` beside the staged entry and returns a bare
-        permission error carrying no URL. That is deliberate -- the agent has
-        no business holding an owner ceremony URL -- so the host reads the
-        private file directly from the Machine's state directory instead.
+        Current Solana outboxes publish `approval_challenge.json` as the
+        canonical resume projection. Read the host-side copy rather than the
+        mount so approval matching cannot be delayed or confused by NFS.
         """
         approval = self._read_host_json(
-            self._host_entry("pending", pending_id) / "approval.json"
+            self._host_entry("pending", pending_id) / "approval_challenge.json"
         )
         if not isinstance(approval, dict):
             return None
@@ -602,7 +605,7 @@ class SolanaTransferEval(EvalDefinition):
         return url
 
     def _read_host_json(self, path: Path) -> Any | None:
-        """Read a private host-side artifact, or None when it does not exist."""
+        """Read a host-side outbox artifact, or None when it does not exist."""
         try:
             raw = path.read_bytes()
         except FileNotFoundError:
@@ -887,6 +890,153 @@ class SolanaTransferEval(EvalDefinition):
             mounts=mounts,
             agent_env=runtime_env,
             verifier_env=verifier_env,
+        )
+
+    async def run_smoke(self, context: EvalRunContext, _agent: Any) -> Any:
+        """Exercise the real mounted lifecycle without invoking an LLM.
+
+        This is intentionally inside the normal preflight/provision/cleanup
+        envelope. A pass proves the mount, route writes, approval watcher,
+        ceremony, broadcast, reconciliation, verifier, and sweep all agree.
+        """
+        staged = json.dumps(
+            {"destination": self.destination, "lamports": self.lamports},
+            separators=(",", ":"),
+        ).encode()
+        created = self.mount.write_route(
+            self.outbox_root / "new.tx", staged, ROUTE_WRITE_TIMEOUT_SECONDS
+        )
+        if created.returncode != 0:
+            raise EvalError(
+                "smoke could not stage new.tx: "
+                + (created.stderr or created.stdout).decode(errors="replace").strip()
+            )
+        if not self.mount.poll_until(
+            lambda: len(self._list_state("pending")) == 1, 20, 0.25
+        ):
+            raise EvalError("smoke stage did not create exactly one pending entry")
+        pending_id = self._list_state("pending")[0]
+        entry = self.outbox_root / "pending" / pending_id
+        intent = self.mount.read_json(entry / "intent.json")
+        if not isinstance(intent, dict) or not self._ceremony_matches_authorized_transfer(
+            pending_id
+        ):
+            raise EvalError("smoke staged intent does not match the authorized transfer")
+        try:
+            plan = subprocess.run(
+                ["cat", str(entry / "plan.md")],
+                check=True,
+                capture_output=True,
+                timeout=CHAIN_READ_TIMEOUT_SECONDS,
+            )
+        except (OSError, subprocess.SubprocessError) as error:
+            raise EvalError(f"smoke could not read plan.md: {error}") from error
+        if not plan.stdout.strip():
+            raise EvalError("smoke plan.md is empty")
+
+        first = self.mount.write_route(
+            entry / "confirm", b"y", ROUTE_WRITE_TIMEOUT_SECONDS
+        )
+        if first.returncode == 0:
+            raise EvalError("smoke first confirm bypassed the approval boundary")
+        if not self.mount.poll_until(
+            lambda: self._pending_confirm_ceremony(pending_id) is not None, 20, 0.25
+        ):
+            raise EvalError("smoke confirm did not publish approval_challenge.json")
+
+        deadline = time.monotonic() + SMOKE_CONFIRM_BUDGET_SECONDS
+        confirmed = False
+        while time.monotonic() < deadline:
+            attempt = self.mount.write_route(
+                entry / "confirm", b"y", ROUTE_WRITE_TIMEOUT_SECONDS
+            )
+            if attempt.returncode == 0:
+                confirmed = True
+                break
+            if self._approver_error is not None:
+                raise EvalError(f"smoke approver failed: {self._approver_error}")
+            await asyncio.sleep(0.5)
+        if not confirmed:
+            raise EvalError("smoke confirm did not succeed before the blockhash deadline")
+        if not self.mount.poll_until(
+            lambda: pending_id in self._list_state("sent"), 30, 0.5
+        ):
+            raise EvalError("smoke confirmed entry did not move to outbox/sent")
+
+        sent = self.outbox_root / "sent" / pending_id
+        attempted = self.mount.read_json(sent / "broadcast_attempted.json")
+        if not isinstance(attempted, dict):
+            raise EvalError("smoke broadcast_attempted.json is malformed")
+        for field in ("fee_payer", "destination", "lamports", "blockhash"):
+            if attempted.get(field) != intent.get(field):
+                raise EvalError(
+                    f"smoke broadcast attempt disagrees with staged intent on {field}"
+                )
+        receipt: Any = None
+
+        def receipt_finalized() -> bool:
+            nonlocal receipt
+            receipt = self.mount.read_json_if_listed(
+                sent / "receipt.json", sent, "receipt.json"
+            )
+            return (
+                isinstance(receipt, dict)
+                and receipt.get("outcome") == "success"
+                and receipt.get("confirmation_status") == "finalized"
+            )
+
+        if not self.mount.poll_until(receipt_finalized, 45, 1.0):
+            raise EvalError("smoke receipt did not reconcile to success/finalized")
+        assert isinstance(receipt, dict)
+        if receipt.get("signature") != attempted.get("signature"):
+            raise EvalError("smoke receipt signature differs from broadcast attempt")
+        report = {
+            "schema": "bloom.eval.solana_transfer.v1",
+            "status": "complete",
+            "network": self.network,
+            "chain": self.chain,
+            "wallet_id": self.wallet_id,
+            "source_address": self.source_address,
+            "key_fingerprint": self.key_fingerprint,
+            "derivation_path": self.derivation_path,
+            "destination": self.destination,
+            "lamports": self.lamports,
+            "fee_lamports": intent.get("fee_lamports"),
+            "blockhash": intent.get("blockhash"),
+            "pending_id": pending_id,
+            "signature": receipt.get("signature"),
+            "slot": receipt.get("slot"),
+            "confirmation_status": receipt.get("confirmation_status"),
+            "outcome": receipt.get("outcome"),
+            "pending_entries_after": len(self._list_state("pending")),
+            "confirm_failed_before_approval": True,
+        }
+        report_path = context.jobs_dir / f"{context.job_name}-smoke-result.json"
+        report_path.write_text(json.dumps(report, separators=(",", ":")))
+        verifier = subprocess.run(
+            [
+                sys.executable,
+                str(context.task_dir / "tests/verify_result.py"),
+                str(report_path),
+            ],
+            env={**os.environ, **context.verifier_env},
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=120,
+        )
+        if verifier.returncode != 0:
+            raise EvalError(
+                "deterministic smoke verifier failed: "
+                + (verifier.stderr or verifier.stdout).strip()
+            )
+        trial = SimpleNamespace(
+            exception_info=None,
+            verifier_result=SimpleNamespace(rewards={"smoke": 1.0}),
+        )
+        return SimpleNamespace(
+            stats=SimpleNamespace(n_errored_trials=0, n_cancelled_trials=0),
+            trial_results=[trial],
         )
 
     # ---- cleanup -------------------------------------------------------

@@ -88,6 +88,11 @@ class HarnessLifecycleTests(unittest.TestCase):
         )
         self.assertEqual(tuple(action.choices), tuple(AGENTS))
 
+    def test_smoke_cli_needs_no_agent(self) -> None:
+        args = parser().parse_args(["solana-transfer", "--smoke-only"])
+        self.assertTrue(args.smoke_only)
+        self.assertIsNone(args.agent)
+
     def test_agent_model_can_be_selected_without_a_code_change(self) -> None:
         with mock.patch.dict(
             os.environ,
@@ -177,6 +182,25 @@ class HarnessLifecycleTests(unittest.TestCase):
                 "harbor_seconds",
                 "session_cleanup_seconds",
             },
+        )
+
+    def test_run_eval_can_use_a_credential_free_runner_spec(self) -> None:
+        definition = FakeDefinition(self.root)
+
+        async def runner(_context: EvalRunContext, agent: AgentSpec) -> object:
+            definition.events.append(f"runner:{agent.model}")
+            return self.passing_result()
+
+        with mock.patch.dict(os.environ, {}, clear=True):
+            run_eval(
+                definition,
+                "smoke",
+                harbor_runner=runner,
+                agent_spec=AgentSpec("smoke", "deterministic"),
+            )
+        self.assertEqual(
+            definition.events,
+            ["preflight", "provision:smoke", "runner:deterministic", "cleanup"],
         )
 
     def test_cleanup_runs_when_provision_fails_after_starting(self) -> None:

@@ -362,22 +362,20 @@ class ApproverMatchTests(SolanaEvalTestCase):
 
 
 class CeremonyDiscoveryTests(ApproverMatchTests):
-    """The Solana outbox publishes no `ceremony.json` through the mount: the
-    confirm route writes a private `approval.json` beside the staged entry and
-    returns a bare permission error. The host reads that file directly."""
+    """The host watches the canonical approval challenge in outbox state."""
 
     def test_no_approval_file_yet_means_no_ceremony(self) -> None:
         self.assertIsNone(self.definition._pending_confirm_ceremony("0001"))
 
-    def test_the_ceremony_url_is_read_from_the_private_approval_file(self) -> None:
+    def test_the_ceremony_url_is_read_from_the_approval_challenge(self) -> None:
         url = "http://localhost:18734/ceremony/" + "A" * 43
-        (self.entry / "approval.json").write_text(
+        (self.entry / "approval_challenge.json").write_text(
             json.dumps({"approval_id": "a" * 64, "ceremony_url": url})
         )
         self.assertEqual(self.definition._pending_confirm_ceremony("0001"), url)
 
     def test_a_malformed_ceremony_url_is_refused(self) -> None:
-        (self.entry / "approval.json").write_text(
+        (self.entry / "approval_challenge.json").write_text(
             json.dumps({"approval_id": "a" * 64, "ceremony_url": "http://evil/x"})
         )
         with self.assertRaisesRegex(EvalError, "invalid ceremony URL"):
@@ -386,7 +384,7 @@ class CeremonyDiscoveryTests(ApproverMatchTests):
     def test_a_torn_write_reads_as_not_yet_published(self) -> None:
         # The file is written atomically, so unparseable bytes mean a rename
         # caught in flight, not corruption.
-        (self.entry / "approval.json").write_text('{"ceremony_ur')
+        (self.entry / "approval_challenge.json").write_text('{"ceremony_ur')
         self.assertIsNone(self.definition._pending_confirm_ceremony("0001"))
 
     def test_host_state_listing_finds_the_staged_entry(self) -> None:

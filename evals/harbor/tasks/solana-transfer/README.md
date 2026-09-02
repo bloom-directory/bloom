@@ -147,11 +147,10 @@ The eval's own advisory lock prevents two Solana trials from overlapping. The
 outer triad lease also excludes unrelated wallet, policy, ceremony, and outbox
 mutations that could invalidate the trial. Never bypass either lock.
 
-`BLOOM_EVAL_SOLANA_HOME_ROOT` is required because the Solana outbox publishes no
-`ceremony.json`. On `ApprovalRequired` the confirm route writes a private
-`approval.json` beside the staged entry and returns a bare permission error
-carrying no URL — the agent has no business holding an owner ceremony URL — so
-the host reads it from `<home>/.solana-outbox/<wallet>/<chain>/pending/<id>/`.
+`BLOOM_EVAL_SOLANA_HOME_ROOT` is required because the approver watches the
+canonical `approval_challenge.json` from stable host state rather than through
+the live mount. Current outboxes also project that sanitized resume artifact to
+the owner filesystem; the agent must not attempt to complete its ceremony.
 
 ### The approval, and why it is watched rather than pre-driven
 
@@ -230,6 +229,16 @@ genesis outright.
 
 ### What live runs have confirmed
 
+Before spending model tokens, run the deterministic mounted lifecycle gate:
+
+```sh
+scripts/evals/run-harbor-solana-local.sh smoke
+```
+
+It needs no provider API key. It uses the same preflight, authority,
+mounted-route, host approval, broadcast, reconciliation, verifier, sweep, and
+cleanup path as a paid trial; only the LLM is replaced by a fixed driver.
+
 `cargo test -p bloom-it --test solana_workflow -- --ignored` drives a real
 `Daemon` against `solana-test-validator`. Running it settled the outbox
 behaviour this task depends on:
@@ -266,19 +275,19 @@ behaviour this task depends on:
 The key fingerprint is lowercase hex: the wire crate declares
 `fixed_lower_hex!(Digest32, 32, ...)`.
 
-### Not yet exercised
+### Paid-agent status
 
-The task has **not** been run end to end through Harbor against a mounted
-Machine, and no agent has read the instruction and attempted it. Three things
-remain open and should be settled on the local lane before the mainnet lane is
-used:
+The task has been attempted through Harbor against a mounted Machine. That run
+proved the dynamic outbox mount, staging, and first fail-closed confirm, then
+exposed a harness drift bug: Bloom emitted the canonical
+`approval_challenge.json` while the host approver still watched the obsolete
+private `approval.json`. The watcher now follows the canonical artifact.
 
-- whether the outbox directory over-mount stays live inside Docker as
-  `pending/<id>/` appears — the design decision with the least evidence behind
-  it, and the one with a documented fallback;
+The deterministic smoke command above is the release gate for the remaining
+live questions before another paid run or any mainnet use:
+
 - whether the configured timeouts suit finalization in that setting;
-- whether the background approver drives a real ceremony correctly; it has been
-  tested against staged fixtures but has never completed one.
+- whether the corrected background approver drives the real ceremony correctly.
 
 Everything else is covered: the verifier, the freshness binding and the sweep
 against a live chain, and the canary preflight, approver match logic, mount
