@@ -415,10 +415,15 @@ PY
 # per-event writers must reopen the canonical path rather than retaining the
 # renamed inode.
 /usr/sbin/newsyslog -F -f "$newsyslog_config"
-sudo -u "$login_user" "$machine_binary" serve triad-health-check "$(
-  plutil -extract build_digest raw -o - \
-    "/Library/Application Support/BloomTriad/config/$login_uid/broker/config.json"
-)" >/dev/null
+sudo -H -u "$login_user" env \
+  BLOOM_HOME="$clean_home" \
+  BLOOM_MACHINE_IDENTITY="$machine_identity" \
+  BLOOM_EDGE_MANIFEST="$edge_manifest" \
+  "$machine_binary" --home "$clean_home" --connect "unix:$machine_socket" \
+    serve triad-health-check "$(
+      plutil -extract build_digest raw -o - \
+        "/Library/Application Support/BloomTriad/config/$login_uid/broker/config.json"
+    )" >/dev/null
 /usr/bin/python3 - "$broker_log.0" "$signer_log.0" "$broker_log" "$signer_log" <<'PY'
 import json
 import pathlib
