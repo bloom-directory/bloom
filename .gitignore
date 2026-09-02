@@ -1,5 +1,6 @@
 target/
-target-docker/
+# Root-level Cargo targets used for isolated candidate builds.
+/target-*/
 cache/
 out/
 /evals/harbor/jobs/
@@ -23,6 +24,8 @@ test.env
 .bloom-local/
 .bloom-play/
 .worktrees/
+# Workspace-local editing helper; not a Bloom executable.
+/bin/edit
 # Downloaded CI log bundles dropped in the repo root during triage.
 /logs_*/
 .claude/worktrees/
