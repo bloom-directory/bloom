@@ -112,10 +112,6 @@ fn resolve_server_endpoint(home: &HomeDir, endpoint: Option<&str>) -> Result<Res
     Ok(ResolvedEndpoint::default_for_home(home))
 }
 
-fn configured_broker_client(home: &HomeDir) -> Result<bloom_machine_client::MachineBrokerClient> {
-    configured_broker_client_with_activation(home, false)
-}
-
 fn validate_wallet_name(name: &str) -> Result<()> {
     anyhow::ensure!(
         !name.is_empty()
@@ -706,7 +702,7 @@ impl CustodyInputShape {
 }
 
 async fn launch_custody_ceremony(
-    home: &HomeDir,
+    daemon: &Daemon,
     requested_name: &str,
     method: bloom_machine_client::CustodyPrepareMethod,
     ceremony_kind: bloom_broker_api::CeremonyKind,
@@ -730,10 +726,11 @@ async fn launch_custody_ceremony(
                 format!("requested wallet name must be a protocol token: {error}"),
             )
         })?;
-    let client = configured_broker_client(home).map_err(|error| {
+    let home = &daemon.home;
+    let client = daemon.broker_client().ok_or_else(|| {
         machine_error(
             MachineErrorKind::Unavailable,
-            format!("custody requires the authenticated Machine-to-Broker edge: {error:#}"),
+            "custody requires the authenticated Machine-to-Broker edge",
         )
     })?;
     let (operation_id, exact_terms_digest, legacy_passkey_migration) =
@@ -839,10 +836,10 @@ async fn launch_account_allocation(
         }
     };
 
-    let client = configured_broker_client(&daemon.home).map_err(|error| {
+    let client = daemon.broker_client().ok_or_else(|| {
         machine_error(
             MachineErrorKind::Unavailable,
-            format!("custody requires the authenticated Machine-to-Broker edge: {error:#}"),
+            "custody requires the authenticated Machine-to-Broker edge",
         )
     })?;
     let wallet = client
@@ -945,10 +942,10 @@ async fn launch_account_retirement(
         .get_wallet(wallet_id)
         .await
         .map_err(machine_wallet_lookup_error)?;
-    let client = configured_broker_client(&daemon.home).map_err(|error| {
+    let client = daemon.broker_client().ok_or_else(|| {
         machine_error(
             MachineErrorKind::Unavailable,
-            format!("custody requires the authenticated Machine-to-Broker edge: {error:#}"),
+            "custody requires the authenticated Machine-to-Broker edge",
         )
     })?;
     let accounts = client
@@ -1344,10 +1341,10 @@ async fn execute_machine_command(
         }
         MachineCommand::WalletAccounts { name } => {
             let wallet_id = bloom_broker_api::Token::new(name)?;
-            let client = configured_broker_client(home).map_err(|error| {
+            let client = daemon.broker_client().ok_or_else(|| {
                 machine_error(
                     MachineErrorKind::Unavailable,
-                    format!("wallet accounts requires the authenticated Machine-to-Broker edge: {error:#}"),
+                    "wallet accounts requires the authenticated Machine-to-Broker edge",
                 )
             })?;
             let accounts = client
@@ -1390,12 +1387,10 @@ async fn execute_machine_command(
                         .into());
                     }
                 };
-                let client = configured_broker_client(&daemon.home).map_err(|error| {
+                let client = daemon.broker_client().ok_or_else(|| {
                     machine_error(
                         MachineErrorKind::Unavailable,
-                        format!(
-                            "wallet address requires the authenticated Machine-to-Broker edge: {error:#}"
-                        ),
+                        "wallet address requires the authenticated Machine-to-Broker edge",
                     )
                 })?;
                 let accounts = client
@@ -1489,8 +1484,16 @@ async fn execute_machine_command(
                         CustodyInputShape::Named("none"),
                     ),
                 };
-                launch_custody_ceremony(home, &name, method, ceremony_kind, wallet_id, input, None)
-                    .await?
+                launch_custody_ceremony(
+                    daemon,
+                    &name,
+                    method,
+                    ceremony_kind,
+                    wallet_id,
+                    input,
+                    None,
+                )
+                .await?
             }
         }
         MachineCommand::WalletMigrate { receipt } => {
@@ -1498,7 +1501,7 @@ async fn execute_machine_command(
                 serde_json::from_value(serde_json::to_value(receipt)?)?;
             let (name, migration) = receipt.into_launch()?;
             launch_custody_ceremony(
-                home,
+                daemon,
                 &name,
                 bloom_machine_client::CustodyPrepareMethod::WalletImport,
                 bloom_broker_api::CeremonyKind::WalletImport,
@@ -1512,9 +1515,9 @@ async fn execute_machine_command(
             name,
             policy,
             assurance_level,
-        } => prepare_policy_update(home, &name, &policy, &assurance_level).await?,
+        } => prepare_policy_update(daemon, &name, &policy, &assurance_level).await?,
         MachineCommand::WalletPolicyCommit { operation_id } => {
-            commit_policy_update(home, operation_id).await?
+            commit_policy_update(daemon, operation_id).await?
         }
         MachineCommand::WalletOutboxCancel {
             wallet,
@@ -1559,7 +1562,7 @@ async fn execute_machine_command(
                 MachineCeremonyAction::Cancel => CeremonyCmd::Cancel { operation_id },
                 MachineCeremonyAction::Result => CeremonyCmd::Result { operation_id },
             };
-            handle_ceremony(home, command).await?
+            handle_ceremony(daemon, command).await?
         }
         MachineCommand::Operation {
             action,
@@ -1569,7 +1572,7 @@ async fn execute_machine_command(
                 MachineOperationAction::Status => OperationCmd::Status { operation_id },
                 MachineOperationAction::Cancel => OperationCmd::Cancel { operation_id },
             };
-            handle_operation(home, command).await?
+            handle_operation(daemon, command).await?
         }
         MachineCommand::UpdateStatus => handle_update(home, UpdateCmd::Status).await?.0,
         MachineCommand::UpdateCheck => {
@@ -1676,7 +1679,7 @@ impl LegacyMigrationReceiptFile {
 const MAX_POLICY_DOCUMENT_BYTES: u64 = 1024 * 1024;
 
 async fn prepare_policy_update(
-    home: &HomeDir,
+    daemon: &Daemon,
     requested_name: &str,
     input: &[u8],
     assurance_level: &str,
@@ -1720,10 +1723,11 @@ async fn prepare_policy_update(
     let proposed_bytes =
         serde_jcs::to_vec(&proposed).context("canonicalize proposed policy document")?;
 
-    let client = configured_broker_client(home).map_err(|error| {
+    let home = &daemon.home;
+    let client = daemon.broker_client().ok_or_else(|| {
         machine_error(
             MachineErrorKind::Unavailable,
-            format!("policy update requires the authenticated Machine-to-Broker edge: {error:#}"),
+            "policy update requires the authenticated Machine-to-Broker edge",
         )
     })?;
     let baseline = client
@@ -1789,13 +1793,14 @@ async fn prepare_policy_update(
     ))
 }
 
-async fn commit_policy_update(home: &HomeDir, operation_id: String) -> Result<String> {
+async fn commit_policy_update(daemon: &Daemon, operation_id: String) -> Result<String> {
+    let home = &daemon.home;
     let operation_id = bloom_broker_api::OperationId::new(operation_id)
         .context("operation ID must be 64 lowercase hexadecimal characters")?;
-    let client = configured_broker_client(home).map_err(|error| {
+    let client = daemon.broker_client().ok_or_else(|| {
         machine_error(
             MachineErrorKind::Unavailable,
-            format!("policy commit requires the authenticated Machine-to-Broker edge: {error:#}"),
+            "policy commit requires the authenticated Machine-to-Broker edge",
         )
     })?;
     let ceremony_receipt = client
@@ -1931,7 +1936,7 @@ fn load_ceremony_projection(
     }
 }
 
-async fn handle_ceremony(home: &HomeDir, command: CeremonyCmd) -> Result<String> {
+async fn handle_ceremony(daemon: &Daemon, command: CeremonyCmd) -> Result<String> {
     let (operation_id, action) = match command {
         CeremonyCmd::Status { operation_id } => (operation_id, "status"),
         CeremonyCmd::Cancel { operation_id } => (operation_id, "cancel"),
@@ -1939,12 +1944,11 @@ async fn handle_ceremony(home: &HomeDir, command: CeremonyCmd) -> Result<String>
     };
     let operation_id = bloom_broker_api::OperationId::new(operation_id)
         .context("operation ID must be 64 lowercase hexadecimal characters")?;
-    let client = configured_broker_client(home).map_err(|error| {
+    let home = &daemon.home;
+    let client = daemon.broker_client().ok_or_else(|| {
         machine_error(
             MachineErrorKind::Unavailable,
-            format!(
-                "ceremony operations require the authenticated Machine-to-Broker edge: {error:#}"
-            ),
+            "ceremony operations require the authenticated Machine-to-Broker edge",
         )
     })?;
     if action == "result" {
@@ -2014,19 +2018,17 @@ async fn handle_ceremony(home: &HomeDir, command: CeremonyCmd) -> Result<String>
     ))
 }
 
-async fn handle_operation(home: &HomeDir, command: OperationCmd) -> Result<String> {
+async fn handle_operation(daemon: &Daemon, command: OperationCmd) -> Result<String> {
     let (raw_operation_id, cancel) = match command {
         OperationCmd::Status { operation_id } => (operation_id, false),
         OperationCmd::Cancel { operation_id } => (operation_id, true),
     };
     let operation_id = bloom_broker_api::OperationId::new(raw_operation_id)
         .context("operation ID must be 64 lowercase hexadecimal characters")?;
-    let client = configured_broker_client(home).map_err(|error| {
+    let client = daemon.broker_client().ok_or_else(|| {
         machine_error(
             MachineErrorKind::Unavailable,
-            format!(
-                "operation lifecycle requires the authenticated Machine-to-Broker edge: {error:#}"
-            ),
+            "operation lifecycle requires the authenticated Machine-to-Broker edge",
         )
     })?;
     let status = if cancel {

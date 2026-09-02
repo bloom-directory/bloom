@@ -100,6 +100,7 @@ pub struct UnixMachineBrokerService {
     identity: LocalIdentity,
     broker: PeerAcl,
     journals: Arc<RwLock<Option<AuthorityJournalState>>>,
+    authority_exchange_gate: Arc<tokio::sync::Mutex<()>>,
 }
 
 /// Narrow provider seam implemented by the signed Machine journal owner. It
@@ -121,6 +122,7 @@ impl UnixMachineBrokerService {
             identity,
             broker,
             journals: Arc::new(RwLock::new(None)),
+            authority_exchange_gate: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -181,6 +183,11 @@ impl UnixMachineBrokerService {
         &self,
         request: MachineBrokerRequest,
     ) -> Result<MachineBrokerResponse, ProtocolError> {
+        // The two independently retained heads form one ordered authority-edge
+        // exchange. Keep the local snapshot/checkpoint and the peer response
+        // checkpoint in the same critical section so concurrent dispatches
+        // cannot publish valid heads out of order and falsely latch rollback.
+        let _exchange = self.authority_exchange_gate.lock().await;
         let method = request.method()?;
         let (provider, checkpoints) = {
             let state = self
@@ -2586,7 +2593,7 @@ mod tests {
         os::unix::fs::{MetadataExt, PermissionsExt},
         sync::{
             Mutex,
-            atomic::{AtomicUsize, Ordering},
+            atomic::{AtomicU64, AtomicUsize, Ordering},
         },
     };
 
@@ -2686,6 +2693,20 @@ mod tests {
     impl MachineJournalHeadProvider for TestJournalProvider {
         fn verified_head(&self) -> Result<(u64, Digest32), ProtocolError> {
             Ok((3, Digest32::from_bytes([3; 32])))
+        }
+
+        fn latch_mutations(&self, _reason: String) {}
+    }
+
+    struct AdvancingJournalProvider(AtomicU64);
+
+    impl MachineJournalHeadProvider for AdvancingJournalProvider {
+        fn verified_head(&self) -> Result<(u64, Digest32), ProtocolError> {
+            let sequence = self.0.fetch_add(1, Ordering::SeqCst);
+            Ok((
+                sequence,
+                Digest32::from_bytes([u8::try_from(sequence).unwrap(); 32]),
+            ))
         }
 
         fn latch_mutations(&self, _reason: String) {}
@@ -4158,6 +4179,130 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response, MachineBrokerResponse::ActionValidate(expected));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn unix_service_serializes_complete_authority_head_exchanges() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("broker.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let uid = std::fs::metadata(directory.path()).unwrap().uid();
+        let machine = local_identity("bloom-machine", "machine-key", 7);
+        let broker = local_identity("bloom-broker", "broker-key", 8);
+        let machine_acl = peer_acl(uid, &machine);
+        let broker_acl = peer_acl(uid, &broker);
+        let server_identity = broker.clone();
+        let (first_received_tx, first_received_rx) = tokio::sync::oneshot::channel();
+        let (probe_tx, probe_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut first_stream, _) = listener.accept().await.unwrap();
+            let first = bloom_triad_local_transport::receive_request::<MachineBrokerRequest>(
+                &mut first_stream,
+                &server_identity,
+                &machine_acl,
+                BROKER_API_CURRENT,
+                BROKER_API_RANGE,
+                bloom_broker_api::JournalHeadPolicy::Required,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                first.unsigned.body,
+                MachineBrokerRequest::ActionValidate(digest(41))
+            );
+            first_received_tx.send(()).unwrap();
+            probe_rx.await.unwrap();
+
+            assert!(
+                tokio::time::timeout(Duration::from_millis(250), listener.accept())
+                    .await
+                    .is_err(),
+                "a second authority exchange reached Broker before the first completed"
+            );
+            let first_response: Result<MachineBrokerResponse, ProtocolError> =
+                Ok(MachineBrokerResponse::ActionValidate(digest(41)));
+            bloom_triad_local_transport::send_response_with_journal_head(
+                &mut first_stream,
+                &server_identity,
+                &first,
+                first_response,
+                bloom_triad_local_transport::sign_journal_head(
+                    &server_identity,
+                    4,
+                    Digest32::from_bytes([4; 32]),
+                ),
+            )
+            .await
+            .unwrap();
+
+            let (mut second_stream, _) = listener.accept().await.unwrap();
+            let second = bloom_triad_local_transport::receive_request::<MachineBrokerRequest>(
+                &mut second_stream,
+                &server_identity,
+                &machine_acl,
+                BROKER_API_CURRENT,
+                BROKER_API_RANGE,
+                bloom_broker_api::JournalHeadPolicy::Required,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                second.unsigned.body,
+                MachineBrokerRequest::ActionValidate(digest(42))
+            );
+            let second_response: Result<MachineBrokerResponse, ProtocolError> =
+                Ok(MachineBrokerResponse::ActionValidate(digest(42)));
+            bloom_triad_local_transport::send_response_with_journal_head(
+                &mut second_stream,
+                &server_identity,
+                &second,
+                second_response,
+                bloom_triad_local_transport::sign_journal_head(
+                    &server_identity,
+                    5,
+                    Digest32::from_bytes([5; 32]),
+                ),
+            )
+            .await
+            .unwrap();
+        });
+
+        let checkpoint_root = directory.path().join("checkpoints");
+        std::fs::create_dir(&checkpoint_root).unwrap();
+        std::fs::set_permissions(&checkpoint_root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let client = MachineBrokerClient::connect_unix(socket, machine, broker_acl);
+        client
+            .attach_authority_journal(
+                Arc::new(AdvancingJournalProvider(AtomicU64::new(3))),
+                &checkpoint_root,
+                uid,
+            )
+            .unwrap();
+
+        let first_client = client.clone();
+        let first = tokio::spawn(async move {
+            first_client
+                .request(MachineBrokerRequest::ActionValidate(digest(41)))
+                .await
+        });
+        first_received_rx.await.unwrap();
+        let second = tokio::spawn(async move {
+            client
+                .request(MachineBrokerRequest::ActionValidate(digest(42)))
+                .await
+        });
+        tokio::task::yield_now().await;
+        probe_tx.send(()).unwrap();
+
+        assert_eq!(
+            first.await.unwrap().unwrap(),
+            MachineBrokerResponse::ActionValidate(digest(41))
+        );
+        assert_eq!(
+            second.await.unwrap().unwrap(),
+            MachineBrokerResponse::ActionValidate(digest(42))
+        );
         server.await.unwrap();
     }
 

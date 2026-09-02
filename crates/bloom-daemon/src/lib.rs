@@ -2727,6 +2727,7 @@ pub struct Daemon {
     pub home_write_permit: Option<Arc<HomeWritePermit>>,
     pub address_book: Arc<AddressBook>,
     pub audit: Arc<AuditLog>,
+    broker: Option<MachineBrokerClient>,
     pub wallet_projections: Arc<dyn WalletProjectionReader>,
     pub vfs: Vfs,
     pub petals: PetalRunner,
@@ -3869,6 +3870,7 @@ impl Daemon {
             home_write_permit,
             address_book: address_book_arc,
             audit: audit_arc,
+            broker,
             wallet_projections,
             vfs,
             petals,
@@ -3882,6 +3884,13 @@ impl Daemon {
             wallet_projection_refresh_started: Arc::new(AtomicBool::new(false)),
             solana_chains: solana_chain_registry,
         })
+    }
+
+    /// Return the daemon's single authenticated Machine→Broker edge.
+    /// Clones share its transport ordering gate and attached audit provider;
+    /// callers must not construct a second edge over the same Machine journal.
+    pub fn broker_client(&self) -> Option<MachineBrokerClient> {
+        self.broker.clone()
     }
 
     /// Idempotent: ensure background workers are running. Already
