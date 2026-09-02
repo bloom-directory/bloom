@@ -388,6 +388,13 @@ fn default_chains() -> BTreeMap<String, ChainSpec> {
             "HyperEVM",
             "HYPE",
         ),
+        evm_chain(
+            "arc-testnet",
+            5042002,
+            &["https://rpc.testnet.arc.io"],
+            "Arc Testnet",
+            "USDC",
+        ),
         ChainSpec::anvil_default(),
     ] {
         chains.insert(spec.name.clone(), spec);
@@ -631,7 +638,7 @@ mod tests {
         assert!(cfg.etherscan.is_none());
         assert!(cfg.enso.is_none());
         assert_eq!(cfg.petals.preinstalled, ["near-intents", "enso"]);
-        assert_eq!(cfg.chains.len(), 13);
+        assert_eq!(cfg.chains.len(), 14);
         let ethereum = cfg.chains.get("ethereum").expect("ethereum entry");
         assert_eq!(ethereum.chain_id, 1);
         assert!(ethereum.allow_broadcast);
@@ -651,6 +658,16 @@ mod tests {
         assert_eq!(robinhood.native_symbol, "ETH");
         let hyperliquid = cfg.chains.get("hyperliquid").expect("hyperliquid entry");
         assert_eq!(hyperliquid.chain_id, 999);
+        let arc_testnet = cfg.chains.get("arc-testnet").expect("arc-testnet entry");
+        assert_eq!(arc_testnet.chain_id, 5_042_002);
+        assert_eq!(arc_testnet.rpc_urls, vec!["https://rpc.testnet.arc.io"]);
+        assert_eq!(arc_testnet.display_name.as_deref(), Some("Arc Testnet"));
+        assert!(arc_testnet.allow_broadcast);
+        assert!(!arc_testnet.op_stack);
+        // Arc meters gas in USDC, but the native balance is still an
+        // 18-decimal EVM quantity — the testnet base fee reads in gwei.
+        assert_eq!(arc_testnet.native_symbol, "USDC");
+        assert_eq!(arc_testnet.native_decimals, 18);
         let anvil = cfg.chains.get("anvil").expect("anvil entry");
         assert_eq!(anvil.chain_id, 31337);
         assert!(!anvil.rpc_urls.is_empty());
@@ -665,6 +682,53 @@ mod tests {
     #[test]
     fn local_default_validates() {
         Config::local_default().validate().unwrap();
+    }
+
+    /// Arc ships testnet-only until Arc mainnet launches.
+    ///
+    /// Adding an `arc` mainnet entry is a deliberate change, not an
+    /// incidental one: the README, the VFS `docs/README.md` the agent
+    /// reads, and `docs/AGENTIC_WALLET.md` all state that Arc is
+    /// testnet-only. Update those alongside this assertion.
+    #[test]
+    fn arc_ships_testnet_only_until_mainnet_launches() {
+        let cfg = Config::local_default();
+        assert!(
+            cfg.chains.contains_key("arc-testnet"),
+            "arc-testnet must remain the Arc default entry"
+        );
+        assert!(
+            !cfg.chains.contains_key("arc"),
+            "an `arc` mainnet entry landed; update the README, the VFS \
+             docs/README.md, and docs/AGENTIC_WALLET.md, which all say Arc \
+             is testnet-only"
+        );
+    }
+
+    /// The chain key is a valid `bloom-rpc-wire` protocol token.
+    ///
+    /// Chain names cross the triad as `Token` in Broker/Signer policy and
+    /// approval terms, so a name the token grammar rejects would break
+    /// broadcast on that chain rather than failing here.
+    #[test]
+    fn default_chain_names_are_valid_protocol_tokens() {
+        for name in Config::local_default().chains.keys() {
+            let bytes = name.as_bytes();
+            assert!(
+                !bytes.is_empty() && bytes.len() <= 64,
+                "chain name {name:?} must be 1-64 bytes"
+            );
+            assert!(
+                bytes[0].is_ascii_lowercase(),
+                "chain name {name:?} must start with a lowercase ASCII letter"
+            );
+            assert!(
+                bytes.iter().all(|byte| byte.is_ascii_lowercase()
+                    || byte.is_ascii_digit()
+                    || matches!(byte, b'.' | b'_' | b'-' | b'/')),
+                "chain name {name:?} must be a lowercase ASCII protocol token"
+            );
+        }
     }
 
     #[test]
