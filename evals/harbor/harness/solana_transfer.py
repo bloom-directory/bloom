@@ -1056,19 +1056,25 @@ class SolanaTransferEval(EvalDefinition):
         # 1. Drain pending. A residual staged entry still holds a broadcastable
         #    blockhash, so it is never an acceptable end state.
         for pending_id in self._list_state("pending"):
-            cancel = self.mount.write_route(
+            self.mount.write_route(
                 self.outbox_root / "pending" / pending_id / "cancel",
                 b"host-cleanup",
                 ROUTE_WRITE_TIMEOUT_SECONDS,
             )
-            if cancel.returncode != 0:
-                failures.append(f"could not cancel pending entry {pending_id}")
+            # A concurrent expiry sweep can move an entry to failed/ after the
+            # listing but before this write. In that case cancel correctly
+            # fails because the route moved, while the cleanup postcondition
+            # is already satisfied. Judge the state after settling below.
         if not self.mount.poll_until(
             lambda: not self._list_state("pending"),
             PENDING_DRAIN_ATTEMPTS,
             PENDING_DRAIN_DELAY_SECONDS,
         ):
-            failures.append("outbox/pending did not drain")
+            remaining = self._list_state("pending")
+            failures.append(
+                "outbox/pending did not drain"
+                + (f": {', '.join(remaining)}" if remaining else "")
+            )
 
         # 2. Zero or one sent entry, and if one, it must have reconciled.
         all_sent = set(self._list_state("sent"))

@@ -200,6 +200,8 @@ grep -Fq '25ccf8b20079e120b189714c84283eba17c937a4' \
   "${repo_root}/scripts/evals/run-harbor-solana-local.sh"
 grep -Fq '745befe63ecd7a0b0a104c4ffd1a092d6d347cad' \
   "${repo_root}/scripts/evals/run-harbor-solana-local.sh"
+grep -Fq -- '--arg chain solana --arg destination' \
+  "${repo_root}/scripts/evals/run-harbor-solana-local.sh"
 
 python3 - <<SOLTOML
 import sys

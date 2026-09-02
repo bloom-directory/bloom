@@ -511,6 +511,31 @@ class SweepTests(SolanaEvalTestCase):
 
 
 class ReusedWalletCleanupTests(SolanaEvalTestCase):
+    def test_cleanup_accepts_an_entry_that_expires_during_cancel(self) -> None:
+        definition = self.make()
+        definition.destination = DESTINATION
+        definition.source_address = SOURCE
+        pending_reads = 0
+
+        def listing(state: str) -> list[str]:
+            nonlocal pending_reads
+            if state == "pending":
+                pending_reads += 1
+                return ["expiring"] if pending_reads == 1 else []
+            return []
+
+        with mock.patch.object(definition, "_stop_approver"):
+            with mock.patch.object(definition, "_list_state", side_effect=listing):
+                with mock.patch.object(
+                    definition.mount,
+                    "write_route",
+                    return_value=SimpleNamespace(returncode=1),
+                ):
+                    with mock.patch.object(
+                        definition, "sweep_destination", return_value=None
+                    ):
+                        definition.cleanup()
+
     def test_cleanup_ignores_reconciled_history_and_checks_only_this_trial(self) -> None:
         definition = self.make()
         definition.destination = DESTINATION

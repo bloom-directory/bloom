@@ -239,6 +239,10 @@ It needs no provider API key. It uses the same preflight, authority,
 mounted-route, host approval, broadcast, reconciliation, verifier, sweep, and
 cleanup path as a paid trial; only the LLM is replaced by a fixed driver.
 
+The temporary wallet policy names the destination under the stable `solana`
+authority namespace. `solana-local` is the VFS/configuration name; cluster
+identity is bound separately by the pinned genesis hash and signed blockhash.
+
 `cargo test -p bloom-it --test solana_workflow -- --ignored` drives a real
 `Daemon` against `solana-test-validator`. Running it settled the outbox
 behaviour this task depends on:

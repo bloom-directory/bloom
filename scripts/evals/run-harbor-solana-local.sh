@@ -332,7 +332,10 @@ source_address="$(printf '%s' "$accounts" | jq -er '
 ')" || die "wallet $wallet_id has no active Solana child"
 
 "$machine_bin" vfs cat "/wallets/${wallet_id}/policy.json" > "${run_root}/policy.original.json"
-jq -cS --arg chain solana-local --arg destination "$destination" '
+# Native Solana signing uses the stable authority namespace `solana`; the
+# concrete cluster remains independently bound by the configured genesis hash
+# and the signed message's recent blockhash.
+jq -cS --arg chain solana --arg destination "$destination" '
   .allowed_destinations = ((.allowed_destinations // []) +
     [{chain:$chain, destination:$destination}] | unique | sort)
 ' "${run_root}/policy.original.json" > "${run_root}/policy.eval.json"
