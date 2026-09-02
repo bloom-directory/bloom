@@ -18,8 +18,11 @@ signer_repo_default="${repo_root}/../bloom-signer"
 [ ! -d "${repo_root}/../signer-eval-isolation" ] || signer_repo_default="${repo_root}/../signer-eval-isolation"
 broker_repo="${BLOOM_EVAL_BROKER_REPO:-${broker_repo_default}}"
 signer_repo="${BLOOM_EVAL_SIGNER_REPO:-${signer_repo_default}}"
-broker_isolation_commit="10aa10f0d676d4292d31d6b72d92c04a5823ae6b"
-signer_isolation_commit="bd3e0a14801a04f00be51d7dcf3e7711cc748896"
+# Reviewed heads of bloom-broker#32 and bloom-signer#25. These PR branches were
+# rebased after the eval launcher was first written, so pin the current commits
+# rather than now-unreachable pre-rebase hashes.
+broker_isolation_commit="25ccf8b20079e120b189714c84283eba17c937a4"
+signer_isolation_commit="745befe63ecd7a0b0a104c4ffd1a092d6d347cad"
 build_root="${BLOOM_EVAL_BUILD_ROOT:-${triad_root}/target}"
 machine_bin="${BLOOM_EVAL_SOLANA_MACHINE_BINARY:-${build_root}/machine/debug/bloom}"
 broker_bin="${BLOOM_INTEGRATION_BROKER_BIN:-${build_root}/broker/debug/bloom-broker}"
@@ -73,9 +76,9 @@ for path in "$launcher" "$broker_repo" "$signer_repo"; do
 done
 [ -x "$launcher" ] || die "triad launcher is not executable: $launcher"
 git -C "$broker_repo" merge-base --is-ancestor "$broker_isolation_commit" HEAD 2>/dev/null ||
-  die "Broker checkout lacks bloom-broker#32: $broker_repo"
+  die "Broker checkout is not based on reviewed bloom-broker#32 head $broker_isolation_commit: $broker_repo"
 git -C "$signer_repo" merge-base --is-ancestor "$signer_isolation_commit" HEAD 2>/dev/null ||
-  die "Signer checkout lacks bloom-signer#25: $signer_repo"
+  die "Signer checkout is not based on reviewed bloom-signer#25 head $signer_isolation_commit: $signer_repo"
 
 # Port 18734 belongs to the normal triad and may remain live. This isolated
 # developer-harness build uses a different exact origin on loopback.

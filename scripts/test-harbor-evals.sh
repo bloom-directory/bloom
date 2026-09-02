@@ -193,6 +193,14 @@ bash -n "${repo_root}/scripts/evals/run-harbor.sh"
 bash -n "${repo_root}/scripts/evals/run-harbor-solana-local.sh"
 bash -n "${solana_task}/tests/test.sh"
 
+# The isolated Broker and Signer PRs were rebased during development. Keep the
+# launcher pinned to their reviewed current heads rather than stale hashes that
+# no checkout can satisfy.
+grep -Fq '25ccf8b20079e120b189714c84283eba17c937a4' \
+  "${repo_root}/scripts/evals/run-harbor-solana-local.sh"
+grep -Fq '745befe63ecd7a0b0a104c4ffd1a092d6d347cad' \
+  "${repo_root}/scripts/evals/run-harbor-solana-local.sh"
+
 python3 - <<SOLTOML
 import sys
 import tomllib
