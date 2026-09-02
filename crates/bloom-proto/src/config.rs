@@ -634,7 +634,7 @@ mod tests {
         assert_eq!(cfg.nfs_listen_addr, "127.0.0.1:12049");
         assert!(cfg.etherscan.is_none());
         assert!(cfg.enso.is_none());
-        assert!(cfg.petals.preinstalled.is_empty());
+        assert_eq!(cfg.petals.preinstalled, default_preinstalled_petals());
         assert_eq!(cfg.chains.len(), 13);
         let ethereum = cfg.chains.get("ethereum").expect("ethereum entry");
         assert_eq!(ethereum.chain_id, 1);
