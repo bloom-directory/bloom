@@ -227,6 +227,53 @@ git -C ../BROKER_WORKTREE rev-parse HEAD
 git rev-parse HEAD
 ```
 
+### Sharing a host with other candidates
+
+Every path in the loops above is fixed, so two people or agents who copy them
+share one developer root, one Machine home, and one socket. Give each candidate
+its own set:
+
+```sh
+tag="$(id -un)-$$"
+root="$HOME/.bloom/triad-dev-${tag}"
+logs="/tmp/bloom-triad-logs-${tag}"
+mkdir -p "$root/machine-home" "$logs"
+
+scripts/triad-dev-launch.sh \
+  --developer-root "$root" \
+  --machine-home "$root/machine-home" \
+  --machine-socket "/tmp/bloom-triad-machine-${tag}.sock" \
+  --log-dir "$logs" \
+  --ready-file "/tmp/bloom-triad-ready-${tag}" \
+  --services-only
+```
+
+Run one Machine per home. `bloom serve` and `bloom init` hold an exclusive lock
+on the whole home for their lifetime, so a second one against the same home
+fails with `Bloom home is already open for writing`. Every other command,
+including all of `bloom vfs`, is a thin IPC client that never takes that lock:
+the Machine serializes writes itself, so concurrent clients need no external
+lease. A client with no Machine on its endpoint fails with `ipc <op> via
+unix:<path>` rather than a lock error.
+
+A client resolves its Machine in this order:
+
+1. `--connect unix:<path>`
+2. `--ipc-socket <path>` (compatibility alias)
+3. `BLOOM_RPC_ENDPOINT`
+4. `BLOOM_IPC_SOCKET` (compatibility alias)
+5. `<BLOOM_HOME, else ~/.bloom>/run/bloom.sock`
+
+Sourcing a candidate's `triad.env` sets `BLOOM_HOME` and `BLOOM_RPC_ENDPOINT`
+together, which is why it belongs only in the terminal addressing that
+candidate. An unsourced shell addresses `~/.bloom`, which is usually nobody's
+triad.
+
+Candidates are otherwise independent, with one exception: the ceremony listener
+address `127.0.0.1:18734` is fixed in the launcher, so only one candidate on a
+host can hold it. Run at most one ceremony-bearing candidate, or keep the others
+on `--services-only` work that does not need it.
+
 ## Cross-repository changes
 
 Advance a candidate left to right:
@@ -398,6 +445,7 @@ packages; do not patch Machine to preserve a retired Petal authority ABI.
 | Variable | Purpose |
 |---|---|
 | `BLOOM_HOME` | Machine-owned state root |
+| `BLOOM_IPC_SOCKET` | Machine endpoint a client connects to |
 | `BLOOM_TRIAD_DEV_ROOT` | Persistent developer Broker/Signer enrollment and state |
 | `BLOOM_TRIAD_DEVELOPER_ROOT` | Explicit same-UID developer enrollment root |
 | `BLOOM_BROKER_SOCKET` | Authenticated Machine-to-Broker endpoint |
@@ -491,6 +539,8 @@ Common failures:
 |---|---|
 | A fix appears to have no effect | Confirm the three `BLOOM_INTEGRATION_*_BIN` paths and recorded commits |
 | Cargo appears hung | Look for another Cargo process sharing the target directory |
+| `Bloom home is already open for writing` | Another Machine owns that home; run one Machine and point clients at its socket |
+| `ipc ... via unix:<path>` | No Machine on that endpoint; check `BLOOM_IPC_SOCKET`, `BLOOM_HOME`, and that `triad.env` was sourced |
 | Linux services never become ready | Confirm an active systemd user manager and inspect Broker/Signer logs |
 | Ceremony cannot bind | Check port `18734` and stop the older developer launcher |
 | Enrollment is rejected as stale | Start with a new developer root; do not mutate custody files by hand |
