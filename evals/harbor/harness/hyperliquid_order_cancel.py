@@ -916,6 +916,15 @@ class HyperliquidOrderCancelEval(EvalDefinition):
             # revision retried here on the theory that a freshly published
             # ceremony URL might not yet resolve; that theory was wrong, and the
             # retries turned one failure into three.
+            # Reserve the next counter durably before invoking the driver. The
+            # assertion may reach Broker even when the local process times out
+            # or is interrupted, so persistence after subprocess completion is
+            # too late to guarantee that this counter will never be reused.
+            attempted_counter = counter
+            counter = attempted_counter + 1
+            if self.counter_committed is not None:
+                self.counter_committed(counter)
+            self.next_sign_count = counter
             try:
                 completed = subprocess.run(
                     [
@@ -925,7 +934,7 @@ class HyperliquidOrderCancelEval(EvalDefinition):
                         "--authenticator-seed-file",
                         str(self.seed_file),
                         "--sign-count",
-                        str(counter),
+                        str(attempted_counter),
                     ],
                     check=False,
                     capture_output=True,
@@ -933,15 +942,14 @@ class HyperliquidOrderCancelEval(EvalDefinition):
                 )
             except (OSError, subprocess.SubprocessError) as error:
                 raise EvalError(
-                    "debug-driver ceremony completion failed: "
+                    f"debug-driver ceremony completion failed at sign count "
+                    f"{attempted_counter} (next unused counter is {counter}): "
                     + self._redact_ceremony_urls(str(error))
                 ) from error
             output += (completed.stdout + completed.stderr).decode(errors="replace")
-            counter += 1
-            self.next_sign_count = counter
             if completed.returncode != 0:
                 raise EvalError(
-                    f"session ceremony failed at sign count {counter - 1} "
+                    f"session ceremony failed at sign count {attempted_counter} "
                     f"(next unused counter is {counter}): "
                     + self._redact_ceremony_urls(output)
                 )
