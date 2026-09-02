@@ -2021,8 +2021,9 @@ fn linux_uninstaller_defaults_to_retaining_custody_and_requires_explicit_purge()
     assert!(installer.contains("retained_custody=false"));
     assert!(installer.contains("$root/etc/bloom/retained/$login_uid.json"));
     assert!(installer.contains(
-        "systemctl --user disable --now \\\n          bloom-machine.service bloom-session.service"
+        "systemctl --user stop \\\n          bloom-machine.service bloom-session.service"
     ));
+    assert!(installer.contains("systemctl --user is-active --quiet \"$stopped_user_unit\""));
     assert!(installer.contains("remove_linux_mount_authorization \"$root\" \"$login_uid\""));
     assert!(installer.contains(
         "if [[ \"$retain_custody\" == false ]]; then\n          runuser -u \"$login_user\" -- rm -rf -- \"$login_home/.bloom\""

@@ -713,15 +713,6 @@ case "$action" in
       # silently skipped because a fresh account name is unresolved.
       numericize_linux_tmpfiles_ownership "$tmpfiles" "$login_uid"
     fi
-    mkdir -p "$installed_config_root"
-    chmod 0711 "$installed_config_root"
-    machine_environment="$installed_config_root/.machine-env.source.$$"
-    printf 'BLOOM_NFS_LISTEN=127.0.0.1:%s\nBLOOM_RELEASE_DIGEST=%s\n' \
-      "$nfs_port" "$release_digest" > "$machine_environment"
-    atomic_install "$machine_environment" "$installed_config_root/machine.env" 0644
-    rm -f -- "$machine_environment"
-    install_linux_mount_authorization \
-      "$root" "$login_uid" "$login_gid" "$login_home" "$nfs_port"
     if [[ "$fresh_install" == true ]]; then
       if [[ "$root" == "/" ]]; then
         broker_uid="$(id -u "bloom-broker-$login_uid")"
@@ -770,6 +761,16 @@ case "$action" in
         }
       done
     fi
+
+    mkdir -p "$installed_config_root"
+    chmod 0711 "$installed_config_root"
+    machine_environment="$installed_config_root/.machine-env.source.$$"
+    printf 'BLOOM_NFS_LISTEN=127.0.0.1:%s\nBLOOM_RELEASE_DIGEST=%s\n' \
+      "$nfs_port" "$release_digest" > "$machine_environment"
+    atomic_install "$machine_environment" "$installed_config_root/machine.env" 0644
+    rm -f -- "$machine_environment"
+    install_linux_mount_authorization \
+      "$root" "$login_uid" "$login_gid" "$login_home" "$nfs_port"
 
     config_root="$root/etc/bloom/$login_uid"
     mkdir -p \
@@ -975,8 +976,23 @@ case "$action" in
         runuser -u "$login_user" -- env \
           XDG_RUNTIME_DIR="$user_runtime" \
           DBUS_SESSION_BUS_ADDRESS="unix:path=$user_runtime/bus" \
-          systemctl --user disable --now \
+          systemctl --user stop \
           bloom-machine.service bloom-session.service \
+          2>/dev/null || true
+        for stopped_user_unit in bloom-machine.service bloom-session.service; do
+          if runuser -u "$login_user" -- env \
+            XDG_RUNTIME_DIR="$user_runtime" \
+            DBUS_SESSION_BUS_ADDRESS="unix:path=$user_runtime/bus" \
+            systemctl --user is-active --quiet "$stopped_user_unit"
+          then
+            echo "refusing to uninstall while $stopped_user_unit is still active" >&2
+            exit 70
+          fi
+        done
+        runuser -u "$login_user" -- env \
+          XDG_RUNTIME_DIR="$user_runtime" \
+          DBUS_SESSION_BUS_ADDRESS="unix:path=$user_runtime/bus" \
+          systemctl --user disable bloom-machine.service bloom-session.service \
           2>/dev/null || true
       fi
       if [[ -n "$login_user" && "$login_home" == /* && "$login_home" != "/" ]]; then

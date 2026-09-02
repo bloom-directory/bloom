@@ -2393,6 +2393,9 @@ enum WalletCmd {
 #[tokio::main]
 async fn main() -> ExitCode {
     let cli = Cli::parse();
+    if unenrolled_packaged_macos_machine(&cli) {
+        return ExitCode::SUCCESS;
+    }
 
     let role = long_running_role(&cli);
     if let Some(role) = role {
@@ -2453,6 +2456,36 @@ async fn main() -> ExitCode {
             }
             ExitCode::FAILURE
         }
+    }
+}
+
+fn unenrolled_packaged_macos_machine(cli: &Cli) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        let packaged_root =
+            std::path::Path::new("/Library/Application Support/BloomTriad/enrollments");
+        if !matches!(
+            cli.cmd.as_ref(),
+            Some(Cmd::Serve {
+                mount_home: true,
+                internal: None,
+                ..
+            })
+        ) || std::env::var_os("BLOOM_ENROLLMENT_ROOT").as_deref()
+            != Some(packaged_root.as_os_str())
+        {
+            return false;
+        }
+        let uid = rustix::process::geteuid().as_raw();
+        matches!(
+            std::fs::symlink_metadata(packaged_root.join(format!("{uid}.json"))),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound
+        )
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = cli;
+        false
     }
 }
 

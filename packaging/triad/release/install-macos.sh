@@ -577,6 +577,15 @@ reload_launchd_job() {
     echo "Bloom installed, but launchd deferred $label" >&2
 }
 
+stop_launchd_job() {
+  local label="$1" attempts=0
+  launchctl bootout "$label" 2>/dev/null || true
+  while launchctl print "$label" >/dev/null 2>&1 && ((attempts < 50)); do
+    sleep 0.1; attempts=$((attempts + 1))
+  done
+  ! launchctl print "$label" >/dev/null 2>&1 || die "refusing to uninstall while $label is still loaded"
+}
+
 reload_current_enrollment() {
   plutil -lint "$broker_plist" "$signer_plist" "$containment_plist" "$session_plist" "$machine_plist" >/dev/null; pfctl -nf "$pf_anchor"
   reload_launchd_job system com.bloom.containment "$containment_plist"
@@ -740,7 +749,7 @@ case "$action" in
     [[ -f "$record" && ! -L "$record" ]] || die "enrollment or retained custody record missing"
     enrollment="$record"; login_user="$(field "$record" login_user)"; BLOOM_RELEASE_DIGEST="$(field "$record" release_digest)"; load_ids
     if $live; then
-      for label in "gui/$login_uid/com.bloom.machine" "system/com.bloom.broker.$login_uid" "system/com.bloom.signer.$login_uid" "gui/$login_uid/com.bloom.session"; do launchctl bootout "$label" 2>/dev/null || true; done
+      for label in "gui/$login_uid/com.bloom.machine" "system/com.bloom.broker.$login_uid" "system/com.bloom.signer.$login_uid" "gui/$login_uid/com.bloom.session"; do stop_launchd_job "$label"; done
       pf_reference remove
     fi
     rm -f "$broker_plist" "$signer_plist" "$pf_anchor" "$newsyslog_config"
