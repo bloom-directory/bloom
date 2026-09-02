@@ -8,6 +8,7 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 agent="${1:-glm}"
 wallet_id="${BLOOM_EVAL_SOLANA_WALLET_ID:-solana-eval}"
 triad_root="${BLOOM_EVAL_TRIAD_ROOT:-${HOME}/bloom-eval-triad}"
+run_base="${BLOOM_EVAL_RUN_ROOT:-${TMPDIR:-/tmp}/bloom-solana-evals-${UID}}"
 developer_root="${BLOOM_EVAL_DEVELOPER_ROOT:-${triad_root}/developer}"
 machine_home="${BLOOM_EVAL_SOLANA_HOME_ROOT:-${developer_root}/machine-home}"
 seed_file="${BLOOM_EVAL_AUTHENTICATOR_SEED_FILE:-${triad_root}/owner-auth.seed}"
@@ -86,8 +87,8 @@ if ss -ltn | awk '{print $4}' | grep -Eq "(^|:)(${rpc_port}|${faucet_port})$"; t
 fi
 
 umask 077
-mkdir -p "${triad_root}/evals" "$developer_root" "$machine_home" "$build_root"
-chmod 0700 "$triad_root" "${triad_root}/evals" "$developer_root" "$machine_home" "$build_root"
+mkdir -p "$run_base" "$developer_root" "$machine_home" "$build_root"
+chmod 0700 "$triad_root" "$run_base" "$developer_root" "$machine_home" "$build_root"
 if [ ! -e "$seed_file" ]; then
   openssl rand -hex 32 > "$seed_file"
   chmod 0600 "$seed_file"
@@ -98,7 +99,7 @@ lifecycle_lock="${triad_root}/triad-lifecycle.lock"
 exec 9>"$lifecycle_lock"
 chmod 0600 "$lifecycle_lock"
 flock -n 9 || die "another local eval owns the triad lifecycle lock"
-run_root="$(mktemp -d "${triad_root}/evals/solana-local.XXXXXX")"
+run_root="$(mktemp -d "${run_base}/solana-local.XXXXXX")"
 mount_dir="${run_root}/bloom"
 log_dir="${run_root}/logs"
 ready_file="${run_root}/ready"

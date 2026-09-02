@@ -14,6 +14,7 @@ from unittest import mock
 
 from harness import hyperliquid_order_cancel
 from harness.core import (
+    AGENTS,
     AgentSpec,
     EvalDefinition,
     EvalError,
@@ -21,6 +22,7 @@ from harness.core import (
     _agent_spec,
     run_eval,
 )
+from harness.__main__ import parser
 from harness.hyperliquid_order_cancel import (
     ACTION_FILES,
     MAINNET_ACK,
@@ -79,6 +81,12 @@ class HarnessLifecycleTests(unittest.TestCase):
         self.assertEqual(
             spec.env["ANTHROPIC_BASE_URL"], "https://api.z.ai/api/anthropic"
         )
+
+    def test_cli_agent_choices_come_from_the_agent_registry(self) -> None:
+        action = next(
+            action for action in parser()._actions if action.dest == "agent"
+        )
+        self.assertEqual(tuple(action.choices), tuple(AGENTS))
 
     def test_agent_model_can_be_selected_without_a_code_change(self) -> None:
         with mock.patch.dict(

@@ -6,7 +6,7 @@ harbor_version="${HARBOR_VERSION:-0.21.0}"
 
 usage() {
   printf '%s\n' \
-    'Usage: scripts/evals/run-harbor.sh <eval> claude|codex|glm' \
+    'Usage: scripts/evals/run-harbor.sh <eval> claude|codex|deepseek|glm' \
     '       scripts/evals/run-harbor.sh <eval> --preauthorization-only' \
     '' \
     'Evals:' \

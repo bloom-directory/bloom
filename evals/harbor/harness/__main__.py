@@ -8,7 +8,7 @@ import sys
 from collections.abc import Callable
 from pathlib import Path
 
-from .core import EvalDefinition, EvalError, run_eval
+from .core import AGENTS, EvalDefinition, EvalError, run_eval
 from .hyperliquid_order_cancel import HyperliquidOrderCancelEval
 from .solana_transfer import SolanaTransferEval
 
@@ -29,7 +29,7 @@ def parser() -> argparse.ArgumentParser:
         choices=tuple(DEFINITIONS),
         help="host-side evaluation definition",
     )
-    value.add_argument("agent", nargs="?", choices=("claude", "codex", "glm"))
+    value.add_argument("agent", nargs="?", choices=tuple(AGENTS))
     value.add_argument(
         "--preauthorization-only",
         action="store_true",

@@ -78,6 +78,11 @@ or add a public chain. The developer-only origin override is implemented by
 [bloom-signer#25](https://github.com/bloom-directory/bloom-signer/pull/25); the
 wrapper verifies those commits before building either authority process.
 
+Per-run sockets, logs, Harbor jobs, and the temporary sweep key live under
+`/tmp/bloom-solana-evals-$UID` by default rather than under the persistent
+triad root. This keeps disposable eval artifacts out of unrelated agents'
+home-directory scans. Set `BLOOM_EVAL_RUN_ROOT` to override that location.
+
 Each run creates a fresh sweep destination, adds only that destination to
 policy through an owner ceremony, runs Harbor, sweeps the local test funds, and
 restores the byte-identical original policy. On Linux it prompts for sudo once
