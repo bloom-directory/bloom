@@ -27,7 +27,7 @@ local_output_root="${BLOOM_TART_OUTPUT_ROOT:-$workspace_root/.macos-conformance/
 run_vm_log="$local_output_root/run-vm.log"
 w0_log="$local_output_root/w0.log"
 
-for command_name in tart jq sshpass ssh nc git tar; do
+for command_name in tart jq sshpass ssh nc git tar ssh-keygen; do
   command -v "$command_name" >/dev/null 2>&1 || {
     echo "missing local Tart W0 dependency: $command_name" >&2
     exit 69
@@ -140,14 +140,65 @@ prepare_source_bundle "$main_root" bloom
 prepare_source_bundle "$broker_root" bloom-broker
 prepare_source_bundle "$signer_root" bloom-signer
 
+candidate_verified_root="$local_output_root/candidate-verified"
 distribution_root="$local_output_root/triad-dist"
+staging_root="$local_output_root/w0-staging"
 verified_root="$local_output_root/verified"
-artifact_name="bloom-triad-test-unclaimed.tar.gz"
-mkdir -p "$distribution_root" "$verified_root"
-for suffix in "" .sha256 .sig .pub; do
-  install -m 0644 "$candidate_archive$suffix" "$distribution_root/$artifact_name$suffix"
-done
+artifact_name="bloom-triad-macos-w0.tar.gz"
+mkdir -p \
+  "$candidate_verified_root" \
+  "$distribution_root" \
+  "$staging_root/bin" \
+  "$verified_root"
 BLOOM_ALLOW_TEST_UNCLAIMED=true \
+  "$main_root/packaging/triad/release/verify-bundle.sh" \
+  "$candidate_archive" \
+  "$candidate_archive.sha256" \
+  "$candidate_archive.sig" \
+  "$candidate_archive.pub"
+tar -xzf "$candidate_archive" -C "$candidate_verified_root"
+candidate_payload="$candidate_verified_root/bloom-triad"
+[[ "$(<"$candidate_payload/PLATFORM_CLAIM")" == test-unclaimed ]] || {
+  echo "local Tart W0 requires a test-unclaimed release candidate" >&2
+  exit 65
+}
+
+machine_revision="$(git -C "$main_root" rev-parse HEAD)"
+broker_revision="$(git -C "$broker_root" rev-parse HEAD)"
+signer_revision="$(git -C "$signer_root" rev-parse HEAD)"
+for source_line in \
+  "BLOOM_MACHINE_SHA=$machine_revision" \
+  "BLOOM_BROKER_SHA=$broker_revision" \
+  "BLOOM_SIGNER_SHA=$signer_revision"
+do
+  grep -Fx "$source_line" "$candidate_payload/SOURCE_REVISIONS" >/dev/null || {
+    echo "candidate source revisions do not match the Tart source checkouts" >&2
+    exit 65
+  }
+done
+[[ "$(wc -l <"$candidate_payload/SOURCE_REVISIONS" | tr -d ' ')" == 3 ]] || {
+  echo "candidate source revisions contain unexpected entries" >&2
+  exit 65
+}
+
+for binary in bloom bloom-broker bloom-signer bloom-signer-migrate; do
+  install -m 0755 "$candidate_payload/bin/$binary" "$staging_root/bin/$binary"
+done
+w0_signing_key="$local_output_root/w0-release-key"
+ssh-keygen -q -t ed25519 -N '' -f "$w0_signing_key"
+source_date_epoch="$(git -C "$main_root" show -s --format=%ct HEAD)"
+BLOOM_PLATFORM_CLAIM=macos-unix-principals-w0 \
+  BLOOM_ALLOW_MACOS_UNIX_W0=true \
+  BLOOM_COMPATIBILITY_FILE="$candidate_payload/compatibility-v1.toml" \
+  BLOOM_MACHINE_SHA="$machine_revision" \
+  BLOOM_BROKER_SHA="$broker_revision" \
+  BLOOM_SIGNER_SHA="$signer_revision" \
+  "$main_root/packaging/triad/release/build-bundle.sh" \
+  "$staging_root" \
+  "$distribution_root/$artifact_name" \
+  "$w0_signing_key" \
+  "$source_date_epoch"
+BLOOM_ALLOW_MACOS_UNIX_W0=true \
   "$main_root/packaging/triad/release/verify-bundle.sh" \
   "$distribution_root/$artifact_name" \
   "$distribution_root/$artifact_name.sha256" \

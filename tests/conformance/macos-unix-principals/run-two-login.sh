@@ -64,8 +64,10 @@ for pair in "$login_uid_a:$login_user_a" "$login_uid_b:$login_user_b"; do
   }
 done
 
-triad_source="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
-installer="$triad_source/release/install-macos.sh"
+conformance_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+main_root="$(cd "$conformance_dir/../../.." && pwd -P)"
+release_dir="$main_root/packaging/triad/release"
+installer="$release_dir/install-macos.sh"
 machine_binary="/usr/local/libexec/bloom/current/bloom"
 session_plist="/Library/LaunchAgents/com.bloom.session.plist"
 scratch="$(mktemp -d /private/tmp/bloom-w0-two-login.XXXXXX)"
@@ -388,7 +390,7 @@ if [[ -n "${BLOOM_MACOS_W0_EVIDENCE_DIR:-}" ]]; then
     exit 65
   }
   subject_digest="$(
-    "$triad_source/release/macos-conformance-subject.sh" "$tested_payload"
+    "$release_dir/macos-conformance-subject.sh" "$tested_payload"
   )"
   for criterion in mui_05 mui_06 two_login_lifecycle lifecycle_repair_recovery_retain_restore; do
     temporary="$evidence_dir/.$criterion.$$.new"

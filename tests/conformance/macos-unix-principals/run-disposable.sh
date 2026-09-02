@@ -45,8 +45,10 @@ launchctl print "gui/$login_uid" >/dev/null 2>&1 || {
   exit 69
 }
 
-triad_source="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
-installer="$triad_source/release/install-macos.sh"
+conformance_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+main_root="$(cd "$conformance_dir/../../.." && pwd -P)"
+release_dir="$main_root/packaging/triad/release"
+installer="$release_dir/install-macos.sh"
 enrollment="/Library/Application Support/BloomTriad/enrollments/$login_uid.json"
 rotation_fixtures="$(mktemp -d /private/tmp/bloom-w0-rotation.XXXXXX)"
 process_probe_dir="$(mktemp -d /private/tmp/bloom-w0-process.XXXXXX)"
@@ -445,7 +447,7 @@ chmod 0755 "$process_probe_dir"
   -Wall \
   -Wextra \
   -Werror \
-  "$triad_source/macos/w0/task-access-probe.c" \
+  "$conformance_dir/task-access-probe.c" \
   -o "$process_probe_dir/task-access-probe"
 chmod 0755 "$process_probe_dir/task-access-probe"
 for service_and_uid in \
@@ -580,7 +582,7 @@ broker_durable_before="$(
     shasum -a 256 |
     awk '{print $1}'
 )"
-/usr/bin/nc -l 127.0.0.1 18734 >/dev/null 2>&1 &
+/usr/bin/nc -lk 127.0.0.1 18734 >/dev/null 2>&1 &
 foreign_listener_pid=$!
 deadline=$((SECONDS + 10))
 while [[ $SECONDS -lt $deadline ]]; do
@@ -827,7 +829,7 @@ if [[ "$installed_acceptance_inputs" -ne 0 ]]; then
     echo "installed acceptance requires all three source roots and the evidence directory" >&2
     exit 65
   }
-  "$triad_source/macos/w0/run-installed-acceptance.sh" \
+  "$conformance_dir/run-installed-acceptance.sh" \
     "$current_good_payload" \
     "$login_uid" \
     "$login_user" \
@@ -858,7 +860,7 @@ done
 
 if [[ -n "${BLOOM_MACOS_W0_EVIDENCE_DIR:-}" ]]; then
   subject_digest="$(
-    "$triad_source/release/macos-conformance-subject.sh" "$current_good_payload"
+    "$release_dir/macos-conformance-subject.sh" "$current_good_payload"
   )"
   for criterion in \
     mui_02 \
