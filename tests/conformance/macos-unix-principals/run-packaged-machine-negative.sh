@@ -118,6 +118,7 @@ mkdir -p \
   "$runtime/machine" \
   "$runtime/machine-broker" \
   "$runtime/hostile-signer" \
+  "$clean_home/audit-checkpoints" \
   "$clean_home" \
   "$mount_dir"
 chown "$login_uid" "$runtime/machine"
@@ -132,7 +133,7 @@ chmod 0755 \
   "$runtime/machine-broker" \
   "$runtime/hostile-signer"
 chmod 0755 "$mount_dir"
-chmod 0700 "$clean_home"
+chmod 0700 "$clean_home" "$clean_home/audit-checkpoints"
 
 # Build the out-of-process deterministic ceremony driver before tracing the
 # packaged Machine. The driver talks only to the real Broker HTTP ceremony
