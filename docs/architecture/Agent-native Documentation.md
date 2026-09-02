@@ -12,8 +12,12 @@ platform evolves.
 ## Mount-Root Guidance: `/AGENTS.md` and `/CLAUDE.md`
 
 The primary surface is a single guidance document served at the mount root
-under two aliases, `AGENTS.md` and `CLAUDE.md`, so that both generic agents
-and Claude-family tooling find it by convention.
+under two aliases, `AGENTS.md` and `CLAUDE.md`. Agents find those files by
+convention only when the Bloom mount is their working directory or an ancestor.
+In the common layout where `/bloom` is a sibling mount beside an agent's project,
+the integration or setup skill must explicitly direct the agent to read
+`/bloom/AGENTS.md`; Codex, Claude Code, and OpenCode do not search arbitrary
+sibling mounts for instruction files.
 
 How it works today:
 
@@ -42,6 +46,8 @@ from the release it ships with.
   Machine-owned; signing uses Broker authorization and Signer-held keys; the
   owner key is never handed to an agent or Machine;
 - the outbox stage/confirm flow;
+- native SOL account selection, payloads, reliable route writes, and receipt
+  evidence through the embedded `/docs/solana.md` runbook;
 - paid HTTP under `/requests` (staging, `plan.md`, `confirm`, spend caps);
 - the mounted Sealed Approval lifecycle for the outbox confirm flow —
   permission-denied confirm writes, `approval_challenge.json`,

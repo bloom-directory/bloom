@@ -34,10 +34,11 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# The Python verifier reads the destination's signature history and the
-# finalized transaction directly from a Solana RPC endpoint. The report is only
-# a claimed transcript; it is not evidence that a transfer landed.
-if python3 /tests/verify_result.py /logs/artifacts/result.json; then
+# The agent is not told about evaluation artifacts. Grade only independent VFS
+# and chain state: no pending action may remain, and the fresh destination must
+# have received the exact finalized transfer.
+if [ -z "$(timeout 30 ls -A "${outbox}/pending" 2>/dev/null)" ] && \
+    python3 /tests/verify_result.py; then
   reward=1
 fi
 
@@ -50,7 +51,7 @@ fi
 
 printf '%s\n' "$reward" > /logs/verifier/reward.txt
 if [ "$reward" -eq 1 ]; then
-  printf '%s\n' 'Bloom Solana result and on-chain transfer evidence passed.'
+  printf '%s\n' 'Bloom Solana on-chain transfer evidence passed.'
   exit 0
 fi
 exit 1

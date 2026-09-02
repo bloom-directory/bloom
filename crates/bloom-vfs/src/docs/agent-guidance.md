@@ -11,6 +11,7 @@ Useful commands:
 - `ls docs` lists the embedded documentation.
 - `cat docs/README.md` reads the VFS overview.
 - `cat docs/examples.md` reads workflow examples.
+- `cat docs/solana.md` reads the native SOL transfer runbook.
 - `cat docs/petals.md` discovers the Petals installed in this Bloom home.
 - `ls chains` lists configured networks.
 
@@ -64,6 +65,10 @@ enumerates both together. Solana chains route through the exact same
 (stage at `outbox/new.tx`, confirm/cancel under `outbox/pending/<id>/`,
 inspect `outbox/{pending,sent,failed}/<id>/`) — there is no separate
 Solana-specific surface to look for.
+
+Before staging a native SOL transfer, read `docs/solana.md`. It documents the
+payload shape, account selection, reliable virtual-route writes, Sealed Approval
+retry, and the artifacts that prove finality.
 
 ### Reading Solana balances
 

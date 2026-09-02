@@ -95,7 +95,10 @@ GLM_API_KEY="$GLM_API_KEY" scripts/evals/run-harbor-solana-local.sh
 
 The wrapper defaults to GLM-5.2 through the shared provider adapter. Override
 the model with `BLOOM_EVAL_MODEL`, the wallet with
-`BLOOM_EVAL_SOLANA_WALLET_ID`, or pass `codex`/`claude` as its sole argument.
+`BLOOM_EVAL_SOLANA_WALLET_ID`, or pass `deepseek`, `opencode`, `codex`, or
+`claude` as its sole argument. `deepseek` runs DeepSeek through Claude Code's
+Anthropic-compatible adapter; `opencode` runs the same provider through Harbor's
+native OpenCode adapter.
 Override the isolated roots and developer-only port with the `BLOOM_EVAL_*`
 and `BLOOM_TRIAD_DEV_CEREMONY_PORT` variables when running more than one eval
 triad. A second instance must never share any root, state, wallet, port, mount,
@@ -126,12 +129,38 @@ scripts/evals/run-harbor.sh solana-transfer --preauthorization-only
 scripts/evals/run-harbor.sh solana-transfer claude
 scripts/evals/run-harbor.sh solana-transfer codex
 scripts/evals/run-harbor.sh solana-transfer glm
+scripts/evals/run-harbor.sh solana-transfer deepseek
+scripts/evals/run-harbor.sh solana-transfer opencode
 ```
 
 Set `BLOOM_EVAL_MODEL` to select a different model without changing the
 harness. The GLM adapter defaults to `glm-5.2` and accepts `GLM_API_KEY`,
 `ZAI_API_KEY`, or `ANTHROPIC_AUTH_TOKEN` from the host; the credential is
 forwarded only to Harbor's agent adapter.
+
+`deepseek` and `opencode` both require `DEEPSEEK_API_KEY`. OpenCode model
+overrides use `provider/model` form, for example
+`BLOOM_EVAL_MODEL=deepseek/deepseek-v4-flash`.
+
+The deterministic `smoke` lane is the protocol conformance fixture: it checks
+the real mounted route, approval boundary, broadcast, and verifier without an
+LLM. For each model trial the harness renders one concrete sentence containing
+only the request a user would make: wallet, destination, network, amount, and a
+request to wait for finality. It exposes no eval variables, documentation hint,
+procedure, or reporting schema to the agent. The operational workflow must be
+discovered from the mounted VFS. The verifier grades independent chain and VFS
+state, not an agent-authored report.
+
+This is a controlled representation of a real session, not a byte-for-byte
+copy. Harbor runs each CLI in a clean `/app` workspace with a temporary tool
+home and non-interactive permissions, while a developer normally has a project,
+settings, skills, and prior conversation. The important topology is preserved:
+Bloom is a sibling mount at `/bloom`, and every wallet read and write reaches the
+real VFS.
+The host auto-completes the owner's ceremony only after independently checking
+the staged terms. Consequently this eval measures Bloom workflow discovery and
+safe execution; it does not measure setup-skill discovery, permission prompts,
+or the human approval UI.
 
 When the triad is shared with other developers or agents, source the lifecycle
 owner's current `triad.env` and hold the triad mutation lease around the entire
@@ -221,11 +250,10 @@ scripts/evals/test-solana-live.sh
 RPC, which proves the logic but not that it matches what a Solana node actually
 returns. This runs the same code against a real validator with real transfers,
 and exercises the host sweep, which cannot be tested at all without a chain. It
-makes a truthful report pass, makes five tampered reports fail, pays the
-destination a second time and confirms the previously-valid report is then
-rejected, and finally sweeps the destination and confirms the drain from the
-chain. It refuses any endpoint that is not local, and refuses the mainnet-beta
-genesis outright.
+accepts the exact transfer from independent chain evidence, pays the destination
+a second time and confirms the previously valid transfer is then rejected, and
+finally sweeps the destination and confirms the drain from the chain. It refuses
+any endpoint that is not local, and refuses the mainnet-beta genesis outright.
 
 ### What live runs have confirmed
 
@@ -267,10 +295,10 @@ behaviour this task depends on:
 - the verifier's `jsonParsed` expectations match a real node's response exactly,
   including `program`, `programId`, `parsed.type`, `info`, `meta.fee` and an
   empty `innerInstructions`;
-- a report that disagrees with the chain on amount, slot, signature, fee, or
-  source is rejected against real data, not just against fixtures;
+- the verifier requires the exact source, destination, amount, transaction
+  shape, finality, and fee ceiling from chain data rather than agent claims;
 - the freshness binding holds: paying the destination a second time invalidates
-  a report that passed moments earlier;
+  a transfer that passed moments earlier;
 - the host sweep drains a funded destination and returns the lamports, and a
   second sweep over an empty one correctly does nothing;
 - a faucet credit is confirmed well before it is finalized, which is why every

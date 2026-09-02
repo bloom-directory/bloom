@@ -6,7 +6,7 @@ harbor_version="${HARBOR_VERSION:-0.21.0}"
 
 if [ "$#" -ne 1 ]; then
   printf '%s\n' \
-    'Usage: scripts/evals/run-harbor-hyperliquid.sh claude|codex|deepseek|glm|--preauthorization-only' >&2
+    'Usage: scripts/evals/run-harbor-hyperliquid.sh claude|codex|deepseek|glm|opencode|--preauthorization-only' >&2
   exit 2
 fi
 

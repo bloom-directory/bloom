@@ -26,6 +26,7 @@ import json
 import os
 import re
 import secrets
+import shutil
 import stat
 import subprocess
 import sys
@@ -859,37 +860,51 @@ class SolanaTransferEval(EvalDefinition):
             },
         ]
 
-        runtime_env = {
+        verifier_env = {
             "BLOOM_EVAL_SOLANA_WALLET_ID": self.wallet_id,
             "BLOOM_EVAL_SOLANA_CHAIN": self.chain,
-            "BLOOM_EVAL_SOLANA_NETWORK": self.network,
+            "BLOOM_EVAL_SOLANA_RPC_URL": self.rpc_url,
+            "BLOOM_EVAL_SOLANA_MAX_FEE_LAMPORTS": str(self.max_fee_lamports),
+            "BLOOM_EVAL_SOLANA_SOURCE": self.source_address,
             "BLOOM_EVAL_SOLANA_DESTINATION": self.destination,
             "BLOOM_EVAL_SOLANA_LAMPORTS": str(self.lamports),
         }
-        verifier_env = dict(runtime_env)
-        # Only the verifier gets the RPC endpoint and the identity expectations.
-        # The agent must discover the source, fingerprint, and derivation path
-        # from the mount; handing them over would remove most of the task.
-        verifier_env.update(
-            {
-                "BLOOM_EVAL_SOLANA_RPC_URL": self.rpc_url,
-                "BLOOM_EVAL_SOLANA_MAX_FEE_LAMPORTS": str(self.max_fee_lamports),
-                "BLOOM_EVAL_SOLANA_SOURCE": self.source_address,
-                "BLOOM_EVAL_SOLANA_KEY_FINGERPRINT": self.key_fingerprint,
-                "BLOOM_EVAL_SOLANA_DERIVATION_PATH": self.derivation_path,
-            }
-        )
 
         self._start_approver(sign_count)
         self.jobs_dir.mkdir(parents=True, exist_ok=True)
+        task_dir = self.jobs_dir.parent / "tasks" / self.trial_id
+        task_template = Path(__file__).resolve().parent.parent / "tasks/solana-transfer"
+        shutil.copytree(task_template, task_dir)
+        whole, fractional = divmod(self.lamports, 1_000_000_000)
+        sol = (
+            str(whole)
+            if fractional == 0
+            else f"{whole}.{fractional:09d}".rstrip("0")
+        )
+        (task_dir / "instruction.md").write_text(
+            f"Using Bloom, send exactly {sol} SOL from my `{self.wallet_id}` wallet "
+            f"to `{self.destination}` on `{self.chain}`. Wait until it is finalized "
+            "and tell me the result.\n"
+        )
+        extra_docker_compose: list[Path] = []
+        if self.lane == "local":
+            # The local validator deliberately listens on host loopback. Harbor's
+            # verifier otherwise sees its container's loopback and cannot inspect
+            # the transfer it is grading. Keep this override local-only: the
+            # mainnet lane neither needs nor receives host networking.
+            extra_docker_compose.append(
+                self.repo_root
+                / "evals/harbor/tasks/solana-transfer/docker-compose.local.yaml"
+            )
         return EvalRunContext(
             eval_name=self.name,
-            task_dir=self.repo_root / "evals/harbor/tasks/solana-transfer",
+            task_dir=task_dir,
             job_name=f"bloom-solana-{agent_name}-{stamp}",
             jobs_dir=self.jobs_dir,
             mounts=mounts,
-            agent_env=runtime_env,
+            agent_env={},
             verifier_env=verifier_env,
+            extra_docker_compose=extra_docker_compose,
         )
 
     async def run_smoke(self, context: EvalRunContext, _agent: Any) -> Any:
@@ -990,34 +1005,10 @@ class SolanaTransferEval(EvalDefinition):
         assert isinstance(receipt, dict)
         if receipt.get("signature") != attempted.get("signature"):
             raise EvalError("smoke receipt signature differs from broadcast attempt")
-        report = {
-            "schema": "bloom.eval.solana_transfer.v1",
-            "status": "complete",
-            "network": self.network,
-            "chain": self.chain,
-            "wallet_id": self.wallet_id,
-            "source_address": self.source_address,
-            "key_fingerprint": self.key_fingerprint,
-            "derivation_path": self.derivation_path,
-            "destination": self.destination,
-            "lamports": self.lamports,
-            "fee_lamports": intent.get("fee_lamports"),
-            "blockhash": intent.get("blockhash"),
-            "pending_id": pending_id,
-            "signature": receipt.get("signature"),
-            "slot": receipt.get("slot"),
-            "confirmation_status": receipt.get("confirmation_status"),
-            "outcome": receipt.get("outcome"),
-            "pending_entries_after": len(self._list_state("pending")),
-            "confirm_failed_before_approval": True,
-        }
-        report_path = context.jobs_dir / f"{context.job_name}-smoke-result.json"
-        report_path.write_text(json.dumps(report, separators=(",", ":")))
         verifier = subprocess.run(
             [
                 sys.executable,
                 str(context.task_dir / "tests/verify_result.py"),
-                str(report_path),
             ],
             env={**os.environ, **context.verifier_env},
             capture_output=True,

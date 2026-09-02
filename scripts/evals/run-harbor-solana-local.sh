@@ -38,14 +38,14 @@ rpc_url="http://127.0.0.1:${rpc_port}"
 die() { printf 'Bloom Solana local eval: %s\n' "$*" >&2; exit 1; }
 usage() {
   printf '%s\n' \
-    'Usage: scripts/evals/run-harbor-solana-local.sh [smoke|glm|deepseek|codex|claude]' \
+    'Usage: scripts/evals/run-harbor-solana-local.sh [smoke|glm|deepseek|opencode|codex|claude]' \
     '' \
     'Defaults to GLM-5.2 and a dedicated solana-eval wallet. The first run' \
     'creates an isolated local-only triad; later runs safely reuse it.'
 }
 
 case "$agent" in
-  smoke|glm|deepseek|codex|claude) ;;
+  smoke|glm|deepseek|opencode|codex|claude) ;;
   -h|--help) usage; exit 0 ;;
   *) usage >&2; exit 2 ;;
 esac
@@ -62,7 +62,7 @@ if [ "$agent" = glm ]; then
   [ -n "${GLM_API_KEY:-${ZAI_API_KEY:-${ANTHROPIC_AUTH_TOKEN:-}}}" ] ||
     die "GLM auth is missing; export GLM_API_KEY, ZAI_API_KEY, or ANTHROPIC_AUTH_TOKEN"
 fi
-if [ "$agent" = deepseek ]; then
+if [ "$agent" = deepseek ] || [ "$agent" = opencode ]; then
   [ -n "${DEEPSEEK_API_KEY:-}" ] ||
     die "DeepSeek auth is missing; export DEEPSEEK_API_KEY"
 fi

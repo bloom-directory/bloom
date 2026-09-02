@@ -411,6 +411,9 @@ AGENTS: dict[str, AgentSpec] = {
     # DeepSeek exposes its current models through an Anthropic-compatible API,
     # which lets the Claude Code adapter retain its normal tool loop.
     "deepseek": AgentSpec("claude-code", "deepseek-v4-flash"),
+    # Exercise the actual OpenCode tool loop with DeepSeek's native provider.
+    # OpenCode model ids include the provider prefix.
+    "opencode": AgentSpec("opencode", "deepseek/deepseek-v4-flash"),
     # Z.AI exposes GLM Coding Plan through an Anthropic-compatible endpoint,
     # so Harbor can run it with its existing Claude Code adapter.
     "glm": AgentSpec("claude-code", "glm-5.2"),
@@ -426,6 +429,7 @@ class EvalRunContext:
     mounts: Sequence[Mapping[str, Any]]
     agent_env: Mapping[str, str]
     verifier_env: Mapping[str, str]
+    extra_docker_compose: Sequence[Path] = ()
 
 
 class EvalDefinition(ABC):
@@ -522,6 +526,7 @@ async def run_harbor_job(context: EvalRunContext, agent: AgentSpec) -> Any:
         environment=EnvironmentConfig(
             type=EnvironmentType.DOCKER,
             mounts=list(context.mounts),
+            extra_docker_compose=list(context.extra_docker_compose),
         ),
         verifier=VerifierConfig(env=dict(context.verifier_env)),
         tasks=[TaskConfig(path=context.task_dir)],
@@ -575,6 +580,11 @@ def _agent_spec(name: str) -> AgentSpec:
             ANTHROPIC_BASE_URL="https://api.deepseek.com/anthropic",
             API_TIMEOUT_MS="3000000",
         )
+    if name == "opencode":
+        api_key = os.getenv("DEEPSEEK_API_KEY")
+        if not api_key:
+            raise EvalError("OpenCode DeepSeek auth is missing; set DEEPSEEK_API_KEY")
+        agent_env["DEEPSEEK_API_KEY"] = api_key
     if name == "codex" and not os.getenv("OPENAI_API_KEY"):
         auth_file = Path.home() / ".codex" / "auth.json"
         if not auth_file.is_file():
@@ -584,6 +594,11 @@ def _agent_spec(name: str) -> AgentSpec:
     model = os.getenv("BLOOM_EVAL_MODEL", spec.model).strip()
     if not model:
         raise EvalError("BLOOM_EVAL_MODEL must not be empty")
+    if name == "opencode" and "/" not in model:
+        raise EvalError(
+            "BLOOM_EVAL_MODEL for OpenCode must be provider/model, "
+            "for example deepseek/deepseek-v4-flash"
+        )
     agent_kwargs = dict(spec.kwargs)
     if spec.harbor_name == "claude-code":
         raw_max_turns = os.getenv("BLOOM_EVAL_MAX_TURNS", "20").strip()

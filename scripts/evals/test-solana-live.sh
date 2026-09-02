@@ -76,66 +76,17 @@ export BLOOM_EVAL_SOLANA_CHAIN="solana-local"
 export BLOOM_EVAL_SOLANA_WALLET_ID="eval-solana"
 export BLOOM_EVAL_SOLANA_SOURCE="$src"
 export BLOOM_EVAL_SOLANA_DESTINATION="$dst"
-export BLOOM_EVAL_SOLANA_KEY_FINGERPRINT="a3f1c09b2e7d4856"
-export BLOOM_EVAL_SOLANA_DERIVATION_PATH="m/44'/501'/0'/0'"
 export BLOOM_EVAL_SOLANA_LAMPORTS="$lamports"
 export BLOOM_EVAL_SOLANA_MAX_FEE_LAMPORTS="10000"
 
-python3 - "$tmp" "$src" "$dst" "$signature" "$slot" "$lamports" <<'PY'
-import json, pathlib, sys
-tmp, src, dst, signature, slot, lamports = sys.argv[1:7]
-pathlib.Path(tmp, "report.json").write_text(json.dumps({
-    "schema": "bloom.eval.solana_transfer.v1",
-    "status": "complete",
-    "network": "local",
-    "chain": "solana-local",
-    "wallet_id": "eval-solana",
-    "source_address": src,
-    "key_fingerprint": "a3f1c09b2e7d4856",
-    "derivation_path": "m/44'/501'/0'/0'",
-    "destination": dst,
-    "lamports": int(lamports),
-    "fee_lamports": 5000,
-    "blockhash": "EkSnNWid2cvwEVnVx9aBqawnmiCNiDgp3gUdkDPTKN1N",
-    "pending_id": "sol-0000000000000000000000000000000f",
-    "signature": signature,
-    "slot": int(slot),
-    "confirmation_status": "finalized",
-    "outcome": "success",
-    "pending_entries_after": 0,
-    "confirm_failed_before_approval": True,
-}))
-PY
-
-python3 "$verifier" "$tmp/report.json"
-printf '%s\n' 'truthful report accepted against the live chain'
-
-# Each of these disagrees with the chain in exactly one place.
-python3 - "$tmp" "$verifier" <<'PY'
-import json, pathlib, subprocess, sys
-
-tmp, verifier = pathlib.Path(sys.argv[1]), sys.argv[2]
-good = json.loads((tmp / "report.json").read_text())
-cases = {
-    "wrong-amount": {"lamports": 999},
-    "wrong-slot": {"slot": good["slot"] + 7},
-    "wrong-signature": {"signature": "4" * 87},
-    "wrong-fee": {"fee_lamports": 4999},
-    "wrong-source": {"source_address": good["destination"]},
-}
-for name, change in cases.items():
-    path = tmp / f"bad_{name}.json"
-    path.write_text(json.dumps(dict(good, **change)))
-    if subprocess.run([sys.executable, verifier, str(path)], capture_output=True).returncode == 0:
-        raise SystemExit(f"a report disagreeing with the chain passed: {name}")
-print("every tampered report was rejected against the live chain")
-PY
+python3 "$verifier"
+printf '%s\n' 'the exact transfer was accepted against the live chain'
 
 # The whole verification design rests on the destination being fresh, so paying
-# it twice must invalidate a report that was valid a moment ago.
+# it twice must invalidate a transfer that was valid a moment ago.
 solana transfer "$dst" 0.0001 --from "$tmp/src.json" --keypair "$tmp/src.json" \
   --url "$rpc" --commitment finalized --allow-unfunded-recipient >/dev/null
-if python3 "$verifier" "$tmp/report.json" >/dev/null 2>&1; then
+if python3 "$verifier" >/dev/null 2>&1; then
   printf '%s\n' 'a destination paid twice still passed; the freshness binding is broken' >&2
   exit 1
 fi

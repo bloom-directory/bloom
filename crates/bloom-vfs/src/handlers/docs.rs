@@ -10,6 +10,7 @@ use crate::path::VfsPath;
 pub struct DocsHandler {
     readme: String,
     examples: String,
+    solana: String,
     petals: Arc<dyn Fn() -> Vec<u8> + Send + Sync>,
 }
 
@@ -18,6 +19,7 @@ impl Default for DocsHandler {
         Self {
             readme: include_str!("../docs/README.md").to_string(),
             examples: include_str!("../docs/examples.md").to_string(),
+            solana: include_str!("../docs/solana.md").to_string(),
             petals: Arc::new(|| {
                 b"# Installed Petals\n\nNo Petals are currently installed.\n".to_vec()
             }),
@@ -72,6 +74,7 @@ impl DocsHandler {
             [] => Ok(Entry::dir("")),
             [s] if s == "README.md" => Ok(Entry::file("README.md")),
             [s] if s == "examples.md" => Ok(Entry::file("examples.md")),
+            [s] if s == "solana.md" => Ok(Entry::file("solana.md")),
             [s] if s == "petals.md" => Ok(Entry::file("petals.md")),
             _ => Err(HandlerError::not_found(path.to_string_path())),
         }
@@ -81,6 +84,7 @@ impl DocsHandler {
         match path.segments() {
             [s] if s == "README.md" => Ok(self.readme.as_bytes().to_vec()),
             [s] if s == "examples.md" => Ok(self.examples.as_bytes().to_vec()),
+            [s] if s == "solana.md" => Ok(self.solana.as_bytes().to_vec()),
             [s] if s == "petals.md" => Ok((self.petals)()),
             _ => Err(HandlerError::NotAFile(path.to_string_path())),
         }
@@ -91,6 +95,7 @@ impl DocsHandler {
             Ok(vec![
                 Entry::file("README.md"),
                 Entry::file("examples.md"),
+                Entry::file("solana.md"),
                 Entry::file("petals.md"),
             ])
         } else {
@@ -109,7 +114,10 @@ mod tests {
         let h = DocsHandler::new();
         let entries = h.list(&VfsPath::root()).await.unwrap();
         let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
-        assert_eq!(names, ["README.md", "examples.md", "petals.md"]);
+        assert_eq!(
+            names,
+            ["README.md", "examples.md", "solana.md", "petals.md"]
+        );
         for e in &entries {
             assert_eq!(e.kind, EntryKind::File);
             // Entry::file => read-only mode.
@@ -138,7 +146,7 @@ mod tests {
     #[tokio::test]
     async fn lookup_known_files_are_files() {
         let h = DocsHandler::new();
-        for name in ["README.md", "examples.md", "petals.md"] {
+        for name in ["README.md", "examples.md", "solana.md", "petals.md"] {
             let p = VfsPath::parse(&format!("/{name}")).unwrap();
             let e = h.lookup(&p).await.unwrap();
             assert_eq!(e.kind, EntryKind::File);
@@ -194,6 +202,15 @@ mod tests {
             .unwrap();
         assert!(!examples.is_empty(), "examples.md must have content");
         assert!(std::str::from_utf8(&examples).is_ok());
+
+        let solana = h
+            .read(&VfsPath::parse("/solana.md").unwrap())
+            .await
+            .unwrap();
+        let solana = std::str::from_utf8(&solana).expect("solana.md is utf-8");
+        assert!(solana.contains("account_fingerprint"));
+        assert!(solana.contains("broadcast_attempted.json"));
+        assert!(solana.contains("os.fsync"));
     }
 
     #[tokio::test]

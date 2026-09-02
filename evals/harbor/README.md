@@ -472,3 +472,9 @@ The [native SOL transfer evaluation](tasks/solana-transfer/README.md) has its
 own operator guide because its irreversible transfer, compile-time canary,
 host sweep, and outbox approval model differ materially from Hyperliquid's
 reversible order/cancel workflow.
+
+Its deterministic smoke lane checks protocol conformance. Paid model lanes are
+documentation-discovery evaluations: they are told to enter through the
+mount-root `AGENTS.md`, while the native SOL workflow lives in the mounted
+`docs/solana.md`. Harbor's `opencode` agent is available with DeepSeek as
+`scripts/evals/run-harbor-solana-local.sh opencode`.

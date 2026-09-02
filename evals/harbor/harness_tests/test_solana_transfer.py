@@ -420,12 +420,38 @@ class ProvisionTests(SolanaEvalTestCase):
         with mock.patch.object(definition, "_start_approver"):
             context = definition.provision("codex")
 
-        self.assertNotIn("BLOOM_EVAL_SOLANA_SOURCE", context.agent_env)
-        self.assertNotIn("BLOOM_EVAL_SOLANA_KEY_FINGERPRINT", context.agent_env)
-        self.assertNotIn("BLOOM_EVAL_SOLANA_RPC_URL", context.agent_env)
+        self.assertEqual(context.agent_env, {})
+        instruction = (context.task_dir / "instruction.md").read_text()
+        self.assertIn("Using Bloom, send exactly", instruction)
+        self.assertIn(WALLET_ID, instruction)
+        self.assertIn(DESTINATION, instruction)
+        self.assertNotIn("/bloom", instruction)
+        self.assertNotIn("BLOOM_EVAL_", instruction)
+        self.assertNotIn("result.json", instruction)
         # The verifier needs all of it to grade independently.
         self.assertEqual(context.verifier_env["BLOOM_EVAL_SOLANA_SOURCE"], SOURCE)
         self.assertIn("BLOOM_EVAL_SOLANA_RPC_URL", context.verifier_env)
+
+    def test_local_lane_shares_host_loopback_with_the_verifier(self) -> None:
+        definition = self.make(BLOOM_EVAL_SOLANA_LANE="local")
+        definition.destination = DESTINATION
+        definition.source_address = SOURCE
+        with mock.patch.object(definition, "_start_approver"):
+            context = definition.provision("codex")
+
+        self.assertEqual(len(context.extra_docker_compose), 1)
+        self.assertEqual(
+            context.extra_docker_compose[0].name, "docker-compose.local.yaml"
+        )
+
+    def test_mainnet_lane_does_not_receive_host_networking(self) -> None:
+        definition = self.make(BLOOM_EVAL_SOLANA_LANE="mainnet-canary")
+        definition.destination = DESTINATION
+        definition.source_address = SOURCE
+        with mock.patch.object(definition, "_start_approver"):
+            context = definition.provision("codex")
+
+        self.assertEqual(context.extra_docker_compose, [])
 
 
 class TrialAmountTests(unittest.TestCase):

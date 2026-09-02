@@ -139,6 +139,34 @@ class HarnessLifecycleTests(unittest.TestCase):
             with self.assertRaisesRegex(EvalError, "DeepSeek auth is missing"):
                 _agent_spec("deepseek")
 
+    def test_opencode_uses_deepseek_native_provider(self) -> None:
+        with mock.patch.dict(
+            os.environ, {"DEEPSEEK_API_KEY": "test-deepseek-key"}, clear=True
+        ):
+            spec = _agent_spec("opencode")
+
+        self.assertEqual(spec.harbor_name, "opencode")
+        self.assertEqual(spec.model, "deepseek/deepseek-v4-flash")
+        self.assertEqual(spec.env["DEEPSEEK_API_KEY"], "test-deepseek-key")
+        self.assertNotIn("ANTHROPIC_BASE_URL", spec.env)
+
+    def test_opencode_requires_its_api_key(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=True):
+            with self.assertRaisesRegex(EvalError, "OpenCode DeepSeek auth is missing"):
+                _agent_spec("opencode")
+
+    def test_opencode_model_override_requires_provider_prefix(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {
+                "DEEPSEEK_API_KEY": "test-deepseek-key",
+                "BLOOM_EVAL_MODEL": "deepseek-v4-flash",
+            },
+            clear=True,
+        ):
+            with self.assertRaisesRegex(EvalError, "provider/model"):
+                _agent_spec("opencode")
+
     def test_claude_adapter_turn_limit_is_bounded(self) -> None:
         with mock.patch.dict(
             os.environ,

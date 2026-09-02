@@ -221,9 +221,19 @@ assert task["environment"]["docker_image"] == EVAL_IMAGE
 # approval, retries, then waits for finalization.
 assert task["agent"]["timeout_sec"] >= 1200.0
 instruction = Path("${solana_task}/instruction.md").read_text()
-assert "confirm.tmp" in instruction
-assert "os.fsync" in instruction
-assert "one shell loop" in instruction
+solana_guide = Path("${repo_root}/crates/bloom-vfs/src/docs/solana.md").read_text()
+solana_harness = Path("${repo_root}/evals/harbor/harness/solana_transfer.py").read_text()
+assert instruction == "This file is replaced with a concrete, user-like request for every trial.\n"
+assert "Using Bloom, send exactly" in solana_harness
+assert "agent_env={}" in solana_harness
+assert "/bloom/AGENTS.md" not in instruction
+assert "result.json" not in instruction
+assert "os.fsync" in solana_guide
+assert "account_fingerprint" in solana_guide
+assert "approval_challenge.json" in solana_guide
+assert "broadcast_attempted.json" in solana_guide
+assert "validity clock starts" in solana_guide
+assert "start a bounded serial retry loop immediately" in solana_guide
 SOLTOML
 
 # Serve deterministic Solana RPC responses so the verifier's trust boundary is
@@ -305,8 +315,6 @@ export BLOOM_EVAL_SOLANA_CHAIN="solana-mainnet"
 export BLOOM_EVAL_SOLANA_WALLET_ID="eval-solana"
 export BLOOM_EVAL_SOLANA_SOURCE="9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin"
 export BLOOM_EVAL_SOLANA_DESTINATION="6dmNQ5jwLeLk5REvio1JcMshcbvkYMwy26sJ8pbkvStu"
-export BLOOM_EVAL_SOLANA_KEY_FINGERPRINT="a3f1c09b2e7d4856"
-export BLOOM_EVAL_SOLANA_DERIVATION_PATH="m/44'/501'/0'/0'"
 export BLOOM_EVAL_SOLANA_LAMPORTS="1003517"
 export BLOOM_EVAL_SOLANA_MAX_FEE_LAMPORTS="10000"
 
@@ -320,65 +328,39 @@ done
 [ -s "$solana_port_file" ] || { printf '%s\n' 'fake Solana RPC did not start' >&2; exit 1; }
 export BLOOM_EVAL_SOLANA_RPC_URL="http://127.0.0.1:$(cat "$solana_port_file")/"
 
-python3 - "$tmp" "${solana_task}/tests/verify_result.py" <<'SOLCASES'
-import json
-import pathlib
+python3 - "${solana_task}/tests/verify_result.py" <<'SOLCASES'
+import os
 import subprocess
 import sys
 
-tmp = pathlib.Path(sys.argv[1])
-verifier = sys.argv[2]
-
-good = {
-    "schema": "bloom.eval.solana_transfer.v1",
-    "status": "complete",
-    "network": "mainnet-beta",
-    "chain": "solana-mainnet",
-    "wallet_id": "eval-solana",
-    "source_address": "9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin",
-    "key_fingerprint": "a3f1c09b2e7d4856",
-    "derivation_path": "m/44'/501'/0'/0'",
-    "destination": "6dmNQ5jwLeLk5REvio1JcMshcbvkYMwy26sJ8pbkvStu",
-    "lamports": 1003517,
-    "fee_lamports": 5000,
-    "blockhash": "EkSnNWid2cvwEVnVx9aBqawnmiCNiDgp3gUdkDPTKN1N",
-    "pending_id": "0001",
-    "signature": "5" * 87,
-    "slot": 301442118,
-    "confirmation_status": "finalized",
-    "outcome": "success",
-    "pending_entries_after": 0,
-    "confirm_failed_before_approval": True,
-}
+verifier = sys.argv[1]
 
 
-def run(name, report):
-    path = tmp / f"solana_{name}.json"
-    path.write_text(json.dumps(report))
-    return subprocess.run([sys.executable, verifier, str(path)], capture_output=True)
+def run(**changes):
+    env = dict(os.environ)
+    env.update(changes)
+    return subprocess.run([sys.executable, verifier], env=env, capture_output=True)
 
 
-result = run("good", good)
+result = run()
 if result.returncode != 0:
     raise SystemExit(
-        "truthful Solana report rejected: " + result.stderr.decode(errors="replace")
+        "valid Solana transfer rejected: " + result.stderr.decode(errors="replace")
     )
 
 adversarial = {
-    "wrong-amount": {"lamports": 1},
-    "wrong-destination": {"destination": "9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin"},
-    "wrong-signature": {"signature": "4" * 87},
-    "wrong-slot": {"slot": 1},
-    "wrong-fee": {"fee_lamports": 1},
-    "unfinalized": {"confirmation_status": "confirmed"},
-    "not-complete": {"status": "partial"},
-    "residual-pending": {"pending_entries_after": 1},
-    "boundary-not-observed": {"confirm_failed_before_approval": False},
-    "wrong-wallet": {"wallet_id": "someone-else"},
+    "wrong-amount": {"BLOOM_EVAL_SOLANA_LAMPORTS": "1"},
+    "wrong-destination": {
+        "BLOOM_EVAL_SOLANA_DESTINATION": "9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin"
+    },
+    "wrong-source": {
+        "BLOOM_EVAL_SOLANA_SOURCE": "6dmNQ5jwLeLk5REvio1JcMshcbvkYMwy26sJ8pbkvStu"
+    },
+    "fee-over-ceiling": {"BLOOM_EVAL_SOLANA_MAX_FEE_LAMPORTS": "1"},
 }
-for name, changes in adversarial.items():
-    if run(name, dict(good, **changes)).returncode == 0:
-        raise SystemExit(f"invalid Solana fixture passed: {name}")
+for name, environment in adversarial.items():
+    if run(**environment).returncode == 0:
+        raise SystemExit(f"invalid Solana expectation passed: {name}")
 SOLCASES
 
 printf '%s\n' 'Solana static checks passed.'
