@@ -74,6 +74,7 @@ pub struct StoreData {
     petal_hash: String,
     net_policy: NetPolicy,
     sign_context: Option<PetalRouteContext>,
+    key_derive_allowed_routes: Vec<String>,
     sign_intents: Option<BTreeSet<String>>,
     store_namespaces: Option<StoreNamespacePolicy>,
     http_response_cap: usize,
@@ -116,6 +117,9 @@ pub struct RunOptions {
     /// Optional private-store namespace policy. `None` preserves legacy/direct
     /// VM behavior; Petal package dispatch sets this from `[store]`.
     pub store_namespaces: Option<StoreNamespacePolicy>,
+    /// Manifest-declared route IDs resolved from canonical patterns at package
+    /// validation time. Empty preserves the legacy guest-supplied scope.
+    pub key_derive_allowed_routes: Vec<String>,
     pub http_response_cap: usize,
     pub private_store_root: Option<PathBuf>,
     /// Force mediated env helpers to deterministic values for install-time checks.
@@ -134,6 +138,7 @@ impl Default for RunOptions {
             net_policy: None,
             sign_intents: None,
             store_namespaces: None,
+            key_derive_allowed_routes: Vec::new(),
             http_response_cap: DEFAULT_HTTP_RESPONSE_CAP,
             private_store_root: None,
             deterministic_env: false,
@@ -261,6 +266,7 @@ impl PetalVm {
                 petal_hash: petal_hash.to_string(),
                 net_policy: opts.net_policy.clone().unwrap_or_else(NetPolicy::deny_all),
                 sign_context: None,
+                key_derive_allowed_routes: opts.key_derive_allowed_routes.clone(),
                 sign_intents: opts.sign_intents.clone(),
                 store_namespaces: opts.store_namespaces.clone(),
                 http_response_cap: opts.http_response_cap,
@@ -335,6 +341,7 @@ impl PetalVm {
                         .iter()
                         .find_map(|(name, value)| (name == "actor").then(|| value.clone())),
                 }),
+                key_derive_allowed_routes: opts.key_derive_allowed_routes.clone(),
                 sign_intents: opts.sign_intents.clone(),
                 store_namespaces: opts.store_namespaces.clone(),
                 http_response_cap: opts.http_response_cap,
@@ -408,6 +415,7 @@ impl PetalVm {
                 petal_hash: petal_hash.to_string(),
                 net_policy: opts.net_policy.clone().unwrap_or_else(NetPolicy::deny_all),
                 sign_context: None,
+                key_derive_allowed_routes: opts.key_derive_allowed_routes.clone(),
                 sign_intents: opts.sign_intents.clone(),
                 store_namespaces: opts.store_namespaces.clone(),
                 http_response_cap: opts.http_response_cap,
@@ -1447,6 +1455,9 @@ async fn component_petal_key_request(
         }
     };
     let mut request = PetalKeyRequest::from(guest);
+    if !store.data().key_derive_allowed_routes.is_empty() {
+        request.allowed_routes = store.data().key_derive_allowed_routes.clone();
+    }
     request.context = store.data().sign_context.clone();
     let host = store.data().host.clone();
     match host.petal_key_request(request).await {
@@ -3931,6 +3942,7 @@ paths = ["/status"]
             actor: None,
         };
         store.data_mut().sign_context = Some(context.clone());
+        store.data_mut().key_derive_allowed_routes = vec!["r000007".into(), "r000008".into()];
 
         let attempted_override = serde_json::to_vec(&serde_json::json!({
             "request_id": "agent-a",
@@ -3956,7 +3968,7 @@ paths = ["/status"]
         let request = serde_json::to_vec(&serde_json::json!({
             "wallet_id": "primary",
             "key_slot": "desk-a",
-            "allowed_routes": ["r000007"],
+            "allowed_routes": ["r999999"],
             "allowed_operation_classes": ["order.place"],
             "allowed_crypto_suites": ["secp256k1-keccak256-recoverable"],
             "maximum_lifetime_ms": 60_000
@@ -3979,6 +3991,7 @@ paths = ["/status"]
         let calls = host.petal_key_calls.lock();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].context, Some(context));
+        assert_eq!(calls[0].allowed_routes, ["r000007", "r000008"]);
     }
 
     #[tokio::test]
@@ -4913,6 +4926,7 @@ paths = ["/status"]
                 petal_hash: VALID_HASH.into(),
                 net_policy,
                 sign_context: None,
+                key_derive_allowed_routes: Vec::new(),
                 sign_intents: None,
                 store_namespaces: None,
                 http_response_cap: DEFAULT_HTTP_RESPONSE_CAP,

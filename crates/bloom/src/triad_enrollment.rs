@@ -1062,6 +1062,7 @@ mod tests {
                 "fixture.delegated".into(),
                 "fixture.immediate".into(),
             ],
+            key_derive_allowed_routes: vec!["r000001".into()],
         };
 
         let classes = developer_route_operation_classes(&route)

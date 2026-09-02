@@ -13,6 +13,7 @@ allowed_intents = ["fixture.payload", "fixture.unrelated"]
 [[key.derive]]
 route = "session.json"
 operation_classes = ["fixture.payload"]
+allowed_routes = ["session.json"]
 
 [store]
 namespaces = ["fixture-public"]

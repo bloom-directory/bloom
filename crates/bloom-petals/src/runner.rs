@@ -521,6 +521,7 @@ impl PetalRunner {
             Some(mask) => declared_store_policy.intersect(&mask),
             None => declared_store_policy,
         });
+        opts.key_derive_allowed_routes = matched.route.key_derive_allowed_routes.clone();
         self.vm
             .dispatch_component_route(
                 &wasm,

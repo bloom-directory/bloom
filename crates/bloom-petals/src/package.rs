@@ -148,6 +148,14 @@ struct KeyPolicyToml {
 struct KeyDerivePolicyToml {
     route: String,
     operation_classes: Vec<String>,
+    #[serde(default)]
+    allowed_routes: Vec<String>,
+}
+
+#[derive(Debug)]
+struct ValidatedKeyDerivePolicy {
+    operation_classes: Vec<String>,
+    allowed_route_ids: Vec<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -334,6 +342,8 @@ pub struct RouteIndexRecord {
     pub install_metadata: InstallRouteMetadata,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub key_derive_operation_classes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub key_derive_allowed_routes: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -488,7 +498,7 @@ impl PreparedPetalPackage {
                 manifest.name
             )));
         }
-        let key_derive_operation_classes =
+        let key_derive_policies =
             validate_key_derive_policy(&manifest.key, &route_files, &allowed_sign_intents)?;
         let policy_hash = hex::encode(blake3::hash(manifest_bytes).as_bytes());
         let mut route_index = RouteIndex {
@@ -575,9 +585,12 @@ impl PreparedPetalPackage {
                 }
                 source_validation
             };
-            let route_key_derive_operation_classes = key_derive_operation_classes
-                .get(&route.pattern)
-                .cloned()
+            let route_key_derive_policy = key_derive_policies.get(&route.pattern);
+            let route_key_derive_operation_classes = route_key_derive_policy
+                .map(|policy| policy.operation_classes.clone())
+                .unwrap_or_default();
+            let route_key_derive_allowed_routes = route_key_derive_policy
+                .map(|policy| policy.allowed_route_ids.clone())
                 .unwrap_or_default();
             if !route_key_derive_operation_classes.is_empty()
                 && !validation
@@ -635,8 +648,10 @@ impl PreparedPetalPackage {
                 specificity: route.specificity.as_array(),
                 install_metadata,
                 key_derive_operation_classes: route_key_derive_operation_classes,
+                key_derive_allowed_routes: route_key_derive_allowed_routes,
             });
         }
+        validate_resolved_key_derive_scopes(&route_index.routes)?;
 
         Ok(Self {
             hash,
@@ -3849,14 +3864,14 @@ fn validate_key_derive_policy(
     policy: &KeyPolicyToml,
     routes: &[RouteRecord],
     allowed_sign_intents: &BTreeSet<String>,
-) -> Result<BTreeMap<String, Vec<String>>, PetalError> {
-    let route_patterns = routes
+) -> Result<BTreeMap<String, ValidatedKeyDerivePolicy>, PetalError> {
+    let routes_by_pattern = routes
         .iter()
-        .map(|route| route.pattern.as_str())
-        .collect::<BTreeSet<_>>();
+        .map(|route| (route.pattern.as_str(), route.route_id.as_str()))
+        .collect::<BTreeMap<_, _>>();
     let mut declarations = BTreeMap::new();
     for declaration in &policy.derive_routes {
-        if !route_patterns.contains(declaration.route.as_str()) {
+        if !routes_by_pattern.contains_key(declaration.route.as_str()) {
             return Err(PetalError::InvalidWasm(format!(
                 "Petal [[key.derive]] declares unknown route {:?}",
                 declaration.route
@@ -3884,8 +3899,36 @@ fn validate_key_derive_policy(
                 )));
             }
         }
+        let mut allowed_patterns = BTreeSet::new();
+        for pattern in &declaration.allowed_routes {
+            if !routes_by_pattern.contains_key(pattern.as_str()) {
+                return Err(PetalError::InvalidWasm(format!(
+                    "Petal [[key.derive]] route {:?} allows unknown route {pattern:?}",
+                    declaration.route
+                )));
+            }
+            if !allowed_patterns.insert(pattern.clone()) {
+                return Err(PetalError::InvalidWasm(format!(
+                    "Petal [[key.derive]] route {:?} has duplicate allowed route {pattern:?}",
+                    declaration.route
+                )));
+            }
+        }
+        if !declaration.allowed_routes.is_empty() {
+            allowed_patterns.insert(declaration.route.clone());
+        }
+        let allowed_route_ids = allowed_patterns
+            .iter()
+            .map(|pattern| routes_by_pattern[pattern.as_str()].to_string())
+            .collect();
         if declarations
-            .insert(declaration.route.clone(), classes.into_iter().collect())
+            .insert(
+                declaration.route.clone(),
+                ValidatedKeyDerivePolicy {
+                    operation_classes: classes.into_iter().collect(),
+                    allowed_route_ids,
+                },
+            )
             .is_some()
         {
             return Err(PetalError::InvalidWasm(format!(
@@ -3895,6 +3938,52 @@ fn validate_key_derive_policy(
         }
     }
     Ok(declarations)
+}
+
+fn validate_resolved_key_derive_scopes(routes: &[RouteIndexRecord]) -> Result<(), PetalError> {
+    let routes_by_id = routes
+        .iter()
+        .map(|route| (route.route_id.as_str(), route))
+        .collect::<BTreeMap<_, _>>();
+    for origin in routes {
+        if origin.key_derive_allowed_routes.is_empty() {
+            continue;
+        }
+        if !origin
+            .key_derive_allowed_routes
+            .iter()
+            .any(|route_id| route_id == &origin.route_id)
+        {
+            return Err(PetalError::InvalidWasm(format!(
+                "Petal [[key.derive]] route {:?} must include its own resolved route id",
+                origin.pattern
+            )));
+        }
+        for route_id in &origin.key_derive_allowed_routes {
+            let target = routes_by_id.get(route_id.as_str()).ok_or_else(|| {
+                PetalError::InvalidWasm(format!(
+                    "Petal [[key.derive]] route {:?} resolves missing route id {route_id:?}",
+                    origin.pattern
+                ))
+            })?;
+            if target.route_id == origin.route_id {
+                continue;
+            }
+            let Some(sign_intent) = target.install_metadata.sign_intent.as_ref() else {
+                return Err(PetalError::InvalidWasm(format!(
+                    "Petal [[key.derive]] route {:?} allows route {:?} without a signing intent",
+                    origin.pattern, target.pattern
+                )));
+            };
+            if !origin.key_derive_operation_classes.contains(sign_intent) {
+                return Err(PetalError::InvalidWasm(format!(
+                    "Petal [[key.derive]] route {:?} allows route {:?} with incompatible signing intent {sign_intent:?}",
+                    origin.pattern, target.pattern
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn store_policy_from_manifest(manifest: &PetalToml) -> StoreNamespacePolicy {
@@ -5764,6 +5853,7 @@ name = "echo"
                 sign_intent: None,
             },
             key_derive_operation_classes: Vec::new(),
+            key_derive_allowed_routes: Vec::new(),
         };
         let metadata = ComponentRouteMetadata {
             kind: ComponentRouteEntryKind::File,
@@ -5805,6 +5895,7 @@ name = "echo"
                 sign_intent: None,
             },
             key_derive_operation_classes: Vec::new(),
+            key_derive_allowed_routes: Vec::new(),
         };
         let metadata = ComponentRouteMetadata {
             kind: ComponentRouteEntryKind::File,
@@ -6081,6 +6172,7 @@ imports = ["components/helper.wasm"]
                 sign_intent: None,
             },
             key_derive_operation_classes: Vec::new(),
+            key_derive_allowed_routes: Vec::new(),
         };
         let metadata = ComponentRouteMetadata {
             kind: ComponentRouteEntryKind::File,
@@ -6620,6 +6712,7 @@ namespaces = ["fixture-public"]
 [[key.derive]]
 route = "session.json"
 operation_classes = ["fixture.secondary", "fixture.payload"]
+allowed_routes = ["session.json"]
 "#,
         )
         .unwrap();
@@ -6638,19 +6731,29 @@ operation_classes = ["fixture.secondary", "fixture.payload"]
                 .key_derive_operation_classes
                 .contains(&"fixture.unrelated".to_string())
         );
+        assert_eq!(route.key_derive_allowed_routes, vec!["r000001"]);
 
         let serialized = serde_json::to_value(route).unwrap();
         assert_eq!(
             serialized["key_derive_operation_classes"],
             serde_json::json!(["fixture.payload", "fixture.secondary"])
         );
+        assert_eq!(
+            serialized["key_derive_allowed_routes"],
+            serde_json::json!(["r000001"])
+        );
         let mut legacy = serialized;
         legacy
             .as_object_mut()
             .unwrap()
             .remove("key_derive_operation_classes");
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("key_derive_allowed_routes");
         let legacy: RouteIndexRecord = serde_json::from_value(legacy).unwrap();
         assert!(legacy.key_derive_operation_classes.is_empty());
+        assert!(legacy.key_derive_allowed_routes.is_empty());
     }
 
     #[test]
@@ -6716,6 +6819,24 @@ operation_class = ["fixture.payload"]
 operation_classes = ["fixture.payload"]
 "#,
                 "unknown field `operation_class`",
+            ),
+            (
+                "unknown allowed route",
+                r#"[[key.derive]]
+route = "session.json"
+operation_classes = ["fixture.payload"]
+allowed_routes = ["missing.json"]
+"#,
+                "allows unknown route",
+            ),
+            (
+                "duplicate allowed route",
+                r#"[[key.derive]]
+route = "session.json"
+operation_classes = ["fixture.payload"]
+allowed_routes = ["session.json", "session.json"]
+"#,
+                "duplicate allowed route",
             ),
         ];
 

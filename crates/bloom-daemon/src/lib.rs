@@ -1473,6 +1473,8 @@ impl PetalHost for DaemonPetalHost {
         let broker = self.broker.as_ref().ok_or_else(|| {
             HostError::Backend("SERVICE_UNAVAILABLE: Broker client is not configured".into())
         })?;
+        let wallet_id = bloom_broker_api::Token::new(req.wallet.clone())
+            .map_err(|error| HostError::Invalid(format!("wallet: {error}")))?;
         let context = req.context.as_ref().ok_or_else(|| {
             warn!(
                 wallet = %req.wallet,
@@ -1672,8 +1674,7 @@ impl PetalHost for DaemonPetalHost {
             .transpose()
             .map_err(|error| HostError::Invalid(error.to_string()))?;
         let trusted_request = TrustedPetalSignRequest {
-            wallet_id: bloom_broker_api::Token::new(req.wallet)
-                .map_err(|error| HostError::Invalid(error.to_string()))?,
+            wallet_id,
             preimage: req.preimage,
             claimed_hash: bloom_broker_api::Digest32::from_bytes(req.claimed_hash),
             crypto_suite,
@@ -1737,6 +1738,8 @@ impl PetalHost for DaemonPetalHost {
         let broker = self.broker.as_ref().ok_or_else(|| {
             HostError::Backend("SERVICE_UNAVAILABLE: Broker client is not configured".into())
         })?;
+        bloom_broker_api::Token::new(req.wallet.clone())
+            .map_err(|error| HostError::Invalid(format!("wallet: {error}")))?;
         let context = req.context.as_ref().ok_or_else(|| {
             HostError::Denied("payload batch signing requires trusted Petal provenance".into())
         })?;
@@ -5273,6 +5276,15 @@ mod tests {
             key_ref: None,
             context: Some(context),
         };
+
+        let mut malformed_wallet = request.clone();
+        malformed_wallet.wallet = "0x0000000000000000000000000000000000000001".into();
+        let error = host
+            .sign_payload_outcome(malformed_wallet)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, HostError::Invalid(_)));
+        assert!(error.to_string().contains("wallet"));
 
         let SignOutcome::ApprovalPending(pending) =
             host.sign_payload_outcome(request.clone()).await.unwrap()

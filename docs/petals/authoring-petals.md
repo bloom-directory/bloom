@@ -82,13 +82,22 @@ the exact route pattern that imports `bloom:key/derive@0.1.0`:
 [[key.derive]]
 route = "[network]/agent_sessions/[wallet]/new.json"
 operation_classes = ["venue.agent_action"]
+allowed_routes = [
+  "[network]/agent_sessions/[wallet]/cancel.json",
+  "[network]/orders/[wallet]/new.json",
+]
 ```
 
 Every listed class must also appear in `[sign].allowed_intents`. Bloom rejects
 unknown or duplicate routes, empty or duplicate class lists, invalid class
 tokens, and declarations on routes without the key-derivation import. The
-installer records only the route's immediate signing intent and these explicit
-delegated classes; other package-level signing intents are not inherited.
+installer resolves `allowed_routes` from canonical manifest patterns to the
+immutable route IDs in that package and always includes the derivation route
+itself. Each allowed route must have a signing intent included in the declared
+operation classes. Components do not choose route IDs at runtime. Omitting
+`allowed_routes` retains the legacy guest-supplied route scope for compatibility;
+new Petals should declare it. Other package-level signing intents are not
+inherited.
 
 ## Routes and ABI
 
