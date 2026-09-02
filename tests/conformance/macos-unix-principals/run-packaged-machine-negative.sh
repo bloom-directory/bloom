@@ -630,6 +630,14 @@ mounted_write_with_deadline() {
     'printf "%s\n" "$2" > "$1"' bloom-mounted-write "$path" "$body"
 }
 
+mounted_file_write_with_deadline() {
+  local output="$1"
+  local path="$2"
+  local source="$3"
+  run_login_with_deadline "$output" /bin/sh -c \
+    '/bin/cat "$1" > "$2"' bloom-mounted-file-write "$source" "$path"
+}
+
 audit_sequence() {
   if [[ ! -s "$clean_home/audit.jsonl" ]]; then
     echo 0
@@ -940,10 +948,10 @@ run_login_with_deadline \
 
 approval_request="$(<"$work/approval-request.json")"
 approval_audit_start="$(audit_sequence)"
-if mounted_write_with_deadline \
+if mounted_file_write_with_deadline \
   "$work/approval.log" \
   "$mount_dir/wallets/$wallet_id/sealed-approvals/new.json" \
-  "$approval_request"
+  "$work/approval-request.json"
 then
   approval_status=0
 else
