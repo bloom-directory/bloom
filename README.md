@@ -62,9 +62,10 @@ Bloom gives an agent a safe wallet workspace:
 
 Bloom ships read-ready RPC defaults for major EVM networks — Ethereum,
 Base, Tempo, Robinhood Chain, Arbitrum, Optimism, Polygon, BNB Smart Chain,
-Avalanche, Gnosis, Linea, and HyperEVM — plus local Anvil. Per-chain
-broadcasting is enabled by default; set `allow_broadcast = false` on a chain to
-disable it.
+Avalanche, Gnosis, Linea, and HyperEVM — plus Arc Testnet and local Anvil.
+Arc coverage is testnet-only for now; an Arc mainnet entry is pending Arc
+mainnet launch. Per-chain broadcasting is enabled by default; set
+`allow_broadcast = false` on a chain to disable it.
 Public reads, simulations, and planning work without adding API keys;
 local devnet sends require a running Anvil node.
 

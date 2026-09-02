@@ -37,7 +37,9 @@ An agent using Bloom can:
   challenges staged for review before any x402 or Tempo MPP credential is
   signed;
 - enforce wallet policy: spend caps, allow/deny lists, contract-call gates, private orderflow preferences, and audit logging;
-- use twelve read-ready public EVM networks immediately after `bloom init`: Ethereum, Base, Tempo, Robinhood Chain, Arbitrum, Optimism, Polygon, BNB Smart Chain, Avalanche, Gnosis, Linea, and HyperEVM, plus local Anvil.
+- use twelve read-ready public EVM mainnets immediately after `bloom init`: Ethereum, Base, Tempo, Robinhood Chain, Arbitrum, Optimism, Polygon, BNB Smart Chain, Avalanche, Gnosis, Linea, and HyperEVM, plus Arc Testnet (`arc-testnet`) and local Anvil.
+
+Arc support is testnet-only at present: `arc-testnet` (chain ID 5042002) is the sole Arc entry, and an Arc mainnet entry is pending Arc mainnet launch. Unlike the other default networks, Arc pays gas in USDC rather than ETH, so plan previews on that chain are denominated in USDC.
 
 Mainnet and L2 broadcast routing is enabled by default. Live sends still require the applicable signing, policy, confirmation, and Sealed Approval gates.
 

@@ -32,8 +32,11 @@ All paths below are relative to the Bloom VFS root.
 
 Default config includes read-ready RPCs for Ethereum, Base, Tempo, Robinhood
 Chain, Arbitrum, Optimism, Polygon, BNB Smart Chain, Avalanche, Gnosis, Linea,
-HyperEVM, and local Anvil. Per-chain broadcasting is enabled by default;
-value-moving actions still require the applicable approval gates.
+HyperEVM, Arc Testnet (`arc-testnet`), and local Anvil. Arc is testnet-only for
+now — there is no Arc mainnet entry until Arc mainnet launches, so do not assume
+an `arc` chain exists. Note that `arc-testnet` pays gas in USDC rather than ETH.
+Per-chain broadcasting is enabled by default; value-moving actions still require
+the applicable approval gates.
 
 ## Reading
 
