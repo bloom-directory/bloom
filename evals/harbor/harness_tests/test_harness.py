@@ -162,6 +162,30 @@ class HarnessLifecycleTests(unittest.TestCase):
         with self.assertRaisesRegex(EvalError, "run failed.*cleanup also failed"):
             run_eval(definition, "codex", harbor_runner=runner)
 
+    def test_provider_error_is_reported_instead_of_aggregate_trial_count(self) -> None:
+        definition = FakeDefinition(self.root)
+        trial = SimpleNamespace(
+            exception_info=SimpleNamespace(
+                exception_type="UnknownApiError",
+                exception_message=(
+                    "command failed with a long transcript\n"
+                    'result={"result":"API Error: Request rejected (429) · '
+                    '[1310][Weekly/Monthly Limit Exhausted.]","type":"result"}'
+                ),
+            ),
+            verifier_result=None,
+        )
+        result = SimpleNamespace(
+            stats=SimpleNamespace(n_errored_trials=1, n_cancelled_trials=0),
+            trial_results=[trial],
+        )
+
+        with self.assertRaisesRegex(
+            EvalError,
+            r"UnknownApiError: API Error: Request rejected \(429\).*Limit Exhausted",
+        ):
+            definition.validate_result(result)
+
 
 class HyperliquidDefinitionTests(unittest.TestCase):
     def setUp(self) -> None:

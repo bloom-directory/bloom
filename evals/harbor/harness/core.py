@@ -452,21 +452,29 @@ class EvalDefinition(ABC):
     def validate_result(self, result: Any) -> None:
         """Fail unless Harbor completed one error-free, positively graded trial."""
         stats = result.stats
-        if stats.n_errored_trials or stats.n_cancelled_trials:
-            raise EvalError(
-                "Harbor reported "
-                f"{stats.n_errored_trials} errored and "
-                f"{stats.n_cancelled_trials} cancelled trials"
-            )
         trials = result.trial_results
         if len(trials) != 1:
             raise EvalError(f"expected exactly one Harbor trial, got {len(trials)}")
         trial = trials[0]
         if trial.exception_info is not None:
+            message = str(trial.exception_info.exception_message)
+            # Harbor agent failures often wrap the useful provider response in
+            # a long command transcript. Prefer the API error itself so quota,
+            # auth, and model failures are immediately actionable.
+            api_error = re.search(r"API Error:[^\"\r\n]+", message)
+            detail = api_error.group(0).strip() if api_error else message.strip()
+            if len(detail) > 500:
+                detail = detail[:497] + "..."
             raise EvalError(
                 "Harbor trial failed with "
                 f"{trial.exception_info.exception_type}: "
-                f"{trial.exception_info.exception_message}"
+                f"{detail}"
+            )
+        if stats.n_errored_trials or stats.n_cancelled_trials:
+            raise EvalError(
+                "Harbor reported "
+                f"{stats.n_errored_trials} errored and "
+                f"{stats.n_cancelled_trials} cancelled trials"
             )
         if trial.verifier_result is None:
             raise EvalError("Harbor trial returned no verifier result")
