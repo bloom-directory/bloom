@@ -19,6 +19,7 @@ services_only=0
 install_authority_fixture="${BLOOM_TRIAD_DEV_AUTHORITY_FIXTURE:-0}"
 build_integration_petals="${BLOOM_TRIAD_DEV_BUILD_PETALS:-1}"
 socket_timeout_seconds="${BLOOM_TRIAD_DEV_SOCKET_TIMEOUT_SECONDS:-30}"
+ceremony_port="${BLOOM_TRIAD_DEV_CEREMONY_PORT:-18734}"
 
 die() { printf 'triad developer launcher: %s\n' "$*" >&2; exit 1; }
 need_value() { [ "$#" -ge 2 ] || die "$1 requires a value"; }
@@ -53,6 +54,11 @@ esac
 case "$socket_timeout_seconds" in
   ''|*[!0-9]*|0) die "BLOOM_TRIAD_DEV_SOCKET_TIMEOUT_SECONDS must be a positive integer" ;;
 esac
+case "$ceremony_port" in
+  ''|*[!0-9]*) die "BLOOM_TRIAD_DEV_CEREMONY_PORT must be an integer from 1 to 65535" ;;
+esac
+[ "$ceremony_port" -ge 1 ] && [ "$ceremony_port" -le 65535 ] ||
+  die "BLOOM_TRIAD_DEV_CEREMONY_PORT must be an integer from 1 to 65535"
 socket_wait_attempts=$((socket_timeout_seconds * 10))
 
 [ "$(id -u)" -ne 0 ] || die "developer harness refuses root"
@@ -326,6 +332,7 @@ env_file="${log_dir}/triad.env"
   printf 'export BLOOM_TRIAD_INSTANCE_ID=%q\n' "$unit_token"
   printf 'export BLOOM_TRIAD_MUTATION_LOCK=%q\n' "$mutation_lock"
   printf 'export BLOOM_TRIAD_READY_FILE=%q\n' "$ready_file"
+  printf 'export BLOOM_TRIAD_DEV_CEREMONY_PORT=%q\n' "$ceremony_port"
   printf 'export BLOOM_TRIAD_LOG_DIR=%q\n' "$log_dir"
   printf 'export BLOOM_HOME=%q\n' "$machine_home"
   printf 'export BLOOM_BIN=%q\n' "$bloom_bin"
@@ -478,7 +485,7 @@ start_linux_authority_services() {
   # partially rendered unit set.
   systemd_units_installed=1
   write_linux_socket_unit "$broker_ceremony_socket_unit" \
-    'Bloom developer Broker ceremony listener' '127.0.0.1:18734' broker-ceremony "$broker_service_unit"
+    'Bloom developer Broker ceremony listener' "127.0.0.1:${ceremony_port}" broker-ceremony "$broker_service_unit"
 
   : > "${log_dir}/signer.log"
   {
@@ -494,6 +501,7 @@ start_linux_authority_services() {
       "BLOOM_SIGNER_CONFIG=${config_dir}/signer.json" \
       "BLOOM_SIGNER_AUDIT_CHECKPOINT_DIR=$signer_checkpoint_dir" \
       "BLOOM_AUTHORITY_EDGE_HISTORY=$authority_edge_history" \
+      "BLOOM_TRIAD_DEV_CEREMONY_PORT=$ceremony_port" \
       "BLOOM_SESSION_SOCKET=$session_socket" \
       "BLOOM_SIGNER_SOCKET=$signer_socket" \
       "BLOOM_SIGNER_CONTROL_SOCKET=$signer_control_socket"
@@ -516,6 +524,7 @@ start_linux_authority_services() {
       "BLOOM_BROKER_CONFIG=${config_dir}/broker.json" \
       "BLOOM_BROKER_AUDIT_CHECKPOINT_DIR=$broker_checkpoint_dir" \
       "BLOOM_AUTHORITY_EDGE_HISTORY=$authority_edge_history" \
+      "BLOOM_TRIAD_DEV_CEREMONY_PORT=$ceremony_port" \
       "BLOOM_SESSION_SOCKET=$session_socket" \
       "BLOOM_BROKER_SOCKET=$broker_socket" \
       "BLOOM_BROKER_CONTROL_SOCKET=$broker_control_socket" \
@@ -559,6 +568,7 @@ else
   BLOOM_SIGNER_SOCKET="$signer_socket" \
   BLOOM_SIGNER_CONTROL_SOCKET="$signer_control_socket" \
   BLOOM_SIGNER_AUDIT_CHECKPOINT_DIR="$signer_checkpoint_dir" \
+  BLOOM_TRIAD_DEV_CEREMONY_PORT="$ceremony_port" \
   BLOOM_SESSION_SOCKET="$session_socket" \
     "$signer_bin" >"${log_dir}/signer.log" 2>&1 &
   signer_pid=$!
@@ -573,6 +583,7 @@ else
   BLOOM_BROKER_SOCKET="$broker_socket" \
   BLOOM_BROKER_CONTROL_SOCKET="$broker_control_socket" \
   BLOOM_BROKER_AUDIT_CHECKPOINT_DIR="$broker_checkpoint_dir" \
+  BLOOM_TRIAD_DEV_CEREMONY_PORT="$ceremony_port" \
   BLOOM_SESSION_SOCKET="$session_socket" \
     "$broker_bin" >"${log_dir}/broker.log" 2>&1 &
   broker_pid=$!

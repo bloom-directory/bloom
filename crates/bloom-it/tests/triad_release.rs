@@ -463,7 +463,8 @@ fn triad_developer_launcher_supports_linux_without_weakening_root_boundary() {
     assert!(launcher.contains("\"BLOOM_BROKER_SOCKET=$broker_socket\""));
     assert!(launcher.contains("\"BLOOM_BROKER_CONTROL_SOCKET=$broker_control_socket\""));
     assert!(launcher.contains("broker_ceremony_socket_unit"));
-    assert!(launcher.contains("'127.0.0.1:18734' broker-ceremony"));
+    assert!(launcher.contains("\"127.0.0.1:${ceremony_port}\" broker-ceremony"));
+    assert!(launcher.contains("BLOOM_TRIAD_DEV_CEREMONY_PORT=$ceremony_port"));
     assert!(launcher.contains("BLOOM_BROKER_CEREMONY_ACTIVATION_NAME=broker-ceremony"));
     assert_eq!(
         launcher

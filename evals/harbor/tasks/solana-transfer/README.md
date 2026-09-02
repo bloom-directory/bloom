@@ -66,14 +66,23 @@ destination that is not the host-controlled sweep address.
 
 ### Run
 
-For the local lane, the developer wrapper is the shortest path. It reuses an
-existing custody wallet (default `debug-bip39`) without exporting its seed,
-starts a disposable validator and mounted Machine, adds only the fresh local
-destination to policy through an owner ceremony, runs Harbor, sweeps the test
-funds, and restores the byte-identical original policy. It refuses to start
-while another triad owns the fixed Broker ceremony port. On Linux it prompts
-for sudo once for the localhost NFS mount and keeps only that temporary sudo
-timestamp alive; it does not install a persistent sudoers rule.
+For the local lane, the developer wrapper is the shortest path. On its first
+run it creates a second, local-only triad under `~/bloom-eval-triad`, including
+independent identities, Broker/Signer custody stores, audit journals, Machine
+home, validator ledger, owner authenticator, and `solana-eval` wallet. It uses
+developer ceremony port 18735, so the normal triad may remain live on canonical
+port 18734. The deterministic mnemonic is a public test vector confined to a
+Machine configuration containing only `solana-local`; never fund this wallet
+or add a public chain. The developer-only origin override is implemented by
+[bloom-broker#32](https://github.com/bloom-directory/bloom-broker/pull/32) and
+[bloom-signer#25](https://github.com/bloom-directory/bloom-signer/pull/25); the
+wrapper verifies those commits before building either authority process.
+
+Each run creates a fresh sweep destination, adds only that destination to
+policy through an owner ceremony, runs Harbor, sweeps the local test funds, and
+restores the byte-identical original policy. On Linux it prompts for sudo once
+for the localhost NFS mount and keeps only that temporary sudo timestamp alive;
+it does not install a persistent sudoers rule.
 
 ```bash
 GLM_API_KEY="$GLM_API_KEY" scripts/evals/run-harbor-solana-local.sh
@@ -82,7 +91,10 @@ GLM_API_KEY="$GLM_API_KEY" scripts/evals/run-harbor-solana-local.sh
 The wrapper defaults to GLM-5.2 through the shared provider adapter. Override
 the model with `BLOOM_EVAL_MODEL`, the wallet with
 `BLOOM_EVAL_SOLANA_WALLET_ID`, or pass `codex`/`claude` as its sole argument.
-The lifecycle owner must stop or hand off any shared triad first.
+Override the isolated roots and developer-only port with the `BLOOM_EVAL_*`
+and `BLOOM_TRIAD_DEV_CEREMONY_PORT` variables when running more than one eval
+triad. A second instance must never share any root, state, wallet, port, mount,
+or audit journal with the first.
 
 For a manually managed triad or the mainnet canary lane, configure the harness
 directly:
