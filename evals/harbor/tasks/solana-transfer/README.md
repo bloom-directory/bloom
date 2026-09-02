@@ -66,6 +66,27 @@ destination that is not the host-controlled sweep address.
 
 ### Run
 
+For the local lane, the developer wrapper is the shortest path. It reuses an
+existing custody wallet (default `debug-bip39`) without exporting its seed,
+starts a disposable validator and mounted Machine, adds only the fresh local
+destination to policy through an owner ceremony, runs Harbor, sweeps the test
+funds, and restores the byte-identical original policy. It refuses to start
+while another triad owns the fixed Broker ceremony port. On Linux it prompts
+for sudo once for the localhost NFS mount and keeps only that temporary sudo
+timestamp alive; it does not install a persistent sudoers rule.
+
+```bash
+GLM_API_KEY="$GLM_API_KEY" scripts/evals/run-harbor-solana-local.sh
+```
+
+The wrapper defaults to GLM-5.2 through the shared provider adapter. Override
+the model with `BLOOM_EVAL_MODEL`, the wallet with
+`BLOOM_EVAL_SOLANA_WALLET_ID`, or pass `codex`/`claude` as its sole argument.
+The lifecycle owner must stop or hand off any shared triad first.
+
+For a manually managed triad or the mainnet canary lane, configure the harness
+directly:
+
 ```bash
 export BLOOM_EVAL_SOLANA_LANE=mainnet-canary        # or: local
 export BLOOM_EVAL_SOLANA_WALLET_ID=...              # Bloom wallet id
