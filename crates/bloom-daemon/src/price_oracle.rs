@@ -29,9 +29,11 @@ impl PricesOracle {
     fn coin_for_chain(chain_name: &str) -> CoinId {
         let s = chain_name.trim().to_ascii_lowercase();
         match s.as_str() {
-            "ethereum" | "mainnet" | "optimism" | "arbitrum" | "base" | "anvil" | "local" => {
-                CoinId::Native("ethereum".into())
-            }
+            // Every configured chain whose native gas token is ETH prices as
+            // ether. DefiLlama has no coin for an L2's own slug, so omitting
+            // one here silently disables USD policy caps on that chain.
+            "ethereum" | "mainnet" | "optimism" | "arbitrum" | "base" | "tempo" | "robinhood"
+            | "linea" | "anvil" | "local" => CoinId::Native("ethereum".into()),
             "polygon" | "matic" => CoinId::Native("polygon".into()),
             other => CoinId::Native(other.to_string()),
         }
@@ -234,6 +236,27 @@ mod tests {
         match PricesOracle::coin_for_chain("polygon") {
             CoinId::Native(s) => assert_eq!(s, "polygon"),
             _ => panic!("expected Native"),
+        }
+    }
+
+    #[test]
+    fn every_eth_gas_chain_in_the_default_config_prices_as_ether() {
+        // Regression: an ETH-gas chain missing from the map asked DefiLlama for
+        // `coingecko:<chain>`, which returns nothing, so `caps.per_tx_usd` and
+        // `caps.per_day_usd` silently stopped evaluating native sends there.
+        for chain in [
+            "ethereum",
+            "base",
+            "optimism",
+            "arbitrum",
+            "tempo",
+            "robinhood",
+            "linea",
+        ] {
+            match PricesOracle::coin_for_chain(chain) {
+                CoinId::Native(s) => assert_eq!(s, "ethereum", "chain {chain}"),
+                _ => panic!("expected Native for {chain}"),
+            }
         }
     }
 
