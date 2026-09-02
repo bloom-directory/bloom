@@ -268,6 +268,7 @@ installed_broker_socket="/private/var/run/bloom/$login_uid/machine-broker/broker
 [[ "$(stat -f '%u' "$installed_broker_socket")" == "$broker_uid" ]]
 sudo -H -u "$login_user" env \
   BLOOM_HOME="$clean_home" \
+  BLOOM_MACHINE_AUDIT_CHECKPOINT_DIR="$clean_home/audit-checkpoints" \
   BLOOM_BROKER_SOCKET="$installed_broker_socket" \
   BLOOM_MACHINE_IDENTITY="$machine_identity" \
   BLOOM_EDGE_MANIFEST="$edge_manifest" \
@@ -732,6 +733,7 @@ PY
 # against its private home, endpoint, and mount.
 sudo -H -u "$login_user" env \
   BLOOM_HOME="$clean_home" \
+  BLOOM_MACHINE_AUDIT_CHECKPOINT_DIR="$clean_home/audit-checkpoints" \
   BLOOM_BROKER_SOCKET="$broker_socket" \
   BLOOM_MACHINE_IDENTITY="$machine_identity" \
   BLOOM_EDGE_MANIFEST="$edge_manifest" \

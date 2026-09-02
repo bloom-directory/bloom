@@ -189,6 +189,8 @@ do
 done
 ! pgrep -u "$broker_uid" -x bloom-broker >/dev/null 2>&1
 ! pgrep -u "$signer_uid" -x bloom-signer >/dev/null 2>&1
+ditto "$broker_state" "$runtime_negative_snapshot/broker"
+ditto "$signer_state" "$runtime_negative_snapshot/signer"
 launchctl bootstrap system "$signer_plist"
 launchctl bootstrap system "$broker_plist"
 deadline=$((SECONDS + 20))
@@ -203,21 +205,6 @@ done
 sudo -u "$login_user" \
   "$release_root/bloom" serve triad-health-check "$release_digest"
 launchctl bootout "$machine_label"
-launchctl bootout "$broker_label"
-launchctl bootout "$signer_label"
-deadline=$((SECONDS + 20))
-while { pgrep -u "$broker_uid" -x bloom-broker >/dev/null 2>&1 ||
-  pgrep -u "$signer_uid" -x bloom-signer >/dev/null 2>&1; } &&
-  [[ $SECONDS -lt $deadline ]]
-do
-  sleep 0.1
-done
-! pgrep -u "$broker_uid" -x bloom-broker >/dev/null 2>&1
-! pgrep -u "$signer_uid" -x bloom-signer >/dev/null 2>&1
-ditto "$broker_state" "$runtime_negative_snapshot/broker"
-ditto "$signer_state" "$runtime_negative_snapshot/signer"
-launchctl bootstrap system "$signer_plist"
-launchctl bootstrap system "$broker_plist"
 "$main_root/tests/conformance/macos-unix-principals/run-packaged-machine-negative.sh" \
   "$release_root/bloom" \
   "$login_uid" \
