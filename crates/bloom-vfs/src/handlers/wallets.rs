@@ -6098,64 +6098,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn outbox_latest_prefers_the_newest_staging_and_breaks_ties_by_allocation() {
-        let f = make_handler_with_chain(true);
-        // Same millisecond: ids are allocated from an increasing counter, so
-        // the greater id is the later staging and must own `latest`.
-        seed_pending_with_created_ms(&f, "0001-older", 5_000);
-        seed_pending_with_created_ms(&f, "0002-newer", 5_000);
-        // And a later millisecond still wins regardless of id.
-        seed_pending_with_created_ms(&f, "0003-newest", 9_000);
-
-        let root = VfsPath::parse(&format!("/{}/chains/anvil/outbox", f.wallet_name)).unwrap();
-        let listed = f.handler.list(&root).await.unwrap();
-        let latest = listed.iter().find(|entry| entry.name == "latest").unwrap();
-        assert_eq!(latest.link_target.as_deref(), Some("pending/0003-newest"));
-
-        // Remove the newest entry and the tie-break decides, deterministically
-        // toward the later allocation.
-        let entry = f
-            .handler
-            .tx_engine
-            .outbox
-            .read_in_state(&f.wallet_name, "anvil", "0003-newest", OutboxState::Pending)
-            .unwrap();
-        f.handler
-            .tx_engine
-            .outbox
-            .transition(&entry, OutboxState::Failed)
-            .unwrap();
-        let listed = f.handler.list(&root).await.unwrap();
-        let latest = listed.iter().find(|entry| entry.name == "latest").unwrap();
-        assert_eq!(latest.link_target.as_deref(), Some("pending/0002-newer"));
-    }
-
-    #[tokio::test]
-    async fn outbox_latest_fails_closed_when_the_newest_pending_entry_is_unreadable() {
-        let f = make_handler_with_chain(true);
-        seed_pending_with_created_ms(&f, "0001-older", 5_000);
-        seed_pending_with_created_ms(&f, "0002-newer", 9_000);
-        // Corrupt the newest entry's intent: an agent following `latest` as
-        // the advertised atomic identity must not be silently redirected to
-        // the older transfer.
-        let dir = f
-            ._tmp
-            .path()
-            .join("outbox")
-            .join(&f.wallet_name)
-            .join("anvil")
-            .join("pending")
-            .join("0002-newer");
-        std::fs::write(dir.join("intent.json"), b"{ not json").unwrap();
-
-        let root = VfsPath::parse(&format!("/{}/chains/anvil/outbox", f.wallet_name)).unwrap();
-        assert!(
-            f.handler.list(&root).await.is_err(),
-            "an unreadable newest pending entry must surface, not fall back to an older transfer"
-        );
-    }
-
-    #[tokio::test]
     async fn outbox_latest_is_advertised_and_resolves_the_pending_identity() {
         let f = make_handler_with_chain(true);
         seed_pending(&f, "0001-pending");

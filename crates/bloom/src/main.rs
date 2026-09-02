@@ -734,7 +734,7 @@ async fn launch_custody_ceremony(
         )
     })?;
     let (operation_id, exact_terms_digest, legacy_passkey_migration) =
-        if let Some(migration) = options.legacy_migration {
+        if let Some(migration) = legacy_migration {
             (
                 migration.operation_id,
                 migration.exact_terms_digest,
@@ -856,14 +856,6 @@ async fn launch_account_allocation(
         )
         .into());
     }
-
-    // Authenticated Machine→Broker edge for the allocation request below.
-    let client = configured_broker_client(&daemon.home).map_err(|error| {
-        machine_error(
-            MachineErrorKind::Unavailable,
-            format!("custody requires the authenticated Machine-to-Broker edge: {error:#}"),
-        )
-    })?;
 
     let mut operation_bytes = [0_u8; 32];
     rand::thread_rng().fill_bytes(&mut operation_bytes);
@@ -4636,8 +4628,10 @@ mod tests {
         let imported = Cli::try_parse_from(["bloom", "wallet", "import", "wallet"]).unwrap();
         assert!(matches!(
             imported.cmd,
-            Some(Cmd::Wallet(WalletCmd::Import { name, profile }))
-                if name == "wallet" && profile == "bip39-multicurve-v1"
+            Some(Cmd::Wallet(WalletCmd::Import {
+                name,
+                raw_private_key: false,
+            })) if name == "wallet"
         ));
 
         let address = Cli::try_parse_from([
