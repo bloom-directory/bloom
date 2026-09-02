@@ -10,8 +10,10 @@ parts of that safety model are replaced here.
 * The binding between the chain record and this trial is a fresh
   host-controlled destination plus that exact amount, rather than a
   host-generated client order id.
-* Cleanup sweeps the destination back to the source with a host-held key, so
-  only the fee is actually spent. The container never sees that key.
+* Mainnet cleanup sweeps the destination back to the source with a host-held
+  key, so only the fee is actually spent. The local lane discards its validator
+  ledger with the rest of the disposable triad. The container never sees the
+  mainnet cleanup key.
 
 `--lane local` drops the canary requirement and runs against a local validator,
 because a non-mainnet genesis is already permitted to broadcast. `--lane
@@ -535,11 +537,12 @@ class SolanaTransferEval(EvalDefinition):
         self.sign_count = self._require_sign_count()
         CeremonyDriver(self.driver, self.seed_file, self.sign_count).preflight()
 
-        # Cleanup must be able to return the lamports. Discovering that the
-        # sweep tool or key is missing after a broadcast is too late, including
-        # on the local lane where unattended repeated trials depend on cleanup.
-        self._require_sweep_tool()
-        self._require_sweep_keypair()
+        # Mainnet cleanup must be able to return the lamports. Discovering that
+        # the sweep tool or key is missing after a broadcast is too late. Local
+        # validator funds disappear with the disposable ledger instead.
+        if self.lane == "mainnet-canary":
+            self._require_sweep_tool()
+            self._require_sweep_keypair()
 
         if not os.path.ismount(self.bloom_mount):
             raise EvalError(f"Bloom is not mounted at {self.bloom_mount}")
@@ -912,7 +915,7 @@ class SolanaTransferEval(EvalDefinition):
 
         This is intentionally inside the normal preflight/provision/cleanup
         envelope. A pass proves the mount, route writes, approval watcher,
-        ceremony, broadcast, reconciliation, verifier, and sweep all agree.
+        ceremony, broadcast, reconciliation, verifier, and cleanup all agree.
         """
         staged = json.dumps(
             {"destination": self.destination, "lamports": self.lamports},
@@ -1091,25 +1094,26 @@ class SolanaTransferEval(EvalDefinition):
             ):
                 failures.append(f"sent entry {sent_id} never reconciled to a receipt")
 
-        # 3. Sweep the destination back to the source.
+        # 3. Sweep the mainnet destination back to the source.
         #
-        # This is what makes the eval repeatable. The transfer cannot be undone,
-        # but the destination is host-controlled, so the lamports come back and
-        # only the fees are actually spent. It runs unconditionally rather than
-        # only when a `sent/` entry exists: a broadcast that the outbox failed
-        # to record still moved funds, and that is exactly the case where
-        # skipping the sweep would be worst.
-        if self.source_address and self.destination:
-            try:
-                signature = self.sweep_destination()
-                if signature is not None:
-                    self.sweep_signature = signature
-            except EvalError as error:
-                failures.append(f"host sweep: {error}")
-        else:
-            failures.append(
-                "cannot sweep: the source or destination address is unknown"
-            )
+        # This is what makes a mainnet eval recoverable. The transfer cannot be
+        # undone, but the destination is host-controlled, so the lamports come
+        # back and only the fees are actually spent. It runs unconditionally
+        # rather than only when a `sent/` entry exists: a broadcast that the
+        # outbox failed to record still moved funds, and that is exactly the
+        # case where skipping the sweep would be worst.
+        if self.lane == "mainnet-canary":
+            if self.source_address and self.destination:
+                try:
+                    signature = self.sweep_destination()
+                    if signature is not None:
+                        self.sweep_signature = signature
+                except EvalError as error:
+                    failures.append(f"host sweep: {error}")
+            else:
+                failures.append(
+                    "cannot sweep: the source or destination address is unknown"
+                )
 
         if failures:
             raise EvalError(

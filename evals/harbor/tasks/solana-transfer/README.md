@@ -59,56 +59,57 @@ destination that is not the host-controlled sweep address.
   eval repeatable. The container never receives this key.
 - The Solana CLI on `PATH` for that sweep. Preflight requires it on the mainnet
   lane, because discovering it missing after a broadcast would be too late.
-- A dedicated wallet with exactly one active Solana account, no pending outbox
-  entries, and only fully reconciled historical sent entries. Reusing the
-  wallet across trials is supported; each trial still needs a fresh
-  host-controlled destination so its chain evidence remains unambiguous.
+- For a manually managed mainnet lane, a dedicated wallet with exactly one
+  active Solana account, no pending outbox entries, and only fully reconciled
+  historical sent entries. Reusing that wallet across trials is supported;
+  each trial still needs a fresh host-controlled destination so its chain
+  evidence remains unambiguous.
 
 ### Run
 
-For the local lane, the developer wrapper is the shortest path. On its first
-run it creates a second, local-only triad under `~/bloom-eval-triad`, including
-independent identities, Broker/Signer custody stores, audit journals, Machine
-home, validator ledger, owner authenticator, and `solana-eval` wallet. It uses
-developer ceremony port 18735, so the normal triad may remain live on canonical
-port 18734. The deterministic mnemonic is a public test vector confined to a
-Machine configuration containing only `solana-local`; never fund this wallet
-or add a public chain. The developer-only origin override is implemented by
+For the local lane, the developer wrapper is the shortest path. Every run
+creates a second, disposable local-only triad, including independent identities,
+Broker/Signer custody stores, audit journals, Machine home, validator ledger,
+owner authenticator, and `solana-eval` wallet. It uses developer ceremony port
+18735, so the normal triad may remain live and fully usable on canonical port
+18734. The deterministic mnemonic is a public test vector confined to a Machine
+configuration containing only `solana-local`; never fund this wallet or add a
+public chain. The developer-only origin override is implemented by
 [bloom-broker#32](https://github.com/bloom-directory/bloom-broker/pull/32) and
 [bloom-signer#25](https://github.com/bloom-directory/bloom-signer/pull/25); the
 wrapper verifies those commits before building either authority process.
 
-Per-run sockets, logs, Harbor jobs, and the temporary sweep key live under
-`/tmp/bloom-solana-evals-$UID` by default rather than under the persistent
-triad root. This keeps disposable eval artifacts out of unrelated agents'
-home-directory scans. Set `BLOOM_EVAL_RUN_ROOT` to override that location.
+All authoritative state, sockets, logs, Harbor jobs, and the fresh destination
+key live under `/tmp/bloom-solana-evals-$UID` by default. A successful run
+removes the authoritative state and retains only logs and Harbor results under
+its `completed/` directory; a failed run retains its private diagnostics.
+Compiled artifacts are cached under its `build-cache/` directory. Set
+`BLOOM_EVAL_RUN_ROOT` or `BLOOM_EVAL_BUILD_ROOT` to relocate those roots.
 
-Each run creates a fresh sweep destination, adds only that destination to
-policy through an owner ceremony, runs Harbor, sweeps the local test funds, and
-restores the byte-identical original policy. On Linux it prompts for sudo once
-for the localhost NFS mount and keeps only that temporary sudo timestamp alive;
-it does not install a persistent sudoers rule.
+Each run creates a fresh destination, adds only that destination to its fresh
+wallet policy through an owner ceremony, and runs Harbor. Cleanup drains pending
+outbox authority before the wrapper stops the triad and discards the local
+validator ledger; no persistent policy or test balance remains to restore. On
+Linux it prompts for sudo once for the localhost NFS mount and keeps only that
+temporary sudo timestamp alive; it does not install a persistent sudoers rule.
 
 ```bash
 GLM_API_KEY="$GLM_API_KEY" scripts/evals/run-harbor-solana-local.sh
 ```
 
 The wrapper defaults to GLM-5.2 through the shared provider adapter. Override
-the model with `BLOOM_EVAL_MODEL`, the wallet with
-`BLOOM_EVAL_SOLANA_WALLET_ID`, or pass `deepseek`, `opencode`, `codex`, or
+the model with `BLOOM_EVAL_MODEL`, or pass `deepseek`, `opencode`, `codex`, or
 `claude` as its sole argument. `deepseek` runs DeepSeek through Claude Code's
 Anthropic-compatible adapter; `opencode` runs the same provider through Harbor's
 native OpenCode adapter.
-Override the isolated roots and developer-only port with the `BLOOM_EVAL_*`
-and `BLOOM_TRIAD_DEV_CEREMONY_PORT` variables when running more than one eval
-triad. A second instance must never share any root, state, wallet, port, mount,
-or audit journal with the first.
+The lifecycle lock permits one local Solana eval at a time. Override the
+developer-only port with `BLOOM_TRIAD_DEV_CEREMONY_PORT` if 18735 is occupied;
+the normal and eval triads must never share a port or authoritative state.
 
-For a manually managed triad or the mainnet canary lane, configure the harness
-directly:
+For the manually managed mainnet canary lane, configure the harness directly:
 
 ```bash
-export BLOOM_EVAL_SOLANA_LANE=mainnet-canary        # or: local
+export BLOOM_EVAL_SOLANA_LANE=mainnet-canary
 export BLOOM_EVAL_SOLANA_WALLET_ID=...              # Bloom wallet id
 export BLOOM_EVAL_SOLANA_CHAIN=solana-mainnet       # the configured chain key
 export BLOOM_EVAL_SOLANA_NETWORK=mainnet-beta
@@ -162,20 +163,6 @@ the staged terms. Consequently this eval measures Bloom workflow discovery and
 safe execution; it does not measure setup-skill discovery, permission prompts,
 or the human approval UI.
 
-When the triad is shared with other developers or agents, source the lifecycle
-owner's current `triad.env` and hold the triad mutation lease around the entire
-eval, including host cleanup:
-
-```bash
-source /path/from/the-triad-owner/triad.env
-scripts/triad-dev-with-mutation-lease \
-  scripts/evals/run-harbor.sh solana-transfer glm
-```
-
-The eval's own advisory lock prevents two Solana trials from overlapping. The
-outer triad lease also excludes unrelated wallet, policy, ceremony, and outbox
-mutations that could invalidate the trial. Never bypass either lock.
-
 `BLOOM_EVAL_SOLANA_HOME_ROOT` is required because the approver watches the
 canonical `approval_challenge.json` from stable host state rather than through
 the live mount. Current outboxes also project that sanitized resume artifact to
@@ -204,14 +191,14 @@ creates an empty directory at a missing bind source and would mask the real one.
 
 ### Cleanup
 
-Host-owned, ordered, fail-closed, and the only place funds move. Pending entries
-are cancelled and the directory must drain, since a residual staged entry still
-holds a broadcastable blockhash. `sent/` must hold zero or one reconciled entry.
-Then the destination is swept back to the source and the drain is confirmed from
-the chain rather than from the CLI's exit code. The sweep runs whenever the
-addresses are known, not only when a `sent/` entry exists: a broadcast the outbox
-failed to record still moved funds, and that is the worst case in which to skip
-it.
+Host-owned, ordered, and fail-closed. Pending entries are cancelled and the
+directory must drain, since a residual staged entry still holds a broadcastable
+blockhash. `sent/` must hold zero or one reconciled entry. On mainnet, the
+destination is then swept back to the source and the drain is confirmed from the
+chain rather than from the CLI's exit code. The sweep runs whenever the addresses
+are known, not only when a `sent/` entry exists: a broadcast the outbox failed to
+record still moved funds, and that is the worst case in which to skip it. The
+local wrapper instead destroys its disposable validator ledger.
 
 The container's own cleanup cancels staged entries and nothing else. There is no
 post-broadcast undo to delegate, and giving a container a path that moves funds
@@ -264,8 +251,9 @@ scripts/evals/run-harbor-solana-local.sh smoke
 ```
 
 It needs no provider API key. It uses the same preflight, authority,
-mounted-route, host approval, broadcast, reconciliation, verifier, sweep, and
-cleanup path as a paid trial; only the LLM is replaced by a fixed driver.
+mounted-route, host approval, broadcast, reconciliation, verifier, and cleanup
+path as a paid trial; only the LLM is replaced by a fixed driver. The mainnet
+lane additionally exercises the host sweep that returns transferred funds.
 
 The temporary wallet policy names the destination under the stable `solana`
 authority namespace. `solana-local` is the VFS/configuration name; cluster

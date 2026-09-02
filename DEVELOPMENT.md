@@ -247,10 +247,6 @@ instance lease:
 ```sh
 scripts/triad-dev-with-mutation-lease \
   bloom wallet account-allocate test-wallet --profile bip44-solana-slip10-ed25519-v1
-
-# Keep the lease around the whole workflow, including its cleanup.
-scripts/triad-dev-with-mutation-lease \
-  scripts/evals/run-harbor.sh solana-transfer glm
 ```
 
 The helper refuses a stale environment, a dead Machine socket, an insecure lock

@@ -537,6 +537,14 @@ class SweepTests(SolanaEvalTestCase):
 
 
 class ReusedWalletCleanupTests(SolanaEvalTestCase):
+    def test_local_cleanup_discards_the_ledger_instead_of_sweeping(self) -> None:
+        definition = self.make(BLOOM_EVAL_SOLANA_LANE="local")
+        with mock.patch.object(definition, "_stop_approver"):
+            with mock.patch.object(definition, "_list_state", return_value=[]):
+                with mock.patch.object(definition, "sweep_destination") as sweep:
+                    definition.cleanup()
+        sweep.assert_not_called()
+
     def test_cleanup_accepts_an_entry_that_expires_during_cancel(self) -> None:
         definition = self.make()
         definition.destination = DESTINATION

@@ -202,6 +202,19 @@ grep -Fq '745befe63ecd7a0b0a104c4ffd1a092d6d347cad' \
   "${repo_root}/scripts/evals/run-harbor-solana-local.sh"
 grep -Fq -- '--arg chain solana --arg destination' \
   "${repo_root}/scripts/evals/run-harbor-solana-local.sh"
+grep -Fq 'developer_root="${run_root}/developer"' \
+  "${repo_root}/scripts/evals/run-harbor-solana-local.sh"
+grep -Fq 'ledger="${run_root}/validator-ledger"' \
+  "${repo_root}/scripts/evals/run-harbor-solana-local.sh"
+grep -Fq 'build_root="${BLOOM_EVAL_BUILD_ROOT:-${run_base}/build-cache}"' \
+  "${repo_root}/scripts/evals/run-harbor-solana-local.sh"
+grep -Fq 'rm -r -- "$run_root"' \
+  "${repo_root}/scripts/evals/run-harbor-solana-local.sh"
+if grep -Fq 'export BLOOM_EVAL_SOLANA_SWEEP_KEYPAIR_FILE=' \
+  "${repo_root}/scripts/evals/run-harbor-solana-local.sh"; then
+  printf '%s\n' 'the disposable local lane must not retain mainnet sweep state' >&2
+  exit 1
+fi
 
 python3 - <<SOLTOML
 import sys

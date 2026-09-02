@@ -6,12 +6,9 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 agent="${1:-glm}"
-wallet_id="${BLOOM_EVAL_SOLANA_WALLET_ID:-solana-eval}"
-triad_root="${BLOOM_EVAL_TRIAD_ROOT:-${HOME}/bloom-eval-triad}"
+wallet_id="solana-eval"
 run_base="${BLOOM_EVAL_RUN_ROOT:-${TMPDIR:-/tmp}/bloom-solana-evals-${UID}}"
-developer_root="${BLOOM_EVAL_DEVELOPER_ROOT:-${triad_root}/developer}"
-machine_home="${BLOOM_EVAL_SOLANA_HOME_ROOT:-${developer_root}/machine-home}"
-seed_file="${BLOOM_EVAL_AUTHENTICATOR_SEED_FILE:-${triad_root}/owner-auth.seed}"
+completed_base="${run_base}/completed"
 broker_repo_default="${repo_root}/../bloom-broker"
 signer_repo_default="${repo_root}/../bloom-signer"
 [ ! -d "${repo_root}/../broker-eval-isolation" ] || broker_repo_default="${repo_root}/../broker-eval-isolation"
@@ -23,13 +20,12 @@ signer_repo="${BLOOM_EVAL_SIGNER_REPO:-${signer_repo_default}}"
 # rather than now-unreachable pre-rebase hashes.
 broker_isolation_commit="25ccf8b20079e120b189714c84283eba17c937a4"
 signer_isolation_commit="745befe63ecd7a0b0a104c4ffd1a092d6d347cad"
-build_root="${BLOOM_EVAL_BUILD_ROOT:-${triad_root}/target}"
+build_root="${BLOOM_EVAL_BUILD_ROOT:-${run_base}/build-cache}"
 machine_bin="${BLOOM_EVAL_SOLANA_MACHINE_BINARY:-${build_root}/machine/debug/bloom}"
 broker_bin="${BLOOM_INTEGRATION_BROKER_BIN:-${build_root}/broker/debug/bloom-broker}"
 signer_bin="${BLOOM_INTEGRATION_SIGNER_BIN:-${build_root}/signer/debug/bloom-signer}"
 driver_bin="${BLOOM_EVAL_DEBUG_DRIVER_BIN:-${build_root}/broker/debug/bloom-broker-debug-driver}"
 launcher="${BLOOM_TRIAD_DEV_LAUNCHER:-${repo_root}/scripts/triad-dev-launch.sh}"
-counter_file="${BLOOM_EVAL_SIGN_COUNT_FILE:-${triad_root}/owner-auth.sign-count}"
 ceremony_port="${BLOOM_TRIAD_DEV_CEREMONY_PORT:-18735}"
 rpc_port="${BLOOM_EVAL_SOLANA_LOCAL_RPC_PORT:-18899}"
 faucet_port="${BLOOM_EVAL_SOLANA_LOCAL_FAUCET_PORT:-19900}"
@@ -40,8 +36,8 @@ usage() {
   printf '%s\n' \
     'Usage: scripts/evals/run-harbor-solana-local.sh [smoke|glm|deepseek|opencode|codex|claude]' \
     '' \
-    'Defaults to GLM-5.2 and a dedicated solana-eval wallet. The first run' \
-    'creates an isolated local-only triad; later runs safely reuse it.'
+    'Defaults to GLM-5.2. Each run creates a disposable local-only triad and' \
+    'a dedicated solana-eval wallet; only compiled artifacts are cached.'
 }
 
 case "$agent" in
@@ -90,34 +86,33 @@ if ss -ltn | awk '{print $4}' | grep -Eq "(^|:)(${rpc_port}|${faucet_port})$"; t
 fi
 
 umask 077
-mkdir -p "$run_base" "$developer_root" "$machine_home" "$build_root"
-chmod 0700 "$triad_root" "$run_base" "$developer_root" "$machine_home" "$build_root"
-if [ ! -e "$seed_file" ]; then
-  openssl rand -hex 32 > "$seed_file"
-  chmod 0600 "$seed_file"
-fi
-[ ! -L "$seed_file" ] && [ -f "$seed_file" ] && [ "$(stat -c %a "$seed_file")" = 600 ] ||
-  die "authenticator seed must be a mode-0600 regular non-symlink file: $seed_file"
-lifecycle_lock="${triad_root}/triad-lifecycle.lock"
+mkdir -p "$run_base" "$completed_base" "$build_root"
+chmod 0700 "$run_base" "$completed_base" "$build_root"
+lifecycle_lock="${run_base}/triad-lifecycle.lock"
 exec 9>"$lifecycle_lock"
 chmod 0600 "$lifecycle_lock"
 flock -n 9 || die "another local eval owns the triad lifecycle lock"
 run_root="$(mktemp -d "${run_base}/solana-local.XXXXXX")"
+developer_root="${run_root}/developer"
+machine_home="${developer_root}/machine-home"
+seed_file="${run_root}/owner-auth.seed"
+counter_file="${run_root}/owner-auth.sign-count"
 mount_dir="${run_root}/bloom"
 log_dir="${run_root}/logs"
 ready_file="${run_root}/ready"
 machine_socket="${run_root}/machine.sock"
-ledger="${triad_root}/validator-ledger"
-sweep_key="${run_root}/sweep.json"
+ledger="${run_root}/validator-ledger"
+destination_key="${run_root}/destination.json"
 launcher_log="${run_root}/launcher.log"
 validator_log="${run_root}/validator.log"
-mkdir -p "$mount_dir" "$log_dir"
-chmod 0700 "$run_root" "$machine_home" "$mount_dir" "$log_dir"
+mkdir -p "$developer_root" "$machine_home" "$mount_dir" "$log_dir"
+chmod 0700 "$run_root" "$developer_root" "$machine_home" "$mount_dir" "$log_dir"
+openssl rand -hex 32 > "$seed_file"
+chmod 0600 "$seed_file"
 
 validator_pid=""
 launcher_pid=""
 sudo_keepalive_pid=""
-policy_changed=0
 cleanup_running=0
 
 write_counter() {
@@ -159,20 +154,16 @@ complete_ceremony() {
 }
 
 cleanup() {
-  local status="$?" restore_status=0
+  local status="$?" cleanup_status=0
   [ "$cleanup_running" -eq 0 ] || exit "$status"
   cleanup_running=1
   trap - EXIT INT TERM HUP
-  if [ "$policy_changed" -eq 1 ] && [ -S "$machine_socket" ]; then
-    printf 'Bloom Solana local eval: restoring the original wallet policy...\n' >&2
-    complete_policy_update "${run_root}/policy.original.json" || restore_status=1
-  fi
   if [ -n "$launcher_pid" ] && kill -0 "$launcher_pid" 2>/dev/null; then
     kill "$launcher_pid" 2>/dev/null || true
     wait "$launcher_pid" 2>/dev/null || true
   fi
   if mountpoint -q "$mount_dir" 2>/dev/null; then
-    sudo -n /usr/bin/umount -l -f "$mount_dir" >/dev/null 2>&1 || restore_status=1
+    sudo -n /usr/bin/umount -l -f "$mount_dir" >/dev/null 2>&1 || cleanup_status=1
   fi
   if [ -n "$validator_pid" ] && kill -0 "$validator_pid" 2>/dev/null; then
     kill "$validator_pid" 2>/dev/null || true
@@ -182,17 +173,24 @@ cleanup() {
     kill "$sudo_keepalive_pid" 2>/dev/null || true
     wait "$sudo_keepalive_pid" 2>/dev/null || true
   fi
-  if [ "$restore_status" -ne 0 ]; then
+  unlink "${run_root}/mnemonic.txt" 2>/dev/null || true
+  if [ "$cleanup_status" -ne 0 ]; then
     printf 'Bloom Solana local eval: cleanup needs attention; artifacts retained at %s\n' "$run_root" >&2
     exit 1
   fi
   if [ "$status" -eq 0 ]; then
-    unlink "$sweep_key" 2>/dev/null || true
-    printf 'Bloom Solana local eval: passed; non-secret logs retained at %s\n' "$run_root" >&2
+    artifact_root="${completed_base}/$(basename "$run_root")"
+    mkdir "$artifact_root"
+    chmod 0700 "$artifact_root"
+    for artifact in "$log_dir" "${run_root}/jobs" "$launcher_log" "$validator_log"; do
+      [ ! -e "$artifact" ] || mv "$artifact" "$artifact_root/"
+    done
+    rm -r -- "$run_root"
+    printf 'Bloom Solana local eval: passed; state removed and results retained at %s\n' \
+      "$artifact_root" >&2
   else
     printf 'Bloom Solana local eval: failed; diagnostics retained at %s\n' "$run_root" >&2
   fi
-  unlink "${run_root}/mnemonic.txt" 2>/dev/null || true
   exit "$status"
 }
 trap cleanup EXIT INT TERM HUP
@@ -261,9 +259,9 @@ machine_config_new="${machine_config}.new.$$"
 chmod 0600 "$machine_config_new"
 mv -f "$machine_config_new" "$machine_config"
 
-solana-keygen new --no-bip39-passphrase --silent --outfile "$sweep_key" >/dev/null
-chmod 0600 "$sweep_key"
-destination="$(solana address --keypair "$sweep_key")"
+solana-keygen new --no-bip39-passphrase --silent --outfile "$destination_key" >/dev/null
+chmod 0600 "$destination_key"
+destination="$(solana address --keypair "$destination_key")"
 
 printf 'Bloom Solana local eval: starting the independent eval triad...\n' >&2
 BLOOM_INTEGRATION_MACHINE_BIN="$machine_bin" \
@@ -341,7 +339,6 @@ jq -cS --arg chain solana --arg destination "$destination" '
 ' "${run_root}/policy.original.json" > "${run_root}/policy.eval.json"
 printf 'Bloom Solana local eval: approving the fresh local-only destination...\n' >&2
 complete_policy_update "${run_root}/policy.eval.json" || die "policy update ceremony failed"
-policy_changed=1
 
 solana airdrop 0.02 "$source_address" --url "$rpc_url" --commitment finalized >/dev/null
 
@@ -353,7 +350,6 @@ export BLOOM_EVAL_SOLANA_RPC_URL="$rpc_url"
 export BLOOM_EVAL_BLOOM_MOUNT="$mount_dir"
 export BLOOM_EVAL_SOLANA_HOME_ROOT="$machine_home"
 export BLOOM_EVAL_SOLANA_MACHINE_BINARY="$machine_bin"
-export BLOOM_EVAL_SOLANA_SWEEP_KEYPAIR_FILE="$sweep_key"
 export BLOOM_EVAL_SOLANA_DESTINATION="$destination"
 export BLOOM_EVAL_AUTHENTICATOR_SEED_FILE="$seed_file"
 export BLOOM_EVAL_DEBUG_DRIVER_BIN="$driver_bin"
