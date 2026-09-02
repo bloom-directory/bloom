@@ -37,6 +37,79 @@ pub fn advisory_evm_policy(projection: &WalletProjection, chain: &str) -> Result
     Ok(policy)
 }
 
+/// What the canonical policy permits on one chain, rendered so a reader can
+/// tell the two very different empty cases apart.
+///
+/// `allowed_destinations` is a cross-chain list that the engine filters per
+/// chain, and an empty filtered set denies every send rather than permitting
+/// them. Reading the canonical document alone, that distinction is invisible:
+/// `"allowed_destinations": []` looks like "unrestricted" and means the
+/// opposite. This projection states the effect outright.
+pub fn effective_chain_policy(
+    projection: &WalletProjection,
+    chain: &str,
+    chain_id: Option<u64>,
+) -> Result<serde_json::Value, String> {
+    let canonical: CanonicalWalletPolicy =
+        serde_json::from_slice(&projection.policy.canonical_policy.decode())
+            .map_err(|error| format!("parse canonical Broker policy projection: {error}"))?;
+    if canonical.wallet_id != projection.wallet.wallet_id {
+        return Err("canonical Broker policy projection names a different wallet".into());
+    }
+
+    let destinations = canonical
+        .allowed_destinations
+        .iter()
+        .filter(|destination| destination.chain.as_str() == chain)
+        .map(|destination| destination.destination.clone())
+        .collect::<Vec<_>>();
+
+    let denies_everything = destinations.is_empty();
+    let effect = if denies_everything {
+        "deny_all"
+    } else {
+        "allowlist"
+    };
+    let summary = if denies_everything {
+        format!(
+            "Wallet {} has no allowed destinations on {chain}, so every send on this chain \
+             is denied. Add one by writing an updated policy to wallets/{}/policy.json.",
+            canonical.wallet_id.as_str(),
+            canonical.wallet_id.as_str(),
+        )
+    } else {
+        format!(
+            "Wallet {} may send only to the {} destination(s) listed here on {chain}. \
+             Everything else is denied.",
+            canonical.wallet_id.as_str(),
+            destinations.len(),
+        )
+    };
+
+    Ok(serde_json::json!({
+        "wallet": canonical.wallet_id.as_str(),
+        "chain": chain,
+        "chain_id": chain_id,
+        "effect": effect,
+        "summary": summary,
+        "allowed_destinations": destinations,
+        "allowed_petal_packages": canonical
+            .allowed_petal_packages
+            .iter()
+            .map(|package| package.to_string())
+            .collect::<Vec<_>>(),
+        "maximum_approval_lifetime_ms": canonical.maximum_approval_lifetime_ms,
+        "required_verifiers": canonical
+            .required_verifiers
+            .iter()
+            .map(|verifier| verifier.verifier_id.as_str().to_string())
+            .collect::<Vec<_>>(),
+        "note": "Advisory projection of the authenticated Broker policy, filtered to this \
+                 chain. Broker enforces the canonical snapshot again before any signature, \
+                 so this file never grants authority.",
+    }))
+}
+
 /// Produce a non-authorizing paid-request planning view. Canonical policy has
 /// no legacy HTTP cap fields; Broker evaluates the exact payload and canonical
 /// policy before signing, so Machine must not invent persistent local limits.
@@ -137,5 +210,68 @@ mod tests {
                 .recipients
                 .contains("__broker_policy_denies_all_destinations__")
         );
+    }
+
+    #[test]
+    fn an_empty_chain_allowlist_reads_as_deny_all_not_unrestricted() {
+        // The bug this route exists for: the canonical document shows
+        // `allowed_destinations: []`, which reads as "no restrictions" and
+        // means "every send is denied".
+        let value = effective_chain_policy(&projection(vec![]), "base", Some(8453)).unwrap();
+        assert_eq!(value["effect"], "deny_all");
+        assert_eq!(value["chain_id"], 8453);
+        assert_eq!(value["allowed_destinations"].as_array().unwrap().len(), 0);
+        let summary = value["summary"].as_str().unwrap();
+        assert!(
+            summary.contains("every send on this chain is denied"),
+            "{summary}"
+        );
+        // The reader is told how to fix it, not just that it is broken.
+        assert!(summary.contains("policy.json"), "{summary}");
+    }
+
+    #[test]
+    fn a_populated_chain_allowlist_reports_only_that_chains_destinations() {
+        let allowed = "0x0000000000000000000000000000000000000001";
+        let value = effective_chain_policy(
+            &projection(vec![PolicyDestination {
+                chain: Token::new("base").unwrap(),
+                destination: allowed.into(),
+            }]),
+            "base",
+            Some(8453),
+        )
+        .unwrap();
+        assert_eq!(value["effect"], "allowlist");
+        assert_eq!(value["allowed_destinations"][0], allowed);
+    }
+
+    #[test]
+    fn destinations_on_another_chain_do_not_leak_into_this_one() {
+        // A wallet allowlisted on ethereum must still read as deny_all on
+        // base, which is exactly the filter the engine applies.
+        let value = effective_chain_policy(
+            &projection(vec![PolicyDestination {
+                chain: Token::new("ethereum").unwrap(),
+                destination: "0x0000000000000000000000000000000000000001".into(),
+            }]),
+            "base",
+            Some(8453),
+        )
+        .unwrap();
+        assert_eq!(value["effect"], "deny_all");
+        assert_eq!(value["allowed_destinations"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn the_projection_never_claims_to_grant_authority() {
+        let value = effective_chain_policy(&projection(vec![]), "base", None).unwrap();
+        assert!(
+            value["note"]
+                .as_str()
+                .unwrap()
+                .contains("never grants authority")
+        );
+        assert!(value["chain_id"].is_null());
     }
 }
