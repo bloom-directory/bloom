@@ -78,15 +78,13 @@ jobs:
               exit 1
             }
             release_sha="$(git rev-parse "refs/tags/$tag^{commit}")"
-            if [[ "$EVENT_NAME" == "push" ]]; then
-              # Supplied by the step environment above.
-              # shellcheck disable=SC2153
-              event_sha="$(git rev-parse "$EVENT_SHA^{commit}")"
-              [[ "$release_sha" == "$event_sha" ]] || {
-                echo "::error::$tag moved after the tag-push event"
-                exit 1
-              }
-            fi
+            # Supplied by the step environment above.
+            # shellcheck disable=SC2153
+            event_sha="$(git rev-parse "$EVENT_SHA^{commit}")"
+            [[ "$release_sha" == "$event_sha" ]] || {
+              echo "::error::production release runs must originate from the tagged commit"
+              exit 1
+            }
             git fetch --force origin \
               "refs/heads/$DEFAULT_BRANCH:refs/remotes/origin/$DEFAULT_BRANCH"
             git merge-base --is-ancestor \
@@ -306,6 +304,18 @@ jobs:
             existing="$(mktemp -d)"
             gh release view "$TAG" --json assets --jq '.assets[].name' \
               > "$existing/names"
+            for asset in dist/*; do basename "$asset"; done |
+              LC_ALL=C sort > "$existing/expected-names"
+            LC_ALL=C sort -u "$existing/names" > "$existing/names.sorted"
+            LC_ALL=C comm -23 \
+              "$existing/names.sorted" \
+              "$existing/expected-names" \
+              > "$existing/unexpected-names"
+            if [[ -s "$existing/unexpected-names" ]]; then
+              echo "::error::release contains unexpected assets"
+              cat "$existing/unexpected-names"
+              exit 1
+            fi
             for asset in dist/*; do
               name="$(basename "$asset")"
               if grep -Fqx -- "$name" "$existing/names"; then

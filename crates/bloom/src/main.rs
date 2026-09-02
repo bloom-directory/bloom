@@ -1327,7 +1327,6 @@ async fn execute_machine_command(
             action,
             operation_id,
         } => {
-            let mutation = matches!(action, MachineOperationAction::Cancel);
             let command = match action {
                 MachineOperationAction::Status => OperationCmd::Status {
                     operation_id: operation_id.clone(),
@@ -1336,11 +1335,7 @@ async fn execute_machine_command(
                     operation_id: operation_id.clone(),
                 },
             };
-            let output = handle_operation(machine_broker()?, command).await?;
-            if mutation {
-                emit_machine_mutation("operation", Some(&operation_id), "committed");
-            }
-            output
+            handle_operation(machine_broker()?, command).await?
         }
         MachineCommand::UpdateStatus => handle_update(home, UpdateCmd::Status).await?.0,
         MachineCommand::UpdateCheck => {

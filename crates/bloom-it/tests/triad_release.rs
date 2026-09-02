@@ -109,6 +109,8 @@ fn tag_release_builds_the_locked_triad_and_isolates_production_signing() {
     assert!(workflow.contains("umask 077"));
     assert!(workflow.contains("unset RELEASE_SIGNING_KEY"));
     assert!(workflow.contains("published asset $name is immutable"));
+    assert!(workflow.contains("production release runs must originate from the tagged commit"));
+    assert!(workflow.contains("release contains unexpected assets"));
     assert!(workflow.contains("gh release view \"$TAG\" --json assets"));
     assert!(workflow.contains("grep -Fqx -- \"$name\" \"$existing/names\""));
     assert!(workflow.contains("gh release upload \"$TAG\" \"$asset\""));
@@ -296,7 +298,7 @@ fn make_installer_payload(root: &Path) -> PathBuf {
     for config in ["broker.json", "signer.json"] {
         fs::write(
             payload.join("config").join(config),
-            format!(r#"{{"build_digest":"{release_digest}"}}"#),
+            format!(r#"{{"build_digest": "{release_digest}"}}"#),
         )
         .unwrap();
     }
@@ -816,7 +818,7 @@ fn installed_acceptance_runs_the_packaged_machine_runtime_negative() {
         "wallet commit-policy",
         "authenticated-projection-cache.json",
         "chown \"$login_uid\" \"$runtime/machine\"",
-        "machine_socket=\"$runtime/machine/machine.sock\"",
+        "machine_socket=\"$clean_home/run/bloom.sock\"",
         "system/com.bloom.signer.$login_uid",
         "/private/var/run/bloom/$login_uid/broker-signer/signer.sock",
         "launchctl bootout \"$signer_label\"",

@@ -399,6 +399,7 @@ sign_candidate() {
   done
   [[ "$(wc -l < "$payload/SOURCE_REVISIONS" | tr -d ' ')" == 3 ]] ||
     die "candidate source revisions contain unexpected entries"
+  require_staged_architecture "$platform" "$payload"
 
   case "$platform" in
     linux)

@@ -235,6 +235,21 @@ fn reconcile_stale_mount(cfg: &MountConfig, from_fstab: bool) -> Result<(), Moun
         return Ok(());
     };
     validate_stale_mount(&mounted, cfg)?;
+    if cfg.nfs_listen.port() == 0 {
+        return Err(MountError::Mount(format!(
+            "refusing to replace an existing Bloom mount at {}",
+            cfg.mount_path.display()
+        )));
+    }
+    match std::net::TcpListener::bind(cfg.nfs_listen) {
+        Ok(probe) => drop(probe),
+        Err(error) => {
+            return Err(MountError::Mount(format!(
+                "refusing to replace an existing Bloom mount at {} while its listener is unavailable: {error}",
+                cfg.mount_path.display()
+            )));
+        }
+    }
     run_command_attempts(
         stale_unmount_attempts(&cfg.mount_path, from_fstab),
         FSTAB_UMOUNT_COMMAND_TIMEOUT,
@@ -405,6 +420,11 @@ pub async fn serve_nfs_from_fstab(
     vfs: Vfs,
     cfg: MountConfig,
 ) -> Result<NfsMountHandle, MountError> {
+    if !cfg.nfs_listen.ip().is_loopback() {
+        return Err(MountError::Config(
+            "fstab mounts require a loopback NFS listener".to_string(),
+        ));
+    }
     if cfg.nfs_listen.port() == 0 {
         return Err(MountError::Config(
             "fstab mounts require a fixed NFS listen port".to_string(),
@@ -658,6 +678,23 @@ mod tests {
             Err(other) => panic!("expected MountError::Config, got {other:?}"),
             Ok(_) => panic!("non-directory mount path should error"),
         }
+    }
+
+    #[tokio::test]
+    async fn fstab_mount_rejects_non_loopback_listener() {
+        let directory = unique_nonexistent_path();
+        std::fs::create_dir(&directory).unwrap();
+        let cfg = MountConfig {
+            mount_path: directory.clone(),
+            nfs_listen: "0.0.0.0:20000".parse().unwrap(),
+            readonly: false,
+        };
+        let vfs = bloom_vfs::Vfs::builder().build();
+        match serve_nfs_from_fstab(vfs, cfg).await {
+            Err(error) => assert!(error.to_string().contains("loopback NFS listener")),
+            Ok(_) => panic!("non-loopback fstab listener must be rejected"),
+        }
+        std::fs::remove_dir(directory).unwrap();
     }
 
     /// Calling `unmount` twice must be safe: the second call observes

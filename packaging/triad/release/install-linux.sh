@@ -237,13 +237,33 @@ install_linux_mount_authorization() {
 linux_record_string() {
   local record="$1"
   local key="$2"
-  sed -n "s/.*\"$key\":\"\([^\"]*\)\".*/\1/p" "$record"
+  sed -n "s/.*\"$key\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" "$record"
 }
 
 linux_record_number() {
   local record="$1"
   local key="$2"
-  sed -n "s/.*\"$key\":\([0-9][0-9]*\).*/\1/p" "$record"
+  sed -n "s/.*\"$key\"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p" "$record"
+}
+
+linux_nfs_port_is_listening() {
+  local candidate="$1"
+  local table port_hex
+  port_hex="$(printf '%04X' "$candidate")"
+  for table in /proc/net/tcp /proc/net/tcp6; do
+    [[ -r "$table" ]] || continue
+    if awk -v port="$port_hex" '
+      NR > 1 {
+        split($2, address, ":")
+        if (toupper(address[2]) == port && $4 == "0A") found = 1
+      }
+      END { exit found ? 0 : 1 }
+    ' "$table"
+    then
+      return 0
+    fi
+  done
+  return 1
 }
 
 validate_linux_release_set() {
@@ -352,7 +372,7 @@ allocate_linux_nfs_port() {
         break
       fi
     done
-    if [[ "$used" == false ]]; then
+    if [[ "$used" == false ]] && ! linux_nfs_port_is_listening "$candidate"; then
       printf '%s\n' "$candidate"
       return 0
     fi

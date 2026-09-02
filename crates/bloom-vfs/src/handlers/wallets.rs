@@ -3292,6 +3292,8 @@ impl WalletsHandler {
                 } else {
                     first_confirm_line(confirm_text)
                 };
+                self.require_outbox_petal_eligibility(wallet, chain, id)
+                    .await?;
                 let _staged = self
                     .tx_engine
                     .confirm(

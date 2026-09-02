@@ -1546,6 +1546,19 @@ impl PetalHost for DaemonPetalHost {
         }
         let trusted_package_hash = bloom_broker_api::Digest32::new(context.package_hash.clone())
             .map_err(|error| HostError::Invalid(error.to_string()))?;
+        if let Some(pending) = self
+            .ensure_petal_eligibility(&req.wallet, &trusted_package_hash)
+            .await?
+        {
+            return Ok(SignOutcome::ApprovalPending(ApprovalPending {
+                action_id: pending.operation_id.as_str().to_owned(),
+                expires_ms: pending
+                    .prepare
+                    .as_ref()
+                    .map(|prepare| prepare.ceremony_expires_at_ms.get())
+                    .unwrap_or(0),
+            }));
+        }
         if req.selector == bloom_broker_api::PetalSignSelector::Exact {
             if req.key_ref.is_some() {
                 warn!(
@@ -1613,19 +1626,6 @@ impl PetalHost for DaemonPetalHost {
             let catalog = self.provenance_catalog.clone().ok_or_else(|| {
                 HostError::Backend("installer provenance catalog is not configured".into())
             })?;
-            if let Some(pending) = self
-                .ensure_petal_eligibility(&req.wallet, &trusted_package_hash)
-                .await?
-            {
-                return Ok(SignOutcome::ApprovalPending(ApprovalPending {
-                    action_id: pending.operation_id.as_str().to_owned(),
-                    expires_ms: pending
-                        .prepare
-                        .as_ref()
-                        .map(|prepare| prepare.ceremony_expires_at_ms.get())
-                        .unwrap_or(0),
-                }));
-            }
             let signer = BrokerExactPayloadSigner::new(broker.clone(), catalog);
             let _guard = self.petal_signing_lock.lock().await;
             let outcome = signer
@@ -2190,6 +2190,31 @@ impl PetalHost for DaemonPetalHost {
             return Err(HostError::Denied(
                 "outbox entry was not staged by this trusted Petal".into(),
             ));
+        }
+        let package_hash = bloom_broker_api::Digest32::new(context.package_hash.clone())
+            .map_err(|error| HostError::Invalid(error.to_string()))?;
+        if let Some(pending) = self
+            .ensure_petal_eligibility(&wallet, &package_hash)
+            .await?
+        {
+            let prepare = pending.prepare.ok_or_else(|| {
+                HostError::Denied(format!(
+                    "Petal policy approval is pending; inspect {}",
+                    pending.status_path
+                ))
+            })?;
+            return petal_outbox_outcome(
+                &service.tx_engine,
+                &wallet,
+                &chain_name,
+                &outbox_id,
+                Some(bloom_tx::ApprovalRequirement {
+                    action_id: pending.operation_id.as_str().to_owned(),
+                    ceremony_url: prepare.ceremony_url,
+                    expires_ms: prepare.ceremony_expires_at_ms.get(),
+                    reason: "wallet policy approval is required for this Petal package".into(),
+                }),
+            );
         }
         let wallet_id = bloom_broker_api::Token::new(wallet.clone())
             .map_err(|error| HostError::Invalid(format!("wallet: {error}")))?;
