@@ -216,52 +216,15 @@ fn validate_stale_mount(mounted: &MountedFilesystem, cfg: &MountConfig) -> Resul
     )))
 }
 
-fn stale_unmount_attempts(path: &Path, from_fstab: bool) -> Vec<CommandAttempt> {
-    if cfg!(target_os = "linux") && from_fstab {
-        return vec![(
-            "umount".to_string(),
-            vec![
-                "-f".to_string(),
-                "-l".to_string(),
-                path.display().to_string(),
-            ],
-        )];
-    }
-    unmount_attempts(path, from_fstab)
-}
-
-fn reconcile_stale_mount(cfg: &MountConfig, from_fstab: bool) -> Result<(), MountError> {
+fn reconcile_stale_mount(cfg: &MountConfig, _from_fstab: bool) -> Result<(), MountError> {
     let Some(mounted) = mounted_filesystem(&cfg.mount_path)? else {
         return Ok(());
     };
     validate_stale_mount(&mounted, cfg)?;
-    if cfg.nfs_listen.port() == 0 {
-        return Err(MountError::Mount(format!(
-            "refusing to replace an existing Bloom mount at {}",
-            cfg.mount_path.display()
-        )));
-    }
-    match std::net::TcpListener::bind(cfg.nfs_listen) {
-        Ok(probe) => drop(probe),
-        Err(error) => {
-            return Err(MountError::Mount(format!(
-                "refusing to replace an existing Bloom mount at {} while its listener is unavailable: {error}",
-                cfg.mount_path.display()
-            )));
-        }
-    }
-    run_command_attempts(
-        stale_unmount_attempts(&cfg.mount_path, from_fstab),
-        FSTAB_UMOUNT_COMMAND_TIMEOUT,
-    )?;
-    if mounted_filesystem(&cfg.mount_path)?.is_some() {
-        return Err(MountError::Mount(format!(
-            "stale NFS mount remains at {}",
-            cfg.mount_path.display()
-        )));
-    }
-    info!(mount_path = %cfg.mount_path.display(), "mount.stale_reconciled");
-    Ok(())
+    Err(MountError::Mount(format!(
+        "refusing to replace an existing Bloom mount at {}",
+        cfg.mount_path.display()
+    )))
 }
 
 fn linux_mount_fallback_args(cfg: &MountConfig, server: SocketAddr) -> Vec<String> {
@@ -758,28 +721,6 @@ mod tests {
         };
         let error = validate_stale_mount(&foreign, &cfg).unwrap_err();
         assert!(error.to_string().contains("foreign filesystem"));
-    }
-
-    #[test]
-    fn stale_fstab_mount_is_force_detached_by_exact_target() {
-        let attempts = stale_unmount_attempts(Path::new("/home/alice/bloom"), true);
-        #[cfg(target_os = "linux")]
-        assert_eq!(
-            attempts,
-            vec![(
-                "umount".to_string(),
-                vec![
-                    "-f".to_string(),
-                    "-l".to_string(),
-                    "/home/alice/bloom".to_string(),
-                ],
-            )]
-        );
-        #[cfg(not(target_os = "linux"))]
-        assert_eq!(
-            attempts,
-            vec![("umount".to_string(), vec!["/home/alice/bloom".to_string()],)]
-        );
     }
 
     /// Aborting the server task as part of `unmount` should cause the
