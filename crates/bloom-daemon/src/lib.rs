@@ -4037,6 +4037,13 @@ impl Daemon {
         })
     }
 
+    /// Return the daemon's single authenticated Machine→Broker edge.
+    /// Clones share its transport ordering gate and attached audit provider;
+    /// callers must not construct a second edge over the same Machine journal.
+    pub fn broker_client(&self) -> Option<MachineBrokerClient> {
+        self.machine_broker.clone()
+    }
+
     /// Idempotent: ensure background workers are running. Already
     /// invoked by [`from_home`] when a tokio runtime is available; call
     /// this after entering an async context if construction happened

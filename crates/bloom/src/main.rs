@@ -747,10 +747,10 @@ async fn launch_account_allocation(
         }
     };
 
-    let client = configured_broker_client(&daemon.home).map_err(|error| {
+    let client = daemon.broker_client().ok_or_else(|| {
         machine_error(
             MachineErrorKind::Unavailable,
-            format!("custody requires the authenticated Machine-to-Broker edge: {error:#}"),
+            "custody requires the authenticated Machine-to-Broker edge",
         )
     })?;
     let wallet = client
@@ -853,10 +853,10 @@ async fn launch_account_retirement(
         .get_wallet(wallet_id)
         .await
         .map_err(machine_wallet_lookup_error)?;
-    let client = configured_broker_client(&daemon.home).map_err(|error| {
+    let client = daemon.broker_client().ok_or_else(|| {
         machine_error(
             MachineErrorKind::Unavailable,
-            format!("custody requires the authenticated Machine-to-Broker edge: {error:#}"),
+            "custody requires the authenticated Machine-to-Broker edge",
         )
     })?;
     let accounts = client
@@ -1509,10 +1509,10 @@ async fn execute_machine_command(
         }
         MachineCommand::WalletAccounts { name } => {
             let wallet_id = bloom_broker_api::Token::new(name)?;
-            let client = configured_broker_client(home).map_err(|error| {
+            let client = daemon.broker_client().ok_or_else(|| {
                 machine_error(
                     MachineErrorKind::Unavailable,
-                    format!("wallet accounts requires the authenticated Machine-to-Broker edge: {error:#}"),
+                    "wallet accounts requires the authenticated Machine-to-Broker edge",
                 )
             })?;
             let accounts = client
@@ -1555,12 +1555,10 @@ async fn execute_machine_command(
                         .into());
                     }
                 };
-                let client = configured_broker_client(&daemon.home).map_err(|error| {
+                let client = daemon.broker_client().ok_or_else(|| {
                     machine_error(
                         MachineErrorKind::Unavailable,
-                        format!(
-                            "wallet address requires the authenticated Machine-to-Broker edge: {error:#}"
-                        ),
+                        "wallet address requires the authenticated Machine-to-Broker edge",
                     )
                 })?;
                 let accounts = client
