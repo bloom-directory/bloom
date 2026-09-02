@@ -35,8 +35,8 @@ return ceremony information; Machine does not create or open a keystore.
 ## BIP-39 roots and derived accounts
 
 The v1 BIP-39 profile accepts a standard English mnemonic only through the
-Broker-hosted owner ceremony and uses the interoperable empty BIP-39
-passphrase. Non-empty BIP-39 passphrases are unsupported and rejected. Signer
+Broker-hosted owner ceremony and exposes no passphrase input.
+Passphrase-protected BIP-39 wallets are unsupported and rejected. Signer
 stores encrypted root material behind the passkey/PRF wrapping path; Machine
 and Broker never persist the mnemonic, seed, passphrase, PRF output, or child
 private keys.
