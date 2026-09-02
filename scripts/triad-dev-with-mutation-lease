@@ -1,0 +1,62 @@
+#!/usr/bin/env python3
+"""Run one complete shared-triad mutation workflow under its instance lease."""
+
+from __future__ import annotations
+
+import fcntl
+import os
+from pathlib import Path
+import stat
+import subprocess
+import sys
+
+
+def fail(message: str) -> "NoReturn":
+    raise SystemExit(f"triad mutation lease: {message}")
+
+
+if len(sys.argv) < 2 or sys.argv[1] in {"-h", "--help"}:
+    print(
+        "Usage: source /path/to/triad.env && "
+        "scripts/triad-dev-with-mutation-lease COMMAND [ARG ...]"
+    )
+    raise SystemExit(0 if len(sys.argv) >= 2 else 2)
+
+lock_value = os.environ.get("BLOOM_TRIAD_MUTATION_LOCK")
+ready_value = os.environ.get("BLOOM_TRIAD_READY_FILE")
+endpoint = os.environ.get("BLOOM_RPC_ENDPOINT", "")
+if not lock_value or not ready_value or not endpoint.startswith("unix:"):
+    fail("source triad.env from the lifecycle owner before running a mutation")
+
+lock_path = Path(lock_value)
+ready_path = Path(ready_value)
+socket_path = Path(endpoint.removeprefix("unix:"))
+if not ready_path.is_file() or ready_path.read_text(encoding="utf-8") != "ready\n":
+    fail("the selected triad is not ready; obtain a fresh triad.env from its owner")
+if not socket_path.is_socket():
+    fail("the selected Machine socket is not live; obtain a fresh triad.env from its owner")
+
+flags = os.O_RDWR | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+try:
+    lock_fd = os.open(lock_path, flags)
+except OSError as error:
+    fail(f"cannot open the launcher's mutation lock: {error}")
+
+with os.fdopen(lock_fd, "r+", encoding="utf-8") as lock:
+    metadata = os.fstat(lock.fileno())
+    if not stat.S_ISREG(metadata.st_mode):
+        fail("the mutation lock is not a regular file")
+    if metadata.st_uid != os.geteuid() or metadata.st_mode & 0o077:
+        fail("the mutation lock must be owned by this user and private")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        fail("another agent owns the triad mutation lease; coordinate and retry later")
+
+    # Keep the parent alive so the lease spans the command's cleanup and signal
+    # handling. Never record argv: eval commands can refer to credential paths.
+    try:
+        result = subprocess.run(sys.argv[1:], check=False)
+    except FileNotFoundError:
+        fail(f"command not found: {sys.argv[1]}")
+    raise SystemExit(result.returncode)

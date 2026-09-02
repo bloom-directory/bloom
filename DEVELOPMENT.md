@@ -9,6 +9,8 @@ For the manual mounted passkey workflow, read
 [`docs/local-mainnet-integration.md`](./docs/local-mainnet-integration.md).
 For the production process and security contract, read
 [`docs/specs/2026-07-23-triad-process-architecture.md`](./docs/specs/2026-07-23-triad-process-architecture.md).
+Agents attaching to a triad owned by another process must also follow
+[`docs/guides/shared-triad-agents.md`](./docs/guides/shared-triad-agents.md).
 
 ## Prerequisites
 
@@ -211,6 +213,66 @@ so use `bloom` directly for commands against the running Machine:
 source /tmp/bloom-triad-logs/triad.env
 bloom wallet new test-wallet
 ```
+
+### Share one running triad between developers or agents
+
+Machine accepts multiple same-UID clients on its authenticated Unix socket, so
+developers and agents may share one running triad. This does **not** make the
+triad's processes or state multi-owner. Designate one lifecycle owner. Only
+that owner starts or stops the launcher, changes its configuration, enrolls
+authority, replaces a running binary, or handles a failed service. Never start
+a second Machine, Broker, or Signer against the same developer root, Machine
+home, sockets, mount, ceremony port, or custody state.
+
+The owner gives attaching clients the generated `triad.env`, not copies of
+identity or custody files. In every client shell:
+
+```sh
+source /tmp/bloom-triad-logs/triad.env
+test "$(cat "$BLOOM_TRIAD_READY_FILE")" = ready
+"$BLOOM_BIN" vfs ls /
+```
+
+The file names one runtime instance and the exact tested Machine binary. It is
+stale as soon as the owner restarts the launcher; source the newly generated
+file after a restart. A build in another worktree does not change the running
+process. Concurrent public reads are supported because Machine accepts each
+connection independently. A multi-step mutation is different: two individually
+valid stage, policy, ceremony, confirm, or cleanup operations can invalidate
+each other's assumptions even when the underlying stores remain consistent.
+
+Run every state-changing workflow under the launcher's fail-fast, portable
+instance lease:
+
+```sh
+scripts/triad-dev-with-mutation-lease \
+  bloom wallet account-allocate test-wallet --profile bip44-solana-slip10-ed25519-v1
+
+# Keep the lease around the whole workflow, including its cleanup.
+scripts/triad-dev-with-mutation-lease \
+  scripts/evals/run-harbor.sh solana-transfer glm
+```
+
+The helper refuses a stale environment, a dead Machine socket, an insecure lock
+file, or an already-held lease. Do not delete, replace, or bypass the lock when
+it is busy. Find its owner and wait or arrange an explicit handoff. Exactly one
+actor drives a Broker ceremony; other clients must not complete, cancel, retry,
+or reconcile a pending operation they did not create. Give every operation a
+unique client/order/session ID wherever the protocol accepts one.
+
+The lease is deliberately triad-wide rather than wallet-scoped. It is a safe
+coordination boundary for workflows whose authority, WebAuthn counters, policy,
+outbox, or cleanup can cross wallet and chain surfaces. Narrower parallel
+mutation requires a protocol-owned lease or batch abstraction, not an informal
+agreement between clients.
+
+For concurrent source work, use separate Git worktrees and distinct
+`CARGO_TARGET_DIR` values. Do not rebuild over a binary currently used by the
+launcher. A useful handoff names the triad instance ID, the three tested
+commits, the active worktree binaries, any pending operation or ceremony, and
+whether the mutation lease has been released. Real custody remains behind
+Broker and Signer throughout; sharing a triad is never a reason to export its
+mnemonic or private keys.
 
 For the BIP-39 import and native-Solana derivation path, use the explicit
 profiles below and open the exact `http://localhost:18734` ceremony URL printed

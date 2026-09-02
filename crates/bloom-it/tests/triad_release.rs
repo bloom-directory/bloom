@@ -393,8 +393,12 @@ fn triad_developer_launcher_exports_its_machine_connection() {
     assert!(
         launcher.contains("printf 'export BLOOM_RPC_ENDPOINT=%q\\n' \"unix:${machine_socket}\"")
             && launcher.contains("printf 'export BLOOM_BIN=%q\\n' \"$bloom_bin\"")
-            && launcher.contains("printf 'export BLOOM_EVAL_BLOOM_MOUNT=%q\\n' \"$mount_dir\""),
-        "triad.env must select the launched Machine, exact bloom binary, and exact mount"
+            && launcher.contains("printf 'export BLOOM_EVAL_BLOOM_MOUNT=%q\\n' \"$mount_dir\"")
+            && launcher.contains("printf 'export BLOOM_TRIAD_INSTANCE_ID=%q\\n' \"$unit_token\"")
+            && launcher
+                .contains("printf 'export BLOOM_TRIAD_MUTATION_LOCK=%q\\n' \"$mutation_lock\"")
+            && launcher.contains("printf 'export BLOOM_TRIAD_READY_FILE=%q\\n' \"$ready_file\""),
+        "triad.env must select the launched Machine, binary, mount, and coordination instance"
     );
 }
 
