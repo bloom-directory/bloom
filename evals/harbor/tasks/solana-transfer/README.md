@@ -59,7 +59,10 @@ destination that is not the host-controlled sweep address.
   eval repeatable. The container never receives this key.
 - The Solana CLI on `PATH` for that sweep. Preflight requires it on the mainnet
   lane, because discovering it missing after a broadcast would be too late.
-- A dedicated wallet with a Solana account and no outbox entries in any state.
+- A dedicated wallet with exactly one active Solana account, no pending outbox
+  entries, and only fully reconciled historical sent entries. Reusing the
+  wallet across trials is supported; each trial still needs a fresh
+  host-controlled destination so its chain evidence remains unambiguous.
 
 ### Run
 
@@ -84,7 +87,27 @@ scripts/evals/run-harbor.sh solana-transfer --preauthorization-only
 
 scripts/evals/run-harbor.sh solana-transfer claude
 scripts/evals/run-harbor.sh solana-transfer codex
+scripts/evals/run-harbor.sh solana-transfer glm
 ```
+
+Set `BLOOM_EVAL_MODEL` to select a different model without changing the
+harness. The GLM adapter defaults to `glm-5.2` and accepts `GLM_API_KEY`,
+`ZAI_API_KEY`, or `ANTHROPIC_AUTH_TOKEN` from the host; the credential is
+forwarded only to Harbor's agent adapter.
+
+When the triad is shared with other developers or agents, source the lifecycle
+owner's current `triad.env` and hold the triad mutation lease around the entire
+eval, including host cleanup:
+
+```bash
+source /path/from/the-triad-owner/triad.env
+scripts/triad-dev-with-mutation-lease \
+  scripts/evals/run-harbor.sh solana-transfer glm
+```
+
+The eval's own advisory lock prevents two Solana trials from overlapping. The
+outer triad lease also excludes unrelated wallet, policy, ceremony, and outbox
+mutations that could invalidate the trial. Never bypass either lock.
 
 `BLOOM_EVAL_SOLANA_HOME_ROOT` is required because the Solana outbox publishes no
 `ceremony.json`. On `ApprovalRequired` the confirm route writes a private

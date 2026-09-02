@@ -13,7 +13,14 @@ from types import SimpleNamespace
 from unittest import mock
 
 from harness import hyperliquid_order_cancel
-from harness.core import AgentSpec, EvalDefinition, EvalError, EvalRunContext, run_eval
+from harness.core import (
+    AgentSpec,
+    EvalDefinition,
+    EvalError,
+    EvalRunContext,
+    _agent_spec,
+    run_eval,
+)
 from harness.hyperliquid_order_cancel import (
     ACTION_FILES,
     MAINNET_ACK,
@@ -61,6 +68,41 @@ class HarnessLifecycleTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.auth.stop()
         self.temp.cleanup()
+
+    def test_glm_uses_zai_coding_plan_through_claude_code(self) -> None:
+        with mock.patch.dict(os.environ, {"GLM_API_KEY": "test-glm-key"}, clear=True):
+            spec = _agent_spec("glm")
+
+        self.assertEqual(spec.harbor_name, "claude-code")
+        self.assertEqual(spec.model, "glm-5.2")
+        self.assertEqual(spec.env["ANTHROPIC_AUTH_TOKEN"], "test-glm-key")
+        self.assertEqual(
+            spec.env["ANTHROPIC_BASE_URL"], "https://api.z.ai/api/anthropic"
+        )
+
+    def test_agent_model_can_be_selected_without_a_code_change(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {"ZAI_API_KEY": "test-zai-key", "BLOOM_EVAL_MODEL": "glm-5.3"},
+            clear=True,
+        ):
+            spec = _agent_spec("glm")
+
+        self.assertEqual(spec.model, "glm-5.3")
+
+    def test_an_empty_agent_model_override_is_rejected(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {"ZAI_API_KEY": "test-zai-key", "BLOOM_EVAL_MODEL": "  "},
+            clear=True,
+        ):
+            with self.assertRaisesRegex(EvalError, "BLOOM_EVAL_MODEL"):
+                _agent_spec("glm")
+
+    def test_glm_requires_a_zai_coding_plan_key(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=True):
+            with self.assertRaisesRegex(EvalError, "GLM Coding Plan auth is missing"):
+                _agent_spec("glm")
 
     def passing_result(self) -> SimpleNamespace:
         trial = SimpleNamespace(

@@ -102,8 +102,24 @@ class SolanaEvalTestCase(unittest.TestCase):
 
 class AuthorizationPreflightTests(SolanaEvalTestCase):
     def test_a_well_formed_authorization_is_accepted(self) -> None:
-        auth = self.make().authorization_preflight()
+        definition = self.make()
+        with mock.patch(
+            "harness.solana_transfer.subprocess.run",
+            return_value=SimpleNamespace(
+                returncode=0, stdout=DESTINATION + "\n", stderr=""
+            ),
+        ):
+            auth = definition.authorization_preflight()
         self.assertEqual(auth["transfer_lamports"], TRANSFER)
+
+    def test_the_sweep_keypair_must_control_the_destination(self) -> None:
+        definition = self.make()
+        with mock.patch(
+            "harness.solana_transfer.subprocess.run",
+            return_value=SimpleNamespace(returncode=0, stdout=SOURCE + "\n", stderr=""),
+        ):
+            with self.assertRaisesRegex(EvalError, "not controlled"):
+                definition.authorization_preflight()
 
     def test_a_world_readable_authorization_is_rejected(self) -> None:
         self.auth_path.chmod(0o644)
@@ -228,6 +244,45 @@ class LanePreflightTests(SolanaEvalTestCase):
             self.make(
                 BLOOM_EVAL_SOLANA_LANE="local"
             ).preauthorization_preflight()
+
+
+class LocalIdentityTests(SolanaEvalTestCase):
+    def test_local_identity_comes_from_the_authenticated_account_projection(self) -> None:
+        definition = self.make(BLOOM_EVAL_SOLANA_LANE="local")
+        projection = {
+            "wallet_id": WALLET_ID,
+            "accounts": [
+                {
+                    "derivation_profile": "bip44-solana-slip10-ed25519-v1",
+                    "lifecycle": "ACTIVE",
+                    "public_key_fingerprint": FINGERPRINT,
+                    "path": DERIVATION,
+                }
+            ],
+        }
+        with mock.patch.object(definition.mount, "read_json", return_value=projection):
+            with mock.patch(
+                "harness.solana_transfer.subprocess.run",
+                return_value=SimpleNamespace(stdout=SOURCE + "\n"),
+            ):
+                definition._load_local_account_identity()
+
+        self.assertEqual(definition.source_address, SOURCE)
+        self.assertEqual(definition.key_fingerprint, FINGERPRINT)
+        self.assertEqual(definition.derivation_path, DERIVATION)
+
+    def test_local_identity_refuses_multiple_active_solana_accounts(self) -> None:
+        definition = self.make(BLOOM_EVAL_SOLANA_LANE="local")
+        account = {
+            "derivation_profile": "bip44-solana-slip10-ed25519-v1",
+            "lifecycle": "ACTIVE",
+            "public_key_fingerprint": FINGERPRINT,
+            "path": DERIVATION,
+        }
+        projection = {"wallet_id": WALLET_ID, "accounts": [account, account]}
+        with mock.patch.object(definition.mount, "read_json", return_value=projection):
+            with self.assertRaisesRegex(EvalError, "exactly one active"):
+                definition._load_local_account_identity()
 
 
 class ApproverMatchTests(SolanaEvalTestCase):
@@ -455,6 +510,45 @@ class SweepTests(SolanaEvalTestCase):
         ):
             with self.assertRaisesRegex(EvalError, "required for host cleanup"):
                 self.definition._require_sweep_tool()
+
+
+class ReusedWalletCleanupTests(SolanaEvalTestCase):
+    def test_cleanup_ignores_reconciled_history_and_checks_only_this_trial(self) -> None:
+        definition = self.make()
+        definition.destination = DESTINATION
+        definition.source_address = SOURCE
+        definition._baseline_sent = {"historical"}
+
+        def listing(state: str) -> list[str]:
+            if state == "pending":
+                return []
+            if state == "sent":
+                return ["historical", "current"]
+            return []
+
+        with mock.patch.object(definition, "_stop_approver"):
+            with mock.patch.object(definition, "_list_state", side_effect=listing):
+                with mock.patch.object(
+                    definition.mount,
+                    "read_json_if_listed",
+                    return_value={"outcome": "success"},
+                ) as receipt:
+                    with mock.patch.object(definition, "sweep_destination", return_value=None):
+                        definition.cleanup()
+
+        self.assertEqual(receipt.call_count, 1)
+        self.assertIn("current", str(receipt.call_args))
+
+    def test_cleanup_fails_if_historical_sent_state_disappears(self) -> None:
+        definition = self.make()
+        definition.destination = DESTINATION
+        definition.source_address = SOURCE
+        definition._baseline_sent = {"historical"}
+        with mock.patch.object(definition, "_stop_approver"):
+            with mock.patch.object(definition, "_list_state", return_value=[]):
+                with mock.patch.object(definition, "sweep_destination", return_value=None):
+                    with self.assertRaisesRegex(EvalError, "historical sent entries"):
+                        definition.cleanup()
 
 
 class ContainerBoundaryTests(SolanaEvalTestCase):

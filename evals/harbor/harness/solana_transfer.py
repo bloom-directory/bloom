@@ -165,6 +165,7 @@ class SolanaTransferEval(EvalDefinition):
         self._approver_stop = threading.Event()
         self._approver_error: str | None = None
         self._approver_completed = 0
+        self._baseline_sent: set[str] = set()
 
     # ---- paths ---------------------------------------------------------
 
@@ -242,6 +243,86 @@ class SolanaTransferEval(EvalDefinition):
             return json.loads(raw)
         except json.JSONDecodeError as error:
             raise EvalError(f"{label} is not valid JSON: {error}") from error
+
+    def _load_local_account_identity(self) -> None:
+        """Resolve the one active Solana child from Broker's public projection."""
+        projection = self.mount.read_json(self.wallet_root / "accounts.json")
+        if not isinstance(projection, dict) or projection.get("wallet_id") != self.wallet_id:
+            raise EvalError("wallet accounts projection does not match the selected wallet")
+        accounts = projection.get("accounts")
+        if not isinstance(accounts, list):
+            raise EvalError("wallet accounts projection has no account list")
+        solana = [
+            account
+            for account in accounts
+            if isinstance(account, dict)
+            and account.get("derivation_profile")
+            == "bip44-solana-slip10-ed25519-v1"
+            and account.get("lifecycle") == "ACTIVE"
+        ]
+        if len(solana) != 1:
+            raise EvalError(
+                "local eval wallet must have exactly one active Solana account; "
+                f"found {len(solana)}"
+            )
+        account = solana[0]
+        fingerprint = account.get("public_key_fingerprint")
+        path = account.get("path")
+        if not isinstance(fingerprint, str) or FINGERPRINT.fullmatch(fingerprint) is None:
+            raise EvalError("Solana account projection has a malformed fingerprint")
+        if not isinstance(path, str) or DERIVATION.fullmatch(path) is None:
+            raise EvalError("Solana account projection has a malformed derivation path")
+        address_path = self.chain_root / "accounts" / fingerprint / "address"
+        try:
+            completed = subprocess.run(
+                ["cat", str(address_path)],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=CHAIN_READ_TIMEOUT_SECONDS,
+            )
+        except (OSError, subprocess.SubprocessError) as error:
+            raise EvalError(f"could not read Solana account address: {error}") from error
+        address = completed.stdout.strip()
+        if ADDRESS.fullmatch(address) is None:
+            raise EvalError("Solana account projection has a malformed address")
+        self.source_address = address
+        self.key_fingerprint = fingerprint
+        self.derivation_path = path
+
+    def _require_sweep_keypair(self) -> None:
+        """Prove the host controls the configured cleanup destination."""
+        if not str(self.sweep_keypair):
+            raise EvalError("BLOOM_EVAL_SOLANA_SWEEP_KEYPAIR_FILE is required")
+        try:
+            keypair_stat = self.sweep_keypair.lstat()
+        except OSError as error:
+            raise EvalError(f"sweep keypair is unavailable: {error}") from error
+        if not stat.S_ISREG(keypair_stat.st_mode) or self.sweep_keypair.is_symlink():
+            raise EvalError("sweep keypair must be a regular non-symlink file")
+        if stat.S_IMODE(keypair_stat.st_mode) != 0o600:
+            raise EvalError("sweep keypair must have mode 0600")
+        try:
+            completed = subprocess.run(
+                [self.solana_cli, "address", "--keypair", str(self.sweep_keypair)],
+                capture_output=True,
+                check=False,
+                text=True,
+                timeout=20,
+            )
+        except (OSError, subprocess.SubprocessError) as error:
+            raise EvalError(f"could not inspect sweep keypair address: {error}") from error
+        if completed.returncode != 0:
+            raise EvalError(
+                "could not inspect sweep keypair address: "
+                + (completed.stderr or completed.stdout).strip()
+            )
+        observed = completed.stdout.strip()
+        if observed != self.destination:
+            raise EvalError(
+                "BLOOM_EVAL_SOLANA_DESTINATION is not controlled by the configured "
+                "sweep keypair"
+            )
 
     # ---- authorization -------------------------------------------------
 
@@ -376,16 +457,6 @@ class SolanaTransferEval(EvalDefinition):
         A destination the host does not hold the key for turns a bounded,
         recoverable trial into an unrecoverable one.
         """
-        if not str(self.sweep_keypair):
-            raise EvalError("BLOOM_EVAL_SOLANA_SWEEP_KEYPAIR_FILE is required")
-        try:
-            keypair_stat = self.sweep_keypair.lstat()
-        except OSError as error:
-            raise EvalError(f"sweep keypair is unavailable: {error}") from error
-        if not stat.S_ISREG(keypair_stat.st_mode) or self.sweep_keypair.is_symlink():
-            raise EvalError("sweep keypair must be a regular non-symlink file")
-        if stat.S_IMODE(keypair_stat.st_mode) != 0o600:
-            raise EvalError("sweep keypair must have mode 0600")
         expected = self.env.get("BLOOM_EVAL_SOLANA_DESTINATION", "")
         if not expected:
             raise EvalError("BLOOM_EVAL_SOLANA_DESTINATION is required")
@@ -394,6 +465,8 @@ class SolanaTransferEval(EvalDefinition):
                 "canary authorization destination is not the host-controlled "
                 "sweep address"
             )
+        self.destination = expected
+        self._require_sweep_keypair()
 
     # ---- preflight -----------------------------------------------------
 
@@ -455,10 +528,11 @@ class SolanaTransferEval(EvalDefinition):
         self.sign_count = self._require_sign_count()
         CeremonyDriver(self.driver, self.seed_file, self.sign_count).preflight()
 
-        if self.lane == "mainnet-canary":
-            # Cleanup must be able to return the lamports. Discovering that the
-            # sweep tool is missing after a mainnet broadcast is too late.
-            self._require_sweep_tool()
+        # Cleanup must be able to return the lamports. Discovering that the
+        # sweep tool or key is missing after a broadcast is too late, including
+        # on the local lane where unattended repeated trials depend on cleanup.
+        self._require_sweep_tool()
+        self._require_sweep_keypair()
 
         if not os.path.ismount(self.bloom_mount):
             raise EvalError(f"Bloom is not mounted at {self.bloom_mount}")
@@ -473,12 +547,28 @@ class SolanaTransferEval(EvalDefinition):
         if not (self.outbox_root / "new.tx").exists():
             raise EvalError(f"{self.outbox_root}/new.tx is missing; the chain is not writable")
 
-        for state in ("pending", "sent"):
-            residue = self._list_state(state)
-            if residue:
+        if self.lane == "local":
+            self._load_local_account_identity()
+
+        pending = self._list_state("pending")
+        if pending:
+            raise EvalError(
+                f"dedicated wallet already has {len(pending)} outbox/pending "
+                "entries; inspect and clear them before a trial"
+            )
+        # Reconciled sent entries are immutable history, not live authority.
+        # Snapshot them so this trial can safely reuse the wallet while cleanup
+        # reasons only about entries created after preflight.
+        self._baseline_sent = set(self._list_state("sent"))
+        for sent_id in self._baseline_sent:
+            receipt = self.mount.read_json_if_listed(
+                self.outbox_root / "sent" / sent_id / "receipt.json",
+                self.outbox_root / "sent",
+                sent_id,
+            )
+            if not isinstance(receipt, dict) or receipt.get("outcome") is None:
                 raise EvalError(
-                    f"dedicated wallet already has {len(residue)} outbox/{state} "
-                    "entries; inspect and clear them before a trial"
+                    f"historical sent entry {sent_id} has not reconciled to a receipt"
                 )
 
     def preauthorization_preflight(self) -> None:
@@ -831,7 +921,11 @@ class SolanaTransferEval(EvalDefinition):
             failures.append("outbox/pending did not drain")
 
         # 2. Zero or one sent entry, and if one, it must have reconciled.
-        sent = self._list_state("sent")
+        all_sent = set(self._list_state("sent"))
+        missing_history = self._baseline_sent - all_sent
+        if missing_history:
+            failures.append("historical sent entries disappeared during the trial")
+        sent = sorted(all_sent - self._baseline_sent)
         if len(sent) > 1:
             failures.append(
                 f"outbox/sent has {len(sent)} entries; the authorization permits one"

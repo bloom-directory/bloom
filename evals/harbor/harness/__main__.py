@@ -29,7 +29,7 @@ def parser() -> argparse.ArgumentParser:
         choices=tuple(DEFINITIONS),
         help="host-side evaluation definition",
     )
-    value.add_argument("agent", nargs="?", choices=("claude", "codex"))
+    value.add_argument("agent", nargs="?", choices=("claude", "codex", "glm"))
     value.add_argument(
         "--preauthorization-only",
         action="store_true",

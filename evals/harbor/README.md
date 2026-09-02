@@ -269,7 +269,18 @@ scripts/evals/run-harbor-hyperliquid.sh claude
 # Codex / GPT-5.6 Terra
 # Uses OPENAI_API_KEY when set; otherwise ~/.codex/auth.json.
 scripts/evals/run-harbor-hyperliquid.sh codex
+
+# Z.AI Coding Plan / GLM-5.2
+# Generate this key in the Z.AI dashboard; it is not an OpenAI credential.
+export GLM_API_KEY=...
+scripts/evals/run-harbor-hyperliquid.sh glm
+
+# Select another provider-compatible model without changing the harness.
+BLOOM_EVAL_MODEL=glm-5.3 scripts/evals/run-harbor-hyperliquid.sh glm
 ```
+
+Each agent has a reviewed default model. Set `BLOOM_EVAL_MODEL` to select a
+different model for a run; Harbor records the resolved model in the job config.
 
 ### Reproduce the package-only wallet policy
 

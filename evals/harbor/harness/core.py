@@ -401,6 +401,9 @@ AGENTS: dict[str, AgentSpec] = {
     # rather than a configuration error.
     "claude": AgentSpec("claude-code", "claude-sonnet-5"),
     "codex": AgentSpec("codex", "gpt-5.6-terra"),
+    # Z.AI exposes GLM Coding Plan through an Anthropic-compatible endpoint,
+    # so Harbor can run it with its existing Claude Code adapter.
+    "glm": AgentSpec("claude-code", "glm-5.2"),
 }
 
 
@@ -519,6 +522,7 @@ def _agent_spec(name: str) -> AgentSpec:
             f"unsupported agent {name!r}; choose: {', '.join(AGENTS)}"
         ) from error
 
+    agent_env = dict(spec.env)
     if name == "claude":
         if not (os.getenv("ANTHROPIC_API_KEY") or os.getenv("CLAUDE_CODE_OAUTH_TOKEN")):
             raise EvalError(
@@ -526,13 +530,33 @@ def _agent_spec(name: str) -> AgentSpec:
                 "CLAUDE_CODE_OAUTH_TOKEN"
             )
         if os.getenv("CLAUDE_CODE_OAUTH_TOKEN") and not os.getenv("ANTHROPIC_API_KEY"):
-            return AgentSpec(spec.harbor_name, spec.model, {"CLAUDE_FORCE_OAUTH": "1"})
+            agent_env["CLAUDE_FORCE_OAUTH"] = "1"
+    if name == "glm":
+        api_key = (
+            os.getenv("GLM_API_KEY")
+            or os.getenv("ZAI_API_KEY")
+            or os.getenv("ANTHROPIC_AUTH_TOKEN")
+        )
+        if not api_key:
+            raise EvalError(
+                "GLM Coding Plan auth is missing; set GLM_API_KEY, "
+                "ZAI_API_KEY, or ANTHROPIC_AUTH_TOKEN"
+            )
+        agent_env.update(
+            ANTHROPIC_AUTH_TOKEN=api_key,
+            ANTHROPIC_BASE_URL="https://api.z.ai/api/anthropic",
+            API_TIMEOUT_MS="3000000",
+        )
     if name == "codex" and not os.getenv("OPENAI_API_KEY"):
         auth_file = Path.home() / ".codex" / "auth.json"
         if not auth_file.is_file():
             raise EvalError("Codex auth is missing")
-        return AgentSpec(spec.harbor_name, spec.model, {"CODEX_FORCE_AUTH_JSON": "1"})
-    return spec
+        agent_env["CODEX_FORCE_AUTH_JSON"] = "1"
+
+    model = os.getenv("BLOOM_EVAL_MODEL", spec.model).strip()
+    if not model:
+        raise EvalError("BLOOM_EVAL_MODEL must not be empty")
+    return AgentSpec(spec.harbor_name, model, agent_env)
 
 
 def run_eval(
