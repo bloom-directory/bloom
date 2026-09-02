@@ -135,6 +135,20 @@ chmod 0755 \
 chmod 0755 "$mount_dir"
 chmod 0700 "$clean_home" "$clean_home/audit-checkpoints"
 
+login_home="$(sudo -H -u "$login_user" /bin/sh -c 'printf "%s\n" "$HOME"')"
+installed_audit="$login_home/.bloom/audit.jsonl"
+[[ "$login_home" == /* && -f "$installed_audit" && ! -L "$installed_audit" ]] || {
+  echo "installed Machine audit is unavailable for the isolated runtime negative" >&2
+  exit 1
+}
+[[ "$(stat -f '%u:%l' "$installed_audit")" == "$login_uid:1" ]] || {
+  echo "installed Machine audit has unsafe ownership or link count" >&2
+  exit 1
+}
+cp "$installed_audit" "$clean_home/audit.jsonl"
+chown "$login_uid" "$clean_home/audit.jsonl"
+chmod 0600 "$clean_home/audit.jsonl"
+
 # Build the out-of-process deterministic ceremony driver before tracing the
 # packaged Machine. The driver talks only to the real Broker HTTP ceremony
 # surface; it cannot mint or stamp a Machine projection.
