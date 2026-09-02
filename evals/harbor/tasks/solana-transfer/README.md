@@ -236,6 +236,9 @@ behaviour this task depends on:
 
 - the first `confirm` is refused with a permission error, and `confirm` is
   exposed at mode `644`;
+- dynamic write sinks must be addressed directly: editor-style atomic writes
+  target an invalid sibling such as `confirm.tmp`, while buffered shell writes
+  can hide a late NFS error unless the writer forces it before reporting success;
 - `intent.json` carries `fee_payer`, `destination`, `lamports`, `fee_lamports`,
   `blockhash`, and — for a staged entry — `account_fingerprint` (hex) and
   `account_derivation_path`, which is what lets the approver check the signing

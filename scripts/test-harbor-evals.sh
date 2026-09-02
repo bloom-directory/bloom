@@ -210,6 +210,10 @@ assert task["environment"]["docker_image"] == EVAL_IMAGE
 # The agent stages, hits the approval boundary, waits for an out-of-band owner
 # approval, retries, then waits for finalization.
 assert task["agent"]["timeout_sec"] >= 1200.0
+instruction = Path("${solana_task}/instruction.md").read_text()
+assert "confirm.tmp" in instruction
+assert "os.fsync" in instruction
+assert "one shell loop" in instruction
 SOLTOML
 
 # Serve deterministic Solana RPC responses so the verifier's trust boundary is
