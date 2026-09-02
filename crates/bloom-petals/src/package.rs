@@ -150,12 +150,19 @@ struct KeyDerivePolicyToml {
     operation_classes: Vec<String>,
     #[serde(default)]
     allowed_routes: Vec<String>,
+    #[serde(default)]
+    allowed_crypto_suites: Vec<String>,
+    #[serde(default)]
+    maximum_lifetime_ms: Option<u64>,
 }
 
 #[derive(Debug)]
 struct ValidatedKeyDerivePolicy {
     operation_classes: Vec<String>,
     allowed_route_ids: Vec<String>,
+    scope_declared: bool,
+    allowed_crypto_suites: Vec<String>,
+    maximum_lifetime_ms: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -344,6 +351,16 @@ pub struct RouteIndexRecord {
     pub key_derive_operation_classes: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub key_derive_allowed_routes: Vec<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub key_derive_scope_declared: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub key_derive_allowed_crypto_suites: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_derive_maximum_lifetime_ms: Option<u64>,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -592,6 +609,13 @@ impl PreparedPetalPackage {
             let route_key_derive_allowed_routes = route_key_derive_policy
                 .map(|policy| policy.allowed_route_ids.clone())
                 .unwrap_or_default();
+            let route_key_derive_scope_declared =
+                route_key_derive_policy.is_some_and(|policy| policy.scope_declared);
+            let route_key_derive_allowed_crypto_suites = route_key_derive_policy
+                .map(|policy| policy.allowed_crypto_suites.clone())
+                .unwrap_or_default();
+            let route_key_derive_maximum_lifetime_ms =
+                route_key_derive_policy.and_then(|policy| policy.maximum_lifetime_ms);
             if !route_key_derive_operation_classes.is_empty()
                 && !validation
                     .required_caps
@@ -649,6 +673,9 @@ impl PreparedPetalPackage {
                 install_metadata,
                 key_derive_operation_classes: route_key_derive_operation_classes,
                 key_derive_allowed_routes: route_key_derive_allowed_routes,
+                key_derive_scope_declared: route_key_derive_scope_declared,
+                key_derive_allowed_crypto_suites: route_key_derive_allowed_crypto_suites,
+                key_derive_maximum_lifetime_ms: route_key_derive_maximum_lifetime_ms,
             });
         }
         validate_resolved_key_derive_scopes(&route_index.routes)?;
@@ -3899,6 +3926,53 @@ fn validate_key_derive_policy(
                 )));
             }
         }
+        let scope_declared = !declaration.allowed_routes.is_empty()
+            || !declaration.allowed_crypto_suites.is_empty()
+            || declaration.maximum_lifetime_ms.is_some();
+        if scope_declared && declaration.allowed_routes.is_empty() {
+            return Err(PetalError::InvalidWasm(format!(
+                "Petal [[key.derive]] route {:?} manifest scope requires non-empty allowed_routes",
+                declaration.route
+            )));
+        }
+        if scope_declared && declaration.allowed_crypto_suites.is_empty() {
+            return Err(PetalError::InvalidWasm(format!(
+                "Petal [[key.derive]] route {:?} manifest scope requires non-empty allowed_crypto_suites",
+                declaration.route
+            )));
+        }
+        if scope_declared && declaration.maximum_lifetime_ms.is_none() {
+            return Err(PetalError::InvalidWasm(format!(
+                "Petal [[key.derive]] route {:?} manifest scope requires maximum_lifetime_ms",
+                declaration.route
+            )));
+        }
+        if declaration.maximum_lifetime_ms == Some(0) {
+            return Err(PetalError::InvalidWasm(format!(
+                "Petal [[key.derive]] route {:?} maximum_lifetime_ms must be greater than zero",
+                declaration.route
+            )));
+        }
+        let mut crypto_suites = BTreeSet::new();
+        for suite in &declaration.allowed_crypto_suites {
+            if !matches!(
+                suite.as_str(),
+                "secp256k1-keccak256-recoverable"
+                    | "secp256k1-sha256-recoverable"
+                    | "ed25519-message"
+            ) {
+                return Err(PetalError::InvalidWasm(format!(
+                    "Petal [[key.derive]] route {:?} has unsupported crypto suite {suite:?}",
+                    declaration.route
+                )));
+            }
+            if !crypto_suites.insert(suite.clone()) {
+                return Err(PetalError::InvalidWasm(format!(
+                    "Petal [[key.derive]] route {:?} has duplicate crypto suite {suite:?}",
+                    declaration.route
+                )));
+            }
+        }
         let mut allowed_patterns = BTreeSet::new();
         for pattern in &declaration.allowed_routes {
             if !routes_by_pattern.contains_key(pattern.as_str()) {
@@ -3927,6 +4001,9 @@ fn validate_key_derive_policy(
                 ValidatedKeyDerivePolicy {
                     operation_classes: classes.into_iter().collect(),
                     allowed_route_ids,
+                    scope_declared,
+                    allowed_crypto_suites: crypto_suites.into_iter().collect(),
+                    maximum_lifetime_ms: declaration.maximum_lifetime_ms,
                 },
             )
             .is_some()
@@ -3946,8 +4023,27 @@ fn validate_resolved_key_derive_scopes(routes: &[RouteIndexRecord]) -> Result<()
         .map(|route| (route.route_id.as_str(), route))
         .collect::<BTreeMap<_, _>>();
     for origin in routes {
-        if origin.key_derive_allowed_routes.is_empty() {
+        if !origin.key_derive_scope_declared {
+            if !origin.key_derive_allowed_routes.is_empty()
+                || !origin.key_derive_allowed_crypto_suites.is_empty()
+                || origin.key_derive_maximum_lifetime_ms.is_some()
+            {
+                return Err(PetalError::InvalidWasm(format!(
+                    "Petal [[key.derive]] route {:?} has scope bounds without a declared manifest scope",
+                    origin.pattern
+                )));
+            }
             continue;
+        }
+        if origin.key_derive_allowed_routes.is_empty()
+            || origin.key_derive_operation_classes.is_empty()
+            || origin.key_derive_allowed_crypto_suites.is_empty()
+            || origin.key_derive_maximum_lifetime_ms.is_none()
+        {
+            return Err(PetalError::InvalidWasm(format!(
+                "Petal [[key.derive]] route {:?} has an incomplete manifest scope",
+                origin.pattern
+            )));
         }
         if !origin
             .key_derive_allowed_routes
@@ -5854,6 +5950,9 @@ name = "echo"
             },
             key_derive_operation_classes: Vec::new(),
             key_derive_allowed_routes: Vec::new(),
+            key_derive_scope_declared: false,
+            key_derive_allowed_crypto_suites: Vec::new(),
+            key_derive_maximum_lifetime_ms: None,
         };
         let metadata = ComponentRouteMetadata {
             kind: ComponentRouteEntryKind::File,
@@ -5896,6 +5995,9 @@ name = "echo"
             },
             key_derive_operation_classes: Vec::new(),
             key_derive_allowed_routes: Vec::new(),
+            key_derive_scope_declared: false,
+            key_derive_allowed_crypto_suites: Vec::new(),
+            key_derive_maximum_lifetime_ms: None,
         };
         let metadata = ComponentRouteMetadata {
             kind: ComponentRouteEntryKind::File,
@@ -6173,6 +6275,9 @@ imports = ["components/helper.wasm"]
             },
             key_derive_operation_classes: Vec::new(),
             key_derive_allowed_routes: Vec::new(),
+            key_derive_scope_declared: false,
+            key_derive_allowed_crypto_suites: Vec::new(),
+            key_derive_maximum_lifetime_ms: None,
         };
         let metadata = ComponentRouteMetadata {
             kind: ComponentRouteEntryKind::File,
@@ -6713,6 +6818,8 @@ namespaces = ["fixture-public"]
 route = "session.json"
 operation_classes = ["fixture.secondary", "fixture.payload"]
 allowed_routes = ["session.json"]
+allowed_crypto_suites = ["secp256k1-keccak256-recoverable"]
+maximum_lifetime_ms = 60000
 "#,
         )
         .unwrap();
@@ -6732,6 +6839,12 @@ allowed_routes = ["session.json"]
                 .contains(&"fixture.unrelated".to_string())
         );
         assert_eq!(route.key_derive_allowed_routes, vec!["r000001"]);
+        assert!(route.key_derive_scope_declared);
+        assert_eq!(
+            route.key_derive_allowed_crypto_suites,
+            vec!["secp256k1-keccak256-recoverable"]
+        );
+        assert_eq!(route.key_derive_maximum_lifetime_ms, Some(60_000));
 
         let serialized = serde_json::to_value(route).unwrap();
         assert_eq!(
@@ -6742,6 +6855,7 @@ allowed_routes = ["session.json"]
             serialized["key_derive_allowed_routes"],
             serde_json::json!(["r000001"])
         );
+        assert_eq!(serialized["key_derive_scope_declared"], true);
         let mut legacy = serialized;
         legacy
             .as_object_mut()
@@ -6751,9 +6865,93 @@ allowed_routes = ["session.json"]
             .as_object_mut()
             .unwrap()
             .remove("key_derive_allowed_routes");
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("key_derive_scope_declared");
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("key_derive_allowed_crypto_suites");
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("key_derive_maximum_lifetime_ms");
         let legacy: RouteIndexRecord = serde_json::from_value(legacy).unwrap();
         assert!(legacy.key_derive_operation_classes.is_empty());
         assert!(legacy.key_derive_allowed_routes.is_empty());
+        assert!(!legacy.key_derive_scope_declared);
+        assert!(legacy.key_derive_allowed_crypto_suites.is_empty());
+        assert_eq!(legacy.key_derive_maximum_lifetime_ms, None);
+    }
+
+    #[test]
+    fn petal_key_derive_manifest_scope_survives_unrelated_route_insertion() {
+        let manifest = br#"schema = "bloom.petal.package.v1"
+name = "triad-authority-fixture"
+[caps]
+allowed = ["bloom:key.derive", "bloom:sign", "bloom:store"]
+
+[sign]
+allowed_intents = ["fixture.payload"]
+
+[store]
+namespaces = ["fixture-public"]
+
+[[key.derive]]
+route = "session.json"
+operation_classes = ["fixture.payload"]
+allowed_routes = ["session.json"]
+allowed_crypto_suites = ["secp256k1-keccak256-recoverable"]
+maximum_lifetime_ms = 60000
+"#;
+        let original = prepared_triad_fixture_with_manifest(manifest).unwrap();
+
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/triad-authority-petal");
+        let mut files = collect_package_dir(&fixture).unwrap();
+        files
+            .iter_mut()
+            .find(|file| file.path == "petal.toml")
+            .unwrap()
+            .bytes = manifest.to_vec();
+        files.retain(|file| !file.path.starts_with("artifacts/"));
+        files.push(NormalizedPackageFile {
+            path: "petal/triad-authority-fixture/aaa.txt.wasm".into(),
+            bytes: route_component_no_imports().to_vec(),
+        });
+        let inserted = PreparedPetalPackage::from_files(files).unwrap();
+
+        let original_route = original
+            .route_index
+            .routes
+            .iter()
+            .find(|route| route.pattern == "session.json")
+            .unwrap();
+        let inserted_route = inserted
+            .route_index
+            .routes
+            .iter()
+            .find(|route| route.pattern == "session.json")
+            .unwrap();
+        assert_ne!(original_route.route_id, inserted_route.route_id);
+        for (package, origin) in [(&original, original_route), (&inserted, inserted_route)] {
+            let patterns = origin
+                .key_derive_allowed_routes
+                .iter()
+                .map(|id| {
+                    package
+                        .route_index
+                        .routes
+                        .iter()
+                        .find(|route| &route.route_id == id)
+                        .unwrap()
+                        .pattern
+                        .as_str()
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(patterns, ["session.json"]);
+        }
     }
 
     #[test]
@@ -6826,6 +7024,8 @@ operation_classes = ["fixture.payload"]
 route = "session.json"
 operation_classes = ["fixture.payload"]
 allowed_routes = ["missing.json"]
+allowed_crypto_suites = ["secp256k1-keccak256-recoverable"]
+maximum_lifetime_ms = 60000
 "#,
                 "allows unknown route",
             ),
@@ -6835,8 +7035,63 @@ allowed_routes = ["missing.json"]
 route = "session.json"
 operation_classes = ["fixture.payload"]
 allowed_routes = ["session.json", "session.json"]
+allowed_crypto_suites = ["secp256k1-keccak256-recoverable"]
+maximum_lifetime_ms = 60000
 "#,
                 "duplicate allowed route",
+            ),
+            (
+                "scope requires suites",
+                r#"[[key.derive]]
+route = "session.json"
+operation_classes = ["fixture.payload"]
+allowed_routes = ["session.json"]
+maximum_lifetime_ms = 60000
+"#,
+                "requires non-empty allowed_crypto_suites",
+            ),
+            (
+                "scope requires lifetime",
+                r#"[[key.derive]]
+route = "session.json"
+operation_classes = ["fixture.payload"]
+allowed_routes = ["session.json"]
+allowed_crypto_suites = ["secp256k1-keccak256-recoverable"]
+"#,
+                "requires maximum_lifetime_ms",
+            ),
+            (
+                "unsupported suite",
+                r#"[[key.derive]]
+route = "session.json"
+operation_classes = ["fixture.payload"]
+allowed_routes = ["session.json"]
+allowed_crypto_suites = ["unknown-suite"]
+maximum_lifetime_ms = 60000
+"#,
+                "unsupported crypto suite",
+            ),
+            (
+                "duplicate suite",
+                r#"[[key.derive]]
+route = "session.json"
+operation_classes = ["fixture.payload"]
+allowed_routes = ["session.json"]
+allowed_crypto_suites = ["ed25519-message", "ed25519-message"]
+maximum_lifetime_ms = 60000
+"#,
+                "duplicate crypto suite",
+            ),
+            (
+                "zero lifetime",
+                r#"[[key.derive]]
+route = "session.json"
+operation_classes = ["fixture.payload"]
+allowed_routes = ["session.json"]
+allowed_crypto_suites = ["ed25519-message"]
+maximum_lifetime_ms = 0
+"#,
+                "must be greater than zero",
             ),
         ];
 

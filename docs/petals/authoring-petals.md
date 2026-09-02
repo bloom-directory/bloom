@@ -86,6 +86,8 @@ allowed_routes = [
   "[network]/agent_sessions/[wallet]/cancel.json",
   "[network]/orders/[wallet]/new.json",
 ]
+allowed_crypto_suites = ["secp256k1-keccak256-recoverable"]
+maximum_lifetime_ms = 86400000
 ```
 
 Every listed class must also appear in `[sign].allowed_intents`. Bloom rejects
@@ -94,9 +96,15 @@ tokens, and declarations on routes without the key-derivation import. The
 installer resolves `allowed_routes` from canonical manifest patterns to the
 immutable route IDs in that package and always includes the derivation route
 itself. Each allowed route must have a signing intent included in the declared
-operation classes. Components do not choose route IDs at runtime. Omitting
-`allowed_routes` retains the legacy guest-supplied route scope for compatibility;
-new Petals should declare it. Other package-level signing intents are not
+operation classes. At runtime the component may request non-empty subsets of
+the declared operation classes and crypto suites and a shorter lifetime, but it
+cannot widen any bound; Bloom supplies the resolved routes. A manifest scope
+must declare all three bounds: `allowed_routes`, `allowed_crypto_suites`, and
+`maximum_lifetime_ms`.
+
+Omitting all three bounds retains the legacy guest-supplied scope only for
+packages created before this manifest contract. New Petals should always
+declare the complete scope. Other package-level signing intents are not
 inherited.
 
 ## Routes and ABI

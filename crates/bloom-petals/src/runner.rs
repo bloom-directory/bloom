@@ -521,7 +521,12 @@ impl PetalRunner {
             Some(mask) => declared_store_policy.intersect(&mask),
             None => declared_store_policy,
         });
+        opts.key_derive_scope_declared = matched.route.key_derive_scope_declared;
         opts.key_derive_allowed_routes = matched.route.key_derive_allowed_routes.clone();
+        opts.key_derive_operation_classes = matched.route.key_derive_operation_classes.clone();
+        opts.key_derive_allowed_crypto_suites =
+            matched.route.key_derive_allowed_crypto_suites.clone();
+        opts.key_derive_maximum_lifetime_ms = matched.route.key_derive_maximum_lifetime_ms;
         self.vm
             .dispatch_component_route(
                 &wasm,

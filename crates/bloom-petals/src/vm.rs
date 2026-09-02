@@ -74,7 +74,11 @@ pub struct StoreData {
     petal_hash: String,
     net_policy: NetPolicy,
     sign_context: Option<PetalRouteContext>,
+    key_derive_scope_declared: bool,
     key_derive_allowed_routes: Vec<String>,
+    key_derive_operation_classes: Vec<String>,
+    key_derive_allowed_crypto_suites: Vec<String>,
+    key_derive_maximum_lifetime_ms: Option<u64>,
     sign_intents: Option<BTreeSet<String>>,
     store_namespaces: Option<StoreNamespacePolicy>,
     http_response_cap: usize,
@@ -117,9 +121,18 @@ pub struct RunOptions {
     /// Optional private-store namespace policy. `None` preserves legacy/direct
     /// VM behavior; Petal package dispatch sets this from `[store]`.
     pub store_namespaces: Option<StoreNamespacePolicy>,
+    /// Whether this route has a complete manifest-declared key scope. False
+    /// preserves the compatibility path for packages created before scopes.
+    pub key_derive_scope_declared: bool,
     /// Manifest-declared route IDs resolved from canonical patterns at package
-    /// validation time. Empty preserves the legacy guest-supplied scope.
+    /// validation time.
     pub key_derive_allowed_routes: Vec<String>,
+    /// Manifest-declared upper bound for delegated operation classes.
+    pub key_derive_operation_classes: Vec<String>,
+    /// Manifest-declared upper bound for derived-key crypto suites.
+    pub key_derive_allowed_crypto_suites: Vec<String>,
+    /// Manifest-declared upper bound for derived-key lifetime.
+    pub key_derive_maximum_lifetime_ms: Option<u64>,
     pub http_response_cap: usize,
     pub private_store_root: Option<PathBuf>,
     /// Force mediated env helpers to deterministic values for install-time checks.
@@ -138,7 +151,11 @@ impl Default for RunOptions {
             net_policy: None,
             sign_intents: None,
             store_namespaces: None,
+            key_derive_scope_declared: false,
             key_derive_allowed_routes: Vec::new(),
+            key_derive_operation_classes: Vec::new(),
+            key_derive_allowed_crypto_suites: Vec::new(),
+            key_derive_maximum_lifetime_ms: None,
             http_response_cap: DEFAULT_HTTP_RESPONSE_CAP,
             private_store_root: None,
             deterministic_env: false,
@@ -266,7 +283,11 @@ impl PetalVm {
                 petal_hash: petal_hash.to_string(),
                 net_policy: opts.net_policy.clone().unwrap_or_else(NetPolicy::deny_all),
                 sign_context: None,
+                key_derive_scope_declared: opts.key_derive_scope_declared,
                 key_derive_allowed_routes: opts.key_derive_allowed_routes.clone(),
+                key_derive_operation_classes: opts.key_derive_operation_classes.clone(),
+                key_derive_allowed_crypto_suites: opts.key_derive_allowed_crypto_suites.clone(),
+                key_derive_maximum_lifetime_ms: opts.key_derive_maximum_lifetime_ms,
                 sign_intents: opts.sign_intents.clone(),
                 store_namespaces: opts.store_namespaces.clone(),
                 http_response_cap: opts.http_response_cap,
@@ -341,7 +362,11 @@ impl PetalVm {
                         .iter()
                         .find_map(|(name, value)| (name == "actor").then(|| value.clone())),
                 }),
+                key_derive_scope_declared: opts.key_derive_scope_declared,
                 key_derive_allowed_routes: opts.key_derive_allowed_routes.clone(),
+                key_derive_operation_classes: opts.key_derive_operation_classes.clone(),
+                key_derive_allowed_crypto_suites: opts.key_derive_allowed_crypto_suites.clone(),
+                key_derive_maximum_lifetime_ms: opts.key_derive_maximum_lifetime_ms,
                 sign_intents: opts.sign_intents.clone(),
                 store_namespaces: opts.store_namespaces.clone(),
                 http_response_cap: opts.http_response_cap,
@@ -415,7 +440,11 @@ impl PetalVm {
                 petal_hash: petal_hash.to_string(),
                 net_policy: opts.net_policy.clone().unwrap_or_else(NetPolicy::deny_all),
                 sign_context: None,
+                key_derive_scope_declared: opts.key_derive_scope_declared,
                 key_derive_allowed_routes: opts.key_derive_allowed_routes.clone(),
+                key_derive_operation_classes: opts.key_derive_operation_classes.clone(),
+                key_derive_allowed_crypto_suites: opts.key_derive_allowed_crypto_suites.clone(),
+                key_derive_maximum_lifetime_ms: opts.key_derive_maximum_lifetime_ms,
                 sign_intents: opts.sign_intents.clone(),
                 store_namespaces: opts.store_namespaces.clone(),
                 http_response_cap: opts.http_response_cap,
@@ -1410,6 +1439,61 @@ async fn component_sign_hashes(
     set_component_result(results, component_host_err(legacy_signing_unsupported()))
 }
 
+fn apply_manifest_key_scope(
+    data: &StoreData,
+    request: &mut PetalKeyRequest,
+) -> Result<(), HostError> {
+    if !data.key_derive_scope_declared {
+        return Ok(());
+    }
+    let maximum_lifetime_ms = data.key_derive_maximum_lifetime_ms.ok_or_else(|| {
+        HostError::Invalid("installed Petal key scope has no lifetime bound".into())
+    })?;
+    if data.key_derive_allowed_routes.is_empty()
+        || data.key_derive_operation_classes.is_empty()
+        || data.key_derive_allowed_crypto_suites.is_empty()
+    {
+        return Err(HostError::Invalid(
+            "installed Petal key scope is incomplete".into(),
+        ));
+    }
+    let requested_classes = request
+        .allowed_operation_classes
+        .iter()
+        .collect::<BTreeSet<_>>();
+    if requested_classes.is_empty()
+        || requested_classes.len() != request.allowed_operation_classes.len()
+        || requested_classes
+            .iter()
+            .any(|class| !data.key_derive_operation_classes.contains(class))
+    {
+        return Err(HostError::Invalid(
+            "Petal key operation classes must be a non-empty subset of the manifest scope".into(),
+        ));
+    }
+    let requested_suites = request
+        .allowed_crypto_suites
+        .iter()
+        .collect::<BTreeSet<_>>();
+    if requested_suites.is_empty()
+        || requested_suites.len() != request.allowed_crypto_suites.len()
+        || requested_suites
+            .iter()
+            .any(|suite| !data.key_derive_allowed_crypto_suites.contains(suite))
+    {
+        return Err(HostError::Invalid(
+            "Petal key crypto suites must be a non-empty subset of the manifest scope".into(),
+        ));
+    }
+    if request.maximum_lifetime_ms == 0 || request.maximum_lifetime_ms > maximum_lifetime_ms {
+        return Err(HostError::Invalid(format!(
+            "Petal key lifetime must be between 1 and {maximum_lifetime_ms} ms"
+        )));
+    }
+    request.allowed_routes = data.key_derive_allowed_routes.clone();
+    Ok(())
+}
+
 async fn component_petal_key_request(
     store: StoreContextMut<'_, StoreData>,
     params: &[ComponentVal],
@@ -1455,8 +1539,8 @@ async fn component_petal_key_request(
         }
     };
     let mut request = PetalKeyRequest::from(guest);
-    if !store.data().key_derive_allowed_routes.is_empty() {
-        request.allowed_routes = store.data().key_derive_allowed_routes.clone();
+    if let Err(error) = apply_manifest_key_scope(store.data(), &mut request) {
+        return set_component_result(results, component_host_err(error));
     }
     request.context = store.data().sign_context.clone();
     let host = store.data().host.clone();
@@ -3942,7 +4026,12 @@ paths = ["/status"]
             actor: None,
         };
         store.data_mut().sign_context = Some(context.clone());
+        store.data_mut().key_derive_scope_declared = true;
         store.data_mut().key_derive_allowed_routes = vec!["r000007".into(), "r000008".into()];
+        store.data_mut().key_derive_operation_classes = vec!["order.place".into()];
+        store.data_mut().key_derive_allowed_crypto_suites =
+            vec!["secp256k1-keccak256-recoverable".into()];
+        store.data_mut().key_derive_maximum_lifetime_ms = Some(60_000);
 
         let attempted_override = serde_json::to_vec(&serde_json::json!({
             "request_id": "agent-a",
@@ -3963,6 +4052,26 @@ paths = ["/status"]
         .await
         .unwrap();
         assert_component_err_contains(&denied[0], "unknown field");
+        assert!(host.petal_key_calls.lock().is_empty());
+
+        let widened = serde_json::to_vec(&serde_json::json!({
+            "wallet_id": "primary",
+            "key_slot": "desk-a",
+            "allowed_routes": [],
+            "allowed_operation_classes": ["order.cancel"],
+            "allowed_crypto_suites": ["secp256k1-keccak256-recoverable"],
+            "maximum_lifetime_ms": 60_000
+        }))
+        .unwrap();
+        let mut denied = vec![ComponentVal::Bool(false)];
+        component_petal_key_request(
+            store.as_context_mut(),
+            &[component_bytes(widened)],
+            &mut denied,
+        )
+        .await
+        .unwrap();
+        assert_component_err_contains(&denied[0], "subset of the manifest scope");
         assert!(host.petal_key_calls.lock().is_empty());
 
         let request = serde_json::to_vec(&serde_json::json!({
@@ -4926,7 +5035,11 @@ paths = ["/status"]
                 petal_hash: VALID_HASH.into(),
                 net_policy,
                 sign_context: None,
+                key_derive_scope_declared: false,
                 key_derive_allowed_routes: Vec::new(),
+                key_derive_operation_classes: Vec::new(),
+                key_derive_allowed_crypto_suites: Vec::new(),
+                key_derive_maximum_lifetime_ms: None,
                 sign_intents: None,
                 store_namespaces: None,
                 http_response_cap: DEFAULT_HTTP_RESPONSE_CAP,

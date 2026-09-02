@@ -1063,6 +1063,9 @@ mod tests {
                 "fixture.immediate".into(),
             ],
             key_derive_allowed_routes: vec!["r000001".into()],
+            key_derive_scope_declared: true,
+            key_derive_allowed_crypto_suites: vec!["secp256k1-keccak256-recoverable".into()],
+            key_derive_maximum_lifetime_ms: Some(60_000),
         };
 
         let classes = developer_route_operation_classes(&route)

@@ -14,6 +14,8 @@ allowed_intents = ["fixture.payload", "fixture.unrelated"]
 route = "session.json"
 operation_classes = ["fixture.payload"]
 allowed_routes = ["session.json"]
+allowed_crypto_suites = ["secp256k1-sha256-recoverable"]
+maximum_lifetime_ms = 300000
 
 [store]
 namespaces = ["fixture-public"]
