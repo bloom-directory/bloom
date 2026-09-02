@@ -18,8 +18,8 @@ signer_repo="${BLOOM_EVAL_SIGNER_REPO:-${signer_repo_default}}"
 # Reviewed heads of bloom-broker#32 and bloom-signer#25. These PR branches were
 # rebased after the eval launcher was first written, so pin the current commits
 # rather than now-unreachable pre-rebase hashes.
-broker_isolation_commit="25ccf8b20079e120b189714c84283eba17c937a4"
-signer_isolation_commit="745befe63ecd7a0b0a104c4ffd1a092d6d347cad"
+broker_isolation_commit="db4f6fc1da95dad5cadb042819c7bc1333a2c699"
+signer_isolation_commit="de55f4131cd1a90e352830b8bb1d08b3f6aa3901"
 build_root="${BLOOM_EVAL_BUILD_ROOT:-${run_base}/build-cache}"
 machine_bin="${BLOOM_EVAL_SOLANA_MACHINE_BINARY:-${build_root}/machine/debug/bloom}"
 broker_bin="${BLOOM_INTEGRATION_BROKER_BIN:-${build_root}/broker/debug/bloom-broker}"
