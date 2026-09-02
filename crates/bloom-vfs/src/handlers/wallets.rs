@@ -2546,7 +2546,10 @@ impl WalletsHandler {
             [s] if s == "balance" || s == "balance.raw" || s == "balance.json" || s == "nonce" => {
                 Ok(Entry::file(s))
             }
-            [s] if s == "pending_external.jsonl" || s == "nonce_conflicts.json" => {
+            [s] if s == "pending_external.jsonl"
+                || s == "nonce_conflicts.json"
+                || s == "policy.json" =>
+            {
                 Ok(Entry::file(s))
             }
             [s] if s == "outbox" => Ok(Entry::dir("outbox")),
@@ -2712,6 +2715,17 @@ impl WalletsHandler {
                 let n = client.nonce(address).await.map_err(err_be)?;
                 Ok(format!("{}\n", n).into_bytes())
             }
+            [s] if s == "policy.json" => {
+                // Answers "what may this wallet send to on this chain", which
+                // the cross-chain canonical document cannot express.
+                let projection = self.wallet_projection(wallet).await?;
+                let value =
+                    crate::effective_chain_policy(&projection, chain, Some(client.spec().chain_id))
+                        .map_err(err_be)?;
+                let mut bytes = serde_json::to_vec_pretty(&value).map_err(err_be)?;
+                bytes.push(b'\n');
+                Ok(bytes)
+            }
             [s, state, id, fname] if s == "outbox" => {
                 let st = parse_state_seg(state)?;
                 // Honour the path's state segment (fix #8): only read from
@@ -2842,6 +2856,7 @@ impl WalletsHandler {
                 Entry::file("nonce"),
                 Entry::file("pending_external.jsonl"),
                 Entry::file("nonce_conflicts.json"),
+                Entry::file("policy.json"),
                 Entry::dir("outbox"),
             ]),
             [s] if s == "outbox" => Ok(Self::outbox_dir_entries()),
