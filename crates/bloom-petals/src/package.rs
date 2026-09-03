@@ -3887,6 +3887,15 @@ fn validate_sign_policy(
     Ok(())
 }
 
+/// Accept exactly the suites `bloom_broker_api::CryptoSuite` defines, so the
+/// manifest contract cannot drift from the enum Broker and Signer agree on.
+fn is_supported_crypto_suite(value: &str) -> bool {
+    serde_json::from_value::<bloom_broker_api::CryptoSuite>(serde_json::Value::String(
+        value.to_owned(),
+    ))
+    .is_ok()
+}
+
 fn validate_key_derive_policy(
     policy: &KeyPolicyToml,
     routes: &[RouteRecord],
@@ -3955,12 +3964,7 @@ fn validate_key_derive_policy(
         }
         let mut crypto_suites = BTreeSet::new();
         for suite in &declaration.allowed_crypto_suites {
-            if !matches!(
-                suite.as_str(),
-                "secp256k1-keccak256-recoverable"
-                    | "secp256k1-sha256-recoverable"
-                    | "ed25519-message"
-            ) {
+            if !is_supported_crypto_suite(suite) {
                 return Err(PetalError::InvalidWasm(format!(
                     "Petal [[key.derive]] route {:?} has unsupported crypto suite {suite:?}",
                     declaration.route
