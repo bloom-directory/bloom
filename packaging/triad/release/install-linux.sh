@@ -620,8 +620,53 @@ stop_linux_release_set() {
   done
 }
 
+require_linux_triad_health() {
+  local install_root="$1" uid="$2" user="$3" digest="$4"
+  local user_runtime="/run/user/$uid" home attempt
+  home="$(getent passwd "$uid" | cut -d: -f6)"
+  [[ "$home" == /* && "$home" != "/" ]] || {
+    echo "cannot resolve home for $user" >&2
+    return 1
+  }
+  for ((attempt = 0; attempt < 20; attempt++)); do
+    if systemctl is-active --quiet \
+        "bloom-session@$uid.path" \
+        "bloom-broker@$uid.service" \
+        "bloom-signer@$uid.service" &&
+      runuser -u "$user" -- env \
+        XDG_RUNTIME_DIR="$user_runtime" \
+        DBUS_SESSION_BUS_ADDRESS="unix:path=$user_runtime/bus" \
+        systemctl --user is-active --quiet \
+          bloom-session.service bloom-machine.service &&
+      runuser -u "$user" -- env \
+        XDG_RUNTIME_DIR="$user_runtime" \
+        DBUS_SESSION_BUS_ADDRESS="unix:path=$user_runtime/bus" \
+        "$install_root/usr/bin/bloom" --home "$home/.bloom" \
+          serve triad-health-check "$digest" >/dev/null 2>&1
+    then
+      return 0
+    fi
+    sleep 0.5
+  done
+  echo "Bloom Linux release failed authenticated activation for UID $uid" >&2
+  systemctl is-active \
+    "bloom-session@$uid.path" \
+    "bloom-broker@$uid.service" \
+    "bloom-signer@$uid.service" >&2 || true
+  runuser -u "$user" -- env \
+    XDG_RUNTIME_DIR="$user_runtime" \
+    DBUS_SESSION_BUS_ADDRESS="unix:path=$user_runtime/bus" \
+    systemctl --user is-active \
+      bloom-session.service bloom-machine.service >&2 || true
+  runuser -u "$user" -- env \
+    XDG_RUNTIME_DIR="$user_runtime" \
+    DBUS_SESSION_BUS_ADDRESS="unix:path=$user_runtime/bus" \
+    "$install_root/usr/bin/bloom" --home "$home/.bloom" \
+      serve triad-health-check "$digest"
+}
+
 start_linux_release_set() {
-  local install_root="$1" record uid user user_runtime
+  local install_root="$1" record uid user digest user_runtime
   [[ "$install_root" == "/" ]] || return 0
 
   systemctl daemon-reload
@@ -629,6 +674,7 @@ start_linux_release_set() {
     [[ -f "$record" && ! -L "$record" ]] || continue
     uid="$(linux_record_number "$record" login_uid)"
     user="$(linux_record_string "$record" login_user)"
+    digest="$(linux_record_string "$record" release_digest)"
     user_runtime="/run/user/$uid"
     systemctl enable --now "bloom-session@$uid.path"
     if [[ -S "$user_runtime/bus" ]]; then
@@ -641,6 +687,7 @@ start_linux_release_set() {
         DBUS_SESSION_BUS_ADDRESS="unix:path=$user_runtime/bus" \
         systemctl --user start bloom-session.service bloom-machine.service
     fi
+    require_linux_triad_health "$install_root" "$uid" "$user" "$digest"
   done
 }
 
@@ -674,9 +721,11 @@ rollback_linux_upgrade() {
   [[ -n "$upgrade_root" && -n "$upgrade_old_digest" ]] || return 0
   switch_linux_release "$upgrade_root" "$upgrade_old_digest" || rollback_status=$?
   rewrite_linux_release_set "$upgrade_root" "$upgrade_old_digest" active || rollback_status=$?
-  rm -rf -- "$upgrade_transaction"
-  upgrade_rollback_required=false
   start_linux_release_set "$upgrade_root" || rollback_status=$?
+  if ((rollback_status == 0)); then
+    rm -rf -- "$upgrade_transaction"
+    upgrade_rollback_required=false
+  fi
   return "$rollback_status"
 }
 

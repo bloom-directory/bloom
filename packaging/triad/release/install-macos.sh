@@ -696,6 +696,36 @@ activate_installed_set() {
   done
 }
 
+snapshot_macos_upgrade_state() {
+  local archive="$upgrade_transaction/rollback-state.tar" record uid
+  local -a paths=(
+    "Library/Application Support/BloomTriad/enrollments"
+    "Library/Application Support/BloomTriad/config"
+    "Library/LaunchDaemons/com.bloom.containment.plist"
+    "Library/LaunchAgents/com.bloom.session.plist"
+    "Library/LaunchAgents/com.bloom.machine.plist"
+  )
+  for record in "$enrollments"/*.json; do
+    [[ -f "$record" && ! -L "$record" ]] || continue
+    uid="${record##*/}"; uid="${uid%.json}"
+    paths+=(
+      "Library/LaunchDaemons/com.bloom.broker.$uid.plist"
+      "Library/LaunchDaemons/com.bloom.signer.$uid.plist"
+      "etc/pf.anchors/com.bloom.triad.$uid"
+      "etc/newsyslog.d/bloom-$uid.conf"
+    )
+  done
+  (cd "${root_prefix:-/}" && tar -cpf "$archive" "${paths[@]}")
+  chmod 0600 "$archive"
+  $live && chown root:wheel "$archive"
+}
+
+restore_macos_upgrade_state() {
+  local archive="$upgrade_transaction/rollback-state.tar"
+  [[ -f "$archive" && ! -L "$archive" ]] || die "macOS upgrade rollback state is missing or unsafe"
+  (cd "${root_prefix:-/}" && tar -xpf "$archive")
+}
+
 find_interrupted_upgrade() {
   local recorded_old recorded_new
   upgrade_transaction="$product/upgrade-transaction"
@@ -705,6 +735,7 @@ find_interrupted_upgrade() {
   recorded_old="$(<"$upgrade_transaction/old-digest")"
   recorded_new="$(<"$upgrade_transaction/new-digest")"
   [[ "$recorded_old" =~ ^[0-9a-f]{64}$ && "$recorded_new" =~ ^[0-9a-f]{64}$ ]] || die "invalid interrupted Bloom upgrade"
+  [[ -f "$upgrade_transaction/rollback-state.tar" && ! -L "$upgrade_transaction/rollback-state.tar" ]] || die "invalid interrupted Bloom upgrade"
   upgrade_old_digest="$recorded_old"
   echo "resuming interrupted Bloom macOS upgrade toward the requested release" >&2
 }
@@ -719,13 +750,14 @@ upgrade_release() {
   printf '%s\n' bloom.macos-upgrade-transaction.2 >"$upgrade_transaction/schema"
   printf '%s\n' "$old" >"$upgrade_transaction/old-digest"
   printf '%s\n' "$new" >"$upgrade_transaction/new-digest"
+  if [[ ! -e "$upgrade_transaction/rollback-state.tar" ]]; then snapshot_macos_upgrade_state; fi
   chmod 0600 "$upgrade_transaction"/*; $live && chown -R root:wheel "$upgrade_transaction"; sync
   stop_all_enrollments
   rewrite_all_enrollments "$new" activating
   switch_release "$new"
   if ! reload_installed_set || ! activate_installed_set; then
     echo "new Bloom release failed authenticated activation; restoring $old" >&2; stop_all_enrollments || true
-    rewrite_all_enrollments "$old" activating; switch_release "$old"
+    restore_macos_upgrade_state; switch_release "$old"
     if reload_installed_set && activate_installed_set; then rm -rf -- "$upgrade_transaction"; upgrade_transaction=""
       echo "previous Bloom release restored after failed activation" >&2
     else echo "automatic restoration of the previous Bloom release failed" >&2; fi

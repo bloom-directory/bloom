@@ -2535,10 +2535,13 @@ fn macos_active_legacy_enrollment_migrates_log_identity_before_upgrade() {
 fn installer_upgrade_transactions_preserve_recovery_state_atomically() {
     let macos = fs::read_to_string(release_script("install-macos.sh")).unwrap();
     assert!(macos.contains("upgrade_release \"$upgrade_old_digest\" \"$BLOOM_RELEASE_DIGEST\""));
+    assert!(macos.contains("snapshot_macos_upgrade_state"));
+    assert!(macos.contains("restore_macos_upgrade_state"));
 
     let linux = fs::read_to_string(release_script("install-linux.sh")).unwrap();
     assert!(linux.contains("upgrade_transaction_scratch=\"${upgrade_transaction}.new.$$\""));
     assert!(linux.contains("mv -T \"$upgrade_transaction_scratch\" \"$upgrade_transaction\""));
+    assert!(linux.contains("require_linux_triad_health"));
 }
 
 #[test]
