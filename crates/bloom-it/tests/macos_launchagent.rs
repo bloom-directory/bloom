@@ -396,6 +396,19 @@ fn production_macos_bundle_forbids_archived_private_identity_material() {
 
 #[test]
 fn macos_conformance_workflows_consume_unified_candidates() {
+    let compatibility =
+        fs::read_to_string(workspace().join("packaging/triad/release/compatibility-v1.toml"))
+            .unwrap();
+    let pinned_revision = |key: &str| {
+        compatibility
+            .lines()
+            .find_map(|line| line.strip_prefix(&format!("{key} = \"")))
+            .and_then(|value| value.strip_suffix('"'))
+            .unwrap()
+    };
+    let broker_commit = pinned_revision("broker_commit");
+    let signer_commit = pinned_revision("signer_commit");
+
     for workflow in [
         "macos-unix-conformance.yml",
         "macos-two-login-conformance.yml",
@@ -406,7 +419,13 @@ fn macos_conformance_workflows_consume_unified_candidates() {
         assert!(source.contains("bloom-triad-test-unclaimed.tar.gz"));
         assert!(source.contains("Reject mutable sibling refs"));
         assert!(source.contains("^[0-9a-f]{40}$"));
+        assert!(source.contains(broker_commit));
+        assert!(source.contains(signer_commit));
     }
+
+    let ci = fs::read_to_string(workspace().join(".github/workflows/ci.yml")).unwrap();
+    assert!(ci.contains(&format!("broker_ref: {broker_commit}")));
+    assert!(ci.contains(&format!("signer_ref: {signer_commit}")));
 }
 
 #[test]
