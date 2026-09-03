@@ -14,7 +14,7 @@ For the production process and security contract, read
 
 | Tool | Use |
 |---|---|
-| Rust 1.85 or newer | Workspace builds and tests |
+| Rust 1.94 or newer | Workspace builds and tests; Iroh 1.1 requires 1.91 and the resolved OP/Tempo stack requires 1.94 |
 | Foundry (`anvil`, `cast`, `forge`) | Local EVM integration tests |
 | `jq` | Developer harnesses and shell tests |
 | macOS NFS client | Real mounted-VFS tests on macOS |

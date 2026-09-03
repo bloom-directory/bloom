@@ -811,7 +811,7 @@ matters where called out; otherwise parallelisable.
   `RootProvider::<Ethereum>::new_http(url)` with the layered stack.
 - `crates/bloom-chain/Cargo.toml`: enable `transport-throttle` feature
   on `alloy` (workspace `alloy.features`). Confirm `governor` pulls
-  cleanly under our toolchain (1.85 stable).
+  cleanly under the workspace toolchain.
 
 **Tests added:** in `rpc/tests.rs`: `retry_policy_extends_alloy`,
 `fallback_with_two_endpoints`. In

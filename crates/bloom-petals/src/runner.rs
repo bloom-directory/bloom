@@ -23,7 +23,7 @@ use crate::package::{
     RouteOp, narrow_runtime_route_metadata, petal_discovery_from_manifest_toml,
     sign_intents_from_manifest_toml, store_policy_from_manifest_toml,
 };
-use crate::policy::NetPolicy;
+use crate::policy::{NetPolicy, StoreNamespacePolicy};
 use crate::registry::NameRegistry;
 use crate::store::PetalStore;
 use crate::vm::{DispatchOutput, PetalVm, RunOptions};
@@ -362,6 +362,51 @@ impl PetalRunner {
         Ok(())
     }
 
+    /// Validate the immutable, install-time ceiling for an evaluator that may
+    /// be invoked from a validated remote review request.
+    pub fn validate_zero_authority_evaluator(
+        &self,
+        mount: &str,
+        path: &str,
+        expected_package_hash: &str,
+    ) -> Result<(), PetalError> {
+        let package_hash = self.resolve_petal_mount(mount)?;
+        if package_hash != expected_package_hash {
+            return Err(PetalError::InvalidHash(format!(
+                "evaluator {mount:?} resolved to {package_hash}, expected pinned {expected_package_hash}"
+            )));
+        }
+        let manifest = std::fs::read(
+            self.store
+                .package_path(&package_hash)?
+                .join("source/petal.toml"),
+        )?;
+        let manifest_caps = petal_discovery_from_manifest_toml(&manifest)?.capabilities;
+        let installed_caps = self.store.load_meta(&package_hash)?.caps;
+        if !manifest_caps.is_empty() || !installed_caps.is_empty() {
+            return Err(PetalError::CapabilityDenied {
+                petal: package_hash,
+                cap: if manifest_caps.is_empty() {
+                    installed_caps
+                        .iter()
+                        .map(|cap| cap.as_str())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                } else {
+                    manifest_caps.join(",")
+                },
+            });
+        }
+        let (_, metadata) = self.petal_route_effective_metadata(mount, DispatchOp::Read, path)?;
+        if !metadata.required_caps.is_empty() {
+            return Err(PetalError::CapabilityDenied {
+                petal: package_hash,
+                cap: metadata.required_caps.join(","),
+            });
+        }
+        Ok(())
+    }
+
     pub fn load_petal_route_index(&self, mount: &str) -> Result<RouteIndex, PetalError> {
         let hash = self.resolve_petal_mount(mount)?;
         self.store.load_route_index(&hash)
@@ -501,7 +546,7 @@ impl PetalRunner {
             caps = caps.intersection(&mask).copied().collect();
         }
         let mut opts = opts;
-        if opts.private_store_root.is_none() {
+        if opts.private_store_root.is_none() && !opts.disable_private_store {
             opts.private_store_root = Some(self.store.private_data_root());
         }
         let declared = self
@@ -539,6 +584,65 @@ impl PetalRunner {
                 opts,
             )
             .await
+    }
+
+    /// Dispatch a route under the strict profile used for remotely triggered
+    /// advisory evaluators.
+    ///
+    /// This is intentionally stronger than applying an empty capability mask:
+    /// routes that declare or dynamically require *any* capability are rejected
+    /// before execution. The remote caller supplies only the request body and
+    /// can never select a package, route, host capability, or runtime setting.
+    pub async fn dispatch_zero_authority_evaluator(
+        &self,
+        mount: &str,
+        path: &str,
+        body: Vec<u8>,
+        fuel: u64,
+        memory_pages: u32,
+    ) -> Result<DispatchOutput, PetalError> {
+        let package_hash = self.resolve_petal_mount(mount)?;
+        self.validate_zero_authority_evaluator(mount, path, &package_hash)?;
+        let mut opts = RunOptions {
+            fuel,
+            memory_pages,
+            net_policy: Some(NetPolicy::deny_all()),
+            sign_intents: Some(BTreeSet::new()),
+            store_namespaces: Some(StoreNamespacePolicy::default()),
+            private_store_root: None,
+            disable_private_store: true,
+            deterministic_env: true,
+            runtime_settings: BTreeMap::new(),
+            endpoint_bindings: BTreeMap::new(),
+            ..RunOptions::default()
+        };
+        let (matched, metadata) = self
+            .petal_route_runtime_metadata(mount, DispatchOp::Read, path, opts.clone())
+            .await?;
+        if !metadata.required_caps.is_empty() {
+            return Err(PetalError::CapabilityDenied {
+                petal: matched.hash,
+                cap: metadata.required_caps.join(","),
+            });
+        }
+        // Keep these values explicit after runtime metadata evaluation so a
+        // future option default cannot accidentally widen this profile.
+        opts.net_policy = Some(NetPolicy::deny_all());
+        opts.sign_intents = Some(BTreeSet::new());
+        opts.store_namespaces = Some(StoreNamespacePolicy::default());
+        self.dispatch_petal_route(
+            mount,
+            DispatchRequest {
+                op: DispatchOp::Read,
+                path: path.to_string(),
+                body,
+                ctx: Vec::new(),
+            },
+            Arc::new(DenyHost),
+            Some(BTreeSet::new()),
+            opts,
+        )
+        .await
     }
 
     async fn runtime_petal_route_metadata(
@@ -1160,6 +1264,75 @@ name = "echo"
             .await
             .unwrap_err();
         assert!(err.to_string().contains("not writable at runtime"));
+    }
+
+    #[tokio::test]
+    async fn zero_authority_evaluator_runs_capability_free_component() {
+        let (dir, r) = runner();
+        let package = dir.path().join("safe-reviewer");
+        write_package_file(
+            &package,
+            "petal.toml",
+            br#"schema = "bloom.petal.package.v1"
+name = "reviewer"
+"#,
+        );
+        write_package_file(&package, "README.md", b"# reviewer");
+        write_package_file(&package, "AGENTS.md", b"# reviewer agents");
+        write_package_file(
+            &package,
+            "petal/reviewer/review.json.wasm",
+            include_bytes!("../tests/fixtures/route_component_no_imports.wasm"),
+        );
+        r.store().install_petal_package_dir(&package).unwrap();
+
+        let out = r
+            .dispatch_zero_authority_evaluator(
+                "reviewer",
+                "review.json",
+                br#"{"dummy":true}"#.to_vec(),
+                5_000_000,
+                128,
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.response, DispatchResponse::Read(b"component".to_vec()));
+    }
+
+    #[tokio::test]
+    async fn zero_authority_evaluator_rejects_declared_vfs_read_even_when_unused() {
+        let (dir, r) = runner();
+        let package = dir.path().join("unsafe-reviewer");
+        write_package_file(
+            &package,
+            "petal.toml",
+            br#"schema = "bloom.petal.package.v1"
+name = "reviewer"
+
+[caps]
+allowed = ["bloom:vfs.read"]
+"#,
+        );
+        write_package_file(&package, "README.md", b"# reviewer");
+        write_package_file(&package, "AGENTS.md", b"# reviewer agents");
+        write_package_file(
+            &package,
+            "petal/reviewer/review.json.wasm",
+            include_bytes!("../tests/fixtures/route_component_no_imports.wasm"),
+        );
+        r.store().install_petal_package_dir(&package).unwrap();
+
+        let err = r
+            .dispatch_zero_authority_evaluator(
+                "reviewer",
+                "review.json",
+                Vec::new(),
+                5_000_000,
+                128,
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("vfs.read"), "{err}");
     }
 
     fn write_package_file(root: &std::path::Path, rel: &str, body: &[u8]) {

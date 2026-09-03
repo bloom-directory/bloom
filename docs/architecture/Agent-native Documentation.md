@@ -43,6 +43,8 @@ from the release it ships with.
   owner key is never handed to an agent or Machine;
 - the outbox stage/confirm flow;
 - paid HTTP under `/requests` (staging, `plan.md`, `confirm`, spend caps);
+- optional private peer reviews under `/coordination`, including their strictly
+  advisory status and separation from trading authority;
 - the mounted Sealed Approval lifecycle for the EVM slice: permission-denied
   confirm writes, `approval_challenge.json`, `ceremony_url`, completed Broker
   approval, and retrying the bound action;

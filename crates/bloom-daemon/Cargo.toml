@@ -40,6 +40,7 @@ bloom-etherscan.workspace = true
 bloom-prices.workspace = true
 bloom-revert.workspace = true
 bloom-petals.workspace = true
+bloom-peer.workspace = true
 bloom-update.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -63,6 +64,8 @@ hex.workspace = true
 reqwest = { workspace = true, features = ["stream"] }
 rustix.workspace = true
 tempfile.workspace = true
+uuid.workspace = true
+iroh.workspace = true
 
 [dev-dependencies]
 bloom-proto = { workspace = true, features = ["audit-test-seam"] }

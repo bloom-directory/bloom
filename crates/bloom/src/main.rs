@@ -33,6 +33,7 @@ use bloom_daemon::ipc::{
     MachineOperationAction, default_socket_path,
 };
 use bloom_machine_client::MachineJournalHeadProvider;
+use bloom_peer::{PeerIdentity, PeerInvite, PeerNodeBuilder, PeerRegistry, ReplayStore};
 use bloom_proto::{AuditIdentity, AuditLog, HomeDir, HomeWritePermit};
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::{Shell, generate};
@@ -1836,6 +1837,9 @@ enum Cmd {
     /// Manage wasm petals: install, app, list, uninstall.
     #[command(subcommand, visible_alias = "petal")]
     Petals(PetalsCmd),
+    /// Coordinate private advisory reviews with enrolled Bloom peers over Iroh.
+    #[command(subcommand)]
+    Peer(PeerCmd),
     /// Check for newer bloom releases on GitHub and inspect the
     /// current update-checker state.
     #[command(subcommand)]
@@ -1848,6 +1852,40 @@ enum Cmd {
 
     /// Print a shell completion script.
     Completions { shell: Shell },
+}
+
+#[derive(Subcommand, Debug)]
+enum PeerCmd {
+    /// Print the dedicated Iroh endpoint identity and current daemon address.
+    Identity,
+    /// Create a signed, short-lived private enrollment ticket.
+    Invite {
+        #[arg(long, default_value_t = 600)]
+        expires_secs: u64,
+    },
+    /// Enroll a peer from a signed Bloom ticket.
+    Add {
+        ticket: String,
+        #[arg(long = "allow-evaluator")]
+        allow_evaluators: Vec<String>,
+    },
+    /// List locally enrolled peers and their evaluator allowlists.
+    List,
+    /// Replace the evaluator allowlist for an enrolled peer.
+    Allow {
+        endpoint_id: String,
+        evaluators: Vec<String>,
+    },
+    /// Remove a peer from the local allowlist.
+    Remove { endpoint_id: String },
+    /// Queue a review request through the running daemon.
+    Review {
+        endpoint_id: String,
+        /// ReviewRequest JSON file; use `-` to read stdin.
+        request: String,
+    },
+    /// Read the local status and decision projection for a request UUID.
+    ReviewStatus { request_id: String },
 }
 
 #[derive(Subcommand, Debug)]
@@ -3065,6 +3103,7 @@ async fn run(cli: Cli) -> Result<()> {
             call_machine_command(&client_endpoint, command).await
         }
         Cmd::Petals(cmd) => run_petals(&client_endpoint, cmd).await,
+        Cmd::Peer(cmd) => run_peer(&home, &client_endpoint, cmd).await,
 
         Cmd::Completions { shell } => {
             call_machine_command(
@@ -3091,6 +3130,141 @@ async fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
     }
+}
+
+async fn ipc_read_bytes(endpoint: &ResolvedEndpoint, path: &str) -> Result<Vec<u8>> {
+    let result = try_ipc(
+        &IpcClient::new(&endpoint.socket),
+        endpoint,
+        "read",
+        serde_json::json!({"path": path}),
+    )
+    .await?;
+    let encoded = result
+        .get("bytes_b64")
+        .and_then(serde_json::Value::as_str)
+        .context("IPC read response missing bytes_b64")?;
+    B64.decode(encoded).context("invalid IPC base64")
+}
+
+async fn run_peer(home: &HomeDir, endpoint: &ResolvedEndpoint, cmd: PeerCmd) -> Result<()> {
+    let root = home.coordination_dir();
+    std::fs::create_dir_all(&root)?;
+    let identity = PeerIdentity::load_or_create(&root.join("identity.key"))?;
+    let registry = PeerRegistry::open(root.join("peers.json"));
+    match cmd {
+        PeerCmd::Identity => {
+            if endpoint.socket.exists()
+                && let Ok(bytes) = ipc_read_bytes(endpoint, "/coordination/status.json").await
+            {
+                println!("{}", String::from_utf8_lossy(&bytes));
+            } else {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "endpoint_id": identity.endpoint_id(),
+                        "online": false,
+                    }))?
+                );
+            }
+        }
+        PeerCmd::Invite { expires_secs } => {
+            let running_addr = if endpoint.socket.exists() {
+                ipc_read_bytes(endpoint, "/coordination/status.json")
+                    .await
+                    .ok()
+                    .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+                    .and_then(|value| value.get("endpoint_addr").cloned())
+                    .and_then(|value| serde_json::from_value(value).ok())
+            } else {
+                None
+            };
+            let (addr, temporary) = if let Some(addr) = running_addr {
+                (addr, None)
+            } else {
+                let node = PeerNodeBuilder::new(identity.clone(), ReplayStore::memory()?)
+                    .use_n0(true)
+                    .bind()
+                    .await?;
+                (node.endpoint_addr(), Some(node))
+            };
+            let invite = PeerInvite::create(&identity, addr, expires_secs.saturating_mul(1000))?;
+            println!("{}", invite.encode()?);
+            if let Some(node) = temporary {
+                node.close().await;
+            }
+        }
+        PeerCmd::Add {
+            ticket,
+            allow_evaluators,
+        } => {
+            let invite = PeerInvite::decode(&ticket)?;
+            let peer = registry.add_invite(&invite)?;
+            registry.set_allowed_evaluators(peer.endpoint_addr.id, allow_evaluators)?;
+            println!("{}", peer.endpoint_addr.id);
+        }
+        PeerCmd::List => println!("{}", serde_json::to_string_pretty(&registry.list()?)?),
+        PeerCmd::Allow {
+            endpoint_id,
+            evaluators,
+        } => {
+            registry.set_allowed_evaluators(endpoint_id.parse()?, evaluators)?;
+        }
+        PeerCmd::Remove { endpoint_id } => {
+            let removed = registry.remove(endpoint_id.parse()?)?;
+            println!("{}", if removed { "removed" } else { "not found" });
+        }
+        PeerCmd::Review {
+            endpoint_id,
+            request,
+        } => {
+            let bytes = if request == "-" {
+                let mut bytes = Vec::new();
+                std::io::Read::read_to_end(&mut std::io::stdin(), &mut bytes)?;
+                bytes
+            } else {
+                std::fs::read(&request).with_context(|| format!("read review request {request}"))?
+            };
+            let review: bloom_peer::ReviewRequest = serde_json::from_slice(&bytes)?;
+            let mut value = serde_json::to_value(&review)?;
+            value
+                .as_object_mut()
+                .context("review request must be an object")?
+                .insert(
+                    "peer_endpoint".into(),
+                    serde_json::Value::String(endpoint_id),
+                );
+            try_ipc(
+                &IpcClient::new(&endpoint.socket),
+                endpoint,
+                "write",
+                serde_json::json!({
+                    "path": "/coordination/requests/new",
+                    "bytes_b64": B64.encode(serde_json::to_vec(&value)?),
+                }),
+            )
+            .await?;
+            println!("{}", review.request_id);
+        }
+        PeerCmd::ReviewStatus { request_id } => {
+            let status = ipc_read_bytes(
+                endpoint,
+                &format!("/coordination/requests/{request_id}/status.json"),
+            )
+            .await?;
+            std::io::Write::write_all(&mut std::io::stdout(), &status)?;
+            if let Ok(decision) = ipc_read_bytes(
+                endpoint,
+                &format!("/coordination/requests/{request_id}/decision.json"),
+            )
+            .await
+            {
+                println!();
+                std::io::Write::write_all(&mut std::io::stdout(), &decision)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone)]

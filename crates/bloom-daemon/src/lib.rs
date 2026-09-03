@@ -5,6 +5,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod coordination;
 pub mod ipc;
 
 mod ens_resolver;
@@ -112,6 +113,10 @@ pub const BACKGROUND_EFFECT_AUDIT_MATRIX: &[(&str, &str)] = &[
     (
         "update checker",
         "advisory release metadata only; never installs or executes updates",
+    ),
+    (
+        "Iroh peer review",
+        "non-authorizing advisory transport; zero-authority Petals only",
     ),
 ];
 
@@ -2723,6 +2728,8 @@ pub struct Daemon {
     pub wallet_projections: Arc<dyn WalletProjectionReader>,
     pub vfs: Vfs,
     pub petals: PetalRunner,
+    /// Optional Iroh peer-review runtime. Present only when explicitly enabled.
+    pub coordination: Option<coordination::CoordinationService>,
     pub watch_registry: Arc<WatchRegistry>,
     pub watch_executor: Arc<WatchExecutor>,
     /// Update checker for newer GitHub releases. Construction loads its
@@ -3448,6 +3455,20 @@ impl Daemon {
         );
         let petal_vm = PetalVm::new().map_err(|e| DaemonError::Audit(format!("petals vm: {e}")))?;
         let petals = PetalRunner::new(petal_store.clone(), petal_registry.clone(), petal_vm);
+        let coordination = if config.coordination.enabled {
+            Some(
+                coordination::CoordinationService::new(
+                    home.clone(),
+                    config.coordination.clone(),
+                    petals.clone(),
+                )
+                .map_err(|error| {
+                    DaemonError::Audit(format!("coordination configuration: {error}"))
+                })?,
+            )
+        } else {
+            None
+        };
         let petal_vfs_host = Arc::new(LateVfsHost::new());
         let petal_app_host = DaemonPetalHost::new(petal_vfs_host.clone(), audit_arc.clone())
             .with_broker(broker.clone())
@@ -3503,6 +3524,13 @@ impl Daemon {
                         .with_revert_decoder(decoder_chain.clone()),
                 ) as _,
             );
+
+        if let Some(service) = coordination.clone() {
+            vfs_builder = vfs_builder.mount(
+                "coordination",
+                Arc::new(coordination::CoordinationHandler::new(service)) as _,
+            );
+        }
 
         let wallets_handler = WalletsHandler::new(
             chains.clone(),
@@ -3776,6 +3804,7 @@ impl Daemon {
             wallet_projections,
             vfs,
             petals,
+            coordination,
             watch_registry,
             watch_executor,
             update_checker,
@@ -3893,10 +3922,21 @@ impl Daemon {
                 }
             }
         });
+        let coordination = self
+            .coordination
+            .as_ref()
+            .and_then(|service| match service.spawn() {
+                Ok(tasks) => Some(tasks),
+                Err(error) => {
+                    debug!(%error, "daemon.coordination_not_spawned");
+                    None
+                }
+            });
         BackgroundTasks {
             cancel: tx,
             handle: Some(handle),
             projection_refresh,
+            coordination,
         }
     }
 
@@ -4149,6 +4189,7 @@ pub struct BackgroundTasks {
     cancel: watch::Sender<bool>,
     handle: Option<JoinHandle<()>>,
     projection_refresh: Option<JoinHandle<()>>,
+    coordination: Option<coordination::CoordinationTasks>,
 }
 
 impl BackgroundTasks {
@@ -4160,6 +4201,9 @@ impl BackgroundTasks {
         }
         if let Some(h) = self.projection_refresh.take() {
             let _ = h.await;
+        }
+        if let Some(tasks) = self.coordination.take() {
+            tasks.shutdown().await;
         }
     }
 }
@@ -4173,6 +4217,7 @@ impl Drop for BackgroundTasks {
         if let Some(h) = self.handle.take() {
             h.abort();
         }
+        self.coordination.take();
         // An audited projection refresh may already have written its intent.
         // Detach it instead of aborting so it can still append the matching
         // result while the runtime remains alive. Long-lived callers must use
@@ -4929,7 +4974,7 @@ mod tests {
 
     #[test]
     fn production_background_effect_inventory_has_explicit_audit_or_non_authority_rationale() {
-        assert_eq!(BACKGROUND_EFFECT_AUDIT_MATRIX.len(), 10);
+        assert_eq!(BACKGROUND_EFFECT_AUDIT_MATRIX.len(), 11);
         for (effect, treatment) in BACKGROUND_EFFECT_AUDIT_MATRIX {
             assert!(!effect.is_empty());
             assert!(
@@ -4997,6 +5042,7 @@ mod tests {
                 "watch polling and durable live/history rotation",
             ),
             (update, "tokio::spawn(async move", "update checker"),
+            (daemon, "service.spawn()", "Iroh peer review"),
         ];
         for (source, launch, effect) in routes {
             assert!(
@@ -5027,6 +5073,8 @@ mod tests {
         assert!(d.vfs.handler("addressbook").is_some());
         assert!(d.vfs.handler("ens").is_some());
         assert!(d.vfs.handler("petals").is_some());
+        assert!(d.vfs.handler("coordination").is_none());
+        assert!(d.coordination.is_none());
         assert!(
             d.vfs.handler("hyperliquid").is_none(),
             "native Hyperliquid must not be mounted; use petals/hyperliquid"
@@ -5035,6 +5083,49 @@ mod tests {
             d.vfs.handler("polymarket").is_none(),
             "native Polymarket must not be mounted; use petals/polymarket"
         );
+    }
+
+    #[test]
+    fn coordination_is_opt_in_and_does_not_bind_during_daemon_construction() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = HomeDir::at(dir.path());
+        home.ensure().unwrap();
+        let mut config = Config::local_default();
+        config.coordination.enabled = true;
+        config.save(&home.config_path()).unwrap();
+
+        let daemon = Daemon::from_home(home.clone()).unwrap();
+        assert!(daemon.coordination.is_some());
+        assert!(daemon.vfs.handler("coordination").is_some());
+        assert!(!home.coordination_dir().join("identity.key").exists());
+        assert!(!daemon.coordination.as_ref().unwrap().status().online);
+    }
+
+    #[tokio::test]
+    async fn enabled_coordination_binds_only_in_background_lifecycle_and_shuts_down() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = HomeDir::at(dir.path());
+        home.ensure().unwrap();
+        let mut config = Config::local_default();
+        config.coordination.enabled = true;
+        config.coordination.iroh.mode = bloom_proto::CoordinationIrohMode::Direct;
+        config.save(&home.config_path()).unwrap();
+
+        let daemon = Daemon::from_home(home.clone()).unwrap();
+        let service = daemon.coordination.as_ref().unwrap();
+        let tasks = service.spawn().unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !service.status().online {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("coordination endpoint did not bind");
+        assert!(home.coordination_dir().join("identity.key").exists());
+        assert!(home.coordination_dir().join("state.db").exists());
+
+        tasks.shutdown().await;
+        assert!(!service.status().online);
     }
 
     #[tokio::test]

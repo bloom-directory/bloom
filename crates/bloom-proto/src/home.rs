@@ -69,6 +69,7 @@ impl HomeDir {
             self.outbox_dir(),
             self.watch_dir(),
             self.logs_dir(),
+            self.coordination_dir(),
         ];
         for d in dirs {
             std::fs::create_dir_all(&d).map_err(|source| HomeError::Io {
@@ -108,6 +109,9 @@ impl HomeDir {
     }
     pub fn logs_dir(&self) -> PathBuf {
         self.root.join("logs")
+    }
+    pub fn coordination_dir(&self) -> PathBuf {
+        self.root.join("coordination")
     }
     pub fn canonical_root(&self) -> Result<PathBuf, HomeError> {
         std::fs::canonicalize(&self.root).map_err(|source| HomeError::Io {

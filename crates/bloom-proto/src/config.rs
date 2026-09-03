@@ -60,6 +60,84 @@ pub struct Config {
     /// reads.
     #[serde(default)]
     pub backends: BackendsConfig,
+    /// Private Bloom-to-Bloom advisory review over Iroh. Disabled by default.
+    #[serde(default)]
+    pub coordination: CoordinationConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CoordinationConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub listen: bool,
+    #[serde(default)]
+    pub auto_evaluate: bool,
+    #[serde(default = "default_coordination_request_ttl_secs")]
+    pub request_ttl_secs: u64,
+    #[serde(default = "default_coordination_max_envelope_bytes")]
+    pub max_envelope_bytes: usize,
+    #[serde(default = "default_coordination_max_concurrent_connections")]
+    pub max_concurrent_connections: usize,
+    #[serde(default = "default_coordination_max_requests_per_minute")]
+    pub max_requests_per_minute: u32,
+    #[serde(default)]
+    pub iroh: CoordinationIrohConfig,
+    #[serde(default)]
+    pub evaluators: BTreeMap<String, CoordinationEvaluatorConfig>,
+}
+
+impl Default for CoordinationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            listen: false,
+            auto_evaluate: false,
+            request_ttl_secs: default_coordination_request_ttl_secs(),
+            max_envelope_bytes: default_coordination_max_envelope_bytes(),
+            max_concurrent_connections: default_coordination_max_concurrent_connections(),
+            max_requests_per_minute: default_coordination_max_requests_per_minute(),
+            iroh: CoordinationIrohConfig::default(),
+            evaluators: BTreeMap::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CoordinationIrohConfig {
+    /// `n0` enables Iroh address lookup, NAT traversal and relay fallback;
+    /// `direct` only uses addresses supplied by enrolled peers.
+    #[serde(default)]
+    pub mode: CoordinationIrohMode,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum CoordinationIrohMode {
+    #[default]
+    N0,
+    Direct,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CoordinationEvaluatorConfig {
+    /// Installed Petal mount name. The immutable package hash below must match.
+    pub petal: String,
+    pub package_hash: String,
+    pub route: String,
+    pub input_schema: String,
+    pub output_schema: String,
+    #[serde(default)]
+    pub auto_run: bool,
+    #[serde(default = "default_coordination_evaluator_timeout_ms")]
+    pub timeout_ms: u64,
+    #[serde(default = "default_coordination_evaluator_fuel")]
+    pub fuel: u64,
+    #[serde(default = "default_coordination_evaluator_memory_pages")]
+    pub memory_pages: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -236,6 +314,27 @@ fn default_enso_url() -> String {
 }
 fn default_max_index_size() -> usize {
     50_000
+}
+fn default_coordination_request_ttl_secs() -> u64 {
+    30
+}
+fn default_coordination_max_envelope_bytes() -> usize {
+    64 * 1024
+}
+fn default_coordination_max_concurrent_connections() -> usize {
+    32
+}
+fn default_coordination_max_requests_per_minute() -> u32 {
+    10
+}
+fn default_coordination_evaluator_timeout_ms() -> u64 {
+    3_000
+}
+fn default_coordination_evaluator_fuel() -> u64 {
+    5_000_000
+}
+fn default_coordination_evaluator_memory_pages() -> u32 {
+    256
 }
 fn default_contract_metadata_backend() -> Backend {
     Backend::Etherscan
@@ -416,6 +515,7 @@ impl Config {
             mempool: BTreeMap::new(),
             private_rpc: BTreeMap::new(),
             backends: BackendsConfig::default(),
+            coordination: CoordinationConfig::default(),
         }
     }
 
@@ -545,6 +645,75 @@ impl Config {
                 }
             }
         }
+        if self.coordination.listen && !self.coordination.enabled {
+            return Err(ConfigError::Invalid(
+                "coordination.listen requires coordination.enabled=true".into(),
+            ));
+        }
+        if self.coordination.auto_evaluate && !self.coordination.enabled {
+            return Err(ConfigError::Invalid(
+                "coordination.auto_evaluate requires coordination.enabled=true".into(),
+            ));
+        }
+        if self.coordination.max_envelope_bytes < 4096
+            || self.coordination.max_envelope_bytes > 1024 * 1024
+        {
+            return Err(ConfigError::Invalid(
+                "coordination.max_envelope_bytes must be between 4096 and 1048576".into(),
+            ));
+        }
+        if self.coordination.max_concurrent_connections == 0
+            || self.coordination.max_requests_per_minute == 0
+        {
+            return Err(ConfigError::Invalid(
+                "coordination connection and request limits must be non-zero".into(),
+            ));
+        }
+        if !(1..=300).contains(&self.coordination.request_ttl_secs) {
+            return Err(ConfigError::Invalid(
+                "coordination.request_ttl_secs must be between 1 and 300".into(),
+            ));
+        }
+        for (alias, evaluator) in &self.coordination.evaluators {
+            validate_petal_runtime_name("coordination evaluator", alias)?;
+            validate_petal_runtime_name("coordination evaluator Petal", &evaluator.petal)?;
+            if evaluator.package_hash.len() != 64
+                || !evaluator
+                    .package_hash
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit())
+            {
+                return Err(ConfigError::Invalid(format!(
+                    "coordination evaluator {alias:?} must pin a 64-character package_hash"
+                )));
+            }
+            if evaluator.route.is_empty()
+                || evaluator.route.starts_with('/')
+                || evaluator.route.contains("..")
+            {
+                return Err(ConfigError::Invalid(format!(
+                    "coordination evaluator {alias:?} has an invalid route"
+                )));
+            }
+            if evaluator.auto_run && !self.coordination.auto_evaluate {
+                return Err(ConfigError::Invalid(format!(
+                    "coordination evaluator {alias:?} auto_run requires coordination.auto_evaluate=true"
+                )));
+            }
+            if evaluator.input_schema.is_empty() || evaluator.output_schema.is_empty() {
+                return Err(ConfigError::Invalid(format!(
+                    "coordination evaluator {alias:?} schemas must be non-empty"
+                )));
+            }
+            if !(1..=30_000).contains(&evaluator.timeout_ms)
+                || evaluator.fuel == 0
+                || evaluator.memory_pages == 0
+            {
+                return Err(ConfigError::Invalid(format!(
+                    "coordination evaluator {alias:?} resource limits must be non-zero and timeout_ms at most 30000"
+                )));
+            }
+        }
         let mut seen_preinstalled = std::collections::BTreeSet::new();
         for name in &self.petals.preinstalled {
             validate_petal_runtime_name("preinstalled entry", name)?;
@@ -660,11 +829,41 @@ mod tests {
         assert_eq!(cfg.backends.event_logs, Backend::Rpc);
         assert_eq!(cfg.backends.storage_reads, Backend::Rpc);
         assert_eq!(cfg.backends.proxy_detection, Backend::Rpc);
+        assert!(!cfg.coordination.enabled);
+        assert!(!cfg.coordination.listen);
+        assert!(!cfg.coordination.auto_evaluate);
     }
 
     #[test]
     fn local_default_validates() {
         Config::local_default().validate().unwrap();
+    }
+
+    #[test]
+    fn coordination_defaults_fail_closed_and_auto_run_requires_global_opt_in() {
+        let mut cfg = Config::local_default();
+        cfg.coordination.listen = true;
+        assert!(cfg.validate().is_err());
+
+        cfg.coordination.enabled = true;
+        cfg.coordination.listen = false;
+        cfg.coordination.evaluators.insert(
+            "risk".into(),
+            CoordinationEvaluatorConfig {
+                petal: "reviewer".into(),
+                package_hash: "ab".repeat(32),
+                route: "review.json".into(),
+                input_schema: "bloom.trade-review-request/v1".into(),
+                output_schema: "bloom.trade-review-decision/v1".into(),
+                auto_run: true,
+                timeout_ms: 3_000,
+                fuel: 5_000_000,
+                memory_pages: 256,
+            },
+        );
+        assert!(cfg.validate().is_err());
+        cfg.coordination.auto_evaluate = true;
+        assert!(cfg.validate().is_ok());
     }
 
     #[test]
