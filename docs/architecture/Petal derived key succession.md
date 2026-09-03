@@ -11,6 +11,13 @@ Signer-owned derived key. It covers local development and production, including:
 - arbitrary Petals installed by an end user; and
 - new versions of those user-installed Petals.
 
+Current production policy is deliberately narrower than the proposal below:
+derived-key authority remains bound to one immutable package hash. Installing a
+new package version does not inherit that authority; the Petal must request a new
+key/session and the user must authorize it. Succession is deferred until a
+durable-key caller requires continuity and the full user-authorized transition
+can be implemented end to end.
+
 The central rule is:
 
 > Installing package bytes is not authorization to use a key. Key access is a

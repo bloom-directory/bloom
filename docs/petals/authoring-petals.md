@@ -82,13 +82,45 @@ the exact route pattern that imports `bloom:key/derive@0.1.0`:
 [[key.derive]]
 route = "[network]/agent_sessions/[wallet]/new.json"
 operation_classes = ["venue.agent_action"]
+allowed_routes = [
+  "[network]/agent_sessions/[wallet]/cancel.json",
+  "[network]/orders/[wallet]/new.json",
+]
+allowed_crypto_suites = ["secp256k1-keccak256-recoverable"]
+maximum_lifetime_ms = 86400000
 ```
 
 Every listed class must also appear in `[sign].allowed_intents`. Bloom rejects
 unknown or duplicate routes, empty or duplicate class lists, invalid class
 tokens, and declarations on routes without the key-derivation import. The
-installer records only the route's immediate signing intent and these explicit
-delegated classes; other package-level signing intents are not inherited.
+installer resolves `allowed_routes` from canonical manifest patterns to the
+immutable route IDs in that package and always includes the derivation route
+itself. Each allowed route must have a signing intent included in the declared
+operation classes. At runtime the component may request non-empty subsets of
+the declared operation classes and crypto suites and a shorter lifetime, but it
+cannot widen any bound; Bloom supplies the resolved routes. A manifest scope
+must declare all three bounds: `allowed_routes`, `allowed_crypto_suites`, and
+`maximum_lifetime_ms`.
+
+A crypto suite selects which hash runs over a payload before the child key
+signs it. `allowed_crypto_suites` accepts exactly the values of `CryptoSuite`
+in `bloom-broker-api`, and Bloom rejects anything else at install:
+
+| Value | Wallet | Use for |
+| --- | --- | --- |
+| `secp256k1-keccak256-recoverable` | EVM | keccak256, what Ethereum verifies: transactions, EIP-712, EIP-191 |
+| `secp256k1-sha256-recoverable` | EVM | SHA-256, for off-chain use such as signed venue API requests; no chain accepts these |
+| `ed25519-message` | Solana | the only suite a Solana wallet permits |
+
+The wallet's derivation profile is the ceiling: an EVM wallet permits both
+secp256k1 suites, a Solana wallet permits only `ed25519-message`. Declare the
+narrowest set the Petal actually needs, since a key limited to
+`secp256k1-sha256-recoverable` cannot produce a signature an EVM node accepts.
+
+Omitting all three bounds retains the legacy guest-supplied scope only for
+packages created before this manifest contract. New Petals should always
+declare the complete scope. Other package-level signing intents are not
+inherited.
 
 ## Routes and ABI
 
