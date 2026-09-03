@@ -77,8 +77,11 @@ approval happens asynchronously while the loop runs. Repeated permission errors
 before approval are expected. Stop on any different error, success, terminal
 state, or expiry; do not hide stderr or inspect Unix permissions between retries.
 Do not restage or create a second transfer while waiting. A Solana blockhash
-expires quickly, so cancel a stale pending entry rather than trying to force it
-through.
+expires quickly. If it expires, write a non-empty value to that entry's
+`restage` route. Bloom atomically moves the old entry to `failed/` as expired
+and creates one replacement with the same economic intent and a fresh
+blockhash. Review the replacement, then confirm it normally. Do not manually
+cancel and submit another `new.tx` for the same payment.
 
 ## Prove completion
 
@@ -87,8 +90,8 @@ After confirmation succeeds, the entry moves to `outbox/sent/<id>/`. Read
 `outcome: "success"` and `confirmation_status: "finalized"`; record its
 signature and slot. Finally, verify the original id is absent from `pending/`.
 
-If the workflow cannot safely continue, write `cancel` to the pending entry and
-report the failure. Never infer finality from a successful route write and never
-stage a compensating transfer unless the owner explicitly authorizes one. If the
-entry has already moved to `failed/`, it is terminal: do not investigate recovery
-or restage it; report failure and stop.
+If a still-valid workflow cannot safely continue, write `cancel` to the pending
+entry and report the failure. Never infer finality from a successful route write
+and never stage a compensating transfer unless the owner explicitly authorizes
+one. An entry in `failed/` is terminal unless it is explicitly marked expired;
+only an expired entry may use its `restage` route for the same requested payment.

@@ -111,6 +111,10 @@ the model with `BLOOM_EVAL_MODEL`, or pass `deepseek`, `opencode`, `codex`, or
 `claude` as its sole argument. `deepseek` runs DeepSeek through Claude Code's
 Anthropic-compatible adapter; `opencode` runs the same provider through Harbor's
 native OpenCode adapter.
+Claude Code-backed local Solana trials default to a bounded 24 turns because
+discovery, owner approval, possible blockhash restaging, and finality can exceed
+the shared adapter's generic 20-turn default. Set `BLOOM_EVAL_MAX_TURNS` to
+override it.
 The lifecycle lock permits one local Solana eval at a time. Override the
 developer-only port with `BLOOM_TRIAD_DEV_CEREMONY_PORT` if 18735 is occupied;
 the normal and eval triads must never share a port or authoritative state.

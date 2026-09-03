@@ -366,6 +366,10 @@ if [ "$agent" = smoke ]; then
   printf 'Bloom Solana local eval: running deterministic zero-token smoke...\n' >&2
   "${repo_root}/scripts/evals/run-harbor.sh" solana-transfer --smoke-only
 else
+  # Discovery, one owner-approval round trip, optional blockhash restaging,
+  # and finality require more than the shared adapter's generic 20-turn cap.
+  # Keep this bounded and honor an operator's explicit tighter/wider limit.
+  export BLOOM_EVAL_MAX_TURNS="${BLOOM_EVAL_MAX_TURNS:-24}"
   printf 'Bloom Solana local eval: running Harbor with %s (%s)...\n' \
     "$agent" "${BLOOM_EVAL_MODEL:-provider default}" >&2
   "${repo_root}/scripts/evals/run-harbor.sh" solana-transfer "$agent"

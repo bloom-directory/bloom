@@ -150,7 +150,7 @@ fn mount_write_path_uses_wallet_signer(path: &VfsPath) -> bool {
                 && chains == "chains"
                 && outbox == "outbox"
                 && pending == "pending"
-                && matches!(action.as_str(), "cancel" | "replace") =>
+                && action == "replace" =>
         {
             true
         }
@@ -2024,6 +2024,9 @@ mod tests {
             "/wallets/minnow/sealed-approvals/approval-id/revoke",
             "/wallets/minnow/sealed-approvals/revoke_all",
             "/requests/pending/req_1/confirm",
+            // The handler distinguishes safe native-Solana cancellation from
+            // EVM cancellation, which signs a replacement transaction.
+            "/wallets/minnow/chains/solana/outbox/pending/0001/cancel",
         ] {
             let p = VfsPath::parse(path).unwrap();
             assert!(!mount_write_path_uses_wallet_signer(&p), "{path}");
@@ -2033,7 +2036,6 @@ mod tests {
             "/wallets/minnow/sign/message",
             "/wallets/minnow/sign/hash",
             "/wallets/minnow/sign/typed_data",
-            "/wallets/minnow/chains/polygon/outbox/pending/0001/cancel",
             "/wallets/minnow/chains/polygon/outbox/pending/0001/replace",
         ] {
             let p = VfsPath::parse(path).unwrap();

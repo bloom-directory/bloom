@@ -249,7 +249,12 @@ assert "broadcast_attempted.json" in solana_guide
 assert "validity clock starts" in solana_guide
 assert "not a Unix ownership, mode, or mount problem" in solana_guide
 assert "Do not wait for a new chat message" in solana_guide
+assert "Do not manually" in solana_guide and "same payment" in solana_guide
+assert "only an expired entry may use its" in solana_guide
 SOLTOML
+
+grep -F 'BLOOM_EVAL_MAX_TURNS="${BLOOM_EVAL_MAX_TURNS:-24}"' \
+  scripts/evals/run-harbor-solana-local.sh >/dev/null
 
 # Serve deterministic Solana RPC responses so the verifier's trust boundary is
 # exercised without touching a cluster. Production points the URL at a node.
