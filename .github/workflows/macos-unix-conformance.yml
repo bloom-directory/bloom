@@ -199,7 +199,7 @@ jobs:
               "$payload"
           )"
           archive_sha="$(
-            shasum -a 256 "$RUNNER_TEMP/triad-dist/bloom-triad.tar.gz" |
+            shasum -a 256 "$RUNNER_TEMP/triad-dist/bloom-triad-test-unclaimed.tar.gz" |
               awk '{print $1}'
           )"
           {
