@@ -2643,6 +2643,76 @@ impl MachineJournalHeadProvider for MachineAuditHeadProvider {
     }
 }
 
+/// Opens Machine's authenticated audit journal and attaches it to the
+/// Machine-to-Broker client before that client can dispatch an RPC.
+pub fn attach_machine_authority_journal(
+    home: &HomeDir,
+    client: &MachineBrokerClient,
+) -> Result<Arc<AuditLog>, DaemonError> {
+    let identity = client.local_application_identity().ok_or_else(|| {
+        DaemonError::Audit(
+            "production Machine construction requires an authenticated application identity"
+                .to_owned(),
+        )
+    })?;
+    let audit_history_path = std::env::var_os("BLOOM_MACHINE_AUDIT_HISTORY")
+        .map(PathBuf::from)
+        .unwrap_or_else(default_machine_audit_history_path);
+    let (audit_history, audit_history_error) =
+        match AuditLog::load_root_trusted_history(&audit_history_path) {
+            Ok(history) => (history, None),
+            Err(error) => (
+                Vec::new(),
+                Some(format!(
+                    "packaging-pinned Machine audit history is invalid: {error}"
+                )),
+            ),
+        };
+    let audit = AuditLog::open_signed_with_history(
+        home.audit_path(),
+        AuditIdentity::new(
+            identity.service_id.as_str(),
+            identity.application_key_id.as_str(),
+            identity.signing_key,
+        ),
+        &audit_history,
+    )
+    .map_err(|error| DaemonError::Audit(error.to_string()))?;
+    if let Some(reason) = audit_history_error {
+        audit.latch_mutations(reason);
+    }
+    let audit = Arc::new(audit);
+    #[cfg(feature = "triad-dev-harness")]
+    let history_owner = if std::env::var_os("BLOOM_TRIAD_DEVELOPER_ROOT").is_some() {
+        rustix::process::geteuid().as_raw()
+    } else {
+        0
+    };
+    #[cfg(not(feature = "triad-dev-harness"))]
+    let history_owner = 0;
+    let attachment = bloom_machine_client::AuthorityEdgeHistory::load_trusted(
+        default_authority_edge_history_path(),
+        history_owner,
+    )
+    .map_err(|error| error.to_string())
+    .and_then(|history| {
+        client
+            .attach_authority_journal_with_history(
+                Arc::new(MachineAuditHeadProvider(audit.clone())),
+                default_machine_checkpoint_path(),
+                rustix::process::geteuid().as_raw(),
+                history,
+            )
+            .map_err(|error| error.to_string())
+    });
+    if let Err(error) = attachment {
+        audit.latch_mutations(format!(
+            "Machine authority-edge checkpoint/history degradation: {error}"
+        ));
+    }
+    Ok(audit)
+}
+
 #[derive(Clone)]
 struct CanonicalBatchConfirmation {
     tx_engine: TxEngine,
@@ -3261,38 +3331,18 @@ impl Daemon {
         };
         let address_book_arc = Arc::new(address_book.clone());
 
-        let audit_history_path = std::env::var_os("BLOOM_MACHINE_AUDIT_HISTORY")
-            .map(PathBuf::from)
-            .unwrap_or_else(default_machine_audit_history_path);
-        let (audit_history, audit_history_error) =
-            match AuditLog::load_root_trusted_history(&audit_history_path) {
-                Ok(history) => (history, None),
-                Err(error) => (
-                    Vec::new(),
-                    Some(format!(
-                        "packaging-pinned Machine audit history is invalid: {error}"
-                    )),
-                ),
-            };
-        let audit = match broker
-            .as_ref()
-            .and_then(MachineBrokerClient::local_application_identity)
-        {
-            Some(identity) => AuditLog::open_signed_with_history(
-                home.audit_path(),
-                AuditIdentity::new(
-                    identity.service_id.as_str(),
-                    identity.application_key_id.as_str(),
-                    identity.signing_key,
-                ),
-                &audit_history,
-            ),
-            None => {
+        let audit_arc = match broker.as_ref() {
+            Some(client) if client.local_application_identity().is_some() => {
+                attach_machine_authority_journal(&home, client)
+            }
+            _ => {
                 #[cfg(any(test, debug_assertions, feature = "unsigned-audit-test-seam"))]
                 {
                     // Explicit nonproduction seam. Release builds do not
                     // compile an unsigned Machine journal constructor.
                     AuditLog::open(home.audit_path())
+                        .map(Arc::new)
+                        .map_err(|error| DaemonError::Audit(error.to_string()))
                 }
                 #[cfg(not(any(test, debug_assertions, feature = "unsigned-audit-test-seam")))]
                 {
@@ -3302,44 +3352,7 @@ impl Daemon {
                     ));
                 }
             }
-        }
-        .map_err(|e| DaemonError::Audit(e.to_string()))?;
-        if let Some(reason) = audit_history_error {
-            audit.latch_mutations(reason);
-        }
-        let audit_arc = Arc::new(audit.clone());
-        if let Some(client) = broker.as_ref()
-            && client.local_application_identity().is_some()
-        {
-            #[cfg(feature = "triad-dev-harness")]
-            let history_owner = if std::env::var_os("BLOOM_TRIAD_DEVELOPER_ROOT").is_some() {
-                rustix::process::geteuid().as_raw()
-            } else {
-                0
-            };
-            #[cfg(not(feature = "triad-dev-harness"))]
-            let history_owner = 0;
-            let attachment = bloom_machine_client::AuthorityEdgeHistory::load_trusted(
-                default_authority_edge_history_path(),
-                history_owner,
-            )
-            .map_err(|error| error.to_string())
-            .and_then(|history| {
-                client
-                    .attach_authority_journal_with_history(
-                        Arc::new(MachineAuditHeadProvider(audit_arc.clone())),
-                        default_machine_checkpoint_path(),
-                        rustix::process::geteuid().as_raw(),
-                        history,
-                    )
-                    .map_err(|error| error.to_string())
-            });
-            if let Err(error) = attachment {
-                audit_arc.latch_mutations(format!(
-                    "Machine authority-edge checkpoint/history degradation: {error}"
-                ));
-            }
-        }
+        }?;
         let path_cache = Arc::new(PathCache::new());
 
         let watch_registry = Arc::new(

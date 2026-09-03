@@ -799,10 +799,11 @@ fn activation_health_only() -> Result<bool> {
 async fn serve_activation_health(home: &HomeDir, endpoint: Option<&str>) -> Result<()> {
     let endpoint = resolve_server_endpoint(home, endpoint).context("resolve serve endpoint")?;
     let socket = endpoint.socket;
+    let broker = configured_raw_broker_client_with_activation(true)?;
+    let _audit = bloom_daemon::attach_machine_authority_journal(home, &broker)
+        .context("attach authenticated Machine authority journal")?;
     let server = IpcServer::new(bloom_vfs::Vfs::new(), env!("CARGO_PKG_VERSION"), vec![])
-        .with_machine_commands(Arc::new(ActivationHealthMachineCommands {
-            broker: configured_raw_broker_client_with_activation(true)?,
-        }))
+        .with_machine_commands(Arc::new(ActivationHealthMachineCommands { broker }))
         .activation_health_only()
         .with_ready_callback(Arc::new(emit_machine_ready));
     let shutdown_server = server.clone();
