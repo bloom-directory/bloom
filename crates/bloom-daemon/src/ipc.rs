@@ -539,6 +539,7 @@ impl IpcOperationContext {
 pub enum MachineCustodyKind {
     New,
     Import,
+    ImportRawPrivateKey,
     Rebind,
     Delete,
 }
@@ -586,6 +587,13 @@ pub enum MachineCommand {
     WalletList,
     WalletProjection {
         name: String,
+    },
+    WalletAccounts {
+        name: String,
+    },
+    WalletAccountAllocate {
+        name: String,
+        profile: String,
     },
     WalletAddress {
         name: String,

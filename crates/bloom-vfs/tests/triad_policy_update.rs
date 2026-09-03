@@ -81,7 +81,7 @@ impl BrokerFixture {
         WalletPublic {
             wallet_id: Token::new("alice").unwrap(),
             wallet_kind: Token::new("passkey").unwrap(),
-            root_key_ref: self.key_ref(),
+            root_key_ref: Some(self.key_ref()),
             key_refs: vec![self.key_ref()],
             policy_version: policy.version,
             policy_digest: policy.policy_digest,

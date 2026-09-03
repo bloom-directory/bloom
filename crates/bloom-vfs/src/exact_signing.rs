@@ -324,6 +324,7 @@ impl BrokerExactPayloadSigner {
             expires_at_ms: state.expires_at_ms.clone(),
             canonical_plan_facts_digest,
             approval_id: state.approval_id.clone(),
+            account_key_ref: None,
             petal_use_claim: petal_claim.map(|(claim, _)| claim.clone()),
             claim_assurance_evidence: petal_claim
                 .and_then(|(_, evidence)| evidence.map(<[u8]>::to_vec)),
@@ -582,6 +583,7 @@ impl BrokerExactPayloadSigner {
             expires_at_ms: state.expires_at_ms.clone(),
             canonical_plan_facts_digest,
             approval_id: state.approval_id.clone(),
+            account_key_ref: None,
             petal_use_claim: Some(claim.clone()),
             claim_assurance_evidence: claim_assurance_evidence.map(<[u8]>::to_vec),
         };
@@ -718,6 +720,7 @@ impl BrokerExactPayloadSigner {
             expires_at_ms: state.expires_at_ms.clone(),
             canonical_plan_facts_digest,
             approval_id: state.approval_id.clone(),
+            account_key_ref: None,
             petal_use_claim: Some(claim.clone()),
             claim_assurance_evidence: claim_assurance_evidence.map(<[u8]>::to_vec),
         };
@@ -860,7 +863,7 @@ mod tests {
                         Ok(MachineBrokerResponse::WalletGetPublic(WalletPublic {
                             wallet_id: token("wallet"),
                             wallet_kind: token("local"),
-                            root_key_ref: test_key_ref(),
+                            root_key_ref: Some(test_key_ref()),
                             key_refs: vec![test_key_ref()],
                             policy_version: DecimalU64::new(1),
                             policy_digest: digest(4),

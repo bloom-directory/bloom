@@ -3348,6 +3348,7 @@ impl TxEngine {
             expires_at_ms: state.expires_at_ms.clone(),
             canonical_plan_facts_digest: state.canonical_plan_facts_digest.clone(),
             approval_id: state.approval_id.clone(),
+            account_key_ref: None,
             petal_use_claim: None,
             claim_assurance_evidence: None,
         };
@@ -4001,6 +4002,7 @@ fn exact_evm_sign_request(
         expires_at_ms: state.expires_at_ms.clone(),
         canonical_plan_facts_digest: state.canonical_plan_facts_digest.clone(),
         approval_id: state.approval_id.clone(),
+        account_key_ref: None,
         petal_use_claim: None,
         claim_assurance_evidence: None,
     })
@@ -4678,7 +4680,7 @@ mod tests {
                         Ok(MachineBrokerResponse::WalletGetPublic(WalletPublic {
                             wallet_id: request.wallet_id,
                             wallet_kind: Token::new("local").unwrap(),
-                            root_key_ref: self.key_ref.clone(),
+                            root_key_ref: Some(self.key_ref.clone()),
                             key_refs: vec![self.key_ref.clone()],
                             policy_version: DecimalU64::new(1),
                             policy_digest: Digest32::from_bytes([7; 32]),

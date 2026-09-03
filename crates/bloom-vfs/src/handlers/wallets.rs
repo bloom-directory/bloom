@@ -37,7 +37,7 @@ use bloom_machine_client::{MachineBrokerClient, WalletProjectionReader};
 use bloom_proto::{AddressBook, CapabilityViewEntry, HomeWritePermit, Policy, RawIntent};
 use bloom_tx::{
     intent_parser,
-    outbox::OutboxState,
+    outbox::{OutboxError, OutboxState},
     tx_engine::{TxEngine, TxEngineError},
 };
 use qrcode::QrCode;
@@ -563,6 +563,9 @@ impl WalletsHandler {
                     browser_output_recipient_key: None,
                     petal_key_scope: None,
                     legacy_passkey_migration: None,
+                    wallet_seed_profile: None,
+                    derivation_request: None,
+                    account_terms: None,
                 },
             )
             .await
@@ -1655,6 +1658,7 @@ impl WalletsHandler {
             Entry::file("public_key"),
             Entry::file("kind"),
             Entry::file("projection.json"),
+            Entry::file("accounts.json"),
             Entry::writable_file("policy.json"),
             Entry::dir("chains"),
             Entry::dir("sealed-approvals"),
@@ -1663,18 +1667,65 @@ impl WalletsHandler {
         ]
     }
 
-    fn outbox_dir_entries() -> Vec<Entry> {
-        vec![
+    fn latest_evm_pending_target(
+        &self,
+        wallet: &str,
+        chain: &str,
+    ) -> Result<Option<String>, HandlerError> {
+        let ids = self
+            .tx_engine
+            .outbox
+            .list(wallet, chain, OutboxState::Pending)
+            .map_err(err_be)?;
+        let mut pending = Vec::with_capacity(ids.len());
+        for id in ids {
+            match self
+                .tx_engine
+                .outbox
+                .read_in_state(wallet, chain, &id, OutboxState::Pending)
+            {
+                Ok(entry) => pending.push((entry.staged.created_ms, id)),
+                // The entry transitioned between listing and reading; it is
+                // no longer a pending candidate.
+                Err(OutboxError::NotFound(_)) => {}
+                // `latest` is advertised as the atomic identity of the newest
+                // staged transfer. An unreadable newest entry must surface,
+                // not silently redirect the reader to an older transfer.
+                Err(error) => return Err(err_be(error)),
+            }
+        }
+        Ok(newest_pending_target(pending))
+    }
+
+    fn outbox_dir_entries(&self, wallet: &str, chain: &str) -> Result<Vec<Entry>, HandlerError> {
+        let mut entries = vec![
             Entry::writable_file("new.tx"),
             Entry::dir("pending"),
             Entry::dir("sent"),
             Entry::dir("failed"),
-        ]
+        ];
+        if let Some(target) = self.latest_evm_pending_target(wallet, chain)? {
+            entries.push(Entry::symlink("latest", &target));
+        }
+        Ok(entries)
     }
 }
 
 fn err_be(e: impl std::fmt::Display) -> HandlerError {
     HandlerError::backend(e.to_string())
+}
+
+/// Render the newest pending entry as a `pending/<id>` symlink target.
+///
+/// Ties on `created_ms` break toward the greater id: outbox ids come from a
+/// monotonically increasing allocation counter, so within one millisecond the
+/// greater id is the later staging. Newest first, deterministically.
+fn newest_pending_target(mut pending: Vec<(u128, String)>) -> Option<String> {
+    pending.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
+    pending
+        .into_iter()
+        .next()
+        .map(|(_, id)| format!("pending/{id}"))
 }
 
 /// Reject a policy-update action id that could escape its state directory
@@ -2078,7 +2129,7 @@ impl WalletsHandler {
         }
         match segs[1].as_str() {
             "address" | "address.qr.png" | "address.qr.svg" | "addresses.json" | "public_key"
-            | "kind" | "projection.json" => Ok(Entry::file(&segs[1])),
+            | "kind" | "projection.json" | "accounts.json" => Ok(Entry::file(&segs[1])),
             "policy.json" => Ok(Entry::writable_file("policy.json")),
             "chains" => match segs.len() {
                 2 => Ok(Entry::dir("chains")),
@@ -2241,6 +2292,21 @@ impl WalletsHandler {
             "addresses.json" => {
                 let projection = self.wallet_projection(wallet).await?;
                 self.projection_addresses_json(&projection)
+            }
+            "accounts.json" => {
+                let broker = self.broker.as_ref().ok_or_else(|| {
+                    HandlerError::backend("Broker edge is unavailable for wallet accounts")
+                })?;
+                let accounts = broker
+                    .wallet_accounts(
+                        bloom_broker_api::Token::new(wallet.to_owned())
+                            .map_err(|error| HandlerError::invalid(error.to_string()))?,
+                    )
+                    .await
+                    .map_err(|error| HandlerError::backend(error.to_string()))?;
+                let mut out = serde_json::to_vec_pretty(&accounts).map_err(err_be)?;
+                out.push(b'\n');
+                Ok(out)
             }
             "public_key" => {
                 let projection = self.wallet_projection(wallet).await?;
@@ -2565,6 +2631,12 @@ impl WalletsHandler {
             [] => Ok(Entry::dir("outbox")),
             [s] if s == "new.tx" => Ok(Entry::writable_file("new.tx")),
             [s] if s == "pending" || s == "sent" || s == "failed" => Ok(Entry::dir(s)),
+            [s] if s == "latest" => {
+                let target = self
+                    .latest_evm_pending_target(wallet, chain)?
+                    .ok_or_else(|| HandlerError::not_found("outbox/latest"))?;
+                Ok(Entry::symlink("latest", &target))
+            }
             [state, id] => {
                 let st = parse_state_seg(state)?;
                 // Confirm the entry actually lives in the requested state
@@ -2844,7 +2916,7 @@ impl WalletsHandler {
                 Entry::file("nonce_conflicts.json"),
                 Entry::dir("outbox"),
             ]),
-            [s] if s == "outbox" => Ok(Self::outbox_dir_entries()),
+            [s] if s == "outbox" => self.outbox_dir_entries(wallet, chain),
             [s, state] if s == "outbox" => {
                 let st = match state.as_str() {
                     "pending" => OutboxState::Pending,
@@ -3088,7 +3160,7 @@ mod tests {
         MachineBrokerRequest, MachineBrokerResponse, MachineBrokerService, OperationId,
         ProtocolError, ProtocolErrorCode, RequestNonce, RevocationState, RevokeRequest,
         SealedApprovalPrepareResponse, SealedApprovalTerms, ServiceFuture, SignedPolicySnapshot,
-        Token, WalletOperationRequest, WalletPublic,
+        Token, WalletAccountsPublic, WalletOperationRequest, WalletPublic, WalletSeedProfile,
     };
     use bloom_machine_client::{ProjectionFreshness, ProjectionVerification};
     use bloom_proto::AddressBook;
@@ -3126,6 +3198,31 @@ mod tests {
         state: Mutex<CeremonyState>,
         omit_ceremony_url: Mutex<bool>,
         status_error: Mutex<Option<ProtocolErrorCode>>,
+    }
+
+    struct WalletAccountsBroker;
+
+    impl MachineBrokerService for WalletAccountsBroker {
+        fn dispatch<'a>(
+            &'a self,
+            request: MachineBrokerRequest,
+        ) -> ServiceFuture<'a, MachineBrokerResponse> {
+            Box::pin(async move {
+                match request {
+                    MachineBrokerRequest::WalletAccounts(request) => Ok(
+                        MachineBrokerResponse::WalletAccounts(WalletAccountsPublic {
+                            wallet_id: request.wallet_id,
+                            seed_profile: WalletSeedProfile::Bip39MulticurveV1,
+                            accounts: Vec::new(),
+                        }),
+                    ),
+                    other => Err(ProtocolError::new(
+                        ProtocolErrorCode::BackendUnsupported,
+                        format!("unexpected request in wallet-accounts fixture: {other:?}"),
+                    )),
+                }
+            })
+        }
     }
 
     impl MachineBrokerService for RegistrationBroker {
@@ -3319,7 +3416,7 @@ mod tests {
             wallet: WalletPublic {
                 wallet_id: wallet_id.clone(),
                 wallet_kind: token("local"),
-                root_key_ref: key_ref.clone(),
+                root_key_ref: Some(key_ref.clone()),
                 key_refs: vec![key_ref.clone()],
                 policy_version: DecimalU64::new(1),
                 policy_digest: policy_digest.clone(),
@@ -3633,6 +3730,10 @@ mod tests {
     /// Write a synthetic staged tx directly into the outbox so the tests
     /// that drive confirm/replace/cancel don't have to spin up a chain.
     fn seed_pending(f: &Fixture, id: &str) {
+        seed_pending_with_created_ms(f, id, 0);
+    }
+
+    fn seed_pending_with_created_ms(f: &Fixture, id: &str, created_ms: u128) {
         let staged = bloom_proto::StagedTx {
             id: id.into(),
             wallet: f.wallet_name.clone(),
@@ -3648,7 +3749,7 @@ mod tests {
             gas_price: None,
             nonce: 0,
             policy_checks: vec![],
-            created_ms: 0,
+            created_ms,
             // Far in the future so expiry never trips during tests.
             expires_ms: u128::MAX,
             status: bloom_proto::TxStatus::Pending,
@@ -4571,6 +4672,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn outbox_latest_prefers_the_newest_staging_and_breaks_ties_by_allocation() {
+        let f = make_handler_with_chain(true);
+        // Same millisecond: ids are allocated from an increasing counter, so
+        // the greater id is the later staging and must own `latest`.
+        seed_pending_with_created_ms(&f, "0001-older", 5_000);
+        seed_pending_with_created_ms(&f, "0002-newer", 5_000);
+        // And a later millisecond still wins regardless of id.
+        seed_pending_with_created_ms(&f, "0003-newest", 9_000);
+
+        let root = VfsPath::parse(&format!("/{}/chains/anvil/outbox", f.wallet_name)).unwrap();
+        let listed = f.handler.list(&root).await.unwrap();
+        let latest = listed.iter().find(|entry| entry.name == "latest").unwrap();
+        assert_eq!(latest.link_target.as_deref(), Some("pending/0003-newest"));
+
+        // Remove the newest entry and the tie-break decides, deterministically
+        // toward the later allocation.
+        let entry = f
+            .handler
+            .tx_engine
+            .outbox
+            .read_in_state(&f.wallet_name, "anvil", "0003-newest", OutboxState::Pending)
+            .unwrap();
+        f.handler
+            .tx_engine
+            .outbox
+            .transition(&entry, OutboxState::Failed)
+            .unwrap();
+        let listed = f.handler.list(&root).await.unwrap();
+        let latest = listed.iter().find(|entry| entry.name == "latest").unwrap();
+        assert_eq!(latest.link_target.as_deref(), Some("pending/0002-newer"));
+    }
+
+    #[tokio::test]
+    async fn outbox_latest_fails_closed_when_the_newest_pending_entry_is_unreadable() {
+        let f = make_handler_with_chain(true);
+        seed_pending_with_created_ms(&f, "0001-older", 5_000);
+        seed_pending_with_created_ms(&f, "0002-newer", 9_000);
+        // Corrupt the newest entry's intent: an agent following `latest` as
+        // the advertised atomic identity must not be silently redirected to
+        // the older transfer.
+        let dir = f
+            ._tmp
+            .path()
+            .join("outbox")
+            .join(&f.wallet_name)
+            .join("anvil")
+            .join("pending")
+            .join("0002-newer");
+        std::fs::write(dir.join("intent.json"), b"{ not json").unwrap();
+
+        let root = VfsPath::parse(&format!("/{}/chains/anvil/outbox", f.wallet_name)).unwrap();
+        assert!(
+            f.handler.list(&root).await.is_err(),
+            "an unreadable newest pending entry must surface, not fall back to an older transfer"
+        );
+    }
+
+    #[tokio::test]
+    async fn outbox_latest_is_advertised_and_resolves_the_pending_identity() {
+        let f = make_handler_with_chain(true);
+        seed_pending(&f, "0001-pending");
+        let root = VfsPath::parse(&format!("/{}/chains/anvil/outbox", f.wallet_name)).unwrap();
+
+        let listed = f.handler.list(&root).await.unwrap();
+        let latest = listed.iter().find(|entry| entry.name == "latest").unwrap();
+        assert_eq!(latest.link_target.as_deref(), Some("pending/0001-pending"));
+
+        let latest_path =
+            VfsPath::parse(&format!("/{}/chains/anvil/outbox/latest", f.wallet_name)).unwrap();
+        assert_eq!(
+            f.handler
+                .lookup(&latest_path)
+                .await
+                .unwrap()
+                .link_target
+                .as_deref(),
+            Some("pending/0001-pending")
+        );
+    }
+
+    #[tokio::test]
     async fn outbox_lookup_rejects_absent_artifacts_but_preserves_virtual_sinks() {
         let f = make_handler_with_chain(true);
         for (state_name, state, id) in [
@@ -5031,5 +5213,35 @@ mod tests {
         .unwrap();
         let body = f.handler.read(&p).await.unwrap();
         assert!(body.is_empty());
+    }
+
+    #[tokio::test]
+    async fn wallet_entries_are_listed_looked_up_and_accounts_are_read_consistently() {
+        let f = make_handler();
+        let handler = f
+            .handler
+            .with_broker(Some(MachineBrokerClient::new(Arc::new(
+                WalletAccountsBroker,
+            ))));
+        let wallet_dir = VfsPath::parse(&format!("/{}", f.wallet_name)).unwrap();
+        let listed = handler.list(&wallet_dir).await.unwrap();
+        let names = listed
+            .iter()
+            .map(|entry| entry.name.clone())
+            .collect::<Vec<_>>();
+        assert!(names.iter().any(|name| name == "accounts.json"));
+
+        for name in &names {
+            let path = VfsPath::parse(&format!("/{}/{}", f.wallet_name, name)).unwrap();
+            handler.lookup(&path).await.unwrap_or_else(|error| {
+                panic!("listed entry {name:?} does not resolve through lookup: {error:?}")
+            });
+        }
+
+        let accounts = VfsPath::parse(&format!("/{}/accounts.json", f.wallet_name)).unwrap();
+        let body = handler.read(&accounts).await.unwrap();
+        let parsed: WalletAccountsPublic = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed.wallet_id.as_str(), f.wallet_name);
+        assert!(parsed.accounts.is_empty());
     }
 }

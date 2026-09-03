@@ -32,6 +32,43 @@ The mounted wallet tree exposes those projections. Wallet creation, import,
 credential changes, deletion, and recovery start Broker custody operations and
 return ceremony information; Machine does not create or open a keystore.
 
+## BIP-39 roots and derived accounts
+
+The v1 BIP-39 profile accepts a standard English mnemonic only through the
+Broker-hosted owner ceremony and exposes no passphrase input.
+Passphrase-protected BIP-39 wallets are unsupported and rejected. Signer
+stores encrypted root material behind the passkey/PRF wrapping path; Machine
+and Broker never persist the mnemonic, seed, passphrase, PRF output, or child
+private keys.
+
+Import allocates the canonical EVM child at `m/44'/60'/0'/0/0`. Machine's v1
+account-allocation command exposes Solana SLIP-10 children only; additional EVM
+children remain unavailable until every EVM transaction and exact-signing
+surface can carry an explicit account selector. This avoids creating a wallet
+state that existing EVM UX cannot spend from safely.
+
+`bloom wallet import <name>` starts the mnemonic ceremony. The recovery phrase
+is entered only in the ceremony browser; it is never a command-line argument.
+`bloom wallet import <name> --raw-private-key` is the explicit migration path
+for an old local wallet after its secp256k1 key has been exported with the old
+offline tooling. The raw key is likewise entered only in the browser. Bloom
+does not accept or retain the old wallet passphrase.
+
+Raw-key migration preserves the corresponding EVM account, but it creates an
+`imported-secp256k1-scalar` wallet rather than a BIP-39 root. It cannot derive
+Solana accounts. A user who needs native Solana support must create or import a
+passphrase-free BIP-39 wallet and transfer assets to its derived accounts.
+Existing v1 passkey wallets use `bloom wallet migrate-passkey <receipt>`; that
+receipt carries public binding data, not the credential secret or root key.
+
+Broker projects public derived accounts through `wallet.accounts`; Machine
+exposes the authenticated collection as `wallets/<wallet>/accounts.json`.
+Selection binds the exact `KeyRef` into approval terms and signing identity.
+When multiple compatible children exist, omission or ambiguity fails closed
+and names the public fingerprints and derivation paths; list order is never an
+authority decision. Top-level EVM address compatibility resolves only the
+canonical initial child and never falls back to another projected child.
+
 ## Signing
 
 Every retained wallet-signing route sends the exact structured payload to

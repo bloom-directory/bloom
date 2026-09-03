@@ -253,12 +253,14 @@ fn require_login_owned_private_file(path: &Path, effective_uid: u32) -> Result<(
 fn require_session_directory(path: &Path, uid: u32, gid: u32) -> Result<()> {
     let metadata =
         fs::symlink_metadata(path).with_context(|| format!("inspect {}", path.display()))?;
+    // Directory hard links are forbidden by POSIX, so `is_dir` already rules
+    // out substitutes; a link-count floor is not portable (btrfs reports
+    // nlink=1 for empty directories) and adds no guarantee beyond `is_dir`.
     if !metadata.file_type().is_dir()
         || metadata.file_type().is_symlink()
         || metadata.uid() != uid
         || metadata.gid() != gid
         || metadata.mode() & 0o7777 != 0o710
-        || metadata.nlink() < 2
     {
         bail!("session socket directory has the wrong owner, group, mode, or type");
     }

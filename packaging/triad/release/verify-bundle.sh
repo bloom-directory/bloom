@@ -84,10 +84,21 @@ for support_edge in signer_control session; do
   require_compat_value "protocols.$support_edge" minor_min 0
   require_compat_value "protocols.$support_edge" minor_max 1
 done
-require_compat_value revisions broker_commit '"1cbb549bea07f78c564ef1e66e52fb087b5f2ffa"'
-require_compat_value revisions signer_commit '"1a1d52376919fff4cb295207e67c54dff60c745d"'
-require_compat_value revisions service_runtime_commit '"2e402f03814166406ea6489b60422b0865d1f6c2"'
-require_compat_value revisions petal_contract_commit '"61938d0c127cfe03c7e3e55baed0ba1439bc5ca2"'
+# The expected authority revisions are the reviewed matrix checked in next to
+# this verifier — one source of truth instead of a second hand-maintained
+# copy that can (and did) drift from the matrix while the workspace pins
+# advanced.
+repo_compatibility="$script_dir/compatibility-v1.toml"
+repo_compat_value() {
+  local section="$1" key="$2"
+  awk -v section="[$section]" -v key="$key" '
+    /^\[/ { active = ($0 == section) }
+    active && $1 == key && $2 == "=" { print $3 }
+  ' "$repo_compatibility"
+}
+for revision_key in broker_commit signer_commit service_runtime_commit petal_contract_commit; do
+  require_compat_value revisions "$revision_key" "$(repo_compat_value revisions "$revision_key")"
+done
 for state_owner in machine broker signer; do
   require_compat_value "state.$state_owner" current 1
   require_compat_value "state.$state_owner" downgrade_floor 1

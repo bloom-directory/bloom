@@ -45,14 +45,15 @@ use bloom_broker_api::{
     ApprovalPrepareRequest, ApprovalPublicStatus, ApprovalRenewRequest, ApprovalSelector,
     ApprovalSubject, BROKER_API_CURRENT, BROKER_API_RANGE, Base64UrlBytes, CeremonyPublicStatus,
     CeremonyState, CredentialPublic, CryptoSuite, CustodyPrepareRequest, CustodyPrepareResponse,
-    CustodyResult, DecimalU64, Digest32, IdRequest, KeyPublic, KeyRef, KeyRequest, KeyRole,
-    MachineBrokerRequest, MachineBrokerResponse, MachineBrokerService, MachineSignRequest,
-    OperationId, OperationPublicStatus, OperationRequest, PetalUseClaim, PolicyCommitReceipt,
-    PolicyCommitUpdateRequest, PolicyUpdatePrepareResponse, PolicyUpdateRequest, ProtocolError,
-    ProtocolErrorCode, ProvenanceCatalog, ProvenanceSubject, RequestNonce, RevocationState,
-    RevokeRequest, SealedApprovalPrepareResponse, SealedApprovalTerms, SignedPolicySnapshot,
-    SigningPayloads, SigningResult, Token, TypedRequestMethod, WalletOperationRequest,
-    WalletPublic, WalletRequest, is_read_only_method,
+    CustodyResult, DecimalU64, DerivedAccountPublic, Digest32, IdRequest, KeyPublic, KeyRef,
+    KeyRequest, KeyRole, MachineBrokerRequest, MachineBrokerResponse, MachineBrokerService,
+    MachineSignRequest, OperationId, OperationPublicStatus, OperationRequest, PetalUseClaim,
+    PolicyCommitReceipt, PolicyCommitUpdateRequest, PolicyUpdatePrepareResponse,
+    PolicyUpdateRequest, ProtocolError, ProtocolErrorCode, ProvenanceCatalog, ProvenanceSubject,
+    RequestNonce, RevocationState, RevokeRequest, SealedApprovalPrepareResponse,
+    SealedApprovalTerms, SignedPolicySnapshot, SigningPayloads, SigningResult, Token,
+    TypedRequestMethod, WalletAccountsPublic, WalletOperationRequest, WalletPublic, WalletRequest,
+    is_read_only_method,
 };
 use bloom_triad_local_transport::{LocalIdentity, PeerAcl};
 use serde::{Deserialize, Serialize};
@@ -643,7 +644,11 @@ impl MachineBrokerClient {
             }
         };
         let key_ref = self
-            .verified_wallet_root(&wallet, request.crypto_suite)
+            .verified_signing_key(
+                &wallet,
+                request.crypto_suite,
+                request.account_key_ref.as_ref(),
+            )
             .await?;
         let activation_mode = request
             .activation_mode
@@ -797,7 +802,11 @@ impl MachineBrokerClient {
             }
         };
         let key_ref = self
-            .verified_wallet_root(&wallet, request.crypto_suite)
+            .verified_signing_key(
+                &wallet,
+                request.crypto_suite,
+                request.account_key_ref.as_ref(),
+            )
             .await?;
         let activation_mode = request
             .activation_mode
@@ -938,7 +947,11 @@ impl MachineBrokerClient {
         }
         let wallet = self.wallet(request.wallet_id.clone()).await?;
         let key_ref = self
-            .verified_wallet_root(&wallet, request.crypto_suite)
+            .verified_signing_key(
+                &wallet,
+                request.crypto_suite,
+                request.account_key_ref.as_ref(),
+            )
             .await?;
         let activation_mode = request
             .activation_mode
@@ -1290,6 +1303,56 @@ impl MachineBrokerClient {
         }
     }
 
+    /// The wallet's derived-account projection (BIP-39 only). Imported-scalar
+    /// and legacy wallets project an empty collection.
+    pub async fn wallet_accounts(
+        &self,
+        wallet_id: Token,
+    ) -> Result<WalletAccountsPublic, ProtocolError> {
+        let expected_wallet = wallet_id.clone();
+        match self
+            .request(MachineBrokerRequest::WalletAccounts(WalletRequest {
+                wallet_id,
+            }))
+            .await?
+        {
+            MachineBrokerResponse::WalletAccounts(accounts) => {
+                if accounts.wallet_id != expected_wallet {
+                    return Err(response_identity_mismatch("wallet.accounts"));
+                }
+                Ok(accounts)
+            }
+            _ => Err(response_mismatch("wallet.accounts")),
+        }
+    }
+
+    /// Prepare an AccountAllocate custody ceremony bound to exact terms.
+    ///
+    /// The response must answer this operation: a crossed or stale
+    /// authenticated reply would otherwise send the owner to a different
+    /// custody ceremony than the one whose terms were just staged.
+    pub async fn account_allocate(
+        &self,
+        request: CustodyPrepareRequest,
+    ) -> Result<CustodyPrepareResponse, ProtocolError> {
+        let expected_operation_id = request.custody_operation_id.clone();
+        let expected_ceremony_kind = request.ceremony_kind;
+        match self
+            .request(MachineBrokerRequest::AccountAllocatePrepare(request))
+            .await?
+        {
+            MachineBrokerResponse::AccountAllocatePrepare(prepared) => {
+                if prepared.custody_operation_id != expected_operation_id
+                    || prepared.ceremony_kind != expected_ceremony_kind
+                {
+                    return Err(response_identity_mismatch("account.allocate_prepare"));
+                }
+                Ok(prepared)
+            }
+            _ => Err(response_mismatch("account.allocate_prepare")),
+        }
+    }
+
     pub async fn key(&self, request: KeyRequest) -> Result<KeyPublic, ProtocolError> {
         match self
             .request(MachineBrokerRequest::KeyGetPublic(request))
@@ -1300,42 +1363,143 @@ impl MachineBrokerClient {
         }
     }
 
-    async fn verified_wallet_root(
+    /// The wallet's signable key for `suite`: the root for legacy/imported-scalar
+    /// wallets, or a derived child for BIP-39 wallets (whose root is a
+    /// non-signable seed).
+    ///
+    /// `selected` names one exact derived account. It is required whenever a
+    /// BIP-39 wallet holds more than one child for `suite` — without it the
+    /// choice is ambiguous, so selection fails closed rather than guessing.
+    /// Only *active* accounts are candidates: a retired child is no longer a
+    /// signing candidate, whether named explicitly or encountered while
+    /// resolving an omission. The key returned here is bound into
+    /// `SealedApprovalTerms::key_ref` when an approval is prepared and into
+    /// `SignOperationIdentity::key_ref` when one is spent, so an approval
+    /// issued for one account can never authorise a signature from another.
+    async fn verified_signing_key(
         &self,
         wallet: &WalletPublic,
         suite: CryptoSuite,
+        selected: Option<&KeyRef>,
     ) -> Result<KeyRef, ProtocolError> {
-        let root = wallet.root_key_ref.clone();
-        if !wallet.key_refs.contains(&root) {
+        let (key_ref, expected_role) = match &wallet.root_key_ref {
+            Some(root) => {
+                // A root-signing wallet has no derived-account selector
+                // surface at all — not even one naming the root itself. A
+                // caller that routes an account selector here is buggy or
+                // hostile, and silently accepting `selected == root` would
+                // hide it.
+                if selected.is_some() {
+                    return Err(ProtocolError::new(
+                        ProtocolErrorCode::KeyrefMismatch,
+                        "wallet signs with its root key; no derived account may be selected",
+                    ));
+                }
+                (root.clone(), KeyRole::WalletRoot)
+            }
+            None => {
+                // A BIP-39 wallet's signable keys are its derived children,
+                // but candidacy is defined by the fresh account projection,
+                // not by the wallet descriptor list: retirement lives only in
+                // `wallet.accounts`, and a retired child must not be
+                // selectable or poison an implicit choice.
+                let accounts = self.wallet_accounts(wallet.wallet_id.clone()).await?;
+                let matching: Vec<&DerivedAccountPublic> = accounts
+                    .accounts
+                    .iter()
+                    .filter(|account| {
+                        account.lifecycle == bloom_broker_api::AccountLifecycleState::Active
+                            && account.key_ref.key_spec == suite.key_spec()
+                    })
+                    .collect();
+                match selected {
+                    Some(selected) => {
+                        let chosen = matching
+                            .iter()
+                            .find(|account| &account.key_ref == selected)
+                            .ok_or_else(|| {
+                                // Name the failure precisely when the
+                                // selection matches a real but retired child.
+                                if accounts.accounts.iter().any(|account| {
+                                    &account.key_ref == selected
+                                        && account.lifecycle
+                                            == bloom_broker_api::AccountLifecycleState::Retired
+                                }) {
+                                    ProtocolError::new(
+                                        ProtocolErrorCode::KeyrefMismatch,
+                                        "selected account is retired and can no longer sign",
+                                    )
+                                } else {
+                                    ProtocolError::new(
+                                        ProtocolErrorCode::KeyrefMismatch,
+                                        format!(
+                                            "selected account is not an active derived child of \
+                                             this wallet for the requested CryptoSuite; this \
+                                             wallet offers: {}",
+                                            describe_accounts(&matching),
+                                        ),
+                                    )
+                                }
+                            })?;
+                        (chosen.key_ref.clone(), KeyRole::Derived)
+                    }
+                    None => match matching.as_slice() {
+                        [account] => (account.key_ref.clone(), KeyRole::Derived),
+                        [] => {
+                            return Err(ProtocolError::new(
+                                ProtocolErrorCode::KeyrefMismatch,
+                                "BIP-39 wallet has no active derived child for the requested CryptoSuite",
+                            ));
+                        }
+                        // Never fall back to the first match. The candidates
+                        // are named so the caller can pick one, because an
+                        // error that only says "ambiguous" leaves no way
+                        // forward.
+                        candidates => {
+                            return Err(ProtocolError::new(
+                                ProtocolErrorCode::KeyrefMismatch,
+                                format!(
+                                    "BIP-39 wallet has {} active derived children for the \
+                                     requested CryptoSuite; select one by account fingerprint: {}",
+                                    candidates.len(),
+                                    describe_accounts(candidates),
+                                ),
+                            ));
+                        }
+                    },
+                }
+            }
+        };
+        if !wallet.key_refs.contains(&key_ref) {
             return Err(ProtocolError::new(
                 ProtocolErrorCode::KeyrefMismatch,
-                "wallet root key is absent from the wallet key set",
+                "wallet signing key is absent from the wallet key set",
             ));
         }
-        if root.key_spec != suite.key_spec() {
+        if key_ref.key_spec != suite.key_spec() {
             return Err(ProtocolError::new(
                 ProtocolErrorCode::SuiteNotAllowed,
-                "wallet root key is incompatible with the requested CryptoSuite",
+                "wallet signing key is incompatible with the requested CryptoSuite",
             ));
         }
         let public = self
             .key(KeyRequest {
-                key_ref: root.clone(),
+                key_ref: key_ref.clone(),
             })
             .await?;
-        if public.key_ref != root || public.role != KeyRole::WalletRoot {
+        if public.key_ref != key_ref || public.role != expected_role {
             return Err(ProtocolError::new(
                 ProtocolErrorCode::KeyrefMismatch,
-                "Broker did not confirm the selected wallet root",
+                "Broker did not confirm the selected wallet signing key",
             ));
         }
         if !public.supported_crypto_suites.contains(&suite) {
             return Err(ProtocolError::new(
                 ProtocolErrorCode::SuiteNotAllowed,
-                "wallet root does not support the requested CryptoSuite",
+                "wallet signing key does not support the requested CryptoSuite",
             ));
         }
-        Ok(root)
+        Ok(key_ref)
     }
 
     pub async fn credentials(
@@ -1537,6 +1701,10 @@ pub struct ExactPayloadSignRequest {
     pub approval_id: Option<Digest32>,
     pub petal_use_claim: Option<PetalUseClaim>,
     pub claim_assurance_evidence: Option<Vec<u8>>,
+    /// The exact derived account to sign with. Required when the wallet is
+    /// BIP-39 and holds more than one child for `crypto_suite`; `None` keeps
+    /// the single-account and legacy-root behaviour.
+    pub account_key_ref: Option<KeyRef>,
 }
 
 #[derive(Clone, Debug)]
@@ -1559,6 +1727,10 @@ pub struct ExactPayloadBatchSignRequest {
     pub approval_id: Option<Digest32>,
     pub petal_use_claim: Option<PetalUseClaim>,
     pub claim_assurance_evidence: Option<Vec<u8>>,
+    /// The exact derived account to sign with. Required when the wallet is
+    /// BIP-39 and holds more than one child for `crypto_suite`; `None` keeps
+    /// the single-account and legacy-root behaviour.
+    pub account_key_ref: Option<KeyRef>,
 }
 
 impl ExactPayloadBatchSignRequest {
@@ -2301,6 +2473,26 @@ impl CustodyPrepareMethod {
     }
 }
 
+/// Name each candidate child so an ambiguity error can be acted on: the public
+/// key fingerprint that selects it, and the derivation path that identifies it
+/// to a human. Ordering here is presentational only — it must never be used to
+/// choose a key.
+/// Name active derived accounts for actionable ambiguity errors: fingerprint
+/// plus derivation path, so the owner can pick one from the error itself.
+fn describe_accounts(candidates: &[&DerivedAccountPublic]) -> String {
+    candidates
+        .iter()
+        .map(|account| {
+            format!(
+                "{} ({})",
+                account.public_key_fingerprint.as_str(),
+                account.path
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 fn response_mismatch(method: &str) -> ProtocolError {
     ProtocolError::new(
         ProtocolErrorCode::MalformedFrame,
@@ -2331,8 +2523,8 @@ mod tests {
     };
 
     use bloom_broker_api::{
-        ApprovalPrepareState, CeremonyKind, CustodyPrepareState, DeclaredFee, KeySpec,
-        NormalizedSignature, RequestNonce, ServiceFuture, SignatureEncoding,
+        ApprovalPrepareState, CeremonyKind, CustodyPrepareState, DeclaredFee, DerivationRef,
+        KeySpec, NormalizedSignature, RequestNonce, ServiceFuture, SignatureEncoding,
     };
     use ed25519_dalek::SigningKey;
 
@@ -2433,8 +2625,48 @@ mod tests {
 
     struct MockBroker {
         wallet: WalletPublic,
+        accounts: WalletAccountsPublic,
         requests: Mutex<Vec<MachineBrokerRequest>>,
         corrupt_response: bool,
+    }
+
+    /// An empty account projection: the shape root-signing wallets (which
+    /// never query it) and pre-allocation BIP-39 flows see.
+    fn empty_accounts() -> WalletAccountsPublic {
+        WalletAccountsPublic {
+            wallet_id: token("wallet"),
+            seed_profile: bloom_broker_api::WalletSeedProfile::Bip39MulticurveV1,
+            accounts: vec![],
+        }
+    }
+
+    /// Build a `DerivedAccountPublic` for a child `KeyRef`, defaulting the
+    /// projection-only fields. `active` toggles the lifecycle state.
+    fn derived_account(key_ref: KeyRef, active: bool) -> DerivedAccountPublic {
+        let path = match &key_ref.derivation {
+            Some(DerivationRef::Bip39Multicurve { path, .. }) => path.clone(),
+            _ => "m/44'/60'/0'/0/0".to_owned(),
+        };
+        let public_key_fingerprint = key_ref.public_key_fingerprint.clone();
+        DerivedAccountPublic {
+            key_ref,
+            wallet_seed_profile: bloom_broker_api::WalletSeedProfile::Bip39MulticurveV1,
+            derivation_profile: bloom_broker_api::DerivationProfile::Bip44EvmSecp256k1V1,
+            path,
+            canonical_public_key: Base64UrlBytes::from_bytes(&[2; 33]),
+            public_key_encoding: bloom_broker_api::PublicKeyEncoding::Secp256k1SpkiDer,
+            public_key_fingerprint,
+            supported_crypto_suites: vec![
+                CryptoSuite::Secp256k1Keccak256Recoverable,
+                CryptoSuite::Secp256k1Sha256Recoverable,
+            ],
+            chain_projections: vec![],
+            lifecycle: if active {
+                bloom_broker_api::AccountLifecycleState::Active
+            } else {
+                bloom_broker_api::AccountLifecycleState::Retired
+            },
+        }
     }
 
     impl MachineBrokerService for MockBroker {
@@ -2448,6 +2680,34 @@ mod tests {
                     MachineBrokerRequest::WalletGetPublic(_) => {
                         Ok(MachineBrokerResponse::WalletGetPublic(self.wallet.clone()))
                     }
+                    MachineBrokerRequest::WalletAccounts(request) => {
+                        let mut accounts = self.accounts.clone();
+                        if self.corrupt_response {
+                            // A crossed collection for a different wallet.
+                            accounts.wallet_id = token("another-wallet");
+                        } else {
+                            accounts.wallet_id = request.wallet_id;
+                        }
+                        Ok(MachineBrokerResponse::WalletAccounts(accounts))
+                    }
+                    MachineBrokerRequest::AccountAllocatePrepare(request) => Ok(
+                        MachineBrokerResponse::AccountAllocatePrepare(CustodyPrepareResponse {
+                            ceremony_kind: if self.corrupt_response {
+                                CeremonyKind::WalletDelete
+                            } else {
+                                request.ceremony_kind
+                            },
+                            custody_operation_id: if self.corrupt_response {
+                                OperationId::from_bytes([98; 32])
+                            } else {
+                                request.custody_operation_id
+                            },
+                            state: CustodyPrepareState::AwaitingUser,
+                            ceremony_url: "http://localhost:18734/ceremony/allocate".into(),
+                            ceremony_expires_at_ms: DecimalU64::new(9_000),
+                            signer_contribution_digest: digest(76),
+                        }),
+                    ),
                     MachineBrokerRequest::KeyGetPublic(request) => {
                         let mut returned_key_ref = request.key_ref;
                         let supported_crypto_suites =
@@ -2463,7 +2723,9 @@ mod tests {
                             returned_key_ref.locator = "wallet/delegated/substituted".into();
                         }
                         Ok(MachineBrokerResponse::KeyGetPublic(KeyPublic {
-                            role: if returned_key_ref.locator.contains("delegated") {
+                            role: if returned_key_ref.locator.contains("delegated")
+                                || returned_key_ref.locator.contains("derived")
+                            {
                                 KeyRole::Derived
                             } else {
                                 KeyRole::WalletRoot
@@ -2698,12 +2960,13 @@ mod tests {
             wallet: WalletPublic {
                 wallet_id: token("wallet"),
                 wallet_kind: token("local"),
-                root_key_ref: key_ref.clone(),
+                root_key_ref: Some(key_ref.clone()),
                 key_refs: vec![key_ref.clone()],
                 policy_version: DecimalU64::new(7),
                 policy_digest: digest(7),
                 wallet_revocation_epoch: DecimalU64::new(2),
             },
+            accounts: empty_accounts(),
             requests: Mutex::new(Vec::new()),
             corrupt_response: false,
         });
@@ -2767,12 +3030,13 @@ mod tests {
             wallet: WalletPublic {
                 wallet_id: token("wallet"),
                 wallet_kind: token("local"),
-                root_key_ref: root_key_ref.clone(),
+                root_key_ref: Some(root_key_ref.clone()),
                 key_refs: vec![root_key_ref],
                 policy_version: DecimalU64::new(7),
                 policy_digest: digest(7),
                 wallet_revocation_epoch: DecimalU64::new(2),
             },
+            accounts: empty_accounts(),
             requests: Mutex::new(Vec::new()),
             corrupt_response: false,
         });
@@ -2928,6 +3192,7 @@ mod tests {
             approval_id,
             petal_use_claim: None,
             claim_assurance_evidence: None,
+            account_key_ref: None,
         }
     }
 
@@ -2959,6 +3224,7 @@ mod tests {
             approval_id,
             petal_use_claim: None,
             claim_assurance_evidence: None,
+            account_key_ref: None,
         }
     }
 
@@ -2971,12 +3237,13 @@ mod tests {
             wallet: WalletPublic {
                 wallet_id: token("wallet"),
                 wallet_kind: token("local"),
-                root_key_ref: root_key_ref.clone(),
+                root_key_ref: Some(root_key_ref.clone()),
                 key_refs: vec![derived_key_ref, root_key_ref.clone()],
                 policy_version: DecimalU64::new(7),
                 policy_digest: digest(7),
                 wallet_revocation_epoch: DecimalU64::new(2),
             },
+            accounts: empty_accounts(),
             requests: Mutex::new(Vec::new()),
             corrupt_response: false,
         });
@@ -3038,12 +3305,13 @@ mod tests {
             wallet: WalletPublic {
                 wallet_id: token("wallet"),
                 wallet_kind: token("local"),
-                root_key_ref: key_ref(),
+                root_key_ref: Some(key_ref()),
                 key_refs: vec![key_ref()],
                 policy_version: DecimalU64::new(7),
                 policy_digest: digest(7),
                 wallet_revocation_epoch: DecimalU64::new(2),
             },
+            accounts: empty_accounts(),
             requests: Mutex::new(Vec::new()),
             corrupt_response: false,
         });
@@ -3083,12 +3351,13 @@ mod tests {
             wallet: WalletPublic {
                 wallet_id: token("wallet"),
                 wallet_kind: token("local"),
-                root_key_ref: key_ref(),
+                root_key_ref: Some(key_ref()),
                 key_refs: vec![key_ref()],
                 policy_version: DecimalU64::new(7),
                 policy_digest: digest(7),
                 wallet_revocation_epoch: DecimalU64::new(2),
             },
+            accounts: empty_accounts(),
             requests: Mutex::new(Vec::new()),
             corrupt_response: false,
         });
@@ -3164,12 +3433,13 @@ mod tests {
             wallet: WalletPublic {
                 wallet_id: token("wallet"),
                 wallet_kind: token("local"),
-                root_key_ref: key_ref(),
+                root_key_ref: Some(key_ref()),
                 key_refs: vec![key_ref()],
                 policy_version: DecimalU64::new(1),
                 policy_digest: digest(1),
                 wallet_revocation_epoch: DecimalU64::new(0),
             },
+            accounts: empty_accounts(),
             requests: Mutex::new(Vec::new()),
             corrupt_response: false,
         });
@@ -3189,12 +3459,13 @@ mod tests {
             wallet: WalletPublic {
                 wallet_id: token("wallet"),
                 wallet_kind: token("local"),
-                root_key_ref: key_ref(),
+                root_key_ref: Some(key_ref()),
                 key_refs: vec![key_ref()],
                 policy_version: DecimalU64::new(1),
                 policy_digest: digest(1),
                 wallet_revocation_epoch: DecimalU64::new(0),
             },
+            accounts: empty_accounts(),
             requests: Mutex::new(Vec::new()),
             corrupt_response: false,
         });
@@ -3214,12 +3485,13 @@ mod tests {
             wallet: WalletPublic {
                 wallet_id: token("wallet"),
                 wallet_kind: token("local"),
-                root_key_ref: key_ref(),
+                root_key_ref: Some(key_ref()),
                 key_refs: vec![key_ref()],
                 policy_version: DecimalU64::new(1),
                 policy_digest: digest(1),
                 wallet_revocation_epoch: DecimalU64::new(0),
             },
+            accounts: empty_accounts(),
             requests: Mutex::new(Vec::new()),
             corrupt_response: false,
         });
@@ -3365,12 +3637,13 @@ mod tests {
             wallet: WalletPublic {
                 wallet_id: token("wallet"),
                 wallet_kind: token("local"),
-                root_key_ref: key_ref(),
+                root_key_ref: Some(key_ref()),
                 key_refs: vec![key_ref()],
                 policy_version: DecimalU64::new(1),
                 policy_digest: digest(1),
                 wallet_revocation_epoch: DecimalU64::new(0),
             },
+            accounts: empty_accounts(),
             requests: Mutex::new(Vec::new()),
             corrupt_response: false,
         });
@@ -3404,12 +3677,13 @@ mod tests {
             wallet: WalletPublic {
                 wallet_id: token("wallet"),
                 wallet_kind: token("local"),
-                root_key_ref: key_ref(),
+                root_key_ref: Some(key_ref()),
                 key_refs: vec![key_ref()],
                 policy_version: DecimalU64::new(1),
                 policy_digest: digest(1),
                 wallet_revocation_epoch: DecimalU64::new(0),
             },
+            accounts: empty_accounts(),
             requests: Mutex::new(Vec::new()),
             corrupt_response: false,
         });
@@ -3437,12 +3711,13 @@ mod tests {
             wallet: WalletPublic {
                 wallet_id: token("wallet"),
                 wallet_kind: token("local"),
-                root_key_ref: key_ref(),
+                root_key_ref: Some(key_ref()),
                 key_refs: vec![key_ref()],
                 policy_version: DecimalU64::new(1),
                 policy_digest: digest(1),
                 wallet_revocation_epoch: DecimalU64::new(0),
             },
+            accounts: empty_accounts(),
             requests: Mutex::new(Vec::new()),
             corrupt_response: true,
         });
@@ -3490,12 +3765,13 @@ mod tests {
             wallet: WalletPublic {
                 wallet_id: token("wallet"),
                 wallet_kind: token("local"),
-                root_key_ref: key_ref(),
+                root_key_ref: Some(key_ref()),
                 key_refs: vec![key_ref()],
                 policy_version: DecimalU64::new(2),
                 policy_digest: digest(82),
                 wallet_revocation_epoch: DecimalU64::new(1),
             },
+            accounts: empty_accounts(),
             requests: Mutex::new(Vec::new()),
             corrupt_response: true,
         });
@@ -3551,6 +3827,9 @@ mod tests {
             browser_output_recipient_key: None,
             petal_key_scope: None,
             legacy_passkey_migration: None,
+            wallet_seed_profile: None,
+            derivation_request: None,
+            account_terms: None,
         };
         assert_eq!(
             client
@@ -3605,12 +3884,13 @@ mod tests {
             wallet: WalletPublic {
                 wallet_id: token("wallet"),
                 wallet_kind: token("local"),
-                root_key_ref: key_ref(),
+                root_key_ref: Some(key_ref()),
                 key_refs: vec![key_ref()],
                 policy_version: DecimalU64::new(2),
                 policy_digest: digest(82),
                 wallet_revocation_epoch: DecimalU64::new(1),
             },
+            accounts: empty_accounts(),
             requests: Mutex::new(Vec::new()),
             corrupt_response: false,
         });
@@ -3886,5 +4166,351 @@ mod tests {
             public_key_fingerprint: digest(3),
             derivation: None,
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Explicit derived-account selection (Finding R1).
+    //
+    // A BIP-39 wallet has no signable root, so `root_key_ref` is None and the
+    // signable keys are its derived children. Two active children of the same
+    // key spec are exactly the ambiguity these cover.
+    // ------------------------------------------------------------------
+
+    fn derived_child(account: u32, fingerprint: u8) -> KeyRef {
+        KeyRef {
+            backend: token("local"),
+            backend_instance: token("primary"),
+            locator: format!("wallet/derived/{account}"),
+            key_spec: KeySpec::Secp256k1,
+            public_key_fingerprint: digest(fingerprint),
+            derivation: Some(DerivationRef::Bip39Multicurve {
+                wallet_seed_ref: token("seed"),
+                profile: bloom_broker_api::DerivationProfile::Bip44EvmSecp256k1V1,
+                path: format!("m/44'/60'/{account}'/0/0"),
+            }),
+        }
+    }
+
+    fn multi_account_broker(children: Vec<KeyRef>) -> Arc<MockBroker> {
+        multi_account_broker_with(children, Vec::new())
+    }
+
+    /// A BIP-39 wallet whose children are all active, except those whose
+    /// fingerprints appear in `retired`.
+    fn multi_account_broker_with(children: Vec<KeyRef>, retired: Vec<Digest32>) -> Arc<MockBroker> {
+        let accounts = children
+            .iter()
+            .map(|child| {
+                let active = !retired.contains(&child.public_key_fingerprint);
+                derived_account(child.clone(), active)
+            })
+            .collect();
+        Arc::new(MockBroker {
+            wallet: WalletPublic {
+                wallet_id: token("wallet"),
+                wallet_kind: token("local"),
+                // A BIP-39 seed root is not signable. The descriptor list
+                // still carries every child — including retired ones, which
+                // is exactly the projection lag the selector must not trust.
+                root_key_ref: None,
+                key_refs: children,
+                policy_version: DecimalU64::new(7),
+                policy_digest: digest(7),
+                wallet_revocation_epoch: DecimalU64::new(2),
+            },
+            accounts: WalletAccountsPublic {
+                wallet_id: token("wallet"),
+                seed_profile: bloom_broker_api::WalletSeedProfile::Bip39MulticurveV1,
+                accounts,
+            },
+            requests: Mutex::new(Vec::new()),
+            corrupt_response: false,
+        })
+    }
+
+    #[test]
+    fn candidate_description_names_every_fingerprint_and_path() {
+        let active = [
+            derived_account(derived_child(0, 0xa1), true),
+            derived_account(derived_child(1, 0xb2), true),
+        ];
+        let described = describe_accounts(&active.iter().collect::<Vec<_>>());
+        assert!(described.contains(digest(0xa1).as_str()));
+        assert!(described.contains(digest(0xb2).as_str()));
+        assert!(described.contains("m/44'/60'/0'/0/0"));
+        assert!(described.contains("m/44'/60'/1'/0/0"));
+    }
+
+    #[tokio::test]
+    async fn omitted_selector_with_two_active_children_fails_and_names_both() {
+        let broker = multi_account_broker(vec![derived_child(0, 0xa1), derived_child(1, 0xb2)]);
+        let client = MachineBrokerClient::new(broker.clone());
+        let error = client
+            .sign_exact_payload(exact_request(b"exact bytes".to_vec(), None))
+            .await
+            .expect_err("two compatible active children must not resolve implicitly");
+
+        assert_eq!(error.code, ProtocolErrorCode::KeyrefMismatch);
+        // Actionable: the caller can pick one from the error itself.
+        assert!(
+            error.message.contains(digest(0xa1).as_str()),
+            "{}",
+            error.message
+        );
+        assert!(
+            error.message.contains(digest(0xb2).as_str()),
+            "{}",
+            error.message
+        );
+        assert!(
+            error.message.contains("m/44'/60'/0'/0/0"),
+            "{}",
+            error.message
+        );
+        assert!(
+            error.message.contains("m/44'/60'/1'/0/0"),
+            "{}",
+            error.message
+        );
+    }
+
+    #[tokio::test]
+    async fn a_single_active_child_still_resolves_without_a_selector() {
+        let broker = multi_account_broker(vec![derived_child(0, 0xa1)]);
+        let client = MachineBrokerClient::new(broker.clone());
+        client
+            .sign_exact_payload(exact_request(b"exact bytes".to_vec(), None))
+            .await
+            .expect("one compatible child keeps the pre-selector behaviour");
+    }
+
+    #[tokio::test]
+    async fn each_selected_child_binds_its_own_key_and_never_the_other() {
+        for (account, fingerprint) in [(0_u32, 0xa1_u8), (1, 0xb2)] {
+            let children = vec![derived_child(0, 0xa1), derived_child(1, 0xb2)];
+            let selected = derived_child(account, fingerprint);
+            let broker = multi_account_broker(children);
+            let client = MachineBrokerClient::new(broker.clone());
+            let mut request = exact_request(b"exact bytes".to_vec(), None);
+            request.account_key_ref = Some(selected.clone());
+            client
+                .sign_exact_payload(request)
+                .await
+                .expect("an explicitly selected active child signs");
+
+            // The approval must be bound to the selected child, not to
+            // whichever child happened to be listed first.
+            let requests = broker.requests.lock().unwrap();
+            let bound: Vec<&KeyRef> = requests
+                .iter()
+                .filter_map(|request| match request {
+                    MachineBrokerRequest::SealedApprovalPrepare(prepare) => {
+                        Some(&prepare.terms.key_ref)
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert!(!bound.is_empty(), "the flow must prepare an approval");
+            for key_ref in bound {
+                assert_eq!(
+                    key_ref, &selected,
+                    "approval bound a key other than the selected account"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_foreign_selector_is_refused_and_names_the_real_children() {
+        let broker = multi_account_broker(vec![derived_child(0, 0xa1), derived_child(1, 0xb2)]);
+        let client = MachineBrokerClient::new(broker.clone());
+        let mut request = exact_request(b"exact bytes".to_vec(), None);
+        // Same shape, but not a child of this wallet.
+        request.account_key_ref = Some(derived_child(9, 0xc3));
+        let error = client
+            .sign_exact_payload(request)
+            .await
+            .expect_err("a key outside the wallet must never be selectable");
+
+        assert_eq!(error.code, ProtocolErrorCode::KeyrefMismatch);
+        assert!(
+            error.message.contains(digest(0xa1).as_str()),
+            "{}",
+            error.message
+        );
+        assert!(
+            error.message.contains(digest(0xb2).as_str()),
+            "{}",
+            error.message
+        );
+        assert_eq!(
+            broker.requests.lock().unwrap().len(),
+            2,
+            "a foreign account must be rejected after the wallet and account projections, \
+             before Broker is asked for key metadata"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_selector_naming_the_root_itself_is_refused_on_a_root_signing_wallet() {
+        let root = key_ref();
+        let broker = Arc::new(MockBroker {
+            wallet: WalletPublic {
+                wallet_id: token("wallet"),
+                wallet_kind: token("local"),
+                root_key_ref: Some(root.clone()),
+                key_refs: vec![root.clone()],
+                policy_version: DecimalU64::new(7),
+                policy_digest: digest(7),
+                wallet_revocation_epoch: DecimalU64::new(2),
+            },
+            accounts: empty_accounts(),
+            requests: Mutex::new(Vec::new()),
+            corrupt_response: false,
+        });
+        let client = MachineBrokerClient::new(broker);
+        let mut request = exact_request(b"exact bytes".to_vec(), None);
+        // Equal to the root, not merely a foreign key: the rule is that a
+        // root-signing wallet has no account-selector surface at all, so a
+        // caller routing selectors here must fail closed, not be silently
+        // tolerated because the selector happened to match.
+        request.account_key_ref = Some(root);
+        let error = client
+            .sign_exact_payload(request)
+            .await
+            .expect_err("the exact root KeyRef is still an account selector");
+        assert_eq!(error.code, ProtocolErrorCode::KeyrefMismatch);
+        assert!(
+            error.message.contains("no derived account may be selected"),
+            "{}",
+            error.message
+        );
+    }
+
+    #[tokio::test]
+    async fn a_retired_child_is_never_a_signing_candidate() {
+        let children = vec![derived_child(0, 0xa1), derived_child(1, 0xb2)];
+
+        // One retired child leaves exactly one active candidate, so an
+        // omitted selector now resolves instead of reporting ambiguity —
+        // the retirement, not list order, defines candidacy.
+        let broker = multi_account_broker_with(children.clone(), vec![digest(0xb2)]);
+        let client = MachineBrokerClient::new(broker.clone());
+        client
+            .sign_exact_payload(exact_request(b"exact bytes".to_vec(), None))
+            .await
+            .expect("the single active child resolves implicitly");
+        let bound: Vec<KeyRef> = {
+            let requests = broker.requests.lock().unwrap();
+            requests
+                .iter()
+                .filter_map(|request| match request {
+                    MachineBrokerRequest::SealedApprovalPrepare(prepare) => {
+                        Some(prepare.terms.key_ref.clone())
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+        assert!(!bound.is_empty());
+        for key_ref in &bound {
+            assert_eq!(key_ref.public_key_fingerprint, digest(0xa1));
+        }
+
+        // Explicitly selecting the retired child fails closed with the
+        // precise reason, even though it still appears in the wallet's
+        // descriptor list.
+        let broker = multi_account_broker_with(children.clone(), vec![digest(0xb2)]);
+        let client = MachineBrokerClient::new(broker);
+        let mut request = exact_request(b"exact bytes".to_vec(), None);
+        request.account_key_ref = Some(derived_child(1, 0xb2));
+        let error = client
+            .sign_exact_payload(request)
+            .await
+            .expect_err("a retired child must not sign");
+        assert_eq!(error.code, ProtocolErrorCode::KeyrefMismatch);
+        assert!(error.message.contains("retired"), "{}", error.message);
+
+        // Retiring every child removes signability entirely rather than
+        // falling back to a retired key.
+        let broker = multi_account_broker_with(children, vec![digest(0xa1), digest(0xb2)]);
+        let client = MachineBrokerClient::new(broker);
+        let error = client
+            .sign_exact_payload(exact_request(b"exact bytes".to_vec(), None))
+            .await
+            .expect_err("no active child means no signable key");
+        assert_eq!(error.code, ProtocolErrorCode::KeyrefMismatch);
+        assert!(
+            error.message.contains("no active derived child"),
+            "{}",
+            error.message
+        );
+    }
+
+    #[tokio::test]
+    async fn a_crossed_accounts_collection_is_refused() {
+        let children = vec![derived_child(0, 0xa1)];
+        let mut broker = multi_account_broker(children);
+        Arc::get_mut(&mut broker).unwrap().corrupt_response = true;
+        let client = MachineBrokerClient::new(broker);
+        let error = client
+            .wallet_accounts(token("wallet"))
+            .await
+            .expect_err("a collection for another wallet must not be accepted");
+        assert_eq!(error.code, ProtocolErrorCode::OperationIdConflict);
+    }
+
+    #[tokio::test]
+    async fn a_crossed_account_allocate_response_is_refused() {
+        let children = vec![derived_child(0, 0xa1)];
+        let mut broker = multi_account_broker(children);
+        Arc::get_mut(&mut broker).unwrap().corrupt_response = true;
+        let client = MachineBrokerClient::new(broker);
+        let request = CustodyPrepareRequest {
+            ceremony_kind: CeremonyKind::AccountAllocate,
+            custody_operation_id: OperationId::from_bytes([77; 32]),
+            wallet_id: Some(token("wallet")),
+            key_ref: None,
+            exact_terms_digest: digest(78),
+            expected_input_class: token("generic-custody-v1"),
+            browser_output_recipient_key: None,
+            petal_key_scope: None,
+            legacy_passkey_migration: None,
+            wallet_seed_profile: None,
+            derivation_request: None,
+            account_terms: None,
+        };
+        let error = client
+            .account_allocate(request)
+            .await
+            .expect_err("a response for a different operation must not be accepted");
+        assert_eq!(error.code, ProtocolErrorCode::OperationIdConflict);
+    }
+
+    #[tokio::test]
+    async fn a_selector_is_refused_on_a_wallet_that_signs_with_its_root() {
+        let root = key_ref();
+        let broker = Arc::new(MockBroker {
+            wallet: WalletPublic {
+                wallet_id: token("wallet"),
+                wallet_kind: token("local"),
+                root_key_ref: Some(root.clone()),
+                key_refs: vec![root],
+                policy_version: DecimalU64::new(7),
+                policy_digest: digest(7),
+                wallet_revocation_epoch: DecimalU64::new(2),
+            },
+            accounts: empty_accounts(),
+            requests: Mutex::new(Vec::new()),
+            corrupt_response: false,
+        });
+        let client = MachineBrokerClient::new(broker);
+        let mut request = exact_request(b"exact bytes".to_vec(), None);
+        request.account_key_ref = Some(derived_child(0, 0xa1));
+        let error = client
+            .sign_exact_payload(request)
+            .await
+            .expect_err("a root-signing wallet has no derived account to select");
+        assert_eq!(error.code, ProtocolErrorCode::KeyrefMismatch);
     }
 }

@@ -80,7 +80,7 @@ mod tests {
             wallet: WalletPublic {
                 wallet_id: wallet_id.clone(),
                 wallet_kind: Token::new("passkey").unwrap(),
-                root_key_ref: root_key_ref.clone(),
+                root_key_ref: Some(root_key_ref.clone()),
                 key_refs: vec![root_key_ref.clone()],
                 policy_version: DecimalU64::new(1),
                 policy_digest: Digest32::from_bytes(sha2::Sha256::digest(&canonical).into()),
