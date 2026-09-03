@@ -1674,11 +1674,41 @@ fn linux_installer_authenticates_payload_before_mutating_existing_files() {
     let pinned_key = directory.path().join("pinned-release-key.pub");
     generate_ed25519_key(&private_key);
     write_ed25519_public_key(&private_key, &pinned_key);
+    fs::remove_file(payload.join("credentials/aws-credentials")).unwrap();
+    fs::remove_file(payload.join("config/aws-kms-ip-allow.conf")).unwrap();
     authenticate_installer_payload(&payload, &private_key);
 
     let installed_binary = root.join("usr/libexec/bloom/bloom-broker");
     fs::create_dir_all(installed_binary.parent().unwrap()).unwrap();
     fs::write(&installed_binary, b"existing-install").unwrap();
+    fs::write(
+        payload.join("credentials/aws-credentials"),
+        b"[default]\naws_access_key_id=unsigned\n",
+    )
+    .unwrap();
+    fs::write(
+        payload.join("config/aws-kms-ip-allow.conf"),
+        b"IPAddressAllow=192.0.2.0/24\n",
+    )
+    .unwrap();
+    let unsigned_overlay = Command::new(release_script("install-linux.sh"))
+        .args(["install"])
+        .arg(&root)
+        .args(["1000", "alice"])
+        .arg(&payload)
+        .env("BLOOM_ALLOW_TEST_UNCLAIMED", "true")
+        .env("BLOOM_TEST_VERIFY_RELEASE_PAYLOAD", "true")
+        .env("BLOOM_RELEASE_PUBLIC_KEY", &pinned_key)
+        .output()
+        .unwrap();
+    assert!(!unsigned_overlay.status.success());
+    assert!(
+        String::from_utf8_lossy(&unsigned_overlay.stderr)
+            .contains("optional signer overlay is not authenticated")
+    );
+    assert_eq!(fs::read(&installed_binary).unwrap(), b"existing-install");
+
+    authenticate_installer_payload(&payload, &private_key);
     fs::write(payload.join("bin/bloom-broker"), b"tampered").unwrap();
     let installer = release_script("install-linux.sh");
     let tampered = Command::new(&installer)

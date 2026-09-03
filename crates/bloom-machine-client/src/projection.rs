@@ -177,10 +177,11 @@ impl FileProjectionStore {
         &self,
         observed: BTreeMap<String, WalletProjection>,
         completed_migrations: BTreeMap<String, WalletProjection>,
+        terminal_migrations: BTreeSet<String>,
         _refresh_lock: &ProjectionRefreshLock,
     ) -> Result<ProjectionCache, ProtocolError> {
         let mut cache = self.load()?;
-        cache.apply_live_refresh(observed, completed_migrations)?;
+        cache.apply_live_refresh(observed, completed_migrations, terminal_migrations)?;
         self.save_unlocked(&cache)?;
         Ok(cache)
     }
@@ -322,15 +323,51 @@ impl CachedWalletProjectionReader {
                 unavailable(format!("join Machine projection lock task: {error}"))
             })??;
         let baseline = self.store.load()?;
-        let observed = Self::observe_wallets(broker).await?;
+        let mut observed = Self::observe_wallets(broker).await?;
         let mut completed_migrations = BTreeMap::new();
+        let mut terminal_migrations = BTreeSet::new();
         for (operation_id, pending) in &baseline.pending_legacy_migrations {
-            let Some(candidate) = observed.get(&pending.wallet_id) else {
-                continue;
-            };
             let operation_id = OperationId::new(operation_id.clone()).map_err(|error| {
                 unavailable(format!("invalid pending migration operation: {error}"))
             })?;
+            let status = match broker.ceremony_status(operation_id.clone()).await {
+                Ok(status) => status,
+                Err(error) if error.code == ProtocolErrorCode::ApprovalNotFound => {
+                    terminal_migrations.insert(operation_id.as_str().to_owned());
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            if status.operation_id != operation_id
+                || status.ceremony_kind != CeremonyKind::WalletImport
+            {
+                return Err(invalid_projection(
+                    "pending migration ceremony status changed its binding",
+                ));
+            }
+            match status.state {
+                CeremonyState::Succeeded => {}
+                CeremonyState::Cancelled | CeremonyState::Expired | CeremonyState::Failed => {
+                    terminal_migrations.insert(operation_id.as_str().to_owned());
+                    continue;
+                }
+                _ => {
+                    if observed.contains_key(&pending.wallet_id) {
+                        match baseline.wallets.get(&pending.wallet_id) {
+                            Some(CachedWallet::Live(projection)) => {
+                                observed.insert(pending.wallet_id.clone(), projection.clone());
+                            }
+                            _ => {
+                                observed.remove(&pending.wallet_id);
+                            }
+                        }
+                    }
+                    continue;
+                }
+            }
+            let Some(candidate) = observed.get(&pending.wallet_id) else {
+                continue;
+            };
             let result = broker
                 .custody_result(OperationRequest {
                     operation_id: operation_id.clone(),
@@ -344,9 +381,12 @@ impl CachedWalletProjectionReader {
             )?;
             completed_migrations.insert(operation_id.as_str().to_owned(), candidate.clone());
         }
-        let updated =
-            self.store
-                .replace_after_live_refresh(observed, completed_migrations, &refresh_lock)?;
+        let updated = self.store.replace_after_live_refresh(
+            observed,
+            completed_migrations,
+            terminal_migrations,
+            &refresh_lock,
+        )?;
         let projections = updated.live(false);
         *self
             .cache
@@ -513,7 +553,11 @@ impl ProjectionCache {
         &mut self,
         observed: BTreeMap<String, WalletProjection>,
         completed_migrations: BTreeMap<String, WalletProjection>,
+        terminal_migrations: BTreeSet<String>,
     ) -> Result<(), ProtocolError> {
+        for operation_id in terminal_migrations {
+            self.pending_legacy_migrations.remove(&operation_id);
+        }
         let mut authorized_wallets = BTreeSet::new();
         for (operation_id, candidate) in completed_migrations {
             let pending = self
@@ -966,9 +1010,9 @@ mod tests {
     use std::sync::Mutex;
 
     use bloom_broker_api::{
-        Base64UrlBytes, CredentialSummary, CryptoSuite, CustodyResult, DecimalU64, KeyRef, KeySpec,
-        MachineBrokerRequest, MachineBrokerResponse, MachineBrokerService, ServiceFuture,
-        WalletRequest,
+        Base64UrlBytes, CeremonyPublicStatus, CredentialSummary, CryptoSuite, CustodyResult,
+        DecimalU64, KeyRef, KeySpec, MachineBrokerRequest, MachineBrokerResponse,
+        MachineBrokerService, ServiceFuture, WalletRequest,
     };
 
     use super::*;
@@ -985,6 +1029,7 @@ mod tests {
         available: Mutex<bool>,
         wallets: Mutex<BTreeMap<String, ProjectionFixture>>,
         custody_results: Mutex<BTreeMap<String, CustodyResult>>,
+        ceremony_states: Mutex<BTreeMap<String, CeremonyState>>,
     }
 
     struct BlockingEmptyBroker {
@@ -1019,6 +1064,7 @@ mod tests {
                     fixture,
                 )])),
                 custody_results: Mutex::new(BTreeMap::new()),
+                ceremony_states: Mutex::new(BTreeMap::new()),
             }
         }
 
@@ -1071,6 +1117,34 @@ mod tests {
                         .cloned()
                         .map(MachineBrokerResponse::CustodyResult)
                         .ok_or_else(|| invalid_projection("unknown fake custody result")),
+                    MachineBrokerRequest::CeremonyStatus(request) => {
+                        let operation_id = OperationId::new(request.id.as_str().to_owned())?;
+                        let state = self
+                            .ceremony_states
+                            .lock()
+                            .unwrap()
+                            .get(operation_id.as_str())
+                            .copied()
+                            .or_else(|| {
+                                self.custody_results
+                                    .lock()
+                                    .unwrap()
+                                    .contains_key(operation_id.as_str())
+                                    .then_some(CeremonyState::Succeeded)
+                            })
+                            .unwrap_or(CeremonyState::AwaitingUser);
+                        Ok(MachineBrokerResponse::CeremonyStatus(
+                            CeremonyPublicStatus {
+                                ceremony_id: Digest32::from_bytes([12; 32]),
+                                ceremony_kind: CeremonyKind::WalletImport,
+                                operation_id,
+                                state,
+                                expires_at_ms: DecimalU64::new(u64::MAX),
+                                ceremony_url: None,
+                                receipt_digest: None,
+                            },
+                        ))
+                    }
                     _ => Err(invalid_projection("unexpected fake Broker method")),
                 }
             })
@@ -1336,6 +1410,58 @@ mod tests {
         let rollback = restarted.list_wallets().await.unwrap_err();
         assert_eq!(rollback.code, ProtocolErrorCode::PolicyBaselineStale);
         assert!(rollback.message.contains("pinned policy key"));
+    }
+
+    #[tokio::test]
+    async fn pending_migration_is_hidden_until_success_and_terminal_failure_is_cleared() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = FileProjectionStore::new(directory.path().join("wallets.json"));
+        let broker = Arc::new(FakeBroker::new(fixture(5)));
+        let reader = CachedWalletProjectionReader::new(
+            Some(MachineBrokerClient::new(broker.clone())),
+            store,
+        )
+        .unwrap();
+        reader.list_wallets().await.unwrap();
+
+        let operation_id = OperationId::from_bytes([16; 32]);
+        reader
+            .begin_legacy_migration(
+                &operation_id,
+                &token("alice"),
+                &Digest32::from_bytes([17; 32]),
+            )
+            .await
+            .unwrap();
+        broker
+            .wallets
+            .lock()
+            .unwrap()
+            .insert("alice".into(), migrated_fixture());
+        assert_eq!(
+            reader.list_wallets().await.unwrap()[0].policy.version.get(),
+            5
+        );
+
+        broker
+            .ceremony_states
+            .lock()
+            .unwrap()
+            .insert(operation_id.as_str().to_owned(), CeremonyState::Cancelled);
+        broker
+            .wallets
+            .lock()
+            .unwrap()
+            .insert("alice".into(), fixture(5));
+        reader.list_wallets().await.unwrap();
+        reader
+            .begin_legacy_migration(
+                &OperationId::from_bytes([18; 32]),
+                &token("alice"),
+                &Digest32::from_bytes([19; 32]),
+            )
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

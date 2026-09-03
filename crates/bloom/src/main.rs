@@ -597,11 +597,11 @@ async fn launch_custody_ceremony(
         }
     };
     let (operation_id, exact_terms_digest, legacy_passkey_migration) =
-        if let Some(migration) = legacy_migration {
+        if let Some(migration) = &legacy_migration {
             (
-                migration.operation_id,
-                migration.exact_terms_digest,
-                Some(migration.public_terms),
+                migration.operation_id.clone(),
+                migration.exact_terms_digest.clone(),
+                Some(migration.public_terms.clone()),
             )
         } else {
             let mut operation_bytes = [0_u8; 32];
@@ -621,6 +621,18 @@ async fn launch_custody_ceremony(
                 None,
             )
         };
+    if let Some(migration) = &legacy_migration {
+        daemon
+            .wallet_projections
+            .begin_legacy_migration(
+                &migration.operation_id,
+                &migration.public_terms.wallet_name,
+                &migration.exact_terms_digest,
+            )
+            .await
+            .map_err(anyhow::Error::new)
+            .context("record pending legacy migration")?;
+    }
     let response = client
         .prepare_custody(
             method,
@@ -1233,32 +1245,16 @@ async fn execute_machine_command(
             let receipt: LegacyMigrationReceiptFile =
                 serde_json::from_value(serde_json::to_value(receipt)?)?;
             let (name, migration) = receipt.into_launch()?;
-            let output = launch_custody_ceremony(
+            launch_custody_ceremony(
                 daemon,
                 &name,
                 bloom_machine_client::CustodyPrepareMethod::WalletImport,
                 bloom_broker_api::CeremonyKind::WalletImport,
                 None,
                 "legacy_passkey_v1_prf",
-                Some(migration.clone()),
+                Some(migration),
             )
-            .await?;
-            let local_result = daemon
-                .wallet_projections
-                .begin_legacy_migration(
-                    &migration.operation_id,
-                    &migration.public_terms.wallet_name,
-                    &migration.exact_terms_digest,
-                )
-                .await
-                .map_err(anyhow::Error::new)
-                .context("record pending legacy migration")
-                .map(|()| output);
-            finish_remote_preparation(
-                "credential_migration",
-                Some(migration.operation_id.as_str()),
-                local_result,
-            )?
+            .await?
         }
         MachineCommand::WalletPolicyPrepare {
             name,

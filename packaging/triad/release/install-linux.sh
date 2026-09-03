@@ -427,6 +427,13 @@ verify_sha256_manifest() {
   fi
 }
 
+manifest_authenticates_path() {
+  awk -v wanted="$2" '
+    $2 == wanted || $2 == "*" wanted { found = 1 }
+    END { exit !found }
+  ' "$1"
+}
+
 verify_release_payload() {
   payload_to_verify="$1"
   expected_pin_uid="$2"
@@ -498,6 +505,7 @@ case "$action" in
       echo "Linux installation requires root" >&2
       exit 77
     fi
+    payload_authenticated=false
     if [[ "$root" == "/" ]]; then
       payload_scratch="$(mktemp -d /var/tmp/bloom-linux-payload.XXXXXX)"
       chmod 0700 "$payload_scratch"
@@ -511,10 +519,12 @@ case "$action" in
       chown -R 0:0 "$payload_scratch"
       payload="$payload_scratch"
       verify_release_payload "$payload" 0
+      payload_authenticated=true
     elif [[ "${BLOOM_TEST_VERIFY_RELEASE_PAYLOAD:-}" == "true" ]]; then
       pin_owner_uid=0
       pin_owner_uid="$(id -u)"
       verify_release_payload "$payload" "$pin_owner_uid"
+      payload_authenticated=true
     fi
     platform_claim="$(<"$payload/PLATFORM_CLAIM")"
     if [[ "$platform_claim" != "linux" ]] &&
@@ -582,6 +592,20 @@ case "$action" in
         exit 66
       }
     done
+    if $payload_authenticated &&
+      [[ -e "$payload/credentials/aws-credentials" || \
+        -e "$payload/config/aws-kms-ip-allow.conf" ]]
+    then
+      for overlay_path in \
+        ./credentials/aws-credentials \
+        ./config/aws-kms-ip-allow.conf
+      do
+        manifest_authenticates_path "$payload/SHA256SUMS" "$overlay_path" || {
+          echo "optional signer overlay is not authenticated: $overlay_path" >&2
+          exit 65
+        }
+      done
+    fi
     release_digest="$(sha256_digest "$payload/SHA256SUMS")"
     [[ "$release_digest" =~ ^[0-9a-f]{64}$ ]] || {
       echo "signed payload release digest is invalid" >&2

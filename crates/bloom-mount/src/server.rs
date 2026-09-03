@@ -56,7 +56,14 @@ fn unmount_args(path: &Path) -> Vec<String> {
 
 fn unmount_attempts(path: &Path, from_fstab: bool) -> Vec<CommandAttempt> {
     if from_fstab {
-        return vec![("umount".to_string(), vec![path.display().to_string()])];
+        let target = path.display().to_string();
+        #[cfg(target_os = "linux")]
+        return vec![
+            ("umount".to_string(), vec![target.clone()]),
+            ("umount".to_string(), vec!["-l".to_string(), target]),
+        ];
+        #[cfg(not(target_os = "linux"))]
+        return vec![("umount".to_string(), vec![target])];
     }
     let args = unmount_args(path);
     #[cfg(target_os = "linux")]
@@ -697,9 +704,19 @@ mod tests {
     fn fstab_unmount_uses_only_the_authorized_target() {
         let attempts = unmount_attempts(Path::new("/home/alice/bloom"), true);
         assert_eq!(
-            attempts,
-            vec![("umount".to_string(), vec!["/home/alice/bloom".to_string()])]
+            attempts[0],
+            ("umount".to_string(), vec!["/home/alice/bloom".to_string()])
         );
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            attempts[1],
+            (
+                "umount".to_string(),
+                vec!["-l".to_string(), "/home/alice/bloom".to_string()],
+            )
+        );
+        #[cfg(not(target_os = "linux"))]
+        assert_eq!(attempts.len(), 1);
     }
 
     #[test]
