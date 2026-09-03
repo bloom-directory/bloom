@@ -285,7 +285,6 @@ fn macos_installer_has_a_forward_only_custody_preserving_lifecycle() {
         assert!(source.contains(required), "lifecycle is missing {required}");
     }
     assert!(!source.contains("rollback_upgrade"));
-    assert!(!source.contains("triad-health-check"));
 }
 
 #[test]
@@ -327,13 +326,16 @@ fn macos_permanent_uninstall_is_explicit_and_small() {
 #[test]
 fn activating_enrollment_is_accepted_during_forward_convergence() {
     let machine = fs::read_to_string(workspace().join("crates/bloom/src/main.rs")).unwrap();
-    let ipc = fs::read_to_string(workspace().join("crates/bloom-daemon/src/ipc.rs")).unwrap();
-    assert!(machine.contains("allow_activating"));
+    assert!(machine.contains("ActivationHealthMachineCommands"));
+    assert!(machine.contains("activation_health_only"));
+    let health_only = machine.find("if activation_health_only").unwrap();
+    let full_daemon = machine.rfind("build_write_daemon(home.clone())").unwrap();
+    assert!(health_only < full_daemon);
+    assert!(machine.contains("IpcServer::new(bloom_vfs::Vfs::new()"));
     assert!(machine.contains("installed Bloom enrollment is not active"));
     assert!(machine.contains("installed_macos_triad_paths_with_activation(true)"));
     assert!(machine.contains("MachineCommand::TriadHealth { expected_build }"));
-    assert!(machine.contains("daemon.machine_broker.as_ref()"));
-    assert!(ipc.contains("TriadHealth"));
+    assert!(machine.contains("activation health endpoint only accepts triad health checks"));
     for forbidden in [
         "open_configured_machine_audit_with_activation",
         "configured_machine_checkpoint_path_with_activation",
@@ -350,11 +352,11 @@ fn activating_enrollment_is_accepted_during_forward_convergence() {
     assert!(sentinel.contains("Some(\"activating\" | \"active\")"));
     let installer =
         fs::read_to_string(workspace().join("packaging/triad/release/install-macos.sh")).unwrap();
-    let publish = installer.rfind("write_enrollment active").unwrap();
-    let reload = installer.rfind("reload_current_enrollment").unwrap();
-    assert!(publish < reload);
+    assert!(installer.contains("activate_current_enrollment"));
+    assert!(installer.contains("activate_installed_set"));
+    assert!(installer.contains("write_enrollment active"));
+    assert!(installer.contains("reload_launchagent_job \"$login_uid\" com.bloom.machine"));
     assert!(installer.contains("launchctl kickstart -k"));
-    assert!(!installer.contains("triad-health-check"));
 }
 
 #[test]

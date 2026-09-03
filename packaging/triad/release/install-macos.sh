@@ -608,6 +608,16 @@ reload_current_enrollment() {
   reload_launchagent_job "$login_uid" com.bloom.machine "$machine_plist"
   require_triad_health "$login_uid" "$login_user" "$BLOOM_RELEASE_DIGEST"
 }
+activate_current_enrollment() {
+  write_enrollment active
+  if reload_launchagent_job "$login_uid" com.bloom.machine "$machine_plist" &&
+    require_triad_health "$login_uid" "$login_user" "$BLOOM_RELEASE_DIGEST"; then
+    return 0
+  fi
+  write_enrollment activating
+  stop_launchd_job "user/$login_uid/com.bloom.machine"
+  return 1
+}
 
 stop_all_enrollments() {
   $live || return 0
@@ -669,6 +679,22 @@ reload_installed_set() {
   done
 }
 
+activate_installed_set() {
+  local record uid user digest; $live || return 0
+  for record in "$enrollments"/*.json; do
+    [[ -f "$record" && ! -L "$record" ]] || continue
+    uid="${record##*/}"; uid="${uid%.json}"; user="$(field "$record" login_user)"; digest="$(field "$record" release_digest)"
+    login_uid="$uid"; login_user="$user"; enrollment="$record"; BLOOM_RELEASE_DIGEST="$digest"; load_names; paths; load_ids
+    write_enrollment active
+    if ! reload_launchagent_job "$uid" com.bloom.machine "$machine_plist" ||
+      ! require_triad_health "$uid" "$user" "$digest"; then
+      write_enrollment activating
+      stop_launchd_job "user/$uid/com.bloom.machine"
+      return 1
+    fi
+  done
+}
+
 find_interrupted_upgrade() {
   local recorded_old recorded_new
   upgrade_transaction="$product/upgrade-transaction"
@@ -695,15 +721,14 @@ upgrade_release() {
   stop_all_enrollments
   rewrite_all_enrollments "$new" activating
   switch_release "$new"
-  if ! reload_installed_set; then
+  if ! reload_installed_set || ! activate_installed_set; then
     echo "new Bloom release failed authenticated activation; restoring $old" >&2; stop_all_enrollments || true
     rewrite_all_enrollments "$old" activating; switch_release "$old"
-    if reload_installed_set; then rewrite_all_enrollments "$old" active; rm -rf -- "$upgrade_transaction"; upgrade_transaction=""
+    if reload_installed_set && activate_installed_set; then rm -rf -- "$upgrade_transaction"; upgrade_transaction=""
       echo "previous Bloom release restored after failed activation" >&2
     else echo "automatic restoration of the previous Bloom release failed" >&2; fi
     return 1
   fi
-  rewrite_all_enrollments "$new" active
   write_state_schema
   rm -rf -- "$upgrade_transaction"; upgrade_transaction=""
 }
@@ -756,7 +781,8 @@ case "$action" in
     switch_release "$BLOOM_RELEASE_DIGEST"; install_config; write_enrollment activating; install_assets
     if $live; then
       secure_ownership; pf_reference add; reload_current_enrollment || { $fresh && rollback_failed_fresh; die "Bloom failed authenticated activation"; }
-      write_enrollment active; created_users=""; created_groups=""
+      activate_current_enrollment || { $fresh && rollback_failed_fresh; die "Bloom failed full activation"; }
+      created_users=""; created_groups=""
     fi
     write_state_schema
     if $restoring; then rm -f "$retained"; restore_pending=false; echo "Bloom macOS retained custody restored"; else echo "Bloom macOS enrollment installed or repaired"; fi

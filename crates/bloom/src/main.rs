@@ -249,6 +249,7 @@ fn configured_broker_connection(
 
 #[derive(Clone)]
 struct InstalledMacosTriadPaths {
+    enrollment_state: String,
     broker_socket: PathBuf,
     machine_identity: PathBuf,
     edge_manifest: PathBuf,
@@ -333,6 +334,7 @@ fn installed_macos_triad_paths_with_activation(
             "/Library/Application Support/BloomTriad/config/{uid}"
         ));
         Ok(Some(InstalledMacosTriadPaths {
+            enrollment_state: state.to_owned(),
             broker_socket: PathBuf::from(format!(
                 "/private/var/run/bloom/{uid}/machine-broker/broker.sock"
             )),
@@ -414,6 +416,7 @@ mod broker_startup_failure_tests {
         )
         .expect("status parent metadata");
         InstalledMacosTriadPaths {
+            enrollment_state: "active".to_owned(),
             broker_socket: PathBuf::new(),
             machine_identity: PathBuf::new(),
             edge_manifest: PathBuf::new(),
@@ -755,6 +758,72 @@ struct LegacyMigrationLaunch {
 struct DaemonMachineCommands {
     home: HomeDir,
     daemon: Daemon,
+}
+
+#[derive(Clone)]
+struct ActivationHealthMachineCommands {
+    broker: bloom_machine_client::MachineBrokerClient,
+}
+
+impl MachineCommandService for ActivationHealthMachineCommands {
+    fn execute(&self, command: MachineCommand) -> MachineCommandFuture<'_> {
+        Box::pin(async move {
+            let MachineCommand::TriadHealth { expected_build } = command else {
+                return Err(machine_error(
+                    MachineErrorKind::PermissionDenied,
+                    "activation health endpoint only accepts triad health checks",
+                ));
+            };
+            installed_triad_health_check(&self.broker, &expected_build)
+                .await
+                .map_err(machine_error_from_anyhow)?;
+            Ok(MachineCommandOutput {
+                stdout: String::new(),
+                stderr: String::new(),
+                exit_code: 0,
+            })
+        })
+    }
+}
+
+fn activation_health_only() -> Result<bool> {
+    if std::env::var_os("BLOOM_ACTIVATION_HEALTH_ONLY").as_deref()
+        != Some(std::ffi::OsStr::new("1"))
+    {
+        return Ok(false);
+    }
+    Ok(installed_macos_triad_paths_with_activation(true)?
+        .is_some_and(|installed| installed.enrollment_state == "activating"))
+}
+
+async fn serve_activation_health(home: &HomeDir, endpoint: Option<&str>) -> Result<()> {
+    let endpoint = resolve_server_endpoint(home, endpoint).context("resolve serve endpoint")?;
+    let socket = endpoint.socket;
+    let server = IpcServer::new(bloom_vfs::Vfs::new(), env!("CARGO_PKG_VERSION"), vec![])
+        .with_machine_commands(Arc::new(ActivationHealthMachineCommands {
+            broker: configured_raw_broker_client_with_activation(true)?,
+        }))
+        .activation_health_only()
+        .with_ready_callback(Arc::new(emit_machine_ready));
+    let shutdown_server = server.clone();
+    let shutdown = tokio::spawn(async move {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{SignalKind, signal};
+            let mut sigterm =
+                signal(SignalKind::terminate()).expect("SIGTERM handler registration failed");
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {},
+                _ = sigterm.recv() => {},
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = tokio::signal::ctrl_c().await;
+        shutdown_server.trigger_shutdown();
+    });
+    let result = server.serve(&socket).await.context("ipc serve");
+    shutdown.abort();
+    result
 }
 
 impl MachineCommandService for DaemonMachineCommands {
@@ -3449,6 +3518,9 @@ async fn run(cli: Cli) -> Result<()> {
             if !structured_service_output() {
                 eprintln!("{ALPHA_DISCLOSURE}");
             }
+            if activation_health_only()? {
+                return serve_activation_health(&home, endpoint.as_deref()).await;
+            }
             if mount_home {
                 let login_home = home
                     .root()
@@ -5165,8 +5237,8 @@ mod tests {
         let daemon_edge = concat!("daemon.machine_", "broker.as_ref()");
         assert_eq!(
             source.matches(raw_connector).count(),
-            2,
-            "the raw authority edge may only be defined and passed into daemon construction"
+            3,
+            "the raw authority edge may only be defined, passed into daemon construction, and used by activation health"
         );
         assert!(
             !source.contains(journal_attachment),

@@ -723,6 +723,7 @@ pub struct IpcServer {
     petal_mutation: Arc<tokio::sync::Mutex<()>>,
     batch_confirmation: Option<Arc<dyn BatchConfirmationService>>,
     machine_commands: Option<Arc<dyn MachineCommandService>>,
+    activation_health_only: bool,
     ready: Option<Arc<dyn Fn() + Send + Sync>>,
     shutdown: Arc<Notify>,
 }
@@ -739,6 +740,7 @@ impl IpcServer {
             petal_mutation: Arc::new(tokio::sync::Mutex::new(())),
             batch_confirmation: None,
             machine_commands: None,
+            activation_health_only: false,
             ready: None,
             shutdown: Arc::new(Notify::new()),
         }
@@ -781,6 +783,11 @@ impl IpcServer {
 
     pub fn with_machine_commands(mut self, service: Arc<dyn MachineCommandService>) -> Self {
         self.machine_commands = Some(service);
+        self
+    }
+
+    pub fn activation_health_only(mut self) -> Self {
+        self.activation_health_only = true;
         self
     }
 
@@ -999,6 +1006,13 @@ impl IpcServer {
             return Response::err(req.id, -32600, "jsonrpc must be 2.0");
         }
         let id = req.id.clone();
+        if self.activation_health_only && req.method != "machine.execute" {
+            return Response::err(
+                id,
+                -32601,
+                "activation health endpoint only accepts machine.execute",
+            );
+        }
         match req.method.as_str() {
             "version" => Response::ok(id, Value::String(self.version.clone())),
             "chains" => Response::ok(id, json!(self.chains)),
