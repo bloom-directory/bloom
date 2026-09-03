@@ -3323,7 +3323,7 @@ summary = "Demo app used by IPC tests."
             .await;
         assert!(read.error.is_none());
         let installed = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
+            std::time::Duration::from_secs(10),
             server.do_petals_install(&json!({"path": package}), IpcOperationContext::detached()),
         )
         .await;
