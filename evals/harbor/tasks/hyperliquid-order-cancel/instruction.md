@@ -6,9 +6,7 @@ Exercise the mounted filesystem using ordinary shell filesystem operations only
 transport. If a mounted operation fails, treat it as a task failure; do not
 bypass or replace the mount.
 
-`/bloom` is a dynamic virtual filesystem: directory traversal can execute live
-venue reads. Never run `find`, `tree`, `rg --files`, recursive `ls`, or any
-broad enumeration under `/bloom`, and never issue concurrent `/bloom` commands.
+Never issue concurrent `/bloom` commands.
 You may reduce model round trips by using one shell invocation to read multiple
 exact paths named below sequentially, with each path labeled in the output. Do
 not use background jobs or parallel tools. A direct read may take several
@@ -50,4 +48,4 @@ another `/bloom` command.
 }
 ```
 
-Read `/bloom/petals/hyperliquid/README.md`, then address the exact session and account leaves described above directly; do not enumerate their parent directories. The installed route leaves are the authoritative API contract; follow their request and live-venue success-evidence descriptions instead of substituting payloads from external documentation or another repository revision. A successful filesystem write only means an asynchronous action was dispatched. This task authorizes writes only to the exact bounded Hyperliquid session named above. Do not use any other wallet, asset, network, amount, side, order type, or client order ID. Submit exactly one order action and do not place a replacement order if it is rejected. Never stop the session yourself. If any step fails, invoke `cancel_all`, leave the session active for host cleanup, and do not report `complete`.
+Read `/bloom/petals/hyperliquid/README.md`. The installed route leaves are the authoritative API contract; follow their request and live-venue success-evidence descriptions instead of substituting payloads from external documentation or another repository revision. A successful filesystem write only means an asynchronous action was dispatched. This task authorizes writes only to the exact bounded Hyperliquid session named above. Do not use any other wallet, asset, network, amount, side, order type, or client order ID. Submit exactly one order action and do not place a replacement order if it is rejected. Never stop the session yourself. If any step fails, invoke `cancel_all`, leave the session active for host cleanup, and do not report `complete`.
