@@ -209,6 +209,14 @@ files, and health. Custody and identity directories are never regenerated or
 replaced during this sequence. The candidate state schemas must be at least the
 installed schemas.
 
+The macOS release remains rooted at `/usr/local/libexec/bloom`, with the
+user-facing `/usr/local/bin/bloom` symlink following its atomic `current`
+selector. Activation then removes the enrolled user's supported legacy
+`~/.local/bin/bloom` file or symlink using that user's authority. Foreign PATH
+entries fail preflight, and legacy cleanup runs only after authenticated health
+has committed; users may need `hash -r`, `rehash`, or a new terminal to clear a
+cached command location.
+
 `uninstall --retain-custody` removes runtime integration while preserving the
 exact service principals, private configuration, and custody state. `restore`
 requires the exact signed retained release and publishes Machine access only

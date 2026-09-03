@@ -76,6 +76,29 @@ interruption; an upgrade that fails authenticated health restores the prior
 release when it can still pass the same check. Compatibility metadata is mandatory and
 a state-schema downgrade is rejected before services are stopped.
 
+Canonical executables live under
+`/usr/local/libexec/bloom/releases/RELEASE_DIGEST`; the root-owned `current`
+selector moves atomically between those immutable directories. The supported
+interactive command is the relative symlink
+`/usr/local/bin/bloom -> ../libexec/bloom/current/bloom`, so it follows every
+repair and upgrade without putting `libexec` itself on `PATH`. Installer
+preflight accepts only that exact managed symlink and refuses to overwrite a
+regular file, directory, or differently targeted link. The command remains
+available while any login has an active enrollment and is removed when the last
+active enrollment is retained or purged; restore recreates it.
+
+Once authenticated activation has committed, the installer migrates the
+enrolled login away from the supported historical standalone location
+`~/.local/bin/bloom`. The home is resolved from Directory Service, and only a
+regular file or final-component symlink at that exact path is unlinked with the
+login user's authority. Parent symlinks and unexpected filesystem objects are
+rejected, and no user-owned binary is executed for identification. Cleanup is
+deliberately post-activation: a failed activation preserves the old command,
+while a cleanup failure reports the installation as incomplete without rolling
+back healthy custody. Other `bloom` commands on `PATH` are not scanned or
+deleted. After migration, a shell that cached the old command may need `hash -r`
+(POSIX shells), `rehash` (zsh/csh), or a new terminal.
+
 `uninstall --retain-custody / LOGIN_UID` removes launchd, packet-filter, and
 runtime integration while preserving service principals, identities, and
 encrypted state. `restore` accepts only the exact signed retained release and
