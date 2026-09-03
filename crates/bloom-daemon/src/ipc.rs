@@ -540,6 +540,7 @@ pub enum MachineCustodyKind {
     New,
     Import,
     Rebind,
+    Export,
     Delete,
 }
 

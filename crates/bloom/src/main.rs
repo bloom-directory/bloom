@@ -943,7 +943,10 @@ fn machine_error_from_handler(error: &bloom_vfs::HandlerError, message: String) 
     let kind = match error {
         bloom_vfs::HandlerError::NotFound(_) => MachineErrorKind::NotFound,
         bloom_vfs::HandlerError::PermissionDenied
-        | bloom_vfs::HandlerError::OperationNotPermitted => MachineErrorKind::PermissionDenied,
+        | bloom_vfs::HandlerError::OperationNotPermitted
+        // Authorized in principle, pending an owner ceremony. The Display impl
+        // already carries the ceremony URL into `message`.
+        | bloom_vfs::HandlerError::ApprovalRequired { .. } => MachineErrorKind::PermissionDenied,
         bloom_vfs::HandlerError::Invalid(_)
         | bloom_vfs::HandlerError::NotADir(_)
         | bloom_vfs::HandlerError::NotAFile(_)
@@ -1124,6 +1127,12 @@ async fn execute_machine_command(
                         bloom_broker_api::CeremonyKind::CredentialReplace,
                         Some(bloom_broker_api::Token::new(name.clone())?),
                         "credential-prf",
+                    ),
+                    MachineCustodyKind::Export => (
+                        bloom_machine_client::CustodyPrepareMethod::WalletExport,
+                        bloom_broker_api::CeremonyKind::WalletExport,
+                        Some(bloom_broker_api::Token::new(name.clone())?),
+                        "none",
                     ),
                     MachineCustodyKind::Delete => (
                         bloom_machine_client::CustodyPrepareMethod::WalletDelete,
@@ -2094,6 +2103,13 @@ enum WalletCmd {
     /// without moving funds. Ceremony status and public results are projected
     /// from Broker.
     RebindPasskey { name: String },
+    /// Reveal a wallet's recovery material through a Broker-originated custody
+    /// ceremony. The secret is sealed to the ceremony browser and displayed
+    /// only there; it never passes through the Machine process. Choose the
+    /// export format (recovery phrase or legacy backup) in the browser.
+    ///
+    /// Anyone who obtains this material controls the wallet's funds.
+    Export { name: String },
     /// Permanently delete a wallet through a Broker-originated custody
     /// ceremony. Signer deletes custody state after owner authorization;
     /// Machine removes only its public projection. This cannot be undone.
@@ -2782,6 +2798,16 @@ async fn run(cli: Cli) -> Result<()> {
                 MachineCommand::WalletCustody {
                     name,
                     kind: MachineCustodyKind::Rebind,
+                },
+            )
+            .await
+        }
+        Cmd::Wallet(WalletCmd::Export { name }) => {
+            call_machine_command(
+                &client_endpoint,
+                MachineCommand::WalletCustody {
+                    name,
+                    kind: MachineCustodyKind::Export,
                 },
             )
             .await
