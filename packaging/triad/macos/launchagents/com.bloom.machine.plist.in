@@ -21,6 +21,8 @@
     <string>/private/var/run/bloom</string>
     <key>BLOOM_LOG_OUTPUT</key>
     <string>json-file-home</string>
+    <key>BLOOM_ACTIVATION_HEALTH_ONLY</key>
+    <string>1</string>
   </dict>
   <key>RunAtLoad</key>
   <true/>

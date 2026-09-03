@@ -359,7 +359,7 @@ pf_reference() {
 
 rollback_failed_restore() {
   if $live; then
-    for label in "gui/$login_uid/com.bloom.machine" "system/com.bloom.broker.$login_uid" "system/com.bloom.signer.$login_uid" "gui/$login_uid/com.bloom.session"; do
+    for label in "gui/$login_uid/com.bloom.machine" "user/$login_uid/com.bloom.machine" "system/com.bloom.broker.$login_uid" "system/com.bloom.signer.$login_uid" "gui/$login_uid/com.bloom.session" "user/$login_uid/com.bloom.session"; do
       launchctl bootout "$label" 2>/dev/null || true
     done
     pf_reference remove || return 1
@@ -368,7 +368,12 @@ rollback_failed_restore() {
   rm -rf "$runtime" "$log_root"
   restore_pending=false
 }
-
+rollback_failed_fresh() {
+  for label in "gui/$login_uid/com.bloom.machine" "user/$login_uid/com.bloom.machine" "system/com.bloom.broker.$login_uid" "system/com.bloom.signer.$login_uid" "gui/$login_uid/com.bloom.session" "user/$login_uid/com.bloom.session"; do launchctl bootout "$label" 2>/dev/null || true; done
+  pf_reference remove || true; rm -f "$broker_plist" "$signer_plist" "$pf_anchor" "$newsyslog_config" "$enrollment"
+  rm -rf "$config" "$variable/db/bloom/$login_uid" "$runtime" "$log_root"
+  has_active_enrollments || { launchctl bootout system/com.bloom.containment 2>/dev/null || true; rm -f "$containment_plist" "$session_plist" "$machine_plist"; }
+}
 write_enrollment() {
   state="$1"; tmp="$enrollment.new.$$"
   if [[ -n "${BLOOM_MACOS_LOG_GID:-}" ]]; then
@@ -566,35 +571,42 @@ secure_ownership() {
 
 reload_launchd_job() {
   local domain="$1" label="$2" plist="$3"
-  launchctl bootout "$domain/$label" 2>/dev/null || true
-  if ! launchctl bootstrap "$domain" "$plist" 2>/dev/null; then
-    if ! launchctl print "$domain/$label" >/dev/null 2>&1; then
-      echo "Bloom installed, but launchd deferred $label" >&2
-      return 0
-    fi
-  fi
-  launchctl kickstart -k "$domain/$label" 2>/dev/null ||
-    echo "Bloom installed, but launchd deferred $label" >&2
+  stop_launchd_job "$domain/$label"
+  launchctl bootstrap "$domain" "$plist" || return 1
+  launchctl kickstart -k "$domain/$label" || return 1
+  launchctl print "$domain/$label" >/dev/null 2>&1
 }
-
 stop_launchd_job() {
   local label="$1" attempts=0
   launchctl bootout "$label" 2>/dev/null || true
   while launchctl print "$label" >/dev/null 2>&1 && ((attempts < 50)); do
     sleep 0.1; attempts=$((attempts + 1))
   done
-  ! launchctl print "$label" >/dev/null 2>&1 || die "refusing to uninstall while $label is still loaded"
+  ! launchctl print "$label" >/dev/null 2>&1 || { echo "launchd job remains loaded after stop: $label" >&2; return 1; }
 }
-
+reload_launchagent_job() {
+  local uid="$1" label="$2" plist="$3"
+  # Old installers could leave these in either domain.
+  stop_launchd_job "gui/$uid/$label"; stop_launchd_job "user/$uid/$label"
+  reload_launchd_job "user/$uid" "$label" "$plist"
+}
+require_triad_health() {
+  local uid="$1" user="$2" digest="$3" home attempt
+  home="$(dscl . -read "/Users/$user" NFSHomeDirectory | awk 'NR==1{sub(/^NFSHomeDirectory:[[:space:]]*/,"");print}')"
+  [[ "$home" == /* && -d "$home" ]] || { echo "cannot resolve home for $user" >&2; return 1; }
+  for ((attempt=0; attempt<20; attempt++)); do launchctl asuser "$uid" /usr/bin/sudo -u "$user" -H "$release_base/current/bloom" --home "$home/.bloom" serve triad-health-check "$digest" >/dev/null 2>&1 && return 0; sleep 0.5; done
+  launchctl asuser "$uid" /usr/bin/sudo -u "$user" -H "$release_base/current/bloom" --home "$home/.bloom" serve triad-health-check "$digest"
+}
 reload_current_enrollment() {
   plutil -lint "$broker_plist" "$signer_plist" "$containment_plist" "$session_plist" "$machine_plist" >/dev/null; pfctl -nf "$pf_anchor"
   reload_launchd_job system com.bloom.containment "$containment_plist"
   "$machine_binary" serve triad-pf-monitor-once 2>/dev/null ||
     echo "Bloom installed, but containment readiness is deferred" >&2
-  reload_launchd_job "gui/$login_uid" com.bloom.session "$session_plist"
+  reload_launchagent_job "$login_uid" com.bloom.session "$session_plist"
   reload_launchd_job system "com.bloom.signer.$login_uid" "$signer_plist"
   reload_launchd_job system "com.bloom.broker.$login_uid" "$broker_plist"
-  reload_launchd_job "gui/$login_uid" com.bloom.machine "$machine_plist"
+  reload_launchagent_job "$login_uid" com.bloom.machine "$machine_plist"
+  require_triad_health "$login_uid" "$login_user" "$BLOOM_RELEASE_DIGEST"
 }
 
 stop_all_enrollments() {
@@ -603,7 +615,7 @@ stop_all_enrollments() {
   for record in "$enrollments"/*.json; do
     [[ -f "$record" && ! -L "$record" ]] || continue
     uid="${record##*/}"; uid="${uid%.json}"; [[ "$uid" =~ ^[1-9][0-9]*$ ]] || return 65
-    for label in "gui/$uid/com.bloom.machine" "gui/$uid/com.bloom.session" "system/com.bloom.broker.$uid" "system/com.bloom.signer.$uid"; do launchctl bootout "$label" 2>/dev/null || true; done
+    for label in "gui/$uid/com.bloom.machine" "user/$uid/com.bloom.machine" "gui/$uid/com.bloom.session" "user/$uid/com.bloom.session" "system/com.bloom.broker.$uid" "system/com.bloom.signer.$uid"; do stop_launchd_job "$label"; done
   done
 }
 
@@ -643,16 +655,17 @@ rewrite_all_enrollments() {
 
 reload_installed_set() {
   local record uid; $live || return 0
-  reload_launchd_job system com.bloom.containment "$containment_plist"
+  reload_launchd_job system com.bloom.containment "$containment_plist" || return 1
   "$release_base/current/bloom" serve triad-pf-monitor-once 2>/dev/null ||
     echo "Bloom installed, but containment readiness is deferred" >&2
   for record in "$enrollments"/*.json; do
     [[ -f "$record" && ! -L "$record" ]] || continue
     uid="${record##*/}"; uid="${uid%.json}"
-    reload_launchd_job "gui/$uid" com.bloom.session "$root_prefix/Library/LaunchAgents/com.bloom.session.plist"
-    reload_launchd_job system "com.bloom.signer.$uid" "$root_prefix/Library/LaunchDaemons/com.bloom.signer.$uid.plist"
-    reload_launchd_job system "com.bloom.broker.$uid" "$root_prefix/Library/LaunchDaemons/com.bloom.broker.$uid.plist"
-    reload_launchd_job "gui/$uid" com.bloom.machine "$root_prefix/Library/LaunchAgents/com.bloom.machine.plist"
+    reload_launchagent_job "$uid" com.bloom.session "$root_prefix/Library/LaunchAgents/com.bloom.session.plist" || return 1
+    reload_launchd_job system "com.bloom.signer.$uid" "$root_prefix/Library/LaunchDaemons/com.bloom.signer.$uid.plist" || return 1
+    reload_launchd_job system "com.bloom.broker.$uid" "$root_prefix/Library/LaunchDaemons/com.bloom.broker.$uid.plist" || return 1
+    reload_launchagent_job "$uid" com.bloom.machine "$root_prefix/Library/LaunchAgents/com.bloom.machine.plist" || return 1
+    require_triad_health "$uid" "$(field "$record" login_user)" "$(field "$record" release_digest)" || return 1
   done
 }
 
@@ -682,9 +695,16 @@ upgrade_release() {
   stop_all_enrollments
   rewrite_all_enrollments "$new" activating
   switch_release "$new"
+  if ! reload_installed_set; then
+    echo "new Bloom release failed authenticated activation; restoring $old" >&2; stop_all_enrollments || true
+    rewrite_all_enrollments "$old" activating; switch_release "$old"
+    if reload_installed_set; then rewrite_all_enrollments "$old" active; rm -rf -- "$upgrade_transaction"; upgrade_transaction=""
+      echo "previous Bloom release restored after failed activation" >&2
+    else echo "automatic restoration of the previous Bloom release failed" >&2; fi
+    return 1
+  fi
   rewrite_all_enrollments "$new" active
   write_state_schema
-  reload_installed_set
   rm -rf -- "$upgrade_transaction"; upgrade_transaction=""
 }
 
@@ -734,7 +754,10 @@ case "$action" in
       exit 0
     fi
     switch_release "$BLOOM_RELEASE_DIGEST"; install_config; write_enrollment activating; install_assets
-    if $live; then secure_ownership; pf_reference add; write_enrollment active; reload_current_enrollment; created_users=""; created_groups=""; fi
+    if $live; then
+      secure_ownership; pf_reference add; reload_current_enrollment || { $fresh && rollback_failed_fresh; die "Bloom failed authenticated activation"; }
+      write_enrollment active; created_users=""; created_groups=""
+    fi
     write_state_schema
     if $restoring; then rm -f "$retained"; restore_pending=false; echo "Bloom macOS retained custody restored"; else echo "Bloom macOS enrollment installed or repaired"; fi
     ;;
@@ -749,7 +772,7 @@ case "$action" in
     [[ -f "$record" && ! -L "$record" ]] || die "enrollment or retained custody record missing"
     enrollment="$record"; login_user="$(field "$record" login_user)"; BLOOM_RELEASE_DIGEST="$(field "$record" release_digest)"; load_ids
     if $live; then
-      for label in "gui/$login_uid/com.bloom.machine" "system/com.bloom.broker.$login_uid" "system/com.bloom.signer.$login_uid" "gui/$login_uid/com.bloom.session"; do stop_launchd_job "$label"; done
+      for label in "gui/$login_uid/com.bloom.machine" "user/$login_uid/com.bloom.machine" "system/com.bloom.broker.$login_uid" "system/com.bloom.signer.$login_uid" "gui/$login_uid/com.bloom.session" "user/$login_uid/com.bloom.session"; do stop_launchd_job "$label"; done
       pf_reference remove
     fi
     rm -f "$broker_plist" "$signer_plist" "$pf_anchor" "$newsyslog_config"

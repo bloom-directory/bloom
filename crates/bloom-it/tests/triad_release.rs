@@ -2607,19 +2607,19 @@ fn macos_restore_cannot_downgrade_the_release_shared_by_an_active_login() {
 }
 
 #[test]
-fn macos_installer_does_not_gate_installation_on_runtime_health() {
+fn macos_installer_requires_authenticated_runtime_health() {
     let installer = fs::read_to_string(release_script("install-macos.sh")).unwrap();
     assert!(
         installer.contains(r#"launchctl kickstart -k "$domain/$label""#),
-        "loaded launchd jobs must be explicitly started when the domain defers RunAtLoad"
+        "loaded launchd jobs must be explicitly restarted"
     );
     assert!(
-        installer.contains("Bloom installed, but launchd deferred"),
-        "deferred runtime startup must be reported without reversing the upgrade"
+        installer.contains(r#"stop_launchd_job "user/$uid/$label""#),
+        "an upgrade must stop an existing per-user LaunchAgent"
     );
     assert!(
-        !installer.contains("triad-health-check"),
-        "runtime health belongs to post-install diagnostics, not the upgrade transaction"
+        installer.contains("triad-health-check"),
+        "activation must require authenticated health on the selected release"
     );
 }
 

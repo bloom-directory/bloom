@@ -219,10 +219,12 @@ fn configured_broker_connection(
     bloom_machine_client::MachineBrokerClient,
     bloom_broker_api::ProvenanceCatalog,
 )> {
+    let allow_activating = std::env::var_os("BLOOM_ACTIVATION_HEALTH_ONLY").as_deref()
+        == Some(std::ffi::OsStr::new("1"));
     // Daemon construction attaches this raw authenticated client to the exact
     // AuditLog instance it owns before any RPC can be dispatched.
-    let broker = configured_raw_broker_client_with_activation(false)?;
-    let installed = installed_macos_triad_paths()?;
+    let broker = configured_raw_broker_client_with_activation(allow_activating)?;
+    let installed = installed_macos_triad_paths_with_activation(allow_activating)?;
     let provenance_catalog = std::env::var_os("BLOOM_PROVENANCE_CATALOG")
         .map(std::path::PathBuf::from)
         .or_else(|| {
@@ -1070,6 +1072,9 @@ async fn execute_machine_command(
     daemon: &Daemon,
     command: MachineCommand,
 ) -> Result<MachineCommandOutput> {
+    if !matches!(&command, MachineCommand::TriadHealth { .. }) {
+        let _ = installed_macos_triad_paths()?;
+    }
     let machine_broker = || {
         daemon.machine_broker.as_ref().ok_or_else(|| {
             machine_error(
