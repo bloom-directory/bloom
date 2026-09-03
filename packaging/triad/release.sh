@@ -92,13 +92,13 @@ require_staged_architecture() {
   done
 }
 
-resolved_compatibility() {
-  local output="$1" broker_sha="$2" signer_sha="$3"
-  awk -v broker_sha="$broker_sha" -v signer_sha="$signer_sha" '
-    /^broker_commit = / { print "broker_commit = \"" broker_sha "\""; next }
-    /^signer_commit = / { print "signer_commit = \"" signer_sha "\""; next }
-    { print }
-  ' "$release_dir/compatibility-v1.toml" >"$output"
+compatibility_revision() {
+  local key="$1" value
+  value="$(sed -n -E "s/^${key} = \"([0-9a-f]{40})\"$/\\1/p" \
+    "$release_dir/compatibility-v1.toml")"
+  [[ "$value" =~ ^[0-9a-f]{40}$ ]] ||
+    die "compatibility-v1.toml must contain exactly one valid $key"
+  printf '%s\n' "$value"
 }
 
 smoke_linux_installer() {
@@ -228,10 +228,16 @@ build_candidate() {
   require_clean_repository "$broker_root"
   require_clean_repository "$signer_root"
 
-  local machine_sha broker_sha signer_sha artifact_name suffix
+  local machine_sha broker_sha signer_sha pinned_broker_sha pinned_signer_sha artifact_name suffix
   machine_sha="$(repository_head "$main_root")"
   broker_sha="$(repository_head "$broker_root")"
   signer_sha="$(repository_head "$signer_root")"
+  pinned_broker_sha="$(compatibility_revision broker_commit)"
+  pinned_signer_sha="$(compatibility_revision signer_commit)"
+  [[ "$broker_sha" == "$pinned_broker_sha" ]] ||
+    die "Broker checkout $broker_sha does not match compatibility-v1.toml pin $pinned_broker_sha"
+  [[ "$signer_sha" == "$pinned_signer_sha" ]] ||
+    die "Signer checkout $signer_sha does not match compatibility-v1.toml pin $pinned_signer_sha"
   artifact_name="bloom-triad-test-unclaimed.tar.gz"
   mkdir -p "$output_dir"
   output_dir="$(cd "$output_dir" && pwd -P)"
@@ -274,8 +280,7 @@ build_candidate() {
     signing_key="$work/test-only-release-key"
     ssh-keygen -q -t ed25519 -N '' -f "$signing_key"
   fi
-  compatibility="$work/compatibility-v1.toml"
-  resolved_compatibility "$compatibility" "$broker_sha" "$signer_sha"
+  compatibility="$release_dir/compatibility-v1.toml"
   builder="$release_dir/build-bundle.sh"
   verifier="$release_dir/verify-bundle.sh"
   export BLOOM_MACHINE_SHA="$machine_sha"

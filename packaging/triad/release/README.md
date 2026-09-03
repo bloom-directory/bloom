@@ -7,8 +7,9 @@ Service packages may advance independently when every edge remains inside its
 declared range; incompatible edges fail closed.
 It also records the reviewed Broker, Signer, service-runtime, and
 Petal-contract commits plus the current state schema and downgrade floor for
-Machine, Broker, and Signer. Candidate builds resolve the current checkouts
-and write those exact Broker and Signer revisions into the artifact-local copy.
+Machine, Broker, and Signer. This committed file is the source of truth for
+the Broker and Signer revisions: candidate builds require the supplied
+checkouts to match its exact pins and never rewrite them.
 
 `build-bundle.sh` accepts the three service binaries, the bounded
 `bloom-signer-migrate` staging tool, and an ephemeral candidate key. It verifies semantic versions, scans every
@@ -76,9 +77,10 @@ packaging/triad/release.sh build macos --output-dir DIR
 ```
 
 It defaults to the current `../bloom-broker` and `../bloom-signer` checkouts,
-rejects dirty source inputs, builds with locked dependencies, validates the
-selected binary architecture and installer, assembles and verifies the bundle
-twice, and publishes byte-identical `test-unclaimed` output. It does not run
+rejects dirty source inputs or HEADs that differ from the compatibility pins,
+builds with locked dependencies, validates the selected binary architecture
+and installer, assembles and verifies the bundle twice, and publishes
+byte-identical `test-unclaimed` output. It does not run
 repository-wide formatting, Clippy, or test suites; those are independent CI
 source-quality gates. Both platforms emit the archive plus `.sha256`, `.sig`,
 and `.pub` sidecars.
