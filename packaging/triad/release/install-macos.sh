@@ -31,6 +31,7 @@ created_groups=""
 upgrade_transaction=""
 upgrade_old_digest=""
 restore_pending=false
+legacy_cli_removed=false
 
 cleanup() {
   rc=$?
@@ -387,11 +388,67 @@ remove_legacy_cli() {
       rm -f -- "$legacy"
     fi
     [[ ! -e "$legacy" && ! -L "$legacy" ]] || return 1
+    legacy_cli_removed=true
     echo "Removed legacy $legacy; run 'hash -r' or 'rehash', or open a new terminal"
     return 0
   fi
   echo "legacy Bloom CLI is not a regular file or symlink: $legacy" >&2
   return 1
+}
+
+report_legacy_wallet_migrations() {
+  local wallet_root wallet_dir kind_file kind wallet_name receipt
+  local found_wallet=false found_supported=false
+  resolve_login_home
+  wallet_root="$login_home/.bloom/keystore"
+  if [[ ! -e "$wallet_root" && ! -L "$wallet_root" ]]; then
+    if $legacy_cli_removed; then
+      echo "Legacy Bloom wallets, if present, remain under $wallet_root"
+    fi
+    return 0
+  fi
+  if [[ ! -d "$wallet_root" || -L "$wallet_root" ]]; then
+    echo "Legacy Bloom wallet path is unsafe and was not inspected: $wallet_root" >&2
+    return 0
+  fi
+
+  echo "Legacy Bloom wallets were not modified and remain at: $wallet_root"
+  for wallet_dir in "$wallet_root"/*; do
+    [[ -e "$wallet_dir" || -L "$wallet_dir" ]] || continue
+    found_wallet=true
+    wallet_name="${wallet_dir##*/}"
+    if [[ ! -d "$wallet_dir" || -L "$wallet_dir" ]]; then
+      echo "Skipping unexpected legacy wallet entry: $wallet_dir" >&2
+      continue
+    fi
+    kind_file="$wallet_dir/kind"
+    if [[ ! -f "$kind_file" || -L "$kind_file" ]]; then
+      echo "Legacy wallet $wallet_name has no safe kind file; it was not modified" >&2
+      continue
+    fi
+    if ! kind="$(/bin/cat "$kind_file")"; then
+      echo "Legacy wallet $wallet_name could not be inspected; it was not modified" >&2
+      continue
+    fi
+    if [[ "$kind" != passkey ]]; then
+      echo "Legacy wallet $wallet_name uses unsupported kind '$kind'; only v1 passkey wallets can be migrated automatically" >&2
+      continue
+    fi
+
+    found_supported=true
+    receipt="$login_home/.bloom/$wallet_name.triad-migration-receipt.json"
+    echo "Migrate legacy passkey wallet $wallet_name with these two commands. Only the staging command requires sudo:"
+    printf '  sudo %q stage --source %q --config %q --source-uid %q --signer-uid %q --signer-gid %q --receipt %q\n' \
+      "$release_base/current/bloom-signer-migrate" "$wallet_dir" \
+      "$signer_config/config.json" "$login_uid" "$BLOOM_MACOS_SIGNER_UID" \
+      "$BLOOM_MACOS_SIGNER_GID" "$receipt"
+    printf '  %q wallet migrate-passkey %q\n' "$cli_link" "$receipt"
+  done
+  if ! $found_wallet; then
+    echo "No legacy wallets were found in $wallet_root"
+  elif ! $found_supported; then
+    echo "No supported v1 passkey wallets were detected; legacy wallet data was left in place"
+  fi
 }
 
 current_release_digest() {
@@ -888,6 +945,7 @@ case "$action" in
       upgrade_release "$shared_digest" "$BLOOM_RELEASE_DIGEST"
       login_uid="$requested_uid"; login_user="$requested_user"
       remove_legacy_cli || die "Bloom is healthy, but legacy CLI cleanup failed; remove ~/.local/bin/bloom and retry"
+      report_legacy_wallet_migrations
       echo "Bloom macOS release upgraded atomically"
       exit 0
     fi
@@ -895,6 +953,7 @@ case "$action" in
       upgrade_release "$upgrade_old_digest" "$BLOOM_RELEASE_DIGEST"
       login_uid="$requested_uid"; login_user="$requested_user"
       remove_legacy_cli || die "Bloom is healthy, but legacy CLI cleanup failed; remove ~/.local/bin/bloom and retry"
+      report_legacy_wallet_migrations
       echo "Bloom macOS release upgraded atomically"
       exit 0
     fi
@@ -908,6 +967,7 @@ case "$action" in
     write_state_schema
     if $restoring; then rm -f "$retained"; restore_pending=false; fi
     remove_legacy_cli || die "Bloom is healthy, but legacy CLI cleanup failed; remove ~/.local/bin/bloom and retry"
+    report_legacy_wallet_migrations
     if $restoring; then echo "Bloom macOS retained custody restored"; else echo "Bloom macOS enrollment installed or repaired"; fi
     ;;
   uninstall)

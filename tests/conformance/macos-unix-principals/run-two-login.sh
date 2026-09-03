@@ -169,6 +169,7 @@ assert_unused_enrollment "$login_uid_b"
 installed_a=true
 release_digest="$(field "$login_uid_a" release_digest)"
 [[ "$(field "$login_uid_a" state)" == "active" ]]
+[[ -L /usr/local/bin/bloom ]]
 [[ "$(readlink /usr/local/bin/bloom)" == ../libexec/bloom/current/bloom ]]
 [[ "$(stat -f '%u' /usr/local/bin/bloom)" == 0 ]]
 sudo -u "$login_user_a" \
@@ -215,6 +216,7 @@ fi
 [[ "$(shasum -a 256 "$identity_a" | awk '{print $1}')" == "$identity_before" ]]
 "$installer" restore / "$login_uid_a" "$login_user_a" "$tested_payload"
 [[ ! -e "/Library/Application Support/BloomTriad/retained/$login_uid_a.json" ]]
+[[ -L /usr/local/bin/bloom ]]
 [[ "$(readlink /usr/local/bin/bloom)" == ../libexec/bloom/current/bloom ]]
 [[ "$(shasum -a 256 "$identity_a" | awk '{print $1}')" == "$identity_before" ]]
 sudo -u "$login_user_a" "$machine_binary" serve triad-health-check "$release_digest"
@@ -422,6 +424,7 @@ fi
 
 "$installer" uninstall / "$login_uid_b" "delete-bloom-login-$login_uid_b"
 installed_b=false
+[[ -L /usr/local/bin/bloom ]]
 [[ "$(readlink /usr/local/bin/bloom)" == ../libexec/bloom/current/bloom ]]
 "$installer" uninstall / "$login_uid_a" "delete-bloom-login-$login_uid_a"
 installed_a=false

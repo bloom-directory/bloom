@@ -302,6 +302,10 @@ fn macos_installer_manages_the_path_entry_and_migrates_legacy_cli_post_activatio
         "resolve_login_home",
         "/usr/bin/sudo -u \"$login_user\" -- /bin/rm -f -- \"$legacy\"",
         "Bloom is healthy, but legacy CLI cleanup failed",
+        "report_legacy_wallet_migrations",
+        "Legacy Bloom wallets were not modified and remain at",
+        "Only the staging command requires sudo",
+        "wallet migrate-passkey",
     ] {
         assert!(
             source.contains(required),
@@ -336,7 +340,12 @@ fn macos_installer_does_not_regenerate_custody_during_lifecycle_operations() {
     for forbidden in ["triad-render-macos-identity-rotation", "rotate-identities"] {
         assert!(!source.contains(forbidden));
     }
-    assert!(!source.contains("source "));
+    assert!(
+        !source
+            .lines()
+            .any(|line| line.trim_start().starts_with("source ")),
+        "installer must not execute shell source commands"
+    );
 }
 
 #[test]

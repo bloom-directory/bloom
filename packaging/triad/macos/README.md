@@ -99,6 +99,17 @@ back healthy custody. Other `bloom` commands on `PATH` are not scanned or
 deleted. After migration, a shell that cached the old command may need `hash -r`
 (POSIX shells), `rehash` (zsh/csh), or a new terminal.
 
+Legacy wallet data is not deleted with the standalone command. When
+`~/.bloom/keystore` exists, successful activation prints its resolved absolute
+location and exact staging and ceremony commands for every detected v1 passkey
+wallet. The staging command uses the packaged `bloom-signer-migrate`, the
+installed Signer configuration, and the enrollment's actual login and Signer
+UID/GID. It requires `sudo` to enter Signer's private state and assign isolated
+ownership. The subsequent `/usr/local/bin/bloom wallet migrate-passkey`
+command must run without `sudo` as the enrolled login. Other legacy wallet
+kinds are unsupported by this bounded converter and remain untouched at the
+reported legacy location.
+
 `uninstall --retain-custody / LOGIN_UID` removes launchd, packet-filter, and
 runtime integration while preserving service principals, identities, and
 encrypted state. `restore` accepts only the exact signed retained release and

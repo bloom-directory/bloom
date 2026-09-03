@@ -2513,6 +2513,29 @@ fn macos_active_legacy_enrollment_migrates_log_identity_before_upgrade() {
         format!("{}\n", "33".repeat(32)),
     )
     .unwrap();
+    let rollback_archive = transaction.join("rollback-state.tar");
+    let rollback = Command::new("tar")
+        .current_dir(&root)
+        .args([
+            "-cpf",
+            rollback_archive.to_str().unwrap(),
+            "Library/Application Support/BloomTriad/enrollments",
+            "Library/Application Support/BloomTriad/config",
+            "Library/LaunchDaemons/com.bloom.containment.plist",
+            "Library/LaunchAgents/com.bloom.session.plist",
+            "Library/LaunchAgents/com.bloom.machine.plist",
+            "Library/LaunchDaemons/com.bloom.broker.501.plist",
+            "Library/LaunchDaemons/com.bloom.signer.501.plist",
+            "etc/pf.anchors/com.bloom.triad.501",
+            "etc/newsyslog.d/bloom-501.conf",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        rollback.status.success(),
+        "{}",
+        String::from_utf8_lossy(&rollback.stderr)
+    );
 
     let migrated = stage_macos_install_digest(&installer, &root, &candidate, &new_digest);
     assert!(

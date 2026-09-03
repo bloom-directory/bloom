@@ -63,16 +63,38 @@ done
 
 root="$work/lifecycle-root"
 legacy="$root/Users/releaseuser/.local/bin/bloom"
+legacy_wallet="$root/Users/releaseuser/.bloom/keystore/alice"
+unsupported_wallet="$root/Users/releaseuser/.bloom/keystore/watch-only"
 mkdir -p "$(dirname "$legacy")"
 printf 'old Bloom\n' >"$legacy"
+mkdir -p "$legacy_wallet" "$unsupported_wallet"
+printf 'passkey\n' >"$legacy_wallet/kind"
+printf 'watch\n' >"$unsupported_wallet/kind"
+resolved_root="$(cd "$root" && pwd -P)"
 
 # Fresh install exposes the exact relative link and removes only the staged
-# login's supported legacy entry after enrollment convergence.
-run_installer "$digest_a" install "$root" 501 releaseuser "$payload_a"
+# login's supported legacy entry after enrollment convergence. Wallet sources
+# remain untouched, and the notice renders exact principal-bound commands.
+install_output="$(run_installer "$digest_a" install "$root" 501 releaseuser "$payload_a" 2>&1)"
 [[ -L "$root/usr/local/bin/bloom" ]]
 [[ "$(readlink "$root/usr/local/bin/bloom")" == ../libexec/bloom/current/bloom ]]
 [[ ! -e "$legacy" && ! -L "$legacy" ]]
+[[ -d "$legacy_wallet" && -f "$legacy_wallet/kind" ]]
 [[ "$(readlink "$root/usr/local/libexec/bloom/current")" == "releases/$digest_a" ]]
+grep -F "Legacy Bloom wallets were not modified and remain at: $resolved_root/Users/releaseuser/.bloom/keystore" <<<"$install_output" >/dev/null
+printf -v stage_command '  sudo %q stage --source %q --config %q --source-uid %q --signer-uid %q --signer-gid %q --receipt %q' \
+  "$resolved_root/usr/local/libexec/bloom/current/bloom-signer-migrate" \
+  "$resolved_root/Users/releaseuser/.bloom/keystore/alice" \
+  "$resolved_root/Library/Application Support/BloomTriad/config/501/signer/config.json" \
+  501 250502 260500 \
+  "$resolved_root/Users/releaseuser/.bloom/alice.triad-migration-receipt.json"
+printf -v finish_command '  %q wallet migrate-passkey %q' \
+  "$resolved_root/usr/local/bin/bloom" \
+  "$resolved_root/Users/releaseuser/.bloom/alice.triad-migration-receipt.json"
+grep -F "$stage_command" <<<"$install_output" >/dev/null
+grep -F "$finish_command" <<<"$install_output" >/dev/null
+grep -F "Only the staging command requires sudo" <<<"$install_output" >/dev/null
+grep -F "Legacy wallet watch-only uses unsupported kind 'watch'" <<<"$install_output" >/dev/null
 
 # The exact managed link is accepted and same-digest repair is idempotent.
 run_installer "$digest_a" install "$root" 501 releaseuser "$payload_a"

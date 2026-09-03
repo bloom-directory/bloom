@@ -167,9 +167,10 @@ smoke_macos_installer() {
       install "$work/macos-root" 501 releaseuser "$payload"
   [[ -x "$work/macos-root/usr/local/libexec/bloom/current/bloom-broker" ]] ||
     die "staged macOS installer did not install Broker"
-  [[ -L "$work/macos-root/usr/local/bin/bloom" &&
-    "$(readlink "$work/macos-root/usr/local/bin/bloom")" == ../libexec/bloom/current/bloom ]] ||
+  [[ -L "$work/macos-root/usr/local/bin/bloom" ]] ||
     die "staged macOS installer did not install the CLI PATH symlink"
+  [[ "$(readlink "$work/macos-root/usr/local/bin/bloom")" == ../libexec/bloom/current/bloom ]] ||
+    die "staged macOS installer installed the wrong CLI PATH symlink"
   [[ -f "$work/macos-root/Library/Application Support/BloomTriad/enrollments/501.json" ]] ||
     die "staged macOS installer did not install enrollment"
   "$payload/installer/release/install-macos.sh" \
