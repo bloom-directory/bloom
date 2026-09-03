@@ -29,6 +29,7 @@ payload_scratch=""
 created_users=""
 created_groups=""
 upgrade_transaction=""
+upgrade_old_digest=""
 restore_pending=false
 
 cleanup() {
@@ -698,12 +699,13 @@ activate_installed_set() {
 find_interrupted_upgrade() {
   local recorded_old recorded_new
   upgrade_transaction="$product/upgrade-transaction"
-  [[ -e "$upgrade_transaction" ]] || { upgrade_transaction=""; return 0; }
+  [[ -e "$upgrade_transaction" ]] || { upgrade_transaction=""; upgrade_old_digest=""; return 0; }
   [[ -d "$upgrade_transaction" && ! -L "$upgrade_transaction" ]] || die "invalid interrupted Bloom upgrade"
   grep -Fx bloom.macos-upgrade-transaction.2 "$upgrade_transaction/schema" >/dev/null || die "invalid interrupted Bloom upgrade"
   recorded_old="$(<"$upgrade_transaction/old-digest")"
   recorded_new="$(<"$upgrade_transaction/new-digest")"
   [[ "$recorded_old" =~ ^[0-9a-f]{64}$ && "$recorded_new" =~ ^[0-9a-f]{64}$ ]] || die "invalid interrupted Bloom upgrade"
+  upgrade_old_digest="$recorded_old"
   echo "resuming interrupted Bloom macOS upgrade toward the requested release" >&2
 }
 
@@ -730,7 +732,7 @@ upgrade_release() {
     return 1
   fi
   write_state_schema
-  rm -rf -- "$upgrade_transaction"; upgrade_transaction=""
+  rm -rf -- "$upgrade_transaction"; upgrade_transaction=""; upgrade_old_digest=""
 }
 
 case "$action" in
@@ -774,7 +776,7 @@ case "$action" in
       exit 0
     fi
     if [[ -n "$upgrade_transaction" ]]; then
-      upgrade_release "$shared_digest" "$BLOOM_RELEASE_DIGEST"
+      upgrade_release "$upgrade_old_digest" "$BLOOM_RELEASE_DIGEST"
       echo "Bloom macOS release upgraded atomically"
       exit 0
     fi

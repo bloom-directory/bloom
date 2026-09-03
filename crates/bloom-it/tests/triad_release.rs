@@ -1600,7 +1600,10 @@ fn linux_installer_rejects_missing_service_configs_before_replacement() {
             String::from_utf8_lossy(&rejected.stderr)
                 .contains("installed Linux enrollment is incomplete")
         );
-        assert_eq!(fs::read(&installed_binary).unwrap(), installed_binary_before);
+        assert_eq!(
+            fs::read(&installed_binary).unwrap(),
+            installed_binary_before
+        );
         fs::write(installed_config, original).unwrap();
     }
 
@@ -1620,7 +1623,10 @@ fn linux_installer_rejects_missing_service_configs_before_replacement() {
         String::from_utf8_lossy(&missing_manifest.stderr)
             .contains("residual Linux enrollment state exists without a manifest")
     );
-    assert_eq!(fs::read(&installed_binary).unwrap(), installed_binary_before);
+    assert_eq!(
+        fs::read(&installed_binary).unwrap(),
+        installed_binary_before
+    );
     fs::write(&manifest, original_manifest).unwrap();
 
     let state_only_root = directory.path().join("state-only-root");
@@ -2523,6 +2529,16 @@ fn macos_active_legacy_enrollment_migrates_log_identity_before_upgrade() {
     assert!(migrated_enrollment.contains(r#""log_gid":260504"#));
     assert!(migrated_enrollment.contains(&new_digest));
     assert!(!transaction.exists());
+}
+
+#[test]
+fn installer_upgrade_transactions_preserve_recovery_state_atomically() {
+    let macos = fs::read_to_string(release_script("install-macos.sh")).unwrap();
+    assert!(macos.contains("upgrade_release \"$upgrade_old_digest\" \"$BLOOM_RELEASE_DIGEST\""));
+
+    let linux = fs::read_to_string(release_script("install-linux.sh")).unwrap();
+    assert!(linux.contains("upgrade_transaction_scratch=\"${upgrade_transaction}.new.$$\""));
+    assert!(linux.contains("mv -T \"$upgrade_transaction_scratch\" \"$upgrade_transaction\""));
 }
 
 #[test]

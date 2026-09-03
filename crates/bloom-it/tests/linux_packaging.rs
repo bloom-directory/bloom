@@ -199,9 +199,7 @@ fn service_sandboxes_remove_machine_and_network_authority() {
             );
         }
         assert!(unit.contains("ProtectClock=yes"));
-        assert!(unit.contains(
-            "LoadCredential=kernel-boot-id:/proc/sys/kernel/random/boot_id"
-        ));
+        assert!(unit.contains("LoadCredential=kernel-boot-id:/proc/sys/kernel/random/boot_id"));
         assert!(
             unit.contains("CapabilityBoundingSet=") && unit.contains("AmbientCapabilities="),
             "{name} must still lack CAP_SYS_TIME after ProtectClock is removed"

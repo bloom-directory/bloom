@@ -17,6 +17,7 @@ shift
 payload_scratch=""
 enrollment_scratch=""
 upgrade_transaction=""
+upgrade_transaction_scratch=""
 upgrade_rollback_required=false
 
 cleanup_scratch() {
@@ -25,7 +26,7 @@ cleanup_scratch() {
   if [[ "$upgrade_rollback_required" == true ]]; then
     rollback_linux_upgrade || status=$?
   fi
-  for scratch_path in "$payload_scratch" "$enrollment_scratch"; do
+  for scratch_path in "$payload_scratch" "$enrollment_scratch" "$upgrade_transaction_scratch"; do
     if [[ -n "$scratch_path" && -d "$scratch_path" ]]; then
       find "$scratch_path" -depth -delete
     fi
@@ -653,12 +654,16 @@ begin_linux_upgrade() {
     echo "an interrupted Linux upgrade must be recovered first" >&2
     return 65
   }
-  mkdir -p "$upgrade_transaction"
-  chmod 0700 "$upgrade_transaction"
-  printf '%s\n' bloom.linux-upgrade-transaction.1 > "$upgrade_transaction/schema"
-  printf '%s\n' "$old_digest" > "$upgrade_transaction/old-digest"
-  printf '%s\n' "$new_digest" > "$upgrade_transaction/new-digest"
-  chmod 0600 "$upgrade_transaction"/*
+  upgrade_transaction_scratch="${upgrade_transaction}.new.$$"
+  mkdir -m 0700 "$upgrade_transaction_scratch"
+  printf '%s\n' bloom.linux-upgrade-transaction.1 > "$upgrade_transaction_scratch/schema"
+  printf '%s\n' "$old_digest" > "$upgrade_transaction_scratch/old-digest"
+  printf '%s\n' "$new_digest" > "$upgrade_transaction_scratch/new-digest"
+  chmod 0600 "$upgrade_transaction_scratch"/*
+  sync
+  mv -T "$upgrade_transaction_scratch" "$upgrade_transaction"
+  upgrade_transaction_scratch=""
+  sync
   upgrade_root="$install_root"
   upgrade_old_digest="$old_digest"
   upgrade_rollback_required=true
