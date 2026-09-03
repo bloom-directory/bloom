@@ -209,6 +209,25 @@ files, and health. Custody and identity directories are never regenerated or
 replaced during this sequence. The candidate state schemas must be at least the
 installed schemas.
 
+The macOS release remains rooted at `/usr/local/libexec/bloom`, with the
+user-facing `/usr/local/bin/bloom` symlink following its atomic `current`
+selector. Activation then removes the enrolled user's supported legacy
+`~/.local/bin/bloom` file or symlink using that user's authority. Foreign PATH
+entries fail preflight, and legacy cleanup runs only after authenticated health
+has committed; users may need `hash -r`, `rehash`, or a new terminal to clear a
+cached command location.
+
+The legacy command migration does not remove old wallet data. If the resolved
+login home contains `~/.bloom/keystore`, the installer prints that exact
+location and a principal-bound two-command conversion for each detected v1
+passkey wallet. The first command runs the packaged `bloom-signer-migrate` as
+an administrator because it must read the Signer-owned configuration, stage
+data in Signer's private state, and set the isolated Signer ownership. The
+second `/usr/local/bin/bloom wallet migrate-passkey RECEIPT` command runs as
+the login user and opens the normal Broker ceremony. Unsupported legacy wallet
+kinds are identified but never modified; the staging tool supports only the
+single v1 passkey format.
+
 `uninstall --retain-custody` removes runtime integration while preserving the
 exact service principals, private configuration, and custody state. `restore`
 requires the exact signed retained release and publishes Machine access only

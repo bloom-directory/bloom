@@ -169,6 +169,9 @@ assert_unused_enrollment "$login_uid_b"
 installed_a=true
 release_digest="$(field "$login_uid_a" release_digest)"
 [[ "$(field "$login_uid_a" state)" == "active" ]]
+[[ -L /usr/local/bin/bloom ]]
+[[ "$(readlink /usr/local/bin/bloom)" == ../libexec/bloom/current/bloom ]]
+[[ "$(stat -f '%u' /usr/local/bin/bloom)" == 0 ]]
 sudo -u "$login_user_a" \
   "$machine_binary" serve triad-health-check "$release_digest"
 
@@ -187,6 +190,16 @@ if [[ -n "$upgrade_payload" ]]; then
   printf '%s\n' bloom.macos-upgrade-transaction.2 >"$transaction/schema"
   printf '%s\n' "$release_digest" >"$transaction/old-digest"
   printf '%s\n' "$(payload_release_digest "$payload")" >"$transaction/new-digest"
+  (cd / && tar -cpf "$transaction/rollback-state.tar" \
+    "Library/Application Support/BloomTriad/enrollments" \
+    "Library/Application Support/BloomTriad/config" \
+    Library/LaunchDaemons/com.bloom.containment.plist \
+    Library/LaunchAgents/com.bloom.session.plist \
+    Library/LaunchAgents/com.bloom.machine.plist \
+    "Library/LaunchDaemons/com.bloom.broker.$login_uid_a.plist" \
+    "Library/LaunchDaemons/com.bloom.signer.$login_uid_a.plist" \
+    "etc/pf.anchors/com.bloom.triad.$login_uid_a" \
+    "etc/newsyslog.d/bloom-$login_uid_a.conf")
   chown -R root:wheel "$transaction"
   chmod 0600 "$transaction"/*
   "$installer" install / "$login_uid_a" "$login_user_a" "$tested_payload"
@@ -199,9 +212,12 @@ fi
 "$installer" uninstall --retain-custody / "$login_uid_a"
 [[ ! -e "/Library/Application Support/BloomTriad/enrollments/$login_uid_a.json" ]]
 [[ -f "/Library/Application Support/BloomTriad/retained/$login_uid_a.json" ]]
+[[ ! -e /usr/local/bin/bloom && ! -L /usr/local/bin/bloom ]]
 [[ "$(shasum -a 256 "$identity_a" | awk '{print $1}')" == "$identity_before" ]]
 "$installer" restore / "$login_uid_a" "$login_user_a" "$tested_payload"
 [[ ! -e "/Library/Application Support/BloomTriad/retained/$login_uid_a.json" ]]
+[[ -L /usr/local/bin/bloom ]]
+[[ "$(readlink /usr/local/bin/bloom)" == ../libexec/bloom/current/bloom ]]
 [[ "$(shasum -a 256 "$identity_a" | awk '{print $1}')" == "$identity_before" ]]
 sudo -u "$login_user_a" "$machine_binary" serve triad-health-check "$release_digest"
 
@@ -405,5 +421,13 @@ if [[ -n "${BLOOM_MACOS_W0_EVIDENCE_DIR:-}" ]]; then
     mv -f "$temporary" "$evidence_dir/mui_09.pass"
   fi
 fi
+
+"$installer" uninstall / "$login_uid_b" "delete-bloom-login-$login_uid_b"
+installed_b=false
+[[ -L /usr/local/bin/bloom ]]
+[[ "$(readlink /usr/local/bin/bloom)" == ../libexec/bloom/current/bloom ]]
+"$installer" uninstall / "$login_uid_a" "delete-bloom-login-$login_uid_a"
+installed_a=false
+[[ ! -e /usr/local/bin/bloom && ! -L /usr/local/bin/bloom ]]
 
 echo "two-login macOS Unix-principal W0 passed"

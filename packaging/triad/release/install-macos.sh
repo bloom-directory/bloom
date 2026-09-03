@@ -31,6 +31,7 @@ created_groups=""
 upgrade_transaction=""
 upgrade_old_digest=""
 restore_pending=false
+legacy_cli_removed=false
 
 cleanup() {
   rc=$?
@@ -299,6 +300,7 @@ render() {
 paths() {
   product="$root_prefix/Library/Application Support/BloomTriad"; enrollments="$product/enrollments"
   enrollment="$enrollments/$login_uid.json"; release_base="$root_prefix/usr/local/libexec/bloom"
+  cli_bin_dir="$root_prefix/usr/local/bin"; cli_link="$cli_bin_dir/bloom"
   config="$product/config/$login_uid"; broker_config="$config/broker"; signer_config="$config/signer"
   machine_config="$config/machine"; session_config="$config/session"; installer_config="$config/installer"
   if $live; then variable=/private/var; else variable="$root_prefix/var"; fi
@@ -313,6 +315,140 @@ paths() {
   machine_plist="$root_prefix/Library/LaunchAgents/com.bloom.machine.plist"
   pf_anchor="$root_prefix/etc/pf.anchors/com.bloom.triad.$login_uid"
   newsyslog_config="$root_prefix/etc/newsyslog.d/bloom-$login_uid.conf"
+}
+
+preflight_cli_link() {
+  local directory target
+  for directory in "$root_prefix/usr" "$root_prefix/usr/local" "$cli_bin_dir"; do
+    [[ ! -e "$directory" && ! -L "$directory" ]] && continue
+    [[ -d "$directory" && ! -L "$directory" ]] || die "Bloom CLI parent path is unsafe: $directory"
+  done
+  [[ ! -e "$cli_link" && ! -L "$cli_link" ]] && return 0
+  [[ -L "$cli_link" ]] || die "refusing to overwrite unrelated Bloom CLI at $cli_link"
+  target="$(readlink "$cli_link")"
+  [[ "$target" == ../libexec/bloom/current/bloom ]] ||
+    die "refusing to overwrite unrelated Bloom CLI symlink at $cli_link"
+}
+
+install_cli_link() {
+  local replacement="$cli_link.new.$$"
+  mkdir -p "$cli_bin_dir"
+  ln -s ../libexec/bloom/current/bloom "$replacement"
+  $live && chown -h root:wheel "$replacement"
+  if [[ "$(uname -s)" == Darwin ]]; then
+    mv -fh "$replacement" "$cli_link"
+  else
+    mv -fT "$replacement" "$cli_link"
+  fi
+}
+
+remove_cli_link() {
+  local target
+  [[ ! -e "$cli_link" && ! -L "$cli_link" ]] && return 0
+  if [[ -L "$cli_link" ]]; then
+    target="$(readlink "$cli_link")"
+    if [[ "$target" == ../libexec/bloom/current/bloom ]]; then
+      rm -f -- "$cli_link"
+      return 0
+    fi
+  fi
+  echo "leaving unrelated Bloom CLI in place at $cli_link" >&2
+}
+
+resolve_login_home() {
+  if $live; then
+    login_home="$(dscl . -read "/Users/$login_user" NFSHomeDirectory |
+      awk 'NR==1{sub(/^NFSHomeDirectory:[[:space:]]*/,"");print}')"
+  else
+    # Staged installs intentionally never resolve or touch the invoking user's
+    # real home. This path also gives lifecycle tests an isolated migration root.
+    login_home="$root_prefix/Users/$login_user"
+  fi
+  [[ "$login_home" == /* && "$login_home" != / &&
+    "$login_home" != *$'\n'* && "$login_home" != *$'\r'* ]] ||
+    die "cannot safely resolve home for $login_user"
+}
+
+remove_legacy_cli() {
+  local parent legacy
+  resolve_login_home
+  for parent in "$login_home" "$login_home/.local" "$login_home/.local/bin"; do
+    [[ ! -e "$parent" && ! -L "$parent" ]] && return 0
+    [[ -d "$parent" && ! -L "$parent" ]] || {
+      echo "legacy Bloom CLI parent path is unsafe: $parent" >&2
+      return 1
+    }
+  done
+  legacy="$login_home/.local/bin/bloom"
+  [[ ! -e "$legacy" && ! -L "$legacy" ]] && return 0
+  if [[ -L "$legacy" || ( -f "$legacy" && ! -L "$legacy" ) ]]; then
+    if $live; then
+      /usr/bin/sudo -u "$login_user" -- /bin/rm -f -- "$legacy"
+    else
+      rm -f -- "$legacy"
+    fi
+    [[ ! -e "$legacy" && ! -L "$legacy" ]] || return 1
+    legacy_cli_removed=true
+    echo "Removed legacy $legacy; run 'hash -r' or 'rehash', or open a new terminal"
+    return 0
+  fi
+  echo "legacy Bloom CLI is not a regular file or symlink: $legacy" >&2
+  return 1
+}
+
+report_legacy_wallet_migrations() {
+  local wallet_root wallet_dir kind_file kind wallet_name receipt
+  local found_wallet=false found_supported=false
+  resolve_login_home
+  wallet_root="$login_home/.bloom/keystore"
+  if [[ ! -e "$wallet_root" && ! -L "$wallet_root" ]]; then
+    if $legacy_cli_removed; then
+      echo "Legacy Bloom wallets, if present, remain under $wallet_root"
+    fi
+    return 0
+  fi
+  if [[ ! -d "$wallet_root" || -L "$wallet_root" ]]; then
+    echo "Legacy Bloom wallet path is unsafe and was not inspected: $wallet_root" >&2
+    return 0
+  fi
+
+  echo "Legacy Bloom wallets were not modified and remain at: $wallet_root"
+  for wallet_dir in "$wallet_root"/*; do
+    [[ -e "$wallet_dir" || -L "$wallet_dir" ]] || continue
+    found_wallet=true
+    wallet_name="${wallet_dir##*/}"
+    if [[ ! -d "$wallet_dir" || -L "$wallet_dir" ]]; then
+      echo "Skipping unexpected legacy wallet entry: $wallet_dir" >&2
+      continue
+    fi
+    kind_file="$wallet_dir/kind"
+    if [[ ! -f "$kind_file" || -L "$kind_file" ]]; then
+      echo "Legacy wallet $wallet_name has no safe kind file; it was not modified" >&2
+      continue
+    fi
+    if ! kind="$(/bin/cat "$kind_file")"; then
+      echo "Legacy wallet $wallet_name could not be inspected; it was not modified" >&2
+      continue
+    fi
+    if [[ "$kind" != passkey ]]; then
+      echo "Legacy wallet $wallet_name uses unsupported kind '$kind'; only v1 passkey wallets can be migrated automatically" >&2
+      continue
+    fi
+
+    found_supported=true
+    receipt="$login_home/.bloom/$wallet_name.triad-migration-receipt.json"
+    echo "Migrate legacy passkey wallet $wallet_name with these two commands. Only the staging command requires sudo:"
+    printf '  sudo %q stage --source %q --config %q --source-uid %q --signer-uid %q --signer-gid %q --receipt %q\n' \
+      "$release_base/current/bloom-signer-migrate" "$wallet_dir" \
+      "$signer_config/config.json" "$login_uid" "$BLOOM_MACOS_SIGNER_UID" \
+      "$BLOOM_MACOS_SIGNER_GID" "$receipt"
+    printf '  %q wallet migrate-passkey %q\n' "$cli_link" "$receipt"
+  done
+  if ! $found_wallet; then
+    echo "No legacy wallets were found in $wallet_root"
+  elif ! $found_supported; then
+    echo "No supported v1 passkey wallets were detected; legacy wallet data was left in place"
+  fi
 }
 
 current_release_digest() {
@@ -367,13 +503,14 @@ rollback_failed_restore() {
   fi
   rm -f "$broker_plist" "$signer_plist" "$pf_anchor" "$newsyslog_config" "$enrollments/$login_uid.json"
   rm -rf "$runtime" "$log_root"
+  has_active_enrollments || remove_cli_link
   restore_pending=false
 }
 rollback_failed_fresh() {
   for label in "gui/$login_uid/com.bloom.machine" "user/$login_uid/com.bloom.machine" "system/com.bloom.broker.$login_uid" "system/com.bloom.signer.$login_uid" "gui/$login_uid/com.bloom.session" "user/$login_uid/com.bloom.session"; do launchctl bootout "$label" 2>/dev/null || true; done
   pf_reference remove || true; rm -f "$broker_plist" "$signer_plist" "$pf_anchor" "$newsyslog_config" "$enrollment"
   rm -rf "$config" "$variable/db/bloom/$login_uid" "$runtime" "$log_root"
-  has_active_enrollments || { launchctl bootout system/com.bloom.containment 2>/dev/null || true; rm -f "$containment_plist" "$session_plist" "$machine_plist"; }
+  has_active_enrollments || { launchctl bootout system/com.bloom.containment 2>/dev/null || true; rm -f "$containment_plist" "$session_plist" "$machine_plist"; remove_cli_link; }
 }
 write_enrollment() {
   state="$1"; tmp="$enrollment.new.$$"
@@ -717,7 +854,7 @@ snapshot_macos_upgrade_state() {
   done
   (cd "${root_prefix:-/}" && tar -cpf "$archive" "${paths[@]}")
   chmod 0600 "$archive"
-  $live && chown root:wheel "$archive"
+  if $live; then chown root:wheel "$archive"; fi
 }
 
 restore_macos_upgrade_state() {
@@ -758,11 +895,12 @@ upgrade_release() {
   if ! reload_installed_set || ! activate_installed_set; then
     echo "new Bloom release failed authenticated activation; restoring $old" >&2; stop_all_enrollments || true
     restore_macos_upgrade_state; switch_release "$old"
-    if reload_installed_set && activate_installed_set; then rm -rf -- "$upgrade_transaction"; upgrade_transaction=""
+    if reload_installed_set && activate_installed_set; then install_cli_link; rm -rf -- "$upgrade_transaction"; upgrade_transaction=""
       echo "previous Bloom release restored after failed activation" >&2
     else echo "automatic restoration of the previous Bloom release failed" >&2; fi
     return 1
   fi
+  install_cli_link
   write_state_schema
   rm -rf -- "$upgrade_transaction"; upgrade_transaction=""; upgrade_old_digest=""
 }
@@ -773,6 +911,7 @@ case "$action" in
     [[ "$login_user" =~ ^[a-z_][a-z0-9_-]*$ ]] || { echo "unsafe LOGIN_USER" >&2; exit 64; }
     $live && { lock_installer; [[ "$(id -u "$login_user")" == "$login_uid" ]] || die "LOGIN_USER does not match LOGIN_UID"; launchctl print "gui/$login_uid" >/dev/null 2>&1 || die "LOGIN_USER has no active GUI domain"; snapshot_live_payload; }
     requested_uid="$login_uid"; requested_user="$login_user"; load_names; paths; verify_payload; preflight_compatibility; prepare_verified_payload_for_execution
+    preflight_cli_link
     find_interrupted_upgrade
     login_uid="$requested_uid"; login_user="$requested_user"; load_names; paths
     shared_digest="$(current_release_digest)"
@@ -804,11 +943,17 @@ case "$action" in
     install_release
     if [[ "$had_active" == true && "$shared_digest" != "$BLOOM_RELEASE_DIGEST" && "$restoring" == false ]]; then
       upgrade_release "$shared_digest" "$BLOOM_RELEASE_DIGEST"
+      login_uid="$requested_uid"; login_user="$requested_user"
+      remove_legacy_cli || die "Bloom is healthy, but legacy CLI cleanup failed; remove ~/.local/bin/bloom and retry"
+      report_legacy_wallet_migrations
       echo "Bloom macOS release upgraded atomically"
       exit 0
     fi
     if [[ -n "$upgrade_transaction" ]]; then
       upgrade_release "$upgrade_old_digest" "$BLOOM_RELEASE_DIGEST"
+      login_uid="$requested_uid"; login_user="$requested_user"
+      remove_legacy_cli || die "Bloom is healthy, but legacy CLI cleanup failed; remove ~/.local/bin/bloom and retry"
+      report_legacy_wallet_migrations
       echo "Bloom macOS release upgraded atomically"
       exit 0
     fi
@@ -818,8 +963,12 @@ case "$action" in
       activate_current_enrollment || { $fresh && rollback_failed_fresh; die "Bloom failed full activation"; }
       created_users=""; created_groups=""
     fi
+    install_cli_link
     write_state_schema
-    if $restoring; then rm -f "$retained"; restore_pending=false; echo "Bloom macOS retained custody restored"; else echo "Bloom macOS enrollment installed or repaired"; fi
+    if $restoring; then rm -f "$retained"; restore_pending=false; fi
+    remove_legacy_cli || die "Bloom is healthy, but legacy CLI cleanup failed; remove ~/.local/bin/bloom and retry"
+    report_legacy_wallet_migrations
+    if $restoring; then echo "Bloom macOS retained custody restored"; else echo "Bloom macOS enrollment installed or repaired"; fi
     ;;
   uninstall)
     retain=false
@@ -851,6 +1000,7 @@ case "$action" in
     fi
     if ! has_active_enrollments; then
       $live && launchctl bootout system/com.bloom.containment 2>/dev/null || true; rm -f "$containment_plist" "$session_plist" "$machine_plist"
+      remove_cli_link
       if ! has_active_enrollments "$product/retained"; then rm -rf "$release_base"; fi
     fi
     $retain || echo "Bloom macOS enrollment permanently purged; custody is unrecoverable"

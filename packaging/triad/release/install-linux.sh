@@ -696,7 +696,13 @@ upgrade_old_digest=""
 
 begin_linux_upgrade() {
   local install_root="$1" old_digest="$2" new_digest="$3"
-  upgrade_transaction="$install_root/var/lib/bloom/upgrade-transaction"
+  local transaction_root="$install_root/var/lib/bloom"
+  mkdir -p "$transaction_root"
+  [[ -d "$transaction_root" && ! -L "$transaction_root" ]] || {
+    echo "Linux upgrade transaction root is unsafe" >&2
+    return 65
+  }
+  upgrade_transaction="$transaction_root/upgrade-transaction"
   [[ ! -e "$upgrade_transaction" && ! -L "$upgrade_transaction" ]] || {
     echo "an interrupted Linux upgrade must be recovered first" >&2
     return 65

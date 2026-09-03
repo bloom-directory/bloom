@@ -1,3 +1,5 @@
+#[cfg(target_os = "macos")]
+use std::process::Command;
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -288,13 +290,62 @@ fn macos_installer_has_a_forward_only_custody_preserving_lifecycle() {
 }
 
 #[test]
+fn macos_installer_manages_the_path_entry_and_migrates_legacy_cli_post_activation() {
+    let source =
+        fs::read_to_string(workspace().join("packaging/triad/release/install-macos.sh")).unwrap();
+    for required in [
+        "../libexec/bloom/current/bloom",
+        "preflight_cli_link",
+        "refusing to overwrite unrelated Bloom CLI",
+        "install_cli_link",
+        "remove_cli_link",
+        "resolve_login_home",
+        "/usr/bin/sudo -u \"$login_user\" -- /bin/rm -f -- \"$legacy\"",
+        "Bloom is healthy, but legacy CLI cleanup failed",
+        "report_legacy_wallet_migrations",
+        "Legacy Bloom wallets were not modified and remain at",
+        "Only the staging command requires sudo",
+        "wallet migrate-passkey",
+    ] {
+        assert!(
+            source.contains(required),
+            "CLI lifecycle is missing {required}"
+        );
+    }
+    assert_ordered(
+        &source,
+        &[
+            "activate_current_enrollment ||",
+            "write_state_schema",
+            "remove_legacy_cli || die \"Bloom is healthy",
+        ],
+    );
+    assert!(!source.contains("rm -rf -- \"$login_home/.local"));
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+fn staged_macos_installer_cli_lifecycle_passes() {
+    let status = Command::new("bash")
+        .arg(workspace().join("tests/packaging/macos-installer-staged.sh"))
+        .status()
+        .expect("run staged macOS installer CLI lifecycle");
+    assert!(status.success());
+}
+
+#[test]
 fn macos_installer_does_not_regenerate_custody_during_lifecycle_operations() {
     let source =
         fs::read_to_string(workspace().join("packaging/triad/release/install-macos.sh")).unwrap();
     for forbidden in ["triad-render-macos-identity-rotation", "rotate-identities"] {
         assert!(!source.contains(forbidden));
     }
-    assert!(!source.contains("source "));
+    assert!(
+        !source
+            .lines()
+            .any(|line| line.trim_start().starts_with("source ")),
+        "installer must not execute shell source commands"
+    );
 }
 
 #[test]
