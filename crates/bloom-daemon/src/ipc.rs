@@ -799,7 +799,7 @@ impl IpcServer {
 
     /// Trigger graceful shutdown of the running [`serve`] loop.
     pub fn trigger_shutdown(&self) {
-        self.shutdown.notify_waiters();
+        self.shutdown.notify_one();
     }
 
     /// Bind a UDS at `socket_path` and accept connections until shutdown
@@ -1018,7 +1018,7 @@ impl IpcServer {
             "chains" => Response::ok(id, json!(self.chains)),
             "shutdown" => {
                 info!("ipc.shutdown_requested_via_rpc");
-                self.shutdown.notify_waiters();
+                self.trigger_shutdown();
                 Response::ok(id, Value::Null)
             }
             "lookup" => match self.do_lookup(&req.params).await {
