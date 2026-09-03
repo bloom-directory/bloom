@@ -18,6 +18,7 @@ Environment=BLOOM_SESSION_SOCKET=/run/bloom/%i/session/session.sock
 Environment=BLOOM_SIGNER_SOCKET=/run/bloom/%i/signer/rpc/signer.sock
 Environment=BLOOM_SIGNER_CONTROL_SOCKET=/run/bloom/%i/signer/control/signer-control.sock
 Environment=BLOOM_SIGNER_AUDIT_CHECKPOINT_DIR=/var/lib/bloom/%i/signer/audit-checkpoints
+LoadCredential=kernel-boot-id:/proc/sys/kernel/random/boot_id
 Restart=on-failure
 RestartSec=5s
 TimeoutStopSec=30s

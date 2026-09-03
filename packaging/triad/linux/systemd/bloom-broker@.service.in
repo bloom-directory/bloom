@@ -21,6 +21,7 @@ Environment=BLOOM_BROKER_SOCKET=/run/bloom/%i/broker/rpc/broker.sock
 Environment=BLOOM_BROKER_CONTROL_SOCKET=/run/bloom/%i/broker/control/broker-control.sock
 Environment=BLOOM_BROKER_AUDIT_CHECKPOINT_DIR=/var/lib/bloom/%i/broker/audit-checkpoints
 Environment=BLOOM_BROKER_CEREMONY_ACTIVATION_NAME=broker-ceremony
+LoadCredential=kernel-boot-id:/proc/sys/kernel/random/boot_id
 Sockets=bloom-broker-ceremony@%i.socket
 Restart=on-failure
 RestartSec=5s
