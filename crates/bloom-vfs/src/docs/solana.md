@@ -64,15 +64,18 @@ request.
 Write `y` directly to
 `outbox/pending/<id>/confirm`. If fresh owner approval is required, this first
 write fails with permission denied after Bloom creates
-`approval_challenge.json`. This is the expected fail-closed boundary.
+`approval_challenge.json`. This is Bloom's expected application-level
+fail-closed response, not a Unix ownership, mode, or mount problem. Do not use
+`chmod`, `chown`, or remount the tree.
 
 Read the challenge and verify its action id, wallet, chain, destination, amount,
-and expiry. Give its ceremony URL to the owner; an agent must not complete the
-owner ceremony or handle owner credentials. After the owner approves, retry the
-same path with byte-identical confirmation bytes. After validating the challenge,
-start a bounded serial retry loop immediately; do not pause to inspect approval
-or capability state. Repeated permission errors before approval are expected,
-but do not suppress their stderr because a different error must stop the loop.
+and expiry. Surface its ceremony URL to the owner; an agent must not complete the
+owner ceremony or handle owner credentials. In the same turn, immediately start
+a bounded serial retry loop against the challenge's `retry_path` with
+byte-identical confirmation bytes. Do not wait for a new chat message: owner
+approval happens asynchronously while the loop runs. Repeated permission errors
+before approval are expected. Stop on any different error, success, terminal
+state, or expiry; do not hide stderr or inspect Unix permissions between retries.
 Do not restage or create a second transfer while waiting. A Solana blockhash
 expires quickly, so cancel a stale pending entry rather than trying to force it
 through.

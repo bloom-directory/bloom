@@ -247,7 +247,8 @@ assert "account_fingerprint" in solana_guide
 assert "approval_challenge.json" in solana_guide
 assert "broadcast_attempted.json" in solana_guide
 assert "validity clock starts" in solana_guide
-assert "start a bounded serial retry loop immediately" in solana_guide
+assert "not a Unix ownership, mode, or mount problem" in solana_guide
+assert "Do not wait for a new chat message" in solana_guide
 SOLTOML
 
 # Serve deterministic Solana RPC responses so the verifier's trust boundary is

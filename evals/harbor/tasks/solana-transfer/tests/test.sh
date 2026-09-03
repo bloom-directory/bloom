@@ -18,8 +18,11 @@ cleanup() {
   # entry; it cannot move funds and is safe to repeat.
   local id
   for id in $(timeout 30 ls -1 "${outbox}/pending" 2>/dev/null); do
+    # A control write may report an ambiguous transport error after Bloom has
+    # accepted it, or race expiry/reconciliation. Judge cleanup by the drain
+    # postcondition below rather than the write's exit status.
     timeout 30 bash -c 'printf %s cleanup > "$1"' _ "${outbox}/pending/${id}/cancel" \
-      >/dev/null 2>&1 || cleanup_status=1
+      >/dev/null 2>&1 || true
   done
   # Require the pending directory to drain. A residual staged entry holds a
   # blockhash that could still be broadcast later, so it is not an acceptable
