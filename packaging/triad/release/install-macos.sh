@@ -834,7 +834,9 @@ activate_installed_set() {
 }
 
 snapshot_macos_upgrade_state() {
-  local archive="$upgrade_transaction/rollback-state.tar" record uid
+  local archive scratch record uid
+  archive="$upgrade_transaction/rollback-state.tar"
+  scratch="$archive.new.$$"
   local -a paths=(
     "Library/Application Support/BloomTriad/enrollments"
     "Library/Application Support/BloomTriad/config"
@@ -852,9 +854,13 @@ snapshot_macos_upgrade_state() {
       "etc/newsyslog.d/bloom-$uid.conf"
     )
   done
-  (cd "${root_prefix:-/}" && tar -cpf "$archive" "${paths[@]}")
-  chmod 0600 "$archive"
-  if $live; then chown root:wheel "$archive"; fi
+  (cd "${root_prefix:-/}" && tar -cpf "$scratch" "${paths[@]}")
+  tar -tf "$scratch" >/dev/null
+  chmod 0600 "$scratch"
+  if $live; then chown root:wheel "$scratch"; fi
+  sync
+  mv -f "$scratch" "$archive"
+  sync
 }
 
 restore_macos_upgrade_state() {
@@ -879,6 +885,15 @@ find_interrupted_upgrade() {
 
 upgrade_release() {
   local old="$1" new="$2"
+  local record uid
+  if $live; then
+    for record in "$enrollments"/*.json; do
+      [[ -f "$record" && ! -L "$record" ]] || continue
+      uid="${record##*/}"; uid="${uid%.json}"
+      launchctl print "user/$uid" >/dev/null 2>&1 ||
+        die "all enrolled Bloom users must be logged in before a shared release upgrade"
+    done
+  fi
   upgrade_transaction="$product/upgrade-transaction"
   if [[ ! -e "$upgrade_transaction" ]]; then
     mkdir -m 0700 "$upgrade_transaction"
@@ -943,7 +958,7 @@ case "$action" in
     install_release
     if [[ "$had_active" == true && "$shared_digest" != "$BLOOM_RELEASE_DIGEST" && "$restoring" == false ]]; then
       upgrade_release "$shared_digest" "$BLOOM_RELEASE_DIGEST"
-      login_uid="$requested_uid"; login_user="$requested_user"
+      login_uid="$requested_uid"; login_user="$requested_user"; load_names; paths; load_ids
       remove_legacy_cli || die "Bloom is healthy, but legacy CLI cleanup failed; remove ~/.local/bin/bloom and retry"
       report_legacy_wallet_migrations
       echo "Bloom macOS release upgraded atomically"
@@ -951,7 +966,7 @@ case "$action" in
     fi
     if [[ -n "$upgrade_transaction" ]]; then
       upgrade_release "$upgrade_old_digest" "$BLOOM_RELEASE_DIGEST"
-      login_uid="$requested_uid"; login_user="$requested_user"
+      login_uid="$requested_uid"; login_user="$requested_user"; load_names; paths; load_ids
       remove_legacy_cli || die "Bloom is healthy, but legacy CLI cleanup failed; remove ~/.local/bin/bloom and retry"
       report_legacy_wallet_migrations
       echo "Bloom macOS release upgraded atomically"
