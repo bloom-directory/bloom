@@ -1330,14 +1330,26 @@ impl TxEngine {
         let nonce = match intent.nonce {
             Some(n) => n,
             None => {
-                let chain_nonce = session.nonce(from).await?;
+                // Deliberately off the pinned session: `Session::nonce` is the
+                // *historical* count at the pinned block, and a transaction
+                // that has broadcast but not yet mined does not appear in it.
+                // `ChainClient::nonce` asks for the pending block instead, the
+                // same source the broadcast-time gap guard uses. Nonces belong
+                // with `gas_price` and `estimate_gas` on the bare client for
+                // exactly the reason given above: pending semantics do not fit
+                // the pinned model.
+                //
+                // The pinned read was a nonce collision. `highest_pending_nonce`
+                // only sees `pending/`, and broadcasting moves an entry to
+                // `sent/`, so between broadcast and inclusion neither source
+                // knew about the in-flight transaction and the next stage
+                // reused its nonce. Seen live on a Morpho approve→deposit pair.
+                let chain_nonce = chain.nonce(from).await?;
                 let pending_high = self
                     .outbox
                     .highest_pending_nonce(wallet, &spec.name, from)?;
                 // If there are staged-but-unconfirmed txs, use the slot
-                // after the highest pending nonce. After broadcast they
-                // move to sent/ and the chain RPC returns the updated
-                // next nonce — no stale-data risk once the queue drains.
+                // after the highest pending nonce.
                 pending_high.map_or(chain_nonce, |h| chain_nonce.max(h + 1))
             }
         };
