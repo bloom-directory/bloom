@@ -1417,8 +1417,8 @@ fn vfs_cat_status_update_with_seed_cache_reports_behind() {
         &cache_dir,
         &bloom_update::UpdateSnapshot::ok(
             "0.1.0".into(),
-            Some("0.2.0".into()),
-            Some("https://github.com/bloom-directory/bloom/releases/tag/v0.2.0".into()),
+            Some("0.3.0".into()),
+            Some("https://github.com/bloom-directory/bloom/releases/tag/v0.3.0".into()),
         ),
     )
     .unwrap();
@@ -1430,13 +1430,13 @@ fn vfs_cat_status_update_with_seed_cache_reports_behind() {
         .args(["vfs", "cat", "/status/update/latest"])
         .assert()
         .success()
-        .stdout(predicate::eq("0.2.0\n"));
+        .stdout(predicate::eq("0.3.0\n"));
     bloom_cmd(home.path())
         .args(["vfs", "cat", "/status/update/available"])
         .assert()
         .success()
         .stdout(predicate::eq(
-            if bloom_update::compare_semver(env!("CARGO_PKG_VERSION"), "0.2.0")
+            if bloom_update::compare_semver(env!("CARGO_PKG_VERSION"), "0.3.0")
                 == std::cmp::Ordering::Less
             {
                 "out_of_date\n"
@@ -1448,9 +1448,9 @@ fn vfs_cat_status_update_with_seed_cache_reports_behind() {
         .arg("status")
         .assert()
         .success()
-        .stdout(predicate::str::contains("latest_release: 0.2.0"))
+        .stdout(predicate::str::contains("latest_release: 0.3.0"))
         .stdout(predicate::str::contains("update_available: out_of_date"))
-        .stderr(predicate::str::contains("hint: bloom v0.2.0 is available"));
+        .stderr(predicate::str::contains("hint: bloom v0.3.0 is available"));
 }
 
 #[test]
