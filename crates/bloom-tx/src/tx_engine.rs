@@ -3304,12 +3304,40 @@ impl TxEngine {
                         }
                         OperationState::Denied
                         | OperationState::Cancelled
-                        | OperationState::Failed
-                        | OperationState::Quarantined => {
+                        | OperationState::Failed => {
+                            // The Broker releases the reservation for these
+                            // three and calls them a definite terminal
+                            // failure: no signature was produced and none can
+                            // be. Holding `sign_dispatched` past that point
+                            // wedges the batch permanently — unlike the single
+                            // payload path there is no `action_id` gate to
+                            // supersede the row, so every later call re-reads
+                            // the same dead operation and denies. Clearing it
+                            // lets a fresh ceremony be minted for the same
+                            // ordered bytes.
+                            state.sign_dispatched = false;
+                            state.expected_operation_digest = None;
+                            state.ceremony_url = None;
+                            state.ceremony_expires_at_ms = None;
+                            write_triad_batch_signing_state(&state_path, &state)?;
                             return Err(TxEngineError::ApprovalDenied(format!(
                                 "Broker batch operation is terminal: {:?}",
                                 status.state
                             )));
+                        }
+                        OperationState::Quarantined => {
+                            // Quarantine is the Broker reporting an ambiguous
+                            // provider effect: a signature may exist. The
+                            // marker stays, because re-signing these nonces
+                            // could double-spend them. Only the dead ceremony
+                            // URL is cleared, so the owner is not pointed at a
+                            // page that can no longer do anything.
+                            state.ceremony_url = None;
+                            state.ceremony_expires_at_ms = None;
+                            write_triad_batch_signing_state(&state_path, &state)?;
+                            return Err(TxEngineError::ApprovalDenied(
+                                "Broker batch operation is terminal: Quarantined".into(),
+                            ));
                         }
                     }
                 }
@@ -3388,12 +3416,26 @@ impl TxEngine {
             state.sign_dispatched = true;
             write_triad_batch_signing_state(&state_path, &state)?;
         }
-        match service
-            .broker
-            .sign_exact_payload_batch(request)
-            .await
-            .map_err(protocol_signing_error)?
-        {
+        let outcome = match service.broker.sign_exact_payload_batch(request).await {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                // Same reasoning as the single-payload path: the marker is
+                // written before dispatch so a crash is assumed to have signed,
+                // but `durable_effect: none` is the Broker saying it refused
+                // before anything durable happened. Leaving it set records a
+                // dispatch that provably did not occur, and for a batch that is
+                // unrecoverable — there is no `action_id` supersession here.
+                if state.approval_id.is_some()
+                    && error.code.contract().durable_effect == DurableEffect::None
+                {
+                    state.sign_dispatched = false;
+                    state.expected_operation_digest = None;
+                    write_triad_batch_signing_state(&state_path, &state)?;
+                }
+                return Err(protocol_signing_error(error));
+            }
+        };
+        match outcome {
             ExactPayloadSignOutcome::ApprovalRequired(prepared) => {
                 if state
                     .approval_id
@@ -4690,6 +4732,10 @@ mod tests {
         active: AtomicBool,
         approval_terminal: parking_lot::Mutex<Option<ApprovalLifecycleState>>,
         deny_sign: parking_lot::Mutex<Option<ProtocolErrorCode>>,
+        /// Forces `operation.status` to report a terminal state instead of
+        /// `Succeeded`, which is how a dispatched row learns its signing
+        /// operation died.
+        operation_terminal: parking_lot::Mutex<Option<OperationState>>,
         lose_sign_response_once: AtomicBool,
         corrupt_status_result: AtomicBool,
         completed_result: parking_lot::Mutex<Option<SigningResult>>,
@@ -4776,12 +4822,13 @@ mod tests {
                         if self.corrupt_status_result.load(Ordering::SeqCst) {
                             result.operation_id = OperationId::from_bytes([222; 32]);
                         }
+                        let terminal = *self.operation_terminal.lock();
                         Ok(MachineBrokerResponse::OperationStatus(
                             OperationPublicStatus {
                                 operation_id: request.operation_id,
                                 operation_digest: result.operation_digest.clone(),
-                                state: OperationState::Succeeded,
-                                result: Some(result),
+                                state: terminal.unwrap_or(OperationState::Succeeded),
+                                result: terminal.is_none().then_some(result),
                                 error: None,
                             },
                         ))
@@ -4818,6 +4865,12 @@ mod tests {
                         Ok(MachineBrokerResponse::SigningSign(result))
                     }
                     MachineBrokerRequest::SigningSignBatch(request) => {
+                        if let Some(code) = *self.deny_sign.lock() {
+                            return Err(bloom_broker_api::ProtocolError::new(
+                                code,
+                                "simulated Broker refusal before any batch signing",
+                            ));
+                        }
                         let SigningPayloads::Batch { children } = &request.payloads else {
                             panic!("fixture expects an exact payload batch");
                         };
@@ -5616,6 +5669,7 @@ mod tests {
             active: AtomicBool::new(false),
             approval_terminal: parking_lot::Mutex::new(None),
             deny_sign: parking_lot::Mutex::new(None),
+            operation_terminal: parking_lot::Mutex::new(None),
             lose_sign_response_once: AtomicBool::new(false),
             corrupt_status_result: AtomicBool::new(false),
             completed_result: parking_lot::Mutex::new(None),
@@ -5930,6 +5984,7 @@ mod tests {
             active: AtomicBool::new(active),
             approval_terminal: parking_lot::Mutex::new(None),
             deny_sign: parking_lot::Mutex::new(None),
+            operation_terminal: parking_lot::Mutex::new(None),
             lose_sign_response_once: AtomicBool::new(lose_sign_response_once),
             corrupt_status_result: AtomicBool::new(false),
             completed_result: parking_lot::Mutex::new(None),
@@ -6064,6 +6119,112 @@ mod tests {
                 .iter()
                 .any(|request| matches!(request, MachineBrokerRequest::SigningSign(_)))
         );
+    }
+
+    #[tokio::test]
+    async fn a_refused_batch_signature_clears_the_dispatch_marker_it_never_earned() {
+        let directory = tempfile::tempdir().unwrap();
+        let outbox = Outbox::new(directory.path().join("outbox")).unwrap();
+        let (engine, fixture, _) = triad_batch_fixture(outbox.clone(), false, false);
+        let (refs, staged, preimages, hashes) = batch_material(&["refused-a", "refused-b"]);
+
+        assert!(matches!(
+            engine
+                .triad_sign_evm_batch("alice", &refs, &staged, &preimages, &hashes)
+                .await,
+            Err(TxEngineError::ApprovalRequired(_))
+        ));
+
+        // The owner completes the ceremony, the commit misses the approval's
+        // validity window, and the Broker refuses outright — the shape that
+        // stranded a live Morpho approve→deposit pair.
+        fixture.active.store(true, Ordering::SeqCst);
+        *fixture.deny_sign.lock() = Some(ProtocolErrorCode::ClaimInvalid);
+        assert!(matches!(
+            engine
+                .triad_sign_evm_batch("alice", &refs, &staged, &preimages, &hashes)
+                .await,
+            Err(TxEngineError::ApprovalDenied(_))
+        ));
+
+        let state_path = batch_signing_state_path(outbox.root(), "alice", &refs).unwrap();
+        let state = read_triad_batch_signing_state(&state_path)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            ProtocolErrorCode::ClaimInvalid.contract().durable_effect,
+            DurableEffect::None,
+            "the premise of this test is the Broker promising nothing durable happened"
+        );
+        // Regression: this stayed true, and a batch has no `action_id` gate to
+        // supersede the row, so the pair was wedged with no recovery short of
+        // deleting the state file by hand.
+        assert!(
+            !state.sign_dispatched,
+            "a refusal that changed nothing must not leave a dispatch recorded"
+        );
+        assert!(state.expected_operation_digest.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_definitely_terminal_batch_operation_releases_the_row_but_quarantine_holds_it() {
+        for (terminal, marker_should_clear) in [
+            // The Broker releases the reservation for these and calls them a
+            // definite terminal failure: no signature exists or can.
+            (OperationState::Denied, true),
+            (OperationState::Cancelled, true),
+            (OperationState::Failed, true),
+            // Quarantine is an ambiguous provider effect. A signature may be
+            // out there, so re-signing these nonces could double-spend them.
+            (OperationState::Quarantined, false),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let outbox = Outbox::new(directory.path().join("outbox")).unwrap();
+            let (engine, fixture, _) = triad_batch_fixture(outbox.clone(), false, true);
+            let (refs, staged, preimages, hashes) = batch_material(&["terminal-a", "terminal-b"]);
+
+            assert!(matches!(
+                engine
+                    .triad_sign_evm_batch("alice", &refs, &staged, &preimages, &hashes)
+                    .await,
+                Err(TxEngineError::ApprovalRequired(_))
+            ));
+            // Lose the response so the row is left holding `sign_dispatched`,
+            // which is the only way to reach the status re-read below.
+            fixture.active.store(true, Ordering::SeqCst);
+            assert!(matches!(
+                engine
+                    .triad_sign_evm_batch("alice", &refs, &staged, &preimages, &hashes)
+                    .await,
+                Err(TxEngineError::ApprovalServiceUnavailable(_))
+            ));
+            let state_path = batch_signing_state_path(outbox.root(), "alice", &refs).unwrap();
+            assert!(
+                read_triad_batch_signing_state(&state_path)
+                    .unwrap()
+                    .unwrap()
+                    .sign_dispatched
+            );
+
+            *fixture.operation_terminal.lock() = Some(terminal);
+            assert!(matches!(
+                engine
+                    .triad_sign_evm_batch("alice", &refs, &staged, &preimages, &hashes)
+                    .await,
+                Err(TxEngineError::ApprovalDenied(_))
+            ));
+
+            let state = read_triad_batch_signing_state(&state_path)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                !state.sign_dispatched, marker_should_clear,
+                "{terminal:?} was handled as though it were the other kind of terminal"
+            );
+            // Either way the ceremony URL is dead and must stop being offered.
+            assert!(state.ceremony_url.is_none(), "{terminal:?}");
+            assert!(state.ceremony_expires_at_ms.is_none(), "{terminal:?}");
+        }
     }
 
     #[tokio::test]
