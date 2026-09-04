@@ -92,17 +92,19 @@ fn tag_release_builds_the_locked_triad_and_isolates_production_signing() {
     assert!(!workflow.contains("--platform-claim linux"));
     assert!(workflow.contains("environment: production-release"));
     assert!(workflow.contains("packaging/triad/release.sh sign linux"));
+    assert!(workflow.contains("packaging/triad/release.sh build macos"));
+    assert!(workflow.contains("packaging/triad/release.sh sign macos"));
     assert!(!workflow.contains("triad-release-gate.sh"));
     assert!(!workflow.contains("verify-release-candidate.sh"));
     assert!(!workflow.contains("sign-release-candidate.sh"));
     assert!(workflow.contains("packaging/triad/release/bloom-release-v1.pub"));
-    assert!(workflow.contains("--prerelease"));
-    assert!(workflow.contains("--latest=false"));
+    assert!(!workflow.contains("--prerelease"));
+    assert!(!workflow.contains("prerelease=true"));
     assert!(workflow.contains("dry_run:"));
     assert!(workflow.contains("if: needs.prepare.outputs.dry_run != 'true'"));
     assert!(workflow.contains("release dry runs require workflow_dispatch"));
     assert!(workflow.contains(
-        "sign:\n    name: Sign reviewed candidate\n    needs: [prepare, build]\n    if: needs.prepare.outputs.dry_run != 'true'"
+        "sign:\n    name: Sign reviewed candidates\n    needs: [prepare, build, build-macos]\n    if: needs.prepare.outputs.dry_run != 'true'"
     ));
     assert!(!workflow.contains("--all-features"));
     assert!(!workflow.contains("--clobber"));
@@ -130,19 +132,9 @@ fn tag_release_builds_the_locked_triad_and_isolates_production_signing() {
 
 #[test]
 fn macos_release_candidate_matches_the_linux_candidate_contract() {
-    let workflow =
-        fs::read_to_string(workspace().join(".github/workflows/macos-release-candidate.yml"))
-            .unwrap();
+    let workflow = fs::read_to_string(workspace().join(".github/workflows/release.yml")).unwrap();
     assert!(workflow.contains("workflow_dispatch:"));
-    assert!(!workflow.contains("push:"));
-    assert!(!workflow.contains("pull_request:"));
     assert!(workflow.contains("runs-on: macos-15"));
-    assert!(
-        workflow
-            .lines()
-            .filter(|line| line.trim_start().starts_with("runs-on:"))
-            .all(|line| line.trim() == "runs-on: macos-15")
-    );
     assert!(workflow.contains("uname -m | grep -Fx arm64"));
     assert!(workflow.contains("packaging/triad/release.sh build macos"));
     assert!(!workflow.contains("triad-release-gate.sh"));

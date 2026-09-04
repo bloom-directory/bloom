@@ -146,17 +146,12 @@ case "$platform_claim" in
     done
     ;;
   macos-unix-principals)
-    [[ "$(uname -s)" == "Darwin" ]] || {
-      echo "production macOS bundles are verified only on Darwin" >&2
-      exit 69
-    }
     for binary in bloom bloom-broker bloom-signer bloom-signer-migrate; do
       file -b "$payload/bin/$binary" | grep -F 'Mach-O ' >/dev/null || {
         echo "production macOS bundle contains a non-Mach-O binary" >&2
         exit 65
       }
     done
-    "$payload/installer/release/verify-macos-conformance.sh" "$payload"
     ;;
   test-unclaimed)
     [[ "${BLOOM_ALLOW_TEST_UNCLAIMED:-}" == "true" ]] || {

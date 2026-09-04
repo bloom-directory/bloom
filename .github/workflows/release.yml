@@ -1,8 +1,7 @@
 name: Release
 
-# The first triad release deliberately ships one reviewable target: Linux
-# x86_64. Releases remain prereleases until the signed artifact has been
-# exercised on a disposable systemd host.
+# Dry runs build unsigned test candidates for both supported platforms.
+# Version tags build, production-sign, and publish both artifacts together.
 
 on:
   push:
@@ -11,14 +10,14 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Existing tag to retry (for example v0.1.4).'
+        description: 'Existing tag to retry when dry_run is false (for example v0.2.0).'
         required: false
         default: ''
         type: string
       dry_run:
-        description: 'Build an ephemeral test-unclaimed candidate without publishing a release.'
+        description: 'Build test candidates only. No production signing or GitHub Release.'
         required: false
-        default: false
+        default: true
         type: boolean
 
 permissions: {}
@@ -190,7 +189,6 @@ jobs:
   build-macos:
     name: Build and test macOS aarch64 candidate
     needs: prepare
-    if: needs.prepare.outputs.dry_run == 'true'
     runs-on: macos-15
     timeout-minutes: 90
     permissions:
@@ -242,6 +240,7 @@ jobs:
         env:
           SOURCE_DATE_EPOCH: ${{ needs.prepare.outputs.source_date_epoch }}
         run: |
+          uname -m | grep -Fx arm64
           packaging/triad/release.sh build macos \
             --output-dir "$RUNNER_TEMP/candidate"
 
@@ -254,8 +253,8 @@ jobs:
           retention-days: 3
 
   sign:
-    name: Sign reviewed candidate
-    needs: [prepare, build]
+    name: Sign reviewed candidates
+    needs: [prepare, build, build-macos]
     if: needs.prepare.outputs.dry_run != 'true'
     runs-on: ubuntu-24.04
     environment: production-release
@@ -271,7 +270,12 @@ jobs:
       - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
           name: triad-linux-x86_64-candidate
-          path: candidate
+          path: candidate/linux
+
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: triad-macos-aarch64-candidate
+          path: candidate/macos
 
       - name: Re-sign candidate without executing it
         env:
@@ -289,7 +293,17 @@ jobs:
           printf '%s\n' "$RELEASE_SIGNING_KEY" > "$signing_key"
           unset RELEASE_SIGNING_KEY
           packaging/triad/release.sh sign linux \
-            candidate/bloom-triad-test-unclaimed.tar.gz \
+            candidate/linux/bloom-triad-test-unclaimed.tar.gz \
+            --output-dir signed \
+            --signing-key "$signing_key" \
+            --pinned-public-key packaging/triad/release/bloom-release-v1.pub \
+            --source-date-epoch "$SOURCE_DATE_EPOCH" \
+            --version '${{ needs.prepare.outputs.release_version }}' \
+            --machine-sha '${{ needs.prepare.outputs.release_sha }}' \
+            --broker-sha '${{ needs.prepare.outputs.broker_sha }}' \
+            --signer-sha '${{ needs.prepare.outputs.signer_sha }}'
+          packaging/triad/release.sh sign macos \
+            candidate/macos/bloom-triad-test-unclaimed.tar.gz \
             --output-dir signed \
             --signing-key "$signing_key" \
             --pinned-public-key packaging/triad/release/bloom-release-v1.pub \
@@ -311,17 +325,25 @@ jobs:
           cmp \
             packaging/triad/release/bloom-release-v1.pub \
             signed/bloom-triad-linux-x86_64.tar.gz.pub
+          packaging/triad/release/verify-bundle.sh \
+            signed/bloom-triad-macos-aarch64.tar.gz \
+            signed/bloom-triad-macos-aarch64.tar.gz.sha256 \
+            signed/bloom-triad-macos-aarch64.tar.gz.sig \
+            packaging/triad/release/bloom-release-v1.pub
+          cmp \
+            packaging/triad/release/bloom-release-v1.pub \
+            signed/bloom-triad-macos-aarch64.tar.gz.pub
 
       - name: Upload signed release assets
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: triad-linux-x86_64-signed
-          path: signed/bloom-triad-linux-x86_64.tar.gz*
+          name: triad-signed-release
+          path: signed/bloom-triad-*.tar.gz*
           if-no-files-found: error
           retention-days: 7
 
   publish:
-    name: Publish prerelease
+    name: Publish release
     needs: [prepare, sign]
     if: needs.prepare.outputs.dry_run != 'true'
     runs-on: ubuntu-24.04
@@ -335,10 +357,10 @@ jobs:
 
       - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
-          name: triad-linux-x86_64-signed
+          name: triad-signed-release
           path: dist
 
-      - name: Create or update GitHub prerelease
+      - name: Create or update GitHub release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPOSITORY: ${{ github.repository }}
@@ -355,12 +377,10 @@ jobs:
           }
           notes="$(mktemp)"
           cat > "$notes" <<EOF
-          ## Bloom v$VERSION triad preview
+          ## Bloom v$VERSION
 
-          This prerelease contains the signed Linux x86_64 Machine, Broker, and
-          Signer bundle. It is published for release validation and operator
-          integration; the public agent setup remains pinned to v0.1.3 until a
-          fresh-install systemd acceptance lane passes.
+          This release contains signed Bloom triad bundles for Linux x86_64 and
+          macOS aarch64.
 
           Verify the archive checksum signature with the reviewed key at
           \`packaging/triad/release/bloom-release-v1.pub\` and the namespace
@@ -397,17 +417,15 @@ jobs:
             release_id="$(gh api "repos/$REPOSITORY/releases/tags/$TAG" --jq .id)"
             gh api --method PATCH \
               "repos/$REPOSITORY/releases/$release_id" \
-              -f name="Bloom v$VERSION triad preview" \
+              -f name="Bloom v$VERSION" \
               -f body="$(<"$notes")" \
-              -F prerelease=true \
-              -f make_latest=false
+              -F prerelease=false \
+              -f make_latest=true
             echo "Existing assets are byte-identical; missing assets were uploaded."
           else
             gh release create "$TAG" \
               --verify-tag \
-              --title "Bloom v$VERSION triad preview" \
+              --title "Bloom v$VERSION" \
               --notes-file "$notes" \
-              --prerelease \
-              --latest=false \
               dist/*
           fi

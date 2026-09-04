@@ -274,21 +274,6 @@ case "$platform_claim" in
     for binary in bloom bloom-broker bloom-signer bloom-signer-migrate; do
       require_binary_format "$staging/bin/$binary" 'Mach-O ' || exit 65
     done
-    for evidence_name in \
-      BLOOM_MACOS_CONFORMANCE_REPORT \
-      BLOOM_MACOS_CONFORMANCE_SIGNATURE \
-      BLOOM_MACOS_CONFORMANCE_PUBLIC_KEY
-    do
-      evidence_path="${!evidence_name:-}"
-      [[ -f "$evidence_path" && ! -L "$evidence_path" ]] || {
-        echo "$evidence_name must name a regular conformance input" >&2
-        exit 66
-      }
-    done
-    [[ "${BLOOM_MACOS_CONFORMANCE_KEY_SHA256:-}" =~ ^[0-9a-f]{64}$ ]] || {
-      echo "BLOOM_MACOS_CONFORMANCE_KEY_SHA256 must pin the reviewed conformance key" >&2
-      exit 66
-    }
     ;;
   test-unclaimed)
     [[ "${BLOOM_ALLOW_TEST_UNCLAIMED:-}" == "true" ]] || {
@@ -323,18 +308,6 @@ install -m 0755 "$script_dir/verify-bundle.sh" "$payload/installer/release/"
 reject_machine_legacy_authority_files "$payload" "packaged Machine artifact"
 reject_legacy_authority_symbols "$payload/bin/bloom"
 reject_global_debug_artifact_files "$payload" "packaged"
-
-if [[ "$platform_claim" == "macos-unix-principals" ]]; then
-  install -m 0644 \
-    "$BLOOM_MACOS_CONFORMANCE_REPORT" \
-    "$payload/MACOS_CONFORMANCE_REPORT.json"
-  install -m 0644 \
-    "$BLOOM_MACOS_CONFORMANCE_SIGNATURE" \
-    "$payload/MACOS_CONFORMANCE_REPORT.sig"
-  install -m 0644 \
-    "$BLOOM_MACOS_CONFORMANCE_PUBLIC_KEY" \
-    "$payload/MACOS_CONFORMANCE_REPORT.pub"
-fi
 
 if [[ "$platform_claim" == "macos-unix-principals" ||
   "$platform_claim" == "macos-unix-principals-w0" ]]
@@ -376,12 +349,6 @@ for revision_name in BLOOM_MACHINE_SHA BLOOM_BROKER_SHA BLOOM_SIGNER_SHA; do
   }
   printf '%s=%s\n' "$revision_name" "$revision"
 done | LC_ALL=C sort > "$payload/SOURCE_REVISIONS"
-
-if [[ "$platform_claim" == "macos-unix-principals" ]]; then
-  "$script_dir/verify-macos-conformance.sh" \
-    "$payload" \
-    "$BLOOM_MACOS_CONFORMANCE_KEY_SHA256"
-fi
 
 "$script_dir/ssh-ed25519-public-key.sh" \
   "$signing_key" \

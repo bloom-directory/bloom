@@ -25,33 +25,18 @@ path never executes a Homebrew- or login-user-owned crypto implementation.
 
 `verify-bundle.sh` verifies the detached signature and both the outer and
 internal checksums before accepting the compatibility matrix or installers.
-Production verification currently accepts Linux ELF bundles. The
+Production verification accepts Linux ELF and macOS Mach-O bundles. The
 non-production `macos-unix-principals-w0` claim accepts Mach-O binaries only
 in its explicitly enabled disposable Darwin lane. The `test-unclaimed` marker requires the explicit
 `BLOOM_ALLOW_TEST_UNCLAIMED=true` override at build, verification, and install;
 neither test claim can be advertised as production.
 
-Production `macos-unix-principals` bundles are accepted only on Darwin and
-only with a signed `bloom.macos-unix-conformance.1` report. The builder
-requires an out-of-band SHA-256 pin for the conformance public key; the report
-must bind the canonical release-subject digest, all three source revisions,
-MUI-01 through MUI-12, installed AC-01 through AC-35, negative-access tests,
-and the two-login lifecycle suite. The subject digest covers every packaged
-binary, installer, compatibility input, plist, ACL, and packet-filter source
-while excluding only the platform-claim value and the release/conformance
-signature envelope. This avoids a self-referential archive digest while still
-invalidating evidence after any security-relevant packaged input changes.
-The final archive and internal release signature then bind the report and its
-public key into the distributed artifact.
-
-`macos-conformance-subject.sh` computes the canonical subject.
-`sign-macos-conformance-report.sh` refuses to sign until each required
-criterion has a regular `CRITERION.pass` evidence file containing that exact
-subject digest; it never overwrites an existing report. The release operator
-reviews those suite outputs and signs with the separately controlled
-conformance key. `verify-macos-conformance.sh` verifies that signature,
-criterion completeness, source revisions, subject binding, and—during
-production assembly—the out-of-band conformance-key fingerprint.
+Production `macos-unix-principals` bundles are authenticated by the same
+reviewed release key as Linux bundles. Tart conformance remains available as
+an optional manual validation suite, but its report is not an input to
+production signing or publication. `macos-conformance-subject.sh`,
+`sign-macos-conformance-report.sh`, and `verify-macos-conformance.sh` can bind
+manual results to an exact candidate without changing the release contract.
 
 For one candidate payload `C`, the disposable evidence matrix is:
 
@@ -85,28 +70,21 @@ repository-wide formatting, Clippy, or test suites; those are independent CI
 source-quality gates. Both platforms emit the archive plus `.sha256`, `.sig`,
 and `.pub` sidecars.
 
-`.github/workflows/macos-release-candidate.yml` is the manual, standard-runner
-macOS aarch64 counterpart to the Linux candidate build. It runs the same
-release command on `macos-15`, proves the staged macOS installer, rejects
-non-arm64 outputs, and uploads the four `bloom-triad-test-unclaimed.tar.gz*`
-files as `triad-macos-aarch64-candidate`. It has no push or pull-request trigger
-and does not use a larger macOS runner. The ephemeral candidate key is trusted
-only when a user explicitly selects that exact Actions artifact; the candidate
-is not a production macOS claim. Live candidate installation requires both a
+The release workflow builds the macOS aarch64 candidate on `macos-15` alongside
+the Linux candidate. A manual `dry_run=true` dispatch uploads both
+`test-unclaimed` candidates as Actions artifacts and cannot reach production
+signing or GitHub publication. Live candidate installation requires both a
 root-owned, non-writable pin of that artifact's ephemeral public key and the
-explicit `BLOOM_ALLOW_TEST_UNCLAIMED=true` installer opt-in, matching the Linux
-candidate trust boundary.
+explicit `BLOOM_ALLOW_TEST_UNCLAIMED=true` installer opt-in.
 
 `release.sh sign linux|macos` is the isolated production signing pass. It never
-executes a candidate-owned binary or script. It verifies the expected version
-and three source revisions, replaces the ephemeral inner signature,
-deterministically repacks the payload, signs the outer checksum, and refuses a
-private key that does not match the reviewed public key. macOS signing also
-requires a complete report bound to the reviewed conformance-key fingerprint.
-GitHub Actions makes the release key available only to the
-`production-release` signing job. The tag workflow publishes the Linux x86_64
-artifact as a prerelease so it can be validated before anything directs agents
-to it.
+executes a candidate-owned binary or script. It verifies the expected version,
+source revisions, and target architecture, replaces the ephemeral inner
+signature, deterministically repacks the payload, signs the outer checksum,
+and refuses a private key that does not match the reviewed public key. GitHub
+Actions makes the release key available only to the protected
+`production-release` signing job. The tag workflow signs and publishes Linux
+x86_64 and macOS aarch64 together as a normal GitHub Release.
 
 Before merging release-workflow changes, dispatch the branch with
 `dry_run=true`. That path builds the exact branch with an ephemeral test key,
@@ -147,16 +125,15 @@ same-boot forward-step guards; it does not install or require a separate time
 daemon. AWS credentials and `aws-kms-ip-allow.conf` are an optional paired
 site overlay.
 
-The v0.1.4 Linux archive generates a complete fresh per-login enrollment from
+The Linux archive generates a complete fresh per-login enrollment from
 packaged public templates and the host CSPRNG; it does not require site-specific
 private identity inputs. It enables a login-user Machine service that maintains
 the `~/bloom` mount without interactive sudo by installing one exact
 `user,nosuid,nodev,noexec` loopback-NFS fstab authorization, including the fixed
 per-login loopback listener and complete NFS option set; no Bloom process is
-given root identity or broad mount capability. It remains an operator-integration prerelease because
-the Linux release lane does not yet prove live installed systemd health on a
-disposable host. The website must remain pinned to v0.1.3 until that acceptance
-lane lands.
+given root identity or broad mount capability. Live installed systemd acceptance
+remains available as an additional operator validation rather than a publication
+requirement.
 
 A live Linux install must receive `BLOOM_RELEASE_PUBLIC_KEY` pointing to a
 separately obtained, root-owned, non-writable copy of

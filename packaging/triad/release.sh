@@ -9,7 +9,7 @@ usage() {
   cat >&2 <<'EOF'
 usage:
   packaging/triad/release.sh build (linux|macos) --output-dir DIR [--broker-root DIR] [--signer-root DIR] [--source-date-epoch INTEGER] [--candidate-signing-key FILE]
-  packaging/triad/release.sh sign (linux|macos) CANDIDATE --output-dir DIR --signing-key FILE --pinned-public-key FILE --source-date-epoch INTEGER --version X.Y.Z --machine-sha SHA --broker-sha SHA --signer-sha SHA [macOS conformance options]
+  packaging/triad/release.sh sign (linux|macos) CANDIDATE --output-dir DIR --signing-key FILE --pinned-public-key FILE --source-date-epoch INTEGER --version X.Y.Z --machine-sha SHA --broker-sha SHA --signer-sha SHA
 EOF
   exit 64
 }
@@ -330,7 +330,6 @@ sign_candidate() {
 
   local output_dir="" signing_key="" pinned_public_key=""
   local source_date_epoch="" version="" machine_sha="" broker_sha="" signer_sha=""
-  local macos_report="" macos_signature="" macos_public_key="" macos_key_sha256=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --output-dir) [[ $# -ge 2 ]] || usage; output_dir="$2"; shift 2 ;;
@@ -341,10 +340,6 @@ sign_candidate() {
       --machine-sha) [[ $# -ge 2 ]] || usage; machine_sha="$2"; shift 2 ;;
       --broker-sha) [[ $# -ge 2 ]] || usage; broker_sha="$2"; shift 2 ;;
       --signer-sha) [[ $# -ge 2 ]] || usage; signer_sha="$2"; shift 2 ;;
-      --macos-conformance-report) [[ $# -ge 2 ]] || usage; macos_report="$2"; shift 2 ;;
-      --macos-conformance-signature) [[ $# -ge 2 ]] || usage; macos_signature="$2"; shift 2 ;;
-      --macos-conformance-public-key) [[ $# -ge 2 ]] || usage; macos_public_key="$2"; shift 2 ;;
-      --macos-conformance-key-sha256) [[ $# -ge 2 ]] || usage; macos_key_sha256="$2"; shift 2 ;;
       *) usage ;;
     esac
   done
@@ -366,21 +361,6 @@ sign_candidate() {
   do
     require_regular_file "$revision"
   done
-  case "$platform" in
-    linux)
-      [[ -z "$macos_report$macos_signature$macos_public_key$macos_key_sha256" ]] ||
-        die "Linux signing does not accept macOS conformance evidence" 64
-      ;;
-    macos)
-      [[ -n "$macos_report" && -n "$macos_signature" &&
-        -n "$macos_public_key" && "$macos_key_sha256" =~ ^[0-9a-f]{64}$ ]] ||
-        die "macOS signing requires complete pinned conformance evidence" 64
-      require_regular_file "$macos_report"
-      require_regular_file "$macos_signature"
-      require_regular_file "$macos_public_key"
-      ;;
-  esac
-
   BLOOM_ALLOW_TEST_UNCLAIMED=true "$release_dir/verify-bundle.sh" \
     "$candidate" "$candidate.sha256" "$candidate.sig" "$candidate.pub"
 
@@ -420,10 +400,6 @@ sign_candidate() {
       ;;
     macos)
       printf 'macos-unix-principals\n' >"$payload/PLATFORM_CLAIM"
-      install -m 0644 "$macos_report" "$payload/MACOS_CONFORMANCE_REPORT.json"
-      install -m 0644 "$macos_signature" "$payload/MACOS_CONFORMANCE_REPORT.sig"
-      install -m 0644 "$macos_public_key" "$payload/MACOS_CONFORMANCE_REPORT.pub"
-      "$release_dir/verify-macos-conformance.sh" "$payload" "$macos_key_sha256"
       artifact_name="bloom-triad-macos-aarch64.tar.gz"
       ;;
   esac

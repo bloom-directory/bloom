@@ -418,12 +418,11 @@ fn production_macos_bundle_forbids_archived_private_identity_material() {
         assert!(source.contains("macOS Unix-principal bundle contains private key material"));
         assert!(source.contains("private_key_seed_hex|signing_seed_hex"));
         assert!(source.contains("private identity-shaped file"));
-        assert!(source.contains("verify-macos-conformance.sh"));
     }
     let builder =
         fs::read_to_string(workspace().join("packaging/triad/release/build-bundle.sh")).unwrap();
-    assert!(builder.contains("BLOOM_MACOS_CONFORMANCE_KEY_SHA256"));
-    assert!(builder.contains("BLOOM_MACOS_CONFORMANCE_REPORT"));
+    assert!(!builder.contains("BLOOM_MACOS_CONFORMANCE_KEY_SHA256"));
+    assert!(!builder.contains("BLOOM_MACOS_CONFORMANCE_REPORT"));
     let verifier =
         fs::read_to_string(workspace().join("packaging/triad/release/verify-macos-conformance.sh"))
             .unwrap();
