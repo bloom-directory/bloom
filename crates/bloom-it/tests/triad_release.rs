@@ -2557,6 +2557,17 @@ fn installer_upgrade_transactions_preserve_recovery_state_atomically() {
     assert!(linux.contains("upgrade_transaction_scratch=\"${upgrade_transaction}.new.$$\""));
     assert!(linux.contains("mv -T \"$upgrade_transaction_scratch\" \"$upgrade_transaction\""));
     assert!(linux.contains("require_linux_triad_health"));
+    assert!(linux.contains("preflight_linux_release_set"));
+    assert!(linux.contains("linux_release_units_active"));
+    assert!(linux.contains("systemctl is-active --quiet \"$unit\""));
+    assert!(linux.contains("systemctl --user is-active --quiet \"$unit\""));
+    assert!(
+        linux.find("preflight_linux_release_set \"$root\"").unwrap()
+            < linux.find("install_linux_release \"$root\"").unwrap()
+    );
+
+    let daemon = fs::read_to_string(workspace().join("crates/bloom-daemon/src/lib.rs")).unwrap();
+    assert!(daemon.contains(".require_outbox_petal_eligibility(&request.wallet, chain_name, id)"));
 }
 
 #[test]

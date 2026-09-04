@@ -620,6 +620,38 @@ stop_linux_release_set() {
   done
 }
 
+preflight_linux_release_set() {
+  local install_root="$1" record uid user_runtime
+  [[ "$install_root" == "/" ]] || return 0
+
+  for record in "$install_root/etc/bloom/enrollments"/*.json; do
+    [[ -f "$record" && ! -L "$record" ]] || continue
+    uid="$(linux_record_number "$record" login_uid)"
+    user_runtime="/run/user/$uid"
+    [[ -d "$user_runtime" && -S "$user_runtime/bus" ]] || {
+      echo "Linux release upgrade requires an active session for enrolled UID $uid" >&2
+      return 69
+    }
+  done
+}
+
+linux_release_units_active() {
+  local uid="$1" user="$2" user_runtime="$3" unit
+  for unit in \
+    "bloom-session@$uid.path" \
+    "bloom-broker@$uid.service" \
+    "bloom-signer@$uid.service"
+  do
+    systemctl is-active --quiet "$unit" || return 1
+  done
+  for unit in bloom-session.service bloom-machine.service; do
+    runuser -u "$user" -- env \
+      XDG_RUNTIME_DIR="$user_runtime" \
+      DBUS_SESSION_BUS_ADDRESS="unix:path=$user_runtime/bus" \
+      systemctl --user is-active --quiet "$unit" || return 1
+  done
+}
+
 require_linux_triad_health() {
   local install_root="$1" uid="$2" user="$3" digest="$4"
   local user_runtime="/run/user/$uid" home attempt
@@ -629,15 +661,7 @@ require_linux_triad_health() {
     return 1
   }
   for ((attempt = 0; attempt < 20; attempt++)); do
-    if systemctl is-active --quiet \
-        "bloom-session@$uid.path" \
-        "bloom-broker@$uid.service" \
-        "bloom-signer@$uid.service" &&
-      runuser -u "$user" -- env \
-        XDG_RUNTIME_DIR="$user_runtime" \
-        DBUS_SESSION_BUS_ADDRESS="unix:path=$user_runtime/bus" \
-        systemctl --user is-active --quiet \
-          bloom-session.service bloom-machine.service &&
+    if linux_release_units_active "$uid" "$user" "$user_runtime" &&
       runuser -u "$user" -- env \
         XDG_RUNTIME_DIR="$user_runtime" \
         DBUS_SESSION_BUS_ADDRESS="unix:path=$user_runtime/bus" \
@@ -1059,6 +1083,9 @@ case "$action" in
         exit 65
       }
       release_upgrade=true
+    fi
+    if [[ "$release_upgrade" == true ]]; then
+      preflight_linux_release_set "$root"
     fi
     capture_legacy_linux_release "$root" "$shared_release_digest"
     install_linux_release "$root" "$payload" "$release_digest"

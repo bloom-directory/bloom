@@ -216,6 +216,10 @@ async fn serve_authenticated_services(
     }
 }
 
+fn enrollment_state_is_usable(state: &str) -> bool {
+    state == "active" || (cfg!(target_os = "macos") && state == "activating")
+}
+
 fn load_enrollment(root: &Path, effective_uid: u32) -> Result<Option<()>> {
     let path = root.join(format!("{effective_uid}.json"));
     let metadata = match fs::symlink_metadata(&path) {
@@ -240,14 +244,26 @@ fn load_enrollment(root: &Path, effective_uid: u32) -> Result<Option<()>> {
             .get("login_uid")
             .and_then(serde_json::Value::as_u64)
             != Some(u64::from(effective_uid))
-        || !matches!(
-            enrollment.get("state").and_then(serde_json::Value::as_str),
-            Some("activating" | "active")
-        )
+        || !enrollment
+            .get("state")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(enrollment_state_is_usable)
     {
         bail!("Bloom enrollment is not valid for this login session");
     }
     Ok(Some(()))
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn activating_enrollment_is_accepted_only_by_macos_sentinel() {
+        assert!(super::enrollment_state_is_usable("active"));
+        assert_eq!(
+            super::enrollment_state_is_usable("activating"),
+            cfg!(target_os = "macos")
+        );
+    }
 }
 
 #[cfg(target_os = "macos")]

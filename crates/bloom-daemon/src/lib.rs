@@ -2719,6 +2719,7 @@ struct CanonicalBatchConfirmation {
     home_write_permit: Arc<HomeWritePermit>,
     chains: ChainRegistry,
     wallet_projections: Arc<dyn WalletProjectionReader>,
+    wallets: Arc<WalletsHandler>,
     audit: Arc<AuditLog>,
 }
 
@@ -2766,6 +2767,7 @@ impl ipc::BatchConfirmationService for CanonicalBatchConfirmation {
                 .await
                 .map_err(|error| format!("load public wallet projection: {error}"))?;
             let mut targets = Vec::with_capacity(request.txs.len());
+            let mut unique_refs = std::collections::BTreeSet::new();
             for reference in &request.txs {
                 let (chain_name, id) = reference
                     .split_once(':')
@@ -2777,6 +2779,15 @@ impl ipc::BatchConfirmationService for CanonicalBatchConfirmation {
                         "tx ref '{reference}' must include non-empty chain and id"
                     ));
                 }
+                if !unique_refs.insert((chain_name.to_owned(), id.to_owned())) {
+                    return Err(format!(
+                        "transaction batch contains duplicate ref '{reference}'"
+                    ));
+                }
+                self.wallets
+                    .require_outbox_petal_eligibility(&request.wallet, chain_name, id)
+                    .await
+                    .map_err(|error| error.to_string())?;
                 let chain = self
                     .chains
                     .get(chain_name)
@@ -2880,6 +2891,7 @@ pub struct Daemon {
     /// Machine journal and creating a second, stale in-memory head.
     pub machine_broker: Option<MachineBrokerClient>,
     pub wallet_projections: Arc<dyn WalletProjectionReader>,
+    wallets: Arc<WalletsHandler>,
     pub vfs: Vfs,
     pub petals: PetalRunner,
     pub watch_registry: Arc<WatchRegistry>,
@@ -3059,6 +3071,7 @@ impl Daemon {
             home_write_permit,
             chains: self.chains.clone(),
             wallet_projections: self.wallet_projections.clone(),
+            wallets: self.wallets.clone(),
             audit: self.audit.clone(),
         }))
     }
@@ -3648,7 +3661,7 @@ impl Daemon {
             );
 
         vfs_builder = vfs_builder
-            .mount("wallets", wallets_handler as _)
+            .mount("wallets", wallets_handler.clone() as _)
             .mount("tools", Arc::new(ToolsHandler::new()) as _)
             .mount(
                 "requests",
@@ -3907,6 +3920,7 @@ impl Daemon {
             audit: audit_arc,
             machine_broker: broker,
             wallet_projections,
+            wallets: wallets_handler,
             vfs,
             petals,
             watch_registry,
