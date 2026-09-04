@@ -254,18 +254,6 @@ fn load_enrollment(root: &Path, effective_uid: u32) -> Result<Option<()>> {
     Ok(Some(()))
 }
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn activating_enrollment_is_accepted_only_by_macos_sentinel() {
-        assert!(super::enrollment_state_is_usable("active"));
-        assert_eq!(
-            super::enrollment_state_is_usable("activating"),
-            cfg!(target_os = "macos")
-        );
-    }
-}
-
 #[cfg(target_os = "macos")]
 fn default_enrollment_root() -> &'static str {
     "/Library/Application Support/BloomTriad/enrollments"
@@ -428,5 +416,17 @@ impl Drop for SocketGuard {
         {
             let _ = fs::remove_file(&self.path);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn activating_enrollment_is_accepted_only_by_macos_sentinel() {
+        assert!(super::enrollment_state_is_usable("active"));
+        assert_eq!(
+            super::enrollment_state_is_usable("activating"),
+            cfg!(target_os = "macos")
+        );
     }
 }
