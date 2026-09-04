@@ -39,7 +39,7 @@ minor_min = 0
 minor_max = 1
 
 [[bundles]]
-machine = "0.1.4"
+machine = "0.2.0"
 broker = "0.1.0"
 signer = "0.1.0"
 backends = ["local", "aws-kms"]
