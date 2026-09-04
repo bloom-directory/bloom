@@ -464,7 +464,8 @@ impl Config {
             .and_then(toml::Value::as_array);
         let is_legacy_default = persisted_preinstalled.is_some_and(|entries| {
             let entries = entries.iter().map(toml::Value::as_str).collect::<Vec<_>>();
-            entries == [Some("near-intents"), Some("enso")]
+            entries == [Some("polymarket"), Some("near-intents"), Some("enso")]
+                || entries == [Some("near-intents"), Some("enso")]
         });
         if is_legacy_default {
             self.petals.preinstalled = default_preinstalled_petals();
@@ -760,10 +761,7 @@ mod tests {
         cfg.save(&path).unwrap();
 
         let migrated = Config::load(&path).unwrap();
-        assert_eq!(
-            migrated.petals.preinstalled,
-            vec!["polymarket", "near-intents", "enso"]
-        );
+        assert_eq!(migrated.petals.preinstalled, default_preinstalled_petals());
 
         cfg.petals.preinstalled = vec!["near-intents".into(), "enso".into()];
         cfg.save(&path).unwrap();

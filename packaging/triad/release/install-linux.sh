@@ -786,6 +786,7 @@ recover_interrupted_linux_upgrade() {
     echo "invalid interrupted Linux upgrade" >&2
     return 65
   }
+  preflight_linux_release_set "$install_root"
   upgrade_transaction="$transaction"
   upgrade_root="$install_root"
   upgrade_old_digest="$old_digest"
