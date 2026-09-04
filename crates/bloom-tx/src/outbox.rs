@@ -612,11 +612,18 @@ impl Outbox {
     /// before any are broadcast (e.g. a DeFi `approve` → `swap` bundle, which
     /// must occupy consecutive nonces).
     ///
-    /// This counts *every* pending entry for `addr`, whether or not it has
-    /// broadcast yet — that is what keeps sequential staging contiguous. The
-    /// hazard it creates (a staged-but-never-broadcast entry reserving a slot,
-    /// so a later tx broadcasts into a gap that never fills and is stranded) is
-    /// caught at broadcast time by the nonce-gap guard in
+    /// This counts entries in `pending/` only. Broadcasting moves an entry to
+    /// `sent/`, so it stops being counted here the moment it goes out — this
+    /// function reserves against *unsent* work, not against everything in
+    /// flight. Callers must therefore combine it with a chain nonce read at the
+    /// **pending** block tag ([`ChainClient::nonce`]), which is what covers the
+    /// window between broadcast and inclusion. Reading a pinned or `latest`
+    /// nonce instead leaves that window uncovered by either source and hands
+    /// out a nonce already spent by an in-flight transaction.
+    ///
+    /// The opposite hazard (a staged-but-never-broadcast entry reserving a
+    /// slot, so a later tx broadcasts into a gap that never fills and is
+    /// stranded) is caught at broadcast time by the nonce-gap guard in
     /// [`TxEngine::assert_nonce_not_ahead_of_chain`], not here — reservation
     /// stays optimistic, broadcast stays safe. Callers that need an exact nonce
     /// bypass this entirely via the intent `nonce` override.
