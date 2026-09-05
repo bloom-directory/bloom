@@ -486,6 +486,25 @@ pub fn authorization_for(chain: &str, now_ms: u128) -> Option<LoadedAuthorizatio
     Some(loaded)
 }
 
+/// Whether config validation may accept a mainnet-beta chain with broadcast
+/// enabled.
+///
+/// This is the *first* of four gates, and deliberately the weakest: it only
+/// asks whether a canary-capable binary holds an authorization naming this
+/// chain. Artifact binding, expiry, the single-use ledger, and every per-value
+/// cap are re-checked later against live facts, at boot and again immediately
+/// before the send. Doing full validation here would tie config loading to a
+/// clock and the filesystem for no safety gain — a config that parses still
+/// cannot broadcast.
+///
+/// In a production build this is unconditionally `false`.
+pub fn config_permits_mainnet_chain(chain: &str) -> bool {
+    match authorization() {
+        Some(loaded) => loaded.authorization.chain.eq_ignore_ascii_case(chain),
+        None => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -753,24 +772,5 @@ mod tests {
         let encoded = serde_json::to_vec(&auth).unwrap();
         assert_eq!(parse(&encoded).unwrap(), auth);
         assert!(parse(b"not json").is_err());
-    }
-}
-
-/// Whether config validation may accept a mainnet-beta chain with broadcast
-/// enabled.
-///
-/// This is the *first* of four gates, and deliberately the weakest: it only
-/// asks whether a canary-capable binary holds an authorization naming this
-/// chain. Artifact binding, expiry, the single-use ledger, and every per-value
-/// cap are re-checked later against live facts, at boot and again immediately
-/// before the send. Doing full validation here would tie config loading to a
-/// clock and the filesystem for no safety gain — a config that parses still
-/// cannot broadcast.
-///
-/// In a production build this is unconditionally `false`.
-pub fn config_permits_mainnet_chain(chain: &str) -> bool {
-    match authorization() {
-        Some(loaded) => loaded.authorization.chain.eq_ignore_ascii_case(chain),
-        None => false,
     }
 }
