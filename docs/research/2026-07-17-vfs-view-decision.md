@@ -1,7 +1,7 @@
 # Bloom views: understand the market, your wallet, and what comes next
 
-Research for #114. Revised 5 September 2026. **Design and working offline
-prototypes; no new runtime VFS routes.** This replaces the six July specifications.
+Research for #114. Revised 5 September 2026. **Design, working offline prototypes, and an optional read-only
+capture from a running daemon; no new runtime VFS routes.** This replaces the six July specifications.
 The decision is made here; there is no questionnaire or approval prerequisite.
 
 Open [Today](vfs-view-mockups/index.html) in a browser. Follow Markets → Chains →
@@ -257,3 +257,30 @@ The committed HTML is directly reviewable without running a build.
 Browser verification and any limitations are recorded in the PR description.
 Runtime adapter acceptance above remains future work, not a claim that research
 fixtures exercise live RPCs, production signing, or actual provider availability.
+
+## Run against an actual wallet
+
+`vfs-view-mockups/live.py` builds a separate, private capture from a running
+Machine using its documented v1 IPC `list` and `read` methods. It collects
+wallet/account projections, native and selected token balances, supported Petal
+positions, pending operations, and bounded history. Public market context comes
+from CoinGecko and DefiLlama. Missing or stale inputs are never fixture fallbacks.
+
+```sh
+python3 docs/research/vfs-view-mockups/live.py \
+  --socket /absolute/path/to/machine.sock \
+  --out /absolute/private/path/bloom-views
+```
+
+Open only the resulting `index.html`; its navigation reaches the other seven
+real-data pages. Output is outside the checkout, with private directory/file
+permissions. It contains wallet data: do not commit it, publish it, or attach it
+to this PR. `--render-only` redraws an existing capture without network reads.
+
+This is a timestamped snapshot, not an automatically refreshing dashboard.
+The reader has bounded timeouts and limited concurrency; wallet chain-discovery
+failure aborts a fresh capture. Other unavailable sources are named. Current
+receipts distinguish confirmed/reverted transactions from a local `sent` state.
+Issuer reference valuations, test assets, and unverified overlaps stay separate
+from market-valued assets. Unsupported SPL/session inventories remain explicit.
+The capture starts no ceremony, stages no operation, and has no write IPC method.
