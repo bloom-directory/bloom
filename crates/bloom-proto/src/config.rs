@@ -1217,7 +1217,7 @@ allow_broadcast = true
     }
 
     #[test]
-    fn solana_broadcast_accepts_pinned_mainnet_genesis() {
+    fn solana_broadcast_rejects_pinned_mainnet_genesis_without_canary_authorization() {
         let mut cfg = Config::local_default();
         cfg.solana_chains.insert(
             "solana-mainnet".into(),
@@ -1236,7 +1236,15 @@ allow_broadcast = true
                 allow_broadcast: true,
             },
         );
-        cfg.validate().unwrap();
+        let error = cfg
+            .validate()
+            .expect_err("mainnet-beta broadcast requires an out-of-band canary authorization");
+        assert!(
+            error
+                .to_string()
+                .contains("cannot enable broadcast for mainnet-beta"),
+            "{error}"
+        );
     }
 
     #[test]
