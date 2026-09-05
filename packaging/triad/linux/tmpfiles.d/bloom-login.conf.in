@@ -1,5 +1,12 @@
 # Parents are traversable but contain no readable data.
 d /run/bloom/@LOGIN_UID@ 0711 root root -
+d /run/bloom/@LOGIN_UID@/broker 0711 bloom-broker-@LOGIN_UID@ bloom-broker-@LOGIN_UID@ -
+d /run/bloom/@LOGIN_UID@/broker/rpc 0710 bloom-broker-@LOGIN_UID@ bloom-machine-broker-@LOGIN_UID@ -
+d /run/bloom/@LOGIN_UID@/broker/control 0710 bloom-broker-@LOGIN_UID@ bloom-revoke-@LOGIN_UID@ -
+d /run/bloom/@LOGIN_UID@/signer 0711 bloom-signer-@LOGIN_UID@ bloom-signer-@LOGIN_UID@ -
+d /run/bloom/@LOGIN_UID@/signer/rpc 0710 bloom-signer-@LOGIN_UID@ bloom-broker-signer-@LOGIN_UID@ -
+d /run/bloom/@LOGIN_UID@/signer/control 0710 bloom-signer-@LOGIN_UID@ bloom-revoke-@LOGIN_UID@ -
+d /run/bloom/@LOGIN_UID@/session 0710 @LOGIN_UID@ bloom-session-@LOGIN_UID@ -
 d /var/lib/bloom/@LOGIN_UID@ 0711 root root -
 d /etc/bloom/@LOGIN_UID@ 0711 root root -
 
@@ -8,7 +15,9 @@ d /var/lib/bloom/@LOGIN_UID@/broker 0700 bloom-broker-@LOGIN_UID@ bloom-broker-@
 d /var/lib/bloom/@LOGIN_UID@/signer 0700 bloom-signer-@LOGIN_UID@ bloom-signer-@LOGIN_UID@ -
 d /var/lib/bloom/@LOGIN_UID@/broker/audit-checkpoints 0700 bloom-broker-@LOGIN_UID@ bloom-broker-@LOGIN_UID@ -
 d /var/lib/bloom/@LOGIN_UID@/signer/audit-checkpoints 0700 bloom-signer-@LOGIN_UID@ bloom-signer-@LOGIN_UID@ -
-d /var/lib/bloom/@LOGIN_UID@/machine 0700 @LOGIN_USER@ @LOGIN_USER@ -
-d /var/lib/bloom/@LOGIN_UID@/machine/audit-checkpoints 0700 @LOGIN_USER@ @LOGIN_USER@ -
+d /var/lib/bloom/@LOGIN_UID@/machine 0700 @LOGIN_UID@ @LOGIN_GID@ -
+d /var/lib/bloom/@LOGIN_UID@/machine/audit-checkpoints 0700 @LOGIN_UID@ @LOGIN_GID@ -
 d /etc/bloom/@LOGIN_UID@/broker 0700 bloom-broker-@LOGIN_UID@ bloom-broker-@LOGIN_UID@ -
 d /etc/bloom/@LOGIN_UID@/signer 0700 bloom-signer-@LOGIN_UID@ bloom-signer-@LOGIN_UID@ -
+d /etc/bloom/@LOGIN_UID@/machine 0700 @LOGIN_UID@ @LOGIN_GID@ -
+d /etc/bloom/@LOGIN_UID@/session 0700 @LOGIN_UID@ @LOGIN_GID@ -

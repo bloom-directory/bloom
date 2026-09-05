@@ -40,7 +40,7 @@ clean_home="$work/clean-home"
 broker_socket="$runtime/machine-broker/broker.sock"
 signer_socket="/private/var/run/bloom/$login_uid/broker-signer/signer.sock"
 signer_socket_dir="$(dirname "$signer_socket")"
-machine_socket="$runtime/machine/machine.sock"
+machine_socket="$clean_home/run/bloom.sock"
 mount_dir="$work/mount"
 broker_connected="$runtime/machine-broker/connected"
 signer_connected="$runtime/hostile-signer/connected"
@@ -118,6 +118,7 @@ mkdir -p \
   "$runtime/machine" \
   "$runtime/machine-broker" \
   "$runtime/hostile-signer" \
+  "$clean_home/audit-checkpoints" \
   "$clean_home" \
   "$mount_dir"
 chown "$login_uid" "$runtime/machine"
@@ -132,7 +133,21 @@ chmod 0755 \
   "$runtime/machine-broker" \
   "$runtime/hostile-signer"
 chmod 0755 "$mount_dir"
-chmod 0700 "$clean_home"
+chmod 0700 "$clean_home" "$clean_home/audit-checkpoints"
+
+login_home="$(sudo -H -u "$login_user" /bin/sh -c 'printf "%s\n" "$HOME"')"
+installed_audit="$login_home/.bloom/audit.jsonl"
+[[ "$login_home" == /* && -f "$installed_audit" && ! -L "$installed_audit" ]] || {
+  echo "installed Machine audit is unavailable for the isolated runtime negative" >&2
+  exit 1
+}
+[[ "$(stat -f '%u:%l' "$installed_audit")" == "$login_uid:1" ]] || {
+  echo "installed Machine audit has unsafe ownership or link count" >&2
+  exit 1
+}
+cp "$installed_audit" "$clean_home/audit.jsonl"
+chown "$login_uid" "$clean_home/audit.jsonl"
+chmod 0600 "$clean_home/audit.jsonl"
 
 # Build the out-of-process deterministic ceremony driver before tracing the
 # packaged Machine. The driver talks only to the real Broker HTTP ceremony
@@ -268,10 +283,39 @@ installed_broker_socket="/private/var/run/bloom/$login_uid/machine-broker/broker
 [[ "$(stat -f '%u' "$installed_broker_socket")" == "$broker_uid" ]]
 sudo -H -u "$login_user" env \
   BLOOM_HOME="$clean_home" \
+  BLOOM_MACHINE_AUDIT_CHECKPOINT_DIR="$clean_home/audit-checkpoints" \
+  BLOOM_BROKER_SOCKET="$installed_broker_socket" \
   BLOOM_MACHINE_IDENTITY="$machine_identity" \
   BLOOM_EDGE_MANIFEST="$edge_manifest" \
-  "$machine_binary" --home "$clean_home" wallet new ma05-cached \
+  BLOOM_LOG_OUTPUT=json-stderr \
+  "$machine_binary" --home "$clean_home" serve \
+    --endpoint "unix:$machine_socket" \
+    >"$work/seed-machine-service.log" 2>&1 &
+machine_service_pid=$!
+deadline=$((SECONDS + 15))
+while [[ ! -S "$machine_socket" && $SECONDS -lt $deadline ]]; do
+  kill -0 "$machine_service_pid" 2>/dev/null || {
+    cat "$work/seed-machine-service.log" >&2
+    exit 1
+  }
+  sleep 0.05
+done
+[[ -S "$machine_socket" ]] || {
+  cat "$work/seed-machine-service.log" >&2
+  echo "packaged Machine seeding service did not publish its IPC socket" >&2
+  exit 1
+}
+if ! sudo -H -u "$login_user" env \
+  BLOOM_HOME="$clean_home" \
+  BLOOM_MACHINE_IDENTITY="$machine_identity" \
+  BLOOM_EDGE_MANIFEST="$edge_manifest" \
+  "$machine_binary" --home "$clean_home" --connect "unix:$machine_socket" \
+    wallet new ma05-cached \
   >"$work/registration.log" 2>&1
+then
+  cat "$work/registration.log" >&2
+  exit 1
+fi
 registration_url="$(sed -n 's/^ceremony_url: //p' "$work/registration.log")"
 [[ "$registration_url" == http://localhost:18734/ceremony/* ]] || {
   cat "$work/registration.log" >&2
@@ -297,7 +341,8 @@ while [[ $SECONDS -lt $deadline ]]; do
     BLOOM_HOME="$clean_home" \
     BLOOM_MACHINE_IDENTITY="$machine_identity" \
     BLOOM_EDGE_MANIFEST="$edge_manifest" \
-    "$machine_binary" --home "$clean_home" wallet projection "$wallet_id" \
+    "$machine_binary" --home "$clean_home" --connect "unix:$machine_socket" \
+      wallet projection "$wallet_id" \
     >"$work/live-projection.log" 2>"$work/live-projection.stderr"
   then
     break
@@ -324,7 +369,8 @@ sudo -H -u "$login_user" env \
   BLOOM_HOME="$clean_home" \
   BLOOM_MACHINE_IDENTITY="$machine_identity" \
   BLOOM_EDGE_MANIFEST="$edge_manifest" \
-  "$machine_binary" --home "$clean_home" wallet update-policy "$wallet_id" \
+  "$machine_binary" --home "$clean_home" --connect "unix:$machine_socket" \
+    wallet update-policy "$wallet_id" \
     --file "$work/live-policy.json" >"$work/policy-prepare-live.log" 2>&1
 policy_operation_id="$(sed -n 's/^operation_id: //p' "$work/policy-prepare-live.log")"
 policy_ceremony_url="$(sed -n 's/^ceremony_url: //p' "$work/policy-prepare-live.log")"
@@ -337,13 +383,86 @@ sudo -H -u "$login_user" env \
   BLOOM_HOME="$clean_home" \
   BLOOM_MACHINE_IDENTITY="$machine_identity" \
   BLOOM_EDGE_MANIFEST="$edge_manifest" \
-  "$machine_binary" --home "$clean_home" wallet commit-policy "$policy_operation_id" \
+  "$machine_binary" --home "$clean_home" --connect "unix:$machine_socket" \
+    wallet commit-policy "$policy_operation_id" \
   >"$work/policy-commit-live.log" 2>&1
+
+broker_log="/private/var/log/bloom/$login_uid/broker.jsonl"
+signer_log="/private/var/log/bloom/$login_uid/signer.jsonl"
+newsyslog_config="/etc/newsyslog.d/bloom-$login_uid.conf"
+for service_log in "$broker_log" "$signer_log"; do
+  sudo -u "$login_user" test -r "$service_log"
+  if sudo -u "$login_user" test -w "$service_log"; then
+    echo "enrolled user can write canonical service log $service_log" >&2
+    exit 1
+  fi
+done
+for protected_state in \
+  "/private/var/db/bloom/$login_uid/broker/journal.db" \
+  "/private/var/db/bloom/$login_uid/signer/journal.db"
+do
+  if sudo -u "$login_user" test -r "$protected_state"; then
+    echo "enrolled user can read protected service state $protected_state" >&2
+    exit 1
+  fi
+done
+grep -F "$policy_operation_id" "$broker_log" >/dev/null
+grep -F "$policy_operation_id" "$signer_log" >/dev/null
+/usr/bin/python3 - "$work/seed-machine-service.log" "$policy_operation_id" <<'PY'
+import json
+import pathlib
+import sys
+
+events = [json.loads(line) for line in pathlib.Path(sys.argv[1]).read_text().splitlines()]
+operation_id = sys.argv[2]
+if not any(
+    event.get("fields", {}).get("operation_id") == operation_id
+    and event.get("fields", {}).get("event") in {
+        "machine.policy_update.transition",
+        "machine.durable_mutation",
+        "rpc.request_completed",
+    }
+    for event in events
+):
+    raise SystemExit("Machine structured log omitted the policy operation ID")
+PY
+
+# Force the package-owned rotation while both services remain loaded. Their
+# per-event writers must reopen the canonical path rather than retaining the
+# renamed inode.
+/usr/sbin/newsyslog -F -f "$newsyslog_config"
 sudo -H -u "$login_user" env \
   BLOOM_HOME="$clean_home" \
   BLOOM_MACHINE_IDENTITY="$machine_identity" \
   BLOOM_EDGE_MANIFEST="$edge_manifest" \
-  "$machine_binary" --home "$clean_home" wallet projection "$wallet_id" \
+  "$machine_binary" --home "$clean_home" --connect "unix:$machine_socket" \
+    serve triad-health-check "$(
+      plutil -extract build_digest raw -o - \
+        "/Library/Application Support/BloomTriad/config/$login_uid/broker/config.json"
+    )" >/dev/null
+/usr/bin/python3 - "$broker_log.0" "$signer_log.0" "$broker_log" "$signer_log" <<'PY'
+import json
+import pathlib
+import sys
+
+for raw in sys.argv[1:]:
+    path = pathlib.Path(raw)
+    lines = path.read_text().splitlines()
+    if not lines:
+        raise SystemExit(f"rotated/current service log is empty: {path}")
+    for line in lines:
+        json.loads(line)
+PY
+for service_log in "$broker_log" "$signer_log"; do
+  sudo -u "$login_user" test -r "$service_log"
+  if sudo -u "$login_user" test -w "$service_log"; then exit 1; fi
+done
+sudo -H -u "$login_user" env \
+  BLOOM_HOME="$clean_home" \
+  BLOOM_MACHINE_IDENTITY="$machine_identity" \
+  BLOOM_EDGE_MANIFEST="$edge_manifest" \
+  "$machine_binary" --home "$clean_home" --connect "unix:$machine_socket" \
+    wallet projection "$wallet_id" \
   >"$work/live-projection.log" 2>"$work/live-projection.stderr"
 jq -e \
   --arg address "$wallet_address" \
@@ -365,6 +484,10 @@ if expected not in policy["allowed_destinations"]:
     raise SystemExit("authenticated policy projection omitted the MA-05 destination")
 PY
 [[ -s "$clean_home/cache/wallet-projections.json" ]]
+kill "$machine_service_pid"
+wait "$machine_service_pid" 2>/dev/null || true
+machine_service_pid=""
+rm -f "$machine_socket"
 cp "$clean_home/cache/wallet-projections.json" "$work/authenticated-projection-cache.json"
 approval_issued_ms="$(($(date +%s) * 1000))"
 approval_expires_ms="$((approval_issued_ms + 600000))"
@@ -455,7 +578,7 @@ run_machine_with_deadline() {
     BLOOM_BROKER_SOCKET="$broker_socket" \
     BLOOM_MACHINE_IDENTITY="$machine_identity" \
     BLOOM_EDGE_MANIFEST="$edge_manifest" \
-    "$machine_binary" "$@" >"$output" 2>&1 &
+    "$machine_binary" --connect "unix:$machine_socket" "$@" >"$output" 2>&1 &
   command_pid=$!
   deadline=$((SECONDS + 8))
   while kill -0 "$command_pid" 2>/dev/null && [[ $SECONDS -lt $deadline ]]; do
@@ -505,6 +628,14 @@ mounted_write_with_deadline() {
   local body="$3"
   run_login_with_deadline "$output" /bin/sh -c \
     'printf "%s\n" "$2" > "$1"' bloom-mounted-write "$path" "$body"
+}
+
+mounted_file_write_with_deadline() {
+  local output="$1"
+  local path="$2"
+  local source="$3"
+  run_login_with_deadline "$output" /bin/sh -c \
+    '/bin/cat "$1" > "$2"' bloom-mounted-file-write "$source" "$path"
 }
 
 audit_sequence() {
@@ -609,7 +740,8 @@ PY
       BLOOM_HOME="$clean_home" \
       BLOOM_MACHINE_IDENTITY="$machine_identity" \
       BLOOM_EDGE_MANIFEST="$edge_manifest" \
-      "$machine_binary" --home "$clean_home" audit status || {
+      "$machine_binary" --home "$clean_home" --connect "unix:$machine_socket" \
+        audit status || {
     cat "$work/$label-audit-status.log" >&2
     echo "$label Machine audit signature verification failed" >&2
     exit 1
@@ -619,11 +751,12 @@ PY
     "$work/$label-audit-status.log" >/dev/null
 }
 
-# Launch the installed production executable in its long-running Machine
-# service mode. macOS packages `bloom`; `serve` is its Machine service mode
-# (there is no separately installed bloom-machine payload or Machine plist).
+# The installed Machine LaunchAgent is stopped by the caller while this
+# isolated negative harness launches the same packaged `bloom serve` binary
+# against its private home, endpoint, and mount.
 sudo -H -u "$login_user" env \
   BLOOM_HOME="$clean_home" \
+  BLOOM_MACHINE_AUDIT_CHECKPOINT_DIR="$clean_home/audit-checkpoints" \
   BLOOM_BROKER_SOCKET="$broker_socket" \
   BLOOM_MACHINE_IDENTITY="$machine_identity" \
   BLOOM_EDGE_MANIFEST="$edge_manifest" \
@@ -658,7 +791,7 @@ fi
 # negatives and proves no legacy authority file remains open in the process.
 run_machine_with_deadline \
   "$work/status.log" \
-  --home "$clean_home" --connect "unix:$machine_socket" status || {
+  --home "$clean_home" status || {
   cat "$work/status.log" >&2
   echo "packaged Machine did not preserve its degraded read/status path" >&2
   exit 1
@@ -815,10 +948,10 @@ run_login_with_deadline \
 
 approval_request="$(<"$work/approval-request.json")"
 approval_audit_start="$(audit_sequence)"
-if mounted_write_with_deadline \
+if mounted_file_write_with_deadline \
   "$work/approval.log" \
   "$mount_dir/wallets/$wallet_id/sealed-approvals/new.json" \
-  "$approval_request"
+  "$work/approval-request.json"
 then
   approval_status=0
 else

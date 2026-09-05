@@ -1,7 +1,7 @@
 [Unit]
 Description=Bloom Broker for login UID %i
-Requires=bloom-broker-rpc@%i.socket bloom-broker-control@%i.socket bloom-broker-ceremony@%i.socket bloom-signer-rpc@%i.socket
-After=bloom-signer-rpc@%i.socket bloom-signer-control@%i.socket
+Requires=bloom-broker-ceremony@%i.socket bloom-signer@%i.service
+After=bloom-broker-ceremony@%i.socket bloom-signer@%i.service
 
 [Service]
 Type=simple
@@ -9,15 +9,20 @@ User=bloom-broker-%i
 Group=bloom-broker-%i
 UMask=0077
 ExecStart=@BLOOM_BROKER_BINARY@
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=bloom-broker-%i
 Environment=BLOOM_BROKER_IDENTITY=/etc/bloom/%i/broker/identity.json
 Environment=BLOOM_BROKER_CONFIG=/etc/bloom/%i/broker/config.json
 Environment=BLOOM_EDGE_MANIFEST=/etc/bloom/%i/edge-manifest.json
 Environment=BLOOM_AUTHORITY_EDGE_HISTORY=/etc/bloom/%i/authority-edge-history.json
+Environment=BLOOM_SESSION_SOCKET=/run/bloom/%i/session/session.sock
+Environment=BLOOM_BROKER_SOCKET=/run/bloom/%i/broker/rpc/broker.sock
+Environment=BLOOM_BROKER_CONTROL_SOCKET=/run/bloom/%i/broker/control/broker-control.sock
 Environment=BLOOM_BROKER_AUDIT_CHECKPOINT_DIR=/var/lib/bloom/%i/broker/audit-checkpoints
-Environment=BLOOM_BROKER_ACTIVATION_NAME=broker
-Environment=BLOOM_BROKER_CONTROL_ACTIVATION_NAME=broker-control
 Environment=BLOOM_BROKER_CEREMONY_ACTIVATION_NAME=broker-ceremony
-Sockets=bloom-broker-rpc@%i.socket bloom-broker-control@%i.socket bloom-broker-ceremony@%i.socket
+LoadCredential=kernel-boot-id:/proc/sys/kernel/random/boot_id
+Sockets=bloom-broker-ceremony@%i.socket
 Restart=on-failure
 RestartSec=5s
 TimeoutStopSec=30s
@@ -45,7 +50,7 @@ LimitCORE=0
 RestrictAddressFamilies=AF_UNIX AF_INET
 IPAddressDeny=any
 IPAddressAllow=localhost
-ReadWritePaths=/var/lib/bloom/%i/broker
+ReadWritePaths=/var/lib/bloom/%i/broker /run/bloom/%i/broker
 
 [Install]
 WantedBy=multi-user.target

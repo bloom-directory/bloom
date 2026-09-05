@@ -1,4 +1,4 @@
-# Disposable macOS W0 lane
+# Disposable macOS Unix-principal conformance
 
 `run-disposable.sh PAYLOAD UID USER` is destructive integration testing for the
 `macos-unix-principals-w0` bundle claim. It creates Directory Service users and
@@ -62,26 +62,27 @@ and Rust-capable development base once:
 
 ```sh
 brew install cirruslabs/cli/tart cirruslabs/cli/sshpass
-packaging/triad/macos/w0/provision-tart-local.sh
+tests/conformance/macos-unix-principals/provision-tart-local.sh
 ```
 
 Run the complete single-login lane with:
 
 ```sh
-packaging/triad/macos/w0/run-tart-local.sh
+tests/conformance/macos-unix-principals/run-tart-local.sh \
+  /path/to/bloom-triad-test-unclaimed.tar.gz
 ```
 
-The runner builds all three sibling working trees in the stopped/reusable
-`bloom-macos-w0-dev-base`, writes the verified candidate and evidence below
-the workspace-local `.w0-local/runs/` directory, and then clones the
-development base for the destructive phase. All root operations, Directory
+The runner verifies and stages the supplied signed candidate below the
+workspace-local `.macos-conformance/runs/` directory, bundles the three source
+HEADs solely for installed acceptance checks, and then clones the stopped,
+reusable `bloom-macos-w0-dev-base` for the destructive phase. All root operations, Directory
 Service changes, LaunchDaemon installation, and packet-filter changes occur
 inside that copy-on-write guest. The guest clone is stopped and deleted after
 the run. Set `BLOOM_TART_KEEP_FAILED=true` only when a failed guest must be
 preserved for interactive diagnosis. The downloaded
 `bloom-macos-w0-base` is never booted or modified by the harness.
 
-The manually dispatched `macOS Unix-principal W0` workflow remains an optional
+The manually dispatched `macOS Unix-principal conformance` workflow remains an optional
 independent reproduction lane. It is not the implementation loop and is not
 required to diagnose or advance local macOS work. Neither lane produces or
 advertises a production platform claim.
@@ -118,7 +119,7 @@ The cross-login harness is intentionally not run on the ordinary
 single-login GitHub-hosted lane. A recorded successful run on a disposable
 two-login VM remains required before the W0 claim can graduate.
 
-`macos-two-login-w0.yml` defines that run for an ephemeral self-hosted runner
+`macos-two-login-conformance.yml` defines that run for an ephemeral self-hosted runner
 labelled `bloom-two-login-disposable`. The runner itself must be outside both
 test UIDs, both supplied users must already have genuine active GUI domains,
 and the VM must be destroyed or reverted after the job. The workflow builds a

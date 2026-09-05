@@ -5,14 +5,14 @@ independently: the Machine–Broker and Broker–Signer authority APIs require
 exactly 1.3, while Signer control and login-session liveness accept 1.0–1.1.
 Service packages may advance independently when every edge remains inside its
 declared range; incompatible edges fail closed.
-It also records the exact Broker, Signer, service-runtime, and Petal-contract
-commits plus the current state schema and downgrade floor for Machine, Broker,
-and Signer. `check-external-pins.py` rejects mutable or abbreviated Git pins;
-its `--remote` mode additionally proves the recorded commits through GitHub.
+It also records the reviewed Broker, Signer, service-runtime, and
+Petal-contract commits plus the current state schema and downgrade floor for
+Machine, Broker, and Signer. This committed file is the source of truth for
+the Broker and Signer revisions: candidate builds require the supplied
+checkouts to match its exact pins and never rewrite them.
 
 `build-bundle.sh` accepts the three service binaries, the bounded
-`bloom-signer-migrate` staging tool, and a
-reviewed Ed25519 release key. It verifies semantic versions, scans every
+`bloom-signer-migrate` staging tool, and an ephemeral candidate key. It verifies semantic versions, scans every
 staged and generated bundle file for release-blocking markers, records all
 three Git revisions, embeds both platform installers, signs the internal
 payload manifest for post-elevation verification, normalizes metadata, and
@@ -25,33 +25,18 @@ path never executes a Homebrew- or login-user-owned crypto implementation.
 
 `verify-bundle.sh` verifies the detached signature and both the outer and
 internal checksums before accepting the compatibility matrix or installers.
-Production verification currently accepts Linux ELF bundles. The
+Production verification accepts Linux ELF and macOS Mach-O bundles. The
 non-production `macos-unix-principals-w0` claim accepts Mach-O binaries only
 in its explicitly enabled disposable Darwin lane. The `test-unclaimed` marker requires the explicit
 `BLOOM_ALLOW_TEST_UNCLAIMED=true` override at build, verification, and install;
 neither test claim can be advertised as production.
 
-Production `macos-unix-principals` bundles are accepted only on Darwin and
-only with a signed `bloom.macos-unix-conformance.1` report. The builder
-requires an out-of-band SHA-256 pin for the conformance public key; the report
-must bind the canonical release-subject digest, all three source revisions,
-MUI-01 through MUI-12, installed AC-01 through AC-35, negative-access tests,
-and the two-login lifecycle suite. The subject digest covers every packaged
-binary, installer, compatibility input, plist, ACL, and packet-filter source
-while excluding only the platform-claim value and the release/conformance
-signature envelope. This avoids a self-referential archive digest while still
-invalidating evidence after any security-relevant packaged input changes.
-The final archive and internal release signature then bind the report and its
-public key into the distributed artifact.
-
-`macos-conformance-subject.sh` computes the canonical subject.
-`sign-macos-conformance-report.sh` refuses to sign until each required
-criterion has a regular `CRITERION.pass` evidence file containing that exact
-subject digest; it never overwrites an existing report. The release operator
-reviews those suite outputs and signs with the separately controlled
-conformance key. `verify-macos-conformance.sh` verifies that signature,
-criterion completeness, source revisions, subject binding, and—during
-production assembly—the out-of-band conformance-key fingerprint.
+Production `macos-unix-principals` bundles are authenticated by the same
+reviewed release key as Linux bundles. Tart conformance remains available as
+an optional manual validation suite, but its report is not an input to
+production signing or publication. `macos-conformance-subject.sh`,
+`sign-macos-conformance-report.sh`, and `verify-macos-conformance.sh` can bind
+manual results to an exact candidate without changing the release contract.
 
 For one candidate payload `C`, the disposable evidence matrix is:
 
@@ -69,26 +54,48 @@ For one candidate payload `C`, the disposable evidence matrix is:
 
 The signer refuses a mixture of evidence from different candidates.
 
-`triad-release-gate.sh` rejects modified or untracked release inputs, runs
-locked fmt, clippy, and tests in all three sibling workspaces, builds release
-binaries, assembles the bundle twice, verifies both, requires byte-identical
-archives, matches the signed source revisions back to the three clean
-workspaces, executes each extracted production binary, then reruns all three
-workspace suites with the verified bundle bound as acceptance input.
-`--test-signing-key` is CI-only; production invocation must set
-`TRIAD_RELEASE_SIGNING_KEY`.
+`../release.sh` is the public local and CI entry point:
 
-Before compiling, `check-machine-authority-boundary.sh --require-clean`
-resolves every entry in `machine-production-feature-sets.tsv` with locked
-Cargo metadata and walks the normal/build edge closure from the exact Machine
-root. It rejects legacy authority crates, concrete local/custody signer
-implementations, and authority-restoring resolved features; dev-dependencies
-are not treated as production edges. The same gate checks the reachable
-production source roots for forbidden authority markers and files. There are
-no file-wide source-marker exceptions: a forbidden marker anywhere in a
-production source root fails the build. Bundle assembly independently rejects forbidden
-paths, printable markers, and retained Machine symbols, so stripping symbols
-or changing one source spelling cannot substitute for the Cargo graph proof.
+```sh
+packaging/triad/release.sh build linux --output-dir DIR
+packaging/triad/release.sh build macos --output-dir DIR
+```
+
+It defaults to the current `../bloom-broker` and `../bloom-signer` checkouts,
+rejects dirty source inputs or HEADs that differ from the compatibility pins,
+builds with locked dependencies, validates the selected binary architecture
+and installer, assembles and verifies the bundle twice, and publishes
+byte-identical `test-unclaimed` output. It does not run
+repository-wide formatting, Clippy, or test suites; those are independent CI
+source-quality gates. Both platforms emit the archive plus `.sha256`, `.sig`,
+and `.pub` sidecars.
+
+The release workflow builds the macOS aarch64 candidate on `macos-15` alongside
+the Linux candidate. A manual `dry_run=true` dispatch uploads both
+`test-unclaimed` candidates as Actions artifacts and cannot reach production
+signing or GitHub publication. Live candidate installation requires both a
+root-owned, non-writable pin of that artifact's ephemeral public key and the
+explicit `BLOOM_ALLOW_TEST_UNCLAIMED=true` installer opt-in.
+
+`release.sh sign linux|macos` is the isolated production signing pass. It never
+executes a candidate-owned binary or script. It verifies the expected version,
+source revisions, and target architecture, replaces the ephemeral inner
+signature, deterministically repacks the payload, signs the outer checksum,
+and refuses a private key that does not match the reviewed public key. GitHub
+Actions makes the release key available only to the protected
+`production-release` signing job. The tag workflow signs and publishes Linux
+x86_64 and macOS aarch64 together as a normal GitHub Release.
+
+Before merging release-workflow changes, dispatch the branch with
+`dry_run=true`. That path builds the exact branch with an ephemeral test key,
+uploads the `test-unclaimed` candidate for inspection, and skips both the
+protected production-signing job and the publish job. Normal tag pushes and tag
+retries cannot select dry-run mode.
+
+Before compiling, `release.sh` rejects the remaining forbidden production
+Machine features from the resolved normal/build Cargo graph. Bundle assembly
+independently rejects forbidden paths, printable markers, and retained Machine
+symbols.
 Debug and accepting-test artifacts remain forbidden across the entire bundle.
 Legacy authority markers, files, and symbols are scoped to the Machine
 executable and explicit Machine-owned payload roots; conforming custody and
@@ -113,10 +120,50 @@ installer fixtures use the following `config/` layout beside the extracted binar
 and `provenance-catalog.json`. The macOS W0 bundle deliberately contains none
 of these private files: its guarded live installer uses the same fresh
 root-owned identity-generation path as the production Unix-principal claim.
-On Linux,
-`nts-servers.conf`. The last file contains at least two distinct reviewed NTS
-host names, one per line. AWS credentials and `aws-kms-ip-allow.conf` are an
-optional paired site overlay.
+On Linux, Bloom uses the host system clock behind its durable rollback and
+same-boot forward-step guards; it does not install or require a separate time
+daemon. AWS credentials and `aws-kms-ip-allow.conf` are an optional paired
+site overlay.
+
+The Linux archive generates a complete fresh per-login enrollment from
+packaged public templates and the host CSPRNG; it does not require site-specific
+private identity inputs. It enables a login-user Machine service that maintains
+the `~/bloom` mount without interactive sudo by installing one exact
+`user,nosuid,nodev,noexec` loopback-NFS fstab authorization, including the fixed
+per-login loopback listener and complete NFS option set; no Bloom process is
+given root identity or broad mount capability. Live installed systemd acceptance
+remains available as an additional operator validation rather than a publication
+requirement.
+
+A live Linux install must receive `BLOOM_RELEASE_PUBLIC_KEY` pointing to a
+separately obtained, root-owned, non-writable copy of
+`bloom-release-v1.pub`. Before stopping services or writing installation
+state, the installer verifies that pin against `RELEASE_PUBLIC_KEY.pem`,
+verifies the `bloom-release-payload-v1` signature over `SHA256SUMS`, and then
+verifies every listed payload file from a private root-owned snapshot. Every
+installed executable, unit, account template, and configuration template is
+read from that verified snapshot. The public key is data, not another time
+service or software package.
+
+Linux binaries are shared by all enrolled logins, so an install first requires
+every active or retained enrollment and both service configurations to name the
+candidate release digest. Digest-distinct reinstall and restore are rejected
+before services stop or files change; a future Linux release upgrade requires a
+separate coordinated host-wide transaction. Retained records preserve the exact
+release digest and allocated NFS port.
+
+Linux installs provide `bloom-uninstall`. Its default `--retain-custody` mode
+stops and disables the selected enrollment, removes runtime integration, and
+preserves its private configuration and Signer state for reinstall. Permanent
+purge requires `--purge` and the exact `delete-bloom-login-LOGIN_UID`
+confirmation. Shared runtime files are removed only after the last active
+enrollment, while the uninstaller remains available until all retained custody
+has also been purged.
+
+```sh
+sudo bloom-uninstall
+sudo bloom-uninstall --purge "delete-bloom-login-$(id -u)"
+```
 
 Production macOS enrollment does not accept that private fixture layout. Its
 installed Machine binary generates fresh per-login Machine, Broker, Signer,
@@ -129,13 +176,34 @@ directory. Bundle build and verification reject concrete private seeds and
 identity-shaped JSON for a production macOS claim.
 
 The macOS installer stages an immutable release before stopping any installed
-triad. It then journals the old and new digests, stops every enrollment before
+triad. A live install first copies the candidate into a private root-owned
+snapshot and authenticates and installs exclusively from that snapshot. It then
+journals the old and new digests, stops every enrollment before
 the shared atomic `current` switch, updates build-digest state, and validates
 each installed triad before publishing all enrollments active. Failed activation
 and a transaction found after interruption restore the old release, integration
 files, and health. Custody and identity directories are never regenerated or
 replaced during this sequence. The candidate state schemas must be at least the
 installed schemas.
+
+The macOS release remains rooted at `/usr/local/libexec/bloom`, with the
+user-facing `/usr/local/bin/bloom` symlink following its atomic `current`
+selector. Activation then removes the enrolled user's supported legacy
+`~/.local/bin/bloom` file or symlink using that user's authority. Foreign PATH
+entries fail preflight, and legacy cleanup runs only after authenticated health
+has committed; users may need `hash -r`, `rehash`, or a new terminal to clear a
+cached command location.
+
+The legacy command migration does not remove old wallet data. If the resolved
+login home contains `~/.bloom/keystore`, the installer prints that exact
+location and a principal-bound two-command conversion for each detected v1
+passkey wallet. The first command runs the packaged `bloom-signer-migrate` as
+an administrator because it must read the Signer-owned configuration, stage
+data in Signer's private state, and set the isolated Signer ownership. The
+second `/usr/local/bin/bloom wallet migrate-passkey RECEIPT` command runs as
+the login user and opens the normal Broker ceremony. Unsupported legacy wallet
+kinds are identified but never modified; the staging tool supports only the
+single v1 passkey format.
 
 `uninstall --retain-custody` removes runtime integration while preserving the
 exact service principals, private configuration, and custody state. `restore`

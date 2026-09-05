@@ -207,10 +207,10 @@ jobs:
     if: >-
       github.event_name == 'workflow_dispatch' &&
       github.ref_name == 'triad-architecture'
-    uses: ./.github/workflows/macos-unix-w0.yml
+    uses: ./.github/workflows/macos-unix-conformance.yml
     with:
-      broker_ref: master
-      signer_ref: master
+      broker_ref: 56252977c99238151c89bb44649fe8f5d1c91ae8
+      signer_ref: 0126ba4589ad8cf504d2f04c8e36471727964089
 
   linux_w0_isolation:
     name: Linux W0 principal and socket isolation

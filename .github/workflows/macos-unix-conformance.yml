@@ -1,4 +1,4 @@
-name: macOS Unix-principal W0
+name: macOS Unix-principal conformance
 
 on:
   workflow_call:
@@ -7,114 +7,89 @@ on:
         description: Public bloom-broker ref
         required: false
         type: string
-        default: 1cbb549bea07f78c564ef1e66e52fb087b5f2ffa
+        default: 56252977c99238151c89bb44649fe8f5d1c91ae8
       signer_ref:
         description: Public bloom-signer ref
         required: false
         type: string
-        default: 1a1d52376919fff4cb295207e67c54dff60c745d
+        default: 0126ba4589ad8cf504d2f04c8e36471727964089
   workflow_dispatch:
     inputs:
       broker_ref:
         description: Public bloom-broker ref
         required: true
-        default: 1cbb549bea07f78c564ef1e66e52fb087b5f2ffa
+        default: 56252977c99238151c89bb44649fe8f5d1c91ae8
       signer_ref:
         description: Public bloom-signer ref
         required: true
-        default: 1a1d52376919fff4cb295207e67c54dff60c745d
+        default: 0126ba4589ad8cf504d2f04c8e36471727964089
 
 permissions:
   contents: read
 
+env:
+  RUSTUP_TOOLCHAIN: 1.96.0
+
 jobs:
-  build-w0:
+  build-candidate:
     runs-on: macos-15
     timeout-minutes: 60
     steps:
       - name: Check out Machine
-        uses: actions/checkout@v4
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           path: bloom
       - name: Reject mutable sibling refs
         shell: bash
         env:
-          BROKER_REF: ${{ inputs.broker_ref || '1cbb549bea07f78c564ef1e66e52fb087b5f2ffa' }}
-          SIGNER_REF: ${{ inputs.signer_ref || '1a1d52376919fff4cb295207e67c54dff60c745d' }}
+          BROKER_REF: ${{ inputs.broker_ref || '56252977c99238151c89bb44649fe8f5d1c91ae8' }}
+          SIGNER_REF: ${{ inputs.signer_ref || '0126ba4589ad8cf504d2f04c8e36471727964089' }}
         run: |
           [[ "$BROKER_REF" =~ ^[0-9a-f]{40}$ ]]
           [[ "$SIGNER_REF" =~ ^[0-9a-f]{40}$ ]]
       - name: Check out Broker
-        uses: actions/checkout@v4
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           repository: bloom-directory/bloom-broker
-          ref: ${{ inputs.broker_ref || '1cbb549bea07f78c564ef1e66e52fb087b5f2ffa' }}
+          ref: ${{ inputs.broker_ref || '56252977c99238151c89bb44649fe8f5d1c91ae8' }}
           path: bloom-broker
       - name: Check out Signer
-        uses: actions/checkout@v4
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           repository: bloom-directory/bloom-signer
-          ref: ${{ inputs.signer_ref || '1a1d52376919fff4cb295207e67c54dff60c745d' }}
+          ref: ${{ inputs.signer_ref || '0126ba4589ad8cf504d2f04c8e36471727964089' }}
           path: bloom-signer
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Configure shared W0 build directory
+      - name: Install Rust toolchain
+        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
+      - name: Configure shared release build directory
         shell: bash
-        run: echo "CARGO_TARGET_DIR=$RUNNER_TEMP/bloom-w0-target" >> "$GITHUB_ENV"
-      - name: Restore W0 build cache
-        uses: actions/cache@v4
+        run: echo "CARGO_TARGET_DIR=$RUNNER_TEMP/bloom-release-target" >> "$GITHUB_ENV"
+      - name: Restore release build cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
-          path: ${{ runner.temp }}/bloom-w0-target
+          path: ${{ runner.temp }}/bloom-release-target
           key: >-
-            macos-w0-target-${{ runner.os }}-${{ runner.arch }}-${{
+            macos-release-target-${{ runner.os }}-${{ runner.arch }}-${{
             hashFiles('bloom/Cargo.lock', 'bloom-broker/Cargo.lock',
             'bloom-signer/Cargo.lock') }}
 
-      - name: Build W0 triad payload
+      - name: Build signed macOS candidate
         shell: bash
         run: |
           set -Eeuo pipefail
-          cargo build --manifest-path bloom/Cargo.toml --release -p bloom --locked
-          cargo build --manifest-path bloom-broker/Cargo.toml --release -p bloom-broker --locked
-          cargo build --manifest-path bloom-signer/Cargo.toml --release \
-            -p bloom-signer -p bloom-signer-migrate --locked
-          mkdir -p "$RUNNER_TEMP/triad-staging/bin" "$RUNNER_TEMP/triad-dist"
-          cp "$CARGO_TARGET_DIR/release/bloom" "$RUNNER_TEMP/triad-staging/bin/"
-          cp "$CARGO_TARGET_DIR/release/bloom-broker" "$RUNNER_TEMP/triad-staging/bin/"
-          cp "$CARGO_TARGET_DIR/release/bloom-signer" "$RUNNER_TEMP/triad-staging/bin/"
-          cp "$CARGO_TARGET_DIR/release/bloom-signer-migrate" \
-            "$RUNNER_TEMP/triad-staging/bin/"
-          /usr/bin/ssh-keygen \
-            -q \
-            -t ed25519 \
-            -N '' \
-            -f "$RUNNER_TEMP/w0-release-key"
-          export BLOOM_PLATFORM_CLAIM=macos-unix-principals-w0
-          export BLOOM_ALLOW_MACOS_UNIX_W0=true
-          export BLOOM_MACHINE_SHA
-          export BLOOM_BROKER_SHA
-          export BLOOM_SIGNER_SHA
-          BLOOM_MACHINE_SHA="$(git -C bloom rev-parse HEAD)"
-          BLOOM_BROKER_SHA="$(git -C bloom-broker rev-parse HEAD)"
-          BLOOM_SIGNER_SHA="$(git -C bloom-signer rev-parse HEAD)"
-          bloom/packaging/triad/release/build-bundle.sh \
-            "$RUNNER_TEMP/triad-staging" \
-            "$RUNNER_TEMP/triad-dist/bloom-triad.tar.gz" \
-            "$RUNNER_TEMP/w0-release-key" \
-            1700000000
-          bloom/packaging/triad/release/verify-bundle.sh \
-            "$RUNNER_TEMP/triad-dist/bloom-triad.tar.gz" \
-            "$RUNNER_TEMP/triad-dist/bloom-triad.tar.gz.sha256" \
-            "$RUNNER_TEMP/triad-dist/bloom-triad.tar.gz.sig" \
-            "$RUNNER_TEMP/triad-dist/bloom-triad.tar.gz.pub"
+          bloom/packaging/triad/release.sh build macos \
+            --broker-root "$GITHUB_WORKSPACE/bloom-broker" \
+            --signer-root "$GITHUB_WORKSPACE/bloom-signer" \
+            --output-dir "$RUNNER_TEMP/triad-dist"
           mkdir "$RUNNER_TEMP/verified"
           tar -xzf \
-            "$RUNNER_TEMP/triad-dist/bloom-triad.tar.gz" \
+            "$RUNNER_TEMP/triad-dist/bloom-triad-test-unclaimed.tar.gz" \
             -C "$RUNNER_TEMP/verified"
 
-      - name: Upload verified W0 candidate
-        uses: actions/upload-artifact@v4
+      - name: Upload verified macOS candidate
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: macos-w0-build-${{ github.run_id }}
+          name: macos-conformance-candidate-${{ github.run_id }}
           path: |
             ${{ runner.temp }}/triad-dist
             ${{ runner.temp }}/verified/bloom-triad
@@ -122,51 +97,52 @@ jobs:
           retention-days: 7
           overwrite: true
 
-  disposable-w0:
-    needs: build-w0
+  disposable-conformance:
+    needs: build-candidate
     runs-on: macos-15
     timeout-minutes: 60
     steps:
       - name: Check out Machine
-        uses: actions/checkout@v4
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           path: bloom
       - name: Reject mutable sibling refs
         shell: bash
         env:
-          BROKER_REF: ${{ inputs.broker_ref || '1cbb549bea07f78c564ef1e66e52fb087b5f2ffa' }}
-          SIGNER_REF: ${{ inputs.signer_ref || '1a1d52376919fff4cb295207e67c54dff60c745d' }}
+          BROKER_REF: ${{ inputs.broker_ref || '56252977c99238151c89bb44649fe8f5d1c91ae8' }}
+          SIGNER_REF: ${{ inputs.signer_ref || '0126ba4589ad8cf504d2f04c8e36471727964089' }}
         run: |
           [[ "$BROKER_REF" =~ ^[0-9a-f]{40}$ ]]
           [[ "$SIGNER_REF" =~ ^[0-9a-f]{40}$ ]]
       - name: Check out Broker
-        uses: actions/checkout@v4
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           repository: bloom-directory/bloom-broker
-          ref: ${{ inputs.broker_ref || '1cbb549bea07f78c564ef1e66e52fb087b5f2ffa' }}
+          ref: ${{ inputs.broker_ref || '56252977c99238151c89bb44649fe8f5d1c91ae8' }}
           path: bloom-broker
       - name: Check out Signer
-        uses: actions/checkout@v4
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           repository: bloom-directory/bloom-signer
-          ref: ${{ inputs.signer_ref || '1a1d52376919fff4cb295207e67c54dff60c745d' }}
+          ref: ${{ inputs.signer_ref || '0126ba4589ad8cf504d2f04c8e36471727964089' }}
           path: bloom-signer
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust toolchain
+        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
       - name: Configure shared W0 acceptance directory
         shell: bash
         run: echo "CARGO_TARGET_DIR=$RUNNER_TEMP/bloom-w0-target" >> "$GITHUB_ENV"
       - name: Restore W0 build cache
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: ${{ runner.temp }}/bloom-w0-target
           key: >-
             macos-w0-target-${{ runner.os }}-${{ runner.arch }}-${{
             hashFiles('bloom/Cargo.lock', 'bloom-broker/Cargo.lock',
             'bloom-signer/Cargo.lock') }}
-      - name: Download verified W0 candidate
-        uses: actions/download-artifact@v4
+      - name: Download verified macOS candidate
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
-          name: macos-w0-build-${{ github.run_id }}
+          name: macos-conformance-candidate-${{ github.run_id }}
           path: ${{ runner.temp }}
 
       - name: Prove disposable host prerequisites
@@ -207,7 +183,7 @@ jobs:
             BLOOM_MACOS_ACCEPTANCE_CARGO="$(command -v cargo)" \
             BLOOM_MACOS_ACCEPTANCE_CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}" \
             BLOOM_MACOS_ACCEPTANCE_RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}" \
-            bloom/packaging/triad/macos/w0/run-disposable.sh \
+            bloom/tests/conformance/macos-unix-principals/run-disposable.sh \
             "$RUNNER_TEMP/verified/bloom-triad" \
             "$login_uid" \
             "$login_user"
@@ -223,7 +199,7 @@ jobs:
               "$payload"
           )"
           archive_sha="$(
-            shasum -a 256 "$RUNNER_TEMP/triad-dist/bloom-triad.tar.gz" |
+            shasum -a 256 "$RUNNER_TEMP/triad-dist/bloom-triad-test-unclaimed.tar.gz" |
               awk '{print $1}'
           )"
           {
@@ -235,7 +211,7 @@ jobs:
 
       - name: Upload W0 subject evidence
         if: success()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: macos-w0-subject-${{ github.sha }}
           path: ${{ runner.temp }}/macos-w0-subject.txt
@@ -244,7 +220,7 @@ jobs:
 
       - name: Upload digest-bound W0 criteria
         if: success()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: macos-w0-criteria-${{ github.sha }}
           path: ${{ runner.temp }}/macos-w0-evidence/*.pass
@@ -253,7 +229,7 @@ jobs:
 
       - name: Upload W0 failure diagnostics
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: macos-w0-failure-${{ github.sha }}
           path: ${{ runner.temp }}/macos-w0-evidence/*

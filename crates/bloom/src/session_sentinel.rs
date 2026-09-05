@@ -1,5 +1,5 @@
-//! Minimal authenticated login-session sentinel for the macOS
-//! Unix-principal installation profile.
+//! Minimal authenticated login-session sentinel for the installed
+//! Unix-principal profiles.
 
 use std::{
     fs,
@@ -39,20 +39,13 @@ pub async fn run() -> Result<()> {
     let config_root = if let Some(root) = developer_root.as_ref() {
         root.join("config")
     } else {
-        let enrollment_root = env_path(
-            "BLOOM_ENROLLMENT_ROOT",
-            "/Library/Application Support/BloomTriad/enrollments",
-        );
+        let enrollment_root = env_path("BLOOM_ENROLLMENT_ROOT", default_enrollment_root());
         let Some(_) = load_enrollment(&enrollment_root, effective_uid)? else {
             // The global LaunchAgent is offered to every GUI login. An
             // unenrolled login is the normal successful no-op case.
             return Ok(());
         };
-        env_path(
-            "BLOOM_CONFIG_ROOT",
-            "/Library/Application Support/BloomTriad/config",
-        )
-        .join(effective_uid.to_string())
+        env_path("BLOOM_CONFIG_ROOT", default_config_root()).join(effective_uid.to_string())
     };
     let identity_path = if developer_root.is_some() {
         config_root.join("session-identity.json")
@@ -109,7 +102,7 @@ pub async fn run() -> Result<()> {
         }
         canonical_runtime.join("session")
     } else {
-        env_path("BLOOM_RUNTIME_ROOT", "/private/var/run/bloom")
+        env_path("BLOOM_RUNTIME_ROOT", default_runtime_root())
             .join(effective_uid.to_string())
             .join("session")
     };
@@ -119,6 +112,7 @@ pub async fn run() -> Result<()> {
 
     let listener = StdUnixListener::bind(&socket_path)
         .with_context(|| format!("bind session sentinel {}", socket_path.display()))?;
+    let mut pending_socket = PendingSocketGuard::new(socket_path.clone(), effective_uid)?;
     std::os::unix::fs::chown(&socket_path, None, Some(socket_gid))
         .context("set session sentinel socket group")?;
     fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o660))
@@ -128,13 +122,30 @@ pub async fn run() -> Result<()> {
         .set_nonblocking(true)
         .context("make session sentinel socket nonblocking")?;
     let listener = UnixListener::from_std(listener).context("adopt session sentinel socket")?;
+    pending_socket.disarm();
     let _socket_guard = SocketGuard {
         path: socket_path,
         uid: effective_uid,
         gid: socket_gid,
     };
 
-    serve_authenticated_services(listener, identity, [broker_acl, signer_acl]).await
+    tracing::info!(
+        event = "service.identity_loaded",
+        service_id = identity.service_id.as_str(),
+        enrolled_login_uid = effective_uid
+    );
+    tracing::info!(event = "service.ready", listener_kind = "unix");
+    crate::native_lifecycle("session-sentinel", "ready");
+
+    tokio::select! {
+        result = serve_authenticated_services(listener, identity, [broker_acl, signer_acl]) => result,
+        result = crate::termination_signal() => {
+            result.context("wait for session sentinel shutdown signal")?;
+            tracing::info!(event = "service.shutdown", reason = "signal");
+            crate::native_lifecycle("session-sentinel", "shutdown");
+            Ok(())
+        }
+    }
 }
 
 async fn serve_authenticated_services(
@@ -192,14 +203,21 @@ async fn serve_authenticated_services(
                     service_id = peer.service_id.as_str(),
                     "session_sentinel.unexpected_channel_data"
                 ),
-                Err(error) => tracing::warn!(
-                    %error,
-                    service_id = peer.service_id.as_str(),
-                    "session_sentinel.monitor_failed"
-                ),
+                Err(error) => {
+                    let _ = error;
+                    tracing::warn!(
+                        error_kind = "channel_read",
+                        service_id = peer.service_id.as_str(),
+                        "session_sentinel.monitor_failed"
+                    )
+                }
             }
         });
     }
+}
+
+fn enrollment_state_is_usable(state: &str) -> bool {
+    state == "active" || (cfg!(target_os = "macos") && state == "activating")
 }
 
 fn load_enrollment(root: &Path, effective_uid: u32) -> Result<Option<()>> {
@@ -221,19 +239,59 @@ fn load_enrollment(root: &Path, effective_uid: u32) -> Result<Option<()>> {
         serde_json::from_slice(&fs::read(&path).context("read Bloom enrollment")?)
             .context("decode Bloom enrollment")?;
     if enrollment.get("schema").and_then(serde_json::Value::as_str)
-        != Some("bloom.macos-enrollment.1")
+        != Some(default_enrollment_schema())
         || enrollment
             .get("login_uid")
             .and_then(serde_json::Value::as_u64)
             != Some(u64::from(effective_uid))
-        || !matches!(
-            enrollment.get("state").and_then(serde_json::Value::as_str),
-            Some("activating" | "active")
-        )
+        || !enrollment
+            .get("state")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(enrollment_state_is_usable)
     {
         bail!("Bloom enrollment is not valid for this login session");
     }
     Ok(Some(()))
+}
+
+#[cfg(target_os = "macos")]
+fn default_enrollment_root() -> &'static str {
+    "/Library/Application Support/BloomTriad/enrollments"
+}
+
+#[cfg(not(target_os = "macos"))]
+fn default_enrollment_root() -> &'static str {
+    "/etc/bloom/enrollments"
+}
+
+#[cfg(target_os = "macos")]
+fn default_config_root() -> &'static str {
+    "/Library/Application Support/BloomTriad/config"
+}
+
+#[cfg(not(target_os = "macos"))]
+fn default_config_root() -> &'static str {
+    "/etc/bloom"
+}
+
+#[cfg(target_os = "macos")]
+fn default_runtime_root() -> &'static str {
+    "/private/var/run/bloom"
+}
+
+#[cfg(not(target_os = "macos"))]
+fn default_runtime_root() -> &'static str {
+    "/run/bloom"
+}
+
+#[cfg(target_os = "macos")]
+fn default_enrollment_schema() -> &'static str {
+    "bloom.macos-enrollment.1"
+}
+
+#[cfg(not(target_os = "macos"))]
+fn default_enrollment_schema() -> &'static str {
+    "bloom.linux-enrollment.1"
 }
 
 fn require_login_owned_private_file(path: &Path, effective_uid: u32) -> Result<()> {
@@ -307,6 +365,47 @@ struct SocketGuard {
     gid: u32,
 }
 
+struct PendingSocketGuard {
+    path: PathBuf,
+    uid: u32,
+    device: u64,
+    inode: u64,
+    armed: bool,
+}
+
+impl PendingSocketGuard {
+    fn new(path: PathBuf, uid: u32) -> Result<Self> {
+        let metadata =
+            fs::symlink_metadata(&path).context("inspect new session sentinel socket")?;
+        Ok(Self {
+            path,
+            uid,
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            armed: true,
+        })
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PendingSocketGuard {
+    fn drop(&mut self) {
+        if self.armed
+            && let Ok(metadata) = fs::symlink_metadata(&self.path)
+            && metadata.file_type().is_socket()
+            && metadata.uid() == self.uid
+            && metadata.dev() == self.device
+            && metadata.ino() == self.inode
+            && metadata.nlink() == 1
+        {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
 impl Drop for SocketGuard {
     fn drop(&mut self) {
         if let Ok(metadata) = fs::symlink_metadata(&self.path)
@@ -317,5 +416,17 @@ impl Drop for SocketGuard {
         {
             let _ = fs::remove_file(&self.path);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn activating_enrollment_is_accepted_only_by_macos_sentinel() {
+        assert!(super::enrollment_state_is_usable("active"));
+        assert_eq!(
+            super::enrollment_state_is_usable("activating"),
+            cfg!(target_os = "macos")
+        );
     }
 }

@@ -31,6 +31,7 @@ bloom-daemon.workspace = true
 bloom-machine-client.workspace = true
 bloom-triad-local-transport.workspace = true
 bloom-service-activation.workspace = true
+bloom-service-observability.workspace = true
 bloom-broker-api.workspace = true
 blake3.workspace = true
 bloom-mount = { workspace = true, optional = true }
@@ -67,6 +68,9 @@ zeroize.workspace = true
 # glibc OpenSSL, so build it from source only for musl targets.
 [target.'cfg(target_env = "musl")'.dependencies]
 openssl-sys = { version = "0.9", features = ["vendored"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+oslog = { version = "0.2", default-features = false }
 
 [dev-dependencies]
 assert_cmd = "2"

@@ -468,7 +468,13 @@ impl PreparedPetalPackage {
     }
 
     pub fn from_petal_tar(path: impl AsRef<Path>) -> Result<Self, PetalError> {
-        Self::from_reader(std::fs::File::open(path)?)
+        let mut reader = std::io::BufReader::new(std::fs::File::open(path)?);
+        let compressed = std::io::BufRead::fill_buf(&mut reader)?.starts_with(&[0x1f, 0x8b]);
+        if compressed {
+            Self::from_reader(flate2::bufread::GzDecoder::new(reader))
+        } else {
+            Self::from_reader(reader)
+        }
     }
 
     pub fn from_reader(reader: impl Read) -> Result<Self, PetalError> {
@@ -2467,7 +2473,7 @@ fn component_host_interface(name: &str) -> Option<ComponentHostInterface> {
         ContractHostInterface::ChainRead => Some(ComponentHostInterface::ChainRead),
         ContractHostInterface::VfsReadwrite => Some(ComponentHostInterface::VfsReadwrite),
         ContractHostInterface::EnvRuntime => Some(ComponentHostInterface::EnvRuntime),
-        ContractHostInterface::RouteTypes | ContractHostInterface::PrivateInputCeremony => None,
+        ContractHostInterface::RouteTypes => None,
     }
 }
 
@@ -5124,6 +5130,25 @@ paths = ["/*"]
         let from_tar = PreparedPetalPackage::from_reader(std::io::Cursor::new(first)).unwrap();
         assert_eq!(from_tar.hash, package.hash);
         assert_eq!(from_tar.route_index, package.route_index);
+    }
+
+    #[test]
+    fn petal_tar_path_accepts_gzip_release_archive() {
+        let source = tempfile::tempdir().unwrap();
+        write_petal_package(source.path());
+        let package = PreparedPetalPackage::from_dir(source.path()).unwrap();
+        let archive = tempfile::Builder::new()
+            .suffix(".petal.tar.gz")
+            .tempfile()
+            .unwrap();
+        let mut encoder =
+            flate2::write::GzEncoder::new(archive.reopen().unwrap(), flate2::Compression::best());
+        package.write_petal_tar(&mut encoder).unwrap();
+        encoder.finish().unwrap();
+
+        let installed = PreparedPetalPackage::from_petal_tar(archive.path()).unwrap();
+        assert_eq!(installed.hash, package.hash);
+        assert_eq!(installed.route_index, package.route_index);
     }
 
     #[test]

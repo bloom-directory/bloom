@@ -1,25 +1,7 @@
 name: Release
 
-# Tag-driven release workflow. Mirrors the structure of vibefi/client's
-# release.yml but adapted to this repo: no cargo-packager, four native
-# runner platforms plus an aarch64 musl build, per-binary verification, and a
-# reviewed workspace version bump (no --config magic, no cargo-edit).
-#
-# Flow:
-#   1. A reviewed version-bump PR is merged, then a maintainer pushes its
-#      matching `vX.Y.Z` tag. `propose-release.yml` can open that PR.
-#   2. `prepare` resolves and validates the existing tag (vX.Y.Z).
-#   3. `build` checks out that exact SHA and runs `cargo build --locked`
-#      for each release target. Verification asserts that
-#      `bloom --version` matches the tag.
-#   4. `publish` verifies the tag still resolves to the built SHA,
-#      downloads the five tarballs, generates SHA256SUMS and release notes
-#      from commits since the previous version tag, then creates or updates
-#      the GitHub release for that existing tag.
-#
-# The floating `latest` git tag is intentionally NOT touched here.
-# GitHub's `/releases/latest/download/<file>` route follows whichever
-# release is marked latest; it does not require a git tag named `latest`.
+# Dry runs build unsigned test candidates for both supported platforms.
+# Version tags build, production-sign, and publish both artifacts together.
 
 on:
   push:
@@ -28,12 +10,16 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Existing tag to retry (e.g. v0.1.1).'
-        required: true
+        description: 'Existing tag to retry when dry_run is false (for example v0.2.0).'
+        required: false
+        default: ''
         type: string
+      dry_run:
+        description: 'Build test candidates only. No production signing or GitHub Release.'
+        required: false
+        default: true
+        type: boolean
 
-# Jobs opt into the minimum permissions they need below. In particular,
-# build runners never receive a write-capable token.
 permissions: {}
 
 concurrency:
@@ -42,126 +28,238 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  RUSTUP_TOOLCHAIN: 1.96.0
 
 jobs:
   prepare:
-    name: Resolve Release Metadata
-    runs-on: ubuntu-latest
+    name: Resolve locked triad
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
     outputs:
       release_tag: ${{ steps.meta.outputs.release_tag }}
       release_version: ${{ steps.meta.outputs.release_version }}
       release_sha: ${{ steps.meta.outputs.release_sha }}
+      source_date_epoch: ${{ steps.meta.outputs.source_date_epoch }}
+      broker_sha: ${{ steps.meta.outputs.broker_sha }}
+      signer_sha: ${{ steps.meta.outputs.signer_sha }}
+      dry_run: ${{ steps.meta.outputs.dry_run }}
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           fetch-depth: 0
           persist-credentials: false
+
       - id: meta
         env:
           RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref_name }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_SHA: ${{ github.sha }}
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.dry_run == 'true' && 'true' || 'false' }}
         run: |
           set -euo pipefail
-          TAG="$RELEASE_TAG"
-          if [[ ! "$TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
-            echo "::error::release tag must match vX.Y.Z, got: $TAG"
+          tag="$RELEASE_TAG"
+          if [[ "$DRY_RUN" == "true" ]]; then
+            [[ "$EVENT_NAME" == "workflow_dispatch" ]] || {
+              echo "::error::release dry runs require workflow_dispatch"
+              exit 1
+            }
+            release_sha="$(git rev-parse HEAD)"
+          else
+            if [[ ! "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+              echo "::error::release tag must match vX.Y.Z, got: $tag"
+              exit 1
+            fi
+            git fetch --tags --force
+            git rev-parse -q --verify "refs/tags/$tag" >/dev/null || {
+              echo "::error::release tag does not exist: $tag"
+              exit 1
+            }
+            release_sha="$(git rev-parse "refs/tags/$tag^{commit}")"
+            # Supplied by the step environment above.
+            # shellcheck disable=SC2153
+            event_sha="$(git rev-parse "$EVENT_SHA^{commit}")"
+            [[ "$release_sha" == "$event_sha" ]] || {
+              echo "::error::production release runs must originate from the tagged commit"
+              exit 1
+            }
+            git fetch --force origin \
+              "refs/heads/$DEFAULT_BRANCH:refs/remotes/origin/$DEFAULT_BRANCH"
+            git merge-base --is-ancestor \
+              "$release_sha" \
+              "refs/remotes/origin/$DEFAULT_BRANCH" || {
+              echo "::error::$tag is not on $DEFAULT_BRANCH"
+              exit 1
+            }
+          fi
+
+          workspace_version="$(git show "$release_sha:Cargo.toml" |
+            sed -n -E 's/^version = "([0-9]+\.[0-9]+\.[0-9]+)"/\1/p' |
+            head -n 1)"
+          if [[ "$DRY_RUN" == "true" ]]; then
+            version="$workspace_version"
+            tag="dry-run-v$version"
+          else
+            version="${tag#v}"
+          fi
+          matrix="$(git show "$release_sha:packaging/triad/release/compatibility-v1.toml")"
+          machine_version="$(sed -n -E 's/^machine = "([0-9]+\.[0-9]+\.[0-9]+)"$/\1/p' <<<"$matrix")"
+          broker_sha="$(sed -n -E 's/^broker_commit = "([0-9a-f]{40})"$/\1/p' <<<"$matrix")"
+          signer_sha="$(sed -n -E 's/^signer_commit = "([0-9a-f]{40})"$/\1/p' <<<"$matrix")"
+          if [[ "$workspace_version" != "$version" || "$machine_version" != "$version" ]]; then
+            echo "::error::$tag must match both the workspace and triad matrix versions"
             exit 1
           fi
-          git fetch --tags --force
-          if ! git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
-            echo "::error::pushed tag does not exist in repository: $TAG"
+          [[ -n "$broker_sha" && -n "$signer_sha" ]] || {
+            echo "::error::triad matrix must pin full Broker and Signer commit IDs"
             exit 1
-          fi
-          REF="refs/tags/$TAG"
-          RELEASE_SHA="$(git rev-parse "$REF^{commit}")"
-          git fetch --force origin \
-            "refs/heads/$DEFAULT_BRANCH:refs/remotes/origin/$DEFAULT_BRANCH"
-          if ! git merge-base --is-ancestor \
-            "$RELEASE_SHA" \
-            "refs/remotes/origin/$DEFAULT_BRANCH"
-          then
-            echo "::error::tag $TAG does not point to a commit on $DEFAULT_BRANCH"
-            exit 1
-          fi
-          VERSION="${TAG#v}"
-          CURRENT_VERSION="$(git show "$RELEASE_SHA:Cargo.toml" | sed -n -E 's/^version = "([0-9]+\.[0-9]+\.[0-9]+)"/\1/p' | head -n 1)"
-          if [[ "$CURRENT_VERSION" != "$VERSION" ]]; then
-            echo "::error::tag $TAG points at workspace version $CURRENT_VERSION; merge the reviewed version bump before tagging"
-            exit 1
-          fi
+          }
+          source_date_epoch="$(git show -s --format=%ct "$release_sha")"
           {
-            echo "release_tag=$TAG"
-            echo "release_version=$VERSION"
-            echo "release_sha=$RELEASE_SHA"
+            echo "release_tag=$tag"
+            echo "release_version=$version"
+            echo "release_sha=$release_sha"
+            echo "source_date_epoch=$source_date_epoch"
+            echo "broker_sha=$broker_sha"
+            echo "signer_sha=$signer_sha"
+            echo "dry_run=$DRY_RUN"
           } >> "$GITHUB_OUTPUT"
-          echo "Resolved release metadata:"
-          echo "  tag: $TAG"
-          echo "  version: $VERSION"
-          echo "  ref: $REF"
-          echo "  sha: $RELEASE_SHA"
-          echo "  workspace version: $CURRENT_VERSION"
-
-  test:
-    name: test tagged release
-    needs: prepare
-    permissions:
-      contents: read
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
-        with:
-          ref: ${{ needs.prepare.outputs.release_sha }}
-          fetch-depth: 0
-          persist-credentials: false
-
-      - name: Install Rust toolchain
-        run: rustup show
-
-      - name: Install Foundry
-        uses: foundry-rs/foundry-toolchain@v1
-        with:
-          version: stable
-
-      - name: Run workspace tests (locked)
-        run: cargo test --workspace --locked
 
   build:
-    name: build ${{ matrix.asset_name }}
-    needs: [prepare, test]
+    name: Build and test Linux x86_64 candidate
+    needs: prepare
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - asset_name: bloom-linux-x86_64.tar.gz
-            os: ubuntu-latest
-            binary: bloom
-            target: x86_64-unknown-linux-gnu
-            static: false
-          - asset_name: bloom-linux-aarch64.tar.gz
-            os: ubuntu-24.04-arm
-            binary: bloom
-            target: aarch64-unknown-linux-gnu
-            static: false
-          - asset_name: bloom-linux-aarch64-musl.tar.gz
-            os: ubuntu-24.04-arm
-            binary: bloom
-            target: aarch64-unknown-linux-musl
-            static: true
-          - asset_name: bloom-macos-x86_64.tar.gz
-            os: macos-26-intel
-            binary: bloom
-            target: x86_64-apple-darwin
-            static: false
-          - asset_name: bloom-macos-aarch64.tar.gz
-            os: macos-26
-            binary: bloom
-            target: aarch64-apple-darwin
-            static: false
-    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Check out Machine
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ needs.prepare.outputs.release_sha }}
+          path: bloom
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check out locked Broker
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          repository: bloom-directory/bloom-broker
+          ref: ${{ needs.prepare.outputs.broker_sha }}
+          path: bloom-broker
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check out locked Signer
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          repository: bloom-directory/bloom-signer
+          ref: ${{ needs.prepare.outputs.signer_sha }}
+          path: bloom-signer
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: |
+            bloom
+            bloom-broker
+            bloom-signer
+
+      - name: Build signed Linux candidate
+        working-directory: bloom
+        env:
+          SOURCE_DATE_EPOCH: ${{ needs.prepare.outputs.source_date_epoch }}
+        run: |
+          packaging/triad/release.sh build linux \
+            --output-dir "$RUNNER_TEMP/candidate"
+
+      - name: Upload verified unsigned candidate
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: triad-linux-x86_64-candidate
+          path: ${{ runner.temp }}/candidate/bloom-triad-test-unclaimed.tar.gz*
+          if-no-files-found: error
+          retention-days: 3
+
+  build-macos:
+    name: Build and test macOS aarch64 candidate
+    needs: prepare
+    runs-on: macos-15
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    steps:
+      - name: Check out Machine
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ needs.prepare.outputs.release_sha }}
+          path: bloom
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check out locked Broker
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          repository: bloom-directory/bloom-broker
+          ref: ${{ needs.prepare.outputs.broker_sha }}
+          path: bloom-broker
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check out locked Signer
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          repository: bloom-directory/bloom-signer
+          ref: ${{ needs.prepare.outputs.signer_sha }}
+          path: bloom-signer
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
+
+      - name: Configure shared build directory
+        run: echo "CARGO_TARGET_DIR=$RUNNER_TEMP/macos-release-target" >> "$GITHUB_ENV"
+
+      - name: Restore release build cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ${{ runner.temp }}/macos-release-target
+          key: >-
+            macos-release-candidate-arm64-${{
+            hashFiles('bloom/Cargo.lock', 'bloom-broker/Cargo.lock',
+            'bloom-signer/Cargo.lock') }}
+
+      - name: Build signed macOS candidate
+        working-directory: bloom
+        env:
+          SOURCE_DATE_EPOCH: ${{ needs.prepare.outputs.source_date_epoch }}
+        run: |
+          uname -m | grep -Fx arm64
+          packaging/triad/release.sh build macos \
+            --output-dir "$RUNNER_TEMP/candidate"
+
+      - name: Upload verified macOS candidate
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: triad-macos-aarch64-candidate
+          path: ${{ runner.temp }}/candidate/bloom-triad-test-unclaimed.tar.gz*
+          if-no-files-found: error
+          retention-days: 3
+
+  sign:
+    name: Sign reviewed candidates
+    needs: [prepare, build, build-macos]
+    if: needs.prepare.outputs.dry_run != 'true'
+    runs-on: ubuntu-24.04
+    environment: production-release
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
@@ -169,75 +267,86 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Install Rust toolchain
-        run: rustup target add "${{ matrix.target }}"
-
-      - name: Install musl toolchain
-        if: matrix.static
-        run: |
-          sudo apt-get update
-          sudo apt-get install --yes make musl-tools perl
-
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
-          cache-targets: false
+          name: triad-linux-x86_64-candidate
+          path: candidate/linux
 
-      - name: Build release binary (locked)
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: triad-macos-aarch64-candidate
+          path: candidate/macos
+
+      - name: Re-sign candidate without executing it
         env:
-          AR_aarch64_unknown_linux_musl: ar
-          CC_aarch64_unknown_linux_musl: musl-gcc
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
-        run: cargo build --release -p bloom --all-features --locked --target "${{ matrix.target }}"
-
-      - name: Verify binary version matches tag
-        env:
-          VERSION: ${{ needs.prepare.outputs.release_version }}
+          RELEASE_SIGNING_KEY: ${{ secrets.TRIAD_RELEASE_SIGNING_KEY }}
+          SOURCE_DATE_EPOCH: ${{ needs.prepare.outputs.source_date_epoch }}
         run: |
           set -euo pipefail
-          BINARY="./target/${{ matrix.target }}/release/${{ matrix.binary }}"
-          ACTUAL="$("$BINARY" --version | head -n 1 | awk '{print $2}')"
-          if [[ "$ACTUAL" != "$VERSION" ]]; then
-            echo "::error::binary version '$ACTUAL' does not match tag '$VERSION'"
+          [[ -n "$RELEASE_SIGNING_KEY" ]] || {
+            echo "::error::configure TRIAD_RELEASE_SIGNING_KEY in the production-release environment"
             exit 1
-          fi
-          echo "Verified: ${{ matrix.binary }} --version = $ACTUAL"
+          }
+          umask 077
+          signing_key="$(mktemp "$RUNNER_TEMP/bloom-release-key.XXXXXX")"
+          trap 'rm -f -- "$signing_key"' EXIT
+          printf '%s\n' "$RELEASE_SIGNING_KEY" > "$signing_key"
+          unset RELEASE_SIGNING_KEY
+          packaging/triad/release.sh sign linux \
+            candidate/linux/bloom-triad-test-unclaimed.tar.gz \
+            --output-dir signed \
+            --signing-key "$signing_key" \
+            --pinned-public-key packaging/triad/release/bloom-release-v1.pub \
+            --source-date-epoch "$SOURCE_DATE_EPOCH" \
+            --version '${{ needs.prepare.outputs.release_version }}' \
+            --machine-sha '${{ needs.prepare.outputs.release_sha }}' \
+            --broker-sha '${{ needs.prepare.outputs.broker_sha }}' \
+            --signer-sha '${{ needs.prepare.outputs.signer_sha }}'
+          packaging/triad/release.sh sign macos \
+            candidate/macos/bloom-triad-test-unclaimed.tar.gz \
+            --output-dir signed \
+            --signing-key "$signing_key" \
+            --pinned-public-key packaging/triad/release/bloom-release-v1.pub \
+            --source-date-epoch "$SOURCE_DATE_EPOCH" \
+            --version '${{ needs.prepare.outputs.release_version }}' \
+            --machine-sha '${{ needs.prepare.outputs.release_sha }}' \
+            --broker-sha '${{ needs.prepare.outputs.broker_sha }}' \
+            --signer-sha '${{ needs.prepare.outputs.signer_sha }}'
+          rm -f -- "$signing_key"
+          trap - EXIT
 
-      - name: Verify static linkage
-        if: matrix.static
+      - name: Verify signed archive against reviewed key
         run: |
-          set -euo pipefail
-          BINARY="./target/${{ matrix.target }}/release/${{ matrix.binary }}"
-          if readelf --program-headers "$BINARY" | grep -q 'Requesting program interpreter'; then
-            echo "::error::$BINARY has a dynamic program interpreter"
-            exit 1
-          fi
-          if readelf --dynamic "$BINARY" 2>/dev/null | grep -q '(NEEDED)'; then
-            echo "::error::$BINARY has dynamic library dependencies"
-            exit 1
-          fi
-          file "$BINARY"
+          packaging/triad/release/verify-bundle.sh \
+            signed/bloom-triad-linux-x86_64.tar.gz \
+            signed/bloom-triad-linux-x86_64.tar.gz.sha256 \
+            signed/bloom-triad-linux-x86_64.tar.gz.sig \
+            packaging/triad/release/bloom-release-v1.pub
+          cmp \
+            packaging/triad/release/bloom-release-v1.pub \
+            signed/bloom-triad-linux-x86_64.tar.gz.pub
+          packaging/triad/release/verify-bundle.sh \
+            signed/bloom-triad-macos-aarch64.tar.gz \
+            signed/bloom-triad-macos-aarch64.tar.gz.sha256 \
+            signed/bloom-triad-macos-aarch64.tar.gz.sig \
+            packaging/triad/release/bloom-release-v1.pub
+          cmp \
+            packaging/triad/release/bloom-release-v1.pub \
+            signed/bloom-triad-macos-aarch64.tar.gz.pub
 
-      - name: Stage package
-        run: |
-          set -euo pipefail
-          mkdir -p package dist
-          cp "target/${{ matrix.target }}/release/${{ matrix.binary }}" package/
-          cp README.md LICENSE package/
-          tar -czf "dist/${{ matrix.asset_name }}" -C package .
-
-      - name: Upload artifact
+      - name: Upload signed release assets
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: ${{ matrix.asset_name }}
-          path: dist/${{ matrix.asset_name }}
+          name: triad-signed-release
+          path: signed/bloom-triad-*.tar.gz*
           if-no-files-found: error
           retention-days: 7
 
   publish:
-    name: Publish GitHub Release
-    needs: [prepare, test, build]
-    runs-on: ubuntu-latest
+    name: Publish release
+    needs: [prepare, sign]
+    if: needs.prepare.outputs.dry_run != 'true'
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
@@ -246,15 +355,10 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Download build artifacts
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
+          name: triad-signed-release
           path: dist
-          merge-multiple: true
-
-      - name: Generate checksums
-        working-directory: dist
-        run: sha256sum bloom-* > SHA256SUMS
 
       - name: Create or update GitHub release
         env:
@@ -266,128 +370,62 @@ jobs:
         run: |
           set -euo pipefail
           git fetch --tags --force
-          TAG_SHA="$(git rev-parse "$TAG^{commit}")"
-          if [[ "$TAG_SHA" != "$SHA" ]]; then
-            echo "::error::refusing to publish: tag $TAG resolves to $TAG_SHA, built SHA is $SHA"
+          tag_sha="$(git rev-parse "$TAG^{commit}")"
+          [[ "$tag_sha" == "$SHA" ]] || {
+            echo "::error::$TAG moved after the build"
             exit 1
-          fi
-
-          version_at_least() {
-            local left right lpart rpart
-            IFS=. read -r -a left <<< "${1#v}"
-            IFS=. read -r -a right <<< "${2#v}"
-            for i in 0 1 2; do
-              lpart=$((10#${left[$i]}))
-              rpart=$((10#${right[$i]}))
-              if (( lpart > rpart )); then return 0; fi
-              if (( lpart < rpart )); then return 1; fi
-            done
-            return 0
           }
+          notes="$(mktemp)"
+          cat > "$notes" <<EOF
+          ## Bloom v$VERSION
 
-          PREVIOUS_TAG=""
-          while IFS= read -r CANDIDATE; do
-            if [[ "$CANDIDATE" != "$TAG" \
-              && "$CANDIDATE" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] \
-              && ! version_at_least "$CANDIDATE" "$TAG"
-            then
-              PREVIOUS_TAG="$CANDIDATE"
-              break
-            fi
-          done < <(git tag --merged "$SHA" --sort=-version:refname)
+          This release contains signed Bloom triad bundles for Linux x86_64 and
+          macOS aarch64.
 
-          RANGE="$SHA"
-          CHANGE_HEADING="### Changes"
-          if [[ -n "$PREVIOUS_TAG" ]]; then
-            RANGE="$PREVIOUS_TAG..$SHA"
-            CHANGE_HEADING="### Changes since \`$PREVIOUS_TAG\`"
-          fi
-
-          NOTES="$(mktemp)"
-          cat > "$NOTES" <<EOF
-          ## bloom v$VERSION
-
-          Automated release for tag \`$TAG\`.
-
-          $CHANGE_HEADING
-
+          Verify the archive checksum signature with the reviewed key at
+          \`packaging/triad/release/bloom-release-v1.pub\` and the namespace
+          \`bloom-release-archive-v1\`.
           EOF
-          while IFS=$'\t' read -r COMMIT SHORT_SHA SUBJECT; do
-            printf -- '- %s ([`%s`](https://github.com/%s/commit/%s))\n' \
-              "$SUBJECT" "$SHORT_SHA" "$REPOSITORY" "$COMMIT" >> "$NOTES"
-          done < <(git log --first-parent --format='%H%x09%h%x09%s' "$RANGE")
-
-          if [[ -n "$PREVIOUS_TAG" ]]; then
-            printf '\n**Full Changelog**: https://github.com/%s/compare/%s...%s\n' \
-              "$REPOSITORY" "$PREVIOUS_TAG" "$TAG" >> "$NOTES"
-          fi
-
-          cat >> "$NOTES" <<EOF
-
-          ### Downloads
-
-          Stable per-version URLs — pick the one for your platform:
-          \`\`\`
-          https://github.com/$REPOSITORY/releases/download/$TAG/bloom-linux-x86_64.tar.gz
-          https://github.com/$REPOSITORY/releases/download/$TAG/bloom-linux-aarch64.tar.gz
-          https://github.com/$REPOSITORY/releases/download/$TAG/bloom-linux-aarch64-musl.tar.gz
-          https://github.com/$REPOSITORY/releases/download/$TAG/bloom-macos-x86_64.tar.gz
-          https://github.com/$REPOSITORY/releases/download/$TAG/bloom-macos-aarch64.tar.gz
-          \`\`\`
-
-          Latest-alias URL (resolves to the release marked latest):
-          \`\`\`
-          https://github.com/$REPOSITORY/releases/latest/download/bloom-linux-x86_64.tar.gz
-          \`\`\`
-
-          Verify your download with \`SHA256SUMS\`.
-          EOF
-
-          LATEST_ERROR="$(mktemp)"
-          if CURRENT_LATEST="$(gh api "repos/${{ github.repository }}/releases/latest" --jq '.tag_name' 2>"$LATEST_ERROR")"; then
-            :
-          else
-            GH_STATUS=$?
-            if grep -q 'HTTP 404' "$LATEST_ERROR"; then
-              CURRENT_LATEST=""
-              echo "No eligible published release exists yet; considering $TAG for latest."
-            else
-              cat "$LATEST_ERROR" >&2
-              echo "::error::failed to resolve the current latest release; refusing to publish"
-              exit "$GH_STATUS"
-            fi
-          fi
-          MARK_LATEST=false
-          if [[ -z "$CURRENT_LATEST" || "$CURRENT_LATEST" == "latest" ]]; then
-            MARK_LATEST=true
-          elif [[ "$CURRENT_LATEST" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] \
-            && version_at_least "$TAG" "$CURRENT_LATEST"; then
-            MARK_LATEST=true
-          fi
-          echo "Current latest release: ${CURRENT_LATEST:-none}"
-          echo "Marking $TAG latest: $MARK_LATEST"
-
           if gh release view "$TAG" >/dev/null 2>&1; then
-            # Retry path: release already exists. Use the REST API because
-            # `gh release edit` can mark a release latest but cannot explicitly
-            # demote one that was previously marked latest.
-            RELEASE_ID="$(gh api "repos/${{ github.repository }}/releases/tags/$TAG" --jq '.id')"
+            existing="$(mktemp -d)"
+            gh release view "$TAG" --json assets --jq '.assets[].name' \
+              > "$existing/names"
+            for asset in dist/*; do basename "$asset"; done |
+              LC_ALL=C sort > "$existing/expected-names"
+            LC_ALL=C sort -u "$existing/names" > "$existing/names.sorted"
+            LC_ALL=C comm -23 \
+              "$existing/names.sorted" \
+              "$existing/expected-names" \
+              > "$existing/unexpected-names"
+            if [[ -s "$existing/unexpected-names" ]]; then
+              echo "::error::release contains unexpected assets"
+              cat "$existing/unexpected-names"
+              exit 1
+            fi
+            for asset in dist/*; do
+              name="$(basename "$asset")"
+              if grep -Fqx -- "$name" "$existing/names"; then
+                gh release download "$TAG" --pattern "$name" --dir "$existing"
+                cmp "$asset" "$existing/$name" || {
+                  echo "::error::published asset $name is immutable and differs from this retry"
+                  exit 1
+                }
+              else
+                gh release upload "$TAG" "$asset"
+              fi
+            done
+            release_id="$(gh api "repos/$REPOSITORY/releases/tags/$TAG" --jq .id)"
             gh api --method PATCH \
-              "repos/${{ github.repository }}/releases/$RELEASE_ID" \
-              -f name="bloom v$VERSION" \
-              -f body="$(<"$NOTES")" \
-              -f make_latest="$MARK_LATEST"
-            gh release upload "$TAG" dist/* --clobber
+              "repos/$REPOSITORY/releases/$release_id" \
+              -f name="Bloom v$VERSION" \
+              -f body="$(<"$notes")" \
+              -F prerelease=false \
+              -f make_latest=true
+            echo "Existing assets are byte-identical; missing assets were uploaded."
           else
-            # First-time create. `--verify-tag` checks that the tag
-            # already exists in the remote repository; lightweight tags
-            # are supported. Together with the TAG_SHA comparison above,
-            # this prevents `gh` from creating a missing tag from the
-            # default branch after the build has completed.
             gh release create "$TAG" \
               --verify-tag \
-              --title "bloom v$VERSION" \
-              --notes-file "$NOTES" \
-              --latest="$MARK_LATEST" \
+              --title "Bloom v$VERSION" \
+              --notes-file "$notes" \
               dist/*
           fi

@@ -45,8 +45,10 @@ launchctl print "gui/$login_uid" >/dev/null 2>&1 || {
   exit 69
 }
 
-triad_source="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
-installer="$triad_source/release/install-macos.sh"
+conformance_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+main_root="$(cd "$conformance_dir/../../.." && pwd -P)"
+release_dir="$main_root/packaging/triad/release"
+installer="$release_dir/install-macos.sh"
 enrollment="/Library/Application Support/BloomTriad/enrollments/$login_uid.json"
 rotation_fixtures="$(mktemp -d /private/tmp/bloom-w0-rotation.XXXXXX)"
 process_probe_dir="$(mktemp -d /private/tmp/bloom-w0-process.XXXXXX)"
@@ -60,7 +62,7 @@ capture_failure_evidence() {
   evidence_dir="${BLOOM_MACOS_W0_EVIDENCE_DIR:-}"
   [[ -n "$evidence_dir" && -d "$evidence_dir" ]] || return 0
   for service in broker signer; do
-    source_log="/private/var/db/bloom/$login_uid/$service/$service.log"
+    source_log="/private/var/log/bloom/$login_uid/$service.jsonl"
     if [[ -f "$source_log" && ! -L "$source_log" ]]; then
       install -m 0644 "$source_log" "$evidence_dir/$service.log" || true
     fi
@@ -151,25 +153,14 @@ assert_record() {
   name="$2"
   attribute="$3"
   expected="$4"
-  record="$(dscl -plist . -read "/$kind/$name" "$attribute")"
-  if observed="$(
-    plutil -extract "dsAttrTypeStandard:$attribute".0 raw -o - - <<<"$record" 2>/dev/null
-  )"; then
-    attribute_key="dsAttrTypeStandard:$attribute"
-  elif observed="$(
-    plutil -extract "dsAttrTypeNative:$attribute".0 raw -o - - <<<"$record" 2>/dev/null
-  )"; then
-    attribute_key="dsAttrTypeNative:$attribute"
-  else
+  record="$(dscl . -read "/$kind/$name" "$attribute")" || {
     echo "$kind/$name is missing required attribute $attribute" >&2
     exit 1
-  fi
-  if plutil -type "$attribute_key".1 -o - - <<<"$record" >/dev/null 2>&1; then
-    echo "$kind/$name has multiple values for $attribute" >&2
-    exit 1
-  fi
-  [[ "$observed" == "$expected" ]] || {
-    echo "$kind/$name $attribute: expected $expected, observed $observed" >&2
+  }
+  [[ "$record" == "$attribute: $expected" ||
+    "$record" == "dsAttrTypeStandard:$attribute: $expected" ||
+    "$record" == "dsAttrTypeNative:$attribute: $expected" ]] || {
+    echo "$kind/$name $attribute: expected one value $expected, observed $record" >&2
     exit 1
   }
 }
@@ -456,7 +447,7 @@ chmod 0755 "$process_probe_dir"
   -Wall \
   -Wextra \
   -Werror \
-  "$triad_source/macos/w0/task-access-probe.c" \
+  "$conformance_dir/task-access-probe.c" \
   -o "$process_probe_dir/task-access-probe"
 chmod 0755 "$process_probe_dir/task-access-probe"
 for service_and_uid in \
@@ -580,7 +571,6 @@ grep -Fi \
 }
 
 broker_plist="/Library/LaunchDaemons/com.bloom.broker.$login_uid.plist"
-broker_log="/private/var/db/bloom/$login_uid/broker/broker.log"
 broker_state="/private/var/db/bloom/$login_uid/broker"
 broker_startup_status="/private/var/run/bloom/$login_uid/status/broker-startup.json"
 containment_status="/private/var/run/bloom/$login_uid/containment/status.json"
@@ -614,17 +604,15 @@ sleep "$(( (containment_maximum_age_ms + 999) / 1000 + 1 ))"
 launchctl bootstrap system "$broker_plist"
 deadline=$((SECONDS + 15))
 while [[ $SECONDS -lt $deadline ]]; do
-  if grep -F \
-    'fatal canonical ceremony listener ownership conflict at 127.0.0.1:18734; no fallback port will be used' \
-    "$broker_log" >/dev/null 2>&1
+  if [[ -f "$broker_startup_status" ]] &&
+    [[ "$(plutil -extract state raw -o - "$broker_startup_status" 2>/dev/null)" == "fatal" ]] &&
+    [[ "$(plutil -extract incident raw -o - "$broker_startup_status" 2>/dev/null)" == \
+      "foreign_or_unverifiable_process" ]]
   then
     break
   fi
   sleep 0.1
 done
-grep -F \
-  'fatal canonical ceremony listener ownership conflict at 127.0.0.1:18734; no fallback port will be used' \
-  "$broker_log" >/dev/null
 assert_metadata \
   "$broker_startup_status" \
   "$broker_uid:$machine_broker_gid:640"
@@ -674,7 +662,7 @@ broker_durable_after="$(
   echo "a Broker that lost the canonical listener mutated durable authority state" >&2
   exit 1
 }
-kill "$foreign_listener_pid"
+kill "$foreign_listener_pid" 2>/dev/null || true
 wait "$foreign_listener_pid" 2>/dev/null || true
 foreign_listener_pid=""
 # Multiple fatal starts while the port is occupied can put launchd into a
@@ -838,7 +826,7 @@ if [[ "$installed_acceptance_inputs" -ne 0 ]]; then
     echo "installed acceptance requires all three source roots and the evidence directory" >&2
     exit 65
   }
-  "$triad_source/macos/w0/run-installed-acceptance.sh" \
+  "$conformance_dir/run-installed-acceptance.sh" \
     "$current_good_payload" \
     "$login_uid" \
     "$login_user" \
@@ -869,7 +857,7 @@ done
 
 if [[ -n "${BLOOM_MACOS_W0_EVIDENCE_DIR:-}" ]]; then
   subject_digest="$(
-    "$triad_source/release/macos-conformance-subject.sh" "$current_good_payload"
+    "$release_dir/macos-conformance-subject.sh" "$current_good_payload"
   )"
   for criterion in \
     mui_02 \

@@ -1,4 +1,4 @@
-name: macOS two-login Unix-principal W0
+name: macOS two-login Unix-principal conformance
 
 on:
   workflow_call:
@@ -7,12 +7,12 @@ on:
         description: Public bloom-broker ref
         required: false
         type: string
-        default: 1cbb549bea07f78c564ef1e66e52fb087b5f2ffa
+        default: 56252977c99238151c89bb44649fe8f5d1c91ae8
       signer_ref:
         description: Public bloom-signer ref
         required: false
         type: string
-        default: 1a1d52376919fff4cb295207e67c54dff60c745d
+        default: 0126ba4589ad8cf504d2f04c8e36471727964089
       login_uid_a:
         description: First active GUI login UID
         required: true
@@ -34,11 +34,11 @@ on:
       broker_ref:
         description: Public bloom-broker ref
         required: true
-        default: 1cbb549bea07f78c564ef1e66e52fb087b5f2ffa
+        default: 56252977c99238151c89bb44649fe8f5d1c91ae8
       signer_ref:
         description: Public bloom-signer ref
         required: true
-        default: 1a1d52376919fff4cb295207e67c54dff60c745d
+        default: 0126ba4589ad8cf504d2f04c8e36471727964089
       login_uid_a:
         description: First active GUI login UID
         required: true
@@ -55,6 +55,9 @@ on:
 permissions:
   contents: read
 
+env:
+  RUSTUP_TOOLCHAIN: 1.96.0
+
 jobs:
   two-login:
     runs-on: [self-hosted, macOS, bloom-two-login-disposable]
@@ -66,57 +69,53 @@ jobs:
       BLOOM_W0_LOGIN_USER_B: ${{ inputs.login_user_b }}
     steps:
       - name: Check out candidate Machine
-        uses: actions/checkout@v4
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           path: bloom
       - name: Reject mutable sibling refs
         shell: bash
         env:
-          BROKER_REF: ${{ inputs.broker_ref || '1cbb549bea07f78c564ef1e66e52fb087b5f2ffa' }}
-          SIGNER_REF: ${{ inputs.signer_ref || '1a1d52376919fff4cb295207e67c54dff60c745d' }}
+          BROKER_REF: ${{ inputs.broker_ref || '56252977c99238151c89bb44649fe8f5d1c91ae8' }}
+          SIGNER_REF: ${{ inputs.signer_ref || '0126ba4589ad8cf504d2f04c8e36471727964089' }}
         run: |
           [[ "$BROKER_REF" =~ ^[0-9a-f]{40}$ ]]
           [[ "$SIGNER_REF" =~ ^[0-9a-f]{40}$ ]]
       - name: Check out Broker
-        uses: actions/checkout@v4
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           repository: bloom-directory/bloom-broker
-          ref: ${{ inputs.broker_ref || '1cbb549bea07f78c564ef1e66e52fb087b5f2ffa' }}
+          ref: ${{ inputs.broker_ref || '56252977c99238151c89bb44649fe8f5d1c91ae8' }}
           path: bloom-broker
       - name: Check out Signer
-        uses: actions/checkout@v4
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           repository: bloom-directory/bloom-signer
-          ref: ${{ inputs.signer_ref || '1a1d52376919fff4cb295207e67c54dff60c745d' }}
+          ref: ${{ inputs.signer_ref || '0126ba4589ad8cf504d2f04c8e36471727964089' }}
           path: bloom-signer
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust toolchain
+        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
 
-      - name: Build baseline, candidate, and activation-failing payloads
+      - name: Build candidate and conformance fixture payloads
         shell: bash
         run: |
           set -Eeuo pipefail
-          for manifest_and_package in \
-            "bloom/Cargo.toml bloom" \
-            "bloom-broker/Cargo.toml bloom-broker" \
-            "bloom-signer/Cargo.toml bloom-signer" \
-            "bloom-signer/Cargo.toml bloom-signer-migrate"
-          do
-            manifest="${manifest_and_package%% *}"
-            package="${manifest_and_package#* }"
-            CARGO_TARGET_DIR="$RUNNER_TEMP/candidate-target" \
-              cargo build \
-              --manifest-path "$manifest" \
-              --release \
-              -p "$package" \
-              --locked
-          done
           /usr/bin/ssh-keygen \
             -q \
             -t ed25519 \
             -N '' \
             -f "$RUNNER_TEMP/w0-release-key"
+          CARGO_TARGET_DIR="$RUNNER_TEMP/candidate-target" \
+            bloom/packaging/triad/release.sh build macos \
+            --broker-root "$GITHUB_WORKSPACE/bloom-broker" \
+            --signer-root "$GITHUB_WORKSPACE/bloom-signer" \
+            --candidate-signing-key "$RUNNER_TEMP/w0-release-key" \
+            --output-dir "$RUNNER_TEMP/candidate-dist"
+          mkdir -p "$RUNNER_TEMP/candidate-verified"
+          tar -xzf \
+            "$RUNNER_TEMP/candidate-dist/bloom-triad-test-unclaimed.tar.gz" \
+            -C "$RUNNER_TEMP/candidate-verified"
 
-          for name in baseline candidate failing; do
+          for name in baseline failing; do
             mkdir -p \
               "$RUNNER_TEMP/$name-staging/bin" \
               "$RUNNER_TEMP/$name-dist" \
@@ -125,14 +124,10 @@ jobs:
           cp "$RUNNER_TEMP/candidate-target/release/bloom" \
             "$RUNNER_TEMP/baseline-staging/bin/bloom"
           cp "$RUNNER_TEMP/candidate-target/release/bloom" \
-            "$RUNNER_TEMP/candidate-staging/bin/bloom"
-          cp "$RUNNER_TEMP/candidate-target/release/bloom" \
             "$RUNNER_TEMP/failing-staging/bin/bloom"
-          for name in baseline candidate; do
-            cp "$RUNNER_TEMP/candidate-target/release/bloom-broker" \
-              "$RUNNER_TEMP/$name-staging/bin/bloom-broker"
-          done
-          for name in baseline candidate failing; do
+          cp "$RUNNER_TEMP/candidate-target/release/bloom-broker" \
+            "$RUNNER_TEMP/baseline-staging/bin/bloom-broker"
+          for name in baseline failing; do
             cp "$RUNNER_TEMP/candidate-target/release/bloom-signer" \
               "$RUNNER_TEMP/$name-staging/bin/bloom-signer"
             cp "$RUNNER_TEMP/candidate-target/release/bloom-signer-migrate" \
@@ -172,7 +167,8 @@ jobs:
             BLOOM_MACHINE_SHA="$(git -C "$source_root" rev-parse HEAD)"
             BLOOM_BROKER_SHA="$(git -C bloom-broker rev-parse HEAD)"
             BLOOM_SIGNER_SHA="$(git -C bloom-signer rev-parse HEAD)"
-            "$source_root/packaging/triad/release/build-bundle.sh" \
+            BLOOM_COMPATIBILITY_FILE="$RUNNER_TEMP/candidate-verified/bloom-triad/compatibility-v1.toml" \
+              "$source_root/packaging/triad/release/build-bundle.sh" \
               "$RUNNER_TEMP/$name-staging" \
               "$RUNNER_TEMP/$name-dist/bloom-triad.tar.gz" \
               "$RUNNER_TEMP/w0-release-key" \
@@ -188,7 +184,6 @@ jobs:
           }
 
           build_payload baseline bloom
-          build_payload candidate bloom
           build_payload failing bloom
 
       - name: Prove disposable two-login host prerequisites
@@ -220,7 +215,7 @@ jobs:
             BLOOM_RUN_MACOS_UNIX_W0=true \
             BLOOM_RELEASE_PUBLIC_KEY=/private/var/db/bloom-w0-release-key.pem \
             BLOOM_MACOS_W0_EVIDENCE_DIR="$RUNNER_TEMP/macos-two-login-evidence" \
-            bloom/packaging/triad/macos/w0/run-two-login.sh \
+            bloom/tests/conformance/macos-unix-principals/run-two-login.sh \
             "$RUNNER_TEMP/baseline-verified/bloom-triad" \
             "$BLOOM_W0_LOGIN_UID_A" \
             "$BLOOM_W0_LOGIN_USER_A" \
@@ -231,7 +226,7 @@ jobs:
 
       - name: Upload digest-bound two-login criteria
         if: success()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: macos-two-login-criteria-${{ github.sha }}
           path: ${{ runner.temp }}/macos-two-login-evidence/*.pass

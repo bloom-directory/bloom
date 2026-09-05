@@ -37,18 +37,14 @@ wire detail. It does not amend that specification.
   its LaunchDaemon supplies only reviewed endpoint paths. Failure-only
   `KeepAlive` retries a fatal `127.0.0.1:18734` conflict. The disposable macOS
   test uses a real direct-bind child, not launchd TCP handover.
-- A complete-version upgrade may have several recorded Broker LaunchDaemons
-  but only one Broker can pass readiness while owning the host-wide canonical
-  listener. Upgrade and rollback therefore restore every session and Signer
-  job first, then bootstrap, authenticate, and stop each recorded Broker with
-  an active login-session job serially against the candidate release.
-  The compact self-contained installer therefore preflights an active GUI
-  domain for every enrollment before it creates the transaction or stops a
-  job. It validates each Broker serially, then restores the complete job set.
-  An operator must perform a shared-release upgrade while all enrolled logins
-  are active; otherwise it fails before the commit boundary. This validates
-  the runnable enrollment set without weakening AC-31 or introducing a
-  fallback port.
+- A complete-version upgrade converges every enrollment toward one requested
+  signed digest, switches the shared content-addressed release, and asks
+  launchd to reload each recorded job. The installer does not serialize runtime
+  health probes or roll a durable upgrade back because a GUI domain defers a
+  LaunchAgent. Runtime readiness and canonical-listener ownership remain
+  fail-closed service concerns and disposable-W0 release evidence. Interrupted
+  installation records forward intent; the next invocation resumes toward the
+  newly requested compatible digest.
 - Until a disposable W0 VM proves account creation/rollback, system-domain
   launchd ownership, socket modes, `pf` behavior, and uninstall, the installer
   accepts live test activation only for the non-production
@@ -141,13 +137,12 @@ wire detail. It does not amend that specification.
   `SOURCE_REVISIONS`; it separately executes, scans, installs, and uninstalls
   the extracted production artifacts. A source-suite pass from a different
   revision or a version-only bundle smoke is not accepted.
-- Section 10.3 permits authenticated NTP, NTS, or a platform-managed time
-  daemon. The edge manifest pins one reviewed source ID per platform:
-  `linux-chrony-nts` or `macos-managed-timed`. Linux packaging requires two
-  NTS sources under chrony's `authselectmode require`; the runtime accepts UTC
-  only while the kernel reports a synchronized clock and applies the compiled
-  one-hour forward-step bound. macOS `timed` does not publish a comparable
-  trust state. Because changing the macOS host clock requires administrator
+- Section 10.3 permits platform-managed host time. The edge manifest pins one
+  reviewed source ID per platform: `linux-system-clock` or
+  `macos-managed-timed`. Linux accepts nondecreasing wall time across boots
+  and applies the compiled one-hour forward-step bound against a suspend-aware
+  monotonic anchor during the same boot. It needs no particular time daemon.
+  Because changing the macOS host clock requires administrator
   authority, which can already alter Bloom state, the macOS profile uses the
   host wall clock directly and does not enter the durable discontinuity or
   repair paths. A missing, cross-platform, or peer-supplied source ID still
