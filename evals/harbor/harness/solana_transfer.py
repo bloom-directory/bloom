@@ -667,6 +667,7 @@ class SolanaTransferEval(EvalDefinition):
 
     def _approve_loop(self, ceremonies: CeremonyDriver) -> None:
         deadline = time.monotonic() + APPROVER_BUDGET_SECONDS
+        selected_pending_id: str | None = None
         while not self._approver_stop.is_set() and time.monotonic() < deadline:
             try:
                 pending = self._list_host_state("pending")
@@ -678,6 +679,14 @@ class SolanaTransferEval(EvalDefinition):
                         self._approver_error = (
                             f"staged entry {pending_id} does not match the authorized "
                             "transfer; refusing to approve it"
+                        )
+                        return
+                    if selected_pending_id is None:
+                        selected_pending_id = pending_id
+                    elif pending_id != selected_pending_id:
+                        self._approver_error = (
+                            f"staged entry {pending_id} is not the selected transfer "
+                            f"{selected_pending_id}; refusing to approve it"
                         )
                         return
                     ceremonies.complete(url)
@@ -1046,74 +1055,85 @@ class SolanaTransferEval(EvalDefinition):
         failures: list[str] = []
         if self._approver_error is not None:
             failures.append(f"approver: {self._approver_error}")
-
-        # 1. Drain pending. A residual staged entry still holds a broadcastable
-        #    blockhash, so it is never an acceptable end state.
-        for pending_id in self._list_state("pending"):
-            self.mount.write_route(
-                self.outbox_root / "pending" / pending_id / "cancel",
-                b"host-cleanup",
-                ROUTE_WRITE_TIMEOUT_SECONDS,
-            )
-            # A concurrent expiry sweep can move an entry to failed/ after the
-            # listing but before this write. In that case cancel correctly
-            # fails because the route moved, while the cleanup postcondition
-            # is already satisfied. Judge the state after settling below.
-        if not self.mount.poll_until(
-            lambda: not self._list_state("pending"),
-            PENDING_DRAIN_ATTEMPTS,
-            PENDING_DRAIN_DELAY_SECONDS,
-        ):
-            remaining = self._list_state("pending")
-            failures.append(
-                "outbox/pending did not drain"
-                + (f": {', '.join(remaining)}" if remaining else "")
-            )
-
-        # 2. Zero or one sent entry, and if one, it must have reconciled.
-        all_sent = set(self._list_state("sent"))
-        missing_history = self._baseline_sent - all_sent
-        if missing_history:
-            failures.append("historical sent entries disappeared during the trial")
-        sent = sorted(all_sent - self._baseline_sent)
-        if len(sent) > 1:
-            failures.append(
-                f"outbox/sent has {len(sent)} entries; the authorization permits one"
-            )
-        for sent_id in sent:
-            def reconciled(entry: str = sent_id) -> bool:
-                receipt = self.mount.read_json_if_listed(
-                    self.outbox_root / "sent" / entry / "receipt.json",
-                    self.outbox_root / "sent",
-                    entry,
+        mounted_error: BaseException | None = None
+        try:
+            # 1. Drain pending. A residual staged entry still holds a
+            #    broadcastable blockhash, so it is never an acceptable end state.
+            for pending_id in self._list_state("pending"):
+                self.mount.write_route(
+                    self.outbox_root / "pending" / pending_id / "cancel",
+                    b"host-cleanup",
+                    ROUTE_WRITE_TIMEOUT_SECONDS,
                 )
-                return isinstance(receipt, dict) and receipt.get("outcome") is not None
-
+                # A concurrent expiry sweep can move an entry to failed/ after
+                # the listing but before this write. In that case cancel
+                # correctly fails because the route moved, while the cleanup
+                # postcondition is already satisfied. Judge the state below.
             if not self.mount.poll_until(
-                reconciled, RECEIPT_SETTLE_ATTEMPTS, RECEIPT_SETTLE_DELAY_SECONDS
+                lambda: not self._list_state("pending"),
+                PENDING_DRAIN_ATTEMPTS,
+                PENDING_DRAIN_DELAY_SECONDS,
             ):
-                failures.append(f"sent entry {sent_id} never reconciled to a receipt")
-
-        # 3. Sweep the mainnet destination back to the source.
-        #
-        # This is what makes a mainnet eval recoverable. The transfer cannot be
-        # undone, but the destination is host-controlled, so the lamports come
-        # back and only the fees are actually spent. It runs unconditionally
-        # rather than only when a `sent/` entry exists: a broadcast that the
-        # outbox failed to record still moved funds, and that is exactly the
-        # case where skipping the sweep would be worst.
-        if self.lane == "mainnet-canary":
-            if self.source_address and self.destination:
-                try:
-                    signature = self.sweep_destination()
-                    if signature is not None:
-                        self.sweep_signature = signature
-                except EvalError as error:
-                    failures.append(f"host sweep: {error}")
-            else:
+                remaining = self._list_state("pending")
                 failures.append(
-                    "cannot sweep: the source or destination address is unknown"
+                    "outbox/pending did not drain"
+                    + (f": {', '.join(remaining)}" if remaining else "")
                 )
+
+            # 2. Zero or one sent entry, and if one, it must have reconciled.
+            all_sent = set(self._list_state("sent"))
+            missing_history = self._baseline_sent - all_sent
+            if missing_history:
+                failures.append("historical sent entries disappeared during the trial")
+            sent = sorted(all_sent - self._baseline_sent)
+            if len(sent) > 1:
+                failures.append(
+                    f"outbox/sent has {len(sent)} entries; the authorization permits one"
+                )
+            for sent_id in sent:
+
+                def reconciled(entry: str = sent_id) -> bool:
+                    receipt = self.mount.read_json_if_listed(
+                        self.outbox_root / "sent" / entry / "receipt.json",
+                        self.outbox_root / "sent",
+                        entry,
+                    )
+                    return (
+                        isinstance(receipt, dict)
+                        and receipt.get("outcome") is not None
+                    )
+
+                if not self.mount.poll_until(
+                    reconciled, RECEIPT_SETTLE_ATTEMPTS, RECEIPT_SETTLE_DELAY_SECONDS
+                ):
+                    failures.append(
+                        f"sent entry {sent_id} never reconciled to a receipt"
+                    )
+        except BaseException as error:  # noqa: BLE001 -- sweep must survive interrupts
+            mounted_error = error
+        finally:
+            # 3. Sweep the mainnet destination back to the source.
+            #
+            # This is the independent recovery boundary. It must run even if a
+            # mounted cancel, listing, or receipt read fails or is interrupted.
+            if self.lane == "mainnet-canary":
+                if self.source_address and self.destination:
+                    try:
+                        signature = self.sweep_destination()
+                        if signature is not None:
+                            self.sweep_signature = signature
+                    except EvalError as error:
+                        failures.append(f"host sweep: {error}")
+                else:
+                    failures.append(
+                        "cannot sweep: the source or destination address is unknown"
+                    )
+
+        if mounted_error is not None:
+            if isinstance(mounted_error, EvalError):
+                failures.append(f"mounted cleanup: {mounted_error}")
+            else:
+                raise mounted_error.with_traceback(mounted_error.__traceback__)
 
         if failures:
             raise EvalError(

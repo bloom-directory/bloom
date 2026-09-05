@@ -306,7 +306,7 @@ class ApproverMatchTests(SolanaEvalTestCase):
         )
         self.entry.mkdir(parents=True)
 
-    def stage(self, **overrides: object) -> None:
+    def stage(self, pending_id: str = "0001", **overrides: object) -> Path:
         # Field names and the hex fingerprint encoding are those of
         # `StagedSolanaTransfer`, confirmed against a live local validator run.
         intent: dict[str, object] = {
@@ -318,7 +318,10 @@ class ApproverMatchTests(SolanaEvalTestCase):
             "account_derivation_path": DERIVATION,
         }
         intent.update(overrides)
-        (self.entry / "intent.json").write_text(json.dumps(intent))
+        entry = self.entry.parent / pending_id
+        entry.mkdir(parents=True, exist_ok=True)
+        (entry / "intent.json").write_text(json.dumps(intent))
+        return entry
 
     def matches(self) -> bool:
         return self.definition._ceremony_matches_authorized_transfer("0001")
@@ -390,6 +393,26 @@ class CeremonyDiscoveryTests(ApproverMatchTests):
     def test_host_state_listing_finds_the_staged_entry(self) -> None:
         self.assertEqual(self.definition._list_host_state("pending"), ["0001"])
         self.assertEqual(self.definition._list_host_state("sent"), [])
+
+    def test_approver_refuses_a_ceremony_for_a_second_staged_transfer(self) -> None:
+        first = self.stage("0001")
+        second = self.stage("0002")
+        first_url = "http://localhost:18734/ceremony/" + "A" * 43
+        second_url = "http://localhost:18734/ceremony/" + "B" * 43
+        (first / "approval_challenge.json").write_text(
+            json.dumps({"ceremony_url": first_url})
+        )
+        (second / "approval_challenge.json").write_text(
+            json.dumps({"ceremony_url": second_url})
+        )
+        ceremonies = SimpleNamespace(
+            completed=set(), next_sign_count=3, complete=mock.Mock()
+        )
+
+        self.definition._approve_loop(ceremonies)
+
+        ceremonies.complete.assert_called_once_with(first_url)
+        self.assertIn("0002 is not the selected transfer 0001", self.definition._approver_error)
 
 
 class ProvisionTests(SolanaEvalTestCase):
@@ -606,6 +629,25 @@ class ReusedWalletCleanupTests(SolanaEvalTestCase):
                 with mock.patch.object(definition, "sweep_destination", return_value=None):
                     with self.assertRaisesRegex(EvalError, "historical sent entries"):
                         definition.cleanup()
+
+    def test_cleanup_sweeps_after_mounted_cancel_failure(self) -> None:
+        definition = self.make()
+        definition.destination = DESTINATION
+        definition.source_address = SOURCE
+        with mock.patch.object(definition, "_stop_approver"):
+            with mock.patch.object(definition, "_list_state", return_value=["stuck"]):
+                with mock.patch.object(
+                    definition.mount,
+                    "write_route",
+                    side_effect=EvalError("mounted cancel timed out"),
+                ):
+                    with mock.patch.object(
+                        definition, "sweep_destination", return_value=None
+                    ) as sweep:
+                        with self.assertRaisesRegex(EvalError, "mounted cleanup"):
+                            definition.cleanup()
+
+        sweep.assert_called_once_with()
 
 
 class ContainerBoundaryTests(SolanaEvalTestCase):
