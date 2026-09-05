@@ -21,6 +21,18 @@ This launcher runs the real Machine, Broker, and Signer protocols separately.
 It does not claim production UID isolation, but it preserves the authority
 boundaries and genuine passkey flow.
 
+Check out `bloom`, `bloom-broker`, and `bloom-signer` side by side. Create the
+canonical Machine config once; the launcher copies it into the isolated
+developer root:
+
+```sh
+cargo run -p bloom -- init
+```
+
+For a no-mount or fast Machine edit loop, use the services-only workflow in
+[`DEVELOPMENT.md`](./DEVELOPMENT.md). The mounted workflow below additionally
+requires the platform mount prerequisites described there.
+
 ```sh
 mkdir -p ~/.bloom/triad-dev/machine-home \
   /tmp/bloom-triad-mount /tmp/bloom-triad-logs

@@ -1,150 +1,179 @@
-# Examples
+# Bloom VFS examples
 
-These examples use paths under the Bloom VFS root.
-
-## Local Anvil round-trip
-
-```sh
-# 1. Inspect the mounted chain and wallet.
-cat /bloom/chains/anvil/head/number
-cat /bloom/wallets/alice/address
-cat /bloom/chains/anvil/chain_id
-
-# 4. Stage a send
-echo '{"to":"0x70997970C51812dc3A010C7d01b50e0d17dc79C8","value":"0.1 eth","chain":"anvil"}' \
-  > /bloom/wallets/alice/chains/anvil/outbox/new.tx
-
-# 5. Inspect plan
-ls /bloom/wallets/alice/chains/anvil/outbox/pending/
-cat /bloom/wallets/alice/chains/anvil/outbox/pending/0001-*/plan.md
-
-# 6. Confirm
-echo y > /bloom/wallets/alice/chains/anvil/outbox/pending/0001-*/confirm
-
-# 7. Inspect receipt
-ls /bloom/wallets/alice/chains/anvil/outbox/sent/
-```
-
-## Creating a wallet (asynchronous passkey registration)
+Run these examples from a normal scratch directory outside the Bloom VFS mount.
+Set the mountpoint once, quoted, and keep scratch files in that directory:
 
 ```sh
-# 1. Start registration. This does not block.
-printf 'main\n' > /bloom/wallets/new
-
-# 2. Inspect the projection keyed by the requested petname.
-cat /bloom/wallets/registrations/main/status.json
-
-# 3. Open/forward its ceremony_url to a human. Poll until ceremony_state is
-#    COMPLETED, then read the new wallet.
-cat /bloom/wallets/registrations/main/status.json
-cat /bloom/wallets/main/address
+BLOOM="<bloom-vfs-mount>"
+cat "$BLOOM/AGENTS.md"
 ```
 
-Verify the projection's `requested_name` before opening its `ceremony_url`,
-polling it, or cancelling it.
+Replace every angle-bracketed value, and always list the live surface before
+choosing it.
 
-Requires a running `bloom serve` daemon. Cancel a live registration with
-`printf 'cancel' > /bloom/wallets/registrations/main/cancel`.
-
-## Tools
+## Local Anvil transaction
 
 ```sh
-cat /bloom/tools/keccak/abc                     # hex digest
-cat /bloom/tools/address/checksum/0xabc...      # EIP-55 form
-cat /bloom/tools/unit/parse/1.5/eth             # → 1500000000000000000
-cat /bloom/tools/unit/format/1500000000000000000/18  # → 1.5
+# 1. Discover and inspect the exact inputs.
+ls "$BLOOM/chains/"
+ls "$BLOOM/wallets/"
+cat "$BLOOM/chains/anvil/chain_id"
+cat "$BLOOM/wallets/alice/projection.json"
+
+# 2. Stage once.
+printf 'send 0.01 ETH to 0x0000000000000000000000000000000000000001\n' \
+  > "$BLOOM/wallets/alice/chains/anvil/outbox/new.tx"
+
+# 3. List pending actions. Set ID to the exact entry created by this staging
+#    operation after matching its intent; do not choose by ordering.
+ls "$BLOOM/wallets/alice/chains/anvil/outbox/pending/"
+ID="<exact-id>"
+cat "$BLOOM/wallets/alice/chains/anvil/outbox/pending/$ID/intent.json"
+cat "$BLOOM/wallets/alice/chains/anvil/outbox/pending/$ID/plan.md"
+
+# 4. Confirm only that inspected action.
+echo y > "$BLOOM/wallets/alice/chains/anvil/outbox/pending/$ID/confirm"
+
+# 5. If approval_challenge.json appears, validate it, complete the human
+#    ceremony, and retry its exact retry_path. Otherwise inspect the terminal
+#    projection directly.
+ls "$BLOOM/wallets/alice/chains/anvil/outbox/sent/"
+ls "$BLOOM/wallets/alice/chains/anvil/outbox/failed/"
 ```
 
-## NFTs (ERC-721 / ERC-1155)
+Never use a glob such as `pending/<glob>/confirm` as action identity. A glob is
+not stable identity and fails when no entry or several entries match.
+
+## Creating a wallet
+
+Wallet creation is asynchronous passkey registration:
 
 ```sh
-# CryptoPunks #5822 — collection view (RPC-only, no etherscan needed):
-cat /bloom/chains/ethereum/contracts/0xb47e3cd837ddf8e4c57f05d70ab865de6e193bbb/nft/kind
-cat /bloom/chains/ethereum/contracts/0xb47e3cd837ddf8e4c57f05d70ab865de6e193bbb/nft/name
-cat /bloom/chains/ethereum/contracts/0xb47e3cd837ddf8e4c57f05d70ab865de6e193bbb/nft/owner_of/5822
+# 1. Request the petname. This does not block and does not create a local
+#    wallet.
+printf 'main\n' > "$BLOOM/wallets/new"
 
-# BoredApe #1 — per-holder view (history needs an etherscan API key):
-cat /bloom/chains/ethereum/addresses/0xd8da6bf26964af9d7eed9e03e53415d37aa96045/nfts/erc721_txs
-cat /bloom/chains/ethereum/addresses/0xd8da6bf26964af9d7eed9e03e53415d37aa96045/nfts/owned.json
+# 2. Read the projection keyed by the requested petname. Confirm that
+#    requested_name is "main" and forward ceremony_url to the human.
+cat "$BLOOM/wallets/registrations/main/status.json"
 
-# Per-token detail (auto-detects ERC-1155 and substitutes the {id}
-# placeholder in the metadata URI):
-cat /bloom/chains/ethereum/addresses/0x.../nfts/0x.../1/owner
-cat /bloom/chains/ethereum/addresses/0x.../nfts/0x.../1/uri
-cat /bloom/chains/ethereum/addresses/0x.../nfts/0x.../1/metadata.json
-cat /bloom/chains/ethereum/addresses/0x.../nfts/0x.../1/is_owner       # true/false
-cat /bloom/chains/ethereum/addresses/0x.../nfts/0x.../1/balance         # always 1 for ERC-721
+# 3. Poll the same projection until ceremony_state is COMPLETED.
+cat "$BLOOM/wallets/registrations/main/status.json"
+cat "$BLOOM/wallets/registrations/main/result.json"
+cat "$BLOOM/wallets/main/projection.json"
 ```
 
-`metadata.json` follows `data:`, `ipfs://`, and `http(s)://` URIs (1 MiB
-ceiling, 5s timeout). For ERC-1155 contracts the `{id}` placeholder in
-the returned URI is substituted with the lowercase 64-char hex form of
-the token id, per spec.
-
-## NFT writes (transfer / approve)
-
-NFT writes go through the same `outbox/new.tx` stage-confirm pipeline
-as native sends. Three intent kinds are wired in. Each one auto-detects
-ERC-721 vs ERC-1155 via ERC-165 (the optional `standard` field skips
-the probe — useful for non-standard contracts).
+Before acceptance, cancellation is explicit:
 
 ```sh
-# 1. Transfer ERC-721 #1234 to Bob (encodes safeTransferFrom by default;
-#    set "safe": false to use the legacy `transferFrom`):
-echo '{
-  "kind": "nft_transfer",
-  "contract": "0xb47e3cd837ddf8e4c57f05d70ab865de6e193bbb",
-  "to":       "0x70997970C51812dc3A010C7d01b50e0d17dc79C8",
-  "token_id": "1234"
-}' > /bloom/wallets/alice/chains/ethereum/outbox/new.tx
-
-# Same intent in shell form:
-echo 'nft transfer 0xb47e3...3bbb #1234 to 0x70997...79C8' \
-  > /bloom/wallets/alice/chains/ethereum/outbox/new.tx
-
-# 2. Per-token approve (ERC-721 only; ERC-1155 has no per-token approval
-#    and the engine rejects it with a clear error):
-echo 'nft approve 0xb47e3...3bbb #1234 operator 0x111...111' \
-  > /bloom/wallets/alice/chains/ethereum/outbox/new.tx
-
-# 3. setApprovalForAll — operator-wide. This always trips a policy WARN
-#    so the resulting plan.md flags the broad scope before you confirm.
-echo '{
-  "kind": "nft_approve_all",
-  "contract": "0xb47e3cd837ddf8e4c57f05d70ab865de6e193bbb",
-  "operator": "0x1111111111111111111111111111111111111111",
-  "approved": true
-}' > /bloom/wallets/alice/chains/ethereum/outbox/new.tx
-
-# 4. ERC-1155 transfer with explicit amount:
-echo '{
-  "kind": "nft_transfer",
-  "contract": "0x495f947276749Ce646f68AC8c248420045cb7b5e",
-  "to":       "0x70997970C51812dc3A010C7d01b50e0d17dc79C8",
-  "token_id": "0x...id...",
-  "standard": "erc1155",
-  "amount":   "3"
-}' > /bloom/wallets/alice/chains/ethereum/outbox/new.tx
+printf 'cancel\n' > "$BLOOM/wallets/registrations/main/cancel"
 ```
 
-Inspect the plan before confirming — it shows the decoded NFT action,
-the contract / counterparty, the token id, and any policy warnings:
+Do not put a mnemonic, private key, passkey response, or PRF output in the
+mount. Those inputs stay inside the Broker-hosted browser ceremony.
+
+## Solana account-aware reads and transfer
 
 ```sh
-cat /bloom/wallets/alice/chains/ethereum/outbox/pending/0001-*/plan.md
-echo y > /bloom/wallets/alice/chains/ethereum/outbox/pending/0001-*/confirm
+# 1. Inspect accounts and choose the full Ed25519 fingerprint from the public
+#    projection. Do not select by position.
+cat "$BLOOM/wallets/alice/accounts.json"
+FP="<full-fingerprint>"
+cat "$BLOOM/wallets/alice/chains/solana/accounts/$FP/address"
+cat "$BLOOM/wallets/alice/chains/solana/accounts/$FP/balance.json"
+cat "$BLOOM/status/chains/<solana-chain>/status.json"
+
+# 2. Solana new.tx accepts strict JSON. Pin the selected account explicitly.
+#    The scratch file is written in the working directory outside the mount.
+cat > solana-transfer.json <<'JSON'
+{
+  "destination": "<solana-address>",
+  "lamports": 10000000,
+  "account_fingerprint": "<full-fingerprint>"
+}
+JSON
+cp solana-transfer.json "$BLOOM/wallets/alice/chains/solana/outbox/new.tx"
+
+# 3. Inspect the exact resulting action.
+ls "$BLOOM/wallets/alice/chains/solana/outbox/pending/"
+ID="<exact-id>"
+cat "$BLOOM/wallets/alice/chains/solana/outbox/pending/$ID/intent.json"
+cat "$BLOOM/wallets/alice/chains/solana/outbox/pending/$ID/plan.md"
 ```
 
-## Polymarket (external Petal)
+Verify that the staged intent names the chosen fingerprint. After confirmation,
+verify the same fingerprint and transaction signature in the receipt. Do not
+blindly retry an ambiguous broadcast.
 
-Bloom does not ship a native Polymarket CLI or root-level VFS subtree.
-`bloom init` provisions the pinned default package; inspect the route contract
-served by that exact package version:
+## ERC-20 discovery
 
 ```sh
-bloom init
-bloom vfs cat /petals/polymarket/meta/route-contract.json
+A="<holder-address>"
+T="<token-contract>"
+ls "$BLOOM/chains/base/addresses/$A/tokens/"
+cat "$BLOOM/chains/base/addresses/$A/tokens/README.md"
+cat "$BLOOM/chains/base/addresses/$A/tokens/known.json"
+cat "$BLOOM/chains/base/addresses/$A/tokens/$T/balance"
+cat "$BLOOM/chains/base/addresses/$A/tokens/$T/balance.raw"
+cat "$BLOOM/chains/base/addresses/$A/tokens/$T/balance.json"
 ```
 
-The installed Petal owns its routes and venue-specific state. Bloom supplies the
-generic HTTP, chain-read, storage, outbox, signing, and approval host contracts.
+These are network-backed reads. They do not authorize a transfer, but they can
+contact the configured RPC provider.
+
+## NFT reads and writes
+
+```sh
+# Collection and token reads.
+cat "$BLOOM/chains/ethereum/contracts/<contract>/nft/kind"
+cat "$BLOOM/chains/ethereum/contracts/<contract>/nft/name"
+cat "$BLOOM/chains/ethereum/contracts/<contract>/nft/owner_of/<token-id>"
+
+# Stage an ERC-721 transfer, then use the exact transaction loop above.
+printf 'nft transfer <contract> <token-id> to <recipient>\n' \
+  > "$BLOOM/wallets/alice/chains/ethereum/outbox/new.tx"
+```
+
+Inspect `plan.md` before confirmation. Operator-wide approval is broader than
+a single-token approval and should be clearly visible in the policy projection.
+
+## Updating wallet policy
+
+```sh
+# The proposal is a scratch file in the working directory, outside the mount.
+cat "$BLOOM/wallets/alice/policy.json" > proposed-policy.json
+# Edit the complete proposal, then stage those exact bytes.
+cp proposed-policy.json "$BLOOM/wallets/alice/policy.json"
+cat "$BLOOM/wallets/alice/policy-updates/latest/status.json"
+cat "$BLOOM/wallets/alice/policy-updates/latest/approval_challenge.json"
+```
+
+After the human completes the Broker ceremony, retry the exact same
+`proposed-policy.json` bytes. Broker performs `policy.validate_update` before
+approval and `policy.commit_update` on the authorized retry.
+
+## Installed Petal workflow
+
+```sh
+# 1. Discover the actual package and read both instruction files.
+cat "$BLOOM/docs/petals.md"
+cat "$BLOOM/petals/<name>/README.md"
+cat "$BLOOM/petals/<name>/AGENTS.md"
+
+# 2. Follow that package's staging grammar. Correlate any resulting Petal
+#    action with its exact central outbox action before confirmation.
+ls "$BLOOM/petals/<name>/"
+ls "$BLOOM/outbox/"
+```
+
+Enso, Hyperliquid, Polymarket, and other applications are Petals when installed.
+Do not guess retired native paths or reuse examples from another package.
+
+## Pure tools
+
+```sh
+cat "$BLOOM/tools/keccak/abc"
+cat "$BLOOM/tools/address/checksum/0xabc..."
+cat "$BLOOM/tools/unit/parse/1.5/eth"
+cat "$BLOOM/tools/unit/format/1500000000000000000/18"
+```

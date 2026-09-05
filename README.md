@@ -8,7 +8,7 @@
   <a href="https://github.com/bloom-directory/bloom/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/bloom-directory/bloom/ci.yml?branch=master&style=flat-square&label=ci"></a>
   <a href="https://github.com/bloom-directory/bloom/releases"><img alt="Release" src="https://img.shields.io/github/v/release/bloom-directory/bloom?include_prereleases&style=flat-square"></a>
   <a href="./LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-141310?style=flat-square"></a>
-  <img alt="Rust 1.85+" src="https://img.shields.io/badge/rust-1.85%2B-a8324c?style=flat-square">
+  <img alt="Rust 1.86+" src="https://img.shields.io/badge/rust-1.86%2B-a8324c?style=flat-square">
 </p>
 
 <p align="center">
@@ -98,6 +98,11 @@ mkdir -p "$HOME/bloom"
 cargo run -p bloom -- serve --mount "$HOME/bloom"
 ```
 
+This is a Machine-only public-read loop. Wallet custody, approval, and signing
+require the separate Broker and Signer processes. Use the triad quickstart for
+authority-bearing workflows; never add a local signer to make this command
+standalone.
+
 In another terminal, or from your agent:
 
 ```sh
@@ -133,14 +138,18 @@ For the full wallet walkthrough, read
 
 ## Development commands
 
-For local development, use the package-manager-native checks:
+For a focused Machine change, use the package-manager-native checks:
 
 ```sh
-cargo fmt
+cargo fmt --all -- --check
 cargo test -p bloom
 cargo test --workspace --lib
 cargo build -p bloom
 ```
+
+Cross-process, BIP-39, and Solana work uses the staged triad workflow and test
+ladder in [`DEVELOPMENT.md`](./DEVELOPMENT.md); a single-process `cargo run` is
+not evidence for an authority-boundary change.
 
 ## Filesystem layout
 
