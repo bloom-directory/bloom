@@ -1186,7 +1186,7 @@ mod tests {
         // Stay inside the router's admission bound; otherwise the barrier
         // could never be reached by every writer at once.
         const WRITERS: usize = 8;
-        assert!(WRITERS <= MAX_CONCURRENT_AUDITED_EFFECTS);
+        const _: () = assert!(WRITERS <= MAX_CONCURRENT_AUDITED_EFFECTS);
 
         let dir = tempfile::tempdir().unwrap();
         let log = Arc::new(AuditLog::open(dir.path().join("audit.jsonl")).unwrap());
