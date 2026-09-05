@@ -10,7 +10,6 @@ pub mod address;
 pub mod assurance;
 pub mod audit;
 pub mod audit_ext;
-pub mod capability;
 pub mod ceremony;
 pub mod chain;
 pub mod config;
@@ -30,11 +29,10 @@ pub use address::{AddressBook, AddressBookError, checksum_address, parse_address
 pub use assurance::AssuranceLevel;
 pub use audit::{AuditIdentity, AuditLog, AuditRecord, AuditTrustedPredecessor};
 pub use audit_ext::{append_auth_event, auth_event};
-pub use capability::{CapabilityStatus, CapabilityViewEntry, SigningModel, Venue};
 pub use ceremony::{CeremonyIntent, CeremonyIntentKind};
 pub use chain::{ChainId, ChainRef, ChainSpec, EndpointSpec, default_endpoint_weight};
 pub use config::{
-    Backend, BackendsConfig, Config, ConfigError, EnsoConfig, EtherscanConfig, MempoolChainConfig,
+    Backend, BackendsConfig, Config, ConfigError, EtherscanConfig, MempoolChainConfig,
     PrivateRpcChainConfig,
 };
 pub use defi_policy::{DefiPolicy, DefiRouteCtx, ReceiverClass, evaluate_defi_route};

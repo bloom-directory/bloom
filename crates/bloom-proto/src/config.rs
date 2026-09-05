@@ -42,8 +42,6 @@ pub struct Config {
     pub chains: BTreeMap<String, ChainSpec>,
     #[serde(default)]
     pub etherscan: Option<EtherscanConfig>,
-    #[serde(default)]
-    pub enso: Option<EnsoConfig>,
     /// Trusted, daemon-owned runtime settings for installed Petals.
     /// Endpoint overrides are matched to named manifest bindings and may only
     /// replace the HTTPS authority; the signed method/path policy remains the
@@ -192,13 +190,6 @@ pub struct EtherscanConfig {
     pub api_url: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EnsoConfig {
-    pub api_key: String,
-    #[serde(default = "default_enso_url")]
-    pub api_url: String,
-}
-
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct MempoolChainConfig {
     /// Provider id — must match a `bloom_mempool::providers::*` adapter
@@ -231,9 +222,6 @@ fn default_stage_ttl() -> std::time::Duration {
 }
 fn default_etherscan_url() -> String {
     "https://api.etherscan.io/v2/api".to_string()
-}
-fn default_enso_url() -> String {
-    "https://api.enso.finance".to_string()
 }
 fn default_max_index_size() -> usize {
     50_000
@@ -412,7 +400,6 @@ impl Config {
             stage_ttl: default_stage_ttl(),
             chains,
             etherscan: None,
-            enso: None,
             petals: PetalsConfig::default(),
             mempool: BTreeMap::new(),
             private_rpc: BTreeMap::new(),
@@ -634,7 +621,6 @@ mod tests {
         assert_eq!(cfg.mount_path, "/bloom");
         assert_eq!(cfg.nfs_listen_addr, "127.0.0.1:12049");
         assert!(cfg.etherscan.is_none());
-        assert!(cfg.enso.is_none());
         assert_eq!(cfg.petals.preinstalled, default_preinstalled_petals());
         assert_eq!(cfg.chains.len(), 13);
         let ethereum = cfg.chains.get("ethereum").expect("ethereum entry");
@@ -1073,7 +1059,7 @@ rpc_urls = ["http://127.0.0.1:8545"]
     }
 
     #[test]
-    fn etherscan_and_enso_blocks_parse() {
+    fn etherscan_block_parses() {
         let toml_text = r#"
 default_chain = "anvil"
 
@@ -1084,17 +1070,11 @@ rpc_urls = ["http://127.0.0.1:8545"]
 
 [etherscan]
 api_key = "ESKEY"
-
-[enso]
-api_key = "ENKEY"
 "#;
         let cfg: Config = toml::from_str(toml_text).unwrap();
         let es = cfg.etherscan.expect("etherscan parsed");
         assert_eq!(es.api_key, "ESKEY");
         assert_eq!(es.api_url, "https://api.etherscan.io/v2/api");
-        let en = cfg.enso.expect("enso parsed");
-        assert_eq!(en.api_key, "ENKEY");
-        assert_eq!(en.api_url, "https://api.enso.finance");
     }
 
     #[test]
