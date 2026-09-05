@@ -749,6 +749,7 @@ begin_linux_upgrade() {
 rollback_linux_upgrade() {
   local rollback_status=0
   [[ -n "$upgrade_root" && -n "$upgrade_old_digest" ]] || return 0
+  stop_linux_release_set "$upgrade_root" || rollback_status=$?
   switch_linux_release "$upgrade_root" "$upgrade_old_digest" || rollback_status=$?
   rewrite_linux_release_set "$upgrade_root" "$upgrade_old_digest" active || rollback_status=$?
   start_linux_release_set "$upgrade_root" || rollback_status=$?
@@ -1137,7 +1138,7 @@ case "$action" in
         DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$login_uid/bus" \
         systemctl --user stop bloom-machine.service 2>/dev/null || true
     fi
-    if [[ "$release_upgrade" == false && "$root" == "/" ]] && \
+    if [[ "$fresh_install" == false && "$release_upgrade" == false && "$root" == "/" ]] && \
       [[ -x "$root/usr/libexec/bloom/current/bloom-broker" ]]
     then
       systemctl stop "bloom-session@$login_uid.path" 2>/dev/null || true
