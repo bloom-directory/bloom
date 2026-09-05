@@ -350,6 +350,18 @@ impl DaemonPetalHost {
         Ok(())
     }
 
+    fn authorize_guest_vfs_write_path(path: &str) -> Result<(), HostError> {
+        Self::authorize_guest_vfs_path(path)?;
+        let parsed = VfsPath::parse(path)
+            .map_err(|error| HostError::Invalid(format!("Petal VFS path: {error}")))?;
+        if parsed.first() == Some("wallets") {
+            return Err(HostError::Denied(
+                "Petals cannot mutate owner wallet projections".into(),
+            ));
+        }
+        Ok(())
+    }
+
     fn new(vfs: Arc<LateVfsHost>, audit: Arc<AuditLog>) -> Self {
         let http = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
@@ -958,7 +970,7 @@ impl PetalHost for DaemonPetalHost {
     }
 
     async fn vfs_write(&self, path: &str, bytes: &[u8]) -> Result<(), HostError> {
-        Self::authorize_guest_vfs_path(path)?;
+        Self::authorize_guest_vfs_write_path(path)?;
         self.vfs.vfs_write(path, bytes).await
     }
 
@@ -1008,15 +1020,30 @@ impl PetalHost for DaemonPetalHost {
         let wallet = broker.wallet(wallet_id.clone()).await.map_err(|error| {
             HostError::Denied(format!("{}: {}", error.code.as_str(), error.message))
         })?;
-        let eligible_parents = wallet
-            .key_refs
-            .iter()
-            .filter(|key| {
-                key.derivation.is_none()
-                    && suites.iter().all(|suite| suite.key_spec() == key.key_spec)
-            })
-            .cloned()
-            .collect::<Vec<_>>();
+        let eligible_parents = if let Some(root) = &wallet.root_key_ref {
+            if suites.iter().all(|suite| suite.key_spec() == root.key_spec) {
+                vec![root.clone()]
+            } else {
+                Vec::new()
+            }
+        } else {
+            broker
+                .wallet_accounts(wallet_id.clone())
+                .await
+                .map_err(|error| {
+                    HostError::Denied(format!("{}: {}", error.code.as_str(), error.message))
+                })?
+                .accounts
+                .into_iter()
+                .filter(|account| {
+                    account.lifecycle == bloom_broker_api::AccountLifecycleState::Active
+                        && suites
+                            .iter()
+                            .all(|suite| account.supported_crypto_suites.contains(suite))
+                })
+                .map(|account| account.key_ref)
+                .collect::<Vec<_>>()
+        };
         let [parent_key_ref] = eligible_parents.as_slice() else {
             return Err(HostError::Denied(
                 "wallet must expose exactly one parent KeyRef compatible with the requested suites"
@@ -5029,7 +5056,10 @@ mod tests {
         completed: std::sync::atomic::AtomicBool,
         approval_active: std::sync::atomic::AtomicBool,
         prepares: std::sync::atomic::AtomicUsize,
+        prepared_parent: std::sync::Mutex<Option<bloom_broker_api::KeyRef>>,
+        bip39: bool,
         parent: bloom_broker_api::KeyRef,
+        extra_parent: bloom_broker_api::KeyRef,
         child: bloom_broker_api::KeyRef,
     }
 
@@ -5210,9 +5240,31 @@ mod tests {
                 completed: std::sync::atomic::AtomicBool::new(false),
                 approval_active: std::sync::atomic::AtomicBool::new(false),
                 prepares: std::sync::atomic::AtomicUsize::new(0),
+                prepared_parent: std::sync::Mutex::new(None),
+                bip39: false,
                 parent: key_ref("wallet/primary/root", 1),
+                extra_parent: key_ref("wallet/primary/unrelated", 9),
                 child,
             }
+        }
+
+        fn new_bip39_solana() -> Self {
+            let mut fixture = Self::new();
+            fixture.bip39 = true;
+            fixture.parent.key_spec = bloom_broker_api::KeySpec::Ed25519;
+            fixture.parent.derivation = Some(bloom_broker_api::DerivationRef::Bip39Multicurve {
+                wallet_seed_ref: bloom_broker_api::Token::new("primary").unwrap(),
+                profile: bloom_broker_api::DerivationProfile::Bip44SolanaSlip10Ed25519V1,
+                path: "m/44'/501'/0'/0'".into(),
+            });
+            fixture.extra_parent.key_spec = bloom_broker_api::KeySpec::Ed25519;
+            fixture.extra_parent.derivation =
+                Some(bloom_broker_api::DerivationRef::Bip39Multicurve {
+                    wallet_seed_ref: bloom_broker_api::Token::new("primary").unwrap(),
+                    profile: bloom_broker_api::DerivationProfile::Bip44SolanaSlip10Ed25519V1,
+                    path: "m/44'/501'/1'/0'".into(),
+                });
+            fixture
         }
     }
 
@@ -5228,13 +5280,57 @@ mod tests {
                             bloom_broker_api::WalletPublic {
                                 wallet_id: request.wallet_id,
                                 wallet_kind: bloom_broker_api::Token::new("local").unwrap(),
-                                root_key_ref: Some(self.parent.clone()),
+                                root_key_ref: (!self.bip39).then(|| self.parent.clone()),
                                 // A previously derived Petal child is also in the public
                                 // projection. It must never make root selection ambiguous.
-                                key_refs: vec![self.parent.clone(), self.child.clone()],
+                                key_refs: vec![
+                                    self.parent.clone(),
+                                    self.extra_parent.clone(),
+                                    self.child.clone(),
+                                ],
                                 policy_version: bloom_broker_api::DecimalU64::new(1),
                                 policy_digest: bloom_broker_api::Digest32::from_bytes([3; 32]),
                                 wallet_revocation_epoch: bloom_broker_api::DecimalU64::new(0),
+                            },
+                        ))
+                    }
+                    MachineBrokerRequest::WalletAccounts(request) => {
+                        let account = |key_ref: bloom_broker_api::KeyRef, lifecycle| {
+                            bloom_broker_api::DerivedAccountPublic {
+                                public_key_fingerprint: key_ref.public_key_fingerprint.clone(),
+                                key_ref,
+                                wallet_seed_profile:
+                                    bloom_broker_api::WalletSeedProfile::Bip39MulticurveV1,
+                                derivation_profile:
+                                    bloom_broker_api::DerivationProfile::Bip44SolanaSlip10Ed25519V1,
+                                path: "m/44'/501'/0'/0'".into(),
+                                canonical_public_key: bloom_broker_api::Base64UrlBytes::from_bytes(
+                                    &[7; 32],
+                                ),
+                                public_key_encoding:
+                                    bloom_broker_api::PublicKeyEncoding::Ed25519SpkiDer,
+                                supported_crypto_suites: vec![
+                                    bloom_broker_api::CryptoSuite::Ed25519Message,
+                                ],
+                                chain_projections: vec![],
+                                lifecycle,
+                            }
+                        };
+                        Ok(MachineBrokerResponse::WalletAccounts(
+                            bloom_broker_api::WalletAccountsPublic {
+                                wallet_id: request.wallet_id,
+                                seed_profile:
+                                    bloom_broker_api::WalletSeedProfile::Bip39MulticurveV1,
+                                accounts: vec![
+                                    account(
+                                        self.parent.clone(),
+                                        bloom_broker_api::AccountLifecycleState::Active,
+                                    ),
+                                    account(
+                                        self.extra_parent.clone(),
+                                        bloom_broker_api::AccountLifecycleState::Retired,
+                                    ),
+                                ],
                             },
                         ))
                     }
@@ -5242,6 +5338,10 @@ mod tests {
                         self.prepares
                             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         request.validate_petal_key_scope_binding()?;
+                        *self.prepared_parent.lock().unwrap() = request
+                            .petal_key_scope
+                            .as_ref()
+                            .map(|scope| scope.parent_key_ref.clone());
                         Ok(MachineBrokerResponse::KeyDerivePrepare(
                             bloom_broker_api::CustodyPrepareResponse {
                                 ceremony_kind: bloom_broker_api::CeremonyKind::KeyDerive,
@@ -5618,6 +5718,11 @@ mod tests {
             1
         );
         assert_eq!(
+            fixture.prepared_parent.lock().unwrap().as_ref(),
+            Some(&fixture.parent),
+            "legacy wallets must use the explicit root despite other root-shaped keys"
+        );
+        assert_eq!(
             host.petal_key_request(request.clone()).await.unwrap(),
             pending
         );
@@ -5702,6 +5807,68 @@ mod tests {
         std::fs::write(&state_path, serde_json::to_vec(&tampered).unwrap()).unwrap();
         let tamper_error = host.petal_key_request(request).await.unwrap_err();
         assert!(tamper_error.to_string().contains("different terms"));
+    }
+
+    #[tokio::test]
+    async fn petal_key_host_selects_only_the_active_bip39_solana_account() {
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = Arc::new(PetalKeyBrokerFixture::new_bip39_solana());
+        let provenance_record = bloom_broker_api::ProvenanceRecord {
+            subject: bloom_broker_api::ProvenanceSubject::Petal {
+                package_hash: bloom_broker_api::Digest32::from_bytes([0xaa; 32]),
+                route: "r000007".into(),
+            },
+            publisher: bloom_broker_api::Token::new("fixture-publisher").unwrap(),
+            petal_lineage: Some(bloom_broker_api::PetalLineageMembership {
+                lineage_id: "pln1_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+                release_sequence: bloom_broker_api::DecimalU64::new(1),
+                predecessor_package_hashes: vec![],
+                controller_key_id: bloom_broker_api::Token::new("fixture-controller").unwrap(),
+                controller_signature: bloom_broker_api::Base64UrlBytes::from_bytes(&[0x44; 64]),
+                active: true,
+            }),
+            operation_classes: vec![bloom_broker_api::ProvenanceOperationClass {
+                operation_class: bloom_broker_api::Token::new("pumpfun.buy").unwrap(),
+                fee_asset: None,
+            }],
+            installer_key_id: bloom_broker_api::Token::new("fixture-installer").unwrap(),
+            installer_signature: bloom_broker_api::Base64UrlBytes::from_bytes(&[0x55; 64]),
+        };
+        let host = DaemonPetalHost::new(
+            Arc::new(LateVfsHost::new()),
+            Arc::new(AuditLog::open(dir.path().join("audit.jsonl")).unwrap()),
+        )
+        .with_broker(Some(MachineBrokerClient::new(fixture.clone())))
+        .with_provenance_catalog(Some(bloom_broker_api::ProvenanceCatalog {
+            schema: bloom_broker_api::PROVENANCE_CATALOG_SCHEMA.into(),
+            records: vec![provenance_record],
+        }))
+        .with_petal_key_state_root(dir.path().join("petal-key-requests"));
+        let request = bloom_petals::PetalKeyRequest {
+            wallet_id: "primary".into(),
+            key_slot: "pump-session".into(),
+            allowed_routes: vec!["r000007".into()],
+            allowed_operation_classes: vec!["pumpfun.buy".into()],
+            allowed_crypto_suites: vec!["ed25519-message".into()],
+            maximum_lifetime_ms: 60_000,
+            context: Some(PetalRouteContext {
+                petal_root: "pumpfun".into(),
+                package_hash: "aa".repeat(32),
+                route_id: "r000007".into(),
+                op: "write".into(),
+                path: "sessions/primary/new.json".into(),
+                params: Vec::new(),
+                actor: None,
+            }),
+        };
+
+        let pending = host.petal_key_request(request).await.unwrap();
+        assert_eq!(serde_json::to_value(pending).unwrap()["state"], "pending");
+        assert_eq!(
+            fixture.prepared_parent.lock().unwrap().as_ref(),
+            Some(&fixture.parent),
+            "the retired Solana account must not poison or replace the active parent"
+        );
     }
 
     #[tokio::test]
@@ -6135,6 +6302,21 @@ mod tests {
         assert_eq!(adjacent, b"0x0000000000000000000000000000000000000001\n");
         assert!(guest.vfs_lookup("wallets/alice/address").await.is_ok());
         assert!(guest.vfs_list("wallets/alice").await.is_ok());
+        for path in [
+            "wallets/alice/address",
+            "wallets/alice/chains/ethereum/outbox/new.tx",
+            "wallets/alice/chains/solana-mainnet-beta/outbox/pending/tx-1/confirm",
+        ] {
+            assert!(
+                matches!(guest.vfs_write(path, b"mutate").await, Err(HostError::Denied(ref message)) if message.contains("cannot mutate")),
+                "Petal guest write unexpectedly reached {path}"
+            );
+        }
+        assert!(
+            !wallet_projection
+                .wrote
+                .load(std::sync::atomic::Ordering::SeqCst)
+        );
     }
 
     #[test]
@@ -6591,7 +6773,7 @@ mod tests {
     async fn daemon_spawns_solana_reconciler_and_it_populates_receipt_json() {
         // A real 32-byte base58 genesis hash: config validation rejects a
         // broadcast-enabled pin that cannot decode to 32 bytes.
-        let genesis_hash = bloom_proto::SOLANA_MAINNET_BETA_GENESIS_HASH.to_string();
+        let genesis_hash = "11111111111111111111111111111111".to_string();
         let signature = "sig-0001".to_string();
         let rpc_endpoint = spawn_solana_node_stub(genesis_hash.clone()).await;
 

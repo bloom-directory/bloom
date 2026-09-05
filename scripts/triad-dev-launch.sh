@@ -552,6 +552,8 @@ else
   BLOOM_SIGNER_SOCKET="$signer_socket" \
   BLOOM_SIGNER_CONTROL_SOCKET="$signer_control_socket" \
   BLOOM_SIGNER_AUDIT_CHECKPOINT_DIR="$signer_checkpoint_dir" \
+  BLOOM_TRIAD_DEV_CEREMONY_PORT="$ceremony_port" \
+  BLOOM_AUTHORITY_EDGE_HISTORY="$authority_edge_history" \
   BLOOM_SESSION_SOCKET="$session_socket" \
     "$signer_bin" >"${log_dir}/signer.log" 2>&1 &
   signer_pid=$!
@@ -566,6 +568,8 @@ else
   BLOOM_BROKER_SOCKET="$broker_socket" \
   BLOOM_BROKER_CONTROL_SOCKET="$broker_control_socket" \
   BLOOM_BROKER_AUDIT_CHECKPOINT_DIR="$broker_checkpoint_dir" \
+  BLOOM_TRIAD_DEV_CEREMONY_PORT="$ceremony_port" \
+  BLOOM_AUTHORITY_EDGE_HISTORY="$authority_edge_history" \
   BLOOM_SESSION_SOCKET="$session_socket" \
     "$broker_bin" >"${log_dir}/broker.log" 2>&1 &
   broker_pid=$!
