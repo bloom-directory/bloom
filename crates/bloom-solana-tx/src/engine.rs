@@ -479,15 +479,6 @@ impl SolanaTransferEngine {
         Ok(outcome)
     }
 
-    /// Broadcast a signed transfer with at-most-once submission semantics.
-    ///
-    /// The exact raw transaction and deterministic signature are durably
-    /// recorded, and the entry is made non-cancellable, before the network
-    /// write begins. A timeout or lost response is therefore reconciled by
-    /// signature instead of being misreported as a safe-to-retry pending
-    /// transfer. `sent` means "a broadcast may have been attempted", not that
-    /// the endpoint acknowledged or the cluster finalized it.
-
     /// The fourth and last mainnet-beta gate: the per-value caps.
     ///
     /// The three preceding gates only decide whether mainnet-beta may be
@@ -552,6 +543,14 @@ impl SolanaTransferEngine {
         Ok(Some(loaded))
     }
 
+    /// Broadcast a signed transfer with at-most-once submission semantics.
+    ///
+    /// The exact raw transaction and deterministic signature are durably
+    /// recorded, and the entry is made non-cancellable, before the network
+    /// write begins. A timeout or lost response is therefore reconciled by
+    /// signature instead of being misreported as a safe-to-retry pending
+    /// transfer. `sent` means "a broadcast may have been attempted", not that
+    /// the endpoint acknowledged or the cluster finalized it.
     pub async fn broadcast(
         &self,
         wallet: &str,
