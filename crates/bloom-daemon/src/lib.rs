@@ -273,6 +273,10 @@ struct PetalKeyRequestState {
     public_key: Option<bloom_broker_api::KeyPublic>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     reusable_approval_id: Option<bloom_broker_api::Digest32>,
+    /// Increments only when an unapproved ceremony expires or becomes
+    /// orphaned, giving the replacement approval a fresh immutable identity.
+    #[serde(default)]
+    reusable_approval_attempt: u64,
 }
 
 impl PetalKeyRequestState {
@@ -515,6 +519,7 @@ impl DaemonPetalHost {
         scope: &bloom_broker_api::PetalKeyScope,
         key_ref: &bloom_broker_api::KeyRef,
         scope_expires_at_ms: u64,
+        approval_attempt: u64,
         provenance_digest: bloom_broker_api::Digest32,
     ) -> Result<bloom_broker_api::SealedApprovalPrepareResponse, HostError> {
         let catalog = self.provenance_catalog.as_ref().ok_or_else(|| {
@@ -577,9 +582,10 @@ impl DaemonPetalHost {
             .map_err(|error| HostError::Invalid(error.to_string()))?;
         let operation_digest = blake3::hash(
             [
-                b"bloom-petal-reusable-approval-operation/v1\0".as_slice(),
+                b"bloom-petal-reusable-approval-operation/v2\0".as_slice(),
                 scope_digest.as_str().as_bytes(),
                 key_ref.public_key_fingerprint.as_str().as_bytes(),
+                &approval_attempt.to_be_bytes(),
             ]
             .concat()
             .as_slice(),
@@ -1200,6 +1206,11 @@ impl PetalHost for DaemonPetalHost {
                         // owner can act on ever again, so stage a fresh one.
                         bloom_broker_api::ApprovalLifecycleState::Prepared
                         | bloom_broker_api::ApprovalLifecycleState::AwaitingCeremony => {}
+                        bloom_broker_api::ApprovalLifecycleState::Expired
+                        | bloom_broker_api::ApprovalLifecycleState::Orphaned => {
+                            stored.reusable_approval_attempt =
+                                stored.reusable_approval_attempt.saturating_add(1);
+                        }
                         state => {
                             return Err(HostError::Denied(format!(
                                 "Petal reusable approval is not active: {state:?}"
@@ -1214,6 +1225,7 @@ impl PetalHost for DaemonPetalHost {
                         &scope,
                         &derived_key_ref,
                         scope_expires_at_ms,
+                        stored.reusable_approval_attempt,
                         provenance_digest.clone().ok_or_else(|| {
                             HostError::Denied("Petal provenance digest is missing".into())
                         })?,
@@ -1292,6 +1304,7 @@ impl PetalHost for DaemonPetalHost {
                             &scope,
                             &public.key_ref,
                             scope_expires_at_ms,
+                            stored.reusable_approval_attempt,
                             provenance_digest.clone().ok_or_else(|| {
                                 HostError::Denied("Petal provenance digest is missing".into())
                             })?,
@@ -1379,6 +1392,7 @@ impl PetalHost for DaemonPetalHost {
             ceremony_expires_at_ms: prepared.ceremony_expires_at_ms,
             public_key: None,
             reusable_approval_id: None,
+            reusable_approval_attempt: 0,
         };
         Self::write_petal_key_state(&path, &stored)?;
         stored.guest_outcome()
@@ -5093,7 +5107,9 @@ mod tests {
     struct PetalKeyBrokerFixture {
         completed: std::sync::atomic::AtomicBool,
         approval_active: std::sync::atomic::AtomicBool,
+        approval_expired: std::sync::atomic::AtomicBool,
         prepares: std::sync::atomic::AtomicUsize,
+        approval_prepares: std::sync::atomic::AtomicUsize,
         prepared_parent: std::sync::Mutex<Option<bloom_broker_api::KeyRef>>,
         bip39: bool,
         parent: bloom_broker_api::KeyRef,
@@ -5280,7 +5296,9 @@ mod tests {
             Self {
                 completed: std::sync::atomic::AtomicBool::new(false),
                 approval_active: std::sync::atomic::AtomicBool::new(false),
+                approval_expired: std::sync::atomic::AtomicBool::new(false),
                 prepares: std::sync::atomic::AtomicUsize::new(0),
+                approval_prepares: std::sync::atomic::AtomicUsize::new(0),
                 prepared_parent: std::sync::Mutex::new(None),
                 bip39: false,
                 parent: key_ref("wallet/primary/root", 1),
@@ -5456,6 +5474,8 @@ mod tests {
                         ))
                     }
                     MachineBrokerRequest::SealedApprovalPrepare(request) => {
+                        self.approval_prepares
+                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         let bloom_broker_api::ApprovalSelector::Petal { route_grants, .. } =
                             &request.terms.selector
                         else {
@@ -5485,11 +5505,16 @@ mod tests {
                         let active = self
                             .approval_active
                             .load(std::sync::atomic::Ordering::SeqCst);
+                        let expired = self
+                            .approval_expired
+                            .load(std::sync::atomic::Ordering::SeqCst);
                         Ok(MachineBrokerResponse::SealedApprovalStatus(
                             bloom_broker_api::ApprovalPublicStatus {
                                 approval_id: request.id,
                                 wallet_id: bloom_broker_api::Token::new("primary").unwrap(),
-                                state: if active {
+                                state: if expired {
+                                    bloom_broker_api::ApprovalLifecycleState::Expired
+                                } else if active {
                                     bloom_broker_api::ApprovalLifecycleState::Active
                                 } else {
                                     bloom_broker_api::ApprovalLifecycleState::AwaitingCeremony
@@ -5851,6 +5876,32 @@ mod tests {
         );
         assert!(approval_owner_status["reusable_approval_id"].is_string());
 
+        let first_approval_id = approval_owner_status["reusable_approval_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        fixture
+            .approval_expired
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let restaged = host.petal_key_request(request.clone()).await.unwrap();
+        assert_eq!(serde_json::to_value(restaged).unwrap()["state"], "pending");
+        let restaged_owner_status: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
+        assert_eq!(restaged_owner_status["reusable_approval_attempt"], 1);
+        assert_ne!(
+            restaged_owner_status["reusable_approval_id"], first_approval_id,
+            "an expired owner ceremony needs a fresh immutable approval identity"
+        );
+        assert_eq!(
+            fixture
+                .approval_prepares
+                .load(std::sync::atomic::Ordering::SeqCst),
+            2
+        );
+
+        fixture
+            .approval_expired
+            .store(false, std::sync::atomic::Ordering::SeqCst);
         fixture
             .approval_active
             .store(true, std::sync::atomic::Ordering::SeqCst);
