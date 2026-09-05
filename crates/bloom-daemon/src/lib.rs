@@ -513,6 +513,7 @@ impl DaemonPetalHost {
         wallet: &bloom_broker_api::WalletPublic,
         scope: &bloom_broker_api::PetalKeyScope,
         key_ref: &bloom_broker_api::KeyRef,
+        scope_expires_at_ms: u64,
         provenance_digest: bloom_broker_api::Digest32,
     ) -> Result<bloom_broker_api::SealedApprovalPrepareResponse, HostError> {
         let catalog = self.provenance_catalog.as_ref().ok_or_else(|| {
@@ -565,15 +566,9 @@ impl DaemonPetalHost {
             .duration_since(UNIX_EPOCH)
             .map(|duration| duration.as_millis() as u64)
             .map_err(|error| HostError::Backend(format!("read system time: {error}")))?;
-        let lifetime_ms = scope.maximum_lifetime_ms.get();
-        let approval_lifetime_ms = if lifetime_ms > 120_000 {
-            lifetime_ms - 60_000
-        } else {
-            lifetime_ms / 2
-        };
-        if approval_lifetime_ms == 0 {
+        if scope_expires_at_ms <= now_ms {
             return Err(HostError::Denied(
-                "derived-key lifetime is too short for reusable approval".into(),
+                "derived Petal key expired before reusable approval preparation".into(),
             ));
         }
         let scope_digest = scope
@@ -633,9 +628,7 @@ impl DaemonPetalHost {
             request_nonce,
             issued_at_ms: bloom_broker_api::DecimalU64::new(now_ms),
             not_before_ms: bloom_broker_api::DecimalU64::new(now_ms),
-            expires_at_ms: bloom_broker_api::DecimalU64::new(
-                now_ms.saturating_add(approval_lifetime_ms),
-            ),
+            expires_at_ms: bloom_broker_api::DecimalU64::new(scope_expires_at_ms),
             renewal_of: None,
         };
         let plan = serde_json::json!({
@@ -1147,8 +1140,42 @@ impl PetalHost for DaemonPetalHost {
                     "Petal key request_id was already used with different terms".into(),
                 ));
             }
-            if let Some(derived_key_ref) = stored.public_key.as_ref().map(|key| key.key_ref.clone())
-            {
+            if let Some(previous_public) = stored.public_key.clone() {
+                // Refresh Broker-owned scope metadata on every reconciliation.
+                // Older durable records predate the absolute expiry projection,
+                // and calculating from retry time can exceed the Signer scope.
+                let public = broker
+                    .key(bloom_broker_api::KeyRequest {
+                        key_ref: previous_public.key_ref.clone(),
+                    })
+                    .await
+                    .map_err(|error| {
+                        HostError::Denied(format!("{}: {}", error.code.as_str(), error.message))
+                    })?;
+                let mut comparable = public.clone();
+                comparable.petal_scope_expires_at_ms =
+                    previous_public.petal_scope_expires_at_ms.clone();
+                if comparable != previous_public
+                    || !scope
+                        .allowed_crypto_suites
+                        .iter()
+                        .all(|suite| public.supported_crypto_suites.contains(suite))
+                {
+                    return Err(HostError::Denied(
+                        "persisted Petal public key conflicts with Broker metadata".into(),
+                    ));
+                }
+                let scope_expires_at_ms = public
+                    .petal_scope_expires_at_ms
+                    .as_ref()
+                    .ok_or_else(|| {
+                        HostError::Denied(
+                            "Broker omitted the derived Petal key scope expiry".into(),
+                        )
+                    })?
+                    .get();
+                let derived_key_ref = public.key_ref.clone();
+                stored.public_key = Some(public);
                 if let Some(approval_id) = stored.reusable_approval_id.clone() {
                     let approval = broker.approval_status(approval_id).await.map_err(|error| {
                         HostError::Denied(format!("{}: {}", error.code.as_str(), error.message))
@@ -1185,6 +1212,7 @@ impl PetalHost for DaemonPetalHost {
                         &wallet,
                         &scope,
                         &derived_key_ref,
+                        scope_expires_at_ms,
                         provenance_digest.clone().ok_or_else(|| {
                             HostError::Denied("Petal provenance digest is missing".into())
                         })?,
@@ -1237,6 +1265,15 @@ impl PetalHost for DaemonPetalHost {
                             "Broker returned public key metadata outside the Petal scope".into(),
                         ));
                     }
+                    let scope_expires_at_ms = public
+                        .petal_scope_expires_at_ms
+                        .as_ref()
+                        .ok_or_else(|| {
+                            HostError::Denied(
+                                "Broker omitted the derived Petal key scope expiry".into(),
+                            )
+                        })?
+                        .get();
                     if stored
                         .public_key
                         .as_ref()
@@ -1253,6 +1290,7 @@ impl PetalHost for DaemonPetalHost {
                             &wallet,
                             &scope,
                             &public.key_ref,
+                            scope_expires_at_ms,
                             provenance_digest.clone().ok_or_else(|| {
                                 HostError::Denied("Petal provenance digest is missing".into())
                             })?,
@@ -4972,6 +5010,8 @@ mod tests {
         parent: bloom_broker_api::KeyRef,
         extra_parent: bloom_broker_api::KeyRef,
         child: bloom_broker_api::KeyRef,
+        scope_expires_at_ms: u64,
+        prepared_approval_expires_at_ms: std::sync::atomic::AtomicU64,
     }
 
     struct PetalExactBrokerFixture {
@@ -5031,6 +5071,7 @@ mod tests {
                                 supported_crypto_suites: vec![
                                     bloom_broker_api::CryptoSuite::Secp256k1Sha256Recoverable,
                                 ],
+                                petal_scope_expires_at_ms: None,
                             },
                         ))
                     }
@@ -5156,6 +5197,14 @@ mod tests {
                 parent: key_ref("wallet/primary/root", 1),
                 extra_parent: key_ref("wallet/primary/unrelated", 9),
                 child,
+                // Model a delayed custody-result reconciliation with only a
+                // few seconds left in the key's original scope.
+                scope_expires_at_ms: SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as u64
+                    + 5_000,
+                prepared_approval_expires_at_ms: std::sync::atomic::AtomicU64::new(0),
             }
         }
 
@@ -5311,6 +5360,9 @@ mod tests {
                                     // narrower scope independently on every use.
                                     bloom_broker_api::CryptoSuite::Secp256k1Sha256Recoverable,
                                 ],
+                                petal_scope_expires_at_ms: Some(bloom_broker_api::DecimalU64::new(
+                                    self.scope_expires_at_ms,
+                                )),
                             },
                         ))
                     }
@@ -5322,6 +5374,10 @@ mod tests {
                         };
                         assert_eq!(route_grants.len(), 1);
                         assert_eq!(route_grants[0].route, "r000007");
+                        self.prepared_approval_expires_at_ms.store(
+                            request.terms.expires_at_ms.get(),
+                            std::sync::atomic::Ordering::SeqCst,
+                        );
                         let approval_id = request.terms.approval_id()?;
                         Ok(MachineBrokerResponse::SealedApprovalPrepare(
                             bloom_broker_api::SealedApprovalPrepareResponse {
@@ -5689,6 +5745,13 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&reusable_pending).unwrap()["state"],
             "pending"
+        );
+        assert_eq!(
+            fixture
+                .prepared_approval_expires_at_ms
+                .load(std::sync::atomic::Ordering::SeqCst),
+            fixture.scope_expires_at_ms,
+            "delayed retries must use Broker's absolute key expiry"
         );
         let approval_owner_status: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();

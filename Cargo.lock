@@ -2274,12 +2274,12 @@ dependencies = [
 [[package]]
 name = "bloom-broker-api"
 version = "0.1.0"
-source = "git+https://github.com/bloom-directory/bloom-broker.git?rev=f1f08ed4e2dd227bf24576ddab88c66534626e23#f1f08ed4e2dd227bf24576ddab88c66534626e23"
+source = "git+https://github.com/bloom-directory/bloom-broker.git?rev=82735bffff0ddb1ace3de9839c2b9a18220ec7a2#82735bffff0ddb1ace3de9839c2b9a18220ec7a2"
 dependencies = [
  "bloom-rpc-wire",
  "serde",
  "serde_jcs",
- "sha2 0.11.0",
+ "sha2 0.10.9",
 ]
 
 [[package]]
@@ -2706,15 +2706,15 @@ dependencies = [
 [[package]]
 name = "bloom-signer-derive"
 version = "0.1.0"
-source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=6b6fa483fe6ba6bd1b3dc020aaf6073d8e4aab8c#6b6fa483fe6ba6bd1b3dc020aaf6073d8e4aab8c"
+source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=7404b62ecac2a9ebd760c8f7b37deb76e1e7eeb8#7404b62ecac2a9ebd760c8f7b37deb76e1e7eeb8"
 dependencies = [
  "bip39",
  "ed25519-dalek",
  "hex",
- "hmac 0.13.0",
+ "hmac 0.12.1",
  "k256",
- "rand 0.10.2",
- "sha2 0.11.0",
+ "rand 0.8.6",
+ "sha2 0.10.9",
  "thiserror 2.0.18",
  "unicode-normalization",
  "zeroize",
