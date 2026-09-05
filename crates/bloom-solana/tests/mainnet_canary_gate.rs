@@ -25,6 +25,8 @@ use bloom_solana::{MAINNET_BETA_GENESIS_HASH, SolanaClient, SolanaSpec};
 const CHILD_ENDPOINT: &str = "BLOOM_CANARY_TEST_ENDPOINT";
 #[cfg(feature = "mainnet-canary")]
 const CHILD_SEND: &str = "BLOOM_CANARY_TEST_SEND";
+#[cfg(feature = "mainnet-canary")]
+const CHILD_ORDINARY_SEND: &str = "BLOOM_CANARY_TEST_ORDINARY_SEND";
 const CHILD_TEST: &str = "the_mainnet_gate_consults_the_canary_authorization";
 const CHAIN: &str = "solana-mainnet-canary";
 const EXIT_PERMITTED: i32 = 30;
@@ -101,6 +103,10 @@ async fn run_child() -> ! {
     let endpoint = std::env::var(CHILD_ENDPOINT).expect("endpoint");
     let client = SolanaClient::build(&mainnet_spec(&endpoint)).expect("build client");
     let verdict = match client.verify_genesis().await {
+        #[cfg(feature = "mainnet-canary")]
+        Ok(_) if std::env::var_os(CHILD_ORDINARY_SEND).is_some() => {
+            client.send_transaction("signed-transaction").await
+        }
         #[cfg(feature = "mainnet-canary")]
         Ok(_) if std::env::var_os(CHILD_SEND).is_some() => {
             let loaded = bloom_proto::canary::authorization_for(CHAIN, 0)
@@ -185,6 +191,8 @@ async fn the_mainnet_gate_consults_the_canary_authorization() {
             permitted past the genesis gate.\nstderr: {stderr}"
         );
 
+        let ordinary_auth_path = dir.path().join("ordinary-canary.json");
+        write_authorization(&ordinary_auth_path);
         let output = Command::new(std::env::current_exe().unwrap())
             .arg(CHILD_TEST)
             .arg("--exact")
@@ -205,6 +213,27 @@ async fn the_mainnet_gate_consults_the_canary_authorization() {
             "the canary send path must pass only after the guarded single-use claim.\nstderr: {stderr}"
         );
         assert!(auth_path.with_file_name("canary.json.spent").exists());
+
+        let output = Command::new(std::env::current_exe().unwrap())
+            .arg(CHILD_TEST)
+            .arg("--exact")
+            .arg("--nocapture")
+            .env(CHILD_ENDPOINT, &endpoint)
+            .env(CHILD_ORDINARY_SEND, "1")
+            .env(AUTHORIZATION_ENV, &ordinary_auth_path)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn ordinary-send child")
+            .wait_with_output()
+            .expect("ordinary-send child output");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            output.status.code(),
+            Some(EXIT_REFUSED),
+            "an active canary authorization must not open the ordinary send path.\nstderr: {stderr}"
+        );
+        assert!(stderr.contains("mainnet-beta is disabled"), "{stderr}");
     }
 }
 

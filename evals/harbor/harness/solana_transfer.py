@@ -673,7 +673,18 @@ class SolanaTransferEval(EvalDefinition):
                 pending = self._list_host_state("pending")
                 for pending_id in pending:
                     url = self._pending_confirm_ceremony(pending_id)
-                    if url is None or url in ceremonies.completed:
+                    if url is None:
+                        continue
+                    if (
+                        selected_pending_id is not None
+                        and pending_id != selected_pending_id
+                    ):
+                        self._approver_error = (
+                            f"staged entry {pending_id} is not the selected transfer "
+                            f"{selected_pending_id}; refusing to approve it"
+                        )
+                        return
+                    if url in ceremonies.completed:
                         continue
                     if not self._ceremony_matches_authorized_transfer(pending_id):
                         self._approver_error = (
@@ -683,12 +694,6 @@ class SolanaTransferEval(EvalDefinition):
                         return
                     if selected_pending_id is None:
                         selected_pending_id = pending_id
-                    elif pending_id != selected_pending_id:
-                        self._approver_error = (
-                            f"staged entry {pending_id} is not the selected transfer "
-                            f"{selected_pending_id}; refusing to approve it"
-                        )
-                        return
                     ceremonies.complete(url)
                     self._approver_completed += 1
                     self.next_sign_count = ceremonies.next_sign_count
