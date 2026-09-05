@@ -657,7 +657,6 @@ impl SolanaTransferEngine {
                             &tx_b64,
                             loaded,
                             &format!("{} {} {}", entry.staged.wallet, id, signature_b58),
-                            now_ms,
                         )
                         .await?
                 }

@@ -364,7 +364,6 @@ impl SolanaClient {
         tx_b64: &str,
         loaded: &bloom_proto::canary::LoadedAuthorization,
         spend_note: &str,
-        now_ms: u128,
     ) -> Result<String, SolanaRpcError> {
         if !self.inner.allow_broadcast {
             return Err(SolanaRpcError::Invalid(format!(
@@ -387,22 +386,34 @@ impl SolanaClient {
                 "mainnet canary send requires the pinned mainnet-beta genesis".into(),
             ));
         }
-        let active =
-            bloom_proto::canary::authorization_for(self.chain_name(), now_ms).ok_or_else(|| {
-                SolanaRpcError::Invalid("mainnet canary authorization is not active".into())
-            })?;
-        if active.path != loaded.path || active.authorization != loaded.authorization {
-            return Err(SolanaRpcError::Invalid(
-                "mainnet canary authorization changed after transfer validation".into(),
-            ));
-        }
         self.inner
             .rpc
             .call_raw_after_genesis_check(
                 expected,
                 "sendTransaction",
-                &json!([tx_b64, { "encoding": "base64" }]),
+                &json!([
+                    tx_b64,
+                    {
+                        "encoding": "base64",
+                        "preflightCommitment": "processed"
+                    }
+                ]),
                 || {
+                    // Re-read after the live endpoint checks, immediately
+                    // before the sole network write. An authorization that
+                    // expired or changed while those checks ran is dead.
+                    let active =
+                        bloom_proto::canary::authorization_for(self.chain_name(), now_ms())
+                            .ok_or_else(|| {
+                                SolanaRpcError::Invalid(
+                                    "mainnet canary authorization is not active".into(),
+                                )
+                            })?;
+                    if active.path != loaded.path || active.authorization != loaded.authorization {
+                        return Err(SolanaRpcError::Invalid(
+                            "mainnet canary authorization changed after transfer validation".into(),
+                        ));
+                    }
                     loaded
                         .claim_single_use(spend_note)
                         .map_err(|error| SolanaRpcError::Invalid(error.to_string()))?;

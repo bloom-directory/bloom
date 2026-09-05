@@ -112,7 +112,7 @@ async fn run_child() -> ! {
             let loaded = bloom_proto::canary::authorization_for(CHAIN, 0)
                 .expect("validated child authorization");
             client
-                .send_mainnet_canary_transaction("signed-transaction", &loaded, "test claim", 0)
+                .send_mainnet_canary_transaction("signed-transaction", &loaded, "test claim")
                 .await
                 .map(|_| MAINNET_BETA_GENESIS_HASH.to_string())
         }
