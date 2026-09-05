@@ -4774,6 +4774,8 @@ mod tests {
 
         config.nfs_listen_addr = "not-a-socket".to_owned();
         assert!(configured_mount(&config, std::path::Path::new("/tmp/bloom-mount")).is_err());
+    }
+
     fn petal_evm_request(value_wei: &str, data_hex: String) -> EvmTransactionRequest {
         EvmTransactionRequest {
             wallet: "alice".into(),

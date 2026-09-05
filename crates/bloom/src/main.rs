@@ -1651,7 +1651,7 @@ async fn execute_machine_command(
                         bloom_machine_client::CustodyPrepareMethod::WalletExport,
                         bloom_broker_api::CeremonyKind::WalletExport,
                         Some(bloom_broker_api::Token::new(name.clone())?),
-                        "none",
+                        CustodyInputShape::Named("none"),
                     ),
                     MachineCustodyKind::Delete => (
                         bloom_machine_client::CustodyPrepareMethod::WalletDelete,
