@@ -5,6 +5,11 @@ edition.workspace = true
 license.workspace = true
 description = "Read-only Solana chain client: layered JSON-RPC transport, account/balance/status lookups, transaction simulation"
 
+[features]
+# The isolated Solana mainnet-beta canary. Never enabled by packaged builds;
+# release packaging rejects an artifact built with it.
+mainnet-canary = ["bloom-proto/mainnet-canary"]
+
 [dependencies]
 bloom-rpc-common.workspace = true
 bloom-proto.workspace = true
@@ -18,3 +23,4 @@ tracing.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tempfile.workspace = true

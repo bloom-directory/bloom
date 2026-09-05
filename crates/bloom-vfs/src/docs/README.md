@@ -30,7 +30,8 @@ All paths below are relative to the Bloom VFS root.
   `sha256`, `blake3`, `hex`, `base64`, `unit/{parse,format}`, `abi`,
   `rlp`, `eip712`.
 - `status/` — daemon health, RPC pool, audit head, cache stats, version.
-- `docs/` — this file and examples.
+- `docs/` — this overview, examples, native Solana transfer guidance, and the
+  installed-Petal index. Read `docs/solana.md` before sending native SOL.
 - `ens/` — forward / reverse / text / contenthash resolution.
 - `prices/` — DefiLlama price oracle (current / historical).
 - `addressbook/` — local petname directory.
@@ -347,4 +348,5 @@ echo '0x000000000000000000000000000000000000beef' \
 cat /bloom/addressbook/alice
 ```
 
-See `examples.md` for end-to-end demos.
+See `examples.md` for end-to-end demos and `solana.md` for the native SOL
+transfer runbook.

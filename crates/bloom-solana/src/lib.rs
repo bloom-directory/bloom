@@ -17,7 +17,12 @@ pub mod transport;
 
 use std::sync::Arc;
 
+pub use bloom_proto::SOLANA_MAINNET_BETA_GENESIS_HASH as MAINNET_BETA_GENESIS_HASH;
 pub use error::SolanaRpcError;
+
+/// The mainnet-beta canary authorization, re-exported so the transfer engine
+/// can enforce its caps without depending on `bloom-proto` directly.
+pub use bloom_proto::canary;
 pub use transport::SolanaRpcClient;
 
 use serde::{Deserialize, Serialize};
@@ -159,10 +164,29 @@ impl SolanaClient {
     /// live check on every call; callers use it at stage and broadcast so an
     /// endpoint or DNS change cannot silently cross clusters.
     pub async fn verify_genesis(&self) -> Result<String, SolanaRpcError> {
-        match &self.inner.expected_genesis_base58 {
+        let observed = match &self.inner.expected_genesis_base58 {
             Some(expected) => self.inner.rpc.verify_all_genesis(expected).await,
             None => self.get_genesis_hash().await,
+        }?;
+        if self.inner.allow_broadcast && observed == crate::MAINNET_BETA_GENESIS_HASH {
+            // The third independent refusal, checked against the *live*
+            // genesis immediately before the client is used to send. It stands
+            // unless this binary was built with the non-default canary
+            // capability and holds an authorization that is bound to this
+            // artifact, names this chain, has not expired, and has not been
+            // spent. In a production build the call below is a function that
+            // returns `None`, so this refusal is unconditional.
+            if bloom_proto::canary::authorization_for(self.chain_name(), now_ms()).is_none() {
+                return Err(SolanaRpcError::Invalid(
+                    "broadcast to Solana mainnet-beta is disabled".into(),
+                ));
+            }
+            tracing::warn!(
+                chain = %self.chain_name(),
+                "solana.mainnet_canary_broadcast_permitted"
+            );
         }
+        Ok(observed)
     }
 
     /// Node health (`getHealth`). Ok when the node reports `"ok"`.
@@ -279,7 +303,9 @@ impl SolanaClient {
     /// Every configured endpoint must first prove the pinned genesis. The
     /// transaction is then sent exactly once through the highest-priority
     /// endpoint; an ambiguous response is reconciled by signature and is never
-    /// retried by the transport.
+    /// retried by the transport. Mainnet-beta remains unconditionally blocked
+    /// here; only [`Self::send_mainnet_canary_transaction`] can consume the
+    /// canary authorization in a canary build.
     pub async fn send_transaction(&self, tx_b64: &str) -> Result<String, SolanaRpcError> {
         if !self.inner.allow_broadcast {
             return Err(SolanaRpcError::Invalid(format!(
@@ -297,6 +323,11 @@ impl SolanaClient {
                     self.chain_name()
                 ))
             })?;
+        if expected == crate::MAINNET_BETA_GENESIS_HASH {
+            return Err(SolanaRpcError::Invalid(
+                "broadcast to Solana mainnet-beta is disabled".into(),
+            ));
+        }
         self.inner
             .rpc
             .call_raw_after_genesis_check(
@@ -313,6 +344,85 @@ impl SolanaClient {
                     }
                 ]),
                 || Ok(()),
+            )
+            .await
+            .and_then(|value| {
+                serde_json::from_value(value)
+                    .map_err(|error| SolanaRpcError::Decode(format!("sendTransaction: {error}")))
+            })
+    }
+
+    /// Submit the one explicitly authorized mainnet-beta canary transaction.
+    ///
+    /// This entry point does not exist in a production build. It revalidates
+    /// the active artifact-bound authorization, proves the genesis of every
+    /// configured endpoint, durably spends the authorization, and only then
+    /// makes one non-retrying `sendTransaction` attempt.
+    #[cfg(feature = "mainnet-canary")]
+    pub async fn send_mainnet_canary_transaction(
+        &self,
+        tx_b64: &str,
+        loaded: &bloom_proto::canary::LoadedAuthorization,
+        spend_note: &str,
+    ) -> Result<String, SolanaRpcError> {
+        if !self.inner.allow_broadcast {
+            return Err(SolanaRpcError::Invalid(format!(
+                "broadcast is disabled for chain '{}'",
+                self.chain_name()
+            )));
+        }
+        let expected = self
+            .inner
+            .expected_genesis_base58
+            .as_deref()
+            .ok_or_else(|| {
+                SolanaRpcError::Invalid(format!(
+                    "chain '{}' cannot broadcast without an expected genesis hash",
+                    self.chain_name()
+                ))
+            })?;
+        if expected != crate::MAINNET_BETA_GENESIS_HASH {
+            return Err(SolanaRpcError::Invalid(
+                "mainnet canary send requires the pinned mainnet-beta genesis".into(),
+            ));
+        }
+        self.inner
+            .rpc
+            .call_raw_after_genesis_check(
+                expected,
+                "sendTransaction",
+                &json!([
+                    tx_b64,
+                    {
+                        "encoding": "base64",
+                        "preflightCommitment": "processed"
+                    }
+                ]),
+                || {
+                    // Re-read after the live endpoint checks, immediately
+                    // before the sole network write. An authorization that
+                    // expired or changed while those checks ran is dead.
+                    let active =
+                        bloom_proto::canary::authorization_for(self.chain_name(), now_ms())
+                            .ok_or_else(|| {
+                                SolanaRpcError::Invalid(
+                                    "mainnet canary authorization is not active".into(),
+                                )
+                            })?;
+                    if active.path != loaded.path || active.authorization != loaded.authorization {
+                        return Err(SolanaRpcError::Invalid(
+                            "mainnet canary authorization changed after transfer validation".into(),
+                        ));
+                    }
+                    loaded
+                        .claim_single_use(spend_note)
+                        .map_err(|error| SolanaRpcError::Invalid(error.to_string()))?;
+                    tracing::warn!(
+                        chain = %self.chain_name(),
+                        "solana.mainnet_canary_single_use_claimed"
+                    );
+                    Ok(())
+                },
             )
             .await
             .and_then(|value| {
@@ -435,4 +545,12 @@ pub struct SignatureStatusProbe {
     pub endpoint_label: String,
     /// `Ok(None)` is that endpoint reporting the signature unseen.
     pub status: Result<Option<SignatureStatus>, SolanaRpcError>,
+}
+
+/// Wall-clock milliseconds, for canary expiry checks.
+fn now_ms() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(u128::MAX)
 }

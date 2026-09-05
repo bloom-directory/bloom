@@ -23,6 +23,17 @@ standard SSHSIG envelope with distinct `bloom-release-archive-v1`,
 Verification invokes the OS-owned `/usr/bin/ssh-keygen`; the privileged macOS
 path never executes a Homebrew- or login-user-owned crypto implementation.
 
+Every signed payload carries an `ARTIFACT_CLASS`. The default and ordinary
+release class is `production`; it continues to reject every mainnet-canary
+marker. The only other accepted class is `solana-mainnet-canary-v1`, selected
+with `BLOOM_ARTIFACT_CLASS`, and it requires all canary markers in the Machine
+binary while rejecting them anywhere else. Required presence checks use the
+runtime authorization/capability markers; optimized linking may remove the
+compile-only label string. It is a Linux-only, non-production artifact.
+Verification and installation each require the
+separate `BLOOM_ALLOW_SOLANA_MAINNET_CANARY_BUNDLE=true` opt in, and the Linux
+installer records the class beside the installed instance configuration.
+
 `verify-bundle.sh` verifies the detached signature and both the outer and
 internal checksums before accepting the compatibility matrix or installers.
 Production verification currently accepts Linux ELF bundles. The
@@ -69,6 +80,12 @@ For one candidate payload `C`, the disposable evidence matrix is:
 
 The signer refuses a mixture of evidence from different candidates.
 
+`check-production-machine-binary.sh` is run by the standalone GitHub release
+workflow and normal CI. It fails if an optimized Machine artifact contains a
+developer-harness, unsafe debug-approval, or mainnet-canary marker. The release
+workflow also builds from an explicit production feature set instead of
+`--all-features`.
+
 `triad-release-gate.sh` rejects modified or untracked release inputs, runs
 locked fmt, clippy, and tests in all three sibling workspaces, builds release
 binaries, assembles the bundle twice, verifies both, requires byte-identical
@@ -77,6 +94,15 @@ workspaces, executes each extracted production binary, then reruns all three
 workspace suites with the verified bundle bound as acceptance input.
 `--test-signing-key` is CI-only; production invocation must set
 `TRIAD_RELEASE_SIGNING_KEY`.
+
+`solana-mainnet-canary-release-gate.sh` is the corresponding bounded canary
+gate. It first builds and scans the ordinary incapable production Machine,
+then deliberately builds the labeled canary Machine, proves the production
+bundle path refuses it, assembles the signed canary bundle twice, verifies
+byte identity and fail-closed opt-in behavior, runs the canary protocol and
+transfer suites, and installs the exact extracted bytes. Its
+`--test-signing-key` mode is CI-only; a candidate for fund testing requires
+the reviewed release key and emits the archive and Machine SHA-256 values.
 
 Before compiling, `check-machine-authority-boundary.sh --require-clean`
 resolves every entry in `machine-production-feature-sets.tsv` with locked

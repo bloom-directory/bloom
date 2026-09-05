@@ -295,13 +295,43 @@ fn sweep_requires_live_cluster_height_not_just_the_wall_estimate() {
 }
 
 #[test]
-fn sweep_does_not_reap_signed_pending_entry() {
+fn sweep_reaps_a_signed_entry_without_a_broadcast_attempt() {
     let (_dir, outbox) = outbox();
     let mut signed = staged("0001-signed");
     signed.expires_ms = 500;
     signed.signature =
         Some("SIG1111111111111111111111111111111111111111111111111111111111111".into());
     outbox.write_pending(&signed, "plan").unwrap();
+
+    assert_eq!(
+        outbox
+            .sweep_expired(1000, &heights_past_window("solana-devnet", 999_999))
+            .unwrap(),
+        1
+    );
+    let expired = outbox
+        .read_in_state(
+            "alice",
+            "solana-devnet",
+            "0001-signed",
+            SolanaOutboxState::Failed,
+        )
+        .unwrap();
+    assert_eq!(expired.staged.status, SolanaTxStatus::Expired);
+}
+
+#[test]
+fn sweep_preserves_a_pending_entry_with_a_broadcast_attempt() {
+    let (_dir, outbox) = outbox();
+    let mut attempted = staged("0001-attempted");
+    attempted.expires_ms = 500;
+    outbox.write_pending(&attempted, "plan").unwrap();
+    let entry = outbox
+        .read("alice", "solana-devnet", "0001-attempted")
+        .unwrap();
+    outbox
+        .write_broadcast_attempt(&entry, "SIG", b"signed-tx-bytes", 600)
+        .unwrap();
 
     assert_eq!(
         outbox
@@ -314,7 +344,7 @@ fn sweep_does_not_reap_signed_pending_entry() {
             .read_in_state(
                 "alice",
                 "solana-devnet",
-                "0001-signed",
+                "0001-attempted",
                 SolanaOutboxState::Pending,
             )
             .is_ok()

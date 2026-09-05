@@ -13,6 +13,13 @@ source_date_epoch="$4"
 tar_command="${TAR:-tar}"
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 
+if "$tar_command" --version 2>/dev/null | grep -F 'GNU tar' >/dev/null; then
+  tar_owner_args=(--owner=0 --group=0 --numeric-owner)
+else
+  # libarchive/bsdtar uses separate numeric and textual owner flags.
+  tar_owner_args=(--uid=0 --gid=0 --uname=root --gname=root)
+fi
+
 python3 "$script_dir/check-legacy-hash-only-routes.py"
 
 machine_artifact_paths() {
@@ -138,6 +145,7 @@ accepting_verifier
 mint_approval
 BLOOM_TRIAD_DEVELOPER_ROOT
 unsafe-debug-signer
+unsafe-debug-approver
 unsigned-audit-test-seam
 audit-test-seam
 local-integration
@@ -146,6 +154,64 @@ triad-authority-fixture
 test-only-release-key
 test_credential
 EOF
+}
+
+reject_canary_markers() {
+  local root="$1"
+  local scope="$2"
+  reject_markers_in_paths "$scope" "$root" <<'EOF'
+BLOOM_MAINNET_CANARY_ARTIFACT
+BLOOM_SOLANA_MAINNET_CANARY_AUTHORIZATION
+NON-PRODUCTION-MAINNET-CANARY
+mainnet-canary
+EOF
+}
+
+require_canary_machine_markers() {
+  local root="$1"
+  local marker status
+  for marker in \
+    BLOOM_SOLANA_MAINNET_CANARY_AUTHORIZATION \
+    mainnet-canary
+  do
+    if LC_ALL=C grep -aF "$marker" "$root/bin/bloom" >/dev/null; then
+      continue
+    else
+      status=$?
+    fi
+    if [[ "$status" -eq 1 ]]; then
+      echo "canary Machine artifact is missing required marker: $marker" >&2
+    else
+      echo "failed to scan canary Machine artifact for marker: $marker" >&2
+    fi
+    return 1
+  done
+}
+
+reject_canary_markers_outside_machine() {
+  local root="$1"
+  local scope="$2"
+  local path marker status
+  while IFS= read -r path; do
+    [[ "$path" == "$root/bin/bloom" || "$path" == "$root/ARTIFACT_CLASS" ]] && continue
+    while IFS= read -r marker; do
+      if LC_ALL=C grep -aF "$marker" "$path" >/dev/null; then
+        echo "forbidden $scope canary marker outside the Machine artifact: ${path#"$root/"}: $marker" >&2
+        return 1
+      else
+        status=$?
+      fi
+      if [[ "$status" -ne 1 ]]; then
+        echo "failed to scan $scope for canary marker: ${path#"$root/"}: $marker" >&2
+        return 1
+      fi
+    done <<'EOF'
+BLOOM_MAINNET_CANARY_ARTIFACT
+BLOOM_SOLANA_MAINNET_CANARY_AUTHORIZATION
+NON-PRODUCTION-MAINNET-CANARY
+mainnet-canary
+EOF
+  done < <(find "$root" -type f -print)
 }
 
 reject_global_debug_artifact_files() {
@@ -204,10 +270,24 @@ for binary in bloom bloom-broker bloom-signer bloom-signer-migrate; do
     exit 66
   }
 done
+artifact_class="${BLOOM_ARTIFACT_CLASS:-production}"
+case "$artifact_class" in
+  production|solana-mainnet-canary-v1) ;;
+  *)
+    echo "BLOOM_ARTIFACT_CLASS is invalid" >&2
+    exit 64
+    ;;
+esac
 reject_machine_legacy_authority_files "$staging" "production Machine artifact"
 reject_legacy_authority_symbols "$staging/bin/bloom"
 reject_global_debug_artifact_files "$staging" "production"
 reject_global_debug_markers "$staging" "production artifact"
+if [[ "$artifact_class" == production ]]; then
+  reject_canary_markers "$staging" "production artifact"
+else
+  require_canary_machine_markers "$staging"
+  reject_canary_markers_outside_machine "$staging" "canary artifact"
+fi
 reject_machine_authority_markers "$staging" "production Machine artifact"
 machine_version="$(sed -n -E 's/^machine = "([^"]+)"$/\1/p' "$script_dir/compatibility-v1.toml")"
 broker_version="$(sed -n -E 's/^broker = "([^"]+)"$/\1/p' "$script_dir/compatibility-v1.toml")"
@@ -220,7 +300,8 @@ for identity in \
 do
   binary="${identity%%:*}"
   expected="${identity#*:}"
-  actual="$("$staging/bin/$binary" --version | awk '{print $2}')"
+  version_line="$("$staging/bin/$binary" --version | sed -n '1p')"
+  actual="$(awk -v binary="$binary" '$1 == binary && NF == 2 { print $2 }' <<<"$version_line")"
   [[ "$actual" == "$expected" ]] || {
     echo "$binary version $actual is outside the compatibility matrix ($expected)" >&2
     exit 65
@@ -237,6 +318,12 @@ payload="$work/bloom-triad"
 mkdir -p "$payload"
 cp -R "$staging/." "$payload/"
 platform_claim="${BLOOM_PLATFORM_CLAIM:-test-unclaimed}"
+if [[ "$artifact_class" != production &&
+  "$platform_claim" != linux && "$platform_claim" != test-unclaimed ]]
+then
+  echo "the Solana mainnet canary artifact class is supported only on Linux" >&2
+  exit 65
+fi
 case "$platform_claim" in
   linux)
     for binary in bloom bloom-broker bloom-signer bloom-signer-migrate; do
@@ -289,6 +376,7 @@ case "$platform_claim" in
     ;;
 esac
 printf '%s\n' "$platform_claim" > "$payload/PLATFORM_CLAIM"
+printf '%s\n' "$artifact_class" > "$payload/ARTIFACT_CLASS"
 install -m 0644 "$script_dir/compatibility-v1.toml" "$payload/compatibility-v1.toml"
 mkdir -p "$payload/installer/release"
 cp -R "$script_dir/../linux" "$payload/installer/linux"
@@ -356,6 +444,12 @@ then
 fi
 
 reject_global_debug_markers "$payload" "packaged artifact"
+if [[ "$artifact_class" == production ]]; then
+  reject_canary_markers "$payload" "packaged production artifact"
+else
+  require_canary_machine_markers "$payload"
+  reject_canary_markers_outside_machine "$payload" "packaged canary artifact"
+fi
 reject_machine_authority_markers "$payload" "packaged Machine artifact"
 
 for revision_name in BLOOM_MACHINE_SHA BLOOM_BROKER_SHA BLOOM_SIGNER_SHA; do
@@ -405,10 +499,7 @@ archive_tmp="$work/archive.tar"
   find bloom-triad -print | LC_ALL=C sort > archive-files
   "$tar_command" \
   --format=ustar \
-  --uid=0 \
-  --gid=0 \
-  --uname=root \
-  --gname=root \
+  "${tar_owner_args[@]}" \
   --no-recursion \
   -cf "$archive_tmp" \
   -T archive-files

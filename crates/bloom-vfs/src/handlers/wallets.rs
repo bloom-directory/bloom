@@ -2293,6 +2293,21 @@ impl Handler for WalletsHandler {
                     .await
                     .map_err(tx_open_err)
             }
+            // Native Solana cancellation only terminalizes a staged local
+            // message. EVM cancellation signs a replacement transaction and
+            // remains unavailable through a mounted agent write.
+            [_wallet, chains, chain, outbox, pending, _id, fname]
+                if chains == "chains"
+                    && outbox == "outbox"
+                    && pending == "pending"
+                    && fname == "cancel" =>
+            {
+                if self.is_solana_chain(chain) {
+                    Ok(())
+                } else {
+                    Err(HandlerError::OperationNotPermitted)
+                }
+            }
             _ => Ok(()),
         };
         if let Err(e) = &r {
@@ -4983,6 +4998,14 @@ mod tests {
             std::sync::Arc::new(engine),
         )]));
 
+        handler
+            .prepare_write_open(
+                &VfsPath::parse("/alice/chains/solana-devnet/outbox/pending/0001-00001/cancel")
+                    .unwrap(),
+            )
+            .await
+            .expect("mounted Solana cancellation has no signing effect");
+
         let new_tx = handler
             .lookup(&VfsPath::parse("/alice/chains/solana-devnet/outbox/new.tx").unwrap())
             .await
@@ -6385,6 +6408,21 @@ mod tests {
         // override sentinel, or an ordinary confirmation. It must therefore
         // allow the write through to write_inner, which owns those semantics.
         f.handler.prepare_write_open(&p).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn evm_cancel_open_remains_unavailable_to_the_mount() {
+        let f = make_handler_with_chain(true);
+        let p = VfsPath::parse(&format!(
+            "/{}/chains/anvil/outbox/pending/not-yet-staged/cancel",
+            f.wallet_name
+        ))
+        .unwrap();
+
+        assert!(matches!(
+            f.handler.prepare_write_open(&p).await,
+            Err(HandlerError::OperationNotPermitted)
+        ));
     }
 
     #[test]

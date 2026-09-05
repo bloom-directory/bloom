@@ -11,6 +11,7 @@ Useful commands:
 - `ls docs` lists the embedded documentation.
 - `cat docs/README.md` reads the VFS overview.
 - `cat docs/examples.md` reads workflow examples.
+- `cat docs/solana.md` reads the native SOL transfer runbook.
 - `cat docs/petals.md` discovers the Petals installed in this Bloom home.
 - `ls chains` lists configured networks.
 
@@ -64,6 +65,10 @@ enumerates both together. Solana chains route through the exact same
 (stage at `outbox/new.tx`, confirm/cancel under `outbox/pending/<id>/`,
 inspect `outbox/{pending,sent,failed}/<id>/`) — there is no separate
 Solana-specific surface to look for.
+
+Before staging a native SOL transfer, read `docs/solana.md`. It documents the
+payload shape, account selection, reliable virtual-route writes, Sealed Approval
+retry, and the artifacts that prove finality.
 
 ### Reading Solana balances
 
@@ -178,9 +183,12 @@ Before opening the ceremony, verify that `approval_challenge.json` has the same
 the future. Then open or forward `ceremony_url`.
 
 The ceremony is owned by Broker and completed cryptographically by Signer.
-After successful completion, retry the same mounted confirm write. Machine has
-no local approval or signer state and cannot substitute another action's
-receipt.
+The initial permission-denied write is Bloom's application-level approval
+signal, not a Unix ownership or mount failure. Surface the ceremony URL to the
+owner, then immediately retry the same mounted confirm write in a bounded serial
+loop while approval happens asynchronously; do not wait for a new chat message.
+Machine has no local approval or signer state and cannot substitute another
+action's receipt.
 
 If the pending transaction has soft policy warnings and you intend to bypass
 them, use the sibling write sink `confirm.override`. Mounted override intent

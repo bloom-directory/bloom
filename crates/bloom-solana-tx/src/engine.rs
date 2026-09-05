@@ -479,6 +479,70 @@ impl SolanaTransferEngine {
         Ok(outcome)
     }
 
+    /// The fourth and last mainnet-beta gate: the per-value caps.
+    ///
+    /// The three preceding gates only decide whether mainnet-beta may be
+    /// reached at all. This one decides whether *this exact transfer* is the
+    /// one the operator authorized — same wallet, same key fingerprint, same
+    /// source, same destination, same amount, a fee inside the ceiling, and a
+    /// funded balance inside the stated total loss budget.
+    ///
+    /// Returns the authorization so the caller can spend its single use
+    /// immediately before sending. On any non-mainnet cluster this is `None`
+    /// and nothing changes.
+    async fn authorized_mainnet_canary(
+        &self,
+        entry: &SolanaOutboxEntry,
+        observed_genesis: &str,
+        now_ms: u128,
+    ) -> Result<Option<bloom_solana::canary::LoadedAuthorization>, EngineError> {
+        if observed_genesis != bloom_solana::MAINNET_BETA_GENESIS_HASH {
+            return Ok(None);
+        }
+        let loaded =
+            bloom_solana::canary::authorization_for(&self.chain, now_ms).ok_or_else(|| {
+                EngineError::Invalid(
+                    "mainnet-beta broadcast requires a valid canary authorization".into(),
+                )
+            })?;
+        let fingerprint = entry.staged.account_fingerprint.as_deref().ok_or_else(|| {
+            EngineError::Invalid(
+                "mainnet canary requires a transfer pinned to an exact key fingerprint".into(),
+            )
+        })?;
+        let derivation_path = entry
+            .staged
+            .account_derivation_path
+            .as_deref()
+            .ok_or_else(|| {
+                EngineError::Invalid(
+                    "mainnet canary requires a transfer pinned to an exact derivation path".into(),
+                )
+            })?;
+        loaded
+            .authorization
+            .authorizes_transfer(&bloom_solana::canary::CanaryTransfer {
+                wallet: &entry.staged.wallet,
+                key_fingerprint: fingerprint,
+                derivation_path,
+                source_address: &entry.staged.fee_payer,
+                destination: &entry.staged.destination,
+                lamports: entry.staged.lamports,
+                fee_lamports: entry.staged.fee_lamports,
+            })
+            .map_err(|error| EngineError::Invalid(error.to_string()))?;
+        // The balance is read live rather than trusted from staging time: the
+        // loss budget the operator agreed to is a statement about the funded
+        // account right now, not about what it held when the transfer was
+        // built.
+        let balance = self.client.get_balance(&entry.staged.fee_payer).await?;
+        loaded
+            .authorization
+            .authorizes_balance(balance)
+            .map_err(|error| EngineError::Invalid(error.to_string()))?;
+        Ok(Some(loaded))
+    }
+
     /// Broadcast a signed transfer with at-most-once submission semantics.
     ///
     /// The exact raw transaction and deterministic signature are durably
@@ -508,6 +572,9 @@ impl SolanaTransferEngine {
                 observed_genesis, entry.staged.genesis_hash
             )));
         }
+        let canary = self
+            .authorized_mainnet_canary(&entry, &observed_genesis, now_ms)
+            .await?;
         let signature_b58 = self
             .outbox
             .recorded_signature(&entry)?
@@ -580,7 +647,28 @@ impl SolanaTransferEngine {
         };
         self.outbox.rewrite_intent(&sent_entry)?;
 
-        let submitted = self.client.send_transaction(&tx_b64).await?;
+        let submitted = match canary.as_ref() {
+            Some(loaded) => {
+                #[cfg(feature = "mainnet-canary")]
+                {
+                    self.client
+                        .send_mainnet_canary_transaction(
+                            &tx_b64,
+                            loaded,
+                            &format!("{} {} {}", entry.staged.wallet, id, signature_b58),
+                        )
+                        .await?
+                }
+                #[cfg(not(feature = "mainnet-canary"))]
+                {
+                    let _ = loaded;
+                    return Err(EngineError::Invalid(
+                        "mainnet canary authorization reached a production build".into(),
+                    ));
+                }
+            }
+            None => self.client.send_transaction(&tx_b64).await?,
+        };
         if submitted != signature_b58 {
             return Err(EngineError::Invalid(format!(
                 "RPC returned transaction signature {submitted}, but Bloom submitted {signature_b58}"

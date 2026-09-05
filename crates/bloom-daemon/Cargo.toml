@@ -9,6 +9,9 @@ description = "Daemon library wiring VFS + chain + tx + mount for bloom"
 doctest = false
 
 [features]
+# The isolated Solana mainnet-beta canary. Never enabled by packaged builds;
+# release packaging rejects an artifact built with it.
+mainnet-canary = ["bloom-proto/mainnet-canary", "bloom-solana/mainnet-canary", "bloom-solana-tx/mainnet-canary"]
 default = ["mount"]
 # Forward to bloom-mount/mount: enables `Daemon::mount(path)` and pulls
 # in the embednfs server. Portable builds can opt out with
