@@ -1,0 +1,271 @@
+{
+  "schema_version": "bloom.views.fixture.v1",
+  "snapshot_id": "example-20260905-1700",
+  "observed_at": "2026-09-05T17:00:00Z",
+  "scope": "Fictional Alex wallet; illustrative market subset, not live data",
+  "sources": [
+    {
+      "id": "market",
+      "status": "partial",
+      "label": "Illustrative CoinGecko-style market data",
+      "source_time": "2026-09-05T16:59:00Z",
+      "window": "24 hours ending 2026-09-05T16:59:00Z",
+      "fetched_at": "2026-09-05T17:00:00Z",
+      "coverage": "4 eligible tokens of 5 in this example subset; not a global ranking"
+    },
+    {
+      "id": "dex",
+      "status": "partial",
+      "label": "Illustrative DefiLlama-style DEX data",
+      "source_time": "2026-09-05T00:00:00Z",
+      "window": "2026-09-04T00:00:00Z to 2026-09-05T00:00:00Z",
+      "fetched_at": "2026-09-05T17:00:00Z",
+      "coverage": "4 covered chains of 5 in this example; Robinhood not covered"
+    },
+    {
+      "id": "wallet",
+      "status": "partial",
+      "label": "Illustrative native and Petal observations",
+      "source_time": "2026-09-05T16:58:00Z",
+      "window": "Point observations between 16:58 and 17:00 UTC",
+      "fetched_at": "2026-09-05T17:00:00Z",
+      "coverage": "10 priced rows; 1 unpriced item; private pool value and Venice credit excluded"
+    }
+  ],
+  "tokens": [
+    {
+      "id": "ethereum",
+      "name": "Ethereum",
+      "symbol": "ETH",
+      "kind": "Network asset",
+      "price": "3000",
+      "change": "4.2",
+      "volume": "12000000000",
+      "status": "fresh",
+      "held": true,
+      "explanation": "ETH pays network fees on Ethereum and several connected networks. Your wallet holds 2.001 ETH across Ethereum and Base."
+    },
+    {
+      "id": "usd-coin",
+      "name": "USD Coin",
+      "symbol": "USDC",
+      "kind": "Stablecoin",
+      "price": "1",
+      "change": "0.01",
+      "volume": "7000000000",
+      "status": "fresh",
+      "held": true,
+      "explanation": "Designed to track one US dollar. High trading volume can accompany very little price movement; the peg is not guaranteed."
+    },
+    {
+      "id": "solana",
+      "name": "Solana",
+      "symbol": "SOL",
+      "kind": "Network asset",
+      "price": "150",
+      "change": "6.8",
+      "volume": "5000000000",
+      "status": "fresh",
+      "held": true,
+      "explanation": "SOL pays Solana network fees. You hold 10 SOL in the example account; native support depends on the Solana stack."
+    },
+    {
+      "id": "hyperliquid",
+      "name": "Hyperliquid",
+      "symbol": "HYPE",
+      "kind": "Network asset",
+      "price": "25",
+      "change": "-2.1",
+      "volume": "1000000000",
+      "status": "fresh",
+      "held": false,
+      "explanation": "This token is distinct from the equity in your Hyperliquid trading account. You have no direct HYPE balance in this example."
+    },
+    {
+      "id": "example-unpriced",
+      "name": "Unidentified token",
+      "symbol": "UNKNOWN",
+      "kind": "Unverified asset",
+      "price": null,
+      "change": null,
+      "volume": null,
+      "status": "unavailable",
+      "held": true,
+      "explanation": "No reliable price or market identity. Excluded from rankings and dollar totals; do not follow links supplied by the token."
+    }
+  ],
+  "chains": [
+    {
+      "id": "eip155:1",
+      "name": "Ethereum",
+      "volume": "3000000000",
+      "previous_volume": "2500000000",
+      "wallet_value": "7050",
+      "health": "Connected",
+      "access": "Policy allows the example scope",
+      "note": "Your ETH and Morpho position live here. More trading does not establish that fees are low."
+    },
+    {
+      "id": "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+      "name": "Solana",
+      "volume": "2000000000",
+      "previous_volume": "1600000000",
+      "wallet_value": "1500",
+      "health": "Read delayed",
+      "access": "Native SOL support is conditional",
+      "note": "The last balance is visible, but the example RPC is delayed. Check connection and exact account before preparing a transfer."
+    },
+    {
+      "id": "eip155:8453",
+      "name": "Base",
+      "volume": "1000000000",
+      "previous_volume": "800000000",
+      "wallet_value": "1003",
+      "health": "Connected",
+      "access": "USDC transfer awaits owner approval",
+      "note": "You have 1,000 USDC here. Base uses ETH for network fees; a sponsored route may have its own fee."
+    },
+    {
+      "id": "eip155:42161",
+      "name": "Arbitrum",
+      "volume": "500000000",
+      "previous_volume": "625000000",
+      "wallet_value": "250",
+      "health": "Connected",
+      "access": "Policy allows the example scope",
+      "note": "Your 250 USDC on Arbitrum is separate from your balance on Base and from Hyperliquid equity."
+    },
+    {
+      "id": "eip155:4663",
+      "name": "Robinhood",
+      "volume": null,
+      "previous_volume": null,
+      "wallet_value": "1000",
+      "health": "Connected",
+      "access": "Transfers blocked by wallet policy",
+      "note": "Issuer-priced stock tokens are visible. Comparable DEX volume is missing; this is not evidence of no activity."
+    }
+  ],
+  "holdings": [
+    {
+      "name": "Ethereum",
+      "quantity": "2 ETH",
+      "value": "6000",
+      "scope": "Ethereum",
+      "source": "Native balance",
+      "note": "Liquid wallet asset; token price movement is not your personal investment return."
+    },
+    {
+      "name": "Ethereum",
+      "quantity": "0.001 ETH",
+      "value": "3",
+      "scope": "Base",
+      "source": "Native balance",
+      "note": "Available for Base network fees; the example transfer estimates 0.00001 ETH, or $0.03."
+    },
+    {
+      "name": "USD Coin",
+      "quantity": "50 USDC",
+      "value": "50",
+      "scope": "Ethereum",
+      "source": "Known-token balance",
+      "note": "Still in the wallet while the Morpho deposit is paused. Approval alone did not move these funds."
+    },
+    {
+      "name": "USD Coin",
+      "quantity": "1,000 USDC",
+      "value": "1000",
+      "scope": "Base",
+      "source": "Known-token balance",
+      "note": "Includes the 100 USDC staged for review. Staging has not spent it."
+    },
+    {
+      "name": "USD Coin",
+      "quantity": "250 USDC",
+      "value": "250",
+      "scope": "Arbitrum",
+      "source": "Known-token balance",
+      "note": "A separate network balance, even if the wallet address is the same."
+    },
+    {
+      "name": "Solana",
+      "quantity": "10 SOL",
+      "value": "1500",
+      "scope": "Solana",
+      "source": "Native SOL \u00b7 conditional stack",
+      "note": "Last observed balance. Connection is delayed; verify before use."
+    },
+    {
+      "name": "Morpho vault",
+      "quantity": "Underlying claim",
+      "value": "1000",
+      "scope": "Ethereum",
+      "source": "Morpho Petal",
+      "note": "Estimated underlying value. Vault shares are excluded elsewhere to avoid counting twice. Withdrawal liquidity is not established here."
+    },
+    {
+      "name": "Hyperliquid account",
+      "quantity": "Account equity",
+      "value": "2100",
+      "scope": "Hyperliquid",
+      "source": "Hyperliquid Petal",
+      "note": "Includes position P&L. The example $3,000 BTC position exposure is risk, not extra wealth."
+    },
+    {
+      "name": "Prediction account",
+      "quantity": "$150 cash + $250 positions",
+      "value": "400",
+      "scope": "Polymarket",
+      "source": "Polymarket adapter concept",
+      "note": "The $80 redeemable position is included in $250. Full valuation requires an adapter beyond the inspected DTO."
+    },
+    {
+      "name": "Apple stock token",
+      "quantity": "5 AAPL tokens",
+      "value": "1000",
+      "scope": "Robinhood",
+      "source": "Robinhood Petal",
+      "note": "Illustrative issuer quote of $200/token. An issuer product, not a brokerage share. Transfer policy is blocked."
+    },
+    {
+      "name": "Unidentified token",
+      "quantity": "25 units",
+      "value": null,
+      "scope": "Base",
+      "source": "Unverified asset",
+      "note": "Excluded from dollar value. No trustworthy market identity or safe action is inferred."
+    }
+  ],
+  "actions": [
+    {
+      "id": "transfer-01",
+      "lane": "needs",
+      "status": "Awaiting you",
+      "title": "Review 100 USDC to Sam",
+      "body": "Your Base transfer is prepared. Nothing has been sent. Check the recipient and estimated fee before continuing in Bloom\u2019s approval ceremony.",
+      "target": "send.html",
+      "cta": "Inspect transfer",
+      "source": "Canonical staged transfer \u00b7 example approval expires 17:10 UTC"
+    },
+    {
+      "id": "morpho-02",
+      "lane": "needs",
+      "status": "Approval expired",
+      "title": "Your Morpho deposit is paused",
+      "body": "The token approval completed; the 50 USDC deposit did not start. Refresh the deposit review if you still want to continue. Do not repeat the completed approval.",
+      "target": "activity.html#morpho",
+      "cta": "See the two steps",
+      "source": "Morpho action + outbox \u00b7 definite no-signature refusal for deposit"
+    },
+    {
+      "id": "redeem-03",
+      "lane": "optional",
+      "status": "Available to check",
+      "title": "A prediction position may be ready to redeem",
+      "body": "The example provider marks an $80 position redeemable. Refresh ownership and the supported redemption route before preparing anything. It is already included in your wallet value.",
+      "target": "portfolio.html#positions",
+      "cta": "See position context",
+      "source": "Polymarket fixture \u00b7 valuation adapter proposed"
+    }
+  ]
+}

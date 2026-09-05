@@ -1,132 +1,18 @@
 <!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="color-scheme" content="light">
-  <title>Bloom VFS view concepts</title>
-  <link rel="stylesheet" href="bloom.css">
-</head>
-<body>
-  <div class="demo-bar">Concept templates · static example data · no live wallet connected</div>
-  <header class="site-header">
-    <a class="brand" href="index.html" aria-label="Bloom view concepts home">
-      <img src="../../assets/bloom-wordmark.png" alt="Bloom">
-    </a>
-    <nav class="showcase-nav" aria-label="View concepts">
-      <a href="portfolio.html">Portfolio</a>
-      <a href="next-moves.html">Next moves</a>
-      <a href="receive.html">Receive</a>
-      <a href="send.html">Send</a>
-      <a href="activity.html">Activity</a>
-      <a href="permissions.html">Permissions</a>
-    </nav>
-  </header>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="theme-color" content="#f4efe6"><meta name="referrer" content="no-referrer">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'self' 'unsafe-inline'; img-src 'self'; base-uri 'none'; form-action 'none'">
+<title>A little clarity. · Bloom</title><link rel="icon" href="bloom-primary.svg" type="image/svg+xml"><link rel="stylesheet" href="bloom.css"></head>
+<body><a class="skip" href="#main">Skip to content</a>
+<div class="demo">Research prototype · fictional data · no wallet connected · no actions execute</div>
+<div class="shell"><header class="masthead"><a class="brand" href="index.html" aria-label="Bloom today"><img src="bloom-primary.svg" width="32" height="32" alt=""><strong>/bloom</strong></a><span class="edition">The wallet fieldnotes<br>Example edition / 05 Sep 2026</span></header>
+<nav aria-label="Wallet views"><a href="index.html" aria-current="page">Today</a><a href="markets.html">Markets</a><a href="chains.html">Chains</a><a href="portfolio.html">Wallet</a><a href="next-moves.html">Next moves</a><a href="activity.html">Activity</a><a href="receive.html">Receive</a><a href="permissions.html">Access</a></nav>
+<main id="main"><div class="intro"><div><p class="eyebrow">Your place in the ecosystem</p><h1>A little clarity.</h1></div><p class="lede">What is moving, where you stand, and the few things that need you. Start here; go deeper when something matters.</p></div>
 
-  <main class="page">
-    <div class="context-row">
-      <div class="vfs-path"><code>issue://114/view-templates</code></div>
-      <div class="snapshot">Research showcase · 17 July 2026</div>
-    </div>
+<section class="hero"><div><p class="eyebrow">The market, in a moment</p><h2>ETH leads volume.<br>SOL leads price gains.</h2><p>In this example, ETH leads the covered tokens by trading volume. SOL has the largest price rise. Those are different signals; neither tells you what to buy.</p><div class="links"><a class="button" href="markets.html">Understand the market →</a></div></div><div class="hero-aside"><span class="label">Alex’s observed wallet value</span><div class="metric">$13,303.00</div><p>Across wallet assets and positions. One unpriced asset is excluded; Solana’s last balance needs a fresh check.</p><a class="link" href="portfolio.html">See what you own →</a></div></section>
+<div class="stats"><div class="stat"><span class="label">Needs your attention</span><strong>2 next steps</strong><small>A transfer to review; a paused deposit.</small></div><div class="stat"><span class="label">Market coverage</span><strong>4 tokens · 4 chains</strong><small>Illustrative subset, not the entire market.</small></div><div class="stat"><span class="label">You have room to pause</span><strong>No trade required</strong><small>A price move is context, not an instruction.</small></div></div>
+<section><div class="section-head"><h2>First, the things that need you.</h2><p>Existing operations, not new trade ideas</p></div><article class="action" id="transfer-01"><span class="action-number" aria-hidden="true">01</span><div><span class="badge warn">Awaiting you</span><h3>Review 100 USDC to Sam</h3><p>Your Base transfer is prepared. Nothing has been sent. Check the recipient and estimated fee before continuing in Bloom’s approval ceremony.</p><small>Canonical staged transfer · example approval expires 17:10 UTC</small></div><a href="send.html">Inspect transfer →</a></article><article class="action" id="morpho-02"><span class="action-number" aria-hidden="true">02</span><div><span class="badge warn">Approval expired</span><h3>Your Morpho deposit is paused</h3><p>The token approval completed; the 50 USDC deposit did not start. Refresh the deposit review if you still want to continue. Do not repeat the completed approval.</p><small>Morpho action + outbox · definite no-signature refusal for deposit</small></div><a href="activity.html#morpho">See the two steps →</a></article></section>
+<section><div class="section-head"><h2>What is moving?</h2><p>Different signals, explained simply</p></div><div class="grid"><article class="card"><p class="eyebrow">01 / Tokens</p><h3>ETH leads trading volume</h3><p>Volume measures how much changed hands. It does not prove new buyers, deep liquidity, or a good entry price.</p><a class="link" href="markets.html">Explore tokens →</a></article><article class="card"><p class="eyebrow">02 / Networks</p><h3>Ethereum leads this chain sample</h3><p>DEX volume measures on-chain exchange activity. Your network connection and wallet permissions are shown separately.</p><a class="link" href="chains.html">Explore chains →</a></article></div></section>
 
-    <section class="index-hero">
-      <div>
-        <p class="eyebrow">A view layer for wallet facts</p>
-        <h1>Useful at a glance.<br>Exact on demand.</h1>
-        <p>Six Bloom-owned templates turn typed VFS snapshots into calm, readable wallet views—for people and the agents helping them.</p>
-        <div class="intro-facts" aria-label="Template principles">
-          <span class="pill">One canonical snapshot</span>
-          <span class="pill">Read-only HTML</span>
-          <span class="pill">Honest coverage</span>
-        </div>
-      </div>
-      <div class="petal-orbit" aria-hidden="true">
-        <span class="slash-core"></span>
-        <span class="orbit-dot one">Portfolio</span>
-        <span class="orbit-dot two">Next</span>
-        <span class="orbit-dot three">Receive</span>
-        <span class="orbit-dot four">Send</span>
-        <span class="orbit-dot five">Activity</span>
-        <span class="orbit-dot six">Security</span>
-      </div>
-    </section>
-
-    <section class="section" aria-labelledby="views-heading">
-      <div class="section-head">
-        <h2 id="views-heading">The six core views</h2>
-        <p>Open any template to explore the example</p>
-      </div>
-      <div class="view-grid">
-        <a class="view-card card" href="portfolio.html">
-          <span class="view-number">01 / HOLDINGS</span>
-          <h2>Portfolio</h2>
-          <p>Balances, venue equity, leveraged positions, and prediction-market bets—valued without double counting.</p>
-          <span class="action-label">Open portfolio</span>
-        </a>
-        <a class="view-card card" href="next-moves.html">
-          <span class="view-number">02 / PRIORITIES</span>
-          <h2>Next moves</h2>
-          <p>A small deterministic inbox for approvals, risks, blocked workflows, and concrete follow-ups available now.</p>
-          <span class="action-label">Open next moves</span>
-        </a>
-        <a class="view-card card" href="receive.html">
-          <span class="view-number">03 / DESTINATIONS</span>
-          <h2>Receive</h2>
-          <p>Verified, chain-qualified receive routes that make network, asset, purpose, and provenance impossible to miss.</p>
-          <span class="action-label">Open receive</span>
-        </a>
-        <a class="view-card card" href="send.html">
-          <span class="view-number">04 / REVIEW</span>
-          <h2>Send</h2>
-          <p>An exact staged-transaction review with ENS resolution, simulation, policy checks, and trusted contact context.</p>
-          <span class="action-label">Open send</span>
-        </a>
-        <a class="view-card card" href="activity.html">
-          <span class="view-number">05 / OUTCOMES</span>
-          <h2>Activity</h2>
-          <p>A semantic wallet timeline: one user action per card, with lifecycle, net effects, finality, and evidence.</p>
-          <span class="action-label">Open activity</span>
-        </a>
-        <a class="view-card card" href="permissions.html">
-          <span class="view-number">06 / AUTHORITY</span>
-          <h2>Permissions &amp; security</h2>
-          <p>Who can act, what they can do, what Bloom can still exercise, and how key custody and recovery are configured.</p>
-          <span class="action-label">Open permissions</span>
-        </a>
-      </div>
-    </section>
-
-    <section class="section" aria-labelledby="contract-heading">
-      <div class="section-head">
-        <h2 id="contract-heading">One rendering contract</h2>
-        <p>Same facts, three useful surfaces</p>
-      </div>
-      <div class="grid-3">
-        <article class="card card-pad">
-          <span class="label">For agents</span>
-          <h3>Typed JSON</h3>
-          <p class="muted">Canonical facts, decimal strings, stable identifiers, evidence paths, and explicit source coverage.</p>
-          <span class="path-box">/wallets/alice/&lt;view&gt;.json</span>
-        </article>
-        <article class="card card-pad">
-          <span class="label">For every chat</span>
-          <h3>Readable Markdown</h3>
-          <p class="muted">The dependable fallback for Codex, Claude, OpenCode, terminals, and clients without rich rendering.</p>
-          <span class="path-box">/wallets/alice/&lt;view&gt;.md</span>
-        </article>
-        <article class="card card-pad">
-          <span class="label">For people</span>
-          <h3>Beautiful HTML</h3>
-          <p class="muted">Semantic, responsive, script-free, escaped, and generated from exactly the same cached snapshot.</p>
-          <span class="path-box">/wallets/alice/&lt;view&gt;.html</span>
-        </article>
-      </div>
-    </section>
-  </main>
-
-  <footer class="page-footer">
-    <span><strong>Bloom VFS view concepts</strong> · research for issue 114</span>
-    <span>Example values only · no live actions</span>
-  </footer>
-</body>
-</html>
+<section class="coverage"><details><summary>Sources, freshness &amp; what is missing</summary><p><strong>Illustrative CoinGecko-style market data</strong> · partial<br>4 eligible tokens of 5 in this example subset; not a global ranking<br>Source time: 2026-09-05T16:59:00Z. Window: 24 hours ending 2026-09-05T16:59:00Z.</p><p><strong>Illustrative DefiLlama-style DEX data</strong> · partial<br>4 covered chains of 5 in this example; Robinhood not covered<br>Source time: 2026-09-05T00:00:00Z. Window: 2026-09-04T00:00:00Z to 2026-09-05T00:00:00Z.</p><p><strong>Illustrative native and Petal observations</strong> · partial<br>10 priced rows; 1 unpriced item; private pool value and Venice credit excluded<br>Source time: 2026-09-05T16:58:00Z. Window: Point observations between 16:58 and 17:00 UTC.</p></details></section>
+</main><footer><span>Illustrative snapshot · 05 Sep 2026, 17:00 UTC<br>example-20260905-1700</span><span><a href="snapshot.md">Text version</a><a href="snapshot.json">Example data</a><a href="states.html">Empty & failure states</a><a href="../2026-07-17-vfs-view-decision.md">Design notes</a></span></footer></div></body></html>

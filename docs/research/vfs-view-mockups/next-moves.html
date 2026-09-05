@@ -1,157 +1,18 @@
 <!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="color-scheme" content="light">
-  <title>Next moves · Bloom</title>
-  <link rel="stylesheet" href="bloom.css">
-</head>
-<body>
-  <div class="demo-bar">Concept template · static example data · no live wallet connected</div>
-  <header class="site-header">
-    <a class="brand" href="index.html" aria-label="Bloom view concepts home">
-      <img src="../../assets/bloom-wordmark.png" alt="Bloom">
-    </a>
-    <nav class="showcase-nav" aria-label="View concepts">
-      <a href="portfolio.html">Portfolio</a>
-      <a href="next-moves.html" aria-current="page">Next moves</a>
-      <a href="receive.html">Receive</a>
-      <a href="send.html">Send</a>
-      <a href="activity.html">Activity</a>
-      <a href="permissions.html">Permissions</a>
-    </nav>
-  </header>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="theme-color" content="#f4efe6"><meta name="referrer" content="no-referrer">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'self' 'unsafe-inline'; img-src 'self'; base-uri 'none'; form-action 'none'">
+<title>A short list. A clear next step. · Bloom</title><link rel="icon" href="bloom-primary.svg" type="image/svg+xml"><link rel="stylesheet" href="bloom.css"></head>
+<body><a class="skip" href="#main">Skip to content</a>
+<div class="demo">Research prototype · fictional data · no wallet connected · no actions execute</div>
+<div class="shell"><header class="masthead"><a class="brand" href="index.html" aria-label="Bloom today"><img src="bloom-primary.svg" width="32" height="32" alt=""><strong>/bloom</strong></a><span class="edition">The wallet fieldnotes<br>Example edition / 05 Sep 2026</span></header>
+<nav aria-label="Wallet views"><a href="index.html">Today</a><a href="markets.html">Markets</a><a href="chains.html">Chains</a><a href="portfolio.html">Wallet</a><a href="next-moves.html" aria-current="page">Next moves</a><a href="activity.html">Activity</a><a href="receive.html">Receive</a><a href="permissions.html">Access</a></nav>
+<main id="main"><div class="intro"><div><p class="eyebrow">Your place in the ecosystem</p><h1>A short list. A clear next step.</h1></div><p class="lede">Your pending decisions come first. Market curiosity can wait. Each item says what happened, why it is here, and what you can do next.</p></div>
 
-  <main class="page">
-    <div class="context-row">
-      <div class="vfs-path"><code>/wallets/alice/next.html</code></div>
-      <div class="snapshot">Snapshot A91F · checked 24 seconds ago</div>
-    </div>
+<section><div class="section-head"><h2>Needs you</h2><p>2 operations · no new trade suggestions</p></div><article class="action" id="transfer-01"><span class="action-number" aria-hidden="true">01</span><div><span class="badge warn">Awaiting you</span><h3>Review 100 USDC to Sam</h3><p>Your Base transfer is prepared. Nothing has been sent. Check the recipient and estimated fee before continuing in Bloom’s approval ceremony.</p><small>Canonical staged transfer · example approval expires 17:10 UTC</small></div><a href="send.html">Inspect transfer →</a></article><article class="action" id="morpho-02"><span class="action-number" aria-hidden="true">02</span><div><span class="badge warn">Approval expired</span><h3>Your Morpho deposit is paused</h3><p>The token approval completed; the 50 USDC deposit did not start. Refresh the deposit review if you still want to continue. Do not repeat the completed approval.</p><small>Morpho action + outbox · definite no-signature refusal for deposit</small></div><a href="activity.html#morpho">See the two steps →</a></article></section>
+<section><div class="section-head"><h2>Worth a look</h2><p>Optional; not part of your attention count</p></div><article class="action" id="redeem-03"><span class="action-number" aria-hidden="true">01</span><div><span class="badge good">Available to check</span><h3>A prediction position may be ready to redeem</h3><p>The example provider marks an $80 position redeemable. Refresh ownership and the supported redemption route before preparing anything. It is already included in your wallet value.</p><small>Polymarket fixture · valuation adapter proposed</small></div><a href="portfolio.html#positions">See position context →</a></article></section>
+<section class="callout warn"><strong>One thing we cannot check right now</strong><p>The Solana connection is delayed. Last-observed balances remain visible, but current transfer readiness is unknown. No resend is suggested.</p></section>
+<section><details><summary>How this list is built</summary><p>Items come from known operations and public provider state. A successful signature is not settlement. Expired reviews need a current request. An unknown broadcast outcome stays in reconciliation until Bloom can prove what happened. Market rankings never create urgent wallet tasks.</p></details></section>
 
-    <section class="page-intro">
-      <div>
-        <p class="eyebrow">Priority inbox</p>
-        <h1>Next moves</h1>
-      </div>
-      <div>
-        <p class="intro-copy">Deterministic wallet conditions that deserve attention or have a supported follow-up—without inventing investment advice.</p>
-        <div class="intro-facts">
-          <span class="status warn">3 need attention</span>
-          <span class="status good">1 available now</span>
-          <span class="pill">Coverage complete</span>
-        </div>
-      </div>
-    </section>
-
-    <div class="inbox-summary">
-      <strong>Four open signals</strong>
-      <span class="muted">Ordered by consequence, deadline, then stable ID</span>
-    </div>
-
-    <section class="lane" aria-labelledby="attention-heading">
-      <div class="lane-heading"><span class="lane-count">3</span><h2 id="attention-heading">Needs attention</h2></div>
-      <div class="move-list">
-        <article class="card move-card">
-          <div class="move-rank">01</div>
-          <div class="move-copy">
-            <div class="move-head"><h3>Swap is waiting for approval</h3><span class="status bloom">Approval required</span></div>
-            <p>Swap 100 USDC for at least 0.0281 ETH on Base. The sealed review expires at 10:58.</p>
-            <div class="move-meta">
-              <span class="pill">Base</span>
-              <span class="pill">Prepared 6m ago</span>
-              <span class="pill">Policy pass</span>
-            </div>
-            <details>
-              <summary>Evidence and supported next step</summary>
-              <div class="detail-body">
-                <p>Bloom found a canonical staged action that still awaits its matching passkey approval.</p>
-                <span class="path-box">/wallets/alice/chains/base/outbox/pending/swap_7KM4/review.html</span>
-              </div>
-            </details>
-          </div>
-          <div class="move-side"><strong>16 min</strong><small>until review expires</small></div>
-        </article>
-
-        <article class="card move-card">
-          <div class="move-rank">02</div>
-          <div class="move-copy">
-            <div class="move-head"><h3>Margin crossed your warning band</h3><span class="status warn">Risk changed</span></div>
-            <p>Hyperliquid cross-margin usage is 68%, above Alice's 65% warning threshold. Current venue data is fresh.</p>
-            <div class="choice-row" aria-label="Possible responses">
-              <span class="choice">Review exposure</span>
-              <span class="choice">Add collateral</span>
-              <span class="choice">Reduce exposure</span>
-              <span class="choice">Leave unchanged</span>
-            </div>
-            <details>
-              <summary>Evidence and supported next steps</summary>
-              <div class="detail-body">
-                <p>Account equity $20,934.40 · BTC-PERP long 0.31 BTC · reported liquidation price $47,908. Bloom does not prescribe a trade.</p>
-                <span class="path-box">/wallets/alice/hyperliquid/portfolio.json</span>
-              </div>
-            </details>
-          </div>
-          <div class="move-side"><strong>68%</strong><small>margin usage</small></div>
-        </article>
-
-        <article class="card move-card">
-          <div class="move-rank">03</div>
-          <div class="move-copy">
-            <div class="move-head"><h3>Transaction is still pending</h3><span class="status warn">Soon</span></div>
-            <p>A Base transfer has been unmined for 8 minutes. Current replacement-fee advice is available for review.</p>
-            <div class="move-meta">
-              <span class="pill">Base</span>
-              <span class="pill">Nonce 184</span>
-              <span class="pill">Original fee 0.000021 ETH</span>
-            </div>
-            <details>
-              <summary>Evidence and supported next step</summary>
-              <div class="detail-body">
-                <p>The scanner refreshed its advice 18 seconds ago. The replacement remains advisory until prepared through the normal intent and approval flow.</p>
-                <span class="path-box">/wallets/alice/chains/base/outbox/sent/tx_184/bump_advice.json</span>
-              </div>
-            </details>
-          </div>
-          <div class="move-side"><strong>8 min</strong><small>pending</small></div>
-        </article>
-      </div>
-    </section>
-
-    <section class="lane available" aria-labelledby="available-heading">
-      <div class="lane-heading"><span class="lane-count">1</span><h2 id="available-heading">Available now</h2></div>
-      <div class="move-list">
-        <article class="card move-card">
-          <div class="move-rank">01</div>
-          <div class="move-copy">
-            <div class="move-head"><h3>Redeem a resolved position</h3><span class="status good">Verified redeemable</span></div>
-            <p>“Was ETH above $3,000 at Friday close?” resolved YES. Polymarket reports 186.40 winning shares ready to redeem.</p>
-            <div class="move-meta">
-              <span class="pill">Polymarket</span>
-              <span class="pill">Resolved 16 Jul</span>
-              <span class="pill">Approval still required</span>
-            </div>
-            <details>
-              <summary>Evidence and supported next step</summary>
-              <div class="detail-body">
-                <p>The market's typed position state is explicitly <code>redeemable=true</code>. Opening the path prepares a new action; it does not redeem from this page.</p>
-                <span class="path-box">/wallets/alice/polymarket/positions/eth-friday/redeem.md</span>
-              </div>
-            </details>
-          </div>
-          <div class="move-side"><strong>$186.40</strong><small>estimated value</small></div>
-        </article>
-      </div>
-    </section>
-
-    <section class="section" aria-label="Safety boundary">
-      <div class="notice"><strong>Discovery, not authorization.</strong> These items point to evidence or a supported preparation path. Any value-moving action is still staged, simulated, policy-checked, and approved through Bloom's existing signing ceremony. Generic airdrops and trade ideas are intentionally absent.</div>
-    </section>
-  </main>
-
-  <footer class="page-footer">
-    <span><strong>Bloom next-moves concept</strong> · generated from bloom.next_moves.v1</span>
-    <span>Facts first · no invented recommendations</span>
-  </footer>
-</body>
-</html>
+<section class="coverage"><details><summary>Sources, freshness &amp; what is missing</summary><p><strong>Illustrative CoinGecko-style market data</strong> · partial<br>4 eligible tokens of 5 in this example subset; not a global ranking<br>Source time: 2026-09-05T16:59:00Z. Window: 24 hours ending 2026-09-05T16:59:00Z.</p><p><strong>Illustrative DefiLlama-style DEX data</strong> · partial<br>4 covered chains of 5 in this example; Robinhood not covered<br>Source time: 2026-09-05T00:00:00Z. Window: 2026-09-04T00:00:00Z to 2026-09-05T00:00:00Z.</p><p><strong>Illustrative native and Petal observations</strong> · partial<br>10 priced rows; 1 unpriced item; private pool value and Venice credit excluded<br>Source time: 2026-09-05T16:58:00Z. Window: Point observations between 16:58 and 17:00 UTC.</p></details></section>
+</main><footer><span>Illustrative snapshot · 05 Sep 2026, 17:00 UTC<br>example-20260905-1700</span><span><a href="snapshot.md">Text version</a><a href="snapshot.json">Example data</a><a href="states.html">Empty & failure states</a><a href="../2026-07-17-vfs-view-decision.md">Design notes</a></span></footer></div></body></html>

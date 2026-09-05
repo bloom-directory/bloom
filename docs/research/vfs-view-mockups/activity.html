@@ -1,156 +1,17 @@
 <!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="color-scheme" content="light">
-  <title>Activity · Bloom</title>
-  <link rel="stylesheet" href="bloom.css">
-</head>
-<body>
-  <div class="demo-bar">Concept template · static example data · no live wallet connected</div>
-  <header class="site-header">
-    <a class="brand" href="index.html" aria-label="Bloom view concepts home">
-      <img src="../../assets/bloom-wordmark.png" alt="Bloom">
-    </a>
-    <nav class="showcase-nav" aria-label="View concepts">
-      <a href="portfolio.html">Portfolio</a>
-      <a href="next-moves.html">Next moves</a>
-      <a href="receive.html">Receive</a>
-      <a href="send.html">Send</a>
-      <a href="activity.html" aria-current="page">Activity</a>
-      <a href="permissions.html">Permissions</a>
-    </nav>
-  </header>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="theme-color" content="#f4efe6"><meta name="referrer" content="no-referrer">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'self' 'unsafe-inline'; img-src 'self'; base-uri 'none'; form-action 'none'">
+<title>The story of your actions. · Bloom</title><link rel="icon" href="bloom-primary.svg" type="image/svg+xml"><link rel="stylesheet" href="bloom.css"></head>
+<body><a class="skip" href="#main">Skip to content</a>
+<div class="demo">Research prototype · fictional data · no wallet connected · no actions execute</div>
+<div class="shell"><header class="masthead"><a class="brand" href="index.html" aria-label="Bloom today"><img src="bloom-primary.svg" width="32" height="32" alt=""><strong>/bloom</strong></a><span class="edition">The wallet fieldnotes<br>Example edition / 05 Sep 2026</span></header>
+<nav aria-label="Wallet views"><a href="index.html">Today</a><a href="markets.html">Markets</a><a href="chains.html">Chains</a><a href="portfolio.html">Wallet</a><a href="next-moves.html">Next moves</a><a href="activity.html" aria-current="page">Activity</a><a href="receive.html">Receive</a><a href="permissions.html">Access</a></nav>
+<main id="main"><div class="intro"><div><p class="eyebrow">Your place in the ecosystem</p><h1>The story of your actions.</h1></div><p class="lede">See what completed, what is waiting, and what remains uncertain. One workflow can have several steps; a completed approval is not a completed deposit.</p></div>
 
-  <main class="page narrow">
-    <div class="context-row">
-      <div class="vfs-path"><code>/wallets/alice/activity.html</code></div>
-      <div class="snapshot">Snapshot T72B · 10:42:16 ART</div>
-    </div>
+<section><div class="section-head"><h2>In progress</h2><p>Example operations · current at the fixture timestamp</p></div><div class="grid"><article class="card"><p class="eyebrow">Base transfer</p><h3>100 USDC still awaits you</h3><p>Prepared → <strong>Owner review</strong> → Submit → Confirm. Nothing sent.</p><a class="link" href="send.html">Inspect transfer →</a></article><article class="card" id="morpho"><p class="eyebrow">Morpho / deposit-02</p><h3>Approval done. Deposit paused.</h3><p>Step 1: the token approval completed. Step 2: the 50 USDC deposit review expired before signing. The existing $1,000 position has not grown by $50.</p><details><summary>What continuing means</summary><p>Use the current Morpho action status and supported retry path to obtain a new deposit review. The completed token approval is not repeated. The new review must reflect current terms.</p></details></article></div></section>
+<section><div class="section-head"><h2>Recent outcomes</h2><p>Linked by operation IDs, not nearby timestamps</p></div><div class="timeline"><article class="event"><span class="label">16:35 UTC / Enso swap-04</span><h3>Swapped 0.05 ETH for 150 USDC</h3><p>Completed on Ethereum. The source receipt contains the attributable token movement and the operation’s supported settlement check passed in this example.</p><details><summary>Why this is one card</summary><p>The approval and swap belong to the same Enso workflow ID. Its earlier approval is a step, not another payment. These are fictional receipt facts, not a live transaction hash.</p></details></article><article class="event"><span class="label">15:10 UTC / Robinhood transfer-05</span><h3>Received 5 Apple stock tokens</h3><p>Observed on Robinhood Chain. The position is valued at the illustrative issuer quote. The incoming sender is not offered as a contact or future payment target.</p></article></div></section>
+<section class="callout"><strong>History has a boundary.</strong><p>This example shows local workflows and selected provider outcomes, not every transaction the wallet has ever made. Unsolicited token metadata is not a trusted link or a payment instruction.</p></section>
 
-    <section class="activity-intro">
-      <p class="eyebrow">Wallet outcomes</p>
-      <h1>Activity</h1>
-      <p class="intro-copy">Actions and effects, not raw transaction noise. Related steps stay together from staging through final settlement.</p>
-      <div class="intro-facts">
-        <span class="status bloom">1 in progress</span>
-        <span class="status warn">Recent coverage partial</span>
-        <span class="pill">America/Argentina/Cordoba</span>
-      </div>
-    </section>
-
-    <section aria-labelledby="progress-heading">
-      <div class="section-head"><h2 id="progress-heading">In progress</h2><p>Outstanding work stays pinned</p></div>
-      <article class="card progress-card">
-        <div class="progress-top">
-          <div><span class="label">Swap · Base</span><h2>Swap 100 USDC → ETH</h2><p>Prepared at 10:36 · minimum received 0.0281 ETH</p></div>
-          <span class="status bloom">Awaiting approval</span>
-        </div>
-        <div class="progress-track" aria-label="Prepared, simulated, and policy checked; approval and broadcast remain">
-          <span class="done"></span><span class="done"></span><span class="done"></span><span></span>
-        </div>
-        <details>
-          <summary>Lifecycle and review path</summary>
-          <div class="detail-body">
-            <p>Prepared → simulated → policy passed → <strong>awaiting passkey</strong> → broadcast → settlement.</p>
-            <span class="path-box">/wallets/alice/chains/base/outbox/pending/swap_7KM4/review.html</span>
-          </div>
-        </details>
-      </article>
-    </section>
-
-    <section class="day-group" aria-labelledby="today-heading">
-      <h2 class="day-label" id="today-heading">Today · 17 July</h2>
-      <div class="timeline">
-        <article class="card timeline-item">
-          <span class="activity-symbol sent" aria-hidden="true">↑</span>
-          <div class="activity-copy">
-            <div class="move-head"><h3>Sent 25 USDC to maya.eth</h3><span class="status good">Finalized</span></div>
-            <p>Base · Bloom-originated transfer · saved ENS resolution</p>
-            <div class="signed-effects"><span class="signed-effect">−25.00 USDC</span><span class="signed-effect">fee −0.000029 ETH</span></div>
-            <details>
-              <summary>Exact destination and evidence</summary>
-              <div class="detail-body">
-                <p><strong>Recipient:</strong> <code>0x52908400098527886E0F7030069857D2E4169EE7</code></p>
-                <p><strong>Transaction:</strong> <code>0x87d2f34b3c91572ce54306269329e19051c9ed8be6bbdcb22362d8cc36ef91af</code></p>
-                <p>Receipt independently checked through finalized block 33,803,112.</p>
-              </div>
-            </details>
-          </div>
-          <time class="timeline-time" datetime="2026-07-17T09:58:12-03:00">09:58</time>
-        </article>
-
-        <article class="card timeline-item">
-          <span class="activity-symbol market" aria-hidden="true">Y</span>
-          <div class="activity-copy">
-            <div class="move-head"><h3>Bought 40 YES on “Fed cuts by September?”</h3><span class="status good">Filled</span></div>
-            <p>Polymarket · one order · two partial fills grouped</p>
-            <div class="signed-effects"><span class="signed-effect">−32.64 USDC</span><span class="signed-effect">+40 YES</span></div>
-            <details>
-              <summary>Order, fills, and provenance</summary>
-              <div class="detail-body"><p>Average price 81.6¢ · order <code>0xe2c7…91d4</code> · fills <code>trade_72A</code> and <code>trade_72B</code>. Outcome and amounts are provider-reported; local receipt links both fills to the order.</p></div>
-            </details>
-          </div>
-          <time class="timeline-time" datetime="2026-07-17T09:12:44-03:00">09:12</time>
-        </article>
-
-        <article class="card timeline-item">
-          <span class="activity-symbol trade" aria-hidden="true">↗</span>
-          <div class="activity-copy">
-            <div class="move-head"><h3>Increased BTC perpetual long</h3><span class="status good">Filled</span></div>
-            <p>Hyperliquid · buy 0.10 BTC at $63,201 · maker fill</p>
-            <div class="signed-effects"><span class="signed-effect">position +0.10 BTC</span><span class="signed-effect">fee −$1.26</span></div>
-            <details>
-              <summary>Order evidence</summary>
-              <div class="detail-body"><p>Order ID <code>88421093117</code> · trade ID <code>771209442108</code> · account state and fill reported by Hyperliquid at 08:46:08 ART.</p></div>
-            </details>
-          </div>
-          <time class="timeline-time" datetime="2026-07-17T08:46:08-03:00">08:46</time>
-        </article>
-
-        <article class="card timeline-item">
-          <span class="activity-symbol" aria-hidden="true">+4</span>
-          <div class="activity-copy">
-            <div class="move-head"><h3>Unverified incoming assets hidden</h3><span class="status info">Collapsed</span></div>
-            <p>Four unsolicited token transfers on Base · no contact or recipient suggestions created</p>
-            <details>
-              <summary>Why Bloom collapsed these</summary>
-              <div class="detail-body">Incoming history is attacker-controlled. The assets and exact source evidence remain in JSON, but names, links, and remote images are not promoted into this timeline.</div>
-            </details>
-          </div>
-          <time class="timeline-time" datetime="2026-07-17T07:31:55-03:00">07:31</time>
-        </article>
-      </div>
-    </section>
-
-    <section class="day-group" aria-labelledby="yesterday-heading">
-      <h2 class="day-label" id="yesterday-heading">Yesterday · 16 July</h2>
-      <div class="timeline">
-        <article class="card timeline-item">
-          <span class="activity-symbol security" aria-hidden="true">✓</span>
-          <div class="activity-copy">
-            <div class="move-head"><h3>Revoked USDC spending approval</h3><span class="status good">Finalized</span></div>
-            <p>Polygon · Polymarket Exchange · authority change</p>
-            <div class="signed-effects"><span class="signed-effect">allowance unlimited → 0</span><span class="signed-effect">fee −0.0031 POL</span></div>
-            <details>
-              <summary>Contract and transaction</summary>
-              <div class="detail-body"><p><strong>Spender:</strong> <code>0x4bFb41d5B3570DeFd03C39a9A4D8dE6BD8B8982E</code></p><p><strong>Transaction:</strong> <code>0x1ef05940f12c9dbd13cc5c91d86f0f669b80eaefed640b18710c1ecbd20a072e</code></p></div>
-            </details>
-          </div>
-          <time class="timeline-time" datetime="2026-07-16T18:22:19-03:00">18:22</time>
-        </article>
-      </div>
-    </section>
-
-    <section class="section" aria-label="Coverage statement">
-      <div class="notice"><strong>Recent-only coverage.</strong> Bloom checked its local outboxes, Base and Ethereum address history, Hyperliquid's recent fills, and Polymarket activity. Ethereum history is provider-limited before 1 July; this is not presented as complete lifetime history.</div>
-    </section>
-  </main>
-
-  <footer class="page-footer">
-    <span><strong>Bloom activity concept</strong> · generated from bloom.activity.v1</span>
-    <span>One lifecycle per action · exact evidence one disclosure away</span>
-  </footer>
-</body>
-</html>
+<section class="coverage"><details><summary>Sources, freshness &amp; what is missing</summary><p><strong>Illustrative CoinGecko-style market data</strong> · partial<br>4 eligible tokens of 5 in this example subset; not a global ranking<br>Source time: 2026-09-05T16:59:00Z. Window: 24 hours ending 2026-09-05T16:59:00Z.</p><p><strong>Illustrative DefiLlama-style DEX data</strong> · partial<br>4 covered chains of 5 in this example; Robinhood not covered<br>Source time: 2026-09-05T00:00:00Z. Window: 2026-09-04T00:00:00Z to 2026-09-05T00:00:00Z.</p><p><strong>Illustrative native and Petal observations</strong> · partial<br>10 priced rows; 1 unpriced item; private pool value and Venice credit excluded<br>Source time: 2026-09-05T16:58:00Z. Window: Point observations between 16:58 and 17:00 UTC.</p></details></section>
+</main><footer><span>Illustrative snapshot · 05 Sep 2026, 17:00 UTC<br>example-20260905-1700</span><span><a href="snapshot.md">Text version</a><a href="snapshot.json">Example data</a><a href="states.html">Empty & failure states</a><a href="../2026-07-17-vfs-view-decision.md">Design notes</a></span></footer></div></body></html>
