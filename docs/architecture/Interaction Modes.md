@@ -164,7 +164,11 @@ state. Their installed package documentation defines their mounted routes.
 ## Examples
 
 - EVM transactions stage unsigned bytes, obtain approval when policy requires
-  it, and use Broker/Signer for the final payload signature.
+  it, and use Broker/Signer for the final payload signature. For Petal-originated
+  canonical ERC-20 `transfer(address,uint256)` calls with zero native value,
+  Machine decodes the recipient and amount, reconstructs the calldata through
+  the typed send path, and evaluates token and recipient policy against those
+  verified fields. Other calldata remains a generic contract call.
 - Paid HTTP stages the selected challenge and payment payload, then obtains any
   required signature through Broker/Signer.
 - Installed Polymarket or Hyperliquid Petals use their package-defined mounted
