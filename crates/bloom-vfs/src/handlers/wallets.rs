@@ -1695,7 +1695,15 @@ fn validate_policy_action_id(id: &str) -> Result<(), HandlerError> {
 
 fn tx_open_err(e: TxEngineError) -> HandlerError {
     match e {
-        TxEngineError::ApprovalRequired(_) => HandlerError::PermissionDenied,
+        // Carry the ceremony forward. Collapsing this to a permissions error
+        // told the caller they may not do the thing, when in fact the
+        // requirement was one owner ceremony whose URL was already in hand.
+        TxEngineError::ApprovalRequired(requirement) => HandlerError::ApprovalRequired {
+            action_id: requirement.action_id,
+            ceremony_url: requirement.ceremony_url,
+            expires_ms: requirement.expires_ms,
+            reason: requirement.reason,
+        },
         TxEngineError::PolicyDenied | TxEngineError::BroadcastDisabled(_) => {
             HandlerError::OperationNotPermitted
         }
@@ -2546,7 +2554,10 @@ impl WalletsHandler {
             [s] if s == "balance" || s == "balance.raw" || s == "balance.json" || s == "nonce" => {
                 Ok(Entry::file(s))
             }
-            [s] if s == "pending_external.jsonl" || s == "nonce_conflicts.json" => {
+            [s] if s == "pending_external.jsonl"
+                || s == "nonce_conflicts.json"
+                || s == "policy.json" =>
+            {
                 Ok(Entry::file(s))
             }
             [s] if s == "outbox" => Ok(Entry::dir("outbox")),
@@ -2712,6 +2723,17 @@ impl WalletsHandler {
                 let n = client.nonce(address).await.map_err(err_be)?;
                 Ok(format!("{}\n", n).into_bytes())
             }
+            [s] if s == "policy.json" => {
+                // Answers "what may this wallet send to on this chain", which
+                // the cross-chain canonical document cannot express.
+                let projection = self.wallet_projection(wallet).await?;
+                let value =
+                    crate::effective_chain_policy(&projection, chain, Some(client.spec().chain_id))
+                        .map_err(err_be)?;
+                let mut bytes = serde_json::to_vec_pretty(&value).map_err(err_be)?;
+                bytes.push(b'\n');
+                Ok(bytes)
+            }
             [s, state, id, fname] if s == "outbox" => {
                 let st = parse_state_seg(state)?;
                 // Honour the path's state segment (fix #8): only read from
@@ -2842,6 +2864,7 @@ impl WalletsHandler {
                 Entry::file("nonce"),
                 Entry::file("pending_external.jsonl"),
                 Entry::file("nonce_conflicts.json"),
+                Entry::file("policy.json"),
                 Entry::dir("outbox"),
             ]),
             [s] if s == "outbox" => Ok(Self::outbox_dir_entries()),
@@ -3004,7 +3027,14 @@ impl WalletsHandler {
                         TxEngineError::EnsoQuoteStale { .. } => {
                             HandlerError::invalid(e.to_string())
                         }
-                        TxEngineError::ApprovalRequired(_) => HandlerError::PermissionDenied,
+                        TxEngineError::ApprovalRequired(requirement) => {
+                            HandlerError::ApprovalRequired {
+                                action_id: requirement.action_id,
+                                ceremony_url: requirement.ceremony_url,
+                                expires_ms: requirement.expires_ms,
+                                reason: requirement.reason,
+                            }
+                        }
                         other => err_be(other),
                     })?;
                 Ok(())
@@ -3077,6 +3107,32 @@ impl WalletsHandler {
 }
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn an_approval_requirement_reaches_the_caller_with_its_ceremony() {
+        // Regression: this was flattened to a bare PermissionDenied, so a
+        // caller was told they may not act when the real requirement was one
+        // owner ceremony whose URL the engine already held.
+        let err = tx_open_err(TxEngineError::ApprovalRequired(
+            bloom_tx::ApprovalRequirement {
+                action_id: "evm-abc123".into(),
+                ceremony_url: "http://localhost:18734/ceremony/TOKEN".into(),
+                expires_ms: 1_788_390_973_738,
+                reason: "transaction.confirm needs owner approval".into(),
+            },
+        ));
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("http://localhost:18734/ceremony/TOKEN"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("evm-abc123"), "{rendered}");
+        assert!(rendered.contains("approval required"), "{rendered}");
+        assert!(
+            !matches!(err, HandlerError::PermissionDenied),
+            "approval required is a step in the flow, not a refusal"
+        );
+    }
     use super::*;
     use alloy::primitives::Address;
     use bloom_broker_api::{

@@ -148,6 +148,25 @@ then performs Signer's policy compare-and-swap against the authenticated
 baseline. Changed bytes require a distinct operation and fresh review. A stale
 baseline fails the compare-and-swap rather than overwriting concurrent policy.
 
+### Reading policy for one chain
+
+To answer "can this wallet send on this chain?", read the per-chain
+projection rather than filtering the whole document yourself:
+
+```sh
+cat wallets/<wallet>/chains/<chain>/policy.json
+```
+
+It carries an `effect` of `allowlist` or `deny_all`, the destinations that
+apply to that chain, and a plain-language `summary`. A wallet with no
+destinations on a chain is `deny_all`, and every send there is denied until
+one is added — which is a policy update, so it crosses a ceremony.
+
+The file is **read-only and advisory**. Broker re-enforces the canonical
+snapshot before any signature, so this projection never grants authority, and
+it says so in its own `note`. `wallets/<wallet>/policy.json` remains the only
+writable policy surface.
+
 `status.json` and `approval_challenge.json` are read-only Machine projections.
 They expose operation identity, review digest, ceremony status, retry guidance,
 and the public commit outcome. The completed custody receipt remains on the
