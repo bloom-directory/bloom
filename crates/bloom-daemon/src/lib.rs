@@ -19,7 +19,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use alloy::network::TransactionBuilder;
 use alloy::primitives::{Address, Bytes, U256};
 use alloy::rpc::types::eth::TransactionRequest;
-use bloom_evm::{ChainClient, ChainRegistry};
+use alloy::sol_types::SolCall;
+use bloom_evm::{ChainClient, ChainRegistry, IERC20};
 
 use bloom_ens::EnsClient;
 use bloom_etherscan::EtherscanClient;
@@ -2036,6 +2037,7 @@ impl PetalHost for DaemonPetalHost {
             .value_wei
             .parse::<U256>()
             .map_err(|error| HostError::Invalid(format!("value-wei: {error}")))?;
+        let typed_erc20_transfer = decode_petal_erc20_transfer(&req, requested_value)?;
         // Keep pending-action reuse and staging atomic within the daemon. Without
         // this guard, concurrent retries can both miss the pending scan.
         let _stage_guard = self.tx_stage_lock.lock().await;
@@ -2073,10 +2075,19 @@ impl PetalHost for DaemonPetalHost {
                 &req.wallet,
                 wallet_address,
                 RawIntent {
-                    body: RawIntentBody::Raw {
-                        to: req.to,
-                        value: format!("{} wei", req.value_wei),
-                        data: req.data_hex,
+                    body: match typed_erc20_transfer {
+                        Some((recipient, amount)) => RawIntentBody::Send {
+                            to: bloom_proto::checksum_address(&recipient),
+                            value: "0".into(),
+                            token: Some(req.to),
+                            amount: format!("{amount} base"),
+                            data: None,
+                        },
+                        None => RawIntentBody::Raw {
+                            to: req.to,
+                            value: format!("{} wei", req.value_wei),
+                            data: req.data_hex,
+                        },
                     },
                     chain: Some(req.chain.clone()),
                     gas: GasStrategy::Auto,
@@ -2370,6 +2381,30 @@ fn parse_petal_hex_bytes(value: &str, field: &str) -> Result<Vec<u8>, HostError>
         )));
     }
     hex::decode(value).map_err(|e| HostError::Invalid(format!("{field}: {e}")))
+}
+
+/// Recognize the one contract-call shape whose policy semantics Bloom can
+/// verify without trusting Petal-authored labels: canonical ERC-20
+/// `transfer(address,uint256)`. The transaction engine reconstructs the
+/// calldata from these decoded fields and reads token metadata onchain before
+/// classifying it as an ERC-20 transfer. Everything else remains a generic
+/// contract call.
+fn decode_petal_erc20_transfer(
+    request: &EvmTransactionRequest,
+    requested_value: U256,
+) -> Result<Option<(Address, U256)>, HostError> {
+    if !requested_value.is_zero() {
+        return Ok(None);
+    }
+    let calldata = parse_petal_hex_bytes(&request.data_hex, "data-hex")?;
+    if calldata.len() != IERC20::transferCall::SELECTOR.len() + 64
+        || !calldata.starts_with(&IERC20::transferCall::SELECTOR)
+    {
+        return Ok(None);
+    }
+    let call = IERC20::transferCall::abi_decode(&calldata)
+        .map_err(|error| HostError::Invalid(format!("ERC-20 transfer calldata: {error}")))?;
+    Ok(Some((call.to, call.amount)))
 }
 
 fn petal_pending_request_matches(
@@ -4310,6 +4345,60 @@ mod tests {
     use bloom_vfs::VfsPath;
     use bloom_vfs::handler::Handler;
     use bloom_vfs::handler::{Entry, HandlerError};
+
+    fn petal_evm_request(value_wei: &str, data_hex: String) -> EvmTransactionRequest {
+        EvmTransactionRequest {
+            wallet: "alice".into(),
+            chain: "anvil".into(),
+            to: "0x0000000000000000000000000000000000000010".into(),
+            value_wei: value_wei.into(),
+            data_hex,
+            nonce: None,
+            max_fee_per_gas: None,
+            max_priority_fee_per_gas: None,
+            context: None,
+        }
+    }
+
+    #[test]
+    fn petal_erc20_transfer_is_decoded_only_from_the_exact_canonical_shape() {
+        let recipient: Address = "0x0000000000000000000000000000000000000020"
+            .parse()
+            .unwrap();
+        let calldata = IERC20::transferCall {
+            to: recipient,
+            amount: U256::from(42_u64),
+        }
+        .abi_encode();
+        let request = petal_evm_request("0", format!("0x{}", hex::encode(&calldata)));
+
+        assert_eq!(
+            decode_petal_erc20_transfer(&request, U256::ZERO).unwrap(),
+            Some((recipient, U256::from(42_u64)))
+        );
+
+        let mut trailing = calldata;
+        trailing.push(0);
+        let request = petal_evm_request("0", format!("0x{}", hex::encode(trailing)));
+        assert_eq!(
+            decode_petal_erc20_transfer(&request, U256::ZERO).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn value_bearing_transfer_shaped_calls_remain_generic() {
+        let calldata = IERC20::transferCall {
+            to: Address::ZERO,
+            amount: U256::from(1_u64),
+        }
+        .abi_encode();
+        let request = petal_evm_request("1", format!("0x{}", hex::encode(calldata)));
+        assert_eq!(
+            decode_petal_erc20_transfer(&request, U256::from(1_u64)).unwrap(),
+            None
+        );
+    }
 
     #[test]
     fn batch_approval_requirement_preserves_owner_launch_fields() {
