@@ -34,7 +34,7 @@ use bloom_broker_api::ProtocolErrorCode;
 use bloom_evm::ChainRegistry;
 use bloom_machine_client::WalletProjection;
 use bloom_machine_client::{MachineBrokerClient, WalletProjectionReader};
-use bloom_proto::{AddressBook, CapabilityViewEntry, HomeWritePermit, Policy, RawIntent};
+use bloom_proto::{AddressBook, HomeWritePermit, Policy, RawIntent};
 use bloom_tx::{
     intent_parser,
     outbox::OutboxState,
@@ -340,71 +340,6 @@ impl WalletsHandler {
         let mut out = serde_json::to_vec_pretty(&body).map_err(err_be)?;
         out.push(b'\n');
         Ok(out)
-    }
-
-    fn evm_capability_views_for(&self, _wallet: &str) -> Vec<CapabilityViewEntry> {
-        Vec::new()
-    }
-
-    fn all_capability_views_for(&self, wallet: &str) -> Vec<CapabilityViewEntry> {
-        let mut all = self.evm_capability_views_for(wallet);
-        all.sort_by(|a, b| {
-            a.created_ms
-                .cmp(&b.created_ms)
-                .then_with(|| a.id.cmp(&b.id))
-        });
-        all
-    }
-
-    fn capabilities_active_json(&self, wallet: &str) -> Result<Vec<u8>, HandlerError> {
-        let entries = self.all_capability_views_for(wallet);
-        let mut out = serde_json::to_vec_pretty(&entries).map_err(err_be)?;
-        out.push(b'\n');
-        Ok(out)
-    }
-
-    fn capabilities_active_md(&self, wallet: &str) -> Result<Vec<u8>, HandlerError> {
-        let entries = self.all_capability_views_for(wallet);
-        let mut md = String::new();
-        md.push_str(&format!("# Capabilities for `{wallet}`\n\n"));
-        if entries.is_empty() {
-            md.push_str("No active capabilities.\n\n");
-            md.push_str(&format!(
-                "Manage reusable authority at `/wallets/{wallet}/sealed-approvals/`.\n"
-            ));
-        } else {
-            for c in &entries {
-                md.push_str(&format!(
-                    "## {} ({})\n\n",
-                    c.id,
-                    serde_json::to_value(&c.venue)
-                        .ok()
-                        .and_then(|value| value.as_str().map(str::to_owned))
-                        .unwrap_or_else(|| "unknown".to_owned()),
-                ));
-                md.push_str(&format!("- **Signing model:** {:?}\n", c.signing_model));
-                md.push_str(&format!("- **Status:** {:?}\n", c.status));
-                if let Some(secs) = c.expires_in_secs {
-                    md.push_str(&format!("- **Expires in:** {secs}s\n"));
-                }
-                md.push_str(&format!("- **Next write:** `{}`\n", c.next_write_path));
-                md.push_str(&format!("- **Stop:** `{}`\n", c.revoke_path));
-                if !c.allowed.is_empty() {
-                    md.push_str("- **Allowed:**\n");
-                    for a in &c.allowed {
-                        md.push_str(&format!("  - {a}\n"));
-                    }
-                }
-                if !c.denied.is_empty() {
-                    md.push_str("- **Denied:**\n");
-                    for d in &c.denied {
-                        md.push_str(&format!("  - {d}\n"));
-                    }
-                }
-                md.push('\n');
-            }
-        }
-        Ok(md.into_bytes())
     }
 
     fn write_permit(&self) -> Result<&HomeWritePermit, HandlerError> {
@@ -1963,7 +1898,6 @@ impl WalletsHandler {
             Entry::dir("chains"),
             Entry::dir("sealed-approvals"),
             Entry::dir("policy-updates"),
-            Entry::dir("capabilities"),
         ]
     }
 
@@ -2491,12 +2425,6 @@ impl WalletsHandler {
                 }
                 _ => Err(HandlerError::not_found(path.to_string_path())),
             },
-            "capabilities" => match segs.len() {
-                2 => Ok(Entry::dir("capabilities")),
-                3 if segs[2] == "active.json" => Ok(Entry::file("active.json")),
-                3 if segs[2] == "active.md" => Ok(Entry::file("active.md")),
-                _ => Err(HandlerError::not_found(path.to_string_path())),
-            },
             _ => Err(HandlerError::not_found(path.to_string_path())),
         }
     }
@@ -2630,12 +2558,6 @@ impl WalletsHandler {
                     .reconcile_triad_policy_projection(wallet, &segs[2], &segs[3])
                     .await?;
                 self.policy_update_status_json(wallet, &state, &segs[3])
-            }
-            "capabilities" if segs.len() == 3 && segs[2] == "active.json" => {
-                self.capabilities_active_json(wallet)
-            }
-            "capabilities" if segs.len() == 3 && segs[2] == "active.md" => {
-                self.capabilities_active_md(wallet)
             }
             _ => Err(HandlerError::NotAFile(path.to_string_path())),
         }

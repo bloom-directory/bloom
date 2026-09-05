@@ -34,9 +34,8 @@ bloom gatekeeps every value-moving action through capabilities:
 
 To see what a wallet can do without a human, check its per-chain state, outbox,
 and the mounted capability views of installed Petals.
-A read-only `wallets/<wallet>/capabilities/` roll-up and a VFS-root `next.md`
-aggregator expose the current capability and next-action view when the daemon
-has the relevant handlers mounted.
+A VFS-root `next.md` aggregator exposes the current next-action view when the
+daemon has the relevant handlers mounted.
 
 ## Wallets
 
