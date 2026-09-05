@@ -64,7 +64,7 @@ fn mainnet_spec(endpoint: &str) -> SolanaSpec {
             max_rps: None,
             http_only: false,
         }],
-        expected_genesis_hex: Some(MAINNET_BETA_GENESIS_HASH.to_string()),
+        expected_genesis_base58: Some(MAINNET_BETA_GENESIS_HASH.to_string()),
         allow_broadcast: true,
     }
 }

@@ -303,7 +303,9 @@ impl SolanaClient {
     /// Every configured endpoint must first prove the pinned genesis. The
     /// transaction is then sent exactly once through the highest-priority
     /// endpoint; an ambiguous response is reconciled by signature and is never
-    /// retried by the transport.
+    /// retried by the transport. Mainnet-beta remains unconditionally blocked
+    /// here; only [`Self::send_mainnet_canary_transaction`] can consume the
+    /// canary authorization in a canary build.
     pub async fn send_transaction(&self, tx_b64: &str) -> Result<String, SolanaRpcError> {
         if !self.inner.allow_broadcast {
             return Err(SolanaRpcError::Invalid(format!(
@@ -321,6 +323,11 @@ impl SolanaClient {
                     self.chain_name()
                 ))
             })?;
+        if expected == crate::MAINNET_BETA_GENESIS_HASH {
+            return Err(SolanaRpcError::Invalid(
+                "broadcast to Solana mainnet-beta is disabled".into(),
+            ));
+        }
         self.inner
             .rpc
             .call_raw_after_genesis_check(
@@ -365,12 +372,16 @@ impl SolanaClient {
                 self.chain_name()
             )));
         }
-        let expected = self.inner.expected_genesis_hex.as_deref().ok_or_else(|| {
-            SolanaRpcError::Invalid(format!(
-                "chain '{}' cannot broadcast without an expected genesis hash",
-                self.chain_name()
-            ))
-        })?;
+        let expected = self
+            .inner
+            .expected_genesis_base58
+            .as_deref()
+            .ok_or_else(|| {
+                SolanaRpcError::Invalid(format!(
+                    "chain '{}' cannot broadcast without an expected genesis hash",
+                    self.chain_name()
+                ))
+            })?;
         if expected != crate::MAINNET_BETA_GENESIS_HASH {
             return Err(SolanaRpcError::Invalid(
                 "mainnet canary send requires the pinned mainnet-beta genesis".into(),
