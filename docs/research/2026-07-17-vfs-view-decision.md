@@ -1,13 +1,25 @@
 # Bloom views: understand the market, your wallet, and what comes next
 
-Research for #114. Revised 5 September 2026. **Design, working offline prototypes, and an optional read-only
-capture from a running daemon; no new runtime VFS routes.** This replaces the six July specifications.
+Research for #114. Revised 5 September 2026. **Design, working offline prototypes, an optional read-only
+capture from a running daemon, and the first runtime VFS view.** This replaces the six July specifications.
 The decision is made here; there is no questionnaire or approval prerequisite.
 
 Open [Today](vfs-view-mockups/index.html) in a browser. Follow Markets → Chains →
 Wallet → Next moves → transfer review → Activity. Every page explicitly uses
 fictional data. [Failure and empty states](vfs-view-mockups/states.html) are part
 of the prototype, not an implementation footnote.
+
+## Rendered review gallery
+
+These are current captures of the committed pages, using fictional data:
+
+| Today | Activity |
+| --- | --- |
+| ![Today wallet briefing](vfs-view-mockups/preview.png) | ![Wallet activity and outcomes](vfs-view-mockups/preview-activity.png) |
+
+| Next moves | Receive |
+| --- | --- |
+| ![Prioritized wallet next moves](vfs-view-mockups/preview-next-moves.png) | ![Network-qualified receiving guidance](vfs-view-mockups/preview-receive.png) |
 
 ## Product decision
 
@@ -189,11 +201,11 @@ Broker; this PR does not design a new keystore export, backup checker, or raw-ke
 viewer. Agent-readable HTML never includes secret material or ceremony tokens in
 shared/exported snapshots.
 
-## Minimal implementation contract (proposed, not mounted today)
+## Minimal implementation contract
 
 | Candidate view | Proposed location | Existing inputs to reuse |
 | --- | --- | --- |
-| Today | `/wallets/<wallet>/overview.{json,md,html}` | Wallet, next actions, bounded market observations |
+| Today | `/wallets/<wallet>/overview.{json,md,html}` | **Mounted here:** public wallet identity, native balances, read coverage, and outbox counts |
 | Markets | `/markets/overview.{json,md,html}` | New market read adapter; existing prices for wallet valuation |
 | Chains | `/markets/chains.{json,md,html}` | New DEX-volume adapter + existing chain-health reads |
 | Wallet | `/wallets/<wallet>/portfolio.{json,md,html}` | Native balances and supported Petal reads |
@@ -255,8 +267,9 @@ Serve locally with `python3 -m http.server 8118 --bind 127.0.0.1` or open `index
 The committed HTML is directly reviewable without running a build.
 
 Browser verification and any limitations are recorded in the PR description.
-Runtime adapter acceptance above remains future work, not a claim that research
-fixtures exercise live RPCs, production signing, or actual provider availability.
+The first runtime slice is exercised directly in `bloom-vfs` tests. Broader
+market, token, and Petal adapters remain future work; the research fixtures do
+not claim to exercise production signing or actual provider availability.
 
 ## Run against an actual wallet
 
