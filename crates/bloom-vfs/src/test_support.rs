@@ -74,6 +74,7 @@ pub(crate) fn wallet_projection_reader(
             canonical_public_key: Base64UrlBytes::from_bytes(&[2; 33]),
             addresses: vec![address.to_owned()],
             supported_crypto_suites: vec![CryptoSuite::Secp256k1Keccak256Recoverable],
+            petal_scope_expires_at_ms: None,
         }],
         credentials: Vec::<CredentialPublic>::new(),
         policy: SignedPolicySnapshot {

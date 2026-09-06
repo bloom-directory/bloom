@@ -174,6 +174,7 @@ impl MultiAccountBroker {
             canonical_public_key: Base64UrlBytes::from_bytes(&spki(&child.pubkey)),
             addresses: vec![child.address.clone()],
             supported_crypto_suites: vec![CryptoSuite::Ed25519Message],
+            petal_scope_expires_at_ms: None,
         }
     }
 

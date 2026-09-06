@@ -3030,6 +3030,7 @@ mod tests {
                             canonical_public_key: Base64UrlBytes::from_bytes(&[2; 33]),
                             addresses: vec!["0x0000000000000000000000000000000000000001".into()],
                             supported_crypto_suites,
+                            petal_scope_expires_at_ms: None,
                         }))
                     }
                     MachineBrokerRequest::SigningSign(request) => {

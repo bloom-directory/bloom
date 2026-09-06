@@ -4656,6 +4656,7 @@ mod tests {
                 canonical_public_key: Base64UrlBytes::from_bytes(&[3; 33]),
                 addresses: vec![format!("{address:#x}")],
                 supported_crypto_suites: vec![CryptoSuite::Secp256k1Keccak256Recoverable],
+                petal_scope_expires_at_ms: None,
             }],
             credentials: Vec::<CredentialPublic>::new(),
             policy: SignedPolicySnapshot {

@@ -4700,6 +4700,7 @@ mod tests {
                             supported_crypto_suites: vec![
                                 CryptoSuite::Secp256k1Keccak256Recoverable,
                             ],
+                            petal_scope_expires_at_ms: None,
                         }))
                     }
                     MachineBrokerRequest::SealedApprovalPrepare(request) => {

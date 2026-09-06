@@ -88,6 +88,7 @@ impl ExactSigningBrokerFixture {
             canonical_public_key: Base64UrlBytes::from_bytes(self.signer.public_key().as_slice()),
             addresses: vec![format!("{:#x}", self.signer.address())],
             supported_crypto_suites: vec![CryptoSuite::Secp256k1Keccak256Recoverable],
+            petal_scope_expires_at_ms: None,
         }
     }
 
