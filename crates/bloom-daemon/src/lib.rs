@@ -1162,6 +1162,13 @@ impl PetalHost for DaemonPetalHost {
                 let mut comparable = public.clone();
                 comparable.petal_scope_expires_at_ms =
                     previous_public.petal_scope_expires_at_ms.clone();
+                if previous_public.addresses.is_empty() {
+                    // Older Signers projected scoped Ed25519 keys without
+                    // their deterministic Solana address. Accept only that
+                    // one-way metadata repair; a changed non-empty address
+                    // remains a conflict.
+                    comparable.addresses.clear();
+                }
                 if comparable != previous_public
                     || !scope
                         .allowed_crypto_suites
@@ -5898,6 +5905,14 @@ mod tests {
                 .load(std::sync::atomic::Ordering::SeqCst),
             2
         );
+
+        let mut legacy_owner_status = restaged_owner_status;
+        legacy_owner_status["public_key"]["addresses"] = serde_json::json!([]);
+        std::fs::write(
+            &state_path,
+            serde_json::to_vec(&legacy_owner_status).unwrap(),
+        )
+        .unwrap();
 
         fixture
             .approval_expired
