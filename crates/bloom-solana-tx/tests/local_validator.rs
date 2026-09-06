@@ -105,6 +105,7 @@ impl MachineBrokerService for BrokerFixture {
                         canonical_public_key: Base64UrlBytes::from_bytes(&self.child_pubkey()),
                         addresses: vec![],
                         supported_crypto_suites: vec![CryptoSuite::Ed25519Message],
+                        petal_scope_expires_at_ms: None,
                     }))
                 }
                 MachineBrokerRequest::SigningSign(sign_request) => {

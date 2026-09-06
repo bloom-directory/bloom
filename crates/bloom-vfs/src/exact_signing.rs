@@ -931,6 +931,7 @@ mod tests {
                                 CryptoSuite::Secp256k1Keccak256Recoverable,
                                 CryptoSuite::Secp256k1Sha256Recoverable,
                             ],
+                            petal_scope_expires_at_ms: None,
                         }))
                     }
                     MachineBrokerRequest::SealedApprovalPrepare(request) => {

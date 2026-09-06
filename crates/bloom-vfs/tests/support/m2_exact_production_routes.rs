@@ -58,6 +58,7 @@ impl MachineBrokerService for ExactBroker {
                         canonical_public_key: Base64UrlBytes::from_bytes(&[3; 33]),
                         addresses: Vec::new(),
                         supported_crypto_suites: vec![CryptoSuite::Secp256k1Keccak256Recoverable],
+                        petal_scope_expires_at_ms: None,
                     }))
                 }
                 MachineBrokerRequest::SealedApprovalPrepare(request) => Ok(
@@ -154,6 +155,7 @@ fn projection(address: String) -> (WalletPublic, Arc<dyn WalletProjectionReader>
             canonical_public_key: Base64UrlBytes::from_bytes(&[3; 33]),
             addresses: vec![address],
             supported_crypto_suites: vec![CryptoSuite::Secp256k1Keccak256Recoverable],
+            petal_scope_expires_at_ms: None,
         }],
         credentials: Vec::<CredentialPublic>::new(),
         policy: SignedPolicySnapshot {
