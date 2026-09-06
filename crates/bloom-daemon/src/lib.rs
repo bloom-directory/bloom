@@ -644,6 +644,7 @@ impl DaemonPetalHost {
         broker
             .prepare_approval(bloom_broker_api::ApprovalPrepareRequest {
                 evm_review_payloads: Vec::new(),
+                safe_review_payloads: Vec::new(),
                 operation_id,
                 terms,
                 canonical_plan_facts_digest: plan_digest,
@@ -1645,6 +1646,11 @@ impl PetalHost for DaemonPetalHost {
                     &trusted_subject,
                     &claim,
                     req.claim_assurance_evidence.as_deref(),
+                    if req.operation_class == "safe.transaction.confirm" {
+                        req.action.as_deref()
+                    } else {
+                        None
+                    },
                 )
                 .await
                 .map_err(|reason| {
