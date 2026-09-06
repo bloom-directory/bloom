@@ -16,6 +16,7 @@
 //! - `wallets/<wallet>/addresses.json`                              — owner/signer + role addresses
 //! - `wallets/<wallet>/public_key`                                  — secp256k1 pubkey hex
 //! - `wallets/<wallet>/kind`                                        — local/watch
+//! - `wallets/<wallet>/overview.{json,md,html}`                     — one cached read-only wallet snapshot
 //! - `wallets/<wallet>/policy.json`                                 — canonical triad policy
 //! - `wallets/<wallet>/sealed-approvals/*`                          — Broker approval lifecycle
 //! - `wallets/<wallet>/chains/<chain>/{balance,balance.raw,balance.json}` — native balance
@@ -26,8 +27,10 @@
 //! - `wallets/<wallet>/chains/<chain>/outbox/sent/<id>/<file>`      — read sent
 //! - `wallets/<wallet>/chains/<chain>/outbox/failed/<id>/<file>`    — read failed
 
+use std::fmt::Write as _;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use bloom_broker_api::ProtocolErrorCode;
@@ -40,6 +43,7 @@ use bloom_tx::{
     outbox::OutboxState,
     tx_engine::{TxEngine, TxEngineError},
 };
+use futures::stream::{self, StreamExt};
 use qrcode::QrCode;
 use qrcode::render::svg;
 use qrcode::types::Color as QrColor;
@@ -49,6 +53,8 @@ use crate::path::VfsPath;
 
 const APPROVAL_CHALLENGE_FILE: &str = "approval_challenge.json";
 const WALLET_POLICY_SURFACE: &str = "wallet-policy";
+const WALLET_OVERVIEW_SCHEMA: &str = "bloom.wallet_overview.v1";
+const WALLET_OVERVIEW_TTL: Duration = Duration::from_secs(5);
 /// Lifecycle states for a staged wallet-policy update, mirroring the
 /// `/outbox/{pending,sent,failed}` stage/confirm structure. A policy update is
 /// `pending` while it carries an unconsumed challenge, `confirmed` once the
@@ -94,6 +100,56 @@ struct WalletRegistrationProjection {
     ceremony_url: Option<String>,
     ceremony_expires_at_ms: Option<bloom_broker_api::DecimalU64>,
     signer_contribution_digest: bloom_broker_api::Digest32,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+struct WalletOverviewSnapshot {
+    schema: &'static str,
+    snapshot_id: String,
+    captured_at_ms: u64,
+    wallet: WalletOverviewIdentity,
+    chains: Vec<WalletOverviewChain>,
+    coverage: WalletOverviewCoverage,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+struct WalletOverviewIdentity {
+    id: String,
+    kind: String,
+    owner: String,
+    projection_observed_at_ms: u64,
+    projection_freshness: String,
+    projection_verification: String,
+    policy_version: u64,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+struct WalletOverviewChain {
+    name: String,
+    display_name: String,
+    chain_id: u64,
+    native_asset: String,
+    balance_status: &'static str,
+    balance_raw: Option<String>,
+    balance_formatted: Option<String>,
+    balance_display: Option<String>,
+    pending_actions: Option<usize>,
+    sent_actions: Option<usize>,
+    failed_actions: Option<usize>,
+    source: String,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+struct WalletOverviewCoverage {
+    complete: bool,
+    available_chains: usize,
+    unavailable_chains: usize,
+    note: &'static str,
+}
+
+struct CachedWalletOverview {
+    inserted: Instant,
+    snapshot: WalletOverviewSnapshot,
 }
 
 impl TriadPolicyUpdateProjection {
@@ -149,6 +205,10 @@ pub struct WalletsHandler {
     pub wallet_projections: Option<Arc<dyn WalletProjectionReader>>,
     /// Machine-owned workflow projections; never a Broker or Signer state root.
     policy_projection_root: std::path::PathBuf,
+    /// Keeps sibling JSON, Markdown, and HTML reads on one observation for a
+    /// short mounted-filesystem burst instead of silently mixing chain heads.
+    overview_cache:
+        Arc<tokio::sync::Mutex<std::collections::BTreeMap<String, CachedWalletOverview>>>,
 }
 
 impl WalletsHandler {
@@ -168,6 +228,7 @@ impl WalletsHandler {
             broker: None,
             wallet_projections: Some(wallet_projections),
             policy_projection_root: policy_projection_root.into(),
+            overview_cache: Arc::new(tokio::sync::Mutex::new(std::collections::BTreeMap::new())),
         }
     }
 
@@ -271,6 +332,133 @@ impl WalletsHandler {
         let mut out = serde_json::to_vec_pretty(&body).map_err(err_be)?;
         out.push(b'\n');
         Ok(out)
+    }
+
+    async fn wallet_overview(&self, wallet: &str) -> Result<WalletOverviewSnapshot, HandlerError> {
+        // Hold this lock while refreshing so concurrent sibling reads coalesce
+        // onto the exact same observation. The cache contains public data only.
+        let mut cache = self.overview_cache.lock().await;
+        if let Some(cached) = cache.get(wallet)
+            && cached.inserted.elapsed() <= WALLET_OVERVIEW_TTL
+        {
+            return Ok(cached.snapshot.clone());
+        }
+
+        let projection = self.wallet_projection(wallet).await?;
+        let owner = projection.primary_address().map_err(err_be)?.to_owned();
+        let address: alloy::primitives::Address = owner.parse().map_err(|error| {
+            HandlerError::backend(format!("invalid projected address: {error}"))
+        })?;
+        let chain_reads = self.chains.list_names().into_iter().map(|name| {
+            let client = self
+                .chains
+                .get(&name)
+                .expect("listed chain remains registered");
+            async move {
+                let spec = client.spec().clone();
+                let balance = client.balance(address).await;
+                (name, spec, balance)
+            }
+        });
+        let mut chain_reads = stream::iter(chain_reads)
+            .buffer_unordered(4)
+            .collect::<Vec<_>>()
+            .await;
+        chain_reads.sort_by(|left, right| left.0.cmp(&right.0));
+
+        let mut chains = Vec::new();
+        for (name, spec, balance) in chain_reads {
+            let (balance_status, balance_raw, balance_formatted, balance_display) = match balance {
+                Ok(raw) => {
+                    let formatted = bloom_proto::format_units(raw, spec.native_decimals);
+                    (
+                        "available",
+                        Some(raw.to_string()),
+                        Some(formatted.clone()),
+                        Some(format!("{formatted} {}", spec.native_symbol)),
+                    )
+                }
+                Err(error) => {
+                    tracing::debug!(wallet, chain = %name, error = %error, "wallet_overview.balance_unavailable");
+                    ("unavailable", None, None, None)
+                }
+            };
+            let action_count = |state| {
+                self.tx_engine
+                    .outbox
+                    .list(wallet, &name, state)
+                    .ok()
+                    .map(|v| v.len())
+            };
+            chains.push(WalletOverviewChain {
+                display_name: spec.display_name.unwrap_or_else(|| name.clone()),
+                chain_id: spec.chain_id,
+                native_asset: spec.native_symbol,
+                balance_status,
+                balance_raw,
+                balance_formatted,
+                balance_display,
+                pending_actions: action_count(OutboxState::Pending),
+                sent_actions: action_count(OutboxState::Sent),
+                failed_actions: action_count(OutboxState::Failed),
+                source: format!("/wallets/{wallet}/chains/{name}/balance.json"),
+                name,
+            });
+        }
+
+        let available_chains = chains
+            .iter()
+            .filter(|chain| chain.balance_status == "available")
+            .count();
+        let captured_at_ms = now_ms_u64();
+        let identity = WalletOverviewIdentity {
+            id: projection.wallet.wallet_id.as_str().to_owned(),
+            kind: projection.wallet.wallet_kind.as_str().to_owned(),
+            owner,
+            projection_observed_at_ms: projection.observed_at_ms,
+            projection_freshness: format!("{:?}", projection.freshness).to_ascii_lowercase(),
+            projection_verification: "authenticated_broker".to_owned(),
+            policy_version: projection.wallet.policy_version.get(),
+        };
+        let coverage = WalletOverviewCoverage {
+            complete: available_chains == chains.len(),
+            available_chains,
+            unavailable_chains: chains.len() - available_chains,
+            note: "Native balances are independent observations and are not an atomic cross-chain total. Token and position balances are not included.",
+        };
+        let snapshot_seed = serde_json::to_vec(&(&captured_at_ms, &identity, &chains, &coverage))
+            .map_err(err_be)?;
+        let snapshot = WalletOverviewSnapshot {
+            schema: WALLET_OVERVIEW_SCHEMA,
+            snapshot_id: format!("wallet-overview-{}", blake3::hash(&snapshot_seed).to_hex()),
+            captured_at_ms,
+            wallet: identity,
+            chains,
+            coverage,
+        };
+        cache.insert(
+            wallet.to_owned(),
+            CachedWalletOverview {
+                inserted: Instant::now(),
+                snapshot: snapshot.clone(),
+            },
+        );
+        Ok(snapshot)
+    }
+
+    async fn wallet_overview_json(&self, wallet: &str) -> Result<Vec<u8>, HandlerError> {
+        let mut out =
+            serde_json::to_vec_pretty(&self.wallet_overview(wallet).await?).map_err(err_be)?;
+        out.push(b'\n');
+        Ok(out)
+    }
+
+    async fn wallet_overview_md(&self, wallet: &str) -> Result<Vec<u8>, HandlerError> {
+        Ok(render_wallet_overview_md(&self.wallet_overview(wallet).await?).into_bytes())
+    }
+
+    async fn wallet_overview_html(&self, wallet: &str) -> Result<Vec<u8>, HandlerError> {
+        Ok(render_wallet_overview_html(&self.wallet_overview(wallet).await?).into_bytes())
     }
 
     fn evm_capability_views_for(&self, _wallet: &str) -> Vec<CapabilityViewEntry> {
@@ -1655,6 +1843,9 @@ impl WalletsHandler {
             Entry::file("public_key"),
             Entry::file("kind"),
             Entry::file("projection.json"),
+            Entry::file("overview.json"),
+            Entry::file("overview.md"),
+            Entry::file("overview.html"),
             Entry::writable_file("policy.json"),
             Entry::dir("chains"),
             Entry::dir("sealed-approvals"),
@@ -1675,6 +1866,153 @@ impl WalletsHandler {
 
 fn err_be(e: impl std::fmt::Display) -> HandlerError {
     HandlerError::backend(e.to_string())
+}
+
+fn markdown_cell(value: &str) -> String {
+    value
+        .replace(['\r', '\n'], " ")
+        .replace('|', "\\|")
+        .replace('`', "\\`")
+}
+
+fn html_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
+}
+
+fn optional_count(value: Option<usize>) -> String {
+    value.map_or_else(|| "unknown".to_owned(), |count| count.to_string())
+}
+
+fn render_wallet_overview_md(snapshot: &WalletOverviewSnapshot) -> String {
+    let pending: Option<usize> = snapshot
+        .chains
+        .iter()
+        .map(|chain| chain.pending_actions)
+        .sum();
+    let mut out = format!(
+        "# Wallet `{}`\n\nSnapshot `{}` captured at `{}` ms. \
+         [Open the visual overview](overview.html).\n\n\
+         - **Address:** `{}`\n\
+         - **Kind:** `{}`\n\
+         - **Wallet projection:** {} (observed at `{}` ms)\n\
+         - **Pending actions:** {} — inspect [`/next.md`](../../next.md) before acting\n\n\
+         ## Native balances\n\n\
+         | Network | Balance | Pending | Sent | Failed | Source |\n\
+         | --- | ---: | ---: | ---: | ---: | --- |\n",
+        markdown_cell(&snapshot.wallet.id),
+        snapshot.snapshot_id,
+        snapshot.captured_at_ms,
+        markdown_cell(&snapshot.wallet.owner),
+        markdown_cell(&snapshot.wallet.kind),
+        snapshot.wallet.projection_freshness,
+        snapshot.wallet.projection_observed_at_ms,
+        optional_count(pending),
+    );
+    for chain in &snapshot.chains {
+        let balance = chain.balance_display.as_deref().unwrap_or("Unavailable");
+        let _ = writeln!(
+            out,
+            "| {} | {} | {} | {} | {} | [`balance.json`]({}) |",
+            markdown_cell(&chain.display_name),
+            markdown_cell(balance),
+            optional_count(chain.pending_actions),
+            optional_count(chain.sent_actions),
+            optional_count(chain.failed_actions),
+            markdown_cell(
+                chain
+                    .source
+                    .trim_start_matches(&format!("/wallets/{}/", snapshot.wallet.id))
+            ),
+        );
+    }
+    if snapshot.chains.is_empty() {
+        out.push_str("| No configured networks | — | — | — | — | — |\n");
+    }
+    let _ = write!(
+        out,
+        "\n## Coverage\n\n{} of {} configured network balance reads succeeded. {}\n\n\
+         This is a read-only presentation. Use the existing staged outbox and Broker-owned \
+         ceremonies for any value-moving action. [Inspect exact snapshot data](overview.json).\n",
+        snapshot.coverage.available_chains,
+        snapshot.chains.len(),
+        snapshot.coverage.note,
+    );
+    out
+}
+
+fn render_wallet_overview_html(snapshot: &WalletOverviewSnapshot) -> String {
+    let pending: Option<usize> = snapshot
+        .chains
+        .iter()
+        .map(|chain| chain.pending_actions)
+        .sum();
+    let mut cards = String::new();
+    for chain in &snapshot.chains {
+        let balance = chain.balance_display.as_deref().unwrap_or("Unavailable");
+        let class = if chain.balance_status == "available" {
+            ""
+        } else {
+            " unavailable"
+        };
+        let _ = write!(
+            cards,
+            "<article class=\"network{class}\"><div><p class=\"eyebrow\">{}</p>\
+             <h2>{}</h2></div><p class=\"balance\">{}</p>\
+             <dl><div><dt>Pending</dt><dd>{}</dd></div><div><dt>Sent</dt><dd>{}</dd></div>\
+             <div><dt>Failed</dt><dd>{}</dd></div></dl>\
+             <a href=\"chains/{}/balance.json\">Inspect source</a></article>",
+            html_escape(&chain.native_asset),
+            html_escape(&chain.display_name),
+            html_escape(balance),
+            optional_count(chain.pending_actions),
+            optional_count(chain.sent_actions),
+            optional_count(chain.failed_actions),
+            html_escape(&chain.name),
+        );
+    }
+    if cards.is_empty() {
+        cards.push_str(
+            "<p class=\"empty\">No configured networks are available for this wallet.</p>",
+        );
+    }
+    let coverage_class = if snapshot.coverage.complete {
+        "coverage"
+    } else {
+        "coverage warning"
+    };
+    format!(
+        r#"<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="referrer" content="no-referrer"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src 'self'; base-uri 'none'; form-action 'none'">
+<title>{wallet} wallet overview · Bloom</title><style>
+:root{{--paper:#f4efe6;--surface:#faf7f1;--ink:#201b17;--muted:#70675c;--rule:#d8cbbb;--accent:#8a2a3a;--deep:#651d2a;--leaf:#526f51;--serif:Georgia,serif;--sans:ui-sans-serif,system-ui,sans-serif;--mono:ui-monospace,SFMono-Regular,monospace}}*{{box-sizing:border-box}}html{{background:var(--paper);color:var(--ink)}}body{{margin:0;font:15px/1.55 var(--sans)}}a{{color:var(--accent);text-underline-offset:4px}}a:focus-visible{{outline:3px solid var(--accent);outline-offset:4px}}.shell{{width:min(1080px,100%);margin:auto;padding:0 36px}}header{{display:flex;justify-content:space-between;align-items:center;gap:20px;padding:25px 0;border-bottom:1px solid var(--rule)}}.brand{{font:600 17px var(--mono);color:var(--ink);text-decoration:none}}.meta,.eyebrow{{font:11px/1.6 var(--mono);text-transform:uppercase;letter-spacing:.08em;color:var(--muted)}}main{{padding:52px 0 64px}}.hero{{display:grid;grid-template-columns:1.25fr .75fr;gap:34px;align-items:end}}h1{{margin:5px 0 0;font:italic 400 clamp(44px,7vw,72px)/1.04 var(--serif);letter-spacing:-.035em}}.lede{{margin:0;color:var(--muted);max-width:42ch}}.identity{{margin:34px 0;padding:26px 30px;border-radius:14px;background:var(--deep);color:var(--surface)}}.identity .eyebrow{{color:#e8cfd4}}.address{{display:block;margin:9px 0 17px;font:13px/1.7 var(--mono);overflow-wrap:anywhere}}.identity a{{color:#fff}}.summary{{display:grid;grid-template-columns:repeat(3,1fr);border-block:1px solid var(--rule);margin:30px 0}}.summary div{{padding:21px;border-right:1px solid var(--rule)}}.summary div:first-child{{padding-left:0}}.summary div:last-child{{border:0}}.summary strong{{display:block;font:32px var(--serif)}}.summary span{{color:var(--muted);font-size:12px}}.section-head{{display:flex;justify-content:space-between;gap:20px;align-items:end;margin:38px 0 16px}}.section-head h2{{font:32px var(--serif);margin:0}}.section-head p{{color:var(--muted);margin:0}}.networks{{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px}}.network{{padding:25px;border:1px solid var(--rule);border-radius:13px;background:var(--surface)}}.network.unavailable{{background:#eee8df}}.network h2{{font:26px var(--serif);margin:0}}.balance{{font:36px/1.2 var(--serif);margin:24px 0;overflow-wrap:anywhere}}dl{{display:grid;grid-template-columns:repeat(3,1fr);margin:0 0 18px}}dl div{{border-left:1px solid var(--rule);padding-left:12px}}dl div:first-child{{border:0;padding:0}}dt{{font-size:11px;color:var(--muted)}}dd{{margin:2px 0 0;font:20px var(--serif)}}.coverage{{margin-top:28px;padding:20px 22px;border-left:3px solid var(--leaf);background:#e8ede3}}.coverage.warning{{border-color:var(--accent);background:#f0e1de}}.coverage p{{margin:4px 0}}footer{{display:flex;flex-wrap:wrap;justify-content:space-between;gap:16px;padding:23px 0 35px;border-top:1px solid var(--rule);color:var(--muted);font-size:11px}}footer a+ a{{margin-left:14px}}@media(max-width:700px){{.shell{{padding:0 18px}}main{{padding-top:34px}}.hero,.networks{{grid-template-columns:1fr}}.summary{{grid-template-columns:1fr}}.summary div,.summary div:first-child{{border:0;border-bottom:1px solid var(--rule);padding:15px 0}}.section-head{{display:block}}.section-head p{{margin-top:6px}}header{{align-items:flex-start}}.meta{{text-align:right}}}}
+</style></head><body><div class="shell"><header><a class="brand" href="../../">/bloom</a><span class="meta">Read-only wallet snapshot<br>{snapshot_short}</span></header><main><section class="hero"><div><p class="eyebrow">Your wallet, at a glance</p><h1>{wallet}</h1></div><p class="lede">Native balances, network coverage, and work already staged in Bloom. This page observes; it never approves or executes an action.</p></section><section class="identity"><p class="eyebrow">Broker-authenticated wallet projection</p><span class="address">{owner}</span><a href="address.qr.svg">Show receiving QR</a></section><section class="summary" aria-label="Snapshot summary"><div><strong>{chain_count}</strong><span>configured networks</span></div><div><strong>{pending}</strong><span>pending actions</span></div><div><strong>{available}/{chain_count}</strong><span>balance sources available</span></div></section><div class="section-head"><h2>Native balances</h2><p>Independent observations · no combined fiat total</p></div><section class="networks">{cards}</section><section class="{coverage_class}"><strong>Read coverage</strong><p>{coverage_note}</p>{coverage_detail}</section></main><footer><span>Captured {captured_at_ms} ms · projection {freshness}</span><span><a href="overview.md">Text version</a><a href="overview.json">Exact data</a><a href="../../next.md">Next actions</a></span></footer></div></body></html>
+"#,
+        wallet = html_escape(&snapshot.wallet.id),
+        owner = html_escape(&snapshot.wallet.owner),
+        snapshot_short = html_escape(&snapshot.snapshot_id),
+        chain_count = snapshot.chains.len(),
+        pending = optional_count(pending),
+        available = snapshot.coverage.available_chains,
+        cards = cards,
+        coverage_class = coverage_class,
+        coverage_note = html_escape(snapshot.coverage.note),
+        coverage_detail = if snapshot.coverage.complete {
+            "All configured native-balance sources answered.".to_owned()
+        } else {
+            format!(
+                "{} configured source(s) were unavailable; missing values were not replaced.",
+                snapshot.coverage.unavailable_chains
+            )
+        },
+        captured_at_ms = snapshot.captured_at_ms,
+        freshness = html_escape(&snapshot.wallet.projection_freshness),
+    )
 }
 
 /// Reject a policy-update action id that could escape its state directory
@@ -2086,7 +2424,9 @@ impl WalletsHandler {
         }
         match segs[1].as_str() {
             "address" | "address.qr.png" | "address.qr.svg" | "addresses.json" | "public_key"
-            | "kind" | "projection.json" => Ok(Entry::file(&segs[1])),
+            | "kind" | "projection.json" | "overview.json" | "overview.md" | "overview.html" => {
+                Ok(Entry::file(&segs[1]))
+            }
             "policy.json" => Ok(Entry::writable_file("policy.json")),
             "chains" => match segs.len() {
                 2 => Ok(Entry::dir("chains")),
@@ -2274,6 +2614,9 @@ impl WalletsHandler {
                 out.push(b'\n');
                 Ok(out)
             }
+            "overview.json" => self.wallet_overview_json(wallet).await,
+            "overview.md" => self.wallet_overview_md(wallet).await,
+            "overview.html" => self.wallet_overview_html(wallet).await,
             "policy.json" => self.read_triad_wallet_policy(wallet).await,
             "chains" if segs.len() >= 4 => self.read_chain(wallet, &segs[2], &segs[3..]).await,
             "sealed-approvals" if segs.len() == 3 && segs[2] == "new.json" => {
@@ -3160,6 +3503,66 @@ mod tests {
         assert!(!entries.iter().any(|entry| entry.name == "policy.toml"));
     }
 
+    #[tokio::test]
+    async fn wallet_overview_formats_share_one_read_only_snapshot() {
+        let f = make_handler();
+        let directory = VfsPath::parse("/alice").unwrap();
+        let entries = f.handler.list(&directory).await.unwrap();
+        for leaf in ["overview.json", "overview.md", "overview.html"] {
+            let entry = entries.iter().find(|entry| entry.name == leaf).unwrap();
+            assert_eq!(entry.mode, 0o444, "{leaf} must be read-only");
+            let path = VfsPath::parse(&format!("/alice/{leaf}")).unwrap();
+            assert_eq!(f.handler.lookup(&path).await.unwrap().mode, 0o444);
+            assert_eq!(f.handler.cache_ttl(&path), None);
+            assert!(matches!(
+                f.handler.write(&path, b"replace").await,
+                Err(HandlerError::PermissionDenied)
+            ));
+        }
+
+        let json: serde_json::Value = serde_json::from_slice(
+            &f.handler
+                .read(&VfsPath::parse("/alice/overview.json").unwrap())
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let snapshot_id = json["snapshot_id"].as_str().unwrap();
+        let markdown = String::from_utf8(
+            f.handler
+                .read(&VfsPath::parse("/alice/overview.md").unwrap())
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let html = String::from_utf8(
+            f.handler
+                .read(&VfsPath::parse("/alice/overview.html").unwrap())
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(json["schema"], WALLET_OVERVIEW_SCHEMA);
+        assert_eq!(json["wallet"]["id"], "alice");
+        assert_eq!(json["wallet"]["owner"], format!("{:#x}", f.wallet_addr));
+        assert_eq!(json["coverage"]["complete"], true);
+        assert!(markdown.contains(snapshot_id));
+        assert!(html.contains(snapshot_id));
+        assert!(html.contains("Content-Security-Policy"));
+        assert!(!html.contains("<script"));
+        assert!(!html.contains("ceremony_url"));
+    }
+
+    #[test]
+    fn wallet_overview_html_escapes_untrusted_display_text() {
+        assert_eq!(
+            html_escape("<script src='https://bad'>\"&"),
+            "&lt;script src=&#39;https://bad&#39;&gt;&quot;&amp;"
+        );
+        assert_eq!(markdown_cell("bad|row\nnext`"), "bad\\|row next\\`");
+    }
+
     struct Fixture {
         _tmp: tempfile::TempDir,
         handler: WalletsHandler,
@@ -3723,6 +4126,28 @@ mod tests {
             .outbox
             .write_pending(&staged, "p")
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn wallet_overview_preserves_actions_when_a_balance_source_is_unavailable() {
+        let f = make_handler_with_chain(true);
+        seed_pending(&f, "overview-pending");
+        let bytes = tokio::time::timeout(
+            Duration::from_secs(3),
+            f.handler
+                .read(&VfsPath::parse("/alice/overview.json").unwrap()),
+        )
+        .await
+        .expect("an unavailable RPC must fail promptly")
+        .unwrap();
+        let overview: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        assert_eq!(overview["coverage"]["complete"], false);
+        assert_eq!(overview["coverage"]["unavailable_chains"], 1);
+        assert_eq!(overview["chains"][0]["name"], "anvil");
+        assert_eq!(overview["chains"][0]["balance_status"], "unavailable");
+        assert!(overview["chains"][0]["balance_raw"].is_null());
+        assert_eq!(overview["chains"][0]["pending_actions"], 1);
     }
 
     #[tokio::test]

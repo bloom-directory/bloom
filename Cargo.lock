@@ -2695,6 +2695,7 @@ dependencies = [
  "bloom-update",
  "bloom-watch",
  "fs2",
+ "futures",
  "hex",
  "lru 0.12.5",
  "mpp",
