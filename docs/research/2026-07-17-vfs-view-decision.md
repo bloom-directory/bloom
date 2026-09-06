@@ -11,15 +11,20 @@ of the prototype, not an implementation footnote.
 
 ## Rendered review gallery
 
-These are current captures of the committed pages, using fictional data:
+These captures use the current private-dashboard renderer in `live.py` with an
+explicitly synthetic preview snapshot. They exercise the same page templates as
+a daemon capture without publishing wallet data. The earlier July fixture pages
+remain available as design history; they are not represented as the current UI.
 
-| Today | Activity |
+| Today | Wallets |
 | --- | --- |
-| ![Today wallet briefing](vfs-view-mockups/preview.png) | ![Wallet activity and outcomes](vfs-view-mockups/preview-activity.png) |
+| ![Current Today wallet briefing](vfs-view-mockups/preview.png) | ![Current wallet holdings](vfs-view-mockups/preview-wallets.png) |
 
 | Next moves | Receive |
 | --- | --- |
-| ![Prioritized wallet next moves](vfs-view-mockups/preview-next-moves.png) | ![Network-qualified receiving guidance](vfs-view-mockups/preview-receive.png) |
+| ![Current prioritized wallet next moves](vfs-view-mockups/preview-next-moves.png) | ![Current network-qualified receiving guidance](vfs-view-mockups/preview-receive.png) |
+
+![Current wallet activity and outcomes](vfs-view-mockups/preview-activity.png)
 
 ## Product decision
 
