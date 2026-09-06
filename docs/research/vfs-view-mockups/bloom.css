@@ -263,7 +263,22 @@ html:not(.interactive) .personal-dashboard :is(.status-filters,.activity-toolbar
 .receiving-qr svg { display:block; width:222px; max-width:100%; height:auto; }
 .receiving-qr figcaption { font:11px var(--mono); color:var(--muted); margin-top:12px; }
 .receiving-card .address { text-align:left; font-size:12px; }
-.receiving-card .receiving-network { color:var(--ink-2); font-size:13px; margin:18px 0 8px; }
-.receiving-card > small { max-width:45ch; margin:0 auto; }
+.receiving-card .receiving-network { color:var(--muted); font-size:12px; margin:12px 0 0; }
+.receive-wallet-picker { display:flex; align-items:center; gap:18px; border-block:1px solid var(--rule); }
+.receive-wallet-picker .chain-switch { flex:1; padding:12px 0; background:transparent; border:0; }
+.receive-wallet-picker .chain-switch button { font-size:13px; padding-inline:18px; }
+.receive-wallet-picker .chain-switch button[aria-pressed="true"] { background:var(--accent-deep); color:var(--paper); border-color:var(--accent-deep); box-shadow:none; }
+.receiving-wallet { margin-top:26px; }
+.receiving-wallet .grid:has(> :only-child) { max-width:560px; margin-inline:auto; }
+.receiving-network-list { margin-top:22px; border-top:1px solid var(--rule); padding-top:16px; text-align:left; }
+.receiving-network-list .label { margin:0 0 10px; }
+.receiving-networks { display:flex; flex-wrap:wrap; gap:8px; padding:0; margin:0; list-style:none; }
+.receiving-networks li { border:1px solid var(--rule); background:var(--paper); border-radius:6px; padding:6px 9px; font-size:12px; }
+.receiving-networks .asset-mark { width:20px; height:20px; flex-basis:20px; }
+.receiving-networks .asset-label { gap:6px; }
+.receiving-network-list details { margin-top:12px; }
+.receiving-network-list summary { font-size:11px; }
+html:not(.interactive) .receive-wallet-picker { display:none; }
+@media(max-width:640px) { .receive-wallet-picker { display:block; padding-top:14px; }.receive-wallet-picker .chain-switch { padding-block:8px 14px; }.receive-wallet-picker .chain-switch button { padding-inline:12px; font-size:12px; } }
 @media(prefers-reduced-motion:reduce) { html { scroll-behavior:auto; } }
 @media print { .demo,nav,.skip,.links { display:none; }.shell { width:100%; padding:0; }main { padding-top:20px; }.card,.hero { break-inside:avoid; box-shadow:none; }details { display:block; }body { background:white; } }

@@ -687,27 +687,44 @@ def render(snapshot):
     ledger='<div class="activity-ledger">'+''.join(activity_row(a) for a in activities)+'</div>'
     bodies['activity']=('Your activity.','See what completed, what failed, and what still needs verification. Newest records first; this is the history captured by Bloom.',f'<section class="activity-browser"><div class="status-filters" role="group" aria-label="Filter activity by outcome">{controls}</div><div class="activity-toolbar"><label>Wallet<select id="activity-wallet"><option value="all">All wallets</option>{wallets}</select></label><label class="search-label">Find an operation<input id="activity-search" type="search" placeholder="Asset, network, wallet or transaction hash"></label><p id="activity-count" role="status">{len(activities)} operations</p></div><div class="activity-legend"><span><b>✓ Confirmed</b> — receipt reports success</span><span><b>! Failed locally</b> — Bloom recorded failure</span><span><b>× Reverted</b> — chain execution failed</span><span><b>? Unverified</b> — no usable receipt</span></div>{ledger}<p class="activity-empty" hidden>No operations match these filters.</p></section>')
     bodies['fees']=('Network fees, over time.','Two useful perspectives: what everyone pays to use a network, and the base gas price for an individual operation.',f'<section>{head("Network fees over time","Daily totals · USD · last 30 completed UTC days")}{history_panel("fees")}</section><section>{head("Gas prices through the day","Block samples · approximately 24 hours")}{history_panel("gas")}</section><section class="attention-strip"><div><h3>Your own execution fees</h3><p>Activity shows gas used × effective gas price for each available receipt, including reverted transactions. Missing receipts stay unverified; additional rollup charges may apply.</p></div><a href="activity.html">Inspect your transactions →</a></section>')
-    receive=[];receiving_seen=set()
-    def receiving_card(w,c,address):
-        identity=(w,c,address)
-        if identity in receiving_seen:return
-        receiving_seen.add(identity)
-        evm=c in snapshot['evm_chains']
-        valid=bool(ADDRESS.fullmatch(address)) if evm else bool(re.fullmatch('[1-9A-HJ-NP-Za-km-z]{32,44}',address))
-        if not valid:return
-        label=f'Receiving address QR for {w} on {chain_name(c)}'
-        receive.append(f'''<article class="card receiving-card" data-address="{text(address)}"><p class="eyebrow">{text(w)} · receiving account</p><h3>{chain_label(c)}</h3><figure class="receiving-qr"><div role="img" aria-label="{text(label)}">{receiving_qr(address)}</div><figcaption>Scan to receive</figcaption></figure><code class="address">{text(address)}</code><p class="receiving-network">In the sending wallet, select <strong>{text(chain_name(c))}</strong>.</p><small>The QR contains the address only; it does not select a network.{' This is a test network.' if 'devnet' in c or 'testnet' in c else ''}</small></article>''')
-    for w,c in snapshot['scopes']:
-        if c in snapshot['evm_chains']:
-            addr=data(get('read',f'/wallets/{w}/addresses.json')).get('owner')
-            if isinstance(addr,str):receiving_card(w,c,addr)
-        else:
-            for account in data(get('read',f'/wallets/{w}/accounts.json')).get('accounts',[]):
-                if account.get('lifecycle')=='ACTIVE':
-                    for projection in account.get('chain_projections',[]):
-                        if projection.get('chain_family')=='solana' and isinstance(projection.get('address'),str):
-                            receiving_card(w,c,projection['address'])
-    bodies['receive']=('Receive into your wallet.','Choose your wallet and network, then scan its QR code. Match the network in the sending wallet and check the full address below the code.',f'<section><div class="grid">{"".join(receive) or "<p>No verified receiving addresses were returned.</p>"}</div></section>')
+    receiving_wallets=[];receiving_controls=[]
+    wallet_order=sorted(snapshot['wallets'],key=lambda w:(-sum((Decimal(h['value']) for h in priced if h['wallet']==w),Decimal(0)),w))
+    for w in wallet_order:
+        groups={}
+        def receiving_account(family,address,chain):
+            valid=isinstance(address,str) and (bool(ADDRESS.fullmatch(address)) if family=='evm' else bool(re.fullmatch('[1-9A-HJ-NP-Za-km-z]{32,44}',address)))
+            if not valid:return
+            # EVM casing is presentation; Solana base58 casing is identity.
+            identity=(family,address.lower() if family=='evm' else address)
+            group=groups.setdefault(identity,{'family':family,'address':address,'networks':set()})
+            group['networks'].add(chain)
+        for wallet,c in snapshot['scopes']:
+            if wallet!=w:continue
+            if c in snapshot['evm_chains']:
+                receiving_account('evm',data(get('read',f'/wallets/{w}/addresses.json')).get('owner'),c)
+            elif c.startswith('solana'):
+                for account in data(get('read',f'/wallets/{w}/accounts.json')).get('accounts',[]):
+                    if account.get('lifecycle')=='ACTIVE':
+                        for projection in account.get('chain_projections',[]):
+                            if projection.get('chain_family')=='solana':receiving_account('solana',projection.get('address'),c)
+        cards=[]
+        for group in groups.values():
+            family,address=group['family'],group['address']
+            networks=sorted(group['networks'],key=lambda c:(c!='ethereum',chain_name(c)))
+            mainnets=[c for c in networks if 'devnet' not in c and 'testnet' not in c]
+            testnets=[c for c in networks if c not in mainnets]
+            network_list='<ul class="receiving-networks">'+''.join(f'<li>{chain_label(c)}</li>' for c in mainnets)+'</ul>' if mainnets else '<p>No main network is configured for this address.</p>'
+            testing=details('Test networks · '+str(len(testnets)), '<p>The same address is also configured on these test networks. Test funds are separate from main-network funds.</p><ul class="receiving-networks">'+''.join(f'<li>{text(c)}</li>' for c in testnets)+'</ul>') if testnets else ''
+            title='Ethereum & EVM' if family=='evm' else 'Solana'
+            label=f'{w}: {title} receiving address QR'
+            note='One address across these networks. Balances stay on the network the sender chooses.' if len(mainnets)>1 else 'Choose the matching network in the sending wallet.'
+            cards.append(f'''<article class="card receiving-card" data-family="{family}" data-address="{text(address)}"><p class="eyebrow">{text(w)} · receiving address</p><h3>{text(title)}</h3><figure class="receiving-qr"><div role="img" aria-label="{text(label)}">{receiving_qr(address)}</div><figcaption>Scan this address</figcaption></figure><code class="address">{text(address)}</code><div class="receiving-network-list"><p class="label">Networks for this address</p>{network_list}<p class="receiving-network">{note}</p>{testing}</div></article>''')
+        if cards:
+            receiving_controls.append(f'<button type="button" data-select="{text(w)}">{text(w)}</button>')
+            count=len(cards)
+            receiving_wallets.append(f'<section class="receiving-wallet" data-panel="{text(w)}" aria-label="{text(w)} receiving addresses">{head(w,str(count)+(" receiving address" if count==1 else " receiving addresses"))}<div class="grid">{"".join(cards)}</div></section>')
+    receiving_body=f'<section class="receive-wallets" data-switcher="receiving"><div class="receive-wallet-picker"><span class="label">Choose wallet</span><div class="chain-switch" role="group" aria-label="Choose receiving wallet">{"".join(receiving_controls)}</div></div>{"".join(receiving_wallets)}</section>' if receiving_wallets else '<p>No verified receiving addresses were returned.</p>'
+    bodies['receive']=('Receive.','Choose a wallet, then scan its Ethereum-compatible or Solana address. Select the matching network in the sending wallet.',receiving_body)
     access=[]
     for w in snapshot['wallets']:
         projection=data(get('read',f'/wallets/{w}/addresses.json'))

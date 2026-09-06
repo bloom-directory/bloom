@@ -295,6 +295,14 @@ wallet, network, and full address remain beside it. Address-only codes do not
 select a network in the sending wallet. Invalid or missing address projections
 produce no QR. Codes work without JavaScript or external image services.
 
+Receive groups by wallet and distinct address, not by chain. Each wallet has
+one EVM address card with its configured networks shown as labels; network
+labels do not pretend to change an address-only QR. Solana accounts remain
+separate from EVM, and distinct Solana addresses are never merged. Networks
+sharing the same Solana address use one code, with test networks disclosed
+separately. A wallet picker defaults to the wallet with the most observed
+priced assets. Without JavaScript, every wallet section remains visible.
+
 The overview puts wallet exposure first, followed by observed market movers,
 funded accounts, pending work, recent outcomes, and network fee history.
 Allocation bars use burgundy and warm neutrals. Token and network marks are

@@ -2,6 +2,7 @@
 import re
 from decimal import Decimal
 import unittest
+from unittest.mock import patch
 
 from live import activity_items, render
 
@@ -74,6 +75,32 @@ class ActivityTests(unittest.TestCase):
         s=snapshot();s['operations'].append(['sample','ethereum','sent','second','/outbox/sent/second'])
         s['records'].append({'method':'list','source':'/outbox/sent','status':'ok','data':[{'name':'second','modified_ms':1000}]})
         self.assertEqual(activity_items(s,lookup(s))[0]['id'],'second')
+
+
+class ReceivingTests(unittest.TestCase):
+    def test_evm_networks_share_one_card_per_wallet(self):
+        s=snapshot();s['wallets']=['first','second'];s['evm_chains']=['ethereum','base']
+        s['scopes']=[(w,c) for w in s['wallets'] for c in s['evm_chains']]
+        for i,w in enumerate(s['wallets'],1):
+            s['records'].append({'method':'read','source':f'/wallets/{w}/addresses.json','status':'ok','data':{'owner':'0x'+str(i)*40}})
+        with patch('live.receiving_qr',return_value='<svg></svg>') as qr:
+            html=render(s)[0]['receive.html']
+        self.assertEqual(html.count('data-family="evm"'),2)
+        self.assertEqual(qr.call_count,2)
+        self.assertIn('data-panel="first"',html)
+        self.assertIn('data-panel="second"',html)
+        self.assertEqual(html.count('Networks for this address'),2)
+
+    def test_solana_networks_group_but_distinct_accounts_do_not(self):
+        s=snapshot();s['scopes']=[('sample','solana-mainnet'),('sample','solana-devnet')]
+        accounts=[{'lifecycle':'ACTIVE','chain_projections':[{'chain_family':'solana','address':address}]} for address in ['A'*32,'a'*32]]
+        s['records'].append({'method':'read','source':'/wallets/sample/accounts.json','status':'ok','data':{'accounts':accounts}})
+        with patch('live.receiving_qr',return_value='<svg></svg>') as qr:
+            html=render(s)[0]['receive.html']
+        self.assertEqual(html.count('data-family="solana"'),2)
+        self.assertEqual(qr.call_count,2)
+        self.assertEqual(html.count('Test networks · 1'),2)
+        self.assertEqual({call.args[0] for call in qr.call_args_list},{'A'*32,'a'*32})
 
 
 class ChartTests(unittest.TestCase):
