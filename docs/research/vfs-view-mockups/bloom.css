@@ -114,5 +114,30 @@ footer a { margin-left:14px; }
   td[data-label] { display:flex; gap:12px; justify-content:space-between; }td[data-label]::before { content:attr(data-label); color:var(--muted); font:11px/1.6 var(--mono); }
   .bar { display:none; }td[data-label] small { display:none; }.review dl div { grid-template-columns:1fr; gap:5px; }dd { text-align:left; }
 }
+/* Personal capture overview: keep the capture distinct from the fixture gallery. */
+.snapshot-banner { display:flex; justify-content:center; flex-wrap:wrap; gap:4px 24px; border-bottom:1px solid var(--rule-2); padding:11px 20px; }
+.wallet-dashboard { display:grid; grid-template-columns:1fr 1fr; border:1px solid var(--rule-2); border-radius:18px; overflow:hidden; }
+.balance-panel { padding:36px; background:var(--accent-deep); color:var(--paper); }
+.balance-panel .eyebrow,.balance-panel small { color:#e9d5d6; }
+.balance-panel .metric { font-size:clamp(48px,6vw,80px); margin:10px 0; }
+.balance-panel .button { background:var(--paper); color:var(--accent-deep); margin:24px 0; }
+.capture-stamp { margin-top:24px; border-left:2px solid #bd8992; padding-left:14px; font:12px/1.8 var(--mono); }
+.allocation-panel { padding:36px; background:var(--surface); }
+.allocation-list,.holding-list { padding:0; list-style:none; margin:22px 0; }
+.allocation-list li { margin-bottom:16px; }
+.allocation-list li > div:first-child { display:grid; grid-template-columns:minmax(0,1fr) auto 50px; align-items:baseline; gap:12px; font-size:13px; }
+.allocation-list small { text-align:right; }
+.allocation-bar { height:7px; border-radius:4px; margin-top:7px; background:#e5dccf; overflow:hidden; }
+.allocation-bar span { display:block; height:100%; background:var(--leaf); }
+.wallet-heading { display:flex; flex-wrap:wrap; align-items:baseline; justify-content:space-between; gap:8px; }
+.wallet-card .wallet-value { color:var(--ink); font:40px/1.2 var(--serif); margin:16px 0 4px; }
+.holding-list li { display:flex; justify-content:space-between; gap:16px; border-top:1px solid var(--rule); padding:12px 0; font-size:14px; }
+.holding-list strong { font-weight:500; font-variant-numeric:tabular-nums; }
+.market-brief { display:grid; grid-template-columns:1fr auto; align-items:center; gap:32px; border-block:1px solid var(--rule); padding:28px 0; }
+@media(max-width:700px) {
+  .wallet-dashboard,.market-brief { grid-template-columns:1fr; }
+  .balance-panel,.allocation-panel { padding:24px; }
+  .market-brief > a { justify-self:start; }
+}
 @media(prefers-reduced-motion:reduce) { html { scroll-behavior:auto; } }
 @media print { .demo,nav,.skip,.links { display:none; }.shell { width:100%; padding:0; }main { padding-top:20px; }.card,.hero { break-inside:avoid; box-shadow:none; }details { display:block; }body { background:white; } }
