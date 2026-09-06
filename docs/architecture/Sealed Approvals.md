@@ -92,6 +92,15 @@ therefore consume the remaining approved capacity by lying within that trust
 model. Exact selectors prevent payload substitution; reusable selectors rely
 on the documented claim assurance.
 
+The `safe.transaction.confirm` operation has an additional fail-closed review
+contract. The Petal supplies one canonical Safe review envelope alongside the
+exact EIP-712 preimage. Machine accepts and forwards that envelope only for
+this operation class. Broker independently rebuilds the Safe transaction hash,
+checks the signing key against the reported owner set, enforces pinned Safe and
+library releases plus zero refund fields, and decodes the supported call before
+constructing approval text. A missing, malformed, or mismatched envelope
+rejects preparation; the exact selector remains the signing authority.
+
 Petals always submit complete payload bytes through a payload-bearing host
 call. Hash-only guest signing is unsupported. Machine may validate guest
 capabilities and provenance, but only Broker can authorize and only Signer can
