@@ -43,6 +43,7 @@ bloom-update.workspace = true
 bloom-petals.workspace = true
 ed25519-dalek.workspace = true
 anyhow.workspace = true
+axum.workspace = true
 clap.workspace = true
 clap_complete.workspace = true
 tokio.workspace = true

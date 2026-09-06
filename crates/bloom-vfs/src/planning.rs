@@ -37,6 +37,29 @@ pub fn advisory_evm_policy(projection: &WalletProjection, chain: &str) -> Result
     Ok(policy)
 }
 
+/// Advisory opt-in for native exact transactions, scoped to numeric chain ID.
+/// Broker still checks the policy and decodes the exact payload for owner review.
+/// Reusable Petal planning must continue using `advisory_evm_policy`.
+pub fn advisory_exact_evm_policy(
+    projection: &WalletProjection,
+    chain: &str,
+    chain_id: u64,
+) -> Result<Policy, String> {
+    let canonical: CanonicalWalletPolicy =
+        serde_json::from_slice(&projection.policy.canonical_policy.decode())
+            .map_err(|error| format!("parse canonical Broker policy projection: {error}"))?;
+    if canonical.wallet_id != projection.wallet.wallet_id {
+        return Err("canonical Broker policy projection names a different wallet".into());
+    }
+    if canonical.allowed_destinations.iter().any(|destination| {
+        destination.chain.as_str() == format!("evm-{chain_id}")
+            && destination.destination == "exact"
+    }) {
+        return Ok(Policy::default());
+    }
+    advisory_evm_policy(projection, chain)
+}
+
 /// Produce a non-authorizing paid-request planning view. Canonical policy has
 /// no legacy HTTP cap fields; Broker evaluates the exact payload and canonical
 /// policy before signing, so Machine must not invent persistent local limits.
@@ -109,6 +132,35 @@ mod tests {
             freshness: ProjectionFreshness::Fresh,
             verification: ProjectionVerification::AuthenticatedBroker,
         }
+    }
+
+    #[test]
+    fn exact_opt_in_is_numeric_chain_scoped_and_does_not_broaden_petal_planning() {
+        let projection = projection(vec![PolicyDestination {
+            chain: Token::new("evm-31337").unwrap(),
+            destination: "exact".into(),
+        }]);
+        assert!(
+            advisory_exact_evm_policy(&projection, "anvil", 31337)
+                .unwrap()
+                .allowlists
+                .recipients
+                .is_empty()
+        );
+        assert!(
+            !advisory_exact_evm_policy(&projection, "anvil", 1)
+                .unwrap()
+                .allowlists
+                .recipients
+                .is_empty()
+        );
+        assert!(
+            !advisory_evm_policy(&projection, "anvil")
+                .unwrap()
+                .allowlists
+                .recipients
+                .is_empty()
+        );
     }
 
     #[test]

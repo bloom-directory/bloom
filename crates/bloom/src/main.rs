@@ -9,6 +9,7 @@
 mod commands {
     pub mod qr;
 }
+mod deploy;
 mod github_source;
 mod petal_provisioning;
 mod pf_monitor;
@@ -1230,6 +1231,16 @@ async fn execute_machine_command(
             emit_machine_mutation("audit_reconcile", Some(&correlation_id), "committed");
             format!("{output}\n")
         }
+        MachineCommand::DeploymentRpc {
+            wallet,
+            chain,
+            method,
+            params,
+        } => serde_json::to_string(
+            &daemon
+                .deployment_rpc(&wallet, &chain, &method, params)
+                .await,
+        )?,
         MachineCommand::WalletList => {
             let mut output = String::new();
             for projection in daemon.wallet_projections.list_wallets().await? {
@@ -2135,6 +2146,8 @@ enum ServeInternal {
 
 #[derive(Subcommand, Debug)]
 enum Cmd {
+    /// Deploy EVM contracts through Foundry or Hardhat using a Bloom wallet.
+    Deploy(deploy::DeployArgs),
     /// Show daemon status (chains configured, version, uptime).
     Status,
     /// Inspect or explicitly reconcile the Machine-owned audit journal.
@@ -3015,6 +3028,7 @@ async fn run(cli: Cli) -> Result<()> {
             println!("agent setup: https://bloom.directory/SKILL.md");
             Ok(())
         }
+        Cmd::Deploy(args) => deploy::run(client_endpoint, args).await,
         Cmd::Status => call_machine_command(&client_endpoint, MachineCommand::Status).await,
         Cmd::Audit(command) => {
             let command = match command {

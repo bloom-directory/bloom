@@ -9,6 +9,7 @@ on:
       - "rust-toolchain.toml"
       - "crates/**"
       - "evals/harbor/**"
+      - "examples/evm-deploy/**"
       - "packaging/**"
       - "scripts/**"
       - "tests/**"
@@ -197,10 +198,30 @@ jobs:
       - name: Run ignored local anvil integration tests from archive
         run: >
           cargo nextest run --archive-file target/nextest-archive.tar.zst
-          -E 'package(bloom-it) or package(bloom-watch)'
+          -E '(package(bloom-it) or package(bloom-watch)) and not binary(deployment_rpc)'
           --run-ignored ignored-only
           --no-tests=pass
           --no-fail-fast
+
+  deployment_compatibility:
+    name: Foundry, Hardhat and Ignition deployment
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install Rust toolchain
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "26"
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: v1.7.1
+      - name: Build actual CLI and test remote deployment workflows on Anvil
+        run: |
+          cargo build --locked -p bloom
+          cargo test --locked -p bloom-it --test deployment_rpc -- --ignored --nocapture
 
   macos_unix_principal_disposable_w0:
     name: macOS Unix-principal disposable W0
@@ -209,7 +230,7 @@ jobs:
       github.ref_name == 'triad-architecture'
     uses: ./.github/workflows/macos-unix-conformance.yml
     with:
-      broker_ref: 56252977c99238151c89bb44649fe8f5d1c91ae8
+      broker_ref: 2030c38ab8d3056ab19fb6fee55a9682792caacf
       signer_ref: 0126ba4589ad8cf504d2f04c8e36471727964089
 
   linux_w0_isolation:
