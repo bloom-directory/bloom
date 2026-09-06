@@ -3949,7 +3949,7 @@ mod tests {
             chain: "anvil".into(),
             chain_id: 31337,
             from: bloom_proto::checksum_address(&f.wallet_addr),
-            to: "0x0000000000000000000000000000000000000002".into(),
+            to: Some("0x0000000000000000000000000000000000000002".into()),
             value_wei: "0".into(),
             data_hex: "0x".into(),
             gas_limit: 21000,

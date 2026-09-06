@@ -24,7 +24,7 @@ pub struct SentEntry {
     /// Parsed from `staged.tx_hash`; entries without a hash are skipped.
     pub hash: alloy::primitives::B256,
     pub from: alloy::primitives::Address,
-    pub to: alloy::primitives::Address,
+    pub to: Option<alloy::primitives::Address>,
     pub value: alloy::primitives::U256,
     /// Raw hex string from `staged.data_hex`.
     pub data: String,
@@ -53,6 +53,9 @@ pub struct MinedReceipt {
     pub tx_hash: String,
     #[serde(default)]
     pub block_number: Option<u64>,
+    /// Actual created address from the mined receipt; absent for calls and failures.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contract_address: Option<String>,
     /// Decoded revert reason (best-effort) when `outcome == "reverted"`.
     #[serde(default)]
     pub revert_reason: Option<String>,
@@ -187,7 +190,7 @@ pub struct BroadcastAttempt {
     pub raw_tx_blake3: String,
     pub raw_tx_path: String,
     pub from: String,
-    pub to: String,
+    pub to: Option<String>,
     pub nonce: u64,
     pub chain_id: u64,
     pub created_ms: u128,
@@ -1086,7 +1089,10 @@ fn parse_sent_entry(
     let hash_str = staged.tx_hash.as_deref()?; // skip if no hash
     let hash: alloy::primitives::B256 = hash_str.parse().ok()?;
     let from: alloy::primitives::Address = staged.from.parse().ok()?;
-    let to: alloy::primitives::Address = staged.to.parse().ok()?;
+    let to = match staged.transaction_kind().ok()? {
+        alloy::primitives::TxKind::Call(address) => Some(address),
+        alloy::primitives::TxKind::Create => None,
+    };
     let value: alloy::primitives::U256 = staged.value_wei.parse().ok()?;
     let fees = if let Some(mfp) = staged.max_fee_per_gas.as_deref() {
         let max_fee_per_gas = mfp.parse::<u128>().ok()?;
@@ -1147,7 +1153,7 @@ mod tests {
             chain: "anvil".into(),
             chain_id: 31337,
             from: "0x0000000000000000000000000000000000000001".into(),
-            to: "0x0000000000000000000000000000000000000002".into(),
+            to: Some("0x0000000000000000000000000000000000000002".into()),
             value_wei: "0".into(),
             data_hex: "0x".into(),
             gas_limit: 21000,
@@ -1214,6 +1220,7 @@ mod tests {
             outcome: "success".into(),
             tx_hash: staged.tx_hash.clone().unwrap(),
             block_number: Some(123),
+            contract_address: None,
             revert_reason: None,
         };
         let se = &ob.walk_all_sent().unwrap()[0];

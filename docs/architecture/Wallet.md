@@ -46,6 +46,29 @@ application keys. Those Petal-owned keys are not Bloom wallet keys. A
 Bloom-managed wallet or derived `KeyRef` remains Broker/Signer-only and is used
 through the payload-bearing Petal signing protocol.
 
+## Native EVM contract creation
+
+The native outbox accepts an explicit `kind: "deploy"` intent with complete
+initcode (including linked libraries and encoded constructor arguments) and an
+optional native endowment. `StagedTx` records `ContractCreation` with `to: null`.
+Calls retain an address string, including calls to the zero address. Missing
+recipients on old call entries are rejected rather than interpreted as creation.
+
+Gas estimation, pre-sign simulation, and both legacy and EIP-1559 unsigned
+encoding preserve CREATE. Fee replacement retains that kind; cancellation is
+still a separately authorized self-transfer. Sent-entry scanning includes
+creation, and successful mined receipts persist the node's actual
+`contract_address`. The plan shows the initcode hash and the conditional address
+prediction from sender and nonce; constructor effects and ownership are not
+verified from arbitrary bytecode.
+
+Creation requires the existing exact payload approval. A recipient or contract
+allowlist cannot authorize it by matching a fabricated destination. Broker and
+Signer protocols and the existing Petal WIT interface are unchanged. This
+native primitive does not yet expose Foundry/Hardhat RPC compatibility or a
+deployment Petal; those and in-flight nonce/recovery gates are tracked in
+[bloom#221](https://github.com/bloom-directory/bloom/issues/221).
+
 ## Policy updates
 
 The mounted policy surface uses Broker's policy custody protocol:

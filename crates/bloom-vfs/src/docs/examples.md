@@ -25,6 +25,31 @@ echo y > /bloom/wallets/alice/chains/anvil/outbox/pending/0001-*/confirm
 ls /bloom/wallets/alice/chains/anvil/outbox/sent/
 ```
 
+## Deploying an EVM contract
+
+Stage direct creation with `kind: "deploy"` and complete hex initcode in `data`.
+Include linked library addresses and ABI-encoded constructor arguments in the
+initcode before staging. `value` is the constructor endowment. There is no `to`
+field; sending to the zero address is an ordinary call, not deployment.
+
+```sh
+# Build with the project's normal tools, then prepare a JSON intent:
+# {"kind":"deploy","data":"0x<complete-initcode>","value":"0","chain":"anvil"}
+# The placeholder above must be replaced with actual compiled initcode.
+cp deployment.json /bloom/wallets/alice/chains/anvil/outbox/new.tx
+ls /bloom/wallets/alice/chains/anvil/outbox/pending/
+```
+
+Read the selected pending entry's `plan.md`, then use its usual `confirm`
+flow and complete the Broker approval. The plan identifies CREATE, the
+initcode hash, and the address predicted from sender and nonce. After mining,
+`sent/<id>/receipt.json` records the actual `contract_address` on success.
+Constructor effects and resulting ownership are not inferred from bytecode.
+Creation remains subject to exact Broker approval; recipient allowlists do
+not grant deployment permission. Follow-up initialization calls are separate
+transactions and approvals. The Foundry/Hardhat RPC adapter is tracked in #221
+and is not provided by this native intent support.
+
 ## Creating a wallet (asynchronous passkey registration)
 
 ```sh

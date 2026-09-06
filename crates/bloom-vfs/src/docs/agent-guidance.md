@@ -119,6 +119,21 @@ After execution, inspect `outbox/sent/<action_id>/` or
 artifacts. Petal-specific wallet paths are projections of the same central
 action id; do not treat them as separate approval queues.
 
+## Deploying EVM contracts
+
+Build with the project's normal tools. Stage a JSON/TOML intent using
+`kind: "deploy"`, complete hex initcode in `data`, and optional native `value`
+at `wallets/<wallet>/chains/<chain>/outbox/new.tx`. Append ABI-encoded constructor
+arguments and link libraries before staging; do not supply `to`. Read the
+pending entry's `plan.md` and complete its usual Broker approval flow.
+
+The predicted address depends on sender and nonce. Check the mined
+`sent/<id>/receipt.json` for success and the actual `contract_address`; a
+broadcast hash alone is not a successful deployment. Constructor ownership and
+effects are not verified. Initialization calls are separate transactions with
+their own approvals. See `docs/examples.md` for the native flow. Foundry/Hardhat
+RPC integration is not available from this primitive yet.
+
 ## Updating wallet policy
 
 `wallets/<wallet>/policy.json` is the only writable policy surface. It accepts
