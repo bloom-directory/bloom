@@ -265,6 +265,7 @@ Machine using its documented v1 IPC `list` and `read` methods. It collects
 wallet/account projections, native and selected token balances, supported Petal
 positions, pending operations, and bounded history. Public market context comes
 from CoinGecko and DefiLlama. Missing or stale inputs are never fixture fallbacks.
+The renderer requires the `qrencode` command for receiving-account QR codes.
 
 ```sh
 python3 docs/research/vfs-view-mockups/live.py \
@@ -286,6 +287,13 @@ from market-valued assets. Unsupported SPL/session inventories remain explicit.
 The capture starts no ceremony, stages no operation, and has no write IPC method.
 
 ### Personal dashboard details
+
+Receiving accounts include offline SVG QR codes, generated locally by
+`qrencode`, with medium error correction, a four-module quiet zone, and an
+unobstructed black-on-white pattern. Each code encodes the exact public address;
+wallet, network, and full address remain beside it. Address-only codes do not
+select a network in the sending wallet. Invalid or missing address projections
+produce no QR. Codes work without JavaScript or external image services.
 
 The overview puts wallet exposure first, followed by observed market movers,
 funded accounts, pending work, recent outcomes, and network fee history.

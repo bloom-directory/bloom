@@ -256,5 +256,14 @@ button:focus-visible,input:focus-visible,select:focus-visible,.time-chart:focus-
 .pulse-note { display:flex; gap:20px; align-items:baseline; justify-content:space-between; margin-top:14px; }.pulse-note p { margin:0; font-size:12px; color:var(--muted); }.pulse-note a { font-size:12px; flex-shrink:0; }
 @media(max-width:640px) { .mover-grid { grid-template-columns:1fr; gap:10px; }.mover-tile { display:grid; grid-template-columns:1fr auto; gap:8px; padding:16px; }.mover-tile > strong { margin:0; font-size:28px; }.mover-tile small { grid-column:1 / -1; }.pulse-note { flex-direction:column; gap:10px; } }
 html:not(.interactive) .personal-dashboard :is(.status-filters,.activity-toolbar,.chain-switch,.range-switch) { display:none; }
+.receiving-card { text-align:center; }
+.receiving-card h3 .asset-label { justify-content:center; }
+.receiving-qr { margin:22px 0 0; }
+.receiving-qr > div { display:inline-block; max-width:100%; background:#fff; border:1px solid var(--rule); border-radius:8px; padding:8px; }
+.receiving-qr svg { display:block; width:222px; max-width:100%; height:auto; }
+.receiving-qr figcaption { font:11px var(--mono); color:var(--muted); margin-top:12px; }
+.receiving-card .address { text-align:left; font-size:12px; }
+.receiving-card .receiving-network { color:var(--ink-2); font-size:13px; margin:18px 0 8px; }
+.receiving-card > small { max-width:45ch; margin:0 auto; }
 @media(prefers-reduced-motion:reduce) { html { scroll-behavior:auto; } }
 @media print { .demo,nav,.skip,.links { display:none; }.shell { width:100%; padding:0; }main { padding-top:20px; }.card,.hero { break-inside:avoid; box-shadow:none; }details { display:block; }body { background:white; } }

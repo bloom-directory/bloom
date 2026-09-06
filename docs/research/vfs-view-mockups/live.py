@@ -15,6 +15,9 @@ import os
 from pathlib import Path
 import re
 import socket
+import shutil
+import subprocess
+from functools import lru_cache
 import urllib.request
 from urllib.parse import quote
 
@@ -503,6 +506,21 @@ def normalize(snapshot):
     return holdings,get
 
 
+@lru_cache(maxsize=128)
+def receiving_qr(address):
+    """Address-only QR, matching Bloom's deposit QR convention. Never remote."""
+    try:
+        result=subprocess.run(
+            ['qrencode','--type=SVG','--inline','--svg-path','--level=M',
+             '--margin=4','--size=6','--output=-'],
+            input=address,text=True,capture_output=True,check=True,timeout=10)
+    except FileNotFoundError as exc:
+        raise RuntimeError('Install qrencode to render receiving-account QR codes, then rerun --render-only.') from exc
+    # qrencode emits only locally generated SVG geometry; the address travels
+    # over stdin rather than appearing in process arguments or a remote URL.
+    return result.stdout.strip()
+
+
 def render(snapshot):
     holdings,get=normalize(snapshot)
     priced=[h for h in holdings if h['value'] is not None and not h['reference']]
@@ -669,18 +687,27 @@ def render(snapshot):
     ledger='<div class="activity-ledger">'+''.join(activity_row(a) for a in activities)+'</div>'
     bodies['activity']=('Your activity.','See what completed, what failed, and what still needs verification. Newest records first; this is the history captured by Bloom.',f'<section class="activity-browser"><div class="status-filters" role="group" aria-label="Filter activity by outcome">{controls}</div><div class="activity-toolbar"><label>Wallet<select id="activity-wallet"><option value="all">All wallets</option>{wallets}</select></label><label class="search-label">Find an operation<input id="activity-search" type="search" placeholder="Asset, network, wallet or transaction hash"></label><p id="activity-count" role="status">{len(activities)} operations</p></div><div class="activity-legend"><span><b>✓ Confirmed</b> — receipt reports success</span><span><b>! Failed locally</b> — Bloom recorded failure</span><span><b>× Reverted</b> — chain execution failed</span><span><b>? Unverified</b> — no usable receipt</span></div>{ledger}<p class="activity-empty" hidden>No operations match these filters.</p></section>')
     bodies['fees']=('Network fees, over time.','Two useful perspectives: what everyone pays to use a network, and the base gas price for an individual operation.',f'<section>{head("Network fees over time","Daily totals · USD · last 30 completed UTC days")}{history_panel("fees")}</section><section>{head("Gas prices through the day","Block samples · approximately 24 hours")}{history_panel("gas")}</section><section class="attention-strip"><div><h3>Your own execution fees</h3><p>Activity shows gas used × effective gas price for each available receipt, including reverted transactions. Missing receipts stay unverified; additional rollup charges may apply.</p></div><a href="activity.html">Inspect your transactions →</a></section>')
-    receive=[]
+    receive=[];receiving_seen=set()
+    def receiving_card(w,c,address):
+        identity=(w,c,address)
+        if identity in receiving_seen:return
+        receiving_seen.add(identity)
+        evm=c in snapshot['evm_chains']
+        valid=bool(ADDRESS.fullmatch(address)) if evm else bool(re.fullmatch('[1-9A-HJ-NP-Za-km-z]{32,44}',address))
+        if not valid:return
+        label=f'Receiving address QR for {w} on {chain_name(c)}'
+        receive.append(f'''<article class="card receiving-card" data-address="{text(address)}"><p class="eyebrow">{text(w)} · receiving account</p><h3>{chain_label(c)}</h3><figure class="receiving-qr"><div role="img" aria-label="{text(label)}">{receiving_qr(address)}</div><figcaption>Scan to receive</figcaption></figure><code class="address">{text(address)}</code><p class="receiving-network">In the sending wallet, select <strong>{text(chain_name(c))}</strong>.</p><small>The QR contains the address only; it does not select a network.{' This is a test network.' if 'devnet' in c or 'testnet' in c else ''}</small></article>''')
     for w,c in snapshot['scopes']:
         if c in snapshot['evm_chains']:
             addr=data(get('read',f'/wallets/{w}/addresses.json')).get('owner')
-            if addr:receive.append(card(w+' · '+c,'Use the exact network and supported asset shown here. The same EVM address on another network has a separate balance.','Receiving account')[:-10]+f'<code class="address">{text(addr)}</code></article>')
+            if isinstance(addr,str):receiving_card(w,c,addr)
         else:
             for account in data(get('read',f'/wallets/{w}/accounts.json')).get('accounts',[]):
                 if account.get('lifecycle')=='ACTIVE':
                     for projection in account.get('chain_projections',[]):
-                        if projection.get('chain_family')=='solana':
-                            receive.append(f'<article class="card"><p class="eyebrow">{text(w)} / {text(c)}</p><h3>SOL receiving account</h3><code class="address">{text(projection["address"])}</code><p>Match the sender’s network. Native SOL support does not imply support for every SPL token.</p>{details("Exact account",f"<p><code>{text(account['public_key_fingerprint'])}</code></p>")}</article>')
-    bodies['receive']=('Your receiving accounts.','Public addresses from your current wallet/account projections. Choose the network first and verify the full address before sending.',f'<section><div class="grid">{"".join(receive)}</div></section>')
+                        if projection.get('chain_family')=='solana' and isinstance(projection.get('address'),str):
+                            receiving_card(w,c,projection['address'])
+    bodies['receive']=('Receive into your wallet.','Choose your wallet and network, then scan its QR code. Match the network in the sending wallet and check the full address below the code.',f'<section><div class="grid">{"".join(receive) or "<p>No verified receiving addresses were returned.</p>"}</div></section>')
     access=[]
     for w in snapshot['wallets']:
         projection=data(get('read',f'/wallets/{w}/addresses.json'))
@@ -708,6 +735,8 @@ def main():
     parser.add_argument('--out',required=True,type=Path)
     parser.add_argument('--render-only',action='store_true',help='Render a previous private capture without fetching')
     args=parser.parse_args()
+    if shutil.which('qrencode') is None:
+        parser.error('Install qrencode to generate local receiving-account QR codes.')
     output=args.out.resolve()
     # Prevent personal observations from entering this checkout.
     if ROOT.parent.parent.parent in [output,*output.parents]:
