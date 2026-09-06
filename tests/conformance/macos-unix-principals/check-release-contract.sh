@@ -25,9 +25,9 @@ env \
   BLOOM_MACOS_CONFORMANCE_SIGNATURE= \
   BLOOM_MACOS_CONFORMANCE_PUBLIC_KEY= \
   BLOOM_MACOS_CONFORMANCE_KEY_SHA256= \
-  BLOOM_MACHINE_SHA="$(sed -n 's/^BLOOM_MACHINE_SHA=//p' "$payload/SOURCE_REVISIONS")" \
-  BLOOM_BROKER_SHA="$(sed -n 's/^BLOOM_BROKER_SHA=//p' "$payload/SOURCE_REVISIONS")" \
-  BLOOM_SIGNER_SHA="$(sed -n 's/^BLOOM_SIGNER_SHA=//p' "$payload/SOURCE_REVISIONS")" \
+  BLOOM_MACHINE_SHA="$(sed -n -E 's/^BLOOM_MACHINE_SHA=([0-9a-f]{40})$/\1/p' "$payload/SOURCE_REVISIONS")" \
+  BLOOM_BROKER_SHA="$(sed -n -E 's/^BLOOM_BROKER_SHA=([0-9a-f]{40})$/\1/p' "$payload/SOURCE_REVISIONS")" \
+  BLOOM_SIGNER_SHA="$(sed -n -E 's/^BLOOM_SIGNER_SHA=([0-9a-f]{40})$/\1/p' "$payload/SOURCE_REVISIONS")" \
   "$release_dir/build-bundle.sh" \
   "$work/staging" "$archive" "$work/release-key" 1700000000
 "$release_dir/verify-bundle.sh" \
