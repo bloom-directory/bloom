@@ -35,8 +35,13 @@ struct SimulationArtifact<'a> {
     logs: &'a Option<Vec<String>>,
 }
 
-/// Default approval/signing TTL for a staged transfer (ms).
-const SIGN_TTL_MS: u64 = 60_000;
+/// Approval/signing TTL for an exact staged transfer (ms).
+///
+/// The chain-validity gate below remains authoritative for broadcast. Keeping
+/// the one-operation approval alive longer than the recent blockhash prevents
+/// a trusted-clock high-water mark from expiring an approval that the owner
+/// completed while the transaction was still valid.
+const SIGN_TTL_MS: u64 = 3_600_000;
 
 /// Conservative estimate of Solana's per-slot duration, used only to turn a
 /// block-height-denominated blockhash validity window into a wall-clock
