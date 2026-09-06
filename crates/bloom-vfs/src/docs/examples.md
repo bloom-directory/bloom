@@ -47,8 +47,31 @@ initcode hash, and the address predicted from sender and nonce. After mining,
 Constructor effects and resulting ownership are not inferred from bytecode.
 Creation remains subject to exact Broker approval; recipient allowlists do
 not grant deployment permission. Follow-up initialization calls are separate
-transactions and approvals. The Foundry/Hardhat RPC adapter is tracked in #221
-and is not provided by this native intent support.
+transactions and approvals. First add the numeric-chain policy opt-in through
+its normal ceremony: `{"chain":"evm-31337","destination":"exact"}` for Anvil.
+Machine and Broker must both support protocol 1.5.
+
+For an existing Foundry project, start the adapter in a separate terminal:
+
+```sh
+umask 077
+bloom deploy --wallet alice --chain anvil rpc > rpc.json
+# In the project terminal (use your script's path and contract name):
+forge script script/Deploy.s.sol:Deploy \
+  --rpc-url "$(jq -r .rpc_url rpc.json)" \
+  --sender "$(jq -r .from rpc.json)" --unlocked --broadcast --slow
+# Complete each owner ceremony printed by the adapter, then continue its ID:
+bloom deploy --wallet alice --chain anvil resume deploy-REPLACE_WITH_ID
+# Inspect after a timeout or interruption:
+bloom deploy --wallet alice --chain anvil list
+bloom deploy --wallet alice --chain anvil status deploy-REPLACE_WITH_ID
+```
+
+Keep `rpc.json` private and untracked. Scripts use the selected public sender
+and `vm.startBroadcast()`; remove private-key environment reads. Hardhat uses
+`accounts: "remote"` plus an ethers `NonceManager`; Ignition supplies nonces
+itself. Runnable examples and recovery instructions are in
+https://github.com/bloom-directory/bloom/tree/master/examples/evm-deploy.
 
 ## Creating a wallet (asynchronous passkey registration)
 

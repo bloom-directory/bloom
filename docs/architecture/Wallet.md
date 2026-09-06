@@ -62,11 +62,27 @@ creation, and successful mined receipts persist the node's actual
 prediction from sender and nonce; constructor effects and ownership are not
 verified from arbitrary bytecode.
 
-Creation requires the existing exact payload approval. A recipient or contract
-allowlist cannot authorize it by matching a fabricated destination. Broker and
-Signer protocols and the existing Petal WIT interface are unchanged. This
-native primitive does not yet expose Foundry/Hardhat RPC compatibility or a
-deployment Petal; those and in-flight nonce/recovery gates are tracked in
+Creation requires exact payload approval and an explicit canonical policy entry
+`{"chain":"evm-<numeric-chain-id>","destination":"exact"}`. Broker verifies the
+unsigned transaction preimage against the exact selector, derives the sender
+from Signer's authenticated public key, and commits decoded creation/call
+fields to the owner review. Machine and Broker require protocol 1.5; Signer
+protocol and Petal WIT are unchanged.
+
+`bloom deploy --wallet <wallet> --chain <chain> rpc` exposes a token-authenticated
+loopback endpoint for Foundry unlocked scripts, Hardhat remote accounts, and
+Ignition. It uses the native wallet/outbox rather than a separate WASM wrapper.
+Every submission requires an explicit nonce and gets a durable ID committing
+the normalized request, wallet, and chain. Retries return the existing entry;
+conflicting nonce use fails closed. Plans, approvals, errors, signed bytes, and
+receipts persist in the outbox. Automatic nonce selection includes the node's
+pending transactions.
+
+The HTTP request prepares owner review and waits for a real hash. The agent
+runs `bloom deploy ... resume <id>` after approval; an idle or disconnected
+client does not continue signing in the background. `list` and `status` expose
+recovery, including cached artifacts during outages. See the runnable
+[Foundry/Hardhat/Ignition guide](../../examples/evm-deploy/README.md) and
 [bloom#221](https://github.com/bloom-directory/bloom/issues/221).
 
 ## Policy updates

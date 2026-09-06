@@ -78,8 +78,8 @@ require_compat_value() {
   }
 }
 require_compat_value protocols.machine_broker major 1
-require_compat_value protocols.machine_broker minor_min 4
-require_compat_value protocols.machine_broker minor_max 4
+require_compat_value protocols.machine_broker minor_min 5
+require_compat_value protocols.machine_broker minor_max 5
 require_compat_value protocols.broker_signer major 1
 require_compat_value protocols.broker_signer minor_min 4
 require_compat_value protocols.broker_signer minor_max 4

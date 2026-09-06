@@ -1184,6 +1184,68 @@ impl TxEngine {
         .await
     }
 
+    /// Idempotent developer-tool staging. The normalized request determines the
+    /// durable outbox ID before any signing or broadcast can occur.
+    pub async fn stage_deployment(
+        &self,
+        permit: &HomeWritePermit,
+        wallet: &str,
+        request: &crate::deployment::DeploymentTransaction,
+        chain: &ChainClient,
+        policy: &Policy,
+    ) -> Result<StagedTx, TxEngineError> {
+        if request.chain_id != chain.spec().chain_id || request.nonce.is_none() {
+            return Err(TxEngineError::Address(
+                "deployment requires the configured chain ID and an explicit nonce".into(),
+            ));
+        }
+        let id = request.id(wallet, &chain.spec().name);
+        let body = match request.to {
+            Some(to) => RawIntentBody::Raw {
+                to: to.to_string(),
+                value: format!("{} wei", request.value),
+                data: request.data.clone(),
+            },
+            None => RawIntentBody::Deploy {
+                value: format!("{} wei", request.value),
+                data: request.data.clone(),
+            },
+        };
+        let mut spec = chain.spec().clone();
+        spec.legacy_tx = request.gas_price.is_some() || spec.legacy_tx;
+        let selected_chain = ChainClient::new(spec)?;
+        let fees = request
+            .max_fee_per_gas
+            .zip(request.max_priority_fee_per_gas)
+            .map(
+                |(max_fee_per_gas, max_priority_fee_per_gas)| Eip1559FeeOverrides {
+                    max_fee_per_gas,
+                    max_priority_fee_per_gas,
+                },
+            );
+        self.stage_with_execution_origin_and_fee_overrides_and_valuation_target(
+            permit,
+            wallet,
+            request.from,
+            RawIntent {
+                body,
+                chain: Some(chain.spec().name.clone()),
+                gas: Default::default(),
+                nonce: request.nonce,
+                gas_limit_hint: request.gas,
+                usd_value_hint: None,
+            },
+            &selected_chain,
+            policy,
+            None,
+            None,
+            fees,
+            None,
+            Some((&id, request)),
+        )
+        .await
+    }
+
     /// Stage an EVM transaction with trusted Petal provenance supplied by the
     /// caller that owns the execution surface. Native wallet staging passes no
     /// origin and therefore retains the default `evm-wallet` identity.
@@ -1239,6 +1301,7 @@ impl TxEngine {
             execution_origin,
             fee_overrides,
             None,
+            None,
         )
         .await
     }
@@ -1270,6 +1333,7 @@ impl TxEngine {
             None,
             None,
             Some(valuation_target),
+            None,
         )
         .await
     }
@@ -1287,6 +1351,7 @@ impl TxEngine {
         execution_origin: Option<ExecutionOrigin>,
         fee_overrides: Option<Eip1559FeeOverrides>,
         trusted_valuation_target: Option<BoundValuationTarget>,
+        deployment: Option<(&str, &crate::deployment::DeploymentTransaction)>,
     ) -> Result<StagedTx, TxEngineError> {
         if let Some(origin) = &execution_origin {
             origin
@@ -1365,6 +1430,37 @@ impl TxEngine {
         // the same nonce.
         let nonce_mutex = self.nonce_lock_for(wallet, &spec.name, from);
         let _nonce_guard = nonce_mutex.lock().await;
+        if let Some((id, _)) = deployment {
+            match self.outbox.read(wallet, &spec.name, id) {
+                Ok(entry) => return Ok(entry.staged),
+                Err(OutboxError::NotFound(_)) => {}
+                Err(error) => return Err(error.into()),
+            }
+            if let Some(nonce) = intent.nonce {
+                let pending = chain.nonce(from).await?;
+                if nonce < pending {
+                    return Err(TxEngineError::ApprovalState(
+                        "nonce is already used or pending; recover the original submission instead"
+                            .into(),
+                    ));
+                }
+                for state in [OutboxState::Pending, OutboxState::Sent] {
+                    for existing in self.outbox.list(wallet, &spec.name, state)? {
+                        let entry = self
+                            .outbox
+                            .read_in_state(wallet, &spec.name, &existing, state)?;
+                        if entry.staged.nonce == nonce
+                            && entry.staged.from.parse::<Address>().ok() == Some(from)
+                        {
+                            return Err(TxEngineError::ApprovalState(format!(
+                                "nonce is reserved by {}; use its replace/cancel flow",
+                                entry.staged.id
+                            )));
+                        }
+                    }
+                }
+            }
+        }
         let now_ms = now_ms();
         let swept = self.outbox.sweep_expired(now_ms)?;
         if swept > 0 {
@@ -1378,7 +1474,7 @@ impl TxEngine {
         let nonce = match intent.nonce {
             Some(n) => n,
             None => {
-                let chain_nonce = session.nonce(from).await?;
+                let chain_nonce = chain.nonce(from).await?;
                 let pending_high = self
                     .outbox
                     .highest_pending_nonce(wallet, &spec.name, from)?;
@@ -1405,6 +1501,9 @@ impl TxEngine {
                 1_000_000_000
             }
         };
+        let gas_price = deployment
+            .and_then(|(_, tx)| tx.gas_price)
+            .unwrap_or(gas_price);
         let (max_fee, prio) = fee_overrides.map_or_else(
             || (gas_price.saturating_mul(2), (gas_price / 10).max(1)),
             |fees| (fees.max_fee_per_gas, fees.max_priority_fee_per_gas),
@@ -1443,6 +1542,7 @@ impl TxEngine {
             }
         };
 
+        let gas_limit = deployment.and_then(|(_, tx)| tx.gas).unwrap_or(gas_limit);
         let (max_fee_field, prio_field, gas_price_field) = if spec.legacy_tx {
             (None, None, Some(gas_price.to_string()))
         } else {
@@ -1720,7 +1820,9 @@ impl TxEngine {
         }
 
         let mut staged = StagedTx {
-            id: self.outbox.allocate_id(),
+            id: deployment
+                .map(|(id, _)| id.to_owned())
+                .unwrap_or_else(|| self.outbox.allocate_id()),
             wallet: wallet.to_string(),
             chain: spec.name.clone(),
             chain_id,
@@ -1735,7 +1837,13 @@ impl TxEngine {
             nonce,
             policy_checks: vec![],
             created_ms: now_ms,
-            expires_ms: now_ms + self.stage_ttl_ms,
+            // A deployment job is durable; each Broker approval retains its
+            // independent bounded lifetime. Only explicit cancellation releases it.
+            expires_ms: if deployment.is_some() {
+                0
+            } else {
+                now_ms + self.stage_ttl_ms
+            },
             status: TxStatus::Pending,
             action_kind,
             tx_hash: None,
@@ -2668,6 +2776,11 @@ impl TxEngine {
         staged: &StagedTx,
         chain: &ChainClient,
     ) -> Result<UnsignedEvmTx, TxEngineError> {
+        if staged.chain_id != chain.spec().chain_id {
+            return Err(TxEngineError::ApprovalState(
+                "staged chain ID differs from the current chain profile".into(),
+            ));
+        }
         let _from: Address = staged
             .from
             .parse()
@@ -2679,7 +2792,7 @@ impl TxEngine {
             .map_err(|_| TxEngineError::Amount("value_wei".into()))?;
         let data = decode_data(&staged.data_hex)?;
 
-        if chain.spec().legacy_tx {
+        if staged.gas_price.is_some() {
             let gp: u128 = staged
                 .gas_price
                 .as_deref()
@@ -3540,6 +3653,7 @@ impl TxEngine {
             .from(from)
             .with_kind(destination)
             .nonce(staged.nonce)
+            .with_gas_limit(staged.gas_limit)
             .value(value)
             .input(data.into());
         match chain.eth_call_capture_revert(req, None).await {

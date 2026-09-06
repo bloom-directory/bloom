@@ -5,6 +5,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod deployment;
 pub mod ipc;
 
 mod ens_resolver;
@@ -642,6 +643,7 @@ impl DaemonPetalHost {
         );
         broker
             .prepare_approval(bloom_broker_api::ApprovalPrepareRequest {
+                evm_review_payloads: Vec::new(),
                 operation_id,
                 terms,
                 canonical_plan_facts_digest: plan_digest,
@@ -2886,6 +2888,7 @@ impl ipc::BatchConfirmationService for CanonicalBatchConfirmation {
 /// behind Arc/clone-safe inner types).
 #[derive(Clone)]
 pub struct Daemon {
+    deployment_lock: Arc<tokio::sync::Mutex<()>>,
     pub home: HomeDir,
     pub config: Config,
     pub chains: ChainRegistry,
@@ -3918,6 +3921,7 @@ impl Daemon {
         );
 
         Ok(Self {
+            deployment_lock: Arc::new(tokio::sync::Mutex::new(())),
             home,
             config,
             chains,

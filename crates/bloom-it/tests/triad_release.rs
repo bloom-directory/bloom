@@ -32,9 +32,10 @@ fn release_compatibility_declares_each_edge_without_a_global_protocol_range() {
 
     let release = workspace().join("packaging/triad/release");
     let compatibility = fs::read_to_string(release.join("compatibility-v1.toml")).unwrap();
-    for exact_authority in ["machine_broker", "broker_signer"] {
-        let block =
-            format!("[protocols.{exact_authority}]\nmajor = 1\nminor_min = 4\nminor_max = 4");
+    for (exact_authority, minor) in [("machine_broker", 5), ("broker_signer", 4)] {
+        let block = format!(
+            "[protocols.{exact_authority}]\nmajor = 1\nminor_min = {minor}\nminor_max = {minor}"
+        );
         assert!(compatibility.contains(&block));
     }
     for compatible_support in ["signer_control", "session"] {
@@ -47,12 +48,12 @@ fn release_compatibility_declares_each_edge_without_a_global_protocol_range() {
     assert!(is_legacy_global_protocol_key("\tprotocol_minor_min = 0"));
 
     let verifier = fs::read_to_string(release.join("verify-bundle.sh")).unwrap();
-    for exact_authority in ["machine_broker", "broker_signer"] {
+    for (exact_authority, minor) in [("machine_broker", 5), ("broker_signer", 4)] {
         assert!(verifier.contains(&format!(
-            "require_compat_value protocols.{exact_authority} minor_min 4"
+            "require_compat_value protocols.{exact_authority} minor_min {minor}"
         )));
         assert!(verifier.contains(&format!(
-            "require_compat_value protocols.{exact_authority} minor_max 4"
+            "require_compat_value protocols.{exact_authority} minor_max {minor}"
         )));
     }
     assert!(verifier.contains("for support_edge in signer_control session"));
@@ -325,7 +326,7 @@ fn build(staging: &Path, output: &Path, key: &Path) -> std::process::Output {
         &compatibility,
         compatibility_source
             .replace(
-                "broker_commit = \"56252977c99238151c89bb44649fe8f5d1c91ae8\"",
+                "broker_commit = \"2030c38ab8d3056ab19fb6fee55a9682792caacf\"",
                 &format!("broker_commit = \"{}\"", "22".repeat(20)),
             )
             .replace(

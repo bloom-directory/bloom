@@ -131,8 +131,16 @@ The predicted address depends on sender and nonce. Check the mined
 `sent/<id>/receipt.json` for success and the actual `contract_address`; a
 broadcast hash alone is not a successful deployment. Constructor ownership and
 effects are not verified. Initialization calls are separate transactions with
-their own approvals. See `docs/examples.md` for the native flow. Foundry/Hardhat
-RPC integration is not available from this primitive yet.
+their own approvals. The wallet policy must opt into the numeric chain with
+`{"chain":"evm-31337","destination":"exact"}` (replace 31337 as appropriate),
+through the normal policy-update ceremony. This permits preparation, not signing.
+
+For Foundry scripts, Hardhat remote accounts, and Ignition, run
+`bloom deploy --wallet <wallet> --chain <chain> rpc`. It prints an ephemeral,
+private submission URL and public sender. After owner review, explicitly run
+`bloom deploy --wallet <wallet> --chain <chain> resume <id>` for the same ID.
+Use `list` and `status <id>` to recover. Do not export signing keys into project
+files or environment variables. See `docs/examples.md` for commands.
 
 ## Updating wallet policy
 

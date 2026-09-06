@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 
 pub mod bump_scanner;
+pub mod deployment;
 pub mod intent_parser;
 pub mod oracle;
 pub mod outbox;

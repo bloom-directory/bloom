@@ -438,12 +438,15 @@ impl Outbox {
             .state_dir(&staged.wallet, &staged.chain, OutboxState::Pending)?
             .join(&staged.id);
         fs::create_dir_all(&dir)?;
-        fs::write(dir.join("intent.json"), serde_json::to_vec_pretty(&staged)?)?;
-        fs::write(dir.join("plan.md"), plan_md.as_bytes())?;
-        fs::write(
-            dir.join("policy_check.json"),
-            serde_json::to_vec_pretty(&staged.policy_checks)?,
+        self.write_artefact(&dir, "plan.md", plan_md.as_bytes())?;
+        self.write_artefact(
+            &dir,
+            "policy_check.json",
+            &serde_json::to_vec_pretty(&staged.policy_checks)?,
         )?;
+        // Publish the complete identity last; a retry can never observe a torn
+        // intent and reinterpret an already-staged deployment as a new one.
+        self.write_artefact(&dir, "intent.json", &serde_json::to_vec_pretty(&staged)?)?;
         Ok(dir)
     }
 
@@ -496,7 +499,11 @@ impl Outbox {
         attempt: &BroadcastAttempt,
     ) -> Result<PathBuf, OutboxError> {
         let path = entry.dir.join(kind.marker_name());
-        fs::write(&path, serde_json::to_vec_pretty(attempt)?)?;
+        self.write_artefact(
+            &entry.dir,
+            kind.marker_name(),
+            &serde_json::to_vec_pretty(attempt)?,
+        )?;
         Ok(path)
     }
 
@@ -518,17 +525,8 @@ impl Outbox {
         kind: BroadcastAttemptKind,
         raw: &[u8],
     ) -> Result<PathBuf, OutboxError> {
-        let path = entry.dir.join(kind.raw_name());
-        let mut opts = fs::OpenOptions::new();
-        opts.create(true).write(true).truncate(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
-        }
-        let mut file = opts.open(&path)?;
-        file.write_all(raw)?;
-        Ok(path)
+        self.write_artefact(&entry.dir, kind.raw_name(), raw)?;
+        Ok(entry.dir.join(kind.raw_name()))
     }
 
     pub fn read_broadcast_raw_tx(
@@ -868,7 +866,11 @@ impl Outbox {
         if name.contains('/') || name.contains('\\') {
             return Err(OutboxError::InvalidId(name.into()));
         }
-        fs::write(dir.join(name), body)?;
+        let mut temp = tempfile::NamedTempFile::new_in(dir)?;
+        temp.write_all(body)?;
+        temp.as_file().sync_all()?;
+        temp.persist(dir.join(name)).map_err(|error| error.error)?;
+        fs::File::open(dir)?.sync_all()?;
         Ok(())
     }
 
