@@ -223,7 +223,7 @@ sudo -u "$login_user_a" "$machine_binary" serve triad-health-check "$release_dig
 
 # Leave A enrolled and its socket-activated LaunchDaemons loaded, but remove its
 # login-session sentinel so B can become the first canonical-listener owner.
-launchctl bootout "gui/$login_uid_a/com.bloom.session"
+launchctl bootout "user/$login_uid_a/com.bloom.session"
 wait_for_services_to_stop "$login_uid_a"
 if /usr/bin/nc -z -w 1 127.0.0.1 18734; then
   echo "login A retained the canonical listener after its sentinel stopped" >&2
@@ -237,7 +237,7 @@ installed_b=true
 sudo -u "$login_user_b" \
   "$machine_binary" serve triad-health-check "$release_digest"
 
-launchctl bootstrap "gui/$login_uid_a" "$session_plist"
+launchctl bootstrap "user/$login_uid_a" "$session_plist"
 session_socket_a="/private/var/run/bloom/$login_uid_a/session/session.sock"
 deadline=$((SECONDS + 15))
 while [[ $SECONDS -lt $deadline && ! -S "$session_socket_a" ]]; do
