@@ -1,7 +1,7 @@
 //! End-to-end transfer lifecycle: stage → sign → broadcast, driven by a stub
 //! Solana RPC node and a real-Ed25519 Broker fixture.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use bloom_broker_api::{
     ApprovalPrepareRequest, ApprovalPrepareState, Base64UrlBytes, CryptoSuite, DecimalU64,
@@ -29,6 +29,7 @@ fn digest(byte: u8) -> Digest32 {
 struct BrokerFixture {
     child_signing_key: ed25519_dalek::SigningKey,
     child_key_ref: KeyRef,
+    prepared_expiries: Mutex<Vec<u64>>,
 }
 
 impl BrokerFixture {
@@ -45,10 +46,15 @@ impl BrokerFixture {
                 public_key_fingerprint: Digest32::from_bytes(Sha256::digest(pubkey).into()),
                 derivation: None,
             },
+            prepared_expiries: Mutex::new(Vec::new()),
         }
     }
     fn child_pubkey(&self) -> [u8; 32] {
         self.child_signing_key.verifying_key().to_bytes()
+    }
+
+    fn last_prepared_expiry(&self) -> u64 {
+        *self.prepared_expiries.lock().unwrap().last().unwrap()
     }
 }
 
@@ -103,6 +109,7 @@ impl MachineBrokerService for BrokerFixture {
                         canonical_public_key: Base64UrlBytes::from_bytes(&self.child_pubkey()),
                         addresses: vec![],
                         supported_crypto_suites: vec![CryptoSuite::Ed25519Message],
+                        petal_scope_expires_at_ms: None,
                     }))
                 }
                 MachineBrokerRequest::SigningSign(sign_request) => {
@@ -128,15 +135,21 @@ impl MachineBrokerService for BrokerFixture {
                 MachineBrokerRequest::SealedApprovalPrepare(ApprovalPrepareRequest {
                     terms,
                     ..
-                }) => Ok(MachineBrokerResponse::SealedApprovalPrepare(
-                    SealedApprovalPrepareResponse {
-                        approval_id: terms.approval_id().unwrap_or_else(|_| digest(7)),
-                        state: ApprovalPrepareState::AwaitingCeremony,
-                        ceremony_url: "http://localhost:18734/ceremony".into(),
-                        ceremony_expires_at_ms: terms.expires_at_ms,
-                        review_manifest_digest: digest(92),
-                    },
-                )),
+                }) => {
+                    self.prepared_expiries
+                        .lock()
+                        .unwrap()
+                        .push(terms.expires_at_ms.get());
+                    Ok(MachineBrokerResponse::SealedApprovalPrepare(
+                        SealedApprovalPrepareResponse {
+                            approval_id: terms.approval_id().unwrap_or_else(|_| digest(7)),
+                            state: ApprovalPrepareState::AwaitingCeremony,
+                            ceremony_url: "http://localhost:18734/ceremony".into(),
+                            ceremony_expires_at_ms: terms.expires_at_ms,
+                            review_manifest_digest: digest(92),
+                        },
+                    ))
+                }
                 other => Err(ProtocolError::new(
                     ProtocolErrorCode::UnknownMethod,
                     format!("unhandled {other:?}"),
@@ -434,6 +447,7 @@ async fn full_transfer_lifecycle_stage_sign_broadcast() {
         }
         other => panic!("expected ApprovalRequired, got {other:?}"),
     };
+    assert_eq!(broker.last_prepared_expiry(), 3_601_100);
     // Still pending: no signature recorded yet.
     assert!(
         outbox
