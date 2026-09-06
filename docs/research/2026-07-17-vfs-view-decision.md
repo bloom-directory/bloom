@@ -272,7 +272,7 @@ python3 docs/research/vfs-view-mockups/live.py \
   --out /absolute/private/path/bloom-views
 ```
 
-Open only the resulting `index.html`; its navigation reaches the other seven
+Open only the resulting `index.html`; its navigation reaches the other eight
 real-data pages. Output is outside the checkout, with private directory/file
 permissions. It contains wallet data: do not commit it, publish it, or attach it
 to this PR. `--render-only` redraws an existing capture without network reads.
@@ -284,3 +284,51 @@ receipts distinguish confirmed/reverted transactions from a local `sent` state.
 Issuer reference valuations, test assets, and unverified overlaps stay separate
 from market-valued assets. Unsupported SPL/session inventories remain explicit.
 The capture starts no ceremony, stages no operation, and has no write IPC method.
+
+### Personal dashboard details
+
+The overview puts wallet exposure first, followed by observed market movers,
+funded accounts, pending work, recent outcomes, and network fee history.
+Allocation bars use burgundy and warm neutrals. Token and network marks are
+cached from CoinGecko and DefiLlama into the private output; unknown identities
+have explicit monograms. Contract-qualified token mappings prevent a ticker
+alone from borrowing a trusted token's mark or transaction decoder.
+
+Activity is a chronological ledger, with text and shape as well as color:
+confirmed checks, burgundy local failures/reverts, dashed unverified outcomes,
+and staged operations. Filters combine outcome, wallet, and search. Only a
+matching receipt establishes on-chain success; `sent` alone does not. Native
+Solana receipt success also needs confirmed/finalized status. Supported ERC-20
+and ERC-4626 calls show their actual action and amount. Details retain exact
+hashes, destinations, time provenance, and execution fees. Missing reasons and
+receipts remain explicit; an old failure is not a task to retry automatically.
+
+Fees has two separately labeled views:
+
+- **Daily network fees:** DefiLlama chain-protocol `dailyFees` histories, in USD,
+  with 7/30-day controls. The current UTC day is excluded. Each network exposes
+  its provider methodology and observation date. These are fees paid by all
+  users, not a quote for one transfer. See [DefiLlama's fee definitions](https://wiki.defillama.com/wiki/Fees).
+- **Base gas prices:** 25 real block-header samples across approximately 24
+  hours on supported EVM chains. Sampling cadence is calibrated from observed
+  block timestamps; chart positions use actual timestamps. Values are
+  `baseFeePerGas` in gwei, excluding tips and additional rollup charges. See
+  [Ethereum's gas documentation](https://ethereum.org/developers/docs/gas/).
+
+Charts break across unavailable samples, expose exact observations, and support
+pointer inspection and keyboard arrows/Home/End. Their scale starts at zero.
+A flat series stays flat. No invented curve, interpolated missing day, or fake
+price history fills an empty chart. Wallet and public-context timestamps are
+separate because the captures are not atomic.
+
+`dashboard.js` only filters and inspects already-rendered local data. There are
+no browser network requests, remote fonts, signing hooks, or transaction actions.
+With JavaScript disabled, all histories and activity remain readable. The
+public RPC reader permits only chain identity, block, transaction, and receipt
+queries, verifies chain identity, and never reads user RPC credentials.
+
+```sh
+python3 -m unittest discover -s docs/research/vfs-view-mockups -p test_live.py
+node --check docs/research/vfs-view-mockups/dashboard.js
+python3 docs/research/vfs-view-mockups/build.py --check
+```
