@@ -837,6 +837,10 @@ impl MachineBrokerClient {
             } else {
                 Vec::new()
             },
+            safe_review_payloads: request
+                .safe_review_payload
+                .map(|payload| vec![Base64UrlBytes::from_bytes(&payload)])
+                .unwrap_or_default(),
             operation_id: request.approval_operation_id,
             terms,
             canonical_plan_facts_digest: request.canonical_plan_facts_digest,
@@ -1010,6 +1014,7 @@ impl MachineBrokerClient {
             } else {
                 Vec::new()
             },
+            safe_review_payloads: Vec::new(),
             operation_id: request.approval_operation_id,
             terms,
             canonical_plan_facts_digest: request.canonical_plan_facts_digest,
@@ -1158,6 +1163,7 @@ impl MachineBrokerClient {
         terms.validate()?;
         self.prepare_approval(ApprovalPrepareRequest {
             evm_review_payloads: Vec::new(),
+            safe_review_payloads: Vec::new(),
             operation_id: request.approval_operation_id,
             terms,
             canonical_plan_facts_digest: request.canonical_plan_facts_digest,
@@ -1670,6 +1676,7 @@ pub struct ExactPayloadSignRequest {
     pub approval_id: Option<Digest32>,
     pub petal_use_claim: Option<PetalUseClaim>,
     pub claim_assurance_evidence: Option<Vec<u8>>,
+    pub safe_review_payload: Option<Vec<u8>>,
 }
 
 #[derive(Clone, Debug)]
@@ -1725,6 +1732,26 @@ impl ExactPayloadSignRequest {
             return Err(ProtocolError::new(
                 ProtocolErrorCode::MalformedFrame,
                 "exact approval validity interval is invalid",
+            ));
+        }
+        if self
+            .safe_review_payload
+            .as_ref()
+            .is_some_and(|payload| payload.len() > 256 * 1024)
+        {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::MalformedFrame,
+                "Safe review payload is too large",
+            ));
+        }
+        let safe_operation = self
+            .petal_use_claim
+            .as_ref()
+            .is_some_and(|claim| claim.operation_class.as_str() == "safe.transaction.confirm");
+        if safe_operation != self.safe_review_payload.is_some() {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::MalformedFrame,
+                "Safe confirmation requires exactly one Safe review payload",
             ));
         }
         SigningPayloads::Single {
@@ -3164,7 +3191,37 @@ mod tests {
             approval_id,
             petal_use_claim: None,
             claim_assurance_evidence: None,
+            safe_review_payload: None,
         }
+    }
+
+    #[test]
+    fn safe_exact_request_requires_a_bounded_semantic_review_envelope() {
+        let mut request = exact_request(vec![0x19, 0x01], None);
+        request.petal_use_claim = Some(PetalUseClaim {
+            package_hash: digest(70),
+            route: "transactions/wallet/one/confirm.json".into(),
+            operation_class: token("safe.transaction.confirm"),
+            crypto_suite: CryptoSuite::Secp256k1Keccak256Recoverable,
+            payload_digest: digest(71),
+            ordered_hashes: vec![request.claimed_hash.clone()],
+            declared_debits: vec![],
+            declared_destinations: vec![],
+            declared_fee: DeclaredFee::None,
+            nonce: RequestNonce::from_bytes([72; 16]),
+            claim_assurance: bloom_broker_api::ClaimAssurance::MachineAsserted,
+        });
+        assert_eq!(
+            request.validate().unwrap_err().code,
+            ProtocolErrorCode::MalformedFrame
+        );
+        request.safe_review_payload = Some(br#"{"schema":"bloom.safe.review.v1"}"#.to_vec());
+        request.validate().unwrap();
+        request.safe_review_payload = Some(vec![0; 256 * 1024 + 1]);
+        assert_eq!(
+            request.validate().unwrap_err().code,
+            ProtocolErrorCode::MalformedFrame
+        );
     }
 
     fn exact_batch_request(
@@ -3739,6 +3796,7 @@ mod tests {
 
         let approval = ApprovalPrepareRequest {
             evm_review_payloads: Vec::new(),
+            safe_review_payloads: Vec::new(),
             operation_id: OperationId::from_bytes([94; 32]),
             terms: approval_terms("wallet", None),
             canonical_plan_facts_digest: digest(95),
