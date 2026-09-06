@@ -1715,6 +1715,21 @@ impl ExactPayloadBatchSignRequest {
                 "exact batch payload and claimed-hash counts differ",
             ));
         }
+        // The batch request carries no Safe review envelope, and
+        // `prepare_approval` sends an empty `safe_review_payloads` for it, so a
+        // Safe confirmation taking this path would be signed with no semantic
+        // review at all. Broker cannot backstop that: `ApprovalPrepareRequest`
+        // carries no operation class for a Petal subject. Refuse here instead.
+        if self
+            .petal_use_claim
+            .as_ref()
+            .is_some_and(|claim| claim.operation_class.as_str() == "safe.transaction.confirm")
+        {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::MalformedFrame,
+                "Safe confirmations require the single-payload exact path with a Safe review envelope",
+            ));
+        }
         SigningPayloads::Batch {
             children: self
                 .preimages
@@ -3218,6 +3233,32 @@ mod tests {
         request.safe_review_payload = Some(br#"{"schema":"bloom.safe.review.v1"}"#.to_vec());
         request.validate().unwrap();
         request.safe_review_payload = Some(vec![0; 256 * 1024 + 1]);
+        assert_eq!(
+            request.validate().unwrap_err().code,
+            ProtocolErrorCode::MalformedFrame
+        );
+    }
+
+    #[test]
+    fn safe_confirmations_cannot_take_the_unreviewed_batch_path() {
+        let mut request = exact_batch_request(vec![vec![0x19, 0x01], vec![0x19, 0x02]], None);
+        request.validate().unwrap();
+        // The batch request has no Safe review envelope and its approval is
+        // prepared with an empty safe_review_payloads, so a Safe confirmation
+        // here would reach the owner with no Safe decoding at all.
+        request.petal_use_claim = Some(PetalUseClaim {
+            package_hash: digest(80),
+            route: "transactions/wallet/one/confirm.json".into(),
+            operation_class: token("safe.transaction.confirm"),
+            crypto_suite: CryptoSuite::Secp256k1Keccak256Recoverable,
+            payload_digest: digest(81),
+            ordered_hashes: request.claimed_hashes.clone(),
+            declared_debits: vec![],
+            declared_destinations: vec![],
+            declared_fee: DeclaredFee::None,
+            nonce: RequestNonce::from_bytes([82; 16]),
+            claim_assurance: bloom_broker_api::ClaimAssurance::MachineAsserted,
+        });
         assert_eq!(
             request.validate().unwrap_err().code,
             ProtocolErrorCode::MalformedFrame

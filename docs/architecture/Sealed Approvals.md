@@ -92,14 +92,28 @@ therefore consume the remaining approved capacity by lying within that trust
 model. Exact selectors prevent payload substitution; reusable selectors rely
 on the documented claim assurance.
 
-The `safe.transaction.confirm` operation has an additional fail-closed review
-contract. The Petal supplies one canonical Safe review envelope alongside the
-exact EIP-712 preimage. Machine accepts and forwards that envelope only for
-this operation class. Broker independently rebuilds the Safe transaction hash,
-checks the signing key against the reported owner set, enforces pinned Safe and
-library releases plus zero refund fields, and decodes the supported call before
-constructing approval text. A missing, malformed, or mismatched envelope
-rejects preparation; the exact selector remains the signing authority.
+The `safe.transaction.confirm` operation has an additional review contract. The
+Petal supplies one canonical Safe review envelope alongside the exact EIP-712
+preimage. Machine accepts and forwards that envelope only for this operation
+class, requires it for that class on the single-payload exact path, and refuses
+the class on the batch path, which carries no envelope field. Broker
+independently rebuilds the Safe transaction hash from the envelope and rejects a
+malformed envelope or one whose reconstruction does not equal the exact
+selector. It fixes all refund fields to zero, constrains a delegatecall to a
+pinned library address, rejects Safe self-administration both at the top level
+and inside a call-only batch, and decodes the supported call before constructing
+approval text.
+
+Only the EIP-712 members are bound that way. The envelope's account of the
+Safe's own configuration — owner set, threshold, guard, enabled modules,
+fallback handler, singleton and version — is not part of the preimage, and
+Broker holds no chain client, so none of it can be corroborated. Approval text
+reports that group separately and marks it unverified; in particular the
+threshold shown is not evidence of how many signatures the Safe requires.
+Requiring an envelope for the operation class is enforced on Machine:
+`ApprovalPrepareRequest` carries no operation class for a Petal subject, so
+Broker cannot distinguish a confirmation that omitted its envelope from one that
+never needed it. The exact selector remains the signing authority.
 
 Petals always submit complete payload bytes through a payload-bearing host
 call. Hash-only guest signing is unsupported. Machine may validate guest
