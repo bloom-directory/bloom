@@ -1718,13 +1718,15 @@ impl ExactPayloadBatchSignRequest {
         // The batch request carries no Safe review envelope, and
         // `prepare_approval` sends an empty `safe_review_payloads` for it, so a
         // Safe confirmation taking this path would be signed with no semantic
-        // review at all. Broker cannot backstop that: `ApprovalPrepareRequest`
-        // carries no operation class for a Petal subject. Refuse here instead.
-        if self
-            .petal_use_claim
-            .as_ref()
-            .is_some_and(|claim| claim.operation_class.as_str() == "safe.transaction.confirm")
-        {
+        // review at all. Both reusable Petal signing and explicit batches funnel
+        // through here, so this refusal plus the pairing rule on the
+        // single-payload path below covers every route a Petal has to a
+        // signature. Broker cannot backstop it — see
+        // `SAFE_CONFIRM_OPERATION_CLASS` for why the class cannot travel in the
+        // approval terms today — so Machine is the only place it can be caught.
+        if self.petal_use_claim.as_ref().is_some_and(|claim| {
+            claim.operation_class.as_str() == bloom_broker_api::SAFE_CONFIRM_OPERATION_CLASS
+        }) {
             return Err(ProtocolError::new(
                 ProtocolErrorCode::MalformedFrame,
                 "Safe confirmations require the single-payload exact path with a Safe review envelope",
@@ -1759,10 +1761,9 @@ impl ExactPayloadSignRequest {
                 "Safe review payload is too large",
             ));
         }
-        let safe_operation = self
-            .petal_use_claim
-            .as_ref()
-            .is_some_and(|claim| claim.operation_class.as_str() == "safe.transaction.confirm");
+        let safe_operation = self.petal_use_claim.as_ref().is_some_and(|claim| {
+            claim.operation_class.as_str() == bloom_broker_api::SAFE_CONFIRM_OPERATION_CLASS
+        });
         if safe_operation != self.safe_review_payload.is_some() {
             return Err(ProtocolError::new(
                 ProtocolErrorCode::MalformedFrame,

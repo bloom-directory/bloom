@@ -96,24 +96,38 @@ The `safe.transaction.confirm` operation has an additional review contract. The
 Petal supplies one canonical Safe review envelope alongside the exact EIP-712
 preimage. Machine accepts and forwards that envelope only for this operation
 class, requires it for that class on the single-payload exact path, and refuses
-the class on the batch path, which carries no envelope field. Broker
-independently rebuilds the Safe transaction hash from the envelope and rejects a
-malformed envelope or one whose reconstruction does not equal the exact
-selector. It fixes all refund fields to zero, constrains a delegatecall to a
-pinned library address, rejects Safe self-administration both at the top level
-and inside a call-only batch, and decodes the supported call before constructing
-approval text.
+the class on every batch path, which carries no envelope field — that refusal
+covers reusable Petal signing too, since it funnels through the same batch
+request. Broker independently rebuilds the Safe transaction hash from the
+envelope and rejects a malformed envelope or one whose reconstruction does not
+equal the exact selector. It fixes all refund fields to zero, constrains a
+delegatecall to an official Safe library address, rejects Safe
+self-administration both at the top level and inside a call-only batch, and
+decodes the supported call before constructing approval text.
 
-Only the EIP-712 members are bound that way. The envelope's account of the
-Safe's own configuration — owner set, threshold, guard, enabled modules,
-fallback handler, singleton and version — is not part of the preimage, and
-Broker holds no chain client, so none of it can be corroborated. Approval text
-reports that group separately and marks it unverified; in particular the
-threshold shown is not evidence of how many signatures the Safe requires.
-Requiring an envelope for the operation class is enforced on Machine:
-`ApprovalPrepareRequest` carries no operation class for a Petal subject, so
-Broker cannot distinguish a confirmation that omitted its envelope from one that
-never needed it. The exact selector remains the signing authority.
+Only the EIP-712 members are bound that way, and Broker checks nothing else.
+The envelope's account of the Safe's own configuration — owner set, threshold,
+guard, enabled modules, fallback handler, singleton, singleton code hash and
+version — is not part of the preimage, and Broker holds no chain client, so none
+of it can be corroborated. It is therefore not matched against pinned tables
+either: both operands of such a check would come from the same Petal message, so
+it could only refuse an honest Petal reporting a Safe the table has not heard of.
+Approval text reports that whole group separately and marks it unverified; in
+particular the threshold shown is not evidence of how many signatures the Safe
+requires. The two facts Broker does establish about the signer and the Safe are
+that the envelope's owner equals the key this approval will sign with, and that
+a delegatecall goes to an official library — `safe_tx.to` is an EIP-712 member,
+so the selector binds it. The exact selector remains the signing authority.
+
+Requiring an envelope for the operation class is enforced on Machine, and cannot
+move to Broker as the protocol stands. `ApprovalPrepareRequest` carries no
+operation class for a Petal subject, so Broker cannot distinguish a confirmation
+that omitted its envelope from one that never needed it — and the class cannot
+simply be added to `ApprovalSubject::Petal`, because `SealedApprovalTerms` is
+mirrored field for field in `bloom-signer-api` and Broker and Signer each derive
+the approval ID from the JCS bytes of their own copy. A field added on one side
+alone would split approval identity between them the first time a Petal approval
+carried it. Closing this properly means changing both crates in one step.
 
 Petals always submit complete payload bytes through a payload-bearing host
 call. Hash-only guest signing is unsupported. Machine may validate guest
