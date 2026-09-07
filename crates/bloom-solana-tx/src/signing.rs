@@ -151,11 +151,21 @@ impl SolanaTransferSigner {
         let maximum_native_debit = lamports
             .checked_add(fee_lamports)
             .ok_or_else(|| "Solana transfer value plus fee exceeds u64".to_owned())?;
-        // These authority identities must survive the owner-ceremony retry
-        // and an unknown-result process restart. The immutable Solana message
-        // includes its recent blockhash, so domain-separated hashes are both
-        // collision resistant and unique to this staged transfer.
-        let request_nonce = deterministic_request_nonce(message_bytes);
+        // The owner approves the invariant transfer intent. The short-lived
+        // blockhash remains bound to the exact bytes and verifier evidence,
+        // but does not force another ceremony when those bytes are refreshed.
+        let intent = serde_jcs::to_vec(&serde_json::json!({
+            "schema": "bloom.solana-transfer-approval-intent.v1",
+            "wallet": wallet_id,
+            "fee_payer": bs58::encode(fee_payer).into_string(),
+            "destination": destination,
+            "lamports": lamports,
+            "fee_lamports": fee_lamports,
+            "genesis_hash": genesis_hash,
+            "account_key_ref": account_key_ref,
+        }))
+        .map_err(|error| format!("canonicalize Solana approval intent: {error}"))?;
+        let request_nonce = deterministic_request_nonce(&intent);
         let system_use_claim = SystemUseClaim {
             component_id: Token::new("bloom-machine").map_err(|e| e.to_string())?,
             action_class: Token::new(SOLANA_CONFIRM_ACTION_CLASS).map_err(|e| e.to_string())?,
@@ -203,7 +213,7 @@ impl SolanaTransferSigner {
             activation_mode: None,
             approval_operation_id: deterministic_operation_id(
                 SOLANA_APPROVAL_OPERATION_DOMAIN,
-                message_bytes,
+                &intent,
             ),
             signing_operation_id: deterministic_operation_id(
                 SOLANA_SIGNING_OPERATION_DOMAIN,
@@ -230,7 +240,7 @@ impl SolanaTransferSigner {
         };
         match self
             .broker
-            .sign_exact_payload(request)
+            .sign_reusable_system_payload(request)
             .await
             .map_err(|e| e.to_string())?
         {
