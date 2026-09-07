@@ -1,0 +1,37 @@
+schema_version = "1.4"
+
+[task]
+name = "bloom/solana-transfer"
+version = "0.1.0"
+authors = [{ name = "Bloom", email = "engineering@bloom.directory" }]
+keywords = ["bloom", "solana", "transfer", "outbox"]
+
+[metadata]
+difficulty = "medium"
+category = "agent-actions"
+tags = ["trading", "cleanup-required", "sealed-approval"]
+
+[agent]
+# The agent stages, hits the fail-closed approval boundary, waits for an
+# out-of-band owner approval, retries, then waits for finalization. The waiting
+# dominates: Solana finalization is roughly 13 seconds on mainnet-beta, and the
+# owner approval is driven by the host on its own schedule.
+timeout_sec = 1200.0
+
+[verifier]
+# Two RPC round trips plus report validation. No finalization wait: the agent
+# has already established it before reporting.
+timeout_sec = 180.0
+
+[environment]
+docker_image = "ghcr.io/bloom-directory/bloom-eval-agent-base@sha256:c1fa42378d25f356d791bc32b20e6e3898f1942368a765830d5419e446b81a7e"
+build_timeout_sec = 600.0
+cpus = 2
+memory_mb = 4096
+storage_mb = 10240
+network_mode = "public"
+mcp_servers = []
+
+[verifier.env]
+
+[solution.env]

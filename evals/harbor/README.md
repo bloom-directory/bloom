@@ -269,7 +269,24 @@ scripts/evals/run-harbor-hyperliquid.sh claude
 # Codex / GPT-5.6 Terra
 # Uses OPENAI_API_KEY when set; otherwise ~/.codex/auth.json.
 scripts/evals/run-harbor-hyperliquid.sh codex
+
+# Z.AI Coding Plan / GLM-5.2
+# Generate this key in the Z.AI dashboard; it is not an OpenAI credential.
+export GLM_API_KEY=...
+scripts/evals/run-harbor-hyperliquid.sh glm
+
+# Select another provider-compatible model without changing the harness.
+BLOOM_EVAL_MODEL=glm-5.3 scripts/evals/run-harbor-hyperliquid.sh glm
+
+# DeepSeek / V4 Flash through DeepSeek's Anthropic-compatible API.
+export DEEPSEEK_API_KEY=...
+BLOOM_EVAL_MAX_TURNS=15 scripts/evals/run-harbor-hyperliquid.sh deepseek
 ```
+
+Each agent has a reviewed default model. Set `BLOOM_EVAL_MODEL` to select a
+different model for a run; Harbor records the resolved model in the job config.
+Claude Code-backed agents default to at most 20 turns. Set
+`BLOOM_EVAL_MAX_TURNS` from 1 through 100 to choose a tighter or wider bound.
 
 ### Reproduce the package-only wallet policy
 
@@ -448,3 +465,16 @@ but it should be a follow-up rather than part of this host-backed eval:
 That mode would complement this task: composed images test reproducibility and
 service wiring; the current host-backed mode tests the machine users actually
 have installed.
+
+## Additional evaluations
+
+The [native SOL transfer evaluation](tasks/solana-transfer/README.md) has its
+own operator guide because its irreversible transfer, compile-time canary,
+host sweep, and outbox approval model differ materially from Hyperliquid's
+reversible order/cancel workflow.
+
+Its deterministic smoke lane checks protocol conformance. Paid model lanes are
+documentation-discovery evaluations: they are told to enter through the
+mount-root `AGENTS.md`, while the native SOL workflow lives in the mounted
+`docs/solana.md`. Harbor's `opencode` agent is available with DeepSeek as
+`scripts/evals/run-harbor-solana-local.sh opencode`.
