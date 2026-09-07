@@ -1,6 +1,6 @@
-use std::io::Read;
+use std::io::{ErrorKind, Read};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 
 use anyhow::{Context, Result, anyhow, bail};
 use bloom_daemon::Daemon;
@@ -17,7 +17,7 @@ use url::Url;
 const TRUSTED_GITHUB_OWNER: &str = "bloom-directory";
 // Retain a bounded diagnostic tail for reconciliation after streamed output.
 const SOURCE_BUILD_STREAM_LIMIT: usize = 256 * 1024;
-const NEAR_INTENTS_RELEASE_COMMIT: &str = "08e9bd83786425656bdd87e35031030cb7f3dc14";
+const NEAR_INTENTS_RELEASE_COMMIT: &str = "ccabb93214f1f18cf9b36946425e60035763f193";
 const ENSO_RELEASE_COMMIT: &str = "59e3c884f83c9c97b69b1b415becf8572791273b";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -32,19 +32,153 @@ pub(crate) struct PreinstalledPetal {
     pub tooling_commit: &'static str,
     pub petal_abi: &'static str,
     pub default_eligible: bool,
+    pub lineage_id: Option<&'static str>,
+    pub release_sequence: u64,
+    pub predecessor_package_hashes: &'static [&'static str],
+    pub authority_routes: &'static [PetalAuthorityRoute],
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PetalAuthorityRoute {
+    pub route_id: &'static str,
+    pub operation_classes: &'static [&'static str],
+}
+
+const POLYMARKET_AUTHORITY_ROUTES: &[PetalAuthorityRoute] = &[
+    PetalAuthorityRoute {
+        route_id: "r000036",
+        operation_classes: &["polymarket.onboard"],
+    },
+    PetalAuthorityRoute {
+        route_id: "r000050",
+        operation_classes: &["polymarket.relayer_batch"],
+    },
+    PetalAuthorityRoute {
+        route_id: "r000058",
+        operation_classes: &["polymarket.relayer_batch"],
+    },
+    PetalAuthorityRoute {
+        route_id: "r000077",
+        operation_classes: &["polymarket.order.poly1271"],
+    },
+    PetalAuthorityRoute {
+        route_id: "r000094",
+        operation_classes: &["polymarket.relayer_batch"],
+    },
+];
+
+const HYPERLIQUID_AUTHORITY_ROUTES: &[PetalAuthorityRoute] = &[
+    PetalAuthorityRoute {
+        route_id: "r000008",
+        operation_classes: &["hyperliquid.agent_action"],
+    },
+    PetalAuthorityRoute {
+        route_id: "r000009",
+        operation_classes: &["hyperliquid.agent_action"],
+    },
+    PetalAuthorityRoute {
+        route_id: "r000010",
+        operation_classes: &["hyperliquid.agent_action"],
+    },
+    PetalAuthorityRoute {
+        route_id: "r000013",
+        operation_classes: &["hyperliquid.agent_action"],
+    },
+    PetalAuthorityRoute {
+        route_id: "r000019",
+        operation_classes: &["hyperliquid.agent_action"],
+    },
+    PetalAuthorityRoute {
+        route_id: "r000023",
+        operation_classes: &["hyperliquid.agent_action"],
+    },
+    PetalAuthorityRoute {
+        route_id: "r000025",
+        operation_classes: &["hyperliquid.approve_agent", "hyperliquid.agent_action"],
+    },
+    PetalAuthorityRoute {
+        route_id: "r000035",
+        operation_classes: &["hyperliquid.cancel"],
+    },
+    PetalAuthorityRoute {
+        route_id: "r000036",
+        operation_classes: &["hyperliquid.cancel_by_cloid"],
+    },
+    PetalAuthorityRoute {
+        route_id: "r000038",
+        operation_classes: &["hyperliquid.order"],
+    },
+    PetalAuthorityRoute {
+        route_id: "r000040",
+        operation_classes: &["hyperliquid.schedule_cancel"],
+    },
+    PetalAuthorityRoute {
+        route_id: "r000041",
+        operation_classes: &["hyperliquid.usd_send"],
+    },
+    PetalAuthorityRoute {
+        route_id: "r000042",
+        operation_classes: &["hyperliquid.update_leverage"],
+    },
+    PetalAuthorityRoute {
+        route_id: "r000043",
+        operation_classes: &["hyperliquid.usd_class_transfer"],
+    },
+    PetalAuthorityRoute {
+        route_id: "r000044",
+        operation_classes: &["hyperliquid.usd_send"],
+    },
+];
+
+const PREINSTALLED_POLYMARKET: PreinstalledPetal = PreinstalledPetal {
+    name: "polymarket",
+    repository: "https://github.com/bloom-directory/bloom-petal-polymarket",
+    commit: "c057e6d82f06626e2143213a9dc0c057e4812f89",
+    release_tag: "v0.1.4",
+    archive: "polymarket-v0.1.4.petal.tar.gz",
+    expected_hash: Some("a564d9559a70520995e550df685f74d3ee26af6fbb16facc08de2745bf5ec693"),
+    archive_sha256: "89e781a7c57a95c12345d9b2ea33a8c9a9e800d826f187b7edac4d87bf6596e9",
+    tooling_commit: "864a80b407387871bae06aabe77b91865e55f7bc",
+    petal_abi: "bloom.petal-host/payload-signing-v1",
+    default_eligible: true,
+    lineage_id: Some("pln1_6etojfshqyk6bzm257kzv7noj3perfz4siioiuhj74xosznyzhka"),
+    release_sequence: 1,
+    predecessor_package_hashes: &[],
+    authority_routes: POLYMARKET_AUTHORITY_ROUTES,
+};
+
+const PREINSTALLED_HYPERLIQUID: PreinstalledPetal = PreinstalledPetal {
+    name: "hyperliquid",
+    repository: "https://github.com/bloom-directory/bloom-petal-hyperliquid",
+    commit: "f19e1b10ab2dbeb145704e76b1189bb257622c60",
+    release_tag: "v0.1.5",
+    archive: "hyperliquid-v0.1.5.petal.tar.gz",
+    expected_hash: Some("aa1c50d3443f4c1a710d0ce93a70a65d196fd5842d241e0f78260c8a019d811c"),
+    archive_sha256: "6e4db18c5a3d4cf6d79f97ae79f25b696784492aed584845ccf05124d0918f52",
+    tooling_commit: "864a80b407387871bae06aabe77b91865e55f7bc",
+    petal_abi: "bloom.petal-host/payload-signing-v1",
+    default_eligible: true,
+    lineage_id: Some("pln1_gyksmg4h5sqeu4pic5cg5xuwhhh3pokli3vc62btxjvi3lkwaykq"),
+    release_sequence: 1,
+    predecessor_package_hashes: &[],
+    authority_routes: HYPERLIQUID_AUTHORITY_ROUTES,
+};
 
 const PREINSTALLED_NEAR_INTENTS: PreinstalledPetal = PreinstalledPetal {
     name: "near-intents",
     repository: "https://github.com/bloom-directory/bloom-petal-near",
     commit: NEAR_INTENTS_RELEASE_COMMIT,
-    release_tag: "v0.1.1",
-    archive: "near-intents-v0.1.1.petal.tar.gz",
-    expected_hash: Some("c3f714c01e17f642b8add45b7501d6675c851a13210ce9e834fd16d23330f166"),
-    archive_sha256: "7f3bcc5b762f7750c2fa9c445491f7be32ffdf233d3f371481e8dc3d0a8116d0",
-    tooling_commit: "ec8fe8e445073e4cbef8a62bb27ab88feca32ef6",
+    release_tag: "v0.1.2",
+    archive: "near-intents-v0.1.2.petal.tar.gz",
+    expected_hash: Some("df2b28a0d852cca0c96828d3ff7371d5ec35211c8872647928beffd794671b71"),
+    archive_sha256: "d990462250a82b1ce98e344156b7f80199355bba35621350f9dea7682d85e95c",
+    tooling_commit: "864a80b407387871bae06aabe77b91865e55f7bc",
     petal_abi: "bloom.petal-host/triad-compatible-nonauthority-v1",
     default_eligible: true,
+    lineage_id: None,
+    release_sequence: 0,
+    predecessor_package_hashes: &[],
+    authority_routes: &[],
 };
 
 const PREINSTALLED_ENSO: PreinstalledPetal = PreinstalledPetal {
@@ -57,7 +191,11 @@ const PREINSTALLED_ENSO: PreinstalledPetal = PreinstalledPetal {
     archive_sha256: "16abd73df768b5f9aba45f20b5c56a50c064368d25bf5e8efa31d3564608422e",
     tooling_commit: "ec8fe8e445073e4cbef8a62bb27ab88feca32ef6",
     petal_abi: "bloom.petal-host/triad-compatible-nonauthority-v1",
-    default_eligible: true,
+    default_eligible: false,
+    lineage_id: None,
+    release_sequence: 0,
+    predecessor_package_hashes: &[],
+    authority_routes: &[],
 };
 
 const PREINSTALLED_GASLESS: PreinstalledPetal = PreinstalledPetal {
@@ -71,6 +209,10 @@ const PREINSTALLED_GASLESS: PreinstalledPetal = PreinstalledPetal {
     tooling_commit: "b9fc22d6d8211bc41304b38b1ef8b5269c8035bd",
     petal_abi: "bloom.petal-host/legacy-hash-signing-v1",
     default_eligible: false,
+    lineage_id: None,
+    release_sequence: 0,
+    predecessor_package_hashes: &[],
+    authority_routes: &[],
 };
 
 const PREINSTALLED_PRIVACY_POOLS: PreinstalledPetal = PreinstalledPetal {
@@ -84,6 +226,10 @@ const PREINSTALLED_PRIVACY_POOLS: PreinstalledPetal = PreinstalledPetal {
     tooling_commit: "b9fc22d6d8211bc41304b38b1ef8b5269c8035bd",
     petal_abi: "bloom.petal-host/pre-triad-v1",
     default_eligible: false,
+    lineage_id: None,
+    release_sequence: 0,
+    predecessor_package_hashes: &[],
+    authority_routes: &[],
 };
 
 const PREINSTALLED_VENICE_X402: PreinstalledPetal = PreinstalledPetal {
@@ -97,6 +243,10 @@ const PREINSTALLED_VENICE_X402: PreinstalledPetal = PreinstalledPetal {
     tooling_commit: "6489cb85e7a0f8804fa3dd712c52c37e732ddcea",
     petal_abi: "bloom.petal-host/legacy-hash-signing-v1",
     default_eligible: false,
+    lineage_id: None,
+    release_sequence: 0,
+    predecessor_package_hashes: &[],
+    authority_routes: &[],
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -404,21 +554,14 @@ fn install_github_source_with_expectation(
             "Installing Petal package...".to_owned(),
         )?;
         ensure_source_install_connected(context)?;
-        let (result, meta, index) = daemon
-            .petals
-            .store()
-            .install_prepared_petal_package_with_source_guarded(
+        let detached = bloom_daemon::ipc::IpcOperationContext::detached();
+        let (result, meta, index) = context
+            .unwrap_or(&detached)
+            .commit_petal_package(
+                daemon.petals.store(),
                 package,
                 Some(provenance.clone()),
-                || {
-                    if context.is_some_and(|context| context.is_cancelled()) {
-                        Err(bloom_petals::PetalError::vm(
-                            "Petal source install cancelled by disconnected client",
-                        ))
-                    } else {
-                        Ok(())
-                    }
-                },
+                None,
             )
             .context("install generated Petal package")?;
         Ok((result, meta, index, consent, provenance))
@@ -452,7 +595,7 @@ fn install_github_source_with_expectation(
 /// replaces a Petal it can prove it installed itself from the same trusted
 /// catalog repository.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum PreinstalledState {
+pub(crate) enum PreinstalledState {
     /// The installed owner is exactly the pinned commit and package hash.
     Current,
     /// Same Petal name, same trusted catalog repository, older pinned commit.
@@ -561,6 +704,53 @@ fn install_prebuilt_release_petal(
     daemon: &Daemon,
     entry: &PreinstalledPetal,
 ) -> Result<GitHubInstallOutput> {
+    let context = bloom_daemon::ipc::IpcOperationContext::detached();
+    prepare_prebuilt_release_petal(daemon, entry, &context)?.commit(daemon, &context, None)
+}
+
+pub(crate) struct PreparedReleasePetal {
+    package: PreparedPetalPackage,
+    consent: PetalConsentSummary,
+    provenance: PetalSourceProvenance,
+}
+
+impl PreparedReleasePetal {
+    pub(crate) fn commit(
+        self,
+        daemon: &Daemon,
+        context: &bloom_daemon::ipc::IpcOperationContext,
+        expected_owner: Option<Option<String>>,
+    ) -> Result<GitHubInstallOutput> {
+        let (result, meta, index) = context
+            .commit_petal_package(
+                daemon.petals.store(),
+                self.package,
+                Some(self.provenance.clone()),
+                expected_owner,
+            )
+            .context("install pre-built Petal package")?;
+        Ok(GitHubInstallOutput {
+            result,
+            meta,
+            index,
+            consent: self.consent,
+            provenance: self.provenance,
+            progress: Vec::new(),
+            build_stdout: Vec::new(),
+            build_stderr: Vec::new(),
+            completion_progress: Vec::new(),
+        })
+    }
+}
+
+pub(crate) fn prepare_prebuilt_release_petal(
+    daemon: &Daemon,
+    entry: &PreinstalledPetal,
+    context: &bloom_daemon::ipc::IpcOperationContext,
+) -> Result<PreparedReleasePetal> {
+    if context.is_cancelled() {
+        bail!("Petal acquisition cancelled");
+    }
     let repo = parse_github_install_url(entry.repository)?
         .ok_or_else(|| anyhow!("built-in Petal repository is not a GitHub source URL"))?;
     let release_base = format!(
@@ -573,6 +763,7 @@ fn install_prebuilt_release_petal(
     curl_download(
         &format!("{release_base}/petal-release.json"),
         manifest_file.path(),
+        context,
     )?;
     let manifest: PetalReleaseManifest = serde_json::from_reader(
         std::fs::File::open(manifest_file.path()).context("open Petal release manifest")?,
@@ -582,10 +773,14 @@ fn install_prebuilt_release_petal(
 
     let url = format!("{release_base}/{}", entry.archive);
     let archive = tempfile::NamedTempFile::new().context("create pre-installed Petal download")?;
-    curl_download(&url, archive.path())?;
+    curl_download(&url, archive.path(), context)?;
 
     let checksums = tempfile::NamedTempFile::new().context("create release checksum download")?;
-    curl_download(&format!("{release_base}/SHA256SUMS"), checksums.path())?;
+    curl_download(
+        &format!("{release_base}/SHA256SUMS"),
+        checksums.path(),
+        context,
+    )?;
     let archive_sha = verify_release_checksum(archive.path(), entry.archive, checksums.path())?;
     if !archive_sha.eq_ignore_ascii_case(&manifest.archive_sha256) {
         bail!(
@@ -593,24 +788,94 @@ fn install_prebuilt_release_petal(
             entry.archive
         );
     }
-    install_prebuilt_petal_archive(daemon, entry, &manifest, archive.path())
+    prepare_prebuilt_petal_archive(daemon, entry, &manifest, archive.path())
 }
 
-fn curl_download(url: &str, output: &Path) -> Result<()> {
-    match Command::new("curl")
-        .args(["--fail", "--silent", "--show-error", "--location"])
+fn curl_download(
+    url: &str,
+    output: &Path,
+    context: &bloom_daemon::ipc::IpcOperationContext,
+) -> Result<()> {
+    let mut command = Command::new("curl");
+    command
+        .args([
+            "--fail",
+            "--silent",
+            "--show-error",
+            "--location",
+            "--connect-timeout",
+            "10",
+            "--max-time",
+            "120",
+        ])
         .arg(url)
         .arg("--output")
-        .arg(output)
-        .status()
-    {
-        Ok(status) if status.success() => Ok(()),
-        Ok(status) => bail!("download {url} with curl failed with status {status}"),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            bail!("curl is required to install pre-installed Petal releases")
-        }
-        Err(error) => Err(error).context("launch curl for pre-installed Petal archive"),
+        .arg(output);
+    let result = run_bounded_command(
+        &mut command,
+        Some(context),
+        std::time::Duration::from_secs(125),
+    )
+    .context("download pre-installed Petal release with curl")?;
+    if !result.status.success() {
+        bail!(
+            "download {url} with curl failed: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
     }
+    Ok(())
+}
+
+/// File-backed capture avoids pipe deadlocks while allowing cancellation and
+/// a finite deadline, including for noninteractive Git network operations.
+fn run_bounded_command(
+    command: &mut Command,
+    context: Option<&bloom_daemon::ipc::IpcOperationContext>,
+    timeout: std::time::Duration,
+) -> Result<std::process::Output> {
+    ensure_source_install_connected(context)?;
+    let stdout = tempfile::tempfile()?;
+    let stderr = tempfile::tempfile()?;
+    command
+        .stdin(Stdio::null())
+        .stdout(stdout.try_clone()?)
+        .stderr(stderr.try_clone()?);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        command.process_group(0);
+    }
+    let mut child = command.spawn().context("spawn acquisition command")?;
+    let deadline = std::time::Instant::now() + timeout;
+    let status = loop {
+        if context.is_some_and(|context| context.is_cancelled())
+            || std::time::Instant::now() >= deadline
+        {
+            #[cfg(unix)]
+            if let Some(pid) = rustix::process::Pid::from_raw(child.id() as i32) {
+                let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!("Petal acquisition cancelled or timed out");
+        }
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    use std::io::{Seek, SeekFrom};
+    let read_output = |mut file: std::fs::File| -> Result<Vec<u8>> {
+        file.seek(SeekFrom::Start(0))?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        Ok(bytes)
+    };
+    Ok(std::process::Output {
+        status,
+        stdout: read_output(stdout)?,
+        stderr: read_output(stderr)?,
+    })
 }
 
 fn verify_release_checksum(archive: &Path, name: &str, checksums: &Path) -> Result<String> {
@@ -694,12 +959,26 @@ fn validate_release_manifest(
     Ok(())
 }
 
+#[cfg(test)]
 fn install_prebuilt_petal_archive(
     daemon: &Daemon,
     entry: &PreinstalledPetal,
     release: &PetalReleaseManifest,
     archive: &Path,
 ) -> Result<GitHubInstallOutput> {
+    prepare_prebuilt_petal_archive(daemon, entry, release, archive)?.commit(
+        daemon,
+        &bloom_daemon::ipc::IpcOperationContext::detached(),
+        None,
+    )
+}
+
+fn prepare_prebuilt_petal_archive(
+    daemon: &Daemon,
+    entry: &PreinstalledPetal,
+    release: &PetalReleaseManifest,
+    archive: &Path,
+) -> Result<PreparedReleasePetal> {
     let file = std::fs::File::open(archive)
         .with_context(|| format!("open pre-installed Petal archive {}", archive.display()))?;
     let package = PreparedPetalPackage::from_reader(GzDecoder::new(file))
@@ -729,6 +1008,7 @@ fn install_prebuilt_petal_archive(
             expected_hash
         );
     }
+    validate_release_authority(entry, &package)?;
 
     let mut consent = petal_consent_summary(&package).context("build Petal consent summary")?;
     let bindings = daemon
@@ -754,27 +1034,17 @@ fn install_prebuilt_petal_archive(
         selected_tag: Some(entry.release_tag.to_string()),
         package_hash: package.hash.clone(),
     };
-    let (result, meta, index) = daemon
-        .petals
-        .store()
-        .install_prepared_petal_package_with_source(package, Some(provenance.clone()))
-        .context("install pre-built Petal package")?;
-
-    Ok(GitHubInstallOutput {
-        result,
-        meta,
-        index,
+    Ok(PreparedReleasePetal {
+        package,
         consent,
         provenance,
-        progress: Vec::new(),
-        build_stdout: Vec::new(),
-        build_stderr: Vec::new(),
-        completion_progress: Vec::new(),
     })
 }
 
-fn preinstalled_petal(name: &str) -> Option<&'static PreinstalledPetal> {
+pub(crate) fn preinstalled_petal(name: &str) -> Option<&'static PreinstalledPetal> {
     match name {
+        "polymarket" => Some(&PREINSTALLED_POLYMARKET),
+        "hyperliquid" => Some(&PREINSTALLED_HYPERLIQUID),
         "near-intents" => Some(&PREINSTALLED_NEAR_INTENTS),
         "enso" => Some(&PREINSTALLED_ENSO),
         "gasless" => Some(&PREINSTALLED_GASLESS),
@@ -784,6 +1054,70 @@ fn preinstalled_petal(name: &str) -> Option<&'static PreinstalledPetal> {
     }
 }
 
+pub(crate) fn release_authority_petals() -> impl Iterator<Item = &'static PreinstalledPetal> {
+    [&PREINSTALLED_POLYMARKET, &PREINSTALLED_HYPERLIQUID].into_iter()
+}
+
+fn validate_release_authority(
+    entry: &PreinstalledPetal,
+    package: &PreparedPetalPackage,
+) -> Result<()> {
+    if entry.lineage_id.is_none() {
+        return Ok(());
+    }
+    let declared = entry
+        .authority_routes
+        .iter()
+        .map(|route| (route.route_id, route))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    if declared.len() != entry.authority_routes.len() {
+        bail!(
+            "pre-installed Petal {} has duplicate authority routes",
+            entry.name
+        );
+    }
+    for route in &package.route_index.routes {
+        let mut actual = route
+            .key_derive_operation_classes
+            .iter()
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>();
+        if let Some(intent) = route.install_metadata.sign_intent.as_deref() {
+            actual.insert(intent);
+        }
+        let expected = declared
+            .get(route.route_id.as_str())
+            .map(|declaration| {
+                declaration
+                    .operation_classes
+                    .iter()
+                    .copied()
+                    .collect::<std::collections::BTreeSet<_>>()
+            })
+            .unwrap_or_default();
+        if actual != expected {
+            bail!(
+                "pre-installed Petal {} route {} authority differs from the release declaration",
+                entry.name,
+                route.route_id
+            );
+        }
+    }
+    if entry.authority_routes.iter().any(|declaration| {
+        !package
+            .route_index
+            .routes
+            .iter()
+            .any(|route| route.route_id == declaration.route_id)
+    }) {
+        bail!(
+            "pre-installed Petal {} declares an absent authority route",
+            entry.name
+        );
+    }
+    Ok(())
+}
+
 /// Classify an installed owner against the pinned catalog entry.
 ///
 /// Returns `Current` when the installation is already the pinned commit and
@@ -791,7 +1125,7 @@ fn preinstalled_petal(name: &str) -> Option<&'static PreinstalledPetal> {
 /// repository at a different commit. Every other shape — missing provenance, a
 /// different repository, or an identity that contradicts itself — is refused so
 /// that manually sourced or untrusted ownership is never overwritten.
-fn classify_existing_preinstalled(
+pub(crate) fn classify_existing_preinstalled(
     expected: &PreinstalledPetal,
     meta: &bloom_petals::meta::PetalMeta,
 ) -> Result<PreinstalledState> {
@@ -1126,8 +1460,7 @@ fn run_source_build_streaming(
         use std::os::unix::process::CommandExt as _;
         build_command.process_group(0);
     }
-    let mut child = build_command
-        .spawn()
+    let mut child = spawn_source_build(&mut build_command)
         .with_context(|| format!("run build command {}", build.command))?;
     let stdout = child.stdout.take().context("capture source-build stdout")?;
     let stderr = child.stderr.take().context("capture source-build stderr")?;
@@ -1147,8 +1480,11 @@ fn run_source_build_streaming(
             bloom_daemon::ipc::IpcOutputStream::Stderr,
         )
     });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
     let status = loop {
-        if context.is_some_and(|context| context.is_cancelled()) {
+        if context.is_some_and(|context| context.is_cancelled())
+            || std::time::Instant::now() >= deadline
+        {
             #[cfg(unix)]
             if let Some(pid) = rustix::process::Pid::from_raw(child.id() as i32) {
                 let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
@@ -1158,7 +1494,7 @@ fn run_source_build_streaming(
             let _ = child.wait();
             let _ = join_captured_stream(stdout_reader, "stdout");
             let _ = join_captured_stream(stderr_reader, "stderr");
-            bail!("Petal source build cancelled by disconnected client");
+            bail!("Petal source build cancelled or timed out");
         }
         if let Some(status) = child
             .try_wait()
@@ -1197,6 +1533,21 @@ fn run_source_build_streaming(
         }
     }
     Ok(SourceBuildOutput { stdout, stderr })
+}
+
+fn spawn_source_build(command: &mut Command) -> std::io::Result<Child> {
+    for retry in 0..=4 {
+        match command.spawn() {
+            Ok(child) => return Ok(child),
+            Err(error) if error.kind() == ErrorKind::ExecutableFileBusy && retry < 4 => {
+                // A freshly materialized script can remain transiently busy on
+                // Linux overlay filesystems. Retry only that kernel condition.
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!("the source-build spawn loop always returns")
 }
 
 fn capture_bounded_stream(
@@ -1315,7 +1666,8 @@ fn git_output(cwd: Option<&Path>, args: &[&str]) -> Result<std::process::Output>
         command.current_dir(cwd);
     }
     command.args(args);
-    command.output().context("spawn git")
+    command.env("GIT_TERMINAL_PROMPT", "0");
+    run_bounded_command(&mut command, None, std::time::Duration::from_secs(120))
 }
 
 #[cfg(test)]
@@ -1371,24 +1723,33 @@ mod tests {
     #[test]
     fn built_in_entries_are_immutable_and_incompatible_petals_are_absent() {
         let near = preinstalled_petal("near-intents").unwrap();
-        assert_eq!(near.release_tag, "v0.1.1");
+        assert_eq!(near.release_tag, "v0.1.2");
         assert_eq!(near.commit.len(), 40);
-        assert_eq!(near.archive, "near-intents-v0.1.1.petal.tar.gz");
+        assert_eq!(near.archive, "near-intents-v0.1.2.petal.tar.gz");
         assert!(near.repository.ends_with("/bloom-petal-near"));
         let enso = preinstalled_petal("enso").unwrap();
         assert_eq!(enso.release_tag, "v0.1.2");
         assert_eq!(enso.commit, ENSO_RELEASE_COMMIT);
         assert_eq!(enso.archive, "enso-v0.1.2.petal.tar.gz");
         assert!(enso.repository.ends_with("/bloom-petal-enso"));
-        for name in ["gasless", "privacy-pools", "venice-x402"] {
+        for name in [
+            "polymarket",
+            "hyperliquid",
+            "near-intents",
+            "enso",
+            "gasless",
+            "privacy-pools",
+            "venice-x402",
+        ] {
             let entry = preinstalled_petal(name).unwrap();
             assert_eq!(entry.name, name);
             assert_eq!(entry.commit.len(), 40);
             assert!(entry.expected_hash.is_some());
-            assert!(!entry.default_eligible);
+            assert_eq!(
+                entry.default_eligible,
+                matches!(name, "polymarket" | "hyperliquid" | "near-intents")
+            );
         }
-        assert!(preinstalled_petal("polymarket").is_none());
-        assert!(preinstalled_petal("hyperliquid").is_none());
         assert!(preinstalled_petal("unknown").is_none());
     }
 
@@ -1542,6 +1903,10 @@ mod tests {
             tooling_commit: "3333333333333333333333333333333333333333",
             petal_abi: "bloom.petal-host/triad-compatible-nonauthority-v1",
             default_eligible: true,
+            lineage_id: None,
+            release_sequence: 0,
+            predecessor_package_hashes: &[],
+            authority_routes: &[],
         }
     }
 
@@ -1703,6 +2068,191 @@ mod tests {
         drop(home);
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn background_acquisition_keeps_ipc_readable_and_cannot_overwrite_manual_install() {
+        use crate::petal_provisioning::{ProvisioningOutcome, provision_with};
+        use bloom_daemon::ipc::{IpcClient, IpcServer};
+        let old = build_near_release("old");
+        let pending = build_near_release("pending");
+        let manual = build_near_release("manual");
+        let (_home, _, daemon) =
+            near_home_with_installed(&old.package, NEAR_REPO, NEAR_OLD_COMMIT, None);
+        let entry = near_catalog_entry(NEAR_NEW_COMMIT, "v0.1.1", "near.tar.gz", None);
+        let server =
+            IpcServer::new(daemon.vfs.clone(), "test", vec![]).with_petals(daemon.petals.clone());
+        let context = server.petal_operation_context();
+        let socket_dir = tempfile::tempdir().unwrap();
+        let socket = socket_dir.path().join("run/bloom.sock");
+        let serving_socket = socket.clone();
+        let serving = server.clone();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let ready_tx = std::sync::Mutex::new(Some(ready_tx));
+        let serving = serving.with_ready_callback(std::sync::Arc::new(move || {
+            ready_tx.lock().unwrap().take().unwrap().send(()).unwrap();
+        }));
+        let server_task =
+            tokio::spawn(async move { serving.serve(&serving_socket).await.unwrap() });
+        ready_rx.await.unwrap();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let started_tx = std::sync::Mutex::new(Some(started_tx));
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let provisioning_daemon = daemon.clone();
+        let worker = tokio::task::spawn_blocking(move || {
+            provision_with(
+                &provisioning_daemon,
+                &context,
+                |_| Some(entry),
+                |daemon, entry, _| {
+                    started_tx.lock().unwrap().take().unwrap().send(()).unwrap();
+                    release_rx
+                        .recv_timeout(std::time::Duration::from_secs(10))
+                        .unwrap();
+                    prepare_prebuilt_petal_archive(
+                        daemon,
+                        entry,
+                        &near_release_manifest(entry, &pending.package.hash),
+                        pending.archive.path(),
+                    )
+                },
+            )
+        });
+        started_rx.await.unwrap();
+        let client = IpcClient::new(&socket);
+        let version = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            client.call("version", serde_json::Value::Null),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(version, "test");
+        let body = daemon
+            .vfs
+            .read(&VfsPath::parse("/petals/near-intents/hello.txt").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(body, b"component");
+        let manual_tar = tempfile::NamedTempFile::new().unwrap();
+        manual
+            .package
+            .write_petal_tar(manual_tar.reopen().unwrap())
+            .unwrap();
+        let installed = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            client.call(
+                "petals.install",
+                serde_json::json!({"path": manual_tar.path()}),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(installed["hash"], manual.package.hash);
+        release_tx.send(()).unwrap();
+        let results = worker.await.unwrap();
+        assert!(
+            matches!(&results[0].outcome, ProvisioningOutcome::Failed(message) if message.contains("owner changed")),
+            "{results:?}"
+        );
+        assert_eq!(
+            installed_owner(&daemon).as_deref(),
+            Some(manual.package.hash.as_str())
+        );
+        server.trigger_shutdown();
+        tokio::time::timeout(std::time::Duration::from_secs(2), server_task)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[test]
+    fn provisioning_attempts_each_entry_once_and_retries_only_on_next_pass() {
+        use crate::petal_provisioning::{ProvisioningOutcome, provision_with};
+        let old = build_near_release("old");
+        let next = build_near_release("new");
+        let (_home, _, mut daemon) =
+            near_home_with_installed(&old.package, NEAR_REPO, NEAR_OLD_COMMIT, None);
+        daemon.config.petals.preinstalled = vec!["offline".into(), "near-intents".into()];
+        let entry = near_catalog_entry(NEAR_NEW_COMMIT, "v0.1.1", "near.tar.gz", None);
+        let context = bloom_daemon::ipc::IpcOperationContext::detached();
+        let calls = std::cell::Cell::new(0);
+        let results = provision_with(
+            &daemon,
+            &context,
+            |name| {
+                Some(PreinstalledPetal {
+                    name: if name == "offline" {
+                        "offline"
+                    } else {
+                        "near-intents"
+                    },
+                    ..entry
+                })
+            },
+            |daemon, entry, _| {
+                calls.set(calls.get() + 1);
+                if entry.name == "offline" {
+                    bail!("offline fixture");
+                }
+                prepare_prebuilt_petal_archive(
+                    daemon,
+                    entry,
+                    &near_release_manifest(entry, &next.package.hash),
+                    next.archive.path(),
+                )
+            },
+        );
+        assert_eq!(calls.get(), 2);
+        assert!(
+            matches!(&results[0].outcome, ProvisioningOutcome::Failed(message) if message.contains("offline"))
+        );
+        assert_eq!(results[1].outcome, ProvisioningOutcome::Installed);
+        daemon.config.petals.preinstalled = vec!["near-intents".into()];
+        let results = provision_with(
+            &daemon,
+            &context,
+            |_| Some(entry),
+            |_, _, _| panic!("current package must not be acquired again"),
+        );
+        assert_eq!(results[0].outcome, ProvisioningOutcome::Current);
+    }
+
+    #[tokio::test]
+    async fn acquisition_command_cancels_and_times_out_without_waiting_for_child() {
+        let context = bloom_daemon::ipc::IpcOperationContext::detached();
+        let cancellation = context.clone();
+        let child = tokio::task::spawn_blocking(move || {
+            run_bounded_command(
+                Command::new("sh").args(["-c", "sleep 30"]),
+                Some(&context),
+                std::time::Duration::from_secs(60),
+            )
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        cancellation.cancel();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(2), child)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_err()
+        );
+        let timed_out = tokio::task::spawn_blocking(|| {
+            run_bounded_command(
+                Command::new("sh").args(["-c", "sleep 30"]),
+                None,
+                std::time::Duration::from_millis(30),
+            )
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(2), timed_out)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_err()
+        );
+    }
+
     #[test]
     fn failed_replacement_verification_leaves_the_previous_owner_active() {
         let old = build_near_release("v0.1.0");
@@ -1847,6 +2397,10 @@ mod tests {
             tooling_commit: "3333333333333333333333333333333333333333",
             petal_abi: "bloom.petal-host/triad-compatible-nonauthority-v1",
             default_eligible: true,
+            lineage_id: None,
+            release_sequence: 0,
+            predecessor_package_hashes: &[],
+            authority_routes: &[],
         };
         let release = PetalReleaseManifest {
             schema: "bloom.petal.release.v1".into(),

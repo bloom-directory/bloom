@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+uid="$(id -u)"
+config_root="/etc/bloom/$uid"
+runtime_root="/run/bloom/$uid"
+
+export BLOOM_BROKER_SOCKET="$runtime_root/broker/rpc/broker.sock"
+export BLOOM_MACHINE_IDENTITY="$config_root/machine/identity.json"
+export BLOOM_EDGE_MANIFEST="$config_root/edge-manifest.json"
+export BLOOM_PROVENANCE_CATALOG="$config_root/provenance-catalog.json"
+export BLOOM_MACHINE_AUDIT_CHECKPOINT_DIR="/var/lib/bloom/$uid/machine/audit-checkpoints"
+export BLOOM_MACHINE_AUDIT_HISTORY="$config_root/machine-audit-history.json"
+export BLOOM_AUTHORITY_EDGE_HISTORY="$config_root/authority-edge-history.json"
+
+exec /usr/libexec/bloom/current/bloom "$@"

@@ -1,0 +1,26 @@
+[Unit]
+Description=Bloom authenticated login-session sentinel
+ConditionPathExists=/etc/bloom/%U/edge-manifest.json
+
+[Service]
+Type=simple
+ExecStart=/usr/libexec/bloom/current/bloom serve session-sentinel
+Environment=BLOOM_LOG_OUTPUT=json-stderr
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=bloom-session
+Restart=on-failure
+RestartSec=5s
+UMask=0077
+NoNewPrivileges=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RemoveIPC=yes
+LimitCORE=0
+RestrictAddressFamilies=AF_UNIX
+
+[Install]
+WantedBy=default.target

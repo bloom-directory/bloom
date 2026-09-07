@@ -178,13 +178,26 @@ fn fixture_is_an_installable_package_with_only_scoped_authority_imports() {
     assert_eq!(package.name, "triad-authority-fixture");
     assert_eq!(
         package.hash,
-        "d1e895bb0ee3fd58a2a0d434724cb6060adb769f8604286a2906fd9b8295e9c6"
+        "d219b74707f3c0d013cb4c4fab4f13818060869bca1e49e649b65452eba1a3c2"
     );
     assert_eq!(package.route_index.routes.len(), 1);
     assert_eq!(package.route_index.routes[0].pattern, "session.json");
     assert_eq!(
         package.route_index.routes[0].key_derive_operation_classes,
         ["fixture.payload"]
+    );
+    assert_eq!(
+        package.route_index.routes[0].key_derive_allowed_routes,
+        ["r000001"]
+    );
+    assert!(package.route_index.routes[0].key_derive_scope_declared);
+    assert_eq!(
+        package.route_index.routes[0].key_derive_allowed_crypto_suites,
+        ["secp256k1-sha256-recoverable"]
+    );
+    assert_eq!(
+        package.route_index.routes[0].key_derive_maximum_lifetime_ms,
+        Some(300_000)
     );
     let component = std::fs::read(format!(
         "{FIXTURE}/petal/triad-authority-fixture/session.json.wasm"

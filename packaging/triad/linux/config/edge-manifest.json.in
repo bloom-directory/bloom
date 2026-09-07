@@ -1,6 +1,6 @@
 {
   "schema": "bloom.edge-manifest.1",
-  "trusted_time_source": "linux-chrony-nts",
+  "trusted_time_source": "linux-system-clock",
   "machine": {
     "effective_uid": @LOGIN_UID@,
     "service_id": "bloom-machine",

@@ -163,6 +163,13 @@ scope and installer-signed provenance. Machine retains the public approval
 binding with the `KeyRef`; the Petal receives neither an approval capability
 nor another ceremony for each matching action.
 
+For manifest-scoped Petals, canonical route patterns, operation classes,
+crypto suites, and the maximum lifetime are authenticated package bounds. The
+component may request narrower classes, suites, or lifetime, but Machine
+rejects widening and supplies the resolved route IDs itself. Packages predating
+that complete manifest scope retain their legacy request semantics only as a
+compatibility path.
+
 Venue-specific custody and signing protocols do not belong in Machine, Broker,
 or Signer. An installed Hyperliquid Petal, for example, uses this generic scope
 instead of a native Machine agent-session key.

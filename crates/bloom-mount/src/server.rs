@@ -29,8 +29,15 @@ use crate::{MountConfig, MountError, MountHandle, build_mount_args, build_mount_
 
 const MOUNT_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 const UMOUNT_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
+const FSTAB_UMOUNT_COMMAND_TIMEOUT: Duration = Duration::from_secs(15);
 
 type CommandAttempt = (String, Vec<String>);
+
+#[derive(Debug, PartialEq, Eq)]
+struct MountedFilesystem {
+    source: String,
+    filesystem_type: String,
+}
 
 fn unmount_args(path: &Path) -> Vec<String> {
     #[cfg(target_os = "linux")]
@@ -47,7 +54,17 @@ fn unmount_args(path: &Path) -> Vec<String> {
     }
 }
 
-fn unmount_attempts(path: &Path) -> Vec<CommandAttempt> {
+fn unmount_attempts(path: &Path, from_fstab: bool) -> Vec<CommandAttempt> {
+    if from_fstab {
+        let target = path.display().to_string();
+        #[cfg(target_os = "linux")]
+        return vec![
+            ("umount".to_string(), vec![target.clone()]),
+            ("umount".to_string(), vec!["-l".to_string(), target]),
+        ];
+        #[cfg(not(target_os = "linux"))]
+        return vec![("umount".to_string(), vec![target])];
+    }
     let args = unmount_args(path);
     #[cfg(target_os = "linux")]
     {
@@ -123,6 +140,100 @@ fn run_command_attempts(
     Err(MountError::Mount(errors.join("; ")))
 }
 
+#[cfg(target_os = "linux")]
+fn mounted_filesystem(path: &Path) -> Result<Option<MountedFilesystem>, MountError> {
+    let args = vec![
+        "--noheadings".to_string(),
+        "--output".to_string(),
+        "SOURCE,FSTYPE".to_string(),
+        "--mountpoint".to_string(),
+        path.display().to_string(),
+    ];
+    let output = run_command_with_timeout("findmnt", &args, UMOUNT_COMMAND_TIMEOUT)?;
+    if output.status.code() == Some(1) {
+        return Ok(None);
+    }
+    if !output.status.success() {
+        return Err(MountError::Mount(format!(
+            "findmnt failed for {}: {}",
+            path.display(),
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut fields = stdout.split_whitespace();
+    let source = fields.next().unwrap_or_default();
+    let filesystem_type = fields.next().unwrap_or_default();
+    if source.is_empty() || filesystem_type.is_empty() || fields.next().is_some() {
+        return Err(MountError::Mount(format!(
+            "findmnt returned an ambiguous mount for {}",
+            path.display()
+        )));
+    }
+    Ok(Some(MountedFilesystem {
+        source: source.to_string(),
+        filesystem_type: filesystem_type.to_string(),
+    }))
+}
+
+#[cfg(target_os = "macos")]
+fn mounted_filesystem(path: &Path) -> Result<Option<MountedFilesystem>, MountError> {
+    let output = run_command_with_timeout("mount", &[], UMOUNT_COMMAND_TIMEOUT)?;
+    if !output.status.success() {
+        return Err(MountError::Mount(format!(
+            "mount listing failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+    let marker = format!(" on {} (", path.display());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut matches = stdout.lines().filter_map(|line| {
+        let (source, suffix) = line.split_once(&marker)?;
+        let filesystem_type = suffix.split(',').next()?.trim_end_matches(')').trim();
+        Some(MountedFilesystem {
+            source: source.to_string(),
+            filesystem_type: filesystem_type.to_string(),
+        })
+    });
+    let mounted = matches.next();
+    if matches.next().is_some() {
+        return Err(MountError::Mount(format!(
+            "mount returned multiple filesystems for {}",
+            path.display()
+        )));
+    }
+    Ok(mounted)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn mounted_filesystem(_path: &Path) -> Result<Option<MountedFilesystem>, MountError> {
+    Ok(None)
+}
+
+fn validate_stale_mount(mounted: &MountedFilesystem, cfg: &MountConfig) -> Result<(), MountError> {
+    let expected_source = format!("{}:/", cfg.nfs_listen.ip());
+    if mounted.source == expected_source && mounted.filesystem_type.starts_with("nfs") {
+        return Ok(());
+    }
+    Err(MountError::Config(format!(
+        "mount path {} contains foreign filesystem {} ({})",
+        cfg.mount_path.display(),
+        mounted.source,
+        mounted.filesystem_type
+    )))
+}
+
+fn reconcile_stale_mount(cfg: &MountConfig, _from_fstab: bool) -> Result<(), MountError> {
+    let Some(mounted) = mounted_filesystem(&cfg.mount_path)? else {
+        return Ok(());
+    };
+    validate_stale_mount(&mounted, cfg)?;
+    Err(MountError::Mount(format!(
+        "refusing to replace an existing Bloom mount at {}",
+        cfg.mount_path.display()
+    )))
+}
+
 fn linux_mount_fallback_args(cfg: &MountConfig, server: SocketAddr) -> Vec<String> {
     let port = server.port();
     let mut opts = build_mount_opts(port);
@@ -146,15 +257,22 @@ pub struct NfsMountHandle {
     mount_path: PathBuf,
     server_task: parking_lot::Mutex<Option<JoinHandle<()>>>,
     unmounted: parking_lot::Mutex<bool>,
+    from_fstab: bool,
 }
 
 impl NfsMountHandle {
-    fn new(nfs_addr: SocketAddr, mount_path: PathBuf, server_task: JoinHandle<()>) -> Self {
+    fn new(
+        nfs_addr: SocketAddr,
+        mount_path: PathBuf,
+        server_task: JoinHandle<()>,
+        from_fstab: bool,
+    ) -> Self {
         Self {
             nfs_addr,
             mount_path,
             server_task: parking_lot::Mutex::new(Some(server_task)),
             unmounted: parking_lot::Mutex::new(false),
+            from_fstab,
         }
     }
 }
@@ -167,12 +285,20 @@ impl Drop for NfsMountHandle {
         let already = *self.unmounted.lock();
         if !already {
             let mp = self.mount_path.clone();
+            let from_fstab = self.from_fstab;
             let mount_path_display = mp.display().to_string();
             if std::thread::Builder::new()
                 .name("bloom-nfs-drop-umount".to_string())
                 .spawn(move || {
                     if let Err(e) =
-                        run_command_attempts(unmount_attempts(&mp), UMOUNT_COMMAND_TIMEOUT)
+                        run_command_attempts(
+                            unmount_attempts(&mp, from_fstab),
+                            if from_fstab {
+                                FSTAB_UMOUNT_COMMAND_TIMEOUT
+                            } else {
+                                UMOUNT_COMMAND_TIMEOUT
+                            },
+                        )
                     {
                         warn!(mount_path = %mount_path_display, error = %e, "mount.drop.umount_failed");
                     }
@@ -203,8 +329,16 @@ impl MountHandle for NfsMountHandle {
             *flag = true;
         }
         let mp = self.mount_path.clone();
+        let from_fstab = self.from_fstab;
         let output = tokio::task::spawn_blocking(move || {
-            run_command_attempts(unmount_attempts(&mp), UMOUNT_COMMAND_TIMEOUT)
+            run_command_attempts(
+                unmount_attempts(&mp, from_fstab),
+                if from_fstab {
+                    FSTAB_UMOUNT_COMMAND_TIMEOUT
+                } else {
+                    UMOUNT_COMMAND_TIMEOUT
+                },
+            )
         })
         .await
         .map_err(|e| MountError::Mount(format!("umount join: {e}")))??;
@@ -246,6 +380,39 @@ pub async fn serve_nfs(vfs: Vfs, mount_point: &Path) -> Result<NfsMountHandle, M
 /// readonly flag. `cfg.nfs_listen` may use port 0 to pick an ephemeral
 /// port; the actual bound address is reflected in the returned handle.
 pub async fn serve_nfs_with(vfs: Vfs, cfg: MountConfig) -> Result<NfsMountHandle, MountError> {
+    serve_nfs_config(vfs, cfg, false).await
+}
+
+/// Mount using an exact `/etc/fstab` entry. The listener must use the same
+/// fixed port recorded by the installer; no source or option supplied by the
+/// unprivileged process is trusted by the system mount helper.
+pub async fn serve_nfs_from_fstab(
+    vfs: Vfs,
+    cfg: MountConfig,
+) -> Result<NfsMountHandle, MountError> {
+    if !cfg.nfs_listen.ip().is_loopback() {
+        return Err(MountError::Config(
+            "fstab mounts require a loopback NFS listener".to_string(),
+        ));
+    }
+    if cfg.nfs_listen.port() == 0 {
+        return Err(MountError::Config(
+            "fstab mounts require a fixed NFS listen port".to_string(),
+        ));
+    }
+    if cfg.readonly {
+        return Err(MountError::Config(
+            "the packaged fstab mount is read-write".to_string(),
+        ));
+    }
+    serve_nfs_config(vfs, cfg, true).await
+}
+
+async fn serve_nfs_config(
+    vfs: Vfs,
+    cfg: MountConfig,
+    from_fstab: bool,
+) -> Result<NfsMountHandle, MountError> {
     if !cfg.mount_path.exists() {
         return Err(MountError::Config(format!(
             "mount path does not exist: {}",
@@ -258,6 +425,11 @@ pub async fn serve_nfs_with(vfs: Vfs, cfg: MountConfig) -> Result<NfsMountHandle
             cfg.mount_path.display()
         )));
     }
+
+    let reconcile_cfg = cfg.clone();
+    tokio::task::spawn_blocking(move || reconcile_stale_mount(&reconcile_cfg, from_fstab))
+        .await
+        .map_err(|e| MountError::Mount(format!("stale mount reconciliation join: {e}")))??;
 
     // Bind the embednfs server on the requested address. Resolve the
     // OS-assigned port immediately so we can wire it into the mount
@@ -279,8 +451,15 @@ pub async fn serve_nfs_with(vfs: Vfs, cfg: MountConfig) -> Result<NfsMountHandle
     // the client struct) doesn't pin the runtime worker.
     let args = build_mount_args(&cfg, local);
     let cmd_name = crate::detect_mount_command();
-    let mut attempts = vec![(cmd_name.to_string(), args.clone())];
-    if cfg!(target_os = "linux") {
+    let mut attempts = if from_fstab {
+        vec![(
+            "mount".to_string(),
+            vec![cfg.mount_path.display().to_string()],
+        )]
+    } else {
+        vec![(cmd_name.to_string(), args.clone())]
+    };
+    if cfg!(target_os = "linux") && !from_fstab {
         let fallback_args = linux_mount_fallback_args(&cfg, local);
         attempts.push(("mount".to_string(), fallback_args.clone()));
         attempts.push(("sudo".to_string(), sudo_args(cmd_name, &args)));
@@ -313,7 +492,12 @@ pub async fn serve_nfs_with(vfs: Vfs, cfg: MountConfig) -> Result<NfsMountHandle
     }
 
     info!(mount_path = %mp_for_log.display(), nfs_addr = %local, "mount.established");
-    Ok(NfsMountHandle::new(local, cfg.mount_path, server_task))
+    Ok(NfsMountHandle::new(
+        local,
+        cfg.mount_path,
+        server_task,
+        from_fstab,
+    ))
 }
 
 #[cfg(test)]
@@ -466,6 +650,23 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn fstab_mount_rejects_non_loopback_listener() {
+        let directory = unique_nonexistent_path();
+        std::fs::create_dir(&directory).unwrap();
+        let cfg = MountConfig {
+            mount_path: directory.clone(),
+            nfs_listen: "0.0.0.0:20000".parse().unwrap(),
+            readonly: false,
+        };
+        let vfs = bloom_vfs::Vfs::builder().build();
+        match serve_nfs_from_fstab(vfs, cfg).await {
+            Err(error) => assert!(error.to_string().contains("loopback NFS listener")),
+            Ok(_) => panic!("non-loopback fstab listener must be rejected"),
+        }
+        std::fs::remove_dir(directory).unwrap();
+    }
+
     /// Calling `unmount` twice must be safe: the second call observes
     /// the `unmounted` flag and returns `Ok(())` without re-running
     /// `umount`. The first call will fail because the mount path is
@@ -475,7 +676,7 @@ mod tests {
     async fn unmount_is_idempotent() {
         let mount_path = unique_nonexistent_path();
         let task = dummy_server_task();
-        let handle = NfsMountHandle::new(ephemeral_addr(), mount_path.clone(), task);
+        let handle = NfsMountHandle::new(ephemeral_addr(), mount_path.clone(), task, false);
         // First call: umount(8) will fail (path doesn't exist / isn't
         // a mount). We don't care about the error variant here, only
         // that the flag flips.
@@ -497,6 +698,46 @@ mod tests {
         assert!(args.contains(&"-l".to_string()));
         #[cfg(not(target_os = "linux"))]
         assert!(!args.contains(&"-l".to_string()));
+    }
+
+    #[test]
+    fn fstab_unmount_uses_only_the_authorized_target() {
+        let attempts = unmount_attempts(Path::new("/home/alice/bloom"), true);
+        assert_eq!(
+            attempts[0],
+            ("umount".to_string(), vec!["/home/alice/bloom".to_string()])
+        );
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            attempts[1],
+            (
+                "umount".to_string(),
+                vec!["-l".to_string(), "/home/alice/bloom".to_string()],
+            )
+        );
+        #[cfg(not(target_os = "linux"))]
+        assert_eq!(attempts.len(), 1);
+    }
+
+    #[test]
+    fn stale_mount_validation_accepts_only_the_expected_loopback_nfs_export() {
+        let cfg = MountConfig {
+            mount_path: PathBuf::from("/home/alice/bloom"),
+            nfs_listen: "127.0.0.1:20000".parse().unwrap(),
+            readonly: false,
+        };
+        let expected = MountedFilesystem {
+            source: "127.0.0.1:/".to_string(),
+            filesystem_type: "nfs4".to_string(),
+        };
+        assert!(validate_stale_mount(&expected, &cfg).is_ok());
+
+        let foreign = MountedFilesystem {
+            source: "/dev/sda1".to_string(),
+            filesystem_type: "ext4".to_string(),
+        };
+        let error = validate_stale_mount(&foreign, &cfg).unwrap_err();
+        assert!(error.to_string().contains("foreign filesystem"));
     }
 
     /// Aborting the server task as part of `unmount` should cause the
@@ -534,7 +775,7 @@ mod tests {
     async fn drop_without_unmount_does_not_panic() {
         let mount_path = unique_nonexistent_path();
         let task = dummy_server_task();
-        let handle = NfsMountHandle::new(ephemeral_addr(), mount_path, task);
+        let handle = NfsMountHandle::new(ephemeral_addr(), mount_path, task, false);
         // Confirm the public accessors expose what we passed in before
         // we drop. (The test asserts `Drop` is sound by simply running
         // it inside the test — a panic in `Drop` would abort the test
@@ -555,7 +796,7 @@ mod tests {
     async fn drop_after_unmount_is_quiet() {
         let mount_path = unique_nonexistent_path();
         let task = dummy_server_task();
-        let handle = NfsMountHandle::new(ephemeral_addr(), mount_path, task);
+        let handle = NfsMountHandle::new(ephemeral_addr(), mount_path, task, false);
         let _ = handle.unmount().await; // flips the unmounted flag
         drop(handle);
     }

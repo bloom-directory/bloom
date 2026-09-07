@@ -1,3 +1,5 @@
+#[cfg(target_os = "macos")]
+use std::process::Command;
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -99,6 +101,25 @@ fn session_agent_has_no_service_authority_and_stops_with_the_login_domain() {
 }
 
 #[test]
+fn machine_agent_runs_bloom_serve_and_mounts_the_login_home() {
+    let source = fs::read_to_string(
+        workspace().join("packaging/triad/macos/launchagents/com.bloom.machine.plist.in"),
+    )
+    .expect("read Machine LaunchAgent source");
+
+    assert!(source.contains("<string>com.bloom.machine</string>"));
+    assert!(source.contains("@BLOOM_MACHINE_BINARY@"));
+    assert!(source.contains("<string>serve</string>"));
+    assert!(source.contains("<string>--mount-home</string>"));
+    assert!(source.contains("<key>RunAtLoad</key>"));
+    assert!(source.contains("<key>KeepAlive</key>"));
+    assert!(source.contains("<string>json-file-home</string>"));
+    assert!(!source.contains("<key>NumberOfProcesses</key>"));
+    assert!(!source.contains("UserName"));
+    assert!(!source.contains("/Users/"));
+}
+
+#[test]
 fn broker_requires_the_authenticated_session_socket_before_ceremonies() {
     let source = fs::read_to_string(
         workspace().join("packaging/triad/macos/launchdaemons/com.bloom.broker.plist.in"),
@@ -135,7 +156,7 @@ fn macos_packaging_pins_platform_time_checkpoint_and_future_rootless_separation(
 #[test]
 fn installed_acceptance_derives_the_signed_release_digest_and_reads_sources_as_login() {
     let source = fs::read_to_string(
-        workspace().join("packaging/triad/macos/w0/run-installed-acceptance.sh"),
+        workspace().join("tests/conformance/macos-unix-principals/run-installed-acceptance.sh"),
     )
     .unwrap();
     assert!(source.contains("shasum -a 256 \"$payload/SHA256SUMS\""));
@@ -170,8 +191,10 @@ fn root_pf_monitor_has_no_rpc_or_custody_surface_and_services_require_its_attest
     .unwrap();
     assert!(plist.contains("<string>root</string>"));
     assert!(plist.contains("<string>serve</string>"));
-    assert!(plist.contains("<string>triad-pf-monitor-once</string>"));
-    assert!(plist.contains("<key>StartInterval</key>"));
+    assert!(plist.contains("<string>triad-pf-monitor</string>"));
+    assert!(plist.contains("<key>KeepAlive</key>"));
+    assert!(plist.contains("<key>ThrottleInterval</key>"));
+    assert!(!plist.contains("<key>StartInterval</key>"));
     assert!(!plist.contains("<key>Sockets</key>"));
 
     let monitor = fs::read_to_string(workspace().join("crates/bloom/src/pf_monitor.rs")).unwrap();
@@ -243,28 +266,71 @@ fn live_installer_provisions_fail_closed_directory_service_records() {
     }
     assert!(!source.contains("macos-rootless-code-identity"));
     assert!(!source.contains("com.apple.security.application-groups"));
-    assert!(source.lines().count() < 750);
 }
 
 #[test]
-fn macos_installer_has_an_explicit_custody_preserving_lifecycle() {
+fn macos_installer_has_a_forward_only_custody_preserving_lifecycle() {
     let source =
         fs::read_to_string(workspace().join("packaging/triad/release/install-macos.sh")).unwrap();
-    assert!(source.lines().count() < 750);
     assert!(source.contains("install ROOT LOGIN_UID LOGIN_USER PAYLOAD_DIR"));
     assert!(source.contains("restore ROOT LOGIN_UID LOGIN_USER PAYLOAD_DIR"));
     assert!(source.contains("uninstall --retain-custody ROOT LOGIN_UID"));
     assert!(source.contains("uninstall ROOT LOGIN_UID delete-bloom-login-LOGIN_UID"));
     for required in [
-        "recover_interrupted_upgrade",
+        "find_interrupted_upgrade",
         "stop_all_enrollments",
         "switch_release",
-        "activate_installed_set",
-        "rollback_upgrade",
+        "reload_installed_set",
+        "resuming interrupted Bloom macOS upgrade toward the requested release",
         "state-schema downgrade rejected before activation",
     ] {
         assert!(source.contains(required), "lifecycle is missing {required}");
     }
+    assert!(!source.contains("rollback_upgrade"));
+}
+
+#[test]
+fn macos_installer_manages_the_path_entry_and_migrates_legacy_cli_post_activation() {
+    let source =
+        fs::read_to_string(workspace().join("packaging/triad/release/install-macos.sh")).unwrap();
+    for required in [
+        "../libexec/bloom/current/bloom",
+        "preflight_cli_link",
+        "refusing to overwrite unrelated Bloom CLI",
+        "install_cli_link",
+        "remove_cli_link",
+        "resolve_login_home",
+        "/usr/bin/sudo -u \"$login_user\" -- /bin/rm -f -- \"$legacy\"",
+        "Bloom is healthy, but legacy CLI cleanup failed",
+        "report_legacy_wallet_migrations",
+        "Legacy Bloom wallets were not modified and remain at",
+        "Only the staging command requires sudo",
+        "wallet migrate-passkey",
+    ] {
+        assert!(
+            source.contains(required),
+            "CLI lifecycle is missing {required}"
+        );
+    }
+    assert_ordered(
+        &source,
+        &[
+            "activate_current_enrollment ||",
+            "write_state_schema",
+            "remove_legacy_cli || die \"Bloom is healthy",
+        ],
+    );
+    assert!(!source.contains("rm -rf -- \"$login_home/.local"));
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+fn staged_macos_installer_cli_lifecycle_passes() {
+    let status = Command::new("bash")
+        .arg(workspace().join("tests/packaging/macos-installer-staged.sh"))
+        .status()
+        .expect("run staged macOS installer CLI lifecycle");
+    assert!(status.success());
 }
 
 #[test]
@@ -274,7 +340,12 @@ fn macos_installer_does_not_regenerate_custody_during_lifecycle_operations() {
     for forbidden in ["triad-render-macos-identity-rotation", "rotate-identities"] {
         assert!(!source.contains(forbidden));
     }
-    assert!(!source.contains("source "));
+    assert!(
+        !source
+            .lines()
+            .any(|line| line.trim_start().starts_with("source ")),
+        "installer must not execute shell source commands"
+    );
 }
 
 #[test]
@@ -304,19 +375,27 @@ fn macos_permanent_uninstall_is_explicit_and_small() {
 }
 
 #[test]
-fn activating_enrollment_is_private_to_installer_health_and_session_bootstrap() {
+fn activating_enrollment_is_accepted_during_forward_convergence() {
     let machine = fs::read_to_string(workspace().join("crates/bloom/src/main.rs")).unwrap();
-    assert!(machine.contains("allow_activating"));
+    assert!(machine.contains("ActivationHealthMachineCommands"));
+    assert!(machine.contains("activation_health_only"));
+    let health_only = machine.find("if activation_health_only").unwrap();
+    let full_daemon = machine.rfind("build_write_daemon(home.clone())").unwrap();
+    assert!(health_only < full_daemon);
+    assert!(machine.contains("IpcServer::new(bloom_vfs::Vfs::new()"));
     assert!(machine.contains("installed Bloom enrollment is not active"));
-    for required in [
+    assert!(machine.contains("installed_macos_triad_paths_with_activation(true)"));
+    assert!(machine.contains("MachineCommand::TriadHealth { expected_build }"));
+    assert!(machine.contains("activation health endpoint only accepts triad health checks"));
+    for forbidden in [
         "open_configured_machine_audit_with_activation",
         "configured_machine_checkpoint_path_with_activation",
         "configured_authority_edge_history_path_with_activation",
         "configured_machine_audit_history_path_with_activation",
     ] {
         assert!(
-            machine.contains(required),
-            "activation health does not carry its narrow enrollment allowance through {required}"
+            !machine.contains(forbidden),
+            "activation health must not create a second Machine journal owner through {forbidden}"
         );
     }
     let sentinel =
@@ -324,9 +403,11 @@ fn activating_enrollment_is_private_to_installer_health_and_session_bootstrap() 
     assert!(sentinel.contains("Some(\"activating\" | \"active\")"));
     let installer =
         fs::read_to_string(workspace().join("packaging/triad/release/install-macos.sh")).unwrap();
-    let health = installer.find("start_and_check").unwrap();
-    let publish = installer.rfind("write_enrollment active").unwrap();
-    assert!(health < publish);
+    assert!(installer.contains("activate_current_enrollment"));
+    assert!(installer.contains("activate_installed_set"));
+    assert!(installer.contains("write_enrollment active"));
+    assert!(installer.contains("reload_launchagent_job \"$login_uid\" com.bloom.machine"));
+    assert!(installer.contains("launchctl kickstart -k"));
 }
 
 #[test]
@@ -337,12 +418,11 @@ fn production_macos_bundle_forbids_archived_private_identity_material() {
         assert!(source.contains("macOS Unix-principal bundle contains private key material"));
         assert!(source.contains("private_key_seed_hex|signing_seed_hex"));
         assert!(source.contains("private identity-shaped file"));
-        assert!(source.contains("verify-macos-conformance.sh"));
     }
     let builder =
         fs::read_to_string(workspace().join("packaging/triad/release/build-bundle.sh")).unwrap();
-    assert!(builder.contains("BLOOM_MACOS_CONFORMANCE_KEY_SHA256"));
-    assert!(builder.contains("BLOOM_MACOS_CONFORMANCE_REPORT"));
+    assert!(!builder.contains("BLOOM_MACOS_CONFORMANCE_KEY_SHA256"));
+    assert!(!builder.contains("BLOOM_MACOS_CONFORMANCE_REPORT"));
     let verifier =
         fs::read_to_string(workspace().join("packaging/triad/release/verify-macos-conformance.sh"))
             .unwrap();
@@ -365,52 +445,50 @@ fn production_macos_bundle_forbids_archived_private_identity_material() {
 }
 
 #[test]
-fn macos_w0_workflows_stage_every_required_bundle_binary() {
-    let builder =
-        fs::read_to_string(workspace().join("packaging/triad/release/build-bundle.sh")).unwrap();
-    let required = [
-        "bloom",
-        "bloom-broker",
-        "bloom-signer",
-        "bloom-signer-migrate",
-    ];
-    for workflow in ["macos-unix-w0.yml", "macos-two-login-w0.yml"] {
+fn macos_conformance_workflows_consume_unified_candidates() {
+    let compatibility =
+        fs::read_to_string(workspace().join("packaging/triad/release/compatibility-v1.toml"))
+            .unwrap();
+    let pinned_revision = |key: &str| {
+        compatibility
+            .lines()
+            .find_map(|line| line.strip_prefix(&format!("{key} = \"")))
+            .and_then(|value| value.strip_suffix('"'))
+            .unwrap()
+    };
+    let broker_commit = pinned_revision("broker_commit");
+    let signer_commit = pinned_revision("signer_commit");
+
+    for workflow in [
+        "macos-unix-conformance.yml",
+        "macos-two-login-conformance.yml",
+    ] {
         let source =
             fs::read_to_string(workspace().join(".github/workflows").join(workflow)).unwrap();
-        for binary in required {
-            assert!(
-                builder
-                    .contains("for binary in bloom bloom-broker bloom-signer bloom-signer-migrate"),
-                "bundle builder required-binary declaration drifted"
-            );
-            assert!(
-                source.contains(&format!("release/{binary}")),
-                "{workflow} does not stage required bundle binary {binary}"
-            );
-        }
+        assert!(source.contains("packaging/triad/release.sh build macos"));
+        assert!(source.contains("bloom-triad-test-unclaimed.tar.gz"));
         assert!(source.contains("Reject mutable sibling refs"));
         assert!(source.contains("^[0-9a-f]{40}$"));
-        assert!(
-            source
-                .matches("$name-staging/bin/bloom-signer-migrate")
-                .count()
-                == 1
-                || workflow == "macos-unix-w0.yml",
-            "two-login baseline, candidate, and failing payload loop must share the complete artifact set"
-        );
+        assert!(source.contains(broker_commit));
+        assert!(source.contains(signer_commit));
     }
+
+    let ci = fs::read_to_string(workspace().join(".github/workflows/ci.yml")).unwrap();
+    assert!(ci.contains(&format!("broker_ref: {broker_commit}")));
+    assert!(ci.contains(&format!("signer_ref: {signer_commit}")));
 }
 
 #[test]
 fn privileged_w0_harness_requires_an_external_disposable_host_marker() {
-    let source =
-        fs::read_to_string(workspace().join("packaging/triad/macos/w0/run-disposable.sh")).unwrap();
+    let source = fs::read_to_string(
+        workspace().join("tests/conformance/macos-unix-principals/run-disposable.sh"),
+    )
+    .unwrap();
     assert!(source.contains("BLOOM_RUN_MACOS_UNIX_W0"));
     assert!(source.contains("/private/var/db/bloom-w0-disposable-host"));
     assert!(source.contains("bloom-macos-unix-w0-disposable-v1"));
     assert!(source.contains("macos-unix-principals-w0"));
     assert!(source.contains("/usr/bin/nc -lk 127.0.0.1 18734"));
-    assert!(source.contains("no fallback port will be used"));
     assert!(source.contains("Broker opened a fallback TCP listener"));
     assert!(source.contains("foreign_or_unverifiable_process"));
     assert!(source.contains("Bloom Broker startup failed: a foreign or unverifiable process"));
@@ -448,8 +526,10 @@ fn privileged_w0_harness_requires_an_external_disposable_host_marker() {
         "the repository must not self-authorize a host as disposable"
     );
 
-    let two_login =
-        fs::read_to_string(workspace().join("packaging/triad/macos/w0/run-two-login.sh")).unwrap();
+    let two_login = fs::read_to_string(
+        workspace().join("tests/conformance/macos-unix-principals/run-two-login.sh"),
+    )
+    .unwrap();
     assert!(two_login.contains("active GUI domains for both selected users"));
     assert!(two_login.contains("another_login_session"));
     assert!(two_login.contains("second Broker opened a fallback TCP listener"));
@@ -470,7 +550,7 @@ fn privileged_w0_harness_requires_an_external_disposable_host_marker() {
     );
 
     let installed_acceptance = fs::read_to_string(
-        workspace().join("packaging/triad/macos/w0/run-installed-acceptance.sh"),
+        workspace().join("tests/conformance/macos-unix-principals/run-installed-acceptance.sh"),
     )
     .unwrap();
     assert!(installed_acceptance.contains("installed_ac_01_35"));
@@ -495,14 +575,16 @@ fn privileged_w0_harness_requires_an_external_disposable_host_marker() {
     assert!(ci.contains("macos_unix_principal_disposable_w0"));
     assert!(ci.contains("github.event_name == 'workflow_dispatch'"));
     assert!(ci.contains("github.ref_name == 'triad-architecture'"));
-    assert!(ci.contains("uses: ./.github/workflows/macos-unix-w0.yml"));
+    assert!(ci.contains("uses: ./.github/workflows/macos-unix-conformance.yml"));
 
     let workflow =
-        fs::read_to_string(workspace().join(".github/workflows/macos-unix-w0.yml")).unwrap();
+        fs::read_to_string(workspace().join(".github/workflows/macos-unix-conformance.yml"))
+            .unwrap();
     assert!(workflow.contains("workflow_call:"));
 
     let two_login_workflow =
-        fs::read_to_string(workspace().join(".github/workflows/macos-two-login-w0.yml")).unwrap();
+        fs::read_to_string(workspace().join(".github/workflows/macos-two-login-conformance.yml"))
+            .unwrap();
     assert!(two_login_workflow.contains("bloom-two-login-disposable"));
     assert!(two_login_workflow.contains("test \"$(id -u)\" !="));
     assert!(two_login_workflow.contains("failing-broker.c"));

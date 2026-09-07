@@ -2,7 +2,19 @@
 set -Eeuo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-main_root="$(cd "$script_dir/../../../.." && pwd)"
+main_root="$(cd "$script_dir/../../.." && pwd)"
+[[ $# -eq 1 ]] || {
+  echo "usage: $0 CANDIDATE_ARCHIVE" >&2
+  exit 64
+}
+candidate_archive="$1"
+candidate_archive="$(cd "$(dirname "$candidate_archive")" && pwd -P)/$(basename "$candidate_archive")"
+for input in "$candidate_archive" "$candidate_archive.sha256" "$candidate_archive.sig" "$candidate_archive.pub"; do
+  [[ -f "$input" && ! -L "$input" ]] || {
+    echo "missing macOS candidate input: $input" >&2
+    exit 66
+  }
+done
 workspace_root="$(dirname "$main_root")"
 broker_root="${BLOOM_TART_BROKER_ROOT:-$workspace_root/bloom-broker}"
 signer_root="${BLOOM_TART_SIGNER_ROOT:-$workspace_root/bloom-signer}"
@@ -11,13 +23,11 @@ guest_password="${BLOOM_TART_GUEST_PASSWORD:-admin}"
 keep_failed="${BLOOM_TART_KEEP_FAILED:-false}"
 run_id="$(date -u +%Y%m%dT%H%M%SZ)-$$"
 run_name="bloom-macos-w0-run-$run_id"
-local_output_root="${BLOOM_TART_OUTPUT_ROOT:-$workspace_root/.w0-local/runs/$run_id}"
-build_vm_log="$local_output_root/build-vm.log"
+local_output_root="${BLOOM_TART_OUTPUT_ROOT:-$workspace_root/.macos-conformance/runs/$run_id}"
 run_vm_log="$local_output_root/run-vm.log"
-build_log="$local_output_root/build.log"
 w0_log="$local_output_root/w0.log"
 
-for command_name in tart jq sshpass ssh nc git; do
+for command_name in tart jq sshpass ssh nc git tar ssh-keygen; do
   command -v "$command_name" >/dev/null 2>&1 || {
     echo "missing local Tart W0 dependency: $command_name" >&2
     exit 69
@@ -25,7 +35,7 @@ for command_name in tart jq sshpass ssh nc git; do
 done
 
 for repository_root in "$main_root" "$broker_root" "$signer_root"; do
-  [[ -d "$repository_root/.git" ]] || {
+  git -C "$repository_root" rev-parse --git-dir >/dev/null 2>&1 || {
     echo "missing local Bloom repository: $repository_root" >&2
     exit 69
   }
@@ -130,6 +140,72 @@ prepare_source_bundle "$main_root" bloom
 prepare_source_bundle "$broker_root" bloom-broker
 prepare_source_bundle "$signer_root" bloom-signer
 
+candidate_verified_root="$local_output_root/candidate-verified"
+distribution_root="$local_output_root/triad-dist"
+staging_root="$local_output_root/w0-staging"
+verified_root="$local_output_root/verified"
+artifact_name="bloom-triad-macos-w0.tar.gz"
+mkdir -p \
+  "$candidate_verified_root" \
+  "$distribution_root" \
+  "$staging_root/bin" \
+  "$verified_root"
+BLOOM_ALLOW_TEST_UNCLAIMED=true \
+  "$main_root/packaging/triad/release/verify-bundle.sh" \
+  "$candidate_archive" \
+  "$candidate_archive.sha256" \
+  "$candidate_archive.sig" \
+  "$candidate_archive.pub"
+tar -xzf "$candidate_archive" -C "$candidate_verified_root"
+candidate_payload="$candidate_verified_root/bloom-triad"
+[[ "$(<"$candidate_payload/PLATFORM_CLAIM")" == test-unclaimed ]] || {
+  echo "local Tart W0 requires a test-unclaimed release candidate" >&2
+  exit 65
+}
+
+machine_revision="$(git -C "$main_root" rev-parse HEAD)"
+broker_revision="$(git -C "$broker_root" rev-parse HEAD)"
+signer_revision="$(git -C "$signer_root" rev-parse HEAD)"
+for source_line in \
+  "BLOOM_MACHINE_SHA=$machine_revision" \
+  "BLOOM_BROKER_SHA=$broker_revision" \
+  "BLOOM_SIGNER_SHA=$signer_revision"
+do
+  grep -Fx "$source_line" "$candidate_payload/SOURCE_REVISIONS" >/dev/null || {
+    echo "candidate source revisions do not match the Tart source checkouts" >&2
+    exit 65
+  }
+done
+[[ "$(wc -l <"$candidate_payload/SOURCE_REVISIONS" | tr -d ' ')" == 3 ]] || {
+  echo "candidate source revisions contain unexpected entries" >&2
+  exit 65
+}
+
+for binary in bloom bloom-broker bloom-signer bloom-signer-migrate; do
+  install -m 0755 "$candidate_payload/bin/$binary" "$staging_root/bin/$binary"
+done
+w0_signing_key="$local_output_root/w0-release-key"
+ssh-keygen -q -t ed25519 -N '' -f "$w0_signing_key"
+source_date_epoch="$(git -C "$main_root" show -s --format=%ct HEAD)"
+BLOOM_PLATFORM_CLAIM=macos-unix-principals-w0 \
+  BLOOM_ALLOW_MACOS_UNIX_W0=true \
+  BLOOM_COMPATIBILITY_FILE="$candidate_payload/compatibility-v1.toml" \
+  BLOOM_MACHINE_SHA="$machine_revision" \
+  BLOOM_BROKER_SHA="$broker_revision" \
+  BLOOM_SIGNER_SHA="$signer_revision" \
+  "$main_root/packaging/triad/release/build-bundle.sh" \
+  "$staging_root" \
+  "$distribution_root/$artifact_name" \
+  "$w0_signing_key" \
+  "$source_date_epoch"
+BLOOM_ALLOW_MACOS_UNIX_W0=true \
+  "$main_root/packaging/triad/release/verify-bundle.sh" \
+  "$distribution_root/$artifact_name" \
+  "$distribution_root/$artifact_name.sha256" \
+  "$distribution_root/$artifact_name.sig" \
+  "$distribution_root/$artifact_name.pub"
+tar -xzf "$distribution_root/$artifact_name" -C "$verified_root"
+
 ssh_options=(
   -o StrictHostKeyChecking=no
   -o UserKnownHostsFile=/dev/null
@@ -226,8 +302,7 @@ start_vm() {
       sleep 60
       if printf '%s\n' \
         'set -e' \
-        'for _fork_probe in {1..200}; do /usr/bin/true; done' \
-        '/usr/bin/python3 -c "pass"' |
+        'for _fork_probe in {1..200}; do /usr/bin/true; done' |
         sshpass -p "$guest_password" \
           ssh "${ssh_options[@]}" "admin@$guest_ip" /bin/bash -s \
         >/dev/null 2>&1
@@ -251,16 +326,7 @@ run_guest() {
     tee "$log_path"
 }
 
-echo "building W0 candidate in local Tart base $development_base"
-start_vm "$development_base" "$build_vm_log"
-builder_ip="$guest_ip"
-run_guest \
-  "$builder_ip" \
-  "$script_dir/tart-build-guest.sh" \
-  "$build_log"
-stop_active_vm
-
-echo "creating disposable local macOS W0 clone $run_name"
+echo "creating disposable local macOS conformance clone $run_name"
 tart clone "$development_base" "$run_name"
 tart set "$run_name" --random-mac
 start_vm "$run_name" "$run_vm_log"

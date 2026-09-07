@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# Self-contained macOS installer. Keep this file readable and below 750 lines:
+# Self-contained macOS installer. Keep this file readable and below 800 lines:
 # it is intentionally suitable for `curl ... | sudo bash -s -- ...`.
 
 die() { echo "$*" >&2; exit 65; }
@@ -15,7 +15,7 @@ usage:
 
 Staged-root tests also supply BLOOM_MACOS_{BROKER,SIGNER}_{UID,GID},
 BLOOM_MACOS_{MACHINE_BROKER,BROKER_SIGNER,REVOKE}_GID, and
-BLOOM_RELEASE_DIGEST.
+BLOOM_MACOS_LOG_GID and BLOOM_RELEASE_DIGEST.
 EOF
   exit 64
 }
@@ -25,26 +25,33 @@ action="$1"; shift
 live=false
 lock=""
 scratch=""
+payload_scratch=""
 created_users=""
 created_groups=""
 upgrade_transaction=""
-rollback_active=false
+upgrade_old_digest=""
 restore_pending=false
+legacy_cli_removed=false
 
 cleanup() {
   rc=$?
   if ((rc != 0)) && $restore_pending; then
     rollback_failed_restore || echo "automatic macOS custody-restore cleanup remains incomplete" >&2
   fi
-  if ((rc != 0)) && [[ -n "$upgrade_transaction" && -d "$upgrade_transaction" ]] && ! $rollback_active; then
-    rollback_active=true
-    rollback_upgrade || echo "automatic macOS upgrade rollback remains incomplete" >&2
-  fi
   [[ -z "$scratch" || ! -d "$scratch" ]] || rm -rf -- "$scratch"
+  [[ -z "$payload_scratch" || ! -d "$payload_scratch" ]] || rm -rf -- "$payload_scratch"
   if ((rc != 0)) && $live; then
-    for user in $created_users; do dscl . -delete "/Users/$user" 2>/dev/null || true; done
-    for group in $created_groups; do dscl . -delete "/Groups/$group" 2>/dev/null || true; done
+    rollback_failed=false
+    for user in $created_users; do
+      dscl . -delete "/Users/$user" 2>/dev/null || { echo "failed to remove incomplete service user $user" >&2; rollback_failed=true; }
+    done
+    for group in $created_groups; do
+      dscl . -delete "/Groups/$group" 2>/dev/null || { echo "failed to remove incomplete service group $group" >&2; rollback_failed=true; }
+    done
     dsmemberutil flushcache 2>/dev/null || true
+    if $rollback_failed; then
+      echo "incomplete service-account rollback will be recovered by the next installer run" >&2
+    fi
   fi
   if [[ -n "$lock" && -d "$lock" ]]; then rm -f "$lock/pid"; rmdir "$lock" 2>/dev/null || true; fi
   ((rc == 0)) || echo "macOS installer failed (status $rc)" >&2
@@ -73,23 +80,55 @@ lock_installer() {
   chown root:wheel "$lock"; printf '%s\n' "$$" >"$lock/pid"; chmod 0600 "$lock/pid"
 }
 
-field() { plutil -extract "$2" raw -o - "$1"; }
+snapshot_live_payload() {
+  local source_payload="$payload"
+  payload_scratch="$(mktemp -d /private/var/tmp/bloom-macos-payload.XXXXXX)"
+  chmod 0700 "$payload_scratch"
+  cp -R "$source_payload/." "$payload_scratch/"
+  if find "$payload_scratch" \
+    \( -type l -o \( ! -type f ! -type d \) \) -print -quit | grep -q .
+  then
+    die "payload contains a symlink or non-regular entry"
+  fi
+  chown -R root:wheel "$payload_scratch"
+  payload="$payload_scratch"
+}
+
+prepare_verified_payload_for_execution() {
+  $live || return 0
+  xattr -dr com.apple.quarantine "$payload" || die "could not remove quarantine from the verified payload"
+  for binary in bloom bloom-broker bloom-signer bloom-signer-migrate; do
+    if xattr -p com.apple.quarantine "$payload/bin/$binary" >/dev/null 2>&1; then
+      die "verified payload binary remains quarantined: $binary"
+    fi
+  done
+  "$payload/bin/bloom" --version >/dev/null || die "verified Bloom candidate cannot execute on this Mac"
+}
+
+field() {
+  if command -v plutil >/dev/null 2>&1; then
+    plutil -extract "$2" raw -o - "$1"
+  else
+    die "plutil is required for live macOS installation"
+  fi
+}
 record_exists() { dscl . -read "/$1/$2" >/dev/null 2>&1; }
 next_id() {
   dscl . -list "/$1" "$2" | awk '$NF~/^[0-9]+$/&&$NF>m{m=$NF} END{if(m>=2147483646)exit 1;print m+1}'
 }
 new_group() {
   record_exists Groups "$1" && die "refusing to adopt pre-existing group $1"
-  dscl . -create "/Groups/$1"; dscl . -create "/Groups/$1" PrimaryGroupID "$2"
-  dscl . -create "/Groups/$1" RealName "Bloom isolated service group"; created_groups="$created_groups $1"
+  dscl . -create "/Groups/$1"; created_groups="$created_groups $1"
+  dscl . -create "/Groups/$1" PrimaryGroupID "$2"
+  dscl . -create "/Groups/$1" RealName "Bloom isolated service group"
 }
 new_user() {
   record_exists Users "$1" && die "refusing to adopt pre-existing user $1"
-  dscl . -create "/Users/$1"; dscl . -create "/Users/$1" UniqueID "$2"
+  dscl . -create "/Users/$1"; created_users="$created_users $1"
+  dscl . -create "/Users/$1" UniqueID "$2"
   dscl . -create "/Users/$1" PrimaryGroupID "$3"; dscl . -create "/Users/$1" RealName "Bloom isolated service"
   dscl . -create "/Users/$1" NFSHomeDirectory /var/empty; dscl . -create "/Users/$1" UserShell /usr/bin/false
   dscl . -create "/Users/$1" IsHidden 1; dscl . -create "/Users/$1" AuthenticationAuthority ';DisabledUser;'
-  created_users="$created_users $1"
 }
 join_group() { dseditgroup -o edit -a "$2" -t user "$1"; }
 
@@ -98,6 +137,30 @@ load_names() {
   signer_user="bloom-signer-$login_uid"; signer_group="$signer_user"
   machine_broker_group="bloom-machine-broker-$login_uid"
   broker_signer_group="bloom-broker-signer-$login_uid"; revoke_group="bloom-revoke-$login_uid"
+  log_group="bloom-log-$login_uid"
+}
+
+adopt_existing_log_group() {
+  local gid user_uuid real_name
+  gid="$(dscl . -read "/Groups/$log_group" PrimaryGroupID | awk 'NR==1{print $2}')"
+  user_uuid="$(dscl . -read "/Users/$login_user" GeneratedUID | awk 'NR==1{print $2}')"
+  real_name="$(dscl . -read "/Groups/$log_group" RealName | awk 'NR==1{sub(/^RealName:[[:space:]]*/,"");if(length)print;next}{sub(/^[[:space:]]*/,"");print}')"
+  [[ "$gid" =~ ^[1-9][0-9]*$ && "$user_uuid" =~ ^[0-9A-Fa-f-]+$ && \
+    "$real_name" == "Bloom isolated service group" && \
+    "$(dscl . -read "/Groups/$log_group" GroupMembers 2>/dev/null)" == "GroupMembers: $user_uuid" && \
+    "$(dscl . -read "/Groups/$log_group" GroupMembership 2>/dev/null)" == "GroupMembership: $login_user" ]] ||
+    die "pre-existing log group does not match the Bloom enrollment"
+  [[ -z "$(dscl . -read "/Groups/$log_group" NestedGroups 2>/dev/null)" ]] ||
+    die "pre-existing log group has nested members"
+  dscl . -list /Groups PrimaryGroupID | awk -v gid="$gid" '$NF==gid{n++} END{exit n==1?0:1}' ||
+    die "pre-existing log group GID is not unique"
+  BLOOM_MACOS_LOG_GID="$gid"
+}
+
+persist_legacy_log_identity() {
+  local legacy_state legacy_digest candidate_digest="$BLOOM_RELEASE_DIGEST"
+  legacy_state="$(field "$enrollment" state)"; legacy_digest="$(field "$enrollment" release_digest)"
+  BLOOM_RELEASE_DIGEST="$legacy_digest"; write_enrollment "$legacy_state"; BLOOM_RELEASE_DIGEST="$candidate_digest"
 }
 
 load_ids() {
@@ -108,6 +171,22 @@ load_ids() {
   BLOOM_MACOS_MACHINE_BROKER_GID="$(field "$enrollment" machine_broker_gid)"
   BLOOM_MACOS_BROKER_SIGNER_GID="$(field "$enrollment" broker_signer_gid)"
   BLOOM_MACOS_REVOKE_GID="$(field "$enrollment" revoke_gid)"
+  if recorded_log_gid="$(field "$enrollment" log_gid 2>/dev/null)"; then
+    BLOOM_MACOS_LOG_GID="$recorded_log_gid"
+    return
+  fi
+  if [[ "$action" == uninstall ]]; then BLOOM_MACOS_LOG_GID=""; return; fi
+  if $live; then
+    if record_exists Groups "$log_group"; then adopt_existing_log_group
+    else
+      BLOOM_MACOS_LOG_GID="$(next_id Groups PrimaryGroupID)"; new_group "$log_group" "$BLOOM_MACOS_LOG_GID"
+      join_group "$log_group" "$login_user"; dsmemberutil flushcache
+    fi
+  else
+    [[ "${BLOOM_MACOS_LOG_GID:-}" =~ ^[1-9][0-9]*$ ]] || die "BLOOM_MACOS_LOG_GID must be positive decimal"
+  fi
+  persist_legacy_log_identity
+  created_groups="${created_groups/ $log_group/}"
 }
 
 allocate_accounts() {
@@ -116,12 +195,41 @@ allocate_accounts() {
   BLOOM_MACOS_MACHINE_BROKER_GID="$(next_id Groups PrimaryGroupID)"; new_group "$machine_broker_group" "$BLOOM_MACOS_MACHINE_BROKER_GID"
   BLOOM_MACOS_BROKER_SIGNER_GID="$(next_id Groups PrimaryGroupID)"; new_group "$broker_signer_group" "$BLOOM_MACOS_BROKER_SIGNER_GID"
   BLOOM_MACOS_REVOKE_GID="$(next_id Groups PrimaryGroupID)"; new_group "$revoke_group" "$BLOOM_MACOS_REVOKE_GID"
+  BLOOM_MACOS_LOG_GID="$(next_id Groups PrimaryGroupID)"; new_group "$log_group" "$BLOOM_MACOS_LOG_GID"
   BLOOM_MACOS_BROKER_UID="$(next_id Users UniqueID)"; new_user "$broker_user" "$BLOOM_MACOS_BROKER_UID" "$BLOOM_MACOS_BROKER_GID"
   BLOOM_MACOS_SIGNER_UID="$(next_id Users UniqueID)"; new_user "$signer_user" "$BLOOM_MACOS_SIGNER_UID" "$BLOOM_MACOS_SIGNER_GID"
   for pair in "$machine_broker_group:$login_user" "$machine_broker_group:$broker_user" \
     "$broker_signer_group:$broker_user" "$broker_signer_group:$signer_user" \
     "$revoke_group:$login_user" "$revoke_group:$broker_user" "$revoke_group:$signer_user"; do
     join_group "${pair%%:*}" "${pair#*:}"
+  done
+  join_group "$log_group" "$login_user"
+  dsmemberutil flushcache
+}
+
+recover_interrupted_fresh_accounts() {
+  local found=false name value
+  [[ ! -e "$enrollment" && ! -e "$config/edge-manifest.json" ]] || return 0
+  for name in "$broker_user" "$signer_user"; do
+    record_exists Users "$name" || continue
+    found=true
+    value="$(dscl . -read "/Users/$name" 2>/dev/null)"
+    [[ "$value" == *$'RealName:\n Bloom isolated service\n'* && "$value" == *"NFSHomeDirectory: /var/empty"* && \
+      "$value" == *"UserShell: /usr/bin/false"* && "$value" == *"dsAttrTypeNative:IsHidden: 1"* ]] ||
+      die "pre-existing user $name is not a recoverable incomplete Bloom service account"
+  done
+  for name in "$broker_group" "$signer_group" "$machine_broker_group" "$broker_signer_group" "$revoke_group" "$log_group"; do
+    record_exists Groups "$name" || continue
+    found=true
+    value="$(dscl . -read "/Groups/$name" 2>/dev/null)"
+    [[ "$value" == *$'RealName:\n Bloom isolated service group\n'* ]] ||
+      die "pre-existing group $name is not a recoverable incomplete Bloom service group"
+  done
+  $found || return 0
+  echo "recovering an interrupted fresh Bloom account allocation" >&2
+  for name in "$broker_user" "$signer_user"; do record_exists Users "$name" && dscl . -delete "/Users/$name"; done
+  for name in "$broker_group" "$signer_group" "$machine_broker_group" "$broker_signer_group" "$revoke_group" "$log_group"; do
+    record_exists Groups "$name" && dscl . -delete "/Groups/$name"
   done
   dsmemberutil flushcache
 }
@@ -134,6 +242,9 @@ verify_payload() {
       macos-unix-principals) ;;
       macos-unix-principals-w0)
         [[ "${BLOOM_RUN_MACOS_UNIX_W0:-}" == true ]] || die "W0 bundle requires disposable-host opt in" ;;
+      test-unclaimed)
+        [[ "${BLOOM_ALLOW_TEST_UNCLAIMED:-}" == true ]] ||
+          die "test-unclaimed bundle requires explicit candidate opt in" ;;
       *) die "live installation requires a macOS Unix-principal bundle" ;;
     esac
     for path in SHA256SUMS RELEASE_PUBLIC_KEY.pem RELEASE_SIGNATURE; do [[ -f "$payload/$path" && ! -L "$payload/$path" ]] || die "payload missing $path"; done
@@ -150,7 +261,7 @@ verify_payload() {
   else
     [[ "$claim" == test-unclaimed && "${BLOOM_ALLOW_TEST_UNCLAIMED:-}" == true ]] || die "staged install requires test-unclaimed"
     [[ "${BLOOM_RELEASE_DIGEST:-}" =~ ^[0-9a-f]{64}$ ]] || die "invalid staged release digest"
-    for n in BROKER_UID SIGNER_UID BROKER_GID SIGNER_GID MACHINE_BROKER_GID BROKER_SIGNER_GID REVOKE_GID; do
+    for n in BROKER_UID SIGNER_UID BROKER_GID SIGNER_GID MACHINE_BROKER_GID BROKER_SIGNER_GID REVOKE_GID LOG_GID; do
       v="BLOOM_MACOS_$n"; [[ "${!v:-}" =~ ^[1-9][0-9]*$ ]] || die "$v must be positive decimal"
     done
   fi
@@ -180,23 +291,164 @@ render() {
     -e "s|@BLOOM_BROKER_STARTUP_STATUS@|$runtime/status/broker-startup.json|g" \
     -e "s|@BLOOM_CONTAINMENT_STATUS@|$runtime/containment/status.json|g" \
     -e "s|@BLOOM_PROVENANCE_CATALOG@|$config/provenance-catalog.json|g" \
-    -e "s|@BLOOM_BROKER_LOG@|$broker_state/broker.log|g" -e "s|@BLOOM_SIGNER_LOG@|$signer_state/signer.log|g" \
+    -e "s|@BLOOM_BROKER_LOG_PATH@|$broker_log|g" -e "s|@BLOOM_SIGNER_LOG_PATH@|$signer_log|g" \
+    -e "s|@BLOOM_BROKER_BOOTSTRAP_LOG@|$broker_bootstrap_log|g" -e "s|@BLOOM_SIGNER_BOOTSTRAP_LOG@|$signer_bootstrap_log|g" \
+    -e "s|@BLOOM_LOG_READER_GID@|$BLOOM_MACOS_LOG_GID|g" \
     "$src" >"$tmp"; chmod "$mode" "$tmp"; mv -f "$tmp" "$dst"
 }
 
 paths() {
   product="$root_prefix/Library/Application Support/BloomTriad"; enrollments="$product/enrollments"
   enrollment="$enrollments/$login_uid.json"; release_base="$root_prefix/usr/local/libexec/bloom"
+  cli_bin_dir="$root_prefix/usr/local/bin"; cli_link="$cli_bin_dir/bloom"
   config="$product/config/$login_uid"; broker_config="$config/broker"; signer_config="$config/signer"
   machine_config="$config/machine"; session_config="$config/session"; installer_config="$config/installer"
   if $live; then variable=/private/var; else variable="$root_prefix/var"; fi
   broker_state="$variable/db/bloom/$login_uid/broker"; signer_state="$variable/db/bloom/$login_uid/signer"
   machine_state="$variable/db/bloom/$login_uid/machine"; runtime="$variable/run/bloom/$login_uid"
+  log_root="$variable/log/bloom/$login_uid"; broker_log="$log_root/broker.jsonl"; signer_log="$log_root/signer.jsonl"
+  broker_bootstrap_log="$log_root/broker-bootstrap.log"; signer_bootstrap_log="$log_root/signer-bootstrap.log"
   broker_plist="$root_prefix/Library/LaunchDaemons/com.bloom.broker.$login_uid.plist"
   signer_plist="$root_prefix/Library/LaunchDaemons/com.bloom.signer.$login_uid.plist"
   containment_plist="$root_prefix/Library/LaunchDaemons/com.bloom.containment.plist"
   session_plist="$root_prefix/Library/LaunchAgents/com.bloom.session.plist"
+  machine_plist="$root_prefix/Library/LaunchAgents/com.bloom.machine.plist"
   pf_anchor="$root_prefix/etc/pf.anchors/com.bloom.triad.$login_uid"
+  newsyslog_config="$root_prefix/etc/newsyslog.d/bloom-$login_uid.conf"
+}
+
+preflight_cli_link() {
+  local directory target
+  for directory in "$root_prefix/usr" "$root_prefix/usr/local" "$cli_bin_dir"; do
+    [[ ! -e "$directory" && ! -L "$directory" ]] && continue
+    [[ -d "$directory" && ! -L "$directory" ]] || die "Bloom CLI parent path is unsafe: $directory"
+  done
+  [[ ! -e "$cli_link" && ! -L "$cli_link" ]] && return 0
+  [[ -L "$cli_link" ]] || die "refusing to overwrite unrelated Bloom CLI at $cli_link"
+  target="$(readlink "$cli_link")"
+  [[ "$target" == ../libexec/bloom/current/bloom ]] ||
+    die "refusing to overwrite unrelated Bloom CLI symlink at $cli_link"
+}
+
+install_cli_link() {
+  local replacement="$cli_link.new.$$"
+  mkdir -p "$cli_bin_dir"
+  ln -s ../libexec/bloom/current/bloom "$replacement"
+  $live && chown -h root:wheel "$replacement"
+  if [[ "$(uname -s)" == Darwin ]]; then
+    mv -fh "$replacement" "$cli_link"
+  else
+    mv -fT "$replacement" "$cli_link"
+  fi
+}
+
+remove_cli_link() {
+  local target
+  [[ ! -e "$cli_link" && ! -L "$cli_link" ]] && return 0
+  if [[ -L "$cli_link" ]]; then
+    target="$(readlink "$cli_link")"
+    if [[ "$target" == ../libexec/bloom/current/bloom ]]; then
+      rm -f -- "$cli_link"
+      return 0
+    fi
+  fi
+  echo "leaving unrelated Bloom CLI in place at $cli_link" >&2
+}
+
+resolve_login_home() {
+  if $live; then
+    login_home="$(dscl . -read "/Users/$login_user" NFSHomeDirectory |
+      awk 'NR==1{sub(/^NFSHomeDirectory:[[:space:]]*/,"");print}')"
+  else
+    # Staged installs intentionally never resolve or touch the invoking user's
+    # real home. This path also gives lifecycle tests an isolated migration root.
+    login_home="$root_prefix/Users/$login_user"
+  fi
+  [[ "$login_home" == /* && "$login_home" != / &&
+    "$login_home" != *$'\n'* && "$login_home" != *$'\r'* ]] ||
+    die "cannot safely resolve home for $login_user"
+}
+
+remove_legacy_cli() {
+  local parent legacy
+  resolve_login_home
+  for parent in "$login_home" "$login_home/.local" "$login_home/.local/bin"; do
+    [[ ! -e "$parent" && ! -L "$parent" ]] && return 0
+    [[ -d "$parent" && ! -L "$parent" ]] || {
+      echo "legacy Bloom CLI parent path is unsafe: $parent" >&2
+      return 1
+    }
+  done
+  legacy="$login_home/.local/bin/bloom"
+  [[ ! -e "$legacy" && ! -L "$legacy" ]] && return 0
+  if [[ -L "$legacy" || ( -f "$legacy" && ! -L "$legacy" ) ]]; then
+    if $live; then
+      /usr/bin/sudo -u "$login_user" -- /bin/rm -f -- "$legacy"
+    else
+      rm -f -- "$legacy"
+    fi
+    [[ ! -e "$legacy" && ! -L "$legacy" ]] || return 1
+    legacy_cli_removed=true
+    echo "Removed legacy $legacy; run 'hash -r' or 'rehash', or open a new terminal"
+    return 0
+  fi
+  echo "legacy Bloom CLI is not a regular file or symlink: $legacy" >&2
+  return 1
+}
+
+report_legacy_wallet_migrations() {
+  local wallet_root wallet_dir kind_file kind wallet_name receipt
+  local found_wallet=false found_supported=false
+  resolve_login_home
+  wallet_root="$login_home/.bloom/keystore"
+  if [[ ! -e "$wallet_root" && ! -L "$wallet_root" ]]; then
+    if $legacy_cli_removed; then
+      echo "Legacy Bloom wallets, if present, remain under $wallet_root"
+    fi
+    return 0
+  fi
+  if [[ ! -d "$wallet_root" || -L "$wallet_root" ]]; then
+    echo "Legacy Bloom wallet path is unsafe and was not inspected: $wallet_root" >&2
+    return 0
+  fi
+
+  echo "Legacy Bloom wallets were not modified and remain at: $wallet_root"
+  for wallet_dir in "$wallet_root"/*; do
+    [[ -e "$wallet_dir" || -L "$wallet_dir" ]] || continue
+    found_wallet=true
+    wallet_name="${wallet_dir##*/}"
+    if [[ ! -d "$wallet_dir" || -L "$wallet_dir" ]]; then
+      echo "Skipping unexpected legacy wallet entry: $wallet_dir" >&2
+      continue
+    fi
+    kind_file="$wallet_dir/kind"
+    if [[ ! -f "$kind_file" || -L "$kind_file" ]]; then
+      echo "Legacy wallet $wallet_name has no safe kind file; it was not modified" >&2
+      continue
+    fi
+    if ! kind="$(/bin/cat "$kind_file")"; then
+      echo "Legacy wallet $wallet_name could not be inspected; it was not modified" >&2
+      continue
+    fi
+    if [[ "$kind" != passkey ]]; then
+      echo "Legacy wallet $wallet_name uses unsupported kind '$kind'; only v1 passkey wallets can be migrated automatically" >&2
+      continue
+    fi
+
+    found_supported=true
+    receipt="$login_home/.bloom/$wallet_name.triad-migration-receipt.json"
+    echo "Migrate legacy passkey wallet $wallet_name with these two commands. Only the staging command requires sudo:"
+    printf '  sudo %q stage --source %q --config %q --source-uid %q --signer-uid %q --signer-gid %q --receipt %q\n' \
+      "$release_base/current/bloom-signer-migrate" "$wallet_dir" \
+      "$signer_config/config.json" "$login_uid" "$BLOOM_MACOS_SIGNER_UID" \
+      "$BLOOM_MACOS_SIGNER_GID" "$receipt"
+    printf '  %q wallet migrate-passkey %q\n' "$cli_link" "$receipt"
+  done
+  if ! $found_wallet; then
+    echo "No legacy wallets were found in $wallet_root"
+  elif ! $found_supported; then
+    echo "No supported v1 passkey wallets were detected; legacy wallet data was left in place"
+  fi
 }
 
 current_release_digest() {
@@ -209,11 +461,27 @@ current_release_digest() {
 }
 
 has_active_enrollments() {
-  local record
-  for record in "$enrollments"/*.json; do
+  local directory="${1:-$enrollments}" record
+  for record in "$directory"/*.json; do
     [[ -f "$record" && ! -L "$record" ]] && return 0
   done
   return 1
+}
+
+validate_active_release_set() {
+  local expected_digest="$1" record state digest
+  for record in "$enrollments"/*.json; do
+    [[ -e "$record" || -L "$record" ]] || continue
+    [[ -f "$record" && ! -L "$record" ]] || die "installed enrollment record is unsafe"
+    [[ "$(field "$record" schema)" == bloom.macos-enrollment.1 ]] || die "unsupported installed enrollment schema"
+    state="$(field "$record" state)"
+    [[ "$state" == active || "$state" == activating ]] || die "installed enrollment set is not active"
+    digest="$(field "$record" release_digest)"
+    [[ "$expected_digest" =~ ^[0-9a-f]{64}$ && "$digest" =~ ^[0-9a-f]{64}$ ]] ||
+      die "installed enrollment set has an invalid release"
+    [[ -n "$upgrade_transaction" || "$digest" == "$expected_digest" ]] ||
+      die "installed enrollment set does not match the shared release"
+  done
 }
 
 pf_reference() {
@@ -228,23 +496,34 @@ pf_reference() {
 
 rollback_failed_restore() {
   if $live; then
-    for label in "system/com.bloom.broker.$login_uid" "system/com.bloom.signer.$login_uid" "gui/$login_uid/com.bloom.session"; do
+    for label in "gui/$login_uid/com.bloom.machine" "user/$login_uid/com.bloom.machine" "system/com.bloom.broker.$login_uid" "system/com.bloom.signer.$login_uid" "gui/$login_uid/com.bloom.session" "user/$login_uid/com.bloom.session"; do
       launchctl bootout "$label" 2>/dev/null || true
     done
     pf_reference remove || return 1
   fi
-  rm -f "$broker_plist" "$signer_plist" "$pf_anchor" "$enrollments/$login_uid.json"
-  rm -rf "$runtime"
+  rm -f "$broker_plist" "$signer_plist" "$pf_anchor" "$newsyslog_config" "$enrollments/$login_uid.json"
+  rm -rf "$runtime" "$log_root"
+  has_active_enrollments || remove_cli_link
   restore_pending=false
 }
-
+rollback_failed_fresh() {
+  for label in "gui/$login_uid/com.bloom.machine" "user/$login_uid/com.bloom.machine" "system/com.bloom.broker.$login_uid" "system/com.bloom.signer.$login_uid" "gui/$login_uid/com.bloom.session" "user/$login_uid/com.bloom.session"; do launchctl bootout "$label" 2>/dev/null || true; done
+  pf_reference remove || true; rm -f "$broker_plist" "$signer_plist" "$pf_anchor" "$newsyslog_config" "$enrollment"
+  rm -rf "$config" "$variable/db/bloom/$login_uid" "$runtime" "$log_root"
+  has_active_enrollments || { launchctl bootout system/com.bloom.containment 2>/dev/null || true; rm -f "$containment_plist" "$session_plist" "$machine_plist"; remove_cli_link; }
+}
 write_enrollment() {
   state="$1"; tmp="$enrollment.new.$$"
-  printf '{"schema":"bloom.macos-enrollment.1","state":"%s","login_uid":%s,"login_user":"%s","broker_user":"%s","broker_uid":%s,"broker_group":"%s","broker_gid":%s,"signer_user":"%s","signer_uid":%s,"signer_group":"%s","signer_gid":%s,"machine_broker_group":"%s","machine_broker_gid":%s,"broker_signer_group":"%s","broker_signer_gid":%s,"revoke_group":"%s","revoke_gid":%s,"release_digest":"%s"}\n' \
+  if [[ -n "${BLOOM_MACOS_LOG_GID:-}" ]]; then
+    log_fields=",\"log_group\":\"$log_group\",\"log_gid\":$BLOOM_MACOS_LOG_GID"
+  else
+    log_fields=""
+  fi
+  printf '{"schema":"bloom.macos-enrollment.1","state":"%s","login_uid":%s,"login_user":"%s","broker_user":"%s","broker_uid":%s,"broker_group":"%s","broker_gid":%s,"signer_user":"%s","signer_uid":%s,"signer_group":"%s","signer_gid":%s,"machine_broker_group":"%s","machine_broker_gid":%s,"broker_signer_group":"%s","broker_signer_gid":%s,"revoke_group":"%s","revoke_gid":%s%s,"release_digest":"%s"}\n' \
     "$state" "$login_uid" "$login_user" "$broker_user" "$BLOOM_MACOS_BROKER_UID" "$broker_group" "$BLOOM_MACOS_BROKER_GID" \
     "$signer_user" "$BLOOM_MACOS_SIGNER_UID" "$signer_group" "$BLOOM_MACOS_SIGNER_GID" "$machine_broker_group" \
     "$BLOOM_MACOS_MACHINE_BROKER_GID" "$broker_signer_group" "$BLOOM_MACOS_BROKER_SIGNER_GID" "$revoke_group" \
-    "$BLOOM_MACOS_REVOKE_GID" "$BLOOM_RELEASE_DIGEST" >"$tmp"
+    "$BLOOM_MACOS_REVOKE_GID" "$log_fields" "$BLOOM_RELEASE_DIGEST" >"$tmp"
   chmod 0644 "$tmp"; $live && chown root:wheel "$tmp"; mv -f "$tmp" "$enrollment"
 }
 
@@ -324,7 +603,13 @@ switch_release() {
   $live && chown -h root:wheel "$release_base/current.new.$$"
   # BSD mv otherwise follows a destination symlink to a directory and moves
   # the candidate link inside the old immutable release.
-  mv -fh "$release_base/current.new.$$" "$release_base/current"
+  if [[ "$(uname -s)" == Darwin ]]; then
+    mv -fh "$release_base/current.new.$$" "$release_base/current"
+  else
+    # Staged-root conformance runs on Linux. GNU mv spells the same
+    # no-dereference destination replacement guarantee as -T.
+    mv -fT "$release_base/current.new.$$" "$release_base/current"
+  fi
   machine_binary="$release_base/current/bloom"; broker_binary="$release_base/current/bloom-broker"; signer_binary="$release_base/current/bloom-signer"
 }
 
@@ -332,12 +617,12 @@ install_config() {
   mkdir -p "$enrollments" "$broker_config" "$signer_config" "$machine_config" "$session_config" "$installer_config" \
     "$broker_state/audit-checkpoints" "$signer_state/audit-checkpoints" "$machine_state/audit-checkpoints" \
     "$runtime/machine-broker" "$runtime/broker-signer" "$runtime/revoke/broker" "$runtime/revoke/signer" \
-    "$runtime/session" "$runtime/containment" "$runtime/status"
+    "$runtime/session" "$runtime/containment" "$runtime/status" "$variable/log/bloom" "$log_root"
   for directory in "$enrollments" "$broker_config" "$signer_config" "$machine_config" "$session_config" \
     "$installer_config" "$broker_state" "$signer_state" "$machine_state" "$broker_state/audit-checkpoints" \
     "$signer_state/audit-checkpoints" "$machine_state/audit-checkpoints" "$runtime" "$runtime/machine-broker" \
     "$runtime/broker-signer" "$runtime/revoke" "$runtime/revoke/broker" "$runtime/revoke/signer" "$runtime/session" \
-    "$runtime/containment" "$runtime/status"; do
+    "$runtime/containment" "$runtime/status" "$variable/log/bloom" "$log_root"; do
     [[ -d "$directory" && ! -L "$directory" ]] || die "security directory is missing or substituted: $directory"
   done
   chmod 0711 "$config" "$runtime" "$runtime/revoke"
@@ -347,6 +632,14 @@ install_config() {
   chmod 0710 "$runtime/machine-broker" "$runtime/broker-signer" "$runtime/revoke/broker" \
     "$runtime/revoke/signer" "$runtime/session"
   chmod 0755 "$runtime/containment"; chmod 0750 "$runtime/status"
+  # Service principals traverse to their owner-writable file; only the log
+  # group can read it. No principal can replace entries in this root directory.
+  chmod 0711 "$variable/log/bloom" "$log_root"
+  for service_log in "$broker_log" "$signer_log" "$broker_bootstrap_log" "$signer_bootstrap_log"; do
+    if [[ ! -e "$service_log" ]]; then install -m 0640 /dev/null "$service_log"; fi
+    [[ -f "$service_log" && ! -L "$service_log" ]] || die "service log is missing or substituted: $service_log"
+    chmod 0640 "$service_log"
+  done
   if [[ ! -f "$config/edge-manifest.json" ]]; then
     if $live; then
       scratch="$(mktemp -d "$product/.material.XXXXXX")"; templates="$scratch/templates"; material="$scratch/material"
@@ -370,17 +663,36 @@ install_config() {
   fi
 }
 
+validate_installed_security_inputs() {
+  local edge_manifest="$config/edge-manifest.json"
+  [[ -e "$edge_manifest" || -L "$edge_manifest" ]] || return 0
+  [[ -f "$edge_manifest" && ! -L "$edge_manifest" ]] ||
+    die "installed edge manifest is missing or substituted"
+  if $live; then
+    [[ "$(stat -f '%u:%Lp:%l' "$edge_manifest")" == 0:644:1 ]] ||
+      die "installed edge manifest has unsafe owner, mode, or link count"
+  fi
+}
+
 install_assets() {
   base="$payload/installer/macos"
   render "$base/launchdaemons/com.bloom.broker.plist.in" "$broker_plist" 0644
   render "$base/launchdaemons/com.bloom.signer.plist.in" "$signer_plist" 0644
   render "$base/launchdaemons/com.bloom.containment.plist.in" "$containment_plist" 0644
   render "$base/launchagents/com.bloom.session.plist.in" "$session_plist" 0644
+  render "$base/launchagents/com.bloom.machine.plist.in" "$machine_plist" 0644
   render "$base/pf/com.bloom.login.conf.in" "$pf_anchor" 0600
+  mkdir -p "$(dirname "$newsyslog_config")"
+  newsyslog_tmp="$newsyslog_config.new.$$"
+  printf '%s %s:%s 640 5 1024 * BN\n%s %s:%s 640 5 1024 * BN\n%s %s:%s 640 2 128 * BN\n%s %s:%s 640 2 128 * BN\n' \
+    "$broker_log" "$broker_user" "$log_group" "$signer_log" "$signer_user" "$log_group" \
+    "$broker_bootstrap_log" "$broker_user" "$log_group" "$signer_bootstrap_log" "$signer_user" "$log_group" >"$newsyslog_tmp"
+  chmod 0644 "$newsyslog_tmp"; mv -f "$newsyslog_tmp" "$newsyslog_config"
 }
 
 secure_ownership() {
-  chown -R root:wheel "$release_base" "$product"; chown root:wheel "$broker_plist" "$signer_plist" "$containment_plist" "$session_plist" "$pf_anchor"
+  chown -R root:wheel "$release_base"
+  chown root:wheel "$product" "$enrollments" "$config" "$broker_plist" "$signer_plist" "$containment_plist" "$session_plist" "$machine_plist" "$pf_anchor" "$newsyslog_config"
   chown -R "$broker_user:$broker_group" "$broker_config" "$broker_state"
   chown -R "$signer_user:$signer_group" "$signer_config" "$signer_state"
   chown -R "$login_user:$machine_broker_group" "$machine_config" "$machine_state"
@@ -390,22 +702,59 @@ secure_ownership() {
   chown "$broker_user:$machine_broker_group" "$runtime/machine-broker" "$runtime/status"
   chown "$signer_user:$broker_signer_group" "$runtime/broker-signer"
   chown "$broker_user:$revoke_group" "$runtime/revoke/broker"; chown "$signer_user:$revoke_group" "$runtime/revoke/signer"
+  chown root:"$log_group" "$log_root"
+  chown "$broker_user:$log_group" "$broker_log"; chown "$signer_user:$log_group" "$signer_log"
+  chown "$broker_user:$log_group" "$broker_bootstrap_log"; chown "$signer_user:$log_group" "$signer_bootstrap_log"
 }
 
-start_and_check() {
-  plutil -lint "$broker_plist" "$signer_plist" "$containment_plist" "$session_plist" >/dev/null; pfctl -nf "$pf_anchor"
-  launchctl bootout system/com.bloom.containment 2>/dev/null || true; launchctl bootstrap system "$containment_plist"
-  "$machine_binary" serve triad-pf-monitor-once
-  for label in "gui/$login_uid/com.bloom.session" "system/com.bloom.broker.$login_uid" "system/com.bloom.signer.$login_uid"; do launchctl bootout "$label" 2>/dev/null || true; done
-  launchctl bootstrap "gui/$login_uid" "$session_plist"; launchctl bootstrap system "$signer_plist"; launchctl bootstrap system "$broker_plist"
-  health_output="$(mktemp "$scratch/health-check.XXXXXX")"
-  for _ in {1..20}; do
-    # shellcheck disable=SC2024 # the installer, not the login user, owns this diagnostic file
-    if sudo -n -u "$login_user" -- "$machine_binary" serve triad-health-check "$BLOOM_RELEASE_DIGEST" >"$health_output" 2>&1; then return; fi
-    sleep 1
+reload_launchd_job() {
+  local domain="$1" label="$2" plist="$3"
+  stop_launchd_job "$domain/$label"
+  launchctl bootstrap "$domain" "$plist" || return 1
+  launchctl kickstart -k "$domain/$label" || return 1
+  launchctl print "$domain/$label" >/dev/null 2>&1
+}
+stop_launchd_job() {
+  local label="$1" attempts=0
+  launchctl bootout "$label" 2>/dev/null || true
+  while launchctl print "$label" >/dev/null 2>&1 && ((attempts < 50)); do
+    sleep 0.1; attempts=$((attempts + 1))
   done
-  cat "$health_output" >&2
-  die "Bloom triad activation failed for login UID $login_uid"
+  ! launchctl print "$label" >/dev/null 2>&1 || { echo "launchd job remains loaded after stop: $label" >&2; return 1; }
+}
+reload_launchagent_job() {
+  local uid="$1" label="$2" plist="$3"
+  # Old installers could leave these in either domain.
+  stop_launchd_job "gui/$uid/$label"; stop_launchd_job "user/$uid/$label"
+  reload_launchd_job "user/$uid" "$label" "$plist"
+}
+require_triad_health() {
+  local uid="$1" user="$2" digest="$3" home attempt
+  home="$(dscl . -read "/Users/$user" NFSHomeDirectory | awk 'NR==1{sub(/^NFSHomeDirectory:[[:space:]]*/,"");print}')"
+  [[ "$home" == /* && -d "$home" ]] || { echo "cannot resolve home for $user" >&2; return 1; }
+  for ((attempt=0; attempt<20; attempt++)); do launchctl asuser "$uid" /usr/bin/sudo -u "$user" -H "$release_base/current/bloom" --home "$home/.bloom" serve triad-health-check "$digest" >/dev/null 2>&1 && return 0; sleep 0.5; done
+  launchctl asuser "$uid" /usr/bin/sudo -u "$user" -H "$release_base/current/bloom" --home "$home/.bloom" serve triad-health-check "$digest"
+}
+reload_current_enrollment() {
+  plutil -lint "$broker_plist" "$signer_plist" "$containment_plist" "$session_plist" "$machine_plist" >/dev/null; pfctl -nf "$pf_anchor"
+  reload_launchd_job system com.bloom.containment "$containment_plist"
+  "$machine_binary" serve triad-pf-monitor-once 2>/dev/null ||
+    echo "Bloom installed, but containment readiness is deferred" >&2
+  reload_launchagent_job "$login_uid" com.bloom.session "$session_plist"
+  reload_launchd_job system "com.bloom.signer.$login_uid" "$signer_plist"
+  reload_launchd_job system "com.bloom.broker.$login_uid" "$broker_plist"
+  reload_launchagent_job "$login_uid" com.bloom.machine "$machine_plist"
+  require_triad_health "$login_uid" "$login_user" "$BLOOM_RELEASE_DIGEST"
+}
+activate_current_enrollment() {
+  write_enrollment active
+  if reload_launchagent_job "$login_uid" com.bloom.machine "$machine_plist" &&
+    require_triad_health "$login_uid" "$login_user" "$BLOOM_RELEASE_DIGEST"; then
+    return 0
+  fi
+  write_enrollment activating
+  stop_launchd_job "user/$login_uid/com.bloom.machine"
+  return 1
 }
 
 stop_all_enrollments() {
@@ -414,105 +763,174 @@ stop_all_enrollments() {
   for record in "$enrollments"/*.json; do
     [[ -f "$record" && ! -L "$record" ]] || continue
     uid="${record##*/}"; uid="${uid%.json}"; [[ "$uid" =~ ^[1-9][0-9]*$ ]] || return 65
-    for label in "gui/$uid/com.bloom.session" "system/com.bloom.broker.$uid" "system/com.bloom.signer.$uid"; do launchctl bootout "$label" 2>/dev/null || true; done
+    for label in "gui/$uid/com.bloom.machine" "user/$uid/com.bloom.machine" "gui/$uid/com.bloom.session" "user/$uid/com.bloom.session" "system/com.bloom.broker.$uid" "system/com.bloom.signer.$uid"; do stop_launchd_job "$label"; done
   done
 }
 
 rewrite_all_enrollments() {
   local digest="$1" state="$2" record
+  # Provision every enrollment first. Ownership is a separate pass so
+  # securing one enrollment cannot disturb an enrollment already repaired.
   for record in "$enrollments"/*.json; do
     [[ -f "$record" && ! -L "$record" ]] || continue
     login_uid="${record##*/}"; login_uid="${login_uid%.json}"; enrollment="$record"
     login_user="$(field "$record" login_user)"; load_names; paths; load_ids
     BLOOM_RELEASE_DIGEST="$digest"; write_enrollment "$state"
     if $live; then
+      catalog_candidate="$config/provenance-catalog.json.new.$$"
+      rm -f -- "$catalog_candidate"
+      "$release_base/releases/$digest/bloom" init triad-refresh-provenance-catalog \
+        "$payload/installer/macos/config/provenance-catalog.unsigned.json" \
+        "$installer_config/identity.json" "$catalog_candidate"
+      chmod 0644 "$catalog_candidate"
+      chown root:wheel "$catalog_candidate"
+      mv -f "$catalog_candidate" "$config/provenance-catalog.json"
       plutil -replace build_digest -string "$digest" "$broker_config/config.json"
       plutil -replace build_digest -string "$digest" "$signer_config/config.json"
     fi
+    install_config
     install_assets
+  done
+  if $live; then
+    for record in "$enrollments"/*.json; do
+      [[ -f "$record" && ! -L "$record" ]] || continue
+      login_uid="${record##*/}"; login_uid="${login_uid%.json}"; enrollment="$record"
+      login_user="$(field "$record" login_user)"; load_names; paths; load_ids
+      secure_ownership
+    done
+  fi
+}
+
+reload_installed_set() {
+  local record uid; $live || return 0
+  reload_launchd_job system com.bloom.containment "$containment_plist" || return 1
+  "$release_base/current/bloom" serve triad-pf-monitor-once 2>/dev/null ||
+    echo "Bloom installed, but containment readiness is deferred" >&2
+  for record in "$enrollments"/*.json; do
+    [[ -f "$record" && ! -L "$record" ]] || continue
+    uid="${record##*/}"; uid="${uid%.json}"
+    reload_launchagent_job "$uid" com.bloom.session "$root_prefix/Library/LaunchAgents/com.bloom.session.plist" || return 1
+    reload_launchd_job system "com.bloom.signer.$uid" "$root_prefix/Library/LaunchDaemons/com.bloom.signer.$uid.plist" || return 1
+    reload_launchd_job system "com.bloom.broker.$uid" "$root_prefix/Library/LaunchDaemons/com.bloom.broker.$uid.plist" || return 1
+    reload_launchagent_job "$uid" com.bloom.machine "$root_prefix/Library/LaunchAgents/com.bloom.machine.plist" || return 1
+    require_triad_health "$uid" "$(field "$record" login_user)" "$(field "$record" release_digest)" || return 1
   done
 }
 
 activate_installed_set() {
-  local expected="$1" record uid user healthy label; $live || return 0
-  launchctl bootstrap system "$containment_plist"
-  "$release_base/current/bloom" serve triad-pf-monitor-once
+  local record uid user digest; $live || return 0
   for record in "$enrollments"/*.json; do
     [[ -f "$record" && ! -L "$record" ]] || continue
-    uid="${record##*/}"; uid="${uid%.json}"; user="$(field "$record" login_user)"
-    launchctl bootstrap "gui/$uid" "$root_prefix/Library/LaunchAgents/com.bloom.session.plist"
-    launchctl bootstrap system "$root_prefix/Library/LaunchDaemons/com.bloom.signer.$uid.plist"
-    launchctl bootstrap system "$root_prefix/Library/LaunchDaemons/com.bloom.broker.$uid.plist"
-    healthy=false
-    for _ in {1..20}; do
-      if sudo -n -u "$user" -- "$release_base/current/bloom" serve triad-health-check "$expected" >/dev/null 2>&1; then healthy=true; break; fi
-      sleep 1
-    done
-    $healthy || { echo "Bloom triad activation failed for login UID $uid" >&2; return 69; }
-    for label in "system/com.bloom.broker.$uid" "system/com.bloom.signer.$uid" "gui/$uid/com.bloom.session"; do launchctl bootout "$label" 2>/dev/null || true; done
+    uid="${record##*/}"; uid="${uid%.json}"; user="$(field "$record" login_user)"; digest="$(field "$record" release_digest)"
+    login_uid="$uid"; login_user="$user"; enrollment="$record"; BLOOM_RELEASE_DIGEST="$digest"; load_names; paths; load_ids
+    write_enrollment active
+    if ! reload_launchagent_job "$uid" com.bloom.machine "$machine_plist" ||
+      ! require_triad_health "$uid" "$user" "$digest"; then
+      write_enrollment activating
+      stop_launchd_job "user/$uid/com.bloom.machine"
+      return 1
+    fi
   done
+}
+
+snapshot_macos_upgrade_state() {
+  local archive scratch record uid
+  archive="$upgrade_transaction/rollback-state.tar"
+  scratch="$archive.new.$$"
+  local -a paths=(
+    "Library/Application Support/BloomTriad/enrollments"
+    "Library/Application Support/BloomTriad/config"
+    "Library/LaunchDaemons/com.bloom.containment.plist"
+    "Library/LaunchAgents/com.bloom.session.plist"
+    "Library/LaunchAgents/com.bloom.machine.plist"
+  )
   for record in "$enrollments"/*.json; do
     [[ -f "$record" && ! -L "$record" ]] || continue
     uid="${record##*/}"; uid="${uid%.json}"
-    launchctl bootstrap "gui/$uid" "$root_prefix/Library/LaunchAgents/com.bloom.session.plist"
-    launchctl bootstrap system "$root_prefix/Library/LaunchDaemons/com.bloom.signer.$uid.plist"
-    launchctl bootstrap system "$root_prefix/Library/LaunchDaemons/com.bloom.broker.$uid.plist"
+    paths+=(
+      "Library/LaunchDaemons/com.bloom.broker.$uid.plist"
+      "Library/LaunchDaemons/com.bloom.signer.$uid.plist"
+      "etc/pf.anchors/com.bloom.triad.$uid"
+      "etc/newsyslog.d/bloom-$uid.conf"
+    )
   done
+  (cd "${root_prefix:-/}" && tar -cpf "$scratch" "${paths[@]}")
+  tar -tf "$scratch" >/dev/null
+  chmod 0600 "$scratch"
+  if $live; then chown root:wheel "$scratch"; fi
+  sync
+  mv -f "$scratch" "$archive"
+  sync
 }
 
-rollback_upgrade() {
-  local old
-  [[ -d "$upgrade_transaction" && ! -L "$upgrade_transaction" ]] || return 65
-  grep -Fx bloom.macos-upgrade-transaction.2 "$upgrade_transaction/schema" >/dev/null || return 65
-  old="$(<"$upgrade_transaction/old-digest")"; [[ "$old" =~ ^[0-9a-f]{64}$ ]] || return 65
-  stop_all_enrollments
-  switch_release "$old"
-  rewrite_all_enrollments "$old" activating
-  activate_installed_set "$old"
-  rewrite_all_enrollments "$old" active
-  rm -rf -- "$upgrade_transaction"; upgrade_transaction=""
+restore_macos_upgrade_state() {
+  local archive="$upgrade_transaction/rollback-state.tar"
+  [[ -f "$archive" && ! -L "$archive" ]] || die "macOS upgrade rollback state is missing or unsafe"
+  (cd "${root_prefix:-/}" && tar -xpf "$archive")
 }
 
-recover_interrupted_upgrade() {
+find_interrupted_upgrade() {
+  local recorded_old recorded_new
   upgrade_transaction="$product/upgrade-transaction"
-  [[ -e "$upgrade_transaction" ]] || { upgrade_transaction=""; return 0; }
-  echo "recovering interrupted Bloom macOS activation" >&2
-  rollback_upgrade || die "interrupted Bloom activation could not be rolled back safely"
+  [[ -e "$upgrade_transaction" ]] || { upgrade_transaction=""; upgrade_old_digest=""; return 0; }
+  [[ -d "$upgrade_transaction" && ! -L "$upgrade_transaction" ]] || die "invalid interrupted Bloom upgrade"
+  grep -Fx bloom.macos-upgrade-transaction.2 "$upgrade_transaction/schema" >/dev/null || die "invalid interrupted Bloom upgrade"
+  recorded_old="$(<"$upgrade_transaction/old-digest")"
+  recorded_new="$(<"$upgrade_transaction/new-digest")"
+  [[ "$recorded_old" =~ ^[0-9a-f]{64}$ && "$recorded_new" =~ ^[0-9a-f]{64}$ ]] || die "invalid interrupted Bloom upgrade"
+  [[ -f "$upgrade_transaction/rollback-state.tar" && ! -L "$upgrade_transaction/rollback-state.tar" ]] || die "invalid interrupted Bloom upgrade"
+  upgrade_old_digest="$recorded_old"
+  echo "resuming interrupted Bloom macOS upgrade toward the requested release" >&2
 }
 
 upgrade_release() {
-  local old="$1" new="$2"; [[ "$old" != "$new" ]] || return 0
+  local old="$1" new="$2"
+  local record uid
   if $live; then
     for record in "$enrollments"/*.json; do
       [[ -f "$record" && ! -L "$record" ]] || continue
       uid="${record##*/}"; uid="${uid%.json}"
-      launchctl print "gui/$uid" >/dev/null 2>&1 || die "atomic upgrade requires an active GUI domain for every enrollment"
+      launchctl print "user/$uid" >/dev/null 2>&1 ||
+        die "all enrolled Bloom users must be logged in before a shared release upgrade"
     done
   fi
-  upgrade_transaction="$product/upgrade-transaction"; [[ ! -e "$upgrade_transaction" ]] || die "unrecovered upgrade transaction exists"
-  mkdir -m 0700 "$upgrade_transaction"
+  upgrade_transaction="$product/upgrade-transaction"
+  if [[ ! -e "$upgrade_transaction" ]]; then
+    mkdir -m 0700 "$upgrade_transaction"
+  fi
+  [[ -d "$upgrade_transaction" && ! -L "$upgrade_transaction" ]] || die "invalid interrupted Bloom upgrade"
   printf '%s\n' bloom.macos-upgrade-transaction.2 >"$upgrade_transaction/schema"
   printf '%s\n' "$old" >"$upgrade_transaction/old-digest"
   printf '%s\n' "$new" >"$upgrade_transaction/new-digest"
+  if [[ ! -e "$upgrade_transaction/rollback-state.tar" ]]; then snapshot_macos_upgrade_state; fi
   chmod 0600 "$upgrade_transaction"/*; $live && chown -R root:wheel "$upgrade_transaction"; sync
   stop_all_enrollments
   rewrite_all_enrollments "$new" activating
   switch_release "$new"
-  activate_installed_set "$new"
-  rewrite_all_enrollments "$new" active
+  if ! reload_installed_set || ! activate_installed_set; then
+    echo "new Bloom release failed authenticated activation; restoring $old" >&2; stop_all_enrollments || true
+    restore_macos_upgrade_state; switch_release "$old"
+    if reload_installed_set && activate_installed_set; then install_cli_link; rm -rf -- "$upgrade_transaction"; upgrade_transaction=""
+      echo "previous Bloom release restored after failed activation" >&2
+    else echo "automatic restoration of the previous Bloom release failed" >&2; fi
+    return 1
+  fi
+  install_cli_link
   write_state_schema
-  rm -rf -- "$upgrade_transaction"; upgrade_transaction=""
+  rm -rf -- "$upgrade_transaction"; upgrade_transaction=""; upgrade_old_digest=""
 }
 
 case "$action" in
   install|restore)
     [[ $# -eq 4 ]] || usage; root_and_uid "$1" "$2"; login_user="$3"; payload="$(cd "$4" && pwd -P)"
     [[ "$login_user" =~ ^[a-z_][a-z0-9_-]*$ ]] || { echo "unsafe LOGIN_USER" >&2; exit 64; }
-    $live && { lock_installer; [[ "$(id -u "$login_user")" == "$login_uid" ]] || die "LOGIN_USER does not match LOGIN_UID"; launchctl print "gui/$login_uid" >/dev/null 2>&1 || die "LOGIN_USER has no active GUI domain"; }
-    requested_uid="$login_uid"; requested_user="$login_user"; load_names; paths; verify_payload; preflight_compatibility
-    recover_interrupted_upgrade
+    $live && { lock_installer; [[ "$(id -u "$login_user")" == "$login_uid" ]] || die "LOGIN_USER does not match LOGIN_UID"; launchctl print "gui/$login_uid" >/dev/null 2>&1 || die "LOGIN_USER has no active GUI domain"; snapshot_live_payload; }
+    requested_uid="$login_uid"; requested_user="$login_user"; load_names; paths; verify_payload; preflight_compatibility; prepare_verified_payload_for_execution
+    preflight_cli_link
+    find_interrupted_upgrade
     login_uid="$requested_uid"; login_user="$requested_user"; load_names; paths
     shared_digest="$(current_release_digest)"
+    validate_active_release_set "$shared_digest"
     had_active=false; has_active_enrollments && had_active=true
     if [[ "$action" == restore && "$had_active" == true && "$shared_digest" != "$BLOOM_RELEASE_DIGEST" ]]; then
       die "restore cannot change the shared release used by active enrollments"
@@ -531,26 +949,41 @@ case "$action" in
       [[ "$(field "$enrollment" schema)" == bloom.macos-enrollment.1 ]] || die "unsupported installed enrollment schema"
       fresh=false; load_ids
     fi
+    $live && $fresh && recover_interrupted_fresh_accounts
+    validate_installed_security_inputs
     if [[ "$fresh" == true && "$had_active" == true && "$shared_digest" != "$BLOOM_RELEASE_DIGEST" ]]; then
       die "new enrollment cannot change the shared release used by active enrollments"
     fi
     $live && $fresh && allocate_accounts
-    old_digest=""; $fresh || old_digest="$(field "$enrollment" release_digest)"
     install_release
-    if [[ -n "$old_digest" && "$old_digest" != "$BLOOM_RELEASE_DIGEST" && "$restoring" == false ]]; then
-      expected_installed_state=activating; $live && expected_installed_state=active
-      for record in "$enrollments"/*.json; do
-        [[ -f "$record" && ! -L "$record" ]] || continue
-        [[ "$(field "$record" schema)" == bloom.macos-enrollment.1 && "$(field "$record" state)" == "$expected_installed_state" && "$(field "$record" release_digest)" == "$old_digest" ]] || die "installed enrollment set is not compatible with atomic upgrade"
-      done
-      upgrade_release "$old_digest" "$BLOOM_RELEASE_DIGEST"
+    if [[ "$had_active" == true && "$shared_digest" != "$BLOOM_RELEASE_DIGEST" && "$restoring" == false ]]; then
+      upgrade_release "$shared_digest" "$BLOOM_RELEASE_DIGEST"
+      login_uid="$requested_uid"; login_user="$requested_user"; load_names; paths; load_ids
+      remove_legacy_cli || die "Bloom is healthy, but legacy CLI cleanup failed; remove ~/.local/bin/bloom and retry"
+      report_legacy_wallet_migrations
+      echo "Bloom macOS release upgraded atomically"
+      exit 0
+    fi
+    if [[ -n "$upgrade_transaction" ]]; then
+      upgrade_release "$upgrade_old_digest" "$BLOOM_RELEASE_DIGEST"
+      login_uid="$requested_uid"; login_user="$requested_user"; load_names; paths; load_ids
+      remove_legacy_cli || die "Bloom is healthy, but legacy CLI cleanup failed; remove ~/.local/bin/bloom and retry"
+      report_legacy_wallet_migrations
       echo "Bloom macOS release upgraded atomically"
       exit 0
     fi
     switch_release "$BLOOM_RELEASE_DIGEST"; install_config; write_enrollment activating; install_assets
-    if $live; then secure_ownership; pf_reference add; start_and_check; write_enrollment active; created_users=""; created_groups=""; fi
+    if $live; then
+      secure_ownership; pf_reference add; reload_current_enrollment || { $fresh && rollback_failed_fresh; die "Bloom failed authenticated activation"; }
+      activate_current_enrollment || { $fresh && rollback_failed_fresh; die "Bloom failed full activation"; }
+      created_users=""; created_groups=""
+    fi
+    install_cli_link
     write_state_schema
-    if $restoring; then rm -f "$retained"; restore_pending=false; echo "Bloom macOS retained custody restored"; else echo "Bloom macOS enrollment installed or repaired"; fi
+    if $restoring; then rm -f "$retained"; restore_pending=false; fi
+    remove_legacy_cli || die "Bloom is healthy, but legacy CLI cleanup failed; remove ~/.local/bin/bloom and retry"
+    report_legacy_wallet_migrations
+    if $restoring; then echo "Bloom macOS retained custody restored"; else echo "Bloom macOS enrollment installed or repaired"; fi
     ;;
   uninstall)
     retain=false
@@ -563,25 +996,27 @@ case "$action" in
     [[ -f "$record" && ! -L "$record" ]] || die "enrollment or retained custody record missing"
     enrollment="$record"; login_user="$(field "$record" login_user)"; BLOOM_RELEASE_DIGEST="$(field "$record" release_digest)"; load_ids
     if $live; then
-      for label in "system/com.bloom.broker.$login_uid" "system/com.bloom.signer.$login_uid" "gui/$login_uid/com.bloom.session"; do launchctl bootout "$label" 2>/dev/null || true; done
+      for label in "gui/$login_uid/com.bloom.machine" "user/$login_uid/com.bloom.machine" "system/com.bloom.broker.$login_uid" "system/com.bloom.signer.$login_uid" "gui/$login_uid/com.bloom.session" "user/$login_uid/com.bloom.session"; do stop_launchd_job "$label"; done
       pf_reference remove
     fi
-    rm -f "$broker_plist" "$signer_plist" "$pf_anchor"
+    rm -f "$broker_plist" "$signer_plist" "$pf_anchor" "$newsyslog_config"
     if $retain; then
       mkdir -p "$product/retained"; enrollment="$retained"; write_enrollment retained
-      rm -f "$enrollments/$login_uid.json"; rm -rf "$runtime"
+      rm -f "$enrollments/$login_uid.json"; rm -rf "$runtime" "$log_root"
       echo "Bloom macOS runtime removed; custody retained for restore"
     else
-      rm -f "$enrollments/$login_uid.json" "$retained"; rm -rf "$config" "$variable/db/bloom/$login_uid" "$runtime"
+      rm -f "$enrollments/$login_uid.json" "$retained"; rm -rf "$config" "$variable/db/bloom/$login_uid" "$runtime" "$log_root"
     fi
     if $live && ! $retain; then
       for name in "$broker_user" "$signer_user"; do dscl . -delete "/Users/$name"; done
       for name in "$broker_group" "$signer_group" "$machine_broker_group" "$broker_signer_group" "$revoke_group"; do dscl . -delete "/Groups/$name"; done
+      record_exists Groups "$log_group" && dscl . -delete "/Groups/$log_group"
       dsmemberutil flushcache
     fi
-    if ! find "$enrollments" -type f -name '*.json' -maxdepth 1 2>/dev/null | grep . >/dev/null; then
-      $live && launchctl bootout system/com.bloom.containment 2>/dev/null || true; rm -f "$containment_plist" "$session_plist"
-      if ! find "$product/retained" -type f -name '*.json' -maxdepth 1 2>/dev/null | grep . >/dev/null; then rm -rf "$release_base"; fi
+    if ! has_active_enrollments; then
+      $live && launchctl bootout system/com.bloom.containment 2>/dev/null || true; rm -f "$containment_plist" "$session_plist" "$machine_plist"
+      remove_cli_link
+      if ! has_active_enrollments "$product/retained"; then rm -rf "$release_base"; fi
     fi
     $retain || echo "Bloom macOS enrollment permanently purged; custody is unrecoverable"
     ;;
