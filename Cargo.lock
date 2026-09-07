@@ -2470,7 +2470,7 @@ dependencies = [
 [[package]]
 name = "bloom-petal-contract"
 version = "0.1.0"
-source = "git+https://github.com/bloom-directory/petal?rev=61938d0c127cfe03c7e3e55baed0ba1439bc5ca2#61938d0c127cfe03c7e3e55baed0ba1439bc5ca2"
+source = "git+https://github.com/bloom-directory/petal?rev=864a80b407387871bae06aabe77b91865e55f7bc#864a80b407387871bae06aabe77b91865e55f7bc"
 dependencies = [
  "sha2 0.10.9",
 ]
@@ -2586,7 +2586,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-rpc-common"
-version = "0.1.3"
+version = "0.2.0"
 dependencies = [
  "parking_lot",
  "serde",
@@ -2627,6 +2627,67 @@ dependencies = [
  "rustix 1.1.4",
  "tracing",
  "tracing-subscriber 0.3.23",
+]
+
+[[package]]
+name = "bloom-signer-derive"
+version = "0.1.0"
+source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=7404b62ecac2a9ebd760c8f7b37deb76e1e7eeb8#7404b62ecac2a9ebd760c8f7b37deb76e1e7eeb8"
+dependencies = [
+ "bip39",
+ "ed25519-dalek",
+ "hex",
+ "hmac 0.12.1",
+ "k256",
+ "rand 0.8.6",
+ "sha2 0.10.9",
+ "thiserror 2.0.18",
+ "unicode-normalization",
+ "zeroize",
+]
+
+[[package]]
+name = "bloom-solana"
+version = "0.2.0"
+dependencies = [
+ "bloom-proto",
+ "bloom-rpc-common",
+ "parking_lot",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "bloom-solana-tx"
+version = "0.2.0"
+dependencies = [
+ "async-trait",
+ "base64",
+ "blake3",
+ "bloom-broker-api",
+ "bloom-machine-client",
+ "bloom-proto",
+ "bloom-solana",
+ "bs58",
+ "ed25519-dalek",
+ "hex",
+ "rand 0.8.6",
+ "serde",
+ "serde_jcs",
+ "serde_json",
+ "sha2 0.10.9",
+ "solana-message",
+ "solana-system-interface",
+ "solana-transaction",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "wincode",
 ]
 
 [[package]]

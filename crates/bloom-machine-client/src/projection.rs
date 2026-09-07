@@ -1714,7 +1714,13 @@ mod tests {
             custody_operation_id: operation_id,
             public_status: CeremonyState::Succeeded,
             wallet_id: Some(fixture.wallet.wallet_id.clone()),
-            public_key_refs: vec![fixture.wallet.root_key_ref.clone()],
+            public_key_refs: vec![
+                fixture
+                    .wallet
+                    .root_key_ref
+                    .clone()
+                    .expect("legacy migration fixture has a root signing key"),
+            ],
             credential_summaries: vec![CredentialSummary {
                 credential_id: Base64UrlBytes::from_bytes(&[11; 16]),
                 rp_id: token("localhost"),

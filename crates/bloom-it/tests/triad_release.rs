@@ -19,6 +19,64 @@ fn release_script(name: &str) -> PathBuf {
 }
 
 #[test]
+fn machine_production_surfaces_exclude_legacy_wallet_secret_inputs() {
+    fn visit_source_files(root: &Path, files: &mut Vec<PathBuf>) {
+        for entry in fs::read_dir(root).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                visit_source_files(&path, files);
+            } else if matches!(
+                path.extension().and_then(|value| value.to_str()),
+                Some("rs" | "html")
+            ) {
+                files.push(path);
+            }
+        }
+    }
+
+    let root = workspace();
+    let mut files = Vec::new();
+    visit_source_files(&root.join("crates/bloom/src"), &mut files);
+    visit_source_files(&root.join("crates/bloom-daemon/src"), &mut files);
+    for relative in [
+        "scripts/play.sh",
+        "scripts/acceptance.sh",
+        "tests/docker/lib.sh",
+        "tests/docker/test_fork_mount.sh",
+        "tests/docker/test_mempool_mock.sh",
+        "tests/docker/docker-compose.yml",
+    ] {
+        let path = root.join(relative);
+        if path.is_file() {
+            files.push(path);
+        }
+    }
+
+    let markers = [
+        "passphrase",
+        "BLOOM_PASSPHRASE",
+        "BLOOM_TEST_WALLET_PASSPHRASE",
+        "--allow-passphrase-wallet",
+        "--passphrase-file",
+        "--passphrase",
+    ];
+    let mut violations = Vec::new();
+    for path in files {
+        let source = fs::read_to_string(&path).unwrap();
+        for marker in markers {
+            if source.contains(marker) {
+                violations.push(format!("{} contains {marker:?}", path.display()));
+            }
+        }
+    }
+    assert!(
+        violations.is_empty(),
+        "legacy wallet-secret input resurfaced on a Machine production surface:\n{}",
+        violations.join("\n")
+    );
+}
+
+#[test]
 fn release_compatibility_declares_each_edge_without_a_global_protocol_range() {
     fn is_legacy_global_protocol_key(line: &str) -> bool {
         let line = line.trim_start();
@@ -325,11 +383,11 @@ fn build(staging: &Path, output: &Path, key: &Path) -> std::process::Output {
         &compatibility,
         compatibility_source
             .replace(
-                "broker_commit = \"56252977c99238151c89bb44649fe8f5d1c91ae8\"",
+                "broker_commit = \"a4711e8446f955a4c0db1b05a2122c091f9873d6\"",
                 &format!("broker_commit = \"{}\"", "22".repeat(20)),
             )
             .replace(
-                "signer_commit = \"0126ba4589ad8cf504d2f04c8e36471727964089\"",
+                "signer_commit = \"7404b62ecac2a9ebd760c8f7b37deb76e1e7eeb8\"",
                 &format!("signer_commit = \"{}\"", "33".repeat(20)),
             ),
     )
