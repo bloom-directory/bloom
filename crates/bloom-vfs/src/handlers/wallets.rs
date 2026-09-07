@@ -3997,10 +3997,40 @@ impl WalletsHandler {
                                 .and_then(|s| bloom_broker_api::Digest32::new(s.to_owned()).ok())
                         })
                 });
+                let target_id = if approval_id.is_some() {
+                    engine
+                        .restage_approved(wallet, id, &child.pubkey, now)
+                        .await
+                        .map_err(|error| HandlerError::backend(error.to_string()))?
+                        .id
+                } else {
+                    id.clone()
+                };
+                let target_entry = engine
+                    .outbox()
+                    .read_in_state(
+                        wallet,
+                        chain,
+                        &target_id,
+                        bloom_solana_tx::outbox::SolanaOutboxState::Pending,
+                    )
+                    .map_err(solana_outbox_err)?;
+                if target_id != *id
+                    && let Ok(challenge) = std::fs::read(
+                        entry
+                            .dir
+                            .join(bloom_solana_tx::outbox::APPROVAL_CHALLENGE_FILE),
+                    )
+                {
+                    engine
+                        .outbox()
+                        .write_approval_challenge(&target_entry, &challenge)
+                        .map_err(solana_outbox_err)?;
+                }
                 match engine
                     .sign(
                         wallet,
-                        id,
+                        &target_id,
                         &child.pubkey,
                         Some(child.key_ref.clone()),
                         approval_id,
@@ -4016,38 +4046,38 @@ impl WalletsHandler {
                     } => {
                         let challenge = serde_json::to_vec_pretty(&serde_json::json!({
                             "schema": "bloom.solana-approval-challenge/1",
-                            "action_id": entry.staged.id,
-                            "tx_id": entry.staged.id,
+                            "action_id": target_entry.staged.id,
+                            "tx_id": target_entry.staged.id,
                             "wallet": wallet,
                             "chain": chain,
                             "approval_id": approval_id.as_str(),
                             "ceremony_url": ceremony_url,
                             "expiry_ms": ceremony_expires_at_ms,
-                            "account_fingerprint": entry.staged.account_fingerprint,
-                            "fee_payer": entry.staged.fee_payer,
-                            "destination": entry.staged.destination,
-                            "lamports": entry.staged.lamports,
-                            "fee_lamports": entry.staged.fee_lamports,
-                            "plan_path": format!("wallets/{wallet}/chains/{chain}/outbox/pending/{id}/plan.md"),
-                            "retry_path": format!("wallets/{wallet}/chains/{chain}/outbox/pending/{id}/confirm"),
+                            "account_fingerprint": target_entry.staged.account_fingerprint,
+                            "fee_payer": target_entry.staged.fee_payer,
+                            "destination": target_entry.staged.destination,
+                            "lamports": target_entry.staged.lamports,
+                            "fee_lamports": target_entry.staged.fee_lamports,
+                            "plan_path": format!("wallets/{wallet}/chains/{chain}/outbox/pending/{target_id}/plan.md"),
+                            "retry_path": format!("wallets/{wallet}/chains/{chain}/outbox/pending/{target_id}/confirm"),
                         }))
                         .map_err(|error| HandlerError::backend(error.to_string()))?;
                         engine
                             .outbox()
-                            .write_approval_challenge(&entry, &challenge)
+                            .write_approval_challenge(&target_entry, &challenge)
                             .map_err(solana_outbox_err)?;
                         Err(HandlerError::PermissionDenied)
                     }
                     bloom_solana_tx::signing::SolanaSignOutcome::Signed { .. } => {
                         engine
                             .outbox()
-                            .clear_approval_challenge(&entry)
+                            .clear_approval_challenge(&target_entry)
                             .map_err(solana_outbox_err)?;
                         engine
-                            .broadcast(wallet, id, now)
+                            .broadcast(wallet, &target_id, now)
                             .await
                             .map_err(|e| HandlerError::backend(e.to_string()))?;
-                        tracing::info!(wallet, chain, id, "solana_outbox.broadcast");
+                        tracing::info!(wallet, chain, id = %target_id, "solana_outbox.broadcast");
                         Ok(())
                     }
                 }
