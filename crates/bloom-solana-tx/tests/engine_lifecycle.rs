@@ -1304,3 +1304,56 @@ async fn broadcast_refuses_when_operator_disables_it() {
         "{err}"
     );
 }
+
+/// Refreshing an approved transfer when the cluster has no newer blockhash is
+/// not a failure. `stage_with_id` deduplicates an identical message, so the
+/// "replacement" is the entry itself; the transfer must stay pending, keep its
+/// id, and remain signable under the approval the owner already granted.
+/// Against a local validator, or whenever a confirm follows staging closely,
+/// this is the ordinary case.
+#[tokio::test]
+async fn approved_restage_without_a_newer_blockhash_keeps_the_staged_transfer() {
+    let height = Arc::new(std::sync::atomic::AtomicU64::new(1));
+    let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let endpoint = spawn_node_with_controls(height.clone(), false, false, requests).await;
+    let dir = tempfile::tempdir().unwrap();
+    let outbox = SolanaOutbox::new(dir.path().join("outbox")).unwrap();
+    let broker = Arc::new(BrokerFixture::new());
+    let signer =
+        SolanaTransferSigner::from_catalog(MachineBrokerClient::new(broker.clone()), &catalog())
+            .unwrap();
+    let engine =
+        SolanaTransferEngine::new(outbox.clone(), client(&endpoint), signer, "solana-devnet");
+    let destination = ed25519_dalek::SigningKey::from_bytes(&[0xcc; 32])
+        .verifying_key()
+        .to_bytes();
+    let original = engine
+        .stage(
+            "wallet",
+            &broker.child_pubkey(),
+            Default::default(),
+            &destination,
+            1_000_000,
+            1_000,
+        )
+        .await
+        .unwrap();
+
+    // The stub node keeps returning the same blockhash, so the refresh finds
+    // nothing newer to stage.
+    let refreshed = engine
+        .restage_approved("wallet", &original.id, &broker.child_pubkey(), 1_100)
+        .await
+        .expect("an unchanged blockhash must not fail an approved refresh");
+
+    assert_eq!(refreshed.id, original.id);
+    assert_eq!(refreshed.blockhash, original.blockhash);
+    outbox
+        .read_in_state(
+            "wallet",
+            "solana-devnet",
+            &original.id,
+            bloom_solana_tx::outbox::SolanaOutboxState::Pending,
+        )
+        .expect("the transfer stays pending under its existing approval");
+}

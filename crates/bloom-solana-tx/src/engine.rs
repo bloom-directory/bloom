@@ -421,9 +421,19 @@ impl SolanaTransferEngine {
             Err(error) => return Err(error.into()),
         };
         if replacement.id == entry.staged.id {
-            return Err(EngineError::Invalid(
-                "Solana RPC has not advanced to a fresh blockhash; retry confirmation".into(),
-            ));
+            if require_expired {
+                // The caller established that the staged blockhash is past its
+                // window, so staging again must not hand back the same message.
+                return Err(EngineError::Invalid(
+                    "Solana RPC has not advanced to a fresh blockhash; retry confirmation".into(),
+                ));
+            }
+            // Refreshing an approved transfer before signing. The cluster has
+            // no newer blockhash than the one already staged — normal when a
+            // confirm follows staging closely, and routine against a local
+            // validator — so there is nothing to replace. Leave the entry, and
+            // its approval, exactly as the owner approved them.
+            return Ok(replacement);
         }
 
         let mut expired = entry;
