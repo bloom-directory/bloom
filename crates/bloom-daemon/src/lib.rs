@@ -309,6 +309,17 @@ struct PetalTxOutbox {
     write_permit: Option<Arc<HomeWritePermit>>,
 }
 
+/// The scoped Petal key a reusable approval is being prepared for, together
+/// with the grant facts that bound it. Grouped so the preparation call does
+/// not grow a positional argument per grant fact.
+#[derive(Clone, Copy)]
+struct PetalKeyApprovalGrant<'a> {
+    scope: &'a bloom_broker_api::PetalKeyScope,
+    key_ref: &'a bloom_broker_api::KeyRef,
+    scope_expires_at_ms: u64,
+    approval_attempt: u64,
+}
+
 impl DaemonPetalHost {
     fn authorize_guest_vfs_path(path: &str) -> Result<(), HostError> {
         let parsed = VfsPath::parse(path)
@@ -516,12 +527,15 @@ impl DaemonPetalHost {
         &self,
         broker: &MachineBrokerClient,
         wallet: &bloom_broker_api::WalletPublic,
-        scope: &bloom_broker_api::PetalKeyScope,
-        key_ref: &bloom_broker_api::KeyRef,
-        scope_expires_at_ms: u64,
-        approval_attempt: u64,
+        grant: PetalKeyApprovalGrant<'_>,
         provenance_digest: bloom_broker_api::Digest32,
     ) -> Result<bloom_broker_api::SealedApprovalPrepareResponse, HostError> {
+        let PetalKeyApprovalGrant {
+            scope,
+            key_ref,
+            scope_expires_at_ms,
+            approval_attempt,
+        } = grant;
         let catalog = self.provenance_catalog.as_ref().ok_or_else(|| {
             HostError::Backend("installer provenance catalog is not configured".into())
         })?;
@@ -1229,10 +1243,12 @@ impl PetalHost for DaemonPetalHost {
                     .prepare_petal_key_reusable_approval(
                         broker,
                         &wallet,
-                        &scope,
-                        &derived_key_ref,
-                        scope_expires_at_ms,
-                        stored.reusable_approval_attempt,
+                        PetalKeyApprovalGrant {
+                            scope: &scope,
+                            key_ref: &derived_key_ref,
+                            scope_expires_at_ms,
+                            approval_attempt: stored.reusable_approval_attempt,
+                        },
                         provenance_digest.clone().ok_or_else(|| {
                             HostError::Denied("Petal provenance digest is missing".into())
                         })?,
@@ -1308,10 +1324,12 @@ impl PetalHost for DaemonPetalHost {
                         .prepare_petal_key_reusable_approval(
                             broker,
                             &wallet,
-                            &scope,
-                            &public.key_ref,
-                            scope_expires_at_ms,
-                            stored.reusable_approval_attempt,
+                            PetalKeyApprovalGrant {
+                                scope: &scope,
+                                key_ref: &public.key_ref,
+                                scope_expires_at_ms,
+                                approval_attempt: stored.reusable_approval_attempt,
+                            },
                             provenance_digest.clone().ok_or_else(|| {
                                 HostError::Denied("Petal provenance digest is missing".into())
                             })?,
