@@ -211,11 +211,13 @@ impl WalletsHandler {
                 // projection reader reports it as an invalid request; to a
                 // filesystem client that must be ENOENT, or `ls` of a mistyped
                 // wallet name looks like the machine is failing.
-                let text = error.to_string();
-                if text.contains("unknown wallet") || text.contains("not found") {
+                let absent = error.code == ProtocolErrorCode::BackendInvalidRequest
+                    && (error.message == format!("wallet {wallet} not found")
+                        || error.message == format!("wallet {wallet} was deleted"));
+                if absent {
                     HandlerError::not_found(wallet.to_owned())
                 } else {
-                    HandlerError::backend(text)
+                    HandlerError::backend(error.to_string())
                 }
             })
     }
@@ -3266,6 +3268,11 @@ mod tests {
 
     struct UnavailableProjection;
 
+    struct FailedProjection {
+        code: ProtocolErrorCode,
+        message: &'static str,
+    }
+
     struct IntegrityFailureProjection(Arc<dyn WalletProjectionReader>);
 
     #[async_trait]
@@ -3321,6 +3328,26 @@ mod tests {
     }
 
     #[async_trait]
+    impl WalletProjectionReader for FailedProjection {
+        async fn list_wallets(
+            &self,
+        ) -> Result<Vec<WalletProjection>, bloom_broker_api::ProtocolError> {
+            Err(ProtocolError::new(self.code, self.message))
+        }
+
+        async fn get_wallet(
+            &self,
+            _wallet_id: &Token,
+        ) -> Result<WalletProjection, bloom_broker_api::ProtocolError> {
+            Err(ProtocolError::new(self.code, self.message))
+        }
+
+        fn cached_wallets(&self) -> Result<Vec<WalletProjection>, bloom_broker_api::ProtocolError> {
+            Err(ProtocolError::new(self.code, self.message))
+        }
+    }
+
+    #[async_trait]
     impl WalletProjectionReader for StaticProjection {
         async fn list_wallets(
             &self,
@@ -3337,7 +3364,7 @@ mod tests {
             } else {
                 Err(ProtocolError::new(
                     ProtocolErrorCode::BackendInvalidRequest,
-                    "unknown wallet projection",
+                    format!("wallet {} not found", wallet_id.as_str()),
                 ))
             }
         }
@@ -5150,6 +5177,44 @@ mod tests {
                 f.handler.read(&p).await.err()
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_deleted_wallet_is_not_found() {
+        let mut f = make_handler_with_chain(true);
+        f.handler.wallet_projections = Some(Arc::new(FailedProjection {
+            code: ProtocolErrorCode::BackendInvalidRequest,
+            message: "wallet alice was deleted",
+        }));
+        let p = VfsPath::parse("/alice").unwrap();
+        assert!(matches!(
+            f.handler.read(&p).await,
+            Err(HandlerError::NotFound(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn an_unrelated_not_found_fault_remains_a_backend_error() {
+        let mut f = make_handler_with_chain(true);
+        f.handler.wallet_projections = Some(Arc::new(FailedProjection {
+            code: ProtocolErrorCode::BackendInvalidRequest,
+            message: "key not found",
+        }));
+        let p = VfsPath::parse("/alice").unwrap();
+        assert!(matches!(
+            f.handler.read(&p).await,
+            Err(HandlerError::Backend(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_registered_wallet_root_is_a_directory_not_a_file() {
+        let f = make_handler_with_chain(true);
+        let p = VfsPath::parse(&format!("/{}", f.wallet_name)).unwrap();
+        assert!(matches!(
+            f.handler.read(&p).await,
+            Err(HandlerError::NotAFile(_))
+        ));
     }
 
     #[tokio::test]
