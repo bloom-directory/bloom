@@ -126,6 +126,34 @@ const PRIVATE_APPROVAL_FILE: &str = "approval.json";
 const RESTAGE_RESERVATION_FILE: &str = ".restage_replacement";
 const BROADCAST_SCHEMA: &str = "bloom.solana-broadcast-attempt/1";
 
+/// Why an entry was retired in favour of a successor. An owner reads this in
+/// `restage_advice.json`, so it must state what actually happened: a transfer
+/// is also restaged *before* its blockhash expires, to put the freshest
+/// possible one under an approval the owner has already granted.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RestageReason {
+    /// The staged blockhash was no longer valid on the cluster.
+    BlockhashExpired,
+    /// An approval exists, so the payload was refreshed before signing.
+    ApprovalRefresh,
+}
+
+impl RestageReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::BlockhashExpired => "blockhash_expired",
+            Self::ApprovalRefresh => "approval_refresh",
+        }
+    }
+
+    fn describe(self) -> &'static str {
+        match self {
+            Self::BlockhashExpired => "The staged blockhash expired",
+            Self::ApprovalRefresh => "The approved transfer was restaged on a fresher blockhash",
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct SolanaOutbox {
     inner: Arc<OutboxInner>,
@@ -676,16 +704,17 @@ impl SolanaOutbox {
         }
     }
 
-    /// Link an expired entry to its freshly staged successor without copying
+    /// Link a retired entry to its freshly staged successor without copying
     /// any private approval or signing material into public artifacts.
     pub fn write_restage_advice(
         &self,
         entry: &SolanaOutboxEntry,
         replacement_id: &str,
+        reason: RestageReason,
     ) -> Result<(), OutboxError> {
         let advice = serde_json::json!({
             "schema": "bloom.solana-restage-advice/1",
-            "reason": "blockhash_expired",
+            "reason": reason.as_str(),
             "replacement_id": replacement_id,
             "wallet": &entry.staged.wallet,
             "chain": &entry.staged.chain,
@@ -699,7 +728,8 @@ impl SolanaOutbox {
             &entry.dir,
             "restage.md",
             format!(
-                "The staged blockhash expired. Replacement: `{replacement_id}`. Review its fresh intent and plan before confirming.\n"
+                "{}. Replacement: `{replacement_id}`. Review its fresh intent and plan before confirming.\n",
+                reason.describe()
             )
             .as_bytes(),
         )

@@ -437,8 +437,15 @@ impl SolanaTransferEngine {
             expired.dir = old_dir;
         }
         self.outbox.rewrite_intent(&expired)?;
-        self.outbox
-            .write_restage_advice(&expired, &replacement.id)?;
+        self.outbox.write_restage_advice(
+            &expired,
+            &replacement.id,
+            if require_expired {
+                crate::outbox::RestageReason::BlockhashExpired
+            } else {
+                crate::outbox::RestageReason::ApprovalRefresh
+            },
+        )?;
         Ok(replacement)
     }
 
