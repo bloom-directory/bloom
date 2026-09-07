@@ -3972,31 +3972,26 @@ impl WalletsHandler {
                 let child = self
                     .resolve_solana_child(wallet, entry.staged.account_fingerprint.as_deref())
                     .await?;
-                let approval_id = std::fs::read(
+                // Read the public challenge before anything retires this entry.
+                // Transitioning an entry to `failed` deletes the challenge, and
+                // `restage_approved` does exactly that to the entry it replaces,
+                // so reading it afterwards silently yields nothing and the
+                // successor inherits no approval id — which makes the next
+                // confirm re-prepare a ceremony the owner already completed.
+                let challenge_bytes = std::fs::read(
                     entry
                         .dir
                         .join(bloom_solana_tx::outbox::APPROVAL_CHALLENGE_FILE),
                 )
-                .ok()
-                .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
-                .and_then(|v| {
-                    v.get("approval_id")
-                        .and_then(|id| id.as_str())
-                        .and_then(|s| bloom_broker_api::Digest32::new(s.to_owned()).ok())
-                })
-                // Compatibility for pending entries produced by earlier
-                // unshipped Solana heads. New entries use the public
-                // challenge as their canonical resume projection.
-                .or_else(|| {
-                    std::fs::read(entry.dir.join("approval.json"))
-                        .ok()
-                        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
-                        .and_then(|v| {
-                            v.get("approval_id")
-                                .and_then(|id| id.as_str())
-                                .and_then(|s| bloom_broker_api::Digest32::new(s.to_owned()).ok())
-                        })
-                });
+                .ok();
+                let approval_id = challenge_bytes
+                    .as_deref()
+                    .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(bytes).ok())
+                    .and_then(|v| {
+                        v.get("approval_id")
+                            .and_then(|id| id.as_str())
+                            .and_then(|s| bloom_broker_api::Digest32::new(s.to_owned()).ok())
+                    });
                 let target_id = if approval_id.is_some() {
                     engine
                         .restage_approved(wallet, id, &child.pubkey, now)
@@ -4016,15 +4011,11 @@ impl WalletsHandler {
                     )
                     .map_err(solana_outbox_err)?;
                 if target_id != *id
-                    && let Ok(challenge) = std::fs::read(
-                        entry
-                            .dir
-                            .join(bloom_solana_tx::outbox::APPROVAL_CHALLENGE_FILE),
-                    )
+                    && let Some(challenge) = challenge_bytes.as_deref()
                 {
                     engine
                         .outbox()
-                        .write_approval_challenge(&target_entry, &challenge)
+                        .write_approval_challenge(&target_entry, challenge)
                         .map_err(solana_outbox_err)?;
                 }
                 match engine
