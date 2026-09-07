@@ -164,11 +164,16 @@ impl MachineBrokerService for SolanaBrokerFixture {
                 }
                 MachineBrokerRequest::SigningSign(sign_request) => {
                     if let Some(prepared) = self.prepared_claim.lock().unwrap().as_ref()
-                        && sign_request.system_use_claim.as_ref() != Some(prepared)
+                        && sign_request
+                            .system_use_claim
+                            .as_ref()
+                            .map(|claim| claim.approval_intent_digest())
+                            .transpose()?
+                            != Some(prepared.approval_intent_digest()?)
                     {
                         return Err(ProtocolError::new(
                             ProtocolErrorCode::ClaimInvalid,
-                            "ceremony retry changed the reviewed Solana claim",
+                            "ceremony retry changed the reviewed Solana intent",
                         ));
                     }
                     let signature = self.sign_payload(&sign_request)?;
@@ -185,6 +190,18 @@ impl MachineBrokerService for SolanaBrokerFixture {
                     system_use_claim,
                     ..
                 }) => {
+                    let bloom_broker_api::ApprovalSelector::System { intent_digest, .. } =
+                        &terms.selector
+                    else {
+                        panic!("native transfer must use a scoped system selector");
+                    };
+                    assert_eq!(
+                        Some(intent_digest),
+                        system_use_claim
+                            .as_ref()
+                            .map(|claim| claim.approval_intent_digest().unwrap())
+                            .as_ref()
+                    );
                     assert_eq!(terms.limits.value_limits.len(), 1);
                     assert_eq!(terms.limits.value_limits[0].asset.chain.as_str(), "solana");
                     assert_eq!(terms.limits.value_limits[0].asset.asset, "native");
@@ -360,18 +377,20 @@ async fn ceremony_retry_preserves_claim_and_authority_identity() {
     let SolanaSignOutcome::ApprovalRequired { approval_id, .. } = first else {
         panic!("expected approval preparation");
     };
+    let refreshed_message =
+        build_transfer_message(&fee_payer, &destination, 50, &[0x44; 32]).unwrap();
     let second = signer
         .sign_transfer(SignTransferRequest {
             wallet_id: "wallet",
             fee_payer: &fee_payer,
             account_key_ref: None,
-            message_bytes: &message,
+            message_bytes: &refreshed_message,
             destination: &bs58::encode(destination).into_string(),
             lamports: 50,
             fee_lamports: 5_000,
             genesis_hash: "test-genesis",
-            recent_blockhash: &bs58::encode([0x43; 32]).into_string(),
-            last_valid_block_height: 100,
+            recent_blockhash: &bs58::encode([0x44; 32]).into_string(),
+            last_valid_block_height: 250,
             approval_id: Some(approval_id),
             issued_at_ms: 1,
             expires_at_ms: 60_000,

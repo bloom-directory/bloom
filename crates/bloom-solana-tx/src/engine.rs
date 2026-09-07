@@ -340,6 +340,29 @@ impl SolanaTransferEngine {
         fee_payer: &[u8; 32],
         now_ms: u128,
     ) -> Result<StagedSolanaTransfer, EngineError> {
+        self.restage(wallet, id, fee_payer, now_ms, true).await
+    }
+
+    /// Rebuild an approved intent immediately before signing, even when the
+    /// old blockhash has not expired yet.
+    pub async fn restage_approved(
+        &self,
+        wallet: &str,
+        id: &str,
+        fee_payer: &[u8; 32],
+        now_ms: u128,
+    ) -> Result<StagedSolanaTransfer, EngineError> {
+        self.restage(wallet, id, fee_payer, now_ms, false).await
+    }
+
+    async fn restage(
+        &self,
+        wallet: &str,
+        id: &str,
+        fee_payer: &[u8; 32],
+        now_ms: u128,
+        require_expired: bool,
+    ) -> Result<StagedSolanaTransfer, EngineError> {
         let operation_lock = self.operation_lock(wallet, id);
         let _operation_guard = operation_lock.lock().await;
         let (entry, found_in) = self.outbox.read_restageable(wallet, &self.chain, id)?;
@@ -352,7 +375,7 @@ impl SolanaTransferEngine {
             ));
         }
         let current = self.client.get_block_height().await?;
-        if current <= entry.staged.last_valid_block_height {
+        if require_expired && current <= entry.staged.last_valid_block_height {
             return Err(EngineError::Invalid(format!(
                 "staged blockhash remains valid through block {}; current block height is {current}",
                 entry.staged.last_valid_block_height
@@ -398,6 +421,11 @@ impl SolanaTransferEngine {
             }
             Err(error) => return Err(error.into()),
         };
+        if replacement.id == entry.staged.id {
+            return Err(EngineError::Invalid(
+                "Solana RPC has not advanced to a fresh blockhash; retry confirmation".into(),
+            ));
+        }
 
         let mut expired = entry;
         expired.staged.status = SolanaTxStatus::Expired;
@@ -451,8 +479,19 @@ impl SolanaTransferEngine {
             .map_err(|e| EngineError::Invalid(format!("message base64: {e}")))?;
         validate_staged_message(&entry.staged, fee_payer, &message)?;
         validate_staged_account(&entry.staged, account_key_ref.as_ref())?;
-        let canonical_plan_facts = serde_jcs::to_vec(&entry.staged)
-            .map_err(|e| EngineError::Invalid(format!("canonical plan facts: {e}")))?;
+        let canonical_plan_facts = serde_jcs::to_vec(&serde_json::json!({
+            "schema": "bloom.solana-transfer-approval-plan.v1",
+            "wallet": entry.staged.wallet,
+            "chain": entry.staged.chain,
+            "fee_payer": entry.staged.fee_payer,
+            "account_fingerprint": entry.staged.account_fingerprint,
+            "account_derivation_path": entry.staged.account_derivation_path,
+            "destination": entry.staged.destination,
+            "lamports": entry.staged.lamports,
+            "fee_lamports": entry.staged.fee_lamports,
+            "genesis_hash": entry.staged.genesis_hash,
+        }))
+        .map_err(|e| EngineError::Invalid(format!("canonical plan facts: {e}")))?;
         let plan_facts_digest = Digest32::from_bytes(Sha256::digest(&canonical_plan_facts).into());
 
         let outcome = self

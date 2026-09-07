@@ -895,6 +895,145 @@ impl MachineBrokerClient {
         .map(ExactPayloadSignOutcome::ApprovalRequired)
     }
 
+    /// Prepare or execute one proof-verified system payload whose short-lived
+    /// chain freshness fields may be replaced after owner approval.
+    pub async fn sign_reusable_system_payload(
+        &self,
+        request: ExactPayloadSignRequest,
+    ) -> Result<ExactPayloadSignOutcome, ProtocolError> {
+        request.validate()?;
+        if request.petal_use_claim.is_some() {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::MalformedFrame,
+                "reusable system signing cannot carry a Petal claim",
+            ));
+        }
+        let claim = request.system_use_claim.as_ref().ok_or_else(|| {
+            ProtocolError::new(
+                ProtocolErrorCode::ClaimInvalid,
+                "reusable system signing requires a SystemUseClaim",
+            )
+        })?;
+        let ProvenanceSubject::System {
+            component_id,
+            operation_class: action_class,
+        } = &request.provenance
+        else {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::ProvenanceMismatch,
+                "reusable system signing requires trusted System provenance",
+            ));
+        };
+        let payload_digest = Digest32::from_bytes(Sha256::digest(&request.preimage).into());
+        let ordered_hash = suite_hash(request.crypto_suite, &request.preimage);
+        if request.claimed_hash != ordered_hash
+            || &claim.component_id != component_id
+            || &claim.action_class != action_class
+            || claim.crypto_suite != request.crypto_suite
+            || claim.payload_digest != payload_digest
+            || claim.ordered_hashes.as_slice() != [ordered_hash.clone()]
+        {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::ClaimInvalid,
+                "reusable system claim does not match provenance or payload",
+            ));
+        }
+        let wallet = self.wallet(request.wallet_id.clone()).await?;
+        let key_ref = self
+            .verified_signing_key(
+                &wallet,
+                request.crypto_suite,
+                request.account_key_ref.as_ref(),
+            )
+            .await?;
+        let claim_digest = Some(jcs_digest(claim)?);
+        let assurance_digest = Some(jcs_digest(&claim.claim_assurance)?);
+        if let Some(approval_id) = request.approval_id {
+            let operation_digest = SignOperationIdentity {
+                operation_id: request.signing_operation_id.clone(),
+                approval_id: approval_id.clone(),
+                key_ref: key_ref.clone(),
+                crypto_suite: request.crypto_suite,
+                ordered_payload_digests: vec![payload_digest],
+                ordered_hashes: vec![ordered_hash],
+                petal_use_claim_digest: claim_digest,
+                claim_assurance_digest: assurance_digest,
+                policy_version: wallet.policy_version,
+                policy_digest: wallet.policy_digest,
+            }
+            .digest()?;
+            return self
+                .sign(MachineSignRequest {
+                    operation_id: request.signing_operation_id,
+                    operation_digest,
+                    approval_id,
+                    key_ref,
+                    crypto_suite: request.crypto_suite,
+                    payloads: SigningPayloads::Single {
+                        payload: Base64UrlBytes::from_bytes(&request.preimage),
+                    },
+                    petal_use_claim: None,
+                    system_use_claim: request.system_use_claim,
+                    claim_assurance_evidence: request
+                        .claim_assurance_evidence
+                        .as_deref()
+                        .map(Base64UrlBytes::from_bytes),
+                    provenance: request.provenance,
+                })
+                .await
+                .map(ExactPayloadSignOutcome::Signed);
+        }
+        let activation_mode = request
+            .activation_mode
+            .clone()
+            .unwrap_or_else(|| default_activation_mode(&key_ref));
+        let terms = SealedApprovalTerms {
+            subject: approval_subject(&request.provenance),
+            wallet_id: request.wallet_id,
+            key_ref,
+            allowed_crypto_suites: vec![request.crypto_suite],
+            selector: ApprovalSelector::System {
+                component_id: component_id.clone(),
+                action_class: action_class.clone(),
+                allowed_operation_classes: vec![claim.operation_class.clone()],
+                required_claim_assurance: claim.claim_assurance.level(),
+                intent_digest: claim.approval_intent_digest().map_err(|error| {
+                    ProtocolError::new(
+                        ProtocolErrorCode::MalformedFrame,
+                        format!("system approval intent encoding failed: {error}"),
+                    )
+                })?,
+            },
+            limits: ApprovalLimits {
+                max_operations: DecimalU64::new(1),
+                max_signatures: DecimalU64::new(1),
+                operation_rate_limits: Vec::new(),
+                signature_rate_limits: Vec::new(),
+                value_limits: request.approval_value_limits,
+            },
+            activation_mode,
+            wallet_revocation_epoch: wallet.wallet_revocation_epoch,
+            policy_version: wallet.policy_version,
+            policy_digest: wallet.policy_digest,
+            provenance_digest: request.provenance_digest,
+            request_nonce: request.request_nonce,
+            issued_at_ms: request.issued_at_ms.clone(),
+            not_before_ms: request.issued_at_ms,
+            expires_at_ms: request.expires_at_ms,
+            renewal_of: None,
+        };
+        terms.validate()?;
+        self.prepare_approval(ApprovalPrepareRequest {
+            operation_id: request.approval_operation_id,
+            terms,
+            canonical_plan_facts_digest: request.canonical_plan_facts_digest,
+            petal_use_claim: None,
+            system_use_claim: request.system_use_claim,
+        })
+        .await
+        .map(ExactPayloadSignOutcome::ApprovalRequired)
+    }
+
     /// Prepare or execute one exact ordered payload batch using the existing
     /// `sealed_approval.prepare` and `signing.sign_batch` wire methods.
     ///
