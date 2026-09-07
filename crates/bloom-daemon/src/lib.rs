@@ -778,6 +778,13 @@ impl DaemonPetalHost {
         grant: PetalKeyApprovalGrant<'_>,
         provenance_digest: bloom_broker_api::Digest32,
     ) -> Result<(bloom_broker_api::SealedApprovalPrepareResponse, u64), HostError> {
+        let PetalKeyApprovalGrant {
+            scope,
+            key_ref,
+            scope_expires_at_ms,
+            approval_attempt,
+            value_limits,
+        } = grant;
         let catalog = self.provenance_catalog.as_ref().ok_or_else(|| {
             HostError::Backend("installer provenance catalog is not configured".into())
         })?;
@@ -1616,12 +1623,26 @@ impl PetalHost for DaemonPetalHost {
                                 .into(),
                         ));
                     }
+                    let scope_expires_at_ms = public
+                        .petal_scope_expires_at_ms
+                        .as_ref()
+                        .ok_or_else(|| {
+                            HostError::Denied(
+                                "Broker omitted the derived Petal key scope expiry".into(),
+                            )
+                        })?
+                        .get();
                     let (reusable, authority_expires_at_ms) = self
                         .prepare_petal_key_reusable_approval(
                             broker,
                             &wallet,
-                            &scope,
-                            &public.key_ref,
+                            PetalKeyApprovalGrant {
+                                scope: &scope,
+                                key_ref: &public.key_ref,
+                                scope_expires_at_ms,
+                                approval_attempt: stored.reusable_approval_attempt,
+                                value_limits: &stored.approval_value_limits,
+                            },
                             provenance_digest.clone().ok_or_else(|| {
                                 HostError::Denied("Petal provenance digest is missing".into())
                             })?,
