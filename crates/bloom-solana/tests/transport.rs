@@ -468,3 +468,69 @@ fn broadcast_requires_an_expected_genesis_hash() {
         "{error}"
     );
 }
+
+/// A stub that mirrors `solana-rpc.publicnode.com`: it refuses any request
+/// that arrives without a `User-Agent` header, exactly as several public
+/// Solana providers do, and otherwise answers normally.
+async fn spawn_user_agent_enforcing_stub(seen: Arc<std::sync::Mutex<Vec<String>>>) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                break;
+            };
+            let seen = Arc::clone(&seen);
+            tokio::spawn(async move {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = vec![0u8; 8192];
+                let n = socket.read(&mut buf).await.unwrap_or(0);
+                let request = String::from_utf8_lossy(&buf[..n]).to_string();
+                let agent = request
+                    .split("\r\n")
+                    .find_map(|line| {
+                        line.strip_prefix("user-agent: ")
+                            .or_else(|| line.strip_prefix("User-Agent: "))
+                    })
+                    .map(str::to_owned);
+                if let Some(agent) = agent.clone() {
+                    seen.lock().unwrap().push(agent);
+                }
+                let response = match agent {
+                    None => {
+                        "HTTP/1.1 403 Forbidden\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                            .to_string()
+                    }
+                    Some(_) => {
+                        let body = r#"{"jsonrpc":"2.0","id":1,"result":12345}"#;
+                        format!(
+                            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        )
+                    }
+                };
+                let _ = socket.write_all(response.as_bytes()).await;
+            });
+        }
+    });
+    format!("http://{addr}/")
+}
+
+#[tokio::test]
+async fn requests_identify_the_client_to_public_providers() {
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let endpoint = spawn_user_agent_enforcing_stub(Arc::clone(&seen)).await;
+    let client = SolanaClient::build(&spec(&endpoint)).unwrap();
+
+    // Without a User-Agent this endpoint answers 403 and the transport would
+    // shed it as though the provider were down.
+    assert_eq!(client.get_slot().await.unwrap(), 12345);
+
+    let seen = seen.lock().unwrap();
+    assert!(!seen.is_empty(), "no request carried a User-Agent");
+    assert!(
+        seen.iter().all(|agent| agent.starts_with("bloom-solana/")),
+        "expected every request to identify as bloom-solana, saw {seen:?}"
+    );
+}
