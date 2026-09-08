@@ -32,6 +32,15 @@ The mounted wallet tree exposes those projections. Wallet creation, import,
 credential changes, deletion, and recovery start Broker custody operations and
 return ceremony information; Machine does not create or open a keystore.
 
+Each wallet also exposes `overview.json`, `overview.md`, and `overview.html`.
+One typed Machine-owned snapshot feeds all three siblings and is coalesced for
+five seconds so a normal mounted-filesystem read burst does not mix chain
+observations between formats. The snapshot combines the authenticated public
+wallet projection with best-effort native EVM balance reads and Machine-owned
+outbox counts. A chain failure is represented as unavailable and does not fail
+or falsify the other chains. The HTML is script-free, makes no external
+requests, and carries no ceremony token or signing authority.
+
 ## Signing
 
 Every retained wallet-signing route sends the exact structured payload to

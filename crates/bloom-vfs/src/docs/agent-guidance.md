@@ -40,6 +40,23 @@ has the relevant handlers mounted.
 
 ## Wallets
 
+Start a wallet inspection with its overview. The JSON, Markdown, and HTML
+siblings are three presentations of one short-lived snapshot:
+
+```sh
+cat wallets/<wallet>/overview.md
+# If the host can display local HTML, open wallets/<wallet>/overview.html.
+# For exact values and source paths, read wallets/<wallet>/overview.json.
+```
+
+The overview contains Broker-authenticated public wallet identity, native EVM
+balances, per-chain read coverage, and counts of actions already in Bloom's
+outbox. It does not discover token or Petal positions, calculate a fiat total,
+or claim an atomic cross-chain observation. An unavailable chain stays visibly
+unavailable; never replace it with zero. The HTML is a read-only presentation,
+not an approval surface. Inspect `next.md` and use the existing staged action
+and Broker ceremony paths for anything value-moving.
+
 When asked for an address for a certain wallet, consider displaying in-line the QR code image for the relevant wallet e.g. `wallets/<wallet>/address.qr.png`.
 
 ## Creating a wallet (asynchronous passkey registration)
