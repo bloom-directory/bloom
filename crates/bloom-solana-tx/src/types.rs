@@ -9,8 +9,6 @@ use serde::{Deserialize, Serialize};
 pub enum SolanaTxStatus {
     Pending,
     Sent,
-    Success,
-    Failed,
     Cancelled,
     Expired,
 }
@@ -72,9 +70,6 @@ pub struct StagedSolanaTransfer {
     /// 0 means no expiry.
     pub expires_ms: u128,
     pub status: SolanaTxStatus,
-    /// Central-outbox `action_id`, stamped when a projection is attached.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub action_id: Option<String>,
 }
 
 /// A parsed view of a `sent/<id>/intent.json` entry, for background scanners.

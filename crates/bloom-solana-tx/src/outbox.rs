@@ -42,8 +42,6 @@ pub enum OutboxError {
     InvalidWallet(String),
     #[error("invalid chain '{0}'")]
     InvalidChain(String),
-    #[error("raw transaction bytes do not match the recorded hash")]
-    RawTxHashMismatch,
     #[error("transfer '{0}' already has a durable broadcast attempt and cannot be cancelled")]
     BroadcastAttempted(String),
     #[error("outbox target already exists: {0}")]
@@ -76,10 +74,8 @@ impl SolanaOutboxState {
     pub fn from_status(s: &SolanaTxStatus) -> Self {
         match s {
             SolanaTxStatus::Pending => Self::Pending,
-            SolanaTxStatus::Sent | SolanaTxStatus::Success => Self::Sent,
-            SolanaTxStatus::Failed | SolanaTxStatus::Cancelled | SolanaTxStatus::Expired => {
-                Self::Failed
-            }
+            SolanaTxStatus::Sent => Self::Sent,
+            SolanaTxStatus::Cancelled | SolanaTxStatus::Expired => Self::Failed,
         }
     }
 
@@ -280,18 +276,6 @@ impl SolanaOutbox {
         let _ = fs::remove_file(entry.dir.join(PRIVATE_SIGNATURE_FILE));
         sync_dir(&entry.dir)?;
         Ok(())
-    }
-
-    /// Read the recorded raw-tx bytes for an entry, verifying their blake3
-    /// hash against the marker (a retry cannot substitute different bytes).
-    pub fn read_broadcast_raw_tx(&self, entry: &SolanaOutboxEntry) -> Result<Vec<u8>, OutboxError> {
-        let attempt: SolanaBroadcastAttempt =
-            serde_json::from_slice(&fs::read(entry.dir.join(BROADCAST_ATTEMPT_FILE))?)?;
-        let raw = fs::read(entry.dir.join(BROADCAST_RAW_TX))?;
-        if blake3_hash(&raw) != attempt.raw_tx_blake3 {
-            return Err(OutboxError::RawTxHashMismatch);
-        }
-        Ok(raw)
     }
 
     /// Move `pending/<id>` → `<new_state>/<id>` (atomic via `fs::rename`).
@@ -913,7 +897,6 @@ mod tests {
             created_ms: 1,
             expires_ms: 0,
             status: SolanaTxStatus::Sent,
-            action_id: None,
         }
     }
 
@@ -975,7 +958,7 @@ mod tests {
             &root,
             "0003",
             SolanaOutboxState::Failed,
-            SolanaTxStatus::Failed,
+            SolanaTxStatus::Cancelled,
         );
         let outbox = SolanaOutbox::new(&root).unwrap();
 
@@ -983,7 +966,7 @@ mod tests {
             .read_restageable("alice", "solana-devnet", "0003")
             .expect("the lookup is state-based, not status-based");
         assert_eq!(found_in, SolanaOutboxState::Failed);
-        assert_eq!(refused.staged.status, SolanaTxStatus::Failed);
+        assert_eq!(refused.staged.status, SolanaTxStatus::Cancelled);
 
         // `sent` is terminal and is never a restage source.
         place(&root, "0004", SolanaOutboxState::Sent, SolanaTxStatus::Sent);
