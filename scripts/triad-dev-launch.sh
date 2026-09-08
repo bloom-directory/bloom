@@ -19,7 +19,6 @@ services_only=0
 install_authority_fixture="${BLOOM_TRIAD_DEV_AUTHORITY_FIXTURE:-0}"
 build_integration_petals="${BLOOM_TRIAD_DEV_BUILD_PETALS:-1}"
 socket_timeout_seconds="${BLOOM_TRIAD_DEV_SOCKET_TIMEOUT_SECONDS:-30}"
-ceremony_port="${BLOOM_TRIAD_DEV_CEREMONY_PORT:-18734}"
 
 die() { printf 'triad developer launcher: %s\n' "$*" >&2; exit 1; }
 need_value() { [ "$#" -ge 2 ] || die "$1 requires a value"; }
@@ -54,11 +53,6 @@ esac
 case "$socket_timeout_seconds" in
   ''|*[!0-9]*|0) die "BLOOM_TRIAD_DEV_SOCKET_TIMEOUT_SECONDS must be a positive integer" ;;
 esac
-case "$ceremony_port" in
-  ''|*[!0-9]*) die "BLOOM_TRIAD_DEV_CEREMONY_PORT must be an integer from 1 to 65535" ;;
-esac
-[ "$ceremony_port" -ge 1 ] && [ "$ceremony_port" -le 65535 ] ||
-  die "BLOOM_TRIAD_DEV_CEREMONY_PORT must be an integer from 1 to 65535"
 socket_wait_attempts=$((socket_timeout_seconds * 10))
 
 [ "$(id -u)" -ne 0 ] || die "developer harness refuses root"
@@ -460,18 +454,6 @@ supervise_services() {
   done
 }
 
-write_linux_socket_unit() {
-  unit="$1"; description="$2"; path="$3"; descriptor="$4"; service="$5"
-  {
-    printf '%s\n' '[Unit]' "Description=$description" '' '[Socket]'
-    printf 'ListenStream=%s\n' "$path"
-    printf 'FileDescriptorName=%s\n' "$descriptor"
-    printf 'Service=%s\n' "$service"
-    printf '%s\n' 'SocketMode=0600' 'DirectoryMode=0700' 'RemoveOnStop=yes' 'Accept=no'
-  } > "${user_unit_dir}/${unit}"
-  chmod 0600 "${user_unit_dir}/${unit}"
-}
-
 # Build a socket unit that owns BOTH canonical loopback ceremony listeners
 # on the canonical port. systemd passes one service invocation both fds,
 # keyed by the names that match `FileDescriptorName=`. The Broker consumes
@@ -497,7 +479,7 @@ start_linux_authority_services() {
   systemd_units_installed=1
   write_linux_loopback_socket_unit "$broker_ceremony_socket_unit" \
     'Bloom developer Broker ceremony listener' \
-    "127.0.0.1:${ceremony_port}" "[::1]:${ceremony_port}" \
+    '127.0.0.1:18734' '[::1]:18734' \
     broker-ceremony-ipv4 broker-ceremony-ipv6 "$broker_service_unit"
 
   : > "${log_dir}/signer.log"
@@ -513,7 +495,6 @@ start_linux_authority_services() {
       "BLOOM_EDGE_MANIFEST=${config_dir}/edge-manifest.json" \
       "BLOOM_SIGNER_CONFIG=${config_dir}/signer.json" \
       "BLOOM_SIGNER_AUDIT_CHECKPOINT_DIR=$signer_checkpoint_dir" \
-      "BLOOM_TRIAD_DEV_CEREMONY_PORT=$ceremony_port" \
       "BLOOM_AUTHORITY_EDGE_HISTORY=$authority_edge_history" \
       "BLOOM_SESSION_SOCKET=$session_socket" \
       "BLOOM_SIGNER_SOCKET=$signer_socket" \
@@ -536,7 +517,6 @@ start_linux_authority_services() {
       "BLOOM_EDGE_MANIFEST=${config_dir}/edge-manifest.json" \
       "BLOOM_BROKER_CONFIG=${config_dir}/broker.json" \
       "BLOOM_BROKER_AUDIT_CHECKPOINT_DIR=$broker_checkpoint_dir" \
-      "BLOOM_TRIAD_DEV_CEREMONY_PORT=$ceremony_port" \
       "BLOOM_AUTHORITY_EDGE_HISTORY=$authority_edge_history" \
       "BLOOM_SESSION_SOCKET=$session_socket" \
       "BLOOM_BROKER_SOCKET=$broker_socket" \
