@@ -383,11 +383,11 @@ fn build(staging: &Path, output: &Path, key: &Path) -> std::process::Output {
         &compatibility,
         compatibility_source
             .replace(
-                "broker_commit = \"a4711e8446f955a4c0db1b05a2122c091f9873d6\"",
+                "broker_commit = \"1a338597c018093d94fee2013131878b9b82bac2\"",
                 &format!("broker_commit = \"{}\"", "22".repeat(20)),
             )
             .replace(
-                "signer_commit = \"7404b62ecac2a9ebd760c8f7b37deb76e1e7eeb8\"",
+                "signer_commit = \"6b6fa483fe6ba6bd1b3dc020aaf6073d8e4aab8c\"",
                 &format!("signer_commit = \"{}\"", "33".repeat(20)),
             ),
     )
