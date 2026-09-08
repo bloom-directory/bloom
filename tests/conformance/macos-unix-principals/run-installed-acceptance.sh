@@ -101,37 +101,9 @@ for binary in bloom bloom-broker bloom-signer bloom-signer-migrate; do
   fi
 done
 
-# Prove the same Mach-O binaries cannot be relabelled as production without
-# supplying the separately reviewed conformance report and pinned public key.
-mkdir -p "$static_work/staging/bin"
-for binary in bloom bloom-broker bloom-signer bloom-signer-migrate; do
-  cp "$payload/bin/$binary" "$static_work/staging/bin/$binary"
-done
-printf '%s\n' 'intentionally invalid: conformance rejection must precede signing' \
-  > "$static_work/release-key.pem"
-chmod 0600 "$static_work/release-key.pem"
-set +e
-env \
-  BLOOM_PLATFORM_CLAIM=macos-unix-principals \
-  BLOOM_MACOS_CONFORMANCE_REPORT= \
-  BLOOM_MACOS_CONFORMANCE_SIGNATURE= \
-  BLOOM_MACOS_CONFORMANCE_PUBLIC_KEY= \
-  BLOOM_MACOS_CONFORMANCE_KEY_SHA256= \
-  "$main_root/packaging/triad/release/build-bundle.sh" \
-  "$static_work/staging" \
-  "$static_work/forbidden-production.tar.gz" \
-  "$static_work/release-key.pem" \
-  1700000000 \
-  >"$static_work/production-gate.log" 2>&1
-production_gate_status=$?
-set -e
-[[ "$production_gate_status" -ne 0 ]] || {
-  echo "release gate emitted a production macOS claim without conformance evidence" >&2
-  exit 1
-}
-grep -F \
-  'BLOOM_MACOS_CONFORMANCE_REPORT must name a regular conformance input' \
-  "$static_work/production-gate.log" >/dev/null
+# Exercise the report-free release contract without installing the test archive.
+"$main_root/tests/conformance/macos-unix-principals/check-release-contract.sh" \
+  "$payload" "$main_root"
 
 assert_installed_process() {
   process_name="$1"
@@ -159,7 +131,7 @@ assert_installed_process bloom-broker "$broker_uid" "$release_root/bloom-broker"
 assert_installed_process bloom-signer "$signer_uid" "$release_root/bloom-signer"
 sudo -u "$login_user" \
   "$release_root/bloom" serve triad-health-check "$release_digest"
-machine_label="gui/$login_uid/com.bloom.machine"
+machine_label="user/$login_uid/com.bloom.machine"
 machine_plist="/Library/LaunchAgents/com.bloom.machine.plist"
 machine_pid="$(launchctl print "$machine_label" | sed -n 's/^[[:space:]]*pid = //p')"
 [[ "$machine_pid" =~ ^[1-9][0-9]*$ ]]
@@ -236,7 +208,7 @@ ditto "$runtime_negative_snapshot/broker" "$broker_state"
 ditto "$runtime_negative_snapshot/signer" "$signer_state"
 launchctl bootstrap system "$signer_plist"
 launchctl bootstrap system "$broker_plist"
-launchctl bootstrap "gui/$login_uid" "$machine_plist"
+launchctl bootstrap "user/$login_uid" "$machine_plist"
 launchctl kickstart -k "$machine_label"
 
 # The restored installed Broker and Signer must return to authenticated health.

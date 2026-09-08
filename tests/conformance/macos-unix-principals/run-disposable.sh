@@ -70,7 +70,7 @@ capture_failure_evidence() {
       > "$evidence_dir/$service-launchctl.txt" 2>&1 || true
     chmod 0644 "$evidence_dir/$service-launchctl.txt" 2>/dev/null || true
   done
-  launchctl print "gui/$login_uid/com.bloom.session" \
+  launchctl print "user/$login_uid/com.bloom.session" \
     > "$evidence_dir/session-launchctl.txt" 2>&1 || true
   chmod 0644 "$evidence_dir/session-launchctl.txt" 2>/dev/null || true
   find "/private/var/run/bloom/$login_uid" -xdev -ls \
@@ -261,7 +261,7 @@ sudo -u "bloom-signer-$login_uid" test ! -r \
 
 launchctl print "system/com.bloom.broker.$login_uid" >/dev/null
 launchctl print "system/com.bloom.signer.$login_uid" >/dev/null
-launchctl print "gui/$login_uid/com.bloom.session" >/dev/null
+launchctl print "user/$login_uid/com.bloom.session" >/dev/null
 
 broker_checkpoint_dir="/private/var/db/bloom/$login_uid/broker/audit-checkpoints"
 signer_checkpoint_dir="/private/var/db/bloom/$login_uid/signer/audit-checkpoints"
@@ -342,7 +342,7 @@ assert_metadata \
 release_digest="$(field release_digest)"
 machine_binary="/usr/local/libexec/bloom/current/bloom"
 session_socket="/private/var/run/bloom/$login_uid/session/session.sock"
-session_label="gui/$login_uid/com.bloom.session"
+session_label="user/$login_uid/com.bloom.session"
 session_plist="/Library/LaunchAgents/com.bloom.session.plist"
 broker_label="system/com.bloom.broker.$login_uid"
 signer_label="system/com.bloom.signer.$login_uid"
@@ -530,7 +530,7 @@ if curl --silent --max-time 1 http://127.0.0.1:18734/ >/dev/null 2>&1; then
 fi
 launchctl print "$broker_label" >/dev/null
 launchctl print "$signer_label" >/dev/null
-launchctl bootstrap "gui/$login_uid" "$session_plist"
+launchctl bootstrap "user/$login_uid" "$session_plist"
 deadline=$((SECONDS + 20))
 while [[ $SECONDS -lt $deadline ]]; do
   if [[ -S "$session_socket" ]] &&

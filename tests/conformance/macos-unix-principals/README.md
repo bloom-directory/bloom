@@ -51,8 +51,11 @@ then reruns the triad protocol, transport, activation, checkpoint, Machine
 client, policy-update, Broker, and Signer acceptance sources while the real
 installed services remain active. Fault injection stays confined to test
 executables. It also rejects provisioning profiles, Developer-ID authorities,
-or Team IDs and executes the production builder without conformance inputs to
-prove that claim generation fails. A final process/health recheck precedes
+or Team IDs. `check-release-contract.sh PAYLOAD MAIN_ROOT` builds and verifies a
+production-claim archive without conformance reports using an ephemeral test
+key, then proves that verification against the reviewed release key rejects
+it. This check never installs its archive and can also run unprivileged on a
+Darwin host with compatible binaries. A final process/health recheck precedes
 digest-bound `mui_01.pass`, `mui_11.pass`, `installed_ac_01_35.pass`, and
 `mui_12.pass` evidence.
 
