@@ -64,8 +64,9 @@ literal and exits fail-closed when the effective login is not enrolled.
 ## Filesystem and network boundaries
 
 The installer renders the root-owned release, edge manifest, account/group
-record, LaunchDaemon definitions, session LaunchAgent, and legacy packet-filter
-anchor. Broker and Signer state/checkpoint roots remain owned by their
+record, LaunchDaemon definitions, and session LaunchAgent. It installs no PF
+anchor; legacy anchors are removed by post-activation migration. Broker and
+Signer state/checkpoint roots remain owned by their
 respective service UIDs and mode `0700`.
 
 The installer keeps digest-named releases immutable. A same-digest install

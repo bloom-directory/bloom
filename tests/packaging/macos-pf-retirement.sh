@@ -114,4 +114,52 @@ live=true
 no_bloom_anchor=true
 cleanup_legacy_pf
 [[ "$(cat "$work/calls")" == '-s Anchors' ]]
+# Failed activation owns only files created by this attempt. Legacy PF state
+# must survive both rollback paths, including when no other enrollment remains.
+for rollback in rollback_failed_fresh rollback_failed_restore; do
+  (
+    eval "$(sed -n "/^$rollback()/,/^}/p" "$installer")"
+    root_prefix="$work/$rollback"
+    mkdir -p "$root_prefix/etc/pf.anchors"
+    seed
+    cp "$root_prefix/etc/pf.conf" "$root_prefix/pf.conf.before"
+    cp "$root_prefix/etc/pf.anchors/com.bloom.triad.501" "$root_prefix/anchor.before"
+    live=true
+    login_uid=501
+    variable="$root_prefix/var"
+    config="$root_prefix/config"
+    runtime="$variable/run/bloom/501"
+    log_root="$variable/log/bloom/501"
+    enrollments="$root_prefix/enrollments"
+    enrollment="$enrollments/501.json"
+    pf_anchor="$root_prefix/etc/pf.anchors/com.bloom.triad.501"
+    broker_plist="$root_prefix/broker.plist"
+    signer_plist="$root_prefix/signer.plist"
+    containment_plist="$root_prefix/containment.plist"
+    session_plist="$root_prefix/session.plist"
+    machine_plist="$root_prefix/machine.plist"
+    newsyslog_config="$root_prefix/newsyslog.conf"
+    cli_link="$root_prefix/bloom"
+    restore_pending=true
+    mkdir -p "$config" "$runtime" "$log_root" "$enrollments" "$variable/db/bloom/501"
+    for file in "$broker_plist" "$signer_plist" "$containment_plist" \
+      "$session_plist" "$machine_plist" "$newsyslog_config" "$enrollment" "$cli_link"; do
+      printf 'attempt-owned\n' >"$file"
+    done
+    launchctl() { printf '%s\n' "$*" >>"$root_prefix/launchctl-calls"; }
+    has_active_enrollments() { return 1; }
+    remove_cli_link() { rm -f "$cli_link"; }
+    "$rollback"
+    cmp "$root_prefix/pf.conf.before" "$root_prefix/etc/pf.conf"
+    cmp "$root_prefix/anchor.before" "$pf_anchor"
+    [[ ! -s "$work/calls" ]]
+    [[ ! -e "$enrollment" && ! -e "$broker_plist" && ! -e "$signer_plist" ]]
+    [[ ! -e "$runtime" && ! -e "$log_root" && ! -e "$cli_link" ]]
+    if [[ "$rollback" == rollback_failed_restore ]]; then
+      [[ "$restore_pending" == false && -d "$config" ]]
+    else
+      [[ ! -e "$config" && ! -e "$variable/db/bloom/501" ]]
+    fi
+  )
+done
 echo 'macOS PF retirement and legacy migration passed'

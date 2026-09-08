@@ -571,20 +571,22 @@ disable_legacy_network_guard() {
   done
 }
 
+# Rollback must leave pre-existing PF files and their load blocks paired.
+# This installer creates no anchors; successful activation owns their cleanup.
 rollback_failed_restore() {
   if $live; then
     for label in "gui/$login_uid/com.bloom.machine" "user/$login_uid/com.bloom.machine" "system/com.bloom.broker.$login_uid" "system/com.bloom.signer.$login_uid" "gui/$login_uid/com.bloom.session" "user/$login_uid/com.bloom.session"; do
       launchctl bootout "$label" 2>/dev/null || true
     done
   fi
-  rm -f "$broker_plist" "$signer_plist" "$pf_anchor" "$newsyslog_config" "$enrollments/$login_uid.json"
+  rm -f "$broker_plist" "$signer_plist" "$newsyslog_config" "$enrollments/$login_uid.json"
   rm -rf "$runtime" "$log_root"
   has_active_enrollments || remove_cli_link
   restore_pending=false
 }
 rollback_failed_fresh() {
   for label in "gui/$login_uid/com.bloom.machine" "user/$login_uid/com.bloom.machine" "system/com.bloom.broker.$login_uid" "system/com.bloom.signer.$login_uid" "gui/$login_uid/com.bloom.session" "user/$login_uid/com.bloom.session"; do launchctl bootout "$label" 2>/dev/null || true; done
-  rm -f "$broker_plist" "$signer_plist" "$pf_anchor" "$newsyslog_config" "$enrollment"
+  rm -f "$broker_plist" "$signer_plist" "$newsyslog_config" "$enrollment"
   rm -rf "$config" "$variable/db/bloom/$login_uid" "$runtime" "$log_root"
   has_active_enrollments || { launchctl bootout system/com.bloom.containment 2>/dev/null || true; rm -f "$containment_plist" "$session_plist" "$machine_plist"; remove_cli_link; }
 }
