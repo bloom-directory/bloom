@@ -276,6 +276,8 @@ struct PetalKeyRequestState {
     /// orphaned, giving the replacement approval a fresh immutable identity.
     #[serde(default)]
     reusable_approval_attempt: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    approval_value_limits: Vec<bloom_broker_api::ValueLimit>,
 }
 
 impl PetalKeyRequestState {
@@ -317,6 +319,7 @@ struct PetalKeyApprovalGrant<'a> {
     key_ref: &'a bloom_broker_api::KeyRef,
     scope_expires_at_ms: u64,
     approval_attempt: u64,
+    value_limits: &'a [bloom_broker_api::ValueLimit],
 }
 
 impl DaemonPetalHost {
@@ -534,6 +537,7 @@ impl DaemonPetalHost {
             key_ref,
             scope_expires_at_ms,
             approval_attempt,
+            value_limits,
         } = grant;
         let catalog = self.provenance_catalog.as_ref().ok_or_else(|| {
             HostError::Backend("installer provenance catalog is not configured".into())
@@ -634,7 +638,7 @@ impl DaemonPetalHost {
                 max_signatures: bloom_broker_api::DecimalU64::new(256),
                 operation_rate_limits: Vec::new(),
                 signature_rate_limits: Vec::new(),
-                value_limits: Vec::new(),
+                value_limits: value_limits.to_vec(),
             },
             activation_mode: if key_ref.backend.as_str() == "local" {
                 bloom_broker_api::ActivationMode::BootBound
@@ -1013,6 +1017,18 @@ impl PetalHost for DaemonPetalHost {
                 "Petal key maximum_lifetime_ms must be greater than zero".into(),
             ));
         }
+        let mut assets = std::collections::BTreeSet::new();
+        for limit in &req.approval_value_limits {
+            if limit.asset.asset.is_empty()
+                || limit.lifetime.as_str() == "0"
+                || !assets.insert((limit.asset.chain.as_str(), limit.asset.asset.as_str()))
+            {
+                return Err(HostError::Invalid(
+                    "approval value limits require unique assets and positive lifetime budgets"
+                        .into(),
+                ));
+            }
+        }
         let suites = req
             .allowed_crypto_suites
             .iter()
@@ -1140,6 +1156,7 @@ impl PetalHost for DaemonPetalHost {
                     != scope_digest
                 || stored.scope_digest != scope_digest
                 || stored.provenance_digest != provenance_digest
+                || stored.approval_value_limits != req.approval_value_limits
                 || !matches!(
                     (
                         stored.status.as_str(),
@@ -1247,6 +1264,7 @@ impl PetalHost for DaemonPetalHost {
                             key_ref: &derived_key_ref,
                             scope_expires_at_ms,
                             approval_attempt: stored.reusable_approval_attempt,
+                            value_limits: &stored.approval_value_limits,
                         },
                         provenance_digest.clone().ok_or_else(|| {
                             HostError::Denied("Petal provenance digest is missing".into())
@@ -1328,6 +1346,7 @@ impl PetalHost for DaemonPetalHost {
                                 key_ref: &public.key_ref,
                                 scope_expires_at_ms,
                                 approval_attempt: stored.reusable_approval_attempt,
+                                value_limits: &stored.approval_value_limits,
                             },
                             provenance_digest.clone().ok_or_else(|| {
                                 HostError::Denied("Petal provenance digest is missing".into())
@@ -1417,6 +1436,7 @@ impl PetalHost for DaemonPetalHost {
             public_key: None,
             reusable_approval_id: None,
             reusable_approval_attempt: 0,
+            approval_value_limits: req.approval_value_limits,
         };
         Self::write_petal_key_state(&path, &stored)?;
         stored.guest_outcome()
@@ -5147,6 +5167,7 @@ mod tests {
         child: bloom_broker_api::KeyRef,
         scope_expires_at_ms: u64,
         prepared_approval_expires_at_ms: std::sync::atomic::AtomicU64,
+        prepared_value_limits: std::sync::Mutex<Vec<bloom_broker_api::ValueLimit>>,
     }
 
     struct PetalExactBrokerFixture {
@@ -5342,6 +5363,7 @@ mod tests {
                     .as_millis() as u64
                     + 5_000,
                 prepared_approval_expires_at_ms: std::sync::atomic::AtomicU64::new(0),
+                prepared_value_limits: std::sync::Mutex::new(Vec::new()),
             }
         }
 
@@ -5513,6 +5535,8 @@ mod tests {
                         };
                         assert_eq!(route_grants.len(), 1);
                         assert_eq!(route_grants[0].route, "r000007");
+                        *self.prepared_value_limits.lock().unwrap() =
+                            request.terms.limits.value_limits.clone();
                         self.prepared_approval_expires_at_ms.store(
                             request.terms.expires_at_ms.get(),
                             std::sync::atomic::Ordering::SeqCst,
@@ -5817,6 +5841,14 @@ mod tests {
             allowed_operation_classes: vec!["exchange-agent".into()],
             allowed_crypto_suites: vec!["secp256k1-keccak256-recoverable".into()],
             maximum_lifetime_ms: 60_000,
+            approval_value_limits: vec![bloom_broker_api::ValueLimit {
+                asset: bloom_broker_api::AssetId {
+                    chain: bloom_broker_api::Token::new("solana").unwrap(),
+                    asset: "native".into(),
+                },
+                lifetime: bloom_broker_api::DecimalU256::parse("20000000").unwrap(),
+                rolling_windows: Vec::new(),
+            }],
             context: Some(context.clone()),
         };
 
@@ -5847,6 +5879,17 @@ mod tests {
         changed.allowed_operation_classes = vec!["payment-key".into()];
         let changed_error = host.petal_key_request(changed).await.unwrap_err();
         assert!(changed_error.to_string().contains("different terms"));
+
+        let mut changed_budget = request.clone();
+        changed_budget.approval_value_limits[0].lifetime =
+            bloom_broker_api::DecimalU256::parse("20000001").unwrap();
+        assert!(
+            host.petal_key_request(changed_budget)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("different terms")
+        );
 
         let state_path = host
             .petal_key_state_path(
@@ -5896,6 +5939,11 @@ mod tests {
                 .load(std::sync::atomic::Ordering::SeqCst),
             fixture.scope_expires_at_ms,
             "delayed retries must use Broker's absolute key expiry"
+        );
+        assert_eq!(
+            *fixture.prepared_value_limits.lock().unwrap(),
+            request.approval_value_limits,
+            "the owner ceremony must seal the requested asset budgets unchanged"
         );
         let approval_owner_status: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
@@ -6003,6 +6051,7 @@ mod tests {
             allowed_operation_classes: vec!["pumpfun.buy".into()],
             allowed_crypto_suites: vec!["ed25519-message".into()],
             maximum_lifetime_ms: 60_000,
+            approval_value_limits: Vec::new(),
             context: Some(PetalRouteContext {
                 petal_root: "pumpfun".into(),
                 package_hash: "aa".repeat(32),
