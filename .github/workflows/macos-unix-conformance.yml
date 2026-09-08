@@ -169,6 +169,15 @@ jobs:
           name: macos-conformance-candidate-${{ github.run_id }}
           path: ${{ runner.temp }}
 
+      # The candidate crosses jobs through the artifact store, which does not
+      # preserve executable bits; the installer refuses a payload whose
+      # binaries cannot run. Restore the modes the bundle recorded.
+      - name: Restore candidate executable modes
+        shell: bash
+        run: |
+          chmod 0755 "$RUNNER_TEMP/verified/bloom-triad/bin/"*
+          chmod 0755 "$RUNNER_TEMP/verified-w0/bloom-triad/bin/"*
+
       - name: Prove disposable host prerequisites
         shell: bash
         run: |
