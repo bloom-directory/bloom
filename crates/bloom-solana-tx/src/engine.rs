@@ -437,6 +437,25 @@ impl SolanaTransferEngine {
             return Ok(replacement);
         }
 
+        // Hand the approval to the successor *before* retiring the entry that
+        // holds it. Transitioning to `failed` deletes the challenge, and it
+        // carries the only durable approval id; copying afterwards leaves a
+        // window where a crash strips the lineage of its approval and the next
+        // confirm re-prepares an operation the Broker will refuse forever.
+        // Doing it first is safe in both directions: a crash after the copy
+        // leaves the id on two entries, and only the successor is confirmable.
+        if let Ok(challenge) = std::fs::read(entry.dir.join(crate::outbox::APPROVAL_CHALLENGE_FILE))
+        {
+            let successor = self.outbox.read_in_state(
+                wallet,
+                &self.chain,
+                &replacement.id,
+                SolanaOutboxState::Pending,
+            )?;
+            self.outbox
+                .write_approval_challenge(&successor, &challenge)?;
+        }
+
         let mut expired = entry;
         expired.staged.status = SolanaTxStatus::Expired;
         if expired.state == SolanaOutboxState::Pending {
