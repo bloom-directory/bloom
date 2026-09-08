@@ -31,6 +31,14 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// Active probe interval, matching `bloom-rpc`'s cadence.
 const PROBE_INTERVAL: Duration = Duration::from_secs(15);
 
+/// Identifies this client to public RPC providers. `reqwest` sends no
+/// `User-Agent` unless one is set, and several public Solana endpoints —
+/// `solana-rpc.publicnode.com` among them — answer an unidentified request
+/// with `403 Forbidden`. That reads as an endpoint outage rather than as a
+/// rejected client, so the transport silently sheds every weighted endpoint
+/// that enforces the rule and concentrates load on whichever one does not.
+const RPC_USER_AGENT: &str = concat!("bloom-solana/", env!("CARGO_PKG_VERSION"));
+
 /// One configured endpoint and its pre-built client.
 struct Endpoint {
     url: String,
@@ -67,6 +75,7 @@ impl SolanaRpcClient {
     pub fn build(spec: &crate::SolanaSpec) -> Result<Self, SolanaRpcError> {
         let client = reqwest::Client::builder()
             .timeout(REQUEST_TIMEOUT)
+            .user_agent(RPC_USER_AGENT)
             .build()
             .map_err(|e| SolanaRpcError::Transport(e.to_string()))?;
         let mut endpoints = Vec::new();
