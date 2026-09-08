@@ -311,12 +311,14 @@ fn require_login_owned_private_file(path: &Path, effective_uid: u32) -> Result<(
 fn require_session_directory(path: &Path, uid: u32, gid: u32) -> Result<()> {
     let metadata =
         fs::symlink_metadata(path).with_context(|| format!("inspect {}", path.display()))?;
+    // Directory hard links are forbidden by POSIX, so `is_dir` already rules
+    // out substitutes; a link-count floor is not portable (btrfs reports
+    // nlink=1 for empty directories) and adds no guarantee beyond `is_dir`.
     if !metadata.file_type().is_dir()
         || metadata.file_type().is_symlink()
         || metadata.uid() != uid
         || metadata.gid() != gid
         || metadata.mode() & 0o7777 != 0o710
-        || metadata.nlink() < 2
     {
         bail!("session socket directory has the wrong owner, group, mode, or type");
     }
@@ -421,6 +423,26 @@ impl Drop for SocketGuard {
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    #[test]
+    fn plain_directory_is_accepted_regardless_of_link_count() {
+        let directory = std::env::temp_dir().join(format!(
+            "bloom-session-sentinel-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&directory).expect("create session directory");
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o710))
+            .expect("set session directory permissions");
+        let metadata = std::fs::symlink_metadata(&directory).expect("directory metadata");
+        let accepted = super::require_session_directory(&directory, metadata.uid(), metadata.gid());
+        let _ = std::fs::remove_dir_all(&directory);
+        assert!(
+            accepted.is_ok(),
+            "plain directory was rejected: {accepted:?}"
+        );
+    }
+
     #[test]
     fn activating_enrollment_is_accepted_only_by_macos_sentinel() {
         assert!(super::enrollment_state_is_usable("active"));
