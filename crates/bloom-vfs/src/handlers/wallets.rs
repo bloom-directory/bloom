@@ -4016,7 +4016,7 @@ impl WalletsHandler {
                     } => {
                         let challenge = serde_json::to_vec_pretty(&serde_json::json!({
                             "schema": "bloom.solana-approval-challenge/1",
-                            "action_id": entry.staged.action_id.as_deref().unwrap_or(&entry.staged.id),
+                            "action_id": entry.staged.id,
                             "tx_id": entry.staged.id,
                             "wallet": wallet,
                             "chain": chain,
@@ -5258,7 +5258,6 @@ mod tests {
             created_ms: 1,
             expires_ms: 0,
             status: bloom_solana_tx::types::SolanaTxStatus::Pending,
-            action_id: None,
         };
         outbox.write_pending(&staged, "plan").unwrap();
         outbox
