@@ -3972,12 +3972,9 @@ impl WalletsHandler {
                 let child = self
                     .resolve_solana_child(wallet, entry.staged.account_fingerprint.as_deref())
                     .await?;
-                // Read the public challenge before anything retires this entry.
-                // Transitioning an entry to `failed` deletes the challenge, and
-                // `restage_approved` does exactly that to the entry it replaces,
-                // so reading it afterwards silently yields nothing and the
-                // successor inherits no approval id — which makes the next
-                // confirm re-prepare a ceremony the owner already completed.
+                // The approval id lives in the public challenge. `restage_approved`
+                // migrates that file to the successor before retiring this entry,
+                // so only the read is needed here.
                 let challenge_bytes = std::fs::read(
                     entry
                         .dir
@@ -4010,14 +4007,6 @@ impl WalletsHandler {
                         bloom_solana_tx::outbox::SolanaOutboxState::Pending,
                     )
                     .map_err(solana_outbox_err)?;
-                if target_id != *id
-                    && let Some(challenge) = challenge_bytes.as_deref()
-                {
-                    engine
-                        .outbox()
-                        .write_approval_challenge(&target_entry, challenge)
-                        .map_err(solana_outbox_err)?;
-                }
                 match engine
                     .sign(
                         wallet,

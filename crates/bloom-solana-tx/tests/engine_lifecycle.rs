@@ -1357,3 +1357,75 @@ async fn approved_restage_without_a_newer_blockhash_keeps_the_staged_transfer() 
         )
         .expect("the transfer stays pending under its existing approval");
 }
+
+/// The approval must reach the successor before the entry holding it is
+/// retired. Retiring an entry deletes its `approval_challenge.json`, which
+/// carries the only durable approval id, so migrating afterwards leaves a
+/// window where a crash strips the lineage of its approval and every later
+/// confirm re-prepares an operation the Broker refuses permanently.
+#[tokio::test]
+async fn restage_migrates_the_approval_before_retiring_its_predecessor() {
+    let height = Arc::new(std::sync::atomic::AtomicU64::new(1));
+    let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let endpoint = spawn_node_with_controls(height.clone(), false, false, requests).await;
+    let dir = tempfile::tempdir().unwrap();
+    let outbox = SolanaOutbox::new(dir.path().join("outbox")).unwrap();
+    let broker = Arc::new(BrokerFixture::new());
+    let signer =
+        SolanaTransferSigner::from_catalog(MachineBrokerClient::new(broker.clone()), &catalog())
+            .unwrap();
+    let engine =
+        SolanaTransferEngine::new(outbox.clone(), client(&endpoint), signer, "solana-devnet");
+    let destination = ed25519_dalek::SigningKey::from_bytes(&[0xdd; 32])
+        .verifying_key()
+        .to_bytes();
+    let original = engine
+        .stage(
+            "wallet",
+            &broker.child_pubkey(),
+            Default::default(),
+            &destination,
+            1_000_000,
+            1_000,
+        )
+        .await
+        .unwrap();
+
+    let entry = outbox
+        .read_in_state(
+            "wallet",
+            "solana-devnet",
+            &original.id,
+            bloom_solana_tx::outbox::SolanaOutboxState::Pending,
+        )
+        .unwrap();
+    let challenge = br#"{"schema":"bloom.solana-approval-challenge/1","approval_id":"beef"}"#;
+    outbox.write_approval_challenge(&entry, challenge).unwrap();
+
+    // Advance past the staged window so the restage produces a real successor.
+    height.store(
+        original.last_valid_block_height + 1,
+        std::sync::atomic::Ordering::SeqCst,
+    );
+    let replacement = engine
+        .restage_expired("wallet", &original.id, &broker.child_pubkey(), 10_000)
+        .await
+        .unwrap();
+    assert_ne!(replacement.id, original.id);
+
+    let successor = outbox
+        .read_in_state(
+            "wallet",
+            "solana-devnet",
+            &replacement.id,
+            bloom_solana_tx::outbox::SolanaOutboxState::Pending,
+        )
+        .unwrap();
+    let migrated = std::fs::read(
+        successor
+            .dir
+            .join(bloom_solana_tx::outbox::APPROVAL_CHALLENGE_FILE),
+    )
+    .expect("the successor must carry the approval the owner already granted");
+    assert_eq!(migrated, challenge);
+}
