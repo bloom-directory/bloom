@@ -63,7 +63,8 @@ to trade at.
 - the migrated local Polymarket and Hyperliquid package checkouts, installed
   only into the disposable Machine overlay;
 - Polymarket onboarding/funding sufficient for the chosen order;
-- no other local process listening on port 18734 on either loopback family (`127.0.0.1` or `[::1]`).
+- no other local process listening on port 18734 on either loopback family (`127.0.0.1` or `[::1]`);
+- IPv6 loopback enabled; the Broker requires a `[::1]:18734` listener.
 
 Linux launches Broker and Signer through temporary per-user systemd socket and
 service units, exercising the same named-descriptor activation interface as

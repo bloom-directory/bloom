@@ -615,6 +615,7 @@ stop_linux_release_set() {
     fi
     systemctl stop "bloom-session@$uid.path" 2>/dev/null || true
     systemctl stop "bloom-broker-ceremony@$uid.socket" 2>/dev/null || true
+    systemctl stop "bloom-broker-ceremony-ipv6@$uid.socket" 2>/dev/null || true
     systemctl stop "bloom-broker@$uid.service"
     systemctl stop "bloom-signer@$uid.service"
   done
@@ -1039,6 +1040,7 @@ case "$action" in
       installer/linux/sysusers.d/bloom-login.conf.in \
       installer/linux/tmpfiles.d/bloom-login.conf.in \
       installer/linux/systemd/bloom-broker-ceremony@.socket \
+      installer/linux/systemd/bloom-broker-ceremony-ipv6@.socket \
       installer/linux/systemd/bloom-session@.path \
       installer/linux/systemd/bloom-broker@.service.in \
       installer/linux/systemd/bloom-signer@.service.in \
@@ -1143,6 +1145,7 @@ case "$action" in
     then
       systemctl stop "bloom-session@$login_uid.path" 2>/dev/null || true
       systemctl stop "bloom-broker-ceremony@$login_uid.socket" 2>/dev/null || true
+      systemctl stop "bloom-broker-ceremony-ipv6@$login_uid.socket" 2>/dev/null || true
       systemctl stop "bloom-broker@$login_uid.service"
       systemctl stop "bloom-signer@$login_uid.service"
     fi
@@ -1179,6 +1182,10 @@ case "$action" in
     atomic_install \
       "$payload/installer/linux/systemd/bloom-broker-ceremony@.socket" \
       "$unit_root/bloom-broker-ceremony@.socket" \
+      0644
+    atomic_install \
+      "$payload/installer/linux/systemd/bloom-broker-ceremony-ipv6@.socket" \
+      "$unit_root/bloom-broker-ceremony-ipv6@.socket" \
       0644
     atomic_install \
       "$payload/installer/linux/systemd/bloom-session@.path" \
@@ -1442,6 +1449,7 @@ case "$action" in
       # enabling every installed login's socket at boot.
       systemctl disable --now \
         "bloom-broker-ceremony@$login_uid.socket" \
+        "bloom-broker-ceremony-ipv6@$login_uid.socket" \
         2>/dev/null || true
       # Materialize the package-owned runtime and state layout at the final
       # activation boundary. Nothing between this check and path activation
@@ -1529,6 +1537,7 @@ case "$action" in
       # account have been removed.
       systemctl disable --now \
         "bloom-broker-ceremony@$login_uid.socket" \
+        "bloom-broker-ceremony-ipv6@$login_uid.socket" \
         "bloom-session@$login_uid.path" \
         2>/dev/null || true
       systemctl disable \
@@ -1541,6 +1550,7 @@ case "$action" in
         2>/dev/null || true
       for stopped_unit in \
         "bloom-broker-ceremony@$login_uid.socket" \
+        "bloom-broker-ceremony-ipv6@$login_uid.socket" \
         "bloom-session@$login_uid.path" \
         "bloom-broker@$login_uid.service" \
         "bloom-signer@$login_uid.service"
@@ -1638,6 +1648,7 @@ case "$action" in
         "$root/usr/lib/systemd/system/bloom-broker@.service" \
         "$root/usr/lib/systemd/system/bloom-signer@.service" \
         "$root/usr/lib/systemd/system/bloom-broker-ceremony@.socket" \
+        "$root/usr/lib/systemd/system/bloom-broker-ceremony-ipv6@.socket" \
         "$root/usr/lib/systemd/system/bloom-session@.path" \
         "$root/usr/lib/systemd/user/bloom-machine.service" \
         "$root/usr/lib/systemd/user/bloom-session.service"

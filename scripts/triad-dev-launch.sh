@@ -286,7 +286,8 @@ unit_token="$(basename "$runtime_dir")"
 unit_prefix="bloom-triad-dev-$(id -u)-${unit_token}"
 signer_service_unit="${unit_prefix}-signer.service"
 broker_service_unit="${unit_prefix}-broker.service"
-broker_ceremony_socket_unit="${unit_prefix}-broker-ceremony.socket"
+broker_ceremony_v4_socket_unit="${unit_prefix}-broker-ceremony-ipv4.socket"
+broker_ceremony_v6_socket_unit="${unit_prefix}-broker-ceremony-ipv6.socket"
 broker_checkpoint_dir="${developer_root}/audit-checkpoints/broker"
 signer_checkpoint_dir="${developer_root}/audit-checkpoints/signer"
 machine_checkpoint_dir="${machine_home}/audit-checkpoints/machine"
@@ -340,10 +341,11 @@ systemd_units_installed=0
 stop_linux_authority_units() {
   [ "$host_os" = Linux ] || return 0
   systemctl --user stop "$broker_service_unit" "$signer_service_unit" >/dev/null 2>&1 || true
-  systemctl --user stop "$broker_ceremony_socket_unit" >/dev/null 2>&1 || true
+  systemctl --user stop "$broker_ceremony_v4_socket_unit" "$broker_ceremony_v6_socket_unit" >/dev/null 2>&1 || true
   if [ "$systemd_units_installed" -eq 1 ]; then
     rm -f -- \
-      "${user_unit_dir}/${broker_ceremony_socket_unit}" \
+      "${user_unit_dir}/${broker_ceremony_v4_socket_unit}" \
+      "${user_unit_dir}/${broker_ceremony_v6_socket_unit}" \
       "${user_unit_dir}/${broker_service_unit}" \
       "${user_unit_dir}/${signer_service_unit}"
     systemctl --user daemon-reload >/dev/null 2>&1 || true
@@ -454,19 +456,16 @@ supervise_services() {
   done
 }
 
-# Build a socket unit that owns BOTH canonical loopback ceremony listeners
-# on the canonical port. systemd passes one service invocation both fds,
-# keyed by the names that match `FileDescriptorName=`. The Broker consumes
-# each by name and refuses anything not on the canonical loopback pair.
-write_linux_loopback_socket_unit() {
-  unit="$1"; description="$2"; ipv4_path="$3"; ipv6_path="$4"
-  ipv4_descriptor="$5"; ipv6_descriptor="$6"; service="$7"
+# One socket unit per listener. systemd's FileDescriptorName= names every
+# fd a unit passes, so a unit with two ListenStream= lines hands the
+# Broker two fds under one name and the activation crate rejects the
+# duplicate. The Broker takes each family by its own name.
+write_linux_socket_unit() {
+  unit="$1"; description="$2"; path="$3"; descriptor="$4"; service="$5"
   {
     printf '%s\n' '[Unit]' "Description=$description" '' '[Socket]'
-    printf 'ListenStream=%s\n' "$ipv4_path"
-    printf 'FileDescriptorName=%s\n' "$ipv4_descriptor"
-    printf 'ListenStream=%s\n' "$ipv6_path"
-    printf 'FileDescriptorName=%s\n' "$ipv6_descriptor"
+    printf 'ListenStream=%s\n' "$path"
+    printf 'FileDescriptorName=%s\n' "$descriptor"
     printf 'Service=%s\n' "$service"
     printf '%s\n' 'SocketMode=0600' 'DirectoryMode=0700' 'RemoveOnStop=yes' 'Accept=no'
   } > "${user_unit_dir}/${unit}"
@@ -477,10 +476,12 @@ start_linux_authority_services() {
   # Mark ownership before the first write so the EXIT trap removes even a
   # partially rendered unit set.
   systemd_units_installed=1
-  write_linux_loopback_socket_unit "$broker_ceremony_socket_unit" \
-    'Bloom developer Broker ceremony listener' \
-    '127.0.0.1:18734' '[::1]:18734' \
-    broker-ceremony-ipv4 broker-ceremony-ipv6 "$broker_service_unit"
+  write_linux_socket_unit "$broker_ceremony_v4_socket_unit" \
+    'Bloom developer Broker IPv4 ceremony listener' \
+    '127.0.0.1:18734' broker-ceremony-ipv4 "$broker_service_unit"
+  write_linux_socket_unit "$broker_ceremony_v6_socket_unit" \
+    'Bloom developer Broker IPv6 ceremony listener' \
+    '[::1]:18734' broker-ceremony-ipv6 "$broker_service_unit"
 
   : > "${log_dir}/signer.log"
   {
@@ -505,7 +506,7 @@ start_linux_authority_services() {
   : > "${log_dir}/broker.log"
   {
     printf '%s\n' '[Unit]' 'Description=Bloom developer Broker' \
-      "Requires=$broker_ceremony_socket_unit" \
+      "Requires=$broker_ceremony_v4_socket_unit $broker_ceremony_v6_socket_unit" \
       "After=$signer_service_unit" '' \
       '[Service]' 'Type=simple' 'UMask=0077'
     printf 'ExecStart=%s\n' "$broker_bin"
@@ -523,12 +524,12 @@ start_linux_authority_services() {
       "BLOOM_BROKER_CONTROL_SOCKET=$broker_control_socket" \
       'BLOOM_BROKER_CEREMONY_ACTIVATION_NAME_IPV4=broker-ceremony-ipv4' \
       'BLOOM_BROKER_CEREMONY_ACTIVATION_NAME_IPV6=broker-ceremony-ipv6'
-    printf 'Sockets=%s\n' "$broker_ceremony_socket_unit"
+    printf 'Sockets=%s %s\n' "$broker_ceremony_v4_socket_unit" "$broker_ceremony_v6_socket_unit"
   } > "${user_unit_dir}/${broker_service_unit}"
   chmod 0600 "${user_unit_dir}/${broker_service_unit}"
 
   systemctl --user daemon-reload
-  systemctl --user start "$broker_ceremony_socket_unit"
+  systemctl --user start "$broker_ceremony_v4_socket_unit" "$broker_ceremony_v6_socket_unit"
   systemctl --user start "$signer_service_unit"
   signer_pid="$(systemctl --user show "$signer_service_unit" -p MainPID --value)"
   [ "$signer_pid" -gt 0 ] ||

@@ -316,6 +316,7 @@ fn make_installer_payload(root: &Path) -> PathBuf {
         "sysusers.d/bloom-login.conf.in",
         "tmpfiles.d/bloom-login.conf.in",
         "systemd/bloom-broker-ceremony@.socket",
+        "systemd/bloom-broker-ceremony-ipv6@.socket",
         "systemd/bloom-session@.path",
         "systemd/bloom-broker@.service.in",
         "systemd/bloom-signer@.service.in",
@@ -596,8 +597,10 @@ fn triad_developer_launcher_supports_linux_without_weakening_root_boundary() {
     assert!(launcher.contains("export LC_ALL=C"));
     assert!(launcher.contains("Linux developer systemd user unit directory is unsafe"));
     assert!(launcher.contains("Linux developer systemd unit paths may contain only ASCII"));
-    assert!(launcher.contains("printf 'FileDescriptorName=%s\\n' \"$ipv4_descriptor\""));
-    assert!(launcher.contains("printf 'FileDescriptorName=%s\\n' \"$ipv6_descriptor\""));
+    assert!(launcher.contains("write_linux_socket_unit \"$broker_ceremony_v4_socket_unit\""));
+    assert!(launcher.contains("write_linux_socket_unit \"$broker_ceremony_v6_socket_unit\""));
+    assert!(!launcher.contains("write_linux_loopback_socket_unit"));
+    assert!(launcher.contains("printf 'FileDescriptorName=%s\\n' \"$descriptor\""));
     assert!(!launcher.contains("signer_socket_unit"));
     assert!(!launcher.contains("BLOOM_SIGNER_ACTIVATION_NAME"));
     assert!(!launcher.contains("BLOOM_SIGNER_CONTROL_ACTIVATION_NAME"));
@@ -609,9 +612,10 @@ fn triad_developer_launcher_supports_linux_without_weakening_root_boundary() {
     assert!(!launcher.contains("BLOOM_BROKER_CONTROL_ACTIVATION_NAME"));
     assert!(launcher.contains("\"BLOOM_BROKER_SOCKET=$broker_socket\""));
     assert!(launcher.contains("\"BLOOM_BROKER_CONTROL_SOCKET=$broker_control_socket\""));
-    assert!(launcher.contains("broker_ceremony_socket_unit"));
-    assert!(launcher.contains("'127.0.0.1:18734' '[::1]:18734'"));
-    assert!(launcher.contains("broker-ceremony-ipv4 broker-ceremony-ipv6"));
+    assert!(launcher.contains("broker_ceremony_v4_socket_unit"));
+    assert!(launcher.contains("broker_ceremony_v6_socket_unit"));
+    assert!(launcher.contains("'127.0.0.1:18734' broker-ceremony-ipv4"));
+    assert!(launcher.contains("'[::1]:18734' broker-ceremony-ipv6"));
     assert!(launcher.contains("BLOOM_BROKER_CEREMONY_ACTIVATION_NAME_IPV4=broker-ceremony-ipv4"));
     assert!(launcher.contains("BLOOM_BROKER_CEREMONY_ACTIVATION_NAME_IPV6=broker-ceremony-ipv6"));
     assert_eq!(
@@ -1939,11 +1943,14 @@ fn macos_live_installer_verifies_and_reads_a_root_owned_payload_snapshot() {
 fn linux_installer_demand_starts_only_the_active_login_ceremony_socket() {
     let installer = fs::read_to_string(release_script("install-linux.sh")).unwrap();
     assert!(installer.contains(
-        "systemctl disable --now \\\n        \"bloom-broker-ceremony@$login_uid.socket\""
+        "systemctl disable --now \\\n        \"bloom-broker-ceremony@$login_uid.socket\" \\\n        \"bloom-broker-ceremony-ipv6@$login_uid.socket\""
     ));
     assert!(installer.contains("systemctl enable --now \"bloom-session@$login_uid.path\""));
     assert!(!installer.contains(
         "systemctl enable --now \\\n        \"bloom-broker-ceremony@$login_uid.socket\""
+    ));
+    assert!(!installer.contains(
+        "systemctl enable --now \\\n        \"bloom-broker-ceremony-ipv6@$login_uid.socket\""
     ));
 }
 
