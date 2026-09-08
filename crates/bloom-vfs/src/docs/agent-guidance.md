@@ -271,6 +271,30 @@ Use the challenge's `retry_path` verbatim after the owner completes its
 written through: `wallets/<wallet>/<n>/chains/...` for account `n`, the
 wallet-level path for account 0's wallet-level outbox.
 
+An approved native Solana transfer may change id before signing because its
+message embeds a short-lived blockhash. When confirm retires the entry to
+`failed`, read its restage advice and continue with the named successor:
+
+```sh
+cat wallets/<wallet>/chains/<solana-chain>/outbox/failed/<id>/restage_advice.json
+# -> {"replacement_id": "sol-...", "reason": "approval_refresh" | "blockhash_expired"}
+```
+
+`reason` distinguishes a deliberate pre-signing refresh from a blockhash that
+actually expired. Follow `replacement_id`, inspect the successor's plan and
+approval challenge, and use only its `retry_path`. An `approval_refresh`
+successor retains the single-use approval; an unapproved expired transfer does
+not inherit authority and may require a new ceremony.
+
+Before opening the ceremony, verify that `approval_challenge.json` has the same
+`action_id` as the directory you are acting on and that `expiry_ms` is still in
+the future. Then open or forward `ceremony_url`.
+
+The ceremony is owned by Broker and completed cryptographically by Signer.
+After successful completion, retry the same mounted confirm write. Machine has
+no local approval or signer state and cannot substitute another action's
+receipt.
+
 ## Updating wallet policy
 
 Replacing `wallets/<wallet>/policy.json` starts a Broker ceremony. Prepare
