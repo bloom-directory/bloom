@@ -352,6 +352,13 @@ impl SolanaOutbox {
         ) {
             let _ = fs::remove_file(target.join(PRIVATE_APPROVAL_FILE));
             let _ = fs::remove_file(target.join(APPROVAL_CHALLENGE_FILE));
+        }
+        // The attempt record outlives a sweep on purpose. An entry retired as
+        // `Expired` is still restageable, and its successor rebuilds the same
+        // approval operation id from the same economic intent; without the
+        // counter that successor collides with the attempt that was swept.
+        // A dispatched transfer has nothing left to approve, so its record goes.
+        if new_state == SolanaOutboxState::Sent {
             let _ = fs::remove_file(target.join(PRIVATE_APPROVAL_ATTEMPT_FILE));
         }
         sync_dir(&target_parent)?;

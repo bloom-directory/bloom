@@ -1870,7 +1870,7 @@ impl PetalHost for DaemonPetalHost {
                 protocol_error_code = error.code.as_str(),
                 "petal.sign_payload_denied"
             );
-            HostError::Denied(format!("{}: {}", error.code.as_str(), error.message))
+            petal_signing_host_error(&error)
         })?;
         let [signature] = result.signatures.as_slice() else {
             return Err(HostError::Backend(
@@ -2528,6 +2528,29 @@ async fn daemon_petal_chain_read(
     };
     serde_json::to_string(&result)
         .map_err(|e| HostError::Backend(format!("encode chain response: {e}")))
+}
+
+/// Classify a Broker signing failure before handing it to a Petal.
+///
+/// A Petal decides from this whether it may rebuild the transaction it was
+/// trying to sign. Collapsing every failure to `Denied` tells the guest that
+/// its message was refused and nothing was signed — so a fault whose outcome
+/// is genuinely unknown, or one the Broker says may already have had an
+/// effect, would license a second signature for a single intent.
+///
+/// The Broker's own error contract already carries the distinction, so use it
+/// rather than a local list of codes: a failure that can never be retried and
+/// left no durable effect is a decision, and everything else is not.
+fn petal_signing_host_error(error: &bloom_broker_api::ProtocolError) -> HostError {
+    let contract = error.code.contract();
+    let message = format!("{}: {}", error.code.as_str(), error.message);
+    if contract.retry == bloom_broker_api::RetryClass::Never
+        && contract.durable_effect == bloom_broker_api::DurableEffect::None
+    {
+        HostError::Denied(message)
+    } else {
+        HostError::Backend(message)
+    }
 }
 
 fn require_latest_block_param(params: &[serde_json::Value], index: usize) -> Result<(), HostError> {
@@ -4832,6 +4855,77 @@ mod tests {
     use bloom_vfs::VfsPath;
     use bloom_vfs::handler::Handler;
     use bloom_vfs::handler::{Entry, HandlerError};
+
+    /// A Petal reads the host error class to decide whether it may rebuild the
+    /// transaction it was signing. `Denied` has to mean the Broker decided
+    /// against this message and no signature exists; anything less certain has
+    /// to arrive as a backend fault, or the guest will authorize a second
+    /// signature for one intent.
+    #[test]
+    fn a_petal_can_tell_a_refused_signature_from_an_unknown_one() {
+        use bloom_broker_api::{ProtocolError, ProtocolErrorCode};
+
+        let denied = [
+            // The owner's approval cannot produce a signature, now or later.
+            ProtocolErrorCode::ApprovalExpired,
+            ProtocolErrorCode::ApprovalRevoked,
+            ProtocolErrorCode::ApprovalNotFound,
+            // The request never described something the Broker would sign.
+            ProtocolErrorCode::ClaimInvalid,
+            ProtocolErrorCode::SelectorMismatch,
+            ProtocolErrorCode::KeyrefMismatch,
+            ProtocolErrorCode::ProvenanceMismatch,
+        ];
+        for code in denied {
+            let error = petal_signing_host_error(&ProtocolError::new(code, "refused"));
+            assert!(
+                matches!(error, HostError::Denied(_)),
+                "{} is a decision: {error:?}",
+                code.as_str()
+            );
+        }
+
+        let uncertain = [
+            // A signature may exist and nobody knows.
+            ProtocolErrorCode::AmbiguousProviderEffect,
+            ProtocolErrorCode::ServiceUnavailable,
+            // A prior operation stands; this one must not be rebuilt over it.
+            ProtocolErrorCode::OperationIdConflict,
+            // Transient or repairable, and the approval is still good.
+            ProtocolErrorCode::CeremonyRateLimited,
+            ProtocolErrorCode::ClockUntrusted,
+            ProtocolErrorCode::PolicyBaselineStale,
+            ProtocolErrorCode::RevocationEpochUnreconciled,
+            ProtocolErrorCode::LimitExceededValue,
+        ];
+        for code in uncertain {
+            let error = petal_signing_host_error(&ProtocolError::new(code, "not a decision"));
+            assert!(
+                matches!(error, HostError::Backend(_)),
+                "{} must not read as a refusal: {error:?}",
+                code.as_str()
+            );
+        }
+
+        // The guest sees only the numeric class, so pin that too: -2 is the
+        // code the Pump.fun Petal treats as "nothing was signed".
+        assert_eq!(
+            petal_signing_host_error(&ProtocolError::new(
+                ProtocolErrorCode::ApprovalRevoked,
+                "revoked"
+            ))
+            .as_wasm_code(),
+            -2
+        );
+        assert_eq!(
+            petal_signing_host_error(&ProtocolError::new(
+                ProtocolErrorCode::AmbiguousProviderEffect,
+                "unknown"
+            ))
+            .as_wasm_code(),
+            -4
+        );
+    }
 
     #[cfg(feature = "mount")]
     #[test]

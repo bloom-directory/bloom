@@ -1773,3 +1773,150 @@ async fn a_transient_broker_fault_keeps_the_approval_and_the_retry_succeeds() {
         "a completed signature ends the attempt"
     );
 }
+
+/// A dead approval followed by a restage: the successor carries the same
+/// economic intent, so it rebuilds the same approval operation id. Losing the
+/// attempt counter on the way across makes that id collide with the approval
+/// that just died.
+#[tokio::test]
+async fn a_dead_approval_survives_a_restage_and_the_successor_recovers() {
+    let height = Arc::new(std::sync::atomic::AtomicU64::new(1));
+    let endpoint = spawn_node_with_controls(
+        height.clone(),
+        false,
+        false,
+        Arc::new(Mutex::new(Vec::new())),
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let outbox = SolanaOutbox::new(dir.path().join("outbox")).unwrap();
+    let broker = Arc::new(BrokerFixture::new());
+    let signer =
+        SolanaTransferSigner::from_catalog(MachineBrokerClient::new(broker.clone()), &catalog())
+            .unwrap();
+    let engine =
+        SolanaTransferEngine::new(outbox.clone(), client(&endpoint), signer, "solana-devnet");
+    let staged = stage_for_retry(&engine, &broker).await;
+    let fee_payer = broker.child_pubkey();
+
+    let approval = approval_required(
+        engine
+            .sign("wallet", &staged.id, &fee_payer, None, None, 1_100)
+            .await
+            .unwrap(),
+    );
+    outbox
+        .write_approval_challenge(&pending(&outbox, &staged.id), br#"{"approval_id":"stale"}"#)
+        .unwrap();
+    broker.fail_next_signature(ProtocolErrorCode::ApprovalExpired, "expired");
+    engine
+        .sign(
+            "wallet",
+            &staged.id,
+            &fee_payer,
+            None,
+            Some(approval),
+            1_200,
+        )
+        .await
+        .expect_err("an expired approval cannot sign");
+
+    height.store(
+        staged.last_valid_block_height + 1,
+        std::sync::atomic::Ordering::SeqCst,
+    );
+    let successor = engine
+        .restage_expired("wallet", &staged.id, &fee_payer, 1_300)
+        .await
+        .unwrap();
+    assert_ne!(successor.id, staged.id);
+
+    let result = engine
+        .sign("wallet", &successor.id, &fee_payer, None, None, 1_400)
+        .await;
+    assert!(
+        result.is_ok(),
+        "a dead approval followed by a restage must still recover: {result:?}"
+    );
+    assert_eq!(
+        broker.conflicts(),
+        0,
+        "the successor must not rebuild the dead approval's operation id"
+    );
+    assert_eq!(
+        outbox
+            .approval_attempt(&pending(&outbox, &successor.id))
+            .unwrap()
+            .expect("the successor carries the lineage")
+            .attempt,
+        1
+    );
+}
+
+/// The same, with the predecessor swept into `failed` before it is restaged.
+/// Retiring an entry must not take its identity lineage with it.
+#[tokio::test]
+async fn a_swept_expired_transfer_keeps_its_approval_lineage() {
+    let height = Arc::new(std::sync::atomic::AtomicU64::new(1));
+    let endpoint = spawn_node_with_controls(
+        height.clone(),
+        false,
+        false,
+        Arc::new(Mutex::new(Vec::new())),
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let outbox = SolanaOutbox::new(dir.path().join("outbox")).unwrap();
+    let broker = Arc::new(BrokerFixture::new());
+    let signer =
+        SolanaTransferSigner::from_catalog(MachineBrokerClient::new(broker.clone()), &catalog())
+            .unwrap();
+    let engine =
+        SolanaTransferEngine::new(outbox.clone(), client(&endpoint), signer, "solana-devnet");
+    let staged = stage_for_retry(&engine, &broker).await;
+    let fee_payer = broker.child_pubkey();
+
+    let approval = approval_required(
+        engine
+            .sign("wallet", &staged.id, &fee_payer, None, None, 1_100)
+            .await
+            .unwrap(),
+    );
+    broker.fail_next_signature(ProtocolErrorCode::ApprovalRevoked, "revoked");
+    engine
+        .sign(
+            "wallet",
+            &staged.id,
+            &fee_payer,
+            None,
+            Some(approval),
+            1_200,
+        )
+        .await
+        .expect_err("a revoked approval cannot sign");
+
+    // The sweep retires the stale entry into `failed` before anyone restages.
+    height.store(
+        staged.last_valid_block_height + 1,
+        std::sync::atomic::Ordering::SeqCst,
+    );
+    let mut heights = std::collections::HashMap::new();
+    heights.insert(
+        "solana-devnet".to_string(),
+        staged.last_valid_block_height + 1,
+    );
+    outbox.sweep_expired(2_000, &heights).unwrap();
+
+    let successor = engine
+        .restage_expired("wallet", &staged.id, &fee_payer, 2_100)
+        .await
+        .unwrap();
+    let result = engine
+        .sign("wallet", &successor.id, &fee_payer, None, None, 2_200)
+        .await;
+    assert!(
+        result.is_ok(),
+        "a swept transfer must not lose the identity of its dead approval: {result:?}"
+    );
+    assert_eq!(broker.conflicts(), 0);
+}

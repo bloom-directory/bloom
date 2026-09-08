@@ -438,30 +438,33 @@ impl SolanaTransferEngine {
             return Ok(replacement);
         }
 
-        // Hand the approval to the successor *before* retiring the entry that
-        // holds it. Transitioning to `failed` deletes the challenge, and it
-        // carries the only durable approval id; copying afterwards leaves a
-        // window where a crash strips the lineage of its approval and the next
-        // confirm re-prepares an operation the Broker will refuse forever.
-        // Doing it first is safe in both directions: a crash after the copy
-        // leaves the id on two entries, and only the successor is confirmable.
+        // Hand the approval and its identity lineage to the successor *before*
+        // retiring the entry that holds them. Transitioning to `failed` deletes
+        // the challenge, which carries the only durable approval id; copying
+        // afterwards leaves a window where a crash strips the lineage of its
+        // approval and the next confirm re-prepares an operation the Broker
+        // will refuse forever. Doing it first is safe in both directions: a
+        // crash after the copy leaves the id on two entries, and only the
+        // successor is confirmable.
+        let successor = self.outbox.read_in_state(
+            wallet,
+            &self.chain,
+            &replacement.id,
+            SolanaOutboxState::Pending,
+        )?;
+        // The attempt record migrates whether or not a live challenge exists.
+        // A refused approval deletes its challenge but keeps its counter, and
+        // the successor carries the same economic intent, so it rebuilds the
+        // same approval operation id. Dropping the counter here resets it to
+        // zero and collides with the approval that was just refused — the
+        // exact conflict this record exists to prevent.
+        if let Some(attempt) = self.outbox.approval_attempt(&entry)? {
+            self.outbox.write_approval_attempt(&successor, &attempt)?;
+        }
         if let Ok(challenge) = std::fs::read(entry.dir.join(crate::outbox::APPROVAL_CHALLENGE_FILE))
         {
-            let successor = self.outbox.read_in_state(
-                wallet,
-                &self.chain,
-                &replacement.id,
-                SolanaOutboxState::Pending,
-            )?;
             self.outbox
                 .write_approval_challenge(&successor, &challenge)?;
-            // The attempt record travels with the approval it belongs to. A
-            // successor that inherits the id but not the window would present
-            // the Broker different terms under the same operation id, which is
-            // exactly the conflict this record exists to avoid.
-            if let Some(attempt) = self.outbox.approval_attempt(&entry)? {
-                self.outbox.write_approval_attempt(&successor, &attempt)?;
-            }
         }
 
         let mut expired = entry;
