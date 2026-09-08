@@ -498,19 +498,35 @@ async fn solana_full_stage_confirm_flow() -> Result<()> {
         "    sent entries: {:?}",
         sent.iter().map(|e| e.name.as_str()).collect::<Vec<_>>()
     );
+    let sent_id = sent
+        .first()
+        .ok_or_else(|| anyhow!("no sent entry after confirm"))?
+        .name
+        .clone();
+    let sent_intent_json = daemon
+        .vfs
+        .read(
+            &VfsPath::parse(&format!(
+                "/wallets/alice/chains/solana-local/outbox/sent/{sent_id}/intent.json"
+            ))
+            .unwrap(),
+        )
+        .await
+        .map_err(|e| anyhow!("read sent intent: {e}"))?;
+    let sent_intent: serde_json::Value = serde_json::from_slice(&sent_intent_json)?;
 
     // 9. What did the Broker actually get asked to sign?
-    step("9", "the Broker signed exactly the staged message bytes");
+    step("9", "the Broker signed exactly the sent message bytes");
     let calls = broker.sign_calls.lock().clone();
     println!("    SigningSign calls: {}", calls.len());
     let signed_payload = calls.last().ok_or_else(|| anyhow!("no signing call"))?;
-    let staged_msg = {
+    let sent_message = {
         use std::io::Read as _;
         let _ = &mut std::io::empty().read(&mut []);
-        staged["message_b64"].as_str().unwrap().to_string()
+        sent_intent["message_b64"].as_str().unwrap().to_string()
     };
     let expected = {
-        // decode the staged base64 message without pulling a base64 dep
+        // Decode the sent base64 message without pulling a base64 dependency.
         fn b64(s: &str) -> Vec<u8> {
             let t = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
             let mut acc = 0u32;
@@ -527,20 +543,21 @@ async fn solana_full_stage_confirm_flow() -> Result<()> {
             }
             out
         }
-        b64(&staged_msg)
+        b64(&sent_message)
     };
-    println!("    staged message  {} bytes", expected.len());
+    println!("    sent message    {} bytes", expected.len());
     println!("    signed payload  {} bytes", signed_payload.len());
     assert_eq!(
         signed_payload, &expected,
-        "Broker was asked to sign bytes other than the staged message"
+        "Broker was asked to sign bytes other than the sent message"
     );
-    println!("    signed payload == staged message bytes");
+    println!("    signed payload == sent message bytes");
 
     // 10. On-chain verification.
     step("10", "verify the transfer on the validator");
-    let receipt_path =
-        format!("/wallets/alice/chains/solana-local/outbox/sent/{id}/broadcast_attempted.json");
+    let receipt_path = format!(
+        "/wallets/alice/chains/solana-local/outbox/sent/{sent_id}/broadcast_attempted.json"
+    );
     if let Ok(b) = daemon
         .vfs
         .read(&VfsPath::parse(&receipt_path).unwrap())
@@ -573,7 +590,7 @@ async fn solana_full_stage_confirm_flow() -> Result<()> {
             .vfs
             .read(
                 &VfsPath::parse(&format!(
-                    "/wallets/alice/chains/solana-local/outbox/sent/{id}/receipt.json"
+                    "/wallets/alice/chains/solana-local/outbox/sent/{sent_id}/receipt.json"
                 ))
                 .unwrap(),
             )
