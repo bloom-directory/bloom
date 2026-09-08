@@ -43,10 +43,7 @@ fn systemd_owns_only_the_tcp_listener_and_services_own_authenticated_unix_socket
             "IPAddressDeny=any".to_string(),
             "IPAddressAllow=localhost".to_string(),
         ] {
-            assert!(
-                ceremony.contains(&required),
-                "{unit} is missing {required}"
-            );
+            assert!(ceremony.contains(&required), "{unit} is missing {required}");
         }
         let other_family = if address.starts_with('[') {
             "127.0.0.1"
@@ -117,8 +114,7 @@ fn every_socket_unit_publishes_exactly_one_named_listener() {
         }
         checked += 1;
         let unit = fs::read_to_string(&path).unwrap();
-        let count =
-            |prefix: &str| unit.lines().filter(|line| line.starts_with(prefix)).count();
+        let count = |prefix: &str| unit.lines().filter(|line| line.starts_with(prefix)).count();
         assert_eq!(
             count("ListenStream="),
             1,
