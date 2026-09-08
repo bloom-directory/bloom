@@ -29,6 +29,15 @@ fn digest(byte: u8) -> Digest32 {
 struct BrokerFixture {
     child_signing_key: ed25519_dalek::SigningKey,
     child_key_ref: KeyRef,
+    prepared_expiries: Mutex<Vec<u64>>,
+    /// Operation id to the exact terms it was first prepared with, mirroring
+    /// the Broker's own `stable_approval_response`: a second prepare carrying
+    /// the same id with different terms is refused, permanently.
+    prepared_terms: Mutex<std::collections::BTreeMap<String, String>>,
+    prepared_ids: Mutex<Vec<Digest32>>,
+    conflicts: Mutex<u32>,
+    /// When set, the next signing request is answered with this error.
+    next_sign_error: Mutex<Option<(ProtocolErrorCode, String)>>,
 }
 
 impl BrokerFixture {
@@ -45,10 +54,33 @@ impl BrokerFixture {
                 public_key_fingerprint: Digest32::from_bytes(Sha256::digest(pubkey).into()),
                 derivation: None,
             },
+            prepared_expiries: Mutex::new(Vec::new()),
+            prepared_terms: Mutex::new(std::collections::BTreeMap::new()),
+            prepared_ids: Mutex::new(Vec::new()),
+            conflicts: Mutex::new(0),
+            next_sign_error: Mutex::new(None),
         }
     }
     fn child_pubkey(&self) -> [u8; 32] {
         self.child_signing_key.verifying_key().to_bytes()
+    }
+
+    fn last_prepared_expiry(&self) -> u64 {
+        *self.prepared_expiries.lock().unwrap().last().unwrap()
+    }
+
+    /// How many prepares were refused as reusing an operation id with
+    /// different terms.
+    fn conflicts(&self) -> u32 {
+        *self.conflicts.lock().unwrap()
+    }
+
+    fn prepared_ids(&self) -> Vec<Digest32> {
+        self.prepared_ids.lock().unwrap().clone()
+    }
+
+    fn fail_next_signature(&self, code: ProtocolErrorCode, message: &str) {
+        *self.next_sign_error.lock().unwrap() = Some((code, message.to_owned()));
     }
 }
 
@@ -106,6 +138,9 @@ impl MachineBrokerService for BrokerFixture {
                     }))
                 }
                 MachineBrokerRequest::SigningSign(sign_request) => {
+                    if let Some((code, message)) = self.next_sign_error.lock().unwrap().take() {
+                        return Err(ProtocolError::new(code, message));
+                    }
                     let SigningPayloads::Single { payload } = &sign_request.payloads else {
                         return Err(ProtocolError::new(
                             ProtocolErrorCode::MalformedFrame,
@@ -126,17 +161,45 @@ impl MachineBrokerService for BrokerFixture {
                     }))
                 }
                 MachineBrokerRequest::SealedApprovalPrepare(ApprovalPrepareRequest {
+                    operation_id,
                     terms,
                     ..
-                }) => Ok(MachineBrokerResponse::SealedApprovalPrepare(
-                    SealedApprovalPrepareResponse {
-                        approval_id: terms.approval_id().unwrap_or_else(|_| digest(7)),
-                        state: ApprovalPrepareState::AwaitingCeremony,
-                        ceremony_url: "http://localhost:18734/ceremony".into(),
-                        ceremony_expires_at_ms: terms.expires_at_ms,
-                        review_manifest_digest: digest(92),
-                    },
-                )),
+                }) => {
+                    // The Broker keys a prepared ceremony by operation id and
+                    // compares the whole request against what it stored. Model
+                    // that here: same id, different terms, permanent refusal.
+                    let fingerprint = serde_json::to_string(&terms).unwrap();
+                    {
+                        let mut prepared = self.prepared_terms.lock().unwrap();
+                        match prepared.get(operation_id.as_str()) {
+                            Some(existing) if existing != &fingerprint => {
+                                *self.conflicts.lock().unwrap() += 1;
+                                return Err(ProtocolError::new(
+                                    ProtocolErrorCode::OperationIdConflict,
+                                    "ceremony operation ID was reused with different stable input",
+                                ));
+                            }
+                            _ => {
+                                prepared.insert(operation_id.as_str().to_owned(), fingerprint);
+                            }
+                        }
+                    }
+                    self.prepared_expiries
+                        .lock()
+                        .unwrap()
+                        .push(terms.expires_at_ms.get());
+                    let approval_id = terms.approval_id().unwrap_or_else(|_| digest(7));
+                    self.prepared_ids.lock().unwrap().push(approval_id.clone());
+                    Ok(MachineBrokerResponse::SealedApprovalPrepare(
+                        SealedApprovalPrepareResponse {
+                            approval_id,
+                            state: ApprovalPrepareState::AwaitingCeremony,
+                            ceremony_url: "http://localhost:18734/ceremony".into(),
+                            ceremony_expires_at_ms: terms.expires_at_ms,
+                            review_manifest_digest: digest(92),
+                        },
+                    ))
+                }
                 other => Err(ProtocolError::new(
                     ProtocolErrorCode::UnknownMethod,
                     format!("unhandled {other:?}"),
