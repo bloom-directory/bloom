@@ -71,10 +71,23 @@ struct AuditInner {
     journal_snapshot: Option<JournalSnapshot>,
     identity: Option<AuditIdentity>,
     degraded: Option<String>,
+    degradation_latched: bool,
     #[cfg(any(test, feature = "audit-test-seam"))]
     fail_next_write: bool,
     #[cfg(any(test, feature = "audit-test-seam"))]
     fail_after_writes: Option<usize>,
+}
+
+fn latch_degradation(inner: &mut AuditInner, reason: String, cause_code: &'static str) {
+    inner.degradation_latched = true;
+    if inner.degraded.is_none() {
+        inner.degraded = Some(reason);
+        tracing::error!(
+            event = "machine.mutations_disabled",
+            cause_code,
+            mutations_disabled_latched = true
+        );
+    }
 }
 
 /// Cheap identity and mutation evidence for the journal verified at startup.
@@ -515,22 +528,30 @@ impl AuditLog {
         };
         let verifier = identity.as_ref().map(AuditIdentity::verifier);
         let inspected = inspect(&path, verifier.as_ref());
-        let (last_digest, sequence, pending_effects, degraded) = if path.exists() {
+        let (last_digest, sequence, pending_effects, degraded, inspected_latched) = if path.exists()
+        {
             match inspected {
                 Ok((digest, tail)) => {
                     let degraded = pending_effect_degradation(&tail.pending_effects);
-                    (digest, tail.sequence, tail.pending_effects, degraded)
+                    (digest, tail.sequence, tail.pending_effects, degraded, false)
                 }
                 Err(error) if identity.is_some() => (
                     String::new(),
                     0,
                     std::collections::BTreeSet::new(),
                     Some(error.to_string()),
+                    true,
                 ),
                 Err(error) => return Err(error),
             }
         } else {
-            (String::new(), 0, std::collections::BTreeSet::new(), None)
+            (
+                String::new(),
+                0,
+                std::collections::BTreeSet::new(),
+                None,
+                false,
+            )
         };
         let journal_snapshot = journal_snapshot(&path)?;
         let history_error = identity
@@ -539,6 +560,10 @@ impl AuditLog {
                 verify_rotation_history(&path, &current.verifier(), trusted_history).err()
             })
             .map(|error| error.to_string());
+        let degradation_latched = inspected_latched
+            || legacy_error.is_some()
+            || rotation_recovery_error.is_some()
+            || history_error.is_some();
         let log = Self {
             inner: Arc::new(Mutex::new(AuditInner {
                 path,
@@ -551,12 +576,20 @@ impl AuditLog {
                     .or(degraded)
                     .or(rotation_recovery_error)
                     .or(history_error),
+                degradation_latched,
                 #[cfg(any(test, feature = "audit-test-seam"))]
                 fail_next_write: false,
                 #[cfg(any(test, feature = "audit-test-seam"))]
                 fail_after_writes: None,
             })),
         };
+        if log.mutation_degradation().is_some() {
+            tracing::error!(
+                event = "machine.mutations_disabled",
+                cause_code = "audit_startup_verification",
+                mutations_disabled_latched = true
+            );
+        }
         if let Some(binding) = legacy_binding {
             log.append(AuditRecord {
                 ts_ms: 0,
@@ -597,19 +630,19 @@ impl AuditLog {
             Ok(snapshot) => snapshot,
             Err(error) => {
                 let reason = error.to_string();
-                g.degraded = Some(reason.clone());
+                latch_degradation(g, reason.clone(), "audit_storage");
                 return Err(AuditError::Degraded(reason));
             }
         };
         if observed_snapshot != g.journal_snapshot {
             let reason = "journal changed since its last verified mutation".to_owned();
-            g.degraded = Some(reason.clone());
+            latch_degradation(g, reason.clone(), "audit_journal_changed");
             return Err(AuditError::Degraded(reason));
         }
         let mut next_pending_effects = g.pending_effects.clone();
         if !apply_effect_transition(&mut next_pending_effects, &record) {
             let reason = "audit effect transition is invalid".to_owned();
-            g.degraded = Some(reason.clone());
+            latch_degradation(g, reason.clone(), "audit_transition_invalid");
             return Err(AuditError::Degraded(reason));
         }
         record.prev = g.last_digest.clone();
@@ -646,7 +679,7 @@ impl AuditLog {
         if g.fail_next_write {
             g.fail_next_write = false;
             let reason = "injected audit write failure".to_owned();
-            g.degraded = Some(reason.clone());
+            latch_degradation(g, reason.clone(), "audit_storage");
             return Err(AuditError::Degraded(reason));
         }
         #[cfg(any(test, feature = "audit-test-seam"))]
@@ -654,7 +687,7 @@ impl AuditLog {
             if *remaining == 0 {
                 g.fail_after_writes = None;
                 let reason = "injected delayed audit write failure".to_owned();
-                g.degraded = Some(reason.clone());
+                latch_degradation(g, reason.clone(), "audit_storage");
                 return Err(AuditError::Degraded(reason));
             }
             *remaining -= 1;
@@ -699,13 +732,13 @@ impl AuditLog {
             Ok(snapshot) => snapshot,
             Err(error) => {
                 let reason = error.to_string();
-                g.degraded = Some(reason);
+                latch_degradation(g, reason, "audit_storage");
                 return Err(AuditError::Io(error));
             }
         };
         if !file_existed && let Err(error) = sync_parent(&g.path) {
             let reason = error.to_string();
-            g.degraded = Some(reason);
+            latch_degradation(g, reason, "audit_storage");
             return Err(error);
         }
         g.last_digest = digest;
@@ -727,14 +760,7 @@ impl AuditLog {
     pub fn latch_mutations(&self, reason: impl Into<String>) {
         let mut g = self.inner.lock();
         let reason = reason.into();
-        match &mut g.degraded {
-            Some(existing) if !existing.contains(&reason) => {
-                existing.push_str("; ");
-                existing.push_str(&reason);
-            }
-            Some(_) => {}
-            None => g.degraded = Some(reason),
-        }
+        latch_degradation(&mut g, reason, "authority_edge_checkpoint");
     }
 
     pub fn sequence(&self) -> u64 {
@@ -792,7 +818,7 @@ impl AuditLog {
             ));
         }
         let pending_degradation = pending_effect_degradation(&tail.pending_effects);
-        if g.degraded != pending_degradation {
+        if g.degradation_latched || g.degraded != pending_degradation {
             return Err(AuditError::Degraded(g.degraded.clone().unwrap_or_else(|| {
                 "audit reconciliation refused because the active degradation is not solely an unresolved effect"
                     .to_owned()
@@ -1820,6 +1846,18 @@ mod tests {
         }
     }
 
+    #[test]
+    fn mutation_degradation_preserves_the_first_cause() {
+        let directory = tempfile::tempdir().unwrap();
+        let log = AuditLog::open(directory.path().join("audit.jsonl")).unwrap();
+        log.latch_mutations("first safe cause");
+        log.latch_mutations("later safe cause");
+        assert_eq!(
+            log.mutation_degradation().as_deref(),
+            Some("first safe cause")
+        );
+    }
+
     fn write_rotation_marker_fixture(
         path: &Path,
         old: &AuditIdentity,
@@ -2283,11 +2321,7 @@ mod tests {
                 "RECONCILE MACHINE AUDIT independent:a AS ABORTED",
             )
             .unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("packaging trust evidence invalid")
-        );
+        assert!(error.to_string().contains("durable intents but no results"));
         assert_eq!(
             restarted.pending_effect_correlations().unwrap(),
             vec!["independent:a".to_owned()]
@@ -2296,7 +2330,7 @@ mod tests {
             restarted
                 .mutation_degradation()
                 .unwrap()
-                .contains("packaging trust evidence invalid")
+                .contains("durable intents but no results")
         );
     }
 

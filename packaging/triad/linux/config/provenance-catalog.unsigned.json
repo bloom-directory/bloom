@@ -1,0 +1,47 @@
+{
+  "schema": "bloom.provenance-catalog.1",
+  "records": [
+    {
+      "subject": {"kind":"system","component_id":"bloom-machine","operation_class":"system.readiness"},
+      "publisher": "bloom-installer",
+      "operation_classes": [{"operation_class":"system.readiness","fee_asset":null}],
+      "installer_key_id": "unsigned-template",
+      "installer_signature": ""
+    },
+    {
+      "subject": {"kind":"system","component_id":"bloom-machine","operation_class":"transaction.confirm"},
+      "publisher": "bloom-installer",
+      "operation_classes": [{"operation_class":"transaction.confirm","fee_asset":null}],
+      "installer_key_id": "unsigned-template",
+      "installer_signature": ""
+    },
+    {
+      "subject": {"kind":"system","component_id":"bloom-machine","operation_class":"transaction.replace"},
+      "publisher": "bloom-installer",
+      "operation_classes": [{"operation_class":"transaction.replace","fee_asset":null}],
+      "installer_key_id": "unsigned-template",
+      "installer_signature": ""
+    },
+    {
+      "subject": {"kind":"system","component_id":"bloom-machine","operation_class":"transaction.cancel"},
+      "publisher": "bloom-installer",
+      "operation_classes": [{"operation_class":"transaction.cancel","fee_asset":null}],
+      "installer_key_id": "unsigned-template",
+      "installer_signature": ""
+    },
+    {
+      "subject": {"kind":"system","component_id":"bloom-machine","operation_class":"paid-http.x402"},
+      "publisher": "bloom-installer",
+      "operation_classes": [{"operation_class":"paid-http.x402","fee_asset":null}],
+      "installer_key_id": "unsigned-template",
+      "installer_signature": ""
+    },
+    {
+      "subject": {"kind":"system","component_id":"bloom-machine","operation_class":"paid-http.mpp"},
+      "publisher": "bloom-installer",
+      "operation_classes": [{"operation_class":"paid-http.mpp","fee_asset":null}],
+      "installer_key_id": "unsigned-template",
+      "installer_signature": ""
+    }
+  ]
+}

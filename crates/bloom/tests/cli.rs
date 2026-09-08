@@ -9,6 +9,7 @@
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;
 use std::sync::{
     Arc, Mutex,
@@ -36,6 +37,29 @@ use tempfile::TempDir;
 fn bloom_cmd(home: &Path) -> Command {
     let mut cmd = Command::cargo_bin("bloom").expect("locate bloom binary");
     cmd.env("BLOOM_HOME", home);
+    cmd.env(
+        "BLOOM_ENROLLMENT_ROOT",
+        home.join("config/test-enrollments"),
+    );
+    cmd.env("BLOOM_CONFIG_ROOT", home.join("config/test-triad-config"));
+    cmd.env("BLOOM_RUNTIME_ROOT", home.join("run/test-triad-runtime"));
+    cmd.env_remove("BLOOM_BROKER_SOCKET");
+    cmd.env(
+        "BLOOM_MACHINE_IDENTITY",
+        home.join("config/test-missing-machine-identity.json"),
+    );
+    cmd.env(
+        "BLOOM_EDGE_MANIFEST",
+        home.join("config/test-missing-edge-manifest.json"),
+    );
+    cmd.env(
+        "BLOOM_PROVENANCE_CATALOG",
+        home.join("config/test-missing-provenance-catalog.json"),
+    );
+    cmd.env(
+        "BLOOM_MACHINE_AUDIT_CHECKPOINT_DIR",
+        home.join("cache/test-machine-audit-checkpoints"),
+    );
     // Quiet logging keeps stdout/stderr predictable for assertions.
     cmd.env("RUST_LOG", "error");
     cmd
@@ -49,6 +73,14 @@ fn fresh_home() -> TempDir {
         .expect("create temp home");
     #[cfg(not(target_os = "macos"))]
     tempfile::tempdir().expect("create temp home")
+}
+
+fn prepare_hermetic_machine_state(home: &Path) {
+    let checkpoint_dir = home.join("cache/test-machine-audit-checkpoints");
+    std::fs::create_dir_all(&checkpoint_dir)
+        .expect("create hermetic Machine audit checkpoint directory");
+    std::fs::set_permissions(&checkpoint_dir, std::fs::Permissions::from_mode(0o700))
+        .expect("secure hermetic Machine audit checkpoint directory");
 }
 
 fn ipc_endpoint_accepting(socket: &Path) -> bool {
@@ -67,6 +99,7 @@ impl RunningBloom {
     }
 
     fn start_with_automatic_update_checks(home: &Path, automatic_update_checks: bool) -> Self {
+        prepare_hermetic_machine_state(home);
         let home_dir = bloom_proto::HomeDir::at(home);
         let mut config = if home_dir.config_path().is_file() {
             bloom_proto::Config::load(&home_dir.config_path()).unwrap()
@@ -79,6 +112,29 @@ impl RunningBloom {
         let mut command = std::process::Command::new(binary.get_program());
         command
             .env("BLOOM_HOME", home)
+            .env(
+                "BLOOM_ENROLLMENT_ROOT",
+                home.join("config/test-enrollments"),
+            )
+            .env("BLOOM_CONFIG_ROOT", home.join("config/test-triad-config"))
+            .env("BLOOM_RUNTIME_ROOT", home.join("run/test-triad-runtime"))
+            .env_remove("BLOOM_BROKER_SOCKET")
+            .env(
+                "BLOOM_MACHINE_IDENTITY",
+                home.join("config/test-missing-machine-identity.json"),
+            )
+            .env(
+                "BLOOM_EDGE_MANIFEST",
+                home.join("config/test-missing-edge-manifest.json"),
+            )
+            .env(
+                "BLOOM_PROVENANCE_CATALOG",
+                home.join("config/test-missing-provenance-catalog.json"),
+            )
+            .env(
+                "BLOOM_MACHINE_AUDIT_CHECKPOINT_DIR",
+                home.join("cache/test-machine-audit-checkpoints"),
+            )
             .env("RUST_LOG", "error")
             .arg("serve")
             .stdout(std::process::Stdio::null())
@@ -699,26 +755,58 @@ fn stop_ipc_server(
 }
 
 fn spawn_bloom_serve(home: &Path) -> std::process::Child {
+    prepare_hermetic_machine_state(home);
     let binary = Command::cargo_bin("bloom")
         .expect("locate bloom binary")
         .get_program()
         .to_owned();
     let mut child = std::process::Command::new(binary)
         .env("BLOOM_HOME", home)
+        .env(
+            "BLOOM_ENROLLMENT_ROOT",
+            home.join("config/test-enrollments"),
+        )
+        .env("BLOOM_CONFIG_ROOT", home.join("config/test-triad-config"))
+        .env("BLOOM_RUNTIME_ROOT", home.join("run/test-triad-runtime"))
+        .env_remove("BLOOM_BROKER_SOCKET")
+        .env(
+            "BLOOM_MACHINE_IDENTITY",
+            home.join("config/test-missing-machine-identity.json"),
+        )
+        .env(
+            "BLOOM_EDGE_MANIFEST",
+            home.join("config/test-missing-edge-manifest.json"),
+        )
+        .env(
+            "BLOOM_PROVENANCE_CATALOG",
+            home.join("config/test-missing-provenance-catalog.json"),
+        )
+        .env(
+            "BLOOM_MACHINE_AUDIT_CHECKPOINT_DIR",
+            home.join("cache/test-machine-audit-checkpoints"),
+        )
         .env("RUST_LOG", "error")
         .arg("serve")
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
         .spawn()
         .expect("spawn bloom serve");
     let socket = bloom_daemon::ipc::default_socket_path(home);
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     while !ipc_endpoint_accepting(&socket) {
-        assert!(
-            child.try_wait().unwrap().is_none(),
-            "bloom serve exited before binding {}",
-            socket.display()
-        );
+        if child.try_wait().unwrap().is_some() {
+            let mut stderr = String::new();
+            child
+                .stderr
+                .take()
+                .unwrap()
+                .read_to_string(&mut stderr)
+                .unwrap();
+            panic!(
+                "bloom serve exited before binding {}: {stderr}",
+                socket.display()
+            );
+        }
         assert!(
             std::time::Instant::now() < deadline,
             "bloom serve did not bind {}",
@@ -935,6 +1023,12 @@ fn docs_petals_discovers_installed_package_from_manifest() {
         .success();
     stop_ipc_server(server, server_thread);
     let _daemon = RunningBloom::start(home.path());
+
+    bloom_cmd(home.path())
+        .args(["petals", "ls"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("app=petals/demo/"));
 
     bloom_cmd(home.path())
         .args(["vfs", "cat", "/docs/petals.md"])
@@ -1323,8 +1417,8 @@ fn vfs_cat_status_update_with_seed_cache_reports_behind() {
         &cache_dir,
         &bloom_update::UpdateSnapshot::ok(
             "0.1.0".into(),
-            Some("0.2.0".into()),
-            Some("https://github.com/bloom-directory/bloom/releases/tag/v0.2.0".into()),
+            Some("0.3.0".into()),
+            Some("https://github.com/bloom-directory/bloom/releases/tag/v0.3.0".into()),
         ),
     )
     .unwrap();
@@ -1336,13 +1430,13 @@ fn vfs_cat_status_update_with_seed_cache_reports_behind() {
         .args(["vfs", "cat", "/status/update/latest"])
         .assert()
         .success()
-        .stdout(predicate::eq("0.2.0\n"));
+        .stdout(predicate::eq("0.3.0\n"));
     bloom_cmd(home.path())
         .args(["vfs", "cat", "/status/update/available"])
         .assert()
         .success()
         .stdout(predicate::eq(
-            if bloom_update::compare_semver(env!("CARGO_PKG_VERSION"), "0.2.0")
+            if bloom_update::compare_semver(env!("CARGO_PKG_VERSION"), "0.3.0")
                 == std::cmp::Ordering::Less
             {
                 "out_of_date\n"
@@ -1354,9 +1448,9 @@ fn vfs_cat_status_update_with_seed_cache_reports_behind() {
         .arg("status")
         .assert()
         .success()
-        .stdout(predicate::str::contains("latest_release: 0.2.0"))
+        .stdout(predicate::str::contains("latest_release: 0.3.0"))
         .stdout(predicate::str::contains("update_available: out_of_date"))
-        .stderr(predicate::str::contains("hint: bloom v0.2.0 is available"));
+        .stderr(predicate::str::contains("hint: bloom v0.3.0 is available"));
 }
 
 #[test]
@@ -1473,6 +1567,7 @@ fn connect_flag_beats_rpc_endpoint_env() {
 #[test]
 fn lifecycle_commands_ignore_invalid_client_endpoint_configuration() {
     let home = fresh_home();
+    prepare_hermetic_machine_state(home.path());
     let home_dir = bloom_proto::HomeDir::at(home.path());
     let mut config = bloom_proto::Config::local_default();
     config.petals.preinstalled.clear();
@@ -1486,6 +1581,37 @@ fn lifecycle_commands_ignore_invalid_client_endpoint_configuration() {
     let binary = Command::cargo_bin("bloom").expect("locate bloom binary");
     let mut child = std::process::Command::new(binary.get_program())
         .env("BLOOM_HOME", home.path())
+        .env(
+            "BLOOM_ENROLLMENT_ROOT",
+            home.path().join("config/test-enrollments"),
+        )
+        .env(
+            "BLOOM_CONFIG_ROOT",
+            home.path().join("config/test-triad-config"),
+        )
+        .env(
+            "BLOOM_RUNTIME_ROOT",
+            home.path().join("run/test-triad-runtime"),
+        )
+        .env_remove("BLOOM_BROKER_SOCKET")
+        .env(
+            "BLOOM_MACHINE_IDENTITY",
+            home.path()
+                .join("config/test-missing-machine-identity.json"),
+        )
+        .env(
+            "BLOOM_EDGE_MANIFEST",
+            home.path().join("config/test-missing-edge-manifest.json"),
+        )
+        .env(
+            "BLOOM_PROVENANCE_CATALOG",
+            home.path()
+                .join("config/test-missing-provenance-catalog.json"),
+        )
+        .env(
+            "BLOOM_MACHINE_AUDIT_CHECKPOINT_DIR",
+            home.path().join("cache/test-machine-audit-checkpoints"),
+        )
         .env("BLOOM_RPC_ENDPOINT", "tcp:invalid")
         .env("RUST_LOG", "error")
         .env(bloom_update::DISABLE_AUTO_CHECK_ENV, "1")
@@ -1539,6 +1665,24 @@ fn ipc_socket_flag_beats_rpc_endpoint_env() {
 }
 
 #[test]
+fn serve_remains_available_with_unavailable_defaults_on_repeated_starts() {
+    let home = fresh_home();
+    let home_dir = bloom_proto::HomeDir::at(home.path());
+    home_dir.ensure().unwrap();
+    let mut config = bloom_proto::Config::local_default();
+    config.petals.preinstalled = vec!["enso".into(), "gasless".into()];
+    config.save(&home_dir.config_path()).unwrap();
+    for _ in 0..2 {
+        let daemon = spawn_bloom_serve(home.path());
+        bloom_cmd(home.path())
+            .args(["ipc", "call", "version"])
+            .assert()
+            .success();
+        stop_bloom_serve(home.path(), daemon);
+    }
+}
+
+#[test]
 fn serve_refuses_when_home_write_lock_is_live() {
     let home = fresh_home();
     let _permit = bloom_proto::HomeWritePermit::acquire(&bloom_proto::HomeDir::at(home.path()))
@@ -1546,9 +1690,10 @@ fn serve_refuses_when_home_write_lock_is_live() {
     let lock = home.path().join("run").join(".daemon.lock");
 
     let mut command = bloom_cmd(home.path());
-    command.arg("serve");
+    command.env("BLOOM_LOG_OUTPUT", "json-stderr").arg("serve");
     command.assert().failure().stderr(
-        predicate::str::contains("already open for writing")
+        predicate::str::contains("Bloom service exited after a runtime failure")
+            .and(predicate::str::contains("service.fatal_exit"))
             .and(predicate::str::contains(lock.display().to_string())),
     );
 }

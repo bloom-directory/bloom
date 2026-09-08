@@ -101,37 +101,9 @@ for binary in bloom bloom-broker bloom-signer bloom-signer-migrate; do
   fi
 done
 
-# Prove the same Mach-O binaries cannot be relabelled as production without
-# supplying the separately reviewed conformance report and pinned public key.
-mkdir -p "$static_work/staging/bin"
-for binary in bloom bloom-broker bloom-signer bloom-signer-migrate; do
-  cp "$payload/bin/$binary" "$static_work/staging/bin/$binary"
-done
-printf '%s\n' 'intentionally invalid: conformance rejection must precede signing' \
-  > "$static_work/release-key.pem"
-chmod 0600 "$static_work/release-key.pem"
-set +e
-env \
-  BLOOM_PLATFORM_CLAIM=macos-unix-principals \
-  BLOOM_MACOS_CONFORMANCE_REPORT= \
-  BLOOM_MACOS_CONFORMANCE_SIGNATURE= \
-  BLOOM_MACOS_CONFORMANCE_PUBLIC_KEY= \
-  BLOOM_MACOS_CONFORMANCE_KEY_SHA256= \
-  "$main_root/packaging/triad/release/build-bundle.sh" \
-  "$static_work/staging" \
-  "$static_work/forbidden-production.tar.gz" \
-  "$static_work/release-key.pem" \
-  1700000000 \
-  >"$static_work/production-gate.log" 2>&1
-production_gate_status=$?
-set -e
-[[ "$production_gate_status" -ne 0 ]] || {
-  echo "release gate emitted a production macOS claim without conformance evidence" >&2
-  exit 1
-}
-grep -F \
-  'BLOOM_MACOS_CONFORMANCE_REPORT must name a regular conformance input' \
-  "$static_work/production-gate.log" >/dev/null
+# Exercise the report-free release contract without installing the test archive.
+"$main_root/tests/conformance/macos-unix-principals/check-release-contract.sh" \
+  "$payload" "$main_root"
 
 assert_installed_process() {
   process_name="$1"
@@ -159,20 +131,40 @@ assert_installed_process bloom-broker "$broker_uid" "$release_root/bloom-broker"
 assert_installed_process bloom-signer "$signer_uid" "$release_root/bloom-signer"
 sudo -u "$login_user" \
   "$release_root/bloom" serve triad-health-check "$release_digest"
+machine_label="user/$login_uid/com.bloom.machine"
+machine_plist="/Library/LaunchAgents/com.bloom.machine.plist"
+machine_pid="$(launchctl print "$machine_label" | sed -n 's/^[[:space:]]*pid = //p')"
+[[ "$machine_pid" =~ ^[1-9][0-9]*$ ]]
+[[ "$(ps -p "$machine_pid" -o uid= | tr -d ' ')" == "$login_uid" ]]
+lsof -nP -a -p "$machine_pid" -d txt -Fn |
+  grep -Fx -e "n$release_root/bloom" -e 'n/usr/local/libexec/bloom/current/bloom' >/dev/null
+sudo -H -u "$login_user" "$release_root/bloom" status >/dev/null
 
 machine_identity="/Library/Application Support/BloomTriad/config/$login_uid/machine/identity.json"
 edge_manifest="/Library/Application Support/BloomTriad/config/$login_uid/edge-manifest.json"
-"$main_root/packaging/triad/macos/w0/run-packaged-machine-negative.sh" \
-  "$release_root/bloom" \
-  "$login_uid" \
-  "$login_user" \
-  "$broker_uid" \
-  "$signer_uid" \
-  "$machine_identity" \
-  "$edge_manifest" \
-  "$broker_root"
-
-# The runtime negative restores the installed Broker before returning.
+broker_label="system/com.bloom.broker.$login_uid"
+signer_label="system/com.bloom.signer.$login_uid"
+broker_plist="/Library/LaunchDaemons/com.bloom.broker.$login_uid.plist"
+signer_plist="/Library/LaunchDaemons/com.bloom.signer.$login_uid.plist"
+broker_state="/private/var/db/bloom/$login_uid/broker"
+signer_state="/private/var/db/bloom/$login_uid/signer"
+runtime_negative_snapshot="$static_work/runtime-negative-state"
+mkdir "$runtime_negative_snapshot"
+launchctl bootout "$broker_label"
+launchctl bootout "$signer_label"
+deadline=$((SECONDS + 20))
+while { pgrep -u "$broker_uid" -x bloom-broker >/dev/null 2>&1 ||
+  pgrep -u "$signer_uid" -x bloom-signer >/dev/null 2>&1; } &&
+  [[ $SECONDS -lt $deadline ]]
+do
+  sleep 0.1
+done
+! pgrep -u "$broker_uid" -x bloom-broker >/dev/null 2>&1
+! pgrep -u "$signer_uid" -x bloom-signer >/dev/null 2>&1
+ditto "$broker_state" "$runtime_negative_snapshot/broker"
+ditto "$signer_state" "$runtime_negative_snapshot/signer"
+launchctl bootstrap system "$signer_plist"
+launchctl bootstrap system "$broker_plist"
 deadline=$((SECONDS + 20))
 while [[ $SECONDS -lt $deadline ]]; do
   if sudo -u "$login_user" \
@@ -184,6 +176,61 @@ while [[ $SECONDS -lt $deadline ]]; do
 done
 sudo -u "$login_user" \
   "$release_root/bloom" serve triad-health-check "$release_digest"
+launchctl bootout "$machine_label"
+"$main_root/tests/conformance/macos-unix-principals/run-packaged-machine-negative.sh" \
+  "$release_root/bloom" \
+  "$login_uid" \
+  "$login_user" \
+  "$broker_uid" \
+  "$signer_uid" \
+  "$machine_identity" \
+  "$edge_manifest" \
+  "$broker_root"
+
+# The runtime negative deliberately exercises real custody before replacing
+# both authority edges with hostile listeners. Restore the stopped, byte-for-
+# byte pre-test authority state so its fixture wallet and peer audit heads do
+# not become part of the candidate subsequently exercised by AC-01..AC-35.
+launchctl bootout "$broker_label"
+launchctl bootout "$signer_label"
+deadline=$((SECONDS + 20))
+while { pgrep -u "$broker_uid" -x bloom-broker >/dev/null 2>&1 ||
+  pgrep -u "$signer_uid" -x bloom-signer >/dev/null 2>&1; } &&
+  [[ $SECONDS -lt $deadline ]]
+do
+  sleep 0.1
+done
+! pgrep -u "$broker_uid" -x bloom-broker >/dev/null 2>&1
+! pgrep -u "$signer_uid" -x bloom-signer >/dev/null 2>&1
+mv "$broker_state" "$static_work/broker-after-runtime-negative"
+mv "$signer_state" "$static_work/signer-after-runtime-negative"
+ditto "$runtime_negative_snapshot/broker" "$broker_state"
+ditto "$runtime_negative_snapshot/signer" "$signer_state"
+launchctl bootstrap system "$signer_plist"
+launchctl bootstrap system "$broker_plist"
+launchctl bootstrap "user/$login_uid" "$machine_plist"
+launchctl kickstart -k "$machine_label"
+
+# The restored installed Broker and Signer must return to authenticated health.
+deadline=$((SECONDS + 20))
+while [[ $SECONDS -lt $deadline ]]; do
+  if sudo -u "$login_user" \
+    "$release_root/bloom" serve triad-health-check "$release_digest"
+  then
+    break
+  fi
+  sleep 1
+done
+sudo -u "$login_user" \
+  "$release_root/bloom" serve triad-health-check "$release_digest"
+deadline=$((SECONDS + 20))
+until sudo -H -u "$login_user" "$release_root/bloom" status >/dev/null 2>&1; do
+  [[ $SECONDS -lt $deadline ]] || {
+    echo "installed Machine service did not restore after runtime-negative acceptance" >&2
+    exit 1
+  }
+  sleep 1
+done
 
 source_revision() {
   key="$1"
@@ -295,6 +342,7 @@ assert_installed_process bloom-broker "$broker_uid" "$release_root/bloom-broker"
 assert_installed_process bloom-signer "$signer_uid" "$release_root/bloom-signer"
 sudo -u "$login_user" \
   "$release_root/bloom" serve triad-health-check "$release_digest"
+sudo -H -u "$login_user" "$release_root/bloom" status >/dev/null
 
 subject_digest="$(
   "$main_root/packaging/triad/release/macos-conformance-subject.sh" "$payload"

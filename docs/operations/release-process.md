@@ -1,191 +1,108 @@
 # Release process
 
-## Overview
+## Current release contract
 
-Releases start from a reviewed version-bump PR followed by a `vX.Y.Z` tag
-push. The optional `propose-release.yml` workflow prepares the PR; it never
-writes to the default branch, creates a stable tag, or publishes a release.
-The `release.yml` workflow:
+Bloom v0.2 releases contain signed triad bundles for **Linux x86_64** and
+**macOS aarch64**. Each archive includes Machine (`bloom`), Broker, Signer,
+`bloom-signer-migrate`, public configuration templates, and installers. The
+published assets are:
 
-1. Validates the tag shape.
-2. Verifies that the tagged commit is reachable from the default branch and
-   already has workspace version `X.Y.Z`.
-3. Builds the exact commit SHA on four runner platforms (Linux x86_64 +
-   aarch64, macOS x86_64 + aarch64) with `--locked`, including both glibc
-   and static musl artifacts for Linux aarch64.
-4. Verifies the resulting binary's `bloom --version` matches the tag.
-5. Verifies the tag still resolves to the built SHA, then creates a
-   GitHub release `vX.Y.Z` with the five tarballs and a `SHA256SUMS`
-   file. It advances GitHub's latest-release alias only when this version is
-   at least as new as the current latest release; failures resolving that
-   release abort publication rather than treating the result as empty.
+- `bloom-triad-linux-x86_64.tar.gz` plus `.sha256`, `.sig`, and `.pub` sidecars;
+- `bloom-triad-macos-aarch64.tar.gz` plus `.sha256`, `.sig`, and `.pub` sidecars.
 
-The floating `latest` git tag is intentionally NOT created by the
-workflow. It is owned by the old (now-retired) branch-driven
-`release.yml`. The legacy `Latest master build` release and the
-`latest` tag are removed in the cleanup step below. GitHub's
-`/releases/latest/download/...` route follows the release marked
-latest; it does not require a git tag literally named `latest`.
+Both platforms use the reviewed key at
+[`packaging/triad/release/bloom-release-v1.pub`](../../packaging/triad/release/bloom-release-v1.pub).
+The archive checksum signature uses the `bloom-release-archive-v1` SSHSIG
+namespace; the internal manifest uses `bloom-release-payload-v1`. Obtain the
+trusted key independently of the downloaded archive. A bundled `.pub` file
+alone does not establish trust. The installers authenticate a private
+root-owned snapshot against a separately provisioned, root-owned,
+non-writable pin before changing services or installation state.
 
-Linux aarch64 releases include two variants. Use
-`bloom-linux-aarch64.tar.gz` on glibc distributions and
-`bloom-linux-aarch64-musl.tar.gz` on Termux/Android, Alpine Linux, and
-minimal Linux systems without glibc. The musl binary is statically linked.
+Production macOS uses the `macos-unix-principals` claim. Tart conformance is
+optional manual validation: `MACOS_CONFORMANCE_REPORT.json`, `.sig`, and
+`.pub` are not required release assets, signing inputs, or install prerequisites.
+The guarded `macos-unix-principals-w0` claim remains for disposable testing.
+See the [package contract](../../packaging/triad/release/README.md) for
+verification, enrollment, upgrade, and custody-retention behavior.
 
-## CI-proposed release
+## Prepare a reviewed version bump
 
-Configure a `RELEASE_PR_TOKEN` repository secret backed by a GitHub App token
-or fine-grained token with Contents read/write and Pull requests read/write.
-The token is needed because a PR created with `GITHUB_TOKEN` does not receive
-the normal pull-request workflow events.
+Releases start from a version-bump PR followed by a `vX.Y.Z` tag on the reviewed
+commit. The optional `propose-release.yml` workflow creates that PR; it never
+writes to the default branch, tags a release, or publishes assets. Configure
+`RELEASE_PR_TOKEN` as a fine-grained token with Contents and Pull requests
+read/write permissions so the generated PR receives normal pull-request CI.
+A GitHub App integration would instead need to mint its installation token in
+the workflow.
 
-Run **Actions → Propose Release → Run workflow**, enter the next version
-without the `v` prefix, and review the generated PR. The workflow updates only
-`Cargo.toml` and the workspace metadata in `Cargo.lock`, and refuses to
-upgrade unrelated external dependencies. After the PR is merged, push a tag
-from the merge commit:
+Run **Actions → Propose Release → Run workflow** with the next version without
+`v`. Review changes to `Cargo.toml`, workspace metadata in `Cargo.lock`, and
+the Machine version in `packaging/triad/release/compatibility-v1.toml`. The
+workflow refuses to upgrade unrelated external dependencies. The compatibility
+matrix also pins the reviewed Broker and Signer source commits; changes to
+those pins require review independently of the version bump.
 
-```bash
-VERSION="0.1.1"
-git switch master
-git pull --ff-only origin master
-test "$(sed -n -E 's/^version = "([0-9]+\.[0-9]+\.[0-9]+)"/\1/p' Cargo.toml | head -n 1)" = "$VERSION"
-git tag "v$VERSION"
-git push origin "v$VERSION"
+After merging the PR, tag the reviewed commit and push that tag. The release
+workflow requires the commit to be reachable from the default branch and both
+the workspace and compatibility-matrix Machine version to equal the tag.
+Repository rules should restrict creation and updates of `v*` tags to release
+maintainers.
+
+## Build and validate candidates
+
+The local and CI entry point is:
+
+```sh
+packaging/triad/release.sh build linux --output-dir /tmp/bloom-linux-candidate
+# On a separate Darwin arm64 host:
+packaging/triad/release.sh build macos --output-dir /tmp/bloom-macos-candidate
 ```
 
-The tag push starts the release workflow. It verifies that the tag points to a
-commit reachable from the default branch, that the tag and workspace version
-agree, builds that immutable commit, and publishes the release only after all
-build jobs pass.
+Linux builds require a Linux x86_64 host; macOS builds require Darwin arm64.
+By default the command uses `../bloom-broker` and `../bloom-signer`; explicit
+`--broker-root` and `--signer-root` options select other checkouts. All three
+source trees must be clean, including untracked files, and the authority
+checkouts must match the committed compatibility pins. Builds use locked
+Cargo dependencies and reject forbidden production Machine features.
 
-Repository rules should require review before merging the proposal PR and
-limit creation or update of `v*` tags to release maintainers. The release
-workflow's write token is used only by the publish job for GitHub release
-metadata and assets.
+The build validates versions, architecture, packaging and installer checks,
+then assembles and verifies the bundle twice to prove deterministic output.
+It emits `bloom-triad-test-unclaimed.tar.gz` and its three sidecars signed by
+an ephemeral candidate key. Source-wide formatting, Clippy, and test suites
+remain separate CI gates; a candidate build is not a full acceptance run.
+Never replace this entry point with a single-binary `--all-features` build.
 
-## Local release
+Before merging changes to the release workflow, dispatch the branch with
+`dry_run=true`. That runs both candidate builds and uploads Actions artifacts,
+while skipping production signing and GitHub publication. It does not create
+commits or tags. Installing a candidate additionally requires a trusted
+root-owned pin of its ephemeral key and the explicit
+`BLOOM_ALLOW_TEST_UNCLAIMED=true` installer opt-in.
 
-Run the first `vX.Y.Z` release locally so you can verify the build
-before pushing the tag:
+## Sign and publish
 
-```bash
-# 1. Decide on the version. For a first release from the existing
-#    master at workspace version 0.1.0, this is likely 0.1.1 (a
-#    small bump that signals "first proper release") or 0.2.0
-#    (signals "now we have update checks + the workflow"). Pick
-#    deliberately and document the choice in the PR description.
-VERSION="0.1.1"
-BRANCH="release-prep/v$VERSION"
-git switch master
-git pull --ff-only origin master
-git switch -c "$BRANCH"
+A `vX.Y.Z` tag push runs `release.yml`. A manual dispatch with `dry_run=false`
+retries an existing tag; select that tag as the workflow ref as well. The run
+must originate from the tagged commit and builds its exact source SHA, using
+Linux x86_64 and `macos-15` arm64 runners.
 
-# 2. Bump the workspace version. `sed` is enough — every member
-#    crate uses `version.workspace = true` and picks up the new
-#    number at compile time. `cargo check --workspace` refreshes only
-#    the lockfile metadata required by the version change; it does not
-#    proactively upgrade compatible transitive dependencies.
-sed -i -E "s/^version = \"[0-9]+\\.[0-9]+\\.[0-9]+\"/version = \"$VERSION\"/" Cargo.toml
-cargo check --workspace
+After both candidate builds succeed, the protected `production-release`
+environment supplies the release key only to the signing step. The isolated
+`release.sh sign linux|macos` pass verifies candidate version, source revisions,
+and target architecture without executing candidate-owned code. It replaces
+the ephemeral inner signature, repacks deterministically, and signs the outer
+checksum with a private key matching the reviewed public key. Both final
+archives are verified against that pin before publication.
 
-# 3. Sanity: the diff is exactly Cargo.toml + Cargo.lock.
-git diff -- Cargo.toml Cargo.lock
+The publish job rechecks that the tag still names the built SHA, then publishes
+both platforms together as a normal GitHub Release. A retry compares existing
+assets byte for byte, rejects unexpected or changed assets, and uploads only
+missing assets. The current retry path marks the release latest; maintainers
+should account for that when retrying an older tag. GitHub's
+`/releases/latest/download/...` routes follow the release marked latest and do
+not need a floating `latest` Git tag.
 
-# 4. Build and verify the binary.
-cargo build --release -p bloom --all-features --locked
-./target/release/bloom --version    # first line must print "bloom $VERSION"
-
-# 5. Commit the bump on a release-prep branch and open a PR. Do not
-#    push directly to master; the default branch requires its status
-#    checks to pass through a PR.
-git add Cargo.toml Cargo.lock
-git commit -m "release: v$VERSION"
-git push -u origin "$BRANCH"
-gh pr create --base master --head "$BRANCH" \
-  --title "release: v$VERSION" \
-  --body "Bump the workspace version for v$VERSION."
-
-# 6. After that PR passes checks and is merged, update local master.
-#    Rebuild so the tag is attached to the exact commit you tested
-#    even if another PR merged in the meantime.
-git switch master
-git pull --ff-only origin master
-test "$(sed -n -E 's/^version = "([0-9]+\.[0-9]+\.[0-9]+)"/\1/p' Cargo.toml | head -n 1)" = "$VERSION"
-cargo build --release -p bloom --all-features --locked
-./target/release/bloom --version    # first line must print "bloom $VERSION"
-git tag "v$VERSION"
-git push origin "v$VERSION"
-```
-
-The tag push starts the workflow automatically. Because the tag already
-points at the reviewed version-bumped commit, the build jobs use that exact
-SHA and the publish job creates the `v$VERSION` release with the five
-tarballs and `SHA256SUMS`. A manual `release.yml` run is available only to
-retry an existing tag and never creates commits or tags.
-
-## Legacy cleanup (one-time, manual)
-
-After the first `vX.Y.Z` release is published and marked latest,
-GitHub's `/releases/latest` API and download routes point to it. The
-legacy `Latest master build` release and floating `latest` git tag can
-then be deleted as cleanup:
-
-```bash
-# 1. Delete the legacy release whose tag is literally "latest".
-gh release delete latest --yes
-
-# 2. Delete its floating git tag.
-git push origin :refs/tags/latest
-```
-
-The stable `/releases/latest/download/...` URLs continue to work: they
-follow the `vX.Y.Z` release marked latest, independently of the deleted
-floating tag.
-
-## Verifying the UpdateChecker
-
-After the first versioned release, the daemon's `/status/update`
-subtree should be meaningful. Verify from any machine running the
-binary:
-
-```bash
-# First-run: no cache file → available=unknown, latest=empty.
-bloom vfs cat /status/update/available    # → unknown\n
-bloom vfs cat /status/update/latest       # → \n
-
-# After 5 minutes (or after `bloom update check`): the snapshot
-# should be populated.
-bloom update check                         # prints snapshot as JSON, exit 0/1/2
-bloom vfs cat /status/update/latest        # → e.g. "0.1.1\n"
-bloom vfs cat /status/update/available     # → out_of_date | up_to_date
-```
-
-Before the first versioned release, GitHub may return the legacy tag
-`latest`. That is a successful HTTP response but not semver, so
-`bloom update check` reports `available: unknown` and exits 2 rather
-than claiming the binary is up to date. An HTTP 404 means no eligible
-published release exists yet.
-
-To disable automatic daemon polling on a host while retaining explicit
-checks, set `BLOOM_DISABLE_UPDATE_CHECK=1` in the service environment.
-
-## What is intentionally NOT in the workflow
-
-- **`cargo install cargo-edit`**: not needed. `sed` is faster and
-  doesn't need a fresh toolchain.
-- **`--config 'package.version="X.Y.Z"'`**: doesn't exist in Cargo.
-  Verified against the Cargo configuration reference.
-- **A floating `latest` git tag**: removed during legacy cleanup. The
-  versioned URL is canonical, while GitHub's latest-release URL remains
-  a stable convenience alias.
-- **Cross-architecture builds**: each artifact is built on a runner with the
-  matching CPU architecture. The release workflow selects explicit Rust
-  targets, including musl on the native aarch64 runner, but does not emulate
-  or cross-compile between CPU architectures.
-- **Windows builds**: intentionally out of scope. Historical commit
-  `cce4250 remove Windows release builds` removed them; the current
-  CI has no Windows tests.
-- **`bloom update install`**: not implemented. Atomicity, macOS
-  SIP/Gatekeeper, and Windows self-overwrite are unsolved. Users
-  download a new release manually.
+Linux aarch64/musl and macOS x86_64 single-binary archives from the older
+pipeline are not outputs of the current triad workflow. Windows builds are
+also outside this workflow.

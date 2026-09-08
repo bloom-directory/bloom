@@ -1,7 +1,0 @@
-# Installed root-owned under chrony's confdir. At least two independently
-# operated NTS servers are rendered by the installer.
-authselectmode require
-server @NTS_SERVER_1@ iburst nts
-server @NTS_SERVER_2@ iburst nts
-minsources 2
-rtcsync

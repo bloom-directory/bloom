@@ -56,7 +56,7 @@ use tokio::io::{
 };
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Notify;
-use tracing::{debug, info, trace, warn};
+use tracing::{Instrument as _, debug, info, trace, warn};
 
 /// Maximum physical newline-delimited frame and reassembled logical message.
 /// Logical messages above one frame are transported as ordered base64 chunks.
@@ -450,7 +450,8 @@ pub trait BatchConfirmationService: Send + Sync {
 
 /// Narrow seam for trusted remote-source installs. Local package install,
 /// build, list, and uninstall stay implemented by the IPC server against its
-/// daemon-owned [`PetalRunner`].
+/// daemon-owned [`PetalRunner`]. Acquisition runs without the mutation lock;
+/// implementations commit through [`IpcOperationContext::commit_petal_package`].
 pub trait PetalSourceInstallService: Send + Sync {
     fn install_source(&self, params: Value, context: IpcOperationContext) -> Result<Value, String>;
 }
@@ -473,6 +474,7 @@ pub struct IpcOutputEvent {
 pub struct IpcOperationContext {
     output: Option<tokio::sync::mpsc::Sender<IpcOutputEvent>>,
     cancelled: Arc<AtomicBool>,
+    petal_mutation: Option<Arc<tokio::sync::Mutex<()>>>,
 }
 
 impl IpcOperationContext {
@@ -480,15 +482,68 @@ impl IpcOperationContext {
         Self {
             output: Some(output),
             cancelled: Arc::new(AtomicBool::new(false)),
+            petal_mutation: None,
         }
     }
 
-    #[cfg(test)]
-    fn detached() -> Self {
+    pub fn detached() -> Self {
         Self {
             output: None,
             cancelled: Arc::new(AtomicBool::new(false)),
+            petal_mutation: None,
         }
+    }
+
+    /// Common installation seam for local, source and background installs.
+    /// Verification/materialization is outside the mutation lock; cancellation
+    /// and the optional expected owner are checked again at the atomic commit.
+    pub fn commit_petal_package(
+        &self,
+        store: &bloom_petals::PetalStore,
+        package: bloom_petals::package::PreparedPetalPackage,
+        source: Option<bloom_petals::meta::PetalSourceProvenance>,
+        expected_owner: Option<Option<String>>,
+    ) -> Result<
+        (
+            bloom_petals::store::InstallResult,
+            bloom_petals::meta::PetalMeta,
+            bloom_petals::package::RouteIndex,
+        ),
+        PetalError,
+    > {
+        let name = package.name.clone();
+        let check = || {
+            if self.is_cancelled() {
+                return Err(PetalError::vm("Petal install cancelled"));
+            }
+            if let Some(expected) = &expected_owner
+                && &store.resolve_petal_owner(&name)? != expected
+            {
+                return Err(PetalError::vm(format!(
+                    "Petal {name} owner changed during acquisition; refusing stale install"
+                )));
+            }
+            Ok(())
+        };
+        if self.is_cancelled() {
+            return Err(PetalError::vm("Petal install cancelled"));
+        }
+        let staged = store.stage_petal_package(package)?;
+        let _mutation = if let Some(mutation) = &self.petal_mutation {
+            Some(loop {
+                if self.is_cancelled() {
+                    return Err(PetalError::vm("Petal install cancelled"));
+                }
+                if let Ok(guard) = mutation.try_lock() {
+                    break guard;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            })
+        } else {
+            None
+        };
+        check()?;
+        store.install_staged_petal_package_with_source_guarded(staged, source, check)
     }
 
     pub fn emit(&self, stream: IpcOutputStream, bytes: impl Into<Vec<u8>>) -> bool {
@@ -529,7 +584,7 @@ impl IpcOperationContext {
         self.cancelled.load(Ordering::Acquire)
     }
 
-    fn cancel(&self) {
+    pub fn cancel(&self) {
         self.cancelled.store(true, Ordering::Release);
     }
 }
@@ -576,6 +631,9 @@ pub struct MachineLegacyMigrationReceipt {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
 pub enum MachineCommand {
+    TriadHealth {
+        expected_build: String,
+    },
     Status,
     AuditStatus,
     AuditReconcile {
@@ -665,6 +723,8 @@ pub struct IpcServer {
     petal_mutation: Arc<tokio::sync::Mutex<()>>,
     batch_confirmation: Option<Arc<dyn BatchConfirmationService>>,
     machine_commands: Option<Arc<dyn MachineCommandService>>,
+    activation_health_only: bool,
+    ready: Option<Arc<dyn Fn() + Send + Sync>>,
     shutdown: Arc<Notify>,
 }
 
@@ -680,6 +740,8 @@ impl IpcServer {
             petal_mutation: Arc::new(tokio::sync::Mutex::new(())),
             batch_confirmation: None,
             machine_commands: None,
+            activation_health_only: false,
+            ready: None,
             shutdown: Arc::new(Notify::new()),
         }
     }
@@ -707,6 +769,13 @@ impl IpcServer {
         self
     }
 
+    /// Detached, cancellable operation sharing the daemon's install commit lock.
+    pub fn petal_operation_context(&self) -> IpcOperationContext {
+        let mut context = IpcOperationContext::detached();
+        context.petal_mutation = Some(self.petal_mutation.clone());
+        context
+    }
+
     pub fn with_batch_confirmation(mut self, service: Arc<dyn BatchConfirmationService>) -> Self {
         self.batch_confirmation = Some(service);
         self
@@ -717,9 +786,20 @@ impl IpcServer {
         self
     }
 
+    pub fn activation_health_only(mut self) -> Self {
+        self.activation_health_only = true;
+        self
+    }
+
+    /// Run a small notification after the secured socket is published.
+    pub fn with_ready_callback(mut self, ready: Arc<dyn Fn() + Send + Sync>) -> Self {
+        self.ready = Some(ready);
+        self
+    }
+
     /// Trigger graceful shutdown of the running [`serve`] loop.
     pub fn trigger_shutdown(&self) {
-        self.shutdown.notify_waiters();
+        self.shutdown.notify_one();
     }
 
     /// Bind a UDS at `socket_path` and accept connections until shutdown
@@ -757,6 +837,9 @@ impl IpcServer {
         listener.set_nonblocking(true)?;
         let listener = UnixListener::from_std(listener)?;
         info!(socket = %socket_path.display(), "ipc.listening");
+        if let Some(ready) = &self.ready {
+            ready();
+        }
 
         loop {
             tokio::select! {
@@ -770,7 +853,8 @@ impl IpcServer {
                             let observed_uid = match stream.peer_cred() {
                                 Ok(credential) => credential.uid(),
                                 Err(error) => {
-                                    warn!(%error, "ipc.peer_credentials_failed");
+                                    let _ = error;
+                                    warn!(error_kind = "peer_credentials", "ipc.peer_credentials_failed");
                                     continue;
                                 }
                             };
@@ -783,15 +867,20 @@ impl IpcServer {
                             }
                             trace!("ipc.conn_accepted");
                             let me = self.clone();
+                            let connection_span = tracing::Span::current();
                             tokio::spawn(async move {
                                 match me.handle_conn(stream).await {
                                     Ok(()) => trace!("ipc.conn_closed"),
-                                    Err(e) => warn!(error = %e, "ipc.conn_err"),
+                                    Err(error) => {
+                                        let _ = error;
+                                        warn!(error_kind = "connection_io", "ipc.conn_err")
+                                    },
                                 }
-                            });
+                            }.instrument(connection_span));
                         }
-                        Err(e) => {
-                            warn!(error = %e, "ipc.accept_err");
+                        Err(error) => {
+                            let _ = error;
+                            warn!(error_kind = "listener_accept", "ipc.accept_err");
                         }
                     }
                 }
@@ -885,12 +974,15 @@ impl IpcServer {
                     }
                 }
                 Err(e) => {
-                    debug!(error = %e, "ipc.parse_error");
+                    debug!(error_kind = "request_parse", "ipc.parse_error");
                     Response::err(Value::Null, -32700, format!("parse error: {e}"))
                 }
             };
-            let out = serde_json::to_vec(&resp).unwrap_or_else(|e| {
-                debug!(error = %e, "ipc.response_serialise_failed");
+            let out = serde_json::to_vec(&resp).unwrap_or_else(|_error| {
+                debug!(
+                    error_kind = "response_serialise",
+                    "ipc.response_serialise_failed"
+                );
                 // We cannot echo the request id here (serialisation of the
                 // proper Response already failed, so we may not have a
                 // well-formed id either). `null` is the safe default per
@@ -914,12 +1006,19 @@ impl IpcServer {
             return Response::err(req.id, -32600, "jsonrpc must be 2.0");
         }
         let id = req.id.clone();
+        if self.activation_health_only && req.method != "machine.execute" {
+            return Response::err(
+                id,
+                -32601,
+                "activation health endpoint only accepts machine.execute",
+            );
+        }
         match req.method.as_str() {
             "version" => Response::ok(id, Value::String(self.version.clone())),
             "chains" => Response::ok(id, json!(self.chains)),
             "shutdown" => {
                 info!("ipc.shutdown_requested_via_rpc");
-                self.shutdown.notify_waiters();
+                self.trigger_shutdown();
                 Response::ok(id, Value::Null)
             }
             "lookup" => match self.do_lookup(&req.params).await {
@@ -1104,8 +1203,9 @@ impl IpcServer {
     async fn do_petals_install(
         &self,
         params: &Value,
-        context: IpcOperationContext,
+        mut context: IpcOperationContext,
     ) -> Result<Value, PetalError> {
+        context.petal_mutation = Some(self.petal_mutation.clone());
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
         struct InstallRequest {
@@ -1123,9 +1223,7 @@ impl IpcServer {
                 PetalError::vm("trusted remote Petal installs are not enabled on this daemon")
             })?;
             let params = json!({"path": request.path, "ref": request.requested_ref});
-            let mutation = self.petal_mutation.clone().lock_owned().await;
             return tokio::task::spawn_blocking(move || {
-                let _mutation = mutation;
                 if context.is_cancelled() {
                     return Err("Petal source install cancelled by disconnected client".to_owned());
                 }
@@ -1149,9 +1247,7 @@ impl IpcServer {
             return Err(PetalError::vm("local Petal install path must be absolute"));
         }
         let bindings_by_name = self.petal_runtime_endpoints.clone();
-        let mutation = self.petal_mutation.clone().lock_owned().await;
         tokio::task::spawn_blocking(move || {
-            let _mutation = mutation;
             if context.is_cancelled() {
                 return Err(PetalError::vm(
                     "Petal install cancelled by disconnected client",
@@ -1174,17 +1270,8 @@ impl IpcServer {
                     "Petal install cancelled by disconnected client",
                 ));
             }
-            let (result, meta, index) = runner
-                .store()
-                .install_prepared_petal_package_with_source_guarded(package, None, || {
-                    if context.is_cancelled() {
-                        Err(PetalError::vm(
-                            "Petal install cancelled by disconnected client",
-                        ))
-                    } else {
-                        Ok(())
-                    }
-                })?;
+            let (result, meta, index) =
+                context.commit_petal_package(runner.store(), package, None, None)?;
             Ok(json!({
                 "hash": result.hash,
                 "mode": "petal",
@@ -2026,7 +2113,7 @@ impl IpcClient {
                     daemon: daemon_protocol,
                 })?;
         if let Some(error) = v.get("error") {
-            debug!(%method, error = %error, "ipc.client.rpc_error");
+            debug!(%method, error_kind = "remote_rpc", "ipc.client.rpc_error");
             let error: RpcError = serde_json::from_value(error.clone())
                 .map_err(|error| IpcClientError::Protocol(error.to_string()))?;
             let machine = error
@@ -2208,8 +2295,9 @@ mod tests {
         fn install_source(
             &self,
             _params: Value,
-            _context: IpcOperationContext,
+            context: IpcOperationContext,
         ) -> Result<Value, String> {
+            let _mutation = context.petal_mutation.as_ref().unwrap().blocking_lock();
             let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
             self.max_active.fetch_max(active, Ordering::SeqCst);
             std::thread::sleep(std::time::Duration::from_millis(100));
@@ -3180,6 +3268,72 @@ summary = "Demo app used by IPC tests."
         assert!(second.error.is_none(), "{:?}", second.error);
         assert!(package.join("artifacts/routes/r000001.wasm").is_file());
         assert!(package.join("artifacts/build-manifest.json").is_file());
+    }
+
+    #[tokio::test]
+    async fn blocked_source_acquisition_does_not_block_reads_or_another_install() {
+        let dir = tempfile::tempdir().unwrap();
+        let package = dir.path().join("demo-package");
+        write_demo_petal_package(&package);
+        let store = bloom_petals::PetalStore::open(dir.path().join("store")).unwrap();
+        store.install_petal_package_dir(&package).unwrap();
+        let registry =
+            Arc::new(bloom_petals::NameRegistry::open(dir.path().join("registry")).unwrap());
+        let runner = PetalRunner::new(store, registry, bloom_petals::PetalVm::new().unwrap());
+        let installer = Arc::new(BlockingSourceInstaller {
+            started: AtomicBool::new(false),
+            cancelled: AtomicBool::new(false),
+            committed: AtomicBool::new(false),
+        });
+        let server = IpcServer::new(vfs(), "0", vec![])
+            .with_petals(runner.clone())
+            .with_petal_source_installer(installer.clone());
+        let context = IpcOperationContext::detached();
+        let remote = server.clone();
+        let remote_context = context.clone();
+        let blocked = tokio::spawn(async move {
+            remote
+                .do_petals_install(
+                    &json!({"path": "https://github.com/bloom-directory/blocked"}),
+                    remote_context,
+                )
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !installer.started.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            runner
+                .store()
+                .resolve_petal_owner("demo")
+                .unwrap()
+                .is_some()
+        );
+        let read = server
+            .dispatch(Request {
+                jsonrpc: "2.0".into(),
+                id: json!(1),
+                method: "read".into(),
+                params: json!({"path": "/stub/greet"}),
+            })
+            .await;
+        assert!(read.error.is_none());
+        let installed = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            server.do_petals_install(&json!({"path": package}), IpcOperationContext::detached()),
+        )
+        .await;
+        context.cancel();
+        assert!(blocked.await.unwrap().is_err());
+        assert!(
+            installed.is_ok(),
+            "blocked acquisition held the shared mutation lock"
+        );
+        assert!(installed.unwrap().is_ok());
     }
 
     #[tokio::test]

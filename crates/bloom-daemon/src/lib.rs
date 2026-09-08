@@ -71,7 +71,7 @@ use sha2::Digest as _;
 use thiserror::Error;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
-use tracing::{debug, info, warn};
+use tracing::{Instrument as _, debug, info, warn};
 
 const WALLET_PROJECTION_LIVE_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -226,6 +226,7 @@ struct DaemonPetalHost {
     tx_outbox: Option<PetalTxOutbox>,
     tx_stage_lock: tokio::sync::Mutex<()>,
     broker: Option<MachineBrokerClient>,
+    wallets: Option<Arc<WalletsHandler>>,
     provenance_catalog: Option<bloom_broker_api::ProvenanceCatalog>,
     petal_key_state_root: Option<PathBuf>,
     petal_key_lock: tokio::sync::Mutex<()>,
@@ -360,6 +361,7 @@ impl DaemonPetalHost {
             tx_outbox: None,
             tx_stage_lock: tokio::sync::Mutex::new(()),
             broker: None,
+            wallets: None,
             provenance_catalog: None,
             petal_key_state_root: None,
             petal_key_lock: tokio::sync::Mutex::new(()),
@@ -376,6 +378,31 @@ impl DaemonPetalHost {
     fn with_broker(mut self, broker: Option<MachineBrokerClient>) -> Self {
         self.broker = broker;
         self
+    }
+
+    fn with_wallets(mut self, wallets: Arc<WalletsHandler>) -> Self {
+        self.wallets = Some(wallets);
+        self
+    }
+
+    async fn ensure_petal_eligibility(
+        &self,
+        wallet: &str,
+        package_hash: &bloom_broker_api::Digest32,
+    ) -> Result<Option<bloom_machine_client::PendingPolicyUpdate>, HostError> {
+        let Some(wallets) = self.wallets.as_ref() else {
+            return Ok(None);
+        };
+        match wallets
+            .ensure_petal_eligibility(wallet, package_hash)
+            .await
+            .map_err(|error| HostError::Denied(error.to_string()))?
+        {
+            bloom_machine_client::PetalEligibility::Allowed(_) => Ok(None),
+            bloom_machine_client::PetalEligibility::AwaitingPolicyApproval(pending) => {
+                Ok(Some(pending))
+            }
+        }
     }
 
     fn with_provenance_catalog(
@@ -799,6 +826,7 @@ impl DaemonPetalHost {
             petal_id: format!("{PETAL_ID_PREFIX}{}", context.petal_root),
             petal_digest: context.package_hash.clone(),
             petal_version: "v1-package".into(),
+            route_id: Some(context.route_id.clone()),
         })
     }
 
@@ -1039,6 +1067,15 @@ impl PetalHost for DaemonPetalHost {
         let scope_digest = scope
             .digest()
             .map_err(|error| HostError::Invalid(error.to_string()))?;
+        if let Some(pending) = self
+            .ensure_petal_eligibility(&req.wallet_id, &scope.package_hash)
+            .await?
+        {
+            return Ok(bloom_petals::PetalKeyOutcome::Pending {
+                operation_id: pending.operation_id.as_str().to_owned(),
+                scope_digest: scope_digest.as_str().to_owned(),
+            });
+        }
         let provenance_digest = Some(
             provenance_record
                 .digest()
@@ -1511,6 +1548,19 @@ impl PetalHost for DaemonPetalHost {
         }
         let trusted_package_hash = bloom_broker_api::Digest32::new(context.package_hash.clone())
             .map_err(|error| HostError::Invalid(error.to_string()))?;
+        if let Some(pending) = self
+            .ensure_petal_eligibility(&req.wallet, &trusted_package_hash)
+            .await?
+        {
+            return Ok(SignOutcome::ApprovalPending(ApprovalPending {
+                action_id: pending.operation_id.as_str().to_owned(),
+                expires_ms: pending
+                    .prepare
+                    .as_ref()
+                    .map(|prepare| prepare.ceremony_expires_at_ms.get())
+                    .unwrap_or(0),
+            }));
+        }
         if req.selector == bloom_broker_api::PetalSignSelector::Exact {
             if req.key_ref.is_some() {
                 warn!(
@@ -1703,7 +1753,7 @@ impl PetalHost for DaemonPetalHost {
             warn!(
                 package_hash = %context.package_hash,
                 route = %context.route_id,
-                reason = %error,
+                protocol_error_code = error.code.as_str(),
                 "petal.sign_payload_denied"
             );
             HostError::Denied(format!("{}: {}", error.code.as_str(), error.message))
@@ -1818,6 +1868,19 @@ impl PetalHost for DaemonPetalHost {
             return Err(HostError::Denied(
                 "payload batch claim does not match trusted route or exact ordered payloads".into(),
             ));
+        }
+        if let Some(pending) = self
+            .ensure_petal_eligibility(&req.wallet, &trusted_package_hash)
+            .await?
+        {
+            return Ok(PayloadBatchSignOutcome::ApprovalPending(ApprovalPending {
+                action_id: pending.operation_id.as_str().to_owned(),
+                expires_ms: pending
+                    .prepare
+                    .as_ref()
+                    .map(|prepare| prepare.ceremony_expires_at_ms.get())
+                    .unwrap_or(0),
+            }));
         }
         let trusted_subject = bloom_broker_api::ProvenanceSubject::Petal {
             package_hash: trusted_package_hash,
@@ -2130,6 +2193,31 @@ impl PetalHost for DaemonPetalHost {
             return Err(HostError::Denied(
                 "outbox entry was not staged by this trusted Petal".into(),
             ));
+        }
+        let package_hash = bloom_broker_api::Digest32::new(context.package_hash.clone())
+            .map_err(|error| HostError::Invalid(error.to_string()))?;
+        if let Some(pending) = self
+            .ensure_petal_eligibility(&wallet, &package_hash)
+            .await?
+        {
+            let prepare = pending.prepare.ok_or_else(|| {
+                HostError::Denied(format!(
+                    "Petal policy approval is pending; inspect {}",
+                    pending.status_path
+                ))
+            })?;
+            return petal_outbox_outcome(
+                &service.tx_engine,
+                &wallet,
+                &chain_name,
+                &outbox_id,
+                Some(bloom_tx::ApprovalRequirement {
+                    action_id: pending.operation_id.as_str().to_owned(),
+                    ceremony_url: prepare.ceremony_url,
+                    expires_ms: prepare.ceremony_expires_at_ms.get(),
+                    reason: "wallet policy approval is required for this Petal package".into(),
+                }),
+            );
         }
         let wallet_id = bloom_broker_api::Token::new(wallet.clone())
             .map_err(|error| HostError::Invalid(format!("wallet: {error}")))?;
@@ -2558,12 +2646,83 @@ impl MachineJournalHeadProvider for MachineAuditHeadProvider {
     }
 }
 
+/// Opens Machine's authenticated audit journal and attaches it to the
+/// Machine-to-Broker client before that client can dispatch an RPC.
+pub fn attach_machine_authority_journal(
+    home: &HomeDir,
+    client: &MachineBrokerClient,
+) -> Result<Arc<AuditLog>, DaemonError> {
+    let identity = client.local_application_identity().ok_or_else(|| {
+        DaemonError::Audit(
+            "production Machine construction requires an authenticated application identity"
+                .to_owned(),
+        )
+    })?;
+    let audit_history_path = std::env::var_os("BLOOM_MACHINE_AUDIT_HISTORY")
+        .map(PathBuf::from)
+        .unwrap_or_else(default_machine_audit_history_path);
+    let (audit_history, audit_history_error) =
+        match AuditLog::load_root_trusted_history(&audit_history_path) {
+            Ok(history) => (history, None),
+            Err(error) => (
+                Vec::new(),
+                Some(format!(
+                    "packaging-pinned Machine audit history is invalid: {error}"
+                )),
+            ),
+        };
+    let audit = AuditLog::open_signed_with_history(
+        home.audit_path(),
+        AuditIdentity::new(
+            identity.service_id.as_str(),
+            identity.application_key_id.as_str(),
+            identity.signing_key,
+        ),
+        &audit_history,
+    )
+    .map_err(|error| DaemonError::Audit(error.to_string()))?;
+    if let Some(reason) = audit_history_error {
+        audit.latch_mutations(reason);
+    }
+    let audit = Arc::new(audit);
+    #[cfg(feature = "triad-dev-harness")]
+    let history_owner = if std::env::var_os("BLOOM_TRIAD_DEVELOPER_ROOT").is_some() {
+        rustix::process::geteuid().as_raw()
+    } else {
+        0
+    };
+    #[cfg(not(feature = "triad-dev-harness"))]
+    let history_owner = 0;
+    let attachment = bloom_machine_client::AuthorityEdgeHistory::load_trusted(
+        default_authority_edge_history_path(),
+        history_owner,
+    )
+    .map_err(|error| error.to_string())
+    .and_then(|history| {
+        client
+            .attach_authority_journal_with_history(
+                Arc::new(MachineAuditHeadProvider(audit.clone())),
+                default_machine_checkpoint_path(),
+                rustix::process::geteuid().as_raw(),
+                history,
+            )
+            .map_err(|error| error.to_string())
+    });
+    if let Err(error) = attachment {
+        audit.latch_mutations(format!(
+            "Machine authority-edge checkpoint/history degradation: {error}"
+        ));
+    }
+    Ok(audit)
+}
+
 #[derive(Clone)]
 struct CanonicalBatchConfirmation {
     tx_engine: TxEngine,
     home_write_permit: Arc<HomeWritePermit>,
     chains: ChainRegistry,
     wallet_projections: Arc<dyn WalletProjectionReader>,
+    wallets: Arc<WalletsHandler>,
     audit: Arc<AuditLog>,
 }
 
@@ -2611,6 +2770,7 @@ impl ipc::BatchConfirmationService for CanonicalBatchConfirmation {
                 .await
                 .map_err(|error| format!("load public wallet projection: {error}"))?;
             let mut targets = Vec::with_capacity(request.txs.len());
+            let mut unique_refs = std::collections::BTreeSet::new();
             for reference in &request.txs {
                 let (chain_name, id) = reference
                     .split_once(':')
@@ -2622,6 +2782,15 @@ impl ipc::BatchConfirmationService for CanonicalBatchConfirmation {
                         "tx ref '{reference}' must include non-empty chain and id"
                     ));
                 }
+                if !unique_refs.insert((chain_name.to_owned(), id.to_owned())) {
+                    return Err(format!(
+                        "transaction batch contains duplicate ref '{reference}'"
+                    ));
+                }
+                self.wallets
+                    .require_outbox_petal_eligibility(&request.wallet, chain_name, id)
+                    .await
+                    .map_err(|error| error.to_string())?;
                 let chain = self
                     .chains
                     .get(chain_name)
@@ -2720,7 +2889,12 @@ pub struct Daemon {
     pub home_write_permit: Option<Arc<HomeWritePermit>>,
     pub address_book: Arc<AddressBook>,
     pub audit: Arc<AuditLog>,
+    /// The single authenticated Machine→Broker edge attached to `audit`.
+    /// Command handlers must reuse this client rather than reopening the
+    /// Machine journal and creating a second, stale in-memory head.
+    pub machine_broker: Option<MachineBrokerClient>,
     pub wallet_projections: Arc<dyn WalletProjectionReader>,
+    wallets: Arc<WalletsHandler>,
     pub vfs: Vfs,
     pub petals: PetalRunner,
     pub watch_registry: Arc<WatchRegistry>,
@@ -2802,7 +2976,11 @@ fn invalidate_stale_ceremony_projections(cache_dir: &Path) -> Result<usize, Daem
             Ok(Some(state)) => state,
             Ok(None) => continue,
             Err(error) => {
-                warn!(path = %path.display(), error = %error, "petal.key_projection_unreadable");
+                let _ = error;
+                warn!(
+                    error_kind = "key_projection",
+                    "petal.key_projection_unreadable"
+                );
                 continue;
             }
         };
@@ -2834,14 +3012,22 @@ fn invalidate_stale_ceremony_projections(cache_dir: &Path) -> Result<usize, Daem
         let bytes = match std::fs::read(&path) {
             Ok(bytes) => bytes,
             Err(error) => {
-                warn!(path = %path.display(), error = %error, "petal.signing_projection_unreadable");
+                let _ = error;
+                warn!(
+                    error_kind = "signing_projection",
+                    "petal.signing_projection_unreadable"
+                );
                 continue;
             }
         };
         let projection: PetalSigningRequestProjection = match serde_json::from_slice(&bytes) {
             Ok(projection) => projection,
             Err(error) => {
-                warn!(path = %path.display(), error = %error, "petal.signing_projection_unreadable");
+                let _ = error;
+                warn!(
+                    error_kind = "signing_projection",
+                    "petal.signing_projection_unreadable"
+                );
                 continue;
             }
         };
@@ -2888,6 +3074,7 @@ impl Daemon {
             home_write_permit,
             chains: self.chains.clone(),
             wallet_projections: self.wallet_projections.clone(),
+            wallets: self.wallets.clone(),
             audit: self.audit.clone(),
         }))
     }
@@ -2978,7 +3165,10 @@ impl Daemon {
         for spec in config.chains.values() {
             match ChainClient::new(spec.clone()) {
                 Ok(c) => clients.push(c),
-                Err(e) => warn!(chain = %spec.name, error = %e, "daemon.chain_skipped"),
+                Err(error) => {
+                    let _ = error;
+                    warn!(chain = %spec.name, error_kind = "chain_configuration", "daemon.chain_skipped")
+                }
             }
         }
         let chains = ChainRegistry::default();
@@ -3147,44 +3337,28 @@ impl Daemon {
                 b
             }
             Err(e) => {
-                debug!(path = %address_book_path.display(), error = %e, "addressbook.load_failed_using_empty");
+                let _ = e;
+                debug!(
+                    error_kind = "address_book_load",
+                    "addressbook.load_failed_using_empty"
+                );
                 AddressBook::default()
             }
         };
         let address_book_arc = Arc::new(address_book.clone());
 
-        let audit_history_path = std::env::var_os("BLOOM_MACHINE_AUDIT_HISTORY")
-            .map(PathBuf::from)
-            .unwrap_or_else(default_machine_audit_history_path);
-        let (audit_history, audit_history_error) =
-            match AuditLog::load_root_trusted_history(&audit_history_path) {
-                Ok(history) => (history, None),
-                Err(error) => (
-                    Vec::new(),
-                    Some(format!(
-                        "packaging-pinned Machine audit history is invalid: {error}"
-                    )),
-                ),
-            };
-        let audit = match broker
-            .as_ref()
-            .and_then(MachineBrokerClient::local_application_identity)
-        {
-            Some(identity) => AuditLog::open_signed_with_history(
-                home.audit_path(),
-                AuditIdentity::new(
-                    identity.service_id.as_str(),
-                    identity.application_key_id.as_str(),
-                    identity.signing_key,
-                ),
-                &audit_history,
-            ),
-            None => {
+        let audit_arc = match broker.as_ref() {
+            Some(client) if client.local_application_identity().is_some() => {
+                attach_machine_authority_journal(&home, client)
+            }
+            _ => {
                 #[cfg(any(test, debug_assertions, feature = "unsigned-audit-test-seam"))]
                 {
                     // Explicit nonproduction seam. Release builds do not
                     // compile an unsigned Machine journal constructor.
                     AuditLog::open(home.audit_path())
+                        .map(Arc::new)
+                        .map_err(|error| DaemonError::Audit(error.to_string()))
                 }
                 #[cfg(not(any(test, debug_assertions, feature = "unsigned-audit-test-seam")))]
                 {
@@ -3194,44 +3368,7 @@ impl Daemon {
                     ));
                 }
             }
-        }
-        .map_err(|e| DaemonError::Audit(e.to_string()))?;
-        if let Some(reason) = audit_history_error {
-            audit.latch_mutations(reason);
-        }
-        let audit_arc = Arc::new(audit.clone());
-        if let Some(client) = broker.as_ref()
-            && client.local_application_identity().is_some()
-        {
-            #[cfg(feature = "triad-dev-harness")]
-            let history_owner = if std::env::var_os("BLOOM_TRIAD_DEVELOPER_ROOT").is_some() {
-                rustix::process::geteuid().as_raw()
-            } else {
-                0
-            };
-            #[cfg(not(feature = "triad-dev-harness"))]
-            let history_owner = 0;
-            let attachment = bloom_machine_client::AuthorityEdgeHistory::load_trusted(
-                default_authority_edge_history_path(),
-                history_owner,
-            )
-            .map_err(|error| error.to_string())
-            .and_then(|history| {
-                client
-                    .attach_authority_journal_with_history(
-                        Arc::new(MachineAuditHeadProvider(audit_arc.clone())),
-                        default_machine_checkpoint_path(),
-                        rustix::process::geteuid().as_raw(),
-                        history,
-                    )
-                    .map_err(|error| error.to_string())
-            });
-            if let Err(error) = attachment {
-                audit_arc.latch_mutations(format!(
-                    "Machine authority-edge checkpoint/history degradation: {error}"
-                ));
-            }
-        }
+        }?;
         let path_cache = Arc::new(PathCache::new());
 
         let watch_registry = Arc::new(
@@ -3251,7 +3388,11 @@ impl Daemon {
                     EtherscanClient::with_base_url(c.api_key.clone(), url)
                 }
                 Err(e) => {
-                    warn!(api_url = %c.api_url, error = %e, "daemon.etherscan_url_invalid_using_default");
+                    let _ = e;
+                    warn!(
+                        error_kind = "etherscan_configuration",
+                        "daemon.etherscan_url_invalid_using_default"
+                    );
                     EtherscanClient::new(c.api_key.clone())
                 }
             });
@@ -3293,14 +3434,16 @@ impl Daemon {
                     Ok(p) => {
                         let arc_p: Arc<dyn bloom_mempool::PrivateRpcProvider> = Arc::new(p);
                         if let Err(e) = tx_engine.register_private_rpc(chain_id, arc_p.clone()) {
-                            warn!(chain = %chain_name, error = %e, "daemon.private_rpc_register_failed");
+                            let _ = e;
+                            warn!(chain = %chain_name, error_kind = "private_rpc_registration", "daemon.private_rpc_register_failed");
                         } else {
                             debug!(chain = %chain_name, provider = "mev_blocker", "daemon.private_rpc_registered");
                             private_rpc_probes.push((chain_name.clone(), arc_p));
                         }
                     }
                     Err(e) => {
-                        warn!(chain = %chain_name, error = %e, "daemon.mev_blocker_init_failed")
+                        let _ = e;
+                        warn!(chain = %chain_name, error_kind = "private_rpc_configuration", "daemon.mev_blocker_init_failed")
                     }
                 }
             }
@@ -3309,14 +3452,16 @@ impl Daemon {
                     Ok(p) => {
                         let arc_p: Arc<dyn bloom_mempool::PrivateRpcProvider> = Arc::new(p);
                         if let Err(e) = tx_engine.register_private_rpc(chain_id, arc_p.clone()) {
-                            warn!(chain = %chain_name, error = %e, "daemon.private_rpc_register_failed");
+                            let _ = e;
+                            warn!(chain = %chain_name, error_kind = "private_rpc_registration", "daemon.private_rpc_register_failed");
                         } else {
                             debug!(chain = %chain_name, provider = "flashbots", "daemon.private_rpc_registered");
                             private_rpc_probes.push((chain_name.clone(), arc_p));
                         }
                     }
                     Err(e) => {
-                        warn!(chain = %chain_name, error = %e, "daemon.flashbots_init_failed")
+                        let _ = e;
+                        warn!(chain = %chain_name, error_kind = "private_rpc_configuration", "daemon.flashbots_init_failed")
                     }
                 }
             }
@@ -3435,6 +3580,19 @@ impl Daemon {
             })),
         );
 
+        let wallets_handler = Arc::new(
+            WalletsHandler::new(
+                chains.clone(),
+                tx_engine.clone(),
+                address_book.clone(),
+                wallet_projections.clone(),
+                home.root().join("machine-policy-projections"),
+            )
+            .with_broker(broker.clone())
+            .with_home_write_permit_opt(home_write_permit.clone())
+            .with_mempool_indexes(mempool_indexes.clone()),
+        );
+
         // Build the petals runtime: content-addressed store under
         // `~/.bloom/petals/store`, name registry under
         // `~/.bloom/petals/registry`, and a wasmtime engine. Petal
@@ -3451,6 +3609,7 @@ impl Daemon {
         let petal_vfs_host = Arc::new(LateVfsHost::new());
         let petal_app_host = DaemonPetalHost::new(petal_vfs_host.clone(), audit_arc.clone())
             .with_broker(broker.clone())
+            .with_wallets(wallets_handler.clone())
             .with_provenance_catalog(provenance_catalog.clone())
             .with_petal_key_state_root(home.cache_dir().join("petal-key-requests"))
             .with_petal_signing_state_root(home.cache_dir().join("petal-signing-requests"))
@@ -3504,20 +3663,8 @@ impl Daemon {
                 ) as _,
             );
 
-        let wallets_handler = WalletsHandler::new(
-            chains.clone(),
-            tx_engine.clone(),
-            address_book.clone(),
-            wallet_projections.clone(),
-            home.root().join("machine-policy-projections"),
-        );
-        let wallets_handler = wallets_handler
-            .with_broker(broker.clone())
-            .with_home_write_permit_opt(home_write_permit.clone())
-            .with_mempool_indexes(mempool_indexes.clone());
-
         vfs_builder = vfs_builder
-            .mount("wallets", Arc::new(wallets_handler) as _)
+            .mount("wallets", wallets_handler.clone() as _)
             .mount("tools", Arc::new(ToolsHandler::new()) as _)
             .mount(
                 "requests",
@@ -3594,7 +3741,8 @@ impl Daemon {
         // mount serve loop) always have one.
         if tokio::runtime::Handle::try_current().is_ok() {
             if let Err(e) = watch_executor.start() {
-                warn!(error = %e, "watch.executor.start_failed");
+                let _ = e;
+                warn!(error_kind = "watch_executor", "watch.executor.start_failed");
             }
         } else {
             warn!("watch.executor.skipped: no tokio runtime; call Daemon::start_workers later");
@@ -3773,7 +3921,9 @@ impl Daemon {
             home_write_permit,
             address_book: address_book_arc,
             audit: audit_arc,
+            machine_broker: broker,
             wallet_projections,
+            wallets: wallets_handler,
             vfs,
             petals,
             watch_registry,
@@ -3793,7 +3943,8 @@ impl Daemon {
     /// outside one.
     pub fn start_workers(&self) {
         if let Err(e) = self.watch_executor.start() {
-            warn!(error = %e, "watch.executor.start_failed");
+            let _ = e;
+            warn!(error_kind = "watch_executor", "watch.executor.start_failed");
         }
     }
 
@@ -3866,6 +4017,7 @@ impl Daemon {
         let audit = self.audit.clone();
         let (tx, mut rx) = watch::channel(false);
         let interval = Duration::from_secs(60);
+        let background_span = tracing::Span::current();
         let handle = tokio::spawn(async move {
             // Tick at `interval`, but exit promptly when the cancel
             // channel flips. We use `tokio::select!` so a long sleep
@@ -3882,7 +4034,10 @@ impl Daemon {
                         match run_expiry_sweep_once(&outbox, &audit, now_ms) {
                             Ok(0) => tracing::trace!("outbox.sweep_expired.empty"),
                             Ok(n) => info!(swept = n, "outbox.sweep_expired"),
-                            Err(e) => warn!(error = %e, "outbox.sweep_expired_failed"),
+                            Err(error) => {
+                                let _ = error;
+                                warn!(error_kind = "expiry_sweep", "outbox.sweep_expired_failed")
+                            },
                         }
                     }
                     _ = rx.changed() => {
@@ -3892,7 +4047,7 @@ impl Daemon {
                     }
                 }
             }
-        });
+        }.instrument(background_span));
         BackgroundTasks {
             cancel: tx,
             handle: Some(handle),
@@ -3917,6 +4072,26 @@ impl Daemon {
         path: &std::path::Path,
     ) -> Result<bloom_mount::NfsMountHandle, bloom_mount::MountError> {
         bloom_mount::serve_nfs(self.vfs.clone(), path).await
+    }
+
+    /// Mount through the installer-authorized fstab entry. This path uses a
+    /// fixed loopback listener and delegates only the exact predeclared mount
+    /// to the operating system's mount helper.
+    #[cfg(feature = "mount")]
+    pub async fn mount_from_fstab(
+        &self,
+        path: &std::path::Path,
+        nfs_listen: std::net::SocketAddr,
+    ) -> Result<bloom_mount::NfsMountHandle, bloom_mount::MountError> {
+        bloom_mount::serve_nfs_from_fstab(
+            self.vfs.clone(),
+            bloom_mount::MountConfig {
+                mount_path: path.to_path_buf(),
+                nfs_listen,
+                readonly: false,
+            },
+        )
+        .await
     }
 }
 
@@ -4026,11 +4201,20 @@ fn spawn_wallet_projection_refresh(
     projections: Arc<dyn WalletProjectionReader>,
     audit: Arc<AuditLog>,
 ) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        if let Err(error) = refresh_wallet_projections_once(projections.as_ref(), &audit).await {
-            warn!(%error, "Machine wallet projection refresh failed");
+    let background_span = tracing::Span::current();
+    tokio::spawn(
+        async move {
+            if let Err(error) = refresh_wallet_projections_once(projections.as_ref(), &audit).await
+            {
+                let _ = error;
+                warn!(
+                    error_kind = "wallet_projection_refresh",
+                    "Machine wallet projection refresh failed"
+                );
+            }
         }
-    })
+        .instrument(background_span),
+    )
 }
 
 struct WalletProjectionRefreshAudit<'a> {
@@ -4077,7 +4261,11 @@ impl Drop for WalletProjectionRefreshAudit<'_> {
             "error": "wallet projection refresh was cancelled before completion",
         });
         if let Err(error) = self.append_result(result) {
-            warn!(%error, "Machine wallet projection cancellation audit failed");
+            let _ = error;
+            warn!(
+                error_kind = "projection_cancellation_audit",
+                "Machine wallet projection cancellation audit failed"
+            );
         }
     }
 }
@@ -4252,7 +4440,11 @@ fn render_installed_petals_doc(petals: &PetalRunner) -> Vec<u8> {
     match petals.installed_petal_discovery() {
         Ok(installed) => render_petal_discovery_markdown(&installed),
         Err(error) => {
-            warn!(error = %error, "daemon.petals_docs_render_failed");
+            let _ = error;
+            warn!(
+                error_kind = "petal_docs_render",
+                "daemon.petals_docs_render_failed"
+            );
             format!(
                 "# Installed Petals\n\n\
                  Bloom could not read the installed Petal manifests: `{error}`\n"
@@ -5633,11 +5825,11 @@ mod tests {
         assert_eq!(origin.petal_id, "petal:polymarket");
         assert_eq!(origin.petal_digest, "a".repeat(64));
         assert_eq!(origin.petal_version, "v1-package");
+        assert_eq!(origin.route_id.as_deref(), Some("r000001"));
 
-        for mutate in ["route", "operation", "path"] {
+        for mutate in ["operation", "path"] {
             let mut changed = context.clone();
             match mutate {
-                "route" => changed.route_id = "r000002".into(),
                 "operation" => changed.op = "read".into(),
                 "path" => changed.path = "/fund/alice/two/confirm".into(),
                 _ => unreachable!(),
