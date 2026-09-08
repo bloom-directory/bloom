@@ -284,6 +284,7 @@ async fn derived_child_signs_transfer_and_signature_verifies() {
             approval_id: Some(digest(7)), // already-approved: sign directly
             issued_at_ms: now,
             expires_at_ms: now + 60_000,
+            approval_attempt: 0,
             canonical_plan_facts_digest: plan_facts_digest(),
         })
         .await
@@ -335,6 +336,7 @@ async fn first_attempt_returns_approval_required() {
             approval_id: None, // no approval yet: prepare the ceremony
             issued_at_ms: 1,
             expires_at_ms: 60_000,
+            approval_attempt: 0,
             canonical_plan_facts_digest: plan_facts_digest(),
         })
         .await
@@ -370,6 +372,7 @@ async fn ceremony_retry_preserves_claim_and_authority_identity() {
             approval_id: None,
             issued_at_ms: 1,
             expires_at_ms: 60_000,
+            approval_attempt: 0,
             canonical_plan_facts_digest: plan_facts_digest(),
         })
         .await
@@ -394,6 +397,7 @@ async fn ceremony_retry_preserves_claim_and_authority_identity() {
             approval_id: Some(approval_id),
             issued_at_ms: 1,
             expires_at_ms: 60_000,
+            approval_attempt: 0,
             canonical_plan_facts_digest: plan_facts_digest(),
         })
         .await

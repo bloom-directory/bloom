@@ -119,8 +119,28 @@ pub const BROADCAST_RAW_TX: &str = "raw_tx";
 pub const APPROVAL_CHALLENGE_FILE: &str = "approval_challenge.json";
 const PRIVATE_SIGNATURE_FILE: &str = ".signature";
 const PRIVATE_APPROVAL_FILE: &str = "approval.json";
+const PRIVATE_APPROVAL_ATTEMPT_FILE: &str = ".approval_attempt";
+
 const RESTAGE_RESERVATION_FILE: &str = ".restage_replacement";
 const BROADCAST_SCHEMA: &str = "bloom.solana-broadcast-attempt/1";
+
+/// One attempt to get an owner's approval for a staged transfer.
+///
+/// The Broker keys a prepared ceremony by operation id and refuses a second
+/// prepare that carries the same id with different terms. The approval window
+/// is part of those terms, so a retry has to present the window the first
+/// attempt used rather than a freshly computed one — otherwise the same
+/// transfer can never be confirmed twice.
+///
+/// `attempt` distinguishes genuinely new attempts. It is folded into the
+/// approval intent, so retiring a dead approval and starting again produces a
+/// different operation id instead of colliding with the one that just died.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct ApprovalAttempt {
+    pub attempt: u32,
+    pub issued_at_ms: u64,
+    pub expires_at_ms: u64,
+}
 
 /// Why an entry was retired in favour of a successor. An owner reads this in
 /// `restage_advice.json`, so it must state what actually happened: a transfer
@@ -332,6 +352,7 @@ impl SolanaOutbox {
         ) {
             let _ = fs::remove_file(target.join(PRIVATE_APPROVAL_FILE));
             let _ = fs::remove_file(target.join(APPROVAL_CHALLENGE_FILE));
+            let _ = fs::remove_file(target.join(PRIVATE_APPROVAL_ATTEMPT_FILE));
         }
         sync_dir(&target_parent)?;
         Ok(target)
@@ -682,6 +703,50 @@ impl SolanaOutbox {
     /// ceremony URL is never advertised after signing succeeds.
     pub fn clear_approval_challenge(&self, entry: &SolanaOutboxEntry) -> Result<(), OutboxError> {
         match fs::remove_file(entry.dir.join(APPROVAL_CHALLENGE_FILE)) {
+            Ok(()) => sync_dir(&entry.dir),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// Read the approval attempt this entry is currently on, if one is
+    /// recorded.
+    pub fn approval_attempt(
+        &self,
+        entry: &SolanaOutboxEntry,
+    ) -> Result<Option<ApprovalAttempt>, OutboxError> {
+        match fs::read(entry.dir.join(PRIVATE_APPROVAL_ATTEMPT_FILE)) {
+            Ok(bytes) => Ok(serde_json::from_slice(&bytes).ok()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// Persist the approval attempt as a private host artifact. The wallet VFS
+    /// never exposes it: it exists so a retry can present the Broker the exact
+    /// terms it presented the first time, and so a dead approval can be
+    /// retired without reusing its identity.
+    pub fn write_approval_attempt(
+        &self,
+        entry: &SolanaOutboxEntry,
+        attempt: &ApprovalAttempt,
+    ) -> Result<(), OutboxError> {
+        if entry.state != SolanaOutboxState::Pending {
+            return Err(OutboxError::StateMismatch {
+                id: entry.staged.id.clone(),
+                expected: SolanaOutboxState::Pending.dirname(),
+                actual: entry.state.dirname(),
+            });
+        }
+        let body = serde_json::to_vec(attempt)
+            .map_err(|error| OutboxError::Other(format!("encode approval attempt: {error}")))?;
+        write_private_atomic(&entry.dir.join(PRIVATE_APPROVAL_ATTEMPT_FILE), &body)
+    }
+
+    /// Forget the recorded approval attempt. The next confirm then starts a
+    /// new one with a distinct identity.
+    pub fn clear_approval_attempt(&self, entry: &SolanaOutboxEntry) -> Result<(), OutboxError> {
+        match fs::remove_file(entry.dir.join(PRIVATE_APPROVAL_ATTEMPT_FILE)) {
             Ok(()) => sync_dir(&entry.dir),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(error.into()),
