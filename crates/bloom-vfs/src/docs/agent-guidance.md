@@ -173,6 +173,24 @@ Use the challenge's `retry_path` verbatim after the owner completes its
 `ceremony_url`; verify `tx_id`, `wallet`, `chain`, amount, destination, and
 `expiry_ms` first.
 
+A native Solana transfer changes id while the owner is approving it. Its
+message embeds a blockhash that stays valid for roughly sixty seconds — less
+time than a passkey ceremony — so each confirm restages the transfer on the
+freshest blockhash, retires the previous entry to `failed`, and carries the
+owner's approval to the successor. **Do not keep confirming the id you
+staged.** When a confirm reports the entry is in `failed`, read the successor
+and continue there:
+
+```sh
+cat wallets/<wallet>/chains/<solana-chain>/outbox/pending/<id>/restage_advice.json
+# -> {"replacement_id": "sol-...", "reason": "approval_refresh" | "blockhash_expired"}
+```
+
+`reason` distinguishes a deliberate pre-signing refresh from a blockhash that
+actually expired. Follow `replacement_id` and confirm that entry; the approval
+travels with it, so no second ceremony is needed. Stopping the loop lets the
+live entry expire and the transfer is lost.
+
 Before opening the ceremony, verify that `approval_challenge.json` has the same
 `action_id` as the directory you are acting on and that `expiry_ms` is still in
 the future. Then open or forward `ceremony_url`.
