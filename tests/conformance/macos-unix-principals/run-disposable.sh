@@ -85,6 +85,13 @@ capture_failure_evidence() {
     find "$login_home/.bloom" -xdev -ls \
       > "$evidence_dir/machine-home-tree.txt" 2>&1 || true
     chmod 0644 "$evidence_dir/machine-home-tree.txt" 2>/dev/null || true
+    if [[ -d "$login_home/.bloom/logs" ]]; then
+      for service_log in "$login_home/.bloom/logs/"*.jsonl; do
+        [[ -f "$service_log" && ! -L "$service_log" ]] || continue
+        install -m 0644 "$service_log" \
+          "$evidence_dir/machine-$(basename "$service_log")" || true
+      done
+    fi
   fi
   find "/private/var/run/bloom/$login_uid" -xdev -ls \
     > "$evidence_dir/runtime-tree.txt" 2>&1 || true
