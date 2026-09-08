@@ -19,7 +19,10 @@ alone does not establish trust. The installers authenticate a private
 root-owned snapshot against a separately provisioned, root-owned,
 non-writable pin before changing services or installation state.
 
-Production macOS uses the `macos-unix-principals` claim. Tart conformance is
+Production macOS uses the `macos-unix-principals` claim for Unix account and
+filesystem separation. Its former PF network-containment boundary is retired
+to preserve Private Relay; Broker and Signer currently have no OS-enforced
+network isolation. See [migration and validation](macos-private-relay.md). Tart conformance is
 optional manual validation: `MACOS_CONFORMANCE_REPORT.json`, `.sig`, and
 `.pub` are not required release assets, signing inputs, or install prerequisites.
 The guarded `macos-unix-principals-w0` claim remains for disposable testing.

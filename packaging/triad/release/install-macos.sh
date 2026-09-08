@@ -32,9 +32,11 @@ upgrade_transaction=""
 upgrade_old_digest=""
 restore_pending=false
 legacy_cli_removed=false
+pf_cleanup_scratch=""
 
 cleanup() {
   rc=$?
+  [[ -z "$pf_cleanup_scratch" ]] || rm -rf "$pf_cleanup_scratch"
   if ((rc != 0)) && $restore_pending; then
     rollback_failed_restore || echo "automatic macOS custody-restore cleanup remains incomplete" >&2
   fi
@@ -484,14 +486,89 @@ validate_active_release_set() {
   done
 }
 
-pf_reference() {
-  op="$1"; begin="# BEGIN BLOOM TRIAD $login_uid"; end="# END BLOOM TRIAD $login_uid"
-  tmp="$(mktemp /etc/pf.conf.bloom.XXXXXX)"
-  awk -v b="$begin" -v e="$end" '$0==b{skip=1;next}$0==e{skip=0;next}!skip{print}' /etc/pf.conf >"$tmp"
-  if [[ "$op" == add ]]; then printf '\n%s\nanchor "com.bloom.triad/%s"\nload anchor "com.bloom.triad/%s" from "%s"\n%s\n' \
-    "$begin" "$login_uid" "$login_uid" "$pf_anchor" "$end" >>"$tmp"; fi
-  pfctl -nf "$tmp"; chown root:wheel "$tmp"; chmod 0644 "$tmp"; mv "$tmp" /etc/pf.conf; pfctl -f /etc/pf.conf
-  pfctl -s info 2>/dev/null | grep -F 'Status: Disabled' >/dev/null && pfctl -E >/dev/null || true
+# Retire only Bloom's legacy PF state. Empty live anchor references are left
+# until reboot: reloading the main ruleset would destroy dynamic system rules.
+# PF enabled with NO custom rules is compatible with Private Relay. Old Bloom
+# discarded its -E token, so we cannot safely release a reference or disable PF.
+cleanup_legacy_pf() {
+  local only_uid="${1:-}"
+  local conf="$root_prefix/etc/pf.conf" anchor uid loaded cleanup_dir candidate
+  mkdir -p "$root_prefix/etc"
+  cleanup_dir="$(mktemp -d "$root_prefix/etc/.bloom-pf-cleanup.XXXXXX")"
+  pf_cleanup_scratch="$cleanup_dir"
+  candidate="$cleanup_dir/pf.conf"
+  : >"$cleanup_dir/uids"
+  if [[ -e "$conf" || -L "$conf" ]]; then
+    [[ -f "$conf" && ! -L "$conf" ]] || die "unsafe PF configuration"
+    cp -p "$conf" "$candidate"
+    awk -v ids="$cleanup_dir/uids" -v only="$only_uid" '
+      /^# BEGIN BLOOM TRIAD [1-9][0-9]*$/ {
+        if (uid != "") exit 1
+        if (only != "" && $5 != only) { print; next }
+        uid=$5; line=0; print uid >> ids; next
+      }
+      uid != "" {
+        line++
+        if (line == 1 && $0 == "anchor \"com.bloom.triad/" uid "\"") next
+        if (line == 2 && $0 == "load anchor \"com.bloom.triad/" uid "\" from \"/etc/pf.anchors/com.bloom.triad." uid "\"") next
+        if (line == 3 && $0 == "# END BLOOM TRIAD " uid) { uid=""; next }
+        exit 1
+      }
+      { print }
+      END { if (uid != "") exit 1 }
+    ' "$conf" >"$cleanup_dir/stripped" || die "malformed Bloom PF block; configuration left unchanged"
+    cat "$cleanup_dir/stripped" >"$candidate"
+  fi
+  for anchor in "$root_prefix"/etc/pf.anchors/com.bloom.triad.*; do
+    [[ -e "$anchor" || -L "$anchor" ]] || continue
+    uid="${anchor##*.}"; [[ "$uid" =~ ^[1-9][0-9]*$ ]] || continue
+    [[ -z "$only_uid" || "$uid" == "$only_uid" ]] || continue
+    [[ -f "$anchor" && ! -L "$anchor" ]] || die "unsafe legacy Bloom PF anchor"
+    printf '%s\n' "$uid" >>"$cleanup_dir/uids"
+  done
+  if $live; then
+    loaded="$(pfctl -s Anchors)" || die "cannot enumerate PF anchors"
+    if grep -Eq '^[[:space:]]*com[.]bloom[.]triad$' <<<"$loaded"; then
+      loaded="$(pfctl -a com.bloom.triad -s Anchors)" || die "cannot enumerate legacy Bloom PF anchors"
+    else
+      loaded=""
+    fi
+    while IFS= read -r uid; do
+      uid="${uid#"${uid%%[![:space:]]*}"}"
+      [[ -z "$uid" ]] && continue
+      uid="${uid#com.bloom.triad/}"
+      [[ "$uid" =~ ^[1-9][0-9]*$ ]] || die "unexpected anchor in Bloom PF namespace"
+      [[ -z "$only_uid" || "$uid" == "$only_uid" ]] || continue
+      printf '%s\n' "$uid" >>"$cleanup_dir/uids"
+    done <<<"$loaded"
+  fi
+  LC_ALL=C sort -u "$cleanup_dir/uids" >"$cleanup_dir/unique"
+  while IFS= read -r uid; do
+    if $live; then
+      pfctl -a "com.bloom.triad/$uid" -F rules || die "cannot clear legacy Bloom PF rules"
+    fi
+  done <"$cleanup_dir/unique"
+  if [[ -f "$candidate" ]] && ! cmp -s "$conf" "$candidate"; then
+    # Same-directory atomic replacement, preserving the original permissions.
+    local replacement
+    replacement="$(mktemp "$conf.bloom.XXXXXX")"
+    cp -p "$candidate" "$replacement"; mv -f "$replacement" "$conf"
+  fi
+  while IFS= read -r uid; do
+    rm -f "$root_prefix/etc/pf.anchors/com.bloom.triad.$uid"
+  done <"$cleanup_dir/unique"
+  rm -rf "$cleanup_dir"; pf_cleanup_scratch=""
+}
+
+# The shipped Broker/Signer support an absent optional network guard. Keep
+# custody and identity fields intact; never fabricate a healthy PF attestation.
+disable_legacy_network_guard() {
+  $live || return 0
+  local service_config
+  for service_config in "$broker_config/config.json" "$signer_config/config.json"; do
+    [[ -f "$service_config" && ! -L "$service_config" ]] || die "unsafe service configuration"
+    plutil -replace network_containment -json null "$service_config" || die "cannot retire legacy network guard"
+  done
 }
 
 rollback_failed_restore() {
@@ -499,7 +576,6 @@ rollback_failed_restore() {
     for label in "gui/$login_uid/com.bloom.machine" "user/$login_uid/com.bloom.machine" "system/com.bloom.broker.$login_uid" "system/com.bloom.signer.$login_uid" "gui/$login_uid/com.bloom.session" "user/$login_uid/com.bloom.session"; do
       launchctl bootout "$label" 2>/dev/null || true
     done
-    pf_reference remove || return 1
   fi
   rm -f "$broker_plist" "$signer_plist" "$pf_anchor" "$newsyslog_config" "$enrollments/$login_uid.json"
   rm -rf "$runtime" "$log_root"
@@ -508,7 +584,7 @@ rollback_failed_restore() {
 }
 rollback_failed_fresh() {
   for label in "gui/$login_uid/com.bloom.machine" "user/$login_uid/com.bloom.machine" "system/com.bloom.broker.$login_uid" "system/com.bloom.signer.$login_uid" "gui/$login_uid/com.bloom.session" "user/$login_uid/com.bloom.session"; do launchctl bootout "$label" 2>/dev/null || true; done
-  pf_reference remove || true; rm -f "$broker_plist" "$signer_plist" "$pf_anchor" "$newsyslog_config" "$enrollment"
+  rm -f "$broker_plist" "$signer_plist" "$pf_anchor" "$newsyslog_config" "$enrollment"
   rm -rf "$config" "$variable/db/bloom/$login_uid" "$runtime" "$log_root"
   has_active_enrollments || { launchctl bootout system/com.bloom.containment 2>/dev/null || true; rm -f "$containment_plist" "$session_plist" "$machine_plist"; remove_cli_link; }
 }
@@ -681,7 +757,6 @@ install_assets() {
   render "$base/launchdaemons/com.bloom.containment.plist.in" "$containment_plist" 0644
   render "$base/launchagents/com.bloom.session.plist.in" "$session_plist" 0644
   render "$base/launchagents/com.bloom.machine.plist.in" "$machine_plist" 0644
-  render "$base/pf/com.bloom.login.conf.in" "$pf_anchor" 0600
   mkdir -p "$(dirname "$newsyslog_config")"
   newsyslog_tmp="$newsyslog_config.new.$$"
   printf '%s %s:%s 640 5 1024 * BN\n%s %s:%s 640 5 1024 * BN\n%s %s:%s 640 2 128 * BN\n%s %s:%s 640 2 128 * BN\n' \
@@ -692,7 +767,7 @@ install_assets() {
 
 secure_ownership() {
   chown -R root:wheel "$release_base"
-  chown root:wheel "$product" "$enrollments" "$config" "$broker_plist" "$signer_plist" "$containment_plist" "$session_plist" "$machine_plist" "$pf_anchor" "$newsyslog_config"
+  chown root:wheel "$product" "$enrollments" "$config" "$broker_plist" "$signer_plist" "$containment_plist" "$session_plist" "$machine_plist" "$newsyslog_config"
   chown -R "$broker_user:$broker_group" "$broker_config" "$broker_state"
   chown -R "$signer_user:$signer_group" "$signer_config" "$signer_state"
   chown -R "$login_user:$machine_broker_group" "$machine_config" "$machine_state"
@@ -736,10 +811,10 @@ require_triad_health() {
   launchctl asuser "$uid" /usr/bin/sudo -u "$user" -H "$release_base/current/bloom" --home "$home/.bloom" serve triad-health-check "$digest"
 }
 reload_current_enrollment() {
-  plutil -lint "$broker_plist" "$signer_plist" "$containment_plist" "$session_plist" "$machine_plist" >/dev/null; pfctl -nf "$pf_anchor"
+  plutil -lint "$broker_plist" "$signer_plist" "$containment_plist" "$session_plist" "$machine_plist" >/dev/null
   reload_launchd_job system com.bloom.containment "$containment_plist"
   "$machine_binary" serve triad-pf-monitor-once 2>/dev/null ||
-    echo "Bloom installed, but containment readiness is deferred" >&2
+    echo "Bloom installed, but session lifecycle refresh is deferred" >&2
   reload_launchagent_job "$login_uid" com.bloom.session "$session_plist"
   reload_launchd_job system "com.bloom.signer.$login_uid" "$signer_plist"
   reload_launchd_job system "com.bloom.broker.$login_uid" "$broker_plist"
@@ -789,6 +864,7 @@ rewrite_all_enrollments() {
       plutil -replace build_digest -string "$digest" "$signer_config/config.json"
     fi
     install_config
+    disable_legacy_network_guard
     install_assets
   done
   if $live; then
@@ -805,7 +881,7 @@ reload_installed_set() {
   local record uid; $live || return 0
   reload_launchd_job system com.bloom.containment "$containment_plist" || return 1
   "$release_base/current/bloom" serve triad-pf-monitor-once 2>/dev/null ||
-    echo "Bloom installed, but containment readiness is deferred" >&2
+    echo "Bloom installed, but session lifecycle refresh is deferred" >&2
   for record in "$enrollments"/*.json; do
     [[ -f "$record" && ! -L "$record" ]] || continue
     uid="${record##*/}"; uid="${uid%.json}"
@@ -850,9 +926,9 @@ snapshot_macos_upgrade_state() {
     paths+=(
       "Library/LaunchDaemons/com.bloom.broker.$uid.plist"
       "Library/LaunchDaemons/com.bloom.signer.$uid.plist"
-      "etc/pf.anchors/com.bloom.triad.$uid"
       "etc/newsyslog.d/bloom-$uid.conf"
     )
+    [[ ! -f "$root_prefix/etc/pf.anchors/com.bloom.triad.$uid" ]] || paths+=("etc/pf.anchors/com.bloom.triad.$uid")
   done
   (cd "${root_prefix:-/}" && tar -cpf "$scratch" "${paths[@]}")
   tar -tf "$scratch" >/dev/null
@@ -961,6 +1037,7 @@ case "$action" in
       login_uid="$requested_uid"; login_user="$requested_user"; load_names; paths; load_ids
       remove_legacy_cli || die "Bloom is healthy, but legacy CLI cleanup failed; remove ~/.local/bin/bloom and retry"
       report_legacy_wallet_migrations
+      cleanup_legacy_pf
       echo "Bloom macOS release upgraded atomically"
       exit 0
     fi
@@ -969,15 +1046,17 @@ case "$action" in
       login_uid="$requested_uid"; login_user="$requested_user"; load_names; paths; load_ids
       remove_legacy_cli || die "Bloom is healthy, but legacy CLI cleanup failed; remove ~/.local/bin/bloom and retry"
       report_legacy_wallet_migrations
+      cleanup_legacy_pf
       echo "Bloom macOS release upgraded atomically"
       exit 0
     fi
-    switch_release "$BLOOM_RELEASE_DIGEST"; install_config; write_enrollment activating; install_assets
+    switch_release "$BLOOM_RELEASE_DIGEST"; install_config; disable_legacy_network_guard; write_enrollment activating; install_assets
     if $live; then
-      secure_ownership; pf_reference add; reload_current_enrollment || { $fresh && rollback_failed_fresh; die "Bloom failed authenticated activation"; }
+      secure_ownership; reload_current_enrollment || { $fresh && rollback_failed_fresh; die "Bloom failed authenticated activation"; }
       activate_current_enrollment || { $fresh && rollback_failed_fresh; die "Bloom failed full activation"; }
       created_users=""; created_groups=""
     fi
+    cleanup_legacy_pf
     install_cli_link
     write_state_schema
     if $restoring; then rm -f "$retained"; restore_pending=false; fi
@@ -997,8 +1076,8 @@ case "$action" in
     enrollment="$record"; login_user="$(field "$record" login_user)"; BLOOM_RELEASE_DIGEST="$(field "$record" release_digest)"; load_ids
     if $live; then
       for label in "gui/$login_uid/com.bloom.machine" "user/$login_uid/com.bloom.machine" "system/com.bloom.broker.$login_uid" "system/com.bloom.signer.$login_uid" "gui/$login_uid/com.bloom.session" "user/$login_uid/com.bloom.session"; do stop_launchd_job "$label"; done
-      pf_reference remove
     fi
+    cleanup_legacy_pf "$login_uid"
     rm -f "$broker_plist" "$signer_plist" "$pf_anchor" "$newsyslog_config"
     if $retain; then
       mkdir -p "$product/retained"; enrollment="$retained"; write_enrollment retained

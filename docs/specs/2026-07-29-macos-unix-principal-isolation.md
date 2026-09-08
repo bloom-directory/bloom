@@ -1,5 +1,10 @@
 # macOS Unix-principal isolation profile
 
+> September 2026 amendment: the PF network-containment portions of this original
+> profile are retired to preserve iCloud Private Relay. The current release
+> retains Unix principal separation but does not satisfy the original MUI-07
+> network boundary. See [the current contract and follow-up plan](../operations/macos-private-relay.md).
+
 **Status:** Proposed implementation profile
 
 **Applies to:** Bloom triad architecture, local macOS placement
