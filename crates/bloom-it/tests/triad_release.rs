@@ -607,7 +607,8 @@ fn triad_developer_launcher_supports_linux_without_weakening_root_boundary() {
     assert!(launcher.contains("export LC_ALL=C"));
     assert!(launcher.contains("Linux developer systemd user unit directory is unsafe"));
     assert!(launcher.contains("Linux developer systemd unit paths may contain only ASCII"));
-    assert!(launcher.contains("printf 'FileDescriptorName=%s\\n' \"$descriptor\""));
+    assert!(launcher.contains("printf 'FileDescriptorName=%s\\n' \"$ipv4_descriptor\""));
+    assert!(launcher.contains("printf 'FileDescriptorName=%s\\n' \"$ipv6_descriptor\""));
     assert!(!launcher.contains("signer_socket_unit"));
     assert!(!launcher.contains("BLOOM_SIGNER_ACTIVATION_NAME"));
     assert!(!launcher.contains("BLOOM_SIGNER_CONTROL_ACTIVATION_NAME"));
@@ -620,8 +621,10 @@ fn triad_developer_launcher_supports_linux_without_weakening_root_boundary() {
     assert!(launcher.contains("\"BLOOM_BROKER_SOCKET=$broker_socket\""));
     assert!(launcher.contains("\"BLOOM_BROKER_CONTROL_SOCKET=$broker_control_socket\""));
     assert!(launcher.contains("broker_ceremony_socket_unit"));
-    assert!(launcher.contains("'127.0.0.1:18734' broker-ceremony"));
-    assert!(launcher.contains("BLOOM_BROKER_CEREMONY_ACTIVATION_NAME=broker-ceremony"));
+    assert!(launcher.contains("'127.0.0.1:18734' '[::1]:18734'"));
+    assert!(launcher.contains("broker-ceremony-ipv4 broker-ceremony-ipv6"));
+    assert!(launcher.contains("BLOOM_BROKER_CEREMONY_ACTIVATION_NAME_IPV4=broker-ceremony-ipv4"));
+    assert!(launcher.contains("BLOOM_BROKER_CEREMONY_ACTIVATION_NAME_IPV6=broker-ceremony-ipv6"));
     assert_eq!(
         launcher
             .matches("\"BLOOM_AUTHORITY_EDGE_HISTORY=$authority_edge_history\"")

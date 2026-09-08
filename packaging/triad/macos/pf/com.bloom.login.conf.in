@@ -7,5 +7,8 @@
 pass out quick on lo0 inet proto tcp \
   from 127.0.0.1 port 18734 to 127.0.0.1 \
   flags A/A user @BLOOM_BROKER_UID@
+pass out quick on lo0 inet6 proto tcp \
+  from ::1 port 18734 to ::1 \
+  flags A/A user @BLOOM_BROKER_UID@
 block return out quick proto { tcp, udp } all user @BLOOM_SIGNER_UID@
 block return out quick proto { tcp, udp } all user @BLOOM_BROKER_UID@

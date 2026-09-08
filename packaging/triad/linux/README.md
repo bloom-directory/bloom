@@ -18,8 +18,12 @@ It grants no access to either data-plane socket.
 
 Broker and Signer own their four authenticated Unix sockets so Linux
 `SO_PEERCRED` reports the actual security-service UID in both directions.
-Systemd owns only the canonical `127.0.0.1:18734` ceremony listener, where Unix
-peer credentials are unavailable, and passes that TCP listener to Broker. The
+Systemd owns only the canonical ceremony listeners, where Unix peer credentials
+are unavailable, and passes them to Broker. Both loopback families are published
+on port 18734 — `127.0.0.1` as `broker-ceremony-ipv4` and `[::1]` as
+`broker-ceremony-ipv6` — because Chromium resolves `localhost` to `::1` before
+`127.0.0.1`, so an IPv4-only listener leaves the canonical origin unreachable
+about half the time. Broker takes each by name and never binds one itself. The
 authenticated login-session sentinel owns its Unix socket while the user's
 systemd session is active. A path unit starts Broker and Signer only after that
 session socket exists. A canonical-listener conflict therefore fails the

@@ -27,9 +27,12 @@ connecting peer on macOS, which cannot satisfy the protocol's mutual kernel
 peer-UID check. It does not fall back from failed launchd activation or create
 endpoints outside the signed profile.
 
-Broker owns the canonical ceremony listener by direct exclusive bind to
-`127.0.0.1:18734`. The LaunchDaemon does not declare or pre-bind that TCP
-socket. A conflict is fatal, reported, retried by failure-only `KeepAlive`, and
+Broker owns the canonical ceremony listeners by direct exclusive bind to
+`127.0.0.1:18734` and `[::1]:18734`. Both families are required because Chromium
+resolves `localhost` to `::1` before `127.0.0.1`. The packet-filter containment
+rules pass listener replies from each family's own loopback address; an IPv4-only
+rule would let IPv6 replies fall through to the deny. The LaunchDaemon does not
+declare or pre-bind either TCP socket. A conflict is fatal, reported, retried by failure-only `KeepAlive`, and
 never selects a fallback address or port. Before exiting, Broker atomically
 writes a Broker-owned, Machine-readable `broker-startup.json`. Machine accepts
 only its exact owner, group, mode, schema, address, incident, and message, so a

@@ -454,12 +454,19 @@ supervise_services() {
   done
 }
 
-write_linux_socket_unit() {
-  unit="$1"; description="$2"; path="$3"; descriptor="$4"; service="$5"
+# Build a socket unit that owns BOTH canonical loopback ceremony listeners
+# on the canonical port. systemd passes one service invocation both fds,
+# keyed by the names that match `FileDescriptorName=`. The Broker consumes
+# each by name and refuses anything not on the canonical loopback pair.
+write_linux_loopback_socket_unit() {
+  unit="$1"; description="$2"; ipv4_path="$3"; ipv6_path="$4"
+  ipv4_descriptor="$5"; ipv6_descriptor="$6"; service="$7"
   {
     printf '%s\n' '[Unit]' "Description=$description" '' '[Socket]'
-    printf 'ListenStream=%s\n' "$path"
-    printf 'FileDescriptorName=%s\n' "$descriptor"
+    printf 'ListenStream=%s\n' "$ipv4_path"
+    printf 'FileDescriptorName=%s\n' "$ipv4_descriptor"
+    printf 'ListenStream=%s\n' "$ipv6_path"
+    printf 'FileDescriptorName=%s\n' "$ipv6_descriptor"
     printf 'Service=%s\n' "$service"
     printf '%s\n' 'SocketMode=0600' 'DirectoryMode=0700' 'RemoveOnStop=yes' 'Accept=no'
   } > "${user_unit_dir}/${unit}"
@@ -470,8 +477,10 @@ start_linux_authority_services() {
   # Mark ownership before the first write so the EXIT trap removes even a
   # partially rendered unit set.
   systemd_units_installed=1
-  write_linux_socket_unit "$broker_ceremony_socket_unit" \
-    'Bloom developer Broker ceremony listener' '127.0.0.1:18734' broker-ceremony "$broker_service_unit"
+  write_linux_loopback_socket_unit "$broker_ceremony_socket_unit" \
+    'Bloom developer Broker ceremony listener' \
+    '127.0.0.1:18734' '[::1]:18734' \
+    broker-ceremony-ipv4 broker-ceremony-ipv6 "$broker_service_unit"
 
   : > "${log_dir}/signer.log"
   {
@@ -512,7 +521,8 @@ start_linux_authority_services() {
       "BLOOM_SESSION_SOCKET=$session_socket" \
       "BLOOM_BROKER_SOCKET=$broker_socket" \
       "BLOOM_BROKER_CONTROL_SOCKET=$broker_control_socket" \
-      'BLOOM_BROKER_CEREMONY_ACTIVATION_NAME=broker-ceremony'
+      'BLOOM_BROKER_CEREMONY_ACTIVATION_NAME_IPV4=broker-ceremony-ipv4' \
+      'BLOOM_BROKER_CEREMONY_ACTIVATION_NAME_IPV6=broker-ceremony-ipv6'
     printf 'Sockets=%s\n' "$broker_ceremony_socket_unit"
   } > "${user_unit_dir}/${broker_service_unit}"
   chmod 0600 "${user_unit_dir}/${broker_service_unit}"
