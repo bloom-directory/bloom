@@ -2205,7 +2205,7 @@ dependencies = [
  "bloom-rpc-wire",
  "serde",
  "serde_jcs",
- "sha2 0.10.9",
+ "sha2 0.11.0",
 ]
 
 [[package]]
@@ -2637,10 +2637,10 @@ dependencies = [
  "bip39",
  "ed25519-dalek",
  "hex",
- "hmac 0.12.1",
+ "hmac 0.13.0",
  "k256",
- "rand 0.8.6",
- "sha2 0.10.9",
+ "rand 0.10.2",
+ "sha2 0.11.0",
  "thiserror 2.0.18",
  "unicode-normalization",
  "zeroize",
