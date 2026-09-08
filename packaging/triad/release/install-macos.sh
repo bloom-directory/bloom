@@ -809,7 +809,9 @@ require_triad_health() {
   local uid="$1" user="$2" digest="$3" home attempt
   home="$(dscl . -read "/Users/$user" NFSHomeDirectory | awk 'NR==1{sub(/^NFSHomeDirectory:[[:space:]]*/,"");print}')"
   [[ "$home" == /* && -d "$home" ]] || { echo "cannot resolve home for $user" >&2; return 1; }
-  for ((attempt=0; attempt<20; attempt++)); do launchctl asuser "$uid" /usr/bin/sudo -u "$user" -H "$release_base/current/bloom" --home "$home/.bloom" serve triad-health-check "$digest" >/dev/null 2>&1 && return 0; sleep 0.5; done
+  # Full Machine startup can warm RPC/cache state well beyond ten seconds.
+  # Keep activation bounded while allowing a cold installed home to become ready.
+  for ((attempt=0; attempt<240; attempt++)); do launchctl asuser "$uid" /usr/bin/sudo -u "$user" -H "$release_base/current/bloom" --home "$home/.bloom" serve triad-health-check "$digest" >/dev/null 2>&1 && return 0; sleep 0.5; done
   launchctl asuser "$uid" /usr/bin/sudo -u "$user" -H "$release_base/current/bloom" --home "$home/.bloom" serve triad-health-check "$digest"
 }
 reload_current_enrollment() {
@@ -912,7 +914,8 @@ activate_installed_set() {
 }
 
 snapshot_macos_upgrade_state() {
-  local archive scratch record uid
+  local archive scratch record uid etc_relative=etc
+  $live && etc_relative=private/etc
   archive="$upgrade_transaction/rollback-state.tar"
   scratch="$archive.new.$$"
   local -a paths=(
@@ -928,9 +931,9 @@ snapshot_macos_upgrade_state() {
     paths+=(
       "Library/LaunchDaemons/com.bloom.broker.$uid.plist"
       "Library/LaunchDaemons/com.bloom.signer.$uid.plist"
-      "etc/newsyslog.d/bloom-$uid.conf"
+      "$etc_relative/newsyslog.d/bloom-$uid.conf"
     )
-    [[ ! -f "$root_prefix/etc/pf.anchors/com.bloom.triad.$uid" ]] || paths+=("etc/pf.anchors/com.bloom.triad.$uid")
+    [[ ! -f "$root_prefix/etc/pf.anchors/com.bloom.triad.$uid" ]] || paths+=("$etc_relative/pf.anchors/com.bloom.triad.$uid")
   done
   (cd "${root_prefix:-/}" && tar -cpf "$scratch" "${paths[@]}")
   tar -tf "$scratch" >/dev/null
@@ -944,7 +947,26 @@ snapshot_macos_upgrade_state() {
 restore_macos_upgrade_state() {
   local archive="$upgrade_transaction/rollback-state.tar"
   [[ -f "$archive" && ! -L "$archive" ]] || die "macOS upgrade rollback state is missing or unsafe"
-  (cd "${root_prefix:-/}" && tar -xpf "$archive")
+  if $live; then
+    # Historical snapshots use etc/... although /etc is a symlink on macOS.
+    # Do not enable tar's global symlink-traversal override. Restore those exact
+    # legacy entries via /private; new snapshots already use private/etc/....
+    local entry listing
+    local -a legacy_etc=()
+    listing="$(tar -tf "$archive")" || die "cannot list rollback archive"
+    while IFS= read -r entry; do
+      [[ "$entry" == etc/* ]] || continue
+      [[ "$entry" =~ ^etc/(newsyslog\.d/bloom-[1-9][0-9]*\.conf|pf\.anchors/com\.bloom\.triad\.[1-9][0-9]*)$ ]] ||
+        die "unexpected legacy etc entry in rollback archive"
+      legacy_etc+=("$entry")
+    done <<<"$listing"
+    (cd "${root_prefix:-/}" && tar -xpf "$archive" --exclude 'etc/*')
+    if ((${#legacy_etc[@]})); then
+      (cd "$root_prefix/private" && tar -xpf "$archive" "${legacy_etc[@]}")
+    fi
+  else
+    (cd "$root_prefix" && tar -xpf "$archive")
+  fi
 }
 
 find_interrupted_upgrade() {

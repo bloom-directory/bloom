@@ -583,3 +583,12 @@ fn macos_pf_retirement_preserves_foreign_rules_and_migrates_legacy_guards() {
         .expect("run isolated macOS PF retirement regression");
     assert!(status.success());
 }
+
+#[test]
+fn macos_upgrade_rollback_handles_the_system_etc_symlink() {
+    let status = Command::new("bash")
+        .arg(workspace().join("tests/packaging/macos-upgrade-rollback.sh"))
+        .status()
+        .expect("run macOS rollback archive regression");
+    assert!(status.success());
+}
