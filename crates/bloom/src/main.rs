@@ -950,6 +950,7 @@ fn machine_command_event_fields(
                 MachineCustodyKind::New => "wallet_registration",
                 MachineCustodyKind::Import => "wallet_import",
                 MachineCustodyKind::Rebind => "credential_rebind",
+                MachineCustodyKind::Export => "wallet_export",
                 MachineCustodyKind::Delete => "wallet_delete",
             },
             None,
