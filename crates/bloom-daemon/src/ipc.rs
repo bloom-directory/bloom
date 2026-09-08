@@ -596,6 +596,7 @@ pub enum MachineCustodyKind {
     Import,
     ImportRawPrivateKey,
     Rebind,
+    Export,
     Delete,
 }
 

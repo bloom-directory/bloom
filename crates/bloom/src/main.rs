@@ -1645,6 +1645,12 @@ async fn execute_machine_command(
                         Some(bloom_broker_api::Token::new(name.clone())?),
                         CustodyInputShape::Named("credential-prf"),
                     ),
+                    MachineCustodyKind::Export => (
+                        bloom_machine_client::CustodyPrepareMethod::WalletExport,
+                        bloom_broker_api::CeremonyKind::WalletExport,
+                        Some(bloom_broker_api::Token::new(name.clone())?),
+                        CustodyInputShape::Named("none"),
+                    ),
                     MachineCustodyKind::Delete => (
                         bloom_machine_client::CustodyPrepareMethod::WalletDelete,
                         bloom_broker_api::CeremonyKind::WalletDelete,
