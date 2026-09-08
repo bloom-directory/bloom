@@ -17,8 +17,15 @@ fn source(relative: &str) -> String {
 fn systemd_owns_only_the_tcp_listener_and_services_own_authenticated_unix_sockets() {
     let ceremony = source("systemd/bloom-broker-ceremony@.socket");
     for required in [
+        // Both canonical loopback families, each named. Chromium resolves
+        // `localhost` to ::1 before 127.0.0.1, and the Broker takes each
+        // listener by name and refuses to bind one itself, so a unit that
+        // publishes only IPv4 — or names it `broker-ceremony` — leaves the
+        // service unable to start.
         "ListenStream=127.0.0.1:18734",
-        "FileDescriptorName=broker-ceremony",
+        "FileDescriptorName=broker-ceremony-ipv4",
+        "ListenStream=[::1]:18734",
+        "FileDescriptorName=broker-ceremony-ipv6",
         "Service=bloom-broker@%i.service",
         "Accept=no",
         "FreeBind=no",
@@ -32,10 +39,22 @@ fn systemd_owns_only_the_tcp_listener_and_services_own_authenticated_unix_socket
         );
     }
     assert!(!ceremony.contains("18735") && !ceremony.contains("Accept=yes"));
+    // The single-descriptor spelling must not survive: it is a prefix of the
+    // IPv4 name, so a substring check alone would not catch a regression.
+    assert!(
+        !ceremony
+            .lines()
+            .any(|line| line.trim() == "FileDescriptorName=broker-ceremony"),
+        "the unnamed single-family descriptor must not be published"
+    );
 
     let broker = source("systemd/bloom-broker@.service.in");
     let signer = source("systemd/bloom-signer@.service.in");
     for required in [
+        // The names must match the socket unit's descriptors exactly; the
+        // Broker looks each up and fails startup when either is absent.
+        "Environment=BLOOM_BROKER_CEREMONY_ACTIVATION_NAME_IPV4=broker-ceremony-ipv4",
+        "Environment=BLOOM_BROKER_CEREMONY_ACTIVATION_NAME_IPV6=broker-ceremony-ipv6",
         "Environment=BLOOM_BROKER_SOCKET=/run/bloom/%i/broker/rpc/broker.sock",
         "Environment=BLOOM_BROKER_CONTROL_SOCKET=/run/bloom/%i/broker/control/broker-control.sock",
     ] {

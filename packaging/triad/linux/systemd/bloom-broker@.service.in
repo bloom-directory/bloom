@@ -20,7 +20,8 @@ Environment=BLOOM_SESSION_SOCKET=/run/bloom/%i/session/session.sock
 Environment=BLOOM_BROKER_SOCKET=/run/bloom/%i/broker/rpc/broker.sock
 Environment=BLOOM_BROKER_CONTROL_SOCKET=/run/bloom/%i/broker/control/broker-control.sock
 Environment=BLOOM_BROKER_AUDIT_CHECKPOINT_DIR=/var/lib/bloom/%i/broker/audit-checkpoints
-Environment=BLOOM_BROKER_CEREMONY_ACTIVATION_NAME=broker-ceremony
+Environment=BLOOM_BROKER_CEREMONY_ACTIVATION_NAME_IPV4=broker-ceremony-ipv4
+Environment=BLOOM_BROKER_CEREMONY_ACTIVATION_NAME_IPV6=broker-ceremony-ipv6
 LoadCredential=kernel-boot-id:/proc/sys/kernel/random/boot_id
 Sockets=bloom-broker-ceremony@%i.socket
 Restart=on-failure
