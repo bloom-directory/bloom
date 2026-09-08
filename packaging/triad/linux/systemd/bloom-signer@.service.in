@@ -1,6 +1,5 @@
 [Unit]
 Description=Bloom Signer for login UID %i
-Requires=bloom-signer-rpc@%i.socket bloom-signer-control@%i.socket
 
 [Service]
 Type=simple
@@ -8,14 +7,18 @@ User=bloom-signer-%i
 Group=bloom-signer-%i
 UMask=0077
 ExecStart=@BLOOM_SIGNER_BINARY@
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=bloom-signer-%i
 Environment=BLOOM_SIGNER_IDENTITY=/etc/bloom/%i/signer/identity.json
 Environment=BLOOM_SIGNER_CONFIG=/etc/bloom/%i/signer/config.json
 Environment=BLOOM_EDGE_MANIFEST=/etc/bloom/%i/edge-manifest.json
 Environment=BLOOM_AUTHORITY_EDGE_HISTORY=/etc/bloom/%i/authority-edge-history.json
+Environment=BLOOM_SESSION_SOCKET=/run/bloom/%i/session/session.sock
+Environment=BLOOM_SIGNER_SOCKET=/run/bloom/%i/signer/rpc/signer.sock
+Environment=BLOOM_SIGNER_CONTROL_SOCKET=/run/bloom/%i/signer/control/signer-control.sock
 Environment=BLOOM_SIGNER_AUDIT_CHECKPOINT_DIR=/var/lib/bloom/%i/signer/audit-checkpoints
-Environment=BLOOM_SIGNER_ACTIVATION_NAME=signer
-Environment=BLOOM_SIGNER_CONTROL_ACTIVATION_NAME=signer-control
-Sockets=bloom-signer-rpc@%i.socket bloom-signer-control@%i.socket
+LoadCredential=kernel-boot-id:/proc/sys/kernel/random/boot_id
 Restart=on-failure
 RestartSec=5s
 TimeoutStopSec=30s
@@ -43,7 +46,7 @@ AmbientCapabilities=
 LimitCORE=0
 RestrictAddressFamilies=AF_UNIX
 IPAddressDeny=any
-ReadWritePaths=/var/lib/bloom/%i/signer
+ReadWritePaths=/var/lib/bloom/%i/signer /run/bloom/%i/signer
 
 [Install]
 WantedBy=multi-user.target

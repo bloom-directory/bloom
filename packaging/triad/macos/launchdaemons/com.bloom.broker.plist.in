@@ -40,6 +40,12 @@
     <string>@BLOOM_SESSION_SOCKET@</string>
     <key>BLOOM_BROKER_STARTUP_STATUS</key>
     <string>@BLOOM_BROKER_STARTUP_STATUS@</string>
+    <key>BLOOM_BROKER_LOG_PATH</key>
+    <string>@BLOOM_BROKER_LOG_PATH@</string>
+    <key>BLOOM_BROKER_LOG_OWNER_UID</key>
+    <string>@BLOOM_BROKER_UID@</string>
+    <key>BLOOM_BROKER_LOG_READER_GID</key>
+    <string>@BLOOM_LOG_READER_GID@</string>
   </dict>
 
   <key>KeepAlive</key>
@@ -72,8 +78,8 @@
     <integer>64</integer>
   </dict>
   <key>StandardOutPath</key>
-  <string>@BLOOM_BROKER_LOG@</string>
+  <string>/dev/null</string>
   <key>StandardErrorPath</key>
-  <string>@BLOOM_BROKER_LOG@</string>
+  <string>@BLOOM_BROKER_BOOTSTRAP_LOG@</string>
 </dict>
 </plist>

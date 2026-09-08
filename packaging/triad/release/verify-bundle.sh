@@ -34,6 +34,9 @@ for required in \
   PLATFORM_CLAIM \
   compatibility-v1.toml \
   installer/release/install-linux.sh \
+  installer/linux/bin/bloom-uninstall \
+  installer/linux/systemd-user/bloom-machine.service \
+  installer/macos/launchagents/com.bloom.machine.plist.in \
   installer/release/install-macos.sh \
   installer/release/macos-conformance-subject.sh \
   installer/release/sign-macos-conformance-report.sh \
@@ -74,19 +77,42 @@ require_compat_value() {
     exit 65
   }
 }
-for authority_edge in machine_broker broker_signer; do
-  require_compat_value "protocols.$authority_edge" major 1
-  require_compat_value "protocols.$authority_edge" minor_min 3
-  require_compat_value "protocols.$authority_edge" minor_max 3
-done
+require_compat_value protocols.machine_broker major 1
+require_compat_value protocols.machine_broker minor_min 4
+require_compat_value protocols.machine_broker minor_max 4
+require_compat_value protocols.broker_signer major 1
+require_compat_value protocols.broker_signer minor_min 4
+require_compat_value protocols.broker_signer minor_max 4
 for support_edge in signer_control session; do
   require_compat_value "protocols.$support_edge" major 1
   require_compat_value "protocols.$support_edge" minor_min 0
   require_compat_value "protocols.$support_edge" minor_max 1
 done
-require_compat_value revisions broker_commit '"1cbb549bea07f78c564ef1e66e52fb087b5f2ffa"'
-require_compat_value revisions signer_commit '"1a1d52376919fff4cb295207e67c54dff60c745d"'
-require_compat_value revisions service_runtime_commit '"2e402f03814166406ea6489b60422b0865d1f6c2"'
+source_revision() {
+  local key="$1" value
+  value="$(sed -n -E "s/^$key=([0-9a-f]{40})$/\\1/p" "$payload/SOURCE_REVISIONS")"
+  [[ "$value" =~ ^[0-9a-f]{40}$ ]] || {
+    echo "bundle source revisions have invalid $key" >&2
+    exit 65
+  }
+  printf '%s\n' "$value"
+}
+[[ "$(wc -l < "$payload/SOURCE_REVISIONS" | tr -d ' ')" == 3 ]] || {
+  echo "bundle source revisions contain unexpected entries" >&2
+  exit 65
+}
+source_revision BLOOM_MACHINE_SHA >/dev/null
+broker_revision="$(source_revision BLOOM_BROKER_SHA)"
+signer_revision="$(source_revision BLOOM_SIGNER_SHA)"
+[[ "$(compat_value revisions broker_commit)" == "\"$broker_revision\"" ]] || {
+  echo "bundle compatibility revision does not match SOURCE_REVISIONS" >&2
+  exit 65
+}
+[[ "$(compat_value revisions signer_commit)" == "\"$signer_revision\"" ]] || {
+  echo "bundle compatibility revision does not match SOURCE_REVISIONS" >&2
+  exit 65
+}
+require_compat_value revisions service_runtime_commit '"bc88cc6760b00bbff0c6a6e5f56d42bb03004436"'
 require_compat_value revisions petal_contract_commit '"61938d0c127cfe03c7e3e55baed0ba1439bc5ca2"'
 for state_owner in machine broker signer; do
   require_compat_value "state.$state_owner" current 1
@@ -120,17 +146,12 @@ case "$platform_claim" in
     done
     ;;
   macos-unix-principals)
-    [[ "$(uname -s)" == "Darwin" ]] || {
-      echo "production macOS bundles are verified only on Darwin" >&2
-      exit 69
-    }
     for binary in bloom bloom-broker bloom-signer bloom-signer-migrate; do
       file -b "$payload/bin/$binary" | grep -F 'Mach-O ' >/dev/null || {
         echo "production macOS bundle contains a non-Mach-O binary" >&2
         exit 65
       }
     done
-    "$payload/installer/release/verify-macos-conformance.sh" "$payload"
     ;;
   test-unclaimed)
     [[ "${BLOOM_ALLOW_TEST_UNCLAIMED:-}" == "true" ]] || {

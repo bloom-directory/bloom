@@ -1,6 +1,0 @@
-# label	package	default-features	features
-bloom-default	bloom	yes	-
-bloom-portable	bloom	no	-
-bloom-decompile	bloom	yes	bytecode-decompile
-bloom-portable-decompile	bloom	no	bytecode-decompile
-bloom-machine	bloom-machine	yes	-
