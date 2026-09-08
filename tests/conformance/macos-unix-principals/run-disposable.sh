@@ -73,10 +73,10 @@ capture_failure_evidence() {
   launchctl print "user/$login_uid/com.bloom.session" \
     > "$evidence_dir/session-launchctl.txt" 2>&1 || true
   chmod 0644 "$evidence_dir/session-launchctl.txt" 2>/dev/null || true
-  # The Machine launchagent's launchd state carries its last exit status and
-  # run count — often the only surviving record once the installer's
-  # fresh-install rollback has removed the runtime tree.
-  launchctl print "gui/$login_uid/com.bloom.machine" \
+  # The Machine launchagent is bootstrapped into the user domain; its launchd
+  # state carries the last exit status and run count. Best effort only: the
+  # installer's rollback may have booted the job out before this runs.
+  launchctl print "user/$login_uid/com.bloom.machine" \
     > "$evidence_dir/machine-launchctl.txt" 2>&1 || true
   chmod 0644 "$evidence_dir/machine-launchctl.txt" 2>/dev/null || true
   login_home="$(dscl . -read "/Users/$login_user" NFSHomeDirectory 2>/dev/null |
