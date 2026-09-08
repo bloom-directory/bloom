@@ -1415,3 +1415,443 @@ async fn restage_migrates_the_approval_before_retiring_its_predecessor() {
     .expect("the successor must carry the approval the owner already granted");
     assert_eq!(migrated, challenge);
 }
+
+/// Fixtures for the approval-retry tests: a node, an outbox, a Broker that
+/// enforces operation-id stability, and an engine wired to all three.
+async fn retry_fixture() -> (
+    tempfile::TempDir,
+    SolanaOutbox,
+    Arc<BrokerFixture>,
+    SolanaTransferEngine,
+) {
+    let endpoint = spawn_node().await;
+    let dir = tempfile::tempdir().unwrap();
+    let outbox = SolanaOutbox::new(dir.path().join("outbox")).unwrap();
+    let broker = Arc::new(BrokerFixture::new());
+    let signer =
+        SolanaTransferSigner::from_catalog(MachineBrokerClient::new(broker.clone()), &catalog())
+            .unwrap();
+    let engine =
+        SolanaTransferEngine::new(outbox.clone(), client(&endpoint), signer, "solana-devnet");
+    (dir, outbox, broker, engine)
+}
+
+async fn stage_for_retry(
+    engine: &SolanaTransferEngine,
+    broker: &BrokerFixture,
+) -> bloom_solana_tx::types::StagedSolanaTransfer {
+    let destination = ed25519_dalek::SigningKey::from_bytes(&[0xbb; 32])
+        .verifying_key()
+        .to_bytes();
+    engine
+        .stage(
+            "wallet",
+            &broker.child_pubkey(),
+            Default::default(),
+            &destination,
+            1_000_000,
+            1_000,
+        )
+        .await
+        .unwrap()
+}
+
+fn pending(outbox: &SolanaOutbox, id: &str) -> bloom_solana_tx::outbox::SolanaOutboxEntry {
+    outbox
+        .read_in_state(
+            "wallet",
+            "solana-devnet",
+            id,
+            bloom_solana_tx::outbox::SolanaOutboxState::Pending,
+        )
+        .unwrap()
+}
+
+fn approval_required(outcome: bloom_solana_tx::signing::SolanaSignOutcome) -> Digest32 {
+    match outcome {
+        bloom_solana_tx::signing::SolanaSignOutcome::ApprovalRequired { approval_id, .. } => {
+            approval_id
+        }
+        other => panic!("expected ApprovalRequired, got {other:?}"),
+    }
+}
+
+/// bloom#236: the operation id is derived from the transfer's stable facts,
+/// but the terms hashed alongside it carried a freshly computed expiry. A
+/// second confirm of the same transfer therefore presented the same id with
+/// different terms and was refused permanently.
+#[tokio::test]
+async fn confirming_the_same_transfer_twice_reaches_the_same_ceremony() {
+    let (_dir, outbox, broker, engine) = retry_fixture().await;
+    let staged = stage_for_retry(&engine, &broker).await;
+    let fee_payer = broker.child_pubkey();
+
+    let first = approval_required(
+        engine
+            .sign("wallet", &staged.id, &fee_payer, None, None, 1_100)
+            .await
+            .unwrap(),
+    );
+    // Time moves between the two confirms; that must not change the terms.
+    let second = approval_required(
+        engine
+            .sign("wallet", &staged.id, &fee_payer, None, None, 900_000)
+            .await
+            .unwrap(),
+    );
+
+    assert_eq!(
+        broker.conflicts(),
+        0,
+        "a retry of one attempt must not look like a different action"
+    );
+    assert_eq!(
+        first, second,
+        "both confirms must reach the one ceremony the owner is being asked about"
+    );
+    let attempt = outbox
+        .approval_attempt(&pending(&outbox, &staged.id))
+        .unwrap()
+        .expect("the attempt is durable");
+    assert_eq!(attempt.attempt, 0, "this is still the first attempt");
+    assert_eq!(attempt.issued_at_ms, 1_100);
+}
+
+/// bloom#237: a definite refusal used to leave the dead approval in place, so
+/// every later confirm replayed an id the Broker would never accept again.
+#[tokio::test]
+async fn a_definitely_dead_approval_is_retired_and_the_next_confirm_starts_over() {
+    let (_dir, outbox, broker, engine) = retry_fixture().await;
+    let staged = stage_for_retry(&engine, &broker).await;
+    let fee_payer = broker.child_pubkey();
+
+    let approval = approval_required(
+        engine
+            .sign("wallet", &staged.id, &fee_payer, None, None, 1_100)
+            .await
+            .unwrap(),
+    );
+    let entry = pending(&outbox, &staged.id);
+    outbox
+        .write_approval_challenge(&entry, br#"{"approval_id":"stale"}"#)
+        .unwrap();
+
+    broker.fail_next_signature(
+        ProtocolErrorCode::ApprovalExpired,
+        "sealed approval is past its expiry",
+    );
+    let error = engine
+        .sign(
+            "wallet",
+            &staged.id,
+            &fee_payer,
+            None,
+            Some(approval.clone()),
+            1_200,
+        )
+        .await
+        .expect_err("an expired approval cannot sign");
+    assert!(error.to_string().contains("APPROVAL_EXPIRED"), "{error}");
+
+    let entry = pending(&outbox, &staged.id);
+    assert_eq!(
+        outbox
+            .approval_attempt(&entry)
+            .unwrap()
+            .expect("the attempt is remembered so its successor gets a new identity")
+            .expires_at_ms,
+        0,
+        "a dead approval must not be resumed"
+    );
+    assert!(
+        !entry
+            .dir
+            .join(bloom_solana_tx::outbox::APPROVAL_CHALLENGE_FILE)
+            .exists(),
+        "a dead ceremony must stop being advertised"
+    );
+
+    // The next confirm is a genuinely new attempt: it must reach a ceremony,
+    // not collide with the operation id the dead approval used.
+    let replacement = approval_required(
+        engine
+            .sign("wallet", &staged.id, &fee_payer, None, None, 1_300)
+            .await
+            .unwrap(),
+    );
+    assert_eq!(
+        broker.conflicts(),
+        0,
+        "a new lineage must not reuse the dead operation id"
+    );
+    assert_ne!(
+        replacement, approval,
+        "the replacement must be a different approval"
+    );
+    assert_eq!(
+        outbox
+            .approval_attempt(&pending(&outbox, &staged.id))
+            .unwrap()
+            .expect("a new attempt is recorded")
+            .attempt,
+        1
+    );
+    assert_eq!(broker.prepared_ids().len(), 2);
+}
+
+/// An outcome that may have produced a signature must keep its approval, so
+/// reconciliation still has one identity to resolve against.
+#[tokio::test]
+async fn an_ambiguous_signing_outcome_keeps_the_approval() {
+    let (_dir, outbox, broker, engine) = retry_fixture().await;
+    let staged = stage_for_retry(&engine, &broker).await;
+    let fee_payer = broker.child_pubkey();
+
+    let approval = approval_required(
+        engine
+            .sign("wallet", &staged.id, &fee_payer, None, None, 1_100)
+            .await
+            .unwrap(),
+    );
+    let entry = pending(&outbox, &staged.id);
+    outbox
+        .write_approval_challenge(&entry, br#"{"approval_id":"live"}"#)
+        .unwrap();
+
+    broker.fail_next_signature(
+        ProtocolErrorCode::AmbiguousProviderEffect,
+        "provider outcome is unknown",
+    );
+    let error = engine
+        .sign(
+            "wallet",
+            &staged.id,
+            &fee_payer,
+            None,
+            Some(approval),
+            1_200,
+        )
+        .await
+        .expect_err("an unknown outcome is not a signature");
+    assert!(
+        error.to_string().contains("AMBIGUOUS_PROVIDER_EFFECT"),
+        "{error}"
+    );
+
+    let entry = pending(&outbox, &staged.id);
+    assert!(
+        outbox.approval_attempt(&entry).unwrap().is_some(),
+        "an unknown outcome must not discard the authority it may already have used"
+    );
+    assert!(
+        entry
+            .dir
+            .join(bloom_solana_tx::outbox::APPROVAL_CHALLENGE_FILE)
+            .exists()
+    );
+}
+
+/// A transient fault is not a decision either: the approval survives it and
+/// the retry reaches the same ceremony.
+#[tokio::test]
+async fn a_transient_broker_fault_keeps_the_approval_and_the_retry_succeeds() {
+    let (_dir, outbox, broker, engine) = retry_fixture().await;
+    let staged = stage_for_retry(&engine, &broker).await;
+    let fee_payer = broker.child_pubkey();
+
+    let approval = approval_required(
+        engine
+            .sign("wallet", &staged.id, &fee_payer, None, None, 1_100)
+            .await
+            .unwrap(),
+    );
+    broker.fail_next_signature(ProtocolErrorCode::ServiceUnavailable, "Broker restarting");
+    engine
+        .sign(
+            "wallet",
+            &staged.id,
+            &fee_payer,
+            None,
+            Some(approval.clone()),
+            1_200,
+        )
+        .await
+        .expect_err("a restarting Broker did not sign");
+    assert!(
+        outbox
+            .approval_attempt(&pending(&outbox, &staged.id))
+            .unwrap()
+            .is_some()
+    );
+
+    let signed = engine
+        .sign(
+            "wallet",
+            &staged.id,
+            &fee_payer,
+            None,
+            Some(approval),
+            1_300,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        signed,
+        bloom_solana_tx::signing::SolanaSignOutcome::Signed { .. }
+    ));
+    assert_eq!(broker.conflicts(), 0);
+    assert!(
+        outbox
+            .approval_attempt(&pending(&outbox, &staged.id))
+            .unwrap()
+            .is_none(),
+        "a completed signature ends the attempt"
+    );
+}
+
+/// A dead approval followed by a restage: the successor carries the same
+/// economic intent, so it rebuilds the same approval operation id. Losing the
+/// attempt counter on the way across makes that id collide with the approval
+/// that just died.
+#[tokio::test]
+async fn a_dead_approval_survives_a_restage_and_the_successor_recovers() {
+    let height = Arc::new(std::sync::atomic::AtomicU64::new(1));
+    let endpoint = spawn_node_with_controls(
+        height.clone(),
+        false,
+        false,
+        Arc::new(Mutex::new(Vec::new())),
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let outbox = SolanaOutbox::new(dir.path().join("outbox")).unwrap();
+    let broker = Arc::new(BrokerFixture::new());
+    let signer =
+        SolanaTransferSigner::from_catalog(MachineBrokerClient::new(broker.clone()), &catalog())
+            .unwrap();
+    let engine =
+        SolanaTransferEngine::new(outbox.clone(), client(&endpoint), signer, "solana-devnet");
+    let staged = stage_for_retry(&engine, &broker).await;
+    let fee_payer = broker.child_pubkey();
+
+    let approval = approval_required(
+        engine
+            .sign("wallet", &staged.id, &fee_payer, None, None, 1_100)
+            .await
+            .unwrap(),
+    );
+    outbox
+        .write_approval_challenge(&pending(&outbox, &staged.id), br#"{"approval_id":"stale"}"#)
+        .unwrap();
+    broker.fail_next_signature(ProtocolErrorCode::ApprovalExpired, "expired");
+    engine
+        .sign(
+            "wallet",
+            &staged.id,
+            &fee_payer,
+            None,
+            Some(approval),
+            1_200,
+        )
+        .await
+        .expect_err("an expired approval cannot sign");
+
+    height.store(
+        staged.last_valid_block_height + 1,
+        std::sync::atomic::Ordering::SeqCst,
+    );
+    let successor = engine
+        .restage_expired("wallet", &staged.id, &fee_payer, 1_300)
+        .await
+        .unwrap();
+    assert_ne!(successor.id, staged.id);
+
+    let result = engine
+        .sign("wallet", &successor.id, &fee_payer, None, None, 1_400)
+        .await;
+    assert!(
+        result.is_ok(),
+        "a dead approval followed by a restage must still recover: {result:?}"
+    );
+    assert_eq!(
+        broker.conflicts(),
+        0,
+        "the successor must not rebuild the dead approval's operation id"
+    );
+    assert_eq!(
+        outbox
+            .approval_attempt(&pending(&outbox, &successor.id))
+            .unwrap()
+            .expect("the successor carries the lineage")
+            .attempt,
+        1
+    );
+}
+
+/// The same, with the predecessor swept into `failed` before it is restaged.
+/// Retiring an entry must not take its identity lineage with it.
+#[tokio::test]
+async fn a_swept_expired_transfer_keeps_its_approval_lineage() {
+    let height = Arc::new(std::sync::atomic::AtomicU64::new(1));
+    let endpoint = spawn_node_with_controls(
+        height.clone(),
+        false,
+        false,
+        Arc::new(Mutex::new(Vec::new())),
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let outbox = SolanaOutbox::new(dir.path().join("outbox")).unwrap();
+    let broker = Arc::new(BrokerFixture::new());
+    let signer =
+        SolanaTransferSigner::from_catalog(MachineBrokerClient::new(broker.clone()), &catalog())
+            .unwrap();
+    let engine =
+        SolanaTransferEngine::new(outbox.clone(), client(&endpoint), signer, "solana-devnet");
+    let staged = stage_for_retry(&engine, &broker).await;
+    let fee_payer = broker.child_pubkey();
+
+    let approval = approval_required(
+        engine
+            .sign("wallet", &staged.id, &fee_payer, None, None, 1_100)
+            .await
+            .unwrap(),
+    );
+    broker.fail_next_signature(ProtocolErrorCode::ApprovalRevoked, "revoked");
+    engine
+        .sign(
+            "wallet",
+            &staged.id,
+            &fee_payer,
+            None,
+            Some(approval),
+            1_200,
+        )
+        .await
+        .expect_err("a revoked approval cannot sign");
+
+    // The sweep retires the stale entry into `failed` before anyone restages.
+    height.store(
+        staged.last_valid_block_height + 1,
+        std::sync::atomic::Ordering::SeqCst,
+    );
+    let mut heights = std::collections::HashMap::new();
+    heights.insert(
+        "solana-devnet".to_string(),
+        staged.last_valid_block_height + 1,
+    );
+    outbox.sweep_expired(2_000, &heights).unwrap();
+
+    let successor = engine
+        .restage_expired("wallet", &staged.id, &fee_payer, 2_100)
+        .await
+        .unwrap();
+    let result = engine
+        .sign("wallet", &successor.id, &fee_payer, None, None, 2_200)
+        .await;
+    assert!(
+        result.is_ok(),
+        "a swept transfer must not lose the identity of its dead approval: {result:?}"
+    );
+    assert_eq!(broker.conflicts(), 0);
+}

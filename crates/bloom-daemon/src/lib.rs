@@ -5600,6 +5600,77 @@ mod tests {
     use bloom_vfs::handler::Entry;
     use bloom_vfs::handler::Handler;
 
+    /// A Petal reads the host error class to decide whether it may rebuild the
+    /// transaction it was signing. `Denied` has to mean the Broker decided
+    /// against this message and no signature exists; anything less certain has
+    /// to arrive as a backend fault, or the guest will authorize a second
+    /// signature for one intent.
+    #[test]
+    fn a_petal_can_tell_a_refused_signature_from_an_unknown_one() {
+        use bloom_broker_api::{ProtocolError, ProtocolErrorCode};
+
+        let denied = [
+            // The owner's approval cannot produce a signature, now or later.
+            ProtocolErrorCode::ApprovalExpired,
+            ProtocolErrorCode::ApprovalRevoked,
+            ProtocolErrorCode::ApprovalNotFound,
+            // The request never described something the Broker would sign.
+            ProtocolErrorCode::ClaimInvalid,
+            ProtocolErrorCode::SelectorMismatch,
+            ProtocolErrorCode::KeyrefMismatch,
+            ProtocolErrorCode::ProvenanceMismatch,
+        ];
+        for code in denied {
+            let error = petal_signing_host_error(&ProtocolError::new(code, "refused"));
+            assert!(
+                matches!(error, HostError::Denied(_)),
+                "{} is a decision: {error:?}",
+                code.as_str()
+            );
+        }
+
+        let uncertain = [
+            // A signature may exist and nobody knows.
+            ProtocolErrorCode::AmbiguousProviderEffect,
+            ProtocolErrorCode::ServiceUnavailable,
+            // A prior operation stands; this one must not be rebuilt over it.
+            ProtocolErrorCode::OperationIdConflict,
+            // Transient or repairable, and the approval is still good.
+            ProtocolErrorCode::CeremonyRateLimited,
+            ProtocolErrorCode::ClockUntrusted,
+            ProtocolErrorCode::PolicyBaselineStale,
+            ProtocolErrorCode::RevocationEpochUnreconciled,
+            ProtocolErrorCode::LimitExceededValue,
+        ];
+        for code in uncertain {
+            let error = petal_signing_host_error(&ProtocolError::new(code, "not a decision"));
+            assert!(
+                matches!(error, HostError::Backend(_)),
+                "{} must not read as a refusal: {error:?}",
+                code.as_str()
+            );
+        }
+
+        // The guest sees only the numeric class, so pin that too: -2 is the
+        // code the Pump.fun Petal treats as "nothing was signed".
+        assert_eq!(
+            petal_signing_host_error(&ProtocolError::new(
+                ProtocolErrorCode::ApprovalRevoked,
+                "revoked"
+            ))
+            .as_wasm_code(),
+            -2
+        );
+        assert_eq!(
+            petal_signing_host_error(&ProtocolError::new(
+                ProtocolErrorCode::AmbiguousProviderEffect,
+                "unknown"
+            ))
+            .as_wasm_code(),
+            -4
+        );
+    }
+
     #[cfg(feature = "mount")]
     #[test]
     fn mount_uses_the_configured_nfs_listener() {
