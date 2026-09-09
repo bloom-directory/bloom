@@ -1542,6 +1542,17 @@ async fn component_petal_key_request(
     if let Err(error) = apply_manifest_key_scope(store.data(), &mut request) {
         return set_component_result(results, component_host_err(error));
     }
+    if let Some(account) = trusted_account(store.data()) {
+        if request.wallet_id != account.wallet {
+            return set_component_result(
+                results,
+                component_host_err(HostError::Denied(format!(
+                    "key request wallet {:?} does not match the trusted account wallet",
+                    request.wallet_id
+                ))),
+            );
+        }
+    }
     request.context = store.data().sign_context.clone();
     let host = store.data().host.clone();
     match host.petal_key_request(request).await {
@@ -1562,6 +1573,48 @@ async fn component_petal_key_request(
             set_component_result(results, component_host_err(error))
         }
     }
+}
+
+/// The trusted account identity carried by the host into this
+/// instantiation, if the route was dispatched under a numbered account.
+fn trusted_account(data: &StoreData) -> Option<crate::abi::TrustedAccountContext> {
+    data.sign_context.as_ref().and_then(|c| c.trusted_account())
+}
+
+/// Reject petal-supplied wallets that do not match the mounted account's
+/// trusted wallet. Account-0 and legacy mounts carry no trusted context and
+/// keep the documented unconstrained behavior.
+fn require_trusted_wallet(data: &StoreData, wallet: &str) -> Result<(), HostError> {
+    if let Some(account) = trusted_account(data) {
+        if wallet != account.wallet {
+            return Err(HostError::Denied(format!(
+                "payload signing wallet {wallet:?} does not match the trusted account wallet"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Explicit key selection under an account-scoped dispatch must resolve to
+/// the trusted owner key of that account's signing family.
+fn require_trusted_key_ref(
+    data: &StoreData,
+    key_ref: &bloom_broker_api::KeyRef,
+) -> Result<(), HostError> {
+    let Some(account) = trusted_account(data) else {
+        return Ok(());
+    };
+    let Some(expected) = &account.owner_key_fingerprint else {
+        return Err(HostError::Denied(
+            "explicit key selection requires a trusted owner fingerprint".into(),
+        ));
+    };
+    if key_ref.public_key_fingerprint.to_string() != *expected {
+        return Err(HostError::Denied(
+            "explicit key does not belong to the mounted account's owner".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn legacy_signing_unsupported() -> HostError {
@@ -1686,6 +1739,10 @@ fn component_payload_sign_record(
     } else {
         bloom_broker_api::PetalSignSelector::Reusable
     };
+    require_trusted_wallet(data, &wallet)?;
+    if let Some(key_ref) = &key_ref {
+        require_trusted_key_ref(data, key_ref)?;
+    }
     Ok(PayloadSignRequest {
         wallet,
         preimage,
@@ -1821,6 +1878,10 @@ fn component_payload_batch_sign_request(
         }
     };
 
+    require_trusted_wallet(data, &wallet)?;
+    if let Some(key_ref) = &key_ref {
+        require_trusted_key_ref(data, key_ref)?;
+    }
     Ok(PayloadBatchSignRequest {
         wallet,
         payloads,
@@ -4978,6 +5039,102 @@ paths = ["/status"]
             .unwrap_err();
         assert!(err.to_string().contains("component route read"));
         assert!(denied_host.http_calls.lock().is_empty());
+    }
+
+    fn account_context(
+        wallet: &str,
+        number: u32,
+        fingerprint: Option<&str>,
+    ) -> crate::abi::PetalRouteContext {
+        let mut params = vec![
+            ("bloom.wallet".to_string(), wallet.to_string()),
+            ("bloom.account".to_string(), number.to_string()),
+        ];
+        if let Some(fp) = fingerprint {
+            params.push(("bloom.owner_key_fingerprint".to_string(), fp.to_string()));
+        }
+        crate::abi::PetalRouteContext {
+            petal_root: "/petals/demo".into(),
+            package_hash: "pkg".into(),
+            route_id: "route".into(),
+            op: "write".into(),
+            path: "/x".into(),
+            params,
+            actor: None,
+        }
+    }
+
+    fn key_ref_with_fingerprint(byte: u8) -> bloom_broker_api::KeyRef {
+        bloom_broker_api::KeyRef {
+            backend: bloom_broker_api::Token::new("local").unwrap(),
+            backend_instance: bloom_broker_api::Token::new("default").unwrap(),
+            locator: format!("wallets/w/{byte}"),
+            key_spec: bloom_broker_api::KeySpec::Secp256k1,
+            public_key_fingerprint: bloom_broker_api::Digest32::from_bytes([byte; 32]),
+            derivation: Some(bloom_broker_api::DerivationRef::Bip32Secp256k1 {
+                root_key_id: bloom_broker_api::Token::new("primary-root").unwrap(),
+                path: "m/44'/60'/0'/18734/7".into(),
+            }),
+        }
+    }
+
+    #[test]
+    fn trusted_account_context_parses_host_params() {
+        let ctx = account_context("w", 2, Some("aa"));
+        let parsed = ctx.trusted_account().unwrap();
+        assert_eq!(parsed.wallet, "w");
+        assert_eq!(parsed.number, 2);
+        assert_eq!(parsed.owner_key_fingerprint.as_deref(), Some("aa"));
+        assert!(
+            account_context("w", 2, None)
+                .trusted_account()
+                .unwrap()
+                .owner_key_fingerprint
+                .is_none()
+        );
+        let mut broken = account_context("w", 2, None);
+        broken.params[1].1 = "x".into();
+        assert!(broken.trusted_account().is_none());
+        let mut missing = account_context("w", 2, None);
+        missing.params.clear();
+        assert!(missing.trusted_account().is_none());
+    }
+
+    #[tokio::test]
+    async fn account_scoped_signing_rejects_foreign_wallet_and_key() {
+        let host = Arc::new(MockHost::default());
+        let mut store = component_test_store(BTreeSet::from([Capability::Sign]), None, host);
+        store.data_mut().sign_context = Some(account_context(
+            "w",
+            2,
+            Some(hex::encode([7u8; 32]).as_str()),
+        ));
+
+        require_trusted_wallet(store.data(), "w").unwrap();
+        assert!(require_trusted_wallet(store.data(), "other").is_err());
+
+        require_trusted_key_ref(store.data(), &key_ref_with_fingerprint(7)).unwrap();
+        assert!(require_trusted_wallet(store.data(), "w").is_ok());
+        let foreign = key_ref_with_fingerprint(9);
+        assert!(require_trusted_key_ref(store.data(), &foreign).is_err());
+    }
+
+    #[tokio::test]
+    async fn account_without_trusted_fingerprint_rejects_explicit_keys() {
+        let host = Arc::new(MockHost::default());
+        let mut store = component_test_store(BTreeSet::from([Capability::Sign]), None, host);
+        store.data_mut().sign_context = Some(account_context("w", 2, None));
+        assert!(require_trusted_key_ref(store.data(), &key_ref_with_fingerprint(7)).is_err());
+        require_trusted_wallet(store.data(), "w").unwrap();
+    }
+
+    #[tokio::test]
+    async fn legacy_mount_without_account_context_keeps_unconstrained_signing() {
+        let host = Arc::new(MockHost::default());
+        let store = component_test_store(BTreeSet::from([Capability::Sign]), None, host);
+        assert!(store.data().sign_context.is_none());
+        require_trusted_wallet(store.data(), "any").unwrap();
+        require_trusted_key_ref(store.data(), &key_ref_with_fingerprint(7)).unwrap();
     }
 
     fn component_test_store(
