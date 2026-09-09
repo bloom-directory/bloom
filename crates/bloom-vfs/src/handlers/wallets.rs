@@ -707,7 +707,6 @@ impl WalletsHandler {
                     petal_key_scope: None,
                     legacy_passkey_migration: None,
                     wallet_seed_profile: None,
-                    derivation_request: None,
                     derivation_requests: Vec::new(),
                     account_terms: None,
                 },
@@ -5119,7 +5118,7 @@ mod tests {
         handler
             .write(
                 &vfs(format!("/{w}/new")),
-                br#"{"request_id":"create-trading","families":["evm","solana"]}"#,
+                br#"{"request_id":"create-trading"}"#,
             )
             .await
             .unwrap();
@@ -5135,7 +5134,7 @@ mod tests {
             "https://broker.test/ceremony/abc"
         );
 
-        // Reusing the request id for different families is refused.
+        // Family selection is no longer part of the request surface.
         let error = handler
             .write(
                 &vfs(format!("/{w}/new")),
@@ -5143,10 +5142,7 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(
-            format!("{error:?}").contains("cannot be reused"),
-            "{error:?}"
-        );
+        assert!(format!("{error:?}").contains("unknown field"), "{error:?}");
 
         // Once Signer commits, the same read derives the number from the
         // returned paths.
@@ -5162,17 +5158,15 @@ mod tests {
         // The prepared request carried the multi-family list and terms.
         let prepared = shared_service.prepared.lock().unwrap().clone().unwrap();
         assert_eq!(prepared.derivation_requests.len(), 2);
-        assert!(prepared.derivation_request.is_none());
         let terms = prepared.account_terms.unwrap();
         assert_eq!(terms.derivations.len(), 2);
-        assert!(terms.derivation.is_none());
 
         // A retry with the same request id returns the same account without
         // allocating again.
         handler
             .write(
                 &vfs(format!("/{w}/new")),
-                br#"{"request_id":"create-trading","families":["evm","solana"]}"#,
+                br#"{"request_id":"create-trading"}"#,
             )
             .await
             .unwrap();
