@@ -69,6 +69,76 @@ and names the public fingerprints and derivation paths; list order is never an
 authority decision. Top-level EVM address compatibility resolves only the
 canonical initial child and never falls back to another projected child.
 
+## The numbered account tree
+
+**Status:** planned. This section lands with milestone M1 of the HD accounts
+plan and does not describe shipped behavior yet.
+
+Numbered accounts give every long-lived family key a stable, permanent home
+under the wallet while installed Petals and shared market data stay at
+`/petals/<petal>/`:
+
+```text
+wallets/<wallet>/
+├── accounts.json                      # gains a number per entry
+├── accounts/
+│   ├── new.json                       # create an account (write)
+│   ├── operations/<request-id>/status.json
+│   └── 0/
+│       ├── account.json               # both families with freshness
+│       ├── evm/key.json, address, public_key, chains/<network>/...
+│       ├── solana/key.json, address, public_key, chains/<network>/...
+│       ├── petals/<petal>/<network>/...
+│       └── sessions/<session-id>/...
+└── policy.json, sealed-approvals/, capabilities/   # unchanged
+```
+
+The number is a permanent account slot, not a position in a list and not
+necessarily a BIP-44 account field. Signer owns the binding: one slot binds at
+most one long-lived key per family, a binding is unique for
+`(wallet, slot, family)`, and neither a slot number nor a retired binding is
+ever reused. Resolving a path yields an exact `KeyRef`; approval and signing
+continue to bind that exact `KeyRef`, and Broker revalidates the slot binding
+before authorizing an effect. Machine keeps no trusted number-to-key table.
+Fingerprint selection remains available for diagnostics and compatibility.
+
+Ordinary new slots use the existing derivation profiles:
+
+| Slot | EVM path | Solana path |
+|---|---|---|
+| 0 | `m/44'/60'/0'/0/0` | `m/44'/501'/0'/0'` |
+| 1 | `m/44'/60'/0'/0/1` | `m/44'/501'/1'/0'` |
+| n | `m/44'/60'/0'/0/n` | `m/44'/501'/n'/0'` |
+
+Wallet-level paths keep their meaning by resolving to account 0: the canonical
+initial child of each family. Explicit fingerprints still override the
+wallet-level default. An account can hold only EVM, only Solana, or both.
+Reading a missing family returns a specific missing-key error and never
+allocates a key; `account.json` reports missing, pending, active, or retired
+bindings. Retired keys remain inspectable, and writes requiring a retired key
+fail. Listings and metadata reads never create accounts, sessions, approvals,
+or transactions.
+
+Account creation is one owner ceremony per slot: a client writes
+`{"request_id": ..., "families": ["evm", "solana"]}` to `accounts/new.json`,
+Signer reserves the next slot across all allocation lifecycles, and the
+returned custody ceremony activates each requested family. Retrying with the
+same `request_id` returns the same operation; a conflicting reuse fails; a
+failed family is retried without allocating another slot; cancellation never
+recycles the reserved number. If one family succeeds and another fails, the
+successful binding is kept and the partial result stays visible.
+
+Existing keys keep their addresses and history. Existing default-profile
+children pair into slots by derivation ordinal, never by list order; a
+supported non-default path is bound explicitly to an unused slot; imported
+single keys occupy slot 0 with no HD path. A mnemonic recovers the
+deterministic key tree; it does not recover labels, exceptional slot grouping,
+allocation history, policies, sessions, or application secrets — a full Bloom
+backup restores those, and seed-only recovery never resurrects session
+approvals. Staged operations, outboxes, and receipts are indexed by the exact
+key and network, so one account can never see or confirm another account's
+pending operations.
+
 ## Signing
 
 Every retained wallet-signing route sends the exact structured payload to
