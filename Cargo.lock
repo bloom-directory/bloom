@@ -2470,7 +2470,7 @@ dependencies = [
 [[package]]
 name = "bloom-petal-contract"
 version = "0.1.0"
-source = "git+https://github.com/bloom-directory/petal?rev=b64f36f7ae08ae6419caa529a2546a957ba4fb66#b64f36f7ae08ae6419caa529a2546a957ba4fb66"
+source = "git+https://github.com/bloom-directory/petal?rev=9ad7a5c635f092bbcdf8f00a06b23676806ff70c#9ad7a5c635f092bbcdf8f00a06b23676806ff70c"
 dependencies = [
  "sha2 0.10.9",
 ]
