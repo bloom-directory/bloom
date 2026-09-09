@@ -209,6 +209,20 @@ impl TriadPolicyUpdateProjection {
     }
 }
 
+/// Account identity supplied only after resolving the authenticated inventory.
+#[derive(Clone, Debug)]
+pub struct AccountPetalContext {
+    pub wallet: String,
+    pub number: u32,
+    pub evm_fingerprint: Option<String>,
+    pub solana_fingerprint: Option<String>,
+}
+
+/// Keeps the VFS independent of the Petal runtime which depends on this crate.
+pub trait AccountPetalMount: Send + Sync {
+    fn for_account(&self, account: AccountPetalContext) -> Arc<dyn Handler>;
+}
+
 #[derive(Clone)]
 pub struct WalletsHandler {
     pub chains: ChainRegistry,
@@ -235,6 +249,7 @@ pub struct WalletsHandler {
     /// client, while staging needs the whole signing seam. A chain present
     /// here but absent from `solana` is readable but cannot stage.
     solana_reads: Option<bloom_solana::SolanaChainRegistry>,
+    account_petals: Option<Arc<dyn AccountPetalMount>>,
 }
 
 impl WalletsHandler {
@@ -256,7 +271,13 @@ impl WalletsHandler {
             policy_projection_root: policy_projection_root.into(),
             solana: None,
             solana_reads: None,
+            account_petals: None,
         }
+    }
+
+    pub fn with_account_petals(mut self, petals: Arc<dyn AccountPetalMount>) -> Self {
+        self.account_petals = Some(petals);
+        self
     }
 
     /// Attach the Solana transfer engines (keyed by chain name). When set,

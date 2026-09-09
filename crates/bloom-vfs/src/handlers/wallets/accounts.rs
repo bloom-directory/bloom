@@ -252,7 +252,17 @@ impl WalletsHandler {
     }
 
     fn account_dir_entries() -> Vec<Entry> {
-        vec![Entry::file("account.json"), Entry::dir("chains")]
+        vec![Entry::file("account.json"), Entry::dir("chains"), Entry::dir("petals")]
+    }
+
+    fn account_petal_handler(&self, wallet: &str, view: &AccountView) -> Result<Arc<dyn Handler>, HandlerError> {
+        let petals = self.account_petals.as_ref().ok_or_else(|| HandlerError::not_found("account Petal runtime is unavailable"))?;
+        Ok(petals.for_account(AccountPetalContext {
+            wallet: wallet.to_owned(),
+            number: view.number,
+            evm_fingerprint: view.evm.as_ref().map(|key| key.fingerprint.clone()),
+            solana_fingerprint: view.solana.as_ref().map(|key| key.fingerprint.clone()),
+        }))
     }
 
     fn chain_name_entries(&self) -> Vec<Entry> {
@@ -274,6 +284,9 @@ impl WalletsHandler {
         let view = self.account_view(wallet, number).await?;
         match rest {
             [] => Ok(Entry::dir(&number.to_string())),
+            [dir, petal_rest @ ..] if dir == "petals" => {
+                self.account_petal_handler(wallet, &view)?.lookup(&petal_rest.iter().fold(VfsPath::root(), |path, segment| path.join(segment))).await
+            }
             [leaf] if leaf == "account.json" => Ok(Entry::file(leaf)),
             [dir] if dir == "chains" => Ok(Entry::dir("chains")),
             [dir, chain, chain_rest @ ..] if dir == "chains" => {
@@ -300,6 +313,9 @@ impl WalletsHandler {
         let view = self.account_view(wallet, number).await?;
         match rest {
             [leaf] if leaf == "account.json" => self.account_json(wallet, &view),
+            [dir, petal_rest @ ..] if dir == "petals" => {
+                self.account_petal_handler(wallet, &view)?.read(&petal_rest.iter().fold(VfsPath::root(), |path, segment| path.join(segment))).await
+            }
             [dir, chain, chain_rest @ ..] if dir == "chains" => {
                 if self.is_solana_chain(chain) {
                     let (family, account) = Self::solana_family(&view, chain)?;
@@ -324,6 +340,9 @@ impl WalletsHandler {
         let view = self.account_view(wallet, number).await?;
         match rest {
             [] => Ok(Self::account_dir_entries()),
+            [dir, petal_rest @ ..] if dir == "petals" => {
+                self.account_petal_handler(wallet, &view)?.list(&petal_rest.iter().fold(VfsPath::root(), |path, segment| path.join(segment))).await
+            }
             [dir] if dir == "chains" => Ok(self.chain_name_entries()),
             [dir, chain, chain_rest @ ..] if dir == "chains" => {
                 if self.is_solana_chain(chain) {
@@ -351,6 +370,11 @@ impl WalletsHandler {
         data: &[u8],
     ) -> Result<(), HandlerError> {
         let view = self.account_view(wallet, number).await?;
+        if let [dir, petal_rest @ ..] = rest
+            && dir == "petals"
+        {
+            return self.account_petal_handler(wallet, &view)?.write(&petal_rest.iter().fold(VfsPath::root(), |path, segment| path.join(segment)), data).await;
+        }
         let [dir, chain, sub, chain_rest @ ..] = rest else {
             return Err(HandlerError::PermissionDenied);
         };

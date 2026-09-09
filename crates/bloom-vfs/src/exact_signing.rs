@@ -71,6 +71,7 @@ fn exact_claim_value_limits(claim: &PetalUseClaim) -> Result<Vec<ValueLimit>, St
 pub struct BrokerExactPayloadSigner {
     broker: MachineBrokerClient,
     provenance_catalog: ProvenanceCatalog,
+    account_key_ref: Option<bloom_broker_api::KeyRef>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -157,7 +158,13 @@ impl BrokerExactPayloadSigner {
         Self {
             broker,
             provenance_catalog,
+            account_key_ref: None,
         }
+    }
+
+    pub fn with_account_key(mut self, key: Option<bloom_broker_api::KeyRef>) -> Self {
+        self.account_key_ref = key;
+        self
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -372,7 +379,7 @@ impl BrokerExactPayloadSigner {
             expires_at_ms: state.expires_at_ms.clone(),
             canonical_plan_facts_digest,
             approval_id: state.approval_id.clone(),
-            account_key_ref: None,
+            account_key_ref: self.account_key_ref.clone(),
             petal_use_claim: petal_claim.map(|(claim, _)| claim.clone()),
             system_use_claim: None,
             claim_assurance_evidence: petal_claim
@@ -633,7 +640,7 @@ impl BrokerExactPayloadSigner {
             expires_at_ms: state.expires_at_ms.clone(),
             canonical_plan_facts_digest,
             approval_id: state.approval_id.clone(),
-            account_key_ref: None,
+            account_key_ref: self.account_key_ref.clone(),
             petal_use_claim: Some(claim.clone()),
             claim_assurance_evidence: claim_assurance_evidence.map(<[u8]>::to_vec),
         };
@@ -770,7 +777,7 @@ impl BrokerExactPayloadSigner {
             expires_at_ms: state.expires_at_ms.clone(),
             canonical_plan_facts_digest,
             approval_id: state.approval_id.clone(),
-            account_key_ref: None,
+            account_key_ref: self.account_key_ref.clone(),
             petal_use_claim: Some(claim.clone()),
             claim_assurance_evidence: claim_assurance_evidence.map(<[u8]>::to_vec),
         };

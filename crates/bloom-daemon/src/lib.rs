@@ -305,6 +305,54 @@ struct PetalTxOutbox {
 }
 
 impl DaemonPetalHost {
+    /// Resolve the path-selected owner against fresh Broker membership before
+    /// preparing any approval, custody ceremony, or signature.
+    async fn account_owner(
+        &self,
+        context: &PetalRouteContext,
+        wallet: &str,
+        suite: bloom_broker_api::CryptoSuite,
+    ) -> Result<Option<bloom_broker_api::KeyRef>, HostError> {
+        let account = context.trusted_account();
+        if let Some(account) = &account
+            && account.wallet != wallet
+        {
+            return Err(HostError::Denied("wallet differs from mounted account".into()));
+        }
+        let broker = self.broker.as_ref().ok_or_else(|| HostError::Backend("Broker unavailable".into()))?;
+        let wallet_id = bloom_broker_api::Token::new(wallet.to_owned()).map_err(|error| HostError::Invalid(error.to_string()))?;
+        let descriptor = broker.wallet(wallet_id.clone()).await.map_err(|error| HostError::Denied(error.to_string()))?;
+        let number = account.as_ref().map_or(0, |account| account.number);
+        let fingerprint = account.as_ref().and_then(|account| account.owner_key_fingerprint.as_deref());
+        if account.is_some() && fingerprint.is_none() {
+            return Err(HostError::Denied("mounted route has no unambiguous family owner".into()));
+        }
+        if let Some(root) = descriptor.root_key_ref {
+            if number != 0 || root.key_spec != suite.key_spec()
+                || fingerprint.is_some_and(|fingerprint| root.public_key_fingerprint.as_str() != fingerprint)
+            {
+                return Err(HostError::Denied("root key does not match mounted account and signing family".into()));
+            }
+            return Ok(None);
+        }
+        let path = match suite {
+            bloom_broker_api::CryptoSuite::Ed25519Message => format!("m/44'/501'/{number}'/0'"),
+            _ => format!("m/44'/60'/0'/0/{number}"),
+        };
+        let accounts = broker.wallet_accounts(wallet_id).await.map_err(|error| HostError::Denied(error.to_string()))?;
+        let matches = accounts.accounts.iter().filter(|key| {
+            key.path == path
+                && key.lifecycle == bloom_broker_api::AccountLifecycleState::Active
+                && key.supported_crypto_suites.contains(&suite)
+                && descriptor.key_refs.contains(&key.key_ref)
+                && fingerprint.is_none_or(|fingerprint| key.public_key_fingerprint.as_str() == fingerprint)
+        }).collect::<Vec<_>>();
+        let [key] = matches.as_slice() else {
+            return Err(HostError::Denied("mounted account has no unique active owner for signing family".into()));
+        };
+        Ok(Some(key.key_ref.clone()))
+    }
+
     fn authorize_guest_vfs_path(path: &str) -> Result<(), HostError> {
         let parsed = VfsPath::parse(path)
             .map_err(|error| HostError::Invalid(format!("Petal VFS path: {error}")))?;
@@ -1030,6 +1078,8 @@ impl PetalHost for DaemonPetalHost {
             ));
         }
 
+        let selected_parent = self.account_owner(context, &req.wallet_id, suites[0]).await?;
+
         let wallet = broker.wallet(wallet_id.clone()).await.map_err(|error| {
             HostError::Denied(format!("{}: {}", error.code.as_str(), error.message))
         })?;
@@ -1055,6 +1105,7 @@ impl PetalHost for DaemonPetalHost {
                 .into_iter()
                 .filter(|account| {
                     account.lifecycle == bloom_broker_api::AccountLifecycleState::Active
+                        && selected_parent.as_ref().is_none_or(|selected| &account.key_ref == selected)
                         && suites
                             .iter()
                             .all(|suite| account.supported_crypto_suites.contains(suite))
@@ -1594,6 +1645,7 @@ impl PetalHost for DaemonPetalHost {
                 )));
             }
         };
+        let account_key = self.account_owner(context, &req.wallet, crypto_suite).await?;
         let claim: bloom_broker_api::PetalUseClaim =
             serde_json::from_slice(&req.petal_use_claim_jcs)
                 .map_err(|error| HostError::Invalid(format!("decode PetalUseClaim: {error}")))?;
@@ -1686,7 +1738,7 @@ impl PetalHost for DaemonPetalHost {
             let catalog = self.provenance_catalog.clone().ok_or_else(|| {
                 HostError::Backend("installer provenance catalog is not configured".into())
             })?;
-            let signer = BrokerExactPayloadSigner::new(broker.clone(), catalog);
+            let signer = BrokerExactPayloadSigner::new(broker.clone(), catalog).with_account_key(account_key.clone());
             let _guard = self.petal_signing_lock.lock().await;
             let outcome = signer
                 .sign_or_prepare_petal(
@@ -1769,7 +1821,7 @@ impl PetalHost for DaemonPetalHost {
                 }
             };
         }
-        let selected_key_ref = req.key_ref;
+        let selected_key_ref = req.key_ref.or(account_key);
         let approval_hint = match (req.approval_hint, selected_key_ref.as_ref()) {
             (Some(hint), _) => Some(hint),
             (None, Some(key_ref)) => self
@@ -1866,6 +1918,7 @@ impl PetalHost for DaemonPetalHost {
                 )));
             }
         };
+        let account_key = self.account_owner(context, &req.wallet, crypto_suite).await?;
         let claim: bloom_broker_api::PetalUseClaim =
             serde_json::from_slice(&req.petal_use_claim_jcs)
                 .map_err(|error| HostError::Invalid(format!("decode PetalUseClaim: {error}")))?;
@@ -2010,7 +2063,7 @@ impl PetalHost for DaemonPetalHost {
         let catalog = self.provenance_catalog.clone().ok_or_else(|| {
             HostError::Backend("installer provenance catalog is not configured".into())
         })?;
-        let signer = BrokerExactPayloadSigner::new(broker.clone(), catalog);
+        let signer = BrokerExactPayloadSigner::new(broker.clone(), catalog).with_account_key(account_key);
         let _guard = self.petal_signing_lock.lock().await;
         let outcome = if req.selector == bloom_broker_api::PetalSignSelector::Reusable {
             signer
@@ -2103,6 +2156,7 @@ impl PetalHost for DaemonPetalHost {
             HostError::Denied("Petal EVM outbox requires trusted Petal route context".into())
         })?;
         let origin = Self::petal_execution_origin(context)?;
+        let account_key = self.account_owner(context, &req.wallet, bloom_broker_api::CryptoSuite::Secp256k1Keccak256Recoverable).await?;
         let service = self
             .tx_outbox
             .as_ref()
@@ -2132,9 +2186,15 @@ impl PetalHost for DaemonPetalHost {
             .get_wallet(&wallet_id)
             .await
             .map_err(|error| HostError::Invalid(format!("wallet: {error}")))?;
-        let wallet_address = wallet_projection
-            .primary_address()
-            .map_err(|error| HostError::Invalid(format!("wallet: {error}")))?
+        let selected_address = match &account_key {
+            Some(key) => wallet_projection.accounts.accounts.iter()
+                .find(|account| &account.key_ref == key)
+                .and_then(|account| account.chain_projections.first())
+                .map(|projection| projection.address.as_str())
+                .ok_or_else(|| HostError::Denied("selected EVM account absent from projection".into()))?,
+            None => wallet_projection.primary_address().map_err(|error| HostError::Invalid(format!("wallet: {error}")))?,
+        };
+        let wallet_address = selected_address
             .parse::<Address>()
             .map_err(|error| HostError::Invalid(format!("wallet address: {error}")))?;
         let wallet_policy = bloom_vfs::advisory_evm_policy(&wallet_projection, &req.chain)
@@ -3748,6 +3808,13 @@ impl Daemon {
                 write_permit: home_write_permit.clone(),
             });
         let petal_app_host = Arc::new(petal_app_host);
+        let petal_router = Arc::new(
+            PetalRouter::new(petals.clone(), petal_app_host)
+                .with_audit(audit_arc.clone())
+                .with_runtime_petals(config.petals.runtime.clone())
+                .map_err(|e| DaemonError::Audit(format!("petals runtime configuration: {e}")))?,
+        );
+        let wallets_handler = Arc::new(wallets_handler.as_ref().clone().with_account_petals(petal_router.clone()));
         debug!(root = %petals_root.display(), "daemon.petals_initialised");
         let petals_for_docs = petals.clone();
         let petals_doc_renderer: Arc<dyn Fn() -> Vec<u8> + Send + Sync> =
@@ -3769,14 +3836,7 @@ impl Daemon {
             )
             .mount(
                 "petals",
-                Arc::new(
-                    PetalRouter::new(petals.clone(), petal_app_host)
-                        .with_audit(audit_arc.clone())
-                        .with_runtime_petals(config.petals.runtime.clone())
-                        .map_err(|e| {
-                            DaemonError::Audit(format!("petals runtime configuration: {e}"))
-                        })?,
-                ) as _,
+                petal_router as _,
             )
             .mount(
                 "chains",
