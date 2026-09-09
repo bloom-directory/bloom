@@ -73,6 +73,26 @@ capture_failure_evidence() {
   launchctl print "user/$login_uid/com.bloom.session" \
     > "$evidence_dir/session-launchctl.txt" 2>&1 || true
   chmod 0644 "$evidence_dir/session-launchctl.txt" 2>/dev/null || true
+  # The Machine launchagent is bootstrapped into the user domain; its launchd
+  # state carries the last exit status and run count. Best effort only: the
+  # installer's rollback may have booted the job out before this runs.
+  launchctl print "user/$login_uid/com.bloom.machine" \
+    > "$evidence_dir/machine-launchctl.txt" 2>&1 || true
+  chmod 0644 "$evidence_dir/machine-launchctl.txt" 2>/dev/null || true
+  login_home="$(dscl . -read "/Users/$login_user" NFSHomeDirectory 2>/dev/null |
+    awk 'NR==1{sub(/^NFSHomeDirectory:[[:space:]]*/,"");print}')" || true
+  if [[ -n "$login_home" && -d "$login_home/.bloom" ]]; then
+    find "$login_home/.bloom" -xdev -maxdepth 5 -ls \
+      > "$evidence_dir/machine-home-tree.txt" 2>&1 || true
+    chmod 0644 "$evidence_dir/machine-home-tree.txt" 2>/dev/null || true
+    if [[ -d "$login_home/.bloom/logs" ]]; then
+      for service_log in "$login_home/.bloom/logs/"*.jsonl; do
+        [[ -f "$service_log" && ! -L "$service_log" ]] || continue
+        install -m 0644 "$service_log" \
+          "$evidence_dir/machine-$(basename "$service_log")" || true
+      done
+    fi
+  fi
   find "/private/var/run/bloom/$login_uid" -xdev -ls \
     > "$evidence_dir/runtime-tree.txt" 2>&1 || true
   chmod 0644 "$evidence_dir/runtime-tree.txt" 2>/dev/null || true
