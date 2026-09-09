@@ -25,10 +25,16 @@
 //! - `wallets/<wallet>/chains/<chain>/outbox/pending/<id>/confirm`  — write to broadcast
 //! - `wallets/<wallet>/chains/<chain>/outbox/sent/<id>/<file>`      — read sent
 //! - `wallets/<wallet>/chains/<chain>/outbox/failed/<id>/<file>`    — read failed
+//! - `wallets/<wallet>/<n>/account.json`                            — numbered account: both families' keys
+//! - `wallets/<wallet>/<n>/chains/<chain>/...`                      — the chain views above, re-rooted at account n's key
 
 use sha2::Digest as _;
 use std::path::Path;
 use std::sync::Arc;
+
+/// `wallets/<wallet>/<n>/...`: the numbered account view.
+mod accounts;
+use accounts::parse_account_segment;
 
 use async_trait::async_trait;
 use bloom_broker_api::ProtocolErrorCode;
@@ -2701,6 +2707,9 @@ impl WalletsHandler {
         if segs.len() == 1 {
             return Ok(Entry::dir(wallet));
         }
+        if let Some(number) = parse_account_segment(&segs[1]) {
+            return self.lookup_account(wallet, number, &segs[2..]).await;
+        }
         match segs[1].as_str() {
             "address" | "address.qr.png" | "address.qr.svg" | "addresses.json" | "public_key"
             | "kind" | "projection.json" | "accounts.json" => Ok(Entry::file(&segs[1])),
@@ -2844,6 +2853,12 @@ impl WalletsHandler {
             };
         }
         let wallet = &segs[0];
+        if let Some(number) = segs
+            .get(1)
+            .and_then(|segment| parse_account_segment(segment))
+        {
+            return self.read_account(wallet, number, &segs[2..]).await;
+        }
         match segs.get(1).map(|s| s.as_str()).unwrap_or("") {
             "address" => {
                 let projection = self.wallet_projection(wallet).await?;
@@ -2872,9 +2887,7 @@ impl WalletsHandler {
                     )
                     .await
                     .map_err(|error| HandlerError::backend(error.to_string()))?;
-                let mut out = serde_json::to_vec_pretty(&accounts).map_err(err_be)?;
-                out.push(b'\n');
-                Ok(out)
+                Self::accounts_json_with_numbers(&accounts)
             }
             "public_key" => {
                 let projection = self.wallet_projection(wallet).await?;
@@ -3005,6 +3018,12 @@ impl WalletsHandler {
             return Err(HandlerError::PermissionDenied);
         }
         let wallet = &segs[0];
+        if let Some(number) = segs
+            .get(1)
+            .and_then(|segment| parse_account_segment(segment))
+        {
+            return self.write_account(wallet, number, &segs[2..]).await;
+        }
         if segs.len() >= 4 && segs[1] == "chains" && segs[3] == "outbox" {
             if let Some(engine) = self.solana_engine(&segs[2]) {
                 return self
@@ -3104,8 +3123,18 @@ impl WalletsHandler {
         }
         let wallet = &segs[0];
         let _projection = self.wallet_projection(wallet).await?;
+        if let Some(number) = segs
+            .get(1)
+            .and_then(|segment| parse_account_segment(segment))
+        {
+            return self.list_account(wallet, number, &segs[2..]).await;
+        }
         match segs.len() {
-            1 => Ok(Self::wallet_dir_entries()),
+            1 => {
+                let mut entries = Self::wallet_dir_entries();
+                entries.extend(self.account_number_entries(wallet).await?);
+                Ok(entries)
+            }
             2 if segs[1] == "chains" => {
                 // Solana chains dispatch through their own engine map
                 // (`self.solana`), not the EVM `ChainRegistry` — list both.
@@ -4673,6 +4702,342 @@ mod tests {
             freshness: ProjectionFreshness::Fresh,
             verification: ProjectionVerification::AuthenticatedBroker,
         }))
+    }
+
+    /// A BIP-39 projection: no signable root; the canonical initial EVM child
+    /// `m/44'/60'/0'/0/0` is the primary key. Its numbered accounts come from
+    /// `wallet.accounts`, served by [`AccountsBroker`].
+    fn bip39_projection(address: Address) -> Arc<dyn WalletProjectionReader> {
+        let wallet_id = token("alice");
+        let key_ref = KeyRef {
+            backend: token("local"),
+            backend_instance: token("alice"),
+            locator: "alice/evm-0".into(),
+            key_spec: KeySpec::Secp256k1,
+            public_key_fingerprint: digest(72),
+            derivation: Some(bloom_broker_api::DerivationRef::Bip39Multicurve {
+                wallet_seed_ref: token("alice"),
+                profile: bloom_broker_api::DerivationProfile::Bip44EvmSecp256k1V1,
+                path: "m/44'/60'/0'/0/0".into(),
+            }),
+        };
+        let canonical = serde_jcs::to_vec(&CanonicalWalletPolicy {
+            wallet_id: wallet_id.clone(),
+            maximum_approval_lifetime_ms: 300_000,
+            allowed_petal_packages: Vec::new(),
+            allowed_destinations: Vec::new(),
+            required_verifiers: Vec::new(),
+        })
+        .unwrap();
+        let policy_digest = Digest32::from_bytes(sha2::Sha256::digest(&canonical).into());
+        Arc::new(StaticProjection(WalletProjection {
+            wallet: WalletPublic {
+                wallet_id: wallet_id.clone(),
+                wallet_kind: token("local"),
+                root_key_ref: None,
+                key_refs: vec![key_ref.clone()],
+                policy_version: DecimalU64::new(1),
+                policy_digest: policy_digest.clone(),
+                wallet_revocation_epoch: DecimalU64::new(0),
+            },
+            keys: vec![KeyPublic {
+                key_ref,
+                role: bloom_broker_api::KeyRole::Derived,
+                canonical_public_key: Base64UrlBytes::from_bytes(&[3; 33]),
+                addresses: vec![format!("{address:#x}")],
+                supported_crypto_suites: vec![CryptoSuite::Secp256k1Keccak256Recoverable],
+            }],
+            credentials: Vec::<CredentialPublic>::new(),
+            policy: SignedPolicySnapshot {
+                wallet_id,
+                version: DecimalU64::new(1),
+                canonical_policy: Base64UrlBytes::from_bytes(&canonical),
+                policy_digest,
+                policy_signing_key_id: token("policy-key"),
+                policy_verifying_key: Base64UrlBytes::from_bytes(&[4; 32]),
+                signer_signature: Base64UrlBytes::from_bytes(&[5; 64]),
+            },
+            source_protocol: "bloom.machine-broker.v1".into(),
+            response_digest: digest(73),
+            observed_at_ms: 1,
+            freshness: ProjectionFreshness::Fresh,
+            verification: ProjectionVerification::AuthenticatedBroker,
+        }))
+    }
+
+    /// One derived child as `wallet.accounts` projects it.
+    fn derived_account(
+        profile: bloom_broker_api::DerivationProfile,
+        path: &str,
+        seed: u8,
+        address: &str,
+    ) -> bloom_broker_api::DerivedAccountPublic {
+        use bloom_broker_api::DerivationProfile as Profile;
+        let (key_spec, encoding, spki, chain_family, caip2, address_encoding) = match profile {
+            Profile::Bip44EvmSecp256k1V1 => (
+                KeySpec::Secp256k1,
+                bloom_broker_api::PublicKeyEncoding::Secp256k1SpkiDer,
+                vec![seed; 88],
+                "evm",
+                "eip155:31337",
+                bloom_broker_api::AddressEncoding::Hex0x,
+            ),
+            Profile::Bip44SolanaSlip10Ed25519V1 => {
+                let mut spki = vec![
+                    0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
+                ];
+                spki.extend_from_slice(&[seed; 32]);
+                (
+                    KeySpec::Ed25519,
+                    bloom_broker_api::PublicKeyEncoding::Ed25519SpkiDer,
+                    spki,
+                    "solana",
+                    "solana:test",
+                    bloom_broker_api::AddressEncoding::Base58,
+                )
+            }
+        };
+        let fingerprint = Digest32::from_bytes(sha2::Sha256::digest(&spki).into());
+        bloom_broker_api::DerivedAccountPublic {
+            key_ref: KeyRef {
+                backend: token("local"),
+                backend_instance: token("alice"),
+                locator: path.to_owned(),
+                key_spec,
+                public_key_fingerprint: fingerprint.clone(),
+                derivation: Some(bloom_broker_api::DerivationRef::Bip39Multicurve {
+                    wallet_seed_ref: token("alice"),
+                    profile,
+                    path: path.to_owned(),
+                }),
+            },
+            wallet_seed_profile: WalletSeedProfile::Bip39MulticurveV1,
+            derivation_profile: profile,
+            path: path.to_owned(),
+            canonical_public_key: Base64UrlBytes::from_bytes(&spki),
+            public_key_encoding: encoding,
+            public_key_fingerprint: fingerprint,
+            supported_crypto_suites: profile.frozen_crypto_suites().to_vec(),
+            chain_projections: vec![bloom_broker_api::ChainAccountProjection {
+                chain_family: token(chain_family),
+                caip2: caip2.into(),
+                caip10: format!("{caip2}:{address}"),
+                address: address.to_owned(),
+                address_encoding,
+            }],
+            lifecycle: bloom_broker_api::AccountLifecycleState::Active,
+        }
+    }
+
+    /// A Broker fake answering `wallet.accounts` with a fixed account list.
+    struct AccountsBroker {
+        accounts: Vec<bloom_broker_api::DerivedAccountPublic>,
+    }
+
+    impl MachineBrokerService for AccountsBroker {
+        fn dispatch<'a>(
+            &'a self,
+            request: MachineBrokerRequest,
+        ) -> ServiceFuture<'a, MachineBrokerResponse> {
+            Box::pin(async move {
+                match request {
+                    MachineBrokerRequest::WalletAccounts(request) => Ok(
+                        MachineBrokerResponse::WalletAccounts(WalletAccountsPublic {
+                            wallet_id: request.wallet_id,
+                            seed_profile: WalletSeedProfile::Bip39MulticurveV1,
+                            accounts: self.accounts.clone(),
+                        }),
+                    ),
+                    other => Err(ProtocolError::new(
+                        ProtocolErrorCode::BackendUnsupported,
+                        format!("unexpected request in accounts fixture: {other:?}"),
+                    )),
+                }
+            })
+        }
+    }
+
+    fn vfs(path: String) -> VfsPath {
+        VfsPath::parse(&path).unwrap()
+    }
+
+    #[tokio::test]
+    async fn numbered_accounts_are_listed_read_and_scoped_to_their_keys() {
+        use bloom_broker_api::DerivationProfile as Profile;
+        let f = make_handler_with_chain(true);
+        // Staged from account 0's key before the handler is rebuilt; the
+        // outbox lives on disk, so the rebuilt handler sees it.
+        seed_pending_with_created_ms(&f, "from-account-zero", 1_000);
+        let evm0 = bloom_proto::checksum_address(&f.wallet_addr);
+        let evm1 = bloom_proto::checksum_address(&Address::repeat_byte(0x22));
+        let broker = MachineBrokerClient::new(Arc::new(AccountsBroker {
+            accounts: vec![
+                derived_account(
+                    Profile::Bip44EvmSecp256k1V1,
+                    "m/44'/60'/0'/0/0",
+                    0x10,
+                    &evm0,
+                ),
+                derived_account(
+                    Profile::Bip44SolanaSlip10Ed25519V1,
+                    "m/44'/501'/0'/0'",
+                    0x20,
+                    "Sol0",
+                ),
+                derived_account(
+                    Profile::Bip44SolanaSlip10Ed25519V1,
+                    "m/44'/501'/1'/0'",
+                    0x21,
+                    "Sol1",
+                ),
+                derived_account(
+                    Profile::Bip44EvmSecp256k1V1,
+                    "m/44'/60'/0'/0/1",
+                    0x11,
+                    &evm1,
+                ),
+            ],
+        }));
+        let mut handler = f.handler.with_broker(Some(broker));
+        handler.wallet_projections = Some(bip39_projection(f.wallet_addr));
+        let w = &f.wallet_name;
+
+        // The wallet lists its numbers, and only its numbers.
+        let names: Vec<String> = handler
+            .list(&vfs(format!("/{w}")))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect();
+        assert!(names.contains(&"0".to_string()), "{names:?}");
+        assert!(names.contains(&"1".to_string()), "{names:?}");
+        assert!(!names.contains(&"2".to_string()), "{names:?}");
+        handler.lookup(&vfs(format!("/{w}/1"))).await.unwrap();
+        for absent in ["2", "01", "1a"] {
+            assert!(
+                matches!(
+                    handler.lookup(&vfs(format!("/{w}/{absent}"))).await,
+                    Err(HandlerError::NotFound(_))
+                ),
+                "{absent} must not resolve"
+            );
+        }
+
+        // account.json carries both families with their paths and addresses.
+        let one: serde_json::Value = serde_json::from_slice(
+            &handler
+                .read(&vfs(format!("/{w}/1/account.json")))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(one["number"], 1);
+        assert_eq!(one["evm"]["state"], "active");
+        assert_eq!(one["evm"]["address"], evm1);
+        assert_eq!(one["evm"]["path"], "m/44'/60'/0'/0/1");
+        assert_eq!(one["solana"]["state"], "active");
+        assert_eq!(one["solana"]["address"], "Sol1");
+        assert_eq!(one["freshness"], "fresh");
+
+        // accounts.json names each entry's number.
+        let all: serde_json::Value = serde_json::from_slice(
+            &handler
+                .read(&vfs(format!("/{w}/accounts.json")))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let numbers: Vec<u64> = all["accounts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["number"].as_u64().unwrap())
+            .collect();
+        assert_eq!(numbers, [0, 0, 1, 1]);
+
+        // Chains under an account are the wallet's chains, re-rooted.
+        let chains: Vec<String> = handler
+            .list(&vfs(format!("/{w}/1/chains")))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect();
+        assert!(chains.contains(&"anvil".to_string()), "{chains:?}");
+        let leaves: Vec<String> = handler
+            .list(&vfs(format!("/{w}/1/chains/anvil")))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect();
+        assert!(leaves.contains(&"balance".to_string()) && leaves.contains(&"outbox".to_string()));
+
+        // The pending entry staged from account 0's key is visible only there.
+        let pending = |number: u32| vfs(format!("/{w}/{number}/chains/anvil/outbox/pending"));
+        let zero_pending: Vec<String> = handler
+            .list(&pending(0))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect();
+        assert_eq!(zero_pending, ["from-account-zero"]);
+        assert!(handler.list(&pending(1)).await.unwrap().is_empty());
+        handler
+            .lookup(&vfs(format!(
+                "/{w}/0/chains/anvil/outbox/pending/from-account-zero"
+            )))
+            .await
+            .unwrap();
+        assert!(matches!(
+            handler
+                .lookup(&vfs(format!(
+                    "/{w}/1/chains/anvil/outbox/pending/from-account-zero"
+                )))
+                .await,
+            Err(HandlerError::NotFound(_))
+        ));
+
+        // Staging through a numbered account is not available yet and says so.
+        assert!(matches!(
+            handler
+                .write(&vfs(format!("/{w}/1/chains/anvil/outbox/new.tx")), b"{}")
+                .await,
+            Err(HandlerError::Unsupported(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_legacy_wallet_is_account_zero() {
+        let f = make_handler();
+        let w = &f.wallet_name;
+        let names: Vec<String> = f
+            .handler
+            .list(&vfs(format!("/{w}")))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect();
+        assert!(names.contains(&"0".to_string()), "{names:?}");
+        assert!(!names.contains(&"1".to_string()), "{names:?}");
+        let zero: serde_json::Value = serde_json::from_slice(
+            &f.handler
+                .read(&vfs(format!("/{w}/0/account.json")))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(zero["number"], 0);
+        assert_eq!(zero["evm"]["state"], "active");
+        assert!(zero["evm"]["path"].is_null());
+        assert_eq!(zero["solana"]["state"], "missing");
+        assert!(matches!(
+            f.handler.lookup(&vfs(format!("/{w}/1"))).await,
+            Err(HandlerError::NotFound(_))
+        ));
     }
 
     impl MachineBrokerService for ApprovalBroker {

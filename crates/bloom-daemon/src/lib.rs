@@ -425,18 +425,44 @@ impl DaemonPetalHost {
         self
     }
 
-    fn petal_key_state_path(&self, lineage_id: &str, key_slot: &str) -> Result<PathBuf, HostError> {
+    /// Where a Petal key request's state lives. The identity includes the
+    /// wallet: two wallets may run the same Petal with the same key slot and
+    /// must never share request state. A file written under the earlier
+    /// wallet-free identity is moved here the first time it is looked up, so
+    /// an in-flight ceremony survives the upgrade.
+    fn petal_key_state_path(
+        &self,
+        wallet_id: &str,
+        lineage_id: &str,
+        key_slot: &str,
+    ) -> Result<PathBuf, HostError> {
         let root = self.petal_key_state_root.as_ref().ok_or_else(|| {
             HostError::Backend("Petal key request state is not configured".into())
         })?;
         let identity = blake3::hash(
             format!(
-                "bloom-petal-key-request-state/v2\0{}\0{}",
-                lineage_id, key_slot
+                "bloom-petal-key-request-state/v3\0{}\0{}\0{}",
+                wallet_id, lineage_id, key_slot
             )
             .as_bytes(),
         );
-        Ok(root.join(format!("{}.json", identity.to_hex())))
+        let path = root.join(format!("{}.json", identity.to_hex()));
+        if !path.exists() {
+            let legacy_identity = blake3::hash(
+                format!(
+                    "bloom-petal-key-request-state/v2\0{}\0{}",
+                    lineage_id, key_slot
+                )
+                .as_bytes(),
+            );
+            let legacy = root.join(format!("{}.json", legacy_identity.to_hex()));
+            if legacy.exists() {
+                std::fs::rename(&legacy, &path).map_err(|error| {
+                    HostError::Backend(format!("migrate Petal key request state: {error}"))
+                })?;
+            }
+        }
+        Ok(path)
     }
 
     fn read_petal_key_state(path: &Path) -> Result<Option<PetalKeyRequestState>, HostError> {
@@ -1007,15 +1033,35 @@ impl PetalHost for DaemonPetalHost {
         let wallet = broker.wallet(wallet_id.clone()).await.map_err(|error| {
             HostError::Denied(format!("{}: {}", error.code.as_str(), error.message))
         })?;
-        let eligible_parents = wallet
-            .key_refs
-            .iter()
-            .filter(|key| {
-                key.derivation.is_none()
-                    && suites.iter().all(|suite| suite.key_spec() == key.key_spec)
-            })
-            .cloned()
-            .collect::<Vec<_>>();
+        // Owner-key candidates come from authenticated classification, never
+        // from the shape of `KeyRef.derivation`: a BIP-39 child carries a
+        // derivation reference too, and filtering on its absence excluded
+        // the owner's own keys. A legacy wallet names its signable root; a
+        // BIP-39 wallet's owner keys are its active derived accounts.
+        let eligible_parents = if let Some(root) = &wallet.root_key_ref {
+            if suites.iter().all(|suite| suite.key_spec() == root.key_spec) {
+                vec![root.clone()]
+            } else {
+                Vec::new()
+            }
+        } else {
+            broker
+                .wallet_accounts(wallet_id.clone())
+                .await
+                .map_err(|error| {
+                    HostError::Denied(format!("{}: {}", error.code.as_str(), error.message))
+                })?
+                .accounts
+                .into_iter()
+                .filter(|account| {
+                    account.lifecycle == bloom_broker_api::AccountLifecycleState::Active
+                        && suites
+                            .iter()
+                            .all(|suite| account.supported_crypto_suites.contains(suite))
+                })
+                .map(|account| account.key_ref)
+                .collect::<Vec<_>>()
+        };
         let [parent_key_ref] = eligible_parents.as_slice() else {
             return Err(HostError::Denied(
                 "wallet must expose exactly one parent KeyRef compatible with the requested suites"
@@ -1088,7 +1134,8 @@ impl PetalHost for DaemonPetalHost {
                 .digest()
                 .map_err(|error| HostError::Denied(error.to_string()))?,
         );
-        let path = self.petal_key_state_path(&lineage.lineage_id, key_slot.as_str())?;
+        let path =
+            self.petal_key_state_path(wallet_id.as_str(), &lineage.lineage_id, key_slot.as_str())?;
 
         if let Some(mut stored) = Self::read_petal_key_state(&path)? {
             if stored.schema != PETAL_KEY_STATE_SCHEMA
@@ -5545,6 +5592,7 @@ mod tests {
 
         let state_path = host
             .petal_key_state_path(
+                "primary",
                 "pln1_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                 &request.key_slot,
             )
