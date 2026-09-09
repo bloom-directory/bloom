@@ -2490,6 +2490,27 @@ fn is_public_solana_outbox_artifact(name: &str) -> bool {
     PUBLIC_SOLANA_OUTBOX_ARTIFACTS.contains(&name)
 }
 
+/// The Solana account a `wallets/<w>/<n>/` path fixes: the child's full
+/// lowercase hex fingerprint and its base58 address.
+#[derive(Clone, Copy)]
+struct SolanaSender<'a> {
+    fingerprint: &'a str,
+    address: &'a str,
+}
+
+/// A staged Solana transfer belongs to the account whose key it pinned.
+/// Entries staged before fingerprints were pinned belong to the key whose
+/// address paid the fee, which is what the wallet-level path has always meant.
+fn solana_entry_belongs(
+    staged: &bloom_solana_tx::types::StagedSolanaTransfer,
+    sender: &SolanaSender<'_>,
+) -> bool {
+    match staged.account_fingerprint.as_deref() {
+        Some(fingerprint) => fingerprint == sender.fingerprint,
+        None => staged.fee_payer == sender.address,
+    }
+}
+
 fn solana_outbox_err(e: bloom_solana_tx::outbox::OutboxError) -> HandlerError {
     match e {
         bloom_solana_tx::outbox::OutboxError::NotFound(id) => HandlerError::not_found(id),
@@ -3022,12 +3043,12 @@ impl WalletsHandler {
             .get(1)
             .and_then(|segment| parse_account_segment(segment))
         {
-            return self.write_account(wallet, number, &segs[2..]).await;
+            return self.write_account(wallet, number, &segs[2..], data).await;
         }
         if segs.len() >= 4 && segs[1] == "chains" && segs[3] == "outbox" {
             if let Some(engine) = self.solana_engine(&segs[2]) {
                 return self
-                    .write_solana_outbox(wallet, &segs[2], &segs[4..], data, &engine)
+                    .write_solana_outbox(wallet, &segs[2], &segs[4..], data, &engine, None)
                     .await;
             }
             // A Solana chain with no engine is readable but cannot stage.
@@ -3935,6 +3956,11 @@ impl WalletsHandler {
         SolanaAccount::from_projection(account)
     }
 
+    /// The Solana outbox write surface. `pinned` is the account a
+    /// `wallets/<w>/<n>/` path fixes: every new stage spends from it, an
+    /// intent naming any other account is refused, and the pending controls
+    /// act only on entries it staged. The wallet-level path passes `None`
+    /// and keeps its selector-by-fingerprint behaviour.
     async fn write_solana_outbox(
         &self,
         wallet: &str,
@@ -3942,13 +3968,37 @@ impl WalletsHandler {
         rest: &[String],
         data: &[u8],
         engine: &Arc<bloom_solana_tx::engine::SolanaTransferEngine>,
+        pinned: Option<SolanaSender<'_>>,
     ) -> Result<(), HandlerError> {
+        let require_pinned = |staged: &bloom_solana_tx::types::StagedSolanaTransfer,
+                              id: &str|
+         -> Result<(), HandlerError> {
+            match &pinned {
+                Some(sender) if !solana_entry_belongs(staged, sender) => {
+                    Err(HandlerError::not_found(format!("outbox/{}/{id}", rest[0])))
+                }
+                _ => Ok(()),
+            }
+        };
         match rest {
             // outbox/new.tx — stage a native transfer.
             [s] if s == "new.tx" => {
                 self.write_permit()?;
-                let intent: bloom_solana_tx::SolanaTransferIntent = serde_json::from_slice(data)
-                    .map_err(|e| HandlerError::invalid(format!("invalid Solana intent: {e}")))?;
+                let mut intent: bloom_solana_tx::SolanaTransferIntent =
+                    serde_json::from_slice(data).map_err(|e| {
+                        HandlerError::invalid(format!("invalid Solana intent: {e}"))
+                    })?;
+                if let Some(sender) = &pinned {
+                    if let Some(named) = intent.account_fingerprint.as_deref()
+                        && !sender.fingerprint.starts_with(&named.to_ascii_lowercase())
+                    {
+                        return Err(HandlerError::invalid(format!(
+                            "intent names account {named}, but this path stages from {}",
+                            sender.fingerprint
+                        )));
+                    }
+                    intent.account_fingerprint = Some(sender.fingerprint.to_owned());
+                }
                 let destination = intent.destination_bytes().map_err(HandlerError::invalid)?;
                 let child = self
                     .resolve_solana_child(wallet, intent.account_fingerprint.as_deref())
@@ -3995,6 +4045,7 @@ impl WalletsHandler {
                         bloom_solana_tx::outbox::SolanaOutboxState::Pending,
                     )
                     .map_err(solana_outbox_err)?;
+                require_pinned(&entry.staged, id)?;
                 // Re-select the exact account this transfer was staged
                 // against. Resolving the wallet's children again would let a
                 // second active child sign a message staged for the first.
@@ -4086,6 +4137,18 @@ impl WalletsHandler {
             // a successful cancel can never race an on-chain submission.
             [state, id, fname] if state == "pending" && fname == "cancel" => {
                 self.write_permit()?;
+                if pinned.is_some() {
+                    let entry = engine
+                        .outbox()
+                        .read_in_state(
+                            wallet,
+                            chain,
+                            id,
+                            bloom_solana_tx::outbox::SolanaOutboxState::Pending,
+                        )
+                        .map_err(solana_outbox_err)?;
+                    require_pinned(&entry.staged, id)?;
+                }
                 engine
                     .cancel(wallet, id)
                     .await
@@ -4122,6 +4185,7 @@ impl WalletsHandler {
                     .outbox()
                     .read_restageable(wallet, chain, id)
                     .map_err(solana_outbox_err)?;
+                require_pinned(&expired.staged, id)?;
                 let child = self
                     .resolve_solana_child(wallet, expired.staged.account_fingerprint.as_deref())
                     .await?;
@@ -4250,6 +4314,8 @@ impl WalletsHandler {
         }
     }
 
+    /// `wallets/<w>/chains/<c>/outbox/...`: the wallet-level path stages
+    /// from the wallet's canonical initial key, which is account 0.
     async fn write_outbox(
         &self,
         wallet: &str,
@@ -4258,6 +4324,49 @@ impl WalletsHandler {
         data: &[u8],
     ) -> Result<(), HandlerError> {
         let (wallet_address, policy) = self.planning_wallet_inputs(wallet, chain).await?;
+        self.write_outbox_from(wallet, chain, wallet_address, &policy, None, rest, data)
+            .await
+    }
+
+    /// Under `wallets/<w>/<n>/`, a pending entry is actionable only when
+    /// this account's key staged it; another account's entry is not found.
+    fn require_staged_by(
+        &self,
+        wallet: &str,
+        chain: &str,
+        id: &str,
+        sender: Option<&str>,
+    ) -> Result<(), HandlerError> {
+        let Some(sender) = sender else {
+            return Ok(());
+        };
+        let entry = self
+            .tx_engine
+            .outbox
+            .read_in_state(wallet, chain, id, OutboxState::Pending)
+            .map_err(err_be)?;
+        if !entry.staged.from.eq_ignore_ascii_case(sender) {
+            return Err(HandlerError::not_found(format!("outbox/pending/{id}")));
+        }
+        Ok(())
+    }
+
+    /// The EVM outbox write surface for one explicit sender. `from` is the
+    /// address every new stage is built for; the key that later signs is
+    /// resolved from that address by the transaction engine, so a stage from
+    /// account 1 can never be signed by account 0. `scope` is `Some(from)`
+    /// under a numbered account, which also fences the pending controls.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn write_outbox_from(
+        &self,
+        wallet: &str,
+        chain: &str,
+        from: alloy::primitives::Address,
+        policy: &Policy,
+        scope: Option<&str>,
+        rest: &[String],
+        data: &[u8],
+    ) -> Result<(), HandlerError> {
         let client = self
             .chains
             .get(chain)
@@ -4273,10 +4382,10 @@ impl WalletsHandler {
                     .stage(
                         self.write_permit()?,
                         wallet,
-                        wallet_address,
+                        from,
                         intent,
                         &client,
-                        &policy,
+                        policy,
                         Some(&self.address_book),
                     )
                     .await
@@ -4288,6 +4397,7 @@ impl WalletsHandler {
             [state, id, fname]
                 if state == "pending" && (fname == "confirm" || fname == "confirm.override") =>
             {
+                self.require_staged_by(wallet, chain, id, scope)?;
                 // Fix #9: confirm must have non-empty content. Quietly
                 // accepting an empty body (the old behaviour) made every
                 // empty `> confirm` a footgun that broadcast a tx.
@@ -4322,7 +4432,7 @@ impl WalletsHandler {
                         chain,
                         id,
                         &client,
-                        &policy,
+                        policy,
                         confirm_text,
                     )
                     .await
@@ -4338,6 +4448,7 @@ impl WalletsHandler {
             // outbox/pending/<id>/cancel — fire a self-send replacement.
             // Same content rules as confirm (fix #9 / #10).
             [state, id, fname] if state == "pending" && fname == "cancel" => {
+                self.require_staged_by(wallet, chain, id, scope)?;
                 let cancel_text = std::str::from_utf8(data)
                     .map_err(|_| HandlerError::invalid("non-utf8 cancel content"))?
                     .trim();
@@ -4350,15 +4461,7 @@ impl WalletsHandler {
                     .await?;
                 let _ = self
                     .tx_engine
-                    .cancel(
-                        self.write_permit()?,
-                        wallet,
-                        chain,
-                        id,
-                        &client,
-                        10,
-                        &policy,
-                    )
+                    .cancel(self.write_permit()?, wallet, chain, id, &client, 10, policy)
                     .await
                     .map_err(err_be)?;
                 Ok(())
@@ -4369,6 +4472,7 @@ impl WalletsHandler {
             // diff against the bumped tx is visible; the engine writes
             // `replacement_intent.json` alongside.
             [state, id, fname] if state == "pending" && fname == "replace" => {
+                self.require_staged_by(wallet, chain, id, scope)?;
                 let body = std::str::from_utf8(data)
                     .map_err(|_| HandlerError::invalid("non-utf8 replace intent"))?;
                 if body.trim().is_empty() {
@@ -4395,7 +4499,7 @@ impl WalletsHandler {
                         10,
                         Some(intent),
                         Some(self.address_book.as_ref()),
-                        &policy,
+                        policy,
                     )
                     .await
                     .map_err(err_be)?;
@@ -5000,13 +5104,65 @@ mod tests {
             Err(HandlerError::NotFound(_))
         ));
 
-        // Staging through a numbered account is not available yet and says so.
+        // Each account offers its own new.tx and, for its pending entries,
+        // the same writable controls as the wallet-level outbox.
+        let new_tx = handler
+            .lookup(&vfs(format!("/{w}/1/chains/anvil/outbox/new.tx")))
+            .await
+            .unwrap();
+        assert_eq!(new_tx.mode, 0o644);
+        let controls: Vec<String> = handler
+            .list(&vfs(format!(
+                "/{w}/0/chains/anvil/outbox/pending/from-account-zero"
+            )))
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|entry| entry.mode == 0o644)
+            .map(|entry| entry.name)
+            .collect();
+        assert_eq!(
+            controls,
+            ["confirm", "confirm.override", "replace", "cancel"]
+        );
+
+        // Account 1 cannot act on an entry account 0 staged: the pending
+        // controls fence on the staged sender before anything else runs.
+        let confirm = |number: u32| {
+            vfs(format!(
+                "/{w}/{number}/chains/anvil/outbox/pending/from-account-zero/confirm"
+            ))
+        };
         assert!(matches!(
-            handler
-                .write(&vfs(format!("/{w}/1/chains/anvil/outbox/new.tx")), b"{}")
-                .await,
-            Err(HandlerError::Unsupported(_))
+            handler.write(&confirm(1), b"y").await,
+            Err(HandlerError::NotFound(_))
         ));
+        // Account 0 passes the fence and reaches the engine, which fails on
+        // this test's dead RPC endpoint rather than on the path.
+        let through = handler.write(&confirm(0), b"y").await.unwrap_err();
+        assert!(
+            !matches!(
+                through,
+                HandlerError::NotFound(_) | HandlerError::Unsupported(_)
+            ),
+            "{through:?}"
+        );
+        // A stage under account 1 is built for account 1's address; here it
+        // fails at the same dead endpoint, not at the path.
+        let staged = handler
+            .write(
+                &vfs(format!("/{w}/1/chains/anvil/outbox/new.tx")),
+                b"to = \"0x0000000000000000000000000000000000000002\"\nvalue = \"0\"\n",
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            !matches!(
+                staged,
+                HandlerError::NotFound(_) | HandlerError::Unsupported(_)
+            ),
+            "{staged:?}"
+        );
     }
 
     #[tokio::test]

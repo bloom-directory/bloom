@@ -8,9 +8,11 @@
 //! the sender fixed to the account's key for the chain's family instead of
 //! the wallet's canonical initial key.
 //!
-//! This is the read side. Staging under a numbered account lands together
-//! with the explicit-sender change to the EVM outbox; until then a write here
-//! says so rather than staging from the wrong key.
+//! Writes go through the same outbox code with the sender fixed: an EVM stage
+//! is built for the account's address and later signed by the key the
+//! transaction engine resolves from that address; a Solana stage pins the
+//! account's fingerprint. Pending controls under `<n>/` act only on entries
+//! that account staged.
 
 use super::*;
 use bloom_broker_api::{AccountLifecycleState, DerivationProfile, DerivedAccountPublic};
@@ -341,18 +343,62 @@ impl WalletsHandler {
         }
     }
 
+    /// Writes under `<n>/chains/<c>/outbox/`: the wallet's outbox surface
+    /// with the sender fixed to this account's key for the chain's family.
+    /// Policy stays wallet-wide, so the same advisory policy applies.
     pub(super) async fn write_account(
         &self,
         wallet: &str,
         number: u32,
-        _rest: &[String],
+        rest: &[String],
+        data: &[u8],
     ) -> Result<(), HandlerError> {
-        // Confirm the account exists so the error names the real limitation.
-        self.account_view(wallet, number).await?;
-        Err(HandlerError::Unsupported(format!(
-            "staging through wallets/{wallet}/{number}/ is not available yet; \
-             wallets/{wallet}/chains/... stages from account 0"
-        )))
+        let view = self.account_view(wallet, number).await?;
+        let [dir, chain, sub, chain_rest @ ..] = rest else {
+            return Err(HandlerError::PermissionDenied);
+        };
+        if dir != "chains" || sub != "outbox" {
+            return Err(HandlerError::PermissionDenied);
+        }
+        if self.is_solana_chain(chain) {
+            let (family, _) = Self::solana_family(&view, chain)?;
+            let engine = self.solana_engine(chain).ok_or_else(|| {
+                HandlerError::not_found(format!(
+                    "chain '{chain}' is configured for reads only; staging is unavailable"
+                ))
+            })?;
+            return self
+                .write_solana_outbox(
+                    wallet,
+                    chain,
+                    chain_rest,
+                    data,
+                    &engine,
+                    Some(Self::solana_sender(family)),
+                )
+                .await;
+        }
+        let family = Self::evm_family(&view, chain)?;
+        let from = Self::evm_address(family)?;
+        let projection = self.wallet_projection(wallet).await?;
+        let policy = crate::advisory_evm_policy(&projection, chain).map_err(err_be)?;
+        self.write_outbox_from(
+            wallet,
+            chain,
+            from,
+            &policy,
+            Some(&family.address),
+            chain_rest,
+            data,
+        )
+        .await
+    }
+
+    fn solana_sender(family: &FamilyKey) -> SolanaSender<'_> {
+        SolanaSender {
+            fingerprint: &family.fingerprint,
+            address: &family.address,
+        }
     }
 
     // ----- EVM -----
@@ -378,6 +424,9 @@ impl WalletsHandler {
                 Ok(Entry::file(leaf))
             }
             [dir] if dir == "outbox" => Ok(Entry::dir("outbox")),
+            [dir, leaf] if dir == "outbox" && leaf == "new.tx" => {
+                Ok(Entry::writable_file("new.tx"))
+            }
             [dir, state] if dir == "outbox" => {
                 parse_state_seg(state)?;
                 Ok(Entry::dir(state))
@@ -388,6 +437,13 @@ impl WalletsHandler {
             }
             [dir, state, id, fname] if dir == "outbox" => {
                 let entry = self.account_evm_outbox_entry(wallet, family, chain, state, id)?;
+                if entry.state == OutboxState::Pending
+                    && EVM_PENDING_CONTROLS.contains(&fname.as_str())
+                {
+                    return Ok(
+                        Entry::writable_file(fname).with_modified_ms(entry.staged.created_ms)
+                    );
+                }
                 open_regular_outbox_artifact(&entry.dir, fname)?;
                 Ok(Entry::file(fname).with_modified_ms(entry.staged.created_ms))
             }
@@ -467,6 +523,7 @@ impl WalletsHandler {
                 Entry::dir("outbox"),
             ]),
             [dir] if dir == "outbox" => Ok(vec![
+                Entry::writable_file("new.tx"),
                 Entry::dir("pending"),
                 Entry::dir("sent"),
                 Entry::dir("failed"),
@@ -497,9 +554,15 @@ impl WalletsHandler {
                     for item in read_dir.flatten() {
                         if let Some(name) = item.file_name().to_str()
                             && item.file_type().map(|t| t.is_file()).unwrap_or(false)
+                            && !EVM_PENDING_CONTROLS.contains(&name)
                         {
                             out.push(Entry::file(name));
                         }
+                    }
+                }
+                if entry.state == OutboxState::Pending {
+                    for control in EVM_PENDING_CONTROLS {
+                        out.push(Entry::writable_file(control));
                     }
                 }
                 Ok(out)
@@ -543,6 +606,14 @@ impl WalletsHandler {
             [] => Ok(Entry::dir(chain)),
             [leaf] if Self::SOLANA_ACCOUNT_LEAVES.contains(&leaf.as_str()) => Ok(Entry::file(leaf)),
             [dir] if dir == "outbox" => Ok(Entry::dir("outbox")),
+            [dir, leaf] if dir == "outbox" && leaf == "new.tx" => {
+                self.solana_engine(chain).ok_or_else(|| {
+                    HandlerError::not_found(format!(
+                        "chain '{chain}' is configured for reads only; staging is unavailable"
+                    ))
+                })?;
+                Ok(Entry::writable_file("new.tx"))
+            }
             [dir, state] if dir == "outbox" && solana_state(state).is_some() => {
                 Ok(Entry::dir(state))
             }
@@ -552,6 +623,13 @@ impl WalletsHandler {
             }
             [dir, state, id, fname] if dir == "outbox" => {
                 let entry = self.account_solana_outbox_entry(wallet, family, chain, state, id)?;
+                if solana_state(state) == Some(bloom_solana_tx::outbox::SolanaOutboxState::Pending)
+                    && SOLANA_PENDING_CONTROLS.contains(&fname.as_str())
+                {
+                    return Ok(
+                        Entry::writable_file(fname).with_modified_ms(entry.staged.created_ms)
+                    );
+                }
                 if !is_public_solana_outbox_artifact(fname) {
                     return Err(HandlerError::not_found(fname));
                 }
@@ -610,6 +688,7 @@ impl WalletsHandler {
                 Ok(entries)
             }
             [dir] if dir == "outbox" => Ok(vec![
+                Entry::writable_file("new.tx"),
                 Entry::dir("pending"),
                 Entry::dir("sent"),
                 Entry::dir("failed"),
@@ -631,7 +710,7 @@ impl WalletsHandler {
                     let Ok(entry) = engine.outbox().read_in_state(wallet, chain, &id, st) else {
                         continue;
                     };
-                    if Self::solana_entry_belongs(&entry.staged, family) {
+                    if solana_entry_belongs(&entry.staged, &Self::solana_sender(family)) {
                         entries.push(Entry::dir(&id).with_modified_ms(entry.staged.created_ms));
                     }
                 }
@@ -650,22 +729,15 @@ impl WalletsHandler {
                         }
                     }
                 }
+                if solana_state(state) == Some(bloom_solana_tx::outbox::SolanaOutboxState::Pending)
+                {
+                    for control in SOLANA_PENDING_CONTROLS {
+                        out.push(Entry::writable_file(control));
+                    }
+                }
                 Ok(out)
             }
             _ => Err(HandlerError::NotADir(rest.join("/"))),
-        }
-    }
-
-    /// A staged Solana transfer belongs to the account whose key it pinned.
-    /// Entries staged before fingerprints were pinned belong to account 0,
-    /// which is what the wallet-level path has always meant.
-    fn solana_entry_belongs(
-        staged: &bloom_solana_tx::types::StagedSolanaTransfer,
-        family: &FamilyKey,
-    ) -> bool {
-        match staged.account_fingerprint.as_deref() {
-            Some(fingerprint) => fingerprint == family.fingerprint,
-            None => staged.fee_payer == family.address,
         }
     }
 
@@ -688,12 +760,17 @@ impl WalletsHandler {
             .outbox()
             .read_in_state(wallet, chain, id, st)
             .map_err(solana_outbox_err)?;
-        if !Self::solana_entry_belongs(&entry.staged, family) {
+        if !solana_entry_belongs(&entry.staged, &Self::solana_sender(family)) {
             return Err(HandlerError::not_found(format!("outbox/{state}/{id}")));
         }
         Ok(entry)
     }
 }
+
+/// The virtual write sinks a pending EVM entry advertises.
+const EVM_PENDING_CONTROLS: [&str; 4] = ["confirm", "confirm.override", "replace", "cancel"];
+/// The virtual write sinks a pending Solana entry advertises.
+const SOLANA_PENDING_CONTROLS: [&str; 3] = ["confirm", "cancel", "restage"];
 
 #[cfg(test)]
 mod tests {
