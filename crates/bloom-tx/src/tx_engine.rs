@@ -50,7 +50,7 @@ sol! {
 use bloom_broker_api::{
     ApprovalLifecycleState, CryptoSuite, DecimalU64, Digest32, DurableEffect, OperationId,
     OperationState, ProtocolErrorCode, ProvenanceCatalog, ProvenanceRecord, ProvenanceSubject,
-    RequestNonce, SigningResult, Token,
+    RequestNonce, RetryClass, SigningResult, Token,
 };
 use bloom_proto::plan::ExecutionOrigin;
 use bloom_proto::{
@@ -1330,20 +1330,8 @@ impl TxEngine {
         let nonce = match intent.nonce {
             Some(n) => n,
             None => {
-                // Deliberately off the pinned session: `Session::nonce` is the
-                // *historical* count at the pinned block, and a transaction
-                // that has broadcast but not yet mined does not appear in it.
-                // `ChainClient::nonce` asks for the pending block instead, the
-                // same source the broadcast-time gap guard uses. Nonces belong
-                // with `gas_price` and `estimate_gas` on the bare client for
-                // exactly the reason given above: pending semantics do not fit
-                // the pinned model.
-                //
-                // The pinned read was a nonce collision. `highest_pending_nonce`
-                // only sees `pending/`, and broadcasting moves an entry to
-                // `sent/`, so between broadcast and inclusion neither source
-                // knew about the in-flight transaction and the next stage
-                // reused its nonce. Seen live on a Morpho approve→deposit pair.
+                // The pinned block misses broadcast-but-unmined transactions,
+                // which have already left our pending outbox. Ask the mempool.
                 let chain_nonce = chain.nonce(from).await?;
                 let pending_high = self
                     .outbox
@@ -3099,24 +3087,14 @@ impl TxEngine {
         let outcome = match service.broker.sign_exact_payload(request).await {
             Ok(outcome) => outcome,
             Err(error) => {
-                // `sign_dispatched` is set before the call on purpose: if we
-                // crash mid-flight we must assume a signature may exist. But a
-                // Broker that answers `durable_effect: none` is telling us it
-                // refused before anything durable happened, so leaving the
-                // marker set records a dispatch that provably did not occur.
-                //
-                // The cost of the lie is not cosmetic. It strands the row: a
-                // retry keeps re-reserving the same dead approval, and cancel
-                // is refused because the state says a signature might be out
-                // there. Clearing it here is what lets either one proceed.
+                // Replace a permanently refused lineage only when no durable
+                // effect occurred. Retryable and ambiguous failures retain it.
                 if state.approval_id.is_some()
+                    && error.code.contract().retry == RetryClass::Never
                     && error.code.contract().durable_effect == DurableEffect::None
                 {
-                    // The approval may itself be the reason for refusal (for
-                    // example ClaimInvalid after its validity window closed),
-                    // and Broker operation IDs are immutable. Replace every
-                    // identity in the refused lineage; retaining any of them
-                    // only submits the same dead request again.
+                    // Approval and operation IDs are immutable: clearing only
+                    // the dispatch marker would reuse the same dead request.
                     state = new_state()?;
                     write_triad_signing_state(&state_path, &state)?;
                 }
@@ -3314,17 +3292,8 @@ impl TxEngine {
                         OperationState::Denied
                         | OperationState::Cancelled
                         | OperationState::Failed => {
-                            // The Broker releases the reservation for these
-                            // three and calls them a definite terminal
-                            // failure: no signature was produced and none can
-                            // be. Holding `sign_dispatched` past that point
-                            // wedges the batch permanently — unlike the single
-                            // payload path there is no `action_id` gate to
-                            // supersede the row, so every later call re-reads
-                            // the same dead operation and denies. Broker
-                            // operation IDs and approvals are immutable, so
-                            // replace the entire lineage and mint a fresh
-                            // ceremony for the same ordered bytes.
+                            // Definite terminal failure: replace the dead
+                            // approval and operation IDs, keeping exact bytes.
                             state = new_state()?;
                             write_triad_batch_signing_state(&state_path, &state)?;
                             return Err(TxEngineError::ApprovalDenied(format!(
@@ -3333,12 +3302,8 @@ impl TxEngine {
                             )));
                         }
                         OperationState::Quarantined => {
-                            // Quarantine is the Broker reporting an ambiguous
-                            // provider effect: a signature may exist. The
-                            // marker stays, because re-signing these nonces
-                            // could double-spend them. Only the dead ceremony
-                            // URL is cleared, so the owner is not pointed at a
-                            // page that can no longer do anything.
+                            // A signature may exist. Keep its identity for
+                            // reconciliation, but stop offering the dead URL.
                             state.ceremony_url = None;
                             state.ceremony_expires_at_ms = None;
                             write_triad_batch_signing_state(&state_path, &state)?;
@@ -3426,18 +3391,12 @@ impl TxEngine {
         let outcome = match service.broker.sign_exact_payload_batch(request).await {
             Ok(outcome) => outcome,
             Err(error) => {
-                // Same reasoning as the single-payload path: the marker is
-                // written before dispatch so a crash is assumed to have signed,
-                // but `durable_effect: none` is the Broker saying it refused
-                // before anything durable happened. Leaving it set records a
-                // dispatch that provably did not occur, and for a batch that is
-                // unrecoverable — there is no `action_id` supersession here.
+                // Match single-payload recovery: preserve retryable or
+                // ambiguous outcomes, replace definite permanent refusals.
                 if state.approval_id.is_some()
+                    && error.code.contract().retry == RetryClass::Never
                     && error.code.contract().durable_effect == DurableEffect::None
                 {
-                    // A refusal can mean the active approval itself is stale,
-                    // and the signing operation ID is immutable even though it
-                    // never committed. Retry from an entirely fresh lineage.
                     state = new_state()?;
                     write_triad_batch_signing_state(&state_path, &state)?;
                 }
@@ -5907,10 +5866,35 @@ mod tests {
         let state_path = entry.dir.join(TRIAD_SIGNING_STATE_FILE);
         let first = read_triad_signing_state(&state_path).unwrap().unwrap();
 
-        // The shape seen live: the owner completes the ceremony, the commit is
-        // not issued before the approval's validity window closes, and the
-        // Broker then refuses the signature outright.
         fixture.active.store(true, Ordering::SeqCst);
+        // Recoverable and ambiguous errors must not mint another approval.
+        for code in ProtocolErrorCode::ALL.into_iter().filter(|code| {
+            code.contract().retry != RetryClass::Never
+                || code.contract().durable_effect != DurableEffect::None
+        }) {
+            *fixture.deny_sign.lock() = Some(code);
+            assert!(
+                engine
+                    .triad_sign_evm_payload(
+                        &entry,
+                        &staged,
+                        EvmOutboxActionKind::Confirm,
+                        &preimage,
+                        signing_hash,
+                    )
+                    .await
+                    .is_err(),
+                "{code:?}"
+            );
+            let held = read_triad_signing_state(&state_path).unwrap().unwrap();
+            assert!(held.sign_dispatched, "{code:?}");
+            assert_eq!(held.approval_id, first.approval_id, "{code:?}");
+            assert_eq!(
+                held.signing_operation_id, first.signing_operation_id,
+                "{code:?}"
+            );
+            assert_eq!(held.request_nonce, first.request_nonce, "{code:?}");
+        }
         *fixture.deny_sign.lock() = Some(ProtocolErrorCode::ClaimInvalid);
         assert!(matches!(
             engine
@@ -6278,10 +6262,30 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        // The owner completes the ceremony, the commit misses the approval's
-        // validity window, and the Broker refuses outright — the shape that
-        // stranded a live Morpho approve→deposit pair.
         fixture.active.store(true, Ordering::SeqCst);
+        for code in ProtocolErrorCode::ALL.into_iter().filter(|code| {
+            code.contract().retry != RetryClass::Never
+                || code.contract().durable_effect != DurableEffect::None
+        }) {
+            *fixture.deny_sign.lock() = Some(code);
+            assert!(
+                engine
+                    .triad_sign_evm_batch("alice", &refs, &staged, &preimages, &hashes)
+                    .await
+                    .is_err(),
+                "{code:?}"
+            );
+            let held = read_triad_batch_signing_state(&state_path)
+                .unwrap()
+                .unwrap();
+            assert!(held.sign_dispatched, "{code:?}");
+            assert_eq!(held.approval_id, first.approval_id, "{code:?}");
+            assert_eq!(
+                held.signing_operation_id, first.signing_operation_id,
+                "{code:?}"
+            );
+            assert_eq!(held.request_nonce, first.request_nonce, "{code:?}");
+        }
         *fixture.deny_sign.lock() = Some(ProtocolErrorCode::ClaimInvalid);
         assert!(matches!(
             engine

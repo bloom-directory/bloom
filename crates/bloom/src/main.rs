@@ -950,7 +950,6 @@ fn machine_command_event_fields(
                 MachineCustodyKind::New => "wallet_registration",
                 MachineCustodyKind::Import => "wallet_import",
                 MachineCustodyKind::Rebind => "credential_rebind",
-                MachineCustodyKind::Export => "wallet_export",
                 MachineCustodyKind::Delete => "wallet_delete",
             },
             None,
@@ -1300,12 +1299,6 @@ async fn execute_machine_command(
                         bloom_broker_api::CeremonyKind::CredentialReplace,
                         Some(bloom_broker_api::Token::new(name.clone())?),
                         "credential-prf",
-                    ),
-                    MachineCustodyKind::Export => (
-                        bloom_machine_client::CustodyPrepareMethod::WalletExport,
-                        bloom_broker_api::CeremonyKind::WalletExport,
-                        Some(bloom_broker_api::Token::new(name.clone())?),
-                        "none",
                     ),
                     MachineCustodyKind::Delete => (
                         bloom_machine_client::CustodyPrepareMethod::WalletDelete,
@@ -2465,13 +2458,6 @@ enum WalletCmd {
     /// without moving funds. Ceremony status and public results are projected
     /// from Broker.
     RebindPasskey { name: String },
-    /// Reveal a wallet's recovery material through a Broker-originated custody
-    /// ceremony. The secret is sealed to the ceremony browser and displayed
-    /// only there; it never passes through the Machine process. Choose the
-    /// export format (recovery phrase or legacy backup) in the browser.
-    ///
-    /// Anyone who obtains this material controls the wallet's funds.
-    Export { name: String },
     /// Permanently delete a wallet through a Broker-originated custody
     /// ceremony. Signer deletes custody state after owner authorization;
     /// Machine removes only its public projection. This cannot be undone.
@@ -3332,16 +3318,6 @@ async fn run(cli: Cli) -> Result<()> {
             )
             .await
         }
-        Cmd::Wallet(WalletCmd::Export { name }) => {
-            call_machine_command(
-                &client_endpoint,
-                MachineCommand::WalletCustody {
-                    name,
-                    kind: MachineCustodyKind::Export,
-                },
-            )
-            .await
-        }
         Cmd::Wallet(WalletCmd::Delete { name }) => {
             call_machine_command(
                 &client_endpoint,
@@ -3533,11 +3509,11 @@ async fn run(cli: Cli) -> Result<()> {
                     .map(|_| ())
                     .context("Bloom triad health check failed"),
                     ServeInternal::TriadPfMonitorOnce => {
-                        pf_monitor::run_once().context("Bloom packet-filter monitor failed")
+                        pf_monitor::run_once().context("Bloom session lifecycle monitor failed")
                     }
                     ServeInternal::TriadPfMonitor => pf_monitor::run()
                         .await
-                        .context("Bloom packet-filter monitor failed"),
+                        .context("Bloom session lifecycle monitor failed"),
                     ServeInternal::SessionSentinel => session_sentinel::run()
                         .await
                         .context("Bloom session sentinel failed"),
