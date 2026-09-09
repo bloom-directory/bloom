@@ -139,6 +139,37 @@ fn production_provenance_catalog_has_no_retired_native_hyperliquid_authority() {
     assert!(!catalog.contains("hyperliquid."));
 }
 
+/// Both installer templates must authorize native Solana transfers. The
+/// daemon leaves every Solana chain read-only when the catalog it was
+/// installed with lacks `solana.transfer.confirm`, and the developer launcher
+/// renders the macOS template on every host, so a gap in the Linux template
+/// is invisible outside a real Linux release install.
+#[test]
+fn every_installer_provenance_catalog_authorizes_native_solana_transfers() {
+    for platform in ["linux", "macos"] {
+        let path = workspace().join(format!(
+            "packaging/triad/{platform}/config/provenance-catalog.unsigned.json"
+        ));
+        let catalog: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        let record = catalog["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|record| record["subject"]["operation_class"] == "solana.transfer.confirm")
+            .unwrap_or_else(|| panic!("{platform} catalog lacks solana.transfer.confirm"));
+        assert_eq!(record["subject"]["kind"], "system");
+        assert_eq!(record["subject"]["component_id"], "bloom-machine");
+        assert_eq!(
+            record["operation_classes"],
+            serde_json::json!([{
+                "operation_class": "solana.native-transfer",
+                "fee_asset": {"chain": "solana", "asset": "native"}
+            }])
+        );
+    }
+}
+
 #[test]
 fn tag_release_builds_the_locked_triad_and_isolates_production_signing() {
     let workflow = fs::read_to_string(workspace().join(".github/workflows/release.yml")).unwrap();
