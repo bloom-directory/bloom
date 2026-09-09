@@ -8,7 +8,8 @@ use bloom_broker_api::{
     CredentialPublic, CryptoSuite, CustodyResult, DecimalU64, Digest32, KeyPublic, KeyRef, KeySpec,
     MachineBrokerRequest, MachineBrokerResponse, MachineBrokerService, OperationId,
     PolicyCommitReceipt, PolicyUpdatePrepareResponse, ProtocolError, ProtocolErrorCode,
-    ServiceFuture, SignedPolicySnapshot, Token, WalletPublic, WalletRequest,
+    ServiceFuture, SignedPolicySnapshot, Token, WalletAccountsPublic, WalletPublic, WalletRequest,
+    WalletSeedProfile,
 };
 use bloom_machine_client::{
     CachedWalletProjectionReader, FileProjectionStore, MachineBrokerClient, PetalEligibility,
@@ -135,11 +136,15 @@ impl MachineBrokerService for BrokerFixture {
                     >::new(
                     )))
                 }
-                // A root-key wallet has no derived accounts; the numbered
-                // tree renders it as account 0 from the root projection.
-                MachineBrokerRequest::WalletAccounts(WalletRequest { wallet_id }) => {
+                MachineBrokerRequest::WalletAccounts(WalletRequest { wallet_id })
+                    if wallet_id.as_str() == "alice" =>
+                {
                     Ok(MachineBrokerResponse::WalletAccounts(
-                        bloom_machine_client::empty_wallet_accounts(wallet_id),
+                        WalletAccountsPublic {
+                            wallet_id,
+                            seed_profile: WalletSeedProfile::Bip39MulticurveV1,
+                            accounts: Vec::new(),
+                        },
                     ))
                 }
                 MachineBrokerRequest::PolicyRead(_) => {

@@ -834,7 +834,6 @@ pub(super) struct AccountCreationRecord {
     schema: String,
     wallet_id: String,
     request_id: String,
-    families: Vec<String>,
     operation_id: bloom_broker_api::OperationId,
     ceremony_url: String,
     ceremony_expires_at_ms: bloom_broker_api::DecimalU64,
@@ -855,8 +854,7 @@ enum AccountCreationState {
 const ACCOUNT_CREATION_SCHEMA: &str = "bloom.machine.account-creation.v1";
 const ACCOUNT_CREATIONS_SCHEMA: &str = "bloom.machine.account-creations.v1";
 
-/// A `families` entry: which derivation request it maps to and the role it
-/// allocates under.
+/// Build one of the two fixed family requests created for every account number.
 fn family_request(family: &str) -> Result<bloom_broker_api::DerivedAccountRequest, HandlerError> {
     let (profile, role) = match family {
         "evm" => (
@@ -925,39 +923,17 @@ impl WalletsHandler {
         wallet: &str,
         data: &[u8],
     ) -> Result<(), HandlerError> {
-        let request: serde_json::Value = serde_json::from_slice(data)
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct AccountCreationRequest {
+            request_id: String,
+        }
+
+        let request: AccountCreationRequest = serde_json::from_slice(data)
             .map_err(|error| HandlerError::invalid(format!("bad creation request: {error}")))?;
-        let request_id = request
-            .get("request_id")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| HandlerError::invalid("creation request requires request_id"))?;
+        let request_id = request.request_id.as_str();
         validate_request_id(request_id)?;
-        let families = request
-            .get("families")
-            .and_then(serde_json::Value::as_array)
-            .ok_or_else(|| HandlerError::invalid("creation request requires families"))?
-            .iter()
-            .map(|family| {
-                family
-                    .as_str()
-                    .ok_or_else(|| HandlerError::invalid("families must be strings"))
-            })
-            .collect::<Result<Vec<&str>, HandlerError>>()?;
-        if families.is_empty() || families.len() > 2 {
-            return Err(HandlerError::invalid(
-                "families must name one or two of \"evm\", \"solana\"",
-            ));
-        }
-        let mut sorted = families.clone();
-        sorted.sort_unstable();
-        sorted.dedup();
-        if sorted.len() != families.len() {
-            return Err(HandlerError::invalid("families must not repeat a family"));
-        }
-        let requests = families
-            .iter()
-            .map(|family| family_request(family))
-            .collect::<Result<Vec<_>, HandlerError>>()?;
+        let requests = vec![family_request("evm")?, family_request("solana")?];
 
         let path = self.account_creation_path(wallet, request_id);
         if path.exists() {
@@ -966,20 +942,6 @@ impl WalletsHandler {
                 return Err(HandlerError::backend(
                     "stored account-creation record names a different wallet",
                 ));
-            }
-            let stored = record
-                .families
-                .iter()
-                .cloned()
-                .collect::<std::collections::BTreeSet<_>>();
-            let requested: std::collections::BTreeSet<String> =
-                families.iter().map(|f| f.to_string()).collect();
-            if stored != requested {
-                return Err(HandlerError::invalid(format!(
-                    "request_id '{request_id}' was created with families {:?}; it cannot be \
-                     reused for {:?}",
-                    record.families, families
-                )));
             }
             self.refresh_and_render_record(record, &path).await?;
             return Ok(());
@@ -1001,7 +963,6 @@ impl WalletsHandler {
         );
         let wallet_id = bloom_broker_api::Token::new(wallet.to_owned())
             .map_err(|error| HandlerError::invalid(error.to_string()))?;
-        let multi = requests.len() > 1;
         let anchor = requests
             .iter()
             .find(|request| {
@@ -1016,12 +977,7 @@ impl WalletsHandler {
                 .map_err(|error| HandlerError::invalid(error.to_string()))?,
             wallet_id: wallet_id.clone(),
             seed_profile: bloom_broker_api::WalletSeedProfile::Bip39MulticurveV1,
-            derivation: if multi {
-                None
-            } else {
-                Some(requests[0].clone())
-            },
-            derivations: if multi { requests.clone() } else { Vec::new() },
+            derivations: requests.clone(),
             retire_key_fingerprint: None,
             path_template: profile.path_template().to_owned(),
             key_spec: profile.key_spec(),
@@ -1048,12 +1004,7 @@ impl WalletsHandler {
                 petal_key_scope: None,
                 legacy_passkey_migration: None,
                 wallet_seed_profile: None,
-                derivation_request: if multi {
-                    None
-                } else {
-                    Some(requests[0].clone())
-                },
-                derivation_requests: if multi { requests.clone() } else { Vec::new() },
+                derivation_requests: requests,
                 account_terms: Some(terms),
             })
             .await
@@ -1062,7 +1013,6 @@ impl WalletsHandler {
             schema: ACCOUNT_CREATION_SCHEMA.to_owned(),
             wallet_id: wallet.to_owned(),
             request_id: request_id.to_owned(),
-            families: families.iter().map(|f| f.to_string()).collect(),
             operation_id,
             ceremony_url: prepared.ceremony_url.clone(),
             ceremony_expires_at_ms: prepared.ceremony_expires_at_ms,
@@ -1079,8 +1029,7 @@ impl WalletsHandler {
 
     /// Re-check a pending ceremony and render the record. Completion is read
     /// only from the authenticated receipt: every returned child must belong
-    /// to this wallet, match a requested family's profile, and, for a
-    /// multi-family request, share one number.
+    /// to this wallet, include both fixed profiles, and share one number.
     async fn refresh_and_render_record(
         &self,
         mut record: AccountCreationRecord,
@@ -1109,7 +1058,7 @@ impl WalletsHandler {
             .wallet_id
             .as_ref()
             .is_some_and(|wallet| wallet.as_str() == record.wallet_id)
-            || receipt.public_key_refs.len() != record.families.len()
+            || receipt.public_key_refs.len() != 2
         {
             return Err(HandlerError::backend(
                 "account-creation receipt contradicts the stored request",
@@ -1130,11 +1079,11 @@ impl WalletsHandler {
             };
             if wallet_seed_ref.as_str() != record.wallet_id
                 || !seen.insert(profile)
-                || !record.families.iter().any(|family| {
-                    family_request(family)
-                        .map(|request| request.derivation_profile == profile)
-                        .unwrap_or(false)
-                })
+                || !matches!(
+                    profile,
+                    bloom_broker_api::DerivationProfile::Bip44EvmSecp256k1V1
+                        | bloom_broker_api::DerivationProfile::Bip44SolanaSlip10Ed25519V1
+                )
             {
                 return Err(HandlerError::backend(
                     "account-creation receipt family set contradicts the stored request",
@@ -1175,7 +1124,6 @@ impl WalletsHandler {
         let mut out = serde_json::to_vec_pretty(&serde_json::json!({
             "schema": ACCOUNT_CREATIONS_SCHEMA,
             "request_id": record.request_id,
-            "families": record.families,
             "state": record.state,
             "ceremony_url": record.ceremony_url,
             "ceremony_expires_at_ms": record.ceremony_expires_at_ms,

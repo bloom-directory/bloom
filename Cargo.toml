@@ -134,7 +134,7 @@ bloom-update   = { path = "crates/bloom-update" }
 # feat/solana-native SystemUseClaim surface merged with #58's revoke_for_key,
 # Exact-scope rule and multi-family allocation terms. Retarget this pin to the
 # landed master revision in the same commit that lands it.
-bloom-broker-api = { git = "https://github.com/bloom-directory/bloom-broker.git", rev = "b61524051bd6020bf880320bc34426263c0a3997" }
+bloom-broker-api = { git = "https://github.com/bloom-directory/bloom-broker.git", rev = "91836edb3191b37a358a298859d92b0e3dd7557c" }
 bloom-rpc-wire = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "bc88cc6760b00bbff0c6a6e5f56d42bb03004436" }
 bloom-triad-local-transport = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "bc88cc6760b00bbff0c6a6e5f56d42bb03004436" }
 bloom-service-activation = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "bc88cc6760b00bbff0c6a6e5f56d42bb03004436" }

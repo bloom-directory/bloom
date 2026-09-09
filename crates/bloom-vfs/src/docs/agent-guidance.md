@@ -63,10 +63,13 @@ available yet; `wallets/<wallet>/chains/...` stages from account 0.
 
 Mnemonic import is an owner custody ceremony, not a mounted agent write. V1
 accepts the standard mnemonic and exposes no passphrase input;
-passphrase-protected mnemonics are unsupported. BIP-39 import creates the
-canonical EVM account. Additional account allocation exposed by Machine is
-currently limited to Solana children until EVM transaction surfaces carry an
-explicit selector.
+passphrase-protected mnemonics are unsupported. BIP-39 registration and import
+create the canonical EVM and Solana account-number-zero children together.
+
+To create another account number, write `{"request_id":"<id>"}` to
+`wallets/<wallet>/new`. The ceremony creates both the EVM and Solana keys under
+the one number Signer chooses. Reusing the same request ID resumes or returns
+that same account creation.
 
 A wallet's chains are listed at `wallets/<wallet>/chains` and include both
 EVM chains and any configured Solana chains — `ls wallets/<wallet>/chains`
