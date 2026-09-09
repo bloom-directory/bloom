@@ -77,6 +77,33 @@ pub(super) fn parse_account_segment(segment: &str) -> Option<u32> {
         .filter(|number| *number < (1_u32 << 31))
 }
 
+/// `accounts.json` with the number each entry's path encodes, shared by the
+/// VFS read and the CLI's `wallet accounts` projection.
+pub fn accounts_json_with_numbers(
+    accounts: &bloom_broker_api::WalletAccountsPublic,
+) -> Result<Vec<u8>, HandlerError> {
+    let mut value = serde_json::to_value(accounts).map_err(err_be)?;
+    if let (Some(serde_json::Value::Array(entries)), Some(numbers)) = (
+        value.get_mut("accounts"),
+        Some(
+            accounts
+                .accounts
+                .iter()
+                .map(account_number)
+                .collect::<Vec<_>>(),
+        ),
+    ) {
+        for (entry, number) in entries.iter_mut().zip(numbers) {
+            if let serde_json::Value::Object(fields) = entry {
+                fields.insert("number".into(), serde_json::json!(number));
+            }
+        }
+    }
+    let mut out = serde_json::to_vec_pretty(&value).map_err(err_be)?;
+    out.push(b'\n');
+    Ok(out)
+}
+
 fn lifecycle_label(lifecycle: AccountLifecycleState) -> &'static str {
     match lifecycle {
         AccountLifecycleState::Active => "active",
@@ -189,33 +216,6 @@ impl WalletsHandler {
             .into_iter()
             .map(|view| Entry::dir(&view.number.to_string()))
             .collect())
-    }
-
-    /// `accounts.json` with the number each entry's path encodes added,
-    /// so a reader never re-derives the mapping.
-    pub(super) fn accounts_json_with_numbers(
-        accounts: &bloom_broker_api::WalletAccountsPublic,
-    ) -> Result<Vec<u8>, HandlerError> {
-        let mut value = serde_json::to_value(accounts).map_err(err_be)?;
-        if let (Some(serde_json::Value::Array(entries)), Some(numbers)) = (
-            value.get_mut("accounts"),
-            Some(
-                accounts
-                    .accounts
-                    .iter()
-                    .map(account_number)
-                    .collect::<Vec<_>>(),
-            ),
-        ) {
-            for (entry, number) in entries.iter_mut().zip(numbers) {
-                if let serde_json::Value::Object(fields) = entry {
-                    fields.insert("number".into(), serde_json::json!(number));
-                }
-            }
-        }
-        let mut out = serde_json::to_vec_pretty(&value).map_err(err_be)?;
-        out.push(b'\n');
-        Ok(out)
     }
 
     fn account_json(&self, wallet: &str, view: &AccountView) -> Result<Vec<u8>, HandlerError> {

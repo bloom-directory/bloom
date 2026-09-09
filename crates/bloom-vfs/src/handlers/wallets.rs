@@ -34,9 +34,9 @@ use std::sync::Arc;
 
 /// `wallets/<wallet>/<n>/...`: the numbered account view.
 mod accounts;
-use accounts::parse_account_segment;
+use accounts::{accounts_json_with_numbers as render_accounts_json, parse_account_segment};
 
-pub use accounts::derivation_path_number;
+pub use accounts::{accounts_json_with_numbers, derivation_path_number};
 
 use async_trait::async_trait;
 use bloom_broker_api::ProtocolErrorCode;
@@ -2968,7 +2968,7 @@ impl WalletsHandler {
                 // The cached, authenticated inventory; freshness rides on the
                 // projection, and this read carries no authority side effect.
                 let projection = self.wallet_projection(wallet).await?;
-                Self::accounts_json_with_numbers(&projection.accounts)
+                render_accounts_json(&projection.accounts)
             }
             "new" => self.account_creation_status(wallet).await,
             "public_key" => {

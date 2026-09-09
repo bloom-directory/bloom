@@ -73,6 +73,32 @@ To create another account number, write `{"request_id":"<id>"}` to
 the one number Signer chooses. Reusing the same request ID resumes or returns
 that same account creation.
 
+### Account-scoped Petals and sessions
+
+Installed Petals also run under `wallets/<wallet>/<n>/petals/<petal>/...` with
+the same routes as `/petals/<petal>/...`. Account 0 and the flat mount list
+every installed Petal; a nonzero account runs only Petals whose `petal.toml`
+declares `[account] aware = true` — an unaware Petal is not found there and
+the message names the missing declaration. The host injects the trusted
+identity (`bloom.wallet`, `bloom.account`, and, when the route's family is
+unambiguous, `bloom.owner_key_fingerprint`) next to `bloom.route_id`; a caller
+context entry using the `bloom.` prefix is rejected before injection.
+
+Every key a Petal derived through a numbered account is mounted at
+`wallets/<wallet>/<n>/sessions/<petal>/<key-slot>/session.json`. It reports
+the delegating owner key, the delegated key and addresses, the scope (routes,
+operation classes, suites, lifetime), the recorded approvals, and the truthful
+`signing_authority`: `pending`, `active`, `stopped`, `expired`, or
+`package_replaced` (the installed package no longer matches the scope's
+hash; `routes_known` is false then). Writing to the sibling `stop` file
+revokes the session's approvals through the Broker; it is idempotent, works
+after the Petal is uninstalled, and after it succeeds only Exact-selector
+signing for the scope's remaining operation classes may still be available
+(`eligible_exact_routes` lists those routes). Replacing an installed package
+that still has active sessions is refused with their mounted paths unless the
+owner installs with `--force` — the stranded sessions then read
+`package_replaced`.
+
 A wallet's chains are listed at `wallets/<wallet>/chains` and include both
 EVM chains and any configured Solana chains — `ls wallets/<wallet>/chains`
 enumerates both together. Solana chains route through the exact same

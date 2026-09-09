@@ -69,6 +69,61 @@ and names the public fingerprints and derivation paths; list order is never an
 authority decision. Top-level EVM address compatibility resolves only the
 canonical initial child and never falls back to another projected child.
 
+## The numbered account tree
+
+Numbered accounts give every derived family key a stable, permanent home
+under the wallet while installed Petals and shared market data stay at
+`/petals/<petal>/`:
+
+```text
+wallets/<wallet>/
+├── accounts.json                      # one number per entry (null off-mapping)
+├── new                                # create an account (write {request_id})
+├── 0/
+│   ├── account.json                   # both families, with freshness
+│   ├── chains/<chain>/...             # chain views and the outbox, this key's
+│   ├── petals/<petal>/...             # installed Petals, account-scoped
+│   └── sessions/<petal>/<slot>/       # session.json + stop for derived keys
+└── policy.json, sealed-approvals/, capabilities/   # unchanged
+```
+
+The number is the derivation path itself, not a position in a list: slot `n`
+is EVM `m/44'/60'/0'/0/n` and Solana `m/44'/501'/n'/0'`. Signer owns the
+numbering — a client never chooses one — and one number carries at most one
+long-lived key per family. Resolving a numbered path yields an exact `KeyRef`;
+approval and signing bind that exact key, and the daemon re-resolves the owner
+from the path against fresh Broker membership before any approval, custody
+ceremony, or signature. Machine keeps no trusted number-to-key table: the
+rendering comes from the authenticated `wallet.accounts` projection, and
+listings, stats, and reads carry no authority side effects (a stale projection
+is marked as such in `account.json`).
+
+Wallet-level paths keep their meaning by resolving to account 0: the canonical
+initial child of each family, even after further children exist. Explicit
+fingerprints still override the wallet-level default, and a body fingerprint
+that disagrees with the numbered path is an error for both families. An
+account can hold only EVM, only Solana, or both; reading a missing family
+returns a specific missing-key error and never allocates a key. Retired keys
+remain readable but cannot spend. Staged operations and outboxes are fenced to
+the staging key, so one account can never see or confirm another account's
+pending operations.
+
+Account creation is one owner ceremony per number: a client writes
+`{"request_id": "<id>"}` to `wallets/<wallet>/new`, and Signer allocates the
+EVM and Solana keys of the next number in one ceremony — every new number has
+both families. Retrying with the same `request_id` returns the same ceremony
+or, after success, the same account; a conflicting reuse fails; extra fields
+are rejected. A legacy or imported single-key wallet is account 0 from its
+root key, rendered in the root key's own family.
+
+Account-scoped Petal dispatch and the session tree (`<n>/sessions/`, core
+stop, and the install guard) are described in
+[Petal derived key succession.md](Petal%20derived%20key%20succession.md); the
+authority invariants they rely on are in
+[Sealed Approvals.md](Sealed%20Approvals.md). A mnemonic recovers the
+deterministic key tree; it does not recover policies, sessions, or application
+secrets, and seed-only recovery never resurrects session approvals.
+
 ## Signing
 
 Every retained wallet-signing route sends the exact structured payload to
