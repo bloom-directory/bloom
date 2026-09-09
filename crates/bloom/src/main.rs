@@ -1517,7 +1517,7 @@ async fn execute_machine_command(
             // mapping print `null`.
             let rendered =
                 String::from_utf8(bloom_vfs::handlers::accounts_json_with_numbers(&accounts)?)?;
-            format!("{rendered}")
+            rendered
         }
         MachineCommand::WalletAccountAllocate { name, profile } => {
             let wallet_id = bloom_broker_api::Token::new(name)?;
