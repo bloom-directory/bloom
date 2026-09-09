@@ -470,11 +470,20 @@ pub struct IpcOutputEvent {
     pub bytes: Vec<u8>,
 }
 
+/// Sessions an install must not strand, keyed by the installed package
+/// hash they scope to.
+pub type ActiveSessionSlots = Arc<dyn Fn(&str) -> Vec<String> + Send + Sync>;
+
 #[derive(Clone)]
 pub struct IpcOperationContext {
     output: Option<tokio::sync::mpsc::Sender<IpcOutputEvent>>,
     cancelled: Arc<AtomicBool>,
     petal_mutation: Option<Arc<tokio::sync::Mutex<()>>>,
+    /// Sessions keyed by installed package hash that an install must not
+    /// strand, supplied by the daemon from its Petal key-state files.
+    petal_active_sessions: Option<ActiveSessionSlots>,
+    /// Set by an install that explicitly overrides the session guard.
+    petal_install_force: bool,
 }
 
 impl IpcOperationContext {
@@ -483,6 +492,8 @@ impl IpcOperationContext {
             output: Some(output),
             cancelled: Arc::new(AtomicBool::new(false)),
             petal_mutation: None,
+            petal_active_sessions: None,
+            petal_install_force: false,
         }
     }
 
@@ -491,6 +502,8 @@ impl IpcOperationContext {
             output: None,
             cancelled: Arc::new(AtomicBool::new(false)),
             petal_mutation: None,
+            petal_active_sessions: None,
+            petal_install_force: false,
         }
     }
 
@@ -522,6 +535,23 @@ impl IpcOperationContext {
                 return Err(PetalError::vm(format!(
                     "Petal {name} owner changed during acquisition; refusing stale install"
                 )));
+            }
+            // Replacing a package strands the sessions scoped to it: their
+            // routes and keys stop matching any installed code, so their
+            // stop and Exact recovery must still be reachable first. An
+            // explicit force overrides the guard and the sessions read
+            // `package_replaced`.
+            if !self.petal_install_force
+                && let Some(active_sessions) = &self.petal_active_sessions
+                && let Ok(Some(outgoing)) = store.resolve_petal_owner(&name)
+            {
+                let stranded = active_sessions(&outgoing);
+                if !stranded.is_empty() {
+                    return Err(PetalError::vm(format!(
+                        "refusing to replace petal '{name}' while its sessions are still                          active: {}. Stop them (wallets/<w>/<n>/sessions/<petal>/<slot>/stop)                          or install with force",
+                        stranded.join(", ")
+                    )));
+                }
             }
             Ok(())
         };
@@ -740,6 +770,7 @@ pub struct IpcServer {
     pub version: String,
     pub chains: Vec<String>,
     petals: Option<PetalRunner>,
+    active_session_slots: Option<ActiveSessionSlots>,
     petal_runtime_endpoints: BTreeMap<String, BTreeMap<String, String>>,
     petal_source_installer: Option<Arc<dyn PetalSourceInstallService>>,
     petal_mutation: Arc<tokio::sync::Mutex<()>>,
@@ -757,6 +788,7 @@ impl IpcServer {
             version: version.into(),
             chains,
             petals: None,
+            active_session_slots: None,
             petal_runtime_endpoints: BTreeMap::new(),
             petal_source_installer: None,
             petal_mutation: Arc::new(tokio::sync::Mutex::new(())),
@@ -772,6 +804,12 @@ impl IpcServer {
     /// `-32601 method not found`.
     pub fn with_petals(mut self, runner: PetalRunner) -> Self {
         self.petals = Some(runner);
+        self
+    }
+
+    /// Supply the active-session lookup that guards package replacement.
+    pub fn with_active_session_slots(mut self, slots: Option<ActiveSessionSlots>) -> Self {
+        self.active_session_slots = slots;
         self
     }
 
@@ -1234,9 +1272,13 @@ impl IpcServer {
             path: String,
             #[serde(rename = "ref")]
             requested_ref: Option<String>,
+            #[serde(default)]
+            force: bool,
         }
         let request: InstallRequest = serde_json::from_value(params.clone())
             .map_err(|error| PetalError::vm(format!("invalid petals.install request: {error}")))?;
+        context.petal_active_sessions = self.active_session_slots.clone();
+        context.petal_install_force = request.force;
         let remote_path = Some(request.path.as_str());
         if remote_path
             .is_some_and(|path| path.contains("://") || path.starts_with("git@github.com:"))
@@ -1244,7 +1286,11 @@ impl IpcServer {
             let installer = self.petal_source_installer.clone().ok_or_else(|| {
                 PetalError::vm("trusted remote Petal installs are not enabled on this daemon")
             })?;
-            let params = json!({"path": request.path, "ref": request.requested_ref});
+            let params = json!({
+                "path": request.path,
+                "ref": request.requested_ref,
+                "force": request.force,
+            });
             return tokio::task::spawn_blocking(move || {
                 if context.is_cancelled() {
                     return Err("Petal source install cancelled by disconnected client".to_owned());
@@ -3121,6 +3167,77 @@ summary = "Demo app used by IPC tests."
         assert_eq!(entries[0]["mode"], "local");
         assert_eq!(entries[0]["petal_mount"], "petals/demo/");
         assert_eq!(entries[0]["petal"]["name"], "demo");
+    }
+
+    #[tokio::test]
+    async fn petals_install_refuses_to_strand_active_sessions_until_forced() {
+        let dir = tempfile::tempdir().unwrap();
+        let v1 = dir.path().join("demo-v1");
+        let v2 = dir.path().join("demo-v2");
+        write_demo_petal_package(&v1);
+        write_demo_petal_package(&v2);
+        std::fs::write(v2.join("README.md"), b"# demo v2\n").unwrap();
+
+        let store = bloom_petals::PetalStore::open(dir.path().join("store")).unwrap();
+        let registry =
+            Arc::new(bloom_petals::NameRegistry::open(dir.path().join("registry")).unwrap());
+        let runner = PetalRunner::new(
+            store.clone(),
+            registry,
+            bloom_petals::PetalVm::new().unwrap(),
+        );
+        let (installed_v1, _, _) = store.install_petal_package_dir(&v1).unwrap();
+        let outgoing = installed_v1.hash.clone();
+        let outgoing_for_guard = outgoing.clone();
+        let slots: ActiveSessionSlots = Arc::new(move |hash| {
+            if hash == outgoing_for_guard {
+                vec!["wallets/minnow/1/sessions/demo/desk-a".to_owned()]
+            } else {
+                Vec::new()
+            }
+        });
+        let server = IpcServer::new(vfs(), "0", vec![])
+            .with_petals(runner.clone())
+            .with_active_session_slots(Some(slots));
+
+        // Unforced replacement is refused and names the mounted slot.
+        let refused = server
+            .do_petals_install(
+                &json!({"path": v2.display().to_string()}),
+                IpcOperationContext::detached(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            refused
+                .to_string()
+                .contains("wallets/minnow/1/sessions/demo/desk-a"),
+            "{refused}"
+        );
+        // v1 stays installed and dispatchable.
+        assert_eq!(runner.resolve_petal_mount("demo").unwrap(), outgoing);
+
+        // Forced replacement proceeds.
+        let forced = server
+            .do_petals_install(
+                &json!({"path": v2.display().to_string(), "force": true}),
+                IpcOperationContext::detached(),
+            )
+            .await
+            .unwrap();
+        let replaced = forced["hash"].as_str().unwrap().to_owned();
+        assert_ne!(replaced, outgoing);
+        assert_eq!(runner.resolve_petal_mount("demo").unwrap(), replaced);
+
+        // An unknown force field is rejected: the request shape is strict.
+        let bad = server
+            .do_petals_install(
+                &json!({"path": v2.display().to_string(), "Force": true}),
+                IpcOperationContext::detached(),
+            )
+            .await
+            .unwrap_err();
+        assert!(bad.to_string().contains("invalid petals.install"), "{bad}");
     }
 
     #[tokio::test]

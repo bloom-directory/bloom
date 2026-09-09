@@ -36,6 +36,8 @@ use std::sync::Arc;
 mod accounts;
 use accounts::parse_account_segment;
 
+pub use accounts::derivation_path_number;
+
 use async_trait::async_trait;
 use bloom_broker_api::ProtocolErrorCode;
 use bloom_evm::ChainRegistry;

@@ -445,7 +445,7 @@ impl DaemonPetalHost {
         owner: &bloom_broker_api::KeyRef,
         named: &bloom_broker_api::KeyRef,
     ) -> bool {
-        Self::petal_key_states_from_root(self.petal_key_state_root.as_deref(), wallet)
+        Self::petal_key_states_from_root(self.petal_key_state_root.as_deref(), Some(wallet))
             .iter()
             .any(|(_, state)| {
                 state
@@ -637,7 +637,7 @@ impl DaemonPetalHost {
     /// rather than hiding the rest of the inventory.
     fn petal_key_states_from_root(
         root: Option<&Path>,
-        wallet_id: &str,
+        wallet_id: Option<&str>,
     ) -> Vec<(PathBuf, PetalKeyRequestState)> {
         let Some(root) = root else {
             return Vec::new();
@@ -655,7 +655,9 @@ impl DaemonPetalHost {
                 continue;
             }
             match Self::read_petal_key_state(&path) {
-                Ok(Some(state)) if state.scope.wallet_id.as_str() == wallet_id => {
+                Ok(Some(state))
+                    if wallet_id.is_none_or(|wallet| state.scope.wallet_id.as_str() == wallet) =>
+                {
                     states.push((path, state));
                 }
                 Ok(_) => {}
@@ -3275,14 +3277,17 @@ impl AccountPetals {
     /// keys: a state whose parent belongs to another account's key never
     /// appears under this number.
     fn states_for(&self, account: &AccountPetalContext) -> Vec<(PathBuf, PetalKeyRequestState)> {
-        DaemonPetalHost::petal_key_states_from_root(Some(&self.key_state_root), &account.wallet)
-            .into_iter()
-            .filter(|(_, state)| {
-                let parent = state.scope.parent_key_ref.public_key_fingerprint.as_str();
-                account.evm_fingerprint.as_deref() == Some(parent)
-                    || account.solana_fingerprint.as_deref() == Some(parent)
-            })
-            .collect()
+        DaemonPetalHost::petal_key_states_from_root(
+            Some(&self.key_state_root),
+            Some(&account.wallet),
+        )
+        .into_iter()
+        .filter(|(_, state)| {
+            let parent = state.scope.parent_key_ref.public_key_fingerprint.as_str();
+            account.evm_fingerprint.as_deref() == Some(parent)
+                || account.solana_fingerprint.as_deref() == Some(parent)
+        })
+        .collect()
     }
 
     /// The mount name whose installed package is exactly the scope's, when
@@ -3295,6 +3300,61 @@ impl AccountPetals {
             .into_iter()
             .find(|(_, mounted)| mounted == hash)
             .map(|(mount, _)| mount)
+    }
+
+    /// The truthful authority derivation, shared by the session document
+    /// and the install guard: pending until the key exists, stopped once
+    /// every revoked approval is terminal, replaced once the scoped package
+    /// is no longer installed, expired once the observed success time plus
+    /// the scope's lifetime bound has passed, else active.
+    fn session_authority(&self, state: &PetalKeyRequestState) -> &'static str {
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_millis() as u64)
+            .unwrap_or(0);
+        if state.status != "succeeded" {
+            "pending"
+        } else if state.stopped.as_ref().is_some_and(|record| record.complete) {
+            "stopped"
+        } else if self.installed_mount_for(state).is_none() {
+            "package_replaced"
+        } else if state
+            .succeeded_at_ms
+            .map(|at| at + state.scope.maximum_lifetime_ms.get())
+            .is_some_and(|expires| now_ms >= expires)
+        {
+            "expired"
+        } else {
+            "active"
+        }
+    }
+
+    /// The mounted session paths an install of `package_hash` would leave
+    /// behind: every state scoped to that package whose derived authority
+    /// is still active, named the way the tree mounts them.
+    fn active_session_slots(&self, package_hash: &str) -> Vec<String> {
+        DaemonPetalHost::petal_key_states_from_root(Some(&self.key_state_root), None)
+            .iter()
+            .filter(|(_, state)| state.scope.package_hash.as_str() == package_hash)
+            .filter(|(_, state)| self.session_authority(state) == "active")
+            .map(|(_, state)| {
+                let number = match &state.scope.parent_key_ref.derivation {
+                    Some(bloom_broker_api::DerivationRef::Bip39Multicurve {
+                        profile,
+                        path,
+                        ..
+                    }) => bloom_vfs::handlers::derivation_path_number(*profile, path),
+                    _ => None,
+                };
+                format!(
+                    "wallets/{}/{}/sessions/{}/{}",
+                    state.scope.wallet_id.as_str(),
+                    number.unwrap_or(0),
+                    Self::rendered_mount(state),
+                    state.key_slot
+                )
+            })
+            .collect()
     }
 
     fn session_entry(
@@ -3327,7 +3387,6 @@ impl AccountPetals {
             owner("solana", &parent_fingerprint, parent_path)
         };
         let installed_mount = self.installed_mount_for(state);
-        let package_installed = installed_mount.is_some();
         // Routes are meaningful only for the package the session was scoped
         // to: a mount name that now resolves to a different package says
         // nothing about this session's routes.
@@ -3337,25 +3396,10 @@ impl AccountPetals {
                 .ok()
                 .map(|index| index.routes)
         });
-        let now_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_millis() as u64)
-            .unwrap_or(0);
-        let stopped_complete = state.stopped.as_ref().is_some_and(|record| record.complete);
         let expires_at_ms = state
             .succeeded_at_ms
             .map(|at| at + state.scope.maximum_lifetime_ms.get());
-        let signing_authority = if state.status != "succeeded" {
-            "pending"
-        } else if stopped_complete {
-            "stopped"
-        } else if !package_installed {
-            "package_replaced"
-        } else if expires_at_ms.is_some_and(|expires| now_ms >= expires) {
-            "expired"
-        } else {
-            "active"
-        };
+        let signing_authority = self.session_authority(state);
         let routes_known = routes.is_some();
         let eligible_exact_routes = match (signing_authority, &routes) {
             ("stopped" | "expired", Some(routes)) => routes
@@ -3563,6 +3607,9 @@ pub struct Daemon {
     /// Shutdown handles for spawned mempool subscription tasks. Dropping
     /// these signals each task to exit at its next iteration.
     pub mempool_shutdown: Arc<parking_lot::Mutex<Vec<tokio::sync::oneshot::Sender<()>>>>,
+    /// Sessions an install must not strand, keyed by the installed package
+    /// hash they scope to. Consumed by the install IPC command's guard.
+    pub active_session_slots: Option<ipc::ActiveSessionSlots>,
     /// Shutdown handles for the bump scanner and the backends probe task.
     /// Sent on shutdown; safe even when no scanner / probe was spawned.
     pub bump_shutdown: Arc<parking_lot::Mutex<Vec<tokio::sync::oneshot::Sender<()>>>>,
@@ -4365,6 +4412,18 @@ impl Daemon {
             key_state_root: home.cache_dir().join("petal-key-requests"),
             broker: broker.clone(),
         });
+        let active_session_slots: ipc::ActiveSessionSlots = {
+            let guard = AccountPetals {
+                router: Arc::new(PetalRouter::new(
+                    petals.clone(),
+                    Arc::new(bloom_petals::DenyHost),
+                )),
+                runner: petals.clone(),
+                key_state_root: home.cache_dir().join("petal-key-requests"),
+                broker: None,
+            };
+            Arc::new(move |package_hash: &str| guard.active_session_slots(package_hash))
+        };
         wallets_handler.set_account_petals(account_petals);
         debug!(root = %petals_root.display(), "daemon.petals_initialised");
         let petals_for_docs = petals.clone();
@@ -4690,6 +4749,7 @@ impl Daemon {
             update_shutdown: Arc::new(parking_lot::Mutex::new(Vec::new())),
             wallet_projection_refresh_started: Arc::new(AtomicBool::new(false)),
             solana_chains: solana_chain_registry,
+            active_session_slots: Some(active_session_slots),
         })
     }
 
@@ -8865,6 +8925,95 @@ allowed = ["bloom:vfs.read"]
             .unwrap();
         let session = session_json(&daemon, "/wallets/w/1/sessions/echo/main/session.json").await;
         assert_eq!(session["signing_authority"], "stopped");
+    }
+
+    #[tokio::test]
+    async fn the_install_guard_names_live_sessions_and_replacement_restores_them() {
+        let dir = isolation_dir();
+        let (daemon, broker) = isolation_daemon_at(&dir).await;
+        let echo_hash = install_isolation_petals(&bloom_proto::HomeDir::at(dir.path()));
+        let evm1 = broker.child(true, 1);
+        write_session_state(
+            &bloom_proto::HomeDir::at(dir.path()),
+            "w",
+            "pln1_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "main",
+            evm1,
+            Some("echo"),
+            &echo_hash,
+            now_ms_for_fixture() - 2_000,
+        );
+
+        // The daemon's guard names exactly the mounted session slot.
+        let slots = daemon
+            .active_session_slots
+            .as_ref()
+            .expect("guard is populated")(&echo_hash);
+        assert_eq!(
+            slots,
+            vec!["wallets/w/1/sessions/echo/main".to_owned()],
+            "{slots:?}"
+        );
+
+        // After the session stops, the same package installs unforced.
+        daemon
+            .vfs
+            .write(
+                &VfsPath::parse("/wallets/w/1/sessions/echo/main/stop").unwrap(),
+                b"y\n",
+            )
+            .await
+            .unwrap();
+        let slots = daemon
+            .active_session_slots
+            .as_ref()
+            .expect("guard is populated")(&echo_hash);
+        assert!(slots.is_empty(), "{slots:?}");
+
+        // Uninstalling the package strands a live session (a stopped one
+        // stays stopped), and reinstalling the same hash restores it.
+        write_session_state(
+            &bloom_proto::HomeDir::at(dir.path()),
+            "w",
+            "pln1_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "second",
+            evm1,
+            Some("echo"),
+            &echo_hash,
+            now_ms_for_fixture() - 2_000,
+        );
+        let slots = daemon
+            .active_session_slots
+            .as_ref()
+            .expect("guard is populated")(&echo_hash);
+        assert_eq!(
+            slots,
+            vec!["wallets/w/1/sessions/echo/second".to_owned()],
+            "{slots:?}"
+        );
+        assert!(daemon.petals.uninstall("echo").unwrap());
+        let session = session_json(&daemon, "/wallets/w/1/sessions/echo/second/session.json").await;
+        assert_eq!(session["signing_authority"], "package_replaced");
+        let slots = daemon
+            .active_session_slots
+            .as_ref()
+            .expect("guard is populated")(&echo_hash);
+        assert!(slots.is_empty(), "{slots:?}");
+        let (reinstalled, _, _) = daemon
+            .petals
+            .store()
+            .install_petal_package_dir(
+                bloom_proto::HomeDir::at(dir.path())
+                    .root()
+                    .join("petals/echo-package"),
+            )
+            .unwrap();
+        assert_eq!(reinstalled.hash, echo_hash);
+        let session = session_json(&daemon, "/wallets/w/1/sessions/echo/second/session.json").await;
+        assert_eq!(
+            session["signing_authority"], "active",
+            "reinstalling the scoped hash restores the authority"
+        );
     }
 
     #[tokio::test]

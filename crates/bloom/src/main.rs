@@ -2630,6 +2630,10 @@ enum PetalsCmd {
         /// Git tag, branch, or commit SHA to install from a GitHub source repository.
         #[arg(long = "ref", value_name = "TAG_OR_SHA")]
         ref_: Option<String>,
+        /// Replace the package even while it still has active sessions; they
+        /// then read `package_replaced` and only Exact recovery remains.
+        #[arg(long)]
+        force: bool,
     },
     /// Validate a Petal package directory and optionally emit a deterministic `.petal.tar`.
     Build {
@@ -3999,6 +4003,7 @@ async fn run(cli: Cli) -> Result<()> {
             );
             let server = IpcServer::new(d.vfs.clone(), env!("CARGO_PKG_VERSION"), chains)
                 .with_petals(d.petals.clone())
+                .with_active_session_slots(d.active_session_slots.clone())
                 .with_petal_runtime_endpoints(
                     d.config
                         .petals
@@ -4299,16 +4304,16 @@ fn validate_petal_archive_output(package_dir: &str, out: &str) -> Result<()> {
 async fn run_petals(endpoint: &ResolvedEndpoint, cmd: PetalsCmd) -> Result<()> {
     let client = IpcClient::new(&endpoint.socket);
     match cmd {
-        PetalsCmd::Install { path, ref_ } => {
+        PetalsCmd::Install { path, ref_, force } => {
             let params = if path.contains("://") || path.starts_with("git@github.com:") {
-                serde_json::json!({ "path": path, "ref": ref_ })
+                serde_json::json!({ "path": path, "ref": ref_, "force": force })
             } else {
                 anyhow::ensure!(
                     ref_.is_none(),
                     "--ref is only supported for trusted GitHub source installs"
                 );
                 let local = absolute_cli_path(&path)?;
-                serde_json::json!({ "path": local, "ref": null })
+                serde_json::json!({ "path": local, "ref": null, "force": force })
             };
             let reply = try_ipc_streaming(
                 &client,

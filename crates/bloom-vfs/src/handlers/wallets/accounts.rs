@@ -46,8 +46,13 @@ pub(super) struct AccountView {
 /// outside the default mapping (an EVM child under a non-zero hardened
 /// account), which the account tree does not present.
 pub(crate) fn account_number(account: &DerivedAccountPublic) -> Option<u32> {
-    let path = account.path.as_str();
-    let digits = match account.derivation_profile {
+    derivation_path_number(account.derivation_profile, account.path.as_str())
+}
+
+/// The account number a derivation path encodes, for callers that hold a
+/// parent key reference rather than a full projection row.
+pub fn derivation_path_number(profile: DerivationProfile, path: &str) -> Option<u32> {
+    let digits = match profile {
         DerivationProfile::Bip44EvmSecp256k1V1 => path.strip_prefix("m/44'/60'/0'/0/")?,
         DerivationProfile::Bip44SolanaSlip10Ed25519V1 => {
             path.strip_prefix("m/44'/501'/")?.strip_suffix("'/0'")?
