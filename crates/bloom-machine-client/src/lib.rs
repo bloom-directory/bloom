@@ -4129,6 +4129,7 @@ mod tests {
             legacy_passkey_migration: None,
             wallet_seed_profile: None,
             derivation_request: None,
+            derivation_requests: Vec::new(),
             account_terms: None,
         };
         assert_eq!(
@@ -4902,6 +4903,7 @@ mod tests {
             legacy_passkey_migration: None,
             wallet_seed_profile: None,
             derivation_request: None,
+            derivation_requests: Vec::new(),
             account_terms: None,
         };
         let error = client
