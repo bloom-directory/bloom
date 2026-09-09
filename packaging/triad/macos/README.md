@@ -3,6 +3,9 @@
 This directory implements the root-requiring Unix-principal profile in
 `docs/specs/2026-07-29-macos-unix-principal-isolation.md`. It is source input
 for the signed installer and is never installed directly from a checkout.
+The PF network boundary in that original profile is retired: current macOS
+packages preserve Private Relay and do not enforce service network isolation.
+See [the migration and sandbox plan](../../../docs/operations/macos-private-relay.md).
 
 The rootless code-identity architecture remains documented as a future target
 in `docs/specs/2026-07-30-macos-rootless-code-identity-isolation.md`. Nothing
@@ -33,10 +36,9 @@ socket. A conflict is fatal, reported, retried by failure-only `KeepAlive`, and
 never selects a fallback address or port. Before exiting, Broker atomically
 writes a Broker-owned, Machine-readable `broker-startup.json`. Machine accepts
 only its exact owner, group, mode, schema, address, incident, and message, so a
-bind failure is reported promptly as either another Bloom login or a foreign
-or unverifiable listener. The root packet-filter monitor performs the public
-owner-marker probe and publishes its result in the fresh root-owned platform
-status because the confined Broker cannot initiate even a loopback SYN. A
+bind failure is reported promptly as a foreign or unverifiable listener. The
+pinned Broker's more specific other-login classification depended on its PF
+attestation and is unavailable with the optional network guard disabled. A
 successful retry removes the stale diagnostic.
 
 The global `com.bloom.session` LaunchAgent invokes only Machine's
@@ -62,8 +64,9 @@ literal and exits fail-closed when the effective login is not enrolled.
 ## Filesystem and network boundaries
 
 The installer renders the root-owned release, edge manifest, account/group
-record, LaunchDaemon definitions, session LaunchAgent, and packet-filter
-anchor. Broker and Signer state/checkpoint roots remain owned by their
+record, LaunchDaemon definitions, and session LaunchAgent. It installs no PF
+anchor; legacy anchors are removed by post-activation migration. Broker and
+Signer state/checkpoint roots remain owned by their
 respective service UIDs and mode `0700`.
 
 The installer keeps digest-named releases immutable. A same-digest install
@@ -130,18 +133,23 @@ condition. A failed fresh install removes Directory Service records
 created by that invocation. An interrupted upgrade retains its forward intent
 so the next invocation can finish the same convergence safely.
 
-The packet-filter template denies new Broker IP flows and all Signer TCP/UDP
-flows by numeric effective UID. A root/wheel one-shot monitor is launched once
-per second with no socket, RPC, custody, or signing surface. It verifies the
-loaded per-UID anchors and atomically publishes short-lived root-owned status
-records. Broker and Signer require the exact login UID, release digest,
-ownership, mode, availability bit, and freshness before readiness or any
-signing/custody/policy mutation; revocation and public status remain
-available. Production activation is prohibited until the disposable macOS W0
-lane proves IPv4/IPv6, TCP/UDP, loopback, accepted Broker responses, anchor
-drift, Fast User Switching, forward upgrades, interrupted resumption,
-retain/restore, same-digest repair, and purge behavior. Local Signer is the only
-initial backend.
+Broker and Signer have `network_containment: null`. No PF rules are installed
+or enabled. Successful install, repair, upgrade and restore remove legacy Bloom
+anchors from disk and flush only their live filter rules. Uninstall scopes that
+cleanup to the removed login. The main system ruleset is never reloaded. Old
+PF enable tokens cannot be safely attributed to Bloom and are left alone.
+
+The root lifecycle monitor retains the `com.bloom.containment` job and
+`triad-pf-monitor` CLI names for upgrade compatibility. It still validates the
+returning session and restarts stopped services, but does not read or write PF.
+Legacy schema-v3 telemetry explicitly reports `available: false` and
+`network_enforcement: "none"`; it cannot satisfy an older PF consumer.
+
+This is an intentional reduction in defense against a compromised Broker or
+Signer making network connections. Unix UID isolation, filesystem and socket
+permissions, authenticated RPC, signing policy, and session revocation remain.
+The disposable macOS W0 lane now checks PF retirement instead of asserting
+network denial and does not emit the original MUI-07 containment evidence.
 
 Static template and staged-root tests are conformance inputs, not proof of an
 operating-system boundary. Tests that create accounts, load LaunchDaemons,
