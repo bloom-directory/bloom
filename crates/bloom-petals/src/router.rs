@@ -13,8 +13,8 @@ use async_trait::async_trait;
 use bloom_proto::config::PetalRuntimeConfig;
 use bloom_proto::{AuditLog, AuditRecord};
 use bloom_vfs::handler::{Entry, EntryKind, Handler, HandlerError};
-use bloom_vfs::path::VfsPath;
 use bloom_vfs::handlers::wallets::{AccountPetalContext, AccountPetalMount};
+use bloom_vfs::path::VfsPath;
 
 use crate::abi::{DispatchEntry, DispatchEntryKind, DispatchOp, DispatchRequest, DispatchResponse};
 use crate::error::PetalError;
@@ -102,35 +102,25 @@ impl PetalRouter {
 
     fn is_petal(&self, mount: &str) -> bool {
         self.runner.resolve_petal_mount(mount).is_ok()
-            && self.account.as_ref().is_none_or(|account| account.number == 0
-                || self.runner.petal_account_aware(mount).unwrap_or(false))
+            && self.account.as_ref().is_none_or(|account| {
+                account.number == 0 || self.runner.petal_account_aware(mount).unwrap_or(false)
+            })
     }
 
     fn require_account_mount(&self, path: &VfsPath) -> Result<(), HandlerError> {
         if let (Some(account), Some(mount)) = (&self.account, path.segments().first())
             && account.number != 0
-            && !self.runner.petal_account_aware(mount).map_err(map_petal_err)?
+            && !self
+                .runner
+                .petal_account_aware(mount)
+                .map_err(map_petal_err)?
         {
-            return Err(HandlerError::not_found(format!("petal '{mount}' does not declare [account] aware = true; it cannot run under account {}", account.number)));
+            return Err(HandlerError::not_found(format!(
+                "petal '{mount}' does not declare [account] aware = true; it cannot run under account {}",
+                account.number
+            )));
         }
         Ok(())
-    }
-
-    fn account_dispatch(&self, mount: &str, account: &AccountPetalContext) -> Result<AccountDispatch, HandlerError> {
-        let index = self.runner.load_petal_route_index(mount).map_err(map_petal_err)?;
-        let suites = index.routes.iter().flat_map(|route| route.key_derive_allowed_crypto_suites.iter()).collect::<Vec<_>>();
-        let evm = suites.iter().any(|suite| suite.starts_with("secp256k1"));
-        let solana = suites.iter().any(|suite| suite.starts_with("ed25519"));
-        let owner_key_fingerprint = match (evm, solana) {
-            (true, false) => account.evm_fingerprint.clone(),
-            (false, true) => account.solana_fingerprint.clone(),
-            (false, false) => match (&account.evm_fingerprint, &account.solana_fingerprint) {
-                (Some(key), None) | (None, Some(key)) => Some(key.clone()),
-                _ => None,
-            },
-            (true, true) => None,
-        };
-        Ok(AccountDispatch { wallet: account.wallet.clone(), number: account.number, owner_key_fingerprint })
     }
 
     fn is_petal_document(path: &str) -> bool {
@@ -152,17 +142,6 @@ impl AccountPetalMount for PetalRouter {
     }
 }
 
-/// The host-trusted identity a `wallets/<w>/<n>/petals/` dispatch
-/// carries. The owner fingerprint names one family's key; a route that
-/// signs as the owner is dispatched with its own family's fingerprint,
-/// never one picked from a two-family account by list order.
-#[derive(Clone, Debug)]
-pub struct AccountDispatch {
-    pub wallet: String,
-    pub number: u32,
-    pub owner_key_fingerprint: Option<String>,
-}
-
 impl PetalRouter {
     /// Dispatch an installed Petal route on behalf of one numbered account.
     /// Accounts other than 0 run only account-aware Petals: an unaware
@@ -174,7 +153,7 @@ impl PetalRouter {
         op: DispatchOp,
         path: String,
         body: Vec<u8>,
-        account: &AccountDispatch,
+        account: &AccountPetalContext,
     ) -> Result<DispatchResponse, HandlerError> {
         if account.number != 0 {
             let aware = self
@@ -189,16 +168,10 @@ impl PetalRouter {
                 )));
             }
         }
-        let mut trusted = vec![
+        let trusted = vec![
             ("bloom.wallet".to_owned(), account.wallet.clone()),
             ("bloom.account".to_owned(), account.number.to_string()),
         ];
-        if let Some(fingerprint) = &account.owner_key_fingerprint {
-            trusted.push((
-                "bloom.owner_key_fingerprint".to_owned(),
-                fingerprint.clone(),
-            ));
-        }
         self.dispatch_with_params(
             mount,
             op,
@@ -206,6 +179,7 @@ impl PetalRouter {
             body,
             &trusted,
             Some(account.wallet.clone()),
+            Some(account),
         )
         .await
     }
@@ -218,9 +192,11 @@ impl PetalRouter {
         body: Vec<u8>,
     ) -> Result<DispatchResponse, HandlerError> {
         if let Some(account) = &self.account {
-            return self.dispatch_for_account(mount, op, path, body, &self.account_dispatch(mount, account)?).await;
+            return self
+                .dispatch_for_account(mount, op, path, body, account)
+                .await;
         }
-        self.dispatch_with_params(mount, op, path, body, &[], None)
+        self.dispatch_with_params(mount, op, path, body, &[], None, None)
             .await
     }
 
@@ -232,6 +208,7 @@ impl PetalRouter {
         body: Vec<u8>,
         trusted_params: &[(String, String)],
         account_wallet: Option<String>,
+        account: Option<&AccountPetalContext>,
     ) -> Result<DispatchResponse, HandlerError> {
         // Lookup, list, and ordinary reads are filesystem observations, not
         // security effects. Auditing them both misstates the event stream and
@@ -309,6 +286,7 @@ impl PetalRouter {
                 None,
                 self.run_options(mount),
                 trusted_params,
+                account,
             )
             .await;
         let (outcome, result_digest) = match &executed {

@@ -135,6 +135,13 @@ impl MachineBrokerService for BrokerFixture {
                     >::new(
                     )))
                 }
+                // A root-key wallet has no derived accounts; the numbered
+                // tree renders it as account 0 from the root projection.
+                MachineBrokerRequest::WalletAccounts(WalletRequest { wallet_id }) => {
+                    Ok(MachineBrokerResponse::WalletAccounts(
+                        bloom_machine_client::empty_wallet_accounts(wallet_id),
+                    ))
+                }
                 MachineBrokerRequest::PolicyRead(_) => {
                     let snapshot = if self.complete.load(Ordering::SeqCst)
                         && self.state.lock().proposed_policy.is_some()
@@ -554,7 +561,8 @@ async fn vfs_policy_write_prepares_then_commits_only_with_completed_custody_rece
             MachineBrokerRequest::WalletListPublic(_),
             MachineBrokerRequest::KeyListPublic(_),
             MachineBrokerRequest::CredentialListPublic(_),
-            MachineBrokerRequest::PolicyRead(_)
+            MachineBrokerRequest::PolicyRead(_),
+            MachineBrokerRequest::WalletAccounts(_)
         ]
     ));
 }

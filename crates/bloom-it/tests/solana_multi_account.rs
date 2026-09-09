@@ -578,8 +578,7 @@ async fn two_active_solana_children_select_sign_and_reconcile_independently() ->
 
     // 5b. A body fingerprint that disagrees with the numbered path is an
     //     error, not a cross-account escalation.
-    let numbered_tx =
-        VfsPath::parse("/wallets/alice/1/chains/solana-local/outbox/new.tx").unwrap();
+    let numbered_tx = VfsPath::parse("/wallets/alice/1/chains/solana-local/outbox/new.tx").unwrap();
     let crossed = daemon
         .vfs
         .write(
@@ -589,7 +588,7 @@ async fn two_active_solana_children_select_sign_and_reconcile_independently() ->
                 "lamports": 250_000_000u64,
                 "account_fingerprint": account0.fingerprint_hex(),
             }))?
-                .as_slice(),
+            .as_slice(),
         )
         .await
         .expect_err("an intent naming another account must not stage");
@@ -611,7 +610,7 @@ async fn two_active_solana_children_select_sign_and_reconcile_independently() ->
                 "destination": numbered_destination,
                 "lamports": 250_000_000u64,
             }))?
-                .as_slice(),
+            .as_slice(),
         )
         .await
         .map_err(|e| anyhow!("numbered stage: {e}"))?;
@@ -687,9 +686,7 @@ async fn two_active_solana_children_select_sign_and_reconcile_independently() ->
     for _ in 0..60 {
         if let Ok(value) = read_json(
             &daemon,
-            &format!(
-                "/wallets/alice/1/chains/solana-local/outbox/sent/{numbered_id}/receipt.json"
-            ),
+            &format!("/wallets/alice/1/chains/solana-local/outbox/sent/{numbered_id}/receipt.json"),
         )
         .await
             && value["confirmation_status"].as_str() == Some("finalized")

@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bloom_vfs::handler::HandlerError;
+use bloom_vfs::handlers::wallets::AccountPetalContext;
 use bloom_vfs::path::VfsPath;
 use bloom_vfs::{Handler, Vfs};
 use lru::LruCache;
@@ -461,8 +462,16 @@ impl PetalRunner {
         cap_mask: Option<BTreeSet<Capability>>,
         opts: RunOptions,
     ) -> Result<DispatchOutput, PetalError> {
-        self.dispatch_petal_route_with_trusted_params(mount, request, host, cap_mask, opts, &[])
-            .await
+        self.dispatch_petal_route_with_trusted_params(
+            mount,
+            request,
+            host,
+            cap_mask,
+            opts,
+            &[],
+            None,
+        )
+        .await
     }
 
     /// [`Self::dispatch_petal_route`] with host-trusted parameters appended
@@ -481,6 +490,7 @@ impl PetalRunner {
         cap_mask: Option<BTreeSet<Capability>>,
         opts: RunOptions,
         trusted_params: &[(String, String)],
+        account: Option<&AccountPetalContext>,
     ) -> Result<DispatchOutput, PetalError> {
         if let Some((name, _)) = request
             .ctx
@@ -505,6 +515,19 @@ impl PetalRunner {
         // it in the trusted match output rather than accepting it from the
         // caller-supplied request context.
         route_params.push(("bloom.route_id".into(), matched.route.route_id.clone()));
+        // The owner fingerprint is chosen for the matched route, not for the
+        // whole Petal: a route that derives or signs in exactly one family
+        // carries that family's key, and only an unambiguous account may
+        // supply one otherwise. A route the account cannot name simply runs
+        // without one; the signing seam resolves the owner from the path.
+        if let Some(fingerprint) =
+            account.and_then(|account| route_owner_fingerprint(&matched.route, account))
+        {
+            route_params.push((
+                "bloom.owner_key_fingerprint".to_owned(),
+                fingerprint.to_owned(),
+            ));
+        }
         route_params.extend(trusted_params.iter().cloned());
         request.ctx.extend(route_params.clone());
 
@@ -848,6 +871,32 @@ fn route_segments(path: &str) -> Vec<&str> {
     }
 }
 
+/// The owner fingerprint one route's dispatch carries. The route's
+/// key-derive suites name a family when they name exactly one; otherwise
+/// only an account with a single family key can supply one, and a route
+/// the account cannot name runs without a fingerprint.
+fn route_owner_fingerprint<'a>(
+    route: &crate::package::RouteIndexRecord,
+    account: &'a AccountPetalContext,
+) -> Option<&'a str> {
+    let (mut evm, mut solana) = (false, false);
+    for suite in &route.key_derive_allowed_crypto_suites {
+        if suite.starts_with("secp256k1") {
+            evm = true;
+        } else if suite.starts_with("ed25519") {
+            solana = true;
+        }
+    }
+    match (evm, solana) {
+        (true, false) => account.evm_fingerprint.as_deref(),
+        (false, true) => account.solana_fingerprint.as_deref(),
+        _ => match (&account.evm_fingerprint, &account.solana_fingerprint) {
+            (Some(fingerprint), None) | (None, Some(fingerprint)) => Some(fingerprint.as_str()),
+            _ => None,
+        },
+    }
+}
+
 fn route_segment_matches(pattern: &str, value: &str) -> bool {
     if let Some(rest) = pattern.strip_prefix('[')
         && let Some(end) = rest.find(']')
@@ -883,6 +932,7 @@ mod tests {
                 None,
                 RunOptions::default(),
                 &[],
+                None,
             )
             .await
             .unwrap_err();
@@ -909,6 +959,7 @@ mod tests {
                 None,
                 RunOptions::default(),
                 &[("wallet".into(), "alice".into())],
+                None,
             )
             .await
             .unwrap_err();

@@ -249,7 +249,10 @@ pub struct WalletsHandler {
     /// client, while staging needs the whole signing seam. A chain present
     /// here but absent from `solana` is readable but cannot stage.
     solana_reads: Option<bloom_solana::SolanaChainRegistry>,
-    account_petals: Option<Arc<dyn AccountPetalMount>>,
+    /// Late-bound: the Petal router is built after this handler because its
+    /// host needs this handler, so there is exactly one of each and the
+    /// router is attached once both exist.
+    account_petals: Arc<parking_lot::RwLock<Option<Arc<dyn AccountPetalMount>>>>,
 }
 
 impl WalletsHandler {
@@ -271,13 +274,13 @@ impl WalletsHandler {
             policy_projection_root: policy_projection_root.into(),
             solana: None,
             solana_reads: None,
-            account_petals: None,
+            account_petals: Arc::new(parking_lot::RwLock::new(None)),
         }
     }
 
-    pub fn with_account_petals(mut self, petals: Arc<dyn AccountPetalMount>) -> Self {
-        self.account_petals = Some(petals);
-        self
+    /// Attach the Petal runtime that serves `wallets/<w>/<n>/petals/`.
+    pub fn set_account_petals(&self, petals: Arc<dyn AccountPetalMount>) {
+        *self.account_petals.write() = Some(petals);
     }
 
     /// Attach the Solana transfer engines (keyed by chain name). When set,

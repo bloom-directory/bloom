@@ -1596,7 +1596,9 @@ fn require_trusted_wallet(data: &StoreData, wallet: &str) -> Result<(), HostErro
 }
 
 /// Explicit key selection under an account-scoped dispatch must resolve to
-/// the trusted owner key of that account's signing family.
+/// the trusted owner key of that account's signing family. Without a
+/// per-route fingerprint this guard defers to the signing seam, which
+/// resolves the owner from the mounted path and rejects any other key.
 fn require_trusted_key_ref(
     data: &StoreData,
     key_ref: &bloom_broker_api::KeyRef,
@@ -1604,12 +1606,9 @@ fn require_trusted_key_ref(
     let Some(account) = trusted_account(data) else {
         return Ok(());
     };
-    let Some(expected) = &account.owner_key_fingerprint else {
-        return Err(HostError::Denied(
-            "explicit key selection requires a trusted owner fingerprint".into(),
-        ));
-    };
-    if key_ref.public_key_fingerprint.to_string() != *expected {
+    if let Some(expected) = &account.owner_key_fingerprint
+        && key_ref.public_key_fingerprint.to_string() != *expected
+    {
         return Err(HostError::Denied(
             "explicit key does not belong to the mounted account's owner".into(),
         ));
@@ -5120,11 +5119,11 @@ paths = ["/status"]
     }
 
     #[tokio::test]
-    async fn account_without_trusted_fingerprint_rejects_explicit_keys() {
+    async fn account_without_trusted_fingerprint_defers_explicit_keys_to_the_host() {
         let host = Arc::new(MockHost::default());
         let mut store = component_test_store(BTreeSet::from([Capability::Sign]), None, host);
         store.data_mut().sign_context = Some(account_context("w", 2, None));
-        assert!(require_trusted_key_ref(store.data(), &key_ref_with_fingerprint(7)).is_err());
+        require_trusted_key_ref(store.data(), &key_ref_with_fingerprint(7)).unwrap();
         require_trusted_wallet(store.data(), "w").unwrap();
     }
 
