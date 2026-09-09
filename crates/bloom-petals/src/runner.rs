@@ -482,6 +482,7 @@ impl PetalRunner {
     /// caller-supplied context entry whose name starts with `bloom.` is
     /// rejected before the host appends its own values, so no dispatch path
     /// can shadow a trusted one.
+    #[allow(clippy::too_many_arguments)]
     pub async fn dispatch_petal_route_with_trusted_params(
         &self,
         mount: &str,

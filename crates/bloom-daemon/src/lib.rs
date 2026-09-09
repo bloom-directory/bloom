@@ -7723,7 +7723,7 @@ allowed = ["bloom:vfs.read"]
             declared_debits: Vec::new(),
             declared_destinations: Vec::new(),
             declared_fee: bloom_broker_api::DeclaredFee::None,
-            nonce: bloom_broker_api::RequestNonce::new(&"9".repeat(32)).unwrap(),
+            nonce: bloom_broker_api::RequestNonce::new("9".repeat(32)).unwrap(),
             claim_assurance: bloom_broker_api::ClaimAssurance::MachineAsserted,
         };
         serde_jcs::to_vec(&claim).unwrap()
@@ -7820,7 +7820,7 @@ allowed = ["bloom:vfs.read"]
             .unwrap();
         assert!(matches!(outcome, SignOutcome::Signature(_)));
         let calls = broker.sign_calls.lock();
-        assert_eq!(calls.as_slice(), &[evm1.key_ref.clone()]);
+        assert_eq!(calls.as_slice(), std::slice::from_ref(&evm1.key_ref));
     }
 
     /// 2. A route under account 1 cannot ask the host to sign with
@@ -8024,6 +8024,6 @@ allowed = ["bloom:vfs.read"]
             .unwrap();
         assert!(matches!(outcome, SignOutcome::Signature(_)));
         let calls = broker.sign_calls.lock();
-        assert_eq!(calls.as_slice(), &[evm0.key_ref.clone()]);
+        assert_eq!(calls.as_slice(), std::slice::from_ref(&evm0.key_ref));
     }
 }

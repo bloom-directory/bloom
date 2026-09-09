@@ -200,6 +200,7 @@ impl PetalRouter {
             .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn dispatch_with_params(
         &self,
         mount: &str,
