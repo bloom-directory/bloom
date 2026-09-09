@@ -297,7 +297,7 @@ fn make_installer_payload(root: &Path) -> PathBuf {
     )
     .unwrap();
     let macos = workspace().join("packaging/triad/macos");
-    for relative in ["launchagents", "launchdaemons", "pf"] {
+    for relative in ["launchagents", "launchdaemons"] {
         let destination = payload.join("installer/macos").join(relative);
         fs::create_dir_all(&destination).unwrap();
         for entry in fs::read_dir(macos.join(relative)).unwrap() {
@@ -383,11 +383,11 @@ fn build(staging: &Path, output: &Path, key: &Path) -> std::process::Output {
         &compatibility,
         compatibility_source
             .replace(
-                "broker_commit = \"f1f08ed4e2dd227bf24576ddab88c66534626e23\"",
+                "broker_commit = \"37e4c551b653988f3fe1e61efe1894b6bca94420\"",
                 &format!("broker_commit = \"{}\"", "22".repeat(20)),
             )
             .replace(
-                "signer_commit = \"6b6fa483fe6ba6bd1b3dc020aaf6073d8e4aab8c\"",
+                "signer_commit = \"d72d038cff514c3b81de0514b6ad07c134359b4b\"",
                 &format!("signer_commit = \"{}\"", "33".repeat(20)),
             ),
     )
@@ -2274,9 +2274,7 @@ fn macos_installer_stages_unix_principals_launchdaemons_and_confirmed_uninstall(
     assert!(enrollment.contains("\"machine_broker_gid\":260501"));
     assert!(enrollment.contains("\"broker_signer_gid\":260502"));
     assert!(enrollment.contains("\"revoke_gid\":260503"));
-    let pf = fs::read_to_string(root.join("etc/pf.anchors/com.bloom.triad.501")).unwrap();
-    assert!(pf.contains("user 250501"));
-    assert!(pf.contains("user 250502"));
+    assert!(!root.join("etc/pf.anchors/com.bloom.triad.501").exists());
     assert!(
         root.join("usr/local/libexec/bloom/current/bloom-broker")
             .exists()
@@ -2576,7 +2574,6 @@ fn macos_active_legacy_enrollment_migrates_log_identity_before_upgrade() {
             "Library/LaunchAgents/com.bloom.machine.plist",
             "Library/LaunchDaemons/com.bloom.broker.501.plist",
             "Library/LaunchDaemons/com.bloom.signer.501.plist",
-            "etc/pf.anchors/com.bloom.triad.501",
             "etc/newsyslog.d/bloom-501.conf",
         ])
         .output()

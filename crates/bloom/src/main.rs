@@ -3926,11 +3926,11 @@ async fn run(cli: Cli) -> Result<()> {
                     .map(|_| ())
                     .context("Bloom triad health check failed"),
                     ServeInternal::TriadPfMonitorOnce => {
-                        pf_monitor::run_once().context("Bloom packet-filter monitor failed")
+                        pf_monitor::run_once().context("Bloom session lifecycle monitor failed")
                     }
                     ServeInternal::TriadPfMonitor => pf_monitor::run()
                         .await
-                        .context("Bloom packet-filter monitor failed"),
+                        .context("Bloom session lifecycle monitor failed"),
                     ServeInternal::SessionSentinel => session_sentinel::run()
                         .await
                         .context("Bloom session sentinel failed"),
