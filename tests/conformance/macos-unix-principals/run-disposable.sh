@@ -82,7 +82,7 @@ capture_failure_evidence() {
   login_home="$(dscl . -read "/Users/$login_user" NFSHomeDirectory 2>/dev/null |
     awk 'NR==1{sub(/^NFSHomeDirectory:[[:space:]]*/,"");print}')" || true
   if [[ -n "$login_home" && -d "$login_home/.bloom" ]]; then
-    find "$login_home/.bloom" -xdev -ls \
+    find "$login_home/.bloom" -xdev -maxdepth 5 -ls \
       > "$evidence_dir/machine-home-tree.txt" 2>&1 || true
     chmod 0644 "$evidence_dir/machine-home-tree.txt" 2>/dev/null || true
     if [[ -d "$login_home/.bloom/logs" ]]; then

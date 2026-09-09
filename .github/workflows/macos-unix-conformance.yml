@@ -185,8 +185,9 @@ jobs:
       - name: Restore candidate executable modes
         shell: bash
         run: |
-          chmod 0755 "$RUNNER_TEMP/verified/bloom-triad/bin/"*
-          chmod 0755 "$RUNNER_TEMP/verified-w0/bloom-triad/bin/"*
+          chmod 0755 \
+            "$RUNNER_TEMP/verified/bloom-triad/bin/"{bloom,bloom-broker,bloom-signer,bloom-signer-migrate} \
+            "$RUNNER_TEMP/verified-w0/bloom-triad/bin/"{bloom,bloom-broker,bloom-signer,bloom-signer-migrate}
 
       - name: Prove disposable host prerequisites
         shell: bash
