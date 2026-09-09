@@ -354,22 +354,47 @@ impl SolanaRpcClient {
                 for (idx, url, client) in &endpoints {
                     let started = Instant::now();
                     let body = serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": "getHealth", "params": [] });
-                    let result = client.post(url).json(&body).send().await;
-                    match result {
-                        Ok(resp) if resp.status().is_success() => {
-                            health.record_success(*idx, started.elapsed(), None);
-                        }
-                        Ok(resp) => {
-                            let retryable = should_retry(RetrySignal::HttpStatus(resp.status().as_u16()));
-                            health.record_failure(*idx, retryable, None);
-                        }
+                    let response = match client.post(url).json(&body).send().await {
+                        Ok(response) => response,
                         Err(_) => {
                             health.record_failure(*idx, true, None);
+                            continue;
+                        }
+                    };
+                    let status = response.status().as_u16();
+                    let payload = response.bytes().await.ok();
+                    match health_probe_outcome(status, payload.as_deref()) {
+                        Ok(()) => health.record_success(*idx, started.elapsed(), None),
+                        Err(retryable) => {
+                            health.record_failure(*idx, retryable, None);
                         }
                     }
                 }
             }
         });
+    }
+}
+
+/// Classify one `getHealth` answer. A node reports an unhealthy or lagging
+/// state with HTTP 200 and a JSON-RPC `error` envelope (`-32005 Node is
+/// behind by N slots`), so the HTTP status alone says nothing: only an
+/// explicit `"ok"` result counts as healthy. `Err` carries the failure's
+/// retry classification.
+fn health_probe_outcome(status: u16, body: Option<&[u8]>) -> Result<(), bool> {
+    if !(200..300).contains(&status) {
+        return Err(should_retry(RetrySignal::HttpStatus(status)));
+    }
+    let Some(payload) = body.and_then(|bytes| serde_json::from_slice::<Value>(bytes).ok()) else {
+        return Err(true);
+    };
+    if let Some(error) = payload.get("error") {
+        let code = error.get("code").and_then(Value::as_i64).unwrap_or(0);
+        let message = error.get("message").and_then(Value::as_str).unwrap_or("");
+        return Err(should_retry(RetrySignal::RpcError { code, message }));
+    }
+    match payload.get("result").and_then(Value::as_str) {
+        Some("ok") => Ok(()),
+        _ => Err(true),
     }
 }
 
@@ -414,4 +439,35 @@ fn endpoint_label(raw: &str) -> String {
     reqwest::Url::parse(raw)
         .map(|url| url.origin().ascii_serialization())
         .unwrap_or_else(|_| "<invalid endpoint>".to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::health_probe_outcome;
+
+    #[test]
+    fn probe_counts_only_an_explicit_ok_result_as_healthy() {
+        assert_eq!(
+            health_probe_outcome(200, Some(br#"{"jsonrpc":"2.0","id":1,"result":"ok"}"#)),
+            Ok(())
+        );
+        // agave answers an unhealthy node with HTTP 200 and an error envelope.
+        assert!(
+            health_probe_outcome(
+                200,
+                Some(
+                    br#"{"jsonrpc":"2.0","id":1,"error":{"code":-32005,"message":"Node is behind by 42 slots","data":{"numSlotsBehind":42}}}"#
+                )
+            )
+            .is_err()
+        );
+        assert!(
+            health_probe_outcome(200, Some(br#"{"jsonrpc":"2.0","id":1,"result":"unknown"}"#))
+                .is_err()
+        );
+        assert!(health_probe_outcome(200, Some(b"<html>upstream error</html>")).is_err());
+        assert!(health_probe_outcome(200, None).is_err());
+        assert_eq!(health_probe_outcome(503, Some(b"")), Err(true));
+        assert_eq!(health_probe_outcome(403, Some(b"")), Err(false));
+    }
 }
