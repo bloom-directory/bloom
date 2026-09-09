@@ -1999,9 +1999,7 @@ fn validate_policy_action_id(id: &str) -> Result<(), HandlerError> {
 
 fn tx_open_err(e: TxEngineError) -> HandlerError {
     match e {
-        // Carry the ceremony forward. Collapsing this to a permissions error
-        // told the caller they may not do the thing, when in fact the
-        // requirement was one owner ceremony whose URL was already in hand.
+        // Approval is a pending step, not a bare permission denial.
         TxEngineError::ApprovalRequired(requirement) => HandlerError::ApprovalRequired {
             action_id: requirement.action_id,
             ceremony_url: requirement.ceremony_url,
@@ -3318,14 +3316,7 @@ impl WalletsHandler {
                         TxEngineError::EnsoQuoteStale { .. } => {
                             HandlerError::invalid(e.to_string())
                         }
-                        TxEngineError::ApprovalRequired(requirement) => {
-                            HandlerError::ApprovalRequired {
-                                action_id: requirement.action_id,
-                                ceremony_url: requirement.ceremony_url,
-                                expires_ms: requirement.expires_ms,
-                                reason: requirement.reason,
-                            }
-                        }
+                        e @ TxEngineError::ApprovalRequired(_) => tx_open_err(e),
                         other => err_be(other),
                     })?;
                 Ok(())

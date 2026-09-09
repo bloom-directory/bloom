@@ -612,14 +612,9 @@ impl Outbox {
     /// before any are broadcast (e.g. a DeFi `approve` → `swap` bundle, which
     /// must occupy consecutive nonces).
     ///
-    /// This counts entries in `pending/` only. Broadcasting moves an entry to
-    /// `sent/`, so it stops being counted here the moment it goes out — this
-    /// function reserves against *unsent* work, not against everything in
-    /// flight. Callers must therefore combine it with a chain nonce read at the
-    /// **pending** block tag ([`ChainClient::nonce`]), which is what covers the
-    /// window between broadcast and inclusion. Reading a pinned or `latest`
-    /// nonce instead leaves that window uncovered by either source and hands
-    /// out a nonce already spent by an in-flight transaction.
+    /// Only `pending/` entries count; broadcasting moves them to `sent/`.
+    /// Combine this with the chain's pending nonce to cover transactions
+    /// already broadcast but not yet mined.
     ///
     /// The opposite hazard (a staged-but-never-broadcast entry reserving a
     /// slot, so a later tx broadcasts into a gap that never fills and is
