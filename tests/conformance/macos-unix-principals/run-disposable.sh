@@ -607,7 +607,7 @@ while [[ $SECONDS -lt $deadline ]]; do
   if [[ -f "$broker_startup_status" ]] &&
     [[ "$(plutil -extract state raw -o - "$broker_startup_status" 2>/dev/null)" == "fatal" ]] &&
     [[ "$(plutil -extract incident raw -o - "$broker_startup_status" 2>/dev/null)" == \
-      "foreign_or_unverifiable_process" ]]
+      "ceremony_listeners_unavailable" ]]
   then
     break
   fi
@@ -620,11 +620,11 @@ assert_metadata \
   "bloom.broker-startup.1" ]]
 [[ "$(plutil -extract state raw -o - "$broker_startup_status")" == "fatal" ]]
 [[ "$(plutil -extract incident raw -o - "$broker_startup_status")" == \
-  "foreign_or_unverifiable_process" ]]
+  "ceremony_listeners_unavailable" ]]
 [[ "$(plutil -extract address raw -o - "$broker_startup_status")" == \
-  "127.0.0.1:18734" ]]
+  "localhost:18734" ]]
 [[ "$(plutil -extract message raw -o - "$broker_startup_status")" == \
-  "a foreign or unverifiable process owns the Bloom ceremony listener" ]]
+  "could not acquire both ceremony loopback listeners; see Broker service logs" ]]
 if foreign_machine_failure="$(
   sudo -u "$login_user" \
     "$machine_binary" \
@@ -635,7 +635,7 @@ then
   exit 1
 fi
 if ! grep -F \
-  'Bloom Broker startup failed: a foreign or unverifiable process owns the Bloom ceremony listener' \
+  'Bloom Broker startup failed: could not acquire both ceremony loopback listeners; see Broker service logs' \
   <<<"$foreign_machine_failure" >/dev/null
 then
   echo "Machine did not report the authenticated foreign-listener diagnostic:" >&2

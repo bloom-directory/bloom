@@ -490,8 +490,10 @@ fn privileged_w0_harness_requires_an_external_disposable_host_marker() {
     assert!(source.contains("macos-unix-principals-w0"));
     assert!(source.contains("/usr/bin/nc -lk 127.0.0.1 18734"));
     assert!(source.contains("Broker opened a fallback TCP listener"));
-    assert!(source.contains("foreign_or_unverifiable_process"));
-    assert!(source.contains("Bloom Broker startup failed: a foreign or unverifiable process"));
+    assert!(source.contains("ceremony_listeners_unavailable"));
+    assert!(source.contains(
+        "Bloom Broker startup failed: could not acquire both ceremony loopback listeners"
+    ));
     let foreign_bind = source
         .find("/usr/bin/nc -lk 127.0.0.1 18734")
         .expect("foreign listener bind");
@@ -531,7 +533,7 @@ fn privileged_w0_harness_requires_an_external_disposable_host_marker() {
     )
     .unwrap();
     assert!(two_login.contains("active GUI domains for both selected users"));
-    assert!(two_login.contains("another_login_session"));
+    assert!(two_login.contains("ceremony_listeners_unavailable"));
     assert!(two_login.contains("second Broker opened a fallback TCP listener"));
     assert!(two_login.contains("launchctl bootout \"gui/$login_uid_b\""));
     assert!(two_login.contains("through failure-only KeepAlive"));

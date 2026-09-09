@@ -381,7 +381,6 @@ fn read_broker_startup_failure(paths: &InstalledMacosTriadPaths) -> Option<Strin
     if value.as_object().map(serde_json::Map::len) != Some(6)
         || value.get("schema").and_then(serde_json::Value::as_str) != Some("bloom.broker-startup.1")
         || value.get("state").and_then(serde_json::Value::as_str) != Some("fatal")
-        || value.get("address").and_then(serde_json::Value::as_str) != Some("127.0.0.1:18734")
         || value
             .get("observed_at_ms")
             .and_then(serde_json::Value::as_u64)
@@ -390,9 +389,15 @@ fn read_broker_startup_failure(paths: &InstalledMacosTriadPaths) -> Option<Strin
         return None;
     }
     let incident = value.get("incident").and_then(serde_json::Value::as_str)?;
-    let expected_message = match incident {
-        "another_login_session" => "another login session owns the Bloom ceremony listener",
-        "foreign_or_unverifiable_process" => {
+    let address = value.get("address").and_then(serde_json::Value::as_str)?;
+    let expected_message = match (incident, address) {
+        ("ceremony_listeners_unavailable", "localhost:18734") => {
+            "could not acquire both ceremony loopback listeners; see Broker service logs"
+        }
+        ("another_login_session", "127.0.0.1:18734") => {
+            "another login session owns the Bloom ceremony listener"
+        }
+        ("foreign_or_unverifiable_process", "127.0.0.1:18734") => {
             "a foreign or unverifiable process owns the Bloom ceremony listener"
         }
         _ => return None,
@@ -446,6 +451,27 @@ mod broker_startup_failure_tests {
                 "Bloom Broker startup failed: another login session owns the Bloom ceremony listener"
             )
         );
+
+        let mut failure = serde_json::json!({
+            "schema": "bloom.broker-startup.1", "state": "fatal",
+            "incident": "ceremony_listeners_unavailable", "address": "localhost:18734",
+            "message": "could not acquire both ceremony loopback listeners; see Broker service logs",
+            "observed_at_ms": 1
+        });
+        std::fs::write(&path, serde_json::to_vec(&failure).unwrap()).unwrap();
+        assert_eq!(
+            read_broker_startup_failure(&installed).as_deref(),
+            Some(
+                "Bloom Broker startup failed: could not acquire both ceremony loopback listeners; see Broker service logs"
+            )
+        );
+        for address in ["127.0.0.1:18734", "[::1]:18734", "attacker.invalid:18734"] {
+            failure["address"] = address.into();
+            std::fs::write(&path, serde_json::to_vec(&failure).unwrap()).unwrap();
+            assert!(read_broker_startup_failure(&installed).is_none());
+        }
+        failure["address"] = "localhost:18734".into();
+        std::fs::write(&path, serde_json::to_vec(&failure).unwrap()).unwrap();
 
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
             .expect("weaken startup diagnostic permissions");
