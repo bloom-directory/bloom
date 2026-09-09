@@ -1166,6 +1166,7 @@ impl PetalHost for DaemonPetalHost {
                     ("awaiting_user", false, true)
                         | ("awaiting_user", true, true)
                         | ("succeeded", true, false)
+                        | ("key_derived", true, false)
                         // A record this process retired at startup advertises
                         // no ceremony. Its terms are still this request's
                         // terms, so it is reconciled and restaged below rather
@@ -1318,46 +1319,13 @@ impl PetalHost for DaemonPetalHost {
                             "Broker returned public key metadata outside the Petal scope".into(),
                         ));
                     }
-                    let scope_expires_at_ms = public
-                        .petal_scope_expires_at_ms
-                        .as_ref()
-                        .ok_or_else(|| {
-                            HostError::Denied(
-                                "Broker omitted the derived Petal key scope expiry".into(),
-                            )
-                        })?
-                        .get();
-                    if stored
-                        .public_key
-                        .as_ref()
-                        .is_some_and(|previous| previous != &public)
-                    {
-                        return Err(HostError::Denied(
-                            "persisted Petal public key conflicts with Broker custody result"
-                                .into(),
-                        ));
-                    }
-                    let reusable = self
-                        .prepare_petal_key_reusable_approval(
-                            broker,
-                            &wallet,
-                            PetalKeyApprovalGrant {
-                                scope: &scope,
-                                key_ref: &public.key_ref,
-                                scope_expires_at_ms,
-                                approval_attempt: stored.reusable_approval_attempt,
-                                value_limits: &stored.approval_value_limits,
-                            },
-                            provenance_digest.clone().ok_or_else(|| {
-                                HostError::Denied("Petal provenance digest is missing".into())
-                            })?,
-                        )
-                        .await?;
+                    // Publish the derived address before staging its reusable
+                    // approval. The owner must be able to add this previously
+                    // unknown funding destination to wallet policy first;
+                    // changing policy after approval invalidates its snapshot.
                     stored.public_key = Some(public);
-                    stored.reusable_approval_id = Some(reusable.approval_id);
-                    stored.status = "awaiting_user".into();
-                    stored.ceremony_url = Some(reusable.ceremony_url);
-                    stored.ceremony_expires_at_ms = reusable.ceremony_expires_at_ms;
+                    stored.status = "key_derived".into();
+                    stored.ceremony_url = None;
                     Self::write_petal_key_state(&path, &stored)?;
                     return stored.guest_outcome();
                 }
@@ -5928,6 +5896,24 @@ mod tests {
         fixture
             .completed
             .store(true, std::sync::atomic::Ordering::SeqCst);
+        let derived_pending = host.petal_key_request(request.clone()).await.unwrap();
+        assert_eq!(
+            serde_json::to_value(derived_pending).unwrap()["state"],
+            "pending"
+        );
+        let derived_status = DaemonPetalHost::read_petal_key_state(&state_path)
+            .unwrap()
+            .unwrap();
+        assert_eq!(derived_status.status, "key_derived");
+        assert!(derived_status.public_key.is_some());
+        assert!(derived_status.ceremony_url.is_none());
+        assert_eq!(
+            fixture
+                .approval_prepares
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "publish the funding address before binding approval to a policy snapshot"
+        );
         let reusable_pending = host.petal_key_request(request.clone()).await.unwrap();
         assert_eq!(
             serde_json::to_value(&reusable_pending).unwrap()["state"],
