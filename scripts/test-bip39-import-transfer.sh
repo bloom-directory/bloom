@@ -204,7 +204,7 @@ case "$solana_address" in
   ''|*[!123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz]*)
     die "wallet address did not print a Base58 Solana address: $solana_address" ;;
 esac
-printf 'bip39 transfer e2e: import projected EVM and Solana children\n'
+printf 'bip39 transfer e2e: import projected EVM and Solana children (Solana: %s)\n' "$solana_address"
 
 # 6. Allowlist the transfer recipient through the canonical policy-update
 #    ceremony (a fresh wallet denies every destination).
@@ -292,5 +292,5 @@ if grep -R -F -a -q -- "$MNEMONIC" "$machine_home" "$log_dir" "$launcher_log" 2>
   die "mnemonic material leaked into Machine-owned artifacts"
 fi
 
-printf 'bip39 transfer e2e passed: wallet %s imported its canonical EVM child %s, allocated a Solana child through the ceremony, and spent from the child on anvil (%s) with the on-chain sender matching cast'\''s independent derivation.\n' \
-  "$wallet_id" "$expected_addr" "$tx_hash"
+printf 'bip39 transfer e2e passed: wallet %s imported canonical EVM child %s and Solana child %s in one ceremony, then spent from the EVM child on anvil (%s) with the on-chain sender matching cast'\''s independent derivation.\n' \
+  "$wallet_id" "$expected_addr" "$solana_address" "$tx_hash"
