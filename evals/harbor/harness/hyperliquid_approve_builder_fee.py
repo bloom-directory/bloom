@@ -358,6 +358,14 @@ class HyperliquidApproveBuilderFeeEval(EvalDefinition):
                 "installed approve_builder_fee route provenance does not match the expected operation class"
             )
 
+    def preauthorization_preflight(self) -> None:
+        if not PACKAGE_HASH.fullmatch(self.package_hash):
+            raise EvalError(
+                "BLOOM_EVAL_HYPERLIQUID_PACKAGE_HASH must be a lowercase BLAKE3"
+            )
+        self._require_installed_package_hash()
+        self._require_builder_fee_provenance()
+
     def _require_exact_wallet_policy(self) -> None:
         policy = self._read_json(self.wallet_root / "policy.json")
         expected_policy = {
@@ -423,8 +431,7 @@ class HyperliquidApproveBuilderFeeEval(EvalDefinition):
             raise EvalError("Hyperliquid Petal is not installed")
         if not self.network_root.exists():
             raise EvalError(f"Hyperliquid {self.network} routes are not installed")
-        self._require_installed_package_hash()
-        self._require_builder_fee_provenance()
+        self.preauthorization_preflight()
         self._require_exact_wallet_policy()
         try:
             subprocess.run(["docker", "info"], check=True, capture_output=True, timeout=20)

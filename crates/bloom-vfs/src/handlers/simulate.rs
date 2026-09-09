@@ -30,7 +30,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use alloy::primitives::{Address, B256, Bytes, U256};
 use alloy::rpc::types::eth::TransactionRequest;
@@ -120,10 +119,7 @@ struct NewSimEnvelope {
 }
 
 fn now_ms() -> u128 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
+    u128::from(bloom_proto::now_ms().unwrap_or(0))
 }
 
 fn err_be(e: impl std::fmt::Display) -> HandlerError {

@@ -64,6 +64,10 @@ class EvalDefinition(ABC):
         """Validate prerequisites without creating external authority."""
 
     @abstractmethod
+    def preauthorization_preflight(self) -> None:
+        """Verify installed ownership and provenance; never inspect wallet policy."""
+
+    @abstractmethod
     def provision(self, agent_name: str) -> EvalRunContext:
         """Create the least-authority capability and return Harbor inputs."""
 

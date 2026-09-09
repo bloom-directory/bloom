@@ -2113,15 +2113,8 @@ fn adler32(data: &[u8]) -> u32 {
     (b << 16) | a
 }
 
-fn now_ms() -> u128 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0)
-}
-
 fn now_ms_u64() -> u64 {
-    now_ms().min(u128::from(u64::MAX)) as u64
+    bloom_proto::now_ms().unwrap_or(0)
 }
 
 fn policy_update_vfs_write_path(wallet: &str) -> String {

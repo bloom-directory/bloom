@@ -15,7 +15,6 @@
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
@@ -737,10 +736,7 @@ fn collect_meta_hashes(dir: PathBuf, out: &mut BTreeSet<String>) -> Result<(), P
 }
 
 fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+    bloom_proto::now_ms().unwrap_or(0)
 }
 
 /// A valid BLAKE3 hex hash: exactly 64 lowercase hex chars.

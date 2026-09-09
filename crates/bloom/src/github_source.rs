@@ -360,14 +360,6 @@ struct PetalReleaseManifest {
     tooling_commit: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-struct SemverTag {
-    major: u64,
-    minor: u64,
-    patch: u64,
-    tag: String,
-}
-
 pub(crate) fn parse_github_install_url(input: &str) -> Result<Option<GitHubRepo>> {
     if is_raw_remote_wasm(input) {
         bail!(
@@ -1321,17 +1313,18 @@ fn resolve_ref(
     }
 
     let tags = git_stdout(Some(cache), &["tag", "--list"])?;
-    let selected = latest_semver_tag(tags.lines()).ok_or_else(|| {
+    let (selected_tag, _version) = latest_semver_tag(tags.lines()).ok_or_else(|| {
         anyhow!(
             "no SemVer tags found for {}; pass --ref <branch-or-sha> or publish a tag",
             repo.canonical_url
         )
     })?;
-    let commit = resolve_explicit_ref(cache, &selected.tag)?;
+    let selected_tag = selected_tag.to_string();
+    let commit = resolve_explicit_ref(cache, &selected_tag)?;
     Ok(ResolvedRef {
-        requested_ref: selected.tag.clone(),
+        requested_ref: selected_tag.clone(),
         commit,
-        selected_tag: Some(selected.tag),
+        selected_tag: Some(selected_tag),
     })
 }
 
@@ -1615,25 +1608,15 @@ fn validate_repo_relative_path(path: &str, field: &str) -> Result<()> {
     Ok(())
 }
 
-fn latest_semver_tag<'a>(tags: impl Iterator<Item = &'a str>) -> Option<SemverTag> {
-    tags.filter_map(parse_semver_tag).max()
-}
-
-fn parse_semver_tag(tag: &str) -> Option<SemverTag> {
-    let version = tag.strip_prefix('v').unwrap_or(tag);
-    let mut parts = version.split('.');
-    let major = parts.next()?.parse().ok()?;
-    let minor = parts.next()?.parse().ok()?;
-    let patch = parts.next()?.parse().ok()?;
-    if parts.next().is_some() {
-        return None;
-    }
-    Some(SemverTag {
-        major,
-        minor,
-        patch,
-        tag: tag.to_string(),
-    })
+/// The tag with the highest SemVer precedence, ordering pre-release and
+/// build-metadata tags correctly per spec rather than rejecting them
+/// outright. Reuses `bloom-update`'s own `parse_semver`, the same parser
+/// this daemon uses to decide whether it's behind a release.
+fn latest_semver_tag<'a>(
+    tags: impl Iterator<Item = &'a str>,
+) -> Option<(&'a str, semver::Version)> {
+    tags.filter_map(|tag| bloom_update::parse_semver(tag).map(|version| (tag, version)))
+        .max_by(|(_, a), (_, b)| a.cmp_precedence(b))
 }
 
 fn git(cwd: Option<&Path>, args: &[&str]) -> Result<()> {
@@ -1716,8 +1699,20 @@ mod tests {
 
     #[test]
     fn selects_latest_semver_like_tag() {
-        let latest = latest_semver_tag(["v0.1.0", "v0.10.0", "junk", "0.2.1"].into_iter()).unwrap();
-        assert_eq!(latest.tag, "v0.10.0");
+        let (tag, _version) =
+            latest_semver_tag(["v0.1.0", "v0.10.0", "junk", "0.2.1"].into_iter()).unwrap();
+        assert_eq!(tag, "v0.10.0");
+    }
+
+    #[test]
+    fn orders_pre_release_tags_correctly_instead_of_rejecting_them() {
+        // The old hand-rolled parser treated any non-numeric segment (like a
+        // pre-release suffix) as "not a version" and silently dropped it, so
+        // a real release could lose to an older tag. SemVer precedence rules
+        // instead order a pre-release below its final release.
+        let (tag, _version) =
+            latest_semver_tag(["v1.2.3-rc.1", "v1.2.3", "v1.2.2"].into_iter()).unwrap();
+        assert_eq!(tag, "v1.2.3");
     }
 
     #[test]

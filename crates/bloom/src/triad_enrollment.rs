@@ -12,9 +12,11 @@ use std::{
 use anyhow::{Context as _, Result, bail};
 use bloom_broker_api::{
     Base64UrlBytes, DecimalU64, Digest32, PROVENANCE_RECORD_SIGNATURE_DOMAIN,
-    PetalLineageMembership, ProvenanceCatalog, ProvenanceOperationClass, ProvenanceRecord,
-    ProvenanceSubject, Token,
+    PetalLineageMembership, ProvenanceCatalog, ProvenanceFeeAsset, ProvenanceOperationClass,
+    ProvenanceRecord, ProvenanceSubject, Token,
 };
+#[cfg(all(test, feature = "triad-dev-harness"))]
+use bloom_petals::package::PreparedPetalPackage;
 #[cfg(feature = "triad-dev-harness")]
 use bloom_petals::package::build_petal_package_dir;
 use ed25519_dalek::{Signer as _, SigningKey};
@@ -458,12 +460,29 @@ fn developer_route_operation_classes(
     classes
         .into_iter()
         .map(|operation_class| {
+            let fee_asset = known_fee_asset(&operation_class);
             Ok(ProvenanceOperationClass {
                 operation_class: Token::new(operation_class)?,
-                fee_asset: None,
+                fee_asset,
             })
         })
         .collect()
+}
+
+/// The fee asset for operation classes that charge a real, owner-approved
+/// fee. Only Hyperliquid's session-bound order class does today; add an
+/// entry here when a second Petal's operation class needs one too, rather
+/// than building a general Petal-declared fee-asset mechanism for one
+/// caller. Shared by the developer-harness and release-pins provenance
+/// paths so both stay consistent.
+fn known_fee_asset(operation_class: &str) -> Option<ProvenanceFeeAsset> {
+    match operation_class {
+        "hyperliquid.agent_action" => Some(ProvenanceFeeAsset {
+            chain: Token::new("hyperliquid").ok()?,
+            asset: "usdc".to_string(),
+        }),
+        _ => None,
+    }
 }
 
 #[cfg(feature = "triad-dev-harness")]
@@ -1038,7 +1057,7 @@ fn append_release_petal_provenance(
                 .map(|class| {
                     Ok(ProvenanceOperationClass {
                         operation_class: Token::new(*class)?,
-                        fee_asset: None,
+                        fee_asset: known_fee_asset(class),
                     })
                 })
                 .collect::<Result<Vec<_>>>()?;
@@ -1238,13 +1257,55 @@ mod tests {
             key_derive_maximum_lifetime_ms: Some(60_000),
         };
 
-        let classes = developer_route_operation_classes(&route)
-            .unwrap()
-            .into_iter()
+        let records = developer_route_operation_classes(&route).unwrap();
+        let classes = records
+            .iter()
             .map(|class| class.operation_class.to_string())
             .collect::<Vec<_>>();
         assert_eq!(classes, ["fixture.delegated", "fixture.immediate"]);
         assert!(!classes.contains(&"fixture.package_wide".to_string()));
+        // Neither fixture class has a known fee asset, so both must still
+        // come out `None` exactly as they did before `known_fee_asset`
+        // existed — pins the no-op guarantee for every Petal that doesn't
+        // use `hyperliquid.agent_action`.
+        assert!(records.iter().all(|class| class.fee_asset.is_none()));
+    }
+
+    #[cfg(feature = "triad-dev-harness")]
+    #[test]
+    fn developer_route_provenance_attaches_the_known_hyperliquid_agent_action_fee_asset() {
+        let route = bloom_petals::package::RouteIndexRecord {
+            route_id: "r000025".into(),
+            pattern: "agent_sessions/[wallet]/new.json".into(),
+            source_path: "petal/fixture/new.json.wasm".into(),
+            artifact_path: "artifacts/routes/r000025.wasm".into(),
+            artifact_hash: "00".repeat(32),
+            abi: bloom_petals::package::RouteAbi::ComponentBloomRoute010,
+            kind: bloom_petals::package::RouteEntryKind::File,
+            ops: vec![bloom_petals::package::RouteOp::Write],
+            params: vec!["wallet".into()],
+            specificity: [1, 1, 1],
+            install_metadata: bloom_petals::package::InstallRouteMetadata {
+                mode: 0o644,
+                cache_ttl_ms: None,
+                side_effecting_read: false,
+                write_async: true,
+                executable: false,
+                required_caps: vec!["bloom:key.derive".into()],
+                sign_intent: None,
+            },
+            key_derive_operation_classes: vec!["hyperliquid.agent_action".into()],
+            key_derive_allowed_routes: vec!["r000025".into()],
+            key_derive_scope_declared: true,
+            key_derive_allowed_crypto_suites: vec!["secp256k1-keccak256-recoverable".into()],
+            key_derive_maximum_lifetime_ms: Some(1_800_000),
+        };
+
+        let records = developer_route_operation_classes(&route).unwrap();
+        assert_eq!(records.len(), 1);
+        let fee_asset = records[0].fee_asset.as_ref().unwrap();
+        assert_eq!(fee_asset.chain.as_str(), "hyperliquid");
+        assert_eq!(fee_asset.asset, "usdc");
     }
 
     #[cfg(feature = "triad-dev-harness")]
@@ -1457,6 +1518,29 @@ mod tests {
             petal_hashes
                 .contains(&"aa1c50d3443f4c1a710d0ce93a70a65d196fd5842d241e0f78260c8a019d811c")
         );
+        // The release-pins path must attach the same known fee asset as the
+        // developer-harness path for hyperliquid.agent_action, and leave
+        // every other operation class (Polymarket's included) untouched.
+        let all_classes = catalog
+            .records
+            .iter()
+            .flat_map(|record| record.operation_classes.iter());
+        let agent_action_fee_assets = all_classes
+            .clone()
+            .filter(|class| class.operation_class.as_str() == "hyperliquid.agent_action")
+            .map(|class| class.fee_asset.as_ref())
+            .collect::<Vec<_>>();
+        assert!(!agent_action_fee_assets.is_empty());
+        assert!(agent_action_fee_assets.iter().all(|fee_asset| {
+            fee_asset
+                .is_some_and(|asset| asset.chain.as_str() == "hyperliquid" && asset.asset == "usdc")
+        }));
+        let polymarket_relayer_fee_assets = all_classes
+            .filter(|class| class.operation_class.as_str() == "polymarket.relayer_batch")
+            .map(|class| class.fee_asset.as_ref())
+            .collect::<Vec<_>>();
+        assert!(!polymarket_relayer_fee_assets.is_empty());
+        assert!(polymarket_relayer_fee_assets.iter().all(Option::is_none));
         for record in catalog.records {
             let mut unsigned = record.clone();
             let signature: [u8; 64] = unsigned.installer_signature.decode().try_into().unwrap();

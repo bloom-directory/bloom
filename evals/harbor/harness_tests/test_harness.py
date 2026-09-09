@@ -39,6 +39,9 @@ class FakeDefinition(EvalDefinition):
     def preflight(self) -> None:
         self.events.append("preflight")
 
+    def preauthorization_preflight(self) -> None:
+        self.events.append("preauthorization_preflight")
+
     def provision(self, agent_name: str) -> EvalRunContext:
         self.events.append(f"provision:{agent_name}")
         if self.provision_error is not None:

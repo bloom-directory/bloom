@@ -548,6 +548,19 @@ else
   signer_pid=$!
   wait_for_socket "$signer_socket" "$signer_pid" signer
 
+  # bloom-service-observability's SecureLogFile deliberately never creates
+  # this file itself (open_secure_append opens for append only, no O_CREAT)
+  # so it can never silently start writing through an unvalidated path. The
+  # launcher must provision it with the exact ownership/mode the Broker will
+  # check before the Broker will start.
+  broker_json_log="${log_dir}/broker.json.log"
+  [ -e "$broker_json_log" ] || : >"$broker_json_log"
+  # A new file under this directory can inherit its parent's group (macOS
+  # BSD semantics), not the creating process's own primary group, so the
+  # group must be set explicitly rather than assumed.
+  chown "$(id -u)":"$(id -g)" "$broker_json_log"
+  chmod 0640 "$broker_json_log"
+
   env -u BLOOM_OPERATOR_ACCEPT_CLOCK_UTC_MS \
   -u BLOOM_OPERATOR_CONFIRM_EXPIRING_APPROVALS_DIGEST \
   BLOOM_TRIAD_DEVELOPER_ROOT="$developer_root" \
@@ -558,6 +571,9 @@ else
   BLOOM_BROKER_CONTROL_SOCKET="$broker_control_socket" \
   BLOOM_BROKER_AUDIT_CHECKPOINT_DIR="$broker_checkpoint_dir" \
   BLOOM_SESSION_SOCKET="$session_socket" \
+  BLOOM_BROKER_LOG_PATH="$broker_json_log" \
+  BLOOM_BROKER_LOG_OWNER_UID="$(id -u)" \
+  BLOOM_BROKER_LOG_READER_GID="$(id -g)" \
     "$broker_bin" >"${log_dir}/broker.log" 2>&1 &
   broker_pid=$!
   wait_for_socket "$broker_socket" "$broker_pid" broker

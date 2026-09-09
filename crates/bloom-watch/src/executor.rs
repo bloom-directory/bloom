@@ -36,7 +36,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use alloy::primitives::{Address, B256, U256};
 use alloy::providers::Provider;
@@ -1239,10 +1239,7 @@ pub struct ExecutorState {
 }
 
 fn now_ms() -> u128 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0)
+    u128::from(bloom_proto::now_ms().unwrap_or(0))
 }
 
 /// Returns `true` if the caller should emit the log, `false` if it has

@@ -492,7 +492,7 @@ fn eip3009_preimage(
         validBefore: U256::from(authorization.valid_before.as_secs()),
         nonce: authorization.nonce,
     };
-    Ok(eip712_preimage(&domain, message.eip712_hash_struct()))
+    Ok(eip712_preimage(&domain, &message))
 }
 
 fn permit2_preimage(
@@ -519,15 +519,20 @@ fn permit2_preimage(
             validAfter: U256::from(authorization.witness.valid_after.as_secs()),
         },
     };
-    Ok(eip712_preimage(&domain, message.eip712_hash_struct()))
+    Ok(eip712_preimage(&domain, &message))
 }
 
-fn eip712_preimage(domain: &Eip712Domain, struct_hash: FixedBytes<32>) -> (Vec<u8>, [u8; 32]) {
+/// Builds the raw `"\x19\x01" || domainSeparator || hashStruct(message)`
+/// preimage (needed as wire bytes for the remote host signer) alongside its
+/// hash, computed via `SolStruct::eip712_signing_hash` rather than a second,
+/// independent keccak256 of the hand-assembled preimage — so the two can
+/// never silently drift apart.
+fn eip712_preimage(domain: &Eip712Domain, message: &impl SolStruct) -> (Vec<u8>, [u8; 32]) {
     let mut preimage = Vec::with_capacity(66);
     preimage.extend_from_slice(&[0x19, 0x01]);
     preimage.extend_from_slice(domain.separator().as_slice());
-    preimage.extend_from_slice(struct_hash.as_slice());
-    let hash = alloy::primitives::keccak256(&preimage).into();
+    preimage.extend_from_slice(message.eip712_hash_struct().as_slice());
+    let hash = message.eip712_signing_hash(domain).into();
     (preimage, hash)
 }
 
@@ -541,27 +546,18 @@ fn replace_payload_signature(header: &str, signature: &[u8; 65]) -> Result<Strin
         .get_mut("payload")
         .and_then(|payload| payload.get_mut("signature"))
         .ok_or_else(|| "x402 draft has no signature field".to_string())?;
-    *signature_slot = serde_json::Value::String(format!("0x{}", hex_lower(signature)));
+    *signature_slot = serde_json::Value::String(format!("0x{}", hex::encode(signature)));
     let encoded = serde_json::to_vec(&value)
         .map_err(|error| format!("serialize signed x402 payload: {error}"))?;
     Ok(Base64Bytes::encode(encoded).to_string())
-}
-
-fn hex_lower(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut output = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        output.push(HEX[(byte >> 4) as usize] as char);
-        output.push(HEX[(byte & 0x0f) as usize] as char);
-    }
-    output
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         HostX402PaymentSigner, X402PaymentSigner, X402SignContext, candidate_matches_requirement,
-        eip3009_preimage, exact_signing_payload, parse_payment_required, proto, v1_exact,
+        eip712_preimage, eip3009_preimage, exact_signing_payload, parse_payment_required, proto,
+        v1_exact,
     };
     use alloy::primitives::{Address, U256};
     use async_trait::async_trait;
@@ -577,6 +573,29 @@ mod tests {
     use x402_types::proto::OriginalJson;
     use x402_types::scheme::client::{PaymentCandidate, PaymentCandidateSigner, X402Error};
     use x402_types::util::Base64Bytes;
+
+    alloy::sol! {
+        #[derive(Default)]
+        struct EmptyTestMessage {
+            uint256 value;
+        }
+    }
+
+    #[test]
+    fn eip712_preimage_hash_matches_keccak256_of_the_preimage_bytes() {
+        let domain = alloy::sol_types::eip712_domain! {
+            name: "test",
+            version: "1",
+            chain_id: 1u64,
+            verifying_contract: alloy::primitives::Address::ZERO,
+        };
+        let message = EmptyTestMessage {
+            value: alloy::primitives::U256::from(42),
+        };
+        let (preimage, hash) = eip712_preimage(&domain, &message);
+        assert_eq!(preimage.len(), 66);
+        assert_eq!(hash, *alloy::primitives::keccak256(&preimage));
+    }
 
     struct DummyPaymentSigner;
 

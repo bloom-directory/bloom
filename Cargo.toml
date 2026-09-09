@@ -74,6 +74,7 @@ tempfile = "3"
 futures = "0.3"
 lru = "0.12"
 fs2 = "0.4"
+governor = "0.10"
 bloom-audit-checkpoint = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "bc88cc6760b00bbff0c6a6e5f56d42bb03004436" }
 wasmtime = { version = "36.0.13", default-features = false, features = ["async", "cranelift", "runtime", "cache", "parallel-compilation"] }
 wasmtime-wasi = "36.0.13"
