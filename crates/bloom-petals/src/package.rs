@@ -2493,7 +2493,7 @@ fn component_host_interface(name: &str) -> Option<ComponentHostInterface> {
         ContractHostInterface::ChainRead => Some(ComponentHostInterface::ChainRead),
         ContractHostInterface::VfsReadwrite => Some(ComponentHostInterface::VfsReadwrite),
         ContractHostInterface::EnvRuntime => Some(ComponentHostInterface::EnvRuntime),
-        ContractHostInterface::RouteTypes | ContractHostInterface::PrivateInputCeremony => None,
+        ContractHostInterface::RouteTypes => None,
     }
 }
 
