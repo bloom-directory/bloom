@@ -58,8 +58,10 @@ same chain view as `wallets/<wallet>/chains/<chain>/...` read through account
 `m/44'/60'/0'/0/<n>`, Solana `m/44'/501'/<n>'/0'`), so it is stable across
 restarts and reorderings. A legacy or imported single-key wallet is account 0.
 Outbox entries under an account are only the ones its key staged; another
-account's entry is not found there. Staging through a numbered account is not
-available yet; `wallets/<wallet>/chains/...` stages from account 0.
+account's entry is not found there. Staging works through the numbered path
+(`wallets/<wallet>/<n>/chains/<chain>/outbox/new.tx`), which fixes the sender
+to that account's key; a body fingerprint naming another account is an error.
+The wallet-level `wallets/<wallet>/chains/...` path stages from account 0.
 
 Mnemonic import is an owner custody ceremony, not a mounted agent write. V1
 accepts the standard mnemonic and exposes no passphrase input;
