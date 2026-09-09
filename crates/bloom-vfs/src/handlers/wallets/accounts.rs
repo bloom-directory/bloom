@@ -104,19 +104,28 @@ impl WalletsHandler {
     /// projection, grouped by the number their paths encode.
     async fn account_views(&self, wallet: &str) -> Result<Vec<AccountView>, HandlerError> {
         let projection = self.wallet_projection(wallet).await?;
-        if projection.wallet.root_key_ref.is_some() {
+        if let Some(root) = &projection.wallet.root_key_ref {
+            // A root-key wallet is account 0 in the root key's own family:
+            // an imported Secp256k1 root renders as EVM, an Ed25519 root as
+            // Solana. The other family simply does not exist for it.
             let key = projection.primary_key().map_err(err_be)?;
+            let address = projection.primary_address().map_err(err_be)?.to_owned();
+            let family = FamilyKey {
+                key_ref: key.key_ref.clone(),
+                address,
+                fingerprint: key.key_ref.public_key_fingerprint.as_str().to_owned(),
+                path: String::new(),
+                lifecycle: AccountLifecycleState::Active,
+                derived: None,
+            };
+            let (evm, solana) = match root.key_spec {
+                bloom_broker_api::KeySpec::Secp256k1 => (Some(family), None),
+                bloom_broker_api::KeySpec::Ed25519 => (None, Some(family)),
+            };
             return Ok(vec![AccountView {
                 number: 0,
-                evm: Some(FamilyKey {
-                    key_ref: key.key_ref.clone(),
-                    address: projection.primary_address().map_err(err_be)?.to_owned(),
-                    fingerprint: key.key_ref.public_key_fingerprint.as_str().to_owned(),
-                    path: String::new(),
-                    lifecycle: AccountLifecycleState::Active,
-                    derived: None,
-                }),
-                solana: None,
+                evm,
+                solana,
                 freshness: projection.freshness,
             }]);
         }
@@ -532,6 +541,23 @@ impl WalletsHandler {
         }
         let family = Self::evm_family(&view, chain)?;
         let from = Self::evm_address(family)?;
+        // A body fingerprint that names a different account is an error,
+        // symmetric with the Solana outbox: the path fixes the sender.
+        if let [state_seg, leaf] = rest
+            && state_seg == "outbox"
+            && leaf == "new.tx"
+            && let Ok(body) = serde_json::from_slice::<serde_json::Value>(data)
+            && let Some(named) = body.get("account_fingerprint").and_then(|v| v.as_str())
+            && !family
+                .fingerprint
+                .to_ascii_lowercase()
+                .starts_with(&named.to_ascii_lowercase())
+        {
+            return Err(HandlerError::invalid(format!(
+                "intent names account {named}, but this path stages from {}",
+                family.fingerprint
+            )));
+        }
         let projection = self.wallet_projection(wallet).await?;
         let policy = crate::advisory_evm_policy(&projection, chain).map_err(err_be)?;
         self.write_outbox_from(

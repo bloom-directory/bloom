@@ -374,6 +374,11 @@ impl WalletsHandler {
             .and_then(|engines| engines.get(chain).cloned())
     }
 
+    pub fn with_projection_reader(mut self, projections: Arc<dyn WalletProjectionReader>) -> Self {
+        self.wallet_projections = Some(projections);
+        self
+    }
+
     pub fn with_broker(mut self, broker: Option<MachineBrokerClient>) -> Self {
         self.broker = broker;
         self
@@ -4009,18 +4014,36 @@ impl WalletsHandler {
         wallet: &str,
         selector: Option<&str>,
     ) -> Result<SolanaAccount, HandlerError> {
-        let broker = self.broker.as_ref().ok_or_else(|| {
-            HandlerError::backend("Broker edge is unavailable for Solana transfers")
-        })?;
-        let accounts = broker
-            .wallet_accounts(
-                bloom_broker_api::Token::new(wallet.to_owned())
-                    .map_err(|error| HandlerError::invalid(error.to_string()))?,
-            )
-            .await
-            .map_err(|error| HandlerError::backend(error.to_string()))?;
+        // Resolve through the cached authenticated inventory like the
+        // numbered tree does, so reads and staging carry no live Broker
+        // side effect. A stale-marked projection is re-observed live
+        // before anything spends from it, because the cache may predate a
+        // retirement or a new sibling.
+        let projection = self.wallet_projection(wallet).await?;
+        let mut accounts = projection.accounts.accounts.clone();
+        if projection.freshness == bloom_machine_client::ProjectionFreshness::Stale {
+            let broker = self.broker.as_ref().ok_or_else(|| {
+                HandlerError::backend(
+                    "the cached Solana account inventory is stale and the Broker edge is \
+                     unavailable to refresh it",
+                )
+            })?;
+            accounts = broker
+                .wallet_accounts(
+                    bloom_broker_api::Token::new(wallet.to_owned())
+                        .map_err(|error| HandlerError::invalid(error.to_string()))?,
+                )
+                .await
+                .map_err(|_| {
+                    HandlerError::backend(
+                        "the cached Solana account inventory is stale and a fresh Broker \
+                         observation failed",
+                    )
+                })?
+                .accounts;
+        }
         let active = bloom_solana_tx::account::active_accounts(
-            &accounts.accounts,
+            &accounts,
             bloom_broker_api::DerivationProfile::Bip44SolanaSlip10Ed25519V1,
         );
         // Wallet-level paths mean account 0. With several active children the
@@ -4844,7 +4867,7 @@ mod tests {
         }
     }
 
-    fn static_projection(address: Address) -> Arc<dyn WalletProjectionReader> {
+    fn static_projection_value(address: Address) -> WalletProjection {
         let wallet_id = token("alice");
         let key_ref = KeyRef {
             backend: token("local"),
@@ -4863,7 +4886,7 @@ mod tests {
         })
         .unwrap();
         let policy_digest = Digest32::from_bytes(sha2::Sha256::digest(&canonical).into());
-        Arc::new(StaticProjection(WalletProjection {
+        WalletProjection {
             wallet: WalletPublic {
                 wallet_id: wallet_id.clone(),
                 wallet_kind: token("local"),
@@ -4898,7 +4921,11 @@ mod tests {
                 bloom_broker_api::Token::new("alice").unwrap(),
             ),
             verification: ProjectionVerification::AuthenticatedBroker,
-        }))
+        }
+    }
+
+    fn static_projection(address: Address) -> Arc<dyn WalletProjectionReader> {
+        Arc::new(StaticProjection(static_projection_value(address)))
     }
 
     /// A BIP-39 projection: no signable root; the canonical initial EVM child
@@ -5759,6 +5786,45 @@ mod tests {
     struct SolanaChildBroker {
         child_pubkey: [u8; 32],
     }
+    fn solana_child_accounts(child_pubkey: &[u8; 32]) -> bloom_broker_api::WalletAccountsPublic {
+        let mut child_spki = vec![
+            0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
+        ];
+        child_spki.extend_from_slice(child_pubkey);
+        let child_key_ref = bloom_broker_api::KeyRef {
+            backend: bloom_broker_api::Token::new("local").unwrap(),
+            backend_instance: bloom_broker_api::Token::new("primary").unwrap(),
+            locator: "wallet/derived/solana-0".into(),
+            key_spec: bloom_broker_api::KeySpec::Ed25519,
+            public_key_fingerprint: bloom_broker_api::Digest32::from_bytes(
+                sha2::Sha256::digest(&child_spki).into(),
+            ),
+            derivation: Some(bloom_broker_api::DerivationRef::Bip39Multicurve {
+                wallet_seed_ref: bloom_broker_api::Token::new("wallet-seed").unwrap(),
+                profile: bloom_broker_api::DerivationProfile::Bip44SolanaSlip10Ed25519V1,
+                path: "m/44'/501'/0'/0'".into(),
+            }),
+        };
+        bloom_broker_api::WalletAccountsPublic {
+            wallet_id: token("alice"),
+            seed_profile: bloom_broker_api::WalletSeedProfile::Bip39MulticurveV1,
+            accounts: vec![bloom_broker_api::DerivedAccountPublic {
+                key_ref: child_key_ref,
+                wallet_seed_profile: bloom_broker_api::WalletSeedProfile::Bip39MulticurveV1,
+                derivation_profile: bloom_broker_api::DerivationProfile::Bip44SolanaSlip10Ed25519V1,
+                path: "m/44'/501'/0'/0'".into(),
+                canonical_public_key: bloom_broker_api::Base64UrlBytes::from_bytes(&child_spki),
+                public_key_encoding: bloom_broker_api::PublicKeyEncoding::Ed25519SpkiDer,
+                public_key_fingerprint: bloom_broker_api::Digest32::from_bytes(
+                    sha2::Sha256::digest(&child_spki).into(),
+                ),
+                supported_crypto_suites: vec![bloom_broker_api::CryptoSuite::Ed25519Message],
+                chain_projections: vec![],
+                lifecycle: bloom_broker_api::AccountLifecycleState::Active,
+            }],
+        }
+    }
+
     impl bloom_broker_api::MachineBrokerService for SolanaChildBroker {
         fn dispatch<'a>(
             &'a self,
@@ -5986,8 +6052,11 @@ mod tests {
             "solana-devnet",
         );
 
+        let mut projection = static_projection_value(f.wallet_addr);
+        projection.accounts = solana_child_accounts(&child_pubkey);
         let handler = f
             .handler
+            .with_projection_reader(Arc::new(StaticProjection(projection)))
             .with_broker(Some(bloom_machine_client::MachineBrokerClient::new(broker)))
             .with_solana(std::collections::BTreeMap::from([(
                 "solana-devnet".to_string(),
