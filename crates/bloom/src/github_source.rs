@@ -1313,9 +1313,9 @@ fn resolve_ref(
     }
 
     let tags = git_stdout(Some(cache), &["tag", "--list"])?;
-    let (selected_tag, _version) = latest_semver_tag(tags.lines()).ok_or_else(|| {
+    let (selected_tag, _version) = latest_stable_semver_tag(tags.lines()).ok_or_else(|| {
         anyhow!(
-            "no SemVer tags found for {}; pass --ref <branch-or-sha> or publish a tag",
+            "no stable SemVer tags found for {}; pass --ref <branch-or-sha> or publish a tag",
             repo.canonical_url
         )
     })?;
@@ -1608,14 +1608,20 @@ fn validate_repo_relative_path(path: &str, field: &str) -> Result<()> {
     Ok(())
 }
 
-/// The tag with the highest SemVer precedence, ordering pre-release and
-/// build-metadata tags correctly per spec rather than rejecting them
-/// outright. Reuses `bloom-update`'s own `parse_semver`, the same parser
-/// this daemon uses to decide whether it's behind a release.
-fn latest_semver_tag<'a>(
+/// The highest-precedence *stable* tag, used only when no `--ref` was given.
+///
+/// Pre-releases are excluded rather than ordered: SemVer ranks `v2.0.0-rc.1`
+/// above `v1.9.9`, so including them would let an implicit install silently
+/// pick up a release candidate. An operator who wants one still names it
+/// explicitly, which resolves through `resolve_explicit_ref` and never
+/// reaches this function. Build metadata stays comparable via
+/// `cmp_precedence`, and parsing reuses `bloom-update`'s own `parse_semver`,
+/// the same parser this daemon uses to decide whether it's behind a release.
+fn latest_stable_semver_tag<'a>(
     tags: impl Iterator<Item = &'a str>,
 ) -> Option<(&'a str, semver::Version)> {
     tags.filter_map(|tag| bloom_update::parse_semver(tag).map(|version| (tag, version)))
+        .filter(|(_, version)| version.pre.is_empty())
         .max_by(|(_, a), (_, b)| a.cmp_precedence(b))
 }
 
@@ -1700,19 +1706,33 @@ mod tests {
     #[test]
     fn selects_latest_semver_like_tag() {
         let (tag, _version) =
-            latest_semver_tag(["v0.1.0", "v0.10.0", "junk", "0.2.1"].into_iter()).unwrap();
+            latest_stable_semver_tag(["v0.1.0", "v0.10.0", "junk", "0.2.1"].into_iter()).unwrap();
         assert_eq!(tag, "v0.10.0");
     }
 
     #[test]
-    fn orders_pre_release_tags_correctly_instead_of_rejecting_them() {
+    fn orders_pre_release_tags_below_their_final_release() {
         // The old hand-rolled parser treated any non-numeric segment (like a
         // pre-release suffix) as "not a version" and silently dropped it, so
-        // a real release could lose to an older tag. SemVer precedence rules
-        // instead order a pre-release below its final release.
+        // a real release could lose to an older tag.
         let (tag, _version) =
-            latest_semver_tag(["v1.2.3-rc.1", "v1.2.3", "v1.2.2"].into_iter()).unwrap();
+            latest_stable_semver_tag(["v1.2.3-rc.1", "v1.2.3", "v1.2.2"].into_iter()).unwrap();
         assert_eq!(tag, "v1.2.3");
+    }
+
+    #[test]
+    fn implicit_selection_never_prefers_a_prerelease_over_a_stable_release() {
+        // SemVer ranks 2.0.0-rc.1 above 1.9.9, so ordering alone would let an
+        // implicit (no `--ref`) install pick up a release candidate. Only
+        // stable tags are eligible; an rc is reachable by naming it.
+        let (tag, _version) =
+            latest_stable_semver_tag(["v1.9.9", "v2.0.0-rc.1"].into_iter()).unwrap();
+        assert_eq!(tag, "v1.9.9");
+    }
+
+    #[test]
+    fn implicit_selection_finds_nothing_when_every_tag_is_a_prerelease() {
+        assert!(latest_stable_semver_tag(["v1.0.0-rc.1", "v2.0.0-beta"].into_iter()).is_none());
     }
 
     #[test]
@@ -2690,7 +2710,7 @@ mod tests {
         let err = resolve_ref(fixture.bare.path(), &repo, None)
             .unwrap_err()
             .to_string();
-        assert!(err.contains("no SemVer tags found"));
+        assert!(err.contains("no stable SemVer tags found"));
         assert!(err.contains("pass --ref"));
     }
 
@@ -3128,7 +3148,7 @@ mod tests {
         )
         .unwrap_err()
         .to_string();
-        assert!(no_tag_err.contains("no SemVer tags found"));
+        assert!(no_tag_err.contains("no stable SemVer tags found"));
 
         let manifest_err = install_github_source(
             &home_dir,

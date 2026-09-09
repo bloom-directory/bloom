@@ -6,14 +6,24 @@ no way for a sandboxed agent container to complete the WebAuthn ceremony it
 requires. So this harness completes the one ceremony itself, in provision(),
 before the agent starts — exactly like session creation completes its
 ceremonies before handing control to the agent in hyperliquid-order-cancel.
-The agent then reissues the identical write (same nonce), which the Petal's
-own idempotent pending-nonce record resolves without a further ceremony, and
-reads back the result. cleanup() revokes the approval the same way it was
-granted, using the max_fee_tenths_bps=0 revocation path.
+
+It deliberately stops there. The Petal short-circuits an already-completed
+nonce, so a harness that also performed the submitting write would leave the
+agent's replay an unobservable no-op — and an agent that never touched
+/bloom could still be graded as passing against venue state the harness had
+established itself. Staging only the approval means the agent's own mounted
+write is what reaches Hyperliquid, and the verifier's independent
+maxBuilderFee query is real evidence that it did.
+
+cleanup() revokes through the full path (ceremony plus submitting write),
+using the max_fee_tenths_bps=0 revocation path, and runs whenever staging
+began rather than only after a confirmed grant.
 """
 
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
 import json
 import os
@@ -33,6 +43,8 @@ NETWORKS = ("mainnet", "testnet")
 ADDRESS = re.compile(r"0x[0-9a-f]{40}")
 WALLET_ID = re.compile(r"[a-z0-9][a-z0-9-]{0,62}")
 PACKAGE_HASH = re.compile(r"[0-9a-f]{64}")
+LINEAGE_ID = re.compile(r"pln1_[a-z2-7]{52}")
+BASE64URL = re.compile(r"[A-Za-z0-9_-]+")
 ROUTE_PATTERN = "[network]/exchange/[wallet]/approve_builder_fee.json"
 OPERATION_CLASS = "hyperliquid.approve_builder_fee"
 # Matches the venue caps enforced in route/src/protocol.rs: 0.1% perps / 1%
@@ -114,7 +126,10 @@ class HyperliquidApproveBuilderFeeEval(EvalDefinition):
             )
         )
         self.nonce: int | None = None
-        self.granted = False
+        # Set before the first side-effecting write, not after it succeeds:
+        # an approval can be live even when a later read or poll fails, and
+        # an unrevoked approval is the worse failure.
+        self.cleanup_needed = False
         self.counter_committed = counter_committed
         self.phase_timings: dict[str, float] = {}
 
@@ -210,27 +225,26 @@ class HyperliquidApproveBuilderFeeEval(EvalDefinition):
     def _redact_ceremony_urls(self, output: str) -> str:
         return CEREMONY_URL.sub("[REDACTED_CEREMONY_URL]", output)
 
-    def _pending_builder_fee_ceremony(self) -> str | None:
-        """Resolve the owner signing request this action's write staged.
+    def _builder_fee_requests(self) -> list[dict[str, Any]]:
+        """Every owner signing request this action's writes have staged.
 
         Unlike hyperliquid-order-cancel's agent-approval ceremony, there is no
         session id to bind against. Scope as tightly as the projection allows:
         exact wallet, exact package hash, exact operation class. Grant and
         revoke are indistinguishable at this layer (both are
-        hyperliquid.approve_builder_fee); the caller only ever has one
-        in flight, so this refuses to act rather than guess if it ever finds
-        more than one.
+        hyperliquid.approve_builder_fee); the caller only ever has one in
+        flight, so callers refuse to act rather than guess on more than one.
         """
         root = self.bloom_mount / "petal-signing-requests"
         try:
             names = sorted(os.listdir(root))
         except FileNotFoundError:
-            return None
+            return []
         except OSError as error:
             raise EvalError(
                 f"could not list owner Petal signing requests: {error}"
             ) from error
-        matches: list[str] = []
+        matches: list[dict[str, Any]] = []
         for name in names:
             if re.fullmatch(r"[0-9a-f]{64}\.json", name) is None:
                 continue
@@ -242,11 +256,18 @@ class HyperliquidApproveBuilderFeeEval(EvalDefinition):
                 continue
             if (
                 record.get("schema") != "bloom.machine.petal-signing-request.v1"
-                or record.get("status") != "awaiting_owner_approval"
                 or record.get("wallet") != self.wallet_id
                 or record.get("package_hash") != self.package_hash
                 or record.get("operation_class") != OPERATION_CLASS
             ):
+                continue
+            matches.append(record)
+        return matches
+
+    def _pending_builder_fee_ceremony(self) -> str | None:
+        matches: list[str] = []
+        for record in self._builder_fee_requests():
+            if record.get("status") != "awaiting_owner_approval":
                 continue
             ceremony_url = record.get("ceremony_url")
             if not isinstance(ceremony_url, str):
@@ -261,6 +282,19 @@ class HyperliquidApproveBuilderFeeEval(EvalDefinition):
                 "multiple approve_builder_fee ceremonies match the exact wallet"
             )
         return matches[0] if matches else None
+
+    def _builder_fee_request_status(self) -> str | None:
+        """The single staged request's status, or None when none is staged."""
+        statuses = [
+            record.get("status")
+            for record in self._builder_fee_requests()
+            if isinstance(record.get("status"), str)
+        ]
+        if len(statuses) > 1:
+            raise EvalError(
+                "multiple approve_builder_fee signing requests match the exact wallet"
+            )
+        return statuses[0] if statuses else None
 
     def _require_local_json(self, path: Path, label: str) -> Any:
         try:
@@ -278,6 +312,16 @@ class HyperliquidApproveBuilderFeeEval(EvalDefinition):
         except (OSError, json.JSONDecodeError) as error:
             raise EvalError(f"{label} is invalid: {error}") from error
 
+    @staticmethod
+    def _is_base64url_signature(value: Any) -> bool:
+        if not isinstance(value, str) or BASE64URL.fullmatch(value) is None:
+            return False
+        try:
+            decoded = base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
+        except (ValueError, binascii.Error):
+            return False
+        return len(decoded) == 64
+
     def _require_installed_package_hash(self) -> None:
         if not self.owner_record_value:
             raise EvalError("BLOOM_EVAL_PETAL_OWNER_RECORD is required")
@@ -291,17 +335,18 @@ class HyperliquidApproveBuilderFeeEval(EvalDefinition):
             )
 
     def _require_builder_fee_provenance(self) -> None:
-        """Confirm the installed route can carry the fee this eval will grant.
+        """Confirm the installed route is the one this eval will sign with.
 
-        Bloom's provenance catalog currently records fee_asset: null for every
-        Petal operation class (see bloom-directory/bloom#<TODO: platform
-        fee_asset issue>). approve_builder_fee.json's own DeclaredFee is
-        `{"kind":"none"}` regardless (approving a cap charges nothing itself),
-        so that gap does not block this specific route the way it blocks
-        order.json with a nonzero builder fee. This check only confirms the
-        route is installed and owned under the expected operation class; it
-        intentionally does not assert a non-null fee_asset, since nothing in
-        the current toolchain can produce one.
+        `fee_asset` is required to be null. Approving a cap charges nothing
+        by itself, so the Petal declares `{"kind":"none"}`, and Broker
+        rejects a `DeclaredFee::None` claim whose class is catalogued with a
+        fee asset (`FEE_REQUIRED`). A non-null fee asset here would therefore
+        break this route rather than price it.
+
+        Lineage and installer-signature material are checked the same way
+        `hyperliquid_order_cancel.py` checks them: a route whose provenance
+        is unsigned, or whose Petal lineage is inactive or malformed, is not
+        authority this eval should exercise.
         """
         if not self.provenance_catalog_value:
             raise EvalError("BLOOM_EVAL_PROVENANCE_CATALOG is required")
@@ -352,10 +397,50 @@ class HyperliquidApproveBuilderFeeEval(EvalDefinition):
             raise EvalError(
                 "installed approve_builder_fee route has no unique installer-provenance record"
             )
-        operation_classes = matching_records[0].get("operation_classes")
+        record = matching_records[0]
+        operation_classes = record.get("operation_classes")
         if operation_classes != [{"operation_class": OPERATION_CLASS, "fee_asset": None}]:
             raise EvalError(
                 "installed approve_builder_fee route provenance does not match the expected operation class"
+            )
+        if (
+            not isinstance(record.get("publisher"), str)
+            or not record["publisher"]
+            or not isinstance(record.get("installer_key_id"), str)
+            or not record["installer_key_id"]
+            or not self._is_base64url_signature(record.get("installer_signature"))
+        ):
+            raise EvalError(
+                "installed approve_builder_fee provenance lacks installer signature material"
+            )
+        lineage = record.get("petal_lineage")
+        if not isinstance(lineage, dict) or lineage.get("active") is not True:
+            raise EvalError(
+                "installed approve_builder_fee route does not have active Petal lineage"
+            )
+        release_sequence = lineage.get("release_sequence")
+        if isinstance(release_sequence, str):
+            release_sequence_valid = (
+                re.fullmatch(r"[1-9][0-9]*", release_sequence) is not None
+                and len(release_sequence) <= 20
+                and int(release_sequence) <= 0xFFFF_FFFF_FFFF_FFFF
+            )
+        else:
+            release_sequence_valid = (
+                isinstance(release_sequence, int)
+                and not isinstance(release_sequence, bool)
+                and 0 < release_sequence <= 0xFFFF_FFFF_FFFF_FFFF
+            )
+        if (
+            not isinstance(lineage.get("lineage_id"), str)
+            or LINEAGE_ID.fullmatch(lineage["lineage_id"]) is None
+            or not release_sequence_valid
+            or not isinstance(lineage.get("controller_key_id"), str)
+            or not lineage["controller_key_id"]
+            or not self._is_base64url_signature(lineage.get("controller_signature"))
+        ):
+            raise EvalError(
+                "installed approve_builder_fee route has malformed Petal lineage"
             )
 
     def preauthorization_preflight(self) -> None:
@@ -461,7 +546,7 @@ class HyperliquidApproveBuilderFeeEval(EvalDefinition):
             raise EvalError(f"could not pull the eval image: {error}") from error
 
     def _drive_action(
-        self, route: Path, body: bytes, counter: int
+        self, route: Path, body: bytes, counter: int, *, submit: bool = True
     ) -> tuple[int, str]:
         """Write `body` to `route`, completing at most one owner ceremony.
 
@@ -469,6 +554,12 @@ class HyperliquidApproveBuilderFeeEval(EvalDefinition):
         subprocess output for error reporting. Raises if the route neither
         resolves nor stages a ceremony within budget, or if the ceremony
         fails.
+
+        With `submit=False` the byte-identical replay that actually reaches
+        the venue is deliberately not performed, leaving the approval staged
+        for someone else's write to consume. Every advance of the counter is
+        persisted to `self.sign_count` before the driver runs, so a later
+        action on this instance can never reuse a counter this one attempted.
         """
         first = self._write_route(route, body, WRITE_TIMEOUT_SECONDS)
         output = (first.stdout + first.stderr).decode(errors="replace")
@@ -500,6 +591,12 @@ class HyperliquidApproveBuilderFeeEval(EvalDefinition):
             if self.counter_committed is not None:
                 self.counter_committed(counter)
             self.next_sign_count = counter
+            # Persist onto the instance too, not just the local. cleanup()
+            # runs a second ceremony on this same object; without this it
+            # would restart from the original environment counter and reuse
+            # one the grant already consumed, which Broker rejects as a
+            # replay -- leaving the granted approval live.
+            self.sign_count = counter
             try:
                 completed = subprocess.run(
                     [
@@ -529,15 +626,17 @@ class HyperliquidApproveBuilderFeeEval(EvalDefinition):
                     + self._redact_ceremony_urls(output)
                 )
 
+            if not submit:
+                return counter, output
+
             retry = self._write_route(route, body, WRITE_TIMEOUT_SECONDS)
             last_output = (retry.stdout + retry.stderr).decode(errors="replace")
             output += last_output
 
         return counter, output
 
-    def _grant_or_revoke(self, max_fee_tenths_bps: int, nonce: int) -> dict[str, Any]:
-        route = self.exchange_root / "approve_builder_fee.json"
-        body = json.dumps(
+    def _request_body(self, max_fee_tenths_bps: int, nonce: int) -> bytes:
+        return json.dumps(
             {
                 "builder": self.builder,
                 "max_fee_tenths_bps": max_fee_tenths_bps,
@@ -545,6 +644,45 @@ class HyperliquidApproveBuilderFeeEval(EvalDefinition):
             },
             separators=(",", ":"),
         ).encode()
+
+    def _observed_max_builder_fee(self) -> int:
+        observed = self._read_json(self.max_builder_fee_path)
+        if not isinstance(observed, int) or isinstance(observed, bool):
+            raise EvalError("Hyperliquid maxBuilderFee projection is not an integer")
+        return observed
+
+    def _stage_grant(self, max_fee_tenths_bps: int, nonce: int) -> None:
+        """Complete the owner ceremony but leave the venue write to the agent.
+
+        The Petal short-circuits a completed nonce (`owner_nonce` returns
+        `completed`, and the route returns success without contacting the
+        venue), so if this harness submitted the grant itself the agent's
+        replay would be an unobservable no-op: it could skip `/bloom`
+        entirely, synthesise a report, and still be graded against venue
+        state this harness established. Staging only the approval makes the
+        verifier's independent maxBuilderFee query the proof that the
+        agent's own mounted write reached Hyperliquid.
+        """
+        route = self.exchange_root / "approve_builder_fee.json"
+        body = self._request_body(max_fee_tenths_bps, nonce)
+        # Conservative: from the first side-effecting write onwards this run
+        # owns a revoke, even if everything after this raises. The approval
+        # may already be usable by the time any later step fails.
+        self.cleanup_needed = True
+        counter = self.sign_count or self._require_sign_count()
+        counter, output = self._drive_action(route, body, counter, submit=False)
+        status = self._builder_fee_request_status()
+        if status != "approved_retry_required":
+            raise EvalError(
+                "approve_builder_fee approval was not staged for the agent to "
+                f"consume (request status {status!r}): "
+                + self._redact_ceremony_urls(output)
+            )
+
+    def _grant_or_revoke(self, max_fee_tenths_bps: int, nonce: int) -> dict[str, Any]:
+        route = self.exchange_root / "approve_builder_fee.json"
+        body = self._request_body(max_fee_tenths_bps, nonce)
+        self.cleanup_needed = True
         counter = self.sign_count or self._require_sign_count()
         counter, output = self._drive_action(route, body, counter)
 
@@ -564,9 +702,7 @@ class HyperliquidApproveBuilderFeeEval(EvalDefinition):
             )
 
         def observed_matches() -> bool:
-            observed = self._read_json(self.max_builder_fee_path)
-            if not isinstance(observed, int) or isinstance(observed, bool):
-                return False
+            observed = self._observed_max_builder_fee()
             if max_fee_tenths_bps > 0:
                 return observed >= max_fee_tenths_bps
             return observed == 0
@@ -590,17 +726,27 @@ class HyperliquidApproveBuilderFeeEval(EvalDefinition):
     def provision(self, agent_name: str) -> EvalRunContext:
         max_fee = int(self.max_fee_tenths_bps_value)
         stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
-        # A deterministic, run-scoped nonce so the agent can reissue the exact
-        # same write and hit the Petal's idempotent completed-nonce path
-        # instead of staging a second ceremony it has no way to complete.
+        # A deterministic, run-scoped nonce. The agent writes this exact body,
+        # which the staged owner approval already covers, so its write signs
+        # and submits rather than staging a second ceremony it has no way to
+        # complete.
         self.nonce = int(
             hashlib.sha256(
                 f"bloom-eval-approve-builder-fee/{self.wallet_id}/{stamp}".encode()
             ).hexdigest()[:12],
             16,
         )
-        self._grant_or_revoke(max_fee, self.nonce)
-        self.granted = True
+        # Fail closed if the venue already grants this builder at least the
+        # target: the verifier proves the agent worked by finding the venue
+        # changed, which proves nothing if it was already true beforehand.
+        already = self._observed_max_builder_fee()
+        if already >= max_fee:
+            raise EvalError(
+                f"Hyperliquid already approves {already} tenths of a bp for this "
+                f"builder (target {max_fee}); a residual approval makes the "
+                "venue-side check unable to attribute the change to the agent"
+            )
+        self._stage_grant(max_fee, self.nonce)
 
         mounts: list[dict[str, Any]] = [
             {
@@ -638,10 +784,16 @@ class HyperliquidApproveBuilderFeeEval(EvalDefinition):
         )
 
     def cleanup(self) -> None:
-        if not self.granted or self.nonce is None:
+        if not self.cleanup_needed or self.nonce is None:
             return
-        # Revoke with a fresh nonce so this is a distinct signed action, not a
-        # replay of the grant. Leaving the run unrevoked would accumulate a
-        # live builder approval on the dedicated wallet on every eval run.
+        # Unconditional once staging began. The approval may have been
+        # consumed by the agent's write, or by an ambiguous outcome this
+        # process never observed, so reconcile by revoking rather than by
+        # trusting a local success flag. Revoking an approval that was never
+        # submitted is a harmless no-op at the venue; leaving a live one is
+        # not.
+        #
+        # A fresh nonce keeps this a distinct signed action rather than a
+        # replay of the grant.
         revoke_nonce = self.nonce + 1
         self._grant_or_revoke(0, revoke_nonce)

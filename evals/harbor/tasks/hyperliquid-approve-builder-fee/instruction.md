@@ -18,7 +18,10 @@ seconds; let it finish before the next read starts.
    other belongs fails as an unqualified permission error.
 3. A trusted host has already completed the one owner ceremony this action
    requires, using the exact request body below — do not vary any field, and
-   do not expect a ceremony URL to appear. Write exactly this JSON object to
+   do not expect a ceremony URL to appear. The approval is staged but not yet
+   submitted: your write is what actually sends it to Hyperliquid, so the
+   request body must match byte for byte or it will not be covered by the
+   approval. Write exactly this JSON object to
    `/bloom/petals/hyperliquid/$BLOOM_EVAL_NETWORK/exchange/$BLOOM_EVAL_WALLET_ID/approve_builder_fee.json`:
 
    ```json

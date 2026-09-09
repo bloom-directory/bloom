@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import copy
 import json
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -16,7 +17,9 @@ from harness.hyperliquid_approve_builder_fee import (
 )
 
 
-class HyperliquidApproveBuilderFeeDefinitionTests(unittest.TestCase):
+class BuilderFeeFixture:
+    """Shared on-disk fixture: installed package, route index, provenance."""
+
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
@@ -73,6 +76,14 @@ class HyperliquidApproveBuilderFeeDefinitionTests(unittest.TestCase):
                             "operation_classes": [
                                 {"operation_class": OPERATION_CLASS, "fee_asset": None}
                             ],
+                            "petal_lineage": {
+                                "lineage_id": "pln1_" + "a" * 52,
+                                "release_sequence": "1",
+                                "predecessor_package_hashes": [],
+                                "controller_key_id": "developer-controller",
+                                "controller_signature": signature,
+                                "active": True,
+                            },
                             "installer_key_id": "developer-installer",
                             "installer_signature": signature,
                         }
@@ -107,6 +118,8 @@ class HyperliquidApproveBuilderFeeDefinitionTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temp.cleanup()
 
+
+class HyperliquidApproveBuilderFeeDefinitionTests(BuilderFeeFixture, unittest.TestCase):
     def test_installed_package_hash_must_match_owner_record(self) -> None:
         self.owner_record.write_text(
             json.dumps({"name": "hyperliquid", "hash": "d" * 64})
@@ -134,6 +147,11 @@ class HyperliquidApproveBuilderFeeDefinitionTests(unittest.TestCase):
             "mismatched provenance package",
             "wrong sign intent",
             "duplicate route",
+            "fee-bearing operation class",
+            "missing installer signature",
+            "inactive lineage",
+            "malformed lineage id",
+            "missing controller signature",
         ):
             routes = copy.deepcopy(base_routes)
             catalog = copy.deepcopy(base_catalog)
@@ -159,6 +177,23 @@ class HyperliquidApproveBuilderFeeDefinitionTests(unittest.TestCase):
                 )
             elif case == "duplicate route":
                 routes["routes"].append(copy.deepcopy(routes["routes"][0]))
+            elif case == "fee-bearing operation class":
+                # Broker denies this route's DeclaredFee::None claims with
+                # FEE_REQUIRED once its class carries a fee asset.
+                catalog["records"][0]["operation_classes"] = [
+                    {
+                        "operation_class": OPERATION_CLASS,
+                        "fee_asset": {"chain": "hyperliquid", "asset": "usdc"},
+                    }
+                ]
+            elif case == "missing installer signature":
+                catalog["records"][0]["installer_signature"] = ""
+            elif case == "inactive lineage":
+                catalog["records"][0]["petal_lineage"]["active"] = False
+            elif case == "malformed lineage id":
+                catalog["records"][0]["petal_lineage"]["lineage_id"] = "not-a-lineage"
+            elif case == "missing controller signature":
+                catalog["records"][0]["petal_lineage"]["controller_signature"] = ""
 
             self.route_index.write_text(json.dumps(routes))
             self.provenance_catalog.write_text(json.dumps(catalog))
@@ -184,6 +219,95 @@ class HyperliquidApproveBuilderFeeDefinitionTests(unittest.TestCase):
             EvalError, "must be a lowercase BLAKE3"
         ):
             self.definition.preauthorization_preflight()
+
+
+class BuilderFeeCeremonyLifecycleTests(BuilderFeeFixture, unittest.TestCase):
+    """The grant/revoke lifecycle around WebAuthn counters and cleanup."""
+
+    def drive(
+        self, *, statuses: list[str] | None = None
+    ) -> tuple[HyperliquidApproveBuilderFeeEval, list[int]]:
+        """Wire a definition whose ceremony completion always succeeds.
+
+        Returns the definition and the list that records every `--sign-count`
+        the debug driver was invoked with, in order.
+        """
+        definition = self.definition
+        counters: list[int] = []
+        ceremony = "http://localhost:18734/ceremony/" + "A" * 43
+        definition._write_route = mock.Mock(
+            return_value=subprocess.CompletedProcess([], 0, b"", b"")
+        )
+        definition._pending_builder_fee_ceremony = mock.Mock(return_value=ceremony)
+        pending = list(statuses or ["approved_retry_required"])
+        definition._builder_fee_request_status = mock.Mock(
+            side_effect=lambda: pending.pop(0) if pending else "signed"
+        )
+
+        def run(command: list[str], **_kwargs: object) -> object:
+            counters.append(int(command[command.index("--sign-count") + 1]))
+            return subprocess.CompletedProcess(command, 0, b"", b"")
+
+        self.driver_runs = mock.patch.object(
+            subprocess, "run", side_effect=run
+        )
+        self.driver_runs.start()
+        self.addCleanup(self.driver_runs.stop)
+        return definition, counters
+
+    def test_grant_then_cleanup_uses_strictly_increasing_driver_counters(
+        self,
+    ) -> None:
+        definition, counters = self.drive()
+        definition._observed_max_builder_fee = mock.Mock(return_value=0)
+        definition._read_json = mock.Mock(return_value={"status": "ok"})
+
+        definition.provision("codex")
+        definition.cleanup()
+
+        self.assertEqual(len(counters), 2, "grant and revoke each spend one")
+        self.assertEqual(counters, sorted(set(counters)))
+        # Starts at the configured counter and never reuses it.
+        self.assertEqual(counters[0], 4)
+        self.assertGreater(counters[1], counters[0])
+        self.assertEqual(definition.sign_count, counters[-1] + 1)
+
+    def test_provision_leaves_the_submitting_write_to_the_agent(self) -> None:
+        definition, _counters = self.drive()
+        definition._observed_max_builder_fee = mock.Mock(return_value=0)
+
+        definition.provision("codex")
+
+        # One staging write only: the byte-identical replay that reaches the
+        # venue is the agent's job, otherwise its write is a Petal no-op and
+        # grading falls back to host-established state.
+        self.assertEqual(definition._write_route.call_count, 1)
+
+    def test_provision_refuses_a_residual_venue_approval(self) -> None:
+        definition, _counters = self.drive()
+        definition._observed_max_builder_fee = mock.Mock(return_value=10)
+        with self.assertRaisesRegex(EvalError, "already approves"):
+            definition.provision("codex")
+
+    def test_provision_fails_closed_when_the_approval_is_not_staged(self) -> None:
+        definition, _counters = self.drive(statuses=["awaiting_owner_approval"])
+        definition._observed_max_builder_fee = mock.Mock(return_value=0)
+        with self.assertRaisesRegex(EvalError, "was not staged"):
+            definition.provision("codex")
+
+    def test_ambiguous_grant_still_schedules_cleanup(self) -> None:
+        definition, _counters = self.drive(statuses=["awaiting_owner_approval"])
+        definition._observed_max_builder_fee = mock.Mock(return_value=0)
+        with self.assertRaises(EvalError):
+            definition.provision("codex")
+        # The approval may be live even though provisioning reported failure,
+        # so the revoke must still be owed.
+        self.assertTrue(definition.cleanup_needed)
+
+    def test_cleanup_is_a_noop_before_any_side_effecting_write(self) -> None:
+        definition, counters = self.drive()
+        definition.cleanup()
+        self.assertEqual(counters, [])
 
 
 if __name__ == "__main__":
