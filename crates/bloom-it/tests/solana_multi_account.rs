@@ -516,32 +516,215 @@ async fn two_active_solana_children_select_sign_and_reconcile_independently() ->
     let new_tx = VfsPath::parse("/wallets/alice/chains/solana-local/outbox/new.tx").unwrap();
     let destination = bs58::encode([0xccu8; 32]).into_string();
 
-    // 5. With two active children, staging without a selector must fail and
-    //    name both, rather than quietly picking whichever is listed first.
+    // 5. The account boundary itself: the wallet-level path stages from
+    //    account 0, a numbered path pins its own account, the two pending
+    //    sets never mix, and a numbered transfer settles on the validator
+    //    signed by exactly that account's key (only account 1 is funded, so
+    //    a wrong key cannot produce a finalized transfer).
     step(
         "5",
-        "staging without a selector fails closed and names both",
+        "wallet-level staging defaults to account 0; numbered paths pin their own",
     );
     let ambiguous = serde_json::json!({
         "destination": destination,
         "lamports": 250_000_000u64,
     });
-    let err = daemon
+
+    // 5a. Wallet level, no selector: the canonical account 0 child is the
+    //     default even while account 1 is also active.
+    daemon
         .vfs
         .write(&new_tx, serde_json::to_vec(&ambiguous)?.as_slice())
         .await
-        .expect_err("two active children must not resolve implicitly");
-    let message = err.to_string();
-    println!("    refused: {message}");
-    assert!(
-        message.contains(account0.fingerprint_hex())
-            && message.contains(account1.fingerprint_hex()),
-        "the error must name both candidates: {message}"
+        .map_err(|e| anyhow!("wallet-level stage: {e}"))?;
+    let zero_staged = daemon
+        .vfs
+        .list(&VfsPath::parse("/wallets/alice/chains/solana-local/outbox/pending").unwrap())
+        .await
+        .map_err(|e| anyhow!("list pending: {e}"))?;
+    let wallet_level_id = zero_staged
+        .first()
+        .ok_or_else(|| anyhow!("nothing staged at wallet level"))?
+        .name
+        .clone();
+    let staged_zero = read_json(
+        &daemon,
+        &format!("/wallets/alice/chains/solana-local/outbox/pending/{wallet_level_id}/intent.json"),
+    )
+    .await?;
+    assert_eq!(
+        staged_zero["account_fingerprint"].as_str().unwrap(),
+        account0.fingerprint_hex(),
+        "the wallet-level default must be the canonical account 0 child"
     );
-    assert!(
-        message.contains(&account0.path) && message.contains(&account1.path),
-        "the error must name both derivation paths: {message}"
+    assert_eq!(
+        staged_zero["fee_payer"].as_str().unwrap(),
+        account0.address,
+        "the wallet-level default must spend from account 0"
     );
+    println!("    wallet-level stage pinned account 0: {wallet_level_id}");
+    // Remove it: later steps need a clean pending set.
+    daemon
+        .vfs
+        .write(
+            &VfsPath::parse(&format!(
+                "/wallets/alice/chains/solana-local/outbox/pending/{wallet_level_id}/cancel"
+            ))
+            .unwrap(),
+            b"y\n",
+        )
+        .await
+        .map_err(|e| anyhow!("cancel wallet-level stage: {e}"))?;
+
+    // 5b. A body fingerprint that disagrees with the numbered path is an
+    //     error, not a cross-account escalation.
+    let numbered_tx =
+        VfsPath::parse("/wallets/alice/1/chains/solana-local/outbox/new.tx").unwrap();
+    let crossed = daemon
+        .vfs
+        .write(
+            &numbered_tx,
+            serde_json::to_vec(&serde_json::json!({
+                "destination": destination,
+                "lamports": 250_000_000u64,
+                "account_fingerprint": account0.fingerprint_hex(),
+            }))?
+                .as_slice(),
+        )
+        .await
+        .expect_err("an intent naming another account must not stage");
+    println!("    path/body disagreement refused: {crossed}");
+
+    // 5c. Stage through account 1's own path, with no selector in the body.
+    let numbered_destination = bs58::encode([0xddu8; 32]).into_string();
+    let numbered_destination_before = rpc(
+        "getBalance",
+        serde_json::json!([numbered_destination.clone()]),
+    )?["result"]["value"]
+        .as_u64()
+        .unwrap_or(0);
+    daemon
+        .vfs
+        .write(
+            &numbered_tx,
+            serde_json::to_vec(&serde_json::json!({
+                "destination": numbered_destination,
+                "lamports": 250_000_000u64,
+            }))?
+                .as_slice(),
+        )
+        .await
+        .map_err(|e| anyhow!("numbered stage: {e}"))?;
+    let one_pending = daemon
+        .vfs
+        .list(&VfsPath::parse("/wallets/alice/1/chains/solana-local/outbox/pending").unwrap())
+        .await
+        .map_err(|e| anyhow!("list account 1 pending: {e}"))?;
+    let numbered_id = one_pending
+        .first()
+        .ok_or_else(|| anyhow!("nothing staged through account 1"))?
+        .name
+        .clone();
+    let staged_one = read_json(
+        &daemon,
+        &format!("/wallets/alice/1/chains/solana-local/outbox/pending/{numbered_id}/intent.json"),
+    )
+    .await?;
+    assert_eq!(
+        staged_one["account_fingerprint"].as_str().unwrap(),
+        account1.fingerprint_hex(),
+        "the numbered path must pin its own account"
+    );
+    assert_eq!(
+        staged_one["fee_payer"].as_str().unwrap(),
+        account1.address,
+        "the numbered path must spend from its own account"
+    );
+    println!("    numbered stage pinned account 1: {numbered_id}");
+
+    // 5d. Account 0's pending does not list account 1's entry, and
+    //     confirming account 1's entry through account 0's path is not
+    //     found.
+    let zero_pending = daemon
+        .vfs
+        .list(&VfsPath::parse("/wallets/alice/0/chains/solana-local/outbox/pending").unwrap())
+        .await
+        .map_err(|e| anyhow!("list account 0 pending: {e}"))?;
+    assert!(
+        zero_pending.iter().all(|entry| entry.name != numbered_id),
+        "account 1's entry must not appear under account 0: {zero_pending:?}"
+    );
+    let crossed_confirm = daemon
+        .vfs
+        .write(
+            &VfsPath::parse(&format!(
+                "/wallets/alice/0/chains/solana-local/outbox/pending/{numbered_id}/confirm"
+            ))
+            .unwrap(),
+            b"y\n",
+        )
+        .await
+        .expect_err("confirming account 1's entry through account 0 must not be found");
+    println!("    cross-account confirm refused: {crossed_confirm}");
+
+    // 5e. Confirm through account 1's path and settle on the validator.
+    let numbered_confirm = VfsPath::parse(&format!(
+        "/wallets/alice/1/chains/solana-local/outbox/pending/{numbered_id}/confirm"
+    ))
+    .unwrap();
+    let refused = daemon.vfs.write(&numbered_confirm, b"y\n").await;
+    assert!(
+        refused.is_err(),
+        "confirm must fail closed before owner approval"
+    );
+    broker.approval_active.store(true, Ordering::SeqCst);
+    daemon
+        .vfs
+        .write(&numbered_confirm, b"y\n")
+        .await
+        .map_err(|e| anyhow!("confirm numbered: {e}"))?;
+    let mut numbered_receipt = None;
+    for _ in 0..60 {
+        if let Ok(value) = read_json(
+            &daemon,
+            &format!(
+                "/wallets/alice/1/chains/solana-local/outbox/sent/{numbered_id}/receipt.json"
+            ),
+        )
+        .await
+            && value["confirmation_status"].as_str() == Some("finalized")
+        {
+            numbered_receipt = Some(value);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+    let numbered_receipt = numbered_receipt
+        .ok_or_else(|| anyhow!("numbered transfer did not reach a finalized receipt"))?;
+    assert_eq!(numbered_receipt["outcome"].as_str(), Some("success"));
+    let numbered_destination_balance =
+        rpc("getBalance", serde_json::json!([numbered_destination]))?["result"]["value"]
+            .as_u64()
+            .unwrap_or(0);
+    assert_eq!(
+        numbered_destination_balance,
+        numbered_destination_before + 250_000_000,
+        "the numbered transfer settled on the validator"
+    );
+    println!("    numbered transfer settled; account boundary holds end to end");
+    // Baselines for the later steps, which count calls and sent entries.
+    let sign_calls_before = broker.sign_calls.lock().len();
+    let sent_before = daemon
+        .vfs
+        .list(&VfsPath::parse("/wallets/alice/chains/solana-local/outbox/sent").unwrap())
+        .await
+        .map_err(|e| anyhow!("list sent: {e}"))?
+        .len();
+    assert_eq!(sign_calls_before, 1, "the numbered confirm signed once");
+    assert_eq!(sent_before, 1, "the numbered transfer is in sent");
+    // Step 8 exercises its own approval gating; drop the fixture approval
+    // again so its pre-approval refusal is real.
+    broker.approval_active.store(false, Ordering::SeqCst);
 
     // 6. A fingerprint that belongs to no active child is refused too.
     step("6", "a foreign fingerprint is refused");
@@ -566,6 +749,10 @@ async fn two_active_solana_children_select_sign_and_reconcile_independently() ->
         "7",
         "stage from account 1 by fingerprint, account 0 still active",
     );
+    let destination_before =
+        rpc("getBalance", serde_json::json!([destination]))?["result"]["value"]
+            .as_u64()
+            .unwrap_or(0);
     let intent = serde_json::json!({
         "destination": destination,
         "lamports": 250_000_000u64,
@@ -628,8 +815,12 @@ async fn two_active_solana_children_select_sign_and_reconcile_independently() ->
     //    the staged bytes.
     step("9", "the signing call named account 1 and the staged bytes");
     let calls = broker.sign_calls.lock().clone();
-    assert_eq!(calls.len(), 1, "exactly one signing call: {calls:?}");
-    let (locator, signed_bytes) = &calls[0];
+    assert_eq!(
+        calls.len(),
+        sign_calls_before + 1,
+        "exactly one new signing call: {calls:?}"
+    );
+    let (locator, signed_bytes) = &calls[sign_calls_before];
     println!("    signed with key locator {locator}");
     assert_eq!(
         locator, &account1.key_ref.locator,
@@ -713,7 +904,11 @@ async fn two_active_solana_children_select_sign_and_reconcile_independently() ->
         rpc("getBalance", serde_json::json!([destination]))?["result"]["value"]
             .as_u64()
             .unwrap_or(0);
-    assert_eq!(destination_balance, 250_000_000, "destination debit");
+    assert_eq!(
+        destination_balance,
+        destination_before + 250_000_000,
+        "destination debit"
+    );
     let account0_after =
         rpc("getBalance", serde_json::json!([account0.address]))?["result"]["value"]
             .as_u64()
@@ -731,7 +926,8 @@ async fn two_active_solana_children_select_sign_and_reconcile_independently() ->
     println!("    replay result: {replay:?}");
     let calls_after = broker.sign_calls.lock().len();
     assert_eq!(
-        calls_after, 1,
+        calls_after,
+        sign_calls_before + 1,
         "a replayed confirm must not sign again (calls={calls_after})"
     );
     let sent_after = daemon
@@ -739,7 +935,11 @@ async fn two_active_solana_children_select_sign_and_reconcile_independently() ->
         .list(&VfsPath::parse("/wallets/alice/chains/solana-local/outbox/sent").unwrap())
         .await
         .map_err(|e| anyhow!("list sent: {e}"))?;
-    assert_eq!(sent_after.len(), 1, "exactly one sent entry must exist");
+    assert_eq!(
+        sent_after.len(),
+        sent_before + 1,
+        "exactly one new sent entry must exist"
+    );
 
     // 13. Restart: the durable receipt and the pinned account survive, and a
     //     post-restart confirm still does not resend.
@@ -808,7 +1008,7 @@ async fn two_active_solana_children_select_sign_and_reconcile_independently() ->
     println!("    second replay result: {replay_again:?}");
     assert_eq!(
         broker.sign_calls.lock().len(),
-        1,
+        sign_calls_before + 1,
         "no replay may produce a second signing call"
     );
 
