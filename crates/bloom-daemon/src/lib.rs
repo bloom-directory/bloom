@@ -7286,4 +7286,744 @@ ws_url = "wss://example.invalid"
         let restarted = AuditLog::open(&path).unwrap();
         assert!(restarted.pending_effect_correlations().unwrap().is_empty());
     }
+
+    // ----- numbered-account Petal isolation -----
+
+    /// One derived child of wallet "w": its KeyRef, published projection
+    /// fields, and the bytes its fingerprint is taken over.
+    struct AccountChild {
+        key_ref: bloom_broker_api::KeyRef,
+        path: String,
+        profile: bloom_broker_api::DerivationProfile,
+        spki: Vec<u8>,
+        suites: Vec<bloom_broker_api::CryptoSuite>,
+        address: String,
+    }
+
+    fn account_child(seed: u8, number: u32, evm: bool) -> AccountChild {
+        use sha2::Digest as _;
+        let (path, key_spec, profile, suites, spki, address) = if evm {
+            let mut spki = vec![0x02];
+            spki.extend(std::iter::repeat_n(seed, 32));
+            (
+                format!("m/44'/60'/0'/0/{number}"),
+                bloom_broker_api::KeySpec::Secp256k1,
+                bloom_broker_api::DerivationProfile::Bip44EvmSecp256k1V1,
+                vec![bloom_broker_api::CryptoSuite::Secp256k1Keccak256Recoverable],
+                spki,
+                format!("0x{:040x}", u64::from(seed)),
+            )
+        } else {
+            let mut spki = vec![
+                0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
+            ];
+            spki.extend(std::iter::repeat_n(seed, 32));
+            (
+                format!("m/44'/501'/{number}'/0'"),
+                bloom_broker_api::KeySpec::Ed25519,
+                bloom_broker_api::DerivationProfile::Bip44SolanaSlip10Ed25519V1,
+                vec![bloom_broker_api::CryptoSuite::Ed25519Message],
+                spki,
+                bs58_number(seed),
+            )
+        };
+        let fingerprint =
+            bloom_broker_api::Digest32::from_bytes(sha2::Sha256::digest(&spki).into());
+        AccountChild {
+            key_ref: bloom_broker_api::KeyRef {
+                backend: bloom_broker_api::Token::new("local").unwrap(),
+                backend_instance: bloom_broker_api::Token::new("iso").unwrap(),
+                locator: format!(
+                    "wallet/derived/{}-{number}",
+                    if evm { "evm" } else { "solana" }
+                ),
+                key_spec,
+                public_key_fingerprint: fingerprint,
+                derivation: Some(bloom_broker_api::DerivationRef::Bip39Multicurve {
+                    wallet_seed_ref: bloom_broker_api::Token::new("w-seed").unwrap(),
+                    profile,
+                    path: path.clone(),
+                }),
+            },
+            path,
+            profile,
+            spki,
+            suites,
+            address,
+        }
+    }
+
+    fn bs58_number(seed: u8) -> String {
+        // A syntactically distinct stand-in address; nothing parses it in
+        // these tests.
+        std::iter::repeat_n((b'A' + (seed % 26)) as char, 32).collect()
+    }
+
+    fn derived_account_public(child: &AccountChild) -> bloom_broker_api::DerivedAccountPublic {
+        bloom_broker_api::DerivedAccountPublic {
+            key_ref: child.key_ref.clone(),
+            wallet_seed_profile: bloom_broker_api::WalletSeedProfile::Bip39MulticurveV1,
+            derivation_profile: child.profile,
+            path: child.path.clone(),
+            canonical_public_key: bloom_broker_api::Base64UrlBytes::from_bytes(&child.spki),
+            public_key_encoding: if child
+                .key_ref
+                .key_spec
+                .eq(&bloom_broker_api::KeySpec::Ed25519)
+            {
+                bloom_broker_api::PublicKeyEncoding::Ed25519SpkiDer
+            } else {
+                bloom_broker_api::PublicKeyEncoding::Secp256k1SpkiDer
+            },
+            public_key_fingerprint: child.key_ref.public_key_fingerprint.clone(),
+            supported_crypto_suites: child.suites.clone(),
+            chain_projections: vec![bloom_broker_api::ChainAccountProjection {
+                chain_family: bloom_broker_api::Token::new(
+                    if child
+                        .key_ref
+                        .key_spec
+                        .eq(&bloom_broker_api::KeySpec::Ed25519)
+                    {
+                        "solana"
+                    } else {
+                        "evm"
+                    },
+                )
+                .unwrap(),
+                caip2: if child
+                    .key_ref
+                    .key_spec
+                    .eq(&bloom_broker_api::KeySpec::Ed25519)
+                {
+                    "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp".into()
+                } else {
+                    "eip155:1".into()
+                },
+                caip10: child.address.clone(),
+                address: child.address.clone(),
+                address_encoding: if child
+                    .key_ref
+                    .key_spec
+                    .eq(&bloom_broker_api::KeySpec::Ed25519)
+                {
+                    bloom_broker_api::AddressEncoding::Base58
+                } else {
+                    bloom_broker_api::AddressEncoding::Hex0x
+                },
+            }],
+            lifecycle: bloom_broker_api::AccountLifecycleState::Active,
+        }
+    }
+
+    /// A Broker fixture exposing one BIP-39 wallet "w" with EVM and Solana
+    /// children at numbers 0 and 1, and a recording signing edge.
+    struct TwoFamilyAccountBroker {
+        children: Vec<AccountChild>,
+        sign_calls: parking_lot::Mutex<Vec<bloom_broker_api::KeyRef>>,
+    }
+
+    impl TwoFamilyAccountBroker {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                children: vec![
+                    account_child(1, 0, true),
+                    account_child(2, 0, false),
+                    account_child(3, 1, true),
+                    account_child(4, 1, false),
+                ],
+                sign_calls: parking_lot::Mutex::new(Vec::new()),
+            })
+        }
+
+        fn child(&self, evm: bool, number: u32) -> &AccountChild {
+            self.children
+                .iter()
+                .find(|child| child.key_spec_is_ed25519() == !evm && child.path_number() == number)
+                .unwrap()
+        }
+
+        fn wallet_public(&self) -> bloom_broker_api::WalletPublic {
+            let policy = self.policy();
+            bloom_broker_api::WalletPublic {
+                wallet_id: bloom_broker_api::Token::new("w").unwrap(),
+                wallet_kind: bloom_broker_api::Token::new("local").unwrap(),
+                root_key_ref: None,
+                key_refs: self.children.iter().map(|c| c.key_ref.clone()).collect(),
+                policy_version: bloom_broker_api::DecimalU64::new(1),
+                policy_digest: policy.policy_digest,
+                wallet_revocation_epoch: bloom_broker_api::DecimalU64::new(0),
+            }
+        }
+
+        fn policy(&self) -> bloom_broker_api::SignedPolicySnapshot {
+            let canonical = serde_json::to_vec(&bloom_broker_api::CanonicalWalletPolicy {
+                wallet_id: bloom_broker_api::Token::new("w").unwrap(),
+                maximum_approval_lifetime_ms: 3_600_000,
+                allowed_petal_packages: Vec::new(),
+                allowed_destinations: Vec::new(),
+                required_verifiers: Vec::new(),
+            })
+            .unwrap();
+            bloom_broker_api::SignedPolicySnapshot {
+                wallet_id: bloom_broker_api::Token::new("w").unwrap(),
+                version: bloom_broker_api::DecimalU64::new(1),
+                canonical_policy: bloom_broker_api::Base64UrlBytes::from_bytes(&canonical),
+                policy_digest: bloom_broker_api::Digest32::from_bytes(
+                    sha2::Sha256::digest(&canonical).into(),
+                ),
+                policy_signing_key_id: bloom_broker_api::Token::new("iso-policy").unwrap(),
+                policy_verifying_key: bloom_broker_api::Base64UrlBytes::from_bytes(&[12; 32]),
+                signer_signature: bloom_broker_api::Base64UrlBytes::from_bytes(&[13; 64]),
+            }
+        }
+
+        fn accounts(&self) -> bloom_broker_api::WalletAccountsPublic {
+            bloom_broker_api::WalletAccountsPublic {
+                wallet_id: bloom_broker_api::Token::new("w").unwrap(),
+                seed_profile: bloom_broker_api::WalletSeedProfile::Bip39MulticurveV1,
+                accounts: self.children.iter().map(derived_account_public).collect(),
+            }
+        }
+
+        fn key_public(&self, child: &AccountChild) -> bloom_broker_api::KeyPublic {
+            bloom_broker_api::KeyPublic {
+                key_ref: child.key_ref.clone(),
+                role: bloom_broker_api::KeyRole::Derived,
+                canonical_public_key: bloom_broker_api::Base64UrlBytes::from_bytes(&child.spki),
+                addresses: vec![child.address.clone()],
+                supported_crypto_suites: child.suites.clone(),
+            }
+        }
+
+        fn signing_result(
+            &self,
+            request: &bloom_broker_api::MachineSignRequest,
+        ) -> bloom_broker_api::SigningResult {
+            let width = match request.crypto_suite.signature_encoding() {
+                bloom_broker_api::SignatureEncoding::Secp256k1Recoverable65 => 65,
+                bloom_broker_api::SignatureEncoding::Ed25519Raw64 => 64,
+            };
+            let count = match &request.payloads {
+                bloom_broker_api::SigningPayloads::Single { .. } => 1,
+                bloom_broker_api::SigningPayloads::Batch { children } => children.len(),
+            };
+            self.sign_calls.lock().push(request.key_ref.clone());
+            bloom_broker_api::SigningResult {
+                operation_id: request.operation_id.clone(),
+                operation_digest: request.operation_digest.clone(),
+                signatures: std::iter::repeat_n(
+                    bloom_broker_api::NormalizedSignature {
+                        crypto_suite: request.crypto_suite,
+                        bytes: bloom_broker_api::Base64UrlBytes::from_bytes(&vec![7_u8; width]),
+                    },
+                    count,
+                )
+                .collect(),
+                signer_receipt_digest: bloom_broker_api::Digest32::from_bytes([9; 32]),
+                broker_receipt_digest: bloom_broker_api::Digest32::from_bytes([10; 32]),
+            }
+        }
+    }
+
+    impl AccountChild {
+        fn fingerprint_hex(&self) -> &str {
+            self.key_ref.public_key_fingerprint.as_str()
+        }
+
+        fn key_spec_is_ed25519(&self) -> bool {
+            matches!(self.key_ref.key_spec, bloom_broker_api::KeySpec::Ed25519)
+        }
+
+        fn path_number(&self) -> u32 {
+            if self.key_spec_is_ed25519() {
+                // m/44'/501'/<n>'/0'
+                self.path
+                    .split('/')
+                    .nth(3)
+                    .and_then(|segment| segment.trim_end_matches('\'').parse().ok())
+            } else {
+                // m/44'/60'/0'/0/<n>
+                self.path
+                    .rsplit('/')
+                    .next()
+                    .and_then(|last| last.parse().ok())
+            }
+            .expect("fixture paths encode their account number")
+        }
+    }
+
+    impl bloom_broker_api::MachineBrokerService for TwoFamilyAccountBroker {
+        fn dispatch<'a>(
+            &'a self,
+            request: bloom_broker_api::MachineBrokerRequest,
+        ) -> bloom_broker_api::ServiceFuture<'a, bloom_broker_api::MachineBrokerResponse> {
+            Box::pin(async move {
+                use bloom_broker_api::{
+                    CredentialPublic, MachineBrokerResponse, ProtocolError, ProtocolErrorCode,
+                };
+                match request {
+                    MachineBrokerRequest::WalletListPublic(_) => {
+                        Ok(MachineBrokerResponse::WalletListPublic(vec![
+                            self.wallet_public(),
+                        ]))
+                    }
+                    MachineBrokerRequest::WalletGetPublic(_) => {
+                        Ok(MachineBrokerResponse::WalletGetPublic(self.wallet_public()))
+                    }
+                    MachineBrokerRequest::KeyListPublic(_) => {
+                        Ok(MachineBrokerResponse::KeyListPublic(
+                            self.children.iter().map(|c| self.key_public(c)).collect(),
+                        ))
+                    }
+                    MachineBrokerRequest::KeyGetPublic(r) => {
+                        let child = self
+                            .children
+                            .iter()
+                            .find(|c| c.key_ref == r.key_ref)
+                            .ok_or_else(|| {
+                                ProtocolError::new(
+                                    ProtocolErrorCode::KeyrefMismatch,
+                                    "key is not a child of this wallet",
+                                )
+                            })?;
+                        Ok(MachineBrokerResponse::KeyGetPublic(self.key_public(child)))
+                    }
+                    MachineBrokerRequest::CredentialListPublic(_) => {
+                        Ok(MachineBrokerResponse::CredentialListPublic(Vec::<
+                            CredentialPublic,
+                        >::new(
+                        )))
+                    }
+                    MachineBrokerRequest::PolicyRead(_) => {
+                        Ok(MachineBrokerResponse::PolicyRead(self.policy()))
+                    }
+                    MachineBrokerRequest::WalletAccounts(_) => {
+                        Ok(MachineBrokerResponse::WalletAccounts(self.accounts()))
+                    }
+                    MachineBrokerRequest::SigningSign(r) => {
+                        Ok(MachineBrokerResponse::SigningSign(self.signing_result(&r)))
+                    }
+                    MachineBrokerRequest::SigningSignBatch(r) => Ok(
+                        MachineBrokerResponse::SigningSignBatch(self.signing_result(&r)),
+                    ),
+                    other => Err(ProtocolError::new(
+                        ProtocolErrorCode::UnknownMethod,
+                        format!("unhandled {other:?}"),
+                    )),
+                }
+            })
+        }
+    }
+
+    fn write_isolation_package_file(root: &std::path::Path, name: &str, bytes: &[u8]) {
+        use std::io::Write as _;
+        let path = root.join(name);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut file = std::fs::File::create(path).unwrap();
+        file.write_all(bytes).unwrap();
+    }
+
+    /// Install an account-aware "echo" petal and an unaware "plain" petal
+    /// into the daemon home before the daemon is built.
+    fn install_isolation_petals(home: &bloom_proto::HomeDir) {
+        let root = home.root().join("petals");
+        let store = bloom_petals::PetalStore::open(root.join("store")).unwrap();
+        let registry = Arc::new(bloom_petals::NameRegistry::open(root.join("registry")).unwrap());
+
+        for (mount, aware) in [("echo", true), ("plain", false)] {
+            let package = root.join(format!("{mount}-package"));
+            write_isolation_package_file(
+                &package,
+                "petal.toml",
+                format!(
+                    r#"schema = "bloom.petal.package.v1"
+name = "{mount}"
+
+[consent]
+summary = "Isolation fixture."
+
+[caps]
+allowed = ["bloom:vfs.read"]
+{account}
+"#,
+                    account = if aware {
+                        "\n[account]\naware = true\n"
+                    } else {
+                        ""
+                    }
+                )
+                .as_bytes(),
+            );
+            write_isolation_package_file(&package, "README.md", b"# fixture");
+            write_isolation_package_file(&package, "AGENTS.md", b"# fixture agents");
+            write_isolation_package_file(
+                &package,
+                &format!("petal/{mount}/message.txt.wasm"),
+                include_bytes!("../../bloom-petals/tests/fixtures/route_component_no_imports.wasm"),
+            );
+            store.install_petal_package_dir(&package).unwrap();
+            let _ = registry;
+        }
+    }
+
+    fn account_route_context(
+        wallet: &str,
+        number: Option<u32>,
+        fingerprint: Option<&str>,
+    ) -> PetalRouteContext {
+        let mut params = Vec::new();
+        if let Some(number) = number {
+            params.push(("bloom.wallet".to_owned(), wallet.to_owned()));
+            params.push(("bloom.account".to_owned(), number.to_string()));
+        }
+        if let Some(fingerprint) = fingerprint {
+            params.push((
+                "bloom.owner_key_fingerprint".to_owned(),
+                fingerprint.to_owned(),
+            ));
+        }
+        PetalRouteContext {
+            petal_root: "echo".into(),
+            package_hash: "ab".repeat(32),
+            route_id: "r000001".into(),
+            op: "read".into(),
+            path: "/message.txt".into(),
+            params,
+            actor: None,
+        }
+    }
+
+    fn isolation_claim_jcs(preimages: &[&[u8]], suite: bloom_broker_api::CryptoSuite) -> Vec<u8> {
+        use sha2::Digest as _;
+        let mut batch = sha2::Sha256::new();
+        batch.update(b"bloom.petal.payload-batch.v1\0");
+        batch.update((preimages.len() as u64).to_be_bytes());
+        for preimage in preimages {
+            batch.update((preimage.len() as u64).to_be_bytes());
+            batch.update(preimage);
+        }
+        let ordered = preimages
+            .iter()
+            .map(|preimage| match suite {
+                bloom_broker_api::CryptoSuite::Secp256k1Keccak256Recoverable => {
+                    bloom_broker_api::Digest32::from_bytes(
+                        alloy::primitives::keccak256(preimage).into(),
+                    )
+                }
+                _ => bloom_broker_api::Digest32::from_bytes(sha2::Sha256::digest(preimage).into()),
+            })
+            .collect::<Vec<_>>();
+        let claim = bloom_broker_api::PetalUseClaim {
+            package_hash: bloom_broker_api::Digest32::new("ab".repeat(32)).unwrap(),
+            route: "r000001".into(),
+            operation_class: bloom_broker_api::Token::new("test.intent").unwrap(),
+            crypto_suite: suite,
+            payload_digest: bloom_broker_api::Digest32::from_bytes(batch.finalize().into()),
+            ordered_hashes: ordered,
+            declared_debits: Vec::new(),
+            declared_destinations: Vec::new(),
+            declared_fee: bloom_broker_api::DeclaredFee::None,
+            nonce: bloom_broker_api::RequestNonce::new(&"9".repeat(32)).unwrap(),
+            claim_assurance: bloom_broker_api::ClaimAssurance::MachineAsserted,
+        };
+        serde_jcs::to_vec(&claim).unwrap()
+    }
+
+    fn isolation_sign_request(
+        context: PetalRouteContext,
+        key_ref: Option<bloom_broker_api::KeyRef>,
+    ) -> bloom_petals::PayloadSignRequest {
+        let preimage = b"isolation-preimage";
+        bloom_petals::PayloadSignRequest {
+            wallet: "w".into(),
+            preimage: preimage.to_vec(),
+            claimed_hash: alloy::primitives::keccak256(preimage).into(),
+            signature_algorithm: "secp256k1-keccak256-recoverable".into(),
+            operation_class: "test.intent".into(),
+            petal_use_claim_jcs: isolation_claim_jcs(
+                &[preimage],
+                bloom_broker_api::CryptoSuite::Secp256k1Keccak256Recoverable,
+            ),
+            claim_assurance_evidence: None,
+            approval_hint: Some("c".repeat(64)),
+            action: None,
+            advisory: None,
+            selector: bloom_broker_api::PetalSignSelector::Reusable,
+            key_ref,
+            context: Some(context),
+        }
+    }
+
+    async fn isolation_daemon() -> (tempfile::TempDir, Daemon, Arc<TwoFamilyAccountBroker>) {
+        let dir = tempfile::tempdir().unwrap();
+        let home = bloom_proto::HomeDir::at(dir.path());
+        home.ensure().unwrap();
+        install_isolation_petals(&home);
+        let broker = TwoFamilyAccountBroker::new();
+        let daemon = Daemon::from_home_with_permit_and_broker(
+            home.clone(),
+            Arc::new(bloom_proto::HomeWritePermit::acquire(&home).unwrap()),
+            MachineBrokerClient::new(broker.clone()),
+            solana_and_evm_catalog(),
+        )
+        .unwrap();
+        (dir, daemon, broker)
+    }
+
+    fn isolation_host(daemon: &Daemon, broker: Arc<TwoFamilyAccountBroker>) -> DaemonPetalHost {
+        DaemonPetalHost::new(Arc::new(LateVfsHost::new()), daemon.audit.clone())
+            .with_broker(Some(MachineBrokerClient::new(broker)))
+    }
+
+    /// 1. `wallets/w/1/petals/` dispatches through the mounted aware petal,
+    ///    and the identity chain the mount feeds — context to resolved
+    ///    owner — lands on account 1's family key.
+    #[tokio::test]
+    async fn account_one_petal_dispatch_runs_aware_petals_and_resolves_account_one_owner() {
+        let (_dir, daemon, broker) = isolation_daemon().await;
+        let evm1 = broker.child(true, 1);
+
+        let message = daemon
+            .vfs
+            .read(&VfsPath::parse("/wallets/w/1/petals/echo/message.txt").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(message, b"component");
+        let zero = daemon
+            .vfs
+            .read(&VfsPath::parse("/wallets/w/0/petals/echo/message.txt").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(zero, b"component");
+
+        let account_one_petals = daemon
+            .vfs
+            .list(&VfsPath::parse("/wallets/w/1/petals").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            account_one_petals
+                .iter()
+                .map(|e| &e.name)
+                .collect::<Vec<_>>(),
+            &["echo"],
+            "only account-aware petals appear under account 1"
+        );
+
+        let host = isolation_host(&daemon, broker.clone());
+        let outcome = host
+            .sign_payload_outcome(isolation_sign_request(
+                account_route_context("w", Some(1), Some(evm1.fingerprint_hex())),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert!(matches!(outcome, SignOutcome::Signature(_)));
+        let calls = broker.sign_calls.lock();
+        assert_eq!(calls.as_slice(), &[evm1.key_ref.clone()]);
+    }
+
+    /// 2. A route under account 1 cannot ask the host to sign with
+    ///    account 0's key.
+    #[tokio::test]
+    async fn account_one_signing_with_account_zero_key_is_denied() {
+        let (_dir, daemon, broker) = isolation_daemon().await;
+        let evm1 = broker.child(true, 1);
+        let evm0 = broker.child(true, 0);
+        let host = isolation_host(&daemon, broker.clone());
+        let error = host
+            .sign_payload_outcome(isolation_sign_request(
+                account_route_context("w", Some(1), Some(evm1.fingerprint_hex())),
+                Some(evm0.key_ref.clone()),
+            ))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, HostError::Denied(ref message) if message.contains("owner")),
+            "{error}"
+        );
+        assert!(broker.sign_calls.lock().is_empty());
+    }
+
+    /// 3. A key from another wallet is not the mounted account's owner.
+    #[tokio::test]
+    async fn account_one_signing_with_a_foreign_wallet_key_is_denied() {
+        let (_dir, daemon, broker) = isolation_daemon().await;
+        let evm1 = broker.child(true, 1);
+        let mut foreign = broker.child(true, 0).key_ref.clone();
+        foreign.locator = "other-wallet/root".into();
+        let host = isolation_host(&daemon, broker.clone());
+        let error = host
+            .sign_payload_outcome(isolation_sign_request(
+                account_route_context("w", Some(1), Some(evm1.fingerprint_hex())),
+                Some(foreign),
+            ))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, HostError::Denied(_)));
+        assert!(broker.sign_calls.lock().is_empty());
+    }
+
+    /// 4. A fingerprint from the wrong family never selects for the
+    ///    requested suite.
+    #[tokio::test]
+    async fn wrong_family_fingerprint_cannot_select_for_the_requested_suite() {
+        let (_dir, daemon, broker) = isolation_daemon().await;
+        let sol1 = broker.child(false, 1);
+        let host = isolation_host(&daemon, broker.clone());
+        let error = host
+            .sign_payload_outcome(isolation_sign_request(
+                account_route_context("w", Some(1), Some(sol1.fingerprint_hex())),
+                None,
+            ))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, HostError::Denied(ref message) if message.contains("signing family")),
+            "{error}"
+        );
+        assert!(broker.sign_calls.lock().is_empty());
+    }
+
+    /// 5. A batch with one mismatched leg is denied whole, before signing.
+    #[tokio::test]
+    async fn a_batch_with_one_mismatched_leg_is_denied_whole() {
+        let (_dir, daemon, broker) = isolation_daemon().await;
+        let evm1 = broker.child(true, 1);
+        let preimages: Vec<Vec<u8>> = vec![b"leg-one".to_vec(), b"leg-two".to_vec()];
+        let mut claimed = [
+            alloy::primitives::keccak256(&preimages[0]).into(),
+            alloy::primitives::keccak256(&preimages[1]).into(),
+        ];
+        claimed[1] = [0xff; 32];
+        let host = isolation_host(&daemon, broker.clone());
+        let error = host
+            .sign_payload_batch_outcome(bloom_petals::PayloadBatchSignRequest {
+                wallet: "w".into(),
+                payloads: preimages
+                    .iter()
+                    .zip(claimed)
+                    .map(|(preimage, hash)| bloom_petals::PayloadSignItem {
+                        preimage: preimage.clone(),
+                        claimed_hash: hash,
+                    })
+                    .collect(),
+                signature_algorithm: "secp256k1-keccak256-recoverable".into(),
+                operation_class: "test.intent".into(),
+                petal_use_claim_jcs: isolation_claim_jcs(
+                    &[&preimages[0], &preimages[1]],
+                    bloom_broker_api::CryptoSuite::Secp256k1Keccak256Recoverable,
+                ),
+                claim_assurance_evidence: None,
+                approval_hint: Some("c".repeat(64)),
+                action: None,
+                advisory: None,
+                selector: bloom_broker_api::PetalSignSelector::Reusable,
+                key_ref: None,
+                context: Some(account_route_context(
+                    "w",
+                    Some(1),
+                    Some(evm1.fingerprint_hex()),
+                )),
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, HostError::Denied(ref message) if message.contains("claimed hashes")),
+            "{error}"
+        );
+        assert!(broker.sign_calls.lock().is_empty());
+    }
+
+    /// 6. Caller-supplied identity never wins: a body wallet that differs
+    ///    from the mounted account is rejected, and the daemon's runner
+    ///    refuses any caller context using the reserved `bloom.` prefix.
+    #[tokio::test]
+    async fn caller_supplied_identity_is_rejected() {
+        let (_dir, daemon, broker) = isolation_daemon().await;
+        let evm1 = broker.child(true, 1);
+        let host = isolation_host(&daemon, broker.clone());
+        let mut request = isolation_sign_request(
+            account_route_context("w", Some(1), Some(evm1.fingerprint_hex())),
+            None,
+        );
+        request.wallet = "other".into();
+        let error = host.sign_payload_outcome(request).await.unwrap_err();
+        assert!(
+            matches!(error, HostError::Denied(ref message) if message.contains("wallet differs")),
+            "{error}"
+        );
+        assert!(broker.sign_calls.lock().is_empty());
+
+        let error = daemon
+            .petals
+            .dispatch_petal_route_with_trusted_params(
+                "echo",
+                bloom_petals::DispatchRequest {
+                    op: bloom_petals::DispatchOp::Read,
+                    path: "message.txt".into(),
+                    body: Vec::new(),
+                    ctx: vec![("bloom.account".into(), "1".into())],
+                },
+                Arc::new(bloom_petals::DenyHost),
+                None,
+                bloom_petals::RunOptions::default(),
+                &[],
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&error, bloom_petals::PetalError::InvalidWasm(message) if message.contains("reserved bloom.")),
+            "{error:?}"
+        );
+    }
+
+    /// 7. An unaware petal is not found under account 1 and names the
+    ///    missing declaration, while account 0 and the flat mount still
+    ///    serve it.
+    #[tokio::test]
+    async fn unaware_petal_is_not_found_under_account_one_only() {
+        let (_dir, daemon, _broker) = isolation_daemon().await;
+        let error = daemon
+            .vfs
+            .read(&VfsPath::parse("/wallets/w/1/petals/plain/message.txt").unwrap())
+            .await
+            .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("plain"), "{message}");
+        assert!(message.contains("[account] aware"), "{message}");
+
+        let zero = daemon
+            .vfs
+            .read(&VfsPath::parse("/wallets/w/0/petals/plain/message.txt").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(zero, b"component");
+        let flat = daemon
+            .vfs
+            .read(&VfsPath::parse("/petals/plain/message.txt").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(flat, b"component");
+    }
+
+    /// 8. Legacy flat dispatch on a two-child wallet signs with account 0
+    ///    (gist §10 scenario 6: the `account == None` branch).
+    #[tokio::test]
+    async fn flat_petal_dispatch_signs_with_account_zero_on_a_two_child_wallet() {
+        let (_dir, daemon, broker) = isolation_daemon().await;
+        let evm0 = broker.child(true, 0);
+        let host = isolation_host(&daemon, broker.clone());
+        let outcome = host
+            .sign_payload_outcome(isolation_sign_request(
+                account_route_context("w", None, None),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert!(matches!(outcome, SignOutcome::Signature(_)));
+        let calls = broker.sign_calls.lock();
+        assert_eq!(calls.as_slice(), &[evm0.key_ref.clone()]);
+    }
 }
