@@ -649,10 +649,6 @@ pub enum MachineCommand {
     WalletAccounts {
         name: String,
     },
-    WalletAccountAllocate {
-        name: String,
-        profile: String,
-    },
     WalletAccountRetire {
         name: String,
         fingerprint: String,

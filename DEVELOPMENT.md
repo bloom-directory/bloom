@@ -212,14 +212,13 @@ source /tmp/bloom-triad-logs/triad.env
 bloom wallet new test-wallet
 ```
 
-For the BIP-39 import and native-Solana derivation path, use the explicit
-profiles below and open the exact `http://localhost:18734` ceremony URL printed
-by each command:
+For the BIP-39 import and native-Solana derivation path, complete the import
+ceremony at the exact `http://localhost:18734` URL, then read either account:
 
 ```sh
 bloom wallet import imported-wallet --profile bip39-multicurve-v1
-bloom wallet account-allocate imported-wallet \
-  --profile bip44-solana-slip10-ed25519-v1
+bloom wallet address imported-wallet --profile solana
+bloom wallet address imported-wallet --profile evm
 ```
 
 Wallet registration, import, credential changes, policy updates, delegated-key

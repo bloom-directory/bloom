@@ -2716,8 +2716,9 @@ mod tests {
     };
 
     use bloom_broker_api::{
-        ApprovalPrepareState, CeremonyKind, CustodyPrepareState, DeclaredFee, DerivationRef,
-        KeySpec, NormalizedSignature, RequestNonce, ServiceFuture, SignatureEncoding,
+        ApprovalPrepareState, CeremonyKind, CustodyPrepareState, DeclaredFee, DerivationProfile,
+        DerivationRef, DerivedAccountRequest, KeySpec, NormalizedSignature, RequestNonce,
+        ServiceFuture, SignatureEncoding,
     };
     use ed25519_dalek::SigningKey;
     use tracing_subscriber::prelude::*;
@@ -4128,7 +4129,7 @@ mod tests {
             petal_key_scope: None,
             legacy_passkey_migration: None,
             wallet_seed_profile: None,
-            derivation_request: None,
+            derivation_requests: Vec::new(),
             account_terms: None,
         };
         assert_eq!(
@@ -4901,7 +4902,18 @@ mod tests {
             petal_key_scope: None,
             legacy_passkey_migration: None,
             wallet_seed_profile: None,
-            derivation_request: None,
+            derivation_requests: vec![
+                DerivedAccountRequest {
+                    derivation_profile: DerivationProfile::Bip44EvmSecp256k1V1,
+                    requested_role: token("primary-evm"),
+                    account: None,
+                },
+                DerivedAccountRequest {
+                    derivation_profile: DerivationProfile::Bip44SolanaSlip10Ed25519V1,
+                    requested_role: token("solana-account"),
+                    account: None,
+                },
+            ],
             account_terms: None,
         };
         let error = client
