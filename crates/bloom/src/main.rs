@@ -1444,7 +1444,7 @@ async fn execute_machine_command(
                     bloom_solana_tx::AccountSelectionError::None { .. } => machine_error(
                         MachineErrorKind::NotFound,
                         format!(
-                            "wallet '{}' has no active {profile} account; only BIP-39 wallets derive Solana accounts",
+                            "wallet '{}' has no active {profile} account; only BIP-39 wallets have derived accounts",
                             wallet_id.as_str(),
                         ),
                     ),
