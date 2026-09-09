@@ -1335,6 +1335,7 @@ impl PetalHost for DaemonPetalHost {
                     legacy_passkey_migration: None,
                     wallet_seed_profile: None,
                     derivation_request: None,
+                    derivation_requests: Vec::new(),
                     account_terms: None,
                 },
             )

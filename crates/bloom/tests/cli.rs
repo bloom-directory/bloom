@@ -374,7 +374,9 @@ fn seed_wallet_projection_fixture(home: &Path, name: &str) {
         keys,
         credentials,
         policy,
-        accounts: bloom_machine_client::empty_wallet_accounts(wallet_id.clone()),
+        accounts: bloom_machine_client::empty_wallet_accounts(
+            bloom_broker_api::Token::new(name.to_owned()).expect("valid fixture wallet ID"),
+        ),
         source_protocol: "bloom.machine-broker.v1".into(),
         response_digest,
         observed_at_ms: 1,

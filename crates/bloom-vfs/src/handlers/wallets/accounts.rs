@@ -764,6 +764,415 @@ impl WalletsHandler {
     }
 }
 
+/// One persisted `wallets/<w>/new` request: the identity a retry must match,
+/// the ceremony it launched, and, once Signer has numbered it, the account
+/// the returned paths encode.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct AccountCreationRecord {
+    schema: String,
+    wallet_id: String,
+    request_id: String,
+    families: Vec<String>,
+    operation_id: bloom_broker_api::OperationId,
+    ceremony_url: String,
+    ceremony_expires_at_ms: bloom_broker_api::DecimalU64,
+    state: AccountCreationState,
+    /// Set only from the authenticated custody receipt's derivation paths,
+    /// never guessed before Signer numbers the account.
+    number: Option<u32>,
+    created_at_ms: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum AccountCreationState {
+    Pending,
+    Created,
+}
+
+const ACCOUNT_CREATION_SCHEMA: &str = "bloom.machine.account-creation.v1";
+const ACCOUNT_CREATIONS_SCHEMA: &str = "bloom.machine.account-creations.v1";
+
+/// A `families` entry: which derivation request it maps to and the role it
+/// allocates under.
+fn family_request(family: &str) -> Result<bloom_broker_api::DerivedAccountRequest, HandlerError> {
+    let (profile, role) = match family {
+        "evm" => (
+            bloom_broker_api::DerivationProfile::Bip44EvmSecp256k1V1,
+            "primary-evm",
+        ),
+        "solana" => (
+            bloom_broker_api::DerivationProfile::Bip44SolanaSlip10Ed25519V1,
+            "solana-account",
+        ),
+        other => {
+            return Err(HandlerError::invalid(format!(
+                "unknown family '{other}'; supported families are \"evm\" and \"solana\""
+            )));
+        }
+    };
+    Ok(bloom_broker_api::DerivedAccountRequest {
+        derivation_profile: profile,
+        requested_role: bloom_broker_api::Token::new(role)
+            .map_err(|error| HandlerError::invalid(error.to_string()))?,
+        account: None,
+    })
+}
+
+/// The same request id must always mean the same request, so the id a shell
+/// writes has to be a safe single path segment before it reaches storage.
+fn validate_request_id(request_id: &str) -> Result<(), HandlerError> {
+    let valid = !request_id.is_empty()
+        && request_id.len() <= 64
+        && request_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        && !request_id.starts_with('.');
+    if valid {
+        Ok(())
+    } else {
+        Err(HandlerError::invalid(
+            "request_id must be 1-64 characters of [A-Za-z0-9._-] and not start with '.'",
+        ))
+    }
+}
+
+impl WalletsHandler {
+    /// The Machine-local storage root for one wallet's creation requests.
+    /// The wallet id is hashed into the directory name: ids may contain `/`,
+    /// and a request id is never interpolated next to an unhashed id.
+    fn account_creation_root(&self, wallet: &str) -> std::path::PathBuf {
+        let digest = sha2::Sha256::digest(wallet.as_bytes());
+        self.policy_projection_root
+            .join("account-creations")
+            .join(bloom_broker_api::Digest32::from_bytes(digest.into()).as_str())
+    }
+
+    fn account_creation_path(&self, wallet: &str, request_id: &str) -> std::path::PathBuf {
+        self.account_creation_root(wallet)
+            .join(format!("{request_id}.json"))
+    }
+
+    /// `wallets/<w>/new` write: start or resume one account-creation
+    /// ceremony. The custody operation id is derived from the wallet and the
+    /// request id, so a retry with the same `request_id` returns the same
+    /// pending ceremony or, after success, the same account; Signer chooses
+    /// the number.
+    pub(super) async fn create_account(
+        &self,
+        wallet: &str,
+        data: &[u8],
+    ) -> Result<(), HandlerError> {
+        let request: serde_json::Value = serde_json::from_slice(data)
+            .map_err(|error| HandlerError::invalid(format!("bad creation request: {error}")))?;
+        let request_id = request
+            .get("request_id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| HandlerError::invalid("creation request requires request_id"))?;
+        validate_request_id(request_id)?;
+        let families = request
+            .get("families")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| HandlerError::invalid("creation request requires families"))?
+            .iter()
+            .map(|family| {
+                family
+                    .as_str()
+                    .ok_or_else(|| HandlerError::invalid("families must be strings"))
+            })
+            .collect::<Result<Vec<&str>, HandlerError>>()?;
+        if families.is_empty() || families.len() > 2 {
+            return Err(HandlerError::invalid(
+                "families must name one or two of \"evm\", \"solana\"",
+            ));
+        }
+        let mut sorted = families.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        if sorted.len() != families.len() {
+            return Err(HandlerError::invalid("families must not repeat a family"));
+        }
+        let requests = families
+            .iter()
+            .map(|family| family_request(family))
+            .collect::<Result<Vec<_>, HandlerError>>()?;
+
+        let path = self.account_creation_path(wallet, request_id);
+        if path.exists() {
+            let record: AccountCreationRecord = read_json(&path)?;
+            if record.wallet_id != wallet {
+                return Err(HandlerError::backend(
+                    "stored account-creation record names a different wallet",
+                ));
+            }
+            let stored = record
+                .families
+                .iter()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>();
+            let requested: std::collections::BTreeSet<String> =
+                families.iter().map(|f| f.to_string()).collect();
+            if stored != requested {
+                return Err(HandlerError::invalid(format!(
+                    "request_id '{request_id}' was created with families {:?}; it cannot be \
+                     reused for {:?}",
+                    record.families, families
+                )));
+            }
+            self.refresh_and_render_record(record, &path).await?;
+            return Ok(());
+        }
+
+        let projection = self.wallet_projection(wallet).await?;
+        if projection.wallet.root_key_ref.is_some() {
+            return Err(HandlerError::invalid(
+                "account creation requires a BIP-39 wallet; imported and legacy wallets have no \
+                 derivation capability",
+            ));
+        }
+        let broker = self.custody_broker()?;
+        let operation_id = bloom_broker_api::OperationId::from_bytes(
+            sha2::Sha256::digest(
+                format!("bloom-account-creation/v1\0{wallet}\0{request_id}").as_bytes(),
+            )
+            .into(),
+        );
+        let wallet_id = bloom_broker_api::Token::new(wallet.to_owned())
+            .map_err(|error| HandlerError::invalid(error.to_string()))?;
+        let multi = requests.len() > 1;
+        let anchor = requests
+            .iter()
+            .find(|request| {
+                request.derivation_profile
+                    == bloom_broker_api::DerivationProfile::Bip44EvmSecp256k1V1
+            })
+            .unwrap_or(&requests[0]);
+        let profile = anchor.derivation_profile;
+        let expires_at_ms = now_ms_u64().saturating_add(30 * 60 * 1_000);
+        let terms = bloom_broker_api::AccountTerms {
+            schema: bloom_broker_api::Token::new(bloom_broker_api::ACCOUNT_TERMS_SCHEMA)
+                .map_err(|error| HandlerError::invalid(error.to_string()))?,
+            wallet_id: wallet_id.clone(),
+            seed_profile: bloom_broker_api::WalletSeedProfile::Bip39MulticurveV1,
+            derivation: if multi {
+                None
+            } else {
+                Some(requests[0].clone())
+            },
+            derivations: if multi { requests.clone() } else { Vec::new() },
+            retire_key_fingerprint: None,
+            path_template: profile.path_template().to_owned(),
+            key_spec: profile.key_spec(),
+            allowed_crypto_suites: profile.frozen_crypto_suites().to_vec(),
+            policy_version: projection.policy.version.clone(),
+            revocation_epoch: projection.wallet.wallet_revocation_epoch.clone(),
+            replay_id: operation_id.clone(),
+            expires_at_ms: bloom_broker_api::DecimalU64::new(expires_at_ms),
+            audit_purpose: bloom_broker_api::Token::new("allocate-derived-account")
+                .map_err(|error| HandlerError::invalid(error.to_string()))?,
+        };
+        let prepared = broker
+            .account_allocate(bloom_broker_api::CustodyPrepareRequest {
+                ceremony_kind: bloom_broker_api::CeremonyKind::AccountAllocate,
+                custody_operation_id: operation_id.clone(),
+                wallet_id: Some(wallet_id),
+                key_ref: None,
+                exact_terms_digest: terms
+                    .request_digest()
+                    .map_err(|error| HandlerError::backend(error.to_string()))?,
+                expected_input_class: bloom_broker_api::Token::new("generic-custody-v1")
+                    .map_err(|error| HandlerError::invalid(error.to_string()))?,
+                browser_output_recipient_key: None,
+                petal_key_scope: None,
+                legacy_passkey_migration: None,
+                wallet_seed_profile: None,
+                derivation_request: if multi {
+                    None
+                } else {
+                    Some(requests[0].clone())
+                },
+                derivation_requests: if multi { requests.clone() } else { Vec::new() },
+                account_terms: Some(terms),
+            })
+            .await
+            .map_err(|error| HandlerError::backend(error.to_string()))?;
+        let record = AccountCreationRecord {
+            schema: ACCOUNT_CREATION_SCHEMA.to_owned(),
+            wallet_id: wallet.to_owned(),
+            request_id: request_id.to_owned(),
+            families: families.iter().map(|f| f.to_string()).collect(),
+            operation_id,
+            ceremony_url: prepared.ceremony_url.clone(),
+            ceremony_expires_at_ms: prepared.ceremony_expires_at_ms,
+            state: AccountCreationState::Pending,
+            number: None,
+            created_at_ms: now_ms_u64(),
+        };
+        std::fs::create_dir_all(self.account_creation_root(wallet))?;
+        write_atomic_json(&path, &record)?;
+        // The caller reads `new` back for the status document: the ceremony
+        // URL now, and the assigned number once Signer has committed it.
+        Ok(())
+    }
+
+    /// Re-check a pending ceremony and render the record. Completion is read
+    /// only from the authenticated receipt: every returned child must belong
+    /// to this wallet, match a requested family's profile, and, for a
+    /// multi-family request, share one number.
+    async fn refresh_and_render_record(
+        &self,
+        mut record: AccountCreationRecord,
+        path: &std::path::Path,
+    ) -> Result<Vec<u8>, HandlerError> {
+        if record.state == AccountCreationState::Created {
+            return Self::render_record(&record, true);
+        }
+        let broker = self.custody_broker()?;
+        let status = broker
+            .ceremony_status(record.operation_id.clone())
+            .await
+            .map_err(|error| HandlerError::backend(error.to_string()))?;
+        if status.state != bloom_broker_api::CeremonyState::Succeeded {
+            // Still pending (or terminal-failed, which the ceremony URL
+            // surfaces); the record stays as it is.
+            return Self::render_record(&record, false);
+        }
+        let receipt = broker
+            .custody_result(bloom_broker_api::OperationRequest {
+                operation_id: record.operation_id.clone(),
+            })
+            .await
+            .map_err(|error| HandlerError::backend(error.to_string()))?;
+        if !receipt
+            .wallet_id
+            .as_ref()
+            .is_some_and(|wallet| wallet.as_str() == record.wallet_id)
+            || receipt.public_key_refs.len() != record.families.len()
+        {
+            return Err(HandlerError::backend(
+                "account-creation receipt contradicts the stored request",
+            ));
+        }
+        let mut number: Option<u32> = None;
+        let mut seen = std::collections::HashSet::new();
+        for child in &receipt.public_key_refs {
+            let Some(bloom_broker_api::DerivationRef::Bip39Multicurve {
+                wallet_seed_ref,
+                profile,
+                path: derivation_path,
+            }) = child.derivation.clone()
+            else {
+                return Err(HandlerError::backend(
+                    "account-creation receipt carries a non-derived child",
+                ));
+            };
+            if wallet_seed_ref.as_str() != record.wallet_id
+                || !seen.insert(profile)
+                || !record.families.iter().any(|family| {
+                    family_request(family)
+                        .map(|request| request.derivation_profile == profile)
+                        .unwrap_or(false)
+                })
+            {
+                return Err(HandlerError::backend(
+                    "account-creation receipt family set contradicts the stored request",
+                ));
+            }
+            let digits = match profile {
+                bloom_broker_api::DerivationProfile::Bip44EvmSecp256k1V1 => derivation_path
+                    .strip_prefix("m/44'/60'/0'/0/")
+                    .ok_or_else(|| HandlerError::backend("unexpected EVM path in receipt"))?,
+                bloom_broker_api::DerivationProfile::Bip44SolanaSlip10Ed25519V1 => derivation_path
+                    .strip_prefix("m/44'/501'/")
+                    .and_then(|rest| rest.strip_suffix("'/0'"))
+                    .ok_or_else(|| HandlerError::backend("unexpected Solana path in receipt"))?,
+            };
+            let child_number: u32 = digits
+                .parse()
+                .map_err(|error| HandlerError::backend(format!("bad account path: {error}")))?;
+            match number {
+                Some(previous) if previous != child_number => {
+                    return Err(HandlerError::backend(
+                        "account-creation receipt families disagree on the account number",
+                    ));
+                }
+                None => number = Some(child_number),
+                _ => {}
+            }
+        }
+        record.state = AccountCreationState::Created;
+        record.number = number;
+        write_atomic_json(path, &record)?;
+        Self::render_record(&record, true)
+    }
+
+    fn render_record(
+        record: &AccountCreationRecord,
+        already_created: bool,
+    ) -> Result<Vec<u8>, HandlerError> {
+        let mut out = serde_json::to_vec_pretty(&serde_json::json!({
+            "schema": ACCOUNT_CREATIONS_SCHEMA,
+            "request_id": record.request_id,
+            "families": record.families,
+            "state": record.state,
+            "ceremony_url": record.ceremony_url,
+            "ceremony_expires_at_ms": record.ceremony_expires_at_ms,
+            "number": record.number,
+            "already_created": already_created,
+        }))
+        .map_err(err_be)?;
+        out.push(b'\n');
+        Ok(out)
+    }
+
+    /// `wallets/<w>/new` read: every stored creation request for the wallet,
+    /// pending ones re-checked against the ceremony.
+    pub(super) async fn account_creation_status(
+        &self,
+        wallet: &str,
+    ) -> Result<Vec<u8>, HandlerError> {
+        let root = self.account_creation_root(wallet);
+        let mut requests: Vec<serde_json::Value> = Vec::new();
+        let Ok(entries) = std::fs::read_dir(&root) else {
+            // No creation request has ever been stored for this wallet.
+            let mut out = serde_json::to_vec_pretty(&serde_json::json!({
+                "schema": ACCOUNT_CREATIONS_SCHEMA,
+                "wallet": wallet,
+                "requests": requests,
+            }))
+            .map_err(err_be)?;
+            out.push(b'\n');
+            return Ok(out);
+        };
+        let mut paths: Vec<std::path::PathBuf> = entries
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().map(|ext| ext == "json").unwrap_or(false))
+            .collect();
+        paths.sort();
+        for path in paths {
+            let record: AccountCreationRecord = read_json(&path)?;
+            if record.wallet_id != wallet {
+                continue;
+            }
+            let rendered = self.refresh_and_render_record(record, &path).await?;
+            requests.push(
+                serde_json::from_slice(&rendered)
+                    .map_err(|error| HandlerError::backend(error.to_string()))?,
+            );
+        }
+        let mut out = serde_json::to_vec_pretty(&serde_json::json!({
+            "schema": ACCOUNT_CREATIONS_SCHEMA,
+            "wallet": wallet,
+            "requests": requests,
+        }))
+        .map_err(err_be)?;
+        out.push(b'\n');
+        Ok(out)
+    }
+}
+
 /// The virtual write sinks a pending EVM entry advertises.
 const EVM_PENDING_CONTROLS: [&str; 4] = ["confirm", "confirm.override", "replace", "cancel"];
 /// The virtual write sinks a pending Solana entry advertises.

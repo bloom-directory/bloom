@@ -708,6 +708,7 @@ impl WalletsHandler {
                     legacy_passkey_migration: None,
                     wallet_seed_profile: None,
                     derivation_request: None,
+                    derivation_requests: Vec::new(),
                     account_terms: None,
                 },
             )
@@ -2037,6 +2038,7 @@ impl WalletsHandler {
             Entry::file("kind"),
             Entry::file("projection.json"),
             Entry::file("accounts.json"),
+            Entry::writable_file("new"),
             Entry::writable_file("policy.json"),
             Entry::dir("chains"),
             Entry::dir("sealed-approvals"),
@@ -2734,6 +2736,7 @@ impl WalletsHandler {
         match segs[1].as_str() {
             "address" | "address.qr.png" | "address.qr.svg" | "addresses.json" | "public_key"
             | "kind" | "projection.json" | "accounts.json" => Ok(Entry::file(&segs[1])),
+            "new" => Ok(Entry::writable_file("new")),
             "policy.json" => Ok(Entry::writable_file("policy.json")),
             "chains" => match segs.len() {
                 2 => Ok(Entry::dir("chains")),
@@ -2898,18 +2901,12 @@ impl WalletsHandler {
                 self.projection_addresses_json(&projection)
             }
             "accounts.json" => {
-                let broker = self.broker.as_ref().ok_or_else(|| {
-                    HandlerError::backend("Broker edge is unavailable for wallet accounts")
-                })?;
-                let accounts = broker
-                    .wallet_accounts(
-                        bloom_broker_api::Token::new(wallet.to_owned())
-                            .map_err(|error| HandlerError::invalid(error.to_string()))?,
-                    )
-                    .await
-                    .map_err(|error| HandlerError::backend(error.to_string()))?;
-                Self::accounts_json_with_numbers(&accounts)
+                // The cached, authenticated inventory; freshness rides on the
+                // projection, and this read carries no authority side effect.
+                let projection = self.wallet_projection(wallet).await?;
+                Self::accounts_json_with_numbers(&projection.accounts)
             }
+            "new" => self.account_creation_status(wallet).await,
             "public_key" => {
                 let projection = self.wallet_projection(wallet).await?;
                 Ok(format!(
@@ -3067,6 +3064,10 @@ impl WalletsHandler {
             return self
                 .write_wallet_policy_update(wallet, &path.to_string_path(), data)
                 .await;
+        }
+        if segs.len() == 2 && segs[1] == "new" {
+            self.write_permit()?;
+            return self.create_account(wallet, data).await;
         }
         if segs.len() == 5
             && segs[1] == "policy-updates"
@@ -5003,6 +5004,184 @@ mod tests {
         }
     }
 
+    /// A Broker stub for account creation: prepares the multi-family
+    /// ceremony, reports its status, and answers the completed receipt.
+    struct CreationBroker {
+        prepared: std::sync::Mutex<Option<bloom_broker_api::CustodyPrepareRequest>>,
+        state: std::sync::Mutex<bloom_broker_api::CeremonyState>,
+    }
+    impl MachineBrokerService for CreationBroker {
+        fn dispatch<'a>(
+            &'a self,
+            request: MachineBrokerRequest,
+        ) -> ServiceFuture<'a, MachineBrokerResponse> {
+            Box::pin(async move {
+                match request {
+                    MachineBrokerRequest::AccountAllocatePrepare(request) => {
+                        *self.prepared.lock().unwrap() = Some(request.clone());
+                        Ok(MachineBrokerResponse::AccountAllocatePrepare(
+                            bloom_broker_api::CustodyPrepareResponse {
+                                ceremony_kind: request.ceremony_kind,
+                                custody_operation_id: request.custody_operation_id.clone(),
+                                state: bloom_broker_api::CustodyPrepareState::AwaitingUser,
+                                ceremony_url: "https://broker.test/ceremony/abc".into(),
+                                ceremony_expires_at_ms: bloom_broker_api::DecimalU64::new(u64::MAX),
+                                signer_contribution_digest: digest(80),
+                            },
+                        ))
+                    }
+                    MachineBrokerRequest::CeremonyStatus(_) => {
+                        let state = *self.state.lock().unwrap();
+                        Ok(MachineBrokerResponse::CeremonyStatus(
+                            bloom_broker_api::CeremonyPublicStatus {
+                                ceremony_id: digest(81),
+                                ceremony_kind: bloom_broker_api::CeremonyKind::AccountAllocate,
+                                operation_id: bloom_broker_api::OperationId::from_bytes([9; 32]),
+                                state,
+                                expires_at_ms: bloom_broker_api::DecimalU64::new(u64::MAX),
+                                ceremony_url: Some("https://broker.test/ceremony/abc".into()),
+                                receipt_digest: None,
+                            },
+                        ))
+                    }
+                    MachineBrokerRequest::CustodyResult(_) => {
+                        let evm = derived_account(
+                            bloom_broker_api::DerivationProfile::Bip44EvmSecp256k1V1,
+                            "m/44'/60'/0'/0/2",
+                            0x31,
+                            "0x0000000000000000000000000000000000000042",
+                        );
+                        let solana = derived_account(
+                            bloom_broker_api::DerivationProfile::Bip44SolanaSlip10Ed25519V1,
+                            "m/44'/501'/2'/0'",
+                            0x32,
+                            "Sol2",
+                        );
+                        let mut key_refs = Vec::new();
+                        for account in [evm, solana] {
+                            let mut key = account.key_ref.clone();
+                            key.derivation =
+                                Some(bloom_broker_api::DerivationRef::Bip39Multicurve {
+                                    wallet_seed_ref: token("alice"),
+                                    profile: account.derivation_profile,
+                                    path: account.path.clone(),
+                                });
+                            key_refs.push(key);
+                        }
+                        Ok(MachineBrokerResponse::CustodyResult(
+                            bloom_broker_api::CustodyResult {
+                                ceremony_kind: bloom_broker_api::CeremonyKind::AccountAllocate,
+                                custody_operation_id: bloom_broker_api::OperationId::from_bytes(
+                                    [9; 32],
+                                ),
+                                public_status: bloom_broker_api::CeremonyState::Succeeded,
+                                wallet_id: Some(token("alice")),
+                                public_key_refs: key_refs,
+                                credential_summaries: Vec::new(),
+                                initial_policy: None,
+                                receipt_digest: digest(82),
+                                encrypted_browser_result: None,
+                                signer_key_id: token("ceremony-key"),
+                                signer_signature: Base64UrlBytes::from_bytes(&[6; 64]),
+                            },
+                        ))
+                    }
+                    other => Err(ProtocolError::new(
+                        ProtocolErrorCode::BackendUnsupported,
+                        format!("unexpected request in creation fixture: {other:?}"),
+                    )),
+                }
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn wallets_new_starts_one_multi_family_ceremony_and_reports_the_numbered_result() {
+        use bloom_broker_api::DerivationProfile as Profile;
+        let f = make_handler();
+        let evm0 = bloom_proto::checksum_address(&f.wallet_addr);
+        let accounts = vec![derived_account(
+            Profile::Bip44EvmSecp256k1V1,
+            "m/44'/60'/0'/0/0",
+            0x10,
+            &evm0,
+        )];
+        let shared_service = Arc::new(CreationBroker {
+            prepared: std::sync::Mutex::new(None),
+            state: std::sync::Mutex::new(bloom_broker_api::CeremonyState::AwaitingUser),
+        });
+        let broker = MachineBrokerClient::new(shared_service.clone());
+        let mut handler = f.handler.with_broker(Some(broker));
+        handler.wallet_projections = Some(bip39_projection(f.wallet_addr, accounts));
+        let w = &f.wallet_name;
+
+        // The write starts one ceremony and stores a pending request.
+        handler
+            .write(
+                &vfs(format!("/{w}/new")),
+                br#"{"request_id":"create-trading","families":["evm","solana"]}"#,
+            )
+            .await
+            .unwrap();
+
+        // Reading `new` while the ceremony is pending reports it truthfully.
+        let status: serde_json::Value =
+            serde_json::from_slice(&handler.read(&vfs(format!("/{w}/new"))).await.unwrap())
+                .unwrap();
+        assert_eq!(status["requests"][0]["state"], "pending");
+        assert_eq!(status["requests"][0]["number"], serde_json::Value::Null);
+        assert_eq!(
+            status["requests"][0]["ceremony_url"],
+            "https://broker.test/ceremony/abc"
+        );
+
+        // Reusing the request id for different families is refused.
+        let error = handler
+            .write(
+                &vfs(format!("/{w}/new")),
+                br#"{"request_id":"create-trading","families":["solana"]}"#,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{error:?}").contains("cannot be reused"),
+            "{error:?}"
+        );
+
+        // Once Signer commits, the same read derives the number from the
+        // returned paths.
+        *shared_service.state.lock().unwrap() = bloom_broker_api::CeremonyState::Succeeded;
+
+        let status: serde_json::Value =
+            serde_json::from_slice(&handler.read(&vfs(format!("/{w}/new"))).await.unwrap())
+                .unwrap();
+        assert_eq!(status["requests"][0]["state"], "created");
+        assert_eq!(status["requests"][0]["number"], 2);
+        assert_eq!(status["requests"][0]["already_created"], true);
+
+        // The prepared request carried the multi-family list and terms.
+        let prepared = shared_service.prepared.lock().unwrap().clone().unwrap();
+        assert_eq!(prepared.derivation_requests.len(), 2);
+        assert!(prepared.derivation_request.is_none());
+        let terms = prepared.account_terms.unwrap();
+        assert_eq!(terms.derivations.len(), 2);
+        assert!(terms.derivation.is_none());
+
+        // A retry with the same request id returns the same account without
+        // allocating again.
+        handler
+            .write(
+                &vfs(format!("/{w}/new")),
+                br#"{"request_id":"create-trading","families":["evm","solana"]}"#,
+            )
+            .await
+            .unwrap();
+        let status: serde_json::Value =
+            serde_json::from_slice(&handler.read(&vfs(format!("/{w}/new"))).await.unwrap())
+                .unwrap();
+        assert_eq!(status["requests"].as_array().unwrap().len(), 1);
+        assert_eq!(status["requests"][0]["number"], 2);
+    }
     fn vfs(path: String) -> VfsPath {
         VfsPath::parse(&path).unwrap()
     }

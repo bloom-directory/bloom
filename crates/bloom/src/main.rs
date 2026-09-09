@@ -683,6 +683,7 @@ async fn launch_custody_ceremony(
                 legacy_passkey_migration,
                 wallet_seed_profile: input.wallet_seed_profile(),
                 derivation_request: None,
+                derivation_requests: Vec::new(),
                 account_terms: None,
             },
         )
@@ -784,6 +785,7 @@ async fn launch_account_allocation(
         wallet_id: wallet_id.clone(),
         seed_profile: bloom_broker_api::WalletSeedProfile::Bip39MulticurveV1,
         derivation: Some(derivation.clone()),
+        derivations: Vec::new(),
         retire_key_fingerprint: None,
         path_template: derivation_profile.path_template().to_owned(),
         key_spec: derivation_profile.key_spec(),
@@ -810,6 +812,7 @@ async fn launch_account_allocation(
             legacy_passkey_migration: None,
             wallet_seed_profile: None,
             derivation_request: Some(derivation),
+            derivation_requests: Vec::new(),
             account_terms: Some(terms),
         })
         .await
@@ -882,6 +885,7 @@ async fn launch_account_retirement(
         wallet_id: wallet_id.clone(),
         seed_profile: accounts.seed_profile,
         derivation: None,
+        derivations: Vec::new(),
         retire_key_fingerprint: Some(account.public_key_fingerprint.clone()),
         path_template: account.derivation_profile.path_template().to_owned(),
         key_spec: account.derivation_profile.key_spec(),
@@ -908,6 +912,7 @@ async fn launch_account_retirement(
             legacy_passkey_migration: None,
             wallet_seed_profile: None,
             derivation_request: None,
+            derivation_requests: Vec::new(),
             account_terms: Some(terms),
         })
         .await
