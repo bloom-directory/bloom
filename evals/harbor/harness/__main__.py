@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 
 from .core import EvalError, run_eval
+from .hyperliquid_approve_builder_fee import HyperliquidApproveBuilderFeeEval
 from .hyperliquid_order_cancel import HyperliquidOrderCancelEval
 
 
@@ -17,7 +18,7 @@ def parser() -> argparse.ArgumentParser:
     )
     value.add_argument(
         "eval",
-        choices=("hyperliquid-order-cancel",),
+        choices=("hyperliquid-order-cancel", "hyperliquid-approve-builder-fee"),
         help="host-side evaluation definition",
     )
     value.add_argument("agent", nargs="?", choices=("claude", "codex"))
@@ -38,7 +39,10 @@ def main(argv: list[str] | None = None) -> int:
         os.environ.get("BLOOM_EVAL_REPO_ROOT", Path(__file__).resolve().parents[3])
     )
     definitions = {
-        "hyperliquid-order-cancel": lambda: HyperliquidOrderCancelEval(repo_root)
+        "hyperliquid-order-cancel": lambda: HyperliquidOrderCancelEval(repo_root),
+        "hyperliquid-approve-builder-fee": lambda: HyperliquidApproveBuilderFeeEval(
+            repo_root
+        ),
     }
     definition = definitions[args.eval]()
     try:
