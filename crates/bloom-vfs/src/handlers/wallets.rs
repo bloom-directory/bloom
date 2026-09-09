@@ -3828,9 +3828,10 @@ impl WalletsHandler {
 
     /// Resolve the child the top-level `balance*` aliases refer to.
     ///
-    /// The aliases are a single-child convenience. With several active
-    /// children there is no defensible default, so this fails and names the
-    /// canonical `accounts/<fingerprint>/` paths instead of guessing.
+    /// Wallet-level paths mean account 0: the alias resolves to the canonical
+    /// initial child whenever it is active, even after further children
+    /// exist. Only when the wallet has no active account-0 child does the
+    /// alias fail, naming the canonical `accounts/<fingerprint>/` paths.
     async fn solana_alias_account(
         &self,
         wallet: &str,
@@ -3838,18 +3839,36 @@ impl WalletsHandler {
     ) -> Result<SolanaAccount, HandlerError> {
         let mut accounts = self.solana_accounts(wallet).await?;
         match accounts.len() {
-            1 => Ok(accounts.remove(0)),
+            // One active child is the wallet-level account only when it is
+            // the canonical initial child; a lone child at another path is a
+            // numbered account, never a wallet-level default.
+            1 => {
+                let account = accounts.remove(0);
+                if account.derivation_path == "m/44'/501'/0'/0'" {
+                    Ok(account)
+                } else {
+                    let fp = account.fingerprint;
+                    Err(HandlerError::invalid(format!(
+                        "wallet '{wallet}' has no Solana account at the canonical initial path; \
+                         read chains/{chain}/accounts/{fp}/ instead"
+                    )))
+                }
+            }
             0 => Err(HandlerError::not_found(format!(
                 "wallet '{wallet}' has no active Solana account"
             ))),
             _ => {
+                let zero_path = "m/44'/501'/0'/0'";
+                if let Some(initial) = accounts.iter().find(|a| a.derivation_path == zero_path) {
+                    return Ok(initial.clone());
+                }
                 let paths = accounts
                     .iter()
                     .map(|a| format!("chains/{chain}/accounts/{}/", a.fingerprint))
                     .collect::<Vec<_>>()
                     .join(", ");
                 Err(HandlerError::invalid(format!(
-                    "wallet '{wallet}' has {} active Solana accounts; read one of: {paths}",
+                    "wallet '{wallet}' has {} active Solana accounts and none is the canonical initial child; read one of: {paths}",
                     accounts.len()
                 )))
             }
@@ -3944,15 +3963,26 @@ impl WalletsHandler {
             &accounts.accounts,
             bloom_broker_api::DerivationProfile::Bip44SolanaSlip10Ed25519V1,
         );
-        let account = bloom_solana_tx::account::select(wallet, &active, selector).map_err(
-            |error| match error {
-                bloom_solana_tx::AccountSelectionError::None { .. }
-                | bloom_solana_tx::AccountSelectionError::NoMatch { .. } => {
-                    HandlerError::not_found(error.to_string())
-                }
-                other => HandlerError::invalid(other.to_string()),
+        // Wallet-level paths mean account 0. With several active children the
+        // canonical initial child is the deterministic default; explicit
+        // fingerprints still override.
+        let resolved = match selector {
+            Some(_) => bloom_solana_tx::account::select(wallet, &active, selector),
+            None => match bloom_solana_tx::account::canonical_initial(
+                &active,
+                bloom_broker_api::DerivationProfile::Bip44SolanaSlip10Ed25519V1,
+            ) {
+                Some(account) => Ok(account),
+                None => bloom_solana_tx::account::select(wallet, &active, None),
             },
-        )?;
+        };
+        let account = resolved.map_err(|error| match error {
+            bloom_solana_tx::AccountSelectionError::None { .. }
+            | bloom_solana_tx::AccountSelectionError::NoMatch { .. } => {
+                HandlerError::not_found(error.to_string())
+            }
+            other => HandlerError::invalid(other.to_string()),
+        })?;
         SolanaAccount::from_projection(account)
     }
 
@@ -4804,14 +4834,21 @@ mod tests {
             response_digest: digest(71),
             observed_at_ms: 1,
             freshness: ProjectionFreshness::Fresh,
+            accounts: bloom_machine_client::empty_wallet_accounts(
+                bloom_broker_api::Token::new("alice").unwrap(),
+            ),
             verification: ProjectionVerification::AuthenticatedBroker,
         }))
     }
 
     /// A BIP-39 projection: no signable root; the canonical initial EVM child
-    /// `m/44'/60'/0'/0/0` is the primary key. Its numbered accounts come from
-    /// `wallet.accounts`, served by [`AccountsBroker`].
-    fn bip39_projection(address: Address) -> Arc<dyn WalletProjectionReader> {
+    /// `m/44'/60'/0'/0/0` is the primary key. The projection carries the
+    /// wallet's cached account inventory, which is what the numbered tree
+    /// renders from.
+    fn bip39_projection(
+        address: Address,
+        accounts: Vec<bloom_broker_api::DerivedAccountPublic>,
+    ) -> Arc<dyn WalletProjectionReader> {
         let wallet_id = token("alice");
         let key_ref = KeyRef {
             backend: token("local"),
@@ -4865,6 +4902,11 @@ mod tests {
             response_digest: digest(73),
             observed_at_ms: 1,
             freshness: ProjectionFreshness::Fresh,
+            accounts: bloom_broker_api::WalletAccountsPublic {
+                wallet_id: bloom_broker_api::Token::new("alice").unwrap(),
+                seed_profile: WalletSeedProfile::Bip39MulticurveV1,
+                accounts,
+            },
             verification: ProjectionVerification::AuthenticatedBroker,
         }))
     }
@@ -4974,36 +5016,37 @@ mod tests {
         seed_pending_with_created_ms(&f, "from-account-zero", 1_000);
         let evm0 = bloom_proto::checksum_address(&f.wallet_addr);
         let evm1 = bloom_proto::checksum_address(&Address::repeat_byte(0x22));
+        let accounts = vec![
+            derived_account(
+                Profile::Bip44EvmSecp256k1V1,
+                "m/44'/60'/0'/0/0",
+                0x10,
+                &evm0,
+            ),
+            derived_account(
+                Profile::Bip44SolanaSlip10Ed25519V1,
+                "m/44'/501'/0'/0'",
+                0x20,
+                "Sol0",
+            ),
+            derived_account(
+                Profile::Bip44SolanaSlip10Ed25519V1,
+                "m/44'/501'/1'/0'",
+                0x21,
+                "Sol1",
+            ),
+            derived_account(
+                Profile::Bip44EvmSecp256k1V1,
+                "m/44'/60'/0'/0/1",
+                0x11,
+                &evm1,
+            ),
+        ];
         let broker = MachineBrokerClient::new(Arc::new(AccountsBroker {
-            accounts: vec![
-                derived_account(
-                    Profile::Bip44EvmSecp256k1V1,
-                    "m/44'/60'/0'/0/0",
-                    0x10,
-                    &evm0,
-                ),
-                derived_account(
-                    Profile::Bip44SolanaSlip10Ed25519V1,
-                    "m/44'/501'/0'/0'",
-                    0x20,
-                    "Sol0",
-                ),
-                derived_account(
-                    Profile::Bip44SolanaSlip10Ed25519V1,
-                    "m/44'/501'/1'/0'",
-                    0x21,
-                    "Sol1",
-                ),
-                derived_account(
-                    Profile::Bip44EvmSecp256k1V1,
-                    "m/44'/60'/0'/0/1",
-                    0x11,
-                    &evm1,
-                ),
-            ],
+            accounts: accounts.clone(),
         }));
         let mut handler = f.handler.with_broker(Some(broker));
-        handler.wallet_projections = Some(bip39_projection(f.wallet_addr));
+        handler.wallet_projections = Some(bip39_projection(f.wallet_addr, accounts));
         let w = &f.wallet_name;
 
         // The wallet lists its numbers, and only its numbers.
@@ -7672,6 +7715,44 @@ mod tests {
     }
 
     /// A Broker fixture projecting several active Solana children.
+    /// One active Solana child at account 1 — no account-0 child exists.
+    struct SecondAccountOnlyBroker;
+    impl bloom_broker_api::MachineBrokerService for SecondAccountOnlyBroker {
+        fn dispatch<'a>(
+            &'a self,
+            request: bloom_broker_api::MachineBrokerRequest,
+        ) -> bloom_broker_api::ServiceFuture<'a, bloom_broker_api::MachineBrokerResponse> {
+            Box::pin(async move {
+                match request {
+                    bloom_broker_api::MachineBrokerRequest::WalletAccounts(
+                        bloom_broker_api::WalletRequest { wallet_id },
+                    ) => {
+                        let mut account = solana_projection([0xbb; 32]);
+                        account.path = "m/44'/501'/1'/0'".into();
+                        if let Some(bloom_broker_api::DerivationRef::Bip39Multicurve {
+                            path, ..
+                        }) = &mut account.key_ref.derivation
+                        {
+                            *path = "m/44'/501'/1'/0'".into();
+                        }
+                        Ok(bloom_broker_api::MachineBrokerResponse::WalletAccounts(
+                            bloom_broker_api::WalletAccountsPublic {
+                                wallet_id,
+                                seed_profile:
+                                    bloom_broker_api::WalletSeedProfile::Bip39MulticurveV1,
+                                accounts: vec![account],
+                            },
+                        ))
+                    }
+                    other => Err(bloom_broker_api::ProtocolError::new(
+                        bloom_broker_api::ProtocolErrorCode::UnknownMethod,
+                        format!("unhandled {other:?}"),
+                    )),
+                }
+            })
+        }
+    }
+
     struct MultiChildBroker {
         pubkeys: Vec<[u8; 32]>,
     }
@@ -7790,11 +7871,11 @@ mod tests {
         );
     }
 
-    /// Top-level `balance*` are single-child aliases. With several children
-    /// there is no defensible default, so they refuse and name the canonical
-    /// per-account paths rather than picking by projection order.
+    /// Top-level `balance*` are wallet-level aliases: they mean account 0.
+    /// After further children exist they keep resolving to the canonical
+    /// initial child, and only refuse when no active account-0 child exists.
     #[tokio::test]
-    async fn top_level_balance_aliases_are_single_child_only() {
+    async fn top_level_balance_aliases_mean_account_zero() {
         let f = make_handler();
         let node = spawn_solana_node().await;
         let w = &f.wallet_name;
@@ -7819,21 +7900,58 @@ mod tests {
         );
         assert_eq!(v["derivation_path"], "m/44'/501'/0'/0'");
 
-        // several children: refuse, and name the canonical candidate paths
-        let many = solana_reads_handler(&f, node, vec![[0xaa; 32], [0xbb; 32]]);
-        let err = many.read(&alias).await.unwrap_err();
-        let msg = format!("{err:?}");
-        for k in [[0xaa_u8; 32], [0xbb_u8; 32]] {
-            let fp = solana_projection(k)
-                .key_ref
-                .public_key_fingerprint
-                .as_str()
-                .to_ascii_lowercase();
-            assert!(
-                msg.contains(&format!("chains/solana-devnet/accounts/{fp}/")),
-                "ambiguity error should name the canonical path for {fp}, got {msg}"
+        // several children: the alias still means account 0
+        let many = solana_reads_handler(&f, node.clone(), vec![[0xaa; 32], [0xbb; 32]]);
+        let body = many
+            .read(&VfsPath::parse(&format!("/{w}/chains/solana-devnet/balance.json")).unwrap())
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            v["derivation_path"], "m/44'/501'/0'/0'",
+            "the wallet-level alias resolves to the canonical initial child"
+        );
+        assert_eq!(
+            v["account_address"],
+            bs58::encode([0xaa_u8; 32]).into_string()
+        );
+
+        // no active account-0 child: refuse and name the canonical paths
+        let shifted = {
+            let registry = bloom_solana::SolanaChainRegistry::new();
+            registry.add(
+                bloom_solana::SolanaClient::build(&bloom_solana::SolanaSpec {
+                    name: "solana-devnet".into(),
+                    endpoints: vec![bloom_solana::EndpointSpec {
+                        url: node,
+                        weight: 100,
+                        cu_per_sec: None,
+                        max_rps: None,
+                        http_only: false,
+                    }],
+                    expected_genesis_base58: Some("test-genesis".into()),
+                    allow_broadcast: false,
+                })
+                .unwrap(),
             );
-        }
+            f.handler
+                .clone()
+                .with_broker(Some(bloom_machine_client::MachineBrokerClient::new(
+                    std::sync::Arc::new(SecondAccountOnlyBroker),
+                )))
+                .with_solana_reads(registry)
+        };
+        let err = shifted.read(&alias).await.unwrap_err();
+        let msg = format!("{err:?}");
+        let fp = solana_projection([0xbb; 32])
+            .key_ref
+            .public_key_fingerprint
+            .as_str()
+            .to_ascii_lowercase();
+        assert!(
+            msg.contains(&format!("chains/solana-devnet/accounts/{fp}/")),
+            "the error should name the canonical path for {fp}, got {msg}"
+        );
     }
 
     /// `accounts/` is unconditional for a configured Solana chain, so the

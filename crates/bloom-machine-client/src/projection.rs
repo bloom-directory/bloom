@@ -14,7 +14,8 @@ use async_trait::async_trait;
 use bloom_broker_api::{
     CanonicalWalletPolicy, CeremonyKind, CeremonyState, CredentialPublic, CredentialState,
     DerivationRef, Digest32, KeyPublic, KeyRequest, KeyRole, KeySpec, OperationId,
-    OperationRequest, ProtocolError, ProtocolErrorCode, SignedPolicySnapshot, Token, WalletPublic,
+    OperationRequest, ProtocolError, ProtocolErrorCode, SignedPolicySnapshot, Token,
+    WalletAccountsPublic, WalletPublic,
 };
 use fs2::FileExt as _;
 use serde::{Deserialize, Serialize};
@@ -51,11 +52,37 @@ pub struct WalletProjection {
     pub keys: Vec<KeyPublic>,
     pub credentials: Vec<CredentialPublic>,
     pub policy: SignedPolicySnapshot,
+    /// The wallet's authenticated derived-account inventory, observed on the
+    /// same Broker edge as the rest of the projection. Numbered-account
+    /// listings and reads render from this cached copy, so they carry no
+    /// authority side effects; its truthfulness rides on `freshness`.
+    /// Serialized with a default so projections persisted by older builds
+    /// still decode; the first live refresh repopulates it.
+    #[serde(default = "empty_accounts")]
+    pub accounts: WalletAccountsPublic,
     pub source_protocol: String,
     pub response_digest: Digest32,
     pub observed_at_ms: u64,
     pub freshness: ProjectionFreshness,
     pub verification: ProjectionVerification,
+}
+
+fn empty_accounts() -> WalletAccountsPublic {
+    WalletAccountsPublic {
+        wallet_id: Token::new("unset").expect("static token"),
+        seed_profile: bloom_broker_api::WalletSeedProfile::Bip39MulticurveV1,
+        accounts: Vec::new(),
+    }
+}
+
+/// An empty derived-account collection for one wallet. Fixture and legacy
+/// decode paths use it; a live observation always replaces it.
+pub fn empty_wallet_accounts(wallet_id: Token) -> WalletAccountsPublic {
+    WalletAccountsPublic {
+        wallet_id,
+        seed_profile: bloom_broker_api::WalletSeedProfile::Bip39MulticurveV1,
+        accounts: Vec::new(),
+    }
 }
 
 impl WalletProjection {
@@ -325,7 +352,9 @@ impl CachedWalletProjectionReader {
             }
             let credentials = broker.credentials(wallet_id.clone()).await?;
             let policy = broker.policy(wallet_id.clone()).await?;
-            let projection = build_projection(wallet, keys, credentials, policy, now_ms()?)?;
+            let accounts = broker.wallet_accounts(wallet_id.clone()).await?;
+            let projection =
+                build_projection(wallet, keys, credentials, policy, accounts, now_ms()?)?;
             observed.insert(wallet_id.as_str().to_owned(), projection);
         }
         Ok(observed)
@@ -875,6 +904,7 @@ fn build_projection(
     keys: Vec<KeyPublic>,
     credentials: Vec<CredentialPublic>,
     policy: SignedPolicySnapshot,
+    accounts: WalletAccountsPublic,
     observed_at_ms: u64,
 ) -> Result<WalletProjection, ProtocolError> {
     let response_digest = projection_digest(&wallet, &keys, &credentials, &policy)?;
@@ -883,6 +913,7 @@ fn build_projection(
         keys,
         credentials,
         policy,
+        accounts,
         source_protocol: SOURCE_PROTOCOL.to_owned(),
         response_digest,
         observed_at_ms,
@@ -1184,6 +1215,11 @@ mod tests {
                             },
                         ))
                     }
+                    MachineBrokerRequest::WalletAccounts(bloom_broker_api::WalletRequest {
+                        wallet_id,
+                    }) => Ok(MachineBrokerResponse::WalletAccounts(
+                        empty_wallet_accounts(wallet_id),
+                    )),
                     _ => Err(invalid_projection("unexpected fake Broker method")),
                 }
             })
@@ -1231,6 +1267,7 @@ mod tests {
             fixture.keys,
             fixture.credentials,
             fixture.policy,
+            empty_wallet_accounts(token("alice")),
             1,
         )
         .unwrap();
@@ -1255,6 +1292,7 @@ mod tests {
             fixture.keys,
             fixture.credentials,
             fixture.policy,
+            empty_wallet_accounts(token("alice")),
             1,
         )
         .unwrap();
@@ -1619,6 +1657,7 @@ mod tests {
             fixture(1).keys,
             fixture(1).credentials,
             fixture(1).policy,
+            empty_wallet_accounts(token("alice")),
             1,
         )
         .unwrap();

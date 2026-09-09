@@ -103,6 +103,9 @@ mod tests {
                 policy_verifying_key: Base64UrlBytes::from_bytes(&[1; 32]),
                 signer_signature: Base64UrlBytes::from_bytes(&[2; 64]),
             },
+            accounts: bloom_machine_client::empty_wallet_accounts(
+                bloom_broker_api::Token::new("planning").unwrap(),
+            ),
             source_protocol: "bloom.machine-broker.v1".into(),
             response_digest: Digest32::from_bytes([3; 32]),
             observed_at_ms: 1,

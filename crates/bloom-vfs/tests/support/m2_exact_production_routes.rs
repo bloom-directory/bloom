@@ -9,6 +9,7 @@ use bloom_broker_api::{
     ProvenanceRecord, ProvenanceSubject, SealedApprovalPrepareResponse, ServiceFuture,
     SignedPolicySnapshot, SigningResult, Token, WalletPublic,
 };
+use bloom_machine_client::empty_wallet_accounts;
 use bloom_machine_client::{
     MachineBrokerClient, ProjectionFreshness, ProjectionVerification, WalletProjection,
     WalletProjectionReader,
@@ -165,6 +166,7 @@ fn projection(address: String) -> (WalletPublic, Arc<dyn WalletProjectionReader>
             policy_verifying_key: Base64UrlBytes::from_bytes(&[4; 32]),
             signer_signature: Base64UrlBytes::from_bytes(&[5; 64]),
         },
+        accounts: empty_wallet_accounts(bloom_broker_api::Token::new("m2").unwrap()),
         source_protocol: "bloom.machine-broker.v1".into(),
         response_digest: digest(6),
         observed_at_ms: 1,

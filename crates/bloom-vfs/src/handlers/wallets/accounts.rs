@@ -115,20 +115,17 @@ impl WalletsHandler {
                 freshness: projection.freshness,
             }]);
         }
-        let broker = self.broker.as_ref().ok_or_else(|| {
-            HandlerError::backend("Broker edge is unavailable for wallet accounts")
-        })?;
-        let accounts = broker
-            .wallet_accounts(
-                bloom_broker_api::Token::new(wallet.to_owned())
-                    .map_err(|error| HandlerError::invalid(error.to_string()))?,
-            )
-            .await
-            .map_err(|error| HandlerError::backend(error.to_string()))?;
+        // The numbered tree renders from the wallet projection's cached,
+        // authenticated account inventory: listings, stats and reads carry no
+        // authority side effects and stay truthful about freshness even while
+        // the Broker edge is down (a stale projection is marked as such).
+        // Authority changes and offline signing still go through the Broker
+        // and remain refused while it is unreachable.
+        let accounts = &projection.accounts;
         let mut views: std::collections::BTreeMap<u32, AccountView> =
             std::collections::BTreeMap::new();
-        for account in accounts.accounts {
-            let Some(number) = account_number(&account) else {
+        for account in &accounts.accounts {
+            let Some(number) = account_number(account) else {
                 continue;
             };
             let family = FamilyKey {

@@ -13,7 +13,7 @@ pub use petal_eligibility::{PendingPolicyUpdate, PetalEligibility, policy_with_p
 
 pub use projection::{
     CachedWalletProjectionReader, FileProjectionStore, ProjectionFreshness, ProjectionVerification,
-    WalletProjection, WalletProjectionReader,
+    WalletProjection, WalletProjectionReader, empty_wallet_accounts,
 };
 
 use std::{
