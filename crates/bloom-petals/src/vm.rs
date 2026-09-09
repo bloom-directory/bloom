@@ -1542,16 +1542,16 @@ async fn component_petal_key_request(
     if let Err(error) = apply_manifest_key_scope(store.data(), &mut request) {
         return set_component_result(results, component_host_err(error));
     }
-    if let Some(account) = trusted_account(store.data()) {
-        if request.wallet_id != account.wallet {
-            return set_component_result(
-                results,
-                component_host_err(HostError::Denied(format!(
-                    "key request wallet {:?} does not match the trusted account wallet",
-                    request.wallet_id
-                ))),
-            );
-        }
+    if let Some(account) = trusted_account(store.data())
+        && request.wallet_id != account.wallet
+    {
+        return set_component_result(
+            results,
+            component_host_err(HostError::Denied(format!(
+                "key request wallet {:?} does not match the trusted account wallet",
+                request.wallet_id
+            ))),
+        );
     }
     request.context = store.data().sign_context.clone();
     let host = store.data().host.clone();
@@ -1585,12 +1585,12 @@ fn trusted_account(data: &StoreData) -> Option<crate::abi::TrustedAccountContext
 /// trusted wallet. Account-0 and legacy mounts carry no trusted context and
 /// keep the documented unconstrained behavior.
 fn require_trusted_wallet(data: &StoreData, wallet: &str) -> Result<(), HostError> {
-    if let Some(account) = trusted_account(data) {
-        if wallet != account.wallet {
-            return Err(HostError::Denied(format!(
-                "payload signing wallet {wallet:?} does not match the trusted account wallet"
-            )));
-        }
+    if let Some(account) = trusted_account(data)
+        && wallet != account.wallet
+    {
+        return Err(HostError::Denied(format!(
+            "payload signing wallet {wallet:?} does not match the trusted account wallet"
+        )));
     }
     Ok(())
 }
