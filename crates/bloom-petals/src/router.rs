@@ -110,6 +110,65 @@ impl PetalRouter {
         entries.extend(PETAL_DOCUMENT_NAMES.map(Entry::read_only_file));
         entries
     }
+}
+
+/// The host-trusted identity a `wallets/<w>/<n>/petals/` dispatch
+/// carries. The owner fingerprint names one family's key; a route that
+/// signs as the owner is dispatched with its own family's fingerprint,
+/// never one picked from a two-family account by list order.
+#[derive(Clone, Debug)]
+pub struct AccountDispatch {
+    pub wallet: String,
+    pub number: u32,
+    pub owner_key_fingerprint: Option<String>,
+}
+
+impl PetalRouter {
+    /// Dispatch an installed Petal route on behalf of one numbered account.
+    /// Accounts other than 0 run only account-aware Petals: an unaware
+    /// package is not found here, with a message naming the Petal and the
+    /// missing declaration.
+    pub async fn dispatch_for_account(
+        &self,
+        mount: &str,
+        op: DispatchOp,
+        path: String,
+        body: Vec<u8>,
+        account: &AccountDispatch,
+    ) -> Result<DispatchResponse, HandlerError> {
+        if account.number != 0 {
+            let aware = self
+                .runner
+                .petal_account_aware(mount)
+                .map_err(map_petal_err)?;
+            if !aware {
+                return Err(HandlerError::not_found(format!(
+                    "petal '{mount}' does not declare [account] aware = true; it cannot run \
+                     under account {}",
+                    account.number
+                )));
+            }
+        }
+        let mut trusted = vec![
+            ("bloom.wallet".to_owned(), account.wallet.clone()),
+            ("bloom.account".to_owned(), account.number.to_string()),
+        ];
+        if let Some(fingerprint) = &account.owner_key_fingerprint {
+            trusted.push((
+                "bloom.owner_key_fingerprint".to_owned(),
+                fingerprint.clone(),
+            ));
+        }
+        self.dispatch_with_params(
+            mount,
+            op,
+            path,
+            body,
+            &trusted,
+            Some(account.wallet.clone()),
+        )
+        .await
+    }
 
     async fn dispatch_petal(
         &self,
@@ -117,6 +176,19 @@ impl PetalRouter {
         op: DispatchOp,
         path: String,
         body: Vec<u8>,
+    ) -> Result<DispatchResponse, HandlerError> {
+        self.dispatch_with_params(mount, op, path, body, &[], None)
+            .await
+    }
+
+    async fn dispatch_with_params(
+        &self,
+        mount: &str,
+        op: DispatchOp,
+        path: String,
+        body: Vec<u8>,
+        trusted_params: &[(String, String)],
+        account_wallet: Option<String>,
     ) -> Result<DispatchResponse, HandlerError> {
         // Lookup, list, and ordinary reads are filesystem observations, not
         // security effects. Auditing them both misstates the event stream and
@@ -160,7 +232,7 @@ impl PetalRouter {
                 .append(AuditRecord {
                     ts_ms: 0,
                     kind: "machine.effect.intent".into(),
-                    wallet: None,
+                    wallet: account_wallet.clone(),
                     chain: None,
                     data: serde_json::json!({
                         "operation": operation,
@@ -182,7 +254,7 @@ impl PetalRouter {
         }
         let executed = self
             .runner
-            .dispatch_petal_route(
+            .dispatch_petal_route_with_trusted_params(
                 mount,
                 DispatchRequest {
                     op,
@@ -193,6 +265,7 @@ impl PetalRouter {
                 self.host.clone(),
                 None,
                 self.run_options(mount),
+                trusted_params,
             )
             .await;
         let (outcome, result_digest) = match &executed {
