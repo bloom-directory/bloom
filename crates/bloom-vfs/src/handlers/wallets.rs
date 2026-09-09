@@ -216,11 +216,45 @@ pub struct AccountPetalContext {
     pub number: u32,
     pub evm_fingerprint: Option<String>,
     pub solana_fingerprint: Option<String>,
+    /// Freshness of the wallet projection the account view rendered from;
+    /// session documents repeat it so a reader knows how current the
+    /// inventory behind them is.
+    pub freshness: bloom_machine_client::ProjectionFreshness,
+}
+
+/// One delegated-key session mounted under `wallets/<w>/<n>/sessions/`.
+/// `document` is the rendered `session.json`; `stoppable` is set when a
+/// delegated key exists for the mounted `stop` control.
+#[derive(Clone, Debug)]
+pub struct AccountSessionEntry {
+    pub petal_mount: String,
+    pub key_slot: String,
+    pub document: Vec<u8>,
+    pub stoppable: bool,
 }
 
 /// Keeps the VFS independent of the Petal runtime which depends on this crate.
+/// The daemon implements the whole seam: Petal dispatch through the router,
+/// and the session inventory and stop over the local key-state files.
+#[async_trait]
 pub trait AccountPetalMount: Send + Sync {
     fn for_account(&self, account: AccountPetalContext) -> Arc<dyn Handler>;
+
+    /// Sessions whose delegating parent is one of the account's family keys.
+    /// Serves listing, stat, and `session.json` reads; never calls Broker.
+    fn sessions(
+        &self,
+        account: &AccountPetalContext,
+    ) -> Result<Vec<AccountSessionEntry>, HandlerError>;
+
+    /// Idempotent, Broker-backed stop for one session. `mount` is the
+    /// session's rendered mount name (including the `unknown-…` form).
+    async fn stop_session(
+        &self,
+        account: &AccountPetalContext,
+        mount: &str,
+        slot: &str,
+    ) -> Result<(), HandlerError>;
 }
 
 #[derive(Clone)]

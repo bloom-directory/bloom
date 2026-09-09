@@ -13,7 +13,7 @@ use async_trait::async_trait;
 use bloom_proto::config::PetalRuntimeConfig;
 use bloom_proto::{AuditLog, AuditRecord};
 use bloom_vfs::handler::{Entry, EntryKind, Handler, HandlerError};
-use bloom_vfs::handlers::wallets::{AccountPetalContext, AccountPetalMount};
+use bloom_vfs::handlers::wallets::AccountPetalContext;
 use bloom_vfs::path::VfsPath;
 
 use crate::abi::{DispatchEntry, DispatchEntryKind, DispatchOp, DispatchRequest, DispatchResponse};
@@ -134,8 +134,12 @@ impl PetalRouter {
     }
 }
 
-impl AccountPetalMount for PetalRouter {
-    fn for_account(&self, account: AccountPetalContext) -> Arc<dyn Handler> {
+impl PetalRouter {
+    /// The router scoped to one numbered account. The daemon's
+    /// `AccountPetalMount` implementation delegates here; it cannot
+    /// implement the trait itself because the session inventory and stop
+    /// live in the daemon, next to the Broker edge and the key-state files.
+    pub fn for_account(&self, account: AccountPetalContext) -> Arc<dyn Handler> {
         let mut router = self.clone();
         router.account = Some(account);
         Arc::new(router)

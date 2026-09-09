@@ -56,6 +56,7 @@ use bloom_tx::tx_engine::{
 };
 use bloom_vfs::handlers::outbox::StagedPetalIdentity;
 use bloom_vfs::handlers::status::{MempoolBackendStatus, PrivateRpcBackendStatus};
+use bloom_vfs::handlers::wallets::{AccountPetalContext, AccountPetalMount, AccountSessionEntry};
 use bloom_vfs::handlers::{
     AddressBookHandler, CentralOutbox, ChainsHandler, DocsHandler, EnsHandler, OutboxHandler,
     PETAL_SIGNING_STATE_SCHEMA, PetalKeyRequestsHandler, PetalSigningRequestProjection,
@@ -234,9 +235,11 @@ struct DaemonPetalHost {
     petal_key_lock: tokio::sync::Mutex<()>,
     petal_signing_state_root: Option<PathBuf>,
     petal_signing_lock: tokio::sync::Mutex<()>,
+    petal_runner: Option<bloom_petals::PetalRunner>,
 }
 
-const PETAL_KEY_STATE_SCHEMA: &str = "bloom.machine.petal-key-request.v2";
+const PETAL_KEY_STATE_SCHEMA: &str = "bloom.machine.petal-key-request.v3";
+const PETAL_KEY_STATE_SCHEMA_V2: &str = "bloom.machine.petal-key-request.v2";
 const PETAL_KEY_INPUT_CLASS: &str = "petal-key-scope-v2";
 
 /// Status written over any Petal ceremony projection that still advertised an
@@ -255,6 +258,24 @@ const PETAL_CEREMONY_INVALIDATED_STATUS: &str = "ceremony_unavailable_after_rest
 /// Machine-owned public reconciliation record. The ceremony URL is retained
 /// here for an owner-readable status projection, but is never returned across
 /// the Petal host boundary.
+/// A recorded session stop: the journaled Broker operation and the approval
+/// statuses it observed. `complete` is set only when every approval the
+/// Broker reported is terminal; a partial record keeps the session's
+/// signing authority unchanged until a retry completes.
+#[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct SessionStopRecord {
+    at_ms: u64,
+    operation_id: bloom_broker_api::OperationId,
+    approvals: Vec<bloom_broker_api::ApprovalPublicStatus>,
+    #[serde(default = "session_stop_complete_default")]
+    complete: bool,
+}
+
+fn session_stop_complete_default() -> bool {
+    true
+}
+
 #[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 struct PetalKeyRequestState {
@@ -272,6 +293,20 @@ struct PetalKeyRequestState {
     public_key: Option<bloom_broker_api::KeyPublic>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     reusable_approval_id: Option<bloom_broker_api::Digest32>,
+    /// The installed Petal mount this request ran under, resolved from the
+    /// package hash at request time. Old records have none; the session
+    /// tree renders them under `unknown-<hash prefix>`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    petal_mount: Option<String>,
+    #[serde(default)]
+    requested_at_ms: u64,
+    /// When this process last observed the delegated key as active, from
+    /// which the scope's lifetime bound is rendered. Absent for records
+    /// written before this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    succeeded_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    stopped: Option<SessionStopRecord>,
 }
 
 impl PetalKeyRequestState {
@@ -309,8 +344,10 @@ impl DaemonPetalHost {
     /// preparing any approval, custody ceremony, or signature. The path
     /// `(wallet, number, suite)` is the authority; an injected per-route
     /// fingerprint must equal the key it resolves to. `named` is a
-    /// Petal-supplied key reference: it may name the resolved owner, never
-    /// replace it. `Ok(None)` means the wallet's root key signs.
+    /// Petal-supplied key reference: it may name the resolved owner or a
+    /// key this wallet delegated from that owner in a recorded Petal key
+    /// state — never a key of another account or wallet. `Ok(None)` means
+    /// the wallet's root key signs.
     async fn account_owner(
         &self,
         context: &PetalRouteContext,
@@ -352,9 +389,11 @@ impl DaemonPetalHost {
             }
             if let Some(named) = named
                 && named != &root
+                && !self.key_delegated_from(wallet, &root, named)
             {
                 return Err(HostError::Denied(
-                    "Petal-supplied key does not name the mounted account's owner".into(),
+                    "Petal-supplied key is not the mounted account's owner or one of its                      delegated session keys"
+                        .into(),
                 ));
             }
             return Ok(None);
@@ -387,12 +426,35 @@ impl DaemonPetalHost {
         };
         if let Some(named) = named
             && named != &key.key_ref
+            && !self.key_delegated_from(wallet, &key.key_ref, named)
         {
             return Err(HostError::Denied(
-                "Petal-supplied key does not name the mounted account's owner".into(),
+                "Petal-supplied key is not the mounted account's owner or one of its                  delegated session keys"
+                    .into(),
             ));
         }
         Ok(Some(key.key_ref.clone()))
+    }
+
+    /// Whether `named` is a key this wallet's Petal key states record as
+    /// delegated from `owner`. Session keys are the legitimate explicit
+    /// selection; their revocation and scope are enforced by Broker.
+    fn key_delegated_from(
+        &self,
+        wallet: &str,
+        owner: &bloom_broker_api::KeyRef,
+        named: &bloom_broker_api::KeyRef,
+    ) -> bool {
+        Self::petal_key_states_from_root(self.petal_key_state_root.as_deref(), wallet)
+            .iter()
+            .any(|(_, state)| {
+                state
+                    .public_key
+                    .as_ref()
+                    .is_some_and(|public| &public.key_ref == named)
+                    && state.scope.parent_key_ref.public_key_fingerprint
+                        == owner.public_key_fingerprint
+            })
     }
 
     fn authorize_guest_vfs_path(path: &str) -> Result<(), HostError> {
@@ -459,6 +521,7 @@ impl DaemonPetalHost {
             petal_key_lock: tokio::sync::Mutex::new(()),
             petal_signing_state_root: None,
             petal_signing_lock: tokio::sync::Mutex::new(()),
+            petal_runner: None,
         }
     }
 
@@ -515,6 +578,11 @@ impl DaemonPetalHost {
         self
     }
 
+    fn with_petal_runner(mut self, runner: bloom_petals::PetalRunner) -> Self {
+        self.petal_runner = Some(runner);
+        self
+    }
+
     /// Where a Petal key request's state lives. The identity includes the
     /// wallet: two wallets may run the same Petal with the same key slot and
     /// must never share request state. A file written under the earlier
@@ -546,13 +614,77 @@ impl DaemonPetalHost {
                 .as_bytes(),
             );
             let legacy = root.join(format!("{}.json", legacy_identity.to_hex()));
-            if legacy.exists() {
+            if legacy.exists()
+                && matches!(
+                    Self::read_petal_key_state(&legacy),
+                    Ok(Some(state)) if state.scope.wallet_id.as_str() == wallet_id
+                )
+            {
+                // The wallet-free v2 identity could name a record belonging
+                // to another wallet that ran the same Petal and slot; only a
+                // record this wallet owns moves, and everything else stays
+                // where it is for its own wallet to find.
                 std::fs::rename(&legacy, &path).map_err(|error| {
                     HostError::Backend(format!("migrate Petal key request state: {error}"))
                 })?;
             }
         }
         Ok(path)
+    }
+
+    /// Every Petal key state recorded for one wallet. The state root holds
+    /// hash-named files; unreadable entries are skipped with a warning
+    /// rather than hiding the rest of the inventory.
+    fn petal_key_states_from_root(
+        root: Option<&Path>,
+        wallet_id: &str,
+    ) -> Vec<(PathBuf, PetalKeyRequestState)> {
+        let Some(root) = root else {
+            return Vec::new();
+        };
+        let Ok(entries) = std::fs::read_dir(root) else {
+            return Vec::new();
+        };
+        let mut states = Vec::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path
+                .extension()
+                .is_some_and(|extension| extension != "json")
+            {
+                continue;
+            }
+            match Self::read_petal_key_state(&path) {
+                Ok(Some(state)) if state.scope.wallet_id.as_str() == wallet_id => {
+                    states.push((path, state));
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    warn!(
+                        path = %path.display(),
+                        error = %error,
+                        "petal_key_state.unreadable"
+                    );
+                }
+            }
+        }
+        states
+    }
+
+    /// The installed mount name for a package hash, if that exact package is
+    /// installed under a name.
+    fn petal_mount_for_hash(&self, package_hash: &str) -> Option<String> {
+        let runner = self.petal_runner.as_ref()?;
+        match runner.local_petal_mounts() {
+            Ok(mounts) => mounts
+                .into_iter()
+                .find(|(_, hash)| hash == package_hash)
+                .map(|(mount, _)| mount),
+            Err(error) => {
+                warn!(%package_hash, %error, "petal_key_state.mount_resolution_failed");
+                None
+            }
+        }
     }
 
     fn read_petal_key_state(path: &Path) -> Result<Option<PetalKeyRequestState>, HostError> {
@@ -1243,8 +1375,10 @@ impl PetalHost for DaemonPetalHost {
             self.petal_key_state_path(wallet_id.as_str(), &lineage.lineage_id, key_slot.as_str())?;
 
         if let Some(mut stored) = Self::read_petal_key_state(&path)? {
-            if stored.schema != PETAL_KEY_STATE_SCHEMA
-                || stored.key_slot != req.key_slot
+            if !matches!(
+                stored.schema.as_str(),
+                PETAL_KEY_STATE_SCHEMA | PETAL_KEY_STATE_SCHEMA_V2
+            ) || stored.key_slot != req.key_slot
                 || stored
                     .scope
                     .digest()
@@ -1282,6 +1416,12 @@ impl PetalHost for DaemonPetalHost {
                         bloom_broker_api::ApprovalLifecycleState::Active => {
                             stored.status = "succeeded".into();
                             stored.ceremony_url = None;
+                            stored.succeeded_at_ms = Some(
+                                SystemTime::now()
+                                    .duration_since(UNIX_EPOCH)
+                                    .map(|duration| duration.as_millis() as u64)
+                                    .unwrap_or(0),
+                            );
                             Self::write_petal_key_state(&path, &stored)?;
                             return stored.guest_outcome();
                         }
@@ -1454,6 +1594,10 @@ impl PetalHost for DaemonPetalHost {
                 "Broker returned a mismatched Petal custody preparation".into(),
             ));
         }
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_millis() as u64)
+            .unwrap_or(0);
         let stored = PetalKeyRequestState {
             schema: PETAL_KEY_STATE_SCHEMA.into(),
             key_slot: req.key_slot,
@@ -1465,6 +1609,10 @@ impl PetalHost for DaemonPetalHost {
             ceremony_expires_at_ms: prepared.ceremony_expires_at_ms,
             public_key: None,
             reusable_approval_id: None,
+            petal_mount: self.petal_mount_for_hash(&context.package_hash),
+            requested_at_ms: now_ms,
+            succeeded_at_ms: None,
+            stopped: None,
         };
         Self::write_petal_key_state(&path, &stored)?;
         stored.guest_outcome()
@@ -3096,6 +3244,297 @@ impl ipc::BatchConfirmationService for CanonicalBatchConfirmation {
     }
 }
 
+/// The daemon's account-Petal seam: dispatch through the router, and the
+/// session inventory and stop over the local Petal key-state files plus the
+/// Broker edge. Listing, stat, and `session.json` reads never call Broker.
+struct AccountPetals {
+    router: Arc<PetalRouter>,
+    runner: bloom_petals::PetalRunner,
+    key_state_root: PathBuf,
+    broker: Option<MachineBrokerClient>,
+}
+
+impl AccountPetals {
+    fn rendered_mount(state: &PetalKeyRequestState) -> String {
+        state
+            .petal_mount
+            .clone()
+            .unwrap_or_else(|| format!("unknown-{}", &state.scope.package_hash.as_str()[..12]))
+    }
+
+    /// A revocation status is terminal when the approval can no longer sign.
+    fn terminal(status: &bloom_broker_api::ApprovalPublicStatus) -> bool {
+        use bloom_broker_api::ApprovalLifecycleState::*;
+        matches!(
+            status.state,
+            Revoked | Failed | Exhausted | Expired | Cancelled | Orphaned
+        )
+    }
+
+    /// The states whose delegating parent is one of this account's family
+    /// keys: a state whose parent belongs to another account's key never
+    /// appears under this number.
+    fn states_for(&self, account: &AccountPetalContext) -> Vec<(PathBuf, PetalKeyRequestState)> {
+        DaemonPetalHost::petal_key_states_from_root(Some(&self.key_state_root), &account.wallet)
+            .into_iter()
+            .filter(|(_, state)| {
+                let parent = state.scope.parent_key_ref.public_key_fingerprint.as_str();
+                account.evm_fingerprint.as_deref() == Some(parent)
+                    || account.solana_fingerprint.as_deref() == Some(parent)
+            })
+            .collect()
+    }
+
+    /// The mount name whose installed package is exactly the scope's, when
+    /// that package is still installed under some name.
+    fn installed_mount_for(&self, state: &PetalKeyRequestState) -> Option<String> {
+        let hash = state.scope.package_hash.as_str();
+        self.runner
+            .local_petal_mounts()
+            .ok()?
+            .into_iter()
+            .find(|(_, mounted)| mounted == hash)
+            .map(|(mount, _)| mount)
+    }
+
+    fn session_entry(
+        &self,
+        account: &AccountPetalContext,
+        state: &PetalKeyRequestState,
+    ) -> AccountSessionEntry {
+        let owner = |family: &str, fingerprint: &str, path: Option<String>| {
+            serde_json::json!({
+                "family": family,
+                "fingerprint": fingerprint,
+                "path": path,
+            })
+        };
+        let parent_fingerprint = state
+            .scope
+            .parent_key_ref
+            .public_key_fingerprint
+            .as_str()
+            .to_owned();
+        let parent_path = match &state.scope.parent_key_ref.derivation {
+            Some(bloom_broker_api::DerivationRef::Bip39Multicurve { path, .. }) => {
+                Some(path.clone())
+            }
+            _ => None,
+        };
+        let owner = if account.evm_fingerprint.as_deref() == Some(parent_fingerprint.as_str()) {
+            owner("evm", &parent_fingerprint, parent_path)
+        } else {
+            owner("solana", &parent_fingerprint, parent_path)
+        };
+        let installed_mount = self.installed_mount_for(state);
+        let package_installed = installed_mount.is_some();
+        // Routes are meaningful only for the package the session was scoped
+        // to: a mount name that now resolves to a different package says
+        // nothing about this session's routes.
+        let routes = installed_mount.as_deref().and_then(|mount| {
+            self.runner
+                .load_petal_route_index(mount)
+                .ok()
+                .map(|index| index.routes)
+        });
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_millis() as u64)
+            .unwrap_or(0);
+        let stopped_complete = state.stopped.as_ref().is_some_and(|record| record.complete);
+        let expires_at_ms = state
+            .succeeded_at_ms
+            .map(|at| at + state.scope.maximum_lifetime_ms.get());
+        let signing_authority = if state.status != "succeeded" {
+            "pending"
+        } else if stopped_complete {
+            "stopped"
+        } else if !package_installed {
+            "package_replaced"
+        } else if expires_at_ms.is_some_and(|expires| now_ms >= expires) {
+            "expired"
+        } else {
+            "active"
+        };
+        let routes_known = routes.is_some();
+        let eligible_exact_routes = match (signing_authority, &routes) {
+            ("stopped" | "expired", Some(routes)) => routes
+                .iter()
+                .filter_map(|route| {
+                    let intent = route.install_metadata.sign_intent.as_deref()?;
+                    state
+                        .scope
+                        .allowed_operation_classes
+                        .iter()
+                        .any(|class| class.as_str() == intent)
+                        .then(|| route.route_id.clone())
+                })
+                .collect::<Vec<_>>(),
+            _ => Vec::new(),
+        };
+        let delegated = match &state.public_key {
+            Some(public) => serde_json::json!({
+                "key_ref": public.key_ref,
+                "addresses": public.addresses,
+            }),
+            None => serde_json::Value::Null,
+        };
+        let approvals = state
+            .reusable_approval_id
+            .as_ref()
+            .map(|id| vec![serde_json::json!(id.as_str())])
+            .unwrap_or_default();
+        let stop = state.stopped.as_ref().map(|record| {
+            serde_json::json!({
+                "at_ms": record.at_ms,
+                "operation_id": record.operation_id.as_str(),
+                "complete": record.complete,
+                "approvals": record.approvals.iter().map(|status| serde_json::json!({
+                    "approval_id": status.approval_id.as_str(),
+                    "state": format!("{:?}", status.state),
+                })).collect::<Vec<_>>(),
+            })
+        });
+        let document = serde_json::json!({
+            "schema": "bloom.session.v1",
+            "petal": Self::rendered_mount(state),
+            "key_slot": state.key_slot,
+            "package_hash": state.scope.package_hash.as_str(),
+            "installed_package_hash": installed_mount
+                .and_then(|mount| self.runner.resolve_petal_mount(&mount).ok()),
+            "owner": owner,
+            "delegated": delegated,
+            "scope_digest": state.scope_digest.as_str(),
+            "operation_classes": state.scope.allowed_operation_classes
+                .iter()
+                .map(|class| class.as_str())
+                .collect::<Vec<_>>(),
+            "allowed_routes": state.scope.allowed_routes,
+            "expires_at_ms": expires_at_ms,
+            "approvals": approvals,
+            "signing_authority": signing_authority,
+            "freshness": account.freshness,
+            "eligible_exact_routes": eligible_exact_routes,
+            "routes_known": routes_known,
+            "stop": stop,
+        });
+        AccountSessionEntry {
+            petal_mount: Self::rendered_mount(state),
+            key_slot: state.key_slot.clone(),
+            document: serde_json::to_vec_pretty(&document).unwrap_or_else(|_| {
+                b"{}
+"
+                .to_vec()
+            }),
+            stoppable: state.public_key.is_some(),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl AccountPetalMount for AccountPetals {
+    fn for_account(&self, account: AccountPetalContext) -> Arc<dyn bloom_vfs::handler::Handler> {
+        self.router.for_account(account)
+    }
+
+    fn sessions(
+        &self,
+        account: &AccountPetalContext,
+    ) -> Result<Vec<AccountSessionEntry>, bloom_vfs::handler::HandlerError> {
+        Ok(self
+            .states_for(account)
+            .iter()
+            .map(|(_, state)| self.session_entry(account, state))
+            .collect())
+    }
+
+    async fn stop_session(
+        &self,
+        account: &AccountPetalContext,
+        mount: &str,
+        slot: &str,
+    ) -> Result<(), bloom_vfs::handler::HandlerError> {
+        let (path, state) = self
+            .states_for(account)
+            .into_iter()
+            .find(|(_, state)| Self::rendered_mount(state) == mount && state.key_slot == *slot)
+            .ok_or_else(|| {
+                bloom_vfs::handler::HandlerError::not_found(format!("sessions/{mount}/{slot}"))
+            })?;
+        let Some(public) = &state.public_key else {
+            return Err(bloom_vfs::handler::HandlerError::invalid(
+                "session has no delegated key to stop",
+            ));
+        };
+        if state.stopped.as_ref().is_some_and(|record| record.complete) {
+            // Idempotent: the journaled operation already completed for
+            // every approval this key had.
+            return Ok(());
+        }
+        let broker = self.broker.as_ref().ok_or_else(|| {
+            bloom_vfs::handler::HandlerError::backend(
+                "Broker edge is unavailable to stop a session",
+            )
+        })?;
+        let operation_hash = blake3::hash(
+            format!(
+                "bloom-session-stop/v1\0{}\0{}\0{}",
+                account.wallet, state.scope.lineage_id, slot
+            )
+            .as_bytes(),
+        );
+        let operation_id = bloom_broker_api::OperationId::from_bytes(*operation_hash.as_bytes());
+        let statuses = broker
+            .revoke_approvals_for_key(bloom_broker_api::RevokeForKeyRequest {
+                operation_id: operation_id.clone(),
+                wallet_id: state.scope.wallet_id.clone(),
+                key_ref: public.key_ref.clone(),
+                reason: format!("owner stopped petal session {slot}"),
+            })
+            .await
+            .map_err(|error| {
+                bloom_vfs::handler::HandlerError::backend(format!(
+                    "sealed_approval.revoke_for_key: {}: {}",
+                    error.code.as_str(),
+                    error.message
+                ))
+            })?;
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_millis() as u64)
+            .unwrap_or(0);
+        let complete = statuses.iter().all(Self::terminal);
+        let mut next = state.clone();
+        next.stopped = Some(SessionStopRecord {
+            at_ms: now_ms,
+            operation_id,
+            approvals: statuses,
+            complete,
+        });
+        DaemonPetalHost::write_petal_key_state(&path, &next)
+            .map_err(|error| bloom_vfs::handler::HandlerError::backend(error.to_string()))?;
+        if !complete {
+            let non_terminal = next
+                .stopped
+                .as_ref()
+                .map(|record| {
+                    record
+                        .approvals
+                        .iter()
+                        .filter(|status| !Self::terminal(status))
+                        .map(|status| status.approval_id.as_str())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            return Err(bloom_vfs::handler::HandlerError::backend(format!(
+                "approvals are not terminal yet: {}",
+                non_terminal.join(", ")
+            )));
+        }
+        Ok(())
+    }
+}
+
 /// All wired-up state the daemon owns. Cheap to clone (everything is
 /// behind Arc/clone-safe inner types).
 #[derive(Clone)]
@@ -3896,6 +4335,7 @@ impl Daemon {
         let petal_vfs_host = Arc::new(LateVfsHost::new());
         let petal_app_host = DaemonPetalHost::new(petal_vfs_host.clone(), audit_arc.clone())
             .with_broker(broker.clone())
+            .with_petal_runner(petals.clone())
             .with_wallets(wallets_handler.clone())
             .with_provenance_catalog(provenance_catalog.clone())
             .with_petal_key_state_root(home.cache_dir().join("petal-key-requests"))
@@ -3914,10 +4354,18 @@ impl Daemon {
                 .with_runtime_petals(config.petals.runtime.clone())
                 .map_err(|e| DaemonError::Audit(format!("petals runtime configuration: {e}")))?,
         );
-        // Exactly one wallets handler exists and is mounted: the router is
-        // attached to it after both are built, rather than cloning a second
-        // instance that the Petal host would not see.
-        wallets_handler.set_account_petals(petal_router.clone());
+        // Exactly one wallets handler exists and is mounted: the account
+        // Petal seam (dispatch through the router, sessions and stop over
+        // the key-state files and the Broker edge) is attached to it after
+        // both are built, rather than cloning a second instance the Petal
+        // host would not see.
+        let account_petals = Arc::new(AccountPetals {
+            router: petal_router.clone(),
+            runner: petals.clone(),
+            key_state_root: home.cache_dir().join("petal-key-requests"),
+            broker: broker.clone(),
+        });
+        wallets_handler.set_account_petals(account_petals);
         debug!(root = %petals_root.display(), "daemon.petals_initialised");
         let petals_for_docs = petals.clone();
         let petals_doc_renderer: Arc<dyn Fn() -> Vec<u8> + Send + Sync> =
@@ -4934,8 +5382,8 @@ mod tests {
     use super::*;
     use bloom_broker_api::{MachineBrokerRequest, MachineBrokerResponse, MachineBrokerService};
     use bloom_vfs::VfsPath;
+    use bloom_vfs::handler::Entry;
     use bloom_vfs::handler::Handler;
-    use bloom_vfs::handler::{Entry, HandlerError};
 
     #[cfg(feature = "mount")]
     #[test]
@@ -5120,13 +5568,13 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Handler for GuestWalletProjectionFixture {
-        async fn lookup(&self, path: &VfsPath) -> Result<Entry, HandlerError> {
+        async fn lookup(&self, path: &VfsPath) -> Result<Entry, bloom_vfs::handler::HandlerError> {
             Ok(Entry::file(
                 path.segments().last().map(String::as_str).unwrap_or(""),
             ))
         }
 
-        async fn read(&self, path: &VfsPath) -> Result<Vec<u8>, HandlerError> {
+        async fn read(&self, path: &VfsPath) -> Result<Vec<u8>, bloom_vfs::handler::HandlerError> {
             if path.segments().last().map(String::as_str) == Some("address") {
                 Ok(b"0x0000000000000000000000000000000000000001\n".to_vec())
             } else {
@@ -5134,11 +5582,18 @@ mod tests {
             }
         }
 
-        async fn list(&self, _path: &VfsPath) -> Result<Vec<Entry>, HandlerError> {
+        async fn list(
+            &self,
+            _path: &VfsPath,
+        ) -> Result<Vec<Entry>, bloom_vfs::handler::HandlerError> {
             Ok(vec![Entry::file("address")])
         }
 
-        async fn write(&self, _path: &VfsPath, _data: &[u8]) -> Result<(), HandlerError> {
+        async fn write(
+            &self,
+            _path: &VfsPath,
+            _data: &[u8],
+        ) -> Result<(), bloom_vfs::handler::HandlerError> {
             self.wrote.store(true, std::sync::atomic::Ordering::SeqCst);
             Ok(())
         }
@@ -7419,6 +7874,13 @@ ws_url = "wss://example.invalid"
     struct TwoFamilyAccountBroker {
         children: Vec<AccountChild>,
         sign_calls: parking_lot::Mutex<Vec<bloom_broker_api::KeyRef>>,
+        /// What `sealed_approval.revoke_for_key` reports, and the requests
+        /// it received.
+        revoke_results: parking_lot::Mutex<Option<Vec<bloom_broker_api::ApprovalPublicStatus>>>,
+        revoke_requests: parking_lot::Mutex<Vec<bloom_broker_api::RevokeForKeyRequest>>,
+        /// Keys whose approvals were revoked: the signing edge refuses them
+        /// naming the revoked approval.
+        revoked: parking_lot::Mutex<Vec<(bloom_broker_api::KeyRef, String)>>,
     }
 
     impl TwoFamilyAccountBroker {
@@ -7431,6 +7893,9 @@ ws_url = "wss://example.invalid"
                     account_child(4, 1, false),
                 ],
                 sign_calls: parking_lot::Mutex::new(Vec::new()),
+                revoke_results: parking_lot::Mutex::new(None),
+                revoke_requests: parking_lot::Mutex::new(Vec::new()),
+                revoked: parking_lot::Mutex::new(Vec::new()),
             })
         }
 
@@ -7551,6 +8016,24 @@ ws_url = "wss://example.invalid"
         }
     }
 
+    /// A stable per-key approval id so a revoked approval can be named.
+    fn approval_status_for_key(
+        request: &bloom_broker_api::RevokeForKeyRequest,
+    ) -> bloom_broker_api::ApprovalPublicStatus {
+        use sha2::Digest as _;
+        bloom_broker_api::ApprovalPublicStatus {
+            approval_id: bloom_broker_api::Digest32::from_bytes(
+                sha2::Sha256::digest(format!("approval\0{}", request.key_ref.locator).as_bytes())
+                    .into(),
+            ),
+            wallet_id: request.wallet_id.clone(),
+            state: bloom_broker_api::ApprovalLifecycleState::Revoked,
+            effective_claim_assurance: None,
+            ceremony_url: None,
+            ceremony_expires_at_ms: None,
+        }
+    }
+
     impl bloom_broker_api::MachineBrokerService for TwoFamilyAccountBroker {
         fn dispatch<'a>(
             &'a self,
@@ -7575,6 +8058,9 @@ ws_url = "wss://example.invalid"
                         ))
                     }
                     MachineBrokerRequest::KeyGetPublic(r) => {
+                        if r.key_ref == session_key_public().key_ref {
+                            return Ok(MachineBrokerResponse::KeyGetPublic(session_key_public()));
+                        }
                         let child = self
                             .children
                             .iter()
@@ -7600,7 +8086,43 @@ ws_url = "wss://example.invalid"
                         Ok(MachineBrokerResponse::WalletAccounts(self.accounts()))
                     }
                     MachineBrokerRequest::SigningSign(r) => {
+                        if let Some((_, approval_id)) = self
+                            .revoked
+                            .lock()
+                            .iter()
+                            .find(|(key, _)| *key == r.key_ref)
+                        {
+                            return Err(ProtocolError::new(
+                                ProtocolErrorCode::ApprovalNotFound,
+                                format!("approval {approval_id} was revoked"),
+                            ));
+                        }
                         Ok(MachineBrokerResponse::SigningSign(self.signing_result(&r)))
+                    }
+                    MachineBrokerRequest::SealedApprovalRevokeForKey(r) => {
+                        let statuses = self
+                            .revoke_results
+                            .lock()
+                            .clone()
+                            .unwrap_or_else(|| vec![approval_status_for_key(&r)]);
+                        for status in &statuses {
+                            if matches!(
+                                status.state,
+                                bloom_broker_api::ApprovalLifecycleState::Revoked
+                                    | bloom_broker_api::ApprovalLifecycleState::Failed
+                                    | bloom_broker_api::ApprovalLifecycleState::Exhausted
+                                    | bloom_broker_api::ApprovalLifecycleState::Expired
+                                    | bloom_broker_api::ApprovalLifecycleState::Cancelled
+                                    | bloom_broker_api::ApprovalLifecycleState::Orphaned
+                            ) {
+                                self.revoked.lock().push((
+                                    r.key_ref.clone(),
+                                    status.approval_id.as_str().to_owned(),
+                                ));
+                            }
+                        }
+                        self.revoke_requests.lock().push(r);
+                        Ok(MachineBrokerResponse::SealedApprovalRevokeForKey(statuses))
                     }
                     MachineBrokerRequest::SigningSignBatch(r) => Ok(
                         MachineBrokerResponse::SigningSignBatch(self.signing_result(&r)),
@@ -7623,11 +8145,14 @@ ws_url = "wss://example.invalid"
     }
 
     /// Install an account-aware "echo" petal and an unaware "plain" petal
-    /// into the daemon home before the daemon is built.
-    fn install_isolation_petals(home: &bloom_proto::HomeDir) {
+    /// into the daemon home before the daemon is built. Returns the echo
+    /// package hash so tests can build session states against an installed
+    /// package.
+    fn install_isolation_petals(home: &bloom_proto::HomeDir) -> String {
         let root = home.root().join("petals");
         let store = bloom_petals::PetalStore::open(root.join("store")).unwrap();
         let registry = Arc::new(bloom_petals::NameRegistry::open(root.join("registry")).unwrap());
+        let mut echo_hash = String::new();
 
         for (mount, aware) in [("echo", true), ("plain", false)] {
             let package = root.join(format!("{mount}-package"));
@@ -7660,9 +8185,13 @@ allowed = ["bloom:vfs.read"]
                 &format!("petal/{mount}/message.txt.wasm"),
                 include_bytes!("../../bloom-petals/tests/fixtures/route_component_no_imports.wasm"),
             );
-            store.install_petal_package_dir(&package).unwrap();
-            let _ = registry;
+            let (installed, _, _) = store.install_petal_package_dir(&package).unwrap();
+            if mount == "echo" {
+                echo_hash = installed.hash;
+            }
         }
+        let _ = registry;
+        echo_hash
     }
 
     fn account_route_context(
@@ -7753,25 +8282,38 @@ allowed = ["bloom:vfs.read"]
         }
     }
 
-    async fn isolation_daemon() -> (tempfile::TempDir, Daemon, Arc<TwoFamilyAccountBroker>) {
-        let dir = tempfile::tempdir().unwrap();
+    fn isolation_dir() -> tempfile::TempDir {
+        tempfile::tempdir().unwrap()
+    }
+
+    async fn isolation_daemon_at(dir: &tempfile::TempDir) -> (Daemon, Arc<TwoFamilyAccountBroker>) {
         let home = bloom_proto::HomeDir::at(dir.path());
         home.ensure().unwrap();
         install_isolation_petals(&home);
         let broker = TwoFamilyAccountBroker::new();
         let daemon = Daemon::from_home_with_permit_and_broker(
-            home.clone(),
-            Arc::new(bloom_proto::HomeWritePermit::acquire(&home).unwrap()),
+            home,
+            Arc::new(
+                bloom_proto::HomeWritePermit::acquire(&bloom_proto::HomeDir::at(dir.path()))
+                    .unwrap(),
+            ),
             MachineBrokerClient::new(broker.clone()),
             solana_and_evm_catalog(),
         )
         .unwrap();
+        (daemon, broker)
+    }
+
+    async fn isolation_daemon() -> (tempfile::TempDir, Daemon, Arc<TwoFamilyAccountBroker>) {
+        let dir = isolation_dir();
+        let (daemon, broker) = isolation_daemon_at(&dir).await;
         (dir, daemon, broker)
     }
 
     fn isolation_host(daemon: &Daemon, broker: Arc<TwoFamilyAccountBroker>) -> DaemonPetalHost {
         DaemonPetalHost::new(Arc::new(LateVfsHost::new()), daemon.audit.clone())
             .with_broker(Some(MachineBrokerClient::new(broker)))
+            .with_petal_key_state_root(daemon.home.cache_dir().join("petal-key-requests"))
     }
 
     /// 1. `wallets/w/1/petals/` dispatches through the mounted aware petal,
@@ -8024,5 +8566,390 @@ allowed = ["bloom:vfs.read"]
         assert!(matches!(outcome, SignOutcome::Signature(_)));
         let calls = broker.sign_calls.lock();
         assert_eq!(calls.as_slice(), std::slice::from_ref(&evm0.key_ref));
+    }
+
+    // ----- sessions inventory and core stop -----
+
+    fn session_key_public() -> bloom_broker_api::KeyPublic {
+        use sha2::Digest as _;
+        let spki = vec![
+            0x02, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
+            7, 7, 7, 7, 7,
+        ];
+        bloom_broker_api::KeyPublic {
+            key_ref: bloom_broker_api::KeyRef {
+                backend: bloom_broker_api::Token::new("local").unwrap(),
+                backend_instance: bloom_broker_api::Token::new("iso").unwrap(),
+                locator: "wallet/derived/session-main".into(),
+                key_spec: bloom_broker_api::KeySpec::Secp256k1,
+                public_key_fingerprint: bloom_broker_api::Digest32::from_bytes(
+                    sha2::Sha256::digest(&spki).into(),
+                ),
+                derivation: None,
+            },
+            role: bloom_broker_api::KeyRole::Derived,
+            canonical_public_key: bloom_broker_api::Base64UrlBytes::from_bytes(&spki),
+            addresses: vec!["0x0000000000000000000000000000000000000007".into()],
+            supported_crypto_suites: vec![
+                bloom_broker_api::CryptoSuite::Secp256k1Keccak256Recoverable,
+            ],
+        }
+    }
+
+    /// One succeeded session state under the daemon's key-state root,
+    /// delegated from the given parent (an account family key).
+    #[allow(clippy::too_many_arguments)]
+    fn write_session_state(
+        home: &bloom_proto::HomeDir,
+        wallet: &str,
+        lineage: &str,
+        slot: &str,
+        parent: &AccountChild,
+        petal_mount: Option<&str>,
+        package_hash: &str,
+        requested_at_ms: u64,
+    ) {
+        let public = session_key_public();
+        let scope = bloom_broker_api::PetalKeyScope {
+            wallet_id: bloom_broker_api::Token::new(wallet).unwrap(),
+            parent_key_ref: parent.key_ref.clone(),
+            package_hash: bloom_broker_api::Digest32::new(package_hash.to_owned()).unwrap(),
+            route: "r000001".into(),
+            lineage_id: lineage.into(),
+            key_slot: bloom_broker_api::Token::new(slot).unwrap(),
+            allowed_routes: vec!["r000001".into()],
+            allowed_operation_classes: vec![bloom_broker_api::Token::new("test.intent").unwrap()],
+            allowed_crypto_suites: vec![
+                bloom_broker_api::CryptoSuite::Secp256k1Keccak256Recoverable,
+            ],
+            maximum_lifetime_ms: bloom_broker_api::DecimalU64::new(3_600_000),
+            custody_operation_id: bloom_broker_api::OperationId::from_bytes([3; 32]),
+        };
+        let state = PetalKeyRequestState {
+            schema: PETAL_KEY_STATE_SCHEMA.into(),
+            key_slot: slot.into(),
+            scope: scope.clone(),
+            scope_digest: scope.digest().expect("fixture scope digest must compute"),
+            provenance_digest: None,
+            status: "succeeded".into(),
+            ceremony_url: None,
+            ceremony_expires_at_ms: bloom_broker_api::DecimalU64::new(0),
+            public_key: Some(public),
+            reusable_approval_id: Some(bloom_broker_api::Digest32::from_bytes([4; 32])),
+            petal_mount: petal_mount.map(str::to_owned),
+            requested_at_ms,
+            succeeded_at_ms: Some(requested_at_ms + 1),
+            stopped: None,
+        };
+        let identity = blake3::hash(
+            format!("bloom-petal-key-request-state/v3\0{wallet}\0{lineage}\0{slot}").as_bytes(),
+        );
+        let path = home
+            .cache_dir()
+            .join("petal-key-requests")
+            .join(format!("{}.json", identity.to_hex()));
+        DaemonPetalHost::write_petal_key_state(&path, &state).unwrap();
+    }
+
+    fn now_ms_for_fixture() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_millis() as u64)
+            .unwrap_or(0)
+    }
+
+    async fn session_json(daemon: &Daemon, path: &str) -> serde_json::Value {
+        let bytes = daemon
+            .vfs
+            .read(&VfsPath::parse(path).unwrap())
+            .await
+            .unwrap_or_else(|error| panic!("read {path}: {error}"));
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn sessions_mount_lists_reads_and_stops_through_the_numbered_tree() {
+        let dir = isolation_dir();
+        let (daemon, broker) = isolation_daemon_at(&dir).await;
+        let echo_hash = install_isolation_petals(&bloom_proto::HomeDir::at(dir.path()));
+        let evm1 = broker.child(true, 1);
+        write_session_state(
+            &bloom_proto::HomeDir::at(dir.path()),
+            "w",
+            "pln1_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "main",
+            evm1,
+            Some("echo"),
+            &echo_hash,
+            now_ms_for_fixture() - 2_000,
+        );
+
+        // Listing and reading never call Broker: the fixture would record
+        // nothing but wallet/account reads, and no signing happens.
+        let mounts = daemon
+            .vfs
+            .list(&VfsPath::parse("/wallets/w/1/sessions").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(mounts.len(), 1);
+        assert_eq!(mounts[0].name, "echo");
+        let slots = daemon
+            .vfs
+            .list(&VfsPath::parse("/wallets/w/1/sessions/echo").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(slots.len(), 1);
+        assert_eq!(slots[0].name, "main");
+
+        let session = session_json(&daemon, "/wallets/w/1/sessions/echo/main/session.json").await;
+        assert_eq!(session["schema"], "bloom.session.v1");
+        assert_eq!(session["signing_authority"], "active");
+        assert_eq!(session["owner"]["family"], "evm");
+        assert_eq!(session["owner"]["fingerprint"], evm1.fingerprint_hex());
+        assert_eq!(
+            session["delegated"]["key_ref"]["locator"],
+            "wallet/derived/session-main"
+        );
+        assert_eq!(session["routes_known"], true);
+        assert!(session["stop"].is_null());
+        assert!(broker.sign_calls.lock().is_empty());
+
+        // Stop: the fixture reports both approvals terminal.
+        daemon
+            .vfs
+            .write(
+                &VfsPath::parse("/wallets/w/1/sessions/echo/main/stop").unwrap(),
+                b"y\n",
+            )
+            .await
+            .unwrap();
+        {
+            let requests = broker.revoke_requests.lock();
+            assert_eq!(requests.len(), 1, "one journaled revoke request");
+            assert_eq!(requests[0].wallet_id.as_str(), "w");
+            assert_eq!(requests[0].key_ref.locator, "wallet/derived/session-main");
+            let expected_operation = blake3::hash(
+                b"bloom-session-stop/v1\0w\0pln1_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\0main",
+            );
+            assert_eq!(
+                requests[0].operation_id.as_str(),
+                expected_operation.to_hex().as_str()
+            );
+        }
+
+        let session = session_json(&daemon, "/wallets/w/1/sessions/echo/main/session.json").await;
+        assert_eq!(session["signing_authority"], "stopped");
+        assert_eq!(session["stop"]["complete"], true);
+
+        // Idempotent: a second stop write returns Ok and changes nothing.
+        daemon
+            .vfs
+            .write(
+                &VfsPath::parse("/wallets/w/1/sessions/echo/main/stop").unwrap(),
+                b"y\n",
+            )
+            .await
+            .unwrap();
+        assert_eq!(broker.revoke_requests.lock().len(), 1);
+
+        // Signing with the stopped session key is refused by the Broker
+        // with the revoked approval id (the real Signer rejection is proven
+        // in bloom-broker #58 / bloom-signer #40 tests).
+        let host = isolation_host(&daemon, broker.clone());
+        let error = host
+            .sign_payload_outcome(isolation_sign_request(
+                account_route_context("w", Some(1), Some(evm1.fingerprint_hex())),
+                Some(session_key_public().key_ref),
+            ))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, HostError::Denied(ref message) if message.contains("revoked")),
+            "{error}"
+        );
+
+        // A fresh process reading the same home still sees the session
+        // stopped: the state is durable, and the session seam is rebuilt
+        // from it alone. (The full daemon graph keeps the home write
+        // permit alive through the VFS/host cycle in-process, so the
+        // restart is exercised at the seam a fresh daemon constructs.)
+        drop(daemon);
+        let home = bloom_proto::HomeDir::at(dir.path());
+        let runner = bloom_petals::PetalRunner::new(
+            bloom_petals::PetalStore::open(home.root().join("petals/store")).unwrap(),
+            Arc::new(
+                bloom_petals::NameRegistry::open(home.root().join("petals/registry")).unwrap(),
+            ),
+            bloom_petals::PetalVm::new().unwrap(),
+        );
+        let restarted = AccountPetals {
+            router: Arc::new(PetalRouter::new(
+                runner.clone(),
+                Arc::new(bloom_petals::DenyHost),
+            )),
+            runner,
+            key_state_root: home.cache_dir().join("petal-key-requests"),
+            broker: Some(MachineBrokerClient::new(broker.clone())),
+        };
+        let sessions = restarted
+            .sessions(&AccountPetalContext {
+                wallet: "w".into(),
+                number: 1,
+                evm_fingerprint: Some(evm1.fingerprint_hex().to_owned()),
+                solana_fingerprint: None,
+                freshness: bloom_machine_client::ProjectionFreshness::Fresh,
+            })
+            .unwrap();
+        let document: serde_json::Value = serde_json::from_slice(&sessions[0].document).unwrap();
+        assert_eq!(document["signing_authority"], "stopped");
+    }
+
+    #[tokio::test]
+    async fn a_partial_revocation_leaves_authority_active_and_names_the_approval() {
+        let dir = isolation_dir();
+        let (daemon, broker) = isolation_daemon_at(&dir).await;
+        let echo_hash = install_isolation_petals(&bloom_proto::HomeDir::at(dir.path()));
+        let evm1 = broker.child(true, 1);
+        write_session_state(
+            &bloom_proto::HomeDir::at(dir.path()),
+            "w",
+            "pln1_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "main",
+            evm1,
+            Some("echo"),
+            &echo_hash,
+            now_ms_for_fixture() - 2_000,
+        );
+
+        let revoke_all = bloom_broker_api::RevokeForKeyRequest {
+            operation_id: bloom_broker_api::OperationId::from_bytes([1; 32]),
+            wallet_id: bloom_broker_api::Token::new("w").unwrap(),
+            key_ref: session_key_public().key_ref,
+            reason: String::new(),
+        };
+        let mut statuses = vec![approval_status_for_key(&revoke_all)];
+        statuses[0].state = bloom_broker_api::ApprovalLifecycleState::Active;
+        *broker.revoke_results.lock() = Some(statuses.clone());
+
+        let error = daemon
+            .vfs
+            .write(
+                &VfsPath::parse("/wallets/w/1/sessions/echo/main/stop").unwrap(),
+                b"y\n",
+            )
+            .await
+            .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("not terminal"), "{message}");
+        assert!(
+            message.contains(statuses[0].approval_id.as_str()),
+            "the error must name the still-active approval: {message}"
+        );
+
+        let session = session_json(&daemon, "/wallets/w/1/sessions/echo/main/session.json").await;
+        assert_eq!(
+            session["signing_authority"], "active",
+            "a partial stop leaves the authority unchanged"
+        );
+        assert_eq!(session["stop"]["complete"], false);
+
+        // A retry after the approval completed stops the session.
+        *broker.revoke_results.lock() = None;
+        daemon
+            .vfs
+            .write(
+                &VfsPath::parse("/wallets/w/1/sessions/echo/main/stop").unwrap(),
+                b"y\n",
+            )
+            .await
+            .unwrap();
+        let session = session_json(&daemon, "/wallets/w/1/sessions/echo/main/session.json").await;
+        assert_eq!(session["signing_authority"], "stopped");
+    }
+
+    #[tokio::test]
+    async fn sessions_of_another_account_or_a_replaced_package_are_truthful() {
+        let dir = isolation_dir();
+        let (daemon, broker) = isolation_daemon_at(&dir).await;
+        let echo_hash = install_isolation_petals(&bloom_proto::HomeDir::at(dir.path()));
+        let evm0 = broker.child(true, 0);
+        // A session whose parent is account 0's key: not visible under 1.
+        write_session_state(
+            &bloom_proto::HomeDir::at(dir.path()),
+            "w",
+            "pln1_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "main",
+            evm0,
+            Some("echo"),
+            &echo_hash,
+            now_ms_for_fixture() - 2_000,
+        );
+        let one = daemon
+            .vfs
+            .list(&VfsPath::parse("/wallets/w/1/sessions").unwrap())
+            .await
+            .unwrap();
+        assert!(one.is_empty(), "account 1 must not list account 0 sessions");
+        let error = daemon
+            .vfs
+            .write(
+                &VfsPath::parse("/wallets/w/1/sessions/echo/main/stop").unwrap(),
+                b"y\n",
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("not found"), "{error}");
+        let zero = daemon
+            .vfs
+            .list(&VfsPath::parse("/wallets/w/0/sessions").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(zero.len(), 1, "account 0 lists its own session");
+        assert!(broker.revoke_requests.lock().is_empty());
+
+        // A session whose package is no longer installed reads as replaced.
+        let evm1 = broker.child(true, 1);
+        write_session_state(
+            &bloom_proto::HomeDir::at(dir.path()),
+            "w",
+            "pln1_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "orphan",
+            evm1,
+            Some("echo"),
+            &"dd".repeat(32),
+            now_ms_for_fixture() - 2_000,
+        );
+        let session = session_json(&daemon, "/wallets/w/1/sessions/echo/orphan/session.json").await;
+        assert_eq!(session["signing_authority"], "package_replaced");
+        assert_eq!(session["routes_known"], false);
+        assert_eq!(
+            session["eligible_exact_routes"]
+                .as_array()
+                .map(Vec::len)
+                .unwrap_or(0),
+            0
+        );
+
+        // A state without a recorded mount renders under unknown-<hash>.
+        write_session_state(
+            &bloom_proto::HomeDir::at(dir.path()),
+            "w",
+            "pln1_cccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "anon",
+            evm1,
+            None,
+            &"ee".repeat(32),
+            now_ms_for_fixture() - 2_000,
+        );
+        let mounts = daemon
+            .vfs
+            .list(&VfsPath::parse("/wallets/w/1/sessions").unwrap())
+            .await
+            .unwrap();
+        let names: Vec<&str> = mounts.iter().map(|entry| entry.name.as_str()).collect();
+        assert!(
+            names.contains(&"unknown-eeeeeeeeeeee"),
+            "an unmounted session renders under unknown-<hash prefix>: {names:?}"
+        );
     }
 }

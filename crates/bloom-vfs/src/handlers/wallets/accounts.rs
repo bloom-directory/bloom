@@ -256,6 +256,7 @@ impl WalletsHandler {
             Entry::file("account.json"),
             Entry::dir("chains"),
             Entry::dir("petals"),
+            Entry::dir("sessions"),
         ]
     }
 
@@ -273,7 +274,26 @@ impl WalletsHandler {
             number: view.number,
             evm_fingerprint: view.evm.as_ref().map(|key| key.fingerprint.clone()),
             solana_fingerprint: view.solana.as_ref().map(|key| key.fingerprint.clone()),
+            freshness: view.freshness,
         }))
+    }
+
+    fn account_sessions(
+        &self,
+        wallet: &str,
+        view: &AccountView,
+    ) -> Result<Vec<AccountSessionEntry>, HandlerError> {
+        let petals = self.account_petals.read();
+        let Some(petals) = petals.as_ref() else {
+            return Ok(Vec::new());
+        };
+        petals.sessions(&AccountPetalContext {
+            wallet: wallet.to_owned(),
+            number: view.number,
+            evm_fingerprint: view.evm.as_ref().map(|key| key.fingerprint.clone()),
+            solana_fingerprint: view.solana.as_ref().map(|key| key.fingerprint.clone()),
+            freshness: view.freshness,
+        })
     }
 
     fn chain_name_entries(&self) -> Vec<Entry> {
@@ -303,6 +323,10 @@ impl WalletsHandler {
                             .fold(VfsPath::root(), |path, segment| path.join(segment)),
                     )
                     .await
+            }
+            [dir, sessions_rest @ ..] if dir == "sessions" => {
+                let sessions = self.account_sessions(wallet, &view)?;
+                Self::lookup_account_session(&sessions, sessions_rest)
             }
             [leaf] if leaf == "account.json" => Ok(Entry::file(leaf)),
             [dir] if dir == "chains" => Ok(Entry::dir("chains")),
@@ -339,6 +363,14 @@ impl WalletsHandler {
                     )
                     .await
             }
+            [dir, mount, slot, leaf] if dir == "sessions" && leaf == "session.json" => {
+                let sessions = self.account_sessions(wallet, &view)?;
+                sessions
+                    .iter()
+                    .find(|session| session.petal_mount == *mount && session.key_slot == *slot)
+                    .map(|session| session.document.clone())
+                    .ok_or_else(|| HandlerError::not_found(rest.join("/")))
+            }
             [dir, chain, chain_rest @ ..] if dir == "chains" => {
                 if self.is_solana_chain(chain) {
                     let (family, account) = Self::solana_family(&view, chain)?;
@@ -371,6 +403,37 @@ impl WalletsHandler {
                             .fold(VfsPath::root(), |path, segment| path.join(segment)),
                     )
                     .await
+            }
+            [dir] if dir == "sessions" => {
+                let sessions = self.account_sessions(wallet, &view)?;
+                let mounts: std::collections::BTreeSet<&str> = sessions
+                    .iter()
+                    .map(|session| session.petal_mount.as_str())
+                    .collect();
+                Ok(mounts.into_iter().map(Entry::dir).collect())
+            }
+            [dir, mount] if dir == "sessions" => {
+                let sessions = self.account_sessions(wallet, &view)?;
+                let slots: std::collections::BTreeSet<&str> = sessions
+                    .iter()
+                    .filter(|session| session.petal_mount == *mount)
+                    .map(|session| session.key_slot.as_str())
+                    .collect();
+                if slots.is_empty() {
+                    return Err(HandlerError::not_found(rest.join("/")));
+                }
+                Ok(slots.into_iter().map(Entry::dir).collect())
+            }
+            [dir, mount, slot] if dir == "sessions" => {
+                let sessions = self.account_sessions(wallet, &view)?;
+                Self::lookup_account_session(&sessions, &[mount.clone(), slot.clone()])?;
+                let mut entries = vec![Entry::file("session.json")];
+                if sessions.iter().any(|session| {
+                    session.petal_mount == *mount && session.key_slot == *slot && session.stoppable
+                }) {
+                    entries.push(Entry::writable_file("stop"));
+                }
+                Ok(entries)
             }
             [dir] if dir == "chains" => Ok(self.chain_name_entries()),
             [dir, chain, chain_rest @ ..] if dir == "chains" => {
@@ -411,6 +474,32 @@ impl WalletsHandler {
                     data,
                 )
                 .await;
+        }
+        if let [dir, mount, slot, leaf] = rest
+            && dir == "sessions"
+            && leaf == "stop"
+        {
+            let content = std::str::from_utf8(data)
+                .map_err(|_| HandlerError::invalid("non-utf8 stop content"))?;
+            if content.trim().is_empty() {
+                return Err(HandlerError::invalid(
+                    "stop requires non-empty content (e.g. 'y')",
+                ));
+            }
+            let petals = {
+                let guard = self.account_petals.read();
+                guard.as_ref().cloned().ok_or_else(|| {
+                    HandlerError::not_found("account Petal runtime is unavailable")
+                })?
+            };
+            let context = AccountPetalContext {
+                wallet: wallet.to_owned(),
+                number: view.number,
+                evm_fingerprint: view.evm.as_ref().map(|key| key.fingerprint.clone()),
+                solana_fingerprint: view.solana.as_ref().map(|key| key.fingerprint.clone()),
+                freshness: view.freshness,
+            };
+            return petals.stop_session(&context, mount, slot).await;
         }
         let [dir, chain, sub, chain_rest @ ..] = rest else {
             return Err(HandlerError::PermissionDenied);
@@ -796,6 +885,36 @@ impl WalletsHandler {
                 Ok(out)
             }
             _ => Err(HandlerError::NotADir(rest.join("/"))),
+        }
+    }
+
+    fn lookup_account_session(
+        sessions: &[AccountSessionEntry],
+        rest: &[String],
+    ) -> Result<Entry, HandlerError> {
+        match rest {
+            [mount] => sessions
+                .iter()
+                .any(|session| session.petal_mount == *mount)
+                .then(|| Entry::dir(mount))
+                .ok_or_else(|| HandlerError::not_found(rest.join("/"))),
+            [mount, slot] => sessions
+                .iter()
+                .find(|session| session.petal_mount == *mount && session.key_slot == *slot)
+                .map(|_| Entry::dir(slot))
+                .ok_or_else(|| HandlerError::not_found(rest.join("/"))),
+            [mount, slot, leaf] if leaf == "session.json" => sessions
+                .iter()
+                .find(|session| session.petal_mount == *mount && session.key_slot == *slot)
+                .map(|_| Entry::file("session.json"))
+                .ok_or_else(|| HandlerError::not_found(rest.join("/"))),
+            [mount, slot, leaf] if leaf == "stop" => sessions
+                .iter()
+                .find(|session| session.petal_mount == *mount && session.key_slot == *slot)
+                .filter(|session| session.stoppable)
+                .map(|_| Entry::writable_file("stop"))
+                .ok_or_else(|| HandlerError::not_found(rest.join("/"))),
+            _ => Err(HandlerError::not_found(rest.join("/"))),
         }
     }
 

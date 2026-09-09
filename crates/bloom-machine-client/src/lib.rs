@@ -55,10 +55,10 @@ use bloom_broker_api::{
     MachineSignRequest, OperationId, OperationPublicStatus, OperationRequest, PetalUseClaim,
     PolicyCommitReceipt, PolicyCommitUpdateRequest, PolicyUpdatePrepareResponse,
     PolicyUpdateRequest, ProtocolError, ProtocolErrorCode, ProvenanceCatalog, ProvenanceSubject,
-    RequestNonce, RevocationState, RevokeRequest, SealedApprovalPrepareResponse,
-    SealedApprovalTerms, SignedPolicySnapshot, SigningPayloads, SigningResult, SystemUseClaim,
-    Token, TypedRequestMethod, ValueLimit, WalletAccountsPublic, WalletOperationRequest,
-    WalletPublic, WalletRequest, is_read_only_method,
+    RequestNonce, RevocationState, RevokeForKeyRequest, RevokeRequest,
+    SealedApprovalPrepareResponse, SealedApprovalTerms, SignedPolicySnapshot, SigningPayloads,
+    SigningResult, SystemUseClaim, Token, TypedRequestMethod, ValueLimit, WalletAccountsPublic,
+    WalletOperationRequest, WalletPublic, WalletRequest, is_read_only_method,
 };
 use bloom_triad_local_transport::{LocalIdentity, PeerAcl};
 use serde::{Deserialize, Serialize};
@@ -1330,6 +1330,22 @@ impl MachineBrokerClient {
         {
             MachineBrokerResponse::SealedApprovalRevokeAll(state) => Ok(state),
             _ => Err(response_mismatch("sealed_approval.revoke_all")),
+        }
+    }
+
+    /// Revoke every Sealed Approval whose terms bind one key. Broker
+    /// resolves the set from its own journal, so the caller needs no local
+    /// approval inventory. Idempotent.
+    pub async fn revoke_approvals_for_key(
+        &self,
+        request: RevokeForKeyRequest,
+    ) -> Result<Vec<ApprovalPublicStatus>, ProtocolError> {
+        match self
+            .request(MachineBrokerRequest::SealedApprovalRevokeForKey(request))
+            .await?
+        {
+            MachineBrokerResponse::SealedApprovalRevokeForKey(statuses) => Ok(statuses),
+            _ => Err(response_mismatch("sealed_approval.revoke_for_key")),
         }
     }
 

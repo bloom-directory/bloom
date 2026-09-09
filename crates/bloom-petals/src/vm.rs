@@ -1595,27 +1595,6 @@ fn require_trusted_wallet(data: &StoreData, wallet: &str) -> Result<(), HostErro
     Ok(())
 }
 
-/// Explicit key selection under an account-scoped dispatch must resolve to
-/// the trusted owner key of that account's signing family. Without a
-/// per-route fingerprint this guard defers to the signing seam, which
-/// resolves the owner from the mounted path and rejects any other key.
-fn require_trusted_key_ref(
-    data: &StoreData,
-    key_ref: &bloom_broker_api::KeyRef,
-) -> Result<(), HostError> {
-    let Some(account) = trusted_account(data) else {
-        return Ok(());
-    };
-    if let Some(expected) = &account.owner_key_fingerprint
-        && key_ref.public_key_fingerprint.to_string() != *expected
-    {
-        return Err(HostError::Denied(
-            "explicit key does not belong to the mounted account's owner".into(),
-        ));
-    }
-    Ok(())
-}
-
 fn legacy_signing_unsupported() -> HostError {
     HostError::UnsupportedVersion(
         "bloom:sign/signing@0.1.0 hash-only signing is disabled; use @0.2.0".into(),
@@ -1739,9 +1718,6 @@ fn component_payload_sign_record(
         bloom_broker_api::PetalSignSelector::Reusable
     };
     require_trusted_wallet(data, &wallet)?;
-    if let Some(key_ref) = &key_ref {
-        require_trusted_key_ref(data, key_ref)?;
-    }
     Ok(PayloadSignRequest {
         wallet,
         preimage,
@@ -1878,9 +1854,6 @@ fn component_payload_batch_sign_request(
     };
 
     require_trusted_wallet(data, &wallet)?;
-    if let Some(key_ref) = &key_ref {
-        require_trusted_key_ref(data, key_ref)?;
-    }
     Ok(PayloadBatchSignRequest {
         wallet,
         payloads,
@@ -5063,20 +5036,6 @@ paths = ["/status"]
         }
     }
 
-    fn key_ref_with_fingerprint(byte: u8) -> bloom_broker_api::KeyRef {
-        bloom_broker_api::KeyRef {
-            backend: bloom_broker_api::Token::new("local").unwrap(),
-            backend_instance: bloom_broker_api::Token::new("default").unwrap(),
-            locator: format!("wallets/w/{byte}"),
-            key_spec: bloom_broker_api::KeySpec::Secp256k1,
-            public_key_fingerprint: bloom_broker_api::Digest32::from_bytes([byte; 32]),
-            derivation: Some(bloom_broker_api::DerivationRef::Bip32Secp256k1 {
-                root_key_id: bloom_broker_api::Token::new("primary-root").unwrap(),
-                path: "m/44'/60'/0'/18734/7".into(),
-            }),
-        }
-    }
-
     #[test]
     fn trusted_account_context_parses_host_params() {
         let ctx = account_context("w", 2, Some("aa"));
@@ -5111,11 +5070,6 @@ paths = ["/status"]
 
         require_trusted_wallet(store.data(), "w").unwrap();
         assert!(require_trusted_wallet(store.data(), "other").is_err());
-
-        require_trusted_key_ref(store.data(), &key_ref_with_fingerprint(7)).unwrap();
-        assert!(require_trusted_wallet(store.data(), "w").is_ok());
-        let foreign = key_ref_with_fingerprint(9);
-        assert!(require_trusted_key_ref(store.data(), &foreign).is_err());
     }
 
     #[tokio::test]
@@ -5123,7 +5077,8 @@ paths = ["/status"]
         let host = Arc::new(MockHost::default());
         let mut store = component_test_store(BTreeSet::from([Capability::Sign]), None, host);
         store.data_mut().sign_context = Some(account_context("w", 2, None));
-        require_trusted_key_ref(store.data(), &key_ref_with_fingerprint(7)).unwrap();
+        // Explicit key membership is decided by the signing seam, which can
+        // see the delegated session keys this layer cannot.
         require_trusted_wallet(store.data(), "w").unwrap();
     }
 
@@ -5133,7 +5088,6 @@ paths = ["/status"]
         let store = component_test_store(BTreeSet::from([Capability::Sign]), None, host);
         assert!(store.data().sign_context.is_none());
         require_trusted_wallet(store.data(), "any").unwrap();
-        require_trusted_key_ref(store.data(), &key_ref_with_fingerprint(7)).unwrap();
     }
 
     fn component_test_store(
