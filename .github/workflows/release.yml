@@ -50,6 +50,9 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      - name: Test release metadata checks and notes
+        run: python3 -m unittest discover -s packaging/triad/release -p 'test_*.py'
+
       - id: meta
         env:
           RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref_name }}
@@ -116,6 +119,7 @@ jobs:
             exit 1
           }
           source_date_epoch="$(git show -s --format=%ct "$release_sha")"
+          python3 packaging/triad/release/release-metadata.py check --version "$version"
           {
             echo "release_tag=$tag"
             echo "release_version=$version"
@@ -352,6 +356,7 @@ jobs:
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
+          ref: ${{ needs.prepare.outputs.release_sha }}
           fetch-depth: 0
           persist-credentials: false
 
@@ -376,16 +381,11 @@ jobs:
             exit 1
           }
           notes="$(mktemp)"
-          cat > "$notes" <<EOF
-          ## Bloom v$VERSION
-
-          This release contains signed Bloom triad bundles for Linux x86_64 and
-          macOS aarch64.
-
-          Verify the archive checksum signature with the reviewed key at
-          \`packaging/triad/release/bloom-release-v1.pub\` and the namespace
-          \`bloom-release-archive-v1\`.
-          EOF
+          releases="$(mktemp)"
+          gh api --paginate --slurp "repos/$REPOSITORY/releases?per_page=100" > "$releases"
+          python3 packaging/triad/release/release-metadata.py notes \
+            --version "$VERSION" --repository "$REPOSITORY" --sha "$SHA" \
+            --releases "$releases" > "$notes"
           if gh release view "$TAG" >/dev/null 2>&1; then
             existing="$(mktemp -d)"
             gh release view "$TAG" --json assets --jq '.assets[].name' \

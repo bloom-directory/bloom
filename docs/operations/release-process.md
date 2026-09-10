@@ -46,6 +46,19 @@ workflow refuses to upgrade unrelated external dependencies. The compatibility
 matrix also pins the reviewed Broker and Signer source commits; changes to
 those pins require review independently of the version bump.
 
+Before merging, bump the Machine, Broker, and Signer binary package versions
+to the same `X.Y.Z` (including their lockfiles). Merge the authority version
+bumps, update `broker_commit` and `signer_commit` to those reviewed commits,
+and set all three `[[bundles]]` versions in the compatibility matrix to `X.Y.Z`.
+The proposal workflow only bumps Machine; completing the Broker and Signer
+bumps and pins is the release developer's responsibility. Review the
+Machine–Broker and Broker–Signer IPC ranges separately: protocol versions do
+not need to equal binary versions.
+
+The release prepare job rejects unequal triad versions, including in dry runs.
+Both candidate builds additionally execute each binary's `--version` and check
+it against the matrix, so changing matrix declarations alone is insufficient.
+
 After merging the PR, tag the reviewed commit and push that tag. The release
 workflow requires the commit to be reachable from the default branch and both
 the workspace and compatibility-matrix Machine version to equal the tag.
@@ -105,6 +118,14 @@ missing assets. The current retry path marks the release latest; maintainers
 should account for that when retrying an older tag. GitHub's
 `/releases/latest/download/...` routes follow the release marked latest and do
 not need a floating `latest` Git tag.
+
+Release bodies include the common binary version, the reviewed Machine–Broker
+and Broker–Signer IPC version ranges, and every Bloom commit (including merge
+commits) since the most recently published stable release on the target's
+ancestry. Drafts, prereleases, and unpublished tags are excluded as baselines.
+Retries exclude releases published after the release being retried. With no
+previous release, the changelog includes the complete history through the
+released commit. Broker and Signer repository commits are not included.
 
 Linux aarch64/musl and macOS x86_64 single-binary archives from the older
 pipeline are not outputs of the current triad workflow. Windows builds are
