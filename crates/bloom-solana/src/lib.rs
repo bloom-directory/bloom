@@ -2,8 +2,9 @@
 //!
 //! The in-tree analogue of `bloom-evm::ChainClient` for Solana: a typed,
 //! genesis-bound read surface over the layered [`SolanaRpcClient`] transport.
-//! It performs no signing, no broadcasting, and no account custody — those
-//! belong to the `bloom-solana-tx` engine and the Broker/Signer triad.
+//! It performs no signing and no account custody; broadcasting is a single
+//! `send_transaction` call whose bytes come from the `bloom-solana-tx`
+//! engine.
 //!
 //! Unlike EVM, Solana has no `alloy` equivalent worth adopting here; this
 //! crate's transport is `reqwest`-based (see [`transport`]) and reuses the
@@ -83,16 +84,6 @@ impl SolanaChainRegistry {
 
     pub fn list_names(&self) -> Vec<String> {
         self.inner.read().keys().cloned().collect()
-    }
-
-    pub fn from_specs<I: IntoIterator<Item = SolanaSpec>>(
-        specs: I,
-    ) -> Result<Self, SolanaRpcError> {
-        let r = Self::new();
-        for spec in specs {
-            r.add(SolanaClient::build(&spec)?);
-        }
-        Ok(r)
     }
 }
 
@@ -319,19 +310,6 @@ impl SolanaClient {
                 serde_json::from_value(value)
                     .map_err(|error| SolanaRpcError::Decode(format!("sendTransaction: {error}")))
             })
-    }
-
-    /// Request a faucet airdrop to a base58 account (local/devnet only). The
-    /// returned value is the airdrop transaction signature.
-    pub async fn request_airdrop(
-        &self,
-        account: &str,
-        lamports: u64,
-    ) -> Result<String, SolanaRpcError> {
-        self.inner
-            .rpc
-            .call("requestAirdrop", &json!([account, lamports]))
-            .await
     }
 
     /// Confirmation status for a list of transaction signatures. The outer

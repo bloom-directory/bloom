@@ -113,7 +113,7 @@ signer_revision="$(source_revision BLOOM_SIGNER_SHA)"
   exit 65
 }
 require_compat_value revisions service_runtime_commit '"bc88cc6760b00bbff0c6a6e5f56d42bb03004436"'
-require_compat_value revisions petal_contract_commit '"864a80b407387871bae06aabe77b91865e55f7bc"'
+require_compat_value revisions petal_contract_commit '"9ad7a5c635f092bbcdf8f00a06b23676806ff70c"'
 for state_owner in machine broker signer; do
   require_compat_value "state.$state_owner" current 1
   require_compat_value "state.$state_owner" downgrade_floor 1

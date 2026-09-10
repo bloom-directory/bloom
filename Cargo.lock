@@ -2134,7 +2134,7 @@ dependencies = [
 
 [[package]]
 name = "bloom"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "alloy 2.0.5",
  "anyhow",
@@ -2200,17 +2200,17 @@ dependencies = [
 [[package]]
 name = "bloom-broker-api"
 version = "0.1.0"
-source = "git+https://github.com/bloom-directory/bloom-broker.git?rev=a4711e8446f955a4c0db1b05a2122c091f9873d6#a4711e8446f955a4c0db1b05a2122c091f9873d6"
+source = "git+https://github.com/bloom-directory/bloom-broker.git?rev=cd1e31e9f33c74355bf3e7fa244af12159716064#cd1e31e9f33c74355bf3e7fa244af12159716064"
 dependencies = [
  "bloom-rpc-wire",
  "serde",
  "serde_jcs",
- "sha2 0.10.9",
+ "sha2 0.11.0",
 ]
 
 [[package]]
 name = "bloom-daemon"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "alloy 2.0.5",
  "anyhow",
@@ -2257,7 +2257,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-ens"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "alloy 2.0.5",
  "bloom-evm",
@@ -2272,7 +2272,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-etherscan"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "alloy 2.0.5",
  "async-trait",
@@ -2290,7 +2290,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-evm"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "alloy 2.0.5",
  "bloom-proto",
@@ -2308,7 +2308,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-it"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "alloy 2.0.5",
  "alloy-signer-local 2.0.5",
@@ -2341,7 +2341,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-machine"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "bloom-broker-api",
@@ -2358,7 +2358,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-machine-client"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "async-trait",
  "bloom-audit-checkpoint",
@@ -2381,7 +2381,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-mempool"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "alloy 2.0.5",
  "alloy-signer-local 2.0.5",
@@ -2403,7 +2403,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-mount"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "async-trait",
  "bloom-vfs",
@@ -2420,7 +2420,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-paid-http"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "async-trait",
  "base64",
@@ -2435,7 +2435,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-paid-mpp"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "alloy 2.0.5",
  "async-trait",
@@ -2452,7 +2452,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-paid-x402"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "alloy 2.0.5",
  "async-trait",
@@ -2470,14 +2470,14 @@ dependencies = [
 [[package]]
 name = "bloom-petal-contract"
 version = "0.1.0"
-source = "git+https://github.com/bloom-directory/petal?rev=864a80b407387871bae06aabe77b91865e55f7bc#864a80b407387871bae06aabe77b91865e55f7bc"
+source = "git+https://github.com/bloom-directory/petal?rev=9ad7a5c635f092bbcdf8f00a06b23676806ff70c#9ad7a5c635f092bbcdf8f00a06b23676806ff70c"
 dependencies = [
  "sha2 0.10.9",
 ]
 
 [[package]]
 name = "bloom-petals"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2512,7 +2512,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-prices"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "parking_lot",
  "reqwest 0.12.28",
@@ -2525,7 +2525,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-proto"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "alloy 2.0.5",
  "blake3",
@@ -2547,7 +2547,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-revert"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "alloy 2.0.5",
  "alloy-dyn-abi",
@@ -2569,7 +2569,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-rpc"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "alloy 2.0.5",
  "bloom-proto",
@@ -2586,7 +2586,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-rpc-common"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "parking_lot",
  "serde",
@@ -2632,15 +2632,15 @@ dependencies = [
 [[package]]
 name = "bloom-signer-derive"
 version = "0.1.0"
-source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=7404b62ecac2a9ebd760c8f7b37deb76e1e7eeb8#7404b62ecac2a9ebd760c8f7b37deb76e1e7eeb8"
+source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=9abe7917b8380d8b6d31af0b376a79c26e816764#9abe7917b8380d8b6d31af0b376a79c26e816764"
 dependencies = [
  "bip39",
  "ed25519-dalek",
  "hex",
- "hmac 0.12.1",
+ "hmac 0.13.0",
  "k256",
- "rand 0.8.6",
- "sha2 0.10.9",
+ "rand 0.10.2",
+ "sha2 0.11.0",
  "thiserror 2.0.18",
  "unicode-normalization",
  "zeroize",
@@ -2648,7 +2648,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-solana"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "bloom-proto",
  "bloom-rpc-common",
@@ -2663,7 +2663,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-solana-tx"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "async-trait",
  "base64",
@@ -2692,7 +2692,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-tools"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "alloy 2.0.5",
  "alloy-dyn-abi",
@@ -2734,7 +2734,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-tx"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "alloy 2.0.5",
  "alloy-signer-local 2.0.5",
@@ -2766,7 +2766,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-update"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "parking_lot",
  "reqwest 0.12.28",
@@ -2781,7 +2781,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-vfs"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "alloy 2.0.5",
  "async-trait",
@@ -2830,7 +2830,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-watch"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "alloy 2.0.5",
  "anyhow",
@@ -8698,7 +8698,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.2",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix 1.1.4",
  "windows-sys 0.61.2",
