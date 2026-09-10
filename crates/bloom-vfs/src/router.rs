@@ -14,6 +14,7 @@ use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
 use bloom_proto::audit::{AuditLog, AuditRecord};
@@ -34,15 +35,47 @@ const AUDIT_KIND_READ: &str = "vfs.read";
 /// when it does, plumb it via a request-scoped extension.
 const AUDIT_ACTOR_LOCAL: &str = "local";
 
+/// How many audited effects this router may leave unresolved at once.
+///
+/// The journal fail-closes once too many intents are pending without results
+/// (`MAX_PENDING_MACHINE_EFFECTS` in `bloom_proto::audit`, currently 64), and
+/// other subsystems — Petal network calls, daemon HTTP, outbox reconciliation
+/// — append into the same journal. The router therefore admits effects well
+/// under that ceiling rather than letting an arbitrary burst of concurrent
+/// writes latch the log.
+const MAX_CONCURRENT_AUDITED_EFFECTS: usize = 16;
+
 /// The VFS facade. The daemon constructs one [`Vfs`] and registers a
 /// handler for each top-level segment.
 #[derive(Clone)]
 pub struct Vfs {
     handlers: Arc<BTreeMap<String, Arc<dyn Handler>>>,
     audit: Option<Arc<AuditLog>>,
-    audit_effect_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Serializes correlation-ID allocation with the intent append that
+    /// consumes it. Held for a journal append only — never across handler
+    /// dispatch — so a slow paid-HTTP write cannot stall unrelated mutations.
+    effect_journal_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Excludes every other mutation while [`Vfs::write_then_lookup`] captures
+    /// the identity its write produced. Ordinary writes and side-effecting
+    /// reads take the shared side, so they only wait on an identity capture.
+    identity_capture_lock: Arc<tokio::sync::RwLock<()>>,
+    /// Admission control for unresolved audited effects; see
+    /// [`MAX_CONCURRENT_AUDITED_EFFECTS`].
+    effect_slots: Arc<tokio::sync::Semaphore>,
+    /// Disambiguates correlation IDs. The journal sequence alone does not:
+    /// unsigned journals never advance it, so two concurrent identical writes
+    /// would otherwise share an ID and the duplicate intent would fail closed.
+    effect_nonce: Arc<AtomicU64>,
     cache: Option<Arc<PathCache>>,
     root_dynamic: Arc<BTreeMap<String, Arc<RootContentRenderer>>>,
+}
+
+/// An audited effect that has a durable intent but no result yet. Holding it
+/// keeps the effect's admission slot occupied until [`Vfs::finish_effect`]
+/// records the outcome.
+struct PendingEffect {
+    correlation_id: String,
+    _slot: tokio::sync::OwnedSemaphorePermit,
 }
 
 type RootContentFuture = Pin<Box<dyn Future<Output = Vec<u8>> + Send + 'static>>;
@@ -56,13 +89,7 @@ impl Default for Vfs {
 
 impl Vfs {
     pub fn new() -> Self {
-        Self {
-            handlers: Arc::new(BTreeMap::new()),
-            audit: None,
-            audit_effect_lock: Arc::new(tokio::sync::Mutex::new(())),
-            cache: None,
-            root_dynamic: Arc::new(BTreeMap::new()),
-        }
+        Self::builder().build()
     }
 
     pub fn builder() -> VfsBuilder {
@@ -146,12 +173,18 @@ impl Vfs {
             .map_err(|error| HandlerError::backend(format!("Machine audit unavailable: {error}")))
     }
 
-    fn begin_effect(
+    /// Claim an admission slot, allocate a correlation ID, and publish the
+    /// effect's intent.
+    ///
+    /// The returned [`PendingEffect`] must stay alive until
+    /// [`Vfs::finish_effect`] has recorded the outcome; dropping it frees the
+    /// slot for the next effect.
+    async fn begin_effect(
         &self,
         operation: &str,
         path: &VfsPath,
         payload: &[u8],
-    ) -> Result<Option<String>, HandlerError> {
+    ) -> Result<Option<PendingEffect>, HandlerError> {
         if self.audit.is_none() {
             // Explicit builder-level unit/developer seam. Production Daemon
             // always installs its signed journal.
@@ -166,12 +199,21 @@ impl Vfs {
             )
             .as_bytes(),
         );
+        let slot = Arc::clone(&self.effect_slots)
+            .acquire_owned()
+            .await
+            .map_err(|_| HandlerError::backend("Machine effect admission is closed"))?;
+        // Allocate and publish under one narrow lock so the recorded sequence
+        // is this intent's own journal position. The nonce carries uniqueness
+        // on its own, so the lock never has to be held across dispatch.
+        let _allocation = self.effect_journal_lock.lock().await;
         let sequence = self
             .audit
             .as_ref()
             .map(|audit| audit.sequence() + 1)
             .unwrap_or(0);
-        let correlation_id = format!("{operation_id}:{sequence}");
+        let nonce = self.effect_nonce.fetch_add(1, Ordering::Relaxed);
+        let correlation_id = format!("{operation_id}:{sequence}:{nonce}");
         self.audit_record(
             "machine.effect.intent",
             path,
@@ -183,7 +225,10 @@ impl Vfs {
                 "payload_size": payload.len(),
             }),
         )?;
-        Ok(Some(correlation_id))
+        Ok(Some(PendingEffect {
+            correlation_id,
+            _slot: slot,
+        }))
     }
 
     fn finish_effect(
@@ -235,20 +280,21 @@ impl Vfs {
             .get(head)
             .ok_or_else(|| HandlerError::NotFound(path.to_string_path()))?;
         let rest = path.shift();
-        let correlation = self.begin_effect(AUDIT_KIND_WRITE, path, data)?;
+        let effect = self.begin_effect(AUDIT_KIND_WRITE, path, data).await?;
+        let correlation = effect.as_ref().map(|e| e.correlation_id.as_str());
         let write_result = h.write(&rest, data).await;
         match &write_result {
             Ok(()) => self.finish_effect(
                 AUDIT_KIND_WRITE,
                 path,
-                correlation.as_deref(),
+                correlation,
                 "ok",
                 serde_json::json!({}),
             )?,
             Err(error) => self.finish_effect(
                 AUDIT_KIND_WRITE,
                 path,
-                correlation.as_deref(),
+                correlation,
                 "error",
                 serde_json::json!({"error": error.to_string()}),
             )?,
@@ -268,7 +314,7 @@ impl Vfs {
         data: &[u8],
         projection_path: &VfsPath,
     ) -> Result<Entry, HandlerError> {
-        let _mutation_guard = self.audit_effect_lock.lock().await;
+        let _capture_guard = self.identity_capture_lock.write().await;
         self.write_under_mutation_gate(write_path, data).await?;
         Handler::lookup(self, projection_path).await
     }
@@ -356,23 +402,24 @@ impl Handler for Vfs {
         }
 
         let side_effecting = h.is_read_side_effecting(&rest);
-        let _audit_guard = if side_effecting {
-            Some(self.audit_effect_lock.lock().await)
+        let _capture_guard = if side_effecting {
+            Some(self.identity_capture_lock.read().await)
         } else {
             None
         };
-        let correlation = if side_effecting {
-            self.begin_effect(AUDIT_KIND_READ, path, &[])?
+        let effect = if side_effecting {
+            self.begin_effect(AUDIT_KIND_READ, path, &[]).await?
         } else {
             None
         };
+        let correlation = effect.as_ref().map(|e| e.correlation_id.as_str());
         let read_result = h.read(&rest).await;
         if correlation.is_some() {
             match &read_result {
                 Ok(bytes) => self.finish_effect(
                     AUDIT_KIND_READ,
                     path,
-                    correlation.as_deref(),
+                    correlation,
                     "ok",
                     serde_json::json!({
                         "sha256": bloom_tools::sha256_hex(bytes),
@@ -382,7 +429,7 @@ impl Handler for Vfs {
                 Err(error) => self.finish_effect(
                     AUDIT_KIND_READ,
                     path,
-                    correlation.as_deref(),
+                    correlation,
                     "error",
                     serde_json::json!({"error": error.to_string()}),
                 )?,
@@ -401,7 +448,9 @@ impl Handler for Vfs {
     }
 
     async fn write(&self, path: &VfsPath, data: &[u8]) -> Result<(), HandlerError> {
-        let _mutation_guard = self.audit_effect_lock.lock().await;
+        // Ordinary writes may run concurrently; only write_then_lookup needs
+        // exclusive access while it captures the identity it just produced.
+        let _capture_guard = self.identity_capture_lock.read().await;
         self.write_under_mutation_gate(path, data).await
     }
 
@@ -446,7 +495,6 @@ impl Handler for Vfs {
 pub struct VfsBuilder {
     handlers: BTreeMap<String, Arc<dyn Handler>>,
     audit: Option<Arc<AuditLog>>,
-    audit_effect_lock: Arc<tokio::sync::Mutex<()>>,
     cache: Option<Arc<PathCache>>,
     root_dynamic: BTreeMap<String, Arc<RootContentRenderer>>,
 }
@@ -494,7 +542,10 @@ impl VfsBuilder {
         Vfs {
             handlers: Arc::new(self.handlers),
             audit: self.audit,
-            audit_effect_lock: self.audit_effect_lock,
+            effect_journal_lock: Arc::new(tokio::sync::Mutex::new(())),
+            identity_capture_lock: Arc::new(tokio::sync::RwLock::new(())),
+            effect_slots: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_AUDITED_EFFECTS)),
+            effect_nonce: Arc::new(AtomicU64::new(0)),
             cache: self.cache,
             root_dynamic: Arc::new(self.root_dynamic),
         }
@@ -1047,5 +1098,140 @@ mod tests {
         assert!(log.mutation_degradation().is_none());
         assert!(log.pending_effect_correlations().unwrap().is_empty());
         assert_eq!(log.count().unwrap(), 4);
+    }
+
+    /// A write that parks inside its handler — the shape of a paid-HTTP
+    /// confirm awaiting a merchant round trip — must not hold unrelated
+    /// mutations behind it.
+    #[tokio::test]
+    async fn slow_audited_write_does_not_block_an_unrelated_write() {
+        struct ParkingHandler {
+            entered: Arc<Notify>,
+            release: Arc<Notify>,
+        }
+        #[async_trait]
+        impl Handler for ParkingHandler {
+            async fn lookup(&self, path: &VfsPath) -> Result<Entry, HandlerError> {
+                Ok(Entry::writable_file(path.to_string_path().as_str()))
+            }
+            async fn write(&self, _path: &VfsPath, _data: &[u8]) -> Result<(), HandlerError> {
+                self.entered.notify_one();
+                self.release.notified().await;
+                Ok(())
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let log = Arc::new(AuditLog::open(dir.path().join("audit.jsonl")).unwrap());
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let quick = Arc::new(CountingHandler::new(None));
+        let vfs = Vfs::builder()
+            .mount(
+                "paid",
+                Arc::new(ParkingHandler {
+                    entered: entered.clone(),
+                    release: release.clone(),
+                }),
+            )
+            .mount("quick", quick.clone())
+            .with_audit(log.clone())
+            .build();
+
+        let parked_vfs = vfs.clone();
+        let parked = tokio::spawn(async move {
+            parked_vfs
+                .write(&VfsPath::parse("/paid/confirm").unwrap(), b"pay")
+                .await
+        });
+        entered.notified().await;
+
+        // The parked write still holds an unresolved effect here. An
+        // unrelated write must complete anyway.
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            vfs.write(&VfsPath::parse("/quick/x").unwrap(), b"unrelated"),
+        )
+        .await
+        .expect("unrelated write must not wait on the parked paid write")
+        .unwrap();
+        assert_eq!(quick.writes.load(Ordering::SeqCst), 1);
+
+        release.notify_one();
+        parked.await.unwrap().unwrap();
+        assert!(log.mutation_degradation().is_none());
+        assert!(log.pending_effect_correlations().unwrap().is_empty());
+    }
+
+    /// Concurrent *identical* writes share an operation ID, so their
+    /// correlation IDs must still differ — a duplicate pending intent is an
+    /// invalid transition that latches the journal for every later mutation.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_identical_writes_get_distinct_correlation_ids() {
+        /// Overlaps every write between its intent and its result.
+        struct BarrierHandler {
+            barrier: tokio::sync::Barrier,
+        }
+        #[async_trait]
+        impl Handler for BarrierHandler {
+            async fn lookup(&self, path: &VfsPath) -> Result<Entry, HandlerError> {
+                Ok(Entry::writable_file(path.to_string_path().as_str()))
+            }
+            async fn write(&self, _path: &VfsPath, _data: &[u8]) -> Result<(), HandlerError> {
+                self.barrier.wait().await;
+                Ok(())
+            }
+        }
+
+        // Stay inside the router's admission bound; otherwise the barrier
+        // could never be reached by every writer at once.
+        const WRITERS: usize = 8;
+        const _: () = assert!(WRITERS <= MAX_CONCURRENT_AUDITED_EFFECTS);
+
+        let dir = tempfile::tempdir().unwrap();
+        let log = Arc::new(AuditLog::open(dir.path().join("audit.jsonl")).unwrap());
+        let vfs = Vfs::builder()
+            .mount(
+                "k",
+                Arc::new(BarrierHandler {
+                    barrier: tokio::sync::Barrier::new(WRITERS),
+                }),
+            )
+            .with_audit(log.clone())
+            .build();
+
+        let mut writes = Vec::new();
+        for _ in 0..WRITERS {
+            let vfs = vfs.clone();
+            writes.push(tokio::spawn(async move {
+                // Identical path and identical bytes on every writer.
+                vfs.write(&VfsPath::parse("/k/x").unwrap(), b"same").await
+            }));
+        }
+        for write in writes {
+            write
+                .await
+                .unwrap()
+                .expect("every identical write succeeds");
+        }
+
+        assert!(
+            log.mutation_degradation().is_none(),
+            "concurrent identical writes must not latch the journal"
+        );
+        assert!(log.pending_effect_correlations().unwrap().is_empty());
+        let records = log.tail(WRITERS * 2).unwrap();
+        let intents: Vec<&str> = records
+            .iter()
+            .filter(|r| r.kind == "machine.effect.intent")
+            .map(|r| r.data["details"]["correlation_id"].as_str().unwrap())
+            .collect();
+        assert_eq!(intents.len(), WRITERS);
+        let distinct: std::collections::BTreeSet<&str> = intents.iter().copied().collect();
+        assert_eq!(
+            distinct.len(),
+            WRITERS,
+            "correlation IDs collided: {intents:?}"
+        );
     }
 }

@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use url::Url;
 
 use crate::BrokerExactPayloadSigner;
@@ -41,6 +41,27 @@ use crate::path::VfsPath;
 const APPROVAL_CHALLENGE_FILE: &str = "approval_challenge.json";
 const PAID_HTTP_X402_SIGN_INTENT: &str = "x402.sign";
 const PAID_HTTP_MPP_SIGN_INTENT: &str = "paid-http.mpp.sign";
+
+/// Upper bound on a single paid-HTTP round trip — the merchant probe, the
+/// payment backend's RPC, and the credentialed retry all use it.
+///
+/// These calls run inside the router's audited effect window, so an
+/// unresponsive merchant would otherwise hold an unresolved effect open with
+/// no ceiling.
+const PAID_HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The one place paid-HTTP clients are built, so every request this handler
+/// makes is bounded by [`PAID_HTTP_REQUEST_TIMEOUT`].
+fn paid_http_client() -> reqwest::Client {
+    paid_http_client_with_timeout(PAID_HTTP_REQUEST_TIMEOUT)
+}
+
+fn paid_http_client_with_timeout(timeout: Duration) -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(timeout)
+        .build()
+        .expect("paid http client builder")
+}
 
 #[cfg(test)]
 struct VenueLocalTestOperationIndex;
@@ -81,7 +102,7 @@ impl RequestsHandler {
             operation_index: Arc::new(FileOperationIndex::new(root.join("operations/index.json"))),
             root,
             default_wallet,
-            client: reqwest::Client::new(),
+            client: paid_http_client(),
             x402_signer: Arc::new(HostX402PaymentSigner::new()),
             paid_http_rpc_resolver: Arc::new(EmptyPaidHttpChainRpcResolver),
             wallet_projections: Some(wallet_projections),
@@ -1411,7 +1432,7 @@ async fn confirm_with_backend(
         .map_err(HandlerError::backend)?;
     write_minted_marker(&pending, id, &execution.credential_metadata)?;
     let retry = retry_paid_request(
-        &reqwest::Client::new(),
+        &paid_http_client(),
         &request,
         execution.header_name,
         &execution.header_value,
@@ -2155,6 +2176,35 @@ fn paid_http_sealed_subject(input: PaidHttpAuthSubject<'_>) -> PaidHttpSealedSub
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Paid requests run inside the router's audited effect window, so an
+    /// unresponsive merchant must be ended by the client, not waited on.
+    #[tokio::test]
+    async fn paid_http_client_is_bounded_by_its_timeout() {
+        // Accept connections and never answer them; only a client-side
+        // deadline can complete this request.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _silent_merchant = tokio::spawn(async move {
+            let mut accepted = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                accepted.push(stream);
+            }
+        });
+
+        let error = paid_http_client_with_timeout(Duration::from_millis(250))
+            .get(format!("http://{addr}/paid"))
+            .send()
+            .await
+            .expect_err("an unresponsive merchant must not hang the request");
+        assert!(error.is_timeout(), "expected a timeout, got {error}");
+
+        assert!(
+            PAID_HTTP_REQUEST_TIMEOUT > Duration::ZERO
+                && PAID_HTTP_REQUEST_TIMEOUT <= Duration::from_secs(60),
+            "the production paid-HTTP bound must stay a real ceiling"
+        );
+    }
 
     fn handler() -> (tempfile::TempDir, RequestsHandler) {
         let tmp = tempfile::tempdir().unwrap();
