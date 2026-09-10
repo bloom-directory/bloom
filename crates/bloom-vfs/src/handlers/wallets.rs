@@ -637,6 +637,9 @@ impl WalletsHandler {
                     browser_output_recipient_key: None,
                     petal_key_scope: None,
                     legacy_passkey_migration: None,
+                    wallet_seed_profile: None,
+                    derivation_request: None,
+                    account_terms: None,
                 },
             )
             .await
@@ -3634,7 +3637,7 @@ mod tests {
             wallet: WalletPublic {
                 wallet_id: wallet_id.clone(),
                 wallet_kind: token("local"),
-                root_key_ref: key_ref.clone(),
+                root_key_ref: Some(key_ref.clone()),
                 key_refs: vec![key_ref.clone()],
                 policy_version: DecimalU64::new(1),
                 policy_digest: policy_digest.clone(),
@@ -4578,6 +4581,8 @@ mod tests {
             .with_broker(Some(MachineBrokerClient::new(broker.clone())));
         let request = ApprovalPrepareRequest {
             evm_review_payloads: Vec::new(),
+            petal_use_claim: None,
+            system_use_claim: None,
             operation_id: OperationId::from_bytes([30; 32]),
             terms: approval_terms("alice", None),
             canonical_plan_facts_digest: digest(31),
@@ -4623,6 +4628,8 @@ mod tests {
                 .with_broker(Some(MachineBrokerClient::new(broker.clone())));
             let request = ApprovalPrepareRequest {
                 evm_review_payloads: Vec::new(),
+                petal_use_claim: None,
+                system_use_claim: None,
                 operation_id: OperationId::from_bytes([30; 32]),
                 terms: approval_terms("alice", None),
                 canonical_plan_facts_digest: digest(31),
@@ -4653,6 +4660,8 @@ mod tests {
             .with_broker(Some(MachineBrokerClient::new(broker.clone())));
         let request = ApprovalPrepareRequest {
             evm_review_payloads: Vec::new(),
+            petal_use_claim: None,
+            system_use_claim: None,
             operation_id: OperationId::from_bytes([30; 32]),
             terms: approval_terms("alice", None),
             canonical_plan_facts_digest: digest(31),
@@ -4682,6 +4691,8 @@ mod tests {
             .with_broker(Some(MachineBrokerClient::new(broker)));
         let request = ApprovalPrepareRequest {
             evm_review_payloads: Vec::new(),
+            petal_use_claim: None,
+            system_use_claim: None,
             operation_id: OperationId::from_bytes([30; 32]),
             terms: approval_terms("alice", None),
             canonical_plan_facts_digest: digest(31),

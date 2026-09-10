@@ -85,7 +85,8 @@ require_staged_architecture() {
           die "$binary is not an x86-64 ELF release binary"
         ;;
       macos)
-        [[ "$description" == *"Mach-O 64-bit executable arm64"* ]] ||
+        [[ "$description" == *"Mach-O 64-bit executable arm64"* ||
+          "$description" == *"Mach-O 64-bit arm64 executable"* ]] ||
           die "$binary is not an arm64 Mach-O release binary"
         ;;
     esac

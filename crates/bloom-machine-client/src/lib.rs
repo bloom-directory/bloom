@@ -689,6 +689,7 @@ impl MachineBrokerClient {
                 payload: Base64UrlBytes::from_bytes(&request.preimage),
             },
             petal_use_claim,
+            system_use_claim: None,
             claim_assurance_evidence,
             provenance: request.trusted_provenance,
         })
@@ -793,6 +794,7 @@ impl MachineBrokerClient {
                         payload: Base64UrlBytes::from_bytes(&request.preimage),
                     },
                     petal_use_claim: request.petal_use_claim,
+                    system_use_claim: None,
                     claim_assurance_evidence: request
                         .claim_assurance_evidence
                         .as_deref()
@@ -837,6 +839,8 @@ impl MachineBrokerClient {
             } else {
                 Vec::new()
             },
+            petal_use_claim: None,
+            system_use_claim: None,
             operation_id: request.approval_operation_id,
             terms,
             canonical_plan_facts_digest: request.canonical_plan_facts_digest,
@@ -956,6 +960,7 @@ impl MachineBrokerClient {
                             .collect(),
                     },
                     petal_use_claim: request.petal_use_claim,
+                    system_use_claim: None,
                     claim_assurance_evidence: request
                         .claim_assurance_evidence
                         .as_deref()
@@ -1010,6 +1015,8 @@ impl MachineBrokerClient {
             } else {
                 Vec::new()
             },
+            petal_use_claim: None,
+            system_use_claim: None,
             operation_id: request.approval_operation_id,
             terms,
             canonical_plan_facts_digest: request.canonical_plan_facts_digest,
@@ -1108,6 +1115,7 @@ impl MachineBrokerClient {
                             .collect(),
                     },
                     petal_use_claim: Some(claim.clone()),
+                    system_use_claim: None,
                     claim_assurance_evidence: request
                         .claim_assurance_evidence
                         .as_deref()
@@ -1158,6 +1166,8 @@ impl MachineBrokerClient {
         terms.validate()?;
         self.prepare_approval(ApprovalPrepareRequest {
             evm_review_payloads: Vec::new(),
+            petal_use_claim: None,
+            system_use_claim: None,
             operation_id: request.approval_operation_id,
             terms,
             canonical_plan_facts_digest: request.canonical_plan_facts_digest,
@@ -1438,7 +1448,12 @@ impl MachineBrokerClient {
         wallet: &WalletPublic,
         suite: CryptoSuite,
     ) -> Result<KeyRef, ProtocolError> {
-        let root = wallet.root_key_ref.clone();
+        let root = wallet.root_key_ref.clone().ok_or_else(|| {
+            ProtocolError::new(
+                ProtocolErrorCode::KeyrefMismatch,
+                "wallet has no signable root key reference",
+            )
+        })?;
         if !wallet.key_refs.contains(&root) {
             return Err(ProtocolError::new(
                 ProtocolErrorCode::KeyrefMismatch,
@@ -2934,7 +2949,7 @@ mod tests {
             wallet: WalletPublic {
                 wallet_id: token("wallet"),
                 wallet_kind: token("local"),
-                root_key_ref: key_ref.clone(),
+                root_key_ref: Some(key_ref.clone()),
                 key_refs: vec![key_ref.clone()],
                 policy_version: DecimalU64::new(7),
                 policy_digest: digest(7),
@@ -3003,7 +3018,7 @@ mod tests {
             wallet: WalletPublic {
                 wallet_id: token("wallet"),
                 wallet_kind: token("local"),
-                root_key_ref: root_key_ref.clone(),
+                root_key_ref: Some(root_key_ref.clone()),
                 key_refs: vec![root_key_ref],
                 policy_version: DecimalU64::new(7),
                 policy_digest: digest(7),
@@ -3207,7 +3222,7 @@ mod tests {
             wallet: WalletPublic {
                 wallet_id: token("wallet"),
                 wallet_kind: token("local"),
-                root_key_ref: root_key_ref.clone(),
+                root_key_ref: Some(root_key_ref.clone()),
                 key_refs: vec![derived_key_ref, root_key_ref.clone()],
                 policy_version: DecimalU64::new(7),
                 policy_digest: digest(7),
@@ -3274,7 +3289,7 @@ mod tests {
             wallet: WalletPublic {
                 wallet_id: token("wallet"),
                 wallet_kind: token("local"),
-                root_key_ref: key_ref(),
+                root_key_ref: Some(key_ref()),
                 key_refs: vec![key_ref()],
                 policy_version: DecimalU64::new(7),
                 policy_digest: digest(7),
@@ -3319,7 +3334,7 @@ mod tests {
             wallet: WalletPublic {
                 wallet_id: token("wallet"),
                 wallet_kind: token("local"),
-                root_key_ref: key_ref(),
+                root_key_ref: Some(key_ref()),
                 key_refs: vec![key_ref()],
                 policy_version: DecimalU64::new(7),
                 policy_digest: digest(7),
@@ -3400,7 +3415,7 @@ mod tests {
             wallet: WalletPublic {
                 wallet_id: token("wallet"),
                 wallet_kind: token("local"),
-                root_key_ref: key_ref(),
+                root_key_ref: Some(key_ref()),
                 key_refs: vec![key_ref()],
                 policy_version: DecimalU64::new(1),
                 policy_digest: digest(1),
@@ -3425,7 +3440,7 @@ mod tests {
             wallet: WalletPublic {
                 wallet_id: token("wallet"),
                 wallet_kind: token("local"),
-                root_key_ref: key_ref(),
+                root_key_ref: Some(key_ref()),
                 key_refs: vec![key_ref()],
                 policy_version: DecimalU64::new(1),
                 policy_digest: digest(1),
@@ -3450,7 +3465,7 @@ mod tests {
             wallet: WalletPublic {
                 wallet_id: token("wallet"),
                 wallet_kind: token("local"),
-                root_key_ref: key_ref(),
+                root_key_ref: Some(key_ref()),
                 key_refs: vec![key_ref()],
                 policy_version: DecimalU64::new(1),
                 policy_digest: digest(1),
@@ -3601,7 +3616,7 @@ mod tests {
             wallet: WalletPublic {
                 wallet_id: token("wallet"),
                 wallet_kind: token("local"),
-                root_key_ref: key_ref(),
+                root_key_ref: Some(key_ref()),
                 key_refs: vec![key_ref()],
                 policy_version: DecimalU64::new(1),
                 policy_digest: digest(1),
@@ -3640,7 +3655,7 @@ mod tests {
             wallet: WalletPublic {
                 wallet_id: token("wallet"),
                 wallet_kind: token("local"),
-                root_key_ref: key_ref(),
+                root_key_ref: Some(key_ref()),
                 key_refs: vec![key_ref()],
                 policy_version: DecimalU64::new(1),
                 policy_digest: digest(1),
@@ -3673,7 +3688,7 @@ mod tests {
             wallet: WalletPublic {
                 wallet_id: token("wallet"),
                 wallet_kind: token("local"),
-                root_key_ref: key_ref(),
+                root_key_ref: Some(key_ref()),
                 key_refs: vec![key_ref()],
                 policy_version: DecimalU64::new(1),
                 policy_digest: digest(1),
@@ -3726,7 +3741,7 @@ mod tests {
             wallet: WalletPublic {
                 wallet_id: token("wallet"),
                 wallet_kind: token("local"),
-                root_key_ref: key_ref(),
+                root_key_ref: Some(key_ref()),
                 key_refs: vec![key_ref()],
                 policy_version: DecimalU64::new(2),
                 policy_digest: digest(82),
@@ -3739,6 +3754,8 @@ mod tests {
 
         let approval = ApprovalPrepareRequest {
             evm_review_payloads: Vec::new(),
+            petal_use_claim: None,
+            system_use_claim: None,
             operation_id: OperationId::from_bytes([94; 32]),
             terms: approval_terms("wallet", None),
             canonical_plan_facts_digest: digest(95),
@@ -3788,6 +3805,9 @@ mod tests {
             browser_output_recipient_key: None,
             petal_key_scope: None,
             legacy_passkey_migration: None,
+            wallet_seed_profile: None,
+            derivation_request: None,
+            account_terms: None,
         };
         assert_eq!(
             client
@@ -3842,7 +3862,7 @@ mod tests {
             wallet: WalletPublic {
                 wallet_id: token("wallet"),
                 wallet_kind: token("local"),
-                root_key_ref: key_ref(),
+                root_key_ref: Some(key_ref()),
                 key_refs: vec![key_ref()],
                 policy_version: DecimalU64::new(2),
                 policy_digest: digest(82),

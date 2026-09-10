@@ -2,7 +2,7 @@
 
 `compatibility-v1.toml` is the closed v1 service matrix. It declares each edge
 independently: the Machine–Broker and Broker–Signer authority APIs require
-exactly 1.3, while Signer control and login-session liveness accept 1.0–1.1.
+exactly 1.4, while Signer control and login-session liveness accept 1.0–1.1.
 Service packages may advance independently when every edge remains inside its
 declared range; incompatible edges fail closed.
 It also records the reviewed Broker, Signer, service-runtime, and
@@ -145,12 +145,13 @@ installed executable, unit, account template, and configuration template is
 read from that verified snapshot. The public key is data, not another time
 service or software package.
 
-Linux binaries are shared by all enrolled logins, so an install first requires
-every active or retained enrollment and both service configurations to name the
-candidate release digest. Digest-distinct reinstall and restore are rejected
-before services stop or files change; a future Linux release upgrade requires a
-separate coordinated host-wide transaction. Retained records preserve the exact
-release digest and allocated NFS port.
+Linux binaries are shared by all enrolled logins. Digest-distinct installs use
+an immutable release directory and a coordinated host-wide transaction: stop
+all active enrollments, atomically switch `current`, update the release digest
+in active and retained configuration, and validate active services before
+committing. Active enrollments require available user session buses. Failed
+activation and interrupted transactions restore the previous release. Custody,
+identity material, and allocated NFS ports are preserved.
 
 Linux installs provide `bloom-uninstall`. Its default `--retain-custody` mode
 stops and disables the selected enrollment, removes runtime integration, and
@@ -215,9 +216,10 @@ The Linux AWS KMS profile requires credentials and a non-wildcard reviewed
 CIDR allowlist together; reinstall without that pair removes any prior
 instance credential and egress drop-in.
 
-The root-requiring macOS Unix-principal templates remain conformance inputs,
-not a production platform claim. A release may claim
-`macos-unix-principals` only after the disposable W0 lane proves the effective
+The root-requiring macOS Unix-principal templates implement the production
+`macos-unix-principals` profile. The optional disposable W0 lane exercises its
 UID/group, filesystem, launchd, listener, network, lifecycle, and rollback
-boundaries and a digest-bound conformance report is included. The rootless
+boundaries; a digest-bound conformance report is supplementary evidence, not a
+required release asset. Machine and session jobs run in the `user/UID` launchd
+domain, while Broker and Signer jobs run in the system domain. The rootless
 code-identity architecture remains a separate future profile.
