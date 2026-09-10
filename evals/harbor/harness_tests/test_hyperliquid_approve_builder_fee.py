@@ -221,8 +221,89 @@ class HyperliquidApproveBuilderFeeDefinitionTests(BuilderFeeFixture, unittest.Te
             self.definition.preauthorization_preflight()
 
 
+class FakeVenue:
+    """Models the parts of the Petal/Broker contract cleanup depends on.
+
+    Specifically: an owner approval covers one exact request body, is
+    single-use (`max_operations: 1`), and only a write covered by a live
+    approval reaches the venue. An uncovered write stages a fresh ceremony
+    instead of doing anything, which is what makes the retry after the
+    ceremony -- not the first write -- the one that moves maxBuilderFee.
+    """
+
+    CEREMONY = "http://localhost:18734/ceremony/" + "C" * 43
+
+    def __init__(self, definition: HyperliquidApproveBuilderFeeEval) -> None:
+        self.definition = definition
+        self.max_builder_fee = 0
+        # request_id -> {"body": bytes, "status": str}
+        self.requests: dict[str, dict[str, object]] = {}
+        self._next_id = 0
+
+    def stage_approval(self, body: bytes, status: str = "approved_retry_required") -> str:
+        self._next_id += 1
+        request_id = f"{self._next_id:064x}"
+        self.requests[request_id] = {"body": body, "status": status}
+        return request_id
+
+    def write(self, _route: object, body: bytes, _timeout: object) -> object:
+        """Consume a live approval for these exact bytes, or stage one."""
+        for entry in self.requests.values():
+            if entry["body"] == body and entry["status"] == "approved_retry_required":
+                entry["status"] = "signed"
+                self.max_builder_fee = json.loads(body)["max_fee_tenths_bps"]
+                return subprocess.CompletedProcess([], 0, b"", b"")
+        # No live approval: the venue is untouched. A body never approved
+        # stages a new ceremony; a replay of an already-consumed request
+        # stages nothing it can complete on its own either -- both leave
+        # maxBuilderFee alone, which is the property under test.
+        if not any(entry["body"] == body for entry in self.requests.values()):
+            self.stage_approval(body, "awaiting_owner_approval")
+            return subprocess.CompletedProcess([], 0, self.CEREMONY.encode(), b"")
+        return subprocess.CompletedProcess([], 0, b"", b"rejected: no live approval")
+
+    def complete_ceremony(self, command: list[str], **_kwargs: object) -> object:
+        """Stand in for the WebAuthn debug driver."""
+        for entry in self.requests.values():
+            if entry["status"] == "awaiting_owner_approval":
+                entry["status"] = "approved_retry_required"
+        return subprocess.CompletedProcess(command, 0, b"", b"")
+
+    def records(self) -> list[dict[str, object]]:
+        return [
+            {"request_id": rid, "status": entry["status"]}
+            for rid, entry in self.requests.items()
+        ]
+
+    def pending_ceremony(self) -> str | None:
+        awaiting = any(
+            entry["status"] == "awaiting_owner_approval"
+            for entry in self.requests.values()
+        )
+        return self.CEREMONY if awaiting else None
+
+    def install(self, test: unittest.TestCase) -> None:
+        d = self.definition
+        d._write_route = mock.Mock(side_effect=self.write)
+        d._builder_fee_requests = mock.Mock(side_effect=self.records)
+        d._pending_builder_fee_ceremony = mock.Mock(side_effect=self.pending_ceremony)
+        d._observed_max_builder_fee = mock.Mock(
+            side_effect=lambda: self.max_builder_fee
+        )
+        d._read_json = mock.Mock(return_value={"status": "ok"})
+        patcher = mock.patch.object(
+            subprocess, "run", side_effect=self.complete_ceremony
+        )
+        patcher.start()
+        test.addCleanup(patcher.stop)
+
+
 class BuilderFeeCeremonyLifecycleTests(BuilderFeeFixture, unittest.TestCase):
     """The grant/revoke lifecycle around WebAuthn counters and cleanup."""
+
+    def venue(self) -> "FakeVenue":
+        """A Petal/venue stand-in that honours single-use approvals."""
+        return FakeVenue(self.definition)
 
     def drive(
         self, *, statuses: list[str] | None = None
@@ -240,9 +321,15 @@ class BuilderFeeCeremonyLifecycleTests(BuilderFeeFixture, unittest.TestCase):
         )
         definition._pending_builder_fee_ceremony = mock.Mock(return_value=ceremony)
         pending = list(statuses or ["approved_retry_required"])
-        definition._builder_fee_request_status = mock.Mock(
-            side_effect=lambda: pending.pop(0) if pending else "signed"
-        )
+        # One staged request, whose status walks `statuses` and then settles
+        # on "signed" -- the state a grant the agent consumed ends in.
+        request_id = "b" * 64
+
+        def requests() -> list[dict[str, object]]:
+            status = pending.pop(0) if pending else "signed"
+            return [{"request_id": request_id, "status": status}]
+
+        definition._builder_fee_requests = mock.Mock(side_effect=requests)
 
         def run(command: list[str], **_kwargs: object) -> object:
             counters.append(int(command[command.index("--sign-count") + 1]))
@@ -308,6 +395,42 @@ class BuilderFeeCeremonyLifecycleTests(BuilderFeeFixture, unittest.TestCase):
         definition, counters = self.drive()
         definition.cleanup()
         self.assertEqual(counters, [])
+
+    def test_cleanup_retires_a_grant_the_agent_never_submitted(self) -> None:
+        """An abandoned staged grant must not survive cleanup.
+
+        Revoking under a different nonce leaves the original approved request
+        executable, so a later replay could restore the fee after cleanup
+        observed zero.
+        """
+        definition = self.definition
+        venue = self.venue()
+        venue.install(self)
+
+        # Stage the grant exactly as provision() does, then leave it: the
+        # agent never performs the write that would consume it.
+        max_fee = int(definition.max_fee_tenths_bps_value)
+        definition.nonce = 4242
+        grant_body = definition._request_body(max_fee, definition.nonce)
+        definition.staged_request_id = venue.stage_approval(grant_body)
+        definition.cleanup_needed = True
+        self.assertEqual(venue.max_builder_fee, 0, "agent never submitted")
+
+        definition.cleanup()
+
+        # The staged grant is spent, not merely outnumbered.
+        self.assertEqual(
+            definition._request_status(definition.staged_request_id), "signed"
+        )
+        self.assertEqual(venue.max_builder_fee, 0, "venue ends revoked")
+
+        # Replaying the original approved bytes must not restore the fee.
+        venue.write(None, grant_body, None)
+        self.assertEqual(
+            venue.max_builder_fee,
+            0,
+            "a consumed single-use approval cannot be replayed to re-grant",
+        )
 
 
 if __name__ == "__main__":

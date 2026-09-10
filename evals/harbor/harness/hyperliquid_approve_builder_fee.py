@@ -130,6 +130,9 @@ class HyperliquidApproveBuilderFeeEval(EvalDefinition):
         # an approval can be live even when a later read or poll fails, and
         # an unrevoked approval is the worse failure.
         self.cleanup_needed = False
+        # The staged grant's request id, so cleanup can tell "the agent
+        # consumed it" from "it is still an executable approval".
+        self.staged_request_id: str | None = None
         self.counter_committed = counter_committed
         self.phase_timings: dict[str, float] = {}
 
@@ -283,18 +286,33 @@ class HyperliquidApproveBuilderFeeEval(EvalDefinition):
             )
         return matches[0] if matches else None
 
-    def _builder_fee_request_status(self) -> str | None:
-        """The single staged request's status, or None when none is staged."""
-        statuses = [
-            record.get("status")
+    def _request_status(self, request_id: str) -> str | None:
+        """One specific request's status, or None when it is not listed.
+
+        Scoped by request id rather than by wallet: completed requests stay
+        listed, so a run that stages a grant and later a revoke legitimately
+        sees several records for the same wallet and class.
+        """
+        for record in self._builder_fee_requests():
+            if record.get("request_id") == request_id:
+                status = record.get("status")
+                return status if isinstance(status, str) else None
+        return None
+
+    def _newly_staged_request_id(self) -> str | None:
+        """The id of the one request now approved and awaiting its write."""
+        staged = [
+            record.get("request_id")
             for record in self._builder_fee_requests()
-            if isinstance(record.get("status"), str)
+            if record.get("status") == "approved_retry_required"
+            and isinstance(record.get("request_id"), str)
         ]
-        if len(statuses) > 1:
+        if len(staged) > 1:
             raise EvalError(
-                "multiple approve_builder_fee signing requests match the exact wallet"
+                "multiple approve_builder_fee approvals are staged for this wallet; "
+                "resolve them before running an eval"
             )
-        return statuses[0] if statuses else None
+        return staged[0] if staged else None
 
     def _require_local_json(self, path: Path, label: str) -> Any:
         try:
@@ -671,12 +689,11 @@ class HyperliquidApproveBuilderFeeEval(EvalDefinition):
         self.cleanup_needed = True
         counter = self.sign_count or self._require_sign_count()
         counter, output = self._drive_action(route, body, counter, submit=False)
-        status = self._builder_fee_request_status()
-        if status != "approved_retry_required":
+        self.staged_request_id = self._newly_staged_request_id()
+        if self.staged_request_id is None:
             raise EvalError(
                 "approve_builder_fee approval was not staged for the agent to "
-                f"consume (request status {status!r}): "
-                + self._redact_ceremony_urls(output)
+                "consume: " + self._redact_ceremony_urls(output)
             )
 
     def _grant_or_revoke(self, max_fee_tenths_bps: int, nonce: int) -> dict[str, Any]:
@@ -783,9 +800,52 @@ class HyperliquidApproveBuilderFeeEval(EvalDefinition):
             verifier_env=runtime_env,
         )
 
+    def _retire_unconsumed_grant(self) -> None:
+        """Spend a staged grant the agent never submitted.
+
+        The staged approval is a durable, owner-approved, exact-payload
+        write. Revoking with a *different* nonce does not touch it: the
+        original request stays executable, so anyone who can replay those
+        exact bytes could raise the builder fee again after cleanup has
+        observed zero, and cleanup's postcondition would not be durable.
+
+        There is no cancel on the owner-visible signing-request surface, and
+        the eval may not reach for Machine RPC, so the approval is retired by
+        consuming it. It carries `max_operations: 1` / `max_signatures: 1`,
+        so submitting it once spends it for good. The revoke that follows
+        returns the venue to zero.
+        """
+        if self.staged_request_id is None:
+            return
+        if self._request_status(self.staged_request_id) != "approved_retry_required":
+            return
+        route = self.exchange_root / "approve_builder_fee.json"
+        body = self._request_body(int(self.max_fee_tenths_bps_value), self.nonce)
+        self._write_route(route, body, WRITE_TIMEOUT_SECONDS)
+        for attempt in range(VENUE_SETTLE_ATTEMPTS):
+            if self._request_status(self.staged_request_id) != "approved_retry_required":
+                return
+            if attempt + 1 < VENUE_SETTLE_ATTEMPTS:
+                time.sleep(VENUE_SETTLE_DELAY_SECONDS)
+        raise EvalError(
+            "staged approve_builder_fee approval is still unconsumed after "
+            "cleanup tried to spend it; it remains an executable grant for "
+            f"builder {self.builder} and must be resolved before another run"
+        )
+
     def cleanup(self) -> None:
         if not self.cleanup_needed or self.nonce is None:
             return
+        # Retire an unconsumed grant first, then revoke. Doing it in this
+        # order means the venue ends at zero even though spending the grant
+        # briefly applies it.
+        retire_error: EvalError | None = None
+        try:
+            self._retire_unconsumed_grant()
+        except EvalError as error:
+            # Still revoke: a live approval plus a nonzero venue fee is
+            # strictly worse than a live approval alone.
+            retire_error = error
         # Unconditional once staging began. The approval may have been
         # consumed by the agent's write, or by an ambiguous outcome this
         # process never observed, so reconcile by revoking rather than by
@@ -797,3 +857,5 @@ class HyperliquidApproveBuilderFeeEval(EvalDefinition):
         # replay of the grant.
         revoke_nonce = self.nonce + 1
         self._grant_or_revoke(0, revoke_nonce)
+        if retire_error is not None:
+            raise retire_error
