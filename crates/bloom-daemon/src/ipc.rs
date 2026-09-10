@@ -19,7 +19,7 @@
 //! | `petals.install` | remote source or package transport | package metadata          |
 //! | `petals.build` | `{ "package_dir", "out"? }`           | package metadata       |
 //! | `petals.list` | `null`                              | `[ package, ... ]`        |
-//! | `petals.uninstall` | `{ "hash" }`                   | `{ "removed" }`          |
+//! | `petals.uninstall` | `{ "hash", "force"? }`         | `{ "removed" }`          |
 //! | `machine.execute` | tagged [`MachineCommand`]        | [`MachineCommandOutput`] |
 //! | `shutdown` | `null`                                | `null`                    |
 //!
@@ -1533,15 +1533,44 @@ impl IpcServer {
 
     async fn do_petals_uninstall(&self, params: &Value) -> Result<Value, PetalError> {
         let runner = self.petals()?.clone();
-        let hash = params
-            .get("hash")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| PetalError::vm("missing 'hash'"))?;
-        let hash = hash.to_owned();
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct UninstallRequest {
+            hash: String,
+            #[serde(default)]
+            force: bool,
+        }
+        let request: UninstallRequest =
+            serde_json::from_value(params.clone()).map_err(|error| {
+                PetalError::vm(format!("invalid petals.uninstall request: {error}"))
+            })?;
+        let active_sessions = self.active_session_slots.clone();
         let mutation = self.petal_mutation.clone().lock_owned().await;
         tokio::task::spawn_blocking(move || {
             let _mutation = mutation;
-            let removed = runner.uninstall(&hash)?;
+            // Removing a package strands the sessions scoped to it exactly as
+            // replacing it does: the delegated keys stay approved while no
+            // installed code matches their scope. Resolve the outgoing hash
+            // under the same lock that removes it, so the guard cannot race a
+            // concurrent install, and refuse unless the caller forces it. A
+            // forced removal is still recoverable: the session keeps
+            // rendering (`package_replaced`) and its `stop` still revokes.
+            if !request.force
+                && let Some(active_sessions) = &active_sessions
+                && let Some(outgoing) = runner.resolve_uninstall_hash(&request.hash)?
+            {
+                let stranded = active_sessions(&outgoing);
+                if !stranded.is_empty() {
+                    return Err(PetalError::vm(format!(
+                        "refusing to uninstall petal '{}' while its sessions are still \
+                         active: {}. Stop them \
+                         (wallets/<w>/<n>/sessions/<petal>/<slot>/stop) or uninstall with force",
+                        request.hash,
+                        stranded.join(", ")
+                    )));
+                }
+            }
+            let removed = runner.uninstall(&request.hash)?;
             Ok(json!({ "removed": removed }))
         })
         .await
@@ -3238,6 +3267,111 @@ summary = "Demo app used by IPC tests."
             .await
             .unwrap_err();
         assert!(bad.to_string().contains("invalid petals.install"), "{bad}");
+    }
+
+    /// Uninstall strands a scoped session exactly as replacement does, so it
+    /// carries the same guard. The install path's coverage does not prove
+    /// this one: `petals.uninstall` reaches the runner by its own route.
+    #[tokio::test]
+    async fn petals_uninstall_refuses_to_strand_active_sessions_until_forced() {
+        let dir = tempfile::tempdir().unwrap();
+        let package = dir.path().join("demo");
+        write_demo_petal_package(&package);
+
+        let store = bloom_petals::PetalStore::open(dir.path().join("store")).unwrap();
+        let registry =
+            Arc::new(bloom_petals::NameRegistry::open(dir.path().join("registry")).unwrap());
+        let runner = PetalRunner::new(
+            store.clone(),
+            registry,
+            bloom_petals::PetalVm::new().unwrap(),
+        );
+        let (installed, _, _) = store.install_petal_package_dir(&package).unwrap();
+        let outgoing = installed.hash.clone();
+        let outgoing_for_guard = outgoing.clone();
+        let slots: ActiveSessionSlots = Arc::new(move |hash| {
+            if hash == outgoing_for_guard {
+                vec!["wallets/minnow/1/sessions/demo/desk-a".to_owned()]
+            } else {
+                Vec::new()
+            }
+        });
+        let server = IpcServer::new(vfs(), "0", vec![])
+            .with_petals(runner.clone())
+            .with_active_session_slots(Some(slots));
+
+        // Refused by name, and the refusal names the mounted slot.
+        let refused = server
+            .do_petals_uninstall(&json!({"hash": "demo"}))
+            .await
+            .unwrap_err();
+        assert!(
+            refused
+                .to_string()
+                .contains("wallets/minnow/1/sessions/demo/desk-a"),
+            "{refused}"
+        );
+        // Refused by full hash too: the guard resolves the target, it does
+        // not pattern-match on how the caller spelled it.
+        let refused = server
+            .do_petals_uninstall(&json!({"hash": outgoing.clone()}))
+            .await
+            .unwrap_err();
+        assert!(refused.to_string().contains("desk-a"), "{refused}");
+        // Nothing was removed by either refusal.
+        assert_eq!(runner.resolve_petal_mount("demo").unwrap(), outgoing);
+
+        // A package with no active session is unaffected by the guard. It is
+        // addressed by hash: this fixture declares the same Petal name, so
+        // installing it rebinds that name away from the guarded package.
+        let other = dir.path().join("other");
+        write_demo_petal_package(&other);
+        std::fs::write(other.join("README.md"), b"# other\n").unwrap();
+        let (other_installed, _, _) = store.install_petal_package_dir(&other).unwrap();
+        assert_ne!(other_installed.hash, outgoing);
+        assert!(
+            server
+                .do_petals_uninstall(&json!({"hash": other_installed.hash}))
+                .await
+                .unwrap()["removed"]
+                .as_bool()
+                .unwrap()
+        );
+        // The guarded package is still installed and still guarded.
+        let refused = server
+            .do_petals_uninstall(&json!({"hash": outgoing.clone()}))
+            .await
+            .unwrap_err();
+        assert!(refused.to_string().contains("desk-a"), "{refused}");
+
+        // Forced removal proceeds, so a broken package is never unremovable.
+        assert!(
+            server
+                .do_petals_uninstall(&json!({"hash": outgoing.clone(), "force": true}))
+                .await
+                .unwrap()["removed"]
+                .as_bool()
+                .unwrap()
+        );
+        // It is gone: a second removal of the same hash reports nothing done.
+        assert!(
+            !server
+                .do_petals_uninstall(&json!({"hash": outgoing.clone(), "force": true}))
+                .await
+                .unwrap()["removed"]
+                .as_bool()
+                .unwrap()
+        );
+
+        // The request shape is strict, like the install side's.
+        let bad = server
+            .do_petals_uninstall(&json!({"hash": "demo", "Force": true}))
+            .await
+            .unwrap_err();
+        assert!(
+            bad.to_string().contains("invalid petals.uninstall"),
+            "{bad}"
+        );
     }
 
     #[tokio::test]

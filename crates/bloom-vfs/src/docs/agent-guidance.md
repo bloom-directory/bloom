@@ -94,10 +94,11 @@ hash; `routes_known` is false then). Writing to the sibling `stop` file
 revokes the session's approvals through the Broker; it is idempotent, works
 after the Petal is uninstalled, and after it succeeds only Exact-selector
 signing for the scope's remaining operation classes may still be available
-(`eligible_exact_routes` lists those routes). Replacing an installed package
-that still has active sessions is refused with their mounted paths unless the
-owner installs with `--force` — the stranded sessions then read
-`package_replaced`.
+(`eligible_exact_routes` lists those routes). Replacing or removing an
+installed package that still has active sessions is refused with their mounted
+paths unless the owner passes `--force` to `petal install` or
+`petal uninstall` — the stranded sessions then read `package_replaced`, and
+their `stop` still revokes them.
 
 A wallet's chains are listed at `wallets/<wallet>/chains` and include both
 EVM chains and any configured Solana chains — `ls wallets/<wallet>/chains`

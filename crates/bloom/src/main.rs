@@ -2656,6 +2656,11 @@ enum PetalsCmd {
         /// unique prefix of at least 12 chars (as printed by `ls`),
         /// a Petal name, or a petname.
         target: String,
+        /// Remove the package even while sessions scoped to it are still
+        /// active. Their `session.json` then reads `package_replaced`;
+        /// `stop` still revokes them.
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -4439,12 +4444,12 @@ async fn run_petals(endpoint: &ResolvedEndpoint, cmd: PetalsCmd) -> Result<()> {
             }
             Ok(())
         }
-        PetalsCmd::Uninstall { target } => {
+        PetalsCmd::Uninstall { target, force } => {
             let result = try_ipc(
                 &client,
                 endpoint,
                 "petals.uninstall",
-                serde_json::json!({ "hash": target }),
+                serde_json::json!({ "hash": target, "force": force }),
             )
             .await
             .with_context(|| format!("ipc petals uninstall via {}", endpoint.display))?;

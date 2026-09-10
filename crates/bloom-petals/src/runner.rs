@@ -282,7 +282,11 @@ impl PetalRunner {
     /// then a hash prefix is tried against every installed hash, then
     /// a Petal name, then a petname. Returns `None` when nothing
     /// matches.
-    fn resolve_uninstall_hash(&self, target: &str) -> Result<Option<String>, PetalError> {
+    ///
+    /// Public so a caller holding the mutation lock can name the exact
+    /// outgoing package before removing it, which is what the active-session
+    /// guard keys on.
+    pub fn resolve_uninstall_hash(&self, target: &str) -> Result<Option<String>, PetalError> {
         if crate::store::is_valid_hex_hash(target) {
             return Ok(Some(target.to_string()));
         }

@@ -8972,7 +8972,10 @@ allowed = ["bloom:vfs.read"]
         assert!(slots.is_empty(), "{slots:?}");
 
         // Uninstalling the package strands a live session (a stopped one
-        // stays stopped), and reinstalling the same hash restores it.
+        // stays stopped), and reinstalling the same hash restores it. This
+        // calls the runner directly, below the `petals.uninstall` guard that
+        // refuses exactly this without `--force`; the guard's own coverage is
+        // `ipc::tests::petals_uninstall_refuses_to_strand_active_sessions_until_forced`.
         write_session_state(
             &bloom_proto::HomeDir::at(dir.path()),
             "w",
