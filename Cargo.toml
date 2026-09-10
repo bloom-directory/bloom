@@ -130,11 +130,10 @@ bloom-petals   = { path = "crates/bloom-petals" }
 bloom-petal-contract = { git = "https://github.com/bloom-directory/petal", rev = "9ad7a5c635f092bbcdf8f00a06b23676806ff70c" }
 bloom-daemon   = { path = "crates/bloom-daemon" }
 bloom-update   = { path = "crates/bloom-update" }
-# Integration head of bloom-broker until #58 squash-merges: #13's landed
-# feat/solana-native SystemUseClaim surface merged with #58's revoke_for_key,
-# Exact-scope rule and multi-family allocation terms. Retarget this pin to the
-# landed master revision in the same commit that lands it.
-bloom-broker-api = { git = "https://github.com/bloom-directory/bloom-broker.git", rev = "91836edb3191b37a358a298859d92b0e3dd7557c" }
+# bloom-broker master: the landed #58 squash, carrying #13's solana verifier,
+# revoke_for_key, the Exact-scope rule, and the list-only multi-family
+# allocation terms that #60 folded in before it merged.
+bloom-broker-api = { git = "https://github.com/bloom-directory/bloom-broker.git", rev = "81b30c0725200c97db0d3ab67299c617f31f30ad" }
 bloom-rpc-wire = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "bc88cc6760b00bbff0c6a6e5f56d42bb03004436" }
 bloom-triad-local-transport = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "bc88cc6760b00bbff0c6a6e5f56d42bb03004436" }
 bloom-service-activation = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "bc88cc6760b00bbff0c6a6e5f56d42bb03004436" }
