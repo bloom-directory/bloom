@@ -12,7 +12,7 @@ on:
         description: Public bloom-signer ref
         required: false
         type: string
-        default: c278cccc93cf87df71173da8755ce77b5f5e9fca
+        default: 18e4d04181f29e752480adb3934326328539568c
   workflow_dispatch:
     inputs:
       broker_ref:
@@ -22,7 +22,7 @@ on:
       signer_ref:
         description: Public bloom-signer ref
         required: true
-        default: c278cccc93cf87df71173da8755ce77b5f5e9fca
+        default: 18e4d04181f29e752480adb3934326328539568c
 
 permissions:
   contents: read
@@ -43,7 +43,7 @@ jobs:
         shell: bash
         env:
           BROKER_REF: ${{ inputs.broker_ref || '91836edb3191b37a358a298859d92b0e3dd7557c' }}
-          SIGNER_REF: ${{ inputs.signer_ref || 'c278cccc93cf87df71173da8755ce77b5f5e9fca' }}
+          SIGNER_REF: ${{ inputs.signer_ref || '18e4d04181f29e752480adb3934326328539568c' }}
         run: |
           [[ "$BROKER_REF" =~ ^[0-9a-f]{40}$ ]]
           [[ "$SIGNER_REF" =~ ^[0-9a-f]{40}$ ]]
@@ -57,7 +57,7 @@ jobs:
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           repository: bloom-directory/bloom-signer
-          ref: ${{ inputs.signer_ref || 'c278cccc93cf87df71173da8755ce77b5f5e9fca' }}
+          ref: ${{ inputs.signer_ref || '18e4d04181f29e752480adb3934326328539568c' }}
           path: bloom-signer
       - name: Install Rust toolchain
         run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
@@ -144,7 +144,7 @@ jobs:
         shell: bash
         env:
           BROKER_REF: ${{ inputs.broker_ref || '91836edb3191b37a358a298859d92b0e3dd7557c' }}
-          SIGNER_REF: ${{ inputs.signer_ref || 'c278cccc93cf87df71173da8755ce77b5f5e9fca' }}
+          SIGNER_REF: ${{ inputs.signer_ref || '18e4d04181f29e752480adb3934326328539568c' }}
         run: |
           [[ "$BROKER_REF" =~ ^[0-9a-f]{40}$ ]]
           [[ "$SIGNER_REF" =~ ^[0-9a-f]{40}$ ]]
@@ -158,7 +158,7 @@ jobs:
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           repository: bloom-directory/bloom-signer
-          ref: ${{ inputs.signer_ref || 'c278cccc93cf87df71173da8755ce77b5f5e9fca' }}
+          ref: ${{ inputs.signer_ref || '18e4d04181f29e752480adb3934326328539568c' }}
           path: bloom-signer
       - name: Install Rust toolchain
         run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal

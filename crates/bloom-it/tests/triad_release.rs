@@ -418,7 +418,7 @@ fn build(staging: &Path, output: &Path, key: &Path) -> std::process::Output {
                 &format!("broker_commit = \"{}\"", "22".repeat(20)),
             )
             .replace(
-                "signer_commit = \"c278cccc93cf87df71173da8755ce77b5f5e9fca\"",
+                "signer_commit = \"18e4d04181f29e752480adb3934326328539568c\"",
                 &format!("signer_commit = \"{}\"", "33".repeat(20)),
             ),
     )
