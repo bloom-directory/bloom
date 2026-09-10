@@ -2,8 +2,8 @@
 
 `run-disposable.sh PAYLOAD UID USER` is destructive integration testing for the
 `macos-unix-principals-w0` bundle claim. It creates Directory Service users and
-groups, installs system LaunchDaemons, modifies the dedicated Bloom block in
-`/etc/pf.conf`, and removes them afterward.
+groups and installs system LaunchDaemons. Current installers remove legacy Bloom
+PF configuration but never install rules or enable PF.
 
 It refuses to run unless all of the following hold:
 
@@ -24,8 +24,8 @@ provisioning owns it. Never create it on a developer workstation.
 the same root, Darwin, payload-claim, and external disposable-marker guards,
 additionally requires two distinct active GUI launchd domains, and refuses
 existing Bloom state or principals for either login. It enrolls both UIDs,
-proves the second Broker dies fatally with the specific Machine-visible
-cross-login diagnostic and no fallback listener, terminates the owning GUI
+proves the second Broker dies fatally with the Machine-visible
+foreign-or-unverifiable listener diagnostic and no fallback listener, terminates the owning GUI
 domain, then proves failure-only KeepAlive transfers the canonical listener
 before another Machine request. When both optional bundles are supplied, it
 also proves a successful complete-version upgrade is published to both
@@ -51,8 +51,11 @@ then reruns the triad protocol, transport, activation, checkpoint, Machine
 client, policy-update, Broker, and Signer acceptance sources while the real
 installed services remain active. Fault injection stays confined to test
 executables. It also rejects provisioning profiles, Developer-ID authorities,
-or Team IDs and executes the production builder without conformance inputs to
-prove that claim generation fails. A final process/health recheck precedes
+or Team IDs. `check-release-contract.sh PAYLOAD MAIN_ROOT` builds and verifies a
+production-claim archive without conformance reports using an ephemeral test
+key, then proves that verification against the reviewed release key rejects
+it. This check never installs its archive and can also run unprivileged on a
+Darwin host with compatible binaries. A final process/health recheck precedes
 digest-bound `mui_01.pass`, `mui_11.pass`, `installed_ac_01_35.pass`, and
 `mui_12.pass` evidence.
 
@@ -89,24 +92,24 @@ advertises a production platform claim.
 
 The lane currently proves account/group shape, non-transitive membership,
 root/service filesystem ownership, explicit checkpoint/config/database
-negative reads, immutable release/plist/manifest/packet-filter replacement
+negative reads, immutable release/plist/manifest replacement
 denial for every product principal, live installer rejection of mode, owner,
 symlink, and hard-link manifest substitutions, process task/sample denial, system-domain
 LaunchDaemon registration, numeric service-owned socket ownership, unrelated-UID
-endpoint denial, Machine denial on the Broker-to-Signer edge, and loaded
-UID-scoped `pf` rules. Authenticated triad health also proves both service UIDs
+endpoint denial, Machine denial on the Broker-to-Signer edge, and absence of legacy
+Bloom PF rules. Authenticated triad health also proves both service UIDs
 can sample the pinned `macos-managed-timed` source. The lane requires the authenticated session socket to
 appear with the login UID and revoke group, then verifies the canonical
 listener's Broker marker. It pre-binds the canonical port with a foreign
 process, verifies Broker's specific fatal/no-fallback diagnostic and Machine
 failure, proves Broker opened no fallback listener, then verifies failure-only
-KeepAlive acquires the port after it is released. It removes the live anchor,
-waits for the root-owned containment attestation to turn unavailable, proves
-authenticated triad health fails, and then restores and re-verifies the
-anchor. Real service-UID probes prove Signer cannot emit IPv4 or IPv6 loopback
-TCP/UDP, and that neither Broker nor Signer can create non-loopback IPv4
-TCP/UDP flows; authenticated Broker responses remain covered by the triad
-health check. The two-login lane supplies complete baseline, candidate, and
+KeepAlive acquires the port after it is released. It verifies that service
+configuration disables the optional PF guard and
+legacy telemetry explicitly reports no network enforcement. This is a PF
+retirement check (`pf_retirement.pass`), not MUI-07 isolation evidence. The
+original MUI-07 pass marker is no longer emitted, so historical full-isolation
+report signing must not be used to claim this boundary for current packages.
+The two-login lane supplies complete baseline, candidate, and
 failing bundles and proves complete-version upgrade, activation-failure
 rollback, journal recovery, same-digest repair, retain/restore, and restoration
 of the exact prior healthy digest without identity rotation. An unauthorized connection from the login UID must be rejected
