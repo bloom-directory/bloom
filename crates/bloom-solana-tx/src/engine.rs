@@ -309,7 +309,6 @@ impl SolanaTransferEngine {
             created_ms: now_ms,
             expires_ms,
             status: SolanaTxStatus::Pending,
-            action_id: None,
         };
         self.outbox.write_pending(
             &staged,
@@ -786,7 +785,6 @@ mod tests {
             created_ms: 1,
             expires_ms: 2,
             status: SolanaTxStatus::Pending,
-            action_id: None,
         };
         (staged, payer, message)
     }

@@ -1,4 +1,5 @@
-//! One-shot root packet-filter monitor for the macOS Unix-principal profile.
+//! Root session lifecycle monitor. Legacy CLI/job names are retained for upgrades.
+//! macOS PF containment is retired because custom rules disable Private Relay.
 
 use std::{
     fs::{self, OpenOptions},
@@ -16,7 +17,6 @@ use rustix::{
     process::geteuid,
 };
 use serde::Serialize;
-use sha2::{Digest as _, Sha256};
 
 const STATUS_SCHEMA: &str = "bloom.macos-platform-status.3";
 const TRUSTED_TIME_SOURCE: &str = "macos-managed-timed";
@@ -29,6 +29,7 @@ struct Status {
     login_uid: u32,
     build_digest: String,
     anchor_sha256: String,
+    network_enforcement: &'static str,
     trusted_time_source: &'static str,
     automatic_time_enabled: bool,
     timed_service_loaded: bool,
@@ -40,12 +41,12 @@ struct Status {
 
 pub async fn run() -> Result<()> {
     if geteuid() != Uid::ROOT {
-        bail!("the packet-filter monitor must run as root");
+        bail!("the session lifecycle monitor must run as root");
     }
     if std::env::consts::OS != "macos" {
-        bail!("the packet-filter monitor requires macOS");
+        bail!("the session lifecycle monitor requires macOS");
     }
-    tracing::info!(event = "service.ready", monitor = "packet-filter");
+    tracing::info!(event = "service.ready", monitor = "session-lifecycle");
     crate::native_lifecycle("containment-monitor", "ready");
     let mut interval = tokio::time::interval(MONITOR_INTERVAL);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -72,15 +73,13 @@ pub async fn run() -> Result<()> {
 
 pub fn run_once() -> Result<()> {
     if geteuid() != Uid::ROOT {
-        bail!("the packet-filter monitor must run as root");
+        bail!("the session lifecycle monitor must run as root");
     }
     if std::env::consts::OS != "macos" {
-        bail!("the packet-filter monitor requires macOS");
+        bail!("the session lifecycle monitor requires macOS");
     }
     let enrollment_root = Path::new("/Library/Application Support/BloomTriad/enrollments");
     require_directory(enrollment_root, 0o755)?;
-    let pf_enabled = command_output("/sbin/pfctl", &["-s", "info"])
-        .is_ok_and(|output| output.contains("Status: Enabled"));
     let (automatic_time_enabled, timed_service_loaded) = macos_managed_time_status();
     let trusted_time_available = automatic_time_enabled && timed_service_loaded;
     let ceremony_listener_bloom_shaped = canonical_listener_is_bloom_shaped();
@@ -96,7 +95,6 @@ pub fn run_once() -> Result<()> {
         .collect::<std::io::Result<Vec<_>>>()
         .context("enumerate Bloom enrollments")?;
     enrollments.sort_by_key(|entry| entry.file_name());
-    let mut all_available = true;
     for entry in enrollments {
         let path = entry.path();
         if path.extension().and_then(|value| value.to_str()) != Some("json") {
@@ -118,48 +116,27 @@ pub fn run_once() -> Result<()> {
         if path.file_name().and_then(|value| value.to_str()) != Some(&format!("{login_uid}.json")) {
             bail!("enrollment filename does not match its login UID");
         }
-        let broker_uid = required_u32(&enrollment, "broker_uid")?;
-        let signer_uid = required_u32(&enrollment, "signer_uid")?;
         let revoke_gid = required_u32(&enrollment, "revoke_gid")?;
         let build_digest = required_digest(&enrollment, "release_digest")?;
-        let anchor = PathBuf::from(format!("/etc/pf.anchors/com.bloom.triad.{login_uid}"));
-        require_file_mode(&anchor, 0o600)?;
-        let anchor_bytes =
-            fs::read(&anchor).with_context(|| format!("read {}", anchor.display()))?;
-        let anchor_sha256 = hex::encode(Sha256::digest(&anchor_bytes));
-        let loaded = command_output(
-            "/sbin/pfctl",
-            &["-a", &format!("com.bloom.triad/{login_uid}"), "-sr"],
-        );
-        let available = pf_enabled
-            && loaded.as_ref().is_ok_and(|rules| {
-                rules.contains("block")
-                    && (rules.contains(&broker_uid.to_string())
-                        || rules.contains(&format!("bloom-broker-{login_uid}")))
-                    && (rules.contains(&signer_uid.to_string())
-                        || rules.contains(&format!("bloom-signer-{login_uid}")))
-            });
-        all_available &= available;
         let status = Status {
             schema: STATUS_SCHEMA,
             login_uid,
             build_digest,
-            anchor_sha256,
+            // Legacy schema stays explicitly unavailable to old PF consumers.
+            anchor_sha256: "0".repeat(64),
+            network_enforcement: "none",
             trusted_time_source: TRUSTED_TIME_SOURCE,
             automatic_time_enabled,
             timed_service_loaded,
             trusted_time_available,
             ceremony_listener_bloom_shaped,
             checked_at_unix_ms,
-            available,
+            available: false,
         };
         write_status(login_uid, &status)?;
         if enrollment_state == "active" {
             restart_services_for_live_session(login_uid, revoke_gid)?;
         }
-    }
-    if !all_available {
-        bail!("Bloom packet-filter platform status is unavailable");
     }
     Ok(())
 }
@@ -346,7 +323,7 @@ fn require_directory(path: &Path, mode: u32) -> Result<()> {
         || metadata.mode() & 0o7777 != mode
     {
         bail!(
-            "unsafe root packet-filter monitor directory {}",
+            "unsafe root session lifecycle monitor directory {}",
             path.display()
         );
     }
@@ -363,13 +340,12 @@ fn require_file(path: &Path, mode: u32) -> Result<()> {
         || metadata.mode() & 0o7777 != mode
         || metadata.nlink() != 1
     {
-        bail!("unsafe root packet-filter monitor file {}", path.display());
+        bail!(
+            "unsafe root session lifecycle monitor file {}",
+            path.display()
+        );
     }
     Ok(())
-}
-
-fn require_file_mode(path: &Path, mode: u32) -> Result<()> {
-    require_file(path, mode)
 }
 
 fn require_service_directory(path: &Path, uid: u32, gid: u32, mode: u32) -> Result<()> {
@@ -382,7 +358,7 @@ fn require_service_directory(path: &Path, uid: u32, gid: u32, mode: u32) -> Resu
         || metadata.mode() & 0o7777 != mode
     {
         bail!(
-            "unsafe root packet-filter monitor service directory {}",
+            "unsafe root session lifecycle monitor service directory {}",
             path.display()
         );
     }

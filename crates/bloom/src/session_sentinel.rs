@@ -423,6 +423,26 @@ impl Drop for SocketGuard {
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    #[test]
+    fn plain_directory_is_accepted_regardless_of_link_count() {
+        let directory = std::env::temp_dir().join(format!(
+            "bloom-session-sentinel-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&directory).expect("create session directory");
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o710))
+            .expect("set session directory permissions");
+        let metadata = std::fs::symlink_metadata(&directory).expect("directory metadata");
+        let accepted = super::require_session_directory(&directory, metadata.uid(), metadata.gid());
+        let _ = std::fs::remove_dir_all(&directory);
+        assert!(
+            accepted.is_ok(),
+            "plain directory was rejected: {accepted:?}"
+        );
+    }
+
     #[test]
     fn activating_enrollment_is_accepted_only_by_macos_sentinel() {
         assert!(super::enrollment_state_is_usable("active"));

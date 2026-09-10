@@ -198,7 +198,6 @@ if [[ -n "$upgrade_payload" ]]; then
     Library/LaunchAgents/com.bloom.machine.plist \
     "Library/LaunchDaemons/com.bloom.broker.$login_uid_a.plist" \
     "Library/LaunchDaemons/com.bloom.signer.$login_uid_a.plist" \
-    "etc/pf.anchors/com.bloom.triad.$login_uid_a" \
     "etc/newsyslog.d/bloom-$login_uid_a.conf")
   chown -R root:wheel "$transaction"
   chmod 0600 "$transaction"/*

@@ -6556,7 +6556,6 @@ weight = 100
             created_ms: 1,
             expires_ms: 0,
             status: bloom_solana_tx::types::SolanaTxStatus::Pending,
-            action_id: None,
         };
         outbox.write_pending(&staged, "plan").unwrap();
         let entry = outbox
@@ -6912,7 +6911,6 @@ ws_url = "wss://example.invalid"
             created_ms: 0,
             expires_ms: 1,
             status: bloom_solana_tx::types::SolanaTxStatus::Pending,
-            action_id: None,
         };
         solana_outbox.write_pending(&staged, "plan").unwrap();
 
