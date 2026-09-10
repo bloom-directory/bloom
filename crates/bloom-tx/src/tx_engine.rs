@@ -4178,6 +4178,7 @@ fn exact_evm_sign_request(
         approval_id: state.approval_id.clone(),
         petal_use_claim: None,
         claim_assurance_evidence: None,
+        safe_review_payload: None,
     })
 }
 

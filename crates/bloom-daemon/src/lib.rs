@@ -644,6 +644,7 @@ impl DaemonPetalHost {
         broker
             .prepare_approval(bloom_broker_api::ApprovalPrepareRequest {
                 evm_review_payloads: Vec::new(),
+                safe_review_payloads: Vec::new(),
                 petal_use_claim: None,
                 system_use_claim: None,
                 operation_id,
@@ -1650,6 +1651,14 @@ impl PetalHost for DaemonPetalHost {
                     &trusted_subject,
                     &claim,
                     req.claim_assurance_evidence.as_deref(),
+                    // `action` is a generic guest blob, so it becomes a Safe
+                    // review envelope only for the one class that owes one.
+                    // Every other Petal's `action` stays uninterpreted.
+                    if req.operation_class == bloom_broker_api::SAFE_CONFIRM_OPERATION_CLASS {
+                        req.action.as_deref()
+                    } else {
+                        None
+                    },
                 )
                 .await
                 .map_err(|reason| {
