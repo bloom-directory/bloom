@@ -1,0 +1,94 @@
+# syntax=docker/dockerfile:1.7
+#
+# Bloom triad bootstrap image -- DEVELOPMENT / SANDBOX ONLY.
+#
+# This image never runs as part of the stack. It runs once, under the
+# `bootstrap` Compose profile, to mint developer enrollment material into the
+# triad's config volumes and then exits.
+#
+# The three release binaries are RECEIVED, not rebuilt. They arrive through
+# BuildKit named contexts that point straight at the already-built service
+# images:
+#
+#     additional_contexts:
+#       bloom-machine-image: docker-image://bloom:<tag>
+#       bloom-broker-image:  docker-image://bloom-broker:<tag>
+#       bloom-signer-image:  docker-image://bloom-signer:<tag>
+#
+# That is the whole point of the design. The release digest that ends up in
+# broker.json and signer.json is computed over these exact bytes, so it cannot
+# describe a build different from the one the services execute. Rebuilding the
+# binaries here from source instead would reintroduce precisely that gap.
+#
+# Build context is the repository root (the packaging templates live there).
+
+ARG DEBIAN_RELEASE=bookworm
+
+# ---------------------------------------------------------------------------
+# Ceremony activation shim
+#
+# Statically linked so it is immune to any libc skew between this image and the
+# Broker runtime image it gets mounted into. See ceremony-activate.c for why a
+# shim is needed at all.
+# ---------------------------------------------------------------------------
+FROM debian:${DEBIAN_RELEASE}-slim AS shim
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends gcc libc6-dev \
+ && rm -rf /var/lib/apt/lists/*
+COPY deploy/triad/ceremony-activate.c /src/ceremony-activate.c
+RUN mkdir -p /out \
+ && gcc -static -O2 -std=c11 -D_DEFAULT_SOURCE -Wall -Wextra -Werror \
+        -o /out/bloom-ceremony-activate /src/ceremony-activate.c \
+ && /out/bloom-ceremony-activate 2>&1 | grep -q '^bloom-ceremony-activate: usage:'
+
+# ---------------------------------------------------------------------------
+# Bootstrap runtime
+# ---------------------------------------------------------------------------
+FROM debian:${DEBIAN_RELEASE}-slim AS bootstrap
+
+LABEL org.opencontainers.image.title="bloom-triad-bootstrap" \
+      org.opencontainers.image.description="Development-only triad enrollment bootstrap for the Bloom Compose stack" \
+      dev.bloom.profile="development-sandbox"
+
+# jq       -- the config rewrites, exactly as scripts/triad-dev-launch.sh uses it
+# libssl3  -- `bloom` links libssl/libcrypto (see the runtime stage of ../../Dockerfile)
+# setpriv  -- from util-linux; drops to the service uid, because
+#             `init triad-render-developer-enrollment` refuses to run as root
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends jq libssl3 util-linux \
+ && rm -rf /var/lib/apt/lists/*
+
+# The exact binaries the services will run. Ordering here mirrors the digest
+# ordering in bootstrap.sh: machine, Broker, Signer.
+COPY --from=bloom-machine-image /usr/local/bin/bloom        /opt/bloom-triad/bin/bloom
+COPY --from=bloom-broker-image  /usr/local/bin/bloom-broker /opt/bloom-triad/bin/bloom-broker
+COPY --from=bloom-signer-image  /usr/local/bin/bloom-signer /opt/bloom-triad/bin/bloom-signer
+
+# Config templates, selected the same way the dev launcher selects them on
+# Linux: the Linux edge manifest, and the platform-neutral Broker/Signer/
+# provenance templates that only exist under packaging/triad/macos/config.
+COPY packaging/triad/linux/config/edge-manifest.json.in \
+     /opt/bloom-triad/templates/edge-manifest.json.in
+COPY packaging/triad/macos/config/broker.json.in \
+     packaging/triad/macos/config/signer.json.in \
+     packaging/triad/macos/config/provenance-catalog.unsigned.json \
+     /opt/bloom-triad/templates/
+
+COPY --from=shim /out/bloom-ceremony-activate /opt/bloom-triad/tools/bloom-ceremony-activate
+COPY deploy/triad/bootstrap.sh /usr/local/bin/bloom-triad-bootstrap
+
+RUN chmod 0755 /usr/local/bin/bloom-triad-bootstrap \
+                /opt/bloom-triad/bin/bloom \
+                /opt/bloom-triad/bin/bloom-broker \
+                /opt/bloom-triad/bin/bloom-signer \
+                /opt/bloom-triad/tools/bloom-ceremony-activate \
+ && chmod 0644 /opt/bloom-triad/templates/* \
+ && /opt/bloom-triad/bin/bloom --version \
+ && /opt/bloom-triad/bin/bloom-broker --version \
+ && /opt/bloom-triad/bin/bloom-signer --version
+
+# Runs as root on purpose: it installs root-owned trust anchors, and drops to
+# the service uid for the one step that must not be root.
+USER root:root
+ENTRYPOINT ["/usr/local/bin/bloom-triad-bootstrap"]
+CMD ["bootstrap"]

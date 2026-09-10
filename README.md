@@ -216,6 +216,205 @@ and example crates used by the broader Bloom runtime and examples.
   chains, private broadcast returns an error instead of silently falling
   back to public RPC.
 
+## Container stack (Docker Compose)
+
+`docker-compose.yml` builds and wires the full triad — Machine (this repo),
+Broker (`../bloom-broker`), Signer (`../bloom-signer`) — from the sibling
+checkout layout that `scripts/triad-dev-launch.sh` already assumes:
+
+```
+bloom-directory/
+  bloom/          <- this repo, build context "."
+  bloom-broker/   <- build context "../bloom-broker"
+  bloom-signer/   <- build context "../bloom-signer"
+```
+
+```bash
+cp .env.example .env          # then set BLOOM_CONFIG_DIR and BLOOM_HOST_DIR
+docker compose run --rm machine-init   # `bloom init` populates BLOOM_HOME
+docker compose up --build
+```
+
+**Read [Mount propagation](#mount-propagation-linux-only) before starting the
+`machine` service.** The mount path is Linux-only and needs host-side setup.
+
+### Trust topology
+
+Reachability is enforced by which containers share which Unix-socket volume,
+not by network rules:
+
+```
+machine  --(broker.sock)-->  broker  --(signer.sock)-->  signer
+```
+
+The Machine has no path to the Signer, because the `signer-rpc` volume is
+mounted only into `signer` and `broker`. Adding that volume to the `machine`
+service would collapse the custody boundary — don't.
+
+Each RPC edge gets its own named volume, shared by exactly the two services on
+that edge. Both **control** sockets (the Broker's and the Signer's) are
+deliberately routed into each service's *private* state volume instead, because
+they are operator surfaces rather than peer surfaces; that way mounting an RPC
+volume into another container can never expose them.
+
+Ownership is worth understanding, because it is easy to break. A fresh named
+volume is initialised from whatever the image has at that mount point,
+*including uid/gid and mode*. The Signer image pre-creates its runtime directory
+as `10001:10001` mode `0700`, so the first container to mount `signer-rpc`
+stamps that onto the volume. The `depends_on: condition: service_healthy`
+chain guarantees the Signer wins that race. The Broker can then traverse a `0700`
+directory only because it runs as the same uid — which is why
+`BLOOM_SERVICE_UID` must match on both, and must equal `broker.effective_uid` /
+`signer.effective_uid` in your edge manifest.
+
+### Service commands
+
+The Broker and Signer services intentionally declare **no `command:`**. Both
+binaries are entirely env- and config-driven and accept no flags beyond a bare
+`--version`; every knob is an environment variable or a field in
+`broker.json` / `signer.json`. The image `ENTRYPOINT` is the whole invocation.
+
+The Machine's command is real and verified against `bloom serve --help`:
+
+```yaml
+command: ["serve", "--mount", "/bloom"]
+```
+
+`--mount` takes an optional path and defaults to `/bloom` on Linux; the path is
+passed explicitly so the file does not depend on the platform default.
+
+### State and secrets
+
+Durable, **non-secret** state lives in named volumes: the Signer and Broker
+SQLite stores, their audit-checkpoint chains, the Broker journal/authority/
+ceremony files, and the Machine's `BLOOM_HOME`.
+
+Secret material is **not** in named volumes. Service identities, the edge
+manifest, `authority-edge-history.json`, and the seed-bearing `signer.json` /
+`broker.json` are bind-mounted read-only from `${BLOOM_CONFIG_DIR}`, so
+`docker compose down -v` cannot destroy them and `docker volume inspect` never
+surfaces them. Keep that directory outside the repo; `signer.json` and
+`broker.json` must be mode `0600`. `scripts/triad-dev-launch.sh` is the
+reference for what those files contain.
+
+If the workspace's `bloom-directory` git dependencies are private, the Broker
+Dockerfile accepts an optional `git_credentials` build secret. It is left
+unwired in compose because a missing file would break the default public build:
+
+```bash
+docker build --secret id=git_credentials,src="$HOME/.git-credentials" ../bloom-broker
+```
+
+### Networking
+
+The Broker and Signer sit on an `internal: true` network. Neither ever uses it —
+they speak only `AF_UNIX` — but Docker installs no gateway for an internal
+network, so it denies egress even if some future code path tried. For the
+tightest possible setting, replace their `networks:` key with
+`network_mode: "none"`; Compose forbids combining the two, which is the only
+reason it is not the default here.
+
+Only the Machine gets egress, on `bloom-egress`. It needs it for JSON-RPC, price
+feeds, ENS, and the GitHub update check.
+
+**The NFS port is not published, on purpose.** The embedded server defaults to
+`nfs_listen_addr = "127.0.0.1:12049"`, and the only client is the mount call in
+the same container, so the traffic never leaves loopback. Publishing it would
+expose an unauthenticated NFS export of the wallet tree to anything that can
+reach the port — there is no NFS-level auth in front of it. If you must inspect
+the export while debugging, bind it to loopback only
+(`127.0.0.1:12049:12049/tcp`) and remove it afterwards.
+
+### Mount propagation (Linux only)
+
+`bloom serve --mount /bloom` starts an embedded NFSv4.1 server bound to loopback
+*inside* the container, then shells out to `mount.nfs4` to mount it at `/bloom`.
+That mount is created in the container's mount namespace. To make the host see
+it, the compose file binds the host directory with `rshared` propagation:
+
+```yaml
+- type: bind
+  source: ${BLOOM_HOST_DIR:-${HOME}/bloom}
+  target: /bloom
+  bind:
+    propagation: rshared
+    create_host_path: true
+```
+
+Three host-side preconditions, none of which are optional:
+
+1. **Linux host.** Mount propagation does not exist on Docker Desktop for macOS
+   or Windows — the daemon runs inside its own VM, so `rshared` would at best
+   project into that VM and never onto your desktop. On those platforms use
+   `bloom vfs` instead of a mount.
+2. **The host bind source must be on a shared mount.** Otherwise the daemon
+   refuses the bind with `path is mounted on / but it is not a shared mount`.
+   Check and fix:
+   ```bash
+   findmnt -no PROPAGATION -T "${HOME}/bloom"   # want: shared
+   sudo mount --make-shared /                   # blunt, affects the whole host
+   ```
+   To scope it instead of making `/` shared, bind the directory onto itself and
+   share only that subtree:
+   ```bash
+   sudo mount --bind "${HOME}/bloom" "${HOME}/bloom"
+   sudo mount --make-shared "${HOME}/bloom"
+   ```
+   Neither survives a reboot unless you add it to `/etc/fstab` or a systemd unit.
+3. **NFS client support in the host kernel** (`sudo modprobe nfs`). The
+   container shares the host kernel and cannot supply this itself.
+
+The mount helper itself is not a host concern: the runtime stage of this repo's
+`Dockerfile` installs `nfs-common`, so `mount.nfs4` is present in the image.
+
+#### Required privileges
+
+The Machine is the only service granted any privilege:
+
+```yaml
+cap_add:
+  - SYS_ADMIN
+security_opt:
+  - apparmor:unconfined
+```
+
+- **`CAP_SYS_ADMIN`** is required for `mount(2)`. Be clear-eyed about it: with
+  the `rshared` bind it is close to root-equivalent on the host, since it is
+  enough to affect host mount state. This is the actual price of projecting the
+  mount outward, and it is precisely why the Broker and Signer are separate
+  services running `cap_drop: [ALL]` — a compromise of the Machine must not
+  reach key material.
+- **`apparmor:unconfined`** is required on AppArmor hosts (Ubuntu, and Debian
+  with AppArmor enabled): the `docker-default` profile denies `mount`
+  unconditionally, so `CAP_SYS_ADMIN` alone is not enough there. Docker's default
+  **seccomp** profile already permits `mount`/`umount2` once `CAP_SYS_ADMIN` is
+  present, so no seccomp override is needed. On an SELinux-enforcing host, drop
+  the AppArmor line and expect to need an SELinux policy adjustment instead.
+- **`privileged: true`** is left commented out as a blunt fallback. It grants
+  strictly more than this needs — all capabilities, unmasked `/proc` and `/sys`,
+  all devices. Use it only to confirm a diagnosis, then narrow it again.
+
+`stop_grace_period: 30s` gives the daemon room to unmount before `SIGKILL`;
+without it the host can be left with a stale NFS mount at `/bloom`.
+
+### Healthchecks
+
+What each probe actually proves, since two of the three are weaker than
+"healthy" suggests:
+
+| Service | Probe | Proves |
+| --- | --- | --- |
+| `signer` | `test -S /run/bloom/signer.sock` | The RPC listener is bound. **Not** that it answers RPC. |
+| `broker` | `test -S` on both sockets | Both listeners are bound, ruling out the half-initialised window. **Not** that either answers RPC. |
+| `machine` | `bloom status -q` | Genuinely round-trips the daemon IPC socket. **Not** that `/bloom` is mounted. |
+
+The Broker and Signer runtime images install no packages at all — not even
+`ca-certificates` — so no shell in them can speak the framed, uid-authenticated
+protocol. Socket existence is the strongest honest signal available. For the
+Machine, the runtime image has no `mountpoint` binary, so a healthy Machine with
+a failed mount is possible; check `docker compose logs machine` for the mount
+result.
+
 ## Limitations
 
 - **Per-login Machine surface.** Production Broker and Signer run as isolated
