@@ -26,13 +26,9 @@ class EvalError(RuntimeError):
 # The Broker publishes owner ceremonies at a fixed local origin with a
 # base64url-encoded 32-byte secret. The shape is Broker-wide, not specific to
 # any one Petal or chain, so every eval that drives a passkey ceremony matches
-# and redacts it the same way.
-_ceremony_port = os.environ.get("BLOOM_TRIAD_DEV_CEREMONY_PORT", "18734")
-if not _ceremony_port.isdigit() or not 1 <= int(_ceremony_port) <= 65535:
-    raise RuntimeError("BLOOM_TRIAD_DEV_CEREMONY_PORT must be an integer from 1 to 65535")
-CEREMONY_URL = re.compile(
-    rf"http://localhost:{re.escape(_ceremony_port)}/ceremony/[A-Za-z0-9_-]{{43}}"
-)
+# and redacts it the same way. Port 18734 is the canonical developer ceremony
+# port the triad launcher binds; there is no alternate-port override.
+CEREMONY_URL = re.compile(r"http://localhost:18734/ceremony/[A-Za-z0-9_-]{43}")
 
 # Mounted reads are not local file reads. Under a Petal they are live venue
 # round-trips made by wasm; under a chain outbox they can wait on an RPC. Both

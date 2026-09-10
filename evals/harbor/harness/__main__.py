@@ -36,8 +36,8 @@ def parser() -> argparse.ArgumentParser:
         help=(
             "verify installed ownership, delegated provenance, action-route signing "
             "metadata, and active lineage without inspecting wallet policy "
-            "(hyperliquid-order-cancel); or validate the canary authorization from "
-            "local files only (solana-transfer)"
+            "(hyperliquid-order-cancel); or run the read-only solana-transfer "
+            "preflight: configuration, mount, wallet, driver, and chain identity"
         ),
     )
     value.add_argument(

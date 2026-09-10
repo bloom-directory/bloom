@@ -4,20 +4,25 @@ The Hyperliquid eval is safe because its primitive is reversible: place, then
 cancel, where the undo is also the proof. A SOL transfer has no undo, so three
 parts of that safety model are replaced here.
 
-* The bound is the compile-time canary authorization rather than a bounded
-  venue session. It pins one artifact, one wallet, one key, one destination, an
-  exact amount, a fee ceiling, a balance ceiling, and a single use.
+* The bound is the host approval contract rather than a bounded venue session.
+  The background approver completes a ceremony only after checking the staged
+  intent against the exact configured transfer: destination, exact lamports,
+  fee payer, fee ceiling, and the pinned signing account. Nothing else is ever
+  approved, and a restaged replacement is approved only when the outbox's own
+  `restage_advice.json` lineage says it replaces the approved entry.
 * The binding between the chain record and this trial is a fresh
   host-controlled destination plus that exact amount, rather than a
   host-generated client order id.
-* Mainnet cleanup sweeps the destination back to the source with a host-held
-  key, so only the fee is actually spent. The local lane discards its validator
-  ledger with the rest of the disposable triad. The container never sees the
-  mainnet cleanup key.
+* On mainnet, cleanup sweeps the destination back to the source with a
+  host-held key, so only the fee is actually spent. The container never sees
+  the sweep key. The local lane's validator funds are worthless and its
+  disposal belongs to whoever started the validator; the runner never touches
+  an externally supplied triad.
 
-`--lane local` drops the canary requirement and runs against a local validator,
-because a non-mainnet genesis is already permitted to broadcast. `--lane
-mainnet-canary` requires the authorization and the acknowledgement.
+Both lanes use the ordinary transfer and approval semantics of the service
+stack. `--lane local` runs against a disposable local validator; `--lane
+mainnet` requires the explicit network selection and acknowledgement and is
+bounded by the same exact-match approval.
 """
 
 from __future__ import annotations
@@ -52,9 +57,12 @@ from .core import (
     resolve_sign_count,
 )
 
-MAINNET_ACK = "TRANSFER_SOL_MAINNET_UP_TO_THE_AUTHORIZED_AMOUNT"
-AUTHORIZATION_SCHEMA = "bloom.solana-mainnet-canary/1"
+MAINNET_ACK = "TRANSFER_SOL_MAINNET_EXACTLY_AS_CONFIGURED"
 MAINNET_NETWORK = "mainnet-beta"
+# The cluster identity the mainnet lane requires and the local lane refuses.
+# This is the chain's own answer to `getGenesisHash`, not a configuration
+# label, so pointing the "local" lane at a mainnet endpoint fails here.
+MAINNET_GENESIS_HASH = "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d"
 
 BASE58 = "[1-9A-HJ-NP-Za-km-z]"
 ADDRESS = re.compile(f"{BASE58}{{32,44}}")
@@ -63,12 +71,11 @@ CHAIN_NAME = re.compile(r"[a-z0-9][a-z0-9-]{0,62}")
 FINGERPRINT = re.compile(r"[0-9a-f]{16,64}")
 DERIVATION = re.compile(r"m/44'/501'/\d+'/0'")
 
-# A ceiling the harness enforces independently of the authorization file, so a
-# fat-fingered authorization cannot widen the blast radius. 0.05 SOL.
+# Ceilings the harness enforces independently of anything the operator
+# configures, so a fat-fingered parameter cannot widen the blast radius.
+# 0.05 SOL balance, 0.02 SOL transfer.
 HARNESS_MAX_BALANCE_LAMPORTS = 50_000_000
 HARNESS_MAX_TRANSFER_LAMPORTS = 20_000_000
-# Refuse an authorization that is about to expire mid-trial.
-MIN_AUTHORIZATION_WINDOW_MS = 10 * 60 * 1000
 
 # Mounted chain reads wait on an RPC round trip, not a disk.
 CHAIN_READ_TIMEOUT_SECONDS = 45
@@ -80,8 +87,9 @@ ROUTE_WRITE_TIMEOUT_SECONDS = 120
 # ceremony up front the way the Hyperliquid provision does.
 APPROVER_POLL_SECONDS = 2.0
 APPROVER_BUDGET_SECONDS = 420.0
-# One confirm ceremony, plus at most one first-use key derivation. The cap
-# bounds a misbehaving route rather than describing the expected count.
+# One confirm ceremony, plus at most one first-use key derivation and one
+# blockhash-expiry re-approval. The cap bounds a misbehaving route rather
+# than describing the expected count.
 MAX_TRANSFER_CEREMONIES = 3
 
 RPC_TIMEOUT_SECONDS = 30
@@ -94,6 +102,11 @@ PENDING_DRAIN_DELAY_SECONDS = 2.0
 RECEIPT_SETTLE_ATTEMPTS = 45
 RECEIPT_SETTLE_DELAY_SECONDS = 2.0
 SMOKE_CONFIRM_BUDGET_SECONDS = 45.0
+# Waiting out a local validator's real blockhash window dominates the restage
+# smoke; opt into it with BLOOM_EVAL_SOLANA_SMOKE_RESTAGE=1.
+SMOKE_RESTAGE_ENV = "BLOOM_EVAL_SOLANA_SMOKE_RESTAGE"
+SMOKE_RESTAGE_WAIT_ATTEMPTS = 600
+SMOKE_RESTAGE_WAIT_DELAY_SECONDS = 1.0
 
 
 def trial_amount(base_lamports: int, trial_id: str) -> int:
@@ -101,7 +114,7 @@ def trial_amount(base_lamports: int, trial_id: str) -> int:
 
     The tail turns the amount itself into a fingerprint, so the destination's
     single transaction can be matched on value as well as on address. It stays
-    well inside the authorized ceiling because the caller picks `base`.
+    well inside the harness ceiling because the caller picks `base`.
     """
     tail = int(hashlib.sha256(trial_id.encode()).hexdigest()[:4], 16) % 10_000
     return base_lamports + tail
@@ -113,18 +126,13 @@ class SolanaTransferEval(EvalDefinition):
     def __init__(self, repo_root: Path, environ: dict[str, str] | None = None) -> None:
         self.repo_root = repo_root.resolve()
         self.env = dict(os.environ if environ is None else environ)
-        self.lane = self.env.get("BLOOM_EVAL_SOLANA_LANE", "mainnet-canary")
+        self.lane = self.env.get("BLOOM_EVAL_SOLANA_LANE", "local")
         self.wallet_id = self.env.get("BLOOM_EVAL_SOLANA_WALLET_ID", "")
         self.chain = self.env.get("BLOOM_EVAL_SOLANA_CHAIN", "")
         self.network = self.env.get("BLOOM_EVAL_SOLANA_NETWORK", "")
         self.rpc_url = self.env.get("BLOOM_EVAL_SOLANA_RPC_URL", "")
         self.bloom_mount_value = self.env.get("BLOOM_EVAL_BLOOM_MOUNT", "").strip()
         self.bloom_mount = Path(self.bloom_mount_value)
-        self.authorization_value = self.env.get(
-            "BLOOM_EVAL_SOLANA_CANARY_AUTHORIZATION", ""
-        )
-        self.authorization_path = Path(self.authorization_value)
-        self.machine_binary = Path(self.env.get("BLOOM_EVAL_SOLANA_MACHINE_BINARY", ""))
         # The Machine's home root, on the host filesystem. The approver reads
         # the canonical approval challenge here so its decision is unaffected
         # by mount latency or a projection changing during a read.
@@ -156,7 +164,6 @@ class SolanaTransferEval(EvalDefinition):
         self._lock_path = Path(
             self.env.get("BLOOM_EVAL_LOCK_FILE", "/tmp/bloom-harbor-solana.lock")
         )
-        self.authorization: dict[str, Any] | None = None
         self.destination = ""
         self.lamports = 0
         self.max_fee_lamports = 0
@@ -172,6 +179,10 @@ class SolanaTransferEval(EvalDefinition):
         self._approver_stop = threading.Event()
         self._approver_error: str | None = None
         self._approver_completed = 0
+        # The approved replacement lineage, oldest first. Entries are outbox
+        # ids whose staged intent matched the configured transfer and whose
+        # succession is documented by the outbox's own restage advice.
+        self._approved_lineage: list[str] = []
         self._baseline_sent: set[str] = set()
 
     # ---- paths ---------------------------------------------------------
@@ -240,16 +251,20 @@ class SolanaTransferEval(EvalDefinition):
         except OSError as error:
             raise EvalError(f"could not list host outbox/{state}: {error}") from error
 
-    def _read_private_json(self, path: Path, label: str) -> Any:
-        """Read a local, immutable host file. Never a mounted path."""
+    def _read_host_json(self, path: Path) -> Any | None:
+        """Read a host-side outbox artifact, or None when it does not exist."""
         try:
             raw = path.read_bytes()
+        except FileNotFoundError:
+            return None
         except OSError as error:
-            raise EvalError(f"could not read {label}: {error}") from error
+            raise EvalError(f"could not read {path}: {error}") from error
         try:
             return json.loads(raw)
-        except json.JSONDecodeError as error:
-            raise EvalError(f"{label} is not valid JSON: {error}") from error
+        except json.JSONDecodeError:
+            # The file is written atomically, so a torn read means we caught a
+            # rename in flight. Treat it as not-yet-published.
+            return None
 
     def _load_local_account_identity(self) -> None:
         """Resolve the one active Solana child from Broker's public projection."""
@@ -299,7 +314,9 @@ class SolanaTransferEval(EvalDefinition):
 
     def _require_sweep_keypair(self) -> None:
         """Prove the host controls the configured cleanup destination."""
-        if not str(self.sweep_keypair):
+        # `Path("")` is `.`, whose lstat succeeds as a directory and would
+        # report the wrong problem.
+        if not str(self.sweep_keypair) or str(self.sweep_keypair) == ".":
             raise EvalError("BLOOM_EVAL_SOLANA_SWEEP_KEYPAIR_FILE is required")
         try:
             keypair_stat = self.sweep_keypair.lstat()
@@ -331,157 +348,109 @@ class SolanaTransferEval(EvalDefinition):
                 "sweep keypair"
             )
 
-    # ---- authorization -------------------------------------------------
+    # ---- transfer parameters and chain identity ------------------------
 
-    def authorization_preflight(self) -> dict[str, Any]:
-        """Validate the canary authorization from local files only.
+    def _require_mainnet_ack(self) -> None:
+        if self.env.get("BLOOM_EVAL_SOLANA_MAINNET_ACK") != MAINNET_ACK:
+            raise EvalError(
+                f"set BLOOM_EVAL_SOLANA_MAINNET_ACK={MAINNET_ACK} to authorize "
+                "this mainnet trial"
+            )
 
-        No ceremony, no mounted write, no Docker job, and no chain call is
-        possible in this mode, so it is safe to run while the wallet is still
-        empty and before any authority exists.
+    def _require_destination(self) -> None:
+        self.destination = self.env.get("BLOOM_EVAL_SOLANA_DESTINATION", "")
+        if ADDRESS.fullmatch(self.destination) is None:
+            raise EvalError("BLOOM_EVAL_SOLANA_DESTINATION must be a base58 address")
+
+    @staticmethod
+    def _positive_lamports(name: str, value: str) -> int:
+        if not value or not value.isdigit():
+            raise EvalError(f"{name} must be a positive integer number of lamports")
+        amount = int(value)
+        if amount <= 0:
+            raise EvalError(f"{name} must be a positive integer number of lamports")
+        return amount
+
+    def _require_mainnet_transfer_parameters(self) -> None:
+        """Take the whole transfer contract from explicit operator input.
+
+        There is no authorization file to parse: the operator configures the
+        exact source, account, amount, and fee ceiling here, the harness
+        ceilings cap them independently, and the approver refuses any staged
+        intent that deviates. A missing field is an error, never a silent
+        bypass.
         """
-        if not self.authorization_value:
+        source = self.env.get("BLOOM_EVAL_SOLANA_SOURCE", "")
+        if ADDRESS.fullmatch(source) is None:
+            raise EvalError("BLOOM_EVAL_SOLANA_SOURCE must be a base58 address")
+        self.source_address = source
+        fingerprint = self.env.get("BLOOM_EVAL_SOLANA_KEY_FINGERPRINT", "")
+        if FINGERPRINT.fullmatch(fingerprint) is None:
             raise EvalError(
-                "BLOOM_EVAL_SOLANA_CANARY_AUTHORIZATION is required on the "
-                "mainnet-canary lane"
+                "BLOOM_EVAL_SOLANA_KEY_FINGERPRINT must be the source account's "
+                "hex public-key fingerprint"
             )
-        try:
-            auth_stat = self.authorization_path.lstat()
-        except OSError as error:
-            raise EvalError(f"canary authorization is unavailable: {error}") from error
-        if not stat.S_ISREG(auth_stat.st_mode) or self.authorization_path.is_symlink():
+        self.key_fingerprint = fingerprint
+        derivation = self.env.get("BLOOM_EVAL_SOLANA_DERIVATION_PATH", "")
+        if DERIVATION.fullmatch(derivation) is None:
             raise EvalError(
-                "canary authorization must be a regular non-symlink file"
+                "BLOOM_EVAL_SOLANA_DERIVATION_PATH must be the account's canonical "
+                "BIP-44 Solana derivation path"
             )
-        if stat.S_IMODE(auth_stat.st_mode) != 0o600:
-            raise EvalError("canary authorization must have mode 0600")
-
-        auth = self._read_private_json(self.authorization_path, "canary authorization")
-        if not isinstance(auth, dict):
-            raise EvalError("canary authorization is not an object")
-
-        if auth.get("schema") != AUTHORIZATION_SCHEMA:
-            raise EvalError(f"canary authorization schema is not {AUTHORIZATION_SCHEMA}")
-        # `max_transactions` must be exactly 1. Bloom enforces this too; the
-        # harness refuses independently so a widened file never reaches it.
-        if auth.get("max_transactions") != 1:
-            raise EvalError("canary authorization must permit exactly one transaction")
-
-        spent = self.authorization_path.with_name(self.authorization_path.name + ".spent")
-        if spent.exists():
+        self.derivation_path = derivation
+        lamports = self._positive_lamports(
+            "BLOOM_EVAL_SOLANA_LAMPORTS",
+            self.env.get("BLOOM_EVAL_SOLANA_LAMPORTS", ""),
+        )
+        if lamports > HARNESS_MAX_TRANSFER_LAMPORTS:
             raise EvalError(
-                f"canary authorization is already spent ({spent}); issue a new one"
-            )
-
-        expires = auth.get("expires_ms")
-        if not isinstance(expires, int):
-            raise EvalError("canary authorization has no integer expires_ms")
-        remaining = expires - int(time.time() * 1000)
-        if remaining < MIN_AUTHORIZATION_WINDOW_MS:
-            raise EvalError(
-                "canary authorization expires too soon to run a trial "
-                f"({remaining}ms left); issue a new one"
-            )
-
-        for field, pattern, label in (
-            ("chain", CHAIN_NAME, "chain"),
-            ("wallet", WALLET_ID, "wallet"),
-            ("source_address", ADDRESS, "source address"),
-            ("destination", ADDRESS, "destination"),
-            ("key_fingerprint", FINGERPRINT, "key fingerprint"),
-            ("derivation_path", DERIVATION, "derivation path"),
-        ):
-            value = auth.get(field)
-            if not isinstance(value, str) or pattern.fullmatch(value) is None:
-                raise EvalError(f"canary authorization has a malformed {label}")
-
-        if auth["chain"] != self.chain:
-            raise EvalError(
-                f"canary authorization is for chain '{auth['chain']}', not '{self.chain}'"
-            )
-        if auth["wallet"] != self.wallet_id:
-            raise EvalError(
-                f"canary authorization is for wallet '{auth['wallet']}', "
-                f"not '{self.wallet_id}'"
-            )
-
-        transfer = auth.get("transfer_lamports")
-        balance_cap = auth.get("max_balance_lamports")
-        fee_cap = auth.get("max_fee_lamports")
-        for value, label in (
-            (transfer, "transfer_lamports"),
-            (balance_cap, "max_balance_lamports"),
-            (fee_cap, "max_fee_lamports"),
-        ):
-            if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
-                raise EvalError(f"canary authorization has a malformed {label}")
-        assert isinstance(transfer, int) and isinstance(balance_cap, int)
-        assert isinstance(fee_cap, int)
-
-        # The harness ceiling is independent of the file on purpose.
-        if transfer > HARNESS_MAX_TRANSFER_LAMPORTS:
-            raise EvalError(
-                f"authorized transfer {transfer} exceeds the harness ceiling "
+                f"configured transfer {lamports} exceeds the harness ceiling "
                 f"{HARNESS_MAX_TRANSFER_LAMPORTS}"
             )
-        if balance_cap > HARNESS_MAX_BALANCE_LAMPORTS:
+        self.lamports = lamports
+        max_fee = self._positive_lamports(
+            "BLOOM_EVAL_SOLANA_MAX_FEE_LAMPORTS",
+            self.env.get("BLOOM_EVAL_SOLANA_MAX_FEE_LAMPORTS", ""),
+        )
+        if max_fee > HARNESS_MAX_TRANSFER_LAMPORTS:
             raise EvalError(
-                f"authorized balance cap {balance_cap} exceeds the harness ceiling "
-                f"{HARNESS_MAX_BALANCE_LAMPORTS}"
+                f"configured fee ceiling {max_fee} exceeds the harness ceiling "
+                f"{HARNESS_MAX_TRANSFER_LAMPORTS}"
             )
-        if transfer + fee_cap > balance_cap:
-            raise EvalError(
-                "authorized transfer plus fee exceeds the authorized balance cap"
-            )
+        self.max_fee_lamports = max_fee
+        # HARNESS_MAX_BALANCE_LAMPORTS bounds the destination's total exposure;
+        # with both per-item ceilings at 20M SOL-lamports the sum can never
+        # exceed it, so no separate sum check is needed here.
 
-        self._require_artifact_binding(auth)
-        self._require_host_controlled_destination(auth)
-        self.authorization = auth
-        return auth
+    def _require_chain_identity(self) -> None:
+        """Check the configured endpoint's actual cluster identity.
 
-    def _require_artifact_binding(self, auth: dict[str, Any]) -> None:
-        """Bind the authorization to the exact Machine binary that will run."""
-        digest = auth.get("artifact_sha256")
-        if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
-            raise EvalError("canary authorization has a malformed artifact_sha256")
-        if not str(self.machine_binary):
-            raise EvalError(
-                "BLOOM_EVAL_SOLANA_MACHINE_BINARY is required so the authorization's "
-                "artifact digest can be checked against the binary that will run"
-            )
-        if not self.machine_binary.is_file():
-            raise EvalError(f"Machine binary is missing: {self.machine_binary}")
-        observed = hashlib.sha256(self.machine_binary.read_bytes()).hexdigest()
-        if observed != digest:
-            raise EvalError(
-                "canary authorization is bound to a different artifact: "
-                f"authorization {digest}, binary {observed}"
-            )
-
-    def _require_host_controlled_destination(self, auth: dict[str, Any]) -> None:
-        """Refuse any destination the host cannot sweep back from.
-
-        A destination the host does not hold the key for turns a bounded,
-        recoverable trial into an unrecoverable one.
+        A network label is operator input, not evidence. Mainnet requires the
+        pinned mainnet-beta genesis; the local lane refuses it, so a mainnet
+        endpoint can never masquerade as a disposable local validator.
         """
-        expected = self.env.get("BLOOM_EVAL_SOLANA_DESTINATION", "")
-        if not expected:
-            raise EvalError("BLOOM_EVAL_SOLANA_DESTINATION is required")
-        if auth["destination"] != expected:
+        observed = self._rpc("getGenesisHash", [])
+        if not isinstance(observed, str) or not observed:
+            raise EvalError("could not read the endpoint's genesis hash")
+        if self.lane == "mainnet":
+            if observed != MAINNET_GENESIS_HASH:
+                raise EvalError(
+                    "the mainnet lane requires a mainnet-beta endpoint; its "
+                    f"genesis hash is {observed}, expected {MAINNET_GENESIS_HASH}"
+                )
+        elif observed == MAINNET_GENESIS_HASH:
             raise EvalError(
-                "canary authorization destination is not the host-controlled "
-                "sweep address"
+                "the local lane refuses mainnet-beta endpoints; the configured "
+                "RPC serves the mainnet-beta genesis"
             )
-        self.destination = expected
-        self._require_sweep_keypair()
 
     # ---- preflight -----------------------------------------------------
 
     def preflight(self) -> None:
         if not self.bloom_mount_value:
             raise EvalError("BLOOM_EVAL_BLOOM_MOUNT is required for a full eval")
-        if self.lane not in ("local", "mainnet-canary"):
-            raise EvalError(f"unknown lane {self.lane!r}; use local or mainnet-canary")
+        if self.lane not in ("local", "mainnet"):
+            raise EvalError(f"unknown lane {self.lane!r}; use local or mainnet")
         if WALLET_ID.fullmatch(self.wallet_id) is None:
             raise EvalError("BLOOM_EVAL_SOLANA_WALLET_ID is required and must be a token")
         if CHAIN_NAME.fullmatch(self.chain) is None:
@@ -493,39 +462,46 @@ class SolanaTransferEval(EvalDefinition):
         # "did the operator mean this" gates, and burying them behind a seed
         # file or driver check would answer a dangerous misconfiguration with
         # an unrelated error message.
-        if self.lane == "mainnet-canary":
-            if self.env.get("BLOOM_EVAL_SOLANA_MAINNET_ACK") != MAINNET_ACK:
-                raise EvalError(
-                    f"set BLOOM_EVAL_SOLANA_MAINNET_ACK={MAINNET_ACK} to authorize "
-                    "this mainnet trial"
-                )
+        if self.lane == "mainnet":
+            self._require_mainnet_ack()
             if self.network != MAINNET_NETWORK:
                 raise EvalError(
-                    f"the mainnet-canary lane requires network {MAINNET_NETWORK}"
+                    f"the mainnet lane requires network {MAINNET_NETWORK}"
                 )
-            auth = self.authorization_preflight()
-            self.destination = auth["destination"]
-            self.lamports = auth["transfer_lamports"]
-            self.max_fee_lamports = auth["max_fee_lamports"]
-            self.source_address = auth["source_address"]
-            self.key_fingerprint = auth["key_fingerprint"]
-            self.derivation_path = auth["derivation_path"]
+            self._require_mainnet_transfer_parameters()
+            self._require_destination()
+            self._require_sweep_keypair()
+            self._require_sweep_tool()
         else:
-            # The local lane needs no canary: a non-mainnet genesis is already
-            # permitted to broadcast, and the validator's funds are worthless.
+            # Local funds are worthless and disappear with the validator's
+            # disposable ledger, whose disposal belongs to whoever started
+            # the validator.
             if self.network == MAINNET_NETWORK:
                 raise EvalError(
                     "the local lane must not be pointed at mainnet-beta; use the "
-                    "mainnet-canary lane"
+                    "mainnet lane"
                 )
-            self.destination = self.env.get("BLOOM_EVAL_SOLANA_DESTINATION", "")
-            if ADDRESS.fullmatch(self.destination) is None:
-                raise EvalError("BLOOM_EVAL_SOLANA_DESTINATION must be a base58 address")
+            self._require_destination()
+            base = self.env.get("BLOOM_EVAL_SOLANA_BASE_LAMPORTS", "1000000")
+            if not base.isdigit() or int(base) <= 0:
+                raise EvalError("BLOOM_EVAL_SOLANA_BASE_LAMPORTS must be a positive integer")
+            if int(base) > HARNESS_MAX_TRANSFER_LAMPORTS:
+                raise EvalError(
+                    f"BLOOM_EVAL_SOLANA_BASE_LAMPORTS {base} exceeds the harness "
+                    f"ceiling {HARNESS_MAX_TRANSFER_LAMPORTS}"
+                )
+            self.max_fee_lamports = self._positive_lamports(
+                "BLOOM_EVAL_SOLANA_MAX_FEE_LAMPORTS",
+                self.env.get("BLOOM_EVAL_SOLANA_MAX_FEE_LAMPORTS", "10000"),
+            )
+
+        # Chain identity is checked from the chain itself, not from labels.
+        self._require_chain_identity()
 
         # The approver reads the canonical host-side approval challenge the
         # confirm route stages. Current outboxes also project a sanitized copy
         # to the owner filesystem; the host copy remains the stable boundary
-        # for matching the exact authorized intent before approval.
+        # for matching the exact configured intent before approval.
         if not str(self.home_root):
             raise EvalError(
                 "BLOOM_EVAL_SOLANA_HOME_ROOT is required so the host approver "
@@ -536,13 +512,6 @@ class SolanaTransferEval(EvalDefinition):
 
         self.sign_count = self._require_sign_count()
         CeremonyDriver(self.driver, self.seed_file, self.sign_count).preflight()
-
-        # Mainnet cleanup must be able to return the lamports. Discovering that
-        # the sweep tool or key is missing after a broadcast is too late. Local
-        # validator funds disappear with the disposable ledger instead.
-        if self.lane == "mainnet-canary":
-            self._require_sweep_tool()
-            self._require_sweep_keypair()
 
         if not os.path.ismount(self.bloom_mount):
             raise EvalError(f"Bloom is not mounted at {self.bloom_mount}")
@@ -559,6 +528,14 @@ class SolanaTransferEval(EvalDefinition):
 
         if self.lane == "local":
             self._load_local_account_identity()
+            # The account the mount projects must be the account the operator
+            # says the trial spends from, when one was configured explicitly.
+            configured_source = self.env.get("BLOOM_EVAL_SOLANA_SOURCE", "")
+            if configured_source and configured_source != self.source_address:
+                raise EvalError(
+                    "BLOOM_EVAL_SOLANA_SOURCE does not match the wallet's active "
+                    "Solana account address"
+                )
 
         pending = self._list_state("pending")
         if pending:
@@ -582,10 +559,13 @@ class SolanaTransferEval(EvalDefinition):
                 )
 
     def preauthorization_preflight(self) -> None:
-        """Local-file-only validation, for use before any authority exists."""
-        if self.lane != "mainnet-canary":
-            raise EvalError("--authorization-only applies to the mainnet-canary lane")
-        self.authorization_preflight()
+        """Read-only validation, for use before any authority exists.
+
+        Preflight performs no ceremony, no mounted write, no Docker job, and
+        no state change; its only network traffic is the RPC genesis identity
+        read. This mode runs it without constructing an agent or a Harbor job.
+        """
+        self.preflight()
 
     # ---- background approver -------------------------------------------
 
@@ -608,32 +588,17 @@ class SolanaTransferEval(EvalDefinition):
             raise EvalError("staged approval has an invalid ceremony URL")
         return url
 
-    def _read_host_json(self, path: Path) -> Any | None:
-        """Read a host-side outbox artifact, or None when it does not exist."""
-        try:
-            raw = path.read_bytes()
-        except FileNotFoundError:
-            return None
-        except OSError as error:
-            raise EvalError(f"could not read {path}: {error}") from error
-        try:
-            return json.loads(raw)
-        except json.JSONDecodeError:
-            # The file is written atomically, so a torn read means we caught a
-            # rename in flight. Treat it as not-yet-published.
-            return None
-
     def _ceremony_matches_authorized_transfer(self, pending_id: str) -> bool:
-        """Refuse to approve anything but the exact authorized transfer.
+        """Refuse to approve anything but the exact configured transfer.
 
         The approver runs while the agent is live, so it must never be a
-        rubber stamp for whatever the agent happened to stage. This is an
-        independent check from the canary: the canary refuses at broadcast,
-        this refuses at approval.
+        rubber stamp for whatever the agent happened to stage.
 
         The staged intent is read from the host state directory rather than
         through the mount, so the decision cannot be affected by mount latency
-        or by a projection replaced mid-read.
+        or by a projection replaced mid-read. Every authoritative field is
+        required: a staged intent that omits the signing account or the fee
+        cannot silently pass by absence.
         """
         intent = self._read_host_json(
             self._host_entry("pending", pending_id) / "intent.json"
@@ -644,57 +609,101 @@ class SolanaTransferEval(EvalDefinition):
             return False
         if intent.get("lamports") != self.lamports:
             return False
-        if self.source_address and intent.get("fee_payer") != self.source_address:
+        if intent.get("fee_payer") != self.source_address:
             return False
         fee = intent.get("fee_lamports")
-        if self.max_fee_lamports and (
-            not isinstance(fee, int) or fee > self.max_fee_lamports
-        ):
+        if not isinstance(fee, int) or isinstance(fee, bool):
             return False
-        # The staged entry pins the exact derived child it was built for, so the
-        # approver can check the same signing identity the canary will check
-        # again at broadcast. A second active child must never be able to have a
-        # message approved that was staged against the first.
+        if self.max_fee_lamports and fee > self.max_fee_lamports:
+            return False
+        # The staged entry pins the exact derived child it was built for, so
+        # the approver can check the same signing identity the engine checks
+        # again at signing. A second active child must never be able to have a
+        # message approved that was staged against the first, and an intent
+        # that omits the pin cannot borrow the configured identity.
         fingerprint = intent.get("account_fingerprint")
-        if self.key_fingerprint and isinstance(fingerprint, str):
-            if fingerprint.lower() != self.key_fingerprint.lower():
+        if self.key_fingerprint:
+            if not isinstance(fingerprint, str) or (
+                fingerprint.lower() != self.key_fingerprint.lower()
+            ):
                 return False
         derivation = intent.get("account_derivation_path")
-        if self.derivation_path and isinstance(derivation, str):
+        if self.derivation_path:
             if derivation != self.derivation_path:
                 return False
         return True
 
+    def _restage_advice(self, entry_id: str) -> dict[str, Any] | None:
+        """The outbox's restage advice for an approved entry, if published.
+
+        `SolanaTransferEngine::restage_expired` moves the expired entry to
+        `failed` and writes `restage_advice.json` naming the replacement id.
+        The restage route write only returns after that advice lands, so a
+        replacement can never reach a confirmable state before its advice
+        exists: absence here means the predecessor was never restaged.
+        """
+        for state in ("failed", "pending"):
+            advice = self._read_host_json(
+                self._host_entry(state, entry_id) / "restage_advice.json"
+            )
+            if isinstance(advice, dict):
+                if advice.get("schema") != "bloom.solana-restage-advice/1":
+                    raise EvalError(
+                        f"restage advice for {entry_id} has an unexpected schema"
+                    )
+                return advice
+        return None
+
+    def _replacement_is_authorized(self, pending_id: str) -> bool:
+        """Decide whether a differently-named pending entry may be approved.
+
+        Only one succession is authorized: the previously approved entry
+        expired, the agent restaged it, and the outbox's own advice names this
+        entry as the replacement. A second entry staged fresh - identical
+        destination and amount, no expiry, no advice - is a new payment
+        attempt and is refused, as is any id the lineage does not name.
+        """
+        if not self._approved_lineage:
+            return False
+        predecessor = self._approved_lineage[-1]
+        advice = self._restage_advice(predecessor)
+        if advice is None:
+            # The restage operation publishes the advice moments after the
+            # replacement appears; wait rather than approve or refuse early.
+            return False
+        named = advice.get("replacement_id")
+        if not isinstance(named, str) or named != pending_id:
+            return False
+        return True
+
     def _approve_loop(self, ceremonies: CeremonyDriver) -> None:
         deadline = time.monotonic() + APPROVER_BUDGET_SECONDS
-        selected_pending_id: str | None = None
         while not self._approver_stop.is_set() and time.monotonic() < deadline:
             try:
-                pending = self._list_host_state("pending")
-                for pending_id in pending:
+                for pending_id in self._list_host_state("pending"):
                     url = self._pending_confirm_ceremony(pending_id)
                     if url is None:
                         continue
-                    if (
-                        selected_pending_id is not None
-                        and pending_id != selected_pending_id
-                    ):
-                        self._approver_error = (
-                            f"staged entry {pending_id} is not the selected transfer "
-                            f"{selected_pending_id}; refusing to approve it"
-                        )
-                        return
                     if url in ceremonies.completed:
+                        continue
+                    if pending_id in self._approved_lineage:
                         continue
                     if not self._ceremony_matches_authorized_transfer(pending_id):
                         self._approver_error = (
-                            f"staged entry {pending_id} does not match the authorized "
+                            f"staged entry {pending_id} does not match the configured "
                             "transfer; refusing to approve it"
                         )
                         return
-                    if selected_pending_id is None:
-                        selected_pending_id = pending_id
+                    if self._approved_lineage and not self._replacement_is_authorized(
+                        pending_id
+                    ):
+                        self._approver_error = (
+                            f"staged entry {pending_id} does not continue the approved "
+                            "replacement lineage; refusing to approve it"
+                        )
+                        return
                     ceremonies.complete(url)
+                    self._approved_lineage.append(pending_id)
                     self._approver_completed += 1
                     self.next_sign_count = ceremonies.next_sign_count
                     if self._approver_completed >= MAX_TRANSFER_CEREMONIES:
@@ -775,10 +784,10 @@ class SolanaTransferEval(EvalDefinition):
     def sweep_destination(self) -> str | None:
         """Return the destination's lamports to the source.
 
-        This is what makes the eval economically reversible and therefore
-        repeatable: the transfer itself cannot be undone, but the destination
-        is host-controlled, so the lamports come back and only the fees are
-        actually spent. The container never sees this key.
+        This is what makes the mainnet eval economically reversible and
+        therefore repeatable: the transfer itself cannot be undone, but the
+        destination is host-controlled, so the lamports come back and only the
+        fees are actually spent. The container never sees this key.
 
         Returns the sweep signature, or None when there was nothing to sweep.
         """
@@ -846,13 +855,10 @@ class SolanaTransferEval(EvalDefinition):
         self.trial_id = f"bloom-eval-{agent_name}-{stamp}-{secrets.token_hex(8)}"
 
         if self.lane == "local":
-            # Only the local lane may choose its own amount; on the canary lane
-            # the authorization pins it and the harness must not deviate.
+            # Only the local lane derives its amount; the mainnet lane is
+            # pinned by the configured exact amount and must not deviate.
             base = int(self.env.get("BLOOM_EVAL_SOLANA_BASE_LAMPORTS", "1000000"))
             self.lamports = trial_amount(base, self.trial_id)
-            self.max_fee_lamports = int(
-                self.env.get("BLOOM_EVAL_SOLANA_MAX_FEE_LAMPORTS", "10000")
-            )
 
         mounts: list[dict[str, Any]] = [
             {
@@ -867,7 +873,8 @@ class SolanaTransferEval(EvalDefinition):
             # Docker read-only flag is defence in depth; the authority boundary
             # is the VFS mode -- everything under outbox/ is 0444 except
             # new.tx and a pending entry's confirm/cancel/restage -- plus
-            # Broker policy, the passkey ceremony, and the canary.
+            # Broker policy, the passkey ceremony, and the exact-match host
+            # approver.
             {
                 "type": "bind",
                 "source": str(self.outbox_root),
@@ -930,6 +937,11 @@ class SolanaTransferEval(EvalDefinition):
         This is intentionally inside the normal preflight/provision/cleanup
         envelope. A pass proves the mount, route writes, approval watcher,
         ceremony, broadcast, reconciliation, verifier, and cleanup all agree.
+
+        With BLOOM_EVAL_SOLANA_SMOKE_RESTAGE=1 the smoke instead delays
+        approval past the staged blockhash's real expiry, drives the outbox's
+        documented restage path, and requires the replacement to settle into
+        exactly one finalized payment under the same approver.
         """
         staged = json.dumps(
             {"destination": self.destination, "lamports": self.lamports},
@@ -953,7 +965,7 @@ class SolanaTransferEval(EvalDefinition):
         if not isinstance(intent, dict) or not self._ceremony_matches_authorized_transfer(
             pending_id
         ):
-            raise EvalError("smoke staged intent does not match the authorized transfer")
+            raise EvalError("smoke staged intent does not match the configured transfer")
         try:
             plan = subprocess.run(
                 ["cat", str(entry / "plan.md")],
@@ -976,20 +988,17 @@ class SolanaTransferEval(EvalDefinition):
         ):
             raise EvalError("smoke confirm did not publish approval_challenge.json")
 
-        deadline = time.monotonic() + SMOKE_CONFIRM_BUDGET_SECONDS
-        confirmed = False
-        while time.monotonic() < deadline:
-            attempt = self.mount.write_route(
-                entry / "confirm", b"y", ROUTE_WRITE_TIMEOUT_SECONDS
+        if self.env.get(SMOKE_RESTAGE_ENV, "") == "1":
+            pending_id, entry, intent = await self._smoke_restage(
+                context, pending_id, entry, intent
             )
-            if attempt.returncode == 0:
-                confirmed = True
-                break
-            if self._approver_error is not None:
-                raise EvalError(f"smoke approver failed: {self._approver_error}")
-            await asyncio.sleep(0.5)
-        if not confirmed:
-            raise EvalError("smoke confirm did not succeed before the blockhash deadline")
+        else:
+            confirmed = await self._smoke_confirm(entry)
+            if not confirmed:
+                raise EvalError(
+                    "smoke confirm did not succeed before the blockhash deadline"
+                )
+
         if not self.mount.poll_until(
             lambda: pending_id in self._list_state("sent"), 30, 0.5
         ):
@@ -1047,6 +1056,103 @@ class SolanaTransferEval(EvalDefinition):
             trial_results=[trial],
         )
 
+    async def _smoke_confirm(self, entry: Path) -> bool:
+        """Retry the confirm write until the approver has completed the
+        ceremony and Bloom accepts it."""
+        deadline = time.monotonic() + SMOKE_CONFIRM_BUDGET_SECONDS
+        while time.monotonic() < deadline:
+            attempt = self.mount.write_route(
+                entry / "confirm", b"y", ROUTE_WRITE_TIMEOUT_SECONDS
+            )
+            if attempt.returncode == 0:
+                return True
+            if self._approver_error is not None:
+                raise EvalError(f"smoke approver failed: {self._approver_error}")
+            await asyncio.sleep(0.5)
+        return False
+
+    async def _smoke_restage(
+        self, context: EvalRunContext, pending_id: str, entry: Path, intent: Any
+    ) -> tuple[str, Path, Any]:
+        """Hold the confirm past the real blockhash expiry, then restage.
+
+        The approver completes the staged ceremony on sight, but the smoke
+        deliberately never retries the confirm: once the live block height
+        passes the staged blockhash's window, the outbox refuses to sign, and
+        the documented recovery is the restage route. That publishes
+        `restage_advice.json` naming the replacement, and the approver follows
+        that lineage to approve exactly the replacement. Acceptance requires
+        exactly one finalized payment in total.
+        """
+        # The engine refuses a restage until the live block height has really
+        # passed the staged blockhash's window, so the write itself is the
+        # expiry gate: retry until the chain, not an estimate, says it expired.
+        # A concurrent expiry sweep can move the entry to `failed/` first, and
+        # the route is reachable from both states, so follow the entry.
+        def restage_after_expiry() -> bool:
+            location = next(
+                (
+                    state
+                    for state in ("pending", "failed")
+                    if pending_id in self._list_state(state)
+                ),
+                None,
+            )
+            if location is None:
+                return False
+            restage = self.mount.write_route(
+                self.outbox_root / location / pending_id / "restage",
+                b"y",
+                ROUTE_WRITE_TIMEOUT_SECONDS,
+            )
+            return restage.returncode == 0
+
+        if not self.mount.poll_until(
+            restage_after_expiry,
+            SMOKE_RESTAGE_WAIT_ATTEMPTS,
+            SMOKE_RESTAGE_WAIT_DELAY_SECONDS,
+        ):
+            raise EvalError(
+                "smoke restage: the restage write never succeeded, so the staged "
+                "blockhash never expired; cannot exercise the replacement path"
+            )
+        if not self.mount.poll_until(
+            lambda: len(self._list_state("pending")) == 1
+            and self._list_state("pending")[0] != pending_id,
+            20,
+            0.25,
+        ):
+            raise EvalError("smoke restage did not publish exactly one replacement entry")
+        replacement_id = self._list_state("pending")[0]
+        advice = self.mount.read_json_if_listed(
+            self.outbox_root / "failed" / pending_id / "restage_advice.json",
+            self.outbox_root / "failed" / pending_id,
+            "restage_advice.json",
+        )
+        if not isinstance(advice, dict) or advice.get("replacement_id") != replacement_id:
+            raise EvalError(
+                "smoke restage advice does not name the replacement the outbox staged"
+            )
+        replacement_entry = self.outbox_root / "pending" / replacement_id
+        replacement_intent = self.mount.read_json(
+            replacement_entry / "intent.json"
+        )
+        if not isinstance(replacement_intent, dict):
+            raise EvalError("smoke replacement intent is malformed")
+        # The replacement re-quotes the fee, so compare the transfer facts
+        # the approver matches on; the fee only has its ceiling here.
+        for field in ("destination", "lamports", "fee_payer"):
+            if replacement_intent.get(field) != intent.get(field):
+                raise EvalError(
+                    f"smoke replacement changed the transfer's {field}"
+                )
+        confirmed = await self._smoke_confirm(replacement_entry)
+        if not confirmed:
+            raise EvalError(
+                "smoke replacement confirm did not succeed before the blockhash deadline"
+            )
+        return replacement_id, replacement_entry, replacement_intent
+
     # ---- cleanup -------------------------------------------------------
 
     def cleanup(self) -> None:
@@ -1093,7 +1199,8 @@ class SolanaTransferEval(EvalDefinition):
             sent = sorted(all_sent - self._baseline_sent)
             if len(sent) > 1:
                 failures.append(
-                    f"outbox/sent has {len(sent)} entries; the authorization permits one"
+                    f"outbox/sent has {len(sent)} entries; the configured transfer "
+                    "permits one"
                 )
             for sent_id in sent:
 
@@ -1121,7 +1228,7 @@ class SolanaTransferEval(EvalDefinition):
             #
             # This is the independent recovery boundary. It must run even if a
             # mounted cancel, listing, or receipt read fails or is interrupted.
-            if self.lane == "mainnet-canary":
+            if self.lane == "mainnet":
                 if self.source_address and self.destination:
                     try:
                         signature = self.sweep_destination()
