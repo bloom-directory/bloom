@@ -516,6 +516,10 @@ class HyperliquidApproveBuilderFeeEval(EvalDefinition):
         if not self.seed_file_value:
             raise EvalError("BLOOM_EVAL_AUTHENTICATOR_SEED_FILE is required")
         self.sign_count = self._require_sign_count()
+        # Before any ceremony spends a counter, prove the spend can be
+        # recorded. A sidecar that cannot be written turns an ordinary
+        # run into a counter Broker will later reject as a replay.
+        self.require_counter_durability()
         try:
             seed_stat = self.seed_file.lstat()
         except OSError as error:
@@ -601,14 +605,9 @@ class HyperliquidApproveBuilderFeeEval(EvalDefinition):
             # One attempt only, matching hyperliquid_order_cancel.py: Broker
             # marks a consumed or absent ceremony CEREMONY_REPLAY with retry
             # "never", so a retry here cannot succeed and only burns another
-            # WebAuthn counter. The counter is reserved durably before
-            # invoking the driver, since the assertion may reach Broker even
-            # if this process is interrupted before it returns.
+            # WebAuthn counter.
             attempted_counter = counter
-            counter = attempted_counter + 1
-            if self.counter_committed is not None:
-                self.counter_committed(counter)
-            self.next_sign_count = counter
+            counter = self.reserve_counter(attempted_counter)
             # Persist onto the instance too, not just the local. cleanup()
             # runs a second ceremony on this same object; without this it
             # would restart from the original environment counter and reuse

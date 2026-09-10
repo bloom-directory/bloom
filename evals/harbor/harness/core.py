@@ -75,6 +75,64 @@ class EvalDefinition(ABC):
     def cleanup(self) -> None:
         """Remove residual side effects and revoke the provisioned capability."""
 
+    # ---- WebAuthn counter reservation -------------------------------------
+    #
+    # Every ceremony this harness drives spends one authenticator counter.
+    # Broker rejects a reused counter as a replay, so a counter must be
+    # treated as spent from the moment the driver could possibly reach
+    # Broker -- not once it returns. Both live Hyperliquid evals reserve
+    # through these two methods so the durability rule has one definition.
+
+    #: Set by the operator to persist the next unused counter durably.
+    #: `None` when the eval is driven without an operator state file.
+    counter_committed: Callable[[int], None] | None = None
+    #: Set by the operator to prove that persistence works, without
+    #: advancing anything. `None` when there is no sidecar to check.
+    counter_durability_check: Callable[[], None] | None = None
+    #: The first counter this run has not consumed.
+    next_sign_count: int | None = None
+
+    def require_counter_durability(self) -> None:
+        """Fail preflight unless a reserved counter can actually be persisted.
+
+        `reserve_counter` commits before invoking the driver precisely so an
+        interrupted run cannot reuse a counter. That guarantee is only as
+        good as the sidecar write behind `counter_committed`: if the
+        operator state file is read-only, or its directory is not writable,
+        the commit raises *after* the assertion may already have reached
+        Broker. The counter is then spent at Broker but not recorded, and
+        the next run starts from a counter Broker will reject as a replay.
+
+        Checking it here converts that into a clean refusal before any
+        authority is created. An eval driven without an operator state file
+        has nothing to verify and is left alone.
+        """
+        if self.counter_durability_check is None:
+            return
+        try:
+            self.counter_durability_check()
+        except EvalError:
+            raise
+        except Exception as error:  # noqa: BLE001 - reported, not swallowed
+            raise EvalError(
+                "authenticator counter sidecar is not writable, so a spent "
+                f"counter could not be recorded: {error}"
+            ) from error
+
+    def reserve_counter(self, counter: int) -> int:
+        """Durably reserve `counter` and return the next unused one.
+
+        Commits *before* the caller invokes the driver: the assertion may
+        reach Broker even if this process is interrupted or times out
+        before the subprocess returns, so persisting afterwards is too late
+        to guarantee the counter is never reused.
+        """
+        reserved = counter + 1
+        if self.counter_committed is not None:
+            self.counter_committed(reserved)
+        self.next_sign_count = reserved
+        return reserved
+
     def validate_result(self, result: Any) -> None:
         """Fail unless Harbor completed one error-free, positively graded trial."""
         stats = result.stats

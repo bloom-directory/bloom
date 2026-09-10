@@ -778,6 +778,10 @@ class HyperliquidOrderCancelEval(EvalDefinition):
         if not self.seed_file_value:
             raise EvalError("BLOOM_EVAL_AUTHENTICATOR_SEED_FILE is required")
         self.sign_count = self._require_sign_count()
+        # Before any ceremony spends a counter, prove the spend can be
+        # recorded. A sidecar that cannot be written turns an ordinary
+        # run into a counter Broker will later reject as a replay.
+        self.require_counter_durability()
         try:
             seed_stat = self.seed_file.lstat()
         except OSError as error:
@@ -916,15 +920,8 @@ class HyperliquidOrderCancelEval(EvalDefinition):
             # revision retried here on the theory that a freshly published
             # ceremony URL might not yet resolve; that theory was wrong, and the
             # retries turned one failure into three.
-            # Reserve the next counter durably before invoking the driver. The
-            # assertion may reach Broker even when the local process times out
-            # or is interrupted, so persistence after subprocess completion is
-            # too late to guarantee that this counter will never be reused.
             attempted_counter = counter
-            counter = attempted_counter + 1
-            if self.counter_committed is not None:
-                self.counter_committed(counter)
-            self.next_sign_count = counter
+            counter = self.reserve_counter(attempted_counter)
             try:
                 completed = subprocess.run(
                     [

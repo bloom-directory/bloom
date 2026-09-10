@@ -201,6 +201,32 @@ attempt that reached the Broker: gaps are valid, while reuse after an ambiguous
 transport result is unsafe. The protected backup and recovery marker are
 cleared only after the deny-by-default policy is visible again.
 
+### The authenticator counter sidecar
+
+`next_sign_count` in the operator state file is the only durable record of
+which WebAuthn counters have been spent. Broker rejects a reused counter as
+a replay, so the harness treats a counter as spent from the moment the debug
+driver could reach Broker, not once it returns: `EvalDefinition.reserve_counter`
+commits the advanced value through `StateStore.update_counter` *before*
+invoking the driver. A run interrupted mid-assertion therefore leaves the
+counter recorded as consumed, which is the safe direction — a skipped
+counter is valid, a reused one is not.
+
+That guarantee depends entirely on the sidecar being writable. If the state
+file is read-only, its parent directory is not writable, or the filesystem is
+full, the commit raises *after* the assertion may already have reached Broker:
+the counter is spent at Broker but absent from the file, and the next run
+starts from a counter Broker will reject. Preflight therefore calls
+`EvalDefinition.require_counter_durability`, which exercises
+`StateStore.verify_writable` — a rewrite of the validated state as its own
+canonical bytes through the same atomic path a real commit uses. It proves the
+write can land while leaving `next_sign_count` untouched, so the check itself
+can never make a run skip a counter. A run driven without an operator state
+file has no sidecar and skips the check.
+
+Both live Hyperliquid evals share these two methods, so the reservation and
+durability rules have a single definition rather than one copy per eval.
+
 Each run writes a mode-`0600` JSON summary beside the operator state, under
 `harbor-summaries/`. It includes source lineage, installed package hash,
 Harbor/model configuration, reward, trial errors/retries, monotonic phase and

@@ -81,6 +81,31 @@ class OperatorStateTests(unittest.TestCase):
         with self.assertRaisesRegex(EvalError, "non-advancing"):
             self.store.update_counter(8)
 
+    def test_verify_writable_proves_the_path_without_moving_the_counter(self) -> None:
+        before = self.store.read()
+        self.store.verify_writable()
+        after = self.store.read()
+        self.assertEqual(after["next_sign_count"], before["next_sign_count"])
+        # Same bytes, so a preflight check can never make a run skip a
+        # counter, and it leaves no temporary behind.
+        self.assertEqual(after, before)
+        self.assertFalse(list(self.root.glob(".state.json.new-*")))
+        self.assertEqual(stat.S_IMODE(self.store.path.stat().st_mode), 0o600)
+
+    def test_verify_writable_fails_on_a_read_only_directory(self) -> None:
+        # The real failure mode: update_counter writes through a temporary
+        # in the parent directory, so a writable file inside a read-only
+        # directory still cannot be committed.
+        original = stat.S_IMODE(self.root.stat().st_mode)
+        self.root.chmod(0o500)
+        try:
+            with self.assertRaises(OSError):
+                self.store.verify_writable()
+        finally:
+            # Restore here, not via addCleanup: tearDown removes the
+            # directory first, and a read-only parent would defeat it.
+            self.root.chmod(original)
+
     def test_default_handoff_is_repository_local_and_self_describing(self) -> None:
         args = parser(self.root).parse_args(["status"])
         self.assertEqual(args.state, self.root / DEFAULT_STATE_RELATIVE)

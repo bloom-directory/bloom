@@ -173,6 +173,18 @@ class StateStore:
     def write(self, value: dict[str, Any]) -> None:
         atomic_write(self.path, canonical_json(value) + b"\n")
 
+    def verify_writable(self) -> None:
+        """Prove a counter commit can land, without advancing the counter.
+
+        Rewrites the validated state as its own canonical bytes through the
+        same atomic path `update_counter` uses, so a read-only file, a
+        read-only parent directory, or a full filesystem is caught during
+        preflight rather than after a ceremony has already spent a counter
+        at Broker. Rewriting identical bytes leaves `next_sign_count`
+        untouched, so a failed run cannot silently skip a counter.
+        """
+        self.write(self.read())
+
     def update_counter(self, next_counter: int) -> None:
         state = self.read()
         current = state.get("next_sign_count")
@@ -1017,6 +1029,7 @@ def run_or_recover(
         definition_env(state),
         counter_committed=store.update_counter,
     )
+    definition.counter_durability_check = store.verify_writable
     with lock_path.open("a+") as lock:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)

@@ -119,6 +119,98 @@ class BuilderFeeFixture:
         self.temp.cleanup()
 
 
+class AddressValidationTests(BuilderFeeFixture, unittest.TestCase):
+    """Hostile addresses must be refused before they reach a path.
+
+    `BLOOM_EVAL_WALLET` and `BLOOM_EVAL_BUILDER` are interpolated straight
+    into `max_builder_fee_path`, so a value carrying path metacharacters
+    would read somewhere other than the venue projection this eval treats
+    as independent evidence. An absolute value is the worst case: pathlib
+    discards everything to its left, so the read escapes the mount
+    entirely rather than merely moving within it.
+    """
+
+    HOSTILE = {
+        "traversal": "../../../../etc/passwd",
+        "absolute": "/etc/passwd",
+        "trailing newline": "0x" + "a" * 40 + "\n",
+        "leading newline": "\n" + "0x" + "a" * 40,
+        "trailing slash segment": "0x" + "a" * 40 + "/..",
+        "glob": "0x" + "a" * 39 + "*",
+        "shell metacharacters": "0x" + "a" * 39 + ";id",
+        "nul byte": "0x" + "a" * 40 + "\x00",
+        "uppercase": "0X" + "A" * 40,
+        "empty": "",
+    }
+
+    def test_preflight_rejects_a_wallet_carrying_path_metacharacters(self) -> None:
+        for case, value in self.HOSTILE.items():
+            self.env["BLOOM_EVAL_WALLET"] = value
+            definition = HyperliquidApproveBuilderFeeEval(self.repo, self.env)
+            with self.subTest(case=case):
+                with self.assertRaisesRegex(EvalError, "BLOOM_EVAL_WALLET"):
+                    definition.preflight()
+
+    def test_preflight_rejects_a_builder_carrying_path_metacharacters(self) -> None:
+        for case, value in self.HOSTILE.items():
+            self.env["BLOOM_EVAL_BUILDER"] = value
+            definition = HyperliquidApproveBuilderFeeEval(self.repo, self.env)
+            with self.subTest(case=case):
+                with self.assertRaisesRegex(EvalError, "BLOOM_EVAL_BUILDER"):
+                    definition.preflight()
+
+    def test_a_hostile_address_would_have_escaped_the_mount(self) -> None:
+        """Why the check above matters, not just that it fires."""
+        self.env["BLOOM_EVAL_WALLET"] = "/etc/passwd"
+        escaped = HyperliquidApproveBuilderFeeEval(self.repo, self.env)
+        self.assertFalse(
+            escaped.max_builder_fee_path.is_relative_to(self.mount),
+            "an absolute wallet escapes the mount, so preflight must refuse it",
+        )
+        # The validated address stays where the venue projection lives.
+        self.assertTrue(self.definition.max_builder_fee_path.is_relative_to(self.mount))
+
+
+class CounterDurabilityTests(BuilderFeeFixture, unittest.TestCase):
+    """A counter that cannot be recorded must stop the run before it starts."""
+
+    def test_preflight_fails_when_the_counter_sidecar_cannot_be_written(self) -> None:
+        def unwritable() -> None:
+            raise OSError(30, "Read-only file system")
+
+        self.definition.counter_durability_check = unwritable
+        with self.assertRaisesRegex(EvalError, "counter sidecar is not writable"):
+            self.definition.preflight()
+
+    def test_preflight_reports_an_eval_error_from_the_sidecar_unchanged(self) -> None:
+        self.definition.counter_durability_check = mock.Mock(
+            side_effect=EvalError("operator state recovery locations are stale")
+        )
+        with self.assertRaisesRegex(EvalError, "recovery locations are stale"):
+            self.definition.preflight()
+
+    def test_reserve_counter_commits_before_returning(self) -> None:
+        committed: list[int] = []
+        self.definition.counter_committed = committed.append
+        self.assertEqual(self.definition.reserve_counter(4), 5)
+        self.assertEqual(committed, [5], "the spend is recorded, not just returned")
+        self.assertEqual(self.definition.next_sign_count, 5)
+
+    def test_reserve_counter_works_without_an_operator_sidecar(self) -> None:
+        self.definition.counter_committed = None
+        self.assertEqual(self.definition.reserve_counter(9), 10)
+        self.assertEqual(self.definition.next_sign_count, 10)
+
+    def test_a_sidecar_commit_failure_aborts_before_the_driver_runs(self) -> None:
+        # reserve_counter must propagate, not swallow: a counter that could
+        # not be recorded is exactly the one that must not be spent.
+        self.definition.counter_committed = mock.Mock(
+            side_effect=EvalError("refusing a non-advancing authenticator counter update")
+        )
+        with self.assertRaisesRegex(EvalError, "non-advancing"):
+            self.definition.reserve_counter(4)
+
+
 class HyperliquidApproveBuilderFeeDefinitionTests(BuilderFeeFixture, unittest.TestCase):
     def test_installed_package_hash_must_match_owner_record(self) -> None:
         self.owner_record.write_text(
