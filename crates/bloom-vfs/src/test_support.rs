@@ -62,7 +62,7 @@ pub(crate) fn wallet_projection_reader(
         wallet: WalletPublic {
             wallet_id: wallet_id.clone(),
             wallet_kind: Token::new("passkey").unwrap(),
-            root_key_ref: key_ref.clone(),
+            root_key_ref: Some(key_ref.clone()),
             key_refs: vec![key_ref.clone()],
             policy_version: DecimalU64::new(1),
             policy_digest: policy_digest.clone(),

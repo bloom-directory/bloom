@@ -860,7 +860,7 @@ mod tests {
                         Ok(MachineBrokerResponse::WalletGetPublic(WalletPublic {
                             wallet_id: token("wallet"),
                             wallet_kind: token("local"),
-                            root_key_ref: test_key_ref(),
+                            root_key_ref: Some(test_key_ref()),
                             key_refs: vec![test_key_ref()],
                             policy_version: DecimalU64::new(1),
                             policy_digest: digest(4),

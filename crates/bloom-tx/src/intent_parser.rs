@@ -149,6 +149,38 @@ impl LooseIntent {
                 value: self.value.unwrap_or_default(),
                 data: self.data.ok_or(ParseError::Ambiguous)?,
             },
+            "deploy" => {
+                if self.to.is_some()
+                    || self.contract.is_some()
+                    || self.token.is_some()
+                    || self.method.is_some()
+                    || self.args.is_some()
+                    || self.amount.is_some()
+                    || self.spender.is_some()
+                    || self.intent.is_some()
+                    || self.operator.is_some()
+                    || self.token_id.is_some()
+                    || self.standard.is_some()
+                    || self.safe.is_some()
+                    || self.approved.is_some()
+                {
+                    return Err(ParseError::Invalid(
+                        "deploy accepts complete initcode in data and an optional native value; call, token, and NFT fields are not supported".into(),
+                    ));
+                }
+                let data = self.data.ok_or(ParseError::Ambiguous)?;
+                let bytes = hex::decode(data.strip_prefix("0x").unwrap_or(&data))
+                    .map_err(|_| ParseError::Invalid("deploy requires hex initcode".into()))?;
+                if bytes.is_empty() {
+                    return Err(ParseError::Invalid(
+                        "deploy requires nonempty initcode".into(),
+                    ));
+                }
+                RawIntentBody::Deploy {
+                    data,
+                    value: self.value.unwrap_or_default(),
+                }
+            }
             "enso" => RawIntentBody::Enso {
                 intent: self.intent.ok_or(ParseError::Ambiguous)?,
             },
@@ -389,6 +421,31 @@ fn parse_nft_shell(line: &str) -> Result<RawIntent, ParseError> {
 mod tests {
     use super::*;
     use bloom_proto::RawIntentBody;
+
+    #[test]
+    fn parse_explicit_deployment_and_reject_ambiguous_fields() {
+        for input in [
+            r#"{"kind":"deploy","data":"0x60006000f3","value":"123 wei"}"#,
+            r#"kind = "deploy"
+data = "0x60006000f3"
+value = "123 wei""#,
+        ] {
+            let parsed = super::parse(input).unwrap();
+            assert!(
+                matches!(parsed.body, bloom_proto::RawIntentBody::Deploy { value, .. } if value == "123 wei")
+            );
+        }
+        for input in [
+            r#"{"kind":"deploy","data":"0x"}"#,
+            r#"{"kind":"deploy","data":"0xz0"}"#,
+            r#"{"kind":"deploy","data":"0x00","to":"0x0000000000000000000000000000000000000000"}"#,
+            r#"{"kind":"deploy","data":"0x00","args":[1]}"#,
+            r#"{"kind":"raw","data":"0x00"}"#,
+            r#"{"data":"0x00"}"#,
+        ] {
+            assert!(super::parse(input).is_err(), "accepted {input}");
+        }
+    }
 
     #[test]
     fn json_send() {

@@ -641,6 +641,12 @@ pub enum MachineCommand {
         outcome: String,
         confirm: String,
     },
+    DeploymentRpc {
+        wallet: String,
+        chain: String,
+        method: String,
+        params: Value,
+    },
     WalletList,
     WalletProjection {
         name: String,

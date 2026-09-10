@@ -90,6 +90,12 @@ pub enum RawIntentBody {
         value: String,
         data: String,
     },
+    /// Direct contract creation. Data is complete initcode, including constructor arguments.
+    Deploy {
+        data: String,
+        #[serde(default)]
+        value: String,
+    },
     /// ERC-20 approval. `amount` accepts a decimal integer or `"max"`
     /// (shorthand for 2^256 - 1 — the conventional infinite-allowance
     /// value). The tx engine encodes `approve(address,uint256)`; the
@@ -167,7 +173,7 @@ pub struct RawIntent {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TxIntent {
     pub from: String,
-    pub to: String,
+    pub to: Option<String>,
     pub value_wei: String,
     pub data_hex: String,
     pub chain_id: u64,

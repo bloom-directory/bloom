@@ -64,7 +64,12 @@ impl WalletProjection {
     }
 
     pub fn primary_key(&self) -> Result<&KeyPublic, ProtocolError> {
-        let key_ref = &self.wallet.root_key_ref;
+        let key_ref = self.wallet.root_key_ref.as_ref().ok_or_else(|| {
+            invalid_projection(format!(
+                "wallet {} has no signable root key reference",
+                self.wallet.wallet_id.as_str()
+            ))
+        })?;
         self.keys
             .iter()
             .find(|key| &key.key_ref == key_ref && key.role == KeyRole::WalletRoot)
@@ -918,19 +923,24 @@ fn validate_projection(projection: &WalletProjection) -> Result<(), ProtocolErro
         .map(|key| serde_json::to_string(&key.key_ref))
         .collect::<Result<BTreeSet<_>, _>>()
         .map_err(|error| invalid_projection(format!("encode public key reference: {error}")))?;
-    let encoded_root = serde_json::to_string(&projection.wallet.root_key_ref).map_err(|error| {
+    let Some(root_key_ref) = projection.wallet.root_key_ref.as_ref() else {
+        return Err(invalid_projection(format!(
+            "wallet {} has no signable root key reference",
+            wallet_id.as_str()
+        )));
+    };
+    let encoded_root = serde_json::to_string(root_key_ref).map_err(|error| {
         invalid_projection(format!("encode wallet root key reference: {error}"))
     })?;
-    if !projection
-        .wallet
-        .key_refs
-        .contains(&projection.wallet.root_key_ref)
-        || !projection.keys.iter().any(|key| {
-            key.key_ref == projection.wallet.root_key_ref && key.role == KeyRole::WalletRoot
-        })
-        || projection.keys.iter().any(|key| {
-            key.role == KeyRole::WalletRoot && key.key_ref != projection.wallet.root_key_ref
-        })
+    if !projection.wallet.key_refs.contains(root_key_ref)
+        || !projection
+            .keys
+            .iter()
+            .any(|key| &key.key_ref == root_key_ref && key.role == KeyRole::WalletRoot)
+        || projection
+            .keys
+            .iter()
+            .any(|key| key.role == KeyRole::WalletRoot && &key.key_ref != root_key_ref)
         || !key_refs.contains(&encoded_root)
     {
         return Err(invalid_projection(format!(
@@ -1186,7 +1196,7 @@ mod tests {
         derived.role = KeyRole::Derived;
         fixture.wallet.key_refs.insert(0, derived.key_ref.clone());
         fixture.keys.insert(0, derived);
-        let expected_root = fixture.wallet.root_key_ref.clone();
+        let expected_root = fixture.wallet.root_key_ref.clone().unwrap();
         let projection = build_projection(
             fixture.wallet,
             fixture.keys,
@@ -1587,7 +1597,7 @@ mod tests {
             wallet: WalletPublic {
                 wallet_id: wallet_id.clone(),
                 wallet_kind: token("passkey"),
-                root_key_ref: key_ref.clone(),
+                root_key_ref: Some(key_ref.clone()),
                 key_refs: vec![key_ref.clone()],
                 policy_version: DecimalU64::new(version),
                 policy_digest: policy_digest.clone(),
@@ -1649,7 +1659,7 @@ mod tests {
             custody_operation_id: operation_id,
             public_status: CeremonyState::Succeeded,
             wallet_id: Some(fixture.wallet.wallet_id.clone()),
-            public_key_refs: vec![fixture.wallet.root_key_ref.clone()],
+            public_key_refs: vec![fixture.wallet.root_key_ref.clone().unwrap()],
             credential_summaries: vec![CredentialSummary {
                 credential_id: Base64UrlBytes::from_bytes(&[11; 16]),
                 rp_id: token("localhost"),

@@ -31,6 +31,7 @@ pub enum TxActionKind {
     NativeTransfer,
     Erc20Transfer,
     ContractCall,
+    ContractCreation,
     Approval,
     NftTransfer,
 }
@@ -104,7 +105,8 @@ pub struct StagedTx {
     pub chain: String,
     pub chain_id: u64,
     pub from: String,
-    pub to: String,
+    /// None is direct CREATE; existing address strings deserialize unchanged.
+    pub to: Option<String>,
     pub value_wei: String,
     pub data_hex: String,
     pub gas_limit: u64,
@@ -163,6 +165,39 @@ pub struct StagedTx {
 }
 
 impl StagedTx {
+    /// Validate the creation/call distinction before simulation or signing.
+    /// Missing recipients on historical calls must never become deployments.
+    pub fn transaction_kind(&self) -> Result<alloy::primitives::TxKind, String> {
+        use alloy::primitives::{Address, TxKind};
+        match (&self.to, self.action_kind) {
+            (None, TxActionKind::ContractCreation)
+                if self.token.is_none() && self.nft.is_none() =>
+            {
+                let data = self.data_hex.strip_prefix("0x").unwrap_or(&self.data_hex);
+                if data.is_empty()
+                    || !data.len().is_multiple_of(2)
+                    || !data.bytes().all(|b| b.is_ascii_hexdigit())
+                {
+                    return Err("contract creation requires nonempty hex initcode".into());
+                }
+                Ok(TxKind::Create)
+            }
+            (Some(to), kind) if kind != TxActionKind::ContractCreation => to
+                .parse::<Address>()
+                .map(TxKind::Call)
+                .map_err(|e| e.to_string()),
+            _ => Err("transaction recipient does not match its creation/call kind".into()),
+        }
+    }
+
+    pub fn predicted_contract_address(&self) -> Option<String> {
+        if self.transaction_kind().ok()? != alloy::primitives::TxKind::Create {
+            return None;
+        }
+        let from = self.from.parse::<alloy::primitives::Address>().ok()?;
+        Some(crate::checksum_address(&from.create(self.nonce)))
+    }
+
     /// Resolve the persisted execution origin, preserving native behavior for
     /// entries serialized before execution provenance existed.
     pub fn resolved_execution_origin(&self) -> ExecutionOrigin {
@@ -237,16 +272,36 @@ impl PlanRender {
         // `From` is always the wallet's own owner/signer EOA — label it so it
         // is never read as a deposit/funder or other role address.
         s.push_str(&format!("From:   {} (owner/signer EOA)\n", staged.from));
-        if let Some(tok) = &staged.token {
+        if staged.action_kind == TxActionKind::ContractCreation {
+            s.push_str("Action: Deploy contract (CREATE)\nTo:     (none; contract creation)\n");
+            if let Some(address) = staged.predicted_contract_address() {
+                s.push_str(&format!(
+                    "Predicted address: {address} (sender and nonce; verify receipt)\n"
+                ));
+            }
+            if let Ok(bytes) = alloy::hex::decode(&staged.data_hex) {
+                s.push_str(&format!(
+                    "Initcode keccak256: {:#x}\n",
+                    alloy::primitives::keccak256(bytes)
+                ));
+            }
+            s.push_str("Constructor effects and resulting ownership are not verified.\n");
+        } else if let Some(tok) = &staged.token {
             // ERC-20 transfer view.
-            s.push_str(&format!("To:     {} (token contract)\n", staged.to));
+            s.push_str(&format!(
+                "To:     {} (token contract)\n",
+                staged.to.as_deref().unwrap_or("(none)")
+            ));
             s.push_str(&format!("Token:  {} ({})\n", tok.symbol, tok.address));
             s.push_str(&format!(
                 "Action: Transfer {} {} to {}\n",
                 tok.amount, tok.symbol, tok.recipient
             ));
         } else if let Some(nft) = &staged.nft {
-            s.push_str(&format!("To:     {} (NFT contract)\n", staged.to));
+            s.push_str(&format!(
+                "To:     {} (NFT contract)\n",
+                staged.to.as_deref().unwrap_or("(none)")
+            ));
             let label = if nft.symbol.is_empty() {
                 nft.contract.clone()
             } else {
@@ -298,7 +353,10 @@ impl PlanRender {
             };
             s.push_str(&line);
         } else {
-            s.push_str(&format!("To:     {}\n", staged.to));
+            s.push_str(&format!(
+                "To:     {}\n",
+                staged.to.as_deref().unwrap_or("(none)")
+            ));
         }
         s.push_str(&format!(
             "Chain:  {} (id {})\n",
@@ -359,7 +417,7 @@ mod tests {
             chain: "ethereum".to_string(),
             chain_id: 1,
             from: "0xfromfromfromfromfromfromfromfromfromfrom".to_string(),
-            to: "0xtotototototototototototototototototototo".to_string(),
+            to: Some("0xtotototototototototototototototototototo".to_string()),
             // 1.5 ETH
             value_wei: "1500000000000000000".to_string(),
             data_hex: "0x".to_string(),
@@ -381,6 +439,59 @@ mod tests {
             depends_on: None,
             action_id: None,
             execution_origin: None,
+        }
+    }
+
+    #[test]
+    fn creation_roundtrip_review_and_call_distinction() {
+        use alloy::primitives::{Address, TxKind};
+        let mut staged = base_eth_send();
+        staged.from = "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266".into();
+        staged.to = None;
+        staged.nonce = 0;
+        staged.action_kind = TxActionKind::ContractCreation;
+        staged.data_hex = "0x60006000f3".into();
+        let json = serde_json::to_value(&staged).unwrap();
+        assert!(json["to"].is_null());
+        let restored: StagedTx = serde_json::from_value(json).unwrap();
+        assert_eq!(restored.transaction_kind().unwrap(), TxKind::Create);
+        assert_eq!(
+            restored
+                .predicted_contract_address()
+                .unwrap()
+                .to_lowercase(),
+            "0x5fbdb2315678afecb367f032d93f642f64180aa3"
+        );
+        let plan = PlanRender::render(&restored, "ETH", 18);
+        assert!(plan.contains("Deploy contract (CREATE)"));
+        assert!(plan.contains("Initcode keccak256:"));
+        assert!(plan.contains("not verified"));
+        staged.to = Some(Address::ZERO.to_string());
+        assert!(staged.transaction_kind().is_err());
+        staged.action_kind = TxActionKind::ContractCall;
+        assert_eq!(
+            staged.transaction_kind().unwrap(),
+            TxKind::Call(Address::ZERO)
+        );
+        // Historical address strings still load; a missing historical recipient is invalid.
+        let call: StagedTx =
+            serde_json::from_value(serde_json::to_value(&staged).unwrap()).unwrap();
+        assert_eq!(
+            call.transaction_kind().unwrap(),
+            TxKind::Call(Address::ZERO)
+        );
+        staged.to = None;
+        assert!(staged.transaction_kind().is_err());
+    }
+
+    #[test]
+    fn creation_rejects_empty_or_invalid_initcode() {
+        let mut staged = base_eth_send();
+        staged.to = None;
+        staged.action_kind = TxActionKind::ContractCreation;
+        for data in ["", "0x", "0x1", "0xzz"] {
+            staged.data_hex = data.into();
+            assert!(staged.transaction_kind().is_err(), "accepted {data}");
         }
     }
 
