@@ -78,11 +78,17 @@ pub(super) fn parse_account_segment(segment: &str) -> Option<u32> {
 }
 
 /// `accounts.json` with the number each entry's path encodes, shared by the
-/// VFS read and the CLI's `wallet accounts` projection.
+/// VFS read and the CLI's `wallet accounts` projection. `unavailable` is the
+/// Broker's reason the inventory could not be projected, rendered as
+/// `accounts_unavailable` so an empty list is never mistaken for an answer.
 pub fn accounts_json_with_numbers(
     accounts: &bloom_broker_api::WalletAccountsPublic,
+    unavailable: Option<&str>,
 ) -> Result<Vec<u8>, HandlerError> {
     let mut value = serde_json::to_value(accounts).map_err(err_be)?;
+    if let (Some(reason), serde_json::Value::Object(fields)) = (unavailable, &mut value) {
+        fields.insert("accounts_unavailable".into(), serde_json::json!(reason));
+    }
     if let (Some(serde_json::Value::Array(entries)), Some(numbers)) = (
         value.get_mut("accounts"),
         Some(

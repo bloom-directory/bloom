@@ -167,6 +167,7 @@ fn projection(address: String) -> (WalletPublic, Arc<dyn WalletProjectionReader>
             signer_signature: Base64UrlBytes::from_bytes(&[5; 64]),
         },
         accounts: empty_wallet_accounts(bloom_broker_api::Token::new("m2").unwrap()),
+        accounts_unavailable: None,
         source_protocol: "bloom.machine-broker.v1".into(),
         response_digest: digest(6),
         observed_at_ms: 1,

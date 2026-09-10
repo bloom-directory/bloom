@@ -63,6 +63,11 @@ receipt carries public binding data, not the credential secret or root key.
 
 Broker projects public derived accounts through `wallet.accounts`; Machine
 exposes the authenticated collection as `wallets/<wallet>/accounts.json`.
+A wallet Broker refuses to characterise, having no root key and no active
+derived key (every child retired) or legacy BIP-32 custody, still mounts: its
+numbered tree is empty and `accounts.json` carries the refusal as
+`accounts_unavailable`, so it never blocks its siblings' `/wallets` tree.
+Spending from it fails closed with that same reason.
 Selection binds the exact `KeyRef` into approval terms and signing identity.
 When multiple compatible children exist, omission or ambiguity fails closed
 and names the public fingerprints and derivation paths; list order is never an

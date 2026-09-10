@@ -2968,7 +2968,10 @@ impl WalletsHandler {
                 // The cached, authenticated inventory; freshness rides on the
                 // projection, and this read carries no authority side effect.
                 let projection = self.wallet_projection(wallet).await?;
-                render_accounts_json(&projection.accounts)
+                render_accounts_json(
+                    &projection.accounts,
+                    projection.accounts_unavailable.as_deref(),
+                )
             }
             "new" => self.account_creation_status(wallet).await,
             "public_key" => {
@@ -4020,7 +4023,11 @@ impl WalletsHandler {
         // before anything spends from it, because the cache may predate a
         // retirement or a new sibling.
         let projection = self.wallet_projection(wallet).await?;
-        let mut accounts = projection.accounts.accounts.clone();
+        let mut accounts = projection
+            .account_inventory()
+            .map_err(err_be)?
+            .accounts
+            .clone();
         if projection.freshness == bloom_machine_client::ProjectionFreshness::Stale {
             let broker = self.broker.as_ref().ok_or_else(|| {
                 HandlerError::backend(
@@ -4920,6 +4927,7 @@ mod tests {
             accounts: bloom_machine_client::empty_wallet_accounts(
                 bloom_broker_api::Token::new("alice").unwrap(),
             ),
+            accounts_unavailable: None,
             verification: ProjectionVerification::AuthenticatedBroker,
         }
     }
@@ -4994,6 +5002,7 @@ mod tests {
                 seed_profile: WalletSeedProfile::Bip39MulticurveV1,
                 accounts,
             },
+            accounts_unavailable: None,
             verification: ProjectionVerification::AuthenticatedBroker,
         }))
     }
@@ -7844,6 +7853,52 @@ mod tests {
         let parsed: WalletAccountsPublic = serde_json::from_slice(&body).unwrap();
         assert_eq!(parsed.wallet_id.as_str(), f.wallet_name);
         assert!(parsed.accounts.is_empty());
+    }
+
+    /// A wallet the Broker refused to characterise (the retired-out legacy
+    /// shape: no root key, no derived keys) still mounts. Its numbered tree
+    /// is empty and `accounts.json` names the refusal instead of presenting
+    /// an empty inventory as fact.
+    #[tokio::test]
+    async fn a_wallet_without_an_account_inventory_mounts_and_names_the_reason() {
+        let f = make_handler();
+        let mut projection = static_projection_value(f.wallet_addr);
+        projection.wallet.root_key_ref = None;
+        projection.wallet.key_refs.clear();
+        projection.keys.clear();
+        projection.accounts_unavailable = Some(
+            "BACKEND_UNSUPPORTED: wallet projection carries neither a root key nor any \
+             derived key, so its seed profile cannot be established"
+                .into(),
+        );
+        let handler = f
+            .handler
+            .with_projection_reader(Arc::new(StaticProjection(projection)));
+
+        let wallet_dir = VfsPath::parse(&format!("/{}", f.wallet_name)).unwrap();
+        let listed = handler.list(&wallet_dir).await.unwrap();
+        let names = listed
+            .iter()
+            .map(|entry| entry.name.clone())
+            .collect::<Vec<_>>();
+        assert!(names.iter().any(|name| name == "accounts.json"));
+        assert!(
+            names.iter().all(|name| name.parse::<u32>().is_err()),
+            "an unprojectable wallet has no numbered accounts: {names:?}"
+        );
+
+        let accounts = VfsPath::parse(&format!("/{}/accounts.json", f.wallet_name)).unwrap();
+        let body: serde_json::Value =
+            serde_json::from_slice(&handler.read(&accounts).await.unwrap()).unwrap();
+        assert_eq!(body["wallet_id"], serde_json::json!(f.wallet_name));
+        assert_eq!(body["accounts"], serde_json::json!([]));
+        assert!(
+            body["accounts_unavailable"]
+                .as_str()
+                .unwrap()
+                .starts_with("BACKEND_UNSUPPORTED: "),
+            "{body}"
+        );
     }
 
     /// The registry split's whole point: a Solana chain with a working RPC

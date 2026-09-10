@@ -87,6 +87,7 @@ pub(crate) fn wallet_projection_reader(
             signer_signature: Base64UrlBytes::from_bytes(&[4; 64]),
         },
         accounts: empty_wallet_accounts(bloom_broker_api::Token::new("static").unwrap()),
+        accounts_unavailable: None,
         source_protocol: "bloom.machine-broker.v1".into(),
         response_digest: Digest32::from_bytes([5; 32]),
         observed_at_ms: 1,

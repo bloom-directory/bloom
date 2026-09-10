@@ -60,6 +60,15 @@ pub struct WalletProjection {
     /// still decode; the first live refresh repopulates it.
     #[serde(default = "empty_accounts")]
     pub accounts: WalletAccountsPublic,
+    /// Why the Broker could not project this wallet's account inventory, when
+    /// it could not. `accounts` is then the empty placeholder, the numbered
+    /// tree is empty, and `accounts.json` carries this reason instead of a
+    /// silent empty list, so one such wallet never takes its siblings' mount
+    /// down with it. Set only for `BACKEND_UNSUPPORTED`, the Broker's verdict
+    /// on this wallet's own custody shape; every other error still fails the
+    /// whole refresh.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accounts_unavailable: Option<String>,
     pub source_protocol: String,
     pub response_digest: Digest32,
     pub observed_at_ms: u64,
@@ -88,6 +97,23 @@ pub fn empty_wallet_accounts(wallet_id: Token) -> WalletAccountsPublic {
 impl WalletProjection {
     pub fn wallet_id(&self) -> &Token {
         &self.wallet.wallet_id
+    }
+
+    /// The projected account inventory, or the Broker's reason it could not
+    /// be projected. Anything that selects, spends from, or allocates against
+    /// a numbered account reads through here so the refusal names the cause
+    /// instead of reporting an empty wallet.
+    pub fn account_inventory(&self) -> Result<&WalletAccountsPublic, ProtocolError> {
+        match &self.accounts_unavailable {
+            None => Ok(&self.accounts),
+            Some(reason) => Err(ProtocolError::new(
+                ProtocolErrorCode::BackendUnsupported,
+                format!(
+                    "wallet {} has no account inventory: {reason}",
+                    self.wallet.wallet_id.as_str()
+                ),
+            )),
+        }
     }
 
     pub fn primary_key(&self) -> Result<&KeyPublic, ProtocolError> {
@@ -352,9 +378,41 @@ impl CachedWalletProjectionReader {
             }
             let credentials = broker.credentials(wallet_id.clone()).await?;
             let policy = broker.policy(wallet_id.clone()).await?;
-            let accounts = broker.wallet_accounts(wallet_id.clone()).await?;
-            let projection =
-                build_projection(wallet, keys, credentials, policy, accounts, now_ms()?)?;
+            // A wallet the Broker refuses to characterise (no root key and no
+            // active derived key, or legacy BIP-32 custody) is still a wallet:
+            // keep it mounted with the reason recorded, so one such wallet
+            // never blocks every sibling's `/wallets` tree. Only that verdict
+            // about this wallet's own custody shape is contained. Everything
+            // else, a transport failure or a Signer/Broker disagreement about
+            // the live registry, still fails the refresh, so nothing is served
+            // on a broken edge.
+            let (accounts, accounts_unavailable) =
+                match broker.wallet_accounts(wallet_id.clone()).await {
+                    Ok(accounts) => (accounts, None),
+                    Err(error) if error.code == ProtocolErrorCode::BackendUnsupported => {
+                        tracing::warn!(
+                            wallet_id = %wallet_id.as_str(),
+                            protocol_error_code = error.code.as_str(),
+                            message = %error.message,
+                            "Broker cannot project this wallet's account inventory; \
+                             mounting it without numbered accounts"
+                        );
+                        (
+                            empty_wallet_accounts(wallet_id.clone()),
+                            Some(format!("{}: {}", error.code.as_str(), error.message)),
+                        )
+                    }
+                    Err(error) => return Err(error),
+                };
+            let projection = build_projection(
+                wallet,
+                keys,
+                credentials,
+                policy,
+                accounts,
+                accounts_unavailable,
+                now_ms()?,
+            )?;
             observed.insert(wallet_id.as_str().to_owned(), projection);
         }
         Ok(observed)
@@ -905,6 +963,7 @@ fn build_projection(
     credentials: Vec<CredentialPublic>,
     policy: SignedPolicySnapshot,
     accounts: WalletAccountsPublic,
+    accounts_unavailable: Option<String>,
     observed_at_ms: u64,
 ) -> Result<WalletProjection, ProtocolError> {
     let response_digest = projection_digest(&wallet, &keys, &credentials, &policy)?;
@@ -914,6 +973,7 @@ fn build_projection(
         credentials,
         policy,
         accounts,
+        accounts_unavailable,
         source_protocol: SOURCE_PROTOCOL.to_owned(),
         response_digest,
         observed_at_ms,
@@ -927,6 +987,11 @@ fn build_projection(
 fn validate_projection(projection: &WalletProjection) -> Result<(), ProtocolError> {
     if projection.source_protocol != SOURCE_PROTOCOL {
         return Err(invalid_projection("projection source protocol is invalid"));
+    }
+    if projection.accounts_unavailable.is_some() && !projection.accounts.accounts.is_empty() {
+        return Err(invalid_projection(
+            "projection carries account entries alongside an unavailable inventory",
+        ));
     }
     if projection.freshness != ProjectionFreshness::Fresh {
         return Err(invalid_projection(
@@ -1100,6 +1165,8 @@ mod tests {
         wallets: Mutex<BTreeMap<String, ProjectionFixture>>,
         custody_results: Mutex<BTreeMap<String, CustodyResult>>,
         ceremony_states: Mutex<BTreeMap<String, CeremonyState>>,
+        /// Per-wallet `wallet.accounts` refusals.
+        accounts_errors: Mutex<BTreeMap<String, ProtocolError>>,
     }
 
     struct BlockingEmptyBroker {
@@ -1135,11 +1202,23 @@ mod tests {
                 )])),
                 custody_results: Mutex::new(BTreeMap::new()),
                 ceremony_states: Mutex::new(BTreeMap::new()),
+                accounts_errors: Mutex::new(BTreeMap::new()),
             }
         }
 
         fn set_available(&self, available: bool) {
             *self.available.lock().unwrap() = available;
+        }
+
+        fn refuse_accounts(&self, wallet_id: &str, error: ProtocolError) {
+            self.accounts_errors
+                .lock()
+                .unwrap()
+                .insert(wallet_id.to_owned(), error);
+        }
+
+        fn accept_accounts(&self, wallet_id: &str) {
+            self.accounts_errors.lock().unwrap().remove(wallet_id);
         }
     }
 
@@ -1217,9 +1296,16 @@ mod tests {
                     }
                     MachineBrokerRequest::WalletAccounts(bloom_broker_api::WalletRequest {
                         wallet_id,
-                    }) => Ok(MachineBrokerResponse::WalletAccounts(
-                        empty_wallet_accounts(wallet_id),
-                    )),
+                    }) => {
+                        if let Some(error) =
+                            self.accounts_errors.lock().unwrap().get(wallet_id.as_str())
+                        {
+                            return Err(error.clone());
+                        }
+                        Ok(MachineBrokerResponse::WalletAccounts(
+                            empty_wallet_accounts(wallet_id),
+                        ))
+                    }
                     _ => Err(invalid_projection("unexpected fake Broker method")),
                 }
             })
@@ -1253,6 +1339,67 @@ mod tests {
         assert_eq!(stale.policy.version.get(), 2);
     }
 
+    /// A wallet the Broker will not characterise (no root key and no active
+    /// derived key, or legacy custody) is still a wallet: the refresh keeps it
+    /// mounted with the reason recorded instead of failing every sibling.
+    #[tokio::test]
+    async fn a_wallet_without_an_account_inventory_does_not_fail_the_refresh() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = FileProjectionStore::new(directory.path().join("wallets.json"));
+        let broker = Arc::new(FakeBroker::new(fixture(1)));
+        broker.refuse_accounts(
+            "alice",
+            ProtocolError::new(
+                ProtocolErrorCode::BackendUnsupported,
+                "wallet projection carries neither a root key nor any derived key",
+            ),
+        );
+        let reader = CachedWalletProjectionReader::new(
+            Some(MachineBrokerClient::new(broker.clone())),
+            store.clone(),
+        )
+        .unwrap();
+
+        let live = reader.list_wallets().await.unwrap();
+        assert_eq!(live.len(), 1);
+        let reason = live[0].accounts_unavailable.clone().unwrap();
+        assert!(reason.starts_with("BACKEND_UNSUPPORTED: "), "{reason}");
+        assert!(live[0].accounts.accounts.is_empty());
+        let error = live[0].account_inventory().unwrap_err();
+        assert_eq!(error.code, ProtocolErrorCode::BackendUnsupported);
+        assert!(error.message.contains("alice"), "{}", error.message);
+
+        // The verdict is persisted with the wallet and survives a restart.
+        let restarted = CachedWalletProjectionReader::new(None, store).unwrap();
+        let cached = restarted.get_wallet(&token("alice")).await.unwrap();
+        assert_eq!(
+            cached.accounts_unavailable.as_deref(),
+            Some(reason.as_str())
+        );
+
+        // A Broker that can characterise the wallet again clears the record.
+        broker.accept_accounts("alice");
+        let live = reader.list_wallets().await.unwrap();
+        assert_eq!(live[0].accounts_unavailable, None);
+    }
+
+    /// Only the Broker's verdict about the wallet is contained; the edge
+    /// failing on `wallet.accounts` is a transport failure like any other.
+    #[tokio::test]
+    async fn an_unavailable_edge_on_wallet_accounts_still_fails_the_refresh() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = FileProjectionStore::new(directory.path().join("wallets.json"));
+        let broker = Arc::new(FakeBroker::new(fixture(1)));
+        broker.refuse_accounts("alice", unavailable("fake Broker unavailable"));
+        let reader = CachedWalletProjectionReader::new(
+            Some(MachineBrokerClient::new(broker.clone())),
+            store,
+        )
+        .unwrap();
+        let error = reader.list_wallets().await.unwrap_err();
+        assert_eq!(error.code, ProtocolErrorCode::ServiceUnavailable);
+    }
+
     #[test]
     fn primary_key_uses_the_declared_root_not_key_list_order() {
         let mut fixture = fixture(1);
@@ -1268,6 +1415,7 @@ mod tests {
             fixture.credentials,
             fixture.policy,
             empty_wallet_accounts(token("alice")),
+            None,
             1,
         )
         .unwrap();
@@ -1293,6 +1441,7 @@ mod tests {
             fixture.credentials,
             fixture.policy,
             empty_wallet_accounts(token("alice")),
+            None,
             1,
         )
         .unwrap();
@@ -1658,6 +1807,7 @@ mod tests {
             fixture(1).credentials,
             fixture(1).policy,
             empty_wallet_accounts(token("alice")),
+            None,
             1,
         )
         .unwrap();

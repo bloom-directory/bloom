@@ -2409,7 +2409,8 @@ impl PetalHost for DaemonPetalHost {
         let selected_address = match &account_key {
             Some(key) => {
                 let account = wallet_projection
-                    .accounts
+                    .account_inventory()
+                    .map_err(|error| HostError::Denied(error.to_string()))?
                     .accounts
                     .iter()
                     .find(|account| &account.key_ref == key)

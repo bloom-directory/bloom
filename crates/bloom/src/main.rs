@@ -1515,7 +1515,9 @@ async fn execute_machine_command(
             // Each row carries the number its path encodes, so a reader
             // never re-derives the mapping; paths outside the default
             // mapping print `null`.
-            String::from_utf8(bloom_vfs::handlers::accounts_json_with_numbers(&accounts)?)?
+            String::from_utf8(bloom_vfs::handlers::accounts_json_with_numbers(
+                &accounts, None,
+            )?)?
         }
         MachineCommand::WalletAccountAllocate { name, profile } => {
             let wallet_id = bloom_broker_api::Token::new(name)?;
