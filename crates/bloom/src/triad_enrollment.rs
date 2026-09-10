@@ -484,7 +484,8 @@ fn developer_route_operation_classes(
 /// A fee asset belongs here only once a Petal emits a *distinct* operation
 /// class whose every claim carries an exact declared fee. Until then this
 /// stays `None` so enrollment cannot outrun what the Petals actually
-/// declare.
+/// declare. See "Operation-class granularity and `fee_asset`" in
+/// `docs/architecture/Sealed Approvals.md`.
 const NO_FEE_ASSET: Option<ProvenanceFeeAsset> = None;
 
 #[cfg(feature = "triad-dev-harness")]

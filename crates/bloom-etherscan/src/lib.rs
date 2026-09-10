@@ -1277,6 +1277,59 @@ mod tests {
         assert_eq!(cfg.rate_limit_per_sec, 5);
     }
 
+    // ---- Rate limiter -----------------------------------------------------
+    //
+    // `until_ready()` would make these sleep, so they assert through the
+    // limiter's synchronous `check()` instead: same governor state machine,
+    // no wall-clock dependence and nothing to make the suite flaky.
+
+    #[test]
+    fn rate_limiter_admits_one_full_burst_then_throttles() {
+        // `Quota::per_second(n)` carries a burst capacity of n, so the first
+        // n calls are admitted immediately and the next one is refused
+        // until the quota replenishes.
+        let limiter = new_rate_limiter(3);
+        for admitted in 0..3 {
+            assert!(
+                limiter.check().is_ok(),
+                "call {admitted} is inside the burst capacity"
+            );
+        }
+        assert!(
+            limiter.check().is_err(),
+            "the call past the burst capacity must be throttled"
+        );
+    }
+
+    #[test]
+    fn rate_limiter_treats_zero_per_second_as_one() {
+        // `NonZeroU32::new(0)` is `None`. Clamping to one preserves the
+        // hand-rolled limiter's `per_sec.max(1)` behaviour; unwrapping
+        // instead would panic on a caller-supplied zero.
+        let limiter = new_rate_limiter(0);
+        assert!(
+            limiter.check().is_ok(),
+            "a zero limit still admits one call"
+        );
+        assert!(
+            limiter.check().is_err(),
+            "a zero limit must not admit unlimited calls"
+        );
+    }
+
+    #[test]
+    fn with_rate_limit_rebuilds_the_live_limiter() {
+        // The setter has to replace the limiter, not just the recorded
+        // config: a stale limiter would keep enforcing the old quota.
+        let client = EtherscanClient::new("k".into()).with_rate_limit(1);
+        assert_eq!(client.cfg.rate_limit_per_sec, 1);
+        assert!(client.limiter.check().is_ok());
+        assert!(
+            client.limiter.check().is_err(),
+            "the narrowed quota must be the one actually enforced"
+        );
+    }
+
     // ---- Live integration (gated) -----------------------------------------
 
     /// Live test against the real Etherscan API. Needs
