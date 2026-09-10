@@ -932,16 +932,15 @@ fn validate_projection(projection: &WalletProjection) -> Result<(), ProtocolErro
     let encoded_root = serde_json::to_string(root_key_ref).map_err(|error| {
         invalid_projection(format!("encode wallet root key reference: {error}"))
     })?;
-    if !projection
-        .wallet
-        .key_refs
-        .contains(root_key_ref)
-        || !projection.keys.iter().any(|key| {
-            &key.key_ref == root_key_ref && key.role == KeyRole::WalletRoot
-        })
-        || projection.keys.iter().any(|key| {
-            key.role == KeyRole::WalletRoot && &key.key_ref != root_key_ref
-        })
+    if !projection.wallet.key_refs.contains(root_key_ref)
+        || !projection
+            .keys
+            .iter()
+            .any(|key| &key.key_ref == root_key_ref && key.role == KeyRole::WalletRoot)
+        || projection
+            .keys
+            .iter()
+            .any(|key| key.role == KeyRole::WalletRoot && &key.key_ref != root_key_ref)
         || !key_refs.contains(&encoded_root)
     {
         return Err(invalid_projection(format!(
