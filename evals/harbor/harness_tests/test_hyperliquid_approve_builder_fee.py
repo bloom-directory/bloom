@@ -2,14 +2,16 @@ from __future__ import annotations
 
 import base64
 import copy
+import hashlib
 import json
+import stat
 import subprocess
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 
-from harness.core import EvalError
+from harness.core import CounterSidecar, EvalError
 from harness.hyperliquid_approve_builder_fee import (
     OPERATION_CLASS,
     ROUTE_PATTERN,
@@ -209,6 +211,153 @@ class CounterDurabilityTests(BuilderFeeFixture, unittest.TestCase):
         )
         with self.assertRaisesRegex(EvalError, "non-advancing"):
             self.definition.reserve_counter(4)
+
+
+class CounterSidecarRestartTests(BuilderFeeFixture, unittest.TestCase):
+    """A spent counter must survive the process that spent it."""
+
+    def sidecar(self) -> CounterSidecar:
+        return CounterSidecar(self.root / "counters" / "builder-fee.counter.json")
+
+    def test_next_process_resumes_at_the_counter_the_last_one_reserved(self) -> None:
+        # Process 1: two ceremonies, exactly as a grant and a revoke spend.
+        first = HyperliquidApproveBuilderFeeEval(self.repo, self.env)
+        first.attach_counter_sidecar(self.sidecar())
+        counter = first._require_sign_count()
+        self.assertEqual(counter, 4, "starts at the configured counter")
+        counter = first.reserve_counter(counter)
+        counter = first.reserve_counter(counter)
+        self.assertEqual(counter, 6)
+
+        # Process 2: same environment, same unchanged
+        # BLOOM_EVAL_AUTHENTICATOR_SIGN_COUNT=4. Before the sidecar this
+        # replayed counter 4 and Broker rejected the assertion.
+        second = HyperliquidApproveBuilderFeeEval(self.repo, self.env)
+        second.attach_counter_sidecar(self.sidecar())
+        self.assertEqual(
+            second._require_sign_count(),
+            6,
+            "a new process must not reuse a counter the last one spent",
+        )
+
+    def test_a_raised_environment_counter_still_wins(self) -> None:
+        first = HyperliquidApproveBuilderFeeEval(self.repo, self.env)
+        first.attach_counter_sidecar(self.sidecar())
+        first.reserve_counter(first._require_sign_count())
+
+        self.env["BLOOM_EVAL_AUTHENTICATOR_SIGN_COUNT"] = "99"
+        second = HyperliquidApproveBuilderFeeEval(self.repo, self.env)
+        second.attach_counter_sidecar(self.sidecar())
+        self.assertEqual(second._require_sign_count(), 99)
+
+    def test_an_interrupted_ceremony_still_burns_its_counter(self) -> None:
+        # Reservation commits before the driver runs, so a process killed
+        # mid-assertion leaves the counter recorded as spent. A gap is safe;
+        # reuse is not.
+        first = HyperliquidApproveBuilderFeeEval(self.repo, self.env)
+        first.attach_counter_sidecar(self.sidecar())
+        first.reserve_counter(first._require_sign_count())
+        del first  # the process dies before the driver returns
+
+        second = HyperliquidApproveBuilderFeeEval(self.repo, self.env)
+        second.attach_counter_sidecar(self.sidecar())
+        self.assertEqual(second._require_sign_count(), 5)
+
+    def test_the_sidecar_refuses_to_move_a_counter_backwards(self) -> None:
+        sidecar = self.sidecar()
+        sidecar.write(9)
+        with self.assertRaisesRegex(EvalError, "non-advancing"):
+            sidecar.write(8)
+        self.assertEqual(sidecar.read(), 9)
+
+    def test_a_malformed_sidecar_is_refused_not_ignored(self) -> None:
+        sidecar = self.sidecar()
+        sidecar.path.parent.mkdir(parents=True, exist_ok=True)
+        for case, body in {
+            "not json": b"{",
+            "wrong schema": b'{"schema":"other","next_sign_count":3}',
+            "missing field": b'{"schema":"bloom.eval.counter-sidecar.v1"}',
+            "not an integer": (
+                b'{"schema":"bloom.eval.counter-sidecar.v1","next_sign_count":"3"}'
+            ),
+            "out of range": (
+                b'{"schema":"bloom.eval.counter-sidecar.v1","next_sign_count":0}'
+            ),
+        }.items():
+            sidecar.path.write_bytes(body)
+            with self.subTest(case=case), self.assertRaises(EvalError):
+                sidecar.read()
+
+    def test_a_written_sidecar_is_mode_0600_and_leaves_no_temporary(self) -> None:
+        sidecar = self.sidecar()
+        sidecar.write(5)
+        self.assertEqual(stat.S_IMODE(sidecar.path.stat().st_mode), 0o600)
+        self.assertFalse(list(sidecar.path.parent.glob(".*.new-*")))
+
+
+class WalletBindingTests(BuilderFeeFixture, unittest.TestCase):
+    """The wallet id must be proven to own the address the verifier reads."""
+
+    def wire(self, addresses: object, policy: object | None = None) -> None:
+        expected = {
+            "allowed_destinations": [],
+            "allowed_petal_packages": [self.package_hash],
+            "maximum_approval_lifetime_ms": 2_592_000_000,
+            "required_verifiers": [],
+            "wallet_id": self.wallet_id,
+        }
+        body = expected if policy is None else policy
+        if isinstance(addresses, dict) and "policy_digest" not in addresses:
+            canonical = json.dumps(body, sort_keys=True, separators=(",", ":")).encode()
+            addresses["policy_digest"] = hashlib.sha256(canonical).hexdigest()
+
+        def read(path: Path, timeout: int = 20) -> object:
+            del timeout
+            return addresses if path.name == "addresses.json" else body
+
+        self.definition._read_json = mock.Mock(side_effect=read)
+
+    def good_addresses(self) -> dict[str, object]:
+        return {
+            "owner": self.wallet,
+            "policy_status": "broker_verified",
+            "freshness": "fresh",
+        }
+
+    def test_a_matching_projection_is_accepted(self) -> None:
+        self.wire(self.good_addresses())
+        self.definition._require_exact_wallet_policy()
+
+    def test_a_wallet_id_owning_a_different_address_is_refused(self) -> None:
+        addresses = self.good_addresses()
+        addresses["owner"] = "0x" + "9" * 40
+        self.wire(addresses)
+        with self.assertRaisesRegex(EvalError, "does not own"):
+            self.definition._require_exact_wallet_policy()
+
+    def test_an_unverified_or_stale_projection_is_refused(self) -> None:
+        for case, patch, expected in (
+            ("unverified", {"policy_status": "unverified"}, "not Broker-verified"),
+            ("stale", {"freshness": "stale"}, "stale"),
+            ("no owner", {"owner": None}, "does not own"),
+        ):
+            addresses = self.good_addresses()
+            addresses.update(patch)
+            self.wire(addresses)
+            with self.subTest(case=case), self.assertRaisesRegex(EvalError, expected):
+                self.definition._require_exact_wallet_policy()
+
+    def test_a_policy_edited_underneath_its_projection_is_refused(self) -> None:
+        addresses = self.good_addresses()
+        addresses["policy_digest"] = "0" * 64
+        self.wire(addresses)
+        with self.assertRaisesRegex(EvalError, "digest does not match"):
+            self.definition._require_exact_wallet_policy()
+
+    def test_a_non_object_projection_is_refused(self) -> None:
+        self.wire(["not", "an", "object"])
+        with self.assertRaisesRegex(EvalError, "not a JSON object"):
+            self.definition._require_exact_wallet_policy()
 
 
 class HyperliquidApproveBuilderFeeDefinitionTests(BuilderFeeFixture, unittest.TestCase):

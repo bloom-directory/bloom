@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import fcntl
+import hashlib
+import json
 import os
 import signal
 import time
@@ -43,6 +45,94 @@ class EvalRunContext:
     mounts: Sequence[Mapping[str, Any]]
     agent_env: Mapping[str, str]
     verifier_env: Mapping[str, str]
+
+
+class CounterSidecar:
+    """A durable next-unused-WebAuthn-counter file for direct runs.
+
+    The operator lifecycle persists counters in its own state file. A run
+    started straight from `python -m harness` has no such file, so without
+    this every ceremony advanced the counter in memory only: the next
+    process re-read the unchanged `BLOOM_EVAL_AUTHENTICATOR_SIGN_COUNT`,
+    replayed a spent counter, and Broker rejected the assertion.
+
+    The file holds one integer and is written atomically through a
+    temporary in the same directory, so an interrupted write leaves either
+    the old value or the new one, never a truncated file. Reads take the
+    larger of the environment value and the recorded one: an operator
+    raising the environment counter is honoured, while a recorded counter
+    is never silently rolled back.
+    """
+
+    SCHEMA = "bloom.eval.counter-sidecar.v1"
+
+    def __init__(self, path: Path) -> None:
+        self.path = path.expanduser()
+
+    def read(self) -> int | None:
+        try:
+            raw = self.path.read_bytes()
+        except FileNotFoundError:
+            return None
+        except OSError as error:
+            raise EvalError(f"counter sidecar is unreadable: {error}") from error
+        try:
+            value = json.loads(raw)
+            counter = value["next_sign_count"]
+            schema = value["schema"]
+        except (json.JSONDecodeError, TypeError, KeyError) as error:
+            raise EvalError(f"counter sidecar is malformed: {error}") from error
+        if schema != self.SCHEMA:
+            raise EvalError(f"counter sidecar has unexpected schema {schema!r}")
+        if not isinstance(counter, int) or isinstance(counter, bool):
+            raise EvalError("counter sidecar next_sign_count is not an integer")
+        if not 1 <= counter <= 0xFFFF_FFFF:
+            raise EvalError("counter sidecar next_sign_count is out of range")
+        return counter
+
+    def write(self, next_counter: int) -> None:
+        recorded = self.read()
+        if recorded is not None and next_counter < recorded:
+            # Never move a counter backwards: the lower value may already
+            # have been accepted by Broker, and reusing it reads as a replay.
+            raise EvalError("refusing a non-advancing counter sidecar update")
+        body = json.dumps(
+            {"schema": self.SCHEMA, "next_sign_count": next_counter},
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode() + b"\n"
+        self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        temporary = self.path.with_name(f".{self.path.name}.new-{os.getpid()}")
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            with os.fdopen(descriptor, "wb") as handle:
+                handle.write(body)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, self.path)
+            os.chmod(self.path, 0o600)
+            directory = os.open(self.path.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+        finally:
+            if temporary.exists():
+                temporary.unlink()
+
+    def verify_writable(self) -> None:
+        """Prove a commit can land, without moving the counter."""
+        recorded = self.read()
+        if recorded is None:
+            # Nothing recorded yet: prove the directory accepts a write by
+            # creating and removing the same temporary a commit would use.
+            self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            probe = self.path.with_name(f".{self.path.name}.probe-{os.getpid()}")
+            descriptor = os.open(probe, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            os.close(descriptor)
+            probe.unlink()
+            return
+        self.write(recorded)
 
 
 class EvalDefinition(ABC):
@@ -92,6 +182,35 @@ class EvalDefinition(ABC):
     #: The first counter this run has not consumed.
     next_sign_count: int | None = None
 
+    def attach_counter_sidecar(self, sidecar: "CounterSidecar") -> None:
+        """Persist this run's counters to `sidecar`.
+
+        Wires commit, durability check, and the resume floor together, so a
+        direct run gets the same never-reuse guarantee the operator
+        lifecycle provides through its own state file.
+        """
+        self.counter_committed = sidecar.write
+        self.counter_durability_check = sidecar.verify_writable
+        self.counter_floor = sidecar.read
+
+    #: Returns a durably recorded next-unused counter, if one exists.
+    counter_floor: Callable[[], int | None] | None = None
+
+    def resume_counter(self, configured: int) -> int:
+        """The first counter safe to attempt this process.
+
+        Takes the larger of the configured counter and any durably recorded
+        one. A recorded counter is the record of what a previous process
+        already spent, so starting below it replays; an operator raising
+        the configured value above it is still honoured.
+        """
+        if self.counter_floor is None:
+            return configured
+        recorded = self.counter_floor()
+        if recorded is None:
+            return configured
+        return max(configured, recorded)
+
     def require_counter_durability(self) -> None:
         """Fail preflight unless a reserved counter can actually be persisted.
 
@@ -132,6 +251,52 @@ class EvalDefinition(ABC):
             self.counter_committed(reserved)
         self.next_sign_count = reserved
         return reserved
+
+    # ---- Wallet identity binding ------------------------------------------
+
+    def require_wallet_binding(
+        self,
+        addresses: Any,
+        owner_address: str,
+        *,
+        label: str = "BLOOM_EVAL_WALLET",
+    ) -> None:
+        """Fail unless the wallet id actually owns `owner_address`.
+
+        These evals address two different things by two different
+        identifiers: writes go to the Bloom wallet id, while the venue
+        projection that supplies independent evidence is keyed by the
+        on-chain address. Nothing else ties them together, so without this
+        an eval can authorize one wallet and grade another -- and still
+        look entirely consistent, because each half is valid on its own.
+
+        The projection's own trust markers are checked here too: a policy
+        that Broker has not verified, or a stale projection, is not
+        evidence about the wallet this run is about to touch.
+        """
+        if not isinstance(addresses, dict):
+            raise EvalError("eval wallet addresses projection is not a JSON object")
+        owner = addresses.get("owner")
+        if not isinstance(owner, str) or owner.lower() != owner_address:
+            raise EvalError(f"BLOOM_EVAL_WALLET_ID does not own {label}")
+        if addresses.get("policy_status") != "broker_verified":
+            raise EvalError("eval wallet policy is not Broker-verified")
+        if addresses.get("freshness") != "fresh":
+            raise EvalError("eval wallet policy projection is stale")
+
+    @staticmethod
+    def require_policy_digest(addresses: Mapping[str, Any], policy: Any) -> None:
+        """Fail unless the policy's digest matches its public projection.
+
+        Binds the policy bytes this eval validated to the digest Broker
+        published, so a policy file edited underneath the projection is
+        refused rather than trusted.
+        """
+        canonical = json.dumps(policy, sort_keys=True, separators=(",", ":")).encode()
+        if addresses.get("policy_digest") != hashlib.sha256(canonical).hexdigest():
+            raise EvalError(
+                "eval wallet policy digest does not match its public projection"
+            )
 
     def validate_result(self, result: Any) -> None:
         """Fail unless Harbor completed one error-free, positively graded trial."""

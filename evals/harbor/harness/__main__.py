@@ -7,7 +7,7 @@ import os
 import sys
 from pathlib import Path
 
-from .core import EvalError, run_eval
+from .core import CounterSidecar, EvalError, run_eval
 from .hyperliquid_approve_builder_fee import HyperliquidApproveBuilderFeeEval
 from .hyperliquid_order_cancel import HyperliquidOrderCancelEval
 
@@ -45,6 +45,19 @@ def main(argv: list[str] | None = None) -> int:
         ),
     }
     definition = definitions[args.eval]()
+    # A direct run has no operator state file, so without a sidecar every
+    # ceremony would advance the counter in memory only and the next
+    # process would replay a spent one. The operator lifecycle supplies its
+    # own durable store and never reaches this path.
+    sidecar = CounterSidecar(
+        Path(
+            os.environ.get(
+                "BLOOM_EVAL_COUNTER_FILE",
+                str(repo_root / f"evals/harbor/{definition.name}.counter.json"),
+            )
+        )
+    )
+    definition.attach_counter_sidecar(sidecar)
     try:
         if args.preauthorization_only:
             if args.agent is not None:

@@ -151,7 +151,9 @@ class HyperliquidApproveBuilderFeeEval(EvalDefinition):
             raise EvalError(
                 "BLOOM_EVAL_AUTHENTICATOR_SIGN_COUNT must be between 1 and 4294967295"
             )
-        return sign_count
+        # A counter recorded by a previous process is the record of
+        # what it already spent; starting below it replays.
+        return self.resume_counter(sign_count)
 
     @property
     def network_root(self) -> Path:
@@ -470,7 +472,16 @@ class HyperliquidApproveBuilderFeeEval(EvalDefinition):
         self._require_builder_fee_provenance()
 
     def _require_exact_wallet_policy(self) -> None:
+        # The write goes to exchange/<wallet_id>/, while the maxBuilderFee
+        # projection the verifier trusts is keyed by <wallet> -- so bind the
+        # two before believing either. Without this the eval can approve a
+        # fee on one wallet and read another's projection as proof.
+        addresses = self._read_json(self.wallet_root / "addresses.json")
+        self.require_wallet_binding(addresses, self.wallet)
+
         policy = self._read_json(self.wallet_root / "policy.json")
+        if not isinstance(policy, dict):
+            raise EvalError("eval wallet policy is not a JSON object")
         expected_policy = {
             "allowed_destinations": [],
             "allowed_petal_packages": [self.package_hash],
@@ -482,6 +493,7 @@ class HyperliquidApproveBuilderFeeEval(EvalDefinition):
             raise EvalError(
                 "eval wallet policy does not match the exact bounded policy"
             )
+        self.require_policy_digest(addresses, policy)
 
     def preflight(self) -> None:
         if not self.bloom_mount_value:

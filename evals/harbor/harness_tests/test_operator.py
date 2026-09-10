@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import stat
 import subprocess
 import tempfile
@@ -92,6 +93,10 @@ class OperatorStateTests(unittest.TestCase):
         self.assertFalse(list(self.root.glob(".state.json.new-*")))
         self.assertEqual(stat.S_IMODE(self.store.path.stat().st_mode), 0o600)
 
+    @unittest.skipIf(
+        hasattr(os, "geteuid") and os.geteuid() == 0,
+        "root bypasses the permission bits this test relies on",
+    )
     def test_verify_writable_fails_on_a_read_only_directory(self) -> None:
         # The real failure mode: update_counter writes through a temporary
         # in the parent directory, so a writable file inside a read-only

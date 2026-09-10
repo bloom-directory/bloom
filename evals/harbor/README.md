@@ -227,6 +227,21 @@ file has no sidecar and skips the check.
 Both live Hyperliquid evals share these two methods, so the reservation and
 durability rules have a single definition rather than one copy per eval.
 
+A run started directly with `python -m harness <eval> <agent>` has no
+operator state file, so it gets its own sidecar instead: a mode-`0600` JSON
+file holding one integer, written through the same atomic
+temporary-then-rename the operator store uses. Its location defaults to
+`evals/harbor/<eval-name>.counter.json` and is overridden with
+`BLOOM_EVAL_COUNTER_FILE`; both are gitignored. Without it a direct run
+advanced the counter in memory only, and the next process re-read the
+unchanged `BLOOM_EVAL_AUTHENTICATOR_SIGN_COUNT` and replayed a counter
+Broker had already accepted.
+
+On startup the harness takes the larger of `BLOOM_EVAL_AUTHENTICATOR_SIGN_COUNT`
+and the recorded value, so raising the environment counter is honoured while
+a recorded one is never rolled back. The sidecar itself refuses a
+non-advancing write for the same reason.
+
 Each run writes a mode-`0600` JSON summary beside the operator state, under
 `harbor-summaries/`. It includes source lineage, installed package hash,
 Harbor/model configuration, reward, trial errors/retries, monotonic phase and

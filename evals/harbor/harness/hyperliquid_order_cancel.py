@@ -149,7 +149,9 @@ class HyperliquidOrderCancelEval(EvalDefinition):
             raise EvalError(
                 "BLOOM_EVAL_AUTHENTICATOR_SIGN_COUNT must be between 1 and 4294967295"
             )
-        return sign_count
+        # A counter recorded by a previous process is the record of
+        # what it already spent; starting below it replays.
+        return self.resume_counter(sign_count)
 
     @property
     def network_root(self) -> Path:
@@ -625,13 +627,7 @@ class HyperliquidOrderCancelEval(EvalDefinition):
             )
 
         addresses = self._read_json(self.wallet_root / "addresses.json")
-        owner = addresses.get("owner") if isinstance(addresses, dict) else None
-        if not isinstance(owner, str) or owner.lower() != self.wallet:
-            raise EvalError("BLOOM_EVAL_WALLET_ID does not own BLOOM_EVAL_WALLET")
-        if addresses.get("policy_status") != "broker_verified":
-            raise EvalError("eval wallet policy is not Broker-verified")
-        if addresses.get("freshness") != "fresh":
-            raise EvalError("eval wallet policy projection is stale")
+        self.require_wallet_binding(addresses, self.wallet)
 
         policy = self._read_json(self.wallet_root / "policy.json")
         if not isinstance(policy, dict):
@@ -647,12 +643,7 @@ class HyperliquidOrderCancelEval(EvalDefinition):
             raise EvalError(
                 "eval wallet policy does not match the exact bounded policy"
             )
-        canonical = json.dumps(policy, sort_keys=True, separators=(",", ":")).encode()
-        digest = hashlib.sha256(canonical).hexdigest()
-        if addresses.get("policy_digest") != digest:
-            raise EvalError(
-                "eval wallet policy digest does not match its public projection"
-            )
+        self.require_policy_digest(addresses, policy)
 
     def _nonzero_positions(self) -> list[dict[str, Any]]:
         clearinghouse = self._read_json(self.user_root / "clearinghouse.json")
