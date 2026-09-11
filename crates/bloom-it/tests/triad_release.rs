@@ -239,7 +239,7 @@ fn make_installer_payload(root: &Path) -> PathBuf {
     )
     .unwrap();
     let macos = workspace().join("packaging/triad/macos");
-    for relative in ["launchagents", "launchdaemons", "pf"] {
+    for relative in ["launchagents", "launchdaemons"] {
         let destination = payload.join("installer/macos").join(relative);
         fs::create_dir_all(&destination).unwrap();
         for entry in fs::read_dir(macos.join(relative)).unwrap() {
@@ -325,7 +325,7 @@ fn build(staging: &Path, output: &Path, key: &Path) -> std::process::Output {
         &compatibility,
         compatibility_source
             .replace(
-                "broker_commit = \"56252977c99238151c89bb44649fe8f5d1c91ae8\"",
+                "broker_commit = \"582d3dd3add7efb2640b900f005e32a5a52f17c0\"",
                 &format!("broker_commit = \"{}\"", "22".repeat(20)),
             )
             .replace(
@@ -2216,9 +2216,7 @@ fn macos_installer_stages_unix_principals_launchdaemons_and_confirmed_uninstall(
     assert!(enrollment.contains("\"machine_broker_gid\":260501"));
     assert!(enrollment.contains("\"broker_signer_gid\":260502"));
     assert!(enrollment.contains("\"revoke_gid\":260503"));
-    let pf = fs::read_to_string(root.join("etc/pf.anchors/com.bloom.triad.501")).unwrap();
-    assert!(pf.contains("user 250501"));
-    assert!(pf.contains("user 250502"));
+    assert!(!root.join("etc/pf.anchors/com.bloom.triad.501").exists());
     assert!(
         root.join("usr/local/libexec/bloom/current/bloom-broker")
             .exists()
@@ -2518,7 +2516,6 @@ fn macos_active_legacy_enrollment_migrates_log_identity_before_upgrade() {
             "Library/LaunchAgents/com.bloom.machine.plist",
             "Library/LaunchDaemons/com.bloom.broker.501.plist",
             "Library/LaunchDaemons/com.bloom.signer.501.plist",
-            "etc/pf.anchors/com.bloom.triad.501",
             "etc/newsyslog.d/bloom-501.conf",
         ])
         .output()

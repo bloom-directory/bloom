@@ -28,6 +28,27 @@ make_payload() {
   done
 }
 
+seed_legacy_pf() {
+  local uid
+  mkdir -p "$root/etc/pf.anchors"
+  printf 'anchor "com.apple/*"\nanchor "other-vendor"\n' >"$root/etc/pf.conf"
+  cp "$root/etc/pf.conf" "$work/foreign-pf.conf"
+  for uid in 501 599; do
+    cat >>"$root/etc/pf.conf" <<CONF
+# BEGIN BLOOM TRIAD $uid
+anchor "com.bloom.triad/$uid"
+load anchor "com.bloom.triad/$uid" from "/etc/pf.anchors/com.bloom.triad.$uid"
+# END BLOOM TRIAD $uid
+CONF
+    printf 'old rule\n' >"$root/etc/pf.anchors/com.bloom.triad.$uid"
+  done
+}
+assert_legacy_pf_removed() {
+  cmp "$work/foreign-pf.conf" "$root/etc/pf.conf"
+  [[ ! -e "$root/etc/pf.anchors/com.bloom.triad.501" ]]
+  [[ ! -e "$root/etc/pf.anchors/com.bloom.triad.599" ]]
+}
+
 run_installer() {
   local digest="$1"; shift
   BLOOM_ALLOW_TEST_UNCLAIMED=true \
@@ -96,21 +117,27 @@ grep -F "$finish_command" <<<"$install_output" >/dev/null
 grep -F "Only the staging command requires sudo" <<<"$install_output" >/dev/null
 grep -F "Legacy wallet watch-only uses unsupported kind 'watch'" <<<"$install_output" >/dev/null
 
-# The exact managed link is accepted and same-digest repair is idempotent.
+# The exact managed link is accepted; repair also retires legacy PF orphans.
+seed_legacy_pf
 run_installer "$digest_a" install "$root" 501 releaseuser "$payload_a"
 [[ "$(readlink "$root/usr/local/bin/bloom")" == ../libexec/bloom/current/bloom ]]
+assert_legacy_pf_removed
 
 # Upgrade leaves the stable PATH entry following the new current release.
+seed_legacy_pf
 run_installer "$digest_b" install "$root" 501 releaseuser "$payload_b"
 [[ "$(readlink "$root/usr/local/libexec/bloom/current")" == "releases/$digest_b" ]]
 [[ "$("$root/usr/local/bin/bloom")" == release-b ]]
+assert_legacy_pf_removed
 
 # Retaining the final active enrollment removes the command; restore recreates
 # it without requiring release-tree deletion.
 "$installer" uninstall --retain-custody "$root" 501
 [[ ! -e "$root/usr/local/bin/bloom" && ! -L "$root/usr/local/bin/bloom" ]]
 [[ -d "$root/usr/local/libexec/bloom" ]]
+seed_legacy_pf
 run_installer "$digest_b" restore "$root" 501 releaseuser "$payload_b"
+assert_legacy_pf_removed
 [[ "$(readlink "$root/usr/local/bin/bloom")" == ../libexec/bloom/current/bloom ]]
 
 # A second active login shares the command. Partial removal keeps it; removal
