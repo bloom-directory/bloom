@@ -3064,17 +3064,31 @@ impl TxEngine {
             }
         }
 
-        let request =
-            exact_evm_sign_request(staged, signing_preimage, signing_hash, provenance, &state)?;
+        let wallet = service
+            .broker
+            .wallet(
+                Token::new(staged.wallet.clone())
+                    .map_err(|error| TxEngineError::ApprovalConstruction(error.to_string()))?,
+            )
+            .await
+            .map_err(protocol_signing_error)?;
+        let key = evm_signing_key(&service.broker, &wallet, &staged.from).await?;
+        let request = exact_evm_sign_request(
+            staged,
+            signing_preimage,
+            signing_hash,
+            provenance,
+            &state,
+            key.selector.clone(),
+        )?;
         if state.approval_id.is_some() {
             let expected_operation_digest = expected_evm_sign_operation_digest(
-                &service.broker,
-                staged,
+                &wallet,
+                key.key_ref.clone(),
                 &state,
                 state.payload_digest.clone(),
                 state.claimed_hash.clone(),
-            )
-            .await?;
+            )?;
             state.sign_dispatched = true;
             state.expected_operation_digest = Some(expected_operation_digest);
             write_triad_signing_state(&state_path, &state)?;
@@ -3332,6 +3346,30 @@ impl TxEngine {
             }
         }
 
+        // One Broker batch spends one key. Every child names the same sender,
+        // and that sender decides which of the wallet's keys signs.
+        let sender = staged_plans
+            .first()
+            .map(|staged| staged.from.as_str())
+            .ok_or_else(|| TxEngineError::ApprovalDenied("empty transaction batch".into()))?;
+        if let Some(other) = staged_plans
+            .iter()
+            .find(|staged| !staged.from.eq_ignore_ascii_case(sender))
+        {
+            return Err(TxEngineError::ApprovalDenied(format!(
+                "a transaction batch must be sent by one account; {} and {} differ",
+                sender, other.from
+            )));
+        }
+        let wallet_public = service
+            .broker
+            .wallet(
+                Token::new(wallet.to_string())
+                    .map_err(|error| TxEngineError::ApprovalConstruction(error.to_string()))?,
+            )
+            .await
+            .map_err(protocol_signing_error)?;
+        let key = evm_signing_key(&service.broker, &wallet_public, sender).await?;
         let request = ExactPayloadBatchSignRequest {
             wallet_id: Token::new(wallet.to_string())
                 .map_err(|error| TxEngineError::ApprovalConstruction(error.to_string()))?,
@@ -3348,14 +3386,16 @@ impl TxEngine {
             expires_at_ms: state.expires_at_ms.clone(),
             canonical_plan_facts_digest: state.canonical_plan_facts_digest.clone(),
             approval_id: state.approval_id.clone(),
-            account_key_ref: None,
+            account_key_ref: key.selector.clone(),
             petal_use_claim: None,
             claim_assurance_evidence: None,
         };
         if state.approval_id.is_some() {
-            state.expected_operation_digest = Some(
-                expected_evm_batch_sign_operation_digest(&service.broker, wallet, &state).await?,
-            );
+            state.expected_operation_digest = Some(expected_evm_batch_sign_operation_digest(
+                &wallet_public,
+                key.key_ref.clone(),
+                &state,
+            )?);
             state.sign_dispatched = true;
             write_triad_batch_signing_state(&state_path, &state)?;
         }
@@ -3979,12 +4019,78 @@ fn random_request_nonce() -> RequestNonce {
     RequestNonce::from_bytes(bytes)
 }
 
+/// The wallet key that signs for one EVM sender address.
+///
+/// A wallet with a root key signs with it; the Broker rejects an account
+/// selector on such a wallet, so none is sent. A BIP-39 wallet signs with the
+/// active derived child whose projected address is the sender. Resolving by
+/// address is what lets `wallets/<w>/<n>/` stage from any account: the staged
+/// `from` is the only account fact an outbox entry carries, and the Broker
+/// binds the chosen key into the sealed approval, so an approval issued for
+/// one account can never sign for another.
+struct EvmSigningKey {
+    /// The key bound into the operation identity.
+    key_ref: bloom_broker_api::KeyRef,
+    /// The `account_key_ref` sent to the Broker: the derived child itself, or
+    /// nothing for a root-signing wallet.
+    selector: Option<bloom_broker_api::KeyRef>,
+}
+
+async fn evm_signing_key(
+    broker: &MachineBrokerClient,
+    wallet: &bloom_broker_api::WalletPublic,
+    from: &str,
+) -> Result<EvmSigningKey, TxEngineError> {
+    let suite = CryptoSuite::Secp256k1Keccak256Recoverable;
+    if let Some(root) = &wallet.root_key_ref {
+        if root.key_spec != suite.key_spec() {
+            return Err(TxEngineError::ApprovalDenied(
+                "wallet root key is incompatible with exact EVM signing".into(),
+            ));
+        }
+        return Ok(EvmSigningKey {
+            key_ref: root.clone(),
+            selector: None,
+        });
+    }
+    let accounts = broker
+        .wallet_accounts(wallet.wallet_id.clone())
+        .await
+        .map_err(protocol_signing_error)?;
+    let matching = accounts
+        .accounts
+        .iter()
+        .filter(|account| {
+            account.lifecycle == bloom_broker_api::AccountLifecycleState::Active
+                && account.derivation_profile
+                    == bloom_broker_api::DerivationProfile::Bip44EvmSecp256k1V1
+                && account
+                    .chain_projections
+                    .iter()
+                    .any(|projection| projection.address.eq_ignore_ascii_case(from))
+        })
+        .collect::<Vec<_>>();
+    match matching.as_slice() {
+        [account] => Ok(EvmSigningKey {
+            key_ref: account.key_ref.clone(),
+            selector: Some(account.key_ref.clone()),
+        }),
+        [] => Err(TxEngineError::ApprovalDenied(format!(
+            "no active derived EVM account of this wallet has address {from}"
+        ))),
+        _ => Err(TxEngineError::ApprovalDenied(format!(
+            "more than one active derived EVM account of this wallet has address {from}"
+        ))),
+    }
+}
+
 fn exact_evm_sign_request(
     staged: &StagedTx,
     signing_preimage: &[u8],
     signing_hash: B256,
     provenance: &ProvenanceRecord,
     state: &TriadEvmSigningState,
+    account_key_ref: Option<bloom_broker_api::KeyRef>,
 ) -> Result<ExactPayloadSignRequest, TxEngineError> {
     Ok(ExactPayloadSignRequest {
         wallet_id: Token::new(staged.wallet.clone())
@@ -4002,7 +4108,7 @@ fn exact_evm_sign_request(
         expires_at_ms: state.expires_at_ms.clone(),
         canonical_plan_facts_digest: state.canonical_plan_facts_digest.clone(),
         approval_id: state.approval_id.clone(),
-        account_key_ref: None,
+        account_key_ref,
         petal_use_claim: None,
         system_use_claim: None,
         claim_assurance_evidence: None,
@@ -4010,9 +4116,9 @@ fn exact_evm_sign_request(
     })
 }
 
-async fn expected_evm_sign_operation_digest(
-    broker: &MachineBrokerClient,
-    staged: &StagedTx,
+fn expected_evm_sign_operation_digest(
+    wallet: &bloom_broker_api::WalletPublic,
+    key_ref: bloom_broker_api::KeyRef,
     state: &TriadEvmSigningState,
     payload_digest: Digest32,
     claimed_hash: Digest32,
@@ -4020,36 +4126,17 @@ async fn expected_evm_sign_operation_digest(
     let approval_id = state.approval_id.clone().ok_or_else(|| {
         TxEngineError::ApprovalState("active exact signing is missing its approval ID".into())
     })?;
-    let wallet_id = Token::new(staged.wallet.clone())
-        .map_err(|error| TxEngineError::ApprovalConstruction(error.to_string()))?;
-    let wallet = broker
-        .wallet(wallet_id)
-        .await
-        .map_err(protocol_signing_error)?;
-    let suite = CryptoSuite::Secp256k1Keccak256Recoverable;
-    let mut matching = wallet
-        .key_refs
-        .into_iter()
-        .filter(|key| key.key_spec == suite.key_spec());
-    let key_ref = matching.next().ok_or_else(|| {
-        TxEngineError::ApprovalDenied("wallet has no key compatible with exact EVM signing".into())
-    })?;
-    if matching.next().is_some() {
-        return Err(TxEngineError::ApprovalDenied(
-            "wallet has multiple compatible keys; exact EVM signing is ambiguous".into(),
-        ));
-    }
     SignOperationIdentity {
         operation_id: state.signing_operation_id.clone(),
         approval_id,
         key_ref,
-        crypto_suite: suite,
+        crypto_suite: CryptoSuite::Secp256k1Keccak256Recoverable,
         ordered_payload_digests: vec![payload_digest],
         ordered_hashes: vec![claimed_hash],
         petal_use_claim_digest: None,
         claim_assurance_digest: None,
-        policy_version: wallet.policy_version,
-        policy_digest: wallet.policy_digest,
+        policy_version: wallet.policy_version.clone(),
+        policy_digest: wallet.policy_digest.clone(),
     }
     .digest()
     .map_err(protocol_signing_error)
@@ -4224,45 +4311,25 @@ async fn lock_triad_batch_signing_state(
     .map_err(TxEngineError::ApprovalState)
 }
 
-async fn expected_evm_batch_sign_operation_digest(
-    broker: &MachineBrokerClient,
-    wallet_id: &str,
+fn expected_evm_batch_sign_operation_digest(
+    wallet: &bloom_broker_api::WalletPublic,
+    key_ref: bloom_broker_api::KeyRef,
     state: &TriadEvmBatchSigningState,
 ) -> Result<Digest32, TxEngineError> {
     let approval_id = state.approval_id.clone().ok_or_else(|| {
         TxEngineError::ApprovalState("active exact batch is missing its approval ID".into())
     })?;
-    let wallet = broker
-        .wallet(
-            Token::new(wallet_id.to_string())
-                .map_err(|error| TxEngineError::ApprovalConstruction(error.to_string()))?,
-        )
-        .await
-        .map_err(protocol_signing_error)?;
-    let suite = CryptoSuite::Secp256k1Keccak256Recoverable;
-    let mut matching = wallet
-        .key_refs
-        .into_iter()
-        .filter(|key| key.key_spec == suite.key_spec());
-    let key_ref = matching.next().ok_or_else(|| {
-        TxEngineError::ApprovalDenied("wallet has no key compatible with exact EVM signing".into())
-    })?;
-    if matching.next().is_some() {
-        return Err(TxEngineError::ApprovalDenied(
-            "wallet has multiple compatible keys; exact EVM signing is ambiguous".into(),
-        ));
-    }
     SignOperationIdentity {
         operation_id: state.signing_operation_id.clone(),
         approval_id,
         key_ref,
-        crypto_suite: suite,
+        crypto_suite: CryptoSuite::Secp256k1Keccak256Recoverable,
         ordered_payload_digests: state.ordered_payload_digests.clone(),
         ordered_hashes: state.ordered_hashes.clone(),
         petal_use_claim_digest: None,
         claim_assurance_digest: None,
-        policy_version: wallet.policy_version,
-        policy_digest: wallet.policy_digest,
+        policy_version: wallet.policy_version.clone(),
+        policy_digest: wallet.policy_digest.clone(),
     }
     .digest()
     .map_err(protocol_signing_error)
@@ -4654,7 +4721,8 @@ mod tests {
         ApprovalPrepareState, ApprovalPublicStatus, Base64UrlBytes, KeyPublic, KeyRef, KeyRole,
         KeySpec, MachineBrokerRequest, MachineBrokerResponse, MachineBrokerService,
         NormalizedSignature, OperationPublicStatus, ProvenanceCatalog, ProvenanceFeeAsset,
-        ProvenanceOperationClass, ServiceFuture, SigningPayloads, SigningResult, WalletPublic,
+        ProvenanceOperationClass, ServiceFuture, SigningPayloads, SigningResult,
+        WalletAccountsPublic, WalletPublic, WalletSeedProfile,
     };
     use bloom_proto::TxStatus;
 
@@ -4668,6 +4736,9 @@ mod tests {
         completed_result: parking_lot::Mutex<Option<SigningResult>>,
         requests: parking_lot::Mutex<Vec<MachineBrokerRequest>>,
         key_ref: KeyRef,
+        /// When non-empty the wallet is BIP-39: no root key, and these are
+        /// its active derived EVM children with their projected addresses.
+        derived: Vec<(KeyRef, String)>,
     }
 
     impl MachineBrokerService for TriadBrokerFixture {
@@ -4679,22 +4750,47 @@ mod tests {
                 self.requests.lock().push(request.clone());
                 match request {
                     MachineBrokerRequest::WalletGetPublic(request) => {
+                        let (root_key_ref, key_refs) = if self.derived.is_empty() {
+                            (Some(self.key_ref.clone()), vec![self.key_ref.clone()])
+                        } else {
+                            (
+                                None,
+                                self.derived.iter().map(|(key, _)| key.clone()).collect(),
+                            )
+                        };
                         Ok(MachineBrokerResponse::WalletGetPublic(WalletPublic {
                             wallet_id: request.wallet_id,
                             wallet_kind: Token::new("local").unwrap(),
-                            root_key_ref: Some(self.key_ref.clone()),
-                            key_refs: vec![self.key_ref.clone()],
+                            root_key_ref,
+                            key_refs,
                             policy_version: DecimalU64::new(1),
                             policy_digest: Digest32::from_bytes([7; 32]),
                             wallet_revocation_epoch: DecimalU64::new(0),
                         }))
                     }
+                    MachineBrokerRequest::WalletAccounts(request) => Ok(
+                        MachineBrokerResponse::WalletAccounts(WalletAccountsPublic {
+                            wallet_id: request.wallet_id,
+                            seed_profile: WalletSeedProfile::Bip39MulticurveV1,
+                            accounts: self
+                                .derived
+                                .iter()
+                                .map(|(key, address)| derived_evm_account(key, address))
+                                .collect(),
+                        }),
+                    ),
                     MachineBrokerRequest::KeyGetPublic(request)
-                        if request.key_ref == self.key_ref =>
+                        if request.key_ref == self.key_ref
+                            || self.derived.iter().any(|(key, _)| key == &request.key_ref) =>
                     {
+                        let role = if self.derived.is_empty() {
+                            KeyRole::WalletRoot
+                        } else {
+                            KeyRole::Derived
+                        };
                         Ok(MachineBrokerResponse::KeyGetPublic(KeyPublic {
                             key_ref: request.key_ref,
-                            role: KeyRole::WalletRoot,
+                            role,
                             canonical_public_key: Base64UrlBytes::from_bytes(&[3; 33]),
                             addresses: Vec::new(),
                             supported_crypto_suites: vec![
@@ -4850,6 +4946,56 @@ mod tests {
             key_spec: KeySpec::Secp256k1,
             public_key_fingerprint: Digest32::from_bytes([12; 32]),
             derivation: None,
+        }
+    }
+
+    /// The derived EVM child at account `number`, as `wallet.accounts` names it.
+    fn derived_evm_key_ref(number: u32) -> KeyRef {
+        let path = format!("m/44'/60'/0'/0/{number}");
+        KeyRef {
+            backend: Token::new("local").unwrap(),
+            backend_instance: Token::new("alice").unwrap(),
+            locator: path.clone(),
+            key_spec: KeySpec::Secp256k1,
+            public_key_fingerprint: Digest32::from_bytes(
+                sha2::Sha256::digest(vec![number as u8 + 0x40; 88]).into(),
+            ),
+            derivation: Some(bloom_broker_api::DerivationRef::Bip39Multicurve {
+                wallet_seed_ref: Token::new("alice").unwrap(),
+                profile: bloom_broker_api::DerivationProfile::Bip44EvmSecp256k1V1,
+                path,
+            }),
+        }
+    }
+
+    fn derived_evm_account(
+        key_ref: &KeyRef,
+        address: &str,
+    ) -> bloom_broker_api::DerivedAccountPublic {
+        let Some(bloom_broker_api::DerivationRef::Bip39Multicurve { path, .. }) =
+            &key_ref.derivation
+        else {
+            panic!("fixture derived keys carry a BIP-39 derivation");
+        };
+        let number: u8 = path.rsplit('/').next().unwrap().parse().unwrap();
+        let spki = vec![number + 0x40; 88];
+        bloom_broker_api::DerivedAccountPublic {
+            key_ref: key_ref.clone(),
+            wallet_seed_profile: WalletSeedProfile::Bip39MulticurveV1,
+            derivation_profile: bloom_broker_api::DerivationProfile::Bip44EvmSecp256k1V1,
+            path: path.clone(),
+            canonical_public_key: Base64UrlBytes::from_bytes(&spki),
+            public_key_encoding: bloom_broker_api::PublicKeyEncoding::Secp256k1SpkiDer,
+            public_key_fingerprint: key_ref.public_key_fingerprint.clone(),
+            supported_crypto_suites: vec![CryptoSuite::Secp256k1Keccak256Recoverable],
+            chain_projections: vec![bloom_broker_api::ChainAccountProjection {
+                chain_family: Token::new("evm").unwrap(),
+                caip2: "eip155:31337".into(),
+                caip10: format!("eip155:31337:{address}"),
+                address: address.to_owned(),
+                address_encoding: bloom_broker_api::AddressEncoding::Hex0x,
+            }],
+            lifecycle: bloom_broker_api::AccountLifecycleState::Active,
         }
     }
 
@@ -5587,6 +5733,7 @@ mod tests {
             completed_result: parking_lot::Mutex::new(None),
             requests: parking_lot::Mutex::new(Vec::new()),
             key_ref: triad_key_ref(),
+            derived: Vec::new(),
         });
         let service: Arc<dyn MachineBrokerService> = fixture.clone();
         let broker = MachineBrokerClient::new(service);
@@ -5666,6 +5813,7 @@ mod tests {
                 requests.as_slice(),
                 [
                     MachineBrokerRequest::WalletGetPublic(_),
+                    MachineBrokerRequest::WalletGetPublic(_),
                     MachineBrokerRequest::KeyGetPublic(_),
                     MachineBrokerRequest::SealedApprovalPrepare(_),
                     MachineBrokerRequest::SealedApprovalStatus(_),
@@ -5676,6 +5824,174 @@ mod tests {
                 ]
             ),
             "unexpected exact signing request sequence: {requests:#?}"
+        );
+    }
+
+    /// A BIP-39 wallet with two derived EVM children. The staged sender picks
+    /// the key: the request's `account_key_ref`, the prepared approval's
+    /// `key_ref`, and the signing call all name account 1, never account 0.
+    #[tokio::test]
+    async fn triad_confirm_signs_with_the_derived_child_that_owns_the_staged_sender() {
+        let directory = tempfile::tempdir().unwrap();
+        let outbox = Outbox::new(directory.path().join("outbox")).unwrap();
+        let mut staged = fake_staged_1559("triad-account-one");
+        staged.created_ms = now_ms();
+        outbox.write_pending(&staged, "exact EVM review").unwrap();
+        let entry = outbox
+            .read_in_state("alice", "anvil", "triad-account-one", OutboxState::Pending)
+            .unwrap();
+        let account_zero = derived_evm_key_ref(0);
+        let account_one = derived_evm_key_ref(1);
+        let fixture = Arc::new(TriadBrokerFixture {
+            active: AtomicBool::new(true),
+            approval_terminal: parking_lot::Mutex::new(None),
+            lose_sign_response_once: AtomicBool::new(false),
+            corrupt_status_result: AtomicBool::new(false),
+            completed_result: parking_lot::Mutex::new(None),
+            requests: parking_lot::Mutex::new(Vec::new()),
+            key_ref: triad_key_ref(),
+            derived: vec![
+                (
+                    account_zero.clone(),
+                    "0x1111111111111111111111111111111111111111".into(),
+                ),
+                (account_one.clone(), TEST_SIGNER_ADDRESS.to_uppercase()),
+            ],
+        });
+        let service: Arc<dyn MachineBrokerService> = fixture.clone();
+        let engine = TxEngine::new(outbox, 60_000)
+            .with_triad_signing(MachineBrokerClient::new(service), triad_catalog())
+            .unwrap();
+        let unsigned = UnsignedEvmTx::Eip1559(TxEip1559 {
+            chain_id: staged.chain_id,
+            nonce: staged.nonce,
+            gas_limit: staged.gas_limit,
+            max_fee_per_gas: 100,
+            max_priority_fee_per_gas: 10,
+            to: TxKind::Call(staged.to.parse().unwrap()),
+            value: U256::ZERO,
+            access_list: AccessList::default(),
+            input: Bytes::new(),
+        });
+        let preimage = TxEngine::unsigned_signing_preimage(&unsigned);
+        let signing_hash = TxEngine::unsigned_signing_hash(&unsigned);
+
+        // First pass prepares the approval against account 1's key.
+        let TxEngineError::ApprovalRequired(_) = engine
+            .triad_sign_evm_payload(
+                &entry,
+                &staged,
+                EvmOutboxActionKind::Confirm,
+                &preimage,
+                signing_hash,
+            )
+            .await
+            .unwrap_err()
+        else {
+            panic!("first exact sign must return the Broker ceremony");
+        };
+        engine
+            .triad_sign_evm_payload(
+                &entry,
+                &staged,
+                EvmOutboxActionKind::Confirm,
+                &preimage,
+                signing_hash,
+            )
+            .await
+            .unwrap();
+
+        let requests = fixture.requests.lock();
+        let prepared = requests
+            .iter()
+            .find_map(|request| match request {
+                MachineBrokerRequest::SealedApprovalPrepare(request) => Some(request),
+                _ => None,
+            })
+            .expect("an approval was prepared");
+        assert_eq!(prepared.terms.key_ref, account_one);
+        let signed = requests
+            .iter()
+            .find_map(|request| match request {
+                MachineBrokerRequest::SigningSign(request) => Some(request),
+                _ => None,
+            })
+            .expect("a signature was requested");
+        assert_eq!(signed.key_ref, account_one);
+        assert!(
+            requests.iter().all(|request| !matches!(
+                request,
+                MachineBrokerRequest::KeyGetPublic(request) if request.key_ref == account_zero
+            )),
+            "account 0 must never be consulted for account 1's transaction"
+        );
+    }
+
+    #[tokio::test]
+    async fn triad_confirm_refuses_a_sender_no_derived_child_owns() {
+        let directory = tempfile::tempdir().unwrap();
+        let outbox = Outbox::new(directory.path().join("outbox")).unwrap();
+        let mut staged = fake_staged_1559("triad-unknown-sender");
+        staged.created_ms = now_ms();
+        staged.from = "0x2222222222222222222222222222222222222222".into();
+        outbox.write_pending(&staged, "exact EVM review").unwrap();
+        let entry = outbox
+            .read_in_state(
+                "alice",
+                "anvil",
+                "triad-unknown-sender",
+                OutboxState::Pending,
+            )
+            .unwrap();
+        let fixture = Arc::new(TriadBrokerFixture {
+            active: AtomicBool::new(true),
+            approval_terminal: parking_lot::Mutex::new(None),
+            lose_sign_response_once: AtomicBool::new(false),
+            corrupt_status_result: AtomicBool::new(false),
+            completed_result: parking_lot::Mutex::new(None),
+            requests: parking_lot::Mutex::new(Vec::new()),
+            key_ref: triad_key_ref(),
+            derived: vec![(derived_evm_key_ref(0), TEST_SIGNER_ADDRESS.into())],
+        });
+        let service: Arc<dyn MachineBrokerService> = fixture.clone();
+        let engine = TxEngine::new(outbox, 60_000)
+            .with_triad_signing(MachineBrokerClient::new(service), triad_catalog())
+            .unwrap();
+        let unsigned = UnsignedEvmTx::Eip1559(TxEip1559 {
+            chain_id: staged.chain_id,
+            nonce: staged.nonce,
+            gas_limit: staged.gas_limit,
+            max_fee_per_gas: 100,
+            max_priority_fee_per_gas: 10,
+            to: TxKind::Call(staged.to.parse().unwrap()),
+            value: U256::ZERO,
+            access_list: AccessList::default(),
+            input: Bytes::new(),
+        });
+        let preimage = TxEngine::unsigned_signing_preimage(&unsigned);
+        let signing_hash = TxEngine::unsigned_signing_hash(&unsigned);
+
+        let error = engine
+            .triad_sign_evm_payload(
+                &entry,
+                &staged,
+                EvmOutboxActionKind::Confirm,
+                &preimage,
+                signing_hash,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&error, TxEngineError::ApprovalDenied(reason) if reason.contains(&staged.from)),
+            "{error:?}"
+        );
+        assert!(
+            !fixture
+                .requests
+                .lock()
+                .iter()
+                .any(|request| matches!(request, MachineBrokerRequest::SealedApprovalPrepare(_))),
+            "no approval may be prepared for an unowned sender"
         );
     }
 
@@ -5762,6 +6078,7 @@ mod tests {
             completed_result: parking_lot::Mutex::new(None),
             requests: parking_lot::Mutex::new(Vec::new()),
             key_ref: triad_key_ref(),
+            derived: Vec::new(),
         });
         let service: Arc<dyn MachineBrokerService> = fixture.clone();
         let broker = MachineBrokerClient::new(service);

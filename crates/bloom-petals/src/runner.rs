@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bloom_vfs::handler::HandlerError;
+use bloom_vfs::handlers::wallets::AccountPetalContext;
 use bloom_vfs::path::VfsPath;
 use bloom_vfs::{Handler, Vfs};
 use lru::LruCache;
@@ -281,7 +282,11 @@ impl PetalRunner {
     /// then a hash prefix is tried against every installed hash, then
     /// a Petal name, then a petname. Returns `None` when nothing
     /// matches.
-    fn resolve_uninstall_hash(&self, target: &str) -> Result<Option<String>, PetalError> {
+    ///
+    /// Public so a caller holding the mutation lock can name the exact
+    /// outgoing package before removing it, which is what the active-session
+    /// guard keys on.
+    pub fn resolve_uninstall_hash(&self, target: &str) -> Result<Option<String>, PetalError> {
         if crate::store::is_valid_hex_hash(target) {
             return Ok(Some(target.to_string()));
         }
@@ -456,11 +461,58 @@ impl PetalRunner {
     pub async fn dispatch_petal_route(
         &self,
         mount: &str,
-        mut request: DispatchRequest,
+        request: DispatchRequest,
         host: Arc<dyn PetalHost>,
         cap_mask: Option<BTreeSet<Capability>>,
         opts: RunOptions,
     ) -> Result<DispatchOutput, PetalError> {
+        self.dispatch_petal_route_with_trusted_params(
+            mount,
+            request,
+            host,
+            cap_mask,
+            opts,
+            &[],
+            None,
+        )
+        .await
+    }
+
+    /// [`Self::dispatch_petal_route`] with host-trusted parameters appended
+    /// next to `bloom.route_id`. The mounted account path is the one caller:
+    /// a route reached under `wallets/<w>/<n>/petals/` runs with the host
+    /// provenance facts `bloom.wallet`, `bloom.account` and
+    /// `bloom.owner_key_fingerprint`, which guest and host both read. A
+    /// caller-supplied context entry whose name starts with `bloom.` is
+    /// rejected before the host appends its own values, so no dispatch path
+    /// can shadow a trusted one.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn dispatch_petal_route_with_trusted_params(
+        &self,
+        mount: &str,
+        mut request: DispatchRequest,
+        host: Arc<dyn PetalHost>,
+        cap_mask: Option<BTreeSet<Capability>>,
+        opts: RunOptions,
+        trusted_params: &[(String, String)],
+        account: Option<&AccountPetalContext>,
+    ) -> Result<DispatchOutput, PetalError> {
+        if let Some((name, _)) = request
+            .ctx
+            .iter()
+            .find(|(name, _)| name.starts_with("bloom."))
+        {
+            return Err(PetalError::InvalidWasm(format!(
+                "caller context parameter '{name}' uses the reserved bloom. prefix"
+            )));
+        }
+        for (name, _) in trusted_params {
+            if !name.starts_with("bloom.") || name == "bloom.route_id" {
+                return Err(PetalError::InvalidWasm(format!(
+                    "trusted parameter '{name}' is not a host-owned bloom. name"
+                )));
+            }
+        }
         let matched = self.petal_route(mount, request.op, &request.path)?;
         let mut route_params = matched.params.clone();
         // Components need the host-selected route identity to construct
@@ -468,6 +520,20 @@ impl PetalRunner {
         // it in the trusted match output rather than accepting it from the
         // caller-supplied request context.
         route_params.push(("bloom.route_id".into(), matched.route.route_id.clone()));
+        // The owner fingerprint is chosen for the matched route, not for the
+        // whole Petal: a route that derives or signs in exactly one family
+        // carries that family's key, and only an unambiguous account may
+        // supply one otherwise. A route the account cannot name simply runs
+        // without one; the signing seam resolves the owner from the path.
+        if let Some(fingerprint) =
+            account.and_then(|account| route_owner_fingerprint(&matched.route, account))
+        {
+            route_params.push((
+                "bloom.owner_key_fingerprint".to_owned(),
+                fingerprint.to_owned(),
+            ));
+        }
+        route_params.extend(trusted_params.iter().cloned());
         request.ctx.extend(route_params.clone());
 
         let wasm = self
@@ -579,6 +645,14 @@ impl PetalRunner {
     fn petal_net_policy(&self, hash: &str) -> Result<NetPolicy, PetalError> {
         let manifest = std::fs::read(self.store.package_path(hash)?.join("source/petal.toml"))?;
         NetPolicy::from_manifest_toml(&manifest)
+    }
+
+    /// Whether the package installed at `mount` declares
+    /// `[account] aware = true` in its manifest.
+    pub fn petal_account_aware(&self, mount: &str) -> Result<bool, PetalError> {
+        let hash = self.resolve_petal_mount(mount)?;
+        let manifest = std::fs::read(self.store.package_path(&hash)?.join("source/petal.toml"))?;
+        crate::package::account_aware_from_manifest_toml(&manifest)
     }
 
     fn petal_sign_intents(&self, hash: &str) -> Result<BTreeSet<String>, PetalError> {
@@ -802,6 +876,32 @@ fn route_segments(path: &str) -> Vec<&str> {
     }
 }
 
+/// The owner fingerprint one route's dispatch carries. The route's
+/// key-derive suites name a family when they name exactly one; otherwise
+/// only an account with a single family key can supply one, and a route
+/// the account cannot name runs without a fingerprint.
+fn route_owner_fingerprint<'a>(
+    route: &crate::package::RouteIndexRecord,
+    account: &'a AccountPetalContext,
+) -> Option<&'a str> {
+    let (mut evm, mut solana) = (false, false);
+    for suite in &route.key_derive_allowed_crypto_suites {
+        if suite.starts_with("secp256k1") {
+            evm = true;
+        } else if suite.starts_with("ed25519") {
+            solana = true;
+        }
+    }
+    match (evm, solana) {
+        (true, false) => account.evm_fingerprint.as_deref(),
+        (false, true) => account.solana_fingerprint.as_deref(),
+        _ => match (&account.evm_fingerprint, &account.solana_fingerprint) {
+            (Some(fingerprint), None) | (None, Some(fingerprint)) => Some(fingerprint.as_str()),
+            _ => None,
+        },
+    }
+}
+
 fn route_segment_matches(pattern: &str, value: &str) -> bool {
     if let Some(rest) = pattern.strip_prefix('[')
         && let Some(end) = rest.find(']')
@@ -819,6 +919,116 @@ mod tests {
     use super::*;
     use crate::abi::DispatchResponse;
     use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn caller_context_never_uses_the_reserved_bloom_prefix() {
+        let (_dir, r) = runner();
+        let host = Arc::new(RejectingHost);
+        let error = r
+            .dispatch_petal_route_with_trusted_params(
+                "echo",
+                DispatchRequest {
+                    op: DispatchOp::Read,
+                    path: "message.txt".into(),
+                    body: Vec::new(),
+                    ctx: vec![("bloom.wallet".into(), "forged".into())],
+                },
+                host,
+                None,
+                RunOptions::default(),
+                &[],
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&error, PetalError::InvalidWasm(message) if message.contains("reserved bloom.")),
+            "{error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn trusted_params_must_be_host_owned_bloom_names() {
+        let (_dir, r) = runner();
+        let host = Arc::new(RejectingHost);
+        let error = r
+            .dispatch_petal_route_with_trusted_params(
+                "echo",
+                DispatchRequest {
+                    op: DispatchOp::Read,
+                    path: "message.txt".into(),
+                    body: Vec::new(),
+                    ctx: Vec::new(),
+                },
+                host,
+                None,
+                RunOptions::default(),
+                &[("wallet".into(), "alice".into())],
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&error, PetalError::InvalidWasm(message) if message.contains("host-owned")),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn installed_manifest_declares_account_awareness() {
+        let (dir, r) = runner();
+        install_echo_app(&dir, &r);
+        assert!(
+            !r.petal_account_aware("echo").unwrap(),
+            "absence of [account] means unaware"
+        );
+
+        let package = dir.path().join("aware-app");
+        write_package_file(
+            &package,
+            "petal.toml",
+            br#"schema = "bloom.petal.package.v1"
+name = "aware"
+
+[consent]
+summary = "Account-aware echo."
+
+[caps]
+allowed = ["bloom:vfs.read"]
+
+[account]
+aware = true
+"#,
+        );
+        write_package_file(&package, "README.md", b"# aware");
+        write_package_file(&package, "AGENTS.md", b"# aware agents");
+        write_package_file(
+            &package,
+            "petal/aware/message.txt.wasm",
+            include_bytes!("../tests/fixtures/route_component_no_imports.wasm"),
+        );
+        let (result, _, _) = r.store().install_petal_package_dir(&package).unwrap();
+        assert!(r.petal_account_aware("aware").unwrap());
+        assert_eq!(r.resolve("aware").unwrap(), result.hash);
+    }
+    /// A host the dispatch must never reach in the rejection tests.
+    struct RejectingHost;
+
+    #[async_trait::async_trait]
+    impl PetalHost for RejectingHost {
+        async fn vfs_lookup(&self, _path: &str) -> Result<HostVfsEntry, HostError> {
+            Err(HostError::Denied("rejecting host".into()))
+        }
+        async fn vfs_read(&self, _path: &str) -> Result<Vec<u8>, HostError> {
+            Err(HostError::Denied("rejecting host".into()))
+        }
+        async fn vfs_list(&self, _path: &str) -> Result<Vec<HostVfsEntry>, HostError> {
+            Err(HostError::Denied("rejecting host".into()))
+        }
+        async fn vfs_write(&self, _path: &str, _bytes: &[u8]) -> Result<(), HostError> {
+            Err(HostError::Denied("rejecting host".into()))
+        }
+    }
 
     fn runner() -> (TempDir, PetalRunner) {
         let dir = TempDir::new().unwrap();
