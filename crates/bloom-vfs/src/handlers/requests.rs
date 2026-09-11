@@ -2034,11 +2034,7 @@ fn new_request_id() -> String {
 }
 
 fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
-        .min(u128::from(u64::MAX)) as u64
+    bloom_proto::now_ms().unwrap_or(0)
 }
 
 #[derive(Debug)]

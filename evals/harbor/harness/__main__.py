@@ -7,7 +7,8 @@ import os
 import sys
 from pathlib import Path
 
-from .core import EvalError, run_eval
+from .core import CounterSidecar, EvalError, run_eval
+from .hyperliquid_approve_builder_fee import HyperliquidApproveBuilderFeeEval
 from .hyperliquid_order_cancel import HyperliquidOrderCancelEval
 
 
@@ -17,7 +18,7 @@ def parser() -> argparse.ArgumentParser:
     )
     value.add_argument(
         "eval",
-        choices=("hyperliquid-order-cancel",),
+        choices=("hyperliquid-order-cancel", "hyperliquid-approve-builder-fee"),
         help="host-side evaluation definition",
     )
     value.add_argument("agent", nargs="?", choices=("claude", "codex"))
@@ -32,13 +33,32 @@ def parser() -> argparse.ArgumentParser:
     return value
 
 
+def counter_sidecar() -> CounterSidecar:
+    """The one counter record for this authenticator, shared by every entry point.
+
+    Keyed only by the credential and kept per user, so direct runs from any
+    checkout and the operator lifecycle all reserve from the same record. There
+    is deliberately no per-run file override: a run pointed at its own file
+    would split the counter sequence again.
+    """
+    seed = os.environ.get("BLOOM_EVAL_AUTHENTICATOR_SEED_FILE", "")
+    if not seed:
+        raise EvalError(
+            "BLOOM_EVAL_AUTHENTICATOR_SEED_FILE is required to key the counter sidecar"
+        )
+    return CounterSidecar.for_credential(Path(seed))
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     repo_root = Path(
         os.environ.get("BLOOM_EVAL_REPO_ROOT", Path(__file__).resolve().parents[3])
     )
     definitions = {
-        "hyperliquid-order-cancel": lambda: HyperliquidOrderCancelEval(repo_root)
+        "hyperliquid-order-cancel": lambda: HyperliquidOrderCancelEval(repo_root),
+        "hyperliquid-approve-builder-fee": lambda: HyperliquidApproveBuilderFeeEval(
+            repo_root
+        ),
     }
     definition = definitions[args.eval]()
     try:
@@ -55,6 +75,11 @@ def main(argv: list[str] | None = None) -> int:
         else:
             if args.agent is None:
                 raise EvalError("an agent is required unless --preauthorization-only is set")
+            # A direct run has no operator state file. Without a sidecar every
+            # ceremony would advance the counter in memory only, and the next
+            # process -- or another eval on the same authenticator -- would
+            # replay a spent one. Preauthorization never signs, so it skips this.
+            definition.attach_counter_sidecar(counter_sidecar())
             run_eval(definition, args.agent)
     except (EvalError, KeyboardInterrupt) as error:
         print(f"Bloom Harbor eval: {error}", file=sys.stderr)

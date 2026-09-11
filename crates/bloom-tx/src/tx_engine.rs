@@ -4,7 +4,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::UNIX_EPOCH;
 
 use alloy::consensus::{SignableTransaction, TxEip1559, TxEnvelope, TxLegacy};
 use alloy::eips::Encodable2718;
@@ -4435,10 +4435,7 @@ fn enso_quote_age_secs(data_hex: &str, now_secs: u64) -> Option<u64> {
 }
 
 fn now_ms() -> u128 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
+    u128::from(bloom_proto::now_ms().unwrap_or(0))
 }
 
 fn outbox_action_id(staged: &StagedTx, action_kind: EvmOutboxActionKind) -> String {

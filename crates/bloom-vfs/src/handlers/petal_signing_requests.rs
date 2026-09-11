@@ -2,7 +2,6 @@
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use bloom_machine_client::MachineBrokerClient;
@@ -165,10 +164,7 @@ impl PetalSigningRequestsHandler {
 }
 
 fn now_ms() -> Result<u64, HandlerError> {
-    let duration = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|_| HandlerError::backend("system clock precedes Unix epoch"))?;
-    u64::try_from(duration.as_millis()).map_err(|_| HandlerError::backend("system time overflow"))
+    bloom_proto::now_ms().map_err(HandlerError::backend)
 }
 
 #[async_trait]

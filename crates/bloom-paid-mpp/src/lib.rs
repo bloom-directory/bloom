@@ -407,7 +407,7 @@ async fn exactize_voucher(
     preimage.extend_from_slice(&[0x19, 0x01]);
     preimage.extend_from_slice(domain.separator().as_slice());
     preimage.extend_from_slice(voucher.eip712_hash_struct().as_slice());
-    let hash: [u8; 32] = alloy::primitives::keccak256(&preimage).into();
+    let hash: [u8; 32] = voucher.eip712_signing_hash(&domain).into();
     let raw = host
         .sign_paid_http_payload(MPP_SIGN_INTENT, signing_slot, &preimage, hash, facts)
         .await?;

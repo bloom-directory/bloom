@@ -145,6 +145,121 @@ git -C "$repo_root" check-ignore -q evals/harbor/operator-state.json
 grep -Fq '`bloom vfs`, the `bloom` executable' \
   "${task}/instruction.md"
 bash -n "${task}/tests/test.sh"
+
+# --- hyperliquid-approve-builder-fee -------------------------------------
+builder_fee_task="${repo_root}/evals/harbor/tasks/hyperliquid-approve-builder-fee"
+builder_fee_verifier="${builder_fee_task}/tests/verify_result.py"
+
+builder="0x4444444444444444444444444444444444444444"
+wallet_id="eval-wallet"
+max_fee_tenths_bps=10
+nonce=1700000000000
+export BLOOM_EVAL_NETWORK="testnet" BLOOM_EVAL_WALLET="$wallet" \
+  BLOOM_EVAL_WALLET_ID="$wallet_id" BLOOM_EVAL_BUILDER="$builder" \
+  BLOOM_EVAL_BUILDER_MAX_FEE_TENTHS_BPS="$max_fee_tenths_bps" \
+  BLOOM_EVAL_APPROVAL_NONCE="$nonce"
+
+# Serve a deterministic maxBuilderFee response so the verifier's HTTP trust
+# boundary is exercised without touching a live venue.
+cat >"$tmp/fake_hyperliquid_builder_fee.py" <<'PY'
+import json
+import os
+import pathlib
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+wallet = os.environ["BLOOM_EVAL_WALLET"]
+builder = os.environ["BLOOM_EVAL_BUILDER"]
+max_fee_tenths_bps = int(os.environ["BLOOM_EVAL_BUILDER_MAX_FEE_TENTHS_BPS"])
+
+
+class Handler(BaseHTTPRequestHandler):
+    def do_POST(self):
+        length = int(self.headers.get("content-length", "0"))
+        request = json.loads(self.rfile.read(length))
+        if (
+            request.get("type") == "maxBuilderFee"
+            and request.get("user") == wallet
+            and request.get("builder") == builder
+        ):
+            response = max_fee_tenths_bps
+        else:
+            response = 0
+        body = json.dumps(response).encode()
+        self.send_response(200)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, _format, *_args):
+        pass
+
+
+server = HTTPServer(("127.0.0.1", 0), Handler)
+pathlib.Path(os.environ["FAKE_HYPERLIQUID_PORT_FILE"]).write_text(
+    str(server.server_port)
+)
+server.serve_forever()
+PY
+builder_fee_port_file="$tmp/fake-hyperliquid-builder-fee.port"
+FAKE_HYPERLIQUID_PORT_FILE="$builder_fee_port_file" "${python_cmd[@]}" \
+  "$tmp/fake_hyperliquid_builder_fee.py" &
+fake_hyperliquid_builder_fee_pid=$!
+trap 'kill "$fake_hyperliquid_pid" "$fake_hyperliquid_builder_fee_pid" 2>/dev/null || true; rm -rf "$tmp"' EXIT
+for _ in $(seq 1 50); do
+  [ -s "$builder_fee_port_file" ] && break
+  sleep 0.1
+done
+[ -s "$builder_fee_port_file" ] || { echo "fake Hyperliquid maxBuilderFee server did not start" >&2; exit 1; }
+export BLOOM_EVAL_HYPERLIQUID_INFO_URL="http://127.0.0.1:$(cat "$builder_fee_port_file")/info"
+
+cat >"$tmp/builder-fee-good.json" <<EOF
+{"schema":"bloom.eval.hyperliquid_approve_builder_fee.v1","status":"complete","network":"testnet","wallet":"$wallet","wallet_id":"$wallet_id","builder":"$builder","max_fee_tenths_bps":$max_fee_tenths_bps,"nonce":$nonce,"hyperliquid_response":{"status":"ok"},"observed_max_builder_fee":$max_fee_tenths_bps}
+EOF
+"${python_cmd[@]}" "$builder_fee_verifier" "$tmp/builder-fee-good.json"
+
+"${python_cmd[@]}" - "$tmp/builder-fee-good.json" "$tmp" "$builder_fee_verifier" <<'PY'
+import json, os, pathlib, subprocess, sys
+source = json.loads(pathlib.Path(sys.argv[1]).read_text())
+root = pathlib.Path(sys.argv[2])
+verifier = sys.argv[3]
+mutations = {
+    "wrong-network": {"network": "mainnet"},
+    "wrong-wallet": {"wallet": "0x5555555555555555555555555555555555555555"},
+    "wrong-builder": {"builder": "0x6666666666666666666666666666666666666666"},
+    "wrong-max-fee": {"max_fee_tenths_bps": source["max_fee_tenths_bps"] + 1},
+    "wrong-nonce": {"nonce": source["nonce"] + 1},
+    "venue-rejected": {"hyperliquid_response": {"status": "err"}},
+    "observed-mismatches-venue": {"observed_max_builder_fee": source["max_fee_tenths_bps"] + 5},
+    "extra-field": {"unexpected": True},
+}
+for name, values in mutations.items():
+    report = source | values
+    path = root / f"builder-fee-{name}.json"
+    path.write_text(json.dumps(report))
+    result = subprocess.run([sys.executable, verifier, str(path)], env=os.environ, capture_output=True, text=True)
+    if result.returncode == 0:
+        raise SystemExit(f"invalid fixture passed: {name}")
+PY
+
+"${python_cmd[@]}" - <<PY
+import sys
+import tomllib
+from pathlib import Path
+sys.path.insert(0, str(Path("${repo_root}/evals/harbor")))
+from harness.hyperliquid_approve_builder_fee import EVAL_IMAGE
+
+with Path("${builder_fee_task}/task.toml").open("rb") as handle:
+    task = tomllib.load(handle)
+assert task["task"]["name"] == "bloom/hyperliquid-approve-builder-fee"
+assert task["environment"]["network_mode"] == "public"
+assert task["environment"]["docker_image"] == EVAL_IMAGE
+PY
+
+grep -Fq '`bloom vfs`, the `bloom` executable' \
+  "${builder_fee_task}/instruction.md"
+bash -n "${builder_fee_task}/tests/test.sh"
+
 PYTHONPATH="${repo_root}/evals/harbor" "${python_cmd[@]}" -m unittest discover \
   -s "${repo_root}/evals/harbor/harness_tests" -v
 

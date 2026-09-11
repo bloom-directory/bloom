@@ -7,7 +7,8 @@ use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+#[cfg(not(unix))]
+use std::time::SystemTime;
 
 use ed25519_dalek::{Signature, Signer as _, SigningKey, Verifier as _, VerifyingKey};
 use parking_lot::Mutex;
@@ -646,7 +647,7 @@ impl AuditLog {
             return Err(AuditError::Degraded(reason));
         }
         record.prev = g.last_digest.clone();
-        record.ts_ms = now_ms();
+        record.ts_ms = crate::clock::now_ms().map_err(AuditError::Degraded)?;
         record.digest = String::new();
         let body = serde_json::to_string(&record)?;
         let digest = blake3::hash(body.as_bytes()).to_hex().to_string();
@@ -1531,14 +1532,6 @@ fn read_signed_lines(path: &Path) -> Result<Vec<SignedAuditLine>, AuditError> {
         })
         .map(|line| Ok(serde_json::from_str(&line?)?))
         .collect()
-}
-
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
-        .min(u64::MAX as u128) as u64
 }
 
 fn decode_record(line: &str) -> Result<AuditRecord, serde_json::Error> {

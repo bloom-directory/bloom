@@ -16,7 +16,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from .core import EvalError, run_eval
+from .core import CounterSidecar, EvalError, run_eval
 from .hyperliquid_order_cancel import (
     MAINNET_ACK,
     PACKAGE_HASH,
@@ -173,6 +173,18 @@ class StateStore:
     def write(self, value: dict[str, Any]) -> None:
         atomic_write(self.path, canonical_json(value) + b"\n")
 
+    def verify_writable(self) -> None:
+        """Prove a counter commit can land, without advancing the counter.
+
+        Rewrites the validated state as its own canonical bytes through the
+        same atomic path `update_counter` uses, so a read-only file, a
+        read-only parent directory, or a full filesystem is caught during
+        preflight rather than after a ceremony has already spent a counter
+        at Broker. Rewriting identical bytes leaves `next_sign_count`
+        untouched, so a failed run cannot silently skip a counter.
+        """
+        self.write(self.read())
+
     def update_counter(self, next_counter: int) -> None:
         state = self.read()
         current = state.get("next_sign_count")
@@ -181,6 +193,19 @@ class StateStore:
         state["next_sign_count"] = next_counter
         state["updated_at"] = datetime.now(UTC).isoformat()
         self.write(state)
+
+    def raise_counter_to(self, next_counter: int) -> None:
+        """Mirror a shared-record reservation into this state file.
+
+        The per-credential sidecar is the source of truth for which counters
+        are spent. This keeps `next_sign_count` at or above it, so recovery
+        never resumes from a counter that was already used. A value that does
+        not advance the mirror is a no-op, not an error.
+        """
+        current = self.read().get("next_sign_count")
+        if isinstance(current, int) and next_counter <= current:
+            return
+        self.update_counter(next_counter)
 
 
 def git_lineage(path: Path) -> dict[str, Any]:
@@ -340,10 +365,14 @@ class PolicyLifecycle:
         store: StateStore,
         state: dict[str, Any],
         definition: HyperliquidOrderCancelEval,
+        sidecar: CounterSidecar | None = None,
     ) -> None:
         self.store = store
         self.state = state
         self.definition = definition
+        # The per-credential counter record direct runs also reserve from.
+        # None keeps the state file as the only record (unit tests).
+        self.sidecar = sidecar
         self.policy_path = definition.wallet_root / "policy.json"
 
     def _read_policy(self) -> tuple[dict[str, Any], bytes]:
@@ -700,7 +729,10 @@ class PolicyLifecycle:
         if not isinstance(operation_id, str) or not isinstance(ceremony_url, str):
             raise EvalError("policy-update challenge is incomplete")
         self._persist_pending(operation_id, digest)
-        counter = int(self.store.read()["next_sign_count"])
+        candidate = int(self.store.read()["next_sign_count"])
+        # Reserve from the record every entry point shares, so a counter a
+        # direct run already spent is skipped rather than replayed.
+        counter = candidate if self.sidecar is None else self.sidecar.reserve(candidate)
         # Persist the next unused counter before the assertion can leave this
         # process. A timeout or interruption after Broker accepts it must not
         # allow a later recovery attempt to reuse the consumed value.
@@ -998,6 +1030,29 @@ def result_summary(result: Any) -> dict[str, Any]:
     }
 
 
+def shared_counter(state: dict[str, Any]) -> CounterSidecar:
+    """The per-credential counter record every entry point shares."""
+    return CounterSidecar.for_credential(Path(state["paths"]["authenticator_seed_file"]))
+
+
+def operator_definition(
+    repo_root: Path, state: dict[str, Any], store: StateStore
+) -> tuple[HyperliquidOrderCancelEval, CounterSidecar]:
+    """The operator's order-cancel eval, reserving from the shared record.
+
+    Counters are spent per credential. Reserving from the same record a
+    direct `python -m harness` run uses, and mirroring into this state file,
+    is what stops an operator run and a direct run on one authenticator from
+    signing with the same counter, one after the other or concurrently.
+    """
+    sidecar = shared_counter(state)
+    definition = HyperliquidOrderCancelEval(repo_root, definition_env(state))
+    definition.attach_counter_sidecar(
+        sidecar, mirror=store.raise_counter_to, also_verify=store.verify_writable
+    )
+    return definition, sidecar
+
+
 def run_or_recover(
     args: argparse.Namespace, repo_root: Path, recover_only: bool
 ) -> None:
@@ -1012,11 +1067,7 @@ def run_or_recover(
     outcome = "failed"
     result: Any | None = None
     error_text: str | None = None
-    definition = HyperliquidOrderCancelEval(
-        repo_root,
-        definition_env(state),
-        counter_committed=store.update_counter,
-    )
+    definition, sidecar = operator_definition(repo_root, state, store)
     with lock_path.open("a+") as lock:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -1024,7 +1075,7 @@ def run_or_recover(
             raise EvalError(
                 "another Hyperliquid eval holds the operator lock"
             ) from error
-        policy = PolicyLifecycle(store, state, definition)
+        policy = PolicyLifecycle(store, state, definition, sidecar=sidecar)
         try:
             if recover_only:
                 if not store.backup_path.exists():

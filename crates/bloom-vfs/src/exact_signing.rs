@@ -4,7 +4,6 @@ use std::fs::{self, OpenOptions};
 use std::io::Write as _;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use bloom_broker_api::{
     CryptoSuite, DecimalU64, Digest32, OperationId, PetalUseClaim, ProtocolErrorCode,
@@ -14,6 +13,7 @@ use bloom_machine_client::{
     ExactPayloadBatchSignRequest, ExactPayloadSignOutcome, ExactPayloadSignRequest,
     MachineBrokerClient,
 };
+use bloom_proto::now_ms;
 use fs2::FileExt as _;
 use rand::RngCore as _;
 use serde::{Deserialize, Serialize};
@@ -786,13 +786,6 @@ fn random_request_nonce() -> RequestNonce {
     let mut bytes = [0_u8; 16];
     rand::rngs::OsRng.fill_bytes(&mut bytes);
     RequestNonce::from_bytes(bytes)
-}
-
-fn now_ms() -> Result<u64, String> {
-    let duration = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|_| "system clock precedes Unix epoch".to_owned())?;
-    u64::try_from(duration.as_millis()).map_err(|_| "system time overflow".to_owned())
 }
 
 fn write_state<T: Serialize>(path: &Path, state: &T) -> Result<(), String> {

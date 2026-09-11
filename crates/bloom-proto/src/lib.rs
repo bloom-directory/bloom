@@ -13,6 +13,7 @@ pub mod audit_ext;
 pub mod capability;
 pub mod ceremony;
 pub mod chain;
+pub mod clock;
 pub mod config;
 pub mod defi_policy;
 pub mod home;
@@ -33,6 +34,7 @@ pub use audit_ext::{append_auth_event, auth_event};
 pub use capability::{CapabilityStatus, CapabilityViewEntry, SigningModel, Venue};
 pub use ceremony::{CeremonyIntent, CeremonyIntentKind};
 pub use chain::{ChainId, ChainRef, ChainSpec, EndpointSpec, default_endpoint_weight};
+pub use clock::now_ms;
 pub use config::{
     Backend, BackendsConfig, Config, ConfigError, EnsoConfig, EtherscanConfig, MempoolChainConfig,
     PrivateRpcChainConfig,
