@@ -22,7 +22,7 @@ bloom-daemon.workspace = true
 bloom-solana-tx.workspace = true
 bloom-machine-client.workspace = true
 bloom-broker-api.workspace = true
-bloom-signer-derive = { git = "https://github.com/bloom-directory/bloom-signer.git", rev = "9abe7917b8380d8b6d31af0b376a79c26e816764" }
+bloom-signer-derive = { git = "https://github.com/bloom-directory/bloom-signer.git", rev = "941dd376568b52ccd269ecf495bcff7dcd9af504" }
 ed25519-dalek.workspace = true
 bs58.workspace = true
 bloom-revert.workspace = true

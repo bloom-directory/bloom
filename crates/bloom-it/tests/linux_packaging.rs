@@ -15,27 +15,67 @@ fn source(relative: &str) -> String {
 
 #[test]
 fn systemd_owns_only_the_tcp_listener_and_services_own_authenticated_unix_sockets() {
-    let ceremony = source("systemd/bloom-broker-ceremony@.socket");
-    for required in [
-        "ListenStream=127.0.0.1:18734",
-        "FileDescriptorName=broker-ceremony",
-        "Service=bloom-broker@%i.service",
-        "Accept=no",
-        "FreeBind=no",
-        "ReusePort=no",
-        "IPAddressDeny=any",
-        "IPAddressAllow=localhost",
+    // One socket unit per loopback family. Chromium resolves `localhost`
+    // to ::1 before 127.0.0.1, and the Broker takes each listener by name
+    // and refuses to bind one itself, so a family that is missing — or
+    // published under the bare `broker-ceremony` name — leaves the service
+    // unable to start.
+    for (unit, address, descriptor) in [
+        (
+            "systemd/bloom-broker-ceremony@.socket",
+            "127.0.0.1:18734",
+            "broker-ceremony-ipv4",
+        ),
+        (
+            "systemd/bloom-broker-ceremony-ipv6@.socket",
+            "[::1]:18734",
+            "broker-ceremony-ipv6",
+        ),
     ] {
+        let ceremony = source(unit);
+        for required in [
+            format!("ListenStream={address}"),
+            format!("FileDescriptorName={descriptor}"),
+            "Service=bloom-broker@%i.service".to_string(),
+            "Accept=no".to_string(),
+            "FreeBind=no".to_string(),
+            "ReusePort=no".to_string(),
+            "IPAddressDeny=any".to_string(),
+            "IPAddressAllow=localhost".to_string(),
+        ] {
+            assert!(ceremony.contains(&required), "{unit} is missing {required}");
+        }
+        let other_family = if address.starts_with('[') {
+            "127.0.0.1"
+        } else {
+            "[::1]"
+        };
         assert!(
-            ceremony.contains(required),
-            "canonical listener is missing {required}"
+            !ceremony.contains(other_family),
+            "{unit} must publish only its own loopback family"
+        );
+        assert!(!ceremony.contains("18735") && !ceremony.contains("Accept=yes"));
+        // The bare single-descriptor spelling must not survive: it is a
+        // prefix of the IPv4 name, so a substring check alone would not
+        // catch a regression.
+        assert!(
+            !ceremony
+                .lines()
+                .any(|line| line.trim() == "FileDescriptorName=broker-ceremony"),
+            "{unit} must not publish the unnamed single-family descriptor"
         );
     }
-    assert!(!ceremony.contains("18735") && !ceremony.contains("Accept=yes"));
 
     let broker = source("systemd/bloom-broker@.service.in");
     let signer = source("systemd/bloom-signer@.service.in");
     for required in [
+        // The names must match the socket units' descriptors exactly; the
+        // Broker looks each up and fails startup when either is absent.
+        "Environment=BLOOM_BROKER_CEREMONY_ACTIVATION_NAME_IPV4=broker-ceremony-ipv4",
+        "Environment=BLOOM_BROKER_CEREMONY_ACTIVATION_NAME_IPV6=broker-ceremony-ipv6",
+        "Requires=bloom-broker-ceremony@%i.socket bloom-broker-ceremony-ipv6@%i.socket bloom-signer@%i.service",
+        "After=bloom-broker-ceremony@%i.socket bloom-broker-ceremony-ipv6@%i.socket bloom-signer@%i.service",
+        "Sockets=bloom-broker-ceremony@%i.socket bloom-broker-ceremony-ipv6@%i.socket",
         "Environment=BLOOM_BROKER_SOCKET=/run/bloom/%i/broker/rpc/broker.sock",
         "Environment=BLOOM_BROKER_CONTROL_SOCKET=/run/bloom/%i/broker/control/broker-control.sock",
     ] {
@@ -53,6 +93,40 @@ fn systemd_owns_only_the_tcp_listener_and_services_own_authenticated_unix_socket
     let session_path = source("systemd/bloom-session@.path");
     assert!(session_path.contains("PathExists=/run/bloom/%i/session/session.sock"));
     assert!(session_path.contains("Unit=bloom-broker@%i.service"));
+}
+
+#[test]
+fn every_socket_unit_publishes_exactly_one_named_listener() {
+    // systemd applies one FileDescriptorName= per unit to every fd it
+    // passes: a unit with two ListenStream= lines hands the service two
+    // fds under one name, which the Broker's activation crate rejects as
+    // a duplicate. Two named listeners therefore require two units.
+    let systemd = packaging_root().join("systemd");
+    let entries = fs::read_dir(&systemd)
+        .unwrap_or_else(|error| panic!("read {systemd:?}: {error}"))
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let mut checked = 0;
+    for entry in entries {
+        let path = entry.path();
+        if path.extension().and_then(|extension| extension.to_str()) != Some("socket") {
+            continue;
+        }
+        checked += 1;
+        let unit = fs::read_to_string(&path).unwrap();
+        let count = |prefix: &str| unit.lines().filter(|line| line.starts_with(prefix)).count();
+        assert_eq!(
+            count("ListenStream="),
+            1,
+            "{path:?} must carry exactly one ListenStream="
+        );
+        assert_eq!(
+            count("FileDescriptorName="),
+            1,
+            "{path:?} must carry exactly one FileDescriptorName="
+        );
+    }
+    assert!(checked >= 2, "the ceremony socket units must be present");
 }
 
 #[test]

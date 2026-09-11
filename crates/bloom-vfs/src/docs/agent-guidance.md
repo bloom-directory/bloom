@@ -81,6 +81,103 @@ chain-level balance alias works only when selection is unambiguous. Unique
 fingerprint prefixes, where accepted as input, are interactive convenience
 only. Resolve ambiguity against `accounts.json`.
 
+Each entry in `accounts.json` carries a `number`, and `wallets/<wallet>/<n>/`
+is that account: `account.json` shows its EVM and Solana keys (path, address,
+fingerprint, lifecycle), and `wallets/<wallet>/<n>/chains/<chain>/...` is the
+same chain view as `wallets/<wallet>/chains/<chain>/...` read through account
+`n`'s key for that chain's family. A number is the derivation path itself (EVM
+`m/44'/60'/0'/0/<n>`, Solana `m/44'/501'/<n>'/0'`), so it is stable across
+restarts and reorderings. A legacy or imported single-key wallet is account 0.
+Outbox entries under an account are only the ones its key staged; another
+account's entry is not found there. Staging works through the numbered path
+(`wallets/<wallet>/<n>/chains/<chain>/outbox/new.tx`), which fixes the sender
+to that account's key; a body fingerprint naming another account is an error.
+The wallet-level `wallets/<wallet>/chains/...` path stages from account 0.
+
+Mnemonic import is an owner custody ceremony, not a mounted agent write. V1
+accepts the standard mnemonic and exposes no passphrase input;
+passphrase-protected mnemonics are unsupported. BIP-39 registration and import
+create the canonical EVM and Solana account-number-zero children together.
+
+To create another account number, write `{"request_id":"<id>"}` to
+`wallets/<wallet>/new`. The ceremony creates both the EVM and Solana keys under
+the one number Signer chooses. Reusing the same request ID resumes or returns
+that same account creation. Reading `new` reports `failed`, `expired`, or
+`cancelled` when a ceremony terminates unsuccessfully. That result remains
+attached to its request ID; write a new request ID to start another ceremony.
+
+### Account-scoped Petals and sessions
+
+Installed Petals also run under `wallets/<wallet>/<n>/petals/<petal>/...` with
+the same routes as `/petals/<petal>/...`. Account 0 and the flat mount list
+every installed Petal; a nonzero account runs only Petals whose `petal.toml`
+declares `[account] aware = true` — an unaware Petal is not found there and
+the message names the missing declaration. The host injects the trusted
+identity (`bloom.wallet`, `bloom.account`, and, when the route's family is
+unambiguous, `bloom.owner_key_fingerprint`) next to `bloom.route_id`; a caller
+context entry using the `bloom.` prefix is rejected before injection.
+
+Every key a Petal derived through a numbered account is mounted at
+`wallets/<wallet>/<n>/sessions/<petal>/<key-slot>/session.json`. It reports
+the delegating owner key, the delegated key and addresses, the scope (routes,
+operation classes, suites, lifetime), the recorded approvals, and the truthful
+`signing_authority`: `pending`, `active`, `stopped`, `expired`, or
+`package_replaced` (the installed package no longer matches the scope's
+hash; `routes_known` is false then). Writing to the sibling `stop` file
+revokes the session's approvals through the Broker; it is idempotent, works
+after the Petal is uninstalled, and after it succeeds only Exact-selector
+signing for the scope's remaining operation classes may still be available
+(`eligible_exact_routes` lists those routes). Replacing or removing an
+installed package that still has active or unresolved pending sessions is refused with their mounted
+paths unless the owner passes `--force` to `petal install` or
+`petal uninstall` — the stranded sessions then read `package_replaced`, and
+their `stop` still revokes them.
+
+Session `expires_at_ms` is the expiry of the approval terms accepted by Broker,
+not the time the Petal last polled. Old records without that expiry report null
+and remain guarded until stopped or forcibly removed. Durable signing retries
+are bound to the full selected key, so accounts using the same route keep
+separate approval identities.
+
+A wallet's chains are listed at `wallets/<wallet>/chains` and include both
+EVM chains and any configured Solana chains — `ls wallets/<wallet>/chains`
+enumerates both together. Solana chains route through the exact same
+`wallets/<wallet>/chains/<chain>/outbox/...` route family described below
+(stage at `outbox/new.tx`, confirm/cancel under `outbox/pending/<id>/`,
+inspect `outbox/{pending,sent,failed}/<id>/`) — there is no separate
+Solana-specific surface to look for.
+
+Newly generated Bloom configuration includes `solana-mainnet` for reads, with
+broadcasting disabled. Existing configurations keep their configured networks;
+devnet and local validators are opt-in. If an owner enables mainnet broadcasting,
+wallet policy and the approval ceremony still apply. Discover the available
+networks with `ls wallets/<wallet>/chains` rather than assuming a network exists.
+
+### Reading Solana balances
+
+A Solana chain directory exposes an account-addressed surface:
+
+```sh
+ls  wallets/<wallet>/chains/<solana-chain>/accounts/       # one dir per active child
+cat wallets/<wallet>/chains/<solana-chain>/accounts/<fingerprint>/address
+cat wallets/<wallet>/chains/<solana-chain>/accounts/<fingerprint>/balance
+```
+
+Directory names are the **full** lowercase account fingerprint. A body
+`account_fingerprint` in `new.tx` may be a prefix, but it must name the
+path's own account: the wallet-level outbox stages from account 0 and refuses
+any other account's fingerprint, so transfers from account `n` belong on
+`wallets/<wallet>/<n>/chains/<chain>/outbox/new.tx`. A prefix is never a
+path — a prefix that is unique today stops being unique when another account
+is allocated.
+
+`chains/<chain>/balance`, `balance.raw` and `balance.json` resolve to account
+0: the canonical initial child while it is active, and a failure naming the
+canonical `accounts/<fingerprint>/` paths once it is not. Bloom will not pick
+another account for you, because spending from the wrong one is not
+recoverable.
+
+
 ## Creating a wallet
 
 Writing a petname to `wallets/new` requests asynchronous passkey registration;
@@ -112,7 +209,10 @@ project into the central outbox:
 A confirm write may return permission denied while projecting
 `approval_challenge.json`. Verify the challenge's wallet, action, intent, and
 expiry before presenting its ceremony URL. This is a waiting state, not a
-reason to restage. After human approval, retry only its exact `retry_path`.
+reason to restage. After human approval, retry only its exact `retry_path`;
+`plan_path` and `retry_path` name the outbox the confirm was written through
+(`wallets/<wallet>/<n>/chains/...` for account `n`, the wallet-level path for
+account 0).
 
 `confirm.override` is not a general escape hatch. Use it only when the
 inspected policy projection explicitly permits that control and the human has
@@ -140,6 +240,7 @@ relying on it. A Petal may request use of a Sealed Approval, but it cannot mint,
 broaden, renew, or revoke authority itself. If fresh approval is required, use
 the central action's `approval_challenge.json` and `retry_path`; do not
 invent a Petal-local approval flow.
+
 
 ## Updating wallet policy
 

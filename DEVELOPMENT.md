@@ -280,13 +280,13 @@ The current import profile is passphrase-free and creates the canonical EVM
 child. See [Wallet architecture](./docs/architecture/Wallet.md#bip-39-roots-and-derived-accounts)
 for supported inputs, derivation paths, and account-selection invariants.
 
-Allocate a Solana child explicitly:
+Import projects the canonical EVM child and the native Solana child
+together; read either one after the ceremony completes:
 
 ```sh
-bloom wallet account-allocate imported-wallet \
-  --profile bip44-solana-slip10-ed25519-v1
 bloom wallet accounts imported-wallet
 bloom wallet address imported-wallet --profile solana
+bloom wallet address imported-wallet --profile evm
 bloom vfs cat /wallets/imported-wallet/accounts.json
 ```
 
@@ -300,8 +300,8 @@ bloom wallet account-retire imported-wallet \
   --fingerprint <full-fingerprint>
 ```
 
-Complete the ceremony URL printed by allocation or retirement before expecting
-the authenticated account projection to change.
+Complete the ceremony URL printed by retirement before expecting the
+authenticated account projection to change.
 
 Raw secp256k1 migration is a separate explicit ceremony:
 

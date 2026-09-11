@@ -72,13 +72,14 @@ disable it.
 Public reads, simulations, and planning work without adding API keys;
 local devnet sends require a running Anvil node.
 
-Mnemonic import is the default wallet-import profile. The legacy raw
-secp256k1 scalar profile remains available only when selected explicitly:
+Every new BIP-39 wallet creates its canonical EVM and Solana accounts in the
+registration ceremony. The legacy raw secp256k1 scalar import profile remains
+available only when selected explicitly:
 
 ```sh
-bloom wallet import main
-bloom wallet account-allocate main --profile bip44-solana-slip10-ed25519-v1
+bloom wallet new main
 bloom wallet address main --profile solana
+bloom wallet address main --profile evm
 ```
 
 Native Solana transfers use the same wallet outbox shape as EVM transfers,

@@ -22,7 +22,9 @@ ls "$BLOOM/wallets/"
 cat "$BLOOM/chains/anvil/chain_id"
 cat "$BLOOM/wallets/alice/projection.json"
 
-# 2. Stage once.
+# 2. Stage once. The wallet-level path spends from account 0; a numbered
+#    path (wallets/alice/1/chains/...) spends from that account's key and
+#    sees only its own outbox entries.
 printf 'send 0.01 ETH to 0x0000000000000000000000000000000000000001\n' \
   > "$BLOOM/wallets/alice/chains/anvil/outbox/new.tx"
 
@@ -46,6 +48,7 @@ If confirmation requires fresh approval, read this exact pending action's
 `approval_challenge.json`. Check its wallet, action, intent, and expiry before
 forwarding the ceremony URL to the human. After approval, retry only the
 challenge's `retry_path`. Do not restage while approval is pending.
+
 
 Follow `$ID` into its resulting state and read its intent and receipt before
 reporting success; listing `sent/` alone does not prove confirmation. A missing

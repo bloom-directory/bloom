@@ -30,16 +30,18 @@ connecting peer on macOS, which cannot satisfy the protocol's mutual kernel
 peer-UID check. It does not fall back from failed launchd activation or create
 endpoints outside the signed profile.
 
-Broker owns the canonical ceremony listener by direct exclusive bind to
-`127.0.0.1:18734`. The LaunchDaemon does not declare or pre-bind that TCP
-socket. A conflict is fatal, reported, retried by failure-only `KeepAlive`, and
-never selects a fallback address or port. Before exiting, Broker atomically
-writes a Broker-owned, Machine-readable `broker-startup.json`. Machine accepts
-only its exact owner, group, mode, schema, address, incident, and message, so a
-bind failure is reported promptly as a foreign or unverifiable listener. The
-pinned Broker's more specific other-login classification depended on its PF
-attestation and is unavailable with the optional network guard disabled. A
-successful retry removes the stale diagnostic.
+Broker owns the canonical ceremony listeners by direct exclusive bind to
+`127.0.0.1:18734` and `[::1]:18734`. Both families are required because
+Chromium resolves `localhost` to `::1` before `127.0.0.1`. The LaunchDaemon
+does not declare or pre-bind either TCP socket. A conflict is fatal, reported,
+retried by failure-only `KeepAlive`, and never selects a fallback address or
+port. Before exiting, Broker atomically writes a Broker-owned,
+Machine-readable `broker-startup.json`. Machine accepts only its exact owner,
+group, mode, schema, address, incident, and message, so a listener acquisition
+failure is reported promptly. The service log identifies the failing address
+or inherited descriptor and its error. An unavailable IPv6 stack is not
+evidence that another process owns the port. A successful retry removes the
+stale diagnostic.
 
 The global `com.bloom.session` LaunchAgent invokes only Machine's
 `serve session-sentinel` mode. It exits successfully for an unenrolled login,
