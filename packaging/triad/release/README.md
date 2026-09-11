@@ -167,12 +167,13 @@ enrolled login passes the authenticated health gate.
 
 Recovery after an interruption restores the coherent previous installation and
 then lets the verified installer retry the requested release; it never
-completes the interrupted candidate in place. Recovery does not start the
-previous release or require it to pass the health gate: the retry stops it
-again immediately, and a host whose previous release cannot start must still be
-able to install the release that fixes it. If the installer exits after
-recovery but before its retry starts anything, the restored release is left
-stopped, as the interruption left it, until the next installer run or reboot. A
+completes the interrupted candidate in place. Recovery clears the transaction
+as soon as the previous installation is restored and only then restarts it,
+without gating on the health check: a host whose previous release cannot start
+must still be able to install the release that fixes it, and a run that stops
+after recovery, or reinstalls the previous release, must not leave the other
+enrolled logins stopped until a reboot. Uninstalling a login is refused while
+an interrupted upgrade is pending. A
 transaction recorded by an earlier installer (`schema
 bloom.linux-upgrade-transaction.1`) carries no unit snapshot; it is recovered
 by rolling the binary selection and release metadata back on their own, as the
