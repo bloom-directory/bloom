@@ -61,12 +61,8 @@ binary overrides do not replace those requirements.
 
 ## Working agreement
 
-- Work autonomously on routine tasks; ask only when missing information would
-  materially change or endanger the result.
 - Preserve unrelated edits and untracked files. Investigate unexpected
   overlapping changes before continuing.
-- Prefer `rg`, bounded reads, and the session's structured edit tool. Check
-  command exit codes and distinguish implemented, verified, and published work.
 - Do not discard work with destructive Git commands without explicit direction.
   Request explicit approval immediately before recursive forced deletion.
 - Use the session's available agent tools only when delegation is authorized.

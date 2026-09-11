@@ -8,8 +8,10 @@ BLOOM="<bloom-vfs-mount>"
 cat "$BLOOM/AGENTS.md"
 ```
 
-Replace every angle-bracketed value, and always list the live surface before
-choosing it.
+Replace every angle-bracketed value. The examples assume the named wallet and
+chain were discovered on this mount. Native transfers also need a funded source
+account and the configured node; the Anvil example requires a running local
+Anvil instance.
 
 ## Local Anvil transaction
 
@@ -34,15 +36,21 @@ cat "$BLOOM/wallets/alice/chains/anvil/outbox/pending/$ID/plan.md"
 # 4. Confirm only that inspected action.
 echo y > "$BLOOM/wallets/alice/chains/anvil/outbox/pending/$ID/confirm"
 
-# 5. If approval_challenge.json appears, validate it, complete the human
-#    ceremony, and retry its exact retry_path. Otherwise inspect the terminal
-#    projection directly.
+# 5. Inspect the resulting state; a pending action may still need approval.
+ls "$BLOOM/wallets/alice/chains/anvil/outbox/pending/"
 ls "$BLOOM/wallets/alice/chains/anvil/outbox/sent/"
 ls "$BLOOM/wallets/alice/chains/anvil/outbox/failed/"
 ```
 
-Never use a glob such as `pending/<glob>/confirm` as action identity. A glob is
-not stable identity and fails when no entry or several entries match.
+If confirmation requires fresh approval, read this exact pending action's
+`approval_challenge.json`. Check its wallet, action, intent, and expiry before
+forwarding the ceremony URL to the human. After approval, retry only the
+challenge's `retry_path`. Do not restage while approval is pending.
+
+Follow `$ID` into its resulting state and read its intent and receipt before
+reporting success; listing `sent/` alone does not prove confirmation. A missing
+pending path or transport error is not a reason to repeat the write. Never use
+a glob, list position, or `latest` as action identity.
 
 ## Creating a wallet
 
@@ -151,9 +159,18 @@ cat "$BLOOM/wallets/alice/policy-updates/latest/status.json"
 cat "$BLOOM/wallets/alice/policy-updates/latest/approval_challenge.json"
 ```
 
-After the human completes the Broker ceremony, retry the exact same
-`proposed-policy.json` bytes. Broker performs `policy.validate_update` before
-approval and `policy.commit_update` on the authorized retry.
+Verify that the update challenge matches the proposal before forwarding its
+ceremony URL. After the human approves, retry the exact same proposal bytes:
+
+```sh
+cp proposed-policy.json "$BLOOM/wallets/alice/policy.json"
+cat "$BLOOM/wallets/alice/policy.json"
+cat "$BLOOM/wallets/alice/policy-updates/latest/status.json"
+```
+
+Verify the committed policy and terminal status. Broker performs
+`policy.validate_update` before approval and `policy.commit_update` on the
+authorized retry. Editing or reformatting the proposal requires fresh review.
 
 ## Installed Petal workflow
 

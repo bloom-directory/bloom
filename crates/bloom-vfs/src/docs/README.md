@@ -1,11 +1,11 @@
 # Bloom virtual filesystem
 
-Bloom exposes public chain data and authority-gated operations as a mounted
-filesystem. This document describes the live operator interface. For Bloom
-development, use the repository's `DEVELOPMENT.md` instead.
+This is the route reference for the mounted operator interface. Read the
+mount's `AGENTS.md` for action-selection and recovery rules, and
+[examples.md](./examples.md) for complete procedures. Contributor setup lives
+in the repository's `DEVELOPMENT.md`.
 
-All examples run from a normal scratch directory outside the mount and address
-the mount through a single quoted variable, so any mountpoint works:
+Work from a scratch directory outside the mount and set its actual location:
 
 ```sh
 BLOOM="<bloom-vfs-mount>"
@@ -14,253 +14,93 @@ cat "$BLOOM/AGENTS.md"
 cat "$BLOOM/next.md"
 ```
 
-Keep scratch files in that working directory, never inside the mount. Do not
-prepend `/bloom` to paths unless that is the mountpoint on this machine.
+Keep scratch files outside the mount. Discover configured wallets, chains, and
+Petals before choosing paths; their names and availability vary by installation.
 
-## Discover the live surface
-
-Always list before acting. Configured chains, wallets, and installed Petals vary
-between machines.
-
-```sh
-ls "$BLOOM"
-ls "$BLOOM/chains/"
-ls "$BLOOM/wallets/"
-cat "$BLOOM/docs/petals.md"
-```
-
-The daemon mounts these top-level surfaces:
+## Top-level routes
 
 | Path | Purpose |
 |---|---|
-| `AGENTS.md`, `CLAUDE.md` | Identical agent operating contract |
-| `next.md` | Current actions and projections needing attention |
+| `AGENTS.md`, `CLAUDE.md` | Identical operator instructions |
+| `next.md` | Actions and projections needing attention |
 | `chains/` | Configured EVM chain reads |
-| `wallets/` | Public wallet projections, accounts, policy, and transaction outboxes |
-| `petals/` | Installed application packages and their local documentation |
-| `requests/` | Planned and authority-gated paid HTTP requests |
+| `wallets/` | Public wallet/account projections, policy, transaction outboxes |
+| `petals/` | Installed packages and their instructions |
+| `requests/` | Planned, authority-gated paid HTTP requests |
 | `outbox/` | Central action projections and correlation records |
 | `simulate/` | EVM dry-run sessions; never broadcasts |
 | `status/` | Daemon, chain, backend, and update status |
-| `watch/` | Registered read watches and their history |
-| `ens/` | ENS resolution and records |
-| `prices/` | Configured price-provider reads |
+| `watch/` | Registered read watches and history |
+| `ens/`, `prices/` | ENS resolution and price-provider reads |
 | `addressbook/` | Named public addresses |
 | `tools/` | Pure encoding, hashing, address, ABI, and unit helpers |
-| `docs/` | This reference, examples, and installed-Petal index |
-| `petal-key-requests/` | Broker-backed Petal public-key request projections |
-| `petal-signing-requests/` | Broker-backed Petal signing request projections |
+| `docs/` | Route reference, examples, installed-Petal index |
+| `petal-key-requests/`, `petal-signing-requests/` | Broker-backed Petal request projections |
 
-`chains/` is EVM-only. Solana has no `chains/` subtree: chain status lives
-under `status/chains/<solana-chain>/` and account reads live under
-`wallets/<wallet>/chains/<solana-chain>/`.
+`chains/` is EVM-only. Solana status lives under
+`status/chains/<solana-chain>/`; account reads live under
+`wallets/<wallet>/chains/<solana-chain>/`. Native `defi/intents` and
+Hyperliquid routes are retired; discover installed Petals instead.
 
-There is no native `defi/intents` or Hyperliquid application route. Those
-workflows are installed Petals and appear under `petals/<name>/`.
+## Reads
 
-## Read classes
+Public projections and metadata do not authorize a transaction. Chain, balance,
+ENS, price, and status leaves can contact configured providers, consume quota,
+and disclose the queried public identifier. Petal reads follow the package's
+capabilities and network policy. Listing wallet accounts and reading their
+addresses do not call chain RPC; read balance leaves explicitly.
 
-Not every read has the same operational cost:
+Representative paths, relative to the mount:
 
-- Wallet projections, staged plans, receipts, and metadata are local public
-  projections.
-- Chain, balance, ENS, price, and status paths may contact configured providers.
-  These reads do not sign or broadcast, but can consume quota and disclose the
-  queried public identifier to the provider.
-- Petal reads obey that package's declared capabilities and network policy.
-  Read its `README.md` and `AGENTS.md` first.
+| Data | Path |
+|---|---|
+| EVM chain identity/head | `chains/<chain>/chain_id`, `chains/<chain>/head/number` |
+| EVM block/receipt | `chains/<chain>/blocks/<number>/full.json`, `chains/<chain>/tx/<hash>/receipt.json` |
+| EVM address balance | `chains/<chain>/addresses/<address>/balance.json` |
+| Token grammar and holdings | `chains/<chain>/addresses/<address>/tokens/{README.md,known.json}` |
+| Token balance | `chains/<chain>/addresses/<address>/tokens/<contract>/balance.json` |
+| NFT kind/owner | `chains/<chain>/contracts/<contract>/nft/{kind,owner_of/<token-id>}` |
+| ENS / price | `ens/<name>/address`, `prices/spot/eth.usd` |
+| Wallet identity | `wallets/<wallet>/{projection.json,accounts.json,address,addresses.json}` |
+| Solana account | `wallets/<wallet>/chains/<chain>/accounts/<full-fingerprint>/{address,balance,balance.raw,balance.json}` |
+| Solana status | `status/chains/<chain>/{status.json,slot,block_height}` |
 
-Directory listing should remain discovery-only. In particular, listing wallet
-accounts does not fan out to chain RPC. Read balance or status leaves explicitly
-when current network state is needed.
+Braces above abbreviate separate leaves, not action selectors. Solana
+chain-level balance aliases work only with one compatible active child. Use
+the full fingerprint and derivation path from `accounts.json` for account
+identity; never select by list position.
 
-## Chain reads
+## Writes and authority
 
-Discover each configured chain rather than assuming an installation default:
+Every write is an operation: it may stage work, start a ceremony, consume
+reusable authority, or broadcast. Inspect the exact action before confirmation,
+and inspect the result before retrying. A timeout does not prove that a
+transaction was not submitted.
 
-```sh
-ls "$BLOOM/chains/"
-ls "$BLOOM/chains/<chain>/"
-cat "$BLOOM/chains/<chain>/chain_id"
-cat "$BLOOM/chains/<chain>/head/number"
-```
+| Operation | Route / procedure |
+|---|---|
+| Register wallet | `wallets/new`; [wallet creation](./examples.md#creating-a-wallet) |
+| EVM transaction | `wallets/<wallet>/chains/<chain>/outbox/new.tx`; [Anvil workflow](./examples.md#local-anvil-transaction) |
+| Solana transaction | Same outbox shape with strict JSON; [Solana workflow](./examples.md#solana-account-aware-reads-and-transfer) |
+| Update policy | `wallets/<wallet>/policy.json`; [policy workflow](./examples.md#updating-wallet-policy) |
+| Reusable authority | `wallets/<wallet>/sealed-approvals/` and `capabilities/` beneath the wallet |
+| Petal operation | `petals/<name>/`; [installed package workflow](./examples.md#installed-petal-workflow) |
+| Paid HTTP | `requests/`; inspect plan, wallet, payment protocol, cap, approval, and receipt |
 
-Representative EVM reads:
+Wallet registration is asynchronous and does not create a local wallet.
+Read `wallets/registrations/<petname>/status.json`, verify `requested_name`,
+complete the human ceremony, then check `COMPLETED` and `result.json`.
+Mnemonic and raw-key input stays in the Broker-hosted browser ceremony.
 
-```sh
-cat "$BLOOM/chains/ethereum/head/number"
-cat "$BLOOM/chains/ethereum/blocks/<number>/full.json"
-cat "$BLOOM/chains/ethereum/tx/<hash>/receipt.json"
-cat "$BLOOM/chains/ethereum/addresses/<address>/balance.json"
-```
+For a transaction requiring fresh approval, inspect the same action's
+`approval_challenge.json`, verify its identity and expiry, and retry its exact
+`retry_path` only after the human approves. Read the resulting state and
+receipt before reporting success; never restage merely because a pending path
+disappeared.
 
-Representative Solana reads. Status and account data live outside `chains/`:
-
-```sh
-cat "$BLOOM/status/chains/<solana-chain>/status.json"
-cat "$BLOOM/status/chains/<solana-chain>/slot"
-cat "$BLOOM/status/chains/<solana-chain>/block_height"
-cat "$BLOOM/wallets/<wallet>/chains/<solana-chain>/accounts/<full-fingerprint>/balance.json"
-```
-
-Solana status deliberately reports `slot` and `block_height`; it does not
-invent EVM block-number or finality semantics.
-
-## Wallets and accounts
-
-Wallet directories are public projections from Broker and Signer authority:
-
-```sh
-cat "$BLOOM/wallets/<wallet>/projection.json"
-cat "$BLOOM/wallets/<wallet>/accounts.json"
-cat "$BLOOM/wallets/<wallet>/address"
-cat "$BLOOM/wallets/<wallet>/addresses.json"
-cat "$BLOOM/wallets/<wallet>/policy.json"
-```
-
-`address` is the canonical primary address only when that concept is
-unambiguous. Account-aware operations use the exact public-key fingerprint and
-derivation path from `accounts.json`. Never select by projection order.
-
-For Solana multi-account wallets, use the full fingerprint:
-
-```sh
-cat "$BLOOM/wallets/<wallet>/chains/<solana-chain>/accounts/<full-fingerprint>/address"
-cat "$BLOOM/wallets/<wallet>/chains/<solana-chain>/accounts/<full-fingerprint>/balance.raw"
-cat "$BLOOM/wallets/<wallet>/chains/<solana-chain>/accounts/<full-fingerprint>/balance.json"
-```
-
-The chain-level Solana balance alias fails closed when several compatible
-children exist.
-
-## Creating a wallet
-
-Writing a requested petname starts asynchronous passkey registration:
-
-```sh
-printf 'main\n' > "$BLOOM/wallets/new"
-cat "$BLOOM/wallets/registrations/main/status.json"
-```
-
-The initial write does not create a local wallet. The projection is keyed by
-the requested petname and includes `requested_name`, `ceremony_url`, and
-`ceremony_state`. Forward the URL to the human passkey holder. Poll the same
-`status.json`; after `COMPLETED`, read:
-
-```sh
-cat "$BLOOM/wallets/registrations/main/result.json"
-cat "$BLOOM/wallets/main/projection.json"
-```
-
-Before ceremony acceptance, cancel with:
-
-```sh
-printf 'cancel\n' > "$BLOOM/wallets/registrations/main/cancel"
-```
-
-Mnemonic and raw-key input belongs only in the Broker-hosted ceremony. Never
-write it into the mount or pass it through the shell.
-
-## Transaction lifecycle
-
-Native transaction surfaces use stage, inspect, authorize, retry, and verify:
-
-```sh
-printf 'send 0.01 ETH to 0x...\n' \
-  > "$BLOOM/wallets/<wallet>/chains/<chain>/outbox/new.tx"
-ls "$BLOOM/wallets/<wallet>/chains/<chain>/outbox/pending/"
-cat "$BLOOM/wallets/<wallet>/chains/<chain>/outbox/pending/<exact-id>/intent.json"
-cat "$BLOOM/wallets/<wallet>/chains/<chain>/outbox/pending/<exact-id>/plan.md"
-echo y > "$BLOOM/wallets/<wallet>/chains/<chain>/outbox/pending/<exact-id>/confirm"
-```
-
-Use the exact identifier whose intent and plan you inspected. Do not use a
-wildcard, infer the newest entry, or rely on sequence ordering.
-
-If fresh authorization is required, the confirm write can return permission
-denied after creating `approval_challenge.json`. Read it from the same exact
-action, verify its wallet, action identity, intent, expiry, and `retry_path`,
-and forward its ceremony URL to the human. After approval, retry only that path.
-Do not restage.
-
-Terminal entries move under `sent/` or `failed/`. Read the receipt and
-reconciliation projections before reporting success. A transport timeout is not
-proof that broadcast failed.
-
-## Reusable authority
-
-Sealed Approvals are Broker-owned reusable authority:
-
-```sh
-ls "$BLOOM/wallets/<wallet>/sealed-approvals/"
-cat "$BLOOM/wallets/<wallet>/sealed-approvals/active.json"
-cat "$BLOOM/wallets/<wallet>/capabilities/active.json"
-```
-
-Broker enforces scope, expiry, limits, counters, and revocation. Machine and
-Petals only project or request use of that authority. Read the exact approval
-before relying on it; never infer authority from a cached capability name.
-
-## Updating wallet policy
-
-`wallets/<wallet>/policy.json` is a canonical public projection. Replacing it
-starts a Broker ceremony:
-
-```sh
-cat "$BLOOM/wallets/<wallet>/policy.json" > proposed-policy.json
-cp proposed-policy.json "$BLOOM/wallets/<wallet>/policy.json"
-cat "$BLOOM/wallets/<wallet>/policy-updates/latest/status.json"
-cat "$BLOOM/wallets/<wallet>/policy-updates/latest/approval_challenge.json"
-```
-
-`proposed-policy.json` stays in the scratch directory outside the mount. Broker
-first performs `policy.validate_update`. After the human completes the
-ceremony, retry the **exact same proposed bytes** so Broker can perform
-`policy.commit_update`. Then verify both the committed `policy.json` and the
-terminal update status. Editing or reformatting the proposal between these
-steps creates a different request.
-
-## Tokens, NFTs, ENS, and tools
-
-Self-describing token routes expose their local grammar:
-
-```sh
-ls "$BLOOM/chains/<chain>/addresses/<address>/tokens/"
-cat "$BLOOM/chains/<chain>/addresses/<address>/tokens/README.md"
-cat "$BLOOM/chains/<chain>/addresses/<address>/tokens/known.json"
-cat "$BLOOM/chains/<chain>/addresses/<address>/tokens/<contract>/balance.json"
-```
-
-Representative NFT and utility reads:
-
-```sh
-cat "$BLOOM/chains/<chain>/contracts/<contract>/nft/kind"
-cat "$BLOOM/chains/<chain>/contracts/<contract>/nft/owner_of/<token-id>"
-cat "$BLOOM/ens/<name>/address"
-cat "$BLOOM/prices/spot/eth.usd"
-cat "$BLOOM/tools/keccak/hello"
-```
-
-## Petals and paid requests
-
-Installed Petals are dynamic. Discover them and follow package-local guidance:
-
-```sh
-cat "$BLOOM/docs/petals.md"
-cat "$BLOOM/petals/<name>/README.md"
-cat "$BLOOM/petals/<name>/AGENTS.md"
-ls "$BLOOM/petals/<name>/"
-```
-
-Petals cannot create or broaden signing authority. Their actions must resolve
-through Broker authorization and Signer custody, with central correlation under
-`outbox/` where applicable.
-
-Paid HTTP operations live under `requests/` and can consume funds or reusable
-authority. Inspect the exact request plan, wallet, payment protocol, maximum
-amount, approval projection, and receipt. Vendor-specific examples belong in
-the installed package or request documentation, not in this stable route index.
-
-## More examples
-
-Read `docs/examples.md` for complete mount-relative walkthroughs.
+Broker enforces Sealed Approval scope, expiry, limits, counters, and revocation.
+Machine and Petals cannot mint or broaden that authority. For
+`policy.json` updates, Broker runs `policy.validate_update` before the
+ceremony and `policy.commit_update` on the authorized retry. Reuse the
+**exact same proposed bytes**, then verify the committed policy and terminal
+update status.

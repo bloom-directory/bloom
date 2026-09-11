@@ -1,47 +1,13 @@
 # Development guide
 
-Bloom is developed as three cooperating executables:
+Use [AGENTS.md](./AGENTS.md#authority-and-ownership) for repository ownership
+and architecture boundaries, and [TESTING.md](./TESTING.md) to select checks.
+This guide covers building and running the real Machine–Broker–Signer triad.
+The developer profile shares a login; it preserves custody and protocol
+boundaries but does not prove production principal isolation.
 
-```text
-Machine <-> Broker <-> Signer
-```
-
-The processes may share a developer login, but their authority boundaries must
-remain the same as production. Development features may simplify enrollment and
-process startup. They must never add wallet custody, approval authority, or a
-signing implementation to Machine.
-
-Read these documents before changing a cross-process contract:
-
-- [Triad process architecture](./docs/specs/2026-07-23-triad-process-architecture.md)
-- [Wallet architecture](./docs/architecture/Wallet.md)
-- [Solana native integration](./docs/architecture/Solana%20Native%20Integration.md)
-- [Triad release package](./packaging/triad/release/README.md)
-
-For the bounded mounted passkey workflow, read
+For the bounded mounted passkey workflow, see
 [Local mainnet integration](./docs/local-mainnet-integration.md).
-
-## Authority and repository ownership
-
-| Process | Owns | Must not own | Repository |
-|---|---|---|---|
-| Machine | CLI, VFS, Petals, public projections, staging, simulation, broadcast, reconciliation | Wallet secrets, approval decisions, ceremony verification, local signing | `bloom` |
-| Broker | Ceremony HTTP, WebAuthn verification, policy semantics, Sealed Approvals, authorization, public custody projections | Raw mnemonic or private-key persistence, signature creation | `bloom-broker` |
-| Signer | Encrypted roots and keys, derivation, counters, replay protection, cryptographic signing | Transaction or Petal orchestration, user-facing action semantics | `bloom-signer` |
-
-Machine talks only to Broker. Broker is the only authority peer allowed to talk
-to Signer. Public data flowing back to Machine must be authenticated and must
-not become a second source of authority.
-
-The cross-repository dependency direction is:
-
-```text
-Signer -> Broker -> Machine
-```
-
-Put a fix in the repository that owns the invariant. Downstream repositories
-normally receive only an exact revision pin and tests for their side of the
-seam.
 
 ## Prerequisites
 
@@ -81,10 +47,9 @@ To use a candidate-specific config instead, set
 `--machine-home` at the canonical `~/.bloom`; the launcher requires Machine
 state to live inside the selected developer root.
 
-Keep optional RPC endpoints and API keys in ignored local configuration. Never
-put mnemonics, raw private keys, passkey PRF output, wallet passwords, ceremony
-capabilities, or backend credentials in command arguments, environment
-variables, Machine state, fixtures, or logs.
+Keep optional RPC endpoints and API keys in ignored local configuration.
+Wallet secret input stays in the Broker-hosted ceremony; use only disposable
+test inputs with the acceptance harnesses.
 
 ## Building
 
@@ -227,34 +192,15 @@ scripts/triad-dev-launch.sh \
   --ready-file /tmp/bloom-triad-ready
 ```
 
-Never infer the tested revisions from directory names. Record them:
-
-```sh
-git -C ../SIGNER_WORKTREE rev-parse HEAD
-git -C ../BROKER_WORKTREE rev-parse HEAD
-git rev-parse HEAD
-```
+Record the actual checkout revisions and dirty state as described under
+[Cross-repository changes](#cross-repository-changes).
 
 ### Sharing a host with other candidates
 
-Every path in the loops above is fixed, so two people or agents who copy them
-share one developer root, one Machine home, and one socket. Give each candidate
-its own set:
-
-```sh
-tag="$(id -un)-$$"
-root="$HOME/.bloom/triad-dev-${tag}"
-logs="/tmp/bloom-triad-logs-${tag}"
-mkdir -p "$root/machine-home" "$logs"
-
-scripts/triad-dev-launch.sh \
-  --developer-root "$root" \
-  --machine-home "$root/machine-home" \
-  --machine-socket "/tmp/bloom-triad-machine-${tag}.sock" \
-  --log-dir "$logs" \
-  --ready-file "/tmp/bloom-triad-ready-${tag}" \
-  --services-only
-```
+The examples use fixed paths. Before running another candidate, give it a
+distinct developer root, Machine home, socket, log directory, ready file, and
+mountpoint. Suffixing each path with a candidate name is sufficient for state
+isolation; the ceremony-port constraint below still applies.
 
 Run one Machine per home. `bloom serve` and `bloom init` hold an exclusive lock
 on the whole home for their lifetime, so a second one against the same home
@@ -330,9 +276,9 @@ the recovery phrase is entered only in the browser:
 bloom wallet import imported-wallet
 ```
 
-There is no mnemonic CLI argument and no import `--profile` flag. The current
-profile accepts an English BIP39 mnemonic without a passphrase. Import creates
-the canonical EVM child at `m/44'/60'/0'/0/0`.
+The current import profile is passphrase-free and creates the canonical EVM
+child. See [Wallet architecture](./docs/architecture/Wallet.md#bip-39-roots-and-derived-accounts)
+for supported inputs, derivation paths, and account-selection invariants.
 
 Allocate a Solana child explicitly:
 
@@ -343,12 +289,6 @@ bloom wallet accounts imported-wallet
 bloom wallet address imported-wallet --profile solana
 bloom vfs cat /wallets/imported-wallet/accounts.json
 ```
-
-Solana uses hardened SLIP-10 Ed25519 paths of the form
-`m/44'/501'/<account>'/0'`. Machine sees only authenticated public account
-projections. Every signing path must select a child by an exact `KeyRef`
-containing its public-key fingerprint and derivation path. Projection order,
-"first matching child", and an unqualified fallback are not authority.
 
 After more than one Solana child exists, select addresses by fingerprint and
 retire accounts through the Broker-hosted authority ceremony:
@@ -374,41 +314,10 @@ Solana account.
 
 ## Solana development
 
-Solana is native Machine functionality, not a Petal. The implementation is
-split between:
-
-| Area | Location |
-|---|---|
-| RPC, endpoint health, genesis verification, reads | `crates/bloom-solana` |
-| Durable transfer outbox, signing orchestration, broadcast, reconciliation | `crates/bloom-solana-tx` |
-| Chain construction and reconciler lifecycle | `crates/bloom-daemon` |
-| Account-aware VFS reads and outbox dispatch | `crates/bloom-vfs` |
-| Public account projections and Broker protocol | `crates/bloom-machine-client` |
-
-The mounted route stays consistent with EVM:
-
-```text
-/wallets/<wallet>/chains/<chain>/
-├── accounts/<full-fingerprint>/{address,balance,balance.raw,balance.json}
-└── outbox/{new.tx,pending,sent,failed}
-```
-
-Listing accounts and reading addresses use Broker projections and do not call a
-Solana node. Balance and chain-status reads use RPC. Chain-level balance aliases
-are allowed only when exactly one compatible child is active; ambiguity must
-name the account-specific paths and fail closed.
-
-Broadcast requires `allow_broadcast = true` and a pinned
-`expected_genesis_base58`. Every configured endpoint must prove that genesis at
-staging and again before the single send attempt. A transport ambiguity is
-reconciled by signature; it is never handled by blindly rebroadcasting.
-
-Run the [Solana test ladder](./TESTING.md#triad-and-solana-ladders), including
-the validator-backed suites for account selection and live transaction changes.
-
-Mainnet uses the same transaction path and remains fail closed. Do not add a
-second mainnet signer, bypass ceremony approval, weaken genesis checks, or move
-chain-specific custody into Machine.
+Use [Solana native integration](./docs/architecture/Solana%20Native%20Integration.md)
+for crate ownership, genesis and broadcast requirements, and account-addressed
+VFS routes. Run the [Solana tests](./TESTING.md#triad-and-solana-ladders) that
+exercise the behavior you changed.
 
 ## General local operation
 
@@ -437,33 +346,21 @@ Its preflight proves generic Petal-scoped derivation and payload signing. It
 does not submit a venue order. Installed Petals remain external immutable
 packages; do not patch Machine to preserve a retired Petal authority ABI.
 
-## Environment variables
+## Launcher configuration
+
+Source the candidate's `triad.env` to select its home, IPC endpoint, and
+transport configuration together. Avoid assembling those settings by hand.
+The launcher's optional controls are:
 
 | Variable | Purpose |
 |---|---|
-| `BLOOM_HOME` | Machine-owned state root |
-| `BLOOM_RPC_ENDPOINT` | Machine endpoint used by IPC clients |
-| `BLOOM_IPC_SOCKET` | Machine endpoint a client connects to |
-| `BLOOM_TRIAD_DEV_ROOT` | Persistent developer Broker/Signer enrollment and state |
-| `BLOOM_TRIAD_DEVELOPER_ROOT` | Explicit same-UID developer enrollment root |
-| `BLOOM_BROKER_SOCKET` | Authenticated Machine-to-Broker endpoint |
-| `BLOOM_MACHINE_IDENTITY` | Machine transport identity file |
-| `BLOOM_EDGE_MANIFEST` | Signed authority-edge manifest |
-| `BLOOM_PROVENANCE_CATALOG` | Signed Petal/operation provenance catalog |
-| `BLOOM_INTEGRATION_MACHINE_BIN` | Exact Machine binary for the launcher |
-| `BLOOM_INTEGRATION_BROKER_BIN` | Exact Broker binary for the launcher |
-| `BLOOM_INTEGRATION_SIGNER_BIN` | Exact Signer binary for the launcher |
-| `BLOOM_TRIAD_DEV_MACHINE_CONFIG` | Canonical config copied into a new developer Machine home |
-| `BLOOM_TRIAD_DEV_AUTHORITY_FIXTURE` | Install the deterministic authority fixture when set to `1` |
+| `BLOOM_TRIAD_DEV_MACHINE_CONFIG` | Config copied into a new developer Machine home |
+| `BLOOM_TRIAD_DEV_AUTHORITY_FIXTURE` | Set to `1` to install the deterministic authority fixture |
 | `BLOOM_TRIAD_DEV_BUILD_PETALS` | Set to `0` only for already-built reviewed Petals |
 | `BLOOM_TRIAD_DEV_SOCKET_TIMEOUT_SECONDS` | Positive launcher socket timeout |
-| `BLOOM_ANVIL_BIN`, `BLOOM_CAST_BIN` | Foundry test binary overrides |
-| `BLOOM_MAINNET_RPC` | Optional read-only EVM endpoint |
-| `SOLANA_VALIDATOR_HTTP` | Local validator endpoint for ignored Solana tests |
-| `RUST_LOG` | `tracing-subscriber` filter |
 
-Machine environment variables must not contain wallet private keys, mnemonics,
-wallet passwords, passkey outputs, backend credentials, or Signer state.
+Binary overrides are covered [above](#test-the-binaries-you-intended);
+test-specific variables are in [TESTING.md](./TESTING.md#environment-variables).
 
 ## Verification
 
@@ -502,9 +399,3 @@ bloom vfs cat /status/outbox/pending_count
 bloom vfs cat /status/backends/summary.json
 bloom vfs cat /wallets/<wallet>/accounts.json
 ```
-
-Production Machine state is key-free. Broker and Signer use separate,
-packaging-selected roots that Machine cannot access. A missing projection or an
-unavailable authority service is never permission to seed, migrate, or reopen
-an obsolete Machine wallet, approval, challenge, authorization-session, or
-decrypted-key cache.

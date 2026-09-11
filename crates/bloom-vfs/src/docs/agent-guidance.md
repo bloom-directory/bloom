@@ -12,34 +12,20 @@ Do not assume a wallet, chain, Petal, or action exists. Inspect the live mount:
 ls
 cat next.md
 cat docs/README.md
-cat docs/examples.md
-cat docs/petals.md
 ```
 
-`next.md` summarizes actions that currently need attention. `docs/petals.md`
-lists installed Petals. For a Petal, read both `petals/<name>/README.md` and
-`petals/<name>/AGENTS.md` before using its routes.
+`next.md` summarizes actions needing attention. Read the relevant walkthrough
+in `docs/examples.md` before using an unfamiliar write surface. For Petal work,
+use `docs/petals.md` to discover installed packages, then read that package's
+`README.md` and `AGENTS.md` before using its routes.
 
 ## Authority and safety
 
-Bloom has three real processes:
-
-```text
-Machine <-> Broker <-> Signer
-```
-
-- Machine exposes this VFS, public wallet projections, staging, simulation,
-  broadcast, and reconciliation.
-- Broker owns WebAuthn ceremonies, policy decisions, Sealed Approvals, and
-  authorization.
-- Signer owns encrypted custody, derivation, replay protection, and signatures.
-
-Machine never holds Bloom wallet mnemonics, wallet private keys, passkey PRF
-outputs, or wallet-signing authority.
-Never provide secret ceremony input through a VFS write, shell argument,
-environment variable, fixture, or log. A ceremony URL is safe to forward to the
-human who controls the passkey; ceremony input remains in the Broker-hosted
-browser flow.
+Machine exposes this VFS; Broker controls approval ceremonies and policy;
+Signer holds Bloom wallet keys and signs. Secret ceremony input belongs only
+in the Broker-hosted browser flow, never a VFS write, shell argument,
+environment variable, fixture, or log. Forward the ceremony URL to the human
+who controls the passkey.
 
 Classify reads before using them:
 
@@ -84,51 +70,27 @@ an incorrect one.
 
 ## Wallet and account identity
 
-```sh
-ls wallets/
-cat wallets/<wallet>/projection.json
-cat wallets/<wallet>/accounts.json
-cat wallets/<wallet>/address
-cat wallets/<wallet>/address.qr.svg
-```
+Read `wallets/<wallet>/projection.json` and `accounts.json` to select the
+wallet and account. Account-sensitive operations bind the public-key
+fingerprint and derivation path. Never select by directory order, list
+position, or an address alias.
 
-Never select a wallet or account by directory order, list position, or an
-address alias. Account-sensitive operations bind the public-key fingerprint and
-derivation path. Use the full fingerprint in persistent paths and records.
-
-Solana wallets can have several compatible children. The chain-level balance
-alias works only when selection is unambiguous. Prefer an account-specific path:
-
-```sh
-cat wallets/<wallet>/chains/solana/accounts/<full-fingerprint>/address
-cat wallets/<wallet>/chains/solana/accounts/<full-fingerprint>/balance.json
-```
-
-If an input accepts a unique fingerprint prefix, treat that only as interactive
-convenience. Ambiguity fails closed; inspect `accounts.json` and use the full
-fingerprint.
+Use full fingerprints in persistent paths and records. Solana account paths
+are `wallets/<wallet>/chains/<chain>/accounts/<full-fingerprint>/`; the
+chain-level balance alias works only when selection is unambiguous. Unique
+fingerprint prefixes, where accepted as input, are interactive convenience
+only. Resolve ambiguity against `accounts.json`.
 
 ## Creating a wallet
 
-Wallet creation is asynchronous passkey registration:
-
-```sh
-printf 'main\n' > wallets/new
-cat wallets/registrations/main/status.json
-```
-
-The write only requests the petname and does not create a local wallet. Read the
-petname-keyed projection, verify its `requested_name`, and forward its
-`ceremony_url` to the human. Poll the same `status.json` until
-`ceremony_state` is `COMPLETED`, then read `result.json` and the new wallet
-projection. Before acceptance, cancel with:
-
-```sh
-printf 'cancel\n' > wallets/registrations/main/cancel
-```
-
-Do not infer success from the initial write or create a second registration
-while the first ceremony is merely waiting.
+Writing a petname to `wallets/new` requests asynchronous passkey registration;
+it does not create a local wallet. Read
+`wallets/registrations/<petname>/status.json`, verify `requested_name`, and
+forward `ceremony_url` to the human. Wait for `ceremony_state: COMPLETED`,
+then read `result.json` and the new wallet projection. Cancel through that
+registration's `cancel` control before acceptance. Do not start a second
+registration merely because the first is waiting. Commands are in the
+wallet-creation walkthrough in `docs/examples.md`.
 
 ## The transaction loop
 
@@ -147,42 +109,22 @@ project into the central outbox:
 7. After the ceremony completes, retry only the exact documented `retry_path`.
 8. Read the sent, failed, or receipt projection before reporting success.
 
-Example staging shape:
-
-```sh
-printf 'send 0.01 ETH to 0x...\n' \
-  > wallets/<wallet>/chains/<chain>/outbox/new.tx
-ls wallets/<wallet>/chains/<chain>/outbox/pending/
-cat wallets/<wallet>/chains/<chain>/outbox/pending/<exact-id>/intent.json
-cat wallets/<wallet>/chains/<chain>/outbox/pending/<exact-id>/plan.md
-echo y > wallets/<wallet>/chains/<chain>/outbox/pending/<exact-id>/confirm
-```
-
-The confirm write may return permission denied while Broker creates
-`approval_challenge.json`. That is a waiting state, not a reason to restage:
-
-```sh
-cat wallets/<wallet>/chains/<chain>/outbox/pending/<exact-id>/approval_challenge.json
-```
-
-Before presenting the ceremony, check that the challenge identifies the same
-wallet, action, intent, and expiry you inspected. After human approval, retry
-the challenge's exact `retry_path`. Never retry a different action and never
-blindly repeat staging after an ambiguous result.
+A confirm write may return permission denied while projecting
+`approval_challenge.json`. Verify the challenge's wallet, action, intent, and
+expiry before presenting its ceremony URL. This is a waiting state, not a
+reason to restage. After human approval, retry only its exact `retry_path`.
 
 `confirm.override` is not a general escape hatch. Use it only when the
 inspected policy projection explicitly permits that control and the human has
 explicitly accepted the displayed warning.
 
-For Solana, verify `account_fingerprint`, `account_derivation_path`, and
-`fee_payer` in the staged `intent.json` against the selected account projection.
-After submission, follow that exact action into `sent/`; its `intent.json`
-retains the account identity. Match the signature in `broadcast_attempted.json`
-to `receipt.json` and inspect the receipt's outcome and confirmation status.
-The receipt does not contain an account fingerprint, and private signing
-sidecars are not exposed through the mount. Broadcast also requires the
-configured genesis pin to agree with every live endpoint. An ambiguous send
-reconciles by signature; do not request a blind retry or endpoint failover.
+For Solana, check the account fingerprint, derivation path, and fee payer in
+`intent.json`; account identity remains there after submission. Correlate the
+signature in `broadcast_attempted.json` with `receipt.json` and inspect the
+outcome and confirmation status. Receipts have no account fingerprint and
+private signing sidecars are not mounted. Genesis checks must pass before
+broadcast; ambiguous sends reconcile by signature, never blind retry or
+endpoint failover. See the Solana walkthrough in `docs/examples.md`.
 
 ## Sealed Approvals
 
@@ -201,20 +143,13 @@ invent a Petal-local approval flow.
 
 ## Updating wallet policy
 
-`wallets/<wallet>/policy.json` is the canonical public policy projection.
-Updating it is a Broker ceremony, not a local file edit:
-
-1. Read the current bytes and prepare the complete replacement.
-2. Write the proposal to `wallets/<wallet>/policy.json`.
-3. Read `wallets/<wallet>/policy-updates/latest/status.json` and
-   `approval_challenge.json`.
-4. Broker runs `policy.validate_update`; forward the ceremony URL to the human.
-5. After approval, retry the exact same proposed bytes. Broker then runs
-   `policy.commit_update`.
-6. Verify the committed projection and terminal update status.
-
-Do not merge, normalize, or regenerate the proposal between validation and
-commit. The exact same proposed bytes are the authorized object.
+Replacing `wallets/<wallet>/policy.json` starts a Broker ceremony. Prepare
+the complete proposal outside the mount and keep the exact same proposed bytes
+through `policy.validate_update`, human approval, and the
+`policy.commit_update` retry. Inspect the update's status and challenge, then
+verify the committed policy and terminal status. Editing or reformatting the
+proposal creates a different request. Commands are in the policy-update
+walkthrough in `docs/examples.md`.
 
 ## Petals and paid requests
 
