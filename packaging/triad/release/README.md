@@ -161,9 +161,22 @@ templates — recording explicit absence alongside bytes and modes. A rollback
 stops the release set, restores that unit contract, reselects the previous
 release, and rewrites release metadata before any restart; a failure at any of
 those steps preserves the transaction instead of starting a Broker over
-mismatched units. Recovery after an interruption always restores the coherent
-previous installation first and then lets the verified installer retry the
-requested release; it never completes the interrupted candidate in place. A
+mismatched units. The rollback clears the transaction only when every enrolled
+login passes the authenticated health gate. The per-login AWS KMS Signer
+drop-in and its credential are not part of the snapshot: they follow the
+payload of the last installation, so a KMS host that rolls back after an
+upgrade with a payload lacking the KMS overlay is repaired by rerunning the
+installer with that overlay.
+
+Recovery after an interruption restores the coherent previous installation and
+then lets the verified installer retry the requested release; it never
+completes the interrupted candidate in place. Recovery clears the transaction
+as soon as the previous installation is restored and only then restarts it,
+without gating on the health check: a host whose previous release cannot start
+must still be able to install the release that fixes it, and a run that stops
+after recovery, or reinstalls the previous release, must not leave the other
+enrolled logins stopped until a reboot. Uninstalling a login is refused while
+an interrupted upgrade is pending. A
 transaction recorded by an earlier installer (`schema
 bloom.linux-upgrade-transaction.1`) carries no unit snapshot; it is recovered
 by rolling the binary selection and release metadata back on their own, as the

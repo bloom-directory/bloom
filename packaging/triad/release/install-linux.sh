@@ -53,9 +53,11 @@ atomic_install() {
   source_file="$1"
   destination="$2"
   mode="$3"
-  mkdir -p "$(dirname "$destination")"
+  # Checked explicitly: rollback runs with errexit suspended, and an ignored
+  # failed copy must not be reported as an installed file.
+  mkdir -p "$(dirname "$destination")" || return
   temporary="${destination}.new.$$"
-  install -m "$mode" "$source_file" "$temporary"
+  install -m "$mode" "$source_file" "$temporary" || return
   mv -f "$temporary" "$destination"
 }
 
@@ -186,6 +188,31 @@ numeric_file_mode() {
   fi
 }
 
+# The Broker requires both loopback ceremony listeners, so a host whose
+# kernel cannot bind [::1] cannot run this release. Check before anything is
+# mutated rather than let the health gate discover it after the unit writes.
+linux_ipv6_loopback_available() {
+  local proc_root="$1"
+  local disable="$proc_root/sys/net/ipv6/conf/lo/disable_ipv6"
+  [[ -r "$disable" && "$(<"$disable")" == 0 ]] || return 1
+  # /proc/net/if_inet6 lists "address ifindex prefix scope flags name";
+  # ::1 must be assigned to the loopback interface.
+  awk '$1 == "00000000000000000000000000000001" && $6 == "lo" { found = 1 }
+    END { exit found ? 0 : 1 }' "$proc_root/net/if_inet6" 2>/dev/null
+}
+
+require_linux_ipv6_loopback() {
+  linux_ipv6_loopback_available "$1" || {
+    echo "Bloom requires IPv6 loopback: the Broker listens on both 127.0.0.1:18734 and [::1]:18734." >&2
+    echo "Enable it (net.ipv6.conf.lo.disable_ipv6=0, and no ipv6.disable=1 kernel parameter) and retry." >&2
+    return 69
+  }
+}
+
+linux_root_is_live() {
+  [[ "$1" == "/" ]]
+}
+
 install_linux_mount_authorization() {
   local install_root="$1"
   local mount_uid="$2"
@@ -280,8 +307,8 @@ write_linux_record() {
   local replacement="${record}.new.$$"
 
   printf '{"schema":"bloom.linux-enrollment.1","state":"%s","login_uid":%s,"login_user":"%s","release_digest":"%s","nfs_port":%s}\n' \
-    "$state" "$uid" "$user" "$digest" "$port" > "$replacement"
-  chmod 0644 "$replacement"
+    "$state" "$uid" "$user" "$digest" "$port" > "$replacement" || return
+  chmod 0644 "$replacement" || return
   mv -f "$replacement" "$record"
 }
 
@@ -482,11 +509,17 @@ replace_linux_json_digest() {
     echo "installed Linux service build digest cannot be updated" >&2
     return 65
   }
-  preserve_file_mode "$config" "$replacement"
+  preserve_file_mode "$config" "$replacement" || {
+    rm -f -- "$replacement"
+    return 65
+  }
   chown --reference="$config" "$replacement" 2>/dev/null || true
   mv -f "$replacement" "$config"
 }
 
+# Every step is checked explicitly: recovery runs this with errexit
+# suspended and then clears the transaction, so an ignored failure would
+# leave release metadata that disagrees with the selected binaries.
 rewrite_linux_release_set() {
   local install_root="$1" digest="$2" active_state="$3"
   local directory record uid state user port principal machine_environment
@@ -501,22 +534,22 @@ rewrite_linux_release_set() {
       for principal in broker signer; do
         replace_linux_json_digest \
           "$install_root/etc/bloom/$uid/$principal/config.json" \
-          "$digest"
+          "$digest" || return 65
       done
       machine_environment="$install_root/etc/bloom/$uid/.machine-env.source.$$"
       printf 'BLOOM_NFS_LISTEN=127.0.0.1:%s\nBLOOM_RELEASE_DIGEST=%s\n' \
-        "$port" "$digest" > "$machine_environment"
+        "$port" "$digest" > "$machine_environment" || return 65
       atomic_install \
         "$machine_environment" \
         "$install_root/etc/bloom/$uid/machine.env" \
-        0644
+        0644 || return 65
       rm -f -- "$machine_environment"
       if [[ "$directory" == enrollments ]]; then
         state="$active_state"
       else
         state=retained
       fi
-      write_linux_record "$record" "$state" "$uid" "$user" "$digest" "$port"
+      write_linux_record "$record" "$state" "$uid" "$user" "$digest" "$port" || return 65
     done
   done
 }
@@ -752,9 +785,13 @@ restore_linux_upgrade_units() {
     fi
   done
 }
+
+# Checked explicitly and aggregated across logins: rollback runs with
+# errexit suspended, where only the last command's status would otherwise
+# be reported, and restoring units under a still-running service is unsafe.
 stop_linux_release_set() {
-  local install_root="$1" record uid user user_runtime
-  [[ "$install_root" == "/" ]] || return 0
+  local install_root="$1" record uid user user_runtime stop_status=0
+  linux_root_is_live "$install_root" || return 0
 
   for record in "$install_root/etc/bloom/enrollments"/*.json; do
     [[ -f "$record" && ! -L "$record" ]] || continue
@@ -771,14 +808,15 @@ stop_linux_release_set() {
     systemctl stop "bloom-session@$uid.path" 2>/dev/null || true
     systemctl stop "bloom-broker-ceremony@$uid.socket" 2>/dev/null || true
     systemctl stop "bloom-broker-ceremony-ipv6@$uid.socket" 2>/dev/null || true
-    systemctl stop "bloom-broker@$uid.service"
-    systemctl stop "bloom-signer@$uid.service"
+    systemctl stop "bloom-broker@$uid.service" || stop_status=1
+    systemctl stop "bloom-signer@$uid.service" || stop_status=1
   done
+  return "$stop_status"
 }
 
 preflight_linux_release_set() {
   local install_root="$1" record uid user_runtime
-  [[ "$install_root" == "/" ]] || return 0
+  linux_root_is_live "$install_root" || return 0
 
   for record in "$install_root/etc/bloom/enrollments"/*.json; do
     [[ -f "$record" && ! -L "$record" ]] || continue
@@ -845,30 +883,45 @@ require_linux_triad_health() {
       serve triad-health-check "$digest"
 }
 
+# Starts every enrolled login and fails if any of them does not pass the
+# authenticated health gate. Rollback runs this with errexit suspended, where
+# only the last login's status would otherwise be reported, so every step is
+# checked explicitly. Later logins are still started after one fails, but the
+# set is never reported healthy while any enrolled login is down.
 start_linux_release_set() {
-  local install_root="$1" record uid user digest user_runtime
-  [[ "$install_root" == "/" ]] || return 0
+  local install_root="$1" record uid user digest user_runtime start_status=0
+  linux_root_is_live "$install_root" || return 0
 
-  systemctl daemon-reload
+  systemctl daemon-reload || return 1
   for record in "$install_root/etc/bloom/enrollments"/*.json; do
     [[ -f "$record" && ! -L "$record" ]] || continue
     uid="$(linux_record_number "$record" login_uid)"
     user="$(linux_record_string "$record" login_user)"
     digest="$(linux_record_string "$record" release_digest)"
     user_runtime="/run/user/$uid"
-    systemctl enable --now "bloom-session@$uid.path"
-    if [[ -S "$user_runtime/bus" ]]; then
-      runuser -u "$user" -- env \
-        XDG_RUNTIME_DIR="$user_runtime" \
-        DBUS_SESSION_BUS_ADDRESS="unix:path=$user_runtime/bus" \
-        systemctl --user daemon-reload
-      runuser -u "$user" -- env \
-        XDG_RUNTIME_DIR="$user_runtime" \
-        DBUS_SESSION_BUS_ADDRESS="unix:path=$user_runtime/bus" \
-        systemctl --user start bloom-session.service bloom-machine.service
+    if ! systemctl enable --now "bloom-session@$uid.path"; then
+      echo "Bloom Linux release could not start the session path for UID $uid" >&2
+      start_status=1
+      continue
     fi
-    require_linux_triad_health "$install_root" "$uid" "$user" "$digest"
+    if [[ -S "$user_runtime/bus" ]]; then
+      if ! runuser -u "$user" -- env \
+        XDG_RUNTIME_DIR="$user_runtime" \
+        DBUS_SESSION_BUS_ADDRESS="unix:path=$user_runtime/bus" \
+        systemctl --user daemon-reload ||
+        ! runuser -u "$user" -- env \
+          XDG_RUNTIME_DIR="$user_runtime" \
+          DBUS_SESSION_BUS_ADDRESS="unix:path=$user_runtime/bus" \
+          systemctl --user start bloom-session.service bloom-machine.service
+      then
+        echo "Bloom Linux release could not start the user services for UID $uid" >&2
+        start_status=1
+        continue
+      fi
+    fi
+    require_linux_triad_health "$install_root" "$uid" "$user" "$digest" || start_status=1
   done
+  return "$start_status"
 }
 
 upgrade_root=""
@@ -921,17 +974,23 @@ rollback_step() {
   return "$step_status"
 }
 
+# Restores the previous release's installed state — its unit contract,
+# binary selection, and release metadata — without starting anything. Each
+# step runs only after the one before it succeeded, and every step is
+# idempotent, so a failure leaves the transaction for a later attempt.
+restore_linux_previous_release() {
+  rollback_step "stop the release set" stop_linux_release_set "$upgrade_root" &&
+    rollback_step "restore installed units" restore_linux_upgrade_units "$upgrade_root" "$upgrade_transaction" &&
+    rollback_step "select the previous release" switch_linux_release "$upgrade_root" "$upgrade_old_digest" &&
+    rollback_step "restore release metadata" rewrite_linux_release_set "$upgrade_root" "$upgrade_old_digest" active
+}
+
 rollback_linux_upgrade() {
   local rollback_status=0
   [[ -n "$upgrade_root" && -n "$upgrade_old_digest" ]] || return 0
   # Never start services over a partially restored installation: the restart
-  # below only runs when stop, unit restoration, binary selection, and
-  # release metadata are all restored coherently.
-  if rollback_step "stop the release set" stop_linux_release_set "$upgrade_root" &&
-    rollback_step "restore installed units" restore_linux_upgrade_units "$upgrade_root" "$upgrade_transaction" &&
-    rollback_step "select the previous release" switch_linux_release "$upgrade_root" "$upgrade_old_digest" &&
-    rollback_step "restore release metadata" rewrite_linux_release_set "$upgrade_root" "$upgrade_old_digest" active
-  then
+  # below only runs when the previous release is restored coherently.
+  if restore_linux_previous_release; then
     start_linux_release_set "$upgrade_root" || rollback_status=$?
   else
     rollback_status=$?
@@ -953,12 +1012,21 @@ finish_linux_upgrade() {
   upgrade_old_digest=""
 }
 
-# New-format interrupted transactions always recover through one path:
-# restore the coherent previous installation first, then let the verified
-# installation that triggered recovery retry the requested release through
-# the normal upgrade steps. Starting the interrupted candidate directly is
-# unsafe because the interruption may have happened before or between unit
-# writes, and it must never be restarted over mixed old and new units.
+# Interrupted transactions always recover through one path: restore the
+# coherent previous installation, then let the verified installation that
+# triggered recovery retry the requested release through the normal upgrade
+# steps. Starting the interrupted candidate directly is unsafe because the
+# interruption may have happened before or between unit writes, and it must
+# never be restarted over mixed old and new units.
+#
+# Recovery then restarts the previous release but never gates on it. The
+# transaction is already cleared, so a previous release that cannot start —
+# typically the release the host is upgrading away from — still leaves the
+# installer free to install the release that fixes it. The restart keeps a
+# run that exits after recovery, or that reinstalls the previous release,
+# from leaving every enrolled login stopped until a reboot. Recovery needs no
+# login sessions, because it neither starts services under a health gate nor
+# touches user state.
 recover_interrupted_linux_upgrade() {
   local install_root="$1"
   local transaction="$install_root/var/lib/bloom/upgrade-transaction"
@@ -988,16 +1056,20 @@ recover_interrupted_linux_upgrade() {
     echo "invalid interrupted Linux upgrade" >&2
     return 65
   }
-  preflight_linux_release_set "$install_root"
   upgrade_transaction="$transaction"
   upgrade_root="$install_root"
   upgrade_old_digest="$old_digest"
-  upgrade_rollback_required=true
+  # upgrade_rollback_required stays false: a failed restoration preserves the
+  # transaction for the next run rather than attempting a restart from the
+  # EXIT trap.
   echo "restoring the interrupted Bloom Linux release before retrying" >&2
-  if ! rollback_linux_upgrade; then
+  if ! restore_linux_previous_release; then
+    echo "Bloom Linux upgrade recovery failed; transaction preserved for retry" >&2
     return 65
   fi
   finish_linux_upgrade
+  start_linux_release_set "$install_root" ||
+    echo "the restored Bloom Linux release did not start cleanly; continuing" >&2
 }
 
 allocate_linux_nfs_port() {
@@ -1269,6 +1341,9 @@ case "$action" in
       exit 65
     }
     recover_interrupted_linux_upgrade "$root"
+    if linux_root_is_live "$root"; then
+      require_linux_ipv6_loopback /proc
+    fi
     migrate_legacy_linux_records "$root"
     validate_linux_release_set "$root"
     shared_release_digest="$validated_release_digest"
@@ -1681,6 +1756,14 @@ case "$action" in
         exit 64
       }
     fi
+    # A pending upgrade transaction means the installed units, binaries, and
+    # release metadata may be mixed. Recover the previous installation before
+    # changing which logins are enrolled.
+    [[ ! -e "$root/var/lib/bloom/upgrade-transaction" && \
+      ! -L "$root/var/lib/bloom/upgrade-transaction" ]] || {
+      echo "an interrupted Linux upgrade must be recovered first; rerun the Bloom installer" >&2
+      exit 65
+    }
     config_target="$root/etc/bloom/$login_uid"
     state_target="$root/var/lib/bloom/$login_uid"
     run_target="$root/run/bloom/$login_uid"

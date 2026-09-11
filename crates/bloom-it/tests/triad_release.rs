@@ -415,11 +415,11 @@ fn build(staging: &Path, output: &Path, key: &Path) -> std::process::Output {
         &compatibility,
         compatibility_source
             .replace(
-                "broker_commit = \"cd1e31e9f33c74355bf3e7fa244af12159716064\"",
+                "broker_commit = \"bd85885bb4fc2c05f20af1f4410683ffbebca6a9\"",
                 &format!("broker_commit = \"{}\"", "22".repeat(20)),
             )
             .replace(
-                "signer_commit = \"9abe7917b8380d8b6d31af0b376a79c26e816764\"",
+                "signer_commit = \"941dd376568b52ccd269ecf495bcff7dcd9af504\"",
                 &format!("signer_commit = \"{}\"", "33".repeat(20)),
             ),
     )
@@ -2673,18 +2673,46 @@ fn installer_upgrade_transactions_preserve_recovery_state_atomically() {
                 .find("\"$payload/installer/linux/systemd/bloom-broker-ceremony@.socket\"")
                 .unwrap()
     );
+    let restore = &linux[linux.find("restore_linux_previous_release() {").unwrap()
+        ..linux.find("rollback_linux_upgrade() {").unwrap()];
+    assert!(
+        restore.contains("restore_linux_upgrade_units \"$upgrade_root\" \"$upgrade_transaction\""),
+        "restoring the previous release must restore its installed unit contract"
+    );
+    assert!(!restore.contains("start_linux_release_set"));
     let rollback = &linux[linux.find("rollback_linux_upgrade() {").unwrap()
         ..linux.find("finish_linux_upgrade() {").unwrap()];
     assert!(
-        rollback
-            .find("restore_linux_upgrade_units \"$upgrade_root\" \"$upgrade_transaction\"")
-            .unwrap()
+        rollback.find("restore_linux_previous_release").unwrap()
             < rollback
                 .find("start_linux_release_set \"$upgrade_root\"")
                 .unwrap(),
         "rollback must restore the installed unit contract before any restart"
     );
+    // Recovery clears the transaction before its restart, so it never depends
+    // on the previous release passing its health gate.
+    let recovery = &linux[linux.find("recover_interrupted_linux_upgrade() {").unwrap()
+        ..linux.find("allocate_linux_nfs_port() {").unwrap()];
+    assert!(recovery.contains("restore_linux_previous_release"));
+    assert!(
+        recovery.find("finish_linux_upgrade").unwrap()
+            < recovery
+                .find("start_linux_release_set \"$install_root\" ||")
+                .unwrap()
+    );
+    assert!(!recovery.contains("rollback_linux_upgrade"));
+    assert!(!recovery.contains("upgrade_rollback_required=true"));
     assert!(!linux.contains("completing interrupted"));
+    // IPv6 loopback is checked after recovery and before anything new is
+    // installed.
+    let ipv6 = linux.find("require_linux_ipv6_loopback /proc").unwrap();
+    assert!(
+        linux
+            .find("recover_interrupted_linux_upgrade \"$root\"")
+            .unwrap()
+            < ipv6
+    );
+    assert!(ipv6 < linux.find("install_linux_release \"$root\"").unwrap());
 
     let daemon = fs::read_to_string(workspace().join("crates/bloom-daemon/src/lib.rs")).unwrap();
     assert!(daemon.contains(".require_outbox_petal_eligibility(&request.wallet, chain_name, id)"));
@@ -2851,9 +2879,10 @@ fn make_linux_candidate_payload(
 /// `begin_linux_upgrade` and then performs the candidate unit writes up to
 /// the requested boundary — `none`, `sockets`, `services`, or `all` — and
 /// exits without the EXIT-trap rollback, simulating an interrupted process.
-/// `recover` runs `recover_interrupted_linux_upgrade` on the preserved
-/// transaction. The start stub fingerprints the units it observes, so a
-/// startup attempt over mixed state is detectable in the log.
+/// `rollback` performs the same writes and then runs the in-process rollback
+/// the EXIT trap would. `recover` runs `recover_interrupted_linux_upgrade` on
+/// the preserved transaction. The start stub fingerprints the units it
+/// observes, so a startup attempt over mixed state is detectable in the log.
 fn write_linux_upgrade_harness(directory: &Path) -> PathBuf {
     let script = directory.join("linux-upgrade-harness.sh");
     fs::write(
@@ -2881,28 +2910,36 @@ start_linux_release_set() {
     "$(sha256sum "$1/usr/lib/systemd/system/bloom-broker@.service" | cut -d' ' -f1)" \
     "$(test -e "$1/usr/lib/systemd/system/bloom-broker-ceremony-ipv6@.socket" && echo present || echo absent)" >> "$log"
 }
+write_candidate_units() {
+  unit_root="$root/usr/lib/systemd/system"
+  user_unit_root="$root/usr/lib/systemd/user"
+  if [[ "$stage" != none ]]; then
+    printf 'candidate v4 socket\n' > "$unit_root/bloom-broker-ceremony@.socket"
+    printf 'candidate v6 socket\n' > "$unit_root/bloom-broker-ceremony-ipv6@.socket"
+    printf 'candidate session path\n' > "$unit_root/bloom-session@.path"
+  fi
+  if [[ "$stage" == services || "$stage" == all ]]; then
+    printf 'candidate session unit\n' > "$user_unit_root/bloom-session.service"
+    printf 'candidate machine unit\n' > "$user_unit_root/bloom-machine.service"
+    printf 'candidate broker unit\n' > "$unit_root/bloom-broker@.service"
+    printf 'candidate signer unit\n' > "$unit_root/bloom-signer@.service"
+  fi
+  if [[ "$stage" == all ]]; then
+    rm -f -- "$unit_root/bloom-signer-rpc@.socket" \
+      "$unit_root/bloom-signer-control@.socket" \
+      "$unit_root/bloom-broker-rpc@.socket" \
+      "$unit_root/bloom-broker-control@.socket"
+  fi
+}
 case "$mode" in
   interrupt)
     begin_linux_upgrade "$root" "$old_digest" "$new_digest"
-    unit_root="$root/usr/lib/systemd/system"
-    user_unit_root="$root/usr/lib/systemd/user"
-    if [[ "$stage" != none ]]; then
-      printf 'candidate v4 socket\n' > "$unit_root/bloom-broker-ceremony@.socket"
-      printf 'candidate v6 socket\n' > "$unit_root/bloom-broker-ceremony-ipv6@.socket"
-      printf 'candidate session path\n' > "$unit_root/bloom-session@.path"
-    fi
-    if [[ "$stage" == services || "$stage" == all ]]; then
-      printf 'candidate session unit\n' > "$user_unit_root/bloom-session.service"
-      printf 'candidate machine unit\n' > "$user_unit_root/bloom-machine.service"
-      printf 'candidate broker unit\n' > "$unit_root/bloom-broker@.service"
-      printf 'candidate signer unit\n' > "$unit_root/bloom-signer@.service"
-    fi
-    if [[ "$stage" == all ]]; then
-      rm -f -- "$unit_root/bloom-signer-rpc@.socket" \
-        "$unit_root/bloom-signer-control@.socket" \
-        "$unit_root/bloom-broker-rpc@.socket" \
-        "$unit_root/bloom-broker-control@.socket"
-    fi
+    write_candidate_units
+    ;;
+  rollback)
+    begin_linux_upgrade "$root" "$old_digest" "$new_digest"
+    write_candidate_units
+    rollback_linux_upgrade
     ;;
   recover)
     recover_interrupted_linux_upgrade "$root"
@@ -2940,6 +2977,26 @@ fn stage_interrupted_linux_root(
     harness: &Path,
     stage: &str,
 ) -> (PathBuf, Vec<LinuxTrackedUnit>, String, String) {
+    let (root, layout, old_digest, new_digest, _) =
+        stage_linux_upgrade_root(directory, harness, "interrupt", stage, |_| {});
+    (root, layout, old_digest, new_digest)
+}
+
+/// Like `stage_interrupted_linux_root`, but runs the harness in `mode` and
+/// lets the caller shape the installed tree before the upgrade snapshots it.
+fn stage_linux_upgrade_root(
+    directory: &Path,
+    harness: &Path,
+    mode: &str,
+    stage: &str,
+    prepare: impl FnOnce(&Path),
+) -> (
+    PathBuf,
+    Vec<LinuxTrackedUnit>,
+    String,
+    String,
+    std::process::Output,
+) {
     let root = directory.join("root");
     fs::create_dir(&root).unwrap();
     let payload = make_installer_payload(&directory.join("release-a"));
@@ -2954,22 +3011,25 @@ fn stage_interrupted_linux_root(
         String::from_utf8_lossy(&installed.stderr)
     );
     let layout = apply_pre_ipv6_linux_layout(&root);
+    prepare(&root);
     let new_digest = hex::encode(Sha256::digest(b"upgraded manifest\n"));
-    let log = directory.join(format!("interrupt-{stage}.log"));
-    let interrupted = run_linux_upgrade_harness(
+    let log = directory.join(format!("{mode}-{stage}.log"));
+    let staged = run_linux_upgrade_harness(
         harness,
         &release_script("install-linux.sh"),
         &root,
-        "interrupt",
+        mode,
         &log,
         &[stage, &old_digest, &new_digest],
     );
-    assert!(
-        interrupted.status.success(),
-        "{}",
-        String::from_utf8_lossy(&interrupted.stderr)
-    );
-    (root, layout, old_digest, new_digest)
+    if mode == "interrupt" {
+        assert!(
+            staged.status.success(),
+            "{}",
+            String::from_utf8_lossy(&staged.stderr)
+        );
+    }
+    (root, layout, old_digest, new_digest, staged)
 }
 
 #[test]
@@ -3114,28 +3174,24 @@ fn linux_interrupted_upgrade_recovery_restores_before_any_restart() {
         let stop = log
             .find("stop\n")
             .unwrap_or_else(|| panic!("no stop at {stage}"));
-        let start = log
-            .find("start current=")
-            .unwrap_or_else(|| panic!("no start at {stage}"));
+        let rewrite = log
+            .find(&format!("rewrite {old_digest} active"))
+            .unwrap_or_else(|| panic!("no metadata restore at {stage}"));
         assert!(
-            stop < start,
-            "the release set must stop before restarting at {stage}"
+            stop < rewrite,
+            "the release set must stop before it is restored at {stage}"
         );
-        let start_line = &log[start..log.len().min(start + 400)];
-        let start_line = &start_line[..start_line.find('\n').unwrap_or(start_line.len())];
-        let old_v4 = hex::encode(Sha256::digest(&layout[0].bytes));
-        let old_broker = hex::encode(Sha256::digest(&layout[1].bytes));
+        // Recovery restarts the previous release only after restoring it.
+        let start = log
+            .find(&format!("start current=releases/{old_digest} "))
+            .unwrap_or_else(|| panic!("no restart of the restored release at {stage}: {log}"));
         assert!(
-            start_line.contains(&format!("current=releases/{old_digest}"))
-                && start_line.contains(&format!("v4={old_v4}"))
-                && start_line.contains(&format!("broker={old_broker}"))
-                && start_line.contains("v6=absent"),
-            "restart at {stage} observed mixed binaries or units: {start_line}"
+            rewrite < start && log.contains("v6=absent"),
+            "recovery must restart only the restored release at {stage}: {log}"
         );
         assert_eq!(
-            log.matches("start current=").count(),
-            1,
-            "recovery must attempt exactly one restart at {stage}"
+            fs::read_link(root.join("usr/libexec/bloom/current")).unwrap(),
+            format!("releases/{old_digest}")
         );
         assert_pre_ipv6_linux_contract(&root, &layout);
         assert!(
@@ -3344,14 +3400,32 @@ fn linux_upgrade_recovery_failure_preserves_the_transaction_and_retries() {
     assert_pre_ipv6_linux_contract(&root, &layout);
     assert!(!root.join("var/lib/bloom/upgrade-transaction").exists());
 
-    // A failed health gate also preserves the transaction; the retry starts
-    // only after the fault clears.
+    // A previous release that cannot pass its health gate — the release a
+    // host is upgrading away from — must not strand the host. The in-process
+    // rollback restores it coherently, fails its health gate, and keeps the
+    // transaction. Recovery then restores it, clears the transaction, and
+    // attempts a restart without gating on it, and the retried upgrade to the
+    // candidate completes.
     let health_root = tempfile::tempdir().unwrap();
-    let (root, layout, old_digest, new_digest) =
-        stage_interrupted_linux_root(health_root.path(), &harness, "all");
-    fs::write(root.join("var/lib/bloom/start-fails"), b"1").unwrap();
+    let (root, layout, old_digest, new_digest, rolled_back) =
+        stage_linux_upgrade_root(health_root.path(), &harness, "rollback", "all", |root| {
+            fs::create_dir_all(root.join("var/lib/bloom")).unwrap();
+            fs::write(root.join("var/lib/bloom/start-fails"), b"1").unwrap();
+        });
+    assert!(!rolled_back.status.success());
+    let rollback_log = fs::read_to_string(health_root.path().join("rollback-all.log")).unwrap();
+    assert!(rollback_log.contains("start refused"));
+    assert!(
+        String::from_utf8_lossy(&rolled_back.stderr).contains("transaction preserved for retry")
+    );
+    assert!(
+        root.join("var/lib/bloom/upgrade-transaction/schema")
+            .is_file()
+    );
+    assert_pre_ipv6_linux_contract(&root, &layout);
+
     let log = health_root.path().join("recover.log");
-    let unhealthy = run_linux_upgrade_harness(
+    let recovered = run_linux_upgrade_harness(
         &harness,
         &installer,
         &root,
@@ -3359,34 +3433,318 @@ fn linux_upgrade_recovery_failure_preserves_the_transaction_and_retries() {
         &log,
         &[&old_digest, &new_digest],
     );
-    assert!(!unhealthy.status.success());
-    assert!(fs::read_to_string(&log).unwrap().contains("start refused"));
     assert!(
-        root.join("var/lib/bloom/upgrade-transaction/schema")
-            .is_file()
+        recovered.status.success(),
+        "recovery must not depend on the previous release's health: {}",
+        String::from_utf8_lossy(&recovered.stderr)
     );
+    assert!(fs::read_to_string(&log).unwrap().contains("start refused"));
+    assert!(String::from_utf8_lossy(&recovered.stderr).contains("did not start cleanly"));
+    assert!(!root.join("var/lib/bloom/upgrade-transaction").exists());
     assert_pre_ipv6_linux_contract(&root, &layout);
-    fs::remove_file(root.join("var/lib/bloom/start-fails")).unwrap();
-    let retry_log = health_root.path().join("retry.log");
-    let retried = run_linux_upgrade_harness(
+
+    let (candidate, _) = make_linux_candidate_payload(
+        health_root.path(),
+        "release-b",
+        b"upgraded broker\n",
+        b"upgraded manifest\n",
+    );
+    let upgraded = run_linux_installer(
+        &root,
+        &["install", "1000", "alice", candidate.to_str().unwrap()],
+    );
+    assert!(
+        upgraded.status.success(),
+        "{}",
+        String::from_utf8_lossy(&upgraded.stderr)
+    );
+    assert_eq!(
+        fs::read_link(root.join("usr/libexec/bloom/current")).unwrap(),
+        format!("releases/{new_digest}")
+    );
+    assert!(!root.join("var/lib/bloom/upgrade-transaction").exists());
+}
+
+/// Uninstall refuses while an interrupted upgrade is pending: the installed
+/// units, binaries, and release metadata may be mixed until recovery restores
+/// the previous installation. Once recovery has run, uninstall proceeds.
+#[test]
+fn linux_uninstall_refuses_while_an_interrupted_upgrade_is_pending() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("root");
+    fs::create_dir(&root).unwrap();
+    let payload = make_installer_payload(&directory.path().join("release-a"));
+    install_linux_logins(&root, &payload, &[("1000", "alice"), ("2000", "bob")]);
+    let harness = write_linux_upgrade_harness(directory.path());
+    let installer = release_script("install-linux.sh");
+    let old_digest = hex::encode(Sha256::digest(b"test payload\n"));
+    let new_digest = hex::encode(Sha256::digest(b"upgraded manifest\n"));
+    let interrupted = run_linux_upgrade_harness(
+        &harness,
+        &installer,
+        &root,
+        "interrupt",
+        &directory.path().join("interrupt.log"),
+        &["all", &old_digest, &new_digest],
+    );
+    assert!(
+        interrupted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&interrupted.stderr)
+    );
+    let transaction = root.join("var/lib/bloom/upgrade-transaction");
+    let uninstall = || {
+        Command::new(&installer)
+            .args(["uninstall", "--retain-custody"])
+            .arg(&root)
+            .arg("2000")
+            .output()
+            .unwrap()
+    };
+
+    let refused = uninstall();
+    assert_eq!(refused.status.code(), Some(65));
+    assert!(
+        String::from_utf8_lossy(&refused.stderr)
+            .contains("an interrupted Linux upgrade must be recovered first")
+    );
+    assert!(root.join("etc/bloom/enrollments/2000.json").is_file());
+    assert!(transaction.join("schema").is_file());
+
+    let recovered = run_linux_upgrade_harness(
         &harness,
         &installer,
         &root,
         "recover",
-        &retry_log,
+        &directory.path().join("recover.log"),
         &[&old_digest, &new_digest],
     );
     assert!(
-        retried.status.success(),
+        recovered.status.success(),
         "{}",
-        String::from_utf8_lossy(&retried.stderr)
+        String::from_utf8_lossy(&recovered.stderr)
+    );
+    assert!(!transaction.exists());
+    let uninstalled = uninstall();
+    assert!(
+        uninstalled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&uninstalled.stderr)
+    );
+    assert!(root.join("etc/bloom/retained/2000.json").is_file());
+}
+
+/// Writes a harness that evaluates the real installer functions and treats
+/// the staged root as a live host, with systemctl, runuser, and the
+/// authenticated health check replaced by logging stubs. A marker file
+/// `fail-<words>` under the root makes the matching stub fail.
+fn write_linux_live_harness(directory: &Path, body: &str) -> PathBuf {
+    let script = directory.join("linux-live-harness.sh");
+    fs::write(
+        &script,
+        format!(
+            r##"#!/usr/bin/env bash
+set -euo pipefail
+# The evaluated installer prefix shifts the positional parameters, so every
+# argument is captured before it is loaded.
+installer="$1"; root="$2"; log="$3"
+arg1="${{4:-}}"; arg2="${{5:-}}"; arg3="${{6:-}}"
+eval "$(sed -n '1,/^case "$action" in$/p' "$installer" | sed '$d')"
+cleanup_scratch() {{ status=$?; trap - EXIT; exit "$status"; }}
+linux_root_is_live() {{ return 0; }}
+stub_fails() {{
+  local marker
+  marker="$root/fail-$(printf '%s' "$*" | tr ' /@' '---')"
+  [[ -e "$marker" ]]
+}}
+systemctl() {{
+  echo "systemctl $*" >> "$log"
+  ! stub_fails systemctl "$@"
+}}
+runuser() {{ echo "runuser $*" >> "$log"; }}
+require_linux_triad_health() {{
+  echo "health $2" >> "$log"
+  ! stub_fails health "$2"
+}}
+{body}
+"##
+        ),
+    )
+    .unwrap();
+    set_linux_mode(&script, 0o755);
+    script
+}
+
+fn install_linux_logins(root: &Path, payload: &Path, logins: &[(&str, &str)]) {
+    for (uid, user) in logins {
+        let installed =
+            run_linux_installer(root, &["install", uid, user, payload.to_str().unwrap()]);
+        assert!(
+            installed.status.success(),
+            "{}",
+            String::from_utf8_lossy(&installed.stderr)
+        );
+    }
+}
+
+/// Rollback runs with errexit suspended. Starting and stopping the release
+/// set must still report a failure from any login, not only the last one,
+/// and a rollback whose first login stays unhealthy must keep the
+/// transaction instead of reporting success.
+#[test]
+fn linux_release_set_start_and_stop_fail_when_any_login_fails() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("root");
+    fs::create_dir(&root).unwrap();
+    let payload = make_installer_payload(&directory.path().join("release-a"));
+    install_linux_logins(&root, &payload, &[("1000", "alice"), ("2000", "bob")]);
+    let harness = write_linux_live_harness(
+        directory.path(),
+        r#"
+case "$arg1" in
+  start)
+    if start_linux_release_set "$root"; then echo "start ok"; else echo "start failed"; fi
+    ;;
+  stop)
+    if stop_linux_release_set "$root"; then echo "stop ok"; else echo "stop failed"; fi
+    ;;
+  rollback)
+    begin_linux_upgrade "$root" "$arg2" "$arg3"
+    if rollback_linux_upgrade; then echo "rollback ok"; else echo "rollback failed"; fi
+    ;;
+esac
+"#,
+    );
+    let installer = release_script("install-linux.sh");
+    let run = |log: &Path, args: &[&str]| {
+        Command::new(&harness)
+            .arg(&installer)
+            .arg(&root)
+            .arg(log)
+            .args(args)
+            .output()
+            .unwrap()
+    };
+
+    // The first login fails its health gate; the second is still started,
+    // and the set reports failure.
+    fs::write(root.join("fail-health-1000"), b"").unwrap();
+    let log = directory.path().join("start.log");
+    let started = run(&log, &["start"]);
+    assert_eq!(
+        String::from_utf8_lossy(&started.stdout).trim(),
+        "start failed"
+    );
+    let log = fs::read_to_string(&log).unwrap();
+    assert!(
+        log.contains("health 1000") && log.contains("health 2000"),
+        "{log}"
+    );
+    fs::remove_file(root.join("fail-health-1000")).unwrap();
+
+    // With every login healthy, the set starts.
+    let log = directory.path().join("start-ok.log");
+    assert_eq!(
+        String::from_utf8_lossy(&run(&log, &["start"]).stdout).trim(),
+        "start ok"
+    );
+
+    // A failed Broker stop for the first login is reported even though the
+    // last stop succeeds.
+    fs::write(
+        root.join("fail-systemctl-stop-bloom-broker-1000.service"),
+        b"",
+    )
+    .unwrap();
+    let log = directory.path().join("stop.log");
+    assert_eq!(
+        String::from_utf8_lossy(&run(&log, &["stop"]).stdout).trim(),
+        "stop failed"
     );
     assert!(
-        fs::read_to_string(&retry_log)
+        fs::read_to_string(&log)
             .unwrap()
-            .contains("start current=")
+            .contains("bloom-signer@2000.service")
     );
-    assert!(!root.join("var/lib/bloom/upgrade-transaction").exists());
+    fs::remove_file(root.join("fail-systemctl-stop-bloom-broker-1000.service")).unwrap();
+
+    // A rollback whose first login stays unhealthy keeps the transaction.
+    let old_digest = hex::encode(Sha256::digest(b"test payload\n"));
+    let new_digest = hex::encode(Sha256::digest(b"upgraded manifest\n"));
+    fs::write(root.join("fail-health-1000"), b"").unwrap();
+    let log = directory.path().join("rollback.log");
+    let rolled_back = run(&log, &["rollback", &old_digest, &new_digest]);
+    assert_eq!(
+        String::from_utf8_lossy(&rolled_back.stdout).trim(),
+        "rollback failed",
+        "{}",
+        String::from_utf8_lossy(&rolled_back.stderr)
+    );
+    assert!(
+        root.join("var/lib/bloom/upgrade-transaction/schema")
+            .is_file(),
+        "a rollback with an unhealthy login must keep its transaction"
+    );
+}
+
+#[test]
+fn linux_installer_requires_ipv6_loopback_on_a_live_host() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("root");
+    fs::create_dir(&root).unwrap();
+    let harness = write_linux_live_harness(
+        directory.path(),
+        r#"
+if require_linux_ipv6_loopback "$arg1"; then echo "available"; else echo "unavailable $?"; fi
+"#,
+    );
+    let installer = release_script("install-linux.sh");
+    let loopback_v6 = "00000000000000000000000000000001 01 80 10 80       lo\n";
+    let other_v6 = "fe800000000000000000000000000001 02 40 20 80     eth0\n";
+    for (name, disable_ipv6, if_inet6, expected) in [
+        ("enabled", Some("0\n"), Some(loopback_v6), "available"),
+        ("kernel-disabled", None, None, "unavailable 69"),
+        (
+            "sysctl-disabled",
+            Some("1\n"),
+            Some(loopback_v6),
+            "unavailable 69",
+        ),
+        (
+            "no-loopback-address",
+            Some("0\n"),
+            Some(other_v6),
+            "unavailable 69",
+        ),
+        ("no-address-table", Some("0\n"), None, "unavailable 69"),
+    ] {
+        let proc_root = directory.path().join(name);
+        if let Some(value) = disable_ipv6 {
+            let sysctl = proc_root.join("sys/net/ipv6/conf/lo/disable_ipv6");
+            fs::create_dir_all(sysctl.parent().unwrap()).unwrap();
+            fs::write(sysctl, value).unwrap();
+        }
+        if let Some(table) = if_inet6 {
+            fs::create_dir_all(proc_root.join("net")).unwrap();
+            fs::write(proc_root.join("net/if_inet6"), table).unwrap();
+        }
+        let output = Command::new(&harness)
+            .arg(&installer)
+            .arg(&root)
+            .arg(directory.path().join(format!("{name}.log")))
+            .arg(&proc_root)
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            expected,
+            "{name}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if expected != "available" {
+            assert!(String::from_utf8_lossy(&output.stderr).contains("requires IPv6 loopback"));
+        }
+    }
 }
 
 #[test]
