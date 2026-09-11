@@ -120,8 +120,8 @@ Use the cheapest loop that still crosses the boundary you changed.
 ### Loop 1: owning-repository tests
 
 Most work should stay here. Run the affected package or named test while
-editing. Before publishing the owning repository, run its format, clippy, and
-workspace test gates.
+editing. Before publishing, run the
+[validation gates appropriate to the change](./TESTING.md#validation-gates).
 
 Do not start overlapping Cargo commands in one target directory. Separate
 repositories can build concurrently. Separate worktrees of one repository need
@@ -201,9 +201,12 @@ on `PATH`.
 
 ### Test the binaries you intended
 
-By default the launcher discovers `../bloom-broker` and `../bloom-signer` and
-builds their debug binaries. For other worktrees, build first and pin all three
-binary paths explicitly:
+The launcher requires `../bloom-broker` and `../bloom-signer` to resolve even
+when binary overrides are supplied. Arrange candidate checkouts side by side,
+or provide those sibling names as symlinks in an isolated candidate directory;
+do not replace another session's checkout or links. Binary overrides select the
+executables, not the repository discovery paths. Build the candidate worktrees
+first and pin all three binary paths explicitly:
 
 ```sh
 cargo build -p bloom --no-default-features \
@@ -274,20 +277,25 @@ together, which is why it belongs only in the terminal addressing that
 candidate. An unsourced shell addresses `~/.bloom`, which is usually nobody's
 triad.
 
-Candidates are otherwise independent, with one exception: the ceremony listener
-address `127.0.0.1:18734` is fixed in the launcher, so only one candidate on a
-host can hold it. Run at most one ceremony-bearing candidate, or keep the others
-on `--services-only` work that does not need it.
+Separate state paths do not isolate the ceremony listener at `127.0.0.1:18734`.
+On Linux the launcher starts that systemd socket before checking
+`--services-only`, so that mode also reserves the port. Run only one launcher
+candidate at a time in the same network namespace; use separate disposable VMs
+for concurrent full triads. The unique paths above prevent state collisions
+when switching candidates, but do not remove this listener constraint.
 
 ## Cross-repository changes
 
 Advance a candidate left to right:
 
-1. Implement and test the Signer invariant, then publish its immutable commit.
-2. Update Broker's exact Signer/runtime pins once; test Broker and publish it.
-3. Update Machine's exact Broker/runtime pins once; test the Machine seams.
-4. Run the out-of-process triad at the recorded three commits.
-5. Run packaging and installed acceptance only after the candidate is frozen.
+1. Implement, test, and land the change in its owning repository, starting with
+   service-runtime or contract dependencies when needed.
+2. Advance downstream pins to the full 40-character landed commit, update the
+   lockfile and other recorded compatibility refs, and test the affected seam.
+3. Repeat in dependency order: Signer, Broker, Machine, then dependent Petals.
+4. Run the out-of-process triad at the recorded three commits when behavior
+   crosses services. Follow the [release package checks](./packaging/triad/release/README.md)
+   for changes affecting the released combination.
 
 Commit each manifest and regenerated lockfile together. Do not repeatedly repin
 downstream repositories while upstream code is moving. A new source commit
@@ -305,10 +313,13 @@ git -C ../bloom-broker rev-parse HEAD
 git rev-parse HEAD
 ```
 
-When concurrent feature branches exist, use a combined integration branch that
-is demonstrably descended from the required Signer, Broker, BIP39, and chain
-heads. Do not merge an independent `master`-based implementation into the
-middle of an active custody stack or reimplement an upstream fix downstream.
+Keep at most one unmerged parent, including dependencies represented by Cargo
+pins. If a temporary stacked candidate is needed, record the exact upstream
+revisions and land the lowest PR first. Squash each PR into one landed commit;
+then retarget its child and advance the child's pins to that landed commit.
+Merge the base forward on branches pinned by downstream code; do not rebase
+them. Avoid long-lived combined integration branches and keep temporary stack
+details in the task's handoff rather than this contributor guide.
 
 ## BIP39 and derived-account development
 
@@ -392,29 +403,8 @@ Broadcast requires `allow_broadcast = true` and a pinned
 staging and again before the single send attempt. A transport ambiguity is
 reconciled by signature; it is never handled by blindly rebroadcasting.
 
-Use the short Solana test ladder:
-
-```sh
-cargo test -p bloom-solana
-cargo test -p bloom-solana-tx
-cargo test -p bloom-vfs
-cargo test -p bloom-it --test solana_workflow -- --ignored --nocapture
-```
-
-For validator-backed coverage, start the pinned Agave v3.0.0 validator used by
-`.github/workflows/solana-validator.yml`, then run:
-
-```sh
-SOLANA_VALIDATOR_HTTP=http://127.0.0.1:8899 \
-  cargo test -p bloom-solana-tx --test local_validator -- \
-  --ignored --nocapture
-
-cargo test -p bloom-it --test solana_multi_account -- \
-  --ignored --nocapture
-```
-
-`local_validator` reads `SOLANA_VALIDATOR_HTTP`; `solana_multi_account`
-intentionally targets the validator at `http://127.0.0.1:8899` directly.
+Run the [Solana test ladder](./TESTING.md#triad-and-solana-ladders), including
+the validator-backed suites for account selection and live transaction changes.
 
 Mainnet uses the same transaction path and remains fail closed. Do not add a
 second mainnet signer, bypass ceremony approval, weaken genesis checks, or move
@@ -422,13 +412,15 @@ chain-specific custody into Machine.
 
 ## General local operation
 
-Machine may run without Broker for cached public reads, unsigned staging, and
-simulation where the public inputs exist:
+An already running Machine may continue without Broker for cached public reads,
+unsigned staging, and simulation where the public inputs exist. `status` and
+`vfs cat` are IPC clients; setting `BLOOM_HOME` does not start a Machine. In a
+terminal connected to the candidate (for example, after sourcing its
+`triad.env`), inspect it with:
 
 ```sh
-BLOOM_HOME=/tmp/bloom-machine cargo run -p bloom -- status
-BLOOM_HOME=/tmp/bloom-machine cargo run -p bloom -- \
-  vfs cat /chains/anvil/head/number
+bloom status
+bloom vfs cat /status/daemon.json
 ```
 
 Signing, custody, approval mutation, and policy mutation must fail promptly
@@ -450,6 +442,7 @@ packages; do not patch Machine to preserve a retired Petal authority ABI.
 | Variable | Purpose |
 |---|---|
 | `BLOOM_HOME` | Machine-owned state root |
+| `BLOOM_RPC_ENDPOINT` | Machine endpoint used by IPC clients |
 | `BLOOM_IPC_SOCKET` | Machine endpoint a client connects to |
 | `BLOOM_TRIAD_DEV_ROOT` | Persistent developer Broker/Signer enrollment and state |
 | `BLOOM_TRIAD_DEVELOPER_ROOT` | Explicit same-UID developer enrollment root |
@@ -472,64 +465,11 @@ packages; do not patch Machine to preserve a retired Petal authority ABI.
 Machine environment variables must not contain wallet private keys, mnemonics,
 wallet passwords, passkey outputs, backend credentials, or Signer state.
 
-## Test ladder
+## Verification
 
-Platform-independent workspace gates:
-
-```sh
-cargo fmt --all -- --check
-cargo clippy --workspace --all-targets --locked -- -D warnings
-cargo test --workspace --locked
-```
-
-Useful focused suites:
-
-```sh
-cargo test -p bloom-proto
-cargo test -p bloom-machine-client
-cargo test -p bloom-vfs
-cargo test -p bloom-mount --features mount
-cargo test -p bloom-daemon
-cargo test -p bloom --test cli
-cargo test -p bloom-petals --test triad_authority_fixture
-scripts/test-local-mainnet-integration.sh
-```
-
-The full projection-fidelity acceptance starts the real triad, builds the
-Broker ceremony driver, installs the deterministic authority fixture, and uses
-a kernel mount. Run it only after focused suites pass and the mounted-launcher
-prerequisites are installed:
-
-```sh
-scripts/acceptance.sh
-```
-
-Production boundary checks:
-
-```sh
-packaging/triad/release/check-machine-authority-boundary.sh
-packaging/triad/release/test-machine-authority-boundary.sh
-```
-
-macOS packaging, service activation, peer-credential isolation, fixed ceremony
-port behavior, and root-installed acceptance belong in a local disposable Tart
-VM. Do not use CI as an interactive polling loop for those checks.
-
-## Change-to-test map
-
-| Changed area | Minimum local verification |
-|---|---|
-| Machine projections or Broker client | `cargo test -p bloom-machine-client` and affected CLI/VFS tests |
-| BIP39 import, migration, or account lifecycle | Owning Broker/Signer suites, then `scripts/acceptance.sh` |
-| VFS handlers or mount shape | `cargo test -p bloom-vfs`; add `bloom-mount --features mount` for adapter changes |
-| EVM staging/signature assembly | `cargo test -p bloom-tx` and affected `bloom-it` tests |
-| Solana RPC or genesis rules | `cargo test -p bloom-solana` |
-| Solana staging, signing, outbox, or reconciliation | `cargo test -p bloom-solana-tx` and `solana_workflow` |
-| Solana account selection | `solana_multi_account` against the local validator |
-| Petal host interfaces | `cargo test -p bloom-petals --test triad_authority_fixture` |
-| Triad protocol or transport | Relevant suites in all three repositories, then full launcher |
-| Machine authority boundary | Both release boundary scripts and production feature checks |
-| macOS packaging or isolation | Local Tart VM packaged acceptance |
+Use the [change-to-test map](./TESTING.md#change-to-test-map) and
+[validation gates](./TESTING.md#validation-gates). Packaging and installed
+acceptance require a frozen candidate with recorded service revisions.
 
 ## Debugging the triad
 

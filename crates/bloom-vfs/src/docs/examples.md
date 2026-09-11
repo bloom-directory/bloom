@@ -101,8 +101,11 @@ cat "$BLOOM/wallets/alice/chains/solana/outbox/pending/$ID/intent.json"
 cat "$BLOOM/wallets/alice/chains/solana/outbox/pending/$ID/plan.md"
 ```
 
-Verify that the staged intent names the chosen fingerprint. After confirmation,
-verify the same fingerprint and transaction signature in the receipt. Do not
+Verify that the staged intent names the chosen fingerprint, derivation path,
+and fee payer. After submission, read the same action under `sent/`: its
+`intent.json` retains the account identity. Match the signature in
+`broadcast_attempted.json` to `receipt.json` and check the receipt's outcome
+and confirmation status. The receipt contains no account fingerprint. Do not
 blindly retry an ambiguous broadcast.
 
 ## ERC-20 discovery

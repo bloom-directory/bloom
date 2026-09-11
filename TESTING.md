@@ -5,16 +5,44 @@ where each one lives, how to run it, and the relevant environment variables.
 The taxonomy is enforced informally via `//! Category: ...` header comments on
 integration test files.
 
-## Running everything
+## Validation gates
+
+Start with the affected package or named test. For a repository-wide code
+candidate, run:
 
 ```sh
-RUST_LOG=warn cargo test --workspace
-RUST_LOG=warn cargo test --workspace -- --ignored
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --locked -- -D warnings
+RUST_LOG=warn cargo test --workspace --locked
 ```
 
-CI runs workspace tests through the split jobs in `.github/workflows/ci.yml`.
-Ignored live-network and docker suites are run only by the CI lanes that opt in
-with `--run-ignored`.
+For documentation-only changes, check the diff and links. When editing embedded
+VFS Markdown, also run the existing documentation tests:
+
+```sh
+git diff --check
+cargo test -p bloom-vfs --locked root_agent_guidance
+cargo test -p bloom-vfs --locked handlers::docs::tests
+```
+
+CI runs workspace tests through the split jobs in
+[`ci.yml`](./.github/workflows/ci.yml). Ignored suites require their documented
+services and tools; run the relevant suite explicitly rather than enabling all
+ignored tests on an unprepared host.
+
+Production authority-boundary checks are:
+
+```sh
+packaging/triad/release/check-machine-authority-boundary.sh
+packaging/triad/release/test-machine-authority-boundary.sh
+```
+
+Use a disposable Tart VM for local macOS packaging and principal-isolation
+checks. For changes affecting the released service combination, follow the
+[release package verification](./packaging/triad/release/README.md) at the
+recorded compatibility revisions, including the Linux release build and both
+macOS conformance workflows with explicit Broker and Signer refs. Local checks
+do not replace required review or CI on the published candidate.
 
 ## Triad and Solana ladders
 
@@ -64,6 +92,23 @@ cargo test -p bloom-it --test solana_multi_account -- \
 
 `local_validator` reads `SOLANA_VALIDATOR_HTTP`; `solana_multi_account`
 intentionally targets `http://127.0.0.1:8899` directly.
+
+## Change-to-test map
+
+| Changed area | Minimum local verification |
+|---|---|
+| Machine projections or Broker client | `cargo test -p bloom-machine-client` and affected CLI/VFS tests |
+| BIP39 import, migration, or account lifecycle | Owning Broker/Signer suites, then `scripts/acceptance.sh` |
+| Embedded VFS documentation | Documentation tests above and link checks |
+| VFS handlers or mount shape | `cargo test -p bloom-vfs`; add `bloom-mount --features mount` for adapter changes |
+| EVM staging/signature assembly | `cargo test -p bloom-tx` and affected `bloom-it` tests |
+| Solana RPC or genesis rules | `cargo test -p bloom-solana` |
+| Solana staging, signing, outbox, or reconciliation | `cargo test -p bloom-solana-tx` and `solana_workflow` |
+| Solana account selection | `solana_multi_account` against the local validator |
+| Petal host interfaces | `cargo test -p bloom-petals --test triad_authority_fixture` |
+| Triad protocol or transport | Relevant suites in all three repositories, then full launcher |
+| Machine authority boundary | Both release boundary scripts and production feature checks |
+| macOS packaging or isolation | Local Tart VM packaged acceptance |
 
 ## Categories
 

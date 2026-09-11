@@ -34,7 +34,8 @@ Machine <-> Broker <-> Signer
   authorization.
 - Signer owns encrypted custody, derivation, replay protection, and signatures.
 
-Machine never holds mnemonics, private keys, PRF outputs, or signing authority.
+Machine never holds Bloom wallet mnemonics, wallet private keys, passkey PRF
+outputs, or wallet-signing authority.
 Never provide secret ceremony input through a VFS write, shell argument,
 environment variable, fixture, or log. A ceremony URL is safe to forward to the
 human who controls the passkey; ceremony input remains in the Broker-hosted
@@ -55,19 +56,25 @@ directory and inspect the resulting projection before retrying or continuing.
 
 ## What an error means
 
-The errors here mean what they mean on any filesystem, and it is worth acting on
-the difference rather than retrying everything.
+Use the error class to decide what to inspect. An error alone does not establish
+whether an earlier operation completed or whether retrying a write is safe.
 
-- **No such file or directory** — the path is not there. This is a fact, not a
-  failure: act on it. In particular, a transfer you discarded or confirmed
-  **leaves `pending/`**, so reading its old path afterwards is supposed to say
-  this. It means your write worked.
-- **Permission denied** — the operation needs an owner approval that has not
-  happened yet. Look for `approval_challenge.json` in the same action directory.
-- **Operation not permitted** — policy refused it. Read `policy_check.json`
-  beside the transfer for the rule and the reason.
-- **Input/output error** — something actually went wrong. This is the only one
-  worth retrying, and it should be rare.
+- **No such file or directory** — the path is absent in the requested state.
+  A discarded transfer or one that advanced out of `pending/` no longer has its
+  old pending path. Check the exact action's resulting state; absence alone
+  does not prove your write succeeded. Do not repeat an operation merely to
+  make the old path reappear.
+- **Permission denied** — access was denied. On a confirm operation this can
+  mean fresh owner approval is required; look for `approval_challenge.json` in
+  the same action directory. Read-only or unsupported write targets can also
+  deny access, so do not assume every denial starts a ceremony.
+- **Operation not permitted** — policy or a broadcast gate refused the
+  operation. Inspect `policy_check.json` where exposed and the chain's broadcast
+  configuration and status. Repeating the write does not remove the gate.
+- **Input/output error** — a backend or I/O operation failed. Inspect action
+  state and diagnostics before considering a retry. For a possibly submitted
+  transaction, reconcile by its recorded hash or signature; never blindly
+  restage or rebroadcast.
 
 If you write to a control file and then cannot find what you wrote, check
 whether the transfer moved to `sent/` or `failed/` before assuming the write
@@ -167,10 +174,15 @@ blindly repeat staging after an ambiguous result.
 inspected policy projection explicitly permits that control and the human has
 explicitly accepted the displayed warning.
 
-For Solana, verify the selected Ed25519 account fingerprint in the staged
-intent, signing request, and receipt. Broadcast also requires the configured
-genesis pin to agree with every live endpoint. An ambiguous send reconciles by
-signature; do not request a blind retry or endpoint failover.
+For Solana, verify `account_fingerprint`, `account_derivation_path`, and
+`fee_payer` in the staged `intent.json` against the selected account projection.
+After submission, follow that exact action into `sent/`; its `intent.json`
+retains the account identity. Match the signature in `broadcast_attempted.json`
+to `receipt.json` and inspect the receipt's outcome and confirmation status.
+The receipt does not contain an account fingerprint, and private signing
+sidecars are not exposed through the mount. Broadcast also requires the
+configured genesis pin to agree with every live endpoint. An ambiguous send
+reconciles by signature; do not request a blind retry or endpoint failover.
 
 ## Sealed Approvals
 
