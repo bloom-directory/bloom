@@ -2528,12 +2528,18 @@ async fn daemon_petal_chain_read(
 ///
 /// The Broker's own error contract already carries the distinction, so use it
 /// rather than a local list of codes: a failure that can never be retried and
-/// left no durable effect is a decision, and everything else is not.
+/// left no durable effect — or only released the budget reservation it took,
+/// as the `LIMIT_EXCEEDED_*` refusals do — is a decision, and everything else
+/// is not.
 fn petal_signing_host_error(error: &bloom_broker_api::ProtocolError) -> HostError {
     let contract = error.code.contract();
     let message = format!("{}: {}", error.code.as_str(), error.message);
     if contract.retry == bloom_broker_api::RetryClass::Never
-        && contract.durable_effect == bloom_broker_api::DurableEffect::None
+        && matches!(
+            contract.durable_effect,
+            bloom_broker_api::DurableEffect::None
+                | bloom_broker_api::DurableEffect::ReservationReleased
+        )
     {
         HostError::Denied(message)
     } else {
@@ -4863,6 +4869,13 @@ mod tests {
             ProtocolErrorCode::SelectorMismatch,
             ProtocolErrorCode::KeyrefMismatch,
             ProtocolErrorCode::ProvenanceMismatch,
+            // A budget refused this message before anything was signed; the
+            // reservation it took was released.
+            ProtocolErrorCode::LimitExceededOperations,
+            ProtocolErrorCode::LimitExceededSignatures,
+            ProtocolErrorCode::LimitExceededValue,
+            ProtocolErrorCode::LimitExceededRate,
+            ProtocolErrorCode::SignerRateBackstopDenied,
         ];
         for code in denied {
             let error = petal_signing_host_error(&ProtocolError::new(code, "refused"));
@@ -4884,7 +4897,6 @@ mod tests {
             ProtocolErrorCode::ClockUntrusted,
             ProtocolErrorCode::PolicyBaselineStale,
             ProtocolErrorCode::RevocationEpochUnreconciled,
-            ProtocolErrorCode::LimitExceededValue,
         ];
         for code in uncertain {
             let error = petal_signing_host_error(&ProtocolError::new(code, "not a decision"));
@@ -5961,6 +5973,24 @@ mod tests {
                 .approval_prepares
                 .load(std::sync::atomic::Ordering::SeqCst),
             2
+        );
+
+        // Only an empty stored address may be repaired from the Broker. A
+        // different non-empty one is a changed funding address, not metadata.
+        let mut changed_owner_status = restaged_owner_status.clone();
+        changed_owner_status["public_key"]["addresses"] =
+            serde_json::json!(["11111111111111111111111111111112"]);
+        std::fs::write(
+            &state_path,
+            serde_json::to_vec(&changed_owner_status).unwrap(),
+        )
+        .unwrap();
+        let changed_error = host.petal_key_request(request.clone()).await.unwrap_err();
+        assert!(
+            changed_error
+                .to_string()
+                .contains("conflicts with Broker metadata"),
+            "{changed_error}"
         );
 
         let mut legacy_owner_status = restaged_owner_status;

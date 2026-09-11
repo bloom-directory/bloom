@@ -42,6 +42,7 @@ struct BrokerFixture {
     /// then waits for a permit, holding the signature in flight.
     sign_gate: Mutex<Option<Arc<tokio::sync::Semaphore>>>,
     sign_reached: tokio::sync::Notify,
+    sign_calls: Mutex<u32>,
 }
 
 impl BrokerFixture {
@@ -65,6 +66,7 @@ impl BrokerFixture {
             next_sign_error: Mutex::new(None),
             sign_gate: Mutex::new(None),
             sign_reached: tokio::sync::Notify::new(),
+            sign_calls: Mutex::new(0),
         }
     }
     fn child_pubkey(&self) -> [u8; 32] {
@@ -145,6 +147,7 @@ impl MachineBrokerService for BrokerFixture {
                     }))
                 }
                 MachineBrokerRequest::SigningSign(sign_request) => {
+                    *self.sign_calls.lock().unwrap() += 1;
                     if let Some((code, message)) = self.next_sign_error.lock().unwrap().take() {
                         return Err(ProtocolError::new(code, message));
                     }
@@ -1088,7 +1091,7 @@ async fn signing_and_broadcast_both_refuse_an_expired_blockhash() {
         .await
         .unwrap_err();
     assert!(broadcast_error.to_string().contains("restage the transfer"));
-    outbox
+    let expired = outbox
         .read_in_state(
             "wallet",
             "solana-devnet",
@@ -1096,13 +1099,98 @@ async fn signing_and_broadcast_both_refuse_an_expired_blockhash() {
             SolanaOutboxState::Pending,
         )
         .expect("expired signed transfer remains pending for explicit restaging");
+    assert!(!requests.lock().unwrap().iter().any(|r| matches!(
+        r["method"].as_str(),
+        Some("simulateTransaction" | "sendTransaction")
+    )));
     assert!(
-        !requests
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|r| { r["method"] == "sendTransaction" })
+        !expired
+            .dir
+            .join(bloom_solana_tx::outbox::BROADCAST_ATTEMPT_FILE)
+            .exists(),
+        "a refused broadcast must not look like one that may have been sent"
     );
+
+    // The last valid height itself is still inside the window.
+    height.store(
+        signed.last_valid_block_height,
+        std::sync::atomic::Ordering::SeqCst,
+    );
+    engine
+        .broadcast("wallet", &signed.id, 1_400)
+        .await
+        .expect("the blockhash is valid through its last valid height");
+}
+
+/// An approval now lives for an hour, far longer than a blockhash. A live
+/// approval must still not sign a message whose blockhash has passed: the
+/// refusal comes before the Broker is asked, and leaves the approval intact
+/// for the restage that follows.
+#[tokio::test]
+async fn a_live_approval_cannot_sign_past_the_blockhash_height() {
+    let (height, _dir, outbox, broker, engine) = restage_fixture().await;
+    let (staged, approval) = stage_awaiting_approval(&engine, &outbox, &broker).await;
+    let fee_payer = broker.child_pubkey();
+    let attempt_before = outbox
+        .approval_attempt(&pending(&outbox, &staged.id))
+        .unwrap()
+        .unwrap();
+
+    height.store(
+        staged.last_valid_block_height + 1,
+        std::sync::atomic::Ordering::SeqCst,
+    );
+    // Half an hour after approval: well inside its window.
+    let error = engine
+        .sign(
+            "wallet",
+            &staged.id,
+            &fee_payer,
+            None,
+            Some(approval.clone()),
+            1_800_100,
+        )
+        .await
+        .expect_err("a passed blockhash cannot be signed");
+    assert!(
+        error.to_string().contains("restage the transfer"),
+        "{error}"
+    );
+    assert_eq!(*broker.sign_calls.lock().unwrap(), 0);
+    let entry = pending(&outbox, &staged.id);
+    assert!(outbox.recorded_signature(&entry).unwrap().is_none());
+    let attempt = outbox.approval_attempt(&entry).unwrap().unwrap();
+    assert_eq!(
+        (attempt.attempt, attempt.issued_at_ms, attempt.expires_at_ms),
+        (
+            attempt_before.attempt,
+            attempt_before.issued_at_ms,
+            attempt_before.expires_at_ms
+        ),
+        "the refusal must not touch the approval"
+    );
+    assert_eq!(challenge_of(&entry)["approval_id"], approval.as_str());
+
+    height.store(
+        staged.last_valid_block_height,
+        std::sync::atomic::Ordering::SeqCst,
+    );
+    let signed = engine
+        .sign(
+            "wallet",
+            &staged.id,
+            &fee_payer,
+            None,
+            Some(approval),
+            1_800_200,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        signed,
+        bloom_solana_tx::signing::SolanaSignOutcome::Signed { .. }
+    ));
+    assert_eq!(*broker.sign_calls.lock().unwrap(), 1);
 }
 
 #[tokio::test]
@@ -1841,6 +1929,18 @@ async fn confirming_the_same_transfer_twice_reaches_the_same_ceremony() {
 /// every later confirm replayed an id the Broker would never accept again.
 #[tokio::test]
 async fn a_definitely_dead_approval_is_retired_and_the_next_confirm_starts_over() {
+    a_dead_approval_is_retired(ProtocolErrorCode::ApprovalExpired).await;
+}
+
+/// A budget refusal is as final as an expired approval: the Broker released
+/// the reservation before anything was signed, and the approval can never
+/// sign this intent. Keeping it replays the refusal on every confirm.
+#[tokio::test]
+async fn a_budget_refusal_retires_the_approval_and_the_next_confirm_starts_over() {
+    a_dead_approval_is_retired(ProtocolErrorCode::LimitExceededSignatures).await;
+}
+
+async fn a_dead_approval_is_retired(code: ProtocolErrorCode) {
     let (_dir, outbox, broker, engine) = retry_fixture().await;
     let staged = stage_for_retry(&engine, &broker).await;
     let fee_payer = broker.child_pubkey();
@@ -1856,10 +1956,7 @@ async fn a_definitely_dead_approval_is_retired_and_the_next_confirm_starts_over(
         .write_approval_challenge(&entry, br#"{"approval_id":"stale"}"#)
         .unwrap();
 
-    broker.fail_next_signature(
-        ProtocolErrorCode::ApprovalExpired,
-        "sealed approval is past its expiry",
-    );
+    broker.fail_next_signature(code, "refused");
     let error = engine
         .sign(
             "wallet",
@@ -1870,8 +1967,8 @@ async fn a_definitely_dead_approval_is_retired_and_the_next_confirm_starts_over(
             1_200,
         )
         .await
-        .expect_err("an expired approval cannot sign");
-    assert!(error.to_string().contains("APPROVAL_EXPIRED"), "{error}");
+        .expect_err("a dead approval cannot sign");
+    assert!(error.to_string().contains(code.as_str()), "{error}");
 
     let entry = pending(&outbox, &staged.id);
     assert_eq!(
