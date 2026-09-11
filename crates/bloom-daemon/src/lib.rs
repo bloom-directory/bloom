@@ -60,7 +60,7 @@ use bloom_vfs::handlers::{
     AddressBookHandler, CentralOutbox, ChainsHandler, DocsHandler, EnsHandler, OutboxHandler,
     PETAL_SIGNING_STATE_SCHEMA, PetalKeyRequestsHandler, PetalSigningRequestProjection,
     PetalSigningRequestsHandler, PricesHandler, RequestsHandler, SimulateHandler, StatusHandler,
-    ToolsHandler, WalletsHandler, WatchHandler,
+    ToolsHandler, ViewsHandler, WalletsHandler, WatchHandler,
 };
 use bloom_vfs::{
     BrokerExactPayloadSigner, FileOperationIndex, OperationIndex, PathCache, Vfs, VfsPath,
@@ -3701,6 +3701,16 @@ impl Daemon {
             )
             .mount("ens", Arc::new(EnsHandler::new(ens_client.clone())) as _)
             .mount("prices", Arc::new(PricesHandler::new(prices)) as _)
+            // views/ — read-only HTML pages a person opens in a browser from
+            // the mount. Observation only: it holds the public wallet
+            // projection and the chain registry, and no write surface.
+            .mount(
+                "views",
+                Arc::new(ViewsHandler::new(
+                    wallet_projections.clone(),
+                    chains.clone(),
+                )) as _,
+            )
             .mount(
                 "outbox",
                 Arc::new(OutboxHandler::new(CentralOutbox::new(
@@ -5219,6 +5229,7 @@ mod tests {
         assert!(d.vfs.handler("addressbook").is_some());
         assert!(d.vfs.handler("ens").is_some());
         assert!(d.vfs.handler("petals").is_some());
+        assert!(d.vfs.handler("views").is_some());
         assert!(
             d.vfs.handler("hyperliquid").is_none(),
             "native Hyperliquid must not be mounted; use petals/hyperliquid"
