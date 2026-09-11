@@ -1287,7 +1287,7 @@ impl PetalHost for DaemonPetalHost {
                     petal_key_scope: Some(scope.clone()),
                     legacy_passkey_migration: None,
                     wallet_seed_profile: None,
-                    derivation_request: None,
+                    derivation_requests: Vec::new(),
                     account_terms: None,
                 },
             )
