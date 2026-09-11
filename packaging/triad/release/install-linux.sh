@@ -597,6 +597,148 @@ switch_linux_release() {
   mv -fT "$replacement" "$release_base/current"
 }
 
+# Every Bloom-owned unit template the installer overwrites or removes while
+# installing a release. An upgrade transaction snapshots exactly these paths
+# so a rollback restores the previous binary selection together with the unit
+# contract it ran with. Administrator units and drop-ins outside this list are
+# never touched by restoration.
+linux_upgrade_unit_paths() {
+  printf '%s\n' \
+    usr/lib/systemd/system/bloom-broker-ceremony@.socket \
+    usr/lib/systemd/system/bloom-broker-ceremony-ipv6@.socket \
+    usr/lib/systemd/system/bloom-broker@.service \
+    usr/lib/systemd/system/bloom-signer@.service \
+    usr/lib/systemd/system/bloom-session@.path \
+    usr/lib/systemd/system/bloom-signer-rpc@.socket \
+    usr/lib/systemd/system/bloom-signer-control@.socket \
+    usr/lib/systemd/system/bloom-broker-rpc@.socket \
+    usr/lib/systemd/system/bloom-broker-control@.socket \
+    usr/lib/systemd/user/bloom-session.service \
+    usr/lib/systemd/user/bloom-machine.service
+}
+
+linux_upgrade_unit_is_tracked() {
+  local candidate="$1" tracked
+  while IFS= read -r tracked; do
+    [[ "$tracked" == "$candidate" ]] && return 0
+  done < <(linux_upgrade_unit_paths)
+  return 1
+}
+
+# Records the actually installed unit contract — explicit absence included —
+# into the upgrade transaction scratch directory. Fails without mutating the
+# installation when a tracked unit is missing, substituted, or unreadable.
+# Every write is checked explicitly: when this function runs inside a
+# rollback step, errexit is suspended for the whole call tree, so a skipped
+# operation would otherwise be reported as a successful snapshot.
+snapshot_linux_upgrade_units() {
+  local install_root="$1" scratch="$2"
+  local relative path mode
+
+  mkdir -m 0700 "$scratch/units" "$scratch/units/files" || return 65
+  : > "$scratch/units/manifest" || return 65
+  while IFS= read -r relative; do
+    path="$install_root/$relative"
+    if [[ ! -e "$path" && ! -L "$path" ]]; then
+      printf 'absent - %s\n' "$relative" >> "$scratch/units/manifest" || return 65
+      continue
+    fi
+    [[ -f "$path" && ! -L "$path" ]] || {
+      echo "installed Linux unit is not a regular file: /$relative" >&2
+      return 65
+    }
+    mode="$(numeric_file_mode "$path")"
+    [[ "$mode" =~ ^[0-7]{3,4}$ ]] || {
+      echo "installed Linux unit has an unusable mode: /$relative" >&2
+      return 65
+    }
+    mkdir -p "$scratch/units/files/$(dirname "$relative")" || return 65
+    cp -- "$path" "$scratch/units/files/$relative" || return 65
+    printf 'present %s %s\n' "$mode" "$relative" >> "$scratch/units/manifest" || return 65
+  done < <(linux_upgrade_unit_paths)
+}
+
+# Restores the snapshotted unit contract: previously present files return
+# with their recorded bytes and modes, and files that did not exist before
+# the upgrade — such as a newly introduced ceremony socket template — are
+# removed. Every manifest entry is validated against the fixed tracked set
+# before any file is touched, and restoration never interprets a stored path
+# outside that set. The operation is idempotent, so an interrupted recovery
+# can simply run it again.
+restore_linux_upgrade_units() {
+  local install_root="$1" transaction="$2"
+  local manifest="$transaction/units/manifest"
+  local files_root="$transaction/units/files"
+  local state mode relative covered="" tracked index
+  local -a states=() modes=() relatives=()
+
+  [[ -f "$manifest" && ! -L "$manifest" && \
+    -d "$files_root" && ! -L "$files_root" ]] || {
+    echo "Linux upgrade unit snapshot is missing or unsafe" >&2
+    return 65
+  }
+  while read -r state mode relative; do
+    [[ "$state" == present || "$state" == absent ]] || {
+      echo "Linux upgrade unit snapshot entry is malformed" >&2
+      return 65
+    }
+    linux_upgrade_unit_is_tracked "$relative" || {
+      echo "Linux upgrade unit snapshot names an untracked path" >&2
+      return 65
+    }
+    [[ " $covered " == *" $relative "* ]] && {
+      echo "Linux upgrade unit snapshot has a duplicate entry" >&2
+      return 65
+    }
+    if [[ "$state" == present ]]; then
+      [[ "$mode" =~ ^[0-7]{3,4}$ && \
+        -f "$files_root/$relative" && ! -L "$files_root/$relative" ]] || {
+        echo "Linux upgrade unit snapshot content is missing or unsafe" >&2
+        return 65
+      }
+    fi
+    covered="$covered $relative"
+    states+=("$state")
+    modes+=("$mode")
+    relatives+=("$relative")
+  done < "$manifest"
+  while IFS= read -r tracked; do
+    [[ " $covered " == *" $tracked "* ]] || {
+      echo "Linux upgrade unit snapshot does not cover the tracked unit set" >&2
+      return 65
+    }
+  done < <(linux_upgrade_unit_paths)
+
+  # Activation audit: the only persisted enablement this design creates is
+  # bloom-session@<uid>.path, which start_linux_release_set re-enables. The
+  # ceremony and retired RPC sockets are demand-started through the session
+  # path or Sockets= dependencies, so restoring the templates restores the
+  # activation contract without enabling sockets across logins.
+  # Like the snapshot, every mutation is checked explicitly because errexit
+  # is suspended while this runs inside a rollback step; a failed write must
+  # surface instead of leaving a half-restored installation behind.
+  for index in "${!relatives[@]}"; do
+    relative="${relatives[$index]}"
+    if [[ "${states[$index]}" == present ]]; then
+      mkdir -p "$install_root/$(dirname "$relative")" || {
+        echo "Linux upgrade unit restoration failed: /$relative" >&2
+        return 65
+      }
+      atomic_install \
+        "$files_root/$relative" \
+        "$install_root/$relative" \
+        "${modes[$index]}" || {
+        echo "Linux upgrade unit restoration failed: /$relative" >&2
+        return 65
+      }
+    else
+      rm -f -- "$install_root/$relative" || {
+        echo "Linux upgrade unit restoration failed: /$relative" >&2
+        return 65
+      }
+    fi
+  done
+}
 stop_linux_release_set() {
   local install_root="$1" record uid user user_runtime
   [[ "$install_root" == "/" ]] || return 0
@@ -734,10 +876,16 @@ begin_linux_upgrade() {
   }
   upgrade_transaction_scratch="${upgrade_transaction}.new.$$"
   mkdir -m 0700 "$upgrade_transaction_scratch"
-  printf '%s\n' bloom.linux-upgrade-transaction.1 > "$upgrade_transaction_scratch/schema"
+  printf '%s\n' bloom.linux-upgrade-transaction.2 > "$upgrade_transaction_scratch/schema"
   printf '%s\n' "$old_digest" > "$upgrade_transaction_scratch/old-digest"
   printf '%s\n' "$new_digest" > "$upgrade_transaction_scratch/new-digest"
-  chmod 0600 "$upgrade_transaction_scratch"/*
+  if ! snapshot_linux_upgrade_units "$install_root" "$upgrade_transaction_scratch"; then
+    rm -rf -- "$upgrade_transaction_scratch"
+    upgrade_transaction_scratch=""
+    echo "Linux upgrade cannot snapshot the installed unit contract" >&2
+    return 65
+  fi
+  chmod -R u+rwX,go-rwx "$upgrade_transaction_scratch"
   sync
   mv -T "$upgrade_transaction_scratch" "$upgrade_transaction"
   upgrade_transaction_scratch=""
@@ -747,16 +895,39 @@ begin_linux_upgrade() {
   upgrade_rollback_required=true
 }
 
+# Runs one rollback step without letting set -e abort the rollback, and
+# keeps the failing exit status for the caller.
+rollback_step() {
+  local label="$1"
+  shift
+  local step_status=0
+  "$@" || step_status=$?
+  if ((step_status != 0)); then
+    echo "Bloom Linux upgrade rollback could not $label" >&2
+  fi
+  return "$step_status"
+}
+
 rollback_linux_upgrade() {
   local rollback_status=0
   [[ -n "$upgrade_root" && -n "$upgrade_old_digest" ]] || return 0
-  stop_linux_release_set "$upgrade_root" || rollback_status=$?
-  switch_linux_release "$upgrade_root" "$upgrade_old_digest" || rollback_status=$?
-  rewrite_linux_release_set "$upgrade_root" "$upgrade_old_digest" active || rollback_status=$?
-  start_linux_release_set "$upgrade_root" || rollback_status=$?
+  # Never start services over a partially restored installation: the restart
+  # below only runs when stop, unit restoration, binary selection, and
+  # release metadata are all restored coherently.
+  if rollback_step "stop the release set" stop_linux_release_set "$upgrade_root" &&
+    rollback_step "restore installed units" restore_linux_upgrade_units "$upgrade_root" "$upgrade_transaction" &&
+    rollback_step "select the previous release" switch_linux_release "$upgrade_root" "$upgrade_old_digest" &&
+    rollback_step "restore release metadata" rewrite_linux_release_set "$upgrade_root" "$upgrade_old_digest" active
+  then
+    start_linux_release_set "$upgrade_root" || rollback_status=$?
+  else
+    rollback_status=$?
+  fi
   if ((rollback_status == 0)); then
     rm -rf -- "$upgrade_transaction"
     upgrade_rollback_required=false
+  else
+    echo "Bloom Linux upgrade rollback failed; transaction preserved for retry" >&2
   fi
   return "$rollback_status"
 }
@@ -769,8 +940,14 @@ finish_linux_upgrade() {
   upgrade_old_digest=""
 }
 
+# New-format interrupted transactions always recover through one path:
+# restore the coherent previous installation first, then let the verified
+# installation that triggered recovery retry the requested release through
+# the normal upgrade steps. Starting the interrupted candidate directly is
+# unsafe because the interruption may have happened before or between unit
+# writes, and it must never be restarted over mixed old and new units.
 recover_interrupted_linux_upgrade() {
-  local install_root="$1" requested_digest="$2"
+  local install_root="$1"
   local transaction="$install_root/var/lib/bloom/upgrade-transaction"
   local schema old_digest new_digest
 
@@ -779,10 +956,24 @@ recover_interrupted_linux_upgrade() {
     echo "invalid interrupted Linux upgrade" >&2
     return 65
   }
+  [[ -f "$transaction/schema" && ! -L "$transaction/schema" && \
+    -f "$transaction/old-digest" && ! -L "$transaction/old-digest" && \
+    -f "$transaction/new-digest" && ! -L "$transaction/new-digest" ]] || {
+    echo "invalid interrupted Linux upgrade" >&2
+    return 65
+  }
   schema="$(<"$transaction/schema")"
   old_digest="$(<"$transaction/old-digest")"
   new_digest="$(<"$transaction/new-digest")"
-  [[ "$schema" == bloom.linux-upgrade-transaction.1 && \
+  if [[ "$schema" == bloom.linux-upgrade-transaction.1 ]]; then
+    # A transaction from an earlier installer carries no unit snapshot, so a
+    # coherent old-layout rollback cannot be reconstructed. Preserve it and
+    # fail explicitly; the supported recovery is documented in the release
+    # README next to this installer.
+    echo "interrupted Linux upgrade predates unit snapshots; remove $transaction and reinstall a verified release payload to recover" >&2
+    return 65
+  fi
+  [[ "$schema" == bloom.linux-upgrade-transaction.2 && \
     "$old_digest" =~ ^[0-9a-f]{64}$ && \
     "$new_digest" =~ ^[0-9a-f]{64}$ ]] || {
     echo "invalid interrupted Linux upgrade" >&2
@@ -793,16 +984,11 @@ recover_interrupted_linux_upgrade() {
   upgrade_root="$install_root"
   upgrade_old_digest="$old_digest"
   upgrade_rollback_required=true
-  if [[ "$new_digest" == "$requested_digest" ]]; then
-    echo "completing interrupted Bloom Linux upgrade" >&2
-    switch_linux_release "$install_root" "$new_digest"
-    rewrite_linux_release_set "$install_root" "$new_digest" active
-    start_linux_release_set "$install_root"
-    finish_linux_upgrade
-  else
-    echo "rolling back interrupted Bloom Linux upgrade" >&2
-    rollback_linux_upgrade
+  echo "restoring the interrupted Bloom Linux release before retrying" >&2
+  if ! rollback_linux_upgrade; then
+    return 65
   fi
+  finish_linux_upgrade
 }
 
 allocate_linux_nfs_port() {
@@ -1073,7 +1259,7 @@ case "$action" in
       echo "signed payload release digest is invalid" >&2
       exit 65
     }
-    recover_interrupted_linux_upgrade "$root" "$release_digest"
+    recover_interrupted_linux_upgrade "$root"
     migrate_legacy_linux_records "$root"
     validate_linux_release_set "$root"
     shared_release_digest="$validated_release_digest"

@@ -153,6 +153,23 @@ committing. Active enrollments require available user session buses. Failed
 activation and interrupted transactions restore the previous release. Custody,
 identity material, and allocated NFS ports are preserved.
 
+Before any unit is mutated, the transaction (`schema
+bloom.linux-upgrade-transaction.2`) snapshots the installed Bloom-owned unit
+templates — both ceremony sockets, the Broker and Signer service templates, the
+session path, the two user service units, and the retired RPC/control socket
+templates — recording explicit absence alongside bytes and modes. A rollback
+stops the release set, restores that unit contract, reselects the previous
+release, and rewrites release metadata before any restart; a failure at any of
+those steps preserves the transaction instead of starting a Broker over
+mismatched units. Recovery after an interruption always restores the coherent
+previous installation first and then lets the verified installer retry the
+requested release; it never completes the interrupted candidate in place. A
+transaction recorded by an earlier installer (`schema
+bloom.linux-upgrade-transaction.1`) carries no unit snapshot, so the installer
+refuses to recover it automatically: remove `/var/lib/bloom/upgrade-transaction`
+and reinstall a verified release payload, which rewrites every Bloom-owned unit
+coherently before starting anything.
+
 Linux installs provide `bloom-uninstall`. Its default `--retain-custody` mode
 stops and disables the selected enrollment, removes runtime integration, and
 preserves its private configuration and Signer state for reinstall. Permanent

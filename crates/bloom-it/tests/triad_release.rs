@@ -2661,9 +2661,920 @@ fn installer_upgrade_transactions_preserve_recovery_state_atomically() {
         linux.find("preflight_linux_release_set \"$root\"").unwrap()
             < linux.find("install_linux_release \"$root\"").unwrap()
     );
+    assert!(linux.contains("bloom.linux-upgrade-transaction.2"));
+    assert!(linux.contains(
+        "snapshot_linux_upgrade_units \"$install_root\" \"$upgrade_transaction_scratch\""
+    ));
+    assert!(
+        linux
+            .find("snapshot_linux_upgrade_units \"$install_root\"")
+            .unwrap()
+            < linux
+                .find("\"$payload/installer/linux/systemd/bloom-broker-ceremony@.socket\"")
+                .unwrap()
+    );
+    let rollback = &linux[linux.find("rollback_linux_upgrade() {").unwrap()
+        ..linux.find("finish_linux_upgrade() {").unwrap()];
+    assert!(
+        rollback
+            .find("restore_linux_upgrade_units \"$upgrade_root\" \"$upgrade_transaction\"")
+            .unwrap()
+            < rollback
+                .find("start_linux_release_set \"$upgrade_root\"")
+                .unwrap(),
+        "rollback must restore the installed unit contract before any restart"
+    );
+    assert!(!linux.contains("completing interrupted"));
 
     let daemon = fs::read_to_string(workspace().join("crates/bloom-daemon/src/lib.rs")).unwrap();
     assert!(daemon.contains(".require_outbox_petal_eligibility(&request.wallet, chain_name, id)"));
+}
+
+struct LinuxTrackedUnit {
+    relative: &'static str,
+    bytes: Vec<u8>,
+    mode: u32,
+}
+
+fn set_linux_mode(path: &Path, mode: u32) {
+    let mut permissions = fs::metadata(path).unwrap().permissions();
+    permissions.set_mode(mode);
+    fs::set_permissions(path, permissions).unwrap();
+}
+
+/// Rewrites an installed tree into the real pre-IPv6 unit layout: the one
+/// ceremony socket publishes the bare `broker-ceremony` descriptor, the
+/// Broker consumes a single socket, the IPv6 unit does not exist, and the
+/// retired RPC/control socket templates are still installed. One unit gets a
+/// non-default mode so restoration can be held to exact bytes and modes.
+fn apply_pre_ipv6_linux_layout(root: &Path) -> Vec<LinuxTrackedUnit> {
+    fn unit(relative: &'static str, contents: &str, mode: u32) -> LinuxTrackedUnit {
+        LinuxTrackedUnit {
+            relative,
+            bytes: contents.as_bytes().to_vec(),
+            mode,
+        }
+    }
+    let layout = vec![
+        unit(
+            "usr/lib/systemd/system/bloom-broker-ceremony@.socket",
+            concat!(
+                "[Unit]\nDescription=old IPv4 ceremony\n\n",
+                "[Socket]\nListenStream=127.0.0.1:18734\n",
+                "FileDescriptorName=broker-ceremony\nService=bloom-broker@%i.service\n",
+            ),
+            0o644,
+        ),
+        unit(
+            "usr/lib/systemd/system/bloom-broker@.service",
+            concat!(
+                "[Unit]\nDescription=old broker\n\n",
+                "[Service]\nExecStart=/usr/libexec/bloom/current/bloom-broker\n",
+                "Sockets=bloom-broker-ceremony@%i.socket\n",
+            ),
+            0o640,
+        ),
+        unit(
+            "usr/lib/systemd/system/bloom-signer@.service",
+            "[Unit]\nDescription=old signer\n",
+            0o600,
+        ),
+        unit(
+            "usr/lib/systemd/system/bloom-session@.path",
+            "[Unit]\nDescription=old session path\n",
+            0o644,
+        ),
+        unit(
+            "usr/lib/systemd/system/bloom-signer-rpc@.socket",
+            "[Socket]\nListenStream=/run/bloom/%i/signer/rpc/signer.sock\n",
+            0o644,
+        ),
+        unit(
+            "usr/lib/systemd/system/bloom-signer-control@.socket",
+            "[Socket]\nListenStream=/run/bloom/%i/signer/control/signer-control.sock\n",
+            0o644,
+        ),
+        unit(
+            "usr/lib/systemd/system/bloom-broker-rpc@.socket",
+            "[Socket]\nListenStream=/run/bloom/%i/broker/rpc/broker.sock\n",
+            0o644,
+        ),
+        unit(
+            "usr/lib/systemd/system/bloom-broker-control@.socket",
+            "[Socket]\nListenStream=/run/bloom/%i/broker/control/broker-control.sock\n",
+            0o644,
+        ),
+        unit(
+            "usr/lib/systemd/user/bloom-session.service",
+            "[Unit]\nDescription=old session sentinel\n",
+            0o644,
+        ),
+        unit(
+            "usr/lib/systemd/user/bloom-machine.service",
+            "[Unit]\nDescription=old machine\n",
+            0o644,
+        ),
+    ];
+    let ipv6 = root.join("usr/lib/systemd/system/bloom-broker-ceremony-ipv6@.socket");
+    if fs::symlink_metadata(&ipv6).is_ok() {
+        fs::remove_file(&ipv6).unwrap();
+    }
+    for tracked in &layout {
+        let path = root.join(tracked.relative);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, &tracked.bytes).unwrap();
+        set_linux_mode(&path, tracked.mode);
+    }
+    fs::write(
+        root.join("usr/lib/systemd/system/unrelated-admin.service"),
+        b"[Unit]\nDescription=administrator-owned\n",
+    )
+    .unwrap();
+    layout
+}
+
+fn assert_pre_ipv6_linux_contract(root: &Path, layout: &[LinuxTrackedUnit]) {
+    for tracked in layout {
+        let path = root.join(tracked.relative);
+        assert!(path.is_file(), "{} is missing", tracked.relative);
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            tracked.bytes,
+            "{} was not restored byte for byte",
+            tracked.relative
+        );
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            tracked.mode,
+            "{} was not restored with its recorded mode",
+            tracked.relative
+        );
+    }
+    assert!(
+        !root
+            .join("usr/lib/systemd/system/bloom-broker-ceremony-ipv6@.socket")
+            .exists(),
+        "the IPv6 ceremony socket that never existed in the old installation must be removed"
+    );
+    assert_eq!(
+        fs::read(root.join("usr/lib/systemd/system/unrelated-admin.service")).unwrap(),
+        b"[Unit]\nDescription=administrator-owned\n",
+        "restoration must not touch administrator units"
+    );
+}
+
+fn run_linux_installer(root: &Path, args: &[&str]) -> std::process::Output {
+    let mut command = Command::new(release_script("install-linux.sh"));
+    command.arg(args[0]).arg(root).args(&args[1..]);
+    if args[0] == "install" {
+        command.env("BLOOM_ALLOW_TEST_UNCLAIMED", "true");
+    }
+    command.output().unwrap()
+}
+
+fn make_linux_candidate_payload(
+    directory: &Path,
+    name: &str,
+    broker_binary: &[u8],
+    manifest: &[u8],
+) -> (PathBuf, String) {
+    let payload = make_installer_payload(&directory.join(name));
+    fs::write(payload.join("bin/bloom-broker"), broker_binary).unwrap();
+    fs::write(payload.join("SHA256SUMS"), manifest).unwrap();
+    let digest = hex::encode(Sha256::digest(manifest));
+    (payload, digest)
+}
+
+/// A bash harness that evaluates the real installer functions (everything
+/// the script defines before its `case` dispatch) and replaces only the
+/// systemctl-integrating helpers with logging stubs. `interrupt` runs
+/// `begin_linux_upgrade` and then performs the candidate unit writes up to
+/// the requested boundary — `none`, `sockets`, `services`, or `all` — and
+/// exits without the EXIT-trap rollback, simulating an interrupted process.
+/// `recover` runs `recover_interrupted_linux_upgrade` on the preserved
+/// transaction. The start stub fingerprints the units it observes, so a
+/// startup attempt over mixed state is detectable in the log.
+fn write_linux_upgrade_harness(directory: &Path) -> PathBuf {
+    let script = directory.join("linux-upgrade-harness.sh");
+    fs::write(
+        &script,
+        r##"#!/usr/bin/env bash
+set -euo pipefail
+installer="$1"; root="$2"; mode="$3"; log="$4"
+stage="${5:-}"; old_digest="${6:-}"; new_digest="${7:-}"
+# The evaluated installer prefix shifts the positional parameters, so every
+# argument is captured before it is loaded.
+eval "$(sed -n '1,/^case "$action" in$/p' "$installer" | sed '$d')"
+# The harness asserts recovery itself; it must not re-run it from the trap.
+cleanup_scratch() { status=$?; trap - EXIT; exit "$status"; }
+stop_linux_release_set() { echo "stop" >> "$log"; }
+rewrite_linux_release_set() { echo "rewrite $2 $3" >> "$log"; }
+preflight_linux_release_set() { :; }
+start_linux_release_set() {
+  if [[ -e "$root/var/lib/bloom/start-fails" ]]; then
+    echo "start refused" >> "$log"
+    return 1
+  fi
+  printf 'start current=%s v4=%s broker=%s v6=%s\n' \
+    "$(readlink "$1/usr/libexec/bloom/current")" \
+    "$(sha256sum "$1/usr/lib/systemd/system/bloom-broker-ceremony@.socket" | cut -d' ' -f1)" \
+    "$(sha256sum "$1/usr/lib/systemd/system/bloom-broker@.service" | cut -d' ' -f1)" \
+    "$(test -e "$1/usr/lib/systemd/system/bloom-broker-ceremony-ipv6@.socket" && echo present || echo absent)" >> "$log"
+}
+case "$mode" in
+  interrupt)
+    begin_linux_upgrade "$root" "$old_digest" "$new_digest"
+    unit_root="$root/usr/lib/systemd/system"
+    user_unit_root="$root/usr/lib/systemd/user"
+    if [[ "$stage" != none ]]; then
+      printf 'candidate v4 socket\n' > "$unit_root/bloom-broker-ceremony@.socket"
+      printf 'candidate v6 socket\n' > "$unit_root/bloom-broker-ceremony-ipv6@.socket"
+      printf 'candidate session path\n' > "$unit_root/bloom-session@.path"
+    fi
+    if [[ "$stage" == services || "$stage" == all ]]; then
+      printf 'candidate session unit\n' > "$user_unit_root/bloom-session.service"
+      printf 'candidate machine unit\n' > "$user_unit_root/bloom-machine.service"
+      printf 'candidate broker unit\n' > "$unit_root/bloom-broker@.service"
+      printf 'candidate signer unit\n' > "$unit_root/bloom-signer@.service"
+    fi
+    if [[ "$stage" == all ]]; then
+      rm -f -- "$unit_root/bloom-signer-rpc@.socket" \
+        "$unit_root/bloom-signer-control@.socket" \
+        "$unit_root/bloom-broker-rpc@.socket" \
+        "$unit_root/bloom-broker-control@.socket"
+    fi
+    ;;
+  recover)
+    recover_interrupted_linux_upgrade "$root"
+    ;;
+esac
+"##,
+    )
+    .unwrap();
+    set_linux_mode(&script, 0o755);
+    script
+}
+
+fn run_linux_upgrade_harness(
+    script: &Path,
+    installer: &Path,
+    root: &Path,
+    mode: &str,
+    log: &Path,
+    extra_args: &[&str],
+) -> std::process::Output {
+    Command::new(script)
+        .arg(installer)
+        .arg(root)
+        .arg(mode)
+        .arg(log)
+        .args(extra_args)
+        .output()
+        .unwrap()
+}
+
+/// Installs the default fixture payload once, rewrites the tree into the
+/// pre-IPv6 layout, and returns the layout plus the digests.
+fn stage_interrupted_linux_root(
+    directory: &Path,
+    harness: &Path,
+    stage: &str,
+) -> (PathBuf, Vec<LinuxTrackedUnit>, String, String) {
+    let root = directory.join("root");
+    fs::create_dir(&root).unwrap();
+    let payload = make_installer_payload(&directory.join("release-a"));
+    let old_digest = hex::encode(Sha256::digest(b"test payload\n"));
+    let installed = run_linux_installer(
+        &root,
+        &["install", "1000", "alice", payload.to_str().unwrap()],
+    );
+    assert!(
+        installed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&installed.stderr)
+    );
+    let layout = apply_pre_ipv6_linux_layout(&root);
+    let new_digest = hex::encode(Sha256::digest(b"upgraded manifest\n"));
+    let log = directory.join(format!("interrupt-{stage}.log"));
+    let interrupted = run_linux_upgrade_harness(
+        harness,
+        &release_script("install-linux.sh"),
+        &root,
+        "interrupt",
+        &log,
+        &[stage, &old_digest, &new_digest],
+    );
+    assert!(
+        interrupted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&interrupted.stderr)
+    );
+    (root, layout, old_digest, new_digest)
+}
+
+#[test]
+fn linux_upgrade_failure_restores_the_previous_unit_contract_before_restart() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("root");
+    fs::create_dir(&root).unwrap();
+    let payload_a = make_installer_payload(&directory.path().join("release-a"));
+    let old_digest = hex::encode(Sha256::digest(b"test payload\n"));
+    let (payload_b, new_digest) = make_linux_candidate_payload(
+        directory.path(),
+        "release-b",
+        b"upgraded broker\n",
+        b"upgraded manifest\n",
+    );
+    let installed = run_linux_installer(
+        &root,
+        &["install", "1000", "alice", payload_a.to_str().unwrap()],
+    );
+    assert!(
+        installed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&installed.stderr)
+    );
+    let layout = apply_pre_ipv6_linux_layout(&root);
+
+    // Force the upgrade to fail after the candidate unit writes: the
+    // fstab-authorized mount path must be a real directory.
+    let mount_path = root.join("home/alice/bloom");
+    fs::remove_dir_all(&mount_path).unwrap();
+    std::os::unix::fs::symlink(directory.path().join("not-a-mount-target"), &mount_path).unwrap();
+    let failed = run_linux_installer(
+        &root,
+        &["install", "1000", "alice", payload_b.to_str().unwrap()],
+    );
+    assert!(!failed.status.success());
+    assert!(
+        String::from_utf8_lossy(&failed.stderr)
+            .contains("Bloom mount path is not a real directory")
+    );
+
+    // The EXIT-trap rollback restored the previous coherent installation.
+    assert_eq!(
+        fs::read_link(root.join("usr/libexec/bloom/current")).unwrap(),
+        format!("releases/{old_digest}")
+    );
+    assert_eq!(
+        fs::read(root.join("usr/libexec/bloom/current/bloom-broker")).unwrap(),
+        fs::read(payload_a.join("bin/bloom-broker")).unwrap(),
+        "the previous Broker binary selection must be restored"
+    );
+    assert_pre_ipv6_linux_contract(&root, &layout);
+    let enrollment = fs::read_to_string(root.join("etc/bloom/enrollments/1000.json")).unwrap();
+    assert!(enrollment.contains(&format!("\"release_digest\":\"{old_digest}\"")));
+    assert!(enrollment.contains("\"state\":\"active\""));
+    assert_eq!(
+        fs::read_to_string(root.join("etc/bloom/1000/machine.env")).unwrap(),
+        format!("BLOOM_NFS_LISTEN=127.0.0.1:20000\nBLOOM_RELEASE_DIGEST={old_digest}\n")
+    );
+    assert!(
+        fs::read_to_string(root.join("etc/bloom/1000/broker/config.json"))
+            .unwrap()
+            .contains(&old_digest)
+    );
+    assert!(
+        !root.join("var/lib/bloom/upgrade-transaction").exists(),
+        "a completed rollback must clear the transaction"
+    );
+
+    // With the fault removed, the same candidate upgrade succeeds and a
+    // same-release repair still works.
+    fs::remove_file(&mount_path).unwrap();
+    for attempt in 1..=2 {
+        let retried = run_linux_installer(
+            &root,
+            &["install", "1000", "alice", payload_b.to_str().unwrap()],
+        );
+        assert!(
+            retried.status.success(),
+            "attempt {attempt}: {}",
+            String::from_utf8_lossy(&retried.stderr)
+        );
+        assert_eq!(
+            fs::read_link(root.join("usr/libexec/bloom/current")).unwrap(),
+            format!("releases/{new_digest}")
+        );
+        assert_eq!(
+            fs::read(root.join("usr/libexec/bloom/current/bloom-broker")).unwrap(),
+            b"upgraded broker\n"
+        );
+        assert!(
+            root.join("usr/lib/systemd/system/bloom-broker-ceremony-ipv6@.socket")
+                .is_file()
+        );
+        for obsolete in [
+            "signer-rpc",
+            "signer-control",
+            "broker-rpc",
+            "broker-control",
+        ] {
+            assert!(
+                !root
+                    .join(format!("usr/lib/systemd/system/bloom-{obsolete}@.socket"))
+                    .exists()
+            );
+        }
+        assert!(!root.join("var/lib/bloom/upgrade-transaction").exists());
+    }
+}
+
+#[test]
+fn linux_interrupted_upgrade_recovery_restores_before_any_restart() {
+    let directory = tempfile::tempdir().unwrap();
+    let harness = write_linux_upgrade_harness(directory.path());
+    let installer = release_script("install-linux.sh");
+
+    for stage in ["none", "sockets", "services", "all"] {
+        let stage_root = tempfile::tempdir().unwrap();
+        let (root, layout, old_digest, new_digest) =
+            stage_interrupted_linux_root(stage_root.path(), &harness, stage);
+        assert!(
+            root.join("var/lib/bloom/upgrade-transaction/schema")
+                .is_file(),
+            "the interrupted transaction must be preserved at stage {stage}"
+        );
+
+        let log = stage_root.path().join("recover.log");
+        let recovered = run_linux_upgrade_harness(
+            &harness,
+            &installer,
+            &root,
+            "recover",
+            &log,
+            &[&old_digest, &new_digest],
+        );
+        assert!(
+            recovered.status.success(),
+            "stage {stage}: {}",
+            String::from_utf8_lossy(&recovered.stderr)
+        );
+        let log = fs::read_to_string(&log).unwrap();
+        let stop = log
+            .find("stop\n")
+            .unwrap_or_else(|| panic!("no stop at {stage}"));
+        let start = log
+            .find("start current=")
+            .unwrap_or_else(|| panic!("no start at {stage}"));
+        assert!(
+            stop < start,
+            "the release set must stop before restarting at {stage}"
+        );
+        let start_line = &log[start..log.len().min(start + 400)];
+        let start_line = &start_line[..start_line.find('\n').unwrap_or(start_line.len())];
+        let old_v4 = hex::encode(Sha256::digest(&layout[0].bytes));
+        let old_broker = hex::encode(Sha256::digest(&layout[1].bytes));
+        assert!(
+            start_line.contains(&format!("current=releases/{old_digest}"))
+                && start_line.contains(&format!("v4={old_v4}"))
+                && start_line.contains(&format!("broker={old_broker}"))
+                && start_line.contains("v6=absent"),
+            "restart at {stage} observed mixed binaries or units: {start_line}"
+        );
+        assert_eq!(
+            log.matches("start current=").count(),
+            1,
+            "recovery must attempt exactly one restart at {stage}"
+        );
+        assert_pre_ipv6_linux_contract(&root, &layout);
+        assert!(
+            !root.join("var/lib/bloom/upgrade-transaction").exists(),
+            "successful recovery must clear the transaction at {stage}"
+        );
+    }
+
+    // Retrying the interrupted candidate and an alternate requested release
+    // both go through the same entrypoint path after recovery.
+    for (name, payload_directory, digest_marker) in [
+        ("same-candidate", "release-b", "upgraded manifest\n"),
+        ("alternate-release", "release-a", "test payload\n"),
+    ] {
+        let retry_root = tempfile::tempdir().unwrap();
+        let (root, _layout, old_digest, new_digest) =
+            stage_interrupted_linux_root(retry_root.path(), &harness, "services");
+        let payload = if name == "same-candidate" {
+            make_linux_candidate_payload(
+                retry_root.path(),
+                payload_directory,
+                b"upgraded broker\n",
+                b"upgraded manifest\n",
+            )
+            .0
+        } else {
+            make_installer_payload(&retry_root.path().join(payload_directory))
+        };
+        let log = retry_root.path().join("retry.log");
+        let recovered = run_linux_upgrade_harness(
+            &harness,
+            &installer,
+            &root,
+            "recover",
+            &log,
+            &[&old_digest, &new_digest],
+        );
+        assert!(
+            recovered.status.success(),
+            "{}: {}",
+            name,
+            String::from_utf8_lossy(&recovered.stderr)
+        );
+        let installed = run_linux_installer(
+            &root,
+            &["install", "1000", "alice", payload.to_str().unwrap()],
+        );
+        assert!(
+            installed.status.success(),
+            "{}: {}",
+            name,
+            String::from_utf8_lossy(&installed.stderr)
+        );
+        let expected = hex::encode(Sha256::digest(digest_marker.as_bytes()));
+        assert_eq!(
+            fs::read_link(root.join("usr/libexec/bloom/current")).unwrap(),
+            format!("releases/{expected}"),
+            "{name} must finish on its requested release"
+        );
+        assert!(!root.join("var/lib/bloom/upgrade-transaction").exists());
+    }
+}
+
+#[test]
+fn linux_upgrade_recovery_failure_preserves_the_transaction_and_retries() {
+    let directory = tempfile::tempdir().unwrap();
+    let harness = write_linux_upgrade_harness(directory.path());
+    let installer = release_script("install-linux.sh");
+
+    for variant in [
+        "missing-manifest",
+        "untracked-path",
+        "duplicate-entry",
+        "incomplete",
+        "missing-content",
+        "content-symlink",
+    ] {
+        let variant_root = tempfile::tempdir().unwrap();
+        let (root, layout, old_digest, new_digest) =
+            stage_interrupted_linux_root(variant_root.path(), &harness, "all");
+        let transaction = root.join("var/lib/bloom/upgrade-transaction");
+        let manifest = transaction.join("units/manifest");
+        let original_manifest = fs::read_to_string(&manifest).unwrap();
+        match variant {
+            "missing-manifest" => fs::remove_file(&manifest).unwrap(),
+            "untracked-path" => fs::write(
+                &manifest,
+                format!("{original_manifest}present 644 etc/passwd\n"),
+            )
+            .unwrap(),
+            "duplicate-entry" => {
+                let first = original_manifest.lines().next().unwrap().to_string();
+                fs::write(&manifest, format!("{original_manifest}{first}\n")).unwrap();
+            }
+            "incomplete" => {
+                let reduced: String = original_manifest
+                    .lines()
+                    .filter(|line| !line.ends_with("bloom-signer@.service"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                fs::write(&manifest, format!("{reduced}\n")).unwrap();
+            }
+            "missing-content" => {
+                fs::remove_file(
+                    transaction.join("units/files/usr/lib/systemd/system/bloom-signer@.service"),
+                )
+                .unwrap();
+            }
+            "content-symlink" => {
+                let content =
+                    transaction.join("units/files/usr/lib/systemd/system/bloom-signer@.service");
+                fs::remove_file(&content).unwrap();
+                std::os::unix::fs::symlink("/etc/passwd", &content).unwrap();
+            }
+            _ => unreachable!(),
+        }
+
+        let log = variant_root.path().join("recover.log");
+        let recovered = run_linux_upgrade_harness(
+            &harness,
+            &installer,
+            &root,
+            "recover",
+            &log,
+            &[&old_digest, &new_digest],
+        );
+        assert!(!recovered.status.success(), "{variant} must fail closed");
+        let stderr = String::from_utf8_lossy(&recovered.stderr);
+        assert!(
+            stderr.contains("could not restore installed units") || stderr.contains("snapshot"),
+            "{variant} must report the restoration failure: {stderr}"
+        );
+        assert!(
+            !fs::read_to_string(&log).unwrap().contains("start"),
+            "{variant} must never reach service startup"
+        );
+        assert!(
+            transaction.join("schema").is_file(),
+            "{variant} must preserve the transaction for retry"
+        );
+        assert_eq!(
+            fs::read(root.join("usr/lib/systemd/system/bloom-broker-ceremony@.socket")).unwrap(),
+            b"candidate v4 socket\n",
+            "{variant} must leave the installation untouched, not half restored"
+        );
+
+        if variant == "missing-manifest" {
+            // Once the fault is repaired, retrying recovery completes.
+            fs::write(&manifest, original_manifest).unwrap();
+            let retry_log = variant_root.path().join("retry.log");
+            let retried = run_linux_upgrade_harness(
+                &harness,
+                &installer,
+                &root,
+                "recover",
+                &retry_log,
+                &[&old_digest, &new_digest],
+            );
+            assert!(
+                retried.status.success(),
+                "{}",
+                String::from_utf8_lossy(&retried.stderr)
+            );
+            assert_pre_ipv6_linux_contract(&root, &layout);
+            assert!(!transaction.exists());
+        }
+    }
+
+    // A filesystem fault during restoration keeps startup away, and removing
+    // the fault lets the retry complete.
+    let fault_root = tempfile::tempdir().unwrap();
+    let (root, layout, old_digest, new_digest) =
+        stage_interrupted_linux_root(fault_root.path(), &harness, "all");
+    set_linux_mode(&root.join("usr/lib/systemd/system"), 0o500);
+    let log = fault_root.path().join("recover.log");
+    let blocked = run_linux_upgrade_harness(
+        &harness,
+        &installer,
+        &root,
+        "recover",
+        &log,
+        &[&old_digest, &new_digest],
+    );
+    assert!(!blocked.status.success());
+    assert!(String::from_utf8_lossy(&blocked.stderr).contains("could not restore installed units"));
+    assert!(!fs::read_to_string(&log).unwrap().contains("start"));
+    assert!(
+        root.join("var/lib/bloom/upgrade-transaction/schema")
+            .is_file()
+    );
+    set_linux_mode(&root.join("usr/lib/systemd/system"), 0o755);
+    let retry_log = fault_root.path().join("retry.log");
+    let retried = run_linux_upgrade_harness(
+        &harness,
+        &installer,
+        &root,
+        "recover",
+        &retry_log,
+        &[&old_digest, &new_digest],
+    );
+    assert!(
+        retried.status.success(),
+        "{}",
+        String::from_utf8_lossy(&retried.stderr)
+    );
+    assert_pre_ipv6_linux_contract(&root, &layout);
+    assert!(!root.join("var/lib/bloom/upgrade-transaction").exists());
+
+    // A failed health gate also preserves the transaction; the retry starts
+    // only after the fault clears.
+    let health_root = tempfile::tempdir().unwrap();
+    let (root, layout, old_digest, new_digest) =
+        stage_interrupted_linux_root(health_root.path(), &harness, "all");
+    fs::write(root.join("var/lib/bloom/start-fails"), b"1").unwrap();
+    let log = health_root.path().join("recover.log");
+    let unhealthy = run_linux_upgrade_harness(
+        &harness,
+        &installer,
+        &root,
+        "recover",
+        &log,
+        &[&old_digest, &new_digest],
+    );
+    assert!(!unhealthy.status.success());
+    assert!(fs::read_to_string(&log).unwrap().contains("start refused"));
+    assert!(
+        root.join("var/lib/bloom/upgrade-transaction/schema")
+            .is_file()
+    );
+    assert_pre_ipv6_linux_contract(&root, &layout);
+    fs::remove_file(root.join("var/lib/bloom/start-fails")).unwrap();
+    let retry_log = health_root.path().join("retry.log");
+    let retried = run_linux_upgrade_harness(
+        &harness,
+        &installer,
+        &root,
+        "recover",
+        &retry_log,
+        &[&old_digest, &new_digest],
+    );
+    assert!(
+        retried.status.success(),
+        "{}",
+        String::from_utf8_lossy(&retried.stderr)
+    );
+    assert!(
+        fs::read_to_string(&retry_log)
+            .unwrap()
+            .contains("start current=")
+    );
+    assert!(!root.join("var/lib/bloom/upgrade-transaction").exists());
+}
+
+#[test]
+fn linux_upgrade_recovery_shares_templates_and_rejects_foreign_transactions() {
+    let directory = tempfile::tempdir().unwrap();
+    let harness = write_linux_upgrade_harness(directory.path());
+    let installer = release_script("install-linux.sh");
+    let payload = make_installer_payload(&directory.path().join("release-a"));
+    let old_digest = hex::encode(Sha256::digest(b"test payload\n"));
+    let new_digest = hex::encode(Sha256::digest(b"upgraded manifest\n"));
+
+    let root = directory.path().join("root");
+    fs::create_dir(&root).unwrap();
+    for (uid, user) in [("1000", "alice"), ("2000", "bob"), ("3000", "carol")] {
+        let installed =
+            run_linux_installer(&root, &["install", uid, user, payload.to_str().unwrap()]);
+        assert!(
+            installed.status.success(),
+            "{}",
+            String::from_utf8_lossy(&installed.stderr)
+        );
+    }
+    let custody = root.join("var/lib/bloom/3000/signer/wallet-custody");
+    fs::create_dir_all(custody.parent().unwrap()).unwrap();
+    fs::write(&custody, b"retain me").unwrap();
+    let retained = Command::new(release_script("install-linux.sh"))
+        .args(["uninstall", "--retain-custody"])
+        .arg(&root)
+        .arg("3000")
+        .status()
+        .unwrap();
+    assert!(retained.success());
+
+    let layout = apply_pre_ipv6_linux_layout(&root);
+    let log = directory.path().join("interrupt.log");
+    let interrupted = run_linux_upgrade_harness(
+        &harness,
+        &installer,
+        &root,
+        "interrupt",
+        &log,
+        &["all", &old_digest, &new_digest],
+    );
+    assert!(
+        interrupted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&interrupted.stderr)
+    );
+    let recovered = run_linux_upgrade_harness(
+        &harness,
+        &installer,
+        &root,
+        "recover",
+        &directory.path().join("recover.log"),
+        &[&old_digest, &new_digest],
+    );
+    assert!(
+        recovered.status.success(),
+        "{}",
+        String::from_utf8_lossy(&recovered.stderr)
+    );
+    // One restoration serves every login that shares the templates.
+    assert_pre_ipv6_linux_contract(&root, &layout);
+    for uid in ["1000", "2000"] {
+        let record =
+            fs::read_to_string(root.join(format!("etc/bloom/enrollments/{uid}.json"))).unwrap();
+        assert!(
+            record.contains(&format!("\"release_digest\":\"{old_digest}\"")),
+            "enrollment {uid} must return to the previous release"
+        );
+        assert!(record.contains("\"state\":\"active\""));
+    }
+    let retained_record = fs::read_to_string(root.join("etc/bloom/retained/3000.json")).unwrap();
+    assert!(retained_record.contains("\"state\":\"retained\""));
+    assert!(retained_record.contains(&format!("\"release_digest\":\"{old_digest}\"")));
+    assert_eq!(fs::read(&custody).unwrap(), b"retain me");
+    assert!(!root.join("var/lib/bloom/upgrade-transaction").exists());
+
+    // The interrupted candidate then lands for every login through the
+    // normal entrypoint path.
+    let (candidate, _) = make_linux_candidate_payload(
+        directory.path(),
+        "release-b",
+        b"upgraded broker\n",
+        b"upgraded manifest\n",
+    );
+    let installed = run_linux_installer(
+        &root,
+        &["install", "1000", "alice", candidate.to_str().unwrap()],
+    );
+    assert!(
+        installed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&installed.stderr)
+    );
+    assert_eq!(
+        fs::read_link(root.join("usr/libexec/bloom/current")).unwrap(),
+        format!("releases/{new_digest}")
+    );
+    for uid in ["1000", "2000"] {
+        let record =
+            fs::read_to_string(root.join(format!("etc/bloom/enrollments/{uid}.json"))).unwrap();
+        assert!(record.contains(&format!("\"release_digest\":\"{new_digest}\"")));
+        assert!(record.contains("\"state\":\"active\""));
+    }
+    let retained_record = fs::read_to_string(root.join("etc/bloom/retained/3000.json")).unwrap();
+    assert!(retained_record.contains(&format!("\"release_digest\":\"{new_digest}\"")));
+    assert!(
+        root.join("usr/lib/systemd/system/bloom-broker-ceremony-ipv6@.socket")
+            .is_file()
+    );
+
+    // A transaction from the earlier installer has no unit snapshot and must
+    // not be fabricated into a rollback.
+    let legacy_root = tempfile::tempdir().unwrap();
+    let (root, _layout, _old_digest, new_digest) =
+        stage_interrupted_linux_root(legacy_root.path(), &harness, "all");
+    fs::write(
+        root.join("var/lib/bloom/upgrade-transaction/schema"),
+        "bloom.linux-upgrade-transaction.1\n",
+    )
+    .unwrap();
+    let (candidate, _) = make_linux_candidate_payload(
+        legacy_root.path(),
+        "release-b",
+        b"upgraded broker\n",
+        b"upgraded manifest\n",
+    );
+    let legacy = run_linux_installer(
+        &root,
+        &["install", "1000", "alice", candidate.to_str().unwrap()],
+    );
+    assert!(!legacy.status.success());
+    let stderr = String::from_utf8_lossy(&legacy.stderr);
+    assert!(
+        stderr.contains("predates unit snapshots"),
+        "legacy transactions need the explicit documented recovery: {stderr}"
+    );
+    assert!(
+        root.join("var/lib/bloom/upgrade-transaction/schema")
+            .is_file()
+    );
+    assert_eq!(
+        fs::read(root.join("usr/lib/systemd/system/bloom-broker-ceremony@.socket")).unwrap(),
+        b"candidate v4 socket\n",
+        "legacy recovery must fail before touching the installation"
+    );
+
+    // Unknown schema versions and snapshot-less transactions also fail
+    // closed without mutating anything.
+    fs::write(
+        root.join("var/lib/bloom/upgrade-transaction/schema"),
+        "bloom.linux-upgrade-transaction.3\n",
+    )
+    .unwrap();
+    let future = run_linux_installer(
+        &root,
+        &["install", "1000", "alice", candidate.to_str().unwrap()],
+    );
+    assert!(!future.status.success());
+    assert!(String::from_utf8_lossy(&future.stderr).contains("invalid interrupted Linux upgrade"));
+    assert!(
+        root.join("var/lib/bloom/upgrade-transaction/schema")
+            .is_file()
+    );
+
+    fs::write(
+        root.join("var/lib/bloom/upgrade-transaction/schema"),
+        "bloom.linux-upgrade-transaction.2\n",
+    )
+    .unwrap();
+    fs::remove_dir_all(root.join("var/lib/bloom/upgrade-transaction/units")).unwrap();
+    let snapshotless = run_linux_installer(
+        &root,
+        &["install", "1000", "alice", candidate.to_str().unwrap()],
+    );
+    assert!(!snapshotless.status.success());
+    assert!(
+        String::from_utf8_lossy(&snapshotless.stderr).contains("could not restore installed units")
+    );
+    assert!(
+        root.join("var/lib/bloom/upgrade-transaction/schema")
+            .is_file()
+    );
+    assert_eq!(
+        fs::read(root.join("usr/lib/systemd/system/bloom-broker-ceremony@.socket")).unwrap(),
+        b"candidate v4 socket\n"
+    );
 }
 
 #[test]
