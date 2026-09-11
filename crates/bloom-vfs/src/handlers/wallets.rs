@@ -4024,24 +4024,13 @@ impl WalletsHandler {
                         ceremony_url,
                         ceremony_expires_at_ms,
                     } => {
-                        let challenge = serde_json::to_vec_pretty(&serde_json::json!({
-                            "schema": "bloom.solana-approval-challenge/1",
-                            "action_id": target_entry.staged.id,
-                            "tx_id": target_entry.staged.id,
-                            "wallet": wallet,
-                            "chain": chain,
-                            "approval_id": approval_id.as_str(),
-                            "ceremony_url": ceremony_url,
-                            "expiry_ms": ceremony_expires_at_ms,
-                            "account_fingerprint": target_entry.staged.account_fingerprint,
-                            "fee_payer": target_entry.staged.fee_payer,
-                            "destination": target_entry.staged.destination,
-                            "lamports": target_entry.staged.lamports,
-                            "fee_lamports": target_entry.staged.fee_lamports,
-                            "plan_path": format!("wallets/{wallet}/chains/{chain}/outbox/pending/{target_id}/plan.md"),
-                            "retry_path": format!("wallets/{wallet}/chains/{chain}/outbox/pending/{target_id}/confirm"),
-                        }))
-                        .map_err(|error| HandlerError::backend(error.to_string()))?;
+                        let challenge = bloom_solana_tx::outbox::SolanaOutbox::approval_challenge(
+                            &target_entry.staged,
+                            approval_id.as_str(),
+                            &ceremony_url,
+                            ceremony_expires_at_ms,
+                        )
+                        .map_err(solana_outbox_err)?;
                         engine
                             .outbox()
                             .write_approval_challenge(&target_entry, &challenge)

@@ -688,6 +688,36 @@ impl SolanaOutbox {
         write_private_atomic(&entry.dir.join(PRIVATE_APPROVAL_FILE), body)
     }
 
+    /// Build the owner-visible approval projection for one pending transfer.
+    /// The confirm path writes it when the Broker asks for a ceremony, and a
+    /// restage rebuilds it for the successor, so the ids, paths, and fee it
+    /// names are always those of the entry it sits in.
+    pub fn approval_challenge(
+        staged: &StagedSolanaTransfer,
+        approval_id: &str,
+        ceremony_url: &str,
+        expiry_ms: u64,
+    ) -> Result<Vec<u8>, OutboxError> {
+        let (wallet, chain, id) = (&staged.wallet, &staged.chain, &staged.id);
+        Ok(serde_json::to_vec_pretty(&serde_json::json!({
+            "schema": "bloom.solana-approval-challenge/1",
+            "action_id": id,
+            "tx_id": id,
+            "wallet": wallet,
+            "chain": chain,
+            "approval_id": approval_id,
+            "ceremony_url": ceremony_url,
+            "expiry_ms": expiry_ms,
+            "account_fingerprint": staged.account_fingerprint,
+            "fee_payer": staged.fee_payer,
+            "destination": staged.destination,
+            "lamports": staged.lamports,
+            "fee_lamports": staged.fee_lamports,
+            "plan_path": format!("wallets/{wallet}/chains/{chain}/outbox/pending/{id}/plan.md"),
+            "retry_path": format!("wallets/{wallet}/chains/{chain}/outbox/pending/{id}/confirm"),
+        }))?)
+    }
+
     /// Atomically publish the sanitized owner-visible approval projection next
     /// to a pending transfer. Unlike the compatibility-only private approval
     /// sidecar, this file is intentionally readable through the wallet VFS.

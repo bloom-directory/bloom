@@ -182,7 +182,7 @@ staged.** When a confirm reports the entry is in `failed`, read the successor
 and continue there:
 
 ```sh
-cat wallets/<wallet>/chains/<solana-chain>/outbox/pending/<id>/restage_advice.json
+cat wallets/<wallet>/chains/<solana-chain>/outbox/failed/<id>/restage_advice.json
 # -> {"replacement_id": "sol-...", "reason": "approval_refresh" | "blockhash_expired"}
 ```
 

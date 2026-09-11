@@ -375,6 +375,16 @@ impl SolanaTransferEngine {
                 "only an expired failed transfer can be restaged".into(),
             ));
         }
+        // A refresh exists so the approval can sign a live message. Once this
+        // entry holds the one signature that approval allows, retiring it would
+        // delete the signature and leave the successor asking the Broker for a
+        // second one it must refuse. The signed entry goes on to broadcast.
+        if !require_expired
+            && found_in == SolanaOutboxState::Pending
+            && self.outbox.recorded_signature(&entry)?.is_some()
+        {
+            return Ok(entry.staged);
+        }
         let current = self.client.get_block_height().await?;
         if require_expired && current <= entry.staged.last_valid_block_height {
             return Err(EngineError::Invalid(format!(
@@ -446,6 +456,15 @@ impl SolanaTransferEngine {
         // will refuse forever. Doing it first is safe in both directions: a
         // crash after the copy leaves the id on two entries, and only the
         // successor is confirmable.
+        //
+        // The successor may already be live: a crash after an earlier copy, or
+        // a second restage of this id after the first retired it. Its own
+        // approval state is then at least as new as ours, so lock it against a
+        // concurrent sign and fill in only what it lacks. Locks are taken
+        // predecessor first; successor ids are always fresh, so the order is
+        // acyclic.
+        let successor_lock = self.operation_lock(wallet, &replacement.id);
+        let _successor_guard = successor_lock.lock().await;
         let successor = self.outbox.read_in_state(
             wallet,
             &self.chain,
@@ -458,11 +477,29 @@ impl SolanaTransferEngine {
         // same approval operation id. Dropping the counter here resets it to
         // zero and collides with the approval that was just refused — the
         // exact conflict this record exists to prevent.
-        if let Some(attempt) = self.outbox.approval_attempt(&entry)? {
+        if self.outbox.approval_attempt(&successor)?.is_none()
+            && let Some(attempt) = self.outbox.approval_attempt(&entry)?
+        {
             self.outbox.write_approval_attempt(&successor, &attempt)?;
         }
-        if let Ok(challenge) = std::fs::read(entry.dir.join(crate::outbox::APPROVAL_CHALLENGE_FILE))
+        // The challenge is rebuilt, not copied: it names the entry it sits in,
+        // and owners check its `action_id` before opening the ceremony.
+        if !successor
+            .dir
+            .join(crate::outbox::APPROVAL_CHALLENGE_FILE)
+            .exists()
+            && let Some(previous) =
+                std::fs::read(entry.dir.join(crate::outbox::APPROVAL_CHALLENGE_FILE))
+                    .ok()
+                    .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+            && let Some(approval_id) = previous["approval_id"].as_str()
         {
+            let challenge = SolanaOutbox::approval_challenge(
+                &successor.staged,
+                approval_id,
+                previous["ceremony_url"].as_str().unwrap_or_default(),
+                previous["expiry_ms"].as_u64().unwrap_or_default(),
+            )?;
             self.outbox
                 .write_approval_challenge(&successor, &challenge)?;
         }
@@ -523,6 +560,11 @@ impl SolanaTransferEngine {
         approval_id: Option<Digest32>,
         now_ms: u128,
     ) -> Result<SolanaSignOutcome, EngineError> {
+        // Serialized with restage: retiring this entry while the Broker is
+        // signing it would consume the approval's one signature on an entry
+        // that can no longer record or broadcast it.
+        let operation_lock = self.operation_lock(wallet, id);
+        let _operation_guard = operation_lock.lock().await;
         let entry =
             self.outbox
                 .read_in_state(wallet, &self.chain, id, SolanaOutboxState::Pending)?;

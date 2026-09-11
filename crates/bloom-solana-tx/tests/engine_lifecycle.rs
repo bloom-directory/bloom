@@ -38,6 +38,10 @@ struct BrokerFixture {
     conflicts: Mutex<u32>,
     /// When set, the next signing request is answered with this error.
     next_sign_error: Mutex<Option<(ProtocolErrorCode, String)>>,
+    /// When set, a signing request announces itself on `sign_reached` and
+    /// then waits for a permit, holding the signature in flight.
+    sign_gate: Mutex<Option<Arc<tokio::sync::Semaphore>>>,
+    sign_reached: tokio::sync::Notify,
 }
 
 impl BrokerFixture {
@@ -59,6 +63,8 @@ impl BrokerFixture {
             prepared_ids: Mutex::new(Vec::new()),
             conflicts: Mutex::new(0),
             next_sign_error: Mutex::new(None),
+            sign_gate: Mutex::new(None),
+            sign_reached: tokio::sync::Notify::new(),
         }
     }
     fn child_pubkey(&self) -> [u8; 32] {
@@ -141,6 +147,11 @@ impl MachineBrokerService for BrokerFixture {
                 MachineBrokerRequest::SigningSign(sign_request) => {
                     if let Some((code, message)) = self.next_sign_error.lock().unwrap().take() {
                         return Err(ProtocolError::new(code, message));
+                    }
+                    let gate = self.sign_gate.lock().unwrap().clone();
+                    if let Some(gate) = gate {
+                        self.sign_reached.notify_one();
+                        gate.acquire().await.unwrap().forget();
                     }
                     let SigningPayloads::Single { payload } = &sign_request.payloads else {
                         return Err(ProtocolError::new(
@@ -1450,8 +1461,10 @@ async fn restage_migrates_the_approval_before_retiring_its_predecessor() {
             bloom_solana_tx::outbox::SolanaOutboxState::Pending,
         )
         .unwrap();
-    let challenge = br#"{"schema":"bloom.solana-approval-challenge/1","approval_id":"beef"}"#;
-    outbox.write_approval_challenge(&entry, challenge).unwrap();
+    let challenge =
+        SolanaOutbox::approval_challenge(&original, "beef", "http://localhost/ceremony", 5_000)
+            .unwrap();
+    outbox.write_approval_challenge(&entry, &challenge).unwrap();
 
     // Advance past the staged window so the restage produces a real successor.
     height.store(
@@ -1478,7 +1491,249 @@ async fn restage_migrates_the_approval_before_retiring_its_predecessor() {
             .join(bloom_solana_tx::outbox::APPROVAL_CHALLENGE_FILE),
     )
     .expect("the successor must carry the approval the owner already granted");
-    assert_eq!(migrated, challenge);
+    let migrated: serde_json::Value = serde_json::from_slice(&migrated).unwrap();
+    assert_eq!(migrated["approval_id"], "beef");
+    assert_eq!(migrated["ceremony_url"], "http://localhost/ceremony");
+    assert_eq!(migrated["expiry_ms"], 5_000);
+    // The copy is rebuilt for the entry it now sits in. A verbatim copy names
+    // the retired id and a retry path that no longer exists, and fails the
+    // `action_id` check owners run before opening the ceremony.
+    assert_eq!(migrated["action_id"], replacement.id.as_str());
+    assert!(
+        migrated["retry_path"]
+            .as_str()
+            .unwrap()
+            .contains(&format!("/pending/{}/", replacement.id))
+    );
+}
+
+/// A node whose blockhash follows `height`, an outbox, a Broker, and an engine
+/// wired to all three, for the restage tests below.
+async fn restage_fixture() -> (
+    Arc<std::sync::atomic::AtomicU64>,
+    tempfile::TempDir,
+    SolanaOutbox,
+    Arc<BrokerFixture>,
+    Arc<SolanaTransferEngine>,
+) {
+    let height = Arc::new(std::sync::atomic::AtomicU64::new(1));
+    let endpoint = spawn_node_with_controls(
+        height.clone(),
+        false,
+        false,
+        Arc::new(Mutex::new(Vec::new())),
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let outbox = SolanaOutbox::new(dir.path().join("outbox")).unwrap();
+    let broker = Arc::new(BrokerFixture::new());
+    let signer =
+        SolanaTransferSigner::from_catalog(MachineBrokerClient::new(broker.clone()), &catalog())
+            .unwrap();
+    let engine = Arc::new(SolanaTransferEngine::new(
+        outbox.clone(),
+        client(&endpoint),
+        signer,
+        "solana-devnet",
+    ));
+    (height, dir, outbox, broker, engine)
+}
+
+/// Stage a transfer and take it to an approval the owner has been asked for,
+/// with the challenge published the way the confirm path publishes it.
+async fn stage_awaiting_approval(
+    engine: &SolanaTransferEngine,
+    outbox: &SolanaOutbox,
+    broker: &BrokerFixture,
+) -> (bloom_solana_tx::types::StagedSolanaTransfer, Digest32) {
+    let staged = stage_for_retry(engine, broker).await;
+    let approval = approval_required(
+        engine
+            .sign(
+                "wallet",
+                &staged.id,
+                &broker.child_pubkey(),
+                None,
+                None,
+                1_100,
+            )
+            .await
+            .unwrap(),
+    );
+    let challenge = SolanaOutbox::approval_challenge(
+        &staged,
+        approval.as_str(),
+        "http://localhost/ceremony",
+        900_000,
+    )
+    .unwrap();
+    outbox
+        .write_approval_challenge(&pending(outbox, &staged.id), &challenge)
+        .unwrap();
+    (staged, approval)
+}
+
+fn challenge_of(entry: &bloom_solana_tx::outbox::SolanaOutboxEntry) -> serde_json::Value {
+    serde_json::from_slice(
+        &std::fs::read(
+            entry
+                .dir
+                .join(bloom_solana_tx::outbox::APPROVAL_CHALLENGE_FILE),
+        )
+        .unwrap(),
+    )
+    .unwrap()
+}
+
+/// The confirm path refreshes an approved transfer onto the newest blockhash
+/// before signing. When the cluster has moved on, the transfer changes id: the
+/// successor must carry the approval and its attempt, the predecessor must be
+/// retired with advice saying why, and the approval must sign the successor.
+#[tokio::test]
+async fn an_approved_refresh_hands_the_approval_to_its_successor() {
+    let (height, _dir, outbox, broker, engine) = restage_fixture().await;
+    let (staged, approval) = stage_awaiting_approval(&engine, &outbox, &broker).await;
+    let fee_payer = broker.child_pubkey();
+
+    // A newer blockhash, while the staged one is still valid.
+    height.store(2, std::sync::atomic::Ordering::SeqCst);
+    assert!(2 <= staged.last_valid_block_height);
+    let successor = engine
+        .restage_approved("wallet", &staged.id, &fee_payer, 1_300)
+        .await
+        .unwrap();
+    assert_ne!(successor.id, staged.id);
+
+    let retired = outbox.read("wallet", "solana-devnet", &staged.id).unwrap();
+    assert_eq!(retired.state, SolanaOutboxState::Failed);
+    assert_eq!(retired.staged.status, SolanaTxStatus::Expired);
+    let advice: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(retired.dir.join("restage_advice.json")).unwrap())
+            .unwrap();
+    assert_eq!(advice["reason"], "approval_refresh");
+    assert_eq!(advice["replacement_id"], successor.id.as_str());
+
+    let live = pending(&outbox, &successor.id);
+    let challenge = challenge_of(&live);
+    assert_eq!(challenge["approval_id"], approval.as_str());
+    assert_eq!(challenge["action_id"], successor.id.as_str());
+    let attempt = outbox
+        .approval_attempt(&live)
+        .unwrap()
+        .expect("the attempt travels with the approval");
+    assert_eq!((attempt.attempt, attempt.issued_at_ms), (0, 1_100));
+
+    let signed = engine
+        .sign(
+            "wallet",
+            &successor.id,
+            &fee_payer,
+            None,
+            Some(approval),
+            1_400,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        signed,
+        bloom_solana_tx::signing::SolanaSignOutcome::Signed { .. }
+    ));
+    assert_eq!(broker.conflicts(), 0);
+}
+
+/// Two confirms of one transfer: the first is signing when the second
+/// refreshes it. The refresh must wait for the signature and then leave the
+/// signed entry alone. Retiring it mid-sign, or after, deletes the one
+/// signature the approval allows and strands the transfer.
+#[tokio::test]
+async fn an_approved_refresh_waits_for_an_in_flight_signature() {
+    let (height, _dir, outbox, broker, engine) = restage_fixture().await;
+    let (staged, approval) = stage_awaiting_approval(&engine, &outbox, &broker).await;
+    let fee_payer = broker.child_pubkey();
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    *broker.sign_gate.lock().unwrap() = Some(gate.clone());
+
+    let signing = tokio::spawn({
+        let engine = engine.clone();
+        let id = staged.id.clone();
+        async move {
+            engine
+                .sign("wallet", &id, &fee_payer, None, Some(approval), 1_200)
+                .await
+        }
+    });
+    broker.sign_reached.notified().await;
+
+    height.store(2, std::sync::atomic::Ordering::SeqCst);
+    let mut refresh = tokio::spawn({
+        let engine = engine.clone();
+        let id = staged.id.clone();
+        async move {
+            engine
+                .restage_approved("wallet", &id, &fee_payer, 1_300)
+                .await
+        }
+    });
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(300), &mut refresh)
+            .await
+            .is_err(),
+        "a refresh must not run while the transfer is being signed"
+    );
+
+    gate.add_permits(1);
+    assert!(matches!(
+        signing.await.unwrap().unwrap(),
+        bloom_solana_tx::signing::SolanaSignOutcome::Signed { .. }
+    ));
+    let refreshed = refresh.await.unwrap().unwrap();
+    assert_eq!(refreshed.id, staged.id, "a signed transfer is not replaced");
+    assert!(
+        outbox
+            .recorded_signature(&pending(&outbox, &staged.id))
+            .unwrap()
+            .is_some(),
+        "the signature stays with the entry that will broadcast it"
+    );
+}
+
+/// A second confirm that read the transfer before the first retired it goes on
+/// to restage the retired id. It must find the same successor and leave that
+/// successor's newer approval state as it is.
+#[tokio::test]
+async fn restaging_a_retired_id_again_leaves_its_successor_alone() {
+    let (height, _dir, outbox, broker, engine) = restage_fixture().await;
+    let (staged, _) = stage_awaiting_approval(&engine, &outbox, &broker).await;
+    let fee_payer = broker.child_pubkey();
+    height.store(2, std::sync::atomic::Ordering::SeqCst);
+    let successor = engine
+        .restage_approved("wallet", &staged.id, &fee_payer, 1_300)
+        .await
+        .unwrap();
+
+    // The successor moves on under its own lineage.
+    let live = pending(&outbox, &successor.id);
+    outbox
+        .write_approval_attempt(
+            &live,
+            &bloom_solana_tx::outbox::ApprovalAttempt {
+                attempt: 3,
+                issued_at_ms: 1_350,
+                expires_at_ms: 900_000,
+            },
+        )
+        .unwrap();
+    let newer = SolanaOutbox::approval_challenge(&successor, "newer", "http://x", 1).unwrap();
+    outbox.write_approval_challenge(&live, &newer).unwrap();
+
+    let again = engine
+        .restage_approved("wallet", &staged.id, &fee_payer, 1_400)
+        .await
+        .unwrap();
+    assert_eq!(again.id, successor.id);
+    let live = pending(&outbox, &successor.id);
+    assert_eq!(outbox.approval_attempt(&live).unwrap().unwrap().attempt, 3);
+    assert_eq!(challenge_of(&live)["approval_id"], "newer");
 }
 
 /// Fixtures for the approval-retry tests: a node, an outbox, a Broker that
