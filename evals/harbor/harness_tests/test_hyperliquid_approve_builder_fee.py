@@ -19,7 +19,9 @@ from harness.hyperliquid_approve_builder_fee import (
     ROUTE_PATTERN,
     HyperliquidApproveBuilderFeeEval,
 )
+from harness import hyperliquid_order_cancel
 from harness.hyperliquid_order_cancel import (
+    MAINNET_ACK,
     MAX_SESSION_CEREMONIES,
     HyperliquidOrderCancelEval,
 )
@@ -375,6 +377,177 @@ class CredentialSidecarTests(BuilderFeeFixture, unittest.TestCase):
         signed = sorted(int(w.communicate(timeout=60)[0].strip()) for w in workers)
         self.assertEqual(signed, list(range(4, 12)), "no two processes may share a counter")
         self.assertEqual(sidecar.read(), 12)
+
+
+class CounterBlockReservationTests(BuilderFeeFixture, unittest.TestCase):
+    """A run owns its whole ceremony budget before it can create authority."""
+
+    def sidecar(self) -> CounterSidecar:
+        return CounterSidecar.for_credential(self.seed, self.root / "counters")
+
+    def fee(self, count: int | str = 4) -> HyperliquidApproveBuilderFeeEval:
+        self.env["BLOOM_EVAL_AUTHENTICATOR_SIGN_COUNT"] = str(count)
+        definition = HyperliquidApproveBuilderFeeEval(self.repo, self.env)
+        definition.attach_counter_sidecar(CounterSidecar(self.sidecar().path))
+        return definition
+
+    def cancel(self, count: int | str = 4) -> HyperliquidOrderCancelEval:
+        self.env["BLOOM_EVAL_AUTHENTICATOR_SIGN_COUNT"] = str(count)
+        definition = HyperliquidOrderCancelEval(self.repo, self.env)
+        definition.attach_counter_sidecar(CounterSidecar(self.sidecar().path))
+        return definition
+
+    def test_the_whole_budget_is_recorded_before_any_ceremony(self) -> None:
+        fee = self.fee()
+        self.assertEqual(fee.reserve_run_counters(fee._require_sign_count()), 4)
+        self.assertEqual(self.sidecar().read(), 6, "grant and revoke are both claimed up front")
+
+    def test_reserving_again_in_the_same_run_claims_nothing_more(self) -> None:
+        fee = self.fee()
+        first = fee.reserve_run_counters(fee._require_sign_count())
+        self.assertEqual(fee.reserve_run_counters(first), first)
+        self.assertEqual(self.sidecar().read(), 6)
+
+    def test_a_run_cannot_sign_outside_its_reserved_range(self) -> None:
+        fee = self.fee()
+        counter = fee.reserve_run_counters(fee._require_sign_count())
+        counter = fee.reserve_counter(counter)  # grant signs 4
+        counter = fee.reserve_counter(counter)  # revoke signs 5
+        with self.assertRaisesRegex(EvalError, "outside its reserved range"):
+            fee.reserve_counter(counter)
+
+    def test_a_competing_eval_cannot_take_the_counter_cleanup_needs(self) -> None:
+        # The reported race: five counters remain. Builder-fee needs 2 and
+        # order-cancel needs 4, and both pass the advisory capacity check.
+        start = COUNTER_MAX - 4
+        fee, cancel = self.fee(start), self.cancel(start)
+        fee_start, cancel_start = fee._require_sign_count(), cancel._require_sign_count()
+        self.assertEqual((fee_start, cancel_start), (start, start))
+
+        # Builder-fee finishes preflight first and signs its grant.
+        counter = fee.reserve_counter(fee.reserve_run_counters(fee_start))
+        grant = counter - 1
+
+        # Order-cancel's preflight can no longer claim four counters, so it is
+        # refused before creating any authority of its own.
+        with self.assertRaisesRegex(EvalError, "including its cleanup"):
+            cancel.reserve_run_counters(cancel_start)
+
+        # Builder-fee's mandatory revoke still has its counter.
+        revoke = fee.reserve_counter(counter) - 1
+        self.assertEqual((grant, revoke), (start, start + 1))
+
+    def test_when_the_other_eval_reserves_first_builder_fee_is_refused_before_granting(self) -> None:
+        start = COUNTER_MAX - 4
+        cancel, fee = self.cancel(start), self.fee(start)
+        cancel.reserve_run_counters(cancel._require_sign_count())
+        with self.assertRaisesRegex(EvalError, "including its cleanup"):
+            fee.reserve_run_counters(fee._require_sign_count())
+
+    def test_insufficient_capacity_writes_nothing(self) -> None:
+        sidecar = self.sidecar()
+        sidecar.write(COUNTER_MAX)
+        with self.assertRaisesRegex(EvalError, "including its cleanup"):
+            sidecar.reserve_block(4, 2)
+        self.assertEqual(sidecar.read(), COUNTER_MAX)
+
+    def test_concurrent_processes_get_disjoint_ranges(self) -> None:
+        sidecar = self.sidecar()
+        code = (
+            "from pathlib import Path\nfrom harness.core import CounterSidecar\n"
+            f"print(CounterSidecar(Path({str(sidecar.path)!r})).reserve_block(4, 2))\n"
+        )
+        workers = [
+            subprocess.Popen([sys.executable, "-c", code], cwd=HARBOR,
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            for _ in range(6)
+        ]
+        starts = sorted(int(w.communicate(timeout=60)[0].strip()) for w in workers)
+        self.assertEqual(starts, [4, 6, 8, 10, 12, 14], "no two runs may share a counter")
+        self.assertEqual(sidecar.read(), 16)
+
+    def test_a_block_reservation_waits_for_another_process_holding_the_lock(self) -> None:
+        sidecar = self.sidecar()
+        holder = subprocess.Popen(
+            [sys.executable, "-c",
+             "import time\nfrom pathlib import Path\nfrom harness.core import CounterSidecar\n"
+             f"s = CounterSidecar(Path({str(sidecar.path)!r}))\n"
+             "with s.locked():\n    print('held', flush=True)\n    time.sleep(1.0)\n"],
+            cwd=HARBOR, stdout=subprocess.PIPE, text=True,
+        )
+        self.addCleanup(holder.stdout.close)
+        self.addCleanup(holder.wait)
+        self.assertEqual(holder.stdout.readline().strip(), "held")
+        started = time.monotonic()
+        self.assertEqual(sidecar.reserve_block(4, 2), 4)
+        self.assertGreaterEqual(time.monotonic() - started, 0.7)
+
+    def test_order_cancel_preflight_claims_the_budget_as_its_last_step(self) -> None:
+        # Same wiring for order-cancel: after the empty-wallet check and
+        # immediately before provision() creates the session.
+        self.env["BLOOM_EVAL_MAINNET_ACK"] = MAINNET_ACK
+        cancel = self.cancel()
+        cancel.network_root.mkdir(parents=True)
+        (cancel.network_root / "mids.json").write_text("{}")
+        (cancel.network_root / "perp_meta.json").write_text("{}")
+        (cancel.network_root.parent / "README.md").write_text("installed")
+        self.driver.write_text("#!/bin/sh\n")
+        self.driver.chmod(0o755)
+        order: list[str] = []
+        cancel.preauthorization_preflight = mock.Mock()
+        cancel._require_exact_wallet_policy = mock.Mock()
+        cancel._pull_eval_image = mock.Mock()
+        cancel._require_empty_wallet = mock.Mock(
+            side_effect=lambda: order.append("empty-wallet-check")
+        )
+        reserve = cancel.reserve_run_counters
+
+        def recording_reserve(start: int) -> int:
+            order.append("reserve")
+            return reserve(start)
+
+        cancel.reserve_run_counters = recording_reserve
+        driver_usage = subprocess.CompletedProcess(
+            [], 0, stdout="usage: complete URL --authenticator-seed-file PATH", stderr=""
+        )
+        with (
+            mock.patch.object(hyperliquid_order_cancel.os.path, "ismount", return_value=True),
+            mock.patch.object(hyperliquid_order_cancel.subprocess, "run", return_value=driver_usage),
+        ):
+            cancel.preflight()
+        self.assertEqual(order, ["empty-wallet-check", "reserve"], "reservation must be the last step")
+        self.assertEqual(cancel.sign_count, 4)
+        self.assertEqual(self.sidecar().read(), 4 + MAX_SESSION_CEREMONIES)
+
+    def test_builder_fee_preflight_claims_the_budget_as_its_last_step(self) -> None:
+        # Wiring: preflight() itself must reserve, after every other check
+        # and immediately before provision() can create authority.
+        (self.mount / "petals/hyperliquid/testnet").mkdir(parents=True)
+        (self.mount / "petals/hyperliquid/README.md").write_text("installed")
+        self.driver.write_text("#!/bin/sh\n")
+        self.driver.chmod(0o755)
+        fee = self.fee()
+        order: list[str] = []
+        fee.preauthorization_preflight = mock.Mock()
+        fee._require_exact_wallet_policy = mock.Mock()
+        fee._pull_eval_image = mock.Mock()
+        fee._pending_builder_fee_ceremony = mock.Mock(
+            side_effect=lambda: order.append("pending-check")
+        )
+        reserve = fee.reserve_run_counters
+
+        def recording_reserve(start: int) -> int:
+            order.append("reserve")
+            return reserve(start)
+
+        fee.reserve_run_counters = recording_reserve
+        with mock.patch.object(
+            subprocess, "run", return_value=subprocess.CompletedProcess([], 0, b"", b"")
+        ):
+            fee.preflight()
+        self.assertEqual(order, ["pending-check", "reserve"], "reservation must be the last step")
+        self.assertEqual(fee.sign_count, 4)
+        self.assertEqual(self.sidecar().read(), 6)
 
 
 class CounterCapacityTests(BuilderFeeFixture, unittest.TestCase):
@@ -757,6 +930,17 @@ class BuilderFeeCeremonyLifecycleTests(BuilderFeeFixture, unittest.TestCase):
         definition._observed_max_builder_fee = mock.Mock(return_value=10)
         with self.assertRaisesRegex(EvalError, "already approves"):
             definition.provision("codex")
+
+    def test_provision_refuses_a_lower_nonzero_baseline_it_would_erase(self) -> None:
+        # Cleanup revokes to zero, not to the prior value, so an approval
+        # below the target (3 < 10) would be silently erased.
+        definition, counters = self.drive()
+        definition._observed_max_builder_fee = mock.Mock(return_value=3)
+        with self.assertRaisesRegex(EvalError, "already approves 3"):
+            definition.provision("codex")
+        definition._write_route.assert_not_called()
+        self.assertEqual(counters, [], "no ceremony may run")
+        self.assertFalse(definition.cleanup_needed, "nothing was staged, so nothing to revoke")
 
     def test_provision_fails_closed_when_the_approval_is_not_staged(self) -> None:
         definition, _counters = self.drive(statuses=["awaiting_owner_approval"])

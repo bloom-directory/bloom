@@ -253,14 +253,34 @@ and the recorded value, so raising the environment counter is honoured while a
 recorded one is never rolled back. It then refuses to start unless enough valid
 counters remain for every ceremony the eval may spend, cleanup included: two
 for `hyperliquid-approve-builder-fee` (the grant and its mandatory revoke) and
-up to four for `hyperliquid-order-cancel`. WebAuthn counters are 32-bit, so the
-last usable one is `4294967295`. A run that spends it records `4294967296` to
-mark the credential exhausted; the next run is refused at preflight rather than
-creating a grant its cleanup could not revoke.
+up to four for `hyperliquid-order-cancel`.
+
+That check alone is only advisory: two evals on one authenticator could both
+pass it near the top of the range, and one could then spend the counters the
+other's mandatory cleanup needs after its grant already exists. So the last
+step of preflight, immediately before any authority is created, reserves the
+run's whole budget atomically under the same lock and records the entire range
+as spent. The run signs only inside that range. Counters it never uses are
+skipped, which is safe; reuse is not. An eval that cannot reserve its full
+budget is refused before it can stage anything.
+
+WebAuthn counters are 32-bit, so the last usable one is `4294967295`. A run
+that reserves it records `4294967296` to mark the credential exhausted, and the
+next run is refused at preflight.
 
 The operator lifecycle still keeps its counter in its own state file and does
 not coordinate with these sidecars. Do not drive one authenticator from both an
 operator run and a direct run.
+
+### Builder-fee starting state
+
+`hyperliquid-approve-builder-fee` requires the dedicated wallet to have no
+existing approval for the configured builder: Hyperliquid's `maxBuilderFee`
+must read `0`. Cleanup revokes to zero rather than restoring a prior value, so
+a run from any nonzero baseline would erase that approval, and one at or above
+the target would also stop the venue-side check from attributing the change to
+the agent. Provision therefore refuses a nonzero baseline before staging
+anything.
 
 Each run writes a mode-`0600` JSON summary beside the operator state, under
 `harbor-summaries/`. It includes source lineage, installed package hash,

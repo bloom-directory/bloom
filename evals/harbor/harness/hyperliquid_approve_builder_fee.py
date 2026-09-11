@@ -17,7 +17,10 @@ maxBuilderFee query is real evidence that it did.
 
 cleanup() revokes through the full path (ceremony plus submitting write),
 using the max_fee_tenths_bps=0 revocation path, and runs whenever staging
-began rather than only after a confirmed grant.
+began rather than only after a confirmed grant. Because it restores zero
+rather than a prior value, provision() refuses any nonzero starting fee.
+Both ceremonies' counters are reserved together at the end of preflight, so
+the revoke always has one.
 """
 
 from __future__ import annotations
@@ -572,6 +575,11 @@ class HyperliquidApproveBuilderFeeEval(EvalDefinition):
             raise EvalError(
                 "a prior approve_builder_fee ceremony is still awaiting owner action"
             )
+        # Last, immediately before provision() can create authority: claim
+        # both counters this run may spend -- the grant and its mandatory
+        # revoke -- atomically, so a concurrent eval on the same passkey
+        # cannot take the revoke's counter after the grant exists.
+        self.sign_count = self.reserve_run_counters(self.sign_count)
 
     def _pull_eval_image(self) -> None:
         try:
@@ -776,11 +784,16 @@ class HyperliquidApproveBuilderFeeEval(EvalDefinition):
         # target: the verifier proves the agent worked by finding the venue
         # changed, which proves nothing if it was already true beforehand.
         already = self._observed_max_builder_fee()
-        if already >= max_fee:
+        # Cleanup revokes to zero, not to the prior value, so any existing
+        # approval -- even one below the target -- would be erased. One at or
+        # above the target would also make the venue-side check unable to
+        # attribute the change to the agent. Refuse before staging anything.
+        if already != 0:
             raise EvalError(
                 f"Hyperliquid already approves {already} tenths of a bp for this "
-                f"builder (target {max_fee}); a residual approval makes the "
-                "venue-side check unable to attribute the change to the agent"
+                f"builder (target {max_fee}); cleanup revokes to zero and would "
+                "erase that approval. Use a dedicated eval wallet with no "
+                "existing approval for this builder"
             )
         self._stage_grant(max_fee, self.nonce)
 

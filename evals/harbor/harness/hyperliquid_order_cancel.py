@@ -832,6 +832,10 @@ class HyperliquidOrderCancelEval(EvalDefinition):
         self._pull_eval_image()
         self.phase_timings["image_pull_seconds"] = time.monotonic() - image_started
         self._require_empty_wallet()
+        # Last, immediately before provision() creates the session: claim
+        # every counter session creation may spend, atomically, so a
+        # concurrent eval on the same passkey cannot take any of them.
+        self.sign_count = self.reserve_run_counters(self.sign_count)
 
     def provision(self, agent_name: str) -> EvalRunContext:
         sign_count = self.sign_count or self._require_sign_count()

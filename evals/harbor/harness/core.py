@@ -195,6 +195,36 @@ class CounterSidecar:
             self._write_unlocked(attempt + 1)
             return attempt
 
+    def reserve_block(self, candidate: int, count: int) -> int:
+        """Atomically claim `count` consecutive counters; return the first.
+
+        The whole range is recorded as spent before this returns, so no other
+        eval or process on the credential can take a counter inside it. A run
+        that reserves its full ceremony budget this way can never be left
+        without the counter its own cleanup needs. Nothing is written when the
+        range does not fit.
+        """
+        if candidate < 1 or count < 1:
+            raise EvalError("authenticator counter reservation must be positive")
+        try:
+            with self.locked():
+                recorded = self.read()
+                start = candidate if recorded is None else max(candidate, recorded)
+                if start + count - 1 > COUNTER_MAX:
+                    remaining = max(0, COUNTER_MAX - start + 1)
+                    raise EvalError(
+                        f"authenticator counter {start} leaves {remaining} usable "
+                        f"counter(s), but this run needs {count} including its "
+                        f"cleanup; the last usable WebAuthn counter is {COUNTER_MAX}"
+                    )
+                self._write_unlocked(start + count)
+                return start
+        except OSError as error:
+            raise EvalError(
+                "authenticator counter sidecar is not writable, so this run's "
+                f"counters could not be reserved: {error}"
+            ) from error
+
     def verify_writable(self) -> None:
         """Prove a reservation can land, without moving the counter.
 
@@ -269,12 +299,18 @@ class EvalDefinition(ABC):
         draws from one counter sequence.
         """
         self.counter_reserve = sidecar.reserve
+        self.counter_reserve_block = sidecar.reserve_block
         self.counter_committed = None
         self.counter_durability_check = sidecar.verify_writable
         self.counter_floor = sidecar.read
 
     #: Atomically claims a counter and returns the one to sign with.
     counter_reserve: Callable[[int], int] | None = None
+    #: Atomically claims `count` consecutive counters and returns the first.
+    counter_reserve_block: Callable[[int, int], int] | None = None
+    #: The counter range this run owns, once preflight has reserved it.
+    _counter_block_next: int | None = None
+    _counter_block_end: int | None = None
     #: Returns a durably recorded next-unused counter, if one exists.
     counter_floor: Callable[[], int | None] | None = None
     #: The most ceremonies one run of this eval may spend, cleanup included.
@@ -288,9 +324,7 @@ class EvalDefinition(ABC):
         finish would let its first ceremony create authority -- a live grant
         -- that its cleanup then has no valid counter to reconcile.
         """
-        budget = self.CEREMONY_BUDGET
-        if not isinstance(budget, int) or isinstance(budget, bool) or budget < 1:
-            raise EvalError(f"{self.name} does not declare its ceremony budget")
+        budget = self._require_ceremony_budget()
         if start + budget - 1 > COUNTER_MAX:
             remaining = max(0, COUNTER_MAX - start + 1)
             raise EvalError(
@@ -299,6 +333,37 @@ class EvalDefinition(ABC):
                 f"cleanup; the last usable WebAuthn counter is {COUNTER_MAX}"
             )
         return start
+
+    def _require_ceremony_budget(self) -> int:
+        budget = self.CEREMONY_BUDGET
+        if not isinstance(budget, int) or isinstance(budget, bool) or budget < 1:
+            raise EvalError(f"{self.name} does not declare its ceremony budget")
+        return budget
+
+    def reserve_run_counters(self, start: int) -> int:
+        """Claim this run's whole ceremony budget before any authority exists.
+
+        A capacity check that does not reserve is only advisory: two evals on
+        one passkey can both pass it near the top of the range, and one can
+        then spend the counters the other's mandatory cleanup needs after its
+        grant already exists. Reserving the full budget atomically under the
+        credential lock makes that range this run's alone. Counters it never
+        uses are skipped, which is safe; reuse is not.
+
+        Returns the first counter of the range. Called as preflight's last
+        step. Without a shared sidecar -- the operator lifecycle, which runs
+        one eval under its own lock -- there is no competing eval to reserve
+        against, and capacity was already checked.
+        """
+        budget = self._require_ceremony_budget()
+        if self.counter_reserve_block is None:
+            return start
+        if self._counter_block_end is not None:
+            return self._counter_block_next
+        first = self.counter_reserve_block(start, budget)
+        self._counter_block_next = first
+        self._counter_block_end = first + budget
+        return first
 
     def resume_counter(self, configured: int) -> int:
         """The first counter safe to attempt this process.
@@ -352,7 +417,18 @@ class EvalDefinition(ABC):
         times out before the subprocess returns, so persisting afterwards is
         too late to guarantee the counter is never reused.
         """
-        if self.counter_reserve is not None:
+        if self._counter_block_end is not None:
+            # Preflight already recorded this whole range as spent, so a
+            # ceremony inside it needs no further write and cannot collide.
+            attempted = max(candidate, self._counter_block_next)
+            if attempted >= self._counter_block_end:
+                raise EvalError(
+                    f"{self.name} tried to spend more than its budget of "
+                    f"{self.CEREMONY_BUDGET} ceremonies; refusing a counter "
+                    "outside its reserved range"
+                )
+            self._counter_block_next = attempted + 1
+        elif self.counter_reserve is not None:
             attempted = self.counter_reserve(candidate)
         else:
             if candidate > COUNTER_MAX:
