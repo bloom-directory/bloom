@@ -157,13 +157,16 @@ Before any unit is mutated, the transaction (`schema
 bloom.linux-upgrade-transaction.2`) snapshots the installed Bloom-owned unit
 templates — both ceremony sockets, the Broker and Signer service templates, the
 session path, the two user service units, and the retired RPC/control socket
-templates — and, for each enrolled login, the AWS KMS Signer drop-in and the
-credential it loads. It records explicit absence alongside bytes, modes, and
-owners. A rollback stops the release set, restores that contract, reselects the
-previous release, and rewrites release metadata before any restart; a failure
-at any of those steps preserves the transaction instead of starting a Broker
-over mismatched units. The rollback clears the transaction only when every
-enrolled login passes the authenticated health gate.
+templates — recording explicit absence alongside bytes and modes. A rollback
+stops the release set, restores that unit contract, reselects the previous
+release, and rewrites release metadata before any restart; a failure at any of
+those steps preserves the transaction instead of starting a Broker over
+mismatched units. The rollback clears the transaction only when every enrolled
+login passes the authenticated health gate. The per-login AWS KMS Signer
+drop-in and its credential are not part of the snapshot: they follow the
+payload of the last installation, so a KMS host that rolls back after an
+upgrade with a payload lacking the KMS overlay is repaired by rerunning the
+installer with that overlay.
 
 Recovery after an interruption restores the coherent previous installation and
 then lets the verified installer retry the requested release; it never

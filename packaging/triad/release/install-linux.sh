@@ -188,14 +188,6 @@ numeric_file_mode() {
   fi
 }
 
-numeric_file_owner() {
-  if [[ "$(uname -s)" == Darwin ]]; then
-    stat -f '%u:%g' "$1"
-  else
-    stat -c '%u:%g' "$1"
-  fi
-}
-
 # The Broker requires both loopback ceremony listeners, so a host whose
 # kernel cannot bind [::1] cannot run this release. Check before anything is
 # mutated rather than let the health gate discover it after the unit writes.
@@ -638,17 +630,12 @@ switch_linux_release() {
   mv -fT "$replacement" "$release_base/current"
 }
 
-# Every Bloom-owned file the installer overwrites or removes while installing
-# a release. An upgrade transaction snapshots exactly these paths so a
-# rollback restores the previous binary selection together with the unit
-# contract and Signer instance configuration it ran with. The unit templates
-# are shared by every login. Each enrolled login also has an AWS KMS Signer
-# drop-in and the credential it loads: installing a payload without the KMS
-# overlay deletes both, and restoring one without the other would leave the
-# previous Signer loading a missing credential. Administrator units and
-# drop-ins outside this list are never touched by restoration.
+# Every Bloom-owned unit template the installer overwrites or removes while
+# installing a release. An upgrade transaction snapshots exactly these paths
+# so a rollback restores the previous binary selection together with the unit
+# contract it ran with. Administrator units and drop-ins outside this list are
+# never touched by restoration.
 linux_upgrade_unit_paths() {
-  local install_root="$1" record uid
   printf '%s\n' \
     usr/lib/systemd/system/bloom-broker-ceremony@.socket \
     usr/lib/systemd/system/bloom-broker-ceremony-ipv6@.socket \
@@ -661,41 +648,32 @@ linux_upgrade_unit_paths() {
     usr/lib/systemd/system/bloom-broker-control@.socket \
     usr/lib/systemd/user/bloom-session.service \
     usr/lib/systemd/user/bloom-machine.service
-  for record in "$install_root/etc/bloom/enrollments"/*.json; do
-    [[ -f "$record" && ! -L "$record" ]] || continue
-    uid="$(linux_record_number "$record" login_uid)"
-    [[ "$uid" =~ ^[1-9][0-9]*$ ]] || continue
-    printf '%s\n' \
-      "usr/lib/systemd/system/bloom-signer@$uid.service.d/50-aws-kms.conf" \
-      "etc/bloom/$uid/signer/aws-credentials"
-  done
 }
 
 linux_upgrade_unit_is_tracked() {
-  local install_root="$1" candidate="$2" tracked
+  local candidate="$1" tracked
   while IFS= read -r tracked; do
     [[ "$tracked" == "$candidate" ]] && return 0
-  done < <(linux_upgrade_unit_paths "$install_root")
+  done < <(linux_upgrade_unit_paths)
   return 1
 }
 
-# Records the actually installed contract — explicit absence included — into
-# the upgrade transaction scratch directory, one manifest line per tracked
-# path: "present MODE UID:GID PATH" or "absent - - PATH". Fails without
-# mutating the installation when a tracked file is substituted or unreadable.
+# Records the actually installed unit contract — explicit absence included —
+# into the upgrade transaction scratch directory. Fails without mutating the
+# installation when a tracked unit is missing, substituted, or unreadable.
 # Every write is checked explicitly: when this function runs inside a
 # rollback step, errexit is suspended for the whole call tree, so a skipped
 # operation would otherwise be reported as a successful snapshot.
 snapshot_linux_upgrade_units() {
   local install_root="$1" scratch="$2"
-  local relative path mode owner
+  local relative path mode
 
   mkdir -m 0700 "$scratch/units" "$scratch/units/files" || return 65
   : > "$scratch/units/manifest" || return 65
   while IFS= read -r relative; do
     path="$install_root/$relative"
     if [[ ! -e "$path" && ! -L "$path" ]]; then
-      printf 'absent - - %s\n' "$relative" >> "$scratch/units/manifest" || return 65
+      printf 'absent - %s\n' "$relative" >> "$scratch/units/manifest" || return 65
       continue
     fi
     [[ -f "$path" && ! -L "$path" ]] || {
@@ -707,37 +685,16 @@ snapshot_linux_upgrade_units() {
       echo "installed Linux unit has an unusable mode: /$relative" >&2
       return 65
     }
-    owner="$(numeric_file_owner "$path")"
-    [[ "$owner" =~ ^[0-9]+:[0-9]+$ ]] || {
-      echo "installed Linux unit has an unusable owner: /$relative" >&2
-      return 65
-    }
     mkdir -p "$scratch/units/files/$(dirname "$relative")" || return 65
     cp -- "$path" "$scratch/units/files/$relative" || return 65
-    printf 'present %s %s %s\n' "$mode" "$owner" "$relative" \
-      >> "$scratch/units/manifest" || return 65
-  done < <(linux_upgrade_unit_paths "$install_root")
+    printf 'present %s %s\n' "$mode" "$relative" >> "$scratch/units/manifest" || return 65
+  done < <(linux_upgrade_unit_paths)
 }
 
-# Installs one snapshotted file with its recorded mode and owner. Ownership is
-# applied before the rename so a restored credential is never visible under
-# the wrong owner.
-restore_linux_upgrade_file() {
-  local source="$1" destination="$2" mode="$3" owner="$4" temporary
-  temporary="${destination}.restore.$$"
-  mkdir -p "$(dirname "$destination")" || return
-  install -m "$mode" "$source" "$temporary" || return
-  chown "$owner" "$temporary" || {
-    rm -f -- "$temporary"
-    return 1
-  }
-  mv -f "$temporary" "$destination"
-}
-
-# Restores the snapshotted contract: previously present files return with
-# their recorded bytes, modes, and owners, and files that did not exist
-# before the upgrade — such as a newly introduced ceremony socket template —
-# are removed. Every manifest entry is validated against the tracked set
+# Restores the snapshotted unit contract: previously present files return
+# with their recorded bytes and modes, and files that did not exist before
+# the upgrade — such as a newly introduced ceremony socket template — are
+# removed. Every manifest entry is validated against the fixed tracked set
 # before any file is touched, and restoration never interprets a stored path
 # outside that set. The operation is idempotent, so an interrupted recovery
 # can simply run it again.
@@ -745,8 +702,8 @@ restore_linux_upgrade_units() {
   local install_root="$1" transaction="$2"
   local manifest="$transaction/units/manifest"
   local files_root="$transaction/units/files"
-  local state mode owner relative covered="" tracked index
-  local -a states=() modes=() owners=() relatives=()
+  local state mode relative covered="" tracked index
+  local -a states=() modes=() relatives=()
 
   # A schema-1 transaction was recorded before this installer snapshotted
   # units, so there is no unit contract to restore and the binary selection
@@ -766,12 +723,12 @@ restore_linux_upgrade_units() {
     echo "Linux upgrade unit snapshot is missing or unsafe" >&2
     return 65
   }
-  while read -r state mode owner relative; do
+  while read -r state mode relative; do
     [[ "$state" == present || "$state" == absent ]] || {
       echo "Linux upgrade unit snapshot entry is malformed" >&2
       return 65
     }
-    linux_upgrade_unit_is_tracked "$install_root" "$relative" || {
+    linux_upgrade_unit_is_tracked "$relative" || {
       echo "Linux upgrade unit snapshot names an untracked path" >&2
       return 65
     }
@@ -780,21 +737,15 @@ restore_linux_upgrade_units() {
       return 65
     }
     if [[ "$state" == present ]]; then
-      [[ "$mode" =~ ^[0-7]{3,4}$ && "$owner" =~ ^[0-9]+:[0-9]+$ && \
+      [[ "$mode" =~ ^[0-7]{3,4}$ && \
         -f "$files_root/$relative" && ! -L "$files_root/$relative" ]] || {
         echo "Linux upgrade unit snapshot content is missing or unsafe" >&2
-        return 65
-      }
-    else
-      [[ "$mode" == - && "$owner" == - ]] || {
-        echo "Linux upgrade unit snapshot entry is malformed" >&2
         return 65
       }
     fi
     covered="$covered $relative"
     states+=("$state")
     modes+=("$mode")
-    owners+=("$owner")
     relatives+=("$relative")
   done < "$manifest"
   while IFS= read -r tracked; do
@@ -802,7 +753,7 @@ restore_linux_upgrade_units() {
       echo "Linux upgrade unit snapshot does not cover the tracked unit set" >&2
       return 65
     }
-  done < <(linux_upgrade_unit_paths "$install_root")
+  done < <(linux_upgrade_unit_paths)
 
   # Activation audit: the only persisted enablement this design creates is
   # bloom-session@<uid>.path, which start_linux_release_set re-enables. The
@@ -815,11 +766,14 @@ restore_linux_upgrade_units() {
   for index in "${!relatives[@]}"; do
     relative="${relatives[$index]}"
     if [[ "${states[$index]}" == present ]]; then
-      restore_linux_upgrade_file \
+      mkdir -p "$install_root/$(dirname "$relative")" || {
+        echo "Linux upgrade unit restoration failed: /$relative" >&2
+        return 65
+      }
+      atomic_install \
         "$files_root/$relative" \
         "$install_root/$relative" \
-        "${modes[$index]}" \
-        "${owners[$index]}" || {
+        "${modes[$index]}" || {
         echo "Linux upgrade unit restoration failed: /$relative" >&2
         return 65
       }
@@ -828,11 +782,6 @@ restore_linux_upgrade_units() {
         echo "Linux upgrade unit restoration failed: /$relative" >&2
         return 65
       }
-      # The installer removes an emptied drop-in directory; so does the
-      # restoration of a drop-in that did not exist before the upgrade.
-      if [[ "$relative" == */*.service.d/* ]]; then
-        rmdir -- "$install_root/$(dirname "$relative")" 2>/dev/null || true
-      fi
     fi
   done
 }
@@ -1807,9 +1756,9 @@ case "$action" in
         exit 64
       }
     fi
-    # An upgrade snapshot covers every enrolled login's Signer drop-in and
-    # credential, and restoration checks it against the enrollments present
-    # then. Removing an enrollment first leaves a transaction no run restores.
+    # A pending upgrade transaction means the installed units, binaries, and
+    # release metadata may be mixed. Recover the previous installation before
+    # changing which logins are enrolled.
     [[ ! -e "$root/var/lib/bloom/upgrade-transaction" && \
       ! -L "$root/var/lib/bloom/upgrade-transaction" ]] || {
       echo "an interrupted Linux upgrade must be recovered first; rerun the Bloom installer" >&2

@@ -1,7 +1,7 @@
 use sha2::{Digest as _, Sha256};
 use std::{
     fs,
-    os::unix::fs::{MetadataExt as _, PermissionsExt as _},
+    os::unix::fs::PermissionsExt as _,
     path::{Path, PathBuf},
     process::Command,
 };
@@ -3465,118 +3465,9 @@ fn linux_upgrade_recovery_failure_preserves_the_transaction_and_retries() {
     assert!(!root.join("var/lib/bloom/upgrade-transaction").exists());
 }
 
-/// The AWS KMS Signer drop-in and the credential it loads are Bloom-owned
-/// and deleted or rewritten by an installation. A rollback must return both
-/// with their bytes, modes, and owners — or remove them when the previous
-/// installation had neither — so the previous Signer never starts loading a
-/// credential that is not there.
-#[test]
-fn linux_upgrade_recovery_restores_the_signer_kms_dropin_and_credential() {
-    let directory = tempfile::tempdir().unwrap();
-    let harness = write_linux_upgrade_harness(directory.path());
-    let installer = release_script("install-linux.sh");
-    let dropin = "usr/lib/systemd/system/bloom-signer@1000.service.d/50-aws-kms.conf";
-    let credential = "etc/bloom/1000/signer/aws-credentials";
-    let dropin_bytes = b"[Service]\nIPAddressAllow=192.0.2.0/24\nLoadCredential=aws-credentials:/etc/bloom/%i/signer/aws-credentials\n";
-    let credential_bytes = b"[default]\naws_access_key_id=previous\n";
-
-    // Present before the upgrade; the candidate payload has no KMS overlay
-    // and deletes both.
-    let removed_root = tempfile::tempdir().unwrap();
-    let (root, layout, old_digest, new_digest) = {
-        let (root, layout, old_digest, new_digest, _) =
-            stage_linux_upgrade_root(removed_root.path(), &harness, "interrupt", "all", |root| {
-                for (relative, bytes, mode) in [
-                    (dropin, &dropin_bytes[..], 0o644),
-                    (credential, &credential_bytes[..], 0o600),
-                ] {
-                    let path = root.join(relative);
-                    fs::create_dir_all(path.parent().unwrap()).unwrap();
-                    fs::write(&path, bytes).unwrap();
-                    set_linux_mode(&path, mode);
-                }
-            });
-        (root, layout, old_digest, new_digest)
-    };
-    let manifest =
-        fs::read_to_string(root.join("var/lib/bloom/upgrade-transaction/units/manifest")).unwrap();
-    for relative in [dropin, credential] {
-        assert!(
-            manifest
-                .lines()
-                .any(|line| line.starts_with("present ") && line.ends_with(relative)),
-            "the snapshot must record {relative}: {manifest}"
-        );
-    }
-    let owner = {
-        let metadata = fs::metadata(root.join(credential)).unwrap();
-        (metadata.uid(), metadata.gid())
-    };
-    fs::remove_file(root.join(credential)).unwrap();
-    fs::remove_dir_all(root.join(dropin).parent().unwrap()).unwrap();
-    let recovered = run_linux_upgrade_harness(
-        &harness,
-        &installer,
-        &root,
-        "recover",
-        &removed_root.path().join("recover.log"),
-        &[&old_digest, &new_digest],
-    );
-    assert!(
-        recovered.status.success(),
-        "{}",
-        String::from_utf8_lossy(&recovered.stderr)
-    );
-    assert_pre_ipv6_linux_contract(&root, &layout);
-    for (relative, bytes, mode) in [
-        (dropin, &dropin_bytes[..], 0o644),
-        (credential, &credential_bytes[..], 0o600),
-    ] {
-        let path = root.join(relative);
-        assert_eq!(fs::read(&path).unwrap(), bytes, "{relative} bytes");
-        let metadata = fs::metadata(&path).unwrap();
-        assert_eq!(
-            metadata.permissions().mode() & 0o777,
-            mode,
-            "{relative} mode"
-        );
-        assert_eq!((metadata.uid(), metadata.gid()), owner, "{relative} owner");
-    }
-
-    // Absent before the upgrade; the candidate added both. Restoration
-    // removes them and the emptied drop-in directory.
-    let added_root = tempfile::tempdir().unwrap();
-    let (root, _layout, old_digest, new_digest, _) =
-        stage_linux_upgrade_root(added_root.path(), &harness, "interrupt", "all", |root| {
-            fs::remove_file(root.join(credential)).unwrap();
-            fs::remove_dir_all(root.join(dropin).parent().unwrap()).unwrap();
-        });
-    for relative in [dropin, credential] {
-        let path = root.join(relative);
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(&path, b"candidate").unwrap();
-    }
-    let recovered = run_linux_upgrade_harness(
-        &harness,
-        &installer,
-        &root,
-        "recover",
-        &added_root.path().join("recover.log"),
-        &[&old_digest, &new_digest],
-    );
-    assert!(
-        recovered.status.success(),
-        "{}",
-        String::from_utf8_lossy(&recovered.stderr)
-    );
-    assert!(!root.join(credential).exists());
-    assert!(!root.join(dropin).parent().unwrap().exists());
-}
-
-/// The snapshot covers every enrolled login's Signer drop-in and credential,
-/// and restoration checks it against the enrollments present at that time.
-/// Uninstalling a login in between would leave a transaction no later run can
-/// restore, so uninstall refuses until recovery has run.
+/// Uninstall refuses while an interrupted upgrade is pending: the installed
+/// units, binaries, and release metadata may be mixed until recovery restores
+/// the previous installation. Once recovery has run, uninstall proceeds.
 #[test]
 fn linux_uninstall_refuses_while_an_interrupted_upgrade_is_pending() {
     let directory = tempfile::tempdir().unwrap();
