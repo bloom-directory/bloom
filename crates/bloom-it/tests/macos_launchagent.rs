@@ -476,14 +476,18 @@ fn privileged_w0_harness_requires_an_external_disposable_host_marker() {
     assert!(source.contains("/private/var/db/bloom-w0-disposable-host"));
     assert!(source.contains("bloom-macos-unix-w0-disposable-v1"));
     assert!(source.contains("macos-unix-principals-w0"));
-    assert!(source.contains("/usr/bin/nc -lk 127.0.0.1 18734"));
+    // A foreign listener on either loopback family must block the Broker.
+    assert!(source.contains("/usr/bin/nc \"-$family\" -lk \"$address\" 18734"));
+    assert!(source.contains("assert_foreign_ceremony_conflict 4 127.0.0.1 127.0.0.1"));
+    assert!(source.contains("assert_foreign_ceremony_conflict 6 ::1 '[::1]'"));
+    assert!(source.contains("for ceremony_host in 127.0.0.1 '[::1]'; do"));
     assert!(source.contains("Broker opened a fallback TCP listener"));
     assert!(source.contains("ceremony_listeners_unavailable"));
     assert!(source.contains(
         "Bloom Broker startup failed: could not acquire both ceremony loopback listeners"
     ));
     let foreign_bind = source
-        .find("/usr/bin/nc -lk 127.0.0.1 18734")
+        .find("/usr/bin/nc \"-$family\" -lk \"$address\" 18734")
         .expect("foreign listener bind");
     let broker_bootstrap = source[foreign_bind..]
         .find("launchctl bootstrap system \"$broker_plist\"")
@@ -501,7 +505,11 @@ fn privileged_w0_harness_requires_an_external_disposable_host_marker() {
     assert!(source.contains("Machine login sampled"));
     assert!(source.contains("session sentinel did not reject an unauthorized login-UID peer"));
     assert!(source.contains("services did not drain after the login-session sentinel disappeared"));
-    assert!(source.contains("Broker retained the ceremony listener after session logout"));
+    assert!(
+        source.contains(
+            "Broker retained the ceremony listener on $ceremony_host after session logout"
+        )
+    );
     assert!(source.contains("launchctl bootstrap \"user/$login_uid\" \"$session_plist\""));
     assert!(source.contains("run-installed-acceptance.sh"));
     assert!(source.contains("BLOOM_MACOS_INSTALLED_ACCEPTANCE_MAIN_ROOT"));
