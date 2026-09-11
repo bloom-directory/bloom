@@ -165,10 +165,10 @@ mismatched units. Recovery after an interruption always restores the coherent
 previous installation first and then lets the verified installer retry the
 requested release; it never completes the interrupted candidate in place. A
 transaction recorded by an earlier installer (`schema
-bloom.linux-upgrade-transaction.1`) carries no unit snapshot, so the installer
-refuses to recover it automatically: remove `/var/lib/bloom/upgrade-transaction`
-and reinstall a verified release payload, which rewrites every Bloom-owned unit
-coherently before starting anything.
+bloom.linux-upgrade-transaction.1`) carries no unit snapshot; it is recovered
+by rolling the binary selection and release metadata back on their own, as the
+installer that opened it would have, and the retried installation then rewrites
+every Bloom-owned unit coherently before starting anything.
 
 Linux installs provide `bloom-uninstall`. Its default `--retain-custody` mode
 stops and disables the selected enrollment, removes runtime integration, and

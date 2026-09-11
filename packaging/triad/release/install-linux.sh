@@ -672,6 +672,19 @@ restore_linux_upgrade_units() {
   local state mode relative covered="" tracked index
   local -a states=() modes=() relatives=()
 
+  # A schema-1 transaction was recorded before this installer snapshotted
+  # units, so there is no unit contract to restore and the binary selection
+  # and release metadata are rolled back on their own, exactly as the
+  # installer that opened it would have. Refusing instead strands the host:
+  # the interrupted upgrade already marked its enrollment records activating,
+  # and every later run is rejected by validate_linux_release_set before it
+  # can rewrite them. This is keyed on the recorded schema, never on the
+  # snapshot being absent — a schema-2 transaction without one is invalid.
+  if [[ -f "$transaction/schema" && ! -L "$transaction/schema" ]] &&
+    [[ "$(<"$transaction/schema")" == bloom.linux-upgrade-transaction.1 ]]
+  then
+    return 0
+  fi
   [[ -f "$manifest" && ! -L "$manifest" && \
     -d "$files_root" && ! -L "$files_root" ]] || {
     echo "Linux upgrade unit snapshot is missing or unsafe" >&2
@@ -965,15 +978,11 @@ recover_interrupted_linux_upgrade() {
   schema="$(<"$transaction/schema")"
   old_digest="$(<"$transaction/old-digest")"
   new_digest="$(<"$transaction/new-digest")"
-  if [[ "$schema" == bloom.linux-upgrade-transaction.1 ]]; then
-    # A transaction from an earlier installer carries no unit snapshot, so a
-    # coherent old-layout rollback cannot be reconstructed. Preserve it and
-    # fail explicitly; the supported recovery is documented in the release
-    # README next to this installer.
-    echo "interrupted Linux upgrade predates unit snapshots; remove $transaction and reinstall a verified release payload to recover" >&2
-    return 65
-  fi
-  [[ "$schema" == bloom.linux-upgrade-transaction.2 && \
+  # Schema 1 predates unit snapshots and is recovered without one. It is the
+  # only format an already-deployed installer can leave behind, and there is
+  # no supported path that reaches a running release without rolling it back.
+  [[ ("$schema" == bloom.linux-upgrade-transaction.1 || \
+    "$schema" == bloom.linux-upgrade-transaction.2) && \
     "$old_digest" =~ ^[0-9a-f]{64}$ && \
     "$new_digest" =~ ^[0-9a-f]{64}$ ]] || {
     echo "invalid interrupted Linux upgrade" >&2

@@ -3499,8 +3499,10 @@ fn linux_upgrade_recovery_shares_templates_and_rejects_foreign_transactions() {
             .is_file()
     );
 
-    // A transaction from the earlier installer has no unit snapshot and must
-    // not be fabricated into a rollback.
+    // A transaction from the earlier installer carries no unit snapshot. It
+    // is recovered without one — binary selection and release metadata only —
+    // because it is the only interrupted state a deployed host can be in, and
+    // refusing it leaves that host with no supported way forward.
     let legacy_root = tempfile::tempdir().unwrap();
     let (root, _layout, _old_digest, new_digest) =
         stage_interrupted_linux_root(legacy_root.path(), &harness, "all");
@@ -3509,6 +3511,7 @@ fn linux_upgrade_recovery_shares_templates_and_rejects_foreign_transactions() {
         "bloom.linux-upgrade-transaction.1\n",
     )
     .unwrap();
+    fs::remove_dir_all(root.join("var/lib/bloom/upgrade-transaction/units")).unwrap();
     let (candidate, _) = make_linux_candidate_payload(
         legacy_root.path(),
         "release-b",
@@ -3519,24 +3522,31 @@ fn linux_upgrade_recovery_shares_templates_and_rejects_foreign_transactions() {
         &root,
         &["install", "1000", "alice", candidate.to_str().unwrap()],
     );
-    assert!(!legacy.status.success());
-    let stderr = String::from_utf8_lossy(&legacy.stderr);
     assert!(
-        stderr.contains("predates unit snapshots"),
-        "legacy transactions need the explicit documented recovery: {stderr}"
+        legacy.status.success(),
+        "a legacy transaction did not recover: {}",
+        String::from_utf8_lossy(&legacy.stderr)
+    );
+    assert!(!root.join("var/lib/bloom/upgrade-transaction").exists());
+    assert!(
+        fs::read_to_string(root.join("usr/lib/systemd/system/bloom-broker-ceremony@.socket"))
+            .unwrap()
+            .contains("FileDescriptorName=broker-ceremony-ipv4"),
+        "the retried installation must rewrite the units the rollback could not restore"
     );
     assert!(
-        root.join("var/lib/bloom/upgrade-transaction/schema")
-            .is_file()
-    );
-    assert_eq!(
-        fs::read(root.join("usr/lib/systemd/system/bloom-broker-ceremony@.socket")).unwrap(),
-        b"candidate v4 socket\n",
-        "legacy recovery must fail before touching the installation"
+        fs::read_to_string(root.join("etc/bloom/1000/machine.env"))
+            .unwrap()
+            .contains(&format!("BLOOM_RELEASE_DIGEST={new_digest}")),
+        "the retried installation must complete the upgrade to the candidate"
     );
 
-    // Unknown schema versions and snapshot-less transactions also fail
-    // closed without mutating anything.
+    // Unknown schema versions still fail closed without mutating anything.
+    // The legacy transaction above was consumed by its recovery, so this
+    // needs an interrupted installation of its own.
+    let future_root = tempfile::tempdir().unwrap();
+    let (root, _layout, _old_digest, _new_digest) =
+        stage_interrupted_linux_root(future_root.path(), &harness, "all");
     fs::write(
         root.join("var/lib/bloom/upgrade-transaction/schema"),
         "bloom.linux-upgrade-transaction.3\n",
@@ -3700,4 +3710,101 @@ fn macos_installer_never_repairs_or_overwrites_a_digest_named_release() {
             .contains("digest-named release does not match the verified payload")
     );
     assert_eq!(fs::read(installed_broker).unwrap(), b"substituted");
+}
+
+/// A transaction left by an already-deployed installer carries no unit
+/// snapshot. It is still the only interrupted state a real host can be in
+/// today, and it has to recover on its own: the interruption already marked
+/// the enrollment records `activating`, so an installer that refuses to roll
+/// the transaction back strands the host behind `validate_linux_release_set`
+/// with no supported way forward.
+#[test]
+fn linux_legacy_interrupted_upgrade_recovers_without_operator_intervention() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("root");
+    fs::create_dir(&root).unwrap();
+    let payload_a = make_installer_payload(&directory.path().join("release-a"));
+    let old_digest = hex::encode(Sha256::digest(b"test payload\n"));
+    assert!(
+        run_linux_installer(
+            &root,
+            &["install", "1000", "alice", payload_a.to_str().unwrap()],
+        )
+        .status
+        .success()
+    );
+    let _layout = apply_pre_ipv6_linux_layout(&root);
+    let (payload_b, new_digest) = make_linux_candidate_payload(
+        directory.path(),
+        "release-b",
+        b"upgraded-broker",
+        b"upgraded manifest\n",
+    );
+
+    // The candidate release is staged and the metadata has moved forward, but
+    // the interruption fell before the binary switch — the window the
+    // previous installer opened with `rewrite_linux_release_set activating`.
+    let releases = root.join("usr/libexec/bloom/releases").join(&new_digest);
+    fs::create_dir_all(&releases).unwrap();
+    for binary in [
+        "bloom",
+        "bloom-broker",
+        "bloom-signer",
+        "bloom-signer-migrate",
+    ] {
+        fs::copy(payload_b.join("bin").join(binary), releases.join(binary)).unwrap();
+        set_linux_mode(&releases.join(binary), 0o755);
+    }
+    for relative in [
+        "etc/bloom/enrollments/1000.json",
+        "etc/bloom/1000/broker/config.json",
+        "etc/bloom/1000/signer/config.json",
+        "etc/bloom/1000/machine.env",
+    ] {
+        let path = root.join(relative);
+        let moved = fs::read_to_string(&path)
+            .unwrap()
+            .replace(&old_digest, &new_digest)
+            .replace("\"state\":\"active\"", "\"state\":\"activating\"");
+        fs::write(&path, moved).unwrap();
+    }
+    let transaction = root.join("var/lib/bloom/upgrade-transaction");
+    fs::create_dir_all(&transaction).unwrap();
+    fs::write(
+        transaction.join("schema"),
+        "bloom.linux-upgrade-transaction.1\n",
+    )
+    .unwrap();
+    fs::write(transaction.join("old-digest"), format!("{old_digest}\n")).unwrap();
+    fs::write(transaction.join("new-digest"), format!("{new_digest}\n")).unwrap();
+
+    let recovered = run_linux_installer(
+        &root,
+        &["install", "1000", "alice", payload_b.to_str().unwrap()],
+    );
+    assert!(
+        recovered.status.success(),
+        "a legacy interrupted upgrade did not recover: {}",
+        String::from_utf8_lossy(&recovered.stderr)
+    );
+    assert!(!transaction.exists());
+    // Rolled back to the previous release, then retried forward coherently:
+    // the candidate binary is selected under the candidate's units.
+    assert_eq!(
+        fs::read(root.join("usr/libexec/bloom/current/bloom-broker")).unwrap(),
+        b"upgraded-broker"
+    );
+    assert!(
+        fs::read_to_string(root.join("usr/lib/systemd/system/bloom-broker-ceremony@.socket"))
+            .unwrap()
+            .contains("FileDescriptorName=broker-ceremony-ipv4")
+    );
+    assert!(
+        root.join("usr/lib/systemd/system/bloom-broker-ceremony-ipv6@.socket")
+            .is_file()
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("etc/bloom/1000/machine.env")).unwrap(),
+        format!("BLOOM_NFS_LISTEN=127.0.0.1:20000\nBLOOM_RELEASE_DIGEST={new_digest}\n")
+    );
 }
