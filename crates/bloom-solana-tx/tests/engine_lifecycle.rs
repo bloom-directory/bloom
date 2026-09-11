@@ -38,6 +38,9 @@ struct BrokerFixture {
     conflicts: Mutex<u32>,
     /// When set, the next signing request is answered with this error.
     next_sign_error: Mutex<Option<(ProtocolErrorCode, String)>>,
+    prepare_calls: std::sync::atomic::AtomicUsize,
+    block_prepares: std::sync::atomic::AtomicBool,
+    prepare_release: tokio::sync::Semaphore,
 }
 
 impl BrokerFixture {
@@ -59,6 +62,9 @@ impl BrokerFixture {
             prepared_ids: Mutex::new(Vec::new()),
             conflicts: Mutex::new(0),
             next_sign_error: Mutex::new(None),
+            prepare_calls: std::sync::atomic::AtomicUsize::new(0),
+            block_prepares: std::sync::atomic::AtomicBool::new(false),
+            prepare_release: tokio::sync::Semaphore::new(0),
         }
     }
     fn child_pubkey(&self) -> [u8; 32] {
@@ -81,6 +87,17 @@ impl BrokerFixture {
 
     fn fail_next_signature(&self, code: ProtocolErrorCode, message: &str) {
         *self.next_sign_error.lock().unwrap() = Some((code, message.to_owned()));
+    }
+
+    fn block_approval_prepares(&self) {
+        self.block_prepares
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn release_approval_prepares(&self) {
+        self.block_prepares
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        self.prepare_release.add_permits(1);
     }
 }
 
@@ -165,6 +182,18 @@ impl MachineBrokerService for BrokerFixture {
                     terms,
                     ..
                 }) => {
+                    self.prepare_calls
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if self
+                        .block_prepares
+                        .load(std::sync::atomic::Ordering::SeqCst)
+                    {
+                        self.prepare_release
+                            .acquire()
+                            .await
+                            .expect("test semaphore remains open")
+                            .forget();
+                    }
                     // The Broker keys a prepared ceremony by operation id and
                     // compares the whole request against what it stored. Model
                     // that here: same id, different terms, permanent refusal.
@@ -1541,6 +1570,62 @@ async fn confirming_the_same_transfer_twice_reaches_the_same_ceremony() {
         .expect("the attempt is durable");
     assert_eq!(attempt.attempt, 0, "this is still the first attempt");
     assert_eq!(attempt.issued_at_ms, 1_100);
+}
+
+#[tokio::test]
+async fn overlapping_confirms_are_serialized_through_approval_preparation() {
+    let (_dir, _outbox, broker, engine) = retry_fixture().await;
+    let staged = stage_for_retry(&engine, &broker).await;
+    let engine = Arc::new(engine);
+    let fee_payer = broker.child_pubkey();
+    broker.block_approval_prepares();
+
+    let first_engine = engine.clone();
+    let first_id = staged.id.clone();
+    let first = tokio::spawn(async move {
+        first_engine
+            .sign("wallet", &first_id, &fee_payer, None, None, 1_100)
+            .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while broker
+            .prepare_calls
+            .load(std::sync::atomic::Ordering::SeqCst)
+            == 0
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the first confirm must reach approval preparation");
+
+    let second_engine = engine.clone();
+    let second_id = staged.id.clone();
+    let second = tokio::spawn(async move {
+        second_engine
+            .sign("wallet", &second_id, &fee_payer, None, None, 2_100)
+            .await
+    });
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), async {
+            while broker
+                .prepare_calls
+                .load(std::sync::atomic::Ordering::SeqCst)
+                < 2
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .is_err(),
+        "a second confirm must not enter Broker while the first owns the transfer lock"
+    );
+
+    broker.release_approval_prepares();
+    let first = approval_required(first.await.unwrap().unwrap());
+    let second = approval_required(second.await.unwrap().unwrap());
+    assert_eq!(first, second);
+    assert_eq!(broker.conflicts(), 0);
 }
 
 /// bloom#237: a definite refusal used to leave the dead approval in place, so
