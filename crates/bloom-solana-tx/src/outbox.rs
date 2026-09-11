@@ -694,6 +694,7 @@ impl SolanaOutbox {
     /// names are always those of the entry it sits in.
     pub fn approval_challenge(
         staged: &StagedSolanaTransfer,
+        outbox_path: &str,
         approval_id: &str,
         ceremony_url: &str,
         expiry_ms: u64,
@@ -713,8 +714,8 @@ impl SolanaOutbox {
             "destination": staged.destination,
             "lamports": staged.lamports,
             "fee_lamports": staged.fee_lamports,
-            "plan_path": format!("wallets/{wallet}/chains/{chain}/outbox/pending/{id}/plan.md"),
-            "retry_path": format!("wallets/{wallet}/chains/{chain}/outbox/pending/{id}/confirm"),
+            "plan_path": format!("{outbox_path}/pending/{id}/plan.md"),
+            "retry_path": format!("{outbox_path}/pending/{id}/confirm"),
         }))?)
     }
 

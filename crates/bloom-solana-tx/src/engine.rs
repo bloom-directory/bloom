@@ -494,8 +494,15 @@ impl SolanaTransferEngine {
                     .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
             && let Some(approval_id) = previous["approval_id"].as_str()
         {
+            let staged = &successor.staged;
+            let default_scope = format!("wallets/{}/chains/{}/outbox", staged.wallet, staged.chain);
+            let outbox_scope = previous["plan_path"]
+                .as_str()
+                .and_then(|plan| plan.split_once("/pending/").map(|(prefix, _)| prefix))
+                .unwrap_or(default_scope.as_str());
             let challenge = SolanaOutbox::approval_challenge(
-                &successor.staged,
+                staged,
+                outbox_scope,
                 approval_id,
                 previous["ceremony_url"].as_str().unwrap_or_default(),
                 previous["expiry_ms"].as_u64().unwrap_or_default(),

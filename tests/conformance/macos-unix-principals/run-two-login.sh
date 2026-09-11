@@ -198,7 +198,6 @@ if [[ -n "$upgrade_payload" ]]; then
     Library/LaunchAgents/com.bloom.machine.plist \
     "Library/LaunchDaemons/com.bloom.broker.$login_uid_a.plist" \
     "Library/LaunchDaemons/com.bloom.signer.$login_uid_a.plist" \
-    "etc/pf.anchors/com.bloom.triad.$login_uid_a" \
     "etc/newsyslog.d/bloom-$login_uid_a.conf")
   chown -R root:wheel "$transaction"
   chmod 0600 "$transaction"/*
@@ -339,7 +338,7 @@ then
   exit 1
 fi
 grep -F \
-  'Bloom Broker startup failed: another login session owns the Bloom ceremony listener' \
+  'Bloom Broker startup failed: could not acquire both ceremony loopback listeners; see Broker service logs' \
   <<<"$machine_failure" >/dev/null
 
 [[ "$(stat -f '%u:%g:%Lp' "$startup_status_a")" == \
@@ -348,9 +347,9 @@ grep -F \
   "bloom.broker-startup.1" ]]
 [[ "$(plutil -extract state raw -o - "$startup_status_a")" == "fatal" ]]
 [[ "$(plutil -extract incident raw -o - "$startup_status_a")" == \
-  "another_login_session" ]]
+  "ceremony_listeners_unavailable" ]]
 [[ "$(plutil -extract message raw -o - "$startup_status_a")" == \
-  "another login session owns the Bloom ceremony listener" ]]
+  "could not acquire both ceremony loopback listeners; see Broker service logs" ]]
 if lsof -nP -a -u "bloom-broker-$login_uid_a" -iTCP -sTCP:LISTEN |
   grep . >/dev/null
 then

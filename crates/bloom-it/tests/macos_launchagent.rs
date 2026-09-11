@@ -1,4 +1,3 @@
-#[cfg(target_os = "macos")]
 use std::process::Command;
 use std::{
     fs,
@@ -169,22 +168,7 @@ fn installed_acceptance_derives_the_signed_release_digest_and_reads_sources_as_l
 }
 
 #[test]
-fn pf_source_denies_broker_and_signer_by_numeric_effective_uid() {
-    let source =
-        fs::read_to_string(workspace().join("packaging/triad/macos/pf/com.bloom.login.conf.in"))
-            .expect("read packet-filter source");
-    assert!(source.contains("user @BLOOM_SIGNER_UID@"));
-    assert!(source.contains("user @BLOOM_BROKER_UID@"));
-    assert!(source.contains("pass out quick on lo0 inet proto tcp"));
-    assert!(source.contains("from 127.0.0.1 port 18734 to 127.0.0.1"));
-    assert!(source.contains("flags A/A user @BLOOM_BROKER_UID@"));
-    assert!(source.contains("block return out quick"));
-    assert!(!source.contains("0.0.0.0/0"));
-    assert!(!source.contains("::/0"));
-}
-
-#[test]
-fn root_pf_monitor_has_no_rpc_or_custody_surface_and_services_require_its_attestation() {
+fn legacy_monitor_preserves_session_lifecycle_without_claiming_network_containment() {
     let plist = fs::read_to_string(
         workspace().join("packaging/triad/macos/launchdaemons/com.bloom.containment.plist.in"),
     )
@@ -198,7 +182,9 @@ fn root_pf_monitor_has_no_rpc_or_custody_surface_and_services_require_its_attest
     assert!(!plist.contains("<key>Sockets</key>"));
 
     let monitor = fs::read_to_string(workspace().join("crates/bloom/src/pf_monitor.rs")).unwrap();
-    assert!(monitor.contains("/sbin/pfctl"));
+    assert!(!monitor.contains("/sbin/pfctl"));
+    assert!(monitor.contains("available: false"));
+    assert!(monitor.contains("network_enforcement: \"none\""));
     assert!(monitor.contains("bloom.macos-platform-status.3"));
     assert!(monitor.contains("/usr/sbin/systemsetup"));
     assert!(monitor.contains("Network Time: On"));
@@ -233,7 +219,7 @@ fn root_pf_monitor_has_no_rpc_or_custody_surface_and_services_require_its_attest
         )
         .unwrap();
         assert!(source.contains("\"network_containment\""));
-        assert!(source.contains("@BLOOM_CONTAINMENT_STATUS@"));
+        assert!(source.contains("\"network_containment\": null"));
     }
 }
 
@@ -400,7 +386,9 @@ fn activating_enrollment_is_accepted_during_forward_convergence() {
     }
     let sentinel =
         fs::read_to_string(workspace().join("crates/bloom/src/session_sentinel.rs")).unwrap();
-    assert!(sentinel.contains("Some(\"activating\" | \"active\")"));
+    assert!(sentinel.contains(
+        "state == \"active\" || (cfg!(target_os = \"macos\") && state == \"activating\")"
+    ));
     let installer =
         fs::read_to_string(workspace().join("packaging/triad/release/install-macos.sh")).unwrap();
     assert!(installer.contains("activate_current_enrollment"));
@@ -488,25 +476,26 @@ fn privileged_w0_harness_requires_an_external_disposable_host_marker() {
     assert!(source.contains("/private/var/db/bloom-w0-disposable-host"));
     assert!(source.contains("bloom-macos-unix-w0-disposable-v1"));
     assert!(source.contains("macos-unix-principals-w0"));
-    assert!(source.contains("/usr/bin/nc -lk 127.0.0.1 18734"));
+    // A foreign listener on either loopback family must block the Broker.
+    assert!(source.contains("/usr/bin/nc \"-$family\" -lk \"$address\" 18734"));
+    assert!(source.contains("assert_foreign_ceremony_conflict 4 127.0.0.1 127.0.0.1"));
+    assert!(source.contains("assert_foreign_ceremony_conflict 6 ::1 '[::1]'"));
+    assert!(source.contains("for ceremony_host in 127.0.0.1 '[::1]'; do"));
     assert!(source.contains("Broker opened a fallback TCP listener"));
-    assert!(source.contains("foreign_or_unverifiable_process"));
-    assert!(source.contains("Bloom Broker startup failed: a foreign or unverifiable process"));
+    assert!(source.contains("ceremony_listeners_unavailable"));
+    assert!(source.contains(
+        "Bloom Broker startup failed: could not acquire both ceremony loopback listeners"
+    ));
     let foreign_bind = source
-        .find("/usr/bin/nc -lk 127.0.0.1 18734")
+        .find("/usr/bin/nc \"-$family\" -lk \"$address\" 18734")
         .expect("foreign listener bind");
-    let freshness_wait = source[foreign_bind..]
-        .find("network_containment.maximum_age_ms")
-        .map(|offset| foreign_bind + offset)
-        .expect("containment freshness wait after foreign bind");
-    let broker_bootstrap = source[freshness_wait..]
+    let broker_bootstrap = source[foreign_bind..]
         .find("launchctl bootstrap system \"$broker_plist\"")
-        .map(|offset| freshness_wait + offset)
-        .expect("Broker bootstrap after containment freshness wait");
-    assert!(foreign_bind < freshness_wait && freshness_wait < broker_bootstrap);
-    assert!(source.contains("Signer opened a forbidden IPv6 loopback TCP connection"));
-    assert!(source.contains("assert_udp_blocked"));
-    assert!(source.contains("forbidden non-loopback IPv4 TCP connection"));
+        .map(|offset| foreign_bind + offset)
+        .expect("Broker bootstrap after foreign bind");
+    assert!(foreign_bind < broker_bootstrap);
+    assert!(source.contains("legacy Bloom PF rules remain loaded"));
+    assert!(!source.contains("assert_udp_blocked"));
     assert!(source.contains("unrelated local UID opened protected Unix endpoint"));
     assert!(source.contains("Machine login opened the Broker-to-Signer data endpoint"));
     assert!(source.contains("assert_principal_cannot_replace"));
@@ -516,8 +505,12 @@ fn privileged_w0_harness_requires_an_external_disposable_host_marker() {
     assert!(source.contains("Machine login sampled"));
     assert!(source.contains("session sentinel did not reject an unauthorized login-UID peer"));
     assert!(source.contains("services did not drain after the login-session sentinel disappeared"));
-    assert!(source.contains("Broker retained the ceremony listener after session logout"));
-    assert!(source.contains("launchctl bootstrap \"gui/$login_uid\" \"$session_plist\""));
+    assert!(
+        source.contains(
+            "Broker retained the ceremony listener on $ceremony_host after session logout"
+        )
+    );
+    assert!(source.contains("launchctl bootstrap \"user/$login_uid\" \"$session_plist\""));
     assert!(source.contains("run-installed-acceptance.sh"));
     assert!(source.contains("BLOOM_MACOS_INSTALLED_ACCEPTANCE_MAIN_ROOT"));
     assert!(
@@ -531,7 +524,7 @@ fn privileged_w0_harness_requires_an_external_disposable_host_marker() {
     )
     .unwrap();
     assert!(two_login.contains("active GUI domains for both selected users"));
-    assert!(two_login.contains("another_login_session"));
+    assert!(two_login.contains("ceremony_listeners_unavailable"));
     assert!(two_login.contains("second Broker opened a fallback TCP listener"));
     assert!(two_login.contains("launchctl bootout \"gui/$login_uid_b\""));
     assert!(two_login.contains("through failure-only KeepAlive"));
@@ -558,7 +551,7 @@ fn privileged_w0_harness_requires_an_external_disposable_host_marker() {
     assert!(installed_acceptance.contains("mui_11"));
     assert!(installed_acceptance.contains("mui_12"));
     assert!(installed_acceptance.contains("TeamIdentifier="));
-    assert!(installed_acceptance.contains("release gate emitted a production macOS claim"));
+    assert!(installed_acceptance.contains("check-release-contract.sh"));
     assert!(installed_acceptance.contains("BLOOM_ACCEPTANCE_BUNDLE_ROOT"));
     assert!(installed_acceptance.contains("assert_installed_process bloom-broker"));
     assert!(installed_acceptance.contains("assert_installed_process bloom-signer"));
@@ -590,4 +583,22 @@ fn privileged_w0_harness_requires_an_external_disposable_host_marker() {
     assert!(two_login_workflow.contains("failing-broker.c"));
     assert!(two_login_workflow.contains("run-two-login.sh"));
     assert!(two_login_workflow.contains("macos-two-login-evidence/*.pass"));
+}
+
+#[test]
+fn macos_pf_retirement_preserves_foreign_rules_and_migrates_legacy_guards() {
+    let status = Command::new("bash")
+        .arg(workspace().join("tests/packaging/macos-pf-retirement.sh"))
+        .status()
+        .expect("run isolated macOS PF retirement regression");
+    assert!(status.success());
+}
+
+#[test]
+fn macos_upgrade_rollback_handles_the_system_etc_symlink() {
+    let status = Command::new("bash")
+        .arg(workspace().join("tests/packaging/macos-upgrade-rollback.sh"))
+        .status()
+        .expect("run macOS rollback archive regression");
+    assert!(status.success());
 }

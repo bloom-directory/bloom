@@ -1549,9 +1549,17 @@ async fn restage_migrates_the_approval_before_retiring_its_predecessor() {
             bloom_solana_tx::outbox::SolanaOutboxState::Pending,
         )
         .unwrap();
-    let challenge =
-        SolanaOutbox::approval_challenge(&original, "beef", "http://localhost/ceremony", 5_000)
-            .unwrap();
+    let challenge = SolanaOutbox::approval_challenge(
+        &original,
+        &format!(
+            "wallets/{}/chains/{}/outbox",
+            original.wallet, original.chain
+        ),
+        "beef",
+        "http://localhost/ceremony",
+        5_000,
+    )
+    .unwrap();
     outbox.write_approval_challenge(&entry, &challenge).unwrap();
 
     // Advance past the staged window so the restage produces a real successor.
@@ -1650,6 +1658,7 @@ async fn stage_awaiting_approval(
     );
     let challenge = SolanaOutbox::approval_challenge(
         &staged,
+        &format!("wallets/{}/chains/{}/outbox", staged.wallet, staged.chain),
         approval.as_str(),
         "http://localhost/ceremony",
         900_000,
@@ -1811,7 +1820,17 @@ async fn restaging_a_retired_id_again_leaves_its_successor_alone() {
             },
         )
         .unwrap();
-    let newer = SolanaOutbox::approval_challenge(&successor, "newer", "http://x", 1).unwrap();
+    let newer = SolanaOutbox::approval_challenge(
+        &successor,
+        &format!(
+            "wallets/{}/chains/{}/outbox",
+            successor.wallet, successor.chain
+        ),
+        "newer",
+        "http://x",
+        1,
+    )
+    .unwrap();
     outbox.write_approval_challenge(&live, &newer).unwrap();
 
     let again = engine
