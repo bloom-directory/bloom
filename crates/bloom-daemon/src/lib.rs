@@ -300,11 +300,13 @@ struct PetalKeyRequestState {
     petal_mount: Option<String>,
     #[serde(default)]
     requested_at_ms: u64,
-    /// When this process last observed the delegated key as active, from
-    /// which the scope's lifetime bound is rendered. Absent for records
-    /// written before this field existed.
+    /// Last local observation; never used to derive authority expiry.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     succeeded_at_ms: Option<u64>,
+    /// Expiry of the exact terms accepted by Broker. Older records have
+    /// unknown expiry and remain guarded until explicitly stopped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    authority_expires_at_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     stopped: Option<SessionStopRecord>,
 }
@@ -752,7 +754,7 @@ impl DaemonPetalHost {
         scope: &bloom_broker_api::PetalKeyScope,
         key_ref: &bloom_broker_api::KeyRef,
         provenance_digest: bloom_broker_api::Digest32,
-    ) -> Result<bloom_broker_api::SealedApprovalPrepareResponse, HostError> {
+    ) -> Result<(bloom_broker_api::SealedApprovalPrepareResponse, u64), HostError> {
         let catalog = self.provenance_catalog.as_ref().ok_or_else(|| {
             HostError::Backend("installer provenance catalog is not configured".into())
         })?;
@@ -892,7 +894,11 @@ impl DaemonPetalHost {
             })?)
             .into(),
         );
-        broker
+        let authority_expires_at_ms = terms.expires_at_ms.get();
+        let expected_approval_id = terms
+            .approval_id()
+            .map_err(|error| HostError::Invalid(error.to_string()))?;
+        let prepared = broker
             .prepare_approval(bloom_broker_api::ApprovalPrepareRequest {
                 operation_id,
                 terms,
@@ -906,7 +912,13 @@ impl DaemonPetalHost {
             .await
             .map_err(|error| {
                 HostError::Denied(format!("{}: {}", error.code.as_str(), error.message))
-            })
+            })?;
+        if prepared.approval_id != expected_approval_id {
+            return Err(HostError::Denied(
+                "Broker returned an approval outside the requested terms".into(),
+            ));
+        }
+        Ok((prepared, authority_expires_at_ms))
     }
 
     fn reusable_approval_for_key(
@@ -964,12 +976,15 @@ impl DaemonPetalHost {
         operation_class: &str,
         claimed_hash: &[u8; 32],
         canonical_claim: &[u8],
+        account_key: Option<&bloom_broker_api::KeyRef>,
     ) -> Result<(String, PathBuf, PathBuf), HostError> {
         let root = self.petal_signing_state_root.as_ref().ok_or_else(|| {
             HostError::Backend("Petal exact signing state is not configured".into())
         })?;
         let mut identity = blake3::Hasher::new();
-        identity.update(b"bloom-petal-exact-signing/v1\0");
+        identity.update(b"bloom-petal-exact-signing/v2\0");
+        let key_identity = serde_jcs::to_vec(&account_key)
+            .map_err(|error| HostError::Invalid(error.to_string()))?;
         for part in [
             context.package_hash.as_bytes(),
             context.route_id.as_bytes(),
@@ -977,6 +992,7 @@ impl DaemonPetalHost {
             operation_class.as_bytes(),
             claimed_hash,
             canonical_claim,
+            &key_identity,
         ] {
             identity.update(&(part.len() as u64).to_be_bytes());
             identity.update(part);
@@ -995,13 +1011,16 @@ impl DaemonPetalHost {
         wallet: &str,
         operation_class: &str,
         signature_count: usize,
+        account_key: Option<&bloom_broker_api::KeyRef>,
     ) -> Result<(String, PathBuf, PathBuf), HostError> {
         let root = self
             .petal_signing_state_root
             .as_ref()
             .ok_or_else(|| HostError::Backend("Petal signing state is not configured".into()))?;
         let mut identity = blake3::Hasher::new();
-        identity.update(b"bloom-petal-reusable-batch-signing/v1\0");
+        identity.update(b"bloom-petal-reusable-batch-signing/v2\0");
+        let key_identity = serde_jcs::to_vec(&account_key)
+            .map_err(|error| HostError::Invalid(error.to_string()))?;
         let signature_count = (signature_count as u64).to_be_bytes();
         for part in [
             context.package_hash.as_bytes(),
@@ -1009,6 +1028,7 @@ impl DaemonPetalHost {
             wallet.as_bytes(),
             operation_class.as_bytes(),
             signature_count.as_slice(),
+            &key_identity,
         ] {
             identity.update(&(part.len() as u64).to_be_bytes());
             identity.update(part);
@@ -1446,7 +1466,7 @@ impl PetalHost for DaemonPetalHost {
                         }
                     }
                 }
-                let reusable = self
+                let (reusable, authority_expires_at_ms) = self
                     .prepare_petal_key_reusable_approval(
                         broker,
                         &wallet,
@@ -1458,6 +1478,7 @@ impl PetalHost for DaemonPetalHost {
                     )
                     .await?;
                 stored.reusable_approval_id = Some(reusable.approval_id);
+                stored.authority_expires_at_ms = Some(authority_expires_at_ms);
                 stored.status = "awaiting_user".into();
                 stored.ceremony_url = Some(reusable.ceremony_url);
                 stored.ceremony_expires_at_ms = reusable.ceremony_expires_at_ms;
@@ -1514,7 +1535,7 @@ impl PetalHost for DaemonPetalHost {
                                 .into(),
                         ));
                     }
-                    let reusable = self
+                    let (reusable, authority_expires_at_ms) = self
                         .prepare_petal_key_reusable_approval(
                             broker,
                             &wallet,
@@ -1527,6 +1548,7 @@ impl PetalHost for DaemonPetalHost {
                         .await?;
                     stored.public_key = Some(public);
                     stored.reusable_approval_id = Some(reusable.approval_id);
+                    stored.authority_expires_at_ms = Some(authority_expires_at_ms);
                     stored.status = "awaiting_user".into();
                     stored.ceremony_url = Some(reusable.ceremony_url);
                     stored.ceremony_expires_at_ms = reusable.ceremony_expires_at_ms;
@@ -1614,6 +1636,7 @@ impl PetalHost for DaemonPetalHost {
             petal_mount: self.petal_mount_for_hash(&context.package_hash),
             requested_at_ms: now_ms,
             succeeded_at_ms: None,
+            authority_expires_at_ms: None,
             stopped: None,
         };
         Self::write_petal_key_state(&path, &stored)?;
@@ -1901,6 +1924,7 @@ impl PetalHost for DaemonPetalHost {
                 &req.operation_class,
                 &req.claimed_hash,
                 &canonical_claim,
+                account_key.as_ref(),
             )?;
             if req
                 .approval_hint
@@ -2212,12 +2236,14 @@ impl PetalHost for DaemonPetalHost {
                 &req.operation_class,
                 &batch_digest_bytes,
                 &canonical_claim,
+                account_key.as_ref(),
             )?,
             bloom_broker_api::PetalSignSelector::Reusable => self.petal_reusable_signing_paths(
                 context,
                 &req.wallet,
                 &req.operation_class,
                 preimages.len(),
+                account_key.as_ref(),
             )?,
         };
         if req
@@ -3306,25 +3332,24 @@ impl AccountPetals {
     /// The truthful authority derivation, shared by the session document
     /// and the install guard: pending until the key exists, stopped once
     /// every revoked approval is terminal, replaced once the scoped package
-    /// is no longer installed, expired once the observed success time plus
-    /// the scope's lifetime bound has passed, else active.
+    /// is no longer installed, expired at the accepted approval's expiry,
+    /// else active. Unobserved approval completion stays pending and guarded.
     fn session_authority(&self, state: &PetalKeyRequestState) -> &'static str {
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|duration| duration.as_millis() as u64)
             .unwrap_or(0);
-        if state.status != "succeeded" {
-            "pending"
-        } else if state.stopped.as_ref().is_some_and(|record| record.complete) {
+        if state.stopped.as_ref().is_some_and(|record| record.complete) {
             "stopped"
         } else if self.installed_mount_for(state).is_none() {
             "package_replaced"
         } else if state
-            .succeeded_at_ms
-            .map(|at| at + state.scope.maximum_lifetime_ms.get())
+            .authority_expires_at_ms
             .is_some_and(|expires| now_ms >= expires)
         {
             "expired"
+        } else if state.status != "succeeded" {
+            "pending"
         } else {
             "active"
         }
@@ -3337,7 +3362,7 @@ impl AccountPetals {
         DaemonPetalHost::petal_key_states_from_root(Some(&self.key_state_root), None)
             .iter()
             .filter(|(_, state)| state.scope.package_hash.as_str() == package_hash)
-            .filter(|(_, state)| self.session_authority(state) == "active")
+            .filter(|(_, state)| matches!(self.session_authority(state), "active" | "pending"))
             .map(|(_, state)| {
                 let number = match &state.scope.parent_key_ref.derivation {
                     Some(bloom_broker_api::DerivationRef::Bip39Multicurve {
@@ -3397,9 +3422,7 @@ impl AccountPetals {
                 .ok()
                 .map(|index| index.routes)
         });
-        let expires_at_ms = state
-            .succeeded_at_ms
-            .map(|at| at + state.scope.maximum_lifetime_ms.get());
+        let expires_at_ms = state.authority_expires_at_ms;
         let signing_authority = self.session_authority(state);
         let routes_known = routes.is_some();
         let eligible_exact_routes = match (signing_authority, &routes) {
@@ -6318,6 +6341,10 @@ mod tests {
             "http://127.0.0.1:18734/ceremony/reusable-owner-only"
         );
         assert!(approval_owner_status["reusable_approval_id"].is_string());
+        let authority_expiry = approval_owner_status["authority_expires_at_ms"]
+            .as_u64()
+            .unwrap();
+        assert!(authority_expiry > now_ms_for_fixture());
 
         fixture
             .approval_active
@@ -6331,6 +6358,16 @@ mod tests {
             serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
         assert_eq!(completed_owner_status["status"], "succeeded");
         assert!(completed_owner_status["ceremony_url"].is_null());
+        assert_eq!(
+            completed_owner_status["authority_expires_at_ms"],
+            authority_expiry
+        );
+        // A delayed or repeated poll cannot extend the accepted terms.
+        host.petal_key_request(request.clone()).await.unwrap();
+        let polled = DaemonPetalHost::read_petal_key_state(&state_path)
+            .unwrap()
+            .unwrap();
+        assert_eq!(polled.authority_expires_at_ms, Some(authority_expiry));
 
         let mut tampered: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
@@ -8381,6 +8418,48 @@ allowed = ["bloom:vfs.read"]
     ///    and the identity chain the mount feeds — context to resolved
     ///    owner — lands on account 1's family key.
     #[tokio::test]
+    async fn alternating_accounts_have_distinct_durable_signing_requests() {
+        let (_dir, daemon, broker) = isolation_daemon().await;
+        let host = isolation_host(&daemon, broker.clone())
+            .with_petal_signing_state_root(daemon.home.cache_dir().join("signing"));
+        let context =
+            account_route_context("w", Some(0), Some(broker.child(true, 0).fingerprint_hex()));
+        let mut identities = Vec::new();
+        for number in [0, 1, 0] {
+            let key = &broker.child(true, number).key_ref;
+            let exact = host
+                .petal_signing_paths(
+                    &context,
+                    "w",
+                    "test.intent",
+                    &[1; 32],
+                    b"same claim",
+                    Some(key),
+                )
+                .unwrap();
+            let reusable = host
+                .petal_reusable_signing_paths(&context, "w", "test.intent", 1, Some(key))
+                .unwrap();
+            identities.push((exact, reusable));
+        }
+        assert_ne!(identities[0], identities[1]);
+        assert_eq!(identities[0], identities[2]);
+        let mut changed_locator = broker.child(true, 0).key_ref.clone();
+        changed_locator.locator.push_str("/different");
+        assert_ne!(
+            identities[0].1,
+            host.petal_reusable_signing_paths(
+                &context,
+                "w",
+                "test.intent",
+                1,
+                Some(&changed_locator)
+            )
+            .unwrap()
+        );
+    }
+
+    #[tokio::test]
     async fn account_one_petal_dispatch_runs_aware_petals_and_resolves_account_one_owner() {
         let (_dir, daemon, broker) = isolation_daemon().await;
         let evm1 = broker.child(true, 1);
@@ -8700,6 +8779,7 @@ allowed = ["bloom:vfs.read"]
             petal_mount: petal_mount.map(str::to_owned),
             requested_at_ms,
             succeeded_at_ms: Some(requested_at_ms + 1),
+            authority_expires_at_ms: Some(requested_at_ms.saturating_add(3_600_001)),
             stopped: None,
         };
         let identity = blake3::hash(
@@ -8926,6 +9006,95 @@ allowed = ["bloom:vfs.read"]
             .unwrap();
         let session = session_json(&daemon, "/wallets/w/1/sessions/echo/main/session.json").await;
         assert_eq!(session["signing_authority"], "stopped");
+    }
+
+    #[tokio::test]
+    async fn unpolled_sessions_guard_ipc_mutations_and_use_fixed_authority_expiry() {
+        let (dir, daemon, broker) = isolation_daemon().await;
+        let home = bloom_proto::HomeDir::at(dir.path());
+        let hash = daemon.petals.resolve_petal_mount("echo").unwrap();
+        write_session_state(
+            &home,
+            "w",
+            "pln1_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "main",
+            broker.child(true, 1),
+            Some("echo"),
+            &hash,
+            now_ms_for_fixture(),
+        );
+        let root = home.cache_dir().join("petal-key-requests");
+        let (path, mut state) = DaemonPetalHost::petal_key_states_from_root(Some(&root), None)
+            .pop()
+            .unwrap();
+        // Broker may already have activated this approval; the Petal has
+        // not retried, so Machine's durable observation remains pending.
+        state.status = "awaiting_user".into();
+        state.ceremony_url = Some("http://broker/approved-but-unpolled".into());
+        state.succeeded_at_ms = None;
+        DaemonPetalHost::write_petal_key_state(&path, &state).unwrap();
+        let ready = Arc::new(tokio::sync::Notify::new());
+        let ready_callback = ready.clone();
+        let server = Arc::new(
+            ipc::IpcServer::new(Vfs::builder().build(), "test", vec![])
+                .with_petals(daemon.petals.clone())
+                .with_active_session_slots(daemon.active_session_slots.clone())
+                .with_ready_callback(Arc::new(move || ready_callback.notify_one())),
+        );
+        let socket = dir.path().join("review.sock");
+        let serving = server.clone();
+        let serve_path = socket.clone();
+        let task = tokio::spawn(async move { serving.serve(&serve_path).await });
+        tokio::time::timeout(std::time::Duration::from_secs(5), ready.notified())
+            .await
+            .unwrap();
+        let client = ipc::IpcClient::new(&socket);
+        let error = client
+            .call("petals.uninstall", serde_json::json!({"hash": "echo"}))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("sessions/echo/main"), "{error}");
+        let error = client
+            .call(
+                "petals.install",
+                serde_json::json!({"path": home.root().join("petals/echo-package")}),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("sessions/echo/main"), "{error}");
+        assert_eq!(daemon.petals.resolve_petal_mount("echo").unwrap(), hash);
+
+        // Polling timestamps cannot keep an expired approval apparently active.
+        state.status = "succeeded".into();
+        state.ceremony_url = None;
+        state.succeeded_at_ms = Some(now_ms_for_fixture());
+        state.authority_expires_at_ms = Some(1);
+        DaemonPetalHost::write_petal_key_state(&path, &state).unwrap();
+        let doc = session_json(&daemon, "/wallets/w/1/sessions/echo/main/session.json").await;
+        assert_eq!(doc["signing_authority"], "expired");
+        assert_eq!(doc["expires_at_ms"], 1);
+        assert!(daemon.active_session_slots.as_ref().unwrap()(&hash).is_empty());
+        // Legacy records carry no trustworthy expiry. Never invent one.
+        state.authority_expires_at_ms = None;
+        DaemonPetalHost::write_petal_key_state(&path, &state).unwrap();
+        let doc = session_json(&daemon, "/wallets/w/1/sessions/echo/main/session.json").await;
+        assert!(doc["expires_at_ms"].is_null());
+        assert!(!daemon.active_session_slots.as_ref().unwrap()(&hash).is_empty());
+        state.status = "awaiting_user".into();
+        DaemonPetalHost::write_petal_key_state(&path, &state).unwrap();
+        client
+            .call(
+                "petals.uninstall",
+                serde_json::json!({"hash": "echo", "force": true}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            session_json(&daemon, "/wallets/w/1/sessions/echo/main/session.json").await["signing_authority"],
+            "package_replaced"
+        );
+        server.trigger_shutdown();
+        task.await.unwrap().unwrap();
     }
 
     #[tokio::test]

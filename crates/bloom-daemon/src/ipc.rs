@@ -548,7 +548,7 @@ impl IpcOperationContext {
                 let stranded = active_sessions(&outgoing);
                 if !stranded.is_empty() {
                     return Err(PetalError::vm(format!(
-                        "refusing to replace petal '{name}' while its sessions are still                          active: {}. Stop them (wallets/<w>/<n>/sessions/<petal>/<slot>/stop)                          or install with force",
+                        "refusing to replace petal '{name}' while its sessions are active or pending: {}. Stop them (wallets/<w>/<n>/sessions/<petal>/<slot>/stop) or install with force",
                         stranded.join(", ")
                     )));
                 }
@@ -1563,7 +1563,7 @@ impl IpcServer {
                 if !stranded.is_empty() {
                     return Err(PetalError::vm(format!(
                         "refusing to uninstall petal '{}' while its sessions are still \
-                         active: {}. Stop them \
+                         active or pending: {}. Stop them \
                          (wallets/<w>/<n>/sessions/<petal>/<slot>/stop) or uninstall with force",
                         request.hash,
                         stranded.join(", ")

@@ -549,9 +549,7 @@ impl WalletsHandler {
         let from = Self::evm_address(family)?;
         // A body fingerprint that names a different account is an error,
         // symmetric with the Solana outbox: the path fixes the sender.
-        if let [state_seg, leaf] = rest
-            && state_seg == "outbox"
-            && leaf == "new.tx"
+        if chain_rest == ["new.tx"]
             && let Ok(body) = serde_json::from_slice::<serde_json::Value>(data)
             && let Some(named) = body.get("account_fingerprint").and_then(|v| v.as_str())
             && !family
@@ -1005,6 +1003,9 @@ pub(super) struct AccountCreationRecord {
 enum AccountCreationState {
     Pending,
     Created,
+    Failed,
+    Expired,
+    Cancelled,
 }
 
 const ACCOUNT_CREATION_SCHEMA: &str = "bloom.machine.account-creation.v1";
@@ -1191,8 +1192,8 @@ impl WalletsHandler {
         mut record: AccountCreationRecord,
         path: &std::path::Path,
     ) -> Result<Vec<u8>, HandlerError> {
-        if record.state == AccountCreationState::Created {
-            return Self::render_record(&record, true);
+        if record.state != AccountCreationState::Pending {
+            return Self::render_record(&record, record.state == AccountCreationState::Created);
         }
         let broker = self.custody_broker()?;
         let status = broker
@@ -1200,8 +1201,15 @@ impl WalletsHandler {
             .await
             .map_err(|error| HandlerError::backend(error.to_string()))?;
         if status.state != bloom_broker_api::CeremonyState::Succeeded {
-            // Still pending (or terminal-failed, which the ceremony URL
-            // surfaces); the record stays as it is.
+            record.state = match status.state {
+                bloom_broker_api::CeremonyState::Failed => AccountCreationState::Failed,
+                bloom_broker_api::CeremonyState::Expired => AccountCreationState::Expired,
+                bloom_broker_api::CeremonyState::Cancelled => AccountCreationState::Cancelled,
+                _ => AccountCreationState::Pending,
+            };
+            if record.state != AccountCreationState::Pending {
+                write_atomic_json(path, &record)?;
+            }
             return Self::render_record(&record, false);
         }
         let receipt = broker
@@ -1281,7 +1289,12 @@ impl WalletsHandler {
             "schema": ACCOUNT_CREATIONS_SCHEMA,
             "request_id": record.request_id,
             "state": record.state,
-            "ceremony_url": record.ceremony_url,
+            "ceremony_url": (record.state == AccountCreationState::Pending).then_some(&record.ceremony_url),
+            "retry": match record.state {
+                AccountCreationState::Failed | AccountCreationState::Expired | AccountCreationState::Cancelled =>
+                    Some("Write a new request_id to start a new ceremony; reusing this request_id returns this terminal result."),
+                _ => None,
+            },
             "ceremony_expires_at_ms": record.ceremony_expires_at_ms,
             "number": record.number,
             "already_created": already_created,

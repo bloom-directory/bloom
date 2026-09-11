@@ -71,7 +71,9 @@ create the canonical EVM and Solana account-number-zero children together.
 To create another account number, write `{"request_id":"<id>"}` to
 `wallets/<wallet>/new`. The ceremony creates both the EVM and Solana keys under
 the one number Signer chooses. Reusing the same request ID resumes or returns
-that same account creation.
+that same account creation. Reading `new` reports `failed`, `expired`, or
+`cancelled` when a ceremony terminates unsuccessfully. That result remains
+attached to its request ID; write a new request ID to start another ceremony.
 
 ### Account-scoped Petals and sessions
 
@@ -95,10 +97,16 @@ revokes the session's approvals through the Broker; it is idempotent, works
 after the Petal is uninstalled, and after it succeeds only Exact-selector
 signing for the scope's remaining operation classes may still be available
 (`eligible_exact_routes` lists those routes). Replacing or removing an
-installed package that still has active sessions is refused with their mounted
+installed package that still has active or unresolved pending sessions is refused with their mounted
 paths unless the owner passes `--force` to `petal install` or
 `petal uninstall` — the stranded sessions then read `package_replaced`, and
 their `stop` still revokes them.
+
+Session `expires_at_ms` is the expiry of the approval terms accepted by Broker,
+not the time the Petal last polled. Old records without that expiry report null
+and remain guarded until stopped or forcibly removed. Durable signing retries
+are bound to the full selected key, so accounts using the same route keep
+separate approval identities.
 
 A wallet's chains are listed at `wallets/<wallet>/chains` and include both
 EVM chains and any configured Solana chains — `ls wallets/<wallet>/chains`

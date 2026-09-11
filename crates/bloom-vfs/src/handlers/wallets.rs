@@ -5191,6 +5191,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn account_creation_terminal_results_require_a_new_request_id() {
+        use bloom_broker_api::CeremonyState;
+        for (terminal, name) in [
+            (CeremonyState::Failed, "failed"),
+            (CeremonyState::Expired, "expired"),
+            (CeremonyState::Cancelled, "cancelled"),
+        ] {
+            let f = make_handler();
+            let service = Arc::new(CreationBroker {
+                prepared: std::sync::Mutex::new(None),
+                state: std::sync::Mutex::new(CeremonyState::AwaitingUser),
+            });
+            let mut handler = f
+                .handler
+                .with_broker(Some(MachineBrokerClient::new(service.clone())));
+            handler.wallet_projections = Some(bip39_projection(f.wallet_addr, vec![]));
+            let path = vfs(format!("/{}/new", f.wallet_name));
+            handler
+                .write(&path, br#"{"request_id":"first"}"#)
+                .await
+                .unwrap();
+            let first_id = service
+                .prepared
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .custody_operation_id
+                .clone();
+            *service.state.lock().unwrap() = terminal;
+            let read = handler.read(&path).await.unwrap();
+            let status: serde_json::Value = serde_json::from_slice(&read).unwrap();
+            assert_eq!(status["requests"][0]["state"], name);
+            assert!(status["requests"][0]["ceremony_url"].is_null());
+            assert!(
+                status["requests"][0]["retry"]
+                    .as_str()
+                    .unwrap()
+                    .contains("new request_id")
+            );
+            // Terminal outcomes are durable, even when the remote status changes.
+            *service.state.lock().unwrap() = CeremonyState::Succeeded;
+            handler
+                .write(&path, br#"{"request_id":"first"}"#)
+                .await
+                .unwrap();
+            assert_eq!(handler.read(&path).await.unwrap(), read);
+            assert_eq!(
+                service
+                    .prepared
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .custody_operation_id,
+                first_id
+            );
+            handler
+                .write(&path, br#"{"request_id":"second"}"#)
+                .await
+                .unwrap();
+            assert_ne!(
+                service
+                    .prepared
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .custody_operation_id,
+                first_id
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn wallets_new_starts_one_multi_family_ceremony_and_reports_the_numbered_result() {
         use bloom_broker_api::DerivationProfile as Profile;
         let f = make_handler();
@@ -5423,6 +5498,22 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(new_tx.mode, 0o644);
+        let mismatch = handler
+            .write(
+                &vfs(format!("/{w}/1/chains/anvil/outbox/new.tx")),
+                &serde_json::to_vec(&serde_json::json!({
+                    "to": "0x0000000000000000000000000000000000000002",
+                    "value": "0",
+                    "account_fingerprint": "10".repeat(32),
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            mismatch.to_string().contains("intent names account"),
+            "{mismatch:?}"
+        );
         let controls: Vec<String> = handler
             .list(&vfs(format!(
                 "/{w}/0/chains/anvil/outbox/pending/from-account-zero"
