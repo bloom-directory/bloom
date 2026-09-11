@@ -76,7 +76,9 @@ class CounterSidecar:
         self.path = path.expanduser()
 
     @classmethod
-    def for_credential(cls, seed_file: Path, directory: Path) -> "CounterSidecar":
+    def for_credential(
+        cls, seed_file: Path, directory: Path | None = None
+    ) -> "CounterSidecar":
         """The sidecar for whichever credential `seed_file` derives.
 
         Keyed by a domain-separated, truncated SHA-256 of the seed contents:
@@ -93,7 +95,22 @@ class CounterSidecar:
         if not seed:
             raise EvalError("authenticator seed file is empty")
         digest = hashlib.sha256(cls._KEY_DOMAIN + seed).hexdigest()[:24]
-        return cls(directory / f"authenticator-{digest}.counter.json")
+        base = cls.default_directory() if directory is None else directory
+        return cls(base / f"authenticator-{digest}.counter.json")
+
+    @staticmethod
+    def default_directory() -> Path:
+        """Where every checkout and entry point for this user keeps counters.
+
+        Per user, not per checkout: a clone or worktree of this repository
+        using the same seed must reach the same record, or it can spend a
+        counter another checkout already spent. `BLOOM_EVAL_COUNTER_DIR` moves
+        the directory (tests, CI); the file name inside it is always derived
+        from the credential.
+        """
+        return Path(
+            os.environ.get("BLOOM_EVAL_COUNTER_DIR", "~/.bloom/eval-counters")
+        ).expanduser()
 
     @property
     def lock_path(self) -> Path:
@@ -291,17 +308,46 @@ class EvalDefinition(ABC):
     #: The first counter this run has not consumed.
     next_sign_count: int | None = None
 
-    def attach_counter_sidecar(self, sidecar: "CounterSidecar") -> None:
+    def attach_counter_sidecar(
+        self,
+        sidecar: "CounterSidecar",
+        *,
+        mirror: Callable[[int], None] | None = None,
+        also_verify: Callable[[], None] | None = None,
+    ) -> None:
         """Reserve this run's counters through the per-credential `sidecar`.
 
         Reservation, durability check, and the resume floor all go through
-        the same record and lock, so every eval sharing the authenticator
-        draws from one counter sequence.
+        the same record and lock, so every eval and entry point sharing the
+        authenticator draws from one counter sequence.
+
+        `mirror`, when given, is told the next unused counter after each
+        reservation lands in the shared record; the operator lifecycle uses it
+        to keep its own state file at or above everything reserved.
+        `also_verify` adds that second store to the durability check.
         """
-        self.counter_reserve = sidecar.reserve
-        self.counter_reserve_block = sidecar.reserve_block
+
+        def reserve(candidate: int) -> int:
+            attempted = sidecar.reserve(candidate)
+            if mirror is not None:
+                mirror(attempted + 1)
+            return attempted
+
+        def reserve_block(candidate: int, count: int) -> int:
+            first = sidecar.reserve_block(candidate, count)
+            if mirror is not None:
+                mirror(first + count)
+            return first
+
+        def verify() -> None:
+            sidecar.verify_writable()
+            if also_verify is not None:
+                also_verify()
+
+        self.counter_reserve = reserve
+        self.counter_reserve_block = reserve_block
         self.counter_committed = None
-        self.counter_durability_check = sidecar.verify_writable
+        self.counter_durability_check = verify
         self.counter_floor = sidecar.read
 
     #: Atomically claims a counter and returns the one to sign with.

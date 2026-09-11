@@ -33,17 +33,20 @@ def parser() -> argparse.ArgumentParser:
     return value
 
 
-def counter_sidecar(repo_root: Path) -> CounterSidecar:
-    """One counter record per authenticator credential, shared by every eval."""
-    override = os.environ.get("BLOOM_EVAL_COUNTER_FILE")
-    if override:
-        return CounterSidecar(Path(override))
+def counter_sidecar() -> CounterSidecar:
+    """The one counter record for this authenticator, shared by every entry point.
+
+    Keyed only by the credential and kept per user, so direct runs from any
+    checkout and the operator lifecycle all reserve from the same record. There
+    is deliberately no per-run file override: a run pointed at its own file
+    would split the counter sequence again.
+    """
     seed = os.environ.get("BLOOM_EVAL_AUTHENTICATOR_SEED_FILE", "")
     if not seed:
         raise EvalError(
             "BLOOM_EVAL_AUTHENTICATOR_SEED_FILE is required to key the counter sidecar"
         )
-    return CounterSidecar.for_credential(Path(seed), repo_root / "evals/harbor")
+    return CounterSidecar.for_credential(Path(seed))
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -76,7 +79,7 @@ def main(argv: list[str] | None = None) -> int:
             # ceremony would advance the counter in memory only, and the next
             # process -- or another eval on the same authenticator -- would
             # replay a spent one. Preauthorization never signs, so it skips this.
-            definition.attach_counter_sidecar(counter_sidecar(repo_root))
+            definition.attach_counter_sidecar(counter_sidecar())
             run_eval(definition, args.agent)
     except (EvalError, KeyboardInterrupt) as error:
         print(f"Bloom Harbor eval: {error}", file=sys.stderr)

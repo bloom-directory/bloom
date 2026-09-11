@@ -228,19 +228,21 @@ Both live Hyperliquid evals share these two methods, so the reservation and
 durability rules have a single definition rather than one copy per eval.
 
 A run started directly with `python -m harness <eval> <agent>` has no
-operator state file, so it gets a sidecar instead: a mode-`0600` JSON file
+operator state file, so the sidecar is its only record: a mode-`0600` JSON file
 holding one integer, written through the same atomic temporary-then-rename the
 operator store uses. Without it a direct run advanced the counter in memory
 only, and the next process replayed a counter Broker had already accepted.
 
-The sidecar belongs to the authenticator, not to an eval. Counters are spent
-per credential, so two evals configured with the same seed -- for example
-`hyperliquid-order-cancel` and `hyperliquid-approve-builder-fee` -- share one
-record at `evals/harbor/authenticator-<id>.counter.json`, where `<id>` is a
+The sidecar belongs to the authenticator, not to an eval or a checkout.
+Counters are spent per credential, so everything configured with the same seed
+-- both evals, direct runs from any clone or worktree of this repository, and
+the operator lifecycle -- shares one record at
+`~/.bloom/eval-counters/authenticator-<id>.counter.json`, where `<id>` is a
 truncated, domain-separated SHA-256 of the seed contents. The name identifies
 the credential without revealing the seed, and a copy of the same seed at
-another path maps to the same record. `BLOOM_EVAL_COUNTER_FILE` overrides the
-location; the record and its `.lock` are gitignored.
+another path maps to the same record. `BLOOM_EVAL_COUNTER_DIR` moves the
+directory, for tests or CI; the file name inside it is always derived from the
+credential, so no run can be pointed at a private counter file.
 
 Every reservation takes an exclusive lock on that `.lock` file, re-reads the
 record, signs with the larger of the recorded counter and the caller's
@@ -268,9 +270,13 @@ WebAuthn counters are 32-bit, so the last usable one is `4294967295`. A run
 that reserves it records `4294967296` to mark the credential exhausted, and the
 next run is refused at preflight.
 
-The operator lifecycle still keeps its counter in its own state file and does
-not coordinate with these sidecars. Do not drive one authenticator from both an
-operator run and a direct run.
+The operator lifecycle reserves through the same record. Its policy ceremonies
+and its order-cancel run take counters from the shared sidecar under the same
+lock, and `next_sign_count` in the operator state file is kept as a mirror at or
+above everything reserved, so recovery still continues from a persisted counter
+that was never spent. An operator run and a direct run on the same
+authenticator therefore never sign with the same counter, whether they run one
+after the other or at the same time.
 
 ### Builder-fee starting state
 
