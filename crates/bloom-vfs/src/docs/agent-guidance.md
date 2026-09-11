@@ -126,13 +126,13 @@ cat wallets/<wallet>/chains/<solana-chain>/accounts/<fingerprint>/address
 cat wallets/<wallet>/chains/<solana-chain>/accounts/<fingerprint>/balance
 ```
 
-Directory names are the **full** lowercase account fingerprint. On the
-wallet-level Solana outbox a unique prefix is accepted as
-`account_fingerprint` when staging is even possible, but the wallet-level
-outbox stages from account 0, so transfers from account `n` belong on
-`wallets/<wallet>/<n>/chains/<chain>/outbox/new.tx` (which refuses a body
-fingerprint naming another account). A prefix is never a path — a prefix that
-is unique today stops being unique when another account is allocated.
+Directory names are the **full** lowercase account fingerprint. A body
+`account_fingerprint` in `new.tx` may be a prefix, but it must name the
+path's own account: the wallet-level outbox stages from account 0 and refuses
+any other account's fingerprint, so transfers from account `n` belong on
+`wallets/<wallet>/<n>/chains/<chain>/outbox/new.tx`. A prefix is never a
+path — a prefix that is unique today stops being unique when another account
+is allocated.
 
 `chains/<chain>/balance`, `balance.raw` and `balance.json` resolve to account
 0: the canonical initial child while it is active, and a failure naming the

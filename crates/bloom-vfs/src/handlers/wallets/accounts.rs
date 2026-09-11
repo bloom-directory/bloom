@@ -43,9 +43,10 @@ impl FamilyKey {
 
 /// The sender filter one scoped outbox surface is fenced by.
 ///
-/// `Unfiltered` is produced only for an `accounts_unavailable` projection:
-/// the numbered tree is empty then, so there is no other account to leak,
-/// and owners keep their history. It never applies to writes.
+/// `Unfiltered` is produced only for an `accounts_unavailable` projection
+/// with no root key: the numbered tree is empty then, so there is no other
+/// account to leak, and owners keep their history. It never applies to
+/// writes.
 #[derive(Clone, Copy, Debug)]
 pub(super) enum OutboxScope<'a> {
     /// Only entries this family key staged are visible and controllable.
@@ -61,9 +62,10 @@ pub(super) enum OutboxScope<'a> {
 pub(super) enum WalletOutboxScope {
     /// Account 0's key for the chain's family.
     Account0(Box<FamilyKey>),
-    /// The projection reports `accounts_unavailable` (every child retired,
-    /// or legacy BIP-32 custody). Reads stay unfiltered; writes are
-    /// refused naming that reason.
+    /// The projection reports `accounts_unavailable` and the wallet has no
+    /// root key (every derived child retired). Reads stay unfiltered;
+    /// writes are refused naming that reason. A root-key wallet (legacy
+    /// BIP-32 custody reports unavailable too) keeps its root as account 0.
     Unavailable,
     /// No account 0, or no account-0 key for this family. The
     /// wallet-level outbox shows nothing and writes fail.
@@ -593,7 +595,7 @@ impl WalletsHandler {
                     chain_rest,
                     data,
                     &engine,
-                    Some(Self::solana_sender(family)),
+                    Self::solana_sender(family),
                 )
                 .await;
         }
@@ -616,16 +618,8 @@ impl WalletsHandler {
         }
         let projection = self.wallet_projection(wallet).await?;
         let policy = crate::advisory_evm_policy(&projection, chain).map_err(err_be)?;
-        self.write_outbox_from(
-            wallet,
-            chain,
-            from,
-            &policy,
-            Some(&family.address),
-            chain_rest,
-            data,
-        )
-        .await
+        self.write_outbox_from(wallet, chain, from, &policy, chain_rest, data)
+            .await
     }
 
     pub(super) fn solana_sender(family: &FamilyKey) -> SolanaSender<'_> {
@@ -650,7 +644,9 @@ impl WalletsHandler {
         chain: &str,
     ) -> Result<WalletOutboxScope, HandlerError> {
         let projection = self.wallet_projection(wallet).await?;
-        if projection.accounts_unavailable.is_some() {
+        // A root-key wallet's account 0 is its root whatever the inventory
+        // says (legacy BIP-32 custody reports unavailable too).
+        if projection.accounts_unavailable.is_some() && projection.wallet.root_key_ref.is_none() {
             return Ok(WalletOutboxScope::Unavailable);
         }
         let family = match self.account_view(wallet, 0).await {
@@ -670,16 +666,19 @@ impl WalletsHandler {
     }
 
     /// The family key the wallet-level outbox stages from: account 0's, or
-    /// the error that names why staging cannot happen. Fail closed: an
-    /// `accounts_unavailable` wallet and a wallet without an account-0 key
-    /// never stage from a guessed key.
+    /// the error that names why staging cannot happen. Fail closed: a
+    /// rootless `accounts_unavailable` wallet and a wallet without an
+    /// account-0 key never stage from a guessed key. A root-key wallet
+    /// stages from its root, as it did before numbered accounts.
     pub(super) async fn wallet_outbox_write_family(
         &self,
         wallet: &str,
         chain: &str,
     ) -> Result<FamilyKey, HandlerError> {
         let projection = self.wallet_projection(wallet).await?;
-        if let Some(reason) = &projection.accounts_unavailable {
+        if let Some(reason) = &projection.accounts_unavailable
+            && projection.wallet.root_key_ref.is_none()
+        {
             return Err(HandlerError::invalid(format!(
                 "wallet '{wallet}' cannot stage through the wallet-level outbox: \
                  the account inventory is unavailable ({reason}); stage through \
@@ -1007,7 +1006,8 @@ impl WalletsHandler {
     /// transfer never pulls `latest`. A read failure surfaces as `Err` —
     /// `latest` is the advertised atomic identity of the newest staged
     /// intent, so silently falling back to an older transfer would lie —
-    /// while no visible candidate at all is simply `Ok(None)`.
+    /// while no visible candidate at all is simply `Ok(None)`. An entry that
+    /// left `pending` between listing and reading is no longer a candidate.
     fn evm_latest_target(
         &self,
         wallet: &str,
@@ -1021,11 +1021,21 @@ impl WalletsHandler {
             .map_err(err_be)?;
         let mut pending = Vec::new();
         for id in ids {
-            let entry = self
-                .tx_engine
-                .outbox
-                .read_in_state(wallet, chain, &id, OutboxState::Pending)
-                .map_err(err_be)?;
+            let entry =
+                match self
+                    .tx_engine
+                    .outbox
+                    .read_in_state(wallet, chain, &id, OutboxState::Pending)
+                {
+                    Ok(entry) => entry,
+                    // Moved to `sent`/`failed` (a rename) or removed after the
+                    // listing: no longer a pending candidate.
+                    Err(
+                        bloom_tx::outbox::OutboxError::NotFound(_)
+                        | bloom_tx::outbox::OutboxError::StateMismatch { .. },
+                    ) => continue,
+                    Err(error) => return Err(err_be(error)),
+                };
             if !self.evm_scope_allows(&entry.staged.from, scope) {
                 continue;
             }
@@ -1046,7 +1056,6 @@ impl WalletsHandler {
         match rest {
             [] => Ok(Entry::dir(chain)),
             [leaf] if Self::SOLANA_ACCOUNT_LEAVES.contains(&leaf.as_str()) => Ok(Entry::file(leaf)),
-            [dir] if dir == "outbox" => Ok(Entry::dir("outbox")),
             [dir, outbox_rest @ ..] if dir == "outbox" => {
                 self.solana_outbox_lookup(wallet, OutboxScope::Key(family), chain, outbox_rest)
                     .await
@@ -1151,16 +1160,15 @@ impl WalletsHandler {
         chain: &str,
         rest: &[String],
     ) -> Result<Entry, HandlerError> {
+        // A read-only chain has no outbox at all, matching its listing.
+        self.solana_engine(chain).ok_or_else(|| {
+            HandlerError::not_found(format!(
+                "chain '{chain}' is configured for reads only; staging is unavailable"
+            ))
+        })?;
         match rest {
             [] => Ok(Entry::dir("outbox")),
-            [leaf] if leaf == "new.tx" => {
-                self.solana_engine(chain).ok_or_else(|| {
-                    HandlerError::not_found(format!(
-                        "chain '{chain}' is configured for reads only; staging is unavailable"
-                    ))
-                })?;
-                Ok(Entry::writable_file("new.tx"))
-            }
+            [leaf] if leaf == "new.tx" => Ok(Entry::writable_file("new.tx")),
             [leaf] if leaf == "latest" => {
                 let target = self
                     .solana_latest_target(wallet, scope, chain)?
@@ -1178,9 +1186,17 @@ impl WalletsHandler {
             }
             [state, id, fname] => {
                 let entry = self.solana_outbox_entry(wallet, scope, chain, state, id)?;
-                if solana_state(state) == Some(bloom_solana_tx::outbox::SolanaOutboxState::Pending)
-                    && SOLANA_PENDING_CONTROLS.contains(&fname.as_str())
-                {
+                let pending_control = solana_state(state)
+                    == Some(bloom_solana_tx::outbox::SolanaOutboxState::Pending)
+                    && SOLANA_PENDING_CONTROLS.contains(&fname.as_str());
+                // The listing advertises `restage` on an expired `failed`
+                // entry; the lookup must resolve it or a mounted write dies
+                // before it reaches the sink.
+                let expired_restage = fname == "restage"
+                    && solana_state(state)
+                        == Some(bloom_solana_tx::outbox::SolanaOutboxState::Failed)
+                    && entry.staged.status == bloom_solana_tx::SolanaTxStatus::Expired;
+                if pending_control || expired_restage {
                     return Ok(
                         Entry::writable_file(fname).with_modified_ms(entry.staged.created_ms)
                     );
@@ -1330,11 +1346,10 @@ impl WalletsHandler {
         Ok(entry)
     }
 
-    /// The newest pending entry the scope can see. The fence applies
-    /// before the newest entry is chosen, so another account's pending
-    /// transfer never pulls `latest`.
-    /// The Solana twin of `evm_latest_target`: scoped, fail-closed on
-    /// unreadable candidates, `Ok(None)` when nothing is visible.
+    /// The Solana twin of `evm_latest_target`: scoped before the newest
+    /// entry is chosen, fail-closed on unreadable candidates, skipping an
+    /// entry that left `pending` mid-listing, `Ok(None)` when nothing is
+    /// visible.
     fn solana_latest_target(
         &self,
         wallet: &str,
@@ -1356,15 +1371,19 @@ impl WalletsHandler {
             .map_err(solana_outbox_err)?;
         let mut pending = Vec::new();
         for id in ids {
-            let entry = engine
-                .outbox()
-                .read_in_state(
-                    wallet,
-                    chain,
-                    &id,
-                    bloom_solana_tx::outbox::SolanaOutboxState::Pending,
-                )
-                .map_err(solana_outbox_err)?;
+            let entry = match engine.outbox().read_in_state(
+                wallet,
+                chain,
+                &id,
+                bloom_solana_tx::outbox::SolanaOutboxState::Pending,
+            ) {
+                Ok(entry) => entry,
+                Err(
+                    bloom_solana_tx::outbox::OutboxError::NotFound(_)
+                    | bloom_solana_tx::outbox::OutboxError::StateMismatch { .. },
+                ) => continue,
+                Err(error) => return Err(solana_outbox_err(error)),
+            };
             if !self.solana_scope_allows(&entry.staged, scope) {
                 continue;
             }

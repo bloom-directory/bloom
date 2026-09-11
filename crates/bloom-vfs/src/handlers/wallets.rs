@@ -2600,7 +2600,7 @@ impl Handler for WalletsHandler {
                 // write-open must not prepare anything for another
                 // account's entry.
                 let scope = self.wallet_outbox_write_family(wallet, chain).await?;
-                self.require_staged_by(wallet, chain, id, Some(scope.address()))?;
+                self.require_staged_by(wallet, chain, id, scope.address())?;
                 let (_, policy) = self.planning_wallet_inputs(wallet, chain).await?;
                 let client = self
                     .chains
@@ -3051,7 +3051,7 @@ impl WalletsHandler {
                         &segs[4..],
                         data,
                         &engine,
-                        Some(Self::solana_sender(&family)),
+                        Self::solana_sender(&family),
                     )
                     .await;
             }
@@ -3066,11 +3066,10 @@ impl WalletsHandler {
             }
             // The wallet-level EVM outbox is account 0's: the numbered
             // implementation fixes the sender, fences the pending controls,
-            // and enforces the body-fingerprint check.
-            // The wallet-level EVM outbox is account 0's: the numbered
-            // implementation fixes the sender, fences the pending controls,
             // and enforces the body-fingerprint check. `segs[1..]` re-roots
-            // the path at account 0 (`/<w>/0/chains/<c>/outbox/...`).
+            // the path at account 0 (`/<w>/0/chains/<c>/outbox/...`). The
+            // family lookup first only turns an unavailable inventory or a
+            // missing account-0 key into the error that names it.
             self.wallet_outbox_write_family(wallet, &segs[2]).await?;
             return self.write_account(wallet, 0, &segs[1..], data).await;
         }
@@ -3321,7 +3320,6 @@ impl WalletsHandler {
         // names an engine-less chain.
         match rest {
             [] => Ok(Entry::dir(chain)),
-            [s] if s == "outbox" => Ok(Entry::dir("outbox")),
             [s, outbox_rest @ ..] if s == "outbox" => {
                 // The wallet-level outbox is account 0's view, fenced like
                 // the numbered tree.
@@ -3858,9 +3856,10 @@ impl WalletsHandler {
             &accounts,
             bloom_broker_api::DerivationProfile::Bip44SolanaSlip10Ed25519V1,
         );
-        // Wallet-level paths mean account 0. With several active children the
-        // canonical initial child is the deterministic default; explicit
-        // fingerprints still override.
+        // Staging always names a fingerprint (the outbox pins the path's
+        // account). `None` reaches here only for an entry staged before
+        // fingerprints were pinned, which belongs to the canonical initial
+        // child.
         let resolved = match selector {
             Some(_) => bloom_solana_tx::account::select(wallet, &active, selector),
             None => match bloom_solana_tx::account::canonical_initial(
@@ -3881,11 +3880,10 @@ impl WalletsHandler {
         SolanaAccount::from_projection(account)
     }
 
-    /// The Solana outbox write surface. `pinned` is the account a
-    /// `wallets/<w>/<n>/` path fixes: every new stage spends from it, an
-    /// intent naming any other account is refused, and the pending controls
-    /// act only on entries it staged. The wallet-level path passes `None`
-    /// and keeps its selector-by-fingerprint behaviour.
+    /// The Solana outbox write surface. `pinned` is the account the path
+    /// fixes (`wallets/<w>/<n>/`, or account 0 at wallet level): every new
+    /// stage spends from it, an intent naming any other account is refused,
+    /// and the pending controls act only on entries it staged.
     async fn write_solana_outbox(
         &self,
         wallet: &str,
@@ -3893,16 +3891,15 @@ impl WalletsHandler {
         rest: &[String],
         data: &[u8],
         engine: &Arc<bloom_solana_tx::engine::SolanaTransferEngine>,
-        pinned: Option<SolanaSender<'_>>,
+        pinned: SolanaSender<'_>,
     ) -> Result<(), HandlerError> {
         let require_pinned = |staged: &bloom_solana_tx::types::StagedSolanaTransfer,
                               id: &str|
          -> Result<(), HandlerError> {
-            match &pinned {
-                Some(sender) if !solana_entry_belongs(staged, sender) => {
-                    Err(HandlerError::not_found(format!("outbox/{}/{id}", rest[0])))
-                }
-                _ => Ok(()),
+            if solana_entry_belongs(staged, &pinned) {
+                Ok(())
+            } else {
+                Err(HandlerError::not_found(format!("outbox/{}/{id}", rest[0])))
             }
         };
         match rest {
@@ -3913,17 +3910,15 @@ impl WalletsHandler {
                     serde_json::from_slice(data).map_err(|e| {
                         HandlerError::invalid(format!("invalid Solana intent: {e}"))
                     })?;
-                if let Some(sender) = &pinned {
-                    if let Some(named) = intent.account_fingerprint.as_deref()
-                        && !sender.fingerprint.starts_with(&named.to_ascii_lowercase())
-                    {
-                        return Err(HandlerError::invalid(format!(
-                            "intent names account {named}, but this path stages from {}",
-                            sender.fingerprint
-                        )));
-                    }
-                    intent.account_fingerprint = Some(sender.fingerprint.to_owned());
+                if let Some(named) = intent.account_fingerprint.as_deref()
+                    && !pinned.fingerprint.starts_with(&named.to_ascii_lowercase())
+                {
+                    return Err(HandlerError::invalid(format!(
+                        "intent names account {named}, but this path stages from {}",
+                        pinned.fingerprint
+                    )));
                 }
+                intent.account_fingerprint = Some(pinned.fingerprint.to_owned());
                 let destination = intent.destination_bytes().map_err(HandlerError::invalid)?;
                 let child = self
                     .resolve_solana_child(wallet, intent.account_fingerprint.as_deref())
@@ -4062,18 +4057,16 @@ impl WalletsHandler {
             // a successful cancel can never race an on-chain submission.
             [state, id, fname] if state == "pending" && fname == "cancel" => {
                 self.write_permit()?;
-                if pinned.is_some() {
-                    let entry = engine
-                        .outbox()
-                        .read_in_state(
-                            wallet,
-                            chain,
-                            id,
-                            bloom_solana_tx::outbox::SolanaOutboxState::Pending,
-                        )
-                        .map_err(solana_outbox_err)?;
-                    require_pinned(&entry.staged, id)?;
-                }
+                let entry = engine
+                    .outbox()
+                    .read_in_state(
+                        wallet,
+                        chain,
+                        id,
+                        bloom_solana_tx::outbox::SolanaOutboxState::Pending,
+                    )
+                    .map_err(solana_outbox_err)?;
+                require_pinned(&entry.staged, id)?;
                 engine
                     .cancel(wallet, id)
                     .await
@@ -4171,18 +4164,16 @@ impl WalletsHandler {
         }
     }
 
-    /// Under `wallets/<w>/<n>/`, a pending entry is actionable only when
-    /// this account's key staged it; another account's entry is not found.
+    /// A pending entry is actionable only when the path's account key staged
+    /// it (`wallets/<w>/<n>/`, or account 0 at wallet level); another
+    /// account's entry is not found.
     fn require_staged_by(
         &self,
         wallet: &str,
         chain: &str,
         id: &str,
-        sender: Option<&str>,
+        sender: &str,
     ) -> Result<(), HandlerError> {
-        let Some(sender) = sender else {
-            return Ok(());
-        };
         let entry = self
             .tx_engine
             .outbox
@@ -4197,19 +4188,18 @@ impl WalletsHandler {
     /// The EVM outbox write surface for one explicit sender. `from` is the
     /// address every new stage is built for; the key that later signs is
     /// resolved from that address by the transaction engine, so a stage from
-    /// account 1 can never be signed by account 0. `scope` is `Some(from)`
-    /// under a numbered account, which also fences the pending controls.
-    #[allow(clippy::too_many_arguments)]
+    /// account 1 can never be signed by account 0. The pending controls are
+    /// fenced to the same sender, so there is no unfenced outbox write.
     pub(super) async fn write_outbox_from(
         &self,
         wallet: &str,
         chain: &str,
         from: alloy::primitives::Address,
         policy: &Policy,
-        scope: Option<&str>,
         rest: &[String],
         data: &[u8],
     ) -> Result<(), HandlerError> {
+        let scope = from.to_string();
         let client = self
             .chains
             .get(chain)
@@ -4240,7 +4230,7 @@ impl WalletsHandler {
             [state, id, fname]
                 if state == "pending" && (fname == "confirm" || fname == "confirm.override") =>
             {
-                self.require_staged_by(wallet, chain, id, scope)?;
+                self.require_staged_by(wallet, chain, id, &scope)?;
                 // Fix #9: confirm must have non-empty content. Quietly
                 // accepting an empty body (the old behaviour) made every
                 // empty `> confirm` a footgun that broadcast a tx.
@@ -4291,7 +4281,7 @@ impl WalletsHandler {
             // outbox/pending/<id>/cancel — fire a self-send replacement.
             // Same content rules as confirm (fix #9 / #10).
             [state, id, fname] if state == "pending" && fname == "cancel" => {
-                self.require_staged_by(wallet, chain, id, scope)?;
+                self.require_staged_by(wallet, chain, id, &scope)?;
                 let cancel_text = std::str::from_utf8(data)
                     .map_err(|_| HandlerError::invalid("non-utf8 cancel content"))?
                     .trim();
@@ -4315,7 +4305,7 @@ impl WalletsHandler {
             // diff against the bumped tx is visible; the engine writes
             // `replacement_intent.json` alongside.
             [state, id, fname] if state == "pending" && fname == "replace" => {
-                self.require_staged_by(wallet, chain, id, scope)?;
+                self.require_staged_by(wallet, chain, id, &scope)?;
                 let body = std::str::from_utf8(data)
                     .map_err(|_| HandlerError::invalid("non-utf8 replace intent"))?;
                 if body.trim().is_empty() {
@@ -5531,8 +5521,9 @@ mod tests {
     /// the old code returned a denial-shaped error while preparing the
     /// approval that later settled that transfer. `prepare_write_open` on
     /// the override sink is fenced by the same rule. Account 0's own entry
-    /// still reaches the engine (a non-NotFound failure from the dead test
-    /// RPC), proving the fence is account-scoped, not a general block.
+    /// still reaches the Broker signing route (which the recording fake
+    /// refuses), proving both that the fence is account-scoped and that the
+    /// empty request log for account 1 is observed, not vacuous.
     #[tokio::test]
     async fn wallet_level_controls_cannot_touch_account_one_evm_entries() {
         let f = make_handler_with_chain(true);
@@ -5545,9 +5536,51 @@ mod tests {
         );
         seed_pending_from(&f, "from-account-one", &evm1, 2_000);
         let broker = approval_broker(Vec::new());
-        let mut handler = f.handler.clone();
+        // The engine checks the write permit against the outbox's home, so
+        // the permit covers the directory the seeded outbox lives in.
+        let mut handler = f.handler.clone().with_home_write_permit(Arc::new(
+            HomeWritePermit::acquire(&bloom_proto::HomeDir::at(f._tmp.path())).unwrap(),
+        ));
         handler.wallet_projections = Some(projection);
         handler.broker = Some(MachineBrokerClient::new(broker.clone()));
+        // Route EVM confirms through the production Machine→Broker signing
+        // path so the recorder sees any approval a control would prepare.
+        handler.tx_engine =
+            TxEngine::new(Outbox::new(f._tmp.path().join("outbox")).unwrap(), 60_000)
+                .with_triad_signing(
+                    MachineBrokerClient::new(broker.clone()),
+                    bloom_broker_api::ProvenanceCatalog {
+                        schema: bloom_broker_api::PROVENANCE_CATALOG_SCHEMA.into(),
+                        records: vec![bloom_broker_api::ProvenanceRecord {
+                            subject: bloom_broker_api::ProvenanceSubject::System {
+                                component_id: bloom_broker_api::Token::new("bloom-machine")
+                                    .unwrap(),
+                                operation_class: bloom_broker_api::Token::new(
+                                    "transaction.confirm",
+                                )
+                                .unwrap(),
+                            },
+                            publisher: bloom_broker_api::Token::new("bloom-installer").unwrap(),
+                            petal_lineage: None,
+                            operation_classes: vec![bloom_broker_api::ProvenanceOperationClass {
+                                operation_class: bloom_broker_api::Token::new(
+                                    "transaction.confirm",
+                                )
+                                .unwrap(),
+                                fee_asset: Some(bloom_broker_api::ProvenanceFeeAsset {
+                                    chain: bloom_broker_api::Token::new("ethereum").unwrap(),
+                                    asset: "native".into(),
+                                }),
+                            }],
+                            installer_key_id: bloom_broker_api::Token::new("installer-key")
+                                .unwrap(),
+                            installer_signature: bloom_broker_api::Base64UrlBytes::from_bytes(
+                                &[11; 64],
+                            ),
+                        }],
+                    },
+                )
+                .unwrap();
         let w = &f.wallet_name;
 
         for control in ["confirm", "confirm.override", "replace", "cancel"] {
@@ -5598,6 +5631,13 @@ value = "0""#
         assert!(
             !matches!(own, HandlerError::NotFound(_)),
             "account 0's own confirm must not be fenced off: {own:?}"
+        );
+        // The recorder is live: the same control on account 0's own entry
+        // enters the Machine→Broker signing route (this fake refuses its
+        // first call), so the empty log above is a real observation.
+        assert!(
+            !broker.requests.lock().unwrap().is_empty(),
+            "account 0's own confirm must reach the Broker signing route: {own:?}"
         );
     }
 
@@ -5788,6 +5828,13 @@ value = "0""#
                 names.contains(&"restage".to_string()),
                 "{path} must advertise restage: {names:?}"
             );
+            // What the listing advertises must resolve, or a mounted
+            // `echo y > …/restage` dies at lookup before reaching the sink.
+            let sink = handler
+                .lookup(&vfs(format!("{path}/restage")))
+                .await
+                .unwrap();
+            assert_eq!(sink.mode, 0o644, "{path}/restage must be writable");
         }
         let one_failed: Vec<String> = handler
             .list(&vfs(format!("/{w}/1/chains/solana-devnet/outbox/failed")))
@@ -6019,6 +6066,62 @@ value = "0""#,
                 .contains("account inventory is unavailable"),
             "the write must name the reason: {error:?}"
         );
+    }
+
+    /// Legacy BIP-32 custody reports `accounts_unavailable`, but the wallet
+    /// has a root, and the root is account 0. Its wallet-level outbox keeps
+    /// staging and controlling from the root, fenced to it, exactly as it
+    /// did before numbered accounts.
+    #[tokio::test]
+    async fn root_key_wallet_with_unavailable_inventory_keeps_its_root_outbox() {
+        let f = make_handler_with_chain(true);
+        let own = bloom_proto::checksum_address(&f.wallet_addr);
+        let foreign = bloom_proto::checksum_address(&Address::repeat_byte(0x22));
+        seed_pending_from(&f, "from-root", &own, 1_000);
+        seed_pending_from(&f, "from-unknown-account", &foreign, 2_000);
+        let mut projection = static_projection_value(f.wallet_addr);
+        projection.accounts_unavailable =
+            Some("BACKEND_UNSUPPORTED: wallet uses legacy BIP-32 custody".into());
+        let mut handler = f.handler.clone();
+        handler.wallet_projections = Some(Arc::new(StaticProjection(projection)));
+        let w = &f.wallet_name;
+
+        let pending: Vec<String> = handler
+            .list(&vfs(format!("/{w}/chains/anvil/outbox/pending")))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect();
+        assert_eq!(pending, ["from-root"], "{pending:?}");
+
+        let staged = handler
+            .write(
+                &vfs(format!("/{w}/chains/anvil/outbox/new.tx")),
+                br#"to = "0x0000000000000000000000000000000000000002"
+value = "0""#,
+            )
+            .await;
+        if let Err(error) = &staged {
+            assert!(
+                !error
+                    .to_string()
+                    .contains("account inventory is unavailable")
+                    && !matches!(error, HandlerError::NotFound(_)),
+                "the root must still stage: {error:?}"
+            );
+        }
+        assert!(matches!(
+            handler
+                .write(
+                    &vfs(format!(
+                        "/{w}/chains/anvil/outbox/pending/from-unknown-account/cancel"
+                    )),
+                    b"y",
+                )
+                .await,
+            Err(HandlerError::NotFound(_))
+        ));
     }
 
     #[tokio::test]
@@ -7982,6 +8085,42 @@ value = "0""#,
     }
 
     #[tokio::test]
+    async fn outbox_latest_skips_entries_that_left_pending_mid_listing() {
+        let f = make_handler_with_chain(true);
+        seed_pending_with_created_ms(&f, "0001-pending", 5_000);
+        seed_pending_with_created_ms(&f, "0003-moved", 9_000);
+        let outbox = f
+            ._tmp
+            .path()
+            .join("outbox")
+            .join(&f.wallet_name)
+            .join("anvil");
+        // A confirm renames the entry into `sent` after the listing saw it
+        // (StateMismatch on read); a cancel removes one outright (NotFound).
+        // Neither is a pending candidate any more, and neither may break the
+        // listing.
+        std::fs::create_dir_all(outbox.join("sent")).unwrap();
+        std::fs::rename(
+            outbox.join("pending").join("0003-moved"),
+            outbox.join("sent").join("0003-moved"),
+        )
+        .unwrap();
+        std::fs::create_dir(outbox.join("pending").join("0003-moved")).unwrap();
+        std::fs::create_dir(outbox.join("pending").join("0002-vanished")).unwrap();
+
+        let root = VfsPath::parse(&format!("/{}/chains/anvil/outbox", f.wallet_name)).unwrap();
+        let latest = f
+            .handler
+            .list(&root)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.name == "latest")
+            .expect("latest is advertised");
+        assert_eq!(latest.link_target.as_deref(), Some("pending/0001-pending"));
+    }
+
+    #[tokio::test]
     async fn outbox_lookup_rejects_absent_artifacts_but_preserves_virtual_sinks() {
         let f = make_handler_with_chain(true);
         for (state_name, state, id) in [
@@ -8571,6 +8710,18 @@ value = "0""#,
             "reads-only chain must not advertise outbox, got {:?}",
             entries.iter().map(|e| &e.name).collect::<Vec<_>>()
         );
+
+        // Nor does the unadvertised outbox resolve by name.
+        for path in ["outbox", "outbox/pending"] {
+            let outbox = VfsPath::parse(&format!("/{w}/chains/solana-devnet/{path}")).unwrap();
+            assert!(
+                matches!(
+                    handler.lookup(&outbox).await,
+                    Err(HandlerError::NotFound(_))
+                ),
+                "reads-only chain must not resolve {path}"
+            );
+        }
 
         // Staging surfaces stay closed rather than falling through to EVM.
         let new_tx = VfsPath::parse(&format!("/{w}/chains/solana-devnet/outbox/new.tx")).unwrap();
