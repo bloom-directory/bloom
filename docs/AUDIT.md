@@ -10,11 +10,9 @@
 **Spec audited:** `docs/specs/2026-05-08-bloom-design.md`
 **Workspace:** 15 crates · `cargo build --workspace` clean ·
 `cargo clippy --workspace --all-targets -- -D warnings` clean.
-**Acceptance:** `scripts/acceptance.sh` passes scenarios 1 (native
-send) + 2 (ERC-20 transfer) through the mounted Sealed Approval gate
-against Anvil: initial confirm is denied and the central
-`approval_challenge.json` includes a local `ceremony_url`. Scenarios 3 + 4
-(Uniswap V2 + Enso on a mainnet fork) auto-skip without `BLOOM_MAINNET_RPC`.
+**Historical acceptance:** the original `scripts/acceptance.sh` exercised the
+retired in-process wallet. The current entrypoint runs the separate-process
+triad projection-fidelity suite; custody never enters Machine.
 **Historical live evidence:** the native implementation exercised Enso + Aave
 on Base mainnet before the Petal extraction. Current validation lives in the
 Enso Petal repository.
@@ -168,12 +166,12 @@ Verified end-to-end via `tests/docker/run.sh --mempool`.
 | `cargo fmt` clean | passing |
 | `cargo clippy --workspace --all-targets -- -D warnings` | passing |
 | `cargo test --workspace --lib` | passing |
-| Anvil-backed tests (RPC, no mocks) | passing — `simulate::tests::anvil_*`, `acceptance.sh` |
-| Acceptance demo (native + ERC-20 on Anvil) | passing — `scripts/acceptance.sh` |
+| Anvil-backed tests (RPC, no mocks) | passing — `simulate::tests::anvil_*` and the triad integration suites |
+| Triad custody acceptance | passing — `scripts/acceptance.sh` delegates to the projection-fidelity suite |
 | Historical acceptance demo (Uniswap V2 + native Enso on mainnet fork) | retired with the native Enso integration; retained here as historical evidence. |
 | Dockerized NFS kernel-mount test | harness at `tests/docker/{Dockerfile,docker-compose.yml,lib.sh,run.sh,test*.sh}`. Native suite `cargo test -p bloom-mount --features mount` passing. |
 | Dockerized workspace tests | passing — `tests/docker/run.sh --workspace`. |
-| Dockerized fork-mode end-to-end | passing — `tests/docker/run.sh --fork` (compose profile `fork`) drives a native send + chain reads through the mount against an anvil fork of Base; no Enso key needed. |
+| Dockerized fork-mode chain reads | passing — `tests/docker/run.sh --fork` (compose profile `fork`) is custody-free; signing is covered by triad acceptance. |
 | Enso Petal route and package checks | maintained in `bloom-petal-enso`: route architecture, route crate tests, package build, and `petal check`. |
 | Historical live Enso broadcast evidence | retained below as provenance; the removed core `--enso-live` harness is not a current verification command. |
 
@@ -249,11 +247,10 @@ cargo fmt --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace --lib
 cargo build --release -p bloom
-scripts/acceptance.sh                              # native + ERC-20 on Anvil
-BLOOM_MAINNET_RPC=... scripts/acceptance.sh          # enables applicable live-network scenarios
+scripts/acceptance.sh                              # real triad custody/projection acceptance
 tests/docker/run.sh                                 # NFS kernel-mount harness (default)
 tests/docker/run.sh --workspace                     # workspace tests inside container
-tests/docker/run.sh --fork                          # native send + chain reads via anvil-fork
+tests/docker/run.sh --fork                          # custody-free chain reads via anvil-fork
 # In a bloom-petal-enso checkout:
 scripts/check-route-architecture.sh
 cargo test --manifest-path route/Cargo.toml

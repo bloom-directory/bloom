@@ -1175,6 +1175,8 @@ struct OwnedInstallerIdentity {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "triad-dev-harness")]
+    use bloom_petals::package::PreparedPetalPackage;
     use ed25519_dalek::{Signature, Verifier as _, VerifyingKey};
     use std::os::unix::fs::PermissionsExt as _;
 

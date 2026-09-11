@@ -333,7 +333,7 @@ fn seed_wallet_projection_fixture(home: &Path, name: &str) {
     let wallet = WalletPublic {
         wallet_id: wallet_id.clone(),
         wallet_kind: Token::new("passkey").unwrap(),
-        root_key_ref: key_ref.clone(),
+        root_key_ref: Some(key_ref.clone()),
         key_refs: vec![key_ref.clone()],
         policy_version: DecimalU64::new(1),
         policy_digest: policy_digest.clone(),
@@ -374,6 +374,10 @@ fn seed_wallet_projection_fixture(home: &Path, name: &str) {
         keys,
         credentials,
         policy,
+        accounts: bloom_machine_client::empty_wallet_accounts(
+            bloom_broker_api::Token::new(name.to_owned()).expect("valid fixture wallet ID"),
+        ),
+        accounts_unavailable: None,
         source_protocol: "bloom.machine-broker.v1".into(),
         response_digest,
         observed_at_ms: 1,
