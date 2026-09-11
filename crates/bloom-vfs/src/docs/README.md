@@ -44,6 +44,7 @@ cat /bloom/chains/anvil/head/number
 cat /bloom/chains/ethereum/blocks/19000000/full.json
 cat /bloom/wallets/alice/address                     # the owner/signer EOA
 cat /bloom/wallets/alice/addresses.json              # owner/signer addresses (see "Wallet addresses & roles")
+cat /bloom/wallets/alice/overview.md                 # one wallet snapshot; also overview.json, overview.html
 cat /bloom/wallets/alice/chains/anvil/balance        # "1.5 ETH" (display); also balance.raw, balance.json
 cat /bloom/wallets/alice/chains/ethereum/history.json
 cat /bloom/tools/keccak/hello
@@ -58,6 +59,14 @@ cat /bloom/addressbook/alice
 Some virtual collections, such as `chains/<chain>/blocks/`, are too large to
 enumerate. Address known block numbers directly; each block directory exposes
 `full.json`.
+
+`wallets/<wallet>/overview.{json,md,html}` renders one short-lived, read-only
+snapshot in three formats. It includes public wallet identity, native balances,
+per-chain availability, and local outbox counts. The HTML is self-contained and
+script-free. Token/Petal positions and fiat totals are intentionally absent;
+native balance reads are independent observations rather than an atomic
+cross-chain total. Missing RPC data remains unavailable rather than becoming
+zero.
 
 Transaction-by-hash reads expose a small directory of receipt and transaction
 views. The hash directory resolves only when the configured RPC returns a
