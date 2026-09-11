@@ -1014,6 +1014,16 @@ impl PetalHost for DaemonPetalHost {
                         .into(),
                 ));
             }
+            if limit
+                .rolling_windows
+                .iter()
+                .any(|window| window.duration_ms.get() == 0)
+            {
+                return Err(HostError::Invalid(
+                    "approval value-limit rolling-window durations must be greater than zero"
+                        .into(),
+                ));
+            }
         }
         let suites = req
             .allowed_crypto_suites
@@ -5637,6 +5647,27 @@ mod tests {
             }],
             context: Some(context.clone()),
         };
+
+        let mut zero_duration_window = request.clone();
+        zero_duration_window.approval_value_limits[0].rolling_windows =
+            vec![bloom_broker_api::ValueWindow {
+                maximum: bloom_broker_api::DecimalU256::parse("1").unwrap(),
+                duration_ms: bloom_broker_api::DecimalU64::new(0),
+            }];
+        let invalid_window = host
+            .petal_key_request(zero_duration_window)
+            .await
+            .unwrap_err();
+        assert!(
+            invalid_window
+                .to_string()
+                .contains("rolling-window durations must be greater than zero")
+        );
+        assert_eq!(
+            fixture.prepares.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "invalid limits must be rejected before starting custody"
+        );
 
         let pending = host.petal_key_request(request.clone()).await.unwrap();
         let pending_json = serde_json::to_value(&pending).unwrap();
