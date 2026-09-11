@@ -87,6 +87,12 @@ enumerates both together. Solana chains route through the exact same
 inspect `outbox/{pending,sent,failed}/<id>/`) — there is no separate
 Solana-specific surface to look for.
 
+Newly generated Bloom configuration includes `solana-mainnet` for reads, with
+broadcasting disabled. Existing configurations keep their configured networks;
+devnet and local validators are opt-in. If an owner enables mainnet broadcasting,
+wallet policy and the approval ceremony still apply. Discover the available
+networks with `ls wallets/<wallet>/chains` rather than assuming a network exists.
+
 ### Reading Solana balances
 
 A Solana chain directory exposes an account-addressed surface:

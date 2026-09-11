@@ -401,9 +401,10 @@ fn default_chains() -> BTreeMap<String, ChainSpec> {
 }
 
 impl Config {
-    /// An agentic-wallet default: read-ready public EVM networks and Anvil.
+    /// An agentic-wallet default: public EVM networks, Anvil, and Solana mainnet.
     ///
-    /// Per-chain broadcast is enabled by default. Signing, policy,
+    /// EVM broadcast is enabled by default; Solana mainnet starts with
+    /// broadcasting disabled. Signing, policy,
     /// confirmation, and Sealed Approval gates still apply to value-moving
     /// actions.
     pub fn local_default() -> Self {
@@ -415,7 +416,23 @@ impl Config {
             default_chain: default_chain_name(),
             stage_ttl: default_stage_ttl(),
             chains,
-            solana_chains: BTreeMap::new(),
+            solana_chains: BTreeMap::from([(
+                "solana-mainnet".into(),
+                SolanaSpec {
+                    name: "solana-mainnet".into(),
+                    endpoints: vec![crate::chain::EndpointSpec {
+                        url: "https://api.mainnet.solana.com".into(),
+                        weight: 100,
+                        cu_per_sec: None,
+                        max_rps: None,
+                        http_only: true,
+                    }],
+                    expected_genesis_base58: Some(
+                        crate::chain::SOLANA_MAINNET_BETA_GENESIS_HASH.into(),
+                    ),
+                    allow_broadcast: false,
+                },
+            )]),
             etherscan: None,
             enso: None,
             petals: PetalsConfig::default(),
@@ -711,6 +728,18 @@ mod tests {
         assert!(cfg.enso.is_none());
         assert_eq!(cfg.petals.preinstalled, default_preinstalled_petals());
         assert_eq!(cfg.chains.len(), 13);
+        assert_eq!(cfg.solana_chains.len(), 1);
+        let solana = cfg
+            .solana_chains
+            .get("solana-mainnet")
+            .expect("Solana mainnet entry");
+        assert_eq!(solana.name, "solana-mainnet");
+        assert_eq!(
+            solana.expected_genesis_base58.as_deref(),
+            Some(crate::chain::SOLANA_MAINNET_BETA_GENESIS_HASH)
+        );
+        assert!(!solana.allow_broadcast);
+        assert_eq!(solana.endpoints[0].url, "https://api.mainnet.solana.com");
         let ethereum = cfg.chains.get("ethereum").expect("ethereum entry");
         assert_eq!(ethereum.chain_id, 1);
         assert!(ethereum.allow_broadcast);
@@ -1056,6 +1085,7 @@ mod tests {
         assert!(path.exists());
         assert_eq!(cfg.default_chain, "ethereum");
         // Second call should load, not overwrite — round-trip equivalent.
+        assert!(cfg.solana_chains.contains_key("solana-mainnet"));
         let cfg2 = Config::load_or_init(&path).unwrap();
         assert_configs_equivalent(&cfg, &cfg2);
     }
@@ -1077,6 +1107,7 @@ allow_broadcast = false
 
         let cfg = Config::load_or_init(&path).unwrap();
         assert!(!cfg.chains["anvil"].allow_broadcast);
+        assert!(cfg.solana_chains.is_empty());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), existing);
     }
 
