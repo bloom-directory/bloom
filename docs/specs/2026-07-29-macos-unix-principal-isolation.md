@@ -271,10 +271,13 @@ The macOS Unix-principal profile uses Broker direct ownership rather than
 launchd TCP handover. This is the section 22 construction for a platform lane
 where reliable conflict handover has not been proven.
 
-Broker binds exactly `127.0.0.1:18734` with:
+Broker binds exactly `127.0.0.1:18734` and `[::1]:18734`, and requires both,
+because Chromium resolves `localhost` to `::1` before `127.0.0.1`. Each bind
+uses:
 
-- no address or port reuse;
-- no wildcard, IPv6, alternate-address, or fallback-port bind;
+- `SO_REUSEADDR`, so a restarted Broker can reacquire a port still held in
+  `TIME_WAIT`, and never `SO_REUSEPORT`;
+- no wildcard, alternate-address, or fallback-port bind;
 - close-on-exec;
 - an exact post-bind local-address check.
 
