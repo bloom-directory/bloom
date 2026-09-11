@@ -1070,10 +1070,14 @@ finish_linux_upgrade() {
 # interruption may have happened before or between unit writes, and it must
 # never be restarted over mixed old and new units.
 #
-# Recovery does not start the previous release either. The retry stops it
-# again straight away, and gating recovery on its health check would strand
-# a host whose previous release cannot start — typically the release it is
-# upgrading away from — with no installer path to the release that fixes it.
+# Recovery then restarts the previous release but never gates on it. The
+# transaction is already cleared, so a previous release that cannot start —
+# typically the release the host is upgrading away from — still leaves the
+# installer free to install the release that fixes it. The restart keeps a
+# run that exits after recovery, or that reinstalls the previous release,
+# from leaving every enrolled login stopped until a reboot. Recovery needs no
+# login sessions, because it neither starts services under a health gate nor
+# touches user state.
 recover_interrupted_linux_upgrade() {
   local install_root="$1"
   local transaction="$install_root/var/lib/bloom/upgrade-transaction"
@@ -1103,7 +1107,6 @@ recover_interrupted_linux_upgrade() {
     echo "invalid interrupted Linux upgrade" >&2
     return 65
   }
-  preflight_linux_release_set "$install_root"
   upgrade_transaction="$transaction"
   upgrade_root="$install_root"
   upgrade_old_digest="$old_digest"
@@ -1116,6 +1119,8 @@ recover_interrupted_linux_upgrade() {
     return 65
   fi
   finish_linux_upgrade
+  start_linux_release_set "$install_root" ||
+    echo "the restored Bloom Linux release did not start cleanly; continuing" >&2
 }
 
 allocate_linux_nfs_port() {
@@ -1802,6 +1807,14 @@ case "$action" in
         exit 64
       }
     fi
+    # An upgrade snapshot covers every enrolled login's Signer drop-in and
+    # credential, and restoration checks it against the enrollments present
+    # then. Removing an enrollment first leaves a transaction no run restores.
+    [[ ! -e "$root/var/lib/bloom/upgrade-transaction" && \
+      ! -L "$root/var/lib/bloom/upgrade-transaction" ]] || {
+      echo "an interrupted Linux upgrade must be recovered first; rerun the Bloom installer" >&2
+      exit 65
+    }
     config_target="$root/etc/bloom/$login_uid"
     state_target="$root/var/lib/bloom/$login_uid"
     run_target="$root/run/bloom/$login_uid"

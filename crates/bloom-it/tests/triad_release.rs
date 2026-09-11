@@ -2689,12 +2689,17 @@ fn installer_upgrade_transactions_preserve_recovery_state_atomically() {
                 .unwrap(),
         "rollback must restore the installed unit contract before any restart"
     );
-    // Recovery restores without starting: it must not depend on the previous
-    // release passing its health gate.
+    // Recovery clears the transaction before its restart, so it never depends
+    // on the previous release passing its health gate.
     let recovery = &linux[linux.find("recover_interrupted_linux_upgrade() {").unwrap()
         ..linux.find("allocate_linux_nfs_port() {").unwrap()];
     assert!(recovery.contains("restore_linux_previous_release"));
-    assert!(!recovery.contains("start_linux_release_set"));
+    assert!(
+        recovery.find("finish_linux_upgrade").unwrap()
+            < recovery
+                .find("start_linux_release_set \"$install_root\" ||")
+                .unwrap()
+    );
     assert!(!recovery.contains("rollback_linux_upgrade"));
     assert!(!recovery.contains("upgrade_rollback_required=true"));
     assert!(!linux.contains("completing interrupted"));
@@ -3176,11 +3181,13 @@ fn linux_interrupted_upgrade_recovery_restores_before_any_restart() {
             stop < rewrite,
             "the release set must stop before it is restored at {stage}"
         );
-        // Recovery restores the previous release without starting it; the
-        // retried installation is the first thing to start anything.
+        // Recovery restarts the previous release only after restoring it.
+        let start = log
+            .find(&format!("start current=releases/{old_digest} "))
+            .unwrap_or_else(|| panic!("no restart of the restored release at {stage}: {log}"));
         assert!(
-            !log.contains("start"),
-            "recovery must not start a release at {stage}: {log}"
+            rewrite < start && log.contains("v6=absent"),
+            "recovery must restart only the restored release at {stage}: {log}"
         );
         assert_eq!(
             fs::read_link(root.join("usr/libexec/bloom/current")).unwrap(),
@@ -3396,8 +3403,9 @@ fn linux_upgrade_recovery_failure_preserves_the_transaction_and_retries() {
     // A previous release that cannot pass its health gate — the release a
     // host is upgrading away from — must not strand the host. The in-process
     // rollback restores it coherently, fails its health gate, and keeps the
-    // transaction. Recovery then restores without starting it, and the
-    // retried upgrade to the candidate completes.
+    // transaction. Recovery then restores it, clears the transaction, and
+    // attempts a restart without gating on it, and the retried upgrade to the
+    // candidate completes.
     let health_root = tempfile::tempdir().unwrap();
     let (root, layout, old_digest, new_digest, rolled_back) =
         stage_linux_upgrade_root(health_root.path(), &harness, "rollback", "all", |root| {
@@ -3430,7 +3438,8 @@ fn linux_upgrade_recovery_failure_preserves_the_transaction_and_retries() {
         "recovery must not depend on the previous release's health: {}",
         String::from_utf8_lossy(&recovered.stderr)
     );
-    assert!(!fs::read_to_string(&log).unwrap().contains("start"));
+    assert!(fs::read_to_string(&log).unwrap().contains("start refused"));
+    assert!(String::from_utf8_lossy(&recovered.stderr).contains("did not start cleanly"));
     assert!(!root.join("var/lib/bloom/upgrade-transaction").exists());
     assert_pre_ipv6_linux_contract(&root, &layout);
 
@@ -3562,6 +3571,76 @@ fn linux_upgrade_recovery_restores_the_signer_kms_dropin_and_credential() {
     );
     assert!(!root.join(credential).exists());
     assert!(!root.join(dropin).parent().unwrap().exists());
+}
+
+/// The snapshot covers every enrolled login's Signer drop-in and credential,
+/// and restoration checks it against the enrollments present at that time.
+/// Uninstalling a login in between would leave a transaction no later run can
+/// restore, so uninstall refuses until recovery has run.
+#[test]
+fn linux_uninstall_refuses_while_an_interrupted_upgrade_is_pending() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("root");
+    fs::create_dir(&root).unwrap();
+    let payload = make_installer_payload(&directory.path().join("release-a"));
+    install_linux_logins(&root, &payload, &[("1000", "alice"), ("2000", "bob")]);
+    let harness = write_linux_upgrade_harness(directory.path());
+    let installer = release_script("install-linux.sh");
+    let old_digest = hex::encode(Sha256::digest(b"test payload\n"));
+    let new_digest = hex::encode(Sha256::digest(b"upgraded manifest\n"));
+    let interrupted = run_linux_upgrade_harness(
+        &harness,
+        &installer,
+        &root,
+        "interrupt",
+        &directory.path().join("interrupt.log"),
+        &["all", &old_digest, &new_digest],
+    );
+    assert!(
+        interrupted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&interrupted.stderr)
+    );
+    let transaction = root.join("var/lib/bloom/upgrade-transaction");
+    let uninstall = || {
+        Command::new(&installer)
+            .args(["uninstall", "--retain-custody"])
+            .arg(&root)
+            .arg("2000")
+            .output()
+            .unwrap()
+    };
+
+    let refused = uninstall();
+    assert_eq!(refused.status.code(), Some(65));
+    assert!(
+        String::from_utf8_lossy(&refused.stderr)
+            .contains("an interrupted Linux upgrade must be recovered first")
+    );
+    assert!(root.join("etc/bloom/enrollments/2000.json").is_file());
+    assert!(transaction.join("schema").is_file());
+
+    let recovered = run_linux_upgrade_harness(
+        &harness,
+        &installer,
+        &root,
+        "recover",
+        &directory.path().join("recover.log"),
+        &[&old_digest, &new_digest],
+    );
+    assert!(
+        recovered.status.success(),
+        "{}",
+        String::from_utf8_lossy(&recovered.stderr)
+    );
+    assert!(!transaction.exists());
+    let uninstalled = uninstall();
+    assert!(
+        uninstalled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&uninstalled.stderr)
+    );
+    assert!(root.join("etc/bloom/retained/2000.json").is_file());
 }
 
 /// Writes a harness that evaluates the real installer functions and treats
