@@ -3401,6 +3401,7 @@ fn linux_upgrade_recovery_failure_preserves_the_transaction_and_retries() {
     let health_root = tempfile::tempdir().unwrap();
     let (root, layout, old_digest, new_digest, rolled_back) =
         stage_linux_upgrade_root(health_root.path(), &harness, "rollback", "all", |root| {
+            fs::create_dir_all(root.join("var/lib/bloom")).unwrap();
             fs::write(root.join("var/lib/bloom/start-fails"), b"1").unwrap();
         });
     assert!(!rolled_back.status.success());
