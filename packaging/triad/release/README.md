@@ -157,13 +157,22 @@ Before any unit is mutated, the transaction (`schema
 bloom.linux-upgrade-transaction.2`) snapshots the installed Bloom-owned unit
 templates — both ceremony sockets, the Broker and Signer service templates, the
 session path, the two user service units, and the retired RPC/control socket
-templates — recording explicit absence alongside bytes and modes. A rollback
-stops the release set, restores that unit contract, reselects the previous
-release, and rewrites release metadata before any restart; a failure at any of
-those steps preserves the transaction instead of starting a Broker over
-mismatched units. Recovery after an interruption always restores the coherent
-previous installation first and then lets the verified installer retry the
-requested release; it never completes the interrupted candidate in place. A
+templates — and, for each enrolled login, the AWS KMS Signer drop-in and the
+credential it loads. It records explicit absence alongside bytes, modes, and
+owners. A rollback stops the release set, restores that contract, reselects the
+previous release, and rewrites release metadata before any restart; a failure
+at any of those steps preserves the transaction instead of starting a Broker
+over mismatched units. The rollback clears the transaction only when every
+enrolled login passes the authenticated health gate.
+
+Recovery after an interruption restores the coherent previous installation and
+then lets the verified installer retry the requested release; it never
+completes the interrupted candidate in place. Recovery does not start the
+previous release or require it to pass the health gate: the retry stops it
+again immediately, and a host whose previous release cannot start must still be
+able to install the release that fixes it. If the installer exits after
+recovery but before its retry starts anything, the restored release is left
+stopped, as the interruption left it, until the next installer run or reboot. A
 transaction recorded by an earlier installer (`schema
 bloom.linux-upgrade-transaction.1`) carries no unit snapshot; it is recovered
 by rolling the binary selection and release metadata back on their own, as the

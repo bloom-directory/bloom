@@ -26,7 +26,9 @@ on port 18734 — `127.0.0.1` as `broker-ceremony-ipv4` and `[::1]` as
 about half the time. Broker takes each by name and never binds one itself; each family is
 published by its own socket unit, and the host must have IPv6 loopback
 enabled (`::1` bindable) because the Broker exits when either listener is
-missing — `net.ipv6.conf.lo.disable_ipv6=1` is unsupported. The
+missing — `net.ipv6.conf.lo.disable_ipv6=1` is unsupported. The installer
+checks this before installing anything: it requires `disable_ipv6=0` for `lo`
+and `::1` assigned to `lo`, and otherwise exits with status 69. The
 authenticated login-session sentinel owns its Unix socket while the user's
 systemd session is active. A path unit starts Broker and Signer only after that
 session socket exists. A canonical-listener conflict therefore fails that family's socket unit
