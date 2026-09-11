@@ -3097,6 +3097,7 @@ impl WalletsHandler {
                         data,
                         &engine,
                         Self::solana_sender(&family),
+                        None,
                     )
                     .await;
             }
@@ -3936,7 +3937,10 @@ impl WalletsHandler {
     /// The Solana outbox write surface. `pinned` is the account the path
     /// fixes (`wallets/<w>/<n>/`, or account 0 at wallet level): every new
     /// stage spends from it, an intent naming any other account is refused,
-    /// and the pending controls act only on entries it staged.
+    /// and the pending controls act only on entries it staged. `account` is
+    /// the mounted number (`None` at wallet level), so an approval challenge
+    /// points back at the surface the confirm came through.
+    #[allow(clippy::too_many_arguments)]
     async fn write_solana_outbox(
         &self,
         wallet: &str,
@@ -3945,6 +3949,7 @@ impl WalletsHandler {
         data: &[u8],
         engine: &Arc<bloom_solana_tx::engine::SolanaTransferEngine>,
         pinned: SolanaSender<'_>,
+        account: Option<u32>,
     ) -> Result<(), HandlerError> {
         let require_pinned = |staged: &bloom_solana_tx::types::StagedSolanaTransfer,
                               id: &str|
@@ -4067,6 +4072,15 @@ impl WalletsHandler {
                         ceremony_url,
                         ceremony_expires_at_ms,
                     } => {
+                        // The wallet-level outbox is fenced to account 0, so
+                        // a wallet-level pointer would not resolve for any
+                        // other account's entry.
+                        let outbox_path = match account {
+                            Some(number) => {
+                                format!("wallets/{wallet}/{number}/chains/{chain}/outbox")
+                            }
+                            None => format!("wallets/{wallet}/chains/{chain}/outbox"),
+                        };
                         let challenge = serde_json::to_vec_pretty(&serde_json::json!({
                             "schema": "bloom.solana-approval-challenge/1",
                             "action_id": entry.staged.id,
@@ -4081,8 +4095,8 @@ impl WalletsHandler {
                             "destination": entry.staged.destination,
                             "lamports": entry.staged.lamports,
                             "fee_lamports": entry.staged.fee_lamports,
-                            "plan_path": format!("wallets/{wallet}/chains/{chain}/outbox/pending/{id}/plan.md"),
-                            "retry_path": format!("wallets/{wallet}/chains/{chain}/outbox/pending/{id}/confirm"),
+                            "plan_path": format!("{outbox_path}/pending/{id}/plan.md"),
+                            "retry_path": format!("{outbox_path}/pending/{id}/confirm"),
                         }))
                         .map_err(|error| HandlerError::backend(error.to_string()))?;
                         engine

@@ -674,21 +674,44 @@ async fn two_active_solana_children_select_sign_and_reconcile_independently() ->
     println!("    cross-account confirm refused: {crossed_confirm}");
 
     // 5e. Confirm through account 1's path and settle on the validator.
-    let numbered_confirm = VfsPath::parse(&format!(
-        "/wallets/alice/1/chains/solana-local/outbox/pending/{numbered_id}/confirm"
-    ))
-    .unwrap();
+    //     The refused confirm projects a challenge whose pointers must name
+    //     account 1's outbox (the wallet-level one is account 0's and would
+    //     not resolve), and the resume follows `retry_path` verbatim.
+    let numbered_outbox = "wallets/alice/1/chains/solana-local/outbox";
+    let numbered_confirm =
+        VfsPath::parse(&format!("/{numbered_outbox}/pending/{numbered_id}/confirm")).unwrap();
     let refused = daemon.vfs.write(&numbered_confirm, b"y\n").await;
     assert!(
         refused.is_err(),
         "confirm must fail closed before owner approval"
     );
+    let challenge = read_json(
+        &daemon,
+        &format!("/{numbered_outbox}/pending/{numbered_id}/approval_challenge.json"),
+    )
+    .await?;
+    let plan_path = challenge["plan_path"].as_str().unwrap_or_default();
+    let retry_path = challenge["retry_path"].as_str().unwrap_or_default();
+    assert_eq!(
+        plan_path,
+        format!("{numbered_outbox}/pending/{numbered_id}/plan.md")
+    );
+    assert_eq!(
+        retry_path,
+        format!("{numbered_outbox}/pending/{numbered_id}/confirm")
+    );
+    let plan = daemon
+        .vfs
+        .read(&VfsPath::parse(&format!("/{plan_path}")).unwrap())
+        .await
+        .map_err(|e| anyhow!("read advertised plan_path {plan_path}: {e}"))?;
+    assert!(!plan.is_empty(), "the advertised plan must be readable");
     broker.approval_active.store(true, Ordering::SeqCst);
     daemon
         .vfs
-        .write(&numbered_confirm, b"y\n")
+        .write(&VfsPath::parse(&format!("/{retry_path}")).unwrap(), b"y\n")
         .await
-        .map_err(|e| anyhow!("confirm numbered: {e}"))?;
+        .map_err(|e| anyhow!("confirm via advertised retry_path {retry_path}: {e}"))?;
     let mut numbered_receipt = None;
     for _ in 0..60 {
         if let Ok(value) = read_json(

@@ -247,7 +247,9 @@ printf 'confirm\n' > wallets/<wallet>/chains/<solana-chain>/outbox/pending/<id>/
 
 Use the challenge's `retry_path` verbatim after the owner completes its
 `ceremony_url`; verify `tx_id`, `wallet`, `chain`, amount, destination, and
-`expiry_ms` first.
+`expiry_ms` first. `plan_path` and `retry_path` name the outbox the confirm was
+written through: `wallets/<wallet>/<n>/chains/...` for account `n`, the
+wallet-level path for account 0's wallet-level outbox.
 
 Before opening the ceremony, verify that `approval_challenge.json` has the same
 `action_id` as the directory you are acting on and that `expiry_ms` is still in
