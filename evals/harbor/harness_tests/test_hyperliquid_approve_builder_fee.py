@@ -6,17 +6,25 @@ import hashlib
 import json
 import stat
 import subprocess
+import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
 
-from harness.core import CounterSidecar, EvalError
+from harness.core import COUNTER_EXHAUSTED, COUNTER_MAX, CounterSidecar, EvalError
 from harness.hyperliquid_approve_builder_fee import (
     OPERATION_CLASS,
     ROUTE_PATTERN,
     HyperliquidApproveBuilderFeeEval,
 )
+from harness.hyperliquid_order_cancel import (
+    MAX_SESSION_CEREMONIES,
+    HyperliquidOrderCancelEval,
+)
+
+HARBOR = Path(__file__).resolve().parents[1]
 
 
 class BuilderFeeFixture:
@@ -293,6 +301,139 @@ class CounterSidecarRestartTests(BuilderFeeFixture, unittest.TestCase):
         sidecar.write(5)
         self.assertEqual(stat.S_IMODE(sidecar.path.stat().st_mode), 0o600)
         self.assertFalse(list(sidecar.path.parent.glob(".*.new-*")))
+
+
+class CredentialSidecarTests(BuilderFeeFixture, unittest.TestCase):
+    """Counters are spent per authenticator, so every eval shares one record."""
+
+    def credential(self) -> CounterSidecar:
+        return CounterSidecar.for_credential(self.seed, self.root / "counters")
+
+    def test_evals_sharing_a_seed_share_one_sidecar(self) -> None:
+        same = self.credential().path
+        self.assertEqual(CounterSidecar.for_credential(self.seed, self.root / "counters").path, same)
+        # A copy of the same seed elsewhere is the same credential.
+        copied = self.root / "seed-copy"
+        copied.write_bytes(self.seed.read_bytes())
+        self.assertEqual(CounterSidecar.for_credential(copied, self.root / "counters").path, same)
+        # A different seed is a different credential.
+        other = self.root / "other-seed"
+        other.write_text("a different authenticator")
+        self.assertNotEqual(CounterSidecar.for_credential(other, self.root / "counters").path, same)
+
+    def test_the_sidecar_name_does_not_expose_the_seed(self) -> None:
+        name = self.credential().path.name
+        seed = self.seed.read_bytes()
+        self.assertNotIn(seed.decode(), name)
+        self.assertNotIn(hashlib.sha256(seed).hexdigest()[:24], name)
+
+    def test_order_cancel_and_builder_fee_never_sign_with_the_same_counter(self) -> None:
+        # The reported bug: both evals read the same unchanged configured
+        # counter, then reserve. Keyed per eval, both signed with it.
+        path = self.credential().path
+        fee = HyperliquidApproveBuilderFeeEval(self.repo, self.env)
+        cancel = HyperliquidOrderCancelEval(self.repo, self.env)
+        for definition in (fee, cancel):
+            definition.attach_counter_sidecar(CounterSidecar(path))
+        fee_start, cancel_start = fee._require_sign_count(), cancel._require_sign_count()
+        self.assertEqual(fee_start, cancel_start, "both begin from the same configured counter")
+        signed_by_fee = fee.reserve_counter(fee_start) - 1
+        signed_by_cancel = cancel.reserve_counter(cancel_start) - 1
+        self.assertNotEqual(signed_by_fee, signed_by_cancel)
+        self.assertEqual({signed_by_fee, signed_by_cancel}, {4, 5})
+
+    def test_a_reservation_waits_for_another_process_holding_the_lock(self) -> None:
+        sidecar = self.credential()
+        holder = subprocess.Popen(
+            [sys.executable, "-c",
+             "import sys, time\nfrom pathlib import Path\nfrom harness.core import CounterSidecar\n"
+             f"s = CounterSidecar(Path({str(sidecar.path)!r}))\n"
+             "with s.locked():\n    print('held', flush=True)\n    time.sleep(1.0)\n"],
+            cwd=HARBOR, stdout=subprocess.PIPE, text=True,
+        )
+        self.addCleanup(holder.stdout.close)
+        self.addCleanup(holder.wait)
+        self.assertEqual(holder.stdout.readline().strip(), "held")
+        started = time.monotonic()
+        self.assertEqual(sidecar.reserve(4), 4)
+        self.assertGreaterEqual(
+            time.monotonic() - started, 0.7,
+            "reserve must block while another process holds the credential lock",
+        )
+
+    def test_concurrent_processes_each_sign_with_a_distinct_counter(self) -> None:
+        sidecar = self.credential()
+        code = (
+            "from pathlib import Path\nfrom harness.core import CounterSidecar\n"
+            f"print(CounterSidecar(Path({str(sidecar.path)!r})).reserve(4))\n"
+        )
+        workers = [
+            subprocess.Popen([sys.executable, "-c", code], cwd=HARBOR,
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            for _ in range(8)
+        ]
+        signed = sorted(int(w.communicate(timeout=60)[0].strip()) for w in workers)
+        self.assertEqual(signed, list(range(4, 12)), "no two processes may share a counter")
+        self.assertEqual(sidecar.read(), 12)
+
+
+class CounterCapacityTests(BuilderFeeFixture, unittest.TestCase):
+    """A run must never start without a counter left for its own cleanup."""
+
+    def fee(self, count: int | str) -> HyperliquidApproveBuilderFeeEval:
+        self.env["BLOOM_EVAL_AUTHENTICATOR_SIGN_COUNT"] = str(count)
+        return HyperliquidApproveBuilderFeeEval(self.repo, self.env)
+
+    def test_builder_fee_refuses_the_last_counter_because_cleanup_needs_another(self) -> None:
+        # The reported bug: 4294967295 was accepted, the grant spent it, and
+        # the mandatory revoke then needed the invalid 4294967296.
+        with self.assertRaisesRegex(EvalError, "including its cleanup"):
+            self.fee(COUNTER_MAX)._require_sign_count()
+        self.assertEqual(self.fee(COUNTER_MAX - 1)._require_sign_count(), COUNTER_MAX - 1)
+
+    def test_order_cancel_reserves_room_for_every_session_ceremony(self) -> None:
+        budget = MAX_SESSION_CEREMONIES
+        last_start = COUNTER_MAX - budget + 1
+        for count, ok in ((last_start, True), (last_start + 1, False)):
+            self.env["BLOOM_EVAL_AUTHENTICATOR_SIGN_COUNT"] = str(count)
+            definition = HyperliquidOrderCancelEval(self.repo, self.env)
+            with self.subTest(count=count):
+                if ok:
+                    self.assertEqual(definition._require_sign_count(), count)
+                else:
+                    with self.assertRaisesRegex(EvalError, "including its cleanup"):
+                        definition._require_sign_count()
+
+    def test_capacity_is_checked_on_the_resumed_counter(self) -> None:
+        # A low configured counter must not hide a sidecar that is near the top.
+        sidecar = CounterSidecar(self.root / "counters" / "near-top.counter.json")
+        sidecar.write(COUNTER_MAX)
+        definition = self.fee(4)
+        definition.attach_counter_sidecar(sidecar)
+        with self.assertRaisesRegex(EvalError, "including its cleanup"):
+            definition._require_sign_count()
+
+    def test_a_run_at_the_top_can_still_record_its_final_revoke(self) -> None:
+        sidecar = CounterSidecar(self.root / "counters" / "top.counter.json")
+        definition = self.fee(COUNTER_MAX - 1)
+        definition.attach_counter_sidecar(sidecar)
+        grant = definition.reserve_counter(definition._require_sign_count()) - 1
+        revoke = definition.reserve_counter(grant + 1) - 1
+        self.assertEqual((grant, revoke), (COUNTER_MAX - 1, COUNTER_MAX))
+        self.assertEqual(sidecar.read(), COUNTER_EXHAUSTED, "exhaustion is recorded, not rejected")
+        with self.assertRaisesRegex(EvalError, "exhausted"):
+            sidecar.reserve(COUNTER_EXHAUSTED)
+        # And the next run refuses at preflight instead of mid-ceremony.
+        follow_up = self.fee(4)
+        follow_up.attach_counter_sidecar(sidecar)
+        with self.assertRaisesRegex(EvalError, "including its cleanup"):
+            follow_up._require_sign_count()
+
+    def test_an_eval_without_a_declared_budget_is_refused(self) -> None:
+        definition = self.fee(4)
+        definition.CEREMONY_BUDGET = None
+        with self.assertRaisesRegex(EvalError, "ceremony budget"):
+            definition._require_sign_count()
 
 
 class WalletBindingTests(BuilderFeeFixture, unittest.TestCase):
@@ -631,6 +772,22 @@ class BuilderFeeCeremonyLifecycleTests(BuilderFeeFixture, unittest.TestCase):
         # The approval may be live even though provisioning reported failure,
         # so the revoke must still be owed.
         self.assertTrue(definition.cleanup_needed)
+
+    def test_the_driver_signs_with_the_counter_the_shared_sidecar_hands_out(self) -> None:
+        # Between this run choosing its start and reaching the ceremony,
+        # another eval on the same authenticator spends counters 4..6. The
+        # driver must sign with 7, not replay the 4 this run had in hand.
+        definition, counters = self.drive()
+        definition._observed_max_builder_fee = mock.Mock(return_value=0)
+        sidecar = CounterSidecar(self.root / "counters" / "shared.counter.json")
+        definition.attach_counter_sidecar(sidecar)
+        definition.sign_count = 4
+        sidecar.write(7)
+
+        definition.provision("codex")
+
+        self.assertEqual(counters, [7], "the driver replayed a counter another eval spent")
+        self.assertEqual(sidecar.read(), 8)
 
     def test_cleanup_is_a_noop_before_any_side_effecting_write(self) -> None:
         definition, counters = self.drive()

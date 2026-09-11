@@ -80,6 +80,9 @@ def session_key_slot(session_id: str) -> str:
 
 class HyperliquidOrderCancelEval(EvalDefinition):
     name = "hyperliquid-order-cancel"
+    # Session creation can publish up to MAX_SESSION_CEREMONIES; cleanup
+    # signs nothing.
+    CEREMONY_BUDGET = MAX_SESSION_CEREMONIES
 
     def __init__(
         self,
@@ -150,8 +153,10 @@ class HyperliquidOrderCancelEval(EvalDefinition):
                 "BLOOM_EVAL_AUTHENTICATOR_SIGN_COUNT must be between 1 and 4294967295"
             )
         # A counter recorded by a previous process is the record of
-        # what it already spent; starting below it replays.
-        return self.resume_counter(sign_count)
+        # what it already spent; starting below it replays. Capacity is
+        # checked on the resumed value, so every ceremony this run may
+        # need -- cleanup included -- still has a valid counter.
+        return self.require_counter_capacity(self.resume_counter(sign_count))
 
     @property
     def network_root(self) -> Path:
@@ -911,8 +916,11 @@ class HyperliquidOrderCancelEval(EvalDefinition):
             # revision retried here on the theory that a freshly published
             # ceremony URL might not yet resolve; that theory was wrong, and the
             # retries turned one failure into three.
-            attempted_counter = counter
-            counter = self.reserve_counter(attempted_counter)
+            # Sign with the counter the reservation hands out, not the local
+            # candidate: under the shared per-authenticator lock it can be
+            # higher, because another eval or process already spent this one.
+            counter = self.reserve_counter(counter)
+            attempted_counter = counter - 1
             try:
                 completed = subprocess.run(
                     [

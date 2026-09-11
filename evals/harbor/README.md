@@ -228,19 +228,39 @@ Both live Hyperliquid evals share these two methods, so the reservation and
 durability rules have a single definition rather than one copy per eval.
 
 A run started directly with `python -m harness <eval> <agent>` has no
-operator state file, so it gets its own sidecar instead: a mode-`0600` JSON
-file holding one integer, written through the same atomic
-temporary-then-rename the operator store uses. Its location defaults to
-`evals/harbor/<eval-name>.counter.json` and is overridden with
-`BLOOM_EVAL_COUNTER_FILE`; both are gitignored. Without it a direct run
-advanced the counter in memory only, and the next process re-read the
-unchanged `BLOOM_EVAL_AUTHENTICATOR_SIGN_COUNT` and replayed a counter
-Broker had already accepted.
+operator state file, so it gets a sidecar instead: a mode-`0600` JSON file
+holding one integer, written through the same atomic temporary-then-rename the
+operator store uses. Without it a direct run advanced the counter in memory
+only, and the next process replayed a counter Broker had already accepted.
+
+The sidecar belongs to the authenticator, not to an eval. Counters are spent
+per credential, so two evals configured with the same seed -- for example
+`hyperliquid-order-cancel` and `hyperliquid-approve-builder-fee` -- share one
+record at `evals/harbor/authenticator-<id>.counter.json`, where `<id>` is a
+truncated, domain-separated SHA-256 of the seed contents. The name identifies
+the credential without revealing the seed, and a copy of the same seed at
+another path maps to the same record. `BLOOM_EVAL_COUNTER_FILE` overrides the
+location; the record and its `.lock` are gitignored.
+
+Every reservation takes an exclusive lock on that `.lock` file, re-reads the
+record, signs with the larger of the recorded counter and the caller's
+candidate, and records the next one before the debug driver runs. Two evals or
+processes on the same authenticator therefore never sign with the same
+counter, even when they start together from the same configured value.
 
 On startup the harness takes the larger of `BLOOM_EVAL_AUTHENTICATOR_SIGN_COUNT`
-and the recorded value, so raising the environment counter is honoured while
-a recorded one is never rolled back. The sidecar itself refuses a
-non-advancing write for the same reason.
+and the recorded value, so raising the environment counter is honoured while a
+recorded one is never rolled back. It then refuses to start unless enough valid
+counters remain for every ceremony the eval may spend, cleanup included: two
+for `hyperliquid-approve-builder-fee` (the grant and its mandatory revoke) and
+up to four for `hyperliquid-order-cancel`. WebAuthn counters are 32-bit, so the
+last usable one is `4294967295`. A run that spends it records `4294967296` to
+mark the credential exhausted; the next run is refused at preflight rather than
+creating a grant its cleanup could not revoke.
+
+The operator lifecycle still keeps its counter in its own state file and does
+not coordinate with these sidecars. Do not drive one authenticator from both an
+operator run and a direct run.
 
 Each run writes a mode-`0600` JSON summary beside the operator state, under
 `harbor-summaries/`. It includes source lineage, installed package hash,

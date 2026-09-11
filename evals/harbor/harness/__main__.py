@@ -33,6 +33,19 @@ def parser() -> argparse.ArgumentParser:
     return value
 
 
+def counter_sidecar(repo_root: Path) -> CounterSidecar:
+    """One counter record per authenticator credential, shared by every eval."""
+    override = os.environ.get("BLOOM_EVAL_COUNTER_FILE")
+    if override:
+        return CounterSidecar(Path(override))
+    seed = os.environ.get("BLOOM_EVAL_AUTHENTICATOR_SEED_FILE", "")
+    if not seed:
+        raise EvalError(
+            "BLOOM_EVAL_AUTHENTICATOR_SEED_FILE is required to key the counter sidecar"
+        )
+    return CounterSidecar.for_credential(Path(seed), repo_root / "evals/harbor")
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     repo_root = Path(
@@ -45,19 +58,6 @@ def main(argv: list[str] | None = None) -> int:
         ),
     }
     definition = definitions[args.eval]()
-    # A direct run has no operator state file, so without a sidecar every
-    # ceremony would advance the counter in memory only and the next
-    # process would replay a spent one. The operator lifecycle supplies its
-    # own durable store and never reaches this path.
-    sidecar = CounterSidecar(
-        Path(
-            os.environ.get(
-                "BLOOM_EVAL_COUNTER_FILE",
-                str(repo_root / f"evals/harbor/{definition.name}.counter.json"),
-            )
-        )
-    )
-    definition.attach_counter_sidecar(sidecar)
     try:
         if args.preauthorization_only:
             if args.agent is not None:
@@ -72,6 +72,11 @@ def main(argv: list[str] | None = None) -> int:
         else:
             if args.agent is None:
                 raise EvalError("an agent is required unless --preauthorization-only is set")
+            # A direct run has no operator state file. Without a sidecar every
+            # ceremony would advance the counter in memory only, and the next
+            # process -- or another eval on the same authenticator -- would
+            # replay a spent one. Preauthorization never signs, so it skips this.
+            definition.attach_counter_sidecar(counter_sidecar(repo_root))
             run_eval(definition, args.agent)
     except (EvalError, KeyboardInterrupt) as error:
         print(f"Bloom Harbor eval: {error}", file=sys.stderr)

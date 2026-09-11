@@ -70,6 +70,9 @@ EVAL_IMAGE_PULL_TIMEOUT_SECONDS = 600
 
 class HyperliquidApproveBuilderFeeEval(EvalDefinition):
     name = "hyperliquid-approve-builder-fee"
+    # The grant in provision() and the revoke cleanup() always owes.
+    # _retire_unconsumed_grant() replays an approved write and spends none.
+    CEREMONY_BUDGET = 2
 
     def __init__(
         self,
@@ -152,8 +155,10 @@ class HyperliquidApproveBuilderFeeEval(EvalDefinition):
                 "BLOOM_EVAL_AUTHENTICATOR_SIGN_COUNT must be between 1 and 4294967295"
             )
         # A counter recorded by a previous process is the record of
-        # what it already spent; starting below it replays.
-        return self.resume_counter(sign_count)
+        # what it already spent; starting below it replays. Capacity is
+        # checked on the resumed value, so every ceremony this run may
+        # need -- cleanup included -- still has a valid counter.
+        return self.require_counter_capacity(self.resume_counter(sign_count))
 
     @property
     def network_root(self) -> Path:
@@ -618,8 +623,11 @@ class HyperliquidApproveBuilderFeeEval(EvalDefinition):
             # marks a consumed or absent ceremony CEREMONY_REPLAY with retry
             # "never", so a retry here cannot succeed and only burns another
             # WebAuthn counter.
-            attempted_counter = counter
-            counter = self.reserve_counter(attempted_counter)
+            # Sign with the counter the reservation hands out, not the local
+            # candidate: under the shared per-authenticator lock it can be
+            # higher, because another eval or process already spent this one.
+            counter = self.reserve_counter(counter)
+            attempted_counter = counter - 1
             # Persist onto the instance too, not just the local. cleanup()
             # runs a second ceremony on this same object; without this it
             # would restart from the original environment counter and reuse

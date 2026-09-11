@@ -6,6 +6,7 @@ out/
 /jobs/
 /evals/harbor/operator-state*.json
 /evals/harbor/*.counter.json
+/evals/harbor/*.counter.json.lock
 /evals/harbor/*policy-backup*.json
 /evals/harbor/harbor-summaries/
 /evals/harbor/harbor-mainnet.lock

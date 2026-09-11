@@ -13,7 +13,14 @@ from types import SimpleNamespace
 from unittest import mock
 
 from harness import hyperliquid_order_cancel
-from harness.core import AgentSpec, EvalDefinition, EvalError, EvalRunContext, run_eval
+from harness.core import (
+    AgentSpec,
+    CounterSidecar,
+    EvalDefinition,
+    EvalError,
+    EvalRunContext,
+    run_eval,
+)
 from harness.hyperliquid_order_cancel import (
     ACTION_FILES,
     MAINNET_ACK,
@@ -646,6 +653,84 @@ class HyperliquidDefinitionTests(unittest.TestCase):
         self.assertEqual(counters, [str(base), str(base + 1), str(base + 2)])
         self.assertEqual(self.definition.next_sign_count, base + 3)
         self.assertEqual(committed, [base + 1, base + 2, base + 3])
+
+    def test_session_driver_signs_with_counters_the_shared_sidecar_hands_out(self) -> None:
+        # Another eval on the same authenticator spends counters base..base+2
+        # after this run chose base. Every session ceremony must sign past
+        # them; the previous call site replayed base on its first ceremony.
+        writes: list[tuple[Path, bytes]] = []
+        pending = ["key", "authority", "approve"]
+
+        def write(path: Path, body: bytes, _timeout: int) -> SimpleNamespace:
+            writes.append((path, body))
+            return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+
+        def key_ceremony() -> str | None:
+            if not pending or pending[0] not in {"key", "authority"}:
+                return None
+            marker = "k" if pending[0] == "key" else "r"
+            return "http://localhost:18734/ceremony/" + marker * 28
+
+        def approve_ceremony() -> str | None:
+            return (
+                "http://localhost:18734/ceremony/" + "a" * 28
+                if pending and pending[0] == "approve"
+                else None
+            )
+
+        def read(path: Path, timeout: int = 20) -> object:
+            del timeout
+            if path.name == "status.json" and not pending:
+                request = json.loads(writes[0][1])
+                return {
+                    "schema": "bloom.hyperliquid_agent_session.v1",
+                    "network": "mainnet",
+                    "wallet": self.wallet_id,
+                    "id": request["id"],
+                    "max_notional_usd": "11",
+                    "max_leverage": 1,
+                    "assets": ["0"],
+                    "stopped": False,
+                }
+            return None
+
+        counters: list[int] = []
+
+        def fake_run(cmd, **kwargs):
+            del kwargs
+            counters.append(int(cmd[cmd.index("--sign-count") + 1]))
+            if pending:
+                pending.pop(0)
+            return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+
+        scratch = tempfile.TemporaryDirectory()
+        self.addCleanup(scratch.cleanup)
+        sidecar = CounterSidecar(Path(scratch.name) / "shared.counter.json")
+        self.definition.attach_counter_sidecar(sidecar)
+        base = int(self.definition.sign_count_value)
+        self.definition.sign_count = base  # chosen at preflight, before the other eval ran
+        sidecar.write(base + 3)
+
+        self.definition._write_route = mock.Mock(side_effect=write)
+        self.definition._read_json_if_exists = mock.Mock(side_effect=read)
+        self.definition._pending_petal_key_ceremony = mock.Mock(
+            side_effect=key_ceremony
+        )
+        self.definition._pending_agent_approval_ceremony = mock.Mock(
+            side_effect=approve_ceremony
+        )
+
+        with mock.patch(
+            "harness.hyperliquid_order_cancel.subprocess.run", side_effect=fake_run
+        ):
+            self.definition.provision("codex")
+
+        self.assertEqual(
+            counters,
+            [base + 3, base + 4, base + 5],
+            "a session ceremony replayed a counter another eval had spent",
+        )
+        self.assertEqual(sidecar.read(), base + 6)
 
     def test_session_timeout_durably_reserves_next_counter_before_driver(self) -> None:
         ceremony = "http://localhost:18734/ceremony/" + "A" * 43
