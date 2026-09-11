@@ -45,8 +45,10 @@ pub enum SolanaSignOutcome {
 ///
 /// The distinction is the Broker's own error contract, not a local guess. An
 /// error whose contract says the request can never be retried and left no
-/// durable effect means no signature exists and never will under this
-/// approval: the caller may safely retire it and start a new attempt. Anything
+/// durable effect — or only released the budget reservation it took, as the
+/// `LIMIT_EXCEEDED_*` refusals do — means no signature exists and never will
+/// under this approval: the caller may safely retire it and start a new
+/// attempt, which needs a fresh owner ceremony. Anything
 /// else — a possible provider effect, an unknown outcome, a transient fault,
 /// or a prior operation that still stands — must keep the approval, because
 /// abandoning it could authorize a second signature for one intent.
@@ -62,7 +64,11 @@ impl SolanaSignError {
         Self {
             message: format!("{}: {}", error.code.as_str(), error.message),
             approval_is_dead: contract.retry == bloom_broker_api::RetryClass::Never
-                && contract.durable_effect == bloom_broker_api::DurableEffect::None,
+                && matches!(
+                    contract.durable_effect,
+                    bloom_broker_api::DurableEffect::None
+                        | bloom_broker_api::DurableEffect::ReservationReleased
+                ),
         }
     }
 

@@ -5619,6 +5619,13 @@ mod tests {
             ProtocolErrorCode::SelectorMismatch,
             ProtocolErrorCode::KeyrefMismatch,
             ProtocolErrorCode::ProvenanceMismatch,
+            // A budget refused this message before anything was signed; the
+            // reservation it took was released.
+            ProtocolErrorCode::LimitExceededOperations,
+            ProtocolErrorCode::LimitExceededSignatures,
+            ProtocolErrorCode::LimitExceededValue,
+            ProtocolErrorCode::LimitExceededRate,
+            ProtocolErrorCode::SignerRateBackstopDenied,
         ];
         for code in denied {
             let error = petal_signing_host_error(&ProtocolError::new(code, "refused"));
@@ -5640,7 +5647,6 @@ mod tests {
             ProtocolErrorCode::ClockUntrusted,
             ProtocolErrorCode::PolicyBaselineStale,
             ProtocolErrorCode::RevocationEpochUnreconciled,
-            ProtocolErrorCode::LimitExceededValue,
         ];
         for code in uncertain {
             let error = petal_signing_host_error(&ProtocolError::new(code, "not a decision"));
