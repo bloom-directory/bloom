@@ -1538,7 +1538,12 @@ async fn execute_machine_command(
                 .wallet_accounts(wallet_id)
                 .await
                 .map_err(machine_wallet_lookup_error)?;
-            format!("{}\n", serde_json::to_string_pretty(&accounts)?)
+            // Each row carries the number its path encodes, so a reader
+            // never re-derives the mapping; paths outside the default
+            // mapping print `null`.
+            String::from_utf8(bloom_vfs::handlers::accounts_json_with_numbers(
+                &accounts, None,
+            )?)?
         }
         MachineCommand::WalletAccountAllocate { name, profile } => {
             let wallet_id = bloom_broker_api::Token::new(name)?;
@@ -2656,6 +2661,10 @@ enum PetalsCmd {
         /// Git tag, branch, or commit SHA to install from a GitHub source repository.
         #[arg(long = "ref", value_name = "TAG_OR_SHA")]
         ref_: Option<String>,
+        /// Replace the package even while it still has active sessions; they
+        /// then read `package_replaced` and only Exact recovery remains.
+        #[arg(long)]
+        force: bool,
     },
     /// Validate a Petal package directory and optionally emit a deterministic `.petal.tar`.
     Build {
@@ -2673,6 +2682,11 @@ enum PetalsCmd {
         /// unique prefix of at least 12 chars (as printed by `ls`),
         /// a Petal name, or a petname.
         target: String,
+        /// Remove the package even while sessions scoped to it are still
+        /// active. Their `session.json` then reads `package_replaced`;
+        /// `stop` still revokes them.
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -4025,6 +4039,7 @@ async fn run(cli: Cli) -> Result<()> {
             );
             let server = IpcServer::new(d.vfs.clone(), env!("CARGO_PKG_VERSION"), chains)
                 .with_petals(d.petals.clone())
+                .with_active_session_slots(d.active_session_slots.clone())
                 .with_petal_runtime_endpoints(
                     d.config
                         .petals
@@ -4325,16 +4340,16 @@ fn validate_petal_archive_output(package_dir: &str, out: &str) -> Result<()> {
 async fn run_petals(endpoint: &ResolvedEndpoint, cmd: PetalsCmd) -> Result<()> {
     let client = IpcClient::new(&endpoint.socket);
     match cmd {
-        PetalsCmd::Install { path, ref_ } => {
+        PetalsCmd::Install { path, ref_, force } => {
             let params = if path.contains("://") || path.starts_with("git@github.com:") {
-                serde_json::json!({ "path": path, "ref": ref_ })
+                serde_json::json!({ "path": path, "ref": ref_, "force": force })
             } else {
                 anyhow::ensure!(
                     ref_.is_none(),
                     "--ref is only supported for trusted GitHub source installs"
                 );
                 let local = absolute_cli_path(&path)?;
-                serde_json::json!({ "path": local, "ref": null })
+                serde_json::json!({ "path": local, "ref": null, "force": force })
             };
             let reply = try_ipc_streaming(
                 &client,
@@ -4455,12 +4470,12 @@ async fn run_petals(endpoint: &ResolvedEndpoint, cmd: PetalsCmd) -> Result<()> {
             }
             Ok(())
         }
-        PetalsCmd::Uninstall { target } => {
+        PetalsCmd::Uninstall { target, force } => {
             let result = try_ipc(
                 &client,
                 endpoint,
                 "petals.uninstall",
-                serde_json::json!({ "hash": target }),
+                serde_json::json!({ "hash": target, "force": force }),
             )
             .await
             .with_context(|| format!("ipc petals uninstall via {}", endpoint.display))?;

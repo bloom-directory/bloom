@@ -13,7 +13,7 @@ pub use petal_eligibility::{PendingPolicyUpdate, PetalEligibility, policy_with_p
 
 pub use projection::{
     CachedWalletProjectionReader, FileProjectionStore, ProjectionFreshness, ProjectionVerification,
-    WalletProjection, WalletProjectionReader,
+    WalletProjection, WalletProjectionReader, empty_wallet_accounts,
 };
 
 use std::{
@@ -55,10 +55,10 @@ use bloom_broker_api::{
     MachineSignRequest, OperationId, OperationPublicStatus, OperationRequest, PetalUseClaim,
     PolicyCommitReceipt, PolicyCommitUpdateRequest, PolicyUpdatePrepareResponse,
     PolicyUpdateRequest, ProtocolError, ProtocolErrorCode, ProvenanceCatalog, ProvenanceSubject,
-    RequestNonce, RevocationState, RevokeRequest, SealedApprovalPrepareResponse,
-    SealedApprovalTerms, SignedPolicySnapshot, SigningPayloads, SigningResult, SystemUseClaim,
-    Token, TypedRequestMethod, ValueLimit, WalletAccountsPublic, WalletOperationRequest,
-    WalletPublic, WalletRequest, is_read_only_method,
+    RequestNonce, RevocationState, RevokeForKeyRequest, RevokeRequest,
+    SealedApprovalPrepareResponse, SealedApprovalTerms, SignedPolicySnapshot, SigningPayloads,
+    SigningResult, SystemUseClaim, Token, TypedRequestMethod, ValueLimit, WalletAccountsPublic,
+    WalletOperationRequest, WalletPublic, WalletRequest, is_read_only_method,
 };
 use bloom_triad_local_transport::{LocalIdentity, PeerAcl};
 use serde::{Deserialize, Serialize};
@@ -1330,6 +1330,22 @@ impl MachineBrokerClient {
         {
             MachineBrokerResponse::SealedApprovalRevokeAll(state) => Ok(state),
             _ => Err(response_mismatch("sealed_approval.revoke_all")),
+        }
+    }
+
+    /// Revoke every Sealed Approval whose terms bind one key. Broker
+    /// resolves the set from its own journal, so the caller needs no local
+    /// approval inventory. Idempotent.
+    pub async fn revoke_approvals_for_key(
+        &self,
+        request: RevokeForKeyRequest,
+    ) -> Result<Vec<ApprovalPublicStatus>, ProtocolError> {
+        match self
+            .request(MachineBrokerRequest::SealedApprovalRevokeForKey(request))
+            .await?
+        {
+            MachineBrokerResponse::SealedApprovalRevokeForKey(statuses) => Ok(statuses),
+            _ => Err(response_mismatch("sealed_approval.revoke_for_key")),
         }
     }
 
@@ -2716,8 +2732,9 @@ mod tests {
     };
 
     use bloom_broker_api::{
-        ApprovalPrepareState, CeremonyKind, CustodyPrepareState, DeclaredFee, DerivationRef,
-        KeySpec, NormalizedSignature, RequestNonce, ServiceFuture, SignatureEncoding,
+        ApprovalPrepareState, CeremonyKind, CustodyPrepareState, DeclaredFee, DerivationProfile,
+        DerivationRef, DerivedAccountRequest, KeySpec, NormalizedSignature, RequestNonce,
+        ServiceFuture, SignatureEncoding,
     };
     use ed25519_dalek::SigningKey;
     use tracing_subscriber::prelude::*;
@@ -4901,7 +4918,18 @@ mod tests {
             petal_key_scope: None,
             legacy_passkey_migration: None,
             wallet_seed_profile: None,
-            derivation_requests: Vec::new(),
+            derivation_requests: vec![
+                DerivedAccountRequest {
+                    derivation_profile: DerivationProfile::Bip44EvmSecp256k1V1,
+                    requested_role: token("primary-evm"),
+                    account: None,
+                },
+                DerivedAccountRequest {
+                    derivation_profile: DerivationProfile::Bip44SolanaSlip10Ed25519V1,
+                    requested_role: token("solana-account"),
+                    account: None,
+                },
+            ],
             account_terms: None,
         };
         let error = client

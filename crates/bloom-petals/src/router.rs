@@ -13,6 +13,7 @@ use async_trait::async_trait;
 use bloom_proto::config::PetalRuntimeConfig;
 use bloom_proto::{AuditLog, AuditRecord};
 use bloom_vfs::handler::{Entry, EntryKind, Handler, HandlerError};
+use bloom_vfs::handlers::wallets::AccountPetalContext;
 use bloom_vfs::path::VfsPath;
 
 use crate::abi::{DispatchEntry, DispatchEntryKind, DispatchOp, DispatchRequest, DispatchResponse};
@@ -28,6 +29,7 @@ pub struct PetalRouter {
     runtime_petals: BTreeMap<String, PetalRuntimeConfig>,
     audit: Option<Arc<AuditLog>>,
     audit_effect_lock: Arc<tokio::sync::Mutex<()>>,
+    account: Option<AccountPetalContext>,
 }
 
 impl PetalRouter {
@@ -38,6 +40,7 @@ impl PetalRouter {
             runtime_petals: BTreeMap::new(),
             audit: None,
             audit_effect_lock: Arc::new(tokio::sync::Mutex::new(())),
+            account: None,
         }
     }
 
@@ -99,6 +102,25 @@ impl PetalRouter {
 
     fn is_petal(&self, mount: &str) -> bool {
         self.runner.resolve_petal_mount(mount).is_ok()
+            && self.account.as_ref().is_none_or(|account| {
+                account.number == 0 || self.runner.petal_account_aware(mount).unwrap_or(false)
+            })
+    }
+
+    fn require_account_mount(&self, path: &VfsPath) -> Result<(), HandlerError> {
+        if let (Some(account), Some(mount)) = (&self.account, path.segments().first())
+            && account.number != 0
+            && !self
+                .runner
+                .petal_account_aware(mount)
+                .map_err(map_petal_err)?
+        {
+            return Err(HandlerError::not_found(format!(
+                "petal '{mount}' does not declare [account] aware = true; it cannot run under account {}",
+                account.number
+            )));
+        }
+        Ok(())
     }
 
     fn is_petal_document(path: &str) -> bool {
@@ -110,6 +132,61 @@ impl PetalRouter {
         entries.extend(PETAL_DOCUMENT_NAMES.map(Entry::read_only_file));
         entries
     }
+}
+
+impl PetalRouter {
+    /// The router scoped to one numbered account. The daemon's
+    /// `AccountPetalMount` implementation delegates here; it cannot
+    /// implement the trait itself because the session inventory and stop
+    /// live in the daemon, next to the Broker edge and the key-state files.
+    pub fn for_account(&self, account: AccountPetalContext) -> Arc<dyn Handler> {
+        let mut router = self.clone();
+        router.account = Some(account);
+        Arc::new(router)
+    }
+}
+
+impl PetalRouter {
+    /// Dispatch an installed Petal route on behalf of one numbered account.
+    /// Accounts other than 0 run only account-aware Petals: an unaware
+    /// package is not found here, with a message naming the Petal and the
+    /// missing declaration.
+    pub async fn dispatch_for_account(
+        &self,
+        mount: &str,
+        op: DispatchOp,
+        path: String,
+        body: Vec<u8>,
+        account: &AccountPetalContext,
+    ) -> Result<DispatchResponse, HandlerError> {
+        if account.number != 0 {
+            let aware = self
+                .runner
+                .petal_account_aware(mount)
+                .map_err(map_petal_err)?;
+            if !aware {
+                return Err(HandlerError::not_found(format!(
+                    "petal '{mount}' does not declare [account] aware = true; it cannot run \
+                     under account {}",
+                    account.number
+                )));
+            }
+        }
+        let trusted = vec![
+            ("bloom.wallet".to_owned(), account.wallet.clone()),
+            ("bloom.account".to_owned(), account.number.to_string()),
+        ];
+        self.dispatch_with_params(
+            mount,
+            op,
+            path,
+            body,
+            &trusted,
+            Some(account.wallet.clone()),
+            Some(account),
+        )
+        .await
+    }
 
     async fn dispatch_petal(
         &self,
@@ -117,6 +194,26 @@ impl PetalRouter {
         op: DispatchOp,
         path: String,
         body: Vec<u8>,
+    ) -> Result<DispatchResponse, HandlerError> {
+        if let Some(account) = &self.account {
+            return self
+                .dispatch_for_account(mount, op, path, body, account)
+                .await;
+        }
+        self.dispatch_with_params(mount, op, path, body, &[], None, None)
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn dispatch_with_params(
+        &self,
+        mount: &str,
+        op: DispatchOp,
+        path: String,
+        body: Vec<u8>,
+        trusted_params: &[(String, String)],
+        account_wallet: Option<String>,
+        account: Option<&AccountPetalContext>,
     ) -> Result<DispatchResponse, HandlerError> {
         // Lookup, list, and ordinary reads are filesystem observations, not
         // security effects. Auditing them both misstates the event stream and
@@ -160,7 +257,7 @@ impl PetalRouter {
                 .append(AuditRecord {
                     ts_ms: 0,
                     kind: "machine.effect.intent".into(),
-                    wallet: None,
+                    wallet: account_wallet.clone(),
                     chain: None,
                     data: serde_json::json!({
                         "operation": operation,
@@ -182,7 +279,7 @@ impl PetalRouter {
         }
         let executed = self
             .runner
-            .dispatch_petal_route(
+            .dispatch_petal_route_with_trusted_params(
                 mount,
                 DispatchRequest {
                     op,
@@ -193,6 +290,8 @@ impl PetalRouter {
                 self.host.clone(),
                 None,
                 self.run_options(mount),
+                trusted_params,
+                account,
             )
             .await;
         let (outcome, result_digest) = match &executed {
@@ -238,6 +337,7 @@ impl PetalRouter {
 #[async_trait]
 impl Handler for PetalRouter {
     async fn lookup(&self, path: &VfsPath) -> Result<Entry, HandlerError> {
+        self.require_account_mount(path)?;
         match path.segments() {
             [] => Ok(Entry::dir("")),
             [mount] => {
@@ -289,6 +389,7 @@ impl Handler for PetalRouter {
     }
 
     async fn read(&self, path: &VfsPath) -> Result<Vec<u8>, HandlerError> {
+        self.require_account_mount(path)?;
         let (mount, rest) = Self::mount_path(path)?;
         if !self.is_petal(mount) {
             return Err(HandlerError::NotFound(path.to_string_path()));
@@ -312,6 +413,7 @@ impl Handler for PetalRouter {
     }
 
     async fn write(&self, path: &VfsPath, data: &[u8]) -> Result<(), HandlerError> {
+        self.require_account_mount(path)?;
         let (mount, rest) = Self::mount_path(path)?;
         if rest.is_empty() {
             return Err(HandlerError::PermissionDenied);
@@ -341,11 +443,14 @@ impl Handler for PetalRouter {
     }
 
     async fn list(&self, path: &VfsPath) -> Result<Vec<Entry>, HandlerError> {
+        self.require_account_mount(path)?;
         match path.segments() {
             [] => {
                 let mut mounts = BTreeMap::new();
                 for (mount, _hash) in self.runner.local_petal_mounts().map_err(map_petal_err)? {
-                    mounts.insert(mount, ());
+                    if self.is_petal(&mount) {
+                        mounts.insert(mount, ());
+                    }
                 }
                 Ok(mounts.into_keys().map(|mount| Entry::dir(&mount)).collect())
             }
