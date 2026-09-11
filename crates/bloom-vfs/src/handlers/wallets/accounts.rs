@@ -994,7 +994,7 @@ impl WalletsHandler {
             .tx_engine
             .outbox
             .read_in_state(wallet, chain, id, st)
-            .map_err(err_be)?;
+            .map_err(outbox_err)?;
         if !self.evm_scope_allows(&entry.staged.from, scope) {
             return Err(HandlerError::not_found(format!("outbox/{state}/{id}")));
         }

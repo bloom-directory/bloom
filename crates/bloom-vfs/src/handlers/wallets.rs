@@ -415,7 +415,20 @@ impl WalletsHandler {
             })?
             .get_wallet(&wallet_id)
             .await
-            .map_err(|error| HandlerError::backend(error.to_string()))
+            .map_err(|error| {
+                // A wallet that is not registered is absent, not broken. The
+                // projection reader reports it as an invalid request; to a
+                // filesystem client that must be ENOENT, or `ls` of a mistyped
+                // wallet name looks like the machine is failing.
+                let absent = error.code == ProtocolErrorCode::BackendInvalidRequest
+                    && (error.message == format!("wallet {wallet} not found")
+                        || error.message == format!("wallet {wallet} was deleted"));
+                if absent {
+                    HandlerError::not_found(wallet.to_owned())
+                } else {
+                    HandlerError::backend(error.to_string())
+                }
+            })
     }
 
     async fn wallet_projection_list(&self) -> Result<Vec<WalletProjection>, HandlerError> {
@@ -2130,6 +2143,31 @@ fn newest_pending_target(mut pending: Vec<(u128, String)>) -> Option<String> {
         .map(|(_, id)| format!("pending/{id}"))
 }
 
+/// Outbox failures, keeping "it is not there" apart from "it broke".
+///
+/// `err_be` flattened every `OutboxError` into `Backend`, which mounts render
+/// as `EIO`. A client reads `EIO` as a server fault worth retrying; `ENOENT` is
+/// a fact it can act on. That is the difference between an agent concluding
+/// "the transfer is gone, I am done" and an agent retrying against a path that
+/// will never exist -- which is what happened in the wallet benchmark, where
+/// agents that had correctly discarded the denied transfers could not tell,
+/// and went on to discard the rest.
+///
+/// `StateMismatch` maps to `NotFound` deliberately: the caller named an id in a
+/// state it is not in, so the path it asked for does not exist. It lives
+/// somewhere else, which is what a lookup should report.
+fn outbox_err(e: bloom_tx::outbox::OutboxError) -> HandlerError {
+    use bloom_tx::outbox::OutboxError;
+    match e {
+        OutboxError::NotFound(what) => HandlerError::not_found(what),
+        OutboxError::StateMismatch { id, .. } => HandlerError::not_found(id),
+        OutboxError::Io(io) if io.kind() == std::io::ErrorKind::NotFound => {
+            HandlerError::not_found(io.to_string())
+        }
+        other => err_be(other),
+    }
+}
+
 /// Reject a policy-update action id that could escape its state directory
 /// (path traversal, the `latest` sentinel, or NUL). Real ids are
 /// `policy-update-<blake3-hex>`, so this is defense-in-depth.
@@ -2850,6 +2888,13 @@ impl WalletsHandler {
         if segs.len() == 1 && segs[0] == "new" {
             return Ok(b"Write a wallet name matching [A-Za-z0-9_-]{1,64}.\n".to_vec());
         }
+        if segs.len() == 1 && segs[0] != "registrations" {
+            // Reading a wallet directory is EISDIR, but only if the wallet is
+            // there. Answering "is a directory" for a name that does not exist
+            // tells the caller the opposite of the truth.
+            self.wallet_projection(&segs[0]).await?;
+            return Err(HandlerError::NotAFile(path.to_string_path()));
+        }
         if segs[0] == "registrations" {
             return match segs {
                 [_, requested_name, leaf] if leaf == "status.json" => {
@@ -3185,6 +3230,14 @@ impl WalletsHandler {
                     names.extend(solana.keys().cloned());
                 }
                 Ok(names.into_iter().map(|n| Entry::dir(&n)).collect())
+            }
+            // `lookup` reports capabilities/ as a directory, so `list` has to
+            // agree. Without this arm it fell through to NotADir, which mounts
+            // render as ENOTDIR: `stat` called it a directory and `ls` refused
+            // to read it, and every `find` over the tree emitted one error per
+            // wallet into whatever was reading the output.
+            2 if segs[1] == "capabilities" => {
+                Ok(vec![Entry::file("active.json"), Entry::file("active.md")])
             }
             2 if segs[1] == "sealed-approvals" => {
                 let mut entries = vec![
@@ -4178,7 +4231,7 @@ impl WalletsHandler {
             .tx_engine
             .outbox
             .read_in_state(wallet, chain, id, OutboxState::Pending)
-            .map_err(err_be)?;
+            .map_err(outbox_err)?;
         if !entry.staged.from.eq_ignore_ascii_case(sender) {
             return Err(HandlerError::not_found(format!("outbox/pending/{id}")));
         }
@@ -4506,6 +4559,11 @@ mod tests {
 
     struct UnavailableProjection;
 
+    struct FailedProjection {
+        code: ProtocolErrorCode,
+        message: &'static str,
+    }
+
     struct IntegrityFailureProjection(Arc<dyn WalletProjectionReader>);
 
     #[async_trait]
@@ -4561,6 +4619,26 @@ mod tests {
     }
 
     #[async_trait]
+    impl WalletProjectionReader for FailedProjection {
+        async fn list_wallets(
+            &self,
+        ) -> Result<Vec<WalletProjection>, bloom_broker_api::ProtocolError> {
+            Err(ProtocolError::new(self.code, self.message))
+        }
+
+        async fn get_wallet(
+            &self,
+            _wallet_id: &Token,
+        ) -> Result<WalletProjection, bloom_broker_api::ProtocolError> {
+            Err(ProtocolError::new(self.code, self.message))
+        }
+
+        fn cached_wallets(&self) -> Result<Vec<WalletProjection>, bloom_broker_api::ProtocolError> {
+            Err(ProtocolError::new(self.code, self.message))
+        }
+    }
+
+    #[async_trait]
     impl WalletProjectionReader for StaticProjection {
         async fn list_wallets(
             &self,
@@ -4577,7 +4655,7 @@ mod tests {
             } else {
                 Err(ProtocolError::new(
                     ProtocolErrorCode::BackendInvalidRequest,
-                    "unknown wallet projection",
+                    format!("wallet {} not found", wallet_id.as_str()),
                 ))
             }
         }
@@ -9081,6 +9159,74 @@ value = "0""#,
         );
     }
 
+    // ---- errno semantics -------------------------------------------------
+    // A client cannot act on an error it cannot read. "No such file" is a fact
+    // it can use; "input/output error" is a fault worth retrying. Mounts render
+    // NotFound as ENOENT and Backend as EIO, so the variant here decides what
+    // an agent believes about the world.
+    //
+    // In the 2026-09-06 wallet benchmark, agents that had correctly discarded
+    // the policy-denied transfers could not tell: the transfer leaves pending/,
+    // and every way of checking returned EIO. Two of them responded by
+    // discarding everything.
+
+    #[tokio::test]
+    async fn a_missing_action_id_is_not_found_not_a_backend_fault() {
+        let f = make_handler_with_chain(true);
+        seed_pending(&f, "0001-real");
+        let p = VfsPath::parse(&format!(
+            "/{}/chains/anvil/outbox/pending/NOPE/confirm",
+            f.wallet_name
+        ))
+        .unwrap();
+        assert!(
+            matches!(f.handler.lookup(&p).await, Err(HandlerError::NotFound(_))),
+            "lookup: {:?}",
+            f.handler.lookup(&p).await.err()
+        );
+        assert!(
+            matches!(f.handler.read(&p).await, Err(HandlerError::NotFound(_))),
+            "read: {:?}",
+            f.handler.read(&p).await.err()
+        );
+    }
+
+    #[tokio::test]
+    async fn an_id_in_the_wrong_state_is_not_found_at_the_path_asked_for() {
+        // It exists, elsewhere. The path named does not, which is what a
+        // lookup reports -- not that the machine is broken.
+        let f = make_handler_with_chain(true);
+        seed_pending(&f, "0001-real");
+        let p = VfsPath::parse(&format!(
+            "/{}/chains/anvil/outbox/sent/0001-real/intent.json",
+            f.wallet_name
+        ))
+        .unwrap();
+        assert!(
+            matches!(f.handler.lookup(&p).await, Err(HandlerError::NotFound(_))),
+            "lookup: {:?}",
+            f.handler.lookup(&p).await.err()
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unregistered_wallet_is_not_found() {
+        let f = make_handler_with_chain(true);
+        for path in ["/nosuchwallet", "/nosuchwallet/address"] {
+            let p = VfsPath::parse(path).unwrap();
+            assert!(
+                matches!(f.handler.lookup(&p).await, Err(HandlerError::NotFound(_))),
+                "lookup {path}: {:?}",
+                f.handler.lookup(&p).await.err()
+            );
+            assert!(
+                matches!(f.handler.read(&p).await, Err(HandlerError::NotFound(_))),
+                "read {path}: {:?}",
+                f.handler.read(&p).await.err()
+            );
+        }
+    }
+
     /// `accounts/` is unconditional for a configured Solana chain, so the
     /// namespace does not change shape when the first child is allocated or
     /// the last is retired. With none active it lists empty, while the
@@ -9164,5 +9310,68 @@ value = "0""#,
             matches!(err, HandlerError::Backend(_)),
             "an unreachable cluster is a backend failure, got {err:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_deleted_wallet_is_not_found() {
+        let mut f = make_handler_with_chain(true);
+        f.handler.wallet_projections = Some(Arc::new(FailedProjection {
+            code: ProtocolErrorCode::BackendInvalidRequest,
+            message: "wallet alice was deleted",
+        }));
+        let p = VfsPath::parse("/alice").unwrap();
+        assert!(matches!(
+            f.handler.read(&p).await,
+            Err(HandlerError::NotFound(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn an_unrelated_not_found_fault_remains_a_backend_error() {
+        let mut f = make_handler_with_chain(true);
+        f.handler.wallet_projections = Some(Arc::new(FailedProjection {
+            code: ProtocolErrorCode::BackendInvalidRequest,
+            message: "key not found",
+        }));
+        let p = VfsPath::parse("/alice").unwrap();
+        assert!(matches!(
+            f.handler.read(&p).await,
+            Err(HandlerError::Backend(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_registered_wallet_root_is_a_directory_not_a_file() {
+        let f = make_handler_with_chain(true);
+        let p = VfsPath::parse(&format!("/{}", f.wallet_name)).unwrap();
+        assert!(matches!(
+            f.handler.read(&p).await,
+            Err(HandlerError::NotAFile(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn capabilities_lists_because_lookup_calls_it_a_directory() {
+        // stat said directory and ls said "Not a directory", so every `find`
+        // over the wallet tree emitted one error per wallet.
+        let f = make_handler_with_chain(true);
+        let p = VfsPath::parse(&format!("/{}/capabilities", f.wallet_name)).unwrap();
+        assert!(matches!(
+            f.handler.lookup(&p).await.unwrap().kind,
+            crate::handler::EntryKind::Dir
+        ));
+        let names: Vec<String> = f
+            .handler
+            .list(&p)
+            .await
+            .expect("a node lookup calls a directory must list")
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert!(
+            names.contains(&"active.json".to_string()),
+            "names={names:?}"
+        );
+        assert!(names.contains(&"active.md".to_string()), "names={names:?}");
     }
 }
