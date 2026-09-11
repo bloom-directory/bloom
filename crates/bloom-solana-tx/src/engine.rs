@@ -475,6 +475,8 @@ impl SolanaTransferEngine {
         approval_id: Option<Digest32>,
         now_ms: u128,
     ) -> Result<SolanaSignOutcome, EngineError> {
+        let operation_lock = self.operation_lock(wallet, id);
+        let _operation_guard = operation_lock.lock().await;
         let entry =
             self.outbox
                 .read_in_state(wallet, &self.chain, id, SolanaOutboxState::Pending)?;
