@@ -8,7 +8,7 @@
   <a href="https://github.com/bloom-directory/bloom/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/bloom-directory/bloom/ci.yml?branch=master&style=flat-square&label=ci"></a>
   <a href="https://github.com/bloom-directory/bloom/releases"><img alt="Release" src="https://img.shields.io/github/v/release/bloom-directory/bloom?include_prereleases&style=flat-square"></a>
   <a href="./LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-141310?style=flat-square"></a>
-  <img alt="Rust 1.86+" src="https://img.shields.io/badge/rust-1.86%2B-a8324c?style=flat-square">
+  <a href="./Cargo.toml"><img alt="Declared MSRV: 1.86" src="https://img.shields.io/badge/Declared%20MSRV%3A%201.86-a8324c?style=flat-square"></a>
 </p>
 
 <p align="center">

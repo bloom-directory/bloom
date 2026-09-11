@@ -47,13 +47,18 @@ seam.
 
 | Tool | Use |
 |---|---|
-| Rust 1.86 or newer | Workspace builds and tests |
+| [Rust via rustup](./rust-toolchain.toml) | Workspace builds and tests |
 | Foundry (`anvil`, `cast`, `forge`) | Local EVM integration tests |
 | `jq` | Developer harnesses and shell tests |
 | Agave `solana-test-validator` v3.0.0 | Optional validator-backed Solana tests |
 | Docker | Optional Linux and Anvil environments |
 | macOS NFS client | Mounted-VFS tests on macOS |
 | Tart | macOS packaging and principal-isolation acceptance |
+
+Run builds from the repository checkout so rustup uses the toolchain selected
+by `rust-toolchain.toml` (currently stable). The workspace manifest declares
+Rust 1.86 as its minimum version; this is separate from the selected
+development toolchain.
 
 Keep the three repositories side by side by default:
 
