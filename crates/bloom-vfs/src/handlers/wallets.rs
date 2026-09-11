@@ -34,6 +34,7 @@ use std::sync::Arc;
 
 /// `wallets/<wallet>/<n>/...`: the numbered account view.
 mod accounts;
+use accounts::OutboxScope;
 use accounts::{accounts_json_with_numbers as render_accounts_json, parse_account_segment};
 
 pub use accounts::{accounts_json_with_numbers, derivation_path_number};
@@ -46,7 +47,7 @@ use bloom_machine_client::{MachineBrokerClient, WalletProjectionReader};
 use bloom_proto::{AddressBook, CapabilityViewEntry, HomeWritePermit, Policy, RawIntent};
 use bloom_tx::{
     intent_parser,
-    outbox::{OutboxError, OutboxState},
+    outbox::OutboxState,
     tx_engine::{TxEngine, TxEngineError},
 };
 use qrcode::QrCode;
@@ -2110,89 +2111,12 @@ impl WalletsHandler {
             Entry::dir("capabilities"),
         ]
     }
-
-    fn latest_evm_pending_target(
-        &self,
-        wallet: &str,
-        chain: &str,
-    ) -> Result<Option<String>, HandlerError> {
-        let ids = self
-            .tx_engine
-            .outbox
-            .list(wallet, chain, OutboxState::Pending)
-            .map_err(err_be)?;
-        let pending = collect_newest_first(ids, |id| {
-            match self
-                .tx_engine
-                .outbox
-                .read_in_state(wallet, chain, id, OutboxState::Pending)
-            {
-                Ok(entry) => Ok(Some(entry.staged.created_ms)),
-                // The entry transitioned between listing and reading; it is
-                // no longer a pending candidate.
-                Err(OutboxError::NotFound(_)) => Ok(None),
-                Err(error) => Err(err_be(error)),
-            }
-        })?;
-        Ok(newest_pending_target(pending))
-    }
-
-    fn latest_solana_pending_target(
-        engine: &bloom_solana_tx::engine::SolanaTransferEngine,
-        wallet: &str,
-        chain: &str,
-    ) -> Result<Option<String>, HandlerError> {
-        let state = bloom_solana_tx::outbox::SolanaOutboxState::Pending;
-        let ids = engine
-            .outbox()
-            .list(wallet, chain, state)
-            .map_err(solana_outbox_err)?;
-        let pending = collect_newest_first(ids, |id| {
-            match engine.outbox().read_in_state(wallet, chain, id, state) {
-                Ok(entry) => Ok(Some(entry.staged.created_ms)),
-                Err(bloom_solana_tx::outbox::OutboxError::NotFound(_)) => Ok(None),
-                Err(error) => Err(solana_outbox_err(error)),
-            }
-        })?;
-        Ok(newest_pending_target(pending))
-    }
-
-    fn outbox_dir_entries(&self, wallet: &str, chain: &str) -> Result<Vec<Entry>, HandlerError> {
-        let mut entries = vec![
-            Entry::writable_file("new.tx"),
-            Entry::dir("pending"),
-            Entry::dir("sent"),
-            Entry::dir("failed"),
-        ];
-        if let Some(target) = self.latest_evm_pending_target(wallet, chain)? {
-            entries.push(Entry::symlink("latest", &target));
-        }
-        Ok(entries)
-    }
 }
 
 fn err_be(e: impl std::fmt::Display) -> HandlerError {
     HandlerError::backend(e.to_string())
 }
 
-/// Collect `(created_ms, id)` pairs for pending entries, skipping only
-/// entries that vanished between listing and reading (a state transition
-/// raced the listing) and surfacing every other read failure. Silently
-/// dropping an unreadable newest entry would point `latest` at an older
-/// transfer, and `latest` is advertised as the atomic identity of the newest
-/// staged intent.
-fn collect_newest_first(
-    ids: Vec<String>,
-    mut read: impl FnMut(&str) -> Result<Option<u128>, HandlerError>,
-) -> Result<Vec<(u128, String)>, HandlerError> {
-    let mut pending = Vec::with_capacity(ids.len());
-    for id in ids {
-        if let Some(created_ms) = read(&id)? {
-            pending.push((created_ms, id));
-        }
-    }
-    Ok(pending)
-}
 /// Render the newest pending entry as a `pending/<id>` symlink target.
 ///
 /// Ties on `created_ms` break toward the greater id: outbox ids come from a
@@ -2672,6 +2596,11 @@ impl Handler for WalletsHandler {
                     && pending == "pending"
                     && fname == "confirm.override" =>
             {
+                // The wallet-level outbox is account 0's: the override
+                // write-open must not prepare anything for another
+                // account's entry.
+                let scope = self.wallet_outbox_write_family(wallet, chain).await?;
+                self.require_staged_by(wallet, chain, id, Some(scope.address()))?;
                 let (_, policy) = self.planning_wallet_inputs(wallet, chain).await?;
                 let client = self
                     .chains
@@ -3111,8 +3040,19 @@ impl WalletsHandler {
         }
         if segs.len() >= 4 && segs[1] == "chains" && segs[3] == "outbox" {
             if let Some(engine) = self.solana_engine(&segs[2]) {
+                // The wallet-level outbox is account 0's, fenced like the
+                // numbered tree: every stage is pinned to account 0's key,
+                // and an intent naming another account is refused.
+                let family = self.wallet_outbox_write_family(wallet, &segs[2]).await?;
                 return self
-                    .write_solana_outbox(wallet, &segs[2], &segs[4..], data, &engine, None)
+                    .write_solana_outbox(
+                        wallet,
+                        &segs[2],
+                        &segs[4..],
+                        data,
+                        &engine,
+                        Some(Self::solana_sender(&family)),
+                    )
                     .await;
             }
             // A Solana chain with no engine is readable but cannot stage.
@@ -3124,7 +3064,15 @@ impl WalletsHandler {
                     segs[2]
                 )));
             }
-            return self.write_outbox(wallet, &segs[2], &segs[4..], data).await;
+            // The wallet-level EVM outbox is account 0's: the numbered
+            // implementation fixes the sender, fences the pending controls,
+            // and enforces the body-fingerprint check.
+            // The wallet-level EVM outbox is account 0's: the numbered
+            // implementation fixes the sender, fences the pending controls,
+            // and enforces the body-fingerprint check. `segs[1..]` re-roots
+            // the path at account 0 (`/<w>/0/chains/<c>/outbox/...`).
+            self.wallet_outbox_write_family(wallet, &segs[2]).await?;
+            return self.write_account(wallet, 0, &segs[1..], data).await;
         }
         if segs.len() == 2 && segs[1] == "policy.json" {
             self.write_permit()?;
@@ -3313,9 +3261,7 @@ impl WalletsHandler {
         rest: &[String],
     ) -> Result<Entry, HandlerError> {
         if self.is_solana_chain(chain) {
-            return self
-                .lookup_solana_chain(wallet, chain, rest, self.solana_engine(chain))
-                .await;
+            return self.lookup_solana_chain(wallet, chain, rest).await;
         }
         let _client = self
             .chains
@@ -3330,7 +3276,13 @@ impl WalletsHandler {
                 Ok(Entry::file(s))
             }
             [s] if s == "outbox" => Ok(Entry::dir("outbox")),
-            [s, ..] if s == "outbox" => self.lookup_outbox(wallet, chain, &rest[1..]).await,
+            [s, ..] if s == "outbox" => {
+                // The wallet-level outbox is account 0's view, fenced like
+                // the numbered tree.
+                let scope = self.wallet_outbox_read_scope(wallet, chain).await?;
+                self.evm_outbox_lookup(wallet, scope.read_scope(), chain, &rest[1..])
+                    .await
+            }
             _ => Err(HandlerError::not_found(rest.join("/"))),
         }
     }
@@ -3340,7 +3292,6 @@ impl WalletsHandler {
         wallet: &str,
         chain: &str,
         rest: &[String],
-        engine: Option<Arc<bloom_solana_tx::engine::SolanaTransferEngine>>,
     ) -> Result<Entry, HandlerError> {
         if rest.is_empty() {
             return Ok(Entry::dir(chain));
@@ -3366,106 +3317,17 @@ impl WalletsHandler {
             _ => {}
         }
         // The chain directory itself resolves for any configured Solana
-        // chain. Everything below is outbox routing, which needs a transfer
-        // engine — a read-only chain has none.
-        let engine = engine.ok_or_else(|| {
-            HandlerError::not_found(format!(
-                "chain '{chain}' is configured for reads only; staging is unavailable"
-            ))
-        })?;
+        // chain. Everything below is outbox routing; the scoped lookup
+        // names an engine-less chain.
         match rest {
             [] => Ok(Entry::dir(chain)),
             [s] if s == "outbox" => Ok(Entry::dir("outbox")),
-            [s, fname] if s == "outbox" && fname == "new.tx" => Ok(Entry::writable_file("new.tx")),
-            [s, fname] if s == "outbox" && fname == "latest" => {
-                let target = Self::latest_solana_pending_target(&engine, wallet, chain)?
-                    .ok_or_else(|| HandlerError::not_found("outbox/latest"))?;
-                Ok(Entry::symlink("latest", &target))
-            }
-            [s, state] if s == "outbox" && solana_state(state).is_some() => Ok(Entry::dir(state)),
-            [s, state, id] if s == "outbox" && solana_state(state).is_some() => {
-                let entry = engine
-                    .outbox()
-                    .read_in_state(wallet, chain, id, solana_state(state).unwrap())
-                    .map_err(solana_outbox_err)?;
-                Ok(Entry::dir(id).with_modified_ms(entry.staged.created_ms))
-            }
-            [s, state, id, fname] if s == "outbox" && solana_state(state).is_some() => {
-                let entry = engine
-                    .outbox()
-                    .read_in_state(wallet, chain, id, solana_state(state).unwrap())
-                    .map_err(solana_outbox_err)?;
-                if solana_state(state) == Some(bloom_solana_tx::outbox::SolanaOutboxState::Pending)
-                    && matches!(fname.as_str(), "confirm" | "cancel" | "restage")
-                {
-                    return Ok(
-                        Entry::writable_file(fname).with_modified_ms(entry.staged.created_ms)
-                    );
-                }
-                if !is_public_solana_outbox_artifact(fname) {
-                    return Err(HandlerError::not_found(fname));
-                }
-                let fpath = entry.dir.join(fname);
-                if !fpath.exists() {
-                    return Err(HandlerError::not_found(format!(
-                        "/{wallet}/chains/{chain}/outbox/{state}/{id}/{fname}"
-                    )));
-                }
-                Ok(Entry::file(fname).with_modified_ms(entry.staged.created_ms))
-            }
-            _ => Err(HandlerError::not_found(rest.join("/"))),
-        }
-    }
-
-    async fn lookup_outbox(
-        &self,
-        wallet: &str,
-        chain: &str,
-        rest: &[String],
-    ) -> Result<Entry, HandlerError> {
-        match rest {
-            [] => Ok(Entry::dir("outbox")),
-            [s] if s == "new.tx" => Ok(Entry::writable_file("new.tx")),
-            [s] if s == "pending" || s == "sent" || s == "failed" => Ok(Entry::dir(s)),
-            [s] if s == "latest" => {
-                let target = self
-                    .latest_evm_pending_target(wallet, chain)?
-                    .ok_or_else(|| HandlerError::not_found("outbox/latest"))?;
-                Ok(Entry::symlink("latest", &target))
-            }
-            [state, id] => {
-                let st = parse_state_seg(state)?;
-                // Confirm the entry actually lives in the requested state
-                // (fix #8): a stale path like `outbox/sent/<pending-id>`
-                // should NotFound, not silently succeed.
-                let entry = self
-                    .tx_engine
-                    .outbox
-                    .read_in_state(wallet, chain, id, st)
-                    .map_err(err_be)?;
-                Ok(Entry::dir(id).with_modified_ms(entry.staged.created_ms))
-            }
-            [state, id, fname] => {
-                let st = parse_state_seg(state)?;
-                let entry = self
-                    .tx_engine
-                    .outbox
-                    .read_in_state(wallet, chain, id, st)
-                    .map_err(err_be)?;
-                // Pending entries advertise the writable controls
-                // (`confirm`, `replace`, `cancel`) even when those files
-                // don't yet exist on disk — they are virtual write sinks.
-                if st == OutboxState::Pending
-                    && matches!(
-                        fname.as_str(),
-                        "confirm" | "confirm.override" | "replace" | "cancel"
-                    )
-                {
-                    Ok(Entry::writable_file(fname).with_modified_ms(entry.staged.created_ms))
-                } else {
-                    open_regular_outbox_artifact(&entry.dir, fname)?;
-                    Ok(Entry::file(fname).with_modified_ms(entry.staged.created_ms))
-                }
+            [s, outbox_rest @ ..] if s == "outbox" => {
+                // The wallet-level outbox is account 0's view, fenced like
+                // the numbered tree.
+                let scope = self.wallet_outbox_read_scope(wallet, chain).await?;
+                self.solana_outbox_lookup(wallet, scope.read_scope(), chain, outbox_rest)
+                    .await
             }
             _ => Err(HandlerError::not_found(rest.join("/"))),
         }
@@ -3495,18 +3357,27 @@ impl WalletsHandler {
     }
 
     /// Read bloom's outbox view of nonces for `(wallet, chain)` in the
-    /// given state. Returns `(sorted_unique_nonces, nonce -> hashes)`
-    /// where the hash list contains only entries that already have a
-    /// `tx_hash` (pending entries may not).
+    /// given state, filtered to the wallet-level scope's sender. The
+    /// mempool side of the conflict report is account 0's address, so an
+    /// unfiltered outbox side would report another account's nonce as a
+    /// conflict that can never exist. Returns
+    /// `(sorted_unique_nonces, nonce -> hashes)` where the hash list
+    /// contains only entries that already have a `tx_hash` (pending
+    /// entries may not).
     fn bloom_outbox_nonces(
         &self,
         wallet: &str,
         chain: &str,
         state: OutboxState,
+        scope: OutboxScope<'_>,
     ) -> (Vec<u64>, std::collections::BTreeMap<u64, Vec<String>>) {
         let mut by_nonce: std::collections::BTreeMap<u64, Vec<String>> =
             std::collections::BTreeMap::new();
         let mut nonces: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
+        if matches!(scope, OutboxScope::Empty) {
+            // No account-0 key: the wallet-level outbox shows nothing.
+            return (Vec::new(), by_nonce);
+        }
         let ids = match self.tx_engine.outbox.list(wallet, chain, state) {
             Ok(v) => v,
             Err(_) => return (Vec::new(), by_nonce),
@@ -3519,6 +3390,9 @@ impl WalletsHandler {
             else {
                 continue;
             };
+            if !self.evm_scope_allows(&entry.staged.from, scope) {
+                continue;
+            }
             nonces.insert(entry.staged.nonce);
             if let Some(h) = entry.staged.tx_hash.as_deref() {
                 by_nonce
@@ -3537,9 +3411,7 @@ impl WalletsHandler {
         rest: &[String],
     ) -> Result<Vec<u8>, HandlerError> {
         if self.is_solana_chain(chain) {
-            return self
-                .read_solana_chain(wallet, chain, rest, self.solana_engine(chain))
-                .await;
+            return self.read_solana_chain(wallet, chain, rest).await;
         }
         // Read-only chain leaves (balance/nonce): never gated on policy sig.
         let address: alloy::primitives::Address = self
@@ -3586,18 +3458,17 @@ impl WalletsHandler {
                 Ok(format!("{}\n", n).into_bytes())
             }
             [s, state, id, fname] if s == "outbox" => {
-                let st = parse_state_seg(state)?;
                 // Honour the path's state segment (fix #8): only read from
-                // the requested state, NotFound otherwise.
-                let entry = self
-                    .tx_engine
-                    .outbox
-                    .read_in_state(wallet, chain, id, st)
-                    .map_err(err_be)?;
-                let mut file = open_regular_outbox_artifact(&entry.dir, fname)?;
-                let mut bytes = Vec::new();
-                std::io::Read::read_to_end(&mut file, &mut bytes)?;
-                Ok(bytes)
+                // the requested state, NotFound otherwise. The wallet-level
+                // outbox is account 0's view.
+                let scope = self.wallet_outbox_read_scope(wallet, chain).await?;
+                self.evm_outbox_read(
+                    wallet,
+                    scope.read_scope(),
+                    chain,
+                    &[state.clone(), id.clone(), fname.clone()],
+                )
+                .await
             }
             [s] if s == "pending_external.jsonl" => {
                 // Cross-reference against the outbox so we don't surface
@@ -3646,10 +3517,12 @@ impl WalletsHandler {
                     }
                     None => (Vec::new(), std::collections::BTreeMap::new()),
                 };
+                let outbox_scope = self.wallet_outbox_read_scope(wallet, chain).await?;
+                let scope = outbox_scope.read_scope();
                 let (pending_nonces, pending_by_nonce) =
-                    self.bloom_outbox_nonces(wallet, chain, OutboxState::Pending);
+                    self.bloom_outbox_nonces(wallet, chain, OutboxState::Pending, scope);
                 let (sent_nonces, sent_by_nonce) =
-                    self.bloom_outbox_nonces(wallet, chain, OutboxState::Sent);
+                    self.bloom_outbox_nonces(wallet, chain, OutboxState::Sent, scope);
                 // Union of nonces we ourselves staged or sent: any nonce
                 // the mempool also sees here is a candidate for conflict.
                 let mut conflicts: Vec<serde_json::Value> = Vec::new();
@@ -3701,7 +3574,6 @@ impl WalletsHandler {
         wallet: &str,
         chain: &str,
         rest: &[String],
-        engine: Option<Arc<bloom_solana_tx::engine::SolanaTransferEngine>>,
     ) -> Result<Vec<u8>, HandlerError> {
         // IPC reads bypass lookup, so Solana must enforce the same wallet
         // projection availability gate as the EVM read path.
@@ -3730,28 +3602,14 @@ impl WalletsHandler {
             _ => {}
         }
 
-        // Everything below is outbox routing, which needs a transfer engine —
-        // a read-only chain has none.
-        let engine = engine.ok_or_else(|| {
-            HandlerError::not_found(format!(
-                "chain '{chain}' is configured for reads only; staging is unavailable"
-            ))
-        })?;
         match rest {
-            [s, state, id, fname] if s == "outbox" => {
-                if !is_public_solana_outbox_artifact(fname) {
-                    return Err(HandlerError::not_found(fname));
-                }
-                let st = solana_state(state)
-                    .ok_or_else(|| HandlerError::not_found(format!("outbox state '{state}'")))?;
-                let entry = engine
-                    .outbox()
-                    .read_in_state(wallet, chain, id, st)
-                    .map_err(solana_outbox_err)?;
-                let mut file = open_regular_outbox_artifact(&entry.dir, fname)?;
-                let mut bytes = Vec::new();
-                std::io::Read::read_to_end(&mut file, &mut bytes)?;
-                Ok(bytes)
+            [s, outbox_rest @ ..] if s == "outbox" => {
+                // The wallet-level outbox is account 0's view. An
+                // engine-less chain has no outbox to read; the scoped read
+                // names that.
+                let scope = self.wallet_outbox_read_scope(wallet, chain).await?;
+                self.solana_outbox_read(wallet, scope.read_scope(), chain, outbox_rest)
+                    .await
             }
             _ => Err(HandlerError::NotAFile(rest.join("/"))),
         }
@@ -3762,7 +3620,6 @@ impl WalletsHandler {
         wallet: &str,
         chain: &str,
         rest: &[String],
-        engine: Option<Arc<bloom_solana_tx::engine::SolanaTransferEngine>>,
     ) -> Result<Vec<Entry>, HandlerError> {
         if rest.is_empty() {
             // `outbox/` is advertised only when this chain can actually
@@ -3773,7 +3630,7 @@ impl WalletsHandler {
                 Entry::file("balance.json"),
                 Entry::dir("accounts"),
             ];
-            if engine.is_some() {
+            if self.solana_engine(chain).is_some() {
                 entries.push(Entry::dir("outbox"));
             }
             return Ok(entries);
@@ -3798,70 +3655,18 @@ impl WalletsHandler {
             }
             _ => {}
         }
-        // The chain directory itself resolves for any configured Solana
-        // chain. Everything below is outbox routing, which needs a transfer
-        // engine — a read-only chain has none.
-        let engine = engine.ok_or_else(|| {
-            HandlerError::not_found(format!(
-                "chain '{chain}' is configured for reads only; staging is unavailable"
-            ))
-        })?;
         match rest {
             [] => Ok(vec![Entry::dir("outbox")]),
             [s] if s == "outbox" => {
-                let mut entries = vec![
-                    Entry::writable_file("new.tx"),
-                    Entry::dir("pending"),
-                    Entry::dir("sent"),
-                    Entry::dir("failed"),
-                ];
-                if let Some(target) = Self::latest_solana_pending_target(&engine, wallet, chain)? {
-                    entries.push(Entry::symlink("latest", &target));
-                }
-                Ok(entries)
+                // The wallet-level outbox is account 0's view.
+                let scope = self.wallet_outbox_read_scope(wallet, chain).await?;
+                self.solana_outbox_list(wallet, scope.read_scope(), chain, &[])
+                    .await
             }
-            [s, state] if s == "outbox" => {
-                let st = solana_state(state)
-                    .ok_or_else(|| HandlerError::not_found(format!("outbox state '{state}'")))?;
-                let ids = engine
-                    .outbox()
-                    .list(wallet, chain, st)
-                    .map_err(solana_outbox_err)?;
-                Ok(ids.into_iter().map(|id| Entry::dir(&id)).collect())
-            }
-            [s, state, id] if s == "outbox" => {
-                let st = solana_state(state)
-                    .ok_or_else(|| HandlerError::not_found(format!("outbox state '{state}'")))?;
-                let entry = engine
-                    .outbox()
-                    .read_in_state(wallet, chain, id, st)
-                    .map_err(solana_outbox_err)?;
-                let mut entries: Vec<Entry> = Vec::new();
-                for file in [
-                    "intent.json",
-                    "plan.md",
-                    "simulation.json",
-                    "receipt.json",
-                    "broadcast_attempted.json",
-                    "approval_challenge.json",
-                    "restage_advice.json",
-                    "restage.md",
-                ] {
-                    let fpath = entry.dir.join(file);
-                    if fpath.exists() {
-                        entries.push(Entry::file(file));
-                    }
-                }
-                if st == bloom_solana_tx::outbox::SolanaOutboxState::Pending {
-                    for control in ["confirm", "cancel", "restage"] {
-                        entries.push(Entry::writable_file(control));
-                    }
-                } else if st == bloom_solana_tx::outbox::SolanaOutboxState::Failed
-                    && entry.staged.status == bloom_solana_tx::SolanaTxStatus::Expired
-                {
-                    entries.push(Entry::writable_file("restage"));
-                }
-                Ok(entries)
+            [s, outbox_rest @ ..] if s == "outbox" => {
+                let scope = self.wallet_outbox_read_scope(wallet, chain).await?;
+                self.solana_outbox_list(wallet, scope.read_scope(), chain, outbox_rest)
+                    .await
             }
             _ => Err(HandlerError::NotADir(rest.join("/"))),
         }
@@ -4333,9 +4138,7 @@ impl WalletsHandler {
         rest: &[String],
     ) -> Result<Vec<Entry>, HandlerError> {
         if self.is_solana_chain(chain) {
-            return self
-                .list_solana_chain(wallet, chain, rest, self.solana_engine(chain))
-                .await;
+            return self.list_solana_chain(wallet, chain, rest).await;
         }
         let _projection = self.wallet_projection(wallet).await?;
         let _client = self
@@ -4352,100 +4155,20 @@ impl WalletsHandler {
                 Entry::file("nonce_conflicts.json"),
                 Entry::dir("outbox"),
             ]),
-            [s] if s == "outbox" => self.outbox_dir_entries(wallet, chain),
-            [s, state] if s == "outbox" => {
-                let st = match state.as_str() {
-                    "pending" => OutboxState::Pending,
-                    "sent" => OutboxState::Sent,
-                    "failed" => OutboxState::Failed,
-                    _ => return Err(HandlerError::not_found(state.clone())),
-                };
-                let ids = self
-                    .tx_engine
-                    .outbox
-                    .list(wallet, chain, st)
-                    .map_err(err_be)?;
-                let entries = ids
-                    .into_iter()
-                    .map(|id| {
-                        match self.tx_engine.outbox.read_in_state(wallet, chain, &id, st) {
-                            Ok(entry) => {
-                                Entry::dir(&id).with_modified_ms(entry.staged.created_ms)
-                            }
-                            Err(e) => {
-                                tracing::warn!(id = %id, error = %e, "wallets.outbox.metadata_fallback");
-                                Entry::dir(&id)
-                            }
-                        }
-                    })
-                    .collect();
-                Ok(entries)
+            [s] if s == "outbox" => {
+                // The wallet-level outbox is account 0's view, fenced like
+                // the numbered tree.
+                let scope = self.wallet_outbox_read_scope(wallet, chain).await?;
+                self.evm_outbox_list(wallet, scope.read_scope(), chain, &[])
+                    .await
             }
-            [s, state, id] if s == "outbox" => {
-                let st = parse_state_seg(state)?;
-                // The state segment is authoritative (fix #8): if the id
-                // isn't in this state we report NotFound rather than
-                // shadowing whatever lives at the other states.
-                let entry = self
-                    .tx_engine
-                    .outbox
-                    .read_in_state(wallet, chain, id, st)
-                    .map_err(err_be)?;
-                let mut out = Vec::new();
-                if let Ok(rd) = std::fs::read_dir(&entry.dir) {
-                    for r in rd.flatten() {
-                        if let Some(n) = r.file_name().to_str()
-                            && r.file_type().map(|t| t.is_file()).unwrap_or(false)
-                        {
-                            // Pending entries' control files are writable;
-                            // everything else is read-only metadata.
-                            if entry.state == OutboxState::Pending
-                                && matches!(
-                                    n,
-                                    "confirm" | "confirm.override" | "replace" | "cancel"
-                                )
-                            {
-                                out.push(
-                                    Entry::writable_file(n)
-                                        .with_modified_ms(entry.staged.created_ms),
-                                );
-                            } else {
-                                out.push(Entry::file(n).with_modified_ms(entry.staged.created_ms));
-                            }
-                        }
-                    }
-                }
-                // Always advertise the pending control files even before
-                // they've been written, so agents can `echo y > confirm`
-                // (and similarly for replace / cancel — fix #10).
-                if entry.state == OutboxState::Pending {
-                    for ctrl in ["confirm", "confirm.override", "replace", "cancel"] {
-                        if !out.iter().any(|e| e.name == ctrl) {
-                            out.push(
-                                Entry::writable_file(ctrl)
-                                    .with_modified_ms(entry.staged.created_ms),
-                            );
-                        }
-                    }
-                }
-                Ok(out)
+            [s, outbox_rest @ ..] if s == "outbox" => {
+                let scope = self.wallet_outbox_read_scope(wallet, chain).await?;
+                self.evm_outbox_list(wallet, scope.read_scope(), chain, outbox_rest)
+                    .await
             }
             _ => Err(HandlerError::NotADir(rest.join("/"))),
         }
-    }
-
-    /// `wallets/<w>/chains/<c>/outbox/...`: the wallet-level path stages
-    /// from the wallet's canonical initial key, which is account 0.
-    async fn write_outbox(
-        &self,
-        wallet: &str,
-        chain: &str,
-        rest: &[String],
-        data: &[u8],
-    ) -> Result<(), HandlerError> {
-        let (wallet_address, policy) = self.planning_wallet_inputs(wallet, chain).await?;
-        self.write_outbox_from(wallet, chain, wallet_address, &policy, None, rest, data)
-            .await
     }
 
     /// Under `wallets/<w>/<n>/`, a pending entry is actionable only when
@@ -4944,6 +4667,13 @@ mod tests {
         address: Address,
         accounts: Vec<bloom_broker_api::DerivedAccountPublic>,
     ) -> Arc<dyn WalletProjectionReader> {
+        Arc::new(StaticProjection(bip39_projection_value(address, accounts)))
+    }
+
+    fn bip39_projection_value(
+        address: Address,
+        accounts: Vec<bloom_broker_api::DerivedAccountPublic>,
+    ) -> WalletProjection {
         let wallet_id = token("alice");
         let key_ref = KeyRef {
             backend: token("local"),
@@ -4966,7 +4696,7 @@ mod tests {
         })
         .unwrap();
         let policy_digest = Digest32::from_bytes(sha2::Sha256::digest(&canonical).into());
-        Arc::new(StaticProjection(WalletProjection {
+        WalletProjection {
             wallet: WalletPublic {
                 wallet_id: wallet_id.clone(),
                 wallet_kind: token("local"),
@@ -5004,7 +4734,7 @@ mod tests {
             },
             accounts_unavailable: None,
             verification: ProjectionVerification::AuthenticatedBroker,
-        }))
+        }
     }
 
     /// One derived child as `wallet.accounts` projects it.
@@ -5568,6 +5298,729 @@ mod tests {
         );
     }
 
+    /// A Solana entry seeded straight into the outbox under the given
+    /// account identity, optionally moved to Failed (with Expired status,
+    /// as the sweeper leaves swept entries).
+    fn seed_solana_entry(
+        outbox: &bloom_solana_tx::outbox::SolanaOutbox,
+        id: &str,
+        fingerprint: &str,
+        address: &str,
+        failed_expired: bool,
+    ) {
+        let staged = bloom_solana_tx::types::StagedSolanaTransfer {
+            id: id.into(),
+            wallet: "alice".into(),
+            chain: "solana-devnet".into(),
+            fee_payer: address.into(),
+            account_fingerprint: Some(fingerprint.into()),
+            account_derivation_path: Some("m/44'/501'/0'/0'".into()),
+            destination: "DEST111111111111111111111111111111111111111".into(),
+            lamports: 1_000_000,
+            fee_lamports: 5_000,
+            genesis_hash: "GENESIS111111111111111111111111111111111111".into(),
+            blockhash: "BLOCKHASH111111111111111111111111111111111111".into(),
+            last_valid_block_height: 100,
+            message_b64: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, b"m"),
+            payload_digest_hex: "ab".repeat(32),
+            signature: None,
+            created_ms: 1,
+            expires_ms: if failed_expired { 1 } else { 0 },
+            status: if failed_expired {
+                bloom_solana_tx::types::SolanaTxStatus::Expired
+            } else {
+                bloom_solana_tx::types::SolanaTxStatus::Pending
+            },
+        };
+        outbox.write_pending(&staged, "plan").unwrap();
+        if failed_expired {
+            let entry = outbox
+                .read_in_state(
+                    "alice",
+                    "solana-devnet",
+                    id,
+                    bloom_solana_tx::outbox::SolanaOutboxState::Pending,
+                )
+                .unwrap();
+            outbox
+                .transition(&entry, bloom_solana_tx::outbox::SolanaOutboxState::Failed)
+                .unwrap();
+        }
+    }
+
+    /// Two BIP-39 accounts (0 and 1, both families) for the wallet-level
+    /// fence tests. Account 0's EVM key is the fixture wallet address, so
+    /// `seed_pending` entries belong to account 0.
+    fn two_account_projection(f: &Fixture) -> (Arc<dyn WalletProjectionReader>, String, String) {
+        use bloom_broker_api::DerivationProfile as Profile;
+        let evm0 = bloom_proto::checksum_address(&f.wallet_addr);
+        let evm1 = bloom_proto::checksum_address(&Address::repeat_byte(0x22));
+        let accounts = vec![
+            derived_account(
+                Profile::Bip44EvmSecp256k1V1,
+                "m/44'/60'/0'/0/0",
+                0x10,
+                &evm0,
+            ),
+            derived_account(
+                Profile::Bip44SolanaSlip10Ed25519V1,
+                "m/44'/501'/0'/0'",
+                0x20,
+                &bs58::encode([0x20u8; 32]).into_string(),
+            ),
+            derived_account(
+                Profile::Bip44SolanaSlip10Ed25519V1,
+                "m/44'/501'/1'/0'",
+                0x21,
+                &bs58::encode([0x21u8; 32]).into_string(),
+            ),
+            derived_account(
+                Profile::Bip44EvmSecp256k1V1,
+                "m/44'/60'/0'/0/1",
+                0x11,
+                &evm1,
+            ),
+        ];
+        (bip39_projection(f.wallet_addr, accounts), evm0, evm1)
+    }
+
+    /// Seed an EVM pending entry staged by an explicit sender address.
+    fn seed_pending_from(f: &Fixture, id: &str, from: &str, created_ms: u128) {
+        let mut staged = bloom_proto::StagedTx {
+            id: id.into(),
+            wallet: f.wallet_name.clone(),
+            chain: "anvil".into(),
+            chain_id: 31337,
+            from: from.into(),
+            to: "0x0000000000000000000000000000000000000002".into(),
+            value_wei: "0".into(),
+            data_hex: "0x".into(),
+            gas_limit: 21000,
+            max_fee_per_gas: Some("100".into()),
+            max_priority_fee_per_gas: Some("10".into()),
+            gas_price: None,
+            nonce: 0,
+            policy_checks: vec![],
+            created_ms,
+            // Far in the future so expiry never trips during tests.
+            expires_ms: u128::MAX,
+            status: bloom_proto::TxStatus::Pending,
+            action_kind: bloom_proto::TxActionKind::Unknown,
+            tx_hash: None,
+            token: None,
+            nft: None,
+            usd_value: None,
+            valuation: None,
+            depends_on: None,
+            action_id: None,
+            execution_origin: None,
+        };
+        if from != bloom_proto::checksum_address(&f.wallet_addr) {
+            staged.nonce = 7; // another sender's nonce space
+        }
+        f.handler
+            .tx_engine
+            .outbox
+            .write_pending(&staged, "p")
+            .unwrap();
+    }
+
+    /// The wallet contract (`docs/architecture/Wallet.md`): the
+    /// wallet-level outbox is account 0's view, so another account's
+    /// pending entry is invisible there — list, lookup, and artifact reads
+    /// all miss — while account 0's own entries behave exactly as before.
+    #[tokio::test]
+    async fn wallet_level_outbox_shows_only_account_zero_evm() {
+        let f = make_handler_with_chain(true);
+        let (projection, _evm0, evm1) = two_account_projection(&f);
+        seed_pending_with_created_ms(&f, "from-account-zero", 1_000);
+        seed_pending_from(&f, "from-account-one", &evm1, 2_000);
+        let mut handler = f.handler.clone();
+        handler.wallet_projections = Some(projection);
+        let w = &f.wallet_name;
+
+        let pending: Vec<String> = handler
+            .list(&vfs(format!("/{w}/chains/anvil/outbox/pending")))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect();
+        assert_eq!(pending, ["from-account-zero"], "{pending:?}");
+
+        // Lookup and reads of account 1's entry miss at wallet level, in
+        // every state spelling and for its artifacts too.
+        for path in [
+            format!("/{w}/chains/anvil/outbox/pending/from-account-one"),
+            format!("/{w}/chains/anvil/outbox/pending/from-account-one/plan.md"),
+        ] {
+            assert!(
+                matches!(
+                    handler.lookup(&vfs(path.clone())).await,
+                    Err(HandlerError::NotFound(_))
+                ),
+                "{path} must not resolve"
+            );
+        }
+        // Reads miss too: the artifact read is NotFound (fenced), and a
+        // read aimed at the entry directory itself is a type error.
+        assert!(matches!(
+            handler
+                .read(&vfs(format!(
+                    "/{w}/chains/anvil/outbox/pending/from-account-one/plan.md"
+                )))
+                .await,
+            Err(HandlerError::NotFound(_))
+        ));
+        assert!(matches!(
+            handler
+                .read(&vfs(format!(
+                    "/{w}/chains/anvil/outbox/pending/from-account-one"
+                )))
+                .await,
+            Err(HandlerError::NotAFile(_))
+        ));
+        assert!(
+            handler
+                .list(&vfs(format!(
+                    "/{w}/chains/anvil/outbox/pending/from-account-one"
+                )))
+                .await
+                .is_err()
+        );
+
+        // Account 0's own entry still behaves as before: it resolves and
+        // advertises its controls at wallet level.
+        let entry = handler
+            .lookup(&vfs(format!(
+                "/{w}/chains/anvil/outbox/pending/from-account-zero"
+            )))
+            .await
+            .unwrap();
+        assert_eq!(entry.name, "from-account-zero");
+        let plan = handler
+            .read(&vfs(format!(
+                "/{w}/chains/anvil/outbox/pending/from-account-zero/plan.md"
+            )))
+            .await
+            .unwrap();
+        assert_eq!(plan, b"p");
+
+        // The numbered views are untouched by the wallet-level fence.
+        let zero: Vec<String> = handler
+            .list(&vfs(format!("/{w}/0/chains/anvil/outbox/pending")))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect();
+        assert_eq!(zero, ["from-account-zero"]);
+        let one: Vec<String> = handler
+            .list(&vfs(format!("/{w}/1/chains/anvil/outbox/pending")))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect();
+        assert_eq!(one, ["from-account-one"]);
+    }
+
+    /// The S4 regression: a wallet-level write to `confirm`,
+    /// `confirm.override`, `replace`, or `cancel` on another account's
+    /// entry returns NotFound and issues no Broker request of any kind —
+    /// the old code returned a denial-shaped error while preparing the
+    /// approval that later settled that transfer. `prepare_write_open` on
+    /// the override sink is fenced by the same rule. Account 0's own entry
+    /// still reaches the engine (a non-NotFound failure from the dead test
+    /// RPC), proving the fence is account-scoped, not a general block.
+    #[tokio::test]
+    async fn wallet_level_controls_cannot_touch_account_one_evm_entries() {
+        let f = make_handler_with_chain(true);
+        let (projection, _evm0, evm1) = two_account_projection(&f);
+        seed_pending_from(
+            &f,
+            "from-account-zero",
+            &bloom_proto::checksum_address(&f.wallet_addr),
+            1_000,
+        );
+        seed_pending_from(&f, "from-account-one", &evm1, 2_000);
+        let broker = approval_broker(Vec::new());
+        let mut handler = f.handler.clone();
+        handler.wallet_projections = Some(projection);
+        handler.broker = Some(MachineBrokerClient::new(broker.clone()));
+        let w = &f.wallet_name;
+
+        for control in ["confirm", "confirm.override", "replace", "cancel"] {
+            let path = vfs(format!(
+                "/{w}/chains/anvil/outbox/pending/from-account-one/{control}"
+            ));
+            let body: &[u8] = if control == "replace" {
+                br#"to = "0x0000000000000000000000000000000000000002"
+value = "0""#
+            } else {
+                b"y"
+            };
+            let result = handler.write(&path, body).await;
+            assert!(
+                matches!(result, Err(HandlerError::NotFound(_))),
+                "{control} on another account's entry must be NotFound, got {result:?}"
+            );
+            // The override write-open is the approval-preparing half of
+            // confirm.override; it must miss the same way.
+            if control == "confirm.override" {
+                let opened = handler
+                    .prepare_write_open(&vfs(format!(
+                        "/{w}/chains/anvil/outbox/pending/from-account-one/confirm.override"
+                    )))
+                    .await;
+                assert!(
+                    matches!(opened, Err(HandlerError::NotFound(_))),
+                    "write-open on another account's entry must be NotFound, got {opened:?}"
+                );
+            }
+        }
+        assert!(
+            broker.requests.lock().unwrap().is_empty(),
+            "no Broker request may be issued for another account's entry: {:?}",
+            broker.requests.lock().unwrap()
+        );
+
+        // Account 0's own entry passes the fence and reaches the engine.
+        let own = handler
+            .write(
+                &vfs(format!(
+                    "/{w}/chains/anvil/outbox/pending/from-account-zero/confirm"
+                )),
+                b"y",
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            !matches!(own, HandlerError::NotFound(_)),
+            "account 0's own confirm must not be fenced off: {own:?}"
+        );
+    }
+
+    /// `latest` is scoped: another account's newer pending entry never
+    /// pulls the wallet-level `latest`, which stays on account 0's newest
+    /// (or disappears when account 0 has none). The numbered view resolves
+    /// its own account's newest.
+    #[tokio::test]
+    async fn wallet_level_outbox_latest_is_scoped_to_account_zero() {
+        let f = make_handler_with_chain(true);
+        let (projection, _evm0, evm1) = two_account_projection(&f);
+        let w = &f.wallet_name;
+
+        // Only account 1 has a pending entry: wallet level has no latest.
+        seed_pending_from(&f, "from-account-one", &evm1, 9_000);
+        let mut handler = f.handler.clone();
+        handler.wallet_projections = Some(projection.clone());
+        assert!(
+            !handler
+                .list(&vfs(format!("/{w}/chains/anvil/outbox")))
+                .await
+                .unwrap()
+                .iter()
+                .any(|entry| entry.name == "latest"),
+            "another account's entry must not advertise wallet-level latest"
+        );
+        assert!(matches!(
+            handler
+                .lookup(&vfs(format!("/{w}/chains/anvil/outbox/latest")))
+                .await,
+            Err(HandlerError::NotFound(_))
+        ));
+
+        // Account 0's older entry becomes visible: wallet-level latest
+        // points at it even though account 1's is newer.
+        seed_pending_from(
+            &f,
+            "from-account-zero",
+            &bloom_proto::checksum_address(&f.wallet_addr),
+            1_000,
+        );
+        let listed = handler
+            .list(&vfs(format!("/{w}/chains/anvil/outbox")))
+            .await
+            .unwrap();
+        assert_eq!(
+            listed
+                .iter()
+                .find(|entry| entry.name == "latest")
+                .and_then(|entry| entry.link_target.as_deref()),
+            Some("pending/from-account-zero"),
+            "{listed:?}"
+        );
+        assert_eq!(
+            handler
+                .lookup(&vfs(format!("/{w}/chains/anvil/outbox/latest")))
+                .await
+                .unwrap()
+                .link_target
+                .as_deref(),
+            Some("pending/from-account-zero")
+        );
+
+        // The numbered view resolves its own account's newest.
+        assert_eq!(
+            handler
+                .lookup(&vfs(format!("/{w}/1/chains/anvil/outbox/latest")))
+                .await
+                .unwrap()
+                .link_target
+                .as_deref(),
+            Some("pending/from-account-one")
+        );
+    }
+
+    /// The Solana wallet-level outbox is account 0's: another account's
+    /// pending entry is invisible, its controls miss, and `restage` on a
+    /// Failed+Expired entry is advertised exactly for the entries the
+    /// scope can see — at wallet level and through the numbered tree.
+    #[tokio::test]
+    async fn wallet_level_solana_outbox_is_account_zero_scoped() {
+        let f = make_handler_with_chain(true);
+        let (projection, _evm0, _evm1) = two_account_projection(&f);
+        // Account fingerprints as the fixture projects them.
+        use sha2::Digest as _;
+        let fp0 = {
+            let mut spki = vec![
+                0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
+            ];
+            spki.extend_from_slice(&[0x20; 32]);
+            bloom_broker_api::Digest32::from_bytes(sha2::Sha256::digest(&spki).into())
+                .as_str()
+                .to_owned()
+        };
+        let fp1 = {
+            let mut spki = vec![
+                0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
+            ];
+            spki.extend_from_slice(&[0x21; 32]);
+            bloom_broker_api::Digest32::from_bytes(sha2::Sha256::digest(&spki).into())
+                .as_str()
+                .to_owned()
+        };
+        let (engine, outbox) = solana_engine_fixture(&f._tmp);
+        seed_solana_entry(&outbox, "sol-zero", &fp0, "Sol0", false);
+        seed_solana_entry(&outbox, "sol-one", &fp1, "Sol1", false);
+        seed_solana_entry(&outbox, "sol-zero-expired", &fp0, "Sol0", true);
+        seed_solana_entry(&outbox, "sol-one-expired", &fp1, "Sol1", true);
+        let mut handler = f.handler.clone();
+        handler.wallet_projections = Some(projection);
+        handler.broker = Some(MachineBrokerClient::new(Arc::new(StubBroker)));
+        handler = handler.with_solana(std::collections::BTreeMap::from([(
+            "solana-devnet".to_string(),
+            std::sync::Arc::new(engine),
+        )]));
+        let w = &f.wallet_name;
+
+        // Wallet level lists only account 0's entries, in both states.
+        let pending: Vec<String> = handler
+            .list(&vfs(format!("/{w}/chains/solana-devnet/outbox/pending")))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect();
+        assert_eq!(pending, ["sol-zero"], "{pending:?}");
+        let failed: Vec<String> = handler
+            .list(&vfs(format!("/{w}/chains/solana-devnet/outbox/failed")))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect();
+        assert_eq!(failed, ["sol-zero-expired"], "{failed:?}");
+
+        // Another account's entries miss lookups and controls at wallet
+        // level, including the restage recovery sink.
+        for path in [
+            format!("/{w}/chains/solana-devnet/outbox/pending/sol-one"),
+            format!("/{w}/chains/solana-devnet/outbox/pending/sol-one/confirm"),
+            format!("/{w}/chains/solana-devnet/outbox/pending/sol-one/cancel"),
+            format!("/{w}/chains/solana-devnet/outbox/failed/sol-one-expired/restage"),
+        ] {
+            let result = handler.lookup(&vfs(path.clone())).await;
+            assert!(
+                matches!(result, Err(HandlerError::NotFound(_))),
+                "{path} must not resolve at wallet level, got {result:?}"
+            );
+        }
+        assert!(matches!(
+            handler
+                .write(
+                    &vfs(format!(
+                        "/{w}/chains/solana-devnet/outbox/pending/sol-one/confirm"
+                    )),
+                    b"y",
+                )
+                .await,
+            Err(HandlerError::NotFound(_))
+        ));
+        assert!(matches!(
+            handler
+                .write(
+                    &vfs(format!(
+                        "/{w}/chains/solana-devnet/outbox/failed/sol-one-expired/restage"
+                    )),
+                    b"y",
+                )
+                .await,
+            Err(HandlerError::NotFound(_))
+        ));
+
+        // Account 0's expired entry advertises restage at wallet level and
+        // through the numbered tree (the port), and account 1's expired
+        // entry advertises it only under account 1.
+        for path in [
+            format!("/{w}/chains/solana-devnet/outbox/failed/sol-zero-expired"),
+            format!("/{w}/0/chains/solana-devnet/outbox/failed/sol-zero-expired"),
+        ] {
+            let names: Vec<String> = handler
+                .list(&vfs(path.clone()))
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|entry| entry.name)
+                .collect();
+            assert!(
+                names.contains(&"restage".to_string()),
+                "{path} must advertise restage: {names:?}"
+            );
+        }
+        let one_failed: Vec<String> = handler
+            .list(&vfs(format!("/{w}/1/chains/solana-devnet/outbox/failed")))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect();
+        assert_eq!(one_failed, ["sol-one-expired"], "{one_failed:?}");
+        let names: Vec<String> = handler
+            .list(&vfs(format!(
+                "/{w}/1/chains/solana-devnet/outbox/failed/sol-one-expired"
+            )))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect();
+        assert!(
+            names.contains(&"restage".to_string()),
+            "numbered failed list must advertise restage: {names:?}"
+        );
+        // Account 0's numbered view still excludes account 1's entry.
+        let zero_failed: Vec<String> = handler
+            .list(&vfs(format!("/{w}/0/chains/solana-devnet/outbox/failed")))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect();
+        assert_eq!(zero_failed, ["sol-zero-expired"]);
+    }
+
+    /// The wallet-level Solana `new.tx` is pinned to account 0: a body
+    /// fingerprint naming another account is refused and nothing stages.
+    #[tokio::test]
+    async fn wallet_level_solana_new_tx_refuses_account_one_fingerprint() {
+        let f = make_handler_with_chain(true);
+        let (projection, _evm0, _evm1) = two_account_projection(&f);
+        use sha2::Digest as _;
+        let mut spki = vec![
+            0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
+        ];
+        spki.extend_from_slice(&[0x21; 32]);
+        let fp1 = bloom_broker_api::Digest32::from_bytes(sha2::Sha256::digest(&spki).into())
+            .as_str()
+            .to_owned();
+        let (engine, outbox) = solana_engine_fixture(&f._tmp);
+        let mut handler = f.handler.clone();
+        handler.wallet_projections = Some(projection);
+        handler = handler.with_solana(std::collections::BTreeMap::from([(
+            "solana-devnet".to_string(),
+            std::sync::Arc::new(engine),
+        )]));
+        let w = &f.wallet_name;
+
+        let error = handler
+            .write(
+                &vfs(format!("/{w}/chains/solana-devnet/outbox/new.tx")),
+                serde_json::to_vec(&serde_json::json!({
+                    "destination": bs58::encode([0xbbu8; 32]).into_string(),
+                    "lamports": 1_000_000u64,
+                    "account_fingerprint": fp1,
+                }))
+                .unwrap()
+                .as_slice(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("intent names account"),
+            "{error:?}"
+        );
+        assert!(
+            outbox
+                .list(
+                    "alice",
+                    "solana-devnet",
+                    bloom_solana_tx::outbox::SolanaOutboxState::Pending
+                )
+                .unwrap()
+                .is_empty(),
+            "nothing may stage through the wallet-level path"
+        );
+    }
+
+    /// Hole 3: with account 0's Solana key retired and account 1 active,
+    /// the wallet-level path must fail — never fall back to the lone
+    /// active child. Account 0's history stays visible through its retired
+    /// key's scope; only spending fails.
+    #[tokio::test]
+    async fn retired_account_zero_solana_never_falls_back_to_account_one() {
+        let f = make_handler_with_chain(true);
+        use bloom_broker_api::DerivationProfile as Profile;
+        let mut accounts = vec![
+            derived_account(
+                Profile::Bip44EvmSecp256k1V1,
+                "m/44'/60'/0'/0/0",
+                0x10,
+                &bloom_proto::checksum_address(&f.wallet_addr),
+            ),
+            derived_account(
+                Profile::Bip44SolanaSlip10Ed25519V1,
+                "m/44'/501'/0'/0'",
+                0x20,
+                "Sol0",
+            ),
+            derived_account(
+                Profile::Bip44SolanaSlip10Ed25519V1,
+                "m/44'/501'/1'/0'",
+                0x21,
+                &bs58::encode([0x21u8; 32]).into_string(),
+            ),
+        ];
+        accounts[1].lifecycle = bloom_broker_api::AccountLifecycleState::Retired;
+        let projection = bip39_projection(f.wallet_addr, accounts);
+        let (engine, outbox) = solana_engine_fixture(&f._tmp);
+        let mut handler = f.handler.clone();
+        handler.wallet_projections = Some(projection);
+        handler = handler.with_solana(std::collections::BTreeMap::from([(
+            "solana-devnet".to_string(),
+            std::sync::Arc::new(engine),
+        )]));
+        let w = &f.wallet_name;
+
+        let error = handler
+            .write(
+                &vfs(format!("/{w}/chains/solana-devnet/outbox/new.tx")),
+                serde_json::to_vec(&serde_json::json!({
+                    "destination": bs58::encode([0xbbu8; 32]).into_string(),
+                    "lamports": 1_000_000u64,
+                }))
+                .unwrap()
+                .as_slice(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, HandlerError::NotFound(_)),
+            "staging must fail without an active account-0 Solana key: {error:?}"
+        );
+        assert!(
+            outbox
+                .list(
+                    "alice",
+                    "solana-devnet",
+                    bloom_solana_tx::outbox::SolanaOutboxState::Pending
+                )
+                .unwrap()
+                .is_empty(),
+            "nothing may stage, least of all from account 1"
+        );
+
+        // Account 1's key was never used: its entry list is empty and its
+        // address never appears as a fee payer anywhere.
+        let one_pending = handler
+            .list(&vfs(format!("/{w}/1/chains/solana-devnet/outbox/pending")))
+            .await
+            .unwrap();
+        assert!(one_pending.is_empty());
+    }
+
+    /// Hole 4: the nonce-conflict view is account 0's, so another
+    /// account's outbox nonce never mixes into it.
+    #[tokio::test]
+    async fn nonce_conflicts_ignores_account_one_outbox_entries() {
+        let f = make_handler_with_chain(true);
+        let (projection, _evm0, evm1) = two_account_projection(&f);
+        seed_pending_from(&f, "from-account-one", &evm1, 1_000);
+        let mut handler = f.handler.clone();
+        handler.wallet_projections = Some(projection);
+        let w = &f.wallet_name;
+
+        let body = handler
+            .read(&vfs(format!("/{w}/chains/anvil/nonce_conflicts.json")))
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            value["outbox_pending_nonces"],
+            serde_json::json!([]),
+            "another account's outbox nonce must not appear at wallet level"
+        );
+
+        // Account 0's own nonce still shows.
+        seed_pending_with_created_ms(&f, "from-account-zero", 2_000);
+        let body = handler
+            .read(&vfs(format!("/{w}/chains/anvil/nonce_conflicts.json")))
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["outbox_pending_nonces"], serde_json::json!([0]));
+    }
+
+    /// The `accounts_unavailable` exception: with no numbered tree there is
+    /// no other account to leak to, so wallet-level reads stay unfiltered
+    /// (owners keep their history) while writes fail naming the reason.
+    #[tokio::test]
+    async fn accounts_unavailable_wallet_reads_unfiltered_and_writes_fail() {
+        let f = make_handler_with_chain(true);
+        let foreign = bloom_proto::checksum_address(&Address::repeat_byte(0x22));
+        seed_pending_from(&f, "from-unknown-account", &foreign, 1_000);
+        let mut projection = bip39_projection_value(f.wallet_addr, Vec::new());
+        projection.accounts_unavailable = Some("wallet accounts projection unavailable".into());
+        let mut handler = f.handler.clone();
+        handler.wallet_projections = Some(Arc::new(StaticProjection(projection)));
+        let w = &f.wallet_name;
+
+        let pending: Vec<String> = handler
+            .list(&vfs(format!("/{w}/chains/anvil/outbox/pending")))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect();
+        assert_eq!(pending, ["from-unknown-account"], "{pending:?}");
+
+        let error = handler
+            .write(
+                &vfs(format!("/{w}/chains/anvil/outbox/new.tx")),
+                br#"to = "0x0000000000000000000000000000000000000002"
+value = "0""#,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("account inventory is unavailable"),
+            "the write must name the reason: {error:?}"
+        );
+    }
+
     #[tokio::test]
     async fn a_legacy_wallet_is_account_zero() {
         let f = make_handler();
@@ -5881,6 +6334,37 @@ mod tests {
         }
     }
 
+    /// A BIP-39 projection whose account 0 holds both families: the
+    /// canonical EVM child at the fixture's address and the given Solana
+    /// child. The wallet-level outbox is account 0's view, so both the EVM
+    /// and Solana wallet-level surfaces fence to these keys.
+    fn bip39_projection_with_solana_account0(
+        evm_address: Address,
+        child_pubkey: &[u8; 32],
+    ) -> (Arc<dyn WalletProjectionReader>, String, String) {
+        let mut solana = solana_child_accounts(child_pubkey).accounts.remove(0);
+        let address = bs58::encode(child_pubkey).into_string();
+        solana.chain_projections = vec![bloom_broker_api::ChainAccountProjection {
+            chain_family: token("solana"),
+            caip2: "solana:test".into(),
+            caip10: format!("solana:test:{address}"),
+            address: address.clone(),
+            address_encoding: bloom_broker_api::AddressEncoding::Base58,
+        }];
+        let evm0 = derived_account(
+            bloom_broker_api::DerivationProfile::Bip44EvmSecp256k1V1,
+            "m/44'/60'/0'/0/0",
+            0x10,
+            &bloom_proto::checksum_address(&evm_address),
+        );
+        let fingerprint = solana.public_key_fingerprint.as_str().to_owned();
+        (
+            bip39_projection(evm_address, vec![evm0, solana]),
+            address,
+            fingerprint,
+        )
+    }
+
     /// A Broker fixture that reports one active Solana derived child, so the
     /// write path can resolve the fee payer.
     struct SolanaChildBroker {
@@ -6152,11 +6636,13 @@ mod tests {
             "solana-devnet",
         );
 
-        let mut projection = static_projection_value(f.wallet_addr);
-        projection.accounts = solana_child_accounts(&child_pubkey);
+        // The wallet-level outbox is account 0's view, so the fixture
+        // wallet must carry account 0's Solana family to stage through it.
+        let (projection, _sol0_address, _sol0_fingerprint) =
+            bip39_projection_with_solana_account0(f.wallet_addr, &child_pubkey);
         let handler = f
             .handler
-            .with_projection_reader(Arc::new(StaticProjection(projection)))
+            .with_projection_reader(projection)
             .with_broker(Some(bloom_machine_client::MachineBrokerClient::new(broker)))
             .with_solana(std::collections::BTreeMap::from([(
                 "solana-devnet".to_string(),
@@ -6205,13 +6691,20 @@ mod tests {
         let f = make_handler_with_chain(true);
         let solana_tmp = tempfile::tempdir().unwrap();
         let (engine, outbox) = solana_engine_fixture(&solana_tmp);
+        // The wallet-level outbox is account 0's view, so the fixture wallet
+        // carries account 0's Solana family and the staged entry belongs to
+        // it. An entry from another account must stay invisible here; that
+        // fence is asserted below.
+        let child_pubkey = [0xccu8; 32];
+        let (projection, sol0_address, sol0_fingerprint) =
+            bip39_projection_with_solana_account0(f.wallet_addr, &child_pubkey);
         let staged = bloom_solana_tx::types::StagedSolanaTransfer {
             id: "0001-00001".into(),
             wallet: "alice".into(),
             chain: "solana-devnet".into(),
-            fee_payer: "FEEPAYER111111111111111111111111111111111".into(),
-            account_fingerprint: None,
-            account_derivation_path: None,
+            fee_payer: sol0_address.clone(),
+            account_fingerprint: Some(sol0_fingerprint.clone()),
+            account_derivation_path: Some("m/44'/501'/0'/0'".into()),
             destination: "DEST111111111111111111111111111111111111111".into(),
             lamports: 1_000_000,
             fee_lamports: 5_000,
@@ -6253,16 +6746,51 @@ mod tests {
             .unwrap();
         std::fs::write(pending.dir.join("raw_tx"), b"secret signed transaction").unwrap();
 
-        let handler = f.handler.with_solana(std::collections::BTreeMap::from([(
-            "solana-devnet".to_string(),
-            std::sync::Arc::new(engine),
-        )]));
+        // An entry another account staged is invisible at wallet level.
+        let foreign = bloom_solana_tx::types::StagedSolanaTransfer {
+            id: "0002-00002".into(),
+            wallet: "alice".into(),
+            chain: "solana-devnet".into(),
+            fee_payer: "FEEPAYER222222222222222222222222222222222".into(),
+            account_fingerprint: Some("ff".repeat(32)),
+            account_derivation_path: Some("m/44'/501'/1'/0'".into()),
+            ..staged.clone()
+        };
+        outbox.write_pending(&foreign, "plan").unwrap();
+
+        let handler = f.handler.with_projection_reader(projection).with_solana(
+            std::collections::BTreeMap::from([(
+                "solana-devnet".to_string(),
+                std::sync::Arc::new(engine),
+            )]),
+        );
 
         let new_tx = handler
             .lookup(&VfsPath::parse("/alice/chains/solana-devnet/outbox/new.tx").unwrap())
             .await
             .unwrap();
         assert_eq!(new_tx.mode, 0o644);
+        let pending_listed = handler
+            .list(&VfsPath::parse("/alice/chains/solana-devnet/outbox/pending").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            pending_listed
+                .iter()
+                .map(|e| e.name.as_str())
+                .collect::<Vec<_>>(),
+            ["0001-00001"],
+            "another account's pending entry must not appear at wallet level"
+        );
+        assert!(matches!(
+            handler
+                .lookup(
+                    &VfsPath::parse("/alice/chains/solana-devnet/outbox/pending/0002-00002",)
+                        .unwrap()
+                )
+                .await,
+            Err(HandlerError::NotFound(_))
+        ));
         let outbox_entries = handler
             .list(&VfsPath::parse("/alice/chains/solana-devnet/outbox").unwrap())
             .await

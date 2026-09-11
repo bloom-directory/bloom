@@ -104,9 +104,11 @@ listings, stats, and reads carry no authority side effects (a stale projection
 is marked as such in `account.json`).
 
 Wallet-level paths keep their meaning by resolving to account 0: the canonical
-initial child of each family, even after further children exist. Explicit
-fingerprints still override the wallet-level default, and a body fingerprint
-that disagrees with the numbered path is an error for both families. An
+initial child of each family, even after further children exist. The
+wallet-level outbox is account 0's outbox with the same fence as the numbered
+tree — it stages from account 0's key, shows only the entries that key staged,
+and a body fingerprint naming any other account is an error for both families;
+staging from account N goes through `wallets/<wallet>/<n>/`. An
 account can hold only EVM, only Solana, or both; reading a missing family
 returns a specific missing-key error and never allocates a key. Retired keys
 remain readable but cannot spend. Staged operations and outboxes are fenced to

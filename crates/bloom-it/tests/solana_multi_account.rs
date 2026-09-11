@@ -29,10 +29,13 @@ use bloom_vfs::VfsPath;
 use bloom_vfs::handler::Handler;
 use sha2::{Digest as _, Sha256};
 
+fn rpc_url_str() -> String {
+    std::env::var("BLOOM_IT_SOLANA_RPC").unwrap_or_else(|_| "http://127.0.0.1:8899".into())
+}
+
 const MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon \
 abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon \
 abandon abandon art";
-const RPC: &str = "http://127.0.0.1:8899";
 
 fn tok(s: &str) -> Token {
     Token::new(s.to_owned()).unwrap()
@@ -300,11 +303,15 @@ impl MachineBrokerService for MultiAccountBroker {
 /// `reqwest::blocking` builds and drops its own runtime, which panics inside
 /// an async context, so it runs on a tokio-naive OS thread.
 fn rpc(method: &str, params: serde_json::Value) -> Result<serde_json::Value> {
+    // Overridable so the suite can run against a validator on a non-default
+    // port (several developer harnesses keep one on 8899).
+    let url = std::env::var("BLOOM_IT_SOLANA_RPC")
+        .unwrap_or_else(|_| "http://127.0.0.1:8899".to_string());
     let method = method.to_string();
     std::thread::spawn(move || -> Result<serde_json::Value> {
         let body = serde_json::json!({"jsonrpc":"2.0","id":1,"method":method,"params":params});
         let resp: serde_json::Value = reqwest::blocking::Client::new()
-            .post(RPC)
+            .post(url)
             .json(&body)
             .send()?
             .json()?;
@@ -429,7 +436,7 @@ async fn two_active_solana_children_select_sign_and_reconcile_independently() ->
         SolanaSpec {
             name: "solana-local".into(),
             endpoints: vec![EndpointSpec {
-                url: RPC.into(),
+                url: rpc_url_str(),
                 weight: 100,
                 cu_per_sec: None,
                 max_rps: None,
@@ -710,15 +717,30 @@ async fn two_active_solana_children_select_sign_and_reconcile_independently() ->
     );
     println!("    numbered transfer settled; account boundary holds end to end");
     // Baselines for the later steps, which count calls and sent entries.
+    // The numbered transfer lives in account 1's outbox view; the
+    // wallet-level view is account 0's and must not show it.
     let sign_calls_before = broker.sign_calls.lock().len();
     let sent_before = daemon
         .vfs
+        .list(&VfsPath::parse("/wallets/alice/1/chains/solana-local/outbox/sent").unwrap())
+        .await
+        .map_err(|e| anyhow!("list account 1 sent: {e}"))?
+        .len();
+    let wallet_sent_before = daemon
+        .vfs
         .list(&VfsPath::parse("/wallets/alice/chains/solana-local/outbox/sent").unwrap())
         .await
-        .map_err(|e| anyhow!("list sent: {e}"))?
+        .map_err(|e| anyhow!("list wallet sent: {e}"))?
         .len();
     assert_eq!(sign_calls_before, 1, "the numbered confirm signed once");
-    assert_eq!(sent_before, 1, "the numbered transfer is in sent");
+    assert_eq!(
+        sent_before, 1,
+        "the numbered transfer is in account 1's sent"
+    );
+    assert_eq!(
+        wallet_sent_before, 0,
+        "the wallet-level view is account 0's: it must not show account 1's entry"
+    );
     // Step 8 exercises its own approval gating; drop the fixture approval
     // again so its pre-approval refusal is real.
     broker.approval_active.store(false, Ordering::SeqCst);
@@ -741,15 +763,42 @@ async fn two_active_solana_children_select_sign_and_reconcile_independently() ->
         .expect_err("a fingerprint outside the wallet must never select");
     println!("    refused: {err}");
 
-    // 7. Select account 1 explicitly, with account 0 still active.
+    // 7. The wallet-level path stages from account 0 only: account 1's
+    //    fingerprint on the wallet-level `new.tx` is refused and nothing
+    //    stages. Account 1 transfers go through `/wallets/alice/1/`.
     step(
         "7",
-        "stage from account 1 by fingerprint, account 0 still active",
+        "wallet-level staging refuses account 1's fingerprint; numbered path stages account 1",
     );
     let destination_before =
         rpc("getBalance", serde_json::json!([destination]))?["result"]["value"]
             .as_u64()
             .unwrap_or(0);
+    let override_intent = serde_json::json!({
+        "destination": destination,
+        "lamports": 250_000_000u64,
+        "account_fingerprint": account1.fingerprint_hex(),
+    });
+    let override_refused = daemon
+        .vfs
+        .write(&new_tx, serde_json::to_vec(&override_intent)?.as_slice())
+        .await;
+    assert!(
+        override_refused.is_err(),
+        "the wallet-level path must not stage another account's transfer"
+    );
+    println!("    wallet-level account-1 stage refused: {override_refused:?}");
+    let wallet_pending_after_refusal = daemon
+        .vfs
+        .list(&VfsPath::parse("/wallets/alice/chains/solana-local/outbox/pending").unwrap())
+        .await
+        .map_err(|e| anyhow!("list wallet pending: {e}"))?;
+    assert!(
+        wallet_pending_after_refusal.is_empty(),
+        "nothing may stage from the refused override: {wallet_pending_after_refusal:?}"
+    );
+
+    // The numbered path pins its own account and settles it.
     let intent = serde_json::json!({
         "destination": destination,
         "lamports": 250_000_000u64,
@@ -757,14 +806,14 @@ async fn two_active_solana_children_select_sign_and_reconcile_independently() ->
     });
     daemon
         .vfs
-        .write(&new_tx, serde_json::to_vec(&intent)?.as_slice())
+        .write(&numbered_tx, serde_json::to_vec(&intent)?.as_slice())
         .await
-        .map_err(|e| anyhow!("stage: {e}"))?;
+        .map_err(|e| anyhow!("numbered stage: {e}"))?;
     let pending = daemon
         .vfs
-        .list(&VfsPath::parse("/wallets/alice/chains/solana-local/outbox/pending").unwrap())
+        .list(&VfsPath::parse("/wallets/alice/1/chains/solana-local/outbox/pending").unwrap())
         .await
-        .map_err(|e| anyhow!("list pending: {e}"))?;
+        .map_err(|e| anyhow!("list account 1 pending: {e}"))?;
     let id = pending
         .first()
         .ok_or_else(|| anyhow!("nothing staged"))?
@@ -772,7 +821,7 @@ async fn two_active_solana_children_select_sign_and_reconcile_independently() ->
         .clone();
     let staged = read_json(
         &daemon,
-        &format!("/wallets/alice/chains/solana-local/outbox/pending/{id}/intent.json"),
+        &format!("/wallets/alice/1/chains/solana-local/outbox/pending/{id}/intent.json"),
     )
     .await?;
     println!("    staged id {id} fee_payer {}", staged["fee_payer"]);
@@ -790,7 +839,7 @@ async fn two_active_solana_children_select_sign_and_reconcile_independently() ->
     // 8. Approve, confirm, broadcast.
     step("8", "owner approves; confirm signs and broadcasts");
     let confirm = VfsPath::parse(&format!(
-        "/wallets/alice/chains/solana-local/outbox/pending/{id}/confirm"
+        "/wallets/alice/1/chains/solana-local/outbox/pending/{id}/confirm"
     ))
     .unwrap();
     let refused = daemon.vfs.write(&confirm, b"y\n").await;
@@ -837,7 +886,7 @@ async fn two_active_solana_children_select_sign_and_reconcile_independently() ->
     );
     let broadcast = read_json(
         &daemon,
-        &format!("/wallets/alice/chains/solana-local/outbox/sent/{id}/broadcast_attempted.json"),
+        &format!("/wallets/alice/1/chains/solana-local/outbox/sent/{id}/broadcast_attempted.json"),
     )
     .await?;
     let signature_b58 = broadcast["signature"]
@@ -882,7 +931,7 @@ async fn two_active_solana_children_select_sign_and_reconcile_independently() ->
     for _ in 0..60 {
         if let Ok(value) = read_json(
             &daemon,
-            &format!("/wallets/alice/chains/solana-local/outbox/sent/{id}/receipt.json"),
+            &format!("/wallets/alice/1/chains/solana-local/outbox/sent/{id}/receipt.json"),
         )
         .await
             && value["confirmation_status"].as_str() == Some("finalized")
@@ -929,9 +978,9 @@ async fn two_active_solana_children_select_sign_and_reconcile_independently() ->
     );
     let sent_after = daemon
         .vfs
-        .list(&VfsPath::parse("/wallets/alice/chains/solana-local/outbox/sent").unwrap())
+        .list(&VfsPath::parse("/wallets/alice/1/chains/solana-local/outbox/sent").unwrap())
         .await
-        .map_err(|e| anyhow!("list sent: {e}"))?;
+        .map_err(|e| anyhow!("list account 1 sent: {e}"))?;
     assert_eq!(
         sent_after.len(),
         sent_before + 1,
@@ -986,7 +1035,7 @@ async fn two_active_solana_children_select_sign_and_reconcile_independently() ->
     );
     let receipt_after = read_json(
         &daemon,
-        &format!("/wallets/alice/chains/solana-local/outbox/sent/{id}/receipt.json"),
+        &format!("/wallets/alice/1/chains/solana-local/outbox/sent/{id}/receipt.json"),
     )
     .await?;
     assert_eq!(
