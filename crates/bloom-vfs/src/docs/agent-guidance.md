@@ -53,6 +53,28 @@ Treat every write as an operation. Writes may stage work, begin a ceremony,
 consume reusable authority, or broadcast after authorization. Read the target
 directory and inspect the resulting projection before retrying or continuing.
 
+## What an error means
+
+The errors here mean what they mean on any filesystem, and it is worth acting on
+the difference rather than retrying everything.
+
+- **No such file or directory** — the path is not there. This is a fact, not a
+  failure: act on it. In particular, a transfer you discarded or confirmed
+  **leaves `pending/`**, so reading its old path afterwards is supposed to say
+  this. It means your write worked.
+- **Permission denied** — the operation needs an owner approval that has not
+  happened yet. Look for `approval_challenge.json` in the same action directory.
+- **Operation not permitted** — policy refused it. Read `policy_check.json`
+  beside the transfer for the rule and the reason.
+- **Input/output error** — something actually went wrong. This is the only one
+  worth retrying, and it should be rare.
+
+If you write to a control file and then cannot find what you wrote, check
+whether the transfer moved to `sent/` or `failed/` before assuming the write
+was lost. Listing the wallet's outbox states is cheaper than re-issuing the
+write, and re-issuing a broadened version of it is how a correct action becomes
+an incorrect one.
+
 ## Wallet and account identity
 
 ```sh
