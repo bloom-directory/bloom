@@ -4,6 +4,7 @@ members = [
   "crates/bloom-machine",
   "crates/bloom-daemon",
   "crates/bloom-vfs",
+  "crates/bloom-mcp",
   "crates/bloom-paid-mpp",
   "crates/bloom-paid-x402",
   "crates/bloom-paid-http",
@@ -109,6 +110,7 @@ bloom-rpc      = { path = "crates/bloom-rpc" }
 bloom-evm      = { path = "crates/bloom-evm" }
 bloom-tx       = { path = "crates/bloom-tx" }
 bloom-vfs      = { path = "crates/bloom-vfs" }
+bloom-mcp      = { path = "crates/bloom-mcp" }
 bloom-paid-mpp = { path = "crates/bloom-paid-mpp" }
 bloom-paid-x402 = { path = "crates/bloom-paid-x402" }
 bloom-paid-http = { path = "crates/bloom-paid-http" }

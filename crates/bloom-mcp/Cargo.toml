@@ -1,0 +1,25 @@
+[package]
+name = "bloom-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Model Context Protocol proxy over the Bloom VFS command surface"
+
+[lib]
+doctest = false
+
+[dependencies]
+bloom-daemon.workspace = true
+bloom-proto.workspace = true
+async-trait.workspace = true
+base64.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+bloom-vfs.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
