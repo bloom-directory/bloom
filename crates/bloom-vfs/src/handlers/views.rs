@@ -2066,17 +2066,40 @@ fn trim_trailing_zeros(text: &str) -> String {
     }
 }
 
-/// A quantity short enough to sit in a table cell. A faucet chain can hand
-/// out a balance sixty digits long, which wraps into a blob that swamps every
-/// real row; the exact figure stays in the row's evidence.
+/// A quantity short enough to sit in a table cell. A faucet chain can hand out
+/// a balance sixty digits long, and an ordinary native balance carries
+/// eighteen decimals; both wrap into a blob that swamps every real row. The
+/// exact figure stays in the row's evidence.
 fn short_quantity(text: &str) -> String {
     let trimmed = trim_trailing_zeros(text);
-    let whole = trimmed.split('.').next().unwrap_or(trimmed.as_str());
-    if whole.len() <= 15 || !whole.is_ascii() {
+    if !trimmed.is_ascii() {
         return trimmed;
     }
-    let lead: String = whole.chars().take(3).collect();
-    format!("≈{}.{} × 10^{}", &lead[..1], &lead[1..], whole.len() - 1)
+    let (whole, fraction) = match trimmed.split_once('.') {
+        Some((whole, fraction)) => (whole, fraction),
+        None => (trimmed.as_str(), ""),
+    };
+    // A faucet quantity becomes a magnitude: sixty digits of precision say
+    // nothing that a power of ten does not.
+    if whole.len() > 15 {
+        let lead: String = whole.chars().take(3).collect();
+        return format!("≈{}.{} × 10^{}", &lead[..1], &lead[1..], whole.len() - 1);
+    }
+    // Otherwise keep six *significant* fractional digits, counted from the
+    // first non-zero. Cutting at six decimal places instead would round a
+    // small native balance away to nothing.
+    const SIGNIFICANT: usize = 6;
+    let leading_zeros = fraction.len() - fraction.trim_start_matches('0').len();
+    let keep = leading_zeros
+        .saturating_add(SIGNIFICANT)
+        .min(fraction.len());
+    if keep == fraction.len() {
+        return trimmed;
+    }
+    format!(
+        "≈{}",
+        trim_trailing_zeros(&format!("{whole}.{}", &fraction[..keep]))
+    )
 }
 
 /// A line chart as static SVG, in the shape the stylesheet already ships: a
@@ -2927,6 +2950,14 @@ mod tests {
         );
         assert_eq!(short_quantity("42"), "42");
         assert_eq!(short_quantity("0.010000000000000000"), "0.01");
+        // Eighteen decimals is the ordinary case, and it swamps a cell just
+        // as thoroughly. Six significant digits is enough to recognise.
+        assert_eq!(short_quantity("4.295587231758644167"), "≈4.295587");
+        // Counted from the first non-zero: cutting at six decimal places
+        // would round a small native balance away to 0.000019.
+        assert_eq!(short_quantity("0.000019577151776"), "≈0.0000195771");
+        // Already short enough is left exactly as it is, with no "≈".
+        assert_eq!(short_quantity("1.5"), "1.5");
     }
 
     #[tokio::test]
