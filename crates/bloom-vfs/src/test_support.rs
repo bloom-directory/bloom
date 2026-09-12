@@ -36,6 +36,14 @@ impl WalletProjectionReader for StaticWalletProjection {
     }
 }
 
+/// A reader over a projection that was read from disk, so the pages can be
+/// rendered against a real Bloom home rather than a synthetic wallet.
+pub(crate) fn wallet_projection_reader_from(
+    projection: WalletProjection,
+) -> Arc<dyn WalletProjectionReader> {
+    Arc::new(StaticWalletProjection(projection))
+}
+
 pub(crate) fn wallet_projection_reader(
     wallet: &str,
     address: &str,

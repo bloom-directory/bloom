@@ -109,7 +109,7 @@ footer a { margin-left:14px; }
   .hero-aside { border-left:0; border-top:1px solid var(--rule-2); padding:20px 0 0; }.hero h2 { font-size:32px; }
   .hero .metric { font-size:46px; }.card { padding:22px; }.section-head { display:block; }.section-head p { margin-top:8px; }
   .stats { grid-template-columns:1fr; }.stat,.stat:first-child { padding:16px 0; border:0; border-bottom:1px solid var(--rule); }.stat:last-child { border:0; }
-  table,tbody,tr,td { display:block; width:100%; }thead { position:absolute; width:1px; height:1px; overflow:hidden; clip-path:inset(50%); }
+  table,tbody,tr,td,caption { display:block; width:100%; }thead { position:absolute; width:1px; height:1px; overflow:hidden; clip-path:inset(50%); }
   tr { padding:16px 0; border-top:1px solid var(--rule); }td,td:first-child,td:last-child { border:0; padding:5px 0; text-align:left; }
   td[data-label] { display:flex; gap:12px; justify-content:space-between; }td[data-label]::before { content:attr(data-label); color:var(--muted); font:11px/1.6 var(--mono); }
   .bar { display:none; }td[data-label] small { display:none; }.review dl div { grid-template-columns:1fr; gap:5px; }dd { text-align:left; }

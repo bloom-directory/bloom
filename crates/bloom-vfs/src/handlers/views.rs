@@ -234,7 +234,12 @@ impl ViewsHandler {
 
         for projection in &projections {
             let wallet = projection.wallet_id().as_str().to_owned();
-            portfolio.wallets.push(wallet.clone());
+            portfolio.wallets.push(WalletSummary {
+                id: wallet.clone(),
+                address: projection.primary_address().ok().map(str::to_owned),
+                kind: projection.wallet.wallet_kind.as_str().to_owned(),
+                policy_version: projection.wallet.policy_version.as_str().to_owned(),
+            });
             if projection.freshness == ProjectionFreshness::Stale {
                 portfolio.stale = true;
             }
@@ -284,9 +289,9 @@ impl ViewsHandler {
                     continue;
                 };
                 match raw {
-                    // A zero balance is a fact, not a holding. Listing every
-                    // configured chain at zero would bury the real rows.
-                    Some(raw) if raw.is_zero() => {}
+                    // A zero balance is kept. "You hold nothing on Base" is
+                    // an answer; dropping the row leaves the reader unable to
+                    // tell it apart from a network that was never read.
                     Some(raw) => {
                         let quantity = bloom_proto::format_units(raw, decimals);
                         let amount = quantity.parse::<f64>().unwrap_or(0.0);
@@ -307,14 +312,18 @@ impl ViewsHandler {
         }
 
         self.price(&mut portfolio).await;
-        portfolio
-            .holdings
-            .sort_by(|a, b| match b.value.partial_cmp(&a.value) {
-                Some(std::cmp::Ordering::Equal) | None => {
-                    (&a.wallet, &a.label).cmp(&(&b.wallet, &b.label))
-                }
-                Some(order) => order,
-            });
+        // Funded rows first and most valuable at the top; the empty networks
+        // keep a stable alphabetical tail rather than interleaving.
+        portfolio.holdings.sort_by(|a, b| {
+            b.is_funded()
+                .cmp(&a.is_funded())
+                .then(
+                    b.value
+                        .partial_cmp(&a.value)
+                        .unwrap_or(std::cmp::Ordering::Equal),
+                )
+                .then_with(|| (&a.wallet, &a.label).cmp(&(&b.wallet, &b.label)))
+        });
         portfolio
     }
 
@@ -387,27 +396,80 @@ impl ViewsHandler {
                 });
                 let plan = self.action_file(state, &id, "plan.md").await;
                 let status = self.action_file(state, &id, "status.json").await;
-                let petal = status.as_deref().and_then(petal_id);
+                let intent = self
+                    .action_file(state, &id, "intent.json")
+                    .await
+                    .as_deref()
+                    .and_then(parse_intent);
+                // The broadcast hash is the result's own field; `status.json`
+                // repeats it. Either answers, and neither invents one.
+                let result = self.action_file(state, &id, "result.json").await;
+                let tx_hash = result
+                    .as_deref()
+                    .and_then(|text| json_field(text, "tx_hash"))
+                    .or_else(|| status.as_deref().and_then(|text| json_field(text, "tx_hash")));
+                // A challenge file means the operation reached an approval
+                // ceremony. With no result beside it, it never got past one.
+                let awaited_approval = self
+                    .action_file(state, &id, "approval_challenge.json")
+                    .await
+                    .is_some();
+                let chain = intent
+                    .as_ref()
+                    .and_then(|i| i.chain.clone())
+                    .or_else(|| plan.as_deref().and_then(|text| plan_field(text, "Chain:")));
+                // Only a transfer of value gets an amount. A zero-value
+                // contract call is not a payment and must not read as one.
+                let amount = intent
+                    .as_ref()
+                    .and_then(|i| i.value_wei.as_deref())
+                    .filter(|wei| *wei != "0")
+                    .map(|wei| self.native_amount(chain.as_deref(), wei));
                 actions.push(Action {
                     summary: plan.as_deref().map(plan_summary).unwrap_or_else(|| {
                         format!("Operation {}", id.split('-').next().unwrap_or(&id))
                     }),
-                    chain: plan.as_deref().and_then(|text| plan_field(text, "Chain:")),
-                    wallet: plan.as_deref().and_then(|text| plan_field(text, "Wallet:")),
+                    wallet: intent
+                        .as_ref()
+                        .and_then(|i| i.wallet.clone())
+                        .or_else(|| plan.as_deref().and_then(|text| plan_field(text, "Wallet:"))),
                     denial: plan.as_deref().and_then(plan_denial),
+                    petal: status.as_deref().and_then(petal_id),
+                    chain,
+                    amount,
+                    tx_hash,
+                    awaited_approval,
+                    intent,
                     id,
                     state,
                     modified_ms,
-                    petal,
                 });
             }
         }
-        actions.sort_by(|a, b| {
-            b.modified_ms
-                .cmp(&a.modified_ms)
-                .then_with(|| a.id.cmp(&b.id))
-        });
+        // Newest first, by when the intent was created rather than when its
+        // directory was last touched: a retry must not reorder history.
+        actions.sort_by(|a, b| b.when().cmp(&a.when()).then_with(|| a.id.cmp(&b.id)));
         actions
+    }
+
+    /// A native-unit amount on a chain this daemon has configured. Without
+    /// that chain's own decimals the raw wei figure is the honest answer:
+    /// assuming 18 would silently mis-scale a chain that does not use them.
+    fn native_amount(&self, chain: Option<&str>, wei: &str) -> String {
+        let Ok(raw) = wei.parse::<alloy::primitives::U256>() else {
+            return format!("{wei} wei");
+        };
+        match chain.and_then(|name| self.chains.get(name)) {
+            Some(client) => {
+                let spec = client.spec();
+                format!(
+                    "{} {}",
+                    trim_trailing_zeros(&bloom_proto::format_units(raw, spec.native_decimals)),
+                    spec.native_symbol,
+                )
+            }
+            None => format!("{wei} wei"),
+        }
     }
 
     async fn action_file(&self, state: &str, id: &str, file: &str) -> Option<String> {
@@ -427,13 +489,10 @@ impl ViewsHandler {
         let pending = actions.iter().filter(|a| a.state == "pending").count();
         let failed = actions.iter().filter(|a| a.state == "failed").count();
 
-        let priced: Vec<&Holding> = portfolio
-            .holdings
-            .iter()
-            .filter(|h| h.value.is_some())
-            .collect();
-        let total: f64 = priced.iter().filter_map(|h| h.value).sum();
-        let unpriced = portfolio.holdings.len() - priced.len();
+        let funded = portfolio.funded();
+        let priced: Vec<&&Holding> = funded.iter().filter(|h| h.value.is_some()).collect();
+        let total: f64 = funded.iter().filter_map(|h| h.value).sum();
+        let unpriced = funded.len() - priced.len();
 
         let mut body = String::new();
         body.push_str(&portfolio.notices());
@@ -447,12 +506,25 @@ impl ViewsHandler {
                 "No balance was read from the configured networks.".to_owned(),
                 "Nothing is counted here yet.".to_owned(),
             )
+        } else if funded.is_empty() {
+            (
+                "—".to_owned(),
+                // Not "none holds anything": a faucet balance on an off-market
+                // chain is something, and Wallets shows it a click away.
+                format!(
+                    "{read} answered; none holds a priced asset.",
+                    read = count_noun(portfolio.holdings.len(), "network", "networks"),
+                ),
+                "Holding nothing is a complete answer. Wallets lists every network that was \
+                 read, so an empty balance stays distinct from one never checked."
+                    .to_owned(),
+            )
         } else if priced.is_empty() {
             (
                 "—".to_owned(),
                 format!(
                     "{held}, none of it priced.",
-                    held = count_noun(portfolio.holdings.len(), "holding", "holdings"),
+                    held = count_noun(funded.len(), "funded holding", "funded holdings"),
                 ),
                 "Nothing here carries a dollar value. The quantities are what the chains \
                  reported; Wallets says why each row is unpriced."
@@ -521,13 +593,17 @@ impl ViewsHandler {
         ));
 
         body.push_str(&format!(
-            "<div class=\"stats\"><div class=\"stat\"><span class=\"label\">Networks read</span>\
-             <div class=\"metric\">{chains}</div></div>\
+            // Three, not four: the row is a three-column grid, and a fourth
+            // tile wraps onto a line of its own looking like a mistake. What
+            // is held is already the headline above.
+            "<div class=\"stats\">\
+             <div class=\"stat\"><span class=\"label\">Networks answered</span>\
+             <div class=\"metric\">{answered}</div></div>\
              <div class=\"stat\"><span class=\"label\">Waiting for you</span>\
              <div class=\"metric\">{pending}</div></div>\
-             <div class=\"stat\"><span class=\"label\">Unsuccessful records</span>\
+             <div class=\"stat\"><span class=\"label\">Never broadcast</span>\
              <div class=\"metric\">{failed}</div></div></div>",
-            chains = self.sorted_chains().len(),
+            answered = portfolio.holdings.len(),
         ));
 
         body.push_str(&attention_strip(pending, true));
@@ -549,12 +625,11 @@ impl ViewsHandler {
 
     async fn render_wallets(&self) -> String {
         let portfolio = self.portfolio().await;
-        let total: f64 = portfolio.holdings.iter().filter_map(|h| h.value).sum();
-        let priced = portfolio
-            .holdings
-            .iter()
-            .filter(|h| h.value.is_some())
-            .count();
+        let funded = portfolio.funded();
+        let off_market = portfolio.off_market();
+        let empty = portfolio.empty_networks();
+        let priced: Vec<&&Holding> = funded.iter().filter(|h| h.value.is_some()).collect();
+        let total: f64 = funded.iter().filter_map(|h| h.value).sum();
 
         let mut body = String::new();
         body.push_str(&portfolio.notices());
@@ -563,26 +638,54 @@ impl ViewsHandler {
                 "—".to_owned(),
                 "No non-zero native balance was read from the networks that answered.".to_owned(),
             )
-        } else if priced == 0 {
+        } else if funded.is_empty() {
+            (
+                "—".to_owned(),
+                // Claiming every balance is empty while a faucet row sits
+                // below it would be plainly contradicted by the page itself.
+                if off_market.is_empty() {
+                    format!(
+                        "Every network that answered reported an empty balance. {} read, none \
+                         holding anything.",
+                        count_noun(portfolio.holdings.len(), "network", "networks"),
+                    )
+                } else {
+                    // Not `count_noun`: it prefixes the count, which would
+                    // read as "1 One network".
+                    format!(
+                        "No network holds a priced asset. {subject} below {verb} a balance on \
+                         a chain with no market for its native unit.",
+                        subject = if off_market.len() == 1 {
+                            "One network".to_owned()
+                        } else {
+                            format!("{} networks", off_market.len())
+                        },
+                        verb = if off_market.len() == 1 {
+                            "carries"
+                        } else {
+                            "carry"
+                        },
+                    )
+                },
+            )
+        } else if priced.is_empty() {
             (
                 "—".to_owned(),
                 // Not `count_noun`: that helper prefixes the count, which
                 // reads as "1 the row".
-                if portfolio.holdings.len() == 1 {
-                    "No price for the row below.".to_owned()
+                if funded.len() == 1 {
+                    "No price for the funded row below.".to_owned()
                 } else {
-                    format!(
-                        "No price for any of the {} rows below.",
-                        portfolio.holdings.len()
-                    )
+                    format!("No price for any of the {} funded rows below.", funded.len())
                 },
             )
         } else {
             (
                 money(Some(total)),
                 format!(
-                    "{priced} of {} rows carry a price.",
-                    portfolio.holdings.len()
+                    "{} of {} funded rows carry a price.",
+                    priced.len(),
+                    funded.len()
                 ),
             )
         };
@@ -592,69 +695,85 @@ impl ViewsHandler {
              <p>{support}</p></div>\
              <div class=\"hero-aside\"><h3>Coverage stays visible.</h3>\
              <p>Native balances only: token and Petal positions are not read here yet. A \
-             missing quote leaves a row unpriced rather than valuing it at zero, and test \
-             networks are never priced.</p></div></section>",
+             missing quote leaves a row unpriced rather than valuing it at zero, and a chain \
+             whose native unit has no market of its own is never priced.</p></div></section>",
             metric = html_escape(&metric),
             support = html_escape(&support),
         ));
 
         for wallet in &portfolio.wallets {
-            let rows: Vec<&Holding> = portfolio
-                .holdings
+            let wallet_funded: Vec<&Holding> = funded
                 .iter()
-                .filter(|holding| &holding.wallet == wallet)
+                .copied()
+                .filter(|holding| holding.wallet == wallet.id)
                 .collect();
-            let wallet_total: f64 = rows.iter().filter_map(|h| h.value).sum();
-            let subtitle = if rows.is_empty() {
-                "No balance read".to_owned()
-            } else if rows.iter().any(|h| h.value.is_some()) {
+            let wallet_off_market: Vec<&Holding> = off_market
+                .iter()
+                .copied()
+                .filter(|holding| holding.wallet == wallet.id)
+                .collect();
+            let wallet_empty: Vec<&Holding> = empty
+                .iter()
+                .copied()
+                .filter(|holding| holding.wallet == wallet.id)
+                .collect();
+            let wallet_total: f64 = wallet_funded.iter().filter_map(|h| h.value).sum();
+            let subtitle = if wallet_funded.iter().any(|h| h.value.is_some()) {
                 money(Some(wallet_total))
+            } else if wallet_funded.is_empty() {
+                "Holds nothing on any network that answered".to_owned()
             } else {
                 "No priced balance".to_owned()
             };
             body.push_str(&format!(
                 "<section id=\"wallet-{id}\"><div class=\"section-head\"><h2>{name}</h2>\
-                 <p>{subtitle}</p></div>",
-                id = html_escape(wallet),
-                name = html_escape(wallet),
+                 <p>{subtitle}</p></div>\
+                 <dl class=\"receipt-facts\">\
+                 <div><dt>Address</dt><dd><code>{address}</code></dd></div>\
+                 <div><dt>Kind</dt><dd>{kind}</dd></div>\
+                 <div><dt>Policy</dt><dd>version {version}</dd></div></dl>",
+                id = html_escape(&wallet.id),
+                name = html_escape(&wallet.id),
                 subtitle = html_escape(&subtitle),
+                address = html_escape(wallet.address.as_deref().unwrap_or("Unavailable")),
+                kind = html_escape(&wallet.kind),
+                version = html_escape(&wallet.policy_version),
             ));
-            if rows.is_empty() {
+
+            if !wallet_funded.is_empty() {
+                body.push_str(&holdings_table(
+                    &wallet_funded,
+                    "Native balances read through Bloom",
+                ));
+            }
+
+            // Faucet and development balances get their own table. Sharing one
+            // with real funds is how an enormous test quantity ends up reading
+            // as a portfolio.
+            if !wallet_off_market.is_empty() {
                 body.push_str(
-                    "<p class=\"lede\">No non-zero native balance in the networks that \
-                     answered.</p>",
+                    "<div class=\"section-head\"><h3>Test and development networks</h3>\
+                     <p>Quantities here are not money</p></div>",
                 );
-            } else {
-                let cells: String = rows
+                body.push_str(&holdings_table(
+                    &wallet_off_market,
+                    "Balances on chains with no market for their native unit",
+                ));
+            }
+
+            // An empty network is reported, not dropped: otherwise "you hold
+            // nothing on Base" is indistinguishable from "Base was not read".
+            if !wallet_empty.is_empty() {
+                let chips: String = wallet_empty
                     .iter()
-                    .map(|holding| {
-                        format!(
-                            "<tr><td data-label=\"Asset\"><span class=\"asset-label\">\
-                             {mark}<span><strong>{symbol}</strong><small>{quantity} {symbol}\
-                             </small></span></span></td>\
-                             <td data-label=\"Network\">{label}</td>\
-                             <td class=\"numeric money\" data-label=\"Observed value\">{value}</td>\
-                             <td data-label=\"Evidence\"><details><summary>Details</summary>\
-                             <p>{note}</p><p><code>{source}</code></p></details></td></tr>",
-                            mark = monogram(&holding.symbol),
-                            symbol = html_escape(&holding.symbol),
-                            quantity = html_escape(&holding.quantity),
-                            label = html_escape(&holding.label),
-                            value = html_escape(&money(holding.value)),
-                            note = html_escape(&holding.note()),
-                            source = html_escape(&format!(
-                                "/wallets/{}/chains/{}/balance.json",
-                                holding.wallet, holding.chain
-                            )),
-                        )
-                    })
+                    .map(|holding| format!("<li>{}</li>", asset_label(&holding.label)))
                     .collect();
                 body.push_str(&format!(
-                    "<div class=\"table-wrap\"><table><caption>Native balances read through \
-                     Bloom</caption><thead><tr><th scope=\"col\">Asset / quantity</th>\
-                     <th scope=\"col\">Network</th><th scope=\"col\">Observed value</th>\
-                     <th scope=\"col\">Evidence</th></tr></thead><tbody>{cells}</tbody>\
-                     </table></div>"
+                    "<details><summary>Holds nothing · {count}</summary>\
+                     <p>These networks answered and reported an empty balance. They are listed \
+                     so that holding nothing stays distinguishable from never having been \
+                     read.</p><ul class=\"receiving-networks\">{chips}</ul></details>",
+                    count = wallet_empty.len(),
                 ));
             }
             body.push_str("</section>");
@@ -835,13 +954,23 @@ impl ViewsHandler {
             );
         }
 
+        // "Failed" overstates what these records show. They carry no result
+        // and no transaction hash, so what is known is that nothing was sent.
         if failed > 0 {
+            let one = failed == 1;
             body.push_str(&format!(
-                "<section class=\"attention-strip\"><div><h3>Review unsuccessful \
-                 operations</h3><p>{failed} failed or reverted {record} in the captured \
-                 history. Check the receipt before trying again.</p></div>\
-                 <a href=\"activity.html\">Inspect failures →</a></section>",
-                record = if failed == 1 { "record" } else { "records" },
+                "<section class=\"attention-strip\"><div><h3>Review what never sent</h3>\
+                 <p>{count} in the captured history {verb} never broadcast, so no transaction \
+                 for {pronoun} exists on any chain. Read the record before staging \
+                 another.</p></div>\
+                 <a href=\"activity.html\">Inspect {pronoun} →</a></section>",
+                count = if one {
+                    "One record".to_owned()
+                } else {
+                    format!("{failed} records")
+                },
+                verb = if one { "was" } else { "were" },
+                pronoun = if one { "it" } else { "them" },
             ));
         }
 
@@ -860,22 +989,31 @@ impl ViewsHandler {
         let counts = |state: &str| actions.iter().filter(|a| a.state == state).count();
         let (sent, pending, failed) = (counts("sent"), counts("pending"), counts("failed"));
 
+        let broadcast = actions.iter().filter(|a| a.tx_hash.is_some()).count();
+
         let mut body = String::new();
         body.push_str(&format!(
             "<section class=\"outcome-overview\" aria-label=\"Outcome summary\">\
              <a href=\"#ledger\"><span class=\"mini-outcome\">✓</span><strong>{sent}</strong>\
-             <span>Recorded as sent</span></a>\
+             <span>Broadcast by Bloom</span></a>\
              <a href=\"#ledger\"><span class=\"mini-outcome\">◷</span><strong>{pending}</strong>\
              <span>Staged, awaiting you</span></a>\
-             <a href=\"#ledger\"><span class=\"mini-outcome\">!</span><strong>{failed}</strong>\
-             <span>Failed or reverted</span></a></section>"
+             <a href=\"#ledger\"><span class=\"mini-outcome\">✗</span><strong>{failed}</strong>\
+             <span>Never broadcast</span></a></section>"
         ));
 
-        body.push_str(
-            "<section class=\"callout\"><strong>Sent is not the same as settled.</strong>\
-             <p>These are Bloom's own records. A record marked sent means Bloom submitted it \
-             and kept the result; read the receipt for the chain's own answer.</p></section>",
-        );
+        body.push_str(&format!(
+            "<section class=\"callout\"><strong>Broadcast is not the same as settled.</strong>\
+             <p>These are Bloom's own records of what it submitted. {carry} a transaction \
+             hash, which is evidence Bloom sent it — not evidence the chain accepted it. \
+             These pages contact no block explorer, so no confirmation, receipt, or revert \
+             reason is read here.</p></section>",
+            carry = match broadcast {
+                0 => "None of them carries".to_owned(),
+                1 => "One of them carries".to_owned(),
+                n => format!("{n} of them carry"),
+            },
+        ));
 
         if actions.is_empty() {
             body.push_str(
@@ -884,18 +1022,43 @@ impl ViewsHandler {
                  </section>",
             );
         } else {
-            let rows: String = actions.iter().map(|action| action.row()).collect();
+            // Grouped by the day the intent was created: a ledger of 22 rows
+            // is a wall of text without a date to anchor each run against.
+            let mut ledger = String::new();
+            let mut open_day: Option<String> = None;
+            for action in &actions {
+                let day = action
+                    .when()
+                    .map(format_utc_day)
+                    .unwrap_or_else(|| "Undated".to_owned());
+                if open_day.as_deref() != Some(day.as_str()) {
+                    if open_day.is_some() {
+                        ledger.push_str("</div>");
+                    }
+                    ledger.push_str(&format!(
+                        "<div class=\"section-head\"><h3>{}</h3></div>\
+                         <div class=\"activity-ledger\">",
+                        html_escape(&day),
+                    ));
+                    open_day = Some(day);
+                }
+                ledger.push_str(&action.row());
+            }
+            if open_day.is_some() {
+                ledger.push_str("</div>");
+            }
             body.push_str(&format!(
                 "<div class=\"section-head\" id=\"ledger\"><h2>Every record</h2>\
-                 <p>Newest first</p></div><div class=\"activity-ledger\">{rows}</div>"
+                 <p>{count}, newest first</p></div>{ledger}",
+                count = count_noun(actions.len(), "operation", "operations"),
             ));
         }
 
         page(
             "Activity",
             "Your activity.",
-            "What completed, what failed, and what is still staged. Newest first; this is the \
-             history Bloom itself recorded.",
+            "Every transaction Bloom staged, broadcast, or never sent — read from its own \
+             records, newest first.",
             ACTIVITY_HTML,
             &body,
         )
@@ -1003,18 +1166,90 @@ impl ViewsHandler {
     }
 }
 
+/// Who a wallet is, as its own projection reports it. Carried alongside the
+/// balances so the page can name a wallet without a second Broker read.
+struct WalletSummary {
+    id: String,
+    address: Option<String>,
+    kind: String,
+    policy_version: String,
+}
+
 #[derive(Default)]
 struct Portfolio {
     holdings: Vec<Holding>,
     /// `(wallet, chain)` pairs whose balance could not be read.
     unavailable: Vec<(String, String)>,
-    wallets: Vec<String>,
+    wallets: Vec<WalletSummary>,
     projections_unavailable: bool,
     price_coverage_gap: bool,
     stale: bool,
 }
 
+/// One table of holdings, with every cell labelled for a narrow screen.
+fn holdings_table(rows: &[&Holding], caption: &str) -> String {
+    let cells: String = rows
+        .iter()
+        .map(|holding| {
+            format!(
+                "<tr><td data-label=\"Asset\"><span class=\"asset-label\">\
+                 {mark}<span><strong>{symbol}</strong><small>{quantity} {symbol}\
+                 </small></span></span></td>\
+                 <td data-label=\"Network\">{label}</td>\
+                 <td class=\"numeric money\" data-label=\"Observed value\">{value}</td>\
+                 <td data-label=\"Evidence\"><details><summary>Details</summary>\
+                 <p>{note}</p><p>Exact quantity: <code>{exact}</code></p>\
+                 <p><code>{source}</code></p></details></td></tr>",
+                mark = monogram(&holding.symbol),
+                symbol = html_escape(&holding.symbol),
+                quantity = html_escape(&short_quantity(&holding.quantity)),
+                exact = html_escape(&trim_trailing_zeros(&holding.quantity)),
+                label = html_escape(&holding.label),
+                value = html_escape(&money(holding.value)),
+                note = html_escape(&holding.note()),
+                source = html_escape(&format!(
+                    "/wallets/{}/chains/{}/balance.json",
+                    holding.wallet, holding.chain
+                )),
+            )
+        })
+        .collect();
+    format!(
+        "<div class=\"table-wrap\"><table><caption>{caption}</caption><thead><tr>\
+         <th scope=\"col\">Asset / quantity</th><th scope=\"col\">Network</th>\
+         <th scope=\"col\">Observed value</th><th scope=\"col\">Evidence</th></tr></thead>\
+         <tbody>{cells}</tbody></table></div>",
+        caption = html_escape(caption),
+    )
+}
+
 impl Portfolio {
+    /// Rows that hold something on a network whose native unit is a traded
+    /// asset. These are the only rows that can carry a dollar value.
+    fn funded(&self) -> Vec<&Holding> {
+        self.holdings
+            .iter()
+            .filter(|holding| holding.is_funded() && !holding.is_off_market())
+            .collect()
+    }
+
+    /// Rows holding a quantity on a chain with no market for its native unit:
+    /// faucet and development balances, kept well away from money.
+    fn off_market(&self) -> Vec<&Holding> {
+        self.holdings
+            .iter()
+            .filter(|holding| holding.is_funded() && holding.is_off_market())
+            .collect()
+    }
+
+    /// Networks that answered and reported nothing held.
+    fn empty_networks(&self) -> Vec<&Holding> {
+        self.holdings
+            .iter()
+            .filter(|holding| !holding.is_funded())
+            .collect()
+    }
+
     /// Everything the reader must know about what is missing, stated rather
     /// than implied. Silence would read as "nothing to report".
     fn notices(&self) -> String {
@@ -1068,6 +1303,21 @@ struct Holding {
 }
 
 impl Holding {
+    /// Whether this row holds anything at all. A network read successfully
+    /// and found empty is reported, but it is not a holding to count or
+    /// value.
+    fn is_funded(&self) -> bool {
+        self.amount > 0.0
+    }
+
+    /// Whether the native unit here is an asset with a market. A development
+    /// or app chain may name its unit "ETH" and hand out an enormous faucet
+    /// balance; that quantity is real but it is not money, and it must never
+    /// share a table with funds that are.
+    fn is_off_market(&self) -> bool {
+        !native_asset_has_market(self.chain_id)
+    }
+
     fn note(&self) -> String {
         if is_test_network(&self.chain) {
             "Test network. Test funds are not main-network funds and are never priced.".to_owned()
@@ -1086,6 +1336,25 @@ impl Holding {
     }
 }
 
+/// What a staged intent recorded about a transaction, read from the outbox's
+/// own `intent.json`. Parsed permissively out of generic JSON: an intent
+/// written by a newer daemon must leave the row poorer, never blank.
+#[derive(Default)]
+struct Intent {
+    wallet: Option<String>,
+    chain: Option<String>,
+    from: Option<String>,
+    to: Option<String>,
+    value_wei: Option<String>,
+    action_kind: Option<String>,
+    nonce: Option<u64>,
+    gas_limit: Option<u64>,
+    created_ms: Option<u64>,
+    usd_value: Option<f64>,
+    data_bytes: usize,
+    petal_version: Option<String>,
+}
+
 struct Action {
     id: String,
     state: &'static str,
@@ -1095,6 +1364,15 @@ struct Action {
     chain: Option<String>,
     petal: Option<String>,
     denial: Option<String>,
+    /// The facts the intent recorded, when one was readable.
+    intent: Option<Intent>,
+    /// Formatted native amount, present only when the intent moved value.
+    amount: Option<String>,
+    /// The broadcast hash Bloom kept. Its presence is what separates an
+    /// operation that reached the network from one that never did.
+    tx_hash: Option<String>,
+    /// Whether this operation reached an approval ceremony.
+    awaited_approval: bool,
 }
 
 impl Action {
@@ -1114,31 +1392,95 @@ impl Action {
         }
     }
 
+    /// The outcome, stated as narrowly as the records support. "Failed" is
+    /// not "reverted": these records carry no receipt at all, so what is
+    /// known is that nothing was ever broadcast.
     fn label(&self) -> &'static str {
         match self.state {
-            "sent" => "✓ Recorded as sent",
-            "failed" => "! Failed",
+            "sent" => "✓ Broadcast",
+            "failed" if self.awaited_approval => "✗ Not approved",
+            "failed" => "✗ Never broadcast",
             _ => "◷ Staged · needs you",
+        }
+    }
+
+    /// When this operation happened, preferring the intent's own creation
+    /// stamp over the mtime of the directory holding it.
+    fn when(&self) -> Option<u64> {
+        self.intent
+            .as_ref()
+            .and_then(|i| i.created_ms)
+            .or(self.modified_ms)
+    }
+
+    /// A plain-language description of what the transaction does, built from
+    /// the intent rather than the plan's title line.
+    fn headline(&self) -> String {
+        let Some(intent) = &self.intent else {
+            return self.summary.clone();
+        };
+        let kind = intent.action_kind.as_deref().unwrap_or_default();
+        let head = match (kind, &self.amount) {
+            ("native_transfer", Some(amount)) => format!("Send {amount}"),
+            ("native_transfer", None) => "Send (zero value)".to_owned(),
+            ("contract_call", Some(amount)) => format!("Contract call with {amount}"),
+            ("contract_call", None) => "Contract call".to_owned(),
+            (_, Some(amount)) => format!("Move {amount}"),
+            _ => self.summary.clone(),
+        };
+        match &intent.to {
+            Some(to) => format!("{head} → {}", short_hex(to)),
+            None => head,
+        }
+    }
+
+    /// Why this row reads the way it does. The distinction that matters is
+    /// whether anything reached the network, and only a broadcast hash
+    /// settles that question.
+    fn outcome_note(&self) -> &'static str {
+        match self.state {
+            "sent" if self.tx_hash.is_some() => {
+                "Bloom broadcast this and kept the hash. Broadcast is not settled: read the \
+                 chain's own receipt for the final outcome."
+            }
+            "sent" => "Bloom recorded this as sent but kept no transaction hash.",
+            "failed" if self.awaited_approval => {
+                "This reached an approval ceremony and was never approved, so it was never \
+                 broadcast. No transaction for it exists on any chain."
+            }
+            "failed" => {
+                "This never reached the network: the record carries no result and no \
+                 transaction hash. Nothing was broadcast."
+            }
+            _ => "Staged and waiting for your review. Nothing has been broadcast.",
         }
     }
 
     fn row(&self) -> String {
         let mut meta = String::new();
+        let mut fact = |text: String| {
+            meta.push_str(&format!("<span>{}</span>", html_escape(&text)));
+        };
         if let Some(wallet) = &self.wallet {
-            meta.push_str(&format!("<span>{}</span>", html_escape(wallet)));
+            fact(format!("wallet {wallet}"));
         }
         if let Some(chain) = &self.chain {
-            meta.push_str(&format!("<span>{}</span>", html_escape(chain)));
+            fact(chain.clone());
         }
-        meta.push_str(&format!(
-            "<span>{}</span>",
-            html_escape(&match self.modified_ms {
-                Some(ms) => format_utc_ms(ms),
-                None => "Time unavailable".to_owned(),
-            })
-        ));
+        fact(match self.when() {
+            Some(ms) => format_utc_ms(ms),
+            None => "Time unavailable".to_owned(),
+        });
         if let Some(petal) = &self.petal {
-            meta.push_str(&format!("<span>{}</span>", html_escape(petal)));
+            fact(petal.clone());
+        }
+        // The hash belongs in the row itself, not buried in the details: it
+        // is the one value a person takes elsewhere to look the tx up.
+        if let Some(hash) = &self.tx_hash {
+            meta.push_str(&format!(
+                "<span><code>{}</code></span>",
+                html_escape(&short_hex(hash))
+            ));
         }
 
         let denial = match &self.denial {
@@ -1146,23 +1488,76 @@ impl Action {
             None => String::new(),
         };
 
+        let mut facts = String::new();
+        let mut row_fact = |label: &str, value: String| {
+            facts.push_str(&format!(
+                "<div><dt>{}</dt><dd>{}</dd></div>",
+                html_escape(label),
+                value,
+            ));
+        };
+        row_fact("Outcome", html_escape(self.outcome_note()));
+        if let Some(hash) = &self.tx_hash {
+            row_fact(
+                "Transaction hash",
+                format!("<code>{}</code>", html_escape(hash)),
+            );
+        }
+        if let Some(intent) = &self.intent {
+            if let Some(from) = &intent.from {
+                row_fact("From", format!("<code>{}</code>", html_escape(from)));
+            }
+            if let Some(to) = &intent.to {
+                row_fact("To", format!("<code>{}</code>", html_escape(to)));
+            }
+            row_fact(
+                "Value",
+                html_escape(self.amount.as_deref().unwrap_or("None — zero value")),
+            );
+            if let Some(kind) = &intent.action_kind {
+                row_fact("Kind", html_escape(kind));
+            }
+            if intent.data_bytes > 0 {
+                row_fact(
+                    "Calldata",
+                    html_escape(&count_noun(intent.data_bytes, "byte", "bytes")),
+                );
+            }
+            if let Some(nonce) = intent.nonce {
+                row_fact("Nonce", nonce.to_string());
+            }
+            if let Some(gas) = intent.gas_limit {
+                row_fact("Gas limit", html_escape(&thousands_int(gas)));
+            }
+            if let Some(usd) = intent.usd_value {
+                row_fact("Value when staged", html_escape(&money(Some(usd))));
+            }
+            if let Some(version) = &intent.petal_version {
+                row_fact("Petal version", html_escape(version));
+            }
+        }
+        row_fact("State", html_escape(self.state));
+        row_fact("Operation", format!("<code>{}</code>", html_escape(&self.id)));
+        row_fact(
+            "Record",
+            format!(
+                "<code>{}</code>",
+                html_escape(&format!("/outbox/{}/{}/", self.state, self.id))
+            ),
+        );
+
         format!(
             "<article class=\"activity-row {class}\">\
              <div class=\"outcome-symbol\" aria-hidden=\"true\">{glyph}</div>\
-             <div class=\"activity-description\"><h3>{summary}</h3>\
+             <div class=\"activity-description\"><h3>{headline}</h3>\
              <div class=\"activity-meta\">{meta}</div>{denial}\
-             <details><summary>Operation details</summary><dl class=\"receipt-facts\">\
-             <div><dt>State</dt><dd>{state}</dd></div>\
-             <div><dt>Operation</dt><dd><code>{id}</code></dd></div>\
-             <div><dt>Plan</dt><dd><code>{path}</code></dd></div></dl></details></div>\
+             <details><summary>Operation details</summary>\
+             <dl class=\"receipt-facts\">{facts}</dl></details></div>\
              <div class=\"activity-outcome\"><span class=\"outcome-label\">{label}</span>\
              </div></article>",
             class = self.status_class(),
             glyph = self.glyph(),
-            summary = html_escape(&self.summary),
-            state = html_escape(self.state),
-            id = html_escape(&self.id),
-            path = html_escape(&format!("/outbox/{}/{}/plan.md", self.state, self.id)),
+            headline = html_escape(&self.headline()),
             label = html_escape(self.label()),
         )
     }
@@ -1181,6 +1576,119 @@ fn petal_id(status: &str) -> Option<String> {
 
 /// A staged plan's own title, so a row reads like the operation rather than
 /// like an identifier.
+/// One string field out of a JSON document, absent when the document does not
+/// parse or the field is empty. Read as generic JSON so these pages do not
+/// bind themselves to another crate's schema.
+fn json_field(text: &str, key: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(text).ok()?;
+    value
+        .get(key)
+        .and_then(|field| field.as_str())
+        .map(str::to_owned)
+        .filter(|found| !found.is_empty())
+}
+
+/// The facts an outbox `intent.json` records. Every field is optional: a
+/// record written by a newer daemon must make a row poorer, never blank.
+fn parse_intent(text: &str) -> Option<Intent> {
+    let value: serde_json::Value = serde_json::from_str(text).ok()?;
+    let string = |key: &str| {
+        value
+            .get(key)
+            .and_then(|field| field.as_str())
+            .map(str::to_owned)
+            .filter(|found| !found.is_empty())
+    };
+    let number = |key: &str| value.get(key).and_then(|field| field.as_u64());
+    Some(Intent {
+        wallet: string("wallet"),
+        chain: string("chain"),
+        from: string("from"),
+        to: string("to"),
+        value_wei: string("value_wei"),
+        action_kind: string("action_kind"),
+        nonce: number("nonce"),
+        gas_limit: number("gas_limit"),
+        created_ms: number("created_ms"),
+        usd_value: value.get("usd_value").and_then(|field| field.as_f64()),
+        // Calldata is reported as a size. Rendering the bytes themselves
+        // invites squinting at hex that the plan already summarises.
+        data_bytes: string("data_hex")
+            .map(|hex| hex.trim_start_matches("0x").len() / 2)
+            .unwrap_or(0),
+        petal_version: value
+            .pointer("/execution_origin/petal_version")
+            .and_then(|field| field.as_str())
+            .map(str::to_owned),
+    })
+}
+
+/// `0.010000000000000000` reads as noise. Trim what a fixed-decimal
+/// rendering leaves, without turning an integer into `1.`.
+fn trim_trailing_zeros(text: &str) -> String {
+    if !text.contains('.') {
+        return text.to_owned();
+    }
+    let trimmed = text.trim_end_matches('0').trim_end_matches('.');
+    if trimmed.is_empty() {
+        "0".to_owned()
+    } else {
+        trimmed.to_owned()
+    }
+}
+
+/// A quantity short enough to sit in a table cell. A faucet chain can hand
+/// out a balance sixty digits long, which wraps into a blob that swamps every
+/// real row; the exact figure stays in the row's evidence.
+fn short_quantity(text: &str) -> String {
+    let trimmed = trim_trailing_zeros(text);
+    let whole = trimmed.split('.').next().unwrap_or(trimmed.as_str());
+    if whole.len() <= 15 || !whole.is_ascii() {
+        return trimmed;
+    }
+    let lead: String = whole.chars().take(3).collect();
+    format!("≈{}.{} × 10^{}", &lead[..1], &lead[1..], whole.len() - 1)
+}
+
+/// `0x4b81a384…eb1748` — enough to recognise, short enough to sit in a row;
+/// the full value stays in the row's details. A non-ASCII value is returned
+/// whole, because slicing it by byte could split a character.
+fn short_hex(value: &str) -> String {
+    let clean = value.trim();
+    if !clean.is_ascii() || clean.len() <= 16 {
+        return clean.to_owned();
+    }
+    format!("{}…{}", &clean[..8], &clean[clean.len() - 6..])
+}
+
+/// Group an integer for reading: `535693` → `535,693`.
+fn thousands_int(value: u64) -> String {
+    let digits = value.to_string();
+    let mut grouped = String::new();
+    for (index, digit) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            grouped.push(',');
+        }
+        grouped.push(digit);
+    }
+    grouped
+}
+
+/// `11 Sep 2026`, for grouping a ledger by day.
+fn format_utc_day(ms: u64) -> String {
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let (year, month, day) = civil_from_days(((ms / 1000) as i64).div_euclid(86_400));
+    format!(
+        "{day:02} {month} {year}",
+        month = MONTHS
+            .get((month.saturating_sub(1)) as usize)
+            .copied()
+            .unwrap_or("???"),
+    )
+}
+
 fn plan_summary(plan: &str) -> String {
     plan.lines()
         .map(str::trim)
@@ -1541,6 +2049,16 @@ mod tests {
         .unwrap();
     }
 
+    /// Stage an action together with the extra records a real outbox keeps
+    /// beside the plan.
+    fn stage_files(fixture: &Fixture, state: &str, id: &str, plan: &str, files: &[(&str, &str)]) {
+        stage(fixture, state, id, plan);
+        let dir = fixture.outbox_root.join(state).join(id);
+        for (name, body) in files {
+            std::fs::write(dir.join(name), body).unwrap();
+        }
+    }
+
     async fn render(handler: &ViewsHandler, page: &str) -> String {
         String::from_utf8(handler.read(&VfsPath::parse(page).unwrap()).await.unwrap()).unwrap()
     }
@@ -1697,7 +2215,12 @@ mod tests {
             next.contains("fund it before approving"),
             "a policy denial is the reason it will not proceed: {next}"
         );
-        assert!(next.contains("1 failed or reverted record"), "{next}");
+        // "Failed" would overstate it: these records carry no result and no
+        // hash, so the honest claim is that nothing was ever sent.
+        assert!(
+            next.contains("One record in the captured history was never broadcast"),
+            "a single record must agree in number: {next}"
+        );
         // A staged row must never be dressed up as an approval control.
         assert!(next.contains("Approving happens in Bloom, not here"));
 
@@ -1708,7 +2231,87 @@ mod tests {
         assert!(activity.contains("status-success"));
         assert!(activity.contains("status-failed"));
         assert!(activity.contains("status-pending"));
-        assert!(activity.contains("Sent is not the same as settled"));
+        assert!(activity.contains("Broadcast is not the same as settled"));
+    }
+
+    #[tokio::test]
+    async fn a_broadcast_record_surfaces_the_hash_it_kept() {
+        let fixture = fixture();
+        stage_files(
+            &fixture,
+            "sent",
+            "evm-0100",
+            "# Send 0.01 ETH\n\nWallet: primary\nChain:  ethereum (id 1)\n",
+            &[
+                (
+                    "intent.json",
+                    "{\"chain\":\"ethereum\",\"from\":\"0x5c3d61167D9dfa2E4171416D084842\
+                     20F1374456\",\"to\":\"0x6818809EefCe719E480a7526D76bD3e561526b46\",\
+                     \"value_wei\":\"10000000000000000\",\"action_kind\":\"native_transfer\",\
+                     \"nonce\":2,\"gas_limit\":535693}",
+                ),
+                (
+                    "result.json",
+                    "{\"tx_hash\":\"0x4b81a384e07d30624b9dc420b0f1c12e4f9a1d3cf027bdd4a1ab8\
+                     68225eb1748\"}",
+                ),
+            ],
+        );
+        let html = render(&fixture.handler, ACTIVITY_HTML).await;
+        // The hash is the one value a person carries elsewhere: short in the
+        // row, whole in the record.
+        assert!(html.contains("0x4b81a3…eb1748"), "{html}");
+        assert!(
+            html.contains("0x4b81a384e07d30624b9dc420b0f1c12e4f9a1d3cf027bdd4a1ab868225eb1748"),
+            "the full hash belongs in the details: {html}"
+        );
+        assert!(html.contains("Broadcast by Bloom"), "{html}");
+        // Counterparty and nonce come from the intent, not the plan title.
+        assert!(html.contains("0x6818809EefCe719E480a7526D76bD3e561526b46"), "{html}");
+    }
+
+    #[tokio::test]
+    async fn a_record_that_never_sent_is_never_called_reverted() {
+        let fixture = fixture();
+        stage_files(
+            &fixture,
+            "failed",
+            "evm-0200",
+            "# Enso operation\n\nChain:  ethereum (id 1)\n",
+            &[("approval_challenge.json", "{\"action_id\":\"evm-0200\"}")],
+        );
+        let html = render(&fixture.handler, ACTIVITY_HTML).await;
+        // These records carry no result and no hash. "Reverted" would claim
+        // the chain rejected something that was never submitted to it.
+        assert!(
+            !html.contains("reverted"),
+            "nothing here is evidence of a revert: {html}"
+        );
+        assert!(html.contains("Not approved"), "{html}");
+        assert!(html.contains("never broadcast"), "{html}");
+    }
+
+    #[test]
+    fn a_hash_is_short_in_a_row_and_quantities_lose_their_padding() {
+        let hash = "0x4b81a384e07d30624b9dc420b0f1c12e4f9a1d3cf027bdd4a1ab868225eb1748";
+        assert_eq!(short_hex(hash), "0x4b81a3…eb1748");
+        // Short enough to read whole is left alone.
+        assert_eq!(short_hex("0xabc"), "0xabc");
+        assert_eq!(trim_trailing_zeros("0.010000000000000000"), "0.01");
+        assert_eq!(trim_trailing_zeros("1.000000"), "1");
+        assert_eq!(trim_trailing_zeros("42"), "42");
+        assert_eq!(thousands_int(535_693), "535,693");
+        assert_eq!(format_utc_day(1_789_158_600_000), "11 Sep 2026");
+        // A faucet chain hands out balances sixty digits long. Left whole,
+        // one row wraps into a blob that swamps every real holding.
+        assert_eq!(
+            short_quantity(
+                "4242424242424242424242424242424242424242424242424242424242.424242424242424242"
+            ),
+            "≈4.24 × 10^57"
+        );
+        assert_eq!(short_quantity("42"), "42");
+        assert_eq!(short_quantity("0.010000000000000000"), "0.01");
     }
 
     #[tokio::test]
@@ -1902,66 +2505,97 @@ mod tests {
         let Ok(out) = std::env::var("VIEWS_DUMP") else {
             return;
         };
+        // Optional real sources, so these pages can be reviewed against a
+        // real Bloom home rather than a synthetic wallet:
+        //   VIEWS_OUTBOX=~/.bloom/central_outbox
+        //   VIEWS_PROJECTION=~/bloom/wallets/<wallet>/projection.json
+        //   VIEWS_CONFIG=~/.bloom/config.toml   (real chains, real balances)
+        //   VIEWS_REAL_PRICES=1                 (reach the live price source)
+        let real_outbox = std::env::var("VIEWS_OUTBOX").ok();
         let tmp = tempfile::tempdir().unwrap();
-        let outbox_root = tmp.path().join("central_outbox");
+        let outbox_root = match &real_outbox {
+            Some(path) => std::path::PathBuf::from(path),
+            None => tmp.path().join("central_outbox"),
+        };
         let outbox = Arc::new(super::super::outbox::OutboxHandler::new(
             super::super::outbox::CentralOutbox::new(outbox_root.clone()),
         ));
         let chains = ChainRegistry::new();
-        for (name, chain_id, display) in [
-            ("arbitrum", 42161u64, "Arbitrum One"),
-            ("base", 8453, "Base"),
-            ("ethereum", 1, "Ethereum"),
-            ("robinhood", 4663, "Robinhood Chain"),
-            ("sepolia-testnet", 11155111, "Sepolia"),
-        ] {
-            let spec = bloom_proto::ChainSpec {
-                name: name.into(),
-                chain_id,
-                rpc_urls: vec!["http://127.0.0.1:1".into()],
-                rpc_endpoints: Vec::new(),
-                allow_broadcast: false,
-                etherscan_api_url: None,
-                display_name: Some(display.to_owned()),
-                native_symbol: "ETH".into(),
-                native_decimals: 18,
-                legacy_tx: false,
-                op_stack: false,
-            };
-            chains.add(bloom_evm::ChainClient::new(spec).unwrap());
+        match std::env::var("VIEWS_CONFIG") {
+            Ok(path) => {
+                let config = bloom_proto::Config::load(std::path::Path::new(&path)).unwrap();
+                for spec in config.chains.values() {
+                    if let Ok(client) = bloom_evm::ChainClient::new(spec.clone()) {
+                        chains.add(client);
+                    }
+                }
+            }
+            Err(_) => {
+                for (name, chain_id, display) in [
+                    ("arbitrum", 42161u64, "Arbitrum One"),
+                    ("base", 8453, "Base"),
+                    ("ethereum", 1, "Ethereum"),
+                    ("robinhood", 4663, "Robinhood Chain"),
+                    ("sepolia-testnet", 11155111, "Sepolia"),
+                ] {
+                    let spec = bloom_proto::ChainSpec {
+                        name: name.into(),
+                        chain_id,
+                        rpc_urls: vec!["http://127.0.0.1:1".into()],
+                        rpc_endpoints: Vec::new(),
+                        allow_broadcast: false,
+                        etherscan_api_url: None,
+                        display_name: Some(display.to_owned()),
+                        native_symbol: "ETH".into(),
+                        native_decimals: 18,
+                        legacy_tx: false,
+                        op_stack: false,
+                    };
+                    chains.add(bloom_evm::ChainClient::new(spec).unwrap());
+                }
+            }
         }
-        let handler = ViewsHandler::new(
-            crate::test_support::wallet_projection_reader("everyday", ADDRESS),
-            chains,
-            bloom_prices::PricesClient::with_base_url("http://127.0.0.1:1"),
-            outbox,
-        );
+        let projections = match std::env::var("VIEWS_PROJECTION") {
+            Ok(path) => crate::test_support::wallet_projection_reader_from(
+                serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap(),
+            ),
+            Err(_) => crate::test_support::wallet_projection_reader("everyday", ADDRESS),
+        };
+        let prices = match std::env::var("VIEWS_REAL_PRICES") {
+            Ok(_) => bloom_prices::PricesClient::new(),
+            Err(_) => bloom_prices::PricesClient::with_base_url("http://127.0.0.1:1"),
+        };
+        let handler = ViewsHandler::new(projections, chains, prices, outbox);
         let staged = Fixture {
             handler: handler.clone(),
             _tmp: tmp,
             outbox_root,
         };
-        stage(
-            &staged,
-            "pending",
-            "evm-54ea2d13844badc5fb1082c036711257",
-            "# Staged tx 0001-62058\n\nWallet: everyday\nChain:  ethereum (id 1)\n\n## Policy\n\
-             - [Deny] balance.native_funds: account has 0 ETH on Ethereum Mainnet; requires up \
-             to 0.010084679918 ETH. Fund the account and restage this transaction before \
-             approving.\n",
-        );
-        stage(
-            &staged,
-            "sent",
-            "evm-75fb67132a5af7ffb607c2590b60c414",
-            "# Send 0.05 ETH\n\nWallet: everyday\nChain:  base (id 8453)\n",
-        );
-        stage(
-            &staged,
-            "failed",
-            "evm-9c1f0aa2b6d34e7f8a5b2c3d4e5f6071",
-            "# Enso operation\n\nWallet: everyday\nChain:  ethereum (id 1)\n",
-        );
+        // A real outbox brings its own records; only the synthetic run needs
+        // these staged in.
+        if real_outbox.is_none() {
+            stage(
+                &staged,
+                "pending",
+                "evm-54ea2d13844badc5fb1082c036711257",
+                "# Staged tx 0001-62058\n\nWallet: everyday\nChain:  ethereum (id 1)\n\n\
+                 ## Policy\n- [Deny] balance.native_funds: account has 0 ETH on Ethereum \
+                 Mainnet; requires up to 0.010084679918 ETH. Fund the account and restage \
+                 this transaction before approving.\n",
+            );
+            stage(
+                &staged,
+                "sent",
+                "evm-75fb67132a5af7ffb607c2590b60c414",
+                "# Send 0.05 ETH\n\nWallet: everyday\nChain:  base (id 8453)\n",
+            );
+            stage(
+                &staged,
+                "failed",
+                "evm-9c1f0aa2b6d34e7f8a5b2c3d4e5f6071",
+                "# Enso operation\n\nWallet: everyday\nChain:  ethereum (id 1)\n",
+            );
+        }
 
         std::fs::create_dir_all(&out).unwrap();
         for (page, _) in PAGES {
