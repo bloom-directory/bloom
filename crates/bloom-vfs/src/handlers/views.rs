@@ -7,7 +7,7 @@
 //! - `views/receive.html`     — receiving addresses grouped by wallet
 //! - `views/next-moves.html`  — staged operations awaiting your review
 //! - `views/activity.html`    — what completed, failed, or is still staged
-//! - `views/access.html`      — what each wallet is allowed to do
+//! - `views/policy.html`      — what each wallet is allowed to do
 //! - `views/bloom.css`        — the shared Bloom stylesheet (compiled in)
 //! - `views/AGENTS.md`        — how an agent should use these pages
 //!
@@ -48,7 +48,7 @@ const WALLETS_HTML: &str = "wallets.html";
 const RECEIVE_HTML: &str = "receive.html";
 const NEXT_MOVES_HTML: &str = "next-moves.html";
 const ACTIVITY_HTML: &str = "activity.html";
-const ACCESS_HTML: &str = "access.html";
+const POLICY_HTML: &str = "policy.html";
 const BLOOM_CSS_NAME: &str = "bloom.css";
 const AGENTS_MD_NAME: &str = "AGENTS.md";
 
@@ -63,7 +63,7 @@ const PAGES: &[(&str, &str)] = &[
     (NEXT_MOVES_HTML, "Next moves"),
     (ACTIVITY_HTML, "Activity"),
     (RECEIVE_HTML, "Receive"),
-    (ACCESS_HTML, "Access"),
+    (POLICY_HTML, "Policy"),
 ];
 
 /// The mount re-reads on every browser access (`actimeo=0`), so a short
@@ -99,6 +99,10 @@ pub struct ViewsHandler {
     prices: Arc<PricesClient>,
     outbox: Arc<OutboxHandler>,
     market: MarketData,
+    /// The `petals/` router, when one is mounted. Positions are read back
+    /// through its own trait so a page cannot drift from what `/petals`
+    /// reports, and absent it the section simply does not appear.
+    petals: Option<Arc<dyn Handler>>,
 }
 
 impl ViewsHandler {
@@ -115,7 +119,14 @@ impl ViewsHandler {
             prices: Arc::new(prices),
             outbox,
             market,
+            petals: None,
         }
+    }
+
+    /// Read Petal positions through the mounted `petals/` router.
+    pub fn with_petals(mut self, petals: Arc<dyn Handler>) -> Self {
+        self.petals = Some(petals);
+        self
     }
 }
 
@@ -180,7 +191,7 @@ impl ViewsHandler {
             RECEIVE_HTML => self.render_receive().await,
             NEXT_MOVES_HTML => self.render_next_moves().await,
             ACTIVITY_HTML => self.render_activity().await,
-            ACCESS_HTML => self.render_access().await,
+            POLICY_HTML => self.render_policy().await,
             _ => return Err(HandlerError::NotAFile(path.to_string_path())),
         };
         Ok(html.into_bytes())
@@ -393,6 +404,154 @@ impl ViewsHandler {
         }
         self.price(&mut portfolio).await;
         portfolio
+    }
+
+    /// One leaf out of the `petals/` subtree, absent when the Petal is not
+    /// onboarded or the leaf cannot be computed. Several Petal leaves are
+    /// derived rather than stored, and answer with an error until their
+    /// credentials exist; that is an absence, not a fault.
+    async fn petal_file(&self, path: &str) -> Option<String> {
+        let petals = self.petals.as_ref()?;
+        let parsed = VfsPath::parse(path).ok()?;
+        match Handler::read(petals.as_ref(), &parsed).await {
+            Ok(bytes) => String::from_utf8(bytes).ok(),
+            Err(error) => {
+                tracing::debug!(path, error = %error, "views.petal_read_unavailable");
+                None
+            }
+        }
+    }
+
+    async fn petal_list(&self, path: &str) -> Vec<String> {
+        let Some(petals) = self.petals.as_ref() else {
+            return Vec::new();
+        };
+        let Ok(parsed) = VfsPath::parse(path) else {
+            return Vec::new();
+        };
+        match Handler::list(petals.as_ref(), &parsed).await {
+            Ok(entries) => entries.into_iter().map(|entry| entry.name).collect(),
+            Err(error) => {
+                tracing::debug!(path, error = %error, "views.petal_list_unavailable");
+                Vec::new()
+            }
+        }
+    }
+
+    /// Value held inside an app rather than as a native balance. A balance
+    /// read cannot see any of this, so a wallet with funds in a Petal
+    /// otherwise reads as empty.
+    async fn petal_positions(&self, addresses: &[String]) -> Vec<PetalPosition> {
+        if self.petals.is_none() {
+            return Vec::new();
+        }
+        let mut positions = Vec::new();
+
+        // Venue account equity, per address the daemon knows about.
+        let mut seen: Vec<String> = Vec::new();
+        for address in addresses {
+            let lowered = address.to_ascii_lowercase();
+            if seen.contains(&lowered) {
+                continue;
+            }
+            seen.push(lowered.clone());
+            let path = format!("hyperliquid/mainnet/users/{lowered}/clearinghouse.json");
+            let Some(text) = self.petal_file(&path).await else {
+                continue;
+            };
+            let equity = serde_json::from_str::<serde_json::Value>(&text)
+                .ok()
+                .and_then(|value| {
+                    value
+                        .pointer("/marginSummary/accountValue")
+                        .and_then(|field| field.as_str())
+                        .and_then(|text| text.parse::<f64>().ok())
+                });
+            let Some(equity) = equity.filter(|equity| *equity > 0.0) else {
+                continue;
+            };
+            positions.push(PetalPosition {
+                petal: "hyperliquid".to_owned(),
+                label: "Trading account equity".to_owned(),
+                scope: short_hex(address),
+                quantity: format!("{} USDC", trim_trailing_zeros(&format!("{equity:.6}"))),
+                // The venue denominates equity in dollars itself, so this
+                // needs no quote of ours.
+                value: Some(equity),
+                source: format!("/petals/{path}"),
+                note: "Account equity as the venue reports it, including unrealised profit \
+                       and loss. Open position notional is not counted again."
+                    .to_owned(),
+            });
+        }
+
+        // Privacy-pool deposits that are confirmed and still unspent.
+        let ether = self.ether_price().await;
+        for wallet in self.petal_list("privacy-pools/notes").await {
+            let mut wei = 0.0_f64;
+            let mut notes = 0usize;
+            for note in self
+                .petal_list(&format!("privacy-pools/notes/{wallet}"))
+                .await
+            {
+                let path = format!("privacy-pools/notes/{wallet}/{note}");
+                let Some(text) = self.petal_file(&path).await else {
+                    continue;
+                };
+                let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+                    continue;
+                };
+                // A spent note is gone, and a pending one is not yours to
+                // count yet. Either would overstate the balance.
+                let spent = value
+                    .get("spent")
+                    .and_then(|field| field.as_bool())
+                    .unwrap_or(true);
+                let confirmed =
+                    value.get("status").and_then(|field| field.as_str()) == Some("confirmed");
+                if spent || !confirmed {
+                    continue;
+                }
+                let Some(amount) = value
+                    .get("value")
+                    .and_then(|field| field.as_str())
+                    .and_then(|text| text.parse::<f64>().ok())
+                else {
+                    continue;
+                };
+                wei += amount;
+                notes += 1;
+            }
+            if notes == 0 {
+                continue;
+            }
+            let ether_amount = wei / 1e18;
+            positions.push(PetalPosition {
+                petal: "privacy-pools".to_owned(),
+                label: count_noun(notes, "unspent deposit", "unspent deposits"),
+                scope: wallet.clone(),
+                quantity: format!(
+                    "{} ETH",
+                    trim_trailing_zeros(&format!("{ether_amount:.18}"))
+                ),
+                value: ether.map(|price| ether_amount * price),
+                source: format!("/petals/privacy-pools/notes/{wallet}/"),
+                note: "Confirmed deposits that have not been withdrawn. Spent and pending \
+                       notes are excluded."
+                    .to_owned(),
+            });
+        }
+        positions
+    }
+
+    /// A fresh ether quote, for Petal positions denominated in ether.
+    async fn ether_price(&self) -> Option<f64> {
+        let coin = CoinId::parse("coingecko:ethereum").ok()?;
+        let quote = tokio::time::timeout(PRICE_TIMEOUT, self.prices.current(coin))
+            .await
+            .ok()?
+            .ok()?;
+        fresh_quote(quote.timestamp, now_secs()).then_some(quote.price)
     }
 
     /// Value what can be valued. A native asset is priced only on a chain
@@ -776,7 +935,7 @@ impl ViewsHandler {
              <div class=\"metric\">{metric}</div>\
              <p>{support}</p></div>\
              <div class=\"hero-aside\"><h3>Coverage stays visible.</h3>\
-             <p>Native balances only: token and Petal positions are not read here yet. A \
+             <p>Native balances, plus value held inside Petals. Token balances are not read here yet. A \
              missing quote leaves a row unpriced rather than valuing it at zero, and a chain \
              whose native unit has no market of its own is never priced.</p></div></section>",
             metric = html_escape(&metric),
@@ -904,6 +1063,65 @@ impl ViewsHandler {
                     table = holdings_table(&rows, "Observed balances"),
                 ));
             }
+        }
+
+        // Value held inside an app is invisible to a balance read, so a
+        // wallet whose funds sit in a Petal otherwise reads as empty.
+        let mut petal_addresses: Vec<String> = portfolio
+            .wallets
+            .iter()
+            .filter_map(|wallet| wallet.address.clone())
+            .collect();
+        petal_addresses.extend(
+            history
+                .wallets
+                .iter()
+                .filter_map(|wallet| wallet.address.clone()),
+        );
+        let positions = self.petal_positions(&petal_addresses).await;
+        if !positions.is_empty() {
+            let cells: String = positions
+                .iter()
+                .map(|position| {
+                    format!(
+                        "<tr><td data-label=\"Position\"><span class=\"asset-label\">{mark}\
+                         <span><strong>{label}</strong><small>{quantity}</small></span></span>\
+                         </td>\
+                         <td data-label=\"Petal\">{petal}</td>\
+                         <td data-label=\"Scope\"><code>{scope}</code></td>\
+                         <td class=\"numeric money\" data-label=\"Observed value\">{value}</td>\
+                         <td data-label=\"Evidence\"><details><summary>Details</summary>\
+                         <p>{note}</p><p><code>{source}</code></p></details></td></tr>",
+                        mark = monogram(&position.petal),
+                        label = html_escape(&position.label),
+                        quantity = html_escape(&short_quantity_with_unit(&position.quantity)),
+                        petal = html_escape(&position.petal),
+                        scope = html_escape(&position.scope),
+                        value = html_escape(&money(position.value)),
+                        note = html_escape(&position.note),
+                        source = html_escape(&position.source),
+                    )
+                })
+                .collect();
+            let total: f64 = positions.iter().filter_map(|position| position.value).sum();
+            body.push_str(&format!(
+                "<div class=\"section-head\"><h2>Petal positions</h2>\
+                 <p>{count} · {total}</p></div>\
+                 <p class=\"lede\">Value held inside an app rather than as a native balance. \
+                 A balance read cannot see any of this, and these figures come from each \
+                 Petal's own records.</p>\
+                 <div class=\"table-wrap\"><table><caption>Positions reported by Petals\
+                 </caption><thead><tr><th scope=\"col\">Position</th>\
+                 <th scope=\"col\">Petal</th><th scope=\"col\">Scope</th>\
+                 <th scope=\"col\">Observed value</th><th scope=\"col\">Evidence</th></tr>\
+                 </thead><tbody>{cells}</tbody></table></div>",
+                count = count_noun(positions.len(), "position", "positions"),
+                total = html_escape(&if total > 0.0 {
+                    money(Some(total))
+                } else {
+                    "No priced value".to_owned()
+                }),
+            ));
         }
 
         page(
@@ -1375,7 +1593,7 @@ impl ViewsHandler {
     /// operation currently costs.
     async fn render_fees(&self) -> String {
         let mut body = String::new();
-        let mut panels = String::new();
+        let mut collected: Vec<(String, market_data::FeeSeries)> = Vec::new();
         for chain in self.sorted_chains() {
             let Some(client) = self.chains.get(&chain) else {
                 continue;
@@ -1387,65 +1605,101 @@ impl ViewsHandler {
             let Some(series) = self.market.fees(slug).await else {
                 continue;
             };
-            if series.points.is_empty() {
+            if series.points.is_empty() && series.total_all_time.is_none() {
                 continue;
             }
-            let latest = series.points.last().copied();
-            let week: Vec<(u64, f64)> = series.points.iter().rev().take(7).rev().copied().collect();
-            let label = self.network_label(&chain);
-            panels.push_str(&format!(
-                "<section class=\"chart-panel\"><div class=\"chart-heading\">\
-                 <div><p class=\"eyebrow\">Network fees paid per day</p><h3>{label}</h3></div>\
-                 <div class=\"chart-latest\"><strong>{latest}</strong><br>\
-                 <small>{when}</small></div></div>\
-                 <p class=\"eyebrow\">Last 30 completed days</p>{month}\
-                 <p class=\"eyebrow\">Last 7 completed days</p>{week}\
-                 <p class=\"chart-note\">Total fees paid by everyone using this chain. This \
-                 measures paid network usage, not your own transaction price.</p>\
-                 {method}</section>",
-                label = html_escape(&label),
-                latest = html_escape(
-                    &latest
-                        .map(|(_, v)| compact_usd(v))
-                        .unwrap_or("—".to_owned())
-                ),
-                when = html_escape(
-                    &latest
-                        .map(|(ts, _)| format_utc_day(ts * 1000))
-                        .unwrap_or_default()
-                ),
-                month = line_chart(
-                    &series.points,
-                    &format!("{label} daily network fees, 30 days"),
-                    "USD / day",
-                ),
-                week = line_chart(
-                    &week,
-                    &format!("{label} daily network fees, 7 days"),
-                    "USD / day",
-                ),
-                method = match &series.methodology {
-                    Some(text) => format!(
-                        "<details><summary>How these fees are measured</summary><p>{}</p>\
-                         <p>Provider daily totals. The current UTC day is excluded because it \
-                         is still accruing; gaps remain gaps.</p></details>",
-                        html_escape(text)
-                    ),
-                    None => String::new(),
-                },
-            ));
+            collected.push((self.network_label(&chain), series));
         }
+        // Ranked by the cumulative total, because that is the question worth
+        // asking: how much use has this chain been worth paying for at all.
+        collected.sort_by(|a, b| {
+            b.1.total_all_time
+                .partial_cmp(&a.1.total_all_time)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
 
-        if panels.is_empty() {
+        let total = |value: Option<f64>| match value {
+            Some(value) => compact_usd(value),
+            None => "Unavailable".to_owned(),
+        };
+
+        if collected.is_empty() {
             body.push_str(
-                "<section class=\"callout warn\"><strong>No fee history was returned</strong>\
-                 <p>The public provider returned no daily totals for the configured networks, \
-                 so none are drawn. Missing history is not drawn as zero.</p></section>",
+                "<section class=\"callout warn\"><strong>No fee totals were returned</strong>\
+                 <p>The public provider returned nothing for the configured networks, so none \
+                 are shown. Missing history is not reported as zero.</p></section>",
             );
         } else {
+            let rows: String = collected
+                .iter()
+                .map(|(label, series)| {
+                    format!(
+                        "<tr><td data-label=\"Network\">{label}</td>\
+                         <td class=\"numeric money\" data-label=\"All time\"><strong>{all}\
+                         </strong></td>\
+                         <td class=\"numeric money\" data-label=\"Past year\">{year}</td>\
+                         <td class=\"numeric money\" data-label=\"30 days\">{month}</td>\
+                         <td class=\"numeric money\" data-label=\"7 days\">{week}</td>\
+                         <td class=\"numeric money\" data-label=\"24 hours\">{day}</td></tr>",
+                        label = asset_label(label),
+                        all = html_escape(&total(series.total_all_time)),
+                        year = html_escape(&total(series.total_1y)),
+                        month = html_escape(&total(series.total_30d)),
+                        week = html_escape(&total(series.total_7d)),
+                        day = html_escape(&total(series.total_24h)),
+                    )
+                })
+                .collect();
             body.push_str(&format!(
-                "<div class=\"section-head\"><h2>Network fees over time</h2>\
-                 <p>Daily totals · USD · last completed UTC days</p></div>{panels}"
+                "<div class=\"section-head\"><h2>Total paid to use each network</h2>\
+                 <p>Cumulative fees · USD · most paid-for first</p></div>\
+                 <div class=\"table-wrap\"><table><caption>Cumulative network fees</caption>\
+                 <thead><tr><th scope=\"col\">Network</th><th scope=\"col\">All time</th>\
+                 <th scope=\"col\">Past year</th><th scope=\"col\">30 days</th>\
+                 <th scope=\"col\">7 days</th><th scope=\"col\">24 hours</th></tr></thead>\
+                 <tbody>{rows}</tbody></table></div>\
+                 <section class=\"callout\"><strong>This is what people paid, willingly, to \
+                 use a chain.</strong><p>Cumulative fees are the clearest measure of whether \
+                 a network has been worth using: every dollar here is someone choosing to pay \
+                 for a block of its capacity. It says nothing about what your own next \
+                 transaction will cost.</p></section>"
+            ));
+
+            let panels: String = collected
+                .iter()
+                .map(|(label, series)| {
+                    format!(
+                        "<section class=\"chart-panel\"><div class=\"chart-heading\">\
+                         <div><p class=\"eyebrow\">Paid to use this network, all time</p>\
+                         <h3>{label}</h3></div>\
+                         <div class=\"chart-latest\"><strong>{all}</strong><br>\
+                         <small>cumulative fees</small></div></div>\
+                         <p class=\"eyebrow\">Daily totals · last 30 completed days</p>{chart}\
+                         <p class=\"chart-note\">Total fees paid by everyone using this \
+                         network, not your own transaction price.</p>{method}</section>",
+                        label = html_escape(label),
+                        all = html_escape(&total(series.total_all_time)),
+                        chart = line_chart(
+                            &series.points,
+                            &format!("{label} daily network fees, 30 days"),
+                            "USD / day",
+                        ),
+                        method = match &series.methodology {
+                            Some(text) => format!(
+                                "<details><summary>How these fees are measured</summary>\
+                                 <p>{}</p><p>Provider totals. The current UTC day is excluded \
+                                 from the daily chart because it is still accruing; gaps \
+                                 remain gaps.</p></details>",
+                                html_escape(text)
+                            ),
+                            None => String::new(),
+                        },
+                    )
+                })
+                .collect();
+            body.push_str(&format!(
+                "<div class=\"section-head\"><h2>How that accumulated</h2>\
+                 <p>Daily totals behind each cumulative figure</p></div>{panels}"
             ));
         }
 
@@ -1466,7 +1720,7 @@ impl ViewsHandler {
         )
     }
 
-    async fn render_access(&self) -> String {
+    async fn render_policy(&self) -> String {
         let (wallets, unavailable) = self.wallet_projections().await;
         let chains = self.sorted_chains();
 
@@ -1558,13 +1812,33 @@ impl ViewsHandler {
         }
 
         page(
-            "Access",
-            "Your current access.",
+            "Policy",
+            "Your signed policy.",
             "What each wallet is allowed to do, read from its signed policy. Not a complete \
              inventory of external approvals.",
-            ACCESS_HTML,
+            POLICY_HTML,
             &body,
         )
+    }
+}
+
+/// A position a Petal reports, valued where the Petal's own units allow it.
+struct PetalPosition {
+    petal: String,
+    label: String,
+    scope: String,
+    quantity: String,
+    value: Option<f64>,
+    source: String,
+    note: String,
+}
+
+/// Shorten the numeric part of a `"<quantity> <UNIT>"` pair, leaving the unit
+/// alone. Eighteen decimals swamp a cell whether or not a symbol follows.
+fn short_quantity_with_unit(text: &str) -> String {
+    match text.split_once(' ') {
+        Some((quantity, unit)) => format!("{} {unit}", short_quantity(quantity)),
+        None => short_quantity(text),
     }
 }
 
@@ -2671,6 +2945,77 @@ mod tests {
         }
     }
 
+    /// A stand-in for the `petals/` router serving two Petals' leaves.
+    /// Positions are read through the `Handler` trait, so a stub proves the
+    /// reader and the rendering without standing up a Petal runtime.
+    struct StubPetals;
+
+    #[async_trait]
+    impl Handler for StubPetals {
+        async fn lookup(&self, _path: &VfsPath) -> Result<Entry, HandlerError> {
+            Ok(Entry::dir(""))
+        }
+
+        async fn read(&self, path: &VfsPath) -> Result<Vec<u8>, HandlerError> {
+            let text = path.to_string_path();
+            let body = if text.ends_with("clearinghouse.json") {
+                "{\"marginSummary\":{\"accountValue\":\"5.259383\"}}"
+            } else if text.ends_with("unspent.json") {
+                "{\"asset\":\"eth\",\"value\":\"9950000000000000\",\
+                 \"status\":\"confirmed\",\"spent\":false}"
+            } else if text.ends_with("spent.json") {
+                "{\"asset\":\"eth\",\"value\":\"9950000000000000\",\
+                 \"status\":\"confirmed\",\"spent\":true}"
+            } else {
+                return Err(HandlerError::not_found(text));
+            };
+            Ok(body.as_bytes().to_vec())
+        }
+
+        async fn list(&self, path: &VfsPath) -> Result<Vec<Entry>, HandlerError> {
+            let text = path.to_string_path();
+            // Deepest first: "notes/dev" also ends with "notes" prefixes.
+            let names: &[&str] = if text.ends_with("notes/dev") {
+                &["unspent.json", "spent.json"]
+            } else if text.ends_with("privacy-pools/notes") {
+                &["dev"]
+            } else {
+                return Err(HandlerError::not_found(text));
+            };
+            Ok(names.iter().map(|name| Entry::file(name)).collect())
+        }
+    }
+
+    #[tokio::test]
+    async fn petal_positions_reach_the_wallets_page() {
+        let fixture = fixture();
+        let handler = fixture.handler.clone().with_petals(Arc::new(StubPetals));
+        let html = render(&handler, WALLETS_HTML).await;
+        assert!(html.contains("Petal positions"), "{html}");
+        // The venue denominates equity in dollars itself, so it is priced
+        // even though no quote source is reachable in this fixture.
+        assert!(html.contains("Trading account equity"), "{html}");
+        assert!(html.contains("$5.26"), "{html}");
+        // One unspent deposit. A spent note is gone and must not be counted.
+        assert!(html.contains("1 unspent deposit"), "{html}");
+        assert!(html.contains("0.00995 ETH"), "{html}");
+        assert!(
+            !html.contains("2 unspent deposits"),
+            "a spent note must not be counted: {html}"
+        );
+    }
+
+    #[tokio::test]
+    async fn without_a_petals_mount_no_position_section_appears() {
+        // Absent the mount the section is simply not there, rather than an
+        // empty table implying there are no positions.
+        let html = render(&fixture().handler, WALLETS_HTML).await;
+        assert!(
+            !html.contains("Positions reported by Petals"),
+            "with no mount there is no position table: {html}"
+        );
+    }
+
     /// Stage an action the way the outbox stores one, so the pages read it
     /// through the outbox handler exactly as they would in production.
     fn stage(fixture: &Fixture, state: &str, id: &str, plan: &str) {
@@ -2970,10 +3315,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn access_reports_a_deny_all_policy_as_denied() {
+    async fn policy_reports_a_deny_all_policy_as_denied() {
         // The test projection carries an empty destination allow-set, which is
         // Broker's fail-closed state, not an absence of policy.
-        let html = render(&fixture().handler, ACCESS_HTML).await;
+        let html = render(&fixture().handler, POLICY_HTML).await;
         assert!(html.contains("every send is denied"), "{html}");
         assert!(html.contains("Broker enforces this, not this page"));
         assert!(html.contains("Policy version 1"), "{html}");
@@ -2988,7 +3333,7 @@ mod tests {
             "evm-0001",
             "# Staged tx\n\nChain:  ethereum (id 1)\n",
         );
-        for page in [WALLETS_HTML, ACCESS_HTML] {
+        for page in [WALLETS_HTML, POLICY_HTML] {
             let html = render(&fixture.handler, page).await;
             let cells = html.matches("<td").count();
             let labelled = html.matches("<td data-label=").count()

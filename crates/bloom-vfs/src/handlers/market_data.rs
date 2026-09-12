@@ -60,13 +60,22 @@ pub fn chain_slug(chain_id: u64) -> Option<&'static str> {
         .map(|(_, slug)| *slug)
 }
 
-/// Daily fees paid by everyone using a chain, newest last.
+/// Daily fees paid by everyone using a chain, newest last, beside the
+/// provider's own cumulative totals.
 #[derive(Clone, Debug, Default)]
 pub struct FeeSeries {
     /// `(unix seconds, USD for that UTC day)`, ascending, gaps preserved.
     pub points: Vec<(u64, f64)>,
     /// The provider's own description of what it counts.
     pub methodology: Option<String>,
+    /// Cumulative fees over each window the provider reports. All-time is the
+    /// total anyone has ever paid to use the chain, which is the measure of
+    /// how much use it has actually been worth paying for.
+    pub total_24h: Option<f64>,
+    pub total_7d: Option<f64>,
+    pub total_30d: Option<f64>,
+    pub total_1y: Option<f64>,
+    pub total_all_time: Option<f64>,
 }
 
 /// Reported DEX volume for a chain.
@@ -172,12 +181,18 @@ impl MarketData {
         if points.len() > FEE_DAYS {
             points.drain(..points.len() - FEE_DAYS);
         }
+        let total = |key: &str| body.get(key).and_then(|value| value.as_f64());
         let series = FeeSeries {
             points,
             methodology: body
                 .pointer("/methodology/Fees")
                 .and_then(|text| text.as_str())
                 .map(str::to_owned),
+            total_24h: total("total24h"),
+            total_7d: total("total7d"),
+            total_30d: total("total30d"),
+            total_1y: total("total1y"),
+            total_all_time: total("totalAllTime"),
         };
         self.store(key, Cached::Fees(series.clone()));
         Some(series)

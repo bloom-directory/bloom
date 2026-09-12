@@ -3635,6 +3635,16 @@ impl Daemon {
         // Cloned before the prices mount consumes the client.
         let views_prices = prices.clone();
 
+        // The petals router is shared: `/petals` serves it, and the views
+        // pages read Petal positions back through its own trait so a page
+        // cannot drift from what `/petals` reports.
+        let petals_handler: Arc<dyn bloom_vfs::handler::Handler> = Arc::new(
+            PetalRouter::new(petals.clone(), petal_app_host)
+                .with_audit(audit_arc.clone())
+                .with_runtime_petals(config.petals.runtime.clone())
+                .map_err(|e| DaemonError::Audit(format!("petals runtime configuration: {e}")))?,
+        );
+
         let mut vfs_builder = Vfs::builder()
             .mount(
                 "petal-key-requests",
@@ -3649,17 +3659,7 @@ impl Daemon {
                     broker.clone(),
                 )) as _,
             )
-            .mount(
-                "petals",
-                Arc::new(
-                    PetalRouter::new(petals.clone(), petal_app_host)
-                        .with_audit(audit_arc.clone())
-                        .with_runtime_petals(config.petals.runtime.clone())
-                        .map_err(|e| {
-                            DaemonError::Audit(format!("petals runtime configuration: {e}"))
-                        })?,
-                ) as _,
-            )
+            .mount("petals", petals_handler.clone())
             .mount(
                 "chains",
                 Arc::new(
@@ -3715,13 +3715,16 @@ impl Daemon {
             // projection and the chain registry, and no write surface.
             .mount(
                 "views",
-                Arc::new(ViewsHandler::new(
-                    wallet_projections.clone(),
-                    chains.clone(),
-                    views_prices,
-                    central_outbox_handler.clone(),
-                    bloom_vfs::handlers::MarketData::new(),
-                )) as _,
+                Arc::new(
+                    ViewsHandler::new(
+                        wallet_projections.clone(),
+                        chains.clone(),
+                        views_prices,
+                        central_outbox_handler.clone(),
+                        bloom_vfs::handlers::MarketData::new(),
+                    )
+                    .with_petals(petals_handler.clone()),
+                ) as _,
             )
             .mount("outbox", central_outbox_handler.clone() as _)
             .mount(

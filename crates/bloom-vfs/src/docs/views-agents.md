@@ -29,7 +29,7 @@ open /Volumes/bloom/views/index.html # macOS
   denial that explains why each will not proceed as staged.
 - `activity.html` — every operation Bloom staged, broadcast, or never sent,
   newest first, with the transaction hash where one exists.
-- `access.html` — where each wallet may send, from its signed policy.
+- `policy.html` — where each wallet may send, from its signed policy.
 
 ## What to tell a person
 
