@@ -407,7 +407,11 @@ impl ViewsHandler {
                 let tx_hash = result
                     .as_deref()
                     .and_then(|text| json_field(text, "tx_hash"))
-                    .or_else(|| status.as_deref().and_then(|text| json_field(text, "tx_hash")));
+                    .or_else(|| {
+                        status
+                            .as_deref()
+                            .and_then(|text| json_field(text, "tx_hash"))
+                    });
                 // A challenge file means the operation reached an approval
                 // ceremony. With no result beside it, it never got past one.
                 let awaited_approval = self
@@ -676,7 +680,10 @@ impl ViewsHandler {
                 if funded.len() == 1 {
                     "No price for the funded row below.".to_owned()
                 } else {
-                    format!("No price for any of the {} funded rows below.", funded.len())
+                    format!(
+                        "No price for any of the {} funded rows below.",
+                        funded.len()
+                    )
                 },
             )
         } else {
@@ -1537,7 +1544,10 @@ impl Action {
             }
         }
         row_fact("State", html_escape(self.state));
-        row_fact("Operation", format!("<code>{}</code>", html_escape(&self.id)));
+        row_fact(
+            "Operation",
+            format!("<code>{}</code>", html_escape(&self.id)),
+        );
         row_fact(
             "Record",
             format!(
@@ -2267,7 +2277,10 @@ mod tests {
         );
         assert!(html.contains("Broadcast by Bloom"), "{html}");
         // Counterparty and nonce come from the intent, not the plan title.
-        assert!(html.contains("0x6818809EefCe719E480a7526D76bD3e561526b46"), "{html}");
+        assert!(
+            html.contains("0x6818809EefCe719E480a7526D76bD3e561526b46"),
+            "{html}"
+        );
     }
 
     #[tokio::test]
