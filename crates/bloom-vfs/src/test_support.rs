@@ -6,6 +6,7 @@ use bloom_broker_api::{
     KeyPublic, KeyRef, KeySpec, ProtocolError, ProtocolErrorCode, SignedPolicySnapshot, Token,
     WalletPublic,
 };
+use bloom_machine_client::empty_wallet_accounts;
 use bloom_machine_client::{
     ProjectionFreshness, ProjectionVerification, WalletProjection, WalletProjectionReader,
 };
@@ -62,7 +63,7 @@ pub(crate) fn wallet_projection_reader(
         wallet: WalletPublic {
             wallet_id: wallet_id.clone(),
             wallet_kind: Token::new("passkey").unwrap(),
-            root_key_ref: key_ref.clone(),
+            root_key_ref: Some(key_ref.clone()),
             key_refs: vec![key_ref.clone()],
             policy_version: DecimalU64::new(1),
             policy_digest: policy_digest.clone(),
@@ -74,6 +75,7 @@ pub(crate) fn wallet_projection_reader(
             canonical_public_key: Base64UrlBytes::from_bytes(&[2; 33]),
             addresses: vec![address.to_owned()],
             supported_crypto_suites: vec![CryptoSuite::Secp256k1Keccak256Recoverable],
+            petal_scope_expires_at_ms: None,
         }],
         credentials: Vec::<CredentialPublic>::new(),
         policy: SignedPolicySnapshot {
@@ -85,6 +87,8 @@ pub(crate) fn wallet_projection_reader(
             policy_verifying_key: Base64UrlBytes::from_bytes(&[3; 32]),
             signer_signature: Base64UrlBytes::from_bytes(&[4; 64]),
         },
+        accounts: empty_wallet_accounts(bloom_broker_api::Token::new("static").unwrap()),
+        accounts_unavailable: None,
         source_protocol: "bloom.machine-broker.v1".into(),
         response_digest: Digest32::from_bytes([5; 32]),
         observed_at_ms: 1,

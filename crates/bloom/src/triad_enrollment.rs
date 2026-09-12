@@ -458,9 +458,26 @@ fn developer_route_operation_classes(
     classes
         .into_iter()
         .map(|operation_class| {
+            // Package route metadata does not declare fee assets. Keep this
+            // developer catalog explicit: these operations submit Solana
+            // transactions and their claims always include the native fee.
+            // Do not infer a fee from a signing suite or a class prefix.
+            let fee_asset = match operation_class.as_str() {
+                "pumpfun.create"
+                | "pumpfun.buy"
+                | "pumpfun.sell"
+                | "pumpfun.collect_fees"
+                | "pumpfun.sharing_config"
+                | "pumpfun.close_token_account"
+                | "pumpfun.sweep" => Some(bloom_broker_api::ProvenanceFeeAsset {
+                    chain: Token::new("solana")?,
+                    asset: "native".into(),
+                }),
+                _ => None,
+            };
             Ok(ProvenanceOperationClass {
                 operation_class: Token::new(operation_class)?,
-                fee_asset: None,
+                fee_asset,
             })
         })
         .collect()
@@ -1175,6 +1192,8 @@ struct OwnedInstallerIdentity {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "triad-dev-harness")]
+    use bloom_petals::package::PreparedPetalPackage;
     use ed25519_dalek::{Signature, Verifier as _, VerifyingKey};
     use std::os::unix::fs::PermissionsExt as _;
 
@@ -1245,6 +1264,40 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(classes, ["fixture.delegated", "fixture.immediate"]);
         assert!(!classes.contains(&"fixture.package_wide".to_string()));
+
+        // Developer enrollment must agree with the fee claims made by the
+        // compiled Pump.fun routes, including their reusable approval grants.
+        let mut route = route;
+        for operation in [
+            "pumpfun.create",
+            "pumpfun.buy",
+            "pumpfun.sell",
+            "pumpfun.collect_fees",
+            "pumpfun.sharing_config",
+            "pumpfun.close_token_account",
+            "pumpfun.sweep",
+        ] {
+            route.install_metadata.sign_intent = Some(operation.into());
+            route.key_derive_operation_classes = vec![operation.into(), "fixture.delegated".into()];
+            let classes = developer_route_operation_classes(&route).unwrap();
+            let fee = classes
+                .iter()
+                .find(|class| class.operation_class.as_str() == operation)
+                .unwrap()
+                .fee_asset
+                .as_ref()
+                .expect("Pump.fun submits a Solana network fee");
+            assert_eq!(fee.chain.as_str(), "solana");
+            assert_eq!(fee.asset, "native");
+            assert!(
+                classes
+                    .iter()
+                    .find(|class| class.operation_class.as_str() == "fixture.delegated")
+                    .unwrap()
+                    .fee_asset
+                    .is_none()
+            );
+        }
     }
 
     #[cfg(feature = "triad-dev-harness")]
@@ -1271,9 +1324,9 @@ mod tests {
             .and_then(Path::parent)
             .unwrap()
             .join("tests/fixtures/triad-authority-petal");
-        let package = PreparedPetalPackage::from_dir(&petal_dir).unwrap();
-
         enroll_developer_petal_provenance(&output, &petal_dir, owner).unwrap();
+        // Enrollment refreshes generated artifacts before signing them.
+        let package = PreparedPetalPackage::from_dir(&petal_dir).unwrap();
         let first: ProvenanceCatalog =
             serde_json::from_slice(&fs::read(output.join("provenance-catalog.json")).unwrap())
                 .unwrap();

@@ -20,14 +20,6 @@ fail() { printf '%s[%s]%s %s\n' "$RED"    "$LOG_PREFIX" "$RESET" "$*" >&2; exit 
 : "${PIDFILE:=/tmp/mount_demo.pid}"
 : "${LOGFILE:=/tmp/mount_demo.log}"
 
-# ---------- shared fixtures ----------
-# Anvil's deterministic accounts (cast wallet new --mnemonic 'test ...').
-# We pin the addresses + key so every fork-mode test reads from the same
-# wallet without each script re-deriving them.
-ANVIL_KEY=0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80
-DEST1=0xf39Fd6e51aad88F6F4ce6aB8827279cfFFb92266
-RECIPIENT=0x70997970C51812dc3A010C7d01b50e0d17dc79C8
-
 # ---------- home dir prep ----------
 prepare_home_dir() {
     local home_dir=$1
@@ -47,7 +39,7 @@ default_chain = "base"
 name = "base"
 chain_id = 8453
 rpc_urls = ["$rpc_url"]
-allow_broadcast = true
+allow_broadcast = false
 display_name = "$display_name"
 native_symbol = "ETH"
 native_decimals = 18
@@ -56,11 +48,16 @@ EOF
 }
 
 build_mount_demo() {
-    log "cargo build --release --features mount --example mount_demo"
+    # The demo constructs its daemon through the debug/test-gated convenience
+    # constructor; release builds expose it only under the unsigned-audit test
+    # seam, which is precisely what this disposable docker test lane is for.
+    # Production release packaging resolves features for package `bloom` and
+    # continues to reject this seam.
+    log "cargo build --release --features mount,unsigned-audit-test-seam --example mount_demo"
     cargo build \
         --release \
         --package bloom-daemon \
-        --features mount \
+        --features mount,unsigned-audit-test-seam \
         --example mount_demo >&2
 
     EXAMPLE_BIN=${CARGO_TARGET_DIR:-target}/release/examples/mount_demo
@@ -70,36 +67,14 @@ build_mount_demo() {
     [[ -x "$EXAMPLE_BIN" ]] || fail "could not find mount_demo binary"
 }
 
-top_up_anvil_balance() {
-    local rpc_url=$1 address=$2 wei_hex=${3:-0x8AC7230489E80000}
-
-    log "anvil_setBalance $address := 10 ETH"
-    curl -fsS -X POST -H 'content-type: application/json' \
-        --data '{"jsonrpc":"2.0","id":1,"method":"anvil_setBalance","params":["'"$address"'","'"$wei_hex"'"]}' \
-        "$rpc_url" \
-        | sed -n 's/.*"result":\([^,}]*\).*/  result=\1/p' >&2 \
-        || fail "anvil_setBalance failed (fork RPC unreachable?)"
-}
-
-# Spawn mount_demo. When `wallet` is empty the test-fixture env vars are
-# omitted entirely (mount_demo treats *unset* differently from *set to
-# empty* — an empty BLOOM_TEST_WALLET_NAME would otherwise trip the
-# unlock branch with a blank name).
+# Spawn the Machine-only mount demo. Custody fixtures belong to the real triad
+# acceptance suite; this helper deliberately has no secret-bearing inputs.
 start_mount_demo() {
     local mnt=$1 home_dir=$2 pidfile=$3 logfile=$4
-    local wallet=${5:-} import_key=${6:-} passphrase=${7:-}
 
     log "spawning mount_demo (mount=$mnt home=$home_dir)"
-    if [[ -n "$wallet" ]]; then
-        BLOOM_TEST_WALLET_NAME="$wallet" \
-        BLOOM_TEST_WALLET_KEY="$import_key" \
-        BLOOM_TEST_WALLET_PASSPHRASE="$passphrase" \
-        RUST_LOG="${RUST_LOG:-info}" \
-            "$EXAMPLE_BIN" "$mnt" "$home_dir" >"$logfile" 2>&1 &
-    else
-        RUST_LOG="${RUST_LOG:-info}" \
-            "$EXAMPLE_BIN" "$mnt" "$home_dir" >"$logfile" 2>&1 &
-    fi
+    RUST_LOG="${RUST_LOG:-info}" \
+        "$EXAMPLE_BIN" "$mnt" "$home_dir" >"$logfile" 2>&1 &
     echo $! > "$pidfile"
     DAEMON_PID=$(cat "$pidfile")
     log "  pid=$DAEMON_PID, logging to $logfile"
@@ -148,93 +123,6 @@ wait_for_mount() {
     fail "timed out waiting for mount sentinel"
 }
 
-pending_set() {
-    local outbox=$1
-    ls "$outbox/pending" 2>/dev/null | sort -u | tr '\n' '|' || true
-}
-
-pending_diff() {
-    local before=$1 after=$2
-    comm -13 \
-        <(printf '%s' "$before" | tr '|' '\n' | sort -u) \
-        <(printf '%s' "$after"  | tr '|' '\n' | sort -u) \
-        | grep -v '^$' || true
-}
-
-first_new_pending_stage() {
-    pending_diff "$1" "$2" | head -n1 || true
-}
-
-wait_for_new_pending_stages() {
-    local outbox=$1 before=$2 budget=${3:-300}
-    local after stages
-
-    for i in $(seq 1 "$budget"); do
-        after=$(pending_set "$outbox")
-        stages=$(pending_diff "$before" "$after")
-        if [[ -n "$stages" ]]; then
-            log "  stage appeared after ${i}s"
-            printf '%s\n' "$stages"
-            return 0
-        fi
-        if [[ -n "${DAEMON_PID:-}" ]] && ! kill -0 "$DAEMON_PID" 2>/dev/null; then
-            fail "mount_demo died while waiting for stage"
-        fi
-        sleep 1
-    done
-    return 1
-}
-
-# Confirm a single staged tx and echo the resulting tx hash. Caller
-# decides whether to wait for a receipt afterwards (see wait_receipt_status).
-confirm_stage_and_get_hash() {
-    local outbox=$1 stage=$2
-    echo y > "$outbox/pending/$stage/confirm"
-    cat "$outbox/sent/$stage/tx_hash" 2>/dev/null | tr -d '\n' || true
-}
-
-# Poll a tx receipt without failing on miss. Returns 0 on success, 1 on
-# revert or timeout. wait_tx_success below stays for the strict-success
-# call sites; this variant is for the unwind path that needs to keep
-# going on transient flakes.
-wait_receipt_status() {
-    local chain=$1 hash=$2 budget=${3:-90}
-    local s
-    for _ in $(seq 1 "$budget"); do
-        s=$(cat "$MNT/chains/$chain/tx/$hash/status" 2>/dev/null | tr -d '\n' || true)
-        case "$s" in
-            success)  return 0 ;;
-            reverted) warn "tx $hash reverted"; return 1 ;;
-        esac
-        sleep 1
-    done
-    warn "tx $hash did not confirm within ${budget}s"
-    return 1
-}
-
-wait_tx_success() {
-    local mnt=$1 chain=$2 hash=$3 budget=${4:-60} label=${5:-tx}
-    local status=
-
-    log "polling /chains/$chain/tx/$hash/status (${budget}s budget)"
-    for i in $(seq 1 "$budget"); do
-        status=$(cat "$mnt/chains/$chain/tx/$hash/status" 2>/dev/null | tr -d '\n' || true)
-        case "$status" in
-            success)
-                log "  status=success after ${i}s"
-                return 0
-                ;;
-            reverted)
-                fail "$label reverted on-chain (hash=$hash)"
-                ;;
-            *)
-                sleep 1
-                ;;
-        esac
-    done
-    fail "$label did not confirm within ${budget}s (last status='$status')"
-}
-
 assert_json_file_starts_with() {
     local path=$1 expect=$2 label=${3:-$path}
 
@@ -245,47 +133,11 @@ assert_json_file_starts_with() {
         || fail "$label does not start with '$expect' (got '$head1') at $path"
 }
 
-assert_tx_receipt_paths() {
-    local tx_dir=$1
-
-    echo '::group::tx receipt paths' >&2
-
-    BLOCK_NUMBER=$(cat "$tx_dir/block_number" 2>/dev/null | tr -d '\n' || true)
-    [[ -n "$BLOCK_NUMBER" && "$BLOCK_NUMBER" =~ ^[0-9]+$ ]] \
-        || fail "block_number empty or non-numeric ('$BLOCK_NUMBER') at $tx_dir/block_number"
-    log "  block_number: $BLOCK_NUMBER"
-
-    GAS_USED=$(cat "$tx_dir/gas_used" 2>/dev/null | tr -d '\n' || true)
-    [[ -n "$GAS_USED" && "$GAS_USED" =~ ^[0-9]+$ ]] \
-        || fail "gas_used empty or non-numeric ('$GAS_USED') at $tx_dir/gas_used"
-    log "  gas_used: $GAS_USED"
-
-    local spec f expect path sz
-    for spec in 'receipt.json:{' 'logs.json:[' 'full.json:{'; do
-        f="${spec%:*}"
-        expect="${spec##*:}"
-        path="$tx_dir/$f"
-        assert_json_file_starts_with "$path" "$expect" "$f"
-        sz=$(wc -c <"$path" | tr -d ' ')
-        log "  $f: ok (${sz}B)"
-    done
-    echo '::endgroup::' >&2
-}
-
 read_chain_head_breadcrumb() {
     local mnt=$1 chain=$2
 
     echo '::group::chain head' >&2
     HEAD_NUMBER=$(cat "$mnt/chains/$chain/head/number" | tr -d '\n')
     log "chain head: block $HEAD_NUMBER"
-    echo '::endgroup::' >&2
-}
-
-read_wallet_balance_breadcrumb() {
-    local mnt=$1 chain=$2 wallet=$3 address=$4
-
-    echo '::group::wallet native balance' >&2
-    BAL_NATIVE=$(cat "$mnt/chains/$chain/addresses/$address/balance" | tr -d '\n')
-    log "$wallet ($address) native balance: $BAL_NATIVE"
     echo '::endgroup::' >&2
 }

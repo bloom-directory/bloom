@@ -166,6 +166,16 @@ When a Petal calls the typed key-derivation host API:
 7. Machine persists only the public `KeyRef`, public-key metadata, scope, and
    ceremony state. The private key remains in Signer.
 
+A guest may also send `approval_value_limits` in its canonical key-request
+JSON through the SDK's `request_key` primitive. Each entry is a Broker
+`ValueLimit` (`asset: {chain, asset}`, decimal-string `lifetime`, and
+`rolling_windows`). Machine persists this list beside the key scope and seals
+it into the separate reusable approval ceremony. An exact key-slot retry must
+carry the same list; changing a budget requires a new slot. Omission retains
+the previous empty allowance: no declared debit or fee asset is authorized.
+These budgets do not widen the Signer custody scope. Pump.fun uses them for
+explicit cumulative native and per-mint debit ceilings.
+
 The stable `PetalKeyScope` digest deliberately excludes the current package hash
 and requesting route. This is the correct beginning of a version-stable key
 identity. The exact derivation request digest still includes them.
@@ -557,6 +567,30 @@ must not replace exact runtime enforcement.
 Side-by-side active versions are also out of scope for the first implementation.
 They require explicit multi-member admission semantics and substantially expand
 the attack surface. The safe default is one active package per lineage.
+
+## Sessions, stop, and the install guard
+
+Every key a Petal derives through a numbered account is mounted at
+`wallets/<wallet>/<n>/sessions/<petal>/<key-slot>/session.json` with a sibling
+`stop` write. The document reports the delegating owner, the delegated key,
+the scope, the recorded approvals, and a truthful `signing_authority`
+(`pending`, `active`, `stopped`, `expired`, or `package_replaced`). Writing
+`stop` journals `sealed_approval.revoke_for_key` under a deterministic
+operation id and succeeds only once every reported approval is terminal;
+partial revocations persist with `complete: false`, leave the authority
+unchanged, and name the stragglers, and a retry is idempotent. After a stop or
+expiry, Exact-selector signing for the scope's remaining operation classes may
+still be available (`eligible_exact_routes` names those routes); reusable
+authority is gone.
+
+Because a session's scope binds the exact package hash, replacing an
+installed package while one of its sessions is still active would strand it:
+its routes and keys no longer match any installed code. The install command
+therefore refuses such a replacement, naming each affected
+`wallets/<w>/<n>/sessions/<petal>/<slot>` path, unless the owner explicitly
+installs with `--force`. A forced replacement (or an uninstall) leaves the
+sessions readable — their authority reads `package_replaced`, stop still
+works, and reinstalling the exact scoped hash restores them to `active`.
 
 ## Implementation anchors for current behavior
 

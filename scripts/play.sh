@@ -2,14 +2,18 @@
 # scripts/play.sh — interactive bloom playground.
 #
 # Brings up a containerized anvil and drops the user into a subshell
-# wired up to a fresh bloom home with two chains:
-#   - anvil (chain_id 31337, broadcast enabled, points at the docker anvil)
+# wired up to a fresh, read-only bloom home with two chains:
+#   - anvil (chain_id 31337, read-only, points at the docker anvil)
 #   - base  (chain_id 8453, broadcast disabled — read-only mainnet)
 #
 # The play home defaults to ~/.bloom-play. Set BLOOM_PLAY_HOME to
 # override. Each invocation wipes and recreates the home so previous
 # stages don't leak in (set BLOOM_PLAY_PERSIST=1 to keep the existing
 # home).
+#
+# Wallet registration, import, and signing intentionally remain in the
+# Broker/Signer browser ceremony; this Machine-only playground never accepts
+# raw keys or wallet-secret inputs.
 #
 # Cleanup: on exit, the local daemon and the anvil container are both
 # stopped. Docker volumes/images are not removed.
@@ -68,8 +72,7 @@ fi
 mkdir -p "$PLAY_HOME"
 "$BLOOM_BIN" --home "$PLAY_HOME" init >/dev/null 2>&1 || true
 
-# Overwrite config.toml with the playground topology. Per-chain
-# allow_broadcast enables anvil broadcasts and disables base broadcasts.
+# Overwrite config.toml with a custody-free, read-only playground topology.
 cat > "$PLAY_HOME/config.toml" <<'EOF'
 stage_ttl = "30m"
 default_chain = "anvil"
@@ -78,7 +81,7 @@ default_chain = "anvil"
 name = "anvil"
 chain_id = 31337
 rpc_urls = ["http://127.0.0.1:8545"]
-allow_broadcast = true
+allow_broadcast = false
 display_name = "Anvil (local docker)"
 native_symbol = "ETH"
 native_decimals = 18
@@ -94,25 +97,6 @@ native_symbol = "ETH"
 native_decimals = 18
 legacy_tx = false
 EOF
-
-# Import anvil's deterministic accounts as alice/bob/carol so the user
-# has spendable test ETH on chain anvil. Skip if the wallet already
-# exists (BLOOM_PLAY_PERSIST=1 case).
-import_if_missing() {
-    local name=$1
-    local key=$2
-    if "$BLOOM_BIN" --home "$PLAY_HOME" wallet list 2>/dev/null \
-        | awk '{print $1}' | grep -qx "$name"; then
-        return 0
-    fi
-    BLOOM_PASSPHRASE=play "$BLOOM_BIN" --home "$PLAY_HOME" wallet import \
-        "$name" "$key" --passphrase play >/dev/null
-}
-
-log "importing anvil keys (passphrase: play)"
-import_if_missing alice "$ANVIL_KEY_0"
-import_if_missing bob   "$ANVIL_KEY_1"
-import_if_missing carol "$ANVIL_KEY_2"
 
 # Start the daemon. We use `serve` so VFS reads/writes from the play
 # subshell hit the same in-memory state.
@@ -163,9 +147,9 @@ cat <<EOF
 │  bloom playground                                            │
 │                                                                  │
 │  Home:    $PLAY_HOME
-│  Anvil:   http://127.0.0.1:8545  (chain_id 31337, broadcasts ok) │
+│  Anvil:   http://127.0.0.1:8545  (chain_id 31337, read-only)     │
 │  Base:    mainnet RPC            (chain_id 8453, read-only)      │
-│  Wallets: alice / bob / carol    (passphrase: play)              │
+│  Wallets: register/import through the triad browser ceremony     │
 │                                                                  │
 │  Try:                                                            │
 │    bloom status                                                   │
@@ -174,9 +158,6 @@ cat <<EOF
 │    bloom vfs cat /chains/anvil/head/number                        │
 │    bloom vfs cat /chains/base/head/number                         │
 │    bloom wallet list                                              │
-│    bloom wallet stage alice anvil --intent \\                     │
-│      '{"to":"0x70997970C51812dc3A010C7d01b50e0d17dc79C8",        │
-│        "value":"1 ETH","chain":"anvil"}'                         │
 │                                                                  │
 │  Type 'exit' to leave (anvil + daemon will stop).                │
 └──────────────────────────────────────────────────────────────────┘

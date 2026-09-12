@@ -80,7 +80,7 @@ mod tests {
             wallet: WalletPublic {
                 wallet_id: wallet_id.clone(),
                 wallet_kind: Token::new("passkey").unwrap(),
-                root_key_ref: root_key_ref.clone(),
+                root_key_ref: Some(root_key_ref.clone()),
                 key_refs: vec![root_key_ref.clone()],
                 policy_version: DecimalU64::new(1),
                 policy_digest: Digest32::from_bytes(sha2::Sha256::digest(&canonical).into()),
@@ -92,6 +92,7 @@ mod tests {
                 canonical_public_key: Base64UrlBytes::from_bytes(&[2; 33]),
                 addresses: vec!["0x0000000000000000000000000000000000000001".into()],
                 supported_crypto_suites: vec![CryptoSuite::Secp256k1Keccak256Recoverable],
+                petal_scope_expires_at_ms: None,
             }],
             credentials: Vec::new(),
             policy: SignedPolicySnapshot {
@@ -103,6 +104,10 @@ mod tests {
                 policy_verifying_key: Base64UrlBytes::from_bytes(&[1; 32]),
                 signer_signature: Base64UrlBytes::from_bytes(&[2; 64]),
             },
+            accounts: bloom_machine_client::empty_wallet_accounts(
+                bloom_broker_api::Token::new("planning").unwrap(),
+            ),
+            accounts_unavailable: None,
             source_protocol: "bloom.machine-broker.v1".into(),
             response_digest: Digest32::from_bytes([3; 32]),
             observed_at_ms: 1,

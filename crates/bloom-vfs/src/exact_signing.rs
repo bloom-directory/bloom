@@ -1,5 +1,6 @@
 //! Durable Machine orchestration for the existing exact Broker signing flow.
 
+use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io::Write as _;
 use std::path::Path;
@@ -7,8 +8,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use bloom_broker_api::{
-    CryptoSuite, DecimalU64, Digest32, OperationId, PetalUseClaim, ProtocolErrorCode,
-    ProvenanceCatalog, ProvenanceSubject, RequestNonce, Token,
+    AssetId, CryptoSuite, DecimalU64, DecimalU256, DeclaredFee, Digest32, OperationId,
+    PetalUseClaim, ProtocolErrorCode, ProvenanceCatalog, ProvenanceSubject, RequestNonce, Token,
+    ValueLimit,
 };
 use bloom_machine_client::{
     ExactPayloadBatchSignRequest, ExactPayloadSignOutcome, ExactPayloadSignRequest,
@@ -23,10 +25,53 @@ const STATE_SCHEMA: &str = "bloom.machine_exact_signing.v1";
 const APPROVAL_TTL_MS: u64 = 5 * 60 * 1000;
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+fn exact_claim_value_limits(claim: &PetalUseClaim) -> Result<Vec<ValueLimit>, String> {
+    let mut totals = BTreeMap::<(String, String), alloy::primitives::U256>::new();
+    let mut add = |chain: &Token, asset: &str, amount: &DecimalU256| -> Result<(), String> {
+        let value = amount
+            .as_str()
+            .parse::<alloy::primitives::U256>()
+            .map_err(|error| format!("parse exact claim value: {error}"))?;
+        let total = totals
+            .entry((chain.as_str().to_owned(), asset.to_owned()))
+            .or_default();
+        *total = total
+            .checked_add(value)
+            .ok_or_else(|| "exact claim value total exceeds uint256".to_owned())?;
+        Ok(())
+    };
+    for debit in &claim.declared_debits {
+        add(&debit.asset.chain, &debit.asset.asset, &debit.amount)?;
+    }
+    if let DeclaredFee::Fee {
+        chain,
+        asset,
+        amount,
+    } = &claim.declared_fee
+    {
+        add(chain, asset, amount)?;
+    }
+    totals
+        .into_iter()
+        .map(|((chain, asset), lifetime)| {
+            Ok(ValueLimit {
+                asset: AssetId {
+                    chain: Token::new(chain).map_err(|error| error.to_string())?,
+                    asset,
+                },
+                lifetime: DecimalU256::parse(lifetime.to_string())
+                    .map_err(|error| error.to_string())?,
+                rolling_windows: Vec::new(),
+            })
+        })
+        .collect()
+}
+
 #[derive(Clone)]
 pub struct BrokerExactPayloadSigner {
     broker: MachineBrokerClient,
     provenance_catalog: ProvenanceCatalog,
+    account_key_ref: Option<bloom_broker_api::KeyRef>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,6 +100,8 @@ struct ExactSigningState {
     schema: String,
     action_id: String,
     wallet_id: Token,
+    #[serde(default)]
+    account_key_ref: Option<bloom_broker_api::KeyRef>,
     operation_class: Token,
     crypto_suite: CryptoSuite,
     payload_digest: Digest32,
@@ -75,6 +122,8 @@ struct ExactBatchSigningState {
     schema: String,
     action_id: String,
     wallet_id: Token,
+    #[serde(default)]
+    account_key_ref: Option<bloom_broker_api::KeyRef>,
     operation_class: Token,
     crypto_suite: CryptoSuite,
     payload_digests: Vec<Digest32>,
@@ -95,6 +144,8 @@ struct ReusablePetalBatchSigningState {
     schema: String,
     action_id: String,
     wallet_id: Token,
+    #[serde(default)]
+    account_key_ref: Option<bloom_broker_api::KeyRef>,
     operation_class: Token,
     crypto_suite: CryptoSuite,
     signature_count: u64,
@@ -113,7 +164,13 @@ impl BrokerExactPayloadSigner {
         Self {
             broker,
             provenance_catalog,
+            account_key_ref: None,
         }
+    }
+
+    pub fn with_account_key(mut self, key: Option<bloom_broker_api::KeyRef>) -> Self {
+        self.account_key_ref = key;
+        self
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -271,6 +328,7 @@ impl BrokerExactPayloadSigner {
                     schema: STATE_SCHEMA.into(),
                     action_id: action_id.to_owned(),
                     wallet_id: wallet_id.clone(),
+                    account_key_ref: self.account_key_ref.clone(),
                     operation_class: operation_class_token.clone(),
                     crypto_suite,
                     payload_digest: payload_digest.clone(),
@@ -290,6 +348,7 @@ impl BrokerExactPayloadSigner {
         if state.schema != STATE_SCHEMA
             || state.action_id != action_id
             || state.wallet_id != wallet_id
+            || state.account_key_ref != self.account_key_ref
             || state.operation_class != operation_class_token
             || state.crypto_suite != crypto_suite
             || state.payload_digest != payload_digest
@@ -309,6 +368,10 @@ impl BrokerExactPayloadSigner {
             state.approval_id = None;
         }
         write_state(state_path, &state)?;
+        let approval_value_limits = petal_claim
+            .map(|(claim, _)| exact_claim_value_limits(claim))
+            .transpose()?
+            .unwrap_or_default();
         let mut request = ExactPayloadSignRequest {
             wallet_id,
             preimage: preimage.to_vec(),
@@ -324,9 +387,12 @@ impl BrokerExactPayloadSigner {
             expires_at_ms: state.expires_at_ms.clone(),
             canonical_plan_facts_digest,
             approval_id: state.approval_id.clone(),
+            account_key_ref: self.account_key_ref.clone(),
             petal_use_claim: petal_claim.map(|(claim, _)| claim.clone()),
+            system_use_claim: None,
             claim_assurance_evidence: petal_claim
                 .and_then(|(_, evidence)| evidence.map(<[u8]>::to_vec)),
+            approval_value_limits,
         };
         let mut response = self.broker.sign_exact_payload(request.clone()).await;
         if response
@@ -529,6 +595,7 @@ impl BrokerExactPayloadSigner {
                     schema: STATE_SCHEMA.into(),
                     action_id: action_id.to_owned(),
                     wallet_id: wallet_id.clone(),
+                    account_key_ref: self.account_key_ref.clone(),
                     operation_class: operation_class_token.clone(),
                     crypto_suite,
                     signature_count,
@@ -547,6 +614,7 @@ impl BrokerExactPayloadSigner {
         if state.schema != STATE_SCHEMA
             || state.action_id != action_id
             || state.wallet_id != wallet_id
+            || state.account_key_ref != self.account_key_ref
             || state.operation_class != operation_class_token
             || state.crypto_suite != crypto_suite
             || state.signature_count != signature_count
@@ -582,6 +650,7 @@ impl BrokerExactPayloadSigner {
             expires_at_ms: state.expires_at_ms.clone(),
             canonical_plan_facts_digest,
             approval_id: state.approval_id.clone(),
+            account_key_ref: self.account_key_ref.clone(),
             petal_use_claim: Some(claim.clone()),
             claim_assurance_evidence: claim_assurance_evidence.map(<[u8]>::to_vec),
         };
@@ -663,6 +732,7 @@ impl BrokerExactPayloadSigner {
                     schema: STATE_SCHEMA.into(),
                     action_id: action_id.to_owned(),
                     wallet_id: wallet_id.clone(),
+                    account_key_ref: self.account_key_ref.clone(),
                     operation_class: operation_class_token.clone(),
                     crypto_suite,
                     payload_digests: payload_digests.clone(),
@@ -682,6 +752,7 @@ impl BrokerExactPayloadSigner {
         if state.schema != STATE_SCHEMA
             || state.action_id != action_id
             || state.wallet_id != wallet_id
+            || state.account_key_ref != self.account_key_ref
             || state.operation_class != operation_class_token
             || state.crypto_suite != crypto_suite
             || state.payload_digests != payload_digests
@@ -718,6 +789,7 @@ impl BrokerExactPayloadSigner {
             expires_at_ms: state.expires_at_ms.clone(),
             canonical_plan_facts_digest,
             approval_id: state.approval_id.clone(),
+            account_key_ref: self.account_key_ref.clone(),
             petal_use_claim: Some(claim.clone()),
             claim_assurance_evidence: claim_assurance_evidence.map(<[u8]>::to_vec),
         };
@@ -860,7 +932,7 @@ mod tests {
                         Ok(MachineBrokerResponse::WalletGetPublic(WalletPublic {
                             wallet_id: token("wallet"),
                             wallet_kind: token("local"),
-                            root_key_ref: test_key_ref(),
+                            root_key_ref: Some(test_key_ref()),
                             key_refs: vec![test_key_ref()],
                             policy_version: DecimalU64::new(1),
                             policy_digest: digest(4),
@@ -878,6 +950,7 @@ mod tests {
                                 CryptoSuite::Secp256k1Keccak256Recoverable,
                                 CryptoSuite::Secp256k1Sha256Recoverable,
                             ],
+                            petal_scope_expires_at_ms: None,
                         }))
                     }
                     MachineBrokerRequest::SealedApprovalPrepare(request) => {
@@ -899,6 +972,18 @@ mod tests {
                             ));
                         }
                         Ok(MachineBrokerResponse::SigningSign(SigningResult {
+                            operation_id: request.operation_id,
+                            operation_digest: request.operation_digest,
+                            signatures: vec![NormalizedSignature {
+                                crypto_suite: request.crypto_suite,
+                                bytes: Base64UrlBytes::from_bytes(&[7_u8; 65]),
+                            }],
+                            signer_receipt_digest: digest(9),
+                            broker_receipt_digest: digest(10),
+                        }))
+                    }
+                    MachineBrokerRequest::SigningSignBatch(request) => {
+                        Ok(MachineBrokerResponse::SigningSignBatch(SigningResult {
                             operation_id: request.operation_id,
                             operation_digest: request.operation_digest,
                             signatures: vec![NormalizedSignature {
@@ -1068,7 +1153,22 @@ mod tests {
             crypto_suite: CryptoSuite::Secp256k1Sha256Recoverable,
             payload_digest: claim_payload_digest,
             ordered_hashes: vec![ordered_hash.clone()],
-            declared_debits: Vec::new(),
+            declared_debits: vec![
+                bloom_broker_api::DeclaredDebit {
+                    asset: AssetId {
+                        chain: token("hyperliquid"),
+                        asset: "usdc".into(),
+                    },
+                    amount: DecimalU256::parse("7").unwrap(),
+                },
+                bloom_broker_api::DeclaredDebit {
+                    asset: AssetId {
+                        chain: token("hyperliquid"),
+                        asset: "usdc".into(),
+                    },
+                    amount: DecimalU256::parse("5").unwrap(),
+                },
+            ],
             declared_destinations: Vec::new(),
             declared_fee: bloom_broker_api::DeclaredFee::None,
             nonce: RequestNonce::from_bytes([21; 16]),
@@ -1113,6 +1213,81 @@ mod tests {
             .unwrap();
         assert_eq!(second, ExactPayloadOutcome::Signed(vec![7; 65]));
 
+        let mut other_key = test_key_ref();
+        // Even the same fingerprint with a different locator is a different
+        // selected key: persist and compare the entire KeyRef.
+        other_key.locator = "wallet/account/1".into();
+        let other_signer = signer.clone().with_account_key(Some(other_key));
+        let before = broker.requests.lock().unwrap().len();
+        let error = other_signer
+            .sign_or_prepare_petal(
+                &state,
+                "petal-action",
+                "wallet",
+                "order.place",
+                payload,
+                claim.ordered_hashes[0].clone(),
+                CryptoSuite::Secp256k1Sha256Recoverable,
+                &serde_json::json!({"asset": "BTC"}),
+                &subject,
+                &claim,
+                Some(b"assurance"),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.contains("persisted"), "{error}");
+        assert_eq!(broker.requests.lock().unwrap().len(), before);
+
+        for reusable in [false, true] {
+            let batch_state = temporary.path().join(format!("batch-{reusable}.json"));
+            let payloads = vec![payload.to_vec()];
+            let facts = serde_json::json!({"asset": "BTC"});
+            for (selected, should_reject) in
+                [(&signer, false), (&other_signer, true), (&signer, false)]
+            {
+                let before = broker.requests.lock().unwrap().len();
+                let outcome = if reusable {
+                    selected
+                        .sign_or_prepare_reusable_petal_batch(
+                            &batch_state,
+                            "batch",
+                            "wallet",
+                            "order.place",
+                            &payloads,
+                            &claim.ordered_hashes,
+                            claim.crypto_suite,
+                            &facts,
+                            &subject,
+                            &claim,
+                            Some(b"assurance"),
+                        )
+                        .await
+                } else {
+                    selected
+                        .sign_or_prepare_petal_batch(
+                            &batch_state,
+                            "batch",
+                            "wallet",
+                            "order.place",
+                            &payloads,
+                            &claim.ordered_hashes,
+                            claim.crypto_suite,
+                            &facts,
+                            &subject,
+                            &claim,
+                            Some(b"assurance"),
+                        )
+                        .await
+                };
+                if should_reject {
+                    assert!(outcome.unwrap_err().contains("persisted"));
+                    assert_eq!(broker.requests.lock().unwrap().len(), before);
+                } else {
+                    outcome.unwrap();
+                }
+            }
+        }
+
         let requests = broker.requests.lock().unwrap();
         let MachineBrokerRequest::SealedApprovalPrepare(prepared) = &requests[2] else {
             panic!("first exact attempt must prepare approval");
@@ -1120,6 +1295,18 @@ mod tests {
         assert_eq!(
             prepared.terms.allowed_crypto_suites,
             [CryptoSuite::Secp256k1Sha256Recoverable]
+        );
+        assert_eq!(prepared.terms.limits.value_limits.len(), 1);
+        assert_eq!(
+            prepared.terms.limits.value_limits[0].asset,
+            AssetId {
+                chain: token("hyperliquid"),
+                asset: "usdc".into(),
+            }
+        );
+        assert_eq!(
+            prepared.terms.limits.value_limits[0].lifetime.as_str(),
+            "12"
         );
         let MachineBrokerRequest::SigningSign(signed) = &requests[5] else {
             panic!("approved retry must sign");

@@ -177,6 +177,40 @@ pub struct PetalRouteContext {
     pub actor: Option<String>,
 }
 
+/// Host-trusted account identity extracted from a route context's
+/// `bloom.*` parameters. Only the host writes those parameters; guests
+/// cannot mint them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrustedAccountContext {
+    pub wallet: String,
+    pub number: u32,
+    pub owner_key_fingerprint: Option<String>,
+}
+
+impl PetalRouteContext {
+    /// Extract the trusted account identity from the host-injected
+    /// `bloom.wallet`, `bloom.account` and `bloom.owner_key_fingerprint`
+    /// parameters, if this dispatch carried them.
+    pub fn trusted_account(&self) -> Option<TrustedAccountContext> {
+        let mut wallet = None;
+        let mut number = None;
+        let mut owner_key_fingerprint = None;
+        for (name, value) in &self.params {
+            match name.as_str() {
+                "bloom.wallet" => wallet = Some(value.clone()),
+                "bloom.account" => number = value.parse().ok(),
+                "bloom.owner_key_fingerprint" => owner_key_fingerprint = Some(value.clone()),
+                _ => {}
+            }
+        }
+        Some(TrustedAccountContext {
+            wallet: wallet?,
+            number: number?,
+            owner_key_fingerprint,
+        })
+    }
+}
+
 /// Guest-supplied, provenance-free request for a Signer-owned Petal sub-key.
 ///
 /// The component ABI carries this as JSON bytes so the interface can evolve
@@ -193,6 +227,10 @@ pub struct PetalKeyGuestRequest {
     pub allowed_operation_classes: Vec<String>,
     pub allowed_crypto_suites: Vec<String>,
     pub maximum_lifetime_ms: u64,
+    /// Asset budgets sealed by the separate reusable-approval ceremony.
+    /// Omission preserves the existing fee-free, no-debit grant.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub approval_value_limits: Vec<bloom_broker_api::ValueLimit>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -203,6 +241,7 @@ pub struct PetalKeyRequest {
     pub allowed_operation_classes: Vec<String>,
     pub allowed_crypto_suites: Vec<String>,
     pub maximum_lifetime_ms: u64,
+    pub approval_value_limits: Vec<bloom_broker_api::ValueLimit>,
     pub context: Option<PetalRouteContext>,
 }
 
@@ -215,6 +254,7 @@ impl From<PetalKeyGuestRequest> for PetalKeyRequest {
             allowed_operation_classes: guest.allowed_operation_classes,
             allowed_crypto_suites: guest.allowed_crypto_suites,
             maximum_lifetime_ms: guest.maximum_lifetime_ms,
+            approval_value_limits: guest.approval_value_limits,
             context: None,
         }
     }
