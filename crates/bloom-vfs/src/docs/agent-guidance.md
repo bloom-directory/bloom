@@ -38,6 +38,15 @@ A read-only `wallets/<wallet>/capabilities/` roll-up and a VFS-root `next.md`
 aggregator expose the current capability and next-action view when the daemon
 has the relevant handlers mounted.
 
+When a person — rather than an agent — needs to see their wallet, `views/`
+holds read-only HTML pages they can open in a browser straight from the mount:
+`views/index.html` for what they hold and what needs them, plus `wallets`,
+`receive`, `next-moves`, `activity` and `access`. Give them the file path and
+let the browser render it; do not paste the HTML into a transcript, and keep
+reading the canonical values from the JSON leaves. These pages observe only:
+they carry no script, and nothing in them approves or executes an action.
+See `views/AGENTS.md`.
+
 ## What an error means
 
 The errors here mean what they mean on any filesystem, and it is worth acting on

@@ -29,6 +29,10 @@ All paths below are relative to the Bloom VFS root.
 - `ens/` — forward / reverse / text / contenthash resolution.
 - `prices/` — DefiLlama price oracle (current / historical).
 - `addressbook/` — local petname directory.
+- `views/` — read-only HTML pages for a person to open in a browser
+  (`index.html`, `wallets.html`, `receive.html`, `next-moves.html`,
+  `activity.html`, `access.html`). They render the same facts these JSON and
+  Markdown leaves expose; read `views/AGENTS.md` before pointing someone at one.
 
 Default config includes read-ready RPCs for Ethereum, Base, Tempo, Robinhood
 Chain, Arbitrum, Optimism, Polygon, BNB Smart Chain, Avalanche, Gnosis, Linea,
