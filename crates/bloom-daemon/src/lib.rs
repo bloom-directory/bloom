@@ -3626,6 +3626,15 @@ impl Daemon {
         let petals_doc_renderer: Arc<dyn Fn() -> Vec<u8> + Send + Sync> =
             Arc::new(move || render_installed_petals_doc(&petals_for_docs));
 
+        // The central outbox handler is shared: `/outbox` serves it, and the
+        // views pages read staged and recorded operations back through its own
+        // trait so a page cannot drift from what `/outbox` reports.
+        let central_outbox_handler = Arc::new(OutboxHandler::new(CentralOutbox::new(
+            home.root().join("central_outbox"),
+        )));
+        // Cloned before the prices mount consumes the client.
+        let views_prices = prices.clone();
+
         let mut vfs_builder = Vfs::builder()
             .mount(
                 "petal-key-requests",
@@ -3709,14 +3718,11 @@ impl Daemon {
                 Arc::new(ViewsHandler::new(
                     wallet_projections.clone(),
                     chains.clone(),
+                    views_prices,
+                    central_outbox_handler.clone(),
                 )) as _,
             )
-            .mount(
-                "outbox",
-                Arc::new(OutboxHandler::new(CentralOutbox::new(
-                    home.root().join("central_outbox"),
-                ))) as _,
-            )
+            .mount("outbox", central_outbox_handler.clone() as _)
             .mount(
                 "addressbook",
                 Arc::new(
