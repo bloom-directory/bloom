@@ -5,113 +5,135 @@ where each one lives, how to run it, and the relevant environment variables.
 The taxonomy is enforced informally via `//! Category: ...` header comments on
 integration test files.
 
-## Running everything
+## Validation gates
+
+Start with the affected package or named test. For a repository-wide code
+candidate, run:
 
 ```sh
-RUST_LOG=warn cargo test --workspace
-RUST_LOG=warn cargo test --workspace -- --ignored
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --locked -- -D warnings
+RUST_LOG=warn cargo test --workspace --locked
 ```
 
-CI runs workspace tests through the split jobs in `.github/workflows/ci.yml`.
-Ignored live-network and docker suites are run only by the CI lanes that opt in
-with `--run-ignored`.
+For documentation-only changes, check the diff and links. When editing embedded
+VFS Markdown, also run the existing documentation tests:
 
-## Categories
+```sh
+git diff --check
+cargo test -p bloom-vfs --locked root_agent_guidance
+cargo test -p bloom-vfs --locked handlers::docs::tests
+```
 
-### unit
+CI runs workspace tests through the split jobs in
+[`ci.yml`](./.github/workflows/ci.yml). Ignored suites require their documented
+services and tools; run the relevant suite explicitly rather than enabling all
+ignored tests on an unprepared host.
 
-In-crate `#[cfg(test)] mod tests { ... }` blocks. Co-located with the code they
-cover. No external services, no filesystem, no network.
+Production authority-boundary checks are:
 
-- Run: `cargo test -p <crate>` (or `cargo test --lib`)
-- Examples: walletFS crates such as `bloom-tx`, `bloom-vfs`, and
-  `bloom-petals`.
+```sh
+packaging/triad/release/check-machine-authority-boundary.sh
+packaging/triad/release/test-machine-authority-boundary.sh
+```
 
-### integration
+Use a disposable Tart VM for local macOS packaging and principal-isolation
+checks. For changes affecting the released service combination, follow the
+[release package verification](./packaging/triad/release/README.md) at the
+recorded compatibility revisions, including the Linux release build and both
+macOS conformance workflows with explicit Broker and Signer refs. Local checks
+do not replace required review or CI on the published candidate.
 
-`crates/<crate>/tests/*.rs` — each file becomes its own test binary linked
-against the crate's public API. May spin up in-process state, but no
-subprocesses.
+## Triad and Solana ladders
 
-- Run: `cargo test -p <crate> --tests`
-- Examples: `bloom-it/tests/anvil_e2e.rs`,
-  `bloom-it/tests/revert_decoding.rs`, and `bloom-petals` tests.
+Select the checks for the changed behavior using the map below. Test an
+authority change in its owning repository before exercising downstream
+boundaries; see the [development workflow](./DEVELOPMENT.md).
 
-### property
+The full custody acceptance entrypoint is `scripts/acceptance.sh`. It runs
+projection fidelity, raw-key import/transfer, and BIP39 import/transfer through
+the real Machine, Broker, and Signer. It requires Foundry, sibling repositories,
+the Broker debug ceremony driver, and the systemd, trusted-time, and kernel
+mount prerequisites documented in the development guide.
 
-`proptest`-driven generators that exercise an invariant across many random
-inputs. Live alongside other integration tests but use `proptest!` macros.
+Solana package tests can run without a validator:
 
-- Run: `cargo test -p <crate> --tests`
-- Examples: property tests live beside the crate integration tests they cover.
+```sh
+cargo test -p bloom-solana --locked
+cargo test -p bloom-solana-tx --locked
+```
 
-### adversarial
+Before running any of the following ignored tests, start the pinned Agave
+v3.0.0 validator using the setup in
+[`solana-validator.yml`](./.github/workflows/solana-validator.yml):
 
-Negative-path tests where forged / tampered / malformed inputs MUST be rejected
-(or accounted for). Test names use the `adversarial_*` prefix where practical.
+```sh
+SOLANA_VALIDATOR_HTTP=http://127.0.0.1:8899 \
+  cargo test -p bloom-solana-tx --locked --test local_validator -- \
+  --ignored --nocapture
+cargo test -p bloom-it --locked --test solana_workflow -- --ignored --nocapture
+cargo test -p bloom-it --locked --test solana_multi_account -- --ignored --nocapture
+```
 
-- Run: `cargo test -p <crate> --tests`
-- Examples: auth ceremony, tx policy, VFS, and petal VM negative-path tests.
+`local_validator` reads `SOLANA_VALIDATOR_HTTP`. Both `solana_workflow` and
+`solana_multi_account` use `http://127.0.0.1:8899` directly. Those two suites
+exercise a real daemon and validator with an in-process Broker fixture; they
+do not verify separate Broker/Signer processes or a kernel mount.
 
-### smoke
+## Change-to-test map
 
-Short-running end-to-end checks that verify the system boots and can do
-something trivial. Used as quick gates.
+Choose by the behavior changed, not merely the file or directory touched.
+Start with named regression tests, then run the affected package suite.
+Documentation follows the documentation gate above. Add the integration
+evidence below when the changed path crosses that boundary; required CI and
+release gates still apply.
 
-- Run: package-specific smoke tests with `cargo test -p <crate> <smoke-name>`.
-- Examples: daemon IPC, VFS handler, and wallet command smoke coverage.
+| Changed behavior | Package coverage | Additional boundary evidence |
+|---|---|---|
+| Public projection or Broker client | `bloom-machine-client`, affected CLI/VFS tests | Real triad workflow when the projection or protocol contract changes |
+| Custody import or account lifecycle | Owning Broker/Signer suites | `scripts/acceptance.sh` for custody/lifecycle behavior; CLI presentation alone needs affected CLI tests |
+| VFS routing or handlers | `bloom-vfs` | `bloom-mount --features mount` and mounted reproduction when kernel-adapter behavior changes |
+| EVM construction or transaction lifecycle | `bloom-tx` | Affected `bloom-it` transaction workflow when staging, signing, or broadcast behavior changes |
+| Solana RPC or genesis checks | `bloom-solana` | Validator-backed coverage when correctness depends on live node behavior |
+| Solana construction or outbox logic | `bloom-solana-tx` | `solana_workflow` when the stage/confirm/broadcast/reconciliation path changes |
+| Solana account selection | Affected account-selection and VFS tests | `solana_multi_account` when selection changes across staging, signing, or chain reads |
+| Petal authority interface | `bloom-petals --test triad_authority_fixture` | Real triad workflow when the authority contract changes |
+| Cross-process protocol or transport | Affected suites in each changed repository | Exercise the affected operation through the real triad at recorded revisions |
+| Machine authority boundary or production features | Both authority-boundary scripts | Release/package checks above |
+| macOS packaging or isolation | Disposable Tart VM acceptance | Required release conformance above |
 
-### acceptance
+Use `cargo test -p <package> --locked` for package entries. A fixture-backed
+test is evidence only for the boundary it exercises; starting the launcher
+alone is not evidence that a custody or transaction workflow succeeds.
 
-Long-running end-to-end tests gated behind `#[ignore]`. They may spin up
-external services such as anvil or exercise real wallet integrations.
+## Categories and entrypoints
 
-- Run: `cargo test --workspace -- --ignored`
+Category comments describe a test's purpose; inspect its setup for actual
+dependencies. An in-crate test can use a temporary filesystem or local server,
+and an integration test can launch subprocesses.
 
-### CLI-subprocess
+| Category | Where and how to run |
+|---|---|
+| Unit | In-crate test modules; `cargo test -p <crate> --lib` |
+| Integration | `crates/<crate>/tests/`; `cargo test -p <crate> --test <name>` |
+| Property / adversarial | Named generative or rejection tests in the owning crate; select the relevant test binary or filter |
+| Smoke | Named startup or basic-workflow tests; select the relevant package/filter |
+| Acceptance | Ignored service-backed tests; `cargo test -p <crate> --test <name> -- --ignored` after preparing its dependencies |
+| CLI-subprocess | `cargo test -p bloom --test cli` and affected `bloom-it` tests |
+| IPC-stub | `cargo test -p bloom-daemon`; dispatch fixtures do not prove real service behavior |
+| WASM guest | `cargo test -p bloom-petals --tests`; guest modules exercise host imports |
 
-Tests that shell out to the compiled `bloom` binary (`target/debug/bloom` or
-`target/release/bloom`) and assert on its stdout / exit code / produced files.
+The custody entrypoint runs these scripts in order:
 
-- Run: `cargo test -p bloom --test cli` and targeted `bloom-it` tests.
-- Env: `BLOOM_BIN` (override the path to the bloom binary; defaults to
-  `target/debug/bloom` resolved from `CARGO_MANIFEST_DIR`).
-- Examples: `bloom/tests/cli.rs`, `bloom-it/tests/anvil_e2e.rs`.
+| Script | Evidence |
+|---|---|
+| `scripts/test-triad-projection-fidelity.sh` | Authenticated public projections and custody ceremonies through the real triad and mount |
+| `scripts/test-raw-key-import-transfer.sh` | Imported scalar spends on local Anvil with the expected sender |
+| `scripts/test-bip39-import-transfer.sh` | Canonical EVM derivation, Solana allocation visible after ceremony completion, and imported-root EVM spending |
 
-### IPC-stub
-
-In-process tests for the IPC handler dispatch layer — `Stub*Handler` shapes
-verify that the daemon's request/response framing handles each method correctly
-without standing up a real service.
-
-- Run: `cargo test -p bloom-daemon`
-- Examples: `bloom-daemon/src/ipc.rs` (`#[cfg(test)] mod tests` near the bottom
-  of the file).
-
-### wasm-guest
-
-Tests that compile inline WAT or load `tests/fixtures/*.wat` files and run them
-inside the petal VM. Each test acts as both a regression for host import
-semantics and a worked example of how a wallet extension petal behaves.
-
-- Run: `cargo test -p bloom-petals --tests`
-- Examples: `bloom-petals` tests and fixtures.
-
-## Shared scaffolding
-
-- `crates/bloom-petals/tests/common/mod.rs` — `make_address`, `wat`, and
-  fixture helpers.
-- `crates/bloom-petals/tests/fixtures/*.wat` — externalised WAT modules.
-- Per-petal canonical-string selector parity tests inline
-  `blake3::hash(b"<canonical>")[..4]` against macro-emitted `SEL_*` constants.
-
-## Naming conventions
-
-- `*_smoke` — minimal "the wires are connected" check.
-- `*_acceptance` — end-to-end behaviour against a real stack.
-- `*_regression` — pinned reproduction of a specific past bug.
-- `*_parity` — wire-format parity (selectors, encoding, replay).
-- `adversarial_*` (prefix) — negative-path / forged-input rejection.
+Use disposable test inputs. Import/transfer suites require `anvil`, `cast`,
+and the selected `BLOOM_INTEGRATION_*_BIN` binaries. Successful fixture
+signing does not replace these service-boundary checks.
 
 ## Environment variables
 
@@ -119,3 +141,8 @@ semantics and a worked example of how a wallet extension petal behaves.
 | --- | --- | --- |
 | `RUST_LOG` | all | Tracing filter; default to `warn` for tests. |
 | `BLOOM_BIN` | CLI-subprocess | Override compiled bloom binary path. |
+| `BLOOM_INTEGRATION_MACHINE_BIN` | triad | Exact Machine binary under test. |
+| `BLOOM_INTEGRATION_BROKER_BIN` | triad | Exact Broker binary under test. |
+| `BLOOM_INTEGRATION_SIGNER_BIN` | triad | Exact Signer binary under test. |
+| `BLOOM_INTEGRATION_STARTUP_TIMEOUT_SECS` | triad | Bounded full-stack startup timeout. |
+| `SOLANA_VALIDATOR_HTTP` | Solana acceptance | Local validator JSON-RPC endpoint. |

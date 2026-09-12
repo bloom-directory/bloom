@@ -9,6 +9,7 @@ use bloom_broker_api::{
     ProvenanceRecord, ProvenanceSubject, SealedApprovalPrepareResponse, ServiceFuture,
     SignedPolicySnapshot, SigningResult, Token, WalletPublic,
 };
+use bloom_machine_client::empty_wallet_accounts;
 use bloom_machine_client::{
     MachineBrokerClient, ProjectionFreshness, ProjectionVerification, WalletProjection,
     WalletProjectionReader,
@@ -50,7 +51,7 @@ impl MachineBrokerService for ExactBroker {
                     Ok(MachineBrokerResponse::WalletGetPublic(self.wallet.clone()))
                 }
                 MachineBrokerRequest::KeyGetPublic(request)
-                    if request.key_ref == self.wallet.root_key_ref =>
+                    if Some(request.key_ref.clone()) == self.wallet.root_key_ref =>
                 {
                     Ok(MachineBrokerResponse::KeyGetPublic(KeyPublic {
                         key_ref: request.key_ref,
@@ -140,7 +141,7 @@ fn projection(address: String) -> (WalletPublic, Arc<dyn WalletProjectionReader>
     let wallet = WalletPublic {
         wallet_id: token("alice"),
         wallet_kind: token("local"),
-        root_key_ref: key_ref.clone(),
+        root_key_ref: Some(key_ref.clone()),
         key_refs: vec![key_ref.clone()],
         policy_version: DecimalU64::new(1),
         policy_digest: policy_digest.clone(),
@@ -165,6 +166,8 @@ fn projection(address: String) -> (WalletPublic, Arc<dyn WalletProjectionReader>
             policy_verifying_key: Base64UrlBytes::from_bytes(&[4; 32]),
             signer_signature: Base64UrlBytes::from_bytes(&[5; 64]),
         },
+        accounts: empty_wallet_accounts(bloom_broker_api::Token::new("m2").unwrap()),
+        accounts_unavailable: None,
         source_protocol: "bloom.machine-broker.v1".into(),
         response_digest: digest(6),
         observed_at_ms: 1,
