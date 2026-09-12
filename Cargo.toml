@@ -69,6 +69,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 flate2 = "1"
 mpp = { version = "0.10.4", default-features = false, features = ["client", "tempo", "reqwest-rustls-tls"] }
 url = "2"
+percent-encoding = "2"
 humantime = "2"
 humantime-serde = "1"
 tempfile = "3"

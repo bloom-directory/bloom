@@ -1128,7 +1128,18 @@ impl IpcServer {
     async fn do_lookup(&self, params: &Value) -> Result<Value, HandlerError> {
         let path = parse_path(params)?;
         let e = self.vfs.lookup(&path).await?;
-        Ok(entry_to_json(&e))
+        let mut entry = entry_to_json(&e);
+        // The mount layer already consults this before rendering content at
+        // GETATTR. Surfacing it on `lookup` lets non-mount clients make the
+        // same decision instead of discovering a signature or a broadcast by
+        // reading a path speculatively.
+        if let Value::Object(fields) = &mut entry {
+            fields.insert(
+                "read_side_effecting".into(),
+                Value::Bool(self.vfs.is_read_side_effecting(&path)),
+            );
+        }
+        Ok(entry)
     }
 
     async fn do_read(
@@ -2342,6 +2353,62 @@ mod tests {
             *self.0.lock().await = data.to_vec();
             Ok(())
         }
+    }
+
+    /// Models the outbox control files: reading `confirm` signs and
+    /// broadcasts, while the sibling status file is inert.
+    struct SideEffectingReadHandler;
+
+    #[async_trait::async_trait]
+    impl Handler for SideEffectingReadHandler {
+        async fn lookup(&self, path: &VfsPath) -> Result<Entry, HandlerError> {
+            match path.segments().last().map(String::as_str) {
+                Some(name @ ("confirm" | "status.json")) => Ok(Entry::file(name)),
+                _ => Err(HandlerError::NotFound(path.to_string_path())),
+            }
+        }
+
+        fn is_read_side_effecting(&self, path: &VfsPath) -> bool {
+            path.segments().last().map(String::as_str) == Some("confirm")
+        }
+    }
+
+    /// `lookup` is the only pre-read probe a non-mount client has. It must
+    /// report whether reading the path would sign or broadcast, so the client
+    /// can refuse to fetch it speculatively.
+    #[tokio::test]
+    async fn lookup_reports_whether_reading_the_path_is_side_effecting() {
+        let server = IpcServer::new(
+            Vfs::builder()
+                .mount("outbox", Arc::new(SideEffectingReadHandler))
+                .build(),
+            "0",
+            vec![],
+        );
+        let lookup = |path: &'static str| {
+            let server = server.clone();
+            async move {
+                server
+                    .dispatch(Request {
+                        jsonrpc: "2.0".into(),
+                        id: json!(1),
+                        method: "lookup".into(),
+                        params: json!({ "path": path }),
+                    })
+                    .await
+                    .result
+                    .expect("lookup result")
+            }
+        };
+
+        let confirm = lookup("/outbox/confirm").await;
+        assert_eq!(confirm["read_side_effecting"], true, "{confirm}");
+        // The pre-existing entry projection is untouched by the new field.
+        assert_eq!(confirm["name"], "confirm");
+        assert_eq!(confirm["kind"], "file");
+
+        let inert = lookup("/outbox/status.json").await;
+        assert_eq!(inert["read_side_effecting"], false, "{inert}");
     }
 
     struct AtomicProjectionHandler {

@@ -17,16 +17,22 @@ use serde_json::{Value, json};
 
 const GREET: &[u8] = b"hi\n";
 const BLOB: &[u8] = &[0xff, 0x00, 0xfe, 0x80];
+/// Every character a VFS segment may hold that an RFC 3986 parser treats
+/// specially. `\` and NUL are the only bytes `VfsPath::parse` rejects.
+const RESERVED_NAME: &str = "odd name#1?q=100%.md";
 /// Larger than the daemon's 1 MiB read chunk, so the reply arrives as streamed
 /// `bloom.output` data rather than a single inline frame.
 const BIG_LEN: usize = 2 * 1024 * 1024 + 7;
 
 /// A handler with one of each thing the VFS can hold: a UTF-8 file, a binary
-/// file, an oversized file, a writable sink, and the projection that sink
-/// produces.
+/// file, an oversized file, a file whose name is full of URI metacharacters, a
+/// writable sink, the projection that sink produces, and — modelling the
+/// wallet outbox control files — a file whose *read* performs an action.
 #[derive(Default)]
 struct ProbeHandler {
     latest: Mutex<Option<Vec<u8>>>,
+    /// Incremented by reading `confirm`, so a test can prove nothing read it.
+    confirmed: std::sync::atomic::AtomicUsize,
 }
 
 impl ProbeHandler {
@@ -50,6 +56,10 @@ impl Handler for ProbeHandler {
             ["blob.bin"] => Ok(Entry::read_only_file("blob.bin").with_size(BLOB.len() as u64)),
             ["big.bin"] => Ok(Entry::read_only_file("big.bin").with_size(BIG_LEN as u64)),
             ["new"] => Ok(Entry::writable_file("new")),
+            ["confirm"] => Ok(Entry::read_only_file("confirm")),
+            [name] if name == RESERVED_NAME => {
+                Ok(Entry::read_only_file(RESERVED_NAME).with_size(GREET.len() as u64))
+            }
             ["latest"] => match latest {
                 Some(bytes) => Ok(Entry::read_only_file("latest").with_size(bytes.len() as u64)),
                 None => Err(HandlerError::not_found(path.to_string_path())),
@@ -70,9 +80,20 @@ impl Handler for ProbeHandler {
             ["greet"] => Ok(GREET.to_vec()),
             ["blob.bin"] => Ok(BLOB.to_vec()),
             ["big.bin"] => Ok(Self::big()),
+            ["confirm"] => {
+                self.confirmed
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(b"broadcast\n".to_vec())
+            }
+            [name] if name == RESERVED_NAME => Ok(GREET.to_vec()),
             ["latest"] => latest.ok_or_else(|| HandlerError::not_found(path.to_string_path())),
             _ => Err(HandlerError::not_found(path.to_string_path())),
         }
+    }
+
+    /// The whole point of the flag: reading `confirm` *is* the broadcast.
+    fn is_read_side_effecting(&self, path: &VfsPath) -> bool {
+        path.segments().last().map(String::as_str) == Some("confirm")
     }
 
     async fn write(&self, path: &VfsPath, data: &[u8]) -> Result<(), HandlerError> {
@@ -116,6 +137,7 @@ impl Handler for ProbeHandler {
 struct Harness {
     server: McpServer,
     ipc: IpcServer,
+    probe: Arc<ProbeHandler>,
     handle: tokio::task::JoinHandle<()>,
     _dir: tempfile::TempDir,
 }
@@ -124,9 +146,8 @@ impl Harness {
     async fn start() -> Self {
         let dir = tempfile::tempdir().expect("temp dir");
         let socket = dir.path().join("private-run/bloom.sock");
-        let vfs = Vfs::builder()
-            .mount("probe", Arc::new(ProbeHandler::default()))
-            .build();
+        let probe = Arc::new(ProbeHandler::default());
+        let vfs = Vfs::builder().mount("probe", probe.clone()).build();
         let ipc = IpcServer::new(vfs, "0.0.0-test", vec!["ethereum".into()]);
         let serving = ipc.clone();
         let serving_socket = socket.clone();
@@ -142,9 +163,16 @@ impl Harness {
         Self {
             server: McpServer::new(Arc::new(IpcVfsCommands::new(socket)), "0.0.0-test"),
             ipc,
+            probe,
             handle,
             _dir: dir,
         }
+    }
+
+    fn confirms(&self) -> usize {
+        self.probe
+            .confirmed
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     async fn request(&self, method: &str, params: Value) -> Value {
@@ -424,10 +452,142 @@ async fn resources_expose_the_same_paths_as_the_read_command() {
         "binary resources stay bytes"
     );
 
+    // A missing path is MCP's own resource-not-found; the daemon's code is
+    // kept as diagnostic data rather than shipped as the protocol code.
     let missing = harness
         .request("resources/read", json!({"uri": "bloom:///probe/missing"}))
         .await;
-    assert_eq!(missing["error"]["code"], -32004);
+    assert_eq!(missing["error"]["code"], -32002);
+    assert_eq!(missing["error"]["data"]["daemonCode"], -32004);
+    assert_eq!(missing["error"]["data"]["uri"], "bloom:///probe/missing");
+
+    harness.stop().await;
+}
+
+/// A resource URI is an RFC 3986 URI: a client that percent-encodes reserved
+/// characters (as it must) has to land on the same VFS path the server
+/// advertised.
+#[tokio::test]
+async fn resource_uris_round_trip_paths_containing_reserved_characters() {
+    let harness = Harness::start().await;
+    let path = format!("/probe/{RESERVED_NAME}");
+
+    // The URI the server itself hands out for this path, via a tool read.
+    let read = harness.ok_tool("vfs_read", json!({"path": path})).await;
+    let uri = read["structuredContent"]["uri"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(
+        uri, "bloom:///probe/odd%20name%231%3Fq=100%25.md",
+        "reserved characters must be percent-encoded"
+    );
+
+    // Feeding it straight back reaches the same file rather than a truncated
+    // or nonexistent one.
+    let resource = harness.request("resources/read", json!({"uri": uri})).await;
+    assert!(resource.get("error").is_none(), "{resource}");
+    assert_eq!(resource["result"]["contents"][0]["text"], "hi\n");
+    assert_eq!(resource["result"]["contents"][0]["uri"], uri);
+
+    // The unencoded form is a different URI — everything from `#` on is a
+    // fragment — and must be refused rather than silently read as `/probe/odd
+    // name`.
+    let raw = harness
+        .request(
+            "resources/read",
+            json!({"uri": format!("bloom:///probe/{RESERVED_NAME}")}),
+        )
+        .await;
+    assert_eq!(raw["error"]["code"], -32602, "{raw}");
+
+    harness.stop().await;
+}
+
+/// Clients fetch resources without asking a human. The few VFS paths whose
+/// read signs or broadcasts must therefore be unreachable that way — and must
+/// still be reachable through the tool, which a client can gate.
+#[tokio::test]
+async fn a_side_effecting_read_is_not_an_inert_resource_but_is_still_a_tool() {
+    let harness = Harness::start().await;
+    let uri = "bloom:///probe/confirm";
+
+    // `vfs_stat` is how a client finds out, and stat'ing must not trigger it.
+    let stat = harness
+        .ok_tool("vfs_stat", json!({"path": "/probe/confirm"}))
+        .await;
+    assert_eq!(
+        stat["structuredContent"]["entry"]["read_side_effecting"],
+        true
+    );
+    assert_eq!(harness.confirms(), 0, "stat must not broadcast");
+
+    let refused = harness.request("resources/read", json!({"uri": uri})).await;
+    assert_eq!(refused["error"]["code"], -32010, "{refused}");
+    assert_eq!(refused["error"]["data"]["tool"], "vfs_read");
+    assert_eq!(
+        harness.confirms(),
+        0,
+        "resources/read must not have performed the action"
+    );
+
+    // The inert sibling is unaffected: this is a per-path gate, not a subtree
+    // ban, and it is the daemon's judgement rather than a list kept here.
+    let inert = harness
+        .request("resources/read", json!({"uri": "bloom:///probe/greet"}))
+        .await;
+    assert_eq!(inert["result"]["contents"][0]["text"], "hi\n");
+
+    // No VFS functionality is lost: the tool still performs the read.
+    let performed = harness
+        .ok_tool("vfs_read", json!({"path": "/probe/confirm"}))
+        .await;
+    assert_eq!(performed["content"][0]["text"], "broadcast\n");
+    assert_eq!(harness.confirms(), 1, "the tool must still do the work");
+
+    harness.stop().await;
+}
+
+/// The argument allowlist is the reason a new daemon parameter cannot leak
+/// through this proxy; it is only safe while every argument it *does* allow
+/// still means something to the daemon.
+#[tokio::test]
+async fn every_advertised_argument_reaches_the_daemon() {
+    let harness = Harness::start().await;
+
+    let listed = harness.request("tools/list", json!({})).await;
+    for tool in listed["result"]["tools"].as_array().unwrap() {
+        let name = tool["name"].as_str().unwrap();
+        // A path each tool can legitimately act on, so a failure means the
+        // argument did not reach the daemon rather than that the path was
+        // wrong for the command.
+        let path = match name {
+            "vfs_list" => "/probe",
+            "vfs_read" | "vfs_stat" => "/probe/greet",
+            _ => "/probe/new",
+        };
+        let arguments: Value = tool["inputSchema"]["properties"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(|key| {
+                let value = match key.as_str() {
+                    "path" => path,
+                    "projection_path" => "/probe/latest",
+                    "bytes_b64" => "aGk=",
+                    "text" => "hi",
+                    other => panic!("{name} advertises an unhandled argument `{other}`"),
+                };
+                (key.clone(), Value::String(value.into()))
+            })
+            .collect::<serde_json::Map<_, _>>()
+            .into();
+
+        // Every advertised argument is forwarded (no `unexpected argument`
+        // rejection) and the daemon accepts the whole set.
+        let result = harness.tool(name, arguments.clone()).await;
+        assert_eq!(result["isError"], false, "{name}: {result} for {arguments}");
+    }
 
     harness.stop().await;
 }

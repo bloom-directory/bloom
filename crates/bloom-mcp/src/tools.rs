@@ -7,12 +7,37 @@
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
+use percent_encoding::{AsciiSet, CONTROLS, percent_decode_str, utf8_percent_encode};
 use serde_json::{Map, Value, json};
 
 use crate::backend::{DAEMON_UNREACHABLE_CODE, VfsCommandError, VfsCommands, VfsMethod};
 
 /// URI scheme for VFS paths exposed as MCP resources: `bloom:///status/health`.
 pub const RESOURCE_SCHEME: &str = "bloom://";
+
+/// Characters a VFS path segment may legitimately contain that would change
+/// how an RFC 3986 parser reads the URI: the generic delimiters that end a
+/// path (`?`, `#`), the segment separator itself, the escape character, and
+/// everything a URL parser is entitled to normalise or reject. Encoding this
+/// set — and nothing else — keeps `bloom:///docs/README.md` readable while
+/// making `a/b`, `a#b`, `a?b`, `100%`, and `two words` round-trip exactly.
+const PATH_SEGMENT: &AsciiSet = &CONTROLS
+    .add(b'%')
+    .add(b'/')
+    .add(b'?')
+    .add(b'#')
+    .add(b'[')
+    .add(b']')
+    .add(b' ')
+    .add(b'"')
+    .add(b'<')
+    .add(b'>')
+    .add(b'\\')
+    .add(b'^')
+    .add(b'`')
+    .add(b'{')
+    .add(b'|')
+    .add(b'}');
 
 /// A tool the MCP server advertises, bound to the VFS command it proxies.
 #[derive(Clone, Copy, Debug)]
@@ -21,11 +46,17 @@ pub struct ToolSpec {
     pub title: &'static str,
     pub description: &'static str,
     pub method: VfsMethod,
-    /// Mirrors the VFS mutation boundary: `read`/`list`/`lookup` are reads,
-    /// the two write commands are not. Note that a handful of VFS reads are
-    /// deliberately side-effecting (signing, broadcast); the daemon audits
-    /// those regardless of which client asks.
+    /// `readOnlyHint`: true only when *every* path the tool can reach is inert.
+    /// `list` and `lookup` qualify; `read` does not, because a handful of VFS
+    /// paths (outbox `confirm`/`replace`/`cancel`) sign or broadcast when read.
+    /// The daemon audits those regardless of which client asks, but a client
+    /// that trusts `readOnlyHint` would skip its confirmation prompt.
     pub read_only: bool,
+    /// `destructiveHint`, only meaningful when [`Self::read_only`] is false.
+    /// Writes are staged and confirmable, but they are the surface that moves
+    /// value, so they claim the conservative hint; a side-effecting read
+    /// produces artifacts rather than overwriting them.
+    pub destructive: bool,
 }
 
 /// Every VFS capability reachable from the public CLI/IPC surface.
@@ -36,20 +67,23 @@ pub const TOOLS: [ToolSpec; 5] = [
         description: "List the children of a Bloom VFS directory. Equivalent to `bloom vfs ls <path>`; returns one entry per child with its name, kind (dir/file/symlink), size, POSIX mode, symlink target, and modification time. Start at `/` to discover the available subtrees.",
         method: VfsMethod::List,
         read_only: true,
+        destructive: false,
     },
     ToolSpec {
         name: "vfs_read",
         title: "Read a Bloom VFS file",
-        description: "Read the bytes of a Bloom VFS file. Equivalent to `bloom vfs cat <path>`. UTF-8 content is returned as text; anything else is returned as a base64 blob. Some paths are side-effecting by design (signing, broadcast); check the path's documentation before reading.",
+        description: "Read the bytes of a Bloom VFS file. Equivalent to `bloom vfs cat <path>`. UTF-8 content is returned as text; anything else is returned as a base64 blob. Most paths are inert data, but a few are side-effecting by design: reading a wallet outbox `confirm`, `confirm.override`, `replace`, or `cancel` file performs that action. Call `vfs_stat` first — it reports `read_side_effecting` — and treat a true there as an action needing confirmation, not a fetch.",
         method: VfsMethod::Read,
-        read_only: true,
+        read_only: false,
+        destructive: false,
     },
     ToolSpec {
         name: "vfs_stat",
         title: "Stat a Bloom VFS path",
-        description: "Return Bloom VFS metadata for a path without reading it. Equivalent to `bloom vfs stat <path>`: name, kind, size, POSIX mode, symlink target, and modification time.",
+        description: "Return Bloom VFS metadata for a path without reading it. Equivalent to `bloom vfs stat <path>`: name, kind, size, POSIX mode, symlink target, modification time, and `read_side_effecting` — whether reading the path would sign or broadcast. Always inert; safe to call before any read.",
         method: VfsMethod::Lookup,
-        read_only: false,
+        read_only: true,
+        destructive: false,
     },
     ToolSpec {
         name: "vfs_write",
@@ -57,6 +91,7 @@ pub const TOOLS: [ToolSpec; 5] = [
         description: "Write bytes to a writable Bloom VFS path. Equivalent to `bloom vfs write <path>`. Supply either `text` (UTF-8) or `bytes_b64` (arbitrary bytes). Writes are audited and only a small set of injection points accept them; everything else fails with `permission denied`.",
         method: VfsMethod::Write,
         read_only: false,
+        destructive: true,
     },
     ToolSpec {
         name: "vfs_write_then_stat",
@@ -64,6 +99,7 @@ pub const TOOLS: [ToolSpec; 5] = [
         description: "Write bytes to a writable Bloom VFS path and, under the daemon's mutation gate, stat the identity projection the write produced (for example writing `/requests/new` and reading back `/requests/latest`). Use this instead of a write followed by a separate stat when the projection identity matters.",
         method: VfsMethod::WriteWithLookup,
         read_only: false,
+        destructive: true,
     },
 ];
 
@@ -154,7 +190,7 @@ impl ToolSpec {
             "annotations": {
                 "title": self.title,
                 "readOnlyHint": self.read_only,
-                "destructiveHint": !self.read_only,
+                "destructiveHint": self.destructive,
                 "idempotentHint": false,
                 "openWorldHint": true,
             },
@@ -350,25 +386,63 @@ pub fn mime_type_for(path: &str, utf8: bool) -> &'static str {
     }
 }
 
-/// `/status/health` → `bloom:///status/health`.
+/// `/status/health` → `bloom:///status/health`, percent-encoding each segment
+/// so a path containing `%`, a space, `#`, or `?` survives an RFC 3986 parser.
+/// The authority is always empty, which is what the leading `///` means.
 pub fn resource_uri(path: &str) -> String {
-    if path.starts_with('/') {
-        format!("{RESOURCE_SCHEME}{path}")
-    } else {
-        format!("{RESOURCE_SCHEME}/{path}")
+    let mut uri = format!("{RESOURCE_SCHEME}/");
+    for (index, segment) in path.trim_start_matches('/').split('/').enumerate() {
+        if index > 0 {
+            uri.push('/');
+        }
+        uri.extend(utf8_percent_encode(segment, PATH_SEGMENT));
     }
+    uri
 }
 
-/// Inverse of [`resource_uri`]. Rejects anything that is not a `bloom://` URI.
+/// Inverse of [`resource_uri`]. Rejects anything that is not a `bloom://` URI
+/// with an empty authority, and refuses percent-escapes that would decode into
+/// a different path than the one the URI names.
 pub fn path_from_uri(uri: &str) -> Result<String, String> {
-    let path = uri
+    let rest = uri
         .strip_prefix(RESOURCE_SCHEME)
         .ok_or_else(|| format!("unsupported resource URI {uri:?}; expected a bloom:// URI"))?;
-    if path.starts_with('/') {
-        Ok(path.to_owned())
-    } else {
-        Ok(format!("/{path}"))
+    // `bloom://host/path` names a different authority, not a VFS path.
+    let encoded = rest
+        .strip_prefix('/')
+        .ok_or_else(|| format!("unsupported resource URI {uri:?}; expected bloom:///<path>"))?;
+    if let Some(index) = encoded.find(['?', '#']) {
+        return Err(format!(
+            "unsupported resource URI {uri:?}: a Bloom VFS path has no {:?} component (percent-encode the character to use it in a path)",
+            &encoded[index..index + 1]
+        ));
     }
+    let mut path = String::new();
+    for segment in encoded.split('/') {
+        let decoded = percent_decode_str(segment)
+            .decode_utf8()
+            .map_err(|error| format!("resource URI {uri:?} is not valid UTF-8: {error}"))?;
+        // A `%2F` must not smuggle an extra separator past the split above,
+        // and a NUL cannot appear in a VFS path at all.
+        if decoded.contains('/') || decoded.contains('\0') {
+            return Err(format!(
+                "unsupported resource URI {uri:?}: a percent-escape decodes to a path separator"
+            ));
+        }
+        path.push('/');
+        path.push_str(&decoded);
+    }
+    Ok(path)
+}
+
+/// Whether the daemon's `lookup` reply says reading this path signs,
+/// broadcasts, or otherwise mutates state. A reply from a daemon predating
+/// the field reads as `false`, matching the VFS default for unknown paths.
+pub fn read_is_side_effecting(entry: &Value) -> bool {
+    entry
+        .get("read_side_effecting")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
 }
 
 fn payload_len(arguments: &Map<String, Value>) -> usize {
@@ -418,6 +492,31 @@ mod tests {
             methods,
             ["list", "lookup", "read", "write", "write_with_lookup"]
         );
+    }
+
+    /// The allowlist is what makes a new daemon parameter invisible to MCP
+    /// clients, so it must at least never disagree with the schema clients are
+    /// told to fill in.
+    #[test]
+    fn advertised_schema_matches_the_forwarded_argument_allowlist() {
+        for tool in &TOOLS {
+            let schema = tool.input_schema();
+            let mut advertised: Vec<&str> = schema["properties"]
+                .as_object()
+                .expect("object schema")
+                .keys()
+                .map(String::as_str)
+                .collect();
+            advertised.sort_unstable();
+            let mut accepted = tool.accepted_arguments().to_vec();
+            accepted.sort_unstable();
+            assert_eq!(advertised, accepted, "{}", tool.name);
+            assert_eq!(
+                schema["additionalProperties"], false,
+                "{} must not invite arguments it will reject",
+                tool.name
+            );
+        }
     }
 
     #[test]
@@ -475,6 +574,79 @@ mod tests {
             "/status/health"
         );
         assert!(path_from_uri("file:///etc/passwd").is_err());
+        // An authority is not a path prefix.
+        assert!(path_from_uri("bloom://host/status/health").is_err());
+    }
+
+    /// A VFS segment may hold any byte but `/` and NUL. Every such segment has
+    /// to survive the trip to an RFC 3986 URI and back, or a compliant client
+    /// silently reads a different path.
+    #[test]
+    fn reserved_characters_survive_the_uri_round_trip() {
+        for path in [
+            "/requests/two words/plan.md",
+            "/requests/100%/plan.md",
+            "/requests/a#b",
+            "/requests/a?b=c",
+            "/requests/a%2Fb",
+            "/docs/caf\u{e9}.md",
+            "/requests/a+b",
+            "/",
+        ] {
+            let uri = resource_uri(path);
+            assert!(!uri[RESOURCE_SCHEME.len()..].contains(['?', '#']), "{uri}");
+            assert_eq!(path_from_uri(&uri).unwrap(), path, "via {uri}");
+        }
+
+        // Readable paths stay readable: nothing is over-encoded.
+        assert_eq!(resource_uri("/docs/README.md"), "bloom:///docs/README.md");
+        assert_eq!(resource_uri("/requests/100%"), "bloom:///requests/100%25");
+        assert_eq!(resource_uri("/a b"), "bloom:///a%20b");
+    }
+
+    #[test]
+    fn uris_that_would_name_a_different_path_are_refused() {
+        // A raw `#`/`?` is a fragment/query to an RFC 3986 parser, so it can
+        // never have come from a VFS segment.
+        assert!(path_from_uri("bloom:///requests/a#b").is_err());
+        assert!(path_from_uri("bloom:///requests/a?b").is_err());
+        // `%252F` decodes to `%2F`, a literal segment, not a separator.
+        assert_eq!(
+            path_from_uri("bloom:///requests/a%252Fb").unwrap(),
+            "/requests/a%2Fb"
+        );
+    }
+
+    /// `readOnlyHint` is what a client gates its confirmation prompt on, so it
+    /// has to match the VFS mutation boundary exactly.
+    #[test]
+    fn advertised_annotations_match_the_vfs_mutation_boundary() {
+        let hints = |name: &str| {
+            let annotations = find(name).unwrap().descriptor()["annotations"].clone();
+            (
+                annotations["readOnlyHint"].as_bool().unwrap(),
+                annotations["destructiveHint"].as_bool().unwrap(),
+            )
+        };
+        // `lookup` and `list` touch nothing.
+        assert_eq!(hints("vfs_stat"), (true, false));
+        assert_eq!(hints("vfs_list"), (true, false));
+        // A read can sign or broadcast on outbox control paths, so it cannot
+        // claim to leave the environment alone.
+        assert_eq!(hints("vfs_read"), (false, false));
+        assert_eq!(hints("vfs_write"), (false, true));
+        assert_eq!(hints("vfs_write_then_stat"), (false, true));
+    }
+
+    #[test]
+    fn a_lookup_reply_without_the_flag_reads_as_inert() {
+        assert!(read_is_side_effecting(
+            &json!({"name": "confirm", "read_side_effecting": true})
+        ));
+        assert!(!read_is_side_effecting(
+            &json!({"name": "confirm", "read_side_effecting": false})
+        ));
+        assert!(!read_is_side_effecting(&json!({"name": "greet"})));
     }
 
     #[test]

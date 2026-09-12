@@ -12,10 +12,24 @@ use bloom_daemon::ipc::{IpcClient, IpcClientError};
 use serde_json::Value;
 use thiserror::Error;
 
-/// JSON-RPC code used when the proxy could not reach the daemon at all.
-/// Daemon-originated failures keep the daemon's own code (`-32004` not found,
-/// `-32007` permission denied, …) so clients see one error vocabulary.
-pub const DAEMON_UNREACHABLE_CODE: i32 = -32002;
+/// JSON-RPC code used when the proxy could not reach the daemon at all, or the
+/// daemon answered with a reply this proxy cannot decode. Both are failures of
+/// this server rather than of the request, which is exactly JSON-RPC's
+/// `-32603 Internal error`.
+///
+/// It deliberately is **not** `-32002`: MCP reserves that code for "Resource
+/// not found" on `resources/read`, so using it for a transport failure would
+/// tell clients a path is absent when the daemon is merely down.
+///
+/// Daemon-originated failures keep the daemon's own code
+/// ([`DAEMON_NOT_FOUND_CODE`], `-32007` permission denied, …) so clients see
+/// one error vocabulary.
+pub const DAEMON_UNREACHABLE_CODE: i32 = -32603;
+
+/// The daemon's "not found" code, as emitted by `HandlerError::NotFound`. The
+/// resource surface translates it into MCP's own not-found code; the tool
+/// surface passes it through untouched.
+pub const DAEMON_NOT_FOUND_CODE: i32 = -32004;
 
 /// The five VFS commands `bloom vfs …` uses, and the only methods this proxy
 /// can name. Modelling them as an enum keeps non-VFS IPC methods
@@ -167,5 +181,14 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.code, DAEMON_UNREACHABLE_CODE);
         assert!(error.message.contains("bloom serve"), "{error}");
+    }
+
+    /// A dead daemon must never be reported with MCP's resource-not-found
+    /// code, which would read as "this VFS path does not exist".
+    #[test]
+    fn the_unreachable_code_does_not_collide_with_mcp_or_daemon_codes() {
+        assert_eq!(DAEMON_UNREACHABLE_CODE, -32603);
+        assert_ne!(DAEMON_UNREACHABLE_CODE, -32002);
+        assert_ne!(DAEMON_UNREACHABLE_CODE, DAEMON_NOT_FOUND_CODE);
     }
 }

@@ -2369,6 +2369,7 @@ dependencies = [
  "bloom-daemon",
  "bloom-proto",
  "bloom-vfs",
+ "percent-encoding",
  "serde",
  "serde_json",
  "tempfile",

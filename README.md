@@ -112,6 +112,28 @@ For the full wallet walkthrough, read
 [`docs/AGENTIC_WALLET.md`](./docs/AGENTIC_WALLET.md) and
 [`QUICKSTART.md`](./QUICKSTART.md).
 
+## MCP server
+
+Agent clients that speak the Model Context Protocol can reach the same VFS
+commands over stdio, without a mount. It is **off by default**; enabling it is
+an explicit edit to `~/.bloom/config.toml`:
+
+```toml
+[mcp]
+enabled = true
+```
+
+```sh
+cargo run -p bloom -- mcp status   # is it on, and which socket would it use
+cargo run -p bloom -- mcp serve    # stdio; an MCP client spawns this
+```
+
+`mcp serve` adds no permissions of its own: it forwards `list`, `read`,
+`lookup`, `write`, and `write_with_lookup` to the daemon a mount would have
+used, so policy, confirmation, and audit gates apply unchanged. There is no
+network listener. See [`docs/guides/mcp.md`](./docs/guides/mcp.md) for the tool
+catalog, resource URI rules, and error codes.
+
 ## Development commands
 
 For local development, use the package-manager-native checks:

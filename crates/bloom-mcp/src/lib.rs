@@ -13,10 +13,23 @@
 //! | `vfs_write`           | `write`             | `bloom vfs write` |
 //! | `vfs_write_then_stat` | `write_with_lookup` | (staging flows)   |
 //!
-//! `resources/read` maps `bloom:///<path>` onto the same `read` command.
+//! `resources/read` maps `bloom:///<path>` onto the same `read` command,
+//! except for the few paths whose read *is* the action — those stay tool-only,
+//! because MCP clients fetch resources without asking.
+//!
 //! Because the proxy delegates, path parsing, authorization, policy gates,
 //! audit journalling, caching, and error codes all keep happening in
-//! `bloom_vfs` and its handlers — new VFS capabilities appear here for free.
+//! `bloom_vfs` and its handlers. New *paths* therefore appear here for free:
+//! every subtree the daemon grows is immediately listable, readable, and
+//! writable through these five tools. New *parameters* do not. Each tool
+//! forwards a fixed argument allowlist (`tools::ToolSpec::accepted_arguments`)
+//! and rejects anything else before the daemon is called, so adding an
+//! argument to a daemon VFS method also means adding it here — which is the
+//! trade for never letting an MCP client name a parameter this proxy has not
+//! reviewed. Two tests keep that list honest against the rest of the surface:
+//! `advertised_schema_matches_the_forwarded_argument_allowlist` (allowlist vs.
+//! `tools/list` schema) and `every_advertised_argument_reaches_the_daemon` in
+//! `tests/vfs_proxy.rs` (allowlist vs. a live daemon).
 //!
 //! The server is **disabled by default**. [`ensure_enabled`] is the single gate;
 //! `bloom mcp serve` calls it before touching stdin, stdout, or the daemon
@@ -35,9 +48,13 @@ use bloom_proto::McpConfig;
 use thiserror::Error;
 
 pub use backend::{
-    DAEMON_UNREACHABLE_CODE, IpcVfsCommands, VfsCommandError, VfsCommands, VfsMethod,
+    DAEMON_NOT_FOUND_CODE, DAEMON_UNREACHABLE_CODE, IpcVfsCommands, VfsCommandError, VfsCommands,
+    VfsMethod,
 };
-pub use server::{McpServer, PROTOCOL_VERSION, SERVER_NAME, SUPPORTED_PROTOCOL_VERSIONS};
+pub use server::{
+    McpServer, PROTOCOL_VERSION, RESOURCE_IS_AN_ACTION_CODE, RESOURCE_NOT_FOUND_CODE, SERVER_NAME,
+    SUPPORTED_PROTOCOL_VERSIONS,
+};
 pub use tools::{RESOURCE_SCHEME, TOOLS, ToolSpec};
 
 /// Returned when the MCP server is asked to start without an explicit opt-in.
