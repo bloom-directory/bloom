@@ -566,10 +566,16 @@ impl ViewsHandler {
         } else if priced == 0 {
             (
                 "—".to_owned(),
-                format!(
-                    "No price for {rows} below.",
-                    rows = count_noun(portfolio.holdings.len(), "the row", "any of the rows"),
-                ),
+                // Not `count_noun`: that helper prefixes the count, which
+                // reads as "1 the row".
+                if portfolio.holdings.len() == 1 {
+                    "No price for the row below.".to_owned()
+                } else {
+                    format!(
+                        "No price for any of the {} rows below.",
+                        portfolio.holdings.len()
+                    )
+                },
             )
         } else {
             (
