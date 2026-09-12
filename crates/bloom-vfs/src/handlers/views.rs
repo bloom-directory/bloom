@@ -32,6 +32,7 @@ use bloom_evm::ChainRegistry;
 use bloom_machine_client::{ProjectionFreshness, WalletProjection, WalletProjectionReader};
 use bloom_prices::{CoinId, PricesClient};
 
+use super::market_data::{self, MarketData, TokenMarket};
 use super::outbox::OutboxHandler;
 use crate::handler::{Entry, Handler, HandlerError};
 use crate::path::VfsPath;
@@ -40,6 +41,9 @@ const BLOOM_CSS: &str = include_str!("../assets/bloom.css");
 const VIEWS_AGENTS_MD: &str = include_str!("../docs/views-agents.md");
 
 const INDEX_HTML: &str = "index.html";
+const MARKETS_HTML: &str = "markets.html";
+const CHAINS_HTML: &str = "chains.html";
+const FEES_HTML: &str = "fees.html";
 const WALLETS_HTML: &str = "wallets.html";
 const RECEIVE_HTML: &str = "receive.html";
 const NEXT_MOVES_HTML: &str = "next-moves.html";
@@ -52,10 +56,13 @@ const AGENTS_MD_NAME: &str = "AGENTS.md";
 /// navigation, so a link can never point at a page that is not served.
 const PAGES: &[(&str, &str)] = &[
     (INDEX_HTML, "Today"),
+    (MARKETS_HTML, "Markets"),
+    (CHAINS_HTML, "Chains"),
+    (FEES_HTML, "Fees"),
     (WALLETS_HTML, "Wallets"),
-    (RECEIVE_HTML, "Receive"),
     (NEXT_MOVES_HTML, "Next moves"),
     (ACTIVITY_HTML, "Activity"),
+    (RECEIVE_HTML, "Receive"),
     (ACCESS_HTML, "Access"),
 ];
 
@@ -91,6 +98,7 @@ pub struct ViewsHandler {
     chains: ChainRegistry,
     prices: Arc<PricesClient>,
     outbox: Arc<OutboxHandler>,
+    market: MarketData,
 }
 
 impl ViewsHandler {
@@ -99,12 +107,14 @@ impl ViewsHandler {
         chains: ChainRegistry,
         prices: PricesClient,
         outbox: Arc<OutboxHandler>,
+        market: MarketData,
     ) -> Self {
         Self {
             projections,
             chains,
             prices: Arc::new(prices),
             outbox,
+            market,
         }
     }
 }
@@ -163,6 +173,9 @@ impl ViewsHandler {
         };
         let html = match page.as_str() {
             INDEX_HTML => self.render_index().await,
+            MARKETS_HTML => self.render_markets().await,
+            CHAINS_HTML => self.render_chains().await,
+            FEES_HTML => self.render_fees().await,
             WALLETS_HTML => self.render_wallets().await,
             RECEIVE_HTML => self.render_receive().await,
             NEXT_MOVES_HTML => self.render_next_moves().await,
@@ -258,57 +271,9 @@ impl ViewsHandler {
                 }
             };
 
-            let mut reads = tokio::task::JoinSet::new();
-            for chain in &chains {
-                let Some(client) = self.chains.get(chain) else {
-                    continue;
-                };
-                let name = chain.clone();
-                reads.spawn(async move {
-                    let symbol = client.spec().native_symbol.clone();
-                    let decimals = client.spec().native_decimals;
-                    let chain_id = client.spec().chain_id;
-                    let raw = match tokio::time::timeout(BALANCE_TIMEOUT, client.balance(address))
-                        .await
-                    {
-                        Ok(Ok(raw)) => Some(raw),
-                        Ok(Err(error)) => {
-                            tracing::debug!(chain = %name, error = %error, "views.balance_unavailable");
-                            None
-                        }
-                        Err(_) => {
-                            tracing::debug!(chain = %name, "views.balance_timeout");
-                            None
-                        }
-                    };
-                    (name, raw, symbol, decimals, chain_id)
-                });
-            }
-            while let Some(joined) = reads.join_next().await {
-                let Ok((chain, raw, symbol, decimals, chain_id)) = joined else {
-                    continue;
-                };
-                match raw {
-                    // A zero balance is kept. "You hold nothing on Base" is
-                    // an answer; dropping the row leaves the reader unable to
-                    // tell it apart from a network that was never read.
-                    Some(raw) => {
-                        let quantity = bloom_proto::format_units(raw, decimals);
-                        let amount = quantity.parse::<f64>().unwrap_or(0.0);
-                        portfolio.holdings.push(Holding {
-                            label: self.network_label(&chain),
-                            wallet: wallet.clone(),
-                            chain,
-                            chain_id,
-                            symbol,
-                            quantity,
-                            amount,
-                            value: None,
-                        });
-                    }
-                    None => portfolio.unavailable.push((wallet.clone(), chain)),
-                }
-            }
+            let (holdings, unavailable) = self.read_balances(&wallet, address, &chains).await;
+            portfolio.holdings.extend(holdings);
+            portfolio.unavailable.extend(unavailable);
         }
 
         self.price(&mut portfolio).await;
@@ -327,48 +292,158 @@ impl ViewsHandler {
         portfolio
     }
 
+    /// Native balance on every configured chain for one address. The reads
+    /// run concurrently, so one slow endpoint costs a single budget rather
+    /// than the sum of them.
+    async fn read_balances(
+        &self,
+        owner: &str,
+        address: alloy::primitives::Address,
+        chains: &[String],
+    ) -> (Vec<Holding>, Vec<(String, String)>) {
+        let mut reads = tokio::task::JoinSet::new();
+        for chain in chains {
+            let Some(client) = self.chains.get(chain) else {
+                continue;
+            };
+            let name = chain.clone();
+            reads.spawn(async move {
+                let symbol = client.spec().native_symbol.clone();
+                let decimals = client.spec().native_decimals;
+                let chain_id = client.spec().chain_id;
+                let raw = match tokio::time::timeout(BALANCE_TIMEOUT, client.balance(address)).await
+                {
+                    Ok(Ok(raw)) => Some(raw),
+                    Ok(Err(error)) => {
+                        tracing::debug!(chain = %name, error = %error, "views.balance_unavailable");
+                        None
+                    }
+                    Err(_) => {
+                        tracing::debug!(chain = %name, "views.balance_timeout");
+                        None
+                    }
+                };
+                (name, raw, symbol, decimals, chain_id)
+            });
+        }
+        let (mut holdings, mut unavailable) = (Vec::new(), Vec::new());
+        while let Some(joined) = reads.join_next().await {
+            let Ok((chain, raw, symbol, decimals, chain_id)) = joined else {
+                continue;
+            };
+            match raw {
+                // A zero balance is kept. "You hold nothing on Base" is an
+                // answer; dropping the row leaves the reader unable to tell
+                // it apart from a network that was never read.
+                Some(raw) => {
+                    let quantity = bloom_proto::format_units(raw, decimals);
+                    let amount = quantity.parse::<f64>().unwrap_or(0.0);
+                    holdings.push(Holding {
+                        label: self.network_label(&chain),
+                        wallet: owner.to_owned(),
+                        chain,
+                        chain_id,
+                        symbol,
+                        quantity,
+                        amount,
+                        value: None,
+                    });
+                }
+                None => unavailable.push((owner.to_owned(), chain)),
+            }
+        }
+        (holdings, unavailable)
+    }
+
+    /// Balances for the addresses that sent your own recorded operations,
+    /// excluding wallets already projected.
+    ///
+    /// The funds are observable and worth seeing. The ownership claim is
+    /// deliberately not made: no projection backs these addresses here, so
+    /// they are reported as observations and never as wallets.
+    async fn history_portfolio(&self, exclude: &[String]) -> Portfolio {
+        let chains = self.sorted_chains();
+        let mut portfolio = Portfolio::default();
+        let mut seen: Vec<String> = Vec::new();
+        for action in self.actions().await {
+            let Some(from) = action
+                .intent
+                .as_ref()
+                .and_then(|intent| intent.from.clone())
+            else {
+                continue;
+            };
+            let lowered = from.to_ascii_lowercase();
+            if exclude.contains(&lowered) || seen.contains(&lowered) {
+                continue;
+            }
+            seen.push(lowered);
+            let Ok(address) = from.parse::<alloy::primitives::Address>() else {
+                continue;
+            };
+            let label = short_hex(&from);
+            portfolio.wallets.push(WalletSummary {
+                id: label.clone(),
+                address: Some(from.clone()),
+                kind: "observed address".to_owned(),
+                policy_version: "none projected".to_owned(),
+            });
+            let (holdings, _) = self.read_balances(&label, address, &chains).await;
+            portfolio.holdings.extend(holdings);
+        }
+        self.price(&mut portfolio).await;
+        portfolio
+    }
+
     /// Value what can be valued. A native asset is priced only on a chain
     /// where that asset *is* the market asset: a development chain whose
     /// native symbol happens to read "ETH" must never be valued at ether's
     /// price. A stale quote prices nothing.
     async fn price(&self, portfolio: &mut Portfolio) {
-        let mut symbols: Vec<String> = portfolio
+        let mut keys: Vec<&'static str> = portfolio
             .holdings
             .iter()
-            .filter(|holding| native_asset_has_market(holding.chain_id))
-            .map(|holding| holding.symbol.to_ascii_lowercase())
+            .filter(|holding| holding.is_funded())
+            .filter_map(|holding| native_asset_market(holding.chain_id))
             .collect();
-        symbols.sort();
-        symbols.dedup();
+        keys.sort_unstable();
+        keys.dedup();
 
         let now = now_secs();
-        let mut quotes: BTreeMap<String, f64> = BTreeMap::new();
-        for symbol in symbols {
-            let coin = CoinId::Symbol(symbol.clone());
+        let mut quotes: BTreeMap<&'static str, f64> = BTreeMap::new();
+        for key in keys {
+            let coin = match CoinId::parse(key) {
+                Ok(coin) => coin,
+                Err(error) => {
+                    tracing::debug!(key, error = %error, "views.price_key_invalid");
+                    portfolio.price_coverage_gap = true;
+                    continue;
+                }
+            };
             match tokio::time::timeout(PRICE_TIMEOUT, self.prices.current(coin)).await {
                 Ok(Ok(quote)) if quote.price >= 0.0 && fresh_quote(quote.timestamp, now) => {
-                    quotes.insert(symbol, quote.price);
+                    quotes.insert(key, quote.price);
                 }
                 Ok(Ok(_)) => {
-                    tracing::debug!(symbol = %symbol, "views.quote_stale");
+                    tracing::debug!(key, "views.quote_stale");
                     portfolio.price_coverage_gap = true;
                 }
                 Ok(Err(error)) => {
-                    tracing::debug!(symbol = %symbol, error = %error, "views.price_unavailable");
+                    tracing::debug!(key, error = %error, "views.price_unavailable");
                     portfolio.price_coverage_gap = true;
                 }
                 Err(_) => {
-                    tracing::debug!(symbol = %symbol, "views.price_timeout");
+                    tracing::debug!(key, "views.price_timeout");
                     portfolio.price_coverage_gap = true;
                 }
             }
         }
 
         for holding in &mut portfolio.holdings {
-            if !native_asset_has_market(holding.chain_id) {
+            let Some(key) = native_asset_market(holding.chain_id) else {
                 continue;
-            }
-            if let Some(price) = quotes.get(&holding.symbol.to_ascii_lowercase()) {
+            };
+            if let Some(price) = quotes.get(key) {
                 holding.value = Some(holding.amount * price);
             }
         }
@@ -786,6 +861,51 @@ impl ViewsHandler {
             body.push_str("</section>");
         }
 
+        // The wallets above are what Broker projects. These addresses are
+        // what actually sent your recorded operations, and a reader looking
+        // for "where is my money" is otherwise told nothing at all.
+        let projected: Vec<String> = portfolio
+            .wallets
+            .iter()
+            .filter_map(|wallet| wallet.address.as_ref())
+            .map(|address| address.to_ascii_lowercase())
+            .collect();
+        let history = self.history_portfolio(&projected).await;
+        let observed = history.funded();
+        if !observed.is_empty() {
+            body.push_str(
+                "<div class=\"section-head\"><h2>Seen in your history</h2>\
+                 <p>Observed addresses · not projected wallets</p></div>\
+                 <p class=\"lede\">These addresses sent operations recorded in your outbox. \
+                 Bloom projects no policy or key for them here, so they are reported as \
+                 observations only and are not counted in the total above.</p>",
+            );
+            for summary in &history.wallets {
+                let rows: Vec<&Holding> = observed
+                    .iter()
+                    .copied()
+                    .filter(|holding| holding.wallet == summary.id)
+                    .collect();
+                if rows.is_empty() {
+                    continue;
+                }
+                let total: f64 = rows.iter().filter_map(|holding| holding.value).sum();
+                body.push_str(&format!(
+                    "<section><div class=\"section-head\"><h3>{id}</h3><p>{total}</p></div>\
+                     <dl class=\"receipt-facts\"><div><dt>Address</dt>\
+                     <dd><code>{address}</code></dd></div></dl>{table}</section>",
+                    id = html_escape(&summary.id),
+                    address = html_escape(summary.address.as_deref().unwrap_or("Unavailable")),
+                    total = html_escape(&if total > 0.0 {
+                        money(Some(total))
+                    } else {
+                        "No priced balance".to_owned()
+                    }),
+                    table = holdings_table(&rows, "Observed balances"),
+                ));
+            }
+        }
+
         page(
             "Wallets",
             "Your actual holdings.",
@@ -1071,6 +1191,281 @@ impl ViewsHandler {
         )
     }
 
+    /// Public market context: what the provider reports is moving, and the
+    /// full sample it was drawn from. Exposure is deliberately not implied —
+    /// a row here is not a holding.
+    async fn render_markets(&self) -> String {
+        let mut body = String::new();
+        let Some(rows) = self.market.markets().await else {
+            body.push_str(
+                "<section class=\"callout warn\"><strong>The market provider did not \
+                 answer</strong><p>No rows were returned, so none are shown. A provider that \
+                 does not answer is not a flat market.</p></section>",
+            );
+            return page(
+                "Markets",
+                "What is moving?",
+                "Public provider observations, read by your daemon. Nothing here is a holding \
+                 of yours, and nothing here is advice.",
+                MARKETS_HTML,
+                &body,
+            );
+        };
+
+        let mut movers: Vec<&TokenMarket> =
+            rows.iter().filter(|row| row.change_24h.is_some()).collect();
+        movers.sort_by(|a, b| {
+            b.change_24h
+                .partial_cmp(&a.change_24h)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        if !movers.is_empty() {
+            let tiles: String = movers
+                .iter()
+                .take(3)
+                .map(|row| {
+                    format!(
+                        "<div class=\"mover-tile\"><h3>{symbol}</h3><strong>{change}</strong>\
+                         <small>{volume} reported volume · 24h</small></div>",
+                        symbol = html_escape(&row.symbol),
+                        change = html_escape(&signed_percent(row.change_24h)),
+                        volume = html_escape(
+                            &row.volume_24h.map(compact_usd).unwrap_or("No".to_owned())
+                        ),
+                    )
+                })
+                .collect();
+            body.push_str(&format!(
+                "<div class=\"section-head\"><h2>What is moving around you</h2>\
+                 <p>Largest signed 24h changes in the provider sample</p></div>\
+                 <div class=\"mover-grid\">{tiles}</div>\
+                 <p class=\"chart-note\">A price move shows direction, not its cause. Volume \
+                 adds context; neither creates a required trade.</p>"
+            ));
+        }
+
+        let cells: String = rows
+            .iter()
+            .map(|row| {
+                format!(
+                    "<tr><td data-label=\"Token\"><span class=\"asset-label\">{mark}\
+                     <span><strong>{name}</strong><small>{symbol}</small></span></span></td>\
+                     <td class=\"numeric\" data-label=\"Price\">{price}</td>\
+                     <td class=\"numeric\" data-label=\"24h change\">{change}</td>\
+                     <td class=\"numeric money\" data-label=\"24h volume\">{volume}</td></tr>",
+                    mark = monogram(&row.symbol),
+                    name = html_escape(&row.name),
+                    symbol = html_escape(&row.symbol),
+                    price = html_escape(&row.price.map(money_precise).unwrap_or("—".to_owned())),
+                    change = html_escape(&signed_percent(row.change_24h)),
+                    volume =
+                        html_escape(&row.volume_24h.map(compact_usd).unwrap_or("—".to_owned())),
+                )
+            })
+            .collect();
+        body.push_str(&format!(
+            "<div class=\"section-head\"><h2>Most traded in the provider sample</h2>\
+             <p>{count} · 24h reported volume</p></div>\
+             <div class=\"table-wrap\"><table><caption>Provider market sample</caption>\
+             <thead><tr><th scope=\"col\">Token</th><th scope=\"col\">Price</th>\
+             <th scope=\"col\">24h change</th><th scope=\"col\">24h volume</th></tr></thead>\
+             <tbody>{cells}</tbody></table></div>",
+            count = count_noun(rows.len(), "row", "rows"),
+        ));
+        body.push_str(
+            "<section class=\"callout\"><strong>Price movement is not your personal \
+             return.</strong><p>Volume is aggregate trading reported by the provider, not \
+             liquidity available to you. Stablecoins stay in this ranking, and none of these \
+             rows is a holding of yours.</p></section>",
+        );
+
+        page(
+            "Markets",
+            "What is moving?",
+            "Public provider observations, read by your daemon. Nothing here is a holding of \
+             yours, and nothing here is advice.",
+            MARKETS_HTML,
+            &body,
+        )
+    }
+
+    /// Where the configured networks stand: whether each answered your own
+    /// daemon, and what the public provider reports for its trading activity.
+    async fn render_chains(&self) -> String {
+        let portfolio = self.portfolio().await;
+        let mut body = String::new();
+        body.push_str(&portfolio.notices());
+
+        let mut cells = String::new();
+        for chain in self.sorted_chains() {
+            let Some(client) = self.chains.get(&chain) else {
+                continue;
+            };
+            let chain_id = client.spec().chain_id;
+            let answered = portfolio
+                .holdings
+                .iter()
+                .any(|holding| holding.chain == chain);
+            let held: f64 = portfolio
+                .holdings
+                .iter()
+                .filter(|holding| holding.chain == chain)
+                .filter_map(|holding| holding.value)
+                .sum();
+            let volume = match market_data::chain_slug(chain_id) {
+                Some(slug) => self.market.volume(slug).await,
+                None => None,
+            };
+            cells.push_str(&format!(
+                "<tr><td data-label=\"Network\">{label}</td>\
+                 <td data-label=\"Read\">{read}</td>\
+                 <td class=\"numeric money\" data-label=\"DEX volume\">{volume}</td>\
+                 <td class=\"numeric\" data-label=\"Vs previous day\">{change}</td>\
+                 <td class=\"numeric money\" data-label=\"Your priced assets\">{held}</td></tr>",
+                label = asset_label(&self.network_label(&chain)),
+                read = if answered {
+                    "<span class=\"badge good\">Answered</span>"
+                } else {
+                    "<span class=\"badge warn\">No answer</span>"
+                },
+                volume = html_escape(
+                    &volume
+                        .as_ref()
+                        .and_then(|v| v.total_24h)
+                        .map(compact_usd)
+                        .unwrap_or("Unavailable".to_owned())
+                ),
+                change = html_escape(&signed_percent(volume.as_ref().and_then(|v| v.change_1d))),
+                held = html_escape(&if held > 0.0 {
+                    money(Some(held))
+                } else {
+                    "—".to_owned()
+                }),
+            ));
+        }
+
+        body.push_str(&format!(
+            "<div class=\"section-head\"><h2>Your configured networks</h2>\
+             <p>Provider-reported 24h DEX volume; not a global chain ranking</p></div>\
+             <div class=\"table-wrap\"><table><caption>Configured networks</caption><thead><tr>\
+             <th scope=\"col\">Network</th><th scope=\"col\">Read</th>\
+             <th scope=\"col\">DEX volume</th><th scope=\"col\">Vs previous day</th>\
+             <th scope=\"col\">Your priced assets</th></tr></thead><tbody>{cells}</tbody>\
+             </table></div>"
+        ));
+        body.push_str(
+            "<section class=\"callout\"><strong>Different sources keep different \
+             clocks.</strong><p>Trading activity is a provider's rolling aggregate, not a \
+             synchronised UTC-day comparison with your own reads. Missing coverage is \
+             \"Unavailable\", never zero, and a chain with no market for its native unit is \
+             never valued.</p></section>",
+        );
+
+        page(
+            "Chains",
+            "Where your assets live.",
+            "Connection comes from your own daemon; trading activity comes from a public \
+             provider. Neither grants this wallet permission to transact.",
+            CHAINS_HTML,
+            &body,
+        )
+    }
+
+    /// What everyone pays to use a network, over time, beside what a single
+    /// operation currently costs.
+    async fn render_fees(&self) -> String {
+        let mut body = String::new();
+        let mut panels = String::new();
+        for chain in self.sorted_chains() {
+            let Some(client) = self.chains.get(&chain) else {
+                continue;
+            };
+            let chain_id = client.spec().chain_id;
+            let Some(slug) = market_data::chain_slug(chain_id) else {
+                continue;
+            };
+            let Some(series) = self.market.fees(slug).await else {
+                continue;
+            };
+            if series.points.is_empty() {
+                continue;
+            }
+            let latest = series.points.last().copied();
+            let week: Vec<(u64, f64)> = series.points.iter().rev().take(7).rev().copied().collect();
+            let label = self.network_label(&chain);
+            panels.push_str(&format!(
+                "<section class=\"chart-panel\"><div class=\"chart-heading\">\
+                 <div><p class=\"eyebrow\">Network fees paid per day</p><h3>{label}</h3></div>\
+                 <div class=\"chart-latest\"><strong>{latest}</strong><br>\
+                 <small>{when}</small></div></div>\
+                 <p class=\"eyebrow\">Last 30 completed days</p>{month}\
+                 <p class=\"eyebrow\">Last 7 completed days</p>{week}\
+                 <p class=\"chart-note\">Total fees paid by everyone using this chain. This \
+                 measures paid network usage, not your own transaction price.</p>\
+                 {method}</section>",
+                label = html_escape(&label),
+                latest = html_escape(
+                    &latest
+                        .map(|(_, v)| compact_usd(v))
+                        .unwrap_or("—".to_owned())
+                ),
+                when = html_escape(
+                    &latest
+                        .map(|(ts, _)| format_utc_day(ts * 1000))
+                        .unwrap_or_default()
+                ),
+                month = line_chart(
+                    &series.points,
+                    &format!("{label} daily network fees, 30 days"),
+                    "USD / day",
+                ),
+                week = line_chart(
+                    &week,
+                    &format!("{label} daily network fees, 7 days"),
+                    "USD / day",
+                ),
+                method = match &series.methodology {
+                    Some(text) => format!(
+                        "<details><summary>How these fees are measured</summary><p>{}</p>\
+                         <p>Provider daily totals. The current UTC day is excluded because it \
+                         is still accruing; gaps remain gaps.</p></details>",
+                        html_escape(text)
+                    ),
+                    None => String::new(),
+                },
+            ));
+        }
+
+        if panels.is_empty() {
+            body.push_str(
+                "<section class=\"callout warn\"><strong>No fee history was returned</strong>\
+                 <p>The public provider returned no daily totals for the configured networks, \
+                 so none are drawn. Missing history is not drawn as zero.</p></section>",
+            );
+        } else {
+            body.push_str(&format!(
+                "<div class=\"section-head\"><h2>Network fees over time</h2>\
+                 <p>Daily totals · USD · last completed UTC days</p></div>{panels}"
+            ));
+        }
+
+        body.push_str(
+            "<section class=\"attention-strip\"><div><h3>Your own execution fees</h3>\
+             <p>Activity records the gas limit and fee cap each operation was staged with. \
+             These network totals are what everyone paid, not what you paid.</p></div>\
+             <a href=\"activity.html\">Inspect your transactions →</a></section>",
+        );
+
+        page(
+            "Fees",
+            "Network fees, over time.",
+            "What everyone pays to use a network. This is paid network usage, not a quote for \
+             your next transaction.",
+            FEES_HTML,
+            &body,
+        )
+    }
+
     async fn render_access(&self) -> String {
         let (wallets, unavailable) = self.wallet_projections().await;
         let chains = self.sorted_chains();
@@ -1350,6 +1745,7 @@ impl Holding {
 struct Intent {
     wallet: Option<String>,
     chain: Option<String>,
+    chain_id: Option<u64>,
     from: Option<String>,
     to: Option<String>,
     value_wei: Option<String>,
@@ -1409,6 +1805,14 @@ impl Action {
             "failed" => "✗ Never broadcast",
             _ => "◷ Staged · needs you",
         }
+    }
+
+    /// A block-explorer link for this operation's broadcast hash, when the
+    /// chain it ran on has a known explorer.
+    fn explorer_url(&self) -> Option<String> {
+        let hash = self.tx_hash.as_deref()?;
+        let chain_id = self.intent.as_ref().and_then(|intent| intent.chain_id)?;
+        explorer_tx_url(chain_id, hash)
     }
 
     /// When this operation happened, preferring the intent's own creation
@@ -1484,10 +1888,15 @@ impl Action {
         // The hash belongs in the row itself, not buried in the details: it
         // is the one value a person takes elsewhere to look the tx up.
         if let Some(hash) = &self.tx_hash {
-            meta.push_str(&format!(
-                "<span><code>{}</code></span>",
-                html_escape(&short_hex(hash))
-            ));
+            let short = html_escape(&short_hex(hash));
+            match self.explorer_url() {
+                Some(url) => meta.push_str(&format!(
+                    "<span><a href=\"{url}\" rel=\"noreferrer noopener\"><code>{short}</code></a>\
+                     </span>",
+                    url = html_escape(&url),
+                )),
+                None => meta.push_str(&format!("<span><code>{short}</code></span>")),
+            }
         }
 
         let denial = match &self.denial {
@@ -1509,6 +1918,15 @@ impl Action {
                 "Transaction hash",
                 format!("<code>{}</code>", html_escape(hash)),
             );
+            if let Some(url) = self.explorer_url() {
+                row_fact(
+                    "Block explorer",
+                    format!(
+                        "<a href=\"{url}\" rel=\"noreferrer noopener\">View transaction ↗</a>",
+                        url = html_escape(&url),
+                    ),
+                );
+            }
         }
         if let Some(intent) = &self.intent {
             if let Some(from) = &intent.from {
@@ -1613,6 +2031,7 @@ fn parse_intent(text: &str) -> Option<Intent> {
     Some(Intent {
         wallet: string("wallet"),
         chain: string("chain"),
+        chain_id: number("chain_id"),
         from: string("from"),
         to: string("to"),
         value_wei: string("value_wei"),
@@ -1658,6 +2077,148 @@ fn short_quantity(text: &str) -> String {
     }
     let lead: String = whole.chars().take(3).collect();
     format!("≈{}.{} × 10^{}", &lead[..1], &lead[1..], whole.len() - 1)
+}
+
+/// A line chart as static SVG, in the shape the stylesheet already ships: a
+/// 600×170 viewBox, three grid rules, one path, a dot per observation, and a
+/// cursor on the latest point. These pages carry no script, so the chart is
+/// drawn once, here.
+///
+/// A gap wider than two days starts a new subpath. Joining across missing
+/// days with a straight line would draw observations that were never made.
+fn line_chart(points: &[(u64, f64)], label: &str, unit: &str) -> String {
+    if points.is_empty() {
+        return "<p class=\"chart-note\">No historical observations were returned. Missing \
+                data is not drawn as zero.</p>"
+            .to_owned();
+    }
+    let peak = points
+        .iter()
+        .map(|(_, value)| *value)
+        .fold(0.0_f64, f64::max)
+        * 1.1;
+    let top = if peak > 0.0 { peak } else { 1.0 };
+    let start = points.first().map(|(ts, _)| *ts).unwrap_or(0);
+    let end = points.last().map(|(ts, _)| *ts).unwrap_or(start);
+    let span = end.saturating_sub(start).max(1) as f64;
+    const GAP_SECS: u64 = 2 * 86_400;
+
+    let coords: Vec<(f64, f64)> = points
+        .iter()
+        .map(|(ts, value)| {
+            (
+                (ts.saturating_sub(start) as f64) / span * 600.0,
+                160.0 - (value / top) * 150.0,
+            )
+        })
+        .collect();
+
+    let mut path = String::new();
+    let mut previous: Option<u64> = None;
+    for ((ts, _), (x, y)) in points.iter().zip(&coords) {
+        let command = match previous {
+            Some(last) if ts.saturating_sub(last) <= GAP_SECS => 'L',
+            _ => 'M',
+        };
+        path.push_str(&format!("{command}{x:.2},{y:.2} "));
+        previous = Some(*ts);
+    }
+    let dots: String = coords
+        .iter()
+        .map(|(x, y)| format!("<circle cx=\"{x:.2}\" cy=\"{y:.2}\" r=\"2.5\"/>"))
+        .collect();
+    let (last_x, last_y) = coords.last().copied().unwrap_or((0.0, 0.0));
+    let rows: String = points
+        .iter()
+        .map(|(ts, value)| {
+            format!(
+                "<tr><td data-label=\"Date\">{date} UTC</td>\
+                 <td class=\"numeric\" data-label=\"{unit}\">{value}</td></tr>",
+                date = html_escape(&format_utc_day(ts * 1000)),
+                unit = html_escape(unit),
+                value = html_escape(&chart_value(*value, unit)),
+            )
+        })
+        .collect();
+
+    format!(
+        "<div class=\"history-chart\"><div class=\"chart-scale\"><span>{peak}</span>\
+         <span>{unit}</span></div>\
+         <svg class=\"time-chart\" viewBox=\"0 0 600 170\" preserveAspectRatio=\"none\" \
+         role=\"img\" aria-label=\"{label}\">\
+         <path class=\"chart-grid\" d=\"M0 10H600 M0 85H600 M0 160H600\"/>\
+         <path class=\"chart-line\" d=\"{path}\"/>\
+         <g class=\"chart-dots\">{dots}</g>\
+         <line class=\"chart-cursor\" x1=\"{last_x:.2}\" x2=\"{last_x:.2}\" y1=\"0\" y2=\"160\"/>\
+         <circle class=\"chart-selected\" cx=\"{last_x:.2}\" cy=\"{last_y:.2}\" r=\"5\"/></svg>\
+         <span class=\"chart-zero\">0</span>\
+         <div class=\"chart-axis\"><span>{first_day}</span><span>{last_day} UTC</span></div>\
+         <output class=\"chart-readout\">{readout}</output>\
+         <details><summary>Exact observations · {count}</summary>\
+         <div class=\"table-wrap\"><table><caption>{label}</caption><thead><tr>\
+         <th scope=\"col\">Date</th><th scope=\"col\">{unit}</th></tr></thead>\
+         <tbody>{rows}</tbody></table></div></details></div>",
+        peak = html_escape(&chart_value(top, unit)),
+        unit = html_escape(unit),
+        label = html_escape(label),
+        first_day = html_escape(&format_utc_day(start * 1000)),
+        last_day = html_escape(&format_utc_day(end * 1000)),
+        readout = html_escape(&format!(
+            "{} UTC · {}",
+            format_utc_day(end * 1000),
+            chart_value(points.last().map(|(_, value)| *value).unwrap_or(0.0), unit),
+        )),
+        count = points.len(),
+    )
+}
+
+/// One chart value, in whatever unit the axis is labelled with.
+fn chart_value(value: f64, unit: &str) -> String {
+    if unit.starts_with("USD") {
+        compact_usd(value)
+    } else {
+        trim_trailing_zeros(&format!("{value:.4}"))
+    }
+}
+
+/// `$254.84K`. A daily fee total runs to seven figures, which does not fit a
+/// chart axis; the exact figure stays in the observations table.
+fn compact_usd(value: f64) -> String {
+    let abs = value.abs();
+    let (scaled, suffix) = if abs >= 1e12 {
+        (value / 1e12, "T")
+    } else if abs >= 1e9 {
+        (value / 1e9, "B")
+    } else if abs >= 1e6 {
+        (value / 1e6, "M")
+    } else if abs >= 1e3 {
+        (value / 1e3, "K")
+    } else {
+        (value, "")
+    };
+    format!("${scaled:.2}{suffix}")
+}
+
+/// `+45.78%`, or an explicit absence. A change the provider did not report is
+/// not a flat market.
+fn signed_percent(value: Option<f64>) -> String {
+    match value {
+        Some(value) => format!(
+            "{sign}{value:.2}%",
+            sign = if value >= 0.0 { "+" } else { "" }
+        ),
+        None => "Not available".to_owned(),
+    }
+}
+
+/// A price, which unlike a total needs sub-cent resolution to say anything
+/// honest about an asset trading below a dollar.
+fn money_precise(value: f64) -> String {
+    if value != 0.0 && value.abs() < 1.0 {
+        format!("${value:.4}")
+    } else {
+        money(Some(value))
+    }
 }
 
 /// `0x4b81a384…eb1748` — enough to recognise, short enough to sit in a row;
@@ -1822,22 +2383,60 @@ fn is_page(name: &str) -> bool {
 /// app chain handing out a faucet balance must not be valued at ether's
 /// price. An unlisted chain reports its quantity and stays unpriced, which is
 /// the same rule as a missing quote.
-const NATIVE_ASSET_MARKETS: &[u64] = &[
-    1,      // Ethereum
-    10,     // OP Mainnet
-    56,     // BNB Smart Chain
-    100,    // Gnosis
-    137,    // Polygon
-    8453,   // Base
-    42161,  // Arbitrum One
-    43114,  // Avalanche C-Chain
-    59144,  // Linea
-    81457,  // Blast
-    534352, // Scroll
+const NATIVE_ASSET_MARKETS: &[(u64, &str)] = &[
+    (1, "coingecko:ethereum"),                  // Ethereum
+    (10, "coingecko:ethereum"),                 // OP Mainnet
+    (56, "coingecko:binancecoin"),              // BNB Smart Chain
+    (100, "coingecko:xdai"),                    // Gnosis
+    (137, "coingecko:polygon-ecosystem-token"), // Polygon
+    (999, "coingecko:hyperliquid"),             // HyperEVM
+    (8453, "coingecko:ethereum"),               // Base
+    (42161, "coingecko:ethereum"),              // Arbitrum One
+    (43114, "coingecko:avalanche-2"),           // Avalanche C-Chain
+    (59144, "coingecko:ethereum"),              // Linea
+    (81457, "coingecko:ethereum"),              // Blast
+    (534352, "coingecko:ethereum"),             // Scroll
 ];
 
+/// The market key for a chain's native unit, when that unit is a traded asset.
+///
+/// A bare symbol is not a usable key: asking the price source for `eth`
+/// answers with no coin at all, which left every row silently unpriced. Every
+/// entry here is a `coingecko:` slug, which the source does resolve.
+fn native_asset_market(chain_id: u64) -> Option<&'static str> {
+    NATIVE_ASSET_MARKETS
+        .iter()
+        .find(|(id, _)| *id == chain_id)
+        .map(|(_, key)| *key)
+}
+
 fn native_asset_has_market(chain_id: u64) -> bool {
-    NATIVE_ASSET_MARKETS.contains(&chain_id)
+    native_asset_market(chain_id).is_some()
+}
+
+/// Block explorers, keyed on chain id. The hash is the one value a person
+/// carries elsewhere, and without a link they have to go and find the right
+/// explorer themselves. Following one is the reader's own choice: these pages
+/// never fetch from an explorer, and `referrer=no-referrer` keeps the visit
+/// unattributed.
+const EXPLORERS: &[(u64, &str)] = &[
+    (1, "https://etherscan.io/tx/"),
+    (10, "https://optimistic.etherscan.io/tx/"),
+    (56, "https://bscscan.com/tx/"),
+    (100, "https://gnosisscan.io/tx/"),
+    (137, "https://polygonscan.com/tx/"),
+    (4663, "https://robinhoodchain.blockscout.com/tx/"),
+    (8453, "https://basescan.org/tx/"),
+    (42161, "https://arbiscan.io/tx/"),
+    (43114, "https://snowtrace.io/tx/"),
+    (59144, "https://lineascan.build/tx/"),
+];
+
+fn explorer_tx_url(chain_id: u64, hash: &str) -> Option<String> {
+    EXPLORERS
+        .iter()
+        .find(|(id, _)| *id == chain_id)
+        .map(|(_, base)| format!("{base}{hash}"))
 }
 
 /// A test network is named as one. No chain spec carries a testnet flag, so
@@ -2038,6 +2637,9 @@ mod tests {
             // page or invent a number.
             bloom_prices::PricesClient::with_base_url("http://127.0.0.1:1"),
             outbox,
+            // Likewise for public market context: an unreachable provider
+            // must leave a panel saying so, never a zero.
+            MarketData::with_base_url("http://127.0.0.1:1"),
         );
         Fixture {
             handler,
@@ -2372,7 +2974,9 @@ mod tests {
     #[tokio::test]
     async fn unknown_page_is_not_found_and_a_page_is_not_a_dir() {
         let handler = fixture().handler;
-        let missing = VfsPath::parse("markets.html").unwrap();
+        // Deliberately not a page: these views observe, and never offer a
+        // send surface, so `send.html` must stay unserved.
+        let missing = VfsPath::parse("send.html").unwrap();
         assert!(matches!(
             handler.lookup(&missing).await,
             Err(HandlerError::NotFound(_))
@@ -2442,6 +3046,42 @@ mod tests {
                 "chain {chain_id} must not be valued at another asset's price"
             );
         }
+    }
+
+    #[test]
+    fn every_market_key_is_one_the_price_source_can_resolve() {
+        // Asking the price source for a bare symbol answers with no coin at
+        // all, which left every row silently unpriced. Only `coingecko:`
+        // slugs resolve, so every entry must be one and must parse.
+        for (chain_id, key) in NATIVE_ASSET_MARKETS {
+            assert!(
+                key.starts_with("coingecko:"),
+                "chain {chain_id} uses {key}, which the price source cannot resolve"
+            );
+            assert!(
+                CoinId::parse(key).is_ok(),
+                "chain {chain_id} key {key} must parse"
+            );
+        }
+        assert_eq!(native_asset_market(1), Some("coingecko:ethereum"));
+        assert_eq!(native_asset_market(43114), Some("coingecko:avalanche-2"));
+        // A faucet chain naming its unit "ETH" is still not ether.
+        assert_eq!(native_asset_market(4217), None);
+    }
+
+    #[test]
+    fn a_broadcast_hash_links_to_its_own_chain_explorer() {
+        assert_eq!(
+            explorer_tx_url(1, "0xabc").as_deref(),
+            Some("https://etherscan.io/tx/0xabc")
+        );
+        assert_eq!(
+            explorer_tx_url(8453, "0xabc").as_deref(),
+            Some("https://basescan.org/tx/0xabc")
+        );
+        // An unknown chain gets no link rather than one pointing at the
+        // wrong chain's explorer.
+        assert_eq!(explorer_tx_url(4217, "0xabc"), None);
     }
 
     #[test]
@@ -2578,7 +3218,11 @@ mod tests {
             Ok(_) => bloom_prices::PricesClient::new(),
             Err(_) => bloom_prices::PricesClient::with_base_url("http://127.0.0.1:1"),
         };
-        let handler = ViewsHandler::new(projections, chains, prices, outbox);
+        let market = match std::env::var("VIEWS_REAL_MARKETS") {
+            Ok(_) => MarketData::new(),
+            Err(_) => MarketData::with_base_url("http://127.0.0.1:1"),
+        };
+        let handler = ViewsHandler::new(projections, chains, prices, outbox, market);
         let staged = Fixture {
             handler: handler.clone(),
             _tmp: tmp,

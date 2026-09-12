@@ -14,6 +14,13 @@ open /Volumes/bloom/views/index.html # macOS
 ## Pages
 
 - `index.html` — Today: what is held, what is waiting, what never sent.
+- `markets.html` — what a public provider reports is moving, and the sample it
+  was drawn from. No row here is a holding of yours.
+- `chains.html` — each configured network: whether it answered your daemon,
+  its provider-reported trading activity, and what you hold priced on it.
+- `fees.html` — daily fees paid by everyone using a network, over the last
+  completed UTC days. This is paid network usage, not a quote for your next
+  transaction.
 - `wallets.html` — native balances per wallet on every network that answered,
   with the wallet's address, kind, and policy version.
 - `receive.html` — receiving addresses grouped by wallet and address family,

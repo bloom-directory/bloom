@@ -3720,6 +3720,7 @@ impl Daemon {
                     chains.clone(),
                     views_prices,
                     central_outbox_handler.clone(),
+                    bloom_vfs::handlers::MarketData::new(),
                 )) as _,
             )
             .mount("outbox", central_outbox_handler.clone() as _)
