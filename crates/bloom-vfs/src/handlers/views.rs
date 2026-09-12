@@ -2986,6 +2986,41 @@ mod tests {
         }
     }
 
+    /// A read-only view of a real `petals/` directory on disk, so the pages
+    /// can be rendered against a live Bloom home. Development aid only: in
+    /// production the section reads the mounted router, which computes leaves
+    /// this cannot.
+    struct FsPetals(std::path::PathBuf);
+
+    #[async_trait]
+    impl Handler for FsPetals {
+        async fn lookup(&self, _path: &VfsPath) -> Result<Entry, HandlerError> {
+            Ok(Entry::dir(""))
+        }
+
+        async fn read(&self, path: &VfsPath) -> Result<Vec<u8>, HandlerError> {
+            let target = self.0.join(path.segments().join("/"));
+            std::fs::read(&target).map_err(|error| HandlerError::not_found(error.to_string()))
+        }
+
+        async fn list(&self, path: &VfsPath) -> Result<Vec<Entry>, HandlerError> {
+            let target = self.0.join(path.segments().join("/"));
+            let listing = std::fs::read_dir(&target)
+                .map_err(|error| HandlerError::not_found(error.to_string()))?;
+            let mut entries = Vec::new();
+            for entry in listing {
+                let entry = entry.map_err(|error| HandlerError::backend(error.to_string()))?;
+                let name = entry.file_name().to_string_lossy().to_string();
+                entries.push(if entry.path().is_dir() {
+                    Entry::dir(&name)
+                } else {
+                    Entry::file(&name)
+                });
+            }
+            Ok(entries)
+        }
+    }
+
     #[tokio::test]
     async fn petal_positions_reach_the_wallets_page() {
         let fixture = fixture();
@@ -3599,6 +3634,13 @@ mod tests {
             Err(_) => MarketData::with_base_url("http://127.0.0.1:1"),
         };
         let handler = ViewsHandler::new(projections, chains, prices, outbox, market);
+        // VIEWS_PETALS=~/bloom/petals renders Petal positions from a live
+        // home. Several Petal leaves are computed by the router rather than
+        // stored, so a filesystem read sees fewer of them than production.
+        let handler = match std::env::var("VIEWS_PETALS") {
+            Ok(root) => handler.with_petals(Arc::new(FsPetals(root.into()))),
+            Err(_) => handler,
+        };
         let staged = Fixture {
             handler: handler.clone(),
             _tmp: tmp,
