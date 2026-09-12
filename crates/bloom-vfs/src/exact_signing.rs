@@ -843,9 +843,114 @@ mod tests {
         WalletPublic,
     };
 
+    #[derive(Default)]
     struct MockBroker {
         requests: Mutex<Vec<MachineBrokerRequest>>,
         conflict_sign_once: AtomicBool,
+        /// Simulates the pre-#265 derivation defect for the negative twin: the
+        /// approval presents no `value_limits` even though the claim declares
+        /// value, so the accounting mirror must refuse it.
+        drop_value_limits: bool,
+        /// The fee asset the provenance catalog marks for the operation class
+        /// under test, mirroring `account_declared_values`' fee matching.
+        class_fee_asset: Option<bloom_broker_api::ProvenanceFeeAsset>,
+    }
+
+    impl MockBroker {
+        /// Mirrors `account_declared_values` in bloom-broker's `authority.rs`
+        /// (the accounting a real Broker runs whenever a claim declares
+        /// value): the claim's declared debits plus its declared fee must
+        /// each name an asset covered by the approval's `value_limits`, and
+        /// each covered total must fit the limit's lifetime. A declared fee
+        /// is only legal when the provenance class is fee-bearing with the
+        /// same asset.
+        fn assert_accounting_accepts(
+            &self,
+            claim: &bloom_broker_api::PetalUseClaim,
+            limits: &[bloom_broker_api::ValueLimit],
+        ) -> Result<(), ProtocolError> {
+            let missing =
+                |why: &str| ProtocolError::new(ProtocolErrorCode::ClaimInvalid, why.to_string());
+            let mut declared: Vec<((String, String), u128)> = Vec::new();
+            {
+                let mut add =
+                    |chain: &str, asset: &str, amount: &str| -> Result<(), ProtocolError> {
+                        let amount: u128 = amount
+                            .parse()
+                            .map_err(|_| missing("declared value is not a decimal amount"))?;
+                        let key = (chain.to_string(), asset.to_string());
+                        if let Some((_, total)) = declared.iter_mut().find(|(name, _)| *name == key)
+                        {
+                            *total = total.checked_add(amount).ok_or_else(|| {
+                                missing("declared value exceeds approval accounting arithmetic")
+                            })?;
+                        } else {
+                            declared.push((key, amount));
+                        }
+                        Ok(())
+                    };
+                for debit in &claim.declared_debits {
+                    add(
+                        debit.asset.chain.as_str(),
+                        &debit.asset.asset,
+                        debit.amount.as_str(),
+                    )?;
+                }
+                match (&self.class_fee_asset, &claim.declared_fee) {
+                    (None, bloom_broker_api::DeclaredFee::None) => {}
+                    (
+                        Some(expected),
+                        bloom_broker_api::DeclaredFee::Fee {
+                            chain,
+                            asset,
+                            amount,
+                        },
+                    ) if expected.chain == *chain && expected.asset == *asset => {
+                        add(chain.as_str(), asset.as_str(), amount.as_str())?;
+                    }
+                    (Some(_), bloom_broker_api::DeclaredFee::None) => {
+                        return Err(missing(
+                            "FEE_REQUIRED: fee-bearing operation class must declare its native fee",
+                        ));
+                    }
+                    (None, bloom_broker_api::DeclaredFee::Fee { .. }) => {
+                        return Err(missing(
+                            "FEE_NOT_ALLOWED: non-fee operation class must declare fee none",
+                        ));
+                    }
+                    _ => {
+                        return Err(missing(
+                            "FEE_ASSET_MISMATCH: declared fee does not match provenance fee asset",
+                        ));
+                    }
+                }
+            }
+            let limits = if self.drop_value_limits {
+                &[][..]
+            } else {
+                limits
+            };
+            for ((chain, asset), total) in &declared {
+                let Some(limit) = limits.iter().find(|limit| {
+                    limit.asset.chain.as_str() == chain && limit.asset.asset.as_str() == asset
+                }) else {
+                    return Err(missing(
+                        "VALUE_ASSET_NOT_ALLOWED: declared debit or fee asset is absent from approval limits",
+                    ));
+                };
+                let lifetime: u128 = limit
+                    .lifetime
+                    .as_str()
+                    .parse()
+                    .map_err(|_| missing("approval lifetime is not a decimal amount"))?;
+                if lifetime < *total {
+                    return Err(missing(
+                        "LimitExceededValue: declared value exceeds the approval's lifetime limit",
+                    ));
+                }
+            }
+            Ok(())
+        }
     }
 
     impl MachineBrokerService for MockBroker {
@@ -891,7 +996,28 @@ mod tests {
                             },
                         ))
                     }
-                    MachineBrokerRequest::SigningSign(request) => {
+                    MachineBrokerRequest::SigningSign(ref request) => {
+                        // The real Broker re-runs accounting at sign time
+                        // against the sealed approval terms, not the request.
+                        if let Some(claim) = request.petal_use_claim.as_ref() {
+                            let recorded = self.requests.lock().unwrap();
+                            let sealed = recorded.iter().find_map(|record| match record {
+                                MachineBrokerRequest::SealedApprovalPrepare(prepared)
+                                    if prepared.terms.approval_id().ok().as_ref()
+                                        == Some(&request.approval_id) =>
+                                {
+                                    Some(&prepared.terms.limits.value_limits)
+                                }
+                                _ => None,
+                            });
+                            let limits = sealed.ok_or_else(|| {
+                                ProtocolError::new(
+                                    ProtocolErrorCode::ClaimInvalid,
+                                    "signing request names no prepared approval".to_string(),
+                                )
+                            })?;
+                            self.assert_accounting_accepts(claim, limits)?;
+                        }
                         if self.conflict_sign_once.swap(false, Ordering::SeqCst) {
                             return Err(ProtocolError::new(
                                 ProtocolErrorCode::OperationIdConflict,
@@ -899,8 +1025,8 @@ mod tests {
                             ));
                         }
                         Ok(MachineBrokerResponse::SigningSign(SigningResult {
-                            operation_id: request.operation_id,
-                            operation_digest: request.operation_digest,
+                            operation_id: request.operation_id.clone(),
+                            operation_digest: request.operation_digest.clone(),
                             signatures: vec![NormalizedSignature {
                                 crypto_suite: request.crypto_suite,
                                 bytes: Base64UrlBytes::from_bytes(&[7_u8; 65]),
@@ -934,6 +1060,7 @@ mod tests {
         let broker = Arc::new(MockBroker {
             requests: Mutex::new(Vec::new()),
             conflict_sign_once: AtomicBool::new(false),
+            ..MockBroker::default()
         });
         let signer = BrokerExactPayloadSigner::new(
             MachineBrokerClient::new(broker.clone()),
@@ -1026,6 +1153,7 @@ mod tests {
         let broker = Arc::new(MockBroker {
             requests: Mutex::new(Vec::new()),
             conflict_sign_once: AtomicBool::new(false),
+            ..MockBroker::default()
         });
         let package_hash = digest(20);
         let subject = ProvenanceSubject::Petal {
@@ -1125,6 +1253,211 @@ mod tests {
             panic!("approved retry must sign");
         };
         assert_eq!(signed.crypto_suite, CryptoSuite::Secp256k1Sha256Recoverable);
+    }
+
+    /// Builds the shared fixture: a petal exact signer whose provenance
+    /// catalog marks one class with the scenario's fee asset.
+    fn debiting_claim_fixture(
+        broker: &Arc<MockBroker>,
+        class_fee_asset: Option<bloom_broker_api::ProvenanceFeeAsset>,
+    ) -> (
+        BrokerExactPayloadSigner,
+        tempfile::TempDir,
+        PetalUseClaim,
+        Digest32,
+    ) {
+        let package_hash = digest(30);
+        let subject = ProvenanceSubject::Petal {
+            package_hash: package_hash.clone(),
+            route: "withdraw/request".into(),
+        };
+        let signer = BrokerExactPayloadSigner::new(
+            MachineBrokerClient::new(broker.clone()),
+            ProvenanceCatalog {
+                schema: PROVENANCE_CATALOG_SCHEMA.into(),
+                records: vec![ProvenanceRecord {
+                    subject,
+                    publisher: token("bloom-installer"),
+                    petal_lineage: None,
+                    operation_classes: vec![ProvenanceOperationClass {
+                        operation_class: token("hyperliquid.withdraw"),
+                        fee_asset: class_fee_asset,
+                    }],
+                    installer_key_id: token("test-key"),
+                    installer_signature: Base64UrlBytes::from_bytes(&[]),
+                }],
+            },
+        );
+        let home = tempfile::tempdir().unwrap();
+        let payload = b"exact withdraw payload";
+        let ordered_hash = Digest32::from_bytes(Sha256::digest(payload).into());
+        let claim = PetalUseClaim {
+            package_hash,
+            route: "withdraw/request".into(),
+            operation_class: token("hyperliquid.withdraw"),
+            crypto_suite: CryptoSuite::Secp256k1Sha256Recoverable,
+            payload_digest: {
+                let mut digest = Sha256::new();
+                digest.update(b"bloom.petal.payload-batch.v1\0");
+                digest.update(1_u64.to_be_bytes());
+                digest.update((payload.len() as u64).to_be_bytes());
+                digest.update(payload);
+                Digest32::from_bytes(digest.finalize().into())
+            },
+            ordered_hashes: vec![Digest32::from_bytes(Sha256::digest(payload).into())],
+            declared_debits: vec![
+                bloom_broker_api::DeclaredDebit {
+                    asset: bloom_broker_api::AssetId {
+                        chain: token("hyperliquid"),
+                        asset: "usdc".into(),
+                    },
+                    amount: bloom_broker_api::DecimalU256::parse("5000000").unwrap(),
+                },
+                bloom_broker_api::DeclaredDebit {
+                    asset: bloom_broker_api::AssetId {
+                        chain: token("arbitrum"),
+                        asset: "usdc".into(),
+                    },
+                    amount: bloom_broker_api::DecimalU256::parse("2500000").unwrap(),
+                },
+            ],
+            declared_destinations: Vec::new(),
+            declared_fee: bloom_broker_api::DeclaredFee::None,
+            nonce: RequestNonce::from_bytes([31; 16]),
+            claim_assurance: bloom_broker_api::ClaimAssurance::MachineAsserted,
+        };
+        (signer, home, claim, ordered_hash)
+    }
+
+    async fn flow_once(
+        signer: &BrokerExactPayloadSigner,
+        home: &tempfile::TempDir,
+        claim: &PetalUseClaim,
+        hash: &Digest32,
+    ) -> Result<ExactPayloadOutcome, String> {
+        let package_hash = claim.package_hash.clone();
+        signer
+            .sign_or_prepare_petal(
+                &home.path().join("petal-exact.json"),
+                "withdraw-action",
+                "wallet",
+                "hyperliquid.withdraw",
+                b"exact withdraw payload",
+                hash.clone(),
+                CryptoSuite::Secp256k1Sha256Recoverable,
+                &serde_json::json!({"asset": "USDC"}),
+                &ProvenanceSubject::Petal {
+                    package_hash,
+                    route: "withdraw/request".into(),
+                },
+                claim,
+                Some(b"assurance"),
+            )
+            .await
+    }
+
+    #[tokio::test]
+    async fn a_claim_declaring_value_is_accounted_end_to_end_against_its_derived_limits() {
+        for (name, class_fee_asset, declared_fee, expected_fee_total) in [
+            ("debit only", None, None, 0),
+            (
+                "debit plus fee",
+                Some(bloom_broker_api::ProvenanceFeeAsset {
+                    chain: token("hyperliquid"),
+                    asset: "usdc".into(),
+                }),
+                Some(bloom_broker_api::DeclaredFee::Fee {
+                    chain: token("hyperliquid"),
+                    asset: "usdc".into(),
+                    amount: bloom_broker_api::DecimalU256::parse("1000000").unwrap(),
+                }),
+                1_000_000,
+            ),
+        ] {
+            let broker = Arc::new(MockBroker {
+                requests: Mutex::new(Vec::new()),
+                conflict_sign_once: AtomicBool::new(false),
+                class_fee_asset: class_fee_asset.clone(),
+                ..MockBroker::default()
+            });
+            let (signer, home, mut claim, hash) = debiting_claim_fixture(&broker, class_fee_asset);
+            claim.declared_fee = declared_fee.unwrap_or(bloom_broker_api::DeclaredFee::None);
+
+            // Prepare: the fixture Broker accounts the claim and accepts the
+            // derived limits instead of refusing VALUE_ASSET_NOT_ALLOWED.
+            let first = flow_once(&signer, &home, &claim, &hash).await.unwrap();
+            assert!(
+                matches!(first, ExactPayloadOutcome::ApprovalRequired { .. }),
+                "{name}"
+            );
+
+            // Sign: the retry re-runs accounting against the sealed terms and
+            // completes the flow with a signature.
+            let second = flow_once(&signer, &home, &claim, &hash).await.unwrap();
+            assert_eq!(
+                second,
+                ExactPayloadOutcome::Signed(vec![7_u8; 65]),
+                "{name}"
+            );
+
+            // The sealed approval carries exactly the claim's declared
+            // debits plus the declared fee, summed per asset.
+            let requests = broker.requests.lock().unwrap();
+            let MachineBrokerRequest::SealedApprovalPrepare(prepared) = &requests[2] else {
+                panic!("{name}: first attempt must prepare an approval");
+            };
+            let expected = |chain: &str, total: u128| bloom_broker_api::ValueLimit {
+                asset: bloom_broker_api::AssetId {
+                    chain: token(chain),
+                    asset: "usdc".into(),
+                },
+                lifetime: bloom_broker_api::DecimalU256::parse(total.to_string()).unwrap(),
+                rolling_windows: Vec::new(),
+            };
+            assert_eq!(
+                prepared.terms.limits.value_limits,
+                vec![
+                    expected("hyperliquid", 5_000_000 + expected_fee_total),
+                    expected("arbitrum", 2_500_000),
+                ],
+                "{name}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_approval_whose_limits_are_empty_again_refuses_the_declaring_claim() {
+        // Negative twin: drop_value_limits simulates the pre-#265 derivation
+        // defect (approvals prepared with empty value_limits). The accounting
+        // mirror must refuse the claim at prepare with the
+        // VALUE_ASSET_NOT_ALLOWED denial, and nothing may sign.
+        let broker = Arc::new(MockBroker {
+            requests: Mutex::new(Vec::new()),
+            conflict_sign_once: AtomicBool::new(false),
+            drop_value_limits: true,
+            ..MockBroker::default()
+        });
+        let (signer, home, claim, hash) = debiting_claim_fixture(&broker, None);
+        // The ceremony still completes — with empty limits the defect only
+        // surfaces when signing re-runs accounting against the sealed terms.
+        let prepared = flow_once(&signer, &home, &claim, &hash).await.unwrap();
+        assert!(matches!(
+            prepared,
+            ExactPayloadOutcome::ApprovalRequired { .. }
+        ));
+        let error = flow_once(&signer, &home, &claim, &hash).await.unwrap_err();
+        assert!(error.contains("VALUE_ASSET_NOT_ALLOWED"), "{error}");
+        // The refusal fired at the signing gate: the sign was dispatched and
+        // refused before any signature existed (proven by the error above).
+        assert!(
+            broker
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|record| matches!(record, MachineBrokerRequest::SigningSign(_))),
+            "the refusal must happen at signing, not before it"
+        );
     }
 
     fn token(value: &str) -> Token {
