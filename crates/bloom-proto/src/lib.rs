@@ -34,8 +34,8 @@ pub use capability::{CapabilityStatus, CapabilityViewEntry, SigningModel, Venue}
 pub use ceremony::{CeremonyIntent, CeremonyIntentKind};
 pub use chain::{ChainId, ChainRef, ChainSpec, EndpointSpec, default_endpoint_weight};
 pub use config::{
-    Backend, BackendsConfig, Config, ConfigError, EnsoConfig, EtherscanConfig, MempoolChainConfig,
-    PrivateRpcChainConfig,
+    Backend, BackendsConfig, Config, ConfigError, EnsoConfig, EtherscanConfig, McpConfig,
+    MempoolChainConfig, PrivateRpcChainConfig,
 };
 pub use defi_policy::{DefiPolicy, DefiRouteCtx, ReceiverClass, evaluate_defi_route};
 pub use home::{HomeDir, HomeError, HomeWritePermit};

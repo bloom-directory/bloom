@@ -4,6 +4,7 @@ members = [
   "crates/bloom-machine",
   "crates/bloom-daemon",
   "crates/bloom-vfs",
+  "crates/bloom-mcp",
   "crates/bloom-paid-mpp",
   "crates/bloom-paid-x402",
   "crates/bloom-paid-http",
@@ -68,6 +69,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 flate2 = "1"
 mpp = { version = "0.10.4", default-features = false, features = ["client", "tempo", "reqwest-rustls-tls"] }
 url = "2"
+percent-encoding = "2"
 humantime = "2"
 humantime-serde = "1"
 tempfile = "3"
@@ -109,6 +111,7 @@ bloom-rpc      = { path = "crates/bloom-rpc" }
 bloom-evm      = { path = "crates/bloom-evm" }
 bloom-tx       = { path = "crates/bloom-tx" }
 bloom-vfs      = { path = "crates/bloom-vfs" }
+bloom-mcp      = { path = "crates/bloom-mcp" }
 bloom-paid-mpp = { path = "crates/bloom-paid-mpp" }
 bloom-paid-x402 = { path = "crates/bloom-paid-x402" }
 bloom-paid-http = { path = "crates/bloom-paid-http" }
