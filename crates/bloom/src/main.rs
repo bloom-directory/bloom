@@ -1093,7 +1093,10 @@ fn machine_error_from_handler(error: &bloom_vfs::HandlerError, message: String) 
     let kind = match error {
         bloom_vfs::HandlerError::NotFound(_) => MachineErrorKind::NotFound,
         bloom_vfs::HandlerError::PermissionDenied
-        | bloom_vfs::HandlerError::OperationNotPermitted => MachineErrorKind::PermissionDenied,
+        | bloom_vfs::HandlerError::OperationNotPermitted
+        // Authorized in principle, pending an owner ceremony. The Display impl
+        // already carries the ceremony URL into `message`.
+        | bloom_vfs::HandlerError::ApprovalRequired { .. } => MachineErrorKind::PermissionDenied,
         bloom_vfs::HandlerError::Invalid(_)
         | bloom_vfs::HandlerError::NotADir(_)
         | bloom_vfs::HandlerError::NotAFile(_)

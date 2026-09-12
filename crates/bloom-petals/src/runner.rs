@@ -176,6 +176,11 @@ fn host_from_handler(e: HandlerError) -> HostError {
         HandlerError::PermissionDenied | HandlerError::OperationNotPermitted => {
             HostError::Denied("vfs".into())
         }
+        // A Petal can surface this to its caller, so pass the ceremony detail
+        // through rather than flattening it to a bare denial.
+        ref approval @ HandlerError::ApprovalRequired { .. } => {
+            HostError::Denied(approval.to_string())
+        }
         HandlerError::Invalid(s) => HostError::Invalid(s),
         HandlerError::Unsupported(s) => HostError::Backend(format!("unsupported: {s}")),
         HandlerError::Backend(s) => HostError::Backend(s),

@@ -176,6 +176,10 @@ fn map_err(e: HandlerError) -> FsError {
         HandlerError::NotADir(_) => FsError::NotDirectory,
         HandlerError::NotAFile(_) => FsError::IsDirectory,
         HandlerError::PermissionDenied => FsError::AccessDenied,
+        // A filesystem has no errno for "an owner ceremony is pending", and
+        // NFS cannot carry the URL. The ceremony stays discoverable as a
+        // readable projection beside the staged action.
+        HandlerError::ApprovalRequired { .. } => FsError::AccessDenied,
         HandlerError::OperationNotPermitted => FsError::PermissionDenied,
         HandlerError::Invalid(_) => FsError::InvalidInput,
         HandlerError::Unsupported(_) => FsError::Unsupported,

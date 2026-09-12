@@ -1899,6 +1899,8 @@ fn map_handler_err(id: Value, e: HandlerError) -> Response {
         HandlerError::NotADir(s) => (-32005, format!("not a dir: {s}")),
         HandlerError::NotAFile(s) => (-32006, format!("not a file: {s}")),
         HandlerError::PermissionDenied => (-32007, "permission denied".into()),
+        // Preserve the wire code, but include the next approval step.
+        ref approval @ HandlerError::ApprovalRequired { .. } => (-32007, approval.to_string()),
         HandlerError::OperationNotPermitted => (-32007, "operation not permitted".into()),
         HandlerError::Invalid(s) => (-32602, format!("invalid: {s}")),
         HandlerError::Unsupported(s) => (-32008, format!("unsupported: {s}")),
