@@ -262,6 +262,7 @@ impl ViewsHandler {
                 reads.spawn(async move {
                     let symbol = client.spec().native_symbol.clone();
                     let decimals = client.spec().native_decimals;
+                    let chain_id = client.spec().chain_id;
                     let raw = match tokio::time::timeout(BALANCE_TIMEOUT, client.balance(address))
                         .await
                     {
@@ -275,11 +276,11 @@ impl ViewsHandler {
                             None
                         }
                     };
-                    (name, raw, symbol, decimals)
+                    (name, raw, symbol, decimals, chain_id)
                 });
             }
             while let Some(joined) = reads.join_next().await {
-                let Ok((chain, raw, symbol, decimals)) = joined else {
+                let Ok((chain, raw, symbol, decimals, chain_id)) = joined else {
                     continue;
                 };
                 match raw {
@@ -293,6 +294,7 @@ impl ViewsHandler {
                             label: self.network_label(&chain),
                             wallet: wallet.clone(),
                             chain,
+                            chain_id,
                             symbol,
                             quantity,
                             amount,
@@ -316,13 +318,15 @@ impl ViewsHandler {
         portfolio
     }
 
-    /// Value what can be valued. A test network is never priced, an unknown
-    /// symbol stays unpriced, and a stale quote prices nothing.
+    /// Value what can be valued. A native asset is priced only on a chain
+    /// where that asset *is* the market asset: a development chain whose
+    /// native symbol happens to read "ETH" must never be valued at ether's
+    /// price. A stale quote prices nothing.
     async fn price(&self, portfolio: &mut Portfolio) {
         let mut symbols: Vec<String> = portfolio
             .holdings
             .iter()
-            .filter(|holding| !is_test_network(&holding.chain))
+            .filter(|holding| native_asset_has_market(holding.chain_id))
             .map(|holding| holding.symbol.to_ascii_lowercase())
             .collect();
         symbols.sort();
@@ -352,7 +356,7 @@ impl ViewsHandler {
         }
 
         for holding in &mut portfolio.holdings {
-            if is_test_network(&holding.chain) {
+            if !native_asset_has_market(holding.chain_id) {
                 continue;
             }
             if let Some(price) = quotes.get(&holding.symbol.to_ascii_lowercase()) {
@@ -450,7 +454,9 @@ impl ViewsHandler {
                     "{held}, none of it priced.",
                     held = count_noun(portfolio.holdings.len(), "holding", "holdings"),
                 ),
-                "No fresh quote was available, so nothing here carries a dollar value.".to_owned(),
+                "Nothing here carries a dollar value. The quantities are what the chains \
+                 reported; Wallets says why each row is unpriced."
+                    .to_owned(),
             )
         } else {
             (
@@ -561,8 +567,8 @@ impl ViewsHandler {
             (
                 "—".to_owned(),
                 format!(
-                    "{rows} carry no price.",
-                    rows = count_noun(portfolio.holdings.len(), "row", "rows"),
+                    "No price for {rows} below.",
+                    rows = count_noun(portfolio.holdings.len(), "the row", "any of the rows"),
                 ),
             )
         } else {
@@ -1047,6 +1053,7 @@ impl Portfolio {
 struct Holding {
     wallet: String,
     chain: String,
+    chain_id: u64,
     label: String,
     symbol: String,
     quantity: String,
@@ -1058,6 +1065,12 @@ impl Holding {
     fn note(&self) -> String {
         if is_test_network(&self.chain) {
             "Test network. Test funds are not main-network funds and are never priced.".to_owned()
+        } else if !native_asset_has_market(self.chain_id) {
+            format!(
+                "This network's native unit is not the traded {} asset, so it carries no \
+                 dollar value here. The quantity is what the chain reported.",
+                self.symbol
+            )
         } else if self.value.is_some() {
             "Native balance, valued with a quote observed within the last hour.".to_owned()
         } else {
@@ -1277,6 +1290,30 @@ fn agents_entry() -> Entry {
 
 fn is_page(name: &str) -> bool {
     PAGES.iter().any(|(page, _)| *page == name)
+}
+
+/// Chains whose native unit is the asset a quote for that symbol actually
+/// prices. Keyed on chain id, never on the symbol string: a chain is free to
+/// call its native unit "ETH" without it being ether, and a development or
+/// app chain handing out a faucet balance must not be valued at ether's
+/// price. An unlisted chain reports its quantity and stays unpriced, which is
+/// the same rule as a missing quote.
+const NATIVE_ASSET_MARKETS: &[u64] = &[
+    1,      // Ethereum
+    10,     // OP Mainnet
+    56,     // BNB Smart Chain
+    100,    // Gnosis
+    137,    // Polygon
+    8453,   // Base
+    42161,  // Arbitrum One
+    43114,  // Avalanche C-Chain
+    59144,  // Linea
+    81457,  // Blast
+    534352, // Scroll
+];
+
+fn native_asset_has_market(chain_id: u64) -> bool {
+    NATIVE_ASSET_MARKETS.contains(&chain_id)
 }
 
 /// A test network is named as one. No chain spec carries a testnet flag, so
@@ -1766,6 +1803,23 @@ mod tests {
         .unwrap();
         assert!(doc.contains("receive.html"));
         assert!(doc.contains("never"));
+    }
+
+    #[test]
+    fn only_a_chain_whose_native_unit_is_the_traded_asset_is_priced() {
+        // Ethereum and its rollups price their native ether.
+        for chain_id in [1u64, 10, 8453, 42161, 59144] {
+            assert!(native_asset_has_market(chain_id), "{chain_id}");
+        }
+        // A development or app chain may call its native unit "ETH" and hand
+        // out an enormous faucet balance. Valuing that at ether's price
+        // produced a nonsense headline total; it must stay unpriced.
+        for chain_id in [4217u64, 31337, 4663] {
+            assert!(
+                !native_asset_has_market(chain_id),
+                "chain {chain_id} must not be valued at another asset's price"
+            );
+        }
     }
 
     #[test]

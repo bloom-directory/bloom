@@ -53,7 +53,7 @@ section + section,.stats + section { margin-top:34px; }
 .hero p { color:var(--ink-2); max-width:55ch; }
 .hero .metric { font-size:56px; }
 .hero-aside { padding-left:30px; border-left:1px solid var(--rule-2); }
-.metric { font:400 42px/1.2 var(--serif); letter-spacing:-.025em; margin:9px 0; font-variant-numeric:tabular-nums; }
+.metric { font:400 42px/1.2 var(--serif); letter-spacing:-.025em; margin:9px 0; font-variant-numeric:tabular-nums; overflow-wrap:anywhere; }
 .stats { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); border-block:1px solid var(--rule); margin-top:30px; }
 .stat { padding:22px 24px; border-right:1px solid var(--rule); }
 .stat:first-child { padding-left:0; }.stat:last-child { border:0; }
@@ -71,7 +71,7 @@ th:first-child,td:first-child { padding-left:0; }th:last-child,td:last-child { p
 td strong { font-weight:550; }td a { text-decoration:none; }
 .token { display:flex; align-items:center; gap:12px; }
 .token-mark { display:grid; place-items:center; flex:0 0 36px; height:36px; border:1px solid var(--rule); border-radius:50%; font:11px var(--mono); background:#eae3d7; color:var(--ink-2); }
-.numeric { text-align:right; }.money { white-space:nowrap; font-variant-numeric:tabular-nums; }
+.numeric { text-align:right; }.money { overflow-wrap:anywhere; font-variant-numeric:tabular-nums; }
 .bar { height:5px; background:#e5dccf; margin-top:9px; border-radius:3px; overflow:hidden; }
 .bar span { display:block; height:100%; width:var(--fill); background:var(--leaf); }
 details { border-top:1px solid var(--rule); margin-top:18px; padding-top:4px; }
