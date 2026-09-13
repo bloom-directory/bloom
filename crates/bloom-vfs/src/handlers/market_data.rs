@@ -88,6 +88,8 @@ pub struct ChainVolume {
 /// One row of the provider's market list.
 #[derive(Clone, Debug)]
 pub struct TokenMarket {
+    /// Provider-stable identifier used for the corresponding market page.
+    pub id: String,
     pub name: String,
     pub symbol: String,
     pub price: Option<f64>,
@@ -231,6 +233,7 @@ impl MarketData {
             .iter()
             .filter_map(|row| {
                 Some(TokenMarket {
+                    id: row.get("id")?.as_str()?.to_owned(),
                     name: row.get("name")?.as_str()?.to_owned(),
                     symbol: row
                         .get("symbol")

@@ -3723,6 +3723,7 @@ impl Daemon {
                         central_outbox_handler.clone(),
                         bloom_vfs::handlers::MarketData::new(),
                     )
+                    .with_address_book(address_book_arc.clone())
                     .with_petals(petals_handler.clone()),
                 ) as _,
             )

@@ -13,23 +13,42 @@ open /Volumes/bloom/views/index.html # macOS
 
 ## Pages
 
-- `index.html` — Today: what is held, what is waiting, what never sent.
-- `markets.html` — what a public provider reports is moving, and the sample it
-  was drawn from. No row here is a holding of yours.
-- `chains.html` — each configured network: whether it answered your daemon,
-  its provider-reported trading activity, and what you hold priced on it.
-- `fees.html` — daily fees paid by everyone using a network, over the last
-  completed UTC days. This is paid network usage, not a quote for your next
-  transaction.
-- `wallets.html` — native balances per wallet on every network that answered,
-  with the wallet's address, kind, and policy version.
-- `receive.html` — receiving addresses grouped by wallet and address family,
-  each with a scannable QR code and the networks that address serves.
-- `next-moves.html` — staged operations awaiting review, with the policy
-  denial that explains why each will not proceed as staged.
+- `index.html` — Today: what you hold, what needs you, what happened recently.
+- `wallets.html` — every wallet in the current Broker listing, organized by
+  projected wallet/account identity. Native balances and Petal positions stay
+  under the identity their records name. Activity-only addresses are compact
+  historical observations and never become controlled wallets.
 - `activity.html` — every operation Bloom staged, broadcast, or never sent,
   newest first, with the transaction hash where one exists.
-- `policy.html` — where each wallet may send, from its signed policy.
+- `chains.html` — Networks: every configured network in one sortable list —
+  cumulative fee totals, 24h fees and DEX volume, and what your wallets hold
+  on it. Opening a row discloses the older fee periods and the 30-day daily
+  history. Solana is included from the same public source without inventing an
+  EVM chain id; public network availability is independent of Solana wallet
+  account projection. Fee totals are network-wide public data (DefiLlama),
+  never a quote for a personal transaction.
+- `fees.html` — an alias of the Networks page, kept so old bookmarks keep
+  working. It serves exactly the same bytes as `chains.html`.
+- `markets.html` — what a public provider reports is moving, and the sample it
+  was drawn from. No row here is a holding of yours.
+- `next-moves.html` — staged operations awaiting review, with the policy
+  denial that explains why each will not proceed as staged.
+- `contacts.html` — saved address-book names and recipients identified from
+  recorded transfers. Repeated unnamed recipients are suggestions; contract
+  targets and unclassified targets are never promoted to contacts.
+- `receive.html` — receiving addresses grouped by wallet and address family,
+  with self-contained QR artwork encoding the displayed address. EVM addresses
+  must parse as EVM addresses; Solana requires an explicit `solana:` CAIP-10
+  address on an Ed25519 key. The current key projection does not expose the
+  newer account-list API; absent Solana data gets an unavailable card, never a
+  guessed destination. Full Solana account discovery still needs that API.
+- `policy.html` — where each wallet may send, which package fingerprints may
+  request it, and how long approval may last, from its signed policy.
+- `bloom.css`, `bloom.js`, and `icons/` — the stylesheet, the small local
+  Networks sorter, and the bundled artwork the pages
+  reference. Icons are matched on canonical identity (chain id, then asset
+  symbol); an unknown name keeps an initials fallback. Provenance is
+  documented in the icon sources beside the handler.
 
 ## What to tell a person
 
@@ -60,8 +79,11 @@ These pages are deliberately narrow about what they claim:
 - These pages are **observations**. Nothing here approves, stages, or executes
   an action. A page that matches Bloom's visual language is still not a trusted
   authorization surface — passkeys and private input belong to Broker's own page.
-- They carry no script and make no network requests. The stylesheet and images
-  are served from this same mount, and no block explorer is ever contacted.
+- They make no automatic network requests. The stylesheet, sorter, and images
+  are served from this same mount. Following an explicit block-explorer link is
+  the reader's choice.
+- Address, transaction, market, app-account, and network-source links are
+  emitted only from known chain ids or provider identities and use no referrer.
 - An address shown here is the wallet's current projected receiving address. A
   network label never changes what an address-only QR code encodes; the sender
   must select the matching network in their own wallet.
