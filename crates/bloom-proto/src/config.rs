@@ -46,8 +46,6 @@ pub struct Config {
     pub solana_chains: BTreeMap<String, SolanaSpec>,
     #[serde(default)]
     pub etherscan: Option<EtherscanConfig>,
-    #[serde(default)]
-    pub enso: Option<EnsoConfig>,
     /// Trusted, daemon-owned runtime settings for installed Petals.
     /// Endpoint overrides are matched to named manifest bindings and may only
     /// replace the HTTPS authority; the signed method/path policy remains the
@@ -196,13 +194,6 @@ pub struct EtherscanConfig {
     pub api_url: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EnsoConfig {
-    pub api_key: String,
-    #[serde(default = "default_enso_url")]
-    pub api_url: String,
-}
-
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct MempoolChainConfig {
     /// Provider id — must match a `bloom_mempool::providers::*` adapter
@@ -235,9 +226,6 @@ fn default_stage_ttl() -> std::time::Duration {
 }
 fn default_etherscan_url() -> String {
     "https://api.etherscan.io/v2/api".to_string()
-}
-fn default_enso_url() -> String {
-    "https://api.enso.finance".to_string()
 }
 fn default_max_index_size() -> usize {
     50_000
@@ -393,6 +381,7 @@ fn default_chains() -> BTreeMap<String, ChainSpec> {
             "HyperEVM",
             "HYPE",
         ),
+        evm_chain("arc", 5_042, &["https://rpc.arc-scan.org"], "Arc", "USDC"),
         ChainSpec::anvil_default(),
     ] {
         chains.insert(spec.name.clone(), spec);
@@ -401,9 +390,10 @@ fn default_chains() -> BTreeMap<String, ChainSpec> {
 }
 
 impl Config {
-    /// An agentic-wallet default: read-ready public EVM networks and Anvil.
+    /// An agentic-wallet default: public EVM networks, Anvil, and Solana mainnet.
     ///
-    /// Per-chain broadcast is enabled by default. Signing, policy,
+    /// EVM broadcast is enabled by default; Solana mainnet starts with
+    /// broadcasting disabled. Signing, policy,
     /// confirmation, and Sealed Approval gates still apply to value-moving
     /// actions.
     pub fn local_default() -> Self {
@@ -415,9 +405,24 @@ impl Config {
             default_chain: default_chain_name(),
             stage_ttl: default_stage_ttl(),
             chains,
-            solana_chains: BTreeMap::new(),
+            solana_chains: BTreeMap::from([(
+                "solana-mainnet".into(),
+                SolanaSpec {
+                    name: "solana-mainnet".into(),
+                    endpoints: vec![crate::chain::EndpointSpec {
+                        url: "https://api.mainnet.solana.com".into(),
+                        weight: 100,
+                        cu_per_sec: None,
+                        max_rps: None,
+                        http_only: true,
+                    }],
+                    expected_genesis_base58: Some(
+                        crate::chain::SOLANA_MAINNET_BETA_GENESIS_HASH.into(),
+                    ),
+                    allow_broadcast: false,
+                },
+            )]),
             etherscan: None,
-            enso: None,
             petals: PetalsConfig::default(),
             mempool: BTreeMap::new(),
             private_rpc: BTreeMap::new(),
@@ -708,9 +713,20 @@ mod tests {
         assert_eq!(cfg.mount_path, "/bloom");
         assert_eq!(cfg.nfs_listen_addr, "127.0.0.1:12049");
         assert!(cfg.etherscan.is_none());
-        assert!(cfg.enso.is_none());
         assert_eq!(cfg.petals.preinstalled, default_preinstalled_petals());
-        assert_eq!(cfg.chains.len(), 13);
+        assert_eq!(cfg.chains.len(), 14);
+        assert_eq!(cfg.solana_chains.len(), 1);
+        let solana = cfg
+            .solana_chains
+            .get("solana-mainnet")
+            .expect("Solana mainnet entry");
+        assert_eq!(solana.name, "solana-mainnet");
+        assert_eq!(
+            solana.expected_genesis_base58.as_deref(),
+            Some(crate::chain::SOLANA_MAINNET_BETA_GENESIS_HASH)
+        );
+        assert!(!solana.allow_broadcast);
+        assert_eq!(solana.endpoints[0].url, "https://api.mainnet.solana.com");
         let ethereum = cfg.chains.get("ethereum").expect("ethereum entry");
         assert_eq!(ethereum.chain_id, 1);
         assert!(ethereum.allow_broadcast);
@@ -730,6 +746,12 @@ mod tests {
         assert_eq!(robinhood.native_symbol, "ETH");
         let hyperliquid = cfg.chains.get("hyperliquid").expect("hyperliquid entry");
         assert_eq!(hyperliquid.chain_id, 999);
+        let arc = cfg.chains.get("arc").expect("Arc entry");
+        assert_eq!(arc.chain_id, 5_042);
+        assert_eq!(arc.rpc_urls, vec!["https://rpc.arc-scan.org"]);
+        assert_eq!(arc.display_name.as_deref(), Some("Arc"));
+        assert_eq!(arc.native_symbol, "USDC");
+        assert_eq!(arc.native_decimals, 18);
         let anvil = cfg.chains.get("anvil").expect("anvil entry");
         assert_eq!(anvil.chain_id, 31337);
         assert!(!anvil.rpc_urls.is_empty());
@@ -1056,6 +1078,7 @@ mod tests {
         assert!(path.exists());
         assert_eq!(cfg.default_chain, "ethereum");
         // Second call should load, not overwrite — round-trip equivalent.
+        assert!(cfg.solana_chains.contains_key("solana-mainnet"));
         let cfg2 = Config::load_or_init(&path).unwrap();
         assert_configs_equivalent(&cfg, &cfg2);
     }
@@ -1077,6 +1100,7 @@ allow_broadcast = false
 
         let cfg = Config::load_or_init(&path).unwrap();
         assert!(!cfg.chains["anvil"].allow_broadcast);
+        assert!(cfg.solana_chains.is_empty());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), existing);
     }
 
@@ -1314,7 +1338,7 @@ rpc_urls = ["http://127.0.0.1:8545"]
     }
 
     #[test]
-    fn etherscan_and_enso_blocks_parse() {
+    fn etherscan_block_parses() {
         let toml_text = r#"
 default_chain = "anvil"
 
@@ -1325,17 +1349,11 @@ rpc_urls = ["http://127.0.0.1:8545"]
 
 [etherscan]
 api_key = "ESKEY"
-
-[enso]
-api_key = "ENKEY"
 "#;
         let cfg: Config = toml::from_str(toml_text).unwrap();
         let es = cfg.etherscan.expect("etherscan parsed");
         assert_eq!(es.api_key, "ESKEY");
         assert_eq!(es.api_url, "https://api.etherscan.io/v2/api");
-        let en = cfg.enso.expect("enso parsed");
-        assert_eq!(en.api_key, "ENKEY");
-        assert_eq!(en.api_url, "https://api.enso.finance");
     }
 
     #[test]

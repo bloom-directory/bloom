@@ -737,127 +737,6 @@ async fn launch_custody_ceremony(
     finish_remote_preparation(workflow, Some(&prepared_operation_id), local_result)
 }
 
-async fn launch_account_allocation(
-    daemon: &Daemon,
-    wallet_id: &bloom_broker_api::Token,
-    profile: &str,
-) -> Result<String> {
-    use bloom_broker_api::{
-        ACCOUNT_TERMS_SCHEMA, AccountTerms, DerivationProfile, DerivedAccountRequest,
-    };
-    use rand::RngCore as _;
-
-    let (derivation_profile, requested_role) = match profile {
-        "bip44-solana-slip10-ed25519-v1" => (
-            DerivationProfile::Bip44SolanaSlip10Ed25519V1,
-            "solana-account",
-        ),
-        "bip44-evm-secp256k1-v1" => {
-            return Err(machine_error(
-                MachineErrorKind::InvalidParams,
-                "BIP-39 import already allocates the canonical EVM account; additional EVM \
-                 accounts are not exposed until EVM transaction surfaces accept an explicit \
-                 account selector",
-            )
-            .into());
-        }
-        other => {
-            return Err(machine_error(
-                MachineErrorKind::InvalidParams,
-                format!(
-                    "unknown derivation profile '{other}'; expected \
-                     bip44-solana-slip10-ed25519-v1"
-                ),
-            )
-            .into());
-        }
-    };
-
-    let client = daemon.broker_client().ok_or_else(|| {
-        machine_error(
-            MachineErrorKind::Unavailable,
-            "custody requires the authenticated Machine-to-Broker edge",
-        )
-    })?;
-    let wallet = client
-        .wallet(wallet_id.clone())
-        .await
-        .map_err(machine_wallet_lookup_error)?;
-    if wallet.root_key_ref.is_some() {
-        return Err(machine_error(
-            MachineErrorKind::InvalidParams,
-            format!(
-                "wallet '{}' is not a BIP-39 wallet; account allocation requires a mnemonic root",
-                wallet_id.as_str()
-            ),
-        )
-        .into());
-    }
-
-    let mut operation_bytes = [0_u8; 32];
-    rand::thread_rng().fill_bytes(&mut operation_bytes);
-    let operation_id = bloom_broker_api::OperationId::from_bytes(operation_bytes);
-    let derivation = DerivedAccountRequest {
-        derivation_profile,
-        requested_role: bloom_broker_api::Token::new(requested_role)
-            .map_err(|error| machine_error(MachineErrorKind::InvalidParams, error.to_string()))?,
-        account: None,
-    };
-    let expires_at_ms = current_unix_ms().saturating_add(30 * 60 * 1_000);
-    let terms = AccountTerms {
-        schema: bloom_broker_api::Token::new(ACCOUNT_TERMS_SCHEMA)
-            .map_err(|error| machine_error(MachineErrorKind::InvalidParams, error.to_string()))?,
-        wallet_id: wallet_id.clone(),
-        seed_profile: bloom_broker_api::WalletSeedProfile::Bip39MulticurveV1,
-        derivations: vec![derivation.clone()],
-        retire_key_fingerprint: None,
-        path_template: derivation_profile.path_template().to_owned(),
-        key_spec: derivation_profile.key_spec(),
-        allowed_crypto_suites: derivation_profile.frozen_crypto_suites().to_vec(),
-        policy_version: wallet.policy_version.clone(),
-        revocation_epoch: wallet.wallet_revocation_epoch.clone(),
-        replay_id: operation_id.clone(),
-        expires_at_ms: bloom_broker_api::DecimalU64::new(expires_at_ms),
-        audit_purpose: bloom_broker_api::Token::new("allocate-derived-account")
-            .map_err(|error| machine_error(MachineErrorKind::InvalidParams, error.to_string()))?,
-    };
-    let exact_terms_digest = terms.request_digest().map_err(anyhow::Error::new)?;
-    let response = client
-        .account_allocate(bloom_broker_api::CustodyPrepareRequest {
-            ceremony_kind: bloom_broker_api::CeremonyKind::AccountAllocate,
-            custody_operation_id: operation_id,
-            wallet_id: Some(wallet_id.clone()),
-            key_ref: None,
-            exact_terms_digest,
-            expected_input_class: bloom_broker_api::Token::new("generic-custody-v1")
-                .context("custody input class")?,
-            browser_output_recipient_key: None,
-            petal_key_scope: None,
-            legacy_passkey_migration: None,
-            wallet_seed_profile: None,
-            derivation_requests: vec![derivation],
-            account_terms: Some(terms),
-        })
-        .await
-        .map_err(anyhow::Error::new)
-        .context("prepare Broker account allocation ceremony")?;
-    let projection = bloom_machine_client::CeremonyProjection::from_custody_prepare(
-        &response,
-        current_unix_ms(),
-    )
-    .map_err(anyhow::Error::new)
-    .context("construct Machine custody projection")?;
-    let projection_path = persist_ceremony_projection(&daemon.home, &projection)?;
-    Ok(format!(
-        "operation_id: {}\nceremony_kind: {:?}\nceremony_url: {}\nceremony_expires_at_ms: {}\nprojection: {}\n",
-        response.custody_operation_id,
-        response.ceremony_kind,
-        response.ceremony_url,
-        response.ceremony_expires_at_ms.get(),
-        projection_path.display(),
-    ))
-}
-
 async fn launch_account_retirement(
     daemon: &Daemon,
     wallet_id: &bloom_broker_api::Token,
@@ -1545,10 +1424,6 @@ async fn execute_machine_command(
                 &accounts, None,
             )?)?
         }
-        MachineCommand::WalletAccountAllocate { name, profile } => {
-            let wallet_id = bloom_broker_api::Token::new(name)?;
-            launch_account_allocation(daemon, &wallet_id, &profile).await?
-        }
         MachineCommand::WalletAccountRetire { name, fingerprint } => {
             let wallet_id = bloom_broker_api::Token::new(name)?;
             launch_account_retirement(daemon, &wallet_id, &fingerprint).await?
@@ -1560,15 +1435,13 @@ async fn execute_machine_command(
         } => {
             let wallet_id = bloom_broker_api::Token::new(name)?;
             if let Some(profile) = profile {
-                let (derivation_profile, allocation_profile) = match profile.as_str() {
-                    "evm" | "bip44-evm-secp256k1-v1" => (
-                        bloom_broker_api::DerivationProfile::Bip44EvmSecp256k1V1,
-                        "bip44-evm-secp256k1-v1",
-                    ),
-                    "solana" | "bip44-solana-slip10-ed25519-v1" => (
-                        bloom_broker_api::DerivationProfile::Bip44SolanaSlip10Ed25519V1,
-                        "bip44-solana-slip10-ed25519-v1",
-                    ),
+                let derivation_profile = match profile.as_str() {
+                    "evm" | "bip44-evm-secp256k1-v1" => {
+                        bloom_broker_api::DerivationProfile::Bip44EvmSecp256k1V1
+                    }
+                    "solana" | "bip44-solana-slip10-ed25519-v1" => {
+                        bloom_broker_api::DerivationProfile::Bip44SolanaSlip10Ed25519V1
+                    }
                     other => {
                         return Err(machine_error(
                             MachineErrorKind::InvalidParams,
@@ -1602,10 +1475,8 @@ async fn execute_machine_command(
                     bloom_solana_tx::AccountSelectionError::None { .. } => machine_error(
                         MachineErrorKind::NotFound,
                         format!(
-                            "wallet '{}' has no active {profile} derived account; allocate one with `bloom wallet account-allocate {} --profile {}`",
+                            "wallet '{}' has no active {profile} account; only BIP-39 wallets have derived accounts",
                             wallet_id.as_str(),
-                            wallet_id.as_str(),
-                            allocation_profile,
                         ),
                     ),
                     bloom_solana_tx::AccountSelectionError::NoMatch { .. } => {
@@ -2774,15 +2645,6 @@ enum WalletCmd {
     Projection { name: String },
     /// Print the wallet's derived-account projection (BIP-39 `wallet.accounts`).
     Accounts { name: String },
-    /// Start a Broker-hosted AccountAllocate ceremony to derive a new account
-    /// under the wallet's BIP-39 root.
-    AccountAllocate {
-        name: String,
-        /// Derivation profile. V1 exposes `bip44-solana-slip10-ed25519-v1`;
-        /// BIP-39 import creates the canonical EVM account itself.
-        #[arg(long)]
-        profile: String,
-    },
     /// Retire one active derived account by its public-key fingerprint.
     AccountRetire {
         name: String,
@@ -3684,13 +3546,6 @@ async fn run(cli: Cli) -> Result<()> {
         }
         Cmd::Wallet(WalletCmd::Accounts { name }) => {
             call_machine_command(&client_endpoint, MachineCommand::WalletAccounts { name }).await
-        }
-        Cmd::Wallet(WalletCmd::AccountAllocate { name, profile }) => {
-            call_machine_command(
-                &client_endpoint,
-                MachineCommand::WalletAccountAllocate { name, profile },
-            )
-            .await
         }
         Cmd::Wallet(WalletCmd::AccountRetire { name, fingerprint }) => {
             call_machine_command(

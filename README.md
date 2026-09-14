@@ -8,7 +8,7 @@
   <a href="https://github.com/bloom-directory/bloom/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/bloom-directory/bloom/ci.yml?branch=master&style=flat-square&label=ci"></a>
   <a href="https://github.com/bloom-directory/bloom/releases"><img alt="Release" src="https://img.shields.io/github/v/release/bloom-directory/bloom?include_prereleases&style=flat-square"></a>
   <a href="./LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-141310?style=flat-square"></a>
-  <img alt="Rust 1.85+" src="https://img.shields.io/badge/rust-1.85%2B-a8324c?style=flat-square">
+  <a href="./Cargo.toml"><img alt="Declared MSRV: 1.86" src="https://img.shields.io/badge/Declared%20MSRV%3A%201.86-a8324c?style=flat-square"></a>
 </p>
 
 <p align="center">
@@ -66,19 +66,20 @@ Bloom gives an agent a safe wallet workspace:
 
 Bloom ships read-ready RPC defaults for major EVM networks — Ethereum,
 Base, Tempo, Robinhood Chain, Arbitrum, Optimism, Polygon, BNB Smart Chain,
-Avalanche, Gnosis, Linea, and HyperEVM — plus local Anvil. Per-chain
+Avalanche, Gnosis, Linea, HyperEVM, and Arc — plus local Anvil. Per-chain
 broadcasting is enabled by default; set `allow_broadcast = false` on a chain to
 disable it.
 Public reads, simulations, and planning work without adding API keys;
 local devnet sends require a running Anvil node.
 
-Mnemonic import is the default wallet-import profile. The legacy raw
-secp256k1 scalar profile remains available only when selected explicitly:
+Every new BIP-39 wallet creates its canonical EVM and Solana accounts in the
+registration ceremony. The legacy raw secp256k1 scalar import profile remains
+available only when selected explicitly:
 
 ```sh
-bloom wallet import main
-bloom wallet account-allocate main --profile bip44-solana-slip10-ed25519-v1
+bloom wallet new main
 bloom wallet address main --profile solana
+bloom wallet address main --profile evm
 ```
 
 Native Solana transfers use the same wallet outbox shape as EVM transfers,
@@ -97,6 +98,11 @@ cargo run -p bloom -- init
 mkdir -p "$HOME/bloom"
 cargo run -p bloom -- serve --mount "$HOME/bloom"
 ```
+
+This is a Machine-only public-read loop. Wallet custody, approval, and signing
+require the separate Broker and Signer processes. Use the triad quickstart for
+authority-bearing workflows; never add a local signer to make this command
+standalone.
 
 In another terminal, or from your agent:
 
@@ -133,14 +139,18 @@ For the full wallet walkthrough, read
 
 ## Development commands
 
-For local development, use the package-manager-native checks:
+For a focused Machine change, use the package-manager-native checks:
 
 ```sh
-cargo fmt
+cargo fmt --all -- --check
 cargo test -p bloom
 cargo test --workspace --lib
 cargo build -p bloom
 ```
+
+Cross-process, BIP-39, and Solana work uses the staged triad workflow and test
+ladder in [`DEVELOPMENT.md`](./DEVELOPMENT.md); a single-process `cargo run` is
+not evidence for an authority-boundary change.
 
 ## Filesystem layout
 
