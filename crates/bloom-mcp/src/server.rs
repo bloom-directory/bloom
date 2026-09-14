@@ -36,9 +36,10 @@ pub const SUPPORTED_PROTOCOL_VERSIONS: [&str; 3] = ["2025-06-18", "2025-03-26", 
 /// client can tell an absent path from a server that is not working.
 pub const RESOURCE_NOT_FOUND_CODE: i32 = -32002;
 
-/// `resources/read` refused because reading the path would sign, broadcast, or
-/// otherwise act. Deliberately outside the daemon's code space: no VFS command
-/// failed, the proxy declined to issue one.
+/// `resources/read` refused because the path's handler flags it
+/// `read_side_effecting`: a read that acts, or a write-only control such as a
+/// wallet outbox `confirm`. Deliberately outside the daemon's code space: no
+/// VFS command failed, the proxy declined to issue one.
 pub const RESOURCE_IS_AN_ACTION_CODE: i32 = -32010;
 
 /// Largest accepted inbound frame. MCP requests are small; the cap stops a
@@ -268,11 +269,14 @@ impl McpServer {
     /// Read a VFS path as an MCP resource.
     ///
     /// Clients treat resources as inert context and fetch them without asking,
-    /// so this refuses the handful of VFS paths whose read *is* the action
-    /// (outbox `confirm`/`replace`/`cancel`). The daemon's `lookup` reports
-    /// that per path, which keeps the judgement in the VFS instead of in a
-    /// path list maintained here. Nothing is lost: `vfs_read` still performs
-    /// those reads, under a tool call the client can present for confirmation.
+    /// so this refuses every path the daemon's `lookup` flags
+    /// `read_side_effecting`, which keeps the judgement in the VFS instead of
+    /// in a path list maintained here. That covers reads that act (a Petal
+    /// route can declare one) and the wallet outbox controls (`confirm`,
+    /// `confirm.override`, `replace`, `cancel`), which are write-only sinks the
+    /// wallet handler flags defensively; reading one acts on nothing. Nothing
+    /// is lost: `vfs_read` still performs those reads, under a tool call the
+    /// client can present for confirmation.
     async fn resources_read(&self, id: Value, params: &Value) -> Value {
         let Some(uri) = params.get("uri").and_then(Value::as_str) else {
             return error_response(id, -32602, "resources/read requires a `uri`");
@@ -291,8 +295,8 @@ impl McpServer {
                     id,
                     RESOURCE_IS_AN_ACTION_CODE,
                     format!(
-                        "reading {path} performs an action (it signs or broadcasts), so it is not \
-                         served as a resource; call the `vfs_read` tool if you intend to trigger it"
+                        "{path} is flagged `read_side_effecting` by its handler, so it is not \
+                         served as a resource; call the `vfs_read` tool to read it deliberately"
                     ),
                     json!({ "uri": uri, "path": path, "tool": "vfs_read" }),
                 );
@@ -335,7 +339,7 @@ fn resource_templates() -> Value {
             "uriTemplate": "bloom:///{+path}",
             "name": "bloom-vfs-path",
             "title": "Bloom VFS path",
-            "description": "Any inert Bloom VFS path, for example `bloom:///status/health`. Use `vfs_list` to discover paths, and percent-encode `%`, spaces, `?`, and `#` inside a path segment. Bloom's few side-effecting reads (a wallet outbox `confirm`, `confirm.override`, `replace`, or `cancel` file, whose read performs the action) are refused here with error -32010 and remain reachable only through the `vfs_read` tool, so fetching a resource never signs or broadcasts.",
+            "description": "Any inert Bloom VFS path, for example `bloom:///status/health`. Use `vfs_list` to discover paths, and percent-encode `%`, spaces, `?`, and `#` inside a path segment. Paths that `vfs_stat` reports as `read_side_effecting` are refused here with error -32010 and remain reachable only through the `vfs_read` tool, so fetching a resource never acts. That includes the wallet outbox controls (`confirm`, `confirm.override`, `replace`, `cancel`): they are write-only sinks, not readable resources, and only a `vfs_write` to one acts.",
         }],
     })
 }
@@ -641,9 +645,10 @@ mod tests {
         assert_eq!(response["error"]["data"]["daemonCode"], -32007);
     }
 
-    /// Clients fetch resources without asking. A path whose read signs or
-    /// broadcasts must therefore never be served as one — but must stay
-    /// reachable through the tool.
+    /// Clients fetch resources without asking. A path flagged
+    /// `read_side_effecting` — here a wallet outbox control, a write-only sink
+    /// the wallet handler flags defensively — must therefore never be served
+    /// as one, and the refusal must not claim that reading it acts.
     #[tokio::test]
     async fn a_side_effecting_read_is_refused_as_a_resource_and_never_issued() {
         let (server, commands) = server(Ok(json!({
@@ -658,6 +663,11 @@ mod tests {
             .unwrap();
         assert_eq!(response["error"]["code"], RESOURCE_IS_AN_ACTION_CODE);
         assert_eq!(response["error"]["data"]["tool"], "vfs_read");
+        let message = response["error"]["message"].as_str().unwrap();
+        assert!(message.contains("read_side_effecting"), "{message}");
+        for false_claim in ["sign", "broadcast", "performs"] {
+            assert!(!message.contains(false_claim), "{message}");
+        }
 
         // Only the (inert) lookup was issued; the read never happened.
         let calls = commands.calls.lock().unwrap();

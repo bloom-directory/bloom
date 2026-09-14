@@ -47,10 +47,11 @@ pub struct ToolSpec {
     pub description: &'static str,
     pub method: VfsMethod,
     /// `readOnlyHint`: true only when *every* path the tool can reach is inert.
-    /// `list` and `lookup` qualify; `read` does not, because a handful of VFS
-    /// paths (outbox `confirm`/`replace`/`cancel`) sign or broadcast when read.
-    /// The daemon audits those regardless of which client asks, but a client
-    /// that trusts `readOnlyHint` would skip its confirmation prompt.
+    /// `list` and `lookup` qualify; `read` does not, because a handler may
+    /// declare a path's read side-effecting (a Petal route can). The daemon
+    /// audits those regardless of which client asks, but a client that trusts
+    /// `readOnlyHint` would skip its confirmation prompt. (The wallet outbox
+    /// controls are not the reason: they are write-only sinks.)
     pub read_only: bool,
     /// `destructiveHint`, only meaningful when [`Self::read_only`] is false.
     /// Writes are staged and confirmable, but they are the surface that moves
@@ -72,7 +73,7 @@ pub const TOOLS: [ToolSpec; 5] = [
     ToolSpec {
         name: "vfs_read",
         title: "Read a Bloom VFS file",
-        description: "Read the bytes of a Bloom VFS file. Equivalent to `bloom vfs cat <path>`. UTF-8 content is returned as text; anything else is returned as a base64 blob. Most paths are inert data, but a few are side-effecting by design: reading a wallet outbox `confirm`, `confirm.override`, `replace`, or `cancel` file performs that action. Call `vfs_stat` first — it reports `read_side_effecting` — and treat a true there as an action needing confirmation, not a fetch.",
+        description: "Read the bytes of a Bloom VFS file. Equivalent to `bloom vfs cat <path>`. UTF-8 content is returned as text; anything else is returned as a base64 blob. Most paths are inert data, but a handler may declare a path's read side-effecting. Call `vfs_stat` first — it reports `read_side_effecting` — and treat a true there as an action needing confirmation, not a fetch. Wallet outbox controls (`confirm`, `confirm.override`, `replace`, `cancel`) carry that flag too but are write-only sinks: reading one does not act, and only `vfs_write` confirms, replaces, or cancels.",
         method: VfsMethod::Read,
         read_only: false,
         destructive: false,
@@ -80,7 +81,7 @@ pub const TOOLS: [ToolSpec; 5] = [
     ToolSpec {
         name: "vfs_stat",
         title: "Stat a Bloom VFS path",
-        description: "Return Bloom VFS metadata for a path without reading it. Equivalent to `bloom vfs stat <path>`: name, kind, size, POSIX mode, symlink target, modification time, and `read_side_effecting` — whether reading the path would sign or broadcast. Always inert; safe to call before any read.",
+        description: "Return Bloom VFS metadata for a path without reading it. Equivalent to `bloom vfs stat <path>`: name, kind, size, POSIX mode, symlink target, modification time, and `read_side_effecting` — the handler's declaration that the path must not be read speculatively (a read that acts, or a write-only control such as a wallet outbox `confirm`). Always inert; safe to call before any read.",
         method: VfsMethod::Lookup,
         read_only: true,
         destructive: false,
@@ -435,9 +436,11 @@ pub fn path_from_uri(uri: &str) -> Result<String, String> {
     Ok(path)
 }
 
-/// Whether the daemon's `lookup` reply says reading this path signs,
-/// broadcasts, or otherwise mutates state. A reply from a daemon predating
-/// the field reads as `false`, matching the VFS default for unknown paths.
+/// Whether the daemon's `lookup` reply carries the handler's
+/// `read_side_effecting` flag: the path must not be read speculatively,
+/// either because its read acts or because it is a write-only control. A
+/// reply from a daemon predating the field reads as `false`, matching the VFS
+/// default for unknown paths.
 pub fn read_is_side_effecting(entry: &Value) -> bool {
     entry
         .get("read_side_effecting")
@@ -631,8 +634,8 @@ mod tests {
         // `lookup` and `list` touch nothing.
         assert_eq!(hints("vfs_stat"), (true, false));
         assert_eq!(hints("vfs_list"), (true, false));
-        // A read can sign or broadcast on outbox control paths, so it cannot
-        // claim to leave the environment alone.
+        // A handler may declare a read side-effecting, so a read cannot claim
+        // to leave the environment alone.
         assert_eq!(hints("vfs_read"), (false, false));
         assert_eq!(hints("vfs_write"), (false, true));
         assert_eq!(hints("vfs_write_then_stat"), (false, true));
@@ -647,6 +650,22 @@ mod tests {
             &json!({"name": "confirm", "read_side_effecting": false})
         ));
         assert!(!read_is_side_effecting(&json!({"name": "greet"})));
+    }
+
+    /// Wallet outbox controls are write-only sinks: only a write confirms,
+    /// replaces, or cancels. No tool may tell a client that reading one acts.
+    #[test]
+    fn no_tool_claims_an_outbox_control_read_acts() {
+        for tool in &TOOLS {
+            for false_claim in ["performs that action", "sign or broadcast"] {
+                assert!(
+                    !tool.description.contains(false_claim),
+                    "{}: {}",
+                    tool.name,
+                    tool.description
+                );
+            }
+        }
     }
 
     #[test]
