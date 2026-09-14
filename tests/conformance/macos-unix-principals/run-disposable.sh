@@ -73,6 +73,26 @@ capture_failure_evidence() {
   launchctl print "user/$login_uid/com.bloom.session" \
     > "$evidence_dir/session-launchctl.txt" 2>&1 || true
   chmod 0644 "$evidence_dir/session-launchctl.txt" 2>/dev/null || true
+  # The Machine launchagent is bootstrapped into the user domain; its launchd
+  # state carries the last exit status and run count. Best effort only: the
+  # installer's rollback may have booted the job out before this runs.
+  launchctl print "user/$login_uid/com.bloom.machine" \
+    > "$evidence_dir/machine-launchctl.txt" 2>&1 || true
+  chmod 0644 "$evidence_dir/machine-launchctl.txt" 2>/dev/null || true
+  login_home="$(dscl . -read "/Users/$login_user" NFSHomeDirectory 2>/dev/null |
+    awk 'NR==1{sub(/^NFSHomeDirectory:[[:space:]]*/,"");print}')" || true
+  if [[ -n "$login_home" && -d "$login_home/.bloom" ]]; then
+    find "$login_home/.bloom" -xdev -maxdepth 5 -ls \
+      > "$evidence_dir/machine-home-tree.txt" 2>&1 || true
+    chmod 0644 "$evidence_dir/machine-home-tree.txt" 2>/dev/null || true
+    if [[ -d "$login_home/.bloom/logs" ]]; then
+      for service_log in "$login_home/.bloom/logs/"*.jsonl; do
+        [[ -f "$service_log" && ! -L "$service_log" ]] || continue
+        install -m 0644 "$service_log" \
+          "$evidence_dir/machine-$(basename "$service_log")" || true
+      done
+    fi
+  fi
   find "/private/var/run/bloom/$login_uid" -xdev -ls \
     > "$evidence_dir/runtime-tree.txt" 2>&1 || true
   chmod 0644 "$evidence_dir/runtime-tree.txt" 2>/dev/null || true
@@ -291,20 +311,15 @@ sudo -u "$login_user" test ! -r "$signer_checkpoint"
 sudo -u "bloom-broker-$login_uid" test ! -r "$signer_checkpoint"
 sudo -u "bloom-signer-$login_uid" test ! -r "$broker_checkpoint"
 
-pf_rules="$(pfctl -a "com.bloom.triad/$login_uid" -sr)"
-assert_pf_principal() {
-  principal_uid="$1"
-  principal_name="$2"
-  grep -E \
-    "user[[:space:]]+(=[[:space:]]+)?(<?$principal_uid|$principal_name)([[:space:]]|$)" \
-    <<<"$pf_rules" >/dev/null || {
-    echo "loaded Bloom pf rules omit $principal_name ($principal_uid):" >&2
-    printf '%s\n' "$pf_rules" >&2
-    exit 1
-  }
+# PF retirement is a compatibility check, not a network-isolation claim.
+[[ ! -e "/etc/pf.anchors/com.bloom.triad.$login_uid" ]]
+[[ -z "$(pfctl -a "com.bloom.triad/$login_uid" -sr)" ]] || {
+  echo "legacy Bloom PF rules remain loaded" >&2; exit 1
 }
-assert_pf_principal "$broker_uid" "bloom-broker-$login_uid"
-assert_pf_principal "$signer_uid" "bloom-signer-$login_uid"
+for service in broker signer; do
+  grep -Eq '"network_containment"[[:space:]]*:[[:space:]]*null' \
+    "/Library/Application Support/BloomTriad/config/$login_uid/$service/config.json"
+done
 
 for socket in \
   "/private/var/run/bloom/$login_uid/machine-broker/broker.sock" \
@@ -429,8 +444,7 @@ for protected_path in \
   "/Library/LaunchDaemons/com.bloom.broker.$login_uid.plist" \
   "/Library/LaunchDaemons/com.bloom.signer.$login_uid.plist" \
   "$session_plist" \
-  "/Library/Application Support/BloomTriad/config/$login_uid/edge-manifest.json" \
-  "/etc/pf.anchors/com.bloom.triad.$login_uid"
+  "/Library/Application Support/BloomTriad/config/$login_uid/edge-manifest.json"
 do
   for principal in \
     "$login_user" \
@@ -524,10 +538,12 @@ then
   echo "services did not drain after the login-session sentinel disappeared" >&2
   exit 1
 fi
-if curl --silent --max-time 1 http://127.0.0.1:18734/ >/dev/null 2>&1; then
-  echo "Broker retained the ceremony listener after session logout" >&2
-  exit 1
-fi
+for ceremony_host in 127.0.0.1 '[::1]'; do
+  if curl --silent --globoff --max-time 1 "http://$ceremony_host:18734/" >/dev/null 2>&1; then
+    echo "Broker retained the ceremony listener on $ceremony_host after session logout" >&2
+    exit 1
+  fi
+done
 launchctl print "$broker_label" >/dev/null
 launchctl print "$signer_label" >/dev/null
 launchctl bootstrap "user/$login_uid" "$session_plist"
@@ -548,268 +564,157 @@ sudo -u "$login_user" \
   serve triad-health-check \
   "$release_digest"
 
-ceremony_headers=""
-deadline=$((SECONDS + 20))
-while [[ $SECONDS -lt $deadline ]]; do
-  if ceremony_headers="$(
-    curl --silent --show-error --max-time 2 --dump-header - \
-      --output /dev/null http://127.0.0.1:18734/ 2>/dev/null
-  )" &&
-    grep -Fi \
-      'x-bloom-ceremony-owner: bloom-broker-v1' \
-      <<<"$ceremony_headers" >/dev/null
-  then
-    break
-  fi
-  sleep 1
+# Chromium resolves localhost to ::1 before 127.0.0.1, so the Broker must
+# answer on both loopback families.
+for ceremony_host in 127.0.0.1 '[::1]'; do
+  ceremony_headers=""
+  deadline=$((SECONDS + 20))
+  while [[ $SECONDS -lt $deadline ]]; do
+    if ceremony_headers="$(
+      curl --silent --show-error --globoff --max-time 2 --dump-header - \
+        --output /dev/null "http://$ceremony_host:18734/" 2>/dev/null
+    )" &&
+      grep -Fi \
+        'x-bloom-ceremony-owner: bloom-broker-v1' \
+        <<<"$ceremony_headers" >/dev/null
+    then
+      break
+    fi
+    sleep 1
+  done
+  grep -Fi \
+    'x-bloom-ceremony-owner: bloom-broker-v1' \
+    <<<"$ceremony_headers" >/dev/null || {
+    echo "Broker did not publish the canonical ceremony-owner marker on $ceremony_host" >&2
+    exit 1
+  }
 done
-grep -Fi \
-  'x-bloom-ceremony-owner: bloom-broker-v1' \
-  <<<"$ceremony_headers" >/dev/null || {
-  echo "Broker did not publish the canonical ceremony-owner marker" >&2
-  exit 1
-}
 
 broker_plist="/Library/LaunchDaemons/com.bloom.broker.$login_uid.plist"
 broker_state="/private/var/db/bloom/$login_uid/broker"
 broker_startup_status="/private/var/run/bloom/$login_uid/status/broker-startup.json"
 containment_status="/private/var/run/bloom/$login_uid/containment/status.json"
-launchctl bootout "$broker_label"
-broker_durable_before="$(
-  find "$broker_state" -type f ! -name broker.log -exec shasum -a 256 {} \; |
-    LC_ALL=C sort |
-    shasum -a 256 |
-    awk '{print $1}'
-)"
-/usr/bin/nc -lk 127.0.0.1 18734 >/dev/null 2>&1 &
-foreign_listener_pid=$!
-deadline=$((SECONDS + 10))
-while [[ $SECONDS -lt $deadline ]]; do
-  lsof -nP -a -p "$foreign_listener_pid" -iTCP@127.0.0.1:18734 -sTCP:LISTEN |
-    grep 18734 >/dev/null && break
-  sleep 0.05
-done
-kill -0 "$foreign_listener_pid"
-# Broker has been deliberately unloaded, so the containment monitor cannot
-# publish a new healthy attestation for that enrollment. Wait beyond the exact
-# configured freshness bound before restarting Broker. The stale prior
-# Bloom-owner observation must not classify this non-Bloom listener as another
-# login session.
-containment_maximum_age_ms="$(
-  plutil -extract network_containment.maximum_age_ms raw -o - \
-    "/Library/Application Support/BloomTriad/config/$login_uid/broker/config.json"
-)"
-[[ "$containment_maximum_age_ms" =~ ^[1-9][0-9]*$ ]]
-sleep "$(( (containment_maximum_age_ms + 999) / 1000 + 1 ))"
-launchctl bootstrap system "$broker_plist"
-deadline=$((SECONDS + 15))
-while [[ $SECONDS -lt $deadline ]]; do
-  if [[ -f "$broker_startup_status" ]] &&
-    [[ "$(plutil -extract state raw -o - "$broker_startup_status" 2>/dev/null)" == "fatal" ]] &&
-    [[ "$(plutil -extract incident raw -o - "$broker_startup_status" 2>/dev/null)" == \
-      "foreign_or_unverifiable_process" ]]
+
+# A foreign listener on either loopback family must keep the Broker from
+# serving at all. Chromium tries ::1 before 127.0.0.1, so a Broker that
+# served only the family it could bind would hand the approval page request
+# to whatever process squats the other one.
+assert_foreign_ceremony_conflict() {
+  local family="$1" address="$2" lsof_address="$3"
+  local broker_durable_before broker_durable_after foreign_machine_failure
+
+  launchctl bootout "$broker_label"
+  broker_durable_before="$(
+    find "$broker_state" -type f ! -name broker.log -exec shasum -a 256 {} \; |
+      LC_ALL=C sort |
+      shasum -a 256 |
+      awk '{print $1}'
+  )"
+  /usr/bin/nc "-$family" -lk "$address" 18734 >/dev/null 2>&1 &
+  foreign_listener_pid=$!
+  deadline=$((SECONDS + 10))
+  while [[ $SECONDS -lt $deadline ]]; do
+    lsof -nP -a -p "$foreign_listener_pid" "-iTCP@$lsof_address:18734" -sTCP:LISTEN |
+      grep 18734 >/dev/null && break
+    sleep 0.05
+  done
+  kill -0 "$foreign_listener_pid"
+  launchctl bootstrap system "$broker_plist"
+  deadline=$((SECONDS + 15))
+  while [[ $SECONDS -lt $deadline ]]; do
+    if [[ -f "$broker_startup_status" ]] &&
+      [[ "$(plutil -extract state raw -o - "$broker_startup_status" 2>/dev/null)" == "fatal" ]] &&
+      [[ "$(plutil -extract incident raw -o - "$broker_startup_status" 2>/dev/null)" == \
+        "ceremony_listeners_unavailable" ]]
+    then
+      break
+    fi
+    sleep 0.1
+  done
+  assert_metadata \
+    "$broker_startup_status" \
+    "$broker_uid:$machine_broker_gid:640"
+  [[ "$(plutil -extract schema raw -o - "$broker_startup_status")" == \
+    "bloom.broker-startup.1" ]]
+  [[ "$(plutil -extract state raw -o - "$broker_startup_status")" == "fatal" ]]
+  [[ "$(plutil -extract incident raw -o - "$broker_startup_status")" == \
+    "ceremony_listeners_unavailable" ]]
+  [[ "$(plutil -extract address raw -o - "$broker_startup_status")" == \
+    "localhost:18734" ]]
+  [[ "$(plutil -extract message raw -o - "$broker_startup_status")" == \
+    "could not acquire both ceremony loopback listeners; see Broker service logs" ]]
+  if foreign_machine_failure="$(
+    sudo -u "$login_user" \
+      "$machine_binary" \
+      serve triad-health-check "$release_digest" 2>&1
+  )"
   then
-    break
+    echo "Machine reported healthy while a foreign process owned the $address ceremony port" >&2
+    exit 1
   fi
-  sleep 0.1
-done
-assert_metadata \
-  "$broker_startup_status" \
-  "$broker_uid:$machine_broker_gid:640"
-[[ "$(plutil -extract schema raw -o - "$broker_startup_status")" == \
-  "bloom.broker-startup.1" ]]
-[[ "$(plutil -extract state raw -o - "$broker_startup_status")" == "fatal" ]]
-[[ "$(plutil -extract incident raw -o - "$broker_startup_status")" == \
-  "foreign_or_unverifiable_process" ]]
-[[ "$(plutil -extract address raw -o - "$broker_startup_status")" == \
-  "127.0.0.1:18734" ]]
-[[ "$(plutil -extract message raw -o - "$broker_startup_status")" == \
-  "a foreign or unverifiable process owns the Bloom ceremony listener" ]]
-if foreign_machine_failure="$(
+  if ! grep -F \
+    'Bloom Broker startup failed: could not acquire both ceremony loopback listeners; see Broker service logs' \
+    <<<"$foreign_machine_failure" >/dev/null
+  then
+    echo "Machine did not report the authenticated foreign-listener diagnostic for $address:" >&2
+    printf '%s\n' "$foreign_machine_failure" >&2
+    stat -f 'startup diagnostic metadata: %u:%g:%Lp links=%l bytes=%z' \
+      "$broker_startup_status" >&2
+    echo "startup diagnostic content:" >&2
+    sudo -u "$login_user" cat "$broker_startup_status" >&2 || true
+    exit 1
+  fi
+  # The Broker must not keep the family it could bind, nor fall back to
+  # another address or port.
+  if lsof -nP -a -u "bloom-broker-$login_uid" -iTCP -sTCP:LISTEN |
+    grep . >/dev/null
+  then
+    echo "Broker opened a fallback TCP listener after the canonical bind conflict on $address" >&2
+    exit 1
+  fi
+  broker_durable_after="$(
+    find "$broker_state" -type f ! -name broker.log -exec shasum -a 256 {} \; |
+      LC_ALL=C sort |
+      shasum -a 256 |
+      awk '{print $1}'
+  )"
+  [[ "$broker_durable_after" == "$broker_durable_before" ]] || {
+    echo "a Broker that lost the canonical $address listener mutated durable authority state" >&2
+    exit 1
+  }
+  kill "$foreign_listener_pid" 2>/dev/null || true
+  wait "$foreign_listener_pid" 2>/dev/null || true
+  foreign_listener_pid=""
+  # Multiple fatal starts while the port is occupied can put launchd into a
+  # failure-backoff interval. Prove failure-only KeepAlive recovery without
+  # imposing a shorter deadline than launchd's scheduler.
+  deadline=$((SECONDS + 60))
+  while [[ $SECONDS -lt $deadline ]]; do
+    if sudo -u "$login_user" \
+      "$machine_binary" \
+      serve triad-health-check \
+      "$release_digest"
+    then
+      break
+    fi
+    sleep 1
+  done
   sudo -u "$login_user" \
-    "$machine_binary" \
-    serve triad-health-check "$release_digest" 2>&1
-)"
-then
-  echo "Machine reported healthy while a foreign process owned the ceremony port" >&2
-  exit 1
-fi
-if ! grep -F \
-  'Bloom Broker startup failed: a foreign or unverifiable process owns the Bloom ceremony listener' \
-  <<<"$foreign_machine_failure" >/dev/null
-then
-  echo "Machine did not report the authenticated foreign-listener diagnostic:" >&2
-  printf '%s\n' "$foreign_machine_failure" >&2
-  stat -f 'startup diagnostic metadata: %u:%g:%Lp links=%l bytes=%z' \
-    "$broker_startup_status" >&2
-  echo "startup diagnostic content:" >&2
-  sudo -u "$login_user" cat "$broker_startup_status" >&2 || true
-  exit 1
-fi
-if lsof -nP -a -u "bloom-broker-$login_uid" -iTCP -sTCP:LISTEN |
-  grep . >/dev/null
-then
-  echo "Broker opened a fallback TCP listener after the canonical bind conflict" >&2
-  exit 1
-fi
-broker_durable_after="$(
-  find "$broker_state" -type f ! -name broker.log -exec shasum -a 256 {} \; |
-    LC_ALL=C sort |
-    shasum -a 256 |
-    awk '{print $1}'
-)"
-[[ "$broker_durable_after" == "$broker_durable_before" ]] || {
-  echo "a Broker that lost the canonical listener mutated durable authority state" >&2
-  exit 1
-}
-kill "$foreign_listener_pid" 2>/dev/null || true
-wait "$foreign_listener_pid" 2>/dev/null || true
-foreign_listener_pid=""
-# Multiple fatal starts while the port is occupied can put launchd into a
-# failure-backoff interval. Prove failure-only KeepAlive recovery without
-# imposing a shorter deadline than launchd's scheduler.
-deadline=$((SECONDS + 60))
-while [[ $SECONDS -lt $deadline ]]; do
-  if sudo -u "$login_user" \
     "$machine_binary" \
     serve triad-health-check \
     "$release_digest"
-  then
-    break
-  fi
-  sleep 1
-done
-sudo -u "$login_user" \
-  "$machine_binary" \
-  serve triad-health-check \
-  "$release_digest"
-[[ ! -e "$broker_startup_status" ]] || {
-  echo "Broker retained a stale startup diagnostic after acquiring the listener" >&2
-  exit 1
-}
-
-if sudo -u "bloom-signer-$login_uid" \
-  /usr/bin/nc -z -G 2 -w 2 127.0.0.1 18734
-then
-  echo "Signer opened a forbidden IPv4 loopback TCP connection" >&2
-  exit 1
-fi
-
-/usr/bin/nc -6 -l ::1 18735 >/dev/null 2>&1 &
-network_listener_pid=$!
-sleep 0.2
-kill -0 "$network_listener_pid"
-if sudo -u "bloom-signer-$login_uid" \
-  /usr/bin/nc -6 -z -G 2 -w 2 ::1 18735
-then
-  echo "Signer opened a forbidden IPv6 loopback TCP connection" >&2
-  exit 1
-fi
-kill "$network_listener_pid"
-wait "$network_listener_pid" 2>/dev/null || true
-network_listener_pid=""
-
-default_interface="$(
-  route -n get default |
-    awk '$1 == "interface:" { print $2; exit }'
-)"
-host_ipv4="$(ipconfig getifaddr "$default_interface")"
-[[ -n "$host_ipv4" && "$host_ipv4" != 127.* ]] || {
-  echo "W0 could not resolve a non-loopback IPv4 test address" >&2
-  exit 69
-}
-/usr/bin/nc -l "$host_ipv4" 18736 >/dev/null 2>&1 &
-network_listener_pid=$!
-sleep 0.2
-kill -0 "$network_listener_pid"
-for service_user in "bloom-broker-$login_uid" "bloom-signer-$login_uid"; do
-  if sudo -u "$service_user" \
-    /usr/bin/nc -z -G 2 -w 2 "$host_ipv4" 18736
-  then
-    echo "$service_user opened a forbidden non-loopback IPv4 TCP connection" >&2
-    exit 1
-  fi
-done
-kill "$network_listener_pid"
-wait "$network_listener_pid" 2>/dev/null || true
-network_listener_pid=""
-
-assert_udp_blocked() {
-  service_user="$1"
-  address_family="$2"
-  address="$3"
-  port="$4"
-  probe="$rotation_fixtures/udp-$port"
-  : > "$probe"
-  /usr/bin/nc "$address_family" -u -l "$address" "$port" > "$probe" 2>/dev/null &
-  network_listener_pid=$!
-  sleep 0.2
-  kill -0 "$network_listener_pid"
-  printf 'bloom-w0-udp-probe\n' |
-    sudo -u "$service_user" \
-      /usr/bin/nc "$address_family" -u -w 1 "$address" "$port" \
-      >/dev/null 2>&1 || true
-  sleep 0.2
-  kill "$network_listener_pid" 2>/dev/null || true
-  wait "$network_listener_pid" 2>/dev/null || true
-  network_listener_pid=""
-  [[ ! -s "$probe" ]] || {
-    echo "$service_user emitted a forbidden UDP packet to $address" >&2
+  [[ ! -e "$broker_startup_status" ]] || {
+    echo "Broker retained a stale startup diagnostic after acquiring the listeners" >&2
     exit 1
   }
 }
+assert_foreign_ceremony_conflict 4 127.0.0.1 127.0.0.1
+assert_foreign_ceremony_conflict 6 ::1 '[::1]'
 
-assert_udp_blocked "bloom-signer-$login_uid" -4 127.0.0.1 18737
-assert_udp_blocked "bloom-signer-$login_uid" -6 ::1 18738
-assert_udp_blocked "bloom-broker-$login_uid" -4 "$host_ipv4" 18739
-
+# Legacy telemetry must never advertise a network boundary after PF retirement.
 assert_metadata "$containment_status" "0:0:644"
-deadline=$((SECONDS + 20))
-while [[ $SECONDS -lt $deadline ]]; do
-  if sudo -u "$login_user" \
-    "$machine_binary" \
-    serve triad-health-check \
-    "$release_digest"
-  then
-    break
-  fi
-  sleep 1
-done
-sudo -u "$login_user" \
-  "$machine_binary" \
-  serve triad-health-check \
-  "$release_digest"
-
-pfctl -a "com.bloom.triad/$login_uid" -F rules
-deadline=$((SECONDS + 10))
-while [[ $SECONDS -lt $deadline ]]; do
-  if [[ -f "$containment_status" ]] &&
-    [[ "$(plutil -extract available raw -o - "$containment_status")" == "false" ]]
-  then
-    break
-  fi
-  sleep 1
-done
-[[ "$(plutil -extract available raw -o - "$containment_status")" == "false" ]] || {
-  echo "packet-filter monitor did not report the removed anchor" >&2
-  exit 1
-}
-if sudo -u "$login_user" \
-  "$machine_binary" \
-  serve triad-health-check \
-  "$release_digest"
-then
-  echo "Broker remained ready after its packet-filter anchor disappeared" >&2
-  exit 1
-fi
-pfctl \
-  -a "com.bloom.triad/$login_uid" \
-  -f "/etc/pf.anchors/com.bloom.triad.$login_uid"
-"$machine_binary" serve triad-pf-monitor-once
-sudo -u "$login_user" \
-  "$machine_binary" \
-  serve triad-health-check \
-  "$release_digest"
+[[ "$(plutil -extract available raw -o - "$containment_status")" == false ]]
+[[ "$(plutil -extract network_enforcement raw -o - "$containment_status")" == none ]]
 
 current_good_payload="$payload"
 installed_acceptance_inputs=0
@@ -863,7 +768,7 @@ if [[ -n "${BLOOM_MACOS_W0_EVIDENCE_DIR:-}" ]]; then
     mui_02 \
     mui_03 \
     mui_04 \
-    mui_07 \
+    pf_retirement \
     mui_08 \
     mui_10 \
     negative_access

@@ -13,10 +13,9 @@
 #                   --workspace --lib). Skips the privileged flags
 #                   because the workspace unit tests don't mount.
 #   --fork        — runs tests/docker/test_fork_mount.sh inside the same
-#                   docker-compose stack via the `fork` profile. Stages and
-#                   broadcasts a native-ETH send via the wallet outbox, then exercises
-#                   the chain read paths (head/tx/blocks/gas) against the
-#                   resulting hash. No Enso key required.
+#                   docker-compose stack via the `fork` profile. Exercises
+#                   custody-free chain reads against an Anvil fork. Signing
+#                   acceptance belongs to the real triad suite.
 #   --mempool     — runs tests/docker/test_mempool_mock.sh inside the same
 #                   docker-compose stack via the `mempool` profile. Spins
 #                   up an in-container WS mock server that emulates
@@ -43,7 +42,7 @@ Usage: $0 [--rebuild] [--workspace|--mount|--fork|--mempool]
 
 Default mode runs the NFS mount integration test.
 --workspace runs \`cargo test --workspace --lib\` inside the same image.
---fork runs the wallet outbox + chain reads test against an anvil fork.
+--fork runs custody-free chain reads against an anvil fork.
 --mempool runs the mempool mock WS + daemon ingestion test.
 --rebuild forces \`docker build --no-cache\`.
 EOF
