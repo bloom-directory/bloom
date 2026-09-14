@@ -13,7 +13,6 @@
 # Required env (set by docker-compose.yml's mempool profile):
 #   BASE_FORK_INTERNAL_URL      RPC URL the daemon hits (anvil-fork:8545)
 #   MEMPOOL_MOCK_WS_URL         WS URL of the mock server (ws://mempool-mock:9551)
-#   BLOOM_TEST_WALLET_PASSPHRASE passphrase for the test wallet
 
 set -euo pipefail
 
@@ -22,13 +21,9 @@ LOG_PREFIX=mempool-test
 source "$SCRIPT_DIR/lib.sh"
 
 # MNT/PIDFILE/LOGFILE/SENTINEL come from lib.sh defaults.
-# DEST1/ANVIL_KEY come from lib.sh fixtures.
 HOME_DIR=/tmp/bloom-mempool-home
-WALLET=dest1
 CHAIN=base
 
-WALLET_PASSPHRASE="${BLOOM_TEST_WALLET_PASSPHRASE:-}"
-[[ -n "$WALLET_PASSPHRASE" ]] || fail "BLOOM_TEST_WALLET_PASSPHRASE not set"
 [[ -n "${BASE_FORK_INTERNAL_URL:-}" ]] || fail "BASE_FORK_INTERNAL_URL not set"
 [[ -n "${MEMPOOL_MOCK_WS_URL:-}" ]] || fail "MEMPOOL_MOCK_WS_URL not set"
 RPC_URL="$BASE_FORK_INTERNAL_URL"
@@ -49,12 +44,7 @@ EOF
 
 build_mount_demo
 
-# Top up the test wallet on the fork so the daemon can query balances
-# without hitting zero-balance paths.
-top_up_anvil_balance "$RPC_URL" "$DEST1"
-
-start_mount_demo "$MNT" "$HOME_DIR" "$PIDFILE" "$LOGFILE" \
-    "$WALLET" "$ANVIL_KEY" "$WALLET_PASSPHRASE"
+start_mount_demo "$MNT" "$HOME_DIR" "$PIDFILE" "$LOGFILE"
 trap 'cleanup_mount_demo "$MNT" "$PIDFILE" "$LOGFILE"' EXIT
 wait_for_mount "$SENTINEL" "$DAEMON_PID" "$LOGFILE" 90
 
