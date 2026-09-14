@@ -375,6 +375,12 @@ under its log directory. Correlate a failure by operation ID and authenticated
 receipt across processes. Do not copy ceremony capabilities or private input
 into an issue or shared log.
 
+On macOS, Broker requires a pre-created log file with mode `0640` and explicit
+ownership settings. The developer launcher prepares `broker.log` in `--log-dir`
+and supplies `BLOOM_BROKER_LOG_PATH`, `BLOOM_BROKER_LOG_OWNER_UID`, and
+`BLOOM_BROKER_LOG_READER_GID` automatically, replacing any inherited values.
+No manual logging configuration is needed when using the launcher.
+
 Common failures:
 
 | Symptom | Check |
