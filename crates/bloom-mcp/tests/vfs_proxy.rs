@@ -232,10 +232,7 @@ async fn initialize_then_discover_and_read_through_the_canonical_surface() {
         )
         .await;
     assert_eq!(initialize["result"]["protocolVersion"], "2025-06-18");
-    assert_eq!(
-        initialize["result"]["capabilities"]["tools"].is_object(),
-        true
-    );
+    assert!(initialize["result"]["capabilities"]["tools"].is_object());
 
     // Root discovery goes through the router, so the router's own entries
     // (agent guidance files) and the mounted subtree both show up.
@@ -427,7 +424,7 @@ async fn resources_expose_the_same_paths_as_the_read_command() {
         .collect();
     assert!(uris.contains(&"bloom:///AGENTS.md"), "{uris:?}");
     // Directories are not resources; `vfs_list` walks the tree instead.
-    assert!(!uris.iter().any(|uri| *uri == "bloom:///probe"), "{uris:?}");
+    assert!(!uris.contains(&"bloom:///probe"), "{uris:?}");
 
     let templates = harness.request("resources/templates/list", json!({})).await;
     assert_eq!(

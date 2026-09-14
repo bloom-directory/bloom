@@ -186,7 +186,7 @@ impl McpServer {
         debug!(%method, "mcp.request");
 
         // No id: a notification. Never answer, not even on error.
-        let Some(id) = id else { return None };
+        let id = id?;
 
         Some(match method {
             "initialize" => ok_response(id, self.initialize(&params)),
