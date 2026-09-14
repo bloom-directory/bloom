@@ -17,9 +17,7 @@ use bloom_solana::{SolanaClient, SolanaRpcError};
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
-use crate::outbox::{
-    ApprovalAttempt, OutboxError, SolanaOutbox, SolanaOutboxEntry, SolanaOutboxState,
-};
+use crate::outbox::{OutboxError, SolanaOutbox, SolanaOutboxEntry, SolanaOutboxState};
 use crate::signing::{SolanaSignOutcome, SolanaTransferSigner};
 use crate::types::{SolanaTxStatus, StagedSolanaTransfer};
 use crate::{assemble_transaction, build_transfer_message, verify_signature};
@@ -37,13 +35,8 @@ struct SimulationArtifact<'a> {
     logs: &'a Option<Vec<String>>,
 }
 
-/// Approval/signing TTL for an exact staged transfer (ms).
-///
-/// The chain-validity gate below remains authoritative for broadcast. Keeping
-/// the one-operation approval alive longer than the recent blockhash prevents
-/// a trusted-clock high-water mark from expiring an approval that the owner
-/// completed while the transaction was still valid.
-const SIGN_TTL_MS: u64 = 3_600_000;
+/// Default approval/signing TTL for a staged transfer (ms).
+const SIGN_TTL_MS: u64 = 60_000;
 
 /// Conservative estimate of Solana's per-slot duration, used only to turn a
 /// block-height-denominated blockhash validity window into a wall-clock
@@ -341,29 +334,6 @@ impl SolanaTransferEngine {
         fee_payer: &[u8; 32],
         now_ms: u128,
     ) -> Result<StagedSolanaTransfer, EngineError> {
-        self.restage(wallet, id, fee_payer, now_ms, true).await
-    }
-
-    /// Rebuild an approved intent immediately before signing, even when the
-    /// old blockhash has not expired yet.
-    pub async fn restage_approved(
-        &self,
-        wallet: &str,
-        id: &str,
-        fee_payer: &[u8; 32],
-        now_ms: u128,
-    ) -> Result<StagedSolanaTransfer, EngineError> {
-        self.restage(wallet, id, fee_payer, now_ms, false).await
-    }
-
-    async fn restage(
-        &self,
-        wallet: &str,
-        id: &str,
-        fee_payer: &[u8; 32],
-        now_ms: u128,
-        require_expired: bool,
-    ) -> Result<StagedSolanaTransfer, EngineError> {
         let operation_lock = self.operation_lock(wallet, id);
         let _operation_guard = operation_lock.lock().await;
         let (entry, found_in) = self.outbox.read_restageable(wallet, &self.chain, id)?;
@@ -375,18 +345,8 @@ impl SolanaTransferEngine {
                 "only an expired failed transfer can be restaged".into(),
             ));
         }
-        // A refresh exists so the approval can sign a live message. Once this
-        // entry holds the one signature that approval allows, retiring it would
-        // delete the signature and leave the successor asking the Broker for a
-        // second one it must refuse. The signed entry goes on to broadcast.
-        if !require_expired
-            && found_in == SolanaOutboxState::Pending
-            && self.outbox.recorded_signature(&entry)?.is_some()
-        {
-            return Ok(entry.staged);
-        }
         let current = self.client.get_block_height().await?;
-        if require_expired && current <= entry.staged.last_valid_block_height {
+        if current <= entry.staged.last_valid_block_height {
             return Err(EngineError::Invalid(format!(
                 "staged blockhash remains valid through block {}; current block height is {current}",
                 entry.staged.last_valid_block_height
@@ -432,84 +392,6 @@ impl SolanaTransferEngine {
             }
             Err(error) => return Err(error.into()),
         };
-        if replacement.id == entry.staged.id {
-            if require_expired {
-                // The caller established that the staged blockhash is past its
-                // window, so staging again must not hand back the same message.
-                return Err(EngineError::Invalid(
-                    "Solana RPC has not advanced to a fresh blockhash; retry confirmation".into(),
-                ));
-            }
-            // Refreshing an approved transfer before signing. The cluster has
-            // no newer blockhash than the one already staged — normal when a
-            // confirm follows staging closely, and routine against a local
-            // validator — so there is nothing to replace. Leave the entry, and
-            // its approval, exactly as the owner approved them.
-            return Ok(replacement);
-        }
-
-        // Hand the approval and its identity lineage to the successor *before*
-        // retiring the entry that holds them. Transitioning to `failed` deletes
-        // the challenge, which carries the only durable approval id; copying
-        // afterwards leaves a window where a crash strips the lineage of its
-        // approval and the next confirm re-prepares an operation the Broker
-        // will refuse forever. Doing it first is safe in both directions: a
-        // crash after the copy leaves the id on two entries, and only the
-        // successor is confirmable.
-        //
-        // The successor may already be live: a crash after an earlier copy, or
-        // a second restage of this id after the first retired it. Its own
-        // approval state is then at least as new as ours, so lock it against a
-        // concurrent sign and fill in only what it lacks. Locks are taken
-        // predecessor first; successor ids are always fresh, so the order is
-        // acyclic.
-        let successor_lock = self.operation_lock(wallet, &replacement.id);
-        let _successor_guard = successor_lock.lock().await;
-        let successor = self.outbox.read_in_state(
-            wallet,
-            &self.chain,
-            &replacement.id,
-            SolanaOutboxState::Pending,
-        )?;
-        // The attempt record migrates whether or not a live challenge exists.
-        // A refused approval deletes its challenge but keeps its counter, and
-        // the successor carries the same economic intent, so it rebuilds the
-        // same approval operation id. Dropping the counter here resets it to
-        // zero and collides with the approval that was just refused — the
-        // exact conflict this record exists to prevent.
-        if self.outbox.approval_attempt(&successor)?.is_none()
-            && let Some(attempt) = self.outbox.approval_attempt(&entry)?
-        {
-            self.outbox.write_approval_attempt(&successor, &attempt)?;
-        }
-        // The challenge is rebuilt, not copied: it names the entry it sits in,
-        // and owners check its `action_id` before opening the ceremony.
-        if !successor
-            .dir
-            .join(crate::outbox::APPROVAL_CHALLENGE_FILE)
-            .exists()
-            && let Some(previous) =
-                std::fs::read(entry.dir.join(crate::outbox::APPROVAL_CHALLENGE_FILE))
-                    .ok()
-                    .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
-            && let Some(approval_id) = previous["approval_id"].as_str()
-        {
-            let staged = &successor.staged;
-            let default_scope = format!("wallets/{}/chains/{}/outbox", staged.wallet, staged.chain);
-            let outbox_scope = previous["plan_path"]
-                .as_str()
-                .and_then(|plan| plan.split_once("/pending/").map(|(prefix, _)| prefix))
-                .unwrap_or(default_scope.as_str());
-            let challenge = SolanaOutbox::approval_challenge(
-                staged,
-                outbox_scope,
-                approval_id,
-                previous["ceremony_url"].as_str().unwrap_or_default(),
-                previous["expiry_ms"].as_u64().unwrap_or_default(),
-            )?;
-            self.outbox
-                .write_approval_challenge(&successor, &challenge)?;
-        }
 
         let mut expired = entry;
         expired.staged.status = SolanaTxStatus::Expired;
@@ -521,15 +403,8 @@ impl SolanaTransferEngine {
             expired.dir = old_dir;
         }
         self.outbox.rewrite_intent(&expired)?;
-        self.outbox.write_restage_advice(
-            &expired,
-            &replacement.id,
-            if require_expired {
-                crate::outbox::RestageReason::BlockhashExpired
-            } else {
-                crate::outbox::RestageReason::ApprovalRefresh
-            },
-        )?;
+        self.outbox
+            .write_restage_advice(&expired, &replacement.id)?;
         Ok(replacement)
     }
 
@@ -551,13 +426,6 @@ impl SolanaTransferEngine {
     /// owns the deterministic signature. On
     /// `ApprovalRequired` the ceremony details are returned and the entry
     /// stays pending for a retry with the returned `approval_id`.
-    ///
-    /// The approval window is persisted with the entry and reused, so a second
-    /// confirm of the same transfer presents the Broker the same terms and
-    /// reaches the standing ceremony instead of colliding with it. A new
-    /// window — and so a new approval identity — is minted only when the
-    /// previous one has passed, or when the Broker says the previous approval
-    /// is definitively dead.
     pub async fn sign(
         &self,
         wallet: &str,
@@ -567,11 +435,6 @@ impl SolanaTransferEngine {
         approval_id: Option<Digest32>,
         now_ms: u128,
     ) -> Result<SolanaSignOutcome, EngineError> {
-        // Serialized with restage: retiring this entry while the Broker is
-        // signing it would consume the approval's one signature on an entry
-        // that can no longer record or broadcast it.
-        let operation_lock = self.operation_lock(wallet, id);
-        let _operation_guard = operation_lock.lock().await;
         let entry =
             self.outbox
                 .read_in_state(wallet, &self.chain, id, SolanaOutboxState::Pending)?;
@@ -582,43 +445,11 @@ impl SolanaTransferEngine {
             .map_err(|e| EngineError::Invalid(format!("message base64: {e}")))?;
         validate_staged_message(&entry.staged, fee_payer, &message)?;
         validate_staged_account(&entry.staged, account_key_ref.as_ref())?;
-        let canonical_plan_facts = serde_jcs::to_vec(&serde_json::json!({
-            "schema": "bloom.solana-transfer-approval-plan.v1",
-            "wallet": entry.staged.wallet,
-            "chain": entry.staged.chain,
-            "fee_payer": entry.staged.fee_payer,
-            "account_fingerprint": entry.staged.account_fingerprint,
-            "account_derivation_path": entry.staged.account_derivation_path,
-            "destination": entry.staged.destination,
-            "lamports": entry.staged.lamports,
-            "fee_lamports": entry.staged.fee_lamports,
-            "genesis_hash": entry.staged.genesis_hash,
-        }))
-        .map_err(|e| EngineError::Invalid(format!("canonical plan facts: {e}")))?;
+        let canonical_plan_facts = serde_jcs::to_vec(&entry.staged)
+            .map_err(|e| EngineError::Invalid(format!("canonical plan facts: {e}")))?;
         let plan_facts_digest = Digest32::from_bytes(Sha256::digest(&canonical_plan_facts).into());
 
-        let now_ms_u64 = now_ms.min(u128::from(u64::MAX)) as u64;
-        // Reuse the window this transfer's live approval attempt was prepared
-        // with. Presenting a freshly computed one changes the terms under an
-        // unchanged operation id, which the Broker refuses as a conflict — so
-        // an ordinary second confirm of the same transfer would otherwise be
-        // rejected permanently and durably.
-        let attempt = match self.outbox.approval_attempt(&entry)? {
-            Some(recorded) if recorded.expires_at_ms > now_ms_u64 => recorded,
-            // No live attempt: the first confirm, or one whose window has
-            // already passed. A lapsed window cannot be resumed, so this is a
-            // genuinely new attempt and takes a new identity.
-            previous => ApprovalAttempt {
-                attempt: previous.map_or(0, |previous| previous.attempt.saturating_add(1)),
-                issued_at_ms: now_ms_u64,
-                expires_at_ms: now_ms_u64.saturating_add(SIGN_TTL_MS),
-            },
-        };
-        // Persist before asking, so a crash between the two cannot lose the
-        // terms the Broker has already seen.
-        self.outbox.write_approval_attempt(&entry, &attempt)?;
-
-        let outcome = match self
+        let outcome = self
             .signer
             .sign_transfer(crate::signing::SignTransferRequest {
                 wallet_id: wallet,
@@ -632,45 +463,17 @@ impl SolanaTransferEngine {
                 recent_blockhash: &entry.staged.blockhash,
                 last_valid_block_height: entry.staged.last_valid_block_height,
                 approval_id,
-                issued_at_ms: attempt.issued_at_ms,
-                expires_at_ms: attempt.expires_at_ms,
-                approval_attempt: attempt.attempt,
+                issued_at_ms: now_ms.min(u128::from(u64::MAX)) as u64,
+                expires_at_ms: (now_ms + u128::from(SIGN_TTL_MS)).min(u128::from(u64::MAX)) as u64,
                 canonical_plan_facts_digest: plan_facts_digest,
             })
             .await
-        {
-            Ok(outcome) => outcome,
-            Err(error) => {
-                if error.approval_is_dead() {
-                    // No signature exists and none can under this approval, so
-                    // retire it: stop advertising its ceremony, and mark the
-                    // attempt as past so the next confirm starts a new one.
-                    // The counter has to survive — deleting the record would
-                    // reset it to zero, rebuild the same operation id, and the
-                    // Broker would refuse the replacement as a conflict with
-                    // the very approval that just died.
-                    self.outbox.write_approval_attempt(
-                        &entry,
-                        &ApprovalAttempt {
-                            expires_at_ms: 0,
-                            ..attempt
-                        },
-                    )?;
-                    self.outbox.clear_approval_challenge(&entry)?;
-                } else {
-                    // The outcome is unknown, transient, or already decided
-                    // elsewhere. Keep the approval so reconciliation still has
-                    // one identity to resolve against.
-                }
-                return Err(EngineError::Signer(error.to_string()));
-            }
-        };
+            .map_err(EngineError::Signer)?;
 
         if let SolanaSignOutcome::Signed { signature } = &outcome {
             let signature_b58 = bs58::encode(signature).into_string();
             self.outbox
                 .record_signature(wallet, &self.chain, id, &signature_b58)?;
-            self.outbox.clear_approval_attempt(&entry)?;
         }
         Ok(outcome)
     }

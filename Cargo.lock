@@ -2274,7 +2274,7 @@ dependencies = [
 [[package]]
 name = "bloom-broker-api"
 version = "0.1.0"
-source = "git+https://github.com/bloom-directory/bloom-broker.git?rev=2a715466dfd9f58d09dd18b0f1ec4699b90fbc3f#2a715466dfd9f58d09dd18b0f1ec4699b90fbc3f"
+source = "git+https://github.com/bloom-directory/bloom-broker.git?rev=57cbc6c6fb3b64899061f54b1f3dd68c827b16e1#57cbc6c6fb3b64899061f54b1f3dd68c827b16e1"
 dependencies = [
  "bloom-rpc-wire",
  "serde",
@@ -2442,6 +2442,7 @@ dependencies = [
  "bloom-triad-local-transport",
  "ed25519-dalek",
  "fs2",
+ "num-bigint",
  "serde",
  "serde_jcs",
  "serde_json",
@@ -2544,9 +2545,10 @@ dependencies = [
 [[package]]
 name = "bloom-petal-contract"
 version = "0.1.0"
-source = "git+https://github.com/bloom-directory/petal?rev=9ad7a5c635f092bbcdf8f00a06b23676806ff70c#9ad7a5c635f092bbcdf8f00a06b23676806ff70c"
+source = "git+https://github.com/bloom-directory/petal?rev=73c5b06a77599368fbc79fb7947a629b5b4c630e#73c5b06a77599368fbc79fb7947a629b5b4c630e"
 dependencies = [
- "sha2 0.10.9",
+ "hex",
+ "sha2 0.11.0",
 ]
 
 [[package]]
@@ -2706,7 +2708,7 @@ dependencies = [
 [[package]]
 name = "bloom-signer-derive"
 version = "0.1.0"
-source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=efb48d0437bb6e5d1e58c10b3873f4729f4e6045#efb48d0437bb6e5d1e58c10b3873f4729f4e6045"
+source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=941dd376568b52ccd269ecf495bcff7dcd9af504#941dd376568b52ccd269ecf495bcff7dcd9af504"
 dependencies = [
  "bip39",
  "ed25519-dalek",
@@ -4237,7 +4239,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -7714,7 +7716,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -7782,7 +7784,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -8776,7 +8778,7 @@ dependencies = [
  "getrandom 0.3.4",
  "once_cell",
  "rustix 1.1.4",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -10238,7 +10240,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.48.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

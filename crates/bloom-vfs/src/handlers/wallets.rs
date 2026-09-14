@@ -44,7 +44,7 @@ use bloom_broker_api::ProtocolErrorCode;
 use bloom_evm::ChainRegistry;
 use bloom_machine_client::WalletProjection;
 use bloom_machine_client::{MachineBrokerClient, WalletProjectionReader};
-use bloom_proto::{AddressBook, CapabilityViewEntry, HomeWritePermit, Policy, RawIntent};
+use bloom_proto::{AddressBook, HomeWritePermit, Policy, RawIntent};
 use bloom_tx::{
     intent_parser,
     outbox::OutboxState,
@@ -493,71 +493,6 @@ impl WalletsHandler {
         let mut out = serde_json::to_vec_pretty(&body).map_err(err_be)?;
         out.push(b'\n');
         Ok(out)
-    }
-
-    fn evm_capability_views_for(&self, _wallet: &str) -> Vec<CapabilityViewEntry> {
-        Vec::new()
-    }
-
-    fn all_capability_views_for(&self, wallet: &str) -> Vec<CapabilityViewEntry> {
-        let mut all = self.evm_capability_views_for(wallet);
-        all.sort_by(|a, b| {
-            a.created_ms
-                .cmp(&b.created_ms)
-                .then_with(|| a.id.cmp(&b.id))
-        });
-        all
-    }
-
-    fn capabilities_active_json(&self, wallet: &str) -> Result<Vec<u8>, HandlerError> {
-        let entries = self.all_capability_views_for(wallet);
-        let mut out = serde_json::to_vec_pretty(&entries).map_err(err_be)?;
-        out.push(b'\n');
-        Ok(out)
-    }
-
-    fn capabilities_active_md(&self, wallet: &str) -> Result<Vec<u8>, HandlerError> {
-        let entries = self.all_capability_views_for(wallet);
-        let mut md = String::new();
-        md.push_str(&format!("# Capabilities for `{wallet}`\n\n"));
-        if entries.is_empty() {
-            md.push_str("No active capabilities.\n\n");
-            md.push_str(&format!(
-                "Manage reusable authority at `/wallets/{wallet}/sealed-approvals/`.\n"
-            ));
-        } else {
-            for c in &entries {
-                md.push_str(&format!(
-                    "## {} ({})\n\n",
-                    c.id,
-                    serde_json::to_value(&c.venue)
-                        .ok()
-                        .and_then(|value| value.as_str().map(str::to_owned))
-                        .unwrap_or_else(|| "unknown".to_owned()),
-                ));
-                md.push_str(&format!("- **Signing model:** {:?}\n", c.signing_model));
-                md.push_str(&format!("- **Status:** {:?}\n", c.status));
-                if let Some(secs) = c.expires_in_secs {
-                    md.push_str(&format!("- **Expires in:** {secs}s\n"));
-                }
-                md.push_str(&format!("- **Next write:** `{}`\n", c.next_write_path));
-                md.push_str(&format!("- **Stop:** `{}`\n", c.revoke_path));
-                if !c.allowed.is_empty() {
-                    md.push_str("- **Allowed:**\n");
-                    for a in &c.allowed {
-                        md.push_str(&format!("  - {a}\n"));
-                    }
-                }
-                if !c.denied.is_empty() {
-                    md.push_str("- **Denied:**\n");
-                    for d in &c.denied {
-                        md.push_str(&format!("  - {d}\n"));
-                    }
-                }
-                md.push('\n');
-            }
-        }
-        Ok(md.into_bytes())
     }
 
     fn write_permit(&self) -> Result<&HomeWritePermit, HandlerError> {
@@ -2121,7 +2056,6 @@ impl WalletsHandler {
             Entry::dir("chains"),
             Entry::dir("sealed-approvals"),
             Entry::dir("policy-updates"),
-            Entry::dir("capabilities"),
         ]
     }
 }
@@ -2870,12 +2804,6 @@ impl WalletsHandler {
                 }
                 _ => Err(HandlerError::not_found(path.to_string_path())),
             },
-            "capabilities" => match segs.len() {
-                2 => Ok(Entry::dir("capabilities")),
-                3 if segs[2] == "active.json" => Ok(Entry::file("active.json")),
-                3 if segs[2] == "active.md" => Ok(Entry::file("active.md")),
-                _ => Err(HandlerError::not_found(path.to_string_path())),
-            },
             _ => Err(HandlerError::not_found(path.to_string_path())),
         }
     }
@@ -3032,12 +2960,6 @@ impl WalletsHandler {
                     .reconcile_triad_policy_projection(wallet, &segs[2], &segs[3])
                     .await?;
                 self.policy_update_status_json(wallet, &state, &segs[3])
-            }
-            "capabilities" if segs.len() == 3 && segs[2] == "active.json" => {
-                self.capabilities_active_json(wallet)
-            }
-            "capabilities" if segs.len() == 3 && segs[2] == "active.md" => {
-                self.capabilities_active_md(wallet)
             }
             _ => Err(HandlerError::NotAFile(path.to_string_path())),
         }
@@ -3231,14 +3153,6 @@ impl WalletsHandler {
                     names.extend(solana.keys().cloned());
                 }
                 Ok(names.into_iter().map(|n| Entry::dir(&n)).collect())
-            }
-            // `lookup` reports capabilities/ as a directory, so `list` has to
-            // agree. Without this arm it fell through to NotADir, which mounts
-            // render as ENOTDIR: `stat` called it a directory and `ls` refused
-            // to read it, and every `find` over the tree emitted one error per
-            // wallet into whatever was reading the output.
-            2 if segs[1] == "capabilities" => {
-                Ok(vec![Entry::file("active.json"), Entry::file("active.md")])
             }
             2 if segs[1] == "sealed-approvals" => {
                 let mut entries = vec![
@@ -4030,45 +3944,35 @@ impl WalletsHandler {
                 let child = self
                     .resolve_solana_child(wallet, entry.staged.account_fingerprint.as_deref())
                     .await?;
-                // The approval id lives in the public challenge. `restage_approved`
-                // migrates that file to the successor before retiring this entry,
-                // so only the read is needed here.
-                let challenge_bytes = std::fs::read(
+                let approval_id = std::fs::read(
                     entry
                         .dir
                         .join(bloom_solana_tx::outbox::APPROVAL_CHALLENGE_FILE),
                 )
-                .ok();
-                let approval_id = challenge_bytes
-                    .as_deref()
-                    .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(bytes).ok())
-                    .and_then(|v| {
-                        v.get("approval_id")
-                            .and_then(|id| id.as_str())
-                            .and_then(|s| bloom_broker_api::Digest32::new(s.to_owned()).ok())
-                    });
-                let target_id = if approval_id.is_some() {
-                    engine
-                        .restage_approved(wallet, id, &child.pubkey, now)
-                        .await
-                        .map_err(|error| HandlerError::backend(error.to_string()))?
-                        .id
-                } else {
-                    id.clone()
-                };
-                let target_entry = engine
-                    .outbox()
-                    .read_in_state(
-                        wallet,
-                        chain,
-                        &target_id,
-                        bloom_solana_tx::outbox::SolanaOutboxState::Pending,
-                    )
-                    .map_err(solana_outbox_err)?;
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+                .and_then(|v| {
+                    v.get("approval_id")
+                        .and_then(|id| id.as_str())
+                        .and_then(|s| bloom_broker_api::Digest32::new(s.to_owned()).ok())
+                })
+                // Compatibility for pending entries produced by earlier
+                // unshipped Solana heads. New entries use the public
+                // challenge as their canonical resume projection.
+                .or_else(|| {
+                    std::fs::read(entry.dir.join("approval.json"))
+                        .ok()
+                        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+                        .and_then(|v| {
+                            v.get("approval_id")
+                                .and_then(|id| id.as_str())
+                                .and_then(|s| bloom_broker_api::Digest32::new(s.to_owned()).ok())
+                        })
+                });
                 match engine
                     .sign(
                         wallet,
-                        &target_id,
+                        id,
                         &child.pubkey,
                         Some(child.key_ref.clone()),
                         approval_id,
@@ -4091,30 +3995,40 @@ impl WalletsHandler {
                             }
                             None => format!("wallets/{wallet}/chains/{chain}/outbox"),
                         };
-                        let challenge = bloom_solana_tx::outbox::SolanaOutbox::approval_challenge(
-                            &target_entry.staged,
-                            &outbox_path,
-                            approval_id.as_str(),
-                            &ceremony_url,
-                            ceremony_expires_at_ms,
-                        )
-                        .map_err(solana_outbox_err)?;
+                        let challenge = serde_json::to_vec_pretty(&serde_json::json!({
+                            "schema": "bloom.solana-approval-challenge/1",
+                            "action_id": entry.staged.id,
+                            "tx_id": entry.staged.id,
+                            "wallet": wallet,
+                            "chain": chain,
+                            "approval_id": approval_id.as_str(),
+                            "ceremony_url": ceremony_url,
+                            "expiry_ms": ceremony_expires_at_ms,
+                            "account_fingerprint": entry.staged.account_fingerprint,
+                            "fee_payer": entry.staged.fee_payer,
+                            "destination": entry.staged.destination,
+                            "lamports": entry.staged.lamports,
+                            "fee_lamports": entry.staged.fee_lamports,
+                            "plan_path": format!("{outbox_path}/pending/{id}/plan.md"),
+                            "retry_path": format!("{outbox_path}/pending/{id}/confirm"),
+                        }))
+                        .map_err(|error| HandlerError::backend(error.to_string()))?;
                         engine
                             .outbox()
-                            .write_approval_challenge(&target_entry, &challenge)
+                            .write_approval_challenge(&entry, &challenge)
                             .map_err(solana_outbox_err)?;
                         Err(HandlerError::PermissionDenied)
                     }
                     bloom_solana_tx::signing::SolanaSignOutcome::Signed { .. } => {
                         engine
                             .outbox()
-                            .clear_approval_challenge(&target_entry)
+                            .clear_approval_challenge(&entry)
                             .map_err(solana_outbox_err)?;
                         engine
-                            .broadcast(wallet, &target_id, now)
+                            .broadcast(wallet, id, now)
                             .await
                             .map_err(|e| HandlerError::backend(e.to_string()))?;
-                        tracing::info!(wallet, chain, id = %target_id, "solana_outbox.broadcast");
+                        tracing::info!(wallet, chain, id, "solana_outbox.broadcast");
                         Ok(())
                     }
                 }
@@ -4795,7 +4709,6 @@ mod tests {
                 canonical_public_key: Base64UrlBytes::from_bytes(&[3; 33]),
                 addresses: vec![format!("{address:#x}")],
                 supported_crypto_suites: vec![CryptoSuite::Secp256k1Keccak256Recoverable],
-                petal_scope_expires_at_ms: None,
             }],
             credentials: Vec::<CredentialPublic>::new(),
             policy: SignedPolicySnapshot {
@@ -9367,27 +9280,19 @@ value = "0""#,
     }
 
     #[tokio::test]
-    async fn capabilities_lists_because_lookup_calls_it_a_directory() {
-        // stat said directory and ls said "Not a directory", so every `find`
-        // over the wallet tree emitted one error per wallet.
+    async fn retired_capabilities_directory_is_not_exposed() {
         let f = make_handler_with_chain(true);
-        let p = VfsPath::parse(&format!("/{}/capabilities", f.wallet_name)).unwrap();
+        let wallet = VfsPath::parse(&format!("/{}", f.wallet_name)).unwrap();
+        let entries = f.handler.list(&wallet).await.unwrap();
+        assert!(entries.iter().all(|entry| entry.name != "capabilities"));
+        let path = VfsPath::parse(&format!("/{}/capabilities", f.wallet_name)).unwrap();
         assert!(matches!(
-            f.handler.lookup(&p).await.unwrap().kind,
-            crate::handler::EntryKind::Dir
+            f.handler.lookup(&path).await,
+            Err(HandlerError::NotFound(_))
         ));
-        let names: Vec<String> = f
-            .handler
-            .list(&p)
-            .await
-            .expect("a node lookup calls a directory must list")
-            .into_iter()
-            .map(|e| e.name)
-            .collect();
-        assert!(
-            names.contains(&"active.json".to_string()),
-            "names={names:?}"
-        );
-        assert!(names.contains(&"active.md".to_string()), "names={names:?}");
+        assert!(matches!(
+            f.handler.list(&path).await,
+            Err(HandlerError::NotADir(_))
+        ));
     }
 }

@@ -293,12 +293,6 @@ struct PetalKeyRequestState {
     public_key: Option<bloom_broker_api::KeyPublic>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     reusable_approval_id: Option<bloom_broker_api::Digest32>,
-    /// Increments only when an unapproved ceremony expires or becomes
-    /// orphaned, giving the replacement approval a fresh immutable identity.
-    #[serde(default)]
-    reusable_approval_attempt: u64,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    approval_value_limits: Vec<bloom_broker_api::ValueLimit>,
     /// The installed Petal mount this request ran under, resolved from the
     /// package hash at request time. Old records have none; the session
     /// tree renders them under `unknown-<hash prefix>`.
@@ -784,13 +778,6 @@ impl DaemonPetalHost {
         grant: PetalKeyApprovalGrant<'_>,
         provenance_digest: bloom_broker_api::Digest32,
     ) -> Result<(bloom_broker_api::SealedApprovalPrepareResponse, u64), HostError> {
-        let PetalKeyApprovalGrant {
-            scope,
-            key_ref,
-            scope_expires_at_ms,
-            approval_attempt,
-            value_limits,
-        } = grant;
         let catalog = self.provenance_catalog.as_ref().ok_or_else(|| {
             HostError::Backend("installer provenance catalog is not configured".into())
         })?;
@@ -1629,13 +1616,23 @@ impl PetalHost for DaemonPetalHost {
                                 .into(),
                         ));
                     }
-                    // Publish the derived address before staging its reusable
-                    // approval. The owner must be able to add this previously
-                    // unknown funding destination to wallet policy first;
-                    // changing policy after approval invalidates its snapshot.
+                    let (reusable, authority_expires_at_ms) = self
+                        .prepare_petal_key_reusable_approval(
+                            broker,
+                            &wallet,
+                            &scope,
+                            &public.key_ref,
+                            provenance_digest.clone().ok_or_else(|| {
+                                HostError::Denied("Petal provenance digest is missing".into())
+                            })?,
+                        )
+                        .await?;
                     stored.public_key = Some(public);
-                    stored.status = "key_derived".into();
-                    stored.ceremony_url = None;
+                    stored.reusable_approval_id = Some(reusable.approval_id);
+                    stored.authority_expires_at_ms = Some(authority_expires_at_ms);
+                    stored.status = "awaiting_user".into();
+                    stored.ceremony_url = Some(reusable.ceremony_url);
+                    stored.ceremony_expires_at_ms = reusable.ceremony_expires_at_ms;
                     Self::write_petal_key_state(&path, &stored)?;
                     return stored.guest_outcome();
                 }
@@ -1717,8 +1714,6 @@ impl PetalHost for DaemonPetalHost {
             ceremony_expires_at_ms: prepared.ceremony_expires_at_ms,
             public_key: None,
             reusable_approval_id: None,
-            reusable_approval_attempt: 0,
-            approval_value_limits: req.approval_value_limits,
             petal_mount: self.petal_mount_for_hash(&context.package_hash),
             requested_at_ms: now_ms,
             succeeded_at_ms: None,
@@ -4650,7 +4645,7 @@ impl Daemon {
 
         // /next.md — brutally-scoped next-action aggregator for agents.
         // Answers: what wallets need attention, what confirms are pending,
-        // what capabilities are active/expired/orphaned, what risk data is stale.
+        // what risk data is stale.
         let next_wallet_projections = wallet_projections.clone();
         vfs_builder = vfs_builder.with_root_dynamic_async("next.md", move || {
             let projections = next_wallet_projections.clone();
@@ -5584,83 +5579,6 @@ mod tests {
     use bloom_vfs::handler::Entry;
     use bloom_vfs::handler::Handler;
 
-    /// A Petal reads the host error class to decide whether it may rebuild the
-    /// transaction it was signing. `Denied` has to mean the Broker decided
-    /// against this message and no signature exists; anything less certain has
-    /// to arrive as a backend fault, or the guest will authorize a second
-    /// signature for one intent.
-    #[test]
-    fn a_petal_can_tell_a_refused_signature_from_an_unknown_one() {
-        use bloom_broker_api::{ProtocolError, ProtocolErrorCode};
-
-        let denied = [
-            // The owner's approval cannot produce a signature, now or later.
-            ProtocolErrorCode::ApprovalExpired,
-            ProtocolErrorCode::ApprovalRevoked,
-            ProtocolErrorCode::ApprovalNotFound,
-            // The request never described something the Broker would sign.
-            ProtocolErrorCode::ClaimInvalid,
-            ProtocolErrorCode::SelectorMismatch,
-            ProtocolErrorCode::KeyrefMismatch,
-            ProtocolErrorCode::ProvenanceMismatch,
-            // A budget refused this message before anything was signed; the
-            // reservation it took was released.
-            ProtocolErrorCode::LimitExceededOperations,
-            ProtocolErrorCode::LimitExceededSignatures,
-            ProtocolErrorCode::LimitExceededValue,
-            ProtocolErrorCode::LimitExceededRate,
-            ProtocolErrorCode::SignerRateBackstopDenied,
-        ];
-        for code in denied {
-            let error = petal_signing_host_error(&ProtocolError::new(code, "refused"));
-            assert!(
-                matches!(error, HostError::Denied(_)),
-                "{} is a decision: {error:?}",
-                code.as_str()
-            );
-        }
-
-        let uncertain = [
-            // A signature may exist and nobody knows.
-            ProtocolErrorCode::AmbiguousProviderEffect,
-            ProtocolErrorCode::ServiceUnavailable,
-            // A prior operation stands; this one must not be rebuilt over it.
-            ProtocolErrorCode::OperationIdConflict,
-            // Transient or repairable, and the approval is still good.
-            ProtocolErrorCode::CeremonyRateLimited,
-            ProtocolErrorCode::ClockUntrusted,
-            ProtocolErrorCode::PolicyBaselineStale,
-            ProtocolErrorCode::RevocationEpochUnreconciled,
-        ];
-        for code in uncertain {
-            let error = petal_signing_host_error(&ProtocolError::new(code, "not a decision"));
-            assert!(
-                matches!(error, HostError::Backend(_)),
-                "{} must not read as a refusal: {error:?}",
-                code.as_str()
-            );
-        }
-
-        // The guest sees only the numeric class, so pin that too: -2 is the
-        // code the Pump.fun Petal treats as "nothing was signed".
-        assert_eq!(
-            petal_signing_host_error(&ProtocolError::new(
-                ProtocolErrorCode::ApprovalRevoked,
-                "revoked"
-            ))
-            .as_wasm_code(),
-            -2
-        );
-        assert_eq!(
-            petal_signing_host_error(&ProtocolError::new(
-                ProtocolErrorCode::AmbiguousProviderEffect,
-                "unknown"
-            ))
-            .as_wasm_code(),
-            -4
-        );
-    }
-
     #[cfg(feature = "mount")]
     #[test]
     fn mount_uses_the_configured_nfs_listener() {
@@ -6120,7 +6038,7 @@ mod tests {
                             bloom_broker_api::WalletPublic {
                                 wallet_id: request.wallet_id,
                                 wallet_kind: bloom_broker_api::Token::new("local").unwrap(),
-                                root_key_ref: (!self.bip39).then(|| self.parent.clone()),
+                                root_key_ref: Some(self.parent.clone()),
                                 // A previously derived Petal child is also in the public
                                 // projection. It must never make root selection ambiguous.
                                 key_refs: vec![
@@ -7746,7 +7664,7 @@ mod tests {
     async fn daemon_spawns_solana_reconciler_and_it_populates_receipt_json() {
         // A real 32-byte base58 genesis hash: config validation rejects a
         // broadcast-enabled pin that cannot decode to 32 bytes.
-        let genesis_hash = "11111111111111111111111111111111".to_string();
+        let genesis_hash = bloom_proto::SOLANA_MAINNET_BETA_GENESIS_HASH.to_string();
         let signature = "sig-0001".to_string();
         let rpc_endpoint = spawn_solana_node_stub(genesis_hash.clone()).await;
 
@@ -8482,7 +8400,7 @@ ws_url = "wss://example.invalid"
         fn child(&self, evm: bool, number: u32) -> &AccountChild {
             self.children
                 .iter()
-                .find(|child| child.key_spec_is_ed25519() == !evm && child.path_number() == number)
+                .find(|child| child.key_spec_is_ed25519() != evm && child.path_number() == number)
                 .unwrap()
         }
 
@@ -8536,7 +8454,6 @@ ws_url = "wss://example.invalid"
                 canonical_public_key: bloom_broker_api::Base64UrlBytes::from_bytes(&child.spki),
                 addresses: vec![child.address.clone()],
                 supported_crypto_suites: child.suites.clone(),
-                petal_scope_expires_at_ms: None,
             }
         }
 
@@ -9216,7 +9133,6 @@ allowed = ["bloom:vfs.read"]
             supported_crypto_suites: vec![
                 bloom_broker_api::CryptoSuite::Secp256k1Keccak256Recoverable,
             ],
-            petal_scope_expires_at_ms: None,
         }
     }
 
@@ -9260,8 +9176,6 @@ allowed = ["bloom:vfs.read"]
             ceremony_expires_at_ms: bloom_broker_api::DecimalU64::new(0),
             public_key: Some(public),
             reusable_approval_id: Some(bloom_broker_api::Digest32::from_bytes([4; 32])),
-            reusable_approval_attempt: 0,
-            approval_value_limits: Vec::new(),
             petal_mount: petal_mount.map(str::to_owned),
             requested_at_ms,
             succeeded_at_ms: Some(requested_at_ms + 1),

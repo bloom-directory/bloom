@@ -37,7 +37,7 @@ license = "MIT"
 repository = "https://github.com/bloom-directory/bloom"
 
 [workspace.dependencies]
-anyhow = ">=1.0.103, <2"
+anyhow = "~1.0.104"
 thiserror = "2"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "signal", "sync", "time", "fs", "net", "io-util"] }
 tokio-tungstenite = { version = "0.24", default-features = false, features = ["rustls-tls-webpki-roots", "connect"] }
@@ -53,6 +53,7 @@ async-trait = "0.1"
 parking_lot = "0.12"
 dirs = "5"
 hex = "0.4"
+num-bigint = "0.4"
 libc = "0.2"
 rustix = { version = "1", features = ["fs", "process"] }
 blake3 = "1"
@@ -79,8 +80,8 @@ futures = "0.3"
 lru = "0.18.2"
 fs2 = "0.4"
 bloom-audit-checkpoint = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "bc88cc6760b00bbff0c6a6e5f56d42bb03004436" }
-wasmtime = { version = "=36.0.14", default-features = false, features = ["async", "cranelift", "runtime", "cache", "parallel-compilation"] }
-wasmtime-wasi = "=36.0.14"
+wasmtime = { version = "=36.0.13", default-features = false, features = ["async", "cranelift", "runtime", "cache", "parallel-compilation"] }
+wasmtime-wasi = "=36.0.13"
 wat = "1"
 # danger-allow-state-serialisation: webauthn-rs requires this feature to allow
 # the PasskeyRegistration / PasskeyAuthentication state structs to be serialised
@@ -127,10 +128,10 @@ bloom-ens      = { path = "crates/bloom-ens" }
 bloom-prices   = { path = "crates/bloom-prices" }
 bloom-revert   = { path = "crates/bloom-revert" }
 bloom-petals   = { path = "crates/bloom-petals" }
-bloom-petal-contract = { git = "https://github.com/bloom-directory/petal", rev = "9ad7a5c635f092bbcdf8f00a06b23676806ff70c" }
+bloom-petal-contract = { git = "https://github.com/bloom-directory/petal", rev = "73c5b06a77599368fbc79fb7947a629b5b4c630e" }
 bloom-daemon   = { path = "crates/bloom-daemon" }
 bloom-update   = { path = "crates/bloom-update" }
-bloom-broker-api = { git = "https://github.com/bloom-directory/bloom-broker.git", rev = "2a715466dfd9f58d09dd18b0f1ec4699b90fbc3f" }
+bloom-broker-api = { git = "https://github.com/bloom-directory/bloom-broker.git", rev = "57cbc6c6fb3b64899061f54b1f3dd68c827b16e1" }
 bloom-rpc-wire = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "bc88cc6760b00bbff0c6a6e5f56d42bb03004436" }
 bloom-triad-local-transport = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "bc88cc6760b00bbff0c6a6e5f56d42bb03004436" }
 bloom-service-activation = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "bc88cc6760b00bbff0c6a6e5f56d42bb03004436" }

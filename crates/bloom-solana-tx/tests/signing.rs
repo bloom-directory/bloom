@@ -159,21 +159,15 @@ impl MachineBrokerService for SolanaBrokerFixture {
                         canonical_public_key: Base64UrlBytes::from_bytes(&self.child_pubkey()),
                         addresses: vec![],
                         supported_crypto_suites: vec![CryptoSuite::Ed25519Message],
-                        petal_scope_expires_at_ms: None,
                     }))
                 }
                 MachineBrokerRequest::SigningSign(sign_request) => {
                     if let Some(prepared) = self.prepared_claim.lock().unwrap().as_ref()
-                        && sign_request
-                            .system_use_claim
-                            .as_ref()
-                            .map(|claim| claim.approval_intent_digest())
-                            .transpose()?
-                            != Some(prepared.approval_intent_digest()?)
+                        && sign_request.system_use_claim.as_ref() != Some(prepared)
                     {
                         return Err(ProtocolError::new(
                             ProtocolErrorCode::ClaimInvalid,
-                            "ceremony retry changed the reviewed Solana intent",
+                            "ceremony retry changed the reviewed Solana claim",
                         ));
                     }
                     let signature = self.sign_payload(&sign_request)?;
@@ -190,18 +184,6 @@ impl MachineBrokerService for SolanaBrokerFixture {
                     system_use_claim,
                     ..
                 }) => {
-                    let bloom_broker_api::ApprovalSelector::System { intent_digest, .. } =
-                        &terms.selector
-                    else {
-                        panic!("native transfer must use a scoped system selector");
-                    };
-                    assert_eq!(
-                        Some(intent_digest),
-                        system_use_claim
-                            .as_ref()
-                            .map(|claim| claim.approval_intent_digest().unwrap())
-                            .as_ref()
-                    );
                     assert_eq!(terms.limits.value_limits.len(), 1);
                     assert_eq!(terms.limits.value_limits[0].asset.chain.as_str(), "solana");
                     assert_eq!(terms.limits.value_limits[0].asset.asset, "native");
@@ -284,7 +266,6 @@ async fn derived_child_signs_transfer_and_signature_verifies() {
             approval_id: Some(digest(7)), // already-approved: sign directly
             issued_at_ms: now,
             expires_at_ms: now + 60_000,
-            approval_attempt: 0,
             canonical_plan_facts_digest: plan_facts_digest(),
         })
         .await
@@ -336,7 +317,6 @@ async fn first_attempt_returns_approval_required() {
             approval_id: None, // no approval yet: prepare the ceremony
             issued_at_ms: 1,
             expires_at_ms: 60_000,
-            approval_attempt: 0,
             canonical_plan_facts_digest: plan_facts_digest(),
         })
         .await
@@ -372,7 +352,6 @@ async fn ceremony_retry_preserves_claim_and_authority_identity() {
             approval_id: None,
             issued_at_ms: 1,
             expires_at_ms: 60_000,
-            approval_attempt: 0,
             canonical_plan_facts_digest: plan_facts_digest(),
         })
         .await
@@ -380,24 +359,21 @@ async fn ceremony_retry_preserves_claim_and_authority_identity() {
     let SolanaSignOutcome::ApprovalRequired { approval_id, .. } = first else {
         panic!("expected approval preparation");
     };
-    let refreshed_message =
-        build_transfer_message(&fee_payer, &destination, 50, &[0x44; 32]).unwrap();
     let second = signer
         .sign_transfer(SignTransferRequest {
             wallet_id: "wallet",
             fee_payer: &fee_payer,
             account_key_ref: None,
-            message_bytes: &refreshed_message,
+            message_bytes: &message,
             destination: &bs58::encode(destination).into_string(),
             lamports: 50,
             fee_lamports: 5_000,
             genesis_hash: "test-genesis",
-            recent_blockhash: &bs58::encode([0x44; 32]).into_string(),
-            last_valid_block_height: 250,
+            recent_blockhash: &bs58::encode([0x43; 32]).into_string(),
+            last_valid_block_height: 100,
             approval_id: Some(approval_id),
             issued_at_ms: 1,
             expires_at_ms: 60_000,
-            approval_attempt: 0,
             canonical_plan_facts_digest: plan_facts_digest(),
         })
         .await

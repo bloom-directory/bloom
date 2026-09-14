@@ -119,56 +119,8 @@ pub const BROADCAST_RAW_TX: &str = "raw_tx";
 pub const APPROVAL_CHALLENGE_FILE: &str = "approval_challenge.json";
 const PRIVATE_SIGNATURE_FILE: &str = ".signature";
 const PRIVATE_APPROVAL_FILE: &str = "approval.json";
-const PRIVATE_APPROVAL_ATTEMPT_FILE: &str = ".approval_attempt";
-
 const RESTAGE_RESERVATION_FILE: &str = ".restage_replacement";
 const BROADCAST_SCHEMA: &str = "bloom.solana-broadcast-attempt/1";
-
-/// One attempt to get an owner's approval for a staged transfer.
-///
-/// The Broker keys a prepared ceremony by operation id and refuses a second
-/// prepare that carries the same id with different terms. The approval window
-/// is part of those terms, so a retry has to present the window the first
-/// attempt used rather than a freshly computed one — otherwise the same
-/// transfer can never be confirmed twice.
-///
-/// `attempt` distinguishes genuinely new attempts. It is folded into the
-/// approval intent, so retiring a dead approval and starting again produces a
-/// different operation id instead of colliding with the one that just died.
-#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
-pub struct ApprovalAttempt {
-    pub attempt: u32,
-    pub issued_at_ms: u64,
-    pub expires_at_ms: u64,
-}
-
-/// Why an entry was retired in favour of a successor. An owner reads this in
-/// `restage_advice.json`, so it must state what actually happened: a transfer
-/// is also restaged *before* its blockhash expires, to put the freshest
-/// possible one under an approval the owner has already granted.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum RestageReason {
-    /// The staged blockhash was no longer valid on the cluster.
-    BlockhashExpired,
-    /// An approval exists, so the payload was refreshed before signing.
-    ApprovalRefresh,
-}
-
-impl RestageReason {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::BlockhashExpired => "blockhash_expired",
-            Self::ApprovalRefresh => "approval_refresh",
-        }
-    }
-
-    fn describe(self) -> &'static str {
-        match self {
-            Self::BlockhashExpired => "The staged blockhash expired",
-            Self::ApprovalRefresh => "The approved transfer was restaged on a fresher blockhash",
-        }
-    }
-}
 
 #[derive(Clone)]
 pub struct SolanaOutbox {
@@ -352,14 +304,6 @@ impl SolanaOutbox {
         ) {
             let _ = fs::remove_file(target.join(PRIVATE_APPROVAL_FILE));
             let _ = fs::remove_file(target.join(APPROVAL_CHALLENGE_FILE));
-        }
-        // The attempt record outlives a sweep on purpose. An entry retired as
-        // `Expired` is still restageable, and its successor rebuilds the same
-        // approval operation id from the same economic intent; without the
-        // counter that successor collides with the attempt that was swept.
-        // A dispatched transfer has nothing left to approve, so its record goes.
-        if new_state == SolanaOutboxState::Sent {
-            let _ = fs::remove_file(target.join(PRIVATE_APPROVAL_ATTEMPT_FILE));
         }
         sync_dir(&target_parent)?;
         Ok(target)
@@ -688,37 +632,6 @@ impl SolanaOutbox {
         write_private_atomic(&entry.dir.join(PRIVATE_APPROVAL_FILE), body)
     }
 
-    /// Build the owner-visible approval projection for one pending transfer.
-    /// The confirm path writes it when the Broker asks for a ceremony, and a
-    /// restage rebuilds it for the successor, so the ids, paths, and fee it
-    /// names are always those of the entry it sits in.
-    pub fn approval_challenge(
-        staged: &StagedSolanaTransfer,
-        outbox_path: &str,
-        approval_id: &str,
-        ceremony_url: &str,
-        expiry_ms: u64,
-    ) -> Result<Vec<u8>, OutboxError> {
-        let (wallet, chain, id) = (&staged.wallet, &staged.chain, &staged.id);
-        Ok(serde_json::to_vec_pretty(&serde_json::json!({
-            "schema": "bloom.solana-approval-challenge/1",
-            "action_id": id,
-            "tx_id": id,
-            "wallet": wallet,
-            "chain": chain,
-            "approval_id": approval_id,
-            "ceremony_url": ceremony_url,
-            "expiry_ms": expiry_ms,
-            "account_fingerprint": staged.account_fingerprint,
-            "fee_payer": staged.fee_payer,
-            "destination": staged.destination,
-            "lamports": staged.lamports,
-            "fee_lamports": staged.fee_lamports,
-            "plan_path": format!("{outbox_path}/pending/{id}/plan.md"),
-            "retry_path": format!("{outbox_path}/pending/{id}/confirm"),
-        }))?)
-    }
-
     /// Atomically publish the sanitized owner-visible approval projection next
     /// to a pending transfer. Unlike the compatibility-only private approval
     /// sidecar, this file is intentionally readable through the wallet VFS.
@@ -747,61 +660,16 @@ impl SolanaOutbox {
         }
     }
 
-    /// Read the approval attempt this entry is currently on, if one is
-    /// recorded.
-    pub fn approval_attempt(
-        &self,
-        entry: &SolanaOutboxEntry,
-    ) -> Result<Option<ApprovalAttempt>, OutboxError> {
-        match fs::read(entry.dir.join(PRIVATE_APPROVAL_ATTEMPT_FILE)) {
-            Ok(bytes) => Ok(serde_json::from_slice(&bytes).ok()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(error.into()),
-        }
-    }
-
-    /// Persist the approval attempt as a private host artifact. The wallet VFS
-    /// never exposes it: it exists so a retry can present the Broker the exact
-    /// terms it presented the first time, and so a dead approval can be
-    /// retired without reusing its identity.
-    pub fn write_approval_attempt(
-        &self,
-        entry: &SolanaOutboxEntry,
-        attempt: &ApprovalAttempt,
-    ) -> Result<(), OutboxError> {
-        if entry.state != SolanaOutboxState::Pending {
-            return Err(OutboxError::StateMismatch {
-                id: entry.staged.id.clone(),
-                expected: SolanaOutboxState::Pending.dirname(),
-                actual: entry.state.dirname(),
-            });
-        }
-        let body = serde_json::to_vec(attempt)
-            .map_err(|error| OutboxError::Other(format!("encode approval attempt: {error}")))?;
-        write_private_atomic(&entry.dir.join(PRIVATE_APPROVAL_ATTEMPT_FILE), &body)
-    }
-
-    /// Forget the recorded approval attempt. The next confirm then starts a
-    /// new one with a distinct identity.
-    pub fn clear_approval_attempt(&self, entry: &SolanaOutboxEntry) -> Result<(), OutboxError> {
-        match fs::remove_file(entry.dir.join(PRIVATE_APPROVAL_ATTEMPT_FILE)) {
-            Ok(()) => sync_dir(&entry.dir),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(error.into()),
-        }
-    }
-
-    /// Link a retired entry to its freshly staged successor without copying
+    /// Link an expired entry to its freshly staged successor without copying
     /// any private approval or signing material into public artifacts.
     pub fn write_restage_advice(
         &self,
         entry: &SolanaOutboxEntry,
         replacement_id: &str,
-        reason: RestageReason,
     ) -> Result<(), OutboxError> {
         let advice = serde_json::json!({
             "schema": "bloom.solana-restage-advice/1",
-            "reason": reason.as_str(),
+            "reason": "blockhash_expired",
             "replacement_id": replacement_id,
             "wallet": &entry.staged.wallet,
             "chain": &entry.staged.chain,
@@ -815,8 +683,7 @@ impl SolanaOutbox {
             &entry.dir,
             "restage.md",
             format!(
-                "{}. Replacement: `{replacement_id}`. Review its fresh intent and plan before confirming.\n",
-                reason.describe()
+                "The staged blockhash expired. Replacement: `{replacement_id}`. Review its fresh intent and plan before confirming.\n"
             )
             .as_bytes(),
         )

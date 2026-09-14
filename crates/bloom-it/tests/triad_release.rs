@@ -411,30 +411,19 @@ fn make_installer_payload(root: &Path) -> PathBuf {
 fn build(staging: &Path, output: &Path, key: &Path) -> std::process::Output {
     let compatibility = PathBuf::from(format!("{}.compatibility.toml", output.display()));
     let compatibility_source = fs::read_to_string(release_script("compatibility-v1.toml")).unwrap();
-    // Rewrite by key, not by the pinned value. Matching the literal revision
-    // meant that bumping a pin silently turned this substitution into a no-op
-    // and the assertions below then compared the real pins against the fixture.
-    let repin = |source: &str, key: &str, value: String| -> String {
-        source
-            .lines()
-            .map(|line| {
-                if line.trim_start().starts_with(&format!("{key} = ")) {
-                    format!("{key} = \"{value}\"")
-                } else {
-                    line.to_owned()
-                }
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
-    };
-    let rewritten = repin(&compatibility_source, "broker_commit", "22".repeat(20));
-    let rewritten = repin(&rewritten, "signer_commit", "33".repeat(20));
-    assert!(
-        rewritten.contains(&format!("broker_commit = \"{}\"", "22".repeat(20)))
-            && rewritten.contains(&format!("signer_commit = \"{}\"", "33".repeat(20))),
-        "the compatibility fixture must carry the test revisions, not the real pins"
-    );
-    fs::write(&compatibility, rewritten).unwrap();
+    fs::write(
+        &compatibility,
+        compatibility_source
+            .replace(
+                "broker_commit = \"57cbc6c6fb3b64899061f54b1f3dd68c827b16e1\"",
+                &format!("broker_commit = \"{}\"", "22".repeat(20)),
+            )
+            .replace(
+                "signer_commit = \"941dd376568b52ccd269ecf495bcff7dcd9af504\"",
+                &format!("signer_commit = \"{}\"", "33".repeat(20)),
+            ),
+    )
+    .unwrap();
     Command::new(release_script("build-bundle.sh"))
         .args([staging.as_os_str(), output.as_os_str(), key.as_os_str()])
         .arg("1700000000")
