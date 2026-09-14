@@ -79,6 +79,33 @@ impl OperationIndex for VenueLocalTestOperationIndex {
     }
 }
 
+/// Weak entries keep locks shared across handler clones without retaining every
+/// request ID forever. All operations acquire request, then wallet, in that order.
+#[derive(Default)]
+struct PaymentLocks {
+    entries: std::sync::Mutex<
+        std::collections::HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>,
+    >,
+}
+
+impl PaymentLocks {
+    async fn acquire(&self, key: &str) -> tokio::sync::OwnedMutexGuard<()> {
+        let lock = {
+            let mut entries = self.entries.lock().expect("payment lock registry poisoned");
+            entries.retain(|_, lock| lock.strong_count() > 0);
+            match entries.get(key).and_then(std::sync::Weak::upgrade) {
+                Some(lock) => lock,
+                None => {
+                    let lock = Arc::new(tokio::sync::Mutex::new(()));
+                    entries.insert(key.to_owned(), Arc::downgrade(&lock));
+                    lock
+                }
+            }
+        };
+        lock.lock_owned().await
+    }
+}
+
 #[derive(Clone)]
 pub struct RequestsHandler {
     root: PathBuf,
@@ -89,6 +116,8 @@ pub struct RequestsHandler {
     operation_index: Arc<dyn OperationIndex>,
     wallet_projections: Option<Arc<dyn WalletProjectionReader>>,
     exact_signer: Option<BrokerExactPayloadSigner>,
+    request_locks: Arc<PaymentLocks>,
+    wallet_locks: Arc<PaymentLocks>,
 }
 
 impl RequestsHandler {
@@ -107,6 +136,8 @@ impl RequestsHandler {
             paid_http_rpc_resolver: Arc::new(EmptyPaidHttpChainRpcResolver),
             wallet_projections: Some(wallet_projections),
             exact_signer: None,
+            request_locks: Arc::new(PaymentLocks::default()),
+            wallet_locks: Arc::new(PaymentLocks::default()),
         }
     }
 
@@ -423,6 +454,31 @@ impl RequestsHandler {
             .map_err(|error| HandlerError::invalid(format!("wallet address: {error}")))
     }
 
+    fn ensure_wallet_reconciled(&self, wallet: &str) -> Result<(), HandlerError> {
+        let pending = self.requests_root().join("pending");
+        if !pending.exists() {
+            return Ok(());
+        }
+        for entry in fs::read_dir(pending)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() || !payment_execution_started(&entry.path()) {
+                continue;
+            }
+            let request: serde_json::Value = read_json(entry.path().join("request.toml"))?;
+            let owner = request
+                .get("wallet")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| HandlerError::backend("unresolved payment has no wallet"))?;
+            if owner == wallet {
+                return Err(HandlerError::invalid(format!(
+                    "payment {} has an unresolved execution outcome; reconcile it before another payment from {wallet}",
+                    entry.file_name().to_string_lossy()
+                )));
+            }
+        }
+        Ok(())
+    }
+
     fn sum_paid_usd_last_24h(&self, wallet: &str) -> Result<f64, HandlerError> {
         let since = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -609,6 +665,7 @@ impl RequestsHandler {
     }
 
     async fn confirm(&self, id: &str, data: &[u8]) -> Result<(), HandlerError> {
+        let _request = self.request_locks.acquire(id).await;
         let value = String::from_utf8_lossy(data).trim().to_ascii_lowercase();
         let pending = self.req_dir("pending", id);
         if !pending.exists() {
@@ -620,9 +677,9 @@ impl RequestsHandler {
                 "dry-run paid requests cannot be confirmed; stage a fresh request with /requests/new",
             ));
         }
-        if pending.join("private/credential_minted.json").exists() {
+        if payment_execution_started(&pending) {
             return Err(HandlerError::invalid(
-                "this pending request already minted a payment credential; cancel and stage a fresh request instead of re-confirming",
+                "payment execution has started; reconcile its outcome before cancelling or retrying",
             ));
         }
         let request = sealed_inputs.request;
@@ -631,6 +688,10 @@ impl RequestsHandler {
             .as_deref()
             .ok_or_else(|| HandlerError::backend("sealed request missing wallet"))?
             .to_string();
+        // Hold through live checks, signing, merchant execution and receipt
+        // publication, so the next payment sees this one's accounting result.
+        let _wallet = self.wallet_locks.acquire(&wallet).await;
+        self.ensure_wallet_reconciled(&wallet)?;
         let host = sealed_inputs.host;
         let mut challenge = sealed_inputs.challenge;
         validate_session_state_target(&challenge, id)?;
@@ -1297,13 +1358,24 @@ impl Handler for RequestsHandler {
                 ))
             }
             [state, id, action] if state == "pending" && action == "cancel" => {
+                let _request = self.request_locks.acquire(id).await;
                 let pending = self.req_dir(state, id);
+                if !pending.exists() {
+                    return Err(HandlerError::NotFound(format!("/requests/pending/{id}")));
+                }
+                if payment_execution_started(&pending) {
+                    return Err(HandlerError::invalid(
+                        "payment execution has started; cancellation cannot undo it; reconcile the outcome",
+                    ));
+                }
                 let failed = self.req_dir("failed", id);
+                if failed.exists() {
+                    return Err(HandlerError::invalid(
+                        "request already has a failed outcome",
+                    ));
+                }
                 fs::write(pending.join("status"), b"cancelled\n")?;
                 fs::write(pending.join("error.txt"), b"cancelled by user\n")?;
-                if failed.exists() {
-                    fs::remove_dir_all(&failed)?;
-                }
                 fs::rename(pending, failed)?;
                 self.write_latest("failed", id)
             }
@@ -1421,9 +1493,9 @@ async fn confirm_with_backend(
             "dry-run paid requests cannot be confirmed; stage a fresh request with /requests/new",
         ));
     }
-    if pending.join("private/credential_minted.json").exists() {
+    if payment_execution_started(&pending) {
         return Err(HandlerError::invalid(
-            "this pending request already minted a payment credential; cancel and stage a fresh request instead of re-confirming",
+            "payment execution has started; reconcile its outcome before cancelling or retrying",
         ));
     }
     let execution = backend
@@ -1802,11 +1874,39 @@ async fn retry_paid_request(
     })
 }
 
+fn payment_execution_started(pending: &Path) -> bool {
+    pending.join("private/execution_started").exists()
+        || pending.join("private/credential_minted.json").exists()
+}
+
+// Persist after preparation, before sending the credential to the merchant.
+// Preparation may require several ceremonies but does not submit a payment.
+// A future dropped after this point leaves an unresolved outcome across restart.
+fn begin_payment_execution(pending: &Path) -> Result<(), HandlerError> {
+    use std::io::Write;
+    let private = pending.join("private");
+    if private.join("execution_started").exists() {
+        return Ok(());
+    }
+    fs::create_dir_all(&private)?;
+    let mut marker = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(private.join("execution_started"))?;
+    marker.write_all(b"outcome unresolved until receipt publication\n")?;
+    marker.sync_all()?;
+    fs::File::open(private)?.sync_all()?;
+    Ok(())
+}
+
 fn write_minted_marker(
     pending: &Path,
     id: &str,
     credential_metadata: &serde_json::Value,
 ) -> Result<(), HandlerError> {
+    // Both payment backends must reach this durable boundary before sending
+    // a credential, including injected signing implementations.
+    begin_payment_execution(pending)?;
     fs::create_dir_all(pending.join("private"))?;
     write_json(pending.join("credential.json"), credential_metadata)?;
     write_json(
@@ -2218,6 +2318,81 @@ mod tests {
         )
         .with_operation_index(Arc::new(VenueLocalTestOperationIndex));
         (tmp, handler)
+    }
+
+    #[tokio::test]
+    async fn wallet_payment_serialization_rechecks_daily_spending() {
+        use std::future::Future;
+        let (_tmp, handler) = handler();
+        handler.ensure_layout().unwrap();
+        let first = handler.wallet_locks.acquire("alice").await;
+        let clone = handler.clone();
+        let second = clone.wallet_locks.acquire("alice");
+        tokio::pin!(second);
+        assert!(
+            std::future::poll_fn(|cx| {
+                std::task::Poll::Ready(second.as_mut().poll(cx).is_pending())
+            })
+            .await
+        );
+        // A different wallet's payment must remain independent.
+        let other =
+            tokio::time::timeout(Duration::from_secs(1), handler.wallet_locks.acquire("bob"))
+                .await
+                .unwrap();
+        drop(other);
+        let mut policy = Policy::default();
+        policy.payments.enabled = true;
+        policy.payments.http.per_day_usd = Some(100.0);
+        let evaluate = || {
+            evaluate_payment_policy(
+                &policy,
+                PolicyEvalInput {
+                    host: "merchant.example",
+                    asset: Some("USDC"),
+                    network: Some("base"),
+                    intent: "charge",
+                    amount_usd: Some(60.0),
+                    request_max_amount_usd: Some(60.0),
+                    spent_24h_usd: handler.sum_paid_usd_last_24h("alice").unwrap(),
+                },
+            )
+        };
+        assert!(
+            !evaluate()
+                .iter()
+                .any(|check| check.rule == "payments.http.per_day_usd" && check.result == "deny")
+        );
+        // Publish the first $60 outcome before releasing its wallet guard.
+        // Failed/unknown merchant outcomes must count just like sent outcomes.
+        for state in ["sent", "failed"] {
+            let receipt_dir = handler.req_dir(state, "first");
+            fs::create_dir_all(&receipt_dir).unwrap();
+            write_json(
+                receipt_dir.join("receipt.json"),
+                &json!({
+                    "wallet": "alice", "protocol": "x402", "amount_usd": 60.0,
+                    "response_status": if state == "sent" { 200 } else { 599 },
+                }),
+            )
+            .unwrap();
+            assert!(
+                evaluate().iter().any(
+                    |check| check.rule == "payments.http.per_day_usd" && check.result == "deny"
+                )
+            );
+            if state == "sent" {
+                fs::remove_file(receipt_dir.join("receipt.json")).unwrap();
+            }
+        }
+        drop(first);
+        let _second = second.await;
+        assert_eq!(handler.sum_paid_usd_last_24h("alice").unwrap(), 60.0);
+        assert!(
+            evaluate()
+                .iter()
+                .any(|check| check.rule == "payments.http.per_day_usd" && check.result == "deny")
+        );
     }
 
     fn staged_subject<'a>(

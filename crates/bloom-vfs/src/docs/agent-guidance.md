@@ -293,3 +293,11 @@ reads: inspect the request plan, selected payment protocol, maximum amount,
 wallet, and approval projection before confirming. Keep vendor-specific request
 syntax in the relevant Petal or request documentation rather than assuming a
 provider contract from this root guide.
+
+A paid request's confirm and cancel operations are serialized. Once execution
+has started, cancellation cannot undo the payment. A timeout or interrupted
+confirmation does not prove non-payment: inspect the exact request's receipt
+and merchant outcome before taking further action. An unresolved execution
+blocks additional paid confirmations for that wallet until reconciled; do not
+bypass that block by restaging. Other wallets and unrelated VFS operations can
+continue. A failed merchant retry still counts toward recorded spending.
