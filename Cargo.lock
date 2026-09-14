@@ -2368,6 +2368,7 @@ dependencies = [
  "bloom-triad-local-transport",
  "ed25519-dalek",
  "fs2",
+ "num-bigint",
  "serde",
  "serde_jcs",
  "serde_json",
