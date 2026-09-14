@@ -67,6 +67,24 @@ Long-running end-to-end tests gated behind `#[ignore]`. They may spin up
 external services such as anvil or exercise real wallet integrations.
 
 - Run: `cargo test --workspace -- --ignored`
+- Shell acceptance suites launch the real triad through
+  `scripts/triad-dev-launch.sh`:
+  - `scripts/acceptance.sh` — the full custody acceptance entrypoint: runs
+    the projection-fidelity suite and both transfer suites below.
+  - `scripts/test-raw-key-import-transfer.sh` — imports a raw secp256k1 EVM
+    key through the real Broker ceremony (base64url key input to the debug
+    driver), allowlists a recipient through the policy-update ceremony, and
+    proves the imported scalar can stage, approve, sign, broadcast, and
+    confirm a transfer on a local anvil chain with the on-chain sender
+    matching the imported address. Requires `anvil`/`cast` and the
+    `BLOOM_INTEGRATION_*_BIN` binaries.
+  - `scripts/test-bip39-import-transfer.sh` — imports a fixed throwaway
+    BIP-39 mnemonic through the real Broker ceremony, asserts the canonical
+    EVM child projection, completes an `AccountAllocate` ceremony and proves
+    the Solana child projects only after the ceremony completes, then spends
+    from the canonical EVM child on a local anvil chain with the on-chain
+    sender matching cast's independent `m/44'/60'/0'/0/0` derivation.
+    Requires `anvil`/`cast` and the `BLOOM_INTEGRATION_*_BIN` binaries.
 
 ### CLI-subprocess
 

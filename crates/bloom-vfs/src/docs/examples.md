@@ -10,7 +10,9 @@ cat /bloom/chains/anvil/head/number
 cat /bloom/wallets/alice/address
 cat /bloom/chains/anvil/chain_id
 
-# 4. Stage a send
+# 4. Stage a send. The wallet-level path spends from account 0; a numbered
+#    path (wallets/alice/1/chains/...) spends from that account's key and
+#    sees only its own outbox entries.
 echo '{"to":"0x70997970C51812dc3A010C7d01b50e0d17dc79C8","value":"0.1 eth","chain":"anvil"}' \
   > /bloom/wallets/alice/chains/anvil/outbox/new.tx
 

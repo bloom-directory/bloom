@@ -1,6 +1,6 @@
 # Bloom virtual filesystem
 
-Bloom is an agentic Ethereum wallet exposed as a virtual filesystem.
+Bloom is an agentic EVM and Solana wallet exposed as a virtual filesystem.
 Agents can inspect chains with reads, stage wallet actions with writes,
 and review generated plans before any transaction is signed.
 
@@ -8,11 +8,16 @@ All paths below are relative to the Bloom VFS root.
 
 ## Top-level layout
 
-- `chains/<chain>/` — read-only chain views: head, blocks, tx, addresses,
+- `chains/<chain>/` — read-only EVM chain views: head, blocks, tx, addresses,
   contracts (`source`/`abi`/`methods`/`events`/`storage`/`proxy`),
   gas oracle, ERC-20 balances under `addresses/<a>/tokens/<token>/...`.
+  Solana chains don't expose this read-only surface yet — see
+  `wallets/<name>/chains/<solana-chain>/` for what they do expose.
 - `wallets/<name>/` — managed wallets, outbox write surface, history,
-  allowances, ENS reverse, sign / EIP-712 surfaces.
+  allowances, ENS reverse, sign / EIP-712 surfaces. `wallets/<name>/chains`
+  lists both EVM and Solana chains together; a Solana chain's
+  `outbox/{new.tx,pending,sent,failed}` uses the same route shape as EVM's,
+  dispatched to the Solana transfer engine instead of the EVM one.
 - `defi/intents/` — Enso-mediated DeFi intents (write `quote` / `execute`).
 - `petals/<name>/` — installed wallet extensions. Read `docs/petals.md` for
   the exact installed names, mount directories, consent summaries, and
