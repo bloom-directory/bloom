@@ -1633,10 +1633,10 @@ impl WalletsHandler {
             })
             .await
             .map_err(|error| HandlerError::backend(error.to_string()))?;
-        if !receipt
+        if receipt
             .wallet_id
             .as_ref()
-            .is_some_and(|wallet| wallet.as_str() == record.wallet_id)
+            .is_none_or(|wallet| wallet.as_str() != record.wallet_id)
             || receipt.public_key_refs.len() != 2
         {
             return Err(HandlerError::backend(

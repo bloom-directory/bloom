@@ -8000,7 +8000,7 @@ ws_url = "wss://example.invalid"
         fn child(&self, evm: bool, number: u32) -> &AccountChild {
             self.children
                 .iter()
-                .find(|child| child.key_spec_is_ed25519() == !evm && child.path_number() == number)
+                .find(|child| child.key_spec_is_ed25519() != evm && child.path_number() == number)
                 .unwrap()
         }
 
