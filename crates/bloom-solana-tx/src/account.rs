@@ -112,6 +112,24 @@ pub fn active_accounts(
         .collect()
 }
 
+/// The wallet's canonical initial child for a profile: the active account
+/// whose path is the profile's account-zero path, if one exists. Wallet-level
+/// paths mean this account, so a wallet with several children still resolves
+/// `account 0` from the path alone — a deterministic rule, never list order.
+pub fn canonical_initial<'a>(
+    active: &[&'a DerivedAccountPublic],
+    profile: DerivationProfile,
+) -> Option<&'a DerivedAccountPublic> {
+    let zero_path = match profile {
+        DerivationProfile::Bip44EvmSecp256k1V1 => "m/44'/60'/0'/0/0",
+        DerivationProfile::Bip44SolanaSlip10Ed25519V1 => "m/44'/501'/0'/0'",
+    };
+    active
+        .iter()
+        .copied()
+        .find(|account| account.path == zero_path)
+}
+
 /// Choose exactly one active account.
 ///
 /// `selector` is a public-key fingerprint or a unique prefix of one, compared
@@ -171,6 +189,25 @@ mod tests {
         Base64UrlBytes, CryptoSuite, Digest32, KeyRef, KeySpec, PublicKeyEncoding, Token,
         WalletSeedProfile,
     };
+
+    #[test]
+    fn canonical_initial_is_the_account_zero_child_when_it_is_active() {
+        let zero = account(0, &fingerprint(0xaa), AccountLifecycleState::Active);
+        let one = account(1, &fingerprint(0xbb), AccountLifecycleState::Active);
+        let active = vec![&one, &zero];
+        assert_eq!(
+            canonical_initial(&active, DerivationProfile::Bip44SolanaSlip10Ed25519V1),
+            Some(&zero)
+        );
+        // Callers pass the already lifecycle-filtered list, so a retired
+        // account-zero child is absent here and no canonical initial exists;
+        // the wallet-level path then fails closed rather than guessing.
+        let active = vec![&one];
+        assert_eq!(
+            canonical_initial(&active, DerivationProfile::Bip44SolanaSlip10Ed25519V1),
+            None
+        );
+    }
 
     fn account(
         account_number: u32,

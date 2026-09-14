@@ -124,7 +124,6 @@ fn sent_entry(id: &str) -> StagedSolanaTransfer {
         created_ms: 1,
         expires_ms: 0,
         status: SolanaTxStatus::Sent,
-        action_id: None,
     }
 }
 

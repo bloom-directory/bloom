@@ -62,6 +62,11 @@ addresses digests:
   { "destination": "…", "lamports": 1000, "account_fingerprint": "9f3c…" }
   ```
 
+Note (2026-09-11): the numbered accounts of PR #248 superseded the
+wallet-level fingerprint override described here — the wallet-level outbox
+now stages from account 0 only, and account `n` is addressed through
+`wallets/<wallet>/<n>/`. The selection rules below remain the design history.
+
 A prefix that matches no active child, or more than one, is an error naming
 the candidates. Only a full-length fingerprint is accepted where the value is
 persisted, so a stored selection can never be re-resolved to a different key.

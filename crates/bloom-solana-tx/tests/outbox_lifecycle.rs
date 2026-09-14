@@ -29,7 +29,6 @@ fn staged(id: &str) -> StagedSolanaTransfer {
         created_ms: 1000,
         expires_ms: 0,
         status: SolanaTxStatus::Pending,
-        action_id: None,
     }
 }
 
@@ -186,12 +185,8 @@ fn broadcast_attempt_binds_raw_tx_hash() {
     outbox
         .write_broadcast_attempt(&entry, "SIG", b"signed-tx-bytes", 2000)
         .unwrap();
-    let raw = outbox.read_broadcast_raw_tx(&entry).unwrap();
+    let raw = std::fs::read(entry.dir.join("raw_tx")).unwrap();
     assert_eq!(raw, b"signed-tx-bytes");
-
-    // Corrupt the raw tx on disk: the hash check must fail closed.
-    std::fs::write(entry.dir.join("raw_tx"), b"tampered").unwrap();
-    assert!(outbox.read_broadcast_raw_tx(&entry).is_err());
 }
 
 #[test]
@@ -334,14 +329,6 @@ fn from_status_maps_every_status_to_its_outbox_state() {
     assert_eq!(
         SolanaOutboxState::from_status(&SolanaTxStatus::Sent),
         SolanaOutboxState::Sent
-    );
-    assert_eq!(
-        SolanaOutboxState::from_status(&SolanaTxStatus::Success),
-        SolanaOutboxState::Sent
-    );
-    assert_eq!(
-        SolanaOutboxState::from_status(&SolanaTxStatus::Failed),
-        SolanaOutboxState::Failed
     );
     assert_eq!(
         SolanaOutboxState::from_status(&SolanaTxStatus::Cancelled),

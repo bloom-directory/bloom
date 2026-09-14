@@ -2,9 +2,8 @@
 # End-to-end acceptance for the BIP-39 account lifecycle through the real
 # triad: a fixed throwaway mnemonic is delivered only to the Broker-hosted
 # ceremony, the imported wallet's canonical EVM child (m/44'/60'/0'/0/0) is
-# projected, an AccountAllocate ceremony adds a Solana child that appears in
-# the account projection only after the ceremony completes, and the canonical
-# EVM child then spends on a local anvil chain through the canonical stage ->
+# projected together with its canonical Solana sibling, and the EVM child then
+# spends on a local anvil chain through the canonical stage ->
 # Sealed Approval ceremony -> Signer signature -> broadcast -> reconciliation
 # lifecycle. The on-chain sender must equal the address independently derived
 # from the mnemonic by cast.
@@ -38,6 +37,7 @@ case "$startup_timeout_secs" in *[!0-9]*|'') die "startup timeout must be an int
 # independently with cast below, funded from anvil account #0.
 MNEMONIC="abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon art"
 EVM_HD_PATH="m/44'/60'/0'/0/0"
+SOLANA_HD_PATH="m/44'/501'/0'/0'"
 RECIPIENT="0x70997970C51812dc3A010C7d01b50e0d17dc79C8"
 FUNDER_PRIV_KEY="0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
 AUTH_SEED="bip39-e2e-auth"
@@ -184,46 +184,29 @@ import_result="$("$driver_bin" complete "$import_ceremony_url" "$AUTH_SEED" \
 wallet_id="$(printf '%s' "$import_result" | jq -er '.wallet_id')"
 printf 'bip39 transfer e2e: imported wallet %s\n' "$wallet_id"
 
-# 5. The canonical EVM child is projected exactly, with its derivation path.
+# 5. Import projects both canonical children without another ceremony.
 accounts="$(cli wallet accounts "$wallet_id")"
-printf '%s' "$accounts" | jq -e --arg wallet "$wallet_id" --arg path "$EVM_HD_PATH" --arg addr "$expected_addr" '
+printf '%s' "$accounts" | jq -e --arg wallet "$wallet_id" --arg evm_path "$EVM_HD_PATH" --arg solana_path "$SOLANA_HD_PATH" --arg addr "$expected_addr" '
   .wallet_id == $wallet and
   .seed_profile == "bip39-multicurve-v1" and
   ([.accounts[] | select(
       .derivation_profile == "bip44-evm-secp256k1-v1" and
-      .path == $path and .lifecycle == "ACTIVE")] | length) == 1 and
+      .path == $evm_path and .lifecycle == "ACTIVE")] | length) == 1 and
+  ([.accounts[] | select(
+      .derivation_profile == "bip44-solana-slip10-ed25519-v1" and
+      .path == $solana_path and .lifecycle == "ACTIVE")] | length) == 1 and
   any(.accounts[]; any(.chain_projections[]?; (.address | ascii_downcase) == $addr))
 ' >/dev/null || die "imported wallet did not project the canonical EVM child at the derived address: $accounts"
-[ "$(printf '%s' "$accounts" | jq '.accounts | length')" = "1" ] ||
-  die "a fresh BIP-39 import must project exactly one account: $accounts"
+[ "$(printf '%s' "$accounts" | jq '.accounts | length')" = "2" ] ||
+  die "a fresh BIP-39 import must project exactly two accounts: $accounts"
+solana_address="$(cli wallet address "$wallet_id" --profile solana)"
+case "$solana_address" in
+  ''|*[!123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz]*)
+    die "wallet address did not print a Base58 Solana address: $solana_address" ;;
+esac
+printf 'bip39 transfer e2e: import projected EVM and Solana children (Solana: %s)\n' "$solana_address"
 
-# 6. AccountAllocate adds a Solana child — but only once its ceremony
-#    completes. Launch, prove the projection has NOT moved, then complete.
-allocate_launch="$(cli wallet account-allocate "$wallet_id" --profile bip44-solana-slip10-ed25519-v1 2>&1)" ||
-  die "account allocation launch failed: ${allocate_launch:-<no diagnostic>}"
-allocate_ceremony_url="$(printf '%s\n' "$allocate_launch" | sed -n 's/^ceremony_url: //p')"
-[ -n "$allocate_ceremony_url" ] || die "allocation launch omitted ceremony_url: $allocate_launch"
-pre_accounts="$(cli wallet accounts "$wallet_id")"
-[ "$(printf '%s' "$pre_accounts" | jq '[.accounts[] | select(.derivation_profile == "bip44-solana-slip10-ed25519-v1")] | length')" = "0" ] ||
-  die "the Solana child was projected before its allocation ceremony completed"
-"$driver_bin" complete "$allocate_ceremony_url" "$AUTH_SEED" --sign-count 2 >/dev/null ||
-  die "completing the allocation ceremony failed"
-post_accounts=""
-attempts=0
-while [ "$attempts" -lt 100 ]; do
-  post_accounts="$(cli wallet accounts "$wallet_id")"
-  if [ "$(printf '%s' "$post_accounts" | jq '[.accounts[] | select(.derivation_profile == "bip44-solana-slip10-ed25519-v1" and .lifecycle == "ACTIVE")] | length')" = "1" ]; then
-    break
-  fi
-  attempts=$((attempts + 1))
-  sleep 0.1
-done
-printf '%s' "$post_accounts" | jq -e '
-  any(.accounts[]; .derivation_profile == "bip44-solana-slip10-ed25519-v1" and .lifecycle == "ACTIVE")
-' >/dev/null || die "the completed allocation ceremony never projected an active Solana child: $post_accounts"
-printf 'bip39 transfer e2e: allocated an active Solana child through the ceremony\n'
-
-# 7. Allowlist the transfer recipient through the canonical policy-update
+# 6. Allowlist the transfer recipient through the canonical policy-update
 #    ceremony (a fresh wallet denies every destination).
 current_policy="$(vcat "/wallets/${wallet_id}/policy.json")"
 policy_file="${run_root}/proposed-policy.json"
@@ -241,7 +224,7 @@ policy_operation="$(printf '%s\n' "$policy_launch" | sed -n 's/^operation_id: //
 cli wallet commit-policy "$policy_operation" >/dev/null ||
   die "policy commit failed"
 
-# 8. Fund the canonical child address and stage a native transfer. The wallet
+# 7. Fund the canonical child address and stage a native transfer. The wallet
 #    holds exactly one EVM child, so the derived-child signing path resolves
 #    implicitly and unambiguously.
 cast send --rpc-url "$rpc_url" --private-key "$FUNDER_PRIV_KEY" \
@@ -266,7 +249,7 @@ done
 [ -n "$pending_id" ] || die "staged intent never reached ${pending_dir}"
 printf 'bip39 transfer e2e: staged pending entry %s\n' "$pending_id"
 
-# 9. First confirm must fail closed and persist the Sealed Approval ceremony.
+# 8. First confirm must fail closed and persist the Sealed Approval ceremony.
 confirm_path="${pending_dir}/${pending_id}/confirm"
 if vwrite "$confirm_path" "y" >/dev/null 2>&1; then
   die "confirm succeeded before the approval ceremony completed"
@@ -274,17 +257,17 @@ fi
 ceremony="$(wait_for_file "pending ceremony projection" "${pending_dir}/${pending_id}/ceremony.json")"
 approval_ceremony_url="$(printf '%s' "$ceremony" | jq -er '.ceremony_url')"
 
-# 10. Complete the approval ceremony and confirm on the exact retry.
+# 9. Complete the approval ceremony and confirm on the exact retry.
 "$driver_bin" complete "$approval_ceremony_url" "$AUTH_SEED" --sign-count 4 >/dev/null ||
   die "completing the Sealed Approval ceremony failed"
 vwrite "$confirm_path" "y" || die "post-ceremony confirm retry failed"
 
-# 11. The entry must reconcile into sent/ with a transaction hash.
+# 10. The entry must reconcile into sent/ with a transaction hash.
 sent_dir="/wallets/${wallet_id}/chains/anvil/outbox/sent"
 tx_hash="$(wait_for_file "broadcast transaction hash" "${sent_dir}/${pending_id}/tx_hash" | tr -d '[:space:]')"
 printf '%s' "$tx_hash" | grep -Eq '^0x[0-9a-f]{64}$' || die "malformed tx_hash: $tx_hash"
 
-# 12. On-chain truth: the sender is the canonical child's address, derived
+# 11. On-chain truth: the sender is the canonical child's address, derived
 #     independently from the mnemonic by cast, and the transfer landed once.
 receipt="$(cast receipt --rpc-url "$rpc_url" --json "$tx_hash")"
 printf '%s' "$receipt" | jq -e --arg addr "$expected_addr" --arg to "$(printf '%s' "$RECIPIENT" | tr '[:upper:]' '[:lower:]')" '
@@ -303,11 +286,11 @@ print('ok' if after - before == 10**18 else 'bad')
 [ "$balance_delta_ok" = "ok" ] ||
   die "recipient balance did not advance by exactly 1 ETH: before=${recipient_balance_before} after=${recipient_balance_after}"
 
-# 13. Secret confinement: the mnemonic phrase must never appear in anything
+# 12. Secret confinement: the mnemonic phrase must never appear in anything
 #     Machine wrote.
 if grep -R -F -a -q -- "$MNEMONIC" "$machine_home" "$log_dir" "$launcher_log" 2>/dev/null; then
   die "mnemonic material leaked into Machine-owned artifacts"
 fi
 
-printf 'bip39 transfer e2e passed: wallet %s imported its canonical EVM child %s, allocated a Solana child through the ceremony, and spent from the child on anvil (%s) with the on-chain sender matching cast'\''s independent derivation.\n' \
-  "$wallet_id" "$expected_addr" "$tx_hash"
+printf 'bip39 transfer e2e passed: wallet %s imported canonical EVM child %s and Solana child %s in one ceremony, then spent from the EVM child on anvil (%s) with the on-chain sender matching cast'\''s independent derivation.\n' \
+  "$wallet_id" "$expected_addr" "$solana_address" "$tx_hash"

@@ -14,7 +14,7 @@ use bloom_broker_api::{
     SigningResult, Token, WalletPublic, WalletRequest,
 };
 use bloom_machine_client::MachineBrokerClient;
-use bloom_solana::{EndpointSpec, SolanaChainRegistry, SolanaClient, SolanaSpec};
+use bloom_solana::{EndpointSpec, SolanaChainRegistry, SolanaClient, SolanaRpcError, SolanaSpec};
 use bloom_solana_tx::engine::SolanaTransferEngine;
 use bloom_solana_tx::outbox::SolanaOutbox;
 use bloom_solana_tx::reconcile::SolanaReconciler;
@@ -178,6 +178,23 @@ fn now_ms() -> u128 {
         .unwrap_or(0)
 }
 
+/// Test-only faucet: fund a base58 account over the same transport. The
+/// read-only client deliberately has no airdrop method.
+async fn request_airdrop(
+    endpoint: &EndpointSpec,
+    account: &str,
+    lamports: u64,
+) -> Result<String, SolanaRpcError> {
+    let rpc = bloom_solana::transport::SolanaRpcClient::build(&SolanaSpec {
+        name: "solana-test-airdrop".into(),
+        endpoints: vec![endpoint.clone()],
+        expected_genesis_base58: None,
+        allow_broadcast: false,
+    })?;
+    rpc.call("requestAirdrop", &serde_json::json!([account, lamports]))
+        .await
+}
+
 #[tokio::test]
 #[ignore]
 async fn local_validator_lifecycle_stage_sign_broadcast_reconcile() {
@@ -201,6 +218,7 @@ async fn local_validator_lifecycle_stage_sign_broadcast_reconcile() {
         .verify_genesis()
         .await
         .expect("discover local validator genesis");
+    let airdrop_spec = endpoint_spec.clone();
     let client = SolanaClient::build(&SolanaSpec {
         name: "solana-local".into(),
         endpoints: vec![endpoint_spec],
@@ -235,10 +253,7 @@ async fn local_validator_lifecycle_stage_sign_broadcast_reconcile() {
     // Fund the derived child and wait for the balance to land.
     let mut airdrop_result = None;
     for attempt in 0..3 {
-        match client
-            .request_airdrop(&fee_payer_b58, airdrop_lamports)
-            .await
-        {
+        match request_airdrop(&airdrop_spec, &fee_payer_b58, airdrop_lamports).await {
             Ok(signature) => {
                 airdrop_result = Some(signature);
                 break;

@@ -141,6 +141,13 @@ impl MachineBrokerService for ExactSigningBrokerFixture {
                         self.policy_snapshot(wallet_id),
                     ))
                 }
+                // A root-key wallet has no derived accounts; the numbered
+                // tree renders it as account 0 from the root projection.
+                MachineBrokerRequest::WalletAccounts(WalletRequest { wallet_id }) => {
+                    Ok(MachineBrokerResponse::WalletAccounts(
+                        bloom_machine_client::empty_wallet_accounts(wallet_id),
+                    ))
+                }
                 MachineBrokerRequest::SealedApprovalPrepare(request) => {
                     Ok(MachineBrokerResponse::SealedApprovalPrepare(
                         bloom_broker_api::SealedApprovalPrepareResponse {

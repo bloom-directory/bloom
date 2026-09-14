@@ -106,6 +106,16 @@ config where a chain name is configured in both.
 
 ## Mainnet posture
 
+Newly generated configuration includes `solana-mainnet`, using the public
+`https://api.mainnet.solana.com` RPC endpoint and the pinned mainnet genesis
+hash. Its `allow_broadcast` defaults to `false`. Devnet and local validators
+remain explicitly configured networks. Loading an existing configuration does
+not add Solana networks or overwrite endpoint and broadcast settings.
+
+The public endpoint is rate-limited; operators can replace it with their own
+RPC endpoint under `[solana_chains.solana-mainnet]`. See Solana's
+[public RPC documentation](https://solana.com/docs/references/clusters).
+
 Mainnet uses the ordinary Solana transaction path. Operators must explicitly
 enable `allow_broadcast` and pin `expected_genesis_base58`; Machine verifies every
 configured endpoint against that genesis at staging and again before its
