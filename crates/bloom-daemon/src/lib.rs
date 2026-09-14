@@ -1573,29 +1573,14 @@ impl PetalHost for DaemonPetalHost {
                                 .into(),
                         ));
                     }
-                    let (reusable, authority_expires_at_ms) = self
-                        .prepare_petal_key_reusable_approval(
-                            broker,
-                            &wallet,
-                            &scope,
-                            &public.key_ref,
-                            provenance_digest.clone().ok_or_else(|| {
-                                HostError::Denied("Petal provenance digest is missing".into())
-                            })?,
-                        )
-                        .await?;
-                    stored.public_key = Some(public);
-                    stored.reusable_approval_id = Some(reusable.approval_id);
-                    stored.authority_expires_at_ms = Some(authority_expires_at_ms);
-                    stored.status = "awaiting_user".into();
-                    stored.ceremony_url = Some(reusable.ceremony_url);
-                    stored.ceremony_expires_at_ms = reusable.ceremony_expires_at_ms;                    // Publish the derived address before staging its reusable
+                    // Publish the derived address before staging its reusable
                     // approval. The owner must be able to add this previously
                     // unknown funding destination to wallet policy first;
                     // changing policy after approval invalidates its snapshot.
                     stored.public_key = Some(public);
                     stored.status = "key_derived".into();
-                    stored.ceremony_url = None;                    Self::write_petal_key_state(&path, &stored)?;
+                    stored.ceremony_url = None;
+                    Self::write_petal_key_state(&path, &stored)?;
                     return stored.guest_outcome();
                 }
                 Err(error)
@@ -2868,8 +2853,15 @@ fn petal_signing_host_error(error: &bloom_broker_api::ProtocolError) -> HostErro
     let contract = error.code.contract();
     let message = format!("{}: {}", error.code.as_str(), error.message);
     if contract.retry == bloom_broker_api::RetryClass::Never
-        && contract.durable_effect == bloom_broker_api::DurableEffect::None
+        && matches!(
+            contract.durable_effect,
+            bloom_broker_api::DurableEffect::None
+                | bloom_broker_api::DurableEffect::ReservationReleased
+        )
     {
+        // `ReservationReleased` marks terminal budget refusals: the budget
+        // reservation was given up and retrying the same request cannot
+        // succeed, so the guest sees a definitive refusal, not uncertainty.
         HostError::Denied(message)
     } else {
         HostError::Backend(message)
@@ -5553,6 +5545,12 @@ mod tests {
             ProtocolErrorCode::SelectorMismatch,
             ProtocolErrorCode::KeyrefMismatch,
             ProtocolErrorCode::ProvenanceMismatch,
+            // Terminal budget refusals release the reservation; retrying the
+            // same request cannot succeed, so they are decisions.
+            ProtocolErrorCode::LimitExceededValue,
+            ProtocolErrorCode::LimitExceededSignatures,
+            ProtocolErrorCode::LimitExceededRate,
+            ProtocolErrorCode::SignerRateBackstopDenied,
         ];
         for code in denied {
             let error = petal_signing_host_error(&ProtocolError::new(code, "refused"));
@@ -5574,7 +5572,6 @@ mod tests {
             ProtocolErrorCode::ClockUntrusted,
             ProtocolErrorCode::PolicyBaselineStale,
             ProtocolErrorCode::RevocationEpochUnreconciled,
-            ProtocolErrorCode::LimitExceededValue,
         ];
         for code in uncertain {
             let error = petal_signing_host_error(&ProtocolError::new(code, "not a decision"));
@@ -8996,6 +8993,7 @@ allowed = ["bloom:vfs.read"]
             succeeded_at_ms: Some(requested_at_ms + 1),
             authority_expires_at_ms: Some(requested_at_ms.saturating_add(3_600_001)),
             stopped: None,
+            approval_value_limits: Vec::new(),
         };
         let identity = blake3::hash(
             format!("bloom-petal-key-request-state/v3\0{wallet}\0{lineage}\0{slot}").as_bytes(),
