@@ -588,9 +588,7 @@ async fn paid_confirm_excludes_cancel_and_same_wallet_execution() {
     assert!(
         !root
             .path()
-            .join(format!(
-                "requests/pending/{second}/private/credential_minted.json"
-            ))
+            .join(format!("requests/pending/{second}/receipt.json"))
             .exists()
     );
     // An unrelated request can still be staged while payment is parked.
@@ -657,32 +655,40 @@ async fn interrupted_payment_cannot_be_cancelled_or_free_wallet_budget() {
         error.to_string().contains("execution has started"),
         "{error}"
     );
-    let confirm = VfsPath::parse(&format!("/pending/{second}/confirm")).unwrap();
-    let error = restarted.write(&confirm, b"confirm").await.unwrap_err();
-    assert!(
-        error.to_string().contains("unresolved execution outcome"),
-        "{error}"
-    );
-    assert!(
-        root.path()
-            .join(format!("requests/pending/{first}"))
-            .exists()
-    );
-    assert!(
-        !root
-            .path()
-            .join(format!("requests/failed/{first}"))
-            .exists()
-    );
+    let receipt: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(
+            root.path()
+                .join(format!("requests/pending/{first}/receipt.json")),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(receipt["outcome"], "unresolved");
+    assert_eq!(receipt["wallet"], "alice");
+    assert!(receipt["amount_usd"].as_f64().unwrap() > 0.0);
     assert!(
         !root
             .path()
             .join(format!(
-                "requests/pending/{second}/private/credential_minted.json"
+                "requests/pending/{first}/private/execution_started"
             ))
             .exists()
     );
-    merchant.release.add_permits(1);
+    assert!(restarted.write(&first_path, b"confirm").await.is_err());
+    // The uncertain first payment stays charged, but is not a blanket wallet lock.
+    merchant.release.add_permits(2);
+    let confirm = VfsPath::parse(&format!("/pending/{second}/confirm")).unwrap();
+    restarted.write(&confirm, b"confirm").await.unwrap();
+    assert!(
+        root.path()
+            .join(format!("requests/sent/{second}/receipt.json"))
+            .exists()
+    );
+    assert!(
+        root.path()
+            .join(format!("requests/pending/{first}/receipt.json"))
+            .exists()
+    );
 }
 
 #[tokio::test]
@@ -716,7 +722,7 @@ async fn paid_preflight_failure_remains_retryable_and_cancellable() {
     assert!(
         !root
             .path()
-            .join(format!("requests/pending/{id}/private/execution_started"))
+            .join(format!("requests/pending/{id}/receipt.json"))
             .exists()
     );
     let repaired = handler
@@ -780,7 +786,7 @@ async fn locally_signed_but_unsubmitted_preparation_does_not_block_retry() {
     assert!(
         !root
             .path()
-            .join(format!("requests/pending/{id}/private/execution_started"))
+            .join(format!("requests/pending/{id}/receipt.json"))
             .exists()
     );
     let handler = handler.with_x402_signer(Arc::new(bloom_paid_x402::HostX402PaymentSigner::new()));

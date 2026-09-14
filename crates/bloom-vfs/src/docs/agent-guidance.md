@@ -297,7 +297,10 @@ provider contract from this root guide.
 A paid request's confirm and cancel operations are serialized. Once execution
 has started, cancellation cannot undo the payment. A timeout or interrupted
 confirmation does not prove non-payment: inspect the exact request's receipt
-and merchant outcome before taking further action. An unresolved execution
-blocks additional paid confirmations for that wallet until reconciled; do not
-bypass that block by restaging. Other wallets and unrelated VFS operations can
-continue. A failed merchant retry still counts toward recorded spending.
+and merchant outcome before taking further action. Before transmission, the
+existing receipt records the full possible charge as unresolved. Unresolved
+charges remain in recorded spending, including after a restart or timeout;
+receiving a response updates the same receipt without counting it twice. Other
+requests can proceed within any remaining budget. Do not repeat an unresolved
+payment by restaging it. A failed merchant retry still counts toward recorded
+spending.
