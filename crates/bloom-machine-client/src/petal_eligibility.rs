@@ -12,9 +12,20 @@ pub fn policy_with_package(
     current: &CanonicalWalletPolicy,
     package_hash: &Digest32,
 ) -> CanonicalWalletPolicy {
+    policy_with_packages(current, std::slice::from_ref(package_hash))
+}
+
+/// Preserve every existing restriction and append each requested exact package
+/// hash once, in order.
+pub fn policy_with_packages(
+    current: &CanonicalWalletPolicy,
+    package_hashes: &[Digest32],
+) -> CanonicalWalletPolicy {
     let mut proposed = current.clone();
-    if !proposed.allowed_petal_packages.contains(package_hash) {
-        proposed.allowed_petal_packages.push(package_hash.clone());
+    for package_hash in package_hashes {
+        if !proposed.allowed_petal_packages.contains(package_hash) {
+            proposed.allowed_petal_packages.push(package_hash.clone());
+        }
     }
     proposed
 }

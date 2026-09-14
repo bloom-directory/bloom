@@ -14,6 +14,8 @@ pub(crate) struct ProvisioningResult {
 pub(crate) enum ProvisioningOutcome {
     Current,
     Installed,
+    /// Replaced an older release, which starts with empty Petal settings.
+    Updated,
     Failed(String),
 }
 
@@ -59,8 +61,13 @@ pub(crate) fn provision_with(
             let prepared = acquire(daemon, &entry, context).with_context(|| {
                 format!("acquire default {name}; retry with `bloom init` or `bloom petals install`")
             })?;
+            let updated = expected_owner.is_some();
             prepared.commit(daemon, context, Some(expected_owner))?;
-            Ok(ProvisioningOutcome::Installed)
+            Ok(if updated {
+                ProvisioningOutcome::Updated
+            } else {
+                ProvisioningOutcome::Installed
+            })
         };
         let outcome = match attempt() {
             Ok(outcome) => outcome,

@@ -17,15 +17,15 @@ The normative security and wire contracts remain
 
 ```text
 bloom init  (once)
-  -> setup menu        choose Petals: Hyperliquid, Polymarket
-                       review Polymarket's daily limit
-  -> installs          the chosen Petals, pinned by Bloom's catalog
+  -> setup menu        choose Petals: Polymarket, Hyperliquid, NEAR Intents
+                       review Polymarket's daily buy limit
   -> saves             the choices in Bloom's config
+  -> installs          the chosen Petals, pinned by Bloom's catalog
+  -> writes            each chosen Petal's settings
 
 bloom wallet new main  (or bloom wallet import main)
   -> ceremony 1        creates the wallet
   -> ceremony 2        signs the default policy for main
-  -> applies           each chosen Petal's settings
 
 using a Petal
   -> each transaction  the owner approves it, like a normal wallet
@@ -46,7 +46,8 @@ Agreed on 2026-09-14:
 1. **Only the `bloom` repository changes.** Broker, Signer, and Petal
    repositories are untouched.
 2. **`bloom init` opens a setup menu** where the user chooses their Petals.
-   It offers Hyperliquid and Polymarket, and Enso once it is fixed.
+   It offers Polymarket, Hyperliquid, and NEAR Intents, and Enso once it is
+   fixed.
 3. **Bloom's setup decides the defaults.** The menu suggests each Petal's
    settings, and the user can change them.
 4. **The default policy is for the first wallet, `main`.** Other wallets
@@ -61,8 +62,8 @@ Agreed on 2026-09-14:
    spending, and the wallet policy only allows the chosen Petals.
 8. **Polymarket uses its existing settings:** trading turned on, with a daily
    limit of 100 pUSD.
-9. **Petal settings do not survive an update.** Bloom tells the user when an
-   update reset a Petal's limits.
+9. **Petal settings do not survive an update.** Bloom keeps the setup choices
+   in its config, writes them again after an update, and says so.
 10. **`bloom init` runs once.** Afterwards users add, update, or remove
     Petals.
 11. **Enso is fixed separately.** Its current release reads a policy file the
@@ -87,34 +88,45 @@ Agreed on 2026-09-14:
 
 `bloom init` shows a menu when run in a terminal:
 
-1. **Choose Petals.** Hyperliquid and Polymarket, both selected by default.
-2. **Review settings.** Show Polymarket's suggested daily limit, 100 pUSD,
-   and let the user change it.
-3. **Confirm.** Install the chosen Petals and save the choices in Bloom's
-   config.
+1. **Choose Petals.** Polymarket, Hyperliquid, and NEAR Intents, all selected
+   by default.
+2. **Review settings.** Show Polymarket's suggested daily buy limit, 100
+   pUSD, and let the user change it. Only positive amounts are accepted.
+3. **Confirm.** Save the choices in Bloom's config, install the chosen
+   Petals, and write each chosen Petal's settings.
 
-The chosen Petals are the existing `[petals] preinstalled` list. Their
-settings are saved beside it, for example:
+Setup records each chosen Petal under `[petals.setup]`, with the values the
+menu asked about. The default policy proposes exactly these Petals. Setup
+also sets `[petals] preinstalled` to the same list, but that list only
+controls which catalog Petals Bloom installs and updates:
 
 ```toml
 [petals]
-preinstalled = ["hyperliquid", "polymarket"]
+preinstalled = ["polymarket", "hyperliquid", "near-intents"]
 
-[[petals.setup.polymarket.settings]]
-path = "settings/{wallet}/venue.toml"
-body = """
-enabled = true
+[petals.setup.hyperliquid]
+
+[petals.setup.near-intents]
+
+[petals.setup.polymarket.values]
 max_daily_usd = "100"
-"""
 ```
 
-Machine writes each saved body through the Petal's own settings route, so
-Bloom never interprets a Petal's settings format.
+Keeping the two apart lets someone who installs Petals themselves, such as
+the local developer triad, which sets `preinstalled = []`, still choose them
+for the default policy.
 
-Bloom's built-in catalog (`crates/bloom/src/github_source.rs`) holds the
-suggested settings next to each pinned release, including the values the
-menu asks about. Scripts and packaged installs get the same result without a
-terminal through a non-interactive form that accepts the suggestions.
+Bloom's built-in catalog (`crates/bloom/src/github_source.rs`) holds each
+Petal's settings template next to its pinned release. For Polymarket that is
+`settings/{wallet}/venue.toml` with `enabled = true` and the daily limit.
+Bloom substitutes the saved values, falling back to the catalog's
+suggestions, and writes the result through the Petal's own settings route,
+so it never interprets a Petal's settings format.
+
+The menu runs only on first-time setup, when `bloom init` finds no config,
+and only in a terminal. Scripts, packaged installs, and later runs of
+`bloom init` skip it and use the config as it is, with the catalog's
+suggestions for any value not saved.
 
 ### 2. The default policy
 
@@ -144,20 +156,28 @@ chosen Petals:
 `bloom wallet new main` and `bloom wallet import main`:
 
 1. Launch the creation ceremony, as today.
-2. Wait for it to complete by polling ceremony status. The Machine's Broker
-   client already has `ceremony_status`.
-3. Stage the default policy through the existing policy update flow, the same
-   one `bloom wallet update-policy` and `bloom wallet commit-policy` use.
-4. Wait for that ceremony, then commit the policy.
-5. Write each chosen Petal's saved settings, such as Polymarket's
-   `settings/main/venue.toml`.
+2. Ask Machine every two seconds where the default policy stands, through the
+   `wallet_default_policy` Machine command, until the wallet exists or its
+   creation ceremony expires.
+3. Machine proposes every chosen, installed Petal together through the
+   wallet's existing policy operation, the same pending-proposal flow the
+   mounted `wallets/<wallet>/policy.json` uses. The command prints that
+   ceremony's URL once.
+4. Once the owner completes the ceremony, the next check commits the policy,
+   and the command reports that `main` now allows the chosen Petals.
 
-If the owner stops the command or lets the policy ceremony expire, the
-wallet still exists. The first Petal operation then proposes the whole
-default policy, not just its own package: `ensure_petal_eligibility` builds
-its proposal from the chosen Petals instead of one package
-(`policy_with_package`). Machine writes the saved settings once that policy
-commits.
+Petal settings are not written here: `bloom init` already wrote them.
+
+If the owner stops the command, or the policy ceremony expires, the wallet
+still exists:
+
+- **`bloom wallet default-policy main`** picks up where the command stopped.
+  It shows a ceremony that is still open, or opens a new one after expiry.
+  While waiting, Bloom never announces a replacement for a ceremony that
+  expired.
+- **The first Petal operation on `main`** also proposes the whole default
+  policy, not just its own package. `ensure_petal_eligibility` adds the
+  chosen Petals to its proposal for the default-policy wallet.
 
 ### 4. Every transaction is approved
 
@@ -177,22 +197,25 @@ the last 24 hours. It does not count sells, and it has no total limit.
 | User action | Policy change proposed for `main` | Petal settings |
 |---|---|---|
 | Add a Petal with `bloom petals install` | Allow its package hash | Write Bloom's suggested settings, if it is a catalog Petal |
-| Update a Petal by installing a newer release | Replace the old package hash with the new one | Reset. Bloom tells the user, and offers to write the saved settings again |
+| Update a Petal by installing a newer release | Replace the old package hash with the new one | Written again from the saved choices, and Bloom says so |
 | Remove a Petal with `bloom petals uninstall` | Remove its package hash | Removed with the package |
 
-Updates reset settings because a Petal's stored state, including its
+An update resets a Petal's settings because its stored state, including its
 settings and trade receipts, is kept under its package hash
-(`crates/bloom-petals/src/private_store.rs`). The notice names the Petal and
-what was reset, for example: "Polymarket was updated to v0.1.5. Its settings,
-including its 100 pUSD daily limit, were reset."
+(`crates/bloom-petals/src/private_store.rs`). Bloom still has the owner's
+choices in its config, so it writes them again and says so, for example:
+"Polymarket was updated, which reset its settings; re-applied max_daily_usd
+= 100". Trade receipts are not restored, so Polymarket's daily count starts
+again after an update.
+
+Catalog Petals are installed and updated in two places: `bloom init`
+(`ensure_preinstalled_petals`) and every `bloom serve` start
+(`petal_provisioning::provision`). Both write the saved settings for a
+Petal they install or update. `bloom init` prints the message, and
+`bloom serve` logs it as `petal.setup_settings_written`.
 
 Each change is one policy update ceremony. Changes waiting at the same time
 merge into one proposal, as Machine already reconciles pending proposals.
-
-Today `bloom init` also updates outdated catalog Petals
-(`ensure_preinstalled_petals`), and nothing else does. Because setup runs
-once, updating to the release a newer Bloom pins becomes a user action on
-the same update path.
 
 ## What still asks the owner
 
@@ -232,35 +255,54 @@ These need other repositories and are out of scope:
 
 ## Implementation plan
 
-All in the `bloom` repository:
+All in the `bloom` repository. The first part is built; proposals from Petal
+changes come next.
 
-- **Setup** (`crates/bloom`, `crates/bloom-proto`): the `bloom init` menu and
-  its non-interactive form, suggested settings in the catalog, and saved
-  choices in config.
-- **Wallet creation** (`crates/bloom`): wait for the creation ceremony, then
-  stage, wait for, and commit the default policy, and write Petal settings.
-- **First use** (`crates/bloom-machine-client`, `crates/bloom-vfs`): propose
-  the whole default policy from `ensure_petal_eligibility`, then write Petal
-  settings after it commits.
+**Built**
+
+- **Setup** (`crates/bloom/src/default_policy.rs`, `crates/bloom-proto`):
+  the `bloom init` menu and its non-interactive form, settings templates in
+  the catalog, and choices saved under `[petals.setup]`. Settings are
+  written through each Petal's route by `bloom init`, and again whenever
+  `bloom init` or `bloom serve` installs or updates a chosen Petal.
+- **Wallet creation** (`crates/bloom`): `bloom wallet new main` and
+  `bloom wallet import main` wait for the wallet, then walk the owner
+  through the default policy with the `wallet_default_policy` Machine
+  command. `bloom wallet default-policy` resumes it.
+- **Policy proposal** (`crates/bloom-vfs`, `crates/bloom-machine-client`,
+  `crates/bloom-daemon`): `ensure_petal_packages_allowed` proposes several
+  packages through the wallet's existing policy operation, and
+  `ensure_petal_eligibility` adds the chosen Petals for `main`.
+
+**Next**
+
 - **Petal changes** (`crates/bloom`): propose policy updates from
-  `bloom petals install`, newer releases, catalog updates, and
-  `bloom petals uninstall`, and show the reset notice.
+  `bloom petals install`, newer releases, and `bloom petals uninstall`.
 
 ### Tests
 
-- The menu and its non-interactive form save the same config.
-- `bloom wallet new main` runs two ceremonies, commits a policy allowing
-  exactly the chosen packages, and writes Polymarket's settings.
-- After setup, Polymarket and Hyperliquid operations no longer return
-  `POLICY_APPROVAL_REQUIRED`.
-- A Polymarket buy over the daily limit is refused before approval.
-- If the policy ceremony is skipped, the first Petal operation proposes the
-  whole default policy.
-- Adding, updating, and removing a Petal propose the expected policy change,
-  and an update shows the reset notice.
-- An end-to-end run on the developer triad: `bloom init`, then
-  `bloom wallet new main` with two ceremonies, then a Polymarket order that
-  needs only its own transaction approval.
+Automated:
+
+- The menu records declines, rejects invalid limits, and accepts the
+  suggestions at the end of input. The scripted form chooses every
+  provisioned Petal and keeps existing values.
+- Chosen Petals round-trip through `config.toml`, and an edited value that
+  is not a positive amount cannot change a Petal's settings file.
+- The wait announces each ceremony once, stops when the policy is applied,
+  and never announces a replacement for an expired ceremony.
+- One policy ceremony allows every chosen package, and packages are added
+  once, in order (`crates/bloom-vfs/tests/triad_policy_update.rs`).
+- Catalog provisioning reports an update separately from a fresh install.
+
+Manual, on the developer triad:
+
+- `bloom wallet new main` runs two ceremonies and commits a policy allowing
+  exactly the chosen packages, and `bloom wallet default-policy main`
+  resumes after an interruption.
+
+Next part:
+
+- Adding, updating, and removing a Petal propose the expected policy change.
 
 ## Related documents
 

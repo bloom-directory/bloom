@@ -75,6 +75,12 @@ pub struct PetalsConfig {
     pub preinstalled: Vec<String>,
     #[serde(default)]
     pub runtime: BTreeMap<String, PetalRuntimeConfig>,
+    /// Petals chosen during `bloom init` setup, with the values each one's
+    /// settings need. The default wallet policy proposes exactly these
+    /// Petals, independent of `preinstalled`, which only controls
+    /// provisioning. They grant no authority.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub setup: BTreeMap<String, PetalSetupConfig>,
 }
 
 impl Default for PetalsConfig {
@@ -82,8 +88,20 @@ impl Default for PetalsConfig {
         Self {
             preinstalled: default_preinstalled_petals(),
             runtime: BTreeMap::new(),
+            setup: BTreeMap::new(),
         }
     }
+}
+
+/// Wallet whose default policy allows the Petals chosen during setup.
+pub const DEFAULT_POLICY_WALLET: &str = "main";
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PetalSetupConfig {
+    /// Named values substituted into the catalog's settings template.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub values: BTreeMap<String, String>,
 }
 
 fn default_preinstalled_petals() -> Vec<String> {

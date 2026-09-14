@@ -259,6 +259,9 @@ pub trait AccountPetalMount: Send + Sync {
         slot: &str,
     ) -> Result<(), HandlerError>;
 }
+/// Package hashes chosen during setup that a wallet's first Petal policy
+/// proposal also allows. It returns nothing for wallets without a default policy.
+pub type DefaultPolicyPackages = Arc<dyn Fn(&str) -> Vec<bloom_broker_api::Digest32> + Send + Sync>;
 
 #[derive(Clone)]
 pub struct WalletsHandler {
@@ -290,6 +293,8 @@ pub struct WalletsHandler {
     /// host needs this handler, so there is exactly one of each and the
     /// router is attached once both exist.
     account_petals: Arc<parking_lot::RwLock<Option<Arc<dyn AccountPetalMount>>>>,
+    /// Setup choices proposed together with a wallet's first Petal package.
+    default_policy_packages: Option<DefaultPolicyPackages>,
 }
 
 impl WalletsHandler {
@@ -312,7 +317,13 @@ impl WalletsHandler {
             solana: None,
             solana_reads: None,
             account_petals: Arc::new(parking_lot::RwLock::new(None)),
+            default_policy_packages: None,
         }
+    }
+
+    pub fn with_default_policy_packages(mut self, packages: DefaultPolicyPackages) -> Self {
+        self.default_policy_packages = Some(packages);
+        self
     }
 
     /// Attach the Petal runtime that serves `wallets/<w>/<n>/petals/`.
@@ -1383,7 +1394,43 @@ impl WalletsHandler {
         wallet: &str,
         package_hash: &bloom_broker_api::Digest32,
     ) -> Result<bloom_machine_client::PetalEligibility, HandlerError> {
-        use bloom_machine_client::{PetalEligibility, policy_with_package};
+        // A wallet's first proposal also allows the Petals chosen during setup,
+        // so the owner approves one policy rather than one per Petal.
+        let mut additions = vec![package_hash.clone()];
+        if let Some(defaults) = &self.default_policy_packages {
+            additions.extend(defaults(wallet));
+        }
+        self.ensure_policy_allows(
+            wallet,
+            package_hash,
+            std::slice::from_ref(package_hash),
+            &additions,
+        )
+        .await
+    }
+
+    /// Drive a wallet's default policy: propose every package together through
+    /// the existing policy operation. `Allowed` means all of them are allowed.
+    pub async fn ensure_petal_packages_allowed(
+        &self,
+        wallet: &str,
+        packages: &[bloom_broker_api::Digest32],
+    ) -> Result<bloom_machine_client::PetalEligibility, HandlerError> {
+        let first = packages
+            .first()
+            .ok_or_else(|| HandlerError::invalid("no Petal packages to allow"))?;
+        self.ensure_policy_allows(wallet, first, packages, packages)
+            .await
+    }
+
+    async fn ensure_policy_allows(
+        &self,
+        wallet: &str,
+        package_hash: &bloom_broker_api::Digest32,
+        required: &[bloom_broker_api::Digest32],
+        additions: &[bloom_broker_api::Digest32],
+    ) -> Result<bloom_machine_client::PetalEligibility, HandlerError> {
+        use bloom_machine_client::{PetalEligibility, policy_with_packages};
         use sha2::Digest as _;
 
         self.write_permit()?;
@@ -1428,10 +1475,13 @@ impl WalletsHandler {
                 "Broker eligibility policy has invalid wallet, digest, or canonical bytes",
             ));
         }
-        if policy.allowed_petal_packages.contains(package_hash) {
+        if required
+            .iter()
+            .all(|package| policy.allowed_petal_packages.contains(package))
+        {
             return Ok(PetalEligibility::Allowed(current));
         }
-        let proposed = policy_with_package(&policy, package_hash);
+        let proposed = policy_with_packages(&policy, additions);
         let proposed_bytes = serde_jcs::to_vec(&proposed).map_err(err_be)?;
         match self
             .write_wallet_policy_update_locked(wallet, &proposed_bytes, Some(&current))

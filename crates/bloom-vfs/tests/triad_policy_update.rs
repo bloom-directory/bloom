@@ -769,6 +769,71 @@ fn package_eligibility_preserves_all_existing_policy_restrictions() {
     assert_eq!(policy_with_package(&after, &hash), after);
 }
 
+#[test]
+fn default_policy_packages_are_appended_once_in_order() {
+    let before = policy(60_000);
+    let first = Digest32::from_bytes([7; 32]);
+    let second = Digest32::from_bytes([8; 32]);
+    let after = bloom_machine_client::policy_with_packages(
+        &before,
+        &[first.clone(), second.clone(), first.clone()],
+    );
+    let mut expected = before.clone();
+    expected.allowed_petal_packages.extend([first, second]);
+    assert_eq!(after, expected);
+}
+
+#[tokio::test]
+async fn default_wallet_first_proposal_allows_setup_packages_together() {
+    let temp = tempfile::tempdir().unwrap();
+    let fixture = broker_fixture(true);
+    let requested = Digest32::from_bytes([7; 32]);
+    let chosen = Digest32::from_bytes([8; 32]);
+    let defaults: bloom_vfs::handlers::DefaultPolicyPackages = {
+        let chosen = chosen.clone();
+        Arc::new(move |wallet: &str| {
+            if wallet == "alice" {
+                vec![chosen.clone()]
+            } else {
+                Vec::new()
+            }
+        })
+    };
+    let handler = eligibility_handler(temp.path(), fixture.clone())
+        .with_default_policy_packages(defaults.clone());
+    assert!(
+        matches!(handler.ensure_petal_eligibility("alice", &requested).await,
+        Err(HandlerError::Backend(message)) if message.contains("SERVICE_UNAVAILABLE"))
+    );
+    let PetalEligibility::AwaitingPolicyApproval(pending) = handler
+        .ensure_petal_eligibility("alice", &requested)
+        .await
+        .unwrap()
+    else {
+        panic!("owner approval must be required");
+    };
+    assert!(pending.includes_requested_package);
+    drop(handler);
+    fixture.complete.store(true, Ordering::SeqCst);
+    let restarted =
+        eligibility_handler(temp.path(), fixture.clone()).with_default_policy_packages(defaults);
+    let PetalEligibility::Allowed(snapshot) = restarted
+        .ensure_petal_packages_allowed("alice", &[requested.clone(), chosen.clone()])
+        .await
+        .unwrap()
+    else {
+        panic!("one completed ceremony must allow every setup package");
+    };
+    assert_eq!(
+        snapshot.canonical_policy.decode(),
+        serde_jcs::to_vec(&bloom_machine_client::policy_with_packages(
+            &policy(60_000),
+            &[requested, chosen]
+        ))
+        .unwrap()
+    );
+}
+
 fn eligibility_handler(temp: &std::path::Path, fixture: Arc<BrokerFixture>) -> WalletsHandler {
     let broker = MachineBrokerClient::new(fixture);
     WalletsHandler::new(
