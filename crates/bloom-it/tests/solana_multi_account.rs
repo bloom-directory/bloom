@@ -713,11 +713,24 @@ async fn two_active_solana_children_select_sign_and_reconcile_independently() ->
         .write(&VfsPath::parse(&format!("/{retry_path}")).unwrap(), b"y\n")
         .await
         .map_err(|e| anyhow!("confirm via advertised retry_path {retry_path}: {e}"))?;
+    let numbered_sent = daemon
+        .vfs
+        .list(&VfsPath::parse("/wallets/alice/1/chains/solana-local/outbox/sent").unwrap())
+        .await
+        .map_err(|e| anyhow!("list account 1 sent after numbered confirm: {e}"))?;
+    assert_eq!(
+        numbered_sent.len(),
+        1,
+        "the numbered confirm must create exactly one sent entry"
+    );
+    let numbered_sent_id = numbered_sent[0].name.clone();
     let mut numbered_receipt = None;
     for _ in 0..60 {
         if let Ok(value) = read_json(
             &daemon,
-            &format!("/wallets/alice/1/chains/solana-local/outbox/sent/{numbered_id}/receipt.json"),
+            &format!(
+                "/wallets/alice/1/chains/solana-local/outbox/sent/{numbered_sent_id}/receipt.json"
+            ),
         )
         .await
             && value["confirmation_status"].as_str() == Some("finalized")
@@ -744,12 +757,12 @@ async fn two_active_solana_children_select_sign_and_reconcile_independently() ->
     // The numbered transfer lives in account 1's outbox view; the
     // wallet-level view is account 0's and must not show it.
     let sign_calls_before = broker.sign_calls.lock().len();
-    let sent_before = daemon
+    let sent_entries_before = daemon
         .vfs
         .list(&VfsPath::parse("/wallets/alice/1/chains/solana-local/outbox/sent").unwrap())
         .await
-        .map_err(|e| anyhow!("list account 1 sent: {e}"))?
-        .len();
+        .map_err(|e| anyhow!("list account 1 sent: {e}"))?;
+    let sent_before = sent_entries_before.len();
     let wallet_sent_before = daemon
         .vfs
         .list(&VfsPath::parse("/wallets/alice/chains/solana-local/outbox/sent").unwrap())
@@ -881,9 +894,14 @@ async fn two_active_solana_children_select_sign_and_reconcile_independently() ->
         .map_err(|e| anyhow!("confirm: {e}"))?;
     println!("    confirm accepted");
 
-    // 9. The Broker was asked to sign with account 1's key, and with exactly
-    //    the staged bytes.
-    step("9", "the signing call named account 1 and the staged bytes");
+    // 9. The Broker was asked to sign with account 1's key and with exactly
+    //    the message persisted for broadcast. Confirmation may replace the
+    //    original pending entry with a fresh-blockhash successor, but it must
+    //    preserve every reviewed transfer fact.
+    step(
+        "9",
+        "the signing call named account 1 and the persisted broadcast bytes",
+    );
     let calls = broker.sign_calls.lock().clone();
     assert_eq!(
         calls.len(),
@@ -896,10 +914,46 @@ async fn two_active_solana_children_select_sign_and_reconcile_independently() ->
         locator, &account1.key_ref.locator,
         "the wrong child was asked to sign"
     );
-    let staged_message = b64_decode(staged["message_b64"].as_str().unwrap());
+    let sent_after_confirm = daemon
+        .vfs
+        .list(&VfsPath::parse("/wallets/alice/1/chains/solana-local/outbox/sent").unwrap())
+        .await
+        .map_err(|e| anyhow!("list account 1 sent after confirm: {e}"))?;
+    let sent_id = sent_after_confirm
+        .iter()
+        .find(|entry| {
+            sent_entries_before
+                .iter()
+                .all(|previous| previous.name != entry.name)
+        })
+        .ok_or_else(|| anyhow!("confirm did not create a new sent entry"))?
+        .name
+        .clone();
+    let sent_intent = read_json(
+        &daemon,
+        &format!("/wallets/alice/1/chains/solana-local/outbox/sent/{sent_id}/intent.json"),
+    )
+    .await?;
+    for fact in [
+        "wallet",
+        "chain",
+        "fee_payer",
+        "account_fingerprint",
+        "account_derivation_path",
+        "destination",
+        "lamports",
+        "fee_lamports",
+        "genesis_hash",
+    ] {
+        assert_eq!(
+            sent_intent[fact], staged[fact],
+            "approval refresh changed reviewed transfer fact {fact}"
+        );
+    }
+    let signed_message = b64_decode(sent_intent["message_b64"].as_str().unwrap());
     assert_eq!(
-        signed_bytes, &staged_message,
-        "the Broker must sign the staged message bytes verbatim"
+        signed_bytes, &signed_message,
+        "the Broker must sign the message persisted for broadcast"
     );
 
     // 10. Independent signature verification over the RAW message, and the
@@ -910,7 +964,9 @@ async fn two_active_solana_children_select_sign_and_reconcile_independently() ->
     );
     let broadcast = read_json(
         &daemon,
-        &format!("/wallets/alice/1/chains/solana-local/outbox/sent/{id}/broadcast_attempted.json"),
+        &format!(
+            "/wallets/alice/1/chains/solana-local/outbox/sent/{sent_id}/broadcast_attempted.json"
+        ),
     )
     .await?;
     let signature_b58 = broadcast["signature"]
@@ -927,7 +983,7 @@ async fn two_active_solana_children_select_sign_and_reconcile_independently() ->
     use ed25519_dalek::Verifier as _;
     let account1_key = ed25519_dalek::VerifyingKey::from_bytes(&account1.pubkey)?;
     account1_key
-        .verify(&staged_message, &signature)
+        .verify(&signed_message, &signature)
         .map_err(|e| anyhow!("signature must verify over the raw message: {e}"))?;
     println!("    verifies against account 1 over the raw message");
 
@@ -935,13 +991,13 @@ async fn two_active_solana_children_select_sign_and_reconcile_independently() ->
     // selection bug fails.
     let account0_key = ed25519_dalek::VerifyingKey::from_bytes(&account0.pubkey)?;
     assert!(
-        account0_key.verify(&staged_message, &signature).is_err(),
+        account0_key.verify(&signed_message, &signature).is_err(),
         "SECURITY: the signature verifies against the account that was not selected"
     );
     println!("    does not verify against account 0");
 
     // Solana signs the serialized message with Ed25519, not SHA-256 of it.
-    let hashed = Sha256::digest(&staged_message);
+    let hashed = Sha256::digest(&signed_message);
     assert!(
         account1_key.verify(&hashed, &signature).is_err(),
         "signature must not verify over SHA-256(message)"
@@ -955,7 +1011,7 @@ async fn two_active_solana_children_select_sign_and_reconcile_independently() ->
     for _ in 0..60 {
         if let Ok(value) = read_json(
             &daemon,
-            &format!("/wallets/alice/1/chains/solana-local/outbox/sent/{id}/receipt.json"),
+            &format!("/wallets/alice/1/chains/solana-local/outbox/sent/{sent_id}/receipt.json"),
         )
         .await
             && value["confirmation_status"].as_str() == Some("finalized")
@@ -1033,7 +1089,7 @@ async fn two_active_solana_children_select_sign_and_reconcile_independently() ->
         .read_in_state(
             "alice",
             "solana-local",
-            &id,
+            &sent_id,
             bloom_solana_tx::outbox::SolanaOutboxState::Sent,
         )
         .map_err(|e| anyhow!("reopened entry must still be sent: {e}"))?;
@@ -1051,7 +1107,7 @@ async fn two_active_solana_children_select_sign_and_reconcile_independently() ->
             .read_in_state(
                 "alice",
                 "solana-local",
-                &id,
+                &sent_id,
                 bloom_solana_tx::outbox::SolanaOutboxState::Pending,
             )
             .is_err(),
@@ -1059,7 +1115,7 @@ async fn two_active_solana_children_select_sign_and_reconcile_independently() ->
     );
     let receipt_after = read_json(
         &daemon,
-        &format!("/wallets/alice/1/chains/solana-local/outbox/sent/{id}/receipt.json"),
+        &format!("/wallets/alice/1/chains/solana-local/outbox/sent/{sent_id}/receipt.json"),
     )
     .await?;
     assert_eq!(
