@@ -81,6 +81,22 @@
       ],
       "installer_key_id": "unsigned-template",
       "installer_signature": ""
+    },
+    {
+      "subject": {
+        "kind": "system",
+        "component_id": "bloom-machine",
+        "operation_class": "solana.transfer.confirm"
+      },
+      "publisher": "bloom-installer",
+      "operation_classes": [
+        {
+          "operation_class": "solana.native-transfer",
+          "fee_asset": { "chain": "solana", "asset": "native" }
+        }
+      ],
+      "installer_key_id": "unsigned-template",
+      "installer_signature": ""
     }
   ]
 }
