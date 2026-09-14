@@ -32,9 +32,6 @@ use tempo_alloy::primitives::transaction::{AASigned, PrimitiveSignature, TempoSi
 /// The `sign-hash` intent string every Tempo MPP host signature is authorized under.
 pub const MPP_SIGN_INTENT: &str = "paid-http.mpp.sign";
 
-/// Total deadline for Tempo session preparation, including all provider RPCs.
-const SESSION_PREPARATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-
 #[async_trait]
 pub trait PaymentBackend: Send + Sync {
     fn name(&self) -> &'static str;
@@ -474,7 +471,6 @@ impl PaymentBackend for RealMppBackend {
                             &payment_challenge,
                             &signer,
                             &rpc_url,
-                            SESSION_PREPARATION_TIMEOUT,
                             policy.payments.sessions.max_deposit_usd.and_then(|usd| {
                                 usd_to_atomic_units(challenge.asset.as_deref(), usd)
                             }),
@@ -574,23 +570,6 @@ async fn prepare_charge_credential(
 }
 
 async fn prepare_session_credential(
-    challenge: &mpp::PaymentChallenge,
-    signer: &DraftMppSigner,
-    rpc_url: &str,
-    timeout: std::time::Duration,
-    max_deposit: Option<u128>,
-) -> Result<mpp::PaymentCredential, mpp::MppError> {
-    // Alloy uses a different reqwest version from the merchant client. Bound
-    // the entire preparation so every internal RPC and retry shares a deadline.
-    tokio::time::timeout(
-        timeout,
-        prepare_session_credential_inner(challenge, signer, rpc_url, max_deposit),
-    )
-    .await
-    .map_err(|_| mpp::MppError::Http("Tempo session preparation timed out".to_owned()))?
-}
-
-async fn prepare_session_credential_inner(
     challenge: &mpp::PaymentChallenge,
     signer: &DraftMppSigner,
     rpc_url: &str,
@@ -711,66 +690,6 @@ mod tests {
     use mpp::client::tempo::signing::{TempoSigningMode, sign_and_encode_async};
     use std::sync::Mutex;
     use tempo_alloy::primitives::transaction::Call;
-
-    #[tokio::test]
-    async fn session_preparation_bounds_a_silent_rpc() {
-        use std::time::Duration;
-        use tokio::io::AsyncReadExt;
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
-        let (seen_tx, seen_rx) = tokio::sync::oneshot::channel();
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let mut buf = [0u8; 4096];
-            assert!(stream.read(&mut buf).await.unwrap() > 0);
-            let _ = seen_tx.send(());
-            std::future::pending::<()>().await;
-            drop(stream);
-        });
-        let challenge = mpp::PaymentChallenge::new(
-            "session-timeout",
-            "merchant.test",
-            "tempo",
-            "session",
-            mpp::Base64UrlJson::from_value(&serde_json::json!({
-                "amount": "1",
-                "currency": format!("{:#x}", Address::repeat_byte(0x33)),
-                "recipient": format!("{:#x}", Address::repeat_byte(0x22)),
-                "suggestedDeposit": "1000",
-                "methodDetails": { "chainId": 42431 }
-            }))
-            .unwrap(),
-        );
-        let signer = DraftMppSigner::new(Address::repeat_byte(0x11), Some(42431));
-        assert_eq!(super::SESSION_PREPARATION_TIMEOUT, Duration::from_secs(30));
-        let result = tokio::time::timeout(
-            Duration::from_secs(2),
-            super::prepare_session_credential(
-                &challenge,
-                &signer,
-                &url,
-                Duration::from_millis(50),
-                Some(1000),
-            ),
-        )
-        .await;
-        server.abort();
-        let _ = server.await;
-        seen_rx
-            .await
-            .expect("preparation must actually contact the RPC");
-        assert!(
-            result.is_ok(),
-            "Tempo RPC bypassed the preparation deadline"
-        );
-        assert!(
-            result
-                .unwrap()
-                .unwrap_err()
-                .to_string()
-                .contains("session preparation timed out")
-        );
-    }
 
     #[derive(Default)]
     struct ExactHost(Mutex<Vec<Vec<u8>>>);
