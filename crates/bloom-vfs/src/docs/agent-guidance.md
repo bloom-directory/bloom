@@ -249,7 +249,6 @@ Reusable authority is Broker-owned and projected under:
 
 ```text
 wallets/<wallet>/sealed-approvals/
-wallets/<wallet>/capabilities/
 ```
 
 Read the active approval, scope, limits, expiry, and remaining capacity before
@@ -294,3 +293,14 @@ reads: inspect the request plan, selected payment protocol, maximum amount,
 wallet, and approval projection before confirming. Keep vendor-specific request
 syntax in the relevant Petal or request documentation rather than assuming a
 provider contract from this root guide.
+
+A paid request's confirm and cancel operations are serialized. Once execution
+has started, cancellation cannot undo the payment. A timeout or interrupted
+confirmation does not prove non-payment: inspect the exact request's receipt
+and merchant outcome before taking further action. Before transmission, the
+existing receipt records the full possible charge as unresolved. Unresolved
+charges remain in recorded spending, including after a restart or timeout;
+receiving a response updates the same receipt without counting it twice. Other
+requests can proceed within any remaining budget. Do not repeat an unresolved
+payment by restaging it. A failed merchant retry still counts toward recorded
+spending.
