@@ -76,7 +76,6 @@ services:
     profiles: ["fork"]
     container_name: bloom-fork-driver
     environment:
-      - BLOOM_TEST_WALLET_PASSPHRASE=test
       - BASE_FORK_INTERNAL_URL=http://anvil-fork:8545
       - RUST_LOG=info
     command: ["bash", "tests/docker/test_fork_mount.sh"]
@@ -111,7 +110,6 @@ services:
       mempool-mock:
         condition: service_healthy
     environment:
-      - BLOOM_TEST_WALLET_PASSPHRASE=test
       - BASE_FORK_INTERNAL_URL=http://anvil-fork:8545
       - MEMPOOL_MOCK_WS_URL=ws://mempool-mock:9551
       - RUST_LOG=info
