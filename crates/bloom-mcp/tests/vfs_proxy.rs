@@ -26,8 +26,8 @@ const BIG_LEN: usize = 2 * 1024 * 1024 + 7;
 
 /// A handler with one of each thing the VFS can hold: a UTF-8 file, a binary
 /// file, an oversized file, a file whose name is full of URI metacharacters, a
-/// writable sink, the projection that sink produces, and — modelling the
-/// wallet outbox control files — a file whose *read* performs an action.
+/// writable sink, the projection that sink produces, and a file whose handler
+/// declares its *read* side-effecting (as a Petal route can).
 #[derive(Default)]
 struct ProbeHandler {
     latest: Mutex<Option<Vec<u8>>>,
@@ -91,7 +91,7 @@ impl Handler for ProbeHandler {
         }
     }
 
-    /// The whole point of the flag: reading `confirm` *is* the broadcast.
+    /// The whole point of the flag: reading `confirm` here *is* the action.
     fn is_read_side_effecting(&self, path: &VfsPath) -> bool {
         path.segments().last().map(String::as_str) == Some("confirm")
     }
@@ -133,11 +133,74 @@ impl Handler for ProbeHandler {
     }
 }
 
+const OUTBOX_PENDING: &str = "/wallets/alice/chains/base/outbox/pending/0001";
+const OUTBOX_CONTROLS: [&str; 4] = ["confirm", "confirm.override", "replace", "cancel"];
+
+/// The shape of the wallet handler's outbox: a pending entry's controls are
+/// write-only sinks (mode 0o644, nothing on disk to read) that the handler
+/// still flags `read_side_effecting` as defense in depth, beside an inert
+/// `intent.json` artifact. Only a write acts.
+#[derive(Default)]
+struct OutboxHandler {
+    reads: std::sync::atomic::AtomicUsize,
+    writes: Mutex<Vec<String>>,
+}
+
+impl OutboxHandler {
+    /// `<w>/chains/<c>/outbox/pending/<id>/<leaf>` under the `wallets` mount.
+    fn pending_leaf(path: &VfsPath) -> Option<&str> {
+        match path.segments() {
+            [_, chains, _, outbox, pending, _, leaf]
+                if chains == "chains" && outbox == "outbox" && pending == "pending" =>
+            {
+                Some(leaf.as_str())
+            }
+            _ => None,
+        }
+    }
+}
+
+#[async_trait]
+impl Handler for OutboxHandler {
+    async fn lookup(&self, path: &VfsPath) -> Result<Entry, HandlerError> {
+        match Self::pending_leaf(path) {
+            Some(leaf) if OUTBOX_CONTROLS.contains(&leaf) => Ok(Entry::writable_file(leaf)),
+            Some("intent.json") => Ok(Entry::read_only_file("intent.json")),
+            _ => Err(HandlerError::not_found(path.to_string_path())),
+        }
+    }
+
+    /// Reading a control opens no artifact and acts on nothing, as in the
+    /// wallet handler.
+    async fn read(&self, path: &VfsPath) -> Result<Vec<u8>, HandlerError> {
+        self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        match Self::pending_leaf(path) {
+            Some("intent.json") => Ok(b"{}".to_vec()),
+            _ => Err(HandlerError::not_found(path.to_string_path())),
+        }
+    }
+
+    async fn write(&self, path: &VfsPath, _data: &[u8]) -> Result<(), HandlerError> {
+        match Self::pending_leaf(path) {
+            Some(leaf) if OUTBOX_CONTROLS.contains(&leaf) => {
+                self.writes.lock().unwrap().push(leaf.to_owned());
+                Ok(())
+            }
+            _ => Err(HandlerError::PermissionDenied),
+        }
+    }
+
+    fn is_read_side_effecting(&self, path: &VfsPath) -> bool {
+        Self::pending_leaf(path).is_some_and(|leaf| OUTBOX_CONTROLS.contains(&leaf))
+    }
+}
+
 /// A live daemon endpoint plus an MCP server pointed at it.
 struct Harness {
     server: McpServer,
     ipc: IpcServer,
     probe: Arc<ProbeHandler>,
+    outbox: Arc<OutboxHandler>,
     handle: tokio::task::JoinHandle<()>,
     _dir: tempfile::TempDir,
 }
@@ -147,7 +210,11 @@ impl Harness {
         let dir = tempfile::tempdir().expect("temp dir");
         let socket = dir.path().join("private-run/bloom.sock");
         let probe = Arc::new(ProbeHandler::default());
-        let vfs = Vfs::builder().mount("probe", probe.clone()).build();
+        let outbox = Arc::new(OutboxHandler::default());
+        let vfs = Vfs::builder()
+            .mount("probe", probe.clone())
+            .mount("wallets", outbox.clone())
+            .build();
         let ipc = IpcServer::new(vfs, "0.0.0-test", vec!["ethereum".into()]);
         let serving = ipc.clone();
         let serving_socket = socket.clone();
@@ -164,6 +231,7 @@ impl Harness {
             server: McpServer::new(Arc::new(IpcVfsCommands::new(socket)), "0.0.0-test"),
             ipc,
             probe,
+            outbox,
             handle,
             _dir: dir,
         }
@@ -501,9 +569,9 @@ async fn resource_uris_round_trip_paths_containing_reserved_characters() {
     harness.stop().await;
 }
 
-/// Clients fetch resources without asking a human. The few VFS paths whose
-/// read signs or broadcasts must therefore be unreachable that way — and must
-/// still be reachable through the tool, which a client can gate.
+/// Clients fetch resources without asking a human. A path whose handler
+/// declares its read side-effecting must therefore be unreachable that way —
+/// and must still be reachable through the tool, which a client can gate.
 #[tokio::test]
 async fn a_side_effecting_read_is_not_an_inert_resource_but_is_still_a_tool() {
     let harness = Harness::start().await;
@@ -541,6 +609,82 @@ async fn a_side_effecting_read_is_not_an_inert_resource_but_is_still_a_tool() {
         .await;
     assert_eq!(performed["content"][0]["text"], "broadcast\n");
     assert_eq!(harness.confirms(), 1, "the tool must still do the work");
+
+    harness.stop().await;
+}
+
+/// Wallet outbox controls are write-only sinks, not readable resources:
+/// nothing advertises them as resources, `resources/read` never reads them,
+/// and no refusal claims a read would act. Only a write does.
+#[tokio::test]
+async fn outbox_controls_are_write_only_sinks_not_readable_resources() {
+    let harness = Harness::start().await;
+    let reads = || {
+        harness
+            .outbox
+            .reads
+            .load(std::sync::atomic::Ordering::SeqCst)
+    };
+
+    let listed = harness.request("resources/list", json!({})).await;
+    for resource in listed["result"]["resources"].as_array().unwrap() {
+        let uri = resource["uri"].as_str().unwrap();
+        assert!(!uri.contains("outbox"), "{uri}");
+    }
+    let templates = harness.request("resources/templates/list", json!({})).await;
+    let description = templates["result"]["resourceTemplates"][0]["description"]
+        .as_str()
+        .unwrap();
+    assert!(description.contains("write-only sinks"), "{description}");
+    assert!(
+        !description.contains("performs the action"),
+        "{description}"
+    );
+
+    for control in OUTBOX_CONTROLS {
+        let path = format!("{OUTBOX_PENDING}/{control}");
+        let stat = harness.ok_tool("vfs_stat", json!({"path": path})).await;
+        let entry = &stat["structuredContent"]["entry"];
+        assert_eq!(entry["read_side_effecting"], true, "{entry}");
+        assert_eq!(entry["mode"], 0o644, "a control is a writable sink");
+
+        let refused = harness
+            .request("resources/read", json!({"uri": format!("bloom://{path}")}))
+            .await;
+        assert_eq!(refused["error"]["code"], -32010, "{refused}");
+        let message = refused["error"]["message"].as_str().unwrap();
+        for false_claim in ["sign", "broadcast", "performs"] {
+            assert!(!message.contains(false_claim), "{message}");
+        }
+    }
+    assert_eq!(reads(), 0, "resources/read must never read a control");
+
+    // The inert artifact beside the controls is still a resource.
+    let intent = harness
+        .request(
+            "resources/read",
+            json!({"uri": format!("bloom://{OUTBOX_PENDING}/intent.json")}),
+        )
+        .await;
+    assert_eq!(intent["result"]["contents"][0]["text"], "{}", "{intent}");
+
+    // A deliberate tool read of a control acts on nothing; a write is what
+    // reaches the sink.
+    let (code, _) = harness
+        .tool_error(
+            "vfs_read",
+            json!({"path": format!("{OUTBOX_PENDING}/confirm")}),
+        )
+        .await;
+    assert_eq!(code, -32004);
+    assert!(harness.outbox.writes.lock().unwrap().is_empty());
+    harness
+        .ok_tool(
+            "vfs_write",
+            json!({"path": format!("{OUTBOX_PENDING}/confirm"), "text": "y"}),
+        )
+        .await;
+    assert_eq!(*harness.outbox.writes.lock().unwrap(), ["confirm"]);
 
     harness.stop().await;
 }

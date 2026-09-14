@@ -2355,8 +2355,8 @@ mod tests {
         }
     }
 
-    /// Models the outbox control files: reading `confirm` signs and
-    /// broadcasts, while the sibling status file is inert.
+    /// Models a handler that flags `confirm` `read_side_effecting` while the
+    /// sibling status file is inert.
     struct SideEffectingReadHandler;
 
     #[async_trait::async_trait]

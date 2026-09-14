@@ -71,10 +71,13 @@ is implemented, so the claim holds for every revision listed.
 | `vfs_write_then_stat` | `write_with_lookup` | (staging flows)   | false          |
 
 `vfs_read` is not marked read-only on purpose. Most of the VFS is inert data,
-but a few paths act when read — a wallet outbox `confirm`, `confirm.override`,
-`replace`, or `cancel` file signs and broadcasts on read. `vfs_stat` reports
-this per path as `read_side_effecting`, and is itself always inert, so a client
-can stat before it reads and prompt when the answer is `true`.
+but a handler may declare a path's read side-effecting (a Petal route can).
+`vfs_stat` reports this per path as `read_side_effecting`, and is itself always
+inert, so a client can stat before it reads and prompt when the answer is
+`true`. The wallet outbox controls (`confirm`, `confirm.override`, `replace`,
+`cancel`) also report `true`, defensively, but they are write-only sinks:
+reading one does not act, and only a `vfs_write` confirms, replaces, or
+cancels.
 
 Reads return UTF-8 as text and anything else as a base64 blob, so binary
 artifacts survive byte-for-byte. Writes take either `text` or `bytes_b64`.
@@ -106,9 +109,11 @@ separator, is rejected rather than read as some other path.
 
 MCP clients treat resources as inert context and commonly fetch them without
 asking a human. Bloom therefore refuses to serve a side-effecting path as a
-resource: `resources/read` stats the path first and answers `-32010` if reading
-it would act, naming `vfs_read` as the way to do it deliberately. No VFS
-functionality is lost — the tool still performs the read.
+resource: `resources/read` stats the path first and answers `-32010` if it is
+flagged `read_side_effecting`, naming `vfs_read` as the way to read it
+deliberately. The same refusal keeps the write-only outbox controls from being
+served as readable resources. No VFS functionality is lost — the tool still
+performs the read.
 
 ## Error codes
 
