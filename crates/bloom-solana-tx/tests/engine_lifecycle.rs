@@ -1,7 +1,7 @@
 //! End-to-end transfer lifecycle: stage → sign → broadcast, driven by a stub
 //! Solana RPC node and a real-Ed25519 Broker fixture.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use bloom_broker_api::{
     ApprovalPrepareRequest, ApprovalPrepareState, Base64UrlBytes, CryptoSuite, DecimalU64,
@@ -143,6 +143,7 @@ impl MachineBrokerService for BrokerFixture {
                         canonical_public_key: Base64UrlBytes::from_bytes(&self.child_pubkey()),
                         addresses: vec![],
                         supported_crypto_suites: vec![CryptoSuite::Ed25519Message],
+                        petal_scope_expires_at_ms: None,
                     }))
                 }
                 MachineBrokerRequest::SigningSign(sign_request) => {
@@ -511,6 +512,7 @@ async fn full_transfer_lifecycle_stage_sign_broadcast() {
         }
         other => panic!("expected ApprovalRequired, got {other:?}"),
     };
+    assert_eq!(broker.last_prepared_expiry(), 3_601_100);
     // Still pending: no signature recorded yet.
     assert!(
         outbox
@@ -1547,15 +1549,14 @@ async fn restage_migrates_the_approval_before_retiring_its_predecessor() {
             bloom_solana_tx::outbox::SolanaOutboxState::Pending,
         )
         .unwrap();
-    let challenge =
-        SolanaOutbox::approval_challenge(
-            &original,
-            "beef",
-            "http://localhost/ceremony",
-            5_000,
-            None,
-        )
-            .unwrap();
+    let challenge = SolanaOutbox::approval_challenge(
+        &original,
+        "beef",
+        "http://localhost/ceremony",
+        5_000,
+        None,
+    )
+    .unwrap();
     outbox.write_approval_challenge(&entry, &challenge).unwrap();
 
     // Advance past the staged window so the restage produces a real successor.
@@ -1816,8 +1817,7 @@ async fn restaging_a_retired_id_again_leaves_its_successor_alone() {
             },
         )
         .unwrap();
-    let newer =
-        SolanaOutbox::approval_challenge(&successor, "newer", "http://x", 1, None).unwrap();
+    let newer = SolanaOutbox::approval_challenge(&successor, "newer", "http://x", 1, None).unwrap();
     outbox.write_approval_challenge(&live, &newer).unwrap();
 
     let again = engine

@@ -415,11 +415,11 @@ fn build(staging: &Path, output: &Path, key: &Path) -> std::process::Output {
         &compatibility,
         compatibility_source
             .replace(
-                "broker_commit = \"57cbc6c6fb3b64899061f54b1f3dd68c827b16e1\"",
+                "broker_commit = \"0c29e057e3e13186b704beb3324fe9e3f371e9ce\"",
                 &format!("broker_commit = \"{}\"", "22".repeat(20)),
             )
             .replace(
-                "signer_commit = \"941dd376568b52ccd269ecf495bcff7dcd9af504\"",
+                "signer_commit = \"c1cf78270815f27f39a81e913e2cebf7828832f2\"",
                 &format!("signer_commit = \"{}\"", "33".repeat(20)),
             ),
     )

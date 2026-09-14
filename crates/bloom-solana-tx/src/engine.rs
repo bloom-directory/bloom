@@ -38,7 +38,9 @@ struct SimulationArtifact<'a> {
 }
 
 /// Default approval/signing TTL for a staged transfer (ms).
-const SIGN_TTL_MS: u64 = 60_000;
+// A native transfer approval must survive well beyond the recent-blockhash
+// window; the refreshed selector keeps the immutable economics single-use.
+const SIGN_TTL_MS: u64 = 3_600_000;
 
 /// Conservative estimate of Solana's per-slot duration, used only to turn a
 /// block-height-denominated blockhash validity window into a wall-clock

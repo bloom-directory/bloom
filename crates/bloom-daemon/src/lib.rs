@@ -293,6 +293,12 @@ struct PetalKeyRequestState {
     public_key: Option<bloom_broker_api::KeyPublic>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     reusable_approval_id: Option<bloom_broker_api::Digest32>,
+    /// Increments only when an unapproved ceremony expires or becomes
+    /// orphaned, giving the replacement approval a fresh immutable identity.
+    #[serde(default)]
+    reusable_approval_attempt: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    approval_value_limits: Vec<bloom_broker_api::ValueLimit>,
     /// The installed Petal mount this request ran under, resolved from the
     /// package hash at request time. Old records have none; the session
     /// tree renders them under `unknown-<hash prefix>`.
@@ -1701,6 +1707,8 @@ impl PetalHost for DaemonPetalHost {
             ceremony_expires_at_ms: prepared.ceremony_expires_at_ms,
             public_key: None,
             reusable_approval_id: None,
+            reusable_approval_attempt: 0,
+            approval_value_limits: req.approval_value_limits,
             petal_mount: self.petal_mount_for_hash(&context.package_hash),
             requested_at_ms: now_ms,
             succeeded_at_ms: None,
@@ -8518,6 +8526,7 @@ ws_url = "wss://example.invalid"
                 canonical_public_key: bloom_broker_api::Base64UrlBytes::from_bytes(&child.spki),
                 addresses: vec![child.address.clone()],
                 supported_crypto_suites: child.suites.clone(),
+                petal_scope_expires_at_ms: None,
             }
         }
 
@@ -9197,6 +9206,7 @@ allowed = ["bloom:vfs.read"]
             supported_crypto_suites: vec![
                 bloom_broker_api::CryptoSuite::Secp256k1Keccak256Recoverable,
             ],
+            petal_scope_expires_at_ms: None,
         }
     }
 
@@ -9240,6 +9250,8 @@ allowed = ["bloom:vfs.read"]
             ceremony_expires_at_ms: bloom_broker_api::DecimalU64::new(0),
             public_key: Some(public),
             reusable_approval_id: Some(bloom_broker_api::Digest32::from_bytes([4; 32])),
+            reusable_approval_attempt: 0,
+            approval_value_limits: Vec::new(),
             petal_mount: petal_mount.map(str::to_owned),
             requested_at_ms,
             succeeded_at_ms: Some(requested_at_ms + 1),

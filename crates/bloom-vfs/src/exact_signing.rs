@@ -1120,18 +1120,6 @@ mod tests {
                             broker_receipt_digest: digest(10),
                         }))
                     }
-                    MachineBrokerRequest::SigningSignBatch(request) => {
-                        Ok(MachineBrokerResponse::SigningSignBatch(SigningResult {
-                            operation_id: request.operation_id,
-                            operation_digest: request.operation_digest,
-                            signatures: vec![NormalizedSignature {
-                                crypto_suite: request.crypto_suite,
-                                bytes: Base64UrlBytes::from_bytes(&[7_u8; 65]),
-                            }],
-                            signer_receipt_digest: digest(9),
-                            broker_receipt_digest: digest(10),
-                        }))
-                    }
                     _ => Err(ProtocolError::new(
                         ProtocolErrorCode::UnknownMethod,
                         "unexpected request",

@@ -94,6 +94,7 @@ impl SolanaBroker {
             canonical_public_key: Base64UrlBytes::from_bytes(&spki(&self.pubkey)),
             addresses: vec![bs58::encode(self.pubkey).into_string()],
             supported_crypto_suites: vec![CryptoSuite::Ed25519Message],
+            petal_scope_expires_at_ms: None,
         }
     }
 
