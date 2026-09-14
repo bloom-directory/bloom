@@ -4287,6 +4287,7 @@ fn exact_evm_sign_request(
         petal_use_claim: None,
         system_use_claim: None,
         claim_assurance_evidence: None,
+        safe_review_payload: None,
         approval_value_limits: Vec::new(),
     })
 }

@@ -217,6 +217,7 @@ impl BrokerExactPayloadSigner {
                 canonical_plan_facts,
                 None,
                 None,
+                None,
             )
             .await;
         let _ = lock.unlock();
@@ -241,6 +242,7 @@ impl BrokerExactPayloadSigner {
         trusted_subject: &ProvenanceSubject,
         claim: &PetalUseClaim,
         claim_assurance_evidence: Option<&[u8]>,
+        safe_review_payload: Option<&[u8]>,
     ) -> Result<ExactPayloadOutcome, String> {
         let parent = state_path
             .parent()
@@ -274,6 +276,7 @@ impl BrokerExactPayloadSigner {
                 canonical_plan_facts,
                 Some(trusted_subject),
                 Some((claim, claim_assurance_evidence)),
+                safe_review_payload,
             )
             .await;
         let _ = lock.unlock();
@@ -293,6 +296,7 @@ impl BrokerExactPayloadSigner {
         canonical_plan_facts: &serde_json::Value,
         trusted_subject: Option<&ProvenanceSubject>,
         petal_claim: Option<(&PetalUseClaim, Option<&[u8]>)>,
+        safe_review_payload: Option<&[u8]>,
     ) -> Result<ExactPayloadOutcome, String> {
         let operation_class_token = Token::new(operation_class.to_owned())
             .map_err(|error| format!("operation class: {error}"))?;
@@ -392,6 +396,7 @@ impl BrokerExactPayloadSigner {
             system_use_claim: None,
             claim_assurance_evidence: petal_claim
                 .and_then(|(_, evidence)| evidence.map(<[u8]>::to_vec)),
+            safe_review_payload: safe_review_payload.map(<[u8]>::to_vec),
             approval_value_limits,
         };
         let mut response = self.broker.sign_exact_payload(request.clone()).await;
@@ -1315,6 +1320,7 @@ mod tests {
                 &subject,
                 &claim,
                 Some(b"assurance"),
+                None,
             )
             .await
             .unwrap();
@@ -1335,6 +1341,7 @@ mod tests {
                 &subject,
                 &claim,
                 Some(b"assurance"),
+                None,
             )
             .await
             .unwrap();
@@ -1359,6 +1366,7 @@ mod tests {
                 &subject,
                 &claim,
                 Some(b"assurance"),
+                None,
             )
             .await
             .unwrap_err();
@@ -1538,6 +1546,7 @@ mod tests {
                 },
                 claim,
                 Some(b"assurance"),
+                None,
             )
             .await
     }
