@@ -393,6 +393,7 @@ fn default_chains() -> BTreeMap<String, ChainSpec> {
             "HyperEVM",
             "HYPE",
         ),
+        evm_chain("arc", 5_042, &["https://rpc.arc-scan.org"], "Arc", "USDC"),
         ChainSpec::anvil_default(),
     ] {
         chains.insert(spec.name.clone(), spec);
@@ -727,7 +728,7 @@ mod tests {
         assert!(cfg.etherscan.is_none());
         assert!(cfg.enso.is_none());
         assert_eq!(cfg.petals.preinstalled, default_preinstalled_petals());
-        assert_eq!(cfg.chains.len(), 13);
+        assert_eq!(cfg.chains.len(), 14);
         assert_eq!(cfg.solana_chains.len(), 1);
         let solana = cfg
             .solana_chains
@@ -759,6 +760,12 @@ mod tests {
         assert_eq!(robinhood.native_symbol, "ETH");
         let hyperliquid = cfg.chains.get("hyperliquid").expect("hyperliquid entry");
         assert_eq!(hyperliquid.chain_id, 999);
+        let arc = cfg.chains.get("arc").expect("Arc entry");
+        assert_eq!(arc.chain_id, 5_042);
+        assert_eq!(arc.rpc_urls, vec!["https://rpc.arc-scan.org"]);
+        assert_eq!(arc.display_name.as_deref(), Some("Arc"));
+        assert_eq!(arc.native_symbol, "USDC");
+        assert_eq!(arc.native_decimals, 18);
         let anvil = cfg.chains.get("anvil").expect("anvil entry");
         assert_eq!(anvil.chain_id, 31337);
         assert!(!anvil.rpc_urls.is_empty());
