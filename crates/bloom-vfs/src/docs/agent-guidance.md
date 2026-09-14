@@ -75,11 +75,12 @@ wallet and account. Account-sensitive operations bind the public-key
 fingerprint and derivation path. Never select by directory order, list
 position, or an address alias.
 
-Use full fingerprints in persistent paths and records. Solana account paths
-are `wallets/<wallet>/chains/<chain>/accounts/<full-fingerprint>/`; the
-chain-level balance alias works only when selection is unambiguous. Unique
-fingerprint prefixes, where accepted as input, are interactive convenience
-only. Resolve ambiguity against `accounts.json`.
+`wallets/<wallet>/accounts.json` is the authenticated Broker projection of a
+BIP-39 wallet's public derived accounts. It includes public fingerprints,
+derivation paths, lifecycle state, supported suites, and chain projections; it
+never contains a mnemonic, seed, passphrase, PRF output, or private child key.
+Do not choose the first account in this list. Choose the numbered account path for the intended sender; wallet-level
+outboxes use account 0.
 
 Each entry in `accounts.json` carries a `number`, and `wallets/<wallet>/<n>/`
 is that account: `account.json` shows its EVM and Solana keys (path, address,
@@ -177,6 +178,22 @@ canonical `accounts/<fingerprint>/` paths once it is not. Bloom will not pick
 another account for you, because spending from the wrong one is not
 recoverable.
 
+Listing accounts, stat-ing any leaf, and reading `address` need only Bloom's
+own projection, so they keep working when a Solana node is unreachable. Only
+`balance*` contacts the chain. If a balance read fails but `address` still
+works, inspect chain health and RPC errors before retrying.
+
+Chain health lives once per chain, not per wallet:
+
+```sh
+cat status/chains/<solana-chain>/status.json   # health, slot, genesis, broadcast posture
+cat status/chains/<solana-chain>/connected
+```
+
+`status.json` still renders when calls fail — the failed fields are `null`
+and `errors` says why. `broadcast.eligible` means an attempt is *permitted*
+(broadcast enabled, genesis verified on every endpoint); it does not promise
+a transaction will land.
 
 ## Creating a wallet
 
@@ -241,6 +258,19 @@ broaden, renew, or revoke authority itself. If fresh approval is required, use
 the central action's `approval_challenge.json` and `retry_path`; do not
 invent a Petal-local approval flow.
 
+For a native Solana transfer, the challenge is projected beside the pending
+wallet transfer instead:
+
+```sh
+cat wallets/<wallet>/chains/<solana-chain>/outbox/pending/<id>/approval_challenge.json
+printf 'confirm\n' > wallets/<wallet>/chains/<solana-chain>/outbox/pending/<id>/confirm
+```
+
+Use the challenge's `retry_path` verbatim after the owner completes its
+`ceremony_url`; verify `tx_id`, `wallet`, `chain`, amount, destination, and
+`expiry_ms` first. `plan_path` and `retry_path` name the outbox the confirm was
+written through: `wallets/<wallet>/<n>/chains/...` for account `n`, the
+wallet-level path for account 0's wallet-level outbox.
 
 ## Updating wallet policy
 

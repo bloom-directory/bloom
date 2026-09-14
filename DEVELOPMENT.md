@@ -277,7 +277,7 @@ bloom wallet import imported-wallet
 ```
 
 The current import profile is passphrase-free and creates the canonical EVM
-child. See [Wallet architecture](./docs/architecture/Wallet.md#bip-39-roots-and-derived-accounts)
+and Solana account-number-zero children. See [Wallet architecture](./docs/architecture/Wallet.md#bip-39-roots-and-derived-accounts)
 for supported inputs, derivation paths, and account-selection invariants.
 
 Import projects the canonical EVM child and the native Solana child

@@ -129,7 +129,7 @@ The custody entrypoint runs these scripts in order:
 |---|---|
 | `scripts/test-triad-projection-fidelity.sh` | Authenticated public projections and custody ceremonies through the real triad and mount |
 | `scripts/test-raw-key-import-transfer.sh` | Imported scalar spends on local Anvil with the expected sender |
-| `scripts/test-bip39-import-transfer.sh` | Canonical EVM derivation, Solana allocation visible after ceremony completion, and imported-root EVM spending |
+| `scripts/test-bip39-import-transfer.sh` | Canonical EVM and Solana children projected together after import, and imported-root EVM spending |
 
 Use disposable test inputs. Import/transfer suites require `anvil`, `cast`,
 and the selected `BLOOM_INTEGRATION_*_BIN` binaries. Successful fixture

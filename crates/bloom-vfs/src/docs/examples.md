@@ -55,6 +55,11 @@ reporting success; listing `sent/` alone does not prove confirmation. A missing
 pending path or transport error is not a reason to repeat the write. Never use
 a glob, list position, or `latest` as action identity.
 
+The wallet-level outbox above spends from account 0. For another account,
+verify `wallets/alice/<n>/account.json` and use
+`wallets/alice/<n>/chains/anvil/outbox/` throughout the same procedure.
+Numbered outboxes expose only actions staged by that account.
+
 ## Creating a wallet
 
 Wallet creation is asynchronous passkey registration:
@@ -94,7 +99,9 @@ cat "$BLOOM/wallets/alice/chains/solana/accounts/$FP/address"
 cat "$BLOOM/wallets/alice/chains/solana/accounts/$FP/balance.json"
 cat "$BLOOM/status/chains/<solana-chain>/status.json"
 
-# 2. Solana new.tx accepts strict JSON. Pin the selected account explicitly.
+# 2. Match the fingerprint to its account number in accounts.json.
+N="<account-number>"
+# Solana new.tx accepts strict JSON. Pin the selected account explicitly.
 #    The scratch file is written in the working directory outside the mount.
 cat > solana-transfer.json <<'JSON'
 {
@@ -103,13 +110,13 @@ cat > solana-transfer.json <<'JSON'
   "account_fingerprint": "<full-fingerprint>"
 }
 JSON
-cp solana-transfer.json "$BLOOM/wallets/alice/chains/solana/outbox/new.tx"
+cp solana-transfer.json "$BLOOM/wallets/alice/$N/chains/solana/outbox/new.tx"
 
 # 3. Inspect the exact resulting action.
-ls "$BLOOM/wallets/alice/chains/solana/outbox/pending/"
+ls "$BLOOM/wallets/alice/$N/chains/solana/outbox/pending/"
 ID="<exact-id>"
-cat "$BLOOM/wallets/alice/chains/solana/outbox/pending/$ID/intent.json"
-cat "$BLOOM/wallets/alice/chains/solana/outbox/pending/$ID/plan.md"
+cat "$BLOOM/wallets/alice/$N/chains/solana/outbox/pending/$ID/intent.json"
+cat "$BLOOM/wallets/alice/$N/chains/solana/outbox/pending/$ID/plan.md"
 ```
 
 Verify that the staged intent names the chosen fingerprint, derivation path,

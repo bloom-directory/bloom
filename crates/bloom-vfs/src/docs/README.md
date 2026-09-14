@@ -66,9 +66,17 @@ Representative paths, relative to the mount:
 | Solana status | `status/chains/<chain>/{status.json,slot,block_height}` |
 
 Braces above abbreviate separate leaves, not action selectors. Solana
-chain-level balance aliases work only with one compatible active child. Use
+chain-level balance aliases resolve to account 0 and fail if its canonical
+child is inactive. Use
 the full fingerprint and derivation path from `accounts.json` for account
 identity; never select by list position.
+
+Numbered accounts live at `wallets/<wallet>/<n>/`: read `account.json` to
+verify the keys, then use `chains/<chain>/outbox/` beneath that account to
+stage and inspect its transactions. Wallet-level outboxes use account 0.
+Account-aware Petals and delegated sessions live beneath the numbered account
+at `petals/<petal>/` and `sessions/<petal>/<key-slot>/`; see the mount
+`AGENTS.md` for account creation, session status, and revocation rules.
 
 ## Writes and authority
 
