@@ -75,7 +75,40 @@ pub struct Vfs {
 /// records the outcome.
 struct PendingEffect {
     correlation_id: String,
-    _slot: tokio::sync::OwnedSemaphorePermit,
+    slot: Option<tokio::sync::OwnedSemaphorePermit>,
+    vfs: Vfs,
+    operation: String,
+    path: VfsPath,
+    completed: std::cell::Cell<bool>,
+}
+
+impl Drop for PendingEffect {
+    fn drop(&mut self) {
+        if self.completed.get() {
+            return;
+        }
+        // Synchronous cancellation records the dispatch outcome before releasing
+        // admission. It does not prove that the external effect failed.
+        if self
+            .vfs
+            .finish_effect(
+                &self.operation,
+                &self.path,
+                Some(&self.correlation_id),
+                "cancelled",
+                serde_json::json!({"effect_outcome": "unknown"}),
+            )
+            .is_err()
+        {
+            // Audit degradation is latched. Keep unresolved admission occupied.
+            if let Some(slot) = self.slot.take() {
+                slot.forget();
+            }
+        }
+        if let Some(cache) = &self.vfs.cache {
+            cache.invalidate(&path_to_cache_key(&self.path));
+        }
+    }
 }
 
 type RootContentFuture = Pin<Box<dyn Future<Output = Vec<u8>> + Send + 'static>>;
@@ -177,8 +210,8 @@ impl Vfs {
     /// effect's intent.
     ///
     /// The returned [`PendingEffect`] must stay alive until
-    /// [`Vfs::finish_effect`] has recorded the outcome; dropping it frees the
-    /// slot for the next effect.
+    /// [`Vfs::finish_effect`] has recorded the outcome. Cancellation records
+    /// an unknown effect outcome before freeing the slot.
     async fn begin_effect(
         &self,
         operation: &str,
@@ -227,7 +260,11 @@ impl Vfs {
         )?;
         Ok(Some(PendingEffect {
             correlation_id,
-            _slot: slot,
+            slot: Some(slot),
+            vfs: self.clone(),
+            operation: operation.to_owned(),
+            path: path.clone(),
+            completed: std::cell::Cell::new(false),
         }))
     }
 
@@ -298,6 +335,9 @@ impl Vfs {
                 "error",
                 serde_json::json!({"error": error.to_string()}),
             )?,
+        }
+        if let Some(effect) = &effect {
+            effect.completed.set(true);
         }
         write_result?;
         if let Some(cache) = &self.cache {
@@ -434,6 +474,9 @@ impl Handler for Vfs {
                     serde_json::json!({"error": error.to_string()}),
                 )?,
             }
+        }
+        if let Some(effect) = &effect {
+            effect.completed.set(true);
         }
         let bytes = read_result?;
 
@@ -1026,6 +1069,86 @@ mod tests {
         assert_eq!(handler.writes.load(Ordering::SeqCst), 0);
         assert_eq!(log.count().unwrap(), 0);
         assert!(log.mutation_degradation().is_some());
+    }
+
+    #[tokio::test]
+    async fn cancelled_effects_record_unknown_outcomes_before_releasing_admission() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = Arc::new(AuditLog::open(dir.path().join("audit.jsonl")).unwrap());
+        struct NeverCompletes(Arc<Notify>);
+        #[async_trait]
+        impl Handler for NeverCompletes {
+            async fn lookup(&self, path: &VfsPath) -> Result<Entry, HandlerError> {
+                Ok(Entry::writable_file(path.to_string_path().as_str()))
+            }
+            fn is_read_side_effecting(&self, _: &VfsPath) -> bool {
+                true
+            }
+            async fn read(&self, _: &VfsPath) -> Result<Vec<u8>, HandlerError> {
+                self.0.notify_one();
+                std::future::pending().await
+            }
+            async fn write(&self, _: &VfsPath, _: &[u8]) -> Result<(), HandlerError> {
+                self.0.notify_one();
+                std::future::pending().await
+            }
+        }
+        let entered = Arc::new(Notify::new());
+        let vfs = Vfs::builder()
+            .mount("k", Arc::new(NeverCompletes(entered.clone())))
+            .with_audit(log.clone())
+            .build();
+        for i in 0..80 {
+            let cloned = vfs.clone();
+            let task = tokio::spawn(async move {
+                let path = VfsPath::parse("/k/x").unwrap();
+                if i % 2 == 0 {
+                    cloned.write(&path, b"x").await
+                } else {
+                    cloned.read(&path).await.map(|_| ())
+                }
+            });
+            entered.notified().await;
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+            assert!(log.pending_effect_correlations().unwrap().is_empty());
+            assert_eq!(
+                vfs.effect_slots.available_permits(),
+                MAX_CONCURRENT_AUDITED_EFFECTS
+            );
+        }
+        assert!(log.mutation_degradation().is_none());
+        let tail = log.tail(1).unwrap();
+        assert_eq!(tail[0].data["details"]["outcome"], "cancelled");
+        assert_eq!(
+            tail[0].data["details"]["result"]["effect_outcome"],
+            "unknown"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_audit_failure_retains_admission_and_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = Arc::new(AuditLog::open(dir.path().join("audit.jsonl")).unwrap());
+        let vfs = Vfs::builder().with_audit(log.clone()).build();
+        let path = VfsPath::parse("/k/x").unwrap();
+        let effect = vfs
+            .begin_effect(AUDIT_KIND_WRITE, &path, b"x")
+            .await
+            .unwrap();
+        log.fail_next_write_for_test();
+        drop(effect);
+        assert_eq!(log.pending_effect_correlations().unwrap().len(), 1);
+        assert_eq!(
+            vfs.effect_slots.available_permits(),
+            MAX_CONCURRENT_AUDITED_EFFECTS - 1
+        );
+        assert!(log.mutation_degradation().is_some());
+        assert!(
+            vfs.begin_effect(AUDIT_KIND_WRITE, &path, b"x")
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

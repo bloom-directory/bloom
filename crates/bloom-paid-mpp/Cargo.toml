@@ -16,6 +16,7 @@ reqwest.workspace = true
 mpp.workspace = true
 tempo-alloy = "=1.8.0"
 tempfile.workspace = true
+tokio.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
