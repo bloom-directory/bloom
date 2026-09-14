@@ -1,8 +1,10 @@
 # Bloom triad release package
 
 `compatibility-v1.toml` is the closed v1 service matrix. It declares each edge
-independently: the Machine–Broker and Broker–Signer authority APIs require
-exactly 1.4, while Signer control and login-session liveness accept 1.0–1.1.
+independently, copying each range from the API crate at the pinned revision:
+the Machine–Broker and Broker–Signer authority APIs each require one exact
+minor, while Signer control and login-session liveness accept a range. The
+`triad_release` tests compare every declared range with those constants.
 Service packages may advance independently when every edge remains inside its
 declared range; incompatible edges fail closed.
 It also records the reviewed Broker, Signer, service-runtime, and

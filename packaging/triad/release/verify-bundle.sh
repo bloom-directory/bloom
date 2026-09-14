@@ -77,16 +77,18 @@ require_compat_value() {
     exit 65
   }
 }
-require_compat_value protocols.machine_broker major 1
-require_compat_value protocols.machine_broker minor_min 4
-require_compat_value protocols.machine_broker minor_max 4
-require_compat_value protocols.broker_signer major 1
-require_compat_value protocols.broker_signer minor_min 4
-require_compat_value protocols.broker_signer minor_max 4
-for support_edge in signer_control session; do
-  require_compat_value "protocols.$support_edge" major 1
-  require_compat_value "protocols.$support_edge" minor_min 0
-  require_compat_value "protocols.$support_edge" minor_max 1
+# Each edge's range is owned by its API crate at the pinned revisions and is
+# compared there by the triad_release tests. The bundle must declare every
+# edge as one well-formed v1 range.
+for edge in machine_broker broker_signer signer_control session; do
+  require_compat_value "protocols.$edge" major 1
+  minor_min="$(compat_value "protocols.$edge" minor_min)"
+  minor_max="$(compat_value "protocols.$edge" minor_max)"
+  [[ "$minor_min" =~ ^(0|[1-9][0-9]{0,4})$ && "$minor_max" =~ ^(0|[1-9][0-9]{0,4})$ ]] &&
+    ((minor_min <= minor_max && minor_max <= 65535)) || {
+    echo "bundle compatibility has invalid protocols.$edge range" >&2
+    exit 65
+  }
 done
 source_revision() {
   local key="$1" value
@@ -112,8 +114,12 @@ signer_revision="$(source_revision BLOOM_SIGNER_SHA)"
   echo "bundle compatibility revision does not match SOURCE_REVISIONS" >&2
   exit 65
 }
-require_compat_value revisions service_runtime_commit '"bc88cc6760b00bbff0c6a6e5f56d42bb03004436"'
-require_compat_value revisions petal_contract_commit '"73c5b06a77599368fbc79fb7947a629b5b4c630e"'
+for dependency in service_runtime_commit petal_contract_commit; do
+  [[ "$(compat_value revisions "$dependency")" =~ ^\"[0-9a-f]{40}\"$ ]] || {
+    echo "bundle compatibility has invalid revisions.$dependency" >&2
+    exit 65
+  }
+done
 for state_owner in machine broker signer; do
   require_compat_value "state.$state_owner" current 1
   require_compat_value "state.$state_owner" downgrade_floor 1
