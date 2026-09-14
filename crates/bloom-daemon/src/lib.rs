@@ -5,6 +5,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod deployment;
 pub mod ipc;
 
 mod ens_resolver;
@@ -900,6 +901,7 @@ impl DaemonPetalHost {
             .map_err(|error| HostError::Invalid(error.to_string()))?;
         let prepared = broker
             .prepare_approval(bloom_broker_api::ApprovalPrepareRequest {
+                evm_review_payloads: Vec::new(),
                 operation_id,
                 terms,
                 canonical_plan_facts_digest: plan_digest,
@@ -2868,7 +2870,11 @@ fn petal_pending_request_matches(
         .unwrap_or(u128::MAX);
     staged.expires_ms > now_ms
         && staged.resolved_execution_origin() == *origin
-        && staged.to.parse::<Address>().ok() == Some(requested_to)
+        && staged
+            .to
+            .as_deref()
+            .and_then(|to| to.parse::<Address>().ok())
+            == Some(requested_to)
         && staged.value_wei.parse::<U256>().ok() == Some(requested_value)
         && staged.data_hex == request.data_hex
         && request.nonce.is_none_or(|nonce| staged.nonce == nonce)
@@ -3607,6 +3613,7 @@ impl AccountPetalMount for AccountPetals {
 /// behind Arc/clone-safe inner types).
 #[derive(Clone)]
 pub struct Daemon {
+    deployment_lock: Arc<tokio::sync::Mutex<()>>,
     pub home: HomeDir,
     pub config: Config,
     pub chains: ChainRegistry,
@@ -4752,6 +4759,7 @@ impl Daemon {
         );
 
         Ok(Self {
+            deployment_lock: Arc::new(tokio::sync::Mutex::new(())),
             home,
             config,
             chains,
@@ -6950,7 +6958,7 @@ mod tests {
             chain: "anvil".into(),
             chain_id: 31337,
             from: "0x0000000000000000000000000000000000000001".into(),
-            to: "0x0000000000000000000000000000000000000002".into(),
+            to: Some("0x0000000000000000000000000000000000000002".into()),
             value_wei: "0".into(),
             data_hex: "0x".into(),
             gas_limit: 21_000,
@@ -6975,7 +6983,7 @@ mod tests {
         let request = EvmTransactionRequest {
             wallet: "alice".into(),
             chain: "anvil".into(),
-            to: staged.to.clone(),
+            to: staged.to.clone().unwrap(),
             value_wei: staged.value_wei.clone(),
             data_hex: staged.data_hex.clone(),
             nonce: None,
@@ -6988,7 +6996,7 @@ mod tests {
             &staged,
             &request,
             &origin,
-            staged.to.parse().unwrap(),
+            staged.to.as_deref().unwrap().parse().unwrap(),
             staged.value_wei.parse().unwrap(),
         ));
         let mut equivalent_fee_request = request.clone();
@@ -6998,7 +7006,7 @@ mod tests {
             &staged,
             &equivalent_fee_request,
             &origin,
-            staged.to.parse().unwrap(),
+            staged.to.as_deref().unwrap().parse().unwrap(),
             staged.value_wei.parse().unwrap(),
         ));
         let mut changed_request = request;
@@ -7007,7 +7015,7 @@ mod tests {
             &staged,
             &changed_request,
             &origin,
-            staged.to.parse().unwrap(),
+            staged.to.as_deref().unwrap().parse().unwrap(),
             staged.value_wei.parse().unwrap(),
         ));
         let entry_dir = daemon
@@ -7019,6 +7027,7 @@ mod tests {
             outcome: "success".into(),
             tx_hash: tx_hash.clone(),
             block_number: Some(42),
+            contract_address: None,
             revert_reason: None,
         };
         daemon
@@ -7599,7 +7608,7 @@ ws_url = "wss://example.invalid"
             chain: "anvil".into(),
             chain_id: 31337,
             from: "0x0000000000000000000000000000000000000001".into(),
-            to: "0x0000000000000000000000000000000000000002".into(),
+            to: Some("0x0000000000000000000000000000000000000002".into()),
             value_wei: "0".into(),
             data_hex: "0x".into(),
             gas_limit: 21000,
@@ -7713,7 +7722,7 @@ ws_url = "wss://example.invalid"
             chain: "anvil".into(),
             chain_id: 31337,
             from: "0x0000000000000000000000000000000000000001".into(),
-            to: "0x0000000000000000000000000000000000000002".into(),
+            to: Some("0x0000000000000000000000000000000000000002".into()),
             value_wei: "0".into(),
             data_hex: "0x".into(),
             gas_limit: 21_000,

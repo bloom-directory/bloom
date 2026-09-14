@@ -112,6 +112,10 @@ impl Reconciler {
                 outcome: if success { "success" } else { "reverted" }.to_string(),
                 tx_hash: format!("{:#x}", se.hash),
                 block_number: receipt.block_number,
+                contract_address: receipt
+                    .contract_address
+                    .filter(|_| success)
+                    .map(|address| format!("{address:#x}")),
                 revert_reason,
             };
             match serde_json::to_vec_pretty(&record) {
@@ -300,7 +304,7 @@ mod tests {
             chain: "anvil".into(),
             chain_id: 31337,
             from: "0x0000000000000000000000000000000000000001".into(),
-            to: "0x0000000000000000000000000000000000000002".into(),
+            to: Some("0x0000000000000000000000000000000000000002".into()),
             value_wei: "0".into(),
             data_hex: "0x".into(),
             gas_limit: 21_000,
@@ -521,6 +525,7 @@ mod tests {
             outcome: "success".into(),
             tx_hash: format!("{:#x}", entry.hash),
             block_number: Some(9),
+            contract_address: None,
             revert_reason: None,
         };
         let bytes = serde_json::to_vec_pretty(&receipt).unwrap();

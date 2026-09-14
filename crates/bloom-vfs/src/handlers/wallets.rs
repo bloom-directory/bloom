@@ -467,7 +467,12 @@ impl WalletsHandler {
             .map_err(err_be)?
             .parse()
             .map_err(|error| HandlerError::invalid(format!("wallet address: {error}")))?;
-        let policy = crate::advisory_evm_policy(&projection, chain).map_err(err_be)?;
+        let client = self
+            .chains
+            .get(chain)
+            .ok_or_else(|| HandlerError::invalid(format!("chain '{chain}' is not configured")))?;
+        let policy = crate::advisory_exact_evm_policy(&projection, chain, client.spec().chain_id)
+            .map_err(err_be)?;
         Ok((address, policy))
     }
 
@@ -5388,7 +5393,7 @@ mod tests {
             chain: "anvil".into(),
             chain_id: 31337,
             from: from.into(),
-            to: "0x0000000000000000000000000000000000000002".into(),
+            to: Some("0x0000000000000000000000000000000000000002".into()),
             value_wei: "0".into(),
             data_hex: "0x".into(),
             gas_limit: 21000,
@@ -7070,7 +7075,7 @@ value = "0""#,
             chain: "anvil".into(),
             chain_id: 31337,
             from: bloom_proto::checksum_address(&f.wallet_addr),
-            to: "0x0000000000000000000000000000000000000002".into(),
+            to: Some("0x0000000000000000000000000000000000000002".into()),
             value_wei: "0".into(),
             data_hex: "0x".into(),
             gas_limit: 21000,
@@ -7693,6 +7698,7 @@ value = "0""#,
             .handler
             .with_broker(Some(MachineBrokerClient::new(broker.clone())));
         let request = ApprovalPrepareRequest {
+            evm_review_payloads: Vec::new(),
             operation_id: OperationId::from_bytes([30; 32]),
             terms: approval_terms("alice", None),
             canonical_plan_facts_digest: digest(31),
@@ -7739,6 +7745,7 @@ value = "0""#,
                 .handler
                 .with_broker(Some(MachineBrokerClient::new(broker.clone())));
             let request = ApprovalPrepareRequest {
+                evm_review_payloads: Vec::new(),
                 operation_id: OperationId::from_bytes([30; 32]),
                 terms: approval_terms("alice", None),
                 canonical_plan_facts_digest: digest(31),
@@ -7770,6 +7777,7 @@ value = "0""#,
             .handler
             .with_broker(Some(MachineBrokerClient::new(broker.clone())));
         let request = ApprovalPrepareRequest {
+            evm_review_payloads: Vec::new(),
             operation_id: OperationId::from_bytes([30; 32]),
             terms: approval_terms("alice", None),
             canonical_plan_facts_digest: digest(31),
@@ -7800,6 +7808,7 @@ value = "0""#,
             .handler
             .with_broker(Some(MachineBrokerClient::new(broker)));
         let request = ApprovalPrepareRequest {
+            evm_review_payloads: Vec::new(),
             operation_id: OperationId::from_bytes([30; 32]),
             terms: approval_terms("alice", None),
             canonical_plan_facts_digest: digest(31),
