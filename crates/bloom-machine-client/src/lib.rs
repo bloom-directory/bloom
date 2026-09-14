@@ -2575,36 +2575,37 @@ mod tests {
         );
     }
 
+    fn value_limit_claim(debit_amount: &str, fee: serde_json::Value) -> PetalUseClaim {
+        serde_json::from_value(serde_json::json!({
+            "package_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+            "route": "r000045",
+            "operation_class": "hyperliquid.withdraw",
+            "crypto_suite": "secp256k1-keccak256-recoverable",
+            "payload_digest": "0100000000000000000000000000000000000000000000000000000000000000",
+            "ordered_hashes": ["0200000000000000000000000000000000000000000000000000000000000000"],
+            "declared_debits": [
+                {
+                    "asset": {"chain": "hyperliquid", "asset": "usdc"},
+                    "amount": debit_amount
+                }
+            ],
+            "declared_destinations": [
+                {"chain": "arbitrum", "destination": "0xa413f398cf58e5127290ad3750ced91af18026ed"}
+            ],
+            "declared_fee": fee,
+            "nonce": "00000000000000000000000000000000",
+            "claim_assurance": {"kind": "machine_asserted"}
+        }))
+        .unwrap()
+    }
+
     #[test]
     fn petal_claim_value_limits_accept_totals_beyond_u128() {
-        let claim = |debit_amount: &str, fee: serde_json::Value| -> PetalUseClaim {
-            serde_json::from_value(serde_json::json!({
-                "package_hash": "0000000000000000000000000000000000000000000000000000000000000000",
-                "route": "r000045",
-                "operation_class": "hyperliquid.withdraw",
-                "crypto_suite": "secp256k1-keccak256-recoverable",
-                "payload_digest": "0100000000000000000000000000000000000000000000000000000000000000",
-                "ordered_hashes": ["0200000000000000000000000000000000000000000000000000000000000000"],
-                "declared_debits": [
-                    {
-                        "asset": {"chain": "hyperliquid", "asset": "usdc"},
-                        "amount": debit_amount
-                    }
-                ],
-                "declared_destinations": [
-                    {"chain": "arbitrum", "destination": "0xa413f398cf58e5127290ad3750ced91af18026ed"}
-                ],
-                "declared_fee": fee,
-                "nonce": "00000000000000000000000000000000",
-                "claim_assurance": {"kind": "machine_asserted"}
-            }))
-            .unwrap()
-        };
         let u128_max = u128::MAX.to_string();
         assert_eq!(u128_max, "340282366920938463463374607431768211455");
 
         // A single declared debit one above u128::MAX.
-        let limits = MachineBrokerClient::petal_claim_value_limits(Some(&claim(
+        let limits = MachineBrokerClient::petal_claim_value_limits(Some(&value_limit_claim(
             "340282366920938463463374607431768211456",
             serde_json::json!({"kind": "none"}),
         )))
@@ -2619,7 +2620,7 @@ mod tests {
         assert!(limits[0].rolling_windows.is_empty());
 
         // A same-asset debit and fee, each u128::MAX, whose sum needs 129 bits.
-        let limits = MachineBrokerClient::petal_claim_value_limits(Some(&claim(
+        let limits = MachineBrokerClient::petal_claim_value_limits(Some(&value_limit_claim(
             &u128_max,
             serde_json::json!({
                 "kind": "fee",
@@ -2637,6 +2638,56 @@ mod tests {
             "680564733841876926926749214863536422910"
         );
         assert!(limits[0].rolling_windows.is_empty());
+    }
+
+    // Decimal literals keep the boundary expectations independent of BigUint.
+    const U256_MAX_DECIMAL: &str =
+        "115792089237316195423570985008687907853269984665640564039457584007913129639935";
+    const U256_MAX_MINUS_ONE_DECIMAL: &str =
+        "115792089237316195423570985008687907853269984665640564039457584007913129639934";
+
+    fn value_limit_boundary_claim(amount: &str, add_as_fee: bool) -> PetalUseClaim {
+        let mut claim = value_limit_claim(amount, serde_json::json!({"kind": "none"}));
+        let one = bloom_broker_api::DecimalU256::parse("1").unwrap();
+        if add_as_fee {
+            claim.declared_fee = DeclaredFee::Fee {
+                chain: claim.declared_debits[0].asset.chain.clone(),
+                asset: claim.declared_debits[0].asset.asset.clone(),
+                amount: one,
+            };
+        } else {
+            claim.declared_debits.push(bloom_broker_api::DeclaredDebit {
+                asset: claim.declared_debits[0].asset.clone(),
+                amount: one,
+            });
+        }
+        claim
+    }
+
+    #[test]
+    fn petal_claim_value_limits_accept_u256_max() {
+        for add_as_fee in [false, true] {
+            let claim = value_limit_boundary_claim(U256_MAX_MINUS_ONE_DECIMAL, add_as_fee);
+            let limits = MachineBrokerClient::petal_claim_value_limits(Some(&claim)).unwrap();
+            assert_eq!(limits.len(), 1);
+            assert_eq!(limits[0].asset, claim.declared_debits[0].asset);
+            assert_eq!(limits[0].lifetime.as_str(), U256_MAX_DECIMAL);
+            assert!(limits[0].rolling_windows.is_empty());
+        }
+    }
+
+    #[test]
+    fn petal_claim_value_limits_reject_u256_max_plus_one() {
+        for add_as_fee in [false, true] {
+            let claim = value_limit_boundary_claim(U256_MAX_DECIMAL, add_as_fee);
+            let error = MachineBrokerClient::petal_claim_value_limits(Some(&claim)).unwrap_err();
+            assert_eq!(error.code, ProtocolErrorCode::ClaimInvalid);
+            assert!(
+                error
+                    .message
+                    .contains("unsigned 256-bit approval limit range")
+            );
+        }
     }
 
     #[test]
