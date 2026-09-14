@@ -4973,44 +4973,32 @@ mod tests {
         }
     }
 
+    fn system_record(operation_class: &str, signature_byte: u8) -> ProvenanceRecord {
+        ProvenanceRecord {
+            subject: ProvenanceSubject::System {
+                component_id: Token::new("bloom-machine").unwrap(),
+                operation_class: Token::new(operation_class).unwrap(),
+            },
+            publisher: Token::new("bloom-installer").unwrap(),
+            petal_lineage: None,
+            operation_classes: vec![ProvenanceOperationClass {
+                operation_class: Token::new(operation_class).unwrap(),
+                fee_asset: Some(ProvenanceFeeAsset {
+                    chain: Token::new("ethereum").unwrap(),
+                    asset: "native".into(),
+                }),
+            }],
+            installer_key_id: Token::new("installer-key").unwrap(),
+            installer_signature: Base64UrlBytes::from_bytes(&[signature_byte; 64]),
+        }
+    }
+
     fn triad_catalog() -> ProvenanceCatalog {
         ProvenanceCatalog {
             schema: bloom_broker_api::PROVENANCE_CATALOG_SCHEMA.into(),
             records: vec![
-                ProvenanceRecord {
-                    subject: ProvenanceSubject::System {
-                        component_id: Token::new("bloom-machine").unwrap(),
-                        operation_class: Token::new("transaction.confirm").unwrap(),
-                    },
-                    publisher: Token::new("bloom-installer").unwrap(),
-                    petal_lineage: None,
-                    operation_classes: vec![ProvenanceOperationClass {
-                        operation_class: Token::new("transaction.confirm").unwrap(),
-                        fee_asset: Some(ProvenanceFeeAsset {
-                            chain: Token::new("ethereum").unwrap(),
-                            asset: "native".into(),
-                        }),
-                    }],
-                    installer_key_id: Token::new("installer-key").unwrap(),
-                    installer_signature: Base64UrlBytes::from_bytes(&[11; 64]),
-                },
-                ProvenanceRecord {
-                    subject: ProvenanceSubject::System {
-                        component_id: Token::new("bloom-machine").unwrap(),
-                        operation_class: Token::new("transaction.cancel").unwrap(),
-                    },
-                    publisher: Token::new("bloom-installer").unwrap(),
-                    petal_lineage: None,
-                    operation_classes: vec![ProvenanceOperationClass {
-                        operation_class: Token::new("transaction.cancel").unwrap(),
-                        fee_asset: Some(ProvenanceFeeAsset {
-                            chain: Token::new("ethereum").unwrap(),
-                            asset: "native".into(),
-                        }),
-                    }],
-                    installer_key_id: Token::new("installer-key").unwrap(),
-                    installer_signature: Base64UrlBytes::from_bytes(&[12; 64]),
-                },
+                system_record("transaction.confirm", 11),
+                system_record("transaction.cancel", 12),
             ],
         }
     }
@@ -6150,30 +6138,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_refused_signature_replaces_the_stale_single_lineage() {
-        let directory = tempfile::tempdir().unwrap();
-        let outbox = Outbox::new(directory.path().join("outbox")).unwrap();
-        let mut staged = fake_staged_1559("triad-refused");
-        staged.wallet = "alice".into();
-        staged.created_ms = now_ms();
-        outbox.write_pending(&staged, "exact EVM review").unwrap();
-        let entry = outbox
-            .read_in_state("alice", "anvil", "triad-refused", OutboxState::Pending)
-            .unwrap();
-        let (engine, fixture, _) = triad_batch_fixture(outbox, false, false);
-        let unsigned = UnsignedEvmTx::Eip1559(TxEip1559 {
-            chain_id: staged.chain_id,
-            nonce: staged.nonce,
-            gas_limit: staged.gas_limit,
-            max_fee_per_gas: 100,
-            max_priority_fee_per_gas: 10,
-            to: TxKind::Call(staged.to.parse().unwrap()),
-            value: U256::ZERO,
-            access_list: AccessList::default(),
-            input: Bytes::new(),
-        });
-        let preimage = TxEngine::unsigned_signing_preimage(&unsigned);
-        let signing_hash = TxEngine::unsigned_signing_hash(&unsigned);
-
+        let (engine, fixture, entry, staged, preimage, signing_hash, _outbox_dir) =
+            single_material("triad-refused", false);
         // First call mints the approval and hands back the ceremony.
         assert!(matches!(
             engine
@@ -6274,35 +6240,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_refused_confirmation_can_be_superseded_by_cancellation() {
-        let directory = tempfile::tempdir().unwrap();
-        let outbox = Outbox::new(directory.path().join("outbox")).unwrap();
-        let mut staged = fake_staged_1559("triad-refused-cancel");
-        staged.wallet = "alice".into();
-        staged.created_ms = now_ms();
-        outbox.write_pending(&staged, "exact EVM review").unwrap();
-        let entry = outbox
-            .read_in_state(
-                "alice",
-                "anvil",
-                "triad-refused-cancel",
-                OutboxState::Pending,
-            )
-            .unwrap();
-        let (engine, fixture, _) = triad_batch_fixture(outbox, false, false);
-        let unsigned = UnsignedEvmTx::Eip1559(TxEip1559 {
-            chain_id: staged.chain_id,
-            nonce: staged.nonce,
-            gas_limit: staged.gas_limit,
-            max_fee_per_gas: 100,
-            max_priority_fee_per_gas: 10,
-            to: TxKind::Call(staged.to.parse().unwrap()),
-            value: U256::ZERO,
-            access_list: AccessList::default(),
-            input: Bytes::new(),
-        });
-        let preimage = TxEngine::unsigned_signing_preimage(&unsigned);
-        let signing_hash = TxEngine::unsigned_signing_hash(&unsigned);
-
+        let (engine, fixture, entry, staged, preimage, signing_hash, _outbox_dir) =
+            single_material("triad-refused-cancel", false);
         assert!(matches!(
             engine
                 .triad_sign_evm_payload(
@@ -6361,30 +6300,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_lost_response_keeps_the_dispatch_marker_because_a_signature_may_exist() {
-        let directory = tempfile::tempdir().unwrap();
-        let outbox = Outbox::new(directory.path().join("outbox")).unwrap();
-        let mut staged = fake_staged_1559("triad-lost");
-        staged.wallet = "alice".into();
-        staged.created_ms = now_ms();
-        outbox.write_pending(&staged, "exact EVM review").unwrap();
-        let entry = outbox
-            .read_in_state("alice", "anvil", "triad-lost", OutboxState::Pending)
-            .unwrap();
-        let (engine, fixture, _) = triad_batch_fixture(outbox, false, true);
-        let unsigned = UnsignedEvmTx::Eip1559(TxEip1559 {
-            chain_id: staged.chain_id,
-            nonce: staged.nonce,
-            gas_limit: staged.gas_limit,
-            max_fee_per_gas: 100,
-            max_priority_fee_per_gas: 10,
-            to: TxKind::Call(staged.to.parse().unwrap()),
-            value: U256::ZERO,
-            access_list: AccessList::default(),
-            input: Bytes::new(),
-        });
-        let preimage = TxEngine::unsigned_signing_preimage(&unsigned);
-        let signing_hash = TxEngine::unsigned_signing_hash(&unsigned);
-
+        let (engine, fixture, entry, staged, preimage, signing_hash, _outbox_dir) =
+            single_material("triad-lost", true);
         assert!(matches!(
             engine
                 .triad_sign_evm_payload(
@@ -6489,6 +6406,54 @@ mod tests {
             .collect::<Vec<_>>();
         let (preimages, hashes): (Vec<_>, Vec<_>) = prepared.into_iter().unzip();
         (refs, staged, preimages, hashes)
+    }
+
+    /// Stage one entry and stand the engine up over it — the single-payload
+    /// counterpart of `batch_material`. Keep the returned `TempDir` alive for
+    /// the whole test: it owns the outbox tree on disk.
+    fn single_material(
+        id: &str,
+        lose_sign_response_once: bool,
+    ) -> (
+        TxEngine,
+        Arc<TriadBrokerFixture>,
+        crate::outbox::OutboxEntry,
+        StagedTx,
+        Vec<u8>,
+        B256,
+        tempfile::TempDir,
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        let outbox = Outbox::new(directory.path().join("outbox")).unwrap();
+        let mut staged = fake_staged_1559(id);
+        staged.created_ms = now_ms();
+        outbox.write_pending(&staged, "exact EVM review").unwrap();
+        let entry = outbox
+            .read_in_state("alice", "anvil", id, OutboxState::Pending)
+            .unwrap();
+        let (engine, fixture, _) = triad_batch_fixture(outbox, false, lose_sign_response_once);
+        let unsigned = UnsignedEvmTx::Eip1559(TxEip1559 {
+            chain_id: staged.chain_id,
+            nonce: staged.nonce,
+            gas_limit: staged.gas_limit,
+            max_fee_per_gas: 100,
+            max_priority_fee_per_gas: 10,
+            to: TxKind::Call(staged.to.parse().unwrap()),
+            value: U256::ZERO,
+            access_list: AccessList::default(),
+            input: Bytes::new(),
+        });
+        let preimage = TxEngine::unsigned_signing_preimage(&unsigned);
+        let signing_hash = TxEngine::unsigned_signing_hash(&unsigned);
+        (
+            engine,
+            fixture,
+            entry,
+            staged,
+            preimage,
+            signing_hash,
+            directory,
+        )
     }
 
     #[tokio::test]
