@@ -558,6 +558,30 @@ Side-by-side active versions are also out of scope for the first implementation.
 They require explicit multi-member admission semantics and substantially expand
 the attack surface. The safe default is one active package per lineage.
 
+## Sessions, stop, and the install guard
+
+Every key a Petal derives through a numbered account is mounted at
+`wallets/<wallet>/<n>/sessions/<petal>/<key-slot>/session.json` with a sibling
+`stop` write. The document reports the delegating owner, the delegated key,
+the scope, the recorded approvals, and a truthful `signing_authority`
+(`pending`, `active`, `stopped`, `expired`, or `package_replaced`). Writing
+`stop` journals `sealed_approval.revoke_for_key` under a deterministic
+operation id and succeeds only once every reported approval is terminal;
+partial revocations persist with `complete: false`, leave the authority
+unchanged, and name the stragglers, and a retry is idempotent. After a stop or
+expiry, Exact-selector signing for the scope's remaining operation classes may
+still be available (`eligible_exact_routes` names those routes); reusable
+authority is gone.
+
+Because a session's scope binds the exact package hash, replacing an
+installed package while one of its sessions is still active would strand it:
+its routes and keys no longer match any installed code. The install command
+therefore refuses such a replacement, naming each affected
+`wallets/<w>/<n>/sessions/<petal>/<slot>` path, unless the owner explicitly
+installs with `--force`. A forced replacement (or an uninstall) leaves the
+sessions readable — their authority reads `package_replaced`, stop still
+works, and reinstalling the exact scoped hash restores them to `active`.
+
 ## Implementation anchors for current behavior
 
 The current-behavior sections above are grounded in these implementation paths:
