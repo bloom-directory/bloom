@@ -72,8 +72,8 @@ the passkey ceremony and wait for `ceremony_state` to become `COMPLETED`, then
 inspect the public wallet projection:
 
 ```sh
-cat wallets/alice/address
-cat wallets/alice/public_key
+cat wallets/alice/0/address
+cat wallets/alice/0/public_key
 cat wallets/alice/policy.json
 ```
 

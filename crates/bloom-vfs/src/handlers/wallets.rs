@@ -10,23 +10,30 @@
 //! - `wallets/registrations/<petname>/status.json`                 — public registration projection
 //! - `wallets/registrations/<petname>/result.json`                 — completed registration result
 //! - `wallets/registrations/<petname>/cancel`                       — write `y`, `yes`, or `cancel` before acceptance
-//! - `wallets/<wallet>/address`                                     — checksummed owner/signer address
-//! - `wallets/<wallet>/address.qr.svg`                              — scannable QR image for the owner/signer address
-//! - `wallets/<wallet>/address.qr.png`                              — scannable QR image for the owner/signer address
-//! - `wallets/<wallet>/addresses.json`                              — owner/signer + role addresses
-//! - `wallets/<wallet>/public_key`                                  — secp256k1 pubkey hex
-//! - `wallets/<wallet>/kind`                                        — local/watch
+//! - `wallets/<wallet>/kind`                                        — wallet kind token
+//! - `wallets/<wallet>/projection.json`                             — authenticated wallet projection
+//! - `wallets/<wallet>/accounts.json`                               — derived accounts, each with its number
+//! - `wallets/<wallet>/new`                                         — write `{request_id}` to create an account
 //! - `wallets/<wallet>/policy.json`                                 — canonical triad policy
+//! - `wallets/<wallet>/policy-updates/*`                            — staged policy-update lifecycle
 //! - `wallets/<wallet>/sealed-approvals/*`                          — Broker approval lifecycle
-//! - `wallets/<wallet>/chains/<chain>/{balance,balance.raw,balance.json}` — native balance
+//! - `wallets/<wallet>/chains/<chain>/{balance,balance.raw,balance.json}` — native balance (account 0)
 //! - `wallets/<wallet>/chains/<chain>/nonce`
-//! - `wallets/<wallet>/chains/<chain>/outbox/new.tx`                — write to stage
+//! - `wallets/<wallet>/chains/<chain>/outbox/new.tx`                — write to stage (account 0)
 //! - `wallets/<wallet>/chains/<chain>/outbox/pending/<id>/<file>`   — read staged
 //! - `wallets/<wallet>/chains/<chain>/outbox/pending/<id>/confirm`  — write to broadcast
 //! - `wallets/<wallet>/chains/<chain>/outbox/sent/<id>/<file>`      — read sent
 //! - `wallets/<wallet>/chains/<chain>/outbox/failed/<id>/<file>`    — read failed
 //! - `wallets/<wallet>/<n>/account.json`                            — numbered account: both families' keys
+//! - `wallets/<wallet>/<n>/address`                                 — the account's display address (EVM checksummed)
+//! - `wallets/<wallet>/<n>/address.qr.{svg,png}`                    — scannable QR images of that address
+//! - `wallets/<wallet>/<n>/addresses.json`                          — owner/signer and wallet policy status
+//! - `wallets/<wallet>/<n>/public_key`                              — canonical public key hex
 //! - `wallets/<wallet>/<n>/chains/<chain>/...`                      — the chain views above, re-rooted at account n's key
+//! - `wallets/<wallet>/<n>/sessions/<petal>/<slot>/{session.json,stop}` — delegated Petal sessions
+//!
+//! Key files exist only under a numbered account. Installed Petals are
+//! mounted only at the VFS root (`petals/`), never under a wallet.
 
 use sha2::Digest as _;
 use std::path::Path;
@@ -35,9 +42,11 @@ use std::sync::Arc;
 /// `wallets/<wallet>/<n>/...`: the numbered account view.
 mod accounts;
 use accounts::OutboxScope;
-use accounts::{accounts_json_with_numbers as render_accounts_json, parse_account_segment};
+use accounts::accounts_json_with_numbers as render_accounts_json;
 
-pub use accounts::{accounts_json_with_numbers, derivation_path_number};
+pub use accounts::{
+    ACCOUNT_KEY_FILES, accounts_json_with_numbers, derivation_path_number, parse_account_segment,
+};
 
 use async_trait::async_trait;
 use bloom_broker_api::ProtocolErrorCode;
@@ -237,12 +246,11 @@ pub struct AccountSessionEntry {
 }
 
 /// Keeps the VFS independent of the Petal runtime which depends on this crate.
-/// The daemon implements the whole seam: Petal dispatch through the router,
-/// and the session inventory and stop over the local key-state files.
+/// The daemon implements the seam that serves `wallets/<w>/<n>/sessions/`:
+/// the session inventory and stop over the local key-state files. Installed
+/// Petals themselves are mounted only at the VFS root, never per account.
 #[async_trait]
 pub trait AccountPetalMount: Send + Sync {
-    fn for_account(&self, account: AccountPetalContext) -> Arc<dyn Handler>;
-
     /// Sessions whose delegating parent is one of the account's family keys.
     /// Serves listing, stat, and `session.json` reads; never calls Broker.
     fn sessions(
@@ -286,9 +294,9 @@ pub struct WalletsHandler {
     /// client, while staging needs the whole signing seam. A chain present
     /// here but absent from `solana` is readable but cannot stage.
     solana_reads: Option<bloom_solana::SolanaChainRegistry>,
-    /// Late-bound: the Petal router is built after this handler because its
+    /// Late-bound: the Petal runtime is built after this handler because its
     /// host needs this handler, so there is exactly one of each and the
-    /// router is attached once both exist.
+    /// session seam is attached once both exist.
     account_petals: Arc<parking_lot::RwLock<Option<Arc<dyn AccountPetalMount>>>>,
 }
 
@@ -315,7 +323,7 @@ impl WalletsHandler {
         }
     }
 
-    /// Attach the Petal runtime that serves `wallets/<w>/<n>/petals/`.
+    /// Attach the session seam that serves `wallets/<w>/<n>/sessions/`.
     pub fn set_account_petals(&self, petals: Arc<dyn AccountPetalMount>) {
         *self.account_petals.write() = Some(petals);
     }
@@ -471,13 +479,17 @@ impl WalletsHandler {
         Ok((address, policy))
     }
 
+    /// `wallets/<w>/<n>/addresses.json`: account `number`'s display address
+    /// as owner and signer, beside the wallet-wide policy status.
     fn projection_addresses_json(
         &self,
         projection: &WalletProjection,
+        number: u32,
+        owner: &str,
     ) -> Result<Vec<u8>, HandlerError> {
-        let owner = projection.primary_address().map_err(err_be)?;
         let body = serde_json::json!({
             "wallet": projection.wallet.wallet_id,
+            "account": number,
             "kind": projection.wallet.wallet_kind,
             "owner": owner,
             "signer": owner,
@@ -2041,13 +2053,10 @@ impl WalletsHandler {
         Ok(out)
     }
 
+    /// The wallet-wide entries beside the numbered accounts. Anything that
+    /// names one key (address, public key, QR images) lives under `<n>/`.
     fn wallet_dir_entries() -> Vec<Entry> {
         vec![
-            Entry::file("address"),
-            Entry::file("address.qr.png"),
-            Entry::file("address.qr.svg"),
-            Entry::file("addresses.json"),
-            Entry::file("public_key"),
             Entry::file("kind"),
             Entry::file("projection.json"),
             Entry::file("accounts.json"),
@@ -2560,18 +2569,21 @@ impl Handler for WalletsHandler {
     }
 
     async fn prepare_write_open(&self, path: &VfsPath) -> Result<(), HandlerError> {
-        let segs = path.segments();
-        let r = match segs {
-            [wallet, chains, chain, outbox, pending, id, fname]
-                if chains == "chains"
-                    && outbox == "outbox"
-                    && pending == "pending"
-                    && fname == "confirm.override" =>
-            {
-                // The wallet-level outbox is account 0's: the override
-                // write-open must not prepare anything for another
-                // account's entry.
-                let scope = self.wallet_outbox_write_family(wallet, chain).await?;
+        let r = match pending_outbox_control(path.segments()) {
+            Some(PendingOutboxControl {
+                wallet,
+                account,
+                chain,
+                id,
+                control: "confirm.override",
+            }) => {
+                // The override write-open must not prepare anything for
+                // another account's entry: the wallet-level outbox is
+                // account 0's, a numbered outbox is its own account's.
+                let scope = match account {
+                    None => self.wallet_outbox_write_family(wallet, chain).await?,
+                    Some(number) => self.account_evm_family(wallet, number, chain).await?,
+                };
                 self.require_staged_by(wallet, chain, id, scope.address())?;
                 let (_, policy) = self.planning_wallet_inputs(wallet, chain).await?;
                 let client = self
@@ -2616,9 +2628,15 @@ impl Handler for WalletsHandler {
     }
 
     fn cache_ttl(&self, path: &VfsPath) -> Option<std::time::Duration> {
-        let segs = path.segments();
-        match segs {
-            [_, s, _, leaf]
+        // The same chain leaves at wallet level (account 0) and under a
+        // numbered account.
+        let chain_path = match path.segments() {
+            [_, number, rest @ ..] if parse_account_segment(number).is_some() => rest,
+            [_, rest @ ..] => rest,
+            [] => return None,
+        };
+        match chain_path {
+            [s, _, leaf]
                 if s == "chains"
                     && matches!(
                         leaf.as_str(),
@@ -2638,20 +2656,48 @@ impl Handler for WalletsHandler {
     /// that bypasses the mode check still cannot trigger a sign or
     /// broadcast just by stat'ing.
     fn is_read_side_effecting(&self, path: &VfsPath) -> bool {
-        let segs = path.segments();
-        // wallets/<w>/chains/<c>/outbox/pending/<id>/{confirm,confirm.override,replace,cancel,restage}
-        if segs.len() == 7
-            && segs[1] == "chains"
-            && segs[3] == "outbox"
-            && segs[4] == "pending"
-            && matches!(
-                segs[6].as_str(),
+        pending_outbox_control(path.segments()).is_some_and(|target| {
+            matches!(
+                target.control,
                 "confirm" | "confirm.override" | "replace" | "cancel" | "restage"
             )
-        {
-            return true;
+        })
+    }
+}
+
+/// A write sink under a pending outbox entry, named through the wallet-level
+/// outbox (account 0) or a numbered account's.
+struct PendingOutboxControl<'a> {
+    wallet: &'a str,
+    /// `None` for the wallet-level path.
+    account: Option<u32>,
+    chain: &'a str,
+    id: &'a str,
+    control: &'a str,
+}
+
+/// Match `<w>/[<n>/]chains/<c>/outbox/pending/<id>/<control>`.
+fn pending_outbox_control(segs: &[String]) -> Option<PendingOutboxControl<'_>> {
+    let (wallet, account, rest) = match segs {
+        [wallet, number, rest @ ..] if parse_account_segment(number).is_some() => {
+            (wallet, parse_account_segment(number), rest)
         }
-        false
+        [wallet, rest @ ..] => (wallet, None, rest),
+        [] => return None,
+    };
+    match rest {
+        [chains, chain, outbox, pending, id, control]
+            if chains == "chains" && outbox == "outbox" && pending == "pending" =>
+        {
+            Some(PendingOutboxControl {
+                wallet,
+                account,
+                chain,
+                id,
+                control,
+            })
+        }
+        _ => None,
     }
 }
 
@@ -2699,8 +2745,7 @@ impl WalletsHandler {
             return self.lookup_account(wallet, number, &segs[2..]).await;
         }
         match segs[1].as_str() {
-            "address" | "address.qr.png" | "address.qr.svg" | "addresses.json" | "public_key"
-            | "kind" | "projection.json" | "accounts.json" => Ok(Entry::file(&segs[1])),
+            "kind" | "projection.json" | "accounts.json" => Ok(Entry::file(&segs[1])),
             "new" => Ok(Entry::writable_file("new")),
             "policy.json" => Ok(Entry::writable_file("policy.json")),
             "chains" => match segs.len() {
@@ -2850,22 +2895,6 @@ impl WalletsHandler {
             return self.read_account(wallet, number, &segs[2..]).await;
         }
         match segs.get(1).map(|s| s.as_str()).unwrap_or("") {
-            "address" => {
-                let projection = self.wallet_projection(wallet).await?;
-                Ok(format!("{}\n", projection.primary_address().map_err(err_be)?).into_bytes())
-            }
-            "address.qr.svg" => {
-                let projection = self.wallet_projection(wallet).await?;
-                render_address_qr_svg(projection.primary_address().map_err(err_be)?)
-            }
-            "address.qr.png" => {
-                let projection = self.wallet_projection(wallet).await?;
-                render_address_qr_png(projection.primary_address().map_err(err_be)?)
-            }
-            "addresses.json" => {
-                let projection = self.wallet_projection(wallet).await?;
-                self.projection_addresses_json(&projection)
-            }
             "accounts.json" => {
                 // The cached, authenticated inventory; freshness rides on the
                 // projection, and this read carries no authority side effect.
@@ -2876,20 +2905,6 @@ impl WalletsHandler {
                 )
             }
             "new" => self.account_creation_status(wallet).await,
-            "public_key" => {
-                let projection = self.wallet_projection(wallet).await?;
-                Ok(format!(
-                    "0x{}\n",
-                    hex::encode(
-                        projection
-                            .primary_key()
-                            .map_err(err_be)?
-                            .canonical_public_key
-                            .decode()
-                    )
-                )
-                .into_bytes())
-            }
             "kind" => {
                 let projection = self.wallet_projection(wallet).await?;
                 Ok(format!("{}\n", projection.wallet.wallet_kind.as_str()).into_bytes())
@@ -7890,18 +7905,19 @@ value = "0""#,
     #[tokio::test]
     async fn addresses_json_reports_owner_and_signer() {
         let f = make_handler();
-        let p = VfsPath::parse(&format!("/{}/addresses.json", f.wallet_name)).unwrap();
+        let p = VfsPath::parse(&format!("/{}/0/addresses.json", f.wallet_name)).unwrap();
         let body = f.handler.read(&p).await.unwrap();
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
         let owner = bloom_proto::checksum_address(&f.wallet_addr);
         assert_eq!(v["wallet"], "alice");
+        assert_eq!(v["account"], 0);
         assert_eq!(v["owner"], owner);
         assert_eq!(v["signer"], owner, "owner and signer are the same EOA");
         assert_eq!(v["policy_status"], "broker_verified");
         assert_eq!(v["unlocked"], false);
         assert!(v["roles"].as_object().unwrap().is_empty());
-        // addresses.json is also a listed dir entry.
-        let dir = VfsPath::parse(&format!("/{}", f.wallet_name)).unwrap();
+        // addresses.json is also a listed entry of the account directory.
+        let dir = VfsPath::parse(&format!("/{}/0", f.wallet_name)).unwrap();
         let names: Vec<String> = f
             .handler
             .list(&dir)
@@ -7914,26 +7930,164 @@ value = "0""#,
     }
 
     #[tokio::test]
-    async fn wallet_dir_surfaces_address_qr_images() {
+    async fn account_dir_surfaces_address_qr_images() {
         let f = make_handler();
-        let dir = VfsPath::parse(&format!("/{}", f.wallet_name)).unwrap();
+        let dir = VfsPath::parse(&format!("/{}/0", f.wallet_name)).unwrap();
         let entries = f.handler.list(&dir).await.unwrap();
         let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
         assert!(names.contains(&"address.qr.png"));
         assert!(names.contains(&"address.qr.svg"));
 
         for leaf in ["address.qr.png", "address.qr.svg"] {
-            let path = VfsPath::parse(&format!("/{}/{leaf}", f.wallet_name)).unwrap();
+            let path = VfsPath::parse(&format!("/{}/0/{leaf}", f.wallet_name)).unwrap();
             let entry = f.handler.lookup(&path).await.unwrap();
             assert_eq!(entry.name, leaf);
             assert!(matches!(entry.kind, crate::handler::EntryKind::File));
         }
     }
 
+    /// The wallet directory holds the numbered accounts and wallet-wide
+    /// state; nothing that names one key is exposed above `<n>/`.
+    #[tokio::test]
+    async fn wallet_dir_exposes_no_account_scoped_key_files() {
+        let f = make_handler();
+        let w = &f.wallet_name;
+        let names: Vec<String> = f
+            .handler
+            .list(&vfs(format!("/{w}")))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect();
+        assert!(names.contains(&"0".to_string()), "{names:?}");
+        for leaf in ACCOUNT_KEY_FILES {
+            assert!(!names.iter().any(|name| name == leaf), "{leaf}: {names:?}");
+            let path = vfs(format!("/{w}/{leaf}"));
+            assert!(
+                matches!(
+                    f.handler.lookup(&path).await,
+                    Err(HandlerError::NotFound(_))
+                ),
+                "lookup {leaf}"
+            );
+            assert!(
+                matches!(f.handler.read(&path).await, Err(HandlerError::NotAFile(_))),
+                "read {leaf}"
+            );
+        }
+        // The same files resolve and read under account 0.
+        let owner = bloom_proto::checksum_address(&f.wallet_addr);
+        assert_eq!(
+            f.handler
+                .read(&vfs(format!("/{w}/0/address")))
+                .await
+                .unwrap(),
+            format!("{owner}\n").into_bytes()
+        );
+        let public_key = f
+            .handler
+            .read(&vfs(format!("/{w}/0/public_key")))
+            .await
+            .unwrap();
+        assert!(public_key.starts_with(b"0x") && public_key.ends_with(b"\n"));
+    }
+
+    /// Every entry a wallet or account directory advertises resolves
+    /// through lookup with the same kind, so `ls` and `stat` agree.
+    #[tokio::test]
+    async fn listed_wallet_and_account_entries_resolve_through_lookup() {
+        let f = make_handler();
+        let w = &f.wallet_name;
+        for dir in [format!("/{w}"), format!("/{w}/0")] {
+            for entry in f.handler.list(&vfs(dir.clone())).await.unwrap() {
+                let path = vfs(format!("{dir}/{}", entry.name));
+                let resolved = f
+                    .handler
+                    .lookup(&path)
+                    .await
+                    .unwrap_or_else(|error| panic!("{path} is listed but {error:?}"));
+                assert_eq!(resolved.kind, entry.kind, "{path}");
+            }
+        }
+    }
+
+    /// Installed Petals are mounted only at the VFS root; an account never
+    /// lists, resolves, reads, or accepts writes for a `petals/` subtree.
+    #[tokio::test]
+    async fn petals_are_not_mounted_under_numbered_accounts() {
+        let f = make_handler();
+        let w = &f.wallet_name;
+        let names: Vec<String> = f
+            .handler
+            .list(&vfs(format!("/{w}/0")))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect();
+        assert!(!names.contains(&"petals".to_string()), "{names:?}");
+        for path in [
+            format!("/{w}/0/petals"),
+            format!("/{w}/0/petals/echo"),
+            format!("/{w}/0/petals/echo/message.txt"),
+        ] {
+            assert!(
+                matches!(
+                    f.handler.lookup(&vfs(path.clone())).await,
+                    Err(HandlerError::NotFound(_))
+                ),
+                "lookup {path}"
+            );
+            assert!(
+                matches!(
+                    f.handler.list(&vfs(path.clone())).await,
+                    Err(HandlerError::NotADir(_))
+                ),
+                "list {path}"
+            );
+            assert!(
+                matches!(
+                    f.handler.read(&vfs(path.clone())).await,
+                    Err(HandlerError::NotAFile(_))
+                ),
+                "read {path}"
+            );
+            assert!(
+                matches!(
+                    f.handler.write(&vfs(path.clone()), b"x").await,
+                    Err(HandlerError::PermissionDenied)
+                ),
+                "write {path}"
+            );
+        }
+    }
+
+    /// `sessions/` is listed unconditionally under an account, so it must
+    /// resolve as a directory even before any session exists.
+    #[tokio::test]
+    async fn account_sessions_directory_resolves_without_sessions() {
+        let f = make_handler();
+        let w = &f.wallet_name;
+        let entry = f
+            .handler
+            .lookup(&vfs(format!("/{w}/0/sessions")))
+            .await
+            .unwrap();
+        assert_eq!(entry.kind, crate::handler::EntryKind::Dir);
+        assert!(
+            f.handler
+                .list(&vfs(format!("/{w}/0/sessions")))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
     #[tokio::test]
     async fn address_qr_svg_is_scannable_svg_document() {
         let f = make_handler();
-        let path = VfsPath::parse(&format!("/{}/address.qr.svg", f.wallet_name)).unwrap();
+        let path = VfsPath::parse(&format!("/{}/0/address.qr.svg", f.wallet_name)).unwrap();
         let body = f.handler.read(&path).await.unwrap();
         let svg = String::from_utf8(body).unwrap();
         assert!(svg.contains("<svg"), "{svg}");
@@ -7947,7 +8101,7 @@ value = "0""#,
     #[tokio::test]
     async fn address_qr_png_is_png_document() {
         let f = make_handler();
-        let path = VfsPath::parse(&format!("/{}/address.qr.png", f.wallet_name)).unwrap();
+        let path = VfsPath::parse(&format!("/{}/0/address.qr.png", f.wallet_name)).unwrap();
         let body = f.handler.read(&path).await.unwrap();
         assert!(body.starts_with(b"\x89PNG\r\n\x1a\n"));
         assert!(
@@ -9140,7 +9294,7 @@ value = "0""#,
     #[tokio::test]
     async fn an_unregistered_wallet_is_not_found() {
         let f = make_handler_with_chain(true);
-        for path in ["/nosuchwallet", "/nosuchwallet/address"] {
+        for path in ["/nosuchwallet", "/nosuchwallet/0/address"] {
             let p = VfsPath::parse(path).unwrap();
             assert!(
                 matches!(f.handler.lookup(&p).await, Err(HandlerError::NotFound(_))),

@@ -61,7 +61,8 @@ Representative paths, relative to the mount:
 | Token balance | `chains/<chain>/addresses/<address>/tokens/<contract>/balance.json` |
 | NFT kind/owner | `chains/<chain>/contracts/<contract>/nft/{kind,owner_of/<token-id>}` |
 | ENS / price | `ens/<name>/address`, `prices/spot/eth.usd` |
-| Wallet identity | `wallets/<wallet>/{projection.json,accounts.json,address,addresses.json}` |
+| Wallet identity | `wallets/<wallet>/{kind,projection.json,accounts.json}` |
+| Account key | `wallets/<wallet>/<n>/{account.json,address,addresses.json,public_key}` |
 | Solana account | `wallets/<wallet>/chains/<chain>/accounts/<full-fingerprint>/{address,balance,balance.raw,balance.json}` |
 | Solana status | `status/chains/<chain>/{status.json,slot,block_height}` |
 
@@ -74,9 +75,11 @@ identity; never select by list position.
 Numbered accounts live at `wallets/<wallet>/<n>/`: read `account.json` to
 verify the keys, then use `chains/<chain>/outbox/` beneath that account to
 stage and inspect its transactions. Wallet-level outboxes use account 0.
-Account-aware Petals and delegated sessions live beneath the numbered account
-at `petals/<petal>/` and `sessions/<petal>/<key-slot>/`; see the mount
-`AGENTS.md` for account creation, session status, and revocation rules.
+Address, QR, and public-key files exist only beneath a numbered account.
+Delegated sessions live beneath the numbered account at
+`sessions/<petal>/<key-slot>/`; installed Petals are mounted only at
+`petals/<petal>/`. See the mount `AGENTS.md` for account creation, session
+status, and revocation rules.
 
 ## Writes and authority
 

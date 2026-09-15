@@ -82,15 +82,23 @@ under the wallet while installed Petals and shared market data stay at
 
 ```text
 wallets/<wallet>/
+├── kind, projection.json              # wallet-wide identity
 ├── accounts.json                      # one number per entry (null off-mapping)
 ├── new                                # create an account (write {request_id})
+├── chains/<chain>/...                 # account 0's chain views and outbox
 ├── 0/
 │   ├── account.json                   # both families, with freshness
+│   ├── address, address.qr.{svg,png}  # display address (EVM when present)
+│   ├── addresses.json, public_key     # owner/signer + policy status; key hex
 │   ├── chains/<chain>/...             # chain views and the outbox, this key's
-│   ├── petals/<petal>/...             # installed Petals, account-scoped
 │   └── sessions/<petal>/<slot>/       # session.json + stop for derived keys
-└── policy.json, sealed-approvals/, capabilities/   # unchanged
+└── policy.json, policy-updates/, sealed-approvals/   # wallet-wide
 ```
+
+Files that name one key (`address`, its QR images, `addresses.json`,
+`public_key`) exist only under a numbered account; the wallet directory holds
+no key files. Installed Petals are mounted only at `/petals/<petal>/`, never
+under a wallet or account.
 
 The number is the derivation path itself, not a position in a list: slot `n`
 is EVM `m/44'/60'/0'/0/n` and Solana `m/44'/501'/n'/0'`. Signer owns the
@@ -123,8 +131,8 @@ or, after success, the same account; a conflicting reuse fails; extra fields
 are rejected. A legacy or imported single-key wallet is account 0 from its
 root key, rendered in the root key's own family.
 
-Account-scoped Petal dispatch and the session tree (`<n>/sessions/`, core
-stop, and the install guard) are described in
+The session tree (`<n>/sessions/`, core stop, and the install guard) is
+described in
 [Petal derived key succession.md](Petal%20derived%20key%20succession.md); the
 authority invariants they rely on are in
 [Sealed Approvals.md](Sealed%20Approvals.md). A mnemonic recovers the

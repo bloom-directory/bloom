@@ -323,7 +323,7 @@ async fn signer_wallet_is_visible_in_vfs_without_a_legacy_keystore_record() {
     assert!(root.iter().any(|entry| entry.name == "alice"));
     assert_eq!(
         handler
-            .read(&VfsPath::parse("/alice/address").unwrap())
+            .read(&VfsPath::parse("/alice/0/address").unwrap())
             .await
             .unwrap(),
         b"0x0000000000000000000000000000000000000001\n"
@@ -377,11 +377,12 @@ async fn signer_wallet_is_visible_in_vfs_without_a_legacy_keystore_record() {
     );
     let addresses: serde_json::Value = serde_json::from_slice(
         &stale_handler
-            .read(&VfsPath::parse("/alice/addresses.json").unwrap())
+            .read(&VfsPath::parse("/alice/0/addresses.json").unwrap())
             .await
             .unwrap(),
     )
     .unwrap();
+    assert_eq!(addresses["account"], 0);
     assert_eq!(addresses["freshness"], "stale");
     assert_eq!(addresses["policy_version"], "1");
     assert_eq!(addresses["policy_digest"], expected_policy_digest.as_str());

@@ -13,9 +13,24 @@
 //! transaction engine resolves from that address; a Solana stage pins the
 //! account's fingerprint. Pending controls under `<n>/` act only on entries
 //! that account staged.
+//!
+//! The key files ([`ACCOUNT_KEY_FILES`]) live here and nowhere above: the
+//! wallet directory holds the numbered accounts and wallet-wide state only.
+//! Installed Petals are never mounted under an account; they live at the
+//! VFS root's `petals/`.
 
 use super::*;
 use bloom_broker_api::{AccountLifecycleState, DerivationProfile, DerivedAccountPublic};
+
+/// Files under `wallets/<w>/<n>/` that present the account's display key:
+/// its EVM key when it has one, otherwise its Solana key.
+pub const ACCOUNT_KEY_FILES: [&str; 5] = [
+    "address",
+    "address.qr.png",
+    "address.qr.svg",
+    "addresses.json",
+    "public_key",
+];
 
 /// One family's key inside an account.
 #[derive(Clone, Debug)]
@@ -24,6 +39,8 @@ pub(super) struct FamilyKey {
     /// Display address in the family's encoding; the same value on every
     /// network of the family.
     address: String,
+    /// Decoded canonical public key bytes, as the projection carries them.
+    public_key: Vec<u8>,
     fingerprint: String,
     /// Empty for a legacy root or imported single key, which has no path.
     path: String,
@@ -113,7 +130,7 @@ pub fn derivation_path_number(profile: DerivationProfile, path: &str) -> Option<
 
 /// A path segment that names an account: decimal digits, canonical spelling,
 /// inside the non-hardened BIP-32 range.
-pub(super) fn parse_account_segment(segment: &str) -> Option<u32> {
+pub fn parse_account_segment(segment: &str) -> Option<u32> {
     if segment.is_empty()
         || segment.len() > 10
         || !segment.bytes().all(|byte| byte.is_ascii_digit())
@@ -196,6 +213,7 @@ impl WalletsHandler {
             let family = FamilyKey {
                 key_ref: key.key_ref.clone(),
                 address,
+                public_key: key.canonical_public_key.decode(),
                 fingerprint: key.key_ref.public_key_fingerprint.as_str().to_owned(),
                 path: String::new(),
                 lifecycle: AccountLifecycleState::Active,
@@ -232,6 +250,7 @@ impl WalletsHandler {
                     .first()
                     .map(|projection| projection.address.clone())
                     .unwrap_or_default(),
+                public_key: account.canonical_public_key.decode(),
                 fingerprint: account.public_key_fingerprint.as_str().to_owned(),
                 path: account.path.clone(),
                 lifecycle: account.lifecycle,
@@ -326,30 +345,56 @@ impl WalletsHandler {
     }
 
     fn account_dir_entries() -> Vec<Entry> {
-        vec![
-            Entry::file("account.json"),
-            Entry::dir("chains"),
-            Entry::dir("petals"),
-            Entry::dir("sessions"),
-        ]
+        let mut entries = vec![Entry::file("account.json")];
+        entries.extend(ACCOUNT_KEY_FILES.map(Entry::file));
+        entries.push(Entry::dir("chains"));
+        entries.push(Entry::dir("sessions"));
+        entries
     }
 
-    fn account_petal_handler(
+    /// The key the account's [`ACCOUNT_KEY_FILES`] present, and its display
+    /// address (EVM checksummed). For account 0 this is the wallet's primary
+    /// key: the canonical initial EVM child, or a root key in its own family.
+    fn display_key(view: &AccountView) -> Result<(&FamilyKey, String), HandlerError> {
+        if let Some(evm) = &view.evm {
+            let address = bloom_proto::checksum_address(&Self::evm_address(evm)?);
+            return Ok((evm, address));
+        }
+        let solana = view
+            .solana
+            .as_ref()
+            .ok_or_else(|| HandlerError::backend(format!("account {} has no key", view.number)))?;
+        Ok((solana, solana.address.clone()))
+    }
+
+    async fn read_account_key_file(
         &self,
         wallet: &str,
         view: &AccountView,
-    ) -> Result<Arc<dyn Handler>, HandlerError> {
-        let account_petals = self.account_petals.read();
-        let petals = account_petals
-            .as_ref()
-            .ok_or_else(|| HandlerError::not_found("account Petal runtime is unavailable"))?;
-        Ok(petals.for_account(AccountPetalContext {
+        leaf: &str,
+    ) -> Result<Vec<u8>, HandlerError> {
+        let (key, address) = Self::display_key(view)?;
+        match leaf {
+            "address" => Ok(format!("{address}\n").into_bytes()),
+            "address.qr.svg" => render_address_qr_svg(&address),
+            "address.qr.png" => render_address_qr_png(&address),
+            "public_key" => Ok(format!("0x{}\n", hex::encode(&key.public_key)).into_bytes()),
+            "addresses.json" => {
+                let projection = self.wallet_projection(wallet).await?;
+                self.projection_addresses_json(&projection, view.number, &address)
+            }
+            _ => Err(HandlerError::NotAFile(leaf.to_owned())),
+        }
+    }
+
+    fn account_context(wallet: &str, view: &AccountView) -> AccountPetalContext {
+        AccountPetalContext {
             wallet: wallet.to_owned(),
             number: view.number,
             evm_fingerprint: view.evm.as_ref().map(|key| key.fingerprint.clone()),
             solana_fingerprint: view.solana.as_ref().map(|key| key.fingerprint.clone()),
             freshness: view.freshness,
-        }))
+        }
     }
 
     fn account_sessions(
@@ -361,13 +406,7 @@ impl WalletsHandler {
         let Some(petals) = petals.as_ref() else {
             return Ok(Vec::new());
         };
-        petals.sessions(&AccountPetalContext {
-            wallet: wallet.to_owned(),
-            number: view.number,
-            evm_fingerprint: view.evm.as_ref().map(|key| key.fingerprint.clone()),
-            solana_fingerprint: view.solana.as_ref().map(|key| key.fingerprint.clone()),
-            freshness: view.freshness,
-        })
+        petals.sessions(&Self::account_context(wallet, view))
     }
 
     fn chain_name_entries(&self) -> Vec<Entry> {
@@ -389,20 +428,14 @@ impl WalletsHandler {
         let view = self.account_view(wallet, number).await?;
         match rest {
             [] => Ok(Entry::dir(&number.to_string())),
-            [dir, petal_rest @ ..] if dir == "petals" => {
-                self.account_petal_handler(wallet, &view)?
-                    .lookup(
-                        &petal_rest
-                            .iter()
-                            .fold(VfsPath::root(), |path, segment| path.join(segment)),
-                    )
-                    .await
-            }
+            [dir] if dir == "sessions" => Ok(Entry::dir("sessions")),
             [dir, sessions_rest @ ..] if dir == "sessions" => {
                 let sessions = self.account_sessions(wallet, &view)?;
                 Self::lookup_account_session(&sessions, sessions_rest)
             }
-            [leaf] if leaf == "account.json" => Ok(Entry::file(leaf)),
+            [leaf] if leaf == "account.json" || ACCOUNT_KEY_FILES.contains(&leaf.as_str()) => {
+                Ok(Entry::file(leaf))
+            }
             [dir] if dir == "chains" => Ok(Entry::dir("chains")),
             [dir, chain, chain_rest @ ..] if dir == "chains" => {
                 if self.is_solana_chain(chain) {
@@ -428,14 +461,8 @@ impl WalletsHandler {
         let view = self.account_view(wallet, number).await?;
         match rest {
             [leaf] if leaf == "account.json" => self.account_json(wallet, &view),
-            [dir, petal_rest @ ..] if dir == "petals" => {
-                self.account_petal_handler(wallet, &view)?
-                    .read(
-                        &petal_rest
-                            .iter()
-                            .fold(VfsPath::root(), |path, segment| path.join(segment)),
-                    )
-                    .await
+            [leaf] if ACCOUNT_KEY_FILES.contains(&leaf.as_str()) => {
+                self.read_account_key_file(wallet, &view, leaf).await
             }
             [dir, mount, slot, leaf] if dir == "sessions" && leaf == "session.json" => {
                 let sessions = self.account_sessions(wallet, &view)?;
@@ -469,15 +496,6 @@ impl WalletsHandler {
         let view = self.account_view(wallet, number).await?;
         match rest {
             [] => Ok(Self::account_dir_entries()),
-            [dir, petal_rest @ ..] if dir == "petals" => {
-                self.account_petal_handler(wallet, &view)?
-                    .list(
-                        &petal_rest
-                            .iter()
-                            .fold(VfsPath::root(), |path, segment| path.join(segment)),
-                    )
-                    .await
-            }
             [dir] if dir == "sessions" => {
                 let sessions = self.account_sessions(wallet, &view)?;
                 let mounts: std::collections::BTreeSet<&str> = sessions
@@ -536,19 +554,6 @@ impl WalletsHandler {
         data: &[u8],
     ) -> Result<(), HandlerError> {
         let view = self.account_view(wallet, number).await?;
-        if let [dir, petal_rest @ ..] = rest
-            && dir == "petals"
-        {
-            return self
-                .account_petal_handler(wallet, &view)?
-                .write(
-                    &petal_rest
-                        .iter()
-                        .fold(VfsPath::root(), |path, segment| path.join(segment)),
-                    data,
-                )
-                .await;
-        }
         if let [dir, mount, slot, leaf] = rest
             && dir == "sessions"
             && leaf == "stop"
@@ -563,17 +568,12 @@ impl WalletsHandler {
             let petals = {
                 let guard = self.account_petals.read();
                 guard.as_ref().cloned().ok_or_else(|| {
-                    HandlerError::not_found("account Petal runtime is unavailable")
+                    HandlerError::not_found("account session runtime is unavailable")
                 })?
             };
-            let context = AccountPetalContext {
-                wallet: wallet.to_owned(),
-                number: view.number,
-                evm_fingerprint: view.evm.as_ref().map(|key| key.fingerprint.clone()),
-                solana_fingerprint: view.solana.as_ref().map(|key| key.fingerprint.clone()),
-                freshness: view.freshness,
-            };
-            return petals.stop_session(&context, mount, slot).await;
+            return petals
+                .stop_session(&Self::account_context(wallet, &view), mount, slot)
+                .await;
         }
         let [dir, chain, sub, chain_rest @ ..] = rest else {
             return Err(HandlerError::PermissionDenied);
@@ -696,6 +696,17 @@ impl WalletsHandler {
                 if solana { "Solana" } else { "EVM" }
             ))
         })
+    }
+
+    /// The EVM key account `number` stages and confirms from on `chain`.
+    pub(super) async fn account_evm_family(
+        &self,
+        wallet: &str,
+        number: u32,
+        chain: &str,
+    ) -> Result<FamilyKey, HandlerError> {
+        let view = self.account_view(wallet, number).await?;
+        Self::evm_family(&view, chain).cloned()
     }
 
     pub(super) fn evm_scope_allows(&self, from: &str, scope: OutboxScope<'_>) -> bool {
