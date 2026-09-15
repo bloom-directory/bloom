@@ -526,7 +526,7 @@ fixture_key_ref="$(printf '%s' "$fixture_key_record_body" | jq -ec '.public_key.
 fixture_provenance_digest="$(printf '%s' "$fixture_key_record_body" | jq -er '.provenance_digest')"
 fixture_agent_id="$(printf '%s' "$fixture_key_record_body" | jq -c '.scope.agent_id')"
 wallet_authority="$(bounded_mounted_read \
-  "$(mounted "/wallets/${registered_wallet}/addresses.json")" \
+  "$(mounted "/wallets/${registered_wallet}/0/addresses.json")" \
   "wallet authority projection read")"
 policy_version="$(printf '%s' "$wallet_authority" | jq -er '.policy_version')"
 policy_digest="$(printf '%s' "$wallet_authority" | jq -er '.policy_digest')"

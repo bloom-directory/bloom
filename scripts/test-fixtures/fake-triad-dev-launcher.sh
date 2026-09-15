@@ -109,7 +109,7 @@ def fifo(relative, callback):
 
 
 write(f"wallets/{wallet}/kind", "passkey\n")
-write(f"wallets/{wallet}/address", address + "\n")
+write(f"wallets/{wallet}/0/address", address + "\n")
 initial_policy = {
     "wallet_id": wallet,
     "maximum_approval_lifetime_ms": 900000,
@@ -119,7 +119,7 @@ initial_policy = {
 }
 policy_path = write_json(f"wallets/{wallet}/policy.json", initial_policy)
 addresses_path = write_json(
-    f"wallets/{wallet}/addresses.json",
+    f"wallets/{wallet}/0/addresses.json",
     {
         "wallet": wallet,
         "kind": "passkey",
@@ -217,7 +217,7 @@ def policy_loop():
             addresses["policy_digest"] = (
                 "99" * 32 if mutate_approval_policy_digest else committed_policy_digest
             )
-            write_json(f"wallets/{wallet}/addresses.json", addresses)
+            write_json(f"wallets/{wallet}/0/addresses.json", addresses)
             write_json(
                 f"wallets/{wallet}/policy-updates/confirmed/{action_id}/status.json",
                 {"status": "confirmed", "ceremony_kind": "policy_update", "action_id": action_id},

@@ -333,7 +333,7 @@ printf '  mode:   %s\n\n' "$([ "$live" -eq 1 ] && printf LIVE || printf NON-SPEN
 
 wallet_kind="$(vcat "/wallets/${wallet}/kind" | tr -d '[:space:]')"
 [ "$wallet_kind" = "passkey" ] || die "VFS reports wallet kind '$wallet_kind', expected passkey"
-wallet_address="$(vcat "/wallets/${wallet}/address" | tr -d '[:space:]')"
+wallet_address="$(vcat "/wallets/${wallet}/0/address" | tr -d '[:space:]')"
 printf 'Passkey wallet: %s (%s)\n' "$wallet" "$wallet_address"
 
 # A freshly registered wallet has no allowed Petal packages. Add only the
@@ -425,7 +425,7 @@ fixture_key_record_body="$(vcat "$fixture_key_record")"
 fixture_key_ref="$(printf '%s' "$fixture_key_record_body" | jq -ec '.public_key.key_ref')"
 fixture_provenance_digest="$(printf '%s' "$fixture_key_record_body" | jq -er '.provenance_digest')"
 fixture_agent_id="$(printf '%s' "$fixture_key_record_body" | jq -c '.scope.agent_id')"
-wallet_authority="$(vcat "/wallets/${wallet}/addresses.json")"
+wallet_authority="$(vcat "/wallets/${wallet}/0/addresses.json")"
 policy_version="$(printf '%s' "$wallet_authority" | jq -er '.policy_version')"
 policy_digest="$(printf '%s' "$wallet_authority" | jq -er '.policy_digest')"
 wallet_revocation_epoch="$(printf '%s' "$wallet_authority" | jq -er '.wallet_revocation_epoch')"

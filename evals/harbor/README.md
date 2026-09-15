@@ -334,7 +334,7 @@ bloom-broker-debug-driver complete "$ceremony_url" \
 
 # Commit by replaying byte-identical bytes, then verify the public projection.
 cp "$policy_file" "$BLOOM_EVAL_BLOOM_MOUNT/wallets/$BLOOM_EVAL_WALLET_ID/policy.json"
-cat "$BLOOM_EVAL_BLOOM_MOUNT/wallets/$BLOOM_EVAL_WALLET_ID/addresses.json"
+cat "$BLOOM_EVAL_BLOOM_MOUNT/wallets/$BLOOM_EVAL_WALLET_ID/0/addresses.json"
 cat "$BLOOM_EVAL_BLOOM_MOUNT/wallets/$BLOOM_EVAL_WALLET_ID/policy.json"
 
 # After the eval, repeat this same stage/approve/byte-identical replay process

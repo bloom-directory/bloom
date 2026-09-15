@@ -184,7 +184,7 @@ Verified end-to-end via `tests/docker/run.sh --mempool`.
 | DefiLlama keyless price oracle | `coins.llama.fi` | `vfs cat /prices/spot/eth.usd` |
 | Etherscan multichain (txlist) | `api.etherscan.io/v2` chainid=1 | `vfs cat /chains/ethereum/addresses/0xd8dA…6045/txs` |
 | ENS canonical-registry forward resolution | mainnet via tx-engine resolver | staged `send 0.0001 eth to vitalik.eth on ethereum` → `plan.md` shows `To: 0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045` |
-| VFS-based wallet creation (round-trip) | local | `vfs write /wallets/new --data 'bob'` → `vfs cat /wallets/bob/address` |
+| VFS-based wallet creation (round-trip) | local | `vfs write /wallets/new --data 'bob'` → `vfs cat /wallets/bob/0/address` |
 | Native ETH send (live) | Base, chain_id 8453 | `0xd4a496fb…3c40` — 0.001 ETH dest1→dest2 |
 | Enso swap (live) | Base, ETH → USDC via Enso router | `0x016fc370…9fc3` — 0.001 ETH → 2.306996 USDC |
 | Enso swap + Aave V3 deposit (live) | Base, ETH → aBaseUSDC | `0xab687461…e3ce` — 0.001 ETH → 2.308456 aBaseUSDC |
