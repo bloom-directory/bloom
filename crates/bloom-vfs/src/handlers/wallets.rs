@@ -1,8 +1,9 @@
 //! `wallets/<wallet>/...` — managed wallets and the outbox write surface.
 //!
 //! This handler wires public wallet projections, chain access, and the
-//! transaction engine. Reads expose wallet metadata and per-chain
-//! balance/nonce; writes go through the outbox stage-confirm flow.
+//! transaction engine. Reads expose wallet metadata and, under a numbered
+//! account, per-chain balance/nonce; writes go through the account's outbox
+//! stage-confirm flow.
 //!
 //! Paths handled:
 //! - `wallets/`                                                     — list wallets
@@ -10,23 +11,33 @@
 //! - `wallets/registrations/<petname>/status.json`                 — public registration projection
 //! - `wallets/registrations/<petname>/result.json`                 — completed registration result
 //! - `wallets/registrations/<petname>/cancel`                       — write `y`, `yes`, or `cancel` before acceptance
-//! - `wallets/<wallet>/address`                                     — checksummed owner/signer address
-//! - `wallets/<wallet>/address.qr.svg`                              — scannable QR image for the owner/signer address
-//! - `wallets/<wallet>/address.qr.png`                              — scannable QR image for the owner/signer address
-//! - `wallets/<wallet>/addresses.json`                              — owner/signer + role addresses
-//! - `wallets/<wallet>/public_key`                                  — secp256k1 pubkey hex
-//! - `wallets/<wallet>/kind`                                        — local/watch
+//! - `wallets/<wallet>/kind`                                        — wallet kind token
+//! - `wallets/<wallet>/projection.json`                             — authenticated wallet projection
+//! - `wallets/<wallet>/accounts.json`                               — derived accounts, each with its number
+//! - `wallets/<wallet>/new`                                         — write `{request_id}` to create an account
 //! - `wallets/<wallet>/policy.json`                                 — canonical triad policy
+//! - `wallets/<wallet>/policy-updates/*`                            — staged policy-update lifecycle
 //! - `wallets/<wallet>/sealed-approvals/*`                          — Broker approval lifecycle
-//! - `wallets/<wallet>/chains/<chain>/{balance,balance.raw,balance.json}` — native balance
-//! - `wallets/<wallet>/chains/<chain>/nonce`
-//! - `wallets/<wallet>/chains/<chain>/outbox/new.tx`                — write to stage
-//! - `wallets/<wallet>/chains/<chain>/outbox/pending/<id>/<file>`   — read staged
-//! - `wallets/<wallet>/chains/<chain>/outbox/pending/<id>/confirm`  — write to broadcast
-//! - `wallets/<wallet>/chains/<chain>/outbox/sent/<id>/<file>`      — read sent
-//! - `wallets/<wallet>/chains/<chain>/outbox/failed/<id>/<file>`    — read failed
 //! - `wallets/<wallet>/<n>/account.json`                            — numbered account: both families' keys
-//! - `wallets/<wallet>/<n>/chains/<chain>/...`                      — the chain views above, re-rooted at account n's key
+//! - `wallets/<wallet>/<n>/address.evm`                             — the account's EVM address (checksummed), if it has an EVM key
+//! - `wallets/<wallet>/<n>/address.evm.qr.{svg,png}`                — scannable QR images of that address
+//! - `wallets/<wallet>/<n>/address.sol`                             — the account's Solana address, if it has a Solana key
+//! - `wallets/<wallet>/<n>/address.sol.qr.{svg,png}`                — scannable QR images of that address
+//! - `wallets/<wallet>/<n>/public_key`                              — canonical public key hex (EVM key, else Solana)
+//! - `wallets/<wallet>/<n>/chains/<chain>/{balance,balance.raw,balance.json}` — native balance of account n
+//! - `wallets/<wallet>/<n>/chains/<evm-chain>/nonce`
+//! - `wallets/<wallet>/<n>/chains/<evm-chain>/{pending_external.jsonl,nonce_conflicts.json}` — mempool views of account n's address
+//! - `wallets/<wallet>/<n>/chains/<solana-chain>/address`
+//! - `wallets/<wallet>/<n>/chains/<chain>/outbox/new.tx`            — write to stage from account n
+//! - `wallets/<wallet>/<n>/chains/<chain>/outbox/pending/<id>/<file>` — read staged
+//! - `wallets/<wallet>/<n>/chains/<chain>/outbox/pending/<id>/confirm` — write to broadcast
+//! - `wallets/<wallet>/<n>/chains/<chain>/outbox/sent/<id>/<file>`  — read sent
+//! - `wallets/<wallet>/<n>/chains/<chain>/outbox/failed/<id>/<file>` — read failed
+//! - `wallets/<wallet>/<n>/sessions/<petal>/<slot>/{session.json,stop}` — delegated Petal sessions
+//!
+//! Key files and chain views exist only under a numbered account; the wallet
+//! directory has no `chains/`. Installed Petals are mounted only at the VFS
+//! root (`petals/`), never under a wallet.
 
 use sha2::Digest as _;
 use std::path::Path;
@@ -34,10 +45,11 @@ use std::sync::Arc;
 
 /// `wallets/<wallet>/<n>/...`: the numbered account view.
 mod accounts;
-use accounts::OutboxScope;
-use accounts::{accounts_json_with_numbers as render_accounts_json, parse_account_segment};
+use accounts::accounts_json_with_numbers as render_accounts_json;
 
-pub use accounts::{accounts_json_with_numbers, derivation_path_number};
+pub use accounts::{
+    ACCOUNT_KEY_FILES, accounts_json_with_numbers, derivation_path_number, parse_account_segment,
+};
 
 use async_trait::async_trait;
 use bloom_broker_api::ProtocolErrorCode;
@@ -237,12 +249,11 @@ pub struct AccountSessionEntry {
 }
 
 /// Keeps the VFS independent of the Petal runtime which depends on this crate.
-/// The daemon implements the whole seam: Petal dispatch through the router,
-/// and the session inventory and stop over the local key-state files.
+/// The daemon implements the seam that serves `wallets/<w>/<n>/sessions/`:
+/// the session inventory and stop over the local key-state files. Installed
+/// Petals themselves are mounted only at the VFS root, never per account.
 #[async_trait]
 pub trait AccountPetalMount: Send + Sync {
-    fn for_account(&self, account: AccountPetalContext) -> Arc<dyn Handler>;
-
     /// Sessions whose delegating parent is one of the account's family keys.
     /// Serves listing, stat, and `session.json` reads; never calls Broker.
     fn sessions(
@@ -286,9 +297,9 @@ pub struct WalletsHandler {
     /// client, while staging needs the whole signing seam. A chain present
     /// here but absent from `solana` is readable but cannot stage.
     solana_reads: Option<bloom_solana::SolanaChainRegistry>,
-    /// Late-bound: the Petal router is built after this handler because its
+    /// Late-bound: the Petal runtime is built after this handler because its
     /// host needs this handler, so there is exactly one of each and the
-    /// router is attached once both exist.
+    /// session seam is attached once both exist.
     account_petals: Arc<parking_lot::RwLock<Option<Arc<dyn AccountPetalMount>>>>,
 }
 
@@ -315,7 +326,7 @@ impl WalletsHandler {
         }
     }
 
-    /// Attach the Petal runtime that serves `wallets/<w>/<n>/petals/`.
+    /// Attach the session seam that serves `wallets/<w>/<n>/sessions/`.
     pub fn set_account_petals(&self, petals: Arc<dyn AccountPetalMount>) {
         *self.account_petals.write() = Some(petals);
     }
@@ -469,30 +480,6 @@ impl WalletsHandler {
             .map_err(|error| HandlerError::invalid(format!("wallet address: {error}")))?;
         let policy = crate::advisory_evm_policy(&projection, chain).map_err(err_be)?;
         Ok((address, policy))
-    }
-
-    fn projection_addresses_json(
-        &self,
-        projection: &WalletProjection,
-    ) -> Result<Vec<u8>, HandlerError> {
-        let owner = projection.primary_address().map_err(err_be)?;
-        let body = serde_json::json!({
-            "wallet": projection.wallet.wallet_id,
-            "kind": projection.wallet.wallet_kind,
-            "owner": owner,
-            "signer": owner,
-            "policy_status": "broker_verified",
-            "policy_version": projection.wallet.policy_version,
-            "policy_digest": projection.wallet.policy_digest,
-            "wallet_revocation_epoch": projection.wallet.wallet_revocation_epoch,
-            "unlocked": false,
-            "freshness": projection.freshness,
-            "observed_at_ms": projection.observed_at_ms,
-            "roles": serde_json::Map::<String, serde_json::Value>::new(),
-        });
-        let mut out = serde_json::to_vec_pretty(&body).map_err(err_be)?;
-        out.push(b'\n');
-        Ok(out)
     }
 
     fn write_permit(&self) -> Result<&HomeWritePermit, HandlerError> {
@@ -2041,19 +2028,16 @@ impl WalletsHandler {
         Ok(out)
     }
 
+    /// The wallet-wide entries beside the numbered accounts. Anything that
+    /// names one key (address, public key, QR images, chain views) lives
+    /// under `<n>/`.
     fn wallet_dir_entries() -> Vec<Entry> {
         vec![
-            Entry::file("address"),
-            Entry::file("address.qr.png"),
-            Entry::file("address.qr.svg"),
-            Entry::file("addresses.json"),
-            Entry::file("public_key"),
             Entry::file("kind"),
             Entry::file("projection.json"),
             Entry::file("accounts.json"),
             Entry::writable_file("new"),
             Entry::writable_file("policy.json"),
-            Entry::dir("chains"),
             Entry::dir("sealed-approvals"),
             Entry::dir("policy-updates"),
         ]
@@ -2345,6 +2329,74 @@ fn integrity(detail: &str) -> HandlerError {
     ))
 }
 
+/// The Broker-projected address for this account's derivation family.
+///
+/// Addresses are authority data: the Machine may validate and consume them,
+/// but it must not manufacture one from `canonical_public_key` when the
+/// Broker did not project one. Multiple network projections are acceptable
+/// only when they agree on the family's network-independent address.
+fn projected_family_address(
+    account: &bloom_broker_api::DerivedAccountPublic,
+) -> Result<Option<&str>, HandlerError> {
+    let (family, expected_encoding) = match account.derivation_profile {
+        bloom_broker_api::DerivationProfile::Bip44EvmSecp256k1V1 => {
+            ("evm", bloom_broker_api::AddressEncoding::Hex0x)
+        }
+        bloom_broker_api::DerivationProfile::Bip44SolanaSlip10Ed25519V1 => {
+            ("solana", bloom_broker_api::AddressEncoding::Base58)
+        }
+    };
+    // The derivation profile defines the account family. `chain_family` is
+    // Broker-owned routing metadata and may name a custom compatible family,
+    // so it must not decide whether this account has an address.
+    let mut projections = account.chain_projections.iter();
+    let Some(first) = projections.next() else {
+        return Ok(None);
+    };
+    if first.address_encoding != expected_encoding {
+        return Err(integrity(&format!(
+            "{family} chain projection uses the wrong address encoding"
+        )));
+    }
+    for projection in projections {
+        if projection.address_encoding != expected_encoding {
+            return Err(integrity(&format!(
+                "{family} chain projection uses the wrong address encoding"
+            )));
+        }
+        let agrees = match account.derivation_profile {
+            bloom_broker_api::DerivationProfile::Bip44EvmSecp256k1V1 => {
+                projection.address.eq_ignore_ascii_case(&first.address)
+            }
+            bloom_broker_api::DerivationProfile::Bip44SolanaSlip10Ed25519V1 => {
+                projection.address == first.address
+            }
+        };
+        if !agrees {
+            return Err(integrity(&format!(
+                "{family} chain projections disagree on the account address"
+            )));
+        }
+    }
+    match account.derivation_profile {
+        bloom_broker_api::DerivationProfile::Bip44EvmSecp256k1V1 => {
+            first
+                .address
+                .parse::<alloy::primitives::Address>()
+                .map_err(|error| integrity(&format!("invalid projected EVM address: {error}")))?;
+        }
+        bloom_broker_api::DerivationProfile::Bip44SolanaSlip10Ed25519V1 => {
+            let bytes = bs58::decode(&first.address).into_vec().map_err(|error| {
+                integrity(&format!("invalid projected Solana address: {error}"))
+            })?;
+            if bytes.len() != 32 {
+                return Err(integrity("projected Solana address is not 32 bytes"));
+            }
+        }
+    }
+    Ok(Some(first.address.as_str()))
+}
+
 /// The child's canonical BIP-39 Solana derivation path, from its `KeyRef`.
 ///
 /// Deliberately read from the `KeyRef` rather than the projection's `path`
@@ -2417,21 +2469,18 @@ impl SolanaAccount {
 
         let mut pubkey = [0_u8; 32];
         pubkey.copy_from_slice(&spki[Self::ED25519_SPKI_PREFIX.len()..]);
-        let address = bs58::encode(pubkey).into_string();
-
-        // A chain projection is present only when the Broker has a matching
-        // configured projection target, so absence is a configuration state
-        // rather than corruption. When one *is* projected, its address must
-        // agree with the key we derived the address from.
-        for projection in &account.chain_projections {
-            if projection.address_encoding == bloom_broker_api::AddressEncoding::Base58
-                && projection.address != address
-            {
-                return Err(integrity(&format!(
-                    "chain projection address '{}' does not match the derived account address '{}'",
-                    projection.address, address
-                )));
-            }
+        let address = projected_family_address(account)?
+            .ok_or_else(|| HandlerError::not_found("Solana child has no Broker-projected address"))?
+            .to_owned();
+        let projected_pubkey: [u8; 32] = bs58::decode(&address)
+            .into_vec()
+            .map_err(|error| integrity(&format!("invalid projected Solana address: {error}")))?
+            .try_into()
+            .map_err(|_| integrity("projected Solana address is not 32 bytes"))?;
+        if projected_pubkey != pubkey {
+            return Err(integrity(
+                "projected Solana address does not identify its canonical public key",
+            ));
         }
 
         Ok(Self {
@@ -2457,19 +2506,21 @@ fn is_public_solana_outbox_artifact(name: &str) -> bool {
 #[derive(Clone, Copy)]
 struct SolanaSender<'a> {
     fingerprint: &'a str,
-    address: &'a str,
+    address: Option<&'a str>,
 }
 
 /// A staged Solana transfer belongs to the account whose key it pinned.
 /// Entries staged before fingerprints were pinned belong to the key whose
-/// address paid the fee, which is what the wallet-level path has always meant.
+/// address paid the fee.
 fn solana_entry_belongs(
     staged: &bloom_solana_tx::types::StagedSolanaTransfer,
     sender: &SolanaSender<'_>,
 ) -> bool {
     match staged.account_fingerprint.as_deref() {
         Some(fingerprint) => fingerprint == sender.fingerprint,
-        None => staged.fee_payer == sender.address,
+        None => sender
+            .address
+            .is_some_and(|address| staged.fee_payer == address),
     }
 }
 
@@ -2560,19 +2611,24 @@ impl Handler for WalletsHandler {
     }
 
     async fn prepare_write_open(&self, path: &VfsPath) -> Result<(), HandlerError> {
-        let segs = path.segments();
-        let r = match segs {
-            [wallet, chains, chain, outbox, pending, id, fname]
-                if chains == "chains"
-                    && outbox == "outbox"
-                    && pending == "pending"
-                    && fname == "confirm.override" =>
-            {
-                // The wallet-level outbox is account 0's: the override
-                // write-open must not prepare anything for another
-                // account's entry.
-                let scope = self.wallet_outbox_write_family(wallet, chain).await?;
-                self.require_staged_by(wallet, chain, id, scope.address())?;
+        let r = match pending_outbox_control(path.segments()) {
+            Some(PendingOutboxControl {
+                wallet,
+                account,
+                chain,
+                id,
+                control: "confirm.override",
+            }) => {
+                // The override write-open must not prepare anything for
+                // another account's entry: a numbered outbox is its own
+                // account's.
+                let family = self.account_evm_family(wallet, account, chain).await?;
+                let address = family.address().ok_or_else(|| {
+                    HandlerError::not_found(format!(
+                        "account has no Broker-projected address for chain '{chain}'"
+                    ))
+                })?;
+                self.require_staged_by(wallet, chain, id, address)?;
                 let (_, policy) = self.planning_wallet_inputs(wallet, chain).await?;
                 let client = self
                     .chains
@@ -2616,10 +2672,11 @@ impl Handler for WalletsHandler {
     }
 
     fn cache_ttl(&self, path: &VfsPath) -> Option<std::time::Duration> {
-        let segs = path.segments();
-        match segs {
-            [_, s, _, leaf]
-                if s == "chains"
+        // Chain leaves exist only under a numbered account.
+        match path.segments() {
+            [_, number, s, _, leaf]
+                if parse_account_segment(number).is_some()
+                    && s == "chains"
                     && matches!(
                         leaf.as_str(),
                         "balance" | "balance.raw" | "balance.json" | "nonce"
@@ -2638,20 +2695,39 @@ impl Handler for WalletsHandler {
     /// that bypasses the mode check still cannot trigger a sign or
     /// broadcast just by stat'ing.
     fn is_read_side_effecting(&self, path: &VfsPath) -> bool {
-        let segs = path.segments();
-        // wallets/<w>/chains/<c>/outbox/pending/<id>/{confirm,confirm.override,replace,cancel,restage}
-        if segs.len() == 7
-            && segs[1] == "chains"
-            && segs[3] == "outbox"
-            && segs[4] == "pending"
-            && matches!(
-                segs[6].as_str(),
+        pending_outbox_control(path.segments()).is_some_and(|target| {
+            matches!(
+                target.control,
                 "confirm" | "confirm.override" | "replace" | "cancel" | "restage"
             )
+        })
+    }
+}
+
+/// A write sink under a pending outbox entry of a numbered account.
+struct PendingOutboxControl<'a> {
+    wallet: &'a str,
+    account: u32,
+    chain: &'a str,
+    id: &'a str,
+    control: &'a str,
+}
+
+/// Match `<w>/<n>/chains/<c>/outbox/pending/<id>/<control>`.
+fn pending_outbox_control(segs: &[String]) -> Option<PendingOutboxControl<'_>> {
+    match segs {
+        [wallet, number, chains, chain, outbox, pending, id, control]
+            if chains == "chains" && outbox == "outbox" && pending == "pending" =>
         {
-            return true;
+            Some(PendingOutboxControl {
+                wallet,
+                account: parse_account_segment(number)?,
+                chain,
+                id,
+                control,
+            })
         }
-        false
+        _ => None,
     }
 }
 
@@ -2699,15 +2775,9 @@ impl WalletsHandler {
             return self.lookup_account(wallet, number, &segs[2..]).await;
         }
         match segs[1].as_str() {
-            "address" | "address.qr.png" | "address.qr.svg" | "addresses.json" | "public_key"
-            | "kind" | "projection.json" | "accounts.json" => Ok(Entry::file(&segs[1])),
+            "kind" | "projection.json" | "accounts.json" => Ok(Entry::file(&segs[1])),
             "new" => Ok(Entry::writable_file("new")),
             "policy.json" => Ok(Entry::writable_file("policy.json")),
-            "chains" => match segs.len() {
-                2 => Ok(Entry::dir("chains")),
-                3 => self.lookup_chain(wallet, &segs[2], &[]).await,
-                _ => self.lookup_chain(wallet, &segs[2], &segs[3..]).await,
-            },
             "sealed-approvals" => match segs.len() {
                 2 => Ok(Entry::dir("sealed-approvals")),
                 3 if segs[2] == "new.json" => Ok(Entry::writable_file("new.json")),
@@ -2850,22 +2920,6 @@ impl WalletsHandler {
             return self.read_account(wallet, number, &segs[2..]).await;
         }
         match segs.get(1).map(|s| s.as_str()).unwrap_or("") {
-            "address" => {
-                let projection = self.wallet_projection(wallet).await?;
-                Ok(format!("{}\n", projection.primary_address().map_err(err_be)?).into_bytes())
-            }
-            "address.qr.svg" => {
-                let projection = self.wallet_projection(wallet).await?;
-                render_address_qr_svg(projection.primary_address().map_err(err_be)?)
-            }
-            "address.qr.png" => {
-                let projection = self.wallet_projection(wallet).await?;
-                render_address_qr_png(projection.primary_address().map_err(err_be)?)
-            }
-            "addresses.json" => {
-                let projection = self.wallet_projection(wallet).await?;
-                self.projection_addresses_json(&projection)
-            }
             "accounts.json" => {
                 // The cached, authenticated inventory; freshness rides on the
                 // projection, and this read carries no authority side effect.
@@ -2876,20 +2930,6 @@ impl WalletsHandler {
                 )
             }
             "new" => self.account_creation_status(wallet).await,
-            "public_key" => {
-                let projection = self.wallet_projection(wallet).await?;
-                Ok(format!(
-                    "0x{}\n",
-                    hex::encode(
-                        projection
-                            .primary_key()
-                            .map_err(err_be)?
-                            .canonical_public_key
-                            .decode()
-                    )
-                )
-                .into_bytes())
-            }
             "kind" => {
                 let projection = self.wallet_projection(wallet).await?;
                 Ok(format!("{}\n", projection.wallet.wallet_kind.as_str()).into_bytes())
@@ -2901,7 +2941,6 @@ impl WalletsHandler {
                 Ok(out)
             }
             "policy.json" => self.read_triad_wallet_policy(wallet).await,
-            "chains" if segs.len() >= 4 => self.read_chain(wallet, &segs[2], &segs[3..]).await,
             "sealed-approvals" if segs.len() == 3 && segs[2] == "new.json" => {
                 match self
                     .approval_ceremony_projection_json(wallet, None)
@@ -3005,42 +3044,6 @@ impl WalletsHandler {
         {
             return self.write_account(wallet, number, &segs[2..], data).await;
         }
-        if segs.len() >= 4 && segs[1] == "chains" && segs[3] == "outbox" {
-            if let Some(engine) = self.solana_engine(&segs[2]) {
-                // The wallet-level outbox is account 0's, fenced like the
-                // numbered tree: every stage is pinned to account 0's key,
-                // and an intent naming another account is refused.
-                let family = self.wallet_outbox_write_family(wallet, &segs[2]).await?;
-                return self
-                    .write_solana_outbox(
-                        wallet,
-                        &segs[2],
-                        &segs[4..],
-                        data,
-                        &engine,
-                        Self::solana_sender(&family),
-                        None,
-                    )
-                    .await;
-            }
-            // A Solana chain with no engine is readable but cannot stage.
-            // Say so, rather than falling through to the EVM outbox — that
-            // would hand a Solana path to a backend that cannot serve it.
-            if self.is_solana_chain(&segs[2]) {
-                return Err(HandlerError::not_found(format!(
-                    "chain '{}' is configured for reads only; staging is unavailable",
-                    segs[2]
-                )));
-            }
-            // The wallet-level EVM outbox is account 0's: the numbered
-            // implementation fixes the sender, fences the pending controls,
-            // and enforces the body-fingerprint check. `segs[1..]` re-roots
-            // the path at account 0 (`/<w>/0/chains/<c>/outbox/...`). The
-            // family lookup first only turns an unavailable inventory or a
-            // missing account-0 key into the error that names it.
-            self.wallet_outbox_write_family(wallet, &segs[2]).await?;
-            return self.write_account(wallet, 0, &segs[1..], data).await;
-        }
         if segs.len() == 2 && segs[1] == "policy.json" {
             self.write_permit()?;
             return self
@@ -3139,21 +3142,6 @@ impl WalletsHandler {
                 entries.extend(self.account_number_entries(wallet).await?);
                 Ok(entries)
             }
-            2 if segs[1] == "chains" => {
-                // Solana chains dispatch through their own engine map
-                // (`self.solana`), not the EVM `ChainRegistry` — list both.
-                // A `BTreeSet` both de-dupes (defensive: `Config::validate`
-                // refuses a name colliding across the two, but listing
-                // shouldn't double-list even if that were ever bypassed)
-                // and keeps a stable sorted order.
-                let mut names: std::collections::BTreeSet<String> =
-                    self.chains.list_names().into_iter().collect();
-                names.extend(self.solana_chain_names());
-                if let Some(solana) = &self.solana {
-                    names.extend(solana.keys().cloned());
-                }
-                Ok(names.into_iter().map(|n| Entry::dir(&n)).collect())
-            }
             2 if segs[1] == "sealed-approvals" => {
                 let mut entries = vec![
                     Entry::writable_file("new.json"),
@@ -3212,530 +3200,12 @@ impl WalletsHandler {
                 }
                 Ok(out)
             }
-            n if n >= 3 && segs[1] == "chains" => {
-                self.list_chain(wallet, &segs[2], &segs[3..]).await
-            }
             _ => Err(HandlerError::NotADir(path.to_string_path())),
         }
     }
 }
 
 impl WalletsHandler {
-    async fn lookup_chain(
-        &self,
-        wallet: &str,
-        chain: &str,
-        rest: &[String],
-    ) -> Result<Entry, HandlerError> {
-        if self.is_solana_chain(chain) {
-            return self.lookup_solana_chain(wallet, chain, rest).await;
-        }
-        let _client = self
-            .chains
-            .get(chain)
-            .ok_or_else(|| HandlerError::not_found(format!("chain '{}'", chain)))?;
-        match rest {
-            [] => Ok(Entry::dir(chain)),
-            [s] if s == "balance" || s == "balance.raw" || s == "balance.json" || s == "nonce" => {
-                Ok(Entry::file(s))
-            }
-            [s] if s == "pending_external.jsonl" || s == "nonce_conflicts.json" => {
-                Ok(Entry::file(s))
-            }
-            [s] if s == "outbox" => Ok(Entry::dir("outbox")),
-            [s, ..] if s == "outbox" => {
-                // The wallet-level outbox is account 0's view, fenced like
-                // the numbered tree.
-                let scope = self.wallet_outbox_read_scope(wallet, chain).await?;
-                self.evm_outbox_lookup(wallet, scope.read_scope(), chain, &rest[1..])
-                    .await
-            }
-            _ => Err(HandlerError::not_found(rest.join("/"))),
-        }
-    }
-
-    async fn lookup_solana_chain(
-        &self,
-        wallet: &str,
-        chain: &str,
-        rest: &[String],
-    ) -> Result<Entry, HandlerError> {
-        if rest.is_empty() {
-            return Ok(Entry::dir(chain));
-        }
-        // Balance and account leaves resolve from the Broker projection
-        // alone — `stat` never reaches the chain.
-        match rest {
-            [s] if matches!(s.as_str(), "balance" | "balance.raw" | "balance.json") => {
-                self.solana_alias_account(wallet, chain).await?;
-                return Ok(Entry::file(s));
-            }
-            [s] if s == "accounts" => return Ok(Entry::dir("accounts")),
-            [s, fp] if s == "accounts" => {
-                self.solana_account_by_fingerprint(wallet, fp).await?;
-                return Ok(Entry::dir(fp));
-            }
-            [s, fp, leaf]
-                if s == "accounts" && Self::SOLANA_ACCOUNT_LEAVES.contains(&leaf.as_str()) =>
-            {
-                self.solana_account_by_fingerprint(wallet, fp).await?;
-                return Ok(Entry::file(leaf));
-            }
-            _ => {}
-        }
-        // The chain directory itself resolves for any configured Solana
-        // chain. Everything below is outbox routing; the scoped lookup
-        // names an engine-less chain.
-        match rest {
-            [] => Ok(Entry::dir(chain)),
-            [s, outbox_rest @ ..] if s == "outbox" => {
-                // The wallet-level outbox is account 0's view, fenced like
-                // the numbered tree.
-                let scope = self.wallet_outbox_read_scope(wallet, chain).await?;
-                self.solana_outbox_lookup(wallet, scope.read_scope(), chain, outbox_rest)
-                    .await
-            }
-            _ => Err(HandlerError::not_found(rest.join("/"))),
-        }
-    }
-
-    /// Collect the set of tx hashes (lowercased `0x...` hex) that bloom
-    /// itself has staged or sent for `(wallet, chain)`. Used to filter
-    /// the mempool-index snapshot so we don't double-count our own txs
-    /// as "external pending" / "nonce conflict".
-    fn bloom_staged_hashes(&self, wallet: &str, chain: &str) -> std::collections::HashSet<String> {
-        let mut out = std::collections::HashSet::new();
-        for st in [OutboxState::Pending, OutboxState::Sent] {
-            let ids = match self.tx_engine.outbox.list(wallet, chain, st) {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-            for id in ids {
-                let Ok(entry) = self.tx_engine.outbox.read_in_state(wallet, chain, &id, st) else {
-                    continue;
-                };
-                if let Some(h) = entry.staged.tx_hash.as_deref() {
-                    out.insert(h.to_lowercase());
-                }
-            }
-        }
-        out
-    }
-
-    /// Read bloom's outbox view of nonces for `(wallet, chain)` in the
-    /// given state, filtered to the wallet-level scope's sender. The
-    /// mempool side of the conflict report is account 0's address, so an
-    /// unfiltered outbox side would report another account's nonce as a
-    /// conflict that can never exist. Returns
-    /// `(sorted_unique_nonces, nonce -> hashes)` where the hash list
-    /// contains only entries that already have a `tx_hash` (pending
-    /// entries may not).
-    fn bloom_outbox_nonces(
-        &self,
-        wallet: &str,
-        chain: &str,
-        state: OutboxState,
-        scope: OutboxScope<'_>,
-    ) -> (Vec<u64>, std::collections::BTreeMap<u64, Vec<String>>) {
-        let mut by_nonce: std::collections::BTreeMap<u64, Vec<String>> =
-            std::collections::BTreeMap::new();
-        let mut nonces: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
-        if matches!(scope, OutboxScope::Empty) {
-            // No account-0 key: the wallet-level outbox shows nothing.
-            return (Vec::new(), by_nonce);
-        }
-        let ids = match self.tx_engine.outbox.list(wallet, chain, state) {
-            Ok(v) => v,
-            Err(_) => return (Vec::new(), by_nonce),
-        };
-        for id in ids {
-            let Ok(entry) = self
-                .tx_engine
-                .outbox
-                .read_in_state(wallet, chain, &id, state)
-            else {
-                continue;
-            };
-            if !self.evm_scope_allows(&entry.staged.from, scope) {
-                continue;
-            }
-            nonces.insert(entry.staged.nonce);
-            if let Some(h) = entry.staged.tx_hash.as_deref() {
-                by_nonce
-                    .entry(entry.staged.nonce)
-                    .or_default()
-                    .push(h.to_lowercase());
-            }
-        }
-        (nonces.into_iter().collect(), by_nonce)
-    }
-
-    async fn read_chain(
-        &self,
-        wallet: &str,
-        chain: &str,
-        rest: &[String],
-    ) -> Result<Vec<u8>, HandlerError> {
-        if self.is_solana_chain(chain) {
-            return self.read_solana_chain(wallet, chain, rest).await;
-        }
-        // Read-only chain leaves (balance/nonce): never gated on policy sig.
-        let address: alloy::primitives::Address = self
-            .wallet_projection(wallet)
-            .await?
-            .primary_address()
-            .map_err(err_be)?
-            .parse()
-            .map_err(|error| {
-                HandlerError::backend(format!("invalid projected address: {error}"))
-            })?;
-        let client = self
-            .chains
-            .get(chain)
-            .ok_or_else(|| HandlerError::not_found(format!("chain '{}'", chain)))?;
-        match rest {
-            [s] if s == "balance" => {
-                let bal = client.balance(address).await.map_err(err_be)?;
-                let spec = client.spec();
-                Ok(super::balances::display_line(
-                    bal,
-                    spec.native_decimals,
-                    &spec.native_symbol,
-                ))
-            }
-            [s] if s == "balance.raw" => {
-                let bal = client.balance(address).await.map_err(err_be)?;
-                Ok(super::balances::raw_line(bal))
-            }
-            [s] if s == "balance.json" => {
-                let bal = client.balance(address).await.map_err(err_be)?;
-                let spec = client.spec();
-                Ok(super::balances::balance_json(
-                    chain,
-                    "native",
-                    None,
-                    &spec.native_symbol,
-                    spec.native_decimals,
-                    bal,
-                ))
-            }
-            [s] if s == "nonce" => {
-                let n = client.nonce(address).await.map_err(err_be)?;
-                Ok(format!("{}\n", n).into_bytes())
-            }
-            [s, state, id, fname] if s == "outbox" => {
-                // Honour the path's state segment (fix #8): only read from
-                // the requested state, NotFound otherwise. The wallet-level
-                // outbox is account 0's view.
-                let scope = self.wallet_outbox_read_scope(wallet, chain).await?;
-                self.evm_outbox_read(
-                    wallet,
-                    scope.read_scope(),
-                    chain,
-                    &[state.clone(), id.clone(), fname.clone()],
-                )
-                .await
-            }
-            [s] if s == "pending_external.jsonl" => {
-                // Cross-reference against the outbox so we don't surface
-                // bloom's own txs as "external pending". A tx is external
-                // iff its hash is NOT in the union of pending+sent outbox
-                // entries for this wallet+chain (pending entries may have
-                // no hash yet — those are dropped from the exclusion set).
-                let idx = match self.mempool_indexes.get(chain) {
-                    Some(i) => i,
-                    None => return Ok(Vec::new()),
-                };
-                let own_hashes = self.bloom_staged_hashes(wallet, chain);
-                let mut out = Vec::new();
-                for tx in idx.snapshot().into_iter().filter(|t| t.from == address) {
-                    let hex = format!("{:?}", tx.hash).to_lowercase();
-                    if own_hashes.contains(&hex) {
-                        continue;
-                    }
-                    serde_json::to_writer(&mut out, &tx).map_err(err_be)?;
-                    out.push(b'\n');
-                }
-                Ok(out)
-            }
-            [s] if s == "nonce_conflicts.json" => {
-                // A real conflict is a (nonce, hash) the mempool index
-                // observed for this wallet that doesn't match any of
-                // bloom's own outbox entries at that nonce. Report the
-                // raw observed_nonces set for backward compat, and add
-                // the outbox-side view + the computed conflict list.
-                let (observed, mempool_by_nonce) = match self.mempool_indexes.get(chain) {
-                    Some(i) => {
-                        let snap = i.snapshot();
-                        let observed = i.observed_nonces(address);
-                        // (nonce -> hash) for this address in the mempool.
-                        // Multiple entries at the same nonce are possible
-                        // (replacements). We surface them all as candidate
-                        // conflicts and let the dedupe against our own
-                        // hashes filter them out below.
-                        let mut by_nonce: std::collections::BTreeMap<u64, Vec<String>> =
-                            std::collections::BTreeMap::new();
-                        for tx in snap.into_iter().filter(|t| t.from == address) {
-                            let hex = format!("{:?}", tx.hash).to_lowercase();
-                            by_nonce.entry(tx.nonce).or_default().push(hex);
-                        }
-                        (observed, by_nonce)
-                    }
-                    None => (Vec::new(), std::collections::BTreeMap::new()),
-                };
-                let outbox_scope = self.wallet_outbox_read_scope(wallet, chain).await?;
-                let scope = outbox_scope.read_scope();
-                let (pending_nonces, pending_by_nonce) =
-                    self.bloom_outbox_nonces(wallet, chain, OutboxState::Pending, scope);
-                let (sent_nonces, sent_by_nonce) =
-                    self.bloom_outbox_nonces(wallet, chain, OutboxState::Sent, scope);
-                // Union of nonces we ourselves staged or sent: any nonce
-                // the mempool also sees here is a candidate for conflict.
-                let mut conflicts: Vec<serde_json::Value> = Vec::new();
-                let mut outbox_by_nonce: std::collections::BTreeMap<u64, Vec<String>> =
-                    std::collections::BTreeMap::new();
-                for (n, hs) in pending_by_nonce.iter().chain(sent_by_nonce.iter()) {
-                    outbox_by_nonce
-                        .entry(*n)
-                        .or_default()
-                        .extend(hs.iter().cloned());
-                }
-                for (nonce, mempool_hashes) in mempool_by_nonce.iter() {
-                    let Some(outbox_hashes) = outbox_by_nonce.get(nonce) else {
-                        continue;
-                    };
-                    for mh in mempool_hashes {
-                        // Only flag when the mempool's hash isn't one of
-                        // our own — i.e. someone else (or a re-broadcast
-                        // we don't recognise) is occupying our nonce.
-                        if outbox_hashes.iter().any(|oh| oh == mh) {
-                            continue;
-                        }
-                        // Pick any outbox hash at this nonce for the
-                        // report; callers can cross-reference if they
-                        // want more detail.
-                        let outbox_hash = outbox_hashes.first().cloned();
-                        conflicts.push(serde_json::json!({
-                            "nonce": nonce,
-                            "mempool_hash": mh,
-                            "outbox_hash": outbox_hash,
-                        }));
-                    }
-                }
-                let body = serde_json::json!({
-                    "address": bloom_proto::checksum_address(&address),
-                    "observed_nonces": observed,
-                    "outbox_pending_nonces": pending_nonces,
-                    "outbox_sent_nonces": sent_nonces,
-                    "conflicts": conflicts,
-                });
-                serde_json::to_vec_pretty(&body).map_err(err_be)
-            }
-            _ => Err(HandlerError::NotAFile(rest.join("/"))),
-        }
-    }
-
-    async fn read_solana_chain(
-        &self,
-        wallet: &str,
-        chain: &str,
-        rest: &[String],
-    ) -> Result<Vec<u8>, HandlerError> {
-        // IPC reads bypass lookup, so Solana must enforce the same wallet
-        // projection availability gate as the EVM read path.
-        let _projection = self.wallet_projection(wallet).await?;
-
-        // Account reads. `address` is projection-only; a balance leaf makes
-        // exactly one getBalance call for the account it names.
-        match rest {
-            [leaf] if matches!(leaf.as_str(), "balance" | "balance.raw" | "balance.json") => {
-                let account = self.solana_alias_account(wallet, chain).await?;
-                let lamports = self.solana_balance(chain, &account.address).await?;
-                return Ok(Self::solana_balance_bytes(leaf, chain, &account, lamports));
-            }
-            [s, fp, leaf] if s == "accounts" && leaf == "address" => {
-                let account = self.solana_account_by_fingerprint(wallet, fp).await?;
-                return Ok(format!("{}\n", account.address).into_bytes());
-            }
-            [s, fp, leaf]
-                if s == "accounts"
-                    && matches!(leaf.as_str(), "balance" | "balance.raw" | "balance.json") =>
-            {
-                let account = self.solana_account_by_fingerprint(wallet, fp).await?;
-                let lamports = self.solana_balance(chain, &account.address).await?;
-                return Ok(Self::solana_balance_bytes(leaf, chain, &account, lamports));
-            }
-            _ => {}
-        }
-
-        match rest {
-            [s, outbox_rest @ ..] if s == "outbox" => {
-                // The wallet-level outbox is account 0's view. An
-                // engine-less chain has no outbox to read; the scoped read
-                // names that.
-                let scope = self.wallet_outbox_read_scope(wallet, chain).await?;
-                self.solana_outbox_read(wallet, scope.read_scope(), chain, outbox_rest)
-                    .await
-            }
-            _ => Err(HandlerError::NotAFile(rest.join("/"))),
-        }
-    }
-
-    async fn list_solana_chain(
-        &self,
-        wallet: &str,
-        chain: &str,
-        rest: &[String],
-    ) -> Result<Vec<Entry>, HandlerError> {
-        if rest.is_empty() {
-            // `outbox/` is advertised only when this chain can actually
-            // stage; a reads-only chain lists no writable surface.
-            let mut entries = vec![
-                Entry::file("balance"),
-                Entry::file("balance.raw"),
-                Entry::file("balance.json"),
-                Entry::dir("accounts"),
-            ];
-            if self.solana_engine(chain).is_some() {
-                entries.push(Entry::dir("outbox"));
-            }
-            return Ok(entries);
-        }
-        match rest {
-            [s] if s == "accounts" => {
-                // One Broker fetch, no chain calls: listing never fans out
-                // balance lookups across children.
-                return Ok(self
-                    .solana_accounts(wallet)
-                    .await?
-                    .into_iter()
-                    .map(|a| Entry::dir(&a.fingerprint))
-                    .collect());
-            }
-            [s, fp] if s == "accounts" => {
-                self.solana_account_by_fingerprint(wallet, fp).await?;
-                return Ok(Self::SOLANA_ACCOUNT_LEAVES
-                    .iter()
-                    .map(|leaf| Entry::file(leaf))
-                    .collect());
-            }
-            _ => {}
-        }
-        match rest {
-            [] => Ok(vec![Entry::dir("outbox")]),
-            [s] if s == "outbox" => {
-                // The wallet-level outbox is account 0's view.
-                let scope = self.wallet_outbox_read_scope(wallet, chain).await?;
-                self.solana_outbox_list(wallet, scope.read_scope(), chain, &[])
-                    .await
-            }
-            [s, outbox_rest @ ..] if s == "outbox" => {
-                let scope = self.wallet_outbox_read_scope(wallet, chain).await?;
-                self.solana_outbox_list(wallet, scope.read_scope(), chain, outbox_rest)
-                    .await
-            }
-            _ => Err(HandlerError::NotADir(rest.join("/"))),
-        }
-    }
-
-    /// One resolved Solana child, derived entirely from the Broker's
-    /// `wallet.accounts` projection. Every field here is projection-derived,
-    /// so building it costs no chain calls.
-    ///
-    /// `fingerprint` is the full canonical lowercase hex fingerprint — the
-    /// durable path identity under `accounts/`. Prefixes are accepted as
-    /// *input* convenience by `new.tx`, never used as a path.
-    async fn solana_accounts(&self, wallet: &str) -> Result<Vec<SolanaAccount>, HandlerError> {
-        let broker = self.broker.as_ref().ok_or_else(|| {
-            HandlerError::backend("Broker edge is unavailable for Solana accounts")
-        })?;
-        let accounts = broker
-            .wallet_accounts(
-                bloom_broker_api::Token::new(wallet.to_owned())
-                    .map_err(|error| HandlerError::invalid(error.to_string()))?,
-            )
-            .await
-            .map_err(|error| HandlerError::backend(error.to_string()))?;
-        bloom_solana_tx::account::active_accounts(
-            &accounts.accounts,
-            bloom_broker_api::DerivationProfile::Bip44SolanaSlip10Ed25519V1,
-        )
-        .into_iter()
-        .map(SolanaAccount::from_projection)
-        .collect()
-    }
-
-    /// Resolve the child the top-level `balance*` aliases refer to.
-    ///
-    /// Wallet-level paths mean account 0: the alias resolves to the canonical
-    /// initial child whenever it is active, even after further children
-    /// exist. Only when the wallet has no active account-0 child does the
-    /// alias fail, naming the canonical `accounts/<fingerprint>/` paths.
-    async fn solana_alias_account(
-        &self,
-        wallet: &str,
-        chain: &str,
-    ) -> Result<SolanaAccount, HandlerError> {
-        let mut accounts = self.solana_accounts(wallet).await?;
-        match accounts.len() {
-            // One active child is the wallet-level account only when it is
-            // the canonical initial child; a lone child at another path is a
-            // numbered account, never a wallet-level default.
-            1 => {
-                let account = accounts.remove(0);
-                if account.derivation_path == "m/44'/501'/0'/0'" {
-                    Ok(account)
-                } else {
-                    let fp = account.fingerprint;
-                    Err(HandlerError::invalid(format!(
-                        "wallet '{wallet}' has no Solana account at the canonical initial path; \
-                         read chains/{chain}/accounts/{fp}/ instead"
-                    )))
-                }
-            }
-            0 => Err(HandlerError::not_found(format!(
-                "wallet '{wallet}' has no active Solana account"
-            ))),
-            _ => {
-                let zero_path = "m/44'/501'/0'/0'";
-                if let Some(initial) = accounts.iter().find(|a| a.derivation_path == zero_path) {
-                    return Ok(initial.clone());
-                }
-                let paths = accounts
-                    .iter()
-                    .map(|a| format!("chains/{chain}/accounts/{}/", a.fingerprint))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                Err(HandlerError::invalid(format!(
-                    "wallet '{wallet}' has {} active Solana accounts and none is the canonical initial child; read one of: {paths}",
-                    accounts.len()
-                )))
-            }
-        }
-    }
-
-    /// The active child named by a full canonical fingerprint.
-    ///
-    /// Only the full lowercase fingerprint is accepted as a path segment:
-    /// prefixes are input convenience for `new.tx`, but a prefix that is
-    /// unique today can become ambiguous when another child is allocated,
-    /// so it is not a durable path identity.
-    async fn solana_account_by_fingerprint(
-        &self,
-        wallet: &str,
-        fingerprint: &str,
-    ) -> Result<SolanaAccount, HandlerError> {
-        self.solana_accounts(wallet)
-            .await?
-            .into_iter()
-            .find(|a| a.fingerprint == fingerprint)
-            .ok_or_else(|| {
-                HandlerError::not_found(format!(
-                    "wallet '{wallet}' has no active Solana account '{fingerprint}'"
-                ))
-            })
-    }
-
     /// Read a Solana account's lamport balance. The one place in the Solana
     /// read surface that touches the chain.
     async fn solana_balance(&self, chain: &str, address: &str) -> Result<u64, HandlerError> {
@@ -3849,11 +3319,11 @@ impl WalletsHandler {
     }
 
     /// The Solana outbox write surface. `pinned` is the account the path
-    /// fixes (`wallets/<w>/<n>/`, or account 0 at wallet level): every new
-    /// stage spends from it, an intent naming any other account is refused,
-    /// and the pending controls act only on entries it staged. `account` is
-    /// the mounted number (`None` at wallet level), so an approval challenge
-    /// points back at the surface the confirm came through.
+    /// fixes (`wallets/<w>/<n>/`): every new stage spends from it, an intent
+    /// naming any other account is refused, and the pending controls act
+    /// only on entries it staged. `account` is the mounted number, so an
+    /// approval challenge points back at the surface the confirm came
+    /// through.
     #[allow(clippy::too_many_arguments)]
     async fn write_solana_outbox(
         &self,
@@ -3863,7 +3333,7 @@ impl WalletsHandler {
         data: &[u8],
         engine: &Arc<bloom_solana_tx::engine::SolanaTransferEngine>,
         pinned: SolanaSender<'_>,
-        account: Option<u32>,
+        account: u32,
     ) -> Result<(), HandlerError> {
         let require_pinned = |staged: &bloom_solana_tx::types::StagedSolanaTransfer,
                               id: &str|
@@ -3986,15 +3456,8 @@ impl WalletsHandler {
                         ceremony_url,
                         ceremony_expires_at_ms,
                     } => {
-                        // The wallet-level outbox is fenced to account 0, so
-                        // a wallet-level pointer would not resolve for any
-                        // other account's entry.
-                        let outbox_path = match account {
-                            Some(number) => {
-                                format!("wallets/{wallet}/{number}/chains/{chain}/outbox")
-                            }
-                            None => format!("wallets/{wallet}/chains/{chain}/outbox"),
-                        };
+                        let outbox_path =
+                            format!("wallets/{wallet}/{account}/chains/{chain}/outbox");
                         let challenge = serde_json::to_vec_pretty(&serde_json::json!({
                             "schema": "bloom.solana-approval-challenge/1",
                             "action_id": entry.staged.id,
@@ -4105,49 +3568,8 @@ impl WalletsHandler {
         }
     }
 
-    async fn list_chain(
-        &self,
-        wallet: &str,
-        chain: &str,
-        rest: &[String],
-    ) -> Result<Vec<Entry>, HandlerError> {
-        if self.is_solana_chain(chain) {
-            return self.list_solana_chain(wallet, chain, rest).await;
-        }
-        let _projection = self.wallet_projection(wallet).await?;
-        let _client = self
-            .chains
-            .get(chain)
-            .ok_or_else(|| HandlerError::not_found(format!("chain '{}'", chain)))?;
-        match rest {
-            [] => Ok(vec![
-                Entry::file("balance"),
-                Entry::file("balance.raw"),
-                Entry::file("balance.json"),
-                Entry::file("nonce"),
-                Entry::file("pending_external.jsonl"),
-                Entry::file("nonce_conflicts.json"),
-                Entry::dir("outbox"),
-            ]),
-            [s] if s == "outbox" => {
-                // The wallet-level outbox is account 0's view, fenced like
-                // the numbered tree.
-                let scope = self.wallet_outbox_read_scope(wallet, chain).await?;
-                self.evm_outbox_list(wallet, scope.read_scope(), chain, &[])
-                    .await
-            }
-            [s, outbox_rest @ ..] if s == "outbox" => {
-                let scope = self.wallet_outbox_read_scope(wallet, chain).await?;
-                self.evm_outbox_list(wallet, scope.read_scope(), chain, outbox_rest)
-                    .await
-            }
-            _ => Err(HandlerError::NotADir(rest.join("/"))),
-        }
-    }
-
     /// A pending entry is actionable only when the path's account key staged
-    /// it (`wallets/<w>/<n>/`, or account 0 at wallet level); another
-    /// account's entry is not found.
+    /// it (`wallets/<w>/<n>/`); another account's entry is not found.
     fn require_staged_by(
         &self,
         wallet: &str,
@@ -4876,7 +4298,7 @@ mod tests {
                             bloom_broker_api::DerivationProfile::Bip44SolanaSlip10Ed25519V1,
                             "m/44'/501'/2'/0'",
                             0x32,
-                            "Sol2",
+                            &bs58::encode([0x32; 32]).into_string(),
                         );
                         let mut key_refs = Vec::new();
                         for account in [evm, solana] {
@@ -5097,13 +4519,13 @@ mod tests {
                 Profile::Bip44SolanaSlip10Ed25519V1,
                 "m/44'/501'/0'/0'",
                 0x20,
-                "Sol0",
+                &bs58::encode([0x20; 32]).into_string(),
             ),
             derived_account(
                 Profile::Bip44SolanaSlip10Ed25519V1,
                 "m/44'/501'/1'/0'",
                 0x21,
-                "Sol1",
+                &bs58::encode([0x21; 32]).into_string(),
             ),
             derived_account(
                 Profile::Bip44EvmSecp256k1V1,
@@ -5154,7 +4576,10 @@ mod tests {
         assert_eq!(one["evm"]["address"], evm1);
         assert_eq!(one["evm"]["path"], "m/44'/60'/0'/0/1");
         assert_eq!(one["solana"]["state"], "active");
-        assert_eq!(one["solana"]["address"], "Sol1");
+        assert_eq!(
+            one["solana"]["address"],
+            bs58::encode([0x21; 32]).into_string()
+        );
         assert_eq!(one["freshness"], "fresh");
 
         // accounts.json names each entry's number.
@@ -5218,7 +4643,7 @@ mod tests {
         ));
 
         // Each account offers its own new.tx and, for its pending entries,
-        // the same writable controls as the wallet-level outbox.
+        // the writable controls.
         let new_tx = handler
             .lookup(&vfs(format!("/{w}/1/chains/anvil/outbox/new.tx")))
             .await
@@ -5344,8 +4769,8 @@ mod tests {
         }
     }
 
-    /// Two BIP-39 accounts (0 and 1, both families) for the wallet-level
-    /// fence tests. Account 0's EVM key is the fixture wallet address, so
+    /// Two BIP-39 accounts (0 and 1, both families) for the account fence
+    /// tests. Account 0's EVM key is the fixture wallet address, so
     /// `seed_pending` entries belong to account 0.
     fn two_account_projection(f: &Fixture) -> (Arc<dyn WalletProjectionReader>, String, String) {
         use bloom_broker_api::DerivationProfile as Profile;
@@ -5421,12 +4846,13 @@ mod tests {
             .unwrap();
     }
 
-    /// The wallet contract (`docs/architecture/Wallet.md`): the
-    /// wallet-level outbox is account 0's view, so another account's
-    /// pending entry is invisible there — list, lookup, and artifact reads
-    /// all miss — while account 0's own entries behave exactly as before.
+    /// The wallet contract (`docs/architecture/Wallet.md`): an account's
+    /// outbox shows only the entries its key staged, so another account's
+    /// pending entry is invisible under account 0 — list, lookup, and
+    /// artifact reads all miss — while account 0's own entries behave
+    /// normally.
     #[tokio::test]
-    async fn wallet_level_outbox_shows_only_account_zero_evm() {
+    async fn account_zero_outbox_shows_only_its_own_evm_entries() {
         let f = make_handler_with_chain(true);
         let (projection, _evm0, evm1) = two_account_projection(&f);
         seed_pending_with_created_ms(&f, "from-account-zero", 1_000);
@@ -5436,7 +4862,7 @@ mod tests {
         let w = &f.wallet_name;
 
         let pending: Vec<String> = handler
-            .list(&vfs(format!("/{w}/chains/anvil/outbox/pending")))
+            .list(&vfs(format!("/{w}/0/chains/anvil/outbox/pending")))
             .await
             .unwrap()
             .into_iter()
@@ -5444,11 +4870,11 @@ mod tests {
             .collect();
         assert_eq!(pending, ["from-account-zero"], "{pending:?}");
 
-        // Lookup and reads of account 1's entry miss at wallet level, in
-        // every state spelling and for its artifacts too.
+        // Lookup and reads of account 1's entry miss under account 0, for
+        // the entry and its artifacts.
         for path in [
-            format!("/{w}/chains/anvil/outbox/pending/from-account-one"),
-            format!("/{w}/chains/anvil/outbox/pending/from-account-one/plan.md"),
+            format!("/{w}/0/chains/anvil/outbox/pending/from-account-one"),
+            format!("/{w}/0/chains/anvil/outbox/pending/from-account-one/plan.md"),
         ] {
             assert!(
                 matches!(
@@ -5463,7 +4889,7 @@ mod tests {
         assert!(matches!(
             handler
                 .read(&vfs(format!(
-                    "/{w}/chains/anvil/outbox/pending/from-account-one/plan.md"
+                    "/{w}/0/chains/anvil/outbox/pending/from-account-one/plan.md"
                 )))
                 .await,
             Err(HandlerError::NotFound(_))
@@ -5471,7 +4897,7 @@ mod tests {
         assert!(matches!(
             handler
                 .read(&vfs(format!(
-                    "/{w}/chains/anvil/outbox/pending/from-account-one"
+                    "/{w}/0/chains/anvil/outbox/pending/from-account-one"
                 )))
                 .await,
             Err(HandlerError::NotAFile(_))
@@ -5479,38 +4905,29 @@ mod tests {
         assert!(
             handler
                 .list(&vfs(format!(
-                    "/{w}/chains/anvil/outbox/pending/from-account-one"
+                    "/{w}/0/chains/anvil/outbox/pending/from-account-one"
                 )))
                 .await
                 .is_err()
         );
 
-        // Account 0's own entry still behaves as before: it resolves and
-        // advertises its controls at wallet level.
+        // Account 0's own entry resolves and reads.
         let entry = handler
             .lookup(&vfs(format!(
-                "/{w}/chains/anvil/outbox/pending/from-account-zero"
+                "/{w}/0/chains/anvil/outbox/pending/from-account-zero"
             )))
             .await
             .unwrap();
         assert_eq!(entry.name, "from-account-zero");
         let plan = handler
             .read(&vfs(format!(
-                "/{w}/chains/anvil/outbox/pending/from-account-zero/plan.md"
+                "/{w}/0/chains/anvil/outbox/pending/from-account-zero/plan.md"
             )))
             .await
             .unwrap();
         assert_eq!(plan, b"p");
 
-        // The numbered views are untouched by the wallet-level fence.
-        let zero: Vec<String> = handler
-            .list(&vfs(format!("/{w}/0/chains/anvil/outbox/pending")))
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|entry| entry.name)
-            .collect();
-        assert_eq!(zero, ["from-account-zero"]);
+        // Account 1's own view shows its entry.
         let one: Vec<String> = handler
             .list(&vfs(format!("/{w}/1/chains/anvil/outbox/pending")))
             .await
@@ -5521,7 +4938,7 @@ mod tests {
         assert_eq!(one, ["from-account-one"]);
     }
 
-    /// The S4 regression: a wallet-level write to `confirm`,
+    /// The S4 regression: a write under account 0 to `confirm`,
     /// `confirm.override`, `replace`, or `cancel` on another account's
     /// entry returns NotFound and issues no Broker request of any kind —
     /// the old code returned a denial-shaped error while preparing the
@@ -5531,7 +4948,7 @@ mod tests {
     /// refuses), proving both that the fence is account-scoped and that the
     /// empty request log for account 1 is observed, not vacuous.
     #[tokio::test]
-    async fn wallet_level_controls_cannot_touch_account_one_evm_entries() {
+    async fn account_zero_controls_cannot_touch_account_one_evm_entries() {
         let f = make_handler_with_chain(true);
         let (projection, _evm0, evm1) = two_account_projection(&f);
         seed_pending_from(
@@ -5591,7 +5008,7 @@ mod tests {
 
         for control in ["confirm", "confirm.override", "replace", "cancel"] {
             let path = vfs(format!(
-                "/{w}/chains/anvil/outbox/pending/from-account-one/{control}"
+                "/{w}/0/chains/anvil/outbox/pending/from-account-one/{control}"
             ));
             let body: &[u8] = if control == "replace" {
                 br#"to = "0x0000000000000000000000000000000000000002"
@@ -5609,7 +5026,7 @@ value = "0""#
             if control == "confirm.override" {
                 let opened = handler
                     .prepare_write_open(&vfs(format!(
-                        "/{w}/chains/anvil/outbox/pending/from-account-one/confirm.override"
+                        "/{w}/0/chains/anvil/outbox/pending/from-account-one/confirm.override"
                     )))
                     .await;
                 assert!(
@@ -5628,7 +5045,7 @@ value = "0""#
         let own = handler
             .write(
                 &vfs(format!(
-                    "/{w}/chains/anvil/outbox/pending/from-account-zero/confirm"
+                    "/{w}/0/chains/anvil/outbox/pending/from-account-zero/confirm"
                 )),
                 b"y",
             )
@@ -5648,36 +5065,36 @@ value = "0""#
     }
 
     /// `latest` is scoped: another account's newer pending entry never
-    /// pulls the wallet-level `latest`, which stays on account 0's newest
-    /// (or disappears when account 0 has none). The numbered view resolves
-    /// its own account's newest.
+    /// pulls account 0's `latest`, which stays on account 0's newest (or
+    /// disappears when account 0 has none). Account 1 resolves its own
+    /// newest.
     #[tokio::test]
-    async fn wallet_level_outbox_latest_is_scoped_to_account_zero() {
+    async fn outbox_latest_is_scoped_to_its_account() {
         let f = make_handler_with_chain(true);
         let (projection, _evm0, evm1) = two_account_projection(&f);
         let w = &f.wallet_name;
 
-        // Only account 1 has a pending entry: wallet level has no latest.
+        // Only account 1 has a pending entry: account 0 has no latest.
         seed_pending_from(&f, "from-account-one", &evm1, 9_000);
         let mut handler = f.handler.clone();
         handler.wallet_projections = Some(projection.clone());
         assert!(
             !handler
-                .list(&vfs(format!("/{w}/chains/anvil/outbox")))
+                .list(&vfs(format!("/{w}/0/chains/anvil/outbox")))
                 .await
                 .unwrap()
                 .iter()
                 .any(|entry| entry.name == "latest"),
-            "another account's entry must not advertise wallet-level latest"
+            "another account's entry must not advertise account 0's latest"
         );
         assert!(matches!(
             handler
-                .lookup(&vfs(format!("/{w}/chains/anvil/outbox/latest")))
+                .lookup(&vfs(format!("/{w}/0/chains/anvil/outbox/latest")))
                 .await,
             Err(HandlerError::NotFound(_))
         ));
 
-        // Account 0's older entry becomes visible: wallet-level latest
+        // Account 0's older entry becomes visible: account 0's latest
         // points at it even though account 1's is newer.
         seed_pending_from(
             &f,
@@ -5686,7 +5103,7 @@ value = "0""#
             1_000,
         );
         let listed = handler
-            .list(&vfs(format!("/{w}/chains/anvil/outbox")))
+            .list(&vfs(format!("/{w}/0/chains/anvil/outbox")))
             .await
             .unwrap();
         assert_eq!(
@@ -5699,7 +5116,7 @@ value = "0""#
         );
         assert_eq!(
             handler
-                .lookup(&vfs(format!("/{w}/chains/anvil/outbox/latest")))
+                .lookup(&vfs(format!("/{w}/0/chains/anvil/outbox/latest")))
                 .await
                 .unwrap()
                 .link_target
@@ -5707,7 +5124,7 @@ value = "0""#
             Some("pending/from-account-zero")
         );
 
-        // The numbered view resolves its own account's newest.
+        // Account 1 resolves its own newest.
         assert_eq!(
             handler
                 .lookup(&vfs(format!("/{w}/1/chains/anvil/outbox/latest")))
@@ -5719,12 +5136,12 @@ value = "0""#
         );
     }
 
-    /// The Solana wallet-level outbox is account 0's: another account's
+    /// A Solana outbox shows only its account's entries: another account's
     /// pending entry is invisible, its controls miss, and `restage` on a
     /// Failed+Expired entry is advertised exactly for the entries the
-    /// scope can see — at wallet level and through the numbered tree.
+    /// account can see.
     #[tokio::test]
-    async fn wallet_level_solana_outbox_is_account_zero_scoped() {
+    async fn solana_outbox_is_scoped_to_its_account() {
         let f = make_handler_with_chain(true);
         let (projection, _evm0, _evm1) = two_account_projection(&f);
         // Account fingerprints as the fixture projects them.
@@ -5748,10 +5165,12 @@ value = "0""#
                 .to_owned()
         };
         let (engine, outbox) = solana_engine_fixture(&f._tmp);
-        seed_solana_entry(&outbox, "sol-zero", &fp0, "Sol0", false);
-        seed_solana_entry(&outbox, "sol-one", &fp1, "Sol1", false);
-        seed_solana_entry(&outbox, "sol-zero-expired", &fp0, "Sol0", true);
-        seed_solana_entry(&outbox, "sol-one-expired", &fp1, "Sol1", true);
+        let sol0 = bs58::encode([0x20; 32]).into_string();
+        let sol1 = bs58::encode([0x21; 32]).into_string();
+        seed_solana_entry(&outbox, "sol-zero", &fp0, &sol0, false);
+        seed_solana_entry(&outbox, "sol-one", &fp1, &sol1, false);
+        seed_solana_entry(&outbox, "sol-zero-expired", &fp0, &sol0, true);
+        seed_solana_entry(&outbox, "sol-one-expired", &fp1, &sol1, true);
         let mut handler = f.handler.clone();
         handler.wallet_projections = Some(projection);
         handler.broker = Some(MachineBrokerClient::new(Arc::new(StubBroker)));
@@ -5761,9 +5180,9 @@ value = "0""#
         )]));
         let w = &f.wallet_name;
 
-        // Wallet level lists only account 0's entries, in both states.
+        // Account 0 lists only its own entries, in both states.
         let pending: Vec<String> = handler
-            .list(&vfs(format!("/{w}/chains/solana-devnet/outbox/pending")))
+            .list(&vfs(format!("/{w}/0/chains/solana-devnet/outbox/pending")))
             .await
             .unwrap()
             .into_iter()
@@ -5771,7 +5190,7 @@ value = "0""#
             .collect();
         assert_eq!(pending, ["sol-zero"], "{pending:?}");
         let failed: Vec<String> = handler
-            .list(&vfs(format!("/{w}/chains/solana-devnet/outbox/failed")))
+            .list(&vfs(format!("/{w}/0/chains/solana-devnet/outbox/failed")))
             .await
             .unwrap()
             .into_iter()
@@ -5779,25 +5198,25 @@ value = "0""#
             .collect();
         assert_eq!(failed, ["sol-zero-expired"], "{failed:?}");
 
-        // Another account's entries miss lookups and controls at wallet
-        // level, including the restage recovery sink.
+        // Another account's entries miss lookups and controls under
+        // account 0, including the restage recovery sink.
         for path in [
-            format!("/{w}/chains/solana-devnet/outbox/pending/sol-one"),
-            format!("/{w}/chains/solana-devnet/outbox/pending/sol-one/confirm"),
-            format!("/{w}/chains/solana-devnet/outbox/pending/sol-one/cancel"),
-            format!("/{w}/chains/solana-devnet/outbox/failed/sol-one-expired/restage"),
+            format!("/{w}/0/chains/solana-devnet/outbox/pending/sol-one"),
+            format!("/{w}/0/chains/solana-devnet/outbox/pending/sol-one/confirm"),
+            format!("/{w}/0/chains/solana-devnet/outbox/pending/sol-one/cancel"),
+            format!("/{w}/0/chains/solana-devnet/outbox/failed/sol-one-expired/restage"),
         ] {
             let result = handler.lookup(&vfs(path.clone())).await;
             assert!(
                 matches!(result, Err(HandlerError::NotFound(_))),
-                "{path} must not resolve at wallet level, got {result:?}"
+                "{path} must not resolve under account 0, got {result:?}"
             );
         }
         assert!(matches!(
             handler
                 .write(
                     &vfs(format!(
-                        "/{w}/chains/solana-devnet/outbox/pending/sol-one/confirm"
+                        "/{w}/0/chains/solana-devnet/outbox/pending/sol-one/confirm"
                     )),
                     b"y",
                 )
@@ -5808,7 +5227,7 @@ value = "0""#
             handler
                 .write(
                     &vfs(format!(
-                        "/{w}/chains/solana-devnet/outbox/failed/sol-one-expired/restage"
+                        "/{w}/0/chains/solana-devnet/outbox/failed/sol-one-expired/restage"
                     )),
                     b"y",
                 )
@@ -5816,12 +5235,19 @@ value = "0""#
             Err(HandlerError::NotFound(_))
         ));
 
-        // Account 0's expired entry advertises restage at wallet level and
-        // through the numbered tree (the port), and account 1's expired
-        // entry advertises it only under account 1.
+        // Each account's expired entry advertises restage under its own
+        // account.
+        let one_failed: Vec<String> = handler
+            .list(&vfs(format!("/{w}/1/chains/solana-devnet/outbox/failed")))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect();
+        assert_eq!(one_failed, ["sol-one-expired"], "{one_failed:?}");
         for path in [
-            format!("/{w}/chains/solana-devnet/outbox/failed/sol-zero-expired"),
             format!("/{w}/0/chains/solana-devnet/outbox/failed/sol-zero-expired"),
+            format!("/{w}/1/chains/solana-devnet/outbox/failed/sol-one-expired"),
         ] {
             let names: Vec<String> = handler
                 .list(&vfs(path.clone()))
@@ -5842,42 +5268,12 @@ value = "0""#
                 .unwrap();
             assert_eq!(sink.mode, 0o644, "{path}/restage must be writable");
         }
-        let one_failed: Vec<String> = handler
-            .list(&vfs(format!("/{w}/1/chains/solana-devnet/outbox/failed")))
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|entry| entry.name)
-            .collect();
-        assert_eq!(one_failed, ["sol-one-expired"], "{one_failed:?}");
-        let names: Vec<String> = handler
-            .list(&vfs(format!(
-                "/{w}/1/chains/solana-devnet/outbox/failed/sol-one-expired"
-            )))
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|entry| entry.name)
-            .collect();
-        assert!(
-            names.contains(&"restage".to_string()),
-            "numbered failed list must advertise restage: {names:?}"
-        );
-        // Account 0's numbered view still excludes account 1's entry.
-        let zero_failed: Vec<String> = handler
-            .list(&vfs(format!("/{w}/0/chains/solana-devnet/outbox/failed")))
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|entry| entry.name)
-            .collect();
-        assert_eq!(zero_failed, ["sol-zero-expired"]);
     }
 
-    /// The wallet-level Solana `new.tx` is pinned to account 0: a body
+    /// Account 0's Solana `new.tx` is pinned to account 0: a body
     /// fingerprint naming another account is refused and nothing stages.
     #[tokio::test]
-    async fn wallet_level_solana_new_tx_refuses_account_one_fingerprint() {
+    async fn solana_new_tx_refuses_another_accounts_fingerprint() {
         let f = make_handler_with_chain(true);
         let (projection, _evm0, _evm1) = two_account_projection(&f);
         use sha2::Digest as _;
@@ -5899,7 +5295,7 @@ value = "0""#
 
         let error = handler
             .write(
-                &vfs(format!("/{w}/chains/solana-devnet/outbox/new.tx")),
+                &vfs(format!("/{w}/0/chains/solana-devnet/outbox/new.tx")),
                 serde_json::to_vec(&serde_json::json!({
                     "destination": bs58::encode([0xbbu8; 32]).into_string(),
                     "lamports": 1_000_000u64,
@@ -5923,14 +5319,14 @@ value = "0""#
                 )
                 .unwrap()
                 .is_empty(),
-            "nothing may stage through the wallet-level path"
+            "nothing may stage under account 0"
         );
     }
 
     /// Hole 3: with account 0's Solana key retired and account 1 active,
-    /// the wallet-level path must fail — never fall back to the lone
+    /// staging under account 0 must fail — never fall back to the lone
     /// active child. Account 0's history stays visible through its retired
-    /// key's scope; only spending fails.
+    /// key's fence; only spending fails.
     #[tokio::test]
     async fn retired_account_zero_solana_never_falls_back_to_account_one() {
         let f = make_handler_with_chain(true);
@@ -5946,7 +5342,7 @@ value = "0""#
                 Profile::Bip44SolanaSlip10Ed25519V1,
                 "m/44'/501'/0'/0'",
                 0x20,
-                "Sol0",
+                &bs58::encode([0x20u8; 32]).into_string(),
             ),
             derived_account(
                 Profile::Bip44SolanaSlip10Ed25519V1,
@@ -5968,7 +5364,7 @@ value = "0""#
 
         let error = handler
             .write(
-                &vfs(format!("/{w}/chains/solana-devnet/outbox/new.tx")),
+                &vfs(format!("/{w}/0/chains/solana-devnet/outbox/new.tx")),
                 serde_json::to_vec(&serde_json::json!({
                     "destination": bs58::encode([0xbbu8; 32]).into_string(),
                     "lamports": 1_000_000u64,
@@ -6015,7 +5411,7 @@ value = "0""#
         let w = &f.wallet_name;
 
         let body = handler
-            .read(&vfs(format!("/{w}/chains/anvil/nonce_conflicts.json")))
+            .read(&vfs(format!("/{w}/0/chains/anvil/nonce_conflicts.json")))
             .await
             .unwrap();
         let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
@@ -6028,18 +5424,224 @@ value = "0""#
         // Account 0's own nonce still shows.
         seed_pending_with_created_ms(&f, "from-account-zero", 2_000);
         let body = handler
-            .read(&vfs(format!("/{w}/chains/anvil/nonce_conflicts.json")))
+            .read(&vfs(format!("/{w}/0/chains/anvil/nonce_conflicts.json")))
             .await
             .unwrap();
         let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(value["outbox_pending_nonces"], serde_json::json!([0]));
     }
 
-    /// The `accounts_unavailable` exception: with no numbered tree there is
-    /// no other account to leak to, so wallet-level reads stay unfiltered
-    /// (owners keep their history) while writes fail naming the reason.
+    /// Seed an EVM sent entry staged by `from` at `nonce` with `tx_hash`.
+    fn seed_sent_from(f: &Fixture, id: &str, from: &str, nonce: u64, tx_hash: &str) {
+        seed_pending_from(f, id, from, 1_000);
+        let outbox = &f.handler.tx_engine.outbox;
+        let mut entry = outbox
+            .read_in_state(&f.wallet_name, "anvil", id, OutboxState::Pending)
+            .unwrap();
+        entry.staged.nonce = nonce;
+        entry.staged.tx_hash = Some(tx_hash.into());
+        std::fs::write(
+            entry.dir.join("intent.json"),
+            serde_json::to_vec_pretty(&entry.staged).unwrap(),
+        )
+        .unwrap();
+        outbox.transition(&entry, OutboxState::Sent).unwrap();
+    }
+
+    /// A mempool tx from `from` at `nonce`, hashed `[hash_byte; 32]`.
+    fn mempool_tx(hash_byte: u8, from: Address, nonce: u64) -> bloom_mempool::PendingTx {
+        bloom_mempool::PendingTx {
+            hash: alloy::primitives::B256::repeat_byte(hash_byte),
+            from,
+            to: None,
+            nonce,
+            value: alloy::primitives::U256::ZERO,
+            gas_limit: 21_000,
+            fees: bloom_mempool::TxFees::Legacy { gas_price: 1 },
+            input: alloy::primitives::Bytes::new(),
+            observed_at: std::time::SystemTime::now(),
+        }
+    }
+
+    /// PR #283 follow-on: `pending_external.jsonl` and `nonce_conflicts.json`
+    /// live under every numbered account, each reading that account's EVM
+    /// address from the mempool and that account's own outbox entries only.
+    /// Account 1's sent tx seen in the mempool is its own, not external; a
+    /// foreign tx at its other sent nonce is external and a conflict; and
+    /// neither account's entries reach the other.
     #[tokio::test]
-    async fn accounts_unavailable_wallet_reads_unfiltered_and_writes_fail() {
+    async fn mempool_views_follow_the_indexed_accounts_evm_key() {
+        let f = make_handler_with_chain(true);
+        let (projection, evm0, evm1) = two_account_projection(&f);
+        let addr0 = f.wallet_addr;
+        let addr1 = Address::repeat_byte(0x22);
+        let hash = |byte| format!("{:?}", alloy::primitives::B256::repeat_byte(byte));
+        let (foreign_hash, own_hash) = (hash(0x02), hash(0x04));
+        seed_pending_with_created_ms(&f, "from-account-zero", 2_000);
+        seed_sent_from(&f, "account-one-seen", &evm1, 7, &hash(0x03));
+        seed_sent_from(&f, "account-one-displaced", &evm1, 8, &own_hash);
+
+        // The index holds one tx per (from, nonce).
+        let index = bloom_mempool::PendingTxIndex::new(8);
+        index.insert(mempool_tx(0x01, addr0, 0));
+        index.insert(mempool_tx(0x03, addr1, 7));
+        index.insert(mempool_tx(0x02, addr1, 8));
+        let mut handler = f
+            .handler
+            .clone()
+            .with_mempool_indexes(std::collections::BTreeMap::from([(
+                "anvil".to_string(),
+                index,
+            )]));
+        handler.wallet_projections = Some(projection);
+        let w = &f.wallet_name;
+
+        for (account, address, expected) in
+            [(0, addr0, hash(0x01)), (1, addr1, foreign_hash.clone())]
+        {
+            let chain_dir = vfs(format!("/{w}/{account}/chains/anvil"));
+            let names: Vec<String> = handler
+                .list(&chain_dir)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|entry| entry.name)
+                .collect();
+            for leaf in ["pending_external.jsonl", "nonce_conflicts.json"] {
+                assert!(
+                    names.iter().any(|name| name == leaf),
+                    "account {account} must list {leaf}: {names:?}"
+                );
+                let entry = handler
+                    .lookup(&vfs(format!("/{w}/{account}/chains/anvil/{leaf}")))
+                    .await
+                    .unwrap();
+                assert_eq!(entry.mode, 0o444, "{leaf} is read-only");
+            }
+
+            let body = handler
+                .read(&vfs(format!(
+                    "/{w}/{account}/chains/anvil/pending_external.jsonl"
+                )))
+                .await
+                .unwrap();
+            let txs: Vec<serde_json::Value> = body
+                .split(|byte| *byte == b'\n')
+                .filter(|line| !line.is_empty())
+                .map(|line| serde_json::from_slice(line).unwrap())
+                .collect();
+            assert_eq!(txs.len(), 1, "account {account}: {txs:?}");
+            assert_eq!(txs[0]["hash"], serde_json::json!(expected));
+            assert_eq!(
+                txs[0]["from"].as_str().unwrap().to_lowercase(),
+                format!("{address:?}").to_lowercase()
+            );
+        }
+
+        for (account, expected) in [
+            (
+                0,
+                serde_json::json!({
+                    "address": evm0,
+                    "observed_nonces": [0],
+                    "outbox_pending_nonces": [0],
+                    "outbox_sent_nonces": [],
+                    "conflicts": [],
+                }),
+            ),
+            (
+                1,
+                serde_json::json!({
+                    "address": evm1,
+                    "observed_nonces": [7, 8],
+                    "outbox_pending_nonces": [],
+                    "outbox_sent_nonces": [7, 8],
+                    "conflicts": [{
+                        "nonce": 8,
+                        "mempool_hash": foreign_hash,
+                        "outbox_hash": own_hash,
+                    }],
+                }),
+            ),
+        ] {
+            let body = handler
+                .read(&vfs(format!(
+                    "/{w}/{account}/chains/anvil/nonce_conflicts.json"
+                )))
+                .await
+                .unwrap();
+            let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(value, expected, "account {account}");
+        }
+    }
+
+    /// The mempool views exist only under a numbered account's EVM chain:
+    /// the wallet root has no `chains/` alias and no bare leaves, and a
+    /// Solana chain never routes them through the account's EVM key.
+    #[tokio::test]
+    async fn mempool_views_are_absent_at_wallet_root_and_on_solana_chains() {
+        let f = make_handler_with_chain(true);
+        let (projection, _evm0, _evm1) = two_account_projection(&f);
+        let (engine, _outbox) = solana_engine_fixture(&f._tmp);
+        let mut handler = f.handler.clone();
+        handler.wallet_projections = Some(projection);
+        handler = handler.with_solana(std::collections::BTreeMap::from([(
+            "solana-devnet".to_string(),
+            std::sync::Arc::new(engine),
+        )]));
+        let w = &f.wallet_name;
+
+        let root: Vec<String> = handler
+            .list(&vfs(format!("/{w}")))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect();
+        for leaf in ["pending_external.jsonl", "nonce_conflicts.json"] {
+            assert!(
+                !root.iter().any(|name| name == leaf),
+                "wallet root must not list {leaf}: {root:?}"
+            );
+            for path in [
+                format!("/{w}/{leaf}"),
+                format!("/{w}/chains/anvil/{leaf}"),
+                format!("/{w}/0/chains/solana-devnet/{leaf}"),
+            ] {
+                assert!(
+                    matches!(
+                        handler.lookup(&vfs(path.clone())).await,
+                        Err(HandlerError::NotFound(_))
+                    ),
+                    "{path} must not resolve"
+                );
+                assert!(
+                    handler.read(&vfs(path.clone())).await.is_err(),
+                    "{path} must not read"
+                );
+            }
+        }
+        let solana: Vec<String> = handler
+            .list(&vfs(format!("/{w}/0/chains/solana-devnet")))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect();
+        assert!(
+            !solana
+                .iter()
+                .any(|name| name == "pending_external.jsonl" || name == "nonce_conflicts.json"),
+            "a Solana chain has no EVM mempool views: {solana:?}"
+        );
+    }
+
+    /// A rootless wallet whose inventory is `accounts_unavailable` has no
+    /// numbered tree, and chains live nowhere else: there is no wallet-root
+    /// `chains/` fallback to read or stage through, so nothing is exposed
+    /// and nothing stages.
+    #[tokio::test]
+    async fn accounts_unavailable_wallet_has_no_chain_views() {
         let f = make_handler_with_chain(true);
         let foreign = bloom_proto::checksum_address(&Address::repeat_byte(0x22));
         seed_pending_from(&f, "from-unknown-account", &foreign, 1_000);
@@ -6049,35 +5651,42 @@ value = "0""#
         handler.wallet_projections = Some(Arc::new(StaticProjection(projection)));
         let w = &f.wallet_name;
 
-        let pending: Vec<String> = handler
-            .list(&vfs(format!("/{w}/chains/anvil/outbox/pending")))
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|entry| entry.name)
-            .collect();
-        assert_eq!(pending, ["from-unknown-account"], "{pending:?}");
+        for path in [
+            format!("/{w}/chains/anvil/outbox/pending"),
+            format!("/{w}/0/chains/anvil/outbox/pending"),
+        ] {
+            assert!(
+                matches!(
+                    handler.lookup(&vfs(path.clone())).await,
+                    Err(HandlerError::NotFound(_))
+                ),
+                "{path} must not resolve"
+            );
+        }
 
         let error = handler
             .write(
-                &vfs(format!("/{w}/chains/anvil/outbox/new.tx")),
+                &vfs(format!("/{w}/0/chains/anvil/outbox/new.tx")),
                 br#"to = "0x0000000000000000000000000000000000000002"
 value = "0""#,
             )
             .await
             .unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("account inventory is unavailable"),
-            "the write must name the reason: {error:?}"
+        assert!(matches!(error, HandlerError::NotFound(_)), "{error:?}");
+        assert_eq!(
+            f.handler
+                .tx_engine
+                .outbox
+                .list(w, "anvil", OutboxState::Pending)
+                .unwrap(),
+            ["from-unknown-account"],
+            "nothing may stage"
         );
     }
 
     /// Legacy BIP-32 custody reports `accounts_unavailable`, but the wallet
-    /// has a root, and the root is account 0. Its wallet-level outbox keeps
-    /// staging and controlling from the root, fenced to it, exactly as it
-    /// did before numbered accounts.
+    /// has a root, and the root is account 0. Account 0's outbox keeps
+    /// staging and controlling from the root, fenced to it.
     #[tokio::test]
     async fn root_key_wallet_with_unavailable_inventory_keeps_its_root_outbox() {
         let f = make_handler_with_chain(true);
@@ -6093,7 +5702,7 @@ value = "0""#,
         let w = &f.wallet_name;
 
         let pending: Vec<String> = handler
-            .list(&vfs(format!("/{w}/chains/anvil/outbox/pending")))
+            .list(&vfs(format!("/{w}/0/chains/anvil/outbox/pending")))
             .await
             .unwrap()
             .into_iter()
@@ -6103,7 +5712,7 @@ value = "0""#,
 
         let staged = handler
             .write(
-                &vfs(format!("/{w}/chains/anvil/outbox/new.tx")),
+                &vfs(format!("/{w}/0/chains/anvil/outbox/new.tx")),
                 br#"to = "0x0000000000000000000000000000000000000002"
 value = "0""#,
             )
@@ -6121,7 +5730,7 @@ value = "0""#,
             handler
                 .write(
                     &vfs(format!(
-                        "/{w}/chains/anvil/outbox/pending/from-unknown-account/cancel"
+                        "/{w}/0/chains/anvil/outbox/pending/from-unknown-account/cancel"
                     )),
                     b"y",
                 )
@@ -6445,8 +6054,7 @@ value = "0""#,
 
     /// A BIP-39 projection whose account 0 holds both families: the
     /// canonical EVM child at the fixture's address and the given Solana
-    /// child. The wallet-level outbox is account 0's view, so both the EVM
-    /// and Solana wallet-level surfaces fence to these keys.
+    /// child. Account 0's EVM and Solana outboxes fence to these keys.
     fn bip39_projection_with_solana_account0(
         evm_address: Address,
         child_pubkey: &[u8; 32],
@@ -6498,6 +6106,7 @@ value = "0""#,
                 path: "m/44'/501'/0'/0'".into(),
             }),
         };
+        let address = bs58::encode(child_pubkey).into_string();
         bloom_broker_api::WalletAccountsPublic {
             wallet_id: token("alice"),
             seed_profile: bloom_broker_api::WalletSeedProfile::Bip39MulticurveV1,
@@ -6512,7 +6121,13 @@ value = "0""#,
                     sha2::Sha256::digest(&child_spki).into(),
                 ),
                 supported_crypto_suites: vec![bloom_broker_api::CryptoSuite::Ed25519Message],
-                chain_projections: vec![],
+                chain_projections: vec![bloom_broker_api::ChainAccountProjection {
+                    chain_family: token("solana"),
+                    caip2: "solana:test".into(),
+                    caip10: format!("solana:test:{address}"),
+                    address,
+                    address_encoding: bloom_broker_api::AddressEncoding::Base58,
+                }],
                 lifecycle: bloom_broker_api::AccountLifecycleState::Active,
             }],
         }
@@ -6532,6 +6147,7 @@ value = "0""#,
                             0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
                         ];
                         child_spki.extend_from_slice(&self.child_pubkey);
+                        let address = bs58::encode(self.child_pubkey).into_string();
                         let child_key_ref = bloom_broker_api::KeyRef {
                             backend: bloom_broker_api::Token::new("local").unwrap(),
                             backend_instance: bloom_broker_api::Token::new("primary").unwrap(),
@@ -6570,7 +6186,16 @@ value = "0""#,
                                     supported_crypto_suites: vec![
                                         bloom_broker_api::CryptoSuite::Ed25519Message,
                                     ],
-                                    chain_projections: vec![],
+                                    chain_projections: vec![
+                                        bloom_broker_api::ChainAccountProjection {
+                                            chain_family: token("solana"),
+                                            caip2: "solana:test".into(),
+                                            caip10: format!("solana:test:{address}"),
+                                            address,
+                                            address_encoding:
+                                                bloom_broker_api::AddressEncoding::Base58,
+                                        },
+                                    ],
                                     lifecycle: bloom_broker_api::AccountLifecycleState::Active,
                                 }],
                             },
@@ -6745,8 +6370,8 @@ value = "0""#,
             "solana-devnet",
         );
 
-        // The wallet-level outbox is account 0's view, so the fixture
-        // wallet must carry account 0's Solana family to stage through it.
+        // The fixture wallet must carry account 0's Solana family to stage
+        // through account 0.
         let (projection, _sol0_address, _sol0_fingerprint) =
             bip39_projection_with_solana_account0(f.wallet_addr, &child_pubkey);
         let handler = f
@@ -6764,21 +6389,21 @@ value = "0""#,
         let intent = serde_json::json!({ "destination": destination, "lamports": 1_000_000 });
         handler
             .write(
-                &VfsPath::parse("/alice/chains/solana-devnet/outbox/new.tx").unwrap(),
+                &VfsPath::parse("/alice/0/chains/solana-devnet/outbox/new.tx").unwrap(),
                 serde_json::to_vec(&intent).unwrap().as_slice(),
             )
             .await
             .unwrap();
 
         let listed = handler
-            .list(&VfsPath::parse("/alice/chains/solana-devnet/outbox/pending").unwrap())
+            .list(&VfsPath::parse("/alice/0/chains/solana-devnet/outbox/pending").unwrap())
             .await
             .unwrap();
         assert_eq!(listed.len(), 1);
         let intent_bytes = handler
             .read(
                 &VfsPath::parse(&format!(
-                    "/alice/chains/solana-devnet/outbox/pending/{}/intent.json",
+                    "/alice/0/chains/solana-devnet/outbox/pending/{}/intent.json",
                     listed[0].name
                 ))
                 .unwrap(),
@@ -6800,10 +6425,9 @@ value = "0""#,
         let f = make_handler_with_chain(true);
         let solana_tmp = tempfile::tempdir().unwrap();
         let (engine, outbox) = solana_engine_fixture(&solana_tmp);
-        // The wallet-level outbox is account 0's view, so the fixture wallet
-        // carries account 0's Solana family and the staged entry belongs to
-        // it. An entry from another account must stay invisible here; that
-        // fence is asserted below.
+        // The fixture wallet carries account 0's Solana family and the
+        // staged entry belongs to it. An entry from another account must stay
+        // invisible here; that fence is asserted below.
         let child_pubkey = [0xccu8; 32];
         let (projection, sol0_address, sol0_fingerprint) =
             bip39_projection_with_solana_account0(f.wallet_addr, &child_pubkey);
@@ -6855,7 +6479,7 @@ value = "0""#,
             .unwrap();
         std::fs::write(pending.dir.join("raw_tx"), b"secret signed transaction").unwrap();
 
-        // An entry another account staged is invisible at wallet level.
+        // An entry another account staged is invisible under account 0.
         let foreign = bloom_solana_tx::types::StagedSolanaTransfer {
             id: "0002-00002".into(),
             wallet: "alice".into(),
@@ -6875,12 +6499,12 @@ value = "0""#,
         );
 
         let new_tx = handler
-            .lookup(&VfsPath::parse("/alice/chains/solana-devnet/outbox/new.tx").unwrap())
+            .lookup(&VfsPath::parse("/alice/0/chains/solana-devnet/outbox/new.tx").unwrap())
             .await
             .unwrap();
         assert_eq!(new_tx.mode, 0o644);
         let pending_listed = handler
-            .list(&VfsPath::parse("/alice/chains/solana-devnet/outbox/pending").unwrap())
+            .list(&VfsPath::parse("/alice/0/chains/solana-devnet/outbox/pending").unwrap())
             .await
             .unwrap();
         assert_eq!(
@@ -6889,19 +6513,19 @@ value = "0""#,
                 .map(|e| e.name.as_str())
                 .collect::<Vec<_>>(),
             ["0001-00001"],
-            "another account's pending entry must not appear at wallet level"
+            "another account's pending entry must not appear under account 0"
         );
         assert!(matches!(
             handler
                 .lookup(
-                    &VfsPath::parse("/alice/chains/solana-devnet/outbox/pending/0002-00002",)
+                    &VfsPath::parse("/alice/0/chains/solana-devnet/outbox/pending/0002-00002",)
                         .unwrap()
                 )
                 .await,
             Err(HandlerError::NotFound(_))
         ));
         let outbox_entries = handler
-            .list(&VfsPath::parse("/alice/chains/solana-devnet/outbox").unwrap())
+            .list(&VfsPath::parse("/alice/0/chains/solana-devnet/outbox").unwrap())
             .await
             .unwrap();
         assert!(outbox_entries.iter().any(|entry| entry.name == "new.tx"));
@@ -6914,7 +6538,7 @@ value = "0""#,
         );
         assert_eq!(
             handler
-                .lookup(&VfsPath::parse("/alice/chains/solana-devnet/outbox/latest").unwrap())
+                .lookup(&VfsPath::parse("/alice/0/chains/solana-devnet/outbox/latest").unwrap())
                 .await
                 .unwrap()
                 .link_target
@@ -6927,7 +6551,7 @@ value = "0""#,
         let intent = handler
             .read(
                 &VfsPath::parse(
-                    "/alice/chains/solana-devnet/outbox/pending/0001-00001/intent.json",
+                    "/alice/0/chains/solana-devnet/outbox/pending/0001-00001/intent.json",
                 )
                 .unwrap(),
             )
@@ -6938,7 +6562,7 @@ value = "0""#,
         assert_eq!(parsed["chain"], "solana-devnet");
 
         let action_dir =
-            VfsPath::parse("/alice/chains/solana-devnet/outbox/pending/0001-00001").unwrap();
+            VfsPath::parse("/alice/0/chains/solana-devnet/outbox/pending/0001-00001").unwrap();
         let action_entries = handler.list(&action_dir).await.unwrap();
         assert!(
             action_entries
@@ -6946,7 +6570,7 @@ value = "0""#,
                 .any(|entry| entry.name == "approval_challenge.json")
         );
         let challenge_path = VfsPath::parse(
-            "/alice/chains/solana-devnet/outbox/pending/0001-00001/approval_challenge.json",
+            "/alice/0/chains/solana-devnet/outbox/pending/0001-00001/approval_challenge.json",
         )
         .unwrap();
         handler.lookup(&challenge_path).await.unwrap();
@@ -6962,7 +6586,7 @@ value = "0""#,
         // explicitly public, sanitized artifacts are addressable there.
         for private_artifact in [".signature", "approval.json", "raw_tx"] {
             let path = VfsPath::parse(&format!(
-                "/alice/chains/solana-devnet/outbox/pending/0001-00001/{private_artifact}"
+                "/alice/0/chains/solana-devnet/outbox/pending/0001-00001/{private_artifact}"
             ))
             .unwrap();
             assert!(handler.lookup(&path).await.is_err());
@@ -6974,7 +6598,7 @@ value = "0""#,
                 handler
                     .lookup(
                         &VfsPath::parse(&format!(
-                            "/alice/chains/solana-devnet/outbox/pending/0001-00001/{control}"
+                            "/alice/0/chains/solana-devnet/outbox/pending/0001-00001/{control}"
                         ))
                         .unwrap()
                     )
@@ -6984,7 +6608,7 @@ value = "0""#,
         }
 
         let listed = handler
-            .list(&VfsPath::parse("/alice/chains/solana-devnet/outbox/pending").unwrap())
+            .list(&VfsPath::parse("/alice/0/chains/solana-devnet/outbox/pending").unwrap())
             .await
             .unwrap();
         assert_eq!(listed.len(), 1);
@@ -6994,7 +6618,7 @@ value = "0""#,
         // registry (a Solana chain name does not shadow it).
         assert!(
             handler
-                .lookup(&VfsPath::parse("/alice/chains/anvil/outbox").unwrap())
+                .lookup(&VfsPath::parse("/alice/0/chains/anvil/outbox").unwrap())
                 .await
                 .is_ok()
         );
@@ -7002,28 +6626,29 @@ value = "0""#,
         // NotFound there.
         assert!(
             handler
-                .lookup(&VfsPath::parse("/alice/chains/solana-mainnet/outbox").unwrap())
+                .lookup(&VfsPath::parse("/alice/0/chains/solana-mainnet/outbox").unwrap())
                 .await
                 .is_err()
         );
     }
 
-    // Fix F (PLAN-SOLANA-PR-FIXES.md): `wallets/<wallet>/chains` listing
-    // only ever enumerated the EVM chain registry — Solana chains are
-    // reachable by direct path (see the dispatch test above) but never
-    // showed up when someone enumerated available chains.
+    // Account chain listings must enumerate both the EVM registry and native
+    // Solana chains.
     #[tokio::test]
     async fn chains_listing_includes_both_evm_and_solana_chains() {
         let f = make_handler_with_chain(true);
         let solana_tmp = tempfile::tempdir().unwrap();
         let (engine, _outbox) = solana_engine_fixture(&solana_tmp);
-        let handler = f.handler.with_solana(std::collections::BTreeMap::from([(
-            "solana-devnet".to_string(),
-            std::sync::Arc::new(engine),
-        )]));
+        let (projection, _, _) = bip39_projection_with_solana_account0(f.wallet_addr, &[0xcc; 32]);
+        let handler = f.handler.with_projection_reader(projection).with_solana(
+            std::collections::BTreeMap::from([(
+                "solana-devnet".to_string(),
+                std::sync::Arc::new(engine),
+            )]),
+        );
 
         let listed = handler
-            .list(&VfsPath::parse("/alice/chains").unwrap())
+            .list(&VfsPath::parse("/alice/0/chains").unwrap())
             .await
             .unwrap();
         let names: std::collections::BTreeSet<&str> =
@@ -7035,7 +6660,7 @@ value = "0""#,
         );
         assert!(
             handler
-                .lookup(&VfsPath::parse("/alice/chains/solana-devnet").unwrap())
+                .lookup(&VfsPath::parse("/alice/0/chains/solana-devnet").unwrap())
                 .await
                 .is_ok(),
             "every advertised Solana chain directory must resolve through lookup"
@@ -7046,14 +6671,14 @@ value = "0""#,
     async fn balance_cache_ttl_covers_wallet_native_balance_leaves() {
         let f = make_handler_with_chain(true);
         for leaf in ["balance", "balance.raw", "balance.json", "nonce"] {
-            let p = VfsPath::parse(&format!("/alice/chains/anvil/{leaf}")).unwrap();
+            let p = VfsPath::parse(&format!("/alice/0/chains/anvil/{leaf}")).unwrap();
             assert_eq!(
                 f.handler.cache_ttl(&p),
                 Some(super::super::balances::LIVE_BALANCE_TTL),
                 "leaf {leaf}"
             );
         }
-        let outbox = VfsPath::parse("/alice/chains/anvil/outbox").unwrap();
+        let outbox = VfsPath::parse("/alice/0/chains/anvil/outbox").unwrap();
         assert_eq!(f.handler.cache_ttl(&outbox), None);
     }
 
@@ -7887,53 +7512,485 @@ value = "0""#,
         }));
     }
 
-    #[tokio::test]
-    async fn addresses_json_reports_owner_and_signer() {
-        let f = make_handler();
-        let p = VfsPath::parse(&format!("/{}/addresses.json", f.wallet_name)).unwrap();
-        let body = f.handler.read(&p).await.unwrap();
-        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        let owner = bloom_proto::checksum_address(&f.wallet_addr);
-        assert_eq!(v["wallet"], "alice");
-        assert_eq!(v["owner"], owner);
-        assert_eq!(v["signer"], owner, "owner and signer are the same EOA");
-        assert_eq!(v["policy_status"], "broker_verified");
-        assert_eq!(v["unlocked"], false);
-        assert!(v["roles"].as_object().unwrap().is_empty());
-        // addresses.json is also a listed dir entry.
-        let dir = VfsPath::parse(&format!("/{}", f.wallet_name)).unwrap();
-        let names: Vec<String> = f
-            .handler
-            .list(&dir)
+    /// The family address files of one account, as it lists them.
+    async fn listed_address_files(handler: &WalletsHandler, w: &str, number: u32) -> Vec<String> {
+        handler
+            .list(&vfs(format!("/{w}/{number}")))
             .await
             .unwrap()
             .into_iter()
-            .map(|e| e.name)
+            .map(|entry| entry.name)
+            .filter(|name| name.starts_with("address"))
+            .collect()
+    }
+
+    /// Neither the removed account-level `addresses.json` nor a
+    /// family-less `address` alias exists under an account: not listed,
+    /// not resolvable, not readable.
+    async fn assert_no_generic_address_files(handler: &WalletsHandler, w: &str, number: u32) {
+        let names: Vec<String> = handler
+            .list(&vfs(format!("/{w}/{number}")))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.name)
             .collect();
-        assert!(names.iter().any(|n| n == "addresses.json"));
+        for leaf in [
+            "address",
+            "address.qr.svg",
+            "address.qr.png",
+            "addresses.json",
+        ] {
+            assert!(!names.iter().any(|name| name == leaf), "{leaf}: {names:?}");
+            let path = vfs(format!("/{w}/{number}/{leaf}"));
+            assert!(
+                matches!(handler.lookup(&path).await, Err(HandlerError::NotFound(_))),
+                "lookup {path}"
+            );
+            assert!(
+                matches!(handler.read(&path).await, Err(HandlerError::NotAFile(_))),
+                "read {path}"
+            );
+        }
     }
 
     #[tokio::test]
-    async fn wallet_dir_surfaces_address_qr_images() {
-        let f = make_handler();
-        let dir = VfsPath::parse(&format!("/{}", f.wallet_name)).unwrap();
-        let entries = f.handler.list(&dir).await.unwrap();
-        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
-        assert!(names.contains(&"address.qr.png"));
-        assert!(names.contains(&"address.qr.svg"));
+    async fn address_files_require_broker_projections_for_both_families() {
+        let f = make_handler_with_chain(true);
+        let w = f.wallet_name.clone();
+        let mut evm = derived_account(
+            bloom_broker_api::DerivationProfile::Bip44EvmSecp256k1V1,
+            "m/44'/60'/0'/0/0",
+            0x10,
+            &bloom_proto::checksum_address(&f.wallet_addr),
+        );
+        evm.chain_projections.clear();
+        let mut solana = solana_projection([0xcc_u8; 32]);
+        solana.chain_projections.clear();
+        let mut handler = f.handler;
+        handler.wallet_projections = Some(bip39_projection(f.wallet_addr, vec![evm, solana]));
 
-        for leaf in ["address.qr.png", "address.qr.svg"] {
-            let path = VfsPath::parse(&format!("/{}/{leaf}", f.wallet_name)).unwrap();
-            let entry = f.handler.lookup(&path).await.unwrap();
+        assert_no_family_address_files(&handler, &w, 0, "evm").await;
+        assert_no_family_address_files(&handler, &w, 0, "sol").await;
+        let account: serde_json::Value = serde_json::from_slice(
+            &handler
+                .read(&vfs(format!("/{w}/0/account.json")))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(account["evm"]["address"].is_null());
+        assert!(account["solana"]["address"].is_null());
+        handler
+            .read(&vfs(format!("/{w}/0/public_key")))
+            .await
+            .expect("the Broker-projected public key remains visible");
+        assert!(
+            handler
+                .list(&vfs(format!("/{w}/0/chains")))
+                .await
+                .unwrap()
+                .is_empty(),
+            "an account without projected addresses must not advertise chain views"
+        );
+    }
+
+    #[tokio::test]
+    async fn duplicate_account_family_entries_are_integrity_faults_in_either_order() {
+        let f = make_handler_with_chain(true);
+        let evm_address = bloom_proto::checksum_address(&f.wallet_addr);
+        let evm = derived_account(
+            bloom_broker_api::DerivationProfile::Bip44EvmSecp256k1V1,
+            "m/44'/60'/0'/0/0",
+            0x10,
+            &evm_address,
+        );
+        let mut duplicate_evm = derived_account(
+            bloom_broker_api::DerivationProfile::Bip44EvmSecp256k1V1,
+            "m/44'/60'/0'/0/0",
+            0x11,
+            &Address::repeat_byte(0x22).to_string(),
+        );
+        duplicate_evm.key_ref.locator = "wallet/derived/duplicate-evm-0".into();
+
+        let solana = solana_projection([0x20; 32]);
+        let mut duplicate_solana = solana_projection([0x21; 32]);
+        duplicate_solana.key_ref.locator = "wallet/derived/duplicate-solana-0".into();
+
+        for (family, first, second) in [
+            ("EVM", evm, duplicate_evm),
+            ("Solana", solana, duplicate_solana),
+        ] {
+            for accounts in [
+                vec![first.clone(), second.clone()],
+                vec![second.clone(), first.clone()],
+            ] {
+                let collection = bloom_broker_api::WalletAccountsPublic {
+                    wallet_id: token("alice"),
+                    seed_profile: bloom_broker_api::WalletSeedProfile::Bip39MulticurveV1,
+                    accounts: accounts.clone(),
+                };
+                collection
+                    .validate()
+                    .expect("duplicate account numbers are valid Broker wire shape");
+                let mut handler = f.handler.clone();
+                handler.wallet_projections = Some(bip39_projection(f.wallet_addr, accounts));
+                match handler.account_view(&f.wallet_name, 0).await {
+                    Err(HandlerError::Backend(message)) => assert!(
+                        message.contains(&format!("duplicate {family} entries for account 0")),
+                        "{message}"
+                    ),
+                    _ => panic!("duplicate {family} entries must fail regardless of list order"),
+                }
+            }
+        }
+    }
+
+    /// A family's address files under an account: each resolves as a file,
+    /// the text file reads the address, and the QR images are documents.
+    async fn assert_family_address_files(
+        handler: &WalletsHandler,
+        w: &str,
+        number: u32,
+        family: &str,
+        address: &str,
+    ) {
+        for leaf in [
+            format!("address.{family}"),
+            format!("address.{family}.qr.svg"),
+            format!("address.{family}.qr.png"),
+        ] {
+            let entry = handler
+                .lookup(&vfs(format!("/{w}/{number}/{leaf}")))
+                .await
+                .unwrap_or_else(|error| panic!("{number}/{leaf}: {error:?}"));
             assert_eq!(entry.name, leaf);
-            assert!(matches!(entry.kind, crate::handler::EntryKind::File));
+            assert_eq!(entry.kind, crate::handler::EntryKind::File);
+        }
+        let text = handler
+            .read(&vfs(format!("/{w}/{number}/address.{family}")))
+            .await
+            .unwrap();
+        assert_eq!(text, format!("{address}\n").into_bytes());
+        let svg = handler
+            .read(&vfs(format!("/{w}/{number}/address.{family}.qr.svg")))
+            .await
+            .unwrap();
+        assert!(String::from_utf8(svg).unwrap().contains("<svg"));
+        let png = handler
+            .read(&vfs(format!("/{w}/{number}/address.{family}.qr.png")))
+            .await
+            .unwrap();
+        assert!(png.starts_with(b"\x89PNG\r\n\x1a\n"));
+    }
+
+    /// A family's address files do not exist for an account that holds no
+    /// key of that family: not listed, not resolvable, not readable.
+    async fn assert_no_family_address_files(
+        handler: &WalletsHandler,
+        w: &str,
+        number: u32,
+        family: &str,
+    ) {
+        let names = listed_address_files(handler, w, number).await;
+        for leaf in [
+            format!("address.{family}"),
+            format!("address.{family}.qr.svg"),
+            format!("address.{family}.qr.png"),
+        ] {
+            assert!(!names.contains(&leaf), "{leaf}: {names:?}");
+            let path = vfs(format!("/{w}/{number}/{leaf}"));
+            assert!(
+                matches!(handler.lookup(&path).await, Err(HandlerError::NotFound(_))),
+                "lookup {path}"
+            );
+            assert!(
+                matches!(handler.read(&path).await, Err(HandlerError::NotFound(_))),
+                "read {path}"
+            );
+        }
+    }
+
+    /// An EVM-only account (a Secp256k1 root) presents exactly the EVM
+    /// address files, and no Solana or family-less ones.
+    #[tokio::test]
+    async fn evm_only_account_presents_only_evm_address_files() {
+        let f = make_handler();
+        let w = &f.wallet_name;
+        assert_eq!(
+            listed_address_files(&f.handler, w, 0).await,
+            ["address.evm", "address.evm.qr.png", "address.evm.qr.svg"]
+        );
+        let evm = bloom_proto::checksum_address(&f.wallet_addr);
+        assert_family_address_files(&f.handler, w, 0, "evm", &evm).await;
+        assert_no_family_address_files(&f.handler, w, 0, "sol").await;
+        assert_no_generic_address_files(&f.handler, w, 0).await;
+    }
+
+    /// Address files follow the families each account holds: account 0
+    /// has both families and presents both sets; account 1 holds only a
+    /// Solana key and presents only the Solana set. `public_key` stays the
+    /// display key, so it is account 1's Solana key.
+    #[tokio::test]
+    async fn address_files_follow_the_families_each_account_holds() {
+        use bloom_broker_api::DerivationProfile as Profile;
+        let f = make_handler();
+        let evm0 = bloom_proto::checksum_address(&f.wallet_addr);
+        let sol0 = bs58::encode([0x20u8; 32]).into_string();
+        let sol1 = bs58::encode([0x21u8; 32]).into_string();
+        let solana1 = derived_account(
+            Profile::Bip44SolanaSlip10Ed25519V1,
+            "m/44'/501'/1'/0'",
+            0x21,
+            &sol1,
+        );
+        let solana1_key = solana1.canonical_public_key.decode();
+        let accounts = vec![
+            derived_account(
+                Profile::Bip44EvmSecp256k1V1,
+                "m/44'/60'/0'/0/0",
+                0x10,
+                &evm0,
+            ),
+            derived_account(
+                Profile::Bip44SolanaSlip10Ed25519V1,
+                "m/44'/501'/0'/0'",
+                0x20,
+                &sol0,
+            ),
+            solana1,
+        ];
+        let mut handler = f.handler;
+        handler.wallet_projections = Some(bip39_projection(f.wallet_addr, accounts));
+        let w = &f.wallet_name;
+
+        assert_eq!(
+            listed_address_files(&handler, w, 0).await,
+            [
+                "address.evm",
+                "address.evm.qr.png",
+                "address.evm.qr.svg",
+                "address.sol",
+                "address.sol.qr.png",
+                "address.sol.qr.svg",
+            ]
+        );
+        assert_family_address_files(&handler, w, 0, "evm", &evm0).await;
+        assert_family_address_files(&handler, w, 0, "sol", &sol0).await;
+        assert_no_generic_address_files(&handler, w, 0).await;
+
+        assert_eq!(
+            listed_address_files(&handler, w, 1).await,
+            ["address.sol", "address.sol.qr.png", "address.sol.qr.svg"]
+        );
+        assert_family_address_files(&handler, w, 1, "sol", &sol1).await;
+        assert_no_family_address_files(&handler, w, 1, "evm").await;
+        assert_no_generic_address_files(&handler, w, 1).await;
+        assert_eq!(
+            handler
+                .read(&vfs(format!("/{w}/1/public_key")))
+                .await
+                .unwrap(),
+            format!("0x{}\n", hex::encode(solana1_key)).into_bytes()
+        );
+
+        // account.json stays the structured record of every family, with
+        // the key refs, fingerprints, paths and lifecycle behind the
+        // address files.
+        let one: serde_json::Value = serde_json::from_slice(
+            &handler
+                .read(&vfs(format!("/{w}/1/account.json")))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(one["evm"]["state"], "missing");
+        assert_eq!(one["solana"]["state"], "active");
+        assert_eq!(one["solana"]["address"], sol1);
+        assert_eq!(one["solana"]["path"], "m/44'/501'/1'/0'");
+        assert!(one["solana"]["public_key_fingerprint"].is_string());
+        assert!(one["solana"]["key_ref"].is_object());
+
+        // Everything either account lists resolves with the same kind.
+        for number in [0, 1] {
+            for entry in handler.list(&vfs(format!("/{w}/{number}"))).await.unwrap() {
+                let path = vfs(format!("/{w}/{number}/{}", entry.name));
+                let resolved = handler
+                    .lookup(&path)
+                    .await
+                    .unwrap_or_else(|error| panic!("{path} is listed but {error:?}"));
+                assert_eq!(resolved.kind, entry.kind, "{path}");
+            }
+        }
+    }
+
+    /// The wallet directory holds the numbered accounts and wallet-wide
+    /// state; nothing that names one key is exposed above `<n>/`.
+    #[tokio::test]
+    async fn wallet_dir_exposes_no_account_scoped_key_files() {
+        let f = make_handler();
+        let w = &f.wallet_name;
+        let names: Vec<String> = f
+            .handler
+            .list(&vfs(format!("/{w}")))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect();
+        assert!(names.contains(&"0".to_string()), "{names:?}");
+        for leaf in ACCOUNT_KEY_FILES {
+            assert!(!names.iter().any(|name| name == leaf), "{leaf}: {names:?}");
+            let path = vfs(format!("/{w}/{leaf}"));
+            assert!(
+                matches!(
+                    f.handler.lookup(&path).await,
+                    Err(HandlerError::NotFound(_))
+                ),
+                "lookup {leaf}"
+            );
+            assert!(
+                matches!(f.handler.read(&path).await, Err(HandlerError::NotAFile(_))),
+                "read {leaf}"
+            );
+        }
+        // The same files resolve and read under account 0.
+        let owner = bloom_proto::checksum_address(&f.wallet_addr);
+        assert_eq!(
+            f.handler
+                .read(&vfs(format!("/{w}/0/address.evm")))
+                .await
+                .unwrap(),
+            format!("{owner}\n").into_bytes()
+        );
+        let public_key = f
+            .handler
+            .read(&vfs(format!("/{w}/0/public_key")))
+            .await
+            .unwrap();
+        assert!(public_key.starts_with(b"0x") && public_key.ends_with(b"\n"));
+    }
+
+    /// Every entry a wallet or account directory advertises resolves
+    /// through lookup with the same kind, so `ls` and `stat` agree.
+    #[tokio::test]
+    async fn listed_wallet_and_account_entries_resolve_through_lookup() {
+        let f = make_handler();
+        let w = &f.wallet_name;
+        for dir in [format!("/{w}"), format!("/{w}/0")] {
+            for entry in f.handler.list(&vfs(dir.clone())).await.unwrap() {
+                let path = vfs(format!("{dir}/{}", entry.name));
+                let resolved = f
+                    .handler
+                    .lookup(&path)
+                    .await
+                    .unwrap_or_else(|error| panic!("{path} is listed but {error:?}"));
+                assert_eq!(resolved.kind, entry.kind, "{path}");
+            }
+        }
+    }
+
+    /// Installed Petals are mounted only at the VFS root; an account never
+    /// lists, resolves, reads, or accepts writes for a `petals/` subtree.
+    #[tokio::test]
+    async fn petals_are_not_mounted_under_numbered_accounts() {
+        let f = make_handler();
+        let w = &f.wallet_name;
+        let names: Vec<String> = f
+            .handler
+            .list(&vfs(format!("/{w}/0")))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect();
+        assert!(!names.contains(&"petals".to_string()), "{names:?}");
+        for path in [
+            format!("/{w}/0/petals"),
+            format!("/{w}/0/petals/echo"),
+            format!("/{w}/0/petals/echo/message.txt"),
+        ] {
+            assert!(
+                matches!(
+                    f.handler.lookup(&vfs(path.clone())).await,
+                    Err(HandlerError::NotFound(_))
+                ),
+                "lookup {path}"
+            );
+            assert!(
+                matches!(
+                    f.handler.list(&vfs(path.clone())).await,
+                    Err(HandlerError::NotADir(_))
+                ),
+                "list {path}"
+            );
+            assert!(
+                matches!(
+                    f.handler.read(&vfs(path.clone())).await,
+                    Err(HandlerError::NotAFile(_))
+                ),
+                "read {path}"
+            );
+            assert!(
+                matches!(
+                    f.handler.write(&vfs(path.clone()), b"x").await,
+                    Err(HandlerError::PermissionDenied)
+                ),
+                "write {path}"
+            );
+        }
+    }
+
+    /// `sessions/` is listed unconditionally under an account, so it must
+    /// resolve as a directory even before any session exists.
+    #[tokio::test]
+    async fn account_sessions_directory_resolves_without_sessions() {
+        let f = make_handler();
+        let w = &f.wallet_name;
+        let entry = f
+            .handler
+            .lookup(&vfs(format!("/{w}/0/sessions")))
+            .await
+            .unwrap();
+        assert_eq!(entry.kind, crate::handler::EntryKind::Dir);
+        assert!(
+            f.handler
+                .list(&vfs(format!("/{w}/0/sessions")))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn indexed_outbox_read_preserves_projection_faults() {
+        let f = make_handler_with_chain(true);
+        let mut evm = derived_account(
+            bloom_broker_api::DerivationProfile::Bip44EvmSecp256k1V1,
+            "m/44'/60'/0'/0/0",
+            0x10,
+            &bloom_proto::checksum_address(&f.wallet_addr),
+        );
+        evm.chain_projections[0].address_encoding = bloom_broker_api::AddressEncoding::Base58;
+        let mut handler = f.handler;
+        handler.wallet_projections = Some(bip39_projection(f.wallet_addr, vec![evm]));
+
+        match handler
+            .list(&vfs(format!("/{}/0/chains/anvil/outbox", f.wallet_name)))
+            .await
+        {
+            Err(HandlerError::Backend(message)) => assert!(
+                message.contains("wrong address encoding"),
+                "projection fault was not preserved: {message}"
+            ),
+            _ => panic!("a projection fault must not become an empty outbox scope"),
         }
     }
 
     #[tokio::test]
     async fn address_qr_svg_is_scannable_svg_document() {
         let f = make_handler();
-        let path = VfsPath::parse(&format!("/{}/address.qr.svg", f.wallet_name)).unwrap();
+        let path = VfsPath::parse(&format!("/{}/0/address.evm.qr.svg", f.wallet_name)).unwrap();
         let body = f.handler.read(&path).await.unwrap();
         let svg = String::from_utf8(body).unwrap();
         assert!(svg.contains("<svg"), "{svg}");
@@ -7947,7 +8004,7 @@ value = "0""#,
     #[tokio::test]
     async fn address_qr_png_is_png_document() {
         let f = make_handler();
-        let path = VfsPath::parse(&format!("/{}/address.qr.png", f.wallet_name)).unwrap();
+        let path = VfsPath::parse(&format!("/{}/0/address.evm.qr.png", f.wallet_name)).unwrap();
         let body = f.handler.read(&path).await.unwrap();
         assert!(body.starts_with(b"\x89PNG\r\n\x1a\n"));
         assert!(
@@ -7975,7 +8032,7 @@ value = "0""#,
         let f = make_handler_with_chain(true);
         seed_pending(&f, "0001-test");
         let p = VfsPath::parse(&format!(
-            "/{}/chains/anvil/outbox/sent/0001-test/intent.json",
+            "/{}/0/chains/anvil/outbox/sent/0001-test/intent.json",
             f.wallet_name
         ))
         .unwrap();
@@ -7990,7 +8047,7 @@ value = "0""#,
         let f = make_handler_with_chain(true);
         seed_pending(&f, "0001-test");
         let p = VfsPath::parse(&format!(
-            "/{}/chains/anvil/outbox/sent/0001-test",
+            "/{}/0/chains/anvil/outbox/sent/0001-test",
             f.wallet_name
         ))
         .unwrap();
@@ -8001,7 +8058,7 @@ value = "0""#,
     #[tokio::test]
     async fn outbox_listing_advertises_new_tx_as_writable() {
         let f = make_handler_with_chain(true);
-        let p = VfsPath::parse(&format!("/{}/chains/anvil/outbox", f.wallet_name)).unwrap();
+        let p = VfsPath::parse(&format!("/{}/0/chains/anvil/outbox", f.wallet_name)).unwrap();
 
         let entries = f.handler.list(&p).await.unwrap();
         let new_tx = entries.iter().find(|entry| entry.name == "new.tx").unwrap();
@@ -8013,14 +8070,14 @@ value = "0""#,
     async fn outbox_latest_is_advertised_and_resolves_the_pending_identity() {
         let f = make_handler_with_chain(true);
         seed_pending(&f, "0001-pending");
-        let root = VfsPath::parse(&format!("/{}/chains/anvil/outbox", f.wallet_name)).unwrap();
+        let root = VfsPath::parse(&format!("/{}/0/chains/anvil/outbox", f.wallet_name)).unwrap();
 
         let listed = f.handler.list(&root).await.unwrap();
         let latest = listed.iter().find(|entry| entry.name == "latest").unwrap();
         assert_eq!(latest.link_target.as_deref(), Some("pending/0001-pending"));
 
         let latest_path =
-            VfsPath::parse(&format!("/{}/chains/anvil/outbox/latest", f.wallet_name)).unwrap();
+            VfsPath::parse(&format!("/{}/0/chains/anvil/outbox/latest", f.wallet_name)).unwrap();
         assert_eq!(
             f.handler
                 .lookup(&latest_path)
@@ -8042,7 +8099,7 @@ value = "0""#,
         // And a later millisecond still wins regardless of id.
         seed_pending_with_created_ms(&f, "0003-newest", 9_000);
 
-        let root = VfsPath::parse(&format!("/{}/chains/anvil/outbox", f.wallet_name)).unwrap();
+        let root = VfsPath::parse(&format!("/{}/0/chains/anvil/outbox", f.wallet_name)).unwrap();
         let listed = f.handler.list(&root).await.unwrap();
         let latest = listed.iter().find(|entry| entry.name == "latest").unwrap();
         assert_eq!(latest.link_target.as_deref(), Some("pending/0003-newest"));
@@ -8083,7 +8140,7 @@ value = "0""#,
             .join("0002-newer");
         std::fs::write(dir.join("intent.json"), b"{ not json").unwrap();
 
-        let root = VfsPath::parse(&format!("/{}/chains/anvil/outbox", f.wallet_name)).unwrap();
+        let root = VfsPath::parse(&format!("/{}/0/chains/anvil/outbox", f.wallet_name)).unwrap();
         assert!(
             f.handler.list(&root).await.is_err(),
             "an unreadable newest pending entry must surface, not fall back to an older transfer"
@@ -8114,7 +8171,7 @@ value = "0""#,
         std::fs::create_dir(outbox.join("pending").join("0003-moved")).unwrap();
         std::fs::create_dir(outbox.join("pending").join("0002-vanished")).unwrap();
 
-        let root = VfsPath::parse(&format!("/{}/chains/anvil/outbox", f.wallet_name)).unwrap();
+        let root = VfsPath::parse(&format!("/{}/0/chains/anvil/outbox", f.wallet_name)).unwrap();
         let latest = f
             .handler
             .list(&root)
@@ -8152,7 +8209,7 @@ value = "0""#,
 
             let real_suffix = format!("{state_name}/{id}/runtime-result-42.json");
             let real = VfsPath::parse(&format!(
-                "/{}/chains/anvil/outbox/{real_suffix}",
+                "/{}/0/chains/anvil/outbox/{real_suffix}",
                 f.wallet_name
             ))
             .unwrap();
@@ -8162,7 +8219,7 @@ value = "0""#,
             assert_eq!(f.handler.read(&real).await.unwrap(), state_name.as_bytes());
 
             let absent = VfsPath::parse(&format!(
-                "/{}/chains/anvil/outbox/{state_name}/{id}/does-not-exist.json",
+                "/{}/0/chains/anvil/outbox/{state_name}/{id}/does-not-exist.json",
                 f.wallet_name
             ))
             .unwrap();
@@ -8177,14 +8234,14 @@ value = "0""#,
         }
 
         let new_tx =
-            VfsPath::parse(&format!("/{}/chains/anvil/outbox/new.tx", f.wallet_name)).unwrap();
+            VfsPath::parse(&format!("/{}/0/chains/anvil/outbox/new.tx", f.wallet_name)).unwrap();
         let metadata = f.handler.lookup(&new_tx).await.unwrap();
         assert_eq!(metadata.kind, crate::handler::EntryKind::File);
         assert_eq!(metadata.mode, 0o644);
 
         for control in ["confirm", "confirm.override", "replace", "cancel"] {
             let path = VfsPath::parse(&format!(
-                "/{}/chains/anvil/outbox/pending/0001-pending/{control}",
+                "/{}/0/chains/anvil/outbox/pending/0001-pending/{control}",
                 f.wallet_name
             ))
             .unwrap();
@@ -8214,7 +8271,7 @@ value = "0""#,
 
         for artifact in ["artifact-dir", "artifact-link.json"] {
             let path = VfsPath::parse(&format!(
-                "/{}/chains/anvil/outbox/pending/0001-test/{artifact}",
+                "/{}/0/chains/anvil/outbox/pending/0001-test/{artifact}",
                 f.wallet_name
             ))
             .unwrap();
@@ -8229,7 +8286,7 @@ value = "0""#,
         }
 
         let directory = VfsPath::parse(&format!(
-            "/{}/chains/anvil/outbox/pending/0001-test",
+            "/{}/0/chains/anvil/outbox/pending/0001-test",
             f.wallet_name
         ))
         .unwrap();
@@ -8287,7 +8344,7 @@ value = "0""#,
         let f = make_handler_with_chain(true);
         seed_pending(&f, "0001-test");
         let p = VfsPath::parse(&format!(
-            "/{}/chains/anvil/outbox/pending/0001-test/confirm",
+            "/{}/0/chains/anvil/outbox/pending/0001-test/confirm",
             f.wallet_name
         ))
         .unwrap();
@@ -8303,7 +8360,7 @@ value = "0""#,
         let f = make_handler_with_chain(true);
         seed_pending(&f, "0001-test");
         let p = VfsPath::parse(&format!(
-            "/{}/chains/anvil/outbox/pending/0001-test/confirm",
+            "/{}/0/chains/anvil/outbox/pending/0001-test/confirm",
             f.wallet_name
         ))
         .unwrap();
@@ -8324,7 +8381,7 @@ value = "0""#,
     async fn normal_confirm_open_preserves_body_control_semantics() {
         let f = make_handler_with_chain(true);
         let p = VfsPath::parse(&format!(
-            "/{}/chains/anvil/outbox/pending/not-yet-staged/confirm",
+            "/{}/0/chains/anvil/outbox/pending/not-yet-staged/confirm",
             f.wallet_name
         ))
         .unwrap();
@@ -8362,7 +8419,7 @@ value = "0""#,
             .unwrap();
         // Path that points at sent — must be permission denied (no route).
         let p = VfsPath::parse(&format!(
-            "/{}/chains/anvil/outbox/sent/0001-test/confirm",
+            "/{}/0/chains/anvil/outbox/sent/0001-test/confirm",
             f.wallet_name
         ))
         .unwrap();
@@ -8374,7 +8431,7 @@ value = "0""#,
         // Path under pending/<id> still resolves but the engine rejects
         // because the id isn't actually pending.
         let p2 = VfsPath::parse(&format!(
-            "/{}/chains/anvil/outbox/pending/0001-test/confirm",
+            "/{}/0/chains/anvil/outbox/pending/0001-test/confirm",
             f.wallet_name
         ))
         .unwrap();
@@ -8389,7 +8446,7 @@ value = "0""#,
         let f = make_handler_with_chain(true);
         seed_pending(&f, "0001-test");
         let p = VfsPath::parse(&format!(
-            "/{}/chains/anvil/outbox/pending/0001-test/cancel",
+            "/{}/0/chains/anvil/outbox/pending/0001-test/cancel",
             f.wallet_name
         ))
         .unwrap();
@@ -8403,7 +8460,7 @@ value = "0""#,
         let f = make_handler_with_chain(true);
         seed_pending(&f, "0001-test");
         let p = VfsPath::parse(&format!(
-            "/{}/chains/anvil/outbox/pending/0001-test/replace",
+            "/{}/0/chains/anvil/outbox/pending/0001-test/replace",
             f.wallet_name
         ))
         .unwrap();
@@ -8418,7 +8475,7 @@ value = "0""#,
         let f = make_handler_with_chain(true);
         seed_pending(&f, "0001-test");
         let p = VfsPath::parse(&format!(
-            "/{}/chains/anvil/outbox/pending/0001-test",
+            "/{}/0/chains/anvil/outbox/pending/0001-test",
             f.wallet_name
         ))
         .unwrap();
@@ -8433,7 +8490,8 @@ value = "0""#,
     async fn list_pending_returns_seeded_ids() {
         let f = make_handler_with_chain(true);
         seed_pending(&f, "0001-21699");
-        let p = VfsPath::parse(&format!("/{}/chains/anvil/outbox/pending", f.wallet_name)).unwrap();
+        let p =
+            VfsPath::parse(&format!("/{}/0/chains/anvil/outbox/pending", f.wallet_name)).unwrap();
         let entries = f.handler.list(&p).await.unwrap();
         let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
         assert!(names.contains(&"0001-21699"), "names={names:?}");
@@ -8482,7 +8540,7 @@ value = "0""#,
         let handler = f.handler.clone().with_mempool_indexes(map);
 
         let p = VfsPath::parse(&format!(
-            "/{}/chains/anvil/pending_external.jsonl",
+            "/{}/0/chains/anvil/pending_external.jsonl",
             f.wallet_name
         ))
         .unwrap();
@@ -8521,7 +8579,7 @@ value = "0""#,
         let handler = f.handler.clone().with_mempool_indexes(map);
 
         let p = VfsPath::parse(&format!(
-            "/{}/chains/anvil/nonce_conflicts.json",
+            "/{}/0/chains/anvil/nonce_conflicts.json",
             f.wallet_name
         ))
         .unwrap();
@@ -8581,7 +8639,7 @@ value = "0""#,
         let f = make_handler_with_chain(true);
         // Don't install any mempool index.
         let p = VfsPath::parse(&format!(
-            "/{}/chains/anvil/pending_external.jsonl",
+            "/{}/0/chains/anvil/pending_external.jsonl",
             f.wallet_name
         ))
         .unwrap();
@@ -8604,6 +8662,19 @@ value = "0""#,
             .map(|entry| entry.name.clone())
             .collect::<Vec<_>>();
         assert!(names.iter().any(|name| name == "accounts.json"));
+        assert!(
+            !names.iter().any(|name| name == "chains"),
+            "wallet root must not advertise the removed chains alias: {names:?}"
+        );
+        let removed_chains = VfsPath::parse(&format!("/{}/chains", f.wallet_name)).unwrap();
+        assert!(
+            matches!(
+                handler.lookup(&removed_chains).await,
+                Err(HandlerError::NotFound(_))
+            ),
+            "wallet-root chains must be absent; use /{}/0/chains instead",
+            f.wallet_name
+        );
 
         for name in &names {
             let path = VfsPath::parse(&format!("/{}/{}", f.wallet_name, name)).unwrap();
@@ -8673,30 +8744,13 @@ value = "0""#,
     #[tokio::test]
     async fn solana_chains_are_readable_without_a_transfer_engine() {
         let f = make_handler();
-        let node = spawn_solana_node().await;
-        let registry = bloom_solana::SolanaChainRegistry::new();
-        registry.add(
-            bloom_solana::SolanaClient::build(&bloom_solana::SolanaSpec {
-                name: "solana-devnet".into(),
-                endpoints: vec![bloom_solana::EndpointSpec {
-                    url: node,
-                    weight: 100,
-                    cu_per_sec: None,
-                    max_rps: None,
-                    http_only: false,
-                }],
-                expected_genesis_base58: Some("test-genesis".into()),
-                allow_broadcast: false,
-            })
-            .unwrap(),
-        );
         // Note: no `.with_solana(..)` — there is no engine for this chain.
-        let handler = f.handler.with_solana_reads(registry);
+        let handler = solana_reads_handler(&f, spawn_solana_node().await, &[0xaa]);
         let w = &f.wallet_name;
 
         // The chain is listed alongside EVM chains...
         let chains = handler
-            .list(&VfsPath::parse(&format!("/{w}/chains")).unwrap())
+            .list(&VfsPath::parse(&format!("/{w}/0/chains")).unwrap())
             .await
             .unwrap();
         assert!(
@@ -8706,7 +8760,7 @@ value = "0""#,
         );
 
         // ...and its directory resolves...
-        let chain_dir = VfsPath::parse(&format!("/{w}/chains/solana-devnet")).unwrap();
+        let chain_dir = VfsPath::parse(&format!("/{w}/0/chains/solana-devnet")).unwrap();
         handler.lookup(&chain_dir).await.unwrap();
 
         // ...but advertises no outbox, because it cannot stage.
@@ -8719,7 +8773,7 @@ value = "0""#,
 
         // Nor does the unadvertised outbox resolve by name.
         for path in ["outbox", "outbox/pending"] {
-            let outbox = VfsPath::parse(&format!("/{w}/chains/solana-devnet/{path}")).unwrap();
+            let outbox = VfsPath::parse(&format!("/{w}/0/chains/solana-devnet/{path}")).unwrap();
             assert!(
                 matches!(
                     handler.lookup(&outbox).await,
@@ -8730,7 +8784,7 @@ value = "0""#,
         }
 
         // Staging surfaces stay closed rather than falling through to EVM.
-        let new_tx = VfsPath::parse(&format!("/{w}/chains/solana-devnet/outbox/new.tx")).unwrap();
+        let new_tx = VfsPath::parse(&format!("/{w}/0/chains/solana-devnet/outbox/new.tx")).unwrap();
         assert!(matches!(
             handler.lookup(&new_tx).await,
             Err(HandlerError::NotFound(_))
@@ -8758,6 +8812,7 @@ value = "0""#,
         spki.extend_from_slice(&pubkey);
         let fingerprint =
             bloom_broker_api::Digest32::from_bytes(sha2::Sha256::digest(&spki).into());
+        let address = bs58::encode(pubkey).into_string();
         bloom_broker_api::DerivedAccountPublic {
             key_ref: bloom_broker_api::KeyRef {
                 backend: bloom_broker_api::Token::new("local").unwrap(),
@@ -8778,7 +8833,13 @@ value = "0""#,
             public_key_encoding: bloom_broker_api::PublicKeyEncoding::Ed25519SpkiDer,
             public_key_fingerprint: fingerprint,
             supported_crypto_suites: vec![bloom_broker_api::CryptoSuite::Ed25519Message],
-            chain_projections: vec![],
+            chain_projections: vec![bloom_broker_api::ChainAccountProjection {
+                chain_family: bloom_broker_api::Token::new("solana").unwrap(),
+                caip2: "solana:test".into(),
+                caip10: format!("solana:test:{address}"),
+                address,
+                address_encoding: bloom_broker_api::AddressEncoding::Base58,
+            }],
             lifecycle: bloom_broker_api::AccountLifecycleState::Active,
         }
     }
@@ -8793,6 +8854,39 @@ value = "0""#,
             SolanaAccount::from_projection(&solana_projection(pubkey)).is_ok(),
             "baseline projection should resolve"
         );
+
+        // The account profile, not a hard-coded routing token, identifies
+        // the address family. Custom Broker chain families remain usable.
+        let mut custom_solana_family = solana_projection(pubkey);
+        custom_solana_family.chain_projections[0].chain_family =
+            bloom_broker_api::Token::new("svm").unwrap();
+        let solana_address = bs58::encode(pubkey).into_string();
+        assert_eq!(
+            projected_family_address(&custom_solana_family).unwrap(),
+            Some(solana_address.as_str())
+        );
+        assert!(SolanaAccount::from_projection(&custom_solana_family).is_ok());
+
+        let evm_address = Address::repeat_byte(0x11).to_string();
+        let mut custom_evm_family = derived_account(
+            bloom_broker_api::DerivationProfile::Bip44EvmSecp256k1V1,
+            "m/44'/60'/0'/0/0",
+            0x10,
+            &evm_address,
+        );
+        custom_evm_family.chain_projections[0].chain_family =
+            bloom_broker_api::Token::new("ethereum").unwrap();
+        assert_eq!(
+            projected_family_address(&custom_evm_family).unwrap(),
+            Some(evm_address.as_str())
+        );
+
+        let mut missing = solana_projection(pubkey);
+        missing.chain_projections.clear();
+        assert!(matches!(
+            SolanaAccount::from_projection(&missing),
+            Err(HandlerError::NotFound(_))
+        ));
 
         // path recorded on the projection disagrees with the signing KeyRef
         let mut a = solana_projection(pubkey);
@@ -8819,7 +8913,29 @@ value = "0""#,
             address: bs58::encode([0x11_u8; 32]).into_string(),
             address_encoding: bloom_broker_api::AddressEncoding::Base58,
         }];
-        expect_integrity(&a, "does not match the derived account address");
+        expect_integrity(&a, "does not identify its canonical public key");
+
+        // EVM follows the same Broker-owned rule: network projections for
+        // one key may vary in CAIP-2, but never in account address.
+        let first = Address::repeat_byte(0x11);
+        let second = Address::repeat_byte(0x22);
+        let mut evm = derived_account(
+            bloom_broker_api::DerivationProfile::Bip44EvmSecp256k1V1,
+            "m/44'/60'/0'/0/0",
+            0x10,
+            &first.to_string(),
+        );
+        evm.chain_projections
+            .push(bloom_broker_api::ChainAccountProjection {
+                chain_family: bloom_broker_api::Token::new("evm").unwrap(),
+                caip2: "eip155:1".into(),
+                caip10: format!("eip155:1:{second}"),
+                address: second.to_string(),
+                address_encoding: bloom_broker_api::AddressEncoding::Hex0x,
+            });
+        assert!(
+            matches!(projected_family_address(&evm), Err(HandlerError::Backend(message)) if message.contains("projections disagree"))
+        );
 
         // wrong key spec / non-canonical encoding
         let mut a = solana_projection(pubkey);
@@ -8847,74 +8963,8 @@ value = "0""#,
         }
     }
 
-    /// A Broker fixture projecting several active Solana children.
-    /// One active Solana child at account 1 — no account-0 child exists.
-    struct SecondAccountOnlyBroker;
-    impl bloom_broker_api::MachineBrokerService for SecondAccountOnlyBroker {
-        fn dispatch<'a>(
-            &'a self,
-            request: bloom_broker_api::MachineBrokerRequest,
-        ) -> bloom_broker_api::ServiceFuture<'a, bloom_broker_api::MachineBrokerResponse> {
-            Box::pin(async move {
-                match request {
-                    bloom_broker_api::MachineBrokerRequest::WalletAccounts(
-                        bloom_broker_api::WalletRequest { wallet_id },
-                    ) => {
-                        let mut account = solana_projection([0xbb; 32]);
-                        account.path = "m/44'/501'/1'/0'".into();
-                        if let Some(bloom_broker_api::DerivationRef::Bip39Multicurve {
-                            path, ..
-                        }) = &mut account.key_ref.derivation
-                        {
-                            *path = "m/44'/501'/1'/0'".into();
-                        }
-                        Ok(bloom_broker_api::MachineBrokerResponse::WalletAccounts(
-                            bloom_broker_api::WalletAccountsPublic {
-                                wallet_id,
-                                seed_profile:
-                                    bloom_broker_api::WalletSeedProfile::Bip39MulticurveV1,
-                                accounts: vec![account],
-                            },
-                        ))
-                    }
-                    other => Err(bloom_broker_api::ProtocolError::new(
-                        bloom_broker_api::ProtocolErrorCode::UnknownMethod,
-                        format!("unhandled {other:?}"),
-                    )),
-                }
-            })
-        }
-    }
-
-    struct MultiChildBroker {
-        pubkeys: Vec<[u8; 32]>,
-    }
-    impl bloom_broker_api::MachineBrokerService for MultiChildBroker {
-        fn dispatch<'a>(
-            &'a self,
-            request: bloom_broker_api::MachineBrokerRequest,
-        ) -> bloom_broker_api::ServiceFuture<'a, bloom_broker_api::MachineBrokerResponse> {
-            Box::pin(async move {
-                match request {
-                    bloom_broker_api::MachineBrokerRequest::WalletAccounts(
-                        bloom_broker_api::WalletRequest { wallet_id },
-                    ) => Ok(bloom_broker_api::MachineBrokerResponse::WalletAccounts(
-                        bloom_broker_api::WalletAccountsPublic {
-                            wallet_id,
-                            seed_profile: bloom_broker_api::WalletSeedProfile::Bip39MulticurveV1,
-                            accounts: self.pubkeys.iter().map(|k| solana_projection(*k)).collect(),
-                        },
-                    )),
-                    other => Err(bloom_broker_api::ProtocolError::new(
-                        bloom_broker_api::ProtocolErrorCode::UnknownMethod,
-                        format!("unhandled {other:?}"),
-                    )),
-                }
-            })
-        }
-    }
-
-    fn solana_reads_handler(f: &Fixture, node: String, pubkeys: Vec<[u8; 32]>) -> WalletsHandler {
+    /// A reads-only `solana-devnet` registry against `node`.
+    fn solana_read_registry(node: String) -> bloom_solana::SolanaChainRegistry {
         let registry = bloom_solana::SolanaChainRegistry::new();
         registry.add(
             bloom_solana::SolanaClient::build(&bloom_solana::SolanaSpec {
@@ -8931,159 +8981,119 @@ value = "0""#,
             })
             .unwrap(),
         );
-        f.handler
-            .clone()
-            .with_broker(Some(bloom_machine_client::MachineBrokerClient::new(
-                std::sync::Arc::new(MultiChildBroker { pubkeys }),
-            )))
-            .with_solana_reads(registry)
+        registry
     }
 
-    /// Listing and stat must resolve from the Broker projection alone. Proven
-    /// structurally: the chain endpoint here is a closed port, so anything
-    /// that reached the chain would fail. Only reading a balance may.
+    /// A reads-only Solana handler over a BIP-39 wallet whose account `n`
+    /// holds the Solana child with public key `[seeds[n]; 32]`.
+    fn solana_reads_handler(f: &Fixture, node: String, seeds: &[u8]) -> WalletsHandler {
+        let accounts = seeds
+            .iter()
+            .enumerate()
+            .map(|(number, seed)| {
+                derived_account(
+                    bloom_broker_api::DerivationProfile::Bip44SolanaSlip10Ed25519V1,
+                    &format!("m/44'/501'/{number}'/0'"),
+                    *seed,
+                    &bs58::encode([*seed; 32]).into_string(),
+                )
+            })
+            .collect();
+        f.handler
+            .clone()
+            .with_projection_reader(bip39_projection(f.wallet_addr, accounts))
+            .with_solana_reads(solana_read_registry(node))
+    }
+
+    /// Listing and stat must resolve from the cached projection alone.
+    /// Proven structurally: the chain endpoint here is a closed port, so
+    /// anything that reached the chain would fail. Only reading a balance
+    /// may.
     #[tokio::test]
     async fn solana_account_listing_and_lookup_never_touch_the_chain() {
         let f = make_handler();
         // A port nothing is listening on.
-        let dead = "http://127.0.0.1:1".to_string();
-        let handler = solana_reads_handler(&f, dead, vec![[0xaa; 32], [0xbb; 32]]);
+        let handler = solana_reads_handler(&f, "http://127.0.0.1:1".into(), &[0xaa, 0xbb]);
         let w = &f.wallet_name;
-        let fp_a = solana_projection([0xaa; 32])
-            .key_ref
-            .public_key_fingerprint
-            .as_str()
-            .to_ascii_lowercase();
 
-        let accounts_dir = VfsPath::parse(&format!("/{w}/chains/solana-devnet/accounts")).unwrap();
-        let listed = handler.list(&accounts_dir).await.unwrap();
-        assert_eq!(listed.len(), 2, "both active children should be listed");
-        assert!(listed.iter().all(|e| e.name.len() == 64));
-
-        handler
-            .lookup(&VfsPath::parse(&format!("/{w}/chains/solana-devnet/accounts/{fp_a}")).unwrap())
-            .await
-            .unwrap();
-        for leaf in ["address", "balance", "balance.raw", "balance.json"] {
-            handler
-                .lookup(
-                    &VfsPath::parse(&format!("/{w}/chains/solana-devnet/accounts/{fp_a}/{leaf}"))
-                        .unwrap(),
-                )
+        for number in [0, 1] {
+            let chain = format!("/{w}/{number}/chains/solana-devnet");
+            let names: Vec<String> = handler
+                .list(&vfs(chain.clone()))
                 .await
-                .unwrap_or_else(|e| panic!("lookup of {leaf} should not need the chain: {e:?}"));
+                .unwrap()
+                .into_iter()
+                .map(|entry| entry.name)
+                .collect();
+            assert_eq!(names, ["address", "balance", "balance.raw", "balance.json"]);
+            for leaf in &names {
+                handler
+                    .lookup(&vfs(format!("{chain}/{leaf}")))
+                    .await
+                    .unwrap_or_else(|e| {
+                        panic!("lookup of {leaf} should not need the chain: {e:?}")
+                    });
+            }
         }
 
         // `address` is projection-only, so it reads with the chain down.
         let addr = handler
-            .read(
-                &VfsPath::parse(&format!(
-                    "/{w}/chains/solana-devnet/accounts/{fp_a}/address"
-                ))
-                .unwrap(),
-            )
+            .read(&vfs(format!("/{w}/1/chains/solana-devnet/address")))
             .await
             .unwrap();
         assert_eq!(
             String::from_utf8(addr).unwrap().trim(),
-            bs58::encode([0xaa_u8; 32]).into_string()
+            bs58::encode([0xbb_u8; 32]).into_string()
         );
 
         // A balance read is the one operation that needs the chain.
         assert!(
             handler
-                .read(
-                    &VfsPath::parse(&format!(
-                        "/{w}/chains/solana-devnet/accounts/{fp_a}/balance"
-                    ))
-                    .unwrap()
-                )
+                .read(&vfs(format!("/{w}/0/chains/solana-devnet/balance")))
                 .await
                 .is_err(),
             "balance must actually consult the chain"
         );
     }
 
-    /// Top-level `balance*` are wallet-level aliases: they mean account 0.
-    /// After further children exist they keep resolving to the canonical
-    /// initial child, and only refuse when no active account-0 child exists.
+    /// Solana balances are per account: `<n>/chains/<chain>/balance*` reads
+    /// account `n`'s child, and no wallet-root alias picks one on the
+    /// caller's behalf.
     #[tokio::test]
-    async fn top_level_balance_aliases_mean_account_zero() {
+    async fn solana_balances_read_through_each_numbered_account() {
         let f = make_handler();
-        let node = spawn_solana_node().await;
+        let handler = solana_reads_handler(&f, spawn_solana_node().await, &[0xaa, 0xbb]);
         let w = &f.wallet_name;
-        let alias = VfsPath::parse(&format!("/{w}/chains/solana-devnet/balance")).unwrap();
 
-        // one child: the alias resolves to it
-        let one = solana_reads_handler(&f, node.clone(), vec![[0xaa; 32]]);
-        let body = one.read(&alias).await.unwrap();
+        let body = handler
+            .read(&vfs(format!("/{w}/0/chains/solana-devnet/balance")))
+            .await
+            .unwrap();
         assert_eq!(String::from_utf8(body).unwrap(), "1.5 SOL\n");
-        let json = one
-            .read(&VfsPath::parse(&format!("/{w}/chains/solana-devnet/balance.json")).unwrap())
-            .await
-            .unwrap();
-        let v: serde_json::Value = serde_json::from_slice(&json).unwrap();
-        assert_eq!(v["schema"], "bloom.solana_native_balance.v1");
-        assert_eq!(v["raw"], "1500000000", "raw must stay a string");
-        assert_eq!(v["formatted"], "1.5");
-        assert_eq!(v["decimals"], 9);
-        assert_eq!(
-            v["account_address"],
-            bs58::encode([0xaa_u8; 32]).into_string()
-        );
-        assert_eq!(v["derivation_path"], "m/44'/501'/0'/0'");
-
-        // several children: the alias still means account 0
-        let many = solana_reads_handler(&f, node.clone(), vec![[0xaa; 32], [0xbb; 32]]);
-        let body = many
-            .read(&VfsPath::parse(&format!("/{w}/chains/solana-devnet/balance.json")).unwrap())
-            .await
-            .unwrap();
-        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(
-            v["derivation_path"], "m/44'/501'/0'/0'",
-            "the wallet-level alias resolves to the canonical initial child"
-        );
-        assert_eq!(
-            v["account_address"],
-            bs58::encode([0xaa_u8; 32]).into_string()
-        );
-
-        // no active account-0 child: refuse and name the canonical paths
-        let shifted = {
-            let registry = bloom_solana::SolanaChainRegistry::new();
-            registry.add(
-                bloom_solana::SolanaClient::build(&bloom_solana::SolanaSpec {
-                    name: "solana-devnet".into(),
-                    endpoints: vec![bloom_solana::EndpointSpec {
-                        url: node,
-                        weight: 100,
-                        cu_per_sec: None,
-                        max_rps: None,
-                        http_only: false,
-                    }],
-                    expected_genesis_base58: Some("test-genesis".into()),
-                    allow_broadcast: false,
-                })
-                .unwrap(),
-            );
-            f.handler
-                .clone()
-                .with_broker(Some(bloom_machine_client::MachineBrokerClient::new(
-                    std::sync::Arc::new(SecondAccountOnlyBroker),
+        for (number, seed) in [(0_u32, 0xaa_u8), (1, 0xbb)] {
+            let json = handler
+                .read(&vfs(format!(
+                    "/{w}/{number}/chains/solana-devnet/balance.json"
                 )))
-                .with_solana_reads(registry)
-        };
-        let err = shifted.read(&alias).await.unwrap_err();
-        let msg = format!("{err:?}");
-        let fp = solana_projection([0xbb; 32])
-            .key_ref
-            .public_key_fingerprint
-            .as_str()
-            .to_ascii_lowercase();
+                .await
+                .unwrap();
+            let v: serde_json::Value = serde_json::from_slice(&json).unwrap();
+            assert_eq!(v["schema"], "bloom.solana_native_balance.v1");
+            assert_eq!(v["raw"], "1500000000", "raw must stay a string");
+            assert_eq!(v["formatted"], "1.5");
+            assert_eq!(v["decimals"], 9);
+            assert_eq!(v["account_address"], bs58::encode([seed; 32]).into_string());
+            assert_eq!(v["derivation_path"], format!("m/44'/501'/{number}'/0'"));
+        }
+
         assert!(
-            msg.contains(&format!("chains/solana-devnet/accounts/{fp}/")),
-            "the error should name the canonical path for {fp}, got {msg}"
+            matches!(
+                handler
+                    .lookup(&vfs(format!("/{w}/chains/solana-devnet/balance")))
+                    .await,
+                Err(HandlerError::NotFound(_))
+            ),
+            "wallet-root chains must be absent"
         );
     }
 
@@ -9103,7 +9113,7 @@ value = "0""#,
         let f = make_handler_with_chain(true);
         seed_pending(&f, "0001-real");
         let p = VfsPath::parse(&format!(
-            "/{}/chains/anvil/outbox/pending/NOPE/confirm",
+            "/{}/0/chains/anvil/outbox/pending/NOPE/confirm",
             f.wallet_name
         ))
         .unwrap();
@@ -9126,7 +9136,7 @@ value = "0""#,
         let f = make_handler_with_chain(true);
         seed_pending(&f, "0001-real");
         let p = VfsPath::parse(&format!(
-            "/{}/chains/anvil/outbox/sent/0001-real/intent.json",
+            "/{}/0/chains/anvil/outbox/sent/0001-real/intent.json",
             f.wallet_name
         ))
         .unwrap();
@@ -9140,7 +9150,7 @@ value = "0""#,
     #[tokio::test]
     async fn an_unregistered_wallet_is_not_found() {
         let f = make_handler_with_chain(true);
-        for path in ["/nosuchwallet", "/nosuchwallet/address"] {
+        for path in ["/nosuchwallet", "/nosuchwallet/0/address.evm"] {
             let p = VfsPath::parse(path).unwrap();
             assert!(
                 matches!(f.handler.lookup(&p).await, Err(HandlerError::NotFound(_))),
@@ -9155,43 +9165,34 @@ value = "0""#,
         }
     }
 
-    /// `accounts/` is unconditional for a configured Solana chain, so the
-    /// namespace does not change shape when the first child is allocated or
-    /// the last is retired. With none active it lists empty, while the
-    /// top-level aliases report that there is nothing to read.
+    /// Solana chains are read through an account's Solana key, and there is
+    /// no `accounts/` directory to pick another: an account without one has
+    /// no Solana chain view, and the error names the account.
     #[tokio::test]
-    async fn accounts_dir_exists_with_zero_active_children() {
+    async fn an_account_without_a_solana_key_has_no_solana_chain_view() {
         let f = make_handler();
-        let handler = solana_reads_handler(&f, spawn_solana_node().await, vec![]);
+        // The legacy EVM root is account 0 and holds no Solana key.
+        let handler = f
+            .handler
+            .clone()
+            .with_solana_reads(solana_read_registry("http://127.0.0.1:1".into()));
         let w = &f.wallet_name;
 
-        let dir = VfsPath::parse(&format!("/{w}/chains/solana-devnet/accounts")).unwrap();
-        handler.lookup(&dir).await.expect("accounts/ must exist");
-        assert!(
-            handler.list(&dir).await.unwrap().is_empty(),
-            "no active children means an empty directory, not a missing one"
-        );
-
-        // The chain directory still advertises the whole read surface.
-        let chain = VfsPath::parse(&format!("/{w}/chains/solana-devnet")).unwrap();
-        let names: Vec<String> = handler
-            .list(&chain)
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|e| e.name)
-            .collect();
-        for expected in ["balance", "balance.raw", "balance.json", "accounts"] {
-            assert!(names.contains(&expected.to_string()), "missing {expected}");
-        }
-
-        for leaf in ["balance", "balance.raw", "balance.json"] {
-            let p = VfsPath::parse(&format!("/{w}/chains/solana-devnet/{leaf}")).unwrap();
+        for rest in ["", "/accounts", "/balance"] {
+            let p = vfs(format!("/{w}/0/chains/solana-devnet{rest}"));
             assert!(
-                matches!(handler.read(&p).await, Err(HandlerError::NotFound(_))),
-                "{leaf} should report no active Solana account"
+                matches!(handler.lookup(&p).await, Err(HandlerError::NotFound(_))),
+                "{rest} must not resolve"
             );
         }
+        let error = handler
+            .read(&vfs(format!("/{w}/0/chains/solana-devnet/balance")))
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("account 0 has no Solana key"),
+            "{error:?}"
+        );
     }
 
     /// An RPC outage must degrade only what genuinely needs the chain. The
@@ -9200,24 +9201,16 @@ value = "0""#,
     #[tokio::test]
     async fn rpc_outage_leaves_the_projection_surface_readable() {
         let f = make_handler();
-        let handler = solana_reads_handler(&f, "http://127.0.0.1:1".into(), vec![[0xaa; 32]]);
+        let handler = solana_reads_handler(&f, "http://127.0.0.1:1".into(), &[0xaa]);
         let w = &f.wallet_name;
-        let fp = solana_projection([0xaa; 32])
-            .key_ref
-            .public_key_fingerprint
-            .as_str()
-            .to_ascii_lowercase();
 
-        // Listing, stat and address all resolve from the Broker projection.
+        // Listing, stat and address all resolve from the cached projection.
         handler
-            .list(&VfsPath::parse(&format!("/{w}/chains/solana-devnet/accounts")).unwrap())
+            .list(&vfs(format!("/{w}/0/chains/solana-devnet")))
             .await
             .unwrap();
         let addr = handler
-            .read(
-                &VfsPath::parse(&format!("/{w}/chains/solana-devnet/accounts/{fp}/address"))
-                    .unwrap(),
-            )
+            .read(&vfs(format!("/{w}/0/chains/solana-devnet/address")))
             .await
             .unwrap();
         assert_eq!(
@@ -9228,10 +9221,7 @@ value = "0""#,
         // Only the balance read fails, and it fails as a backend error
         // rather than pretending the account does not exist.
         let err = handler
-            .read(
-                &VfsPath::parse(&format!("/{w}/chains/solana-devnet/accounts/{fp}/balance"))
-                    .unwrap(),
-            )
+            .read(&vfs(format!("/{w}/0/chains/solana-devnet/balance")))
             .await
             .unwrap_err();
         assert!(
