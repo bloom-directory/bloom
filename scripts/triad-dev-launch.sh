@@ -197,10 +197,9 @@ release_digest="$(
 fixture_root="${repo_root}/tests/fixtures/triad-authority-petal"
 fixture_hash=""
 if [ "$install_authority_fixture" -eq 1 ]; then
-  # The catalog must be signed before Machine starts, while package building is
-  # intentionally daemon-only. Pin the fixture's reviewed package hash here,
-  # then prove it against the daemon build before installing the fixture.
-  fixture_hash="2f11ee17f612fbc43f34f81771c53760f56768959624d29fd63b8e4285f5a9ac"
+  # Pin the reviewed fixture bytes, then verify both developer enrollment and
+  # the daemon build before installing the fixture.
+  fixture_hash="6281bb7b222d30eed1e66f416379f18c502575f2fbf5a37892186e559f95a1ae"
 fi
 if [ ! -f "${config_dir}/edge-manifest.json" ]; then
   [ ! -e "$config_dir" ] || die "incomplete developer config already exists: $config_dir"
@@ -263,9 +262,14 @@ do
   chmod 0600 "${config_dir}/${name}"
 done
 if [ "$install_authority_fixture" -eq 1 ]; then
+  # Use the same installer-signed lineage enrollment as other local Petals.
+  # A route-only provenance record cannot authorize scoped key derivation.
+  "$bloom_bin" init triad-enroll-developer-petal-provenance \
+    "$config_dir" "$fixture_root"
   jq -e --arg package_hash "$fixture_hash" '
     any(.records[]; .subject.kind == "petal" and
-        .subject.package_hash == $package_hash and .subject.route == "r000001")
+        .subject.package_hash == $package_hash and .subject.route == "r000001" and
+        .petal_lineage.active == true)
   ' "${config_dir}/provenance-catalog.json" >/dev/null ||
     die "developer enrollment predates the current fixture; create a fresh developer root"
 fi
