@@ -1876,7 +1876,7 @@ async fn a_swept_transfer_fails_over_and_restages_onto_a_fresh_approval() {
     );
     assert_eq!(
         outbox
-            .sweep_expired(u128::from(staged.expires_ms), &heights)
+            .sweep_expired(staged.expires_ms, &heights)
             .unwrap(),
         1,
         "exactly the stale entry must be swept at its own deadline"
