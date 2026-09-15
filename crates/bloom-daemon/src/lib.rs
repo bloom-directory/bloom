@@ -7901,9 +7901,9 @@ ws_url = "wss://example.invalid"
     }
 
     fn bs58_number(seed: u8) -> String {
-        // A syntactically distinct stand-in address; nothing parses it in
-        // these tests.
-        std::iter::repeat_n((b'A' + (seed % 26)) as char, 32).collect()
+        // The fixture Broker projects the address belonging to the same raw
+        // Ed25519 public-key bytes carried by the account SPKI.
+        bs58::encode([seed; 32]).into_string()
     }
 
     fn derived_account_public(child: &AccountChild) -> bloom_broker_api::DerivedAccountPublic {

@@ -68,3 +68,4 @@ tempfile.workspace = true
 
 [dev-dependencies]
 bloom-proto = { workspace = true, features = ["audit-test-seam"] }
+bs58.workspace = true
