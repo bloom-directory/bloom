@@ -91,16 +91,18 @@ mount. Those inputs stay inside the Broker-hosted browser ceremony.
 ## Solana account-aware reads and transfer
 
 ```sh
-# 1. Inspect accounts and choose the full Ed25519 fingerprint from the public
-#    projection. Do not select by position.
+# 1. Find the intended Solana key by its full fingerprint and derivation
+#    path. Use that entry's number, not its position in the list.
 cat "$BLOOM/wallets/alice/accounts.json"
-FP="<full-fingerprint>"
-cat "$BLOOM/wallets/alice/0/chains/solana/accounts/$FP/address"
-cat "$BLOOM/wallets/alice/0/chains/solana/accounts/$FP/balance.json"
-cat "$BLOOM/status/chains/<solana-chain>/status.json"
-
-# 2. Match the fingerprint to its account number in accounts.json.
 N="<account-number>"
+cat "$BLOOM/wallets/alice/$N/account.json"
+ls "$BLOOM/wallets/alice/$N/chains"
+CHAIN="<configured-solana-chain>"
+cat "$BLOOM/wallets/alice/$N/chains/$CHAIN/address"
+cat "$BLOOM/wallets/alice/$N/chains/$CHAIN/balance.json"
+cat "$BLOOM/status/chains/$CHAIN/status.json"
+
+# 2. Stage from this numbered account using its full fingerprint below.
 # Solana new.tx accepts strict JSON. Pin the selected account explicitly.
 #    The scratch file is written in the working directory outside the mount.
 cat > solana-transfer.json <<'JSON'
@@ -110,13 +112,13 @@ cat > solana-transfer.json <<'JSON'
   "account_fingerprint": "<full-fingerprint>"
 }
 JSON
-cp solana-transfer.json "$BLOOM/wallets/alice/$N/chains/solana/outbox/new.tx"
+cp solana-transfer.json "$BLOOM/wallets/alice/$N/chains/$CHAIN/outbox/new.tx"
 
 # 3. Inspect the exact resulting action.
-ls "$BLOOM/wallets/alice/$N/chains/solana/outbox/pending/"
+ls "$BLOOM/wallets/alice/$N/chains/$CHAIN/outbox/pending/"
 ID="<exact-id>"
-cat "$BLOOM/wallets/alice/$N/chains/solana/outbox/pending/$ID/intent.json"
-cat "$BLOOM/wallets/alice/$N/chains/solana/outbox/pending/$ID/plan.md"
+cat "$BLOOM/wallets/alice/$N/chains/$CHAIN/outbox/pending/$ID/intent.json"
+cat "$BLOOM/wallets/alice/$N/chains/$CHAIN/outbox/pending/$ID/plan.md"
 ```
 
 Verify that the staged intent names the chosen fingerprint, derivation path,

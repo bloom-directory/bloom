@@ -138,8 +138,8 @@ are bound to the full selected key, so accounts using the same route keep
 separate approval identities.
 
 A selected account's chains are listed at `wallets/<wallet>/<n>/chains` and
-include both EVM chains and any configured Solana chains — for account 0, use
-`ls wallets/<wallet>/0/chains`. Solana chains route through the exact same
+include configured chains for the families with Broker-projected addresses —
+for account 0, use `ls wallets/<wallet>/0/chains`. Solana chains use the
 `wallets/<wallet>/<n>/chains/<chain>/outbox/...` route family described below
 (stage at `outbox/new.tx`, confirm/cancel under `outbox/pending/<id>/`,
 inspect `outbox/{pending,sent,failed}/<id>/`) — there is no separate
@@ -153,27 +153,28 @@ networks with `ls wallets/<wallet>/0/chains` rather than assuming a network exis
 
 ### Reading Solana balances
 
-A Solana chain directory exposes an account-addressed surface:
+Choose the intended Solana entry in `wallets/<wallet>/accounts.json` by its
+full fingerprint and derivation path, then use that entry's `number` as `<n>`.
+The number comes from the derivation path, not the entry's position in the list.
+Verify the same key in `wallets/<wallet>/<n>/account.json` before acting.
 
 ```sh
-ls  wallets/<wallet>/0/chains/<solana-chain>/accounts/       # one dir per active child
-cat wallets/<wallet>/0/chains/<solana-chain>/accounts/<fingerprint>/address
-cat wallets/<wallet>/0/chains/<solana-chain>/accounts/<fingerprint>/balance
+cat wallets/<wallet>/accounts.json
+cat wallets/<wallet>/<n>/account.json
+ls  wallets/<wallet>/<n>/chains/
+cat wallets/<wallet>/<n>/chains/<solana-chain>/address
+cat wallets/<wallet>/<n>/chains/<solana-chain>/balance
 ```
 
-Directory names are the **full** lowercase account fingerprint. A body
-`account_fingerprint` in `new.tx` may be a prefix, but it must name the
-path's own account: account `0` refuses any other account's fingerprint, so
-transfers from account `n` belong on
-`wallets/<wallet>/<n>/chains/<chain>/outbox/new.tx`. A prefix is never a
-path — a prefix that is unique today stops being unique when another account
-is allocated.
+`address`, `balance`, `balance.raw` and `balance.json` live directly under the
+selected account's chain directory. There is no `accounts/<fingerprint>/`
+subdirectory or wallet-root `chains/` alias. Use `<n> = 0` only when the intended
+key belongs to account 0; Bloom never substitutes another account.
 
-`chains/<chain>/balance`, `balance.raw` and `balance.json` resolve to account
-0: the canonical initial child while it is active, and a failure naming the
-canonical `accounts/<fingerprint>/` paths once it is not. Bloom will not pick
-another account for you, because spending from the wrong one is not
-recoverable.
+A body `account_fingerprint` in `new.tx` may be a unique prefix, but it must
+name the path's own account. Transfers from account `n` belong on
+`wallets/<wallet>/<n>/chains/<chain>/outbox/new.tx`; a fingerprint naming another
+account is rejected. Fingerprints identify keys, not path segments.
 
 Listing accounts, stat-ing any leaf, and reading `address` need only Bloom's
 own projection, so they keep working when a Solana node is unreachable. Only

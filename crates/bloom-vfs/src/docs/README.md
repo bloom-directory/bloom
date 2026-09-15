@@ -63,14 +63,13 @@ Representative paths, relative to the mount:
 | ENS / price | `ens/<name>/address`, `prices/spot/eth.usd` |
 | Wallet identity | `wallets/<wallet>/{kind,projection.json,accounts.json}` |
 | Account keys | `wallets/<wallet>/<n>/{account.json,address.evm,address.sol,public_key}` |
-| Solana account | `wallets/<wallet>/0/chains/<chain>/accounts/<full-fingerprint>/{address,balance,balance.raw,balance.json}` |
+| Solana account | `wallets/<wallet>/<n>/chains/<solana-chain>/{address,balance,balance.raw,balance.json}` |
 | Solana status | `status/chains/<chain>/{status.json,slot,block_height}` |
 
-Braces above abbreviate separate leaves, not action selectors. Solana
-chain-level balance aliases resolve to account 0 and fail if its canonical
-child is inactive. Use
-the full fingerprint and derivation path from `accounts.json` for account
-identity; never select by list position.
+Braces above abbreviate separate leaves, not action selectors. Match the
+intended Solana key's full fingerprint and derivation path in `accounts.json`
+to its `number`, then use that number as `<n>`. Address and balance leaves
+refer only to that account; never select by list position.
 
 Numbered accounts live at `wallets/<wallet>/<n>/`: read `account.json` to
 verify the keys, then use `chains/<chain>/outbox/` beneath that account to
