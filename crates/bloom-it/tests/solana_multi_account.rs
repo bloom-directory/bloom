@@ -526,7 +526,7 @@ async fn two_active_solana_children_select_sign_and_reconcile_independently() ->
             .unwrap_or(0);
     println!("    account 0 balance before: {account0_balance} lamports");
 
-    let new_tx = VfsPath::parse("/wallets/alice/chains/solana-local/outbox/new.tx").unwrap();
+    let new_tx = VfsPath::parse("/wallets/alice/0/chains/solana-local/outbox/new.tx").unwrap();
     let destination = bs58::encode([0xccu8; 32]).into_string();
 
     // 5. The account boundary itself: the wallet-level path stages from
@@ -552,7 +552,7 @@ async fn two_active_solana_children_select_sign_and_reconcile_independently() ->
         .map_err(|e| anyhow!("wallet-level stage: {e}"))?;
     let zero_staged = daemon
         .vfs
-        .list(&VfsPath::parse("/wallets/alice/chains/solana-local/outbox/pending").unwrap())
+        .list(&VfsPath::parse("/wallets/alice/0/chains/solana-local/outbox/pending").unwrap())
         .await
         .map_err(|e| anyhow!("list pending: {e}"))?;
     let wallet_level_id = zero_staged
@@ -562,7 +562,9 @@ async fn two_active_solana_children_select_sign_and_reconcile_independently() ->
         .clone();
     let staged_zero = read_json(
         &daemon,
-        &format!("/wallets/alice/chains/solana-local/outbox/pending/{wallet_level_id}/intent.json"),
+        &format!(
+            "/wallets/alice/0/chains/solana-local/outbox/pending/{wallet_level_id}/intent.json"
+        ),
     )
     .await?;
     assert_eq!(
@@ -581,7 +583,7 @@ async fn two_active_solana_children_select_sign_and_reconcile_independently() ->
         .vfs
         .write(
             &VfsPath::parse(&format!(
-                "/wallets/alice/chains/solana-local/outbox/pending/{wallet_level_id}/cancel"
+                "/wallets/alice/0/chains/solana-local/outbox/pending/{wallet_level_id}/cancel"
             ))
             .unwrap(),
             b"y\n",
@@ -757,7 +759,7 @@ async fn two_active_solana_children_select_sign_and_reconcile_independently() ->
         .len();
     let wallet_sent_before = daemon
         .vfs
-        .list(&VfsPath::parse("/wallets/alice/chains/solana-local/outbox/sent").unwrap())
+        .list(&VfsPath::parse("/wallets/alice/0/chains/solana-local/outbox/sent").unwrap())
         .await
         .map_err(|e| anyhow!("list wallet sent: {e}"))?
         .len();
@@ -819,7 +821,7 @@ async fn two_active_solana_children_select_sign_and_reconcile_independently() ->
     println!("    wallet-level account-1 stage refused: {override_refused:?}");
     let wallet_pending_after_refusal = daemon
         .vfs
-        .list(&VfsPath::parse("/wallets/alice/chains/solana-local/outbox/pending").unwrap())
+        .list(&VfsPath::parse("/wallets/alice/0/chains/solana-local/outbox/pending").unwrap())
         .await
         .map_err(|e| anyhow!("list wallet pending: {e}"))?;
     assert!(
@@ -1119,7 +1121,7 @@ async fn two_active_solana_children_select_sign_and_reconcile_independently() ->
         .map_err(|e| anyhow!("stage from account 0: {e}"))?;
     let pending = daemon
         .vfs
-        .list(&VfsPath::parse("/wallets/alice/chains/solana-local/outbox/pending").unwrap())
+        .list(&VfsPath::parse("/wallets/alice/0/chains/solana-local/outbox/pending").unwrap())
         .await
         .map_err(|e| anyhow!("list pending: {e}"))?;
     let second_id = pending
@@ -1129,7 +1131,7 @@ async fn two_active_solana_children_select_sign_and_reconcile_independently() ->
         .clone();
     let staged0 = read_json(
         &daemon,
-        &format!("/wallets/alice/chains/solana-local/outbox/pending/{second_id}/intent.json"),
+        &format!("/wallets/alice/0/chains/solana-local/outbox/pending/{second_id}/intent.json"),
     )
     .await?;
     assert_eq!(

@@ -3,19 +3,19 @@
 //! A number is a presentation of two derivation paths, EVM
 //! `m/44'/60'/0'/0/<n>` and Solana `m/44'/501'/<n>'/0'`, computed here from
 //! the authenticated projection and never stored or sent anywhere. The
-//! directory re-roots the wallet's chain views at that account's keys: the
-//! same balance, nonce and outbox code as `wallets/<wallet>/chains/...`, with
-//! the sender fixed to the account's key for the chain's family instead of
-//! the wallet's canonical initial key.
+//! wallet's chain views live here and nowhere above: `<n>/chains/<chain>/`
+//! reads balance, nonce, mempool views and outbox through the account's key
+//! for the chain's family.
 //!
-//! Writes go through the same outbox code with the sender fixed: an EVM stage
-//! is built for the account's address and later signed by the key the
+//! Writes go through the outbox code with the sender fixed: an EVM stage is
+//! built for the account's address and later signed by the key the
 //! transaction engine resolves from that address; a Solana stage pins the
 //! account's fingerprint. Pending controls under `<n>/` act only on entries
 //! that account staged.
 //!
-//! The key files ([`ACCOUNT_KEY_FILES`]) live here and nowhere above: the
-//! wallet directory holds the numbered accounts and wallet-wide state only.
+//! The key files ([`ACCOUNT_KEY_FILES`]) and `chains/` live here and nowhere
+//! above: the wallet directory holds the numbered accounts and wallet-wide
+//! state only.
 //! Installed Petals are never mounted under an account; they live at the
 //! VFS root's `petals/`.
 
@@ -36,6 +36,14 @@ pub const ACCOUNT_KEY_FILES: [&str; 7] = [
     "address.sol.qr.svg",
     "public_key",
 ];
+
+/// The mempool views under `<n>/chains/<evm-chain>/`. Both read the
+/// account's own EVM address from the chain's mempool index and compare it
+/// only with outbox entries that account's EVM key staged.
+const EVM_MEMPOOL_LEAVES: [&str; 2] = ["pending_external.jsonl", "nonce_conflicts.json"];
+
+/// Sorted account-owned nonces and the transaction hashes grouped by nonce.
+type EvmOutboxNonces = (Vec<u64>, std::collections::BTreeMap<u64, Vec<String>>);
 
 /// One family's key inside an account.
 #[derive(Clone, Debug)]
@@ -60,48 +68,6 @@ impl FamilyKey {
     /// against (EVM, case-insensitively).
     pub(super) fn address(&self) -> Option<&str> {
         self.address.as_deref()
-    }
-}
-
-/// The sender filter one scoped outbox surface is fenced by.
-///
-/// `Unfiltered` is produced only for an `accounts_unavailable` projection
-/// with no root key: the numbered tree is empty then, so there is no other
-/// account to leak, and owners keep their history. It never applies to
-/// writes.
-#[derive(Clone, Copy, Debug)]
-pub(super) enum OutboxScope<'a> {
-    /// Only entries this family key staged are visible and controllable.
-    Key(&'a FamilyKey),
-    /// No sender filter (the `accounts_unavailable` read fallback).
-    Unfiltered,
-    /// No account-0 key for this family: nothing is visible here.
-    Empty,
-}
-
-/// The wallet-level outbox resolution, per the Wallet contract: the
-/// wallet-level surface is account 0's outbox with the numbered fence.
-pub(super) enum WalletOutboxScope {
-    /// Account 0's key for the chain's family.
-    Account0(Box<FamilyKey>),
-    /// The projection reports `accounts_unavailable` and the wallet has no
-    /// root key (every derived child retired). Reads stay unfiltered;
-    /// writes are refused naming that reason. A root-key wallet (legacy
-    /// BIP-32 custody reports unavailable too) keeps its root as account 0.
-    Unavailable,
-    /// No account 0, or no account-0 key for this family. The
-    /// wallet-level outbox shows nothing and writes fail.
-    Empty,
-}
-
-impl WalletOutboxScope {
-    /// The read scope the shared outbox implementations take.
-    pub(super) fn read_scope(&self) -> OutboxScope<'_> {
-        match self {
-            Self::Account0(family) => OutboxScope::Key(family),
-            Self::Unavailable => OutboxScope::Unfiltered,
-            Self::Empty => OutboxScope::Empty,
-        }
     }
 }
 
@@ -640,7 +606,7 @@ impl WalletsHandler {
                     data,
                     &engine,
                     Self::solana_sender(family),
-                    Some(number),
+                    number,
                 )
                 .await;
         }
@@ -674,84 +640,6 @@ impl WalletsHandler {
         }
     }
 
-    /// The wallet-level outbox read scope, resolved from the cached
-    /// projection (`account_view(wallet, 0)`). This is a projection read,
-    /// never a live Broker call, so listings stay side-effect free;
-    /// `solana_alias_account`'s live `wallet_accounts` call is deliberately
-    /// not used here.
-    ///
-    /// Lifecycle is irrelevant to the fence: a retired account-0 key still
-    /// scopes reads so account 0's history stays visible, while spending
-    /// from it fails at staging because resolution searches active keys.
-    pub(super) async fn wallet_outbox_read_scope(
-        &self,
-        wallet: &str,
-        chain: &str,
-    ) -> Result<WalletOutboxScope, HandlerError> {
-        let projection = self.wallet_projection(wallet).await?;
-        // A root-key wallet's account 0 is its root whatever the inventory
-        // says (legacy BIP-32 custody reports unavailable too).
-        if projection.accounts_unavailable.is_some() && projection.wallet.root_key_ref.is_none() {
-            return Ok(WalletOutboxScope::Unavailable);
-        }
-        let family = match self.account_view(wallet, 0).await {
-            Ok(view) => {
-                if self.is_solana_chain(chain) {
-                    view.solana
-                } else {
-                    view.evm
-                }
-            }
-            // No account 0: nothing to leak and nothing to show. Projection
-            // and backend faults must remain visible rather than becoming an
-            // apparently valid empty outbox.
-            Err(HandlerError::NotFound(_)) => None,
-            Err(error) => return Err(error),
-        };
-        Ok(family.map_or(WalletOutboxScope::Empty, |family| {
-            WalletOutboxScope::Account0(Box::new(family))
-        }))
-    }
-
-    /// The family key the wallet-level outbox stages from: account 0's, or
-    /// the error that names why staging cannot happen. Fail closed: a
-    /// rootless `accounts_unavailable` wallet and a wallet without an
-    /// account-0 key never stage from a guessed key. A root-key wallet
-    /// stages from its root, as it did before numbered accounts.
-    pub(super) async fn wallet_outbox_write_family(
-        &self,
-        wallet: &str,
-        chain: &str,
-    ) -> Result<FamilyKey, HandlerError> {
-        let projection = self.wallet_projection(wallet).await?;
-        if let Some(reason) = &projection.accounts_unavailable
-            && projection.wallet.root_key_ref.is_none()
-        {
-            return Err(HandlerError::invalid(format!(
-                "wallet '{wallet}' cannot stage through the wallet-level outbox: \
-                 the account inventory is unavailable ({reason}); stage through \
-                 a numbered account once it recovers"
-            )));
-        }
-        let view = self.account_view(wallet, 0).await?;
-        let solana = self.is_solana_chain(chain);
-        let family = if solana { view.solana } else { view.evm };
-        let family = family.ok_or_else(|| {
-            HandlerError::not_found(format!(
-                "wallet '{wallet}' has no account-0 {} key, so chain '{chain}' \
-                 cannot stage through the wallet-level outbox",
-                if solana { "Solana" } else { "EVM" }
-            ))
-        })?;
-        if family.address.is_none() {
-            return Err(HandlerError::not_found(format!(
-                "wallet '{wallet}' has no Broker-projected account-0 {} address, so chain '{chain}' cannot stage through the wallet-level outbox",
-                if solana { "Solana" } else { "EVM" }
-            )));
-        }
-        Ok(family)
-    }
-
     /// The EVM key account `number` stages and confirms from on `chain`.
     pub(super) async fn account_evm_family(
         &self,
@@ -763,26 +651,11 @@ impl WalletsHandler {
         Self::evm_family(&view, chain).cloned()
     }
 
-    pub(super) fn evm_scope_allows(&self, from: &str, scope: OutboxScope<'_>) -> bool {
-        match scope {
-            OutboxScope::Key(family) => family
-                .address()
-                .is_some_and(|address| from.eq_ignore_ascii_case(address)),
-            OutboxScope::Unfiltered => true,
-            OutboxScope::Empty => false,
-        }
-    }
-
-    pub(super) fn solana_scope_allows(
-        &self,
-        staged: &bloom_solana_tx::types::StagedSolanaTransfer,
-        scope: OutboxScope<'_>,
-    ) -> bool {
-        match scope {
-            OutboxScope::Key(family) => solana_entry_belongs(staged, &Self::solana_sender(family)),
-            OutboxScope::Unfiltered => true,
-            OutboxScope::Empty => false,
-        }
+    /// Whether an EVM entry's staged sender is this account's key.
+    fn evm_entry_belongs(family: &FamilyKey, from: &str) -> bool {
+        family
+            .address()
+            .is_some_and(|address| from.eq_ignore_ascii_case(address))
     }
 
     // ----- EVM -----
@@ -803,13 +676,13 @@ impl WalletsHandler {
                 if matches!(
                     leaf.as_str(),
                     "balance" | "balance.raw" | "balance.json" | "nonce"
-                ) =>
+                ) || EVM_MEMPOOL_LEAVES.contains(&leaf.as_str()) =>
             {
                 Ok(Entry::file(leaf))
             }
             [dir] if dir == "outbox" => Ok(Entry::dir("outbox")),
             [dir, outbox_rest @ ..] if dir == "outbox" => {
-                self.evm_outbox_lookup(wallet, OutboxScope::Key(family), chain, outbox_rest)
+                self.evm_outbox_lookup(wallet, family, chain, outbox_rest)
                     .await
             }
             _ => Err(HandlerError::not_found(rest.join("/"))),
@@ -858,8 +731,14 @@ impl WalletsHandler {
                 let nonce = client.nonce(address).await.map_err(err_be)?;
                 Ok(format!("{nonce}\n").into_bytes())
             }
+            [leaf] if leaf == "pending_external.jsonl" => {
+                self.evm_pending_external(wallet, family, chain, address)
+            }
+            [leaf] if leaf == "nonce_conflicts.json" => {
+                self.evm_nonce_conflicts(wallet, family, chain, address)
+            }
             [dir, outbox_rest @ ..] if dir == "outbox" => {
-                self.evm_outbox_read(wallet, OutboxScope::Key(family), chain, outbox_rest)
+                self.evm_outbox_read(wallet, family, chain, outbox_rest)
                     .await
             }
             _ => Err(HandlerError::NotAFile(rest.join("/"))),
@@ -882,33 +761,27 @@ impl WalletsHandler {
                 Entry::file("balance.raw"),
                 Entry::file("balance.json"),
                 Entry::file("nonce"),
+                Entry::file("pending_external.jsonl"),
+                Entry::file("nonce_conflicts.json"),
                 Entry::dir("outbox"),
             ]),
-            [dir] if dir == "outbox" => {
-                self.evm_outbox_list(wallet, OutboxScope::Key(family), chain, &[])
-                    .await
-            }
+            [dir] if dir == "outbox" => self.evm_outbox_list(wallet, family, chain, &[]).await,
             [dir, outbox_rest @ ..] if dir == "outbox" => {
-                self.evm_outbox_list(wallet, OutboxScope::Key(family), chain, outbox_rest)
+                self.evm_outbox_list(wallet, family, chain, outbox_rest)
                     .await
             }
             _ => Err(HandlerError::NotADir(rest.join("/"))),
         }
     }
 
-    /// The one scoped EVM outbox implementation, shared by the numbered
-    /// tree (`OutboxScope::Key`) and the wallet-level account-0 view. The
-    /// numbered copy is the base because it is the stricter one: artifact
-    /// opens are NOFOLLOW, the entry listing filters the writable control
-    /// names out of the regular files, and unreadable entries are skipped.
-    ///
-    /// `OutboxScope::Unfiltered` is the `accounts_unavailable` fallback and
-    /// exists for reads only: the numbered tree is empty then, so there is
-    /// no other account to leak, and owners keep their history.
-    pub(super) async fn evm_outbox_lookup(
+    /// `<n>/chains/<chain>/outbox/` for an EVM chain, fenced to the entries
+    /// `family` staged: artifact opens are NOFOLLOW, the entry listing
+    /// filters the writable control names out of the regular files, and
+    /// unreadable entries are skipped.
+    async fn evm_outbox_lookup(
         &self,
         wallet: &str,
-        scope: OutboxScope<'_>,
+        family: &FamilyKey,
         chain: &str,
         rest: &[String],
     ) -> Result<Entry, HandlerError> {
@@ -917,7 +790,7 @@ impl WalletsHandler {
             [leaf] if leaf == "new.tx" => Ok(Entry::writable_file("new.tx")),
             [leaf] if leaf == "latest" => {
                 let target = self
-                    .evm_latest_target(wallet, scope, chain)?
+                    .evm_latest_target(wallet, family, chain)?
                     .ok_or_else(|| HandlerError::not_found("outbox/latest"))?;
                 Ok(Entry::symlink("latest", &target))
             }
@@ -926,11 +799,11 @@ impl WalletsHandler {
                 Ok(Entry::dir(state))
             }
             [state, id] => {
-                let entry = self.evm_outbox_entry(wallet, scope, chain, state, id)?;
+                let entry = self.evm_outbox_entry(wallet, family, chain, state, id)?;
                 Ok(Entry::dir(id).with_modified_ms(entry.staged.created_ms))
             }
             [state, id, fname] => {
-                let entry = self.evm_outbox_entry(wallet, scope, chain, state, id)?;
+                let entry = self.evm_outbox_entry(wallet, family, chain, state, id)?;
                 if entry.state == OutboxState::Pending
                     && EVM_PENDING_CONTROLS.contains(&fname.as_str())
                 {
@@ -945,16 +818,16 @@ impl WalletsHandler {
         }
     }
 
-    pub(super) async fn evm_outbox_read(
+    async fn evm_outbox_read(
         &self,
         wallet: &str,
-        scope: OutboxScope<'_>,
+        family: &FamilyKey,
         chain: &str,
         rest: &[String],
     ) -> Result<Vec<u8>, HandlerError> {
         match rest {
             [state, id, fname] => {
-                let entry = self.evm_outbox_entry(wallet, scope, chain, state, id)?;
+                let entry = self.evm_outbox_entry(wallet, family, chain, state, id)?;
                 let mut file = open_regular_outbox_artifact(&entry.dir, fname)?;
                 let mut bytes = Vec::new();
                 std::io::Read::read_to_end(&mut file, &mut bytes)?;
@@ -964,10 +837,10 @@ impl WalletsHandler {
         }
     }
 
-    pub(super) async fn evm_outbox_list(
+    async fn evm_outbox_list(
         &self,
         wallet: &str,
-        scope: OutboxScope<'_>,
+        family: &FamilyKey,
         chain: &str,
         rest: &[String],
     ) -> Result<Vec<Entry>, HandlerError> {
@@ -981,11 +854,8 @@ impl WalletsHandler {
                 ];
                 // `latest` is the advertised atomic identity of the newest
                 // staged intent; an unreadable candidate surfaces here
-                // instead of silently pointing at an older transfer. With
-                // no account-0 key there is nothing to point at.
-                if !matches!(scope, OutboxScope::Empty)
-                    && let Some(target) = self.evm_latest_target(wallet, scope, chain)?
-                {
+                // instead of silently pointing at an older transfer.
+                if let Some(target) = self.evm_latest_target(wallet, family, chain)? {
                     entries.push(Entry::symlink("latest", &target));
                 }
                 Ok(entries)
@@ -999,31 +869,21 @@ impl WalletsHandler {
                     .map_err(err_be)?;
                 let mut entries = Vec::new();
                 for id in ids {
-                    match self.tx_engine.outbox.read_in_state(wallet, chain, &id, st) {
-                        Ok(entry) => {
-                            if !self.evm_scope_allows(&entry.staged.from, scope) {
-                                continue;
-                            }
-                            entries.push(Entry::dir(&id).with_modified_ms(entry.staged.created_ms));
-                        }
-                        Err(error) => {
-                            // Ownership of an unreadable entry cannot be
-                            // proven, so a scoped reader excludes it. The
-                            // unfiltered fallback (accounts_unavailable)
-                            // surfaces it with unknown metadata instead.
-                            if matches!(scope, OutboxScope::Unfiltered) {
-                                tracing::warn!(
-                                    id = %id, error = %error, "wallets.outbox.metadata_fallback"
-                                );
-                                entries.push(Entry::dir(&id));
-                            }
-                        }
+                    // Ownership of an unreadable entry cannot be proven, so
+                    // it is excluded.
+                    let Ok(entry) = self.tx_engine.outbox.read_in_state(wallet, chain, &id, st)
+                    else {
+                        continue;
+                    };
+                    if !Self::evm_entry_belongs(family, &entry.staged.from) {
+                        continue;
                     }
+                    entries.push(Entry::dir(&id).with_modified_ms(entry.staged.created_ms));
                 }
                 Ok(entries)
             }
             [state, id] => {
-                let entry = self.evm_outbox_entry(wallet, scope, chain, state, id)?;
+                let entry = self.evm_outbox_entry(wallet, family, chain, state, id)?;
                 let mut out = Vec::new();
                 if let Ok(read_dir) = std::fs::read_dir(&entry.dir) {
                     for item in read_dir.flatten() {
@@ -1046,13 +906,13 @@ impl WalletsHandler {
         }
     }
 
-    /// The outbox entry at `state/id`, visible only when the scope allows
-    /// its staged sender. Another account's entry is not found here, never
+    /// The outbox entry at `state/id`, visible only when `family` is its
+    /// staged sender. Another account's entry is not found here, never
     /// exposed.
     fn evm_outbox_entry(
         &self,
         wallet: &str,
-        scope: OutboxScope<'_>,
+        family: &FamilyKey,
         chain: &str,
         state: &str,
         id: &str,
@@ -1063,13 +923,13 @@ impl WalletsHandler {
             .outbox
             .read_in_state(wallet, chain, id, st)
             .map_err(outbox_err)?;
-        if !self.evm_scope_allows(&entry.staged.from, scope) {
+        if !Self::evm_entry_belongs(family, &entry.staged.from) {
             return Err(HandlerError::not_found(format!("outbox/{state}/{id}")));
         }
         Ok(entry)
     }
 
-    /// The newest pending entry the scope can see. The fence applies
+    /// The newest pending entry `family` staged. The fence applies
     /// before the newest entry is chosen, so another account's pending
     /// transfer never pulls `latest`. A read failure surfaces as `Err` —
     /// `latest` is the advertised atomic identity of the newest staged
@@ -1079,7 +939,7 @@ impl WalletsHandler {
     fn evm_latest_target(
         &self,
         wallet: &str,
-        scope: OutboxScope<'_>,
+        family: &FamilyKey,
         chain: &str,
     ) -> Result<Option<String>, HandlerError> {
         let ids = self
@@ -1104,12 +964,145 @@ impl WalletsHandler {
                     ) => continue,
                     Err(error) => return Err(err_be(error)),
                 };
-            if !self.evm_scope_allows(&entry.staged.from, scope) {
+            if !Self::evm_entry_belongs(family, &entry.staged.from) {
                 continue;
             }
             pending.push((entry.staged.created_ms, id));
         }
         Ok(newest_pending_target(pending))
+    }
+
+    /// The outbox entries `family` staged on `chain` in `state`, as
+    /// `(sorted unique nonces, nonce -> lowercased tx hashes)`. A pending
+    /// entry may have no hash yet. Another account's entry never counts,
+    /// and an unreadable entry is skipped because its sender cannot be
+    /// proven.
+    fn evm_outbox_nonces(
+        &self,
+        wallet: &str,
+        family: &FamilyKey,
+        chain: &str,
+        state: OutboxState,
+    ) -> Result<EvmOutboxNonces, HandlerError> {
+        let mut nonces = std::collections::BTreeSet::new();
+        let mut by_nonce: std::collections::BTreeMap<u64, Vec<String>> =
+            std::collections::BTreeMap::new();
+        let ids = self
+            .tx_engine
+            .outbox
+            .list(wallet, chain, state)
+            .map_err(err_be)?;
+        for id in ids {
+            let Ok(entry) = self
+                .tx_engine
+                .outbox
+                .read_in_state(wallet, chain, &id, state)
+            else {
+                continue;
+            };
+            if !Self::evm_entry_belongs(family, &entry.staged.from) {
+                continue;
+            }
+            nonces.insert(entry.staged.nonce);
+            if let Some(hash) = entry.staged.tx_hash.as_deref() {
+                by_nonce
+                    .entry(entry.staged.nonce)
+                    .or_default()
+                    .push(hash.to_lowercase());
+            }
+        }
+        Ok((nonces.into_iter().collect(), by_nonce))
+    }
+
+    /// `pending_external.jsonl`: the mempool txs from `address` that none of
+    /// this account's pending or sent outbox entries produced, one JSON
+    /// object per line. Empty when the chain has no mempool index.
+    fn evm_pending_external(
+        &self,
+        wallet: &str,
+        family: &FamilyKey,
+        chain: &str,
+        address: alloy::primitives::Address,
+    ) -> Result<Vec<u8>, HandlerError> {
+        let Some(index) = self.mempool_indexes.get(chain) else {
+            return Ok(Vec::new());
+        };
+        let mut own_hashes = std::collections::HashSet::new();
+        for state in [OutboxState::Pending, OutboxState::Sent] {
+            let (_, by_nonce) = self.evm_outbox_nonces(wallet, family, chain, state)?;
+            own_hashes.extend(by_nonce.into_values().flatten());
+        }
+        let mut out = Vec::new();
+        for tx in index.snapshot().into_iter().filter(|tx| tx.from == address) {
+            if own_hashes.contains(&format!("{:?}", tx.hash).to_lowercase()) {
+                continue;
+            }
+            serde_json::to_writer(&mut out, &tx).map_err(err_be)?;
+            out.push(b'\n');
+        }
+        Ok(out)
+    }
+
+    /// `nonce_conflicts.json`: the nonces the mempool observed for
+    /// `address`, this account's pending and sent outbox nonces, and every
+    /// mempool hash that occupies one of those nonces without being one of
+    /// this account's own hashes.
+    fn evm_nonce_conflicts(
+        &self,
+        wallet: &str,
+        family: &FamilyKey,
+        chain: &str,
+        address: alloy::primitives::Address,
+    ) -> Result<Vec<u8>, HandlerError> {
+        // The mempool may hold several txs at one nonce (replacements);
+        // each is a candidate until it matches one of this account's hashes.
+        let mut mempool_by_nonce: std::collections::BTreeMap<u64, Vec<String>> =
+            std::collections::BTreeMap::new();
+        let observed = match self.mempool_indexes.get(chain) {
+            Some(index) => {
+                for tx in index.snapshot().into_iter().filter(|tx| tx.from == address) {
+                    mempool_by_nonce
+                        .entry(tx.nonce)
+                        .or_default()
+                        .push(format!("{:?}", tx.hash).to_lowercase());
+                }
+                index.observed_nonces(address)
+            }
+            None => Vec::new(),
+        };
+        let (pending_nonces, pending_by_nonce) =
+            self.evm_outbox_nonces(wallet, family, chain, OutboxState::Pending)?;
+        let (sent_nonces, sent_by_nonce) =
+            self.evm_outbox_nonces(wallet, family, chain, OutboxState::Sent)?;
+        let mut outbox_by_nonce: std::collections::BTreeMap<u64, Vec<String>> =
+            std::collections::BTreeMap::new();
+        for (nonce, hashes) in pending_by_nonce.into_iter().chain(sent_by_nonce) {
+            outbox_by_nonce.entry(nonce).or_default().extend(hashes);
+        }
+        let mut conflicts = Vec::new();
+        for (nonce, mempool_hashes) in &mempool_by_nonce {
+            let Some(outbox_hashes) = outbox_by_nonce.get(nonce) else {
+                continue;
+            };
+            for mempool_hash in mempool_hashes {
+                if outbox_hashes.contains(mempool_hash) {
+                    continue;
+                }
+                conflicts.push(serde_json::json!({
+                    "nonce": nonce,
+                    "mempool_hash": mempool_hash,
+                    "outbox_hash": outbox_hashes.first(),
+                }));
+            }
+        }
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "address": bloom_proto::checksum_address(&address),
+            "observed_nonces": observed,
+            "outbox_pending_nonces": pending_nonces,
+            "outbox_sent_nonces": sent_nonces,
+            "conflicts": conflicts,
+        }))
+        .map_err(err_be)
     }
 
     // ----- Solana -----
@@ -1125,7 +1118,7 @@ impl WalletsHandler {
             [] => Ok(Entry::dir(chain)),
             [leaf] if Self::SOLANA_ACCOUNT_LEAVES.contains(&leaf.as_str()) => Ok(Entry::file(leaf)),
             [dir, outbox_rest @ ..] if dir == "outbox" => {
-                self.solana_outbox_lookup(wallet, OutboxScope::Key(family), chain, outbox_rest)
+                self.solana_outbox_lookup(wallet, family, chain, outbox_rest)
                     .await
             }
             _ => Err(HandlerError::not_found(rest.join("/"))),
@@ -1147,7 +1140,7 @@ impl WalletsHandler {
                 Ok(Self::solana_balance_bytes(leaf, chain, account, lamports))
             }
             [dir, outbox_rest @ ..] if dir == "outbox" => {
-                self.solana_outbox_read(wallet, OutboxScope::Key(family), chain, outbox_rest)
+                self.solana_outbox_read(wallet, family, chain, outbox_rest)
                     .await
             }
             _ => Err(HandlerError::NotAFile(rest.join("/"))),
@@ -1173,12 +1166,9 @@ impl WalletsHandler {
                 }
                 Ok(entries)
             }
-            [dir] if dir == "outbox" => {
-                self.solana_outbox_list(wallet, OutboxScope::Key(family), chain, &[])
-                    .await
-            }
+            [dir] if dir == "outbox" => self.solana_outbox_list(wallet, family, chain, &[]).await,
             [dir, outbox_rest @ ..] if dir == "outbox" => {
-                self.solana_outbox_list(wallet, OutboxScope::Key(family), chain, outbox_rest)
+                self.solana_outbox_list(wallet, family, chain, outbox_rest)
                     .await
             }
             _ => Err(HandlerError::NotADir(rest.join("/"))),
@@ -1215,16 +1205,14 @@ impl WalletsHandler {
         }
     }
 
-    /// The one scoped Solana outbox implementation, shared by the numbered
-    /// tree (`OutboxScope::Key`) and the wallet-level account-0 view. It is
-    /// the stricter copy: artifact opens are NOFOLLOW, the entry listing
-    /// applies the public-artifact filter, and unreadable entries are
-    /// skipped. `OutboxScope::Unfiltered` is the `accounts_unavailable`
-    /// read fallback; it never applies to writes.
-    pub(super) async fn solana_outbox_lookup(
+    /// `<n>/chains/<chain>/outbox/` for a Solana chain, fenced to the
+    /// entries pinned to `family`: artifact opens are NOFOLLOW, the entry
+    /// listing applies the public-artifact filter, and unreadable entries
+    /// are skipped.
+    async fn solana_outbox_lookup(
         &self,
         wallet: &str,
-        scope: OutboxScope<'_>,
+        family: &FamilyKey,
         chain: &str,
         rest: &[String],
     ) -> Result<Entry, HandlerError> {
@@ -1239,7 +1227,7 @@ impl WalletsHandler {
             [leaf] if leaf == "new.tx" => Ok(Entry::writable_file("new.tx")),
             [leaf] if leaf == "latest" => {
                 let target = self
-                    .solana_latest_target(wallet, scope, chain)?
+                    .solana_latest_target(wallet, family, chain)?
                     .ok_or_else(|| HandlerError::not_found("outbox/latest"))?;
                 Ok(Entry::symlink("latest", &target))
             }
@@ -1249,11 +1237,11 @@ impl WalletsHandler {
                 Ok(Entry::dir(state))
             }
             [state, id] => {
-                let entry = self.solana_outbox_entry(wallet, scope, chain, state, id)?;
+                let entry = self.solana_outbox_entry(wallet, family, chain, state, id)?;
                 Ok(Entry::dir(id).with_modified_ms(entry.staged.created_ms))
             }
             [state, id, fname] => {
-                let entry = self.solana_outbox_entry(wallet, scope, chain, state, id)?;
+                let entry = self.solana_outbox_entry(wallet, family, chain, state, id)?;
                 let pending_control = solana_state(state)
                     == Some(bloom_solana_tx::outbox::SolanaOutboxState::Pending)
                     && SOLANA_PENDING_CONTROLS.contains(&fname.as_str());
@@ -1279,10 +1267,10 @@ impl WalletsHandler {
         }
     }
 
-    pub(super) async fn solana_outbox_read(
+    async fn solana_outbox_read(
         &self,
         wallet: &str,
-        scope: OutboxScope<'_>,
+        family: &FamilyKey,
         chain: &str,
         rest: &[String],
     ) -> Result<Vec<u8>, HandlerError> {
@@ -1291,7 +1279,7 @@ impl WalletsHandler {
                 if !is_public_solana_outbox_artifact(fname) {
                     return Err(HandlerError::not_found(fname));
                 }
-                let entry = self.solana_outbox_entry(wallet, scope, chain, state, id)?;
+                let entry = self.solana_outbox_entry(wallet, family, chain, state, id)?;
                 let mut file = open_regular_outbox_artifact(&entry.dir, fname)?;
                 let mut bytes = Vec::new();
                 std::io::Read::read_to_end(&mut file, &mut bytes)?;
@@ -1301,10 +1289,10 @@ impl WalletsHandler {
         }
     }
 
-    pub(super) async fn solana_outbox_list(
+    async fn solana_outbox_list(
         &self,
         wallet: &str,
-        scope: OutboxScope<'_>,
+        family: &FamilyKey,
         chain: &str,
         rest: &[String],
     ) -> Result<Vec<Entry>, HandlerError> {
@@ -1316,9 +1304,7 @@ impl WalletsHandler {
                     Entry::dir("sent"),
                     Entry::dir("failed"),
                 ];
-                if !matches!(scope, OutboxScope::Empty)
-                    && let Some(target) = self.solana_latest_target(wallet, scope, chain)?
-                {
+                if let Some(target) = self.solana_latest_target(wallet, family, chain)? {
                     entries.push(Entry::symlink("latest", &target));
                 }
                 Ok(entries)
@@ -1337,17 +1323,12 @@ impl WalletsHandler {
                     .map_err(solana_outbox_err)?;
                 let mut entries = Vec::new();
                 for id in ids {
+                    // Ownership of an unreadable entry cannot be proven, so
+                    // it is excluded.
                     let Ok(entry) = engine.outbox().read_in_state(wallet, chain, &id, st) else {
-                        // A scoped reader cannot prove ownership of an
-                        // unreadable entry, so it is excluded. The
-                        // unfiltered fallback (accounts_unavailable)
-                        // surfaces it with unknown metadata instead.
-                        if matches!(scope, OutboxScope::Unfiltered) {
-                            entries.push(Entry::dir(&id));
-                        }
                         continue;
                     };
-                    if !self.solana_scope_allows(&entry.staged, scope) {
+                    if !solana_entry_belongs(&entry.staged, &Self::solana_sender(family)) {
                         continue;
                     }
                     entries.push(Entry::dir(&id).with_modified_ms(entry.staged.created_ms));
@@ -1355,7 +1336,7 @@ impl WalletsHandler {
                 Ok(entries)
             }
             [state, id] => {
-                let entry = self.solana_outbox_entry(wallet, scope, chain, state, id)?;
+                let entry = self.solana_outbox_entry(wallet, family, chain, state, id)?;
                 let mut out = Vec::new();
                 if let Ok(read_dir) = std::fs::read_dir(&entry.dir) {
                     for item in read_dir.flatten() {
@@ -1386,13 +1367,12 @@ impl WalletsHandler {
         }
     }
 
-    /// The outbox entry at `state/id`, visible only when the scope allows
-    /// its pinned sender. Another account's entry is not found here, never
-    /// exposed.
+    /// The outbox entry at `state/id`, visible only when it is pinned to
+    /// `family`. Another account's entry is not found here, never exposed.
     fn solana_outbox_entry(
         &self,
         wallet: &str,
-        scope: OutboxScope<'_>,
+        family: &FamilyKey,
         chain: &str,
         state: &str,
         id: &str,
@@ -1408,20 +1388,20 @@ impl WalletsHandler {
             .outbox()
             .read_in_state(wallet, chain, id, st)
             .map_err(solana_outbox_err)?;
-        if !self.solana_scope_allows(&entry.staged, scope) {
+        if !solana_entry_belongs(&entry.staged, &Self::solana_sender(family)) {
             return Err(HandlerError::not_found(format!("outbox/{state}/{id}")));
         }
         Ok(entry)
     }
 
-    /// The Solana twin of `evm_latest_target`: scoped before the newest
+    /// The Solana twin of `evm_latest_target`: fenced before the newest
     /// entry is chosen, fail-closed on unreadable candidates, skipping an
     /// entry that left `pending` mid-listing, `Ok(None)` when nothing is
     /// visible.
     fn solana_latest_target(
         &self,
         wallet: &str,
-        scope: OutboxScope<'_>,
+        family: &FamilyKey,
         chain: &str,
     ) -> Result<Option<String>, HandlerError> {
         let engine = self.solana_engine(chain).ok_or_else(|| {
@@ -1452,7 +1432,7 @@ impl WalletsHandler {
                 ) => continue,
                 Err(error) => return Err(solana_outbox_err(error)),
             };
-            if !self.solana_scope_allows(&entry.staged, scope) {
+            if !solana_entry_belongs(&entry.staged, &Self::solana_sender(family)) {
                 continue;
             }
             pending.push((entry.staged.created_ms, id));

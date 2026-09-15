@@ -82,7 +82,7 @@ The `head` leaf is a digest that depends on every prior record. After any write 
 
 ```sh
 before=$(cat /bloom/status/audit/head)
-echo y > /bloom/wallets/alice/chains/anvil/outbox/pending/0001-abc/confirm
+echo y > /bloom/wallets/alice/0/chains/anvil/outbox/pending/0001-abc/confirm
 after=$(cat /bloom/status/audit/head)
 [ "$before" != "$after" ] && echo "audit chain advanced"
 ```
@@ -91,7 +91,7 @@ To verify the chain is fully intact (no tampering of intermediate records), reco
 
 ## Cache, wallets, outbox, policies
 
-Counts only — no list surfaces here. (For the wallet list, use `/bloom/wallets/`. For pending outbox detail, use `/bloom/wallets/<wallet>/chains/<chain>/outbox/pending/`.)
+Counts only — no list surfaces here. (For the wallet list, use `/bloom/wallets/`. For pending outbox detail, use `/bloom/wallets/<wallet>/0/chains/<chain>/outbox/pending/`.)
 
 ```sh
 ls /bloom/status/cache/                                # etherscan_entries, prices_entries

@@ -37,10 +37,10 @@ cat /bloom/wallets/alice/kind             # public backend/kind projection
 cat /bloom/wallets/alice/policy.json      # canonical Broker policy projection
 
 # Per-chain native balance + nonce.
-cat /bloom/wallets/alice/chains/base/balance       # human "0.123 ETH" (display, with symbol)
-cat /bloom/wallets/alice/chains/base/balance.raw   # raw wei (integer base units)
-cat /bloom/wallets/alice/chains/base/balance.json  # { symbol, decimals, raw, formatted, display }
-cat /bloom/wallets/alice/chains/base/nonce
+cat /bloom/wallets/alice/0/chains/base/balance       # human "0.123 ETH" (display, with symbol)
+cat /bloom/wallets/alice/0/chains/base/balance.raw   # raw wei (integer base units)
+cat /bloom/wallets/alice/0/chains/base/balance.json  # { symbol, decimals, raw, formatted, display }
+cat /bloom/wallets/alice/0/chains/base/nonce
 ```
 
 `policy.json` is the only writable policy surface. The first exact write calls
@@ -92,10 +92,10 @@ JSON, or TOML.
 ```sh
 # Native send, shell shorthand.
 echo 'send 0.01 eth to 0x70997970C51812dc3A010C7d01b50e0d17dc79C8 on anvil' \
-  > /bloom/wallets/alice/chains/anvil/outbox/new.tx
+  > /bloom/wallets/alice/0/chains/anvil/outbox/new.tx
 
 # Native send, JSON.
-cat <<'EOF' > /bloom/wallets/alice/chains/anvil/outbox/new.tx
+cat <<'EOF' > /bloom/wallets/alice/0/chains/anvil/outbox/new.tx
 {
   "kind": "send",
   "to": "0x70997970C51812dc3A010C7d01b50e0d17dc79C8",
@@ -107,7 +107,7 @@ EOF
 # ERC-20 transfer, JSON. Token + amount triggers ERC-20 encoding.
 # The engine resolves the token, encodes transfer(address,uint256),
 # and renders the plan as a token transfer (TokenRef in plan.md).
-cat <<'EOF' > /bloom/wallets/alice/chains/base/outbox/new.tx
+cat <<'EOF' > /bloom/wallets/alice/0/chains/base/outbox/new.tx
 {
   "kind": "send",
   "to": "0x70997970C51812dc3A010C7d01b50e0d17dc79C8",
@@ -119,7 +119,7 @@ EOF
 
 # Generic call against an arbitrary contract via ABI signature + args.
 # Example: WETH deposit() with 0.05 ETH attached on Base.
-cat <<'EOF' > /bloom/wallets/alice/chains/base/outbox/new.tx
+cat <<'EOF' > /bloom/wallets/alice/0/chains/base/outbox/new.tx
 {
   "kind": "call",
   "contract": "0x4200000000000000000000000000000000000006",
@@ -149,7 +149,7 @@ To pin an exact nonce, add a `nonce` field to the `new.tx` body (JSON or
 TOML). Use it to deliberately fill a gap or queue a specific slot:
 
 ```sh
-cat <<'EOF' > /bloom/wallets/alice/chains/anvil/outbox/new.tx
+cat <<'EOF' > /bloom/wallets/alice/0/chains/anvil/outbox/new.tx
 { "kind": "send", "to": "0x7099…79C8", "value": "0.01 eth", "chain": "anvil", "nonce": 3 }
 EOF
 ```
@@ -180,12 +180,12 @@ with an explicit `nonce` to fill the gap on purpose.
 ### Review
 
 ```sh
-ls /bloom/wallets/alice/chains/anvil/outbox/pending/
+ls /bloom/wallets/alice/0/chains/anvil/outbox/pending/
 # 0001-21699/
 
-ID=$(ls /bloom/wallets/alice/chains/anvil/outbox/pending/ | head -n1)
+ID=$(ls /bloom/wallets/alice/0/chains/anvil/outbox/pending/ | head -n1)
 
-cat /bloom/wallets/alice/chains/anvil/outbox/pending/$ID/plan.md
+cat /bloom/wallets/alice/0/chains/anvil/outbox/pending/$ID/plan.md
 ```
 
 `plan.md` is rendered from the `StagedTx` and looks like:
@@ -217,8 +217,8 @@ slot renders `transfer ERC-721 …` / `transfer ERC-1155 …`.
 ```sh
 # The full StagedTx JSON. (Note: the on-disk file is intent.json — there
 # is no separate tx.json; the staged record carries every field.)
-cat /bloom/wallets/alice/chains/anvil/outbox/pending/$ID/intent.json
-cat /bloom/wallets/alice/chains/anvil/outbox/pending/$ID/policy_check.json
+cat /bloom/wallets/alice/0/chains/anvil/outbox/pending/$ID/intent.json
+cat /bloom/wallets/alice/0/chains/anvil/outbox/pending/$ID/policy_check.json
 ```
 
 ### Confirm (broadcast)
@@ -231,11 +231,11 @@ Machine has no wallet unlock state.
 
 ```sh
 # Plain confirm.
-echo y > /bloom/wallets/alice/chains/anvil/outbox/pending/$ID/confirm
+echo y > /bloom/wallets/alice/0/chains/anvil/outbox/pending/$ID/confirm
 
 # Override token to bypass soft-policy warnings (Warn outcome only;
 # Deny is never overridable).
-echo override > /bloom/wallets/alice/chains/anvil/outbox/pending/$ID/confirm
+echo override > /bloom/wallets/alice/0/chains/anvil/outbox/pending/$ID/confirm
 ```
 
 After a successful broadcast the daemon moves the directory to
@@ -243,14 +243,14 @@ After a successful broadcast the daemon moves the directory to
 artefacts:
 
 ```sh
-ls /bloom/wallets/alice/chains/anvil/outbox/sent/$ID/
+ls /bloom/wallets/alice/0/chains/anvil/outbox/sent/$ID/
 # intent.json   plan.md   policy_check.json   tx_hash
 
-cat /bloom/wallets/alice/chains/anvil/outbox/sent/$ID/tx_hash
+cat /bloom/wallets/alice/0/chains/anvil/outbox/sent/$ID/tx_hash
 # 0xabc...
 
 # The receipt itself is exposed under the chain reader, keyed by hash:
-HASH=$(cat /bloom/wallets/alice/chains/anvil/outbox/sent/$ID/tx_hash)
+HASH=$(cat /bloom/wallets/alice/0/chains/anvil/outbox/sent/$ID/tx_hash)
 cat /bloom/chains/anvil/tx/$HASH/receipt
 ```
 
@@ -268,13 +268,13 @@ non-empty body and the same Broker/Signer authorization as confirmation.
 # Replace: bumped fees plus a substituted intent body. Same nonce, the
 # original record stays in place; the engine writes replacement_intent.json
 # and replacement_tx_hash alongside.
-cat <<'EOF' > /bloom/wallets/alice/chains/anvil/outbox/pending/$ID/replace
+cat <<'EOF' > /bloom/wallets/alice/0/chains/anvil/outbox/pending/$ID/replace
 send 0.02 eth to 0x70997970C51812dc3A010C7d01b50e0d17dc79C8 on anvil
 EOF
 
 # Cancel: fires a self-send replacement at the same nonce with a >=10%
 # fee bump. Body is any non-empty token, conventionally 'y'.
-echo y > /bloom/wallets/alice/chains/anvil/outbox/pending/$ID/cancel
+echo y > /bloom/wallets/alice/0/chains/anvil/outbox/pending/$ID/cancel
 ```
 
 ### Mainnet broadcast
