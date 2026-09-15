@@ -513,9 +513,13 @@ impl Handler for PetalRouter {
         }
     }
 
+    // Repository documents are served by the host, never by a matching guest
+    // route. Keep their metadata consistent with lookup/read/write, including
+    // before a parameterized route has supplied its runtime metadata.
     fn cache_ttl(&self, path: &VfsPath) -> Option<Duration> {
         if let Ok((mount, rest)) = Self::mount_path(path)
             && self.is_petal(mount)
+            && !Self::is_petal_document(&rest)
         {
             return self
                 .runner
@@ -531,6 +535,7 @@ impl Handler for PetalRouter {
     fn is_read_side_effecting(&self, path: &VfsPath) -> bool {
         if let Ok((mount, rest)) = Self::mount_path(path)
             && self.is_petal(mount)
+            && !Self::is_petal_document(&rest)
         {
             return self
                 .runner
@@ -545,6 +550,7 @@ impl Handler for PetalRouter {
     fn is_async_write_command(&self, path: &VfsPath) -> bool {
         if let Ok((mount, rest)) = Self::mount_path(path)
             && self.is_petal(mount)
+            && !Self::is_petal_document(&rest)
         {
             return self
                 .runner
@@ -821,6 +827,73 @@ name = "example"
 
         assert!(router.is_read_side_effecting(&route_path));
         assert_eq!(router.cache_ttl(&route_path), None);
+    }
+
+    #[tokio::test]
+    async fn package_documents_do_not_inherit_parameterized_route_metadata() {
+        let (dir, runner) = runner();
+        let package = dir.path().join("example-app");
+        write_dynamic_dir_package(&package, false);
+        runner.store().install_petal_package_dir(&package).unwrap();
+
+        let router = PetalRouter::new(runner, Arc::new(DenyHost));
+        let vfs = Vfs::builder()
+            .mount("petals", Arc::new(router.clone()))
+            .build();
+        // Unknown dynamic routes must still fail closed before guest lookup.
+        assert!(vfs.is_read_side_effecting(&VfsPath::parse("/petals/example/alice").unwrap()));
+        for (name, contents) in [
+            ("README.md", b"# example".as_slice()),
+            ("AGENTS.md", b"# example agents".as_slice()),
+        ] {
+            let path = VfsPath::parse(&format!("/petals/example/{name}")).unwrap();
+            // NFS uses this gate before rendering a file to determine its size.
+            assert!(!vfs.is_read_side_effecting(&path));
+            let entry = vfs.lookup(&path).await.unwrap();
+            assert_eq!(entry.size, contents.len() as u64);
+            assert_eq!(entry.mode, 0o444);
+            assert_eq!(vfs.read(&path).await.unwrap(), contents);
+            assert!(!vfs.is_async_write_command(&path));
+            assert!(matches!(
+                vfs.write(&path, b"replace").await,
+                Err(HandlerError::PermissionDenied)
+            ));
+        }
+        // Once guest metadata is known, its TTL still does not apply to docs.
+        vfs.lookup(&VfsPath::parse("/petals/example/alice").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            router.cache_ttl(&VfsPath::parse("/example/alice").unwrap()),
+            Some(Duration::from_secs(30))
+        );
+        for name in PETAL_DOCUMENT_NAMES {
+            assert_eq!(
+                router.cache_ttl(&VfsPath::parse(&format!("/example/{name}")).unwrap()),
+                None
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn package_documents_are_not_async_guest_commands() {
+        let (dir, runner) = runner();
+        let package = dir.path().join("example-app");
+        write_async_failing_package(&package);
+        std::fs::rename(
+            package.join("petal/example/[wallet].txt.wasm"),
+            package.join("petal/example/[wallet].wasm"),
+        )
+        .unwrap();
+        runner.store().install_petal_package_dir(&package).unwrap();
+        let router = PetalRouter::new(runner, Arc::new(DenyHost));
+        assert!(router.is_async_write_command(&VfsPath::parse("/example/alice").unwrap()));
+        for name in PETAL_DOCUMENT_NAMES {
+            assert!(
+                !router
+                    .is_async_write_command(&VfsPath::parse(&format!("/example/{name}")).unwrap())
+            );
+        }
     }
 
     #[tokio::test]
