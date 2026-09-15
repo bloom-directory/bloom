@@ -116,9 +116,6 @@ Solana-only account), `address.qr.svg`, `address.qr.png`, `public_key`, and
 policy status). The wallet directory itself has no `address` or `public_key`;
 read `wallets/<wallet>/0/address` for the canonical initial account.
 
-Installed Petals are mounted only at `/petals/<petal>/...`; there is no
-`petals/` directory under a wallet or a numbered account.
-
 Every key a Petal derived from one of an account's family keys is mounted at
 `wallets/<wallet>/<n>/sessions/<petal>/<key-slot>/session.json`. It reports
 the delegating owner key, the delegated key and addresses, the scope (routes,
