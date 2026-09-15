@@ -5995,6 +5995,265 @@ mod tests {
         );
     }
 
+    fn triad_fixture(active: bool) -> Arc<TriadBrokerFixture> {
+        Arc::new(TriadBrokerFixture {
+            active: AtomicBool::new(active),
+            approval_terminal: parking_lot::Mutex::new(None),
+            lose_sign_response_once: AtomicBool::new(false),
+            corrupt_status_result: AtomicBool::new(false),
+            completed_result: parking_lot::Mutex::new(None),
+            requests: parking_lot::Mutex::new(Vec::new()),
+            key_ref: triad_key_ref(),
+            derived: Vec::new(),
+        })
+    }
+
+    /// Every file a signed or broadcast outbox action leaves behind.
+    fn outbox_action_artifacts(dir: &std::path::Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| {
+                name.contains("raw_tx")
+                    || name.contains("broadcast_attempted")
+                    || name.ends_with("_tx_hash")
+                    || name.ends_with("_intent.json")
+            })
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// A pending entry whose original payload differs from a cancellation in
+    /// every field a cancellation rewrites, so the signed bytes prove the
+    /// Broker was asked for the self-send and nothing else.
+    fn stage_cancellable(outbox: &Outbox, id: &str) {
+        let mut staged = fake_staged_1559(id);
+        staged.value_wei = "5000".into();
+        staged.data_hex = "0xdeadbeef".into();
+        staged.gas_limit = 60_000;
+        staged.action_kind = TxActionKind::ContractCall;
+        staged.created_ms = now_ms();
+        outbox.write_pending(&staged, "exact EVM review").unwrap();
+    }
+
+    /// Cancellation is a new signature, so it gets the same exact Broker
+    /// approval as a confirm. Before the approval is active nothing is
+    /// signed or broadcast; afterwards exactly one signature is requested,
+    /// with the staged sender's key, over the same-nonce zero-value self-send.
+    #[tokio::test]
+    async fn triad_cancel_signs_only_the_exact_self_send_after_its_approval() {
+        let directory = tempfile::tempdir().unwrap();
+        let outbox = Outbox::new(directory.path().join("outbox")).unwrap();
+        stage_cancellable(&outbox, "triad-cancel");
+        let fixture = triad_fixture(false);
+        let service: Arc<dyn MachineBrokerService> = fixture.clone();
+        // As in the installer catalogs: cancellation is its own authorized
+        // class and carries no fee asset.
+        let mut catalog = triad_catalog();
+        let mut cancel = catalog.records[0].clone();
+        cancel.subject = ProvenanceSubject::System {
+            component_id: Token::new("bloom-machine").unwrap(),
+            operation_class: Token::new("transaction.cancel").unwrap(),
+        };
+        cancel.operation_classes = vec![ProvenanceOperationClass {
+            operation_class: Token::new("transaction.cancel").unwrap(),
+            fee_asset: None,
+        }];
+        catalog.records.push(cancel);
+        let engine = TxEngine::new(outbox.clone(), 60_000)
+            .with_triad_signing(MachineBrokerClient::new(service), catalog)
+            .unwrap();
+        let permit = permit_for(&directory);
+        let chain = stage_chain(&spawn_batch_rpc(None).await);
+        let policy = Policy::default();
+
+        let error = engine
+            .cancel(
+                &permit,
+                "alice",
+                "anvil",
+                "triad-cancel",
+                &chain,
+                10,
+                &policy,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, TxEngineError::ApprovalRequired(_)),
+            "{error:?}"
+        );
+        let pending = outbox
+            .read_in_state("alice", "anvil", "triad-cancel", OutboxState::Pending)
+            .unwrap();
+        assert_eq!(outbox_action_artifacts(&pending.dir), Vec::<String>::new());
+        assert!(
+            !fixture
+                .requests
+                .lock()
+                .iter()
+                .any(|request| matches!(request, MachineBrokerRequest::SigningSign(_))),
+            "nothing may be signed before the approval is active"
+        );
+
+        fixture.active.store(true, Ordering::SeqCst);
+        let cancelled = engine
+            .cancel(
+                &permit,
+                "alice",
+                "anvil",
+                "triad-cancel",
+                &chain,
+                10,
+                &policy,
+            )
+            .await
+            .unwrap();
+        assert_eq!(cancelled.status, TxStatus::Cancelled);
+
+        let signer: Address = TEST_SIGNER_ADDRESS.parse().unwrap();
+        let expected = UnsignedEvmTx::Eip1559(TxEip1559 {
+            chain_id: 31337,
+            nonce: 0,
+            gas_limit: 21_000,
+            max_fee_per_gas: 110,
+            max_priority_fee_per_gas: 11,
+            to: TxKind::Call(signer),
+            value: U256::ZERO,
+            access_list: AccessList::default(),
+            input: Bytes::new(),
+        });
+        let requests = fixture.requests.lock();
+        let prepared: Vec<_> = requests
+            .iter()
+            .filter_map(|request| match request {
+                MachineBrokerRequest::SealedApprovalPrepare(request) => Some(request),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(prepared.len(), 1, "{requests:#?}");
+        assert_eq!(prepared[0].terms.key_ref, triad_key_ref());
+        let signed: Vec<_> = requests
+            .iter()
+            .filter_map(|request| match request {
+                MachineBrokerRequest::SigningSign(request) => Some(request),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(signed.len(), 1, "{requests:#?}");
+        assert_eq!(signed[0].key_ref, triad_key_ref());
+        let SigningPayloads::Single { payload } = &signed[0].payloads else {
+            panic!("cancellation signs one exact payload");
+        };
+        assert_eq!(
+            payload.decode(),
+            TxEngine::unsigned_signing_preimage(&expected)
+        );
+
+        let failed = outbox
+            .read_in_state("alice", "anvil", "triad-cancel", OutboxState::Failed)
+            .unwrap();
+        assert!(failed.dir.join("cancel_tx_hash").exists());
+    }
+
+    /// A Broker that refuses every request, as when it is stopped or its
+    /// socket is unreachable.
+    struct UnavailableBroker(parking_lot::Mutex<Vec<MachineBrokerRequest>>);
+
+    impl MachineBrokerService for UnavailableBroker {
+        fn dispatch<'a>(
+            &'a self,
+            request: MachineBrokerRequest,
+        ) -> ServiceFuture<'a, MachineBrokerResponse> {
+            Box::pin(async move {
+                self.0.lock().push(request);
+                Err(bloom_broker_api::ProtocolError::new(
+                    ProtocolErrorCode::ServiceUnavailable,
+                    "Broker unavailable",
+                ))
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn cancel_fails_closed_without_a_reachable_broker() {
+        let directory = tempfile::tempdir().unwrap();
+        let outbox = Outbox::new(directory.path().join("outbox")).unwrap();
+        stage_cancellable(&outbox, "no-broker");
+        let permit = permit_for(&directory);
+        let chain = stage_chain(&spawn_batch_rpc(None).await);
+        let policy = Policy::default();
+        let broker = Arc::new(UnavailableBroker(parking_lot::Mutex::new(Vec::new())));
+        let service: Arc<dyn MachineBrokerService> = broker.clone();
+
+        for engine in [
+            // No Machine-to-Broker signing edge at all.
+            TxEngine::new(outbox.clone(), 60_000),
+            // An edge whose Broker refuses every call.
+            TxEngine::new(outbox.clone(), 60_000)
+                .with_triad_signing(MachineBrokerClient::new(service.clone()), triad_catalog())
+                .unwrap(),
+        ] {
+            engine
+                .cancel(&permit, "alice", "anvil", "no-broker", &chain, 10, &policy)
+                .await
+                .unwrap_err();
+            let pending = outbox
+                .read_in_state("alice", "anvil", "no-broker", OutboxState::Pending)
+                .unwrap();
+            assert_eq!(outbox_action_artifacts(&pending.dir), Vec::<String>::new());
+        }
+        assert!(
+            !broker
+                .0
+                .lock()
+                .iter()
+                .any(|request| matches!(request, MachineBrokerRequest::SigningSign(_)))
+        );
+    }
+
+    /// The VFS `replace` control always carries an intent body, and a
+    /// substituted same-nonce replacement is hard-denied by policy before
+    /// the Broker is asked for anything.
+    #[tokio::test]
+    async fn substituted_replacement_is_denied_before_any_broker_request() {
+        let directory = tempfile::tempdir().unwrap();
+        let outbox = Outbox::new(directory.path().join("outbox")).unwrap();
+        stage_cancellable(&outbox, "substituted");
+        let fixture = triad_fixture(true);
+        let service: Arc<dyn MachineBrokerService> = fixture.clone();
+        let engine = TxEngine::new(outbox.clone(), 60_000)
+            .with_triad_signing(MachineBrokerClient::new(service), triad_catalog())
+            .unwrap();
+        let permit = permit_for(&directory);
+        let chain = stage_chain(&spawn_stage_rpc(true).await);
+
+        let error = engine
+            .replace_with_intent(
+                &permit,
+                "alice",
+                "anvil",
+                "substituted",
+                &chain,
+                10,
+                Some(native_intent("0", None)),
+                None,
+                &Policy::default(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, TxEngineError::ApprovalDenied(_)),
+            "{error:?}"
+        );
+        assert!(fixture.requests.lock().is_empty());
+        let pending = outbox
+            .read_in_state("alice", "anvil", "substituted", OutboxState::Pending)
+            .unwrap();
+        assert_eq!(outbox_action_artifacts(&pending.dir), Vec::<String>::new());
+    }
+
     #[tokio::test]
     async fn triad_confirm_reissues_an_expired_approval_with_fresh_operation_identity() {
         let directory = tempfile::tempdir().unwrap();
