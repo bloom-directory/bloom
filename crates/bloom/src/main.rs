@@ -3329,7 +3329,7 @@ async fn run(cli: Cli) -> Result<()> {
             }
             let owners_before = default_policy::petal_owners(&d)?;
             let preinstalled = github_source::ensure_preinstalled_petals(&home, &d)
-                .context("provision configured pre-installed Petals")?;
+                .context("provision canonical pre-installed Petals")?;
             for message in default_policy::apply_setup_settings(&d, &owners_before, first_setup)
                 .await
                 .context("write Petal settings chosen during setup")?

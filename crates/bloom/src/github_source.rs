@@ -18,7 +18,11 @@ const TRUSTED_GITHUB_OWNER: &str = "bloom-directory";
 // Retain a bounded diagnostic tail for reconciliation after streamed output.
 const SOURCE_BUILD_STREAM_LIMIT: usize = 256 * 1024;
 const NEAR_INTENTS_RELEASE_COMMIT: &str = "ccabb93214f1f18cf9b36946425e60035763f193";
-const ENSO_RELEASE_COMMIT: &str = "59e3c884f83c9c97b69b1b415becf8572791273b";
+const ENSO_RELEASE_COMMIT: &str = "709c8ef8396a562387c8aa8f5ef2cc6f97784cfc";
+
+/// Canonical defaults for every Bloom home, independent of persisted config.
+pub(crate) const DEFAULT_PETALS: &[&str] =
+    &["polymarket", "hyperliquid", "enso", "near-intents", "tolly"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PreinstalledPetal {
@@ -158,17 +162,21 @@ const HYPERLIQUID_AUTHORITY_ROUTES: &[PetalAuthorityRoute] = &[
         route_id: "r000044",
         operation_classes: &["hyperliquid.usd_send"],
     },
+    PetalAuthorityRoute {
+        route_id: "r000045",
+        operation_classes: &["hyperliquid.withdraw"],
+    },
 ];
 
 const PREINSTALLED_POLYMARKET: PreinstalledPetal = PreinstalledPetal {
     name: "polymarket",
     repository: "https://github.com/bloom-directory/bloom-petal-polymarket",
-    commit: "c057e6d82f06626e2143213a9dc0c057e4812f89",
-    release_tag: "v0.1.4",
-    archive: "polymarket-v0.1.4.petal.tar.gz",
-    expected_hash: Some("a564d9559a70520995e550df685f74d3ee26af6fbb16facc08de2745bf5ec693"),
-    archive_sha256: "89e781a7c57a95c12345d9b2ea33a8c9a9e800d826f187b7edac4d87bf6596e9",
-    tooling_commit: "864a80b407387871bae06aabe77b91865e55f7bc",
+    commit: "cb6259f6458fc9a27708b8c4c4e35d28a69d24fc",
+    release_tag: "v0.1.5",
+    archive: "polymarket-v0.1.5.petal.tar.gz",
+    expected_hash: Some("5df5a1377dc4d70c71e47ffe6827e691e1f5868543b752dc8d19a500284e5fa6"),
+    archive_sha256: "eb2cfc9c254649ce5e5ed6073925803b206ce5e4615942eff3e9492e3b705cd4",
+    tooling_commit: "1af3ba971e8b494b58bb85d0c0fcf2ad15cd3b4c",
     petal_abi: "bloom.petal-host/payload-signing-v1",
     default_eligible: true,
     lineage_id: Some("pln1_6etojfshqyk6bzm257kzv7noj3perfz4siioiuhj74xosznyzhka"),
@@ -181,11 +189,11 @@ const PREINSTALLED_POLYMARKET: PreinstalledPetal = PreinstalledPetal {
 const PREINSTALLED_HYPERLIQUID: PreinstalledPetal = PreinstalledPetal {
     name: "hyperliquid",
     repository: "https://github.com/bloom-directory/bloom-petal-hyperliquid",
-    commit: "f19e1b10ab2dbeb145704e76b1189bb257622c60",
-    release_tag: "v0.1.5",
-    archive: "hyperliquid-v0.1.5.petal.tar.gz",
-    expected_hash: Some("aa1c50d3443f4c1a710d0ce93a70a65d196fd5842d241e0f78260c8a019d811c"),
-    archive_sha256: "6e4db18c5a3d4cf6d79f97ae79f25b696784492aed584845ccf05124d0918f52",
+    commit: "1d44a1c3586849afe735866c6b54057590f91147",
+    release_tag: "v0.1.6",
+    archive: "hyperliquid-v0.1.6.petal.tar.gz",
+    expected_hash: Some("b29c7afb88ec9d2df774b18dad2699ec169100eeeedbcefca02ea0cc3712a188"),
+    archive_sha256: "2dae21cb207563caea508842f9ad72754acc2bcfb9ba97952520a5fc3f3841ad",
     tooling_commit: "864a80b407387871bae06aabe77b91865e55f7bc",
     petal_abi: "bloom.petal-host/payload-signing-v1",
     default_eligible: true,
@@ -218,13 +226,13 @@ const PREINSTALLED_ENSO: PreinstalledPetal = PreinstalledPetal {
     name: "enso",
     repository: "https://github.com/bloom-directory/bloom-petal-enso",
     commit: ENSO_RELEASE_COMMIT,
-    release_tag: "v0.1.2",
-    archive: "enso-v0.1.2.petal.tar.gz",
-    expected_hash: Some("82e541b237cd8dde0a566dfca7f3d20d6e688aacd23f62b1d0f1306f9c76ecb7"),
-    archive_sha256: "16abd73df768b5f9aba45f20b5c56a50c064368d25bf5e8efa31d3564608422e",
-    tooling_commit: "ec8fe8e445073e4cbef8a62bb27ab88feca32ef6",
+    release_tag: "v0.1.3",
+    archive: "enso-v0.1.3.petal.tar.gz",
+    expected_hash: Some("4449269cc3b3a55cece350ddbbf0e22c6d523d90eb867c9be1087b99c01239ac"),
+    archive_sha256: "00554421df1e506da36bad346bfd6e0641313ccc0c4c0c9177ffc78600fcf1d2",
+    tooling_commit: "1af3ba971e8b494b58bb85d0c0fcf2ad15cd3b4c",
     petal_abi: "bloom.petal-host/triad-compatible-nonauthority-v1",
-    default_eligible: false,
+    default_eligible: true,
     lineage_id: None,
     release_sequence: 0,
     predecessor_package_hashes: &[],
@@ -284,6 +292,23 @@ const PREINSTALLED_VENICE_X402: PreinstalledPetal = PreinstalledPetal {
     predecessor_package_hashes: &[],
     authority_routes: &[],
     setup: None,
+};
+
+const PREINSTALLED_TOLLY: PreinstalledPetal = PreinstalledPetal {
+    name: "tolly",
+    repository: "https://github.com/TollyLabs/bloom-petal-tolly",
+    commit: "652a88cccfeb8767c76b3fc2305107e4bbac53a7",
+    release_tag: "v0.2.0",
+    archive: "tolly-v0.2.0.petal.tar.gz",
+    expected_hash: Some("f50f9f6f55eca103c11ed40d424311c6e5863ff5046231f57f58822d1aac6709"),
+    archive_sha256: "3a2407e3b9b519ce2be98bfb6f447cd6a6c84607c75c90308af506d3c2237d51",
+    tooling_commit: "73c5b06a77599368fbc79fb7947a629b5b4c630e",
+    petal_abi: "bloom.petal-host/triad-compatible-nonauthority-v1",
+    default_eligible: true,
+    lineage_id: None,
+    release_sequence: 0,
+    predecessor_package_hashes: &[],
+    authority_routes: &[],
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -642,18 +667,20 @@ pub(crate) enum PreinstalledState {
 pub(crate) fn ensure_preinstalled_petals(_home: &HomeDir, daemon: &Daemon) -> Result<Vec<String>> {
     ensure_preinstalled_petals_with(
         daemon,
+        DEFAULT_PETALS,
         |name| preinstalled_petal(name).copied(),
         install_prebuilt_release_petal,
     )
 }
 
-/// Provision every configured pre-installed Petal, replacing catalogued
+/// Provision every canonical pre-installed Petal, replacing catalogued
 /// installations that are pinned to an older commit.
 ///
 /// `resolve` and `acquire` are injected so tests can drive the classification
 /// and replacement logic against local fixtures without reaching GitHub.
 fn ensure_preinstalled_petals_with(
     daemon: &Daemon,
+    names: &[&str],
     resolve: impl Fn(&str) -> Option<PreinstalledPetal>,
     acquire: impl Fn(&Daemon, &PreinstalledPetal) -> Result<GitHubInstallOutput>,
 ) -> Result<Vec<String>> {
@@ -667,7 +694,7 @@ fn ensure_preinstalled_petals_with(
         .collect::<std::collections::BTreeMap<_, _>>();
     let mut ready = Vec::new();
 
-    for name in &daemon.config.petals.preinstalled {
+    for &name in names {
         let entry = resolve(name).ok_or_else(|| anyhow!("unknown pre-installed Petal {name:?}"))?;
         let entry = &entry;
         if !entry.default_eligible {
@@ -691,7 +718,7 @@ fn ensure_preinstalled_petals_with(
                             "preinstalled_petal: {name} (already installed at {})",
                             &hash[..hash.len().min(bloom_petals::store::HASH_PREFIX_LEN)]
                         );
-                        ready.push(name.clone());
+                        ready.push(name.to_owned());
                         continue;
                     }
                     PreinstalledState::Outdated { installed_commit } => {
@@ -720,7 +747,7 @@ fn ensure_preinstalled_petals_with(
         .with_context(|| {
             let action = if replacing { "update" } else { "provision" };
             format!(
-                "{action} pre-installed Petal {} from {} release {} at commit {}; fix the cause and retry `bloom init`, or persistently opt out with `[petals] preinstalled = []`",
+                "{action} pre-installed Petal {} from {} release {} at commit {}; fix the cause and retry `bloom init`",
                 entry.name, entry.repository, entry.release_tag, entry.commit
             )
         })?;
@@ -731,7 +758,7 @@ fn ensure_preinstalled_petals_with(
             if replacing { "updated" } else { "ready" },
             entry.name
         );
-        ready.push(name.clone());
+        ready.push(name.to_owned());
     }
 
     Ok(ready)
@@ -788,8 +815,7 @@ pub(crate) fn prepare_prebuilt_release_petal(
     if context.is_cancelled() {
         bail!("Petal acquisition cancelled");
     }
-    let repo = parse_github_install_url(entry.repository)?
-        .ok_or_else(|| anyhow!("built-in Petal repository is not a GitHub source URL"))?;
+    let repo = built_in_github_repo(entry.repository)?;
     let release_base = format!(
         "https://github.com/{}/{}/releases/download/{}",
         repo.owner, repo.repo, entry.release_tag
@@ -1059,8 +1085,7 @@ fn prepare_prebuilt_petal_archive(
     bloom_petals::package::apply_petal_consent_endpoint_bindings(&mut consent, &bindings)
         .context("apply configured Petal endpoint bindings")?;
 
-    let repo = parse_github_install_url(entry.repository)?
-        .ok_or_else(|| anyhow!("built-in Petal repository is not a GitHub source URL"))?;
+    let repo = built_in_github_repo(entry.repository)?;
     let provenance = PetalSourceProvenance {
         source_kind: "github".to_string(),
         url: repo.canonical_url,
@@ -1087,6 +1112,7 @@ pub(crate) fn preinstalled_petal(name: &str) -> Option<&'static PreinstalledPeta
         "gasless" => Some(&PREINSTALLED_GASLESS),
         "privacy-pools" => Some(&PREINSTALLED_PRIVACY_POOLS),
         "venice-x402" => Some(&PREINSTALLED_VENICE_X402),
+        "tolly" => Some(&PREINSTALLED_TOLLY),
         _ => None,
     }
 }
@@ -1179,7 +1205,7 @@ pub(crate) fn classify_existing_preinstalled(
     }
     let source = meta.source.as_ref().ok_or_else(|| {
         anyhow!(
-            "pre-installed Petal {} is already owned by an installation without source provenance; uninstall it or set `[petals] preinstalled = []`",
+            "pre-installed Petal {} is already owned by an installation without source provenance; uninstall it before retrying",
             expected.name
         )
     })?;
@@ -1279,6 +1305,18 @@ fn trusted_repo(owner: &str, repo: &str) -> Result<GitHubRepo> {
     if owner != TRUSTED_GITHUB_OWNER {
         bail!("unsupported GitHub owner {owner}; trusted owner is {TRUSTED_GITHUB_OWNER}");
     }
+    github_repo(owner, repo)
+}
+
+fn built_in_github_repo(repository: &str) -> Result<GitHubRepo> {
+    let path = repository
+        .strip_prefix("https://github.com/")
+        .ok_or_else(|| anyhow!("built-in Petal repository must use canonical GitHub HTTPS URL"))?;
+    let (owner, repo) = split_owner_repo(path)?;
+    github_repo(owner, repo)
+}
+
+fn github_repo(owner: &str, repo: &str) -> Result<GitHubRepo> {
     let repo = repo.strip_suffix(".git").unwrap_or(repo);
     if repo.is_empty() || repo.contains('/') {
         bail!("GitHub source URL has invalid repository name");
@@ -1765,9 +1803,9 @@ mod tests {
         assert_eq!(near.archive, "near-intents-v0.1.2.petal.tar.gz");
         assert!(near.repository.ends_with("/bloom-petal-near"));
         let enso = preinstalled_petal("enso").unwrap();
-        assert_eq!(enso.release_tag, "v0.1.2");
+        assert_eq!(enso.release_tag, "v0.1.3");
         assert_eq!(enso.commit, ENSO_RELEASE_COMMIT);
-        assert_eq!(enso.archive, "enso-v0.1.2.petal.tar.gz");
+        assert_eq!(enso.archive, "enso-v0.1.3.petal.tar.gz");
         assert!(enso.repository.ends_with("/bloom-petal-enso"));
         for name in [
             "polymarket",
@@ -1777,6 +1815,7 @@ mod tests {
             "gasless",
             "privacy-pools",
             "venice-x402",
+            "tolly",
         ] {
             let entry = preinstalled_petal(name).unwrap();
             assert_eq!(entry.name, name);
@@ -1784,9 +1823,21 @@ mod tests {
             assert!(entry.expected_hash.is_some());
             assert_eq!(
                 entry.default_eligible,
-                matches!(name, "polymarket" | "hyperliquid" | "near-intents")
+                matches!(
+                    name,
+                    "polymarket" | "hyperliquid" | "enso" | "near-intents" | "tolly"
+                )
             );
         }
+        let tolly = preinstalled_petal("tolly").unwrap();
+        assert_eq!(
+            tolly.repository,
+            "https://github.com/TollyLabs/bloom-petal-tolly"
+        );
+        assert_eq!(
+            built_in_github_repo(tolly.repository).unwrap().owner,
+            "TollyLabs"
+        );
         assert!(preinstalled_petal("unknown").is_none());
     }
 
@@ -1861,35 +1912,6 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("without source provenance"), "{err}");
-    }
-
-    #[test]
-    fn explicit_empty_preinstalled_list_is_network_free_and_idempotent() {
-        let home = tempfile::tempdir().unwrap();
-        let home_dir = HomeDir::at(home.path());
-        let mut config = bloom_proto::Config::local_default();
-        config.petals.preinstalled.clear();
-        config.save(&home_dir.config_path()).unwrap();
-        let daemon = Daemon::from_home(home_dir.clone()).unwrap();
-
-        assert!(
-            ensure_preinstalled_petals(&home_dir, &daemon)
-                .unwrap()
-                .is_empty()
-        );
-        assert!(
-            ensure_preinstalled_petals(&home_dir, &daemon)
-                .unwrap()
-                .is_empty()
-        );
-        assert!(
-            daemon
-                .petals
-                .store()
-                .list_petal_owners()
-                .unwrap()
-                .is_empty()
-        );
     }
 
     const NEAR_OLD_COMMIT: &str = "1111111111111111111111111111111111111111";
@@ -1977,8 +1999,7 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let home_dir = HomeDir::at(home.path());
         home_dir.ensure().unwrap();
-        let mut config = bloom_proto::Config::local_default();
-        config.petals.preinstalled = vec!["near-intents".into()];
+        let config = bloom_proto::Config::local_default();
         config.save(&home_dir.config_path()).unwrap();
         let daemon = Daemon::from_home(home_dir.clone()).unwrap();
 
@@ -2035,6 +2056,7 @@ mod tests {
 
         let ready = ensure_preinstalled_petals_with(
             &daemon,
+            &["near-intents"],
             |name| (name == "near-intents").then_some(entry),
             |daemon, entry| {
                 acquisitions.set(acquisitions.get() + 1);
@@ -2076,6 +2098,7 @@ mod tests {
         let serve_daemon = Daemon::from_home(home_dir.clone()).unwrap();
         let ready = ensure_preinstalled_petals_with(
             &serve_daemon,
+            &["near-intents"],
             |name| (name == "near-intents").then_some(entry),
             |_, _| panic!("a current installation must not be re-acquired"),
         )
@@ -2097,6 +2120,7 @@ mod tests {
         // A third run over the same home changes nothing.
         let ready = ensure_preinstalled_petals_with(
             &serve_daemon,
+            &["near-intents"],
             |name| (name == "near-intents").then_some(entry),
             |_, _| panic!("provisioning must be idempotent"),
         )
@@ -2139,6 +2163,7 @@ mod tests {
             provision_with(
                 &provisioning_daemon,
                 &context,
+                &["near-intents"],
                 |_| Some(entry),
                 |daemon, entry, _| {
                     started_tx.lock().unwrap().take().unwrap().send(()).unwrap();
@@ -2208,15 +2233,15 @@ mod tests {
         use crate::petal_provisioning::{ProvisioningOutcome, provision_with};
         let old = build_near_release("old");
         let next = build_near_release("new");
-        let (_home, _, mut daemon) =
+        let (_home, _, daemon) =
             near_home_with_installed(&old.package, NEAR_REPO, NEAR_OLD_COMMIT, None);
-        daemon.config.petals.preinstalled = vec!["offline".into(), "near-intents".into()];
         let entry = near_catalog_entry(NEAR_NEW_COMMIT, "v0.1.1", "near.tar.gz", None);
         let context = bloom_daemon::ipc::IpcOperationContext::detached();
         let calls = std::cell::Cell::new(0);
         let results = provision_with(
             &daemon,
             &context,
+            &["offline", "near-intents"],
             |name| {
                 Some(PreinstalledPetal {
                     name: if name == "offline" {
@@ -2246,10 +2271,10 @@ mod tests {
         );
         // The fixture replaces an older installed release.
         assert_eq!(results[1].outcome, ProvisioningOutcome::Updated);
-        daemon.config.petals.preinstalled = vec!["near-intents".into()];
         let results = provision_with(
             &daemon,
             &context,
+            &["near-intents"],
             |_| Some(entry),
             |_, _, _| panic!("current package must not be acquired again"),
         );
@@ -2310,6 +2335,7 @@ mod tests {
         // The downloaded archive does not carry the pinned package hash.
         let err = ensure_preinstalled_petals_with(
             &daemon,
+            &["near-intents"],
             |name| (name == "near-intents").then_some(entry),
             |daemon, entry| {
                 install_prebuilt_petal_archive(
@@ -2360,6 +2386,7 @@ mod tests {
             near_home_with_installed(&old.package, "bloom-petal-near-fork", NEAR_OLD_COMMIT, None);
         let err = ensure_preinstalled_petals_with(
             &fork_daemon,
+            &["near-intents"],
             |name| (name == "near-intents").then_some(entry),
             |_, _| panic!("an untrusted installation must never be replaced"),
         )
@@ -2376,8 +2403,7 @@ mod tests {
         let manual_home = tempfile::tempdir().unwrap();
         let manual_home_dir = HomeDir::at(manual_home.path());
         manual_home_dir.ensure().unwrap();
-        let mut config = bloom_proto::Config::local_default();
-        config.petals.preinstalled = vec!["near-intents".into()];
+        let config = bloom_proto::Config::local_default();
         config.save(&manual_home_dir.config_path()).unwrap();
         let manual_daemon = Daemon::from_home(manual_home_dir).unwrap();
         manual_daemon
@@ -2388,6 +2414,7 @@ mod tests {
 
         let err = ensure_preinstalled_petals_with(
             &manual_daemon,
+            &["near-intents"],
             |name| (name == "near-intents").then_some(entry),
             |_, _| panic!("a manually sourced installation must never be replaced"),
         )
