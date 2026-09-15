@@ -884,14 +884,22 @@ name = "example"
             package.join("petal/example/[wallet].wasm"),
         )
         .unwrap();
+        // Even explicit guest documentation routes cannot override the host's
+        // repository documents or attach their command/cache metadata.
+        for name in PETAL_DOCUMENT_NAMES {
+            write_package_file(
+                &package,
+                &format!("petal/example/{name}.wasm"),
+                &crate::package::route_fixtures::async_failing_write_route_component(),
+            );
+        }
         runner.store().install_petal_package_dir(&package).unwrap();
         let router = PetalRouter::new(runner, Arc::new(DenyHost));
         assert!(router.is_async_write_command(&VfsPath::parse("/example/alice").unwrap()));
         for name in PETAL_DOCUMENT_NAMES {
-            assert!(
-                !router
-                    .is_async_write_command(&VfsPath::parse(&format!("/example/{name}")).unwrap())
-            );
+            let path = VfsPath::parse(&format!("/example/{name}")).unwrap();
+            assert!(!router.is_async_write_command(&path));
+            assert_eq!(router.cache_ttl(&path), None);
         }
     }
 
