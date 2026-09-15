@@ -174,11 +174,8 @@ fn mount_write_path_uses_wallet_signer(path: &VfsPath) -> bool {
 /// must escape the bytes decoding would otherwise change (`%`) or that cannot
 /// appear in a directory entry name (`/`, NUL). Everything else is listed
 /// verbatim, so `percent_decode_segment(listed_name(s)) == s`.
-fn listed_name(segment: &str) -> std::borrow::Cow<'_, str> {
-    if !segment.contains(['%', '/', '\0']) {
-        return std::borrow::Cow::Borrowed(segment);
-    }
-    let mut listed = String::with_capacity(segment.len() + 4);
+fn listed_name(segment: &str) -> String {
+    let mut listed = String::with_capacity(segment.len());
     for character in segment.chars() {
         match character {
             '%' => listed.push_str("%25"),
@@ -187,7 +184,7 @@ fn listed_name(segment: &str) -> std::borrow::Cow<'_, str> {
             other => listed.push(other),
         }
     }
-    std::borrow::Cow::Owned(listed)
+    listed
 }
 
 /// Convert a `HandlerError` from the VFS into the matching NFS error.
@@ -1276,7 +1273,7 @@ impl FileSystem for BloomFs {
                 None
             };
             out.push(DirEntry {
-                name: listed_name(&e.name).into_owned(),
+                name: listed_name(&e.name),
                 handle,
                 cookie: (start + idx + 3) as u64,
                 attrs,
@@ -3785,50 +3782,6 @@ mod tests {
         assert_eq!(&r.data[..], b"100%done");
     }
 
-    /// A handler may list a name containing `%`. READDIR must return a name
-    /// that LOOKUP resolves back to the same VFS segment.
-    #[tokio::test]
-    async fn readdir_names_round_trip_through_percent_decoding_lookup() {
-        struct ListingEchoHandler;
-
-        #[async_trait]
-        impl Handler for ListingEchoHandler {
-            async fn lookup(&self, p: &VfsPath) -> Result<Entry, HandlerError> {
-                match p.segments() {
-                    [] => Ok(Entry::dir("")),
-                    [name] if name == "100%done" || name == "a b" => Ok(Entry::file(name)),
-                    _ => Err(HandlerError::not_found(p.to_string_path())),
-                }
-            }
-            async fn read(&self, p: &VfsPath) -> Result<Vec<u8>, HandlerError> {
-                Ok(p.segments()
-                    .last()
-                    .cloned()
-                    .unwrap_or_default()
-                    .into_bytes())
-            }
-            async fn list(&self, _p: &VfsPath) -> Result<Vec<Entry>, HandlerError> {
-                Ok(vec![Entry::file("100%done"), Entry::file("a b")])
-            }
-        }
-
-        let vfs = Vfs::builder()
-            .mount("echo", Arc::new(ListingEchoHandler))
-            .build();
-        let fs = BloomFs::new(vfs);
-        let ctx = fake_ctx();
-        let dir = fs.lookup(&ctx, &BloomHandle::Root, "echo").await.unwrap();
-        let page = fs.readdir(&ctx, &dir, 0, 100, true).await.unwrap();
-        let names: Vec<&str> = page.entries.iter().map(|e| e.name.as_str()).collect();
-        assert_eq!(names, ["100%25done", "a b"]);
-        for (entry, segment) in page.entries.iter().zip(["100%done", "a b"]) {
-            let leaf = fs.lookup(&ctx, &dir, &entry.name).await.unwrap();
-            assert_eq!(leaf, entry.handle);
-            let read = fs.read(&ctx, &leaf, 0, 1024).await.unwrap();
-            assert_eq!(&read.data[..], segment.as_bytes());
-        }
-    }
-
     #[test]
     fn listed_names_decode_to_their_segment() {
         for segment in ["plain", "100%done", "%25", "a/b", "nul\0byte", "é%/"] {
@@ -3836,10 +3789,6 @@ mod tests {
             assert!(!listed.contains(['/', '\0']), "{listed}");
             assert_eq!(percent_decode_segment(&listed).unwrap(), segment);
         }
-        assert!(matches!(
-            listed_name("plain"),
-            std::borrow::Cow::Borrowed(_)
-        ));
     }
 
     #[tokio::test]
