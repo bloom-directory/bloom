@@ -107,6 +107,7 @@ impl SolanaBroker {
     }
 
     fn accounts(&self, wallet_id: Token) -> WalletAccountsPublic {
+        let address = bs58::encode(self.pubkey).into_string();
         WalletAccountsPublic {
             wallet_id,
             seed_profile: WalletSeedProfile::Bip39MulticurveV1,
@@ -121,7 +122,13 @@ impl SolanaBroker {
                     Sha256::digest(spki(&self.pubkey)).into(),
                 ),
                 supported_crypto_suites: vec![CryptoSuite::Ed25519Message],
-                chain_projections: vec![],
+                chain_projections: vec![ChainAccountProjection {
+                    chain_family: tok("solana"),
+                    caip2: "solana:local".into(),
+                    caip10: format!("solana:local:{address}"),
+                    address,
+                    address_encoding: AddressEncoding::Base58,
+                }],
                 lifecycle: AccountLifecycleState::Active,
             }],
         }

@@ -799,7 +799,7 @@ run_machine_with_deadline \
 
 run_login_with_deadline \
   "$work/cached-wallet-address.log" \
-  /bin/cat "$mount_dir/wallets/$wallet_id/address" || {
+  /bin/cat "$mount_dir/wallets/$wallet_id/0/address.evm" || {
   cat "$work/cached-wallet-address.log" >&2
   echo "packaged Machine did not preserve cached reads through its kernel mount" >&2
   exit 1

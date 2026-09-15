@@ -107,18 +107,16 @@ that same account creation. Reading `new` reports `failed`, `expired`, or
 `cancelled` when a ceremony terminates unsuccessfully. That result remains
 attached to its request ID; write a new request ID to start another ceremony.
 
-### Account-scoped Petals and sessions
+### Account keys and sessions
 
-Installed Petals also run under `wallets/<wallet>/<n>/petals/<petal>/...` with
-the same routes as `/petals/<petal>/...`. Account 0 and the flat mount list
-every installed Petal; a nonzero account runs only Petals whose `petal.toml`
-declares `[account] aware = true` — an unaware Petal is not found there and
-the message names the missing declaration. The host injects the trusted
-identity (`bloom.wallet`, `bloom.account`, and, when the route's family is
-unambiguous, `bloom.owner_key_fingerprint`) next to `bloom.route_id`; a caller
-context entry using the `bloom.` prefix is rejected before injection.
+The files that name one key live only beneath a numbered account:
+`wallets/<wallet>/<n>/address.evm` (EVM checksummed) and
+`address.sol`, each with `.qr.svg` and `.qr.png` variants when that family is
+present, plus `public_key` for the display key. The wallet directory itself
+has no account key files; read `wallets/<wallet>/0/address.evm` for the
+canonical initial EVM account.
 
-Every key a Petal derived through a numbered account is mounted at
+Every key a Petal derived from one of an account's family keys is mounted at
 `wallets/<wallet>/<n>/sessions/<petal>/<key-slot>/session.json`. It reports
 the delegating owner key, the delegated key and addresses, the scope (routes,
 operation classes, suites, lifetime), the recorded approvals, and the truthful

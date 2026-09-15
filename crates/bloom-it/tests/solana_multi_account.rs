@@ -115,7 +115,13 @@ impl Child {
             public_key_encoding: PublicKeyEncoding::Ed25519SpkiDer,
             public_key_fingerprint: fingerprint_of(&self.pubkey),
             supported_crypto_suites: vec![CryptoSuite::Ed25519Message],
-            chain_projections: vec![],
+            chain_projections: vec![ChainAccountProjection {
+                chain_family: tok("solana"),
+                caip2: "solana:local".into(),
+                caip10: format!("solana:local:{}", self.address),
+                address: self.address.clone(),
+                address_encoding: AddressEncoding::Base58,
+            }],
             // Both children stay active for the whole test. That is the point.
             lifecycle: AccountLifecycleState::Active,
         }

@@ -10,23 +10,31 @@
 //! - `wallets/registrations/<petname>/status.json`                 — public registration projection
 //! - `wallets/registrations/<petname>/result.json`                 — completed registration result
 //! - `wallets/registrations/<petname>/cancel`                       — write `y`, `yes`, or `cancel` before acceptance
-//! - `wallets/<wallet>/address`                                     — checksummed owner/signer address
-//! - `wallets/<wallet>/address.qr.svg`                              — scannable QR image for the owner/signer address
-//! - `wallets/<wallet>/address.qr.png`                              — scannable QR image for the owner/signer address
-//! - `wallets/<wallet>/addresses.json`                              — owner/signer + role addresses
-//! - `wallets/<wallet>/public_key`                                  — secp256k1 pubkey hex
-//! - `wallets/<wallet>/kind`                                        — local/watch
+//! - `wallets/<wallet>/kind`                                        — wallet kind token
+//! - `wallets/<wallet>/projection.json`                             — authenticated wallet projection
+//! - `wallets/<wallet>/accounts.json`                               — derived accounts, each with its number
+//! - `wallets/<wallet>/new`                                         — write `{request_id}` to create an account
 //! - `wallets/<wallet>/policy.json`                                 — canonical triad policy
+//! - `wallets/<wallet>/policy-updates/*`                            — staged policy-update lifecycle
 //! - `wallets/<wallet>/sealed-approvals/*`                          — Broker approval lifecycle
-//! - `wallets/<wallet>/chains/<chain>/{balance,balance.raw,balance.json}` — native balance
+//! - `wallets/<wallet>/chains/<chain>/{balance,balance.raw,balance.json}` — native balance (account 0)
 //! - `wallets/<wallet>/chains/<chain>/nonce`
-//! - `wallets/<wallet>/chains/<chain>/outbox/new.tx`                — write to stage
+//! - `wallets/<wallet>/chains/<chain>/outbox/new.tx`                — write to stage (account 0)
 //! - `wallets/<wallet>/chains/<chain>/outbox/pending/<id>/<file>`   — read staged
 //! - `wallets/<wallet>/chains/<chain>/outbox/pending/<id>/confirm`  — write to broadcast
 //! - `wallets/<wallet>/chains/<chain>/outbox/sent/<id>/<file>`      — read sent
 //! - `wallets/<wallet>/chains/<chain>/outbox/failed/<id>/<file>`    — read failed
 //! - `wallets/<wallet>/<n>/account.json`                            — numbered account: both families' keys
+//! - `wallets/<wallet>/<n>/address.evm`                             — the Broker-projected EVM address (checksummed), when present
+//! - `wallets/<wallet>/<n>/address.evm.qr.{svg,png}`                — scannable QR images of that address
+//! - `wallets/<wallet>/<n>/address.sol`                             — the Broker-projected Solana address, when present
+//! - `wallets/<wallet>/<n>/address.sol.qr.{svg,png}`                — scannable QR images of that address
+//! - `wallets/<wallet>/<n>/public_key`                              — canonical public key hex (EVM key, else Solana)
 //! - `wallets/<wallet>/<n>/chains/<chain>/...`                      — the chain views above, re-rooted at account n's key
+//! - `wallets/<wallet>/<n>/sessions/<petal>/<slot>/{session.json,stop}` — delegated Petal sessions
+//!
+//! Key files exist only under a numbered account. Installed Petals are
+//! mounted only at the VFS root (`petals/`), never under a wallet.
 
 use sha2::Digest as _;
 use std::path::Path;
@@ -35,9 +43,11 @@ use std::sync::Arc;
 /// `wallets/<wallet>/<n>/...`: the numbered account view.
 mod accounts;
 use accounts::OutboxScope;
-use accounts::{accounts_json_with_numbers as render_accounts_json, parse_account_segment};
+use accounts::accounts_json_with_numbers as render_accounts_json;
 
-pub use accounts::{accounts_json_with_numbers, derivation_path_number};
+pub use accounts::{
+    ACCOUNT_KEY_FILES, accounts_json_with_numbers, derivation_path_number, parse_account_segment,
+};
 
 use async_trait::async_trait;
 use bloom_broker_api::ProtocolErrorCode;
@@ -237,12 +247,11 @@ pub struct AccountSessionEntry {
 }
 
 /// Keeps the VFS independent of the Petal runtime which depends on this crate.
-/// The daemon implements the whole seam: Petal dispatch through the router,
-/// and the session inventory and stop over the local key-state files.
+/// The daemon implements the seam that serves `wallets/<w>/<n>/sessions/`:
+/// the session inventory and stop over the local key-state files. Installed
+/// Petals themselves are mounted only at the VFS root, never per account.
 #[async_trait]
 pub trait AccountPetalMount: Send + Sync {
-    fn for_account(&self, account: AccountPetalContext) -> Arc<dyn Handler>;
-
     /// Sessions whose delegating parent is one of the account's family keys.
     /// Serves listing, stat, and `session.json` reads; never calls Broker.
     fn sessions(
@@ -286,9 +295,9 @@ pub struct WalletsHandler {
     /// client, while staging needs the whole signing seam. A chain present
     /// here but absent from `solana` is readable but cannot stage.
     solana_reads: Option<bloom_solana::SolanaChainRegistry>,
-    /// Late-bound: the Petal router is built after this handler because its
+    /// Late-bound: the Petal runtime is built after this handler because its
     /// host needs this handler, so there is exactly one of each and the
-    /// router is attached once both exist.
+    /// session seam is attached once both exist.
     account_petals: Arc<parking_lot::RwLock<Option<Arc<dyn AccountPetalMount>>>>,
 }
 
@@ -315,7 +324,7 @@ impl WalletsHandler {
         }
     }
 
-    /// Attach the Petal runtime that serves `wallets/<w>/<n>/petals/`.
+    /// Attach the session seam that serves `wallets/<w>/<n>/sessions/`.
     pub fn set_account_petals(&self, petals: Arc<dyn AccountPetalMount>) {
         *self.account_petals.write() = Some(petals);
     }
@@ -469,30 +478,6 @@ impl WalletsHandler {
             .map_err(|error| HandlerError::invalid(format!("wallet address: {error}")))?;
         let policy = crate::advisory_evm_policy(&projection, chain).map_err(err_be)?;
         Ok((address, policy))
-    }
-
-    fn projection_addresses_json(
-        &self,
-        projection: &WalletProjection,
-    ) -> Result<Vec<u8>, HandlerError> {
-        let owner = projection.primary_address().map_err(err_be)?;
-        let body = serde_json::json!({
-            "wallet": projection.wallet.wallet_id,
-            "kind": projection.wallet.wallet_kind,
-            "owner": owner,
-            "signer": owner,
-            "policy_status": "broker_verified",
-            "policy_version": projection.wallet.policy_version,
-            "policy_digest": projection.wallet.policy_digest,
-            "wallet_revocation_epoch": projection.wallet.wallet_revocation_epoch,
-            "unlocked": false,
-            "freshness": projection.freshness,
-            "observed_at_ms": projection.observed_at_ms,
-            "roles": serde_json::Map::<String, serde_json::Value>::new(),
-        });
-        let mut out = serde_json::to_vec_pretty(&body).map_err(err_be)?;
-        out.push(b'\n');
-        Ok(out)
     }
 
     fn write_permit(&self) -> Result<&HomeWritePermit, HandlerError> {
@@ -2041,13 +2026,10 @@ impl WalletsHandler {
         Ok(out)
     }
 
+    /// The wallet-wide entries beside the numbered accounts. Anything that
+    /// names one key (address, public key, QR images) lives under `<n>/`.
     fn wallet_dir_entries() -> Vec<Entry> {
         vec![
-            Entry::file("address"),
-            Entry::file("address.qr.png"),
-            Entry::file("address.qr.svg"),
-            Entry::file("addresses.json"),
-            Entry::file("public_key"),
             Entry::file("kind"),
             Entry::file("projection.json"),
             Entry::file("accounts.json"),
@@ -2345,6 +2327,74 @@ fn integrity(detail: &str) -> HandlerError {
     ))
 }
 
+/// The Broker-projected address for this account's derivation family.
+///
+/// Addresses are authority data: the Machine may validate and consume them,
+/// but it must not manufacture one from `canonical_public_key` when the
+/// Broker did not project one. Multiple network projections are acceptable
+/// only when they agree on the family's network-independent address.
+fn projected_family_address(
+    account: &bloom_broker_api::DerivedAccountPublic,
+) -> Result<Option<&str>, HandlerError> {
+    let (family, expected_encoding) = match account.derivation_profile {
+        bloom_broker_api::DerivationProfile::Bip44EvmSecp256k1V1 => {
+            ("evm", bloom_broker_api::AddressEncoding::Hex0x)
+        }
+        bloom_broker_api::DerivationProfile::Bip44SolanaSlip10Ed25519V1 => {
+            ("solana", bloom_broker_api::AddressEncoding::Base58)
+        }
+    };
+    // The derivation profile defines the account family. `chain_family` is
+    // Broker-owned routing metadata and may name a custom compatible family,
+    // so it must not decide whether this account has an address.
+    let mut projections = account.chain_projections.iter();
+    let Some(first) = projections.next() else {
+        return Ok(None);
+    };
+    if first.address_encoding != expected_encoding {
+        return Err(integrity(&format!(
+            "{family} chain projection uses the wrong address encoding"
+        )));
+    }
+    for projection in projections {
+        if projection.address_encoding != expected_encoding {
+            return Err(integrity(&format!(
+                "{family} chain projection uses the wrong address encoding"
+            )));
+        }
+        let agrees = match account.derivation_profile {
+            bloom_broker_api::DerivationProfile::Bip44EvmSecp256k1V1 => {
+                projection.address.eq_ignore_ascii_case(&first.address)
+            }
+            bloom_broker_api::DerivationProfile::Bip44SolanaSlip10Ed25519V1 => {
+                projection.address == first.address
+            }
+        };
+        if !agrees {
+            return Err(integrity(&format!(
+                "{family} chain projections disagree on the account address"
+            )));
+        }
+    }
+    match account.derivation_profile {
+        bloom_broker_api::DerivationProfile::Bip44EvmSecp256k1V1 => {
+            first
+                .address
+                .parse::<alloy::primitives::Address>()
+                .map_err(|error| integrity(&format!("invalid projected EVM address: {error}")))?;
+        }
+        bloom_broker_api::DerivationProfile::Bip44SolanaSlip10Ed25519V1 => {
+            let bytes = bs58::decode(&first.address).into_vec().map_err(|error| {
+                integrity(&format!("invalid projected Solana address: {error}"))
+            })?;
+            if bytes.len() != 32 {
+                return Err(integrity("projected Solana address is not 32 bytes"));
+            }
+        }
+    }
+    Ok(Some(first.address.as_str()))
+}
+
 /// The child's canonical BIP-39 Solana derivation path, from its `KeyRef`.
 ///
 /// Deliberately read from the `KeyRef` rather than the projection's `path`
@@ -2417,21 +2467,18 @@ impl SolanaAccount {
 
         let mut pubkey = [0_u8; 32];
         pubkey.copy_from_slice(&spki[Self::ED25519_SPKI_PREFIX.len()..]);
-        let address = bs58::encode(pubkey).into_string();
-
-        // A chain projection is present only when the Broker has a matching
-        // configured projection target, so absence is a configuration state
-        // rather than corruption. When one *is* projected, its address must
-        // agree with the key we derived the address from.
-        for projection in &account.chain_projections {
-            if projection.address_encoding == bloom_broker_api::AddressEncoding::Base58
-                && projection.address != address
-            {
-                return Err(integrity(&format!(
-                    "chain projection address '{}' does not match the derived account address '{}'",
-                    projection.address, address
-                )));
-            }
+        let address = projected_family_address(account)?
+            .ok_or_else(|| HandlerError::not_found("Solana child has no Broker-projected address"))?
+            .to_owned();
+        let projected_pubkey: [u8; 32] = bs58::decode(&address)
+            .into_vec()
+            .map_err(|error| integrity(&format!("invalid projected Solana address: {error}")))?
+            .try_into()
+            .map_err(|_| integrity("projected Solana address is not 32 bytes"))?;
+        if projected_pubkey != pubkey {
+            return Err(integrity(
+                "projected Solana address does not identify its canonical public key",
+            ));
         }
 
         Ok(Self {
@@ -2457,7 +2504,7 @@ fn is_public_solana_outbox_artifact(name: &str) -> bool {
 #[derive(Clone, Copy)]
 struct SolanaSender<'a> {
     fingerprint: &'a str,
-    address: &'a str,
+    address: Option<&'a str>,
 }
 
 /// A staged Solana transfer belongs to the account whose key it pinned.
@@ -2469,7 +2516,9 @@ fn solana_entry_belongs(
 ) -> bool {
     match staged.account_fingerprint.as_deref() {
         Some(fingerprint) => fingerprint == sender.fingerprint,
-        None => staged.fee_payer == sender.address,
+        None => sender
+            .address
+            .is_some_and(|address| staged.fee_payer == address),
     }
 }
 
@@ -2560,19 +2609,27 @@ impl Handler for WalletsHandler {
     }
 
     async fn prepare_write_open(&self, path: &VfsPath) -> Result<(), HandlerError> {
-        let segs = path.segments();
-        let r = match segs {
-            [wallet, chains, chain, outbox, pending, id, fname]
-                if chains == "chains"
-                    && outbox == "outbox"
-                    && pending == "pending"
-                    && fname == "confirm.override" =>
-            {
-                // The wallet-level outbox is account 0's: the override
-                // write-open must not prepare anything for another
-                // account's entry.
-                let scope = self.wallet_outbox_write_family(wallet, chain).await?;
-                self.require_staged_by(wallet, chain, id, scope.address())?;
+        let r = match pending_outbox_control(path.segments()) {
+            Some(PendingOutboxControl {
+                wallet,
+                account,
+                chain,
+                id,
+                control: "confirm.override",
+            }) => {
+                // The override write-open must not prepare anything for
+                // another account's entry: the wallet-level outbox is
+                // account 0's, a numbered outbox is its own account's.
+                let scope = match account {
+                    None => self.wallet_outbox_write_family(wallet, chain).await?,
+                    Some(number) => self.account_evm_family(wallet, number, chain).await?,
+                };
+                let address = scope.address().ok_or_else(|| {
+                    HandlerError::not_found(format!(
+                        "account has no Broker-projected address for chain '{chain}'"
+                    ))
+                })?;
+                self.require_staged_by(wallet, chain, id, address)?;
                 let (_, policy) = self.planning_wallet_inputs(wallet, chain).await?;
                 let client = self
                     .chains
@@ -2616,9 +2673,15 @@ impl Handler for WalletsHandler {
     }
 
     fn cache_ttl(&self, path: &VfsPath) -> Option<std::time::Duration> {
-        let segs = path.segments();
-        match segs {
-            [_, s, _, leaf]
+        // The same chain leaves at wallet level (account 0) and under a
+        // numbered account.
+        let chain_path = match path.segments() {
+            [_, number, rest @ ..] if parse_account_segment(number).is_some() => rest,
+            [_, rest @ ..] => rest,
+            [] => return None,
+        };
+        match chain_path {
+            [s, _, leaf]
                 if s == "chains"
                     && matches!(
                         leaf.as_str(),
@@ -2638,20 +2701,48 @@ impl Handler for WalletsHandler {
     /// that bypasses the mode check still cannot trigger a sign or
     /// broadcast just by stat'ing.
     fn is_read_side_effecting(&self, path: &VfsPath) -> bool {
-        let segs = path.segments();
-        // wallets/<w>/chains/<c>/outbox/pending/<id>/{confirm,confirm.override,replace,cancel,restage}
-        if segs.len() == 7
-            && segs[1] == "chains"
-            && segs[3] == "outbox"
-            && segs[4] == "pending"
-            && matches!(
-                segs[6].as_str(),
+        pending_outbox_control(path.segments()).is_some_and(|target| {
+            matches!(
+                target.control,
                 "confirm" | "confirm.override" | "replace" | "cancel" | "restage"
             )
-        {
-            return true;
+        })
+    }
+}
+
+/// A write sink under a pending outbox entry, named through the wallet-level
+/// outbox (account 0) or a numbered account's.
+struct PendingOutboxControl<'a> {
+    wallet: &'a str,
+    /// `None` for the wallet-level path.
+    account: Option<u32>,
+    chain: &'a str,
+    id: &'a str,
+    control: &'a str,
+}
+
+/// Match `<w>/[<n>/]chains/<c>/outbox/pending/<id>/<control>`.
+fn pending_outbox_control(segs: &[String]) -> Option<PendingOutboxControl<'_>> {
+    let (wallet, account, rest) = match segs {
+        [wallet, number, rest @ ..] if parse_account_segment(number).is_some() => {
+            (wallet, parse_account_segment(number), rest)
         }
-        false
+        [wallet, rest @ ..] => (wallet, None, rest),
+        [] => return None,
+    };
+    match rest {
+        [chains, chain, outbox, pending, id, control]
+            if chains == "chains" && outbox == "outbox" && pending == "pending" =>
+        {
+            Some(PendingOutboxControl {
+                wallet,
+                account,
+                chain,
+                id,
+                control,
+            })
+        }
+        _ => None,
     }
 }
 
@@ -2699,8 +2790,7 @@ impl WalletsHandler {
             return self.lookup_account(wallet, number, &segs[2..]).await;
         }
         match segs[1].as_str() {
-            "address" | "address.qr.png" | "address.qr.svg" | "addresses.json" | "public_key"
-            | "kind" | "projection.json" | "accounts.json" => Ok(Entry::file(&segs[1])),
+            "kind" | "projection.json" | "accounts.json" => Ok(Entry::file(&segs[1])),
             "new" => Ok(Entry::writable_file("new")),
             "policy.json" => Ok(Entry::writable_file("policy.json")),
             "chains" => match segs.len() {
@@ -2850,22 +2940,6 @@ impl WalletsHandler {
             return self.read_account(wallet, number, &segs[2..]).await;
         }
         match segs.get(1).map(|s| s.as_str()).unwrap_or("") {
-            "address" => {
-                let projection = self.wallet_projection(wallet).await?;
-                Ok(format!("{}\n", projection.primary_address().map_err(err_be)?).into_bytes())
-            }
-            "address.qr.svg" => {
-                let projection = self.wallet_projection(wallet).await?;
-                render_address_qr_svg(projection.primary_address().map_err(err_be)?)
-            }
-            "address.qr.png" => {
-                let projection = self.wallet_projection(wallet).await?;
-                render_address_qr_png(projection.primary_address().map_err(err_be)?)
-            }
-            "addresses.json" => {
-                let projection = self.wallet_projection(wallet).await?;
-                self.projection_addresses_json(&projection)
-            }
             "accounts.json" => {
                 // The cached, authenticated inventory; freshness rides on the
                 // projection, and this read carries no authority side effect.
@@ -2876,20 +2950,6 @@ impl WalletsHandler {
                 )
             }
             "new" => self.account_creation_status(wallet).await,
-            "public_key" => {
-                let projection = self.wallet_projection(wallet).await?;
-                Ok(format!(
-                    "0x{}\n",
-                    hex::encode(
-                        projection
-                            .primary_key()
-                            .map_err(err_be)?
-                            .canonical_public_key
-                            .decode()
-                    )
-                )
-                .into_bytes())
-            }
             "kind" => {
                 let projection = self.wallet_projection(wallet).await?;
                 Ok(format!("{}\n", projection.wallet.wallet_kind.as_str()).into_bytes())
@@ -4876,7 +4936,7 @@ mod tests {
                             bloom_broker_api::DerivationProfile::Bip44SolanaSlip10Ed25519V1,
                             "m/44'/501'/2'/0'",
                             0x32,
-                            "Sol2",
+                            &bs58::encode([0x32; 32]).into_string(),
                         );
                         let mut key_refs = Vec::new();
                         for account in [evm, solana] {
@@ -5097,13 +5157,13 @@ mod tests {
                 Profile::Bip44SolanaSlip10Ed25519V1,
                 "m/44'/501'/0'/0'",
                 0x20,
-                "Sol0",
+                &bs58::encode([0x20; 32]).into_string(),
             ),
             derived_account(
                 Profile::Bip44SolanaSlip10Ed25519V1,
                 "m/44'/501'/1'/0'",
                 0x21,
-                "Sol1",
+                &bs58::encode([0x21; 32]).into_string(),
             ),
             derived_account(
                 Profile::Bip44EvmSecp256k1V1,
@@ -5154,7 +5214,10 @@ mod tests {
         assert_eq!(one["evm"]["address"], evm1);
         assert_eq!(one["evm"]["path"], "m/44'/60'/0'/0/1");
         assert_eq!(one["solana"]["state"], "active");
-        assert_eq!(one["solana"]["address"], "Sol1");
+        assert_eq!(
+            one["solana"]["address"],
+            bs58::encode([0x21; 32]).into_string()
+        );
         assert_eq!(one["freshness"], "fresh");
 
         // accounts.json names each entry's number.
@@ -5748,10 +5811,12 @@ value = "0""#
                 .to_owned()
         };
         let (engine, outbox) = solana_engine_fixture(&f._tmp);
-        seed_solana_entry(&outbox, "sol-zero", &fp0, "Sol0", false);
-        seed_solana_entry(&outbox, "sol-one", &fp1, "Sol1", false);
-        seed_solana_entry(&outbox, "sol-zero-expired", &fp0, "Sol0", true);
-        seed_solana_entry(&outbox, "sol-one-expired", &fp1, "Sol1", true);
+        let sol0 = bs58::encode([0x20; 32]).into_string();
+        let sol1 = bs58::encode([0x21; 32]).into_string();
+        seed_solana_entry(&outbox, "sol-zero", &fp0, &sol0, false);
+        seed_solana_entry(&outbox, "sol-one", &fp1, &sol1, false);
+        seed_solana_entry(&outbox, "sol-zero-expired", &fp0, &sol0, true);
+        seed_solana_entry(&outbox, "sol-one-expired", &fp1, &sol1, true);
         let mut handler = f.handler.clone();
         handler.wallet_projections = Some(projection);
         handler.broker = Some(MachineBrokerClient::new(Arc::new(StubBroker)));
@@ -5946,7 +6011,7 @@ value = "0""#
                 Profile::Bip44SolanaSlip10Ed25519V1,
                 "m/44'/501'/0'/0'",
                 0x20,
-                "Sol0",
+                &bs58::encode([0x20; 32]).into_string(),
             ),
             derived_account(
                 Profile::Bip44SolanaSlip10Ed25519V1,
@@ -6498,6 +6563,7 @@ value = "0""#,
                 path: "m/44'/501'/0'/0'".into(),
             }),
         };
+        let address = bs58::encode(child_pubkey).into_string();
         bloom_broker_api::WalletAccountsPublic {
             wallet_id: token("alice"),
             seed_profile: bloom_broker_api::WalletSeedProfile::Bip39MulticurveV1,
@@ -6512,7 +6578,13 @@ value = "0""#,
                     sha2::Sha256::digest(&child_spki).into(),
                 ),
                 supported_crypto_suites: vec![bloom_broker_api::CryptoSuite::Ed25519Message],
-                chain_projections: vec![],
+                chain_projections: vec![bloom_broker_api::ChainAccountProjection {
+                    chain_family: token("solana"),
+                    caip2: "solana:test".into(),
+                    caip10: format!("solana:test:{address}"),
+                    address,
+                    address_encoding: bloom_broker_api::AddressEncoding::Base58,
+                }],
                 lifecycle: bloom_broker_api::AccountLifecycleState::Active,
             }],
         }
@@ -6532,6 +6604,7 @@ value = "0""#,
                             0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
                         ];
                         child_spki.extend_from_slice(&self.child_pubkey);
+                        let address = bs58::encode(self.child_pubkey).into_string();
                         let child_key_ref = bloom_broker_api::KeyRef {
                             backend: bloom_broker_api::Token::new("local").unwrap(),
                             backend_instance: bloom_broker_api::Token::new("primary").unwrap(),
@@ -6570,7 +6643,16 @@ value = "0""#,
                                     supported_crypto_suites: vec![
                                         bloom_broker_api::CryptoSuite::Ed25519Message,
                                     ],
-                                    chain_projections: vec![],
+                                    chain_projections: vec![
+                                        bloom_broker_api::ChainAccountProjection {
+                                            chain_family: token("solana"),
+                                            caip2: "solana:test".into(),
+                                            caip10: format!("solana:test:{address}"),
+                                            address,
+                                            address_encoding:
+                                                bloom_broker_api::AddressEncoding::Base58,
+                                        },
+                                    ],
                                     lifecycle: bloom_broker_api::AccountLifecycleState::Active,
                                 }],
                             },
@@ -7887,53 +7969,485 @@ value = "0""#,
         }));
     }
 
-    #[tokio::test]
-    async fn addresses_json_reports_owner_and_signer() {
-        let f = make_handler();
-        let p = VfsPath::parse(&format!("/{}/addresses.json", f.wallet_name)).unwrap();
-        let body = f.handler.read(&p).await.unwrap();
-        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        let owner = bloom_proto::checksum_address(&f.wallet_addr);
-        assert_eq!(v["wallet"], "alice");
-        assert_eq!(v["owner"], owner);
-        assert_eq!(v["signer"], owner, "owner and signer are the same EOA");
-        assert_eq!(v["policy_status"], "broker_verified");
-        assert_eq!(v["unlocked"], false);
-        assert!(v["roles"].as_object().unwrap().is_empty());
-        // addresses.json is also a listed dir entry.
-        let dir = VfsPath::parse(&format!("/{}", f.wallet_name)).unwrap();
-        let names: Vec<String> = f
-            .handler
-            .list(&dir)
+    /// The family address files of one account, as it lists them.
+    async fn listed_address_files(handler: &WalletsHandler, w: &str, number: u32) -> Vec<String> {
+        handler
+            .list(&vfs(format!("/{w}/{number}")))
             .await
             .unwrap()
             .into_iter()
-            .map(|e| e.name)
+            .map(|entry| entry.name)
+            .filter(|name| name.starts_with("address"))
+            .collect()
+    }
+
+    /// Neither the removed account-level `addresses.json` nor a
+    /// family-less `address` alias exists under an account: not listed,
+    /// not resolvable, not readable.
+    async fn assert_no_generic_address_files(handler: &WalletsHandler, w: &str, number: u32) {
+        let names: Vec<String> = handler
+            .list(&vfs(format!("/{w}/{number}")))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.name)
             .collect();
-        assert!(names.iter().any(|n| n == "addresses.json"));
+        for leaf in [
+            "address",
+            "address.qr.svg",
+            "address.qr.png",
+            "addresses.json",
+        ] {
+            assert!(!names.iter().any(|name| name == leaf), "{leaf}: {names:?}");
+            let path = vfs(format!("/{w}/{number}/{leaf}"));
+            assert!(
+                matches!(handler.lookup(&path).await, Err(HandlerError::NotFound(_))),
+                "lookup {path}"
+            );
+            assert!(
+                matches!(handler.read(&path).await, Err(HandlerError::NotAFile(_))),
+                "read {path}"
+            );
+        }
+    }
+
+    /// A family's address files under an account: each resolves as a file,
+    /// the text file reads the address, and the QR images are documents.
+    async fn assert_family_address_files(
+        handler: &WalletsHandler,
+        w: &str,
+        number: u32,
+        family: &str,
+        address: &str,
+    ) {
+        for leaf in [
+            format!("address.{family}"),
+            format!("address.{family}.qr.svg"),
+            format!("address.{family}.qr.png"),
+        ] {
+            let entry = handler
+                .lookup(&vfs(format!("/{w}/{number}/{leaf}")))
+                .await
+                .unwrap_or_else(|error| panic!("{number}/{leaf}: {error:?}"));
+            assert_eq!(entry.name, leaf);
+            assert_eq!(entry.kind, crate::handler::EntryKind::File);
+        }
+        let text = handler
+            .read(&vfs(format!("/{w}/{number}/address.{family}")))
+            .await
+            .unwrap();
+        assert_eq!(text, format!("{address}\n").into_bytes());
+        let svg = handler
+            .read(&vfs(format!("/{w}/{number}/address.{family}.qr.svg")))
+            .await
+            .unwrap();
+        assert!(String::from_utf8(svg).unwrap().contains("<svg"));
+        let png = handler
+            .read(&vfs(format!("/{w}/{number}/address.{family}.qr.png")))
+            .await
+            .unwrap();
+        assert!(png.starts_with(b"\x89PNG\r\n\x1a\n"));
+    }
+
+    /// A family's address files do not exist for an account that holds no
+    /// key of that family: not listed, not resolvable, not readable.
+    async fn assert_no_family_address_files(
+        handler: &WalletsHandler,
+        w: &str,
+        number: u32,
+        family: &str,
+    ) {
+        let names = listed_address_files(handler, w, number).await;
+        for leaf in [
+            format!("address.{family}"),
+            format!("address.{family}.qr.svg"),
+            format!("address.{family}.qr.png"),
+        ] {
+            assert!(!names.contains(&leaf), "{leaf}: {names:?}");
+            let path = vfs(format!("/{w}/{number}/{leaf}"));
+            assert!(
+                matches!(handler.lookup(&path).await, Err(HandlerError::NotFound(_))),
+                "lookup {path}"
+            );
+            assert!(
+                matches!(handler.read(&path).await, Err(HandlerError::NotFound(_))),
+                "read {path}"
+            );
+        }
+    }
+
+    /// An EVM-only account (a Secp256k1 root) presents exactly the EVM
+    /// address files, and no Solana or family-less ones.
+    #[tokio::test]
+    async fn evm_only_account_presents_only_evm_address_files() {
+        let f = make_handler();
+        let w = &f.wallet_name;
+        assert_eq!(
+            listed_address_files(&f.handler, w, 0).await,
+            ["address.evm", "address.evm.qr.png", "address.evm.qr.svg"]
+        );
+        let evm = bloom_proto::checksum_address(&f.wallet_addr);
+        assert_family_address_files(&f.handler, w, 0, "evm", &evm).await;
+        assert_no_family_address_files(&f.handler, w, 0, "sol").await;
+        assert_no_generic_address_files(&f.handler, w, 0).await;
+    }
+
+    /// Address files follow the families each account holds: account 0
+    /// has both families and presents both sets; account 1 holds only a
+    /// Solana key and presents only the Solana set. `public_key` stays the
+    /// display key, so it is account 1's Solana key.
+    #[tokio::test]
+    async fn address_files_follow_the_families_each_account_holds() {
+        use bloom_broker_api::DerivationProfile as Profile;
+        let f = make_handler();
+        let evm0 = bloom_proto::checksum_address(&f.wallet_addr);
+        let sol0 = bs58::encode([0x20u8; 32]).into_string();
+        let sol1 = bs58::encode([0x21u8; 32]).into_string();
+        let solana1 = derived_account(
+            Profile::Bip44SolanaSlip10Ed25519V1,
+            "m/44'/501'/1'/0'",
+            0x21,
+            &sol1,
+        );
+        let solana1_key = solana1.canonical_public_key.decode();
+        let accounts = vec![
+            derived_account(
+                Profile::Bip44EvmSecp256k1V1,
+                "m/44'/60'/0'/0/0",
+                0x10,
+                &evm0,
+            ),
+            derived_account(
+                Profile::Bip44SolanaSlip10Ed25519V1,
+                "m/44'/501'/0'/0'",
+                0x20,
+                &sol0,
+            ),
+            solana1,
+        ];
+        let mut handler = f.handler;
+        handler.wallet_projections = Some(bip39_projection(f.wallet_addr, accounts));
+        let w = &f.wallet_name;
+
+        assert_eq!(
+            listed_address_files(&handler, w, 0).await,
+            [
+                "address.evm",
+                "address.evm.qr.png",
+                "address.evm.qr.svg",
+                "address.sol",
+                "address.sol.qr.png",
+                "address.sol.qr.svg",
+            ]
+        );
+        assert_family_address_files(&handler, w, 0, "evm", &evm0).await;
+        assert_family_address_files(&handler, w, 0, "sol", &sol0).await;
+        assert_no_generic_address_files(&handler, w, 0).await;
+
+        assert_eq!(
+            listed_address_files(&handler, w, 1).await,
+            ["address.sol", "address.sol.qr.png", "address.sol.qr.svg"]
+        );
+        assert_family_address_files(&handler, w, 1, "sol", &sol1).await;
+        assert_no_family_address_files(&handler, w, 1, "evm").await;
+        assert_no_generic_address_files(&handler, w, 1).await;
+        assert_eq!(
+            handler
+                .read(&vfs(format!("/{w}/1/public_key")))
+                .await
+                .unwrap(),
+            format!("0x{}\n", hex::encode(solana1_key)).into_bytes()
+        );
+
+        // account.json stays the structured record of every family, with
+        // the key refs, fingerprints, paths and lifecycle behind the
+        // address files.
+        let one: serde_json::Value = serde_json::from_slice(
+            &handler
+                .read(&vfs(format!("/{w}/1/account.json")))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(one["evm"]["state"], "missing");
+        assert_eq!(one["solana"]["state"], "active");
+        assert_eq!(one["solana"]["address"], sol1);
+        assert_eq!(one["solana"]["path"], "m/44'/501'/1'/0'");
+        assert!(one["solana"]["public_key_fingerprint"].is_string());
+        assert!(one["solana"]["key_ref"].is_object());
+
+        // Everything either account lists resolves with the same kind.
+        for number in [0, 1] {
+            for entry in handler.list(&vfs(format!("/{w}/{number}"))).await.unwrap() {
+                let path = vfs(format!("/{w}/{number}/{}", entry.name));
+                let resolved = handler
+                    .lookup(&path)
+                    .await
+                    .unwrap_or_else(|error| panic!("{path} is listed but {error:?}"));
+                assert_eq!(resolved.kind, entry.kind, "{path}");
+            }
+        }
     }
 
     #[tokio::test]
-    async fn wallet_dir_surfaces_address_qr_images() {
-        let f = make_handler();
-        let dir = VfsPath::parse(&format!("/{}", f.wallet_name)).unwrap();
-        let entries = f.handler.list(&dir).await.unwrap();
-        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
-        assert!(names.contains(&"address.qr.png"));
-        assert!(names.contains(&"address.qr.svg"));
+    async fn address_files_require_broker_projections_for_both_families() {
+        let f = make_handler_with_chain(true);
+        let w = f.wallet_name.clone();
+        let mut evm = derived_account(
+            bloom_broker_api::DerivationProfile::Bip44EvmSecp256k1V1,
+            "m/44'/60'/0'/0/0",
+            0x10,
+            &bloom_proto::checksum_address(&f.wallet_addr),
+        );
+        evm.chain_projections.clear();
+        let mut solana = solana_projection([0xcc_u8; 32]);
+        solana.chain_projections.clear();
+        let mut handler = f.handler;
+        handler.wallet_projections = Some(bip39_projection(f.wallet_addr, vec![evm, solana]));
 
-        for leaf in ["address.qr.png", "address.qr.svg"] {
-            let path = VfsPath::parse(&format!("/{}/{leaf}", f.wallet_name)).unwrap();
-            let entry = f.handler.lookup(&path).await.unwrap();
-            assert_eq!(entry.name, leaf);
-            assert!(matches!(entry.kind, crate::handler::EntryKind::File));
+        assert_no_family_address_files(&handler, &w, 0, "evm").await;
+        assert_no_family_address_files(&handler, &w, 0, "sol").await;
+        let account: serde_json::Value = serde_json::from_slice(
+            &handler
+                .read(&vfs(format!("/{w}/0/account.json")))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(account["evm"]["address"].is_null());
+        assert!(account["solana"]["address"].is_null());
+        handler
+            .read(&vfs(format!("/{w}/0/public_key")))
+            .await
+            .expect("the Broker-projected public key remains visible");
+        assert!(
+            handler
+                .list(&vfs(format!("/{w}/0/chains")))
+                .await
+                .unwrap()
+                .is_empty(),
+            "an account without projected addresses must not advertise chain views"
+        );
+    }
+
+    #[tokio::test]
+    async fn duplicate_account_family_entries_are_integrity_faults_in_either_order() {
+        let f = make_handler_with_chain(true);
+        let evm_address = bloom_proto::checksum_address(&f.wallet_addr);
+        let evm = derived_account(
+            bloom_broker_api::DerivationProfile::Bip44EvmSecp256k1V1,
+            "m/44'/60'/0'/0/0",
+            0x10,
+            &evm_address,
+        );
+        let mut duplicate_evm = derived_account(
+            bloom_broker_api::DerivationProfile::Bip44EvmSecp256k1V1,
+            "m/44'/60'/0'/0/0",
+            0x11,
+            &Address::repeat_byte(0x22).to_string(),
+        );
+        duplicate_evm.key_ref.locator = "wallet/derived/duplicate-evm-0".into();
+
+        let solana = solana_projection([0x20; 32]);
+        let mut duplicate_solana = solana_projection([0x21; 32]);
+        duplicate_solana.key_ref.locator = "wallet/derived/duplicate-solana-0".into();
+
+        for (family, first, second) in [
+            ("EVM", evm, duplicate_evm),
+            ("Solana", solana, duplicate_solana),
+        ] {
+            for accounts in [
+                vec![first.clone(), second.clone()],
+                vec![second.clone(), first.clone()],
+            ] {
+                let collection = bloom_broker_api::WalletAccountsPublic {
+                    wallet_id: token("alice"),
+                    seed_profile: bloom_broker_api::WalletSeedProfile::Bip39MulticurveV1,
+                    accounts: accounts.clone(),
+                };
+                collection
+                    .validate()
+                    .expect("duplicate account numbers are valid Broker wire shape");
+                let mut handler = f.handler.clone();
+                handler.wallet_projections = Some(bip39_projection(f.wallet_addr, accounts));
+                match handler.account_view(&f.wallet_name, 0).await {
+                    Err(HandlerError::Backend(message)) => assert!(
+                        message.contains(&format!("duplicate {family} entries for account 0")),
+                        "{message}"
+                    ),
+                    _ => panic!("duplicate {family} entries must fail regardless of list order"),
+                }
+            }
         }
+    }
+
+    #[tokio::test]
+    async fn wallet_outbox_read_scope_preserves_projection_faults() {
+        let f = make_handler_with_chain(true);
+        let mut evm = derived_account(
+            bloom_broker_api::DerivationProfile::Bip44EvmSecp256k1V1,
+            "m/44'/60'/0'/0/0",
+            0x10,
+            &bloom_proto::checksum_address(&f.wallet_addr),
+        );
+        evm.chain_projections[0].address_encoding = bloom_broker_api::AddressEncoding::Base58;
+        let mut handler = f.handler;
+        handler.wallet_projections = Some(bip39_projection(f.wallet_addr, vec![evm]));
+
+        match handler
+            .wallet_outbox_read_scope(&f.wallet_name, "anvil")
+            .await
+        {
+            Err(HandlerError::Backend(message)) => assert!(
+                message.contains("wrong address encoding"),
+                "projection fault was not preserved: {message}"
+            ),
+            _ => panic!("a projection fault must not become an empty outbox scope"),
+        }
+    }
+
+    /// The wallet directory holds the numbered accounts and wallet-wide
+    /// state; nothing that names one key is exposed above `<n>/`.
+    #[tokio::test]
+    async fn wallet_dir_exposes_no_account_scoped_key_files() {
+        let f = make_handler();
+        let w = &f.wallet_name;
+        let names: Vec<String> = f
+            .handler
+            .list(&vfs(format!("/{w}")))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect();
+        assert!(names.contains(&"0".to_string()), "{names:?}");
+        for leaf in ACCOUNT_KEY_FILES {
+            assert!(!names.iter().any(|name| name == leaf), "{leaf}: {names:?}");
+            let path = vfs(format!("/{w}/{leaf}"));
+            assert!(
+                matches!(
+                    f.handler.lookup(&path).await,
+                    Err(HandlerError::NotFound(_))
+                ),
+                "lookup {leaf}"
+            );
+            assert!(
+                matches!(f.handler.read(&path).await, Err(HandlerError::NotAFile(_))),
+                "read {leaf}"
+            );
+        }
+        // The same files resolve and read under account 0.
+        let owner = bloom_proto::checksum_address(&f.wallet_addr);
+        assert_eq!(
+            f.handler
+                .read(&vfs(format!("/{w}/0/address.evm")))
+                .await
+                .unwrap(),
+            format!("{owner}\n").into_bytes()
+        );
+        let public_key = f
+            .handler
+            .read(&vfs(format!("/{w}/0/public_key")))
+            .await
+            .unwrap();
+        assert!(public_key.starts_with(b"0x") && public_key.ends_with(b"\n"));
+    }
+
+    /// Every entry a wallet or account directory advertises resolves
+    /// through lookup with the same kind, so `ls` and `stat` agree.
+    #[tokio::test]
+    async fn listed_wallet_and_account_entries_resolve_through_lookup() {
+        let f = make_handler();
+        let w = &f.wallet_name;
+        for dir in [format!("/{w}"), format!("/{w}/0")] {
+            for entry in f.handler.list(&vfs(dir.clone())).await.unwrap() {
+                let path = vfs(format!("{dir}/{}", entry.name));
+                let resolved = f
+                    .handler
+                    .lookup(&path)
+                    .await
+                    .unwrap_or_else(|error| panic!("{path} is listed but {error:?}"));
+                assert_eq!(resolved.kind, entry.kind, "{path}");
+            }
+        }
+    }
+
+    /// Installed Petals are mounted only at the VFS root; an account never
+    /// lists, resolves, reads, or accepts writes for a `petals/` subtree.
+    #[tokio::test]
+    async fn petals_are_not_mounted_under_numbered_accounts() {
+        let f = make_handler();
+        let w = &f.wallet_name;
+        let names: Vec<String> = f
+            .handler
+            .list(&vfs(format!("/{w}/0")))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect();
+        assert!(!names.contains(&"petals".to_string()), "{names:?}");
+        for path in [
+            format!("/{w}/0/petals"),
+            format!("/{w}/0/petals/echo"),
+            format!("/{w}/0/petals/echo/message.txt"),
+        ] {
+            assert!(
+                matches!(
+                    f.handler.lookup(&vfs(path.clone())).await,
+                    Err(HandlerError::NotFound(_))
+                ),
+                "lookup {path}"
+            );
+            assert!(
+                matches!(
+                    f.handler.list(&vfs(path.clone())).await,
+                    Err(HandlerError::NotADir(_))
+                ),
+                "list {path}"
+            );
+            assert!(
+                matches!(
+                    f.handler.read(&vfs(path.clone())).await,
+                    Err(HandlerError::NotAFile(_))
+                ),
+                "read {path}"
+            );
+            assert!(
+                matches!(
+                    f.handler.write(&vfs(path.clone()), b"x").await,
+                    Err(HandlerError::PermissionDenied)
+                ),
+                "write {path}"
+            );
+        }
+    }
+
+    /// `sessions/` is listed unconditionally under an account, so it must
+    /// resolve as a directory even before any session exists.
+    #[tokio::test]
+    async fn account_sessions_directory_resolves_without_sessions() {
+        let f = make_handler();
+        let w = &f.wallet_name;
+        let entry = f
+            .handler
+            .lookup(&vfs(format!("/{w}/0/sessions")))
+            .await
+            .unwrap();
+        assert_eq!(entry.kind, crate::handler::EntryKind::Dir);
+        assert!(
+            f.handler
+                .list(&vfs(format!("/{w}/0/sessions")))
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
     async fn address_qr_svg_is_scannable_svg_document() {
         let f = make_handler();
-        let path = VfsPath::parse(&format!("/{}/address.qr.svg", f.wallet_name)).unwrap();
+        let path = VfsPath::parse(&format!("/{}/0/address.evm.qr.svg", f.wallet_name)).unwrap();
         let body = f.handler.read(&path).await.unwrap();
         let svg = String::from_utf8(body).unwrap();
         assert!(svg.contains("<svg"), "{svg}");
@@ -7947,7 +8461,7 @@ value = "0""#,
     #[tokio::test]
     async fn address_qr_png_is_png_document() {
         let f = make_handler();
-        let path = VfsPath::parse(&format!("/{}/address.qr.png", f.wallet_name)).unwrap();
+        let path = VfsPath::parse(&format!("/{}/0/address.evm.qr.png", f.wallet_name)).unwrap();
         let body = f.handler.read(&path).await.unwrap();
         assert!(body.starts_with(b"\x89PNG\r\n\x1a\n"));
         assert!(
@@ -8758,6 +9272,7 @@ value = "0""#,
         spki.extend_from_slice(&pubkey);
         let fingerprint =
             bloom_broker_api::Digest32::from_bytes(sha2::Sha256::digest(&spki).into());
+        let address = bs58::encode(pubkey).into_string();
         bloom_broker_api::DerivedAccountPublic {
             key_ref: bloom_broker_api::KeyRef {
                 backend: bloom_broker_api::Token::new("local").unwrap(),
@@ -8778,7 +9293,13 @@ value = "0""#,
             public_key_encoding: bloom_broker_api::PublicKeyEncoding::Ed25519SpkiDer,
             public_key_fingerprint: fingerprint,
             supported_crypto_suites: vec![bloom_broker_api::CryptoSuite::Ed25519Message],
-            chain_projections: vec![],
+            chain_projections: vec![bloom_broker_api::ChainAccountProjection {
+                chain_family: bloom_broker_api::Token::new("solana").unwrap(),
+                caip2: "solana:test".into(),
+                caip10: format!("solana:test:{address}"),
+                address,
+                address_encoding: bloom_broker_api::AddressEncoding::Base58,
+            }],
             lifecycle: bloom_broker_api::AccountLifecycleState::Active,
         }
     }
@@ -8793,6 +9314,39 @@ value = "0""#,
             SolanaAccount::from_projection(&solana_projection(pubkey)).is_ok(),
             "baseline projection should resolve"
         );
+
+        // The account profile, not a hard-coded routing token, identifies
+        // the address family. Custom Broker chain families remain usable.
+        let mut custom_solana_family = solana_projection(pubkey);
+        custom_solana_family.chain_projections[0].chain_family =
+            bloom_broker_api::Token::new("svm").unwrap();
+        let solana_address = bs58::encode(pubkey).into_string();
+        assert_eq!(
+            projected_family_address(&custom_solana_family).unwrap(),
+            Some(solana_address.as_str())
+        );
+        assert!(SolanaAccount::from_projection(&custom_solana_family).is_ok());
+
+        let evm_address = Address::repeat_byte(0x11).to_string();
+        let mut custom_evm_family = derived_account(
+            bloom_broker_api::DerivationProfile::Bip44EvmSecp256k1V1,
+            "m/44'/60'/0'/0/0",
+            0x10,
+            &evm_address,
+        );
+        custom_evm_family.chain_projections[0].chain_family =
+            bloom_broker_api::Token::new("ethereum").unwrap();
+        assert_eq!(
+            projected_family_address(&custom_evm_family).unwrap(),
+            Some(evm_address.as_str())
+        );
+
+        let mut missing = solana_projection(pubkey);
+        missing.chain_projections.clear();
+        assert!(matches!(
+            SolanaAccount::from_projection(&missing),
+            Err(HandlerError::NotFound(_))
+        ));
 
         // path recorded on the projection disagrees with the signing KeyRef
         let mut a = solana_projection(pubkey);
@@ -8819,7 +9373,29 @@ value = "0""#,
             address: bs58::encode([0x11_u8; 32]).into_string(),
             address_encoding: bloom_broker_api::AddressEncoding::Base58,
         }];
-        expect_integrity(&a, "does not match the derived account address");
+        expect_integrity(&a, "does not identify its canonical public key");
+
+        // EVM follows the same Broker-owned rule: network projections for
+        // one key may vary in CAIP-2, but never in account address.
+        let first = Address::repeat_byte(0x11);
+        let second = Address::repeat_byte(0x22);
+        let mut evm = derived_account(
+            bloom_broker_api::DerivationProfile::Bip44EvmSecp256k1V1,
+            "m/44'/60'/0'/0/0",
+            0x10,
+            &first.to_string(),
+        );
+        evm.chain_projections
+            .push(bloom_broker_api::ChainAccountProjection {
+                chain_family: bloom_broker_api::Token::new("evm").unwrap(),
+                caip2: "eip155:1".into(),
+                caip10: format!("eip155:1:{second}"),
+                address: second.to_string(),
+                address_encoding: bloom_broker_api::AddressEncoding::Hex0x,
+            });
+        assert!(
+            matches!(projected_family_address(&evm), Err(HandlerError::Backend(message)) if message.contains("projections disagree"))
+        );
 
         // wrong key spec / non-canonical encoding
         let mut a = solana_projection(pubkey);
@@ -9140,7 +9716,7 @@ value = "0""#,
     #[tokio::test]
     async fn an_unregistered_wallet_is_not_found() {
         let f = make_handler_with_chain(true);
-        for path in ["/nosuchwallet", "/nosuchwallet/address"] {
+        for path in ["/nosuchwallet", "/nosuchwallet/0/address.evm"] {
             let p = VfsPath::parse(path).unwrap();
             assert!(
                 matches!(f.handler.lookup(&p).await, Err(HandlerError::NotFound(_))),
