@@ -82,15 +82,22 @@ under the wallet while installed Petals and shared market data stay at
 
 ```text
 wallets/<wallet>/
+├── kind, projection.json              # wallet-wide identity
 ├── accounts.json                      # one number per entry (null off-mapping)
 ├── new                                # create an account (write {request_id})
 ├── 0/
 │   ├── account.json                   # both families, with freshness
+│   ├── address.evm, address.evm.qr.*  # EVM address and QR files, when present
+│   ├── address.sol, address.sol.qr.*  # Solana address and QR files, when present
+│   ├── public_key                     # display-key public-key hex
 │   ├── chains/<chain>/...             # chain views and the outbox, this key's
-│   ├── petals/<petal>/...             # installed Petals, account-scoped
 │   └── sessions/<petal>/<slot>/       # session.json + stop for derived keys
-└── policy.json, sealed-approvals/, capabilities/   # unchanged
+└── policy.json, policy-updates/, sealed-approvals/   # wallet-wide
 ```
+
+Files that name one key (`address.evm`/`address.sol`, their QR images, and
+`public_key`) live under a numbered account. Installed Petals are mounted at
+`/petals/<petal>/`.
 
 The number is the derivation path itself, not a position in a list: slot `n`
 is EVM `m/44'/60'/0'/0/n` and Solana `m/44'/501'/n'/0'`. Signer owns the
@@ -103,17 +110,21 @@ rendering comes from the authenticated `wallet.accounts` projection, and
 listings, stats, and reads carry no authority side effects (a stale projection
 is marked as such in `account.json`).
 
-Wallet-level paths keep their meaning by resolving to account 0: the canonical
-initial child of each family, even after further children exist. The
-wallet-level outbox is account 0's outbox with the same fence as the numbered
-tree — it stages from account 0's key, shows only the entries that key staged,
-and a body fingerprint naming any other account is an error for both families;
-staging from account N goes through `wallets/<wallet>/<n>/`. An
-account can hold only EVM, only Solana, or both; reading a missing family
-returns a specific missing-key error and never allocates a key. Retired keys
-remain readable but cannot spend. Staged operations and outboxes are fenced to
-the staging key, so one account can never see or confirm another account's
-pending operations.
+Chain views and outboxes live under `wallets/<wallet>/<n>/chains/`.
+Use the explicit number `0` for the canonical initial child, and the selected
+entry's number for any other child.
+Match its fingerprint and derivation path in `accounts.json` and verify
+`<n>/account.json`; the number is a route to the key, not signing authority.
+
+An account can hold only EVM, only Solana, or both. Its chain listing includes
+configured chains for families with Broker-projected addresses; a missing
+family or address never causes key allocation or fallback to another account.
+Solana `address` and `balance*` leaves live directly under the numbered chain
+directory. Retired keys remain readable while present in the projection but
+cannot spend. Staged operations
+and outboxes are fenced to the staging key, so one account can never see or
+confirm another account's pending operations. A body fingerprint naming any
+other account is rejected for both families.
 
 Account creation is one owner ceremony per number: a client writes
 `{"request_id": "<id>"}` to `wallets/<wallet>/new`, and Signer allocates the
@@ -123,8 +134,8 @@ or, after success, the same account; a conflicting reuse fails; extra fields
 are rejected. A legacy or imported single-key wallet is account 0 from its
 root key, rendered in the root key's own family.
 
-Account-scoped Petal dispatch and the session tree (`<n>/sessions/`, core
-stop, and the install guard) are described in
+The session tree (`<n>/sessions/`, core stop, and the install guard) is
+described in
 [Petal derived key succession.md](Petal%20derived%20key%20succession.md); the
 authority invariants they rely on are in
 [Sealed Approvals.md](Sealed%20Approvals.md). A mnemonic recovers the
