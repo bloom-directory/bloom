@@ -2237,6 +2237,7 @@ dependencies = [
  "bloom-update",
  "bloom-vfs",
  "bloom-watch",
+ "bs58",
  "fs2",
  "futures",
  "hex",

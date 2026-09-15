@@ -47,7 +47,7 @@ from the release it ships with.
   permission-denied confirm writes, `approval_challenge.json`,
   `ceremony_url`, completed Broker approval, and retrying the bound action.
   Solana chains dispatch through the identical
-  `wallets/<wallet>/chains/<chain>/outbox/...` mechanism (see
+  `wallets/<wallet>/0/chains/<chain>/outbox/...` mechanism (see
   [`Solana Native Integration.md`](./Solana%20Native%20Integration.md)), so
   this is no longer EVM-only;
 - discovery of installed Petal docs and route contracts;
