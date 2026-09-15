@@ -60,12 +60,12 @@ bloom wallet list
 
 # 4. Stage a devnet transaction when Anvil is running.
 bloom vfs write \
-  /wallets/alice/chains/anvil/outbox/new.tx \
+  /wallets/alice/0/chains/anvil/outbox/new.tx \
   --data 'send 0.01 eth to 0x70997970C51812dc3A010C7d01b50e0d17dc79C8 on anvil'
 
 # 5. Review the generated plan before confirming.
-bloom vfs ls /wallets/alice/chains/anvil/outbox/pending
-bloom vfs cat /wallets/alice/chains/anvil/outbox/pending/<id>/plan.md
+bloom vfs ls /wallets/alice/0/chains/anvil/outbox/pending
+bloom vfs cat /wallets/alice/0/chains/anvil/outbox/pending/<id>/plan.md
 ```
 
 ## Paid HTTP requests

@@ -1872,7 +1872,7 @@ fn wallet_stage_routes_via_ipc_when_home_write_lock_is_live() {
     stop_ipc_server(server, server_thread);
     let writes = wallets.writes();
     assert_eq!(writes.len(), 1, "writes={writes:?}");
-    assert_eq!(writes[0].0, "/alice/chains/anvil/outbox/new.tx");
+    assert_eq!(writes[0].0, "/alice/0/chains/anvil/outbox/new.tx");
     assert_eq!(String::from_utf8_lossy(&writes[0].1), intent);
 }
 
@@ -2310,7 +2310,7 @@ fn wallet_confirm_uses_plain_ipc_write_when_socket_exists() {
     assert_eq!(writes.len(), 1, "expected one VFS write, got {writes:?}");
     assert_eq!(
         writes[0].0,
-        "/alice/chains/base/outbox/pending/0001-deadbeef/confirm"
+        "/alice/0/chains/base/outbox/pending/0001-deadbeef/confirm"
     );
     assert_eq!(writes[0].1, b"y");
 }

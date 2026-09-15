@@ -107,6 +107,7 @@ impl SolanaBroker {
     }
 
     fn accounts(&self, wallet_id: Token) -> WalletAccountsPublic {
+        let address = bs58::encode(self.pubkey).into_string();
         WalletAccountsPublic {
             wallet_id,
             seed_profile: WalletSeedProfile::Bip39MulticurveV1,
@@ -121,7 +122,13 @@ impl SolanaBroker {
                     Sha256::digest(spki(&self.pubkey)).into(),
                 ),
                 supported_crypto_suites: vec![CryptoSuite::Ed25519Message],
-                chain_projections: vec![],
+                chain_projections: vec![ChainAccountProjection {
+                    chain_family: tok("solana"),
+                    caip2: "solana:local".into(),
+                    caip10: format!("solana:local:{address}"),
+                    address,
+                    address_encoding: AddressEncoding::Base58,
+                }],
                 lifecycle: AccountLifecycleState::Active,
             }],
         }
@@ -425,7 +432,7 @@ async fn solana_expired_blockhash_fails_closed_then_restages() -> Result<()> {
 
     // 5. Stage transfer T1.
     step("5", "stage transfer T1");
-    let new_tx = VfsPath::parse("/wallets/alice/chains/solana-local/outbox/new.tx").unwrap();
+    let new_tx = VfsPath::parse("/wallets/alice/0/chains/solana-local/outbox/new.tx").unwrap();
     let intent = serde_json::json!({"destination": destination, "lamports": LAMPORTS});
     daemon
         .vfs
@@ -434,7 +441,7 @@ async fn solana_expired_blockhash_fails_closed_then_restages() -> Result<()> {
         .map_err(|e| anyhow!("stage write: {e}"))?;
     let pending = daemon
         .vfs
-        .list(&VfsPath::parse("/wallets/alice/chains/solana-local/outbox/pending").unwrap())
+        .list(&VfsPath::parse("/wallets/alice/0/chains/solana-local/outbox/pending").unwrap())
         .await
         .map_err(|e| anyhow!("list pending: {e}"))?;
     let t1_id = pending
@@ -444,7 +451,7 @@ async fn solana_expired_blockhash_fails_closed_then_restages() -> Result<()> {
         .clone();
     let t1 = read_json(
         &daemon,
-        &format!("/wallets/alice/chains/solana-local/outbox/pending/{t1_id}/intent.json"),
+        &format!("/wallets/alice/0/chains/solana-local/outbox/pending/{t1_id}/intent.json"),
     )
     .await?;
     let t1_lvbh = t1["last_valid_block_height"]
@@ -481,7 +488,7 @@ async fn solana_expired_blockhash_fails_closed_then_restages() -> Result<()> {
     );
     broker.approval_active.store(true, Ordering::SeqCst);
     let confirm_t1 = VfsPath::parse(&format!(
-        "/wallets/alice/chains/solana-local/outbox/pending/{t1_id}/confirm"
+        "/wallets/alice/0/chains/solana-local/outbox/pending/{t1_id}/confirm"
     ))
     .unwrap();
     let refusal = daemon.vfs.write(&confirm_t1, b"y\n").await;
@@ -506,7 +513,7 @@ async fn solana_expired_blockhash_fails_closed_then_restages() -> Result<()> {
     // Nothing moved to `sent`, and the destination is untouched.
     let sent = daemon
         .vfs
-        .list(&VfsPath::parse("/wallets/alice/chains/solana-local/outbox/sent").unwrap())
+        .list(&VfsPath::parse("/wallets/alice/0/chains/solana-local/outbox/sent").unwrap())
         .await
         .map_err(|e| anyhow!("list sent: {e}"))?;
     assert!(
@@ -525,7 +532,7 @@ async fn solana_expired_blockhash_fails_closed_then_restages() -> Result<()> {
     // 8. Restage T1 → a fresh replacement, T1 marked failed/Expired.
     step("8", "restage T1 into a fresh replacement T2");
     let restage_t1 = VfsPath::parse(&format!(
-        "/wallets/alice/chains/solana-local/outbox/pending/{t1_id}/restage"
+        "/wallets/alice/0/chains/solana-local/outbox/pending/{t1_id}/restage"
     ))
     .unwrap();
     daemon
@@ -535,7 +542,7 @@ async fn solana_expired_blockhash_fails_closed_then_restages() -> Result<()> {
         .map_err(|e| anyhow!("restage write: {e}"))?;
     let advice = read_json(
         &daemon,
-        &format!("/wallets/alice/chains/solana-local/outbox/failed/{t1_id}/restage_advice.json"),
+        &format!("/wallets/alice/0/chains/solana-local/outbox/failed/{t1_id}/restage_advice.json"),
     )
     .await?;
     println!(
@@ -557,7 +564,7 @@ async fn solana_expired_blockhash_fails_closed_then_restages() -> Result<()> {
     // T1 is now terminal: failed/, status Expired, and gone from pending/.
     let t1_failed = read_json(
         &daemon,
-        &format!("/wallets/alice/chains/solana-local/outbox/failed/{t1_id}/intent.json"),
+        &format!("/wallets/alice/0/chains/solana-local/outbox/failed/{t1_id}/intent.json"),
     )
     .await?;
     assert_eq!(
@@ -567,7 +574,7 @@ async fn solana_expired_blockhash_fails_closed_then_restages() -> Result<()> {
     );
     let pending_after = daemon
         .vfs
-        .list(&VfsPath::parse("/wallets/alice/chains/solana-local/outbox/pending").unwrap())
+        .list(&VfsPath::parse("/wallets/alice/0/chains/solana-local/outbox/pending").unwrap())
         .await
         .map_err(|e| anyhow!("list pending: {e}"))?;
     assert!(
@@ -586,7 +593,7 @@ async fn solana_expired_blockhash_fails_closed_then_restages() -> Result<()> {
     );
     let t2 = read_json(
         &daemon,
-        &format!("/wallets/alice/chains/solana-local/outbox/pending/{t2_id}/intent.json"),
+        &format!("/wallets/alice/0/chains/solana-local/outbox/pending/{t2_id}/intent.json"),
     )
     .await?;
     let t2_blockhash = t2["blockhash"].as_str().unwrap().to_string();
@@ -615,7 +622,7 @@ async fn solana_expired_blockhash_fails_closed_then_restages() -> Result<()> {
     //     the retry reuses the recorded approval and signs + broadcasts.
     step("10", "confirm T2: approve, sign, broadcast");
     let confirm_t2 = VfsPath::parse(&format!(
-        "/wallets/alice/chains/solana-local/outbox/pending/{t2_id}/confirm"
+        "/wallets/alice/0/chains/solana-local/outbox/pending/{t2_id}/confirm"
     ))
     .unwrap();
     let first = daemon.vfs.write(&confirm_t2, b"y\n").await;
@@ -642,7 +649,7 @@ async fn solana_expired_blockhash_fails_closed_then_restages() -> Result<()> {
     );
     let sent = daemon
         .vfs
-        .list(&VfsPath::parse("/wallets/alice/chains/solana-local/outbox/sent").unwrap())
+        .list(&VfsPath::parse("/wallets/alice/0/chains/solana-local/outbox/sent").unwrap())
         .await
         .map_err(|e| anyhow!("list sent: {e}"))?;
     assert!(
@@ -660,7 +667,7 @@ async fn solana_expired_blockhash_fails_closed_then_restages() -> Result<()> {
     for _ in 0..60 {
         if let Ok(value) = read_json(
             &daemon,
-            &format!("/wallets/alice/chains/solana-local/outbox/sent/{t2_id}/receipt.json"),
+            &format!("/wallets/alice/0/chains/solana-local/outbox/sent/{t2_id}/receipt.json"),
         )
         .await
             && value["confirmation_status"].as_str() == Some("finalized")

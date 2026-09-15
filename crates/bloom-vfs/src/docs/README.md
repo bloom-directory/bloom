@@ -39,8 +39,8 @@ Petals before choosing paths; their names and availability vary by installation.
 
 `chains/` is EVM-only. Solana status lives under
 `status/chains/<solana-chain>/`; account reads live under
-`wallets/<wallet>/chains/<solana-chain>/`. Native `defi/intents` and
-Hyperliquid routes are retired; discover installed Petals instead.
+`wallets/<wallet>/<n>/chains/<solana-chain>/`. Discover installed applications
+under `petals/`.
 
 ## Reads
 
@@ -61,22 +61,25 @@ Representative paths, relative to the mount:
 | Token balance | `chains/<chain>/addresses/<address>/tokens/<contract>/balance.json` |
 | NFT kind/owner | `chains/<chain>/contracts/<contract>/nft/{kind,owner_of/<token-id>}` |
 | ENS / price | `ens/<name>/address`, `prices/spot/eth.usd` |
-| Wallet identity | `wallets/<wallet>/{projection.json,accounts.json,address,addresses.json}` |
-| Solana account | `wallets/<wallet>/chains/<chain>/accounts/<full-fingerprint>/{address,balance,balance.raw,balance.json}` |
+| Wallet identity | `wallets/<wallet>/{kind,projection.json,accounts.json}` |
+| Account keys | `wallets/<wallet>/<n>/{account.json,address.evm,address.sol,public_key}` |
+| Solana account | `wallets/<wallet>/<n>/chains/<solana-chain>/{address,balance,balance.raw,balance.json}` |
 | Solana status | `status/chains/<chain>/{status.json,slot,block_height}` |
 
-Braces above abbreviate separate leaves, not action selectors. Solana
-chain-level balance aliases resolve to account 0 and fail if its canonical
-child is inactive. Use
-the full fingerprint and derivation path from `accounts.json` for account
-identity; never select by list position.
+Braces above abbreviate separate leaves, not action selectors. Match the
+intended Solana key's full fingerprint and derivation path in `accounts.json`
+to its `number`, then use that number as `<n>`. Address and balance leaves
+refer only to that account; never select by list position.
 
 Numbered accounts live at `wallets/<wallet>/<n>/`: read `account.json` to
 verify the keys, then use `chains/<chain>/outbox/` beneath that account to
-stage and inspect its transactions. Wallet-level outboxes use account 0.
-Account-aware Petals and delegated sessions live beneath the numbered account
-at `petals/<petal>/` and `sessions/<petal>/<key-slot>/`; see the mount
-`AGENTS.md` for account creation, session status, and revocation rules.
+stage and inspect its transactions. Use the explicit `0` account path for the
+initial account.
+Address, QR, and public-key files exist only beneath a numbered account.
+Delegated sessions live beneath the numbered account at
+`sessions/<petal>/<key-slot>/`; installed Petals are mounted only at
+`petals/<petal>/`. See the mount `AGENTS.md` for account creation, session
+status, and revocation rules.
 
 ## Writes and authority
 
@@ -88,7 +91,7 @@ transaction was not submitted.
 | Operation | Route / procedure |
 |---|---|
 | Register wallet | `wallets/new`; [wallet creation](./examples.md#creating-a-wallet) |
-| EVM transaction | `wallets/<wallet>/chains/<chain>/outbox/new.tx`; [Anvil workflow](./examples.md#local-anvil-transaction) |
+| EVM transaction | `wallets/<wallet>/0/chains/<chain>/outbox/new.tx`; [Anvil workflow](./examples.md#local-anvil-transaction) |
 | Solana transaction | Same outbox shape with strict JSON; [Solana workflow](./examples.md#solana-account-aware-reads-and-transfer) |
 | Update policy | `wallets/<wallet>/policy.json`; [policy workflow](./examples.md#updating-wallet-policy) |
 | Reusable authority | `wallets/<wallet>/sealed-approvals/` |
