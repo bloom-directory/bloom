@@ -4936,7 +4936,7 @@ mod tests {
                             bloom_broker_api::DerivationProfile::Bip44SolanaSlip10Ed25519V1,
                             "m/44'/501'/2'/0'",
                             0x32,
-                            "Sol2",
+                            &bs58::encode([0x32; 32]).into_string(),
                         );
                         let mut key_refs = Vec::new();
                         for account in [evm, solana] {
@@ -5157,13 +5157,13 @@ mod tests {
                 Profile::Bip44SolanaSlip10Ed25519V1,
                 "m/44'/501'/0'/0'",
                 0x20,
-                "Sol0",
+                &bs58::encode([0x20; 32]).into_string(),
             ),
             derived_account(
                 Profile::Bip44SolanaSlip10Ed25519V1,
                 "m/44'/501'/1'/0'",
                 0x21,
-                "Sol1",
+                &bs58::encode([0x21; 32]).into_string(),
             ),
             derived_account(
                 Profile::Bip44EvmSecp256k1V1,
@@ -5214,7 +5214,10 @@ mod tests {
         assert_eq!(one["evm"]["address"], evm1);
         assert_eq!(one["evm"]["path"], "m/44'/60'/0'/0/1");
         assert_eq!(one["solana"]["state"], "active");
-        assert_eq!(one["solana"]["address"], "Sol1");
+        assert_eq!(
+            one["solana"]["address"],
+            bs58::encode([0x21; 32]).into_string()
+        );
         assert_eq!(one["freshness"], "fresh");
 
         // accounts.json names each entry's number.
@@ -5808,10 +5811,12 @@ value = "0""#
                 .to_owned()
         };
         let (engine, outbox) = solana_engine_fixture(&f._tmp);
-        seed_solana_entry(&outbox, "sol-zero", &fp0, "Sol0", false);
-        seed_solana_entry(&outbox, "sol-one", &fp1, "Sol1", false);
-        seed_solana_entry(&outbox, "sol-zero-expired", &fp0, "Sol0", true);
-        seed_solana_entry(&outbox, "sol-one-expired", &fp1, "Sol1", true);
+        let sol0 = bs58::encode([0x20; 32]).into_string();
+        let sol1 = bs58::encode([0x21; 32]).into_string();
+        seed_solana_entry(&outbox, "sol-zero", &fp0, &sol0, false);
+        seed_solana_entry(&outbox, "sol-one", &fp1, &sol1, false);
+        seed_solana_entry(&outbox, "sol-zero-expired", &fp0, &sol0, true);
+        seed_solana_entry(&outbox, "sol-one-expired", &fp1, &sol1, true);
         let mut handler = f.handler.clone();
         handler.wallet_projections = Some(projection);
         handler.broker = Some(MachineBrokerClient::new(Arc::new(StubBroker)));
@@ -6006,7 +6011,7 @@ value = "0""#
                 Profile::Bip44SolanaSlip10Ed25519V1,
                 "m/44'/501'/0'/0'",
                 0x20,
-                "Sol0",
+                &bs58::encode([0x20; 32]).into_string(),
             ),
             derived_account(
                 Profile::Bip44SolanaSlip10Ed25519V1,
