@@ -16,7 +16,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from .core import EvalError, run_eval
+from .core import EvalError, EvalEvidence, run_eval
 from .hyperliquid_order_cancel import (
     MAINNET_ACK,
     PACKAGE_HASH,
@@ -1010,7 +1010,7 @@ def run_or_recover(
     started_total = time.monotonic()
     timings: dict[str, float] = {}
     outcome = "failed"
-    result: Any | None = None
+    evidence = EvalEvidence()
     error_text: str | None = None
     definition = HyperliquidOrderCancelEval(
         repo_root,
@@ -1052,11 +1052,12 @@ def run_or_recover(
                         )
                     refreshed = store.read()
                     definition.sign_count_value = str(refreshed["next_sign_count"])
-                    result = run_eval(
+                    run_eval(
                         definition,
                         state["model"],
                         acquire_lock=False,
                         phase_timings=timings,
+                        evidence=evidence,
                     )
                 finally:
                     if store.backup_path.exists():
@@ -1084,12 +1085,18 @@ def run_or_recover(
                 "package_hash": state["package_hash"],
                 "lineage": state["lineage"],
                 "timings": {key: round(value, 6) for key, value in timings.items()},
-                "result": result_summary(result) if result is not None else None,
+                "result": result_summary(evidence.result)
+                if evidence.result is not None else None,
                 "error": error_text,
+                "cleanup": {
+                    "succeeded": evidence.cleanup_succeeded,
+                    "error": redact(evidence.cleanup_error, state)
+                    if evidence.cleanup_error is not None else None,
+                },
                 "final_state": {
-                    "open_orders": 0 if outcome == "passed" else None,
-                    "positions": 0 if outcome == "passed" else None,
-                    "session_stopped": True if outcome == "passed" else None,
+                    "open_orders": definition.cleanup_observations.get("open_orders"),
+                    "positions": definition.cleanup_observations.get("positions"),
+                    "session_stopped": definition.cleanup_observations.get("session_stopped"),
                     "policy_restored": not store.backup_path.exists(),
                     "counter_reconciled": store.read().get("pending_policy_recovery")
                     is None,

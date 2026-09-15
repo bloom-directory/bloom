@@ -81,6 +81,50 @@ class OperatorStateTests(unittest.TestCase):
         with self.assertRaisesRegex(EvalError, "non-advancing"):
             self.store.update_counter(8)
 
+    def test_failed_trial_summary_retains_reward_and_observed_cleanup(self) -> None:
+        state = self.store.read()
+        state["lineage"] = {}
+        self.store.write(state)
+        for cleanup_fails in (False, True):
+            with self.subTest(cleanup_fails=cleanup_fails):
+                definition = SimpleNamespace(
+                    phase_timings={},
+                    cleanup_observations={
+                        "open_orders": 1 if cleanup_fails else 0,
+                        "positions": None if cleanup_fails else 0,
+                        "session_stopped": False if cleanup_fails else True,
+                    },
+                )
+                def run(_definition, _model, *, evidence, **_kwargs):
+                    evidence.result = SimpleNamespace(
+                        stats=SimpleNamespace(n_errored_trials=0, n_cancelled_trials=0),
+                        trial_results=[SimpleNamespace(
+                            verifier_result=SimpleNamespace(rewards={"reward": 0})
+                        )],
+                    )
+                    evidence.cleanup_succeeded = not cleanup_fails
+                    evidence.cleanup_error = "residual order" if cleanup_fails else None
+                    raise EvalError("Harbor verifier did not award a passing reward")
+
+                with (
+                    mock.patch("harness.operator.validate_lineage"),
+                    mock.patch("harness.operator.HyperliquidOrderCancelEval", return_value=definition),
+                    mock.patch("harness.operator.PolicyLifecycle"),
+                    mock.patch("harness.operator.run_eval", side_effect=run),
+                    self.assertRaisesRegex(EvalError, "passing reward"),
+                ):
+                    run_or_recover(
+                        Namespace(state=self.store.path, ack=MAINNET_ACK),
+                        self.root, recover_only=False,
+                    )
+                summary = json.loads(next(self.store.summary_dir.glob("*.json")).read_text())
+                self.assertEqual(summary["outcome"], "failed")
+                self.assertEqual(summary["result"]["rewards"], {"reward": 0})
+                self.assertEqual(summary["cleanup"]["succeeded"], not cleanup_fails)
+                self.assertEqual(summary["cleanup"]["error"], "residual order" if cleanup_fails else None)
+                for key, value in definition.cleanup_observations.items():
+                    self.assertEqual(summary["final_state"][key], value)
+
     def test_default_handoff_is_repository_local_and_self_describing(self) -> None:
         args = parser(self.root).parse_args(["status"])
         self.assertEqual(args.state, self.root / DEFAULT_STATE_RELATIVE)
@@ -184,7 +228,7 @@ class OperatorStateTests(unittest.TestCase):
             self.store.write(current)
             self.store.backup_path.unlink()
 
-        definition = SimpleNamespace(phase_timings={})
+        definition = SimpleNamespace(phase_timings={}, cleanup_observations={})
         policy = SimpleNamespace(restore=restore)
         with (
             mock.patch(
@@ -234,7 +278,7 @@ class OperatorStateTests(unittest.TestCase):
             self.store.write(current)
             self.store.backup_path.unlink()
 
-        definition = SimpleNamespace(phase_timings={})
+        definition = SimpleNamespace(phase_timings={}, cleanup_observations={})
         policy = SimpleNamespace(activate=activate, restore=restore)
         with (
             mock.patch("harness.operator.validate_lineage"),

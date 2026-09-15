@@ -3,8 +3,13 @@ Use the Bloom filesystem mounted at `/bloom` to perform this exact task on **Hyp
 Exercise the mounted filesystem using ordinary shell filesystem operations only
 (for example, `cat` for reads and shell redirection for writes). Do not invoke
 `bloom vfs`, the `bloom` executable, a Machine RPC endpoint, or any alternate
-transport. If a mounted operation fails, treat it as a task failure; do not
-bypass or replace the mount.
+transport. Permission errors (`EPERM`/`EACCES`), I/O errors, malformed responses,
+and polling timeouts are task failures; do not bypass or replace the mount.
+The narrow exception is `ENOENT` (No such file or directory) when reading the
+exact asynchronous receipt or action-outcome path documented by the installed
+route for this session, action, and CLOID after dispatch. It means pending
+within the documented polling window, not immediate failure. Missing required
+contract or session files are still failures.
 
 Never issue concurrent `/bloom` commands.
 You may reduce model round trips by using one shell invocation to read multiple
@@ -18,7 +23,7 @@ another `/bloom` command.
 2. The trusted host has already created and owner-approved the session. Read its `status.json` and refuse to continue unless it is active, mainnet, BTC-only (asset ID `0`), capped at `11` USD notional and 1x leverage.
 3. Read the session's `update_leverage.json` leaf and follow its `request_schema`, `example`, and `success_evidence` exactly to set BTC cross leverage to 1 and confirm it on the venue.
 4. Read the current BTC mark from `/bloom/petals/hyperliquid/mainnet/mids.json`. Then read the session's `order.json` leaf and follow its `request_schema` and `example` to submit one BTC **post-only (ALO) buy** with client order ID `BLOOM_EVAL_CLOID`. Its limit price must be 5% below the observed mark, rounded down to a valid Hyperliquid BTC price: first floor the target to one decimal place; if that result has more than five significant figures, floor the original target to a whole-dollar integer instead. Choose a five-decimal-or-less BTC size whose notional at the limit price is at least $10 and no more than $11.
-5. Follow `order.json`'s `success_evidence`: under the session route from step 1, poll the exact immutable `receipts/$BLOOM_EVAL_CLOID/order.json` leaf, confirm its CLOID and nested resting response match the submitted order, and record the venue order ID from that response. Do not substitute `last_response.json` or infer success from the write itself.
+5. Follow `order.json`'s `success_evidence`: under the session route from step 1, poll the exact immutable `receipts/$BLOOM_EVAL_CLOID/order.json` leaf for the full documented window (currently 120 seconds), confirm its CLOID and nested resting response match the submitted order, and record the venue order ID from that response. Do not substitute `last_response.json` or infer success from the write itself.
 6. Read the session's `cancel.json` leaf and cancel the exact order by CLOID using its documented `cancelByCloid` request shape. Under the same session route, poll `receipts/$BLOOM_EVAL_CLOID/cancel.json` until its response records success, then poll `/bloom/petals/hyperliquid/mainnet/users/$BLOOM_EVAL_WALLET/open_orders.json` sequentially until no entry has that CLOID.
 7. Invoke the session's `cancel_all` cleanup endpoint, but leave the session active so the verifier and host can independently repeat cleanup and stop it.
 8. Write exactly one JSON object to `/logs/artifacts/result.json`, matching the schema below. Harbor re-materializes that conventional artifact path unchanged for the verifier. Decimal values must be JSON strings.
@@ -49,3 +54,18 @@ another `/bloom` command.
 ```
 
 Read `/bloom/petals/hyperliquid/README.md`. The installed route leaves are the authoritative API contract; follow their request and live-venue success-evidence descriptions instead of substituting payloads from external documentation or another repository revision. A successful filesystem write only means an asynchronous action was dispatched. This task authorizes writes only to the exact bounded Hyperliquid session named above. Do not use any other wallet, asset, network, amount, side, order type, or client order ID. Submit exactly one order action and do not place a replacement order if it is rejected. Never stop the session yourself. If any step fails, invoke `cancel_all`, leave the session active for host cleanup, and do not report `complete`.
+
+Sequential polling example (apply to both order and cancel): read the exact
+receipt; if it is pending, read the exact correlated action outcome **if the
+installed route documents one**; then wait the documented interval and repeat
+until the deadline. Catch only `ENOENT` for these pending reads, not every
+nonzero `cat` exit status. Complete each read before beginning the next one.
+Before trusting an outcome, verify its session, action, CLOID, and original
+request (or request digest) match this dispatch, following the installed schema;
+a stale outcome for a reused CLOID is not evidence about this request.
+If an outcome reports `rejected_before_submission`, stop and perform cleanup.
+If it reports `submission_unknown`, preserve that evidence and continue only
+the documented read/reconciliation checks within the deadline; never resend.
+`submitted` alone does not prove a resting order or successful cancel: the
+receipt must satisfy the success checks above. A deadline without that evidence
+is a task failure and requires cleanup, even if the original write succeeded.
