@@ -4,8 +4,8 @@
 //! `m/44'/60'/0'/0/<n>` and Solana `m/44'/501'/<n>'/0'`, computed here from
 //! the authenticated projection and never stored or sent anywhere. The
 //! wallet's chain views live here and nowhere above: `<n>/chains/<chain>/`
-//! reads balance, nonce and outbox through the account's key for the chain's
-//! family.
+//! reads balance, nonce, mempool views and outbox through the account's key
+//! for the chain's family.
 //!
 //! Writes go through the outbox code with the sender fixed: an EVM stage is
 //! built for the account's address and later signed by the key the
@@ -37,6 +37,11 @@ pub const ACCOUNT_KEY_FILES: [&str; 7] = [
     "address.sol.qr.svg",
     "public_key",
 ];
+
+/// The mempool views under `<n>/chains/<evm-chain>/`. Both read the
+/// account's own EVM address from the chain's mempool index and compare it
+/// only with outbox entries that account's EVM key staged.
+const EVM_MEMPOOL_LEAVES: [&str; 2] = ["pending_external.jsonl", "nonce_conflicts.json"];
 
 /// One family's key inside an account.
 #[derive(Clone, Debug)]
@@ -638,7 +643,7 @@ impl WalletsHandler {
                 if matches!(
                     leaf.as_str(),
                     "balance" | "balance.raw" | "balance.json" | "nonce"
-                ) =>
+                ) || EVM_MEMPOOL_LEAVES.contains(&leaf.as_str()) =>
             {
                 Ok(Entry::file(leaf))
             }
@@ -693,6 +698,12 @@ impl WalletsHandler {
                 let nonce = client.nonce(address).await.map_err(err_be)?;
                 Ok(format!("{nonce}\n").into_bytes())
             }
+            [leaf] if leaf == "pending_external.jsonl" => {
+                self.evm_pending_external(wallet, family, chain, address)
+            }
+            [leaf] if leaf == "nonce_conflicts.json" => {
+                self.evm_nonce_conflicts(wallet, family, chain, address)
+            }
             [dir, outbox_rest @ ..] if dir == "outbox" => {
                 self.evm_outbox_read(wallet, family, chain, outbox_rest)
                     .await
@@ -717,6 +728,8 @@ impl WalletsHandler {
                 Entry::file("balance.raw"),
                 Entry::file("balance.json"),
                 Entry::file("nonce"),
+                Entry::file("pending_external.jsonl"),
+                Entry::file("nonce_conflicts.json"),
                 Entry::dir("outbox"),
             ]),
             [dir] if dir == "outbox" => self.evm_outbox_list(wallet, family, chain, &[]).await,
@@ -924,6 +937,139 @@ impl WalletsHandler {
             pending.push((entry.staged.created_ms, id));
         }
         Ok(newest_pending_target(pending))
+    }
+
+    /// The outbox entries `family` staged on `chain` in `state`, as
+    /// `(sorted unique nonces, nonce -> lowercased tx hashes)`. A pending
+    /// entry may have no hash yet. Another account's entry never counts,
+    /// and an unreadable entry is skipped because its sender cannot be
+    /// proven.
+    fn evm_outbox_nonces(
+        &self,
+        wallet: &str,
+        family: &FamilyKey,
+        chain: &str,
+        state: OutboxState,
+    ) -> Result<(Vec<u64>, std::collections::BTreeMap<u64, Vec<String>>), HandlerError> {
+        let mut nonces = std::collections::BTreeSet::new();
+        let mut by_nonce: std::collections::BTreeMap<u64, Vec<String>> =
+            std::collections::BTreeMap::new();
+        let ids = self
+            .tx_engine
+            .outbox
+            .list(wallet, chain, state)
+            .map_err(err_be)?;
+        for id in ids {
+            let Ok(entry) = self
+                .tx_engine
+                .outbox
+                .read_in_state(wallet, chain, &id, state)
+            else {
+                continue;
+            };
+            if !Self::evm_entry_belongs(family, &entry.staged.from) {
+                continue;
+            }
+            nonces.insert(entry.staged.nonce);
+            if let Some(hash) = entry.staged.tx_hash.as_deref() {
+                by_nonce
+                    .entry(entry.staged.nonce)
+                    .or_default()
+                    .push(hash.to_lowercase());
+            }
+        }
+        Ok((nonces.into_iter().collect(), by_nonce))
+    }
+
+    /// `pending_external.jsonl`: the mempool txs from `address` that none of
+    /// this account's pending or sent outbox entries produced, one JSON
+    /// object per line. Empty when the chain has no mempool index.
+    fn evm_pending_external(
+        &self,
+        wallet: &str,
+        family: &FamilyKey,
+        chain: &str,
+        address: alloy::primitives::Address,
+    ) -> Result<Vec<u8>, HandlerError> {
+        let Some(index) = self.mempool_indexes.get(chain) else {
+            return Ok(Vec::new());
+        };
+        let mut own_hashes = std::collections::HashSet::new();
+        for state in [OutboxState::Pending, OutboxState::Sent] {
+            let (_, by_nonce) = self.evm_outbox_nonces(wallet, family, chain, state)?;
+            own_hashes.extend(by_nonce.into_values().flatten());
+        }
+        let mut out = Vec::new();
+        for tx in index.snapshot().into_iter().filter(|tx| tx.from == address) {
+            if own_hashes.contains(&format!("{:?}", tx.hash).to_lowercase()) {
+                continue;
+            }
+            serde_json::to_writer(&mut out, &tx).map_err(err_be)?;
+            out.push(b'\n');
+        }
+        Ok(out)
+    }
+
+    /// `nonce_conflicts.json`: the nonces the mempool observed for
+    /// `address`, this account's pending and sent outbox nonces, and every
+    /// mempool hash that occupies one of those nonces without being one of
+    /// this account's own hashes.
+    fn evm_nonce_conflicts(
+        &self,
+        wallet: &str,
+        family: &FamilyKey,
+        chain: &str,
+        address: alloy::primitives::Address,
+    ) -> Result<Vec<u8>, HandlerError> {
+        // The mempool may hold several txs at one nonce (replacements);
+        // each is a candidate until it matches one of this account's hashes.
+        let mut mempool_by_nonce: std::collections::BTreeMap<u64, Vec<String>> =
+            std::collections::BTreeMap::new();
+        let observed = match self.mempool_indexes.get(chain) {
+            Some(index) => {
+                for tx in index.snapshot().into_iter().filter(|tx| tx.from == address) {
+                    mempool_by_nonce
+                        .entry(tx.nonce)
+                        .or_default()
+                        .push(format!("{:?}", tx.hash).to_lowercase());
+                }
+                index.observed_nonces(address)
+            }
+            None => Vec::new(),
+        };
+        let (pending_nonces, pending_by_nonce) =
+            self.evm_outbox_nonces(wallet, family, chain, OutboxState::Pending)?;
+        let (sent_nonces, sent_by_nonce) =
+            self.evm_outbox_nonces(wallet, family, chain, OutboxState::Sent)?;
+        let mut outbox_by_nonce: std::collections::BTreeMap<u64, Vec<String>> =
+            std::collections::BTreeMap::new();
+        for (nonce, hashes) in pending_by_nonce.into_iter().chain(sent_by_nonce) {
+            outbox_by_nonce.entry(nonce).or_default().extend(hashes);
+        }
+        let mut conflicts = Vec::new();
+        for (nonce, mempool_hashes) in &mempool_by_nonce {
+            let Some(outbox_hashes) = outbox_by_nonce.get(nonce) else {
+                continue;
+            };
+            for mempool_hash in mempool_hashes {
+                if outbox_hashes.contains(mempool_hash) {
+                    continue;
+                }
+                conflicts.push(serde_json::json!({
+                    "nonce": nonce,
+                    "mempool_hash": mempool_hash,
+                    "outbox_hash": outbox_hashes.first(),
+                }));
+            }
+        }
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "address": bloom_proto::checksum_address(&address),
+            "observed_nonces": observed,
+            "outbox_pending_nonces": pending_nonces,
+            "outbox_sent_nonces": sent_nonces,
+            "conflicts": conflicts,
+        }))
+        .map_err(err_be)
     }
 
     // ----- Solana -----

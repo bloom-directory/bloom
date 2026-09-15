@@ -104,9 +104,9 @@ data or rely on their own internal caches, e.g. the etherscan client).
 | `chains/<c>/mempool/by_address/<a>/...` | rpc | `chains_mempool::by_address` |
 | `chains/<c>/mempool/by_pool/<a>/recent.jsonl` | rpc | `chains_mempool::by_pool` |
 | `chains/<c>/mempool/<hash>/{tx,decoded,status}` | rpc | `chains_mempool::tx_hash_subtree` |
-| `wallets/<w>/0/chains/<c>/pending_external.jsonl` | rpc | `bloom-vfs/src/handlers/wallets.rs` |
-| `wallets/<w>/outbox/sent/<h>/{bump.tx,cancel.tx,bump_advice.json}` | local | `bloom-tx::bump_scanner` |
-| `wallets/<w>/outbox/pending/<id>/{mev_risk.json,nonce_conflict.json}` | local | `bloom-tx::tx_engine::stage` |
+| `wallets/<w>/<n>/chains/<c>/{pending_external.jsonl,nonce_conflicts.json}` | rpc | `bloom-vfs/src/handlers/wallets/accounts.rs` |
+| `wallets/<w>/<n>/chains/<c>/outbox/sent/<h>/{bump.tx,cancel.tx,bump_advice.json}` | local | `bloom-tx::bump_scanner` |
+| `wallets/<w>/<n>/chains/<c>/outbox/pending/<id>/{mev_risk.json,nonce_conflict.json}` | local | `bloom-tx::tx_engine::stage` |
 | `status/backends/{mempool,private_rpc}` | local | `bloom-vfs/src/handlers/status.rs` |
 
 Verified end-to-end via `tests/docker/run.sh --mempool`.

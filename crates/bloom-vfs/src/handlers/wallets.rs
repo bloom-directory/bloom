@@ -5354,6 +5354,211 @@ value = "0""#
         assert_eq!(value["outbox_pending_nonces"], serde_json::json!([0]));
     }
 
+    /// Seed an EVM sent entry staged by `from` at `nonce` with `tx_hash`.
+    fn seed_sent_from(f: &Fixture, id: &str, from: &str, nonce: u64, tx_hash: &str) {
+        seed_pending_from(f, id, from, 1_000);
+        let outbox = &f.handler.tx_engine.outbox;
+        let mut entry = outbox
+            .read_in_state(&f.wallet_name, "anvil", id, OutboxState::Pending)
+            .unwrap();
+        entry.staged.nonce = nonce;
+        entry.staged.tx_hash = Some(tx_hash.into());
+        std::fs::write(
+            entry.dir.join("intent.json"),
+            serde_json::to_vec_pretty(&entry.staged).unwrap(),
+        )
+        .unwrap();
+        outbox.transition(&entry, OutboxState::Sent).unwrap();
+    }
+
+    /// A mempool tx from `from` at `nonce`, hashed `[hash_byte; 32]`.
+    fn mempool_tx(hash_byte: u8, from: Address, nonce: u64) -> bloom_mempool::PendingTx {
+        bloom_mempool::PendingTx {
+            hash: alloy::primitives::B256::repeat_byte(hash_byte),
+            from,
+            to: None,
+            nonce,
+            value: alloy::primitives::U256::ZERO,
+            gas_limit: 21_000,
+            fees: bloom_mempool::TxFees::Legacy { gas_price: 1 },
+            input: alloy::primitives::Bytes::new(),
+            observed_at: std::time::SystemTime::now(),
+        }
+    }
+
+    /// PR #283 follow-on: `pending_external.jsonl` and `nonce_conflicts.json`
+    /// live under every numbered account, each reading that account's EVM
+    /// address from the mempool and that account's own outbox entries only.
+    /// Account 1's sent tx seen in the mempool is its own, not external; a
+    /// foreign tx at its other sent nonce is external and a conflict; and
+    /// neither account's entries reach the other.
+    #[tokio::test]
+    async fn mempool_views_follow_the_indexed_accounts_evm_key() {
+        let f = make_handler_with_chain(true);
+        let (projection, evm0, evm1) = two_account_projection(&f);
+        let addr0 = f.wallet_addr;
+        let addr1 = Address::repeat_byte(0x22);
+        let hash = |byte| format!("{:?}", alloy::primitives::B256::repeat_byte(byte));
+        let (foreign_hash, own_hash) = (hash(0x02), hash(0x04));
+        seed_pending_with_created_ms(&f, "from-account-zero", 2_000);
+        seed_sent_from(&f, "account-one-seen", &evm1, 7, &hash(0x03));
+        seed_sent_from(&f, "account-one-displaced", &evm1, 8, &own_hash);
+
+        // The index holds one tx per (from, nonce).
+        let index = bloom_mempool::PendingTxIndex::new(8);
+        index.insert(mempool_tx(0x01, addr0, 0));
+        index.insert(mempool_tx(0x03, addr1, 7));
+        index.insert(mempool_tx(0x02, addr1, 8));
+        let mut handler = f
+            .handler
+            .clone()
+            .with_mempool_indexes(std::collections::BTreeMap::from([(
+                "anvil".to_string(),
+                index,
+            )]));
+        handler.wallet_projections = Some(projection);
+        let w = &f.wallet_name;
+
+        for (account, address, expected) in
+            [(0, addr0, hash(0x01)), (1, addr1, foreign_hash.clone())]
+        {
+            let chain_dir = vfs(format!("/{w}/{account}/chains/anvil"));
+            let names: Vec<String> = handler
+                .list(&chain_dir)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|entry| entry.name)
+                .collect();
+            for leaf in ["pending_external.jsonl", "nonce_conflicts.json"] {
+                assert!(
+                    names.iter().any(|name| name == leaf),
+                    "account {account} must list {leaf}: {names:?}"
+                );
+                let entry = handler
+                    .lookup(&vfs(format!("/{w}/{account}/chains/anvil/{leaf}")))
+                    .await
+                    .unwrap();
+                assert_eq!(entry.mode, 0o444, "{leaf} is read-only");
+            }
+
+            let body = handler
+                .read(&vfs(format!(
+                    "/{w}/{account}/chains/anvil/pending_external.jsonl"
+                )))
+                .await
+                .unwrap();
+            let txs: Vec<serde_json::Value> = body
+                .split(|byte| *byte == b'\n')
+                .filter(|line| !line.is_empty())
+                .map(|line| serde_json::from_slice(line).unwrap())
+                .collect();
+            assert_eq!(txs.len(), 1, "account {account}: {txs:?}");
+            assert_eq!(txs[0]["hash"], serde_json::json!(expected));
+            assert_eq!(
+                txs[0]["from"].as_str().unwrap().to_lowercase(),
+                format!("{address:?}").to_lowercase()
+            );
+        }
+
+        for (account, expected) in [
+            (
+                0,
+                serde_json::json!({
+                    "address": evm0,
+                    "observed_nonces": [0],
+                    "outbox_pending_nonces": [0],
+                    "outbox_sent_nonces": [],
+                    "conflicts": [],
+                }),
+            ),
+            (
+                1,
+                serde_json::json!({
+                    "address": evm1,
+                    "observed_nonces": [7, 8],
+                    "outbox_pending_nonces": [],
+                    "outbox_sent_nonces": [7, 8],
+                    "conflicts": [{
+                        "nonce": 8,
+                        "mempool_hash": foreign_hash,
+                        "outbox_hash": own_hash,
+                    }],
+                }),
+            ),
+        ] {
+            let body = handler
+                .read(&vfs(format!(
+                    "/{w}/{account}/chains/anvil/nonce_conflicts.json"
+                )))
+                .await
+                .unwrap();
+            let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(value, expected, "account {account}");
+        }
+    }
+
+    /// The mempool views exist only under a numbered account's EVM chain:
+    /// the wallet root has no `chains/` alias and no bare leaves, and a
+    /// Solana chain never routes them through the account's EVM key.
+    #[tokio::test]
+    async fn mempool_views_are_absent_at_wallet_root_and_on_solana_chains() {
+        let f = make_handler_with_chain(true);
+        let (projection, _evm0, _evm1) = two_account_projection(&f);
+        let (engine, _outbox) = solana_engine_fixture(&f._tmp);
+        let mut handler = f.handler.clone();
+        handler.wallet_projections = Some(projection);
+        handler = handler.with_solana(std::collections::BTreeMap::from([(
+            "solana-devnet".to_string(),
+            std::sync::Arc::new(engine),
+        )]));
+        let w = &f.wallet_name;
+
+        let root: Vec<String> = handler
+            .list(&vfs(format!("/{w}")))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect();
+        for leaf in ["pending_external.jsonl", "nonce_conflicts.json"] {
+            assert!(
+                !root.iter().any(|name| name == leaf),
+                "wallet root must not list {leaf}: {root:?}"
+            );
+            for path in [
+                format!("/{w}/{leaf}"),
+                format!("/{w}/chains/anvil/{leaf}"),
+                format!("/{w}/0/chains/solana-devnet/{leaf}"),
+            ] {
+                assert!(
+                    matches!(
+                        handler.lookup(&vfs(path.clone())).await,
+                        Err(HandlerError::NotFound(_))
+                    ),
+                    "{path} must not resolve"
+                );
+                assert!(
+                    handler.read(&vfs(path.clone())).await.is_err(),
+                    "{path} must not read"
+                );
+            }
+        }
+        let solana: Vec<String> = handler
+            .list(&vfs(format!("/{w}/0/chains/solana-devnet")))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect();
+        assert!(
+            !solana
+                .iter()
+                .any(|name| name == "pending_external.jsonl" || name == "nonce_conflicts.json"),
+            "a Solana chain has no EVM mempool views: {solana:?}"
+        );
+    }
+
     /// A rootless wallet whose inventory is `accounts_unavailable` has no
     /// numbered tree, and chains live nowhere else: there is no wallet-root
     /// `chains/` fallback to read or stage through, so nothing is exposed
