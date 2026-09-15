@@ -309,6 +309,7 @@ const PREINSTALLED_TOLLY: PreinstalledPetal = PreinstalledPetal {
     release_sequence: 0,
     predecessor_package_hashes: &[],
     authority_routes: &[],
+    setup: None,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
