@@ -20,13 +20,13 @@ downgrade_floor = 1
 
 [protocols.machine_broker]
 major = 1
-minor_min = 4
-minor_max = 4
+minor_min = 6
+minor_max = 6
 
 [protocols.broker_signer]
 major = 1
-minor_min = 4
-minor_max = 4
+minor_min = 5
+minor_max = 5
 
 [protocols.signer_control]
 major = 1
@@ -42,7 +42,7 @@ minor_max = 1
 machine = "0.2.1"
 broker = "0.1.0"
 signer = "0.1.0"
-backends = ["local", "aws-kms"]
+backends = ["local"]
 algorithms = ["ed25519", "secp256k1", "p256"]
 
 [unsupported]
