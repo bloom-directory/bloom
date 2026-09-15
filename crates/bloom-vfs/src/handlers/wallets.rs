@@ -4938,6 +4938,30 @@ mod tests {
         assert_eq!(one, ["from-account-one"]);
     }
 
+    /// The installer catalog that authorizes Machine EVM outbox signing.
+    fn evm_outbox_catalog() -> bloom_broker_api::ProvenanceCatalog {
+        bloom_broker_api::ProvenanceCatalog {
+            schema: bloom_broker_api::PROVENANCE_CATALOG_SCHEMA.into(),
+            records: vec![bloom_broker_api::ProvenanceRecord {
+                subject: bloom_broker_api::ProvenanceSubject::System {
+                    component_id: bloom_broker_api::Token::new("bloom-machine").unwrap(),
+                    operation_class: bloom_broker_api::Token::new("transaction.confirm").unwrap(),
+                },
+                publisher: bloom_broker_api::Token::new("bloom-installer").unwrap(),
+                petal_lineage: None,
+                operation_classes: vec![bloom_broker_api::ProvenanceOperationClass {
+                    operation_class: bloom_broker_api::Token::new("transaction.confirm").unwrap(),
+                    fee_asset: Some(bloom_broker_api::ProvenanceFeeAsset {
+                        chain: bloom_broker_api::Token::new("ethereum").unwrap(),
+                        asset: "native".into(),
+                    }),
+                }],
+                installer_key_id: bloom_broker_api::Token::new("installer-key").unwrap(),
+                installer_signature: bloom_broker_api::Base64UrlBytes::from_bytes(&[11; 64]),
+            }],
+        }
+    }
+
     /// The S4 regression: a write under account 0 to `confirm`,
     /// `confirm.override`, `replace`, or `cancel` on another account's
     /// entry returns NotFound and issues no Broker request of any kind —
@@ -4972,36 +4996,7 @@ mod tests {
             TxEngine::new(Outbox::new(f._tmp.path().join("outbox")).unwrap(), 60_000)
                 .with_triad_signing(
                     MachineBrokerClient::new(broker.clone()),
-                    bloom_broker_api::ProvenanceCatalog {
-                        schema: bloom_broker_api::PROVENANCE_CATALOG_SCHEMA.into(),
-                        records: vec![bloom_broker_api::ProvenanceRecord {
-                            subject: bloom_broker_api::ProvenanceSubject::System {
-                                component_id: bloom_broker_api::Token::new("bloom-machine")
-                                    .unwrap(),
-                                operation_class: bloom_broker_api::Token::new(
-                                    "transaction.confirm",
-                                )
-                                .unwrap(),
-                            },
-                            publisher: bloom_broker_api::Token::new("bloom-installer").unwrap(),
-                            petal_lineage: None,
-                            operation_classes: vec![bloom_broker_api::ProvenanceOperationClass {
-                                operation_class: bloom_broker_api::Token::new(
-                                    "transaction.confirm",
-                                )
-                                .unwrap(),
-                                fee_asset: Some(bloom_broker_api::ProvenanceFeeAsset {
-                                    chain: bloom_broker_api::Token::new("ethereum").unwrap(),
-                                    asset: "native".into(),
-                                }),
-                            }],
-                            installer_key_id: bloom_broker_api::Token::new("installer-key")
-                                .unwrap(),
-                            installer_signature: bloom_broker_api::Base64UrlBytes::from_bytes(
-                                &[11; 64],
-                            ),
-                        }],
-                    },
+                    evm_outbox_catalog(),
                 )
                 .unwrap();
         let w = &f.wallet_name;
@@ -5268,6 +5263,207 @@ value = "0""#
                 .unwrap();
             assert_eq!(sink.mode, 0o644, "{path}/restage must be writable");
         }
+    }
+
+    fn solana_fixture_fingerprint(byte: u8) -> String {
+        use sha2::Digest as _;
+        let mut spki = vec![
+            0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
+        ];
+        spki.extend_from_slice(&[byte; 32]);
+        bloom_broker_api::Digest32::from_bytes(sha2::Sha256::digest(&spki).into())
+            .as_str()
+            .to_owned()
+    }
+
+    /// Solana cancellation is a local outbox transition with no signature.
+    /// Solana cancellation is a local outbox transition with no signature.
+    /// Outbox writes are pinned to numbered account routes, so the `/0/`
+    /// spelling cancels account 0's unbroadcast entry, refuses another
+    /// account's entry, and refuses once a broadcast attempt is durable —
+    /// while a wallet-level write is denied before touching the outbox.
+    #[tokio::test]
+    async fn solana_cancel_uses_numbered_account_zero_while_wallet_level_writes_are_denied() {
+        use bloom_solana_tx::outbox::SolanaOutboxState;
+        use bloom_solana_tx::types::SolanaTxStatus;
+
+        let f = make_handler_with_chain(true);
+        let (projection, _evm0, _evm1) = two_account_projection(&f);
+        let fp0 = solana_fixture_fingerprint(0x20);
+        let fp1 = solana_fixture_fingerprint(0x21);
+        let (engine, outbox) = solana_engine_fixture(&f._tmp);
+        for id in ["numbered", "attempted"] {
+            seed_solana_entry(&outbox, id, &fp0, "Sol0", false);
+        }
+        seed_solana_entry(&outbox, "account-one", &fp1, "Sol1", false);
+        let attempted = outbox
+            .read_in_state(
+                "alice",
+                "solana-devnet",
+                "attempted",
+                SolanaOutboxState::Pending,
+            )
+            .unwrap();
+        outbox
+            .write_broadcast_attempt(&attempted, "signature", b"raw", 1)
+            .unwrap();
+        let mut handler = f.handler.clone();
+        handler.wallet_projections = Some(projection);
+        handler.broker = Some(MachineBrokerClient::new(Arc::new(StubBroker)));
+        handler = handler.with_solana(std::collections::BTreeMap::from([(
+            "solana-devnet".to_string(),
+            std::sync::Arc::new(engine),
+        )]));
+        let w = &f.wallet_name;
+        let numbered = format!("/{w}/0/chains/solana-devnet/outbox/pending");
+        let wallet_level = format!("/{w}/chains/solana-devnet/outbox/pending");
+
+        // The wallet-level spelling is denied before the outbox is read.
+        let denied = handler
+            .write(&vfs(format!("{wallet_level}/numbered/cancel")), b"cancel")
+            .await;
+        assert!(
+            matches!(denied, Err(HandlerError::PermissionDenied)),
+            "wallet-level cancel must be denied, got {denied:?}"
+        );
+        assert_eq!(
+            outbox
+                .read("alice", "solana-devnet", "numbered")
+                .unwrap()
+                .state,
+            SolanaOutboxState::Pending,
+            "a denied cancel must not mutate the entry"
+        );
+
+        // The numbered spelling cancels the unbroadcast entry.
+        handler
+            .write(&vfs(format!("{numbered}/numbered/cancel")), b"cancel")
+            .await
+            .unwrap();
+        let cancelled = outbox.read("alice", "solana-devnet", "numbered").unwrap();
+        assert_eq!(cancelled.state, SolanaOutboxState::Failed);
+        assert_eq!(cancelled.staged.status, SolanaTxStatus::Cancelled);
+
+        // Another account's entry and a broadcast attempt are refused.
+        let other = handler
+            .write(&vfs(format!("{numbered}/account-one/cancel")), b"cancel")
+            .await;
+        assert!(
+            matches!(other, Err(HandlerError::NotFound(_))),
+            "another account's entry must not be cancellable, got {other:?}"
+        );
+        let broadcast = handler
+            .write(&vfs(format!("{numbered}/attempted/cancel")), b"cancel")
+            .await;
+        assert!(broadcast.is_err(), "{broadcast:?}");
+        for id in ["account-one", "attempted"] {
+            assert_eq!(
+                outbox.read("alice", "solana-devnet", id).unwrap().state,
+                SolanaOutboxState::Pending,
+                "{id}"
+            );
+        }
+    }
+
+    /// EVM cancel and replace produce new signatures, so they must stop at
+    /// Broker exact signing. Through the router, for both spellings of
+    /// account 0's route, with no signing edge and with one whose Broker
+    /// refuses to answer, neither control signs, broadcasts, or leaves action
+    /// artifacts. Account 1's entry is not addressable through account 0's
+    /// numbered route either. The engine tests cover the approved path.
+    #[tokio::test]
+    async fn evm_cancel_and_replace_fail_closed_for_both_account_zero_spellings() {
+        let f = make_handler_with_chain(true);
+        let (projection, evm0, evm1) = two_account_projection(&f);
+        seed_pending_from(&f, "evm-zero", &evm0, 1_000);
+        seed_pending_from(&f, "evm-one", &evm1, 2_000);
+        let broker = approval_broker(Vec::new());
+        let mut without_signing = f.handler.clone().with_home_write_permit(Arc::new(
+            HomeWritePermit::acquire(&bloom_proto::HomeDir::at(f._tmp.path())).unwrap(),
+        ));
+        without_signing.wallet_projections = Some(projection);
+        without_signing.broker = Some(MachineBrokerClient::new(broker.clone()));
+        // Both shipped installer catalogs authorize these classes, so the
+        // Broker approval is what stands between the write and a signature.
+        let mut catalog = evm_outbox_catalog();
+        for class in ["transaction.cancel", "transaction.replace"] {
+            let mut record = catalog.records[0].clone();
+            record.subject = bloom_broker_api::ProvenanceSubject::System {
+                component_id: bloom_broker_api::Token::new("bloom-machine").unwrap(),
+                operation_class: bloom_broker_api::Token::new(class).unwrap(),
+            };
+            record.operation_classes = vec![bloom_broker_api::ProvenanceOperationClass {
+                operation_class: bloom_broker_api::Token::new(class).unwrap(),
+                fee_asset: None,
+            }];
+            catalog.records.push(record);
+        }
+        let mut with_signing = without_signing.clone();
+        with_signing.tx_engine =
+            TxEngine::new(Outbox::new(f._tmp.path().join("outbox")).unwrap(), 60_000)
+                .with_triad_signing(MachineBrokerClient::new(broker.clone()), catalog)
+                .unwrap();
+        let w = &f.wallet_name;
+        let replacement = br#"to = "0x0000000000000000000000000000000000000002"
+value = "0""#;
+
+        for handler in [&without_signing, &with_signing] {
+            // IPC writes and mount flushes both enter through the router.
+            let router = crate::Vfs::builder()
+                .mount("wallets", Arc::new(handler.clone()))
+                .build();
+            for prefix in [format!("/wallets/{w}"), format!("/wallets/{w}/0")] {
+                let pending = format!("{prefix}/chains/anvil/outbox/pending/evm-zero");
+                let cancel = router.write(&vfs(format!("{pending}/cancel")), b"y").await;
+                assert!(cancel.is_err(), "{pending}/cancel: {cancel:?}");
+                let replace = router
+                    .write(&vfs(format!("{pending}/replace")), replacement)
+                    .await;
+                assert!(replace.is_err(), "{pending}/replace: {replace:?}");
+            }
+            let other = router
+                .write(
+                    &vfs(format!(
+                        "/wallets/{w}/0/chains/anvil/outbox/pending/evm-one/cancel"
+                    )),
+                    b"y",
+                )
+                .await;
+            assert!(
+                matches!(other, Err(HandlerError::NotFound(_))),
+                "account 1's entry must not be cancellable through account 0: {other:?}"
+            );
+        }
+
+        let outbox = &f.handler.tx_engine.outbox;
+        for id in ["evm-zero", "evm-one"] {
+            let entry = outbox
+                .read_in_state(w, "anvil", id, OutboxState::Pending)
+                .unwrap();
+            let artifacts: Vec<String> = std::fs::read_dir(&entry.dir)
+                .unwrap()
+                .map(|file| file.unwrap().file_name().to_string_lossy().into_owned())
+                .filter(|name| {
+                    name.contains("raw_tx")
+                        || name.contains("broadcast_attempted")
+                        || name.ends_with("_tx_hash")
+                        || name.ends_with("_intent.json")
+                })
+                .collect();
+            assert!(artifacts.is_empty(), "{id}: {artifacts:?}");
+        }
+        let requests = broker.requests.lock().unwrap();
+        assert!(
+            !requests.is_empty(),
+            "the signing edge must reach the Broker"
+        );
+        assert!(
+            !requests.iter().any(|request| matches!(
+                request,
+                MachineBrokerRequest::SigningSign(_) | MachineBrokerRequest::SigningSignBatch(_)
+            )),
+            "{requests:?}"
+        );
     }
 
     /// Account 0's Solana `new.tx` is pinned to account 0: a body
