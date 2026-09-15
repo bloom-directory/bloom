@@ -40,6 +40,65 @@ pub enum SolanaSignOutcome {
     },
 }
 
+/// Why one sign attempt failed, and what that means for the approval the
+/// attempt was carrying.
+///
+/// The distinction is the Broker's own error contract, not a local guess. An
+/// error whose contract says the request can never be retried and left no
+/// durable effect means no signature exists and never will under this
+/// approval: the caller may safely retire it and start a new attempt. Anything
+/// else — a possible provider effect, an unknown outcome, a transient fault,
+/// or a prior operation that still stands — must keep the approval, because
+/// abandoning it could authorize a second signature for one intent.
+#[derive(Debug, Clone)]
+pub struct SolanaSignError {
+    message: String,
+    approval_is_dead: bool,
+}
+
+impl SolanaSignError {
+    fn from_broker(error: &bloom_broker_api::ProtocolError) -> Self {
+        let contract = error.code.contract();
+        Self {
+            message: format!("{}: {}", error.code.as_str(), error.message),
+            approval_is_dead: contract.retry == bloom_broker_api::RetryClass::Never
+                && contract.durable_effect == bloom_broker_api::DurableEffect::None,
+        }
+    }
+
+    fn local(message: impl Into<String>) -> Self {
+        // A fault on this side of the wire never reached a decision, so the
+        // approval it was carrying is still whatever it was.
+        Self {
+            message: message.into(),
+            approval_is_dead: false,
+        }
+    }
+
+    /// True when the approval this attempt used can never produce a signature
+    /// and the caller should begin a new approval attempt.
+    pub fn approval_is_dead(&self) -> bool {
+        self.approval_is_dead
+    }
+}
+
+impl From<String> for SolanaSignError {
+    /// Every string error raised inside this module is a local encoding or
+    /// validation fault, not a Broker decision, so it leaves the approval
+    /// intact.
+    fn from(message: String) -> Self {
+        Self::local(message)
+    }
+}
+
+impl std::fmt::Display for SolanaSignError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for SolanaSignError {}
+
 /// The full set of inputs to [`SolanaTransferSigner::sign_transfer`].
 ///
 /// Grouped into one request so the signing call cannot silently transpose the
@@ -74,6 +133,10 @@ pub struct SignTransferRequest<'a> {
     pub issued_at_ms: u64,
     /// Approval expiry timestamp, in ms.
     pub expires_at_ms: u64,
+    /// Which approval attempt this is for the same transfer. Folded into the
+    /// approval intent so a retired approval's successor gets a distinct
+    /// operation id instead of colliding with the dead one.
+    pub approval_attempt: u32,
     /// Digest of the canonical staged-transfer plan facts.
     pub canonical_plan_facts_digest: Digest32,
 }
@@ -129,7 +192,7 @@ impl SolanaTransferSigner {
     pub async fn sign_transfer(
         &self,
         request: SignTransferRequest<'_>,
-    ) -> Result<SolanaSignOutcome, String> {
+    ) -> Result<SolanaSignOutcome, SolanaSignError> {
         let SignTransferRequest {
             wallet_id,
             fee_payer,
@@ -144,6 +207,7 @@ impl SolanaTransferSigner {
             approval_id,
             issued_at_ms,
             expires_at_ms,
+            approval_attempt,
             canonical_plan_facts_digest,
         } = request;
         let preimage = message_bytes.to_vec();
@@ -152,10 +216,14 @@ impl SolanaTransferSigner {
             .checked_add(fee_lamports)
             .ok_or_else(|| "Solana transfer value plus fee exceeds u64".to_owned())?;
         // These authority identities must survive the owner-ceremony retry
-        // and an unknown-result process restart. The immutable Solana message
-        // includes its recent blockhash, so domain-separated hashes are both
-        // collision resistant and unique to this staged transfer.
-        let request_nonce = deterministic_request_nonce(message_bytes);
+        // and an unknown-result process restart. The immutable message keeps
+        // this an Exact approval; the attempt suffix only prevents a new
+        // ceremony from reusing a definitively dead approval's identity.
+        let mut nonce_material = Vec::with_capacity(message_bytes.len() + 12);
+        nonce_material.extend_from_slice(&(message_bytes.len() as u64).to_be_bytes());
+        nonce_material.extend_from_slice(message_bytes);
+        nonce_material.extend_from_slice(&approval_attempt.to_be_bytes());
+        let request_nonce = deterministic_request_nonce(&nonce_material);
         let system_use_claim = SystemUseClaim {
             component_id: Token::new("bloom-machine").map_err(|e| e.to_string())?,
             action_class: Token::new(SOLANA_CONFIRM_ACTION_CLASS).map_err(|e| e.to_string())?,
@@ -203,7 +271,7 @@ impl SolanaTransferSigner {
             activation_mode: None,
             approval_operation_id: deterministic_operation_id(
                 SOLANA_APPROVAL_OPERATION_DOMAIN,
-                message_bytes,
+                &nonce_material,
             ),
             signing_operation_id: deterministic_operation_id(
                 SOLANA_SIGNING_OPERATION_DOMAIN,
@@ -232,7 +300,7 @@ impl SolanaTransferSigner {
             .broker
             .sign_exact_payload(request)
             .await
-            .map_err(|e| e.to_string())?
+            .map_err(|error| SolanaSignError::from_broker(&error))?
         {
             ExactPayloadSignOutcome::ApprovalRequired(prepared) => {
                 Ok(SolanaSignOutcome::ApprovalRequired {
@@ -244,10 +312,9 @@ impl SolanaTransferSigner {
             ExactPayloadSignOutcome::Signed(signing) => {
                 let signature = normalized_ed25519_signature(&signing)?;
                 if !verify_signature(fee_payer, message_bytes, &signature) {
-                    return Err(
-                        "Broker returned a signature that does not verify over the raw message"
-                            .into(),
-                    );
+                    return Err(SolanaSignError::local(
+                        "Broker returned a signature that does not verify over the raw message",
+                    ));
                 }
                 Ok(SolanaSignOutcome::Signed { signature })
             }
