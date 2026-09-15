@@ -129,13 +129,14 @@ fn release_compatibility_declares_each_edge_without_a_global_protocol_range() {
     // The API crates above must come from the revisions the manifest records.
     let lockfile = fs::read_to_string(workspace().join("Cargo.lock")).unwrap();
     for (package, repository, key) in [
-        ("bloom-broker-api", "bloom-broker", "broker_commit"),
-        ("bloom-signer-api", "bloom-signer", "signer_commit"),
+        ("bloom-broker-api", "bloom-broker.git", "broker_commit"),
+        ("bloom-signer-api", "bloom-signer.git", "signer_commit"),
         (
             "bloom-service-activation",
-            "bloom-service-runtime",
+            "bloom-service-runtime.git",
             "service_runtime_commit",
         ),
+        ("bloom-petal-contract", "petal", "petal_contract_commit"),
     ] {
         let revision = compatibility
             .lines()
@@ -143,7 +144,7 @@ fn release_compatibility_declares_each_edge_without_a_global_protocol_range() {
             .and_then(|tail| tail.strip_suffix('"'))
             .unwrap_or_else(|| panic!("compatibility lacks {key}"));
         let source = format!(
-            "source = \"git+https://github.com/bloom-directory/{repository}.git?rev={revision}#{revision}\""
+            "source = \"git+https://github.com/bloom-directory/{repository}?rev={revision}#{revision}\""
         );
         let locked = lockfile
             .split("[[package]]")
@@ -179,6 +180,92 @@ fn release_compatibility_declares_each_edge_without_a_global_protocol_range() {
     for component in ["machine", "broker", "signer"] {
         assert!(compatibility.contains(&format!("[state.{component}]")));
         assert!(compatibility.contains("downgrade_floor = 1"));
+    }
+}
+
+#[test]
+fn bundle_metadata_rejects_widened_authority_and_unreviewed_dependencies() {
+    // Exercise the verifier's actual metadata block without generating keys or
+    // running archive/installer code. Signature and archive tests are separate.
+    let verifier = fs::read_to_string(release_script("verify-bundle.sh")).unwrap();
+    let start = verifier
+        .find("compatibility=\"$payload/compatibility-v1.toml\"")
+        .unwrap();
+    let end = verifier
+        .find("platform_claim=\"$(<\"$payload/PLATFORM_CLAIM\")\"")
+        .unwrap();
+    let script = format!(
+        "set -euo pipefail\npayload=$1\nscript_dir=$2\n{}",
+        &verifier[start..end]
+    );
+    let original = fs::read_to_string(release_script("compatibility-v1.toml")).unwrap();
+    let revision = |key: &str| {
+        original
+            .lines()
+            .find_map(|line| line.strip_prefix(&format!("{key} = \"")))
+            .unwrap()
+            .trim_end_matches('"')
+            .to_owned()
+    };
+    let payload = tempfile::tempdir().unwrap();
+    fs::write(
+        payload.path().join("SOURCE_REVISIONS"),
+        format!(
+            "BLOOM_MACHINE_SHA={}\nBLOOM_BROKER_SHA={}\nBLOOM_SIGNER_SHA={}\n",
+            "11".repeat(20),
+            revision("broker_commit"),
+            revision("signer_commit")
+        ),
+    )
+    .unwrap();
+    let check = |candidate: &str, expected: Option<&str>| {
+        fs::write(payload.path().join("compatibility-v1.toml"), candidate).unwrap();
+        let output = Command::new("bash")
+            .arg("-c")
+            .arg(&script)
+            .arg("metadata-test")
+            .arg(payload.path())
+            .arg(release_script(""))
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        match expected {
+            None => assert!(output.status.success(), "{stderr}"),
+            Some(message) => {
+                assert_eq!(output.status.code(), Some(65), "{stderr}");
+                assert!(stderr.contains(message), "{stderr}");
+            }
+        }
+    };
+    check(&original, None);
+    for edge in ["machine_broker", "broker_signer"] {
+        let section = format!("[protocols.{edge}]\n");
+        let tail = original.split_once(&section).unwrap().1;
+        let block = tail.split("\n[").next().unwrap();
+        let widened = block
+            .lines()
+            .map(|line| {
+                if line.starts_with("minor_max = ") {
+                    "minor_max = 65535"
+                } else {
+                    line
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let candidate = original.replacen(
+            &format!("{section}{block}"),
+            &format!("{section}{widened}"),
+            1,
+        );
+        check(&candidate, Some(&format!("exact protocols.{edge} minor")));
+    }
+    for key in ["service_runtime_commit", "petal_contract_commit"] {
+        let candidate = original.replace(
+            &format!("{key} = \"{}\"", revision(key)),
+            &format!("{key} = \"{}\"", "ab".repeat(20)),
+        );
+        check(&candidate, Some(&format!("invalid revisions.{key}")));
     }
 }
 

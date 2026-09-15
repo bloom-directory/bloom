@@ -27,6 +27,10 @@ path never executes a Homebrew- or login-user-owned crypto implementation.
 
 `verify-bundle.sh` verifies the detached signature and both the outer and
 internal checksums before accepting the compatibility matrix or installers.
+Authority edges must declare an exact minor. Runtime and Petal-contract
+revisions must match the reviewed `compatibility-v1.toml` beside the verifier;
+use the verifier from the release being checked. The `triad_release` tests
+also bind those dependency pins to the resolved Cargo lockfile.
 Production verification accepts Linux ELF and macOS Mach-O bundles. The
 non-production `macos-unix-principals-w0` claim accepts Mach-O binaries only
 in its explicitly enabled disposable Darwin lane. The `test-unclaimed` marker requires the explicit

@@ -79,7 +79,7 @@ require_compat_value() {
 }
 # Each edge's range is owned by its API crate at the pinned revisions and is
 # compared there by the triad_release tests. The bundle must declare every
-# edge as one well-formed v1 range.
+# edge as one well-formed v1 range, with exact authority minors.
 for edge in machine_broker broker_signer signer_control session; do
   require_compat_value "protocols.$edge" major 1
   minor_min="$(compat_value "protocols.$edge" minor_min)"
@@ -89,6 +89,14 @@ for edge in machine_broker broker_signer signer_control session; do
     echo "bundle compatibility has invalid protocols.$edge range" >&2
     exit 65
   }
+  case "$edge" in
+    machine_broker|broker_signer)
+      ((minor_min == minor_max)) || {
+        echo "bundle compatibility requires an exact protocols.$edge minor" >&2
+        exit 65
+      }
+      ;;
+  esac
 done
 source_revision() {
   local key="$1" value
@@ -115,10 +123,14 @@ signer_revision="$(source_revision BLOOM_SIGNER_SHA)"
   exit 65
 }
 for dependency in service_runtime_commit petal_contract_commit; do
-  [[ "$(compat_value revisions "$dependency")" =~ ^\"[0-9a-f]{40}\"$ ]] || {
-    echo "bundle compatibility has invalid revisions.$dependency" >&2
+  # Use the verifier's reviewed matrix, never the candidate's own copy as
+  # evidence that its dependency revisions are supported by this release.
+  expected="$(compatibility="$script_dir/compatibility-v1.toml" compat_value revisions "$dependency")"
+  [[ "$expected" =~ ^\"[0-9a-f]{40}\"$ ]] || {
+    echo "verifier compatibility has invalid revisions.$dependency" >&2
     exit 65
   }
+  require_compat_value revisions "$dependency" "$expected"
 done
 for state_owner in machine broker signer; do
   require_compat_value "state.$state_owner" current 1
