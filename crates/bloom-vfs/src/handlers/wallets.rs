@@ -25,9 +25,9 @@
 //! - `wallets/<wallet>/chains/<chain>/outbox/sent/<id>/<file>`      — read sent
 //! - `wallets/<wallet>/chains/<chain>/outbox/failed/<id>/<file>`    — read failed
 //! - `wallets/<wallet>/<n>/account.json`                            — numbered account: both families' keys
-//! - `wallets/<wallet>/<n>/address.evm`                             — the account's EVM address (checksummed), if it has an EVM key
+//! - `wallets/<wallet>/<n>/address.evm`                             — the Broker-projected EVM address (checksummed), when present
 //! - `wallets/<wallet>/<n>/address.evm.qr.{svg,png}`                — scannable QR images of that address
-//! - `wallets/<wallet>/<n>/address.sol`                             — the account's Solana address, if it has a Solana key
+//! - `wallets/<wallet>/<n>/address.sol`                             — the Broker-projected Solana address, when present
 //! - `wallets/<wallet>/<n>/address.sol.qr.{svg,png}`                — scannable QR images of that address
 //! - `wallets/<wallet>/<n>/public_key`                              — canonical public key hex (EVM key, else Solana)
 //! - `wallets/<wallet>/<n>/chains/<chain>/...`                      — the chain views above, re-rooted at account n's key
@@ -2327,6 +2327,74 @@ fn integrity(detail: &str) -> HandlerError {
     ))
 }
 
+/// The Broker-projected address for this account's derivation family.
+///
+/// Addresses are authority data: the Machine may validate and consume them,
+/// but it must not manufacture one from `canonical_public_key` when the
+/// Broker did not project one. Multiple network projections are acceptable
+/// only when they agree on the family's network-independent address.
+fn projected_family_address(
+    account: &bloom_broker_api::DerivedAccountPublic,
+) -> Result<Option<&str>, HandlerError> {
+    let (family, expected_encoding) = match account.derivation_profile {
+        bloom_broker_api::DerivationProfile::Bip44EvmSecp256k1V1 => {
+            ("evm", bloom_broker_api::AddressEncoding::Hex0x)
+        }
+        bloom_broker_api::DerivationProfile::Bip44SolanaSlip10Ed25519V1 => {
+            ("solana", bloom_broker_api::AddressEncoding::Base58)
+        }
+    };
+    let mut projections = account
+        .chain_projections
+        .iter()
+        .filter(|projection| projection.chain_family.as_str() == family);
+    let Some(first) = projections.next() else {
+        return Ok(None);
+    };
+    if first.address_encoding != expected_encoding {
+        return Err(integrity(&format!(
+            "{family} chain projection uses the wrong address encoding"
+        )));
+    }
+    for projection in projections {
+        if projection.address_encoding != expected_encoding {
+            return Err(integrity(&format!(
+                "{family} chain projection uses the wrong address encoding"
+            )));
+        }
+        let agrees = match account.derivation_profile {
+            bloom_broker_api::DerivationProfile::Bip44EvmSecp256k1V1 => {
+                projection.address.eq_ignore_ascii_case(&first.address)
+            }
+            bloom_broker_api::DerivationProfile::Bip44SolanaSlip10Ed25519V1 => {
+                projection.address == first.address
+            }
+        };
+        if !agrees {
+            return Err(integrity(&format!(
+                "{family} chain projections disagree on the account address"
+            )));
+        }
+    }
+    match account.derivation_profile {
+        bloom_broker_api::DerivationProfile::Bip44EvmSecp256k1V1 => {
+            first
+                .address
+                .parse::<alloy::primitives::Address>()
+                .map_err(|error| integrity(&format!("invalid projected EVM address: {error}")))?;
+        }
+        bloom_broker_api::DerivationProfile::Bip44SolanaSlip10Ed25519V1 => {
+            let bytes = bs58::decode(&first.address).into_vec().map_err(|error| {
+                integrity(&format!("invalid projected Solana address: {error}"))
+            })?;
+            if bytes.len() != 32 {
+                return Err(integrity("projected Solana address is not 32 bytes"));
+            }
+        }
+    }
+    Ok(Some(first.address.as_str()))
+}
+
 /// The child's canonical BIP-39 Solana derivation path, from its `KeyRef`.
 ///
 /// Deliberately read from the `KeyRef` rather than the projection's `path`
@@ -2399,21 +2467,18 @@ impl SolanaAccount {
 
         let mut pubkey = [0_u8; 32];
         pubkey.copy_from_slice(&spki[Self::ED25519_SPKI_PREFIX.len()..]);
-        let address = bs58::encode(pubkey).into_string();
-
-        // A chain projection is present only when the Broker has a matching
-        // configured projection target, so absence is a configuration state
-        // rather than corruption. When one *is* projected, its address must
-        // agree with the key we derived the address from.
-        for projection in &account.chain_projections {
-            if projection.address_encoding == bloom_broker_api::AddressEncoding::Base58
-                && projection.address != address
-            {
-                return Err(integrity(&format!(
-                    "chain projection address '{}' does not match the derived account address '{}'",
-                    projection.address, address
-                )));
-            }
+        let address = projected_family_address(account)?
+            .ok_or_else(|| HandlerError::not_found("Solana child has no Broker-projected address"))?
+            .to_owned();
+        let projected_pubkey: [u8; 32] = bs58::decode(&address)
+            .into_vec()
+            .map_err(|error| integrity(&format!("invalid projected Solana address: {error}")))?
+            .try_into()
+            .map_err(|_| integrity("projected Solana address is not 32 bytes"))?;
+        if projected_pubkey != pubkey {
+            return Err(integrity(
+                "projected Solana address does not identify its canonical public key",
+            ));
         }
 
         Ok(Self {
@@ -2439,7 +2504,7 @@ fn is_public_solana_outbox_artifact(name: &str) -> bool {
 #[derive(Clone, Copy)]
 struct SolanaSender<'a> {
     fingerprint: &'a str,
-    address: &'a str,
+    address: Option<&'a str>,
 }
 
 /// A staged Solana transfer belongs to the account whose key it pinned.
@@ -2451,7 +2516,9 @@ fn solana_entry_belongs(
 ) -> bool {
     match staged.account_fingerprint.as_deref() {
         Some(fingerprint) => fingerprint == sender.fingerprint,
-        None => staged.fee_payer == sender.address,
+        None => sender
+            .address
+            .is_some_and(|address| staged.fee_payer == address),
     }
 }
 
@@ -2557,7 +2624,12 @@ impl Handler for WalletsHandler {
                     None => self.wallet_outbox_write_family(wallet, chain).await?,
                     Some(number) => self.account_evm_family(wallet, number, chain).await?,
                 };
-                self.require_staged_by(wallet, chain, id, scope.address())?;
+                let address = scope.address().ok_or_else(|| {
+                    HandlerError::not_found(format!(
+                        "account has no Broker-projected address for chain '{chain}'"
+                    ))
+                })?;
+                self.require_staged_by(wallet, chain, id, address)?;
                 let (_, policy) = self.planning_wallet_inputs(wallet, chain).await?;
                 let client = self
                     .chains
@@ -6486,6 +6558,7 @@ value = "0""#,
                 path: "m/44'/501'/0'/0'".into(),
             }),
         };
+        let address = bs58::encode(child_pubkey).into_string();
         bloom_broker_api::WalletAccountsPublic {
             wallet_id: token("alice"),
             seed_profile: bloom_broker_api::WalletSeedProfile::Bip39MulticurveV1,
@@ -6500,7 +6573,13 @@ value = "0""#,
                     sha2::Sha256::digest(&child_spki).into(),
                 ),
                 supported_crypto_suites: vec![bloom_broker_api::CryptoSuite::Ed25519Message],
-                chain_projections: vec![],
+                chain_projections: vec![bloom_broker_api::ChainAccountProjection {
+                    chain_family: token("solana"),
+                    caip2: "solana:test".into(),
+                    caip10: format!("solana:test:{address}"),
+                    address,
+                    address_encoding: bloom_broker_api::AddressEncoding::Base58,
+                }],
                 lifecycle: bloom_broker_api::AccountLifecycleState::Active,
             }],
         }
@@ -6520,6 +6599,7 @@ value = "0""#,
                             0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
                         ];
                         child_spki.extend_from_slice(&self.child_pubkey);
+                        let address = bs58::encode(self.child_pubkey).into_string();
                         let child_key_ref = bloom_broker_api::KeyRef {
                             backend: bloom_broker_api::Token::new("local").unwrap(),
                             backend_instance: bloom_broker_api::Token::new("primary").unwrap(),
@@ -6558,7 +6638,16 @@ value = "0""#,
                                     supported_crypto_suites: vec![
                                         bloom_broker_api::CryptoSuite::Ed25519Message,
                                     ],
-                                    chain_projections: vec![],
+                                    chain_projections: vec![
+                                        bloom_broker_api::ChainAccountProjection {
+                                            chain_family: token("solana"),
+                                            caip2: "solana:test".into(),
+                                            caip10: format!("solana:test:{address}"),
+                                            address,
+                                            address_encoding:
+                                                bloom_broker_api::AddressEncoding::Base58,
+                                        },
+                                    ],
                                     lifecycle: bloom_broker_api::AccountLifecycleState::Active,
                                 }],
                             },
@@ -8096,18 +8185,44 @@ value = "0""#,
     }
 
     #[tokio::test]
-    async fn solana_address_file_does_not_require_a_chain_projection() {
-        let f = make_handler();
+    async fn address_files_require_broker_projections_for_both_families() {
+        let f = make_handler_with_chain(true);
         let w = f.wallet_name.clone();
-        let pubkey = [0xcc_u8; 32];
-        let expected = bs58::encode(pubkey).into_string();
+        let mut evm = derived_account(
+            bloom_broker_api::DerivationProfile::Bip44EvmSecp256k1V1,
+            "m/44'/60'/0'/0/0",
+            0x10,
+            &bloom_proto::checksum_address(&f.wallet_addr),
+        );
+        evm.chain_projections.clear();
+        let mut solana = solana_projection([0xcc_u8; 32]);
+        solana.chain_projections.clear();
         let mut handler = f.handler;
-        handler.wallet_projections = Some(bip39_projection(
-            f.wallet_addr,
-            vec![solana_projection(pubkey)],
-        ));
+        handler.wallet_projections = Some(bip39_projection(f.wallet_addr, vec![evm, solana]));
 
-        assert_family_address_files(&handler, &w, 0, "sol", &expected).await;
+        assert_no_family_address_files(&handler, &w, 0, "evm").await;
+        assert_no_family_address_files(&handler, &w, 0, "sol").await;
+        let account: serde_json::Value = serde_json::from_slice(
+            &handler
+                .read(&vfs(format!("/{w}/0/account.json")))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(account["evm"]["address"].is_null());
+        assert!(account["solana"]["address"].is_null());
+        handler
+            .read(&vfs(format!("/{w}/0/public_key")))
+            .await
+            .expect("the Broker-projected public key remains visible");
+        assert!(
+            handler
+                .list(&vfs(format!("/{w}/0/chains")))
+                .await
+                .unwrap()
+                .is_empty(),
+            "an account without projected addresses must not advertise chain views"
+        );
     }
 
     /// The wallet directory holds the numbered accounts and wallet-wide
@@ -9076,6 +9191,7 @@ value = "0""#,
         spki.extend_from_slice(&pubkey);
         let fingerprint =
             bloom_broker_api::Digest32::from_bytes(sha2::Sha256::digest(&spki).into());
+        let address = bs58::encode(pubkey).into_string();
         bloom_broker_api::DerivedAccountPublic {
             key_ref: bloom_broker_api::KeyRef {
                 backend: bloom_broker_api::Token::new("local").unwrap(),
@@ -9096,7 +9212,13 @@ value = "0""#,
             public_key_encoding: bloom_broker_api::PublicKeyEncoding::Ed25519SpkiDer,
             public_key_fingerprint: fingerprint,
             supported_crypto_suites: vec![bloom_broker_api::CryptoSuite::Ed25519Message],
-            chain_projections: vec![],
+            chain_projections: vec![bloom_broker_api::ChainAccountProjection {
+                chain_family: bloom_broker_api::Token::new("solana").unwrap(),
+                caip2: "solana:test".into(),
+                caip10: format!("solana:test:{address}"),
+                address,
+                address_encoding: bloom_broker_api::AddressEncoding::Base58,
+            }],
             lifecycle: bloom_broker_api::AccountLifecycleState::Active,
         }
     }
@@ -9111,6 +9233,13 @@ value = "0""#,
             SolanaAccount::from_projection(&solana_projection(pubkey)).is_ok(),
             "baseline projection should resolve"
         );
+
+        let mut missing = solana_projection(pubkey);
+        missing.chain_projections.clear();
+        assert!(matches!(
+            SolanaAccount::from_projection(&missing),
+            Err(HandlerError::NotFound(_))
+        ));
 
         // path recorded on the projection disagrees with the signing KeyRef
         let mut a = solana_projection(pubkey);
@@ -9137,7 +9266,29 @@ value = "0""#,
             address: bs58::encode([0x11_u8; 32]).into_string(),
             address_encoding: bloom_broker_api::AddressEncoding::Base58,
         }];
-        expect_integrity(&a, "does not match the derived account address");
+        expect_integrity(&a, "does not identify its canonical public key");
+
+        // EVM follows the same Broker-owned rule: network projections for
+        // one key may vary in CAIP-2, but never in account address.
+        let first = Address::repeat_byte(0x11);
+        let second = Address::repeat_byte(0x22);
+        let mut evm = derived_account(
+            bloom_broker_api::DerivationProfile::Bip44EvmSecp256k1V1,
+            "m/44'/60'/0'/0/0",
+            0x10,
+            &first.to_string(),
+        );
+        evm.chain_projections
+            .push(bloom_broker_api::ChainAccountProjection {
+                chain_family: bloom_broker_api::Token::new("evm").unwrap(),
+                caip2: "eip155:1".into(),
+                caip10: format!("eip155:1:{second}"),
+                address: second.to_string(),
+                address_encoding: bloom_broker_api::AddressEncoding::Hex0x,
+            });
+        assert!(
+            matches!(projected_family_address(&evm), Err(HandlerError::Backend(message)) if message.contains("projections disagree"))
+        );
 
         // wrong key spec / non-canonical encoding
         let mut a = solana_projection(pubkey);
