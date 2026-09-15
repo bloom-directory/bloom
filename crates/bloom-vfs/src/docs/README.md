@@ -62,7 +62,7 @@ Representative paths, relative to the mount:
 | NFT kind/owner | `chains/<chain>/contracts/<contract>/nft/{kind,owner_of/<token-id>}` |
 | ENS / price | `ens/<name>/address`, `prices/spot/eth.usd` |
 | Wallet identity | `wallets/<wallet>/{kind,projection.json,accounts.json}` |
-| Account key | `wallets/<wallet>/<n>/{account.json,address,addresses.json,public_key}` |
+| Account keys | `wallets/<wallet>/<n>/{account.json,address.evm,address.sol,public_key}` |
 | Solana account | `wallets/<wallet>/chains/<chain>/accounts/<full-fingerprint>/{address,balance,balance.raw,balance.json}` |
 | Solana status | `status/chains/<chain>/{status.json,slot,block_height}` |
 

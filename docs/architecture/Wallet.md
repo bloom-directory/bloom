@@ -88,14 +88,15 @@ wallets/<wallet>/
 ├── chains/<chain>/...                 # account 0's chain views and outbox
 ├── 0/
 │   ├── account.json                   # both families, with freshness
-│   ├── address, address.qr.{svg,png}  # display address (EVM when present)
-│   ├── addresses.json, public_key     # owner/signer + policy status; key hex
+│   ├── address.evm, address.evm.qr.*  # EVM address and QR files, when present
+│   ├── address.sol, address.sol.qr.*  # Solana address and QR files, when present
+│   ├── public_key                     # display-key public-key hex
 │   ├── chains/<chain>/...             # chain views and the outbox, this key's
 │   └── sessions/<petal>/<slot>/       # session.json + stop for derived keys
 └── policy.json, policy-updates/, sealed-approvals/   # wallet-wide
 ```
 
-Files that name one key (`address`, its QR images, `addresses.json`,
+Files that name one key (`address.evm`/`address.sol`, their QR images, and
 `public_key`) exist only under a numbered account; the wallet directory holds
 no key files. Installed Petals are mounted only at `/petals/<petal>/`, never
 under a wallet or account.

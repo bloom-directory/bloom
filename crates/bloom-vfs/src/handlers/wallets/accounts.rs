@@ -22,13 +22,19 @@
 use super::*;
 use bloom_broker_api::{AccountLifecycleState, DerivationProfile, DerivedAccountPublic};
 
-/// Files under `wallets/<w>/<n>/` that present the account's display key:
-/// its EVM key when it has one, otherwise its Solana key.
-pub const ACCOUNT_KEY_FILES: [&str; 5] = [
-    "address",
-    "address.qr.png",
-    "address.qr.svg",
-    "addresses.json",
+/// Every file under `wallets/<w>/<n>/` that presents one of the account's
+/// keys. Address files name their family: an account presents the
+/// `address.evm` files only when it holds an EVM key and the `address.sol`
+/// files only when it holds a Solana key; there is no family-less
+/// `address`. `public_key` presents the display key: the EVM key when the
+/// account has one, otherwise its Solana key.
+pub const ACCOUNT_KEY_FILES: [&str; 7] = [
+    "address.evm",
+    "address.evm.qr.png",
+    "address.evm.qr.svg",
+    "address.sol",
+    "address.sol.qr.png",
+    "address.sol.qr.svg",
     "public_key",
 ];
 
@@ -344,45 +350,55 @@ impl WalletsHandler {
             .map_err(|error| HandlerError::backend(format!("invalid projected address: {error}")))
     }
 
-    fn account_dir_entries() -> Vec<Entry> {
+    fn account_dir_entries(view: &AccountView) -> Vec<Entry> {
         let mut entries = vec![Entry::file("account.json")];
-        entries.extend(ACCOUNT_KEY_FILES.map(Entry::file));
+        entries.extend(
+            ACCOUNT_KEY_FILES
+                .into_iter()
+                .filter(|leaf| Self::key_file_key(view, leaf).is_some())
+                .map(Entry::file),
+        );
         entries.push(Entry::dir("chains"));
         entries.push(Entry::dir("sessions"));
         entries
     }
 
-    /// The key the account's [`ACCOUNT_KEY_FILES`] present, and its display
-    /// address (EVM checksummed). For account 0 this is the wallet's primary
-    /// key: the canonical initial EVM child, or a root key in its own family.
-    fn display_key(view: &AccountView) -> Result<(&FamilyKey, String), HandlerError> {
-        if let Some(evm) = &view.evm {
-            let address = bloom_proto::checksum_address(&Self::evm_address(evm)?);
-            return Ok((evm, address));
+    /// The key one of the [`ACCOUNT_KEY_FILES`] presents, or `None` when the
+    /// file does not exist for this account: it names a family the account
+    /// holds no key for, or it is not a key file at all. For account 0 the
+    /// display key is the wallet's primary key: the canonical initial EVM
+    /// child, or a root key in its own family.
+    fn key_file_key<'a>(view: &'a AccountView, leaf: &str) -> Option<&'a FamilyKey> {
+        match leaf {
+            "address.evm" | "address.evm.qr.png" | "address.evm.qr.svg" => view.evm.as_ref(),
+            "address.sol" | "address.sol.qr.png" | "address.sol.qr.svg" => view.solana.as_ref(),
+            "public_key" => view.evm.as_ref().or(view.solana.as_ref()),
+            _ => None,
         }
-        let solana = view
-            .solana
-            .as_ref()
-            .ok_or_else(|| HandlerError::backend(format!("account {} has no key", view.number)))?;
-        Ok((solana, solana.address.clone()))
     }
 
-    async fn read_account_key_file(
-        &self,
-        wallet: &str,
-        view: &AccountView,
-        leaf: &str,
-    ) -> Result<Vec<u8>, HandlerError> {
-        let (key, address) = Self::display_key(view)?;
-        match leaf {
-            "address" => Ok(format!("{address}\n").into_bytes()),
-            "address.qr.svg" => render_address_qr_svg(&address),
-            "address.qr.png" => render_address_qr_png(&address),
-            "public_key" => Ok(format!("0x{}\n", hex::encode(&key.public_key)).into_bytes()),
-            "addresses.json" => {
-                let projection = self.wallet_projection(wallet).await?;
-                self.projection_addresses_json(&projection, view.number, &address)
-            }
+    fn read_account_key_file(view: &AccountView, leaf: &str) -> Result<Vec<u8>, HandlerError> {
+        let key = Self::key_file_key(view, leaf).ok_or_else(|| {
+            HandlerError::not_found(format!("account {} has no {leaf}", view.number))
+        })?;
+        if leaf == "public_key" {
+            return Ok(format!("0x{}\n", hex::encode(&key.public_key)).into_bytes());
+        }
+        // An EVM address displays checksummed; a Solana address as projected.
+        let (address, form) = match leaf.strip_prefix("address.evm") {
+            Some(form) => (
+                bloom_proto::checksum_address(&Self::evm_address(key)?),
+                form,
+            ),
+            None => (
+                key.address.clone(),
+                leaf.strip_prefix("address.sol").unwrap_or(leaf),
+            ),
+        };
+        match form {
+            "" => Ok(format!("{address}\n").into_bytes()),
+            ".qr.svg" => render_address_qr_svg(&address),
+            ".qr.png" => render_address_qr_png(&address),
             _ => Err(HandlerError::NotAFile(leaf.to_owned())),
         }
     }
@@ -433,7 +449,7 @@ impl WalletsHandler {
                 let sessions = self.account_sessions(wallet, &view)?;
                 Self::lookup_account_session(&sessions, sessions_rest)
             }
-            [leaf] if leaf == "account.json" || ACCOUNT_KEY_FILES.contains(&leaf.as_str()) => {
+            [leaf] if leaf == "account.json" || Self::key_file_key(&view, leaf).is_some() => {
                 Ok(Entry::file(leaf))
             }
             [dir] if dir == "chains" => Ok(Entry::dir("chains")),
@@ -462,7 +478,7 @@ impl WalletsHandler {
         match rest {
             [leaf] if leaf == "account.json" => self.account_json(wallet, &view),
             [leaf] if ACCOUNT_KEY_FILES.contains(&leaf.as_str()) => {
-                self.read_account_key_file(wallet, &view, leaf).await
+                Self::read_account_key_file(&view, leaf)
             }
             [dir, mount, slot, leaf] if dir == "sessions" && leaf == "session.json" => {
                 let sessions = self.account_sessions(wallet, &view)?;
@@ -495,7 +511,7 @@ impl WalletsHandler {
     ) -> Result<Vec<Entry>, HandlerError> {
         let view = self.account_view(wallet, number).await?;
         match rest {
-            [] => Ok(Self::account_dir_entries()),
+            [] => Ok(Self::account_dir_entries(&view)),
             [dir] if dir == "sessions" => {
                 let sessions = self.account_sessions(wallet, &view)?;
                 let mounts: std::collections::BTreeSet<&str> = sessions

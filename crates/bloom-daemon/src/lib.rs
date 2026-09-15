@@ -5649,7 +5649,7 @@ mod tests {
         }
 
         async fn read(&self, path: &VfsPath) -> Result<Vec<u8>, bloom_vfs::handler::HandlerError> {
-            if path.segments().last().map(String::as_str) == Some("address") {
+            if path.segments().last().map(String::as_str) == Some("address.evm") {
                 Ok(b"0x0000000000000000000000000000000000000001\n".to_vec())
             } else {
                 Ok(b"owner-only-launch-token".to_vec())
@@ -5660,7 +5660,7 @@ mod tests {
             &self,
             _path: &VfsPath,
         ) -> Result<Vec<Entry>, bloom_vfs::handler::HandlerError> {
-            Ok(vec![Entry::file("address")])
+            Ok(vec![Entry::file("address.evm")])
         }
 
         async fn write(
@@ -6794,9 +6794,14 @@ mod tests {
             "normalized denied writes must never reach WalletsHandler"
         );
 
-        let adjacent = guest.vfs_read("wallets/alice/0/address").await.unwrap();
+        let adjacent = guest.vfs_read("wallets/alice/0/address.evm").await.unwrap();
         assert_eq!(adjacent, b"0x0000000000000000000000000000000000000001\n");
-        assert!(guest.vfs_lookup("wallets/alice/0/address").await.is_ok());
+        assert!(
+            guest
+                .vfs_lookup("wallets/alice/0/address.evm")
+                .await
+                .is_ok()
+        );
         assert!(guest.vfs_list("wallets/alice").await.is_ok());
     }
 

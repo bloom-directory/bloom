@@ -323,7 +323,7 @@ async fn signer_wallet_is_visible_in_vfs_without_a_legacy_keystore_record() {
     assert!(root.iter().any(|entry| entry.name == "alice"));
     assert_eq!(
         handler
-            .read(&VfsPath::parse("/alice/0/address").unwrap())
+            .read(&VfsPath::parse("/alice/0/address.evm").unwrap())
             .await
             .unwrap(),
         b"0x0000000000000000000000000000000000000001\n"
@@ -375,18 +375,29 @@ async fn signer_wallet_is_visible_in_vfs_without_a_legacy_keystore_record() {
         stale_projections,
         temp.path().join("stale-machine-policy-projections"),
     );
-    let addresses: serde_json::Value = serde_json::from_slice(
+    let account: serde_json::Value = serde_json::from_slice(
         &stale_handler
-            .read(&VfsPath::parse("/alice/0/addresses.json").unwrap())
+            .read(&VfsPath::parse("/alice/0/account.json").unwrap())
             .await
             .unwrap(),
     )
     .unwrap();
-    assert_eq!(addresses["account"], 0);
-    assert_eq!(addresses["freshness"], "stale");
-    assert_eq!(addresses["policy_version"], "1");
-    assert_eq!(addresses["policy_digest"], expected_policy_digest.as_str());
-    assert_eq!(addresses["wallet_revocation_epoch"], "0");
+    assert_eq!(account["number"], 0);
+    assert_eq!(account["freshness"], "stale");
+    let projection: serde_json::Value = serde_json::from_slice(
+        &stale_handler
+            .read(&VfsPath::parse("/alice/projection.json").unwrap())
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(projection["freshness"], "stale");
+    assert_eq!(projection["wallet"]["policy_version"], "1");
+    assert_eq!(
+        projection["wallet"]["policy_digest"],
+        expected_policy_digest.as_str()
+    );
+    assert_eq!(projection["wallet"]["wallet_revocation_epoch"], "0");
     assert_eq!(
         stale_handler
             .read(&VfsPath::parse("/alice/policy.json").unwrap())

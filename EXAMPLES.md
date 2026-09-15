@@ -23,7 +23,7 @@ cat /bloom/prices/spot/eth.usd
 cat /bloom/status/daemon.json
 
 ls /bloom/wallets
-cat /bloom/wallets/alice/0/address
+cat /bloom/wallets/alice/0/address.evm
 cat /bloom/wallets/alice/0/public_key
 cat /bloom/wallets/alice/kind
 cat /bloom/wallets/alice/policy.json

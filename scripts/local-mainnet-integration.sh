@@ -333,7 +333,7 @@ printf '  mode:   %s\n\n' "$([ "$live" -eq 1 ] && printf LIVE || printf NON-SPEN
 
 wallet_kind="$(vcat "/wallets/${wallet}/kind" | tr -d '[:space:]')"
 [ "$wallet_kind" = "passkey" ] || die "VFS reports wallet kind '$wallet_kind', expected passkey"
-wallet_address="$(vcat "/wallets/${wallet}/0/address" | tr -d '[:space:]')"
+wallet_address="$(vcat "/wallets/${wallet}/0/address.evm" | tr -d '[:space:]')"
 printf 'Passkey wallet: %s (%s)\n' "$wallet" "$wallet_address"
 
 # A freshly registered wallet has no allowed Petal packages. Add only the
@@ -425,10 +425,10 @@ fixture_key_record_body="$(vcat "$fixture_key_record")"
 fixture_key_ref="$(printf '%s' "$fixture_key_record_body" | jq -ec '.public_key.key_ref')"
 fixture_provenance_digest="$(printf '%s' "$fixture_key_record_body" | jq -er '.provenance_digest')"
 fixture_agent_id="$(printf '%s' "$fixture_key_record_body" | jq -c '.scope.agent_id')"
-wallet_authority="$(vcat "/wallets/${wallet}/0/addresses.json")"
-policy_version="$(printf '%s' "$wallet_authority" | jq -er '.policy_version')"
-policy_digest="$(printf '%s' "$wallet_authority" | jq -er '.policy_digest')"
-wallet_revocation_epoch="$(printf '%s' "$wallet_authority" | jq -er '.wallet_revocation_epoch')"
+wallet_projection="$(vcat "/wallets/${wallet}/projection.json")"
+policy_version="$(printf '%s' "$wallet_projection" | jq -er '.wallet.policy_version')"
+policy_digest="$(printf '%s' "$wallet_projection" | jq -er '.wallet.policy_digest')"
+wallet_revocation_epoch="$(printf '%s' "$wallet_projection" | jq -er '.wallet.wallet_revocation_epoch')"
 for digest_value in "$fixture_provenance_digest" "$policy_digest"; do
   printf '%s' "$digest_value" | jq -R -e 'test("^[0-9a-f]{64}$")' >/dev/null ||
     die "mounted approval authority metadata contains a malformed digest"

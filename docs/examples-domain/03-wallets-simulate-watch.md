@@ -31,7 +31,7 @@ inputs belong only in the Broker-hosted ceremony.
 ### Per-wallet leaves
 
 ```sh
-cat /bloom/wallets/alice/0/address        # 0x... (EIP-55 checksum), account 0
+cat /bloom/wallets/alice/0/address.evm    # 0x... (EIP-55 checksum), account 0
 cat /bloom/wallets/alice/0/public_key     # 0x... canonical public key hex
 cat /bloom/wallets/alice/kind             # public backend/kind projection
 cat /bloom/wallets/alice/policy.json      # canonical Broker policy projection
@@ -65,7 +65,7 @@ chain-rooted reader at
 For example, alice's USDC balance on Base:
 
 ```sh
-ALICE=$(cat /bloom/wallets/alice/0/address)
+ALICE=$(cat /bloom/wallets/alice/0/address.evm)
 cat /bloom/chains/base/addresses/$ALICE/tokens/0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913/balance
 ```
 

@@ -110,11 +110,11 @@ attached to its request ID; write a new request ID to start another ceremony.
 ### Account keys and sessions
 
 The files that name one key live only beneath a numbered account:
-`wallets/<wallet>/<n>/address` (EVM checksummed, or the Solana address for a
-Solana-only account), `address.qr.svg`, `address.qr.png`, `public_key`, and
-`addresses.json` (that address as owner and signer, beside the wallet-wide
-policy status). The wallet directory itself has no `address` or `public_key`;
-read `wallets/<wallet>/0/address` for the canonical initial account.
+`wallets/<wallet>/<n>/address.evm` (EVM checksummed) and
+`address.sol`, each with `.qr.svg` and `.qr.png` variants when that family is
+present, plus `public_key` for the display key. The wallet directory itself
+has no account key files; read `wallets/<wallet>/0/address.evm` for the
+canonical initial EVM account.
 
 Every key a Petal derived from one of an account's family keys is mounted at
 `wallets/<wallet>/<n>/sessions/<petal>/<key-slot>/session.json`. It reports
