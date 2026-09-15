@@ -49,7 +49,7 @@ const SIGN_TTL_MS: u64 = 60_000;
 const APPROX_SLOT_MS: u128 = 400;
 
 /// A native SOL transfer intent as supplied by the write surface
-/// (`wallets/<wallet>/chains/<chain>/outbox/new.tx`).
+/// (`wallets/<wallet>/<index>/chains/<chain>/outbox/new.tx`).
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SolanaTransferIntent {

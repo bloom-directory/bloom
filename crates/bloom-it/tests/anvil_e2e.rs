@@ -89,7 +89,7 @@ async fn anvil_full_stage_confirm_flow() -> Result<()> {
     sleep(Duration::from_millis(250)).await;
 
     // 5. Verify the balance is reflected through the VFS.
-    let bal_path = VfsPath::parse("/wallets/alice/chains/anvil/balance").unwrap();
+    let bal_path = VfsPath::parse("/wallets/alice/0/chains/anvil/balance").unwrap();
     let bal_bytes = daemon
         .vfs
         .read(&bal_path)
@@ -117,7 +117,7 @@ async fn anvil_full_stage_confirm_flow() -> Result<()> {
         "usd_value_hint": "1",
     })
     .to_string();
-    let new_tx_path = VfsPath::parse("/wallets/alice/chains/anvil/outbox/new.tx").unwrap();
+    let new_tx_path = VfsPath::parse("/wallets/alice/0/chains/anvil/outbox/new.tx").unwrap();
     daemon
         .vfs
         .write(&new_tx_path, intent.as_bytes())
@@ -125,7 +125,7 @@ async fn anvil_full_stage_confirm_flow() -> Result<()> {
         .map_err(|e| anyhow!("stage write: {e}"))?;
 
     // Confirm a pending entry now exists.
-    let pending_dir = VfsPath::parse("/wallets/alice/chains/anvil/outbox/pending").unwrap();
+    let pending_dir = VfsPath::parse("/wallets/alice/0/chains/anvil/outbox/pending").unwrap();
     let entries = daemon
         .vfs
         .list(&pending_dir)
@@ -136,7 +136,7 @@ async fn anvil_full_stage_confirm_flow() -> Result<()> {
 
     // 7. Read plan.md and policy_check.json from the pending dir.
     let plan_path = VfsPath::parse(&format!(
-        "/wallets/alice/chains/anvil/outbox/pending/{pending_id}/plan.md"
+        "/wallets/alice/0/chains/anvil/outbox/pending/{pending_id}/plan.md"
     ))
     .unwrap();
     let plan_bytes = daemon
@@ -148,7 +148,7 @@ async fn anvil_full_stage_confirm_flow() -> Result<()> {
     assert!(!plan.is_empty(), "plan.md is empty");
 
     let policy_path = VfsPath::parse(&format!(
-        "/wallets/alice/chains/anvil/outbox/pending/{pending_id}/policy_check.json"
+        "/wallets/alice/0/chains/anvil/outbox/pending/{pending_id}/policy_check.json"
     ))
     .unwrap();
     let policy_bytes = daemon
@@ -163,7 +163,7 @@ async fn anvil_full_stage_confirm_flow() -> Result<()> {
     // projection. Once the fixture reports the same approval active, retry
     // signs the exact EIP-1559 preimage through MachineBrokerClient.
     let confirm_path = VfsPath::parse(&format!(
-        "/wallets/alice/chains/anvil/outbox/pending/{pending_id}/confirm"
+        "/wallets/alice/0/chains/anvil/outbox/pending/{pending_id}/confirm"
     ))
     .unwrap();
     let confirm_body = "y\n";
@@ -177,7 +177,7 @@ async fn anvil_full_stage_confirm_flow() -> Result<()> {
     );
 
     let ceremony_path = VfsPath::parse(&format!(
-        "/wallets/alice/chains/anvil/outbox/pending/{pending_id}/ceremony.json"
+        "/wallets/alice/0/chains/anvil/outbox/pending/{pending_id}/ceremony.json"
     ))
     .unwrap();
     let ceremony_bytes = daemon
@@ -213,7 +213,7 @@ async fn anvil_full_stage_confirm_flow() -> Result<()> {
             .vfs
             .read(
                 &VfsPath::parse(&format!(
-                    "/wallets/alice/chains/anvil/outbox/sent/{pending_id}/ceremony.json"
+                    "/wallets/alice/0/chains/anvil/outbox/sent/{pending_id}/ceremony.json"
                 ))
                 .unwrap(),
             )
@@ -235,7 +235,7 @@ async fn anvil_full_stage_confirm_flow() -> Result<()> {
     );
 
     // 9. Verify the entry now lives in `sent/` with a tx_hash artefact.
-    let sent_dir = VfsPath::parse("/wallets/alice/chains/anvil/outbox/sent").unwrap();
+    let sent_dir = VfsPath::parse("/wallets/alice/0/chains/anvil/outbox/sent").unwrap();
     let sent_entries = daemon
         .vfs
         .list(&sent_dir)
@@ -248,7 +248,7 @@ async fn anvil_full_stage_confirm_flow() -> Result<()> {
     );
 
     let tx_hash_path = VfsPath::parse(&format!(
-        "/wallets/alice/chains/anvil/outbox/sent/{pending_id}/tx_hash"
+        "/wallets/alice/0/chains/anvil/outbox/sent/{pending_id}/tx_hash"
     ))
     .unwrap();
     let tx_hash_bytes = daemon
@@ -264,7 +264,7 @@ async fn anvil_full_stage_confirm_flow() -> Result<()> {
 
     // intent.json should reflect Sent status with a tx_hash.
     let intent_path = VfsPath::parse(&format!(
-        "/wallets/alice/chains/anvil/outbox/sent/{pending_id}/intent.json"
+        "/wallets/alice/0/chains/anvil/outbox/sent/{pending_id}/intent.json"
     ))
     .unwrap();
     let intent_bytes = daemon
@@ -334,14 +334,14 @@ async fn anvil_confirm_refuses_nonce_gap() -> Result<()> {
         "nonce": 5,
     })
     .to_string();
-    let new_tx_path = VfsPath::parse("/wallets/alice/chains/anvil/outbox/new.tx").unwrap();
+    let new_tx_path = VfsPath::parse("/wallets/alice/0/chains/anvil/outbox/new.tx").unwrap();
     daemon
         .vfs
         .write(&new_tx_path, intent.as_bytes())
         .await
         .map_err(|e| anyhow!("stage write: {e}"))?;
 
-    let pending_dir = VfsPath::parse("/wallets/alice/chains/anvil/outbox/pending").unwrap();
+    let pending_dir = VfsPath::parse("/wallets/alice/0/chains/anvil/outbox/pending").unwrap();
     let entries = daemon
         .vfs
         .list(&pending_dir)
@@ -353,7 +353,7 @@ async fn anvil_confirm_refuses_nonce_gap() -> Result<()> {
     // The nonce gap is a deterministic pre-signing failure. It must be denied
     // before Machine creates a Broker ceremony or dispatches a signing request.
     let confirm_path = VfsPath::parse(&format!(
-        "/wallets/alice/chains/anvil/outbox/pending/{pending_id}/confirm"
+        "/wallets/alice/0/chains/anvil/outbox/pending/{pending_id}/confirm"
     ))
     .unwrap();
     let gap_confirm = daemon.vfs.write(&confirm_path, b"y\n").await;
@@ -364,7 +364,7 @@ async fn anvil_confirm_refuses_nonce_gap() -> Result<()> {
         "expected a nonce-gap refusal, got: {err}"
     );
     let ceremony_path = VfsPath::parse(&format!(
-        "/wallets/alice/chains/anvil/outbox/pending/{pending_id}/ceremony.json"
+        "/wallets/alice/0/chains/anvil/outbox/pending/{pending_id}/ceremony.json"
     ))
     .unwrap();
     assert!(
@@ -373,7 +373,7 @@ async fn anvil_confirm_refuses_nonce_gap() -> Result<()> {
     );
 
     // The entry stays pending (never sent), with a machine-readable advisory.
-    let sent_dir = VfsPath::parse("/wallets/alice/chains/anvil/outbox/sent").unwrap();
+    let sent_dir = VfsPath::parse("/wallets/alice/0/chains/anvil/outbox/sent").unwrap();
     let sent = daemon
         .vfs
         .list(&sent_dir)
@@ -383,7 +383,7 @@ async fn anvil_confirm_refuses_nonce_gap() -> Result<()> {
     assert!(!sent, "gapped tx must not have been broadcast to sent/");
 
     let advisory_path = VfsPath::parse(&format!(
-        "/wallets/alice/chains/anvil/outbox/pending/{pending_id}/nonce_gap.json"
+        "/wallets/alice/0/chains/anvil/outbox/pending/{pending_id}/nonce_gap.json"
     ))
     .unwrap();
     let advisory: serde_json::Value = serde_json::from_slice(
