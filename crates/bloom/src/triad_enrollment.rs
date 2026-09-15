@@ -1528,10 +1528,12 @@ mod tests {
                 .contains(&"aa1c50d3443f4c1a710d0ce93a70a65d196fd5842d241e0f78260c8a019d811c")
         );
         // The release-pins path must agree with the developer-harness path:
-        // no catalogued class is fee-bearing, because Broker would then deny
-        // every `DeclaredFee::None` claim in it with `FEE_REQUIRED`. Assert
-        // it over the shared Hyperliquid class and Polymarket's relayer
-        // class explicitly, then over the catalog as a whole.
+        // no enrolled Petal class is fee-bearing, because Broker would then
+        // deny every `DeclaredFee::None` claim in it with `FEE_REQUIRED`.
+        // Assert it over the shared Hyperliquid class and Polymarket's
+        // relayer class explicitly, then over every Petal record. System
+        // records are out of scope: a native Solana transfer always pays a
+        // network fee, so its template class names one.
         let all_classes = catalog
             .records
             .iter()
@@ -1545,7 +1547,14 @@ mod tests {
             assert!(!matching.is_empty(), "{class} is absent from the catalog");
             assert!(matching.iter().all(|entry| entry.fee_asset.is_none()));
         }
-        assert!(all_classes.iter().all(|class| class.fee_asset.is_none()));
+        assert!(
+            catalog
+                .records
+                .iter()
+                .filter(|record| matches!(record.subject, ProvenanceSubject::Petal { .. }))
+                .flat_map(|record| record.operation_classes.iter())
+                .all(|class| class.fee_asset.is_none())
+        );
         for record in catalog.records {
             let mut unsigned = record.clone();
             let signature: [u8; 64] = unsigned.installer_signature.decode().try_into().unwrap();

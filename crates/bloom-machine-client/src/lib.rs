@@ -48,20 +48,20 @@ use bloom_audit_checkpoint::{
 use bloom_broker_api::{
     ActivationMode, ApprovalLifecycleState, ApprovalLimitState, ApprovalLimits,
     ApprovalPrepareRequest, ApprovalPublicStatus, ApprovalRenewRequest, ApprovalSelector,
-    ApprovalSubject, AssetId, BROKER_API_CURRENT, BROKER_API_RANGE, Base64UrlBytes,
-    CeremonyPublicStatus, CeremonyState, CredentialPublic, CryptoSuite, CustodyPrepareRequest,
-    CustodyPrepareResponse, CustodyResult, DecimalU64, DecimalU256, DeclaredFee,
-    DerivedAccountPublic, Digest32, IdRequest, KeyPublic, KeyRef, KeyRequest, KeyRole,
-    MachineBrokerRequest, MachineBrokerResponse, MachineBrokerService, MachineSignRequest,
-    OperationId, OperationPublicStatus, OperationRequest, PetalUseClaim, PolicyCommitReceipt,
-    PolicyCommitUpdateRequest, PolicyUpdatePrepareResponse, PolicyUpdateRequest, ProtocolError,
-    ProtocolErrorCode, ProvenanceCatalog, ProvenanceSubject, RequestNonce, RevocationState,
-    RevokeForKeyRequest, RevokeRequest, SealedApprovalPrepareResponse, SealedApprovalTerms,
-    SignedPolicySnapshot, SigningPayloads, SigningResult, SystemUseClaim, Token,
-    TypedRequestMethod, ValueLimit, WalletAccountsPublic, WalletOperationRequest, WalletPublic,
-    WalletRequest, is_read_only_method,
+    ApprovalSubject, BROKER_API_CURRENT, BROKER_API_RANGE, Base64UrlBytes, CeremonyPublicStatus,
+    CeremonyState, CredentialPublic, CryptoSuite, CustodyPrepareRequest, CustodyPrepareResponse,
+    CustodyResult, DecimalU64, DerivedAccountPublic, Digest32, IdRequest, KeyPublic, KeyRef,
+    KeyRequest, KeyRole, MachineBrokerRequest, MachineBrokerResponse, MachineBrokerService,
+    MachineSignRequest, OperationId, OperationPublicStatus, OperationRequest, PetalUseClaim,
+    PolicyCommitReceipt, PolicyCommitUpdateRequest, PolicyUpdatePrepareResponse,
+    PolicyUpdateRequest, ProtocolError, ProtocolErrorCode, ProvenanceCatalog, ProvenanceSubject,
+    RequestNonce, RevocationState, RevokeForKeyRequest, RevokeRequest,
+    SealedApprovalPrepareResponse, SealedApprovalTerms, SignedPolicySnapshot, SigningPayloads,
+    SigningResult, SystemUseClaim, Token, TypedRequestMethod, ValueLimit, WalletAccountsPublic,
+    WalletOperationRequest, WalletPublic, WalletRequest, is_read_only_method,
 };
 use bloom_triad_local_transport::{LocalIdentity, PeerAcl};
+use num_bigint::BigUint;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use sha3::Keccak256;
@@ -705,6 +705,73 @@ impl MachineBrokerClient {
         .await
     }
 
+    /// Exact and reusable Petal approvals bound the claim's declared value to
+    /// the approval so Broker-side debit accounting has a limit to check the
+    /// declared debits (and any declared fee) against. Amounts are summed per
+    /// asset without a narrower intermediate, as Broker accounts them; only a
+    /// total beyond the unsigned 256-bit range is refused.
+    fn petal_claim_value_limits(
+        claim: Option<&PetalUseClaim>,
+    ) -> Result<Vec<ValueLimit>, ProtocolError> {
+        let Some(claim) = claim else {
+            return Ok(Vec::new());
+        };
+        let overflow = || {
+            ProtocolError::fatal(
+                ProtocolErrorCode::ClaimInvalid,
+                "declared value exceeds the unsigned 256-bit approval limit range",
+            )
+        };
+        let fee = match &claim.declared_fee {
+            bloom_broker_api::DeclaredFee::Fee {
+                chain,
+                asset,
+                amount,
+            } => Some((chain, asset, amount)),
+            bloom_broker_api::DeclaredFee::None => None,
+        };
+        let declared = claim
+            .declared_debits
+            .iter()
+            .map(|debit| (&debit.asset.chain, &debit.asset.asset, &debit.amount))
+            .chain(fee);
+        let mut totals: Vec<(bloom_broker_api::AssetId, BigUint)> = Vec::new();
+        for (chain, asset, amount) in declared {
+            let amount: BigUint = amount.as_str().parse().map_err(|_| overflow())?;
+            let index = match totals
+                .iter()
+                .position(|(id, _)| &id.chain == chain && &id.asset == asset)
+            {
+                Some(index) => index,
+                None => {
+                    totals.push((
+                        bloom_broker_api::AssetId {
+                            chain: chain.clone(),
+                            asset: asset.clone(),
+                        },
+                        BigUint::default(),
+                    ));
+                    totals.len() - 1
+                }
+            };
+            let total = &mut totals[index].1;
+            *total += amount;
+            if total.bits() > 256 {
+                return Err(overflow());
+            }
+        }
+        totals
+            .into_iter()
+            .map(|(asset, total)| {
+                Ok(ValueLimit {
+                    asset,
+                    lifetime: bloom_broker_api::DecimalU256::parse(total.to_string())?,
+                    rolling_windows: Vec::new(),
+                })
+            })
+            .collect()
+    }
+
     /// Prepare or execute one exact payload-bearing Machine/CLI operation.
     ///
     /// The caller persists the returned approval ID and reuses the exact
@@ -871,9 +938,10 @@ impl MachineBrokerClient {
                 max_signatures: DecimalU64::new(1),
                 operation_rate_limits: Vec::new(),
                 signature_rate_limits: Vec::new(),
-                // Callers derive these: the VFS path from the Petal claim, and
-                // system transfers (Solana) from their own native debit.
-                value_limits: request.approval_value_limits,
+                value_limits: match request.petal_use_claim.as_ref() {
+                    Some(claim) => Self::petal_claim_value_limits(Some(claim))?,
+                    None => request.approval_value_limits,
+                },
             },
             activation_mode,
             wallet_revocation_epoch: wallet.wallet_revocation_epoch,
@@ -1044,7 +1112,7 @@ impl MachineBrokerClient {
                 max_signatures: DecimalU64::new(signature_count),
                 operation_rate_limits: Vec::new(),
                 signature_rate_limits: Vec::new(),
-                value_limits: value_limits_from_claim(request.petal_use_claim.as_ref())?,
+                value_limits: Self::petal_claim_value_limits(request.petal_use_claim.as_ref())?,
             },
             activation_mode,
             wallet_revocation_epoch: wallet.wallet_revocation_epoch,
@@ -1198,11 +1266,7 @@ impl MachineBrokerClient {
                 max_signatures: DecimalU64::new(signature_count),
                 operation_rate_limits: Vec::new(),
                 signature_rate_limits: Vec::new(),
-                // The claim is mandatory on this path and describes the whole
-                // batch, which is one operation. Leaving this empty made
-                // Broker deny any nonzero debit or fee with
-                // VALUE_ASSET_NOT_ALLOWED, since no asset was listed.
-                value_limits: value_limits_from_claim(Some(claim))?,
+                value_limits: Self::petal_claim_value_limits(Some(claim))?,
             },
             activation_mode,
             wallet_revocation_epoch: wallet.wallet_revocation_epoch,
@@ -2363,94 +2427,6 @@ fn default_activation_mode(key_ref: &KeyRef) -> ActivationMode {
     }
 }
 
-/// Sums two canonical non-negative base-10 integer strings (as produced by
-/// `DecimalU256`) without pulling in a big-integer dependency for grade
-/// school addition.
-fn add_decimal_strings(a: &str, b: &str) -> String {
-    let a = a.as_bytes();
-    let b = b.as_bytes();
-    let mut result = Vec::with_capacity(a.len().max(b.len()) + 1);
-    let mut carry = 0u8;
-    let mut ai = a.len();
-    let mut bi = b.len();
-    while ai > 0 || bi > 0 || carry > 0 {
-        let da = if ai > 0 {
-            ai -= 1;
-            a[ai] - b'0'
-        } else {
-            0
-        };
-        let db = if bi > 0 {
-            bi -= 1;
-            b[bi] - b'0'
-        } else {
-            0
-        };
-        let sum = da + db + carry;
-        result.push(b'0' + sum % 10);
-        carry = sum / 10;
-    }
-    result.reverse();
-    String::from_utf8(result).expect("ascii digits")
-}
-
-/// Derives an exact-payload approval's `value_limits` from the claim it
-/// signs. Safe because these approvals cover exactly one signature
-/// (`max_operations: 1`): the ceremony IS the review of this exact value, so
-/// echoing the claim's own debits/fee back as the limit adds no authority
-/// beyond what's already being signed.
-fn value_limits_from_claim(
-    claim: Option<&PetalUseClaim>,
-) -> Result<Vec<ValueLimit>, ProtocolError> {
-    let Some(claim) = claim else {
-        return Ok(Vec::new());
-    };
-    let mut limits: Vec<ValueLimit> = Vec::new();
-    // Two amounts that each parse as a `DecimalU256` can still sum past
-    // U256, so the sum is re-parsed rather than assumed canonical. Broker
-    // rejects the same overflow with `VALUE_OVERFLOW`; refusing here keeps
-    // that a protocol error instead of a panic in the Machine.
-    let mut add = |asset: AssetId, amount: &DecimalU256| -> Result<(), ProtocolError> {
-        let Some(existing) = limits.iter_mut().find(|limit| limit.asset == asset) else {
-            limits.push(ValueLimit {
-                asset,
-                lifetime: amount.clone(),
-                rolling_windows: Vec::new(),
-            });
-            return Ok(());
-        };
-        let sum = add_decimal_strings(existing.lifetime.as_str(), amount.as_str());
-        existing.lifetime = DecimalU256::parse(sum).map_err(|error| {
-            ProtocolError::new(
-                ProtocolErrorCode::ClaimInvalid,
-                format!(
-                    "claim value for {} exceeds u256: {error}",
-                    existing.asset.asset
-                ),
-            )
-        })?;
-        Ok(())
-    };
-    for debit in &claim.declared_debits {
-        add(debit.asset.clone(), &debit.amount)?;
-    }
-    if let DeclaredFee::Fee {
-        chain,
-        asset,
-        amount,
-    } = &claim.declared_fee
-    {
-        add(
-            AssetId {
-                chain: chain.clone(),
-                asset: asset.clone(),
-            },
-            amount,
-        )?;
-    }
-    Ok(limits)
-}
-
 /// Load the installer-owned public provenance catalog used to bind approval
 /// terms. Broker independently verifies every record signature before use.
 #[cfg(unix)]
@@ -2827,12 +2803,179 @@ mod tests {
     };
 
     use bloom_broker_api::{
-        ApprovalPrepareState, CeremonyKind, CustodyPrepareState, DeclaredFee, DerivationProfile,
-        DerivationRef, DerivedAccountRequest, KeySpec, NormalizedSignature, RequestNonce,
-        ServiceFuture, SignatureEncoding,
+        ApprovalPrepareState, AssetId, CeremonyKind, CustodyPrepareState, DecimalU256, DeclaredFee,
+        DerivationProfile, DerivationRef, DerivedAccountRequest, KeySpec, NormalizedSignature,
+        RequestNonce, ServiceFuture, SignatureEncoding,
     };
     use ed25519_dalek::SigningKey;
     use tracing_subscriber::prelude::*;
+
+    #[test]
+    fn petal_claim_value_limits_sum_debits_and_fee_per_asset() {
+        let claim: PetalUseClaim = serde_json::from_value(serde_json::json!({
+            "package_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+            "route": "r000045",
+            "operation_class": "hyperliquid.withdraw",
+            "crypto_suite": "secp256k1-keccak256-recoverable",
+            "payload_digest": "0100000000000000000000000000000000000000000000000000000000000000",
+            "ordered_hashes": ["0200000000000000000000000000000000000000000000000000000000000000"],
+            "declared_debits": [
+                {
+                    "asset": {"chain": "hyperliquid", "asset": "usdc"},
+                    "amount": "5000000"
+                },
+                {
+                    "asset": {"chain": "arbitrum", "asset": "usdc"},
+                    "amount": "2500000"
+                }
+            ],
+            "declared_destinations": [
+                {"chain": "arbitrum", "destination": "0xa413f398cf58e5127290ad3750ced91af18026ed"}
+            ],
+            "declared_fee": {
+                "kind": "fee",
+                "chain": "hyperliquid",
+                "asset": "usdc",
+                "amount": "1000000"
+            },
+            "nonce": "00000000000000000000000000000000",
+            "claim_assurance": {"kind": "machine_asserted"}
+        }))
+        .unwrap();
+        let mut limits = MachineBrokerClient::petal_claim_value_limits(Some(&claim)).unwrap();
+        limits.sort_by(|a, b| {
+            a.asset
+                .asset
+                .cmp(&b.asset.asset)
+                .then(a.asset.chain.as_str().cmp(b.asset.chain.as_str()))
+        });
+        assert_eq!(limits.len(), 2);
+        assert_eq!(limits[0].asset.chain.as_str(), "arbitrum");
+        assert_eq!(limits[0].lifetime.as_str(), "2500000");
+        assert_eq!(limits[1].asset.chain.as_str(), "hyperliquid");
+        assert_eq!(limits[1].lifetime.as_str(), "6000000");
+        assert!(limits.iter().all(|limit| limit.rolling_windows.is_empty()));
+        assert!(
+            MachineBrokerClient::petal_claim_value_limits(None)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    fn value_limit_claim(debit_amount: &str, fee: serde_json::Value) -> PetalUseClaim {
+        serde_json::from_value(serde_json::json!({
+            "package_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+            "route": "r000045",
+            "operation_class": "hyperliquid.withdraw",
+            "crypto_suite": "secp256k1-keccak256-recoverable",
+            "payload_digest": "0100000000000000000000000000000000000000000000000000000000000000",
+            "ordered_hashes": ["0200000000000000000000000000000000000000000000000000000000000000"],
+            "declared_debits": [
+                {
+                    "asset": {"chain": "hyperliquid", "asset": "usdc"},
+                    "amount": debit_amount
+                }
+            ],
+            "declared_destinations": [
+                {"chain": "arbitrum", "destination": "0xa413f398cf58e5127290ad3750ced91af18026ed"}
+            ],
+            "declared_fee": fee,
+            "nonce": "00000000000000000000000000000000",
+            "claim_assurance": {"kind": "machine_asserted"}
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn petal_claim_value_limits_accept_totals_beyond_u128() {
+        let u128_max = u128::MAX.to_string();
+        assert_eq!(u128_max, "340282366920938463463374607431768211455");
+
+        // A single declared debit one above u128::MAX.
+        let limits = MachineBrokerClient::petal_claim_value_limits(Some(&value_limit_claim(
+            "340282366920938463463374607431768211456",
+            serde_json::json!({"kind": "none"}),
+        )))
+        .unwrap();
+        assert_eq!(limits.len(), 1);
+        assert_eq!(limits[0].asset.chain.as_str(), "hyperliquid");
+        assert_eq!(limits[0].asset.asset, "usdc");
+        assert_eq!(
+            limits[0].lifetime.as_str(),
+            "340282366920938463463374607431768211456"
+        );
+        assert!(limits[0].rolling_windows.is_empty());
+
+        // A same-asset debit and fee, each u128::MAX, whose sum needs 129 bits.
+        let limits = MachineBrokerClient::petal_claim_value_limits(Some(&value_limit_claim(
+            &u128_max,
+            serde_json::json!({
+                "kind": "fee",
+                "chain": "hyperliquid",
+                "asset": "usdc",
+                "amount": u128_max
+            }),
+        )))
+        .unwrap();
+        assert_eq!(limits.len(), 1);
+        assert_eq!(limits[0].asset.chain.as_str(), "hyperliquid");
+        assert_eq!(limits[0].asset.asset, "usdc");
+        assert_eq!(
+            limits[0].lifetime.as_str(),
+            "680564733841876926926749214863536422910"
+        );
+        assert!(limits[0].rolling_windows.is_empty());
+    }
+
+    // Decimal literals keep the boundary expectations independent of BigUint.
+    const U256_MAX_DECIMAL: &str =
+        "115792089237316195423570985008687907853269984665640564039457584007913129639935";
+    const U256_MAX_MINUS_ONE_DECIMAL: &str =
+        "115792089237316195423570985008687907853269984665640564039457584007913129639934";
+
+    fn value_limit_boundary_claim(amount: &str, add_as_fee: bool) -> PetalUseClaim {
+        let mut claim = value_limit_claim(amount, serde_json::json!({"kind": "none"}));
+        let one = bloom_broker_api::DecimalU256::parse("1").unwrap();
+        if add_as_fee {
+            claim.declared_fee = DeclaredFee::Fee {
+                chain: claim.declared_debits[0].asset.chain.clone(),
+                asset: claim.declared_debits[0].asset.asset.clone(),
+                amount: one,
+            };
+        } else {
+            claim.declared_debits.push(bloom_broker_api::DeclaredDebit {
+                asset: claim.declared_debits[0].asset.clone(),
+                amount: one,
+            });
+        }
+        claim
+    }
+
+    #[test]
+    fn petal_claim_value_limits_accept_u256_max() {
+        for add_as_fee in [false, true] {
+            let claim = value_limit_boundary_claim(U256_MAX_MINUS_ONE_DECIMAL, add_as_fee);
+            let limits = MachineBrokerClient::petal_claim_value_limits(Some(&claim)).unwrap();
+            assert_eq!(limits.len(), 1);
+            assert_eq!(limits[0].asset, claim.declared_debits[0].asset);
+            assert_eq!(limits[0].lifetime.as_str(), U256_MAX_DECIMAL);
+            assert!(limits[0].rolling_windows.is_empty());
+        }
+    }
+
+    #[test]
+    fn petal_claim_value_limits_reject_u256_max_plus_one() {
+        for add_as_fee in [false, true] {
+            let claim = value_limit_boundary_claim(U256_MAX_DECIMAL, add_as_fee);
+            let error = MachineBrokerClient::petal_claim_value_limits(Some(&claim)).unwrap_err();
+            assert_eq!(error.code, ProtocolErrorCode::ClaimInvalid);
+            assert!(
+                error
+                    .message
+                    .contains("unsigned 256-bit approval limit range")
+            );
+        }
+    }
 
     #[test]
     fn checkpoint_event_has_exact_safe_evidence_and_omits_marker_secret() {
@@ -3755,22 +3898,6 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn add_decimal_strings_matches_expected_sums() {
-        assert_eq!(add_decimal_strings("0", "0"), "0");
-        assert_eq!(add_decimal_strings("1", "2"), "3");
-        assert_eq!(add_decimal_strings("5", "5"), "10");
-        assert_eq!(add_decimal_strings("999", "1"), "1000");
-        assert_eq!(add_decimal_strings("123", "45678"), "45801");
-        assert_eq!(
-            add_decimal_strings(
-                "115792089237316195423570985008687907853269984665640564039457584007913129639935",
-                "0"
-            ),
-            "115792089237316195423570985008687907853269984665640564039457584007913129639935"
-        );
-    }
-
     fn asset_id(chain: &str, asset: &str) -> AssetId {
         AssetId {
             chain: token(chain),
@@ -3797,145 +3924,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn value_limits_from_claim_is_empty_without_a_claim_or_a_zero_effect_claim() {
-        assert!(value_limits_from_claim(None).unwrap().is_empty());
-        assert!(
-            value_limits_from_claim(Some(&petal_use_claim(Vec::new(), DeclaredFee::None)))
-                .unwrap()
-                .is_empty()
-        );
-    }
-
-    #[test]
-    fn value_limits_from_claim_covers_each_debit_asset() {
-        let claim = petal_use_claim(
-            vec![
-                bloom_broker_api::DeclaredDebit {
-                    asset: asset_id("hyperliquid", "usdc"),
-                    amount: DecimalU256::parse("100").unwrap(),
-                },
-                bloom_broker_api::DeclaredDebit {
-                    asset: asset_id("hyperliquid", "btc"),
-                    amount: DecimalU256::parse("5").unwrap(),
-                },
-            ],
-            DeclaredFee::None,
-        );
-        let limits = value_limits_from_claim(Some(&claim)).unwrap();
-        assert_eq!(limits.len(), 2);
-        assert!(
-            limits
-                .iter()
-                .any(|limit| limit.asset == asset_id("hyperliquid", "usdc")
-                    && limit.lifetime.as_str() == "100"
-                    && limit.rolling_windows.is_empty())
-        );
-        assert!(
-            limits
-                .iter()
-                .any(|limit| limit.asset == asset_id("hyperliquid", "btc")
-                    && limit.lifetime.as_str() == "5"
-                    && limit.rolling_windows.is_empty())
-        );
-    }
-
-    #[test]
-    fn value_limits_from_claim_rejects_a_same_asset_sum_that_overflows_u256() {
-        // Each amount is individually a valid DecimalU256; only their sum
-        // exceeds u256. Folding them must surface a protocol error rather
-        // than panicking before Broker ever sees the claim.
-        let max = DecimalU256::parse(
-            "115792089237316195423570985008687907853269984665640564039457584007913129639935",
-        )
-        .unwrap();
-        let claim = petal_use_claim(
-            vec![
-                bloom_broker_api::DeclaredDebit {
-                    asset: asset_id("hyperliquid", "usdc"),
-                    amount: max.clone(),
-                },
-                bloom_broker_api::DeclaredDebit {
-                    asset: asset_id("hyperliquid", "usdc"),
-                    amount: max,
-                },
-            ],
-            DeclaredFee::None,
-        );
-        let error = value_limits_from_claim(Some(&claim)).unwrap_err();
-        assert_eq!(error.code, ProtocolErrorCode::ClaimInvalid);
-        assert!(error.message.contains("exceeds u256"));
-    }
-
-    #[test]
-    fn value_limits_from_claim_rejects_a_fee_that_overflows_its_debit_asset() {
-        let max = DecimalU256::parse(
-            "115792089237316195423570985008687907853269984665640564039457584007913129639935",
-        )
-        .unwrap();
-        let claim = petal_use_claim(
-            vec![bloom_broker_api::DeclaredDebit {
-                asset: asset_id("hyperliquid", "usdc"),
-                amount: max.clone(),
-            }],
-            DeclaredFee::Fee {
-                chain: token("hyperliquid"),
-                asset: "usdc".to_owned(),
-                amount: max,
-            },
-        );
-        let error = value_limits_from_claim(Some(&claim)).unwrap_err();
-        assert_eq!(error.code, ProtocolErrorCode::ClaimInvalid);
-    }
-
-    #[test]
-    fn value_limits_from_claim_folds_a_fee_sharing_a_debits_asset() {
-        let claim = petal_use_claim(
-            vec![bloom_broker_api::DeclaredDebit {
-                asset: asset_id("hyperliquid", "usdc"),
-                amount: DecimalU256::parse("100").unwrap(),
-            }],
-            DeclaredFee::Fee {
-                chain: token("hyperliquid"),
-                asset: "usdc".to_owned(),
-                amount: DecimalU256::parse("3").unwrap(),
-            },
-        );
-        let limits = value_limits_from_claim(Some(&claim)).unwrap();
-        assert_eq!(limits.len(), 1);
-        assert_eq!(limits[0].asset, asset_id("hyperliquid", "usdc"));
-        assert_eq!(limits[0].lifetime.as_str(), "103");
-    }
-
-    #[test]
-    fn value_limits_from_claim_adds_a_separate_entry_for_a_fee_on_a_different_asset() {
-        let claim = petal_use_claim(
-            vec![bloom_broker_api::DeclaredDebit {
-                asset: asset_id("hyperliquid", "btc"),
-                amount: DecimalU256::parse("1").unwrap(),
-            }],
-            DeclaredFee::Fee {
-                chain: token("hyperliquid"),
-                asset: "usdc".to_owned(),
-                amount: DecimalU256::parse("3").unwrap(),
-            },
-        );
-        let limits = value_limits_from_claim(Some(&claim)).unwrap();
-        assert_eq!(limits.len(), 2);
-        assert!(
-            limits
-                .iter()
-                .any(|limit| limit.asset == asset_id("hyperliquid", "btc")
-                    && limit.lifetime.as_str() == "1")
-        );
-        assert!(
-            limits
-                .iter()
-                .any(|limit| limit.asset == asset_id("hyperliquid", "usdc")
-                    && limit.lifetime.as_str() == "3")
-        );
-    }
-
     #[tokio::test]
     async fn reusable_petal_batch_binds_declared_value_to_the_approval_limits() {
         // Regression: this path left value_limits empty while requiring a
@@ -3946,12 +3934,13 @@ mod tests {
             wallet: WalletPublic {
                 wallet_id: token("wallet"),
                 wallet_kind: token("local"),
-                root_key_ref: key_ref(),
+                root_key_ref: Some(key_ref()),
                 key_refs: vec![key_ref()],
                 policy_version: DecimalU64::new(7),
                 policy_digest: digest(7),
                 wallet_revocation_epoch: DecimalU64::new(2),
             },
+            accounts: empty_accounts(),
             requests: Mutex::new(Vec::new()),
             corrupt_response: false,
         });

@@ -133,6 +133,22 @@ if [ -n "$mount_dir" ]; then
   fi
 fi
 log_dir="$(cd "$log_dir" && pwd -P)"
+if [ "$host_os" = Darwin ]; then
+  # macOS Broker requires a pre-created 0640 log with explicit ownership.
+  # Keep developer output in --log-dir, including when the shell inherited
+  # logging settings from an installed service or another developer triad.
+  export BLOOM_BROKER_LOG_PATH="${log_dir}/broker.log"
+  export BLOOM_BROKER_LOG_OWNER_UID="$(id -u)"
+  [ ! -L "$BLOOM_BROKER_LOG_PATH" ] || die "Broker log must not be a symlink"
+  if [ -e "$BLOOM_BROKER_LOG_PATH" ]; then
+    [ -f "$BLOOM_BROKER_LOG_PATH" ] &&
+      [ "$(stat -f %u "$BLOOM_BROKER_LOG_PATH")" = "$BLOOM_BROKER_LOG_OWNER_UID" ] ||
+      die "Broker log must be a regular file owned by the current user"
+  fi
+  : >> "$BLOOM_BROKER_LOG_PATH"
+  chmod 0640 "$BLOOM_BROKER_LOG_PATH"
+  export BLOOM_BROKER_LOG_READER_GID="$(stat -f %g "$BLOOM_BROKER_LOG_PATH")"
+fi
 machine_socket="$(cd "$(dirname "$machine_socket")" && pwd -P)/$(basename "$machine_socket")"
 ready_file="$(cd "$(dirname "$ready_file")" && pwd -P)/$(basename "$ready_file")"
 if [ -e "$machine_socket" ] || [ -L "$machine_socket" ]; then
@@ -568,19 +584,6 @@ else
   signer_pid=$!
   wait_for_socket "$signer_socket" "$signer_pid" signer
 
-  # bloom-service-observability's SecureLogFile deliberately never creates
-  # this file itself (open_secure_append opens for append only, no O_CREAT)
-  # so it can never silently start writing through an unvalidated path. The
-  # launcher must provision it with the exact ownership/mode the Broker will
-  # check before the Broker will start.
-  broker_json_log="${log_dir}/broker.json.log"
-  [ -e "$broker_json_log" ] || : >"$broker_json_log"
-  # A new file under this directory can inherit its parent's group (macOS
-  # BSD semantics), not the creating process's own primary group, so the
-  # group must be set explicitly rather than assumed.
-  chown "$(id -u)":"$(id -g)" "$broker_json_log"
-  chmod 0640 "$broker_json_log"
-
   env -u BLOOM_OPERATOR_ACCEPT_CLOCK_UTC_MS \
   -u BLOOM_OPERATOR_CONFIRM_EXPIRING_APPROVALS_DIGEST \
   BLOOM_TRIAD_DEVELOPER_ROOT="$developer_root" \
@@ -591,9 +594,6 @@ else
   BLOOM_BROKER_CONTROL_SOCKET="$broker_control_socket" \
   BLOOM_BROKER_AUDIT_CHECKPOINT_DIR="$broker_checkpoint_dir" \
   BLOOM_SESSION_SOCKET="$session_socket" \
-  BLOOM_BROKER_LOG_PATH="$broker_json_log" \
-  BLOOM_BROKER_LOG_OWNER_UID="$(id -u)" \
-  BLOOM_BROKER_LOG_READER_GID="$(id -g)" \
     "$broker_bin" >"${log_dir}/broker.log" 2>&1 &
   broker_pid=$!
   wait_for_socket "$broker_socket" "$broker_pid" broker

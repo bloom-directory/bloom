@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use url::Url;
 
 use crate::BrokerExactPayloadSigner;
@@ -41,6 +41,27 @@ use crate::path::VfsPath;
 const APPROVAL_CHALLENGE_FILE: &str = "approval_challenge.json";
 const PAID_HTTP_X402_SIGN_INTENT: &str = "x402.sign";
 const PAID_HTTP_MPP_SIGN_INTENT: &str = "paid-http.mpp.sign";
+
+/// Upper bound on a single paid-HTTP round trip — the merchant probe, the
+/// payment backend's RPC, and the credentialed retry all use it.
+///
+/// These calls run inside the router's audited effect window, so an
+/// unresponsive merchant would otherwise hold an unresolved effect open with
+/// no ceiling.
+const PAID_HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The one place paid-HTTP clients are built, so every request this handler
+/// makes is bounded by [`PAID_HTTP_REQUEST_TIMEOUT`].
+fn paid_http_client() -> reqwest::Client {
+    paid_http_client_with_timeout(PAID_HTTP_REQUEST_TIMEOUT)
+}
+
+fn paid_http_client_with_timeout(timeout: Duration) -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(timeout)
+        .build()
+        .expect("paid http client builder")
+}
 
 #[cfg(test)]
 struct VenueLocalTestOperationIndex;
@@ -58,6 +79,33 @@ impl OperationIndex for VenueLocalTestOperationIndex {
     }
 }
 
+/// Weak entries keep locks shared across handler clones without retaining every
+/// request ID forever. All operations acquire request, then wallet, in that order.
+#[derive(Default)]
+struct PaymentLocks {
+    entries: std::sync::Mutex<
+        std::collections::HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>,
+    >,
+}
+
+impl PaymentLocks {
+    async fn acquire(&self, key: &str) -> tokio::sync::OwnedMutexGuard<()> {
+        let lock = {
+            let mut entries = self.entries.lock().expect("payment lock registry poisoned");
+            entries.retain(|_, lock| lock.strong_count() > 0);
+            match entries.get(key).and_then(std::sync::Weak::upgrade) {
+                Some(lock) => lock,
+                None => {
+                    let lock = Arc::new(tokio::sync::Mutex::new(()));
+                    entries.insert(key.to_owned(), Arc::downgrade(&lock));
+                    lock
+                }
+            }
+        };
+        lock.lock_owned().await
+    }
+}
+
 #[derive(Clone)]
 pub struct RequestsHandler {
     root: PathBuf,
@@ -68,6 +116,8 @@ pub struct RequestsHandler {
     operation_index: Arc<dyn OperationIndex>,
     wallet_projections: Option<Arc<dyn WalletProjectionReader>>,
     exact_signer: Option<BrokerExactPayloadSigner>,
+    request_locks: Arc<PaymentLocks>,
+    wallet_locks: Arc<PaymentLocks>,
 }
 
 impl RequestsHandler {
@@ -81,11 +131,13 @@ impl RequestsHandler {
             operation_index: Arc::new(FileOperationIndex::new(root.join("operations/index.json"))),
             root,
             default_wallet,
-            client: reqwest::Client::new(),
+            client: paid_http_client(),
             x402_signer: Arc::new(HostX402PaymentSigner::new()),
             paid_http_rpc_resolver: Arc::new(EmptyPaidHttpChainRpcResolver),
             wallet_projections: Some(wallet_projections),
             exact_signer: None,
+            request_locks: Arc::new(PaymentLocks::default()),
+            wallet_locks: Arc::new(PaymentLocks::default()),
         }
     }
 
@@ -305,8 +357,8 @@ impl RequestsHandler {
             fs::write(dir.join("response/body"), &body)?;
             let sha = bloom_tools::sha256_hex(&body);
             fs::write(dir.join("response/body.sha256"), format!("{sha}\n"))?;
-            write_json(
-                dir.join("receipt.json"),
+            write_receipt_atomically(
+                &dir,
                 &json!({
                     "request_id": id,
                     "wallet": wallet,
@@ -409,7 +461,7 @@ impl RequestsHandler {
             .as_secs()
             .saturating_sub(24 * 60 * 60);
         let mut total = 0.0;
-        for state in ["sent", "failed"] {
+        for state in ["pending", "sent", "failed"] {
             let root = self.requests_root().join(state);
             if !root.exists() {
                 continue;
@@ -427,19 +479,44 @@ impl RequestsHandler {
                     .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
                     .map(|d| d.as_secs())
                     .unwrap_or(0);
-                if modified < since {
-                    continue;
-                }
-                let Ok(receipt) = read_json::<serde_json::Value>(dir.join("receipt.json")) else {
+                let receipt_path = dir.join("receipt.json");
+                let receipt = if receipt_path.exists() {
+                    // Never turn a corrupt accounting record into zero spending.
+                    read_json::<serde_json::Value>(&receipt_path)?
+                } else if state == "pending" && payment_execution_started(&dir) {
+                    // Compatibility with interrupted requests from older builds:
+                    // derive their full possible charge from the staged snapshot.
+                    let snapshot: MachinePaidHttpExecutionSnapshot =
+                        read_json(dir.join("private/execution.json"))?;
+                    payment_attempt_receipt(
+                        &entry.file_name().to_string_lossy(),
+                        &snapshot.wallet,
+                        &snapshot.subject.challenge,
+                        &snapshot.subject.selected_requirement,
+                    )
+                } else {
                     continue;
                 };
-                if receipt.get("wallet").and_then(|v| v.as_str()) != Some(wallet) {
-                    continue;
-                }
+                let owner = receipt
+                    .get("wallet")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| HandlerError::backend("payment receipt has no wallet"))?;
                 let protocol = receipt
                     .get("protocol")
                     .and_then(|v| v.as_str())
-                    .unwrap_or("free");
+                    .ok_or_else(|| HandlerError::backend("payment receipt has no protocol"))?;
+                let unresolved = state == "pending"
+                    || receipt.get("outcome").and_then(|v| v.as_str()) == Some("unresolved");
+                let attempted_at = receipt
+                    .get("attempted_at_secs")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(modified);
+                if !unresolved && attempted_at < since {
+                    continue;
+                }
+                if owner != wallet {
+                    continue;
+                }
                 if protocol == "free" {
                     continue;
                 }
@@ -452,7 +529,10 @@ impl RequestsHandler {
                             receipt.get("amount").and_then(|v| v.as_str()),
                         )
                     })
-                    .unwrap_or(0.0);
+                    .filter(|amount| amount.is_finite() && *amount >= 0.0)
+                    // An unpriceable payment cannot be treated as free under a
+                    // configured USD cap. With no cap this does not block work.
+                    .unwrap_or(f64::INFINITY);
             }
         }
         Ok(total)
@@ -588,6 +668,7 @@ impl RequestsHandler {
     }
 
     async fn confirm(&self, id: &str, data: &[u8]) -> Result<(), HandlerError> {
+        let _request = self.request_locks.acquire(id).await;
         let value = String::from_utf8_lossy(data).trim().to_ascii_lowercase();
         let pending = self.req_dir("pending", id);
         if !pending.exists() {
@@ -599,9 +680,9 @@ impl RequestsHandler {
                 "dry-run paid requests cannot be confirmed; stage a fresh request with /requests/new",
             ));
         }
-        if pending.join("private/credential_minted.json").exists() {
+        if payment_execution_started(&pending) {
             return Err(HandlerError::invalid(
-                "this pending request already minted a payment credential; cancel and stage a fresh request instead of re-confirming",
+                "payment was attempted; inspect its receipt and merchant outcome; do not resubmit this request",
             ));
         }
         let request = sealed_inputs.request;
@@ -610,6 +691,9 @@ impl RequestsHandler {
             .as_deref()
             .ok_or_else(|| HandlerError::backend("sealed request missing wallet"))?
             .to_string();
+        // Hold through live checks, signing, merchant execution and receipt
+        // publication, so the next payment sees this one's accounting result.
+        let _wallet = self.wallet_locks.acquire(&wallet).await;
         let host = sealed_inputs.host;
         let mut challenge = sealed_inputs.challenge;
         validate_session_state_target(&challenge, id)?;
@@ -793,7 +877,14 @@ impl RequestsHandler {
             "secret_material_in_vfs": false,
             "public": credential.public_metadata,
         });
-        write_minted_marker(&pending, id, &credential_metadata)?;
+        record_payment_attempt(
+            &pending,
+            id,
+            &wallet,
+            &challenge,
+            &requirement,
+            &credential_metadata,
+        )?;
         let retry = retry_paid_request(
             &self.client,
             &request,
@@ -1276,13 +1367,24 @@ impl Handler for RequestsHandler {
                 ))
             }
             [state, id, action] if state == "pending" && action == "cancel" => {
+                let _request = self.request_locks.acquire(id).await;
                 let pending = self.req_dir(state, id);
+                if !pending.exists() {
+                    return Err(HandlerError::NotFound(format!("/requests/pending/{id}")));
+                }
+                if payment_execution_started(&pending) {
+                    return Err(HandlerError::invalid(
+                        "payment execution has started; cancellation cannot undo it; reconcile the outcome",
+                    ));
+                }
                 let failed = self.req_dir("failed", id);
+                if failed.exists() {
+                    return Err(HandlerError::invalid(
+                        "request already has a failed outcome",
+                    ));
+                }
                 fs::write(pending.join("status"), b"cancelled\n")?;
                 fs::write(pending.join("error.txt"), b"cancelled by user\n")?;
-                if failed.exists() {
-                    fs::remove_dir_all(&failed)?;
-                }
                 fs::rename(pending, failed)?;
                 self.write_latest("failed", id)
             }
@@ -1400,18 +1502,25 @@ async fn confirm_with_backend(
             "dry-run paid requests cannot be confirmed; stage a fresh request with /requests/new",
         ));
     }
-    if pending.join("private/credential_minted.json").exists() {
+    if payment_execution_started(&pending) {
         return Err(HandlerError::invalid(
-            "this pending request already minted a payment credential; cancel and stage a fresh request instead of re-confirming",
+            "payment was attempted; inspect its receipt and merchant outcome; do not resubmit this request",
         ));
     }
     let execution = backend
         .prepare(&challenge, &request, &wallet, options.policy, id)
         .await
         .map_err(HandlerError::backend)?;
-    write_minted_marker(&pending, id, &execution.credential_metadata)?;
+    record_payment_attempt(
+        &pending,
+        id,
+        &wallet,
+        &challenge,
+        &requirement,
+        &execution.credential_metadata,
+    )?;
     let retry = retry_paid_request(
-        &reqwest::Client::new(),
+        &paid_http_client(),
         &request,
         execution.header_name,
         &execution.header_value,
@@ -1781,21 +1890,88 @@ async fn retry_paid_request(
     })
 }
 
-fn write_minted_marker(
+fn payment_execution_started(pending: &Path) -> bool {
+    pending.join("receipt.json").exists()
+        // Retain retry protection for interrupted requests from older builds.
+        || pending.join("private/execution_started").exists()
+        || pending.join("private/credential_minted.json").exists()
+}
+
+fn payment_attempt_receipt(
+    id: &str,
+    wallet: &str,
+    challenge: &NormalizedChallenge,
+    requirement: &PaymentRequirement,
+) -> serde_json::Value {
+    json!({
+        "request_id": id,
+        "wallet": wallet,
+        "merchant": challenge.merchant,
+        "amount": requirement.amount,
+        "currency": requirement.asset,
+        "network": requirement.network,
+        "protocol": challenge.protocol,
+        "intent": challenge.intent,
+        "scheme": requirement.scheme,
+        "amount_usd": selected_requirement_amount_usd(challenge, requirement),
+        "attempted_at_secs": now_secs(),
+        "outcome": "unresolved",
+        "credential_redacted": true,
+    })
+}
+
+// Persist after preparation, before transmitting the credential. The same
+// receipt remains the accounting record through completion or interruption.
+fn record_payment_attempt(
     pending: &Path,
     id: &str,
+    wallet: &str,
+    challenge: &NormalizedChallenge,
+    requirement: &PaymentRequirement,
     credential_metadata: &serde_json::Value,
 ) -> Result<(), HandlerError> {
-    fs::create_dir_all(pending.join("private"))?;
     write_json(pending.join("credential.json"), credential_metadata)?;
-    write_json(
-        pending.join("private/credential_minted.json"),
-        &json!({
-            "request_id": id,
-            "credential_redacted": true,
-            "secret_material_in_vfs": false
-        }),
-    )
+    write_receipt_atomically(
+        pending,
+        &payment_attempt_receipt(id, wallet, challenge, requirement),
+    )?;
+    // Persist directory entries too: syncing the receipt alone does not make
+    // a newly staged request survive power loss. Include newly created layout
+    // ancestors before any credential can leave this process.
+    for ancestor in pending
+        .ancestors()
+        .skip(1)
+        .filter(|p| !p.as_os_str().is_empty())
+    {
+        fs::File::open(ancestor)?.sync_all()?;
+    }
+    Ok(())
+}
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn write_receipt_atomically(dir: &Path, receipt: &serde_json::Value) -> Result<(), HandlerError> {
+    use std::io::Write;
+    // Request serialization ensures a single writer. An interrupted temporary
+    // file never replaces the previously committed accounting record.
+    let temp = dir.join(".receipt.json.tmp");
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&temp)?;
+    let bytes =
+        serde_json::to_vec_pretty(receipt).map_err(|e| HandlerError::backend(e.to_string()))?;
+    file.write_all(&bytes)?;
+    file.sync_all()?;
+    fs::rename(temp, dir.join("receipt.json"))?;
+    fs::File::open(dir)?.sync_all()?;
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1839,8 +2015,9 @@ fn finalize_paid_retry(
         .and_then(|h| mpp::parse_receipt(h).ok())
         .and_then(|r| serde_json::to_value(r).ok())
         .unwrap_or_else(|| json!({}));
-    write_json(
-        pending.join("receipt.json"),
+    let attempt: serde_json::Value = read_json(pending.join("receipt.json"))?;
+    write_receipt_atomically(
+        pending,
         &json!({
             "request_id": id,
             "wallet": wallet,
@@ -1854,6 +2031,8 @@ fn finalize_paid_retry(
             "charge_id": challenge.charge_id,
             "session_id": challenge.session_id,
             "amount_usd": amount_usd,
+            "attempted_at_secs": attempt.get("attempted_at_secs").cloned().unwrap_or_else(|| json!(now_secs())),
+            "outcome": if retry_error.is_some() { "unresolved" } else { "response_received" },
             "response_status": status,
             "response_sha256": sha,
             "credential_redacted": true,
@@ -1889,6 +2068,8 @@ fn finalize_paid_retry(
         )));
     }
     fs::rename(pending, &dest)?;
+    fs::File::open(requests_root.join(final_state))?.sync_all()?;
+    fs::File::open(requests_root.join("pending"))?.sync_all()?;
     Ok(final_state.into())
 }
 
@@ -2152,6 +2333,35 @@ fn paid_http_sealed_subject(input: PaidHttpAuthSubject<'_>) -> PaidHttpSealedSub
 mod tests {
     use super::*;
 
+    /// Paid requests run inside the router's audited effect window, so an
+    /// unresponsive merchant must be ended by the client, not waited on.
+    #[tokio::test]
+    async fn paid_http_client_is_bounded_by_its_timeout() {
+        // Accept connections and never answer them; only a client-side
+        // deadline can complete this request.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _silent_merchant = tokio::spawn(async move {
+            let mut accepted = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                accepted.push(stream);
+            }
+        });
+
+        let error = paid_http_client_with_timeout(Duration::from_millis(250))
+            .get(format!("http://{addr}/paid"))
+            .send()
+            .await
+            .expect_err("an unresponsive merchant must not hang the request");
+        assert!(error.is_timeout(), "expected a timeout, got {error}");
+
+        assert!(
+            PAID_HTTP_REQUEST_TIMEOUT > Duration::ZERO
+                && PAID_HTTP_REQUEST_TIMEOUT <= Duration::from_secs(60),
+            "the production paid-HTTP bound must stay a real ceiling"
+        );
+    }
+
     fn handler() -> (tempfile::TempDir, RequestsHandler) {
         let tmp = tempfile::tempdir().unwrap();
         let handler = RequestsHandler::new_projected(
@@ -2164,6 +2374,200 @@ mod tests {
         )
         .with_operation_index(Arc::new(VenueLocalTestOperationIndex));
         (tmp, handler)
+    }
+
+    #[tokio::test]
+    async fn wallet_payment_serialization_rechecks_daily_spending() {
+        use std::future::Future;
+        let (_tmp, handler) = handler();
+        handler.ensure_layout().unwrap();
+        let first = handler.wallet_locks.acquire("alice").await;
+        let clone = handler.clone();
+        let second = clone.wallet_locks.acquire("alice");
+        tokio::pin!(second);
+        assert!(
+            std::future::poll_fn(|cx| {
+                std::task::Poll::Ready(second.as_mut().poll(cx).is_pending())
+            })
+            .await
+        );
+        // A different wallet's payment must remain independent.
+        let other =
+            tokio::time::timeout(Duration::from_secs(1), handler.wallet_locks.acquire("bob"))
+                .await
+                .unwrap();
+        drop(other);
+        let mut policy = Policy::default();
+        policy.payments.enabled = true;
+        policy.payments.http.per_day_usd = Some(100.0);
+        let evaluate = || {
+            evaluate_payment_policy(
+                &policy,
+                PolicyEvalInput {
+                    host: "merchant.example",
+                    asset: Some("USDC"),
+                    network: Some("base"),
+                    intent: "charge",
+                    amount_usd: Some(60.0),
+                    request_max_amount_usd: Some(60.0),
+                    spent_24h_usd: handler.sum_paid_usd_last_24h("alice").unwrap(),
+                },
+            )
+        };
+        assert!(
+            !evaluate()
+                .iter()
+                .any(|check| check.rule == "payments.http.per_day_usd" && check.result == "deny")
+        );
+        // Publish the first $60 outcome before releasing its wallet guard.
+        // Failed/unknown merchant outcomes must count just like sent outcomes.
+        for state in ["sent", "failed"] {
+            let receipt_dir = handler.req_dir(state, "first");
+            fs::create_dir_all(&receipt_dir).unwrap();
+            write_json(
+                receipt_dir.join("receipt.json"),
+                &json!({
+                    "wallet": "alice", "protocol": "x402", "amount_usd": 60.0,
+                    "response_status": if state == "sent" { 200 } else { 599 },
+                }),
+            )
+            .unwrap();
+            assert!(
+                evaluate().iter().any(
+                    |check| check.rule == "payments.http.per_day_usd" && check.result == "deny"
+                )
+            );
+            if state == "sent" {
+                fs::remove_file(receipt_dir.join("receipt.json")).unwrap();
+            }
+        }
+        drop(first);
+        let _second = second.await;
+        assert_eq!(handler.sum_paid_usd_last_24h("alice").unwrap(), 60.0);
+        assert!(
+            evaluate()
+                .iter()
+                .any(|check| check.rule == "payments.http.per_day_usd" && check.result == "deny")
+        );
+    }
+
+    #[test]
+    fn payment_attempt_is_counted_once_through_completion_and_timeout() {
+        for timeout in [false, true] {
+            let (_tmp, handler) = handler();
+            handler.ensure_layout().unwrap();
+            let pending = handler.req_dir("pending", "attempt");
+            fs::create_dir_all(&pending).unwrap();
+            let mut challenge = normalize_challenge(
+                &HeaderMap::new(),
+                b"{}",
+                &Url::parse("https://merchant.example").unwrap(),
+            );
+            challenge.protocol = "x402".into();
+            challenge.intent = "charge".into();
+            let requirement = PaymentRequirement {
+                scheme: Some("exact".into()),
+                network: Some("base".into()),
+                asset: Some("USDC".into()),
+                amount: Some("60".into()),
+                pay_to: None,
+                resource: None,
+                raw: json!({}),
+            };
+            record_payment_attempt(
+                &pending,
+                "attempt",
+                "alice",
+                &challenge,
+                &requirement,
+                &json!({}),
+            )
+            .unwrap();
+            let attempt: serde_json::Value = read_json(pending.join("receipt.json")).unwrap();
+            assert_eq!(handler.sum_paid_usd_last_24h("alice").unwrap(), 60.0);
+            assert_eq!(handler.sum_paid_usd_last_24h("bob").unwrap(), 0.0);
+            let mut policy = Policy::default();
+            policy.payments.enabled = true;
+            policy.payments.http.per_day_usd = Some(100.0);
+            for (amount, denied) in [(30.0, false), (40.0, false), (60.0, true)] {
+                let checks = evaluate_payment_policy(
+                    &policy,
+                    PolicyEvalInput {
+                        host: "merchant.example",
+                        asset: Some("USDC"),
+                        network: Some("base"),
+                        intent: "charge",
+                        amount_usd: Some(amount),
+                        request_max_amount_usd: Some(amount),
+                        spent_24h_usd: handler.sum_paid_usd_last_24h("alice").unwrap(),
+                    },
+                );
+                assert_eq!(
+                    checks
+                        .iter()
+                        .any(|c| c.rule == "payments.http.per_day_usd" && c.result == "deny"),
+                    denied
+                );
+            }
+            let retry = if timeout {
+                Err(HandlerError::backend("merchant timeout"))
+            } else {
+                Ok(PaidRetryResponse {
+                    status: 200,
+                    headers: HeaderMap::new(),
+                    body: vec![],
+                })
+            };
+            finalize_paid_retry(
+                &handler.requests_root(),
+                &pending,
+                "attempt",
+                "alice",
+                "merchant.example",
+                &challenge,
+                &requirement,
+                Some(60.0),
+                json!({}),
+                retry,
+            )
+            .unwrap();
+            let archived = handler.req_dir(if timeout { "failed" } else { "sent" }, "attempt");
+            let receipt: serde_json::Value = read_json(archived.join("receipt.json")).unwrap();
+            assert_eq!(receipt["attempted_at_secs"], attempt["attempted_at_secs"]);
+            assert_eq!(
+                receipt["outcome"],
+                if timeout {
+                    "unresolved"
+                } else {
+                    "response_received"
+                }
+            );
+            assert_eq!(handler.sum_paid_usd_last_24h("alice").unwrap(), 60.0);
+            // A crash before the final directory move must not lose or duplicate the charge.
+            fs::rename(&archived, &pending).unwrap();
+            assert_eq!(handler.sum_paid_usd_last_24h("alice").unwrap(), 60.0);
+        }
+    }
+
+    #[test]
+    fn unresolved_receipts_do_not_expire_or_disappear_on_corruption() {
+        let (_tmp, handler) = handler();
+        handler.ensure_layout().unwrap();
+        let dir = handler.req_dir("failed", "attempt");
+        fs::create_dir_all(&dir).unwrap();
+        let mut receipt = json!({
+            "wallet": "alice", "protocol": "x402", "amount_usd": 60.0,
+            "attempted_at_secs": 1, "outcome": "unresolved",
+        });
+        write_receipt_atomically(&dir, &receipt).unwrap();
+        assert_eq!(handler.sum_paid_usd_last_24h("alice").unwrap(), 60.0);
+        receipt["outcome"] = json!("response_received");
+        write_receipt_atomically(&dir, &receipt).unwrap();
+        assert_eq!(handler.sum_paid_usd_last_24h("alice").unwrap(), 0.0);
+        for corrupt in [b"{".as_slice(), b"{}".as_slice()] {
+            fs::write(dir.join("receipt.json"), corrupt).unwrap();
+            assert!(handler.sum_paid_usd_last_24h("alice").is_err());
+        }
     }
 
     fn staged_subject<'a>(
@@ -2225,6 +2629,19 @@ mod tests {
         assert_eq!(snapshot.wallet, "alice");
         assert!(!pending.join("intent_hash").exists());
         assert!(!pending.join("approval.json").exists());
+        // Older interrupted executions have markers instead of receipts.
+        // Their sealed snapshots still reserve the selected possible charge.
+        let mut snapshot = snapshot;
+        snapshot.subject.challenge.protocol = "x402".into();
+        write_json(pending.join("private/execution.json"), &snapshot).unwrap();
+        for marker in ["execution_started", "credential_minted.json"] {
+            let path = pending.join("private").join(marker);
+            fs::write(&path, b"{}").unwrap();
+            assert!(payment_execution_started(&pending));
+            assert_eq!(handler.sum_paid_usd_last_24h("alice").unwrap(), 1.0);
+            fs::remove_file(path).unwrap();
+        }
+        assert!(!payment_execution_started(&pending));
     }
 
     #[tokio::test]

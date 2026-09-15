@@ -4535,7 +4535,7 @@ impl Daemon {
 
         // /next.md — brutally-scoped next-action aggregator for agents.
         // Answers: what wallets need attention, what confirms are pending,
-        // what capabilities are active/expired/orphaned, what risk data is stale.
+        // what risk data is stale.
         let next_wallet_projections = wallet_projections.clone();
         vfs_builder = vfs_builder.with_root_dynamic_async("next.md", move || {
             let projections = next_wallet_projections.clone();
@@ -8000,7 +8000,7 @@ ws_url = "wss://example.invalid"
         fn child(&self, evm: bool, number: u32) -> &AccountChild {
             self.children
                 .iter()
-                .find(|child| child.key_spec_is_ed25519() == !evm && child.path_number() == number)
+                .find(|child| child.key_spec_is_ed25519() != evm && child.path_number() == number)
                 .unwrap()
         }
 
