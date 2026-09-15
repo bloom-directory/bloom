@@ -1193,8 +1193,7 @@ impl FileSystem for BloomFs {
                 if segs.len() <= 1 {
                     Ok(Some(BloomHandle::Root))
                 } else {
-                    let parent_str = format!("/{}", segs[..segs.len() - 1].join("/"));
-                    let parent = VfsPath::parse(&parent_str).map_err(|_| FsError::InvalidInput)?;
+                    let parent = Self::parent_path(path).expect("non-root path has a parent");
                     let name = parent
                         .segments()
                         .last()
@@ -3841,6 +3840,53 @@ mod tests {
             listed_name("plain"),
             std::borrow::Cow::Borrowed(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn listed_directory_parent_preserves_encoded_segments() {
+        struct NestedHandler;
+        #[async_trait]
+        impl Handler for NestedHandler {
+            async fn lookup(&self, path: &VfsPath) -> Result<Entry, HandlerError> {
+                match path.segments() {
+                    [] => Ok(Entry::dir("")),
+                    [name] if name == "a/b%" => Ok(Entry::dir(name)),
+                    [name, child] if name == "a/b%" && child == "child" => Ok(Entry::dir(child)),
+                    _ => Err(HandlerError::not_found(path.to_string_path())),
+                }
+            }
+            async fn list(&self, path: &VfsPath) -> Result<Vec<Entry>, HandlerError> {
+                match path.segments() {
+                    [] => Ok(vec![Entry::dir("a/b%")]),
+                    [name] if name == "a/b%" => Ok(vec![Entry::dir("child")]),
+                    _ => Err(HandlerError::not_found(path.to_string_path())),
+                }
+            }
+        }
+        let vfs = Vfs::builder()
+            .mount("nested", Arc::new(NestedHandler))
+            .build();
+        let fs = BloomFs::new(vfs);
+        let ctx = fake_ctx();
+        let root = fs.lookup(&ctx, &BloomHandle::Root, "nested").await.unwrap();
+        let entries = fs.readdir(&ctx, &root, 0, 100, true).await.unwrap();
+        assert_eq!(entries.entries[0].name, "a%2Fb%25");
+        let directory = fs
+            .lookup(&ctx, &root, &entries.entries[0].name)
+            .await
+            .unwrap();
+        assert_eq!(directory, entries.entries[0].handle);
+        let children = fs.readdir(&ctx, &directory, 0, 100, true).await.unwrap();
+        let child = fs
+            .lookup(&ctx, &directory, &children.entries[0].name)
+            .await
+            .unwrap();
+        let parent = fs.parent(&ctx, &child).await.unwrap().unwrap();
+        assert_eq!(parent, directory);
+        // The returned parent must still address the same handler directory.
+        let again = fs.lookup(&ctx, &parent, "child").await.unwrap();
+        assert_eq!(again, child);
+        assert_eq!(fs.parent(&ctx, &parent).await.unwrap(), Some(root));
     }
 
     #[tokio::test]
